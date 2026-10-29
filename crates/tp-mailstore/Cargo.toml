@@ -1,0 +1,27 @@
+[package]
+name = "tp-mailstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tp-contracts.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+mail-parser.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tp-testkit.workspace = true
+proptest.workspace = true
+tempfile.workspace = true

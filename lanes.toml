@@ -1,0 +1,70 @@
+# Полосы The Post (процесс pets-dev). Glob fnmatch (* включает /), первое совпадение сверху вниз.
+# Полоса = единица работы одного агента. Правка этого файла — класс B.
+
+[common]
+# Разрешено в любом PR: свои карточки, ручные проверки, решения.
+paths = ["docs/tasks/*", "docs/manual-tests/*", "docs/decisions/*"]
+
+[lane.contracts]
+# Класс B: межкрейтовые контракты.
+paths = ["crates/tp-contracts/*", "docs/CONTRACTS.md"]
+
+[lane.testkit]
+paths = ["crates/tp-testkit/*"]
+
+[lane.sys]
+paths = ["crates/tp-sys/*"]
+
+[lane.platform]
+paths = ["crates/tp-platform/*"]
+
+[lane.meta]
+paths = ["crates/tp-meta/*"]
+
+[lane.blob]
+paths = ["crates/tp-blob/*"]
+
+[lane.mailstore]
+paths = ["crates/tp-mailstore/*"]
+
+[lane.cluster]
+paths = ["crates/tp-cluster/*"]
+
+[lane.auth]
+paths = ["crates/tp-auth/*"]
+
+[lane.smtp]
+paths = ["crates/tp-smtp/*"]
+
+[lane.sieve]
+paths = ["crates/tp-sieve/*"]
+
+[lane.imap]
+paths = ["crates/tp-imap/*"]
+
+[lane.jmap]
+paths = ["crates/tp-jmap/*"]
+
+[lane.dav]
+paths = ["crates/tp-dav/*"]
+
+[lane.search]
+paths = ["crates/tp-search/*"]
+
+[lane.admin]
+paths = ["crates/tp-admin/*"]
+
+[lane.app]
+paths = ["crates/thepost/*"]
+
+[lane.deploy]
+paths = ["deploy/*"]
+
+[lane.docs]
+paths = ["docs/*", "*.md"]
+
+[lane.deps]
+paths = ["Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml"]
+
+[lane.ci]
+paths = [".github/*", ".config/*", "scripts/*", "lanes.toml", ".gitignore", "LICENSE-*"]

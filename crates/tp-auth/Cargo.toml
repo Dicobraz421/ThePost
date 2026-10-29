@@ -1,0 +1,30 @@
+[package]
+name = "tp-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+gssapi = ["dep:libgssapi"]
+
+[dependencies]
+libgssapi = { workspace = true, optional = true }
+tp-contracts.workspace = true
+argon2.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+jsonwebtoken.workspace = true
+ldap3.workspace = true
+moka.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tp-testkit.workspace = true

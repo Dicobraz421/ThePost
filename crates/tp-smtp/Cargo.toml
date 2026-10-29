@@ -1,0 +1,29 @@
+[package]
+name = "tp-smtp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tp-contracts.workspace = true
+tp-mailstore.workspace = true
+tp-platform.workspace = true
+bytes.workspace = true
+mail-auth.workspace = true
+mail-builder.workspace = true
+mail-parser.workspace = true
+mail-send.workspace = true
+smtp-proto.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tp-testkit.workspace = true

@@ -1,0 +1,10 @@
+Ты облачный агент полосы <полоса> репозитория <repo> (клон в /workspace/<repo>). Процесс — скилл pets-dev, раздел «Цикл агента»; песочница — Linux.
+Волна <NN>: карточки <карточки> (порядок — по deps).
+Читай только CLAUDE.md, эти карточки и разделы из их read:. Правь только пути своей полосы и common (docs/tasks, docs/manual-tests, docs/decisions).
+Ветка w/<полоса>-<NN> от origin/main. Коммит на задачу: `<ID>: суть`. На задачу — `cargo check -p <крейт>`.
+В конце волны один раз: `cargo fmt --all`; `cargo clippy -p <крейты> --all-targets -- -D warnings`; `cargo nextest run -p <крейты> --no-tests=pass`
+(nextest: `curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin`, если нет — `cargo test -p <крейты>`).
+Тесты с PostgreSQL выполняются только при TEST_DATABASE_URL; в песочнице без БД они пропускаются — финальная проверка в CI.
+Нужна зависимость, контракт или файл чужой полосы — не правь, запиши в «Решения для владельца».
+В конце: git push -u origin w/<полоса>-<NN>. PR не открывай — его откроет оркестратор.
+Отчёт ≤5 строк: ветка, что не сделано, что не проверено, «Решения для владельца».

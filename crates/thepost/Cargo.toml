@@ -1,0 +1,34 @@
+[package]
+name = "thepost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tp-contracts.workspace = true
+tp-platform.workspace = true
+tp-meta.workspace = true
+tp-blob.workspace = true
+tp-mailstore.workspace = true
+tp-cluster.workspace = true
+tp-auth.workspace = true
+tp-smtp.workspace = true
+tp-sieve.workspace = true
+tp-imap.workspace = true
+tp-jmap.workspace = true
+tp-dav.workspace = true
+tp-search.workspace = true
+tp-admin.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tp-testkit.workspace = true

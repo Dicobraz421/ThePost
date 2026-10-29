@@ -1,0 +1,147 @@
+# CI The Post (процесс pets-dev). PR и merge queue ≤7 мин; docs-PR без сборки.
+# Required check в защите main — один: `gate`. Release — только main, бета (тег beta-*) и ручной запуск.
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+    tags: ['beta-*']
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.d.outputs.rust }}
+      deps: ${{ steps.d.outputs.deps }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: d
+        name: Что изменилось
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ -z "$BASE" ]; then echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"; exit 0; fi
+          git diff --name-only "$BASE" HEAD > changed.txt
+          cat changed.txt
+          if [ "$EVENT" = pull_request ]; then
+            python3 .github/lane_check.py lanes.toml changed.txt "$HEAD_REF"
+          fi
+          if grep -qvE '^(docs/|[^/]*\.md$|.*/README\.md$)' changed.txt; then
+            echo rust=true >> "$GITHUB_OUTPUT"
+          else
+            echo rust=false >> "$GITHUB_OUTPUT"
+          fi
+          if grep -qE '(^|/)Cargo\.(toml|lock)$|^deny\.toml$' changed.txt; then
+            echo deps=true >> "$GITHUB_OUTPUT"
+          else
+            echo deps=false >> "$GITHUB_OUTPUT"
+          fi
+
+  fmt:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all --check
+
+  clippy:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --locked --profile ci --no-tests=pass
+      - run: cargo test --doc --workspace --locked
+
+  deny:
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check licenses bans sources
+
+  # Только main, бета и ручной запуск: release-сборка и артефакт.
+  release:
+    needs: [changes, test]
+    if: >-
+      always() && needs.test.result != 'failure' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --locked -p thepost
+      - run: target/release/thepost --version || target/release/thepost
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thepost-linux-x86_64
+          path: target/release/thepost
+
+  # Единственный required check: зелёный, если всё нужное прошло или было пропущено.
+  gate:
+    needs: [changes, fmt, clippy, test, deny]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          r='${{ join(needs.*.result, ' ') }}'
+          echo "$r"
+          case " $r " in *" failure "*|*" cancelled "*) exit 1;; esac
