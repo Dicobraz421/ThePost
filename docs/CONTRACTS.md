@@ -5,11 +5,12 @@
 Асинхронные трейты, используемые как `dyn`, — через `async-trait`; все трейты `Send + Sync + 'static`.
 
 ## Ids
-- `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` — организация по умолчанию.
+- `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` = `00000000-0000-0000-0000-000000000001` — организация по умолчанию.
 - `Uid(u32)` — IMAP UID в ящике, монотонный; `UidValidity(u32)`.
 - `ModSeq(u64)` — монотонный на ящик (IMAP CONDSTORE, состояние JMAP).
 - `BlobHash([u8; 32])` — SHA-256, `Display` — hex. `Gen(u32)` — поколение объекта.
-- `BlobKey { tenant, hash, gen }` → путь объекта `"{tenant}/{hash[0..2]}/{hash}/{gen}"`.
+- `BlobKey { tenant, hash, generation }` → путь объекта `"{tenant}/{hash[0..2]}/{hash}/{gen}"`; `BlobKey::parse_path`.
+  Поле и параметры называются `generation`: `gen` — зарезервированное слово Rust 2024.
 
 ## Errors
 `enum Error { NotFound, Conflict, Invalid(String), Forbidden, QuotaExceeded, Unavailable { retry_after: Option<Duration> }, Internal(String) }`;
@@ -25,32 +26,34 @@ SRS 3.2. Объекты неизменяемы, запись идемпотен�
 - `put(&BlobKey, Bytes) -> Result<()>`; `put_stream(&BlobKey, ByteStream, size_hint) -> Result<()>`
 - `get(&BlobKey, Option<Range<u64>>) -> Result<ByteStream>`; `head(&BlobKey) -> Result<Option<u64>>`
 - `delete(&BlobKey) -> Result<()>` (отсутствие — не ошибка)
-- `list(prefix: &str, older_than: OffsetDateTime) -> ByteKeyStream` — для поиска «сирот» и миграции.
-- `put_raw/get_raw(path)` — произвольные пути для сегментов индексов (`idx/{tenant}/{account}/...`).
+- `list(prefix: &str, older_than: OffsetDateTime) -> ObjectStream` (`ObjectEntry { path, size, modified }`, `key()`) — для поиска «сирот» и миграции.
+- `put_raw/get_raw/delete_raw(path)` — произвольные пути для сегментов индексов (`idx/{tenant}/{account}/...`).
 
 ## BlobIndex
 SRS 3.4. Учёт объектов в метаданных. Реализация — `tp-meta`; in-memory — `tp-testkit`.
-- `acquire(tenant, hash, refs: u32) -> Result<Acquire>`; `Acquire::Existing { gen }` — ссылки добавлены,
-  загрузка не нужна; `Acquire::Absent { gen }` — загрузить по `gen` и вызвать `commit_new`.
-- `commit_new(tenant, hash, gen, size, refs) -> Result<Commit>`; `Commit::Done` или
-  `Commit::Bumped { gen }` — запись была `deleting`: загрузить по новому `gen` и повторить `commit_new`.
-- `release(tenant, hash, gen, refs) -> Result<()>` — при обнулении фиксирует `zero_since`.
-- `gc_candidates(older_than, limit) -> Result<Vec<BlobKey>>`; `mark_deleting(&BlobKey) -> Result<bool>`;
+- `acquire(tenant, hash, refs: u32) -> Result<Acquire>`; `Acquire::Existing { generation }` — ссылки добавлены,
+  загрузка не нужна; `Acquire::Absent { generation }` — загрузить по нему и вызвать `commit_new`.
+- `commit_new(tenant, hash, generation, size, refs) -> Result<Commit>`; `Commit::Done { generation }` (письмо ссылается
+  на это поколение) или `Commit::Bumped { generation }` — запись была `deleting`: загрузить по новому `gen` и повторить `commit_new`.
+- `release(tenant, hash, generation, refs) -> Result<()>` — при обнулении фиксирует `zero_since`.
+- `gc_candidates(older_than, limit) -> Result<Vec<BlobKey>>`; `mark_deleting(&BlobKey, older_than) -> Result<bool>` (перепроверяет окно W);
   `finalize_delete(&BlobKey) -> Result<bool>` — удаляет запись, только если `gen` не изменился.
 - `exists(&BlobKey) -> Result<bool>` — для поиска «сирот».
 
 ## Metadata
-SRS 3.1, 3.6. Все операции ящика принимают `AccountId`; без связей между ящиками.
+SRS 3.1, 3.6. Все операции ящика принимают `AccountScope { tenant, account }`; без связей между ящиками.
+`ModSeq` выдаётся из одного счётчика учётной записи: монотонен в папке (CONDSTORE) и в учётной записи (состояние JMAP).
 - `AccountStore`: `get`, `by_login`, `upsert` (из LDAP), `quota`.
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
-- `MessageStore`: `insert(account, mailbox, NewMessage) -> (MessageId, Uid, ModSeq)`; `get`, `list(range|uids)`,
-  `set_flags(..., FlagOp) -> ModSeq`, `copy`, `move_to`, `to_trash`, `restore`, `expunge_final`.
+- `MessageStore`: `insert(scope, mailbox, NewMessage) -> Inserted { id, uid, modseq }`; `get`, `list(mailbox, MessageQuery, limit)`,
+  `set_flags(ids, FlagOp, unchanged_since) -> FlagsUpdate`, `copy`, `move_to`, `to_trash`, `restore`, `expunge_final`.
 - `NewMessage`: `skeleton: BlobKey`, `parts: Vec<PartRef>`, `size`, `received_at`, `flags`, `meta: MessageMeta`
   (envelope, bodystructure, preview, thread key — вычисляются при приёме).
 
 ## ChangeLog
-Журнал изменений для IMAP QRESYNC и JMAP `/changes`: `changes(account, since: ModSeq|State, limit)
--> Changes { created, updated, destroyed, new_state }`. Пишется в той же транзакции, что изменение.
+Журнал изменений для IMAP QRESYNC и JMAP `/changes`: `message_changes(scope, mailbox?, since: ModSeq, limit)
+-> Changes<MessageChange>`, `mailbox_changes(scope, since, limit) -> Changes<MailboxId>`;
+`Changes { created, updated, destroyed, new_state: ModSeq, has_more }`; устаревший `since` — `Conflict`. Пишется в той же транзакции, что изменение.
 
 ## MailStore
 Высокоуровневый API, крейт `tp-mailstore` (полоса mailstore). Протоколы (smtp, imap, jmap, admin) работают через него.
@@ -62,20 +65,22 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountId`;
 - `set_flags`, `copy`, `move_to`, `delete_to_trash`, `restore` — публикуют событие в `EventBus`.
 
 ## EventBus
-SRS 2.1. `publish(Event)`, `subscribe(account) -> EventStream`. `Event { tenant, account, kind }`,
+SRS 2.1. `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`. `Event { tenant, account: Option, kind }`,
 `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded`.
 Реализации: в процессе (`tp-cluster`, SMB), Valkey (`tp-cluster`, Enterprise). Доставка — at-most-once;
 клиент после переподключения сверяется по `ModSeq`.
 
 ## Lease
-`LeaseStore`: `try_acquire(name, holder, ttl) -> Option<Lease>`, `renew`, `release`. Лидер maintenance,
+`LeaseStore`: `try_acquire(name, holder, ttl) -> Option<Lease>`, `renew(&Lease, ttl) -> Option<Lease>`, `release`.
+`Lease { name, holder, fencing, expires_at }`; `fencing` растёт при каждом новом захвате. Лидер maintenance,
 индексатор ящика, записи очереди. Реализация — PostgreSQL.
 
 ## Events
-SRS 2.5. Журнал событий ядра (outbox): `EventLog::append(tx, CoreEvent)` — в той же транзакции, что изменение.
+SRS 2.5. Журнал событий ядра (outbox): событие пишет реализация хранилища метаданных (`tp-meta`) в той же транзакции, что изменение;
+метода записи в `EventLog` нет.
 `CoreEvent { tenant, account, mailbox?, kind, at }`, `kind: Delivered | Submitted | FlagsChanged | Moved | Trashed | Purged | MailboxCreated | MailboxDeleted`.
-Раздел = hash(account) mod N; подписчик (`EventSink`: индексатор, модули) читает `read(subscriber, partition, after, limit)`,
-фиксирует `commit(subscriber, partition, pos)`; раздел подписчика — под лизой. Доставка не менее одного раза, порядок — в пределах ящика.
+Раздел = `partition_of(account, N)` (FNV-1a, зафиксирован тестом); подписчик (`EventSink`: индексатор, модули) читает
+`read(partition, after, limit)`, позиция — `position(subscriber, partition)`, фиксирует `commit(subscriber, partition, pos)`; раздел подписчика — под лизой. Доставка не менее одного раза, порядок — в пределах ящика.
 
 ## Search
 SRS 4.6. `SearchIndex`: `query(account, scope: Vec<MailboxId>, q: TextQuery, sort, limit) -> Vec<MessageId>`,
@@ -93,8 +98,10 @@ SASL-механизмы (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, GSSAPI) — `tp-aut
 
 ## Roles
 SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`; пресеты (`all`, `edge`, `transport`, `access`, `backend`, `mailbox`) раскрываются в набор ролей при загрузке конфигурации; режим edge — параметр smtp-in (SRS 2.6).
-`RoleService`: `name()`, `run(ctx: RoleCtx) -> Result<()>` до сигнала отмены; `RoleCtx { config: watch::Receiver<Arc<…>>,
-shutdown: CancellationToken, drain_deadline, ready: ReadyHandle, metrics }`.
+Раскрытие — `RoleSet::expand(&[RoleEntry]) -> RoleSet { roles, edge }`; `RoleEntry` = пресет | роль (строка config.yaml).
+`RoleService`: `name()`, `run(ctx: RoleCtx) -> Result<()>` до сигнала отмены; `RoleCtx { config: Arc<dyn ConfigWatch>,
+shutdown: Shutdown, drain_deadline, ready: ReadyHandle }`. `ConfigWatch` — `current() -> Arc<dyn Any>`, `changed()`; типизированно —
+`RoleCtx::config::<T>()`. `Shutdown` — на `futures` (tokio в `tp-contracts` не подключён); метрики — позже.
 
 ## Config
 Каждый крейт владеет своей секцией `XxxConfig: Deserialize + Default + Clone` и документирует её поля.
@@ -118,3 +125,6 @@ SRS 2.5, 1.3. Модуль — cargo feature + `modules.<имя>.enabled`. `Modu
 ## CHANGELOG
 - 2026-10-29 — первая редакция (по SRS ред. 3).
 - 2026-10-30 — ред. 4: Tenant, Events (журнал событий вместо Outbox), SearchIndex, Directory, Extension points; Legal Hold — модуль.
+- 2026-10-30 — CTR-01…04 (волна contracts-01): `generation` вместо `gen`, `Commit::Done { generation }`, `mark_deleting(.., older_than)`,
+  `ObjectEntry`, `AccountScope`, `ModSeq` учётной записи, `Changes<T>`, системная подписка шины, fencing лиз, `EventLog` без `append`,
+  `RoleSet`/`RoleEntry`, `ConfigWatch`/`Shutdown` вместо tokio-типов.
