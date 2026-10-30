@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use nix::libc;
 use schemars::JsonSchema;
+use serde::Deserialize;
 use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{OnceCell, Semaphore};
@@ -18,8 +19,9 @@ use tokio::time::timeout;
 use super::protocol;
 use super::worker::{ENV_CPU, ENV_MAX_INPUT, ENV_MEMORY};
 
-/// Конфигурация пула изолированных подпроцессов (SRS 2.7).
-#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+/// Конфигурация пула изолированных подпроцессов (SRS 2.7); пропущенные поля — значения по умолчанию.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct SandboxConfig {
     /// Максимум одновременно работающих подпроцессов; создаются по первому заданию.
     pub workers: usize,
@@ -148,8 +150,16 @@ impl SandboxPool {
         }
     }
 
-    /// Выполняет задание в подпроцессе.
+    /// Выполняет задание в подпроцессе. Сбой подпроцесса записывается в журнал и возвращается ошибкой.
     pub async fn run(&self, input: &[u8]) -> Result<Vec<u8>, JobError> {
+        let res = self.run_job(input).await;
+        if let Err(e) = &res {
+            log_failure(e);
+        }
+        res
+    }
+
+    async fn run_job(&self, input: &[u8]) -> Result<Vec<u8>, JobError> {
         if input.len() as u64 > self.cfg.max_input_bytes {
             return Err(JobError::InputTooLarge(input.len()));
         }
@@ -267,6 +277,18 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(io::Error::other)?
+}
+
+/// Журнал сбоев подпроцесса. Ошибки самого задания (размер входа, ошибка обработчика) не пишутся:
+/// подпроцесс исправен, а текст ошибки обработчика может содержать фрагменты разбираемых данных.
+fn log_failure(err: &JobError) {
+    match err {
+        JobError::InputTooLarge(_) | JobError::Failed(_) => {}
+        JobError::Timeout | JobError::CpuLimit | JobError::Crashed(_) | JobError::Protocol(_) => {
+            tracing::warn!(error = %err, "sandbox worker failed; replaced on next job");
+        }
+        JobError::Spawn(_) => tracing::error!(error = %err, "sandbox worker not started"),
+    }
 }
 
 fn classify(status: Option<ExitStatus>) -> JobError {
