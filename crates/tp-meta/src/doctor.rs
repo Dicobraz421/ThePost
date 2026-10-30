@@ -1,7 +1,9 @@
 //! Проверки СУБД для `thepost doctor` (SRS 3.1): структурированный отчёт, вывод — забота приложения.
+//! Проверка `tls` сообщает режим канала до СУБД (CTR-12, META-14): `sslmode` пула и TLS соединения на сервере.
 
 use std::time::Duration;
 
+use sqlx::postgres::PgSslMode;
 use sqlx::{FromRow, PgPool};
 use tp_contracts::Result;
 
@@ -51,7 +53,7 @@ pub enum Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     /// Идентификатор: `server_version`, `sync_replication`, `max_connections`, `timezone`,
-    /// `log_timezone`, `rls`.
+    /// `log_timezone`, `rls`, `tls`.
     pub id: &'static str,
     /// Итог.
     pub status: Status,
@@ -105,6 +107,9 @@ struct Settings {
     log_timezone: String,
     rolsuper: bool,
     rolbypassrls: bool,
+    ssl: Option<bool>,
+    ssl_version: Option<String>,
+    ssl_cipher: Option<String>,
 }
 
 /// Число кандидатов в синхронные реплики из `synchronous_standby_names`
@@ -147,18 +152,37 @@ pub async fn check(pool: &PgPool, cfg: &DoctorConfig) -> Result<Report> {
                 current_setting('synchronous_commit') AS sync_commit,
                 current_setting('TimeZone') AS timezone,
                 current_setting('log_timezone') AS log_timezone,
-                r.rolsuper, r.rolbypassrls
-         FROM pg_roles r WHERE r.rolname = current_user",
+                r.rolsuper, r.rolbypassrls,
+                ss.ssl, ss.version AS ssl_version, ss.cipher AS ssl_cipher
+         FROM pg_roles r LEFT JOIN pg_stat_ssl ss ON ss.pid = pg_backend_pid()
+         WHERE r.rolname = current_user",
     )
     .fetch_one(pool);
     let s = tokio::time::timeout(cfg.timeout, query)
         .await
         .map_err(|_| tp_contracts::Error::UNAVAILABLE)?
         .map_err(db_err)?;
-    Ok(evaluate(&s, cfg, pool.options().get_max_connections()))
+    Ok(evaluate(
+        &s,
+        cfg,
+        pool.options().get_max_connections(),
+        pool.connect_options().get_ssl_mode(),
+    ))
 }
 
-fn evaluate(s: &Settings, cfg: &DoctorConfig, pool_max: u32) -> Report {
+/// Значение `sslmode` в записи libpq.
+fn sslmode_name(mode: PgSslMode) -> &'static str {
+    match mode {
+        PgSslMode::Disable => "disable",
+        PgSslMode::Allow => "allow",
+        PgSslMode::Prefer => "prefer",
+        PgSslMode::Require => "require",
+        PgSslMode::VerifyCa => "verify-ca",
+        PgSslMode::VerifyFull => "verify-full",
+    }
+}
+
+fn evaluate(s: &Settings, cfg: &DoctorConfig, pool_max: u32, ssl_mode: PgSslMode) -> Report {
     let mut r = Report::default();
 
     let version_ok = u32::try_from(s.version_num).is_ok_and(|v| v >= cfg.min_server_version);
@@ -260,6 +284,30 @@ fn evaluate(s: &Settings, cfg: &DoctorConfig, pool_max: u32) -> Report {
             "роль приложения обходит RLS: нужна роль без SUPERUSER и BYPASSRLS"
         },
     );
+
+    // Сервер видит своё соединение: через PgBouncer — участок PgBouncer → PostgreSQL.
+    let server_tls = s.ssl == Some(true);
+    let mut value = format!("sslmode={}", sslmode_name(ssl_mode));
+    if server_tls {
+        for part in [&s.ssl_version, &s.ssl_cipher].into_iter().flatten() {
+            value.push_str(", ");
+            value.push_str(part);
+        }
+    } else {
+        value.push_str(", соединение без TLS");
+    }
+    let (status, message) = match (ssl_mode, server_tls) {
+        (PgSslMode::VerifyFull, true) => (Status::Ok, "канал до СУБД — TLS с проверкой сервера"),
+        (PgSslMode::VerifyFull, false) => (
+            Status::Fail,
+            "сервер видит соединение без TLS: участок PgBouncer → PostgreSQL открыт",
+        ),
+        _ => (
+            Status::Warn,
+            "канал до СУБД без проверки сервера: допустимо только в профиле dev (tls.allow_plaintext)",
+        ),
+    };
+    r.push("tls", status, value, message);
     r
 }
 
@@ -279,6 +327,9 @@ mod tests {
             log_timezone: "Etc/UTC".into(),
             rolsuper: false,
             rolbypassrls: false,
+            ssl: Some(true),
+            ssl_version: Some("TLSv1.3".into()),
+            ssl_cipher: Some("TLS_AES_256_GCM_SHA384".into()),
         }
     }
 
@@ -303,9 +354,18 @@ mod tests {
 
     #[test]
     fn healthy_server() {
-        let r = evaluate(&settings(), &DoctorConfig::default(), 32);
+        let r = evaluate(
+            &settings(),
+            &DoctorConfig::default(),
+            32,
+            PgSslMode::VerifyFull,
+        );
         assert_eq!(r.status(), Status::Ok);
-        assert_eq!(r.checks.len(), 6);
+        assert_eq!(r.checks.len(), 7);
+        assert_eq!(
+            r.get("tls").map(|c| c.value.as_str()),
+            Some("sslmode=verify-full, TLSv1.3, TLS_AES_256_GCM_SHA384")
+        );
         assert_eq!(
             r.get("sync_replication").map(|c| c.status),
             Some(Status::Skipped)
@@ -320,13 +380,16 @@ mod tests {
         };
         let mut s = settings();
         s.sync_names = "ANY 1 (a, b)".into();
-        assert_eq!(evaluate(&s, &cfg, 32).status(), Status::Ok);
+        assert_eq!(
+            evaluate(&s, &cfg, 32, PgSslMode::VerifyFull).status(),
+            Status::Ok
+        );
 
         s.sync_names = "a".into();
         s.version_num = 150_008;
         s.timezone = "Europe/Moscow".into();
         s.rolbypassrls = true;
-        let r = evaluate(&s, &cfg, 500);
+        let r = evaluate(&s, &cfg, 500, PgSslMode::VerifyFull);
         for id in ["server_version", "sync_replication", "timezone", "rls"] {
             assert_eq!(r.get(id).map(|c| c.status), Some(Status::Fail), "{id}");
         }
@@ -338,10 +401,32 @@ mod tests {
 
         s.sync_names = "ANY 1 (a, b)".into();
         s.sync_commit = "local".into();
-        let r = evaluate(&s, &cfg, 32);
+        let r = evaluate(&s, &cfg, 32, PgSslMode::VerifyFull);
         assert_eq!(
             r.get("sync_replication").map(|c| c.status),
             Some(Status::Fail)
         );
+    }
+
+    #[test]
+    fn tls_mode() {
+        let cfg = DoctorConfig::default();
+        let tls = |s: &Settings, mode| evaluate(s, &cfg, 32, mode).get("tls").cloned();
+        let mut s = settings();
+        s.ssl = Some(false);
+        s.ssl_version = None;
+        s.ssl_cipher = None;
+        let behind = tls(&s, PgSslMode::VerifyFull).expect("tls");
+        assert_eq!(behind.status, Status::Fail);
+        assert_eq!(behind.value, "sslmode=verify-full, соединение без TLS");
+
+        let dev = tls(&s, PgSslMode::Disable).expect("tls");
+        assert_eq!(dev.status, Status::Warn);
+        assert_eq!(dev.value, "sslmode=disable, соединение без TLS");
+
+        // Шифрование без проверки сервера (prefer) — тоже только dev.
+        let prefer = tls(&settings(), PgSslMode::Prefer).expect("tls");
+        assert_eq!(prefer.status, Status::Warn);
+        assert!(prefer.value.starts_with("sslmode=prefer, TLSv1.3"));
     }
 }

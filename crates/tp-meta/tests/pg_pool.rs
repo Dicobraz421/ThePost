@@ -1,4 +1,5 @@
-//! Пул из конфигурации, транзакции организации, проверки doctor (META-07).
+//! Пул из конфигурации, транзакции организации, проверки doctor (META-07); TLS канала (META-14).
+//! Интеграционные тесты — в профиле dev (`common::dev_pool_config`).
 
 mod common;
 
@@ -9,10 +10,9 @@ use tp_meta::schema::db_err;
 
 fn cfg(url: String, pgbouncer: bool) -> PoolConfig {
     PoolConfig {
-        url,
         pgbouncer,
         max_connections: 4,
-        ..PoolConfig::default()
+        ..common::dev_pool_config(&url)
     }
 }
 
@@ -23,7 +23,10 @@ fn config_validation_hides_password() {
         empty.connect_options(&empty.url, false),
         Err(Error::Invalid(_))
     ));
-    let bad = cfg("postgres://u:secret@h:port/db".into(), false);
+    let bad = cfg(
+        "postgres://u:secret@h:port/db?sslmode=disable".into(),
+        false,
+    );
     match bad.connect_options(&bad.url, false) {
         Err(Error::Invalid(m)) => assert!(!m.contains("secret")),
         other => panic!("{other:?}"),
@@ -43,7 +46,8 @@ async fn pool_modes_and_with_tenant() {
         let pool = pool::connect(&cfg(url.clone(), pgbouncer))
             .await
             .expect("connect");
-        let lazy = pool::connect_lazy(&cfg(url.clone(), pgbouncer), &url).expect("lazy");
+        let lazy =
+            pool::connect_lazy(&cfg(url.clone(), pgbouncer), &common::dev_url(&url)).expect("lazy");
         let direct = pool::connect_direct(&cfg(url.clone(), pgbouncer))
             .await
             .expect("direct");
@@ -118,7 +122,8 @@ async fn doctor_structured_report() {
             "max_connections",
             "timezone",
             "log_timezone",
-            "rls"
+            "rls",
+            "tls"
         ]
     );
     assert_eq!(
@@ -148,4 +153,31 @@ async fn doctor_structured_report() {
         Status::Fail
     );
     assert_eq!(report.status(), Status::Fail);
+}
+
+#[tokio::test]
+async fn sslmode_disable_only_in_dev() {
+    let Some(url) = common::pg_url() else {
+        return;
+    };
+    let dev = cfg(url, false);
+    // Тот же адрес вне dev — ошибка конфигурации до подключения.
+    let prod = PoolConfig {
+        profile: tp_contracts::tls::Profile::Prod,
+        ..dev.clone()
+    };
+    assert!(matches!(pool::connect(&prod).await, Err(Error::Invalid(_))));
+    assert!(matches!(
+        pool::connect_lazy(&prod, &dev.url),
+        Err(Error::Invalid(_))
+    ));
+
+    // doctor сообщает режим канала.
+    let pool = pool::connect(&dev).await.expect("connect");
+    let report = doctor::check(&pool, &DoctorConfig::default())
+        .await
+        .expect("doctor");
+    let tls = report.get("tls").expect("tls");
+    assert!(tls.value.starts_with("sslmode=disable"), "{tls:?}");
+    assert_eq!(tls.status, Status::Warn);
 }
