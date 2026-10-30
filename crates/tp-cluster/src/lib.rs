@@ -2,9 +2,11 @@
 
 pub mod hashing;
 pub mod local_bus;
+pub mod valkey_bus;
 
 #[cfg(test)]
 mod conformance;
 
 pub use hashing::Rendezvous;
 pub use local_bus::{LocalBus, LocalBusConfig};
+pub use valkey_bus::{ValkeyBus, ValkeyBusConfig, ValkeyBusMetrics};
