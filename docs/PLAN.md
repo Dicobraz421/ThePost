@@ -14,10 +14,10 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-01 | CTR-01, CTR-02, CTR-03, CTR-04 | B | — | 1 |
-| sys-01 | SYS-01, SYS-02, SYS-03, SYS-04 | A/B | — | 2 |
-| deploy-01 | DEP-01, DEP-02, DEP-03 | A | — | 3 |
-| ci-01 | CI-01 | B | — | 4 |
+| ✅ contracts-01 | CTR-01, CTR-02, CTR-03, CTR-04 | B | — | 1 |
+| ✅ sys-01 | SYS-01, SYS-02, SYS-03, SYS-04 | A/B | — | 2 |
+| ✅ deploy-01 | DEP-01, DEP-02, DEP-03 | A | — | 3 |
+| ✅ ci-01 | CI-01 | B | — | 4 |
 | contracts-02 | CTR-05, CTR-10 | B | contracts-01 | 1 |
 | testkit-01 | KIT-01, KIT-02, KIT-03, KIT-04 | A | contracts-01 | 1 |
 | platform-01 | PLT-01, PLT-02, PLT-03, PLT-04 | A | contracts-01, SYS-01 | 2 |
