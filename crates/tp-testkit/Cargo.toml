@@ -17,6 +17,7 @@ bytes.workspace = true
 futures.workspace = true
 tokio.workspace = true
 mail-parser.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
