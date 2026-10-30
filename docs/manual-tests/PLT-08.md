@@ -30,13 +30,13 @@ HTTP включает `acme::challenge_router`) — до волны прилож
 ## Повторный запуск и продление
 1. Перезапустить `thepost serve` → нового выпуска нет (в журнале нет `acme certificate issued`), учётная запись та же
    (`account.yaml` не изменился).
-2. Временно задать `acme.renew_before_days: 365`, перечитать конфигурацию (`kill -HUP <pid>`) и перезапустить
+2. Временно задать `acme.renew_before: 365d`, перечитать конфигурацию (`kill -HUP <pid>`) и перезапустить
    (период проверки — 12 ч) → новый выпуск, серийный номер в `openssl s_client` сменился, соединения IMAP не рвались.
 3. Добавить второе имя в `acme.domains` (с записью DNS) и перезапустить → перевыпуск с двумя SAN.
-4. Вернуть `renew_before_days: 30`.
+4. Вернуть `renew_before: 30d`.
 
 ## Ошибки
 1. Закрыть порт 80 (или указать имя без DNS-записи) и перезапустить → в журнале `acme request failed` и
    `acme renewal failed`; прежние `fullchain.pem`/`privkey.pem` не изменились, TLS продолжает работать; повтор через
-   `retry_interval_secs` (по умолчанию 1 ч).
+   `retry_interval` (по умолчанию `1h`).
 2. `curl -i http://mail.example.org/.well-known/acme-challenge/unknown` → `404`.

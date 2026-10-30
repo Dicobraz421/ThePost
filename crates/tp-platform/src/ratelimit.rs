@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tp_contracts::config::duration;
 
 use crate::listen::Cidr;
 
@@ -31,8 +32,10 @@ pub struct RateLimitConfig {
     pub ipv4_prefix: u8,
     /// Длина префикса подсети IPv6.
     pub ipv6_prefix: u8,
-    /// Блокировка источника (адреса или подсети) при исчерпании лимита, с; 0 — без блокировки, только отказ.
-    pub block_secs: u64,
+    /// Блокировка источника (адреса или подсети) при исчерпании лимита (`15m`); `0s` — без блокировки, только отказ.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub block_duration: Duration,
     /// Предел числа отслеживаемых ключей; при превышении удаляются восполненные корзины и истёкшие блокировки.
     pub max_entries: usize,
 }
@@ -58,7 +61,7 @@ impl Default for RateLimitConfig {
             },
             ipv4_prefix: 24,
             ipv6_prefix: 64,
-            block_secs: 900,
+            block_duration: Duration::from_secs(900),
             max_entries: 100_000,
         }
     }
@@ -233,7 +236,7 @@ impl RateLimiter {
         }
     }
 
-    /// Блокирует адрес `ip` на `block_secs` (например, после серии неудачных аутентификаций).
+    /// Блокирует адрес `ip` на `block_duration` (например, после серии неудачных аутентификаций).
     pub fn block_ip_at(&self, ip: IpAddr, now: Instant) {
         let cfg = self.config();
         let mut state = self.lock();
@@ -277,13 +280,13 @@ impl RateLimiter {
         retry_after: Duration,
         now: Instant,
     ) -> Verdict {
-        if cfg.block_secs == 0 {
+        if cfg.block_duration.is_zero() {
             return Verdict::Limited { retry_after };
         }
-        tracing::warn!(source = %describe(&key), block_secs = cfg.block_secs, "rate limit exceeded, source blocked");
+        tracing::warn!(source = %describe(&key), block = %duration::format(cfg.block_duration), "rate limit exceeded, source blocked");
         block(state, cfg, key, now);
         Verdict::Blocked {
-            remaining: Duration::from_secs(cfg.block_secs),
+            remaining: cfg.block_duration,
         }
     }
 
@@ -307,7 +310,7 @@ fn blocked(state: &HashMap<Key, Entry>, key: &Key, now: Instant) -> Option<Durat
 }
 
 fn block(state: &mut HashMap<Key, Entry>, cfg: &RateLimitConfig, key: Key, now: Instant) {
-    let until = now + Duration::from_secs(cfg.block_secs);
+    let until = now + cfg.block_duration;
     reserve(state, cfg, now);
     let entry = state.entry(key).or_default();
     entry.blocked_until = Some(until);
@@ -415,7 +418,7 @@ mod tests {
                 burst: 2,
                 per_minute: 6,
             },
-            block_secs: 60,
+            block_duration: Duration::from_secs(60),
             ..RateLimitConfig::default()
         }
     }
@@ -463,7 +466,7 @@ mod tests {
     #[test]
     fn bucket_refills_over_time() {
         let rl = RateLimiter::new(RateLimitConfig {
-            block_secs: 0,
+            block_duration: Duration::ZERO,
             ..cfg()
         });
         let clock = Clock(Instant::now());
@@ -477,7 +480,7 @@ mod tests {
                 retry_after: Duration::from_secs(1)
             }
         );
-        assert!(!rl.is_blocked_at(a, clock.at(0.0)), "block_secs: 0");
+        assert!(!rl.is_blocked_at(a, clock.at(0.0)), "block_duration: 0s");
         // 60 в минуту = 1 в секунду.
         assert!(rl.check_ip_at(a, clock.at(1.0)).is_allowed());
         assert!(!rl.check_ip_at(a, clock.at(1.0)).is_allowed());
@@ -606,11 +609,13 @@ mod tests {
     #[test]
     fn config_from_yaml() {
         let cfg: RateLimitConfig =
-            serde_yaml_ng::from_str("ip: { burst: 5, per_minute: 30 }\nblock_secs: 10\n")
+            serde_yaml_ng::from_str("ip: { burst: 5, per_minute: 30 }\nblock_duration: 10s\n")
                 .expect("parse");
         assert_eq!(cfg.ip.burst, 5);
-        assert_eq!(cfg.block_secs, 10);
+        assert_eq!(cfg.block_duration, Duration::from_secs(10));
         assert_eq!(cfg.ipv4_prefix, 24);
         assert!(serde_yaml_ng::from_str::<RateLimitConfig>("ip: { rate: 1 }").is_err());
+        assert!(serde_yaml_ng::from_str::<RateLimitConfig>("block_duration: 900").is_err());
+        assert!(serde_yaml_ng::from_str::<RateLimitConfig>("block_secs: 900").is_err());
     }
 }

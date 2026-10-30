@@ -1,6 +1,6 @@
 //! Встроенный клиент ACME для профиля SMB (SRS 6.2): выпуск сертификата по HTTP-01 (ответ на проверку отдаёт
 //! служебный HTTP — [`challenge_router`]), хранение цепочки и ключа на диске в файлах секции `tls`,
-//! продление за `renew_before_days` до истечения, перечитывание [`TlsCerts`] без перезапуска.
+//! продление за `renew_before` до истечения, перечитывание [`TlsCerts`] без перезапуска.
 //!
 //! Учётная запись ACME сохраняется в `state_dir/account.yaml`, список доменов последнего выпуска — в
 //! `state_dir/domains` (смена доменов вызывает перевыпуск). Срок действия читается из сертификата на диске.
@@ -26,6 +26,7 @@ use instant_acme::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tp_contracts::Error;
+use tp_contracts::config::duration;
 use tp_contracts::role::CancellationToken;
 
 use crate::tls::{TlsCerts, TlsConfig};
@@ -44,14 +45,22 @@ pub struct AcmeConfig {
     pub domains: Vec<String>,
     /// Каталог состояния: учётная запись ACME и список доменов последнего выпуска.
     pub state_dir: PathBuf,
-    /// За сколько дней до истечения продлевать сертификат.
-    pub renew_before_days: u32,
-    /// Период проверки срока действия, с.
-    pub check_interval_secs: u64,
-    /// Пауза перед повтором после неудачного выпуска, с.
-    pub retry_interval_secs: u64,
-    /// Время ожидания проверки и выпуска на стороне ACME, с.
-    pub order_timeout_secs: u64,
+    /// За сколько до истечения продлевать сертификат (`30d`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub renew_before: Duration,
+    /// Период проверки срока действия (`12h`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub check_interval: Duration,
+    /// Пауза перед повтором после неудачного выпуска (`1h`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub retry_interval: Duration,
+    /// Время ожидания проверки и выпуска на стороне ACME (`5m`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub order_timeout: Duration,
 }
 
 impl Default for AcmeConfig {
@@ -62,17 +71,11 @@ impl Default for AcmeConfig {
             contact: Vec::new(),
             domains: Vec::new(),
             state_dir: PathBuf::from("/var/lib/thepost/acme"),
-            renew_before_days: 30,
-            check_interval_secs: 12 * 3600,
-            retry_interval_secs: 3600,
-            order_timeout_secs: 300,
+            renew_before: Duration::from_secs(30 * 86_400),
+            check_interval: Duration::from_secs(12 * 3600),
+            retry_interval: Duration::from_secs(3600),
+            order_timeout: Duration::from_secs(300),
         }
-    }
-}
-
-impl AcmeConfig {
-    fn renew_before(&self) -> Duration {
-        Duration::from_secs(u64::from(self.renew_before_days) * 86_400)
     }
 }
 
@@ -199,7 +202,7 @@ impl Acme {
         self
     }
 
-    /// Выпускает сертификат, если его нет, домены изменились или до истечения меньше `renew_before_days`.
+    /// Выпускает сертификат, если его нет, домены изменились или до истечения меньше `renew_before`.
     /// `true` — сертификат выпущен.
     pub async fn renew_if_needed(&self) -> tp_contracts::Result<bool> {
         self.renew_if_needed_at(SystemTime::now()).await
@@ -236,7 +239,7 @@ impl Acme {
         if issued_for.as_deref() != Some(self.domains_text().as_str()) {
             return Ok(true);
         }
-        Ok(now + self.cfg.renew_before() >= not_after)
+        Ok(now + self.cfg.renew_before >= not_after)
     }
 
     /// Выпускает сертификат безусловно: заказ, проверки HTTP-01, финализация, запись файлов, перечитывание TLS.
@@ -244,7 +247,7 @@ impl Acme {
         Ok(self.try_issue().await?)
     }
 
-    /// Проверяет сертификат каждые `check_interval_secs` (после ошибки — через `retry_interval_secs`) до сигнала остановки.
+    /// Проверяет сертификат каждые `check_interval` (после ошибки — через `retry_interval`) до сигнала остановки.
     pub async fn run(self, shutdown: CancellationToken) {
         if !self.cfg.enabled {
             return;
@@ -255,16 +258,16 @@ impl Acme {
                     if issued {
                         tracing::info!(domains = ?self.cfg.domains, "acme certificate issued");
                     }
-                    self.cfg.check_interval_secs
+                    self.cfg.check_interval
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "acme renewal failed");
-                    self.cfg.retry_interval_secs
+                    self.cfg.retry_interval
                 }
             };
             tokio::select! {
                 () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(Duration::from_secs(wait.max(1))) => {}
+                () = tokio::time::sleep(wait.max(Duration::from_secs(1))) => {}
             }
         }
     }
@@ -305,8 +308,7 @@ impl Acme {
                 tokens.push(token);
                 challenge.set_ready().await?;
             }
-            let retry =
-                RetryPolicy::new().timeout(Duration::from_secs(self.cfg.order_timeout_secs));
+            let retry = RetryPolicy::new().timeout(self.cfg.order_timeout);
             let status = order.poll_ready(&retry).await?;
             if status != OrderStatus::Ready {
                 return Err(AcmeError::Protocol(format!("order is {status:?}")));
@@ -994,11 +996,21 @@ mod tests {
         )
         .expect("parse");
         assert!(cfg.enabled);
-        assert_eq!(cfg.renew_before_days, 30);
+        assert_eq!(cfg.renew_before, Duration::from_secs(30 * 86_400));
         assert!(
             cfg.directory_url
                 .starts_with("https://acme-v02.api.letsencrypt.org")
         );
         assert!(serde_yaml_ng::from_str::<AcmeConfig>("renew: 1").is_err());
+        let cfg: AcmeConfig = serde_yaml_ng::from_str(
+            "renew_before: 14d\ncheck_interval: 6h\nretry_interval: 10m\norder_timeout: 2m\n",
+        )
+        .expect("durations");
+        assert_eq!(cfg.renew_before, Duration::from_secs(14 * 86_400));
+        assert_eq!(cfg.check_interval, Duration::from_secs(6 * 3600));
+        assert_eq!(cfg.retry_interval, Duration::from_secs(600));
+        assert_eq!(cfg.order_timeout, Duration::from_secs(120));
+        assert!(serde_yaml_ng::from_str::<AcmeConfig>("check_interval: 3600").is_err());
+        assert!(serde_yaml_ng::from_str::<AcmeConfig>("renew_before_days: 30").is_err());
     }
 }
