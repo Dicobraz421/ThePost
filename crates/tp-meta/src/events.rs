@@ -8,8 +8,10 @@
 //! [`EventConsumer`] обрабатывает раздел подписчика под лизой `events/{subscriber}/{partition}`:
 //! позиция → пачка → [`EventSink::handle`] → продление лизы → фиксация позиции. Сбой до фиксации —
 //! пачка придёт снова (не менее одного раза); порядок внутри раздела, а значит и ящика, сохраняется.
+//! Между экземплярами разделы распределяет [`PartitionAssigner`] по живым узлам ([`crate::membership`]).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -20,15 +22,17 @@ use time::OffsetDateTime;
 use tp_contracts::config::duration;
 use tp_contracts::events::{
     CoreEvent, CoreEventKind, EventLog, EventPos, EventSink, LoggedEvent, Partition,
+    PartitionAssigner,
 };
-use tp_contracts::lease::LeaseStore;
+use tp_contracts::lease::{Lease, LeaseStore};
+use tp_contracts::membership::NodeId;
 use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
 use uuid::Uuid;
 
 use crate::PgMeta;
 use crate::schema::{begin_system, db_err, to_i64, to_u64};
 
-/// Секция конфигурации подписчиков журнала событий `meta.events` (SRS 5.5).
+/// Секция конфигурации подписчиков журнала событий и членства узлов `meta.events` (SRS 5.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct EventsConfig {
@@ -40,6 +44,18 @@ pub struct EventsConfig {
     pub lease_ttl: Duration,
     /// Событий, удаляемых одним вызовом очистки ([`PgMeta::purge_events`]).
     pub purge_batch: usize,
+    /// Срок записи узла в членстве (`Membership::heartbeat`); узел продлевает её с периодом `node_ttl / 3`.
+    /// Меньше — быстрее переход разделов упавшего узла, больше — устойчивее к паузам СУБД и сети.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub node_ttl: Duration,
+}
+
+impl EventsConfig {
+    /// Период продления записи узла: треть [`EventsConfig::node_ttl`].
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.node_ttl / 3
+    }
 }
 
 impl Default for EventsConfig {
@@ -48,6 +64,7 @@ impl Default for EventsConfig {
             batch: 256,
             lease_ttl: Duration::from_secs(30),
             purge_batch: 10_000,
+            node_ttl: Duration::from_secs(15),
         }
     }
 }
@@ -187,29 +204,47 @@ impl EventLog for PgMeta {
     }
 }
 
+/// Назначение разделов узлу: распределитель и имя этого узла.
+#[derive(Clone)]
+struct Assignment {
+    assigner: Arc<dyn PartitionAssigner>,
+    node: NodeId,
+}
+
+/// Лизы разделов, которые держит экземпляр: (подписчик, раздел) → последняя полученная лиза.
+type Held = HashMap<(String, u32), Lease>;
+
 /// Обработчик разделов журнала для подписчиков одного экземпляра (узла и процесса).
 ///
 /// Раздел подписчика обрабатывает один экземпляр — держатель лизы; лиза не освобождается между
 /// вызовами, после сбоя экземпляра раздел переходит к другому по истечении [`EventsConfig::lease_ttl`].
+///
+/// С распределителем ([`EventConsumer::with_assigner`], решение 2026-10-30, #45) экземпляр берёт лизы
+/// только назначенных его узлу разделов, а лизы разделов, снятых с узла, отдаёт после фиксации текущей
+/// пачки (в следующем [`EventConsumer::poll`]); узел вне состава отдаёт все. Без распределителя
+/// экземпляру доступны все разделы (один узел).
 #[derive(Clone)]
 pub struct EventConsumer {
     log: Arc<dyn EventLog>,
     leases: Arc<dyn LeaseStore>,
     holder: String,
     cfg: EventsConfig,
+    assignment: Option<Assignment>,
+    held: Arc<Mutex<Held>>,
 }
 
 impl std::fmt::Debug for EventConsumer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventConsumer")
             .field("holder", &self.holder)
+            .field("node", &self.assignment.as_ref().map(|a| &a.node))
             .field("cfg", &self.cfg)
             .finish_non_exhaustive()
     }
 }
 
 impl EventConsumer {
-    /// Обработчик с держателем лиз `holder` (идентификатор узла и процесса).
+    /// Обработчик с держателем лиз `holder` (идентификатор узла и процесса); доступны все разделы.
     pub fn new(
         log: Arc<dyn EventLog>,
         leases: Arc<dyn LeaseStore>,
@@ -221,7 +256,15 @@ impl EventConsumer {
             leases,
             holder: holder.into(),
             cfg,
+            assignment: None,
+            held: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Обрабатывать только разделы, назначенные узлу `node` распределителем `assigner`.
+    pub fn with_assigner(mut self, assigner: Arc<dyn PartitionAssigner>, node: NodeId) -> Self {
+        self.assignment = Some(Assignment { assigner, node });
+        self
     }
 
     /// Имя лизы раздела подписчика.
@@ -229,18 +272,55 @@ impl EventConsumer {
         format!("events/{subscriber}/{}", partition.0)
     }
 
-    /// Обрабатывает одну пачку раздела. `None` — раздел обрабатывает другой экземпляр;
-    /// иначе — число обработанных и зафиксированных событий. Ошибка подписчика — позиция не меняется.
+    /// Разделы подписчика, назначенные этому экземпляру при текущем составе, по возрастанию.
+    pub fn assigned(&self, subscriber: &str) -> Vec<Partition> {
+        let partitions = self.log.partitions();
+        match &self.assignment {
+            None => (0..partitions).map(Partition).collect(),
+            Some(a) => a.assigner.assigned(subscriber, &a.node, partitions),
+        }
+    }
+
+    /// Разделы подписчика, лизы которых держит экземпляр, по возрастанию.
+    pub fn held(&self, subscriber: &str) -> Vec<Partition> {
+        let mut out: Vec<_> = self
+            .held_map()
+            .keys()
+            .filter(|(s, _)| s == subscriber)
+            .map(|(_, p)| Partition(*p))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Обрабатывает одну пачку раздела. `None` — раздел обрабатывает другой экземпляр или он не назначен
+    /// этому (лиза неназначенного раздела отдаётся); иначе — число обработанных и зафиксированных событий.
+    /// Ошибка подписчика — позиция не меняется.
     pub async fn poll_partition(
         &self,
         sink: &dyn EventSink,
         partition: Partition,
     ) -> Result<Option<usize>> {
+        if self.assignment.is_some() && !self.assigned(sink.name()).contains(&partition) {
+            self.release(sink.name(), partition).await?;
+            return Ok(None);
+        }
+        self.poll_assigned(sink, partition).await
+    }
+
+    async fn poll_assigned(
+        &self,
+        sink: &dyn EventSink,
+        partition: Partition,
+    ) -> Result<Option<usize>> {
+        let key = (sink.name().to_owned(), partition.0);
         let name = Self::lease_name(sink.name(), partition);
         let ttl = self.cfg.lease_ttl;
         let Some(lease) = self.leases.try_acquire(&name, &self.holder, ttl).await? else {
+            self.held_map().remove(&key);
             return Ok(None);
         };
+        self.held_map().insert(key.clone(), lease.clone());
         let after = self.log.position(sink.name(), partition).await?;
         let batch = self.log.read(partition, after, self.cfg.batch).await?;
         let Some(last) = batch.last().map(|e| e.pos) else {
@@ -248,25 +328,62 @@ impl EventConsumer {
         };
         sink.handle(&batch).await?;
         // Лиза потеряна во время обработки: позицию фиксирует новый держатель, пачка придёт ему снова.
-        if self.leases.renew(&lease, ttl).await?.is_none() {
+        let Some(lease) = self.leases.renew(&lease, ttl).await? else {
+            self.held_map().remove(&key);
             tracing::warn!(
                 subscriber = sink.name(),
                 partition = partition.0,
                 "лиза раздела потеряна"
             );
             return Ok(None);
-        }
+        };
+        self.held_map().insert(key, lease);
         self.log.commit(sink.name(), partition, last).await?;
         Ok(Some(batch.len()))
     }
 
-    /// Одна пачка каждого раздела, доступного этому экземпляру; возвращает число обработанных событий.
+    /// Одна пачка каждого раздела, назначенного этому экземпляру; возвращает число обработанных событий.
+    /// Сначала отдаёт лизы разделов, снятых с экземпляра (их пачки уже зафиксированы предыдущим проходом).
     /// Ошибка подписчика в разделе прерывает проход (разделы после него — в следующем).
     pub async fn poll(&self, sink: &dyn EventSink) -> Result<usize> {
+        let assigned = self.assigned(sink.name());
+        for p in self.held(sink.name()) {
+            if assigned.binary_search(&p).is_err() {
+                self.release(sink.name(), p).await?;
+            }
+        }
         let mut total = 0;
-        for p in 0..self.log.partitions() {
-            total += self.poll_partition(sink, Partition(p)).await?.unwrap_or(0);
+        for p in assigned {
+            total += self.poll_assigned(sink, p).await?.unwrap_or(0);
         }
         Ok(total)
+    }
+
+    /// Отдаёт все лизы подписчика (штатная остановка): разделы переходят к другим узлам без ожидания срока.
+    pub async fn release_all(&self, subscriber: &str) -> Result<()> {
+        for p in self.held(subscriber) {
+            self.release(subscriber, p).await?;
+        }
+        Ok(())
+    }
+
+    async fn release(&self, subscriber: &str, partition: Partition) -> Result<()> {
+        let lease = self
+            .held_map()
+            .remove(&(subscriber.to_owned(), partition.0));
+        if let Some(lease) = lease {
+            tracing::debug!(
+                subscriber,
+                partition = partition.0,
+                "лиза раздела отдана: раздел снят с узла"
+            );
+            self.leases.release(&lease).await?;
+        }
+        Ok(())
+    }
+
+    fn held_map(&self) -> MutexGuard<'_, Held> {
+        // Карта согласована при любой панике держателя: каждая правка — одна операция.
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

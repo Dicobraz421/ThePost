@@ -10,8 +10,10 @@ use sqlx::{AssertSqlSafe, PgPool, Postgres, SqlSafeStr, Transaction};
 use tp_contracts::{Error, Result, TenantId};
 
 /// Миграции ядра: (версия, описание, SQL). Версии только добавляются; применённые не меняются.
-const MIGRATIONS: &[(i64, &str, &str)] =
-    &[(1, "schema", include_str!("../migrations/0001_schema.sql"))];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "schema", include_str!("../migrations/0001_schema.sql")),
+    (2, "nodes", include_str!("../migrations/0002_nodes.sql")),
+];
 
 /// Мигратор схемы ядра.
 pub fn migrator() -> Migrator {
