@@ -425,7 +425,10 @@ mod tests {
         assert_eq!(format!("{rs:?}"), "Rights(\"rs\")");
         let s = serde_json::to_string(&Rights::ALL).expect("serialize");
         assert_eq!(s, "\"lrswipkxtea\"");
-        assert_eq!(serde_json::from_str::<Rights>(&s).expect("parse"), Rights::ALL);
+        assert_eq!(
+            serde_json::from_str::<Rights>(&s).expect("parse"),
+            Rights::ALL
+        );
     }
 
     #[test]
