@@ -5,13 +5,17 @@ use std::ops::Range;
 use tp_contracts::{Error, Result};
 
 pub mod cache;
+pub mod gc;
 pub mod local;
 pub mod s3;
+mod worker;
 pub mod writer;
 
 pub use cache::{BlobCache, CacheConfig};
+pub use gc::{GcConfig, GcMetrics, GcPass, GcWorker};
 pub use local::{LocalConfig, LocalStore};
 pub use s3::{S3Config, S3Store};
+pub use worker::{Now, system_now};
 pub use writer::{BlobHasher, BlobWriter, WriterConfig, WriterMetrics};
 
 /// Проверка произвольного пути `put_raw`/`get_raw`/`delete_raw`: относительный, сегменты через `/`,
