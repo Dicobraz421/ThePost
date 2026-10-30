@@ -11,7 +11,7 @@ pub mod telemetry;
 pub mod tls;
 
 pub use acme::{Acme, AcmeConfig, Http01Challenges};
-pub use config::{Config, Section, SectionRegistry};
+pub use config::{CheckMode, Config, Section, SectionRegistry};
 pub use listen::{Cidr, Conn, ConnInfo, EndpointConfig, Listener};
 pub use ratelimit::{RateLimitConfig, RateLimiter, Verdict};
 pub use reload::{ReloadConfig, ReloadTrigger, Reloader, section_watch};

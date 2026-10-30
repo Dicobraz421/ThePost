@@ -5,6 +5,12 @@
 //! (`add_section::<XxxConfig>("xxx")`), приложение собирает реестр и вызывает [`SectionRegistry::load`].
 //! Секция разбирается из исходного текста по своему пути, поэтому ошибка содержит путь параметра
 //! (`smtp.limits.max_size: invalid type ...`) и позицию в файле.
+//!
+//! Два режима проверки (решение #29, PLT-09): строгий ([`CheckMode::Strict`], `thepost config check`) и мягкий
+//! ([`CheckMode::Lenient`], старт и hot reload). Оба собирают все ошибки разом: отсутствующие обязательные параметры,
+//! неверные типы (первая в каждой секции), открытые внутренние каналы вне профиля dev. Неизвестные параметры
+//! (по JSON Schema секций, включая секции модулей) в строгом режиме — ошибки, в мягком — предупреждения в лог
+//! ([`Config::warnings`]); в обоих режимах они отбрасываются до разбора секций.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -20,6 +26,7 @@ use serde::{Deserialize, Deserializer};
 use serde_yaml_ng::{Mapping, Value};
 use tp_contracts::Error;
 use tp_contracts::role::{RoleEntry, RolePreset, RoleSet};
+use tp_contracts::tls::Profile;
 
 use crate::acme::AcmeConfig;
 use crate::ratelimit::RateLimitConfig;
@@ -39,7 +46,7 @@ pub const ENV_PREFIX: &str = "THEPOST_";
 pub const ENV_CONFIG_PATH: &str = "THEPOST_CONFIG";
 
 /// Ключи верхнего уровня, которыми владеет платформа.
-const CORE_KEYS: &[&str] = &["domain", "roles", "modules"];
+const CORE_KEYS: &[&str] = &["domain", "profile", "roles", "modules"];
 
 /// Секции с обязательным `url`, которые допускаются и без регистрации (их крейты регистрируются приложением).
 const URL_SECTIONS: &[&str] = &["database", "blob"];
@@ -51,6 +58,19 @@ impl<T: DeserializeOwned + JsonSchema + Default + Send + Sync + 'static> Section
 
 /// Значение секции со стёртым типом.
 pub type AnySection = Arc<dyn Any + Send + Sync>;
+
+/// Режим проверки конфигурации.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckMode {
+    /// `thepost config check`: неизвестные параметры — ошибки.
+    Strict,
+    /// Старт и hot reload: неизвестные параметры — предупреждения в лог.
+    #[default]
+    Lenient,
+}
+
+/// Проверка разобранной секции с учётом профиля (адреса внутренних каналов и т. п.).
+type CheckFn = Arc<dyn Fn(&AnySection, Profile) -> tp_contracts::Result<()> + Send + Sync>;
 
 /// Ошибка загрузки конфигурации; на границе крейта — `Error::Invalid`.
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +90,9 @@ pub(crate) enum ConfigError {
     NoModule(String),
     #[error("{var}: {path} is not a section")]
     Env { var: String, path: String },
+    /// Все найденные ошибки, по одной в строке.
+    #[error("{}", .0.join("\n"))]
+    Invalid(Vec<String>),
 }
 
 impl From<ConfigError> for Error {
@@ -90,6 +113,7 @@ struct SectionDef {
 pub struct SectionRegistry {
     sections: BTreeMap<&'static str, SectionDef>,
     modules: BTreeMap<&'static str, SectionDef>,
+    checks: BTreeMap<&'static str, Vec<CheckFn>>,
 }
 
 impl fmt::Debug for SectionRegistry {
@@ -97,6 +121,7 @@ impl fmt::Debug for SectionRegistry {
         f.debug_struct("SectionRegistry")
             .field("sections", &self.sections.keys().collect::<Vec<_>>())
             .field("modules", &self.modules.keys().collect::<Vec<_>>())
+            .field("checks", &self.checks.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -113,6 +138,7 @@ impl SectionRegistry {
         let mut r = Self {
             sections: BTreeMap::new(),
             modules: BTreeMap::new(),
+            checks: BTreeMap::new(),
         };
         r.sections.insert("telemetry", def::<TelemetryConfig>());
         r.sections
@@ -122,6 +148,10 @@ impl SectionRegistry {
         r.sections.insert("tls", def::<TlsConfig>());
         r.sections.insert("ratelimit", def::<RateLimitConfig>());
         r.sections.insert("acme", def::<AcmeConfig>());
+        r.checks
+            .entry("service_http")
+            .or_default()
+            .push(check_fn(ServiceHttpConfig::check));
         r
     }
 
@@ -143,37 +173,89 @@ impl SectionRegistry {
         Ok(())
     }
 
-    /// Читает файл и переменные окружения процесса. Блокирующий I/O: в async — через `spawn_blocking`.
+    /// Регистрирует проверку секции `name` (тип `T` — как в `add_section`): адреса внутренних каналов и прочие
+    /// условия, зависящие от профиля. Выполняется в обоих режимах; ошибка — ошибка конфигурации. Секции с проверкой
+    /// не просматриваются общим поиском `tls.allow_plaintext`. Секция не зарегистрирована — `Error::NotFound`.
+    pub fn add_check<T: Section>(
+        &mut self,
+        name: &'static str,
+        check: impl Fn(&T, Profile) -> tp_contracts::Result<()> + Send + Sync + 'static,
+    ) -> tp_contracts::Result<()> {
+        if !self.sections.contains_key(name) {
+            return Err(Error::NotFound);
+        }
+        self.checks.entry(name).or_default().push(check_fn(check));
+        Ok(())
+    }
+
+    /// Читает файл и переменные окружения процесса в мягком режиме (старт сервера); предупреждения — в лог.
+    /// Блокирующий I/O: в async — через `spawn_blocking`.
     pub fn load(&self, path: &Path) -> tp_contracts::Result<Config> {
+        self.load_mode(path, CheckMode::Lenient)
+    }
+
+    /// Строгая проверка файла для `thepost config check`: все ошибки разом, неизвестные параметры — ошибки.
+    /// Блокирующий I/O.
+    pub fn check(&self, path: &Path) -> tp_contracts::Result<Config> {
+        self.load_mode(path, CheckMode::Strict)
+    }
+
+    fn load_mode(&self, path: &Path, mode: CheckMode) -> tp_contracts::Result<Config> {
         let src = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_owned(),
             source,
         })?;
-        Ok(self.parse_with(&src, std::env::vars())?)
+        Ok(self.parse_with(&src, std::env::vars(), mode)?)
     }
 
-    /// Разбирает текст config.yaml с переопределениями `env` (пары «имя — значение», лишние игнорируются).
+    /// Разбирает текст config.yaml в мягком режиме с переопределениями `env` (пары «имя — значение»,
+    /// лишние игнорируются); предупреждения — в лог и в [`Config::warnings`].
     pub fn parse(
         &self,
         src: &str,
         env: impl IntoIterator<Item = (String, String)>,
     ) -> tp_contracts::Result<Config> {
-        Ok(self.parse_with(src, env)?)
+        Ok(self.parse_with(src, env, CheckMode::Lenient)?)
+    }
+
+    /// Разбирает текст config.yaml в строгом режиме (`thepost config check`).
+    pub fn parse_strict(
+        &self,
+        src: &str,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> tp_contracts::Result<Config> {
+        Ok(self.parse_with(src, env, CheckMode::Strict)?)
     }
 
     pub(crate) fn parse_with(
         &self,
         src: &str,
         env: impl IntoIterator<Item = (String, String)>,
+        mode: CheckMode,
     ) -> Result<Config, ConfigError> {
         let mut tree: Value = serde_yaml_ng::from_str(src)?;
         if tree.is_null() {
             tree = Value::Mapping(Mapping::new());
         }
         let overridden = apply_env(&mut tree, env)?;
-        // После переопределения позиции в ошибках относятся к объединённому тексту; путь параметра — точный.
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+
+        // Неизвестные параметры отбрасываются до разбора: секции с `deny_unknown_fields` разбираются дальше,
+        // и ошибки типов в них не прячутся за первым неизвестным полем.
+        let unknown = self.unknown_params(&tree);
+        for path in &unknown {
+            remove_path(&mut tree, path);
+            let msg = ConfigError::Unknown(path_string(path)).to_string();
+            match mode {
+                CheckMode::Strict => errors.push(msg),
+                CheckMode::Lenient => warnings.push(msg),
+            }
+        }
+        // После переопределения или отбрасывания позиции в ошибках относятся к объединённому тексту;
+        // путь параметра — точный.
         let merged;
-        let src = if overridden {
+        let src = if overridden || !unknown.is_empty() {
             merged = serde_yaml_ng::to_string(&tree)?;
             merged.as_str()
         } else {
@@ -185,36 +267,34 @@ impl SectionRegistry {
             match lookup(&tree, &key) {
                 Some(Value::String(s)) if !s.trim().is_empty() => {}
                 Some(Value::String(_)) | None | Some(Value::Null) => {
-                    return Err(ConfigError::Missing((*path).to_owned()));
+                    errors.push(ConfigError::Missing((*path).to_owned()).to_string());
                 }
                 Some(_) => {
                     // Не строка: точное сообщение с позицией даст разбор строки.
-                    at::<String>(src, &key)?;
+                    note(&mut errors, at::<String>(src, &key));
                 }
             }
         }
 
-        if let Value::Mapping(root) = &tree {
-            for key in root.keys() {
-                let name = key.as_str().unwrap_or_default();
-                let known = CORE_KEYS.contains(&name)
-                    || URL_SECTIONS.contains(&name)
-                    || self.sections.contains_key(name);
-                if !known {
-                    return Err(ConfigError::Unknown(yaml_key(key)));
-                }
-            }
-        }
-
-        let domain: String = at(src, &["domain"])?.unwrap_or_default();
-        let role_entries: Vec<RoleEntry> =
-            at(src, &["roles"])?.unwrap_or_else(|| vec![RoleEntry::Preset(RolePreset::All)]);
+        // Тип `domain` уже проверен вместе с обязательными параметрами.
+        let domain = lookup(&tree, &["domain"])
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let profile: Profile = note(&mut errors, at(src, &["profile"]))
+            .flatten()
+            .unwrap_or_default();
+        let role_entries: Vec<RoleEntry> = note(&mut errors, at(src, &["roles"]))
+            .flatten()
+            .unwrap_or_else(|| vec![RoleEntry::Preset(RolePreset::All)]);
         let roles = RoleSet::expand(&role_entries);
 
         let mut sections = BTreeMap::new();
         for (name, def) in &self.sections {
             let present = lookup(&tree, &[name]).is_some_and(|v| !v.is_null());
-            sections.insert(*name, (def.parse)(present.then_some(src), &[name])?);
+            if let Some(section) = note(&mut errors, (def.parse)(present.then_some(src), &[name])) {
+                sections.insert(*name, section);
+            }
         }
 
         let mut modules = BTreeMap::new();
@@ -224,31 +304,127 @@ impl SectionRegistry {
         };
         for name in &listed {
             if !self.modules.contains_key(name.as_str()) {
-                let switch: Option<ModuleSwitch> = at(src, &["modules", name])?;
+                let switch: Option<ModuleSwitch> =
+                    note(&mut errors, at(src, &["modules", name])).flatten();
                 if switch.is_some_and(|s| s.enabled) {
-                    return Err(ConfigError::NoModule(name.clone()));
+                    errors.push(ConfigError::NoModule(name.clone()).to_string());
                 }
             }
         }
         for (name, def) in &self.modules {
             let path = ["modules", name];
             let present = lookup(&tree, &path).is_some_and(|v| !v.is_null());
-            let enabled: bool = if present {
-                at::<ModuleSwitch>(src, &path)?.is_some_and(|s| s.enabled)
+            let switch = if present {
+                match at::<ModuleSwitch>(src, &path) {
+                    Ok(switch) => switch,
+                    Err(e) => {
+                        // Та же ошибка повторилась бы при разборе полей модуля.
+                        errors.push(e.to_string());
+                        continue;
+                    }
+                }
             } else {
-                false
+                None
             };
-            let config = (def.parse)(present.then_some(src), &path)?;
-            modules.insert(*name, ModuleState { enabled, config });
+            let enabled = switch.is_some_and(|s| s.enabled);
+            if let Some(config) = note(&mut errors, (def.parse)(present.then_some(src), &path)) {
+                modules.insert(*name, ModuleState { enabled, config });
+            }
         }
 
+        self.check_channels(&tree, &sections, profile, &mut errors);
+
+        if !errors.is_empty() {
+            return Err(ConfigError::Invalid(errors));
+        }
+        for w in &warnings {
+            tracing::warn!(warning = %w, "configuration parameter ignored");
+        }
         Ok(Config {
             domain,
+            profile,
             role_entries,
             roles,
             sections,
             modules,
+            warnings,
         })
+    }
+
+    /// Открытые внутренние каналы вне профиля dev (решение «Шифрование любого обмена»): проверки секций
+    /// ([`Self::add_check`]; адреса каналов проверяют крейты — `PoolConfig::check`, `S3Config::check` и т. п.)
+    /// и `tls.allow_plaintext: true` в секциях без проверки.
+    fn check_channels(
+        &self,
+        tree: &Value,
+        sections: &BTreeMap<&'static str, AnySection>,
+        profile: Profile,
+        errors: &mut Vec<String>,
+    ) {
+        for (name, checks) in &self.checks {
+            let Some(section) = sections.get(name) else {
+                continue;
+            };
+            for check in checks {
+                if let Err(e) = check(section, profile) {
+                    errors.push(format!("{name}: {}", message(&e)));
+                }
+            }
+        }
+        if profile != Profile::Dev
+            && let Value::Mapping(root) = tree
+        {
+            for (key, value) in root {
+                let name = key.as_str().unwrap_or_default();
+                if ["domain", "profile", "roles"].contains(&name) || self.checks.contains_key(name)
+                {
+                    continue;
+                }
+                let mut path = vec![Seg::Key(key.clone())];
+                find_plaintext(value, &mut path, errors);
+            }
+        }
+    }
+
+    /// Неизвестные параметры: ключи верхнего уровня вне платформы и реестра, поля зарегистрированных секций
+    /// и модулей, которых нет в их JSON Schema. Незарегистрированные `database`/`blob` и модули не проверяются.
+    fn unknown_params(&self, tree: &Value) -> Vec<Vec<Seg>> {
+        let mut out = Vec::new();
+        let Value::Mapping(root) = tree else {
+            return out;
+        };
+        // Схема с `$defs` как дерево YAML: обход без зависимости от serde_json.
+        let schema = serde_yaml_ng::to_value(self.schema()).unwrap_or(Value::Null);
+        let defs = schema.get("$defs").unwrap_or(&Value::Null);
+        let props = |path: &[&str]| schema_at(&schema, path);
+        for (key, value) in root {
+            let name = key.as_str().unwrap_or_default();
+            let mut path = vec![Seg::Key(key.clone())];
+            if self.sections.contains_key(name) {
+                let Some(s) = props(&[name]) else {
+                    continue;
+                };
+                walk(value, &[s], defs, &mut path, &mut out);
+            } else if name == "modules" {
+                let Value::Mapping(listed) = value else {
+                    continue;
+                };
+                for (module, config) in listed {
+                    let registered = module
+                        .as_str()
+                        .filter(|m| self.modules.contains_key(*m))
+                        .and_then(|m| props(&["modules", m]));
+                    if let Some(s) = registered {
+                        path.push(Seg::Key(module.clone()));
+                        walk(config, &[s], defs, &mut path, &mut out);
+                        path.pop();
+                    }
+                }
+            } else if !CORE_KEYS.contains(&name) && !URL_SECTIONS.contains(&name) {
+                out.push(path);
+            }
+        }
+        out
     }
 
     /// JSON Schema config.yaml (draft 2020-12): все зарегистрированные секции и модули.
@@ -256,6 +432,7 @@ impl SectionRegistry {
         let mut generator = SchemaSettings::draft2020_12().into_generator();
         let mut props = BTreeMap::new();
         props.insert("domain".to_owned(), generator.subschema_for::<String>());
+        props.insert("profile".to_owned(), generator.subschema_for::<Profile>());
         props.insert(
             "roles".to_owned(),
             generator.subschema_for::<Vec<RoleEntry>>(),
@@ -305,10 +482,12 @@ impl SectionRegistry {
 #[derive(Clone)]
 pub struct Config {
     domain: String,
+    profile: Profile,
     role_entries: Vec<RoleEntry>,
     roles: RoleSet,
     sections: BTreeMap<&'static str, AnySection>,
     modules: BTreeMap<&'static str, ModuleState>,
+    warnings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -321,6 +500,7 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("domain", &self.domain)
+            .field("profile", &self.profile)
             .field("roles", &self.role_entries)
             .field("sections", &self.sections.keys().collect::<Vec<_>>())
             .field(
@@ -339,6 +519,16 @@ impl Config {
     /// Основной домен.
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// Профиль запуска (`profile`); по умолчанию `prod`.
+    pub fn profile(&self) -> Profile {
+        self.profile
+    }
+
+    /// Предупреждения мягкого режима: отброшенные неизвестные параметры.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Параметр `roles` как в файле.
@@ -395,6 +585,232 @@ struct ModuleSwitch {
     /// Модуль включён.
     #[serde(default)]
     enabled: bool,
+}
+
+fn check_fn<T: Section>(
+    check: impl Fn(&T, Profile) -> tp_contracts::Result<()> + Send + Sync + 'static,
+) -> CheckFn {
+    Arc::new(move |section: &AnySection, profile: Profile| {
+        let section = section
+            .as_ref()
+            .downcast_ref::<T>()
+            .ok_or_else(|| Error::internal("config section type mismatch"))?;
+        check(section, profile)
+    })
+}
+
+/// Текст ошибки без префикса `invalid: `.
+fn message(e: &Error) -> String {
+    match e {
+        Error::Invalid(m) => m.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Добавляет ошибку в список; `None` — была ошибка.
+fn note<T, E: fmt::Display>(errors: &mut Vec<String>, r: Result<T, E>) -> Option<T> {
+    r.map_err(|e| errors.push(e.to_string())).ok()
+}
+
+/// Шаг пути параметра в дереве YAML.
+#[derive(Debug, Clone, PartialEq)]
+enum Seg {
+    Key(Value),
+    Index(usize),
+}
+
+/// Путь параметра для сообщений: `smtp.limits.bogus`, `smtp.relays[1].port`.
+fn path_string(path: &[Seg]) -> String {
+    let mut out = String::new();
+    for seg in path {
+        match seg {
+            Seg::Key(k) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(&yaml_key(k));
+            }
+            Seg::Index(i) => {
+                out.push('[');
+                out.push_str(&i.to_string());
+                out.push(']');
+            }
+        }
+    }
+    out
+}
+
+fn remove_path(tree: &mut Value, path: &[Seg]) {
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let mut node = tree;
+    for seg in parents {
+        let next = match (seg, node) {
+            (Seg::Key(k), Value::Mapping(m)) => m.get_mut(k),
+            (Seg::Index(i), Value::Sequence(s)) => s.get_mut(*i),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return;
+        };
+        node = next;
+    }
+    if let (Seg::Key(k), Value::Mapping(m)) = (last, node) {
+        m.shift_remove(k);
+    }
+}
+
+/// Подсхема поля по пути `properties.<a>.properties.<b>…`.
+fn schema_at<'s>(schema: &'s Value, path: &[&str]) -> Option<&'s Value> {
+    path.iter()
+        .try_fold(schema, |node, key| node.get("properties")?.get(*key))
+}
+
+/// Допустимые поля объекта по объединению схем (`$ref`, `allOf`/`anyOf`/`oneOf`).
+#[derive(Default)]
+struct Shape<'s> {
+    props: BTreeMap<String, Vec<&'s Value>>,
+    additional: Vec<&'s Value>,
+    items: Vec<&'s Value>,
+    /// Объект с произвольными полями.
+    open: bool,
+}
+
+/// Глубина разворачивания `$ref`: защита от циклических схем.
+const MAX_SCHEMA_DEPTH: usize = 32;
+
+/// Ключевые слова схемы, при которых она сама не описывает «объект с любыми полями».
+const STRUCTURED: &[&str] = &[
+    "$ref",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "properties",
+    "additionalProperties",
+    "const",
+    "enum",
+];
+
+fn collect<'s>(schema: &'s Value, defs: &'s Value, shape: &mut Shape<'s>, depth: usize) {
+    if depth > MAX_SCHEMA_DEPTH {
+        shape.open = true;
+        return;
+    }
+    let map = match schema {
+        Value::Bool(open) => {
+            shape.open |= *open;
+            return;
+        }
+        Value::Mapping(m) => m,
+        _ => return,
+    };
+    if let Some(target) = map.get("$ref").and_then(Value::as_str) {
+        match target
+            .strip_prefix("#/$defs/")
+            .and_then(|name| defs.get(name))
+        {
+            Some(def) => collect(def, defs, shape, depth + 1),
+            None => shape.open = true,
+        }
+    }
+    for kw in ["allOf", "anyOf", "oneOf"] {
+        if let Some(Value::Sequence(subs)) = map.get(kw) {
+            for sub in subs {
+                collect(sub, defs, shape, depth + 1);
+            }
+        }
+    }
+    if let Some(Value::Mapping(props)) = map.get("properties") {
+        for (k, s) in props {
+            shape.props.entry(yaml_key(k)).or_default().push(s);
+        }
+    }
+    match map.get("additionalProperties") {
+        Some(Value::Bool(open)) => shape.open |= *open,
+        Some(s @ Value::Mapping(_)) => shape.additional.push(s),
+        _ => {}
+    }
+    if let Some(items) = map.get("items") {
+        shape.items.push(items);
+    }
+    let object_type = match map.get("type") {
+        None => true,
+        Some(Value::String(t)) => t == "object",
+        Some(Value::Sequence(ts)) => ts.iter().any(|t| t.as_str() == Some("object")),
+        Some(_) => false,
+    };
+    // Объект без описания полей (`{}`, `{"type": "object"}`) принимает любые поля.
+    if object_type && !STRUCTURED.iter().any(|k| map.contains_key(*k)) {
+        shape.open = true;
+    }
+}
+
+/// Собирает пути полей `value`, которых нет в объединении схем `schemas`.
+fn walk(
+    value: &Value,
+    schemas: &[&Value],
+    defs: &Value,
+    path: &mut Vec<Seg>,
+    out: &mut Vec<Vec<Seg>>,
+) {
+    let mut shape = Shape::default();
+    for s in schemas {
+        collect(s, defs, &mut shape, 0);
+    }
+    match value {
+        Value::Mapping(m) => {
+            for (k, child) in m {
+                path.push(Seg::Key(k.clone()));
+                match k.as_str().and_then(|n| shape.props.get(n)) {
+                    Some(subs) => walk(child, subs, defs, path, out),
+                    None if !shape.additional.is_empty() => {
+                        walk(child, &shape.additional, defs, path, out);
+                    }
+                    None if shape.open => {}
+                    None => out.push(path.clone()),
+                }
+                path.pop();
+            }
+        }
+        Value::Sequence(items) if !shape.items.is_empty() => {
+            for (i, item) in items.iter().enumerate() {
+                path.push(Seg::Index(i));
+                walk(item, &shape.items, defs, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `tls.allow_plaintext: true` в поддереве: открытый внутренний канал, допустимый только в профиле dev.
+fn find_plaintext(value: &Value, path: &mut Vec<Seg>, errors: &mut Vec<String>) {
+    match value {
+        Value::Mapping(m) => {
+            for (k, child) in m {
+                path.push(Seg::Key(k.clone()));
+                if k.as_str() == Some("tls")
+                    && child.get("allow_plaintext").and_then(Value::as_bool) == Some(true)
+                {
+                    errors.push(format!(
+                        "{}.allow_plaintext: allowed only with profile: dev",
+                        path_string(path)
+                    ));
+                }
+                find_plaintext(child, path, errors);
+                path.pop();
+            }
+        }
+        Value::Sequence(items) => {
+            for (i, item) in items.iter().enumerate() {
+                path.push(Seg::Index(i));
+                find_plaintext(item, path, errors);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
 }
 
 fn def<T: Section>() -> SectionDef {
@@ -544,6 +960,7 @@ fn apply_env(
 #[cfg(test)]
 mod tests {
     use tp_contracts::role::Role;
+    use tp_contracts::tls::{InternalChannel, InternalTls};
 
     use super::*;
 
@@ -561,6 +978,7 @@ mod tests {
     struct SmtpConfig {
         banner: String,
         limits: Limits,
+        relays: Vec<Limits>,
     }
 
     #[derive(Debug, Default, Deserialize, JsonSchema, PartialEq)]
@@ -569,19 +987,36 @@ mod tests {
         days: u32,
     }
 
+    /// Секция внутреннего канала с полем `tls` (как у `tp-cluster`, `tp-blob`).
+    #[derive(Debug, Default, Deserialize, JsonSchema, PartialEq)]
+    #[serde(default, deny_unknown_fields)]
+    struct ChannelConfig {
+        url: String,
+        tls: InternalTls,
+    }
+
     fn registry() -> SectionRegistry {
         let mut r = SectionRegistry::new();
         r.add_section::<SmtpConfig>("smtp").expect("smtp");
+        r.add_section::<ChannelConfig>("bus").expect("bus");
         r.add_module::<ArchiveConfig>("archive").expect("archive");
         r
     }
 
     fn parse(src: &str) -> Result<Config, ConfigError> {
-        registry().parse_with(src, Vec::new())
+        registry().parse_with(src, Vec::new(), CheckMode::Lenient)
+    }
+
+    fn strict(src: &str) -> Result<Config, ConfigError> {
+        registry().parse_with(src, Vec::new(), CheckMode::Strict)
     }
 
     fn err(src: &str) -> String {
         parse(src).expect_err("must fail").to_string()
+    }
+
+    fn lines(e: ConfigError) -> Vec<String> {
+        e.to_string().lines().map(str::to_owned).collect()
     }
 
     #[test]
@@ -619,7 +1054,11 @@ mod tests {
             err("database: { url: x }\nblob: { url: y }\ndomain: ''"),
             "domain: required parameter is missing"
         );
-        assert_eq!(err(""), "database.url: required parameter is missing");
+        // Все отсутствующие разом.
+        assert_eq!(
+            err(""),
+            "database.url: required parameter is missing\nblob.url: required parameter is missing\ndomain: required parameter is missing"
+        );
     }
 
     #[test]
@@ -627,15 +1066,136 @@ mod tests {
         let e = err(&format!("{MINIMAL}smtp:\n  limits:\n    max_size: big\n"));
         assert!(e.starts_with("smtp.limits.max_size: invalid type"), "{e}");
         assert!(e.contains("line 6"), "{e}");
-        let e = err(&format!("{MINIMAL}smtp:\n  limits:\n    bogus: 1\n"));
-        assert!(e.starts_with("smtp.limits: unknown field `bogus`"), "{e}");
         let e = err(&format!("{MINIMAL}roles: [mailbox, imapp]\n"));
         // `RoleEntry` — untagged enum: путь до параметра, без индекса элемента.
         assert!(e.starts_with("roles: ") && e.contains("line 4"), "{e}");
+        let e = strict(&format!("{MINIMAL}smtp:\n  limits:\n    bogus: 1\n"))
+            .expect_err("strict")
+            .to_string();
+        assert_eq!(e, "smtp.limits.bogus: unknown parameter");
         assert_eq!(
-            err(&format!("{MINIMAL}smtpp: {{}}\n")),
+            strict(&format!("{MINIMAL}smtpp: {{}}\n"))
+                .expect_err("strict")
+                .to_string(),
             "smtpp: unknown parameter"
         );
+        let e = strict(&format!(
+            "{MINIMAL}smtp:\n  relays: [{{ max_size: 1 }}, {{ burst: 2, extra: 3 }}]\n"
+        ))
+        .expect_err("strict")
+        .to_string();
+        assert_eq!(e, "smtp.relays[1].extra: unknown parameter");
+        let e = err(&format!("{MINIMAL}profile: staging\n"));
+        assert!(e.starts_with("profile: unknown variant"), "{e}");
+    }
+
+    /// Приёмка PLT-09: один файл с неизвестными полями (секция, модуль, верхний уровень), ошибкой типа
+    /// и открытыми внутренними каналами вне dev.
+    #[test]
+    fn strict_and_lenient_on_same_file() {
+        let body = "smtp:\n  banner: hi\n  limits: { bogus: 1, burst: many }\n\
+                    smtpp: {}\n\
+                    modules:\n  archive: { enabled: true, days: 3, dayz: 4 }\n\
+                    service_http: { allow_plaintext: true }\n\
+                    bus: { url: redis://cache, tls: { allow_plaintext: true } }\n";
+        let prod = format!("{MINIMAL}{body}");
+
+        let all = lines(strict(&prod).expect_err("strict"));
+        assert_eq!(all.len(), 6, "{all:#?}");
+        for unknown in ["smtp.limits.bogus", "smtpp", "modules.archive.dayz"] {
+            assert!(
+                all.contains(&format!("{unknown}: unknown parameter")),
+                "{unknown}: {all:#?}"
+            );
+        }
+        assert!(
+            all.iter()
+                .any(|l| l.starts_with("smtp.limits.burst: invalid type")),
+            "{all:#?}"
+        );
+        assert!(
+            all.iter().any(|l| l
+                .starts_with("service_http: allow_plaintext is allowed only with profile: dev")),
+            "{all:#?}"
+        );
+        assert!(
+            all.contains(&"bus.tls.allow_plaintext: allowed only with profile: dev".to_owned()),
+            "{all:#?}"
+        );
+
+        // Мягкий режим: неизвестные поля не ошибки, остальное — ошибки.
+        let soft = lines(parse(&prod).expect_err("lenient"));
+        assert_eq!(soft.len(), 3, "{soft:#?}");
+        assert!(
+            soft.iter().all(|l| !l.contains("unknown parameter")),
+            "{soft:#?}"
+        );
+
+        // Профиль dev, без ошибки типа: мягкий режим запускается с предупреждениями, строгий — нет.
+        let dev = format!(
+            "{MINIMAL}profile: dev\n{}",
+            body.replace("burst: many", "burst: 2")
+        );
+        let cfg = parse(&dev).expect("lenient dev");
+        assert_eq!(cfg.profile(), Profile::Dev);
+        assert_eq!(
+            cfg.warnings(),
+            [
+                "smtp.limits.bogus: unknown parameter",
+                "smtpp: unknown parameter",
+                "modules.archive.dayz: unknown parameter",
+            ]
+        );
+        let smtp = cfg.section::<SmtpConfig>("smtp").expect("smtp");
+        assert_eq!((smtp.banner.as_str(), smtp.limits.burst), ("hi", 2));
+        assert_eq!(cfg.module::<ArchiveConfig>("archive").expect("m").days, 3);
+        assert!(cfg.module_enabled("archive"));
+        assert!(
+            cfg.section::<ServiceHttpConfig>("service_http")
+                .expect("service_http")
+                .allow_plaintext
+        );
+        assert_eq!(lines(strict(&dev).expect_err("strict dev")).len(), 3);
+        assert!(parse(MINIMAL).expect("clean").warnings().is_empty());
+    }
+
+    #[test]
+    fn section_checks() {
+        let mut r = registry();
+        r.add_check::<ChannelConfig>("bus", |c, profile| {
+            c.tls
+                .check_url(InternalChannel::Valkey, &c.url, profile)
+                .map(|_| ())
+        })
+        .expect("check");
+        assert_eq!(
+            r.add_check::<ChannelConfig>("nope", |_, _| Ok(())),
+            Err(Error::NotFound)
+        );
+        let e = r
+            .parse_with(
+                &format!("{MINIMAL}bus: {{ url: redis://cache }}\n"),
+                Vec::new(),
+                CheckMode::Lenient,
+            )
+            .expect_err("plaintext")
+            .to_string();
+        assert!(e.starts_with("bus: Valkey: address without TLS"), "{e}");
+        // Секция с проверкой не просматривается общим поиском: одна ошибка, не две.
+        let e = r
+            .parse_with(
+                &format!(
+                    "{MINIMAL}bus: {{ url: rediss://cache, tls: {{ allow_plaintext: true }} }}\n"
+                ),
+                Vec::new(),
+                CheckMode::Strict,
+            )
+            .expect_err("allow_plaintext");
+        assert_eq!(lines(e).len(), 1);
+        let ok = format!(
+            "{MINIMAL}profile: dev\nbus: {{ url: redis://cache, tls: {{ allow_plaintext: true }} }}\n"
+        );
+        assert!(r.parse_with(&ok, Vec::new(), CheckMode::Strict).is_ok());
     }
 
     #[test]
@@ -676,7 +1236,9 @@ mod tests {
             ("HOME", "/root"),
         ]
         .map(|(k, v)| (k.to_owned(), v.to_owned()));
-        let cfg = registry().parse_with(MINIMAL, env).expect("env");
+        let cfg = registry()
+            .parse_with(MINIMAL, env, CheckMode::Lenient)
+            .expect("env");
         assert_eq!(cfg.domain(), "corp.example");
         assert_eq!(
             cfg.section::<SmtpConfig>("smtp")
@@ -690,7 +1252,7 @@ mod tests {
 
         let env = [("THEPOST_DOMAIN__X".to_owned(), "1".to_owned())];
         let e = registry()
-            .parse_with(MINIMAL, env)
+            .parse_with(MINIMAL, env, CheckMode::Lenient)
             .expect_err("scalar")
             .to_string();
         assert_eq!(e, "THEPOST_DOMAIN__X: domain is not a section");
@@ -701,7 +1263,9 @@ mod tests {
             ("THEPOST_DOMAIN", "d"),
         ]
         .map(|(k, v)| (k.to_owned(), v.to_owned()));
-        registry().parse_with("", env).expect("env only");
+        registry()
+            .parse_with("", env, CheckMode::Lenient)
+            .expect("env only");
     }
 
     #[test]
@@ -709,6 +1273,7 @@ mod tests {
         let mut r = registry();
         assert_eq!(r.add_section::<SmtpConfig>("smtp"), Err(Error::Conflict));
         assert_eq!(r.add_section::<SmtpConfig>("roles"), Err(Error::Conflict));
+        assert_eq!(r.add_section::<SmtpConfig>("profile"), Err(Error::Conflict));
         assert_eq!(
             r.add_module::<ArchiveConfig>("archive"),
             Err(Error::Conflict)

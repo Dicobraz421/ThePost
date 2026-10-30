@@ -12,7 +12,7 @@ use tp_contracts::Error;
 use tp_contracts::config::duration;
 use tp_contracts::role::{CancellationToken, ConfigRx, ConfigValue};
 
-use crate::config::{Config, ConfigError, SectionRegistry};
+use crate::config::{CheckMode, Config, ConfigError, SectionRegistry};
 
 /// Секция `reload`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -79,7 +79,7 @@ impl Reloader {
             source,
         })?;
         let stamp = std::fs::metadata(&path).ok().map(|m| stamp_of(&m));
-        let config = registry.parse_with(&applied, env.clone())?;
+        let config = registry.parse_with(&applied, env.clone(), CheckMode::Lenient)?;
         let (tx, _) = watch::channel(Arc::new(config));
         Ok(Self {
             registry,
@@ -119,7 +119,9 @@ impl Reloader {
         if text == self.applied {
             return Ok(false);
         }
-        let config = self.registry.parse_with(&text, self.env.clone())?;
+        let config = self
+            .registry
+            .parse_with(&text, self.env.clone(), CheckMode::Lenient)?;
         self.applied = text;
         self.tx.send_replace(Arc::new(config));
         Ok(true)
