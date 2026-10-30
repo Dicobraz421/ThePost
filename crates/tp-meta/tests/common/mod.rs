@@ -4,7 +4,9 @@
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{DomainId, TenantId};
+use tp_meta::pool::PoolConfig;
 use tp_meta::{MetaConfig, PgMeta, schema};
 
 /// Адрес тестовой БД.
@@ -14,6 +16,28 @@ pub fn pg_url() -> Option<String> {
         eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
     }
     url
+}
+
+/// Адрес тестовой БД для пулов из конфигурации: без `sslmode` — открытый канал (`sslmode=disable`).
+pub fn dev_url(url: &str) -> String {
+    if url.contains("sslmode=") {
+        return url.to_owned();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}sslmode=disable")
+}
+
+/// Секция пула для интеграционных тестов: профиль dev с `tls.allow_plaintext` (META-14).
+pub fn dev_pool_config(url: &str) -> PoolConfig {
+    PoolConfig {
+        url: dev_url(url),
+        tls: InternalTls {
+            allow_plaintext: true,
+            ..InternalTls::default()
+        },
+        profile: Profile::Dev,
+        ..PoolConfig::default()
+    }
 }
 
 /// Пул к тестовой БД с применённой схемой.

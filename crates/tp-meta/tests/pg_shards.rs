@@ -78,7 +78,7 @@ async fn new_shard_without_caller_changes() {
         meta.pool().clone(),
         PoolConfig {
             application_name: marker.clone(),
-            ..PoolConfig::default()
+            ..common::dev_pool_config(&url)
         },
     ));
     let before = count_mailboxes(resolver.as_ref(), scope).await;
@@ -88,7 +88,7 @@ async fn new_shard_without_caller_changes() {
     sqlx::query("INSERT INTO shards (shard_id, name, dsn, accepts_new) VALUES ($1, $2, $3, false)")
         .bind(id.0)
         .bind(&marker)
-        .bind(&url)
+        .bind(common::dev_url(&url))
         .execute(meta.pool())
         .await
         .expect("shard");
