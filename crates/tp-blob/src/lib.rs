@@ -4,9 +4,11 @@ use std::ops::Range;
 
 use tp_contracts::{Error, Result};
 
+pub mod cache;
 pub mod local;
 pub mod s3;
 
+pub use cache::{BlobCache, CacheConfig};
 pub use local::{LocalConfig, LocalStore};
 pub use s3::{S3Config, S3Store};
 
