@@ -25,6 +25,7 @@ tp-jmap.workspace = true
 tp-dav.workspace = true
 tp-search.workspace = true
 tp-admin.workspace = true
+schemars.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

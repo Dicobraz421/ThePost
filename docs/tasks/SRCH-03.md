@@ -9,7 +9,7 @@ checks: [nextest]
 manual: no
 
 ## Сделать
-- SearchBackend.query: разбор TextQuery, сортировка по дате, лимит; snippet.
+- SearchIndex.query: разбор TextQuery, сортировка по дате, лимит; snippet.
 
 ## Приёмка
 - Тесты релевантности на корпусе.

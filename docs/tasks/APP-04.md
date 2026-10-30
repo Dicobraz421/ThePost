@@ -9,7 +9,7 @@ checks: [nextest]
 manual: no
 
 ## Сделать
-- Все роли в одном процессе, локальный BLOB, шина в процессе; конфигурация SMB из deploy/config.
+- roles: [all], локальный BLOB, шина в процессе; конфигурация SMB из deploy/config.
 
 ## Приёмка
 - Старт SMB-профиля до ready.

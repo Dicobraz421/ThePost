@@ -10,7 +10,8 @@ manual: no
 
 ## Сделать
 - Пул sqlx из конфигурации; режим совместимости с PgBouncer transaction; проверки для doctor: версия ≥16,
-- synchronous_standby_names (Enterprise), max_connections, часовой пояс UTC.
+- synchronous_standby_names (Enterprise), max_connections, часовой пояс UTC;
+- транзакция в контексте организации: `with_tenant(tenant, |tx| …)` выполняет SET LOCAL app.tenant_id.
 
 ## Приёмка
 - Тест: проверки возвращают структурированный отчёт.

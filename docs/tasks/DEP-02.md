@@ -9,7 +9,7 @@ checks: [none]
 manual: no
 
 ## Сделать
-- Юнит systemd (hardening: ProtectSystem, NoNewPrivileges, CapabilityBoundingSet для портов <1024), config.smb.yaml, config.enterprise.yaml.
+- Юнит systemd (hardening: ProtectSystem, NoNewPrivileges, CapabilityBoundingSet для портов <1024); примеры config для пресетов all, mailbox, edge.
 
 ## Приёмка
 - systemd-analyze verify проходит.

@@ -9,7 +9,7 @@ checks: [nextest]
 manual: no
 
 ## Сделать
-- Email/query, queryChanges: фильтры, сортировка, collapseThreads, текст через SearchBackend.
+- Email/query, queryChanges: фильтры, сортировка, collapseThreads, текст через SearchIndex.
 
 ## Приёмка
-- Тесты с мок-SearchBackend.
+- Тесты с мок-SearchIndex.

@@ -9,7 +9,7 @@ checks: [nextest]
 manual: no
 
 ## Сделать
-- SEARCH/UID SEARCH, ESEARCH: критерии по метаданным, TEXT/BODY через SearchBackend.
+- SEARCH/UID SEARCH, ESEARCH: критерии по метаданным, TEXT/BODY через SearchIndex.
 
 ## Приёмка
-- Тесты на testkit с мок-SearchBackend.
+- Тесты на testkit с мок-SearchIndex.

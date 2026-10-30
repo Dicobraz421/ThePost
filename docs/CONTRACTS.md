@@ -5,7 +5,7 @@
 Асинхронные трейты, используемые как `dyn`, — через `async-trait`; все трейты `Send + Sync + 'static`.
 
 ## Ids
-- `TenantId`, `AccountId`, `MailboxId`, `MessageId` — newtype над `Uuid` (v7), `Copy`, `Serialize`.
+- `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` — организация по умолчанию.
 - `Uid(u32)` — IMAP UID в ящике, монотонный; `UidValidity(u32)`.
 - `ModSeq(u64)` — монотонный на ящик (IMAP CONDSTORE, состояние JMAP).
 - `BlobHash([u8; 32])` — SHA-256, `Display` — hex. `Gen(u32)` — поколение объекта.
@@ -14,6 +14,11 @@
 ## Errors
 `enum Error { NotFound, Conflict, Invalid(String), Forbidden, QuotaExceeded, Unavailable { retry_after: Option<Duration> }, Internal(String) }`;
 `type Result<T> = std::result::Result<T, Error>`. `Unavailable` — повторяемая (сеть, БД, S3).
+
+## Tenant
+SRS 3.8. Все операции хранилищ выполняются в контексте `TenantId` (параметр или контекст вызова). PostgreSQL — RLS по `tenant_id`,
+параметр сеанса `app.tenant_id` через `SET LOCAL` в начале каждой транзакции. Политики (квоты, срок корзины, лимиты отправки,
+ключи DKIM, профиль Milter) — `PolicyResolver::resolve(tenant, domain, account, mailbox?) -> Policy` по цепочке организация → домен → ящик (→ папка).
 
 ## BlobStore
 SRS 3.2. Объекты неизменяемы, запись идемпотентна.
@@ -66,13 +71,19 @@ SRS 2.1. `publish(Event)`, `subscribe(account) -> EventStream`. `Event { tenant,
 `LeaseStore`: `try_acquire(name, holder, ttl) -> Option<Lease>`, `renew`, `release`. Лидер maintenance,
 индексатор ящика, записи очереди. Реализация — PostgreSQL.
 
-## Outbox
-Задания для фоновых ролей: `push(kind, key, payload)` в транзакции изменения; `claim(kind, limit, lease_ttl)`
-(`SKIP LOCKED`), `done`, `retry_at`. Виды: `IndexMessage`, `DeindexMessage`, `ReindexMailbox`.
+## Events
+SRS 2.5. Журнал событий ядра (outbox): `EventLog::append(tx, CoreEvent)` — в той же транзакции, что изменение.
+`CoreEvent { tenant, account, mailbox?, kind, at }`, `kind: Delivered | Submitted | FlagsChanged | Moved | Trashed | Purged | MailboxCreated | MailboxDeleted`.
+Раздел = hash(account) mod N; подписчик (`EventSink`: индексатор, модули) читает `read(subscriber, partition, after, limit)`,
+фиксирует `commit(subscriber, partition, pos)`; раздел подписчика — под лизой. Доставка не менее одного раза, порядок — в пределах ящика.
 
 ## Search
-SRS 4.6. `SearchBackend`: `query(account, scope: Vec<MailboxId>, q: TextQuery, sort, limit) -> Vec<MessageId>`,
+SRS 4.6. `SearchIndex`: `query(account, scope: Vec<MailboxId>, q: TextQuery, sort, limit) -> Vec<MessageId>`,
 `snippet(account, message, q)`. `IndexManifestStore` (метаданные): `get/put_manifest(account) -> (version, segments)`.
+
+## Directory
+SRS 5.1, 3.8. Каталог организации: `accounts_since(cursor)`, `groups_since`, `aliases`, `domains`, `gal_attributes` — инкрементально.
+Реализация — `tp-auth` (LDAP); модуль «Мультитенантность» подключает каталог на организацию.
 
 ## Auth
 SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>`;
@@ -94,9 +105,16 @@ Hot reload: новая копия рассылается через `watch`; п�
 `QueueStore`: `enqueue(OutMessage { blob, from, rcpts, next_attempt })`, `claim(limit, lease)`,
 `reschedule(id, rcpt, at, reason)`, `complete(id, rcpt, status)`. Повторы и DSN — `tp-smtp`.
 
-## Trash, Retention, Quota (Ф1)
-`TrashStore`: `list(account)`, `restore(item)`, `expired(before, limit)`. `RetentionPolicy` — срок по уровню
-(организация, группа, ящик, папка); `LegalHold` блокирует окончательное удаление. `Quota`: `usage/limit(account)`.
+## Trash, Quota (Ф1)
+`TrashStore`: `list(account)`, `restore(item)`, `expired(before, limit)`; срок — `PolicyResolver`. `Quota`: `usage/limit(account)`.
+Политики хранения и Legal Hold — модуль «Соответствие требованиям» через `DecisionHook::before_final_delete`.
+
+## Extension points
+SRS 2.5, 1.3. Модуль — cargo feature + `modules.<имя>.enabled`. `Module { name(), schema() -> "mod_<имя>", migrations(), register(&mut Registry, &ModuleCtx) }`.
+`Registry`: `add_role`, `add_jmap_capability`, `add_admin_routes`, `add_event_sink`, `add_decision_hook`, реализации трейтов (`BlobStore`, `Directory`, `SearchIndex`).
+`DecisionHook`: `before_final_delete`, `on_delivery`, `on_submission` → `Decision::{ Allow, Deny(reason), Augment(headers|copies) }`;
+без модулей — `Allow`. Данные модуля — только в схеме `mod_<имя>` с собственными миграциями.
 
 ## CHANGELOG
 - 2026-10-29 — первая редакция (по SRS ред. 3).
+- 2026-10-30 — ред. 4: Tenant, Events (журнал событий вместо Outbox), SearchIndex, Directory, Extension points; Legal Hold — модуль.

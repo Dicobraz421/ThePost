@@ -4,12 +4,13 @@ lane: contracts
 deps: []
 class: B
 files: [crates/tp-contracts/src/ids.rs, crates/tp-contracts/src/error.rs, crates/tp-contracts/src/lib.rs]
-read: [docs/CONTRACTS.md#Ids, docs/CONTRACTS.md#Errors]
+read: [docs/CONTRACTS.md#Ids, docs/CONTRACTS.md#Errors, docs/spec/S3.md#3.8]
 checks: [nextest]
 manual: no
 
 ## Сделать
-- Newtype-идентификаторы, Uid, UidValidity, ModSeq, BlobHash (hex Display/FromStr), Gen, BlobKey с путём объекта.
+- Newtype-идентификаторы (TenantId, DomainId, AccountId, MailboxId, MessageId), Uid, UidValidity, ModSeq, BlobHash, Gen, BlobKey с tenant в пути;
+- TenantId::DEFAULT — организация по умолчанию (SRS 3.8).
 - Error и Result; From для io::Error → Unavailable/Internal.
 
 ## Приёмка

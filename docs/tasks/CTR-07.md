@@ -1,4 +1,4 @@
-# CTR-07: Корзина, хранение, квоты
+# CTR-07: Корзина и квоты
 
 lane: contracts
 deps: [CTR-05]
@@ -9,7 +9,7 @@ checks: [nextest]
 manual: no
 
 ## Сделать
-- TrashStore, RetentionPolicy, LegalHold, Quota.
+- TrashStore, Quota; срок корзины и квота — через PolicyResolver. Политики хранения и Legal Hold — модуль «Соответствие требованиям» (DecisionHook).
 
 ## Приёмка
-- Трейты object-safe; разрешение политики по уровням (тест).
+- Трейты object-safe.

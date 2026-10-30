@@ -9,7 +9,7 @@ checks: [nextest]
 manual: no
 
 ## Сделать
-- Подкоманда-экстрактор в sandbox: PDF (lopdf), DOCX/PPTX (zip + quick-xml), XLSX/ODS (calamine), ODT, HTML, TXT; лимиты из конфигурации.
+- Подкоманда-экстрактор в пуле подпроцессов SYS-04 (SRS 2.7), сбой → документ «не извлечён»: PDF (lopdf), DOCX/PPTX (zip + quick-xml), XLSX/ODS (calamine), ODT, HTML, TXT; лимиты из конфигурации.
 
 ## Приёмка
 - Тесты на вложениях корпуса; бомба-архив отклоняется.

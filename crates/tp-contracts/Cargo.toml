@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+schemars.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
