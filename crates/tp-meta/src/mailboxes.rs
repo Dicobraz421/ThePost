@@ -79,7 +79,7 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn fetch(
+pub(crate) async fn fetch(
     tx: &mut PgConnection,
     scope: AccountScope,
     id: MailboxId,
@@ -164,6 +164,34 @@ pub(crate) async fn insert(
     })
 }
 
+/// Выделяет `n` UID в папке `to` (её `ModSeq` — `modseq`); возвращает первый.
+pub(crate) async fn alloc_uids(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    to: MailboxId,
+    n: usize,
+    modseq: ModSeq,
+) -> Result<Uid> {
+    let n = i64::try_from(n).map_err(|_| Error::invalid("слишком много писем"))?;
+    let first: i64 = sqlx::query_scalar(
+        "UPDATE mailboxes SET uid_next = uid_next + $4, highest_modseq = $5
+         WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3 RETURNING uid_next - $4",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(to.as_uuid())
+    .bind(n)
+    .bind(to_i64(modseq.0)?)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?
+    .ok_or(Error::NotFound)?;
+    if first + n - 1 > i64::from(u32::MAX) {
+        return Err(Error::invalid("исчерпаны UID папки"));
+    }
+    Ok(Uid(to_u32(first)?))
+}
+
 /// Письмо, перенесённое [`relocate`] с тем же идентификатором.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Relocated {
@@ -187,24 +215,8 @@ pub(crate) async fn relocate(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let n = i64::try_from(ids.len()).map_err(|_| Error::invalid("слишком много писем"))?;
+    let first = alloc_uids(tx, scope, to, ids.len(), modseq).await?;
     let ms = to_i64(modseq.0)?;
-    let first: i64 = sqlx::query_scalar(
-        "UPDATE mailboxes SET uid_next = uid_next + $4, highest_modseq = $5
-         WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3 RETURNING uid_next - $4",
-    )
-    .bind(scope.tenant.as_uuid())
-    .bind(scope.account.as_uuid())
-    .bind(to.as_uuid())
-    .bind(n)
-    .bind(ms)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(db_err)?
-    .ok_or(Error::NotFound)?;
-    if first + n - 1 > i64::from(u32::MAX) {
-        return Err(Error::invalid("исчерпаны UID папки"));
-    }
     // Подзапрос `old` видит строки до UPDATE: прежние папка и UID.
     let rows: Vec<(Uuid, Uuid, i64, i64)> = sqlx::query_as(
         "WITH src AS (SELECT id, ord FROM unnest($3::uuid[]) WITH ORDINALITY AS s(id, ord)),
@@ -221,7 +233,7 @@ pub(crate) async fn relocate(
     .bind(scope.account.as_uuid())
     .bind(ids)
     .bind(to.as_uuid())
-    .bind(first)
+    .bind(i64::from(first.0))
     .bind(ms)
     .bind(trash)
     .fetch_all(&mut *tx)
