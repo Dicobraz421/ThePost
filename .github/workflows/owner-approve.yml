@@ -1,0 +1,51 @@
+# Автоапрув владельца для PR от dicobraz-bot (решение владельца 2026-10-30).
+# Approve ставится токеном Dicobraz (секрет OWNER_APPROVE_TOKEN) и засчитывается как code owner review.
+# Метка owner-review на PR — автоапрув пропускается, PR ждёт ручного approve; снять метку — approve.
+# Ручной запуск одобряет все открытые PR бота. Код PR не выгружается и не исполняется.
+name: Owner auto-approve
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, unlabeled]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: owner-approve-${{ github.event.pull_request.number || 'all' }}
+
+jobs:
+  approve:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.user.login == 'dicobraz-bot' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       !github.event.pull_request.draft &&
+       !contains(github.event.pull_request.labels.*.name, 'owner-review'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Approve от владельца
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OWNER_APPROVE_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "::error::нет секрета OWNER_APPROVE_TOKEN"; exit 1; fi
+          owner=$(gh api user --jq .login)
+          if [ "$owner" != Dicobraz ]; then echo "::error::токен принадлежит $owner, а не Dicobraz"; exit 1; fi
+          if [ -n "$PR" ]; then
+            prs=$PR
+          else
+            prs=$(gh pr list --author dicobraz-bot --state open --json number,isDraft,isCrossRepository,labels \
+              --jq '.[] | select((.isDraft or .isCrossRepository) | not)
+                        | select([.labels[].name] | index("owner-review") | not) | .number')
+          fi
+          for n in $prs; do
+            if [ "$(gh pr view "$n" --json reviewDecision --jq .reviewDecision)" = APPROVED ]; then
+              echo "#$n уже одобрен"; continue
+            fi
+            gh pr review "$n" --approve --body "Автоапрув владельца: PR от dicobraz-bot (owner-approve.yml)."
+            echo "#$n одобрен"
+          done
