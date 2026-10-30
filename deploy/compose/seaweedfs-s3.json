@@ -1,0 +1,11 @@
+{
+  "identities": [
+    {
+      "name": "thepost-dev",
+      "credentials": [
+        { "accessKey": "thepost", "secretKey": "thepost-dev-secret" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

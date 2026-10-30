@@ -1,0 +1,7 @@
+# Контекст сборки — корень репозитория; в образ нужны только исходники Rust.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/**
+crates/**/target

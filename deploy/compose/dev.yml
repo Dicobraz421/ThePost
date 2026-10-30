@@ -1,0 +1,89 @@
+# Зависимости The Post для разработки и эталон SMB (SRS 1.2). Описание — deploy/README.md.
+#   dev (по умолчанию, см. .env): PostgreSQL 16, SeaweedFS (S3), Valkey, Rspamd — для интеграционных тестов.
+#   smb: thepost (roles: all, локальный BLOB, шина в процессе) + PostgreSQL + Rspamd.
+#     docker compose -f deploy/compose/dev.yml --profile smb up -d --build
+# Пароли и ключи — только для локальной разработки.
+
+name: thepost
+
+services:
+  postgres:
+    image: postgres:16
+    profiles: [dev, smb]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "${TP_PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.80
+    profiles: [dev]
+    command: ["server", "-dir=/data", "-ip.bind=0.0.0.0", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json"]
+    ports:
+      - "${TP_S3_PORT:-8333}:8333"
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+      - s3data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  valkey:
+    image: valkey/valkey:8.1
+    profiles: [dev]
+    ports:
+      - "${TP_VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rspamd:
+    image: rspamd/rspamd:3.11.1
+    profiles: [dev, smb]
+    ports:
+      - "${TP_RSPAMD_PORT:-11333}:11333"
+      - "${TP_RSPAMD_UI_PORT:-11334}:11334"
+    volumes:
+      - ./rspamd/worker-normal.inc:/etc/rspamd/override.d/worker-normal.inc:ro
+      - ./rspamd/worker-controller.inc:/etc/rspamd/override.d/worker-controller.inc:ro
+
+  thepost:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: thepost:dev
+    profiles: [smb]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rspamd:
+        condition: service_started
+    volumes:
+      - ./thepost-smb.yaml:/etc/thepost/config.yaml:ro
+      - tpdata:/var/lib/thepost
+    ports:
+      - "${TP_SMTP_PORT:-25}:25"
+      - "${TP_SUBMISSIONS_PORT:-465}:465"
+      - "${TP_SUBMISSION_PORT:-587}:587"
+      - "${TP_IMAP_PORT:-143}:143"
+      - "${TP_IMAPS_PORT:-993}:993"
+      - "${TP_HTTP_PORT:-80}:80"
+      - "${TP_HTTPS_PORT:-443}:443"
+
+volumes:
+  pgdata:
+  s3data:
+  tpdata:
