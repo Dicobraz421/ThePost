@@ -197,11 +197,7 @@ mod tests {
     fn backup_takes_over_on_owner_failure() {
         let mut ring = Rendezvous::new(["n1", "n2", "n3"]);
         for acc in accounts(500) {
-            let ranked: Vec<String> = ring
-                .owners(acc, 2)
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
+            let ranked: Vec<String> = ring.owners(acc, 2).into_iter().map(str::to_owned).collect();
             assert_eq!(ranked.len(), 2);
             ring.remove(&ranked[0]);
             assert_eq!(ring.owner(acc), Some(ranked[1].as_str()));

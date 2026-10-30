@@ -94,7 +94,9 @@ async fn fans_out_to_all_subscribers(bus: &dyn EventBus) {
     let scope = scope();
     let mut one = bus.subscribe(scope).await.expect("subscribe");
     let mut two = bus.subscribe(scope).await.expect("subscribe");
-    bus.publish(mailbox_changed(scope, 1)).await.expect("publish");
+    bus.publish(mailbox_changed(scope, 1))
+        .await
+        .expect("publish");
     assert_eq!(next(&mut one).await, Some(mailbox_changed(scope, 1)));
     assert_eq!(next(&mut two).await, Some(mailbox_changed(scope, 1)));
 }
@@ -103,7 +105,9 @@ async fn keeps_order(bus: &dyn EventBus) {
     let scope = scope();
     let mut sub = bus.subscribe(scope).await.expect("subscribe");
     for i in 1..=20 {
-        bus.publish(mailbox_changed(scope, i)).await.expect("publish");
+        bus.publish(mailbox_changed(scope, i))
+            .await
+            .expect("publish");
     }
     for i in 1..=20 {
         assert_eq!(next(&mut sub).await, Some(mailbox_changed(scope, i)));
@@ -114,7 +118,9 @@ async fn separates_system_events(bus: &dyn EventBus) {
     let scope = scope();
     let mut sys = bus.subscribe_system().await.expect("subscribe");
     let mut acc = bus.subscribe(scope).await.expect("subscribe");
-    bus.publish(mailbox_changed(scope, 1)).await.expect("publish");
+    bus.publish(mailbox_changed(scope, 1))
+        .await
+        .expect("publish");
     for kind in [EventKind::QueueReady, EventKind::ConfigReloaded] {
         bus.publish(system(kind)).await.expect("publish");
     }
@@ -123,10 +129,15 @@ async fn separates_system_events(bus: &dyn EventBus) {
         ..system(EventKind::QueueReady)
     };
     bus.publish(tenant_event.clone()).await.expect("publish");
-    bus.publish(mailbox_changed(scope, 2)).await.expect("publish");
+    bus.publish(mailbox_changed(scope, 2))
+        .await
+        .expect("publish");
 
     assert_eq!(next(&mut sys).await, Some(system(EventKind::QueueReady)));
-    assert_eq!(next(&mut sys).await, Some(system(EventKind::ConfigReloaded)));
+    assert_eq!(
+        next(&mut sys).await,
+        Some(system(EventKind::ConfigReloaded))
+    );
     assert_eq!(next(&mut sys).await, Some(tenant_event));
     assert_eq!(next(&mut acc).await, Some(mailbox_changed(scope, 1)));
     assert_eq!(next(&mut acc).await, Some(mailbox_changed(scope, 2)));
@@ -143,11 +154,15 @@ async fn dropped_subscriber_does_not_block(bus: &dyn EventBus) {
     let gone = bus.subscribe(scope).await.expect("subscribe");
     let mut live = bus.subscribe(scope).await.expect("subscribe");
     drop(gone);
-    bus.publish(mailbox_changed(scope, 1)).await.expect("publish");
+    bus.publish(mailbox_changed(scope, 1))
+        .await
+        .expect("publish");
     assert_eq!(next(&mut live).await, Some(mailbox_changed(scope, 1)));
     drop(live);
     // Канал отпущен и создаётся заново следующей подпиской.
     let mut again = bus.subscribe(scope).await.expect("subscribe");
-    bus.publish(mailbox_changed(scope, 2)).await.expect("publish");
+    bus.publish(mailbox_changed(scope, 2))
+        .await
+        .expect("publish");
     assert_eq!(next(&mut again).await, Some(mailbox_changed(scope, 2)));
 }
