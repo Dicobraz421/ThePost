@@ -66,3 +66,27 @@ pub async fn domain(pool: &PgPool, tenant: TenantId) -> (DomainId, String) {
     tx.commit().await.expect("commit");
     (id, name)
 }
+
+/// Новая учётная запись в новой организации.
+pub async fn account(meta: &PgMeta) -> tp_contracts::meta::AccountScope {
+    use tp_contracts::meta::{AccountStore, AccountUpsert};
+    let tenant = tenant(meta.pool()).await;
+    let (domain, name) = domain(meta.pool(), tenant).await;
+    let acc = meta
+        .upsert(
+            tenant,
+            AccountUpsert {
+                domain,
+                login: format!("user@{name}"),
+                display_name: "User".into(),
+                external_id: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("upsert");
+    tp_contracts::meta::AccountScope {
+        tenant,
+        account: acc.id,
+    }
+}

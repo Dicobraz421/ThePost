@@ -4,7 +4,10 @@
 //! короткая транзакция в контексте организации ([`schema::begin`]); к BLOB и сети внутри транзакций
 //! реализация не обращается.
 
+pub mod accounts;
 pub mod blob_index;
+mod changelog;
+pub mod mailboxes;
 pub mod schema;
 
 use std::sync::Arc;
@@ -21,6 +24,8 @@ pub struct MetaConfig {
     /// Срок хранения надгробия BLOB после `finalize_delete`: загрузка, начатая до удаления объекта,
     /// получит `Bumped`. Больше максимальной длительности загрузки объекта (SRS 3.4).
     pub blob_tombstone_ttl: Duration,
+    /// Число разделов журнала событий ядра; постоянно для инсталляции (смена — миграция журнала).
+    pub event_partitions: u32,
 }
 
 impl Default for MetaConfig {
@@ -28,6 +33,7 @@ impl Default for MetaConfig {
         Self {
             migrate_on_start: true,
             blob_tombstone_ttl: Duration::from_secs(24 * 3600),
+            event_partitions: 64,
         }
     }
 }
