@@ -5,12 +5,21 @@ domain: example.ru
 
 # Кластер PostgreSQL через PgBouncer.
 database:
-  url: postgres://thepost:CHANGE_ME@pgbouncer.example.ru:6432/thepost
+  url: postgres://thepost@pgbouncer.example.ru:6432/thepost?sslmode=verify-full
+  password: { secret: "thepost/db#password" }
 
-# S3 (эталон — SeaweedFS); ключи доступа — в секции BLOB-хранилища или окружении сервиса.
+# S3 (эталон — SeaweedFS); ключи доступа — ссылки на секрет thepost/s3 в секции BLOB-хранилища.
 blob:
   url: s3://thepost-blob
 
 roles: [mailbox]
 
 # Шина событий и кэш — Valkey (секция задаётся платформой, см. thepost config schema).
+
+# Секреты — только из хранилища (OpenBao или Vault), канал — TLS; поля секции — по PLT-12.
+secrets:
+  url: https://openbao.example.ru:8200
+  auth:
+    approle:
+      role_id_file: /etc/thepost/openbao/role_id
+      secret_id_file: /run/credentials/thepost.service/openbao-secret-id

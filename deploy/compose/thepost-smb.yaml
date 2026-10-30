@@ -1,7 +1,20 @@
 # Конфигурация thepost для профиля smb в compose (эталон — deploy/config/all.yaml).
 domain: example.test
+# Роль thepost без SUPERUSER и BYPASSRLS (postgres-role-tls); пароль — только из OpenBao.
 database:
-  url: postgres://postgres:postgres@postgres-tls:5432/postgres?sslmode=verify-full&sslrootcert=/etc/thepost/tls/ca.pem
+  url: postgres://thepost@postgres-tls:5432/thepost?sslmode=verify-full&sslrootcert=/etc/thepost/tls/ca.pem
+  password: { secret: "thepost/db#password" }
 blob:
   url: file:///var/lib/thepost/blob
 roles: [all]
+
+# Хранилище секретов (OpenBao, только TLS); вход AppRole — role_id и secret_id выдаёт openbao-init-tls.
+# Поля секции — по PLT-12.
+secrets:
+  url: https://openbao-tls:8200
+  tls:
+    ca_file: /etc/thepost/tls/ca.pem
+  auth:
+    approle:
+      role_id_file: /etc/thepost/openbao/role_id
+      secret_id_file: /etc/thepost/openbao/secret_id

@@ -18,7 +18,7 @@ RestartSec=5s
 TimeoutStopSec=60s
 LimitNOFILE=1048576
 
-# Каталоги: /etc/thepost (чтение; владелец root, секреты — в config.yaml с правами 0640 root:thepost),
+# Каталоги: /etc/thepost (чтение; владелец root, config.yaml 0640 root:thepost — секретов в нём нет, только ссылки),
 # /var/lib/thepost (данные, локальный BLOB), /run/thepost.
 ConfigurationDirectory=thepost
 StateDirectory=thepost
@@ -26,6 +26,10 @@ StateDirectoryMode=0750
 RuntimeDirectory=thepost
 RuntimeDirectoryMode=0750
 UMask=0027
+
+# Вход в OpenBao (AppRole): secret_id — учётные данные systemd, процессу доступен только
+# /run/credentials/thepost.service/openbao-secret-id. С TPM — LoadCredentialEncrypted= (systemd-creds encrypt --with-key=tpm2).
+LoadCredential=openbao-secret-id:/etc/thepost/credentials/openbao-secret-id
 
 # Порты <1024 (25, 465, 587, 143, 993, 80, 443) без root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE

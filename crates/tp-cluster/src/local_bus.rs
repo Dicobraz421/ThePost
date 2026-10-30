@@ -4,6 +4,7 @@
 //! общем канале. Канал учётной записи создаётся первой подпиской и удаляется с последним подписчиком.
 //! Подписчик, отставший больше чем на буфер, получает `Lagged`: его поток завершается, и подписчик,
 //! переподписавшись, сверяется с хранилищем по `ModSeq` (доставка at-most-once).
+//! Счётчики — [`BusCounters`] (метрики платформы).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +17,8 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tp_contracts::bus::{Event, EventBus, EventStream};
 use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Result, TenantId};
+
+use crate::metrics::{BusCounters, BusMetrics, inc};
 
 /// Конфигурация шины в процессе.
 #[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -46,7 +49,7 @@ struct Inner {
     generation: AtomicU64,
     accounts: Mutex<HashMap<Key, Channel>>,
     system: Mutex<broadcast::Sender<Event>>,
-    lagged: AtomicU64,
+    counters: Arc<BusCounters>,
 }
 
 impl Inner {
@@ -68,6 +71,13 @@ pub struct LocalBus {
 impl LocalBus {
     /// Создаёт шину.
     pub fn new(config: &LocalBusConfig) -> Self {
+        let counters = BusCounters::default();
+        counters.set_connected(true);
+        Self::with_counters(config, Arc::new(counters))
+    }
+
+    /// Шина со счётчиками внешней шины: считает выдачу подписчикам и отставания.
+    pub(crate) fn with_counters(config: &LocalBusConfig, counters: Arc<BusCounters>) -> Self {
         // broadcast::channel паникует на 0 и на ёмкости больше usize::MAX / 2.
         let capacity = config.capacity.clamp(1, usize::MAX >> 1);
         Self {
@@ -76,14 +86,24 @@ impl LocalBus {
                 generation: AtomicU64::new(0),
                 accounts: Mutex::new(HashMap::new()),
                 system: Mutex::new(broadcast::channel(capacity).0),
-                lagged: AtomicU64::new(0),
+                counters,
             }),
         }
     }
 
     /// Сколько раз подписчики отстали и были отключены.
     pub fn lagged(&self) -> u64 {
-        self.inner.lagged.load(Ordering::Relaxed)
+        self.inner.counters.lagged.load(Ordering::Relaxed)
+    }
+
+    /// Счётчики шины для метрик платформы.
+    pub fn counters(&self) -> Arc<BusCounters> {
+        Arc::clone(&self.inner.counters)
+    }
+
+    /// Снимок счётчиков.
+    pub fn metrics(&self) -> BusMetrics {
+        self.inner.counters.snapshot()
     }
 
     /// Завершает потоки всех подписчиков (после уже накопленных уведомлений): они переподписываются
@@ -129,6 +149,7 @@ impl LocalBus {
         }
         into_stream(Subscription {
             rx,
+            counters: self.counters(),
             inner: Arc::downgrade(&self.inner),
             channel: Some((key, generation)),
         })
@@ -138,6 +159,7 @@ impl LocalBus {
     pub(crate) fn subscribe_system_now(&self) -> EventStream {
         into_stream(Subscription {
             rx: self.inner.system().subscribe(),
+            counters: self.counters(),
             inner: Arc::downgrade(&self.inner),
             channel: None,
         })
@@ -158,6 +180,9 @@ impl Default for LocalBus {
 #[async_trait]
 impl EventBus for LocalBus {
     async fn publish(&self, event: Event) -> Result<()> {
+        let counters = &self.inner.counters;
+        inc(&counters.published);
+        inc(&counters.received);
         self.deliver(event);
         Ok(())
     }
@@ -175,6 +200,7 @@ impl EventBus for LocalBus {
 #[derive(Debug)]
 struct Subscription {
     rx: broadcast::Receiver<Event>,
+    counters: Arc<BusCounters>,
     inner: Weak<Inner>,
     channel: Option<(Key, u64)>,
 }
@@ -198,11 +224,12 @@ impl Drop for Subscription {
 fn into_stream(sub: Subscription) -> EventStream {
     stream::unfold(sub, |mut sub| async move {
         match sub.rx.recv().await {
-            Ok(event) => Some((event, sub)),
+            Ok(event) => {
+                inc(&sub.counters.delivered);
+                Some((event, sub))
+            }
             Err(RecvError::Lagged(skipped)) => {
-                if let Some(inner) = sub.inner.upgrade() {
-                    inner.lagged.fetch_add(1, Ordering::Relaxed);
-                }
+                inc(&sub.counters.lagged);
                 tracing::debug!(skipped, "шина: подписчик отстал, поток завершён");
                 None
             }
@@ -294,6 +321,38 @@ mod tests {
         assert_eq!(bus.account_channels(), 1);
         bus.publish(changed(scope, 2)).await.expect("publish");
         assert_eq!(fresh.next().await, Some(changed(scope, 2)));
+    }
+
+    #[tokio::test]
+    async fn counters_grow_on_publish_and_receive() {
+        let bus = LocalBus::default();
+        let counters = bus.counters();
+        assert_eq!(
+            counters.snapshot(),
+            BusMetrics {
+                connected: true,
+                ..BusMetrics::default()
+            }
+        );
+        let scope = conformance::scope();
+        let mut a = bus.subscribe(scope).await.expect("subscribe");
+        let mut b = bus.subscribe(scope).await.expect("subscribe");
+        let mut sys = bus.subscribe_system().await.expect("subscribe");
+        bus.publish(changed(scope, 1)).await.expect("publish");
+        bus.publish(conformance::system(EventKind::QueueReady))
+            .await
+            .expect("publish");
+        assert_eq!(a.next().await, Some(changed(scope, 1)));
+        assert_eq!(b.next().await, Some(changed(scope, 1)));
+        assert!(sys.next().await.is_some());
+
+        let m = counters.snapshot();
+        assert_eq!((m.published, m.received, m.delivered), (2, 2, 3));
+        assert_eq!(
+            (m.publish_errors, m.decode_errors, m.reconnects, m.lagged),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(bus.metrics(), m);
     }
 
     #[test]

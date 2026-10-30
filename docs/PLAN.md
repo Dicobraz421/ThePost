@@ -34,14 +34,26 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-04 (ветка `x/contracts-04`) | CTR-11, CTR-12 | B | contracts-02 | 1 |
-| sys-02 | SYS-05 | B | sys-01 | 2 |
-| ci-02 | CI-02 | B | ci-01 | 3 |
-| deploy-03 | DEP-06 | A | deploy-01 | 3 |
+| ✅ contracts-04 (ветка `x/contracts-04`) | CTR-11, CTR-12 | B | contracts-02 | 1 |
+| ✅ sys-02 | SYS-05 | B | sys-01 | 2 |
+| ✅ ci-02 | CI-02 | B | ci-01 | 3 |
+| ✅ deploy-03 | DEP-06 | A | deploy-01 | 3 |
 | cluster-02 | CLU-04, CLU-05 | A | cluster-01, contracts-04, ci-02 | 4 |
 | platform-03 | PLT-09, PLT-10, PLT-11 | A | platform-02, cluster-02, contracts-04 | 2 |
 | meta-04 | META-14 | A | meta-02, contracts-04 | 3 |
 | blob-03 | BLOB-09, BLOB-10 | A | blob-02, contracts-04 | 4 |
+
+### Решения владельца 2026-10-30, секреты и журнал (`docs/decisions/2026-10-30-config-events-secrets.md`)
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| contracts-05 | CTR-13, CTR-14, CTR-15 | B | contracts-04 | 1 |
+| deploy-04 | DEP-07 | A | deploy-03 | 3 |
+| testkit-03 | KIT-06 | A | contracts-05 | 1 |
+| meta-05 | META-15, META-16, META-17 | A/B | meta-04, contracts-05 | 3 |
+| cluster-03 | CLU-06 | A | cluster-02, contracts-05 | 4 |
+| platform-04 | PLT-12 | B | platform-03, contracts-05 | 2 |
+| meta-06 | META-18 | A | meta-05, platform-04 | 3 |
 
 Выход Ф0: `thepost serve` с минимальным config и `roles: [all]` доходит до ready; RLS по tenant включён; журнал событий и точки расширения работают; `doctor` и `verify` работают; протокол BLOB проверен тестом гонки.
 

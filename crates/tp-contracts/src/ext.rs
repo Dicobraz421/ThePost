@@ -3,7 +3,7 @@
 //! Модуль — набор крейтов под cargo feature, активируется `modules.<имя>.enabled` в config.yaml.
 //! Ядро не меняется: модуль при запуске регистрирует в [`Registry`] свои роли, capability JMAP,
 //! маршруты Admin API, подписчиков журнала событий ([`EventSink`]), точки принятия решений
-//! ([`DecisionHook`]) и реализации интерфейсов ядра ([`BlobStore`], [`Directory`], [`SearchIndex`]).
+//! ([`DecisionHook`]) и реализации интерфейсов ядра ([`BlobStore`], [`Directory`], [`SearchIndex`], [`SecretStore`]).
 //! Данные модуля — только в схеме PostgreSQL `mod_<имя>` с собственной последовательностью миграций.
 //!
 //! # Точки принятия решений
@@ -49,6 +49,7 @@ use crate::mailstore::Delivery;
 use crate::meta::AccountScope;
 use crate::role::{RoleService, watch};
 use crate::search::SearchIndex;
+use crate::secrets::SecretStore;
 
 // ---------- Модуль ----------
 
@@ -355,6 +356,7 @@ pub struct Registry {
     blob_store: Option<Arc<dyn BlobStore>>,
     directory: Option<Arc<dyn Directory>>,
     search_index: Option<Arc<dyn SearchIndex>>,
+    secret_store: Option<Arc<dyn SecretStore>>,
 }
 
 fn unique<T: ?Sized>(items: &[Arc<T>], key: impl Fn(&T) -> &str, new: &T) -> Result<()> {
@@ -424,6 +426,11 @@ impl Registry {
         set_once(&mut self.search_index, index)
     }
 
+    /// Хранилище секретов вместо встроенного клиента OpenBao/Vault.
+    pub fn set_secret_store(&mut self, store: Arc<dyn SecretStore>) -> Result<()> {
+        set_once(&mut self.secret_store, store)
+    }
+
     /// Роли модулей.
     pub fn roles(&self) -> &[Arc<dyn RoleService>] {
         &self.roles
@@ -463,6 +470,11 @@ impl Registry {
     pub fn search_index(&self) -> Option<Arc<dyn SearchIndex>> {
         self.search_index.clone()
     }
+
+    /// Хранилище секретов модуля, если зарегистрировано.
+    pub fn secret_store(&self) -> Option<Arc<dyn SecretStore>> {
+        self.secret_store.clone()
+    }
 }
 
 impl fmt::Debug for Registry {
@@ -488,6 +500,7 @@ impl fmt::Debug for Registry {
             .field("blob_store", &self.blob_store.is_some())
             .field("directory", &self.directory.is_some())
             .field("search_index", &self.search_index.is_some())
+            .field("secret_store", &self.secret_store.is_some())
             .finish()
     }
 }
@@ -604,6 +617,28 @@ mod tests {
         assert!(!reg.decision_hooks().is_empty());
         assert!(reg.blob_store().is_none());
         assert!(format!("{reg:?}").contains("passive"));
+    }
+
+    struct NoSecrets;
+
+    #[async_trait]
+    impl SecretStore for NoSecrets {
+        async fn get(&self, _: &crate::secrets::SecretRef) -> Result<crate::secrets::Secret> {
+            Err(Error::NotFound)
+        }
+    }
+
+    #[test]
+    fn registry_secret_store_once() {
+        let mut reg = Registry::default();
+        assert!(reg.secret_store().is_none());
+        reg.set_secret_store(Arc::new(NoSecrets)).expect("first");
+        assert_eq!(
+            reg.set_secret_store(Arc::new(NoSecrets)),
+            Err(Error::Conflict)
+        );
+        assert!(reg.secret_store().is_some());
+        assert!(format!("{reg:?}").contains("secret_store: true"));
     }
 
     #[test]
