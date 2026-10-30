@@ -41,6 +41,9 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
         run: |
           if [ -z "$BASE" ]; then echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"; exit 0; fi
+          # pull_request: HEAD — пробный мерж с main; base.sha в событии отстаёт, если main ушёл вперёд,
+          # и в изменения попадают чужие файлы. Первый родитель мержа — тот main, с которым сливали.
+          if [ "$EVENT" = pull_request ] && git rev-parse -q --verify HEAD^2 >/dev/null; then BASE=$(git rev-parse HEAD^1); fi
           git diff --name-only "$BASE" HEAD > changed.txt
           cat changed.txt
           if [ "$EVENT" = pull_request ]; then
