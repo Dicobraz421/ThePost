@@ -25,6 +25,7 @@ use crate::reload::ReloadConfig;
 use crate::roles::RuntimeConfig;
 use crate::service_http::ServiceHttpConfig;
 use crate::telemetry::TelemetryConfig;
+use crate::tls::TlsConfig;
 
 /// Обязательные параметры (SRS 5.5): адрес PostgreSQL, адрес BLOB-хранилища, основной домен.
 pub const REQUIRED: &[&str] = &["database.url", "blob.url", "domain"];
@@ -105,7 +106,7 @@ impl Default for SectionRegistry {
 }
 
 impl SectionRegistry {
-    /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`.
+    /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`, `tls`.
     pub fn new() -> Self {
         let mut r = Self {
             sections: BTreeMap::new(),
@@ -116,6 +117,7 @@ impl SectionRegistry {
             .insert("service_http", def::<ServiceHttpConfig>());
         r.sections.insert("reload", def::<ReloadConfig>());
         r.sections.insert("runtime", def::<RuntimeConfig>());
+        r.sections.insert("tls", def::<TlsConfig>());
         r
     }
 
