@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tp_contracts::Result;
+use tp_contracts::config::duration;
 use tp_contracts::events::{Partition, PartitionAssigner};
 use tp_contracts::membership::{Membership, NodeId};
 
@@ -21,15 +22,16 @@ use crate::hashing::Rendezvous;
 /// Конфигурация назначения разделов.
 #[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
 pub struct PartitionAssignerConfig {
-    /// Интервал опроса живых узлов, мс (не меньше 1). Смена состава замечается не позже чем через интервал;
-    /// разумно — не больше периода продления записи узла (`ttl / 3`).
-    pub poll_interval_ms: u64,
+    /// Интервал опроса живых узлов (`2s`, `500ms`; ноль считается за 1 мс). Смена состава замечается
+    /// не позже чем через интервал; разумно — не больше периода продления записи узла (`ttl / 3`).
+    #[schemars(with = "duration::HumanDuration")]
+    pub poll_interval: Duration,
 }
 
 impl Default for PartitionAssignerConfig {
     fn default() -> Self {
         Self {
-            poll_interval_ms: 2_000,
+            poll_interval: Duration::from_secs(2),
         }
     }
 }
@@ -70,14 +72,14 @@ pub struct RendezvousAssigner {
 }
 
 impl RendezvousAssigner {
-    /// Читает живые узлы и запускает их опрос с интервалом `config.poll_interval_ms`.
+    /// Читает живые узлы и запускает их опрос с интервалом `config.poll_interval`.
     /// Ошибка первого чтения состава возвращается: без состава узлу нечего назначить.
     pub async fn start(
         membership: Arc<dyn Membership>,
         config: &PartitionAssignerConfig,
     ) -> Result<Self> {
         let members = watch::Sender::new(normalize(membership.live().await?));
-        let period = Duration::from_millis(config.poll_interval_ms.max(1));
+        let period = config.poll_interval.max(Duration::from_millis(1));
         let poller = tokio::spawn(poll(membership, members.clone(), period));
         Ok(Self {
             members,
@@ -281,6 +283,20 @@ mod tests {
     }
 
     #[test]
+    fn config_interval_is_humantime() {
+        assert_eq!(
+            PartitionAssignerConfig::default().poll_interval,
+            Duration::from_secs(2)
+        );
+        let schema = schemars::schema_for!(PartitionAssignerConfig)
+            .as_value()
+            .to_string();
+        assert!(schema.contains("poll_interval"), "{schema}");
+        assert!(!schema.contains("poll_interval_ms"), "{schema}");
+        assert!(schema.contains("\"type\":\"string\""), "{schema}");
+    }
+
+    #[test]
     fn key_is_pinned() {
         // Ключ `<подписчик>/<раздел>` одинаков на всех узлах и версиях.
         assert_eq!(partition_key("indexer", Partition(17)), "indexer/17");
@@ -359,7 +375,7 @@ mod tests {
         let m = Arc::new(StubMembership::default());
         m.set(&["n1"]);
         let config = PartitionAssignerConfig {
-            poll_interval_ms: 10,
+            poll_interval: Duration::from_millis(10),
         };
         let a = RendezvousAssigner::start(m.clone(), &config)
             .await
