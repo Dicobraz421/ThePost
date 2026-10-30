@@ -11,9 +11,14 @@
 //! неверные типы (первая в каждой секции), открытые внутренние каналы вне профиля dev. Неизвестные параметры
 //! (по JSON Schema секций, включая секции модулей) в строгом режиме — ошибки, в мягком — предупреждения в лог
 //! ([`Config::warnings`]); в обоих режимах они отбрасываются до разбора секций.
+//!
+//! Секреты (решение 2026-10-30, PLT-12) — только ссылки `{ secret: "<путь>#<поле>" }`: значение открытым текстом
+//! в параметре с именем секрета (`password`, `token`, `secret_access_key` …) и пароль в адресе вне профиля dev —
+//! ошибки обоих режимов. Ссылки всех секций собираются при разборе ([`Config::secret_refs`]) и читаются из
+//! хранилища [`Config::resolve_secrets`] при запуске и перечитывании.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -26,12 +31,14 @@ use serde::{Deserialize, Deserializer};
 use serde_yaml_ng::{Mapping, Value};
 use tp_contracts::Error;
 use tp_contracts::role::{RoleEntry, RolePreset, RoleSet};
+use tp_contracts::secrets::{Secret, SecretLease, SecretRef, SecretStore};
 use tp_contracts::tls::Profile;
 
 use crate::acme::AcmeConfig;
 use crate::ratelimit::RateLimitConfig;
 use crate::reload::ReloadConfig;
 use crate::roles::RuntimeConfig;
+use crate::secrets::SecretsConfig;
 use crate::service_http::ServiceHttpConfig;
 use crate::telemetry::TelemetryConfig;
 use crate::tls::TlsConfig;
@@ -44,6 +51,25 @@ pub const ENV_PREFIX: &str = "THEPOST_";
 
 /// Переменная с путём к config.yaml; не переопределяет параметр.
 pub const ENV_CONFIG_PATH: &str = "THEPOST_CONFIG";
+
+/// Имена параметров со значением-секретом: допустима только ссылка `{ secret: "<путь>#<поле>" }` (регистр не важен).
+pub const SECRET_KEYS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret_access_key",
+    "secret_key",
+    "client_secret",
+    "secret_id",
+    "api_key",
+    "private_key",
+    "token",
+    "access_token",
+    "refresh_token",
+];
+
+/// Сообщение о секрете открытым текстом (без значения).
+const PLAINTEXT_SECRET: &str =
+    "secret in plaintext is not allowed; use a reference { secret: \"<path>#<field>\" }";
 
 /// Ключи верхнего уровня, которыми владеет платформа.
 const CORE_KEYS: &[&str] = &["domain", "profile", "roles", "modules"];
@@ -133,7 +159,8 @@ impl Default for SectionRegistry {
 }
 
 impl SectionRegistry {
-    /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`, `tls`, `ratelimit`, `acme`.
+    /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`, `tls`, `ratelimit`, `acme`,
+    /// `secrets`.
     pub fn new() -> Self {
         let mut r = Self {
             sections: BTreeMap::new(),
@@ -148,10 +175,15 @@ impl SectionRegistry {
         r.sections.insert("tls", def::<TlsConfig>());
         r.sections.insert("ratelimit", def::<RateLimitConfig>());
         r.sections.insert("acme", def::<AcmeConfig>());
+        r.sections.insert("secrets", def::<SecretsConfig>());
         r.checks
             .entry("service_http")
             .or_default()
             .push(check_fn(ServiceHttpConfig::check));
+        r.checks
+            .entry("secrets")
+            .or_default()
+            .push(check_fn(SecretsConfig::check));
         r
     }
 
@@ -335,6 +367,8 @@ impl SectionRegistry {
         }
 
         self.check_channels(&tree, &sections, profile, &mut errors);
+        self.check_plaintext_secrets(&tree, profile, &mut errors);
+        let secret_refs = self.secret_refs(&tree, &mut errors);
 
         if !errors.is_empty() {
             return Err(ConfigError::Invalid(errors));
@@ -350,7 +384,44 @@ impl SectionRegistry {
             sections,
             modules,
             warnings,
+            secret_refs,
+            secrets: BTreeMap::new(),
         })
+    }
+
+    /// Секреты открытым текстом (обе проверки): параметр с именем из [`SECRET_KEYS`] со строкой или числом и —
+    /// вне профиля dev — адрес с паролем (`scheme://user:password@…`, `password=`). Адреса секций с собственной
+    /// проверкой ([`Self::add_check`]) не просматриваются: их проверяют крейты (`PoolConfig::check` и т. п.).
+    fn check_plaintext_secrets(&self, tree: &Value, profile: Profile, errors: &mut Vec<String>) {
+        let Value::Mapping(root) = tree else {
+            return;
+        };
+        for (key, value) in root {
+            let name = key.as_str().unwrap_or_default();
+            if ["domain", "profile", "roles"].contains(&name) {
+                continue;
+            }
+            let urls = profile != Profile::Dev && !self.checks.contains_key(name);
+            let mut path = vec![Seg::Key(key.clone())];
+            find_plaintext_secrets(value, &mut path, urls, errors);
+        }
+    }
+
+    /// Ссылки на секреты во всех секциях. Неверная ссылка в секции без регистрации — ошибка (секции из реестра
+    /// сообщают о ней при разборе).
+    fn secret_refs(&self, tree: &Value, errors: &mut Vec<String>) -> BTreeSet<SecretRef> {
+        let mut out = BTreeSet::new();
+        let Value::Mapping(root) = tree else {
+            return out;
+        };
+        for (key, value) in root {
+            let report = !key
+                .as_str()
+                .is_some_and(|n| self.sections.contains_key(n) || n == "modules");
+            let mut path = vec![Seg::Key(key.clone())];
+            collect_refs(value, &mut path, report, &mut out, errors);
+        }
+        out
     }
 
     /// Открытые внутренние каналы вне профиля dev (решение «Шифрование любого обмена»): проверки секций
@@ -490,6 +561,9 @@ pub struct Config {
     sections: BTreeMap<&'static str, AnySection>,
     modules: BTreeMap<&'static str, ModuleState>,
     warnings: Vec<String>,
+    secret_refs: BTreeSet<SecretRef>,
+    /// Значения ссылок после [`Config::resolve_secrets`].
+    secrets: BTreeMap<SecretRef, Secret>,
 }
 
 #[derive(Clone)]
@@ -561,6 +635,71 @@ impl Config {
     /// Секция модуля `name` как `T` (тот же тип, что в `add_module`).
     pub fn module<T: Any + Send + Sync>(&self, name: &str) -> tp_contracts::Result<Arc<T>> {
         downcast(&self.modules.get(name).ok_or(Error::NotFound)?.config)
+    }
+
+    /// Ссылки на секреты во всех секциях (`{ secret: "<путь>#<поле>" }`), без повторов.
+    pub fn secret_refs(&self) -> impl Iterator<Item = &SecretRef> {
+        self.secret_refs.iter()
+    }
+
+    /// Значение секрета, прочитанное [`Config::resolve_secrets`]. Ссылки нет в конфигурации или секреты
+    /// не прочитаны — `NotFound`.
+    pub fn secret(&self, secret: &SecretRef) -> tp_contracts::Result<Secret> {
+        self.secrets.get(secret).cloned().ok_or(Error::NotFound)
+    }
+
+    /// Читает все секреты конфигурации из `store`. Ошибка — прочитанные значения не меняются: все ссылки
+    /// недоступны временно — `Unavailable`, иначе `Invalid` со списком ссылок и причин (без значений).
+    pub async fn resolve_secrets(&mut self, store: &dyn SecretStore) -> tp_contracts::Result<()> {
+        let mut resolved = BTreeMap::new();
+        let mut failed = Vec::new();
+        let mut retryable = true;
+        for r in &self.secret_refs {
+            match store.get(r).await {
+                Ok(s) => {
+                    resolved.insert(r.clone(), s);
+                }
+                Err(e) => {
+                    retryable &= e.is_retryable();
+                    failed.push(format!("secret {r}: {}", message(&e)));
+                }
+            }
+        }
+        if failed.is_empty() {
+            self.secrets = resolved;
+            return Ok(());
+        }
+        for f in &failed {
+            tracing::warn!(error = %f, "configuration secret not resolved");
+        }
+        if retryable {
+            Err(Error::UNAVAILABLE)
+        } else {
+            Err(Error::Invalid(failed.join("\n")))
+        }
+    }
+
+    /// Те же значения и аренды секретов, что у `other`.
+    pub(crate) fn same_secrets(&self, other: &Config) -> bool {
+        self.secrets.len() == other.secrets.len()
+            && self
+                .secrets
+                .iter()
+                .zip(&other.secrets)
+                .all(|((ra, a), (rb, b))| {
+                    ra == rb && a.expose() == b.expose() && a.lease() == b.lease()
+                })
+    }
+
+    /// Аренды прочитанных секретов, без повторов (поля одного динамического пути делят аренду).
+    pub(crate) fn secret_leases(&self) -> Vec<SecretLease> {
+        let mut seen = BTreeSet::new();
+        self.secrets
+            .values()
+            .filter_map(Secret::lease)
+            .filter(|l| !l.ttl.is_zero() && seen.insert(l.id.clone()))
+            .cloned()
+            .collect()
     }
 }
 
@@ -779,6 +918,118 @@ fn walk(
             for (i, item) in items.iter().enumerate() {
                 path.push(Seg::Index(i));
                 walk(item, &shape.items, defs, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Секреты открытым текстом в поддереве (см. `SectionRegistry::check_plaintext_secrets`); `urls` — искать
+/// пароли в адресах. Ошибку с тем же путём, уже найденную разбором секции, не повторяет.
+fn find_plaintext_secrets(
+    value: &Value,
+    path: &mut Vec<Seg>,
+    urls: bool,
+    errors: &mut Vec<String>,
+) {
+    match value {
+        Value::Mapping(m) => {
+            for (k, child) in m {
+                path.push(Seg::Key(k.clone()));
+                let secret_key = k
+                    .as_str()
+                    .is_some_and(|k| SECRET_KEYS.iter().any(|s| k.eq_ignore_ascii_case(s)));
+                let scalar = match child {
+                    Value::String(s) => !s.is_empty(),
+                    Value::Number(_) => true,
+                    _ => false,
+                };
+                if secret_key && scalar {
+                    let p = path_string(path);
+                    let prefix = format!("{p}:");
+                    if !errors.iter().any(|e| e.starts_with(&prefix)) {
+                        errors.push(format!("{p}: {PLAINTEXT_SECRET}"));
+                    }
+                } else {
+                    find_plaintext_secrets(child, path, urls, errors);
+                }
+                path.pop();
+            }
+        }
+        Value::Sequence(items) => {
+            for (i, item) in items.iter().enumerate() {
+                path.push(Seg::Index(i));
+                find_plaintext_secrets(item, path, urls, errors);
+                path.pop();
+            }
+        }
+        Value::String(s) if urls && url_has_password(s) => errors.push(format!(
+            "{}: password in the address is allowed only with profile: dev; \
+             use a reference {{ secret: \"<path>#<field>\" }}",
+            path_string(path)
+        )),
+        _ => {}
+    }
+}
+
+/// Адрес содержит пароль: `scheme://user:password@host…` или параметр `password=`.
+fn url_has_password(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if rest[..authority_end]
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+    {
+        return true;
+    }
+    rest[authority_end..]
+        .split_once('?')
+        .is_some_and(|(_, query)| {
+            query.split(['&', '#']).any(|kv| {
+                kv.split_once('=')
+                    .map_or(kv, |(k, _)| k)
+                    .eq_ignore_ascii_case("password")
+            })
+        })
+}
+
+/// Ссылки `{ secret: "<путь>#<поле>" }` в поддереве; `report` — сообщать о неверных ссылках.
+fn collect_refs(
+    value: &Value,
+    path: &mut Vec<Seg>,
+    report: bool,
+    out: &mut BTreeSet<SecretRef>,
+    errors: &mut Vec<String>,
+) {
+    match value {
+        Value::Mapping(m) => {
+            if m.len() == 1
+                && let Some(Value::String(r)) = value.get("secret")
+            {
+                match r.parse::<SecretRef>() {
+                    Ok(r) => {
+                        out.insert(r);
+                    }
+                    Err(e) if report => {
+                        errors.push(format!("{}: {}", path_string(path), message(&e)));
+                    }
+                    Err(_) => {}
+                }
+                return;
+            }
+            for (k, child) in m {
+                path.push(Seg::Key(k.clone()));
+                collect_refs(child, path, report, out, errors);
+                path.pop();
+            }
+        }
+        Value::Sequence(items) => {
+            for (i, item) in items.iter().enumerate() {
+                path.push(Seg::Index(i));
+                collect_refs(item, path, report, out, errors);
                 path.pop();
             }
         }

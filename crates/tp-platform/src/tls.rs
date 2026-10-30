@@ -273,7 +273,7 @@ pub(crate) fn read_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, Tl
     Ok(chain)
 }
 
-fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
+pub(crate) fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
     let io = |source| TlsError::Io {
         path: path.to_owned(),
         source,

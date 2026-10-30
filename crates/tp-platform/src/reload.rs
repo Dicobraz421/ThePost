@@ -1,6 +1,12 @@
 //! Hot reload конфигурации (SRS 5.5, CONTRACTS.md#Config): по SIGHUP, по запросу и по опросу mtime
 //! файл перечитывается, проверяется и рассылается через `watch`. Ошибка — прежняя версия остаётся в силе.
+//!
+//! С хранилищем секретов ([`Reloader::with_secret_store`]) каждая версия рассылается с прочитанными секретами
+//! (`Config::secret`): секреты читаются при запуске и при каждом перечитывании — по SIGHUP и запросу даже без
+//! изменения файла (ротация секрета); аренды динамических секретов продлеваются после двух третей срока, истёкшая
+//! или непродлеваемая аренда — секреты перечитываются.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -8,9 +14,11 @@ use std::time::{Duration, SystemTime};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::{Notify, watch};
+use tokio::time::Instant;
 use tp_contracts::Error;
 use tp_contracts::config::duration;
 use tp_contracts::role::{CancellationToken, ConfigRx, ConfigValue};
+use tp_contracts::secrets::{SecretLease, SecretStore};
 
 use crate::config::{CheckMode, Config, ConfigError, SectionRegistry};
 
@@ -35,6 +43,23 @@ impl Default for ReloadConfig {
 /// Отметка версии файла для опроса: время изменения и размер.
 type Stamp = (Option<SystemTime>, u64);
 
+/// Хранилище секретов перечитывания.
+#[derive(Clone)]
+struct Store(Arc<dyn SecretStore>);
+
+impl fmt::Debug for Store {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretStore")
+    }
+}
+
+/// Аренда секрета текущей версии и момент следующего действия (продление или перечитывание).
+#[derive(Debug, Clone)]
+struct Tracked {
+    lease: SecretLease,
+    due: Instant,
+}
+
 /// Перечитывает config.yaml и рассылает новые версии подписчикам.
 #[derive(Debug)]
 pub struct Reloader {
@@ -45,6 +70,8 @@ pub struct Reloader {
     applied: String,
     stamp: Option<Stamp>,
     request: Arc<Notify>,
+    secrets: Option<Store>,
+    leases: Vec<Tracked>,
 }
 
 /// Запрос перечитать конфигурацию (Admin API, тесты) — то же, что SIGHUP.
@@ -56,6 +83,14 @@ impl ReloadTrigger {
     pub fn request(&self) {
         self.0.notify_one();
     }
+}
+
+/// Причина пробуждения цикла [`Reloader::run`].
+enum Wake {
+    Stop,
+    Forced,
+    Poll,
+    Lease,
 }
 
 impl Reloader {
@@ -89,7 +124,22 @@ impl Reloader {
             applied,
             stamp,
             request: Arc::new(Notify::new()),
+            secrets: None,
+            leases: Vec::new(),
         })
+    }
+
+    /// Подключает хранилище секретов: читает секреты текущей версии и рассылает её с ними; дальше секреты
+    /// читаются при каждом перечитывании. Ошибка чтения — `Config::resolve_secrets`.
+    pub async fn with_secret_store(
+        mut self,
+        store: Arc<dyn SecretStore>,
+    ) -> tp_contracts::Result<Self> {
+        let mut config = (*self.current()).clone();
+        config.resolve_secrets(store.as_ref()).await?;
+        self.secrets = Some(Store(store));
+        self.publish(config);
+        Ok(self)
     }
 
     /// Подписка на версии конфигурации.
@@ -107,8 +157,8 @@ impl Reloader {
         ReloadTrigger(self.request.clone())
     }
 
-    /// Перечитывает файл. `Ok(true)` — разослана новая версия, `Ok(false)` — текст не изменился;
-    /// ошибка — версия не изменилась, подписчики ничего не получают.
+    /// Перечитывает файл (и секреты, если подключено хранилище). `Ok(true)` — разослана новая версия,
+    /// `Ok(false)` — не изменились ни текст, ни секреты; ошибка — версия не изменилась, подписчики ничего не получают.
     pub async fn reload(&mut self) -> tp_contracts::Result<bool> {
         let text = tokio::fs::read_to_string(&self.path)
             .await
@@ -116,18 +166,43 @@ impl Reloader {
                 path: self.path.clone(),
                 source,
             })?;
-        if text == self.applied {
+        let changed = text != self.applied;
+        let store = self.secrets.clone();
+        if !changed && store.is_none() {
             return Ok(false);
         }
-        let config = self
-            .registry
-            .parse_with(&text, self.env.clone(), CheckMode::Lenient)?;
+        let mut config = if changed {
+            self.registry
+                .parse_with(&text, self.env.clone(), CheckMode::Lenient)?
+        } else {
+            (*self.current()).clone()
+        };
+        if let Some(store) = store {
+            config.resolve_secrets(store.0.as_ref()).await?;
+            if !changed && config.same_secrets(&self.current()) {
+                return Ok(false);
+            }
+        }
         self.applied = text;
-        self.tx.send_replace(Arc::new(config));
+        self.publish(config);
         Ok(true)
     }
 
-    /// Работает до сигнала остановки: SIGHUP, [`ReloadTrigger`] и опрос mtime с периодом `reload.poll_interval`.
+    fn publish(&mut self, config: Config) {
+        let now = Instant::now();
+        self.leases = config
+            .secret_leases()
+            .into_iter()
+            .map(|lease| Tracked {
+                due: now + lease.ttl * 2 / 3,
+                lease,
+            })
+            .collect();
+        self.tx.send_replace(Arc::new(config));
+    }
+
+    /// Работает до сигнала остановки: SIGHUP, [`ReloadTrigger`], опрос mtime с периодом `reload.poll_interval`
+    /// и сроки аренд секретов.
     pub async fn run(mut self, shutdown: CancellationToken) {
         let mut hup = Hup::install();
         loop {
@@ -136,14 +211,26 @@ impl Reloader {
                 .section::<ReloadConfig>("reload")
                 .map(|c| c.poll_interval)
                 .unwrap_or_default();
-            let forced = tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = self.request.notified() => true,
-                () = hup.recv() => true,
-                () = sleep_or_never(poll) => false,
+            let lease_due = self.leases.iter().map(|t| t.due).min();
+            let wake = tokio::select! {
+                () = shutdown.cancelled() => Wake::Stop,
+                () = self.request.notified() => Wake::Forced,
+                () = hup.recv() => Wake::Forced,
+                () = sleep_or_never(poll) => Wake::Poll,
+                () = sleep_until_or_never(lease_due) => Wake::Lease,
             };
-            if !forced && !self.file_changed().await {
-                continue;
+            match wake {
+                Wake::Stop => return,
+                Wake::Lease => {
+                    self.keep_leases().await;
+                    continue;
+                }
+                Wake::Poll => {
+                    if !self.file_changed().await {
+                        continue;
+                    }
+                }
+                Wake::Forced => {}
             }
             match self.reload().await {
                 Ok(true) => tracing::info!(path = %self.path.display(), "configuration reloaded"),
@@ -151,6 +238,54 @@ impl Reloader {
                 Err(e) => {
                     tracing::warn!(error = %e, "configuration reload failed; previous version kept");
                 }
+            }
+        }
+    }
+
+    /// Продлевает наступившие аренды; истёкшая, отозванная или непродлеваемая аренда — секреты перечитываются.
+    /// Неудача — повтор через шестую часть срока (не реже раза в секунду).
+    async fn keep_leases(&mut self) {
+        let Some(store) = self.secrets.clone() else {
+            self.leases.clear();
+            return;
+        };
+        let now = Instant::now();
+        let retry = |lease: &SecretLease| now + (lease.ttl / 6).max(Duration::from_secs(1));
+        let mut reread = false;
+        for t in &mut self.leases {
+            if t.due > now {
+                continue;
+            }
+            if !t.lease.renewable {
+                reread = true;
+                continue;
+            }
+            match store.0.renew(&t.lease).await {
+                Ok(renewed) => {
+                    t.lease.ttl = renewed.ttl;
+                    t.due = now + renewed.ttl * 2 / 3;
+                }
+                Err(Error::NotFound) => reread = true,
+                Err(e) => {
+                    tracing::warn!(lease = %t.lease.id, error = %e, "secret lease not renewed; retrying");
+                    t.due = retry(&t.lease);
+                }
+            }
+        }
+        if !reread {
+            return;
+        }
+        match self.reload().await {
+            Ok(true) => tracing::info!("configuration secrets re-read after lease expiry"),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "configuration secrets re-read failed; previous version kept")
+            }
+        }
+        // Не заменённые новой версией аренды — повторить позже, без частого цикла.
+        for t in &mut self.leases {
+            if t.due <= now {
+                t.due = retry(&t.lease);
             }
         }
     }
@@ -163,6 +298,13 @@ impl Reloader {
         let changed = stamp != self.stamp;
         self.stamp = stamp;
         changed
+    }
+}
+
+async fn sleep_until_or_never(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
