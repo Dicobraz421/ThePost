@@ -60,9 +60,10 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
 - Модель «скелет + части»: письмо = объект-скелет (заголовки, границы MIME, ссылки) + объекты частей.
   Побайтовая реконструкция исходного письма обязательна.
 - `ingest(IngestRequest { tenant, raw: ByteStream, deliveries: Vec<Delivery { account, mailbox, extra_headers, flags }>, received_at })
-  -> Result<Vec<Delivered { account, mailbox, message, uid }>>` — одна загрузка частей на всех получателей.
-- `fetch_raw(account, message, Option<Range>) -> ByteStream`; `fetch_part(account, message, part_path)`.
-- `set_flags`, `copy`, `move_to`, `delete_to_trash`, `restore` — публикуют событие в `EventBus`.
+  -> Result<Vec<Delivered { account, mailbox, message, uid }>>` — одна загрузка частей на всех получателей;
+  квота одного получателя — `QuotaExceeded` на весь запрос.
+- `fetch_raw(AccountScope, message, Option<Range>) -> ByteStream`; `fetch_part(AccountScope, message, part_path)` — тело в кодировке передачи.
+- `set_flags`, `copy`, `move_to`, `delete_to_trash`, `restore` (по `AccountScope`) — публикуют событие в `EventBus` после фиксации.
 
 ## EventBus
 SRS 2.1. `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`. `Event { tenant, account: Option, kind }`,
@@ -83,18 +84,27 @@ SRS 2.5. Журнал событий ядра (outbox): событие пише�
 `read(partition, after, limit)`, позиция — `position(subscriber, partition)`, фиксирует `commit(subscriber, partition, pos)`; раздел подписчика — под лизой. Доставка не менее одного раза, порядок — в пределах ящика.
 
 ## Search
-SRS 4.6. `SearchIndex`: `query(account, scope: Vec<MailboxId>, q: TextQuery, sort, limit) -> Vec<MessageId>`,
-`snippet(account, message, q)`. `IndexManifestStore` (метаданные): `get/put_manifest(account) -> (version, segments)`.
+SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
+`snippet(AccountScope, message, &TextQuery) -> Snippet { subject?, preview? }` (`<mark>`). `TextQuery` — дерево
+`Term { field: TextField, text } | And | Or | Not`; нетекстовые условия фильтрует вызывающий по метаданным.
+`IndexManifestStore` (метаданные): `get_manifest(AccountScope) -> IndexManifest { version, segments }`,
+`put_manifest(AccountScope, expected, segments) -> version` (несовпадение версии — `Conflict`).
 
 ## Directory
-SRS 5.1, 3.8. Каталог организации: `accounts_since(cursor)`, `groups_since`, `aliases`, `domains`, `gal_attributes` — инкрементально.
-Реализация — `tp-auth` (LDAP); модуль «Мультитенантность» подключает каталог на организацию.
+SRS 5.1, 3.8. Каталог организации: `accounts_since(tenant, Option<&DirCursor>, limit)`, `groups_since` — инкрементально,
+`DirPage { changes: Vec<DirChange::{Upsert, Removed}>, next, has_more }`, устаревший курсор — `Conflict`;
+`aliases`, `domains`, `gal_attributes` (имена атрибутов GAL; значения — `DirAccount::attributes`) — полным списком.
+Реализация — `tp-auth` (LDAP); модуль «Мультитенантность» подключает каталог на организацию. Код — `auth.rs`.
 
 ## Auth
-SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>`;
-`Credentials::{ Password { login, secret }, Bearer(token), Gssapi(ctx) }`. `Principal { tenant, account, groups, scopes }`.
-`Authorizer`: `check(&Principal, Resource, Rights) -> Result<()>`; права — RFC 4314 (`lrswipkxtea`), Send As / Send on Behalf.
-SASL-механизмы (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, GSSAPI) — `tp-auth`, интерфейс `SaslServer` (шаги challenge/response).
+SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>` (неверные данные — `Forbidden`);
+`Credentials::{ Password { login, secret }, Bearer(token), Gssapi { principal, authzid } }`, секреты скрыты в `Debug`.
+`Principal { tenant, account, login, groups, scopes: Option<_> }` (`None` — без ограничений).
+`Authorizer`: `rights(&Principal, &Resource) -> Rights`, `check(.., required)` (по умолчанию через `rights`),
+`send_right(&Principal, from) -> Option<SendRight::{SendAs, SendOnBehalf}>`; `Resource::{ Account, Mailbox }`.
+`Rights` — RFC 4314, строка `lrswipkxtea` в каноническом порядке; `c`/`d` (RFC 2086) разворачивает IMAP.
+SASL-механизмы (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, GSSAPI) — `tp-auth`, интерфейс `SaslServer { mechanisms(tls), start(mech) }`
+→ `SaslSession::step(response) -> SaslStep::{ Challenge, Done(Principal) }`.
 
 ## Roles
 SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`; пресеты (`all`, `edge`, `transport`, `access`, `backend`, `mailbox`) раскрываются в набор ролей при загрузке конфигурации; режим edge — параметр smtp-in (SRS 2.6).
