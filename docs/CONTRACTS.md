@@ -114,9 +114,10 @@ SASL-механизмы (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, GSSAPI) — `tp-aut
 ## Roles
 SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`; пресеты (`all`, `edge`, `transport`, `access`, `backend`, `mailbox`) раскрываются в набор ролей при загрузке конфигурации; режим edge — параметр smtp-in (SRS 2.6).
 Раскрытие — `RoleSet::expand(&[RoleEntry]) -> RoleSet { roles, edge }`; `RoleEntry` = пресет | роль (строка config.yaml).
-`RoleService`: `name()`, `run(ctx: RoleCtx) -> Result<()>` до сигнала отмены; `RoleCtx { config: Arc<dyn ConfigWatch>,
-shutdown: Shutdown, drain_deadline, ready: ReadyHandle }`. `ConfigWatch` — `current() -> Arc<dyn Any>`, `changed()`; типизированно —
-`RoleCtx::config::<T>()`. `Shutdown` — на `futures` (tokio в `tp-contracts` не подключён); метрики — позже.
+`RoleService`: `name()`, `run(ctx: RoleCtx) -> Result<()>` до отмены `shutdown`; `RoleCtx { config: ConfigRx,
+shutdown: CancellationToken, drain_deadline, ready: ReadyHandle }` (`tokio`, `tokio-util`; `role` реэкспортирует `watch` и `CancellationToken`).
+`ConfigRx = watch::Receiver<Arc<dyn Any + Send + Sync>>` — секция роли; типизированно — `RoleCtx::config::<T>()`, ожидание версии —
+`RoleCtx::config_changed()` (закрытый канал — не завершается). `config_channel(v)`, `fixed_config(v)` — для приложения и тестов; метрики — позже.
 
 ## Config
 Каждый крейт владеет своей секцией `XxxConfig: Deserialize + Default + Clone` и документирует её поля.
@@ -134,11 +135,13 @@ Hot reload: новая копия рассылается через `watch`; п�
 ## Extension points
 SRS 2.5, 1.3. Модуль — cargo feature + `modules.<имя>.enabled`. `Module { name(), schema() -> "mod_<имя>", migrations() -> &[Migration { version, name, sql }],
 register(&mut Registry, &ModuleCtx) -> Result<()> }`; имя — `validate_module_name` (`[a-z][a-z0-9_]*`, ≤ 59).
-`ModuleCtx { config: Arc<dyn ConfigWatch> }` (`#[non_exhaustive]`, `ModuleCtx::new`) — секция `modules.<имя>` как JSON-значение приложения.
+`ModuleCtx { config: watch::Receiver<serde_json::Value> }` (`#[non_exhaustive]`, `ModuleCtx::new`) — секция `modules.<имя>`;
+типизированно — `ModuleCtx::config::<T: DeserializeOwned>() -> Result<T>` (ошибка полей — `Invalid`).
 `Registry`: `add_role(RoleService)`, `add_jmap_capability(JmapCapability { uri, session_object, methods, call })`,
 `add_admin_routes(AdminRoutes { prefix, handle(AdminRequest) -> AdminResponse })`, `add_event_sink`, `add_decision_hook`;
 `set_blob_store` / `set_directory` / `set_search_index` — замена встроенной реализации. Повтор имени, URI, префикса, реализации — `Conflict`.
-JSON в JMAP и тела Admin API — `Bytes` (serde_json в `tp-contracts` не подключён).
+JSON в JMAP (`session_object`, аргументы и результат `call`) и тела Admin API модулей — `serde_json::Value`
+(`Null` — тела нет; ответ — `application/json`).
 `DecisionHook { name, before_final_delete(&FinalDelete), on_delivery(&DeliveryInfo), on_submission(&SubmissionInfo) }`, методы по умолчанию — `Allow`;
 → `Decision::{ Allow, Deny(reason), Augment { headers, copies: Vec<CopyTo::{ Mailbox(Delivery), Address }> } }`.
 `DecisionHooks` вызывает хуки по порядку регистрации: первый `Deny` прерывает, дополнения объединяются, без хуков — `Allow`;
@@ -156,3 +159,6 @@ JSON в JMAP и тела Admin API — `Bytes` (serde_json в `tp-contracts` н�
   `DecisionHooks`, `CopyTo`.
 - 2026-10-30 — x/mailbox-delete-cascade: `MailboxStore::delete(.., cascade)`; надгробия BLOB в `finalize_delete`;
   `to_trash`/`restore` сохраняют `MessageId`.
+- 2026-10-30 — CTR-11 (волна contracts-04): `tokio`/`tokio-util`/`serde_json` в контрактах; `RoleCtx { config: ConfigRx, shutdown: CancellationToken }`
+  вместо `ConfigWatch`/`Shutdown`; `ModuleCtx::config::<T>()`; `serde_json::Value` в `JmapCapability` и `AdminRequest`/`AdminResponse`
+  (`content_type` убран).

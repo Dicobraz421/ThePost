@@ -26,7 +26,7 @@ use instant_acme::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tp_contracts::Error;
-use tp_contracts::role::Shutdown;
+use tp_contracts::role::CancellationToken;
 
 use crate::tls::{TlsCerts, TlsConfig};
 
@@ -245,7 +245,7 @@ impl Acme {
     }
 
     /// Проверяет сертификат каждые `check_interval_secs` (после ошибки — через `retry_interval_secs`) до сигнала остановки.
-    pub async fn run(self, shutdown: Shutdown) {
+    pub async fn run(self, shutdown: CancellationToken) {
         if !self.cfg.enabled {
             return;
         }
@@ -263,7 +263,7 @@ impl Acme {
                 }
             };
             tokio::select! {
-                () = shutdown.triggered() => return,
+                () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(Duration::from_secs(wait.max(1))) => {}
             }
         }

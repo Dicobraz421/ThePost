@@ -15,7 +15,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::task::{Id, JoinSet};
 use tp_contracts::Error;
-use tp_contracts::role::{ConfigWatch, Role, RoleCtx, RoleService, RoleSet, Shutdown};
+use tp_contracts::role::{CancellationToken, ConfigRx, Role, RoleCtx, RoleService, RoleSet};
 use tp_sys::NodeResources;
 
 use crate::service_http::Health;
@@ -112,7 +112,7 @@ pub struct RoleSpec {
     /// Сервис роли.
     pub service: Arc<dyn RoleService>,
     /// Секция конфигурации роли с hot reload.
-    pub config: Arc<dyn ConfigWatch>,
+    pub config: ConfigRx,
 }
 
 impl fmt::Debug for RoleSpec {
@@ -195,12 +195,17 @@ impl Roles {
     /// Запускает роли и работает до сигнала `shutdown` или аварийного завершения роли, затем останавливает все роли.
     ///
     /// Аварийное завершение роли останавливает узел: остальные роли проходят drain, ошибка попадает в отчёт.
-    pub async fn run(self, health: &Health, metrics: &Metrics, shutdown: Shutdown) -> RolesReport {
+    pub async fn run(
+        self,
+        health: &Health,
+        metrics: &Metrics,
+        shutdown: CancellationToken,
+    ) -> RolesReport {
         let deadline = self.cfg.drain_deadline();
         let running = Gauge::<i64>::default();
         metrics.register("tp_roles_running", "Running role tasks", running.clone());
 
-        let (role_shutdown, role_trigger) = Shutdown::new();
+        let role_shutdown = CancellationToken::new();
         let mut tasks = JoinSet::new();
         let mut names: BTreeMap<Id, String> = BTreeMap::new();
         let mut handles = Vec::new();
@@ -227,7 +232,7 @@ impl Roles {
         // До сигнала: роль, завершившаяся сама, — штатно (Ok) или аварийно (ошибка → остановка узла).
         loop {
             tokio::select! {
-                () = shutdown.triggered() => break,
+                () = shutdown.cancelled() => break,
                 done = tasks.join_next_with_id() => {
                     let Some(done) = done else { break };
                     running.set(tasks.len() as i64);
@@ -245,7 +250,7 @@ impl Roles {
         for h in &handles {
             h.set(false);
         }
-        role_trigger.trigger();
+        role_shutdown.cancel();
 
         let drained = tokio::time::timeout(deadline, async {
             while let Some(done) = tasks.join_next_with_id().await {
@@ -349,7 +354,7 @@ impl RssGauge {
     }
 
     /// Обновляет метрику каждые `cfg.rss_interval_ms` до сигнала остановки.
-    pub async fn run(self, cfg: &RuntimeConfig, shutdown: Shutdown) {
+    pub async fn run(self, cfg: &RuntimeConfig, shutdown: CancellationToken) {
         if cfg.rss_interval_ms == 0 {
             return;
         }
@@ -357,7 +362,7 @@ impl RssGauge {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                () = shutdown.triggered() => return,
+                () = shutdown.cancelled() => return,
                 _ = tick.tick() => {
                     self.update().await;
                 }
@@ -384,7 +389,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
-    use tp_contracts::role::{FixedConfig, RoleEntry, RolePreset};
+    use tp_contracts::role::{RoleEntry, RolePreset, fixed_config};
 
     use super::*;
 
@@ -442,7 +447,7 @@ mod tests {
                     return Err(Error::internal("boom"));
                 }
                 ctx.ready.set(true);
-                ctx.shutdown.triggered().await;
+                ctx.shutdown.cancelled().await;
                 match self.mode {
                     Mode::Drain(d) => tokio::time::sleep(d).await,
                     Mode::Hang => std::future::pending::<()>().await,
@@ -461,7 +466,7 @@ mod tests {
                 mode,
                 dropped: dropped.clone(),
             }),
-            config: Arc::new(FixedConfig::new(())),
+            config: fixed_config(()),
         };
         (spec, dropped)
     }
@@ -559,7 +564,8 @@ mod tests {
         roles.add(Role::Jmap, |_| spec("jmap", Mode::Drain(Duration::ZERO)).0);
         let health = Health::default();
         let metrics = Metrics::default();
-        let (shutdown, trigger) = Shutdown::new();
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
         let run = tokio::spawn({
             let health = health.clone();
             let metrics = metrics.clone();
@@ -574,7 +580,7 @@ mod tests {
         );
 
         let started = Instant::now();
-        trigger.trigger();
+        trigger.cancel();
         let report = run.await.expect("join");
         assert!(started.elapsed() < Duration::from_millis(2_000));
         assert!(health.is_draining());
@@ -593,7 +599,8 @@ mod tests {
         roles.add(Role::Imap, |_| hung);
         roles.add(Role::Dav, |_| spec("dav", Mode::Drain(Duration::ZERO)).0);
         let health = Health::default();
-        let (shutdown, trigger) = Shutdown::new();
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
         let run = tokio::spawn({
             let health = health.clone();
             async move { roles.run(&health, &Metrics::default(), shutdown).await }
@@ -601,7 +608,7 @@ mod tests {
         wait_ready(&health).await;
 
         let started = Instant::now();
-        trigger.trigger();
+        trigger.cancel();
         let report = run.await.expect("join");
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
@@ -618,7 +625,7 @@ mod tests {
         let (maint, maint_dropped) = spec("maintenance", Mode::Drain(Duration::ZERO));
         roles.add(Role::Maintenance, |_| maint);
         let health = Health::default();
-        let (shutdown, _trigger) = Shutdown::new();
+        let shutdown = CancellationToken::new();
         let report = tokio::time::timeout(
             Duration::from_secs(5),
             roles.run(&health, &Metrics::default(), shutdown),

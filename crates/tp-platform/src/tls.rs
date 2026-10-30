@@ -20,7 +20,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tp_contracts::Error;
-use tp_contracts::role::Shutdown;
+use tp_contracts::role::CancellationToken;
 
 /// Секция `tls`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -171,7 +171,7 @@ impl TlsCerts {
     }
 
     /// Проверяет файлы каждые `reload_interval_ms` до сигнала остановки; ошибки пишет в лог.
-    pub async fn run(self: Arc<Self>, shutdown: Shutdown) {
+    pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
         loop {
             let interval = self.config().reload_interval_ms;
             let wait = if interval == 0 {
@@ -181,7 +181,7 @@ impl TlsCerts {
                 Duration::from_millis(interval)
             };
             tokio::select! {
-                () = shutdown.triggered() => return,
+                () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(wait) => {}
             }
             if interval == 0 {

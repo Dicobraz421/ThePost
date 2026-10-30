@@ -576,7 +576,6 @@ pub trait PolicyResolver: Send + Sync + 'static {
 mod tests {
     use super::*;
     use crate::ids::{BlobHash, Gen};
-    use schemars::_private::serde_json;
     use std::sync::Arc;
 
     #[test]
