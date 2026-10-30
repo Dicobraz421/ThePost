@@ -5,8 +5,10 @@ use std::ops::Range;
 use tp_contracts::{Error, Result};
 
 pub mod local;
+pub mod s3;
 
 pub use local::{LocalConfig, LocalStore};
+pub use s3::{S3Config, S3Store};
 
 /// Проверка произвольного пути `put_raw`/`get_raw`/`delete_raw`: относительный, сегменты через `/`,
 /// без пустых сегментов и сегментов, начинающихся с `.` (служебные каталоги, `..`).
