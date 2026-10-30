@@ -2,11 +2,19 @@
 //!
 //! Готовность узла — все зарегистрированные роли готовы ([`ReadyHandle`]) и узел не выводится из пула (drain);
 //! по `/healthz/ready` балансировщик включает и исключает узел.
+//!
+//! Служебный HTTP — только по TLS (решение «Шифрование любого обмена», PLT-11): сертификаты узла [`TlsCerts`]
+//! (файлы, секреты Kubernetes, ACME — с перечитыванием без перезапуска, как у слушателей протоколов).
+//! Открытый HTTP — только `profile: dev` с `service_http.allow_plaintext: true` и предупреждением в лог при
+//! каждом запуске; вне dev — ошибка конфигурации.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
@@ -15,11 +23,19 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
+use tokio_rustls::server::TlsStream;
 use tp_contracts::Error;
+use tp_contracts::config::duration;
 use tp_contracts::role::{CancellationToken, ReadyHandle};
+use tp_contracts::tls::Profile;
 
 use crate::telemetry::Metrics;
+use crate::tls::TlsCerts;
+
+/// Пауза после ошибки приёма соединения (нехватка дескрипторов и т. п.).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Секция `service_http`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -27,13 +43,51 @@ use crate::telemetry::Metrics;
 pub struct ServiceHttpConfig {
     /// Адрес служебного HTTP (метрики и проверки доступности). Требует перезапуска.
     pub listen: SocketAddr,
+    /// Открытый HTTP без TLS. Только `profile: dev`, с предупреждением в лог; иначе — ошибка конфигурации.
+    /// Требует перезапуска.
+    pub allow_plaintext: bool,
+    /// Время на TLS-рукопожатие (`10s`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub handshake_timeout: Duration,
+    /// Одновременных незавершённых TLS-рукопожатий; сверх — новые соединения ждут в очереди сокета.
+    pub max_handshakes: usize,
 }
 
 impl Default for ServiceHttpConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 8081)),
+            allow_plaintext: false,
+            handshake_timeout: Duration::from_secs(10),
+            max_handshakes: 128,
         }
+    }
+}
+
+impl ServiceHttpConfig {
+    /// Проверка секции (`thepost config check` и запуск): `allow_plaintext` — только в профиле dev.
+    pub fn check(&self, profile: Profile) -> tp_contracts::Result<()> {
+        if self.allow_plaintext && profile != Profile::Dev {
+            return Err(Error::Invalid(
+                "allow_plaintext is allowed only with profile: dev; /metrics and /healthz are served over TLS"
+                    .to_owned(),
+            ));
+        }
+        if self.handshake_timeout.is_zero() {
+            return Err(Error::Invalid(
+                "handshake_timeout must be positive".to_owned(),
+            ));
+        }
+        if self.max_handshakes == 0 {
+            return Err(Error::Invalid("max_handshakes must be positive".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Предупреждение для лога при открытом служебном HTTP.
+    pub fn plaintext_warning() -> &'static str {
+        "service http (/metrics, /healthz) is NOT encrypted (service_http.allow_plaintext, profile dev); never use in production"
     }
 }
 
@@ -103,16 +157,116 @@ pub fn bind(cfg: &ServiceHttpConfig) -> tp_contracts::Result<TcpListener> {
         .map_err(|e| Error::Invalid(format!("service_http.listen {}: {e}", cfg.listen)))
 }
 
-/// Обслуживает служебный HTTP до сигнала остановки.
+/// Обслуживает служебный HTTP до сигнала остановки: по TLS на сертификатах `certs` или, только в профиле dev
+/// с `allow_plaintext`, открытым HTTP с предупреждением в лог. Нарушение — `Error::Invalid` до приёма соединений.
 pub async fn serve(
     listener: TcpListener,
     router: Router,
+    cfg: &ServiceHttpConfig,
+    profile: Profile,
+    certs: Option<Arc<TlsCerts>>,
     shutdown: CancellationToken,
 ) -> tp_contracts::Result<()> {
+    cfg.check(profile).map_err(|e| match e {
+        Error::Invalid(m) => Error::Invalid(format!("service_http: {m}")),
+        other => other,
+    })?;
+    if cfg.allow_plaintext {
+        tracing::warn!("{}", ServiceHttpConfig::plaintext_warning());
+        return serve_on(listener, router, shutdown).await;
+    }
+    let certs = certs.ok_or_else(|| {
+        Error::Invalid(
+            "service_http: TLS certificates are required (section tls or acme); plaintext only with profile: dev and service_http.allow_plaintext"
+                .to_owned(),
+        )
+    })?;
+    let tls = TlsListener {
+        tcp: listener,
+        certs,
+        timeout: cfg.handshake_timeout,
+        max_pending: cfg.max_handshakes,
+        pending: JoinSet::new(),
+    };
+    serve_on(tls, router, shutdown).await
+}
+
+async fn serve_on<L>(
+    listener: L,
+    router: Router,
+    shutdown: CancellationToken,
+) -> tp_contracts::Result<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: fmt::Debug,
+{
     axum::serve(listener, router)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .map_err(|e| Error::Internal(format!("service http: {e}")))
+}
+
+/// Результат рукопожатия: поток TLS и адрес клиента; `None` — рукопожатие не удалось.
+type Handshake = Option<(TlsStream<TcpStream>, SocketAddr)>;
+
+/// Слушатель TLS для axum: рукопожатия идут параллельно в задачах с таймаутом, медленный клиент не задерживает
+/// приём остальных. Сертификаты берутся из [`TlsCerts`] на каждое соединение — перечитывание действует сразу.
+struct TlsListener {
+    tcp: TcpListener,
+    certs: Arc<TlsCerts>,
+    timeout: Duration,
+    max_pending: usize,
+    pending: JoinSet<Handshake>,
+}
+
+impl TlsListener {
+    fn start_handshake(&mut self, tcp: TcpStream, peer: SocketAddr) {
+        let acceptor = self.certs.acceptor();
+        let timeout = self.timeout;
+        self.pending.spawn(async move {
+            match tokio::time::timeout(timeout, acceptor.accept(tcp)).await {
+                Ok(Ok(tls)) => Some((tls, peer)),
+                Ok(Err(e)) => {
+                    tracing::debug!(%peer, error = %e, "service http: tls handshake failed");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!(%peer, "service http: tls handshake timed out");
+                    None
+                }
+            }
+        });
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let room = self.pending.len() < self.max_pending;
+            let busy = !self.pending.is_empty();
+            tokio::select! {
+                accepted = self.tcp.accept(), if room => match accepted {
+                    Ok((tcp, peer)) => self.start_handshake(tcp, peer),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "service http: accept failed");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    }
+                },
+                Some(done) = self.pending.join_next(), if busy => {
+                    if let Ok(Some(conn)) = done {
+                        return conn;
+                    }
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.tcp.local_addr()
+    }
 }
 
 async fn metrics_handler(State(s): State<AppState>) -> Response {
@@ -151,17 +305,30 @@ async fn ready_handler(State(s): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use prometheus_client::metrics::counter::Counter;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use rustls::pki_types::ServerName;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+    use crate::telemetry::BusSample;
+    use crate::tls::tests::{CERT_A, KEY_A, TempDir, connector, write_pair};
 
-    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
-        let mut s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    fn local() -> ServiceHttpConfig {
+        ServiceHttpConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ..ServiceHttpConfig::default()
+        }
+    }
+
+    async fn request<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, path: &str) -> (u16, String) {
         let req = format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
         s.write_all(req.as_bytes()).await.expect("write");
-        let mut resp = String::new();
-        s.read_to_string(&mut resp).await.expect("read");
+        let mut raw = Vec::new();
+        // Сервер может закрыть TLS без close_notify: берём то, что успели прочитать.
+        let _ = s.read_to_end(&mut raw).await;
+        let resp = String::from_utf8_lossy(&raw).into_owned();
         let code = resp
             .split(' ')
             .nth(1)
@@ -169,6 +336,21 @@ mod tests {
             .expect("status");
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or_default().to_owned();
         (code, body)
+    }
+
+    async fn get_plain(addr: SocketAddr, path: &str) -> (u16, String) {
+        let s = TcpStream::connect(addr).await.expect("connect");
+        request(s, path).await
+    }
+
+    async fn get_tls(addr: SocketAddr, path: &str) -> (u16, String) {
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        let name = ServerName::try_from("localhost").expect("name");
+        let tls = connector(&[CERT_A], &[&rustls::version::TLS13])
+            .connect(name, tcp)
+            .await
+            .expect("tls handshake");
+        request(tls, path).await
     }
 
     #[test]
@@ -194,45 +376,179 @@ mod tests {
         );
     }
 
+    /// Счётчики шины в процессе (как `tp_cluster::BusCounters`): платформа читает снимок на каждый `/metrics`.
+    #[derive(Default)]
+    struct Bus {
+        published: AtomicU64,
+        received: AtomicU64,
+    }
+
+    impl Bus {
+        fn publish(&self) {
+            self.published.fetch_add(1, Ordering::Relaxed);
+            self.received.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     #[tokio::test]
-    async fn http_endpoints() {
+    async fn https_endpoints_with_bus_metrics() {
+        let dir = TempDir::new("service-https");
+        let certs = Arc::new(
+            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
+                .await
+                .expect("certs"),
+        );
         let health = Health::default();
         let metrics = Metrics::default();
         let hits = Counter::<u64>::default();
         metrics.register("tp_hits", "Hits", hits.clone());
         hits.inc();
+        let bus = Arc::new(Bus::default());
+        let source = bus.clone();
+        metrics.register_bus(move || BusSample {
+            connected: true,
+            published: source.published.load(Ordering::Relaxed),
+            received: source.received.load(Ordering::Relaxed),
+            ..BusSample::default()
+        });
 
-        let cfg = ServiceHttpConfig {
-            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-        };
+        let cfg = local();
         let listener = bind(&cfg).expect("bind");
         let addr = listener.local_addr().expect("addr");
         let shutdown = CancellationToken::new();
         let trigger = shutdown.clone();
-        let server = tokio::spawn(serve(listener, router(health.clone(), metrics), shutdown));
+        let router = router(health.clone(), metrics);
+        let server = tokio::spawn(async move {
+            serve(listener, router, &cfg, Profile::Prod, Some(certs), shutdown).await
+        });
 
-        assert_eq!(get(addr, "/healthz/live").await, (200, "live\n".to_owned()));
+        assert_eq!(
+            get_tls(addr, "/healthz/live").await,
+            (200, "live\n".to_owned())
+        );
         let role = health.register("jmap");
         assert_eq!(
-            get(addr, "/healthz/ready").await,
+            get_tls(addr, "/healthz/ready").await,
             (503, "jmap not-ready\n".to_owned())
         );
         role.set(true);
         assert_eq!(
-            get(addr, "/healthz/ready").await,
+            get_tls(addr, "/healthz/ready").await,
             (200, "jmap ready\n".to_owned())
         );
         health.drain();
         assert_eq!(
-            get(addr, "/healthz/ready").await,
+            get_tls(addr, "/healthz/ready").await,
             (503, "draining\njmap ready\n".to_owned())
         );
-        assert_eq!(get(addr, "/healthz/live").await.0, 200);
-        let (code, body) = get(addr, "/metrics").await;
+
+        bus.publish();
+        bus.publish();
+        let (code, body) = get_tls(addr, "/metrics").await;
         assert_eq!(code, 200);
         assert!(body.contains("tp_hits_total 1"), "{body}");
+        assert!(body.contains("tp_bus_published_total 2"), "{body}");
+        assert!(body.contains("tp_bus_received_total 2"), "{body}");
+        assert!(body.contains("tp_bus_connected 1"), "{body}");
+        bus.publish();
+        let (_, body) = get_tls(addr, "/metrics").await;
+        assert!(body.contains("tp_bus_published_total 3"), "{body}");
+
+        // Открытый HTTP на порту TLS не обслуживается.
+        let mut plain = TcpStream::connect(addr).await.expect("connect");
+        plain
+            .write_all(b"GET /healthz/live HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .expect("write");
+        let mut buf = Vec::new();
+        let _ = plain.read_to_end(&mut buf).await;
+        assert!(!String::from_utf8_lossy(&buf).contains("live"), "{buf:?}");
+        // После неудачного рукопожатия сервер продолжает обслуживать TLS.
+        assert_eq!(get_tls(addr, "/healthz/live").await.0, 200);
 
         trigger.cancel();
         server.await.expect("join").expect("serve");
+    }
+
+    #[tokio::test]
+    async fn plaintext_only_in_dev() {
+        let open = ServiceHttpConfig {
+            allow_plaintext: true,
+            ..local()
+        };
+        assert!(open.check(Profile::Dev).is_ok());
+        let e = open.check(Profile::Prod).expect_err("prod");
+        assert!(
+            matches!(&e, Error::Invalid(m) if m.contains("profile: dev")),
+            "{e:?}"
+        );
+
+        let app = || router(Health::default(), Metrics::default());
+        let listener = bind(&open).expect("bind");
+        let e = serve(
+            listener,
+            app(),
+            &open,
+            Profile::Prod,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("plaintext outside dev");
+        assert!(
+            matches!(&e, Error::Invalid(m) if m.starts_with("service_http: allow_plaintext")),
+            "{e:?}"
+        );
+
+        // Без сертификатов и без allow_plaintext — ошибка в любом профиле.
+        let listener = bind(&local()).expect("bind");
+        let e = serve(
+            listener,
+            app(),
+            &local(),
+            Profile::Dev,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("no certs");
+        assert!(
+            matches!(&e, Error::Invalid(m) if m.contains("TLS certificates are required")),
+            "{e:?}"
+        );
+
+        let listener = bind(&open).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
+        let server = tokio::spawn(async move {
+            serve(listener, app(), &open, Profile::Dev, None, shutdown).await
+        });
+        assert_eq!(
+            get_plain(addr, "/healthz/live").await,
+            (200, "live\n".to_owned())
+        );
+        trigger.cancel();
+        server.await.expect("join").expect("serve");
+    }
+
+    #[test]
+    fn config_from_yaml() {
+        let cfg: ServiceHttpConfig = serde_yaml_ng::from_str(
+            "listen: 127.0.0.1:9090\nhandshake_timeout: 2s\nallow_plaintext: true\n",
+        )
+        .expect("parse");
+        assert_eq!(cfg.handshake_timeout, Duration::from_secs(2));
+        assert!(cfg.allow_plaintext);
+        assert_eq!(
+            cfg.max_handshakes,
+            ServiceHttpConfig::default().max_handshakes
+        );
+        assert!(serde_yaml_ng::from_str::<ServiceHttpConfig>("handshake_timeout: 2000").is_err());
+        let zero = ServiceHttpConfig {
+            handshake_timeout: Duration::ZERO,
+            ..ServiceHttpConfig::default()
+        };
+        assert!(zero.check(Profile::Dev).is_err());
     }
 }
