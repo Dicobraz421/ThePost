@@ -2,6 +2,7 @@
 //!
 //! Спецификация — `docs/CONTRACTS.md`. Асинхронные трейты для `dyn` — через `async-trait`; все трейты `Send + Sync + 'static`.
 
+pub mod blob;
 pub mod error;
 pub mod ids;
 
