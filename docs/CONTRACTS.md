@@ -81,7 +81,7 @@ SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>`;
 SASL-механизмы (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, GSSAPI) — `tp-auth`, интерфейс `SaslServer` (шаги challenge/response).
 
 ## Roles
-SRS 2.1. `enum Role { SmtpIn, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`.
+SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`; пресеты (`all`, `edge`, `transport`, `access`, `backend`, `mailbox`) раскрываются в набор ролей при загрузке конфигурации; режим edge — параметр smtp-in (SRS 2.6).
 `RoleService`: `name()`, `run(ctx: RoleCtx) -> Result<()>` до сигнала отмены; `RoleCtx { config: watch::Receiver<Arc<…>>,
 shutdown: CancellationToken, drain_deadline, ready: ReadyHandle, metrics }`.
 
