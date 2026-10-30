@@ -2,6 +2,8 @@
 
 pub mod resources;
 pub mod signals;
+pub mod socket;
 
 pub use resources::NodeResources;
 pub use signals::{Signal, Signals};
+pub use socket::{ListenerConfig, bind_tcp};
