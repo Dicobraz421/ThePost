@@ -17,15 +17,26 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::time::Duration;
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgConnection, PgPool};
+use tp_contracts::config::duration;
 use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{Error, Result, TenantId};
 
 use crate::schema::{begin, begin_system, db_err};
 
 /// Секция конфигурации пула соединений `database` (SRS 5.5). Все параметры требуют перезапуска.
-#[derive(Clone, PartialEq, Eq)]
+/// Все поля, кроме `url`, необязательны; неизвестное поле — ошибка разбора.
+///
+/// ```yaml
+/// database:
+///   url: postgres://user:password@db.example.ru:5432/thepost
+///   acquire_timeout: 5s
+/// ```
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct PoolConfig {
     /// Адрес PostgreSQL или PgBouncer (`postgres://user:password@host:port/db`); обязателен.
     pub url: String,
@@ -38,10 +49,16 @@ pub struct PoolConfig {
     /// Число соединений, поддерживаемых открытыми.
     pub min_connections: u32,
     /// Ожидание свободного соединения; дольше — `Unavailable`.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
     pub acquire_timeout: Duration,
-    /// Простаивающее соединение закрывается через этот срок.
+    /// Простаивающее соединение закрывается через этот срок; `null` — не закрывается.
+    #[serde(with = "duration::option")]
+    #[schemars(with = "Option<duration::HumanDuration>")]
     pub idle_timeout: Option<Duration>,
-    /// Соединение пересоздаётся через этот срок (переключение реплик, балансировка).
+    /// Соединение пересоздаётся через этот срок (переключение реплик, балансировка); `null` — не пересоздаётся.
+    #[serde(with = "duration::option")]
+    #[schemars(with = "Option<duration::HumanDuration>")]
     pub max_lifetime: Option<Duration>,
     /// Подготовленных выражений в кэше соединения (без PgBouncer).
     pub statement_cache: usize,
@@ -49,7 +66,9 @@ pub struct PoolConfig {
     pub application_name: String,
     /// TLS канала `database.tls`: корни для проверки сервера, клиентский сертификат, `allow_plaintext` (dev).
     pub tls: InternalTls,
-    /// Профиль запуска (параметр `profile` верхнего уровня; задаёт приложение).
+    /// Профиль запуска: параметр `profile` верхнего уровня config.yaml, задаёт приложение (в секции не пишется).
+    #[serde(skip)]
+    #[schemars(skip)]
     pub profile: Profile,
 }
 
@@ -91,6 +110,9 @@ impl fmt::Debug for PoolConfig {
 }
 
 impl PoolConfig {
+    /// Имя секции в config.yaml.
+    pub const SECTION: &'static str = "database";
+
     /// Параметры соединения с `url`; `pgbouncer` отключает кэш подготовленных выражений.
     pub fn connect_options(&self, url: &str, pgbouncer: bool) -> Result<PgConnectOptions> {
         self.options(url, pgbouncer).map(|(opts, _)| opts)

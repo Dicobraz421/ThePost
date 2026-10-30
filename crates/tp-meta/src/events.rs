@@ -13,8 +13,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use time::OffsetDateTime;
+use tp_contracts::config::duration;
 use tp_contracts::events::{
     CoreEvent, CoreEventKind, EventLog, EventPos, EventSink, LoggedEvent, Partition,
 };
@@ -25,12 +28,15 @@ use uuid::Uuid;
 use crate::PgMeta;
 use crate::schema::{begin_system, db_err, to_i64, to_u64};
 
-/// Секция конфигурации подписчиков журнала событий (SRS 5.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Секция конфигурации подписчиков журнала событий `meta.events` (SRS 5.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct EventsConfig {
     /// Событий в одной пачке подписчика.
     pub batch: usize,
     /// Срок лизы раздела подписчика: больше времени обработки пачки.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
     pub lease_ttl: Duration,
     /// Событий, удаляемых одним вызовом очистки ([`PgMeta::purge_events`]).
     pub purge_batch: usize,

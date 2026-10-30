@@ -3,14 +3,18 @@
 
 use std::time::Duration;
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgSslMode;
 use sqlx::{FromRow, PgPool};
 use tp_contracts::Result;
+use tp_contracts::config::duration;
 
 use crate::schema::db_err;
 
-/// Пороги проверок СУБД (SRS 3.1, 5.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Пороги проверок СУБД (SRS 3.1, 5.5): секция `meta.doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct DoctorConfig {
     /// Наименьшая версия сервера (`server_version_num`).
     pub min_server_version: u32,
@@ -21,6 +25,8 @@ pub struct DoctorConfig {
     /// Наименьшее значение `max_connections`.
     pub min_max_connections: u32,
     /// Предел ожидания ответа СУБД на проверки.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
     pub timeout: Duration,
 }
 
