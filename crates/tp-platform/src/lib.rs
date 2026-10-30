@@ -2,10 +2,12 @@
 
 pub mod config;
 pub mod reload;
+pub mod roles;
 pub mod service_http;
 pub mod telemetry;
 
 pub use config::{Config, Section, SectionRegistry};
 pub use reload::{ReloadConfig, ReloadTrigger, Reloader, SectionWatch};
+pub use roles::{RoleLimits, RoleSpec, Roles, RolesReport, RuntimeConfig};
 pub use service_http::{Health, ServiceHttpConfig};
 pub use telemetry::{Metrics, Telemetry, TelemetryConfig};
