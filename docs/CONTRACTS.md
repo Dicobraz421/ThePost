@@ -28,6 +28,8 @@ SRS 3.2. Объекты неизменяемы, запись идемпотен�
 - `delete(&BlobKey) -> Result<()>` (отсутствие — не ошибка)
 - `list(prefix: &str, older_than: OffsetDateTime) -> ObjectStream` (`ObjectEntry { path, size, modified }`, `key()`) — для поиска «сирот» и миграции.
 - `put_raw/get_raw/delete_raw(path)` — произвольные пути для сегментов индексов (`idx/{tenant}/{account}/...`).
+  Сегменты (`*_raw`) неизменяемы: путь записывается один раз, перезапись запрещена (новая версия — новый путь, манифест
+  индекса переключается CAS); кэш BLOB кэширует их без инвалидации (решение 2026-10-30, #35).
 
 ## BlobIndex
 SRS 3.4. Учёт объектов в метаданных. Реализация — `tp-meta`; in-memory — `tp-testkit`.
@@ -87,6 +89,17 @@ SRS 2.5. Журнал событий ядра (outbox): событие пише�
 `CoreEvent { tenant, account, mailbox?, kind, at }`, `kind: Delivered | Submitted | FlagsChanged | Moved | Trashed | Purged | MailboxCreated | MailboxDeleted`.
 Раздел = `partition_of(account, N)` (FNV-1a, зафиксирован тестом); подписчик (`EventSink`: индексатор, модули) читает
 `read(partition, after, limit)`, позиция — `position(subscriber, partition)`, фиксирует `commit(subscriber, partition, pos)`; раздел подписчика — под лизой. Доставка не менее одного раза, порядок — в пределах ящика.
+Между экземплярами (решение 2026-10-30, #45): `PartitionAssigner` (`tp-cluster`, rendezvous-хэширование `<подписчик>/<раздел>`
+по `Membership::live()`) — `assigned(subscriber, &NodeId, partitions) -> Vec<Partition>` (по возрастанию), `members() ->
+watch::Receiver<Vec<NodeId>>` (новое значение — пересчитать). Для одного состава каждый раздел назначен ровно одному узлу; узел вне
+состава — пусто, единственный узел — все. Узел берёт лизу только назначенного ему раздела и отдаёт лизы снятых разделов после
+фиксации текущей пачки; лиза с `fencing` остаётся гарантией единственности, пока узлы видят разный состав.
+
+## Membership
+Решение 2026-10-30, #45. `Membership`: `heartbeat(&NodeId, ttl)` — создать или продлить запись узла (период ≈ `ttl / 3`),
+`leave(&NodeId)` — удалить (штатная остановка; отсутствующая — не ошибка), `live() -> Vec<NodeId>` — узлы с непросроченной записью,
+по возрастанию. Время — часы хранилища (PostgreSQL). `NodeId` — имя экземпляра, не пустое, без пробелов, ≤ 255 байт (строка в JSON).
+Реализация — `tp-meta` (META-16), in-memory — `tp-testkit`. Код — `membership.rs`.
 
 ## Search
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
@@ -114,14 +127,40 @@ SASL-механизмы (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, GSSAPI) — `tp-aut
 ## Roles
 SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`; пресеты (`all`, `edge`, `transport`, `access`, `backend`, `mailbox`) раскрываются в набор ролей при загрузке конфигурации; режим edge — параметр smtp-in (SRS 2.6).
 Раскрытие — `RoleSet::expand(&[RoleEntry]) -> RoleSet { roles, edge }`; `RoleEntry` = пресет | роль (строка config.yaml).
-`RoleService`: `name()`, `run(ctx: RoleCtx) -> Result<()>` до сигнала отмены; `RoleCtx { config: Arc<dyn ConfigWatch>,
-shutdown: Shutdown, drain_deadline, ready: ReadyHandle }`. `ConfigWatch` — `current() -> Arc<dyn Any>`, `changed()`; типизированно —
-`RoleCtx::config::<T>()`. `Shutdown` — на `futures` (tokio в `tp-contracts` не подключён); метрики — позже.
+`RoleService`: `name()`, `run(ctx: RoleCtx) -> Result<()>` до отмены `shutdown`; `RoleCtx { config: ConfigRx,
+shutdown: CancellationToken, drain_deadline, ready: ReadyHandle }` (`tokio`, `tokio-util`; `role` реэкспортирует `watch` и `CancellationToken`).
+`ConfigRx = watch::Receiver<Arc<dyn Any + Send + Sync>>` — секция роли; типизированно — `RoleCtx::config::<T>()`, ожидание версии —
+`RoleCtx::config_changed()` (закрытый канал — не завершается). `config_channel(v)`, `fixed_config(v)` — для приложения и тестов; метрики — позже.
 
 ## Config
 Каждый крейт владеет своей секцией `XxxConfig: Deserialize + Default + Clone` и документирует её поля.
 Приложение собирает общий `Config`; обязательны только `database.url`, `blob.url`, `domain` (SRS 5.5).
 Hot reload: новая копия рассылается через `watch`; параметры, требующие перезапуска, помечены в doc-комментарии.
+Длительности (решение 2026-10-30, #43) — только строки `5s`, `250ms`, `10m`, `24h`, `1h30m` (единицы `d h m s ms us ns` по убыванию,
+каждая раз, без пробелов; ноль — `0s`); поля без единицы в имени (`acquire_timeout`, `reload.poll_interval`). Поле —
+`#[serde(with = "tp_contracts::config::duration")]` + `#[schemars(with = "duration::HumanDuration")]` (`Option` — `duration::option`
+и `Option<HumanDuration>`); схема — `type: string`, `pattern` = `duration::PATTERN`. Число, `5 sec`, `-1s`, переполнение — ошибка.
+Секреты — только `secrets::SecretRef` (раздел Secrets); строка или число на месте ссылки — ошибка разбора.
+
+## Secrets
+Решение 2026-10-30. Секреты (пароли PostgreSQL и Valkey, ключи S3, DKIM, ACME, подписи токенов, LDAP/OIDC) — только во внешнем хранилище
+(OpenBao / Vault, API Vault). В config.yaml и таблицах БД — `SecretRef`: в конфигурации `{ secret: "<путь>#<поле>" }`
+(`deny_unknown_fields`), в БД — строка `<путь>#<поле>` (`Display`/`FromStr`); путь — сегменты `[A-Za-z0-9_.-]+` через `/` без `.`/`..`,
+поле — `[A-Za-z0-9_.-]+`. Скаляр на месте ссылки — ошибка «secret in plaintext» без значения в тексте. `Secret` — значение,
+`***` в `Debug`/`Display`, обнуляется при удалении, доступ — `expose()`; `lease() -> Option<&SecretLease { id, ttl, renewable }>`,
+`lease_ttl()`. `SecretStore`: `get(&SecretRef) -> Result<Secret>` (`NotFound` — нет пути или поля, `Forbidden` — политика,
+`Unavailable` — недоступно или запечатано), `renew(&SecretLease) -> Result<SecretLease>` (неизвестная/истёкшая — `NotFound`, перечитать;
+по умолчанию — `NotFound`). Встроенный клиент — `tp-platform` (PLT-12), замена — `Registry::set_secret_store`, in-memory — `tp-testkit`.
+Код — `secrets.rs`.
+
+## Internal TLS
+SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, Valkey, S3, узел ↔ узел — только TLS. Общая секция `tls::InternalTls
+{ ca_file, cert_file, key_file, server_name, allow_plaintext }` — поле `tls` секции канала; `Profile { Prod (по умолчанию), Dev }` —
+параметр `profile` верхнего уровня config.yaml. `InternalTls::check_url(InternalChannel::{Postgres, Valkey, S3, Node}, url, profile)
+-> Result<Transport::{Tls, Plaintext}>` вызывается в `thepost config check` и при запуске: `allow_plaintext` вне dev, адрес без TLS
+без `allow_plaintext`, `sslmode=require|verify-ca` — `Invalid`. Схемы: PostgreSQL — `sslmode=verify-full` (без `sslmode` клиент
+обязан verify-full), Valkey — `rediss://`, S3 — `https://`, узел — `https://`/`smtps://`. `Transport::Plaintext` — крейт канала пишет
+`InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
 
 ## Queue (Ф1)
 `QueueStore`: `enqueue(OutMessage { blob, from, rcpts, next_attempt })`, `claim(limit, lease)`,
@@ -134,11 +173,13 @@ Hot reload: новая копия рассылается через `watch`; п�
 ## Extension points
 SRS 2.5, 1.3. Модуль — cargo feature + `modules.<имя>.enabled`. `Module { name(), schema() -> "mod_<имя>", migrations() -> &[Migration { version, name, sql }],
 register(&mut Registry, &ModuleCtx) -> Result<()> }`; имя — `validate_module_name` (`[a-z][a-z0-9_]*`, ≤ 59).
-`ModuleCtx { config: Arc<dyn ConfigWatch> }` (`#[non_exhaustive]`, `ModuleCtx::new`) — секция `modules.<имя>` как JSON-значение приложения.
+`ModuleCtx { config: watch::Receiver<serde_json::Value> }` (`#[non_exhaustive]`, `ModuleCtx::new`) — секция `modules.<имя>`;
+типизированно — `ModuleCtx::config::<T: DeserializeOwned>() -> Result<T>` (ошибка полей — `Invalid`).
 `Registry`: `add_role(RoleService)`, `add_jmap_capability(JmapCapability { uri, session_object, methods, call })`,
 `add_admin_routes(AdminRoutes { prefix, handle(AdminRequest) -> AdminResponse })`, `add_event_sink`, `add_decision_hook`;
-`set_blob_store` / `set_directory` / `set_search_index` — замена встроенной реализации. Повтор имени, URI, префикса, реализации — `Conflict`.
-JSON в JMAP и тела Admin API — `Bytes` (serde_json в `tp-contracts` не подключён).
+`set_blob_store` / `set_directory` / `set_search_index` / `set_secret_store` — замена встроенной реализации. Повтор имени, URI, префикса, реализации — `Conflict`.
+JSON в JMAP (`session_object`, аргументы и результат `call`) и тела Admin API модулей — `serde_json::Value`
+(`Null` — тела нет; ответ — `application/json`).
 `DecisionHook { name, before_final_delete(&FinalDelete), on_delivery(&DeliveryInfo), on_submission(&SubmissionInfo) }`, методы по умолчанию — `Allow`;
 → `Decision::{ Allow, Deny(reason), Augment { headers, copies: Vec<CopyTo::{ Mailbox(Delivery), Address }> } }`.
 `DecisionHooks` вызывает хуки по порядку регистрации: первый `Deny` прерывает, дополнения объединяются, без хуков — `Allow`;
@@ -156,3 +197,10 @@ JSON в JMAP и тела Admin API — `Bytes` (serde_json в `tp-contracts` н�
   `DecisionHooks`, `CopyTo`.
 - 2026-10-30 — x/mailbox-delete-cascade: `MailboxStore::delete(.., cascade)`; надгробия BLOB в `finalize_delete`;
   `to_trash`/`restore` сохраняют `MessageId`.
+- 2026-10-30 — CTR-11 (волна contracts-04): `tokio`/`tokio-util`/`serde_json` в контрактах; `RoleCtx { config: ConfigRx, shutdown: CancellationToken }`
+  вместо `ConfigWatch`/`Shutdown`; `ModuleCtx::config::<T>()`; `serde_json::Value` в `JmapCapability` и `AdminRequest`/`AdminResponse`
+  (`content_type` убран).
+- 2026-10-30 — CTR-12 (волна contracts-04): `tls::InternalTls`, `Profile`, `InternalChannel`, `Transport`; сегменты `*_raw` неизменяемы.
+- 2026-10-30 — CTR-13 (волна contracts-05): `config::duration` (длительности humantime); `reload.poll_interval_ms` → `reload.poll_interval` (tp-platform).
+- 2026-10-30 — CTR-14: `membership::{Membership, NodeId}`, `events::PartitionAssigner`.
+- 2026-10-30 — CTR-15: `secrets::{SecretRef, Secret, SecretLease, SecretStore}`, `Registry::set_secret_store`.

@@ -4,11 +4,22 @@
 
 domain: example.ru
 
+# Роль thepost без SUPERUSER и BYPASSRLS — владелец БД; пароль — только ссылка на секрет в OpenBao.
 database:
-  url: postgres://thepost:CHANGE_ME@localhost:5432/thepost
+  url: postgres://thepost@localhost:5432/thepost?sslmode=verify-full
+  password: { secret: "thepost/db#password" }
 
 # Локальная POSIX-директория; шина событий и кэш — в процессе.
 blob:
   url: file:///var/lib/thepost/blob
 
 roles: [all]
+
+# Секреты — только из хранилища (OpenBao или Vault), канал — TLS. Вход AppRole: secret_id — учётные данные
+# systemd (LoadCredential в thepost.service). Поля секции — по PLT-12.
+secrets:
+  url: https://openbao.example.ru:8200
+  auth:
+    approle:
+      role_id_file: /etc/thepost/openbao/role_id
+      secret_id_file: /run/credentials/thepost.service/openbao-secret-id

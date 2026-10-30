@@ -5,15 +5,19 @@
 pub mod auth;
 pub mod blob;
 pub mod bus;
+pub mod config;
 pub mod error;
 pub mod events;
 pub mod ext;
 pub mod ids;
 pub mod lease;
 pub mod mailstore;
+pub mod membership;
 pub mod meta;
 pub mod role;
 pub mod search;
+pub mod secrets;
+pub mod tls;
 
 pub use error::{Error, Result};
 pub use ids::{

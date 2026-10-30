@@ -1,15 +1,206 @@
 # Зависимости The Post для разработки и эталон SMB (SRS 1.2). Описание — deploy/README.md.
-#   dev (по умолчанию, см. .env): PostgreSQL 16, SeaweedFS (S3), Valkey, Rspamd — для интеграционных тестов.
-#   smb: thepost (roles: all, локальный BLOB, шина в процессе) + PostgreSQL + Rspamd.
+#   tls (по умолчанию, см. .env): PostgreSQL 16, SeaweedFS (S3), Valkey, OpenBao — только TLS-подключения,
+#     самоподписанный CA (tls-init, tls/gen-certs.sh); бакет thepost-test; OpenBao — Raft, автоматическое
+#     распечатывание ключом из файла, политика и AppRole thepost; роль thepost в PostgreSQL без SUPERUSER/BYPASSRLS.
+#   dev: те же зависимости и Rspamd с открытыми каналами — для интеграционных тестов; бакет thepost-test;
+#     OpenBao в dev-режиме с секретами стенда.
+#     docker compose -f deploy/compose/dev.yml --profile dev up -d
+#   smb: thepost (roles: all, локальный BLOB, шина в процессе) + PostgreSQL (TLS) + OpenBao (TLS) + Rspamd;
+#     секреты thepost — только из OpenBao (вход AppRole).
 #     docker compose -f deploy/compose/dev.yml --profile smb up -d --build
-# Пароли и ключи — только для локальной разработки.
+# Профили tls и dev публикуют одни и те же порты хоста — запускается один из них.
+# Пароли, ключи и CA — только для локальной разработки.
 
 name: thepost
 
 services:
+  # --- Профиль tls (по умолчанию) и smb: только TLS ---
+
+  tls-init:
+    image: postgres:16
+    profiles: [tls, smb]
+    entrypoint: ["sh", "/gen-certs.sh", "/certs", "/out"]
+    restart: "no"
+    volumes:
+      - ./tls/gen-certs.sh:/gen-certs.sh:ro
+      - ./tls:/out
+      - tls:/certs
+
+  postgres-tls:
+    image: postgres:16
+    profiles: [tls, smb]
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/server.pem
+      - -c
+      - ssl_key_file=/certs/server.key
+      - -c
+      - ssl_ca_file=/certs/ca.pem
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "${TP_PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata-tls:/var/lib/postgresql/data
+      - tls:/certs:ro
+      - ./tls/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Роль приложения thepost и БД thepost; пароль — новый из openbao-init-tls (файл удаляется после применения).
+  postgres-role-tls:
+    image: postgres:16
+    profiles: [tls, smb]
+    depends_on:
+      postgres-tls:
+        condition: service_healthy
+      openbao-init-tls:
+        condition: service_completed_successfully
+    entrypoint: ["sh", "/app-role.sh"]
+    restart: "no"
+    environment:
+      PGHOST: postgres-tls
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      PGSSLMODE: verify-full
+      PGSSLROOTCERT: /certs/ca.pem
+      TP_DB_PASSWORD_FILE: /bootstrap/db-password
+    volumes:
+      - ./postgres/app-role.sh:/app-role.sh:ro
+      - tls:/certs:ro
+      - pg-bootstrap:/bootstrap
+
+  # OpenBao: Raft, TLS; ключ распечатывания — в томе openbao-seal (seal "static", doctor предупреждает).
+  openbao-tls:
+    image: openbao/openbao:2.7.2
+    profiles: [tls, smb]
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    entrypoint: ["sh", "/openbao-init/start.sh"]
+    # start.sh — от root (ключи в томах), сервер — пользователем openbao (su-exec в docker-entrypoint.sh).
+    user: "0:0"
+    environment:
+      SKIP_CHOWN: "true"
+    ports:
+      - "${TP_OPENBAO_PORT:-8200}:8200"
+    volumes:
+      - ./openbao:/openbao-init:ro
+      - ./openbao/openbao.hcl:/openbao/config/openbao.hcl:ro
+      - tls:/certs:ro
+      - openbao-data:/openbao/data
+      - openbao-seal:/openbao/seal
+    healthcheck:
+      # 0 — распечатан; до инициализации (openbao-init-tls) — 2.
+      test: ["CMD", "bao", "status", "-address=https://127.0.0.1:8200", "-ca-cert=/certs/ca.pem"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # Инициализация, KV thepost, политика и AppRole thepost, секреты стенда (openbao/init.sh).
+  openbao-init-tls:
+    image: openbao/openbao:2.7.2
+    profiles: [tls, smb]
+    depends_on:
+      openbao-tls:
+        condition: service_started
+    entrypoint: ["sh", "/openbao-init/init.sh"]
+    user: "0:0"
+    restart: "no"
+    environment:
+      BAO_ADDR: https://openbao-tls:8200
+      BAO_CACERT: /certs/ca.pem
+      TP_S3_ACCESS_KEY_ID: thepost
+      TP_S3_SECRET_ACCESS_KEY: thepost-dev-secret
+    volumes:
+      - ./openbao:/openbao-init:ro
+      - ../openbao:/openbao-policy:ro
+      - tls:/certs:ro
+      - openbao-admin:/admin
+      - openbao-approle:/approle
+      - pg-bootstrap:/bootstrap
+
+  seaweedfs-tls:
+    image: chrislusf/seaweedfs:3.80
+    profiles: [tls]
+    entrypoint: ["sh", "/seaweedfs-start.sh"]
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    command:
+      - server
+      - -dir=/data
+      - -ip.bind=0.0.0.0
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/s3.json
+      - -s3.cert.file=/certs/server.pem
+      - -s3.key.file=/certs/server.key
+    ports:
+      - "${TP_S3_PORT:-8333}:8333"
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+      - ./seaweedfs-start.sh:/seaweedfs-start.sh:ro
+      - s3data-tls:/data
+      - tls:/certs:ro
+    healthcheck:
+      # ssl_client busybox с этим TLS не работает — порт и метка готовности (seaweedfs-start.sh).
+      test: ["CMD-SHELL", "test -f /tmp/ready && nc -z 127.0.0.1 8333"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  valkey-tls:
+    image: valkey/valkey:8.1
+    profiles: [tls]
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    command:
+      - valkey-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6379"
+      - --tls-cert-file
+      - /certs/server.pem
+      - --tls-key-file
+      - /certs/server.key
+      - --tls-ca-cert-file
+      - /certs/ca.pem
+      - --tls-auth-clients
+      - "no"
+    ports:
+      - "${TP_VALKEY_PORT:-6379}:6379"
+    volumes:
+      - tls:/certs:ro
+    healthcheck:
+      test: ["CMD", "valkey-cli", "--tls", "--cacert", "/certs/ca.pem", "-h", "localhost", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # --- Профиль dev: открытые каналы (клиенту — явный allow_plaintext) ---
+
   postgres:
     image: postgres:16
-    profiles: [dev, smb]
+    profiles: [dev]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -24,17 +215,73 @@ services:
       timeout: 3s
       retries: 30
 
+  # Роль приложения thepost (без SUPERUSER и BYPASSRLS) и БД thepost; тесты ходят ролью postgres.
+  postgres-role:
+    image: postgres:16
+    profiles: [dev]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["sh", "/app-role.sh"]
+    restart: "no"
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      TP_DB_PASSWORD: thepost-dev
+    volumes:
+      - ./postgres/app-role.sh:/app-role.sh:ro
+
+  # OpenBao в dev-режиме: в памяти, распечатан, root-токен thepost-dev-root; данные пропадают при перезапуске
+  # (openbao-init заново записывает секреты стенда).
+  openbao:
+    image: openbao/openbao:2.7.2
+    profiles: [dev]
+    command: ["server", "-dev"]
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: thepost-dev-root
+    ports:
+      - "${TP_OPENBAO_PORT:-8200}:8200"
+    healthcheck:
+      test: ["CMD", "bao", "status", "-address=http://127.0.0.1:8200"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  openbao-init:
+    image: openbao/openbao:2.7.2
+    profiles: [dev]
+    depends_on:
+      openbao:
+        condition: service_healthy
+    entrypoint: ["sh", "/openbao-init/init.sh"]
+    restart: "no"
+    environment:
+      BAO_ADDR: http://openbao:8200
+      BAO_TOKEN: thepost-dev-root
+      TP_DB_PASSWORD: thepost-dev
+      TP_APPROLE_ROLE_ID: thepost-dev
+      TP_APPROLE_SECRET_ID: thepost-dev-secret-id
+      TP_S3_ACCESS_KEY_ID: thepost
+      TP_S3_SECRET_ACCESS_KEY: thepost-dev-secret
+    volumes:
+      - ./openbao:/openbao-init:ro
+      - ../openbao:/openbao-policy:ro
+
   seaweedfs:
     image: chrislusf/seaweedfs:3.80
     profiles: [dev]
+    entrypoint: ["sh", "/seaweedfs-start.sh"]
     command: ["server", "-dir=/data", "-ip.bind=0.0.0.0", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json"]
     ports:
       - "${TP_S3_PORT:-8333}:8333"
     volumes:
       - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+      - ./seaweedfs-start.sh:/seaweedfs-start.sh:ro
       - s3data:/data
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
+      test: ["CMD-SHELL", "test -f /tmp/ready && wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
       interval: 3s
       timeout: 3s
       retries: 30
@@ -67,12 +314,16 @@ services:
     image: thepost:dev
     profiles: [smb]
     depends_on:
-      postgres:
+      postgres-role-tls:
+        condition: service_completed_successfully
+      openbao-tls:
         condition: service_healthy
       rspamd:
         condition: service_started
     volumes:
       - ./thepost-smb.yaml:/etc/thepost/config.yaml:ro
+      - tls:/etc/thepost/tls:ro
+      - openbao-approle:/etc/thepost/openbao:ro
       - tpdata:/var/lib/thepost
     ports:
       - "${TP_SMTP_PORT:-25}:25"
@@ -85,5 +336,14 @@ services:
 
 volumes:
   pgdata:
+  pgdata-tls:
   s3data:
+  s3data-tls:
+  tls:
   tpdata:
+  openbao-data:
+  # Ключ распечатывания — отдельно от данных Raft; ключ восстановления и root-токен — только стенд.
+  openbao-seal:
+  openbao-admin:
+  openbao-approle:
+  pg-bootstrap:

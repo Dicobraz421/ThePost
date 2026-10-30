@@ -3,7 +3,7 @@
 //! Модуль — набор крейтов под cargo feature, активируется `modules.<имя>.enabled` в config.yaml.
 //! Ядро не меняется: модуль при запуске регистрирует в [`Registry`] свои роли, capability JMAP,
 //! маршруты Admin API, подписчиков журнала событий ([`EventSink`]), точки принятия решений
-//! ([`DecisionHook`]) и реализации интерфейсов ядра ([`BlobStore`], [`Directory`], [`SearchIndex`]).
+//! ([`DecisionHook`]) и реализации интерфейсов ядра ([`BlobStore`], [`Directory`], [`SearchIndex`], [`SecretStore`]).
 //! Данные модуля — только в схеме PostgreSQL `mod_<имя>` с собственной последовательностью миграций.
 //!
 //! # Точки принятия решений
@@ -34,9 +34,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::future::BoxFuture;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::auth::{Directory, Principal};
@@ -46,8 +47,9 @@ use crate::events::EventSink;
 use crate::ids::{MailboxId, MessageId, TenantId};
 use crate::mailstore::Delivery;
 use crate::meta::AccountScope;
-use crate::role::{ConfigWatch, RoleService};
+use crate::role::{RoleService, watch};
 use crate::search::SearchIndex;
+use crate::secrets::SecretStore;
 
 // ---------- Модуль ----------
 
@@ -66,15 +68,21 @@ pub struct Migration {
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct ModuleCtx {
-    /// Секция `modules.<имя>` config.yaml с hot reload. Значение — секция в виде, который приложение
-    /// разбирает из YAML (JSON-значение), см. CONTRACTS.md#Extension points.
-    pub config: Arc<dyn ConfigWatch>,
+    /// Секция `modules.<имя>` config.yaml с hot reload: JSON-значение, разобранное приложением из YAML
+    /// (без ключа `enabled`). Типизированно — [`ModuleCtx::config`]; закрытый канал — новых версий не будет.
+    pub config: watch::Receiver<Value>,
 }
 
 impl ModuleCtx {
     /// Контекст с секцией конфигурации модуля.
-    pub fn new(config: Arc<dyn ConfigWatch>) -> Self {
+    pub fn new(config: watch::Receiver<Value>) -> Self {
         ModuleCtx { config }
+    }
+
+    /// Текущая секция как `T`; несоответствие полей — `Error::Invalid` с путём к полю
+    /// (`modules.<имя>` добавляет вызывающий).
+    pub fn config<T: DeserializeOwned>(&self) -> Result<T> {
+        T::deserialize(&*self.config.borrow()).map_err(|e| Error::Invalid(e.to_string()))
     }
 }
 
@@ -117,7 +125,7 @@ pub trait Module: Send + Sync + 'static {
 
 // ---------- JMAP, Admin API ----------
 
-/// Capability JMAP модуля (RFC 8620): объект в сессии и методы. JSON передаётся байтами;
+/// Capability JMAP модуля (RFC 8620): объект в сессии и методы. JSON — `serde_json::Value`;
 /// ссылки на результаты (`#`-аргументы) разрешает `tp-jmap` до вызова.
 #[async_trait]
 pub trait JmapCapability: Send + Sync + 'static {
@@ -125,13 +133,13 @@ pub trait JmapCapability: Send + Sync + 'static {
     fn uri(&self) -> &str;
 
     /// JSON-объект capability для `Session.capabilities`.
-    fn session_object(&self) -> Bytes;
+    fn session_object(&self) -> Value;
 
     /// Имена методов (`Foo/get`, `Foo/set`).
     fn methods(&self) -> &[&str];
 
     /// Выполняет метод: аргументы и результат — JSON-объекты.
-    async fn call(&self, principal: &Principal, method: &str, args: Bytes) -> Result<Bytes>;
+    async fn call(&self, principal: &Principal, method: &str, args: Value) -> Result<Value>;
 }
 
 /// Запрос к маршрутам Admin API модуля.
@@ -143,19 +151,17 @@ pub struct AdminRequest {
     pub path: String,
     /// Строка запроса без `?`.
     pub query: Option<String>,
-    /// Тело.
-    pub body: Bytes,
+    /// Тело JSON; `Value::Null` — тела нет.
+    pub body: Value,
 }
 
-/// Ответ маршрута Admin API модуля.
+/// Ответ маршрута Admin API модуля; тело отдаётся как `application/json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminResponse {
     /// Код HTTP.
     pub status: u16,
-    /// `Content-Type`.
-    pub content_type: String,
-    /// Тело.
-    pub body: Bytes,
+    /// Тело JSON; `Value::Null` — тела нет (например, 204).
+    pub body: Value,
 }
 
 /// Маршруты Admin API модуля. Аутентификацию и проверку прав администратора выполняет `tp-admin`
@@ -350,6 +356,7 @@ pub struct Registry {
     blob_store: Option<Arc<dyn BlobStore>>,
     directory: Option<Arc<dyn Directory>>,
     search_index: Option<Arc<dyn SearchIndex>>,
+    secret_store: Option<Arc<dyn SecretStore>>,
 }
 
 fn unique<T: ?Sized>(items: &[Arc<T>], key: impl Fn(&T) -> &str, new: &T) -> Result<()> {
@@ -419,6 +426,11 @@ impl Registry {
         set_once(&mut self.search_index, index)
     }
 
+    /// Хранилище секретов вместо встроенного клиента OpenBao/Vault.
+    pub fn set_secret_store(&mut self, store: Arc<dyn SecretStore>) -> Result<()> {
+        set_once(&mut self.secret_store, store)
+    }
+
     /// Роли модулей.
     pub fn roles(&self) -> &[Arc<dyn RoleService>] {
         &self.roles
@@ -458,6 +470,11 @@ impl Registry {
     pub fn search_index(&self) -> Option<Arc<dyn SearchIndex>> {
         self.search_index.clone()
     }
+
+    /// Хранилище секретов модуля, если зарегистрировано.
+    pub fn secret_store(&self) -> Option<Arc<dyn SecretStore>> {
+        self.secret_store.clone()
+    }
 }
 
 impl fmt::Debug for Registry {
@@ -483,6 +500,7 @@ impl fmt::Debug for Registry {
             .field("blob_store", &self.blob_store.is_some())
             .field("directory", &self.directory.is_some())
             .field("search_index", &self.search_index.is_some())
+            .field("secret_store", &self.secret_store.is_some())
             .finish()
     }
 }
@@ -599,6 +617,60 @@ mod tests {
         assert!(!reg.decision_hooks().is_empty());
         assert!(reg.blob_store().is_none());
         assert!(format!("{reg:?}").contains("passive"));
+    }
+
+    struct NoSecrets;
+
+    #[async_trait]
+    impl SecretStore for NoSecrets {
+        async fn get(&self, _: &crate::secrets::SecretRef) -> Result<crate::secrets::Secret> {
+            Err(Error::NotFound)
+        }
+    }
+
+    #[test]
+    fn registry_secret_store_once() {
+        let mut reg = Registry::default();
+        assert!(reg.secret_store().is_none());
+        reg.set_secret_store(Arc::new(NoSecrets)).expect("first");
+        assert_eq!(
+            reg.set_secret_store(Arc::new(NoSecrets)),
+            Err(Error::Conflict)
+        );
+        assert!(reg.secret_store().is_some());
+        assert!(format!("{reg:?}").contains("secret_store: true"));
+    }
+
+    #[test]
+    fn module_config_typed() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Cfg {
+            retention_days: u32,
+            journal: Option<String>,
+        }
+        impl Default for Cfg {
+            fn default() -> Self {
+                Cfg {
+                    retention_days: 30,
+                    journal: None,
+                }
+            }
+        }
+
+        let (tx, rx) = watch::channel(serde_json::json!({ "journal": "j@example.org" }));
+        let ctx = ModuleCtx::new(rx);
+        assert_eq!(
+            ctx.config::<Cfg>(),
+            Ok(Cfg {
+                retention_days: 30,
+                journal: Some("j@example.org".into()),
+            })
+        );
+        tx.send_replace(serde_json::json!({ "retention_days": "many" }));
+        assert!(matches!(ctx.config::<Cfg>(), Err(Error::Invalid(_))));
+        tx.send_replace(serde_json::json!({ "bogus": 1 }));
+        assert!(matches!(ctx.config::<Cfg>(), Err(Error::Invalid(m)) if m.contains("bogus")));
     }
 
     #[test]

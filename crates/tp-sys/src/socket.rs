@@ -5,11 +5,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use schemars::JsonSchema;
+use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::net::TcpListener;
 
 /// Параметры слушающего сокета. Keepalive наследуется принятыми соединениями (Linux).
-#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+/// Разбирается из секции конфигурации; пропущенные поля — значения по умолчанию.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct ListenerConfig {
     /// Длина очереди принятых, но не обработанных соединений.
     pub backlog: u32,
@@ -70,6 +73,32 @@ mod tests {
 
     fn localhost_v4() -> SocketAddr {
         (Ipv4Addr::LOCALHOST, 0).into()
+    }
+
+    #[test]
+    fn section_from_yaml() {
+        let cfg: ListenerConfig = serde_yaml_ng::from_str(
+            "backlog: 128
+reuse_port: false
+",
+        )
+        .expect("yaml");
+        assert_eq!(
+            cfg,
+            ListenerConfig {
+                backlog: 128,
+                reuse_port: false,
+                ..ListenerConfig::default()
+            }
+        );
+        let empty: ListenerConfig = serde_yaml_ng::from_str("{}").expect("empty section");
+        assert_eq!(empty, ListenerConfig::default());
+        let err = serde_yaml_ng::from_str::<ListenerConfig>(
+            "backlg: 1
+",
+        )
+        .expect_err("unknown");
+        assert!(err.to_string().contains("unknown field `backlg`"), "{err}");
     }
 
     #[tokio::test]

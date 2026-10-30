@@ -388,7 +388,6 @@ pub trait Authorizer: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use schemars::_private::serde_json;
     use std::sync::Arc;
 
     #[test]

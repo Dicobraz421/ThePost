@@ -280,8 +280,6 @@ impl fmt::Display for BlobKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Временно: serde_json не подключён к tp-contracts (dev-зависимость — полоса deps), берём реэкспорт schemars.
-    use schemars::_private::serde_json;
 
     fn roundtrip<T>(v: &T) -> String
     where

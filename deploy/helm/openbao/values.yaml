@@ -1,0 +1,93 @@
+# OpenBao для The Post в Kubernetes — значения официального чарта openbao/openbao:
+#   helm repo add openbao https://openbao.github.io/openbao-helm
+#   helm install openbao openbao/openbao --version 0.30.6 -n openbao --create-namespace -f deploy/helm/openbao/values.yaml
+# До установки — секрет openbao-tls (tls.crt, tls.key, ca.crt; SAN: openbao, openbao.openbao.svc,
+# openbao-{0,1,2}.openbao-internal, 127.0.0.1 — для bao внутри пода) и способ распечатывания (seal ниже).
+# После — bao operator init и deploy/helm/openbao/bootstrap.sh (KV, политика и Kubernetes auth для thepost).
+# Описание — deploy/README.md.
+
+global:
+  tlsDisable: false
+
+injector:
+  enabled: false
+
+ui:
+  enabled: false
+
+server:
+  image:
+    tag: "2.7.2"
+  extraEnvironmentVars:
+    BAO_CACERT: /openbao/userconfig/openbao-tls/ca.crt
+  # Kubernetes auth проверяет токены сервисных аккаунтов через TokenReview (system:auth-delegator).
+  authDelegator:
+    enabled: true
+  volumes:
+    - name: openbao-tls
+      secret:
+        secretName: openbao-tls
+    - name: openbao-unseal
+      secret:
+        secretName: openbao-unseal
+        optional: true
+  volumeMounts:
+    - name: openbao-tls
+      mountPath: /openbao/userconfig/openbao-tls
+      readOnly: true
+    - name: openbao-unseal
+      mountPath: /openbao/userconfig/openbao-unseal
+      readOnly: true
+  dataStorage:
+    enabled: true
+    size: 10Gi
+  ha:
+    enabled: true
+    replicas: 3
+    raft:
+      enabled: true
+      setNodeId: true
+      config: |
+        ui = false
+        disable_mlock = true
+
+        listener "tcp" {
+          address         = "[::]:8200"
+          cluster_address = "[::]:8201"
+          tls_cert_file   = "/openbao/userconfig/openbao-tls/tls.crt"
+          tls_key_file    = "/openbao/userconfig/openbao-tls/tls.key"
+          tls_min_version = "tls12"
+        }
+
+        storage "raft" {
+          path = "/openbao/data"
+          retry_join {
+            leader_api_addr     = "https://openbao-0.openbao-internal:8200"
+            leader_ca_cert_file = "/openbao/userconfig/openbao-tls/ca.crt"
+          }
+          retry_join {
+            leader_api_addr     = "https://openbao-1.openbao-internal:8200"
+            leader_ca_cert_file = "/openbao/userconfig/openbao-tls/ca.crt"
+          }
+          retry_join {
+            leader_api_addr     = "https://openbao-2.openbao-internal:8200"
+            leader_ca_cert_file = "/openbao/userconfig/openbao-tls/ca.crt"
+          }
+        }
+
+        # Распечатывание после перезапуска — автоматическое (решение владельца 2026-10-30). Вместо seal "static"
+        # задать один из вариантов, если он есть:
+        #   облачный KMS:  seal "awskms" { region = "...", kms_key_id = "..." }  (также gcpckms, azurekeyvault, ocikms);
+        #   HSM (PKCS#11): seal "pkcs11" { lib = "/usr/lib/softhsm/libsofthsm2.so", slot = "0", key_label = "openbao" }
+        #                  (PIN — переменная BAO_HSM_PIN из секрета);
+        #   другой OpenBao/Vault: seal "transit" { address = "...", key_name = "openbao-unseal", mount_path = "transit/" }.
+        # Без KMS и HSM — ключ в секрете Kubernetes openbao-unseal (32 случайных байта), thepost doctor предупреждает:
+        #   head -c 32 /dev/urandom > unseal.key
+        #   kubectl -n openbao create secret generic openbao-unseal --from-file=unseal.key && rm unseal.key
+        # Ручной ввод ключей (bao operator unseal после каждого перезапуска) — убрать блок seal.
+        seal "static" {
+          current_key_id = "k8s-1"
+          current_key    = "file:///openbao/userconfig/openbao-unseal/unseal.key"
+        }
+
+        service_registration "kubernetes" {}

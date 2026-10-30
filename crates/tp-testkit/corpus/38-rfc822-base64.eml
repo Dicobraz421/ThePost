@@ -1,0 +1,29 @@
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: rfc822 in base64
+Date: Thu, 29 Oct 2026 10:40:00 +0300
+Message-ID: <corpus-040@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="fwd-3"
+
+This is a multi-part message in MIME format.
+--fwd-3
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Encoded forward.
+--fwd-3
+Content-Type: message/rfc822
+Content-Transfer-Encoding: base64
+
+RnJvbTogQWxpY2UgRXhhbXBsZSA8YWxpY2VAZXhhbXBsZS5jb20+DQpUbzogQm9iIDxib2JAZXhh
+bXBsZS5vcmc+DQpTdWJqZWN0OiA9P3V0Zi04P2I/MEpMUXU5QyswTGJRdGRDOTBMM1F2dEMxSU5D
+LzBMalJnZEdNMEx6UXZnPT0/PQ0KRGF0ZTogVGh1LCAyOSBPY3QgMjAyNiAxMDozMzowMCArMDMw
+MA0KTWVzc2FnZS1JRDogPGNvcnB1cy0wMzNAZXhhbXBsZS5jb20+DQpNSU1FLVZlcnNpb246IDEu
+MA0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJ1dGYtOCINCkNvbnRlbnQtVHJh
+bnNmZXItRW5jb2Rpbmc6IDhiaXQNCg0K0J/RgNC40LLQtdGCISDQrdGC0L4g0YLQtdGB0YLQvtCy
+0L7QtSDQv9C40YHRjNC80L4g0LTQu9GPINC/0YDQvtCy0LXRgNC60Lgg0YDQsNC30LHQvtGA0LAg
+0LrQuNGA0LjQu9C70LjRhtGLLiDQodGK0LXRiNGMINC20LUg0LXRidGRINGN0YLQuNGFINC80Y/Q
+s9C60LjRhSDRhNGA0LDQvdGG0YPQt9GB0LrQuNGFINCx0YPQu9C+0LosINC00LAg0LLRi9C/0LXQ
+uSDRh9Cw0Y4u
+--fwd-3--

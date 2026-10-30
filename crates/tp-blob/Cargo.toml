@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 tp-contracts.workspace = true
 schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true

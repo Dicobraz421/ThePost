@@ -1,0 +1,38 @@
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Encoded-word filename
+Date: Thu, 29 Oct 2026 10:23:00 +0300
+Message-ID: <corpus-023@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix-6"
+
+This is a multi-part message in MIME format.
+--mix-6
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+The quick brown fox jumps over the lazy dog. Quarterly report attached, please review before Friday.
+--mix-6
+Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document;
+ name="=?utf-8?b?0J/RgNC+0YLQvtC60L7QuyDRgdC+0LLQtdGJ0LDQvdC40Y8uZG9jeA==?="
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment;
+ filename="=?windows-1251?b?z/Du8u7q7usg8e7i5fng7ej/LmRvY3g=?="
+
+UEsDBBQAAAAIACB1Xl3MVIwQ4QAAAJwBAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbH2QTU7DMBCF
+r2J5i2KHLhBCSbqAsgQW5QCWM0ks7BnLMw3h9iht6QIV1u/ne3rNdklRzVA4ELb61tRaAXrqA46t
+ft8/V/d62zX7rwyslhSRWz2J5Adr2U+QHBvKgEuKA5XkhA2V0WbnP9wIdlPXd9YTCqBUsnbornmC
+wR2iqN0igCdsgchaPZ6MK6vVLucYvJNAaGfsf1GqM8EUiEcPTyHzzZKitlcJq/I34Jx7naGU0IN6
+c0VeXIJW208qve3JHxKgmP9rruykYQgeLvm1LRfywBxwTNFclOQC/uy3x7u7b1BLAwQUAAAACAAg
+dV5dNlfe3KQAAAAYAQAACwAAAF9yZWxzLy5yZWxzjc+xCsIwFAXQXwlvN2kdRKRpFxG6Sv2AkLy2
+wSQvJFHr37s4WHFwvVzO5Tbd4h27Y8qWgoSaV8AwaDI2TBIuw2mzh65tzuhUsRTybGNmi3chS5hL
+iQchsp7Rq8wpYli8Gyl5VTKnNImo9FVNKLZVtRPp04C1yXojIfWmBjY8I/5j0zhajUfSN4+h/Jj4
+agAbVJqwSHhQMsK8Y754B6JtxOpi+wJQSwMEFAAAAAgAIHVeXY/1+eexAAAA1wAAABEAAAB3b3Jk
+L2RvY3VtZW50LnhtbEXOMQ6CMBgF4Ks03aXoYAwB3DyBHgBLhSa0f9NWwU09gwcxuBgHvMLPjUxx
+cPne8vLy0nWnGnIS1knQGZ1HMSVCcyilrjK6225mK7rO0zYpgR+V0J50qtEuaTNae28SxhyvhSpc
+BEboTjUHsKrwLgJbsRZsaSxw4ZzUlWrYIo6XTBVS0zC5h/Ic0gRswOd4xwGfOGCPw3gh+MFhvI43
+fGCPb3ylLJSCdtJM/obY/2T+BVBLAQIUABQAAAAIACB1Xl3MVIwQ4QAAAJwBAAATAAAAAAAAAAAA
+AACAAQAAAABbQ29udGVudF9UeXBlc10ueG1sUEsBAhQAFAAAAAgAIHVeXTZX3tykAAAAGAEAAAsA
+AAAAAAAAAAAAAIABEgEAAF9yZWxzLy5yZWxzUEsBAhQAFAAAAAgAIHVeXY/1+eexAAAA1wAAABEA
+AAAAAAAAAAAAAIAB3wEAAHdvcmQvZG9jdW1lbnQueG1sUEsFBgAAAAADAAMAuQAAAL8CAAAAAA==
+--mix-6--

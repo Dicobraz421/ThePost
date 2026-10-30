@@ -1,0 +1,21 @@
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Signed
+Date: Thu, 29 Oct 2026 10:30:00 +0300
+Message-ID: <corpus-030@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/signed; boundary="sig-1"; protocol="application/pkcs7-signature"; micalg=sha-256
+
+This is a multi-part message in MIME format.
+--sig-1
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+The quick brown fox jumps over the lazy dog. Quarterly report attached, please review before Friday.
+--sig-1
+Content-Type: application/pkcs7-signature; name="smime.p7s"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="smime.p7s"
+
+MIIBAGZha2Utc2lnbmF0dXJl
+--sig-1--

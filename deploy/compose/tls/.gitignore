@@ -1,0 +1,2 @@
+# Копия CA, которую пишет tls-init (gen-certs.sh).
+*.pem

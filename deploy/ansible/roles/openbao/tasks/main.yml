@@ -1,0 +1,264 @@
+# Установка и начальная настройка OpenBao для The Post. Повторный прогон ничего не меняет.
+---
+- name: Check TLS sources
+  ansible.builtin.assert:
+    that:
+      - openbao_tls_cert_src | length > 0
+      - openbao_tls_key_src | length > 0
+      - openbao_tls_ca_src | length > 0
+    fail_msg: "Канал к OpenBao — только TLS: задайте openbao_tls_cert_src, openbao_tls_key_src, openbao_tls_ca_src"
+
+- name: Download OpenBao package
+  ansible.builtin.get_url:
+    url: "{{ openbao_package_url }}"
+    checksum: "{{ openbao_package_checksum }}"
+    dest: "/var/cache/openbao_{{ openbao_version }}.{{ openbao_package_ext }}"
+    mode: "0644"
+
+- name: Install OpenBao package (deb)
+  ansible.builtin.apt:
+    deb: "/var/cache/openbao_{{ openbao_version }}.{{ openbao_package_ext }}"
+  when: openbao_package_ext == 'deb'
+
+- name: Install OpenBao package (rpm)
+  ansible.builtin.dnf:
+    name: "/var/cache/openbao_{{ openbao_version }}.{{ openbao_package_ext }}"
+    disable_gpg_check: true  # пакет проверен по checksums.txt релиза
+  when: openbao_package_ext == 'rpm'
+
+- name: Create TLS directory
+  ansible.builtin.file:
+    path: "{{ openbao_config_dir }}/tls"
+    state: directory
+    owner: root
+    group: "{{ openbao_user }}"
+    mode: "0750"
+
+- name: Copy TLS certificate and CA
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ openbao_config_dir }}/tls/{{ item.dest }}"
+    owner: root
+    group: "{{ openbao_user }}"
+    mode: "0644"
+  loop:
+    - { src: "{{ openbao_tls_cert_src }}", dest: server.pem }
+    - { src: "{{ openbao_tls_ca_src }}", dest: ca.pem }
+  notify: Restart openbao
+
+- name: Copy TLS key
+  ansible.builtin.copy:
+    src: "{{ openbao_tls_key_src }}"
+    dest: "{{ openbao_config_dir }}/tls/server.key"
+    owner: root
+    group: "{{ openbao_user }}"
+    mode: "0640"
+  no_log: true
+  notify: Restart openbao
+
+- name: Create static unseal key
+  ansible.builtin.shell:
+    cmd: umask 077 && head -c 32 /dev/urandom > {{ openbao_static_key_file | quote }}
+    creates: "{{ openbao_static_key_file }}"
+  when: openbao_seal == 'static'
+
+- name: Restrict static unseal key
+  ansible.builtin.file:
+    path: "{{ openbao_static_key_file }}"
+    owner: "{{ openbao_user }}"
+    group: "{{ openbao_user }}"
+    mode: "0400"
+  when: openbao_seal == 'static'
+
+- name: Allow PKCS#11 devices (TPM, HSM) for openbao.service
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ openbao_service }}.service.d/thepost-pkcs11.conf"
+    content: |
+      # PKCS#11 (TPM, HSM): пакетный юнит закрывает устройства (PrivateDevices=yes).
+      [Service]
+      PrivateDevices=no
+    owner: root
+    group: root
+    mode: "0644"
+  when: openbao_seal == 'pkcs11'
+  notify: Restart openbao
+
+- name: Write OpenBao configuration
+  ansible.builtin.template:
+    src: openbao.hcl.j2
+    dest: "{{ openbao_config_dir }}/openbao.hcl"
+    owner: root
+    group: "{{ openbao_user }}"
+    mode: "0640"
+  notify: Restart openbao
+
+- name: Start OpenBao
+  ansible.builtin.systemd_service:
+    name: "{{ openbao_service }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Apply pending restart
+  ansible.builtin.meta: flush_handlers
+
+- name: Set OpenBao CLI environment
+  ansible.builtin.set_fact:
+    openbao_cli_env:
+      BAO_ADDR: "{{ openbao_api_addr }}"
+      BAO_CACERT: "{{ openbao_config_dir }}/tls/ca.pem"
+
+# /v1/sys/health: 200 — активен, 429 — резерв, 501 — не инициализирован, 503 — запечатан.
+- name: Wait for OpenBao API
+  ansible.builtin.uri:
+    url: "{{ openbao_api_addr }}/v1/sys/health"
+    ca_path: "{{ openbao_config_dir }}/tls/ca.pem"
+    status_code: [200, 429, 501, 503]
+  register: openbao_health
+  until: openbao_health.status in [200, 429, 501, 503]
+  retries: 30
+  delay: 2
+
+- name: Initialize OpenBao
+  ansible.builtin.command:
+    cmd: >-
+      bao operator init -format=json
+      -{{ 'key' if openbao_seal == 'shamir' else 'recovery' }}-shares={{ openbao_recovery_shares | int }}
+      -{{ 'key' if openbao_seal == 'shamir' else 'recovery' }}-threshold={{ openbao_recovery_threshold | int }}
+  environment: "{{ openbao_cli_env }}"
+  register: openbao_init
+  when: openbao_health.status == 501
+  changed_when: true
+  no_log: true
+
+- name: Save initialization result (recovery keys, root token)
+  ansible.builtin.copy:
+    content: "{{ openbao_init.stdout }}"
+    dest: "{{ openbao_init_file }}"
+    owner: root
+    group: root
+    mode: "0400"
+  when: openbao_health.status == 501
+  no_log: true
+
+- name: Remind about initialization result
+  ansible.builtin.debug:
+    msg: >-
+      OpenBao инициализирован: ключи восстановления и root-токен — {{ openbao_init_file }} на {{ inventory_hostname }}.
+      Перенесите их в надёжное место и удалите файл; дальнейшие прогоны — с openbao_admin_token.
+  when: openbao_health.status == 501
+
+- name: Stop when OpenBao waits for manual unseal
+  ansible.builtin.fail:
+    msg: "OpenBao запечатан (seal shamir): bao operator unseal на каждом узле, затем повторите прогон"
+  when: openbao_seal == 'shamir' and openbao_health.status != 200 and openbao_health.status != 429
+
+- name: Read root token from initialization result
+  ansible.builtin.slurp:
+    src: "{{ openbao_init_file }}"
+  register: openbao_init_saved
+  when: openbao_admin_token | length == 0
+  no_log: true
+
+- name: Set admin token
+  ansible.builtin.set_fact:
+    openbao_cli_env: >-
+      {{ openbao_cli_env | combine({'BAO_TOKEN': openbao_admin_token if openbao_admin_token | length > 0
+         else (openbao_init_saved.content | b64decode | from_json).root_token}) }}
+  no_log: true
+
+- name: Wait for unseal
+  ansible.builtin.command: bao status
+  environment: "{{ openbao_cli_env }}"
+  register: openbao_status
+  until: openbao_status.rc == 0
+  retries: 30
+  delay: 2
+  changed_when: false
+  no_log: true
+
+- name: Copy thepost policy
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../openbao/thepost-policy.hcl"
+    dest: "{{ openbao_config_dir }}/thepost-policy.hcl"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure KV, policy and AppRole thepost
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      changed=no
+      if ! bao secrets list | grep -q '^thepost/'; then bao secrets enable -path=thepost -version=2 kv; changed=yes; fi
+      bao policy write thepost {{ (openbao_config_dir ~ '/thepost-policy.hcl') | quote }} >/dev/null
+      if ! bao auth list | grep -q '^approle/'; then bao auth enable approle; changed=yes; fi
+      bao write auth/approle/role/thepost token_policies=thepost token_ttl={{ openbao_thepost_token_ttl | quote }} \
+        token_max_ttl={{ openbao_thepost_token_max_ttl | quote }} secret_id_ttl=0 secret_id_num_uses=0 >/dev/null
+      if ! bao kv get -mount=thepost db >/dev/null 2>&1; then
+        head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' | bao kv put -mount=thepost db username=thepost password=- >/dev/null
+        changed=yes
+      fi
+      echo "changed=$changed"
+    executable: /bin/bash
+  environment: "{{ openbao_cli_env }}"
+  register: openbao_bootstrap
+  changed_when: "'changed=yes' in openbao_bootstrap.stdout"
+  no_log: true
+
+- name: Create thepost credential directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ openbao_thepost_role_id_file | dirname }}"
+    - "{{ openbao_thepost_secret_id_file | dirname }}"
+
+- name: Read AppRole role_id
+  ansible.builtin.command: bao read -field=role_id auth/approle/role/thepost/role-id
+  environment: "{{ openbao_cli_env }}"
+  register: openbao_role_id
+  changed_when: false
+  no_log: true
+
+- name: Write AppRole role_id
+  ansible.builtin.copy:
+    content: "{{ openbao_role_id.stdout }}"
+    dest: "{{ openbao_thepost_role_id_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# secret_id читает systemd (LoadCredential в thepost.service) — только root.
+- name: Issue AppRole secret_id
+  ansible.builtin.shell:
+    cmd: >-
+      umask 077 && bao write -f -field=secret_id auth/approle/role/thepost/secret-id
+      > {{ openbao_thepost_secret_id_file | quote }}
+    creates: "{{ openbao_thepost_secret_id_file }}"
+    executable: /bin/sh
+  environment: "{{ openbao_cli_env }}"
+  no_log: true
+
+- name: Read PostgreSQL password of role thepost
+  ansible.builtin.command: bao kv get -mount=thepost -field=password db
+  environment: "{{ openbao_cli_env }}"
+  register: openbao_db_password
+  changed_when: false
+  no_log: true
+
+# Для роли PostgreSQL (DEP-05): CREATE ROLE thepost LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD … — владелец БД thepost.
+- name: Expose PostgreSQL password for the PostgreSQL role
+  ansible.builtin.set_fact:
+    thepost_db_password: "{{ openbao_db_password.stdout }}"
+  no_log: true
+
+- name: Warn about unseal key in file
+  ansible.builtin.debug:
+    msg: >-
+      Ключ распечатывания OpenBao — в файле {{ openbao_static_key_file }}: секреты защищены слабее, чем с TPM/HSM
+      (openbao_seal: pkcs11) или KMS. thepost doctor выдаёт предупреждение.
+  when: openbao_seal == 'static'

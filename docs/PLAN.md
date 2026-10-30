@@ -18,17 +18,42 @@
 | ✅ sys-01 | SYS-01, SYS-02, SYS-03, SYS-04 | A/B | — | 2 |
 | ✅ deploy-01 | DEP-01, DEP-02, DEP-03 | A | — | 3 |
 | ✅ ci-01 | CI-01 | B | — | 4 |
-| contracts-02 | CTR-05, CTR-10 | B | contracts-01 | 1 |
-| testkit-01 | KIT-01, KIT-02, KIT-03, KIT-04 | A | contracts-01 | 1 |
-| platform-01 | PLT-01, PLT-02, PLT-03, PLT-04 | A | contracts-01, SYS-01 | 2 |
-| meta-01 | META-01, META-02, META-03, META-04 | B | contracts-01 | 3 |
-| cluster-01 | CLU-01, CLU-02, CLU-03 | A | contracts-01 | 4 |
-| blob-01 | BLOB-01, BLOB-02, BLOB-04 | A | contracts-01 | 4 |
-| platform-02 | PLT-05, PLT-06, PLT-07, PLT-08 | A | platform-01, SYS-03 | 2 |
-| meta-02 | META-05, META-06, META-07, META-08, META-13 | B | meta-01, contracts-02 | 3 |
+| ✅ contracts-02 | CTR-05, CTR-10 | B | contracts-01 | 1 |
+| ✅ testkit-01 | KIT-01, KIT-02, KIT-03, KIT-04 | A | contracts-01 | 1 |
+| ✅ platform-01 | PLT-01, PLT-02, PLT-03, PLT-04 | A | contracts-01, SYS-01 | 2 |
+| ✅ meta-01 | META-01, META-02, META-03, META-04 | B | contracts-01 | 3 |
+| ✅ cluster-01 | CLU-01, CLU-02, CLU-03 | A | contracts-01 | 4 |
+| ✅ blob-01 | BLOB-01, BLOB-02, BLOB-04 | A | contracts-01 | 4 |
+| ✅ platform-02 | PLT-05, PLT-06, PLT-07, PLT-08 | A | platform-01, SYS-03 | 2 |
+| ✅ meta-02 | META-05, META-06, META-07, META-08, META-13 | B | meta-01, contracts-02 | 3 |
 | blob-02 | BLOB-03, BLOB-05, BLOB-06, BLOB-07, BLOB-08 | A | blob-01, testkit-01 | 4 |
 | mailstore-01 | MS-01, MS-02, MS-03, MS-04 | A | contracts-02, testkit-01, blob-02 | 1 |
-| app-01 | APP-01, APP-02, APP-03 | A | platform-02, meta-02, mailstore-01, cluster-01 | 2 |
+| app-01 | APP-01, APP-02, APP-03 | A | platform-03, meta-02, mailstore-01, cluster-02 | 2 |
+
+### Решения владельца 2026-10-30 (`docs/decisions/2026-10-30-owner-answers.md`)
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| ✅ contracts-04 (ветка `x/contracts-04`) | CTR-11, CTR-12 | B | contracts-02 | 1 |
+| ✅ sys-02 | SYS-05 | B | sys-01 | 2 |
+| ✅ ci-02 | CI-02 | B | ci-01 | 3 |
+| ✅ deploy-03 | DEP-06 | A | deploy-01 | 3 |
+| cluster-02 | CLU-04, CLU-05 | A | cluster-01, contracts-04, ci-02 | 4 |
+| platform-03 | PLT-09, PLT-10, PLT-11 | A | platform-02, cluster-02, contracts-04 | 2 |
+| meta-04 | META-14 | A | meta-02, contracts-04 | 3 |
+| blob-03 | BLOB-09, BLOB-10 | A | blob-02, contracts-04 | 4 |
+
+### Решения владельца 2026-10-30, секреты и журнал (`docs/decisions/2026-10-30-config-events-secrets.md`)
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| contracts-05 | CTR-13, CTR-14, CTR-15 | B | contracts-04 | 1 |
+| deploy-04 | DEP-07 | A | deploy-03 | 3 |
+| testkit-03 | KIT-06 | A | contracts-05 | 1 |
+| meta-05 | META-15, META-16, META-17 | A/B | meta-04, contracts-05 | 3 |
+| cluster-03 | CLU-06 | A | cluster-02, contracts-05 | 4 |
+| platform-04 | PLT-12 | B | platform-03, contracts-05 | 2 |
+| meta-06 | META-18 | A | meta-05, platform-04 | 3 |
 
 Выход Ф0: `thepost serve` с минимальным config и `roles: [all]` доходит до ready; RLS по tenant включён; журнал событий и точки расширения работают; `doctor` и `verify` работают; протокол BLOB проверен тестом гонки.
 

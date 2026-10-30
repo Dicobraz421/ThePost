@@ -1,6 +1,8 @@
 //! Подпроцесс в тестах — этот же тестовый бинарник, запущенный на тест [`worker_entry`].
 
 use std::hint::black_box;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::*;
 
@@ -101,6 +103,81 @@ async fn timeout_kills_worker_and_pool_recovers() {
     let err = pool.run(b"spin").await.expect_err("must time out");
     assert!(matches!(err, JobError::Timeout), "{err:?}");
     assert_recovers(&pool).await;
+}
+
+/// Журнал тестового подписчика `tracing`.
+#[derive(Debug, Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
+    }
+}
+
+impl Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn worker_failure_is_logged() {
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    // Однопоточный рантайм теста: подписчик потока видит события пула.
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let pool = pool(SandboxConfig {
+        timeout_ms: 300,
+        ..config()
+    });
+
+    // Ошибка обработчика — не сбой подпроцесса: в журнал не пишется.
+    pool.run(b"write").await.expect_err("write must fail");
+    assert!(!logs.text().contains("sandbox"), "{}", logs.text());
+
+    let err = pool.run(b"spin").await.expect_err("must time out");
+    assert!(matches!(err, JobError::Timeout), "{err:?}");
+    let text = logs.text();
+    assert!(text.contains("WARN"), "{text}");
+    assert!(text.contains("sandbox worker failed"), "{text}");
+    assert!(text.contains(&JobError::Timeout.to_string()), "{text}");
+}
+
+#[test]
+fn section_from_yaml() {
+    let yaml = "workers: 4
+timeout_ms: 1500
+cgroup_dir: /sys/fs/cgroup/thepost/sandbox
+";
+    let cfg: SandboxConfig = serde_yaml_ng::from_str(yaml).expect("yaml");
+    assert_eq!(
+        cfg,
+        SandboxConfig {
+            workers: 4,
+            timeout_ms: 1500,
+            cgroup_dir: Some("/sys/fs/cgroup/thepost/sandbox".into()),
+            ..SandboxConfig::default()
+        }
+    );
+    let err = serde_yaml_ng::from_str::<SandboxConfig>(
+        "worker: 4
+",
+    )
+    .expect_err("unknown");
+    assert!(err.to_string().contains("unknown field `worker`"), "{err}");
 }
 
 #[tokio::test]
