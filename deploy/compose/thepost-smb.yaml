@@ -1,0 +1,7 @@
+# Конфигурация thepost для профиля smb в compose (эталон — deploy/config/all.yaml).
+domain: example.test
+database:
+  url: postgres://postgres:postgres@postgres:5432/postgres
+blob:
+  url: file:///var/lib/thepost/blob
+roles: [all]
