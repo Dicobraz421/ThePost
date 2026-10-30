@@ -213,12 +213,18 @@ async fn mailbox_crud_and_status() {
     );
 
     // Удаление: системные — нельзя; с вложенными — конфликт; пересоздание — новый UIDVALIDITY.
-    assert_eq!(meta.delete(scope, trash).await, Err(Error::Forbidden));
+    assert_eq!(
+        meta.delete(scope, trash, false).await,
+        Err(Error::Forbidden)
+    );
     meta.rename(scope, child.id, Some(projects.id), "Alpha")
         .await
         .expect("rename");
-    assert_eq!(meta.delete(scope, projects.id).await, Err(Error::Conflict));
-    meta.delete(scope, child.id).await.expect("delete");
+    assert_eq!(
+        meta.delete(scope, projects.id, false).await,
+        Err(Error::Conflict)
+    );
+    meta.delete(scope, child.id, false).await.expect("delete");
     assert_eq!(meta.get(scope, child.id).await.expect("get"), None);
     let again = meta
         .create(scope, new(Some(projects.id), "Alpha"))
@@ -226,7 +232,7 @@ async fn mailbox_crud_and_status() {
         .expect("recreate");
     assert!(again.uid_validity > child.uid_validity);
     assert_eq!(
-        meta.delete(scope, MailboxId::new()).await,
+        meta.delete(scope, MailboxId::new(), false).await,
         Err(Error::NotFound)
     );
     assert_eq!(

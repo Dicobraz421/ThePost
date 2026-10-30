@@ -392,30 +392,19 @@ impl MailboxStore for PgMeta {
         Ok(())
     }
 
-    async fn delete(&self, scope: AccountScope, id: MailboxId) -> Result<()> {
+    async fn delete(&self, scope: AccountScope, id: MailboxId, cascade: bool) -> Result<()> {
         let mut tx = begin(&self.pool, scope.tenant).await?;
+        // Строка учётной записи заблокирована: иерархия папок не меняется до конца транзакции.
         let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let mb = fetch(&mut tx, scope, id, true)
-            .await?
-            .ok_or(Error::NotFound)?;
-        if mb.role.is_some() {
-            return Err(Error::Forbidden);
-        }
-        let has_children: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM mailboxes WHERE tenant_id = $1 AND account_id = $2 AND parent_id = $3)",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(id.as_uuid())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        if has_children {
-            return Err(Error::Conflict);
-        }
-        // Письма — в корзину (SRS 4.7); восстановление без исходной папки — во «Входящие».
-        let ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT message_id FROM messages WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3 ORDER BY uid",
+        // Папка и все вложенные, предки раньше потомков.
+        let subtree: Vec<(Uuid, Option<String>)> = sqlx::query_as(
+            "WITH RECURSIVE sub(id, role, depth) AS (
+                 SELECT mailbox_id, role, 0 FROM mailboxes
+                 WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3
+                 UNION ALL
+                 SELECT m.mailbox_id, m.role, sub.depth + 1 FROM mailboxes m JOIN sub ON m.parent_id = sub.id
+                 WHERE m.tenant_id = $1 AND m.account_id = $2)
+             SELECT id, role FROM sub ORDER BY depth, id",
         )
         .bind(scope.tenant.as_uuid())
         .bind(scope.account.as_uuid())
@@ -423,7 +412,30 @@ impl MailboxStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        let mut events = Vec::with_capacity(ids.len() + 1);
+        if subtree.is_empty() {
+            return Err(Error::NotFound);
+        }
+        if subtree.iter().any(|(_, role)| role.is_some()) {
+            return Err(Error::Forbidden);
+        }
+        // Вложенные без подтверждения: решение принимает пользователь в клиенте.
+        if subtree.len() > 1 && !cascade {
+            return Err(Error::Conflict);
+        }
+        let boxes: Vec<Uuid> = subtree.iter().map(|(b, _)| *b).collect();
+        // Письма — в корзину (SRS 4.7); восстановление без исходной папки — во «Входящие».
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT message_id FROM messages
+             WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = ANY($3)
+             ORDER BY array_position($3, mailbox_id), uid",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(&boxes)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let mut events = Vec::with_capacity(ids.len() + boxes.len());
         if !ids.is_empty() {
             let trash = by_role(&mut tx, scope, SpecialUse::Trash)
                 .await?
@@ -438,20 +450,30 @@ impl MailboxStore for PgMeta {
             }
         }
         sqlx::query(
-            "DELETE FROM mailboxes WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3",
+            "DELETE FROM mailboxes WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = ANY($3)",
         )
         .bind(scope.tenant.as_uuid())
         .bind(scope.account.as_uuid())
-        .bind(id.as_uuid())
+        .bind(&boxes)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        changelog::log(&mut tx, scope, ms, &[Change::mailbox(id, Op::Destroyed)]).await?;
-        events.push(changelog::event(
-            scope,
-            Some(id),
-            CoreEventKind::MailboxDeleted,
-        ));
+        // Потомки раньше предков.
+        let destroyed: Vec<MailboxId> = boxes
+            .iter()
+            .rev()
+            .map(|b| MailboxId::from_uuid(*b))
+            .collect();
+        let changes: Vec<Change> = destroyed
+            .iter()
+            .map(|b| Change::mailbox(*b, Op::Destroyed))
+            .collect();
+        changelog::log(&mut tx, scope, ms, &changes).await?;
+        events.extend(
+            destroyed
+                .iter()
+                .map(|b| changelog::event(scope, Some(*b), CoreEventKind::MailboxDeleted)),
+        );
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(())

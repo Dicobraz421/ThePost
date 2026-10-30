@@ -439,7 +439,7 @@ async fn move_trash_restore_expunge_and_changes() {
     );
 
     // Удаление папки: письма — в корзину; восстановление без папки — во «Входящие».
-    meta.delete(scope, x).await.expect("delete");
+    meta.delete(scope, x, false).await.expect("delete");
     let b2 = MessageStore::get(&meta, scope, moved[0].id)
         .await
         .expect("get")
@@ -617,4 +617,88 @@ async fn core_events_written_in_transaction() {
         vec!["Delivered", "FlagsChanged", "Trashed"]
     );
     assert!(rows.windows(2).all(|w| w[0].0 == w[1].0 && w[1].1 > w[0].1));
+}
+
+#[tokio::test]
+async fn cascade_delete_moves_subtree_to_trash() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let scope = common::account(&meta).await;
+    let inbox = folder(&meta, scope, SpecialUse::Inbox).await;
+    let trash = folder(&meta, scope, SpecialUse::Trash).await;
+    let mk = |parent, name: &str, role| NewMailbox {
+        parent,
+        name: name.into(),
+        role,
+    };
+    let p = meta.create(scope, mk(None, "P", None)).await.expect("p").id;
+    let a = meta
+        .create(scope, mk(Some(p), "A", None))
+        .await
+        .expect("a")
+        .id;
+    let b = meta
+        .create(scope, mk(Some(a), "B", None))
+        .await
+        .expect("b")
+        .id;
+    let ma = meta
+        .insert(scope, a, message(scope, "a"))
+        .await
+        .expect("ma");
+    let mb = meta
+        .insert(scope, b, message(scope, "b"))
+        .await
+        .expect("mb");
+    let s0 = meta
+        .mailbox_changes(scope, ModSeq::ZERO, 100)
+        .await
+        .expect("mb")
+        .new_state;
+
+    // Без подтверждения — Conflict, ничего не меняется.
+    assert_eq!(meta.delete(scope, p, false).await, Err(Error::Conflict));
+    assert!(
+        MailboxStore::get(&meta, scope, b)
+            .await
+            .expect("get")
+            .is_some()
+    );
+
+    // Системная папка в поддереве — Forbidden даже с каскадом.
+    let q = meta.create(scope, mk(None, "Q", None)).await.expect("q").id;
+    meta.create(scope, mk(Some(q), "Archive", Some(SpecialUse::Archive)))
+        .await
+        .expect("archive");
+    assert_eq!(meta.delete(scope, q, true).await, Err(Error::Forbidden));
+
+    meta.delete(scope, p, true).await.expect("cascade");
+    for id in [p, a, b] {
+        assert_eq!(
+            MailboxStore::get(&meta, scope, id).await.expect("get"),
+            None
+        );
+    }
+    for m in [ma.id, mb.id] {
+        let msg = MessageStore::get(&meta, scope, m)
+            .await
+            .expect("get")
+            .expect("msg");
+        assert_eq!(msg.mailbox, trash);
+    }
+    let ch = meta.mailbox_changes(scope, s0, 100).await.expect("changes");
+    let mut destroyed = ch.destroyed.clone();
+    destroyed.sort();
+    let mut expected = vec![p, a, b];
+    expected.sort();
+    assert_eq!(destroyed, expected);
+
+    // Исходной папки нет — восстановление во «Входящие».
+    let back = meta.restore(scope, &[mb.id]).await.expect("restore");
+    let msg = MessageStore::get(&meta, scope, back[0].id)
+        .await
+        .expect("get")
+        .expect("msg");
+    assert_eq!(msg.mailbox, inbox);
 }

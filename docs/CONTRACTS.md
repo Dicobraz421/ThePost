@@ -37,16 +37,21 @@ SRS 3.4. Учёт объектов в метаданных. Реализация
   на это поколение) или `Commit::Bumped { generation }` — запись была `deleting`: загрузить по новому `gen` и повторить `commit_new`.
 - `release(tenant, hash, generation, refs) -> Result<()>` — при обнулении фиксирует `zero_since`.
 - `gc_candidates(older_than, limit) -> Result<Vec<BlobKey>>`; `mark_deleting(&BlobKey, older_than) -> Result<bool>` (перепроверяет окно W);
-  `finalize_delete(&BlobKey) -> Result<bool>` — удаляет запись, только если `gen` не изменился.
+  `finalize_delete(&BlobKey) -> Result<bool>` — заменяет запись надгробием, только если `gen` не изменился.
+  Надгробие хранит поколение удалённого объекта: загрузка, начатая до удаления, получит `Bumped`; удаляется по истечении
+  срока, большего максимальной длительности загрузки.
 - `exists(&BlobKey) -> Result<bool>` — для поиска «сирот».
 
 ## Metadata
 SRS 3.1, 3.6. Все операции ящика принимают `AccountScope { tenant, account }`; без связей между ящиками.
 `ModSeq` выдаётся из одного счётчика учётной записи: монотонен в папке (CONDSTORE) и в учётной записи (состояние JMAP).
 - `AccountStore`: `get`, `by_login`, `upsert` (из LDAP), `quota`.
-- `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
+- `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
+  `delete` папки с вложенными без `cascade` — `Conflict`: решение («удалить вместе с вложенными?») принимает пользователь
+  в клиенте, клиент повторяет вызов с `cascade = true`; письма всего поддерева — в корзину.
 - `MessageStore`: `insert(scope, mailbox, NewMessage) -> Inserted { id, uid, modseq }`; `get`, `list(mailbox, MessageQuery, limit)`,
   `set_flags(ids, FlagOp, unchanged_since) -> FlagsUpdate`, `copy`, `move_to`, `to_trash`, `restore`, `expunge_final`.
+  `copy`/`move_to` создают новые `MessageId`; `to_trash`/`restore` сохраняют `MessageId` (меняются папка и UID).
 - `NewMessage`: `skeleton: BlobKey`, `parts: Vec<PartRef>`, `size`, `received_at`, `flags`, `meta: MessageMeta`
   (envelope, bodystructure, preview, thread key — вычисляются при приёме).
 
@@ -149,3 +154,5 @@ JSON в JMAP и тела Admin API — `Bytes` (serde_json в `tp-contracts` н�
 - 2026-10-30 — CTR-05, CTR-10 (волна contracts-02): `MailStore` по `AccountScope`, `SearchSort`/`Snippet`, CAS манифеста индекса,
   `DirPage`/`DirChange`, `Authorizer::rights`/`send_right`, `SaslServer`/`SaslSession`; `ext`: `Migration`, `JmapCapability`, `AdminRoutes`,
   `DecisionHooks`, `CopyTo`.
+- 2026-10-30 — x/mailbox-delete-cascade: `MailboxStore::delete(.., cascade)`; надгробия BLOB в `finalize_delete`;
+  `to_trash`/`restore` сохраняют `MessageId`.
