@@ -127,10 +127,18 @@ Hot reload: новая копия рассылается через `watch`; п�
 Политики хранения и Legal Hold — модуль «Соответствие требованиям» через `DecisionHook::before_final_delete`.
 
 ## Extension points
-SRS 2.5, 1.3. Модуль — cargo feature + `modules.<имя>.enabled`. `Module { name(), schema() -> "mod_<имя>", migrations(), register(&mut Registry, &ModuleCtx) }`.
-`Registry`: `add_role`, `add_jmap_capability`, `add_admin_routes`, `add_event_sink`, `add_decision_hook`, реализации трейтов (`BlobStore`, `Directory`, `SearchIndex`).
-`DecisionHook`: `before_final_delete`, `on_delivery`, `on_submission` → `Decision::{ Allow, Deny(reason), Augment(headers|copies) }`;
-без модулей — `Allow`. Данные модуля — только в схеме `mod_<имя>` с собственными миграциями.
+SRS 2.5, 1.3. Модуль — cargo feature + `modules.<имя>.enabled`. `Module { name(), schema() -> "mod_<имя>", migrations() -> &[Migration { version, name, sql }],
+register(&mut Registry, &ModuleCtx) -> Result<()> }`; имя — `validate_module_name` (`[a-z][a-z0-9_]*`, ≤ 59).
+`ModuleCtx { config: Arc<dyn ConfigWatch> }` (`#[non_exhaustive]`, `ModuleCtx::new`) — секция `modules.<имя>` как JSON-значение приложения.
+`Registry`: `add_role(RoleService)`, `add_jmap_capability(JmapCapability { uri, session_object, methods, call })`,
+`add_admin_routes(AdminRoutes { prefix, handle(AdminRequest) -> AdminResponse })`, `add_event_sink`, `add_decision_hook`;
+`set_blob_store` / `set_directory` / `set_search_index` — замена встроенной реализации. Повтор имени, URI, префикса, реализации — `Conflict`.
+JSON в JMAP и тела Admin API — `Bytes` (serde_json в `tp-contracts` не подключён).
+`DecisionHook { name, before_final_delete(&FinalDelete), on_delivery(&DeliveryInfo), on_submission(&SubmissionInfo) }`, методы по умолчанию — `Allow`;
+→ `Decision::{ Allow, Deny(reason), Augment { headers, copies: Vec<CopyTo::{ Mailbox(Delivery), Address }> } }`.
+`DecisionHooks` вызывает хуки по порядку регистрации: первый `Deny` прерывает, дополнения объединяются, без хуков — `Allow`;
+для удаления `Augment` = `Allow`. Ошибка хука — ошибка операции. `on_delivery` вызывает `MailStore::ingest` до загрузки,
+`on_submission` — submission и JMAP EmailSubmission до очереди. Данные модуля — только в схеме `mod_<имя>` с собственными миграциями.
 
 ## CHANGELOG
 - 2026-10-29 — первая редакция (по SRS ред. 3).
@@ -138,3 +146,6 @@ SRS 2.5, 1.3. Модуль — cargo feature + `modules.<имя>.enabled`. `Modu
 - 2026-10-30 — CTR-01…04 (волна contracts-01): `generation` вместо `gen`, `Commit::Done { generation }`, `mark_deleting(.., older_than)`,
   `ObjectEntry`, `AccountScope`, `ModSeq` учётной записи, `Changes<T>`, системная подписка шины, fencing лиз, `EventLog` без `append`,
   `RoleSet`/`RoleEntry`, `ConfigWatch`/`Shutdown` вместо tokio-типов.
+- 2026-10-30 — CTR-05, CTR-10 (волна contracts-02): `MailStore` по `AccountScope`, `SearchSort`/`Snippet`, CAS манифеста индекса,
+  `DirPage`/`DirChange`, `Authorizer::rights`/`send_right`, `SaslServer`/`SaslSession`; `ext`: `Migration`, `JmapCapability`, `AdminRoutes`,
+  `DecisionHooks`, `CopyTo`.
