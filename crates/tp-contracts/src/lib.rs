@@ -7,6 +7,7 @@ pub mod blob;
 pub mod bus;
 pub mod error;
 pub mod events;
+pub mod ext;
 pub mod ids;
 pub mod lease;
 pub mod mailstore;
