@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod blob;
 pub mod bus;
+pub mod config;
 pub mod error;
 pub mod events;
 pub mod ext;
