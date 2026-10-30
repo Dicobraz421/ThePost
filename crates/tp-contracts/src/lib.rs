@@ -5,6 +5,7 @@
 pub mod blob;
 pub mod error;
 pub mod ids;
+pub mod meta;
 
 pub use error::{Error, Result};
 pub use ids::{
