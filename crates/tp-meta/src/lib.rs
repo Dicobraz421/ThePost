@@ -14,6 +14,7 @@ pub mod mailboxes;
 pub mod messages;
 pub mod pool;
 pub mod schema;
+pub mod shards;
 
 use std::sync::Arc;
 use std::time::Duration;
