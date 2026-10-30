@@ -141,6 +141,8 @@ pub trait BlobStore: Send + Sync + 'static {
     fn list(&self, prefix: &str, older_than: OffsetDateTime) -> ObjectStream;
 
     /// Записывает объект по произвольному пути (сегменты индексов `idx/{tenant}/{account}/...`).
+    /// Сегмент неизменяем: путь записывается один раз, перезапись существующего пути запрещена
+    /// (новая версия — новый путь); поэтому кэш BLOB кэширует `*_raw` без инвалидации.
     async fn put_raw(&self, path: &str, data: Bytes) -> Result<()>;
 
     /// Читает объект по произвольному пути. Отсутствие — `Error::NotFound`.

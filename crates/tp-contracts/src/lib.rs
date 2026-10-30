@@ -14,6 +14,7 @@ pub mod mailstore;
 pub mod meta;
 pub mod role;
 pub mod search;
+pub mod tls;
 
 pub use error::{Error, Result};
 pub use ids::{
