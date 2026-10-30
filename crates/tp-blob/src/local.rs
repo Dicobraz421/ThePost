@@ -100,7 +100,7 @@ impl LocalStore {
     }
 
     /// Атомарная запись: временный файл → fsync → rename. Повторная запись заменяет объект.
-    async fn write(&self, path: &str, data: ByteStream) -> Result<()> {
+    pub(crate) async fn write(&self, path: &str, data: ByteStream) -> Result<()> {
         let tmp = self.tmp_path();
         let mut res = self.write_tmp(&tmp, data).await;
         if res.is_ok() {
@@ -140,7 +140,7 @@ impl LocalStore {
     }
 
     /// Чтение объекта: файл открывается сразу (отсутствие — `NotFound` из вызова), байты — потоком.
-    async fn read(&self, path: &str, range: Option<Range<u64>>) -> Result<ByteStream> {
+    pub(crate) async fn read(&self, path: &str, range: Option<Range<u64>>) -> Result<ByteStream> {
         let mut file = fs::File::open(self.cfg.root.join(path)).await?;
         let range = clamp_range(range, file.metadata().await?.len())?;
         if range.start > 0 {
@@ -164,7 +164,7 @@ impl LocalStore {
         }
     }
 
-    async fn remove(&self, path: &str) -> Result<()> {
+    pub(crate) async fn remove(&self, path: &str) -> Result<()> {
         remove_if_exists(&self.cfg.root.join(path)).await
     }
 
