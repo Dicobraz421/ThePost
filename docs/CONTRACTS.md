@@ -28,6 +28,8 @@ SRS 3.2. Объекты неизменяемы, запись идемпотен�
 - `delete(&BlobKey) -> Result<()>` (отсутствие — не ошибка)
 - `list(prefix: &str, older_than: OffsetDateTime) -> ObjectStream` (`ObjectEntry { path, size, modified }`, `key()`) — для поиска «сирот» и миграции.
 - `put_raw/get_raw/delete_raw(path)` — произвольные пути для сегментов индексов (`idx/{tenant}/{account}/...`).
+  Сегменты (`*_raw`) неизменяемы: путь записывается один раз, перезапись запрещена (новая версия — новый путь, манифест
+  индекса переключается CAS); кэш BLOB кэширует их без инвалидации (решение 2026-10-30, #35).
 
 ## BlobIndex
 SRS 3.4. Учёт объектов в метаданных. Реализация — `tp-meta`; in-memory — `tp-testkit`.
@@ -124,6 +126,15 @@ shutdown: CancellationToken, drain_deadline, ready: ReadyHandle }` (`tokio`, `to
 Приложение собирает общий `Config`; обязательны только `database.url`, `blob.url`, `domain` (SRS 5.5).
 Hot reload: новая копия рассылается через `watch`; параметры, требующие перезапуска, помечены в doc-комментарии.
 
+## Internal TLS
+SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, Valkey, S3, узел ↔ узел — только TLS. Общая секция `tls::InternalTls
+{ ca_file, cert_file, key_file, server_name, allow_plaintext }` — поле `tls` секции канала; `Profile { Prod (по умолчанию), Dev }` —
+параметр `profile` верхнего уровня config.yaml. `InternalTls::check_url(InternalChannel::{Postgres, Valkey, S3, Node}, url, profile)
+-> Result<Transport::{Tls, Plaintext}>` вызывается в `thepost config check` и при запуске: `allow_plaintext` вне dev, адрес без TLS
+без `allow_plaintext`, `sslmode=require|verify-ca` — `Invalid`. Схемы: PostgreSQL — `sslmode=verify-full` (без `sslmode` клиент
+обязан verify-full), Valkey — `rediss://`, S3 — `https://`, узел — `https://`/`smtps://`. `Transport::Plaintext` — крейт канала пишет
+`InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
+
 ## Queue (Ф1)
 `QueueStore`: `enqueue(OutMessage { blob, from, rcpts, next_attempt })`, `claim(limit, lease)`,
 `reschedule(id, rcpt, at, reason)`, `complete(id, rcpt, status)`. Повторы и DSN — `tp-smtp`.
@@ -162,3 +173,4 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-10-30 — CTR-11 (волна contracts-04): `tokio`/`tokio-util`/`serde_json` в контрактах; `RoleCtx { config: ConfigRx, shutdown: CancellationToken }`
   вместо `ConfigWatch`/`Shutdown`; `ModuleCtx::config::<T>()`; `serde_json::Value` в `JmapCapability` и `AdminRequest`/`AdminResponse`
   (`content_type` убран).
+- 2026-10-30 — CTR-12 (волна contracts-04): `tls::InternalTls`, `Profile`, `InternalChannel`, `Transport`; сегменты `*_raw` неизменяемы.
