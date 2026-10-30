@@ -1,0 +1,117 @@
+# Бета The Post (процесс pets-dev, CI-01): ночной тег beta-YYYYMMDD, если main изменился с прошлой беты.
+# Release-сборка x86_64 и aarch64 через cross (один образ glibc на обе цели), артефакты, GitHub pre-release.
+# Ручной запуск (workflow_dispatch) собирает бету всегда; повтор в тот же день — тег beta-YYYYMMDD.N.
+# Тег создаёт `gh release create` только после успешной сборки; тег от GITHUB_TOKEN не запускает ci.yml.
+name: Beta
+
+on:
+  schedule:
+    - cron: '0 1 * * *' # 01:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: beta
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.p.outputs.build }}
+      tag: ${{ steps.p.outputs.tag }}
+      prev: ${{ steps.p.outputs.prev }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: p
+        name: Нужна ли бета и какой тег
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          prev=$(git tag --list 'beta-*' --sort=-v:refname | head -n1)
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = schedule ] && [ -n "$prev" ] && [ "$(git rev-list -n1 "$prev")" = "$SHA" ]; then
+            echo "main не изменился с $prev — бета не нужна"
+            echo build=false >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag="beta-$(date -u +%Y%m%d)"
+          n=1
+          while git rev-parse -q --verify "refs/tags/$tag" >/dev/null; do
+            n=$((n + 1)); tag="beta-$(date -u +%Y%m%d).$n"
+          done
+          echo "Бета $tag от $SHA (предыдущая: ${prev:-нет})"
+          echo build=true >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    env:
+      PKG: thepost-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: beta-${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - run: cross build --release --locked -p thepost --target ${{ matrix.target }}
+      - name: Smoke (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: target/${{ matrix.target }}/release/thepost --version || target/${{ matrix.target }}/release/thepost
+      - name: Архив
+        shell: bash
+        run: |
+          mkdir -p "dist/$PKG"
+          cp "target/${{ matrix.target }}/release/thepost" LICENSE-APACHE LICENSE-MIT README.md "dist/$PKG/"
+          tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
+          (cd dist && sha256sum "$PKG.tar.gz" > "$PKG.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: |
+            dist/${{ env.PKG }}.tar.gz
+            dist/${{ env.PKG }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          PREV: ${{ needs.plan.outputs.prev }}
+          SHA: ${{ github.sha }}
+        run: |
+          ls -l dist
+          args=(--prerelease --target "$SHA" --title "$TAG" --generate-notes)
+          if [ -n "$PREV" ]; then args+=(--notes-start-tag "$PREV"); fi
+          gh release create "$TAG" "${args[@]}" dist/*
