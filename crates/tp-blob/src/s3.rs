@@ -21,8 +21,8 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::prefix::PrefixStore;
 use object_store::{
-    BackoffConfig, Certificate, ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload,
-    RetryConfig, WriteMultipart,
+    BackoffConfig, Certificate, ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt,
+    PutPayload, RetryConfig, WriteMultipart,
 };
 use schemars::JsonSchema;
 use time::OffsetDateTime;
@@ -169,7 +169,8 @@ fn url_host(url: &str) -> Option<&str> {
 
 /// Корневые сертификаты из `tls.ca_file` (PEM). Блокирующий I/O: вызывается при создании клиента.
 fn read_ca(path: &FsPath) -> Result<Vec<Certificate>> {
-    let bad = |e: &dyn fmt::Display| Error::invalid(format!("S3: tls.ca_file {}: {e}", path.display()));
+    let bad =
+        |e: &dyn fmt::Display| Error::invalid(format!("S3: tls.ca_file {}: {e}", path.display()));
     let pem = std::fs::read(path).map_err(|e| bad(&e))?;
     let certs = Certificate::from_pem_bundle(&pem).map_err(|e| bad(&e))?;
     // Без сертификатов проверка сервера не пройдёт ни разу — это ошибка настройки.
@@ -719,11 +720,12 @@ mod tests {
 
         let empty = dir.path().join("empty.pem");
         std::fs::write(&empty, b"not a certificate").expect("write");
-        assert!(invalid(S3Store::new(endpoint(https, ca(&empty)), Profile::Prod)).contains("ca_file"));
+        assert!(
+            invalid(S3Store::new(endpoint(https, ca(&empty)), Profile::Prod)).contains("ca_file")
+        );
         let missing = dir.path().join("missing.pem");
         assert!(
-            invalid(S3Store::new(endpoint(https, ca(&missing)), Profile::Prod))
-                .contains("ca_file")
+            invalid(S3Store::new(endpoint(https, ca(&missing)), Profile::Prod)).contains("ca_file")
         );
     }
 
@@ -745,13 +747,19 @@ mod tests {
             endpoint(https, name("S3.internal")).check(Profile::Prod),
             Ok(Transport::Tls)
         );
-        assert!(endpoint(https, name("other.internal")).check(Profile::Prod).is_err());
-        assert!(S3Config {
-            tls: name("s3.amazonaws.com"),
-            ..S3Config::default()
-        }
-        .check(Profile::Prod)
-        .is_err());
+        assert!(
+            endpoint(https, name("other.internal"))
+                .check(Profile::Prod)
+                .is_err()
+        );
+        assert!(
+            S3Config {
+                tls: name("s3.amazonaws.com"),
+                ..S3Config::default()
+            }
+            .check(Profile::Prod)
+            .is_err()
+        );
     }
 
     #[test]
