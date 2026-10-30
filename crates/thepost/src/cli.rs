@@ -9,7 +9,7 @@ use tp_contracts::Error;
 use tp_contracts::role::CancellationToken;
 use tp_platform::config::ENV_CONFIG_PATH;
 
-use crate::{secrets, sections, serve};
+use crate::{doctor, secrets, sections, serve};
 
 /// Путь к config.yaml по умолчанию.
 pub const DEFAULT_CONFIG: &str = "/etc/thepost/config.yaml";
@@ -40,6 +40,12 @@ pub enum Command {
         /// Действие.
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Проверка окружения: СУБД, BLOB, время, секреты.
+    Doctor {
+        /// Вывод в JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -115,6 +121,18 @@ pub async fn run(cli: Cli) -> i32 {
             }
             code
         }
+        Command::Doctor { json } => {
+            let report = doctor::run(&path, None).await;
+            if json {
+                match report.to_json() {
+                    Ok(j) => println!("{j}"),
+                    Err(e) => return fail(&e),
+                }
+            } else {
+                print!("{}", report.to_table());
+            }
+            report.exit_code()
+        }
         Command::Serve => serve_until_signal(path).await,
     }
 }
@@ -168,8 +186,9 @@ mod tests {
 
     #[test]
     fn parses_commands() {
-        let cli = Cli::try_parse_from(["thepost", "--config", "/x.yaml", "serve"]).expect("serve");
-        assert!(matches!(cli.command, Command::Serve));
+        let cli = Cli::try_parse_from(["thepost", "--config", "/x.yaml", "doctor", "--json"])
+            .expect("doctor");
+        assert!(matches!(cli.command, Command::Doctor { json: true }));
         assert_eq!(cli.config_path(), PathBuf::from("/x.yaml"));
         let cli =
             Cli::try_parse_from(["thepost", "config", "check", "-c", "/y.yaml"]).expect("check");
