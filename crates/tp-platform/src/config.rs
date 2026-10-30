@@ -21,6 +21,7 @@ use serde_yaml_ng::{Mapping, Value};
 use tp_contracts::Error;
 use tp_contracts::role::{RoleEntry, RolePreset, RoleSet};
 
+use crate::acme::AcmeConfig;
 use crate::ratelimit::RateLimitConfig;
 use crate::reload::ReloadConfig;
 use crate::roles::RuntimeConfig;
@@ -107,7 +108,7 @@ impl Default for SectionRegistry {
 }
 
 impl SectionRegistry {
-    /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`, `tls`, `ratelimit`.
+    /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`, `tls`, `ratelimit`, `acme`.
     pub fn new() -> Self {
         let mut r = Self {
             sections: BTreeMap::new(),
@@ -120,6 +121,7 @@ impl SectionRegistry {
         r.sections.insert("runtime", def::<RuntimeConfig>());
         r.sections.insert("tls", def::<TlsConfig>());
         r.sections.insert("ratelimit", def::<RateLimitConfig>());
+        r.sections.insert("acme", def::<AcmeConfig>());
         r
     }
 
