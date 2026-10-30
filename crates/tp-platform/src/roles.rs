@@ -4,20 +4,32 @@
 //! Ленивая инициализация: сервис роли создаётся фабрикой только для включённой роли, поэтому невключённая
 //! роль не создаёт пулов, кэшей, потоков и портов. Остановка: сигнал → узел выводится из пула (`/healthz/ready`
 //! 503) → роли получают `ctx.shutdown` и завершают работу за `drain_deadline` → оставшиеся задачи отменяются.
+//!
+//! Аварийное завершение роли (ошибка или паника) не останавливает остальные роли: роль снимается с готовности и
+//! перезапускается с нарастающей паузой. Больше `restart.max_restarts` падений одной роли за `restart.window` —
+//! узел останавливается штатно, дальше процесс перезапускает systemd или Kubernetes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::task::{Id, JoinSet};
+use tokio::sync::watch;
+use tokio::task::{Id, JoinError, JoinSet};
+use tokio::time::Instant;
 use tp_contracts::Error;
-use tp_contracts::role::{CancellationToken, ConfigRx, Role, RoleCtx, RoleService, RoleSet};
+use tp_contracts::config::duration;
+use tp_contracts::role::{
+    CancellationToken, ConfigRx, ReadyHandle, Role, RoleCtx, RoleService, RoleSet,
+};
 use tp_sys::NodeResources;
 
+use crate::config::Config;
 use crate::service_http::Health;
 use crate::telemetry::Metrics;
 
@@ -27,6 +39,8 @@ use crate::telemetry::Metrics;
 pub struct RuntimeConfig {
     /// Время на завершение текущей работы ролей после сигнала остановки, мс; затем задачи отменяются.
     pub drain_deadline_ms: u64,
+    /// Перезапуск упавшей роли внутри процесса.
+    pub restart: RestartConfig,
     /// Доля памяти узла под кэши всех включённых ролей, %. Делится поровну между ролями. Требует перезапуска.
     pub cache_memory_percent: u8,
     /// Соединений с PostgreSQL на один CPU узла. Делятся поровну между ролями. Требует перезапуска.
@@ -43,6 +57,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             drain_deadline_ms: 30_000,
+            restart: RestartConfig::default(),
             cache_memory_percent: 25,
             db_pool_per_cpu: 4,
             db_pool_max: 64,
@@ -56,6 +71,49 @@ impl RuntimeConfig {
     /// `drain_deadline_ms` как `Duration`.
     pub fn drain_deadline(&self) -> Duration {
         Duration::from_millis(self.drain_deadline_ms)
+    }
+}
+
+/// Подсекция `runtime.restart`: перезапуск упавшей роли с нарастающей паузой.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct RestartConfig {
+    /// Перезапусков одной роли за окно; следующее падение останавливает узел. 0 — первое падение останавливает узел.
+    pub max_restarts: u32,
+    /// Окно подсчёта падений (`10m`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub window: Duration,
+    /// Пауза перед первым перезапуском (`1s`); каждое следующее падение в окне удваивает её.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub backoff_initial: Duration,
+    /// Предел паузы перед перезапуском (`1m`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub backoff_max: Duration,
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            max_restarts: 5,
+            window: Duration::from_secs(600),
+            backoff_initial: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(60),
+        }
+    }
+}
+
+impl RestartConfig {
+    /// Пауза перед перезапуском после `failures`-го падения в окне (с 1).
+    pub fn backoff(&self, failures: u32) -> Duration {
+        let factor = 1u32
+            .checked_shl(failures.saturating_sub(1))
+            .unwrap_or(u32::MAX);
+        self.backoff_initial
+            .saturating_mul(factor)
+            .min(self.backoff_max)
     }
 }
 
@@ -130,8 +188,10 @@ pub struct RolesReport {
     pub completed: Vec<String>,
     /// Роли, не уложившиеся в `drain_deadline` и отменённые.
     pub cancelled: Vec<String>,
-    /// Роли, завершившиеся ошибкой или паникой.
+    /// Роли, завершившиеся ошибкой или паникой без перезапуска: превышен лимит перезапусков или сбой при drain.
     pub failed: Vec<(String, Error)>,
+    /// Число перезапусков по ролям.
+    pub restarts: BTreeMap<String, u32>,
 }
 
 /// Набор ролей узла до запуска.
@@ -140,6 +200,59 @@ pub struct Roles {
     set: RoleSet,
     limits: BTreeMap<Role, RoleLimits>,
     specs: Vec<RoleSpec>,
+    updates: Option<watch::Receiver<Arc<Config>>>,
+}
+
+/// Запущенная роль: всё для перезапуска и история падений.
+struct Slot {
+    name: String,
+    service: Arc<dyn RoleService>,
+    config: ConfigRx,
+    ready: ReadyHandle,
+    failures: VecDeque<Instant>,
+}
+
+impl Slot {
+    /// Запускает роль после паузы `delay`; сигнал остановки во время паузы завершает задачу штатно.
+    fn spawn(
+        &self,
+        tasks: &mut JoinSet<tp_contracts::Result<()>>,
+        shutdown: &CancellationToken,
+        deadline: Duration,
+        delay: Duration,
+    ) -> Id {
+        let service = self.service.clone();
+        let ctx = RoleCtx {
+            config: self.config.clone(),
+            shutdown: shutdown.clone(),
+            drain_deadline: deadline,
+            ready: self.ready.clone(),
+        };
+        tasks
+            .spawn(async move {
+                if !delay.is_zero() {
+                    tokio::select! {
+                        () = ctx.shutdown.cancelled() => return Ok(()),
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                }
+                service.run(ctx).await
+            })
+            .id()
+    }
+
+    /// Учитывает падение в момент `now`; возвращает число падений за окно `window`.
+    fn fail(&mut self, now: Instant, window: Duration) -> u32 {
+        while self
+            .failures
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= window)
+        {
+            self.failures.pop_front();
+        }
+        self.failures.push_back(now);
+        u32::try_from(self.failures.len()).unwrap_or(u32::MAX)
+    }
 }
 
 impl fmt::Debug for Roles {
@@ -160,7 +273,14 @@ impl Roles {
             set,
             limits,
             specs: Vec::new(),
+            updates: None,
         }
+    }
+
+    /// Новые `runtime.restart` и `runtime.drain_deadline_ms` применяются на ходу из перечитанной конфигурации.
+    pub fn with_updates(mut self, rx: watch::Receiver<Arc<Config>>) -> Self {
+        self.updates = Some(rx);
+        self
     }
 
     /// Лимиты включённой роли; `None` — роль не включена.
@@ -192,70 +312,121 @@ impl Roles {
             .collect()
     }
 
-    /// Запускает роли и работает до сигнала `shutdown` или аварийного завершения роли, затем останавливает все роли.
+    /// Запускает роли и работает до сигнала `shutdown`, затем останавливает все роли.
     ///
-    /// Аварийное завершение роли останавливает узел: остальные роли проходят drain, ошибка попадает в отчёт.
+    /// Упавшая роль снимается с готовности и перезапускается после паузы `restart.backoff`. Больше
+    /// `restart.max_restarts` падений за окно — узел останавливается: остальные роли проходят drain, ошибка — в отчёте.
     pub async fn run(
         self,
         health: &Health,
         metrics: &Metrics,
         shutdown: CancellationToken,
     ) -> RolesReport {
-        let deadline = self.cfg.drain_deadline();
+        let mut cfg = self.cfg;
+        let mut updates = self.updates;
         let running = Gauge::<i64>::default();
         metrics.register("tp_roles_running", "Running role tasks", running.clone());
+        let restarts = Family::<Vec<(String, String)>, Counter>::default();
+        metrics.register(
+            "tp_role_restarts",
+            "Role restarts after failure",
+            restarts.clone(),
+        );
 
         let role_shutdown = CancellationToken::new();
         let mut tasks = JoinSet::new();
-        let mut names: BTreeMap<Id, String> = BTreeMap::new();
-        let mut handles = Vec::new();
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut ids: BTreeMap<Id, usize> = BTreeMap::new();
         for spec in self.specs {
             let name = spec.service.name().to_owned();
-            let ready = health.register(&name);
-            handles.push(ready.clone());
-            let ctx = RoleCtx {
+            let slot = Slot {
+                ready: health.register(&name),
+                name,
+                service: spec.service,
                 config: spec.config,
-                shutdown: role_shutdown.clone(),
-                drain_deadline: deadline,
-                ready,
+                failures: VecDeque::new(),
             };
-            let service = spec.service;
-            let handle = tasks.spawn(async move { service.run(ctx).await });
-            names.insert(handle.id(), name);
+            let id = slot.spawn(
+                &mut tasks,
+                &role_shutdown,
+                cfg.drain_deadline(),
+                Duration::ZERO,
+            );
+            ids.insert(id, slots.len());
+            slots.push(slot);
         }
         running.set(tasks.len() as i64);
-        tracing::info!(roles = ?names.values().collect::<Vec<_>>(), "roles started");
+        tracing::info!(roles = ?slots.iter().map(|s| &s.name).collect::<Vec<_>>(), "roles started");
 
         let mut report = RolesReport::default();
-        let name_of =
-            |names: &BTreeMap<Id, String>, id| names.get(&id).cloned().unwrap_or_default();
-        // До сигнала: роль, завершившаяся сама, — штатно (Ok) или аварийно (ошибка → остановка узла).
+        // До сигнала: роль, завершившаяся сама, — штатно (Ok) или аварийно (перезапуск либо остановка узла).
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
+                new = config_changed(&mut updates) => {
+                    if let Some(new) = new {
+                        cfg.restart = new.restart.clone();
+                        cfg.drain_deadline_ms = new.drain_deadline_ms;
+                    }
+                }
                 done = tasks.join_next_with_id() => {
                     let Some(done) = done else { break };
                     running.set(tasks.len() as i64);
-                    let failed = record(&mut report, done, &names, name_of);
-                    if failed {
-                        tracing::error!("role failed, stopping node");
+                    let (id, result) = outcome(done);
+                    let Some(&idx) = ids.get(&id) else { continue };
+                    let slot = &mut slots[idx];
+                    let err = match result {
+                        Ok(()) => {
+                            report.completed.push(slot.name.clone());
+                            continue;
+                        }
+                        Err(err) => err,
+                    };
+                    slot.ready.set(false);
+                    let failures = slot.fail(Instant::now(), cfg.restart.window);
+                    if failures > cfg.restart.max_restarts {
+                        tracing::error!(role = %slot.name, error = %err, failures, "role restart limit exceeded, stopping node");
+                        report.failed.push((slot.name.clone(), err));
                         break;
                     }
+                    let delay = cfg.restart.backoff(failures);
+                    tracing::warn!(role = %slot.name, error = %err, failures, delay_ms = delay.as_millis() as u64, "role failed, restarting");
+                    restarts
+                        .get_or_create(&vec![("role".to_owned(), slot.name.clone())])
+                        .inc();
+                    *report.restarts.entry(slot.name.clone()).or_default() += 1;
+                    let id = slot.spawn(&mut tasks, &role_shutdown, cfg.drain_deadline(), delay);
+                    ids.insert(id, idx);
+                    running.set(tasks.len() as i64);
                 }
             }
         }
 
+        let deadline = cfg.drain_deadline();
         tracing::info!(deadline_ms = deadline.as_millis() as u64, "roles draining");
         health.drain();
-        for h in &handles {
-            h.set(false);
+        for slot in &slots {
+            slot.ready.set(false);
         }
         role_shutdown.cancel();
 
+        let name_of = |id: Id| {
+            ids.get(&id)
+                .map(|&i| slots[i].name.clone())
+                .unwrap_or_default()
+        };
+        let finish = |report: &mut RolesReport, done| match outcome(done) {
+            (id, Ok(())) => report.completed.push(name_of(id)),
+            (id, Err(err)) => {
+                let name = name_of(id);
+                tracing::error!(role = %name, error = %err, "role failed during drain");
+                report.failed.push((name, err));
+            }
+        };
         let drained = tokio::time::timeout(deadline, async {
             while let Some(done) = tasks.join_next_with_id().await {
                 running.set(tasks.len() as i64);
-                record(&mut report, done, &names, name_of);
+                finish(&mut report, done);
             }
         })
         .await;
@@ -264,13 +435,11 @@ impl Roles {
             while let Some(done) = tasks.join_next_with_id().await {
                 match done {
                     Err(e) if e.is_cancelled() => {
-                        let name = name_of(&names, e.id());
+                        let name = name_of(e.id());
                         tracing::warn!(role = %name, "role cancelled after drain deadline");
                         report.cancelled.push(name);
                     }
-                    done => {
-                        record(&mut report, done, &names, name_of);
-                    }
+                    done => finish(&mut report, done),
                 }
             }
         }
@@ -279,36 +448,32 @@ impl Roles {
     }
 }
 
-/// Учитывает завершённую задачу роли; `true` — аварийное завершение.
-fn record(
-    report: &mut RolesReport,
-    done: Result<(Id, tp_contracts::Result<()>), tokio::task::JoinError>,
-    names: &BTreeMap<Id, String>,
-    name_of: impl Fn(&BTreeMap<Id, String>, Id) -> String,
-) -> bool {
+/// Результат задачи роли; паника и отмена — ошибки.
+fn outcome(
+    done: Result<(Id, tp_contracts::Result<()>), JoinError>,
+) -> (Id, tp_contracts::Result<()>) {
     match done {
-        Ok((id, Ok(()))) => {
-            report.completed.push(name_of(names, id));
-            false
-        }
-        Ok((id, Err(e))) => {
-            let name = name_of(names, id);
-            tracing::error!(role = %name, error = %e, "role failed");
-            report.failed.push((name, e));
-            true
-        }
-        Err(e) => {
-            let name = name_of(names, e.id());
-            let err = if e.is_panic() {
-                Error::internal("role panicked")
-            } else {
-                Error::internal("role task cancelled")
-            };
-            tracing::error!(role = %name, error = %err, "role task ended abnormally");
-            report.failed.push((name, err));
-            true
-        }
+        Ok(done) => done,
+        Err(e) if e.is_panic() => (e.id(), Err(Error::internal("role panicked"))),
+        Err(e) => (e.id(), Err(Error::internal("role task cancelled"))),
     }
+}
+
+/// Секция `runtime` после перечитывания конфигурации; без источника обновлений ждёт вечно.
+async fn config_changed(
+    updates: &mut Option<watch::Receiver<Arc<Config>>>,
+) -> Option<Arc<RuntimeConfig>> {
+    let Some(rx) = updates else {
+        return std::future::pending().await;
+    };
+    if rx.changed().await.is_err() {
+        *updates = None;
+        return None;
+    }
+    let section = rx.borrow_and_update().section::<RuntimeConfig>("runtime");
+    section
+        .inspect_err(|e| tracing::warn!(error = %e, "runtime section unavailable"))
+        .ok()
 }
 
 /// Ждёт SIGTERM или SIGINT; SIGHUP пропускает (его обрабатывает hot reload). Требует контекста tokio-рантайма.
@@ -386,12 +551,12 @@ fn parse_vm_rss(status: &str) -> Option<u64> {
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use tp_contracts::role::{RoleEntry, RolePreset, fixed_config};
 
     use super::*;
+    use crate::config::SectionRegistry;
 
     const GIB: u64 = 1 << 30;
 
@@ -409,14 +574,19 @@ mod tests {
         Drain(Duration),
         /// Игнорирует сигнал.
         Hang,
-        /// Сразу завершается ошибкой.
+        /// Каждый запуск сразу завершается ошибкой.
         Fail,
+        /// Первые `n` запусков завершаются ошибкой, затем работает до сигнала.
+        FailFirst(u32),
+        /// Первый запуск паникует, затем работает до сигнала.
+        PanicOnce,
     }
 
     struct TestRole {
         name: &'static str,
         mode: Mode,
         dropped: Arc<AtomicBool>,
+        runs: Arc<AtomicU32>,
     }
 
     struct DropFlag(Arc<AtomicBool>);
@@ -443,15 +613,19 @@ mod tests {
         {
             Box::pin(async move {
                 let _flag = DropFlag(self.dropped.clone());
-                if matches!(self.mode, Mode::Fail) {
-                    return Err(Error::internal("boom"));
+                let run = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
+                match self.mode {
+                    Mode::Fail => return Err(Error::internal("boom")),
+                    Mode::FailFirst(n) if run <= n => return Err(Error::internal("boom")),
+                    Mode::PanicOnce if run == 1 => panic!("role panic"),
+                    _ => {}
                 }
                 ctx.ready.set(true);
                 ctx.shutdown.cancelled().await;
                 match self.mode {
                     Mode::Drain(d) => tokio::time::sleep(d).await,
                     Mode::Hang => std::future::pending::<()>().await,
-                    Mode::Fail => {}
+                    _ => {}
                 }
                 Ok(())
             })
@@ -459,21 +633,43 @@ mod tests {
     }
 
     fn spec(name: &'static str, mode: Mode) -> (RoleSpec, Arc<AtomicBool>) {
+        let (spec, dropped, _) = spec_runs(name, mode);
+        (spec, dropped)
+    }
+
+    fn spec_runs(name: &'static str, mode: Mode) -> (RoleSpec, Arc<AtomicBool>, Arc<AtomicU32>) {
         let dropped = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicU32::new(0));
         let spec = RoleSpec {
             service: Arc::new(TestRole {
                 name,
                 mode,
                 dropped: dropped.clone(),
+                runs: runs.clone(),
             }),
             config: fixed_config(()),
         };
-        (spec, dropped)
+        (spec, dropped, runs)
+    }
+
+    /// Перезапуск с паузой 10–40 мс.
+    fn fast_restart(max_restarts: u32) -> RestartConfig {
+        RestartConfig {
+            max_restarts,
+            window: Duration::from_secs(600),
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(40),
+        }
     }
 
     fn runtime(drain_ms: u64, roles: &[Role]) -> Roles {
+        runtime_with(drain_ms, fast_restart(5), roles)
+    }
+
+    fn runtime_with(drain_ms: u64, restart: RestartConfig, roles: &[Role]) -> Roles {
         let cfg = RuntimeConfig {
             drain_deadline_ms: drain_ms,
+            restart,
             ..RuntimeConfig::default()
         };
         let set = RoleSet::expand(
@@ -618,10 +814,118 @@ mod tests {
         assert!(hung_dropped.load(Ordering::SeqCst), "hung task dropped");
     }
 
+    #[test]
+    fn restart_backoff_doubles_up_to_limit() {
+        let cfg = RestartConfig::default();
+        let ms = |n| cfg.backoff(n).as_millis();
+        assert_eq!(
+            [ms(1), ms(2), ms(3), ms(6), ms(7), ms(100)],
+            [1_000, 2_000, 4_000, 32_000, 60_000, 60_000]
+        );
+
+        let cfg: RuntimeConfig =
+            serde_yaml_ng::from_str("restart: { max_restarts: 0, backoff_max: 500ms }\n")
+                .expect("parse");
+        assert_eq!(cfg.restart.max_restarts, 0);
+        assert_eq!(cfg.restart.backoff(10), Duration::from_millis(500));
+        assert_eq!(cfg.restart.window, Duration::from_secs(600));
+        assert!(serde_yaml_ng::from_str::<RuntimeConfig>("restart: { bogus: 1 }").is_err());
+    }
+
+    #[test]
+    fn failures_outside_window_are_forgotten() {
+        let (spec, _) = spec("imap", Mode::Fail);
+        let mut slot = Slot {
+            name: "imap".to_owned(),
+            service: spec.service,
+            config: spec.config,
+            ready: Health::default().register("imap"),
+            failures: VecDeque::new(),
+        };
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+        assert_eq!(slot.fail(t0, window), 1);
+        assert_eq!(slot.fail(t0 + Duration::from_secs(30), window), 2);
+        assert_eq!(
+            slot.fail(t0 + Duration::from_secs(61), window),
+            2,
+            "first one expired"
+        );
+        assert_eq!(slot.fail(t0 + Duration::from_secs(200), window), 1);
+    }
+
     #[tokio::test]
-    async fn failed_role_stops_node() {
+    async fn failed_role_is_restarted_others_keep_running() {
         let mut roles = runtime(1_000, &[Role::Admin, Role::Maintenance]);
-        roles.add(Role::Admin, |_| spec("admin", Mode::Fail).0);
+        let (admin, _, admin_runs) = spec_runs("admin", Mode::FailFirst(2));
+        roles.add(Role::Admin, |_| admin);
+        let (maint, maint_dropped, maint_runs) =
+            spec_runs("maintenance", Mode::Drain(Duration::ZERO));
+        roles.add(Role::Maintenance, |_| maint);
+        let health = Health::default();
+        let metrics = Metrics::default();
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
+        let run = tokio::spawn({
+            let health = health.clone();
+            let metrics = metrics.clone();
+            async move { roles.run(&health, &metrics, shutdown).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), wait_ready(&health))
+            .await
+            .expect("admin is back");
+        assert_eq!(admin_runs.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            maint_runs.load(Ordering::SeqCst),
+            1,
+            "neighbour not restarted"
+        );
+        assert!(
+            !maint_dropped.load(Ordering::SeqCst),
+            "neighbour still running"
+        );
+        let text = metrics.encode().expect("encode");
+        assert!(
+            text.contains("tp_role_restarts_total{role=\"admin\"} 2"),
+            "{text}"
+        );
+
+        trigger.cancel();
+        let report = run.await.expect("join");
+        assert_eq!(report.restarts, BTreeMap::from([("admin".to_owned(), 2)]));
+        assert!(report.failed.is_empty());
+        let mut completed = report.completed.clone();
+        completed.sort();
+        assert_eq!(completed, ["admin", "maintenance"]);
+    }
+
+    #[tokio::test]
+    async fn panicking_role_is_restarted() {
+        let mut roles = runtime(1_000, &[Role::Imap]);
+        let (imap, _, runs) = spec_runs("imap", Mode::PanicOnce);
+        roles.add(Role::Imap, |_| imap);
+        let health = Health::default();
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
+        let run = tokio::spawn({
+            let health = health.clone();
+            async move { roles.run(&health, &Metrics::default(), shutdown).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), wait_ready(&health))
+            .await
+            .expect("imap is back");
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        trigger.cancel();
+        let report = run.await.expect("join");
+        assert_eq!(report.restarts["imap"], 1);
+        assert_eq!(report.completed, ["imap"]);
+    }
+
+    #[tokio::test]
+    async fn restart_limit_stops_node() {
+        let mut roles = runtime_with(1_000, fast_restart(2), &[Role::Admin, Role::Maintenance]);
+        let (admin, _, admin_runs) = spec_runs("admin", Mode::Fail);
+        roles.add(Role::Admin, |_| admin);
         let (maint, maint_dropped) = spec("maintenance", Mode::Drain(Duration::ZERO));
         roles.add(Role::Maintenance, |_| maint);
         let health = Health::default();
@@ -632,6 +936,8 @@ mod tests {
         )
         .await
         .expect("node stops by itself");
+        assert_eq!(admin_runs.load(Ordering::SeqCst), 3, "start + 2 restarts");
+        assert_eq!(report.restarts["admin"], 2);
         assert_eq!(
             report.failed,
             [("admin".to_owned(), Error::internal("boom"))]
@@ -639,6 +945,92 @@ mod tests {
         assert_eq!(report.completed, ["maintenance"]);
         assert!(maint_dropped.load(Ordering::SeqCst));
         assert!(health.is_draining());
+    }
+
+    #[tokio::test]
+    async fn zero_restarts_means_fail_fast() {
+        let mut roles = runtime_with(1_000, fast_restart(0), &[Role::Admin]);
+        let (admin, _, runs) = spec_runs("admin", Mode::Fail);
+        roles.add(Role::Admin, |_| admin);
+        let shutdown = CancellationToken::new();
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            roles.run(&Health::default(), &Metrics::default(), shutdown),
+        )
+        .await
+        .expect("node stops by itself");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(report.restarts.is_empty());
+        assert_eq!(report.failed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_backoff_skips_restart() {
+        let restart = RestartConfig {
+            backoff_initial: Duration::from_secs(60),
+            ..fast_restart(5)
+        };
+        let mut roles = runtime_with(1_000, restart, &[Role::Admin, Role::Maintenance]);
+        let (admin, _, admin_runs) = spec_runs("admin", Mode::Fail);
+        roles.add(Role::Admin, |_| admin);
+        roles.add(Role::Maintenance, |_| {
+            spec("maintenance", Mode::Drain(Duration::ZERO)).0
+        });
+        let health = Health::default();
+        let metrics = Metrics::default();
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
+        let run = tokio::spawn({
+            let health = health.clone();
+            let metrics = metrics.clone();
+            async move { roles.run(&health, &metrics, shutdown).await }
+        });
+        while !metrics
+            .encode()
+            .expect("encode")
+            .contains("tp_role_restarts_total")
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !health.is_ready(),
+            "failed role is not ready during backoff"
+        );
+        let started = Instant::now();
+        trigger.cancel();
+        let report = run.await.expect("join");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(admin_runs.load(Ordering::SeqCst), 1);
+        assert!(report.failed.is_empty() && report.cancelled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_settings_follow_config_reload() {
+        let registry = SectionRegistry::new();
+        let base = "database: { url: pg }\nblob: { url: file:///b }\ndomain: d\n";
+        let parse = |extra: &str| {
+            Arc::new(
+                registry
+                    .parse(&format!("{base}{extra}"), Vec::new())
+                    .expect("parse"),
+            )
+        };
+        let (tx, rx) = watch::channel(parse(""));
+        // Сначала лимит 5; после перечитывания — 0, и следующее падение останавливает узел.
+        let mut roles = runtime_with(1_000, fast_restart(5), &[Role::Admin]).with_updates(rx);
+        let (admin, _, runs) = spec_runs("admin", Mode::Fail);
+        roles.add(Role::Admin, |_| admin);
+        tx.send(parse("runtime: { restart: { max_restarts: 0 } }\n"))
+            .expect("send");
+        let shutdown = CancellationToken::new();
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            roles.run(&Health::default(), &Metrics::default(), shutdown),
+        )
+        .await
+        .expect("node stops by itself");
+        assert_eq!(report.failed.len(), 1);
+        assert!(runs.load(Ordering::SeqCst) <= 2, "new limit applied");
     }
 
     #[test]
