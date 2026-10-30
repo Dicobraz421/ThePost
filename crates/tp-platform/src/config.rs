@@ -22,6 +22,7 @@ use tp_contracts::Error;
 use tp_contracts::role::{RoleEntry, RolePreset, RoleSet};
 
 use crate::reload::ReloadConfig;
+use crate::roles::RuntimeConfig;
 use crate::service_http::ServiceHttpConfig;
 use crate::telemetry::TelemetryConfig;
 
@@ -104,7 +105,7 @@ impl Default for SectionRegistry {
 }
 
 impl SectionRegistry {
-    /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`.
+    /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`.
     pub fn new() -> Self {
         let mut r = Self {
             sections: BTreeMap::new(),
@@ -114,6 +115,7 @@ impl SectionRegistry {
         r.sections
             .insert("service_http", def::<ServiceHttpConfig>());
         r.sections.insert("reload", def::<ReloadConfig>());
+        r.sections.insert("runtime", def::<RuntimeConfig>());
         r
     }
 
