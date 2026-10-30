@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 tp-contracts.workspace = true
+schemars.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true

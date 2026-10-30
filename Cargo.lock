@@ -1065,6 +1065,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
 name = "ecb"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3252,6 +3258,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3506,6 +3532,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "schemars"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
+dependencies = [
+ "dyn-clone",
+ "ref-cast",
+ "schemars_derive",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3582,6 +3633,17 @@ name = "serde_derive"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4293,6 +4355,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "schemars",
  "tokio",
  "tp-admin",
  "tp-auth",
@@ -4563,6 +4626,7 @@ name = "tp-admin"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -4585,6 +4649,7 @@ dependencies = [
  "ldap3",
  "libgssapi",
  "moka",
+ "schemars",
  "thiserror 2.0.21",
  "tokio",
  "tp-contracts",
@@ -4603,6 +4668,7 @@ dependencies = [
  "moka",
  "object_store",
  "proptest",
+ "schemars",
  "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
@@ -4618,6 +4684,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "redis",
+ "schemars",
  "thiserror 2.0.21",
  "tokio",
  "tp-contracts",
@@ -4632,6 +4699,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "schemars",
  "serde",
  "thiserror 2.0.21",
  "time",
@@ -4645,6 +4713,7 @@ dependencies = [
  "axum",
  "calcard",
  "quick-xml 0.42.0",
+ "schemars",
  "thiserror 2.0.21",
  "tp-contracts",
  "tp-platform",
@@ -4659,6 +4728,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "flate2",
+ "schemars",
  "thiserror 2.0.21",
  "tokio",
  "tp-contracts",
@@ -4674,6 +4744,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -4694,6 +4765,7 @@ dependencies = [
  "futures",
  "mail-parser",
  "proptest",
+ "schemars",
  "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
@@ -4709,6 +4781,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "proptest",
+ "schemars",
  "serde_json",
  "sqlx",
  "tempfile",
@@ -4734,6 +4807,7 @@ dependencies = [
  "prometheus-client",
  "rustls",
  "rustls-pemfile",
+ "schemars",
  "serde",
  "serde_yaml_ng",
  "thiserror 2.0.21",
@@ -4754,6 +4828,7 @@ dependencies = [
  "calamine",
  "lopdf",
  "quick-xml 0.42.0",
+ "schemars",
  "tantivy",
  "thiserror 2.0.21",
  "tokio",
@@ -4769,6 +4844,7 @@ name = "tp-sieve"
 version = "0.1.0"
 dependencies = [
  "mail-parser",
+ "schemars",
  "thiserror 2.0.21",
  "tp-contracts",
  "tp-testkit",
@@ -4783,6 +4859,7 @@ dependencies = [
  "mail-builder 1.0.0",
  "mail-parser",
  "mail-send",
+ "schemars",
  "smtp-proto",
  "thiserror 2.0.21",
  "tokio",
@@ -4799,6 +4876,7 @@ name = "tp-sys"
 version = "0.1.0"
 dependencies = [
  "nix",
+ "schemars",
  "seccompiler",
  "socket2",
  "thiserror 2.0.21",

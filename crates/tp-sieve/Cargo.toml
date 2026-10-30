@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 tp-contracts.workspace = true
+schemars.workspace = true
 mail-parser.workspace = true
 thiserror.workspace = true
 
