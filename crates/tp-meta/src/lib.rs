@@ -12,6 +12,7 @@ pub mod events;
 pub mod lease;
 pub mod mailboxes;
 pub mod messages;
+pub mod modules;
 pub mod pool;
 pub mod schema;
 pub mod shards;
