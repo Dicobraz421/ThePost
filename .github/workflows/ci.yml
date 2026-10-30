@@ -89,8 +89,16 @@ jobs:
         ports: ['5432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+      # Шина tp-cluster (решение 2026-10-30, #38): интеграционные тесты идут в CI.
+      valkey:
+        image: valkey/valkey:8
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "valkey-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    # Сервисы CI — профиль dev: открытые каналы на localhost раннера (TLS — профиль по умолчанию).
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      TEST_VALKEY_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
