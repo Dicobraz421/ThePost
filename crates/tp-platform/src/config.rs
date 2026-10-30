@@ -21,6 +21,7 @@ use serde_yaml_ng::{Mapping, Value};
 use tp_contracts::Error;
 use tp_contracts::role::{RoleEntry, RolePreset, RoleSet};
 
+use crate::reload::ReloadConfig;
 use crate::service_http::ServiceHttpConfig;
 use crate::telemetry::TelemetryConfig;
 
@@ -103,7 +104,7 @@ impl Default for SectionRegistry {
 }
 
 impl SectionRegistry {
-    /// Реестр с секциями платформы: `telemetry`, `service_http`.
+    /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`.
     pub fn new() -> Self {
         let mut r = Self {
             sections: BTreeMap::new(),
@@ -112,6 +113,7 @@ impl SectionRegistry {
         r.sections.insert("telemetry", def::<TelemetryConfig>());
         r.sections
             .insert("service_http", def::<ServiceHttpConfig>());
+        r.sections.insert("reload", def::<ReloadConfig>());
         r
     }
 
