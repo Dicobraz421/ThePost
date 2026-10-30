@@ -4811,6 +4811,7 @@ dependencies = [
 name = "tp-platform"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "instant-acme",
  "opentelemetry",
@@ -4822,6 +4823,7 @@ dependencies = [
  "rustls-pemfile",
  "schemars",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "thiserror 2.0.21",
  "tokio",
