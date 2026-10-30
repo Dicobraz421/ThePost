@@ -8,6 +8,7 @@ pub mod roles;
 pub mod secrets;
 pub mod sections;
 pub mod serve;
+pub mod verify;
 
 #[cfg(test)]
 mod testutil;

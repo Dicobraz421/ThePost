@@ -9,7 +9,7 @@ use tp_contracts::Error;
 use tp_contracts::role::CancellationToken;
 use tp_platform::config::ENV_CONFIG_PATH;
 
-use crate::{doctor, secrets, sections, serve};
+use crate::{doctor, secrets, sections, serve, verify};
 
 /// Путь к config.yaml по умолчанию.
 pub const DEFAULT_CONFIG: &str = "/etc/thepost/config.yaml";
@@ -44,6 +44,15 @@ pub enum Command {
     /// Проверка окружения: СУБД, BLOB, время, секреты.
     Doctor {
         /// Вывод в JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Сверка хранилища BLOB и учёта объектов.
+    Verify {
+        /// Удалить «сирот» и пометить повреждённые записи.
+        #[arg(long)]
+        fix: bool,
+        /// Отчёт в JSON.
         #[arg(long)]
         json: bool,
     },
@@ -133,6 +142,20 @@ pub async fn run(cli: Cli) -> i32 {
             }
             report.exit_code()
         }
+        Command::Verify { fix, json } => match verify::command(&path, fix, None).await {
+            Ok(report) => {
+                if json {
+                    match report.to_json() {
+                        Ok(j) => println!("{j}"),
+                        Err(e) => return fail(&e),
+                    }
+                } else {
+                    print!("{}", verify::summary(&report));
+                }
+                verify::exit_code(&report)
+            }
+            Err(e) => fail(&e),
+        },
         Command::Serve => serve_until_signal(path).await,
     }
 }
@@ -190,6 +213,14 @@ mod tests {
             .expect("doctor");
         assert!(matches!(cli.command, Command::Doctor { json: true }));
         assert_eq!(cli.config_path(), PathBuf::from("/x.yaml"));
+        let cli = Cli::try_parse_from(["thepost", "verify", "--fix"]).expect("verify");
+        assert!(matches!(
+            cli.command,
+            Command::Verify {
+                fix: true,
+                json: false
+            }
+        ));
         let cli =
             Cli::try_parse_from(["thepost", "config", "check", "-c", "/y.yaml"]).expect("check");
         assert!(matches!(
