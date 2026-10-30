@@ -234,7 +234,9 @@ impl SectionRegistry {
         mode: CheckMode,
     ) -> Result<Config, ConfigError> {
         let mut tree: Value = serde_yaml_ng::from_str(src)?;
-        if tree.is_null() {
+        // Пустой файл — пустое отображение; секции разбираются из его текста.
+        let empty = tree.is_null();
+        if empty {
             tree = Value::Mapping(Mapping::new());
         }
         let overridden = apply_env(&mut tree, env)?;
@@ -255,7 +257,7 @@ impl SectionRegistry {
         // После переопределения или отбрасывания позиции в ошибках относятся к объединённому тексту;
         // путь параметра — точный.
         let merged;
-        let src = if overridden || !unknown.is_empty() {
+        let src = if empty || overridden || !unknown.is_empty() {
             merged = serde_yaml_ng::to_string(&tree)?;
             merged.as_str()
         } else {
