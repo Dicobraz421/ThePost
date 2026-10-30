@@ -9,13 +9,20 @@
 //! под лизой `events/{subscriber}/{partition}`: читает [`EventLog::read`], обрабатывает, фиксирует
 //! [`EventLog::commit`]. Доставка не менее одного раза: после сбоя до `commit` события придут снова,
 //! обработка должна быть идемпотентной.
+//!
+//! Между экземплярами разделы распределяет [`PartitionAssigner`] (решение 2026-10-30, #45): узел берёт лизу
+//! только назначенного ему раздела и отдаёт лизы разделов, снятых с него, после фиксации текущей пачки.
+//! Лиза с номером захвата остаётся гарантией, что раздел обрабатывает один экземпляр, в том числе пока узлы
+//! видят разный состав (переходный период).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tokio::sync::watch;
 
 use crate::error::Result;
 use crate::ids::{AccountId, MailboxId, MessageId, TenantId};
+use crate::membership::NodeId;
 
 /// Вид события ядра.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +151,20 @@ pub trait EventSink: Send + Sync + 'static {
     async fn handle(&self, batch: &[LoggedEvent]) -> Result<()>;
 }
 
+/// Назначение разделов журнала узлам по составу живых узлов ([`crate::membership::Membership::live`]).
+/// Реализация — `tp-cluster` (rendezvous-хэширование ключа `<подписчик>/<раздел>`).
+///
+/// Для одного состава каждый раздел `0..partitions` назначен ровно одному узлу состава; назначение — функция
+/// подписчика, раздела и состава, одинаковая на всех узлах. Узел вне состава не получает разделов, единственный
+/// узел получает все. Смена состава переносит только разделы ушедших узлов и ≈ 1/N разделов на новый узел.
+pub trait PartitionAssigner: Send + Sync + 'static {
+    /// Разделы подписчика `subscriber`, назначенные узлу `node` при текущем составе, по возрастанию.
+    fn assigned(&self, subscriber: &str, node: &NodeId, partitions: u32) -> Vec<Partition>;
+
+    /// Текущий состав (по возрастанию); новое значение — повод пересчитать [`PartitionAssigner::assigned`].
+    fn members(&self) -> watch::Receiver<Vec<NodeId>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +174,70 @@ mod tests {
     fn object_safe() {
         fn _log(_: Arc<dyn EventLog>) {}
         fn _sink(_: Arc<dyn EventSink>) {}
+        fn _assigner(_: Arc<dyn PartitionAssigner>) {}
+    }
+
+    /// Простейшее назначение для проверки контракта: раздел `p` — узлу `(p + len(подписчик)) mod N` состава.
+    struct Modulo(watch::Sender<Vec<NodeId>>);
+
+    impl PartitionAssigner for Modulo {
+        fn assigned(&self, subscriber: &str, node: &NodeId, partitions: u32) -> Vec<Partition> {
+            let members = self.0.borrow();
+            let Some(index) = members.iter().position(|m| m == node) else {
+                return Vec::new();
+            };
+            (0..partitions)
+                .filter(|p| (*p as usize + subscriber.len()) % members.len() == index)
+                .map(Partition)
+                .collect()
+        }
+
+        fn members(&self) -> watch::Receiver<Vec<NodeId>> {
+            self.0.subscribe()
+        }
+    }
+
+    fn nodes(names: &[&str]) -> Vec<NodeId> {
+        names
+            .iter()
+            .map(|n| NodeId::new(*n).expect("node"))
+            .collect()
+    }
+
+    /// Инвариант контракта: разделы узлов состава не пересекаются и покрывают `0..partitions`.
+    fn check_cover(a: &dyn PartitionAssigner, partitions: u32) {
+        let members = a.members().borrow().clone();
+        let mut all: Vec<Partition> = members
+            .iter()
+            .flat_map(|n| a.assigned("indexer", n, partitions))
+            .collect();
+        all.sort();
+        assert_eq!(all, (0..partitions).map(Partition).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn membership_change_changes_assignment() {
+        let a = Modulo(watch::Sender::new(nodes(&["n1"])));
+        let mut rx = a.members();
+        let n1 = NodeId::new("n1").expect("n1");
+        let n2 = NodeId::new("n2").expect("n2");
+        // Один узел — все разделы; узел вне состава — ни одного.
+        assert_eq!(a.assigned("indexer", &n1, 4).len(), 4);
+        assert!(a.assigned("indexer", &n2, 4).is_empty());
+        check_cover(&a, 4);
+
+        a.0.send_replace(nodes(&["n1", "n2"]));
+        assert!(rx.has_changed().expect("open"));
+        assert_eq!(rx.borrow_and_update().len(), 2);
+        let (p1, p2) = (a.assigned("indexer", &n1, 4), a.assigned("indexer", &n2, 4));
+        assert_eq!((p1.len(), p2.len()), (2, 2));
+        assert!(p1.iter().all(|p| !p2.contains(p)));
+        check_cover(&a, 4);
+
+        a.0.send_replace(nodes(&["n2"]));
+        assert!(a.assigned("indexer", &n1, 4).is_empty());
+        assert_eq!(a.assigned("indexer", &n2, 4).len(), 4);
+        check_cover(&a, 4);
     }
 
     #[test]

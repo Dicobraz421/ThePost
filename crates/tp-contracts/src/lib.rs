@@ -12,6 +12,7 @@ pub mod ext;
 pub mod ids;
 pub mod lease;
 pub mod mailstore;
+pub mod membership;
 pub mod meta;
 pub mod role;
 pub mod search;

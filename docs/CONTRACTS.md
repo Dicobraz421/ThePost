@@ -89,6 +89,17 @@ SRS 2.5. Журнал событий ядра (outbox): событие пише�
 `CoreEvent { tenant, account, mailbox?, kind, at }`, `kind: Delivered | Submitted | FlagsChanged | Moved | Trashed | Purged | MailboxCreated | MailboxDeleted`.
 Раздел = `partition_of(account, N)` (FNV-1a, зафиксирован тестом); подписчик (`EventSink`: индексатор, модули) читает
 `read(partition, after, limit)`, позиция — `position(subscriber, partition)`, фиксирует `commit(subscriber, partition, pos)`; раздел подписчика — под лизой. Доставка не менее одного раза, порядок — в пределах ящика.
+Между экземплярами (решение 2026-10-30, #45): `PartitionAssigner` (`tp-cluster`, rendezvous-хэширование `<подписчик>/<раздел>`
+по `Membership::live()`) — `assigned(subscriber, &NodeId, partitions) -> Vec<Partition>` (по возрастанию), `members() ->
+watch::Receiver<Vec<NodeId>>` (новое значение — пересчитать). Для одного состава каждый раздел назначен ровно одному узлу; узел вне
+состава — пусто, единственный узел — все. Узел берёт лизу только назначенного ему раздела и отдаёт лизы снятых разделов после
+фиксации текущей пачки; лиза с `fencing` остаётся гарантией единственности, пока узлы видят разный состав.
+
+## Membership
+Решение 2026-10-30, #45. `Membership`: `heartbeat(&NodeId, ttl)` — создать или продлить запись узла (период ≈ `ttl / 3`),
+`leave(&NodeId)` — удалить (штатная остановка; отсутствующая — не ошибка), `live() -> Vec<NodeId>` — узлы с непросроченной записью,
+по возрастанию. Время — часы хранилища (PostgreSQL). `NodeId` — имя экземпляра, не пустое, без пробелов, ≤ 255 байт (строка в JSON).
+Реализация — `tp-meta` (META-16), in-memory — `tp-testkit`. Код — `membership.rs`.
 
 ## Search
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
@@ -179,3 +190,4 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (`content_type` убран).
 - 2026-10-30 — CTR-12 (волна contracts-04): `tls::InternalTls`, `Profile`, `InternalChannel`, `Transport`; сегменты `*_raw` неизменяемы.
 - 2026-10-30 — CTR-13 (волна contracts-05): `config::duration` (длительности humantime); `reload.poll_interval_ms` → `reload.poll_interval` (tp-platform).
+- 2026-10-30 — CTR-14: `membership::{Membership, NodeId}`, `events::PartitionAssigner`.
