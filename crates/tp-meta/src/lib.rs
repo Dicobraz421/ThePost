@@ -11,6 +11,7 @@ pub mod doctor;
 pub mod events;
 pub mod lease;
 pub mod mailboxes;
+pub mod membership;
 pub mod messages;
 pub mod modules;
 pub mod pool;
@@ -37,6 +38,7 @@ use crate::events::EventsConfig;
 ///   blob_tombstone_ttl: 24h
 ///   events:
 ///     lease_ttl: 30s
+///     node_ttl: 15s
 ///   doctor:
 ///     timeout: 10s
 /// ```
@@ -53,7 +55,7 @@ pub struct MetaConfig {
     /// Число разделов журнала событий ядра; постоянно для инсталляции (смена — миграция журнала).
     /// Требует перезапуска.
     pub event_partitions: u32,
-    /// Подписчики журнала событий.
+    /// Подписчики журнала событий и членство узлов.
     pub events: EventsConfig,
     /// Пороги проверок СУБД `thepost doctor`.
     pub doctor: DoctorConfig,
@@ -143,6 +145,7 @@ meta:
   blob_tombstone_ttl: 12h
   events:
     lease_ttl: 30s
+    node_ttl: 9s
   doctor:
     timeout: 250ms
 "#,
@@ -157,6 +160,8 @@ meta:
         );
         assert_eq!(s.meta.blob_tombstone_ttl, Duration::from_secs(12 * 3600));
         assert_eq!(s.meta.events.lease_ttl, Duration::from_secs(30));
+        assert_eq!(s.meta.events.node_ttl, Duration::from_secs(9));
+        assert_eq!(s.meta.events.heartbeat_interval(), Duration::from_secs(3));
         assert_eq!(s.meta.events.batch, EventsConfig::default().batch);
         assert_eq!(s.meta.doctor.timeout, Duration::from_millis(250));
         assert!(s.database.check().is_ok());
