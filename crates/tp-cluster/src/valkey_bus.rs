@@ -8,34 +8,46 @@
 //! При потере связи задача завершает потоки всех подписчиков (они переподписываются и сверяются
 //! по `ModSeq`) и переподключается с экспоненциальной задержкой. Пока связи нет, `subscribe`
 //! и `publish` отвечают `Unavailable`. Публикация — отдельным мультиплексным соединением.
+//!
+//! Связь — только `rediss://` с проверкой сертификата сервера по CA из секции `tls` (CONTRACTS.md#Internal
+//! TLS); файлы сертификатов перечитываются при каждом подключении. `redis://` — только профиль dev с
+//! `tls.allow_plaintext`, с предупреждением в лог при запуске. Счётчики — [`BusCounters`].
 
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use redis::aio::{MultiplexedConnection, PubSubSink, PubSubStream};
+use redis::{ClientTlsConfig, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, TlsCertificates};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use schemars::JsonSchema;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
 use tp_contracts::meta::AccountScope;
+use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{AccountId, Error, ModSeq, Result, TenantId};
 
 use crate::local_bus::{LocalBus, LocalBusConfig};
+use crate::metrics::{BusCounters, BusMetrics, inc};
 
 /// Конфигурация шины Valkey.
 #[derive(Clone, PartialEq, Eq, JsonSchema)]
 pub struct ValkeyBusConfig {
-    /// Адрес Valkey (`redis://[:пароль@]узел:порт[/база]`); в логи не попадает.
+    /// Адрес Valkey (`rediss://[:пароль@]узел:порт[/база]`; `redis://` — только профиль dev с
+    /// `tls.allow_plaintext`); в логи не попадает.
     pub url: String,
+    /// TLS канала: CA сервера, клиентский сертификат для mTLS, разрешение открытого канала в dev.
+    pub tls: InternalTls,
     /// Префикс имён каналов: разные кластеры на одном Valkey не слышат друг друга.
     pub channel_prefix: String,
     /// Буфер уведомлений подписчика на узле (как `capacity` шины в процессе).
@@ -55,7 +67,8 @@ pub struct ValkeyBusConfig {
 impl Default for ValkeyBusConfig {
     fn default() -> Self {
         Self {
-            url: "redis://127.0.0.1:6379".to_owned(),
+            url: "rediss://127.0.0.1:6379".to_owned(),
+            tls: InternalTls::default(),
             channel_prefix: "thepost".to_owned(),
             buffer: LocalBusConfig::default().capacity,
             connect_timeout_ms: 5_000,
@@ -71,6 +84,7 @@ impl fmt::Debug for ValkeyBusConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValkeyBusConfig")
             .field("url", &"<скрыт>")
+            .field("tls", &self.tls)
             .field("channel_prefix", &self.channel_prefix)
             .field("buffer", &self.buffer)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
@@ -83,6 +97,42 @@ impl fmt::Debug for ValkeyBusConfig {
 }
 
 impl ValkeyBusConfig {
+    /// Проверяет адрес и секцию TLS (`thepost config check` и запуск): `rediss://` с проверкой
+    /// сертификата; `redis://` — только профиль dev с `tls.allow_plaintext`.
+    pub fn check(&self, profile: Profile) -> Result<Transport> {
+        self.parse(profile).map(|(_, transport)| transport)
+    }
+
+    fn parse(&self, profile: Profile) -> Result<(ConnectionInfo, Transport)> {
+        let transport = self
+            .tls
+            .check_url(InternalChannel::Valkey, &self.url, profile)?;
+        let info = self
+            .url
+            .as_str()
+            .into_connection_info()
+            .map_err(|_| Error::Invalid("шина Valkey: неверный адрес url".to_owned()))?;
+        if let ConnectionAddr::TcpTls { host, insecure, .. } = info.addr() {
+            if *insecure {
+                return Err(Error::Invalid(
+                    "шина Valkey: #insecure в адресе отключает проверку сертификата".to_owned(),
+                ));
+            }
+            // Клиент Valkey проверяет сертификат по узлу из адреса; другое имя не подставить.
+            if self
+                .tls
+                .server_name
+                .as_ref()
+                .is_some_and(|name| name != host)
+            {
+                return Err(Error::Invalid(
+                    "шина Valkey: tls.server_name должен совпадать с узлом в адресе url".to_owned(),
+                ));
+            }
+        }
+        Ok((info, transport))
+    }
+
     fn connect_timeout(&self) -> Duration {
         Duration::from_millis(self.connect_timeout_ms)
     }
@@ -112,44 +162,13 @@ impl ValkeyBusConfig {
     }
 }
 
-/// Снимок метрик шины Valkey.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ValkeyBusMetrics {
-    /// Есть pub/sub-соединение.
-    pub connected: bool,
-    /// Опубликовано уведомлений.
-    pub published: u64,
-    /// Неудачных публикаций (нет связи, таймаут).
-    pub publish_errors: u64,
-    /// Получено уведомлений из Valkey.
-    pub received: u64,
-    /// Получено нераспознанных сообщений.
-    pub decode_errors: u64,
-    /// Потерь pub/sub-соединения.
-    pub reconnects: u64,
-    /// Подписчиков, отключённых за отставание.
-    pub lagged: u64,
-}
-
-#[derive(Debug, Default)]
-struct Counters {
-    connected: AtomicBool,
-    published: AtomicU64,
-    publish_errors: AtomicU64,
-    received: AtomicU64,
-    decode_errors: AtomicU64,
-    reconnects: AtomicU64,
-}
-
-fn inc(counter: &AtomicU64) {
-    counter.fetch_add(1, Ordering::Relaxed);
-}
-
 /// Ошибка связи с Valkey.
 #[derive(Debug, thiserror::Error)]
 enum LinkError {
     #[error("таймаут")]
     Timeout,
+    #[error("TLS: {0}")]
+    Tls(String),
     #[error(transparent)]
     Redis(#[from] redis::RedisError),
 }
@@ -177,26 +196,99 @@ enum Cmd {
     Unsub { channel: String },
 }
 
+/// Файлы TLS секции канала: CA сервера и клиентский сертификат. Блокирующий I/O.
+fn read_certs(tls: &InternalTls) -> std::result::Result<TlsCertificates, String> {
+    let read = |path: &Path, field: &str| {
+        std::fs::read(path).map_err(|e| format!("tls.{field} {}: {e}", path.display()))
+    };
+    let root_cert = match tls.ca_file.as_deref() {
+        Some(path) => {
+            let pem = read(path, "ca_file")?;
+            // Без сертификатов в файле проверка сервера не пройдёт ни разу — это ошибка настройки.
+            if CertificateDer::pem_slice_iter(&pem).next().is_none() {
+                return Err(format!(
+                    "tls.ca_file {}: нет сертификатов PEM",
+                    path.display()
+                ));
+            }
+            Some(pem)
+        }
+        None => None,
+    };
+    let client_tls = match (tls.cert_file.as_deref(), tls.key_file.as_deref()) {
+        (Some(cert), Some(key)) => Some(ClientTlsConfig {
+            client_cert: read(cert, "cert_file")?,
+            client_key: read(key, "key_file")?,
+        }),
+        _ => None,
+    };
+    Ok(TlsCertificates {
+        client_tls,
+        root_cert,
+    })
+}
+
+/// Клиент Valkey; для TLS — с сертификатами из `certs`.
+fn build_client(
+    info: &ConnectionInfo,
+    certs: Option<TlsCertificates>,
+) -> redis::RedisResult<redis::Client> {
+    match certs {
+        Some(certs) => redis::Client::build_with_tls(info.clone(), certs),
+        None => redis::Client::open(info.clone()),
+    }
+}
+
+/// В сборке включены оба провайдера rustls (ring и aws-lc-rs) — без процессного провайдера
+/// клиент TLS внутри redis не создаётся. Ставит тот же, что берёт платформа по умолчанию.
+fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Ошибка — провайдер успел поставить другой поток; используется он.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 struct Shared {
     config: ValkeyBusConfig,
-    client: redis::Client,
+    info: ConnectionInfo,
+    transport: Transport,
     local: LocalBus,
     publisher: tokio::sync::Mutex<Option<MultiplexedConnection>>,
-    counters: Counters,
+    counters: Arc<BusCounters>,
 }
 
 impl Shared {
+    /// Клиент для нового подключения: файлы TLS перечитываются (ротация сертификатов).
+    async fn client(&self) -> std::result::Result<redis::Client, LinkError> {
+        let certs = match self.transport {
+            Transport::Plaintext => None,
+            Transport::Tls => {
+                let tls = self.config.tls.clone();
+                let certs = tokio::task::spawn_blocking(move || read_certs(&tls))
+                    .await
+                    .map_err(|_| LinkError::Tls("чтение файлов прервано".to_owned()))?
+                    .map_err(LinkError::Tls)?;
+                Some(certs)
+            }
+        };
+        Ok(build_client(&self.info, certs)?)
+    }
+
+    async fn open_publisher(&self) -> std::result::Result<MultiplexedConnection, LinkError> {
+        let client = self.client().await?;
+        within(
+            self.config.connect_timeout(),
+            client.get_multiplexed_async_connection(),
+        )
+        .await
+    }
+
     async fn publisher(&self) -> Result<MultiplexedConnection> {
         let mut slot = self.publisher.lock().await;
         if let Some(conn) = slot.as_ref() {
             return Ok(conn.clone());
         }
-        match within(
-            self.config.connect_timeout(),
-            self.client.get_multiplexed_async_connection(),
-        )
-        .await
-        {
+        match self.open_publisher().await {
             Ok(conn) => {
                 *slot = Some(conn.clone());
                 Ok(conn)
@@ -213,11 +305,8 @@ impl Shared {
         &self,
         channels: &HashMap<String, usize>,
     ) -> std::result::Result<(PubSubSink, PubSubStream), LinkError> {
-        let pubsub = within(
-            self.config.connect_timeout(),
-            self.client.get_async_pubsub(),
-        )
-        .await?;
+        let client = self.client().await?;
+        let pubsub = within(self.config.connect_timeout(), client.get_async_pubsub()).await?;
         let (mut sink, stream) = pubsub.split();
         for channel in channels.keys() {
             within(self.config.command_timeout(), sink.subscribe(channel)).await?;
@@ -263,38 +352,51 @@ impl Drop for ValkeyBus {
 
 impl ValkeyBus {
     /// Запускает шину: фоновая задача подключается к Valkey и держит подписки.
-    /// Вызывать внутри runtime tokio.
-    pub fn start(config: ValkeyBusConfig) -> Result<Self> {
-        let client = redis::Client::open(config.url.as_str())
-            .map_err(|_| Error::Invalid("шина Valkey: неверный адрес url".to_owned()))?;
+    /// `profile` — профиль узла (`profile` config.yaml). Вызывать внутри runtime tokio.
+    pub fn start(config: ValkeyBusConfig, profile: Profile) -> Result<Self> {
+        let (info, transport) = config.parse(profile)?;
+        match transport {
+            Transport::Plaintext => {
+                tracing::warn!("{}", InternalChannel::Valkey.plaintext_warning());
+            }
+            Transport::Tls => {
+                install_crypto_provider();
+                // Ошибка в файлах — ошибка конфигурации при запуске, а не бесконечные переподключения.
+                let certs = read_certs(&config.tls)
+                    .map_err(|e| Error::Invalid(format!("шина Valkey: {e}")))?;
+                build_client(&info, Some(certs))
+                    .map_err(|e| Error::Invalid(format!("шина Valkey: {e}")))?;
+            }
+        }
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Internal("шина Valkey: запуск вне runtime tokio".to_owned()))?;
+        let counters = Arc::new(BusCounters::default());
         let shared = Arc::new(Shared {
-            local: LocalBus::new(&LocalBusConfig {
-                capacity: config.buffer,
-            }),
+            local: LocalBus::with_counters(
+                &LocalBusConfig {
+                    capacity: config.buffer,
+                },
+                Arc::clone(&counters),
+            ),
             config,
-            client,
+            info,
+            transport,
             publisher: tokio::sync::Mutex::new(None),
-            counters: Counters::default(),
+            counters,
         });
         let (cmds, rx) = mpsc::unbounded_channel();
         let task = runtime.spawn(run(Arc::clone(&shared), rx));
         Ok(Self { shared, cmds, task })
     }
 
-    /// Снимок метрик.
-    pub fn metrics(&self) -> ValkeyBusMetrics {
-        let c = &self.shared.counters;
-        ValkeyBusMetrics {
-            connected: c.connected.load(Ordering::Relaxed),
-            published: c.published.load(Ordering::Relaxed),
-            publish_errors: c.publish_errors.load(Ordering::Relaxed),
-            received: c.received.load(Ordering::Relaxed),
-            decode_errors: c.decode_errors.load(Ordering::Relaxed),
-            reconnects: c.reconnects.load(Ordering::Relaxed),
-            lagged: self.shared.local.lagged(),
-        }
+    /// Счётчики шины для метрик платформы.
+    pub fn counters(&self) -> Arc<BusCounters> {
+        Arc::clone(&self.shared.counters)
+    }
+
+    /// Снимок счётчиков.
+    pub fn metrics(&self) -> BusMetrics {
+        self.shared.counters.snapshot()
     }
 
     /// Подписывает канал в Valkey; поток `local` живёт, пока нужен канал.
@@ -423,11 +525,11 @@ async fn run(shared: Arc<Shared>, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
     loop {
         match shared.connect(&channels).await {
             Ok((sink, stream)) => {
-                shared.counters.connected.store(true, Ordering::Relaxed);
+                shared.counters.set_connected(true);
                 tracing::info!("шина Valkey: соединение установлено");
                 backoff = shared.config.reconnect_min();
                 let stop = serve(&shared, &mut cmds, &mut channels, sink, stream).await;
-                shared.counters.connected.store(false, Ordering::Relaxed);
+                shared.counters.set_connected(false);
                 // Уведомления за время разрыва потеряны — подписчики сверятся по ModSeq.
                 shared.local.close_all();
                 if stop {
@@ -575,14 +677,22 @@ mod tests {
     use std::sync::Mutex;
     use tokio::net::{TcpListener, TcpStream};
 
+    fn dev_plaintext() -> InternalTls {
+        InternalTls {
+            allow_plaintext: true,
+            ..InternalTls::default()
+        }
+    }
+
     fn valkey_url() -> Option<String> {
         std::env::var("TEST_VALKEY_URL").ok()
     }
 
-    /// Свой префикс на тест: тесты идут параллельно на одном Valkey.
+    /// Свой префикс на тест: тесты идут параллельно на одном Valkey. Valkey в CI — без TLS (профиль dev).
     fn config(url: String) -> ValkeyBusConfig {
         ValkeyBusConfig {
             url,
+            tls: dev_plaintext(),
             channel_prefix: format!("tp-test-{}", AccountId::new()),
             connect_timeout_ms: 1_000,
             command_timeout_ms: 1_000,
@@ -650,11 +760,146 @@ mod tests {
             url: "not a url".to_owned(),
             ..ValkeyBusConfig::default()
         };
-        assert!(matches!(ValkeyBus::start(bad), Err(Error::Invalid(_))));
         assert!(matches!(
-            ValkeyBus::start(ValkeyBusConfig::default()),
+            ValkeyBus::start(bad, Profile::Dev),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            ValkeyBus::start(ValkeyBusConfig::default(), Profile::Prod),
             Err(Error::Internal(_))
         ));
+    }
+
+    #[test]
+    fn plaintext_only_in_dev() {
+        let open = ValkeyBusConfig {
+            url: "redis://cache:6379".to_owned(),
+            ..ValkeyBusConfig::default()
+        };
+        // Без allow_plaintext адрес redis:// отклоняется в любом профиле.
+        assert!(matches!(open.check(Profile::Prod), Err(Error::Invalid(_))));
+        assert!(matches!(open.check(Profile::Dev), Err(Error::Invalid(_))));
+        assert!(matches!(
+            ValkeyBus::start(open.clone(), Profile::Prod),
+            Err(Error::Invalid(_))
+        ));
+
+        let dev = ValkeyBusConfig {
+            tls: dev_plaintext(),
+            ..open
+        };
+        assert_eq!(dev.check(Profile::Dev).ok(), Some(Transport::Plaintext));
+        // allow_plaintext вне dev — ошибка конфигурации, даже с адресом rediss://.
+        assert!(matches!(dev.check(Profile::Prod), Err(Error::Invalid(_))));
+        let tls_dev = ValkeyBusConfig {
+            url: "rediss://cache:6379".to_owned(),
+            ..dev
+        };
+        assert!(matches!(
+            tls_dev.check(Profile::Prod),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(tls_dev.check(Profile::Dev).ok(), Some(Transport::Tls));
+    }
+
+    #[test]
+    fn tls_address_checks() {
+        let tls = |url: &str, server_name: Option<&str>| ValkeyBusConfig {
+            url: url.to_owned(),
+            tls: InternalTls {
+                server_name: server_name.map(str::to_owned),
+                ..InternalTls::default()
+            },
+            ..ValkeyBusConfig::default()
+        };
+        for url in [
+            "rediss://cache.internal:6379",
+            "rediss://:secret@cache.internal:6380/2",
+            "valkeys://cache.internal",
+        ] {
+            assert_eq!(
+                tls(url, None).check(Profile::Prod).ok(),
+                Some(Transport::Tls),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            tls("rediss://cache.internal", Some("cache.internal"))
+                .check(Profile::Prod)
+                .ok(),
+            Some(Transport::Tls)
+        );
+        for (url, name) in [
+            // Отключение проверки сертификата.
+            ("rediss://cache.internal/#insecure", None),
+            // Имя для проверки не совпадает с узлом в адресе.
+            ("rediss://cache.internal", Some("other.internal")),
+            ("redis+unix:///run/valkey.sock", None),
+            ("https://cache.internal", None),
+        ] {
+            assert!(
+                matches!(tls(url, name).check(Profile::Prod), Err(Error::Invalid(_))),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_tls_files_fail_start() {
+        let dir = std::env::temp_dir().join(format!("tp-cluster-{}", AccountId::new()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let garbage = dir.join("ca.pem");
+        std::fs::write(&garbage, "не сертификат").expect("write");
+        for ca in [dir.join("missing.pem"), garbage] {
+            let cfg = ValkeyBusConfig {
+                tls: InternalTls {
+                    ca_file: Some(ca.clone()),
+                    ..InternalTls::default()
+                },
+                ..ValkeyBusConfig::default()
+            };
+            assert!(
+                matches!(ValkeyBus::start(cfg, Profile::Prod), Err(Error::Invalid(_))),
+                "{}",
+                ca.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tls_to_plain_server_is_unavailable() {
+        // Сервер без TLS: принимает соединение и отвечает не TLS — рукопожатие не проходит.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = conn.write_all(b"-ERR plaintext\r\n").await;
+            }
+        });
+        let cfg = ValkeyBusConfig {
+            url: format!("rediss://{addr}"),
+            ..config(String::new())
+        };
+        let cfg = ValkeyBusConfig {
+            tls: InternalTls::default(),
+            ..cfg
+        };
+        let bus = ValkeyBus::start(cfg, Profile::Prod).expect("start");
+        assert!(matches!(
+            bus.subscribe(conformance::scope()).await,
+            Err(Error::Unavailable { .. })
+        ));
+        assert!(matches!(
+            bus.publish(conformance::system(EventKind::QueueReady))
+                .await,
+            Err(Error::Unavailable { .. })
+        ));
+        let m = bus.metrics();
+        assert!(!m.connected);
+        assert_eq!((m.published, m.publish_errors), (0, 1));
+        server.abort();
     }
 
     #[tokio::test]
@@ -663,7 +908,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         drop(listener);
-        let bus = ValkeyBus::start(config(format!("redis://{addr}"))).expect("start");
+        let bus = ValkeyBus::start(config(format!("redis://{addr}")), Profile::Dev).expect("start");
         assert!(matches!(
             bus.subscribe(conformance::scope()).await,
             Err(Error::Unavailable { .. })
@@ -684,12 +929,13 @@ mod tests {
             eprintln!("TEST_VALKEY_URL не задан — пропуск");
             return;
         };
-        let bus = ValkeyBus::start(config(url)).expect("start");
+        let bus = ValkeyBus::start(config(url), Profile::Dev).expect("start");
         conformance::run(&bus).await;
         let m = bus.metrics();
         assert!(m.connected);
         assert_eq!(m.decode_errors, 0);
         assert!(m.received > 0 && m.published >= m.received / 2);
+        assert!(m.delivered > 0);
     }
 
     #[tokio::test]
@@ -699,8 +945,8 @@ mod tests {
             return;
         };
         let cfg = config(url);
-        let node_a = ValkeyBus::start(cfg.clone()).expect("start");
-        let node_b = ValkeyBus::start(cfg).expect("start");
+        let node_a = ValkeyBus::start(cfg.clone(), Profile::Dev).expect("start");
+        let node_b = ValkeyBus::start(cfg, Profile::Dev).expect("start");
         let scope = conformance::scope();
         let mut on_b = node_b.subscribe(scope).await.expect("subscribe");
         let mut sys_b = node_b.subscribe_system().await.expect("subscribe");
@@ -779,7 +1025,8 @@ mod tests {
             .addr()
             .to_string();
         let proxy = Proxy::start(info).await;
-        let bus = ValkeyBus::start(config(format!("redis://{}", proxy.addr))).expect("start");
+        let bus = ValkeyBus::start(config(format!("redis://{}", proxy.addr)), Profile::Dev)
+            .expect("start");
         let scope = conformance::scope();
         let mut sub = bus.subscribe(scope).await.expect("subscribe");
         bus.publish(conformance::mailbox_changed(scope, 1))
