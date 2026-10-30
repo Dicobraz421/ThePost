@@ -138,6 +138,7 @@ mod tests {
             r#"
 database:
   url: postgres://thepost@db.internal/thepost
+  password: { secret: "thepost/db#password" }
   acquire_timeout: 5s
   idle_timeout: null
   max_lifetime: 1h30m
@@ -154,6 +155,14 @@ meta:
         assert_eq!(s.database.acquire_timeout, Duration::from_secs(5));
         assert_eq!(s.database.idle_timeout, None);
         assert_eq!(s.database.max_lifetime, Some(Duration::from_secs(5400)));
+        assert_eq!(
+            s.database
+                .password
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("thepost/db#password")
+        );
         assert_eq!(
             s.database.max_connections,
             PoolConfig::default().max_connections
@@ -198,6 +207,9 @@ meta:
         assert!(err("meta:\n  doctor:\n    timeot: 1s\n").contains("timeot"));
         // Профиль задаёт приложение, не секция.
         assert!(err("database:\n  profile: dev\n").contains("profile"));
+        // Пароль открытым текстом на месте ссылки — ошибка без значения.
+        let e = err("database:\n  password: hunter2\n");
+        assert!(!e.contains("hunter2"), "{e}");
     }
 
     #[test]

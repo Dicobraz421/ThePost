@@ -1,8 +1,10 @@
 //! Пул из конфигурации, транзакции организации, проверки doctor (META-07); TLS канала (META-14).
-//! Интеграционные тесты — в профиле dev (`common::dev_pool_config`).
+//! Интеграционные тесты — в профиле dev (`common::dev_pool_config`); пароль — из хранилища секретов (META-17).
 
 mod common;
 
+use tp_contracts::secrets::SecretRef;
+use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, TenantId};
 use tp_meta::doctor::{self, DoctorConfig, Status};
 use tp_meta::pool::{self, PoolConfig};
@@ -23,16 +25,73 @@ fn config_validation_hides_password() {
         empty.connect_options(&empty.url, false),
         Err(Error::Invalid(_))
     ));
-    let bad = cfg(
-        "postgres://u:secret@h:port/db?sslmode=disable".into(),
-        false,
-    );
+    // Адрес с паролем — без разбора `dev_pool_config` (он переносит пароль в общее хранилище тестов).
+    let dev = |url: &str| PoolConfig {
+        url: url.into(),
+        tls: InternalTls {
+            allow_plaintext: true,
+            ..InternalTls::default()
+        },
+        profile: Profile::Dev,
+        ..PoolConfig::default()
+    };
+    let bad = dev("postgres://u:secret@h:port/db?sslmode=disable");
     match bad.connect_options(&bad.url, false) {
         Err(Error::Invalid(m)) => assert!(!m.contains("secret")),
         other => panic!("{other:?}"),
     }
-    let good = cfg("postgres://u:secret@h/db".into(), true);
+    let good = dev("postgres://u:secret@h/db?sslmode=disable");
     assert!(!format!("{good:?}").contains("secret"));
+    // Пароль в адресе — только dev; вне dev — ошибка без значения в тексте.
+    assert!(good.check().is_ok());
+    let prod = PoolConfig {
+        url: "postgres://u:hunter2@h/db".into(),
+        ..PoolConfig::default()
+    };
+    match prod.check() {
+        Err(Error::Invalid(m)) => assert!(!m.contains("hunter2") && m.contains("password"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn password_from_secret_store() {
+    let Some(url) = common::pg_url() else {
+        return;
+    };
+    let (_, password) = common::split_password(&url);
+    let Some(password) = password else {
+        eprintln!("в TEST_DATABASE_URL нет пароля — проверка пароля из хранилища пропущена");
+        return;
+    };
+    let secret: SecretRef = format!("test/pool-{}#password", uuid::Uuid::now_v7().simple())
+        .parse()
+        .expect("ссылка");
+    let store = common::secrets();
+    store.set(&secret, &password);
+    let c = PoolConfig {
+        password: Some(secret.clone()),
+        max_connections: 1,
+        ..common::dev_pool_config(&url)
+    };
+    assert!(!pool::url_has_password(&c.url), "адрес без пароля");
+    let pool = pool::connect(&c, &*store).await.expect("connect");
+    let one: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("select");
+    assert_eq!(one, 1);
+
+    // Отозванный секрет — понятная ошибка Unavailable, без значения.
+    store.revoke(&secret);
+    assert_eq!(
+        pool::connect(&c, &*store).await.err(),
+        Some(Error::UNAVAILABLE)
+    );
+    assert_eq!(
+        pool::connect_direct(&c, &*store).await.err(),
+        Some(Error::UNAVAILABLE)
+    );
 }
 
 #[tokio::test]
@@ -43,14 +102,12 @@ async fn pool_modes_and_with_tenant() {
     let base = common::pool().await.expect("pool");
     let tenant = common::tenant(&base).await;
     for pgbouncer in [false, true] {
-        let pool = pool::connect(&cfg(url.clone(), pgbouncer))
-            .await
-            .expect("connect");
-        let lazy =
-            pool::connect_lazy(&cfg(url.clone(), pgbouncer), &common::dev_url(&url)).expect("lazy");
-        let direct = pool::connect_direct(&cfg(url.clone(), pgbouncer))
-            .await
-            .expect("direct");
+        let c = cfg(url.clone(), pgbouncer);
+        let secrets = common::secrets();
+        let pool = pool::connect(&c, &*secrets).await.expect("connect");
+        let password = c.password(&*secrets).await.expect("password");
+        let lazy = pool::connect_lazy(&c, &c.url, password.as_ref()).expect("lazy");
+        let direct = pool::connect_direct(&c, &*secrets).await.expect("direct");
         for p in [&pool, &lazy, &direct] {
             let seen: String = pool::with_tenant(p, tenant, |tx| {
                 Box::pin(async move {
@@ -75,7 +132,7 @@ async fn pool_modes_and_with_tenant() {
     }
 
     // Ошибка тела — откат.
-    let pool = pool::connect(&cfg(url.clone(), false))
+    let pool = pool::connect(&cfg(url.clone(), false), &*common::secrets())
         .await
         .expect("connect");
     let other = TenantId::new();
@@ -166,14 +223,19 @@ async fn sslmode_disable_only_in_dev() {
         profile: tp_contracts::tls::Profile::Prod,
         ..dev.clone()
     };
-    assert!(matches!(pool::connect(&prod).await, Err(Error::Invalid(_))));
     assert!(matches!(
-        pool::connect_lazy(&prod, &dev.url),
+        pool::connect(&prod, &*common::secrets()).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        pool::connect_lazy(&prod, &dev.url, None),
         Err(Error::Invalid(_))
     ));
 
     // doctor сообщает режим канала.
-    let pool = pool::connect(&dev).await.expect("connect");
+    let pool = pool::connect(&dev, &*common::secrets())
+        .await
+        .expect("connect");
     let report = doctor::check(&pool, &DoctorConfig::default())
         .await
         .expect("doctor");

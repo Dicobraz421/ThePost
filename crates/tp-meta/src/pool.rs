@@ -10,6 +10,9 @@
 //! [`PoolConfig::tls`] (CTR-12, решение 2026-10-30); адрес без `sslmode` подключается так же. Открытый канал
 //! (`sslmode=disable|allow|prefer`) — только профиль dev с `tls.allow_plaintext`, с предупреждением в лог
 //! при каждом создании пула; в остальных случаях — ошибка конфигурации ([`PoolConfig::check`]).
+//!
+//! Пароль — только ссылка на секрет в хранилище ([`PoolConfig::password`], CTR-15, решение 2026-10-30): адрес
+//! без пароля, значение читается из [`SecretStore`] при создании пула. Пароль в адресе — только профиль dev.
 
 use std::fmt;
 use std::future::Future;
@@ -22,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgConnection, PgPool};
 use tp_contracts::config::duration;
+use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{Error, Result, TenantId};
 
@@ -32,15 +36,20 @@ use crate::schema::{begin, begin_system, db_err};
 ///
 /// ```yaml
 /// database:
-///   url: postgres://user:password@db.example.ru:5432/thepost
+///   url: postgres://thepost@db.example.ru:5432/thepost
+///   password: { secret: "thepost/db#password" }
 ///   acquire_timeout: 5s
 /// ```
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct PoolConfig {
-    /// Адрес PostgreSQL или PgBouncer (`postgres://user:password@host:port/db`); обязателен.
+    /// Адрес PostgreSQL или PgBouncer без пароля (`postgres://user@host:port/db`); обязателен.
+    /// Пароль в адресе — только профиль dev.
     pub url: String,
-    /// Адрес PostgreSQL в обход PgBouncer для миграций; по умолчанию — `url`.
+    /// Пароль роли — ссылка на секрет в хранилище (`{ secret: "<путь>#<поле>" }`), общий для `url` и
+    /// `direct_url`. Не задан — вход без пароля (сертификат клиента; `trust` в dev).
+    pub password: Option<SecretRef>,
+    /// Адрес PostgreSQL в обход PgBouncer для миграций (без пароля); по умолчанию — `url`.
     pub direct_url: Option<String>,
     /// Соединение через PgBouncer в режиме transaction.
     pub pgbouncer: bool,
@@ -76,6 +85,7 @@ impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             url: String::new(),
+            password: None,
             direct_url: None,
             pgbouncer: false,
             max_connections: 32,
@@ -92,9 +102,10 @@ impl Default for PoolConfig {
 }
 
 impl fmt::Debug for PoolConfig {
-    // Адреса содержат пароль — в журнал не попадают.
+    // Адрес в dev может содержать пароль — в журнал не попадает; ссылка на секрет — не секрет.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PoolConfig")
+            .field("password", &self.password)
             .field("pgbouncer", &self.pgbouncer)
             .field("max_connections", &self.max_connections)
             .field("min_connections", &self.min_connections)
@@ -113,12 +124,24 @@ impl PoolConfig {
     /// Имя секции в config.yaml.
     pub const SECTION: &'static str = "database";
 
-    /// Параметры соединения с `url`; `pgbouncer` отключает кэш подготовленных выражений.
+    /// Пароль роли из хранилища секретов; `None` — пароль не задан.
+    /// Недоступный, отозванный или запрещённый политикой секрет — `Unavailable` (причина — в журнале).
+    pub async fn password(&self, secrets: &dyn SecretStore) -> Result<Option<Secret>> {
+        match &self.password {
+            None => Ok(None),
+            Some(r) => fetch_secret(secrets, r, "database.password")
+                .await
+                .map(Some),
+        }
+    }
+
+    /// Параметры соединения с `url` без пароля; `pgbouncer` отключает кэш подготовленных выражений.
     pub fn connect_options(&self, url: &str, pgbouncer: bool) -> Result<PgConnectOptions> {
         self.options(url, pgbouncer).map(|(opts, _)| opts)
     }
 
-    /// Проверяет секцию (`thepost config check` и запуск): адреса `url` и `direct_url`, TLS канала.
+    /// Проверяет секцию (`thepost config check` и запуск): адреса `url` и `direct_url`, TLS канала,
+    /// пароль в адресах (только профиль dev).
     /// `Transport::Plaintext` — хотя бы один адрес открыт (только профиль dev с `tls.allow_plaintext`).
     pub fn check(&self) -> Result<Transport> {
         let (_, mut transport) = self.options(&self.url, self.pgbouncer)?;
@@ -138,6 +161,12 @@ impl PoolConfig {
         let transport = self
             .tls
             .check_url(InternalChannel::Postgres, url, self.profile)?;
+        if self.profile != Profile::Dev && url_has_password(url) {
+            return Err(Error::invalid(
+                "database: пароль в адресе PostgreSQL допустим только в профиле dev; \
+                 задайте database.password: { secret: \"<путь>#<поле>\" }",
+            ));
+        }
         if self.tls.server_name.is_some() {
             return Err(Error::invalid(
                 "database.tls.server_name не поддерживается: сертификат проверяется по хосту из database.url",
@@ -164,13 +193,21 @@ impl PoolConfig {
         Ok((opts, transport))
     }
 
-    /// Параметры нового пула; открытый канал — предупреждение в лог.
-    fn open_options(&self, url: &str, pgbouncer: bool) -> Result<PgConnectOptions> {
+    /// Параметры нового пула с паролем из хранилища; открытый канал — предупреждение в лог.
+    fn open_options(
+        &self,
+        url: &str,
+        pgbouncer: bool,
+        password: Option<&Secret>,
+    ) -> Result<PgConnectOptions> {
         let (opts, transport) = self.options(url, pgbouncer)?;
         if transport == Transport::Plaintext {
             tracing::warn!("{}", InternalChannel::Postgres.plaintext_warning());
         }
-        Ok(opts)
+        Ok(match password {
+            Some(p) => opts.password(p.expose()),
+            None => opts,
+        })
     }
 
     fn pool_options(&self) -> PgPoolOptions {
@@ -183,25 +220,66 @@ impl PoolConfig {
     }
 }
 
-/// Пул по конфигурации; первое соединение открывается сразу (ошибка адреса или доступа — при старте).
-pub async fn connect(cfg: &PoolConfig) -> Result<PgPool> {
-    let opts = cfg.open_options(&cfg.url, cfg.pgbouncer)?;
+/// Адрес PostgreSQL содержит пароль: `scheme://user:password@host…` или параметр `password=`.
+pub fn url_has_password(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if rest[..authority_end]
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+    {
+        return true;
+    }
+    rest[authority_end..]
+        .split_once('?')
+        .is_some_and(|(_, query)| {
+            query.split(['&', '#']).any(|kv| {
+                kv.split_once('=')
+                    .map_or(kv, |(k, _)| k)
+                    .eq_ignore_ascii_case("password")
+            })
+        })
+}
+
+/// Значение секрета для подключения. Отказ хранилища (нет секрета, отозван, запрещён, недоступно) —
+/// `Unavailable`: пароль мог смениться, повтор после исправления поможет; ссылка (не значение) и причина — в журнал.
+pub(crate) async fn fetch_secret(
+    secrets: &dyn SecretStore,
+    secret: &SecretRef,
+    what: &str,
+) -> Result<Secret> {
+    secrets.get(secret).await.map_err(|e| {
+        tracing::warn!(%secret, error = %e, "{what}: секрет недоступен");
+        match e {
+            Error::Unavailable { retry_after } => Error::Unavailable { retry_after },
+            _ => Error::UNAVAILABLE,
+        }
+    })
+}
+
+/// Пул по конфигурации; пароль — из хранилища секретов. Первое соединение открывается сразу
+/// (ошибка адреса, секрета или доступа — при старте).
+pub async fn connect(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Result<PgPool> {
+    let password = cfg.password(secrets).await?;
+    let opts = cfg.open_options(&cfg.url, cfg.pgbouncer, password.as_ref())?;
     cfg.pool_options().connect_with(opts).await.map_err(db_err)
 }
 
-/// Пул по конфигурации с соединениями по требованию (роли загружаются лениво, SRS 2.7).
-pub fn connect_lazy(cfg: &PoolConfig, url: &str) -> Result<PgPool> {
-    let opts = cfg.open_options(url, cfg.pgbouncer)?;
+/// Пул к адресу `url` с паролем `password` и параметрами `cfg`, соединения — по требованию
+/// (роли загружаются лениво, SRS 2.7; пулы шардов).
+pub fn connect_lazy(cfg: &PoolConfig, url: &str, password: Option<&Secret>) -> Result<PgPool> {
+    let opts = cfg.open_options(url, cfg.pgbouncer, password)?;
     Ok(cfg.pool_options().connect_lazy_with(opts))
 }
 
 /// Пул из одного соединения в обход PgBouncer для миграций ([`crate::schema::migrate`], модули).
-pub async fn connect_direct(cfg: &PoolConfig) -> Result<PgPool> {
+pub async fn connect_direct(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Result<PgPool> {
     let (url, pgbouncer) = match &cfg.direct_url {
         Some(url) => (url.as_str(), false),
         None => (cfg.url.as_str(), cfg.pgbouncer),
     };
-    let opts = cfg.open_options(url, pgbouncer)?;
+    let password = cfg.password(secrets).await?;
+    let opts = cfg.open_options(url, pgbouncer, password.as_ref())?;
     PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(cfg.acquire_timeout)
@@ -275,8 +353,8 @@ mod tests {
     #[test]
     fn verify_full_by_default() {
         for url in [
-            "postgres://u:p@db.internal/thepost",
-            "postgres://u:p@db.internal/thepost?sslmode=verify-full",
+            "postgres://u@db.internal/thepost",
+            "postgres://u@db.internal/thepost?sslmode=verify-full",
         ] {
             let c = cfg(url);
             assert_eq!(c.check(), Ok(Transport::Tls), "{url}");
@@ -336,6 +414,31 @@ mod tests {
             ..dev("postgres://pgbouncer:6432/thepost")
         };
         assert_eq!(d.check(), Ok(Transport::Plaintext));
+    }
+
+    #[test]
+    fn password_in_url() {
+        for url in [
+            "postgres://u:p@db/thepost",
+            "postgres://u:p@h1:5432,h2:5432/thepost",
+            "postgresql://u:@db",
+            "postgres://u@db/thepost?sslmode=verify-full&password=p",
+            "postgres://db/thepost?PASSWORD=p",
+        ] {
+            assert!(url_has_password(url), "{url}");
+            assert!(cfg(url).check().is_err(), "{url}");
+        }
+        for url in [
+            "postgres://u@db:5432/thepost",
+            "postgres://db/thepost?sslmode=verify-full",
+            "postgres://u@db/thepost?application_name=a:b@c",
+            "postgres://db/p:q@r",
+        ] {
+            assert!(!url_has_password(url), "{url}");
+        }
+        // dev: пароль в адресе допустим.
+        let url = "postgres://u:p@db/thepost?sslmode=disable";
+        assert_eq!(dev(url).check(), Ok(Transport::Plaintext));
     }
 
     #[test]

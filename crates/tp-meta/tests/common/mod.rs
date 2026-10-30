@@ -2,8 +2,14 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use async_trait::async_trait;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{DomainId, TenantId};
 use tp_meta::pool::PoolConfig;
@@ -27,10 +33,17 @@ pub fn dev_url(url: &str) -> String {
     format!("{url}{sep}sslmode=disable")
 }
 
-/// Секция пула для интеграционных тестов: профиль dev с `tls.allow_plaintext` (META-14).
+/// Секция пула для интеграционных тестов: профиль dev с `tls.allow_plaintext` (META-14); пароль из адреса
+/// тестовой БД перенесён в хранилище секретов [`secrets`] под ссылкой [`DB_SECRET`] (META-17).
 pub fn dev_pool_config(url: &str) -> PoolConfig {
+    let (url, password) = split_password(url);
     PoolConfig {
-        url: dev_url(url),
+        url: dev_url(&url),
+        password: password.map(|p| {
+            let r = db_secret();
+            secrets().set(&r, &p);
+            r
+        }),
         tls: InternalTls {
             allow_plaintext: true,
             ..InternalTls::default()
@@ -38,6 +51,102 @@ pub fn dev_pool_config(url: &str) -> PoolConfig {
         profile: Profile::Dev,
         ..PoolConfig::default()
     }
+}
+
+/// Ссылка на пароль тестовой БД в [`secrets`].
+pub const DB_SECRET: &str = "test/db#password";
+
+/// [`DB_SECRET`] как ссылка.
+pub fn db_secret() -> SecretRef {
+    DB_SECRET.parse().expect("ссылка")
+}
+
+/// Адрес без пароля и пароль (с раскрытыми `%XX`), если он был в `user:password@`.
+pub fn split_password(url: &str) -> (String, Option<String>) {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return (url.to_owned(), None);
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+        return (url.to_owned(), None);
+    };
+    let Some((user, password)) = userinfo.split_once(':') else {
+        return (url.to_owned(), None);
+    };
+    (
+        format!("{scheme}://{user}@{host}{tail}"),
+        Some(percent_decode(password)),
+    )
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(b) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).expect("utf-8")
+}
+
+/// Хранилище секретов тестов (до `MemSecretStore` из tp-testkit, KIT-06): значения из кода теста, отзыв,
+/// отказ хранилища целиком.
+#[derive(Debug, Default)]
+pub struct MemSecrets {
+    values: Mutex<HashMap<SecretRef, String>>,
+    unavailable: AtomicBool,
+}
+
+impl MemSecrets {
+    /// Задаёт значение секрета.
+    pub fn set(&self, r: &SecretRef, value: &str) {
+        self.values
+            .lock()
+            .expect("lock")
+            .insert(r.clone(), value.to_owned());
+    }
+
+    /// Отзывает секрет: дальше — `NotFound`.
+    pub fn revoke(&self, r: &SecretRef) {
+        self.values.lock().expect("lock").remove(r);
+    }
+
+    /// Хранилище недоступно (запечатано): все чтения — `Unavailable`.
+    pub fn set_unavailable(&self, on: bool) {
+        self.unavailable.store(on, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl SecretStore for MemSecrets {
+    async fn get(&self, r: &SecretRef) -> tp_contracts::Result<Secret> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(tp_contracts::Error::UNAVAILABLE);
+        }
+        self.values
+            .lock()
+            .expect("lock")
+            .get(r)
+            .map(Secret::new)
+            .ok_or(tp_contracts::Error::NotFound)
+    }
+}
+
+/// Общее хранилище секретов тестов процесса.
+pub fn secrets() -> Arc<MemSecrets> {
+    static STORE: OnceLock<Arc<MemSecrets>> = OnceLock::new();
+    STORE.get_or_init(Arc::default).clone()
 }
 
 /// Пул к тестовой БД с применённой схемой.

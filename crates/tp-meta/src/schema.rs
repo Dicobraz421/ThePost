@@ -13,6 +13,11 @@ use tp_contracts::{Error, Result, TenantId};
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "schema", include_str!("../migrations/0001_schema.sql")),
     (2, "nodes", include_str!("../migrations/0002_nodes.sql")),
+    (
+        3,
+        "shard credentials",
+        include_str!("../migrations/0003_shard_credentials.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
