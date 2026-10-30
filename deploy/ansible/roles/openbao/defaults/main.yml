@@ -1,0 +1,45 @@
+# Роль openbao: хранилище секретов The Post на ВМ (SMB, Enterprise-ВМ) — Raft, TLS, автоматическое распечатывание,
+# политика и вход AppRole thepost. Описание — deploy/README.md.
+---
+openbao_version: "2.7.2"
+openbao_arch: "{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+openbao_package_ext: "{{ 'deb' if ansible_os_family == 'Debian' else 'rpm' }}"
+openbao_release_url: "https://github.com/openbao/openbao/releases/download/v{{ openbao_version }}"
+openbao_package_url: >-
+  {{ openbao_release_url }}/openbao_{{ openbao_version }}_linux_{{ openbao_arch }}.{{ openbao_package_ext }}
+# Проверка пакета по checksums.txt релиза; своя зеркальная копия — "sha256:<сумма>".
+openbao_package_checksum: "sha256:{{ openbao_release_url }}/checksums.txt"
+openbao_service: openbao
+openbao_user: openbao
+openbao_config_dir: /etc/openbao
+openbao_data_dir: /opt/openbao/data
+
+# Адрес API для узлов thepost и для самой роли; имя — в SAN сертификата.
+openbao_api_addr: "https://{{ ansible_fqdn }}:8200"
+openbao_listen_address: "0.0.0.0:8200"
+openbao_cluster_address: "0.0.0.0:8201"
+# TLS обязателен: PEM на управляющей машине (ACME или свой CA) копируются в {{ openbao_config_dir }}/tls.
+openbao_tls_cert_src: ""
+openbao_tls_key_src: ""
+openbao_tls_ca_src: ""
+
+# Распечатывание после перезапуска (решение владельца 2026-10-30): автоматическое.
+#   pkcs11 — TPM или HSM через PKCS#11; awskms, gcpckms, azurekeyvault, ocikms, transit — KMS (параметры —
+#   openbao_seal_options, имена как в документации OpenBao); static — ключ в файле (по умолчанию, когда нет ни
+#   TPM/HSM, ни KMS; thepost doctor предупреждает); shamir — ручной ввод ключей после каждого перезапуска.
+openbao_seal: static
+openbao_seal_options: {}
+openbao_static_key_file: "{{ openbao_config_dir }}/unseal.key"
+
+# Результат bao operator init (ключи восстановления, root-токен) — только root на этой ВМ; перенести в надёжное место.
+openbao_init_file: /root/openbao-init.json
+openbao_recovery_shares: 1
+openbao_recovery_threshold: 1
+# Токен администратора для настройки; пусто — root-токен из openbao_init_file.
+openbao_admin_token: ""
+
+# AppRole thepost: role_id — в каталоге конфигурации thepost, secret_id — для LoadCredential (thepost.service).
+openbao_thepost_role_id_file: /etc/thepost/openbao/role_id
+openbao_thepost_secret_id_file: /etc/thepost/credentials/openbao-secret-id
+openbao_thepost_token_ttl: 1h
+openbao_thepost_token_max_ttl: 24h

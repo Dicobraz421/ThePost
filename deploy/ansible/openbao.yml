@@ -1,0 +1,8 @@
+# Хранилище секретов The Post на ВМ: ansible-playbook -i <инвентарь> deploy/ansible/openbao.yml
+# Переменные — deploy/ansible/roles/openbao/defaults/main.yml; группа инвентаря — openbao.
+---
+- name: OpenBao for The Post
+  hosts: openbao
+  become: true
+  roles:
+    - openbao

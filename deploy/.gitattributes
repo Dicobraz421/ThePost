@@ -1,0 +1,4 @@
+# Скрипты, конфигурация OpenBao и шаблоны монтируются или копируются в Linux — только LF.
+*.sh text eol=lf
+*.hcl text eol=lf
+*.j2 text eol=lf
