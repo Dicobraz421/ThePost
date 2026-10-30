@@ -11,7 +11,8 @@ manual: no
 ## Сделать
 - Пул sqlx из конфигурации; режим совместимости с PgBouncer transaction; проверки для doctor: версия ≥16,
 - synchronous_standby_names (Enterprise), max_connections, часовой пояс UTC;
-- транзакция в контексте организации: `with_tenant(tenant, |tx| …)` выполняет SET LOCAL app.tenant_id.
+- транзакция в контексте организации: `with_tenant(tenant, |tx| …)` выполняет SET LOCAL app.tenant_id;
+- проверка doctor: роль приложения не суперпользователь и без BYPASSRLS (иначе RLS не действует).
 
 ## Приёмка
 - Тест: проверки возвращают структурированный отчёт.

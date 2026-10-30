@@ -189,8 +189,13 @@ pub trait MailboxStore: Send + Sync + 'static {
         name: &str,
     ) -> Result<()>;
 
-    /// Удаляет папку (письма — в корзину); системные папки удалять нельзя — `Error::Forbidden`.
-    async fn delete(&self, scope: AccountScope, id: MailboxId) -> Result<()>;
+    /// Удаляет папку (письма — в корзину, SRS 4.7); системные папки удалять нельзя — `Error::Forbidden`.
+    ///
+    /// У папки есть вложенные и `cascade = false` — `Error::Conflict`: клиент (IMAP, JMAP `mailboxHasChild`,
+    /// веб-интерфейс, Admin API) предупреждает пользователя и после подтверждения повторяет вызов
+    /// с `cascade = true`. Тогда удаляется всё поддерево одной транзакцией, письма всех его папок — в корзину;
+    /// системная папка в поддереве — `Error::Forbidden`, ничего не удаляется.
+    async fn delete(&self, scope: AccountScope, id: MailboxId, cascade: bool) -> Result<()>;
 
     /// Подписка IMAP.
     async fn set_subscribed(&self, scope: AccountScope, id: MailboxId, on: bool) -> Result<()>;
@@ -368,7 +373,8 @@ pub struct Message {
 /// Результат вставки, копирования, переноса.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inserted {
-    /// Новый идентификатор.
+    /// Идентификатор письма в папке назначения: новый у `insert`, `copy`, `move_to`;
+    /// у `restore` — прежний (корзина сохраняет `MessageId`).
     pub id: MessageId,
     /// Новый UID в папке назначения.
     pub uid: Uid,
@@ -450,10 +456,12 @@ pub trait MessageStore: Send + Sync + 'static {
         to: MailboxId,
     ) -> Result<Vec<Inserted>>;
 
-    /// Переносит письма в корзину (SRS 4.7); ссылки на объекты сохраняются.
+    /// Переносит письма в корзину (SRS 4.7): `MessageId` сохраняется, меняются папка и UID;
+    /// ссылки на объекты сохраняются. Отсутствующие и уже лежащие в корзине письма пропускаются.
     async fn to_trash(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq>;
 
-    /// Восстанавливает письма из корзины в исходные папки.
+    /// Восстанавливает письма из корзины в исходные папки (папки нет — во «Входящие») с тем же `MessageId`
+    /// и новым UID. Письмо не в корзине — `Error::Invalid`.
     async fn restore(&self, scope: AccountScope, ids: &[MessageId]) -> Result<Vec<Inserted>>;
 
     /// Окончательно удаляет письма и уменьшает счётчики ссылок объектов (SRS 3.4, удаление шаг 2).
