@@ -116,8 +116,12 @@ pub trait BlobStore: Send + Sync + 'static {
     async fn put(&self, key: &BlobKey, data: Bytes) -> Result<()>;
 
     /// Записывает объект из потока; объект становится видимым только после полной записи.
-    async fn put_stream(&self, key: &BlobKey, data: ByteStream, size_hint: Option<u64>)
-    -> Result<()>;
+    async fn put_stream(
+        &self,
+        key: &BlobKey,
+        data: ByteStream,
+        size_hint: Option<u64>,
+    ) -> Result<()>;
 
     /// Читает объект или диапазон байтов. Отсутствие — `Error::NotFound`.
     async fn get(&self, key: &BlobKey, range: Option<Range<u64>>) -> Result<ByteStream>;
