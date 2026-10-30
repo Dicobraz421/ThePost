@@ -6,8 +6,9 @@
 
 pub mod accounts;
 pub mod blob_index;
-mod changelog;
+pub mod changelog;
 pub mod mailboxes;
+pub mod messages;
 pub mod schema;
 
 use std::sync::Arc;
