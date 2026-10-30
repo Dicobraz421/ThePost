@@ -20,6 +20,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tp_contracts::Error;
+use tp_contracts::config::duration;
 use tp_contracts::role::CancellationToken;
 
 /// Секция `tls`.
@@ -32,8 +33,10 @@ pub struct TlsConfig {
     pub key_file: PathBuf,
     /// Минимальная версия TLS для клиентского доступа.
     pub min_version: TlsVersion,
-    /// Период проверки изменения файлов, мс; 0 — только по новой версии секции и по запросу.
-    pub reload_interval_ms: u64,
+    /// Период проверки изменения файлов (`1m`); `0s` — только по новой версии секции и по запросу.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub reload_interval: Duration,
 }
 
 impl Default for TlsConfig {
@@ -42,7 +45,7 @@ impl Default for TlsConfig {
             cert_file: PathBuf::from("/etc/thepost/tls/fullchain.pem"),
             key_file: PathBuf::from("/etc/thepost/tls/privkey.pem"),
             min_version: TlsVersion::Tls13,
-            reload_interval_ms: 60_000,
+            reload_interval: Duration::from_secs(60),
         }
     }
 }
@@ -170,21 +173,21 @@ impl TlsCerts {
         Ok(true)
     }
 
-    /// Проверяет файлы каждые `reload_interval_ms` до сигнала остановки; ошибки пишет в лог.
+    /// Проверяет файлы каждые `reload_interval` до сигнала остановки; ошибки пишет в лог.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
         loop {
-            let interval = self.config().reload_interval_ms;
-            let wait = if interval == 0 {
-                // Опрос выключен: период могут включить новой версией секции.
+            let interval = self.config().reload_interval;
+            // Опрос выключен: период могут включить новой версией секции.
+            let wait = if interval.is_zero() {
                 Duration::from_secs(60)
             } else {
-                Duration::from_millis(interval)
+                interval
             };
             tokio::select! {
                 () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(wait) => {}
             }
-            if interval == 0 {
+            if interval.is_zero() {
                 continue;
             }
             match self.reload_if_changed().await {
@@ -270,7 +273,7 @@ pub(crate) fn read_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, Tl
     Ok(chain)
 }
 
-fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
+pub(crate) fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
     let io = |source| TlsError::Io {
         path: path.to_owned(),
         source,
@@ -460,5 +463,10 @@ pub(crate) mod tests {
         assert_eq!(cfg.cert_file, PathBuf::from("/x/c.pem"));
         assert_eq!(cfg.key_file, TlsConfig::default().key_file);
         assert!(serde_yaml_ng::from_str::<TlsConfig>("min_version: \"1.1\"").is_err());
+        assert_eq!(cfg.reload_interval, Duration::from_secs(60));
+        let off: TlsConfig = serde_yaml_ng::from_str("reload_interval: 0s").expect("0s");
+        assert!(off.reload_interval.is_zero());
+        assert!(serde_yaml_ng::from_str::<TlsConfig>("reload_interval: 60000").is_err());
+        assert!(serde_yaml_ng::from_str::<TlsConfig>("reload_interval_ms: 60000").is_err());
     }
 }

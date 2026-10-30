@@ -37,8 +37,10 @@ use crate::telemetry::Metrics;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// Время на завершение текущей работы ролей после сигнала остановки, мс; затем задачи отменяются.
-    pub drain_deadline_ms: u64,
+    /// Время на завершение текущей работы ролей после сигнала остановки (`30s`); затем задачи отменяются.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub drain_deadline: Duration,
     /// Перезапуск упавшей роли внутри процесса.
     pub restart: RestartConfig,
     /// Доля памяти узла под кэши всех включённых ролей, %. Делится поровну между ролями. Требует перезапуска.
@@ -49,28 +51,23 @@ pub struct RuntimeConfig {
     pub db_pool_max: u32,
     /// Явные лимиты отдельных ролей вместо рассчитанных. Требует перезапуска.
     pub limits: BTreeMap<Role, RoleLimitsOverride>,
-    /// Период обновления метрики RSS процесса, мс; 0 — метрика не обновляется.
-    pub rss_interval_ms: u64,
+    /// Период обновления метрики RSS процесса (`15s`); `0s` — метрика не обновляется.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub rss_interval: Duration,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            drain_deadline_ms: 30_000,
+            drain_deadline: Duration::from_secs(30),
             restart: RestartConfig::default(),
             cache_memory_percent: 25,
             db_pool_per_cpu: 4,
             db_pool_max: 64,
             limits: BTreeMap::new(),
-            rss_interval_ms: 15_000,
+            rss_interval: Duration::from_secs(15),
         }
-    }
-}
-
-impl RuntimeConfig {
-    /// `drain_deadline_ms` как `Duration`.
-    pub fn drain_deadline(&self) -> Duration {
-        Duration::from_millis(self.drain_deadline_ms)
     }
 }
 
@@ -277,7 +274,7 @@ impl Roles {
         }
     }
 
-    /// Новые `runtime.restart` и `runtime.drain_deadline_ms` применяются на ходу из перечитанной конфигурации.
+    /// Новые `runtime.restart` и `runtime.drain_deadline` применяются на ходу из перечитанной конфигурации.
     pub fn with_updates(mut self, rx: watch::Receiver<Arc<Config>>) -> Self {
         self.updates = Some(rx);
         self
@@ -349,7 +346,7 @@ impl Roles {
             let id = slot.spawn(
                 &mut tasks,
                 &role_shutdown,
-                cfg.drain_deadline(),
+                cfg.drain_deadline,
                 Duration::ZERO,
             );
             ids.insert(id, slots.len());
@@ -366,7 +363,7 @@ impl Roles {
                 new = config_changed(&mut updates) => {
                     if let Some(new) = new {
                         cfg.restart = new.restart.clone();
-                        cfg.drain_deadline_ms = new.drain_deadline_ms;
+                        cfg.drain_deadline = new.drain_deadline;
                     }
                 }
                 done = tasks.join_next_with_id() => {
@@ -395,14 +392,14 @@ impl Roles {
                         .get_or_create(&vec![("role".to_owned(), slot.name.clone())])
                         .inc();
                     *report.restarts.entry(slot.name.clone()).or_default() += 1;
-                    let id = slot.spawn(&mut tasks, &role_shutdown, cfg.drain_deadline(), delay);
+                    let id = slot.spawn(&mut tasks, &role_shutdown, cfg.drain_deadline, delay);
                     ids.insert(id, idx);
                     running.set(tasks.len() as i64);
                 }
             }
         }
 
-        let deadline = cfg.drain_deadline();
+        let deadline = cfg.drain_deadline;
         tracing::info!(deadline_ms = deadline.as_millis() as u64, "roles draining");
         health.drain();
         for slot in &slots {
@@ -518,12 +515,12 @@ impl RssGauge {
         self.0.get()
     }
 
-    /// Обновляет метрику каждые `cfg.rss_interval_ms` до сигнала остановки.
+    /// Обновляет метрику каждые `cfg.rss_interval` до сигнала остановки.
     pub async fn run(self, cfg: &RuntimeConfig, shutdown: CancellationToken) {
-        if cfg.rss_interval_ms == 0 {
+        if cfg.rss_interval.is_zero() {
             return;
         }
-        let mut tick = tokio::time::interval(Duration::from_millis(cfg.rss_interval_ms));
+        let mut tick = tokio::time::interval(cfg.rss_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -668,7 +665,7 @@ mod tests {
 
     fn runtime_with(drain_ms: u64, restart: RestartConfig, roles: &[Role]) -> Roles {
         let cfg = RuntimeConfig {
-            drain_deadline_ms: drain_ms,
+            drain_deadline: Duration::from_millis(drain_ms),
             restart,
             ..RuntimeConfig::default()
         };
@@ -725,13 +722,18 @@ mod tests {
     #[test]
     fn config_parses_role_overrides() {
         let cfg: RuntimeConfig = serde_yaml_ng::from_str(
-            "drain_deadline_ms: 500\nlimits:\n  search: { cache_bytes: 1024 }\n",
+            "drain_deadline: 500ms\nlimits:\n  search: { cache_bytes: 1024 }\n",
         )
         .expect("parse");
-        assert_eq!(cfg.drain_deadline(), Duration::from_millis(500));
+        assert_eq!(cfg.drain_deadline, Duration::from_millis(500));
         assert_eq!(cfg.limits[&Role::Search].cache_bytes, Some(1024));
         assert_eq!(cfg.cache_memory_percent, 25);
         assert!(serde_yaml_ng::from_str::<RuntimeConfig>("limits: { bogus: {} }").is_err());
+        assert_eq!(cfg.rss_interval, Duration::from_secs(15));
+        let off: RuntimeConfig = serde_yaml_ng::from_str("rss_interval: 0s").expect("0s");
+        assert!(off.rss_interval.is_zero());
+        assert!(serde_yaml_ng::from_str::<RuntimeConfig>("drain_deadline: 500").is_err());
+        assert!(serde_yaml_ng::from_str::<RuntimeConfig>("drain_deadline_ms: 500").is_err());
     }
 
     #[test]

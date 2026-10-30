@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::server::TlsStream;
 use tp_contracts::Error;
+use tp_contracts::config::duration;
 
 use crate::tls::TlsCerts;
 
@@ -40,16 +41,17 @@ pub struct EndpointConfig {
     #[serde(default)]
     #[schemars(with = "Vec<String>")]
     pub trusted_proxies: Vec<Cidr>,
-    /// Время на заголовок PROXY и TLS-рукопожатие, мс.
-    #[serde(default = "default_handshake_timeout_ms")]
-    pub handshake_timeout_ms: u64,
+    /// Время на заголовок PROXY и TLS-рукопожатие (`10s`).
+    #[serde(default = "default_handshake_timeout", with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub handshake_timeout: Duration,
     /// Длина очереди принятых соединений. Требует перезапуска.
     #[serde(default = "default_backlog")]
     pub backlog: u32,
 }
 
-fn default_handshake_timeout_ms() -> u64 {
-    10_000
+fn default_handshake_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 fn default_backlog() -> u32 {
@@ -64,13 +66,9 @@ impl EndpointConfig {
             implicit_tls: false,
             proxy_protocol: false,
             trusted_proxies: Vec::new(),
-            handshake_timeout_ms: default_handshake_timeout_ms(),
+            handshake_timeout: default_handshake_timeout(),
             backlog: default_backlog(),
         }
-    }
-
-    fn handshake_timeout(&self) -> Duration {
-        Duration::from_millis(self.handshake_timeout_ms)
     }
 
     fn expects_proxy_header(&self, peer: IpAddr) -> bool {
@@ -277,9 +275,9 @@ impl Incoming {
         self.peer
     }
 
-    /// Читает заголовок PROXY (если ожидается) и выполняет неявный TLS за `handshake_timeout_ms`.
+    /// Читает заголовок PROXY (если ожидается) и выполняет неявный TLS за `handshake_timeout`.
     pub async fn establish(self) -> tp_contracts::Result<Conn> {
-        let timeout = self.cfg.handshake_timeout();
+        let timeout = self.cfg.handshake_timeout;
         Ok(tokio::time::timeout(timeout, self.establish_inner())
             .await
             .map_err(|_| ListenError::Timeout)??)
@@ -303,7 +301,7 @@ impl Incoming {
             info,
             stream: Stream::Plain(self.tcp),
             tls: self.tls,
-            timeout: self.cfg.handshake_timeout(),
+            timeout: self.cfg.handshake_timeout,
         };
         if self.cfg.implicit_tls {
             return conn.upgrade().await;
@@ -565,7 +563,7 @@ mod tests {
         assert_eq!(&payload, b"plain");
 
         cfg.trusted_proxies = vec!["127.0.0.1".parse().expect("cidr")];
-        cfg.handshake_timeout_ms = 50;
+        cfg.handshake_timeout = Duration::from_millis(50);
         let (l, at) = listener(cfg, None).await;
         let server =
             tokio::spawn(async move { l.accept().await.expect("accept").establish().await });
@@ -695,7 +693,18 @@ mod tests {
         .expect("parse");
         assert!(cfg.implicit_tls && cfg.proxy_protocol);
         assert_eq!(cfg.trusted_proxies[0].to_string(), "10.0.0.0/8");
-        assert_eq!(cfg.handshake_timeout_ms, 10_000);
+        assert_eq!(cfg.handshake_timeout, Duration::from_secs(10));
+        let fast: EndpointConfig =
+            serde_yaml_ng::from_str("listen: \"0.0.0.0:1\"\nhandshake_timeout: 250ms")
+                .expect("parse");
+        assert_eq!(fast.handshake_timeout, Duration::from_millis(250));
+        for bad in ["handshake_timeout: 10000", "handshake_timeout_ms: 10000"] {
+            let text = format!("listen: \"0.0.0.0:1\"\n{bad}");
+            assert!(
+                serde_yaml_ng::from_str::<EndpointConfig>(&text).is_err(),
+                "{bad}"
+            );
+        }
         assert!(
             serde_yaml_ng::from_str::<EndpointConfig>("implicit_tls: true").is_err(),
             "listen is required"
