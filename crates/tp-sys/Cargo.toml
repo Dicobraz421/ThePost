@@ -14,6 +14,6 @@ workspace = true
 schemars.workspace = true
 nix = { workspace = true, features = ["sched"] }
 seccompiler.workspace = true
-socket2.workspace = true
+socket2 = { workspace = true, features = ["all"] }
 thiserror.workspace = true
 tokio.workspace = true
