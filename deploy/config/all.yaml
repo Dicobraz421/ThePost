@@ -1,0 +1,14 @@
+# Пресет all — профиль SMB: все роли в одном процессе на одной ВМ (SRS 1.2).
+# Обязательны три параметра (SRS 5.5); остальное — по умолчанию или от ресурсов узла.
+# Полный перечень секций: thepost config schema. Файл: /etc/thepost/config.yaml.
+
+domain: example.ru
+
+database:
+  url: postgres://thepost:CHANGE_ME@localhost:5432/thepost
+
+# Локальная POSIX-директория; шина событий и кэш — в процессе.
+blob:
+  url: file:///var/lib/thepost/blob
+
+roles: [all]
