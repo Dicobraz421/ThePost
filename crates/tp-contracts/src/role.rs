@@ -349,7 +349,10 @@ mod tests {
             serde_json::from_str(r#"["mailbox", "imap"]"#).expect("parse");
         assert_eq!(
             entries,
-            [RoleEntry::Preset(RolePreset::Mailbox), RoleEntry::Role(Role::Imap)]
+            [
+                RoleEntry::Preset(RolePreset::Mailbox),
+                RoleEntry::Role(Role::Imap)
+            ]
         );
         assert!(serde_json::from_str::<RoleEntry>(r#""bogus""#).is_err());
     }

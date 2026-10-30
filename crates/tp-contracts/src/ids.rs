@@ -198,8 +198,8 @@ impl FromStr for BlobHash {
             return Err(Error::invalid("BlobHash: expected 64 hex chars"));
         }
         let mut out = [0u8; 32];
-        for (i, pair) in s.chunks_exact(2).enumerate() {
-            match (nibble(pair[0]), nibble(pair[1])) {
+        for (i, [hi, lo]) in s.as_chunks::<2>().0.iter().enumerate() {
+            match (nibble(*hi), nibble(*lo)) {
                 (Some(h), Some(l)) => out[i] = (h << 4) | l,
                 _ => return Err(Error::invalid("BlobHash: not hex")),
             }
@@ -266,7 +266,14 @@ impl BlobKey {
 impl fmt::Display for BlobKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let hash = self.hash.to_string();
-        write!(f, "{}/{}/{}/{}", self.tenant, &hash[..2], hash, self.generation)
+        write!(
+            f,
+            "{}/{}/{}/{}",
+            self.tenant,
+            &hash[..2],
+            hash,
+            self.generation
+        )
     }
 }
 
@@ -324,7 +331,10 @@ mod tests {
         let h = hash();
         let s = h.to_string();
         assert_eq!(s.len(), 64);
-        assert!(s.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            s.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         assert_eq!(s.parse::<BlobHash>(), Ok(h));
         assert_eq!(s.to_uppercase().parse::<BlobHash>(), Ok(h));
         assert_eq!(roundtrip(&h), format!("\"{s}\""));
