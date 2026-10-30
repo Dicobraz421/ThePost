@@ -4357,8 +4357,15 @@ name = "thepost"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "bytes",
  "clap",
+ "futures",
  "schemars",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
  "tokio",
  "tp-admin",
  "tp-auth",
@@ -4374,6 +4381,7 @@ dependencies = [
  "tp-search",
  "tp-sieve",
  "tp-smtp",
+ "tp-sys",
  "tp-testkit",
  "tracing",
 ]
