@@ -4,9 +4,11 @@
 //! короткая транзакция в контексте организации ([`schema::begin`]); к BLOB и сети внутри транзакций
 //! реализация не обращается.
 
+pub mod blob_index;
 pub mod schema;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::PgPool;
 use tp_contracts::Result;
@@ -16,12 +18,16 @@ use tp_contracts::Result;
 pub struct MetaConfig {
     /// Применять миграции схемы ядра при старте ([`PgMeta::open`]). Требует перезапуска.
     pub migrate_on_start: bool,
+    /// Срок хранения надгробия BLOB после `finalize_delete`: загрузка, начатая до удаления объекта,
+    /// получит `Bumped`. Больше максимальной длительности загрузки объекта (SRS 3.4).
+    pub blob_tombstone_ttl: Duration,
 }
 
 impl Default for MetaConfig {
     fn default() -> Self {
         Self {
             migrate_on_start: true,
+            blob_tombstone_ttl: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -30,8 +36,6 @@ impl Default for MetaConfig {
 #[derive(Debug, Clone)]
 pub struct PgMeta {
     pool: PgPool,
-    // Читается реализациями хранилищ.
-    #[allow(dead_code)]
     cfg: Arc<MetaConfig>,
 }
 
