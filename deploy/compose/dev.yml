@@ -1,15 +1,129 @@
 # Зависимости The Post для разработки и эталон SMB (SRS 1.2). Описание — deploy/README.md.
-#   dev (по умолчанию, см. .env): PostgreSQL 16, SeaweedFS (S3), Valkey, Rspamd — для интеграционных тестов.
-#   smb: thepost (roles: all, локальный BLOB, шина в процессе) + PostgreSQL + Rspamd.
+#   tls (по умолчанию, см. .env): PostgreSQL 16, SeaweedFS (S3), Valkey — только TLS-подключения,
+#     самоподписанный CA (tls-init, tls/gen-certs.sh); бакет thepost-test.
+#   dev: те же зависимости и Rspamd с открытыми каналами — для интеграционных тестов; бакет thepost-test.
+#     docker compose -f deploy/compose/dev.yml --profile dev up -d
+#   smb: thepost (roles: all, локальный BLOB, шина в процессе) + PostgreSQL (TLS) + Rspamd.
 #     docker compose -f deploy/compose/dev.yml --profile smb up -d --build
-# Пароли и ключи — только для локальной разработки.
+# Профили tls и dev публикуют одни и те же порты хоста — запускается один из них.
+# Пароли, ключи и CA — только для локальной разработки.
 
 name: thepost
 
 services:
+  # --- Профиль tls (по умолчанию) и smb: только TLS ---
+
+  tls-init:
+    image: postgres:16
+    profiles: [tls, smb]
+    entrypoint: ["sh", "/gen-certs.sh", "/certs", "/out"]
+    restart: "no"
+    volumes:
+      - ./tls/gen-certs.sh:/gen-certs.sh:ro
+      - ./tls:/out
+      - tls:/certs
+
+  postgres-tls:
+    image: postgres:16
+    profiles: [tls, smb]
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/server.pem
+      - -c
+      - ssl_key_file=/certs/server.key
+      - -c
+      - ssl_ca_file=/certs/ca.pem
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "${TP_PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata-tls:/var/lib/postgresql/data
+      - tls:/certs:ro
+      - ./tls/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  seaweedfs-tls:
+    image: chrislusf/seaweedfs:3.80
+    profiles: [tls]
+    entrypoint: ["sh", "/seaweedfs-start.sh"]
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    command:
+      - server
+      - -dir=/data
+      - -ip.bind=0.0.0.0
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/s3.json
+      - -s3.cert.file=/certs/server.pem
+      - -s3.key.file=/certs/server.key
+    ports:
+      - "${TP_S3_PORT:-8333}:8333"
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+      - ./seaweedfs-start.sh:/seaweedfs-start.sh:ro
+      - s3data-tls:/data
+      - tls:/certs:ro
+    healthcheck:
+      # ssl_client busybox с этим TLS не работает — порт и метка готовности (seaweedfs-start.sh).
+      test: ["CMD-SHELL", "test -f /tmp/ready && nc -z 127.0.0.1 8333"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  valkey-tls:
+    image: valkey/valkey:8.1
+    profiles: [tls]
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    command:
+      - valkey-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6379"
+      - --tls-cert-file
+      - /certs/server.pem
+      - --tls-key-file
+      - /certs/server.key
+      - --tls-ca-cert-file
+      - /certs/ca.pem
+      - --tls-auth-clients
+      - "no"
+    ports:
+      - "${TP_VALKEY_PORT:-6379}:6379"
+    volumes:
+      - tls:/certs:ro
+    healthcheck:
+      test: ["CMD", "valkey-cli", "--tls", "--cacert", "/certs/ca.pem", "-h", "localhost", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # --- Профиль dev: открытые каналы (клиенту — явный allow_plaintext) ---
+
   postgres:
     image: postgres:16
-    profiles: [dev, smb]
+    profiles: [dev]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -27,14 +141,16 @@ services:
   seaweedfs:
     image: chrislusf/seaweedfs:3.80
     profiles: [dev]
+    entrypoint: ["sh", "/seaweedfs-start.sh"]
     command: ["server", "-dir=/data", "-ip.bind=0.0.0.0", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json"]
     ports:
       - "${TP_S3_PORT:-8333}:8333"
     volumes:
       - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+      - ./seaweedfs-start.sh:/seaweedfs-start.sh:ro
       - s3data:/data
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
+      test: ["CMD-SHELL", "test -f /tmp/ready && wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
       interval: 3s
       timeout: 3s
       retries: 30
@@ -67,12 +183,13 @@ services:
     image: thepost:dev
     profiles: [smb]
     depends_on:
-      postgres:
+      postgres-tls:
         condition: service_healthy
       rspamd:
         condition: service_started
     volumes:
       - ./thepost-smb.yaml:/etc/thepost/config.yaml:ro
+      - tls:/etc/thepost/tls:ro
       - tpdata:/var/lib/thepost
     ports:
       - "${TP_SMTP_PORT:-25}:25"
@@ -85,5 +202,8 @@ services:
 
 volumes:
   pgdata:
+  pgdata-tls:
   s3data:
+  s3data-tls:
+  tls:
   tpdata:
