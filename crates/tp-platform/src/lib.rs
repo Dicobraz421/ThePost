@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod listen;
+pub mod ratelimit;
 pub mod reload;
 pub mod roles;
 pub mod service_http;
@@ -10,6 +11,7 @@ pub mod tls;
 
 pub use config::{Config, Section, SectionRegistry};
 pub use listen::{Cidr, Conn, ConnInfo, EndpointConfig, Listener};
+pub use ratelimit::{RateLimitConfig, RateLimiter, Verdict};
 pub use reload::{ReloadConfig, ReloadTrigger, Reloader, SectionWatch};
 pub use roles::{RoleLimits, RoleSpec, Roles, RolesReport, RuntimeConfig};
 pub use service_http::{Health, ServiceHttpConfig};
