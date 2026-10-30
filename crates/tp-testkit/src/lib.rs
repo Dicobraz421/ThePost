@@ -5,6 +5,8 @@
 
 pub mod blob;
 pub mod infra;
+pub mod meta;
 
 pub use blob::{BlobOp, MemBlobIndex, MemBlobStore};
 pub use infra::{Clock, ManualClock, MemEventBus, MemEventLog, MemLease, SystemClock};
+pub use meta::MemMetadata;
