@@ -146,7 +146,10 @@ async fn generations_protocol() {
 
 #[tokio::test]
 async fn finalize_checks_generation_and_tombstone_expires() {
-    let Some(idx) = index(Duration::ZERO).await else {
+    // Очистка надгробий — по всем организациям: срок 0 удалил бы надгробия параллельных тестов
+    // (generations_protocol), поэтому срок короткий, но больше длительности их шагов.
+    let ttl = Duration::from_secs(2);
+    let Some(idx) = index(ttl).await else {
         return;
     };
     let tenant = common::tenant(idx.pool()).await;
@@ -178,8 +181,8 @@ async fn finalize_checks_generation_and_tombstone_expires() {
         .expect("release");
     assert!(idx.mark_deleting(&key(1), future()).await.expect("mark"));
     assert!(idx.finalize_delete(&key(1)).await.expect("finalize"));
-    // Срок надгробия 0: удаляется при следующем gc_candidates, поколения начинаются заново.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Срок надгробия истёк: удаляется при следующем gc_candidates, поколения начинаются заново.
+    tokio::time::sleep(ttl + Duration::from_millis(100)).await;
     idx.gc_candidates(future(), 100_000).await.expect("gc");
     assert_eq!(
         idx.acquire(tenant, &hash, 1).await.expect("acquire"),
