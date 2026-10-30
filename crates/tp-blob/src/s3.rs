@@ -3,9 +3,14 @@
 //! Объекты от `multipart_threshold_bytes` загружаются multipart: части пишутся по мере поступления
 //! потока, объект становится видимым только после завершения загрузки; при ошибке загрузка
 //! отменяется. Повторы с экспоненциальным backoff и таймауты — средствами клиента `object_store`.
+//!
+//! Канал до S3 — только `https://` с проверкой сертификата (CONTRACTS.md#Internal TLS): корни — из
+//! `tls.ca_file` или системные. `http://` — только профиль dev с `tls.allow_plaintext`, с предупреждением
+//! в лог при каждом создании клиента; в остальных случаях — ошибка конфигурации.
 
 use std::fmt;
 use std::ops::Range;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -16,12 +21,13 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::prefix::PrefixStore;
 use object_store::{
-    BackoffConfig, ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload,
+    BackoffConfig, Certificate, ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload,
     RetryConfig, WriteMultipart,
 };
 use schemars::JsonSchema;
 use time::OffsetDateTime;
 use tp_contracts::blob::{BlobStore, ByteStream, ObjectEntry, ObjectStream};
+use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{BlobKey, Error, Result};
 
 use crate::check_raw_path;
@@ -30,7 +36,7 @@ use crate::check_raw_path;
 /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, роль экземпляра).
 #[derive(Clone, PartialEq, Eq, JsonSchema)]
 pub struct S3Config {
-    /// Адрес S3 API (`http://seaweedfs:8333`); `None` — AWS по региону.
+    /// Адрес S3 API (`https://seaweedfs:8333`); `None` — AWS по региону (https).
     pub endpoint: Option<String>,
     /// Бакет.
     pub bucket: String,
@@ -44,8 +50,9 @@ pub struct S3Config {
     pub secret_access_key: Option<String>,
     /// Адресация path-style (`endpoint/bucket/key`) — нужна SeaweedFS и MinIO.
     pub path_style: bool,
-    /// Разрешить HTTP без TLS.
-    pub allow_http: bool,
+    /// TLS канала до S3: `ca_file` — корни для проверки сервера, `allow_plaintext` — `http://` в профиле dev.
+    /// Клиентский сертификат (mTLS) клиент S3 не поддерживает; `server_name` — только равный узлу адреса.
+    pub tls: InternalTls,
     /// Объекты не меньше этого размера загружаются multipart, байт.
     pub multipart_threshold_bytes: u64,
     /// Размер части multipart, байт (S3 — не меньше 5 МиБ, кроме последней).
@@ -76,7 +83,7 @@ impl Default for S3Config {
             access_key_id: None,
             secret_access_key: None,
             path_style: true,
-            allow_http: false,
+            tls: InternalTls::default(),
             multipart_threshold_bytes: 16 << 20,
             multipart_part_bytes: 8 << 20,
             multipart_concurrency: 4,
@@ -104,7 +111,7 @@ impl fmt::Debug for S3Config {
                 &self.secret_access_key.as_ref().map(|_| "***"),
             )
             .field("path_style", &self.path_style)
-            .field("allow_http", &self.allow_http)
+            .field("tls", &self.tls)
             .field("multipart_threshold_bytes", &self.multipart_threshold_bytes)
             .field("multipart_part_bytes", &self.multipart_part_bytes)
             .field("multipart_concurrency", &self.multipart_concurrency)
@@ -118,6 +125,60 @@ impl fmt::Debug for S3Config {
     }
 }
 
+impl S3Config {
+    /// Проверяет адрес и секцию TLS (`thepost config check` и запуск): `https://` с проверкой
+    /// сертификата; `http://` — только профиль dev с `tls.allow_plaintext`. Файлы не читаются.
+    pub fn check(&self, profile: Profile) -> Result<Transport> {
+        let channel = InternalChannel::S3;
+        let transport = match &self.endpoint {
+            Some(url) => self.tls.check_url(channel, url, profile)?,
+            None => {
+                self.tls.validate(channel, profile)?;
+                Transport::Tls
+            }
+        };
+        if self.tls.cert_file.is_some() || self.tls.key_file.is_some() {
+            return Err(Error::invalid(
+                "S3: tls.cert_file/tls.key_file (mTLS) are not supported by the S3 client",
+            ));
+        }
+        if let Some(name) = &self.tls.server_name {
+            // Клиент S3 проверяет сертификат по узлу из адреса; другое имя не подставить.
+            let host = self.endpoint.as_deref().and_then(url_host);
+            if host.is_none_or(|host| !host.eq_ignore_ascii_case(name)) {
+                return Err(Error::invalid(
+                    "S3: tls.server_name must match the host of endpoint",
+                ));
+            }
+        }
+        Ok(transport)
+    }
+}
+
+/// Узел из адреса `scheme://[userinfo@]host[:port][/...]`; IPv6 — без скобок.
+fn url_host(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split_once(']')?.0,
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// Корневые сертификаты из `tls.ca_file` (PEM). Блокирующий I/O: вызывается при создании клиента.
+fn read_ca(path: &FsPath) -> Result<Vec<Certificate>> {
+    let bad = |e: &dyn fmt::Display| Error::invalid(format!("S3: tls.ca_file {}: {e}", path.display()));
+    let pem = std::fs::read(path).map_err(|e| bad(&e))?;
+    let certs = Certificate::from_pem_bundle(&pem).map_err(|e| bad(&e))?;
+    // Без сертификатов проверка сервера не пройдёт ни разу — это ошибка настройки.
+    if certs.is_empty() {
+        return Err(bad(&"no PEM certificates"));
+    }
+    Ok(certs)
+}
+
 /// BlobStore поверх S3 (или любого `ObjectStore` — для тестов).
 #[derive(Debug)]
 pub struct S3Store {
@@ -126,14 +187,35 @@ pub struct S3Store {
 }
 
 impl S3Store {
-    /// Клиент S3 по конфигурации; сеть при создании не используется.
-    pub fn new(cfg: S3Config) -> Result<Self> {
+    /// Клиент S3 по конфигурации; `profile` — профиль узла (`profile` config.yaml). Адрес и секция
+    /// TLS проверяются [`S3Config::check`], `tls.ca_file` читается сразу; сеть не используется.
+    pub fn new(cfg: S3Config, profile: Profile) -> Result<Self> {
         let ms = Duration::from_millis;
+        let transport = cfg.check(profile)?;
+        let allow_http = transport == Transport::Plaintext;
+        let mut client = ClientOptions::new()
+            .with_allow_http(allow_http)
+            .with_timeout(ms(cfg.request_timeout_ms))
+            .with_connect_timeout(ms(cfg.connect_timeout_ms));
+        match transport {
+            Transport::Plaintext => {
+                tracing::warn!("{}", InternalChannel::S3.plaintext_warning());
+            }
+            Transport::Tls => {
+                if let Some(path) = &cfg.tls.ca_file {
+                    // CA из секции заменяет системные корни: доверие — только своему центру.
+                    client = client.with_no_system_certificates(true);
+                    for cert in read_ca(path)? {
+                        client = client.with_root_certificate(cert);
+                    }
+                }
+            }
+        }
         let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(&cfg.bucket)
             .with_region(&cfg.region)
             .with_virtual_hosted_style_request(!cfg.path_style)
-            .with_allow_http(cfg.allow_http)
+            .with_allow_http(allow_http)
             .with_retry(RetryConfig {
                 backoff: BackoffConfig {
                     init_backoff: ms(cfg.retry_init_backoff_ms),
@@ -143,12 +225,7 @@ impl S3Store {
                 max_retries: cfg.max_retries,
                 retry_timeout: ms(cfg.retry_timeout_ms),
             })
-            .with_client_options(
-                ClientOptions::new()
-                    .with_allow_http(cfg.allow_http)
-                    .with_timeout(ms(cfg.request_timeout_ms))
-                    .with_connect_timeout(ms(cfg.connect_timeout_ms)),
-            );
+            .with_client_options(client);
         if let Some(endpoint) = &cfg.endpoint {
             builder = builder.with_endpoint(endpoint);
         }
@@ -567,6 +644,125 @@ mod tests {
         ));
     }
 
+    fn plaintext() -> InternalTls {
+        InternalTls {
+            allow_plaintext: true,
+            ..InternalTls::default()
+        }
+    }
+
+    fn endpoint(url: &str, tls: InternalTls) -> S3Config {
+        S3Config {
+            endpoint: Some(url.into()),
+            tls,
+            ..S3Config::default()
+        }
+    }
+
+    fn invalid(res: Result<S3Store>) -> String {
+        match res {
+            Err(Error::Invalid(m)) => m,
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_outside_dev_is_config_error() {
+        let http = "http://seaweedfs:8333";
+        // Без allow_plaintext — ошибка в любом профиле, с подсказкой https://.
+        for profile in [Profile::Prod, Profile::Dev] {
+            let cfg = endpoint(http, InternalTls::default());
+            assert!(matches!(cfg.check(profile), Err(Error::Invalid(_))));
+            assert!(invalid(S3Store::new(cfg, profile)).contains("https://"));
+        }
+        // allow_plaintext вне dev — ошибка даже при https://.
+        for url in [http, "https://s3.internal"] {
+            let cfg = endpoint(url, plaintext());
+            assert!(invalid(S3Store::new(cfg, Profile::Prod)).contains("profile: dev"));
+        }
+        let no_endpoint = S3Config {
+            tls: plaintext(),
+            ..S3Config::default()
+        };
+        assert!(matches!(
+            no_endpoint.check(Profile::Prod),
+            Err(Error::Invalid(_))
+        ));
+        // Dev с allow_plaintext — открытый канал допустим.
+        let dev = endpoint(http, plaintext());
+        assert_eq!(dev.check(Profile::Dev), Ok(Transport::Plaintext));
+        assert!(S3Store::new(dev, Profile::Dev).is_ok());
+        assert!(matches!(
+            endpoint("ftp://s3", InternalTls::default()).check(Profile::Prod),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn https_with_ca_from_section() {
+        let https = "https://s3.internal:8333";
+        assert_eq!(
+            endpoint(https, InternalTls::default()).check(Profile::Prod),
+            Ok(Transport::Tls)
+        );
+        assert_eq!(S3Config::default().check(Profile::Prod), Ok(Transport::Tls));
+        assert!(S3Store::new(endpoint(https, InternalTls::default()), Profile::Prod).is_ok());
+
+        let ca = |path: &FsPath| InternalTls {
+            ca_file: Some(path.to_path_buf()),
+            ..InternalTls::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("ca.pem");
+        std::fs::write(&good, include_bytes!("testdata/ca.pem")).expect("write ca");
+        assert!(S3Store::new(endpoint(https, ca(&good)), Profile::Prod).is_ok());
+
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, b"not a certificate").expect("write");
+        assert!(invalid(S3Store::new(endpoint(https, ca(&empty)), Profile::Prod)).contains("ca_file"));
+        let missing = dir.path().join("missing.pem");
+        assert!(
+            invalid(S3Store::new(endpoint(https, ca(&missing)), Profile::Prod))
+                .contains("ca_file")
+        );
+    }
+
+    #[test]
+    fn unsupported_tls_fields() {
+        let https = "https://s3.internal:8333";
+        let mtls = InternalTls {
+            cert_file: Some("/etc/thepost/node.pem".into()),
+            key_file: Some("/etc/thepost/node.key".into()),
+            ..InternalTls::default()
+        };
+        assert!(invalid(S3Store::new(endpoint(https, mtls), Profile::Prod)).contains("mTLS"));
+
+        let name = |n: &str| InternalTls {
+            server_name: Some(n.into()),
+            ..InternalTls::default()
+        };
+        assert_eq!(
+            endpoint(https, name("S3.internal")).check(Profile::Prod),
+            Ok(Transport::Tls)
+        );
+        assert!(endpoint(https, name("other.internal")).check(Profile::Prod).is_err());
+        assert!(S3Config {
+            tls: name("s3.amazonaws.com"),
+            ..S3Config::default()
+        }
+        .check(Profile::Prod)
+        .is_err());
+    }
+
+    #[test]
+    fn hosts() {
+        assert_eq!(url_host("https://s3.internal"), Some("s3.internal"));
+        assert_eq!(url_host("https://k:s@s3:8333/b?x"), Some("s3"));
+        assert_eq!(url_host("https://[::1]:8333"), Some("::1"));
+        assert_eq!(url_host("https:///x"), None);
+        assert_eq!(url_host("s3.internal"), None);
+    }
+
     #[test]
     fn debug_hides_secret() {
         let cfg = S3Config {
@@ -583,15 +779,19 @@ mod tests {
         let Ok(endpoint) = std::env::var("TEST_S3_URL") else {
             return;
         };
-        let store = S3Store::new(S3Config {
-            endpoint: Some(endpoint),
-            bucket: std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "thepost-test".into()),
-            prefix: format!("blob-{}", std::process::id()),
-            allow_http: true,
-            multipart_threshold_bytes: 6 << 20,
-            multipart_part_bytes: 5 << 20,
-            ..S3Config::default()
-        })
+        // Стенд dev: SeaweedFS может слушать http:// — допустимо только в профиле dev.
+        let store = S3Store::new(
+            S3Config {
+                endpoint: Some(endpoint),
+                bucket: std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "thepost-test".into()),
+                prefix: format!("blob-{}", std::process::id()),
+                tls: plaintext(),
+                multipart_threshold_bytes: 6 << 20,
+                multipart_part_bytes: 5 << 20,
+                ..S3Config::default()
+            },
+            Profile::Dev,
+        )
         .expect("s3 client");
 
         let k = key(10);
