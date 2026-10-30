@@ -15,7 +15,8 @@ tp-contracts.workspace = true
 schemars.workspace = true
 async-trait.workspace = true
 futures.workspace = true
-redis.workspace = true
+redis = { workspace = true, features = ["tokio-rustls-comp"] }
+rustls.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
