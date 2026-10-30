@@ -4684,6 +4684,7 @@ name = "tp-cluster"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "redis",
  "schemars",
  "thiserror 2.0.21",
