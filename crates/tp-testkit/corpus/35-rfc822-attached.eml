@@ -1,0 +1,29 @@
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Fwd: nested
+Date: Thu, 29 Oct 2026 10:34:00 +0300
+Message-ID: <corpus-034@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="fwd-1"
+
+This is a multi-part message in MIME format.
+--fwd-1
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+See attached message.
+--fwd-1
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="fwd.eml"
+
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: =?utf-8?b?0JLQu9C+0LbQtdC90L3QvtC1INC/0LjRgdGM0LzQvg==?=
+Date: Thu, 29 Oct 2026 10:33:00 +0300
+Message-ID: <corpus-033@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Привет! Это тестовое письмо для проверки разбора кириллицы. Съешь же ещё этих мягких французских булок, да выпей чаю.
+--fwd-1--

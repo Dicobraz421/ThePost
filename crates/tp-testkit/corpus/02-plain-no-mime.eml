@@ -1,0 +1,6 @@
+From: old@example.com
+To: bob@example.org
+Subject: No MIME-Version
+Date: Thu, 29 Oct 2026 10:01:00 +0300
+
+Legacy RFC 822 message without MIME headers.

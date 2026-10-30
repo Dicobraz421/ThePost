@@ -1,0 +1,310 @@
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Many parts
+Date: Thu, 29 Oct 2026 10:44:00 +0300
+Message-ID: <corpus-044@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="many"
+
+This is a multi-part message in MIME format.
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 0
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 1
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 2
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 3
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 4
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 5
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 6
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 7
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 8
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 9
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 10
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 11
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 12
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 13
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 14
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 15
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 16
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 17
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 18
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 19
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 20
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 21
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 22
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 23
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 24
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 25
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 26
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 27
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 28
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 29
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 30
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 31
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 32
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 33
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 34
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 35
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 36
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 37
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 38
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 39
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 40
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 41
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 42
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 43
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 44
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 45
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 46
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 47
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 48
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 49
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 50
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 51
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 52
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 53
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 54
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 55
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 56
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 57
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 58
+--many
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+part 59
+--many--

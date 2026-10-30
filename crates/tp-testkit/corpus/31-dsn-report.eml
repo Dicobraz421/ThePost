@@ -1,0 +1,31 @@
+From: MAILER-DAEMON@example.com
+To: Bob <bob@example.org>
+Subject: Delivery Status Notification (Failure)
+Date: Thu, 29 Oct 2026 10:29:00 +0300
+Message-ID: <corpus-029@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/report; boundary="rep-1"; report-type=delivery-status
+
+This is a multi-part message in MIME format.
+--rep-1
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Delivery to bob@example.org failed.
+--rep-1
+Content-Type: message/delivery-status
+
+Reporting-MTA: dns; mx.example.com
+
+Final-Recipient: rfc822; bob@example.org
+Action: failed
+Status: 5.1.1
+
+--rep-1
+Content-Type: text/rfc822-headers
+
+From: alice@example.com
+To: bob@example.org
+Subject: Original
+
+--rep-1--

@@ -1,0 +1,56 @@
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Alternative + related
+Date: Thu, 29 Oct 2026 10:25:00 +0300
+Message-ID: <corpus-025@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix-7"
+
+This is a multi-part message in MIME format.
+--mix-7
+Content-Type: multipart/alternative; boundary="alt-3"
+
+This is a multi-part message in MIME format.
+--alt-3
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+The quick brown fox jumps over the lazy dog. Quarterly report attached, please review before Friday.
+--alt-3
+Content-Type: multipart/related; boundary="rel-2"
+
+This is a multi-part message in MIME format.
+--rel-2
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+<p><img src="cid:img1"></p>
+--rel-2
+Content-Type: image/png; name="img1.png"
+Content-Transfer-Encoding: base64
+Content-Disposition: inline; filename="img1.png"
+Content-ID: <img1>
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9
+awAAAABJRU5ErkJggg==
+--rel-2--
+
+--alt-3--
+
+--mix-7
+Content-Type: application/pdf; name="doc.pdf"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="doc.pdf"
+
+JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2Jq
+CjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2Jq
+CjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIg
+NzkyXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgPj4g
+Pj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA0NyA+PgpzdHJlYW0KQlQgL0YxIDEyIFRm
+IDcyIDcyMCBUZCAoUXVhcnRlcmx5IHJlcG9ydCkgVGogRVQKZW5kc3RyZWFtCmVuZG9iago1IDAg
+b2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+
+PgplbmRvYmoKeHJlZgowIDYKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4g
+CjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDExNSAwMDAwMCBuIAowMDAwMDAwMjQxIDAwMDAw
+IG4gCjAwMDAwMDAzMzggMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA2IC9Sb290IDEgMCBSID4+
+CnN0YXJ0eHJlZgo0MDgKJSVFT0YK
+--mix-7--
