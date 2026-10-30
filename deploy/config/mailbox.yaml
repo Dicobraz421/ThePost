@@ -1,0 +1,16 @@
+# Пресет mailbox — узел ящиков профиля Enterprise-ВМ (SRS 1.2): N узлов под systemd за L4-балансировщиком.
+# Обязательны три параметра (SRS 5.5); полный перечень секций: thepost config schema.
+
+domain: example.ru
+
+# Кластер PostgreSQL через PgBouncer.
+database:
+  url: postgres://thepost:CHANGE_ME@pgbouncer.example.ru:6432/thepost
+
+# S3 (эталон — SeaweedFS); ключи доступа — в секции BLOB-хранилища или окружении сервиса.
+blob:
+  url: s3://thepost-blob
+
+roles: [mailbox]
+
+# Шина событий и кэш — Valkey (секция задаётся платформой, см. thepost config schema).
