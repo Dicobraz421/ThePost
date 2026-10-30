@@ -366,6 +366,23 @@ impl MemBlobIndex {
         lock(&self.rows).get(&(tenant, *hash)).copied()
     }
 
+    /// Изменяет счётчики записей `live` с совпадающим поколением на `delta` за каждое вхождение ключа
+    /// (учёт ссылок писем в `MemMetadata`, как `adjust_refs` в `tp-meta`).
+    pub(crate) fn adjust(&self, keys: &[BlobKey], delta: i64) {
+        let now = self.clock.now();
+        let mut rows = lock(&self.rows);
+        for k in keys {
+            if let Some(r) = rows
+                .get_mut(&(k.tenant, k.hash))
+                .filter(|r| r.generation == k.generation && r.state == BlobState::Live)
+            {
+                let n = (i64::from(r.refcnt) + delta).clamp(0, i64::from(u32::MAX));
+                r.refcnt = u32::try_from(n).unwrap_or(u32::MAX);
+                r.zero_since = (r.refcnt == 0).then_some(now);
+            }
+        }
+    }
+
     /// Удаляет надгробия, обнулённые раньше `older_than`.
     pub fn prune_tombstones(&self, older_than: OffsetDateTime) {
         lock(&self.rows).retain(|_, r| {
