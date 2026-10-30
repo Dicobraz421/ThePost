@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::{Notify, watch};
 use tp_contracts::Error;
+use tp_contracts::config::duration;
 use tp_contracts::role::{CancellationToken, ConfigRx, ConfigValue};
 
 use crate::config::{Config, ConfigError, SectionRegistry};
@@ -17,14 +18,16 @@ use crate::config::{Config, ConfigError, SectionRegistry};
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReloadConfig {
-    /// Период проверки mtime config.yaml, мс; 0 — только по SIGHUP и запросу. Применяется без перезапуска.
-    pub poll_interval_ms: u64,
+    /// Период проверки mtime config.yaml (`5s`); `0s` — только по SIGHUP и запросу. Применяется без перезапуска.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub poll_interval: Duration,
 }
 
 impl Default for ReloadConfig {
     fn default() -> Self {
         Self {
-            poll_interval_ms: 5000,
+            poll_interval: Duration::from_secs(5),
         }
     }
 }
@@ -122,20 +125,20 @@ impl Reloader {
         Ok(true)
     }
 
-    /// Работает до сигнала остановки: SIGHUP, [`ReloadTrigger`] и опрос mtime с периодом `reload.poll_interval_ms`.
+    /// Работает до сигнала остановки: SIGHUP, [`ReloadTrigger`] и опрос mtime с периодом `reload.poll_interval`.
     pub async fn run(mut self, shutdown: CancellationToken) {
         let mut hup = Hup::install();
         loop {
             let poll = self
                 .current()
                 .section::<ReloadConfig>("reload")
-                .map(|c| c.poll_interval_ms)
+                .map(|c| c.poll_interval)
                 .unwrap_or_default();
             let forced = tokio::select! {
                 () = shutdown.cancelled() => return,
                 () = self.request.notified() => true,
                 () = hup.recv() => true,
-                () = sleep_ms(poll) => false,
+                () = sleep_or_never(poll) => false,
             };
             if !forced && !self.file_changed().await {
                 continue;
@@ -165,11 +168,11 @@ fn stamp_of(m: &std::fs::Metadata) -> Stamp {
     (m.modified().ok(), m.len())
 }
 
-async fn sleep_ms(ms: u64) {
-    if ms == 0 {
+async fn sleep_or_never(period: Duration) {
+    if period.is_zero() {
         std::future::pending::<()>().await;
     }
-    tokio::time::sleep(Duration::from_millis(ms)).await;
+    tokio::time::sleep(period).await;
 }
 
 /// SIGHUP процесса; без обработчика (ошибка установки) — никогда не срабатывает.
@@ -295,7 +298,7 @@ mod tests {
     }
 
     fn cfg(max: u32, poll_ms: u64) -> String {
-        format!("{BASE}limits: {{ max: {max} }}\nreload: {{ poll_interval_ms: {poll_ms} }}\n")
+        format!("{BASE}limits: {{ max: {max} }}\nreload: {{ poll_interval: {poll_ms}ms }}\n")
     }
 
     fn max(c: &Config) -> u32 {

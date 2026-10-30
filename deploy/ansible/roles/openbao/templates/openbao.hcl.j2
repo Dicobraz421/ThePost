@@ -1,0 +1,34 @@
+# {{ ansible_managed }}
+# OpenBao для The Post: Raft, только TLS, распечатывание — {{ openbao_seal }}.
+
+storage "raft" {
+  path    = "{{ openbao_data_dir }}"
+  node_id = "{{ inventory_hostname_short }}"
+}
+
+listener "tcp" {
+  address         = "{{ openbao_listen_address }}"
+  cluster_address = "{{ openbao_cluster_address }}"
+  tls_cert_file   = "{{ openbao_config_dir }}/tls/server.pem"
+  tls_key_file    = "{{ openbao_config_dir }}/tls/server.key"
+  tls_min_version = "tls12"
+}
+
+{% if openbao_seal == 'static' %}
+# Ключ в файле: секреты защищены слабее, чем TPM/HSM или KMS (thepost doctor предупреждает).
+seal "static" {
+  current_key_id = "{{ inventory_hostname_short }}-1"
+  current_key    = "file://{{ openbao_static_key_file }}"
+}
+{% elif openbao_seal != 'shamir' %}
+seal "{{ openbao_seal }}" {
+{% for key, value in openbao_seal_options | dictsort %}
+  {{ key }} = {{ value | to_json }}
+{% endfor %}
+}
+{% endif %}
+
+api_addr      = "{{ openbao_api_addr }}"
+cluster_addr  = "{{ openbao_api_addr | regex_replace(':8200$', ':8201') }}"
+disable_mlock = true
+ui            = false
