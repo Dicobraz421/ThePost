@@ -16,6 +16,7 @@ pub mod membership;
 pub mod meta;
 pub mod role;
 pub mod search;
+pub mod secrets;
 pub mod tls;
 
 pub use error::{Error, Result};
