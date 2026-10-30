@@ -8,6 +8,10 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
+use prometheus_client::metrics::counter::ConstCounter;
+use prometheus_client::metrics::gauge::ConstGauge;
 use prometheus_client::registry::{Metric, Registry};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -110,6 +114,17 @@ impl Metrics {
             .register(name, help, metric);
     }
 
+    /// Регистрирует метрики шины уведомлений (решение #39, PLT-10): `snapshot` вызывается на каждый `/metrics`.
+    /// Приложение переносит в [`BusSample`] снимок `tp_cluster::BusCounters::snapshot` (CLU-05) — платформа
+    /// и tp-cluster не зависят друг от друга. Имена: `tp_bus_published_total`, `tp_bus_received_total`,
+    /// `tp_bus_reconnects_total`, `tp_bus_decode_errors_total` и др., `tp_bus_connected` (0/1).
+    pub fn register_bus(&self, snapshot: impl Fn() -> BusSample + Send + Sync + 'static) {
+        self.0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register_collector(Box::new(BusCollector(Box::new(snapshot))));
+    }
+
     /// Текстовый формат OpenMetrics/Prometheus.
     pub fn encode(&self) -> tp_contracts::Result<String> {
         let mut out = String::new();
@@ -119,6 +134,84 @@ impl Metrics {
         )
         .map_err(TelemetryError::from)?;
         Ok(out)
+    }
+}
+
+/// Снимок счётчиков шины уведомлений; поля — как у `tp_cluster::BusMetrics` (CLU-05).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusSample {
+    /// Есть связь с шиной.
+    pub connected: bool,
+    /// Опубликовано уведомлений.
+    pub published: u64,
+    /// Неудачных публикаций.
+    pub publish_errors: u64,
+    /// Получено уведомлений из шины.
+    pub received: u64,
+    /// Выдано уведомлений подписчикам узла.
+    pub delivered: u64,
+    /// Получено нераспознанных сообщений.
+    pub decode_errors: u64,
+    /// Потерь связи (переподключений).
+    pub reconnects: u64,
+    /// Подписчиков, отключённых за отставание.
+    pub lagged: u64,
+}
+
+/// Снимает [`BusSample`] при каждом кодировании реестра.
+struct BusCollector(Box<dyn Fn() -> BusSample + Send + Sync>);
+
+impl fmt::Debug for BusCollector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BusCollector")
+    }
+}
+
+impl Collector for BusCollector {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
+        let s = (self.0)();
+        let counters = [
+            (
+                "tp_bus_published",
+                "Bus notifications published",
+                s.published,
+            ),
+            (
+                "tp_bus_publish_errors",
+                "Bus publish failures",
+                s.publish_errors,
+            ),
+            ("tp_bus_received", "Bus notifications received", s.received),
+            (
+                "tp_bus_delivered",
+                "Bus notifications delivered to local subscribers",
+                s.delivered,
+            ),
+            (
+                "tp_bus_decode_errors",
+                "Unrecognized bus messages",
+                s.decode_errors,
+            ),
+            (
+                "tp_bus_reconnects",
+                "Bus connection losses (reconnects)",
+                s.reconnects,
+            ),
+            ("tp_bus_lagged", "Subscribers dropped for lagging", s.lagged),
+        ];
+        for (name, help, value) in counters {
+            let counter = ConstCounter::new(value);
+            let metric = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+            counter.encode(metric)?;
+        }
+        let gauge = ConstGauge::new(i64::from(s.connected));
+        let metric = encoder.encode_descriptor(
+            "tp_bus_connected",
+            "Bus connection is up (1) or down (0)",
+            None,
+            gauge.metric_type(),
+        )?;
+        gauge.encode(metric)
     }
 }
 
@@ -231,6 +324,43 @@ mod tests {
         assert!(text.contains("tp_requests_total 3"), "{text}");
         assert!(text.contains("tp_connections 2"), "{text}");
         assert!(text.ends_with("# EOF\n"), "{text}");
+    }
+
+    #[test]
+    fn bus_counters_in_shared_registry() {
+        let metrics = Metrics::default();
+        let sample = Arc::new(RwLock::new(BusSample::default()));
+        let source = sample.clone();
+        metrics.register_bus(move || *source.read().unwrap_or_else(PoisonError::into_inner));
+        let text = metrics.encode().expect("encode");
+        assert!(text.contains("tp_bus_connected 0"), "{text}");
+        assert!(text.contains("tp_bus_published_total 0"), "{text}");
+
+        *sample.write().unwrap_or_else(PoisonError::into_inner) = BusSample {
+            connected: true,
+            published: 5,
+            publish_errors: 1,
+            received: 4,
+            delivered: 8,
+            decode_errors: 2,
+            reconnects: 3,
+            lagged: 6,
+        };
+        let text = metrics.encode().expect("encode");
+        for line in [
+            "tp_bus_connected 1",
+            "tp_bus_published_total 5",
+            "tp_bus_publish_errors_total 1",
+            "tp_bus_received_total 4",
+            "tp_bus_delivered_total 8",
+            "tp_bus_decode_errors_total 2",
+            "tp_bus_reconnects_total 3",
+            "tp_bus_lagged_total 6",
+            "# TYPE tp_bus_reconnects counter",
+            "# TYPE tp_bus_connected gauge",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
     }
 
     #[test]

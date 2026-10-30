@@ -17,5 +17,5 @@ pub use ratelimit::{RateLimitConfig, RateLimiter, Verdict};
 pub use reload::{ReloadConfig, ReloadTrigger, Reloader, section_watch};
 pub use roles::{RoleLimits, RoleSpec, Roles, RolesReport, RuntimeConfig};
 pub use service_http::{Health, ServiceHttpConfig};
-pub use telemetry::{Metrics, Telemetry, TelemetryConfig};
+pub use telemetry::{BusSample, Metrics, Telemetry, TelemetryConfig};
 pub use tls::{TlsCerts, TlsConfig};
