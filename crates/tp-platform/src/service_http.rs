@@ -17,7 +17,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tp_contracts::Error;
-use tp_contracts::role::{ReadyHandle, Shutdown};
+use tp_contracts::role::{CancellationToken, ReadyHandle};
 
 use crate::telemetry::Metrics;
 
@@ -107,10 +107,10 @@ pub fn bind(cfg: &ServiceHttpConfig) -> tp_contracts::Result<TcpListener> {
 pub async fn serve(
     listener: TcpListener,
     router: Router,
-    shutdown: Shutdown,
+    shutdown: CancellationToken,
 ) -> tp_contracts::Result<()> {
     axum::serve(listener, router)
-        .with_graceful_shutdown(async move { shutdown.triggered().await })
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .map_err(|e| Error::Internal(format!("service http: {e}")))
 }
@@ -207,7 +207,8 @@ mod tests {
         };
         let listener = bind(&cfg).expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let (shutdown, trigger) = Shutdown::new();
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
         let server = tokio::spawn(serve(listener, router(health.clone(), metrics), shutdown));
 
         assert_eq!(get(addr, "/healthz/live").await, (200, "live\n".to_owned()));
@@ -231,7 +232,7 @@ mod tests {
         assert_eq!(code, 200);
         assert!(body.contains("tp_hits_total 1"), "{body}");
 
-        trigger.trigger();
+        trigger.cancel();
         server.await.expect("join").expect("serve");
     }
 }

@@ -9,9 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::FutureExt;
-use futures::channel::oneshot;
-use futures::future::Shared;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -177,86 +174,24 @@ impl RoleSet {
 
 // ---------- Запуск ролей ----------
 
-/// Источник актуальной конфигурации роли (hot reload, CONTRACTS.md#Config).
-///
-/// Значение — секция конфигурации крейта роли (`Arc<XxxConfig>`), стёртая до `Any`;
-/// типизированный доступ — [`RoleCtx::config`]. Реализация приложения — поверх `tokio::sync::watch`.
-#[async_trait]
-pub trait ConfigWatch: Send + Sync + 'static {
-    /// Текущая версия секции.
-    fn current(&self) -> Arc<dyn Any + Send + Sync>;
+pub use tokio::sync::watch;
+pub use tokio_util::sync::CancellationToken;
 
-    /// Ждёт следующей версии. `Error::Unavailable` — источник закрыт (процесс завершается).
-    async fn changed(&self) -> Result<()>;
+/// Значение секции конфигурации роли (`Arc<XxxConfig>`), стёртое до `Any`; типизированно — [`RoleCtx::config`].
+pub type ConfigValue = Arc<dyn Any + Send + Sync>;
+
+/// Источник актуальной секции конфигурации роли (hot reload, CONTRACTS.md#Config): приложение рассылает
+/// новую версию через [`watch::Sender`]. Закрытый канал — новых версий не будет (значение остаётся в силе).
+pub type ConfigRx = watch::Receiver<ConfigValue>;
+
+/// Канал секции конфигурации со значением `value`: приложение держит `Sender` и рассылает новые версии.
+pub fn config_channel<T: Any + Send + Sync>(value: T) -> (watch::Sender<ConfigValue>, ConfigRx) {
+    watch::channel(Arc::new(value) as ConfigValue)
 }
 
-/// Неизменяемая конфигурация (тесты, роли без hot reload): `changed` не завершается.
-pub struct FixedConfig(Arc<dyn Any + Send + Sync>);
-
-impl FixedConfig {
-    /// Из значения секции.
-    pub fn new<T: Any + Send + Sync>(value: T) -> Self {
-        FixedConfig(Arc::new(value))
-    }
-}
-
-impl fmt::Debug for FixedConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("FixedConfig")
-    }
-}
-
-#[async_trait]
-impl ConfigWatch for FixedConfig {
-    fn current(&self) -> Arc<dyn Any + Send + Sync> {
-        self.0.clone()
-    }
-
-    async fn changed(&self) -> Result<()> {
-        futures::future::pending().await
-    }
-}
-
-/// Сигнал остановки роли. Клонируется; срабатывает при [`ShutdownTrigger::trigger`] или удалении триггера.
-#[derive(Clone)]
-pub struct Shutdown(Shared<oneshot::Receiver<()>>);
-
-/// Сторона, подающая сигнал остановки (процесс приложения).
-#[derive(Debug)]
-pub struct ShutdownTrigger(oneshot::Sender<()>);
-
-impl Shutdown {
-    /// Новая пара «сигнал — триггер».
-    pub fn new() -> (Shutdown, ShutdownTrigger) {
-        let (tx, rx) = oneshot::channel();
-        (Shutdown(rx.shared()), ShutdownTrigger(tx))
-    }
-
-    /// Сигнал уже подан.
-    pub fn is_triggered(&self) -> bool {
-        self.0.clone().now_or_never().is_some()
-    }
-
-    /// Ждёт сигнала.
-    pub async fn triggered(&self) {
-        // Ошибка `Canceled` — триггер удалён, что тоже означает остановку.
-        let _ = self.0.clone().await;
-    }
-}
-
-impl fmt::Debug for Shutdown {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Shutdown")
-            .field(&self.is_triggered())
-            .finish()
-    }
-}
-
-impl ShutdownTrigger {
-    /// Подаёт сигнал остановки.
-    pub fn trigger(self) {
-        let _ = self.0.send(());
-    }
+/// Неизменяемая секция (тесты, роли без hot reload): канал сразу закрыт, [`RoleCtx::config_changed`] не завершается.
+pub fn fixed_config<T: Any + Send + Sync>(value: T) -> ConfigRx {
+    config_channel(value).1
 }
 
 /// Признак готовности роли (readiness probe): роль выставляет его, когда начала обслуживать.
@@ -279,9 +214,9 @@ impl ReadyHandle {
 #[derive(Clone)]
 pub struct RoleCtx {
     /// Секция конфигурации роли с hot reload.
-    pub config: Arc<dyn ConfigWatch>,
+    pub config: ConfigRx,
     /// Сигнал остановки: перестать принимать новую работу и завершить текущую.
-    pub shutdown: Shutdown,
+    pub shutdown: CancellationToken,
     /// Время на завершение текущей работы после сигнала; затем соединения закрываются принудительно.
     pub drain_deadline: Duration,
     /// Признак готовности.
@@ -292,9 +227,18 @@ impl RoleCtx {
     /// Текущая секция конфигурации как `T`; другой тип — `Error::Internal`.
     pub fn config<T: Any + Send + Sync>(&self) -> Result<Arc<T>> {
         self.config
-            .current()
+            .borrow()
+            .clone()
             .downcast::<T>()
             .map_err(|_| Error::internal("role config type mismatch"))
+    }
+
+    /// Ждёт следующей версии секции (затем — [`RoleCtx::config`]). Источник закрыт — не завершается:
+    /// конфигурация больше не меняется, а остановку роли сигналит `shutdown`. Удобно в `tokio::select!`.
+    pub async fn config_changed(&mut self) {
+        if self.config.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -314,7 +258,7 @@ pub trait RoleService: Send + Sync + 'static {
     /// Имя роли (`Role::as_str` или имя роли модуля).
     fn name(&self) -> &str;
 
-    /// Работает до сигнала `ctx.shutdown`, затем завершает текущую работу за `ctx.drain_deadline`.
+    /// Работает до отмены `ctx.shutdown`, затем завершает текущую работу за `ctx.drain_deadline`.
     /// Возврат ошибки — аварийное завершение роли.
     async fn run(&self, ctx: RoleCtx) -> Result<()>;
 }
@@ -322,12 +266,10 @@ pub trait RoleService: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use schemars::_private::serde_json;
 
     #[test]
     fn object_safe() {
         fn _svc(_: Arc<dyn RoleService>) {}
-        fn _cfg(_: Arc<dyn ConfigWatch>) {}
     }
 
     #[test]
@@ -393,27 +335,48 @@ mod tests {
 
     #[test]
     fn shutdown_and_ready() {
-        let (sd, trigger) = Shutdown::new();
-        let sd2 = sd.clone();
-        assert!(!sd.is_triggered());
-        trigger.trigger();
-        futures::executor::block_on(sd2.triggered());
-        assert!(sd.is_triggered());
-
-        let (sd, trigger) = Shutdown::new();
-        drop(trigger);
-        futures::executor::block_on(sd.triggered());
-
+        let shutdown = CancellationToken::new();
         let ready = ReadyHandle::default();
         let ctx = RoleCtx {
-            config: Arc::new(FixedConfig::new(5u32)),
-            shutdown: sd,
+            config: fixed_config(5u32),
+            shutdown: shutdown.clone(),
             drain_deadline: Duration::from_secs(1),
             ready: ready.clone(),
         };
+        assert!(!ctx.shutdown.is_cancelled());
+        shutdown.cancel();
+        futures::executor::block_on(ctx.shutdown.cancelled());
         ctx.ready.set(true);
         assert!(ready.is_ready());
         assert_eq!(*ctx.config::<u32>().expect("u32"), 5);
         assert!(ctx.config::<String>().is_err());
+    }
+
+    #[test]
+    fn config_reload_and_fixed() {
+        use futures::FutureExt;
+
+        let (tx, rx) = config_channel(1u32);
+        let mut ctx = RoleCtx {
+            config: rx,
+            shutdown: CancellationToken::new(),
+            drain_deadline: Duration::from_secs(1),
+            ready: ReadyHandle::default(),
+        };
+        assert!(
+            ctx.config_changed().now_or_never().is_none(),
+            "no new version yet"
+        );
+        tx.send_replace(Arc::new(2u32));
+        futures::executor::block_on(ctx.config_changed());
+        assert_eq!(*ctx.config::<u32>().expect("u32"), 2);
+
+        // Источник закрыт: значение остаётся, ожидание новой версии не завершается.
+        drop(tx);
+        assert!(ctx.config_changed().now_or_never().is_none());
+        assert_eq!(*ctx.config::<u32>().expect("u32"), 2);
+        ctx.config = fixed_config(3u32);
+        assert!(ctx.config_changed().now_or_never().is_none());
+        assert_eq!(*ctx.config::<u32>().expect("u32"), 3);
     }
 }

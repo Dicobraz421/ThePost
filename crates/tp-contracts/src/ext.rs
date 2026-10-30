@@ -34,9 +34,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::future::BoxFuture;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::auth::{Directory, Principal};
@@ -46,7 +47,7 @@ use crate::events::EventSink;
 use crate::ids::{MailboxId, MessageId, TenantId};
 use crate::mailstore::Delivery;
 use crate::meta::AccountScope;
-use crate::role::{ConfigWatch, RoleService};
+use crate::role::{RoleService, watch};
 use crate::search::SearchIndex;
 
 // ---------- Модуль ----------
@@ -66,15 +67,21 @@ pub struct Migration {
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct ModuleCtx {
-    /// Секция `modules.<имя>` config.yaml с hot reload. Значение — секция в виде, который приложение
-    /// разбирает из YAML (JSON-значение), см. CONTRACTS.md#Extension points.
-    pub config: Arc<dyn ConfigWatch>,
+    /// Секция `modules.<имя>` config.yaml с hot reload: JSON-значение, разобранное приложением из YAML
+    /// (без ключа `enabled`). Типизированно — [`ModuleCtx::config`]; закрытый канал — новых версий не будет.
+    pub config: watch::Receiver<Value>,
 }
 
 impl ModuleCtx {
     /// Контекст с секцией конфигурации модуля.
-    pub fn new(config: Arc<dyn ConfigWatch>) -> Self {
+    pub fn new(config: watch::Receiver<Value>) -> Self {
         ModuleCtx { config }
+    }
+
+    /// Текущая секция как `T`; несоответствие полей — `Error::Invalid` с путём к полю
+    /// (`modules.<имя>` добавляет вызывающий).
+    pub fn config<T: DeserializeOwned>(&self) -> Result<T> {
+        T::deserialize(&*self.config.borrow()).map_err(|e| Error::Invalid(e.to_string()))
     }
 }
 
@@ -117,7 +124,7 @@ pub trait Module: Send + Sync + 'static {
 
 // ---------- JMAP, Admin API ----------
 
-/// Capability JMAP модуля (RFC 8620): объект в сессии и методы. JSON передаётся байтами;
+/// Capability JMAP модуля (RFC 8620): объект в сессии и методы. JSON — `serde_json::Value`;
 /// ссылки на результаты (`#`-аргументы) разрешает `tp-jmap` до вызова.
 #[async_trait]
 pub trait JmapCapability: Send + Sync + 'static {
@@ -125,13 +132,13 @@ pub trait JmapCapability: Send + Sync + 'static {
     fn uri(&self) -> &str;
 
     /// JSON-объект capability для `Session.capabilities`.
-    fn session_object(&self) -> Bytes;
+    fn session_object(&self) -> Value;
 
     /// Имена методов (`Foo/get`, `Foo/set`).
     fn methods(&self) -> &[&str];
 
     /// Выполняет метод: аргументы и результат — JSON-объекты.
-    async fn call(&self, principal: &Principal, method: &str, args: Bytes) -> Result<Bytes>;
+    async fn call(&self, principal: &Principal, method: &str, args: Value) -> Result<Value>;
 }
 
 /// Запрос к маршрутам Admin API модуля.
@@ -143,19 +150,17 @@ pub struct AdminRequest {
     pub path: String,
     /// Строка запроса без `?`.
     pub query: Option<String>,
-    /// Тело.
-    pub body: Bytes,
+    /// Тело JSON; `Value::Null` — тела нет.
+    pub body: Value,
 }
 
-/// Ответ маршрута Admin API модуля.
+/// Ответ маршрута Admin API модуля; тело отдаётся как `application/json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminResponse {
     /// Код HTTP.
     pub status: u16,
-    /// `Content-Type`.
-    pub content_type: String,
-    /// Тело.
-    pub body: Bytes,
+    /// Тело JSON; `Value::Null` — тела нет (например, 204).
+    pub body: Value,
 }
 
 /// Маршруты Admin API модуля. Аутентификацию и проверку прав администратора выполняет `tp-admin`
@@ -599,6 +604,38 @@ mod tests {
         assert!(!reg.decision_hooks().is_empty());
         assert!(reg.blob_store().is_none());
         assert!(format!("{reg:?}").contains("passive"));
+    }
+
+    #[test]
+    fn module_config_typed() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Cfg {
+            retention_days: u32,
+            journal: Option<String>,
+        }
+        impl Default for Cfg {
+            fn default() -> Self {
+                Cfg {
+                    retention_days: 30,
+                    journal: None,
+                }
+            }
+        }
+
+        let (tx, rx) = watch::channel(serde_json::json!({ "journal": "j@example.org" }));
+        let ctx = ModuleCtx::new(rx);
+        assert_eq!(
+            ctx.config::<Cfg>(),
+            Ok(Cfg {
+                retention_days: 30,
+                journal: Some("j@example.org".into()),
+            })
+        );
+        tx.send_replace(serde_json::json!({ "retention_days": "many" }));
+        assert!(matches!(ctx.config::<Cfg>(), Err(Error::Invalid(_))));
+        tx.send_replace(serde_json::json!({ "bogus": 1 }));
+        assert!(matches!(ctx.config::<Cfg>(), Err(Error::Invalid(m)) if m.contains("bogus")));
     }
 
     #[test]

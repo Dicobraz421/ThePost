@@ -14,7 +14,7 @@ pub use acme::{Acme, AcmeConfig, Http01Challenges};
 pub use config::{Config, Section, SectionRegistry};
 pub use listen::{Cidr, Conn, ConnInfo, EndpointConfig, Listener};
 pub use ratelimit::{RateLimitConfig, RateLimiter, Verdict};
-pub use reload::{ReloadConfig, ReloadTrigger, Reloader, SectionWatch};
+pub use reload::{ReloadConfig, ReloadTrigger, Reloader, section_watch};
 pub use roles::{RoleLimits, RoleSpec, Roles, RolesReport, RuntimeConfig};
 pub use service_http::{Health, ServiceHttpConfig};
 pub use telemetry::{Metrics, Telemetry, TelemetryConfig};
