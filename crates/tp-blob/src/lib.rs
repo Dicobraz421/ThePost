@@ -9,6 +9,7 @@ pub mod gc;
 pub mod local;
 pub mod orphans;
 pub mod s3;
+pub mod verify;
 mod worker;
 pub mod writer;
 
@@ -17,6 +18,7 @@ pub use gc::{GcConfig, GcMetrics, GcPass, GcWorker};
 pub use local::{LocalConfig, LocalStore};
 pub use orphans::{OrphanConfig, OrphanMetrics, OrphanPass, OrphanSweeper};
 pub use s3::{S3Config, S3Store};
+pub use verify::{BlobInventory, IndexedBlob, Verifier, VerifyConfig, VerifyReport};
 pub use worker::{Now, system_now};
 pub use writer::{BlobHasher, BlobWriter, WriterConfig, WriterMetrics};
 
