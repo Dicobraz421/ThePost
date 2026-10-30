@@ -221,7 +221,7 @@ mod tests {
         let (a, b) = (points[1] + 1, points[points.len() - 2] - 1);
         let got = raw(&env, scope, id, Some(a..b)).await;
         assert!(got.as_ref() == &mail.raw[a as usize..b as usize]);
-        for bad in [size + 1..size + 2, 5..4] {
+        for bad in [size + 1..size + 2, Range { start: 5, end: 4 }] {
             let err = env
                 .store
                 .fetch_raw(scope, id, Some(bad.clone()))

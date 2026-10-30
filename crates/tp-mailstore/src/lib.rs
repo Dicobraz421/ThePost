@@ -153,7 +153,6 @@ pub(crate) mod testenv {
         pub blobs: MemBlobStore,
         pub index: MemBlobIndex,
         pub meta: MemMetadata,
-        #[allow(dead_code)]
         pub bus: MemEventBus,
         pub store: Store,
     }
