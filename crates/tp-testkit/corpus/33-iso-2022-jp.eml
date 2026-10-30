@@ -1,0 +1,10 @@
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: =?ISO-2022-JP?B?GyRCJUYlOSVIGyhC?=
+Date: Thu, 29 Oct 2026 10:31:00 +0300
+Message-ID: <corpus-031@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="iso-2022-jp"
+Content-Transfer-Encoding: 7bit
+
+テストメッセージ

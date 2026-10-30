@@ -1,0 +1,47 @@
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Level 1
+Date: Thu, 29 Oct 2026 10:39:00 +0300
+Message-ID: <corpus-039@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="lvl-1"
+
+This is a multi-part message in MIME format.
+--lvl-1
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+level one
+--lvl-1
+Content-Type: message/rfc822
+
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Level 2
+Date: Thu, 29 Oct 2026 10:38:00 +0300
+Message-ID: <corpus-038@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="lvl-2"
+
+This is a multi-part message in MIME format.
+--lvl-2
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+level two
+--lvl-2
+Content-Type: message/rfc822
+
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Level 3
+Date: Thu, 29 Oct 2026 10:37:00 +0300
+Message-ID: <corpus-037@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+deepest
+--lvl-2--
+
+--lvl-1--

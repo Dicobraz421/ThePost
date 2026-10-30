@@ -1,0 +1,50 @@
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Fwd: with attachment
+Date: Thu, 29 Oct 2026 10:36:00 +0300
+Message-ID: <corpus-036@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="fwd-2"
+
+This is a multi-part message in MIME format.
+--fwd-2
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Forwarded.
+--fwd-2
+Content-Type: message/rfc822
+
+From: Alice Example <alice@example.com>
+To: Bob <bob@example.org>
+Subject: Inner with PDF
+Date: Thu, 29 Oct 2026 10:35:00 +0300
+Message-ID: <corpus-035@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="in-2"
+
+This is a multi-part message in MIME format.
+--in-2
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+The quick brown fox jumps over the lazy dog. Quarterly report attached, please review before Friday.
+--in-2
+Content-Type: application/pdf; name="inner.pdf"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="inner.pdf"
+
+JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2Jq
+CjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2Jq
+CjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIg
+NzkyXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgPj4g
+Pj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA0NyA+PgpzdHJlYW0KQlQgL0YxIDEyIFRm
+IDcyIDcyMCBUZCAoUXVhcnRlcmx5IHJlcG9ydCkgVGogRVQKZW5kc3RyZWFtCmVuZG9iago1IDAg
+b2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+
+PgplbmRvYmoKeHJlZgowIDYKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4g
+CjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDExNSAwMDAwMCBuIAowMDAwMDAwMjQxIDAwMDAw
+IG4gCjAwMDAwMDAzMzggMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA2IC9Sb290IDEgMCBSID4+
+CnN0YXJ0eHJlZgo0MDgKJSVFT0YK
+--in-2--
+
+--fwd-2--
