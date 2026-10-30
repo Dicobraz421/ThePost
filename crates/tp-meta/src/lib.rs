@@ -7,10 +7,12 @@
 pub mod accounts;
 pub mod blob_index;
 pub mod changelog;
+pub mod doctor;
 pub mod events;
 pub mod lease;
 pub mod mailboxes;
 pub mod messages;
+pub mod pool;
 pub mod schema;
 
 use std::sync::Arc;
