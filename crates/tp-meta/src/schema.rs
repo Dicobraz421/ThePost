@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 
 use sqlx::migrate::{MigrateError, Migration, MigrationType, Migrator};
-use sqlx::{PgPool, Postgres, SqlSafeStr, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, SqlSafeStr, Transaction};
 use tp_contracts::{Error, Result, TenantId};
 
 /// Миграции ядра: (версия, описание, SQL). Версии только добавляются; применённые не меняются.
@@ -23,7 +23,8 @@ pub fn migrator() -> Migrator {
                     *version,
                     Cow::Borrowed(*desc),
                     MigrationType::Simple,
-                    sql.into_sql_str(),
+                    // Контрольная сумма не зависит от окончаний строк в рабочей копии.
+                    AssertSqlSafe(sql.replace("\r\n", "\n")).into_sql_str(),
                     false,
                 )
             })
@@ -98,4 +99,14 @@ pub fn db_err(e: sqlx::Error) -> Error {
             Error::internal(e.to_string())
         }
     }
+}
+
+/// Значение столбца `bigint` → `u32` (UID, UIDVALIDITY, поколение).
+pub(crate) fn to_u32(v: i64) -> Result<u32> {
+    u32::try_from(v).map_err(|_| Error::internal(format!("значение вне u32: {v}")))
+}
+
+/// `u64` → `bigint`.
+pub(crate) fn to_i64(v: u64) -> Result<i64> {
+    i64::try_from(v).map_err(|_| Error::invalid(format!("значение вне bigint: {v}")))
 }
