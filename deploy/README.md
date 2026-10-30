@@ -3,7 +3,8 @@
 | Путь | Содержание |
 |---|---|
 | `docker/Dockerfile` | OCI-образ: сборка на `rust:<ver>-bookworm`, запуск на `distroless/cc-debian12:nonroot` |
-| `compose/dev.yml` | Зависимости для разработки (профиль `dev`) и эталон SMB (профиль `smb`) |
+| `compose/dev.yml` | Зависимости: только TLS (профиль `tls`, по умолчанию) и открытые для тестов (`dev`); эталон SMB (`smb`) |
+| `compose/tls/` | Генерация самоподписанного CA (`gen-certs.sh`), `pg_hba.conf` (только `hostssl`) |
 | `systemd/` | Юнит `thepost.service` с hardening, пользователь `thepost` (sysusers) |
 | `config/` | Примеры `config.yaml` для пресетов `all` (SMB), `mailbox` (Enterprise-ВМ), `edge` (DMZ) |
 
@@ -14,27 +15,48 @@
    Пакеты для сборки: `build-essential pkg-config`; клиенты для проверок (необязательно): `postgresql-client`, `awscli`.
 4. `git clone https://github.com/Dicobraz421/ThePost && cd ThePost`.
 
-## Зависимости (профиль dev)
-Из корня репозитория:
+## Зависимости
+Внутренние каналы — только TLS (решение 2026-10-30); открытые каналы — только профиль `dev`, явной настройкой.
+Профили `tls` и `dev` публикуют одни и те же порты хоста — запускается один из них.
+
+### Профиль tls (по умолчанию)
 ```bash
-docker compose -f deploy/compose/dev.yml up -d
-docker compose -f deploy/compose/dev.yml ps        # postgres, seaweedfs, valkey — healthy
+docker compose -f deploy/compose/dev.yml up -d --wait   # tls-init, postgres-tls, seaweedfs-tls, valkey-tls
 ```
-Профиль `dev` выбран по умолчанию в `compose/.env`. Остановить с удалением данных:
-`docker compose -f deploy/compose/dev.yml down -v`.
+Профиль `tls` выбран по умолчанию в `compose/.env`. Сервис `tls-init` при первом запуске создаёт самоподписанный CA
+и серверный сертификат (SAN: `localhost`, `127.0.0.1`, имена сервисов) в томе `tls`; копия CA — `compose/tls/ca.pem`.
+Новый CA — `down -v`. Вне compose: `sh deploy/compose/tls/gen-certs.sh <каталог>`.
+
+| Сервис | Адрес с хоста | Подключение |
+|---|---|---|
+| PostgreSQL 16 | `localhost:5432` | только TLS (`pg_hba`: `hostnossl … reject`): `sslmode=verify-full&sslrootcert=deploy/compose/tls/ca.pem` |
+| SeaweedFS S3 | `https://localhost:8333` | только https; CA — `compose/tls/ca.pem`; бакет `thepost-test` |
+| Valkey | `rediss://localhost:6379` | только TLS (`--port 0`), сертификат клиента не нужен |
+
+### Профиль dev (открытые каналы, интеграционные тесты)
+```bash
+docker compose -f deploy/compose/dev.yml --profile dev up -d --wait
+docker compose -f deploy/compose/dev.yml --profile dev ps   # postgres, seaweedfs, valkey — healthy
+```
+Подключение к этим сервисам — открытый канал: в конфигурации `thepost` он допускается только явной настройкой
+`allow_plaintext: true` в секции канала с предупреждением в лог при каждом запуске (настройку вводят полосы каналов).
+Бакет `thepost-test` создаётся при старте SeaweedFS (`compose/seaweedfs-start.sh`, имя — `TP_S3_BUCKET`).
+Остановить с удалением данных: `docker compose -f deploy/compose/dev.yml --profile dev down -v`.
 
 | Сервис | Адрес с хоста | Учётные данные (только dev) |
 |---|---|---|
 | PostgreSQL 16 | `localhost:5432` | `postgres` / `postgres`, БД `postgres` |
-| SeaweedFS S3 | `http://localhost:8333` | ключ `thepost`, секрет `thepost-dev-secret` (`compose/seaweedfs-s3.json`) |
+| SeaweedFS S3 | `http://localhost:8333` | ключ `thepost`, секрет `thepost-dev-secret` (`compose/seaweedfs-s3.json`); бакет `thepost-test` |
 | Valkey | `localhost:6379` | без пароля |
 | Rspamd | `http://localhost:11333` (проверка), `http://localhost:11334` (веб) | пароль веб-интерфейса `thepost-dev` |
 
-Занятый порт хоста переопределяется переменной: `TP_PG_PORT`, `TP_S3_PORT`, `TP_VALKEY_PORT`, `TP_RSPAMD_PORT`,
-`TP_RSPAMD_UI_PORT` (например, `TP_PG_PORT=55432 docker compose -f deploy/compose/dev.yml up -d`).
+Учётные данные профиля `tls` — те же. Занятый порт хоста переопределяется переменной: `TP_PG_PORT`, `TP_S3_PORT`,
+`TP_VALKEY_PORT`, `TP_RSPAMD_PORT`, `TP_RSPAMD_UI_PORT`
+(например, `TP_PG_PORT=55432 docker compose -f deploy/compose/dev.yml --profile dev up -d`).
 
 ## Интеграционные тесты
 Тест с внешней зависимостью пропускается, если её переменная не задана (`tp_testkit::pg_url()` и аналоги).
+Зависимости — профиль `dev`:
 ```bash
 export TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
 export TEST_S3_URL=http://localhost:8333
@@ -49,7 +71,8 @@ cargo nextest run -p <крейты> --no-tests=pass
 Без переменных выполняются только тесты на in-memory реализациях `tp-testkit`.
 
 ## Эталон SMB в контейнерах (профиль smb)
-`thepost` (`roles: [all]`, локальный BLOB, шина в процессе) + PostgreSQL + Rspamd; конфигурация — `compose/thepost-smb.yaml`.
+`thepost` (`roles: [all]`, локальный BLOB, шина в процессе) + PostgreSQL (TLS, `sslmode=verify-full`, CA из тома `tls`)
++ Rspamd; конфигурация — `compose/thepost-smb.yaml`.
 ```bash
 docker compose -f deploy/compose/dev.yml --profile smb up -d --build
 ```
