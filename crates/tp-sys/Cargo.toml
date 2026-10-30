@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 schemars.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["sched"] }
 seccompiler.workspace = true
 socket2.workspace = true
 thiserror.workspace = true
