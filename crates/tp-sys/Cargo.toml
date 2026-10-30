@@ -12,8 +12,14 @@ workspace = true
 
 [dependencies]
 schemars.workspace = true
+serde.workspace = true
 nix = { workspace = true, features = ["sched"] }
 seccompiler.workspace = true
 socket2 = { workspace = true, features = ["all"] }
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_yaml_ng.workspace = true
+tracing-subscriber.workspace = true
