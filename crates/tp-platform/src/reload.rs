@@ -1,0 +1,418 @@
+//! Hot reload конфигурации (SRS 5.5, CONTRACTS.md#Config): по SIGHUP, по запросу и по опросу mtime
+//! файл перечитывается, проверяется и рассылается через `watch`. Ошибка — прежняя версия остаётся в силе.
+
+use std::any::Any;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use schemars::JsonSchema;
+use serde::Deserialize;
+use tokio::sync::{Mutex, Notify, watch};
+use tp_contracts::Error;
+use tp_contracts::role::{ConfigWatch, Shutdown};
+
+use crate::config::{AnySection, Config, ConfigError, SectionRegistry};
+
+/// Секция `reload`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReloadConfig {
+    /// Период проверки mtime config.yaml, мс; 0 — только по SIGHUP и запросу. Применяется без перезапуска.
+    pub poll_interval_ms: u64,
+}
+
+impl Default for ReloadConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: 5000,
+        }
+    }
+}
+
+/// Отметка версии файла для опроса: время изменения и размер.
+type Stamp = (Option<SystemTime>, u64);
+
+/// Перечитывает config.yaml и рассылает новые версии подписчикам.
+#[derive(Debug)]
+pub struct Reloader {
+    registry: Arc<SectionRegistry>,
+    path: PathBuf,
+    env: Vec<(String, String)>,
+    tx: watch::Sender<Arc<Config>>,
+    applied: String,
+    stamp: Option<Stamp>,
+    request: Arc<Notify>,
+}
+
+/// Запрос перечитать конфигурацию (Admin API, тесты) — то же, что SIGHUP.
+#[derive(Debug, Clone)]
+pub struct ReloadTrigger(Arc<Notify>);
+
+impl ReloadTrigger {
+    /// Просит перечитать конфигурацию; повторные запросы до обработки объединяются.
+    pub fn request(&self) {
+        self.0.notify_one();
+    }
+}
+
+impl Reloader {
+    /// Первая загрузка `path` с переменными окружения процесса (снимок на время работы).
+    /// Блокирующий I/O: вызывать при запуске или через `spawn_blocking`.
+    pub fn start(registry: Arc<SectionRegistry>, path: PathBuf) -> tp_contracts::Result<Self> {
+        Ok(Self::start_with(
+            registry,
+            path,
+            std::env::vars().collect(),
+        )?)
+    }
+
+    pub(crate) fn start_with(
+        registry: Arc<SectionRegistry>,
+        path: PathBuf,
+        env: Vec<(String, String)>,
+    ) -> Result<Self, ConfigError> {
+        let applied = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let stamp = std::fs::metadata(&path).ok().map(|m| stamp_of(&m));
+        let config = registry.parse_with(&applied, env.clone())?;
+        let (tx, _) = watch::channel(Arc::new(config));
+        Ok(Self {
+            registry,
+            path,
+            env,
+            tx,
+            applied,
+            stamp,
+            request: Arc::new(Notify::new()),
+        })
+    }
+
+    /// Подписка на версии конфигурации.
+    pub fn subscribe(&self) -> watch::Receiver<Arc<Config>> {
+        self.tx.subscribe()
+    }
+
+    /// Текущая версия.
+    pub fn current(&self) -> Arc<Config> {
+        self.tx.borrow().clone()
+    }
+
+    /// Источник запросов перечитать конфигурацию.
+    pub fn trigger(&self) -> ReloadTrigger {
+        ReloadTrigger(self.request.clone())
+    }
+
+    /// Перечитывает файл. `Ok(true)` — разослана новая версия, `Ok(false)` — текст не изменился;
+    /// ошибка — версия не изменилась, подписчики ничего не получают.
+    pub async fn reload(&mut self) -> tp_contracts::Result<bool> {
+        let text = tokio::fs::read_to_string(&self.path)
+            .await
+            .map_err(|source| ConfigError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        if text == self.applied {
+            return Ok(false);
+        }
+        let config = self.registry.parse_with(&text, self.env.clone())?;
+        self.applied = text;
+        self.tx.send_replace(Arc::new(config));
+        Ok(true)
+    }
+
+    /// Работает до сигнала остановки: SIGHUP, [`ReloadTrigger`] и опрос mtime с периодом `reload.poll_interval_ms`.
+    pub async fn run(mut self, shutdown: Shutdown) {
+        let mut hup = Hup::install();
+        loop {
+            let poll = self
+                .current()
+                .section::<ReloadConfig>("reload")
+                .map(|c| c.poll_interval_ms)
+                .unwrap_or_default();
+            let forced = tokio::select! {
+                () = shutdown.triggered() => return,
+                () = self.request.notified() => true,
+                () = hup.recv() => true,
+                () = sleep_ms(poll) => false,
+            };
+            if !forced && !self.file_changed().await {
+                continue;
+            }
+            match self.reload().await {
+                Ok(true) => tracing::info!(path = %self.path.display(), "configuration reloaded"),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "configuration reload failed; previous version kept");
+                }
+            }
+        }
+    }
+
+    async fn file_changed(&mut self) -> bool {
+        let stamp = tokio::fs::metadata(&self.path)
+            .await
+            .ok()
+            .map(|m| stamp_of(&m));
+        let changed = stamp != self.stamp;
+        self.stamp = stamp;
+        changed
+    }
+}
+
+fn stamp_of(m: &std::fs::Metadata) -> Stamp {
+    (m.modified().ok(), m.len())
+}
+
+async fn sleep_ms(ms: u64) {
+    if ms == 0 {
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// SIGHUP процесса; без обработчика (ошибка установки) — никогда не срабатывает.
+struct Hup(Option<tp_sys::Signals>);
+
+impl Hup {
+    fn install() -> Self {
+        match tp_sys::Signals::new() {
+            Ok(s) => Self(Some(s)),
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGHUP handler not installed; reload by poll only");
+                Self(None)
+            }
+        }
+    }
+
+    async fn recv(&mut self) {
+        let Some(signals) = &mut self.0 else {
+            return std::future::pending().await;
+        };
+        // SIGTERM/SIGINT обрабатывает приложение (tokio рассылает сигнал всем подписчикам).
+        loop {
+            match signals.recv().await {
+                Some(tp_sys::Signal::Hup) => return,
+                Some(_) => {}
+                None => return std::future::pending().await,
+            }
+        }
+    }
+}
+
+/// Секция конфигурации для роли (`RoleCtx::config`) поверх рассылки [`Reloader`].
+///
+/// `changed` срабатывает на любую новую версию файла, а не только при изменении этой секции.
+#[derive(Debug)]
+pub struct SectionWatch {
+    name: String,
+    rx: Mutex<watch::Receiver<Arc<Config>>>,
+    current: std::sync::Mutex<AnySection>,
+}
+
+impl SectionWatch {
+    /// Секция `name`; не зарегистрирована — `Error::NotFound`.
+    pub fn new(rx: watch::Receiver<Arc<Config>>, name: &str) -> tp_contracts::Result<Self> {
+        let current = rx.borrow().section_any(name).ok_or(Error::NotFound)?;
+        Ok(Self {
+            name: name.to_owned(),
+            rx: Mutex::new(rx),
+            current: std::sync::Mutex::new(current),
+        })
+    }
+}
+
+impl ConfigWatch for SectionWatch {
+    fn current(&self) -> Arc<dyn Any + Send + Sync> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn changed<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<Box<dyn Future<Output = tp_contracts::Result<()>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let mut rx = self.rx.lock().await;
+            rx.changed()
+                .await
+                .map_err(|_| Error::Unavailable { retry_after: None })?;
+            let section = rx.borrow_and_update().section_any(&self.name);
+            if let Some(section) = section {
+                *self
+                    .current
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = section;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use tp_contracts::role::RoleCtx;
+    use tp_contracts::role::{ReadyHandle, Shutdown};
+
+    use super::*;
+
+    #[derive(Debug, Default, Deserialize, JsonSchema, PartialEq)]
+    #[serde(default, deny_unknown_fields)]
+    struct LimitsConfig {
+        max: u32,
+    }
+
+    const BASE: &str = "database: { url: pg }\nblob: { url: file:///b }\ndomain: d\n";
+
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str, text: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "tp-platform-{tag}-{}-{nanos}.yaml",
+                std::process::id()
+            ));
+            fs::write(&path, text).expect("write");
+            Self(path)
+        }
+
+        /// Пишет текст и сдвигает mtime, чтобы опрос заметил изменение при грубой точности ФС.
+        fn rewrite(&self, text: &str, bump_secs: u64) {
+            fs::write(&self.0, text).expect("write");
+            let f = fs::File::options().write(true).open(&self.0).expect("open");
+            f.set_modified(SystemTime::now() + Duration::from_secs(bump_secs))
+                .expect("mtime");
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn registry() -> Arc<SectionRegistry> {
+        let mut r = SectionRegistry::new();
+        r.add_section::<LimitsConfig>("limits").expect("limits");
+        Arc::new(r)
+    }
+
+    fn cfg(max: u32, poll_ms: u64) -> String {
+        format!("{BASE}limits: {{ max: {max} }}\nreload: {{ poll_interval_ms: {poll_ms} }}\n")
+    }
+
+    fn max(c: &Config) -> u32 {
+        c.section::<LimitsConfig>("limits").expect("limits").max
+    }
+
+    #[tokio::test]
+    async fn threshold_change_reaches_subscriber() {
+        let file = TempFile::new("trigger", &cfg(1, 0));
+        let reloader =
+            Reloader::start_with(registry(), file.path().to_owned(), Vec::new()).expect("start");
+        let mut rx = reloader.subscribe();
+        let trigger = reloader.trigger();
+        let (shutdown, stop) = Shutdown::new();
+        let task = tokio::spawn(reloader.run(shutdown));
+
+        file.rewrite(&cfg(2, 0), 0);
+        trigger.request();
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("in time")
+            .expect("changed");
+        assert_eq!(max(&rx.borrow_and_update()), 2);
+
+        stop.trigger();
+        task.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn poll_detects_mtime_change() {
+        let file = TempFile::new("poll", &cfg(1, 20));
+        let reloader =
+            Reloader::start_with(registry(), file.path().to_owned(), Vec::new()).expect("start");
+        let mut rx = reloader.subscribe();
+        let (shutdown, stop) = Shutdown::new();
+        let task = tokio::spawn(reloader.run(shutdown));
+
+        file.rewrite(&cfg(7, 20), 2);
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("in time")
+            .expect("changed");
+        assert_eq!(max(&rx.borrow_and_update()), 7);
+
+        stop.trigger();
+        task.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn broken_file_keeps_current_config() {
+        let file = TempFile::new("broken", &cfg(3, 0));
+        let mut reloader =
+            Reloader::start_with(registry(), file.path().to_owned(), Vec::new()).expect("start");
+        let rx = reloader.subscribe();
+
+        assert_eq!(reloader.reload().await, Ok(false), "same text");
+        file.rewrite(&format!("{BASE}limits: {{ max: many }}\n"), 0);
+        let e = reloader.reload().await.expect_err("broken");
+        assert!(
+            matches!(&e, Error::Invalid(m) if m.starts_with("limits.max:")),
+            "{e:?}"
+        );
+        file.rewrite("limits: [\n", 0);
+        assert!(reloader.reload().await.is_err(), "syntax error");
+        assert!(!rx.has_changed().expect("open"));
+        assert_eq!(max(&reloader.current()), 3);
+
+        file.rewrite(&cfg(4, 0), 0);
+        assert_eq!(reloader.reload().await, Ok(true));
+        assert_eq!(max(&rx.borrow()), 4);
+    }
+
+    #[tokio::test]
+    async fn section_watch_for_role_ctx() {
+        let file = TempFile::new("watch", &cfg(5, 0));
+        let mut reloader =
+            Reloader::start_with(registry(), file.path().to_owned(), Vec::new()).expect("start");
+        assert!(SectionWatch::new(reloader.subscribe(), "nope").is_err());
+        let watch = Arc::new(SectionWatch::new(reloader.subscribe(), "limits").expect("watch"));
+        let (shutdown, _stop) = Shutdown::new();
+        let ctx = RoleCtx {
+            config: watch.clone(),
+            shutdown,
+            drain_deadline: Duration::from_secs(1),
+            ready: ReadyHandle::default(),
+        };
+        assert_eq!(ctx.config::<LimitsConfig>().expect("typed").max, 5);
+
+        file.rewrite(&cfg(6, 0), 0);
+        assert_eq!(reloader.reload().await, Ok(true));
+        tokio::time::timeout(Duration::from_secs(5), ctx.config.changed())
+            .await
+            .expect("in time")
+            .expect("changed");
+        assert_eq!(ctx.config::<LimitsConfig>().expect("typed").max, 6);
+    }
+}
