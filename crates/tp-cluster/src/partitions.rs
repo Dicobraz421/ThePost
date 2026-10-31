@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use schemars::JsonSchema;
+use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -19,11 +20,13 @@ use tp_contracts::membership::{Membership, NodeId};
 
 use crate::hashing::Rendezvous;
 
-/// Конфигурация назначения разделов.
-#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+/// Конфигурация назначения разделов. Незаданные поля — по умолчанию, неизвестные — ошибка разбора.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct PartitionAssignerConfig {
     /// Интервал опроса живых узлов (`2s`, `500ms`; ноль считается за 1 мс). Смена состава замечается
     /// не позже чем через интервал; разумно — не больше периода продления записи узла (`ttl / 3`).
+    #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub poll_interval: Duration,
 }
@@ -280,6 +283,30 @@ mod tests {
         }
         // Ключ включает подписчика: разные подписчики распределены по-разному.
         assert_ne!(owners(&a, "indexer", 256), owners(&a, "mod_audit", 256));
+    }
+
+    #[test]
+    fn parses_yaml_section() {
+        let c: PartitionAssignerConfig =
+            serde_yaml_ng::from_str("poll_interval: 1m30s").expect("yaml");
+        assert_eq!(c.poll_interval, Duration::from_secs(90));
+        let c: PartitionAssignerConfig =
+            serde_yaml_ng::from_str("poll_interval: 500ms").expect("yaml");
+        assert_eq!(c.poll_interval, Duration::from_millis(500));
+        assert_eq!(
+            serde_yaml_ng::from_str::<PartitionAssignerConfig>("{}").expect("empty"),
+            PartitionAssignerConfig::default()
+        );
+        for bad in [
+            "poll_interval: 2000",
+            "poll_interval: 2 s",
+            "poll_interval_ms: 2000",
+        ] {
+            assert!(
+                serde_yaml_ng::from_str::<PartitionAssignerConfig>(bad).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
