@@ -5,6 +5,10 @@
 //! по тому же поколению, начатая до удаления (`acquire` видел отсутствие записи), при `commit_new` получит
 //! `Bumped`, а не ссылку на удалённый объект. Надгробия старше `MetaConfig::blob_tombstone_ttl`
 //! удаляются в `gc_candidates`.
+//!
+//! Для `thepost verify` (SRS 3.5) — постраничное перечисление записей `live` по всем организациям
+//! ([`PgMeta::live_blobs`]) и пометка повреждённых ([`PgMeta::mark_blob_damaged`]); в контракт [`BlobIndex`]
+//! они не входят.
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -25,6 +29,85 @@ fn refs_arg(refs: u32) -> Result<i64> {
 
 fn gen_of(v: i64) -> Result<Gen> {
     to_u32(v).map(Gen)
+}
+
+fn key_of(tenant: Uuid, hash: Vec<u8>, g: i64) -> Result<BlobKey> {
+    let hash: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| Error::internal("длина хэша в blobs"))?;
+    Ok(BlobKey {
+        tenant: TenantId::from_uuid(tenant),
+        hash: BlobHash(hash),
+        generation: gen_of(g)?,
+    })
+}
+
+/// Запись учёта `live` для сверки ([`PgMeta::live_blobs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveBlob {
+    /// Ключ объекта (поколение записи).
+    pub key: BlobKey,
+    /// Размер по учёту, байт.
+    pub size: u64,
+    /// Запись уже помечена повреждённой ([`PgMeta::mark_blob_damaged`]).
+    pub damaged: bool,
+}
+
+impl PgMeta {
+    /// Страница записей `live` по всем организациям в порядке (организация, хэш): не больше `limit` записей
+    /// после `after` — ключа последней записи предыдущей страницы (`None` — с начала; поколение не учитывается).
+    /// Страница короче `limit` — последняя. Каждая страница — своя короткая транзакция по первичному ключу:
+    /// записи, добавленные или удалённые во время перечисления, могут попасть или не попасть в него.
+    pub async fn live_blobs(&self, after: Option<&BlobKey>, limit: usize) -> Result<Vec<LiveBlob>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Нулевой uuid и пустой хэш меньше любого ключа таблицы (хэш — 32 байта).
+        let (tenant, hash) = after.map_or((Uuid::nil(), Vec::new()), |k| {
+            (*k.tenant.as_uuid(), k.hash.as_bytes().to_vec())
+        });
+        let mut tx = begin_system(&self.pool).await?;
+        let rows: Vec<(Uuid, Vec<u8>, i64, i64, bool)> = sqlx::query_as(
+            "SELECT tenant_id, hash, gen, size, damaged_at IS NOT NULL FROM blobs
+             WHERE (tenant_id, hash) > ($1, $2) AND state = 'live'
+             ORDER BY tenant_id, hash LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(hash)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        rows.into_iter()
+            .map(|(tenant, hash, g, size, damaged)| {
+                Ok(LiveBlob {
+                    key: key_of(tenant, hash, g)?,
+                    size: u64::try_from(size).map_err(|_| Error::internal("размер в blobs"))?,
+                    damaged,
+                })
+            })
+            .collect()
+    }
+
+    /// Помечает запись `live` поколения `key` повреждённой: объекта нет в хранилище или он испорчен (SRS 3.5).
+    /// Повторная пометка сохраняет время первой. `false` — такой записи нет (объект удалён или
+    /// загружен заново другим поколением): помечать нечего.
+    pub async fn mark_blob_damaged(&self, key: &BlobKey) -> Result<bool> {
+        let mut tx = begin(&self.pool, key.tenant).await?;
+        let marked = sqlx::query(
+            "UPDATE blobs SET damaged_at = coalesce(damaged_at, now())
+             WHERE tenant_id = $1 AND hash = $2 AND gen = $3 AND state = 'live'",
+        )
+        .bind(key.tenant.as_uuid())
+        .bind(key.hash.as_bytes().as_slice())
+        .bind(i64::from(key.generation.0))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected()
+            == 1;
+        tx.commit().await.map_err(db_err)?;
+        Ok(marked)
+    }
 }
 
 #[async_trait]
@@ -174,16 +257,7 @@ impl BlobIndex for PgMeta {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         rows.into_iter()
-            .map(|(tenant, hash, g)| {
-                let hash: [u8; 32] = hash
-                    .try_into()
-                    .map_err(|_| Error::internal("длина хэша в blobs"))?;
-                Ok(BlobKey {
-                    tenant: TenantId::from_uuid(tenant),
-                    hash: BlobHash(hash),
-                    generation: gen_of(g)?,
-                })
-            })
+            .map(|(tenant, hash, g)| key_of(tenant, hash, g))
             .collect()
     }
 

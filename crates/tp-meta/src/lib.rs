@@ -7,6 +7,7 @@
 pub mod accounts;
 pub mod blob_index;
 pub mod changelog;
+pub mod credentials;
 pub mod doctor;
 pub mod events;
 pub mod lease;

@@ -13,11 +13,14 @@
 //!
 //! Пароль — только ссылка на секрет в хранилище ([`PoolConfig::password`], CTR-15, решение 2026-10-30): адрес
 //! без пароля, значение читается из [`SecretStore`] при создании пула. Пароль в адресе — только профиль dev.
+//! Динамические учётные данные (database secrets engine, [`PoolConfig::dynamic_credentials`], META-18) —
+//! пул [`connect_rotating`] с продлением аренды и сменой учётных данных без остановки ролей ([`crate::credentials`]).
 
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -29,6 +32,7 @@ use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{Error, Result, TenantId};
 
+use crate::credentials::{self, DynamicCredentials, Rotated, Rotation};
 use crate::schema::{begin, begin_system, db_err};
 
 /// Секция конфигурации пула соединений `database` (SRS 5.5). Все параметры требуют перезапуска.
@@ -49,6 +53,9 @@ pub struct PoolConfig {
     /// Пароль роли — ссылка на секрет в хранилище (`{ secret: "<путь>#<поле>" }`), общий для `url` и
     /// `direct_url`. Не задан — вход без пароля (сертификат клиента; `trust` в dev).
     pub password: Option<SecretRef>,
+    /// Логин и пароль из database secrets engine с арендой и ротацией (вместо `password`; логин из адреса
+    /// не используется). Не задано — статический пароль `password`.
+    pub dynamic_credentials: Option<DynamicCredentials>,
     /// Адрес PostgreSQL в обход PgBouncer для миграций (без пароля); по умолчанию — `url`.
     pub direct_url: Option<String>,
     /// Соединение через PgBouncer в режиме transaction.
@@ -86,6 +93,7 @@ impl Default for PoolConfig {
         Self {
             url: String::new(),
             password: None,
+            dynamic_credentials: None,
             direct_url: None,
             pgbouncer: false,
             max_connections: 32,
@@ -106,6 +114,7 @@ impl fmt::Debug for PoolConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PoolConfig")
             .field("password", &self.password)
+            .field("dynamic_credentials", &self.dynamic_credentials)
             .field("pgbouncer", &self.pgbouncer)
             .field("max_connections", &self.max_connections)
             .field("min_connections", &self.min_connections)
@@ -141,9 +150,10 @@ impl PoolConfig {
     }
 
     /// Проверяет секцию (`thepost config check` и запуск): адреса `url` и `direct_url`, TLS канала,
-    /// пароль в адресах (только профиль dev).
+    /// пароль в адресах (только профиль dev), динамические учётные данные.
     /// `Transport::Plaintext` — хотя бы один адрес открыт (только профиль dev с `tls.allow_plaintext`).
     pub fn check(&self) -> Result<Transport> {
+        self.check_credentials()?;
         let (_, mut transport) = self.options(&self.url, self.pgbouncer)?;
         if let Some(direct) = &self.direct_url
             && self.options(direct, false)?.1 == Transport::Plaintext
@@ -151,6 +161,19 @@ impl PoolConfig {
             transport = Transport::Plaintext;
         }
         Ok(transport)
+    }
+
+    /// Пароль и динамические учётные данные не заданы вместе; параметры ротации.
+    fn check_credentials(&self) -> Result<()> {
+        if let Some(dc) = &self.dynamic_credentials {
+            if self.password.is_some() {
+                return Err(Error::invalid(
+                    "database: задайте либо password, либо dynamic_credentials",
+                ));
+            }
+            dc.check()?;
+        }
+        Ok(())
     }
 
     fn options(&self, url: &str, pgbouncer: bool) -> Result<(PgConnectOptions, Transport)> {
@@ -257,12 +280,82 @@ pub(crate) async fn fetch_secret(
     })
 }
 
+/// Параметры соединения с `url` и учётными данными из хранилища: статический пароль или одна выдача
+/// динамических учётных данных (без ротации).
+async fn credentials_options(
+    cfg: &PoolConfig,
+    url: &str,
+    pgbouncer: bool,
+    secrets: &dyn SecretStore,
+) -> Result<PgConnectOptions> {
+    cfg.check_credentials()?;
+    match &cfg.dynamic_credentials {
+        Some(dc) => {
+            let issued = credentials::issue(dc, secrets).await?;
+            Ok(issued.apply(cfg.open_options(url, pgbouncer, None)?))
+        }
+        None => {
+            let password = cfg.password(secrets).await?;
+            cfg.open_options(url, pgbouncer, password.as_ref())
+        }
+    }
+}
+
 /// Пул по конфигурации; пароль — из хранилища секретов. Первое соединение открывается сразу
 /// (ошибка адреса, секрета или доступа — при старте).
+///
+/// Динамические учётные данные берутся один раз, без продления аренды — для коротких команд (`doctor`,
+/// `verify`); долгоживущему узлу — [`connect_rotating`].
 pub async fn connect(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Result<PgPool> {
-    let password = cfg.password(secrets).await?;
-    let opts = cfg.open_options(&cfg.url, cfg.pgbouncer, password.as_ref())?;
+    let opts = credentials_options(cfg, &cfg.url, cfg.pgbouncer, secrets).await?;
     cfg.pool_options().connect_with(opts).await.map_err(db_err)
+}
+
+/// Пул узла: как [`connect`], а с [`PoolConfig::dynamic_credentials`] — с задачей ротации учётных данных
+/// ([`crate::credentials`]): аренда продлевается, при отказе — новые учётные данные для новых соединений без
+/// остановки ролей. Задача завершается с закрытием пула ([`PgPool::close`]).
+pub async fn connect_rotating(cfg: &PoolConfig, secrets: Arc<dyn SecretStore>) -> Result<PgPool> {
+    if cfg.dynamic_credentials.is_none() {
+        return connect(cfg, secrets.as_ref()).await;
+    }
+    let pool = rotating_pool(cfg, secrets).await?;
+    if let Err(e) = pool.acquire().await {
+        pool.close().await;
+        return Err(db_err(e));
+    }
+    Ok(pool)
+}
+
+/// Пул с ротацией без открытия соединения (соединения — по требованию).
+pub(crate) async fn rotating_pool(
+    cfg: &PoolConfig,
+    secrets: Arc<dyn SecretStore>,
+) -> Result<PgPool> {
+    cfg.check_credentials()?;
+    let Some(dc) = cfg.dynamic_credentials.clone() else {
+        return Err(Error::invalid("database.dynamic_credentials не задан"));
+    };
+    let issued = credentials::issue(&dc, secrets.as_ref()).await?;
+    let opts = issued.apply(cfg.open_options(&cfg.url, cfg.pgbouncer, None)?);
+    let rotated = Rotated::default();
+    let hook = rotated.clone();
+    // Соединение, открытое до смены учётных данных, закрывается при выдаче из пула (занятые — дорабатывают).
+    let pool = cfg
+        .pool_options()
+        .before_acquire(move |_conn, meta| {
+            let keep = hook.current(meta.age);
+            Box::pin(async move { Ok(keep) })
+        })
+        .connect_lazy_with(opts);
+    let rotation = Rotation {
+        cfg: cfg.clone(),
+        dc,
+        secrets,
+        pool: pool.clone(),
+        rotated,
+    };
+    tokio::spawn(rotation.run(issued));
+    Ok(pool)
 }
 
 /// Пул к адресу `url` с паролем `password` и параметрами `cfg`, соединения — по требованию
@@ -278,8 +371,7 @@ pub async fn connect_direct(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Resu
         Some(url) => (url.as_str(), false),
         None => (cfg.url.as_str(), cfg.pgbouncer),
     };
-    let password = cfg.password(secrets).await?;
-    let opts = cfg.open_options(url, pgbouncer, password.as_ref())?;
+    let opts = credentials_options(cfg, url, pgbouncer, secrets).await?;
     PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(cfg.acquire_timeout)
@@ -439,6 +531,37 @@ mod tests {
         // dev: пароль в адресе допустим.
         let url = "postgres://u:p@db/thepost?sslmode=disable";
         assert_eq!(dev(url).check(), Ok(Transport::Plaintext));
+    }
+
+    #[test]
+    fn dynamic_credentials_section() {
+        let yaml = r#"
+url: postgres://db.internal/thepost
+dynamic_credentials:
+  username: { secret: "database/creds/thepost#username" }
+  password: { secret: "database/creds/thepost#password" }
+  retry_interval: 2s
+"#;
+        let c: PoolConfig = serde_yaml_ng::from_str(yaml).expect("yaml");
+        let dc = c.dynamic_credentials.as_ref().expect("dynamic");
+        assert_eq!(dc.username.to_string(), "database/creds/thepost#username");
+        assert_eq!(dc.retry_interval, Duration::from_secs(2));
+        assert_eq!(dc.renew_at_percent, 67);
+        assert_eq!(c.check(), Ok(Transport::Tls));
+        assert!(format!("{c:?}").contains("database/creds/thepost"));
+        // Вместе со статическим паролем — ошибка; неверная доля продления — тоже.
+        let both = PoolConfig {
+            password: Some("thepost/db#password".parse().expect("ref")),
+            ..c.clone()
+        };
+        assert!(
+            matches!(both.check(), Err(Error::Invalid(m)) if m.contains("dynamic_credentials"))
+        );
+        let mut bad = c.clone();
+        if let Some(dc) = bad.dynamic_credentials.as_mut() {
+            dc.renew_at_percent = 95;
+        }
+        assert!(bad.check().is_err());
     }
 
     #[test]
