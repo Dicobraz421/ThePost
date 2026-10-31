@@ -44,7 +44,7 @@
 <text x="375.0" y="124" font-size="11" text-anchor="middle" fill="#262626">приём 25 по MX, Milter</text>
 <text x="375.0" y="139" font-size="11" text-anchor="middle" fill="#262626">без доступа к данным</text>
 <text x="375.0" y="154" font-size="11" text-anchor="middle" fill="#262626">без очереди (сквозная)</text>
-<text x="375.0" y="169" font-size="11" text-anchor="middle" fill="#262626">адреса, ключи — изнутри</text>
+<text x="375.0" y="169" font-size="11" text-anchor="middle" fill="#262626">секреты: OpenBao (edge/*)</text>
 <path d="M260,128 L300,128" fill="none" stroke="#404040" stroke-width="1.6" marker-end="url(#a)" marker-start="url(#a)"/>
 <text x="375" y="82" font-size="10.5" text-anchor="middle" fill="#404040">SMTP 25 по MX → edge → transport</text>
 <path d="M260,243 L300,243" fill="none" stroke="#404040" stroke-width="1.6" marker-end="url(#a)"/>
