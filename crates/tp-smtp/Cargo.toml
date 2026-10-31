@@ -33,3 +33,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tp-testkit.workspace = true
+insta.workspace = true
