@@ -10,8 +10,8 @@
 //!    в той же транзакции); затем `MailboxChanged` в шину.
 //!
 //! Сбой загрузки снимает добавленные ссылки и не оставляет метаданных; сбой вставки одной доставки
-//! откатывает уже вставленные (`expunge_final`) и снимает ссылки остальных: запрос выполняется целиком
-//! или не выполняется (вызывающий может повторить).
+//! откатывает уже вставленные (`to_trash` и `expunge_final`: окончательно удаляются только письма в корзине)
+//! и снимает ссылки остальных: запрос выполняется целиком или не выполняется (вызывающий может повторить).
 
 use std::collections::HashMap;
 
@@ -295,7 +295,11 @@ impl Store {
             }
         }
         for (scope, ids) in by_account {
-            if let Err(e) = self.d.messages.expunge_final(scope, &ids).await {
+            let purged = match self.d.messages.to_trash(scope, &ids).await {
+                Ok(_) => self.d.messages.expunge_final(scope, &ids).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = purged {
                 tracing::error!(error = %e, "mailstore: откат приёма — вставленные письма не удалены");
             }
         }

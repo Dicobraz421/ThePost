@@ -1998,6 +1998,11 @@ mod tests {
             panic!("message expected");
         };
         assert_eq!((mailbox, inserted.id), (inbox, m2));
+        // Восстановлено между `expired` и `expunge_final` (CTR-18): письмо остаётся.
+        let ms = meta.expunge_final(s, &[m2]).await.expect("expunge");
+        assert_eq!(ms, inserted.modseq, "ничего не изменилось");
+        let kept = MessageStore::get(&meta, s, m2).await.expect("get");
+        assert_eq!(kept.map(|m| m.mailbox), Some(inbox));
         assert_eq!(
             trash.restore(s, TrashObject::Message(m2)).await,
             Err(Error::NotFound)
