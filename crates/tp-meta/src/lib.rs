@@ -16,6 +16,7 @@ pub mod membership;
 pub mod messages;
 pub mod modules;
 pub mod pool;
+pub mod queue;
 pub mod schema;
 pub mod shards;
 

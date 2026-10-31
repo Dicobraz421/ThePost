@@ -223,3 +223,58 @@ pub async fn account(meta: &PgMeta) -> tp_contracts::meta::AccountScope {
         account: acc.id,
     }
 }
+
+/// Отдельная чистая БД для тестов системных выборок по всем организациям (очередь, истёкшая корзина,
+/// перестройки индексов): записи других тестов и прежних запусков в них не попадают.
+pub struct FreshDb {
+    /// Хранилища над чистой БД.
+    pub meta: PgMeta,
+    admin: PgPool,
+    name: String,
+}
+
+impl FreshDb {
+    /// Удаляет БД (в конце теста).
+    pub async fn drop_db(self) {
+        use sqlx::{AssertSqlSafe, Executor};
+        self.meta.pool().close().await;
+        self.admin
+            .execute(AssertSqlSafe(format!(
+                "DROP DATABASE {} WITH (FORCE)",
+                self.name
+            )))
+            .await
+            .expect("drop database");
+    }
+}
+
+/// Хранилища над новой чистой БД со схемой.
+pub async fn fresh_meta() -> Option<FreshDb> {
+    use std::str::FromStr;
+
+    use sqlx::postgres::PgConnectOptions;
+    use sqlx::{AssertSqlSafe, Executor};
+    let url = pg_url()?;
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("подключение к TEST_DATABASE_URL");
+    let name = format!("tp_meta_{}", uuid::Uuid::now_v7().simple());
+    admin
+        .execute(AssertSqlSafe(format!("CREATE DATABASE {name}")))
+        .await
+        .expect("create database");
+    let opts = PgConnectOptions::from_str(&url)
+        .expect("url")
+        .database(&name);
+    let pool = PgPoolOptions::new()
+        .max_connections(16)
+        .connect_with(opts)
+        .await
+        .expect("подключение к чистой БД");
+    let meta = PgMeta::open(pool, MetaConfig::default())
+        .await
+        .expect("open");
+    Some(FreshDb { meta, admin, name })
+}
