@@ -17,6 +17,7 @@ pub mod meta;
 pub mod queue;
 pub mod retention;
 pub mod role;
+pub mod sasl;
 pub mod search;
 pub mod secrets;
 pub mod tls;
