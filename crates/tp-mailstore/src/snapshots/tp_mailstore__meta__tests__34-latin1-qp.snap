@@ -1,0 +1,61 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      32,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Café crème",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-032@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "text",
+    "subtype": "plain",
+    "params": [
+      [
+        "charset",
+        "iso-8859-1"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": "quoted-printable",
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 44,
+    "lines": 0,
+    "children": []
+  },
+  "preview": "Café crème brûlée, naïve façade.",
+  "thread_key": "<corpus-032@example.com>",
+  "has_attachment": false
+}

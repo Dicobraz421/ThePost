@@ -1,0 +1,61 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      31,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "\u001b$B%F%9%H\u001b(B",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-031@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "text",
+    "subtype": "plain",
+    "params": [
+      [
+        "charset",
+        "iso-2022-jp"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": "7bit",
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 24,
+    "lines": 0,
+    "children": []
+  },
+  "preview": "テストメッセージ",
+  "thread_key": "<corpus-031@example.com>",
+  "has_attachment": false
+}

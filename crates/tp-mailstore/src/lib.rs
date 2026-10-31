@@ -24,6 +24,7 @@ use tp_contracts::{MailboxId, MessageId, ModSeq, Result};
 
 mod fetch;
 mod ingest;
+pub mod meta;
 mod ops;
 pub mod quota;
 pub mod split;
