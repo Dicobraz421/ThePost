@@ -5,22 +5,21 @@
 //! проверок окружения. Проверки открытых каналов подключаются через [`SectionRegistry::add_check`]: `thepost config
 //! check` (строгий режим) и запуск (мягкий режим) отвергают адрес без TLS вне профиля dev.
 //!
-//! Конфигурации `tp-blob` и `tp-cluster` пока без `Deserialize` и с длительностями в секундах/миллисекундах;
-//! здесь — их секции с длительностями humantime, переводимые в конфигурации крейтов.
+//! Подсекции `blob.local`, `blob.s3` и `bus.valkey` — секции крейтов `tp-blob` и `tp-cluster` как есть (BLOB-11,
+//! CLU-07): приложение подставляет только каталог, бакет и префикс из `blob.url`.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tp_blob::{LocalConfig, S3Config};
-use tp_cluster::{LocalBusConfig, ValkeyBusConfig};
+use tp_blob::{GcConfig, LocalConfig, OrphanConfig, S3Config};
+use tp_cluster::{LocalBusConfig, ValkeyConfig};
 use tp_contracts::config::duration;
-use tp_contracts::secrets::SecretRef;
-use tp_contracts::tls::{InternalChannel, InternalTls, Profile};
+use tp_contracts::tls::{InternalChannel, Profile};
 use tp_contracts::{Error, Result};
 use tp_meta::MetaConfig;
-use tp_meta::pool::{PoolConfig, url_has_password};
+use tp_meta::pool::PoolConfig;
 use tp_platform::SectionRegistry;
 
 use crate::modules;
@@ -33,6 +32,8 @@ pub const BUS: &str = "bus";
 pub const CLUSTER: &str = "cluster";
 /// Имя секции порогов `thepost doctor`.
 pub const DOCTOR: &str = "doctor";
+/// Имя секции `thepost verify`.
+pub const VERIFY: &str = "verify";
 
 /// Реестр секций: платформа, `tp-meta`, приложение и встроенные модули; проверки каналов.
 pub fn registry() -> Result<SectionRegistry> {
@@ -43,6 +44,7 @@ pub fn registry() -> Result<SectionRegistry> {
     r.add_section::<BusSection>(BUS)?;
     r.add_section::<ClusterSection>(CLUSTER)?;
     r.add_section::<DoctorSection>(DOCTOR)?;
+    r.add_section::<VerifySection>(VERIFY)?;
     r.add_check::<PoolConfig>(PoolConfig::SECTION, |c, profile| {
         pool_config(c, profile).check().map(drop)
     })?;
@@ -70,8 +72,9 @@ pub fn pool_config(c: &PoolConfig, profile: Profile) -> PoolConfig {
 ///   url: file:///var/lib/thepost/blob      # или s3://thepost-blob/prefix
 ///   s3:
 ///     endpoint: https://seaweedfs:8333
-///     access_key_id: { secret: "thepost/s3#access_key_id" }
-///     secret_access_key: { secret: "thepost/s3#secret_access_key" }
+///     credentials:
+///       access_key_id: { secret: "thepost/s3#access_key_id" }
+///       secret_access_key: { secret: "thepost/s3#secret_access_key" }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -79,10 +82,14 @@ pub struct BlobSection {
     /// Адрес хранилища: `file:///<каталог>` — локальный каталог (в том числе общий для узлов),
     /// `s3://<бакет>[/<префикс>]` — S3 (адрес API — `s3.endpoint`). Требует перезапуска.
     pub url: String,
-    /// Параметры локального каталога.
-    pub local: LocalSection,
-    /// Параметры S3.
-    pub s3: S3Section,
+    /// Параметры локального каталога — секция `tp-blob`; каталог (`root`) задаётся в `url`.
+    pub local: LocalConfig,
+    /// Параметры S3 — секция `tp-blob`; бакет и префикс (`bucket`, `prefix`) задаются в `url`.
+    pub s3: S3Config,
+    /// Сборка мусора объектов (роль maintenance) — секция `tp-blob`.
+    pub gc: GcConfig,
+    /// Поиск «сирот» (роль maintenance) — секция `tp-blob`.
+    pub orphans: OrphanConfig,
 }
 
 /// Где лежат объекты: разобранный `blob.url`.
@@ -126,143 +133,42 @@ impl BlobSection {
         ))
     }
 
-    /// Проверка секции: адрес, TLS канала S3 (`https://`; `http://` — только dev с `s3.tls.allow_plaintext`).
-    pub fn check(&self, profile: Profile) -> Result<()> {
-        self.s3.tls.validate(InternalChannel::S3, profile)?;
-        match self.location()? {
-            BlobLocation::Local(_) => Ok(()),
-            BlobLocation::S3 { bucket, prefix } => self
-                .s3
-                .config(bucket, prefix, None)
-                .check(profile)
-                .map(drop),
-        }
-    }
-}
-
-/// Подсекция `blob.local`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(default, deny_unknown_fields)]
-pub struct LocalSection {
-    /// fsync файла и каталога при записи (выключать нельзя для источника истины).
-    pub fsync: bool,
-    /// Размер блока потокового чтения, байт.
-    pub read_chunk_bytes: usize,
-    /// Возраст брошенного временного файла, после которого он удаляется при открытии (`24h`).
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub stale_tmp: Duration,
-}
-
-impl Default for LocalSection {
-    fn default() -> Self {
-        let d = LocalConfig::default();
-        Self {
-            fsync: d.fsync,
-            read_chunk_bytes: d.read_chunk_bytes,
-            stale_tmp: Duration::from_secs(d.stale_tmp_secs),
-        }
-    }
-}
-
-impl LocalSection {
-    /// Конфигурация `tp-blob` для каталога `root`.
-    pub fn config(&self, root: PathBuf) -> LocalConfig {
+    /// Конфигурация локального хранилища для каталога `root` из `url`.
+    pub fn local_config(&self, root: PathBuf) -> LocalConfig {
         LocalConfig {
             root,
-            fsync: self.fsync,
-            read_chunk_bytes: self.read_chunk_bytes,
-            stale_tmp_secs: self.stale_tmp.as_secs(),
+            ..self.local.clone()
         }
     }
-}
 
-/// Подсекция `blob.s3`. Ключи доступа — только ссылки на секреты; не заданы — из окружения или роли экземпляра.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(default, deny_unknown_fields)]
-pub struct S3Section {
-    /// Адрес S3 API (`https://seaweedfs:8333`); не задан — AWS по региону.
-    pub endpoint: Option<String>,
-    /// Регион.
-    pub region: String,
-    /// Адресация path-style (SeaweedFS, MinIO).
-    pub path_style: bool,
-    /// Идентификатор ключа доступа — ссылка на секрет.
-    pub access_key_id: Option<SecretRef>,
-    /// Секрет ключа доступа — ссылка на секрет.
-    pub secret_access_key: Option<SecretRef>,
-    /// TLS канала до S3.
-    pub tls: InternalTls,
-    /// Объекты не меньше этого размера загружаются multipart, байт.
-    pub multipart_threshold_bytes: u64,
-    /// Размер части multipart, байт.
-    pub multipart_part_bytes: usize,
-    /// Одновременно загружаемых частей объекта.
-    pub multipart_concurrency: usize,
-    /// Повторов запроса при временных сбоях.
-    pub max_retries: usize,
-    /// Предел времени повторов запроса.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub retry_timeout: Duration,
-    /// Таймаут запроса.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub request_timeout: Duration,
-    /// Таймаут установления соединения.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub connect_timeout: Duration,
-}
-
-impl Default for S3Section {
-    fn default() -> Self {
-        let d = S3Config::default();
-        Self {
-            endpoint: d.endpoint,
-            region: d.region,
-            path_style: d.path_style,
-            access_key_id: None,
-            secret_access_key: None,
-            tls: d.tls,
-            multipart_threshold_bytes: d.multipart_threshold_bytes,
-            multipart_part_bytes: d.multipart_part_bytes,
-            multipart_concurrency: d.multipart_concurrency,
-            max_retries: d.max_retries,
-            retry_timeout: Duration::from_millis(d.retry_timeout_ms),
-            request_timeout: Duration::from_millis(d.request_timeout_ms),
-            connect_timeout: Duration::from_millis(d.connect_timeout_ms),
-        }
-    }
-}
-
-impl S3Section {
-    /// Конфигурация `tp-blob` для бакета и префикса; `keys` — значения ключей доступа из хранилища секретов.
-    pub fn config(
-        &self,
-        bucket: String,
-        prefix: String,
-        keys: Option<(String, String)>,
-    ) -> S3Config {
-        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-        let (access_key_id, secret_access_key) = keys.unzip();
+    /// Конфигурация S3 для бакета и префикса из `url`.
+    pub fn s3_config(&self, bucket: String, prefix: String) -> S3Config {
         S3Config {
-            endpoint: self.endpoint.clone(),
             bucket,
-            region: self.region.clone(),
             prefix,
-            access_key_id,
-            secret_access_key,
-            path_style: self.path_style,
-            tls: self.tls.clone(),
-            multipart_threshold_bytes: self.multipart_threshold_bytes,
-            multipart_part_bytes: self.multipart_part_bytes,
-            multipart_concurrency: self.multipart_concurrency,
-            max_retries: self.max_retries,
-            retry_timeout_ms: ms(self.retry_timeout),
-            request_timeout_ms: ms(self.request_timeout),
-            connect_timeout_ms: ms(self.connect_timeout),
-            ..S3Config::default()
+            ..self.s3.clone()
+        }
+    }
+
+    /// Проверка секции: адрес, TLS канала S3 (`https://`; `http://` — только dev с `s3.tls.allow_plaintext`);
+    /// каталог, бакет и префикс — только в `url`.
+    pub fn check(&self, profile: Profile) -> Result<()> {
+        self.s3.tls.validate(InternalChannel::S3, profile)?;
+        if self.local.root != LocalConfig::default().root {
+            return Err(Error::invalid(
+                "local.root: каталог задаётся в blob.url (file:///<каталог>)",
+            ));
+        }
+        if self.s3.bucket != S3Config::default().bucket || !self.s3.prefix.is_empty() {
+            return Err(Error::invalid(
+                "s3.bucket, s3.prefix: бакет и префикс задаются в blob.url (s3://<бакет>/<префикс>)",
+            ));
+        }
+        match self.location()? {
+            BlobLocation::Local(_) => Ok(()),
+            BlobLocation::S3 { bucket, prefix } => {
+                self.s3_config(bucket, prefix).check(profile).map(drop)
+            }
         }
     }
 }
@@ -296,8 +202,8 @@ pub struct BusSection {
     pub kind: BusKind,
     /// Буфер подписчика шины в процессе: столько непрочитанных уведомлений до отключения отставшего.
     pub capacity: usize,
-    /// Параметры Valkey (`kind: valkey`).
-    pub valkey: ValkeySection,
+    /// Параметры Valkey (`kind: valkey`) — секция `tp-cluster`.
+    pub valkey: ValkeyConfig,
 }
 
 impl Default for BusSection {
@@ -305,26 +211,20 @@ impl Default for BusSection {
         Self {
             kind: BusKind::Local,
             capacity: LocalBusConfig::default().capacity,
-            valkey: ValkeySection::default(),
+            valkey: ValkeyConfig::default(),
         }
     }
 }
 
 impl BusSection {
     /// Проверка: адрес Valkey `rediss://` (`redis://` — только dev с `valkey.tls.allow_plaintext`),
-    /// пароль — только ссылкой `valkey.password` (в адресе — только dev).
+    /// пароль — только ссылкой `valkey.password` (в адресе — только dev): `ValkeyConfig::check`.
     pub fn check(&self, profile: Profile) -> Result<()> {
         self.valkey.tls.validate(InternalChannel::Valkey, profile)?;
         if self.kind != BusKind::Valkey {
             return Ok(());
         }
-        if profile != Profile::Dev && url_has_password(&self.valkey.url) {
-            return Err(Error::invalid(
-                "bus.valkey.url: пароль в адресе допустим только в профиле dev; \
-                 задайте bus.valkey.password: { secret: \"<путь>#<поле>\" }",
-            ));
-        }
-        self.valkey.config(None).check(profile).map(drop)
+        self.valkey.check(profile).map(drop)
     }
 
     /// Конфигурация шины в процессе.
@@ -333,114 +233,6 @@ impl BusSection {
             capacity: self.capacity,
         }
     }
-}
-
-/// Подсекция `bus.valkey`.
-#[derive(Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(default, deny_unknown_fields)]
-pub struct ValkeySection {
-    /// Адрес без пароля: `rediss://узел:порт[/база]`.
-    pub url: String,
-    /// Пароль — ссылка на секрет.
-    pub password: Option<SecretRef>,
-    /// TLS канала: CA, клиентский сертификат (mTLS), `allow_plaintext` (dev).
-    pub tls: InternalTls,
-    /// Префикс имён каналов.
-    pub channel_prefix: String,
-    /// Буфер уведомлений подписчика на узле.
-    pub buffer: usize,
-    /// Таймаут установки соединения.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub connect_timeout: Duration,
-    /// Таймаут команды.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub command_timeout: Duration,
-    /// Начальная задержка переподключения (удваивается до `reconnect_max`).
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub reconnect_min: Duration,
-    /// Предельная задержка переподключения.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub reconnect_max: Duration,
-    /// Период проверки соединения PING.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub ping_interval: Duration,
-}
-
-impl std::fmt::Debug for ValkeySection {
-    // Адрес в dev может содержать пароль — в журнал не попадает.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ValkeySection")
-            .field("password", &self.password)
-            .field("tls", &self.tls)
-            .field("channel_prefix", &self.channel_prefix)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for ValkeySection {
-    fn default() -> Self {
-        let d = ValkeyBusConfig::default();
-        Self {
-            url: d.url,
-            password: None,
-            tls: d.tls,
-            channel_prefix: d.channel_prefix,
-            buffer: d.buffer,
-            connect_timeout: Duration::from_millis(d.connect_timeout_ms),
-            command_timeout: Duration::from_millis(d.command_timeout_ms),
-            reconnect_min: Duration::from_millis(d.reconnect_min_ms),
-            reconnect_max: Duration::from_millis(d.reconnect_max_ms),
-            ping_interval: Duration::from_millis(d.ping_interval_ms),
-        }
-    }
-}
-
-impl ValkeySection {
-    /// Конфигурация `tp-cluster`; `password` — значение из хранилища секретов (вставляется в адрес).
-    pub fn config(&self, password: Option<&str>) -> ValkeyBusConfig {
-        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-        ValkeyBusConfig {
-            url: match password {
-                Some(p) => url_with_password(&self.url, p),
-                None => self.url.clone(),
-            },
-            tls: self.tls.clone(),
-            channel_prefix: self.channel_prefix.clone(),
-            buffer: self.buffer,
-            connect_timeout_ms: ms(self.connect_timeout),
-            command_timeout_ms: ms(self.command_timeout),
-            reconnect_min_ms: ms(self.reconnect_min),
-            reconnect_max_ms: ms(self.reconnect_max),
-            ping_interval_ms: ms(self.ping_interval),
-        }
-    }
-}
-
-/// Адрес `scheme://[user@]host…` с паролем `scheme://[user]:<пароль>@host…` (пароль кодируется `%XX`).
-pub fn url_with_password(url: &str, password: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_owned();
-    };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    let (user, host) = match authority.rsplit_once('@') {
-        Some((userinfo, host)) => (userinfo.split(':').next().unwrap_or_default(), host),
-        None => ("", authority),
-    };
-    let mut encoded = String::with_capacity(password.len());
-    for b in password.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            encoded.push(char::from(b));
-        } else {
-            encoded.push_str(&format!("%{b:02X}"));
-        }
-    }
-    format!("{scheme}://{user}:{encoded}@{host}{tail}")
 }
 
 // ---------- cluster ----------
@@ -481,6 +273,22 @@ impl ClusterSection {
             return Err(Error::invalid("периоды опроса должны быть больше нуля"));
         }
         Ok(())
+    }
+}
+
+// ---------- verify ----------
+
+/// Секция `verify`: сверка хранилища BLOB и учёта объектов (`thepost verify`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerifySection {
+    /// Записей учёта на страницу перечисления (каждая страница — своя короткая транзакция).
+    pub page_size: usize,
+}
+
+impl Default for VerifySection {
+    fn default() -> Self {
+        Self { page_size: 1000 }
     }
 }
 
@@ -600,7 +408,7 @@ blob:
         let e = err(parse(&prod(
             "bus:\n  kind: valkey\n  valkey:\n    url: rediss://:pw@v:6379\n",
         )));
-        assert!(e.contains("bus.valkey.url"), "{e}");
+        assert!(e.contains("bus") && e.contains("пароль в адресе"), "{e}");
         assert!(!e.contains("pw@"), "{e}");
         // allow_plaintext вне dev — ошибка даже у невыбранной реализации.
         let e = err(parse(&prod(
@@ -616,20 +424,25 @@ blob:
 
     #[test]
     fn secrets_only_by_reference() {
-        let e = err(parse(&format!(
-            "{MINIMAL_DEV}  s3:\n    secret_access_key: hunter2\n"
-        )));
+        let keys = |key: &str| {
+            format!(
+                "{MINIMAL_DEV}  s3:\n    credentials:\n      access_key_id: {{ secret: \"thepost/s3#id\" }}\n      secret_access_key: {key}\n"
+            )
+        };
+        let e = err(parse(&keys("hunter2")));
         assert!(!e.contains("hunter2"), "{e}");
         assert!(e.contains("secret"), "{e}");
-        let c = parse(&format!(
-            "{MINIMAL_DEV}  s3:\n    secret_access_key: {{ secret: \"thepost/s3#key\" }}\n"
-        ))
-        .expect("reference");
+        let c = parse(&keys("{ secret: \"thepost/s3#key\" }")).expect("reference");
         let blob = c.section::<BlobSection>(BLOB).expect("blob");
         assert_eq!(
-            blob.s3.secret_access_key.as_ref().map(ToString::to_string),
+            blob.s3
+                .credentials
+                .as_ref()
+                .map(|k| k.secret_access_key.to_string()),
             Some("thepost/s3#key".to_owned())
         );
+        let refs: Vec<String> = c.secret_refs().map(ToString::to_string).collect();
+        assert_eq!(refs.len(), 2, "{refs:?}");
     }
 
     #[test]
@@ -678,21 +491,28 @@ blob:
     }
 
     #[test]
-    fn valkey_password_goes_into_url() {
+    fn crate_sections_parse_and_url_owns_location() {
+        let c = parse(&format!(
+            "{MINIMAL_DEV}  local:\n    stale_tmp: 1h\n  s3:\n    request_timeout: 5s\n\
+             bus:\n  valkey:\n    url: rediss://v:6379\n    connect_timeout: 2s\n"
+        ))
+        .expect("config");
+        let blob = c.section::<BlobSection>(BLOB).expect("blob");
+        let local = blob.local_config(PathBuf::from("/data"));
         assert_eq!(
-            url_with_password("rediss://v:6379/0", "p@ss:w/rd"),
-            "rediss://:p%40ss%3Aw%2Frd@v:6379/0"
+            (local.root, local.stale_tmp_secs),
+            (PathBuf::from("/data"), 3600)
         );
-        assert_eq!(
-            url_with_password("rediss://user@v:6379", "pw"),
-            "rediss://user:pw@v:6379"
-        );
-        let s = ValkeySection {
-            url: "rediss://v:6379".into(),
-            ..ValkeySection::default()
-        };
-        assert_eq!(s.config(Some("x")).url, "rediss://:x@v:6379");
-        assert!(!format!("{s:?}").contains("6379"));
+        let s3 = blob.s3_config("b".into(), "p".into());
+        assert_eq!((s3.bucket.as_str(), s3.prefix.as_str()), ("b", "p"));
+        assert_eq!(s3.request_timeout_ms, 5000);
+        let bus = c.section::<BusSection>(BUS).expect("bus");
+        assert_eq!(bus.valkey.connect_timeout, Duration::from_secs(2));
+        // Каталог и бакет — только в blob.url.
+        let e = err(parse(&format!("{MINIMAL_DEV}  local:\n    root: /other\n")));
+        assert!(e.contains("local.root"), "{e}");
+        let e = err(parse(&format!("{MINIMAL_DEV}  s3:\n    bucket: other\n")));
+        assert!(e.contains("s3.bucket"), "{e}");
     }
 
     #[test]
@@ -705,6 +525,8 @@ blob:
             "\"database\"",
             "\"meta\"",
             "\"doctor\"",
+            "\"verify\"",
+            "\"secrets\"",
         ] {
             assert!(schema.contains(key), "{key}");
         }

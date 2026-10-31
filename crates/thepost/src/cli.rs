@@ -85,10 +85,9 @@ pub fn config_check(path: &Path) -> (i32, String) {
             let mut out = format!("{}: конфигурация верна\n", path.display());
             let refs = secrets::references(&cfg);
             if !refs.is_empty() {
-                let params: Vec<&str> = refs.iter().map(|(p, _)| *p).collect();
                 out.push_str(&format!(
                     "ссылки на секреты (читаются из хранилища секретов при запуске): {}\n",
-                    params.join(", ")
+                    refs.join(", ")
                 ));
             }
             (0, out)
@@ -241,7 +240,7 @@ mod tests {
         std::fs::write(&path, base).expect("write");
         let (code, out) = config_check(&path);
         assert_eq!(code, 0, "{out}");
-        assert!(out.contains("database.password"), "{out}");
+        assert!(out.contains("thepost/db#password"), "{out}");
 
         std::fs::write(&path, format!("{base}telemetry:\n  log_levl: info\n")).expect("write");
         let (code, out) = config_check(&path);

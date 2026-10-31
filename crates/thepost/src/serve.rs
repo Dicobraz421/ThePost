@@ -1,7 +1,8 @@
 //! `thepost serve`: сборка узла по config.yaml и работа до сигнала остановки (SRS 2.1, 2.7; APP-01).
 //!
 //! Порядок запуска: конфигурация (мягкий режим, неизвестные поля — предупреждение) → телеметрия → хранилище
-//! секретов → PostgreSQL и миграции → модули → членство узла и распределитель разделов журнала → BLOB, шина →
+//! секретов (OpenBao/Vault по секции `secrets`; секреты конфигурации читаются при запуске и перечитывании) →
+//! PostgreSQL (с ротацией динамических учётных данных) и миграции → модули → членство узла и распределитель разделов журнала → BLOB, шина →
 //! роли → служебный HTTP (`/healthz/ready` — 200, когда готовы все роли узла). Остановка: роли проходят drain,
 //! узел покидает членство, служебный HTTP и фоновые задачи останавливаются последними.
 
@@ -32,13 +33,13 @@ use crate::infra;
 use crate::modules;
 use crate::roles::{Maintenance, PendingRole};
 use crate::secrets;
-use crate::sections::{self, CLUSTER, ClusterSection};
+use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection};
 
 /// Параметры запуска узла.
 pub struct ServeOptions {
     /// Путь к config.yaml.
     pub config: PathBuf,
-    /// Хранилище секретов; `None` — не настроено (ссылки на секреты в конфигурации — ошибка запуска).
+    /// Хранилище секретов вместо клиента по секции `secrets` (тесты); `None` — по секции `secrets`.
     pub secrets: Option<Arc<dyn SecretStore>>,
     /// Установить глобальный подписчик `tracing` по секции `telemetry` (процесс; в тестах — нет).
     pub telemetry: bool,
@@ -96,6 +97,10 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         .await
         .map_err(|_| Error::internal("чтение конфигурации прервано"))??;
     let cfg = reloader.current();
+    let store = secrets::store(&cfg, opts.secrets).await?;
+    // Секреты конфигурации — при запуске и каждом перечитывании; аренды продлеваются (PLT-12).
+    let reloader = reloader.with_secret_store(store.clone()).await?;
+    let cfg = reloader.current();
 
     let telemetry = if opts.telemetry {
         Some(Telemetry::init(
@@ -119,14 +124,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         "запуск узла"
     );
 
-    let store = secrets::store(&cfg, opts.secrets)?;
-    let pool = infra::connect_db(&cfg, store.as_ref()).await?;
+    let pool = infra::connect_node_db(&cfg, store.clone()).await?;
     let meta_cfg = (*cfg.section::<MetaConfig>(MetaConfig::SECTION)?).clone();
     let migrations = infra::migration_pool(&cfg, store.as_ref(), &pool).await?;
     if meta_cfg.migrate_on_start {
         tp_meta::schema::migrate(&migrations).await?;
     }
     let events_cfg = meta_cfg.events.clone();
+    let blob_cfg = cfg.section::<BlobSection>(BLOB)?;
     let meta = PgMeta::new(pool, meta_cfg);
 
     let ext = modules::activate(&cfg, &migrations).await?;
@@ -187,6 +192,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         events,
         sinks: ext.event_sinks().to_vec(),
         events_poll: cluster.events_poll_interval,
+        gc: blob_cfg.gc.clone(),
+        orphans: blob_cfg.orphans.clone(),
     });
     for role in Role::ALL.iter().copied() {
         roles.add(role, |_limits| {
@@ -409,7 +416,7 @@ mod tests {
         let (o, _) = opts(path, None);
         let e = start(o).await.expect_err("no secret store").to_string();
         assert!(e.contains("хранилище секретов не настроено"), "{e}");
-        assert!(e.contains("database.password"), "{e}");
+        assert!(e.contains("thepost/db#password"), "{e}");
     }
 
     #[tokio::test]
@@ -430,15 +437,11 @@ mod tests {
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let (url, password) = split_password(&dev_url(&url));
-        let secrets = MemSecretStore::default();
-        let password_line = match password {
-            Some(p) => {
-                let r: SecretRef = "thepost/db#password".parse().expect("ref");
-                secrets.set(&r, p);
-                "  password: { secret: \"thepost/db#password\" }\n"
-            }
-            None => "",
-        };
+        let secrets = Arc::new(MemSecretStore::default());
+        // Без пароля в адресе (trust) пароль серверу не нужен, но ссылка всё равно разрешается.
+        let db: SecretRef = "thepost/db#password".parse().expect("ref");
+        secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+        let valkey: SecretRef = "thepost/valkey#password".parse().expect("ref");
         let node = format!("app-test-{}", std::process::id());
         let blob = dir.path().join("blob");
         let path = write_config(
@@ -446,15 +449,22 @@ mod tests {
             &format!(
                 "domain: example.org\nprofile: dev\nroles: [all]\n\
                  service_http:\n  listen: 127.0.0.1:0\n  allow_plaintext: true\n\
-                 database:\n  url: \"{url}\"\n{password_line}  tls: {{ allow_plaintext: true }}\n\
+                 database:\n  url: \"{url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
+                 bus:\n  valkey:\n    password: {{ secret: \"{valkey}\" }}\n\
                  meta:\n  events:\n    node_ttl: 3s\n\
                  cluster:\n  node_id: {node}\n\
-                 runtime:\n  drain_deadline_ms: 5000\n\
+                 runtime:\n  drain_deadline: 5s\n\
                  blob:\n  url: file://{}\n",
                 blob.display()
             ),
         );
-        let (o, shutdown) = opts(path, Some(Arc::new(secrets)));
+        // Секреты конфигурации читаются все при запуске: пароля Valkey (шиной в процессе он не используется)
+        // нет в хранилище — узел не стартует.
+        let (o, _) = opts(path.clone(), Some(secrets.clone()));
+        let e = start(o).await.expect_err("no valkey secret").to_string();
+        assert!(e.contains("thepost/valkey#password"), "{e}");
+        secrets.set(&valkey, "pw");
+        let (o, shutdown) = opts(path, Some(secrets));
         let running = start(o).await.expect("start");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         while !running.health.is_ready() {

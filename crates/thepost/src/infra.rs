@@ -14,7 +14,6 @@ use tp_contracts::{Error, Result};
 use tp_meta::pool::{self, PoolConfig};
 use tp_platform::{BusSample, Config};
 
-use crate::secrets;
 use crate::sections::{
     self, BLOB, BUS, BlobLocation, BlobSection, BusKind, BusSection, CLUSTER, ClusterSection,
 };
@@ -27,10 +26,20 @@ pub fn pool_config(cfg: &Config) -> Result<PoolConfig> {
     ))
 }
 
-/// Пул PostgreSQL узла (пароль — из хранилища секретов).
+/// Пул PostgreSQL для коротких команд (`doctor`, `verify`): пароль или динамические учётные данные — из
+/// хранилища секретов, один раз.
 pub async fn connect_db(cfg: &Config, store: &dyn SecretStore) -> Result<PgPool> {
     let db = pool_config(cfg)?;
     pool::connect(&db, store)
+        .await
+        .map_err(|e| context("database", e))
+}
+
+/// Пул PostgreSQL узла (`serve`): с `database.dynamic_credentials` аренда учётных данных продлевается, при
+/// отказе — новые учётные данные для новых соединений (META-18).
+pub async fn connect_node_db(cfg: &Config, store: Arc<dyn SecretStore>) -> Result<PgPool> {
+    let db = pool_config(cfg)?;
+    pool::connect_rotating(&db, store)
         .await
         .map_err(|e| context("database", e))
 }
@@ -50,37 +59,20 @@ pub async fn migration_pool(
     Ok(main.clone())
 }
 
-/// Хранилище BLOB по `blob.url`.
+/// Хранилище BLOB по `blob.url`; ключи S3 — из хранилища секретов (`blob.s3.credentials`).
 pub async fn open_blob(cfg: &Config, store: &dyn SecretStore) -> Result<Arc<dyn BlobStore>> {
     let blob = cfg.section::<BlobSection>(BLOB)?;
     match blob.location()? {
         BlobLocation::Local(root) => {
-            let store = LocalStore::open(blob.local.config(root))
+            let store = LocalStore::open(blob.local_config(root))
                 .await
                 .map_err(|e| context("blob", e))?;
             Ok(Arc::new(store))
         }
         BlobLocation::S3 { bucket, prefix } => {
-            let keys = match (&blob.s3.access_key_id, &blob.s3.secret_access_key) {
-                (Some(id), Some(key)) => {
-                    let id = secrets::fetch(store, "blob.s3.access_key_id", id).await?;
-                    let key = secrets::fetch(store, "blob.s3.secret_access_key", key).await?;
-                    Some((id.expose().to_owned(), key.expose().to_owned()))
-                }
-                (None, None) => None,
-                _ => {
-                    return Err(Error::invalid(
-                        "blob.s3: access_key_id и secret_access_key задаются вместе",
-                    ));
-                }
-            };
-            let s3 = blob.s3.config(bucket, prefix, keys);
-            let profile = cfg.profile();
-            // Чтение CA из файла — блокирующий I/O.
-            let store = tokio::task::spawn_blocking(move || S3Store::new(s3, profile))
+            let store = S3Store::connect(blob.s3_config(bucket, prefix), cfg.profile(), store)
                 .await
-                .map_err(|_| Error::internal("blob: задача создания клиента S3 прервана"))?
-                .map_err(|e| context("blob", e))?;
+                .map_err(|e| context("blob.s3", e))?;
             Ok(Arc::new(store))
         }
     }
@@ -115,14 +107,9 @@ pub async fn open_bus(cfg: &Config, store: &dyn SecretStore) -> Result<Bus> {
             })
         }
         BusKind::Valkey => {
-            let password = match &section.valkey.password {
-                Some(r) => Some(secrets::fetch(store, "bus.valkey.password", r).await?),
-                None => None,
-            };
-            let config = section
-                .valkey
-                .config(password.as_ref().map(tp_contracts::secrets::Secret::expose));
-            let bus = ValkeyBus::start(config, cfg.profile()).map_err(|e| context("bus", e))?;
+            let bus = ValkeyBus::connect(section.valkey.clone(), cfg.profile(), store)
+                .await
+                .map_err(|e| context("bus.valkey", e))?;
             let counters = bus.counters();
             Ok(Bus {
                 bus: Arc::new(bus),
@@ -193,7 +180,7 @@ mod tests {
              blob:\n  url: file://{}\ncluster:\n  node_id: node-a\n",
             dir.path().display().to_string().replace('\\', "/")
         ));
-        let none = secrets::NoSecretStore;
+        let none = crate::secrets::NoSecretStore;
         let store = open_blob(&cfg, &none).await.expect("blob");
         store
             .put_raw("doctor/probe", bytes::Bytes::from_static(b"x"))
@@ -213,11 +200,8 @@ mod tests {
              blob:\n  url: file:///tmp/b\nbus:\n  kind: valkey\n  valkey:\n    url: redis://127.0.0.1:1\n    password: { secret: \"thepost/valkey#password\" }\n    tls: { allow_plaintext: true }\n",
         );
         let mem = tp_testkit::MemSecretStore::default();
-        let e = open_bus(&cfg, &mem)
-            .await
-            .expect_err("no secret")
-            .to_string();
-        assert!(e.contains("bus.valkey.password"), "{e}");
+        let e = open_bus(&cfg, &mem).await.expect_err("no secret");
+        assert!(e.is_retryable(), "{e}");
         mem.set(&"thepost/valkey#password".parse().expect("ref"), "pw");
         // Шина стартует (подключение — в фоне, адрес недоступен — переподключения).
         let bus = open_bus(&cfg, &mem).await.expect("bus");

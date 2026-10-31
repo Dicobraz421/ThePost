@@ -7,12 +7,16 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tp_blob::{BlobInventory, Verifier, VerifyConfig, VerifyReport, system_now};
+use async_trait::async_trait;
+use futures::stream::{self, BoxStream};
+use futures::{StreamExt, TryStreamExt};
+use tp_blob::{BlobInventory, IndexedBlob, Verifier, VerifyConfig, VerifyReport, system_now};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::secrets::SecretStore;
-use tp_contracts::{Error, Result};
+use tp_contracts::{BlobKey, Error, Result};
 use tp_meta::{MetaConfig, PgMeta};
 
+use crate::sections::{VERIFY, VerifySection};
 use crate::{infra, secrets, sections};
 
 /// Сверка: учёт `index`/`inventory` против хранилища `store`.
@@ -63,16 +67,62 @@ pub fn summary(report: &VerifyReport) -> String {
     out
 }
 
-/// Перечисление записей учёта BLOB в PostgreSQL для сверки.
-///
-/// `tp-meta` пока не даёт перечисления записей `live` и пометки повреждённых (трейт `BlobInventory` — в
-/// `tp-blob`, от которого `tp-meta` не зависит): нужна правка полосы meta.
-fn pg_inventory(_meta: &PgMeta) -> Result<Arc<dyn BlobInventory>> {
-    Err(Error::Invalid(
-        "verify: учёт BLOB в PostgreSQL пока не поддерживает перечисление записей и пометку повреждённых \
-         (нужна правка tp-meta); сверка недоступна"
-            .to_owned(),
-    ))
+/// Записи учёта BLOB в PostgreSQL для сверки: перечисление `live` страницами по первичному ключу и пометка
+/// повреждённых (META-19; трейт `BlobInventory` — в `tp-blob`, от которого `tp-meta` не зависит).
+pub struct PgInventory {
+    meta: PgMeta,
+    page_size: usize,
+}
+
+impl std::fmt::Debug for PgInventory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgInventory")
+            .field("page_size", &self.page_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PgInventory {
+    /// Перечисление по `page_size` записей на страницу.
+    pub fn new(meta: PgMeta, page_size: usize) -> Self {
+        Self {
+            meta,
+            page_size: page_size.max(1),
+        }
+    }
+}
+
+#[async_trait]
+impl BlobInventory for PgInventory {
+    fn live(&self) -> BoxStream<'static, Result<IndexedBlob>> {
+        let page = self.page_size;
+        stream::try_unfold(
+            (self.meta.clone(), None::<BlobKey>, false),
+            move |(meta, after, done)| async move {
+                if done {
+                    return Ok::<_, Error>(None);
+                }
+                let rows = meta.live_blobs(after.as_ref(), page).await?;
+                let next = (meta, rows.last().map(|b| b.key), rows.len() < page);
+                let items = rows.into_iter().map(|b| {
+                    Ok(IndexedBlob {
+                        key: b.key,
+                        size: b.size,
+                    })
+                });
+                Ok(Some((stream::iter(items.collect::<Vec<_>>()), next)))
+            },
+        )
+        .try_flatten()
+        .boxed()
+    }
+
+    async fn mark_damaged(&self, key: &BlobKey) -> Result<()> {
+        if !self.meta.mark_blob_damaged(key).await? {
+            tracing::debug!(path = %key.path(), "verify: записи этого поколения уже нет — не помечена");
+        }
+        Ok(())
+    }
 }
 
 /// `thepost verify` по config.yaml `path`.
@@ -86,14 +136,15 @@ pub async fn command(
     let cfg = tokio::task::spawn_blocking(move || registry.load(&p))
         .await
         .map_err(|_| Error::internal("чтение конфигурации прервано"))??;
-    let secrets = secrets::store(&cfg, store)?;
+    let secrets = secrets::store(&cfg, store).await?;
     let pool = infra::connect_db(&cfg, secrets.as_ref()).await?;
     let meta = PgMeta::new(
         pool,
         (*cfg.section::<MetaConfig>(MetaConfig::SECTION)?).clone(),
     );
     let blob = infra::open_blob(&cfg, secrets.as_ref()).await?;
-    let inventory = pg_inventory(&meta)?;
+    let page_size = cfg.section::<VerifySection>(VERIFY)?.page_size;
+    let inventory = Arc::new(PgInventory::new(meta.clone(), page_size));
     verifier(Arc::new(meta), inventory, blob, VerifyConfig::default())
         .run(fix)
         .await
@@ -239,5 +290,58 @@ mod tests {
         let report = verifier.run(false).await.expect("verify");
         assert!(report.is_clean(), "{report:?}");
         assert_eq!(exit_code(&report), 0);
+    }
+
+    /// Учёт в PostgreSQL: перечисление страницами отдаёт все записи организации, пометка — без ошибки.
+    /// Сверка целиком не запускается: в общей тестовой БД есть записи других тестов.
+    #[tokio::test]
+    async fn pg_inventory_pages_and_marks() {
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let tenant = TenantId::new();
+        tp_meta::pool::with_tenant(&pool, tenant, |tx| {
+            Box::pin(async move {
+                sqlx::query("INSERT INTO tenants (tenant_id, name) VALUES ($1, 'verify')")
+                    .bind(tenant.as_uuid())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(tp_meta::schema::db_err)
+                    .map(drop)
+            })
+        })
+        .await
+        .expect("tenant");
+        let meta = PgMeta::new(pool, MetaConfig::default());
+        let writer = BlobWriter::new(
+            Arc::new(meta.clone()),
+            Arc::new(MemBlobStore::default()),
+            WriterConfig::default(),
+        );
+        let mut keys = BTreeSet::new();
+        for body in [&b"a"[..], b"bb", b"ccc"] {
+            let key = writer
+                .write(tenant, Bytes::from_static(body), 1)
+                .await
+                .expect("write");
+            keys.insert(key);
+        }
+        let inventory = PgInventory::new(meta, 2);
+        let seen: BTreeSet<BlobKey> = inventory
+            .live()
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("live")
+            .into_iter()
+            .filter(|b| b.key.tenant == tenant)
+            .map(|b| b.key)
+            .collect();
+        assert_eq!(seen, keys);
+        let first = *keys.iter().next().expect("key");
+        inventory.mark_damaged(&first).await.expect("mark");
+        inventory.mark_damaged(&first).await.expect("mark again");
     }
 }
