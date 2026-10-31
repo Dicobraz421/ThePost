@@ -133,6 +133,15 @@ SASL (код — `sasl.rs`, RFC 4422): механизмы `Mechanism::{ Plain, L
 start(mech, &SaslContext { service, tls }) }` → `SaslSession::step(Option<&[u8]>) -> SaslStep::{ Challenge(bytes), Done(Principal), Fail(SaslFailure) }`
 (`None` — нет начального ответа; `SaslFailure::{ Authentication, Authorization, Expired }` — коды RFC 5530 / SMTP 535).
 Неизвестный или недоступный механизм, нарушение формата — `Invalid`; base64 и отмена `*` — протокол.
+ACL (код — `acl.rs`, SRS 4.5, RFC 4314): `AclStore` — данные `Authorizer`, IMAP ACL, JMAP и Admin API. Идентификаторы — имя входа, группа,
+`ANYONE` (`"anyone"`), с `-` в начале — отрицательные права; `validate_identifier(id, negative)` (≤ 255 байт, без пробелов и управляющих, не `-`)
+→ `Invalid`. Права владельца на свои папки — правило `Authorizer`, в ACL не хранятся.
+`acl(owner: AccountScope, mailbox) -> Vec<AclEntry { identifier, rights }>` (по идентификатору; нет папки — `NotFound`);
+`set_acl(owner, mailbox, identifier, rights)` — замена целиком, пустые права удаляют запись; удаление папки удаляет её ACL;
+`acl_rights(owner, mailbox, identifiers) -> Rights` — записи субъекта и `anyone` минус отрицательные (`effective_rights`), нет папки — `NONE`;
+`shared_mailboxes(tenant, identifiers) -> Vec<SharedMailbox { account, mailbox, rights }>` — папки с правом `l`, по (`account`, `mailbox`).
+Делегирование: `send_delegations(owner) -> Vec<SendDelegation { delegate, right }>`, `set_send_delegation(owner, delegate, Option<SendRight>)`
+(`None` — отзыв; нет учётной записи — `NotFound`), `send_right_of(owner, identifiers) -> Option<SendRight>` — сильнейшее (Send As), без `anyone`.
 
 ## Roles
 SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`; пресеты (`all`, `edge`, `transport`, `access`, `backend`, `mailbox`) раскрываются в набор ролей при загрузке конфигурации; режим edge — параметр smtp-in (SRS 2.6).
@@ -237,3 +246,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `step(Option<&[u8]>)` (нет начального ответа ≠ пустой).
 - 2026-10-31 — CTR-09 (волна contracts-03): манифест индекса — `schema`, `IndexSegment::docs`, `rebuild`; `put_manifest(.., ManifestUpdate)`,
   `request_rebuild`, `pending_rebuilds`.
+- 2026-10-31 — CTR-19 (x/contracts-08): `acl::{AclStore, AclEntry, SharedMailbox, SendDelegation, ANYONE, validate_identifier, effective_rights}`
+  — ACL папок и делегирование отправки (META-11) за контрактом; реализации — `PgMeta`, `tp_testkit::MemAcl`, набор `suite::acl_store`.
