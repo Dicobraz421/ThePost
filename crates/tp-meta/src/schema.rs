@@ -24,6 +24,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0004_blob_damaged.sql"),
     ),
     (5, "queue", include_str!("../migrations/0005_queue.sql")),
+    (
+        6,
+        "retention",
+        include_str!("../migrations/0006_retention.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
