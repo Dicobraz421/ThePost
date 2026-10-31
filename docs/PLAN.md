@@ -82,12 +82,13 @@
 | ✅ contracts-07 | CTR-18 | B | contracts-03 | 1 |
 | ✅ mailstore-04 | MS-09 | A | mailstore-02, testkit-02 | 4 |
 | contracts-08 (ветка `x/contracts-08`) | CTR-19 | B | meta-03 | 1 |
-| contracts-09 (ветка `x/contracts-09`) | CTR-20 | B | contracts-06 | 1 |
-| mailstore-05 | MS-10 | A | contracts-09 | 4 |
+| ✅ contracts-09 (ветка `x/contracts-09`) | CTR-20 | B | contracts-06 | 1 |
+| ✅ mailstore-05 | MS-10 | A | contracts-09 | 4 |
+| mailstore-06 | MS-11 | A | mailstore-02 | 4 |
 | ✅ meta-07 | META-20 | A | — | 3 |
 | ✅ auth-01 | AUTH-01, AUTH-02, AUTH-03, AUTH-04 | A | contracts-03 | 1 |
 | ✅ search-01 | SRCH-01, SRCH-02, SRCH-03, SRCH-04 | A | contracts-03 | 3 |
-| smtp-01 | SMTP-01, SMTP-02, SMTP-03, SMTP-04 | A | auth-01, testkit-02 | 4 |
+| ✅ smtp-01 | SMTP-01, SMTP-02, SMTP-03, SMTP-04 | A | auth-01, testkit-02 | 4 |
 | auth-02 | AUTH-05, AUTH-06 | A | auth-01, contracts-08 | 1 |
 | jmap-01 | JMAP-01, JMAP-02, JMAP-03, JMAP-04 | A | auth-01, mailstore-02, testkit-02 | 3 |
 | imap-01 | IMAP-01, IMAP-02, IMAP-03, IMAP-04 | A | testkit-02, auth-01, mailstore-02 | 2 |
