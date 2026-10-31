@@ -4,7 +4,8 @@
 //!   пароля привязкой (bind) к каталогу;
 //! - [`password`] — [`Authenticator`](tp_contracts::auth::Authenticator) для имени входа и пароля: пароли
 //!   приложений (argon2) с отзывом и пароль каталога. Защиту от перебора (`tp-platform`, PLT-07) вызывают
-//!   протоколы до проверки и по её результату.
+//!   протоколы до проверки и по её результату;
+//! - [`oidc`] — [`Authenticator`](tp_contracts::auth::Authenticator) для токенов OpenID Connect (Bearer).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -16,9 +17,11 @@ use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result, TenantId};
 
 pub mod ldap;
+pub mod oidc;
 pub mod password;
 
 pub use ldap::{LdapConfig, LdapDirectory};
+pub use oidc::{OidcAuthenticator, OidcConfig};
 pub use password::{
     AppPassword, AppPasswordStore, AppPasswords, PasswordAuthenticator, PasswordCheck,
     PasswordConfig,
