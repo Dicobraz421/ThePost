@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::error::Result;
 use crate::ids::{MailboxId, MessageId};
@@ -112,41 +113,105 @@ pub trait SearchIndex: Send + Sync + 'static {
     ) -> Result<Snippet>;
 }
 
-/// Сегмент индекса в BLOB.
+/// Сегмент индекса в BLOB (неизменяемый: путь записывается один раз).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSegment {
     /// Путь `BlobStore::put_raw` (`idx/{tenant}/{account}/...`).
     pub path: String,
     /// Размер, байт.
     pub size: u64,
+    /// Число документов (писем) в сегменте, без удалённых.
+    pub docs: u64,
+}
+
+/// Причина перестройки индекса.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RebuildReason {
+    /// Запрос администратора (Admin API, `thepost`).
+    Admin,
+    /// Индекс повреждён или сегмент не читается.
+    Corrupt,
+    /// Восстановление ящика из резервной копии, перенос между организациями.
+    Restore,
+}
+
+/// Запрошенная перестройка индекса.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebuildRequest {
+    /// Момент запроса.
+    pub requested_at: OffsetDateTime,
+    /// Причина.
+    pub reason: RebuildReason,
 }
 
 /// Манифест индекса учётной записи: действующий набор сегментов.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IndexManifest {
-    /// Версия: растёт при каждой записи; `0` — индекса нет.
+    /// Версия: растёт при каждой записи и запросе перестройки; `0` — индекса нет.
     pub version: u64,
+    /// Версия схемы индекса (`tp-search`); старше текущей — индекс перестраивается.
+    pub schema: u32,
     /// Сегменты.
     pub segments: Vec<IndexSegment>,
+    /// Запрошенная и ещё не выполненная перестройка.
+    pub rebuild: Option<RebuildRequest>,
+}
+
+impl IndexManifest {
+    /// Размер индекса, байт.
+    pub fn size(&self) -> u64 {
+        self.segments.iter().map(|s| s.size).sum()
+    }
+
+    /// Число документов.
+    pub fn docs(&self) -> u64 {
+        self.segments.iter().map(|s| s.docs).sum()
+    }
+}
+
+/// Новое состояние индекса для [`IndexManifestStore::put_manifest`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ManifestUpdate {
+    /// Версия схемы, по которой построены сегменты.
+    pub schema: u32,
+    /// Действующий набор сегментов (полностью заменяет прежний).
+    pub segments: Vec<IndexSegment>,
+    /// Запись завершает перестройку: снимает `rebuild`.
+    pub rebuilt: bool,
 }
 
 /// Манифесты индексов в метаданных. Реализация — `tp-meta`; in-memory — `tp-testkit`.
 ///
 /// Сегменты загружаются в BLOB до `put_manifest`; сегменты, выпавшие из манифеста, удаляет индексатор
 /// после записи нового манифеста (с задержкой на завершение читающих запросов).
+///
+/// # Перестройка
+///
+/// Индекс — производные данные (SRS 4.6): перестраивается из метаданных и BLOB. Индексатор ящика (под лизой)
+/// читает манифест (версия `v`), строит новый индекс полным обходом писем в новых путях, пока запросы
+/// обслуживает прежний, и переключает его `put_manifest(scope, v, ManifestUpdate { rebuilt: true, .. })`.
+/// Запрос перестройки увеличивает версию, поэтому запрос, пришедший во время перестройки, даёт `Conflict`
+/// при переключении — перестройка начинается заново.
 #[async_trait]
 pub trait IndexManifestStore: Send + Sync + 'static {
     /// Текущий манифест; индекса нет — версия `0` и пустой набор.
     async fn get_manifest(&self, scope: AccountScope) -> Result<IndexManifest>;
 
-    /// Записывает набор сегментов, если текущая версия равна `expected` (иначе `Error::Conflict`).
+    /// Записывает состояние индекса, если текущая версия равна `expected` (иначе `Error::Conflict`).
     /// Возвращает новую версию.
     async fn put_manifest(
         &self,
         scope: AccountScope,
         expected: u64,
-        segments: Vec<IndexSegment>,
+        update: ManifestUpdate,
     ) -> Result<u64>;
+
+    /// Запрашивает перестройку индекса (повторный запрос заменяет прежний). Возвращает новую версию.
+    async fn request_rebuild(&self, scope: AccountScope, request: RebuildRequest) -> Result<u64>;
+
+    /// Учётные записи всех организаций, чей индекс нужно перестроить: запрошена перестройка или
+    /// схема старше `schema` (индекс есть); сначала давние запросы, не более `limit`. Системный вызов роли indexer.
+    async fn pending_rebuilds(&self, schema: u32, limit: usize) -> Result<Vec<AccountScope>>;
 }
 
 #[cfg(test)]
@@ -171,5 +236,37 @@ mod tests {
         ]);
         let s = serde_json::to_string(&q).expect("serialize");
         assert_eq!(serde_json::from_str::<TextQuery>(&s).expect("parse"), q);
+    }
+
+    #[test]
+    fn manifest_serde() {
+        let seg = |n: u64| IndexSegment {
+            path: format!("idx/t/a/{n}.seg"),
+            size: n * 100,
+            docs: n,
+        };
+        let m = IndexManifest {
+            version: 7,
+            schema: 2,
+            segments: vec![seg(1), seg(2)],
+            rebuild: Some(RebuildRequest {
+                requested_at: OffsetDateTime::UNIX_EPOCH,
+                reason: RebuildReason::Corrupt,
+            }),
+        };
+        assert_eq!((m.size(), m.docs()), (300, 3));
+        let s = serde_json::to_string(&m).expect("serialize");
+        assert_eq!(serde_json::from_str::<IndexManifest>(&s).expect("parse"), m);
+        let u = ManifestUpdate {
+            schema: 2,
+            segments: vec![seg(3)],
+            rebuilt: true,
+        };
+        let s = serde_json::to_string(&u).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<ManifestUpdate>(&s).expect("parse"),
+            u
+        );
+        assert_eq!(IndexManifest::default().version, 0);
     }
 }

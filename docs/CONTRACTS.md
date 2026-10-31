@@ -5,7 +5,7 @@
 Асинхронные трейты, используемые как `dyn`, — через `async-trait`; все трейты `Send + Sync + 'static`.
 
 ## Ids
-- `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` = `00000000-0000-0000-0000-000000000001` — организация по умолчанию.
+- `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId`, `QueueId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` = `00000000-0000-0000-0000-000000000001` — организация по умолчанию.
 - `Uid(u32)` — IMAP UID в ящике, монотонный; `UidValidity(u32)`.
 - `ModSeq(u64)` — монотонный на ящик (IMAP CONDSTORE, состояние JMAP).
 - `BlobHash([u8; 32])` — SHA-256, `Display` — hex. `Gen(u32)` — поколение объекта.
@@ -107,8 +107,12 @@ watch::Receiver<Vec<NodeId>>` (новое значение — пересчит�
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
 `snippet(AccountScope, message, &TextQuery) -> Snippet { subject?, preview? }` (`<mark>`). `TextQuery` — дерево
 `Term { field: TextField, text } | And | Or | Not`; нетекстовые условия фильтрует вызывающий по метаданным.
-`IndexManifestStore` (метаданные): `get_manifest(AccountScope) -> IndexManifest { version, segments }`,
-`put_manifest(AccountScope, expected, segments) -> version` (несовпадение версии — `Conflict`).
+`IndexManifestStore` (метаданные): `get_manifest(AccountScope) -> IndexManifest { version, schema, segments: Vec<IndexSegment { path, size, docs }>,
+rebuild: Option<RebuildRequest { requested_at, reason: RebuildReason::{ Admin, Corrupt, Restore } }> }` (`size()`, `docs()` — суммы),
+`put_manifest(AccountScope, expected, ManifestUpdate { schema, segments, rebuilt }) -> version` (несовпадение версии — `Conflict`;
+`rebuilt` снимает `rebuild`). Перестройка: `request_rebuild(scope, request) -> version` (версия растёт — идущая перестройка
+получит `Conflict` и начнётся заново), `pending_rebuilds(schema, limit) -> Vec<AccountScope>` — запрошенные и со схемой старше
+`schema` (все организации); новый индекс строится в новых путях, прежний обслуживает запросы до переключения.
 
 ## Directory
 SRS 5.1, 3.8. Каталог организации: `accounts_since(tenant, Option<&DirCursor>, limit)`, `groups_since` — инкрементально,
@@ -123,8 +127,11 @@ SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>` (невер
 `Authorizer`: `rights(&Principal, &Resource) -> Rights`, `check(.., required)` (по умолчанию через `rights`),
 `send_right(&Principal, from) -> Option<SendRight::{SendAs, SendOnBehalf}>`; `Resource::{ Account, Mailbox }`.
 `Rights` — RFC 4314, строка `lrswipkxtea` в каноническом порядке; `c`/`d` (RFC 2086) разворачивает IMAP.
-SASL-механизмы (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, GSSAPI) — `tp-auth`, интерфейс `SaslServer { mechanisms(tls), start(mech) }`
-→ `SaslSession::step(response) -> SaslStep::{ Challenge, Done(Principal) }`.
+SASL (код — `sasl.rs`, RFC 4422): механизмы `Mechanism::{ Plain, Login, OauthBearer, Xoauth2, Gssapi }` (`name()`, разбор без учёта регистра,
+`plaintext()` — без TLS не предлагается) — `tp-auth` поверх `Authenticator`; `SaslServer { mechanisms(tls) -> Vec<Mechanism>,
+start(mech, &SaslContext { service, tls }) }` → `SaslSession::step(Option<&[u8]>) -> SaslStep::{ Challenge(bytes), Done(Principal), Fail(SaslFailure) }`
+(`None` — нет начального ответа; `SaslFailure::{ Authentication, Authorization, Expired }` — коды RFC 5530 / SMTP 535).
+Неизвестный или недоступный механизм, нарушение формата — `Invalid`; base64 и отмена `*` — протокол.
 
 ## Roles
 SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`; пресеты (`all`, `edge`, `transport`, `access`, `backend`, `mailbox`) раскрываются в набор ролей при загрузке конфигурации; режим edge — параметр smtp-in (SRS 2.6).
@@ -165,11 +172,24 @@ SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, Valkey, S3, узе�
 `InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
 
 ## Queue (Ф1)
-`QueueStore`: `enqueue(OutMessage { blob, from, rcpts, next_attempt })`, `claim(limit, lease)`,
-`reschedule(id, rcpt, at, reason)`, `complete(id, rcpt, status)`. Повторы и DSN — `tp-smtp`.
+SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организаций; время передаёт вызывающий):
+`enqueue(OutMessage { tenant, blob, size, from, dsn: DsnParams { envid, ret }, rcpts: Vec<OutRcpt { address, notify, orcpt }>, next_attempt }) -> QueueId`
+(пусто или повтор адреса — `Invalid`); `claim(now, limit, lease) -> Vec<Claimed { claim: QueueClaim { id, fencing }, until, queued_at, .., rcpts: Vec<QueuedRcpt { rcpt, attempts, last_error }> }>`
+— записи с наступившим сроком попытки без действующей лизы; `renew(&claim, until)`, `reschedule(&claim, rcpt, at, reason)` (`attempts` + 1),
+`complete(&claim, rcpt, RcptStatus::{ Delivered { reply }, Failed { reply } }) -> bool` (`true` — все получатели завершены, запись удалена).
+Устаревший захват — `Conflict`; не завершённые до истечения лизы получатели возвращаются в очередь без `attempts` + 1.
+Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
+Расписание повторов, срок доставки и DSN — `tp-smtp` (DSN ставится в очередь до `complete(.., Failed)`).
 
-## Trash, Quota (Ф1)
-`TrashStore`: `list(account)`, `restore(item)`, `expired(before, limit)`; срок — `PolicyResolver`. `Quota`: `usage/limit(account)`.
+## Trash, Retention, Quota (Ф1)
+SRS 4.7, 3.8. Код — `retention.rs`. `TrashStore`: `list(scope, offset, limit) -> Vec<TrashItem { scope, object: TrashObject::Message(id), origin, size,
+received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Message { mailbox, inserted }`,
+`expired(now, limit)` (все организации, по `expires_at`), `defer(scope, object, until)`.
+Срок корзины — `PolicyResolver` (`trash_retention`, по умолчанию 30 суток из конфигурации): хранилище вычисляет `expires_at`
+при переносе в корзину; изменение политики действует на элементы, удалённые после него.
+Истечение: `expired` → `DecisionHooks::before_final_delete` (`FinalDelete::mailbox` = `origin`) → `MessageStore::expunge_final`; `Deny` — `defer`.
+`Quota`: `usage(scope) -> QuotaUsage` (лимит — `PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded`
+(по умолчанию через `usage` и `QuotaUsage::allows`).
 Политики хранения и Legal Hold — модуль «Соответствие требованиям» через `DecisionHook::before_final_delete`.
 
 ## Extension points
@@ -207,3 +227,11 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-10-30 — CTR-14: `membership::{Membership, NodeId}`, `events::PartitionAssigner`.
 - 2026-10-30 — CTR-15: `secrets::{SecretRef, Secret, SecretLease, SecretStore}`, `Registry::set_secret_store`.
 - 2026-10-31 — CTR-16 (решение 2026-10-31-ingest-envelope): `IngestRequest::mail_from`; `ingest` → `Ingested { delivered, forward }`.
+- 2026-10-31 — CTR-06 (волна contracts-03): `queue::QueueStore` с захватом записей (`QueueClaim`, fencing), `OutMessage` с параметрами DSN,
+  `RcptStatus`, `QueueId`.
+- 2026-10-31 — CTR-07 (волна contracts-03): `retention::{TrashStore, TrashItem, TrashObject, Restored, Quota}`, `QuotaUsage::allows`;
+  раздел «Trash, Quota» → «Trash, Retention, Quota».
+- 2026-10-31 — CTR-08 (волна contracts-03): SASL из `auth` в `sasl`; `Mechanism`, `SaslContext`, `SaslStep::Fail(SaslFailure)`,
+  `step(Option<&[u8]>)` (нет начального ответа ≠ пустой).
+- 2026-10-31 — CTR-09 (волна contracts-03): манифест индекса — `schema`, `IndexSegment::docs`, `rebuild`; `put_manifest(.., ManifestUpdate)`,
+  `request_rebuild`, `pending_rebuilds`.

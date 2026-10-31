@@ -14,13 +14,16 @@ pub mod lease;
 pub mod mailstore;
 pub mod membership;
 pub mod meta;
+pub mod queue;
+pub mod retention;
 pub mod role;
+pub mod sasl;
 pub mod search;
 pub mod secrets;
 pub mod tls;
 
 pub use error::{Error, Result};
 pub use ids::{
-    AccountId, BlobHash, BlobKey, DomainId, Gen, MailboxId, MessageId, ModSeq, TenantId, Uid,
-    UidValidity,
+    AccountId, BlobHash, BlobKey, DomainId, Gen, MailboxId, MessageId, ModSeq, QueueId, TenantId,
+    Uid, UidValidity,
 };

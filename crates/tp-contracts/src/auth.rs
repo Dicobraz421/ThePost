@@ -193,31 +193,7 @@ pub trait Authenticator: Send + Sync + 'static {
     async fn verify(&self, credentials: Credentials) -> Result<Principal>;
 }
 
-/// Шаг обмена SASL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SaslStep {
-    /// Вызов сервера (байты до base64), ждать ответа клиента.
-    Challenge(Vec<u8>),
-    /// Обмен завершён успешно.
-    Done(Principal),
-}
-
-/// Сеанс одного обмена SASL.
-#[async_trait]
-pub trait SaslSession: Send {
-    /// Обрабатывает ответ клиента (первый вызов — начальный ответ, возможно пустой).
-    /// Неверные данные — `Error::Forbidden`, нарушение протокола — `Error::Invalid`.
-    async fn step(&mut self, response: &[u8]) -> Result<SaslStep>;
-}
-
-/// Механизмы SASL (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, GSSAPI) для smtp, imap.
-pub trait SaslServer: Send + Sync + 'static {
-    /// Доступные механизмы; без TLS — без механизмов с открытым паролем.
-    fn mechanisms(&self, tls: bool) -> Vec<&'static str>;
-
-    /// Начинает обмен; неизвестный механизм — `Error::Invalid`.
-    fn start(&self, mechanism: &str) -> Result<Box<dyn SaslSession>>;
-}
+// SASL — модуль `sasl`.
 
 // ---------- Права ----------
 
@@ -395,8 +371,6 @@ mod tests {
         fn _dir(_: Arc<dyn Directory>) {}
         fn _authn(_: Arc<dyn Authenticator>) {}
         fn _authz(_: Arc<dyn Authorizer>) {}
-        fn _sasl(_: Arc<dyn SaslServer>) {}
-        fn _session(_: Box<dyn SaslSession>) {}
     }
 
     #[test]
