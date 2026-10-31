@@ -4911,12 +4911,16 @@ dependencies = [
 name = "tp-search"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "calamine",
  "lopdf",
  "quick-xml 0.42.0",
  "schemars",
+ "serde",
  "tantivy",
+ "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tp-contracts",
  "tp-sys",

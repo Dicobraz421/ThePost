@@ -754,13 +754,20 @@ impl MessageStore for PgMeta {
     async fn expunge_final(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
         let mut tx = begin(&self.pool, scope.tenant).await?;
         let current = changelog::lock_modseq(&mut tx, scope).await?;
-        let found = existing(&mut tx, scope, &uuids(ids)).await?;
-        if found.is_empty() {
+        // Только письма в корзине (под блокировкой `ModSeq` учётной записи, как и `restore`):
+        // восстановленные после `TrashStore::expired` и прочие пропускаются.
+        let trash = by_role(&mut tx, scope, SpecialUse::Trash).await?;
+        let src: Vec<Uuid> = existing(&mut tx, scope, &uuids(ids))
+            .await?
+            .into_iter()
+            .filter(|(_, mb)| trash.is_some_and(|t| mb == t.as_uuid()))
+            .map(|(id, _)| id)
+            .collect();
+        if src.is_empty() {
             tx.commit().await.map_err(db_err)?;
             return Ok(current);
         }
         let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let src: Vec<Uuid> = found.iter().map(|(id, _)| *id).collect();
         adjust_refs(&mut tx, scope, &src, -1).await?;
         let removed: Vec<(Uuid, Uuid, i64)> = sqlx::query_as(
             "DELETE FROM messages WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)

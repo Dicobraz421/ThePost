@@ -1,0 +1,39 @@
+# Каталог Active Directory для тестов синхронизации (режим USN, надгробия).
+
+dn:
+dsServiceName: CN=NTDS Settings,CN=DC1,CN=Servers,CN=Site,CN=Sites,CN=Configuration,DC=corp,DC=example
+
+dn: CN=Alice,OU=Staff,DC=corp,DC=example
+objectClass: user
+objectGUID:: AAECAwQFBgcICQoLDA0ODw==
+userPrincipalName: alice@corp.example
+displayName: Alice A.
+mail: alice@corp.example
+proxyAddresses: SMTP:alice@corp.example
+proxyAddresses: smtp:al@corp.example
+proxyAddresses: X500:/o=Org/ou=Exchange/cn=alice
+proxyAddresses: SIP:alice@corp.example
+userAccountControl: 512
+uSNChanged: 120
+
+dn: CN=Dave,OU=Staff,DC=corp,DC=example
+objectClass: user
+objectGUID:: /////////////////////w==
+userPrincipalName: dave@corp.example
+mail: dave@corp.example
+userAccountControl: 514
+uSNChanged: 110
+
+dn: CN=Bob\0ADEL:10111213-1415-1617-1819-1a1b1c1d1e1f,CN=Deleted Objects,DC=corp,DC=example
+objectClass: user
+isDeleted: TRUE
+objectGUID:: EBESExQVFhcYGRobHB0eHw==
+uSNChanged: 130
+
+dn: CN=Staff,OU=Groups,DC=corp,DC=example
+objectClass: group
+cn: Staff
+mail: staff@corp.example
+member: CN=Alice,OU=Staff,DC=corp,DC=example
+objectGUID:: ICEiIyQlJicoKSorLC0uLw==
+uSNChanged: 125

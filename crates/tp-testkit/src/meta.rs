@@ -1118,7 +1118,13 @@ impl MessageStore for MemMetadata {
 
     async fn expunge_final(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
         self.with_account(scope, |acc, fx| {
-            let src = acc.existing(ids);
+            // Только письма в корзине: восстановленные после `TrashStore::expired` и прочие пропускаются.
+            let trash = acc.by_role(SpecialUse::Trash).ok();
+            let src: Vec<_> = acc
+                .existing(ids)
+                .into_iter()
+                .filter(|id| Some(acc.messages[id].message.mailbox) == trash)
+                .collect();
             if src.is_empty() {
                 return Ok(acc.modseq);
             }
@@ -1372,6 +1378,7 @@ mod tests {
             .await
             .expect("ok");
         let last_id = all.last().expect("ok").id;
+        meta.to_trash(scope, &[last_id]).await.expect("ok");
         let ms = meta.expunge_final(scope, &[last_id]).await.expect("ok");
         assert!(ms > last);
         let ins = meta.insert(scope, inbox, new_message(1)).await.expect("ok");
@@ -1474,6 +1481,7 @@ mod tests {
         meta.set_flags(scope, &[a.id], FlagOp::Add(Flags::from([Flag::Seen])), None)
             .await
             .expect("ok");
+        meta.to_trash(scope, &[b.id]).await.expect("ok");
         meta.expunge_final(scope, &[b.id]).await.expect("ok");
         let c2 = meta
             .message_changes(scope, None, c1.new_state, 100)
@@ -1501,9 +1509,10 @@ mod tests {
             .expect("ok");
         assert!(!p2.has_more);
 
-        // Изменения папок: вставка меняет счётчики папки.
+        // Изменения папок: вставка меняет счётчики папки, перенос в корзину и удаление — и корзины.
         let mc = meta.mailbox_changes(scope, s0, 100).await.expect("ok");
-        assert_eq!(mc.updated, [inbox]);
+        assert_eq!(mc.updated[0], inbox);
+        assert_eq!(mc.updated.len(), 2);
 
         // Устаревший или будущий since — Conflict.
         meta.truncate_changelog(scope, a.modseq).expect("ok");
@@ -1609,7 +1618,15 @@ mod tests {
             .expect("ok");
         assert_eq!(trash_changes.destroyed.len(), 1);
 
-        // Окончательное удаление снимает ссылки.
+        // Окончательное удаление — только из корзины — снимает ссылки.
+        meta.expunge_final(scope, &[m]).await.expect("ok");
+        assert!(
+            MessageStore::get(&meta, scope, m)
+                .await
+                .expect("ok")
+                .is_some()
+        );
+        meta.to_trash(scope, &[m, copied[0].id]).await.expect("ok");
         meta.expunge_final(scope, &[m, copied[0].id])
             .await
             .expect("ok");
