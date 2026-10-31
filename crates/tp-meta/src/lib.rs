@@ -5,17 +5,21 @@
 //! реализация не обращается.
 
 pub mod accounts;
+pub mod acl;
 pub mod blob_index;
 pub mod changelog;
 pub mod credentials;
 pub mod doctor;
 pub mod events;
+pub mod index_manifest;
 pub mod lease;
 pub mod mailboxes;
 pub mod membership;
 pub mod messages;
 pub mod modules;
 pub mod pool;
+pub mod queue;
+pub mod retention;
 pub mod schema;
 pub mod shards;
 
@@ -30,6 +34,7 @@ use tp_contracts::config::duration;
 
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
+use crate::retention::RetentionConfig;
 
 /// Секция конфигурации контура метаданных `meta` (SRS 5.5); пул соединений — отдельная секция
 /// `database` ([`pool::PoolConfig`]). Все поля необязательны; неизвестное поле — ошибка разбора.
@@ -42,6 +47,8 @@ use crate::events::EventsConfig;
 ///     node_ttl: 15s
 ///   doctor:
 ///     timeout: 10s
+///   retention:
+///     trash_retention: 30d
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -60,6 +67,8 @@ pub struct MetaConfig {
     pub events: EventsConfig,
     /// Пороги проверок СУБД `thepost doctor`.
     pub doctor: DoctorConfig,
+    /// Значения по умолчанию политик хранения: срок корзины, квота.
+    pub retention: RetentionConfig,
 }
 
 impl MetaConfig {
@@ -75,6 +84,7 @@ impl Default for MetaConfig {
             event_partitions: 64,
             events: EventsConfig::default(),
             doctor: DoctorConfig::default(),
+            retention: RetentionConfig::default(),
         }
     }
 }
