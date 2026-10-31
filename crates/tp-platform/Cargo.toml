@@ -22,6 +22,7 @@ opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 ppp.workspace = true
 prometheus-client.workspace = true
+reqwest.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true

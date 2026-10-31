@@ -4827,6 +4827,7 @@ dependencies = [
  "opentelemetry_sdk",
  "ppp",
  "prometheus-client",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "schemars",
