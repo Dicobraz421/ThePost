@@ -1,38 +1,7 @@
-//! Разбор полей `LocalConfig`/`S3Config`, которые приложение пока заполняет числами секунд и миллисекунд.
+//! Разбор секций tp-blob из config.yaml (`LocalConfig`, `S3Config`, `CacheConfig`, `GcConfig`, `OrphanConfig`).
 //!
-//! В config.yaml длительность — строка humantime без единицы в имени поля (`stale_tmp: 24h`, решение #43,
-//! CTR-13); поле Rust сохраняет прежние имя и тип (`stale_tmp_secs: u64`) до перехода приложения на секции
-//! tp-blob (APP-07). Значение, не кратное единице поля (`1500ms` для секунд), — ошибка разбора, а не округление.
-
-use std::time::Duration;
-
-use serde::{Deserializer, de};
-use tp_contracts::config::duration;
-
-fn whole<E: de::Error>(d: Duration, unit: Duration, name: &str) -> Result<u64, E> {
-    let (n, unit) = (d.as_nanos(), unit.as_nanos());
-    if n % unit != 0 {
-        return Err(E::custom(format!(
-            "duration {} is not a whole number of {name}",
-            duration::format(d)
-        )));
-    }
-    u64::try_from(n / unit).map_err(|_| E::custom("duration overflow"))
-}
-
-/// Длительность humantime → целые секунды.
-pub(crate) fn secs<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
-    whole(duration::deserialize(d)?, Duration::from_secs(1), "seconds")
-}
-
-/// Длительность humantime → целые миллисекунды.
-pub(crate) fn millis<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
-    whole(
-        duration::deserialize(d)?,
-        Duration::from_millis(1),
-        "milliseconds",
-    )
-}
+//! Длительность — строка humantime без единицы в имени поля (`stale_tmp: 24h`, решение #43, CTR-13);
+//! число без единицы и прежние имена с единицей (`stale_tmp_secs`) — ошибка разбора.
 
 #[cfg(test)]
 mod tests {
@@ -61,7 +30,7 @@ mod tests {
             LocalConfig {
                 root: PathBuf::from("/srv/blob"),
                 fsync: false,
-                stale_tmp_secs: 5400,
+                stale_tmp: Duration::from_secs(5400),
                 ..LocalConfig::default()
             }
         );
@@ -120,11 +89,11 @@ mod tests {
                     access_key_id: r("thepost/s3#access_key_id"),
                     secret_access_key: r("thepost/s3#secret_access_key"),
                 }),
-                retry_init_backoff_ms: 250,
-                retry_max_backoff_ms: 10_000,
-                retry_timeout_ms: 120_000,
-                request_timeout_ms: 20_000,
-                connect_timeout_ms: 1500,
+                retry_init_backoff: Duration::from_millis(250),
+                retry_max_backoff: Duration::from_secs(10),
+                retry_timeout: Duration::from_secs(120),
+                request_timeout: Duration::from_secs(20),
+                connect_timeout: Duration::from_millis(1500),
                 ..S3Config::default()
             }
         );
@@ -143,12 +112,11 @@ mod tests {
     fn bad_durations_rejected() {
         for (bad, why) in [
             ("stale_tmp: 3600", "число без единицы"),
-            ("stale_tmp: 1500ms", "не целые секунды"),
             ("stale_tmp_secs: 3600", "прежнее имя с единицей"),
         ] {
             assert!(parse::<LocalConfig>(bad).is_err(), "{why}: {bad}");
         }
-        for bad in ["request_timeout: 30000", "connect_timeout: 1500us"] {
+        for bad in ["request_timeout: 30000", "request_timeout_ms: 30000"] {
             assert!(parse::<S3Config>(bad).is_err(), "{bad}");
         }
         assert!(parse::<GcConfig>("window_secs: 3600").is_err());
@@ -166,7 +134,7 @@ mod tests {
             "значение не попадает в ошибку: {e}"
         );
 
-        // Прежние поля значений — не из config.yaml.
+        // Полей значений ключей нет.
         let flat = "access_key_id: AKIA0SECRET\nsecret_access_key: hunter2\n";
         let e = parse::<S3Config>(flat).expect_err("поле значения");
         assert!(!e.contains("AKIA0SECRET") && !e.contains("hunter2"), "{e}");
