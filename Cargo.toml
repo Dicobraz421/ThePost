@@ -50,6 +50,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1.10"
 futures = "0.3.34"
 hex = "0.4.3"
+insta = { version = "1.49.0", features = ["json"] }
 instant-acme = "0.8.5"
 jsonwebtoken = "11.1.0"
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
