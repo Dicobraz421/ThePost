@@ -500,12 +500,12 @@ blob:
         let blob = c.section::<BlobSection>(BLOB).expect("blob");
         let local = blob.local_config(PathBuf::from("/data"));
         assert_eq!(
-            (local.root, local.stale_tmp_secs),
-            (PathBuf::from("/data"), 3600)
+            (local.root, local.stale_tmp),
+            (PathBuf::from("/data"), Duration::from_secs(3600))
         );
         let s3 = blob.s3_config("b".into(), "p".into());
         assert_eq!((s3.bucket.as_str(), s3.prefix.as_str()), ("b", "p"));
-        assert_eq!(s3.request_timeout_ms, 5000);
+        assert_eq!(s3.request_timeout, Duration::from_secs(5));
         let bus = c.section::<BusSection>(BUS).expect("bus");
         assert_eq!(bus.valkey.connect_timeout, Duration::from_secs(2));
         // Каталог и бакет — только в blob.url.
