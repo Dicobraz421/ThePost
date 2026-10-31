@@ -107,8 +107,12 @@ watch::Receiver<Vec<NodeId>>` (новое значение — пересчит�
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
 `snippet(AccountScope, message, &TextQuery) -> Snippet { subject?, preview? }` (`<mark>`). `TextQuery` — дерево
 `Term { field: TextField, text } | And | Or | Not`; нетекстовые условия фильтрует вызывающий по метаданным.
-`IndexManifestStore` (метаданные): `get_manifest(AccountScope) -> IndexManifest { version, segments }`,
-`put_manifest(AccountScope, expected, segments) -> version` (несовпадение версии — `Conflict`).
+`IndexManifestStore` (метаданные): `get_manifest(AccountScope) -> IndexManifest { version, schema, segments: Vec<IndexSegment { path, size, docs }>,
+rebuild: Option<RebuildRequest { requested_at, reason: RebuildReason::{ Admin, Corrupt, Restore } }> }` (`size()`, `docs()` — суммы),
+`put_manifest(AccountScope, expected, ManifestUpdate { schema, segments, rebuilt }) -> version` (несовпадение версии — `Conflict`;
+`rebuilt` снимает `rebuild`). Перестройка: `request_rebuild(scope, request) -> version` (версия растёт — идущая перестройка
+получит `Conflict` и начнётся заново), `pending_rebuilds(schema, limit) -> Vec<AccountScope>` — запрошенные и со схемой старше
+`schema` (все организации); новый индекс строится в новых путях, прежний обслуживает запросы до переключения.
 
 ## Directory
 SRS 5.1, 3.8. Каталог организации: `accounts_since(tenant, Option<&DirCursor>, limit)`, `groups_since` — инкрементально,
@@ -229,3 +233,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   раздел «Trash, Quota» → «Trash, Retention, Quota».
 - 2026-10-31 — CTR-08 (волна contracts-03): SASL из `auth` в `sasl`; `Mechanism`, `SaslContext`, `SaslStep::Fail(SaslFailure)`,
   `step(Option<&[u8]>)` (нет начального ответа ≠ пустой).
+- 2026-10-31 — CTR-09 (волна contracts-03): манифест индекса — `schema`, `IndexSegment::docs`, `rebuild`; `put_manifest(.., ManifestUpdate)`,
+  `request_rebuild`, `pending_rebuilds`.
