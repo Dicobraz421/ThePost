@@ -4701,6 +4701,8 @@ dependencies = [
  "redis",
  "rustls",
  "schemars",
+ "serde",
+ "serde_yaml_ng",
  "thiserror 2.0.21",
  "tokio",
  "tp-contracts",
