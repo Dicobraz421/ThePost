@@ -3,6 +3,7 @@
 //! Реализации разделяют состояние между клонами (`Arc` внутри) и берут время из [`Clock`]:
 //! тесты таймаутов используют [`ManualClock`]. Фейки Ф1 для протокольных полос — [`fakes`]. Общие наборы тестов контрактов — [`suite`].
 
+pub mod acl;
 pub mod blob;
 pub mod corpus;
 pub mod fakes;
@@ -12,6 +13,7 @@ pub mod meta;
 pub mod secrets;
 pub mod suite;
 
+pub use acl::MemAcl;
 pub use blob::{BlobOp, MemBlobIndex, MemBlobStore};
 pub use corpus::{LoadModel, SyntheticMail, corpus, pg_schema, pg_url};
 pub use fakes::{

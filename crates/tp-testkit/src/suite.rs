@@ -1,5 +1,5 @@
 //! Общие наборы тестов контрактов: in-memory реализации testkit и настоящие реализации полос
-//! (`tp-meta` — `Membership`, `tp-platform` — `SecretStore`) проходят одни и те же проверки.
+//! (`tp-meta` — `Membership`, `AclStore`, `tp-platform` — `SecretStore`) проходят одни и те же проверки.
 //!
 //! Время в наборах идёт через [`Wait`]: для testkit — [`ManualClock`] (сдвиг без ожидания), для PostgreSQL
 //! и OpenBao — [`RealTime`] (сон), тогда сроки выбирают с запасом на задержки.
@@ -20,10 +20,12 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tp_contracts::Error;
-use tp_contracts::TenantId;
+use tp_contracts::acl::{ANYONE, AclEntry, AclStore, SendDelegation, SharedMailbox};
+use tp_contracts::auth::{Rights, SendRight};
 use tp_contracts::membership::{Membership, NodeId};
+use tp_contracts::meta::{AccountScope, MailboxStore, NewMailbox, SpecialUse};
 use tp_contracts::secrets::{SecretLease, SecretRef, SecretStore};
+use tp_contracts::{AccountId, Error, MailboxId, TenantId};
 
 use crate::ManualClock;
 
@@ -177,4 +179,301 @@ pub async fn secret_store(store: &dyn SecretStore, fixture: &SecretFixture, wait
     assert_eq!(store.renew(&renewed).await, Err(Error::NotFound));
     let again = store.get(dynamic).await.expect("dynamic again");
     assert!(again.lease().is_some_and(|l| l.id != lease.id));
+}
+
+// ---------- AclStore ----------
+
+/// Учётные записи для [`acl_store`]; создаёт тест до запуска набора (у каждой — системные папки).
+#[derive(Debug, Clone, Copy)]
+pub struct AclFixture {
+    /// Владелец папок.
+    pub owner: AccountScope,
+    /// Другая учётная запись той же организации.
+    pub peer: AccountScope,
+    /// Учётная запись другой организации.
+    pub foreign: AccountScope,
+}
+
+/// Набор проверок `AclStore`; папки создаёт и удаляет через `mailboxes`. Идентификаторы — с уникальным
+/// суффиксом: записи других тестов той же организации не мешают.
+pub async fn acl_store(acl: &dyn AclStore, mailboxes: &dyn MailboxStore, fx: &AclFixture) {
+    let sfx = TenantId::new().to_string();
+    let id = |n: &str| format!("{n}-{sfx}");
+    let ids = |list: &[&str]| list.iter().map(|n| id(n)).collect::<Vec<_>>();
+    let r = |s: &str| s.parse::<Rights>().expect("rights");
+    let (fred, sales, assistants) = (id("fred"), id("sales"), id("assistants"));
+    let not_fred = format!("-{fred}");
+    let owner = fx.owner;
+    let folder = |scope: AccountScope, name: &str| {
+        let name = format!("{name}-{sfx}");
+        async move {
+            mailboxes
+                .create(
+                    scope,
+                    NewMailbox {
+                        parent: None,
+                        name,
+                        role: None,
+                    },
+                )
+                .await
+                .expect("create mailbox")
+                .id
+        }
+    };
+    let inbox = mailboxes
+        .list(owner)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|m| m.role == Some(SpecialUse::Inbox))
+        .expect("inbox")
+        .id;
+    let shared = folder(owner, "Shared").await;
+    let peer_box = folder(fx.peer, "Peer").await;
+
+    // Чтение и запись ACL; замена прав целиком; порядок — по идентификатору.
+    assert!(acl.acl(owner, inbox).await.expect("acl").is_empty());
+    for (who, rights) in [
+        (fred.as_str(), "lrs"),
+        (sales.as_str(), "lrswi"),
+        (ANYONE, "l"),
+        (not_fred.as_str(), "w"),
+        (fred.as_str(), "lrsp"),
+    ] {
+        acl.set_acl(owner, inbox, who, r(rights))
+            .await
+            .expect("set_acl");
+    }
+    let mut expected = vec![
+        AclEntry {
+            identifier: not_fred.clone(),
+            rights: r("w"),
+        },
+        AclEntry {
+            identifier: ANYONE.to_owned(),
+            rights: r("l"),
+        },
+        AclEntry {
+            identifier: fred.clone(),
+            rights: r("lrsp"),
+        },
+        AclEntry {
+            identifier: sales.clone(),
+            rights: r("lrswi"),
+        },
+    ];
+    expected.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+    assert_eq!(acl.acl(owner, inbox).await.expect("acl"), expected);
+
+    // Действующие права: объединение своих, групп и anyone минус отрицательные.
+    let rights = |mailbox: MailboxId, who: Vec<String>| async move {
+        acl.acl_rights(owner, mailbox, &who).await.expect("rights")
+    };
+    assert_eq!(rights(inbox, ids(&["fred", "sales"])).await, r("lrsip"));
+    assert_eq!(rights(inbox, ids(&["fred"])).await, r("lrsp"));
+    assert_eq!(rights(inbox, ids(&["bob"])).await, r("l"), "anyone");
+    assert_eq!(rights(inbox, Vec::new()).await, r("l"), "только anyone");
+    assert_eq!(rights(shared, ids(&["fred"])).await, Rights::NONE);
+    assert_eq!(rights(MailboxId::new(), ids(&["fred"])).await, Rights::NONE);
+    assert!(matches!(
+        acl.acl_rights(owner, inbox, std::slice::from_ref(&not_fred))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Общие папки: только с правом l, по возрастанию (учётная запись, папка).
+    let shared_of = |who: Vec<String>| async move {
+        acl.shared_mailboxes(owner.tenant, &who)
+            .await
+            .expect("shared")
+    };
+    acl.set_acl(owner, shared, &fred, r("r"))
+        .await
+        .expect("без l");
+    assert_eq!(
+        shared_of(ids(&["fred"])).await,
+        vec![SharedMailbox {
+            account: owner.account,
+            mailbox: inbox,
+            rights: r("lrsp"),
+        }]
+    );
+    acl.set_acl(owner, shared, &fred, r("lr"))
+        .await
+        .expect("с l");
+    acl.set_acl(fx.peer, peer_box, &sales, r("lre"))
+        .await
+        .expect("peer");
+    let mut expected = vec![
+        SharedMailbox {
+            account: owner.account,
+            mailbox: inbox,
+            rights: r("lrsip"),
+        },
+        SharedMailbox {
+            account: owner.account,
+            mailbox: shared,
+            rights: r("lr"),
+        },
+        SharedMailbox {
+            account: fx.peer.account,
+            mailbox: peer_box,
+            rights: r("lre"),
+        },
+    ];
+    expected.sort_by_key(|s| (s.account, s.mailbox));
+    assert_eq!(shared_of(ids(&["fred", "sales"])).await, expected);
+    assert!(matches!(
+        acl.shared_mailboxes(owner.tenant, std::slice::from_ref(&not_fred))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Пустые права удаляют запись (повторно — не ошибка); удаление папки удаляет её ACL.
+    for _ in 0..2 {
+        acl.set_acl(owner, inbox, &not_fred, Rights::NONE)
+            .await
+            .expect("delete entry");
+    }
+    assert_eq!(rights(inbox, ids(&["fred"])).await, r("lrsp"));
+    mailboxes
+        .delete(owner, shared, false)
+        .await
+        .expect("delete mailbox");
+    assert_eq!(acl.acl(owner, shared).await, Err(Error::NotFound));
+    assert_eq!(rights(shared, ids(&["fred"])).await, Rights::NONE);
+    let left: Vec<MailboxId> = shared_of(ids(&["fred"]))
+        .await
+        .iter()
+        .map(|s| s.mailbox)
+        .collect();
+    assert_eq!(left, vec![inbox]);
+
+    // Ошибки: нет папки (и папка другой учётной записи); недопустимый идентификатор проверяется первым.
+    for mailbox in [MailboxId::new(), peer_box] {
+        assert_eq!(acl.acl(owner, mailbox).await, Err(Error::NotFound));
+        assert_eq!(
+            acl.set_acl(owner, mailbox, &fred, r("l")).await,
+            Err(Error::NotFound)
+        );
+    }
+    let long = "x".repeat(256);
+    for bad in ["", "-", "a b", "a\tb", long.as_str()] {
+        for mailbox in [inbox, MailboxId::new()] {
+            assert!(
+                matches!(
+                    acl.set_acl(owner, mailbox, bad, r("l")).await,
+                    Err(Error::Invalid(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    // Другая организация не видит ACL.
+    let alien = AccountScope {
+        tenant: fx.foreign.tenant,
+        account: owner.account,
+    };
+    assert_eq!(acl.acl(alien, inbox).await, Err(Error::NotFound));
+    assert_eq!(
+        acl.set_acl(alien, inbox, &fred, r("l")).await,
+        Err(Error::NotFound)
+    );
+    assert!(
+        acl.shared_mailboxes(fx.foreign.tenant, &ids(&["fred", "sales"]))
+            .await
+            .expect("foreign")
+            .is_empty()
+    );
+
+    // ---- Делегирование отправки ----
+    let right_of = |who: Vec<String>| async move {
+        acl.send_right_of(owner, &who).await.expect("send_right_of")
+    };
+    assert!(acl.send_delegations(owner).await.expect("list").is_empty());
+    assert_eq!(right_of(ids(&["fred"])).await, None);
+    acl.set_send_delegation(owner, &fred, Some(SendRight::SendOnBehalf))
+        .await
+        .expect("fred");
+    acl.set_send_delegation(owner, &assistants, Some(SendRight::SendAs))
+        .await
+        .expect("group");
+    assert_eq!(
+        right_of(ids(&["fred"])).await,
+        Some(SendRight::SendOnBehalf)
+    );
+    // Send As через группу сильнее Send on Behalf; anyone не добавляется.
+    assert_eq!(
+        right_of(ids(&["fred", "assistants"])).await,
+        Some(SendRight::SendAs)
+    );
+    assert_eq!(right_of(Vec::new()).await, None);
+    let mut expected = vec![
+        SendDelegation {
+            delegate: assistants.clone(),
+            right: SendRight::SendAs,
+        },
+        SendDelegation {
+            delegate: fred.clone(),
+            right: SendRight::SendOnBehalf,
+        },
+    ];
+    expected.sort_by(|a, b| a.delegate.cmp(&b.delegate));
+    assert_eq!(acl.send_delegations(owner).await.expect("list"), expected);
+    assert!(
+        acl.send_delegations(fx.peer)
+            .await
+            .expect("peer")
+            .is_empty()
+    );
+
+    // Замена и отзыв (повторный отзыв — не ошибка).
+    acl.set_send_delegation(owner, &fred, Some(SendRight::SendAs))
+        .await
+        .expect("upgrade");
+    assert_eq!(right_of(ids(&["fred"])).await, Some(SendRight::SendAs));
+    for _ in 0..2 {
+        acl.set_send_delegation(owner, &fred, None)
+            .await
+            .expect("revoke");
+    }
+    assert_eq!(right_of(ids(&["fred"])).await, None);
+    assert_eq!(acl.send_delegations(owner).await.expect("list").len(), 1);
+
+    // Ошибки: нет учётной записи, недопустимый идентификатор; другая организация не видит делегирований.
+    let missing = AccountScope {
+        tenant: owner.tenant,
+        account: AccountId::new(),
+    };
+    assert_eq!(
+        acl.set_send_delegation(missing, &fred, Some(SendRight::SendAs))
+            .await,
+        Err(Error::NotFound)
+    );
+    for bad in ["", "-fred", "a b"] {
+        assert!(matches!(
+            acl.set_send_delegation(owner, bad, Some(SendRight::SendAs))
+                .await,
+            Err(Error::Invalid(_))
+        ));
+    }
+    assert!(matches!(
+        acl.send_right_of(owner, std::slice::from_ref(&not_fred))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(
+        acl.send_delegations(alien)
+            .await
+            .expect("foreign")
+            .is_empty()
+    );
+    assert_eq!(
+        acl.set_send_delegation(alien, &fred, Some(SendRight::SendAs))
+            .await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(acl.send_right_of(alien, &[assistants]).await, Ok(None));
 }

@@ -1,64 +1,22 @@
 //! ACL папок (RFC 4314) и делегирование отправки на PostgreSQL (SRS 4.5).
 //!
-//! Хранилище для `Authorizer` (`tp-auth`): записи ACL папок учётной записи-владельца (`mailbox_acl`) и права
+//! Реализация [`AclStore`] (CONTRACTS.md#Auth): записи ACL папок учётной записи-владельца (`mailbox_acl`) и права
 //! отправки от её адресов (`send_delegations`). Идентификаторы — как у [`Principal`](tp_contracts::auth::Principal):
 //! имя входа, имя группы, `anyone`; ACL с `-` в начале идентификатора — отрицательные права (RFC 4314 §2).
 //! Владелец учётной записи имеет все права без записей ACL — это правило `Authorizer`, здесь не хранится.
 
-use serde::{Deserialize, Serialize};
+use async_trait::async_trait;
 use sqlx::PgConnection;
+use tp_contracts::acl::{AclStore, effective_rights, validate_identifier};
 use tp_contracts::auth::{Rights, SendRight};
+use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
 use uuid::Uuid;
 
+pub use tp_contracts::acl::{ANYONE, AclEntry, SendDelegation, SharedMailbox};
+
 use crate::PgMeta;
 use crate::schema::{begin, db_err};
-
-/// Идентификатор «все пользователи организации» (RFC 4314 §2).
-pub const ANYONE: &str = "anyone";
-
-/// Запись ACL папки.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AclEntry {
-    /// Идентификатор (с `-` в начале — отрицательные права).
-    pub identifier: String,
-    /// Права.
-    pub rights: Rights,
-}
-
-/// Папка другой учётной записи, доступная субъекту по ACL (пространство имён общих папок IMAP).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SharedMailbox {
-    /// Владелец.
-    pub account: AccountId,
-    /// Папка.
-    pub mailbox: MailboxId,
-    /// Действующие права субъекта (без прав владельца).
-    pub rights: Rights,
-}
-
-/// Право отправки, выданное представителю.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SendDelegation {
-    /// Представитель: имя входа или группы.
-    pub delegate: String,
-    /// Вид права.
-    pub right: SendRight,
-}
-
-fn check_identifier(id: &str, negative_allowed: bool) -> Result<()> {
-    let bad = id.is_empty()
-        || id.len() > 255
-        || id == "-"
-        || id.chars().any(|c| c.is_whitespace() || c.is_control())
-        || (!negative_allowed && id.starts_with('-'));
-    if bad {
-        return Err(Error::invalid(format!(
-            "недопустимый идентификатор: {id:?}"
-        )));
-    }
-    Ok(())
-}
 
 fn parse_rights(s: &str) -> Result<Rights> {
     s.parse()
@@ -84,7 +42,7 @@ fn parse_kind(s: &str) -> Result<SendRight> {
 fn with_negatives(identifiers: &[String]) -> Result<(Vec<String>, Vec<String>)> {
     let mut pos: Vec<String> = Vec::with_capacity(identifiers.len() + 1);
     for id in identifiers {
-        check_identifier(id, false)?;
+        validate_identifier(id, false)?;
         pos.push(id.clone());
     }
     if !pos.iter().any(|i| i == ANYONE) {
@@ -94,31 +52,25 @@ fn with_negatives(identifiers: &[String]) -> Result<(Vec<String>, Vec<String>)> 
     Ok((pos, neg))
 }
 
-/// Действующие права: объединение положительных записей минус объединение отрицательных.
-fn effective(rows: impl IntoIterator<Item = (String, String)>) -> Result<Rights> {
-    let (mut plus, mut minus) = (Rights::NONE, Rights::NONE);
-    for (id, rights) in rows {
-        let r = parse_rights(&rights)?;
-        if id.starts_with('-') {
-            minus |= r;
-        } else {
-            plus |= r;
-        }
-    }
-    Ok(plus - minus)
+/// Действующие права по строкам `(identifier, rights)` выборки.
+fn effective(rows: Vec<(String, String)>) -> Result<Rights> {
+    let rows = rows
+        .into_iter()
+        .map(|(id, rights)| Ok((id, parse_rights(&rights)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(effective_rights(rows))
 }
 
 async fn mailbox_exists(
     tx: &mut PgConnection,
-    tenant: TenantId,
-    owner: AccountId,
+    owner: AccountScope,
     mailbox: MailboxId,
 ) -> Result<bool> {
     let found: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM mailboxes WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3",
     )
-    .bind(tenant.as_uuid())
-    .bind(owner.as_uuid())
+    .bind(owner.tenant.as_uuid())
+    .bind(owner.account.as_uuid())
     .bind(mailbox.as_uuid())
     .fetch_optional(&mut *tx)
     .await
@@ -126,24 +78,19 @@ async fn mailbox_exists(
     Ok(found.is_some())
 }
 
-impl PgMeta {
-    /// ACL папки (IMAP GETACL), по идентификатору. Папки нет — `NotFound`.
-    pub async fn acl(
-        &self,
-        tenant: TenantId,
-        owner: AccountId,
-        mailbox: MailboxId,
-    ) -> Result<Vec<AclEntry>> {
-        let mut tx = begin(&self.pool, tenant).await?;
-        if !mailbox_exists(&mut tx, tenant, owner, mailbox).await? {
+#[async_trait]
+impl AclStore for PgMeta {
+    async fn acl(&self, owner: AccountScope, mailbox: MailboxId) -> Result<Vec<AclEntry>> {
+        let mut tx = begin(&self.pool, owner.tenant).await?;
+        if !mailbox_exists(&mut tx, owner, mailbox).await? {
             return Err(Error::NotFound);
         }
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT identifier, rights FROM mailbox_acl
              WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3 ORDER BY identifier COLLATE \"C\"",
         )
-        .bind(tenant.as_uuid())
-        .bind(owner.as_uuid())
+        .bind(owner.tenant.as_uuid())
+        .bind(owner.account.as_uuid())
         .bind(mailbox.as_uuid())
         .fetch_all(&mut *tx)
         .await
@@ -159,19 +106,16 @@ impl PgMeta {
             .collect()
     }
 
-    /// Задаёт права идентификатора на папку целиком (IMAP SETACL); пустые права удаляют запись
-    /// (DELETEACL). Папки нет — `NotFound`; недопустимый идентификатор — `Invalid`.
-    pub async fn set_acl(
+    async fn set_acl(
         &self,
-        tenant: TenantId,
-        owner: AccountId,
+        owner: AccountScope,
         mailbox: MailboxId,
         identifier: &str,
         rights: Rights,
     ) -> Result<()> {
-        check_identifier(identifier, true)?;
-        let mut tx = begin(&self.pool, tenant).await?;
-        if !mailbox_exists(&mut tx, tenant, owner, mailbox).await? {
+        validate_identifier(identifier, true)?;
+        let mut tx = begin(&self.pool, owner.tenant).await?;
+        if !mailbox_exists(&mut tx, owner, mailbox).await? {
             return Err(Error::NotFound);
         }
         if rights.is_empty() {
@@ -179,8 +123,8 @@ impl PgMeta {
                 "DELETE FROM mailbox_acl
                  WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3 AND identifier = $4",
             )
-            .bind(tenant.as_uuid())
-            .bind(owner.as_uuid())
+            .bind(owner.tenant.as_uuid())
+            .bind(owner.account.as_uuid())
             .bind(mailbox.as_uuid())
             .bind(identifier)
             .execute(&mut *tx)
@@ -193,8 +137,8 @@ impl PgMeta {
                  ON CONFLICT (tenant_id, account_id, mailbox_id, identifier)
                  DO UPDATE SET rights = EXCLUDED.rights, updated_at = now()",
             )
-            .bind(tenant.as_uuid())
-            .bind(owner.as_uuid())
+            .bind(owner.tenant.as_uuid())
+            .bind(owner.account.as_uuid())
             .bind(mailbox.as_uuid())
             .bind(identifier)
             .bind(rights.to_string())
@@ -206,24 +150,21 @@ impl PgMeta {
         Ok(())
     }
 
-    /// Права субъекта с идентификаторами `identifiers` (имя входа, группы) на папку по ACL: записи
-    /// идентификаторов и `anyone`, минус их отрицательные записи. Права владельца не учитываются.
-    pub async fn acl_rights(
+    async fn acl_rights(
         &self,
-        tenant: TenantId,
-        owner: AccountId,
+        owner: AccountScope,
         mailbox: MailboxId,
         identifiers: &[String],
     ) -> Result<Rights> {
         let (pos, neg) = with_negatives(identifiers)?;
-        let mut tx = begin(&self.pool, tenant).await?;
+        let mut tx = begin(&self.pool, owner.tenant).await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT identifier, rights FROM mailbox_acl
              WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3
                AND (identifier = ANY($4) OR identifier = ANY($5))",
         )
-        .bind(tenant.as_uuid())
-        .bind(owner.as_uuid())
+        .bind(owner.tenant.as_uuid())
+        .bind(owner.account.as_uuid())
         .bind(mailbox.as_uuid())
         .bind(&pos)
         .bind(&neg)
@@ -234,8 +175,7 @@ impl PgMeta {
         effective(rows)
     }
 
-    /// Папки других учётных записей, на которые у субъекта есть право `l` (RFC 4314 LIST), с действующими правами.
-    pub async fn shared_mailboxes(
+    async fn shared_mailboxes(
         &self,
         tenant: TenantId,
         identifiers: &[String],
@@ -265,7 +205,7 @@ impl PgMeta {
         let mut current: Option<(Uuid, Uuid)> = None;
         let mut flush = |key: Option<(Uuid, Uuid)>, group: &mut Vec<(String, String)>| {
             if let Some((account, mailbox)) = key {
-                let rights = effective(group.drain(..))?;
+                let rights = effective(std::mem::take(group))?;
                 if rights.contains(Rights::LOOKUP) {
                     out.push(SharedMailbox {
                         account: AccountId::from_uuid(account),
@@ -287,19 +227,14 @@ impl PgMeta {
         Ok(out)
     }
 
-    /// Делегирования отправки учётной записи-владельца, по представителю.
-    pub async fn send_delegations(
-        &self,
-        tenant: TenantId,
-        owner: AccountId,
-    ) -> Result<Vec<SendDelegation>> {
-        let mut tx = begin(&self.pool, tenant).await?;
+    async fn send_delegations(&self, owner: AccountScope) -> Result<Vec<SendDelegation>> {
+        let mut tx = begin(&self.pool, owner.tenant).await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT delegate, kind FROM send_delegations
              WHERE tenant_id = $1 AND account_id = $2 ORDER BY delegate COLLATE \"C\"",
         )
-        .bind(tenant.as_uuid())
-        .bind(owner.as_uuid())
+        .bind(owner.tenant.as_uuid())
+        .bind(owner.account.as_uuid())
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -314,21 +249,18 @@ impl PgMeta {
             .collect()
     }
 
-    /// Выдаёт представителю право отправки от адресов владельца (Send As / Send on Behalf);
-    /// `None` — отзывает. Учётной записи нет — `NotFound`.
-    pub async fn set_send_delegation(
+    async fn set_send_delegation(
         &self,
-        tenant: TenantId,
-        owner: AccountId,
+        owner: AccountScope,
         delegate: &str,
         right: Option<SendRight>,
     ) -> Result<()> {
-        check_identifier(delegate, false)?;
-        let mut tx = begin(&self.pool, tenant).await?;
+        validate_identifier(delegate, false)?;
+        let mut tx = begin(&self.pool, owner.tenant).await?;
         let found: Option<i32> =
             sqlx::query_scalar("SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2")
-                .bind(tenant.as_uuid())
-                .bind(owner.as_uuid())
+                .bind(owner.tenant.as_uuid())
+                .bind(owner.account.as_uuid())
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -340,8 +272,8 @@ impl PgMeta {
                 sqlx::query(
                     "DELETE FROM send_delegations WHERE tenant_id = $1 AND account_id = $2 AND delegate = $3",
                 )
-                .bind(tenant.as_uuid())
-                .bind(owner.as_uuid())
+                .bind(owner.tenant.as_uuid())
+                .bind(owner.account.as_uuid())
                 .bind(delegate)
                 .execute(&mut *tx)
                 .await
@@ -353,8 +285,8 @@ impl PgMeta {
                      ON CONFLICT (tenant_id, account_id, delegate)
                      DO UPDATE SET kind = EXCLUDED.kind, updated_at = now()",
                 )
-                .bind(tenant.as_uuid())
-                .bind(owner.as_uuid())
+                .bind(owner.tenant.as_uuid())
+                .bind(owner.account.as_uuid())
                 .bind(delegate)
                 .bind(kind_str(r))
                 .execute(&mut *tx)
@@ -366,24 +298,21 @@ impl PgMeta {
         Ok(())
     }
 
-    /// Право субъекта с идентификаторами `identifiers` отправлять от адресов владельца: сильнейшее из
-    /// выданных (Send As сильнее Send on Behalf); `None` — нет права.
-    pub async fn send_right_of(
+    async fn send_right_of(
         &self,
-        tenant: TenantId,
-        owner: AccountId,
+        owner: AccountScope,
         identifiers: &[String],
     ) -> Result<Option<SendRight>> {
         for id in identifiers {
-            check_identifier(id, false)?;
+            validate_identifier(id, false)?;
         }
-        let mut tx = begin(&self.pool, tenant).await?;
+        let mut tx = begin(&self.pool, owner.tenant).await?;
         let kinds: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT kind FROM send_delegations
              WHERE tenant_id = $1 AND account_id = $2 AND delegate = ANY($3)",
         )
-        .bind(tenant.as_uuid())
-        .bind(owner.as_uuid())
+        .bind(owner.tenant.as_uuid())
+        .bind(owner.account.as_uuid())
         .bind(identifiers)
         .fetch_all(&mut *tx)
         .await
@@ -406,30 +335,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identifiers() {
-        for ok in ["fred", "group:sales", "anyone", "a@b.test"] {
-            assert!(check_identifier(ok, false).is_ok(), "{ok}");
-        }
-        assert!(check_identifier("-fred", true).is_ok());
-        for bad in ["", "-", "a b", "a\tb", "a\u{7}"] {
-            assert!(check_identifier(bad, true).is_err(), "{bad:?}");
-        }
-        assert!(check_identifier("-fred", false).is_err());
-        assert!(check_identifier(&"x".repeat(256), true).is_err());
-    }
-
-    #[test]
-    fn negative_rights_subtract() {
+    fn subject_identifiers() {
+        let (pos, neg) = with_negatives(&["fred".into()]).expect("ids");
+        assert_eq!(pos, ["fred", ANYONE]);
+        assert_eq!(neg, ["-fred", "-anyone"]);
+        let (pos, _) = with_negatives(&[ANYONE.into()]).expect("ids");
+        assert_eq!(pos, [ANYONE]);
+        assert!(with_negatives(&["-fred".into()]).is_err());
         let rows = vec![
             ("fred".to_owned(), "lrswi".to_owned()),
-            ("anyone".to_owned(), "lr".to_owned()),
             ("-fred".to_owned(), "w".to_owned()),
         ];
         assert_eq!(effective(rows).expect("rights").to_string(), "lrsi");
-        let (pos, neg) = with_negatives(&["fred".into()]).expect("ids");
-        assert_eq!(pos, ["fred", "anyone"]);
-        assert_eq!(neg, ["-fred", "-anyone"]);
-        assert!(with_negatives(&["-fred".into()]).is_err());
+        assert!(effective(vec![("fred".into(), "?".into())]).is_err());
     }
 
     #[test]
