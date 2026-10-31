@@ -59,50 +59,6 @@ impl Store {
     }
 }
 
-/// Временная квота для тестов поверх `MemMetadata` (до `MemQuota` из testkit-02).
-#[cfg(test)]
-pub(crate) mod fake {
-    use std::sync::{Arc, Mutex};
-
-    use async_trait::async_trait;
-    use tp_contracts::meta::{AccountStore, QuotaUsage};
-    use tp_contracts::retention::Quota;
-    use tp_testkit::MemMetadata;
-
-    use super::*;
-
-    /// Использование — по письмам `MemMetadata` (включая корзину), лимит задаёт тест.
-    #[derive(Clone)]
-    pub struct TestQuota {
-        meta: MemMetadata,
-        limit: Arc<Mutex<Option<u64>>>,
-    }
-
-    impl TestQuota {
-        pub fn new(meta: MemMetadata) -> Self {
-            Self {
-                meta,
-                limit: Arc::new(Mutex::new(None)),
-            }
-        }
-
-        pub fn set_limit(&self, limit: Option<u64>) {
-            *self.limit.lock().expect("lock") = limit;
-        }
-    }
-
-    #[async_trait]
-    impl Quota for TestQuota {
-        async fn usage(&self, scope: AccountScope) -> Result<QuotaUsage> {
-            let used = AccountStore::quota(&self.meta, scope.tenant, scope.account).await?;
-            Ok(QuotaUsage {
-                limit_bytes: *self.limit.lock().expect("lock"),
-                ..used
-            })
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use time::OffsetDateTime;
@@ -176,7 +132,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_at_threshold() {
         let f = fixture().await;
-        f.env.quota.set_limit(Some(2 * f.size()));
+        f.env.quota.set_default_limit(Some(2 * f.size()));
         let first = f.ingest(1).await.expect("ingest").delivered[0].message;
         f.ingest(1).await.expect("ровно на пороге");
         let m = MessageStore::get(&f.env.meta, f.scope, first)
@@ -214,7 +170,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_sums_deliveries_of_account() {
         let f = fixture().await;
-        f.env.quota.set_limit(Some(2 * f.size() - 1));
+        f.env.quota.set_default_limit(Some(2 * f.size() - 1));
         assert_eq!(f.ingest(2).await, Err(Error::QuotaExceeded));
         assert_eq!(f.count(f.inbox).await, 0);
         f.ingest(1).await.expect("одна копия помещается");
@@ -239,7 +195,7 @@ mod tests {
             .await
             .expect("create")
             .id;
-        f.env.quota.set_limit(Some(3 * f.size()));
+        f.env.quota.set_default_limit(Some(3 * f.size()));
         assert_eq!(
             f.env.store.copy(f.scope, &[a, b], to).await,
             Err(Error::QuotaExceeded)

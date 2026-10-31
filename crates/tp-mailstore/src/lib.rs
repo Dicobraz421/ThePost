@@ -180,18 +180,18 @@ impl MailStore for Store {
 #[cfg(test)]
 pub(crate) mod testenv {
     use super::*;
-    use tp_testkit::{Clock, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata, SystemClock};
-
-    use crate::quota::fake::TestQuota;
-    use crate::trash::fake::TestTrash;
+    use tp_testkit::{
+        Clock, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata, MemQuota, MemTrash,
+        SystemClock,
+    };
 
     pub struct Env {
         pub blobs: MemBlobStore,
         pub index: MemBlobIndex,
         pub meta: MemMetadata,
         pub bus: MemEventBus,
-        pub trash: TestTrash,
-        pub quota: TestQuota,
+        pub trash: MemTrash,
+        pub quota: MemQuota,
         pub store: Store,
     }
 
@@ -206,8 +206,8 @@ pub(crate) mod testenv {
             let index = MemBlobIndex::new(clock.clone());
             let meta = MemMetadata::new(clock).with_blob_index(index.clone());
             let bus = MemEventBus::default();
-            let trash = TestTrash::new(meta.clone());
-            let quota = TestQuota::new(meta.clone());
+            let trash = MemTrash::new(&meta);
+            let quota = MemQuota::new(&meta);
             let store = Store::new(Deps {
                 blobs: Arc::new(blobs.clone()),
                 index: Arc::new(index.clone()),
