@@ -29,80 +29,140 @@ use redis::{ClientTlsConfig, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use schemars::JsonSchema;
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
+use tp_contracts::config::duration;
 use tp_contracts::meta::AccountScope;
+use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{AccountId, Error, ModSeq, Result, TenantId};
 
 use crate::local_bus::{LocalBus, LocalBusConfig};
 use crate::metrics::{BusCounters, BusMetrics, inc};
 
-/// Конфигурация шины Valkey.
-#[derive(Clone, PartialEq, Eq, JsonSchema)]
-pub struct ValkeyBusConfig {
-    /// Адрес Valkey (`rediss://[:пароль@]узел:порт[/база]`; `redis://` — только профиль dev с
-    /// `tls.allow_plaintext`); в логи не попадает.
+/// Секция шины Valkey в config.yaml (`bus.valkey`). Незаданные поля — по умолчанию, неизвестные — ошибка
+/// разбора. Запуск — [`ValkeyBus::connect`].
+///
+/// ```yaml
+/// url: rediss://valkey.internal:6379
+/// password: { secret: "thepost/valkey#password" }
+/// tls: { ca_file: /etc/thepost/tls/ca.pem }
+/// connect_timeout: 5s
+/// ```
+#[derive(Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ValkeyConfig {
+    /// Адрес Valkey без пароля: `rediss://[пользователь@]узел:порт[/база]` (`redis://` — только профиль dev с
+    /// `tls.allow_plaintext`; пароль в адресе — тоже только dev); в логи не попадает.
     pub url: String,
+    /// Пароль — только ссылка на секрет в хранилище (`{ secret: "<путь>#<поле>" }`); значение читает
+    /// [`ValkeyBus::connect`] при запуске.
+    pub password: Option<SecretRef>,
     /// TLS канала: CA сервера, клиентский сертификат для mTLS, разрешение открытого канала в dev.
     pub tls: InternalTls,
     /// Префикс имён каналов: разные кластеры на одном Valkey не слышат друг друга.
     pub channel_prefix: String,
     /// Буфер уведомлений подписчика на узле (как `capacity` шины в процессе).
     pub buffer: usize,
-    /// Таймаут установки соединения, мс.
-    pub connect_timeout_ms: u64,
-    /// Таймаут команды (PUBLISH, SUBSCRIBE, PING), мс.
-    pub command_timeout_ms: u64,
-    /// Начальная задержка переподключения, мс; удваивается до `reconnect_max_ms`.
-    pub reconnect_min_ms: u64,
-    /// Предельная задержка переподключения, мс.
-    pub reconnect_max_ms: u64,
-    /// Период проверки pub/sub-соединения командой PING, мс.
-    pub ping_interval_ms: u64,
+    /// Таймаут установки соединения (`5s`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub connect_timeout: Duration,
+    /// Таймаут команды (PUBLISH, SUBSCRIBE, PING).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub command_timeout: Duration,
+    /// Начальная задержка переподключения (ноль считается за 1 мс); удваивается до `reconnect_max`.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub reconnect_min: Duration,
+    /// Предельная задержка переподключения (не меньше `reconnect_min`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub reconnect_max: Duration,
+    /// Период проверки pub/sub-соединения командой PING (ноль считается за 1 мс).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub ping_interval: Duration,
 }
 
-impl Default for ValkeyBusConfig {
+impl Default for ValkeyConfig {
     fn default() -> Self {
         Self {
             url: "rediss://127.0.0.1:6379".to_owned(),
+            password: None,
             tls: InternalTls::default(),
             channel_prefix: "thepost".to_owned(),
             buffer: LocalBusConfig::default().capacity,
-            connect_timeout_ms: 5_000,
-            command_timeout_ms: 2_000,
-            reconnect_min_ms: 100,
-            reconnect_max_ms: 10_000,
-            ping_interval_ms: 15_000,
+            connect_timeout: Duration::from_secs(5),
+            command_timeout: Duration::from_secs(2),
+            reconnect_min: Duration::from_millis(100),
+            reconnect_max: Duration::from_secs(10),
+            ping_interval: Duration::from_secs(15),
         }
     }
 }
 
-impl fmt::Debug for ValkeyBusConfig {
+impl fmt::Debug for ValkeyConfig {
+    // Адрес в dev может содержать пароль — в журнал не попадает.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ValkeyBusConfig")
+        f.debug_struct("ValkeyConfig")
             .field("url", &"<скрыт>")
+            .field("password", &self.password)
             .field("tls", &self.tls)
             .field("channel_prefix", &self.channel_prefix)
             .field("buffer", &self.buffer)
-            .field("connect_timeout_ms", &self.connect_timeout_ms)
-            .field("command_timeout_ms", &self.command_timeout_ms)
-            .field("reconnect_min_ms", &self.reconnect_min_ms)
-            .field("reconnect_max_ms", &self.reconnect_max_ms)
-            .field("ping_interval_ms", &self.ping_interval_ms)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("command_timeout", &self.command_timeout)
+            .field("reconnect_min", &self.reconnect_min)
+            .field("reconnect_max", &self.reconnect_max)
+            .field("ping_interval", &self.ping_interval)
             .finish()
     }
 }
 
-impl ValkeyBusConfig {
-    /// Проверяет адрес и секцию TLS (`thepost config check` и запуск): `rediss://` с проверкой
-    /// сертификата; `redis://` — только профиль dev с `tls.allow_plaintext`.
+impl ValkeyConfig {
+    /// Проверяет адрес, пароль и секцию TLS (`thepost config check` и запуск): `rediss://` с проверкой
+    /// сертификата; `redis://` — только профиль dev с `tls.allow_plaintext`; пароль — ссылкой `password`
+    /// (в адресе — только профиль dev и не вместе со ссылкой).
     pub fn check(&self, profile: Profile) -> Result<Transport> {
-        self.parse(profile).map(|(_, transport)| transport)
+        let (info, transport) = self.parse(profile)?;
+        if info.redis_settings().password().is_some() {
+            if self.password.is_some() {
+                return Err(Error::Invalid(
+                    "шина Valkey: пароль задан и в адресе url, и ссылкой password".to_owned(),
+                ));
+            }
+            if profile != Profile::Dev {
+                return Err(Error::Invalid(
+                    "шина Valkey: пароль в адресе url допустим только в профиле dev; \
+                     задайте password: { secret: \"<путь>#<поле>\" }"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(transport)
     }
 
+    /// Пароль из хранилища секретов по ссылке `password`; `None` — пароль не задан. Отказ хранилища —
+    /// `Unavailable` (ссылка и причина — в журнал, значение — нет).
+    pub async fn password(&self, secrets: &dyn SecretStore) -> Result<Option<Secret>> {
+        let Some(secret) = &self.password else {
+            return Ok(None);
+        };
+        secrets.get(secret).await.map(Some).map_err(|e| {
+            tracing::warn!(%secret, error = %e, "шина Valkey: секрет password недоступен");
+            match e {
+                Error::Unavailable { retry_after } => Error::Unavailable { retry_after },
+                _ => Error::UNAVAILABLE,
+            }
+        })
+    }
+
+    /// Адрес и TLS без правила о пароле (его проверяет [`Self::check`]).
     fn parse(&self, profile: Profile) -> Result<(ConnectionInfo, Transport)> {
         let transport = self
             .tls
@@ -133,24 +193,16 @@ impl ValkeyBusConfig {
         Ok((info, transport))
     }
 
-    fn connect_timeout(&self) -> Duration {
-        Duration::from_millis(self.connect_timeout_ms)
-    }
-
-    fn command_timeout(&self) -> Duration {
-        Duration::from_millis(self.command_timeout_ms)
-    }
-
     fn reconnect_min(&self) -> Duration {
-        Duration::from_millis(self.reconnect_min_ms.max(1))
+        self.reconnect_min.max(Duration::from_millis(1))
     }
 
     fn reconnect_max(&self) -> Duration {
-        Duration::from_millis(self.reconnect_max_ms).max(self.reconnect_min())
+        self.reconnect_max.max(self.reconnect_min())
     }
 
     fn ping_interval(&self) -> Duration {
-        Duration::from_millis(self.ping_interval_ms.max(1))
+        self.ping_interval.max(Duration::from_millis(1))
     }
 
     fn account_channel(&self, tenant: TenantId, account: AccountId) -> String {
@@ -159,6 +211,83 @@ impl ValkeyBusConfig {
 
     fn system_channel(&self) -> String {
         format!("{}:sys", self.channel_prefix)
+    }
+}
+
+/// Конфигурация шины Valkey прежнего вида: длительности в миллисекундах, пароль — в адресе.
+///
+/// Устарела: только для приложения до перехода на [`ValkeyConfig`] и [`ValkeyBus::connect`] (APP-07), затем
+/// удаляется. Правило «пароль в адресе — только dev» здесь не действует: его проверяет секция приложения.
+#[derive(Clone, PartialEq, Eq, JsonSchema)]
+pub struct ValkeyBusConfig {
+    /// Адрес Valkey (`rediss://[:пароль@]узел:порт[/база]`); в логи не попадает.
+    pub url: String,
+    /// TLS канала.
+    pub tls: InternalTls,
+    /// Префикс имён каналов.
+    pub channel_prefix: String,
+    /// Буфер уведомлений подписчика на узле.
+    pub buffer: usize,
+    /// Таймаут установки соединения, мс.
+    pub connect_timeout_ms: u64,
+    /// Таймаут команды, мс.
+    pub command_timeout_ms: u64,
+    /// Начальная задержка переподключения, мс.
+    pub reconnect_min_ms: u64,
+    /// Предельная задержка переподключения, мс.
+    pub reconnect_max_ms: u64,
+    /// Период проверки соединения PING, мс.
+    pub ping_interval_ms: u64,
+}
+
+impl Default for ValkeyBusConfig {
+    fn default() -> Self {
+        let d = ValkeyConfig::default();
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        Self {
+            url: d.url,
+            tls: d.tls,
+            channel_prefix: d.channel_prefix,
+            buffer: d.buffer,
+            connect_timeout_ms: ms(d.connect_timeout),
+            command_timeout_ms: ms(d.command_timeout),
+            reconnect_min_ms: ms(d.reconnect_min),
+            reconnect_max_ms: ms(d.reconnect_max),
+            ping_interval_ms: ms(d.ping_interval),
+        }
+    }
+}
+
+impl fmt::Debug for ValkeyBusConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&ValkeyConfig::from(self.clone()), f)
+    }
+}
+
+impl From<ValkeyBusConfig> for ValkeyConfig {
+    fn from(c: ValkeyBusConfig) -> Self {
+        Self {
+            url: c.url,
+            password: None,
+            tls: c.tls,
+            channel_prefix: c.channel_prefix,
+            buffer: c.buffer,
+            connect_timeout: Duration::from_millis(c.connect_timeout_ms),
+            command_timeout: Duration::from_millis(c.command_timeout_ms),
+            reconnect_min: Duration::from_millis(c.reconnect_min_ms),
+            reconnect_max: Duration::from_millis(c.reconnect_max_ms),
+            ping_interval: Duration::from_millis(c.ping_interval_ms),
+        }
+    }
+}
+
+impl ValkeyBusConfig {
+    /// Проверяет адрес и секцию TLS: `rediss://` с проверкой сертификата; `redis://` — только профиль dev
+    /// с `tls.allow_plaintext`.
+    pub fn check(&self, profile: Profile) -> Result<Transport> {
+        ValkeyConfig::from(self.clone())
+            .parse(profile)
+            .map(|(_, transport)| transport)
     }
 }
 
@@ -249,7 +378,7 @@ fn install_crypto_provider() {
 }
 
 struct Shared {
-    config: ValkeyBusConfig,
+    config: ValkeyConfig,
     info: ConnectionInfo,
     transport: Transport,
     local: LocalBus,
@@ -277,7 +406,7 @@ impl Shared {
     async fn open_publisher(&self) -> std::result::Result<MultiplexedConnection, LinkError> {
         let client = self.client().await?;
         within(
-            self.config.connect_timeout(),
+            self.config.connect_timeout,
             client.get_multiplexed_async_connection(),
         )
         .await
@@ -306,10 +435,10 @@ impl Shared {
         channels: &HashMap<String, usize>,
     ) -> std::result::Result<(PubSubSink, PubSubStream), LinkError> {
         let client = self.client().await?;
-        let pubsub = within(self.config.connect_timeout(), client.get_async_pubsub()).await?;
+        let pubsub = within(self.config.connect_timeout, client.get_async_pubsub()).await?;
         let (mut sink, stream) = pubsub.split();
         for channel in channels.keys() {
-            within(self.config.command_timeout(), sink.subscribe(channel)).await?;
+            within(self.config.command_timeout, sink.subscribe(channel)).await?;
         }
         Ok((sink, stream))
     }
@@ -351,10 +480,46 @@ impl Drop for ValkeyBus {
 }
 
 impl ValkeyBus {
-    /// Запускает шину: фоновая задача подключается к Valkey и держит подписки.
+    /// Запускает шину с паролем из хранилища секретов (ссылка `password`; секреты читаются при запуске).
+    /// Ошибка конфигурации — `Invalid`, хранилище недоступно или нет секрета — `Unavailable`.
     /// `profile` — профиль узла (`profile` config.yaml). Вызывать внутри runtime tokio.
+    pub async fn connect(
+        config: ValkeyConfig,
+        profile: Profile,
+        secrets: &dyn SecretStore,
+    ) -> Result<Self> {
+        config.check(profile)?;
+        let password = config.password(secrets).await?;
+        Self::launch(config, profile, password.as_ref())
+    }
+
+    /// Запускает шину по конфигурации прежнего вида (пароль — в адресе). Устарело: до перехода
+    /// приложения на [`Self::connect`] (APP-07). Вызывать внутри runtime tokio.
     pub fn start(config: ValkeyBusConfig, profile: Profile) -> Result<Self> {
+        Self::launch(config.into(), profile, None)
+    }
+
+    /// Фоновая задача подключается к Valkey и держит подписки. `password` — значение по ссылке
+    /// `password`: есть ссылка — должно быть и значение, и наоборот.
+    fn launch(config: ValkeyConfig, profile: Profile, password: Option<&Secret>) -> Result<Self> {
         let (info, transport) = config.parse(profile)?;
+        let info = match (&config.password, password) {
+            (None, None) => info,
+            (Some(_), Some(p)) => {
+                let redis = info.redis_settings().clone().set_password(p.expose());
+                info.set_redis_settings(redis)
+            }
+            (Some(_), None) => {
+                return Err(Error::Invalid(
+                    "шина Valkey: пароль по ссылке password не прочитан из хранилища".to_owned(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::Invalid(
+                    "шина Valkey: пароль передан без ссылки password в конфигурации".to_owned(),
+                ));
+            }
+        };
         match transport {
             Transport::Plaintext => {
                 tracing::warn!("{}", InternalChannel::Valkey.plaintext_warning());
@@ -409,7 +574,7 @@ impl ValkeyBus {
             })
             .map_err(|_| unavailable(None))?;
         // Задача может быть занята подключением — ждём его и саму подписку.
-        let wait = self.shared.config.connect_timeout() + self.shared.config.command_timeout();
+        let wait = self.shared.config.connect_timeout + self.shared.config.command_timeout;
         match tokio::time::timeout(wait, acked).await {
             Ok(Ok(Ok(()))) => Ok(Guarded {
                 inner: local,
@@ -438,7 +603,7 @@ impl EventBus for ValkeyBus {
         let payload = encode(&event);
         let mut conn = self.shared.publisher().await?;
         let sent = within(
-            config.command_timeout(),
+            config.command_timeout,
             redis::cmd("PUBLISH")
                 .arg(&channel)
                 .arg(&payload)
@@ -567,7 +732,7 @@ async fn serve(
     mut sink: PubSubSink,
     mut stream: PubSubStream,
 ) -> bool {
-    let timeout = shared.config.command_timeout();
+    let timeout = shared.config.command_timeout;
     let mut ping = tokio::time::interval_at(
         Instant::now() + shared.config.ping_interval(),
         shared.config.ping_interval(),
@@ -689,16 +854,16 @@ mod tests {
     }
 
     /// Свой префикс на тест: тесты идут параллельно на одном Valkey. Valkey в CI — без TLS (профиль dev).
-    fn config(url: String) -> ValkeyBusConfig {
-        ValkeyBusConfig {
+    fn config(url: String) -> ValkeyConfig {
+        ValkeyConfig {
             url,
             tls: dev_plaintext(),
             channel_prefix: format!("tp-test-{}", AccountId::new()),
-            connect_timeout_ms: 1_000,
-            command_timeout_ms: 1_000,
-            reconnect_min_ms: 20,
-            reconnect_max_ms: 200,
-            ..ValkeyBusConfig::default()
+            connect_timeout: Duration::from_secs(1),
+            command_timeout: Duration::from_secs(1),
+            reconnect_min: Duration::from_millis(20),
+            reconnect_max: Duration::from_millis(200),
+            ..ValkeyConfig::default()
         }
     }
 
@@ -739,59 +904,82 @@ mod tests {
 
     #[test]
     fn channel_names() {
-        let c = ValkeyBusConfig::default();
+        let c = ValkeyConfig::default();
         let (t, a) = (TenantId::DEFAULT, AccountId::new());
         assert_eq!(c.account_channel(t, a), format!("thepost:acct:{t}:{a}"));
         assert_eq!(c.system_channel(), "thepost:sys");
     }
 
     #[test]
-    fn debug_hides_url() {
-        let c = ValkeyBusConfig {
-            url: "redis://:secret@host:6379".to_owned(),
+    fn legacy_config_converts() {
+        let legacy = ValkeyBusConfig {
+            url: "rediss://:secret@cache.internal:6379".to_owned(),
+            connect_timeout_ms: 1_500,
             ..ValkeyBusConfig::default()
+        };
+        let c = ValkeyConfig::from(legacy.clone());
+        assert_eq!(c.connect_timeout, Duration::from_millis(1_500));
+        assert_eq!(c.password, None);
+        assert_eq!(
+            ValkeyConfig::from(ValkeyBusConfig::default()),
+            ValkeyConfig::default()
+        );
+        // Прежний путь: пароль в адресе принимается и вне dev (его ограничивает секция приложения).
+        assert_eq!(legacy.check(Profile::Prod).ok(), Some(Transport::Tls));
+        assert!(!format!("{legacy:?}").contains("secret"));
+        assert!(matches!(
+            ValkeyBus::start(legacy, Profile::Prod),
+            Err(Error::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn debug_hides_url() {
+        let c = ValkeyConfig {
+            url: "redis://:secret@host:6379".to_owned(),
+            ..ValkeyConfig::default()
         };
         assert!(!format!("{c:?}").contains("secret"));
     }
 
     #[test]
     fn rejects_bad_url_and_missing_runtime() {
-        let bad = ValkeyBusConfig {
+        let bad = ValkeyConfig {
             url: "not a url".to_owned(),
-            ..ValkeyBusConfig::default()
+            ..ValkeyConfig::default()
         };
         assert!(matches!(
-            ValkeyBus::start(bad, Profile::Dev),
+            ValkeyBus::launch(bad, Profile::Dev, None),
             Err(Error::Invalid(_))
         ));
         assert!(matches!(
-            ValkeyBus::start(ValkeyBusConfig::default(), Profile::Prod),
+            ValkeyBus::launch(ValkeyConfig::default(), Profile::Prod, None),
             Err(Error::Internal(_))
         ));
     }
 
     #[test]
     fn plaintext_only_in_dev() {
-        let open = ValkeyBusConfig {
+        let open = ValkeyConfig {
             url: "redis://cache:6379".to_owned(),
-            ..ValkeyBusConfig::default()
+            ..ValkeyConfig::default()
         };
         // Без allow_plaintext адрес redis:// отклоняется в любом профиле.
         assert!(matches!(open.check(Profile::Prod), Err(Error::Invalid(_))));
         assert!(matches!(open.check(Profile::Dev), Err(Error::Invalid(_))));
         assert!(matches!(
-            ValkeyBus::start(open.clone(), Profile::Prod),
+            ValkeyBus::launch(open.clone(), Profile::Prod, None),
             Err(Error::Invalid(_))
         ));
 
-        let dev = ValkeyBusConfig {
+        let dev = ValkeyConfig {
             tls: dev_plaintext(),
             ..open
         };
         assert_eq!(dev.check(Profile::Dev).ok(), Some(Transport::Plaintext));
         // allow_plaintext вне dev — ошибка конфигурации, даже с адресом rediss://.
         assert!(matches!(dev.check(Profile::Prod), Err(Error::Invalid(_))));
-        let tls_dev = ValkeyBusConfig {
+        let tls_dev = ValkeyConfig {
             url: "rediss://cache:6379".to_owned(),
             ..dev
         };
@@ -804,17 +992,17 @@ mod tests {
 
     #[test]
     fn tls_address_checks() {
-        let tls = |url: &str, server_name: Option<&str>| ValkeyBusConfig {
+        let tls = |url: &str, server_name: Option<&str>| ValkeyConfig {
             url: url.to_owned(),
             tls: InternalTls {
                 server_name: server_name.map(str::to_owned),
                 ..InternalTls::default()
             },
-            ..ValkeyBusConfig::default()
+            ..ValkeyConfig::default()
         };
         for url in [
             "rediss://cache.internal:6379",
-            "rediss://:secret@cache.internal:6380/2",
+            "rediss://thepost@cache.internal:6380/2",
             "valkeys://cache.internal",
         ] {
             assert_eq!(
@@ -844,6 +1032,147 @@ mod tests {
         }
     }
 
+    fn secret_ref() -> SecretRef {
+        SecretRef::new("thepost/valkey", "password").expect("ref")
+    }
+
+    #[test]
+    fn password_only_by_reference() {
+        let in_url = ValkeyConfig {
+            url: "rediss://:hunter2@cache.internal:6379".to_owned(),
+            ..ValkeyConfig::default()
+        };
+        // Пароль в адресе — только dev.
+        assert!(matches!(
+            in_url.check(Profile::Prod),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(in_url.check(Profile::Dev).ok(), Some(Transport::Tls));
+        // И в адресе, и ссылкой — ошибка в любом профиле.
+        let both = ValkeyConfig {
+            password: Some(secret_ref()),
+            ..in_url
+        };
+        assert!(matches!(both.check(Profile::Dev), Err(Error::Invalid(_))));
+        let by_ref = ValkeyConfig {
+            url: "rediss://thepost@cache.internal:6379".to_owned(),
+            ..both
+        };
+        assert_eq!(by_ref.check(Profile::Prod).ok(), Some(Transport::Tls));
+        // Ссылка без прочитанного значения и значение без ссылки — ошибка запуска.
+        assert!(matches!(
+            ValkeyBus::launch(by_ref, Profile::Prod, None),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            ValkeyBus::launch(
+                ValkeyConfig::default(),
+                Profile::Prod,
+                Some(&Secret::new("x"))
+            ),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn parses_yaml_section() {
+        let yaml = r#"
+url: rediss://thepost@valkey.internal:6380/1
+password: { secret: "thepost/valkey#password" }
+tls:
+  ca_file: /etc/thepost/tls/ca.pem
+channel_prefix: mail-eu
+connect_timeout: 3s
+reconnect_min: 250ms
+reconnect_max: 1m
+"#;
+        let c: ValkeyConfig = serde_yaml_ng::from_str(yaml).expect("yaml");
+        let d = ValkeyConfig::default();
+        assert_eq!(c.url, "rediss://thepost@valkey.internal:6380/1");
+        assert_eq!(c.password, Some(secret_ref()));
+        assert_eq!(
+            c.tls.ca_file.as_deref(),
+            Some(Path::new("/etc/thepost/tls/ca.pem"))
+        );
+        assert_eq!(c.channel_prefix, "mail-eu");
+        assert_eq!(c.connect_timeout, Duration::from_secs(3));
+        assert_eq!(c.reconnect_min, Duration::from_millis(250));
+        assert_eq!(c.reconnect_max, Duration::from_secs(60));
+        // Незаданные — по умолчанию.
+        assert_eq!(
+            (c.buffer, c.command_timeout, c.ping_interval),
+            (d.buffer, d.command_timeout, d.ping_interval)
+        );
+        assert_eq!(c.check(Profile::Prod).ok(), Some(Transport::Tls));
+        assert_eq!(
+            serde_yaml_ng::from_str::<ValkeyConfig>("{}").expect("empty"),
+            d
+        );
+
+        for bad in [
+            // Пароль открытым текстом вместо ссылки.
+            "password: hunter2",
+            // Длительность без единицы и старое имя поля в миллисекундах.
+            "connect_timeout: 5000",
+            "connect_timeout_ms: 5000",
+            "unknown: 1",
+        ] {
+            assert!(
+                serde_yaml_ng::from_str::<ValkeyConfig>(bad).is_err(),
+                "{bad}"
+            );
+        }
+        let schema = schemars::schema_for!(ValkeyConfig).as_value().to_string();
+        assert!(schema.contains("ping_interval"), "{schema}");
+        assert!(!schema.contains("_ms"), "{schema}");
+    }
+
+    /// Сервер, отдающий первые байты от клиента и отвечающий ошибкой.
+    async fn capture_server() -> (std::net::SocketAddr, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0; 4096];
+                let n = conn.read(&mut buf).await.unwrap_or(0);
+                buf.truncate(n);
+                let _ = tx.send(buf);
+                let _ = conn.write_all(b"-ERR nope\r\n").await;
+            }
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn connect_reads_password_from_store() {
+        let (addr, mut seen) = capture_server().await;
+        let store = tp_testkit::MemSecretStore::new(Arc::new(tp_testkit::SystemClock));
+        let cfg = ValkeyConfig {
+            password: Some(secret_ref()),
+            ..config(format!("redis://{addr}"))
+        };
+        // Секрета ещё нет — Unavailable, к Valkey не подключаемся.
+        assert!(matches!(
+            ValkeyBus::connect(cfg.clone(), Profile::Dev, &store).await,
+            Err(Error::Unavailable { .. })
+        ));
+        store.set(&secret_ref(), "s3cr3t-пароль");
+        let bus = ValkeyBus::connect(cfg, Profile::Dev, &store)
+            .await
+            .expect("connect");
+        assert!(!format!("{bus:?}").contains("s3cr3t"));
+        let _ = bus.subscribe(conformance::scope()).await;
+        let hello = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+            .await
+            .expect("timeout")
+            .expect("bytes");
+        let hello = String::from_utf8_lossy(&hello);
+        assert!(hello.contains("AUTH"), "{hello}");
+        assert!(hello.contains("s3cr3t-пароль"), "{hello}");
+    }
+
     #[tokio::test]
     async fn bad_tls_files_fail_start() {
         let dir = std::env::temp_dir().join(format!("tp-cluster-{}", AccountId::new()));
@@ -851,15 +1180,18 @@ mod tests {
         let garbage = dir.join("ca.pem");
         std::fs::write(&garbage, "не сертификат").expect("write");
         for ca in [dir.join("missing.pem"), garbage] {
-            let cfg = ValkeyBusConfig {
+            let cfg = ValkeyConfig {
                 tls: InternalTls {
                     ca_file: Some(ca.clone()),
                     ..InternalTls::default()
                 },
-                ..ValkeyBusConfig::default()
+                ..ValkeyConfig::default()
             };
             assert!(
-                matches!(ValkeyBus::start(cfg, Profile::Prod), Err(Error::Invalid(_))),
+                matches!(
+                    ValkeyBus::launch(cfg, Profile::Prod, None),
+                    Err(Error::Invalid(_))
+                ),
                 "{}",
                 ca.display()
             );
@@ -878,15 +1210,15 @@ mod tests {
                 let _ = conn.write_all(b"-ERR plaintext\r\n").await;
             }
         });
-        let cfg = ValkeyBusConfig {
+        let cfg = ValkeyConfig {
             url: format!("rediss://{addr}"),
             ..config(String::new())
         };
-        let cfg = ValkeyBusConfig {
+        let cfg = ValkeyConfig {
             tls: InternalTls::default(),
             ..cfg
         };
-        let bus = ValkeyBus::start(cfg, Profile::Prod).expect("start");
+        let bus = ValkeyBus::launch(cfg, Profile::Prod, None).expect("start");
         assert!(matches!(
             bus.subscribe(conformance::scope()).await,
             Err(Error::Unavailable { .. })
@@ -908,7 +1240,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         drop(listener);
-        let bus = ValkeyBus::start(config(format!("redis://{addr}")), Profile::Dev).expect("start");
+        let bus = ValkeyBus::launch(config(format!("redis://{addr}")), Profile::Dev, None)
+            .expect("start");
         assert!(matches!(
             bus.subscribe(conformance::scope()).await,
             Err(Error::Unavailable { .. })
@@ -929,7 +1262,7 @@ mod tests {
             eprintln!("TEST_VALKEY_URL не задан — пропуск");
             return;
         };
-        let bus = ValkeyBus::start(config(url), Profile::Dev).expect("start");
+        let bus = ValkeyBus::launch(config(url), Profile::Dev, None).expect("start");
         conformance::run(&bus).await;
         let m = bus.metrics();
         assert!(m.connected);
@@ -945,8 +1278,8 @@ mod tests {
             return;
         };
         let cfg = config(url);
-        let node_a = ValkeyBus::start(cfg.clone(), Profile::Dev).expect("start");
-        let node_b = ValkeyBus::start(cfg, Profile::Dev).expect("start");
+        let node_a = ValkeyBus::launch(cfg.clone(), Profile::Dev, None).expect("start");
+        let node_b = ValkeyBus::launch(cfg, Profile::Dev, None).expect("start");
         let scope = conformance::scope();
         let mut on_b = node_b.subscribe(scope).await.expect("subscribe");
         let mut sys_b = node_b.subscribe_system().await.expect("subscribe");
@@ -1025,8 +1358,12 @@ mod tests {
             .addr()
             .to_string();
         let proxy = Proxy::start(info).await;
-        let bus = ValkeyBus::start(config(format!("redis://{}", proxy.addr)), Profile::Dev)
-            .expect("start");
+        let bus = ValkeyBus::launch(
+            config(format!("redis://{}", proxy.addr)),
+            Profile::Dev,
+            None,
+        )
+        .expect("start");
         let scope = conformance::scope();
         let mut sub = bus.subscribe(scope).await.expect("subscribe");
         bus.publish(conformance::mailbox_changed(scope, 1))

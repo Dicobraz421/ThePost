@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use schemars::JsonSchema;
+use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tp_contracts::bus::{Event, EventBus, EventStream};
 use tp_contracts::meta::AccountScope;
@@ -20,8 +21,9 @@ use tp_contracts::{AccountId, Result, TenantId};
 
 use crate::metrics::{BusCounters, BusMetrics, inc};
 
-/// Конфигурация шины в процессе.
-#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+/// Конфигурация шины в процессе. Незаданные поля — по умолчанию, неизвестные — ошибка разбора.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct LocalBusConfig {
     /// Буфер канала учётной записи и системного канала: сколько непрочитанных уведомлений
     /// подписчик может накопить, прежде чем отстанет и будет отключён (не меньше 1).
@@ -252,6 +254,22 @@ mod tests {
     #[tokio::test]
     async fn conformance_suite() {
         conformance::run(&LocalBus::default()).await;
+    }
+
+    #[test]
+    fn parses_yaml_section() {
+        let c: LocalBusConfig = serde_yaml_ng::from_str("capacity: 64").expect("yaml");
+        assert_eq!(c, LocalBusConfig { capacity: 64 });
+        assert_eq!(
+            serde_yaml_ng::from_str::<LocalBusConfig>("{}").expect("empty"),
+            LocalBusConfig::default()
+        );
+        for bad in ["capacity: -1", "capacity: many", "buffer: 64"] {
+            assert!(
+                serde_yaml_ng::from_str::<LocalBusConfig>(bad).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -14,4 +14,4 @@ pub use hashing::Rendezvous;
 pub use local_bus::{LocalBus, LocalBusConfig};
 pub use metrics::{BusCounters, BusMetrics};
 pub use partitions::{AssignmentChange, PartitionAssignerConfig, RendezvousAssigner};
-pub use valkey_bus::{ValkeyBus, ValkeyBusConfig};
+pub use valkey_bus::{ValkeyBus, ValkeyBusConfig, ValkeyConfig};
