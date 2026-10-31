@@ -4,11 +4,34 @@ mod common;
 
 use std::time::Duration;
 
-use tp_contracts::lease::LeaseStore;
+use tp_contracts::lease::{Lease, LeaseStore};
 use uuid::Uuid;
 
 fn name() -> String {
     format!("test/{}", Uuid::now_v7())
+}
+
+/// Срок, которого с запасом хватает на любой тест: проверки «лиза держится» от скорости машины не зависят.
+const HOLD: Duration = Duration::from_secs(60);
+
+/// Захватывает лизу, как только она освободится: ждёт события (успешного захвата), а не времени.
+/// Предел ожидания — только защита от зависания, на исход теста на медленной машине он не влияет.
+async fn acquire_when_free(meta: &impl LeaseStore, name: &str, holder: &str) -> Lease {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(l) = meta
+            .try_acquire(name, holder, HOLD)
+            .await
+            .expect("try_acquire")
+        {
+            return l;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "лиза {name} не освободилась за минуту"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -17,15 +40,14 @@ async fn second_holder_waits_for_expiry() {
         return;
     };
     let name = name();
-    let ttl = Duration::from_millis(400);
     let a = meta
-        .try_acquire(&name, "a", ttl)
+        .try_acquire(&name, "a", HOLD)
         .await
         .expect("try_acquire")
         .expect("a");
     assert_eq!(a.holder, "a");
     assert!(
-        meta.try_acquire(&name, "b", ttl)
+        meta.try_acquire(&name, "b", HOLD)
             .await
             .expect("try_acquire")
             .is_none()
@@ -33,33 +55,43 @@ async fn second_holder_waits_for_expiry() {
 
     // Повторный захват тем же держателем продлевает лизу без нового номера.
     let a2 = meta
-        .try_acquire(&name, "a", ttl)
+        .try_acquire(&name, "a", HOLD)
         .await
         .expect("try_acquire")
         .expect("a2");
     assert_eq!(a2.fencing, a.fencing);
     assert!(a2.expires_at >= a.expires_at);
     assert!(
-        meta.try_acquire(&name, "b", ttl)
+        meta.try_acquire(&name, "b", HOLD)
             .await
             .expect("try_acquire")
             .is_none()
     );
 
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let b = meta
-        .try_acquire(&name, "b", ttl)
+    // Держатель сокращает срок; второй ждёт истечения. Что захват случился не раньше срока, видно по
+    // времени СУБД: `expires_at` нового держателя — `now()` захвата плюс его срок.
+    let short = Duration::from_millis(300);
+    let a3 = meta
+        .try_acquire(&name, "a", short)
         .await
         .expect("try_acquire")
-        .expect("b");
+        .expect("a3");
+    assert_eq!(a3.fencing, a.fencing);
+    let b = acquire_when_free(&meta, &name, "b").await;
     assert_eq!(b.holder, "b");
     assert!(b.fencing > a.fencing);
+    assert!(
+        b.expires_at - HOLD >= a3.expires_at,
+        "лиза захвачена до истечения: {} < {}",
+        b.expires_at - HOLD,
+        a3.expires_at
+    );
 
     // Потерянную лизу не продлить, её освобождение — не ошибка и не трогает нового держателя.
-    assert!(meta.renew(&a, ttl).await.expect("renew").is_none());
+    assert!(meta.renew(&a, HOLD).await.expect("renew").is_none());
     meta.release(&a).await.expect("release");
     assert!(
-        meta.try_acquire(&name, "a", ttl)
+        meta.try_acquire(&name, "a", HOLD)
             .await
             .expect("try_acquire")
             .is_none()
