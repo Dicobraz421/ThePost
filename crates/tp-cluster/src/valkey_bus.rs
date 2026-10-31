@@ -214,83 +214,6 @@ impl ValkeyConfig {
     }
 }
 
-/// Конфигурация шины Valkey прежнего вида: длительности в миллисекундах, пароль — в адресе.
-///
-/// Устарела: только для приложения до перехода на [`ValkeyConfig`] и [`ValkeyBus::connect`] (APP-07), затем
-/// удаляется. Правило «пароль в адресе — только dev» здесь не действует: его проверяет секция приложения.
-#[derive(Clone, PartialEq, Eq, JsonSchema)]
-pub struct ValkeyBusConfig {
-    /// Адрес Valkey (`rediss://[:пароль@]узел:порт[/база]`); в логи не попадает.
-    pub url: String,
-    /// TLS канала.
-    pub tls: InternalTls,
-    /// Префикс имён каналов.
-    pub channel_prefix: String,
-    /// Буфер уведомлений подписчика на узле.
-    pub buffer: usize,
-    /// Таймаут установки соединения, мс.
-    pub connect_timeout_ms: u64,
-    /// Таймаут команды, мс.
-    pub command_timeout_ms: u64,
-    /// Начальная задержка переподключения, мс.
-    pub reconnect_min_ms: u64,
-    /// Предельная задержка переподключения, мс.
-    pub reconnect_max_ms: u64,
-    /// Период проверки соединения PING, мс.
-    pub ping_interval_ms: u64,
-}
-
-impl Default for ValkeyBusConfig {
-    fn default() -> Self {
-        let d = ValkeyConfig::default();
-        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-        Self {
-            url: d.url,
-            tls: d.tls,
-            channel_prefix: d.channel_prefix,
-            buffer: d.buffer,
-            connect_timeout_ms: ms(d.connect_timeout),
-            command_timeout_ms: ms(d.command_timeout),
-            reconnect_min_ms: ms(d.reconnect_min),
-            reconnect_max_ms: ms(d.reconnect_max),
-            ping_interval_ms: ms(d.ping_interval),
-        }
-    }
-}
-
-impl fmt::Debug for ValkeyBusConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&ValkeyConfig::from(self.clone()), f)
-    }
-}
-
-impl From<ValkeyBusConfig> for ValkeyConfig {
-    fn from(c: ValkeyBusConfig) -> Self {
-        Self {
-            url: c.url,
-            password: None,
-            tls: c.tls,
-            channel_prefix: c.channel_prefix,
-            buffer: c.buffer,
-            connect_timeout: Duration::from_millis(c.connect_timeout_ms),
-            command_timeout: Duration::from_millis(c.command_timeout_ms),
-            reconnect_min: Duration::from_millis(c.reconnect_min_ms),
-            reconnect_max: Duration::from_millis(c.reconnect_max_ms),
-            ping_interval: Duration::from_millis(c.ping_interval_ms),
-        }
-    }
-}
-
-impl ValkeyBusConfig {
-    /// Проверяет адрес и секцию TLS: `rediss://` с проверкой сертификата; `redis://` — только профиль dev
-    /// с `tls.allow_plaintext`.
-    pub fn check(&self, profile: Profile) -> Result<Transport> {
-        ValkeyConfig::from(self.clone())
-            .parse(profile)
-            .map(|(_, transport)| transport)
-    }
-}
-
 /// Ошибка связи с Valkey.
 #[derive(Debug, thiserror::Error)]
 enum LinkError {
@@ -491,12 +414,6 @@ impl ValkeyBus {
         config.check(profile)?;
         let password = config.password(secrets).await?;
         Self::launch(config, profile, password.as_ref())
-    }
-
-    /// Запускает шину по конфигурации прежнего вида (пароль — в адресе). Устарело: до перехода
-    /// приложения на [`Self::connect`] (APP-07). Вызывать внутри runtime tokio.
-    pub fn start(config: ValkeyBusConfig, profile: Profile) -> Result<Self> {
-        Self::launch(config.into(), profile, None)
     }
 
     /// Фоновая задача подключается к Valkey и держит подписки. `password` — значение по ссылке
@@ -908,29 +825,6 @@ mod tests {
         let (t, a) = (TenantId::DEFAULT, AccountId::new());
         assert_eq!(c.account_channel(t, a), format!("thepost:acct:{t}:{a}"));
         assert_eq!(c.system_channel(), "thepost:sys");
-    }
-
-    #[test]
-    fn legacy_config_converts() {
-        let legacy = ValkeyBusConfig {
-            url: "rediss://:secret@cache.internal:6379".to_owned(),
-            connect_timeout_ms: 1_500,
-            ..ValkeyBusConfig::default()
-        };
-        let c = ValkeyConfig::from(legacy.clone());
-        assert_eq!(c.connect_timeout, Duration::from_millis(1_500));
-        assert_eq!(c.password, None);
-        assert_eq!(
-            ValkeyConfig::from(ValkeyBusConfig::default()),
-            ValkeyConfig::default()
-        );
-        // Прежний путь: пароль в адресе принимается и вне dev (его ограничивает секция приложения).
-        assert_eq!(legacy.check(Profile::Prod).ok(), Some(Transport::Tls));
-        assert!(!format!("{legacy:?}").contains("secret"));
-        assert!(matches!(
-            ValkeyBus::start(legacy, Profile::Prod),
-            Err(Error::Internal(_))
-        ));
     }
 
     #[test]
