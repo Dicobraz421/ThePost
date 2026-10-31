@@ -1,0 +1,23 @@
+# Цель fuzz парсера IMAP (IMAP-01): `cargo +nightly fuzz run command` в каталоге crates/tp-imap.
+# Отдельный workspace: в сборку и Cargo.lock основного workspace не входит.
+[package]
+name = "tp-imap-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tp-imap = { path = ".." }
+
+[[bin]]
+name = "command"
+path = "fuzz_targets/command.rs"
+test = false
+doc = false
+bench = false
