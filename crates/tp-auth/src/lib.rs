@@ -2,16 +2,18 @@
 //!
 //! - [`ldap`] — каталог организации ([`Directory`](tp_contracts::auth::Directory)) поверх LDAPS и проверка
 //!   пароля привязкой (bind) к каталогу;
-//! - [`password`] — [`Authenticator`](tp_contracts::auth::Authenticator) для имени входа и пароля: пароли
+//! - [`password`] — [`Authenticator`] для имени входа и пароля: пароли
 //!   приложений (argon2) с отзывом и пароль каталога. Защиту от перебора (`tp-platform`, PLT-07) вызывают
 //!   протоколы до проверки и по её результату;
-//! - [`oidc`] — [`Authenticator`](tp_contracts::auth::Authenticator) для токенов OpenID Connect (Bearer).
+//! - [`oidc`] — [`Authenticator`] для токенов OpenID Connect (Bearer);
+//! - [`sasl`] — механизмы SASL PLAIN, LOGIN, OAUTHBEARER, XOAUTH2 для smtp и imap; пароль и токен в одном
+//!   обмене проверяет [`CredentialsRouter`].
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tp_contracts::auth::Principal;
+use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::meta::{Account, AccountStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result, TenantId};
@@ -19,6 +21,7 @@ use tp_contracts::{Error, Result, TenantId};
 pub mod ldap;
 pub mod oidc;
 pub mod password;
+pub mod sasl;
 
 pub use ldap::{LdapConfig, LdapDirectory};
 pub use oidc::{OidcAuthenticator, OidcConfig};
@@ -26,6 +29,7 @@ pub use password::{
     AppPassword, AppPasswordStore, AppPasswords, PasswordAuthenticator, PasswordCheck,
     PasswordConfig,
 };
+pub use sasl::AuthSasl;
 
 /// Группы учётной записи для `Principal::groups` (с учётом вложенности). Реализация — [`LdapDirectory`].
 #[async_trait]
@@ -97,6 +101,60 @@ impl Accounts {
             groups,
             scopes,
         })
+    }
+}
+
+/// Проверка учётных данных по виду: пароль, токен, Kerberos — своим [`Authenticator`]
+/// ([`PasswordAuthenticator`], [`OidcAuthenticator`]). Вид без проверяющего — `Forbidden`.
+#[derive(Default, Clone)]
+pub struct CredentialsRouter {
+    password: Option<Arc<dyn Authenticator>>,
+    bearer: Option<Arc<dyn Authenticator>>,
+    gssapi: Option<Arc<dyn Authenticator>>,
+}
+
+impl std::fmt::Debug for CredentialsRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialsRouter")
+            .field("password", &self.password.is_some())
+            .field("bearer", &self.bearer.is_some())
+            .field("gssapi", &self.gssapi.is_some())
+            .finish()
+    }
+}
+
+impl CredentialsRouter {
+    /// Имя входа и пароль.
+    pub fn password(mut self, a: Arc<dyn Authenticator>) -> Self {
+        self.password = Some(a);
+        self
+    }
+
+    /// Токены OAuth 2.0 / OIDC.
+    pub fn bearer(mut self, a: Arc<dyn Authenticator>) -> Self {
+        self.bearer = Some(a);
+        self
+    }
+
+    /// Принципал Kerberos (AUTH-05).
+    pub fn gssapi(mut self, a: Arc<dyn Authenticator>) -> Self {
+        self.gssapi = Some(a);
+        self
+    }
+}
+
+#[async_trait]
+impl Authenticator for CredentialsRouter {
+    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
+        let target = match &credentials {
+            Credentials::Password { .. } => &self.password,
+            Credentials::Bearer(_) => &self.bearer,
+            Credentials::Gssapi { .. } => &self.gssapi,
+        };
+        match target {
+            Some(a) => a.verify(credentials).await,
+            None => Err(Error::Forbidden),
+        }
     }
 }
 
@@ -227,5 +285,28 @@ mod tests {
             Ok(true)
         );
         assert!(check_channel("LDAP", "ldap://dc", &s, &p, &dev, Profile::Prod).is_err());
+    }
+
+    #[tokio::test]
+    async fn router_by_kind() {
+        let (accounts, _) = testutil::accounts(&[("alice@example.org", true)]).await;
+
+        struct Any(Accounts);
+
+        #[async_trait]
+        impl Authenticator for Any {
+            async fn verify(&self, _: Credentials) -> Result<Principal> {
+                let a = self.0.enabled("alice@example.org").await?;
+                self.0.principal(a, None).await
+            }
+        }
+
+        let r = CredentialsRouter::default().bearer(Arc::new(Any(accounts)));
+        assert!(r.verify(Credentials::Bearer("t".into())).await.is_ok());
+        let pw = Credentials::Password {
+            login: "alice@example.org".into(),
+            secret: "x".into(),
+        };
+        assert_eq!(r.verify(pw).await, Err(Error::Forbidden));
     }
 }
