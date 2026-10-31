@@ -23,6 +23,18 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "blob damaged",
         include_str!("../migrations/0004_blob_damaged.sql"),
     ),
+    (5, "queue", include_str!("../migrations/0005_queue.sql")),
+    (
+        6,
+        "retention",
+        include_str!("../migrations/0006_retention.sql"),
+    ),
+    (7, "acl", include_str!("../migrations/0007_acl.sql")),
+    (
+        8,
+        "index manifests",
+        include_str!("../migrations/0008_index_manifests.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

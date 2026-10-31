@@ -1,0 +1,102 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      47,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Bad base64",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-047@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "multipart",
+    "subtype": "mixed",
+    "params": [
+      [
+        "boundary",
+        "bad-1"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 368,
+    "lines": null,
+    "children": [
+      {
+        "part": "1",
+        "media_type": "text",
+        "subtype": "plain",
+        "params": [
+          [
+            "charset",
+            "utf-8"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "8bit",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 100,
+        "lines": 0,
+        "children": []
+      },
+      {
+        "part": "2",
+        "media_type": "application",
+        "subtype": "pdf",
+        "params": [
+          [
+            "name",
+            "bad.pdf"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "base64",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 27,
+        "lines": null,
+        "children": []
+      }
+    ]
+  },
+  "preview": "The quick brown fox jumps over the lazy dog. Quarterly report attached, please review before Friday.",
+  "thread_key": "<corpus-047@example.com>",
+  "has_attachment": true
+}

@@ -1,0 +1,118 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      40,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "rfc822 in base64",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-040@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "multipart",
+    "subtype": "mixed",
+    "params": [
+      [
+        "boundary",
+        "fwd-3"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 954,
+    "lines": null,
+    "children": [
+      {
+        "part": "1",
+        "media_type": "text",
+        "subtype": "plain",
+        "params": [
+          [
+            "charset",
+            "utf-8"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "8bit",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 16,
+        "lines": 0,
+        "children": []
+      },
+      {
+        "part": "2",
+        "media_type": "message",
+        "subtype": "rfc822",
+        "params": [],
+        "content_id": null,
+        "description": null,
+        "encoding": "base64",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 714,
+        "lines": 9,
+        "children": [
+          {
+            "part": "2.1",
+            "media_type": "text",
+            "subtype": "plain",
+            "params": [
+              [
+                "charset",
+                "utf-8"
+              ]
+            ],
+            "content_id": null,
+            "description": null,
+            "encoding": "8bit",
+            "disposition": null,
+            "language": [],
+            "location": null,
+            "size": 213,
+            "lines": 0,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  "preview": "Encoded forward.",
+  "thread_key": "<corpus-040@example.com>",
+  "has_attachment": true
+}

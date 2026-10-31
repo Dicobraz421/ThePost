@@ -4,6 +4,8 @@
 //! поэтому пересозданная папка с тем же именем получает новое значение. UIDNEXT и наибольший `ModSeq`
 //! папки хранятся в её строке.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use sqlx::{FromRow, PgConnection};
 use tp_contracts::events::CoreEventKind;
@@ -15,6 +17,7 @@ use uuid::Uuid;
 
 use crate::PgMeta;
 use crate::changelog::{self, Change, Op};
+use crate::retention::micros;
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
 
 /// Системные папки новой учётной записи.
@@ -202,7 +205,9 @@ pub(crate) struct Relocated {
 }
 
 /// Переносит письма `ids` (в этом порядке) в папку `to` с сохранением идентификаторов и новыми UID;
-/// `trash` — запомнить исходную папку для восстановления. Записывает изменения `Moved` и изменения папок.
+/// `trash` — перенос в корзину: запомнить исходную папку для восстановления и срок окончательного удаления
+/// (политика папки по цепочке, иначе `trash` — срок по умолчанию конфигурации; CTR-07).
+/// Записывает изменения `Moved` и изменения папок.
 /// Отсутствующие письма пропускаются (в UID папки остаётся пропуск).
 pub(crate) async fn relocate(
     tx: &mut PgConnection,
@@ -210,7 +215,7 @@ pub(crate) async fn relocate(
     modseq: ModSeq,
     ids: &[Uuid],
     to: MailboxId,
-    trash: bool,
+    trash: Option<Duration>,
 ) -> Result<Vec<Relocated>> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -224,7 +229,10 @@ pub(crate) async fn relocate(
                       WHERE m.tenant_id = $1 AND m.account_id = $2)
          UPDATE messages m SET mailbox_id = $4, uid = $5 + src.ord - 1, modseq = $6,
                                trashed_from = CASE WHEN $7 THEN old.mailbox_id END,
-                               trashed_at = CASE WHEN $7 THEN now() END
+                               trashed_at = CASE WHEN $7 THEN now() END,
+                               trash_expires_at = CASE WHEN $7 THEN now() + coalesce(
+                                   tp_trash_retention_us(m.tenant_id, m.account_id, old.mailbox_id), $8
+                               ) * interval '1 microsecond' END
          FROM src, old
          WHERE m.tenant_id = $1 AND m.account_id = $2 AND m.message_id = src.id AND old.message_id = src.id
          RETURNING m.message_id, old.mailbox_id, old.uid, m.uid",
@@ -235,7 +243,8 @@ pub(crate) async fn relocate(
     .bind(to.as_uuid())
     .bind(i64::from(first.0))
     .bind(ms)
-    .bind(trash)
+    .bind(trash.is_some())
+    .bind(trash.map(micros).transpose()?.unwrap_or(0))
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -440,7 +449,16 @@ impl MailboxStore for PgMeta {
             let trash = by_role(&mut tx, scope, SpecialUse::Trash)
                 .await?
                 .ok_or(Error::NotFound)?;
-            for m in relocate(&mut tx, scope, ms, &ids, trash, true).await? {
+            for m in relocate(
+                &mut tx,
+                scope,
+                ms,
+                &ids,
+                trash,
+                Some(self.cfg.retention.trash_retention),
+            )
+            .await?
+            {
                 let message = tp_contracts::MessageId::from_uuid(m.id);
                 events.push(changelog::event(
                     scope,

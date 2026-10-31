@@ -1,0 +1,114 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      24,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Related inline image",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-024@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "multipart",
+    "subtype": "related",
+    "params": [
+      [
+        "boundary",
+        "rel-1"
+      ],
+      [
+        "type",
+        "text/html"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 485,
+    "lines": null,
+    "children": [
+      {
+        "part": "1",
+        "media_type": "text",
+        "subtype": "html",
+        "params": [
+          [
+            "charset",
+            "utf-8"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "8bit",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 70,
+        "lines": 0,
+        "children": []
+      },
+      {
+        "part": "2",
+        "media_type": "image",
+        "subtype": "png",
+        "params": [
+          [
+            "name",
+            "logo.png"
+          ]
+        ],
+        "content_id": "<logo@example.com>",
+        "description": null,
+        "encoding": "base64",
+        "disposition": [
+          "inline",
+          [
+            [
+              "filename",
+              "logo.png"
+            ]
+          ]
+        ],
+        "language": [],
+        "location": null,
+        "size": 98,
+        "lines": null,
+        "children": []
+      }
+    ]
+  },
+  "preview": "Logo:",
+  "thread_key": "<corpus-024@example.com>",
+  "has_attachment": true
+}

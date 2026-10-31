@@ -1,0 +1,61 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      2,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Тема без кодирования",
+    "from": [
+      {
+        "name": "Иван Петров",
+        "email": "ivan@example.ru"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": null,
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": null
+  },
+  "body": {
+    "part": "",
+    "media_type": "text",
+    "subtype": "plain",
+    "params": [
+      [
+        "charset",
+        "utf-8"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": "8bit",
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 215,
+    "lines": 1,
+    "children": []
+  },
+  "preview": "Привет! Это тестовое письмо для проверки разбора кириллицы. Съешь же ещё этих мягких французских булок, да выпей чаю.",
+  "thread_key": "subject:тема без кодирования",
+  "has_attachment": false
+}

@@ -657,14 +657,21 @@ impl MessageStore for PgMeta {
             return Ok(current);
         }
         let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let events: Vec<_> = relocate(&mut tx, scope, ms, &src, trash, true)
-            .await?
-            .into_iter()
-            .map(|m| {
-                let message = MessageId::from_uuid(m.id);
-                changelog::event(scope, Some(trash), CoreEventKind::Trashed { message })
-            })
-            .collect();
+        let events: Vec<_> = relocate(
+            &mut tx,
+            scope,
+            ms,
+            &src,
+            trash,
+            Some(self.cfg.retention.trash_retention),
+        )
+        .await?
+        .into_iter()
+        .map(|m| {
+            let message = MessageId::from_uuid(m.id);
+            changelog::event(scope, Some(trash), CoreEventKind::Trashed { message })
+        })
+        .collect();
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(ms)
@@ -717,7 +724,7 @@ impl MessageStore for PgMeta {
         let mut uids = HashMap::new();
         let mut events = Vec::with_capacity(src.len());
         for (to, group) in groups {
-            for m in relocate(&mut tx, scope, ms, &group, to, false).await? {
+            for m in relocate(&mut tx, scope, ms, &group, to, None).await? {
                 uids.insert(m.id, m.uid);
                 let message = MessageId::from_uuid(m.id);
                 events.push(changelog::event(

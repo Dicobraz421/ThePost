@@ -24,7 +24,7 @@ use tp_contracts::blob::{BlobStore, ByteStream, ObjectEntry, ObjectStream};
 use tp_contracts::config::duration;
 use tp_contracts::{BlobKey, Error, Result};
 
-use crate::{check_raw_path, clamp_range, config};
+use crate::{check_raw_path, clamp_range};
 
 /// Каталог временных файлов внутри корня; в листинг не попадает.
 const TMP_DIR: &str = ".tmp";
@@ -48,10 +48,10 @@ pub struct LocalConfig {
     pub read_chunk_bytes: usize,
     /// Возраст временного файла, после которого он считается брошенным и удаляется
     /// при открытии хранилища. Больше максимальной длительности записи объекта.
-    /// В config.yaml — `stale_tmp: 24h` (целые секунды).
-    #[serde(rename = "stale_tmp", deserialize_with = "config::secs")]
+    /// В config.yaml — `stale_tmp: 24h`.
+    #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
-    pub stale_tmp_secs: u64,
+    pub stale_tmp: Duration,
 }
 
 impl Default for LocalConfig {
@@ -60,7 +60,7 @@ impl Default for LocalConfig {
             root: PathBuf::from("/var/lib/thepost/blob"),
             fsync: true,
             read_chunk_bytes: 256 << 10,
-            stale_tmp_secs: 24 * 3600,
+            stale_tmp: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -93,7 +93,7 @@ impl LocalStore {
     }
 
     async fn remove_stale_tmp(&self) -> Result<()> {
-        let stale = SystemTime::now() - Duration::from_secs(self.cfg.stale_tmp_secs);
+        let stale = SystemTime::now() - self.cfg.stale_tmp;
         let mut dir = fs::read_dir(self.cfg.root.join(TMP_DIR)).await?;
         while let Some(entry) = dir.next_entry().await? {
             let meta = entry.metadata().await?;
@@ -512,7 +512,7 @@ mod tests {
         drop(fresh);
         LocalStore::open(LocalConfig {
             root: dir.path().to_path_buf(),
-            stale_tmp_secs: 0,
+            stale_tmp: Duration::ZERO,
             ..LocalConfig::default()
         })
         .await

@@ -1,0 +1,61 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      48,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Bad QP",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-048@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "text",
+    "subtype": "plain",
+    "params": [
+      [
+        "charset",
+        "utf-8"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": "quoted-printable",
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 58,
+    "lines": 2,
+    "children": []
+  },
+  "preview": "Broken =ZZ escape and trailing � truncated utf-8",
+  "thread_key": "<corpus-048@example.com>",
+  "has_attachment": false
+}

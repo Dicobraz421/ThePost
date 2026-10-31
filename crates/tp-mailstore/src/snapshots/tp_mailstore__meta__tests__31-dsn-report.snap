@@ -1,0 +1,116 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      29,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Delivery Status Notification (Failure)",
+    "from": [
+      {
+        "name": null,
+        "email": "MAILER-DAEMON@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-029@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "multipart",
+    "subtype": "report",
+    "params": [
+      [
+        "boundary",
+        "rep-1"
+      ],
+      [
+        "report-type",
+        "delivery-status"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 457,
+    "lines": null,
+    "children": [
+      {
+        "part": "1",
+        "media_type": "text",
+        "subtype": "plain",
+        "params": [
+          [
+            "charset",
+            "utf-8"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "8bit",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 35,
+        "lines": 0,
+        "children": []
+      },
+      {
+        "part": "2",
+        "media_type": "message",
+        "subtype": "delivery-status",
+        "params": [],
+        "content_id": null,
+        "description": null,
+        "encoding": null,
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 111,
+        "lines": null,
+        "children": []
+      },
+      {
+        "part": "3",
+        "media_type": "text",
+        "subtype": "rfc822-headers",
+        "params": [],
+        "content_id": null,
+        "description": null,
+        "encoding": null,
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 65,
+        "lines": 3,
+        "children": []
+      }
+    ]
+  },
+  "preview": "Delivery to bob@example.org failed.",
+  "thread_key": "<corpus-029@example.com>",
+  "has_attachment": true
+}

@@ -1,0 +1,102 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      17,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Альтернатива",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-017@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "multipart",
+    "subtype": "alternative",
+    "params": [
+      [
+        "boundary",
+        "alt-2"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 1171,
+    "lines": null,
+    "children": [
+      {
+        "part": "1",
+        "media_type": "text",
+        "subtype": "plain",
+        "params": [
+          [
+            "charset",
+            "utf-8"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "quoted-printable",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 621,
+        "lines": 8,
+        "children": []
+      },
+      {
+        "part": "2",
+        "media_type": "text",
+        "subtype": "html",
+        "params": [
+          [
+            "charset",
+            "utf-8"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "base64",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 302,
+        "lines": 3,
+        "children": []
+      }
+    ]
+  },
+  "preview": "Привет! Это тестовое письмо для проверки разбора кириллицы. Съешь же ещё этих мягких французских булок, да выпей чаю.",
+  "thread_key": "<corpus-017@example.com>",
+  "has_attachment": false
+}

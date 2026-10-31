@@ -1,0 +1,56 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      1,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "No MIME-Version",
+    "from": [
+      {
+        "name": null,
+        "email": "old@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": null,
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": null
+  },
+  "body": {
+    "part": "",
+    "media_type": "text",
+    "subtype": "plain",
+    "params": [],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 46,
+    "lines": 1,
+    "children": []
+  },
+  "preview": "Legacy RFC 822 message without MIME headers.",
+  "thread_key": "subject:no mime-version",
+  "has_attachment": false
+}

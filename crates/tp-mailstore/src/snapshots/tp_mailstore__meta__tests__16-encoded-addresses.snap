@@ -1,0 +1,79 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      14,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Адреса",
+    "from": [
+      {
+        "name": "Иван Петров",
+        "email": "ivan@example.ru"
+      }
+    ],
+    "sender": [],
+    "reply_to": [
+      {
+        "name": null,
+        "email": "reply@example.com"
+      }
+    ],
+    "to": [
+      {
+        "name": "Отдел продаж",
+        "email": "sales@example.ru"
+      },
+      {
+        "name": "Smith, John",
+        "email": "john@example.com"
+      }
+    ],
+    "cc": [
+      {
+        "name": null,
+        "email": "a@example.com"
+      },
+      {
+        "name": null,
+        "email": "b@example.com"
+      }
+    ],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-014@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "text",
+    "subtype": "plain",
+    "params": [
+      [
+        "charset",
+        "utf-8"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": "8bit",
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 100,
+    "lines": 0,
+    "children": []
+  },
+  "preview": "The quick brown fox jumps over the lazy dog. Quarterly report attached, please review before Friday.",
+  "thread_key": "<corpus-014@example.com>",
+  "has_attachment": false
+}
