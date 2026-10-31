@@ -9,7 +9,9 @@
 //!   ставит в очередь [`Outbound`].
 //!
 //! Каталог (псевдонимы, адреса учётных записей, группы) читается полным снимком и кэшируется на
-//! `delivery.directory_refresh`; учётная запись — [`AccountStore::by_login`].
+//! `delivery.directory_refresh`; учётная запись — [`AccountStore::by_login`]. Проверки SPF, DKIM, DMARC и ARC
+//! входящей почты — [`crate::authcheck`]: их заголовки добавляются к письму, письмо с проваленным DMARC
+//! (`quarantine`, `reject`) доставляется в «Спам».
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -25,6 +27,7 @@ use tp_contracts::meta::{Account, AccountScope, AccountStore, MailboxStore, Spec
 use tp_contracts::retention::Quota;
 use tp_contracts::{Error, MailboxId, Result, TenantId};
 
+use crate::authcheck::AuthCheck;
 use crate::config::{DeliveryConfig, SmtpConfig};
 use crate::server::{Envelope, Handler, Mode, Reply, reply};
 
@@ -61,6 +64,8 @@ pub struct Deps {
     pub quota: Option<Arc<dyn Quota>>,
     /// Очередь исходящей почты (SMTP-06).
     pub outbound: Option<Arc<dyn Outbound>>,
+    /// Проверки SPF, DKIM, DMARC, ARC входящей почты (smtp-in); `None` — без проверок.
+    pub authcheck: Option<Arc<AuthCheck>>,
 }
 
 impl fmt::Debug for Deps {
@@ -69,6 +74,7 @@ impl fmt::Debug for Deps {
             .field("tenant", &self.tenant)
             .field("directory", &self.directory.is_some())
             .field("outbound", &self.outbound.is_some())
+            .field("authcheck", &self.authcheck.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -455,8 +461,18 @@ impl Delivery {
 
     async fn accept(&self, env: &Envelope, raw: Bytes) -> Result<()> {
         let received_at = OffsetDateTime::now_utc();
-        let prepared = self.prepare(env, false).await?;
-        let headers = self.trace_headers(env, received_at);
+        let check = match (&self.deps.authcheck, env.mode) {
+            (Some(ac), Mode::Inbound) => Some(ac.check(env, &raw).await),
+            _ => None,
+        };
+        // DMARC не пройден при политике quarantine/reject — в «Спам».
+        let junk = check.as_ref().is_some_and(|c| c.junk);
+        let prepared = self.prepare(env, junk).await?;
+        let mut headers = self.trace_headers(env, received_at);
+        if let Some(c) = &check {
+            // Authentication-Results и Received-SPF — выше Received этого узла (RFC 8601, 7208).
+            headers.insert_str(0, &c.headers);
+        }
         let mut full = Vec::with_capacity(headers.len() + raw.len());
         full.extend_from_slice(headers.as_bytes());
         full.extend_from_slice(&raw);

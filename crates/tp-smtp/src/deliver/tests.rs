@@ -152,6 +152,7 @@ impl Env {
                 directory: Some(Arc::new(self.dir.clone())),
                 quota: Some(Arc::new(self.quota.clone())),
                 outbound: outbound.then(|| self.queue.clone() as Arc<dyn Outbound>),
+                authcheck: None,
             },
             &cfg,
         )
@@ -441,4 +442,55 @@ async fn session_delivers_to_several_recipients() {
         assert!(inbox[0].ends_with("Subject: hi\r\n\r\nhello\r\n"));
     }
     assert!(env.inbox("carol@example.org").await.is_empty());
+}
+
+#[tokio::test]
+async fn dmarc_failure_is_delivered_to_junk_with_results() {
+    use crate::authcheck::tests as fx;
+    let env = Env::new(DecisionHooks::default()).await;
+    let check = fx::checker();
+    let signer = fx::Signer::new("example.com", "s1");
+    signer.publish(check.cache());
+    fx::publish_sender(check.cache(), "quarantine");
+    let mut d = env.delivery(false);
+    d.deps.authcheck = Some(Arc::new(check));
+    // Подписанное письмо с адреса из SPF — во «Входящие».
+    let good = signer.sign(fx::MAIL);
+    let r = d
+        .data(&fx::envelope("192.0.2.10:1000"), Bytes::from(good))
+        .await;
+    assert_eq!(r.code, 250);
+    let inbox = env.inbox("bob@example.org").await;
+    assert_eq!(inbox.len(), 1);
+    assert!(
+        inbox[0].starts_with("Authentication-Results: mx.example.org;"),
+        "{}",
+        inbox[0]
+    );
+    assert!(inbox[0].contains("dmarc=pass"));
+    assert!(
+        inbox[0].contains("\r\nReturn-Path: <sender@example.com>\r\nReceived: from example.com")
+    );
+    // Подделка: подпись не сходится, адрес вне SPF — в «Спам».
+    let forged = signer.sign(fx::MAIL).replace("body", "forged");
+    let r = d
+        .data(&fx::envelope("203.0.113.5:1000"), Bytes::from(forged))
+        .await;
+    assert_eq!(r.code, 250);
+    assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+    let scope = env.scope("bob@example.org").await;
+    let junk = env
+        .meta
+        .mailbox_by_role(scope, SpecialUse::Junk)
+        .expect("junk");
+    let msgs = MessageStore::list(&env.meta, scope, junk, MessageQuery::All, 10)
+        .await
+        .expect("list");
+    assert_eq!(msgs.len(), 1);
+    // Submission не проверяется: письмо пользователя — во «Входящие» получателя.
+    let mut e = fx::envelope("203.0.113.5:1000");
+    e.mode = Mode::Submission;
+    let forged = signer.sign(fx::MAIL).replace("body", "forged");
+    assert_eq!(d.data(&e, Bytes::from(forged)).await.code, 250);
+    assert_eq!(env.inbox("bob@example.org").await.len(), 2);
 }

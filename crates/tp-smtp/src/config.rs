@@ -43,6 +43,8 @@ pub struct SmtpConfig {
     pub timeouts: Timeouts,
     /// Локальная доставка.
     pub delivery: DeliveryConfig,
+    /// Проверки SPF, DKIM, DMARC, ARC.
+    pub authcheck: AuthCheckConfig,
 }
 
 impl Default for SmtpConfig {
@@ -54,6 +56,7 @@ impl Default for SmtpConfig {
             limits: Limits::default(),
             timeouts: Timeouts::default(),
             delivery: DeliveryConfig::default(),
+            authcheck: AuthCheckConfig::default(),
         }
     }
 }
@@ -127,6 +130,22 @@ impl Default for DeliveryConfig {
         Self {
             local_domains: Vec::new(),
             directory_refresh: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+/// Проверки SPF, DKIM, DMARC, ARC входящей почты.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthCheckConfig {
+    /// Записей DNS каждого типа (TXT, MX, A, AAAA, PTR) в кэше проверок. Требует перезапуска.
+    pub dns_cache_size: usize,
+}
+
+impl Default for AuthCheckConfig {
+    fn default() -> Self {
+        Self {
+            dns_cache_size: 10_000,
         }
     }
 }
