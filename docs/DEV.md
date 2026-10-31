@@ -25,6 +25,8 @@ gh pr create -R Dicobraz421/ThePost --head w/<полоса>-<NN> --fill && gh pr
 Нужны `ant` (`ant auth login`) и `gh` (`gh auth login`). Агент и окружение — те же, что у pets (`PETS_AGENT_ID`, `PETS_AGENT_ENV`).
 Альтернатива — сессия Claude Code (claude.ai/code или локально в WSL2) с промптом `docs/process/agent-prompt.md`;
 локально — отдельный worktree на полосу: `git worktree add ../ThePost-<полоса> origin/main`, свой `CARGO_TARGET_DIR`, общий `sccache`.
+Локально — только `-p <крейты>` на хосте; сборка под Linux, tp-sys/thepost и тесты с PostgreSQL — CI (без локальных контейнеров и томов).
+В конце волны агент удаляет свой worktree и `CARGO_TARGET_DIR`.
 
 ## Карточки
 Шаблон — поля `lane, deps, class, files, read, checks, manual` + разделы «Сделать», «Приёмка» (см. любую `docs/tasks/*.md`).
