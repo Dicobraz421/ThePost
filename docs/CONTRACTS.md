@@ -5,7 +5,7 @@
 Асинхронные трейты, используемые как `dyn`, — через `async-trait`; все трейты `Send + Sync + 'static`.
 
 ## Ids
-- `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` = `00000000-0000-0000-0000-000000000001` — организация по умолчанию.
+- `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId`, `QueueId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` = `00000000-0000-0000-0000-000000000001` — организация по умолчанию.
 - `Uid(u32)` — IMAP UID в ящике, монотонный; `UidValidity(u32)`.
 - `ModSeq(u64)` — монотонный на ящик (IMAP CONDSTORE, состояние JMAP).
 - `BlobHash([u8; 32])` — SHA-256, `Display` — hex. `Gen(u32)` — поколение объекта.
@@ -165,8 +165,14 @@ SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, Valkey, S3, узе�
 `InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
 
 ## Queue (Ф1)
-`QueueStore`: `enqueue(OutMessage { blob, from, rcpts, next_attempt })`, `claim(limit, lease)`,
-`reschedule(id, rcpt, at, reason)`, `complete(id, rcpt, status)`. Повторы и DSN — `tp-smtp`.
+SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организаций; время передаёт вызывающий):
+`enqueue(OutMessage { tenant, blob, size, from, dsn: DsnParams { envid, ret }, rcpts: Vec<OutRcpt { address, notify, orcpt }>, next_attempt }) -> QueueId`
+(пусто или повтор адреса — `Invalid`); `claim(now, limit, lease) -> Vec<Claimed { claim: QueueClaim { id, fencing }, until, queued_at, .., rcpts: Vec<QueuedRcpt { rcpt, attempts, last_error }> }>`
+— записи с наступившим сроком попытки без действующей лизы; `renew(&claim, until)`, `reschedule(&claim, rcpt, at, reason)` (`attempts` + 1),
+`complete(&claim, rcpt, RcptStatus::{ Delivered { reply }, Failed { reply } }) -> bool` (`true` — все получатели завершены, запись удалена).
+Устаревший захват — `Conflict`; не завершённые до истечения лизы получатели возвращаются в очередь без `attempts` + 1.
+Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
+Расписание повторов, срок доставки и DSN — `tp-smtp` (DSN ставится в очередь до `complete(.., Failed)`).
 
 ## Trash, Quota (Ф1)
 `TrashStore`: `list(account)`, `restore(item)`, `expired(before, limit)`; срок — `PolicyResolver`. `Quota`: `usage/limit(account)`.
@@ -207,3 +213,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-10-30 — CTR-14: `membership::{Membership, NodeId}`, `events::PartitionAssigner`.
 - 2026-10-30 — CTR-15: `secrets::{SecretRef, Secret, SecretLease, SecretStore}`, `Registry::set_secret_store`.
 - 2026-10-31 — CTR-16 (решение 2026-10-31-ingest-envelope): `IngestRequest::mail_from`; `ingest` → `Ingested { delivered, forward }`.
+- 2026-10-31 — CTR-06 (волна contracts-03): `queue::QueueStore` с захватом записей (`QueueClaim`, fencing), `OutMessage` с параметрами DSN,
+  `RcptStatus`, `QueueId`.
