@@ -41,6 +41,8 @@ pub struct SmtpConfig {
     pub limits: Limits,
     /// Таймауты сессии.
     pub timeouts: Timeouts,
+    /// Локальная доставка.
+    pub delivery: DeliveryConfig,
 }
 
 impl Default for SmtpConfig {
@@ -51,6 +53,7 @@ impl Default for SmtpConfig {
             submission: Vec::new(),
             limits: Limits::default(),
             timeouts: Timeouts::default(),
+            delivery: DeliveryConfig::default(),
         }
     }
 }
@@ -103,6 +106,27 @@ impl Default for Timeouts {
         Self {
             command: Duration::from_secs(5 * 60),
             data: Duration::from_secs(10 * 60),
+        }
+    }
+}
+
+/// Локальная доставка.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeliveryConfig {
+    /// Локальные домены сверх доменов каталога (установка без LDAP, переходный период).
+    pub local_domains: Vec<String>,
+    /// Время жизни снимка каталога (домены, псевдонимы, группы) для разрешения получателей.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub directory_refresh: Duration,
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            local_domains: Vec::new(),
+            directory_refresh: Duration::from_secs(5 * 60),
         }
     }
 }
