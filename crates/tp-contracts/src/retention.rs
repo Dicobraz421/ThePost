@@ -7,6 +7,7 @@
 //!
 //! Истечение (роль maintenance, `tp-mailstore`): [`TrashStore::expired`] → точка принятия решений
 //! `DecisionHooks::before_final_delete` → `MessageStore::expunge_final`; отказ хука — [`TrashStore::defer`].
+//! `expunge_final` удаляет только письма, которые всё ещё в корзине: восстановленное после `expired` остаётся.
 //! Политики хранения и Legal Hold — модуль «Соответствие требованиям» через этот хук (SRS 1.3).
 
 use async_trait::async_trait;

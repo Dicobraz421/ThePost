@@ -464,7 +464,9 @@ pub trait MessageStore: Send + Sync + 'static {
     /// и новым UID. Письмо не в корзине — `Error::Invalid`.
     async fn restore(&self, scope: AccountScope, ids: &[MessageId]) -> Result<Vec<Inserted>>;
 
-    /// Окончательно удаляет письма и уменьшает счётчики ссылок объектов (SRS 3.4, удаление шаг 2).
+    /// Окончательно удаляет письма, которые в момент вызова лежат в корзине, и уменьшает счётчики ссылок
+    /// объектов (SRS 3.4, удаление шаг 2). Отсутствующие и письма вне корзины (например, восстановленные
+    /// между `TrashStore::expired` и этим вызовом) пропускаются без ошибки.
     async fn expunge_final(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq>;
 }
 
