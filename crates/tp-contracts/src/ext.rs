@@ -182,7 +182,7 @@ pub trait AdminRoutes: Send + Sync + 'static {
 pub enum CopyTo {
     /// В папку учётной записи организации (журнальный ящик) — в той же загрузке, что основные доставки.
     Mailbox(Delivery),
-    /// Внешнему получателю (через очередь smtp-out).
+    /// Внешнему получателю: для доставки — в `Ingested::forward`, в очередь smtp-out ставит вызывающий.
     Address(String),
 }
 

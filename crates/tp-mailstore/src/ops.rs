@@ -175,6 +175,7 @@ mod tests {
                 .store
                 .ingest(IngestRequest {
                     tenant: TenantId::DEFAULT,
+                    mail_from: String::new(),
                     raw: stream(&raw, 4096),
                     deliveries: vec![Delivery {
                         account: scope.account,
@@ -186,7 +187,7 @@ mod tests {
                 })
                 .await
                 .expect("ingest");
-            ids.push(done[0].message);
+            ids.push(done.delivered[0].message);
         }
         Fixture {
             env,

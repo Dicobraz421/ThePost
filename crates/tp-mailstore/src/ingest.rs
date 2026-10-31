@@ -19,7 +19,7 @@ use futures::TryStreamExt;
 use mail_parser::{HeaderValue, MessageParser};
 use tp_contracts::blob::{Acquire, ByteStream, Commit};
 use tp_contracts::ext::{CopyTo, Decision, DeliveryInfo};
-use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest};
+use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, Ingested};
 use tp_contracts::meta::{AccountScope, MessageMeta, NewMessage, PartRef};
 use tp_contracts::{BlobHash, BlobKey, Error, MessageId, Result, TenantId};
 
@@ -36,9 +36,10 @@ struct SkeletonGroup {
 }
 
 impl Store {
-    pub(crate) async fn ingest_impl(&self, req: IngestRequest) -> Result<Vec<Delivered>> {
+    pub(crate) async fn ingest_impl(&self, req: IngestRequest) -> Result<Ingested> {
         let IngestRequest {
             tenant,
+            mail_from: _,
             raw,
             mut deliveries,
             received_at,
@@ -207,7 +208,10 @@ impl Store {
         }
         // Доставки сверх запроса (копии точек принятия решений) вызывающему не возвращаются.
         done.truncate(info.deliveries.len());
-        Ok(done)
+        Ok(Ingested {
+            delivered: done,
+            forward: Vec::new(),
+        })
     }
 
     /// Учитывает объект с `refs` ссылками и загружает его, если его ещё нет (SRS 3.4, шаги 2–3).
@@ -440,6 +444,7 @@ mod tests {
     fn request(raw: &[u8], deliveries: Vec<Delivery>) -> IngestRequest {
         IngestRequest {
             tenant: TenantId::DEFAULT,
+            mail_from: String::new(),
             raw: stream(raw, 1000),
             deliveries,
             received_at: SystemClock.now(),
@@ -482,7 +487,8 @@ mod tests {
             .store
             .ingest(request(&raw, ds.clone()))
             .await
-            .expect("ingest");
+            .expect("ingest")
+            .delivered;
         assert_eq!(done.len(), 10);
         // Части — один раз; скелетов два: общий и с заголовком получателя.
         assert_eq!(env.blobs.calls(BlobOp::Put), unique.len() as u64 + 2);
@@ -652,7 +658,11 @@ mod tests {
             .ingest(request(&raw, ds.clone()))
             .await
             .expect("ingest");
-        assert_eq!(done.len(), 2, "копии журнала вызывающему не возвращаются");
+        assert_eq!(
+            done.delivered.len(),
+            2,
+            "копии журнала вызывающему не возвращаются"
+        );
         let copies = env
             .meta
             .list(js, to.mailbox, MessageQuery::All, 10)

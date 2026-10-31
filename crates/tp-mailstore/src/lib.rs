@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tp_contracts::blob::{BlobIndex, BlobStore, ByteStream};
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::ext::DecisionHooks;
-use tp_contracts::mailstore::{Delivered, IngestRequest, MailStore};
+use tp_contracts::mailstore::{IngestRequest, Ingested, MailStore};
 use tp_contracts::meta::{AccountScope, ChangeLog, FlagOp, FlagsUpdate, Inserted, MessageStore};
 use tp_contracts::{MailboxId, MessageId, ModSeq, Result};
 
@@ -84,7 +84,7 @@ impl Store {
 
 #[async_trait]
 impl MailStore for Store {
-    async fn ingest(&self, req: IngestRequest) -> Result<Vec<Delivered>> {
+    async fn ingest(&self, req: IngestRequest) -> Result<Ingested> {
         self.ingest_impl(req).await
     }
 
