@@ -11,6 +11,7 @@ pub mod changelog;
 pub mod credentials;
 pub mod doctor;
 pub mod events;
+pub mod index_manifest;
 pub mod lease;
 pub mod mailboxes;
 pub mod membership;
