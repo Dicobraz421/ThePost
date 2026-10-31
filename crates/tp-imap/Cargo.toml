@@ -17,10 +17,23 @@ tp-platform.workspace = true
 schemars.workspace = true
 base64.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 flate2.workspace = true
+futures.workspace = true
+imap-codec.workspace = true
+mail-parser.workspace = true
+nom.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 tp-testkit.workspace = true
+insta.workspace = true
+proptest.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
