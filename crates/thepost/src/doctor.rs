@@ -47,6 +47,18 @@ impl Status {
     }
 }
 
+impl From<tp_platform::secrets::DoctorStatus> for Status {
+    fn from(s: tp_platform::secrets::DoctorStatus) -> Self {
+        use tp_platform::secrets::DoctorStatus as S;
+        match s {
+            S::Skipped => Status::Skipped,
+            S::Ok => Status::Ok,
+            S::Warn => Status::Warn,
+            S::Fail => Status::Fail,
+        }
+    }
+}
+
 impl From<tp_meta::doctor::Status> for Status {
     fn from(s: tp_meta::doctor::Status) -> Self {
         match s {
@@ -61,7 +73,8 @@ impl From<tp_meta::doctor::Status> for Status {
 /// Одна проверка.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Check {
-    /// Идентификатор `<группа>.<проверка>`: `config.load`, `database.rls`, `blob.write`, `time.clock_skew` …
+    /// Идентификатор `<группа>.<проверка>`: `config.load`, `secrets.store`, `database.rls`, `blob.write`,
+    /// `time.clock_skew` …
     pub id: String,
     /// Итог.
     pub status: Status,
@@ -198,19 +211,24 @@ pub async fn check(cfg: &Config, store: Option<Arc<dyn SecretStore>>, report: &m
         .section::<DoctorSection>(DOCTOR)
         .map(|d| (*d).clone())
         .unwrap_or_default();
+    // Хранилище секретов (PLT-12): `secrets_store` → `secrets.store` и т. д.
+    for c in secrets::doctor(cfg).await.checks {
+        let id = c.id.replacen('_', ".", 1);
+        report.push(&id, c.status.into(), c.value, c.message);
+    }
     let refs = secrets::references(cfg);
-    let store = match secrets::store(cfg, store) {
+    let store = match secrets::store(cfg, store).await {
         Ok(store) => {
             let (status, msg) = if refs.is_empty() {
                 (Status::Skipped, "ссылок на секреты нет".to_owned())
             } else {
                 (Status::Ok, format!("ссылок на секреты: {}", refs.len()))
             };
-            report.push("secrets.store", status, "", msg);
+            report.push("secrets.refs", status, "", msg);
             Some(store)
         }
         Err(e) => {
-            report.push("secrets.store", Status::Fail, "", message(&e));
+            report.push("secrets.refs", Status::Fail, "", message(&e));
             None
         }
     };
@@ -459,8 +477,13 @@ mod tests {
         );
         let report = run(&path, None).await;
         assert_eq!(
-            report.get("secrets.store").map(|c| c.status),
+            report.get("secrets.refs").map(|c| c.status),
             Some(Status::Fail)
+        );
+        assert_eq!(
+            report.get("secrets.config").map(|c| c.status),
+            Some(Status::Skipped),
+            "{report:?}"
         );
         assert_eq!(
             report.get("database.connect").map(|c| c.status),

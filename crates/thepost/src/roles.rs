@@ -48,6 +48,10 @@ pub struct Maintenance {
     pub sinks: Vec<Arc<dyn EventSink>>,
     /// Период опроса журнала.
     pub events_poll: Duration,
+    /// Сборка мусора объектов (`blob.gc`).
+    pub gc: GcConfig,
+    /// Поиск «сирот» (`blob.orphans`).
+    pub orphans: OrphanConfig,
 }
 
 impl std::fmt::Debug for Maintenance {
@@ -73,13 +77,13 @@ impl RoleService for Maintenance {
         let gc = GcWorker::new(
             self.index.clone(),
             self.store.clone(),
-            GcConfig::default(),
+            self.gc.clone(),
             system_now(),
         );
         let orphans = OrphanSweeper::new(
             self.index.clone(),
             self.store.clone(),
-            OrphanConfig::default(),
+            self.orphans.clone(),
             system_now(),
         );
         let (leases, holder, token) = (
@@ -87,7 +91,7 @@ impl RoleService for Maintenance {
             self.holder.clone(),
             ctx.shutdown.clone(),
         );
-        let gc = spawn_leased(move || async move {
+        let gc = tokio::spawn(async move {
             gc.run(&*leases, &holder, token.cancelled_owned()).await;
         });
         let (leases, holder, token) = (
@@ -95,7 +99,7 @@ impl RoleService for Maintenance {
             self.holder.clone(),
             ctx.shutdown.clone(),
         );
-        let orphans = spawn_leased(move || async move {
+        let orphans = tokio::spawn(async move {
             orphans
                 .run(&*leases, &holder, token.cancelled_owned())
                 .await;
@@ -118,19 +122,6 @@ impl RoleService for Maintenance {
         }
         Ok(())
     }
-}
-
-/// Запускает воркер `tp-blob` под лизой в отдельном потоке на текущем runtime.
-///
-/// Будущее `GcWorker::run`/`OrphanSweeper::run` не доказуемо `Send` (async-замыкание внутри `run_leased`
-/// в `tp-blob`), поэтому его нельзя держать в задаче tokio; поток ведёт его через `Handle::block_on`.
-fn spawn_leased<F, Fut>(make: F) -> tokio::task::JoinHandle<()>
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = ()>,
-{
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || handle.block_on(make()))
 }
 
 /// Опрос журнала событий подписчиками до остановки; затем лизы разделов отдаются другим узлам.
@@ -238,6 +229,8 @@ mod tests {
             events,
             sinks: vec![sink.clone()],
             events_poll: Duration::from_millis(10),
+            gc: GcConfig::default(),
+            orphans: OrphanConfig::default(),
         };
         let (ctx, shutdown, ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
