@@ -549,10 +549,31 @@ impl<T: Transport> Session<T> {
             self.bad(Some(tag), "No mailbox selected");
             return;
         }
-        match body {
-            CommandBody::Check => self.ok(tag, None, "CHECK completed"),
-            CommandBody::Unselect => self.unselect(tag),
-            _ => self.bad(Some(tag), "Command not supported"),
+        let done = match body {
+            CommandBody::Check => {
+                self.ok(tag, None, "CHECK completed");
+                Ok(())
+            }
+            CommandBody::Unselect => {
+                self.unselect(tag);
+                Ok(())
+            }
+            CommandBody::Fetch {
+                sequence_set,
+                macro_or_item_names,
+                uid,
+                ..
+            } => {
+                self.fetch(tag, &sequence_set, macro_or_item_names, uid)
+                    .await
+            }
+            _ => {
+                self.bad(Some(tag), "Command not supported");
+                Ok(())
+            }
+        };
+        if let Err(e) = done {
+            self.store_error(tag, &e);
         }
     }
 

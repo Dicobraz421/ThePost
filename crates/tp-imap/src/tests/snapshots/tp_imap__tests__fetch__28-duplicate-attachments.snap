@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 28 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:26:00 +0300" "Same attachment twice" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-026@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL)("application" "pdf" ("name" "copy1.pdf") NIL NIL "base64" 808 NIL ("attachment" ("filename" "copy1.pdf")) NIL NIL)("application" "pdf" ("name" "copy2.pdf") NIL NIL "base64" 808 NIL ("attachment" ("filename" "copy2.pdf")) NIL NIL) "mixed" ("boundary" "mix-8") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {124}
+From: Alice Example <alice@example.com>
+Subject: Same attachment twice
+Content-Type: multipart/mixed; boundary="mix-8"
+
+ BINARY.SIZE[1] 100)
+F28 OK FETCH completed

@@ -4,9 +4,11 @@
 //! - [`session`] — сессия: состояния, TLS, аутентификация; [`Server`] — приём соединений и остановка с `BYE`.
 //! - `mailbox` — операции с папками: LIST (LIST-EXTENDED, SPECIAL-USE, LIST-STATUS), SELECT, STATUS, CREATE,
 //!   DELETE, RENAME, SUBSCRIBE.
+//! - `fetch` — FETCH: метаданные, разделы BODY[], BINARY, частичная выборка.
 //! - [`config`] — секция `imap` config.yaml.
 
 pub mod config;
+mod fetch;
 mod mailbox;
 pub mod proto;
 pub mod session;

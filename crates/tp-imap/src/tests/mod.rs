@@ -20,6 +20,7 @@ use tp_testkit::{
 use crate::config::ImapConfig;
 use crate::session::{Deps, Session, SessionCtx, Transport};
 
+mod fetch;
 mod mailbox;
 mod session;
 

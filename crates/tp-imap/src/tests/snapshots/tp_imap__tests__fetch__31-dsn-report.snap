@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 31 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:29:00 +0300" "Delivery Status Notification (Failure)" ((NIL NIL "MAILER-DAEMON" "example.com")) ((NIL NIL "MAILER-DAEMON" "example.com")) ((NIL NIL "MAILER-DAEMON" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-029@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 35 0 NIL NIL NIL NIL)("message" "delivery-status" NIL NIL NIL "7bit" 111 NIL NIL NIL NIL)("TEXT" "rfc822-headers" NIL NIL NIL "7bit" 65 3 NIL NIL NIL NIL) "report" ("boundary" "rep-1" "report-type" "delivery-status") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {163}
+From: MAILER-DAEMON@example.com
+Subject: Delivery Status Notification (Failure)
+Content-Type: multipart/report; boundary="rep-1"; report-type=delivery-status
+
+ BINARY.SIZE[1] 35)
+F31 OK FETCH completed

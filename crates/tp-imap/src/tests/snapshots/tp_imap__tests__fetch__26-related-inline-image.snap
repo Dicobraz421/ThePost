@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 26 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:24:00 +0300" "Related inline image" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-024@example.com>") BODYSTRUCTURE (("TEXT" "html" ("charset" "utf-8") NIL NIL "8bit" 70 0 NIL NIL NIL NIL)("image" "png" ("name" "logo.png") "<logo@example.com>" NIL "base64" 98 NIL ("inline" ("filename" "logo.png")) NIL NIL) "related" ("boundary" "rel-1" "type" "text/html") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {143}
+From: Alice Example <alice@example.com>
+Subject: Related inline image
+Content-Type: multipart/related; boundary="rel-1"; type="text/html"
+
+ BINARY.SIZE[1] 70)
+F26 OK FETCH completed
