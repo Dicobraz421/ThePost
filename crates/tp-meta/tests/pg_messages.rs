@@ -641,6 +641,109 @@ async fn core_events_written_in_transaction() {
     assert!(rows.windows(2).all(|w| w[0].0 == w[1].0 && w[1].1 > w[0].1));
 }
 
+/// События учётной записи в журнале.
+async fn account_events(meta: &PgMeta, scope: AccountScope) -> i64 {
+    let mut tx = tp_meta::schema::begin_system(meta.pool())
+        .await
+        .expect("begin");
+    let n = sqlx::query_scalar("SELECT count(*) FROM events WHERE account_id = $1")
+        .bind(scope.account.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("events");
+    tx.commit().await.expect("commit");
+    n
+}
+
+#[tokio::test]
+async fn insert_batch_all_or_nothing() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let a = common::account(&meta).await;
+    let (domain, name) = common::domain(meta.pool(), a.tenant).await;
+    let acc = meta
+        .upsert(
+            a.tenant,
+            tp_contracts::meta::AccountUpsert {
+                domain,
+                login: format!("b@{name}"),
+                display_name: "B".into(),
+                external_id: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("upsert");
+    let b = AccountScope {
+        tenant: a.tenant,
+        account: acc.id,
+    };
+    let inbox_a = folder(&meta, a, SpecialUse::Inbox).await;
+    let inbox_b = folder(&meta, b, SpecialUse::Inbox).await;
+    let events = (
+        account_events(&meta, a).await,
+        account_events(&meta, b).await,
+    );
+
+    // Сбой на последней вставке (папки нет): транзакция откатывается целиком.
+    let err = meta
+        .insert_batch(
+            a.tenant,
+            vec![
+                (a, inbox_a, message(a, "a")),
+                (b, inbox_b, message(b, "b")),
+                (b, MailboxId::new(), message(b, "c")),
+            ],
+        )
+        .await;
+    assert_eq!(err, Err(Error::NotFound));
+    for (scope, mailbox) in [(a, inbox_a), (b, inbox_b)] {
+        let left = MessageStore::list(&meta, scope, mailbox, MessageQuery::All, 10)
+            .await
+            .expect("list");
+        assert!(left.is_empty());
+    }
+    assert_eq!(
+        (
+            account_events(&meta, a).await,
+            account_events(&meta, b).await
+        ),
+        events
+    );
+
+    // Успех: результат — в порядке доставок, событие доставки на каждую.
+    let ins = meta
+        .insert_batch(
+            a.tenant,
+            vec![
+                (b, inbox_b, message(b, "b")),
+                (a, inbox_a, message(a, "a1")),
+                (a, inbox_a, message(a, "a2")),
+            ],
+        )
+        .await
+        .expect("batch");
+    assert_eq!(
+        ins.iter().map(|i| i.uid).collect::<Vec<_>>(),
+        vec![Uid(1), Uid(1), Uid(2)]
+    );
+    for (scope, i, subject) in [(b, ins[0], "b"), (a, ins[1], "a1"), (a, ins[2], "a2")] {
+        let m = MessageStore::get(&meta, scope, i.id)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(m.meta.envelope.subject.as_deref(), Some(subject));
+    }
+    assert_eq!(
+        (
+            account_events(&meta, a).await,
+            account_events(&meta, b).await
+        ),
+        (events.0 + 2, events.1 + 1)
+    );
+}
+
 #[tokio::test]
 async fn cascade_delete_moves_subtree_to_trash() {
     let Some(meta) = common::meta().await else {
