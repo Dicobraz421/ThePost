@@ -36,7 +36,7 @@ use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{BlobKey, Error, Result};
 
-use crate::{check_raw_path, config};
+use crate::check_raw_path;
 
 /// Ключи доступа S3 — ссылки на поля секрета в хранилище: задаются только вместе.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -60,7 +60,7 @@ pub struct S3Credentials {
 ///   secret_access_key: { secret: "thepost/s3#secret_access_key" }
 /// request_timeout: 30s
 /// ```
-#[derive(Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct S3Config {
     /// Адрес S3 API (`https://seaweedfs:8333`); `None` — AWS по региону (https).
@@ -73,15 +73,6 @@ pub struct S3Config {
     pub prefix: String,
     /// Ключи доступа — ссылки на секреты; читаются [`S3Store::connect`].
     pub credentials: Option<S3Credentials>,
-    /// Значение идентификатора ключа, уже прочитанное вызывающим (не из config.yaml); для [`S3Store::new`].
-    /// Остаётся, пока приложение читает секреты само (до APP-07).
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub access_key_id: Option<String>,
-    /// Значение секрета ключа, уже прочитанное вызывающим (не из config.yaml); для [`S3Store::new`].
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub secret_access_key: Option<String>,
     /// Адресация path-style (`endpoint/bucket/key`) — нужна SeaweedFS и MinIO.
     pub path_style: bool,
     /// TLS канала до S3: `ca_file` — корни для проверки сервера, `allow_plaintext` — `http://` в профиле dev.
@@ -95,26 +86,26 @@ pub struct S3Config {
     pub multipart_concurrency: usize,
     /// Повторов запроса при временных сбоях; 0 — без повторов.
     pub max_retries: usize,
-    /// Начальная пауза backoff, мс. В config.yaml — `retry_init_backoff: 100ms`.
-    #[serde(rename = "retry_init_backoff", deserialize_with = "config::millis")]
+    /// Начальная пауза backoff (`retry_init_backoff: 100ms`).
+    #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
-    pub retry_init_backoff_ms: u64,
-    /// Максимальная пауза backoff, мс. В config.yaml — `retry_max_backoff: 15s`.
-    #[serde(rename = "retry_max_backoff", deserialize_with = "config::millis")]
+    pub retry_init_backoff: Duration,
+    /// Максимальная пауза backoff (`retry_max_backoff: 15s`).
+    #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
-    pub retry_max_backoff_ms: u64,
-    /// Предел времени повторов запроса от первой попытки, мс. В config.yaml — `retry_timeout: 3m`.
-    #[serde(rename = "retry_timeout", deserialize_with = "config::millis")]
+    pub retry_max_backoff: Duration,
+    /// Предел времени повторов запроса от первой попытки (`retry_timeout: 3m`).
+    #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
-    pub retry_timeout_ms: u64,
-    /// Таймаут запроса, мс. В config.yaml — `request_timeout: 30s`.
-    #[serde(rename = "request_timeout", deserialize_with = "config::millis")]
+    pub retry_timeout: Duration,
+    /// Таймаут запроса (`request_timeout: 30s`).
+    #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
-    pub request_timeout_ms: u64,
-    /// Таймаут установления соединения, мс. В config.yaml — `connect_timeout: 5s`.
-    #[serde(rename = "connect_timeout", deserialize_with = "config::millis")]
+    pub request_timeout: Duration,
+    /// Таймаут установления соединения (`connect_timeout: 5s`).
+    #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
-    pub connect_timeout_ms: u64,
+    pub connect_timeout: Duration,
 }
 
 impl Default for S3Config {
@@ -125,49 +116,18 @@ impl Default for S3Config {
             region: "us-east-1".into(),
             prefix: String::new(),
             credentials: None,
-            access_key_id: None,
-            secret_access_key: None,
             path_style: true,
             tls: InternalTls::default(),
             multipart_threshold_bytes: 16 << 20,
             multipart_part_bytes: 8 << 20,
             multipart_concurrency: 4,
             max_retries: 10,
-            retry_init_backoff_ms: 100,
-            retry_max_backoff_ms: 15_000,
-            retry_timeout_ms: 180_000,
-            request_timeout_ms: 30_000,
-            connect_timeout_ms: 5_000,
+            retry_init_backoff: Duration::from_millis(100),
+            retry_max_backoff: Duration::from_secs(15),
+            retry_timeout: Duration::from_secs(180),
+            request_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(5),
         }
-    }
-}
-
-impl fmt::Debug for S3Config {
-    /// Секрет ключа доступа не выводится.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("S3Config")
-            .field("endpoint", &self.endpoint)
-            .field("bucket", &self.bucket)
-            .field("region", &self.region)
-            .field("prefix", &self.prefix)
-            .field("credentials", &self.credentials)
-            .field("access_key_id", &self.access_key_id)
-            .field(
-                "secret_access_key",
-                &self.secret_access_key.as_ref().map(|_| "***"),
-            )
-            .field("path_style", &self.path_style)
-            .field("tls", &self.tls)
-            .field("multipart_threshold_bytes", &self.multipart_threshold_bytes)
-            .field("multipart_part_bytes", &self.multipart_part_bytes)
-            .field("multipart_concurrency", &self.multipart_concurrency)
-            .field("max_retries", &self.max_retries)
-            .field("retry_init_backoff_ms", &self.retry_init_backoff_ms)
-            .field("retry_max_backoff_ms", &self.retry_max_backoff_ms)
-            .field("retry_timeout_ms", &self.retry_timeout_ms)
-            .field("request_timeout_ms", &self.request_timeout_ms)
-            .field("connect_timeout_ms", &self.connect_timeout_ms)
-            .finish()
     }
 }
 
@@ -271,26 +231,14 @@ impl S3Store {
             .map_err(|e| Error::Internal(format!("s3 client: {e}")))?
     }
 
-    /// Клиент S3 с ключами, уже прочитанными вызывающим (`access_key_id`/`secret_access_key`), или из
-    /// окружения. Блокирующий: читает `tls.ca_file`. Конфигурация с `credentials` — `Invalid`
-    /// (нужен [`S3Store::connect`]).
-    pub fn new(cfg: S3Config, profile: Profile) -> Result<Self> {
-        if cfg.credentials.is_some() {
-            return Err(Error::invalid(
-                "S3: credentials are read from the secret store; use S3Store::connect",
-            ));
-        }
-        Self::build(cfg, profile, None)
-    }
-
+    /// Клиент S3 с ключами `keys` или (без них) из окружения. Блокирующий: читает `tls.ca_file`.
     fn build(cfg: S3Config, profile: Profile, keys: Option<(Secret, Secret)>) -> Result<Self> {
-        let ms = Duration::from_millis;
         let transport = cfg.check(profile)?;
         let allow_http = transport == Transport::Plaintext;
         let mut client = ClientOptions::new()
             .with_allow_http(allow_http)
-            .with_timeout(ms(cfg.request_timeout_ms))
-            .with_connect_timeout(ms(cfg.connect_timeout_ms));
+            .with_timeout(cfg.request_timeout)
+            .with_connect_timeout(cfg.connect_timeout);
         match transport {
             Transport::Plaintext => {
                 tracing::warn!("{}", InternalChannel::S3.plaintext_warning());
@@ -312,12 +260,12 @@ impl S3Store {
             .with_allow_http(allow_http)
             .with_retry(RetryConfig {
                 backoff: BackoffConfig {
-                    init_backoff: ms(cfg.retry_init_backoff_ms),
-                    max_backoff: ms(cfg.retry_max_backoff_ms),
+                    init_backoff: cfg.retry_init_backoff,
+                    max_backoff: cfg.retry_max_backoff,
                     base: 2.0,
                 },
                 max_retries: cfg.max_retries,
-                retry_timeout: ms(cfg.retry_timeout_ms),
+                retry_timeout: cfg.retry_timeout,
             })
             .with_client_options(client);
         if let Some(endpoint) = &cfg.endpoint {
@@ -327,13 +275,6 @@ impl S3Store {
             builder = builder
                 .with_access_key_id(id.expose())
                 .with_secret_access_key(secret.expose());
-        } else {
-            if let Some(id) = &cfg.access_key_id {
-                builder = builder.with_access_key_id(id);
-            }
-            if let Some(secret) = &cfg.secret_access_key {
-                builder = builder.with_secret_access_key(secret);
-            }
         }
         let s3 = builder
             .build()
@@ -759,6 +700,11 @@ mod tests {
         }
     }
 
+    /// Клиент без ключей (из окружения), как `connect` без `credentials`.
+    fn new(cfg: S3Config, profile: Profile) -> Result<S3Store> {
+        S3Store::build(cfg, profile, None)
+    }
+
     fn invalid(res: Result<S3Store>) -> String {
         match res {
             Err(Error::Invalid(m)) => m,
@@ -773,12 +719,12 @@ mod tests {
         for profile in [Profile::Prod, Profile::Dev] {
             let cfg = endpoint(http, InternalTls::default());
             assert!(matches!(cfg.check(profile), Err(Error::Invalid(_))));
-            assert!(invalid(S3Store::new(cfg, profile)).contains("https://"));
+            assert!(invalid(new(cfg, profile)).contains("https://"));
         }
         // allow_plaintext вне dev — ошибка даже при https://.
         for url in [http, "https://s3.internal"] {
             let cfg = endpoint(url, plaintext());
-            assert!(invalid(S3Store::new(cfg, Profile::Prod)).contains("profile: dev"));
+            assert!(invalid(new(cfg, Profile::Prod)).contains("profile: dev"));
         }
         let no_endpoint = S3Config {
             tls: plaintext(),
@@ -791,7 +737,7 @@ mod tests {
         // Dev с allow_plaintext — открытый канал допустим.
         let dev = endpoint(http, plaintext());
         assert_eq!(dev.check(Profile::Dev), Ok(Transport::Plaintext));
-        assert!(S3Store::new(dev, Profile::Dev).is_ok());
+        assert!(new(dev, Profile::Dev).is_ok());
         assert!(matches!(
             endpoint("ftp://s3", InternalTls::default()).check(Profile::Prod),
             Err(Error::Invalid(_))
@@ -806,7 +752,7 @@ mod tests {
             Ok(Transport::Tls)
         );
         assert_eq!(S3Config::default().check(Profile::Prod), Ok(Transport::Tls));
-        assert!(S3Store::new(endpoint(https, InternalTls::default()), Profile::Prod).is_ok());
+        assert!(new(endpoint(https, InternalTls::default()), Profile::Prod).is_ok());
 
         let ca = |path: &FsPath| InternalTls {
             ca_file: Some(path.to_path_buf()),
@@ -815,17 +761,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let good = dir.path().join("ca.pem");
         std::fs::write(&good, include_bytes!("testdata/ca.pem")).expect("write ca");
-        assert!(S3Store::new(endpoint(https, ca(&good)), Profile::Prod).is_ok());
+        assert!(new(endpoint(https, ca(&good)), Profile::Prod).is_ok());
 
         let empty = dir.path().join("empty.pem");
         std::fs::write(&empty, b"not a certificate").expect("write");
-        assert!(
-            invalid(S3Store::new(endpoint(https, ca(&empty)), Profile::Prod)).contains("ca_file")
-        );
+        assert!(invalid(new(endpoint(https, ca(&empty)), Profile::Prod)).contains("ca_file"));
         let missing = dir.path().join("missing.pem");
-        assert!(
-            invalid(S3Store::new(endpoint(https, ca(&missing)), Profile::Prod)).contains("ca_file")
-        );
+        assert!(invalid(new(endpoint(https, ca(&missing)), Profile::Prod)).contains("ca_file"));
     }
 
     #[test]
@@ -836,7 +778,7 @@ mod tests {
             key_file: Some("/etc/thepost/node.key".into()),
             ..InternalTls::default()
         };
-        assert!(invalid(S3Store::new(endpoint(https, mtls), Profile::Prod)).contains("mTLS"));
+        assert!(invalid(new(endpoint(https, mtls), Profile::Prod)).contains("mTLS"));
 
         let name = |n: &str| InternalTls {
             server_name: Some(n.into()),
@@ -870,15 +812,6 @@ mod tests {
         assert_eq!(url_host("s3.internal"), None);
     }
 
-    #[test]
-    fn debug_hides_secret() {
-        let cfg = S3Config {
-            secret_access_key: Some("top-secret".into()),
-            ..S3Config::default()
-        };
-        assert!(!format!("{cfg:?}").contains("top-secret"));
-    }
-
     fn with_credentials() -> S3Config {
         S3Config {
             credentials: Some(S3Credentials {
@@ -903,12 +836,10 @@ mod tests {
         assert!(!e.contains("AKIA0TEST"), "{e}");
 
         mem.set(&creds.secret_access_key, "s3cr3t-value");
-        S3Store::connect(cfg.clone(), Profile::Prod, &mem)
+        S3Store::connect(cfg, Profile::Prod, &mem)
             .await
             .expect("клиент с ключами из хранилища");
 
-        // Синхронный конструктор хранилища секретов не видит — ссылки не игнорируются молча.
-        assert!(invalid(S3Store::new(cfg, Profile::Prod)).contains("S3Store::connect"));
         // Без ссылок connect не обращается к хранилищу.
         S3Store::connect(S3Config::default(), Profile::Prod, &mem)
             .await
@@ -923,7 +854,7 @@ mod tests {
             return;
         };
         // Стенд dev: SeaweedFS может слушать http:// — допустимо только в профиле dev.
-        let store = S3Store::new(
+        let store = new(
             S3Config {
                 endpoint: Some(endpoint),
                 bucket: std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "thepost-test".into()),
