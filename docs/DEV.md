@@ -20,7 +20,7 @@ Release-сборка — только main, `beta-*`, ручной запуск.
 ```
 python scripts/cloud_agent.py run ThePost <полоса> <NN> <ID> [<ID> ...] [--budget 10]
 python scripts/cloud_agent.py wait <session>
-gh pr create -R Dicobraz421/ThePost --head w/<полоса>-<NN> --fill && gh pr merge -R Dicobraz421/ThePost --auto --rebase w/<полоса>-<NN>
+gh pr create -R Dicobraz421/ThePost --head w/<полоса>-<NN> --fill && gh pr merge -R Dicobraz421/ThePost --auto w/<полоса>-<NN>
 ```
 Нужны `ant` (`ant auth login`) и `gh` (`gh auth login`). Агент и окружение — те же, что у pets (`PETS_AGENT_ID`, `PETS_AGENT_ENV`).
 Альтернатива — сессия Claude Code (claude.ai/code или локально в WSL2) с промптом `docs/process/agent-prompt.md`;
