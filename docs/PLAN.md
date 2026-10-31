@@ -54,6 +54,7 @@
 | ✅ cluster-03 | CLU-06 | A | cluster-02, contracts-05 | 4 |
 | ✅ platform-04 | PLT-12, PLT-13 | B | platform-03, contracts-05 | 2 |
 | ✅ meta-06 | META-18, META-19 | A | meta-05, platform-04 | 3 |
+| contracts-07 (ветка `x/contracts-07`) | CTR-17 | B | contracts-05, platform-04 | 1 |
 
 ### Остаток связки Ф0 (отчёт app-01, PR #89; конверт ingest — `docs/decisions/2026-10-31-ingest-envelope.md`)
 
@@ -101,7 +102,7 @@
 | Этап | Полосы | Содержание |
 |---|---|---|
 | Ф2. Совместная работа (≈5 мес.) | dav, jmap, sieve, auth | CalDAV, CardDAV, GAL, scheduling, iTIP/iMIP, free/busy, ресурсы; JMAP Contacts/Calendars/Sieve; Sieve и ManageSieve |
-| Ф3. Enterprise (≈5 мес.) | smtp, blob, cluster, admin, app, deploy | Профиль S3, Valkey, режим edge (локальная очередь, реплика получателей, SMTP mTLS — SRS 2.6), пресеты transport/access/backend/mailbox, экспорт/импорт, эталонные Ansible-роли и Helm-чарт (SRS 5.6), стенд Enterprise и испытания Д.6 |
+| Ф3. Enterprise (≈5 мес.) | smtp, blob, cluster, admin, app, deploy | Профиль S3, Valkey, режим edge (локальная очередь, реплика получателей, SMTP mTLS, доставка секретов edge от transport — SRS 2.6, решение 2026-10-31), пресеты transport/access/backend/mailbox, экспорт/импорт, эталонные Ansible-роли и Helm-чарт (SRS 5.6), стенд Enterprise и испытания Д.6 |
 | Ф4. Выпуск (≈3 мес.) | все | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора |
 
 ## Дополнительные модули (SRS 1.3; после Ф1, порядок — решение владельца)
