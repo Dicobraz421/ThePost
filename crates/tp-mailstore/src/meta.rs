@@ -9,7 +9,10 @@
 //!   составной — с путём `p`, несоставной — `p.1`. Размер — тела части в кодировке передачи; строки — у `text/*`
 //!   и `message/rfc822`. Тип по умолчанию — `text/plain`.
 //! - `preview` — начало текста (`text/plain` или текст из HTML) с пробелами, сжатыми до одного, не длиннее
-//!   [`PREVIEW_CHARS`] символов.
+//!   [`PREVIEW_CHARS`] символов; тело в UTF-8 с ошибочной меткой `charset` читается как UTF-8.
+//!
+//! Кодировки — полный набор `mail-parser` (`full_encoding`, encoding_rs): результат не зависит от того,
+//! включили ли его другие крейты сборки.
 //! - `thread_key` — первый идентификатор `References`, иначе `In-Reply-To`, иначе собственный `Message-ID`
 //!   (письмо — начало цепочки), в угловых скобках; без идентификаторов — `subject:` и тема без `Re:`/`Fwd:`
 //!   в нижнем регистре; пустая строка — нет ни идентификаторов, ни темы.
@@ -17,7 +20,7 @@
 
 use std::borrow::Cow;
 
-use mail_parser::{HeaderValue, Message, MessageParser, MimeHeaders, PartType};
+use mail_parser::{Encoding, HeaderValue, Message, MessageParser, MimeHeaders, PartType};
 use time::{OffsetDateTime, UtcOffset};
 use tp_contracts::meta::{Address, BodyPart, Envelope, MessageMeta};
 
@@ -221,7 +224,10 @@ fn child_path(base: &str, n: usize) -> String {
 
 /// Начало текста письма: пробельные символы сжаты до одного пробела, не длиннее [`PREVIEW_CHARS`].
 fn preview(msg: &Message<'_>) -> String {
-    let text: Cow<'_, str> = msg.body_preview(usize::MAX).unwrap_or_default();
+    let text: Cow<'_, str> = match mislabeled_utf8(msg) {
+        Some(text) => Cow::Borrowed(text),
+        None => msg.body_preview(usize::MAX).unwrap_or_default(),
+    };
     let mut out = String::new();
     let mut n = 0;
     'words: for (i, word) in text.split_whitespace().enumerate() {
@@ -235,6 +241,23 @@ fn preview(msg: &Message<'_>) -> String {
     }
     out.truncate(out.trim_end().len());
     out
+}
+
+/// Текст первой текстовой части, если он записан в UTF-8 вопреки метке `charset`: тело без кодирования
+/// передачи не декодировалось по метке (есть U+FFFD), но как UTF-8 корректно. Частая ошибка почтовых
+/// клиентов; без проверки превью зависело бы от набора кодировок `mail-parser`.
+fn mislabeled_utf8<'a>(msg: &'a Message<'_>) -> Option<&'a str> {
+    let part = msg.text_part(0)?;
+    let PartType::Text(text) = &part.body else {
+        return None;
+    };
+    if part.encoding != Encoding::None || !text.contains(char::REPLACEMENT_CHARACTER) {
+        return None;
+    }
+    let raw = msg
+        .raw_message()
+        .get(part.offset_body as usize..part.offset_end as usize)?;
+    std::str::from_utf8(raw).ok()
 }
 
 fn thread_key(msg: &Message<'_>) -> String {
