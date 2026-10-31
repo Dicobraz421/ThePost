@@ -51,7 +51,7 @@ flate2 = "1.1.10"
 futures = "0.3.34"
 hex = "0.4.3"
 instant-acme = "0.8.5"
-jsonwebtoken = "11.1.0"
+jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 libgssapi = "0.11.0"
 lopdf = "0.46.0"
@@ -72,7 +72,9 @@ quick-xml = "0.42.0"
 rand = "0.10.3"
 redis = { version = "1.8.0", features = ["tokio-comp"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+rsasl = { version = "2.3.1", default-features = false, features = ["config_builder", "provider", "plain", "login", "oauthbearer", "xoauth2"] }
 rustls = "0.23.46"
+rustls-native-certs = "0.8.5"
 rustls-pemfile = "2.2.0"
 schemars = "1.2.3"
 seccompiler = "0.5.0"
