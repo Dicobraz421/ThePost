@@ -174,8 +174,15 @@ SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организа
 Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
 Расписание повторов, срок доставки и DSN — `tp-smtp` (DSN ставится в очередь до `complete(.., Failed)`).
 
-## Trash, Quota (Ф1)
-`TrashStore`: `list(account)`, `restore(item)`, `expired(before, limit)`; срок — `PolicyResolver`. `Quota`: `usage/limit(account)`.
+## Trash, Retention, Quota (Ф1)
+SRS 4.7, 3.8. Код — `retention.rs`. `TrashStore`: `list(scope, offset, limit) -> Vec<TrashItem { scope, object: TrashObject::Message(id), origin, size,
+received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Message { mailbox, inserted }`,
+`expired(now, limit)` (все организации, по `expires_at`), `defer(scope, object, until)`.
+Срок корзины — `PolicyResolver` (`trash_retention`, по умолчанию 30 суток из конфигурации): хранилище вычисляет `expires_at`
+при переносе в корзину; изменение политики действует на элементы, удалённые после него.
+Истечение: `expired` → `DecisionHooks::before_final_delete` (`FinalDelete::mailbox` = `origin`) → `MessageStore::expunge_final`; `Deny` — `defer`.
+`Quota`: `usage(scope) -> QuotaUsage` (лимит — `PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded`
+(по умолчанию через `usage` и `QuotaUsage::allows`).
 Политики хранения и Legal Hold — модуль «Соответствие требованиям» через `DecisionHook::before_final_delete`.
 
 ## Extension points
@@ -215,3 +222,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-10-31 — CTR-16 (решение 2026-10-31-ingest-envelope): `IngestRequest::mail_from`; `ingest` → `Ingested { delivered, forward }`.
 - 2026-10-31 — CTR-06 (волна contracts-03): `queue::QueueStore` с захватом записей (`QueueClaim`, fencing), `OutMessage` с параметрами DSN,
   `RcptStatus`, `QueueId`.
+- 2026-10-31 — CTR-07 (волна contracts-03): `retention::{TrashStore, TrashItem, TrashObject, Restored, Quota}`, `QuotaUsage::allows`;
+  раздел «Trash, Quota» → «Trash, Retention, Quota».

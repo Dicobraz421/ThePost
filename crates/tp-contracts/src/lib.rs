@@ -15,6 +15,7 @@ pub mod mailstore;
 pub mod membership;
 pub mod meta;
 pub mod queue;
+pub mod retention;
 pub mod role;
 pub mod search;
 pub mod secrets;
