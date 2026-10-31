@@ -4,7 +4,7 @@
 //! [`MessageStore`] и [`ChangeLog`]: письмо хранится как объект-скелет и объекты частей ([`split`]),
 //! части дедуплицируются в пределах организации, объекты загружаются вне транзакций БД (SRS 3.4).
 //! Изменяющие операции после фиксации публикуют `MailboxChanged` в [`EventBus`]; ошибка публикации
-//! не отменяет операцию (шина at-most-once, клиенты сверяются по `ModSeq`).
+//! не отменяет операцию (шина at-most-once, клиенты сверяются по `ModSeq`). Корзина и истечение её срока — [`trash`].
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -12,17 +12,38 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use tp_contracts::blob::{BlobIndex, BlobStore, ByteStream};
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{IngestRequest, Ingested, MailStore};
 use tp_contracts::meta::{AccountScope, ChangeLog, FlagOp, FlagsUpdate, Inserted, MessageStore};
+use tp_contracts::retention::TrashStore;
 use tp_contracts::{MailboxId, MessageId, ModSeq, Result};
 
 mod fetch;
 mod ingest;
 mod ops;
 pub mod split;
+pub mod trash;
+
+pub use trash::{TrashConfig, TrashPass};
+
+/// Конфигурация хранилища (секция config.yaml; поля необязательны, неизвестное — ошибка).
+///
+/// ```yaml
+/// trash:
+///   interval: 1h
+///   batch: 500
+///   defer: 1d
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    /// Истечение срока корзины.
+    pub trash: TrashConfig,
+}
 
 /// Зависимости [`Store`]: реализации контрактов, выбранные приложением.
 #[derive(Clone)]
@@ -35,6 +56,8 @@ pub struct Deps {
     pub messages: Arc<dyn MessageStore>,
     /// Журнал изменений: папки, затронутые операцией, — для уведомлений.
     pub changes: Arc<dyn ChangeLog>,
+    /// Корзина: элементы с истёкшим сроком.
+    pub trash: Arc<dyn TrashStore>,
     /// Шина уведомлений.
     pub bus: Arc<dyn EventBus>,
     /// Точки принятия решений модулей.
@@ -53,12 +76,18 @@ impl fmt::Debug for Deps {
 #[derive(Debug, Clone)]
 pub struct Store {
     d: Deps,
+    cfg: Config,
 }
 
 impl Store {
-    /// Хранилище поверх зависимостей.
+    /// Хранилище поверх зависимостей с конфигурацией по умолчанию.
     pub fn new(deps: Deps) -> Self {
-        Self { d: deps }
+        Self::with_config(deps, Config::default())
+    }
+
+    /// Хранилище поверх зависимостей с конфигурацией.
+    pub fn with_config(deps: Deps, cfg: Config) -> Self {
+        Self { d: deps, cfg }
     }
 
     /// Публикует `MailboxChanged` для папок учётной записи (каждой — один раз).
@@ -149,11 +178,14 @@ pub(crate) mod testenv {
     use super::*;
     use tp_testkit::{Clock, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata, SystemClock};
 
+    use crate::trash::fake::TestTrash;
+
     pub struct Env {
         pub blobs: MemBlobStore,
         pub index: MemBlobIndex,
         pub meta: MemMetadata,
         pub bus: MemEventBus,
+        pub trash: TestTrash,
         pub store: Store,
     }
 
@@ -168,11 +200,13 @@ pub(crate) mod testenv {
             let index = MemBlobIndex::new(clock.clone());
             let meta = MemMetadata::new(clock).with_blob_index(index.clone());
             let bus = MemEventBus::default();
+            let trash = TestTrash::new(meta.clone());
             let store = Store::new(Deps {
                 blobs: Arc::new(blobs.clone()),
                 index: Arc::new(index.clone()),
                 messages: Arc::new(meta.clone()),
                 changes: Arc::new(meta.clone()),
+                trash: Arc::new(trash.clone()),
                 bus: Arc::new(bus.clone()),
                 hooks,
             });
@@ -181,6 +215,7 @@ pub(crate) mod testenv {
                 index,
                 meta,
                 bus,
+                trash,
                 store,
             }
         }
