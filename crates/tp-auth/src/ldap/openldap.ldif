@@ -1,0 +1,70 @@
+# Каталог OpenLDAP / FreeIPA для тестов синхронизации (режим modifyTimestamp).
+
+dn: ou=people,dc=example,dc=org
+objectClass: organizationalUnit
+ou: people
+entryUUID: 00000000-0000-0000-0000-0000000000f0
+modifyTimestamp: 20261001000000Z
+
+dn: uid=alice,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: alice
+cn: Alice Liddell
+mail: alice@example.org
+mail: A.Liddell@example.org
+mail: alice@example.org
+title: Engineer
+entryUUID: 00000000-0000-0000-0000-0000000000a1
+modifyTimestamp: 20261001100000Z
+userPassword: wonderland
+
+dn: uid=bob,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: bob
+cn: Bob Builder
+mail: bob@example.org
+nsAccountLock: TRUE
+entryUUID: 00000000-0000-0000-0000-0000000000b1
+modifyTimestamp: 20261001100000Z
+userPassword: builder
+
+dn: uid=carol,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: carol
+cn:: Q2Fyb2wg0JrRjdGA0YDQvtC70Ls=
+mail: carol@example.org
+entryUUID: 00000000-0000-0000-0000-0000000000c1
+modifyTimestamp: 20261002000000Z
+userPassword: secret
+
+dn: uid=nomail,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: nomail
+cn: No Mail
+entryUUID: 00000000-0000-0000-0000-0000000000d1
+modifyTimestamp: 20261002000000Z
+
+dn: cn=staff,ou=groups,dc=example,dc=org
+objectClass: groupOfNames
+cn: staff
+mail: staff@example.org
+member: uid=alice,ou=people,dc=example,dc=org
+member: cn=devs,ou=groups,dc=example,dc=org
+member: uid=ghost,ou=people,dc=example,dc=org
+entryUUID: 00000000-0000-0000-0000-0000000000e1
+modifyTimestamp: 20261001000000Z
+
+dn: cn=devs,ou=groups,dc=example,dc=org
+objectClass: groupOfNames
+cn: devs
+member: UID=carol,ou=people,dc=example,dc=org
+member: uid=alice,ou=people,dc=example,dc=org
+entryUUID: 00000000-0000-0000-0000-0000000000e2
+modifyTimestamp: 20261001000001Z
+
+dn: cn=postmaster,ou=aliases,dc=example,dc=org
+objectClass: mailAlias
+cn: postmaster
+mail: postmaster@example.org
+mail: abuse@example.org
+aliasedObjectName: uid=alice,ou=people,dc=example,dc=org
