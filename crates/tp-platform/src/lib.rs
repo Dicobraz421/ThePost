@@ -3,7 +3,6 @@
 
 pub mod acme;
 pub mod config;
-mod http;
 pub mod listen;
 pub mod ratelimit;
 pub mod reload;
