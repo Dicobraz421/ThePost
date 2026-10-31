@@ -3,13 +3,31 @@
 //! - [`index`] — схема индекса ящика и менеджер индексов в каталоге;
 //! - [`analyzers`] — анализатор текста: слова, регистр, «ё», стеммеры Snowball (ru, en);
 //! - [`query`] — исполнитель запросов [`tp_contracts::search::SearchIndex`];
+//! - [`indexer`] — роль indexer: подписчик журнала событий, пакетный коммит индекса.
 
 pub mod analyzers;
 pub mod index;
+pub mod indexer;
 pub mod query;
 
 pub use index::{IndexConfig, IndexDoc, IndexManager, IndexOp, MailIndex, SCHEMA_VERSION};
+pub use indexer::{DocumentSource, Indexer, IndexerConfig, SUBSCRIBER};
 pub use query::{QueryConfig, Search};
+
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// Секция `search` конфигурации (поля необязательны, неизвестное — ошибка).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Индексы ящиков на локальном диске.
+    pub index: IndexConfig,
+    /// Индексатор (роль indexer).
+    pub indexer: IndexerConfig,
+    /// Выполнение запросов (роль search).
+    pub query: QueryConfig,
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
