@@ -13,15 +13,19 @@ workspace = true
 [dependencies]
 tp-contracts.workspace = true
 tp-sys.workspace = true
+async-trait.workspace = true
 schemars.workspace = true
 calamine.workspace = true
 lopdf.workspace = true
 quick-xml.workspace = true
+serde.workspace = true
 tantivy.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
 tp-testkit.workspace = true
+tempfile.workspace = true
