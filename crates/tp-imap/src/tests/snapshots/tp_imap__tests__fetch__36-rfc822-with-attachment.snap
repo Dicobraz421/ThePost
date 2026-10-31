@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 36 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:36:00 +0300" "Fwd: with attachment" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-036@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 10 0 NIL NIL NIL NIL)("MESSAGE" "RFC822" NIL NIL NIL "7bit" 1442 ("Thu, 29 Oct 2026 10:35:00 +0300" "Inner with PDF" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-035@example.com>") (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 1 NIL NIL NIL NIL)("application" "pdf" ("name" "inner.pdf") NIL NIL "base64" 808 NIL ("attachment" ("filename" "inner.pdf")) NIL NIL) "mixed" ("boundary" "in-2") NIL NIL NIL) 31 NIL NIL NIL NIL) "mixed" ("boundary" "fwd-2") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {123}
+From: Alice Example <alice@example.com>
+Subject: Fwd: with attachment
+Content-Type: multipart/mixed; boundary="fwd-2"
+
+ BINARY.SIZE[1] 10)
+F36 OK FETCH completed

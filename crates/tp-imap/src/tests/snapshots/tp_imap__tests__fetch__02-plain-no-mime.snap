@@ -1,0 +1,10 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 2 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:01:00 +0300" "No MIME-Version" ((NIL NIL "old" "example.com")) ((NIL NIL "old" "example.com")) ((NIL NIL "old" "example.com")) ((NIL NIL "bob" "example.org")) NIL NIL NIL NIL) BODYSTRUCTURE ("TEXT" "plain" NIL NIL NIL "7bit" 46 1 NIL NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {51}
+From: old@example.com
+Subject: No MIME-Version
+
+ BINARY.SIZE[1] 46)
+F2 OK FETCH completed

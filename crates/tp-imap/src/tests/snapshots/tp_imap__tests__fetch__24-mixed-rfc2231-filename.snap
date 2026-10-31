@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 24 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:22:00 +0300" "RFC 2231 filename" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-022@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL)("application" "pdf" NIL NIL NIL "base64" 808 NIL ("attachment" ("filename" "=?utf-8?B?0L7RgtGH0ZHRgi5wZGY=?=")) NIL NIL) "mixed" ("boundary" "mix-5") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {120}
+From: Alice Example <alice@example.com>
+Subject: RFC 2231 filename
+Content-Type: multipart/mixed; boundary="mix-5"
+
+ BINARY.SIZE[1] 100)
+F24 OK FETCH completed

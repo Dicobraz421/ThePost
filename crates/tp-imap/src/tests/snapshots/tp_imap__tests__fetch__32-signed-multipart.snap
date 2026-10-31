@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 32 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:30:00 +0300" "Signed" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-030@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL)("application" "pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 24 NIL ("attachment" ("filename" "smime.p7s")) NIL NIL) "signed" ("boundary" "sig-1" "protocol" "application/pkcs7-signature" "micalg" "sha-256") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {166}
+From: Alice Example <alice@example.com>
+Subject: Signed
+Content-Type: multipart/signed; boundary="sig-1"; protocol="application/pkcs7-signature"; micalg=sha-256
+
+ BINARY.SIZE[1] 100)
+F32 OK FETCH completed

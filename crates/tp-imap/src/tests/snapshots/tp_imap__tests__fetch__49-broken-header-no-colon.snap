@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 49 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:51:00 +0300" "Header without colon" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-051@example.com>") BODYSTRUCTURE ("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {117}
+From: Alice Example <alice@example.com>
+Subject: Header without colon
+Content-Type: text/plain; charset="utf-8"
+
+ BINARY.SIZE[1] 100)
+F49 OK FETCH completed

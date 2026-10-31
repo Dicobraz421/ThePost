@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 45 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:47:00 +0300" "Bad base64" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-047@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL)("application" "pdf" ("name" "bad.pdf") NIL NIL "base64" 27 NIL NIL NIL NIL) "mixed" ("boundary" "bad-1") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {113}
+From: Alice Example <alice@example.com>
+Subject: Bad base64
+Content-Type: multipart/mixed; boundary="bad-1"
+
+ BINARY.SIZE[1] 100)
+F45 OK FETCH completed

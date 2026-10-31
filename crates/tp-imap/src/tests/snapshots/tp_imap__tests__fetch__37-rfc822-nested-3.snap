@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 37 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:39:00 +0300" "Level 1" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-039@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 9 0 NIL NIL NIL NIL)("MESSAGE" "RFC822" NIL NIL NIL "7bit" 698 ("Thu, 29 Oct 2026 10:38:00 +0300" "Level 2" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-038@example.com>") (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 9 0 NIL NIL NIL NIL)("MESSAGE" "RFC822" NIL NIL NIL "7bit" 267 ("Thu, 29 Oct 2026 10:37:00 +0300" "Level 3" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-037@example.com>") ("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 7 0 NIL NIL NIL NIL) 0 NIL NIL NIL NIL) "mixed" ("boundary" "lvl-2") NIL NIL NIL) 28 NIL NIL NIL NIL) "mixed" ("boundary" "lvl-1") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {110}
+From: Alice Example <alice@example.com>
+Subject: Level 1
+Content-Type: multipart/mixed; boundary="lvl-1"
+
+ BINARY.SIZE[1] 9)
+F37 OK FETCH completed

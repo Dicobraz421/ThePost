@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 13 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:11:00 +0300" "Empty body" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-011@example.com>") BODYSTRUCTURE ("TEXT" "plain" NIL NIL NIL "7bit" 0 0 NIL NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {90}
+From: Alice Example <alice@example.com>
+Subject: Empty body
+Content-Type: text/plain
+
+ BINARY.SIZE[1] 0)
+F13 OK FETCH completed

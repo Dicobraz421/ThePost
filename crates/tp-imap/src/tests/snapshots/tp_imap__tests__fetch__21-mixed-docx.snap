@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 21 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:19:00 +0300" "=?utf-8?B?0JTQvtCz0L7QstC+0YAgRE9DWA==?=" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-019@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 213 0 NIL NIL NIL NIL)("application" "vnd.openxmlformats-officedocument.wordprocessingml.document" ("name" "contract.docx") NIL NIL "base64" 1246 NIL ("attachment" ("filename" "contract.docx")) NIL NIL) "mixed" ("boundary" "mix-2") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {143}
+From: Alice Example <alice@example.com>
+Subject: =?utf-8?b?0JTQvtCz0L7QstC+0YAgRE9DWA==?=
+Content-Type: multipart/mixed; boundary="mix-2"
+
+ BINARY.SIZE[1] 213)
+F21 OK FETCH completed
