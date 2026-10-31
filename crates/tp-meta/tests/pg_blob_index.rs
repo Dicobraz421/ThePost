@@ -1,4 +1,4 @@
-//! META-02: протокол поколений BlobIndex на PostgreSQL.
+//! META-02: протокол поколений BlobIndex на PostgreSQL; META-19: перечисление и пометка повреждённых для verify.
 
 mod common;
 
@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use time::OffsetDateTime;
-use tp_contracts::blob::{Acquire, BlobIndex, Commit};
+use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, Commit};
 use tp_contracts::{BlobHash, BlobKey, Error, Gen};
 use tp_meta::{MetaConfig, PgMeta};
+use tp_testkit::MemBlobStore;
 
 fn random_hash() -> BlobHash {
     let mut h = [0u8; 32];
@@ -285,4 +286,101 @@ async fn concurrent_acquire_release_gc_keeps_references() {
     };
     assert!(matches!(refcnt, None | Some(0)), "refcnt = {refcnt:?}");
     eprintln!("удалено объектов: {}", deleted.load(Ordering::Relaxed));
+}
+
+/// Сверка, как в `thepost verify`: записи `live` страницами, объект в хранилище отсутствует или другого размера —
+/// запись помечается повреждённой.
+#[tokio::test]
+async fn verify_pages_live_records_and_marks_damaged() {
+    let Some(idx) = index(Duration::from_secs(3600)).await else {
+        return;
+    };
+    let tenant = common::tenant(idx.pool()).await;
+    let store = MemBlobStore::default();
+    let mut keys = Vec::new();
+    for i in 0..6u8 {
+        let hash = random_hash();
+        let Acquire::Absent { generation } = idx.acquire(tenant, &hash, 1).await.expect("acquire")
+        else {
+            panic!("новый хэш");
+        };
+        assert_eq!(
+            idx.commit_new(tenant, &hash, generation, 10, 1)
+                .await
+                .expect("commit"),
+            Commit::Done { generation }
+        );
+        let key = BlobKey {
+            tenant,
+            hash,
+            generation,
+        };
+        // Расхождения: у записи 1 нет объекта, у записи 2 объект другого размера.
+        if i != 1 {
+            let size = if i == 2 { 7 } else { 10 };
+            store.put(&key, vec![0u8; size].into()).await.expect("put");
+        }
+        keys.push(key);
+    }
+    // Запись 5 удалена (надгробие) — не `live`, в перечисление не входит.
+    let gone = keys[5];
+    idx.release(tenant, &gone.hash, gone.generation, 1)
+        .await
+        .expect("release");
+    assert!(idx.mark_deleting(&gone, future()).await.expect("deleting"));
+    assert!(idx.finalize_delete(&gone).await.expect("finalize"));
+
+    // Перечисление — со своей организации (в общей тестовой БД есть записи других тестов).
+    let start = BlobKey {
+        tenant,
+        hash: BlobHash([0; 32]),
+        generation: Gen::INITIAL,
+    };
+    let pass = || async {
+        let mut after = start;
+        let mut seen = Vec::new();
+        loop {
+            let page = idx.live_blobs(Some(&after), 2).await.expect("page");
+            assert!(page.len() <= 2);
+            let last = page.last().map(|b| b.key);
+            let done = page.len() < 2 || page.iter().any(|b| b.key.tenant != tenant);
+            seen.extend(page.into_iter().filter(|b| b.key.tenant == tenant));
+            match last {
+                Some(k) if !done => after = k,
+                _ => break,
+            }
+        }
+        seen
+    };
+
+    let seen = pass().await;
+    let mut expected: Vec<BlobKey> = keys[..5].to_vec();
+    expected.sort_by_key(|k| k.hash.0);
+    assert_eq!(seen.iter().map(|b| b.key).collect::<Vec<_>>(), expected);
+    assert!(seen.iter().all(|b| b.size == 10 && !b.damaged));
+    let mut found = Vec::new();
+    for b in &seen {
+        if store.head(&b.key).await.expect("head") != Some(b.size) {
+            assert!(idx.mark_blob_damaged(&b.key).await.expect("mark"));
+            found.push(b.key);
+        }
+    }
+    found.sort_by_key(|k| k.hash.0);
+    let mut damaged = vec![keys[1], keys[2]];
+    damaged.sort_by_key(|k| k.hash.0);
+    assert_eq!(found, damaged);
+
+    // Повторная сверка видит пометку; повторная пометка — без ошибки.
+    let again = pass().await;
+    for b in &again {
+        assert_eq!(b.damaged, damaged.contains(&b.key), "{:?}", b.key);
+    }
+    assert!(idx.mark_blob_damaged(&keys[1]).await.expect("again"));
+    // Нет записи `live` этого поколения — помечать нечего.
+    assert!(!idx.mark_blob_damaged(&gone).await.expect("deleted"));
+    let other_gen = BlobKey {
+        generation: keys[0].generation.next(),
+        ..keys[0]
+    };
+    assert!(!idx.mark_blob_damaged(&other_gen).await.expect("other gen"));
 }
