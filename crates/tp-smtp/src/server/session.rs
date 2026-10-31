@@ -37,7 +37,7 @@ pub enum Exit {
 }
 
 /// Что разбирает сессия.
-enum State {
+pub(super) enum State {
     /// Команды.
     Command(RequestReceiver),
     /// Данные `DATA` до `<CRLF>.<CRLF>`.
@@ -46,10 +46,12 @@ enum State {
     Bdat(BdatReceiver),
     /// Пропуск данных, которые не будут приняты (превышен размер, нет транзакции); затем — ответ.
     Discard(DummyDataReceiver, Reply),
+    /// Ответ клиента в обмене SASL (`AUTH`).
+    Auth(super::auth::Exchange),
 }
 
 impl State {
-    fn command() -> Self {
+    pub(super) fn command() -> Self {
         State::Command(RequestReceiver::default())
     }
 }
@@ -77,6 +79,7 @@ pub struct Session {
     pub(super) principal: Option<Principal>,
     pub(super) tx: Option<Tx>,
     pub(super) errors: u32,
+    pub(super) auth_failures: u32,
     /// Сессия завершается после отправки накопленных ответов.
     pub(super) exit: Option<Exit>,
 }
@@ -103,6 +106,7 @@ impl Session {
             principal: None,
             tx: None,
             errors: 0,
+            auth_failures: 0,
             exit: None,
         }
     }
@@ -120,6 +124,7 @@ impl Session {
         self.esmtp = false;
         self.principal = None;
         self.tx = None;
+        self.exit = None;
     }
 
     /// Ведёт сессию над `io` до `QUIT`, `STARTTLS` или закрытия; `greet` — отправить приветствие `220`.
@@ -145,7 +150,7 @@ impl Session {
                 return Ok(exit);
             }
             let wait = match state {
-                State::Command(_) => self.ctx.config.timeouts.command,
+                State::Command(_) | State::Auth(_) => self.ctx.config.timeouts.command,
                 _ => self.ctx.config.timeouts.data,
             };
             let n = match tokio::time::timeout(wait, io.read(&mut buf)).await {
@@ -193,6 +198,7 @@ impl Session {
                         .bdat_bytes(&mut rx, &mut bytes, &mut out)
                         .await
                         .unwrap_or(State::Bdat(rx)),
+                    State::Auth(ex) => self.auth_bytes(ex, &mut bytes, &mut out).await,
                     State::Discard(mut rx, r) => {
                         if rx.ingest(&mut bytes) {
                             push(&mut out, &r);
@@ -268,8 +274,11 @@ impl Session {
             ),
             Request::Help { .. } => push(out, &reply(214, [2, 0, 0], "See RFC 5321")),
             Request::StartTls => self.starttls(out),
-            Request::Auth { .. }
-            | Request::Expn { .. }
+            Request::Auth {
+                mechanism,
+                initial_response,
+            } => return self.auth(mechanism, initial_response, out).await,
+            Request::Expn { .. }
             | Request::Lhlo { .. }
             | Request::Etrn { .. }
             | Request::Atrn { .. }
@@ -300,6 +309,7 @@ impl Session {
         if self.starttls {
             ehlo.capabilities |= EXT_START_TLS;
         }
+        self.advertise_auth(&mut ehlo);
         // Запись в Vec не завершается ошибкой.
         let _ = ehlo.write(&mut *out);
     }
@@ -332,6 +342,10 @@ impl Session {
                 reply(552, [5, 3, 4], "Message size exceeds fixed limit"),
                 out,
             );
+        }
+        if let Some(r) = self.mail_rate_limit() {
+            push(out, &r);
+            return;
         }
         self.tx = Some(Tx {
             mail_from: from.address,

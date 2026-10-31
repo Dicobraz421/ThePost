@@ -140,6 +140,8 @@ async fn start(mode: Mode, cfg: Arc<SmtpConfig>) -> Env {
         mode,
         config: cfg,
         handler: rec.clone(),
+        sasl: None,
+        limiter: None,
     };
     let (client, mut server) = tokio::io::duplex(64 * 1024);
     let task = tokio::spawn(async move {

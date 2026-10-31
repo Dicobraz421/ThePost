@@ -4,6 +4,9 @@
 //! `RCPT`, `DATA`, `BDAT` (CHUNKING), `RSET`, `NOOP`, `QUIT`; расширения PIPELINING, SIZE, 8BITMIME, SMTPUTF8,
 //! ENHANCEDSTATUSCODES; лимиты и таймауты — секция [`SmtpConfig`]. Что делать с получателем и письмом,
 //! решает [`Handler`] (локальная доставка — [`crate::deliver`]).
+//!
+//! Роли smtp-in и submission ([`SmtpService`]): слушатели, STARTTLS и неявный TLS ([`serve_conn`]),
+//! `AUTH` только по TLS, лимиты частоты соединений, попыток и отправки.
 
 use std::fmt;
 use std::sync::Arc;
@@ -13,15 +16,24 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
 use tp_contracts::auth::Principal;
-use tp_platform::ConnInfo;
+use tp_contracts::sasl::SaslServer;
+use tp_platform::{ConnInfo, RateLimiter};
 
 use crate::config::SmtpConfig;
 
+mod auth;
+pub mod listen;
 mod session;
-#[cfg(test)]
-mod tests;
+mod tls;
 
+#[cfg(test)]
+pub(crate) mod tests;
+#[cfg(test)]
+mod tls_tests;
+
+pub use listen::{ServerDeps, SmtpService};
 pub use session::{Exit, Session};
+pub use tls::serve_conn;
 
 /// Ответ SMTP: код, расширенный код (RFC 3463) и текст.
 pub type Reply = smtp_proto::Response<String>;
@@ -118,6 +130,10 @@ pub struct SessionCtx {
     pub config: Arc<SmtpConfig>,
     /// Обработчик транзакций.
     pub handler: Arc<dyn Handler>,
+    /// Механизмы SASL (submission).
+    pub sasl: Option<Arc<dyn SaslServer>>,
+    /// Ограничитель частоты узла.
+    pub limiter: Option<Arc<RateLimiter>>,
 }
 
 impl fmt::Debug for SessionCtx {

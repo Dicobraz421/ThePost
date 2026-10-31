@@ -5,6 +5,10 @@
 //!   hostname: mx.example.org
 //!   inbound:
 //!     - listen: "[::]:25"
+//!   submission:
+//!     - listen: "[::]:587"
+//!     - listen: "[::]:465"
+//!       implicit_tls: true
 //!   limits:
 //!     max_message_size: 52428800
 //!     max_recipients: 100
@@ -31,6 +35,8 @@ pub struct SmtpConfig {
     pub hostname: String,
     /// Слушатели роли smtp-in (приём почты, 25 с STARTTLS). Требует перезапуска.
     pub inbound: Vec<EndpointConfig>,
+    /// Слушатели роли submission: 587 (STARTTLS) и 465 (`implicit_tls: true`). Требует перезапуска.
+    pub submission: Vec<EndpointConfig>,
     /// Лимиты сессии.
     pub limits: Limits,
     /// Таймауты сессии.
@@ -42,6 +48,7 @@ impl Default for SmtpConfig {
         Self {
             hostname: "localhost".into(),
             inbound: Vec::new(),
+            submission: Vec::new(),
             limits: Limits::default(),
             timeouts: Timeouts::default(),
         }
@@ -60,6 +67,9 @@ pub struct Limits {
     pub max_errors: u32,
     /// Одновременных соединений на слушатель; сверх лимита — `421` и закрытие.
     pub max_connections: usize,
+    /// Неудачных `AUTH` подряд; затем адрес клиента блокируется (`ratelimit.block_duration`) и соединение
+    /// закрывается.
+    pub max_auth_failures: u32,
 }
 
 impl Default for Limits {
@@ -69,6 +79,7 @@ impl Default for Limits {
             max_recipients: 100,
             max_errors: 10,
             max_connections: 1000,
+            max_auth_failures: 3,
         }
     }
 }
