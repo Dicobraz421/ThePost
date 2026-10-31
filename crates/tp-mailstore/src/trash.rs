@@ -210,176 +210,6 @@ impl Store {
     }
 }
 
-/// Временная корзина для тестов поверх `MemMetadata` (до `MemTrash` из testkit-02).
-#[cfg(test)]
-pub(crate) mod fake {
-    use std::sync::{Arc, Mutex, MutexGuard};
-
-    use async_trait::async_trait;
-    use tp_contracts::Error;
-    use tp_contracts::meta::{MessageStore, SpecialUse};
-    use tp_contracts::retention::{Restored, TrashStore};
-    use tp_contracts::{MailboxId, MessageId};
-    use tp_testkit::MemMetadata;
-
-    use super::*;
-
-    /// Элементы записывает тест ([`TestTrash::record`]) со сроком, действующим в момент записи, — как хранилище
-    /// метаданных при переносе; элемент живёт, пока письмо лежит в корзине.
-    #[derive(Clone)]
-    pub struct TestTrash {
-        meta: MemMetadata,
-        state: Arc<Mutex<State>>,
-    }
-
-    struct State {
-        retention: Duration,
-        items: Vec<TrashItem>,
-    }
-
-    impl TestTrash {
-        pub fn new(meta: MemMetadata) -> Self {
-            Self {
-                meta,
-                state: Arc::new(Mutex::new(State {
-                    retention: Duration::from_secs(30 * 86_400),
-                    items: Vec::new(),
-                })),
-            }
-        }
-
-        fn lock(&self) -> MutexGuard<'_, State> {
-            self.state.lock().expect("lock")
-        }
-
-        /// Срок (политика `trash_retention`) для элементов, записанных после вызова.
-        pub fn set_retention(&self, retention: Duration) {
-            self.lock().retention = retention;
-        }
-
-        /// Элементы писем, перенесённых в корзину из `origin` в момент `deleted_at`.
-        pub async fn record(
-            &self,
-            scope: AccountScope,
-            ids: &[MessageId],
-            origin: MailboxId,
-            deleted_at: OffsetDateTime,
-        ) {
-            for id in ids {
-                let m = MessageStore::get(&self.meta, scope, *id)
-                    .await
-                    .expect("get")
-                    .expect("msg");
-                let mut st = self.lock();
-                let expires_at = deleted_at + st.retention;
-                st.items.push(TrashItem {
-                    scope,
-                    object: TrashObject::Message(*id),
-                    origin,
-                    size: m.size,
-                    received_at: m.received_at,
-                    deleted_at,
-                    expires_at,
-                });
-            }
-        }
-
-        pub fn item(&self, id: MessageId) -> Option<TrashItem> {
-            self.lock()
-                .items
-                .iter()
-                .find(|i| i.object == TrashObject::Message(id))
-                .cloned()
-        }
-
-        /// Убирает элементы писем, которых в корзине больше нет.
-        async fn prune(&self) -> Result<()> {
-            let items = self.lock().items.clone();
-            let mut live = Vec::new();
-            for i in items {
-                let TrashObject::Message(id) = i.object else {
-                    continue;
-                };
-                let trash = self.meta.mailbox_by_role(i.scope, SpecialUse::Trash)?;
-                if MessageStore::get(&self.meta, i.scope, id)
-                    .await?
-                    .is_some_and(|m| m.mailbox == trash)
-                {
-                    live.push(i);
-                }
-            }
-            self.lock().items = live;
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl TrashStore for TestTrash {
-        async fn list(
-            &self,
-            scope: AccountScope,
-            offset: usize,
-            limit: usize,
-        ) -> Result<Vec<TrashItem>> {
-            self.prune().await?;
-            let mut v: Vec<TrashItem> = self
-                .lock()
-                .items
-                .iter()
-                .filter(|i| i.scope == scope)
-                .cloned()
-                .collect();
-            v.sort_by_key(|i| std::cmp::Reverse(i.deleted_at));
-            Ok(v.into_iter().skip(offset).take(limit).collect())
-        }
-
-        async fn restore(&self, scope: AccountScope, object: TrashObject) -> Result<Restored> {
-            let TrashObject::Message(id) = object else {
-                return Err(Error::NotFound);
-            };
-            let inserted = MessageStore::restore(&self.meta, scope, &[id])
-                .await?
-                .pop()
-                .ok_or(Error::NotFound)?;
-            let mailbox = MessageStore::get(&self.meta, scope, id)
-                .await?
-                .ok_or(Error::NotFound)?
-                .mailbox;
-            Ok(Restored::Message { mailbox, inserted })
-        }
-
-        async fn expired(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<TrashItem>> {
-            self.prune().await?;
-            let mut v: Vec<TrashItem> = self
-                .lock()
-                .items
-                .iter()
-                .filter(|i| i.expires_at <= now)
-                .cloned()
-                .collect();
-            v.sort_by_key(|i| i.expires_at);
-            v.truncate(limit);
-            Ok(v)
-        }
-
-        async fn defer(
-            &self,
-            scope: AccountScope,
-            object: TrashObject,
-            until: OffsetDateTime,
-        ) -> Result<()> {
-            let mut st = self.lock();
-            let item = st
-                .items
-                .iter_mut()
-                .find(|i| i.scope == scope && i.object == object)
-                .ok_or(Error::NotFound)?;
-            item.expires_at = until;
-            Ok(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -450,17 +280,21 @@ mod tests {
     }
 
     impl Fixture {
-        /// Удаляет письма в корзину в момент `self.now`.
+        /// Удаляет письма в корзину (срок — от момента удаления, не раньше `self.now`).
         async fn delete(&self, ids: &[MessageId]) {
             self.env
                 .store
                 .delete_to_trash(self.scope, ids)
                 .await
                 .expect("trash");
-            self.env
-                .trash
-                .record(self.scope, ids, self.inbox, self.now)
-                .await;
+        }
+
+        async fn item(&self, id: MessageId) -> Option<TrashItem> {
+            TrashStore::list(&self.env.trash, self.scope, 0, 100)
+                .await
+                .expect("list")
+                .into_iter()
+                .find(|i| i.object == TrashObject::Message(id))
         }
 
         async fn exists(&self, id: MessageId) -> bool {
@@ -578,7 +412,7 @@ mod tests {
             (calls[0].scope, calls[0].mailbox, calls[0].message),
             (f.scope, f.inbox, f.ids[0])
         );
-        let item = f.env.trash.item(f.ids[0]).expect("item");
+        let item = f.item(f.ids[0]).await.expect("item");
         assert_eq!(item.expires_at, at + days(1), "отсрочка по конфигурации");
 
         // До конца отсрочки элемент не запрашивается.
@@ -592,8 +426,13 @@ mod tests {
         let f = fixture(DecisionHooks::default(), 2).await;
         f.delete(&f.ids[..1]).await;
         // Политика изменилась: действует только на удалённое после неё.
-        f.env.trash.set_retention(Duration::from_secs(86_400));
-        f.delete(&f.ids[1..]).await;
+        f.env
+            .meta
+            .clone()
+            .with_trash_retention(Duration::from_secs(86_400))
+            .to_trash(f.scope, &f.ids[1..])
+            .await
+            .expect("trash");
 
         let pass = f
             .env
