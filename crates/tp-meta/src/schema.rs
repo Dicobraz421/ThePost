@@ -29,6 +29,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "retention",
         include_str!("../migrations/0006_retention.sql"),
     ),
+    (7, "acl", include_str!("../migrations/0007_acl.sql")),
 ];
 
 /// Мигратор схемы ядра.
