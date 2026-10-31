@@ -27,11 +27,10 @@ use time::OffsetDateTime;
 use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Error, MailboxId, MessageId, Result, TenantId};
 
+use crate::analyzers::{self, TOKENIZER};
+
 /// Версия схемы индекса (манифест индекса, CONTRACTS.md#Search): индекс со схемой старше перестраивается.
 pub const SCHEMA_VERSION: u32 = 1;
-
-/// Имя анализатора текстовых полей в менеджере токенизаторов индекса.
-pub(crate) const TOKENIZER: &str = "default";
 
 /// Наименьший буфер записи Tantivy на поток, байт.
 const MIN_WRITER_MEMORY: usize = 15 << 20;
@@ -172,6 +171,7 @@ impl MailIndex {
     fn open(dir: MmapDirectory, writer_memory: usize) -> Result<MailIndex> {
         let (schema, fields) = schema();
         let index = Index::open_or_create(dir, schema).map_err(tantivy_err)?;
+        analyzers::register(&index);
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -184,6 +184,11 @@ impl MailIndex {
             writer_memory: writer_memory.max(MIN_WRITER_MEMORY),
             write: Mutex::new(()),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fields(&self) -> &Fields {
+        &self.fields
     }
 
     /// Снимок индекса на момент последнего [`MailIndex::apply`].
@@ -355,8 +360,17 @@ pub(crate) mod tests {
         }
     }
 
+    /// Число писем с термом: для темы — после анализатора, для служебных полей — как есть.
     fn count(index: &MailIndex, field: Field, text: &str) -> usize {
-        let q = TermQuery::new(Term::from_field_text(field, text), IndexRecordOption::Basic);
+        let term = if field == index.fields.subject {
+            analyzers::tokens(text).remove(0)
+        } else {
+            text.to_owned()
+        };
+        let q = TermQuery::new(
+            Term::from_field_text(field, &term),
+            IndexRecordOption::Basic,
+        );
         index.searcher().search(&q, &Count).expect("search")
     }
 
@@ -369,7 +383,13 @@ pub(crate) mod tests {
         let index = m.open_or_create(scope).expect("create");
         let mailbox = MailboxId::new();
         let start = OffsetDateTime::UNIX_EPOCH + time::Duration::days(20_000);
-        let ops: Vec<IndexOp> = SyntheticMail::new(7, LoadModel::default())
+        // Письма короче модели Д.3: тест о числе писем, а не об объёме текста (отладочная сборка).
+        let model = LoadModel {
+            avg_body: 2 << 10,
+            avg_attachment: 4 << 10,
+            ..LoadModel::default()
+        };
+        let ops: Vec<IndexOp> = SyntheticMail::new(7, model)
             .take(1000)
             .enumerate()
             .map(|(i, raw)| {
