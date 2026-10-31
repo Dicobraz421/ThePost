@@ -18,6 +18,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "shard credentials",
         include_str!("../migrations/0003_shard_credentials.sql"),
     ),
+    (
+        4,
+        "blob damaged",
+        include_str!("../migrations/0004_blob_damaged.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
