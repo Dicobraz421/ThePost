@@ -110,6 +110,36 @@ fn section_from_yaml_and_checks() {
     assert!(serde_yaml_ng::from_str::<SecretsConfig>("auth: { ldap: {} }").is_err());
 }
 
+#[test]
+fn url_forms() {
+    for (url, base, tls) in [
+        (
+            "https://openbao.example.ru:8200",
+            "https://openbao.example.ru:8200/",
+            true,
+        ),
+        ("https://vault/", "https://vault/", true),
+        ("http://[::1]:8200", "http://[::1]:8200/", false),
+    ] {
+        let u = parse_url(url).expect(url);
+        assert_eq!((u.as_str(), is_tls(&u)), (base, tls));
+    }
+    for bad in [
+        "openbao:8200",
+        "ftp://x",
+        "https://",
+        "https://h:port",
+        "https://h:70000",
+        "https://u:p@h:8200",
+        "https://h/v1",
+        "https://h?x=1",
+        "https://h#f",
+        "https://[::1",
+    ] {
+        assert!(parse_url(bad).is_err(), "{bad}");
+    }
+}
+
 // ---------- имитация хранилища ----------
 
 #[derive(Default)]
@@ -396,8 +426,10 @@ async fn serve<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         (status, st.chunked, reply)
     };
     let bytes = serde_json::to_vec(&reply).unwrap_or_default();
-    let mut out =
-        format!("HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\n").into_bytes();
+    let mut out = format!(
+        "HTTP/1.1 {status} Mock\r\nConnection: close\r\nContent-Type: application/json\r\n"
+    )
+    .into_bytes();
     if status == 503 {
         out.extend_from_slice(b"Retry-After: 7\r\n");
     }
@@ -967,18 +999,14 @@ async fn openbao_contract_suite() {
         return;
     };
     let root_token = std::env::var("TEST_OPENBAO_TOKEN").expect("TEST_OPENBAO_TOKEN (root token)");
-    let endpoint = Endpoint::parse(&url).expect("TEST_OPENBAO_URL");
-    let profile = if endpoint.tls {
-        Profile::Prod
-    } else {
-        Profile::Dev
-    };
+    let https = is_tls(&parse_url(&url).expect("TEST_OPENBAO_URL"));
+    let profile = if https { Profile::Prod } else { Profile::Dev };
     let dir = TempDir::new("openbao");
     let tls = SecretsTlsConfig {
         ca_file: std::env::var("TEST_OPENBAO_CACERT")
             .map(Into::into)
             .unwrap_or_else(|_| SecretsTlsConfig::default().ca_file),
-        allow_plaintext: !endpoint.tls,
+        allow_plaintext: !https,
     };
     let root_file = dir.0.join("root-token");
     std::fs::write(&root_file, &root_token).expect("root token");

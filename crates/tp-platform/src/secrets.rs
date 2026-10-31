@@ -11,6 +11,8 @@
 //! (`secret_id` из файла, например учётные данные systemd) или готовый токен из файла (Vault Agent, dev).
 //! Токен узла продлевается, когда прошло две трети срока; отказ продления или ответ 403 — новый вход.
 //! Канал — только TLS с CA из `secrets.tls.ca_file`; открытый HTTP — профиль dev и явный `tls.allow_plaintext`.
+//! HTTP — `reqwest` (решение 2026-10-31 «готовое вместо своего»): без прокси и перенаправлений (токен узла не
+//! уходит на другой адрес), таймаут — на весь запрос, размер ответа ограничен `max_response_bytes`.
 //!
 //! ```yaml
 //! secrets:
@@ -31,6 +33,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
+use reqwest::{Client, Method, Url};
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, RootCertStore};
 use schemars::JsonSchema;
@@ -41,8 +45,6 @@ use tp_contracts::config::duration;
 use tp_contracts::secrets::{Secret, SecretLease, SecretRef, SecretStore};
 use tp_contracts::tls::Profile;
 use tp_contracts::{Error, Result};
-
-use crate::http::{Endpoint, HttpClient, HttpError};
 
 /// Секция `secrets`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -242,8 +244,7 @@ impl SecretsConfig {
         let Some(url) = &self.url else {
             return Ok(());
         };
-        let endpoint = Endpoint::parse(url).map_err(|e| Error::invalid(e.to_string()))?;
-        if !endpoint.tls {
+        if !is_tls(&parse_url(url)?) {
             if profile != Profile::Dev {
                 return Err(Error::invalid(
                     "url: the channel to the secret store is TLS only; use https://",
@@ -315,8 +316,12 @@ impl SecretsConfig {
 enum VaultError {
     #[error("{0}")]
     Config(String),
-    #[error("secret store: {0}")]
-    Http(#[from] HttpError),
+    #[error("secret store: {}", chain(.0))]
+    Http(#[from] reqwest::Error),
+    #[error("secret store request: {0}")]
+    Request(&'static str),
+    #[error("secret store response larger than {0} bytes")]
+    TooLarge(usize),
     #[error("secret store answered {status}: {}", .errors.join("; "))]
     Status {
         status: u16,
@@ -342,10 +347,9 @@ impl From<VaultError> for Error {
     fn from(e: VaultError) -> Self {
         match &e {
             VaultError::Config(m) => Error::Invalid(m.clone()),
-            VaultError::Http(HttpError::Url(_) | HttpError::Request(_)) => {
-                Error::Invalid(e.to_string())
-            }
-            VaultError::Http(_) => Error::UNAVAILABLE,
+            VaultError::Http(h) if h.is_builder() => Error::Invalid(e.to_string()),
+            VaultError::Request(_) => Error::Invalid(e.to_string()),
+            VaultError::Http(_) | VaultError::TooLarge(_) => Error::UNAVAILABLE,
             VaultError::Status {
                 status,
                 retry_after,
@@ -429,7 +433,10 @@ struct Issued {
 }
 
 struct Inner {
-    http: HttpClient,
+    http: Client,
+    /// Адрес хранилища (`https://host:port/`).
+    base: Url,
+    max_body: usize,
     namespace: Option<String>,
     auth: Auth,
     dynamic_mounts: Vec<String>,
@@ -446,7 +453,7 @@ pub struct VaultStore {
 impl fmt::Debug for VaultStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VaultStore")
-            .field("endpoint", &self.inner.http.endpoint().to_string())
+            .field("endpoint", &self.inner.base.as_str())
             .field("auth", &self.inner.auth.name())
             .finish_non_exhaustive()
     }
@@ -461,27 +468,33 @@ impl VaultStore {
             .url
             .as_deref()
             .ok_or_else(|| Error::invalid("secrets.url is not set"))?;
-        let endpoint = Endpoint::parse(url).map_err(|e| Error::invalid(e.to_string()))?;
+        let base = parse_url(url)?;
         let auth = Auth::from_config(&cfg.auth)
             .ok_or_else(|| Error::invalid("secrets.auth: no method"))?;
-        let tls = if endpoint.tls {
+        let builder = Client::builder()
+            .timeout(cfg.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .user_agent("thepost");
+        let builder = if is_tls(&base) {
             let cfg = cfg.clone();
             let tls = tokio::task::spawn_blocking(move || client_tls(&cfg))
                 .await
                 .map_err(|_| Error::internal("secrets: tls loader task failed"))??;
-            Some(Arc::new(tls))
+            builder.use_preconfigured_tls(tls).https_only(true)
         } else {
             tracing::warn!(
-                url = %endpoint,
+                url = %base,
                 "secret store channel is NOT encrypted (profile dev, secrets.tls.allow_plaintext)"
             );
-            None
+            builder
         };
-        let http = HttpClient::new(endpoint, tls, cfg.request_timeout, cfg.max_response_bytes)
-            .map_err(VaultError::from)?;
+        let http = builder.build().map_err(VaultError::from)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 http,
+                base,
+                max_body: cfg.max_response_bytes,
                 namespace: cfg.namespace.clone(),
                 auth,
                 dynamic_mounts: cfg.dynamic_mounts.clone(),
@@ -491,7 +504,7 @@ impl VaultStore {
         })
     }
 
-    /// Запрос без повторного входа; `token` — `X-Vault-Token`. Тела запроса и ответа затираются после разбора.
+    /// Запрос без повторного входа; `token` — `X-Vault-Token`. Тело ответа затирается после разбора.
     async fn request(
         &self,
         method: &str,
@@ -499,45 +512,56 @@ impl VaultStore {
         token: Option<&Secret>,
         body: Option<&Value>,
     ) -> std::result::Result<Value, VaultError> {
-        let mut headers = vec![("X-Vault-Request", "true")];
-        if let Some(t) = token {
-            headers.push(("X-Vault-Token", t.expose()));
-        }
-        if let Some(ns) = &self.inner.namespace {
-            headers.push(("X-Vault-Namespace", ns.as_str()));
-        }
-        let mut bytes = match body {
-            Some(b) => {
-                Some(serde_json::to_vec(b).map_err(|_| VaultError::Response("request encoding"))?)
-            }
-            None => None,
-        };
-        let sent = self
+        let method =
+            Method::from_bytes(method.as_bytes()).map_err(|_| VaultError::Request("method"))?;
+        let url = self
+            .inner
+            .base
+            .join(path)
+            .map_err(|_| VaultError::Request("path"))?;
+        let mut req = self
             .inner
             .http
-            .send(method, path, &headers, bytes.as_deref())
-            .await;
-        if let Some(b) = bytes.as_mut() {
-            b.fill(0);
+            .request(method, url)
+            .header(ACCEPT, "application/json")
+            .header("X-Vault-Request", "true");
+        if let Some(t) = token {
+            let mut value =
+                HeaderValue::from_str(t.expose()).map_err(|_| VaultError::Request("token"))?;
+            value.set_sensitive(true);
+            req = req.header("X-Vault-Token", value);
         }
-        let mut resp = sent?;
-        let result = if (200..300).contains(&resp.status) {
-            if resp.body.iter().all(u8::is_ascii_whitespace) {
+        if let Some(ns) = &self.inner.namespace {
+            req = req.header("X-Vault-Namespace", ns.as_str());
+        }
+        if let Some(b) = body {
+            let bytes =
+                serde_json::to_vec(b).map_err(|_| VaultError::Response("request encoding"))?;
+            req = req.header(CONTENT_TYPE, "application/json").body(bytes);
+        }
+        let mut resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let mut raw = read_body(&mut resp, self.inner.max_body).await?;
+        let result = if (200..300).contains(&status) {
+            if raw.iter().all(u8::is_ascii_whitespace) {
                 Ok(Value::Null)
             } else {
-                serde_json::from_slice(&resp.body).map_err(|_| VaultError::Response("invalid JSON"))
+                serde_json::from_slice(&raw).map_err(|_| VaultError::Response("invalid JSON"))
             }
         } else {
             Err(VaultError::Status {
-                status: resp.status,
-                errors: errors_of(&resp.body),
-                retry_after: resp
-                    .header("retry-after")
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .map(Duration::from_secs),
+                status,
+                errors: errors_of(&raw),
+                retry_after,
             })
         };
-        resp.body.fill(0);
+        raw.fill(0);
         result
     }
 
@@ -816,6 +840,64 @@ impl SecretStore for VaultStore {
     }
 }
 
+/// Адрес хранилища `https://host[:port]` (`http://` — открытый канал): без пути, параметров и учётных данных.
+fn parse_url(url: &str) -> Result<Url> {
+    let bad = |m: &str| Error::invalid(format!("url: {m}"));
+    let u = Url::parse(url).map_err(|e| bad(&format!("{e}, expected https://host[:port]")))?;
+    if !matches!(u.scheme(), "https" | "http") {
+        return Err(bad("expected https://host[:port]"));
+    }
+    if u.host_str().is_none_or(str::is_empty) {
+        return Err(bad("host is missing"));
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err(bad("credentials in the address are not allowed"));
+    }
+    if u.path() != "/" {
+        return Err(bad("path is not allowed, expected https://host[:port]"));
+    }
+    if u.query().is_some() || u.fragment().is_some() {
+        return Err(bad("expected https://host[:port]"));
+    }
+    Ok(u)
+}
+
+fn is_tls(url: &Url) -> bool {
+    url.scheme() == "https"
+}
+
+/// Тело ответа не больше `max` байт.
+async fn read_body(
+    resp: &mut reqwest::Response,
+    max: usize,
+) -> std::result::Result<Vec<u8>, VaultError> {
+    let len = resp.content_length().unwrap_or(0);
+    if len > max as u64 {
+        return Err(VaultError::TooLarge(max));
+    }
+    let mut body = Vec::with_capacity(len as usize);
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > max {
+            body.fill(0);
+            return Err(VaultError::TooLarge(max));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Текст ошибки с причинами (у `reqwest` суть — в `source`).
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        text.push_str(": ");
+        text.push_str(&s.to_string());
+        source = s.source();
+    }
+    text
+}
+
 /// Конфигурация rustls клиента: CA из `tls.ca_file`, сертификат узла для входа cert. Блокирующий I/O.
 fn client_tls(cfg: &SecretsConfig) -> Result<ClientConfig> {
     let provider = CryptoProvider::get_default()
@@ -1010,7 +1092,7 @@ pub async fn doctor(cfg: &SecretsConfig, profile: Profile) -> DoctorReport {
             return r;
         }
     };
-    if store.inner.http.endpoint().tls {
+    if is_tls(&store.inner.base) {
         r.push("secrets_config", Pass, url.clone(), "TLS channel");
     } else {
         r.push(
