@@ -7,6 +7,9 @@
 //! Канал до S3 — только `https://` с проверкой сертификата (CONTRACTS.md#Internal TLS): корни — из
 //! `tls.ca_file` или системные. `http://` — только профиль dev с `tls.allow_plaintext`, с предупреждением
 //! в лог при каждом создании клиента; в остальных случаях — ошибка конфигурации.
+//!
+//! Ключи доступа в config.yaml — только ссылки на секреты (`credentials`, CTR-15): значения читает
+//! [`S3Store::connect`] из [`SecretStore`]; ключ открытым текстом — ошибка разбора.
 
 use std::fmt;
 use std::ops::Range;
@@ -25,16 +28,40 @@ use object_store::{
     PutPayload, RetryConfig, WriteMultipart,
 };
 use schemars::JsonSchema;
+use serde::Deserialize;
 use time::OffsetDateTime;
 use tp_contracts::blob::{BlobStore, ByteStream, ObjectEntry, ObjectStream};
+use tp_contracts::config::duration;
+use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{BlobKey, Error, Result};
 
-use crate::check_raw_path;
+use crate::{check_raw_path, config};
 
-/// Конфигурация S3-хранилища. Ключи доступа, не заданные здесь, берутся из окружения
-/// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, роль экземпляра).
-#[derive(Clone, PartialEq, Eq, JsonSchema)]
+/// Ключи доступа S3 — ссылки на поля секрета в хранилище: задаются только вместе.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct S3Credentials {
+    /// Идентификатор ключа доступа: `{ secret: "thepost/s3#access_key_id" }`.
+    pub access_key_id: SecretRef,
+    /// Секрет ключа доступа: `{ secret: "thepost/s3#secret_access_key" }`.
+    pub secret_access_key: SecretRef,
+}
+
+/// Конфигурация S3-хранилища (секция config.yaml; поля необязательны, неизвестное — ошибка).
+/// Без `credentials` ключи доступа берутся из окружения (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+/// роль экземпляра).
+///
+/// ```yaml
+/// endpoint: https://seaweedfs:8333
+/// bucket: thepost-blob
+/// credentials:
+///   access_key_id: { secret: "thepost/s3#access_key_id" }
+///   secret_access_key: { secret: "thepost/s3#secret_access_key" }
+/// request_timeout: 30s
+/// ```
+#[derive(Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct S3Config {
     /// Адрес S3 API (`https://seaweedfs:8333`); `None` — AWS по региону (https).
     pub endpoint: Option<String>,
@@ -44,9 +71,16 @@ pub struct S3Config {
     pub region: String,
     /// Префикс ключей внутри бакета; пустой — без префикса.
     pub prefix: String,
-    /// Идентификатор ключа доступа.
+    /// Ключи доступа — ссылки на секреты; читаются [`S3Store::connect`].
+    pub credentials: Option<S3Credentials>,
+    /// Значение идентификатора ключа, уже прочитанное вызывающим (не из config.yaml); для [`S3Store::new`].
+    /// Остаётся, пока приложение читает секреты само (до APP-07).
+    #[serde(skip)]
+    #[schemars(skip)]
     pub access_key_id: Option<String>,
-    /// Секрет ключа доступа.
+    /// Значение секрета ключа, уже прочитанное вызывающим (не из config.yaml); для [`S3Store::new`].
+    #[serde(skip)]
+    #[schemars(skip)]
     pub secret_access_key: Option<String>,
     /// Адресация path-style (`endpoint/bucket/key`) — нужна SeaweedFS и MinIO.
     pub path_style: bool,
@@ -61,15 +95,25 @@ pub struct S3Config {
     pub multipart_concurrency: usize,
     /// Повторов запроса при временных сбоях; 0 — без повторов.
     pub max_retries: usize,
-    /// Начальная пауза backoff, мс.
+    /// Начальная пауза backoff, мс. В config.yaml — `retry_init_backoff: 100ms`.
+    #[serde(rename = "retry_init_backoff", deserialize_with = "config::millis")]
+    #[schemars(with = "duration::HumanDuration")]
     pub retry_init_backoff_ms: u64,
-    /// Максимальная пауза backoff, мс.
+    /// Максимальная пауза backoff, мс. В config.yaml — `retry_max_backoff: 15s`.
+    #[serde(rename = "retry_max_backoff", deserialize_with = "config::millis")]
+    #[schemars(with = "duration::HumanDuration")]
     pub retry_max_backoff_ms: u64,
-    /// Предел времени повторов запроса от первой попытки, мс.
+    /// Предел времени повторов запроса от первой попытки, мс. В config.yaml — `retry_timeout: 3m`.
+    #[serde(rename = "retry_timeout", deserialize_with = "config::millis")]
+    #[schemars(with = "duration::HumanDuration")]
     pub retry_timeout_ms: u64,
-    /// Таймаут запроса, мс.
+    /// Таймаут запроса, мс. В config.yaml — `request_timeout: 30s`.
+    #[serde(rename = "request_timeout", deserialize_with = "config::millis")]
+    #[schemars(with = "duration::HumanDuration")]
     pub request_timeout_ms: u64,
-    /// Таймаут установления соединения, мс.
+    /// Таймаут установления соединения, мс. В config.yaml — `connect_timeout: 5s`.
+    #[serde(rename = "connect_timeout", deserialize_with = "config::millis")]
+    #[schemars(with = "duration::HumanDuration")]
     pub connect_timeout_ms: u64,
 }
 
@@ -80,6 +124,7 @@ impl Default for S3Config {
             bucket: "thepost-blob".into(),
             region: "us-east-1".into(),
             prefix: String::new(),
+            credentials: None,
             access_key_id: None,
             secret_access_key: None,
             path_style: true,
@@ -105,6 +150,7 @@ impl fmt::Debug for S3Config {
             .field("bucket", &self.bucket)
             .field("region", &self.region)
             .field("prefix", &self.prefix)
+            .field("credentials", &self.credentials)
             .field("access_key_id", &self.access_key_id)
             .field(
                 "secret_access_key",
@@ -167,6 +213,22 @@ fn url_host(url: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
+/// Значение поля `credentials.<field>` из хранилища; в журнал и ошибку — ссылка, не значение.
+async fn fetch(secrets: &dyn SecretStore, field: &str, secret: &SecretRef) -> Result<Secret> {
+    secrets.get(secret).await.map_err(|e| {
+        tracing::warn!(field, %secret, error = %e, "S3: секрет ключа доступа недоступен");
+        match e {
+            Error::NotFound => Error::invalid(format!(
+                "S3: credentials.{field}: secret {secret} not found"
+            )),
+            Error::Forbidden => Error::invalid(format!(
+                "S3: credentials.{field}: access to secret {secret} denied"
+            )),
+            other => other,
+        }
+    })
+}
+
 /// Корневые сертификаты из `tls.ca_file` (PEM). Блокирующий I/O: вызывается при создании клиента.
 fn read_ca(path: &FsPath) -> Result<Vec<Certificate>> {
     let bad =
@@ -188,9 +250,40 @@ pub struct S3Store {
 }
 
 impl S3Store {
-    /// Клиент S3 по конфигурации; `profile` — профиль узла (`profile` config.yaml). Адрес и секция
-    /// TLS проверяются [`S3Config::check`], `tls.ca_file` читается сразу; сеть не используется.
+    /// Клиент S3 по конфигурации; ключи `credentials` читаются из хранилища секретов `secrets`.
+    /// `profile` — профиль узла (`profile` config.yaml). Адрес и секция TLS проверяются [`S3Config::check`],
+    /// `tls.ca_file` читается сразу (в `spawn_blocking`); сеть до S3 не используется.
+    /// Нет секрета или доступа к нему — `Invalid` с именем поля; хранилище недоступно — его ошибка.
+    pub async fn connect(
+        cfg: S3Config,
+        profile: Profile,
+        secrets: &dyn SecretStore,
+    ) -> Result<Self> {
+        let keys = match &cfg.credentials {
+            Some(c) => Some((
+                fetch(secrets, "access_key_id", &c.access_key_id).await?,
+                fetch(secrets, "secret_access_key", &c.secret_access_key).await?,
+            )),
+            None => None,
+        };
+        tokio::task::spawn_blocking(move || Self::build(cfg, profile, keys))
+            .await
+            .map_err(|e| Error::Internal(format!("s3 client: {e}")))?
+    }
+
+    /// Клиент S3 с ключами, уже прочитанными вызывающим (`access_key_id`/`secret_access_key`), или из
+    /// окружения. Блокирующий: читает `tls.ca_file`. Конфигурация с `credentials` — `Invalid`
+    /// (нужен [`S3Store::connect`]).
     pub fn new(cfg: S3Config, profile: Profile) -> Result<Self> {
+        if cfg.credentials.is_some() {
+            return Err(Error::invalid(
+                "S3: credentials are read from the secret store; use S3Store::connect",
+            ));
+        }
+        Self::build(cfg, profile, None)
+    }
+
+    fn build(cfg: S3Config, profile: Profile, keys: Option<(Secret, Secret)>) -> Result<Self> {
         let ms = Duration::from_millis;
         let transport = cfg.check(profile)?;
         let allow_http = transport == Transport::Plaintext;
@@ -230,11 +323,17 @@ impl S3Store {
         if let Some(endpoint) = &cfg.endpoint {
             builder = builder.with_endpoint(endpoint);
         }
-        if let Some(id) = &cfg.access_key_id {
-            builder = builder.with_access_key_id(id);
-        }
-        if let Some(secret) = &cfg.secret_access_key {
-            builder = builder.with_secret_access_key(secret);
+        if let Some((id, secret)) = &keys {
+            builder = builder
+                .with_access_key_id(id.expose())
+                .with_secret_access_key(secret.expose());
+        } else {
+            if let Some(id) = &cfg.access_key_id {
+                builder = builder.with_access_key_id(id);
+            }
+            if let Some(secret) = &cfg.secret_access_key {
+                builder = builder.with_secret_access_key(secret);
+            }
         }
         let s3 = builder
             .build()
@@ -778,6 +877,42 @@ mod tests {
             ..S3Config::default()
         };
         assert!(!format!("{cfg:?}").contains("top-secret"));
+    }
+
+    fn with_credentials() -> S3Config {
+        S3Config {
+            credentials: Some(S3Credentials {
+                access_key_id: "thepost/s3#access_key_id".parse().expect("ссылка"),
+                secret_access_key: "thepost/s3#secret_access_key".parse().expect("ссылка"),
+            }),
+            ..S3Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn keys_from_secret_store() {
+        let mem = tp_testkit::MemSecretStore::default();
+        let cfg = with_credentials();
+        let creds = cfg.credentials.clone().expect("ключи");
+        mem.set(&creds.access_key_id, "AKIA0TEST");
+
+        // Нет второго поля — ошибка с именем поля и ссылкой, без значений.
+        let e = invalid(S3Store::connect(cfg.clone(), Profile::Prod, &mem).await);
+        assert!(e.contains("credentials.secret_access_key"), "{e}");
+        assert!(e.contains("thepost/s3#secret_access_key"), "{e}");
+        assert!(!e.contains("AKIA0TEST"), "{e}");
+
+        mem.set(&creds.secret_access_key, "s3cr3t-value");
+        S3Store::connect(cfg.clone(), Profile::Prod, &mem)
+            .await
+            .expect("клиент с ключами из хранилища");
+
+        // Синхронный конструктор хранилища секретов не видит — ссылки не игнорируются молча.
+        assert!(invalid(S3Store::new(cfg, Profile::Prod)).contains("S3Store::connect"));
+        // Без ссылок connect не обращается к хранилищу.
+        S3Store::connect(S3Config::default(), Profile::Prod, &mem)
+            .await
+            .expect("клиент без ключей");
     }
 
     /// Интеграционный: SeaweedFS из compose (`TEST_S3_URL`, ключи — в окружении, `deploy/README.md`);

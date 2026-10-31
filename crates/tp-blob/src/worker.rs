@@ -18,11 +18,11 @@ pub fn system_now() -> Now {
     Arc::new(OffsetDateTime::now_utc)
 }
 
-/// `t - secs` с насыщением.
-pub(crate) fn before(t: OffsetDateTime, secs: u64) -> OffsetDateTime {
-    i64::try_from(secs)
+/// `t - d` с насыщением.
+pub(crate) fn before(t: OffsetDateTime, d: Duration) -> OffsetDateTime {
+    time::Duration::try_from(d)
         .ok()
-        .and_then(|s| t.checked_sub(time::Duration::seconds(s)))
+        .and_then(|d| t.checked_sub(d))
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
@@ -99,13 +99,19 @@ pub(crate) struct Schedule<'a> {
     pub what: &'static str,
 }
 
+/// Проход фоновой работы под лизой. Футура — `Send`: `run` воркеров запускается через `tokio::spawn`
+/// (async-замыкание здесь не годится — `Send` его футуры компилятор не выводит).
+pub(crate) trait LeasedPass: Sync {
+    fn leased_pass(&self, leader: &mut Leader<'_>) -> impl Future<Output = Result<()>> + Send;
+}
+
 /// Каждые `interval` захватывает (или продлевает) лизу `name` и выполняет проход `pass`;
 /// узел без лизы пропускает проход. Завершается по `shutdown` и освобождает лизу.
 /// Прерывание прохода на точке ожидания безопасно: каждый шаг протокола идемпотентен.
 pub(crate) async fn run_leased(
     s: Schedule<'_>,
     shutdown: impl Future<Output = ()>,
-    mut pass: impl AsyncFnMut(&mut Leader<'_>) -> Result<()>,
+    pass: &impl LeasedPass,
 ) {
     tokio::pin!(shutdown);
     let mut held: Option<Lease> = None;
@@ -113,7 +119,7 @@ pub(crate) async fn run_leased(
         tokio::select! {
             biased;
             () = &mut shutdown => break,
-            () = tick(s, &mut held, &mut pass) => {}
+            () = tick(s, &mut held, pass) => {}
         }
         tokio::select! {
             biased;
@@ -128,11 +134,7 @@ pub(crate) async fn run_leased(
     }
 }
 
-async fn tick(
-    s: Schedule<'_>,
-    held: &mut Option<Lease>,
-    pass: &mut impl AsyncFnMut(&mut Leader<'_>) -> Result<()>,
-) {
+async fn tick(s: Schedule<'_>, held: &mut Option<Lease>, pass: &impl LeasedPass) {
     let lease = match held.take() {
         Some(lease) => s.leases.renew(&lease, s.ttl).await,
         None => s.leases.try_acquire(s.name, s.holder, s.ttl).await,
@@ -151,7 +153,7 @@ async fn tick(
         ttl: s.ttl,
         lost: false,
     };
-    if let Err(e) = pass(&mut leader).await {
+    if let Err(e) = pass.leased_pass(&mut leader).await {
         tracing::warn!(what = s.what, error = %e, "проход прерван ошибкой");
     }
     if leader.lost {
@@ -169,10 +171,10 @@ mod tests {
     fn before_saturates() {
         let t = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10);
         assert_eq!(
-            before(t, 4),
+            before(t, Duration::from_secs(4)),
             OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(6)
         );
-        assert_eq!(before(t, u64::MAX), OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(before(t, Duration::MAX), OffsetDateTime::UNIX_EPOCH);
     }
 
     #[tokio::test]

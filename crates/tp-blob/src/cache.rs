@@ -20,6 +20,7 @@ use moka::future::Cache;
 use moka::notification::RemovalCause;
 use moka::policy::EvictionPolicy;
 use schemars::JsonSchema;
+use serde::Deserialize;
 use time::OffsetDateTime;
 use tp_contracts::blob::{BlobStore, ByteStream, ObjectStream};
 use tp_contracts::{BlobKey, Error, Result};
@@ -32,8 +33,9 @@ const OBJECTS_DIR: &str = "objects";
 /// Подкаталог сегментов `*_raw` внутри каталога объектов.
 const RAW_DIR: &str = "raw";
 
-/// Конфигурация кэша объектов.
-#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+/// Конфигурация кэша объектов (секция config.yaml; поля необязательны, неизвестное — ошибка).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     /// Каталог кэша на локальном NVMe.
     pub dir: PathBuf,

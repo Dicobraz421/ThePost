@@ -280,7 +280,7 @@ impl World {
             index,
             store,
             GcConfig {
-                window_secs: W_SECS,
+                window: Duration::from_secs(W_SECS),
                 batch: 2,
                 max_deletes_per_sec: 0,
                 ..GcConfig::default()
@@ -300,7 +300,7 @@ impl World {
             index,
             store,
             OrphanConfig {
-                grace_secs: GRACE_SECS,
+                grace: Duration::from_secs(GRACE_SECS),
                 max_checks_per_sec: 0,
                 max_deletes_per_sec: 0,
                 ..OrphanConfig::default()
