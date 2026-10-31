@@ -5,6 +5,7 @@ use std::ops::Range;
 use tp_contracts::{Error, Result};
 
 pub mod cache;
+mod config;
 pub mod gc;
 pub mod local;
 pub mod orphans;
@@ -17,7 +18,7 @@ pub use cache::{BlobCache, CacheConfig};
 pub use gc::{GcConfig, GcMetrics, GcPass, GcWorker};
 pub use local::{LocalConfig, LocalStore};
 pub use orphans::{OrphanConfig, OrphanMetrics, OrphanPass, OrphanSweeper};
-pub use s3::{S3Config, S3Store};
+pub use s3::{S3Config, S3Credentials, S3Store};
 pub use verify::{BlobInventory, IndexedBlob, Verifier, VerifyConfig, VerifyReport};
 pub use worker::{Now, system_now};
 pub use writer::{BlobHasher, BlobWriter, WriterConfig, WriterMetrics};

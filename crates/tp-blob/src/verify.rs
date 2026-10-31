@@ -11,6 +11,7 @@
 //! на другом узле: второй устаревший листинг может задеть объект, загруженный после удаления первым.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -178,7 +179,7 @@ impl Verifier {
         };
         let mut pacer = Pacer::new(self.cfg.max_ops_per_sec);
         self.orphans(
-            before(started, self.cfg.grace_secs),
+            before(started, Duration::from_secs(self.cfg.grace_secs)),
             fix,
             &mut pacer,
             &mut report,

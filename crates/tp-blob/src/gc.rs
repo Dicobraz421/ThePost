@@ -12,39 +12,57 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use schemars::JsonSchema;
+use serde::Deserialize;
 use tp_contracts::Result;
 use tp_contracts::blob::{BlobIndex, BlobStore};
+use tp_contracts::config::duration;
 use tp_contracts::lease::LeaseStore;
 
-use crate::worker::{Leader, Now, Pacer, Schedule, before, keep, run_leased};
+use crate::worker::{Leader, LeasedPass, Now, Pacer, Schedule, before, keep, run_leased};
 
-/// Конфигурация GC.
-#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+/// Конфигурация GC (секция config.yaml; поля необязательны, неизвестное — ошибка).
+///
+/// ```yaml
+/// window: 7d
+/// batch: 1000
+/// max_deletes_per_sec: 200
+/// interval: 5m
+/// lease_name: blob-gc
+/// lease_ttl: 2m
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct GcConfig {
-    /// Окно W: объект удаляется не раньше, чем через столько секунд после обнуления ссылок.
+    /// Окно W: объект удаляется не раньше, чем через это время после обнуления ссылок.
     /// Не меньше глубины самой старой точки восстановления (PITR, DR-реплика, снапшоты).
-    pub window_secs: u64,
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub window: Duration,
     /// Размер пакета кандидатов.
     pub batch: usize,
     /// Предел удалений в секунду; 0 — без ограничения.
     pub max_deletes_per_sec: u32,
-    /// Пауза между проходами, с.
-    pub interval_secs: u64,
+    /// Пауза между проходами.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub interval: Duration,
     /// Имя лизы лидера GC.
     pub lease_name: String,
-    /// Срок лизы, с; продлевается между пакетами.
-    pub lease_ttl_secs: u64,
+    /// Срок лизы; продлевается между пакетами.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub lease_ttl: Duration,
 }
 
 impl Default for GcConfig {
     fn default() -> Self {
         Self {
-            window_secs: 7 * 24 * 3600,
+            window: Duration::from_secs(7 * 24 * 3600),
             batch: 1000,
             max_deletes_per_sec: 200,
-            interval_secs: 300,
+            interval: Duration::from_secs(300),
             lease_name: "blob-gc".to_owned(),
-            lease_ttl_secs: 120,
+            lease_ttl: Duration::from_secs(120),
         }
     }
 }
@@ -155,6 +173,7 @@ impl GcWorker {
     }
 
     /// Периодические проходы под лизой лидера до `shutdown`; `holder` — идентификатор узла.
+    /// Футура — `Send` (при `Send`-футуре `shutdown`): запускается через `tokio::spawn`.
     pub async fn run(
         &self,
         leases: &dyn LeaseStore,
@@ -165,14 +184,11 @@ impl GcWorker {
             leases,
             name: &self.cfg.lease_name,
             holder,
-            ttl: Duration::from_secs(self.cfg.lease_ttl_secs),
-            interval: Duration::from_secs(self.cfg.interval_secs),
+            ttl: self.cfg.lease_ttl,
+            interval: self.cfg.interval,
             what: "blob-gc",
         };
-        run_leased(s, shutdown, async |leader: &mut Leader<'_>| {
-            self.pass(Some(leader)).await.map(drop)
-        })
-        .await;
+        run_leased(s, shutdown, self).await;
     }
 
     async fn pass(&self, mut leader: Option<&mut Leader<'_>>) -> Result<GcPass> {
@@ -201,7 +217,7 @@ impl GcWorker {
 
     async fn pass_inner(&self, leader: &mut Option<&mut Leader<'_>>) -> Result<GcPass> {
         // Граница окна фиксируется на проход: кандидаты и `mark_deleting` проверяют одно условие.
-        let older_than = before((self.now)(), self.cfg.window_secs);
+        let older_than = before((self.now)(), self.cfg.window);
         let batch = self.cfg.batch.max(1);
         let mut pacer = Pacer::new(self.cfg.max_deletes_per_sec);
         let mut pass = GcPass::default();
@@ -243,6 +259,12 @@ impl GcWorker {
     }
 }
 
+impl LeasedPass for GcWorker {
+    async fn leased_pass(&self, leader: &mut Leader<'_>) -> Result<()> {
+        self.pass(Some(leader)).await.map(drop)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,7 +285,7 @@ mod tests {
         index: MemBlobIndex,
         store: MemBlobStore,
         writer: BlobWriter,
-        gc: GcWorker,
+        gc: Arc<GcWorker>,
     }
 
     fn env(cfg: GcConfig) -> Env {
@@ -276,16 +298,16 @@ mod tests {
             WriterConfig::default(),
         );
         let c = clock.clone();
-        let gc = GcWorker::new(
+        let gc = Arc::new(GcWorker::new(
             Arc::new(index.clone()),
             Arc::new(store.clone()),
             GcConfig {
-                window_secs: W,
+                window: Duration::from_secs(W),
                 max_deletes_per_sec: 0,
                 ..cfg
             },
             Arc::new(move || c.now()),
-        );
+        ));
         Env {
             clock,
             index,
@@ -429,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn run_under_lease() {
         let e = env(GcConfig {
-            interval_secs: 3600,
+            interval: Duration::from_secs(3600),
             ..GcConfig::default()
         });
         let key = put(&e, "leader", 1).await;
@@ -474,6 +496,38 @@ mod tests {
             tx.send(()).ok();
         };
         tokio::join!(run, check);
+        assert!(!e.store.contains(&key));
+        assert_eq!(leases.holder("blob-gc"), None);
+    }
+
+    /// Фоновая работа: `run` — `Send`-футура, задача tokio выполняет проход под лизой и останавливается.
+    #[tokio::test]
+    async fn run_in_spawned_task() {
+        let e = env(GcConfig::default());
+        let key = put(&e, "spawned", 1).await;
+        e.index
+            .release(T, &key.hash, key.generation, 1)
+            .await
+            .expect("вызов");
+        e.clock.advance(Duration::from_secs(W + 1));
+
+        let leases = Arc::new(MemLease::new(e.clock.shared()));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (gc, l) = (e.gc.clone(), leases.clone());
+        let task = tokio::spawn(async move {
+            gc.run(&*l, "node-a", async {
+                rx.await.ok();
+            })
+            .await;
+        });
+        for _ in 0..100 {
+            if !e.store.contains(&key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(()).ok();
+        task.await.expect("задача");
         assert!(!e.store.contains(&key));
         assert_eq!(leases.holder("blob-gc"), None);
     }

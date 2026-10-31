@@ -16,19 +16,29 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt, stream};
 use schemars::JsonSchema;
+use serde::Deserialize;
 use time::OffsetDateTime;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tp_contracts::blob::{BlobStore, ByteStream, ObjectEntry, ObjectStream};
+use tp_contracts::config::duration;
 use tp_contracts::{BlobKey, Error, Result};
 
-use crate::{check_raw_path, clamp_range};
+use crate::{check_raw_path, clamp_range, config};
 
 /// Каталог временных файлов внутри корня; в листинг не попадает.
 const TMP_DIR: &str = ".tmp";
 
-/// Конфигурация локального хранилища.
-#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+/// Конфигурация локального хранилища (секция config.yaml; поля необязательны, неизвестное — ошибка).
+///
+/// ```yaml
+/// root: /var/lib/thepost/blob
+/// fsync: true
+/// read_chunk_bytes: 262144
+/// stale_tmp: 24h
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct LocalConfig {
     /// Корневой каталог объектов.
     pub root: PathBuf,
@@ -37,7 +47,10 @@ pub struct LocalConfig {
     /// Размер блока потокового чтения, байт.
     pub read_chunk_bytes: usize,
     /// Возраст временного файла, после которого он считается брошенным и удаляется
-    /// при открытии хранилища, с. Больше максимальной длительности записи объекта.
+    /// при открытии хранилища. Больше максимальной длительности записи объекта.
+    /// В config.yaml — `stale_tmp: 24h` (целые секунды).
+    #[serde(rename = "stale_tmp", deserialize_with = "config::secs")]
+    #[schemars(with = "duration::HumanDuration")]
     pub stale_tmp_secs: u64,
 }
 

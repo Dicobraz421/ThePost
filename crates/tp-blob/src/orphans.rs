@@ -16,17 +16,33 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use schemars::JsonSchema;
+use serde::Deserialize;
 use tp_contracts::blob::{BlobIndex, BlobStore, ObjectEntry};
+use tp_contracts::config::duration;
 use tp_contracts::lease::LeaseStore;
 use tp_contracts::{BlobKey, Result};
 
-use crate::worker::{Leader, Now, Pacer, Schedule, before, keep, run_leased};
+use crate::worker::{Leader, LeasedPass, Now, Pacer, Schedule, before, keep, run_leased};
 
-/// Конфигурация поиска «сирот».
-#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+/// Конфигурация поиска «сирот» (секция config.yaml; поля необязательны, неизвестное — ошибка).
+///
+/// ```yaml
+/// grace: 24h
+/// prefix: ""
+/// max_checks_per_sec: 500
+/// max_deletes_per_sec: 50
+/// renew_every: 1000
+/// interval: 6h
+/// lease_name: blob-orphans
+/// lease_ttl: 2m
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct OrphanConfig {
-    /// Период ожидания, с: объекты моложе не проверяются. Больше максимальной длительности загрузки.
-    pub grace_secs: u64,
+    /// Период ожидания: объекты моложе не проверяются. Больше максимальной длительности загрузки.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub grace: Duration,
     /// Префикс путей листинга (`""` — всё хранилище, `"{tenant}/"` — одна организация).
     pub prefix: String,
     /// Предел проверок записей учёта в секунду; 0 — без ограничения.
@@ -35,25 +51,29 @@ pub struct OrphanConfig {
     pub max_deletes_per_sec: u32,
     /// Число проверенных объектов между продлениями лизы.
     pub renew_every: u64,
-    /// Пауза между проходами, с.
-    pub interval_secs: u64,
+    /// Пауза между проходами.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub interval: Duration,
     /// Имя лизы.
     pub lease_name: String,
-    /// Срок лизы, с.
-    pub lease_ttl_secs: u64,
+    /// Срок лизы.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub lease_ttl: Duration,
 }
 
 impl Default for OrphanConfig {
     fn default() -> Self {
         Self {
-            grace_secs: 24 * 3600,
+            grace: Duration::from_secs(24 * 3600),
             prefix: String::new(),
             max_checks_per_sec: 500,
             max_deletes_per_sec: 50,
             renew_every: 1000,
-            interval_secs: 6 * 3600,
+            interval: Duration::from_secs(6 * 3600),
             lease_name: "blob-orphans".to_owned(),
-            lease_ttl_secs: 120,
+            lease_ttl: Duration::from_secs(120),
         }
     }
 }
@@ -160,6 +180,7 @@ impl OrphanSweeper {
     }
 
     /// Периодические проходы под лизой до `shutdown`; `holder` — идентификатор узла.
+    /// Футура — `Send` (при `Send`-футуре `shutdown`): запускается через `tokio::spawn`.
     pub async fn run(
         &self,
         leases: &dyn LeaseStore,
@@ -170,14 +191,11 @@ impl OrphanSweeper {
             leases,
             name: &self.cfg.lease_name,
             holder,
-            ttl: Duration::from_secs(self.cfg.lease_ttl_secs),
-            interval: Duration::from_secs(self.cfg.interval_secs),
+            ttl: self.cfg.lease_ttl,
+            interval: self.cfg.interval,
             what: "blob-orphans",
         };
-        run_leased(s, shutdown, async |leader: &mut Leader<'_>| {
-            self.pass(Some(leader)).await.map(drop)
-        })
-        .await;
+        run_leased(s, shutdown, self).await;
     }
 
     async fn pass(&self, mut leader: Option<&mut Leader<'_>>) -> Result<OrphanPass> {
@@ -201,7 +219,7 @@ impl OrphanSweeper {
     }
 
     async fn pass_inner(&self, leader: &mut Option<&mut Leader<'_>>) -> Result<OrphanPass> {
-        let older_than = before((self.now)(), self.cfg.grace_secs);
+        let older_than = before((self.now)(), self.cfg.grace);
         let mut checks = Pacer::new(self.cfg.max_checks_per_sec);
         let mut deletes = Pacer::new(self.cfg.max_deletes_per_sec);
         let renew_every = self.cfg.renew_every.max(1);
@@ -234,6 +252,12 @@ impl OrphanSweeper {
     }
 }
 
+impl LeasedPass for OrphanSweeper {
+    async fn leased_pass(&self, leader: &mut Leader<'_>) -> Result<()> {
+        self.pass(Some(leader)).await.map(drop)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,7 +266,7 @@ mod tests {
     use tp_contracts::blob::Acquire;
     use tp_contracts::{BlobHash, Error, Gen, TenantId};
     use tp_testkit::blob::{BlobOp, MemBlobIndex, MemBlobStore};
-    use tp_testkit::{Clock, ManualClock};
+    use tp_testkit::{Clock, ManualClock, MemLease};
 
     use crate::writer::{BlobHasher, BlobWriter, WriterConfig};
 
@@ -254,7 +278,7 @@ mod tests {
         index: MemBlobIndex,
         store: MemBlobStore,
         writer: BlobWriter,
-        sweeper: OrphanSweeper,
+        sweeper: Arc<OrphanSweeper>,
     }
 
     fn env() -> Env {
@@ -267,17 +291,17 @@ mod tests {
             WriterConfig::default(),
         );
         let c = clock.clone();
-        let sweeper = OrphanSweeper::new(
+        let sweeper = Arc::new(OrphanSweeper::new(
             Arc::new(index.clone()),
             Arc::new(store.clone()),
             OrphanConfig {
-                grace_secs: GRACE,
+                grace: Duration::from_secs(GRACE),
                 max_checks_per_sec: 0,
                 max_deletes_per_sec: 0,
                 ..OrphanConfig::default()
             },
             Arc::new(move || c.now()),
-        );
+        ));
         Env {
             clock,
             index,
@@ -380,5 +404,34 @@ mod tests {
         e.store.fail_next(BlobOp::List, Error::UNAVAILABLE);
         assert_eq!(e.sweeper.run_once().await, Err(Error::UNAVAILABLE));
         assert_eq!(e.sweeper.metrics().errors, 1);
+    }
+
+    /// Фоновая работа: `run` — `Send`-футура, задача tokio выполняет проход под лизой и останавливается.
+    #[tokio::test]
+    async fn run_in_spawned_task() {
+        let e = env();
+        let orphan = interrupted(&e, b"spawned").await;
+        e.clock.advance(Duration::from_secs(GRACE + 1));
+
+        let leases = Arc::new(MemLease::new(e.clock.shared()));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (sweeper, l) = (e.sweeper.clone(), leases.clone());
+        let task = tokio::spawn(async move {
+            sweeper
+                .run(&*l, "node-a", async {
+                    rx.await.ok();
+                })
+                .await;
+        });
+        for _ in 0..100 {
+            if !e.store.contains(&orphan) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(()).ok();
+        task.await.expect("задача");
+        assert!(!e.store.contains(&orphan));
+        assert_eq!(leases.holder("blob-orphans"), None);
     }
 }
