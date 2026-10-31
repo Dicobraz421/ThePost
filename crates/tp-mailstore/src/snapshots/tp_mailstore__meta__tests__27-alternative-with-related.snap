@@ -1,0 +1,200 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      25,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Alternative + related",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-025@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "multipart",
+    "subtype": "mixed",
+    "params": [
+      [
+        "boundary",
+        "mix-7"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 1821,
+    "lines": null,
+    "children": [
+      {
+        "part": "1",
+        "media_type": "multipart",
+        "subtype": "alternative",
+        "params": [
+          [
+            "boundary",
+            "alt-3"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": null,
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 740,
+        "lines": null,
+        "children": [
+          {
+            "part": "1.1",
+            "media_type": "text",
+            "subtype": "plain",
+            "params": [
+              [
+                "charset",
+                "utf-8"
+              ]
+            ],
+            "content_id": null,
+            "description": null,
+            "encoding": "8bit",
+            "disposition": null,
+            "language": [],
+            "location": null,
+            "size": 100,
+            "lines": 0,
+            "children": []
+          },
+          {
+            "part": "1.2",
+            "media_type": "multipart",
+            "subtype": "related",
+            "params": [
+              [
+                "boundary",
+                "rel-2"
+              ]
+            ],
+            "content_id": null,
+            "description": null,
+            "encoding": null,
+            "disposition": null,
+            "language": [],
+            "location": null,
+            "size": 430,
+            "lines": null,
+            "children": [
+              {
+                "part": "1.2.1",
+                "media_type": "text",
+                "subtype": "html",
+                "params": [
+                  [
+                    "charset",
+                    "utf-8"
+                  ]
+                ],
+                "content_id": null,
+                "description": null,
+                "encoding": "8bit",
+                "disposition": null,
+                "language": [],
+                "location": null,
+                "size": 27,
+                "lines": 0,
+                "children": []
+              },
+              {
+                "part": "1.2.2",
+                "media_type": "image",
+                "subtype": "png",
+                "params": [
+                  [
+                    "name",
+                    "img1.png"
+                  ]
+                ],
+                "content_id": "<img1>",
+                "description": null,
+                "encoding": "base64",
+                "disposition": [
+                  "inline",
+                  [
+                    [
+                      "filename",
+                      "img1.png"
+                    ]
+                  ]
+                ],
+                "language": [],
+                "location": null,
+                "size": 98,
+                "lines": null,
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "part": "2",
+        "media_type": "application",
+        "subtype": "pdf",
+        "params": [
+          [
+            "name",
+            "doc.pdf"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "base64",
+        "disposition": [
+          "attachment",
+          [
+            [
+              "filename",
+              "doc.pdf"
+            ]
+          ]
+        ],
+        "language": [],
+        "location": null,
+        "size": 808,
+        "lines": null,
+        "children": []
+      }
+    ]
+  },
+  "preview": "The quick brown fox jumps over the lazy dog. Quarterly report attached, please review before Friday.",
+  "thread_key": "<corpus-025@example.com>",
+  "has_attachment": true
+}

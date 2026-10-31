@@ -1,0 +1,110 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      20,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Budget XLSX",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-020@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "multipart",
+    "subtype": "mixed",
+    "params": [
+      [
+        "boundary",
+        "mix-3"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 2548,
+    "lines": null,
+    "children": [
+      {
+        "part": "1",
+        "media_type": "text",
+        "subtype": "plain",
+        "params": [
+          [
+            "charset",
+            "utf-8"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "8bit",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 100,
+        "lines": 0,
+        "children": []
+      },
+      {
+        "part": "2",
+        "media_type": "application",
+        "subtype": "vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "params": [
+          [
+            "name",
+            "budget.xlsx"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "base64",
+        "disposition": [
+          "attachment",
+          [
+            [
+              "filename",
+              "budget.xlsx"
+            ]
+          ]
+        ],
+        "language": [],
+        "location": null,
+        "size": 2096,
+        "lines": null,
+        "children": []
+      }
+    ]
+  },
+  "preview": "The quick brown fox jumps over the lazy dog. Quarterly report attached, please review before Friday.",
+  "thread_key": "<corpus-020@example.com>",
+  "has_attachment": true
+}

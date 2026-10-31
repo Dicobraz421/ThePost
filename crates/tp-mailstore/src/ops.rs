@@ -1,13 +1,11 @@
-//! Флаги, копирование, перемещение, корзина (CONTRACTS.md#MailStore, #EventBus).
+//! Флаги, копирование, перемещение (CONTRACTS.md#MailStore, #EventBus).
 //!
 //! Изменение выполняет хранилище метаданных одной транзакцией (новый `ModSeq`, журнал изменений, событие
 //! ядра; у `copy` — и ссылки на объекты частей и скелета, поэтому здесь `BlobIndex` не вызывается: иначе
 //! ссылки учлись бы дважды). После фиксации — `MailboxChanged` для каждой затронутой папки с `ModSeq`
 //! изменения. Затронутые папки берутся из журнала изменений (`ModSeq` изменения — один на операцию);
 //! исходные папки переноса в корзину журнал учётной записи не хранит — они читаются до операции.
-//!
-//! Корзина (`delete_to_trash`, `restore`) — здесь без воркера истечения; срок хранения, окончательное
-//! удаление и `before_final_delete` — MS-05.
+//! Корзина — [`crate::trash`].
 
 use tp_contracts::meta::{AccountScope, FlagOp, FlagsUpdate, Inserted};
 use tp_contracts::{MailboxId, MessageId, ModSeq, Result};
@@ -42,6 +40,7 @@ impl Store {
         ids: &[MessageId],
         to: MailboxId,
     ) -> Result<Vec<Inserted>> {
+        self.check_copy_quota(scope, ids).await?;
         let inserted = self.d.messages.copy(scope, ids, to).await?;
         if let Some(modseq) = inserted.first().map(|i| i.modseq) {
             self.notify(scope, [to], modseq).await;
@@ -65,40 +64,14 @@ impl Store {
         Ok(inserted)
     }
 
-    pub(crate) async fn trash_impl(
-        &self,
-        scope: AccountScope,
-        ids: &[MessageId],
-    ) -> Result<ModSeq> {
-        let sources = self.mailboxes_of(scope, ids).await?;
-        let modseq = self.d.messages.to_trash(scope, ids).await?;
-        if !sources.is_empty() {
-            let trash = self.touched(scope, modseq, ids.len()).await;
-            self.notify(scope, sources.into_iter().chain(trash), modseq)
-                .await;
-        }
-        Ok(modseq)
-    }
-
-    pub(crate) async fn restore_impl(
-        &self,
-        scope: AccountScope,
-        ids: &[MessageId],
-    ) -> Result<Vec<Inserted>> {
-        // Все письма — в корзине (иначе `Invalid`): исходная папка одна.
-        let trash = self.mailboxes_of(scope, &ids[..ids.len().min(1)]).await?;
-        let inserted = self.d.messages.restore(scope, ids).await?;
-        if let Some(modseq) = inserted.first().map(|i| i.modseq) {
-            let boxes = self.touched(scope, modseq, inserted.len()).await;
-            self.notify(scope, trash.into_iter().chain(boxes), modseq)
-                .await;
-        }
-        Ok(inserted)
-    }
-
     /// Папки писем изменения `modseq` по журналу изменений учётной записи. Ошибка журнала — без уведомления
     /// (шина at-most-once; клиенты сверяются по `ModSeq`).
-    async fn touched(&self, scope: AccountScope, modseq: ModSeq, hint: usize) -> Vec<MailboxId> {
+    pub(crate) async fn touched(
+        &self,
+        scope: AccountScope,
+        modseq: ModSeq,
+        hint: usize,
+    ) -> Vec<MailboxId> {
         let since = ModSeq(modseq.0.saturating_sub(1));
         match self
             .d
@@ -122,7 +95,11 @@ impl Store {
     }
 
     /// Текущие папки писем (отсутствующие пропускаются).
-    async fn mailboxes_of(&self, scope: AccountScope, ids: &[MessageId]) -> Result<Vec<MailboxId>> {
+    pub(crate) async fn mailboxes_of(
+        &self,
+        scope: AccountScope,
+        ids: &[MessageId],
+    ) -> Result<Vec<MailboxId>> {
         let mut out = Vec::new();
         for id in ids {
             if let Some(m) = self.d.messages.get(scope, *id).await?

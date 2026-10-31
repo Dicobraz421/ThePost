@@ -1,0 +1,61 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      1,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Plain ASCII",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-001@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "text",
+    "subtype": "plain",
+    "params": [
+      [
+        "charset",
+        "us-ascii"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 102,
+    "lines": 1,
+    "children": []
+  },
+  "preview": "The quick brown fox jumps over the lazy dog. Quarterly report attached, please review before Friday.",
+  "thread_key": "<corpus-001@example.com>",
+  "has_attachment": false
+}

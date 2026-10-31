@@ -3,7 +3,9 @@
 //! 1. Письмо читается из потока, точки принятия решений (`DecisionHook::on_delivery`) разрешают,
 //!    запрещают или дополняют доставку (заголовки, копии в журнальные ящики) — до загрузки;
 //!    отправитель для них — с конверта (`IngestRequest::mail_from`), внешние копии возвращаются в `forward`.
-//! 2. Разбор на скелет и части ([`Split`]); заголовки получателя — в его скелете, части общие.
+//!    Затем квота всех доставок, включая копии ([`crate::quota`]).
+//! 2. Разбор на скелет и части ([`Split`]) и метаданные для протоколов ([`meta`]); заголовки получателя —
+//!    в его скелете, части общие.
 //! 3. Каждый объект учитывается одним `BlobIndex::acquire` на всех получателей (`refs` = число ссылок)
 //!    и загружается, только если его ещё нет; всё — вне транзакций БД (протокол SRS 3.4).
 //! 4. Метаданные каждой доставки — `MessageStore::insert` (событие доставки пишет хранилище метаданных
@@ -20,11 +22,11 @@ use futures::TryStreamExt;
 use tp_contracts::blob::{Acquire, ByteStream, Commit};
 use tp_contracts::ext::{CopyTo, Decision, DeliveryInfo};
 use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, Ingested};
-use tp_contracts::meta::{AccountScope, MessageMeta, NewMessage, PartRef};
+use tp_contracts::meta::{AccountScope, NewMessage, PartRef};
 use tp_contracts::{BlobHash, BlobKey, Error, MessageId, Result, TenantId};
 
-use crate::Store;
 use crate::split::{self, Split};
+use crate::{Store, meta};
 
 /// Объект-скелет одной группы доставок с одинаковыми заголовками получателя.
 struct SkeletonGroup {
@@ -78,11 +80,23 @@ impl Store {
         for d in &deliveries {
             check_headers(&d.extra_headers)?;
         }
+        // Квота — до разбора и загрузки: превышение у одного получателя отклоняет весь запрос.
+        let demands: Vec<_> = deliveries
+            .iter()
+            .map(|d| {
+                let size = header_block(&d.extra_headers, &common).len() + raw.len();
+                (d.account, size as u64)
+            })
+            .collect();
+        self.check_quota(tenant, &demands).await?;
 
         // Разбор — работа процессора на всё письмо: вне потоков асинхронного рантайма.
-        let split = tokio::task::spawn_blocking(move || Split::new(raw))
-            .await
-            .map_err(|e| Error::internal(format!("ingest: разбор письма: {e}")))?;
+        let (split, meta) = tokio::task::spawn_blocking(move || {
+            let meta = meta::message_meta(&raw);
+            (Split::new(raw), meta)
+        })
+        .await
+        .map_err(|e| Error::internal(format!("ingest: разбор письма: {e}")))?;
 
         let mut groups: Vec<SkeletonGroup> = Vec::new();
         for (i, d) in deliveries.iter().enumerate() {
@@ -173,8 +187,7 @@ impl Store {
                         size: message_size(&split, &d.extra_headers, &common),
                         received_at,
                         flags: d.flags.clone(),
-                        // ENVELOPE, BODYSTRUCTURE, превью, ключ цепочки — MS-07.
-                        meta: MessageMeta::default(),
+                        meta: meta.clone(),
                     };
                     self.d.messages.insert(scope, d.mailbox, msg).await
                 }

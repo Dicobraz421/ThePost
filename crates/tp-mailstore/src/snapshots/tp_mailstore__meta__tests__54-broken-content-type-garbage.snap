@@ -1,0 +1,56 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      56,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Garbage content type",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-056@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "text",
+    "subtype": "plain",
+    "params": [],
+    "content_id": null,
+    "description": null,
+    "encoding": "x-weird",
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 6,
+    "lines": 1,
+    "children": []
+  },
+  "preview": "body",
+  "thread_key": "<corpus-056@example.com>",
+  "has_attachment": false
+}

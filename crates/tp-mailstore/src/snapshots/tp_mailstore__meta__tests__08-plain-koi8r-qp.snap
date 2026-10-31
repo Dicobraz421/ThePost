@@ -1,0 +1,61 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      7,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Привет",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-007@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "text",
+    "subtype": "plain",
+    "params": [
+      [
+        "charset",
+        "koi8-r"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": "quoted-printable",
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 321,
+    "lines": 4,
+    "children": []
+  },
+  "preview": "Привет! Это тестовое письмо для проверки разбора кириллицы. Съешь же ещё этих мягких французских булок, да выпей чаю.",
+  "thread_key": "<corpus-007@example.com>",
+  "has_attachment": false
+}

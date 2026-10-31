@@ -1,0 +1,110 @@
+---
+source: crates/tp-mailstore/src/meta.rs
+expression: meta
+---
+{
+  "envelope": {
+    "date": [
+      2026,
+      302,
+      10,
+      19,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    "subject": "Договор DOCX",
+    "from": [
+      {
+        "name": "Alice Example",
+        "email": "alice@example.com"
+      }
+    ],
+    "sender": [],
+    "reply_to": [],
+    "to": [
+      {
+        "name": "Bob",
+        "email": "bob@example.org"
+      }
+    ],
+    "cc": [],
+    "bcc": [],
+    "in_reply_to": null,
+    "message_id": "<corpus-019@example.com>"
+  },
+  "body": {
+    "part": "",
+    "media_type": "multipart",
+    "subtype": "mixed",
+    "params": [
+      [
+        "boundary",
+        "mix-2"
+      ]
+    ],
+    "content_id": null,
+    "description": null,
+    "encoding": null,
+    "disposition": null,
+    "language": [],
+    "location": null,
+    "size": 1821,
+    "lines": null,
+    "children": [
+      {
+        "part": "1",
+        "media_type": "text",
+        "subtype": "plain",
+        "params": [
+          [
+            "charset",
+            "utf-8"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "8bit",
+        "disposition": null,
+        "language": [],
+        "location": null,
+        "size": 213,
+        "lines": 0,
+        "children": []
+      },
+      {
+        "part": "2",
+        "media_type": "application",
+        "subtype": "vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "params": [
+          [
+            "name",
+            "contract.docx"
+          ]
+        ],
+        "content_id": null,
+        "description": null,
+        "encoding": "base64",
+        "disposition": [
+          "attachment",
+          [
+            [
+              "filename",
+              "contract.docx"
+            ]
+          ]
+        ],
+        "language": [],
+        "location": null,
+        "size": 1246,
+        "lines": null,
+        "children": []
+      }
+    ]
+  },
+  "preview": "Привет! Это тестовое письмо для проверки разбора кириллицы. Съешь же ещё этих мягких французских булок, да выпей чаю.",
+  "thread_key": "<corpus-019@example.com>",
+  "has_attachment": true
+}
