@@ -9,8 +9,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use time::OffsetDateTime;
 use tp_contracts::events::{CoreEvent, CoreEventKind};
 use tp_contracts::meta::{
     Account, AccountScope, AccountStore, AccountUpsert, ChangeLog, Changes, Flag, FlagOp, Flags,
@@ -24,6 +26,9 @@ use tp_contracts::{
 
 use crate::blob::MemBlobIndex;
 use crate::infra::{Clock, MemEventLog, SystemClock, lock};
+
+/// Срок хранения в корзине по умолчанию (как в конфигурации хранилища).
+pub const DEFAULT_TRASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// Системные папки новой учётной записи (как в `tp-meta`).
 pub const SYSTEM_FOLDERS: [(&str, SpecialUse); 5] = [
@@ -66,8 +71,26 @@ struct MailboxRow {
 #[derive(Debug, Clone)]
 struct MessageRow {
     message: Message,
-    /// Исходная папка письма в корзине (для `restore`).
-    trashed_from: Option<MailboxId>,
+    /// Письмо в корзине: исходная папка (для `restore`) и сроки ([`crate::MemTrash`]).
+    trashed: Option<Trashed>,
+}
+
+/// Отметка переноса в корзину.
+#[derive(Debug, Clone, Copy)]
+struct Trashed {
+    from: MailboxId,
+    deleted_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+}
+
+/// Элемент корзины для [`crate::MemTrash`].
+#[derive(Debug, Clone)]
+pub(crate) struct TrashRow {
+    pub(crate) scope: AccountScope,
+    pub(crate) message: Message,
+    pub(crate) origin: MailboxId,
+    pub(crate) deleted_at: OffsetDateTime,
+    pub(crate) expires_at: OffsetDateTime,
 }
 
 /// Изменения вне данных учётной записи, применяемые вместе с ней.
@@ -227,7 +250,7 @@ impl AccountData {
             id,
             MessageRow {
                 message,
-                trashed_from: None,
+                trashed: None,
             },
         );
         Ok(Inserted {
@@ -274,13 +297,13 @@ impl AccountData {
     }
 
     /// Переносит письма `ids` в папку `to` с теми же идентификаторами и новыми UID;
-    /// `trash` — запомнить исходную папку. Возвращает (письмо, прежняя папка, новый UID).
+    /// `trash` — момент удаления и срок корзины: запомнить исходную папку. Возвращает (письмо, прежняя папка, новый UID).
     fn relocate(
         &mut self,
         ms: ModSeq,
         ids: &[MessageId],
         to: MailboxId,
-        trash: bool,
+        trash: Option<(OffsetDateTime, OffsetDateTime)>,
     ) -> Result<Vec<(MessageId, MailboxId, Uid)>> {
         self.check_uids(to, ids.len())?;
         let mut out = Vec::with_capacity(ids.len());
@@ -294,7 +317,11 @@ impl AccountData {
                 continue;
             };
             let from = (row.message.mailbox, row.message.uid);
-            row.trashed_from = trash.then_some(from.0);
+            row.trashed = trash.map(|(deleted_at, expires_at)| Trashed {
+                from: from.0,
+                deleted_at,
+                expires_at,
+            });
             row.message.mailbox = to;
             row.message.uid = uid;
             row.message.modseq = ms;
@@ -327,6 +354,7 @@ pub struct MemMetadata {
     clock: Arc<dyn Clock>,
     events: MemEventLog,
     blobs: Option<MemBlobIndex>,
+    trash_retention: Duration,
 }
 
 impl MemMetadata {
@@ -337,6 +365,7 @@ impl MemMetadata {
             clock,
             events: MemEventLog::default(),
             blobs: None,
+            trash_retention: DEFAULT_TRASH_RETENTION,
         }
     }
 
@@ -349,6 +378,12 @@ impl MemMetadata {
     /// Учёт ссылок на объекты (`copy` добавляет, `expunge_final` снимает) — в `blobs`.
     pub fn with_blob_index(mut self, blobs: MemBlobIndex) -> Self {
         self.blobs = Some(blobs);
+        self
+    }
+
+    /// Срок хранения в корзине для писем, удаляемых после вызова (по умолчанию 30 суток).
+    pub fn with_trash_retention(mut self, retention: Duration) -> Self {
+        self.trash_retention = retention;
         self
     }
 
@@ -436,6 +471,64 @@ impl MemMetadata {
         f(st.accounts
             .get(&(scope.tenant, scope.account))
             .ok_or(Error::NotFound)?)
+    }
+
+    /// Момент удаления в корзину и срок окончательного удаления.
+    fn trash_mark(&self) -> (OffsetDateTime, OffsetDateTime) {
+        let now = self.clock.now();
+        (
+            now,
+            now.saturating_add(
+                self.trash_retention
+                    .try_into()
+                    .unwrap_or(time::Duration::MAX),
+            ),
+        )
+    }
+
+    /// Элементы корзины: учётная запись `scope` или все (`None`).
+    pub(crate) fn trash_rows(&self, scope: Option<AccountScope>) -> Vec<TrashRow> {
+        let st = lock(&self.state);
+        st.accounts
+            .iter()
+            .filter(|(k, _)| scope.is_none_or(|s| (s.tenant, s.account) == **k))
+            .flat_map(|(&(tenant, account), acc)| {
+                let trash = acc.by_role(SpecialUse::Trash).ok();
+                acc.messages.values().filter_map(move |row| {
+                    let t = row.trashed?;
+                    (Some(row.message.mailbox) == trash).then(|| TrashRow {
+                        scope: AccountScope { tenant, account },
+                        message: row.message.clone(),
+                        origin: t.from,
+                        deleted_at: t.deleted_at,
+                        expires_at: t.expires_at,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Переносит срок окончательного удаления письма в корзине; письма в корзине нет — `NotFound`.
+    pub(crate) fn defer_trash(
+        &self,
+        scope: AccountScope,
+        id: MessageId,
+        until: OffsetDateTime,
+    ) -> Result<()> {
+        let mut st = lock(&self.state);
+        let acc = st
+            .accounts
+            .get_mut(&(scope.tenant, scope.account))
+            .ok_or(Error::NotFound)?;
+        let trash = acc.by_role(SpecialUse::Trash)?;
+        let row = acc
+            .messages
+            .get_mut(&id)
+            .filter(|r| r.message.mailbox == trash)
+            .ok_or(Error::NotFound)?;
+        let t = row.trashed.as_mut().ok_or(Error::NotFound)?;
+        t.expires_at = until;
+        Ok(())
     }
 
     fn now_unix(&self) -> i64 {
@@ -655,6 +748,7 @@ impl MailboxStore for MemMetadata {
     }
 
     async fn delete(&self, scope: AccountScope, id: MailboxId, cascade: bool) -> Result<()> {
+        let mark = self.trash_mark();
         self.with_account(scope, |acc, fx| {
             acc.mailbox(id)?;
             // Папка и все вложенные, предки раньше потомков.
@@ -701,7 +795,7 @@ impl MailboxStore for MemMetadata {
             let ms = acc.bump();
             // Письма — в корзину (SRS 4.7); восстановление без исходной папки — во «Входящие».
             if let Some(trash) = trash {
-                for (message, _, _) in acc.relocate(ms, &ids, trash, true)? {
+                for (message, _, _) in acc.relocate(ms, &ids, trash, Some(mark))? {
                     fx.events
                         .push((Some(trash), CoreEventKind::Trashed { message }));
                 }
@@ -943,6 +1037,7 @@ impl MessageStore for MemMetadata {
     }
 
     async fn to_trash(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
+        let mark = self.trash_mark();
         self.with_account(scope, |acc, fx| {
             let trash = acc.by_role(SpecialUse::Trash)?;
             // Отсутствующие и уже лежащие в корзине письма пропускаются.
@@ -956,7 +1051,7 @@ impl MessageStore for MemMetadata {
             }
             acc.check_uids(trash, src.len())?;
             let ms = acc.bump();
-            for (message, _, _) in acc.relocate(ms, &src, trash, true)? {
+            for (message, _, _) in acc.relocate(ms, &src, trash, Some(mark))? {
                 fx.events
                     .push((Some(trash), CoreEventKind::Trashed { message }));
             }
@@ -982,7 +1077,8 @@ impl MessageStore for MemMetadata {
             let mut groups: Vec<(MailboxId, Vec<MessageId>)> = Vec::new();
             for id in &src {
                 let to = acc.messages[id]
-                    .trashed_from
+                    .trashed
+                    .map(|t| t.from)
                     .filter(|m| acc.mailboxes.contains_key(m))
                     .unwrap_or(inbox);
                 match groups.iter_mut().find(|(g, _)| *g == to) {
@@ -996,7 +1092,7 @@ impl MessageStore for MemMetadata {
             let ms = acc.bump();
             let mut uids = HashMap::new();
             for (to, group) in groups {
-                for (message, _, uid) in acc.relocate(ms, &group, to, false)? {
+                for (message, _, uid) in acc.relocate(ms, &group, to, None)? {
                     uids.insert(message, uid);
                     fx.events.push((
                         Some(to),

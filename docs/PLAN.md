@@ -63,11 +63,11 @@
 | ✅ blob-04 | BLOB-11 | A | blob-03, contracts-05 | 4 |
 | ✅ cluster-04 | CLU-07 | A | cluster-03 | 4 |
 | ✅ platform-05 | PLT-14 | A | platform-04 | 2 |
-| contracts-06 (ветка `x/contracts-06`) | CTR-16 | B | contracts-02 | 1 |
-| mailstore-03 | MS-08 | A | mailstore-01, contracts-06 | 1 |
-| app-03 | APP-07 | A | app-01, platform-04, blob-04, cluster-04, meta-06 | 2 |
-| blob-05 | BLOB-12 | A | app-03 | 4 |
-| cluster-05 | CLU-08 | A | app-03 | 4 |
+| ✅ contracts-06 (ветка `x/contracts-06`) | CTR-16 | B | contracts-02 | 1 |
+| ✅ mailstore-03 | MS-08 | A | mailstore-01, contracts-06 | 1 |
+| ✅ app-03 | APP-07 | A | app-01, platform-04, blob-04, cluster-04, meta-06 | 2 |
+| ✅ blob-05 | BLOB-12 | A | app-03 | 4 |
+| ✅ cluster-05 | CLU-08 | A | app-03 | 4 |
 
 Выход Ф0: `thepost serve` с минимальным config и `roles: [all]` доходит до ready; RLS по tenant включён; журнал событий и точки расширения работают; `doctor` и `verify` работают; протокол BLOB проверен тестом гонки.
 
@@ -75,10 +75,12 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-03 | CTR-06, CTR-07, CTR-08, CTR-09 | B | Ф0 | 1 |
+| ✅ contracts-03 | CTR-06, CTR-07, CTR-08, CTR-09 | B | Ф0 | 1 |
 | testkit-02 | KIT-05 | A | contracts-03 | 1 |
 | meta-03 | META-09, META-10, META-11, META-12 | B | contracts-03 | 3 |
 | mailstore-02 | MS-05, MS-06, MS-07 | A | contracts-03 | 4 |
+| contracts-07 | CTR-18 | B | contracts-03 | 1 |
+| mailstore-04 | MS-09 | A | mailstore-02, testkit-02 | 4 |
 | auth-01 | AUTH-01, AUTH-02, AUTH-03, AUTH-04 | A | contracts-03 | 1 |
 | search-01 | SRCH-01, SRCH-02, SRCH-03, SRCH-04 | A | contracts-03 | 3 |
 | smtp-01 | SMTP-01, SMTP-02, SMTP-03, SMTP-04 | A | auth-01, testkit-02 | 4 |
