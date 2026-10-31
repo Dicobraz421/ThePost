@@ -2,9 +2,12 @@
 //!
 //! - [`proto`] — разбор команд и сериализация ответов IMAP4rev2 на `imap-codec`.
 //! - [`session`] — сессия: состояния, TLS, аутентификация; [`Server`] — приём соединений и остановка с `BYE`.
+//! - `mailbox` — операции с папками: LIST (LIST-EXTENDED, SPECIAL-USE, LIST-STATUS), SELECT, STATUS, CREATE,
+//!   DELETE, RENAME, SUBSCRIBE.
 //! - [`config`] — секция `imap` config.yaml.
 
 pub mod config;
+mod mailbox;
 pub mod proto;
 pub mod session;
 

@@ -20,6 +20,7 @@ use tp_testkit::{
 use crate::config::ImapConfig;
 use crate::session::{Deps, Session, SessionCtx, Transport};
 
+mod mailbox;
 mod session;
 
 pub(crate) const LOGIN: &str = "user@example.org";

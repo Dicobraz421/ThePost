@@ -499,14 +499,61 @@ impl<T: Transport> Session<T> {
             self.bad(Some(&tag), "Not authenticated");
             return Ok(());
         }
-        match body {
-            Body::Std(CommandBody::Enable { capabilities }) => self.enable(&tag, capabilities),
-            Body::Std(CommandBody::Check) if self.selected.is_some() => {
-                self.ok(&tag, None, "CHECK completed");
+        let done = match body {
+            Body::Std(CommandBody::Enable { capabilities }) => {
+                self.enable(&tag, capabilities);
+                Ok(())
             }
-            _ => self.bad(Some(&tag), "Command not supported"),
+            Body::List(cmd) => self.list(&tag, cmd).await,
+            Body::Status { mailbox, items } => self.status(&tag, &mailbox, &items).await,
+            Body::Create { mailbox, uses } => self.create(&tag, &mailbox, &uses).await,
+            Body::Std(body) => match body {
+                CommandBody::Select { mailbox, .. } => {
+                    self.select(&tag, &proto::mailbox_bytes(&mailbox), false)
+                        .await
+                }
+                CommandBody::Examine { mailbox, .. } => {
+                    self.select(&tag, &proto::mailbox_bytes(&mailbox), true)
+                        .await
+                }
+                CommandBody::Delete { mailbox } => {
+                    self.delete(&tag, &proto::mailbox_bytes(&mailbox)).await
+                }
+                CommandBody::Rename { from, to } => {
+                    let (from, to) = (proto::mailbox_bytes(&from), proto::mailbox_bytes(&to));
+                    self.rename(&tag, &from, &to).await
+                }
+                CommandBody::Subscribe { mailbox } => {
+                    self.subscribe(&tag, &proto::mailbox_bytes(&mailbox), true)
+                        .await
+                }
+                CommandBody::Unsubscribe { mailbox } => {
+                    self.subscribe(&tag, &proto::mailbox_bytes(&mailbox), false)
+                        .await
+                }
+                body => {
+                    self.selected_command(&tag, body).await;
+                    Ok(())
+                }
+            },
+        };
+        if let Err(e) = done {
+            self.store_error(&tag, &e);
         }
         Ok(())
+    }
+
+    /// Команды состояния «папка выбрана».
+    async fn selected_command(&mut self, tag: &Tag<'static>, body: CommandBody<'static>) {
+        if self.selected.is_none() {
+            self.bad(Some(tag), "No mailbox selected");
+            return;
+        }
+        match body {
+            CommandBody::Check => self.ok(tag, None, "CHECK completed"),
+            CommandBody::Unselect => self.unselect(tag),
+            _ => self.bad(Some(tag), "Command not supported"),
+        }
     }
 
     async fn starttls(&mut self, tag: &Tag<'static>) -> Result<()> {
