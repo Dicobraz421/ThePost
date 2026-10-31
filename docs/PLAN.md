@@ -120,6 +120,22 @@
 | jmap-03 | JMAP-09 | A | jmap-02 | 3 |
 | deploy-05 | DEP-08 | A | deploy-02, meta-08, platform-06 | 4 |
 
+### Решение 2026-11-01: взаимодействие компонентов и требования к СУБД
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| contracts-11 (ветка `x/contracts-11`) | CTR-22 | B | contracts-10 | 1 |
+| meta-09 | META-25 | A | meta-08 | 3 |
+| meta-10 | META-26, META-27 | A | meta-09, contracts-11 | 3 |
+| cluster-06 | CLU-09, CLU-10, CLU-11 | A | contracts-11 | 4 |
+| app-04 | APP-08 | A | meta-10, cluster-06 | 2 |
+| platform-07 | PLT-17 | A | platform-06 | 2 |
+| mailstore-08 | MS-14 | A | mailstore-07 | 1 |
+| blob-07 | BLOB-14 | A | blob-06 | 4 |
+| auth-04 | AUTH-08 | A | auth-03, meta-10 | 1 |
+| ci-04 | CI-05 | B | ci-03, cluster-06 | 4 |
+| deploy-06 | DEP-09 | A | deploy-05, cluster-06 | 4 |
+
 Выход Ф1: MVP SMB — критерии `docs/spec/APP-D.md#Д.7` для профиля SMB на стенде DEP-04.
 
 ## Ф2–Ф4 базовой поставки (карточки — по завершении Ф1)
@@ -127,7 +143,7 @@
 | Этап | Полосы | Содержание |
 |---|---|---|
 | Ф2. Совместная работа (≈5 мес.) | dav, jmap, sieve, auth | CalDAV, CardDAV, GAL, scheduling, iTIP/iMIP, free/busy, ресурсы; JMAP Contacts/Calendars/Sieve; Sieve и ManageSieve |
-| Ф3. Enterprise (≈5 мес.) | smtp, blob, cluster, admin, app, deploy | Профиль S3, Valkey, режим edge (без очереди, сквозная передача на transport, реплика получателей, SMTP mTLS, секреты edge — из хранилища по отдельной политике — SRS 2.6, решение 2026-11-01), пресеты transport/access/backend/mailbox, экспорт/импорт, эталонные Ansible-роли и Helm-чарт (SRS 5.6), стенд Enterprise и испытания Д.6 |
+| Ф3. Enterprise (≈5 мес.) | smtp, blob, cluster, admin, app, deploy | Профиль S3, межузловые запросы для ролей search и admin (SRS 2.8), режим edge (без очереди, сквозная передача на transport, реплика получателей, SMTP mTLS, секреты edge — из хранилища по отдельной политике — SRS 2.6, решение 2026-11-01), пресеты transport/access/backend/mailbox, экспорт/импорт, эталонные Ansible-роли и Helm-чарт (SRS 5.6), стенд Enterprise и испытания Д.6 |
 | Ф4. Выпуск (≈3 мес.) | все | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора |
 
 ## Дополнительные модули (SRS 1.3; после Ф1, порядок — решение владельца)

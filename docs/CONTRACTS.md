@@ -80,8 +80,10 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
 ## EventBus
 SRS 2.1. `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`. `Event { tenant, account: Option, kind }`,
 `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded`.
-Реализации: в процессе (`tp-cluster`, SMB), Valkey (`tp-cluster`, Enterprise). Доставка — at-most-once;
-клиент после переподключения сверяется по `ModSeq`.
+Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер; решение 2026-11-01, SRS 2.8). Доставка — at-most-once;
+клиент после переподключения сверяется по `ModSeq`. Публикация — только после фиксации, вне транзакции изменения. CTR-22: `kind` дополняется
+`LogAppended { partition }`, `MembersChanged`, `Blocked { subject }`, `Resync` (переполнение буфера подписчика — сверка с хранилищем);
+`subscribe_system()` получает системные виды. Valkey удаляется (CLU-09).
 
 ## Lease
 `LeaseStore`: `try_acquire(name, holder, ttl) -> Option<Lease>`, `renew(&Lease, ttl) -> Option<Lease>`, `release`.
@@ -105,6 +107,19 @@ watch::Receiver<Vec<NodeId>>` (новое значение — пересчит�
 `leave(&NodeId)` — удалить (штатная остановка; отсутствующая — не ошибка), `live() -> Vec<NodeId>` — узлы с непросроченной записью,
 по возрастанию. Время — часы хранилища (PostgreSQL). `NodeId` — имя экземпляра, не пустое, без пробелов, ≤ 255 байт (строка в JSON).
 Реализация — `tp-meta` (META-16), in-memory — `tp-testkit`. Код — `membership.rs`.
+CTR-22: запись узла дополняется ролями и адресом служебного канала (`NodeInfo { id, roles, addr }`, `live_info()`); вход и выход узла
+публикуются сигналом `MembersChanged`; `PartitionAssigner::members()` обновляется по сигналу, а не опросом.
+
+## Rpc
+Решение 2026-11-01, SRS 2.8 (CTR-22). Запрос узел → узел: `Rpc::call(service, key, body, deadline) -> Result<Bytes>`; `service` — роль и имя
+службы, маршрут — `live_info()` с нужной ролью, владелец ключа — rendezvous-хэширование, при отказе — следующий. Ошибки: `Busy` (параллельность
+превышена), `Timeout`, `Unavailable`. Обработчик — `RpcHandler` регистрируется ролью; матрица разрешений «роль → службы» проверяется
+на принимающем узле по сертификату вызывающего. Транспорт — HTTPS/2 с mTLS (`InternalChannel::Node`). Реализация — `tp-cluster`.
+
+## AbuseBlocks
+Решение 2026-11-01, SRS 6.3 (CTR-22). Блокировки источников и учётных записей: `block(tenant, subject, until, reason)`,
+`blocked(tenant, subject) -> Option<until>`; `subject` — IP, подсеть или учётная запись. Счётчики попыток — на узле (`tp-auth`);
+факт блокировки — в PostgreSQL (`tp-meta`) и сигнал `Blocked`.
 
 ## Search
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
@@ -164,7 +179,7 @@ Hot reload: новая копия рассылается через `watch`; п�
 Секреты — только `secrets::SecretRef` (раздел Secrets); строка или число на месте ссылки — ошибка разбора.
 
 ## Secrets
-Решение 2026-10-30. Секреты (пароли PostgreSQL и Valkey, ключи S3, DKIM, ACME, подписи токенов, LDAP/OIDC) — только во внешнем хранилище
+Решение 2026-10-30. Секреты (пароли PostgreSQL, ключи S3, DKIM, ACME, подписи токенов, LDAP/OIDC) — только во внешнем хранилище
 (OpenBao / Vault, API Vault). В config.yaml и таблицах БД — `SecretRef`: в конфигурации `{ secret: "<путь>#<поле>" }`
 (`deny_unknown_fields`), в БД — строка `<путь>#<поле>` (`Display`/`FromStr`); путь — сегменты `[A-Za-z0-9_.-]+` через `/` без `.`/`..`,
 поле — `[A-Za-z0-9_.-]+`. Скаляр на месте ссылки — ошибка «secret in plaintext» без значения в тексте. `Secret` — значение,
@@ -175,12 +190,12 @@ Hot reload: новая копия рассылается через `watch`; п�
 Код — `secrets.rs`.
 
 ## Internal TLS
-SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, Valkey, S3, узел ↔ узел — только TLS. Общая секция `tls::InternalTls
+SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, S3, узел ↔ узел — только TLS. Общая секция `tls::InternalTls
 { ca_file, cert_file, key_file, server_name, allow_plaintext }` — поле `tls` секции канала; `Profile { Prod (по умолчанию), Dev }` —
-параметр `profile` верхнего уровня config.yaml. `InternalTls::check_url(InternalChannel::{Postgres, Valkey, S3, Node}, url, profile)
+параметр `profile` верхнего уровня config.yaml. `InternalTls::check_url(InternalChannel::{Postgres, S3, Node}, url, profile)
 -> Result<Transport::{Tls, Plaintext}>` вызывается в `thepost config check` и при запуске: `allow_plaintext` вне dev, адрес без TLS
 без `allow_plaintext`, `sslmode=require|verify-ca` — `Invalid`. Схемы: PostgreSQL — `sslmode=verify-full` (без `sslmode` клиент
-обязан verify-full), Valkey — `rediss://`, S3 — `https://`, узел — `https://`/`smtps://`. `Transport::Plaintext` — крейт канала пишет
+обязан verify-full), S3 — `https://`, узел — `https://`/`smtps://`. `Transport::Plaintext` — крейт канала пишет
 `InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
 
 ## Queue (Ф1)
@@ -251,3 +266,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-10-31 — CTR-20 (решение 2026-10-31-atomic-delivery): `MessageStore::insert_batch` — все доставки приёма одной транзакцией.
 - 2026-10-31 — CTR-19 (x/contracts-08): `acl::{AclStore, AclEntry, SharedMailbox, SendDelegation, ANYONE, validate_identifier, effective_rights}`
   — ACL папок и делегирование отправки (META-11) за контрактом; реализации — `PgMeta`, `tp_testkit::MemAcl`, набор `suite::acl_store`.
+- 2026-11-01 — решение «Взаимодействие компонентов и требования к СУБД»: сигналы через PostgreSQL LISTEN/NOTIFY, `Rpc`, `AbuseBlocks`,
+  `NodeInfo`; канал и шина Valkey удаляются (реализация — CTR-22, CLU-09).
