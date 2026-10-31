@@ -8,12 +8,11 @@
 //!    в его скелете, части общие.
 //! 3. Каждый объект учитывается одним `BlobIndex::acquire` на всех получателей (`refs` = число ссылок)
 //!    и загружается, только если его ещё нет; всё — вне транзакций БД (протокол SRS 3.4).
-//! 4. Метаданные каждой доставки — `MessageStore::insert` (событие доставки пишет хранилище метаданных
-//!    в той же транзакции); затем `MailboxChanged` в шину.
+//! 4. Метаданные всех доставок, включая копии, — одной транзакцией `MessageStore::insert_batch` (события доставки
+//!    пишет хранилище метаданных в ней же; решение 2026-10-31-atomic-delivery); затем `MailboxChanged` в шину.
 //!
-//! Сбой загрузки снимает добавленные ссылки и не оставляет метаданных; сбой вставки одной доставки
-//! откатывает уже вставленные (`to_trash` и `expunge_final`: окончательно удаляются только письма в корзине)
-//! и снимает ссылки остальных: запрос выполняется целиком или не выполняется (вызывающий может повторить).
+//! До шага 4 ничего не раскладывается. Сбой загрузки или транзакции снимает добавленные ссылки и не оставляет
+//! метаданных: запрос выполняется целиком или не выполняется (вызывающий может повторить).
 
 use std::collections::HashMap;
 
@@ -23,7 +22,7 @@ use tp_contracts::blob::{Acquire, ByteStream, Commit};
 use tp_contracts::ext::{CopyTo, Decision, DeliveryInfo};
 use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, Ingested};
 use tp_contracts::meta::{AccountScope, NewMessage, PartRef};
-use tp_contracts::{BlobHash, BlobKey, Error, MessageId, Result, TenantId};
+use tp_contracts::{BlobHash, BlobKey, Error, Result, TenantId};
 
 use crate::split::{self, Split};
 use crate::{Store, meta};
@@ -156,67 +155,61 @@ impl Store {
             return Err(e);
         }
 
-        let mut parts = Vec::with_capacity(split.cuts().len());
-        for cut in split.cuts() {
-            let blob = *part_keys.get(&cut.hash).ok_or(Error::Conflict)?;
-            parts.push(PartRef {
-                part: cut.path.clone(),
-                blob,
-                size: cut.range.end - cut.range.start,
-            });
-        }
-        let mut skeleton_of = vec![None; deliveries.len()];
-        for g in &groups {
-            for &m in &g.members {
-                skeleton_of[m] = g.key.map(|k| (k, g.data.len()));
+        let inserted = async {
+            let mut parts = Vec::with_capacity(split.cuts().len());
+            for cut in split.cuts() {
+                parts.push(PartRef {
+                    part: cut.path.clone(),
+                    blob: *part_keys.get(&cut.hash).ok_or(Error::Conflict)?,
+                    size: cut.range.end - cut.range.start,
+                });
             }
+            let mut skeleton_of = vec![None; deliveries.len()];
+            for g in &groups {
+                for &m in &g.members {
+                    skeleton_of[m] = g.key;
+                }
+            }
+            let mut items = Vec::with_capacity(deliveries.len());
+            for (d, skeleton) in deliveries.iter().zip(skeleton_of) {
+                let scope = AccountScope {
+                    tenant,
+                    account: d.account,
+                };
+                let msg = NewMessage {
+                    skeleton: skeleton.ok_or(Error::Conflict)?,
+                    parts: parts.clone(),
+                    size: message_size(&split, &d.extra_headers, &common),
+                    received_at,
+                    flags: d.flags.clone(),
+                    meta: meta.clone(),
+                };
+                items.push((scope, d.mailbox, msg));
+            }
+            self.d.messages.insert_batch(tenant, items).await
         }
+        .await;
+        let inserted = match inserted {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                self.release(&held).await;
+                return Err(e);
+            }
+        };
 
         let mut done: Vec<Delivered> = Vec::with_capacity(deliveries.len());
-        let mut modseqs = Vec::with_capacity(deliveries.len());
-        for (i, d) in deliveries.iter().enumerate() {
+        for (d, ins) in deliveries.iter().zip(inserted) {
             let scope = AccountScope {
                 tenant,
                 account: d.account,
             };
-            let inserted = match skeleton_of[i] {
-                Some((skeleton, _)) => {
-                    let msg = NewMessage {
-                        skeleton,
-                        parts: parts.clone(),
-                        size: message_size(&split, &d.extra_headers, &common),
-                        received_at,
-                        flags: d.flags.clone(),
-                        meta: meta.clone(),
-                    };
-                    self.d.messages.insert(scope, d.mailbox, msg).await
-                }
-                None => Err(Error::Conflict),
-            };
-            match inserted {
-                Ok(ins) => {
-                    done.push(Delivered {
-                        account: d.account,
-                        mailbox: d.mailbox,
-                        message: ins.id,
-                        uid: ins.uid,
-                    });
-                    modseqs.push(ins.modseq);
-                }
-                Err(e) => {
-                    self.rollback(tenant, &done, &deliveries[i..], &skeleton_of[i..], &parts)
-                        .await;
-                    return Err(e);
-                }
-            }
-        }
-
-        for (d, modseq) in done.iter().zip(modseqs) {
-            let scope = AccountScope {
-                tenant,
+            self.notify(scope, [d.mailbox], ins.modseq).await;
+            done.push(Delivered {
                 account: d.account,
-            };
-            self.notify(scope, [d.mailbox], modseq).await;
+                mailbox: d.mailbox,
+                message: ins.id,
+                uid: ins.uid,
+            });
         }
         // Доставки сверх запроса (копии точек принятия решений) вызывающему не возвращаются.
         done.truncate(info.deliveries.len());
@@ -269,7 +262,7 @@ impl Store {
         }
     }
 
-    /// Снимает ссылки (откат приёма). Ошибка снятия — в журнал: объект останется до ручной сверки.
+    /// Снимает ссылки (сбой приёма). Ошибка снятия — в журнал: объект останется до ручной сверки.
     async fn release(&self, held: &[(BlobKey, u32)]) {
         for (key, refs) in held {
             if *refs == 0 {
@@ -281,55 +274,9 @@ impl Store {
                 .release(key.tenant, &key.hash, key.generation, *refs)
                 .await
             {
-                tracing::error!(error = %e, blob = %key.hash, "mailstore: ссылки не сняты при откате приёма");
+                tracing::error!(error = %e, blob = %key.hash, "mailstore: ссылки не сняты при сбое приёма");
             }
         }
-    }
-
-    /// Откат частично выполненного приёма: вставленные доставки удаляются окончательно (ссылки снимает
-    /// хранилище метаданных), ссылки невставленных снимаются явно.
-    async fn rollback(
-        &self,
-        tenant: TenantId,
-        done: &[Delivered],
-        rest: &[Delivery],
-        rest_skeletons: &[Option<(BlobKey, usize)>],
-        parts: &[PartRef],
-    ) {
-        let mut by_account: Vec<(AccountScope, Vec<MessageId>)> = Vec::new();
-        for d in done {
-            let scope = AccountScope {
-                tenant,
-                account: d.account,
-            };
-            match by_account.iter_mut().find(|(s, _)| *s == scope) {
-                Some((_, ids)) => ids.push(d.message),
-                None => by_account.push((scope, vec![d.message])),
-            }
-        }
-        for (scope, ids) in by_account {
-            let purged = match self.d.messages.to_trash(scope, &ids).await {
-                Ok(_) => self.d.messages.expunge_final(scope, &ids).await,
-                Err(e) => Err(e),
-            };
-            if let Err(e) = purged {
-                tracing::error!(error = %e, "mailstore: откат приёма — вставленные письма не удалены");
-            }
-        }
-        let mut refs: Vec<(BlobKey, u32)> = Vec::new();
-        let mut add = |key: BlobKey| match refs.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, n)) => *n += 1,
-            None => refs.push((key, 1)),
-        };
-        for (_, skeleton) in rest.iter().zip(rest_skeletons) {
-            if let Some((key, _)) = skeleton {
-                add(*key);
-            }
-            for p in parts {
-                add(p.blob);
-            }
-        }
-        self.release(&refs).await;
     }
 }
 
@@ -394,6 +341,7 @@ fn len_u32(n: usize) -> u32 {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use tp_contracts::MessageId;
     use tp_contracts::ext::{Augment, DecisionHook, DecisionHooks};
     use tp_contracts::mailstore::MailStore;
     use tp_contracts::meta::{Flag, MessageQuery, MessageStore, SpecialUse};
@@ -674,26 +622,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_failure_rolls_back() {
+    async fn insert_failure_leaves_nothing() {
         let env = Env::new();
         let raw = mail();
         let mut ds = recipients(&env, 3).await;
-        // Папки нет — вставка третьей доставки падает.
+        let events = env.meta.event_log().all().len();
+        // Папки нет — сбой на последней доставке: транзакция не раскладывает ни одной.
         ds[2].mailbox = tp_contracts::MailboxId::new();
         let err = env.store.ingest(request(&raw, ds.clone())).await;
-        assert!(err.is_err());
+        assert_eq!(err, Err(Error::NotFound));
         for d in &ds[..2] {
-            assert_eq!(inbox_count(&env, d).await, 0, "вставленные откатаны");
+            assert_eq!(inbox_count(&env, d).await, 0, "копий нет");
+            let scope = AccountScope {
+                tenant: TenantId::DEFAULT,
+                account: d.account,
+            };
+            let trash = env
+                .meta
+                .mailbox_by_role(scope, SpecialUse::Trash)
+                .expect("trash");
+            let trashed = env
+                .meta
+                .list(scope, trash, MessageQuery::All, 10)
+                .await
+                .expect("list");
+            assert!(trashed.is_empty(), "в корзине копий нет");
         }
+        assert_eq!(env.meta.event_log().all().len(), events, "событий нет");
         let split = Split::new(Bytes::from(raw));
-        for c in split.cuts() {
-            assert_eq!(
-                env.index
-                    .row(TenantId::DEFAULT, &c.hash)
-                    .expect("row")
-                    .refcnt,
-                0
-            );
+        let skeleton = split::hash(&split.skeleton(b""));
+        for h in split.cuts().iter().map(|c| c.hash).chain([skeleton]) {
+            assert_eq!(env.index.row(TenantId::DEFAULT, &h).expect("row").refcnt, 0);
         }
     }
 
