@@ -198,6 +198,23 @@ SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, S3, узел ↔ у
 обязан verify-full), S3 — `https://`, узел — `https://`/`smtps://`. `Transport::Plaintext` — крейт канала пишет
 `InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
 
+## Transport (Ф1)
+SRS 4.1, 2.6. Код — `transport.rs` (CTR-23). Настройки транспорта — данные в PostgreSQL; узлы держат снимок в памяти и перечитывают его
+по сигналу `TransportChanged { tenant: Option<TenantId> }` (`None` — уровень кластера) и при `Resync`.
+`TransportStore`: `cluster() -> ClusterTransport { version, domains: Vec<AcceptedDomain { id: DomainId, tenant, name, kind: DomainKind::{
+Authoritative, InternalRelay { next_hop } } }>, sources: Vec<TrustedSource { name, matcher: SourceMatch::{ Networks(Vec<IpNet>),
+ClientCert { subject } }, kind: SourceKind::{ Gateway { xclient, authserv_id: Option<String> }, Application { senders: Vec<AddressPattern>,
+external: bool } } }> }` — для выбора организации и источника до аутентификации; `tenant(tenant) -> TenantTransport { version,
+routes: Vec<DestinationPolicy { pattern ("*" — все внешние), tls: TlsRequirement, smart_host?, egress_ip? }>, rules: Vec<FlowRule> }`.
+Запись — `put_*`/`delete_*` с проверкой `version` (устаревшая — `Conflict`), публикация сигнала — после фиксации.
+`FlowRule { id, priority, enabled, mode: RuleMode::{ Enforce, Audit }, conditions: Vec<Condition>, exceptions: Vec<Condition>,
+actions: Vec<Action>, stop: bool }`; `Condition` — отправитель или получатель (адрес, домен, группа, `Internal`/`External`), заголовок,
+тема и текст (слова, регулярное выражение), вложение (тип, имя, размер), размер письма; `Action::{ Reject { text }, Drop, AddHeader,
+RemoveHeader, PrependSubject, Disclaimer { text, html }, Copy(address), Redirect(address), Moderate, Route(pattern) }`.
+`MailFlow` (реализация — `tp-smtp`): `apply(&FlowInput { tenant, direction: Inbound | Submission, envelope, message: BlobRef })
+-> FlowOutcome { verdict: Accept | Reject(text) | Drop | Moderate, envelope, message: Option<BlobRef>, route?, matched: Vec<RuleId> }`
+— один раз на письмо, до `DecisionHooks`; изменённое тело — новый объект BLOB (ссылку учитывает вызывающий); `Audit` — только `matched`.
+
 ## Queue (Ф1)
 SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организаций; время передаёт вызывающий):
 `enqueue(OutMessage { tenant, blob, size, from, dsn: DsnParams { envid, ret }, rcpts: Vec<OutRcpt { address, notify, orcpt }>, next_attempt }) -> QueueId`
@@ -268,3 +285,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   — ACL папок и делегирование отправки (META-11) за контрактом; реализации — `PgMeta`, `tp_testkit::MemAcl`, набор `suite::acl_store`.
 - 2026-11-01 — решение «Взаимодействие компонентов и требования к СУБД»: сигналы через PostgreSQL LISTEN/NOTIFY, `Rpc`, `AbuseBlocks`,
   `NodeInfo`; канал и шина Valkey удаляются (реализация — CTR-22, CLU-09).
+- 2026-11-01 — решение «Состав функций транспорта и внешний MTA»: `transport::{TransportStore, MailFlow}`, `EventKind::TransportChanged`
+  (реализация — CTR-23).

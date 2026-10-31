@@ -67,6 +67,7 @@
 
 - imaptest — сценарии IMAP (SELECT, FETCH, IDLE, STORE, APPEND) с профилями клиентов;
 - smtp-source и smtp-sink (Postfix) — входящий поток и приёмник исходящей почты;
+- Postfix как внешний шлюз (XFORWARD) перед smtp-in и промежуточный узел после smtp-out — проверка интеграции с внешним MTA (п. 2.6);
 - k6 — JMAP, push (WebSocket), CalDAV, CardDAV, Admin API;
 - toxiproxy, tc netem — задержки, потери и обрывы между ядром и PostgreSQL / S3;
 - отказы — остановка процесса (kill -9), удаление пода, переключение primary PostgreSQL, выключение узла SeaweedFS, разрыв сети между узлами;

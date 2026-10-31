@@ -112,7 +112,7 @@
 | meta-08 | META-21, META-22, META-23, META-24 | B | contracts-10 | 3 |
 | blob-06 | BLOB-13 | A | meta-08 | 4 |
 | mailstore-07 | MS-12, MS-13 | A | mailstore-06 | 1 |
-| smtp-04 | SMTP-12, SMTP-13, SMTP-14, SMTP-15 | A | smtp-03 | 4 |
+| smtp-04 | SMTP-12, SMTP-13, SMTP-14, SMTP-15 | A | smtp-03, contracts-12 | 4 |
 | smtp-05 | SMTP-16, SMTP-17, SMTP-18, SMTP-19 | A | smtp-04, meta-08, mailstore-07 | 4 |
 | auth-03 | AUTH-07 | A | auth-02, meta-08 | 1 |
 | admin-02 | ADM-05, ADM-06, ADM-07 | A | admin-01, meta-08 | 3 |
@@ -135,6 +135,17 @@
 | auth-04 | AUTH-08 | A | auth-03, meta-10 | 1 |
 | ci-04 | CI-05 | B | ci-03, cluster-06 | 4 |
 | deploy-06 | DEP-09 | A | deploy-05, cluster-06 | 4 |
+
+### Решение 2026-11-01: состав функций транспорта и внешний MTA
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| contracts-12 (ветка `x/contracts-12`) | CTR-23 | B | contracts-11 | 1 |
+| meta-11 | META-28 | A | meta-10, contracts-12 | 3 |
+| smtp-06 | SMTP-20, SMTP-21, SMTP-22, SMTP-23 | A | smtp-05, contracts-12 | 4 |
+| admin-03 | ADM-08 | A | admin-02, contracts-12 | 3 |
+| jmap-04 | JMAP-10 | A | jmap-03, contracts-12 | 3 |
+| app-05 | APP-09 | A | meta-11, smtp-06, admin-03, jmap-04 | 2 |
 
 Выход Ф1: MVP SMB — критерии `docs/spec/APP-D.md#Д.7` для профиля SMB на стенде DEP-04.
 

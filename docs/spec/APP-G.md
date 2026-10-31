@@ -10,7 +10,7 @@
 |---|---|---|---|
 | Платформа | Конфигурация и hot reload, роли, рантайм, системный слой, телеметрия, Admin API, команды doctor и verify | 18 | 14 |
 | Хранилище | Схема PostgreSQL, репозитории, BlobStore (диск, S3), дедупликация с поколениями, GC, «сироты», шардирование и перенос ящиков, миграция бэкенда | 22 | 22 |
-| SMTP | Приём и отправка, очередь, SPF, DKIM, DMARC, ARC, MTA-STS, DANE, Milter-клиент | 24 | 20 |
+| SMTP | Приём и отправка, очередь, SPF, DKIM, DMARC, ARC, MTA-STS, DANE, Milter-клиент, доверенные источники, правила потока, SRS | 24 | 20 |
 | Sieve | Интерпретатор RFC 5228 и расширений, ManageSieve, JMAP Sieve | 8 | 6 |
 | IMAP, POP3 | IMAP4rev2 и расширения, POP3 | 25 | 22 |
 | JMAP | Core, Mail, Submission, Push, Calendars, Contacts, Tasks | 30 | 24 |
