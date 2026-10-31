@@ -102,6 +102,25 @@
 | app-02 | APP-04, APP-05, APP-06 | A | smtp-01, imap-01, jmap-01, search-01, admin-01 | 1 |
 | deploy-02 | DEP-04, DEP-05 | A | app-02 | 4 |
 
+### Решение 2026-11-01: заимствования и базовые принципы безопасности
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| contracts-10 (ветка `x/contracts-10`) | CTR-21 | B | contracts-09 | 1 |
+| sys-03 | SYS-06, SYS-07 | B | sys-01 | 2 |
+| ci-03 | CI-03, CI-04 | B | ci-01 | 4 |
+| platform-06 | PLT-15, PLT-16 | A | sys-03, contracts-10 | 2 |
+| meta-08 | META-21, META-22, META-23, META-24 | B | contracts-10 | 3 |
+| blob-06 | BLOB-13 | A | meta-08 | 4 |
+| mailstore-07 | MS-12, MS-13 | A | mailstore-06 | 1 |
+| smtp-04 | SMTP-12, SMTP-13, SMTP-14, SMTP-15 | A | smtp-03 | 4 |
+| smtp-05 | SMTP-16, SMTP-17, SMTP-18, SMTP-19 | A | smtp-04, meta-08, mailstore-07 | 4 |
+| auth-03 | AUTH-07 | A | auth-02, meta-08 | 1 |
+| admin-02 | ADM-05, ADM-06, ADM-07 | A | admin-01, meta-08 | 3 |
+| imap-04 | IMAP-13 | A | imap-03 | 2 |
+| jmap-03 | JMAP-09 | A | jmap-02 | 3 |
+| deploy-05 | DEP-08 | A | deploy-02, meta-08, platform-06 | 4 |
+
 Выход Ф1: MVP SMB — критерии `docs/spec/APP-D.md#Д.7` для профиля SMB на стенде DEP-04.
 
 ## Ф2–Ф4 базовой поставки (карточки — по завершении Ф1)
@@ -109,7 +128,7 @@
 | Этап | Полосы | Содержание |
 |---|---|---|
 | Ф2. Совместная работа (≈5 мес.) | dav, jmap, sieve, auth | CalDAV, CardDAV, GAL, scheduling, iTIP/iMIP, free/busy, ресурсы; JMAP Contacts/Calendars/Sieve; Sieve и ManageSieve |
-| Ф3. Enterprise (≈5 мес.) | smtp, blob, cluster, admin, app, deploy | Профиль S3, Valkey, режим edge (локальная очередь, реплика получателей, SMTP mTLS, доставка секретов edge от transport — SRS 2.6, решение 2026-10-31), пресеты transport/access/backend/mailbox, экспорт/импорт, эталонные Ansible-роли и Helm-чарт (SRS 5.6), стенд Enterprise и испытания Д.6 |
+| Ф3. Enterprise (≈5 мес.) | smtp, blob, cluster, admin, app, deploy | Профиль S3, Valkey, режим edge (без очереди, сквозная передача на transport, реплика получателей, SMTP mTLS, доставка секретов edge от transport — SRS 2.6, решение 2026-10-31), пресеты transport/access/backend/mailbox, экспорт/импорт, эталонные Ansible-роли и Helm-чарт (SRS 5.6), стенд Enterprise и испытания Д.6 |
 | Ф4. Выпуск (≈3 мес.) | все | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора |
 
 ## Дополнительные модули (SRS 1.3; после Ф1, порядок — решение владельца)
