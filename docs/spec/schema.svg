@@ -149,10 +149,18 @@
 <text x="1350.0" y="412" font-size="11" text-anchor="middle" fill="#262626">удаление — не раньше окна W</text>
 <text x="1350.0" y="427" font-size="11" text-anchor="middle" fill="#262626"></text>
 <text x="1350.0" y="442" font-size="11" text-anchor="middle" fill="#262626">эталон: SeaweedFS · SMB: локальная POSIX-директория</text>
-<rect x="1120" y="520" width="460" height="86" rx="6" fill="#FBE5D6" stroke="#C55A11" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="1350.0" y="540" font-size="14" font-weight="bold" text-anchor="middle" fill="#1A1A1A">Valkey (только Enterprise)</text>
-<text x="1350.0" y="557" font-size="11" text-anchor="middle" fill="#262626">шина событий между узлами: push JMAP, IMAP IDLE</text>
-<text x="1350.0" y="572" font-size="11" text-anchor="middle" fill="#262626">в SMB — шина внутри процесса</text>
+<rect x="1120" y="520" width="220" height="86" rx="6" fill="#FBE5D6" stroke="#C55A11" stroke-width="1.6" stroke-dasharray="6 4"/>
+<rect x="1350" y="520" width="230" height="86" rx="6" fill="#E2F0D9" stroke="#548235" stroke-width="1.6"/>
+<text x="1465.0" y="540" font-size="14" font-weight="bold" text-anchor="middle" fill="#1A1A1A">OpenBao / Vault</text>
+<text x="1465.0" y="557" font-size="11" text-anchor="middle" fill="#262626">секреты: БД, S3, DKIM, ACME</text>
+<text x="1465.0" y="572" font-size="11" text-anchor="middle" fill="#262626">в config.yaml — только ссылки</text>
+<text x="1465.0" y="587" font-size="11" text-anchor="middle" fill="#262626">или хранилище заказчика</text>
+<path d="M1080,616 L1465,616 L1465,608" fill="none" stroke="#404040" stroke-width="1.6" marker-end="url(#a)"/>
+<text x="1300" y="630" font-size="10" text-anchor="middle" fill="#404040">HTTPS (API Vault)</text>
+<text x="1230.0" y="540" font-size="14" font-weight="bold" text-anchor="middle" fill="#1A1A1A">Valkey (Enterprise)</text>
+<text x="1230.0" y="557" font-size="11" text-anchor="middle" fill="#262626">шина событий между узлами:</text>
+<text x="1230.0" y="572" font-size="11" text-anchor="middle" fill="#262626">push JMAP, IMAP IDLE</text>
+<text x="1230.0" y="587" font-size="11" text-anchor="middle" fill="#262626">SMB — внутри процесса</text>
 <path d="M1080,150 L1120,150" fill="none" stroke="#404040" stroke-width="1.6" marker-end="url(#a)" marker-start="url(#a)"/>
 <path d="M1260,150 L1290,150" fill="none" stroke="#404040" stroke-width="1.6" marker-end="url(#a)" marker-start="url(#a)"/>
 <text x="1100" y="142" font-size="10" text-anchor="middle" fill="#404040">SQL</text>
@@ -207,6 +215,7 @@
 <text x="342.0" y="978" font-size="13" font-weight="bold" text-anchor="middle" fill="#1A1A1A">PostgreSQL</text>
 <text x="342.0" y="994" font-size="11" text-anchor="middle" fill="#262626">одиночный экземпляр</text>
 <text x="342.0" y="1009" font-size="11" text-anchor="middle" fill="#262626">бэкап — pgBackRest</text>
+<text x="342.0" y="1024" font-size="11" text-anchor="middle" fill="#262626">+ OpenBao на той же ВМ</text>
 <rect x="452" y="958" width="196" height="88" rx="6" fill="#FFFFFF" stroke="#404040" stroke-width="1.6"/>
 <text x="550.0" y="978" font-size="13" font-weight="bold" text-anchor="middle" fill="#1A1A1A">Локальный диск</text>
 <text x="550.0" y="994" font-size="11" text-anchor="middle" fill="#262626">BLOB и индексы Tantivy</text>
