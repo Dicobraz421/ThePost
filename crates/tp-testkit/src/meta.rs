@@ -260,6 +260,26 @@ impl AccountData {
         })
     }
 
+    /// Новое письмо в папке `mailbox` с новым `ModSeq`; свободный UID проверен (`check_uids`).
+    fn deliver(&mut self, mailbox: MailboxId, msg: NewMessage) -> Result<Inserted> {
+        let ms = self.bump();
+        let message = Message {
+            id: MessageId::new(),
+            mailbox,
+            uid: Uid::MIN,
+            modseq: ms,
+            size: msg.size,
+            received_at: msg.received_at,
+            flags: msg.flags,
+            skeleton: msg.skeleton,
+            parts: msg.parts,
+            meta: msg.meta,
+        };
+        let ins = self.insert_message(ms, mailbox, message)?;
+        self.touch(ms, [mailbox]);
+        Ok(ins)
+    }
+
     /// Копирует письма `src` (существующие) в папку `to` с новыми идентификаторами и UID.
     fn clone_into(
         &mut self,
@@ -566,6 +586,17 @@ fn check_flags(flags: &Flags) -> Result<()> {
     Ok(())
 }
 
+/// Флаги допустимы, объекты письма — организации учётной записи.
+fn check_new(scope: AccountScope, msg: &NewMessage) -> Result<()> {
+    check_flags(&msg.flags)?;
+    if msg.skeleton.tenant != scope.tenant
+        || msg.parts.iter().any(|p| p.blob.tenant != scope.tenant)
+    {
+        return Err(Error::invalid("объект письма другой организации"));
+    }
+    Ok(())
+}
+
 fn apply(op: &FlagOp, old: &Flags) -> Flags {
     match op {
         FlagOp::Add(add) => old.union(add).cloned().collect(),
@@ -852,33 +883,59 @@ impl MessageStore for MemMetadata {
         mailbox: MailboxId,
         msg: NewMessage,
     ) -> Result<Inserted> {
-        check_flags(&msg.flags)?;
-        if msg.skeleton.tenant != scope.tenant
-            || msg.parts.iter().any(|p| p.blob.tenant != scope.tenant)
-        {
-            return Err(Error::invalid("объект письма другой организации"));
-        }
+        check_new(scope, &msg)?;
         self.with_account(scope, |acc, fx| {
             acc.check_uids(mailbox, 1)?;
-            let ms = acc.bump();
-            let message = Message {
-                id: MessageId::new(),
-                mailbox,
-                uid: Uid::MIN,
-                modseq: ms,
-                size: msg.size,
-                received_at: msg.received_at,
-                flags: msg.flags,
-                skeleton: msg.skeleton,
-                parts: msg.parts,
-                meta: msg.meta,
-            };
-            let ins = acc.insert_message(ms, mailbox, message)?;
-            acc.touch(ms, [mailbox]);
+            let ins = acc.deliver(mailbox, msg)?;
             fx.events
                 .push((Some(mailbox), CoreEventKind::Delivered { message: ins.id }));
             Ok(ins)
         })
+    }
+
+    async fn insert_batch(
+        &self,
+        tenant: TenantId,
+        items: Vec<(AccountScope, MailboxId, NewMessage)>,
+    ) -> Result<Vec<Inserted>> {
+        let mut per_mailbox: HashMap<(AccountId, MailboxId), usize> = HashMap::new();
+        for (scope, mailbox, msg) in &items {
+            if scope.tenant != tenant {
+                return Err(Error::invalid("доставка другой организации"));
+            }
+            check_new(*scope, msg)?;
+            *per_mailbox.entry((scope.account, *mailbox)).or_default() += 1;
+        }
+        let mut st = lock(&self.state);
+        // Все условия — до изменений: после проверки раскладка не отказывает, вставлены все или ни одного.
+        for ((account, mailbox), n) in per_mailbox {
+            st.accounts
+                .get(&(tenant, account))
+                .ok_or(Error::NotFound)?
+                .check_uids(mailbox, n)?;
+        }
+        let at = self.clock.now();
+        let mut out = Vec::with_capacity(items.len());
+        let mut events = Vec::with_capacity(items.len());
+        for (scope, mailbox, msg) in items {
+            let acc = st
+                .accounts
+                .get_mut(&(tenant, scope.account))
+                .ok_or(Error::NotFound)?;
+            let ins = acc.deliver(mailbox, msg)?;
+            events.push(CoreEvent {
+                tenant,
+                account: scope.account,
+                mailbox: Some(mailbox),
+                kind: CoreEventKind::Delivered { message: ins.id },
+                at,
+            });
+            out.push(ins);
+        }
+        for e in events {
+            self.events.append(e);
+        }
+        Ok(out)
     }
 
     async fn get(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
@@ -1355,6 +1412,75 @@ mod tests {
         let scope = meta.account("user@example.com").await.expect("ok");
         let inbox = meta.mailbox_by_role(scope, SpecialUse::Inbox).expect("ok");
         (meta, scope, inbox)
+    }
+
+    #[tokio::test]
+    async fn insert_batch_all_or_nothing() {
+        let (meta, a, inbox_a) = setup().await;
+        let b = meta.account("b@example.com").await.expect("ok");
+        let inbox_b = meta.mailbox_by_role(b, SpecialUse::Inbox).expect("ok");
+        let events = meta.event_log().all().len();
+
+        // Сбой на последней вставке (папки нет): ни одного письма и события.
+        let err = meta
+            .insert_batch(
+                TenantId::DEFAULT,
+                vec![
+                    (a, inbox_a, new_message(1)),
+                    (b, inbox_b, new_message(2)),
+                    (b, MailboxId::new(), new_message(3)),
+                ],
+            )
+            .await;
+        assert_eq!(err, Err(Error::NotFound));
+        for (scope, mailbox) in [(a, inbox_a), (b, inbox_b)] {
+            let left = MessageStore::list(&meta, scope, mailbox, MessageQuery::All, 10)
+                .await
+                .expect("ok");
+            assert!(left.is_empty());
+        }
+        assert_eq!(meta.event_log().all().len(), events);
+
+        // Доставка другой организации — весь запрос отклонён.
+        let foreign = AccountScope {
+            tenant: TenantId::new(),
+            account: b.account,
+        };
+        let err = meta
+            .insert_batch(TenantId::DEFAULT, vec![(foreign, inbox_b, new_message(1))])
+            .await;
+        assert!(matches!(err, Err(Error::Invalid(_))));
+
+        // Успех: результат — в порядке доставок, событие доставки на каждую.
+        let ins = meta
+            .insert_batch(
+                TenantId::DEFAULT,
+                vec![
+                    (a, inbox_a, new_message(1)),
+                    (b, inbox_b, new_message(2)),
+                    (a, inbox_a, new_message(3)),
+                ],
+            )
+            .await
+            .expect("ok");
+        assert_eq!(
+            ins.iter().map(|i| i.uid).collect::<Vec<_>>(),
+            [Uid(1), Uid(1), Uid(2)]
+        );
+        for (scope, i, size) in [(a, ins[0], 1), (b, ins[1], 2), (a, ins[2], 3)] {
+            let m = MessageStore::get(&meta, scope, i.id)
+                .await
+                .expect("ok")
+                .expect("some");
+            assert_eq!(m.size, size);
+        }
+        let delivered = meta
+            .event_log()
+            .all()
+            .into_iter()
+            .filter(|e| matches!(e.event.kind, CoreEventKind::Delivered { .. }))
+            .count();
+        assert_eq!(delivered, 3);
     }
 
     #[tokio::test]

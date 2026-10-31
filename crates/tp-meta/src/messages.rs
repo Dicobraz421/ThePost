@@ -3,6 +3,7 @@
 //! Каждая изменяющая операция — одна транзакция: блокировка строки учётной записи и новый `ModSeq`,
 //! изменения строк писем, журнал изменений и события ядра. UID выдаются из `uid_next` строки папки.
 //! `to_trash` и `restore` сохраняют `MessageId` (меняются папка и UID), `copy` и `move_to` создают новые.
+//! `insert_batch` — все доставки приёма одной транзакцией (решение 2026-10-31-atomic-delivery).
 //! Ссылки на объекты BLOB: `copy` добавляет, `expunge_final` снимает — в той же транзакции.
 
 use std::cmp::Ordering;
@@ -16,12 +17,15 @@ use tp_contracts::meta::{
     AccountScope, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Message, MessageQuery, MessageStore,
     NewMessage, PartRef, SpecialUse,
 };
-use tp_contracts::{BlobHash, BlobKey, Error, Gen, MailboxId, MessageId, ModSeq, Result, Uid};
+use tp_contracts::{
+    BlobHash, BlobKey, Error, Gen, MailboxId, MessageId, ModSeq, Result, TenantId, Uid,
+};
 use uuid::Uuid;
 
 use crate::PgMeta;
 use crate::changelog::{self, Change, Op};
 use crate::mailboxes::{self, alloc_uids, by_role, relocate, touch};
+use crate::pool::with_tenant;
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
 
 // ---------- Флаги ----------
@@ -310,6 +314,101 @@ async fn require_all(
     Ok(found)
 }
 
+/// Флаги допустимы, объекты письма — организации учётной записи.
+fn check_new(scope: AccountScope, msg: &NewMessage) -> Result<()> {
+    check_flags(&msg.flags)?;
+    if msg.skeleton.tenant != scope.tenant
+        || msg.parts.iter().any(|p| p.blob.tenant != scope.tenant)
+    {
+        return Err(Error::invalid("объект письма другой организации"));
+    }
+    Ok(())
+}
+
+/// Вставка письма в открытой транзакции: новый `ModSeq`, UID, строки письма и частей, журнал изменений
+/// и событие доставки.
+async fn insert_one(
+    tx: &mut PgConnection,
+    partitions: u32,
+    scope: AccountScope,
+    mailbox: MailboxId,
+    msg: NewMessage,
+) -> Result<Inserted> {
+    let meta = serde_json::to_value(&msg.meta).map_err(|e| Error::internal(e.to_string()))?;
+    let ms = changelog::bump_modseq(tx, scope).await?;
+    let uid = alloc_uids(tx, scope, mailbox, 1, ms).await?;
+    let id = MessageId::new();
+    sqlx::query(
+        "INSERT INTO messages (tenant_id, account_id, message_id, mailbox_id, uid, modseq, size, received_at,
+                               flags, skeleton_hash, skeleton_gen, thread_key, meta)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(id.as_uuid())
+    .bind(mailbox.as_uuid())
+    .bind(i64::from(uid.0))
+    .bind(to_i64(ms.0)?)
+    .bind(to_i64(msg.size)?)
+    .bind(msg.received_at)
+    .bind(flags_vec(&msg.flags))
+    .bind(msg.skeleton.hash.as_bytes().as_slice())
+    .bind(i64::from(msg.skeleton.generation.0))
+    .bind(&msg.meta.thread_key)
+    .bind(meta)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if !msg.parts.is_empty() {
+        let parts: Vec<&str> = msg.parts.iter().map(|p| p.part.as_str()).collect();
+        let hashes: Vec<Vec<u8>> = msg
+            .parts
+            .iter()
+            .map(|p| p.blob.hash.as_bytes().to_vec())
+            .collect();
+        let gens: Vec<i64> = msg
+            .parts
+            .iter()
+            .map(|p| i64::from(p.blob.generation.0))
+            .collect();
+        let sizes = msg
+            .parts
+            .iter()
+            .map(|p| to_i64(p.size))
+            .collect::<Result<Vec<_>>>()?;
+        sqlx::query(
+            "INSERT INTO message_parts (tenant_id, account_id, message_id, part, blob_hash, blob_gen, size)
+             SELECT $1, $2, $3, p.* FROM unnest($4::text[], $5::bytea[], $6::int8[], $7::int8[]) AS p",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(id.as_uuid())
+        .bind(parts)
+        .bind(hashes)
+        .bind(gens)
+        .bind(sizes)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+    let changes = [
+        Change::message(*id.as_uuid(), Op::Created, mailbox, uid),
+        Change::mailbox(mailbox, Op::Updated),
+    ];
+    changelog::log(tx, scope, ms, &changes).await?;
+    let ev = changelog::event(
+        scope,
+        Some(mailbox),
+        CoreEventKind::Delivered { message: id },
+    );
+    changelog::append_events(tx, partitions, &[ev]).await?;
+    Ok(Inserted {
+        id,
+        uid,
+        modseq: ms,
+    })
+}
+
 #[async_trait]
 impl MessageStore for PgMeta {
     async fn insert(
@@ -318,87 +417,45 @@ impl MessageStore for PgMeta {
         mailbox: MailboxId,
         msg: NewMessage,
     ) -> Result<Inserted> {
-        check_flags(&msg.flags)?;
-        if msg.skeleton.tenant != scope.tenant
-            || msg.parts.iter().any(|p| p.blob.tenant != scope.tenant)
-        {
-            return Err(Error::invalid("объект письма другой организации"));
-        }
-        let meta = serde_json::to_value(&msg.meta).map_err(|e| Error::internal(e.to_string()))?;
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let uid = alloc_uids(&mut tx, scope, mailbox, 1, ms).await?;
-        let id = MessageId::new();
-        sqlx::query(
-            "INSERT INTO messages (tenant_id, account_id, message_id, mailbox_id, uid, modseq, size, received_at,
-                                   flags, skeleton_hash, skeleton_gen, thread_key, meta)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(id.as_uuid())
-        .bind(mailbox.as_uuid())
-        .bind(i64::from(uid.0))
-        .bind(to_i64(ms.0)?)
-        .bind(to_i64(msg.size)?)
-        .bind(msg.received_at)
-        .bind(flags_vec(&msg.flags))
-        .bind(msg.skeleton.hash.as_bytes().as_slice())
-        .bind(i64::from(msg.skeleton.generation.0))
-        .bind(&msg.meta.thread_key)
-        .bind(meta)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        if !msg.parts.is_empty() {
-            let parts: Vec<&str> = msg.parts.iter().map(|p| p.part.as_str()).collect();
-            let hashes: Vec<Vec<u8>> = msg
-                .parts
-                .iter()
-                .map(|p| p.blob.hash.as_bytes().to_vec())
-                .collect();
-            let gens: Vec<i64> = msg
-                .parts
-                .iter()
-                .map(|p| i64::from(p.blob.generation.0))
-                .collect();
-            let sizes = msg
-                .parts
-                .iter()
-                .map(|p| to_i64(p.size))
-                .collect::<Result<Vec<_>>>()?;
-            sqlx::query(
-                "INSERT INTO message_parts (tenant_id, account_id, message_id, part, blob_hash, blob_gen, size)
-                 SELECT $1, $2, $3, p.* FROM unnest($4::text[], $5::bytea[], $6::int8[], $7::int8[]) AS p",
-            )
-            .bind(scope.tenant.as_uuid())
-            .bind(scope.account.as_uuid())
-            .bind(id.as_uuid())
-            .bind(parts)
-            .bind(hashes)
-            .bind(gens)
-            .bind(sizes)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        }
-        let changes = [
-            Change::message(*id.as_uuid(), Op::Created, mailbox, uid),
-            Change::mailbox(mailbox, Op::Updated),
-        ];
-        changelog::log(&mut tx, scope, ms, &changes).await?;
-        let ev = changelog::event(
-            scope,
-            Some(mailbox),
-            CoreEventKind::Delivered { message: id },
-        );
-        changelog::append_events(&mut tx, self.cfg.event_partitions, &[ev]).await?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(Inserted {
-            id,
-            uid,
-            modseq: ms,
+        check_new(scope, &msg)?;
+        let partitions = self.cfg.event_partitions;
+        with_tenant(&self.pool, scope.tenant, |tx| {
+            Box::pin(insert_one(tx, partitions, scope, mailbox, msg))
         })
+        .await
+    }
+
+    async fn insert_batch(
+        &self,
+        tenant: TenantId,
+        items: Vec<(AccountScope, MailboxId, NewMessage)>,
+    ) -> Result<Vec<Inserted>> {
+        for (scope, _, msg) in &items {
+            if scope.tenant != tenant {
+                return Err(Error::invalid("доставка другой организации"));
+            }
+            check_new(*scope, msg)?;
+        }
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Строки учётных записей и папок блокируются по порядку идентификаторов: встречные приёмы
+        // не ждут друг друга по кругу.
+        let mut items: Vec<_> = items.into_iter().enumerate().collect();
+        items
+            .sort_by_key(|(_, (scope, mailbox, _))| (*scope.account.as_uuid(), *mailbox.as_uuid()));
+        let partitions = self.cfg.event_partitions;
+        with_tenant(&self.pool, tenant, |tx| {
+            Box::pin(async move {
+                let mut out = Vec::with_capacity(items.len());
+                for (i, (scope, mailbox, msg)) in items {
+                    out.push((i, insert_one(tx, partitions, scope, mailbox, msg).await?));
+                }
+                out.sort_by_key(|(i, _)| *i);
+                Ok(out.into_iter().map(|(_, ins)| ins).collect())
+            })
+        })
+        .await
     }
 
     async fn get(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
