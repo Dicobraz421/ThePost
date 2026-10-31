@@ -39,6 +39,9 @@ pub struct Delivery {
 pub struct IngestRequest {
     /// Организация: дедупликация и все доставки — в её пределах.
     pub tenant: TenantId,
+    /// Отправитель конверта (SMTP `MAIL FROM`); пустой — уведомление о недоставке.
+    /// Хранилище не выводит его из заголовков письма (`Return-Path`).
+    pub mail_from: String,
     /// Исходное письмо (RFC 5322), читается один раз потоково.
     pub raw: ByteStream,
     /// Доставки; пустой список — `Error::Invalid`.
@@ -52,6 +55,7 @@ impl fmt::Debug for IngestRequest {
         // Содержимое письма в отладочный вывод не попадает.
         f.debug_struct("IngestRequest")
             .field("tenant", &self.tenant)
+            .field("mail_from", &self.mail_from)
             .field("deliveries", &self.deliveries)
             .field("received_at", &self.received_at)
             .finish_non_exhaustive()
@@ -71,6 +75,16 @@ pub struct Delivered {
     pub uid: Uid,
 }
 
+/// Результат приёма письма.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ingested {
+    /// Доставки в порядке `IngestRequest::deliveries` (копии в папки от точек принятия решений не входят).
+    pub delivered: Vec<Delivered>,
+    /// Внешние адреса для пересылки копии (`CopyTo::Address` от точек принятия решений).
+    /// В очередь исходящей почты их ставит вызывающий: хранилище почту не отправляет.
+    pub forward: Vec<String>,
+}
+
 /// Почтовое хранилище: приём, чтение и изменение писем.
 ///
 /// Операции, кроме `ingest`, — в контексте одной учётной записи ([`AccountScope`]).
@@ -80,7 +94,7 @@ pub trait MailStore: Send + Sync + 'static {
     /// Принимает письмо: разбор, загрузка частей (одна на всех получателей), метаданные каждой доставки.
     /// Превышение квоты одного получателя — `Error::QuotaExceeded` для всего запроса
     /// (вызывающий исключает получателя и повторяет).
-    async fn ingest(&self, req: IngestRequest) -> Result<Vec<Delivered>>;
+    async fn ingest(&self, req: IngestRequest) -> Result<Ingested>;
 
     /// Исходное письмо побайтово или диапазон его байтов (IMAP `BODY[]<partial>`, JMAP blob).
     async fn fetch_raw(
@@ -144,6 +158,7 @@ mod tests {
     fn ingest_request_debug_hides_body() {
         let req = IngestRequest {
             tenant: TenantId::DEFAULT,
+            mail_from: "sender@example.org".into(),
             raw: Box::pin(futures::stream::iter([Ok(bytes::Bytes::from_static(
                 b"Subject: secret",
             ))])),

@@ -163,13 +163,14 @@ mod tests {
             .store
             .ingest(IngestRequest {
                 tenant: TenantId::DEFAULT,
+                mail_from: String::new(),
                 raw: input(raw, 64 * 1024),
                 deliveries: vec![delivery],
                 received_at: SystemClock.now(),
             })
             .await
             .expect("ingest");
-        (scope, done[0].message)
+        (scope, done.delivered[0].message)
     }
 
     async fn raw(env: &Env, scope: AccountScope, id: MessageId, r: Option<Range<u64>>) -> Bytes {
