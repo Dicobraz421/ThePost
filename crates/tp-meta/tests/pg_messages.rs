@@ -452,7 +452,26 @@ async fn move_trash_restore_expunge_and_changes() {
         .expect("b'");
     assert_eq!(b2.mailbox, inbox);
 
+    // Только из корзины (CTR-18): письмо вне корзины, в том числе восстановленное, остаётся.
+    let kept = meta
+        .expunge_final(scope, &[a.id, back[0].id])
+        .await
+        .expect("skip");
+    assert!(
+        MessageStore::get(&meta, scope, a.id)
+            .await
+            .expect("get")
+            .is_some()
+    );
+    assert!(
+        MessageStore::get(&meta, scope, back[0].id)
+            .await
+            .expect("get")
+            .is_some()
+    );
+    meta.to_trash(scope, &[a.id]).await.expect("trash");
     let gone = meta.expunge_final(scope, &[a.id]).await.expect("expunge");
+    assert!(gone > kept);
     assert_eq!(
         MessageStore::get(&meta, scope, a.id).await.expect("get"),
         None
@@ -554,6 +573,9 @@ async fn copy_and_expunge_adjust_blob_refs() {
     for k in &keys {
         assert_eq!(refcnt(meta.clone(), *k).await, 2);
     }
+    meta.to_trash(scope, &[moved[0].id, a.id])
+        .await
+        .expect("trash");
     meta.expunge_final(scope, &[moved[0].id, a.id])
         .await
         .expect("expunge");

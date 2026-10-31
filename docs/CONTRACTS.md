@@ -53,7 +53,8 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
   в клиенте, клиент повторяет вызов с `cascade = true`; письма всего поддерева — в корзину.
 - `MessageStore`: `insert(scope, mailbox, NewMessage) -> Inserted { id, uid, modseq }`; `get`, `list(mailbox, MessageQuery, limit)`,
   `set_flags(ids, FlagOp, unchanged_since) -> FlagsUpdate`, `copy`, `move_to`, `to_trash`, `restore`, `expunge_final`.
-  `copy`/`move_to` создают новые `MessageId`; `to_trash`/`restore` сохраняют `MessageId` (меняются папка и UID).
+  `copy`/`move_to` создают новые `MessageId`; `to_trash`/`restore` сохраняют `MessageId` (меняются папка и UID);
+  `expunge_final` удаляет только письма в корзине (остальные пропускает).
 - `NewMessage`: `skeleton: BlobKey`, `parts: Vec<PartRef>`, `size`, `received_at`, `flags`, `meta: MessageMeta`
   (envelope, bodystructure, preview, thread key — вычисляются при приёме).
 
@@ -188,6 +189,7 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 Срок корзины — `PolicyResolver` (`trash_retention`, по умолчанию 30 суток из конфигурации): хранилище вычисляет `expires_at`
 при переносе в корзину; изменение политики действует на элементы, удалённые после него.
 Истечение: `expired` → `DecisionHooks::before_final_delete` (`FinalDelete::mailbox` = `origin`) → `MessageStore::expunge_final`; `Deny` — `defer`.
+`expunge_final` удаляет только письма, которые всё ещё в корзине; восстановленные между `expired` и `expunge_final` и прочие — пропуск, не ошибка.
 `Quota`: `usage(scope) -> QuotaUsage` (лимит — `PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded`
 (по умолчанию через `usage` и `QuotaUsage::allows`).
 Политики хранения и Legal Hold — модуль «Соответствие требованиям» через `DecisionHook::before_final_delete`.
