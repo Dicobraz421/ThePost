@@ -28,7 +28,7 @@
 | ✅ meta-02 | META-05, META-06, META-07, META-08, META-13 | B | meta-01, contracts-02 | 3 |
 | ✅ blob-02 | BLOB-03, BLOB-05, BLOB-06, BLOB-07, BLOB-08 | A | blob-01, testkit-01 | 4 |
 | ✅ mailstore-01 | MS-01, MS-02, MS-03, MS-04 | A | contracts-02, testkit-01, blob-02 | 1 |
-| app-01 | APP-01, APP-02, APP-03 | A | platform-03, meta-02, mailstore-01, cluster-02 | 2 |
+| ✅ app-01 | APP-01, APP-02, APP-03 | A | platform-03, meta-02, mailstore-01, cluster-02 | 2 |
 
 ### Решения владельца 2026-10-30 (`docs/decisions/2026-10-30-owner-answers.md`)
 
@@ -52,16 +52,21 @@
 | ✅ testkit-03 | KIT-06 | A | contracts-05 | 1 |
 | ✅ meta-05 | META-15, META-16, META-17 | A/B | meta-04, contracts-05 | 3 |
 | ✅ cluster-03 | CLU-06 | A | cluster-02, contracts-05 | 4 |
-| platform-04 | PLT-12, PLT-13 | B | platform-03, contracts-05 | 2 |
-| meta-06 | META-18, META-19 | A | meta-05, platform-04 | 3 |
+| ✅ platform-04 | PLT-12, PLT-13 | B | platform-03, contracts-05 | 2 |
+| ✅ meta-06 | META-18, META-19 | A | meta-05, platform-04 | 3 |
 
-### Остаток связки Ф0 (отчёт app-01, PR #89)
+### Остаток связки Ф0 (отчёт app-01, PR #89; конверт ingest — `docs/decisions/2026-10-31-ingest-envelope.md`)
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| blob-04 | BLOB-11 | A | blob-03, contracts-05 | 4 |
-| cluster-04 | CLU-07 | A | cluster-03 | 4 |
+| ✅ blob-04 | BLOB-11 | A | blob-03, contracts-05 | 4 |
+| ✅ cluster-04 | CLU-07 | A | cluster-03 | 4 |
+| ✅ platform-05 | PLT-14 | A | platform-04 | 2 |
+| contracts-06 (ветка `x/contracts-06`) | CTR-16 | B | contracts-02 | 1 |
+| mailstore-03 | MS-08 | A | mailstore-01, contracts-06 | 1 |
 | app-03 | APP-07 | A | app-01, platform-04, blob-04, cluster-04, meta-06 | 2 |
+| blob-05 | BLOB-12 | A | app-03 | 4 |
+| cluster-05 | CLU-08 | A | app-03 | 4 |
 
 Выход Ф0: `thepost serve` с минимальным config и `roles: [all]` доходит до ready; RLS по tenant включён; журнал событий и точки расширения работают; `doctor` и `verify` работают; протокол BLOB проверен тестом гонки.
 
