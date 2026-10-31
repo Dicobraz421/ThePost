@@ -1,7 +1,8 @@
 //! Приём письма (CONTRACTS.md#MailStore `ingest`; SRS 3.3, 3.4).
 //!
 //! 1. Письмо читается из потока, точки принятия решений (`DecisionHook::on_delivery`) разрешают,
-//!    запрещают или дополняют доставку (заголовки, копии в журнальные ящики) — до загрузки.
+//!    запрещают или дополняют доставку (заголовки, копии в журнальные ящики) — до загрузки;
+//!    отправитель для них — с конверта (`IngestRequest::mail_from`), внешние копии возвращаются в `forward`.
 //! 2. Разбор на скелет и части ([`Split`]); заголовки получателя — в его скелете, части общие.
 //! 3. Каждый объект учитывается одним `BlobIndex::acquire` на всех получателей (`refs` = число ссылок)
 //!    и загружается, только если его ещё нет; всё — вне транзакций БД (протокол SRS 3.4).
@@ -16,7 +17,6 @@ use std::collections::HashMap;
 
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
-use mail_parser::{HeaderValue, MessageParser};
 use tp_contracts::blob::{Acquire, ByteStream, Commit};
 use tp_contracts::ext::{CopyTo, Decision, DeliveryInfo};
 use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, Ingested};
@@ -39,7 +39,7 @@ impl Store {
     pub(crate) async fn ingest_impl(&self, req: IngestRequest) -> Result<Ingested> {
         let IngestRequest {
             tenant,
-            mail_from: _,
+            mail_from,
             raw,
             mut deliveries,
             received_at,
@@ -51,11 +51,12 @@ impl Store {
 
         let info = DeliveryInfo {
             tenant,
-            mail_from: envelope_from(&deliveries, &raw),
+            mail_from,
             deliveries: deliveries.clone(),
             size: raw.len() as u64,
         };
         let mut common = Vec::new();
+        let mut forward = Vec::new();
         match self.d.hooks.on_delivery(&info).await? {
             Decision::Allow => {}
             Decision::Deny(reason) => {
@@ -67,10 +68,8 @@ impl Store {
                 for copy in a.copies {
                     match copy {
                         CopyTo::Mailbox(d) => deliveries.push(d),
-                        // Внешние копии отправляет smtp-out через очередь; в контракте ingest её нет.
-                        CopyTo::Address(_) => tracing::warn!(
-                            "mailstore: копия внешнему адресату из on_delivery не поддерживается ingest"
-                        ),
+                        // Внешние копии ставит в очередь smtp-out вызывающий.
+                        CopyTo::Address(a) => forward.push(a),
                     }
                 }
             }
@@ -210,7 +209,7 @@ impl Store {
         done.truncate(info.deliveries.len());
         Ok(Ingested {
             delivered: done,
-            forward: Vec::new(),
+            forward,
         })
     }
 
@@ -326,34 +325,6 @@ async fn read_all(stream: ByteStream) -> Result<Bytes> {
         })
         .await?;
     Ok(buf.freeze())
-}
-
-/// Отправитель конверта: `Return-Path` из заголовков получателя (его добавляет SMTP при доставке,
-/// RFC 5321 §4.4), иначе из письма; без него — пусто.
-fn envelope_from(deliveries: &[Delivery], raw: &[u8]) -> String {
-    let from_extra = deliveries.first().and_then(|d| {
-        d.extra_headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case("Return-Path"))
-            .map(|(_, v)| v.clone())
-    });
-    let value = from_extra.or_else(|| {
-        let msg = MessageParser::default().parse_headers(raw)?;
-        match msg.return_path() {
-            HeaderValue::Text(t) => Some(t.to_string()),
-            HeaderValue::TextList(l) => l.last().map(|t| t.to_string()),
-            _ => None,
-        }
-    });
-    value
-        .map(|v| {
-            v.trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .trim()
-                .to_owned()
-        })
-        .unwrap_or_default()
 }
 
 /// Имя заголовка — печатные ASCII без `:`; значение — без переводов строки, кроме свёртки (CRLF + пробел).
@@ -623,7 +594,10 @@ mod tests {
             }
             Ok(Decision::Augment(Augment {
                 headers: vec![("X-Journal".into(), "yes".into())],
-                copies: vec![CopyTo::Mailbox(self.to.clone())],
+                copies: vec![
+                    CopyTo::Mailbox(self.to.clone()),
+                    CopyTo::Address("archive@example.com".into()),
+                ],
             }))
         }
     }
@@ -652,12 +626,15 @@ mod tests {
         };
         let store = with_hook(false);
         let mut ds = recipients(&env, 2).await;
-        ds[0].extra_headers = vec![("Return-Path".into(), "<bounce@example.net>".into())];
+        // Отправитель — с конверта, не из заголовка.
+        ds[0].extra_headers = vec![("Return-Path".into(), "<header@example.net>".into())];
         let raw = mail();
-        let done = store
-            .ingest(request(&raw, ds.clone()))
-            .await
-            .expect("ingest");
+        let req = |ds: Vec<Delivery>| IngestRequest {
+            mail_from: "bounce@example.net".into(),
+            ..request(&raw, ds)
+        };
+        let done = store.ingest(req(ds.clone())).await.expect("ingest");
+        assert_eq!(done.forward, ["archive@example.com"]);
         assert_eq!(
             done.delivered.len(),
             2,
@@ -674,7 +651,7 @@ mod tests {
         assert!(got.starts_with(b"X-Journal: yes\r\n"));
         assert!(got.ends_with(&raw));
 
-        let err = with_hook(true).ingest(request(&raw, ds.clone())).await;
+        let err = with_hook(true).ingest(req(ds.clone())).await;
         assert_eq!(err, Err(Error::Forbidden));
         assert_eq!(inbox_count(&env, &ds[1]).await, 1, "запрет не доставляет");
     }
@@ -719,20 +696,5 @@ mod tests {
                 "{n:?} {v:?}"
             );
         }
-    }
-
-    #[test]
-    fn envelope_from_sources() {
-        let d = |h: Vec<(String, String)>| Delivery {
-            account: tp_contracts::AccountId::new(),
-            mailbox: tp_contracts::MailboxId::new(),
-            extra_headers: h,
-            flags: Default::default(),
-        };
-        let raw = b"Return-Path: <m@x.org>\r\nSubject: s\r\n\r\nb";
-        assert_eq!(envelope_from(&[d(vec![])], raw), "m@x.org");
-        let extra = vec![("return-path".into(), "<e@x.org>".into())];
-        assert_eq!(envelope_from(&[d(extra)], raw), "e@x.org");
-        assert_eq!(envelope_from(&[d(vec![])], b"Subject: s\r\n\r\nb"), "");
     }
 }
