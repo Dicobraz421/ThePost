@@ -1,0 +1,421 @@
+//! Схема индекса ящика и менеджер индексов (SRS 4.6).
+//!
+//! Единица индекса — учётная запись: каталог `{dir}/{tenant}/{account}` с индексом Tantivy. Индексируется
+//! неизменяемое содержимое письма (тема, адреса, тело, текст вложений, заголовки); момент приёма — fast field
+//! для сортировки. Флаги не индексируются, папка — только для фильтра запроса.
+//!
+//! Методы [`MailIndex`] и [`IndexManager`] блокирующие (файловый ввод-вывод): из async-кода — через
+//! `spawn_blocking`. Изменяет индекс один индексатор (лиза раздела журнала), внутри процесса записи
+//! индекса упорядочены.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use schemars::JsonSchema;
+use serde::Deserialize;
+use tantivy::directory::MmapDirectory;
+use tantivy::schema::{
+    DateOptions, Field, IndexRecordOption, JsonObjectOptions, OwnedValue, STORED, STRING, Schema,
+    TextFieldIndexing, TextOptions,
+};
+use tantivy::{
+    DateTime, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term,
+};
+use time::OffsetDateTime;
+use tp_contracts::meta::AccountScope;
+use tp_contracts::{AccountId, Error, MailboxId, MessageId, Result, TenantId};
+
+/// Версия схемы индекса (манифест индекса, CONTRACTS.md#Search): индекс со схемой старше перестраивается.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Имя анализатора текстовых полей в менеджере токенизаторов индекса.
+pub(crate) const TOKENIZER: &str = "default";
+
+/// Наименьший буфер записи Tantivy на поток, байт.
+const MIN_WRITER_MEMORY: usize = 15 << 20;
+
+/// Индексы ящиков на локальном диске (секция `search.index`; поля необязательны, неизвестное — ошибка).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexConfig {
+    /// Каталог индексов ящиков (локальный NVMe). Требует перезапуска.
+    pub dir: PathBuf,
+    /// Буфер записи индекса ящика на пакет, байт (меньше 15 МиБ — 15 МиБ, требование Tantivy).
+    pub writer_memory_bytes: usize,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::from("/var/lib/thepost/search"),
+            writer_memory_bytes: 32 << 20,
+        }
+    }
+}
+
+/// Письмо для индекса: тексты полей (декодированные), папка и момент приёма.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDoc {
+    /// Письмо.
+    pub message: MessageId,
+    /// Папка.
+    pub mailbox: MailboxId,
+    /// Момент приёма (сортировка результатов).
+    pub received_at: OffsetDateTime,
+    /// Тема.
+    pub subject: String,
+    /// `From`.
+    pub from: String,
+    /// `To`.
+    pub to: String,
+    /// `Cc`.
+    pub cc: String,
+    /// `Bcc`.
+    pub bcc: String,
+    /// Текст письма.
+    pub body: String,
+    /// Имена и текст вложений.
+    pub attachments: String,
+    /// Заголовки: имя и значение.
+    pub headers: Vec<(String, String)>,
+}
+
+/// Изменение индекса.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexOp {
+    /// Добавить письмо или заменить его прежний документ.
+    Upsert(Box<IndexDoc>),
+    /// Удалить письмо (отсутствие — не ошибка).
+    Delete(MessageId),
+}
+
+/// Поля схемы.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Fields {
+    pub(crate) id: Field,
+    pub(crate) mailbox: Field,
+    pub(crate) received_at: Field,
+    pub(crate) subject: Field,
+    pub(crate) from: Field,
+    pub(crate) to: Field,
+    pub(crate) cc: Field,
+    pub(crate) bcc: Field,
+    pub(crate) body: Field,
+    pub(crate) attachments: Field,
+    /// Значения всех заголовков (поиск по любому полю).
+    pub(crate) headers: Field,
+    /// Заголовки по имени (нижний регистр): JSON-объект «имя → значения».
+    pub(crate) header: Field,
+    /// Имена заголовков письма (нижний регистр): условие «заголовок есть».
+    pub(crate) header_names: Field,
+}
+
+/// Схема индекса ящика.
+pub(crate) fn schema() -> (Schema, Fields) {
+    let indexing = TextFieldIndexing::default()
+        .set_tokenizer(TOKENIZER)
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+    let text = TextOptions::default().set_indexing_options(indexing.clone());
+    let stored = text.clone().set_stored();
+    let mut b = Schema::builder();
+    let fields = Fields {
+        id: b.add_text_field("id", STRING | STORED),
+        mailbox: b.add_text_field("mailbox", STRING),
+        received_at: b.add_date_field("received_at", DateOptions::default().set_fast()),
+        subject: b.add_text_field("subject", stored.clone()),
+        from: b.add_text_field("from", text.clone()),
+        to: b.add_text_field("to", text.clone()),
+        cc: b.add_text_field("cc", text.clone()),
+        bcc: b.add_text_field("bcc", text.clone()),
+        body: b.add_text_field("body", stored),
+        attachments: b.add_text_field("attachments", text.clone()),
+        headers: b.add_text_field("headers", text),
+        header: b.add_json_field(
+            "header",
+            JsonObjectOptions::default().set_indexing_options(indexing),
+        ),
+        header_names: b.add_text_field("header_names", STRING),
+    };
+    (b.build(), fields)
+}
+
+/// Ошибка Tantivy на границе крейта.
+pub(crate) fn tantivy_err(e: tantivy::TantivyError) -> Error {
+    Error::internal(format!("search index: {e}"))
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Индекс одной учётной записи.
+pub struct MailIndex {
+    index: Index,
+    reader: IndexReader,
+    fields: Fields,
+    writer_memory: usize,
+    /// Записи индекса в процессе — по одной (блокировка каталога Tantivy).
+    write: Mutex<()>,
+}
+
+impl fmt::Debug for MailIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MailIndex")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MailIndex {
+    fn open(dir: MmapDirectory, writer_memory: usize) -> Result<MailIndex> {
+        let (schema, fields) = schema();
+        let index = Index::open_or_create(dir, schema).map_err(tantivy_err)?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(tantivy_err)?;
+        Ok(MailIndex {
+            index,
+            reader,
+            fields,
+            writer_memory: writer_memory.max(MIN_WRITER_MEMORY),
+            write: Mutex::new(()),
+        })
+    }
+
+    /// Снимок индекса на момент последнего [`MailIndex::apply`].
+    pub fn searcher(&self) -> Searcher {
+        self.reader.searcher()
+    }
+
+    /// Число писем в индексе.
+    pub fn docs(&self) -> u64 {
+        self.searcher().num_docs()
+    }
+
+    /// Применяет изменения одним коммитом; после возврата они видны запросам. Блокирующий.
+    pub fn apply(&self, ops: &[IndexOp]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let _write = lock(&self.write);
+        let mut writer: IndexWriter = self
+            .index
+            .writer_with_num_threads(1, self.writer_memory)
+            .map_err(tantivy_err)?;
+        for op in ops {
+            match op {
+                IndexOp::Upsert(doc) => {
+                    writer.delete_term(self.id_term(doc.message));
+                    writer
+                        .add_document(self.document(doc))
+                        .map_err(tantivy_err)?;
+                }
+                IndexOp::Delete(message) => {
+                    writer.delete_term(self.id_term(*message));
+                }
+            }
+        }
+        writer.commit().map_err(tantivy_err)?;
+        drop(writer);
+        self.reader.reload().map_err(tantivy_err)
+    }
+
+    pub(crate) fn id_term(&self, message: MessageId) -> Term {
+        Term::from_field_text(self.fields.id, &message.to_string())
+    }
+
+    fn document(&self, d: &IndexDoc) -> TantivyDocument {
+        let f = &self.fields;
+        let mut doc = TantivyDocument::default();
+        doc.add_text(f.id, d.message.to_string());
+        doc.add_text(f.mailbox, d.mailbox.to_string());
+        doc.add_date(f.received_at, DateTime::from_utc(d.received_at));
+        for (field, text) in [
+            (f.subject, &d.subject),
+            (f.from, &d.from),
+            (f.to, &d.to),
+            (f.cc, &d.cc),
+            (f.bcc, &d.bcc),
+            (f.body, &d.body),
+            (f.attachments, &d.attachments),
+        ] {
+            doc.add_text(field, text);
+        }
+        let mut by_name: BTreeMap<String, Vec<OwnedValue>> = BTreeMap::new();
+        for (name, value) in &d.headers {
+            doc.add_text(f.headers, value);
+            by_name
+                .entry(name.to_lowercase())
+                .or_default()
+                .push(OwnedValue::Str(value.clone()));
+        }
+        for name in by_name.keys().collect::<BTreeSet<_>>() {
+            doc.add_text(f.header_names, name);
+        }
+        let object = by_name
+            .into_iter()
+            .map(|(name, values)| (name, OwnedValue::Array(values)))
+            .collect();
+        doc.add_object(f.header, object);
+        doc
+    }
+}
+
+/// Индексы учётных записей в каталоге [`IndexConfig::dir`]; открытые держит в памяти.
+#[derive(Debug)]
+pub struct IndexManager {
+    cfg: IndexConfig,
+    open: Mutex<HashMap<(TenantId, AccountId), Arc<MailIndex>>>,
+}
+
+impl IndexManager {
+    /// Менеджер индексов по конфигурации.
+    pub fn new(cfg: IndexConfig) -> Self {
+        Self {
+            cfg,
+            open: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Каталог индекса учётной записи.
+    pub fn path(&self, scope: AccountScope) -> PathBuf {
+        self.cfg
+            .dir
+            .join(scope.tenant.to_string())
+            .join(scope.account.to_string())
+    }
+
+    /// Индекс учётной записи; нет — создаётся пустой. Блокирующий.
+    pub fn open_or_create(&self, scope: AccountScope) -> Result<Arc<MailIndex>> {
+        self.get(scope, true)?
+            .ok_or_else(|| Error::internal("search index was not created"))
+    }
+
+    /// Индекс учётной записи; нет — `None` (письма ещё не индексировались). Блокирующий.
+    pub fn open(&self, scope: AccountScope) -> Result<Option<Arc<MailIndex>>> {
+        self.get(scope, false)
+    }
+
+    fn get(&self, scope: AccountScope, create: bool) -> Result<Option<Arc<MailIndex>>> {
+        let mut open = lock(&self.open);
+        if let Some(index) = open.get(&(scope.tenant, scope.account)) {
+            return Ok(Some(index.clone()));
+        }
+        let path = self.path(scope);
+        if !create && !path.join("meta.json").exists() {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(&path)?;
+        let dir = MmapDirectory::open(&path).map_err(|e| Error::internal(format!("{e}")))?;
+        let index = Arc::new(MailIndex::open(dir, self.cfg.writer_memory_bytes)?);
+        open.insert((scope.tenant, scope.account), index.clone());
+        Ok(Some(index))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use tantivy::collector::Count;
+    use tantivy::query::TermQuery;
+    use tp_testkit::{LoadModel, SearchDoc, SyntheticMail};
+
+    pub(crate) fn scope() -> AccountScope {
+        AccountScope {
+            tenant: TenantId::new(),
+            account: AccountId::new(),
+        }
+    }
+
+    pub(crate) fn manager(dir: &tempfile::TempDir) -> IndexManager {
+        IndexManager::new(IndexConfig {
+            dir: dir.path().to_path_buf(),
+            ..IndexConfig::default()
+        })
+    }
+
+    /// Документ индекса из разобранного письма testkit.
+    pub(crate) fn doc(d: SearchDoc) -> IndexDoc {
+        IndexDoc {
+            message: d.message,
+            mailbox: d.mailbox,
+            received_at: d.received_at.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            subject: d.subject,
+            from: d.from,
+            to: d.to,
+            cc: d.cc,
+            bcc: d.bcc,
+            body: d.body,
+            attachments: d.attachments,
+            headers: d.headers,
+        }
+    }
+
+    fn count(index: &MailIndex, field: Field, text: &str) -> usize {
+        let q = TermQuery::new(Term::from_field_text(field, text), IndexRecordOption::Basic);
+        index.searcher().search(&q, &Count).expect("search")
+    }
+
+    #[test]
+    fn index_and_search_1000() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = manager(&dir);
+        let scope = scope();
+        assert!(m.open(scope).expect("open").is_none());
+        let index = m.open_or_create(scope).expect("create");
+        let mailbox = MailboxId::new();
+        let start = OffsetDateTime::UNIX_EPOCH + time::Duration::days(20_000);
+        let ops: Vec<IndexOp> = SyntheticMail::new(7, LoadModel::default())
+            .take(1000)
+            .enumerate()
+            .map(|(i, raw)| {
+                let at = start + time::Duration::minutes(i as i64);
+                let d = SearchDoc::parse(MessageId::new(), mailbox, at, &raw).expect("parse");
+                IndexOp::Upsert(Box::new(doc(d)))
+            })
+            .collect();
+        index.apply(&ops).expect("apply");
+        assert_eq!(index.docs(), 1000);
+        let f = index.fields;
+        // Тема «Synthetic {n}: ...» у каждого письма, номер — у одного.
+        assert_eq!(count(&index, f.subject, "synthetic"), 1000);
+        assert_eq!(count(&index, f.subject, "537"), 1);
+        assert_eq!(count(&index, f.mailbox, &mailbox.to_string()), 1000);
+        assert!(count(&index, f.header_names, "message-id") > 0);
+
+        // Повторная индексация письма заменяет документ, удаление — убирает.
+        let IndexOp::Upsert(first) = &ops[0] else {
+            unreachable!()
+        };
+        index
+            .apply(&[IndexOp::Upsert(first.clone())])
+            .expect("reindex");
+        assert_eq!(index.docs(), 1000);
+        index
+            .apply(&[
+                IndexOp::Delete(first.message),
+                IndexOp::Delete(MessageId::new()),
+            ])
+            .expect("delete");
+        assert_eq!(index.docs(), 999);
+
+        // Индекс переживает перезапуск: новый менеджер открывает каталог.
+        drop(index);
+        let reopened = manager(&dir).open(scope).expect("reopen").expect("exists");
+        assert_eq!(reopened.docs(), 999);
+        assert_eq!(count(&reopened, f.subject, "537"), 1);
+    }
+
+    #[test]
+    fn config_defaults_and_unknown() {
+        assert_eq!(
+            crate::tests::from_pairs::<IndexConfig>(&[]).expect("defaults"),
+            IndexConfig::default()
+        );
+        assert!(crate::tests::from_pairs::<IndexConfig>(&[("dirr", "/x")]).is_err());
+    }
+}
