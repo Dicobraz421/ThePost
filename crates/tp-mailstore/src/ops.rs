@@ -40,6 +40,7 @@ impl Store {
         ids: &[MessageId],
         to: MailboxId,
     ) -> Result<Vec<Inserted>> {
+        self.check_copy_quota(scope, ids).await?;
         let inserted = self.d.messages.copy(scope, ids, to).await?;
         if let Some(modseq) = inserted.first().map(|i| i.modseq) {
             self.notify(scope, [to], modseq).await;

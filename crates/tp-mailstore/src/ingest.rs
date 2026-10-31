@@ -3,6 +3,7 @@
 //! 1. Письмо читается из потока, точки принятия решений (`DecisionHook::on_delivery`) разрешают,
 //!    запрещают или дополняют доставку (заголовки, копии в журнальные ящики) — до загрузки;
 //!    отправитель для них — с конверта (`IngestRequest::mail_from`), внешние копии возвращаются в `forward`.
+//!    Затем квота всех доставок, включая копии ([`crate::quota`]).
 //! 2. Разбор на скелет и части ([`Split`]); заголовки получателя — в его скелете, части общие.
 //! 3. Каждый объект учитывается одним `BlobIndex::acquire` на всех получателей (`refs` = число ссылок)
 //!    и загружается, только если его ещё нет; всё — вне транзакций БД (протокол SRS 3.4).
@@ -78,6 +79,15 @@ impl Store {
         for d in &deliveries {
             check_headers(&d.extra_headers)?;
         }
+        // Квота — до разбора и загрузки: превышение у одного получателя отклоняет весь запрос.
+        let demands: Vec<_> = deliveries
+            .iter()
+            .map(|d| {
+                let size = header_block(&d.extra_headers, &common).len() + raw.len();
+                (d.account, size as u64)
+            })
+            .collect();
+        self.check_quota(tenant, &demands).await?;
 
         // Разбор — работа процессора на всё письмо: вне потоков асинхронного рантайма.
         let split = tokio::task::spawn_blocking(move || Split::new(raw))

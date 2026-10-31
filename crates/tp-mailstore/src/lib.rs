@@ -19,12 +19,13 @@ use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{IngestRequest, Ingested, MailStore};
 use tp_contracts::meta::{AccountScope, ChangeLog, FlagOp, FlagsUpdate, Inserted, MessageStore};
-use tp_contracts::retention::TrashStore;
+use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::{MailboxId, MessageId, ModSeq, Result};
 
 mod fetch;
 mod ingest;
 mod ops;
+pub mod quota;
 pub mod split;
 pub mod trash;
 
@@ -58,6 +59,8 @@ pub struct Deps {
     pub changes: Arc<dyn ChangeLog>,
     /// Корзина: элементы с истёкшим сроком.
     pub trash: Arc<dyn TrashStore>,
+    /// Квоты учётных записей.
+    pub quota: Arc<dyn Quota>,
     /// Шина уведомлений.
     pub bus: Arc<dyn EventBus>,
     /// Точки принятия решений модулей.
@@ -178,6 +181,7 @@ pub(crate) mod testenv {
     use super::*;
     use tp_testkit::{Clock, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata, SystemClock};
 
+    use crate::quota::fake::TestQuota;
     use crate::trash::fake::TestTrash;
 
     pub struct Env {
@@ -186,6 +190,7 @@ pub(crate) mod testenv {
         pub meta: MemMetadata,
         pub bus: MemEventBus,
         pub trash: TestTrash,
+        pub quota: TestQuota,
         pub store: Store,
     }
 
@@ -201,12 +206,14 @@ pub(crate) mod testenv {
             let meta = MemMetadata::new(clock).with_blob_index(index.clone());
             let bus = MemEventBus::default();
             let trash = TestTrash::new(meta.clone());
+            let quota = TestQuota::new(meta.clone());
             let store = Store::new(Deps {
                 blobs: Arc::new(blobs.clone()),
                 index: Arc::new(index.clone()),
                 messages: Arc::new(meta.clone()),
                 changes: Arc::new(meta.clone()),
                 trash: Arc::new(trash.clone()),
+                quota: Arc::new(quota.clone()),
                 bus: Arc::new(bus.clone()),
                 hooks,
             });
@@ -216,6 +223,7 @@ pub(crate) mod testenv {
                 meta,
                 bus,
                 trash,
+                quota,
                 store,
             }
         }
