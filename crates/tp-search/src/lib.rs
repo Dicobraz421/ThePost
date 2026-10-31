@@ -2,11 +2,14 @@
 //!
 //! - [`index`] — схема индекса ящика и менеджер индексов в каталоге;
 //! - [`analyzers`] — анализатор текста: слова, регистр, «ё», стеммеры Snowball (ru, en);
+//! - [`query`] — исполнитель запросов [`tp_contracts::search::SearchIndex`];
 
 pub mod analyzers;
 pub mod index;
+pub mod query;
 
 pub use index::{IndexConfig, IndexDoc, IndexManager, IndexOp, MailIndex, SCHEMA_VERSION};
+pub use query::{QueryConfig, Search};
 
 #[cfg(test)]
 pub(crate) mod tests {

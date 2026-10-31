@@ -186,7 +186,6 @@ impl MailIndex {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn fields(&self) -> &Fields {
         &self.fields
     }
