@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 43 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:45:00 +0300" "No closing boundary" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-045@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL)("application" "pdf" ("name" "x.pdf") NIL NIL "base64" 810 NIL ("attachment" ("filename" "x.pdf")) NIL NIL) "mixed" ("boundary" "b1") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {119}
+From: Alice Example <alice@example.com>
+Subject: No closing boundary
+Content-Type: multipart/mixed; boundary="b1"
+
+ BINARY.SIZE[1] 100)
+F43 OK FETCH completed

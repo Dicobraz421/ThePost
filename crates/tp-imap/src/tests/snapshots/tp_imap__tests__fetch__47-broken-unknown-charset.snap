@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 47 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:49:00 +0300" "Hello" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-049@example.com>") BODYSTRUCTURE ("TEXT" "plain" ("charset" "x-unknown-charset") NIL NIL "8bit" 100 0 NIL NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {133}
+From: Alice Example <alice@example.com>
+Subject: =?x-unknown?B?SGVsbG8=?=
+Content-Type: text/plain; charset="x-unknown-charset"
+
+ BINARY.SIZE[1] 100)
+F47 OK FETCH completed

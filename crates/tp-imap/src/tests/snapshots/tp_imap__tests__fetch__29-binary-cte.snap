@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 29 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:27:00 +0300" "Binary CTE" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-027@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL)("application" "octet-stream" NIL NIL NIL "binary" 253 NIL NIL NIL NIL) "mixed" ("boundary" "mix-9") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {113}
+From: Alice Example <alice@example.com>
+Subject: Binary CTE
+Content-Type: multipart/mixed; boundary="mix-9"
+
+ BINARY.SIZE[1] 100)
+F29 OK FETCH completed

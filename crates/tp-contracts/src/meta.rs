@@ -419,6 +419,15 @@ pub trait MessageStore: Send + Sync + 'static {
         msg: NewMessage,
     ) -> Result<Inserted>;
 
+    /// Вставляет письма всех доставок одного приёма одной транзакцией (решение 2026-10-31-atomic-delivery):
+    /// вставлены все или ни одного; события доставки — в той же транзакции. Результат — в порядке `items`.
+    /// `scope.tenant` элемента не равен `tenant` — `Error::Invalid`; нет учётной записи или папки — `Error::NotFound`.
+    async fn insert_batch(
+        &self,
+        tenant: TenantId,
+        items: Vec<(AccountScope, MailboxId, NewMessage)>,
+    ) -> Result<Vec<Inserted>>;
+
     /// Письмо по идентификатору.
     async fn get(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>>;
 

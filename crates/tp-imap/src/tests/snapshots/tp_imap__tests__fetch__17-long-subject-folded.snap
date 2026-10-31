@@ -1,0 +1,13 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 17 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:15:00 +0300" "A very long subject line that is folded across multiple header lines because it exceeds the recommended seventy-eight characters by a wide margin" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL "<c@example.com>" "<corpus-015@example.com>") BODYSTRUCTURE ("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {246}
+From: Alice Example <alice@example.com>
+Subject: A very long subject line that is folded across multiple header lines
+ because it exceeds the recommended seventy-eight characters
+ by a wide margin
+Content-Type: text/plain; charset="utf-8"
+
+ BINARY.SIZE[1] 100)
+F17 OK FETCH completed

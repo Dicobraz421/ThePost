@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 22 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:20:00 +0300" "Budget XLSX" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-020@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL)("application" "vnd.openxmlformats-officedocument.spreadsheetml.sheet" ("name" "budget.xlsx") NIL NIL "base64" 2096 NIL ("attachment" ("filename" "budget.xlsx")) NIL NIL) "mixed" ("boundary" "mix-3") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {114}
+From: Alice Example <alice@example.com>
+Subject: Budget XLSX
+Content-Type: multipart/mixed; boundary="mix-3"
+
+ BINARY.SIZE[1] 100)
+F22 OK FETCH completed

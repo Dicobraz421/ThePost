@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 27 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:25:00 +0300" "Alternative + related" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-025@example.com>") BODYSTRUCTURE ((("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL)(("TEXT" "html" ("charset" "utf-8") NIL NIL "8bit" 27 0 NIL NIL NIL NIL)("image" "png" ("name" "img1.png") "<img1>" NIL "base64" 98 NIL ("inline" ("filename" "img1.png")) NIL NIL) "related" ("boundary" "rel-2") NIL NIL NIL) "alternative" ("boundary" "alt-3") NIL NIL NIL)("application" "pdf" ("name" "doc.pdf") NIL NIL "base64" 808 NIL ("attachment" ("filename" "doc.pdf")) NIL NIL) "mixed" ("boundary" "mix-7") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {124}
+From: Alice Example <alice@example.com>
+Subject: Alternative + related
+Content-Type: multipart/mixed; boundary="mix-7"
+
+ BINARY.SIZE[1] 740)
+F27 OK FETCH completed

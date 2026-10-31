@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 51 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:53:00 +0300" "Boundary clash" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-053@example.com>") BODYSTRUCTURE ((("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL) "alternative" ("boundary" "same") NIL NIL NIL)("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 5 0 NIL NIL NIL NIL) "mixed" ("boundary" "same") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {116}
+From: Alice Example <alice@example.com>
+Subject: Boundary clash
+Content-Type: multipart/mixed; boundary="same"
+
+ BINARY.SIZE[1] 244)
+F51 OK FETCH completed

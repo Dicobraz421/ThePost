@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 44 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:46:00 +0300" "Missing boundary" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-046@example.com>") BODYSTRUCTURE ("TEXT" "plain" NIL NIL NIL "7bit" 196 0 NIL NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {101}
+From: Alice Example <alice@example.com>
+Subject: Missing boundary
+Content-Type: multipart/mixed
+
+ BINARY.SIZE[1] 196)
+F44 OK FETCH completed

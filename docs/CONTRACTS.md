@@ -51,7 +51,9 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
   `delete` папки с вложенными без `cascade` — `Conflict`: решение («удалить вместе с вложенными?») принимает пользователь
   в клиенте, клиент повторяет вызов с `cascade = true`; письма всего поддерева — в корзину.
-- `MessageStore`: `insert(scope, mailbox, NewMessage) -> Inserted { id, uid, modseq }`; `get`, `list(mailbox, MessageQuery, limit)`,
+- `MessageStore`: `insert(scope, mailbox, NewMessage) -> Inserted { id, uid, modseq }` (APPEND, импорт);
+  `insert_batch(tenant, Vec<(AccountScope, MailboxId, NewMessage)>) -> Vec<Inserted>` — все доставки одного приёма
+  одной транзакцией: вставлены все или ни одного, события доставки — в ней же (решение 2026-10-31-atomic-delivery); `get`, `list(mailbox, MessageQuery, limit)`,
   `set_flags(ids, FlagOp, unchanged_since) -> FlagsUpdate`, `copy`, `move_to`, `to_trash`, `restore`, `expunge_final`.
   `copy`/`move_to` создают новые `MessageId`; `to_trash`/`restore` сохраняют `MessageId` (меняются папка и UID);
   `expunge_final` удаляет только письма в корзине (остальные пропускает).
@@ -246,5 +248,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `step(Option<&[u8]>)` (нет начального ответа ≠ пустой).
 - 2026-10-31 — CTR-09 (волна contracts-03): манифест индекса — `schema`, `IndexSegment::docs`, `rebuild`; `put_manifest(.., ManifestUpdate)`,
   `request_rebuild`, `pending_rebuilds`.
+- 2026-10-31 — CTR-20 (решение 2026-10-31-atomic-delivery): `MessageStore::insert_batch` — все доставки приёма одной транзакцией.
 - 2026-10-31 — CTR-19 (x/contracts-08): `acl::{AclStore, AclEntry, SharedMailbox, SendDelegation, ANYONE, validate_identifier, effective_rights}`
   — ACL папок и делегирование отправки (META-11) за контрактом; реализации — `PgMeta`, `tp_testkit::MemAcl`, набор `suite::acl_store`.

@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 23 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:21:00 +0300" "Three attachments" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-021@example.com>") BODYSTRUCTURE ((("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 100 0 NIL NIL NIL NIL)("TEXT" "html" ("charset" "utf-8") NIL NIL "8bit" 107 0 NIL NIL NIL NIL) "alternative" ("boundary" "inner-alt") NIL NIL NIL)("application" "pdf" ("name" "a.pdf") NIL NIL "base64" 808 NIL ("attachment" ("filename" "a.pdf")) NIL NIL)("application" "vnd.openxmlformats-officedocument.wordprocessingml.document" ("name" "b.docx") NIL NIL "base64" 1246 NIL ("attachment" ("filename" "b.docx")) NIL NIL)("application" "vnd.openxmlformats-officedocument.spreadsheetml.sheet" ("name" "c.xlsx") NIL NIL "base64" 2096 NIL ("attachment" ("filename" "c.xlsx")) NIL NIL) "mixed" ("boundary" "mix-4") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {120}
+From: Alice Example <alice@example.com>
+Subject: Three attachments
+Content-Type: multipart/mixed; boundary="mix-4"
+
+ BINARY.SIZE[1] 453)
+F23 OK FETCH completed

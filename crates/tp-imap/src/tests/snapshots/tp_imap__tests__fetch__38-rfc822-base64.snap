@@ -1,0 +1,11 @@
+---
+source: crates/tp-imap/src/tests/fetch.rs
+expression: r
+---
+* 38 FETCH (ENVELOPE ("Thu, 29 Oct 2026 10:40:00 +0300" "rfc822 in base64" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-040@example.com>") BODYSTRUCTURE (("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 16 0 NIL NIL NIL NIL)("MESSAGE" "RFC822" NIL NIL NIL "base64" 714 ("Thu, 29 Oct 2026 10:33:00 +0300" "=?utf-8?B?0JLQu9C+0LbQtdC90L3QvtC1INC/0LjRgdGM0LzQvg==?=" (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Alice Example" NIL "alice" "example.com")) (("Bob" NIL "bob" "example.org")) NIL NIL NIL "<corpus-033@example.com>") ("TEXT" "plain" ("charset" "utf-8") NIL NIL "8bit" 213 0 NIL NIL NIL NIL) 9 NIL NIL NIL NIL) "mixed" ("boundary" "fwd-3") NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)] {119}
+From: Alice Example <alice@example.com>
+Subject: rfc822 in base64
+Content-Type: multipart/mixed; boundary="fwd-3"
+
+ BINARY.SIZE[1] 16)
+F38 OK FETCH completed
