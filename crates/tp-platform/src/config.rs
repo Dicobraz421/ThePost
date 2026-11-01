@@ -1353,6 +1353,37 @@ mod tests {
         assert!(e.starts_with("profile: unknown variant"), "{e}");
     }
 
+    /// Приёмка PLT-18: служебный HTTP по умолчанию на loopback; публичный адрес и все интерфейсы без явного
+    /// списка внутренних сетей — ошибка `config check`.
+    #[test]
+    fn service_http_internal_only() {
+        let cfg = strict(MINIMAL).expect("default");
+        let http = cfg
+            .section::<ServiceHttpConfig>("service_http")
+            .expect("service_http");
+        assert!(http.listen.ip().is_loopback(), "{}", http.listen);
+
+        for listen in ["\"0.0.0.0:8081\"", "\"[::]:8081\"", "\"203.0.113.5:8081\""] {
+            let e = lines(
+                strict(&format!("{MINIMAL}service_http: {{ listen: {listen} }}\n"))
+                    .expect_err(listen),
+            );
+            assert!(
+                e.iter().any(|l| l.starts_with("service_http: listen")
+                    && l.contains("not an internal address")),
+                "{listen}: {e:#?}"
+            );
+        }
+        for ok in [
+            "{ listen: \"10.1.2.3:8081\" }",
+            "{ listen: \"[fd00::1]:8081\" }",
+            "{ listen: \"0.0.0.0:8081\", internal_networks: [0.0.0.0/32] }",
+            "{ listen: \"203.0.113.5:8081\", internal_networks: [203.0.113.0/24] }",
+        ] {
+            strict(&format!("{MINIMAL}service_http: {ok}\n")).expect(ok);
+        }
+    }
+
     /// Приёмка PLT-09: один файл с неизвестными полями (секция, модуль, верхний уровень), ошибкой типа
     /// и открытыми внутренними каналами вне dev.
     #[test]

@@ -8,7 +8,7 @@ HTTP включает `acme::challenge_router`) — до волны прилож
 ## Выпуск
 1. В config.yaml:
    ```yaml
-   service_http: { listen: "0.0.0.0:80" }   # или проброс 80 → 8081
+   service_http: { listen: "0.0.0.0:80", internal_networks: ["0.0.0.0/32"] }   # или проброс 80 → 8081; без списка — ошибка (PLT-18)
    tls:
      cert_file: /var/lib/thepost/tls/fullchain.pem
      key_file: /var/lib/thepost/tls/privkey.pem
