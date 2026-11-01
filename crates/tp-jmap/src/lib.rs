@@ -2,12 +2,14 @@
 //!
 //! - [`core`] — сессия, запрос API, ссылки на результаты, ошибки, лимиты, аутентификация, capability модулей (RFC 8620);
 //! - `mailbox` — Mailbox/get, changes, query, queryChanges, set (RFC 8621 §2);
-//! - `email_get` — Email/get, Email/changes, Thread/get, Thread/changes (RFC 8621 §3, §4.2–4.3).
+//! - `email_get` — Email/get, Email/changes, Thread/get, Thread/changes (RFC 8621 §3, §4.2–4.3);
+//! - `email_query` — Email/query, Email/queryChanges: фильтры, сортировка, collapseThreads, текст через `SearchIndex`.
 //!
 //! Протокол — JSON поверх HTTP: типы запросов и ответов — `serde_json`, HTTP — `axum`.
 
 pub mod core;
 mod email_get;
+mod email_query;
 mod mailbox;
 #[cfg(test)]
 mod testenv;
@@ -31,10 +33,12 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("Email/changes", MAIL),
     ("Thread/get", MAIL),
     ("Thread/changes", MAIL),
+    ("Email/query", MAIL),
+    ("Email/queryChanges", MAIL),
 ];
 
 /// Варианты сортировки `Email/query` (сессия, `emailQuerySortOptions`).
-pub(crate) const EMAIL_SORT_OPTIONS: &[&str] = &[];
+pub(crate) const EMAIL_SORT_OPTIONS: &[&str] = email_query::SORT_OPTIONS;
 
 /// Выполняет встроенный метод из [`METHODS`].
 pub(crate) async fn call_builtin(
@@ -53,6 +57,8 @@ pub(crate) async fn call_builtin(
         "Email/changes" => email_get::changes(ctx, args).await,
         "Thread/get" => email_get::thread_get(ctx, args).await,
         "Thread/changes" => email_get::thread_changes(ctx, args).await,
+        "Email/query" => email_query::query(ctx, args).await,
+        "Email/queryChanges" => email_query::query_changes(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
 }
