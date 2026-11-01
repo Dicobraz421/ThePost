@@ -3,7 +3,8 @@
 //! - [`ldap`] — каталог организации ([`Directory`](tp_contracts::auth::Directory)) поверх LDAPS и проверка
 //!   пароля привязкой (bind) к каталогу;
 //! - [`password`] — [`Authenticator`] для имени входа и пароля: пароли
-//!   приложений (argon2) с отзывом и пароль каталога. Защиту от перебора (`tp-platform`, PLT-07) вызывают
+//!   приложений (argon2, хранилище — [`AppPasswordStore`](tp_contracts::app_password::AppPasswordStore))
+//!   с отзывом и пароль каталога. Защиту от перебора (`tp-platform`, PLT-07) вызывают
 //!   протоколы до проверки и по её результату;
 //! - [`oidc`] — [`Authenticator`] для токенов OpenID Connect (Bearer);
 //! - [`sasl`] — механизмы SASL PLAIN, LOGIN, OAUTHBEARER, XOAUTH2 для smtp и imap; пароль и токен в одном
@@ -25,10 +26,7 @@ pub mod sasl;
 
 pub use ldap::{LdapConfig, LdapDirectory};
 pub use oidc::{OidcAuthenticator, OidcConfig};
-pub use password::{
-    AppPassword, AppPasswordStore, AppPasswords, PasswordAuthenticator, PasswordCheck,
-    PasswordConfig,
-};
+pub use password::{AppPasswords, PasswordAuthenticator, PasswordCheck, PasswordConfig};
 pub use sasl::AuthSasl;
 
 /// Группы учётной записи для `Principal::groups` (с учётом вложенности). Реализация — [`LdapDirectory`].
@@ -227,7 +225,15 @@ pub(crate) mod testutil {
 
     /// Учётные записи `(login, enabled)` в `MemMetadata` организации по умолчанию.
     pub(crate) async fn accounts(list: &[(&str, bool)]) -> (Accounts, Vec<AccountId>) {
-        let meta = Arc::new(MemMetadata::new(Arc::new(SystemClock)));
+        let (_, accounts, ids) = meta_accounts(list).await;
+        (accounts, ids)
+    }
+
+    /// То же, что [`accounts`], и сами метаданные (для хранилищ `tp-testkit` поверх них).
+    pub(crate) async fn meta_accounts(
+        list: &[(&str, bool)],
+    ) -> (MemMetadata, Accounts, Vec<AccountId>) {
+        let meta = MemMetadata::new(Arc::new(SystemClock));
         let domain = DomainId::new();
         let mut ids = Vec::new();
         for (login, enabled) in list {
@@ -246,8 +252,9 @@ pub(crate) mod testutil {
                 .expect("upsert");
             ids.push(a.id);
         }
-        let accounts = Accounts::new(TenantId::DEFAULT, meta).with_groups(Arc::new(StaffOnly));
-        (accounts, ids)
+        let accounts = Accounts::new(TenantId::DEFAULT, Arc::new(meta.clone()))
+            .with_groups(Arc::new(StaffOnly));
+        (meta, accounts, ids)
     }
 
     /// Каждый — в группе `staff`.

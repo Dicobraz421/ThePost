@@ -14,9 +14,11 @@ use async_trait::async_trait;
 use rand::RngExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tp_contracts::app_password::{AppPassword, AppPasswordStore};
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
+use tp_contracts::meta::AccountScope;
 use tp_contracts::secrets::Secret;
-use tp_contracts::{AccountId, Error, Result, TenantId};
+use tp_contracts::{Error, Result};
 
 use crate::Accounts;
 use crate::ldap::LdapDirectory;
@@ -86,56 +88,6 @@ impl PasswordConfig {
     }
 }
 
-/// Пароль приложения (без значения: оно выдаётся один раз при выпуске).
-#[derive(Clone, PartialEq, Eq)]
-pub struct AppPassword {
-    /// Идентификатор (для отзыва).
-    pub id: String,
-    /// Подпись владельца («Телефон», «Thunderbird дома»).
-    pub label: String,
-    /// Хэш argon2id, PHC-строка.
-    pub hash: String,
-    /// Выпущен.
-    pub created_at: SystemTime,
-    /// Отозван; отозванный пароль не принимается.
-    pub revoked_at: Option<SystemTime>,
-}
-
-impl fmt::Debug for AppPassword {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AppPassword")
-            .field("id", &self.id)
-            .field("label", &self.label)
-            .field("created_at", &self.created_at)
-            .field("revoked_at", &self.revoked_at)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Хранилище паролей приложений учётной записи (метаданные).
-#[async_trait]
-pub trait AppPasswordStore: Send + Sync + 'static {
-    /// Пароли учётной записи, включая отозванные.
-    async fn list(&self, tenant: TenantId, account: AccountId) -> Result<Vec<AppPassword>>;
-
-    /// Добавляет пароль.
-    async fn insert(
-        &self,
-        tenant: TenantId,
-        account: AccountId,
-        password: AppPassword,
-    ) -> Result<()>;
-
-    /// Отмечает пароль отозванным; нет пароля — `NotFound`, повторный отзыв — не ошибка.
-    async fn revoke(
-        &self,
-        tenant: TenantId,
-        account: AccountId,
-        id: &str,
-        at: SystemTime,
-    ) -> Result<()>;
-}
-
 /// Выпуск, отзыв и проверка паролей приложений.
 #[derive(Clone)]
 pub struct AppPasswords {
@@ -160,15 +112,10 @@ impl AppPasswords {
 
     /// Выпускает пароль с подписью `label`; значение возвращается один раз. Предел действующих паролей —
     /// `Conflict`.
-    pub async fn issue(
-        &self,
-        tenant: TenantId,
-        account: AccountId,
-        label: &str,
-    ) -> Result<(AppPassword, Secret)> {
+    pub async fn issue(&self, scope: AccountScope, label: &str) -> Result<(AppPassword, Secret)> {
         let active = self
             .store
-            .list(tenant, account)
+            .list(scope)
             .await?
             .iter()
             .filter(|p| p.revoked_at.is_none())
@@ -198,30 +145,28 @@ impl AppPasswords {
             id,
             label: label.to_owned(),
             hash,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::now().into(),
             revoked_at: None,
         };
-        self.store.insert(tenant, account, password.clone()).await?;
+        self.store.insert(scope, password.clone()).await?;
         Ok((password, value))
     }
 
     /// Отзывает пароль `id`.
-    pub async fn revoke(&self, tenant: TenantId, account: AccountId, id: &str) -> Result<()> {
-        self.store
-            .revoke(tenant, account, id, SystemTime::now())
-            .await
+    pub async fn revoke(&self, scope: AccountScope, id: &str) -> Result<()> {
+        self.store.revoke(scope, id, SystemTime::now().into()).await
     }
 
     /// Пароли учётной записи (без значений), включая отозванные.
-    pub async fn list(&self, tenant: TenantId, account: AccountId) -> Result<Vec<AppPassword>> {
-        self.store.list(tenant, account).await
+    pub async fn list(&self, scope: AccountScope) -> Result<Vec<AppPassword>> {
+        self.store.list(scope).await
     }
 
     /// Совпадает ли `secret` с действующим паролем приложения учётной записи.
-    pub async fn verify(&self, tenant: TenantId, account: AccountId, secret: &str) -> Result<bool> {
+    pub async fn verify(&self, scope: AccountScope, secret: &str) -> Result<bool> {
         let hashes: Vec<String> = self
             .store
-            .list(tenant, account)
+            .list(scope)
             .await?
             .into_iter()
             .filter(|p| p.revoked_at.is_none())
@@ -313,9 +258,11 @@ impl Authenticator for PasswordAuthenticator {
         let account = self.accounts.enabled(&login).await?;
         let mut ok = false;
         if let Some(apps) = &self.apps {
-            ok = apps
-                .verify(account.tenant, account.id, secret.expose())
-                .await?;
+            let scope = AccountScope {
+                tenant: account.tenant,
+                account: account.id,
+            };
+            ok = apps.verify(scope, secret.expose()).await?;
         }
         if !ok && let Some(dir) = &self.directory {
             ok = dir.check_password(&account.login, secret.expose()).await?;
@@ -331,58 +278,12 @@ impl Authenticator for PasswordAuthenticator {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
-    use std::sync::Mutex;
+
+    use tp_contracts::TenantId;
+    use tp_testkit::MemAppPasswords;
 
     use super::*;
-    use crate::testutil::accounts;
-
-    /// Пароли приложений в памяти (временно: хранилища в метаданных и контракта для него пока нет).
-    #[derive(Default)]
-    struct MemAppPasswords(Mutex<HashMap<(TenantId, AccountId), Vec<AppPassword>>>);
-
-    #[async_trait]
-    impl AppPasswordStore for MemAppPasswords {
-        async fn list(&self, tenant: TenantId, account: AccountId) -> Result<Vec<AppPassword>> {
-            Ok(self
-                .0
-                .lock()
-                .expect("lock")
-                .get(&(tenant, account))
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        async fn insert(
-            &self,
-            tenant: TenantId,
-            account: AccountId,
-            password: AppPassword,
-        ) -> Result<()> {
-            self.0
-                .lock()
-                .expect("lock")
-                .entry((tenant, account))
-                .or_default()
-                .push(password);
-            Ok(())
-        }
-
-        async fn revoke(
-            &self,
-            tenant: TenantId,
-            account: AccountId,
-            id: &str,
-            at: SystemTime,
-        ) -> Result<()> {
-            let mut map = self.0.lock().expect("lock");
-            let p = map
-                .get_mut(&(tenant, account))
-                .and_then(|v| v.iter_mut().find(|p| p.id == id))
-                .ok_or(Error::NotFound)?;
-            p.revoked_at.get_or_insert(at);
-            Ok(())
-        }
-    }
+    use crate::testutil::{accounts, meta_accounts};
 
     /// Каталог: имя входа → пароль.
     struct Dir(HashMap<&'static str, &'static str>);
@@ -443,26 +344,28 @@ mod tests {
 
     #[tokio::test]
     async fn app_password_issue_and_revoke() {
-        let (accounts, ids) = accounts(&[("alice@example.org", true)]).await;
-        let store = Arc::new(MemAppPasswords::default());
-        let apps = AppPasswords::new(store.clone(), cheap()).expect("cfg");
+        let (meta, accounts, ids) = meta_accounts(&[("alice@example.org", true)]).await;
+        let apps = AppPasswords::new(Arc::new(MemAppPasswords::new(&meta)), cheap()).expect("cfg");
         let auth = PasswordAuthenticator::new(accounts)
             .with_app_passwords(apps.clone())
             .with_directory(Arc::new(Dir(HashMap::from([(
                 "alice@example.org",
                 "wonderland",
             )]))));
-        let t = TenantId::DEFAULT;
+        let t = AccountScope {
+            tenant: TenantId::DEFAULT,
+            account: ids[0],
+        };
 
-        let (phone, secret) = apps.issue(t, ids[0], "Телефон").await.expect("issue");
+        let (phone, secret) = apps.issue(t, "Телефон").await.expect("issue");
         assert_eq!(secret.expose().len(), 16);
         assert!(secret.expose().bytes().all(|b| b.is_ascii_lowercase()));
         assert!(phone.hash.starts_with("$argon2id$"));
         assert!(!format!("{phone:?}").contains(&phone.hash));
-        let (_, other) = apps.issue(t, ids[0], "Ноутбук").await.expect("issue 2");
+        let (_, other) = apps.issue(t, "Ноутбук").await.expect("issue 2");
         assert_ne!(secret.expose(), other.expose());
         assert_eq!(
-            apps.issue(t, ids[0], "лишний").await.map(|_| ()),
+            apps.issue(t, "лишний").await.map(|_| ()),
             Err(Error::Conflict)
         );
 
@@ -483,10 +386,8 @@ mod tests {
         );
 
         // Отозванный пароль не принимается; другой пароль приложения и пароль каталога — по-прежнему.
-        apps.revoke(t, ids[0], &phone.id).await.expect("revoke");
-        apps.revoke(t, ids[0], &phone.id)
-            .await
-            .expect("revoke again");
+        apps.revoke(t, &phone.id).await.expect("revoke");
+        apps.revoke(t, &phone.id).await.expect("revoke again");
         assert_eq!(
             auth.verify(pw("alice@example.org", secret.expose())).await,
             Err(Error::Forbidden)
@@ -501,10 +402,10 @@ mod tests {
                 .await
                 .is_ok()
         );
-        assert_eq!(apps.revoke(t, ids[0], "nope").await, Err(Error::NotFound));
+        assert_eq!(apps.revoke(t, "nope").await, Err(Error::NotFound));
         // После отзыва можно выпустить новый.
-        assert!(apps.issue(t, ids[0], "Телефон 2").await.is_ok());
-        assert_eq!(apps.list(t, ids[0]).await.expect("list").len(), 3);
+        assert!(apps.issue(t, "Телефон 2").await.is_ok());
+        assert_eq!(apps.list(t).await.expect("list").len(), 3);
     }
 
     #[test]
