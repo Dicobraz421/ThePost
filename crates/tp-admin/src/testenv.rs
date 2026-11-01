@@ -7,13 +7,20 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header};
+use bytes::Bytes;
 use serde_json::Value;
+use time::OffsetDateTime;
 use tower::ServiceExt;
 use tp_contracts::auth::Principal;
 use tp_contracts::ext::AdminRoutes;
-use tp_contracts::meta::{AccountScope, Policy, PolicyResolver};
-use tp_contracts::{AccountId, DomainId, Error, MailboxId, Result, TenantId};
-use tp_testkit::{FakeAuthenticator, MemMetadata, MemQuota, SystemClock};
+use tp_contracts::ext::DecisionHooks;
+use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
+use tp_contracts::meta::{AccountScope, Flags, Policy, PolicyResolver, SpecialUse};
+use tp_contracts::{AccountId, DomainId, Error, MailboxId, MessageId, Result, TenantId};
+use tp_testkit::{
+    Clock, FakeAuthenticator, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata, MemQuota,
+    MemTrash, SystemClock,
+};
 
 use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
 use crate::audit::{AuditRecord, AuditSink};
@@ -138,20 +145,53 @@ impl DomainStore for MemDomains {
     }
 }
 
-/// Зависимости поверх in-memory реализаций (без субъектов и модулей).
-pub fn deps() -> Deps {
-    let meta = MemMetadata::new(Arc::new(SystemClock));
-    let policies = MemPolicies::default();
-    Deps {
-        auth: Arc::new(FakeAuthenticator::default()),
-        audit: Arc::new(MemAudit::default()),
-        modules: Vec::new(),
-        accounts: Arc::new(meta.clone()),
-        quota: Arc::new(MemQuota::new(&meta)),
-        policies: Arc::new(policies.clone()),
-        resolver: Arc::new(policies),
-        domains: Arc::new(MemDomains::default()),
+/// Хранилища в памяти: метаданные, квоты, почтовое хранилище.
+pub struct Stores {
+    pub meta: MemMetadata,
+    pub quota: MemQuota,
+    pub store: tp_mailstore::Store,
+}
+
+impl Stores {
+    pub fn new() -> Self {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let index = MemBlobIndex::new(clock.clone());
+        let meta = MemMetadata::new(clock.clone()).with_blob_index(index.clone());
+        let quota = MemQuota::new(&meta);
+        let store = tp_mailstore::Store::new(tp_mailstore::Deps {
+            blobs: Arc::new(MemBlobStore::new(clock)),
+            index: Arc::new(index),
+            messages: Arc::new(meta.clone()),
+            changes: Arc::new(meta.clone()),
+            trash: Arc::new(MemTrash::new(&meta)),
+            quota: Arc::new(quota.clone()),
+            bus: Arc::new(MemEventBus::default()),
+            hooks: DecisionHooks::default(),
+        });
+        Self { meta, quota, store }
     }
+
+    /// Зависимости Admin API поверх хранилищ (без субъектов и модулей).
+    pub fn deps(&self) -> Deps {
+        let policies = MemPolicies::default();
+        Deps {
+            auth: Arc::new(FakeAuthenticator::default()),
+            audit: Arc::new(MemAudit::default()),
+            modules: Vec::new(),
+            accounts: Arc::new(self.meta.clone()),
+            quota: Arc::new(self.quota.clone()),
+            policies: Arc::new(policies.clone()),
+            resolver: Arc::new(policies),
+            domains: Arc::new(MemDomains::default()),
+            trash: Arc::new(MemTrash::new(&self.meta)),
+            store: Arc::new(self.store.clone()),
+        }
+    }
+}
+
+/// Зависимости поверх новых хранилищ в памяти.
+pub fn deps() -> Deps {
+    Stores::new().deps()
 }
 
 /// Токены: `root` — администратор инсталляции, `org` — администратор организации по умолчанию,
@@ -161,6 +201,7 @@ pub struct Env {
     pub audit: MemAudit,
     pub meta: MemMetadata,
     pub quota: MemQuota,
+    pub store: tp_mailstore::Store,
     pub router: Router,
     pub other_tenant: TenantId,
 }
@@ -212,28 +253,24 @@ impl Env {
         auth.add_token("user", subject(d, "user@example.org", &["staff"]));
         auth.add_token("other", subject(other_tenant, "admin@example.org", &[]));
         let audit = MemAudit::default();
-        let meta = MemMetadata::new(Arc::new(SystemClock));
-        let quota = MemQuota::new(&meta);
-        let policies = MemPolicies::default();
+        let stores = Stores::new();
         let admin = Admin::new(
             Deps {
                 auth: Arc::new(auth.clone()),
                 audit: Arc::new(audit.clone()),
                 modules,
-                accounts: Arc::new(meta.clone()),
-                quota: Arc::new(quota.clone()),
-                policies: Arc::new(policies.clone()),
-                resolver: Arc::new(policies),
-                domains: Arc::new(MemDomains::default()),
+                ..stores.deps()
             },
             cfg,
         )
         .expect("admin");
+        let Stores { meta, quota, store } = stores;
         Self {
             auth,
             audit,
             meta,
             quota,
+            store,
             router: Arc::new(admin).router(),
             other_tenant,
         }
@@ -242,6 +279,40 @@ impl Env {
     /// Учётная запись организации по умолчанию.
     pub async fn account(&self, login: &str) -> AccountScope {
         self.meta.account(login).await.expect("account")
+    }
+
+    /// Доставляет простое письмо во «Входящие».
+    pub async fn deliver(&self, scope: AccountScope, subject: &str) -> MessageId {
+        let inbox = self
+            .meta
+            .mailbox_by_role(scope, SpecialUse::Inbox)
+            .expect("inbox");
+        let raw = format!(
+            "From: a@example.com
+To: user@example.org
+Subject: {subject}
+
+body
+"
+        );
+        let chunks: Vec<Result<Bytes>> = vec![Ok(Bytes::from(raw))];
+        let got = self
+            .store
+            .ingest(IngestRequest {
+                tenant: scope.tenant,
+                mail_from: "a@example.com".into(),
+                raw: Box::pin(futures::stream::iter(chunks)),
+                deliveries: vec![Delivery {
+                    account: scope.account,
+                    mailbox: inbox,
+                    extra_headers: vec![],
+                    flags: Flags::default(),
+                }],
+                received_at: OffsetDateTime::now_utc(),
+            })
+            .await
+            .expect("ingest");
+        got.delivered[0].message
     }
 
     /// Запрос с Bearer-токеном `token` и телом JSON: код, заголовки, тело (JSON; не JSON — строка; пусто — `Null`).

@@ -29,8 +29,9 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::ext::{AdminRequest, AdminRoutes};
+use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountStore, PolicyResolver};
-use tp_contracts::retention::Quota;
+use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::{Error, Result, TenantId};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
@@ -133,6 +134,11 @@ impl AdminConfig {
         }
         Ok(())
     }
+
+    /// Размер страницы по запросу клиента.
+    pub(crate) fn page(&self, limit: Option<usize>) -> usize {
+        limit.unwrap_or(self.page_size).clamp(1, self.max_page_size)
+    }
 }
 
 /// Администратор запроса: субъект и его роли (расширение запроса после [`guard`]).
@@ -172,6 +178,10 @@ pub struct Deps {
     pub resolver: Arc<dyn PolicyResolver>,
     /// Домены.
     pub domains: Arc<dyn DomainStore>,
+    /// Корзина: список элементов.
+    pub trash: Arc<dyn TrashStore>,
+    /// Почтовое хранилище: восстановление из корзины с уведомлением клиентов.
+    pub store: Arc<dyn MailStore>,
 }
 
 impl fmt::Debug for Deps {
@@ -217,6 +227,7 @@ impl Admin {
     pub fn router(self: Arc<Self>) -> Router {
         let mut api: Router<Arc<Admin>> = Router::new().route("/api/v1/whoami", get(whoami));
         api = crate::accounts::routes(api);
+        api = crate::retention::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -500,6 +511,7 @@ impl Modify for BearerAuth {
 pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     let mut api = ApiDoc::openapi();
     api.merge(crate::accounts::Doc::openapi());
+    api.merge(crate::retention::Doc::openapi());
     api
 }
 
