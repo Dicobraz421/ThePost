@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use time::OffsetDateTime;
-use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, Commit};
-use tp_contracts::{BlobHash, BlobKey, Error, Gen};
-use tp_meta::{MetaConfig, PgMeta};
+use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, Commit, Compression};
+use tp_contracts::{BlobHash, BlobKey, Error, Gen, TenantId};
+use tp_meta::{MetaConfig, PgMeta, schema};
 use tp_testkit::MemBlobStore;
+use tp_testkit::suite::blob_compression;
 
 fn random_hash() -> BlobHash {
     let mut h = [0u8; 32];
@@ -383,4 +384,116 @@ async fn verify_pages_live_records_and_marks_damaged() {
         ..keys[0]
     };
     assert!(!idx.mark_blob_damaged(&other_gen).await.expect("other gen"));
+}
+
+#[tokio::test]
+async fn passes_compression_suite() {
+    let Some(idx) = index(Duration::from_secs(3600)).await else {
+        return;
+    };
+    let tenant = common::tenant(idx.pool()).await;
+    blob_compression(&idx, tenant).await;
+}
+
+/// META-24: миграция признака сжатия на записях, созданных прежней схемой.
+#[tokio::test]
+async fn compression_migration_keeps_existing_rows() {
+    use std::str::FromStr;
+
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx::{AssertSqlSafe, Executor};
+
+    let Some(url) = common::pg_url() else { return };
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let db = format!("tp_meta_{}", uuid::Uuid::now_v7().simple());
+    admin
+        .execute(AssertSqlSafe(format!("CREATE DATABASE {db}")))
+        .await
+        .expect("create database");
+    let opts = PgConnectOptions::from_str(&url).expect("url").database(&db);
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(opts)
+        .await
+        .expect("connect clean");
+
+    // Схема до META-24 и записи в разных состояниях.
+    schema::migrator_until(12)
+        .run(&pool)
+        .await
+        .expect("old schema");
+    let t = TenantId::DEFAULT;
+    let (live, deleting, deleted) = (random_hash(), random_hash(), random_hash());
+    let mut tx = schema::begin(&pool, t).await.expect("begin");
+    for (hash, state, refcnt) in [
+        (live, "live", 2_i64),
+        (deleting, "deleting", 0),
+        (deleted, "deleted", 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO blobs (tenant_id, hash, gen, refcnt, state, size, zero_since)
+             VALUES ($1, $2, 3, $3, $4, 100, CASE WHEN $3 = 0 THEN now() END)",
+        )
+        .bind(t.as_uuid())
+        .bind(hash.as_bytes().as_slice())
+        .bind(refcnt)
+        .bind(state)
+        .execute(&mut *tx)
+        .await
+        .expect("old row");
+    }
+    tx.commit().await.expect("commit");
+
+    schema::migrate(&pool).await.expect("migrate");
+    let idx = PgMeta::new(pool.clone(), MetaConfig::default());
+    let key = |hash| BlobKey {
+        tenant: t,
+        hash,
+        generation: Gen(3),
+    };
+    assert_eq!(
+        idx.compression(&key(live)).await,
+        Ok(Some(Compression::None))
+    );
+    assert_eq!(
+        idx.compression(&key(deleting)).await,
+        Ok(Some(Compression::None))
+    );
+    assert_eq!(idx.compression(&key(deleted)).await, Ok(None));
+    let page = idx.live_blobs(None, 10).await.expect("live");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].key, key(live));
+    assert_eq!(page[0].compression, Compression::None);
+    // Существующая запись не меняет признак при новых ссылках; после надгробия — новая запись со сжатием.
+    assert!(matches!(
+        idx.acquire(t, &live, 1).await,
+        Ok(Acquire::Existing { generation: Gen(3) })
+    ));
+    assert_eq!(
+        idx.compression(&key(live)).await,
+        Ok(Some(Compression::None))
+    );
+    assert_eq!(
+        idx.commit_new_with(t, &deleted, Gen(4), 100, 1, Compression::Zstd)
+            .await,
+        Ok(Commit::Done { generation: Gen(4) })
+    );
+    assert_eq!(
+        idx.compression(&BlobKey {
+            generation: Gen(4),
+            ..key(deleted)
+        })
+        .await,
+        Ok(Some(Compression::Zstd))
+    );
+
+    pool.close().await;
+    admin
+        .execute(AssertSqlSafe(format!("DROP DATABASE {db} WITH (FORCE)")))
+        .await
+        .expect("drop database");
 }
