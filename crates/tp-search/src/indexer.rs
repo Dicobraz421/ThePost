@@ -14,7 +14,8 @@
 //!
 //! С хранилищем сегментов ([`Indexer::with_store`]) индекс перед записью сверяется с манифестом (нет на узле —
 //! загружается из BlobStore), а после коммита выгружается и манифест записывается (SRCH-05). Манифест изменил
-//! другой узел — индекс на узле забывается и `Conflict`: повтор пачки начнётся с загрузки.
+//! другой узел — индекс на узле забывается и `Conflict`: повтор пачки начнётся с загрузки. С кэшем узла
+//! ([`Indexer::with_cache`]) записанный индекс учитывается в его размере (SRCH-06).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -30,7 +31,8 @@ use tp_contracts::events::{CoreEventKind, EventSink, LoggedEvent};
 use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Error, MessageId, Result, TenantId};
 
-use crate::index::{IndexDoc, IndexManager, IndexOp, blocking};
+use crate::cache::IndexCache;
+use crate::index::{IndexDoc, IndexManager, IndexOp, MailIndex, blocking};
 use crate::persist::IndexStore;
 
 /// Имя подписчика журнала событий (ключ позиций и лиз разделов).
@@ -71,6 +73,7 @@ pub struct Indexer {
     indexes: Arc<IndexManager>,
     source: Arc<dyn DocumentSource>,
     store: Option<Arc<IndexStore>>,
+    cache: Option<Arc<IndexCache>>,
     cfg: IndexerConfig,
 }
 
@@ -97,6 +100,7 @@ impl Indexer {
             indexes,
             source,
             store: None,
+            cache: None,
             cfg,
         }
     }
@@ -104,6 +108,13 @@ impl Indexer {
     /// Индексы сохраняются в BlobStore с манифестом (SRCH-05).
     pub fn with_store(mut self, store: Arc<IndexStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Индексы сохраняются в BlobStore кэша и учитываются в размере кэша узла (SRCH-06).
+    pub fn with_cache(mut self, cache: Arc<IndexCache>) -> Self {
+        self.store = Some(cache.store().clone());
+        self.cache = Some(cache);
         self
     }
 
@@ -147,13 +158,22 @@ impl Indexer {
     /// Коммит накопленных изменений: по коммиту на учётную запись.
     async fn flush(&self, pending: &mut Pending) -> Result<()> {
         for ((tenant, account), ops) in std::mem::take(pending) {
-            self.commit(AccountScope { tenant, account }, ops).await?;
+            let scope = AccountScope { tenant, account };
+            let index = self.commit(scope, ops).await?;
+            // Учёт в кэше — без блокировки индекса: вытеснение захватывает её само.
+            if let (Some(cache), Some(index)) = (&self.cache, index) {
+                cache.touch(scope, &index).await;
+            }
         }
         Ok(())
     }
 
-    /// Коммит изменений индекса учётной записи и его выгрузка.
-    async fn commit(&self, scope: AccountScope, ops: Vec<IndexOp>) -> Result<()> {
+    /// Коммит изменений индекса учётной записи и его выгрузка; индекса нет и не нужен — `None`.
+    async fn commit(
+        &self,
+        scope: AccountScope,
+        ops: Vec<IndexOp>,
+    ) -> Result<Option<Arc<MailIndex>>> {
         let _gate = self.indexes.lock(scope).await;
         // Только удаления — индекс не создаётся, если его ещё нет.
         let create = !ops.iter().all(|op| matches!(op, IndexOp::Delete(_)));
@@ -168,7 +188,7 @@ impl Indexer {
         };
         let index = match index {
             Some(index) => index,
-            None if !create => return Ok(()),
+            None if !create => return Ok(None),
             None => {
                 let m = self.indexes.clone();
                 blocking(move || m.open_or_create(scope)).await?
@@ -186,7 +206,7 @@ impl Indexer {
                 Err(e) => return Err(e),
             }
         }
-        Ok(())
+        Ok(Some(index))
     }
 }
 

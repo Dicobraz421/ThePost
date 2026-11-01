@@ -4,14 +4,17 @@
 //! - [`analyzers`] — анализатор текста: слова, регистр, «ё», стеммеры Snowball (ru, en);
 //! - [`query`] — исполнитель запросов [`tp_contracts::search::SearchIndex`];
 //! - [`indexer`] — роль indexer: подписчик журнала событий, пакетный коммит индекса;
-//! - [`persist`] — сегменты индекса в BlobStore и манифест версии, загрузка индекса на другом узле.
+//! - [`persist`] — сегменты индекса в BlobStore и манифест версии, загрузка индекса на другом узле;
+//! - [`cache`] — LRU индексов на NVMe узла по размеру, холодная загрузка, метрики.
 
 pub mod analyzers;
+pub mod cache;
 pub mod index;
 pub mod indexer;
 pub mod persist;
 pub mod query;
 
+pub use cache::{CacheConfig, CacheStats, IndexCache};
 pub use index::{IndexConfig, IndexDoc, IndexManager, IndexOp, MailIndex, SCHEMA_VERSION};
 pub use indexer::{DocumentSource, Indexer, IndexerConfig, SUBSCRIBER};
 pub use persist::{IndexStore, PersistConfig};
@@ -32,6 +35,8 @@ pub struct SearchConfig {
     pub query: QueryConfig,
     /// Сегменты в BlobStore.
     pub persist: PersistConfig,
+    /// Кэш индексов на узле (роль search).
+    pub cache: CacheConfig,
 }
 
 #[cfg(test)]
