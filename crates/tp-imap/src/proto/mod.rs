@@ -420,6 +420,54 @@ pub fn status_line(mailbox: AString<'static>, items: &[(StatusItem, u64)]) -> Ve
     line
 }
 
+/// Ответ `* n FETCH (…)`. imap-codec пишет `MODSEQ n` без скобок (RFC 7162, 3.1.4.1: `MODSEQ (n)`) и не умеет
+/// `BINARY[…]<origin>` (RFC 3516, 4.3): такие ответы собираются из элементов, сериализованных по одному.
+/// `origins` — номер элемента `BINARY` и начало его диапазона.
+pub fn fetch_line(
+    seq: NonZeroU32,
+    items: types::core::Vec1<types::fetch::MessageDataItem<'static>>,
+    origins: &[(usize, u32)],
+) -> Vec<u8> {
+    use types::fetch::MessageDataItem;
+    let modseq = items
+        .as_ref()
+        .iter()
+        .any(|i| matches!(i, MessageDataItem::ModSeq(_)));
+    if origins.is_empty() && !modseq {
+        return encode(&Response::Data(Data::Fetch { seq, items }));
+    }
+    let head = format!("* {seq} FETCH (");
+    let mut out = head.clone().into_bytes();
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.push(b' ');
+        }
+        if let MessageDataItem::ModSeq(m) = item {
+            out.extend_from_slice(format!("MODSEQ ({m})").as_bytes());
+            continue;
+        }
+        let line = encode(&Response::Data(Data::Fetch {
+            seq,
+            items: types::core::Vec1::from(item),
+        }));
+        // `* n FETCH (` элемент `)\r\n`.
+        let body = line
+            .get(head.len()..line.len().saturating_sub(3))
+            .unwrap_or_default();
+        let origin = origins.iter().find(|(j, _)| *j == i).map(|(_, o)| *o);
+        match (origin, body.iter().position(|&b| b == b']')) {
+            (Some(origin), Some(end)) => {
+                out.extend_from_slice(&body[..=end]);
+                out.extend_from_slice(format!("<{origin}>").as_bytes());
+                out.extend_from_slice(&body[end + 1..]);
+            }
+            _ => out.extend_from_slice(body),
+        }
+    }
+    out.extend_from_slice(b")\r\n");
+    out
+}
+
 /// Ответ `* LIST` с расширенными данными (`CHILDINFO`, RFC 5258) после имени папки.
 pub fn list_line(data: Data<'static>, extended: &str) -> Vec<u8> {
     let mut line = encode(&Response::Data(data));
@@ -440,6 +488,53 @@ pub fn astring(bytes: Vec<u8>) -> Option<AString<'static>> {
 /// Ненулевое число для кодов ответа (`UIDNEXT`, `UIDVALIDITY`).
 pub fn nz(n: u32) -> NonZeroU32 {
     NonZeroU32::new(n).unwrap_or(NonZeroU32::MIN)
+}
+
+/// Отрезки подряд идущих чисел (по возрастанию, без повторов, без нуля).
+pub fn runs(nums: &[u32]) -> Vec<(u32, u32)> {
+    let mut sorted: Vec<u32> = nums.iter().copied().filter(|&n| n > 0).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for n in sorted {
+        match out.last_mut() {
+            Some((_, end)) if end.checked_add(1) == Some(n) => *end = n,
+            _ => out.push((n, n)),
+        }
+    }
+    out
+}
+
+/// Набор номеров (`1:3,7`) для кодов ответа (`MODIFIED`); пустой — `None`.
+pub fn sequence_set(nums: &[u32]) -> Option<types::sequence::SequenceSet> {
+    use types::sequence::{SeqOrUid, Sequence, SequenceSet};
+    let seqs: Vec<Sequence> = runs(nums)
+        .into_iter()
+        .map(|(a, b)| {
+            let (a, b) = (SeqOrUid::Value(nz(a)), SeqOrUid::Value(nz(b)));
+            if a == b {
+                Sequence::Single(a)
+            } else {
+                Sequence::Range(a, b)
+            }
+        })
+        .collect();
+    types::core::Vec1::try_from(seqs).ok().map(SequenceSet)
+}
+
+/// Набор номеров текстом (`1:3,7`) для ответов, которые собираются вручную (`ESEARCH`).
+pub fn sequence_text(nums: &[u32]) -> String {
+    runs(nums)
+        .into_iter()
+        .map(|(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}:{b}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Разбор произвольных байтов как потока команд: не должен паниковать (цель fuzz, `fuzz/`).

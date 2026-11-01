@@ -15,6 +15,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -29,9 +30,10 @@ use tp_platform::{Conn, Listener};
 
 use crate::config::ImapConfig;
 use crate::proto::types::auth::AuthMechanism;
-use crate::proto::types::command::CommandBody;
+use crate::proto::types::command::{CommandBody, FetchModifier, SelectParameter};
 use crate::proto::types::core::{AString, Atom, IString, NString, Tag, Vec1};
 use crate::proto::types::extensions::enable::CapabilityEnable;
+use crate::proto::types::fetch::MessageDataItem;
 use crate::proto::types::response::{
     Capability, Code, CommandContinuationRequest, Data, Greeting, GreetingKind, Response, Status,
     StatusBody, StatusKind,
@@ -133,6 +135,9 @@ pub struct Session<T: Transport> {
     pub(crate) selected: Option<Selected>,
     /// Клиент включил IMAP4rev2 (`ENABLE IMAP4rev2`): имена папок в UTF-8, без `RECENT`.
     pub(crate) rev2: bool,
+    /// CONDSTORE включён (`ENABLE CONDSTORE` или команда с `MODSEQ`, RFC 7162, 3.1): `MODSEQ` в ответах
+    /// `FETCH` и `HIGHESTMODSEQ` при выборе папки.
+    pub(crate) condstore: bool,
     errors: u32,
     auth_failures: u32,
     /// Сессия завершается после отправки накопленных ответов.
@@ -169,6 +174,7 @@ const EXTENSIONS: &[&str] = &[
     "CREATE-SPECIAL-USE",
     "STATUS=SIZE",
     "BINARY",
+    "CONDSTORE",
 ];
 
 fn reader(config: &ImapConfig) -> Reader {
@@ -188,6 +194,7 @@ impl<T: Transport> Session<T> {
             principal: None,
             selected: None,
             rev2: false,
+            condstore: false,
             errors: 0,
             auth_failures: 0,
             close: false,
@@ -327,6 +334,16 @@ impl<T: Transport> Session<T> {
 
     pub(crate) fn data(&mut self, data: Data<'static>) {
         self.push(&Response::Data(data));
+    }
+
+    /// Ответ `* n FETCH (…)` (см. [`proto::fetch_line`]).
+    pub(crate) fn fetch_data(
+        &mut self,
+        seq: NonZeroU32,
+        items: Vec1<MessageDataItem<'static>>,
+        origins: &[(usize, u32)],
+    ) {
+        self.out.extend(proto::fetch_line(seq, items, origins));
     }
 
     fn tagged(
@@ -508,11 +525,19 @@ impl<T: Transport> Session<T> {
             Body::Status { mailbox, items } => self.status(&tag, &mailbox, &items).await,
             Body::Create { mailbox, uses } => self.create(&tag, &mailbox, &uses).await,
             Body::Std(body) => match body {
-                CommandBody::Select { mailbox, .. } => {
+                CommandBody::Select {
+                    mailbox,
+                    parameters,
+                } => {
+                    self.select_params(&parameters);
                     self.select(&tag, &proto::mailbox_bytes(&mailbox), false)
                         .await
                 }
-                CommandBody::Examine { mailbox, .. } => {
+                CommandBody::Examine {
+                    mailbox,
+                    parameters,
+                } => {
+                    self.select_params(&parameters);
                     self.select(&tag, &proto::mailbox_bytes(&mailbox), true)
                         .await
                 }
@@ -562,11 +587,16 @@ impl<T: Transport> Session<T> {
                 sequence_set,
                 macro_or_item_names,
                 uid,
-                ..
+                modifiers,
             } => {
-                self.fetch(tag, &sequence_set, macro_or_item_names, uid)
+                let changed_since = modifiers.iter().find_map(|m| match m {
+                    FetchModifier::ChangedSince(n) => Some(n.get()),
+                    FetchModifier::Vanished => None,
+                });
+                self.fetch(tag, &sequence_set, macro_or_item_names, uid, changed_since)
                     .await
             }
+            body @ CommandBody::Store { .. } => self.store(tag, body).await,
             _ => {
                 self.bad(Some(tag), "Command not supported");
                 Ok(())
@@ -738,6 +768,16 @@ impl<T: Transport> Session<T> {
         );
     }
 
+    /// Параметры `SELECT`/`EXAMINE`: `CONDSTORE` включает CONDSTORE (RFC 7162, 3.1.8).
+    fn select_params(&mut self, parameters: &[SelectParameter]) {
+        if parameters
+            .iter()
+            .any(|p| matches!(p, SelectParameter::CondStore))
+        {
+            self.condstore = true;
+        }
+    }
+
     fn enable(&mut self, tag: &Tag<'static>, capabilities: Vec1<CapabilityEnable<'static>>) {
         if self.selected.is_some() {
             self.bad(Some(tag), "ENABLE is not allowed in selected state");
@@ -745,8 +785,12 @@ impl<T: Transport> Session<T> {
         }
         let mut enabled = Vec::new();
         for c in capabilities.into_iter() {
-            if c.to_string().eq_ignore_ascii_case("IMAP4rev2") {
+            let name = c.to_string();
+            if name.eq_ignore_ascii_case("IMAP4rev2") {
                 self.rev2 = true;
+                enabled.push(c);
+            } else if name.eq_ignore_ascii_case("CONDSTORE") {
+                self.condstore = true;
                 enabled.push(c);
             }
         }

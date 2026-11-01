@@ -5,6 +5,7 @@
 //! - `mailbox` — операции с папками: LIST (LIST-EXTENDED, SPECIAL-USE, LIST-STATUS), SELECT, STATUS, CREATE,
 //!   DELETE, RENAME, SUBSCRIBE.
 //! - `fetch` — FETCH: метаданные, разделы BODY[], BINARY, частичная выборка.
+//! - `store` — STORE и CONDSTORE (`UNCHANGEDSINCE`, `MODSEQ`).
 //! - [`config`] — секция `imap` config.yaml.
 
 pub mod config;
@@ -12,6 +13,7 @@ mod fetch;
 mod mailbox;
 pub mod proto;
 pub mod session;
+mod store;
 
 pub use config::ImapConfig;
 pub use session::{Deps, Server, Session, SessionCtx, Transport};

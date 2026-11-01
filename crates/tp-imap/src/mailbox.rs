@@ -8,6 +8,8 @@
 //! Удаление папки с вложенными — `NO [HASCHILDREN]` (хранилище удаляет поддерево только по подтверждению,
 //! которого в IMAP нет); системные папки не удаляются (`NO [CANNOT]`).
 
+use std::num::NonZeroU64;
+
 use tp_contracts::meta::{Flag, Mailbox, MessageQuery, NewMailbox, SpecialUse};
 use tp_contracts::{Error, MailboxId, Result};
 
@@ -441,6 +443,14 @@ impl<T: Transport> Session<T> {
             Some(Code::UidNext(proto::nz(st.uid_next.0))),
             "Predicted next UID",
         );
+        if self.condstore {
+            let highest = NonZeroU64::new(st.highest_modseq.0).unwrap_or(NonZeroU64::MIN);
+            self.untagged(
+                StatusKind::Ok,
+                Some(Code::HighestModSeq(highest)),
+                "Highest",
+            );
+        }
         if self.rev2 {
             let mailbox = self.imap_mailbox(&node.path);
             self.data(Data::List {

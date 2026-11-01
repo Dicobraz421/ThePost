@@ -23,6 +23,7 @@ use crate::session::{Deps, Session, SessionCtx, Transport};
 mod fetch;
 mod mailbox;
 mod session;
+mod store;
 
 pub(crate) const LOGIN: &str = "user@example.org";
 pub(crate) const PASSWORD: &str = "secret";

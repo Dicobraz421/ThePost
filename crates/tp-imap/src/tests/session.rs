@@ -169,7 +169,10 @@ async fn authenticated_commands() {
     let r = c.cmd(&format!("A5 LOGIN {LOGIN} {PASSWORD}")).await;
     assert!(r.starts_with("A5 OK"), "{r}");
     let r = c.cmd("A6 ENABLE IMAP4rev2 CONDSTORE").await;
-    assert!(r.starts_with("* ENABLED IMAP4rev2\r\nA6 OK"), "{r}");
+    assert!(
+        r.starts_with("* ENABLED IMAP4rev2 CONDSTORE\r\nA6 OK"),
+        "{r}"
+    );
     let r = c.cmd("A7 LOGOUT").await;
     assert_eq!(r, "* BYE Logging out\r\nA7 OK LOGOUT completed\r\n");
     assert_eq!(c.rest().await, "");
