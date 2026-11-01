@@ -40,13 +40,39 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "app passwords",
         include_str!("../migrations/0009_app_passwords.sql"),
     ),
+    (
+        10,
+        "distribution groups",
+        include_str!("../migrations/0010_distribution_groups.sql"),
+    ),
+    (
+        11,
+        "delivery and audit logs",
+        include_str!("../migrations/0011_delivery_audit.sql"),
+    ),
+    (
+        12,
+        "node roles",
+        include_str!("../migrations/0012_node_roles.sql"),
+    ),
+    (
+        13,
+        "blob compression",
+        include_str!("../migrations/0013_blob_compression.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
 pub fn migrator() -> Migrator {
+    migrator_until(i64::MAX)
+}
+
+/// Мигратор схемы ядра до версии `version` включительно — проверка миграции на данных прежней схемы.
+pub fn migrator_until(version: i64) -> Migrator {
     Migrator::with_migrations(
         MIGRATIONS
             .iter()
+            .filter(|(v, _, _)| *v <= version)
             .map(|(version, desc, sql)| {
                 Migration::new(
                     *version,

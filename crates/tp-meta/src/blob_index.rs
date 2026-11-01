@@ -6,17 +6,21 @@
 //! `Bumped`, а не ссылку на удалённый объект. Надгробия старше `MetaConfig::blob_tombstone_ttl`
 //! удаляются в `gc_candidates`.
 //!
+//! Признак сжатия объекта (META-24, SRS 3.2) — столбец `compression`: задаётся при создании записи `live`
+//! ([`BlobIndex::commit_new_with`]), повторные ссылки и параллельная загрузка его не меняют.
+//!
 //! Для `thepost verify` (SRS 3.5) — постраничное перечисление записей `live` по всем организациям
 //! ([`PgMeta::live_blobs`]) и пометка повреждённых ([`PgMeta::mark_blob_damaged`]); в контракт [`BlobIndex`]
 //! они не входят.
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
-use tp_contracts::blob::{Acquire, BlobIndex, Commit};
+use tp_contracts::blob::{Acquire, BlobIndex, Commit, Compression};
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, Result, TenantId};
 use uuid::Uuid;
 
 use crate::PgMeta;
+use crate::pool::with_tenant;
 use crate::schema::{begin, begin_system, db_err, to_u32};
 
 /// Число ссылок операции: не меньше одной.
@@ -25,6 +29,11 @@ fn refs_arg(refs: u32) -> Result<i64> {
         return Err(Error::invalid("число ссылок должно быть больше нуля"));
     }
     Ok(i64::from(refs))
+}
+
+fn compression_of(s: &str) -> Result<Compression> {
+    s.parse()
+        .map_err(|_| Error::internal(format!("сжатие в blobs: {s}")))
 }
 
 fn gen_of(v: i64) -> Result<Gen> {
@@ -47,8 +56,10 @@ fn key_of(tenant: Uuid, hash: Vec<u8>, g: i64) -> Result<BlobKey> {
 pub struct LiveBlob {
     /// Ключ объекта (поколение записи).
     pub key: BlobKey,
-    /// Размер по учёту, байт.
+    /// Размер исходного содержимого по учёту, байт (у сжатого объекта в хранилище — меньше).
     pub size: u64,
+    /// Сжатие объекта в хранилище.
+    pub compression: Compression,
     /// Запись уже помечена повреждённой ([`PgMeta::mark_blob_damaged`]).
     pub damaged: bool,
 }
@@ -65,8 +76,8 @@ impl PgMeta {
             (*k.tenant.as_uuid(), k.hash.as_bytes().to_vec())
         });
         let mut tx = begin_system(&self.pool).await?;
-        let rows: Vec<(Uuid, Vec<u8>, i64, i64, bool)> = sqlx::query_as(
-            "SELECT tenant_id, hash, gen, size, damaged_at IS NOT NULL FROM blobs
+        let rows: Vec<(Uuid, Vec<u8>, i64, i64, bool, String)> = sqlx::query_as(
+            "SELECT tenant_id, hash, gen, size, damaged_at IS NOT NULL, compression FROM blobs
              WHERE (tenant_id, hash) > ($1, $2) AND state = 'live'
              ORDER BY tenant_id, hash LIMIT $3",
         )
@@ -78,11 +89,12 @@ impl PgMeta {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         rows.into_iter()
-            .map(|(tenant, hash, g, size, damaged)| {
+            .map(|(tenant, hash, g, size, damaged, compression)| {
                 Ok(LiveBlob {
                     key: key_of(tenant, hash, g)?,
                     size: u64::try_from(size).map_err(|_| Error::internal("размер в blobs"))?,
                     damaged,
+                    compression: compression_of(&compression)?,
                 })
             })
             .collect()
@@ -152,14 +164,32 @@ impl BlobIndex for PgMeta {
         size: u64,
         refs: u32,
     ) -> Result<Commit> {
+        self.commit_new_with(tenant, hash, generation, size, refs, Compression::None)
+            .await
+    }
+
+    fn supports_compression(&self) -> bool {
+        true
+    }
+
+    async fn commit_new_with(
+        &self,
+        tenant: TenantId,
+        hash: &BlobHash,
+        generation: Gen,
+        size: u64,
+        refs: u32,
+        compression: Compression,
+    ) -> Result<Commit> {
         let refs = refs_arg(refs)?;
         let size = crate::schema::to_i64(size)?;
         let mut tx = begin(&self.pool, tenant).await?;
-        // Конфликт: запись live — добавить ссылки; deleting/deleted со старшим поколением — живая запись
-        // нашего поколения; deleting/deleted с тем же или большим поколением — без изменений, Bumped.
+        // Конфликт: запись live — добавить ссылки (признак сжатия — её); deleting/deleted со старшим
+        // поколением — живая запись нашего поколения и сжатия; deleting/deleted с тем же или большим
+        // поколением — без изменений, Bumped.
         let (g, state): (i64, String) = sqlx::query_as(
-            "INSERT INTO blobs (tenant_id, hash, gen, refcnt, state, size)
-             VALUES ($1, $2, $3, $4, 'live', $5)
+            "INSERT INTO blobs (tenant_id, hash, gen, refcnt, state, size, compression)
+             VALUES ($1, $2, $3, $4, 'live', $5, $6)
              ON CONFLICT (tenant_id, hash) DO UPDATE SET
                  refcnt = CASE WHEN blobs.state = 'live' THEN blobs.refcnt + EXCLUDED.refcnt
                                WHEN blobs.gen < EXCLUDED.gen THEN EXCLUDED.refcnt
@@ -168,6 +198,8 @@ impl BlobIndex for PgMeta {
                             ELSE blobs.gen END,
                  size = CASE WHEN blobs.state <> 'live' AND blobs.gen < EXCLUDED.gen THEN EXCLUDED.size
                              ELSE blobs.size END,
+                 compression = CASE WHEN blobs.state <> 'live' AND blobs.gen < EXCLUDED.gen
+                                    THEN EXCLUDED.compression ELSE blobs.compression END,
                  zero_since = CASE WHEN blobs.state = 'live' OR blobs.gen < EXCLUDED.gen THEN NULL
                                    ELSE blobs.zero_since END,
                  state = CASE WHEN blobs.state = 'live' OR blobs.gen < EXCLUDED.gen THEN 'live'
@@ -179,6 +211,7 @@ impl BlobIndex for PgMeta {
         .bind(i64::from(generation.0))
         .bind(refs)
         .bind(size)
+        .bind(compression.as_str())
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -313,5 +346,25 @@ impl BlobIndex for PgMeta {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(found)
+    }
+
+    async fn compression(&self, key: &BlobKey) -> Result<Option<Compression>> {
+        let key = *key;
+        let found: Option<String> = with_tenant(&self.pool, key.tenant, move |tx| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT compression FROM blobs
+                     WHERE tenant_id = $1 AND hash = $2 AND gen = $3 AND state <> 'deleted'",
+                )
+                .bind(key.tenant.as_uuid())
+                .bind(key.hash.as_bytes().as_slice())
+                .bind(i64::from(key.generation.0))
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)
+            })
+        })
+        .await?;
+        found.as_deref().map(compression_of).transpose()
     }
 }
