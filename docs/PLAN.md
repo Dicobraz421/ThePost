@@ -80,21 +80,21 @@
 | ✅ mailstore-02 | MS-05, MS-06, MS-07 | A | contracts-03 | 4 |
 | ✅ contracts-07 | CTR-18 | B | contracts-03 | 1 |
 | ✅ mailstore-04 | MS-09 | A | mailstore-02, testkit-02 | 4 |
-| contracts-08 (ветка `x/contracts-08`) | CTR-19 | B | meta-03 | 1 |
+| ✅ contracts-08 (ветка `x/contracts-08`) | CTR-19 | B | meta-03 | 1 |
 | ✅ contracts-09 (ветка `x/contracts-09`) | CTR-20 | B | contracts-06 | 1 |
 | ✅ mailstore-05 | MS-10 | A | contracts-09 | 4 |
-| mailstore-06 | MS-11 | A | mailstore-02 | 4 |
+| ✅ mailstore-06 | MS-11 | A | mailstore-02 | 4 |
 | ✅ meta-07 | META-20 | A | — | 3 |
 | ✅ auth-01 | AUTH-01, AUTH-02, AUTH-03, AUTH-04 | A | contracts-03 | 1 |
 | ✅ search-01 | SRCH-01, SRCH-02, SRCH-03, SRCH-04 | A | contracts-03 | 3 |
 | ✅ smtp-01 | SMTP-01, SMTP-02, SMTP-03, SMTP-04 | A | auth-01, testkit-02 | 4 |
-| auth-02 | AUTH-05, AUTH-06 | A | auth-01, contracts-08 | 1 |
-| jmap-01 | JMAP-01, JMAP-02, JMAP-03, JMAP-04 | A | auth-01, mailstore-02, testkit-02 | 3 |
-| imap-01 | IMAP-01, IMAP-02, IMAP-03, IMAP-04 | A | testkit-02, auth-01, mailstore-02 | 2 |
-| smtp-02 | SMTP-05, SMTP-06, SMTP-07, SMTP-08 | A | smtp-01, meta-03 | 4 |
-| imap-02 | IMAP-05, IMAP-06, IMAP-07, IMAP-08 | A | imap-01 | 2 |
-| search-02 | SRCH-05, SRCH-06, SRCH-07, SRCH-08 | A | search-01, meta-03 | 1 |
-| admin-01 | ADM-01, ADM-02, ADM-03, ADM-04 | A | auth-01, mailstore-02 | 3 |
+| ✅ auth-02 | AUTH-05, AUTH-06 | A | auth-01, contracts-08 | 1 |
+| ✅ jmap-01 | JMAP-01, JMAP-02, JMAP-03, JMAP-04 | A | auth-01, mailstore-02, testkit-02 | 3 |
+| ✅ imap-01 | IMAP-01, IMAP-02, IMAP-03, IMAP-04 | A | testkit-02, auth-01, mailstore-02 | 2 |
+| ✅ smtp-02 | SMTP-05, SMTP-06, SMTP-07, SMTP-08 | A | smtp-01, meta-03 | 4 |
+| ✅ imap-02 | IMAP-05, IMAP-06, IMAP-07, IMAP-08 | A | imap-01 | 2 |
+| ✅ search-02 | SRCH-05, SRCH-06, SRCH-07, SRCH-08 | A | search-01, meta-03 | 1 |
+| ✅ admin-01 | ADM-01, ADM-02, ADM-03, ADM-04 | A | auth-01, mailstore-02 | 3 |
 | smtp-03 | SMTP-09, SMTP-10, SMTP-11 | A | smtp-02 | 4 |
 | jmap-02 | JMAP-05, JMAP-06, JMAP-07, JMAP-08 | A | jmap-01, smtp-02 | 3 |
 | imap-03 | IMAP-09, IMAP-10, IMAP-11, IMAP-12 | A | imap-02, auth-02 | 2 |
@@ -105,7 +105,7 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-10 (ветка `x/contracts-10`) | CTR-21 | B | contracts-09 | 1 |
+| ✅ contracts-10 (ветка `x/contracts-10`) | CTR-21 | B | contracts-09 | 1 |
 | sys-03 | SYS-06, SYS-07 | B | sys-01 | 2 |
 | ci-03 | CI-03, CI-04 | B | ci-01 | 4 |
 | platform-06 | PLT-15, PLT-16 | A | sys-03, contracts-10 | 2 |
@@ -146,6 +146,17 @@
 | admin-03 | ADM-08 | A | admin-02, contracts-13 | 3 |
 | jmap-04 | JMAP-10 | A | jmap-03, contracts-13 | 3 |
 | app-05 | APP-09 | A | meta-11, smtp-06, admin-03, jmap-04 | 2 |
+
+### Решение 2026-11-01: «Очистить корзину» — настройка; APPEND без правил доставки (`docs/decisions/2026-11-01-trash-purge.md`)
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| contracts-14 (ветка `x/contracts-14`) | CTR-26 | B | contracts-07 | 1 |
+| contracts-15 (ветка `x/contracts-15`) | CTR-27 | B | contracts-09 | 1 |
+| meta-12 | META-29 | B | contracts-14, meta-03 | 3 |
+| imap-05 | IMAP-14 | A | contracts-14, contracts-15, imap-02 | 2 |
+| jmap-05 | JMAP-11 | A | contracts-14, contracts-15, jmap-02 | 3 |
+| admin-04 | ADM-09 | A | contracts-14, admin-01 | 3 |
 
 Выход Ф1: MVP SMB — критерии `docs/spec/APP-D.md#Д.7` для профиля SMB на стенде DEP-04.
 
