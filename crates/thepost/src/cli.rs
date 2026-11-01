@@ -47,6 +47,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Подпроцесс извлечения текста вложений для индекса поиска (запускает роль indexer).
+    #[command(name = "search-extract", hide = true)]
+    SearchExtract,
     /// Сверка хранилища BLOB и учёта объектов.
     Verify {
         /// Удалить «сирот» и пометить повреждённые записи.
@@ -156,6 +159,11 @@ pub async fn run(cli: Cli) -> i32 {
             Err(e) => fail(&e),
         },
         Command::Serve => serve_until_signal(path).await,
+        Command::SearchExtract => {
+            // Подпроцесс запускается до рантайма (`main`): сюда приходит только вызов из кода.
+            eprintln!("thepost: search-extract — подпроцесс роли indexer, запускается до рантайма");
+            2
+        }
     }
 }
 
@@ -230,6 +238,9 @@ mod tests {
         ));
         assert_eq!(cli.config_path(), PathBuf::from("/y.yaml"));
         assert!(Cli::try_parse_from(["thepost", "bogus"]).is_err());
+        let cli = Cli::try_parse_from(["thepost", tp_search::extract::WORKER_SUBCOMMAND])
+            .expect("worker");
+        assert!(matches!(cli.command, Command::SearchExtract));
     }
 
     #[test]

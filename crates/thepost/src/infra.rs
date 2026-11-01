@@ -44,17 +44,23 @@ pub async fn connect_node_db(cfg: &Config, store: Arc<dyn SecretStore>) -> Resul
         .map_err(|e| context("database", e))
 }
 
-/// Пул для миграций: в обход PgBouncer, если он используется; иначе — основной пул.
+/// Пул для миграций: от владельца схемы (`database.owner`, META-23) и/или в обход PgBouncer; иначе — основной пул.
+/// Узлы с ролью PostgreSQL `thepost_app` без `database.owner` схему не меняют: им — `meta.migrate_on_start: false`.
 pub async fn migration_pool(
     cfg: &Config,
     store: &dyn SecretStore,
     main: &PgPool,
 ) -> Result<PgPool> {
     let db = pool_config(cfg)?;
-    if db.pgbouncer || db.direct_url.is_some() {
+    if db.pgbouncer || db.direct_url.is_some() || db.owner.is_some() {
+        let section = if db.owner.is_some() {
+            "database.owner"
+        } else {
+            "database.direct_url"
+        };
         return pool::connect_direct(&db, store)
             .await
-            .map_err(|e| context("database.direct_url", e));
+            .map_err(|e| context(section, e));
     }
     Ok(main.clone())
 }

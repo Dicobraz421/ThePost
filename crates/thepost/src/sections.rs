@@ -7,7 +7,11 @@
 //!
 //! Подсекции `blob.local`, `blob.s3` и `bus.valkey` — секции крейтов `tp-blob` и `tp-cluster` как есть (BLOB-11,
 //! CLU-07): приложение подставляет только каталог, бакет и префикс из `blob.url`.
+//!
+//! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `imap`, `jmap`, `search`, `admin`, `mailstore`;
+//! приложение добавляет `auth` (каталог, OIDC, пароли приложений, Kerberos) и `http` (слушатели jmap и admin).
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -20,7 +24,7 @@ use tp_contracts::tls::{InternalChannel, Profile};
 use tp_contracts::{Error, Result};
 use tp_meta::MetaConfig;
 use tp_meta::pool::PoolConfig;
-use tp_platform::SectionRegistry;
+use tp_platform::{SectionRegistry, ServiceHttpConfig};
 
 use crate::modules;
 
@@ -34,6 +38,22 @@ pub const CLUSTER: &str = "cluster";
 pub const DOCTOR: &str = "doctor";
 /// Имя секции `thepost verify`.
 pub const VERIFY: &str = "verify";
+/// Имя секции SMTP (`tp-smtp`).
+pub const SMTP: &str = "smtp";
+/// Имя секции IMAP (`tp-imap`).
+pub const IMAP: &str = "imap";
+/// Имя секции JMAP (`tp-jmap`).
+pub const JMAP: &str = "jmap";
+/// Имя секции поиска (`tp-search`).
+pub const SEARCH: &str = "search";
+/// Имя секции Admin API (`tp-admin`).
+pub const ADMIN: &str = "admin";
+/// Имя секции почтового хранилища (`tp-mailstore`).
+pub const MAILSTORE: &str = "mailstore";
+/// Имя секции входа: каталог, OIDC, пароли приложений, Kerberos.
+pub const AUTH: &str = "auth";
+/// Имя секции слушателей HTTP ролей jmap и admin.
+pub const HTTP: &str = "http";
 
 /// Реестр секций: платформа, `tp-meta`, приложение и встроенные модули; проверки каналов.
 pub fn registry() -> Result<SectionRegistry> {
@@ -45,12 +65,23 @@ pub fn registry() -> Result<SectionRegistry> {
     r.add_section::<ClusterSection>(CLUSTER)?;
     r.add_section::<DoctorSection>(DOCTOR)?;
     r.add_section::<VerifySection>(VERIFY)?;
+    r.add_section::<tp_smtp::SmtpConfig>(SMTP)?;
+    r.add_section::<tp_imap::ImapConfig>(IMAP)?;
+    r.add_section::<tp_jmap::JmapConfig>(JMAP)?;
+    r.add_section::<tp_search::SearchConfig>(SEARCH)?;
+    r.add_section::<tp_admin::AdminConfig>(ADMIN)?;
+    r.add_section::<tp_mailstore::Config>(MAILSTORE)?;
+    r.add_section::<AuthSection>(AUTH)?;
+    r.add_section::<HttpSection>(HTTP)?;
     r.add_check::<PoolConfig>(PoolConfig::SECTION, |c, profile| {
         pool_config(c, profile).check().map(drop)
     })?;
     r.add_check::<BlobSection>(BLOB, BlobSection::check)?;
     r.add_check::<BusSection>(BUS, BusSection::check)?;
     r.add_check::<ClusterSection>(CLUSTER, |c, _| c.check())?;
+    r.add_check::<tp_admin::AdminConfig>(ADMIN, |c, _| c.check())?;
+    r.add_check::<AuthSection>(AUTH, AuthSection::check)?;
+    r.add_check::<HttpSection>(HTTP, HttpSection::check)?;
     modules::register_sections(&mut r)?;
     Ok(r)
 }
@@ -90,6 +121,8 @@ pub struct BlobSection {
     pub gc: GcConfig,
     /// Поиск «сирот» (роль maintenance) — секция `tp-blob`.
     pub orphans: OrphanConfig,
+    /// Сжатие объектов писем zstd при записи (BLOB-13, MS-15) — секция `tp-blob`.
+    pub compression: tp_blob::CompressionConfig,
 }
 
 /// Где лежат объекты: разобранный `blob.url`.
@@ -251,6 +284,9 @@ pub struct ClusterSection {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub events_poll_interval: Duration,
+    /// Запросов перестройки индексов, просматриваемых ролью indexer за проход (перестраиваются ящики своих
+    /// разделов журнала).
+    pub rebuild_scan: usize,
 }
 
 impl Default for ClusterSection {
@@ -259,6 +295,7 @@ impl Default for ClusterSection {
             node_id: None,
             assign_poll_interval: Duration::from_secs(2),
             events_poll_interval: Duration::from_secs(1),
+            rebuild_scan: 64,
         }
     }
 }
@@ -273,6 +310,139 @@ impl ClusterSection {
             return Err(Error::invalid("периоды опроса должны быть больше нуля"));
         }
         Ok(())
+    }
+}
+
+// ---------- auth ----------
+
+/// Секция `auth`: вход в протоколы (SRS 6.1) — каталог LDAP, OIDC (Bearer), пароли приложений, Kerberos.
+///
+/// ```yaml
+/// auth:
+///   ldap:
+///     url: ldaps://dc.example.ru
+///     bind_dn: cn=thepost,ou=services,dc=example,dc=ru
+///     bind_password: { secret: "thepost/ldap#password" }
+///     base_dn: dc=example,dc=ru
+///   oidc:
+///     issuer: https://sso.example.ru/realms/mail
+///     audience: [thepost]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthSection {
+    /// Каталог LDAP / Active Directory (`tp-auth`): адреса, группы, проверка пароля привязкой; не задан —
+    /// учётные записи только из PostgreSQL, вход — паролями приложений. Требует перезапуска.
+    pub ldap: Option<tp_auth::LdapConfig>,
+    /// Поставщик OpenID Connect: токены Bearer (JMAP, Admin API, SASL OAUTHBEARER). Требует перезапуска.
+    pub oidc: Option<tp_auth::OidcConfig>,
+    /// Пароли приложений (argon2id).
+    pub passwords: tp_auth::PasswordConfig,
+    /// Kerberos (SASL GSSAPI). Keytab задаёт переменная `KRB5_KTNAME` (systemd `Environment=`): поле `keytab`
+    /// только сверяется с ней. Требует перезапуска.
+    pub gssapi: Option<tp_auth::GssapiConfig>,
+}
+
+impl AuthSection {
+    /// Проверка: каналы LDAP и OIDC (TLS вне dev), keytab Kerberos.
+    pub fn check(&self, profile: Profile) -> Result<()> {
+        if let Some(ldap) = &self.ldap {
+            ldap.check(profile).map_err(|e| sub("ldap", e))?;
+        }
+        if let Some(oidc) = &self.oidc {
+            oidc.check(profile).map_err(|e| sub("oidc", e))?;
+        }
+        if let Some(gssapi) = &self.gssapi {
+            gssapi.check().map_err(|e| sub("gssapi", e))?;
+        }
+        Ok(())
+    }
+}
+
+// ---------- http ----------
+
+/// Секция `http`: слушатели HTTP ролей jmap и admin (TLS — секция `tls`; открытый HTTP — только `profile: dev`
+/// с `allow_plaintext`). Слушатель не задан — роль готова, но соединений не принимает. Требует перезапуска.
+///
+/// ```yaml
+/// http:
+///   jmap: { listen: 0.0.0.0:443 }
+///   admin: { listen: 127.0.0.1:8443 }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpSection {
+    /// JMAP (`/.well-known/jmap`, `/jmap/*`).
+    pub jmap: Option<HttpListener>,
+    /// Admin API (`/api/*`); адрес — только внутренний (loopback, частные сети).
+    pub admin: Option<HttpListener>,
+}
+
+/// Слушатель HTTP роли.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpListener {
+    /// Адрес и порт.
+    pub listen: SocketAddr,
+    /// Открытый HTTP без TLS: только `profile: dev`.
+    pub allow_plaintext: bool,
+    /// Время на TLS-рукопожатие.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub handshake_timeout: Duration,
+    /// Одновременных незавершённых TLS-рукопожатий.
+    pub max_handshakes: usize,
+}
+
+impl Default for HttpListener {
+    fn default() -> Self {
+        let base = ServiceHttpConfig::default();
+        Self {
+            listen: SocketAddr::from(([0, 0, 0, 0], 443)),
+            allow_plaintext: false,
+            handshake_timeout: base.handshake_timeout,
+            max_handshakes: base.max_handshakes,
+        }
+    }
+}
+
+impl HttpListener {
+    /// Параметры сервера HTTP платформы (`tp_platform::service_http::serve`). `public` — роль для клиентов
+    /// (jmap): адрес слушателя разрешён явно; иначе (admin) — только внутренние адреса, как у служебного HTTP.
+    pub fn server(&self, public: bool) -> ServiceHttpConfig {
+        let ip = self.listen.ip();
+        let prefix = if ip.is_ipv4() { 32 } else { 128 };
+        ServiceHttpConfig {
+            listen: self.listen,
+            internal_networks: if public {
+                vec![tp_platform::Cidr::new(ip, prefix)]
+            } else {
+                Vec::new()
+            },
+            allow_plaintext: self.allow_plaintext,
+            handshake_timeout: self.handshake_timeout,
+            max_handshakes: self.max_handshakes,
+        }
+    }
+}
+
+impl HttpSection {
+    /// Проверка: открытый HTTP — только в dev, ненулевые таймауты, Admin API — только на внутреннем адресе.
+    pub fn check(&self, profile: Profile) -> Result<()> {
+        for (name, l, public) in [("jmap", &self.jmap, true), ("admin", &self.admin, false)] {
+            if let Some(l) = l {
+                l.server(public).check(profile).map_err(|e| sub(name, e))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Ошибка подсекции с префиксом её имени.
+fn sub(name: &str, e: Error) -> Error {
+    match e {
+        Error::Invalid(m) => Error::Invalid(format!("{name}: {m}")),
+        other => other,
     }
 }
 
@@ -310,6 +480,14 @@ pub struct DoctorSection {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub blob_timeout: Duration,
+    /// Предел ожидания каждого запроса DNS (MX, SPF, DKIM, DMARC, MTA-STS, PTR).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub dns_timeout: Duration,
+    /// Сертификату `tls` осталось действовать меньше — предупреждение.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub cert_warn_before: Duration,
 }
 
 impl Default for DoctorSection {
@@ -318,6 +496,8 @@ impl Default for DoctorSection {
             warn_clock_skew: Duration::from_millis(500),
             max_clock_skew: Duration::from_secs(5),
             blob_timeout: Duration::from_secs(10),
+            dns_timeout: Duration::from_secs(5),
+            cert_warn_before: Duration::from_secs(21 * 86_400),
         }
     }
 }
@@ -527,6 +707,13 @@ blob:
             "\"doctor\"",
             "\"verify\"",
             "\"secrets\"",
+            "\"smtp\"",
+            "\"imap\"",
+            "\"jmap\"",
+            "\"search\"",
+            "\"admin\"",
+            "\"auth\"",
+            "\"http\"",
         ] {
             assert!(schema.contains(key), "{key}");
         }
