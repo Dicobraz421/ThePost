@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="560" viewBox="0 0 1000 560" font-family="Arial, 'Liberation Sans', 'DejaVu Sans', sans-serif">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#404040"/></marker><marker id="s" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#404040"/></marker></defs>
+<rect width="1000" height="560" fill="#FFFFFF"/>
+<text x="500.0" y="26" font-size="16" text-anchor="middle" fill="#1F4E79" font-weight="bold">Малый Enterprise: 2 узла + 3 ВМ данных</text>
+<rect x="20" y="70" width="150" height="54" rx="6" fill="#EDEDED" stroke="#7F7F7F" stroke-width="1.5"/>
+<text x="95.0" y="87" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Клиенты</text>
+<text x="95.0" y="102" font-size="10.5" text-anchor="middle" fill="#262626">IMAP, JMAP, DAV</text>
+<text x="95.0" y="116" font-size="10.5" text-anchor="middle" fill="#262626">SMTP</text>
+<rect x="20" y="160" width="150" height="40" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.5"/>
+<text x="95.0" y="177" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Узлы edge (DMZ)</text>
+<text x="95.0" y="192" font-size="10.5" text-anchor="middle" fill="#262626">по необходимости</text>
+<rect x="220" y="110" width="160" height="54" rx="6" fill="#EDEDED" stroke="#7F7F7F" stroke-width="1.5"/>
+<text x="300.0" y="127" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Виртуальный адрес</text>
+<text x="300.0" y="142" font-size="10.5" text-anchor="middle" fill="#262626">keepalived или</text>
+<text x="300.0" y="156" font-size="10.5" text-anchor="middle" fill="#262626">балансировщик заказчика</text>
+<path d="M170,100 L220,130" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M170,185 L220,150" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<rect x="420" y="50" width="560" height="130" rx="8" fill="#F5F9FD" stroke="#1F4E79" stroke-width="1.6"/>
+<text x="432" y="70" font-size="13" text-anchor="start" fill="#1F4E79" font-weight="bold">Узлы приложения</text>
+<rect x="440" y="85" width="250" height="54" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.5"/>
+<text x="565.0" y="102" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Узел 1: пресет mailbox</text>
+<text x="565.0" y="117" font-size="10.5" text-anchor="middle" fill="#262626">transport + access + backend</text>
+<text x="565.0" y="131" font-size="10.5" text-anchor="middle" fill="#262626">Rspamd (Milter)</text>
+<rect x="710" y="85" width="250" height="54" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.5"/>
+<text x="835.0" y="102" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Узел 2: пресет mailbox</text>
+<text x="835.0" y="117" font-size="10.5" text-anchor="middle" fill="#262626">transport + access + backend</text>
+<text x="835.0" y="131" font-size="10.5" text-anchor="middle" fill="#262626">Rspamd (Milter)</text>
+<path d="M380,130 L440,115" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M380,145 L410,145 L410,160 L835,160 L835,139" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<rect x="20" y="240" width="960" height="260" rx="8" fill="#F5F9FD" stroke="#1F4E79" stroke-width="1.6"/>
+<text x="32" y="260" font-size="13" text-anchor="start" fill="#1F4E79" font-weight="bold">ВМ данных (PostgreSQL, SeaweedFS, OpenBao)</text>
+<text x="190" y="290" font-size="12" text-anchor="middle" fill="#1F4E79" font-weight="bold">ВМ данных 1</text>
+<rect x="50" y="300" width="280" height="40" rx="6" fill="#FBE5D6" stroke="#C55A11" stroke-width="1.5"/>
+<text x="190.0" y="317" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">PostgreSQL primary</text>
+<text x="190.0" y="332" font-size="10.5" text-anchor="middle" fill="#262626">метаданные</text>
+<rect x="50" y="360" width="280" height="54" rx="6" fill="#FBE5D6" stroke="#C55A11" stroke-width="1.5"/>
+<text x="190.0" y="377" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">SeaweedFS</text>
+<text x="190.0" y="392" font-size="10.5" text-anchor="middle" fill="#262626">master + volume + filer + S3</text>
+<text x="190.0" y="406" font-size="10.5" text-anchor="middle" fill="#262626">метаданные filer — в PostgreSQL</text>
+<rect x="50" y="428" width="280" height="40" rx="6" fill="#E2F0D9" stroke="#548235" stroke-width="1.5"/>
+<text x="190.0" y="445" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">OpenBao</text>
+<text x="190.0" y="460" font-size="10.5" text-anchor="middle" fill="#262626">узел кластера Raft</text>
+<text x="505" y="290" font-size="12" text-anchor="middle" fill="#1F4E79" font-weight="bold">ВМ данных 2</text>
+<rect x="365" y="300" width="280" height="40" rx="6" fill="#FBE5D6" stroke="#C55A11" stroke-width="1.5"/>
+<text x="505.0" y="317" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">PostgreSQL standby (синхр.)</text>
+<text x="505.0" y="332" font-size="10.5" text-anchor="middle" fill="#262626">метаданные</text>
+<rect x="365" y="360" width="280" height="54" rx="6" fill="#FBE5D6" stroke="#C55A11" stroke-width="1.5"/>
+<text x="505.0" y="377" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">SeaweedFS</text>
+<text x="505.0" y="392" font-size="10.5" text-anchor="middle" fill="#262626">master + volume + filer + S3</text>
+<text x="505.0" y="406" font-size="10.5" text-anchor="middle" fill="#262626">метаданные filer — в PostgreSQL</text>
+<rect x="365" y="428" width="280" height="40" rx="6" fill="#E2F0D9" stroke="#548235" stroke-width="1.5"/>
+<text x="505.0" y="445" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">OpenBao</text>
+<text x="505.0" y="460" font-size="10.5" text-anchor="middle" fill="#262626">узел кластера Raft</text>
+<text x="820" y="290" font-size="12" text-anchor="middle" fill="#1F4E79" font-weight="bold">ВМ данных 3</text>
+<rect x="680" y="300" width="280" height="40" rx="6" fill="#EDEDED" stroke="#7F7F7F" stroke-width="1.5"/>
+<text x="820.0" y="317" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">монитор pg_auto_failover</text>
+<text x="820.0" y="332" font-size="10.5" text-anchor="middle" fill="#262626">выбор primary, свидетель</text>
+<rect x="680" y="360" width="280" height="54" rx="6" fill="#FBE5D6" stroke="#C55A11" stroke-width="1.5"/>
+<text x="820.0" y="377" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">SeaweedFS</text>
+<text x="820.0" y="392" font-size="10.5" text-anchor="middle" fill="#262626">master + volume + filer + S3</text>
+<text x="820.0" y="406" font-size="10.5" text-anchor="middle" fill="#262626">метаданные filer — в PostgreSQL</text>
+<rect x="680" y="428" width="280" height="40" rx="6" fill="#E2F0D9" stroke="#548235" stroke-width="1.5"/>
+<text x="820.0" y="445" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">OpenBao</text>
+<text x="820.0" y="460" font-size="10.5" text-anchor="middle" fill="#262626">узел кластера Raft</text>
+<path d="M330,320 L365,320" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M700,180 L700,240" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="755" y="215" font-size="10" text-anchor="middle" fill="#404040" font-style="italic">SQL, S3, секреты</text>
+<text x="500" y="520" font-size="11" text-anchor="middle" fill="#404040" font-style="italic">Переносит отказ любой одной ВМ; RPO = 0 при работающем standby</text>
+<rect x="20" y="532" width="14" height="12" rx="2" fill="#DCE9F5" stroke="#2E75B6"/>
+<text x="40" y="542" font-size="10.5" fill="#404040">узел The Post</text>
+<rect x="170" y="532" width="14" height="12" rx="2" fill="#FBE5D6" stroke="#C55A11"/>
+<text x="190" y="542" font-size="10.5" fill="#404040">хранилище данных</text>
+<rect x="320" y="532" width="14" height="12" rx="2" fill="#E2F0D9" stroke="#548235"/>
+<text x="340" y="542" font-size="10.5" fill="#404040">секреты, антиспам</text>
+<rect x="470" y="532" width="14" height="12" rx="2" fill="#EDEDED" stroke="#7F7F7F"/>
+<text x="490" y="542" font-size="10.5" fill="#404040">внешняя система</text>
+</svg>

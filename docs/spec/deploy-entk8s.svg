@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="520" viewBox="0 0 1000 520" font-family="Arial, 'Liberation Sans', 'DejaVu Sans', sans-serif">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#404040"/></marker><marker id="s" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#404040"/></marker></defs>
+<rect width="1000" height="520" fill="#FFFFFF"/>
+<text x="500.0" y="26" font-size="16" text-anchor="middle" fill="#1F4E79" font-weight="bold">Enterprise-K8s</text>
+<rect x="20" y="60" width="140" height="40" rx="6" fill="#EDEDED" stroke="#7F7F7F" stroke-width="1.5"/>
+<text x="90.0" y="77" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Интернет</text>
+<text x="90.0" y="92" font-size="10.5" text-anchor="middle" fill="#262626">MX, клиенты</text>
+<rect x="190" y="45" width="180" height="120" rx="8" fill="#F5F9FD" stroke="#1F4E79" stroke-width="1.6"/>
+<text x="202" y="65" font-size="13" text-anchor="start" fill="#1F4E79" font-weight="bold">DMZ (ВМ)</text>
+<rect x="205" y="75" width="150" height="54" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.5"/>
+<text x="280.0" y="92" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">edge × 2+</text>
+<text x="280.0" y="107" font-size="10.5" text-anchor="middle" fill="#262626">вне кластера</text>
+<text x="280.0" y="121" font-size="10.5" text-anchor="middle" fill="#262626">Kubernetes</text>
+<path d="M160,85 L205,95" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<rect x="20" y="210" width="140" height="40" rx="6" fill="#EDEDED" stroke="#7F7F7F" stroke-width="1.5"/>
+<text x="90.0" y="227" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Клиенты</text>
+<text x="90.0" y="242" font-size="10.5" text-anchor="middle" fill="#262626">внутренняя сеть</text>
+<rect x="190" y="185" width="790" height="300" rx="8" fill="#F5F9FD" stroke="#1F4E79" stroke-width="1.6"/>
+<text x="202" y="205" font-size="13" text-anchor="start" fill="#1F4E79" font-weight="bold">Кластер Kubernetes</text>
+<rect x="210" y="220" width="160" height="68" rx="6" fill="#EDEDED" stroke="#7F7F7F" stroke-width="1.5"/>
+<text x="290.0" y="237" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Service LoadBalancer</text>
+<text x="290.0" y="252" font-size="10.5" text-anchor="middle" fill="#262626">MetalLB или внешний</text>
+<text x="290.0" y="266" font-size="10.5" text-anchor="middle" fill="#262626">externalTrafficPolicy:</text>
+<text x="290.0" y="280" font-size="10.5" text-anchor="middle" fill="#262626">Local / PROXY v2</text>
+<path d="M160,235 L210,240" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M280,165 L280,175 L487,175 L487,220" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="390" y="170" font-size="10" text-anchor="middle" fill="#404040" font-style="italic">SMTP, mTLS</text>
+<rect x="400" y="220" width="175" height="54" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.5"/>
+<text x="487.5" y="237" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Deployment transport</text>
+<text x="487.5" y="252" font-size="10.5" text-anchor="middle" fill="#262626">HPA по CPU</text>
+<text x="487.5" y="266" font-size="10.5" text-anchor="middle" fill="#262626">PDB, anti-affinity</text>
+<rect x="590" y="220" width="175" height="54" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.5"/>
+<text x="677.5" y="237" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Deployment access</text>
+<text x="677.5" y="252" font-size="10.5" text-anchor="middle" fill="#262626">HPA по CPU</text>
+<text x="677.5" y="266" font-size="10.5" text-anchor="middle" fill="#262626">(+ соединения — опция)</text>
+<rect x="780" y="220" width="180" height="54" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.5"/>
+<text x="870.0" y="237" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Deployment backend</text>
+<text x="870.0" y="252" font-size="10.5" text-anchor="middle" fill="#262626">HPA по CPU</text>
+<text x="870.0" y="266" font-size="10.5" text-anchor="middle" fill="#262626">VPA — рекомендации</text>
+<path d="M370,250 L400,250" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<rect x="400" y="330" width="175" height="54" rx="6" fill="#FBE5D6" stroke="#C55A11" stroke-width="1.5"/>
+<text x="487.5" y="347" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">CloudNativePG</text>
+<text x="487.5" y="362" font-size="10.5" text-anchor="middle" fill="#262626">primary + реплики</text>
+<text x="487.5" y="376" font-size="10.5" text-anchor="middle" fill="#262626">PgBouncer (Pooler)</text>
+<rect x="590" y="330" width="175" height="40" rx="6" fill="#FBE5D6" stroke="#C55A11" stroke-width="1.5"/>
+<text x="677.5" y="347" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">SeaweedFS</text>
+<text x="677.5" y="362" font-size="10.5" text-anchor="middle" fill="#262626">Helm; S3 Service</text>
+<rect x="780" y="330" width="180" height="54" rx="6" fill="#E2F0D9" stroke="#548235" stroke-width="1.5"/>
+<text x="870.0" y="347" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">OpenBao</text>
+<text x="870.0" y="362" font-size="10.5" text-anchor="middle" fill="#262626">Helm, Raft;</text>
+<text x="870.0" y="376" font-size="10.5" text-anchor="middle" fill="#262626">вход — Kubernetes auth</text>
+<rect x="400" y="430" width="175" height="40" rx="6" fill="#E2F0D9" stroke="#548235" stroke-width="1.5"/>
+<text x="487.5" y="447" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Rspamd</text>
+<text x="487.5" y="462" font-size="10.5" text-anchor="middle" fill="#262626">Deployment, Milter</text>
+<rect x="590" y="430" width="370" height="40" rx="6" fill="#EDEDED" stroke="#7F7F7F" stroke-width="1.5"/>
+<text x="775.0" y="447" font-size="12" text-anchor="middle" fill="#1A1A1A" font-weight="bold">Наблюдение</text>
+<text x="775.0" y="462" font-size="10.5" text-anchor="middle" fill="#262626">Prometheus, prometheus-adapter (для HPA по соединениям)</text>
+<path d="M677,284 L677,330" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M600,284 L500,330" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M760,284 L860,330" fill="none" stroke="#404040" stroke-width="1.5" marker-end="url(#a)"/>
+<rect x="20" y="492" width="14" height="12" rx="2" fill="#DCE9F5" stroke="#2E75B6"/>
+<text x="40" y="502" font-size="10.5" fill="#404040">узел The Post</text>
+<rect x="170" y="492" width="14" height="12" rx="2" fill="#FBE5D6" stroke="#C55A11"/>
+<text x="190" y="502" font-size="10.5" fill="#404040">хранилище данных</text>
+<rect x="320" y="492" width="14" height="12" rx="2" fill="#E2F0D9" stroke="#548235"/>
+<text x="340" y="502" font-size="10.5" fill="#404040">секреты, антиспам</text>
+<rect x="470" y="492" width="14" height="12" rx="2" fill="#EDEDED" stroke="#7F7F7F"/>
+<text x="490" y="502" font-size="10.5" fill="#404040">внешняя система</text>
+</svg>
