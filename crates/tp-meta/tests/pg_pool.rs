@@ -180,6 +180,7 @@ async fn doctor_structured_report() {
             "timezone",
             "log_timezone",
             "rls",
+            "node_role",
             "tls"
         ]
     );

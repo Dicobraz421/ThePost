@@ -58,6 +58,9 @@ pub struct PoolConfig {
     pub dynamic_credentials: Option<DynamicCredentials>,
     /// Адрес PostgreSQL в обход PgBouncer для миграций (без пароля); по умолчанию — `url`.
     pub direct_url: Option<String>,
+    /// Владелец схемы — только для миграций ([`connect_direct`], `thepost migrate`); узлы входят ролями с
+    /// минимальными правами (`thepost_app`, `thepost_reader`, META-23). Не задано — миграции от роли `url`.
+    pub owner: Option<SchemaOwner>,
     /// Соединение через PgBouncer в режиме transaction.
     pub pgbouncer: bool,
     /// Наибольшее число соединений пула узла.
@@ -95,6 +98,7 @@ impl Default for PoolConfig {
             password: None,
             dynamic_credentials: None,
             direct_url: None,
+            owner: None,
             pgbouncer: false,
             max_connections: 32,
             min_connections: 0,
@@ -115,6 +119,7 @@ impl fmt::Debug for PoolConfig {
         f.debug_struct("PoolConfig")
             .field("password", &self.password)
             .field("dynamic_credentials", &self.dynamic_credentials)
+            .field("owner", &self.owner)
             .field("pgbouncer", &self.pgbouncer)
             .field("max_connections", &self.max_connections)
             .field("min_connections", &self.min_connections)
@@ -163,8 +168,13 @@ impl PoolConfig {
         Ok(transport)
     }
 
-    /// Пароль и динамические учётные данные не заданы вместе; параметры ротации.
+    /// Пароль и динамические учётные данные не заданы вместе; параметры ротации; имя владельца схемы.
     fn check_credentials(&self) -> Result<()> {
+        if let Some(owner) = &self.owner
+            && owner.user.trim().is_empty()
+        {
+            return Err(Error::invalid("database.owner.user не задан"));
+        }
         if let Some(dc) = &self.dynamic_credentials {
             if self.password.is_some() {
                 return Err(Error::invalid(
@@ -241,6 +251,24 @@ impl PoolConfig {
             .idle_timeout(self.idle_timeout)
             .max_lifetime(self.max_lifetime)
     }
+}
+
+/// Владелец схемы для миграций (`database.owner`).
+///
+/// ```yaml
+/// database:
+///   owner:
+///     user: thepost_owner
+///     password: { secret: "thepost/db-owner#password" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaOwner {
+    /// Имя роли владельца схемы.
+    pub user: String,
+    /// Пароль — ссылка на секрет; не задан — вход без пароля (сертификат клиента; `trust` в dev).
+    #[serde(default)]
+    pub password: Option<SecretRef>,
 }
 
 /// Адрес PostgreSQL содержит пароль: `scheme://user:password@host…` или параметр `password=`.
@@ -365,13 +393,25 @@ pub fn connect_lazy(cfg: &PoolConfig, url: &str, password: Option<&Secret>) -> R
     Ok(cfg.pool_options().connect_lazy_with(opts))
 }
 
-/// Пул из одного соединения в обход PgBouncer для миграций ([`crate::schema::migrate`], модули).
+/// Пул из одного соединения в обход PgBouncer для миграций ([`crate::schema::migrate`], модули): с
+/// [`PoolConfig::owner`] — от владельца схемы с его паролем, иначе — с учётными данными узла.
 pub async fn connect_direct(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Result<PgPool> {
     let (url, pgbouncer) = match &cfg.direct_url {
         Some(url) => (url.as_str(), false),
         None => (cfg.url.as_str(), cfg.pgbouncer),
     };
-    let opts = credentials_options(cfg, url, pgbouncer, secrets).await?;
+    let opts = match &cfg.owner {
+        Some(owner) => {
+            cfg.check_credentials()?;
+            let password = match &owner.password {
+                Some(r) => Some(fetch_secret(secrets, r, "database.owner.password").await?),
+                None => None,
+            };
+            cfg.open_options(url, pgbouncer, password.as_ref())?
+                .username(&owner.user)
+        }
+        None => credentials_options(cfg, url, pgbouncer, secrets).await?,
+    };
     PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(cfg.acquire_timeout)
