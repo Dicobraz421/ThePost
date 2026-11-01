@@ -7,6 +7,7 @@
 //! - `fetch` — FETCH: метаданные, разделы BODY[], BINARY, частичная выборка.
 //! - `store` — STORE и CONDSTORE (`UNCHANGEDSINCE`, `MODSEQ`).
 //! - `search` — SEARCH и ESEARCH: метаданные и полнотекстовый индекс.
+//! - `write` — APPEND, COPY, MOVE, EXPUNGE, CLOSE (UIDPLUS).
 //! - [`config`] — секция `imap` config.yaml.
 
 pub mod config;
@@ -16,6 +17,7 @@ pub mod proto;
 mod search;
 pub mod session;
 mod store;
+mod write;
 
 pub use config::ImapConfig;
 pub use session::{Deps, Server, Session, SessionCtx, Transport};

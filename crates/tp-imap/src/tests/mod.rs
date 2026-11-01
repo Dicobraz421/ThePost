@@ -26,6 +26,7 @@ mod mailbox;
 mod search;
 mod session;
 mod store;
+mod write;
 
 pub(crate) const LOGIN: &str = "user@example.org";
 pub(crate) const PASSWORD: &str = "secret";

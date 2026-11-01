@@ -189,6 +189,22 @@ impl<T: Transport> Session<T> {
         }
     }
 
+    /// Папка назначения `APPEND`/`COPY`/`MOVE`; нет — `NO [TRYCREATE]` (RFC 9051, 6.3.12) уже записан.
+    pub(crate) async fn target(&mut self, tag: &Tag<'static>, raw: &[u8]) -> Result<Option<Node>> {
+        let Some(name) = self.decode_name(raw) else {
+            self.bad(Some(tag), "Invalid mailbox name");
+            return Ok(None);
+        };
+        let tree = self.tree().await?;
+        match tree.find(&name) {
+            Some(n) => Ok(Some(n.clone())),
+            None => {
+                self.no(tag, Some(Code::TryCreate), "No such mailbox");
+                Ok(None)
+            }
+        }
+    }
+
     // ---------- LIST ----------
 
     pub(crate) async fn list(&mut self, tag: &Tag<'static>, cmd: ListCommand) -> Result<()> {

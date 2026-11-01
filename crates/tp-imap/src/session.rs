@@ -180,6 +180,8 @@ const EXTENSIONS: &[&str] = &[
     "BINARY",
     "CONDSTORE",
     "ESEARCH",
+    "UIDPLUS",
+    "MOVE",
 ];
 
 fn reader(config: &ImapConfig) -> Reader {
@@ -571,6 +573,15 @@ impl<T: Transport> Session<T> {
                     let (from, to) = (proto::mailbox_bytes(&from), proto::mailbox_bytes(&to));
                     self.rename(&tag, &from, &to).await
                 }
+                CommandBody::Append {
+                    mailbox,
+                    flags,
+                    date,
+                    message,
+                } => {
+                    self.append(&tag, &mailbox, &flags, date.as_ref(), &message)
+                        .await
+                }
                 CommandBody::Subscribe { mailbox } => {
                     self.subscribe(&tag, &proto::mailbox_bytes(&mailbox), true)
                         .await
@@ -620,6 +631,27 @@ impl<T: Transport> Session<T> {
                     .await
             }
             body @ CommandBody::Store { .. } => self.store(tag, body).await,
+            CommandBody::Copy {
+                sequence_set,
+                mailbox,
+                uid,
+            } => {
+                self.copy_or_move(tag, &sequence_set, &mailbox, uid, false)
+                    .await
+            }
+            CommandBody::Move {
+                sequence_set,
+                mailbox,
+                uid,
+            } => {
+                self.copy_or_move(tag, &sequence_set, &mailbox, uid, true)
+                    .await
+            }
+            CommandBody::Expunge => self.expunge(tag, None).await,
+            CommandBody::ExpungeUid { sequence_set } => {
+                self.expunge(tag, Some(&sequence_set)).await
+            }
+            CommandBody::Close => self.close(tag).await,
             CommandBody::Search {
                 charset,
                 criteria,
