@@ -1,5 +1,5 @@
 //! Общие наборы тестов контрактов: in-memory реализации testkit и настоящие реализации полос
-//! (`tp-meta` — `Membership`, `AclStore`, `tp-platform` — `SecretStore`) проходят одни и те же проверки.
+//! (`tp-meta` — `Membership`, `AclStore`, `AppPasswordStore`, `tp-platform` — `SecretStore`) проходят одни и те же проверки.
 //!
 //! Время в наборах идёт через [`Wait`]: для testkit — [`ManualClock`] (сдвиг без ожидания), для PostgreSQL
 //! и OpenBao — [`RealTime`] (сон), тогда сроки выбирают с запасом на задержки.
@@ -20,7 +20,9 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use time::OffsetDateTime;
 use tp_contracts::acl::{ANYONE, AclEntry, AclStore, SendDelegation, SharedMailbox};
+use tp_contracts::app_password::{AppPassword, AppPasswordStore};
 use tp_contracts::auth::{Rights, SendRight};
 use tp_contracts::membership::{Membership, NodeId};
 use tp_contracts::meta::{AccountScope, MailboxStore, NewMailbox, SpecialUse};
@@ -476,4 +478,128 @@ pub async fn acl_store(acl: &dyn AclStore, mailboxes: &dyn MailboxStore, fx: &Ac
         Err(Error::NotFound)
     );
     assert_eq!(acl.send_right_of(alien, &[assistants]).await, Ok(None));
+}
+
+// ---------- AppPasswordStore ----------
+
+/// Учётные записи для [`app_password_store`]; создаёт тест до запуска набора.
+#[derive(Debug, Clone, Copy)]
+pub struct AppPasswordFixture {
+    /// Владелец паролей (без паролей до набора).
+    pub owner: AccountScope,
+    /// Другая учётная запись той же организации (без паролей до набора).
+    pub peer: AccountScope,
+    /// Другая организация.
+    pub foreign_tenant: TenantId,
+}
+
+/// Набор проверок `AppPasswordStore`. Моменты — целые секунды (точность хранилища — не грубее микросекунды).
+pub async fn app_password_store(store: &dyn AppPasswordStore, fx: &AppPasswordFixture) {
+    let at = |s: i64| OffsetDateTime::from_unix_timestamp(1_800_000_000 + s).expect("time");
+    let pw = |id: &str, created: i64| AppPassword {
+        id: id.to_owned(),
+        label: format!("Телефон {id}"),
+        hash: format!("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA${id}"),
+        created_at: at(created),
+        revoked_at: None,
+    };
+    let owner = fx.owner;
+    let list = |scope: AccountScope| async move { store.list(scope).await.expect("list") };
+    assert!(list(owner).await.is_empty());
+
+    // Порядок — по created_at, затем по id; отозванный при добавлении сохраняется как есть.
+    let (b, z, a) = (pw("b", 10), pw("z", 0), pw("a", 10));
+    let old = AppPassword {
+        revoked_at: Some(at(5)),
+        ..pw("old", -10)
+    };
+    for p in [&b, &z, &a, &old] {
+        store.insert(owner, p.clone()).await.expect("insert");
+    }
+    assert_eq!(
+        list(owner).await,
+        vec![old.clone(), z.clone(), a.clone(), b.clone()]
+    );
+
+    // Идентификатор занят — Conflict; в другой учётной записи тот же идентификатор свободен.
+    assert_eq!(store.insert(owner, pw("a", 20)).await, Err(Error::Conflict));
+    assert!(list(fx.peer).await.is_empty());
+    store.insert(fx.peer, pw("a", 20)).await.expect("peer");
+    assert_eq!(list(fx.peer).await, vec![pw("a", 20)]);
+
+    // Недопустимые поля — Invalid (раньше NotFound); нет учётной записи — NotFound.
+    let missing = AccountScope {
+        tenant: owner.tenant,
+        account: AccountId::new(),
+    };
+    let bad = [
+        AppPassword {
+            id: String::new(),
+            ..pw("x", 0)
+        },
+        AppPassword {
+            id: "a b".into(),
+            ..pw("x", 0)
+        },
+        AppPassword {
+            hash: String::new(),
+            ..pw("x", 0)
+        },
+        AppPassword {
+            label: "a\nb".into(),
+            ..pw("x", 0)
+        },
+    ];
+    for p in bad {
+        for scope in [owner, missing] {
+            assert!(
+                matches!(store.insert(scope, p.clone()).await, Err(Error::Invalid(_))),
+                "{p:?}"
+            );
+        }
+    }
+    assert_eq!(
+        store.insert(missing, pw("x", 0)).await,
+        Err(Error::NotFound)
+    );
+    assert!(list(missing).await.is_empty());
+
+    // Отзыв: момент первого отзыва сохраняется; нет пароля — NotFound.
+    store.revoke(owner, "a", at(30)).await.expect("revoke");
+    store
+        .revoke(owner, "a", at(40))
+        .await
+        .expect("revoke again");
+    store
+        .revoke(owner, "old", at(50))
+        .await
+        .expect("revoke revoked");
+    let revoked = AppPassword {
+        revoked_at: Some(at(30)),
+        ..a.clone()
+    };
+    assert_eq!(list(owner).await, vec![old, z, revoked, b]);
+    assert_eq!(
+        list(fx.peer).await,
+        vec![pw("a", 20)],
+        "отзыв не задел peer"
+    );
+    assert_eq!(
+        store.revoke(owner, "nope", at(30)).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        store.revoke(fx.peer, "b", at(30)).await,
+        Err(Error::NotFound)
+    );
+
+    // Другая организация не видит пароли.
+    let alien = AccountScope {
+        tenant: fx.foreign_tenant,
+        account: owner.account,
+    };
+    assert!(list(alien).await.is_empty());
+    assert_eq!(store.revoke(alien, "b", at(30)).await, Err(Error::NotFound));
+    assert_eq!(store.insert(alien, pw("c", 0)).await, Err(Error::NotFound));
+    assert_eq!(list(owner).await.len(), 4);
 }

@@ -35,6 +35,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "index manifests",
         include_str!("../migrations/0008_index_manifests.sql"),
     ),
+    (
+        9,
+        "app passwords",
+        include_str!("../migrations/0009_app_passwords.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
