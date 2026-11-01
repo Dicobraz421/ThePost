@@ -182,6 +182,8 @@ pub struct Deps {
     pub trash: Arc<dyn TrashStore>,
     /// Почтовое хранилище: восстановление из корзины с уведомлением клиентов.
     pub store: Arc<dyn MailStore>,
+    /// Пароли приложений: выпуск, список, отзыв.
+    pub app_passwords: tp_auth::AppPasswords,
 }
 
 impl fmt::Debug for Deps {
@@ -228,6 +230,7 @@ impl Admin {
         let mut api: Router<Arc<Admin>> = Router::new().route("/api/v1/whoami", get(whoami));
         api = crate::accounts::routes(api);
         api = crate::retention::routes(api);
+        api = crate::app_passwords::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -512,6 +515,7 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     let mut api = ApiDoc::openapi();
     api.merge(crate::accounts::Doc::openapi());
     api.merge(crate::retention::Doc::openapi());
+    api.merge(crate::app_passwords::Doc::openapi());
     api
 }
 

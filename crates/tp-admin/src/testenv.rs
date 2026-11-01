@@ -18,8 +18,8 @@ use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, Flags, Policy, PolicyResolver, SpecialUse};
 use tp_contracts::{AccountId, DomainId, Error, MailboxId, MessageId, Result, TenantId};
 use tp_testkit::{
-    Clock, FakeAuthenticator, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata, MemQuota,
-    MemTrash, SystemClock,
+    Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemEventBus,
+    MemMetadata, MemQuota, MemTrash, SystemClock,
 };
 
 use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
@@ -150,6 +150,7 @@ pub struct Stores {
     pub meta: MemMetadata,
     pub quota: MemQuota,
     pub store: tp_mailstore::Store,
+    pub passwords: MemAppPasswords,
 }
 
 impl Stores {
@@ -168,7 +169,22 @@ impl Stores {
             bus: Arc::new(MemEventBus::default()),
             hooks: DecisionHooks::default(),
         });
-        Self { meta, quota, store }
+        let passwords = MemAppPasswords::new(&meta);
+        Self {
+            meta,
+            quota,
+            store,
+            passwords,
+        }
+    }
+
+    /// Пароли приложений поверх хранилища паролей.
+    pub fn app_passwords(&self) -> tp_auth::AppPasswords {
+        tp_auth::AppPasswords::new(
+            Arc::new(self.passwords.clone()),
+            tp_auth::PasswordConfig::default(),
+        )
+        .expect("app passwords")
     }
 
     /// Зависимости Admin API поверх хранилищ (без субъектов и модулей).
@@ -185,6 +201,7 @@ impl Stores {
             domains: Arc::new(MemDomains::default()),
             trash: Arc::new(MemTrash::new(&self.meta)),
             store: Arc::new(self.store.clone()),
+            app_passwords: self.app_passwords(),
         }
     }
 }
@@ -202,6 +219,7 @@ pub struct Env {
     pub meta: MemMetadata,
     pub quota: MemQuota,
     pub store: tp_mailstore::Store,
+    pub app_passwords: tp_auth::AppPasswords,
     pub router: Router,
     pub other_tenant: TenantId,
 }
@@ -264,13 +282,17 @@ impl Env {
             cfg,
         )
         .expect("admin");
-        let Stores { meta, quota, store } = stores;
+        let app_passwords = stores.app_passwords();
+        let Stores {
+            meta, quota, store, ..
+        } = stores;
         Self {
             auth,
             audit,
             meta,
             quota,
             store,
+            app_passwords,
             router: Arc::new(admin).router(),
             other_tenant,
         }
