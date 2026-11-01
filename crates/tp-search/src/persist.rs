@@ -549,10 +549,11 @@ pub(crate) mod tests {
         let m2 = store.publish(scope, &index).await.expect("publish 2");
         assert_eq!((m2.version, m2.docs()), (2, 21));
         let uploaded = blob.calls(BlobOp::PutRaw) - puts;
+        // Файл сегмента узнаётся по пути (число писем сегмента могло перейти к его файлу удалений).
         let reused = m2
             .segments
             .iter()
-            .filter(|s| m1.segments.contains(s))
+            .filter(|s| m1.segments.iter().any(|old| old.path == s.path))
             .count();
         assert!(reused > 0, "unchanged segment files are not uploaded again");
         assert_eq!(uploaded as usize, m2.segments.len() - reused);
