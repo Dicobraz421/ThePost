@@ -1,0 +1,52 @@
+---
+source: crates/tp-smtp/src/dsn/tests.rs
+expression: "String::from_utf8(raw.clone()).expect(\"utf8\")"
+---
+From: "Mail Delivery System" <MAILER-DAEMON@mx.example.org>
+To: <alice@example.org>
+Subject: Delayed Mail (still being retried)
+Date: Thu, 1 Jan 2026 14:00:00 +0000
+Message-ID: <dsn-0001@mx.example.org>
+Auto-Submitted: auto-replied
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type="delivery-status";
+ boundary="dsn-0001"
+
+
+--dsn-0001
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: base64
+
+0J/QuNGB0YzQvNC+INC/0L7QutCwINC90LUg0LTQvtGB0YLQsNCy0LvQtdC90L4sINC/0L7Qv9GL
+0YLQutC4INC/0YDQvtC00L7Qu9C20LDRjtGC0YHRjzoNCllvdXIgbWVzc2FnZSBoYXMgbm90IGJl
+ZW4gZGVsaXZlcmVkIHlldCwgZGVsaXZlcnkgaXMgc3RpbGwgYmVpbmcgcmV0cmllZDoNCg0KICA8
+eEBleGFtcGxlLm5ldD46IDQ1MSA0LjMuMCBtYWlsYm94IGJ1c3kNCg0K0J/QvtC/0YvRgtC60Lgg
+0L/RgNC+0LTQvtC70LbQsNGC0YHRjyDQtNC+IC8gV2lsbCByZXRyeSB1bnRpbDogVHVlLCA2IEph
+biAyMDI2IDEwOjAwOjAwICswMDAwDQoNCi0tIA0KVGhlIFBvc3QsIG14LmV4YW1wbGUub3JnDQo=
+
+--dsn-0001
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Reporting-MTA: dns; mx.example.org
+Original-Envelope-Id: QQ314159
+Arrival-Date: Thu, 1 Jan 2026 10:00:00 +0000
+
+Final-Recipient: rfc822; x@example.net
+Action: delayed
+Status: 4.3.0
+Diagnostic-Code: smtp; 451 4.3.0 mailbox busy
+Last-Attempt-Date: Thu, 1 Jan 2026 14:00:00 +0000
+Will-Retry-Until: Tue, 6 Jan 2026 10:00:00 +0000
+
+--dsn-0001
+Content-Type: text/rfc822-headers
+Content-Transfer-Encoding: 7bit
+
+From: alice@example.org
+To: x@example.net
+Subject: hello
+Message-ID: <m1@example.org>
+
+
+--dsn-0001--
