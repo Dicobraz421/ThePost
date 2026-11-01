@@ -7,7 +7,7 @@
 //! завершается [`SaslFailure::Authentication`]; этот вызов строит тот же механизм `rsasl` повторным разбором.
 //!
 //! Вход от имени другого субъекта (`authzid`, `a=`, `user=`, отличный от имени входа) не поддерживается —
-//! [`SaslFailure::Authorization`]. GSSAPI — AUTH-05.
+//! [`SaslFailure::Authorization`]. GSSAPI (Kerberos) — [`crate::gssapi`], подключается [`AuthSasl::with_gssapi`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -23,7 +23,9 @@ use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslFailure, SaslServer, SaslSession, SaslStep};
 use tp_contracts::{Error, Result};
 
-/// Механизмы по умолчанию: всё, кроме GSSAPI.
+use crate::gssapi::Gssapi;
+
+/// Механизмы по умолчанию: всё, кроме GSSAPI (его добавляет [`AuthSasl::with_gssapi`]).
 const DEFAULT: [Mechanism; 4] = [
     Mechanism::Plain,
     Mechanism::Login,
@@ -37,6 +39,7 @@ pub struct AuthSasl {
     authn: Arc<dyn Authenticator>,
     mechanisms: Vec<Mechanism>,
     openid_configuration: Option<String>,
+    gssapi: Option<Gssapi>,
 }
 
 impl fmt::Debug for AuthSasl {
@@ -44,6 +47,7 @@ impl fmt::Debug for AuthSasl {
         f.debug_struct("AuthSasl")
             .field("mechanisms", &self.mechanisms)
             .field("openid_configuration", &self.openid_configuration)
+            .field("gssapi", &self.gssapi.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -55,16 +59,22 @@ impl AuthSasl {
             authn,
             mechanisms: DEFAULT.to_vec(),
             openid_configuration: None,
+            gssapi: None,
         }
     }
 
-    /// Предлагать только `mechanisms` (GSSAPI здесь не реализован и пропускается).
+    /// Предлагать только `mechanisms` (GSSAPI — только вместе с [`AuthSasl::with_gssapi`]).
     pub fn with_mechanisms(mut self, mechanisms: &[Mechanism]) -> Self {
-        self.mechanisms = mechanisms
-            .iter()
-            .copied()
-            .filter(|m| DEFAULT.contains(m))
-            .collect();
+        self.mechanisms = mechanisms.to_vec();
+        self
+    }
+
+    /// Механизм GSSAPI (Kerberos); принципал проверяет тот же `authn` ([`Credentials::Gssapi`]).
+    pub fn with_gssapi(mut self, gssapi: Gssapi) -> Self {
+        self.gssapi = Some(gssapi);
+        if !self.mechanisms.contains(&Mechanism::Gssapi) {
+            self.mechanisms.push(Mechanism::Gssapi);
+        }
         self
     }
 
@@ -81,6 +91,7 @@ impl SaslServer for AuthSasl {
             .iter()
             .copied()
             .filter(|m| tls || !m.plaintext())
+            .filter(|m| *m != Mechanism::Gssapi || self.gssapi.is_some())
             .collect()
     }
 
@@ -89,6 +100,9 @@ impl SaslServer for AuthSasl {
             return Err(Error::Invalid(format!(
                 "SASL mechanism {mechanism} is not available"
             )));
+        }
+        if let (Mechanism::Gssapi, Some(g)) = (mechanism, &self.gssapi) {
+            return g.session(ctx.service, self.authn.clone());
         }
         Ok(Box::new(Exchange {
             authn: self.authn.clone(),

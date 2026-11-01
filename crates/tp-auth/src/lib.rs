@@ -3,11 +3,16 @@
 //! - [`ldap`] — каталог организации ([`Directory`](tp_contracts::auth::Directory)) поверх LDAPS и проверка
 //!   пароля привязкой (bind) к каталогу;
 //! - [`password`] — [`Authenticator`] для имени входа и пароля: пароли
-//!   приложений (argon2) с отзывом и пароль каталога. Защиту от перебора (`tp-platform`, PLT-07) вызывают
+//!   приложений (argon2, хранилище — [`AppPasswordStore`](tp_contracts::app_password::AppPasswordStore))
+//!   с отзывом и пароль каталога. Защиту от перебора (`tp-platform`, PLT-07) вызывают
 //!   протоколы до проверки и по её результату;
 //! - [`oidc`] — [`Authenticator`] для токенов OpenID Connect (Bearer);
-//! - [`sasl`] — механизмы SASL PLAIN, LOGIN, OAUTHBEARER, XOAUTH2 для smtp и imap; пароль и токен в одном
-//!   обмене проверяет [`CredentialsRouter`].
+//! - [`authz`] — [`Authorizer`](tp_contracts::auth::Authorizer) поверх ACL папок (RFC 4314), групп и
+//!   делегирования отправки (Send As / Send on Behalf);
+//! - [`gssapi`] — Kerberos: механизм SASL GSSAPI (системная MIT Kerberos — feature `gssapi`) и
+//!   [`KerberosAuthenticator`] (принципал → учётная запись);
+//! - [`sasl`] — механизмы SASL PLAIN, LOGIN, OAUTHBEARER, XOAUTH2 (и GSSAPI) для smtp и imap; пароль, токен
+//!   и принципал Kerberos в одном обмене проверяет [`CredentialsRouter`].
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -18,17 +23,18 @@ use tp_contracts::meta::{Account, AccountStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result, TenantId};
 
+pub mod authz;
+pub mod gssapi;
 pub mod ldap;
 pub mod oidc;
 pub mod password;
 pub mod sasl;
 
+pub use authz::AclAuthorizer;
+pub use gssapi::{Gssapi, GssapiConfig, KerberosAuthenticator};
 pub use ldap::{LdapConfig, LdapDirectory};
 pub use oidc::{OidcAuthenticator, OidcConfig};
-pub use password::{
-    AppPassword, AppPasswordStore, AppPasswords, PasswordAuthenticator, PasswordCheck,
-    PasswordConfig,
-};
+pub use password::{AppPasswords, PasswordAuthenticator, PasswordCheck, PasswordConfig};
 pub use sasl::AuthSasl;
 
 /// Группы учётной записи для `Principal::groups` (с учётом вложенности). Реализация — [`LdapDirectory`].
@@ -136,7 +142,7 @@ impl CredentialsRouter {
         self
     }
 
-    /// Принципал Kerberos (AUTH-05).
+    /// Принципал Kerberos ([`KerberosAuthenticator`]).
     pub fn gssapi(mut self, a: Arc<dyn Authenticator>) -> Self {
         self.gssapi = Some(a);
         self
@@ -227,7 +233,15 @@ pub(crate) mod testutil {
 
     /// Учётные записи `(login, enabled)` в `MemMetadata` организации по умолчанию.
     pub(crate) async fn accounts(list: &[(&str, bool)]) -> (Accounts, Vec<AccountId>) {
-        let meta = Arc::new(MemMetadata::new(Arc::new(SystemClock)));
+        let (_, accounts, ids) = meta_accounts(list).await;
+        (accounts, ids)
+    }
+
+    /// То же, что [`accounts`], и сами метаданные (для хранилищ `tp-testkit` поверх них).
+    pub(crate) async fn meta_accounts(
+        list: &[(&str, bool)],
+    ) -> (MemMetadata, Accounts, Vec<AccountId>) {
+        let meta = MemMetadata::new(Arc::new(SystemClock));
         let domain = DomainId::new();
         let mut ids = Vec::new();
         for (login, enabled) in list {
@@ -246,8 +260,9 @@ pub(crate) mod testutil {
                 .expect("upsert");
             ids.push(a.id);
         }
-        let accounts = Accounts::new(TenantId::DEFAULT, meta).with_groups(Arc::new(StaffOnly));
-        (accounts, ids)
+        let accounts = Accounts::new(TenantId::DEFAULT, Arc::new(meta.clone()))
+            .with_groups(Arc::new(StaffOnly));
+        (meta, accounts, ids)
     }
 
     /// Каждый — в группе `staff`.
