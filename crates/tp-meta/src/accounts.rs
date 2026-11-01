@@ -195,6 +195,7 @@ impl AccountStore for PgMeta {
             "SELECT coalesce(sum(m.size), 0)::bigint, count(m.message_id)
              FROM accounts a
              LEFT JOIN messages m ON m.tenant_id = a.tenant_id AND m.account_id = a.account_id
+                                 AND m.hidden_at IS NULL
              WHERE a.tenant_id = $1 AND a.account_id = $2
              GROUP BY a.account_id",
         )
