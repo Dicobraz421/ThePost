@@ -564,10 +564,10 @@ async fn update_one(ctx: &Ctx<'_>, id: &str, patch: &Value) -> MethodResult<Resu
             (k, _) => return Ok(Err(invalid(&[k]))),
         }
     }
-    if name != mb.name || parent != mb.parent {
-        if let Err(e) = d.mailboxes.rename(ctx.scope, mb.id, parent, &name).await {
-            return Ok(Err(store_set_error(e)?));
-        }
+    if (name != mb.name || parent != mb.parent)
+        && let Err(e) = d.mailboxes.rename(ctx.scope, mb.id, parent, &name).await
+    {
+        return Ok(Err(store_set_error(e)?));
     }
     if let Some(on) = subscribe {
         d.mailboxes.set_subscribed(ctx.scope, mb.id, on).await?;
