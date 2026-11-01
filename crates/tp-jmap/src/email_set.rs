@@ -4,10 +4,12 @@
 //!   (`maxMailboxesPerEmail` = 1), перенос — `MailStore::move_to`. Перенос создаёт новое письмо (CONTRACTS.md#Metadata),
 //!   поэтому `updated` содержит новый `id`.
 //! - Создание — черновик: MIME собирает `mail-builder` из адресов, темы, `textBody`/`htmlBody` (текст из `bodyValues`),
-//!   вложений из blob и полей `header:<имя>`; письмо принимается `MailStore::ingest`. `bodyStructure` не поддерживается.
-//! - Удаление — в корзину (`MailStore::delete_to_trash`); письмо уже в корзине — `notDestroyed`: окончательное
-//!   удаление выполняет maintenance по сроку корзины (SRS 4.7).
-//! - `Email/import` — письмо из blob, `MailStore::ingest` с одной доставкой.
+//!   вложений из blob и полей `header:<имя>`; письмо кладёт `MailStore::append`. `bodyStructure` не поддерживается.
+//! - Удаление — в корзину (`MailStore::delete_to_trash`); письмо уже в корзине — «очистить корзину»
+//!   (`TrashStore::purge`, решение 2026-11-01-trash-purge): по настройке `trash.purge` скрыть до конца срока корзины
+//!   или стереть (под Legal Hold — скрыть). Хранилище корзины в шину не пишет: `MailboxChanged` корзины публикует сервер.
+//! - `Email/import` — письмо из blob, `MailStore::append`. Письмо, которое кладёт клиент (черновик, импорт), —
+//!   не доставка: точки принятия решений доставки не вызываются, копий нет.
 //! - `Email/copy` — между учётными записями; доступна только своя, поэтому копировать неоткуда (`fromAccountNotFound`).
 
 use std::collections::BTreeSet;
@@ -25,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tp_contracts::mailstore::{Delivery, IngestRequest};
+use tp_contracts::bus::{Event, EventKind};
 use tp_contracts::meta::{Flag, FlagOp, Flags, SpecialUse};
 use tp_contracts::{Error, MailboxId, MessageId};
 
@@ -117,7 +119,7 @@ fn received_at(v: Option<&Value>) -> Result<OffsetDateTime, Value> {
     }
 }
 
-/// Принимает письмо в папку учётной записи; копии внешним адресам от точек принятия решений — в очередь.
+/// Кладёт письмо клиента в папку учётной записи (`MailStore::append`: не доставка).
 async fn store_message(
     ctx: &Ctx<'_>,
     raw: Vec<u8>,
@@ -125,32 +127,16 @@ async fn store_message(
     flags: Flags,
     received_at: OffsetDateTime,
 ) -> MethodResult<Result<MessageId, Value>> {
-    let d = &ctx.jmap.d;
-    let data = Bytes::from(raw);
-    let body = data.clone();
-    let got = d
+    let body = Bytes::from(raw);
+    let raw = Box::pin(futures::stream::once(async move { Ok(body) }));
+    let got = ctx
+        .jmap
+        .d
         .store
-        .ingest(IngestRequest {
-            tenant: ctx.scope.tenant,
-            mail_from: ctx.principal.login.clone(),
-            raw: Box::pin(futures::stream::once(async move { Ok(body) })),
-            deliveries: vec![Delivery {
-                account: ctx.scope.account,
-                mailbox,
-                extra_headers: Vec::new(),
-                flags,
-            }],
-            received_at,
-        })
+        .append(ctx.scope, mailbox, raw, flags, received_at)
         .await;
     match got {
-        Ok(got) => {
-            crate::submission::forward(ctx, &ctx.principal.login, &data, &got.forward).await?;
-            match got.delivered.first() {
-                Some(d) => Ok(Ok(d.message)),
-                None => Err(MethodError::server_fail("no delivery")),
-            }
-        }
+        Ok(d) => Ok(Ok(d.message)),
         Err(Error::QuotaExceeded) => Ok(Err(set_error("overQuota", None, &[]))),
         Err(Error::Invalid(m)) => Ok(Err(set_error("invalidEmail", Some(&m), &[]))),
         Err(e) => Err(e.into()),
@@ -782,7 +768,7 @@ pub(crate) async fn set(
         .find(|m| m.role == Some(SpecialUse::Trash))
         .map(|m| m.id);
     let (mut destroyed, mut not_destroyed) = (Vec::new(), Map::new());
-    let mut to_trash = Vec::new();
+    let (mut to_trash, mut to_purge) = (Vec::new(), Vec::new());
     for id in a.destroy.unwrap_or_default() {
         let msg = match MessageId::from_str(ctx.resolve_id(&id)) {
             Ok(mid) => d.messages.get(ctx.scope, mid).await?,
@@ -792,16 +778,7 @@ pub(crate) async fn set(
             None => {
                 not_destroyed.insert(id, set_error("notFound", None, &[]));
             }
-            Some(m) if Some(m.mailbox) == trash => {
-                not_destroyed.insert(
-                    id,
-                    set_error(
-                        "forbidden",
-                        Some("email is in Trash: it is deleted when the retention period expires"),
-                        &[],
-                    ),
-                );
-            }
+            Some(m) if Some(m.mailbox) == trash => to_purge.push((id, m.id)),
             Some(m) => {
                 to_trash.push(m.id);
                 destroyed.push(id);
@@ -810,6 +787,32 @@ pub(crate) async fn set(
     }
     if !to_trash.is_empty() {
         d.store.delete_to_trash(ctx.scope, &to_trash).await?;
+    }
+    if let (Some(trash), false) = (trash, to_purge.is_empty()) {
+        let ids: Vec<MessageId> = to_purge.iter().map(|p| p.1).collect();
+        let out = d.trash.purge(ctx.scope, &ids, &d.hooks).await?;
+        let gone: BTreeSet<MessageId> = out.hidden.into_iter().chain(out.erased).collect();
+        if !gone.is_empty() {
+            let event = Event {
+                tenant: ctx.scope.tenant,
+                account: Some(ctx.scope.account),
+                kind: EventKind::MailboxChanged {
+                    mailbox: trash,
+                    modseq: out.modseq,
+                },
+            };
+            if let Err(e) = d.bus.publish(event).await {
+                tracing::warn!(error = %e, "jmap: уведомление об очистке корзины не опубликовано");
+            }
+        }
+        for (id, mid) in to_purge {
+            if gone.contains(&mid) {
+                destroyed.push(id);
+            } else {
+                // Письмо успели убрать из корзины (восстановлено, очищено другим запросом).
+                not_destroyed.insert(id, set_error("notFound", None, &[]));
+            }
+        }
     }
 
     let new = state_string(ctx.state().await?);
@@ -831,6 +834,13 @@ mod tests {
     use super::*;
     use crate::testenv::{Env, mail};
     use axum::body::Bytes;
+    use futures::StreamExt;
+    use tp_contracts::bus::EventBus;
+    use tp_contracts::ext::Decision;
+    use tp_contracts::mailstore::MailStore;
+    use tp_contracts::meta::MailboxStore;
+    use tp_contracts::retention::{TrashPurge, TrashPurgeRule, TrashStore};
+    use tp_testkit::{HookCall, PolicyLevel};
 
     async fn get(env: &Env, id: &str) -> Value {
         let args = json!({
@@ -937,7 +947,8 @@ mod tests {
                 "Email/set",
             )
             .await;
-        assert_eq!(r["notDestroyed"][&id]["type"], "forbidden", "{r}");
+        // Уже в корзине — «очистить корзину» (подробно — destroy_in_trash_*).
+        assert_eq!(r["destroyed"], json!([&id]), "{r}");
         let r = env
             .call(
                 "Email/set",
@@ -1070,6 +1081,173 @@ mod tests {
             )
             .await;
         assert_eq!(r["type"], "fromAccountNotFound");
+    }
+
+    /// Письмо, которое кладёт клиент (import, черновик), — не доставка: `on_delivery` не вызывается,
+    /// запрет доставки не мешает, письмо хранится побайтово.
+    #[tokio::test]
+    async fn import_is_not_a_delivery() {
+        let env = Env::new().await;
+        env.hook.set_delivery(Decision::Deny("no delivery".into()));
+        let acc = env.account();
+        let inbox = env.mailbox(SpecialUse::Inbox).to_string();
+        let raw = mail("Imported", "a@x.test", "", "text");
+        let key = env
+            .jmap
+            .put_upload(env.scope.tenant, Bytes::from(raw.clone()))
+            .await
+            .expect("upload");
+        let r = env
+            .call(
+                "Email/import",
+                json!({"accountId": acc, "emails": {
+                    "i": {"blobId": crate::blob::upload_id(&key), "mailboxIds": {&inbox: true}}
+                }}),
+                "Email/import",
+            )
+            .await;
+        let id = r["created"]["i"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("not imported: {r}"))
+            .to_owned();
+        let mid = MessageId::from_str(&id).expect("id");
+        let stored = env
+            .store
+            .fetch_raw(env.scope, mid, None)
+            .await
+            .expect("raw");
+        let stored: Vec<u8> = stored.map(|c| c.expect("chunk").to_vec()).concat().await;
+        assert_eq!(stored, raw);
+        let r = env
+            .call(
+                "Email/set",
+                json!({"accountId": acc, "create": {"d": {"mailboxIds": {&inbox: true}, "subject": "Draft"}}}),
+                "Email/set",
+            )
+            .await;
+        assert!(r["created"]["d"].is_object(), "{r}");
+        assert!(env.hook.calls().is_empty(), "{:?}", env.hook.calls());
+    }
+
+    /// Три письма в корзине.
+    async fn three_in_trash(env: &Env) -> Vec<String> {
+        let inbox = env.mailbox(SpecialUse::Inbox);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let raw = mail(&format!("m{i}"), "a@x.test", "", "body");
+            ids.push(env.deliver(inbox, &raw, Flags::new()).await.to_string());
+        }
+        let r = env
+            .call(
+                "Email/set",
+                json!({"accountId": env.account(), "destroy": &ids}),
+                "Email/set",
+            )
+            .await;
+        assert_eq!(r["destroyed"].as_array().map(Vec::len), Some(3), "{r}");
+        ids
+    }
+
+    async fn destroy(env: &Env, ids: &[&String]) -> Value {
+        env.call(
+            "Email/set",
+            json!({"accountId": env.account(), "destroy": ids}),
+            "Email/set",
+        )
+        .await
+    }
+
+    async fn hidden(env: &Env) -> usize {
+        env.trash
+            .list_hidden(env.scope, 0, 100)
+            .await
+            .expect("hidden")
+            .len()
+    }
+
+    fn final_deletes(env: &Env) -> usize {
+        env.hook
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, HookCall::FinalDelete(_)))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn destroy_in_trash_hides_by_default() {
+        let env = Env::new().await;
+        let ids = three_in_trash(&env).await;
+        let trash = env.mailbox(SpecialUse::Trash);
+        let mut events = env.bus.subscribe(env.scope).await.expect("subscribe");
+        let r = destroy(&env, &[&ids[0], &ids[1]]).await;
+        assert_eq!(r["destroyed"], json!([&ids[0], &ids[1]]), "{r}");
+        assert_ne!(r["oldState"], r["newState"]);
+        // `hide`: письма исчезают у пользователя и хранятся скрыто.
+        assert!(get(&env, &ids[0]).await["mailboxIds"].is_null());
+        assert_eq!(hidden(&env).await, 2);
+        assert_eq!(final_deletes(&env), 0);
+        // MailboxChanged корзины публикует сервер (TrashStore в шину не пишет) с ModSeq изменения.
+        let e = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("event in time")
+            .expect("event");
+        let st = env.meta.status(env.scope, trash).await.expect("status");
+        assert_eq!(
+            e.kind,
+            EventKind::MailboxChanged {
+                mailbox: trash,
+                modseq: st.highest_modseq
+            }
+        );
+        // Повторно — письма уже нет.
+        let r = destroy(&env, &[&ids[0]]).await;
+        assert_eq!(r["notDestroyed"][&ids[0]]["type"], "notFound", "{r}");
+    }
+
+    #[tokio::test]
+    async fn destroy_in_trash_erases_by_user_choice_unless_legal_hold() {
+        let env = Env::new().await;
+        let ids = three_in_trash(&env).await;
+        let rule = TrashPurgeRule {
+            mode: TrashPurge::Hide,
+            user_can_choose: true,
+        };
+        env.policies
+            .set_trash_purge_rule(env.scope.tenant, PolicyLevel::Tenant, Some(rule));
+        let r = env
+            .request(json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:thepost:params:jmap:settings"],
+                "methodCalls": [["UserSettings/set", {"accountId": env.account(),
+                    "update": {"singleton": {"trashPurge": "erase"}}}, "s"]],
+            }))
+            .await;
+        assert_eq!(
+            r["methodResponses"][0][1]["updated"],
+            json!({"singleton": null}),
+            "{r}"
+        );
+        // `erase` пользователя: стирается, перед стиранием — точка принятия решений.
+        let r = destroy(&env, &[&ids[0]]).await;
+        assert_eq!(r["destroyed"], json!([&ids[0]]), "{r}");
+        assert_eq!(hidden(&env).await, 0);
+        assert_eq!(final_deletes(&env), 1);
+        // Legal Hold: стирание запрещено — письмо исчезает у пользователя, но хранится скрыто.
+        env.hook
+            .set_final_delete(Decision::Deny("legal hold".into()));
+        let r = destroy(&env, &[&ids[1]]).await;
+        assert_eq!(r["destroyed"], json!([&ids[1]]), "{r}");
+        assert_eq!(hidden(&env).await, 1);
+        assert!(get(&env, &ids[1]).await["mailboxIds"].is_null());
+        // Администратор отнял выбор — действует его `hide`, точка принятия решений не вызывается.
+        env.policies.set_trash_purge_rule(
+            env.scope.tenant,
+            PolicyLevel::Tenant,
+            Some(TrashPurgeRule::default()),
+        );
+        let r = destroy(&env, &[&ids[2]]).await;
+        assert_eq!(r["destroyed"], json!([&ids[2]]), "{r}");
+        assert_eq!(hidden(&env).await, 2);
+        assert_eq!(final_deletes(&env), 2);
     }
 
     #[test]
