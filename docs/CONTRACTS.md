@@ -5,7 +5,7 @@
 Асинхронные трейты, используемые как `dyn`, — через `async-trait`; все трейты `Send + Sync + 'static`.
 
 ## Ids
-- `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId`, `QueueId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` = `00000000-0000-0000-0000-000000000001` — организация по умолчанию.
+- `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId`, `QueueId`, `GroupId`, `HeldId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` = `00000000-0000-0000-0000-000000000001` — организация по умолчанию.
 - `Uid(u32)` — IMAP UID в ящике, монотонный; `UidValidity(u32)`.
 - `ModSeq(u64)` — монотонный на ящик (IMAP CONDSTORE, состояние JMAP).
 - `BlobHash([u8; 32])` — SHA-256, `Display` — hex. `Gen(u32)` — поколение объекта.
@@ -43,6 +43,13 @@ SRS 3.4. Учёт объектов в метаданных. Реализация
   Надгробие хранит поколение удалённого объекта: загрузка, начатая до удаления, получит `Bumped`; удаляется по истечении
   срока, большего максимальной длительности загрузки.
 - `exists(&BlobKey) -> Result<bool>` — для поиска «сирот».
+- Сжатие (SRS 3.2, CTR-21; код — `blob.rs`): `Compression { None, Zstd }` (строки `none`/`zstd`) — признак в записи учёта; хэш и `size` —
+  от исходного содержимого. Писатель сжимает zstd, если это уменьшает размер и формат не сжат (архивы, изображения, видео), и только
+  при `supports_compression()`; запись — `commit_new_with(.., compression)` (при `Done` с поколением параллельной записи признак — её;
+  после `Bumped` — тот же признак), чтение — `compression(&BlobKey) -> Option<Compression>` (`None` — записи нет, как `exists`).
+  Методы по умолчанию: `supports_compression = false`, `commit_new_with(None)` = `commit_new`, иное — `Internal`, `compression` —
+  `None`-сжатие для существующей записи; `commit_new` = `commit_new_with(.., None)`. Реализация признака — `tp-meta` (META-24),
+  in-memory — `MemBlobIndex`; набор — `suite::blob_compression`.
 
 ## Metadata
 SRS 3.1, 3.6. Все операции ящика принимают `AccountScope { tenant, account }`; без связей между ящиками.
@@ -121,6 +128,34 @@ CTR-23: запись узла дополняется ролями и адрес�
 `blocked(tenant, subject) -> Option<until>`; `subject` — IP, подсеть или учётная запись. Счётчики попыток — на узле (`tp-auth`);
 факт блокировки — в PostgreSQL (`tp-meta`) и сигнал `Blocked`.
 
+## DeliveryLog
+SRS 5.2, решение 2026-11-01-borrowings-security (CTR-21; код — `delivery.rs`). Журнал доставки (message tracking): только добавление
+и поиск, содержимое писем не хранится. `DeliveryEvent { tenant, at, node: NodeId, kind, sender, recipients, message_id: Option<_>
+(без угловых скобок), queue_id: Option<QueueId>, decision, reason: Option<String> }`; `DeliveryEventKind { Receive, Reject, Deliver,
+Relay, Dsn }`, `DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, Hold }` (строки в нижнем регистре).
+`DeliveryLog`: `record(event)`, `record_batch(Vec<_>)` (по умолчанию — по одной), `search(tenant, &DeliveryQuery) -> DeliveryPage
+{ events, next: Option<DeliveryCursor> }`, `purge(before)` — по всем организациям (maintenance), можно целыми сутками-секциями.
+`DeliveryQuery { sender, recipient, message_id, since, until, limit, after }`: условия по «и», адреса — точно без учёта регистра ASCII,
+Message-ID — точно, интервал `[since, until)`; `validate()` (`limit ≥ 1`, непустой интервал) и `matches(&event)` — в контракте;
+порядок — по `at`, равные — в порядке записи; некорректный запрос или позиция — `Invalid`. Срок хранения (по умолчанию 30 суток) —
+секция конфигурации реализации. Пишет `tp-smtp` (SMTP-17); реализация — `tp-meta` (META-22: секции по суткам, роль приложения —
+только INSERT и SELECT), in-memory — `MemDeliveryLog` (`events()`); набор — `suite::delivery_log`.
+
+## Groups
+SRS 4.5, решение 2026-11-01-borrowings-security (CTR-21; код — `groups.rs`). `DistributionGroup { id: GroupId, tenant, name, address:
+Option<_> (уникален без учёта регистра; `None` — только вложенная), external_id: Option<_> (каталог, уникален), members:
+Vec<GroupMember::{Account, Group}>, senders: SenderRestriction::{Anyone, Internal, Only { accounts, groups }}, moderators:
+Vec<AccountId> (непусто — модерируемая), hidden_from_gal }`; `validate()`, `moderated()`, `requires_moderation(sender)` (модераторы —
+без одобрения). `GroupStore`: `get`, `by_address`, `by_external_id`, `list(tenant)` (по `id`), `put(group)` — замена целиком
+(`Invalid`; занятый адрес или `external_id` — `Conflict`), `remove` — возвращает письма очереди группы (отсутствующая — пусто),
+`expand(tenant, id) -> Vec<AccountId>` — с вложенными, каждая группа один раз (циклы), по возрастанию без повторов, неизвестные
+вложенные группы пропускаются, нет корня — `NotFound`; `sender_allowed(tenant, &group, Option<AccountId>)` — по умолчанию через
+`expand` (`None` — внешний). Ограничения и модерация — для группы-адресата, не для вложенных. Очередь модерации:
+`HeldMessage { id: HeldId, group, sender, sender_account, message_id, blob, size, held_at }` (ссылка на объект — у вызывающего);
+`hold` (нет группы — `NotFound`, занятый id — `Conflict`), `held(tenant, Option<GroupId>, limit)` по (`held_at`, `id`),
+`take_held(tenant, id)` — забрать для решения (повторно — `NotFound`). Синхронизация из каталога — `tp-auth` (AUTH-07), проверки
+при приёме — `tp-smtp` (SMTP-16), Admin API — ADM-07; реализация — `tp-meta` (META-21), in-memory — `MemGroups`; набор — `suite::group_store`.
+
 ## Search
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
 `snippet(AccountScope, message, &TextQuery) -> Snippet { subject?, preview? }` (`<mark>`). `TextQuery` — дерево
@@ -172,6 +207,17 @@ SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Searc
 shutdown: CancellationToken, drain_deadline, ready: ReadyHandle }` (`tokio`, `tokio-util`; `role` реэкспортирует `watch` и `CancellationToken`).
 `ConfigRx = watch::Receiver<Arc<dyn Any + Send + Sync>>` — секция роли; типизированно — `RoleCtx::config::<T>()`, ожидание версии —
 `RoleCtx::config_changed()` (закрытый канал — не завершается). `config_channel(v)`, `fixed_config(v)` — для приложения и тестов; метрики — позже.
+`RoleCtx::load: Arc<dyn LoadMonitor>` — уровень нагрузки узла (раздел Load), `RoleCtx::load_level()`; до PLT-15 приложение передаёт
+`fixed_load(LoadLevel::Normal)`.
+
+## Load
+SRS 6.3, решение 2026-11-01-borrowings-security (CTR-21; код — `load.rs`). `LoadLevel { Normal, Elevated, High }` (по возрастанию,
+строки `normal`/`elevated`/`high`): `Elevated` (по умолчанию 85 %) — `pauses_background()`: фоновые задания (индексация, GC, миграция)
+приостановлены, меньше параллельность новых сессий, замедление подозрительных источников; `High` (95 %) — `limits_new_sessions()`:
+SMTP — 4xx новым сессиям, IMAP и JMAP — ограничение новых сессий, принятые письма обрабатываются.
+`LoadMonitor`: `subscribe() -> LoadRx` (`watch::Receiver<LoadLevel>`: новое значение — переход между уровнями), `level()` (по умолчанию
+через `subscribe`). Показатели, пороги относительно лимитов cgroups, гистерезис, метрики — реализация `tp-platform` (PLT-15);
+`fixed_load(level)` — постоянный уровень (канал открыт); подменный — `tp_testkit::MemLoadMonitor` (`set(level)`).
 
 ## Config
 Каждый крейт владеет своей секцией `XxxConfig: Deserialize + Default + Clone` и документирует её поля.
@@ -290,6 +336,11 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   — ACL папок и делегирование отправки (META-11) за контрактом; реализации — `PgMeta`, `tp_testkit::MemAcl`, набор `suite::acl_store`.
 - 2026-11-01 — CTR-22 (x/contracts-11): `app_password::{AppPasswordStore, AppPassword}` вместо временного трейта `tp-auth` (AUTH-02);
   реализации — `PgMeta` (миграция `0009_app_passwords`), `tp_testkit::MemAppPasswords`, набор `suite::app_password_store`.
+- 2026-11-01 — CTR-21 (x/contracts-10, решение 2026-11-01-borrowings-security): `blob::Compression` и методы `BlobIndex`
+  `supports_compression`/`commit_new_with`/`compression` (по умолчанию — без сжатия); `load::{LoadLevel, LoadMonitor, fixed_load}`
+  и поле `RoleCtx::load`; `delivery::{DeliveryLog, DeliveryEvent, DeliveryQuery, DeliveryPage}`; `groups::{GroupStore,
+  DistributionGroup, HeldMessage}`, `GroupId`, `HeldId`. In-memory — `MemBlobIndex` (признак), `MemLoadMonitor`, `MemDeliveryLog`,
+  `MemGroups`; наборы `suite::{blob_compression, delivery_log, group_store}`.
 - 2026-11-01 — решение «Взаимодействие компонентов и требования к СУБД»: сигналы через PostgreSQL LISTEN/NOTIFY, `Rpc`, `AbuseBlocks`,
   `NodeInfo`; канал и шина Valkey удаляются (реализация — CTR-23, CLU-09).
 - 2026-11-01 — решение «Состав функций транспорта и внешний MTA»: `transport::{TransportStore, MailFlow}`, `EventKind::TransportChanged`

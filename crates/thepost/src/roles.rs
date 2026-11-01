@@ -187,6 +187,7 @@ mod tests {
             shutdown: shutdown.clone(),
             drain_deadline: Duration::from_secs(5),
             ready: ready.clone(),
+            load: tp_contracts::load::fixed_load(tp_contracts::load::LoadLevel::Normal),
         };
         (ctx, shutdown, ready)
     }

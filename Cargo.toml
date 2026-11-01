@@ -99,6 +99,7 @@ time = { version = "0.3.55", features = ["serde"] }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = "0.26.6"
 tokio-util = "0.7.20"
+tower = "0.5.3"
 tracing = "0.1.44"
 tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }

@@ -159,6 +159,15 @@ async fn binary_and_seen() {
         "* 1 FETCH (BINARY[1] {5}\r\ncafé BINARY.SIZE[2] 4 BINARY[2] ~{4}\r\n\u{0}\u{1}\u{2}\u{3})\r\n\
          A1 OK FETCH completed\r\n"
     );
+    // Диапазон: в ответе — начало (RFC 3516, 4.3: `BINARY[1]<1>`).
+    let r = c
+        .cmd("A11 FETCH 1 (BINARY.PEEK[2]<1.2> BINARY.PEEK[1]<3.10> UID)")
+        .await;
+    assert_eq!(
+        r,
+        "* 1 FETCH (BINARY[2]<1> {2}\r\n\u{1}\u{2} BINARY[1]<3> {2}\r\né UID 1)\r\n\
+         A11 OK FETCH completed\r\n"
+    );
     // Без .PEEK — \Seen и FLAGS в ответе; повторно флаг не меняется.
     let r = c.cmd("A2 FETCH 1 BODY[1]").await;
     assert_eq!(

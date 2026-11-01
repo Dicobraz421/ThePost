@@ -86,6 +86,14 @@ uuid_id!(
     /// Запись очереди исходящей почты (`queue::QueueStore`).
     QueueId
 );
+uuid_id!(
+    /// Группа рассылки (`groups::GroupStore`).
+    GroupId
+);
+uuid_id!(
+    /// Письмо в очереди модерации группы рассылки (`groups::GroupStore::hold`).
+    HeldId
+);
 
 impl TenantId {
     /// Организация по умолчанию — единственная в базовой поставке (SRS 3.8).

@@ -12,15 +12,21 @@ workspace = true
 
 [dependencies]
 tp-contracts.workspace = true
-tp-platform.workspace = true
 tp-mailstore.workspace = true
+tp-auth.workspace = true
+async-trait.workspace = true
 schemars.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time = { workspace = true, features = ["formatting", "parsing"] }
 tracing.workspace = true
 utoipa.workspace = true
 
 [dev-dependencies]
 tp-testkit.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tower = { workspace = true, features = ["util"] }

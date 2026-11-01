@@ -528,6 +528,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             drain_deadline: Duration::from_secs(1),
             ready: ReadyHandle::default(),
+            load: tp_contracts::load::fixed_load(tp_contracts::load::LoadLevel::Normal),
         };
         assert_eq!(ctx.config::<LimitsConfig>().expect("typed").max, 5);
 

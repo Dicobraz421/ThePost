@@ -1,5 +1,6 @@
 //! Общие наборы тестов контрактов: in-memory реализации testkit и настоящие реализации полос
-//! (`tp-meta` — `Membership`, `AclStore`, `AppPasswordStore`, `tp-platform` — `SecretStore`) проходят одни и те же проверки.
+//! (`tp-meta` — `Membership`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие `BlobIndex`,
+//! `tp-platform` — `SecretStore`) проходят одни и те же проверки.
 //!
 //! Время в наборах идёт через [`Wait`]: для testkit — [`ManualClock`] (сдвиг без ожидания), для PostgreSQL
 //! и OpenBao — [`RealTime`] (сон), тогда сроки выбирают с запасом на задержки.
@@ -24,10 +25,19 @@ use time::OffsetDateTime;
 use tp_contracts::acl::{ANYONE, AclEntry, AclStore, SendDelegation, SharedMailbox};
 use tp_contracts::app_password::{AppPassword, AppPasswordStore};
 use tp_contracts::auth::{Rights, SendRight};
+use tp_contracts::blob::{Acquire, BlobIndex, Commit, Compression};
+use tp_contracts::delivery::{
+    DeliveryDecision, DeliveryEvent, DeliveryEventKind, DeliveryLog, DeliveryPage, DeliveryQuery,
+};
+use tp_contracts::groups::{
+    DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
+};
 use tp_contracts::membership::{Membership, NodeId};
 use tp_contracts::meta::{AccountScope, MailboxStore, NewMailbox, SpecialUse};
 use tp_contracts::secrets::{SecretLease, SecretRef, SecretStore};
-use tp_contracts::{AccountId, Error, MailboxId, TenantId};
+use tp_contracts::{
+    AccountId, BlobHash, BlobKey, Error, Gen, GroupId, HeldId, MailboxId, QueueId, TenantId,
+};
 
 use crate::ManualClock;
 
@@ -602,4 +612,401 @@ pub async fn app_password_store(store: &dyn AppPasswordStore, fx: &AppPasswordFi
     assert_eq!(store.revoke(alien, "b", at(30)).await, Err(Error::NotFound));
     assert_eq!(store.insert(alien, pw("c", 0)).await, Err(Error::NotFound));
     assert_eq!(list(owner).await.len(), 4);
+}
+
+// ---------- BlobIndex: сжатие ----------
+
+/// Набор проверок признака сжатия `BlobIndex` (`supports_compression`). Хэши набора — случайные:
+/// чужие записи учёта не мешают.
+pub async fn blob_compression(index: &dyn BlobIndex, tenant: TenantId) {
+    let fresh = || {
+        let mut h = [0u8; 32];
+        h[..16].copy_from_slice(AccountId::new().as_uuid().as_bytes());
+        h[16..].copy_from_slice(AccountId::new().as_uuid().as_bytes());
+        BlobHash(h)
+    };
+    let absent =
+        async |hash: &BlobHash| match index.acquire(tenant, hash, 1).await.expect("acquire") {
+            Acquire::Absent { generation } => generation,
+            other => panic!("ожидался Absent: {other:?}"),
+        };
+    let done = |c: Commit| match c {
+        Commit::Done { generation } => generation,
+        other => panic!("ожидался Done: {other:?}"),
+    };
+    let key = |hash: BlobHash, generation| BlobKey {
+        tenant,
+        hash,
+        generation,
+    };
+    assert!(index.supports_compression());
+
+    // Сжатый объект: признак в записи, повторная ссылка его не меняет.
+    let zstd = fresh();
+    let g = absent(&zstd).await;
+    let g = done(
+        index
+            .commit_new_with(tenant, &zstd, g, 100, 1, Compression::Zstd)
+            .await
+            .expect("commit"),
+    );
+    assert_eq!(
+        index.compression(&key(zstd, g)).await,
+        Ok(Some(Compression::Zstd))
+    );
+    assert!(matches!(
+        index.acquire(tenant, &zstd, 1).await,
+        Ok(Acquire::Existing { generation }) if generation == g
+    ));
+    assert_eq!(
+        index.compression(&key(zstd, g)).await,
+        Ok(Some(Compression::Zstd))
+    );
+
+    // Параллельная загрузка без сжатия получает поколение существующей записи и её признак.
+    let other = done(
+        index
+            .commit_new_with(tenant, &zstd, g, 100, 1, Compression::None)
+            .await
+            .expect("commit"),
+    );
+    assert_eq!(other, g);
+    assert_eq!(
+        index.compression(&key(zstd, g)).await,
+        Ok(Some(Compression::Zstd))
+    );
+
+    // commit_new — без сжатия; нет записи или чужое поколение — None.
+    let plain = fresh();
+    let pg = absent(&plain).await;
+    let pg = done(
+        index
+            .commit_new(tenant, &plain, pg, 10, 1)
+            .await
+            .expect("commit"),
+    );
+    assert_eq!(
+        index.compression(&key(plain, pg)).await,
+        Ok(Some(Compression::None))
+    );
+    assert_eq!(index.compression(&key(fresh(), g)).await, Ok(None));
+    assert_eq!(index.compression(&key(zstd, g.next())).await, Ok(None));
+}
+
+// ---------- DeliveryLog ----------
+
+/// Организации для [`delivery_log`].
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryFixture {
+    /// Организация набора.
+    pub tenant: TenantId,
+    /// Другая организация.
+    pub foreign_tenant: TenantId,
+}
+
+/// Набор проверок `DeliveryLog`: запись, поиск по отправителю, получателю, Message-ID и интервалу, страницы,
+/// изоляция организаций. Адреса набора — с уникальной меткой: чужие записи не мешают. Моменты — текущие,
+/// целые секунды; `purge` набор не проверяет (удаление по секциям — тест реализации).
+pub async fn delivery_log(log: &dyn DeliveryLog, fx: &DeliveryFixture) {
+    let tag = AccountId::new().to_string();
+    let addr = |who: &str| format!("{who}-{tag}@example.org");
+    let now = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("time");
+    let at = |s: i64| now - time::Duration::seconds(100 - s);
+    let node = NodeId::new("suite-node").expect("node");
+    let event = |s: i64, kind, from: &str, to: &[&str], msg: &str| DeliveryEvent {
+        tenant: fx.tenant,
+        at: at(s),
+        node: node.clone(),
+        kind,
+        sender: addr(from),
+        recipients: to.iter().map(|r| addr(r)).collect(),
+        message_id: Some(format!("{msg}.{tag}@example.org")),
+        queue_id: None,
+        decision: DeliveryDecision::Accept,
+        reason: None,
+    };
+    use DeliveryEventKind as K;
+    let received = event(0, K::Receive, "alice", &["bob", "carol"], "m1");
+    let delivered = event(1, K::Deliver, "alice", &["bob", "carol"], "m1");
+    let rejected = DeliveryEvent {
+        decision: DeliveryDecision::Reject,
+        reason: Some("550 5.7.1 spam".into()),
+        message_id: None,
+        ..event(2, K::Reject, "mallory", &["bob"], "m2")
+    };
+    let relayed = DeliveryEvent {
+        queue_id: Some(QueueId::new()),
+        ..event(3, K::Relay, "bob", &["dave"], "m3")
+    };
+    let dsn = DeliveryEvent {
+        sender: String::new(),
+        ..event(4, K::Dsn, "x", &["bob"], "m3")
+    };
+    // Записи в другом порядке: поиск упорядочивает по моменту.
+    log.record(relayed.clone()).await.expect("record");
+    log.record_batch(vec![received.clone(), delivered.clone(), rejected.clone()])
+        .await
+        .expect("batch");
+    log.record(dsn.clone()).await.expect("record");
+    log.record(DeliveryEvent {
+        tenant: fx.foreign_tenant,
+        ..received.clone()
+    })
+    .await
+    .expect("foreign");
+
+    let search = async |q: DeliveryQuery| log.search(fx.tenant, &q).await.expect("search");
+    let mut by = DeliveryQuery::all(100);
+    by.recipient = Some(addr("BOB"));
+    assert_eq!(
+        search(by.clone()).await,
+        DeliveryPage {
+            events: vec![
+                received.clone(),
+                delivered.clone(),
+                rejected.clone(),
+                dsn.clone()
+            ],
+            next: None,
+        },
+        "получатель без учёта регистра, по моменту"
+    );
+
+    let mut q = DeliveryQuery::all(100);
+    q.sender = Some(addr("alice").to_uppercase());
+    assert_eq!(
+        search(q).await.events,
+        vec![received.clone(), delivered.clone()]
+    );
+    let mut q = DeliveryQuery::all(100);
+    q.message_id = received.message_id.clone();
+    assert_eq!(
+        search(q).await.events,
+        vec![received.clone(), delivered.clone()]
+    );
+    let mut q = DeliveryQuery::all(100);
+    q.message_id = relayed.message_id.clone();
+    q.sender = Some(addr("bob"));
+    assert_eq!(search(q).await.events, vec![relayed.clone()]);
+
+    // Интервал [since, until).
+    let mut q = by.clone();
+    q.since = Some(at(1));
+    q.until = Some(at(4));
+    assert_eq!(
+        search(q).await.events,
+        vec![delivered.clone(), rejected.clone()]
+    );
+
+    // Страницы по limit.
+    let mut q = by.clone();
+    q.limit = 3;
+    let first = search(q.clone()).await;
+    assert_eq!(
+        first.events,
+        vec![received.clone(), delivered.clone(), rejected.clone()]
+    );
+    q.after = Some(first.next.expect("next page"));
+    assert_eq!(
+        search(q).await,
+        DeliveryPage {
+            events: vec![dsn.clone()],
+            next: None,
+        }
+    );
+
+    // Некорректный запрос — Invalid; другая организация видит только своё.
+    let mut q = by.clone();
+    q.limit = 0;
+    assert!(matches!(
+        log.search(fx.tenant, &q).await,
+        Err(Error::Invalid(_))
+    ));
+    let mut q = DeliveryQuery::all(100);
+    q.message_id = received.message_id.clone();
+    assert_eq!(
+        log.search(fx.foreign_tenant, &q)
+            .await
+            .expect("foreign")
+            .events
+            .len(),
+        1
+    );
+}
+
+// ---------- GroupStore ----------
+
+/// Учётные записи для [`group_store`]; создаёт тест до запуска набора.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupFixture {
+    /// Организация набора.
+    pub tenant: TenantId,
+    /// Учётные записи организации.
+    pub accounts: [AccountId; 4],
+    /// Другая организация.
+    pub foreign_tenant: TenantId,
+}
+
+/// Набор проверок `GroupStore`: группы, вложенность и циклы, ограничения отправителей, очередь модерации,
+/// изоляция организаций. Адреса и `external_id` набора — с уникальной меткой.
+pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
+    let tag = AccountId::new().to_string();
+    let t = fx.tenant;
+    let [a, b, c, d] = fx.accounts;
+    let group = |name: &str, members: Vec<GroupMember>| DistributionGroup {
+        id: GroupId::new(),
+        tenant: t,
+        name: format!("{name} {tag}"),
+        address: Some(format!("{name}-{tag}@example.org")),
+        external_id: Some(format!("{name}-{tag}")),
+        members,
+        senders: SenderRestriction::Anyone,
+        moderators: Vec::new(),
+        hidden_from_gal: false,
+    };
+    let sorted = |mut v: Vec<AccountId>| {
+        v.sort();
+        v
+    };
+
+    // Вложенность с циклом: all → (a, team), team → (b, inner, all), inner → (c, team); d — вне групп.
+    let mut all = group("all", vec![GroupMember::Account(a)]);
+    let mut team = group("team", vec![GroupMember::Account(b)]);
+    let inner = DistributionGroup {
+        address: None,
+        ..group(
+            "inner",
+            vec![GroupMember::Account(c), GroupMember::Group(team.id)],
+        )
+    };
+    all.members.push(GroupMember::Group(team.id));
+    team.members.extend([
+        GroupMember::Group(inner.id),
+        GroupMember::Group(all.id),
+        GroupMember::Group(GroupId::new()), // неизвестная группа
+        GroupMember::Account(b),            // повтор
+    ]);
+    for g in [&all, &team, &inner] {
+        store.put(g.clone()).await.expect("put");
+    }
+    assert_eq!(store.expand(t, all.id).await, Ok(sorted(vec![a, b, c])));
+    assert_eq!(store.expand(t, inner.id).await, Ok(sorted(vec![a, b, c])));
+    assert_eq!(store.expand(t, GroupId::new()).await, Err(Error::NotFound));
+
+    // Поиск: по id, адресу без учёта регистра, external_id; список организации.
+    assert_eq!(store.get(t, all.id).await, Ok(Some(all.clone())));
+    let upper = all.address.clone().expect("address").to_uppercase();
+    assert_eq!(store.by_address(t, &upper).await, Ok(Some(all.clone())));
+    assert_eq!(
+        store.by_external_id(t, &format!("team-{tag}")).await,
+        Ok(Some(team.clone()))
+    );
+    let mine: Vec<_> = store
+        .list(t)
+        .await
+        .expect("list")
+        .into_iter()
+        .filter(|g| g.name.ends_with(&tag))
+        .collect();
+    let mut expected = vec![all.clone(), team.clone(), inner.clone()];
+    expected.sort_by_key(|g| g.id);
+    assert_eq!(mine, expected);
+
+    // Замена целиком; занятый адрес или external_id — Conflict; некорректное — Invalid.
+    let hidden = DistributionGroup {
+        hidden_from_gal: true,
+        senders: SenderRestriction::Internal,
+        ..team.clone()
+    };
+    store.put(hidden.clone()).await.expect("replace");
+    assert_eq!(store.get(t, team.id).await, Ok(Some(hidden.clone())));
+    let clash = DistributionGroup {
+        address: Some(upper.clone()),
+        ..group("clash", Vec::new())
+    };
+    assert_eq!(store.put(clash).await, Err(Error::Conflict));
+    let clash = DistributionGroup {
+        external_id: all.external_id.clone(),
+        ..group("clash2", Vec::new())
+    };
+    assert_eq!(store.put(clash).await, Err(Error::Conflict));
+    let bad = DistributionGroup {
+        name: String::new(),
+        ..group("bad", Vec::new())
+    };
+    assert!(matches!(store.put(bad).await, Err(Error::Invalid(_))));
+
+    // Ограничения отправителей.
+    assert_eq!(store.sender_allowed(t, &all, None).await, Ok(true));
+    assert_eq!(store.sender_allowed(t, &hidden, None).await, Ok(false));
+    assert_eq!(store.sender_allowed(t, &hidden, Some(d)).await, Ok(true));
+    let closed = DistributionGroup {
+        senders: SenderRestriction::Only {
+            accounts: vec![d],
+            groups: vec![inner.id],
+        },
+        moderators: vec![a],
+        ..group("closed", Vec::new())
+    };
+    store.put(closed.clone()).await.expect("put");
+    assert_eq!(store.sender_allowed(t, &closed, Some(d)).await, Ok(true));
+    assert_eq!(store.sender_allowed(t, &closed, Some(c)).await, Ok(true));
+    assert_eq!(store.sender_allowed(t, &closed, None).await, Ok(false));
+
+    // Очередь модерации: по моменту, по группе; take_held — один раз.
+    assert!(closed.requires_moderation(Some(d)));
+    let base = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("time");
+    let held = |s: i64, group: GroupId| HeldMessage {
+        id: HeldId::new(),
+        group,
+        sender: format!("d-{tag}@example.org"),
+        sender_account: Some(d),
+        message_id: Some(format!("{s}.{tag}@example.org")),
+        blob: BlobKey {
+            tenant: t,
+            hash: BlobHash([7; 32]),
+            generation: Gen::INITIAL,
+        },
+        size: 1000,
+        held_at: base + time::Duration::seconds(s),
+    };
+    let (h2, h1, h3) = (held(2, closed.id), held(1, closed.id), held(3, all.id));
+    for h in [&h2, &h1, &h3] {
+        store.hold(t, h.clone()).await.expect("hold");
+    }
+    assert_eq!(store.hold(t, h1.clone()).await, Err(Error::Conflict));
+    assert_eq!(
+        store.hold(t, held(4, GroupId::new())).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        store.held(t, Some(closed.id), 10).await,
+        Ok(vec![h1.clone(), h2.clone()])
+    );
+    assert_eq!(
+        store.held(t, Some(closed.id), 1).await,
+        Ok(vec![h1.clone()])
+    );
+    assert_eq!(store.take_held(t, h1.id).await, Ok(h1.clone()));
+    assert_eq!(store.take_held(t, h1.id).await, Err(Error::NotFound));
+
+    // Другая организация не видит группы и очередь.
+    let f = fx.foreign_tenant;
+    assert_eq!(store.get(f, all.id).await, Ok(None));
+    assert_eq!(store.by_address(f, &upper).await, Ok(None));
+    assert_eq!(store.expand(f, all.id).await, Err(Error::NotFound));
+    assert_eq!(store.held(f, None, 10).await, Ok(Vec::new()));
+    assert_eq!(store.take_held(f, h2.id).await, Err(Error::NotFound));
+    assert_eq!(store.remove(f, closed.id).await, Ok(Vec::new()));
+    assert_eq!(store.get(t, closed.id).await, Ok(Some(closed.clone())));
+
+    // Удаление возвращает очередь группы; вложенная ссылка становится неизвестной; повтор — не ошибка.
+    assert_eq!(store.remove(t, closed.id).await, Ok(vec![h2]));
+    assert_eq!(store.remove(t, closed.id).await, Ok(Vec::new()));
+    assert_eq!(store.get(t, closed.id).await, Ok(None));
+    store.remove(t, inner.id).await.expect("remove");
+    assert_eq!(store.expand(t, all.id).await, Ok(sorted(vec![a, b])));
+    assert_eq!(store.held(t, Some(all.id), 10).await, Ok(vec![h3]));
 }

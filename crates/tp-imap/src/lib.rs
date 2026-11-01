@@ -5,13 +5,21 @@
 //! - `mailbox` — операции с папками: LIST (LIST-EXTENDED, SPECIAL-USE, LIST-STATUS), SELECT, STATUS, CREATE,
 //!   DELETE, RENAME, SUBSCRIBE.
 //! - `fetch` — FETCH: метаданные, разделы BODY[], BINARY, частичная выборка.
+//! - `store` — STORE и CONDSTORE (`UNCHANGEDSINCE`, `MODSEQ`).
+//! - `search` — SEARCH и ESEARCH: метаданные и полнотекстовый индекс.
+//! - `write` — APPEND, COPY, MOVE, EXPUNGE, CLOSE (UIDPLUS).
+//! - `idle` — IDLE и уведомления о выбранной папке (`EXISTS`, `EXPUNGE`, `FETCH FLAGS`).
 //! - [`config`] — секция `imap` config.yaml.
 
 pub mod config;
 mod fetch;
+mod idle;
 mod mailbox;
 pub mod proto;
+mod search;
 pub mod session;
+mod store;
+mod write;
 
 pub use config::ImapConfig;
 pub use session::{Deps, Server, Session, SessionCtx, Transport};
