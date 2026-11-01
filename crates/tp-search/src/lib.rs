@@ -5,16 +5,19 @@
 //! - [`query`] — исполнитель запросов [`tp_contracts::search::SearchIndex`];
 //! - [`indexer`] — роль indexer: подписчик журнала событий, пакетный коммит индекса;
 //! - [`persist`] — сегменты индекса в BlobStore и манифест версии, загрузка индекса на другом узле;
-//! - [`cache`] — LRU индексов на NVMe узла по размеру, холодная загрузка, метрики.
+//! - [`cache`] — LRU индексов на NVMe узла по размеру, холодная загрузка, метрики;
+//! - [`extract`] — текст вложений в изолированном подпроцессе (SYS-04).
 
 pub mod analyzers;
 pub mod cache;
+pub mod extract;
 pub mod index;
 pub mod indexer;
 pub mod persist;
 pub mod query;
 
 pub use cache::{CacheConfig, CacheStats, IndexCache};
+pub use extract::{ExtractConfig, ExtractLimits, Extractor, NotExtracted};
 pub use index::{IndexConfig, IndexDoc, IndexManager, IndexOp, MailIndex, SCHEMA_VERSION};
 pub use indexer::{DocumentSource, Indexer, IndexerConfig, SUBSCRIBER};
 pub use persist::{IndexStore, PersistConfig};
@@ -37,6 +40,8 @@ pub struct SearchConfig {
     pub persist: PersistConfig,
     /// Кэш индексов на узле (роль search).
     pub cache: CacheConfig,
+    /// Извлечение текста вложений (роль indexer).
+    pub extract: ExtractConfig,
 }
 
 #[cfg(test)]
