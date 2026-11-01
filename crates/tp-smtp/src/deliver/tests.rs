@@ -154,6 +154,7 @@ impl Env {
                 outbound: outbound.then(|| self.queue.clone() as Arc<dyn Outbound>),
                 authcheck: None,
                 milter: None,
+                hooks: DecisionHooks::default(),
             },
             &cfg,
         )
@@ -382,7 +383,7 @@ async fn forward_from_decision_hook_is_queued() {
     assert_eq!(env.inbox("carol@example.org").await.len(), 1);
     let queued = env.queue.0.lock().expect("lock").clone();
     assert_eq!(queued[0].1, ["archive@example.com"]);
-    // Без очереди пересылка не ломает доставку (точка вызова — TODO SMTP-06).
+    // Без очереди пересылка не ломает доставку (узел без smtp-out).
     let d = env.delivery(false);
     assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
     assert_eq!(env.inbox("carol@example.org").await.len(), 2);
@@ -494,4 +495,32 @@ async fn dmarc_failure_is_delivered_to_junk_with_results() {
     let forged = signer.sign(fx::MAIL).replace("body", "forged");
     assert_eq!(d.data(&e, Bytes::from(forged)).await.code, 250);
     assert_eq!(env.inbox("bob@example.org").await.len(), 2);
+}
+
+#[tokio::test]
+async fn submission_decision_hook() {
+    let hook = Arc::new(RecordingDecisionHook::new("journal"));
+    hook.set_submission(Decision::Augment(Augment {
+        headers: vec![("X-Journal".into(), "yes".into())],
+        copies: vec![CopyTo::Address("archive@example.com".into())],
+    }));
+    let env = Env::new(DecisionHooks::default()).await;
+    let mut d = env.delivery(true);
+    d.deps.hooks = DecisionHooks::new(vec![hook.clone()]);
+    let mut e = envelope(Mode::Submission, &["bob@example.org", "x@example.net"]);
+    e.principal = Some(tp_testkit::principal(
+        TenantId::DEFAULT,
+        "alice@example.org",
+    ));
+    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    let inbox = env.inbox("bob@example.org").await;
+    assert!(inbox[0].starts_with("X-Journal: yes\r\n"), "{}", inbox[0]);
+    let queued = env.queue.0.lock().expect("lock").clone();
+    assert_eq!(queued[0].1, ["x@example.net", "archive@example.com"]);
+    // Запрет — отказ всему письму, ничего не доставлено и не поставлено в очередь.
+    hook.set_submission(Decision::Deny("dlp".into()));
+    let r = d.data(&e, Bytes::from_static(MAIL)).await;
+    assert_eq!((r.code, r.esc), (550, [5, 7, 1]));
+    assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+    assert_eq!(env.queue.0.lock().expect("lock").len(), 1);
 }

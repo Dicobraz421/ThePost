@@ -4,7 +4,9 @@
 //! [`Delivery`] — обработчик сессий ([`Handler`]) обеих ролей:
 //! - получатель в локальном домене — учётные записи, на которые он разрешается; неизвестный — `550 5.1.1`;
 //! - внешний получатель: smtp-in — `550 5.7.1` (не открытый релей), submission — в очередь исходящей почты
-//!   ([`Outbound`], SMTP-06); пока очереди нет — `451 4.3.2`;
+//!   ([`Outbound`], [`crate::queue::Queue`]); узел без очереди (`Deps::outbound` = `None`) — `451 4.3.2`;
+//! - submission: до доставки и очереди — `DecisionHooks::on_submission` (`Deny` — `550 5.7.1`; дополнения:
+//!   заголовки в начало письма, копии в папки и внешним адресам);
 //! - внешние адреса пересылки из результата `ingest` (`Ingested::forward`, решение 2026-10-31-ingest-envelope)
 //!   ставит в очередь [`Outbound`].
 //!
@@ -23,6 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
 use tp_contracts::auth::{DirChange, DirCursor, Directory};
+use tp_contracts::ext::{CopyTo, Decision, DecisionHooks, SubmissionInfo};
 use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested, MailStore};
 use tp_contracts::meta::{Account, AccountScope, AccountStore, MailboxStore, SpecialUse};
 use tp_contracts::retention::Quota;
@@ -33,9 +36,8 @@ use crate::config::{DeliveryConfig, SmtpConfig};
 use crate::milter::{Milters, Verdict};
 use crate::server::{Envelope, Handler, Mode, Reply, reply};
 
-/// Очередь исходящей почты: внешние получатели submission и пересылки модулей.
-///
-/// TODO(SMTP-06): реализация поверх `QueueStore` и `BlobStore` (роль smtp-out); до неё [`Deps::outbound`] — `None`.
+/// Очередь исходящей почты: внешние получатели submission и пересылки модулей. Реализация —
+/// [`crate::queue::Queue`] (`QueueStore` и `BlobStore`).
 #[async_trait]
 pub trait Outbound: Send + Sync + 'static {
     /// Ставит письмо `raw` от `mail_from` получателям `rcpts` организации `tenant`.
@@ -64,8 +66,10 @@ pub struct Deps {
     pub directory: Option<Arc<dyn Directory>>,
     /// Квоты: переполненный ящик отклоняется на `RCPT`.
     pub quota: Option<Arc<dyn Quota>>,
-    /// Очередь исходящей почты (SMTP-06).
+    /// Очередь исходящей почты; `None` — узел не отправляет наружу (submission: `451` внешним получателям).
     pub outbound: Option<Arc<dyn Outbound>>,
+    /// Точки принятия решений модулей (`on_submission`; `on_delivery` вызывает хранилище).
+    pub hooks: DecisionHooks,
     /// Проверки SPF, DKIM, DMARC, ARC входящей почты (smtp-in); `None` — без проверок.
     pub authcheck: Option<Arc<AuthCheck>>,
     /// Фильтры Milter; `None` — без фильтров.
@@ -452,8 +456,8 @@ impl Delivery {
                     .await
             }
             None => {
-                // TODO(SMTP-06): очередь исходящей почты. Внешних получателей submission без очереди не
-                // принимает (RCPT — 451), здесь остаются только пересылки модулей (`Ingested::forward`).
+                // Узел без очереди: внешних получателей submission не принимает (RCPT — 451), здесь остаются
+                // только пересылки модулей (`Ingested::forward`).
                 tracing::warn!(
                     id = %env.id,
                     count = rcpts.len(),
@@ -506,7 +510,55 @@ impl Delivery {
             }
             full = out.message;
         }
-        let prepared = self.prepare(env, junk).await?;
+        let mut copies = Vec::new();
+        if env.mode == Mode::Submission
+            && let Some(principal) = &env.principal
+            && !self.deps.hooks.is_empty()
+        {
+            let info = SubmissionInfo {
+                principal: principal.clone(),
+                mail_from: env.mail_from.clone(),
+                rcpt_to: env.rcpts.clone(),
+                size: full.len() as u64,
+            };
+            match self.deps.hooks.on_submission(&info).await? {
+                Decision::Allow => {}
+                Decision::Deny(reason) => {
+                    tracing::info!(id = %env.id, %reason, "smtp: отправка запрещена точкой принятия решений");
+                    return Ok(Some(reply(550, [5, 7, 1], "Message rejected by policy")));
+                }
+                Decision::Augment(a) => {
+                    let mut h = String::new();
+                    for (name, value) in &a.headers {
+                        h.push_str(&format!("{}: {}\r\n", clean(name), clean(value)));
+                    }
+                    let mut m = Vec::with_capacity(h.len() + full.len());
+                    m.extend_from_slice(h.as_bytes());
+                    m.extend_from_slice(&full);
+                    full = Bytes::from(m);
+                    copies = a.copies;
+                }
+            }
+        }
+        let mut prepared = self.prepare(env, junk).await?;
+        for copy in copies {
+            match copy {
+                CopyTo::Mailbox(d) => {
+                    if !prepared
+                        .deliveries
+                        .iter()
+                        .any(|(_, x)| x.account == d.account && x.mailbox == d.mailbox)
+                    {
+                        prepared.deliveries.push((String::new(), d));
+                    }
+                }
+                CopyTo::Address(a) => {
+                    if !prepared.external.iter().any(|x| x.eq_ignore_ascii_case(&a)) {
+                        prepared.external.push(a);
+                    }
+                }
+            }
+        }
         let mut forward = Vec::new();
         if !prepared.deliveries.is_empty() {
             let deliveries = prepared.deliveries.into_iter().map(|(_, d)| d).collect();
@@ -549,7 +601,7 @@ impl Handler for Delivery {
             Ok(Resolved::External) => match env.mode {
                 Mode::Inbound => reply(550, [5, 7, 1], "Relaying denied"),
                 Mode::Submission if self.deps.outbound.is_some() => reply(250, [2, 1, 5], "OK"),
-                // TODO(SMTP-06): без очереди исходящей почты внешние получатели не принимаются.
+                // Узел без очереди исходящей почты внешних получателей не принимает.
                 Mode::Submission => reply(451, [4, 3, 2], "Outbound delivery not available"),
             },
             Ok(Resolved::Unknown) => reply(550, [5, 1, 1], "Mailbox unavailable"),

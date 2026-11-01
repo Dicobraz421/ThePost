@@ -21,6 +21,9 @@
 //!         address: "127.0.0.1:11332"
 //!         submission: true
 //!         on_failure: accept
+//!   queue:
+//!     retry: [5m, 15m, 30m, 1h, 2h, 4h, 8h]
+//!     expire: 5d
 //! ```
 //!
 //! Слушатели (`inbound`, `submission`) применяются при запуске роли; лимиты и таймауты — к новым сессиям
@@ -31,6 +34,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tp_contracts::config::duration;
+use tp_contracts::config::duration::HumanDuration;
 use tp_platform::EndpointConfig;
 
 /// Секция `smtp`.
@@ -53,6 +57,8 @@ pub struct SmtpConfig {
     pub authcheck: AuthCheckConfig,
     /// Фильтры Milter (антиспам, антивирус).
     pub milter: MilterConfig,
+    /// Очередь исходящей почты и отправка (роль smtp-out).
+    pub queue: QueueConfig,
 }
 
 impl Default for SmtpConfig {
@@ -66,6 +72,7 @@ impl Default for SmtpConfig {
             delivery: DeliveryConfig::default(),
             authcheck: AuthCheckConfig::default(),
             milter: MilterConfig::default(),
+            queue: QueueConfig::default(),
         }
     }
 }
@@ -219,4 +226,89 @@ pub enum MilterOnFailure {
     Accept,
     /// Временный отказ (`451 4.7.1`), отправитель повторит.
     Tempfail,
+}
+
+/// Очередь исходящей почты (SRS 4.1): расписание повторов, срок доставки, отправка. Применяется без перезапуска.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct QueueConfig {
+    /// Интервалы до повтора после 1-й, 2-й, … неудачи; последний повторяется до `expire`.
+    pub retry: Vec<HumanDuration>,
+    /// Срок доставки от постановки в очередь; затем — окончательный отказ и уведомление отправителю.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub expire: Duration,
+    /// Уведомление о задержке (DSN `delayed`) — однажды, когда письмо в очереди дольше этого срока.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub delay_notify: Duration,
+    /// Пауза опроса очереди, когда записей со сроком попытки нет.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub poll_interval: Duration,
+    /// Записей за один захват.
+    pub batch: usize,
+    /// Одновременно обрабатываемых записей на узле.
+    pub concurrency: usize,
+    /// Лиза записи: за это время узел должен завершить попытку, иначе запись берёт другой узел.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub lease: Duration,
+    /// Таймаут соединения и каждой команды SMTP (RFC 5321, 4.5.3.2).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub timeout: Duration,
+    /// Узел-ретранслятор `хост:порт` (smarthost) вместо MX получателя.
+    pub relay: Option<String>,
+    /// Порт MX.
+    pub port: u16,
+    /// MX-узлов, которые пробуются за попытку.
+    pub max_mx: usize,
+    /// Исходящий адрес (egress-IP, согласованный с PTR и SPF); `None` — выбирает система.
+    pub source_ip: Option<std::net::IpAddr>,
+    /// TLS при отправке.
+    pub tls: OutboundTls,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        let m = |n: u64| HumanDuration(Duration::from_secs(n * 60));
+        Self {
+            retry: vec![m(5), m(15), m(30), m(60), m(120), m(240), m(480)],
+            expire: Duration::from_secs(5 * 24 * 3600),
+            delay_notify: Duration::from_secs(4 * 3600),
+            poll_interval: Duration::from_secs(5),
+            batch: 32,
+            concurrency: 16,
+            lease: Duration::from_secs(10 * 60),
+            timeout: Duration::from_secs(5 * 60),
+            relay: None,
+            port: 25,
+            max_mx: 5,
+            source_ip: None,
+            tls: OutboundTls::default(),
+        }
+    }
+}
+
+impl QueueConfig {
+    /// Интервал до повтора после `attempts`-й неудачи (с 1).
+    pub fn retry_after(&self, attempts: u32) -> Duration {
+        let i = (attempts.max(1) - 1) as usize;
+        self.retry
+            .get(i)
+            .or(self.retry.last())
+            .map_or(Duration::from_secs(3600), |d| d.0)
+    }
+}
+
+/// TLS при отправке на MX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundTls {
+    /// STARTTLS, если сервер его предлагает, без проверки сертификата (RFC 7435); иначе — без TLS.
+    #[default]
+    Opportunistic,
+    /// Только STARTTLS с проверкой сертификата по системным корням; иначе — временная неудача.
+    Require,
 }
