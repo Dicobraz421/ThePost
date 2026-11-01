@@ -11,6 +11,7 @@
 //!   timeouts:
 //!     login: 1m
 //!     autologout: 30m
+//!     idle: 30m
 //!     drain: 30s
 //! ```
 //!
@@ -84,6 +85,10 @@ pub struct Timeouts {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub autologout: Duration,
+    /// Наибольшая длительность `IDLE`; затем `BYE` (клиенты повторяют `IDLE` раз в 29 минут).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub idle: Duration,
     /// Ожидание завершения сессий при остановке узла после `BYE`.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -95,6 +100,7 @@ impl Default for Timeouts {
         Self {
             login: Duration::from_secs(60),
             autologout: Duration::from_secs(30 * 60),
+            idle: Duration::from_secs(30 * 60),
             drain: Duration::from_secs(30),
         }
     }

@@ -15,29 +15,34 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
+use tp_contracts::bus::EventBus;
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountScope, MailboxStore, MessageStore};
+use tp_contracts::meta::{AccountScope, ChangeLog, MailboxStore, MessageStore};
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslFailure, SaslServer, SaslStep};
-use tp_contracts::{Error, MailboxId, MessageId, Result, Uid, UidValidity};
+use tp_contracts::search::SearchIndex;
+use tp_contracts::{Error, MailboxId, MessageId, ModSeq, Result, Uid, UidValidity};
 use tp_platform::{Conn, Listener};
 
 use crate::config::ImapConfig;
 use crate::proto::types::auth::AuthMechanism;
-use crate::proto::types::command::CommandBody;
+use crate::proto::types::command::{CommandBody, FetchModifier, SelectParameter};
 use crate::proto::types::core::{AString, Atom, IString, NString, Tag, Vec1};
 use crate::proto::types::extensions::enable::CapabilityEnable;
+use crate::proto::types::fetch::MessageDataItem;
 use crate::proto::types::response::{
     Capability, Code, CommandContinuationRequest, Data, Greeting, GreetingKind, Response, Status,
     StatusBody, StatusKind,
 };
 use crate::proto::types::secret::Secret;
 use crate::proto::{self, Body, Command, Expect, Input, Reader};
+use crate::search::SearchCmd;
 
 /// Канал сессии: поток байтов, признак TLS, апгрейд STARTTLS.
 pub trait Transport: Send + Sized + 'static {
@@ -90,6 +95,12 @@ pub struct Deps {
     pub messages: Arc<dyn MessageStore>,
     /// Почтовое хранилище (содержимое, флаги).
     pub store: Arc<dyn MailStore>,
+    /// Полнотекстовый поиск (`SEARCH BODY`, `TEXT`).
+    pub search: Arc<dyn SearchIndex>,
+    /// Журнал изменений: что сообщить клиенту о выбранной папке (`EXISTS`, `EXPUNGE`, `FETCH`).
+    pub changes: Arc<dyn ChangeLog>,
+    /// Шина уведомлений: изменения папок для `IDLE`.
+    pub bus: Arc<dyn EventBus>,
 }
 
 impl fmt::Debug for Deps {
@@ -121,22 +132,27 @@ pub(crate) struct Selected {
     pub uid_validity: UidValidity,
     /// Письма по возрастанию UID; номер последовательности — индекс + 1.
     pub messages: Vec<(Uid, MessageId)>,
+    /// Изменения папки до этого `ModSeq` клиенту сообщены (или были в снимке при выборе).
+    pub modseq: ModSeq,
 }
 
 /// Сессия IMAP одного соединения.
 pub struct Session<T: Transport> {
     pub(crate) ctx: Arc<SessionCtx>,
-    conn: Option<T>,
-    reader: Reader,
+    pub(crate) conn: Option<T>,
+    pub(crate) reader: Reader,
     pub(crate) out: Vec<u8>,
     pub(crate) principal: Option<Principal>,
     pub(crate) selected: Option<Selected>,
     /// Клиент включил IMAP4rev2 (`ENABLE IMAP4rev2`): имена папок в UTF-8, без `RECENT`.
     pub(crate) rev2: bool,
+    /// CONDSTORE включён (`ENABLE CONDSTORE` или команда с `MODSEQ`, RFC 7162, 3.1): `MODSEQ` в ответах
+    /// `FETCH` и `HIGHESTMODSEQ` при выборе папки.
+    pub(crate) condstore: bool,
     errors: u32,
     auth_failures: u32,
     /// Сессия завершается после отправки накопленных ответов.
-    close: bool,
+    pub(crate) close: bool,
 }
 
 impl<T: Transport> fmt::Debug for Session<T> {
@@ -169,6 +185,11 @@ const EXTENSIONS: &[&str] = &[
     "CREATE-SPECIAL-USE",
     "STATUS=SIZE",
     "BINARY",
+    "CONDSTORE",
+    "ESEARCH",
+    "UIDPLUS",
+    "MOVE",
+    "IDLE",
 ];
 
 fn reader(config: &ImapConfig) -> Reader {
@@ -188,6 +209,7 @@ impl<T: Transport> Session<T> {
             principal: None,
             selected: None,
             rev2: false,
+            condstore: false,
             errors: 0,
             auth_failures: 0,
             close: false,
@@ -329,6 +351,16 @@ impl<T: Transport> Session<T> {
         self.push(&Response::Data(data));
     }
 
+    /// Ответ `* n FETCH (…)` (см. [`proto::fetch_line`]).
+    pub(crate) fn fetch_data(
+        &mut self,
+        seq: NonZeroU32,
+        items: Vec1<MessageDataItem<'static>>,
+        origins: &[(usize, u32)],
+    ) {
+        self.out.extend(proto::fetch_line(seq, items, origins));
+    }
+
     fn tagged(
         &mut self,
         tag: &Tag<'static>,
@@ -369,7 +401,7 @@ impl<T: Transport> Session<T> {
         })));
     }
 
-    fn bye(&mut self, code: Option<Code<'static>>, text: &str) {
+    pub(crate) fn bye(&mut self, code: Option<Code<'static>>, text: &str) {
         self.push(&Response::Status(Status::Bye(
             crate::proto::types::response::Bye {
                 code,
@@ -458,7 +490,15 @@ impl<T: Transport> Session<T> {
                 self.data(Data::Capability(caps));
                 self.ok(&tag, None, "CAPABILITY completed");
             }
-            CommandBody::Noop => self.ok(&tag, None, "NOOP completed"),
+            CommandBody::Noop => {
+                // NOOP — опрос изменений выбранной папки (RFC 9051, 6.1.2).
+                if self.selected.is_some()
+                    && let Err(e) = self.sync().await
+                {
+                    tracing::debug!(error = %e, "imap: изменения папки не получены");
+                }
+                self.ok(&tag, None, "NOOP completed");
+            }
             CommandBody::Logout => {
                 self.bye(None, "Logging out");
                 self.ok(&tag, None, "LOGOUT completed");
@@ -507,12 +547,38 @@ impl<T: Transport> Session<T> {
             Body::List(cmd) => self.list(&tag, cmd).await,
             Body::Status { mailbox, items } => self.status(&tag, &mailbox, &items).await,
             Body::Create { mailbox, uses } => self.create(&tag, &mailbox, &uses).await,
+            Body::ESearch {
+                charset,
+                criteria,
+                uid,
+                ret,
+            } => {
+                if self.selected.is_none() {
+                    self.bad(Some(&tag), "No mailbox selected");
+                    return Ok(());
+                }
+                let cmd = SearchCmd {
+                    charset,
+                    criteria,
+                    uid,
+                    ret: Some(ret),
+                };
+                self.search(&tag, cmd).await
+            }
             Body::Std(body) => match body {
-                CommandBody::Select { mailbox, .. } => {
+                CommandBody::Select {
+                    mailbox,
+                    parameters,
+                } => {
+                    self.select_params(&parameters);
                     self.select(&tag, &proto::mailbox_bytes(&mailbox), false)
                         .await
                 }
-                CommandBody::Examine { mailbox, .. } => {
+                CommandBody::Examine {
+                    mailbox,
+                    parameters,
+                } => {
+                    self.select_params(&parameters);
                     self.select(&tag, &proto::mailbox_bytes(&mailbox), true)
                         .await
                 }
@@ -523,6 +589,16 @@ impl<T: Transport> Session<T> {
                     let (from, to) = (proto::mailbox_bytes(&from), proto::mailbox_bytes(&to));
                     self.rename(&tag, &from, &to).await
                 }
+                CommandBody::Append {
+                    mailbox,
+                    flags,
+                    date,
+                    message,
+                } => {
+                    self.append(&tag, &mailbox, &flags, date.as_ref(), &message)
+                        .await
+                }
+                CommandBody::Idle => self.idle(&tag).await,
                 CommandBody::Subscribe { mailbox } => {
                     self.subscribe(&tag, &proto::mailbox_bytes(&mailbox), true)
                         .await
@@ -550,10 +626,13 @@ impl<T: Transport> Session<T> {
             return;
         }
         let done = match body {
-            CommandBody::Check => {
-                self.ok(tag, None, "CHECK completed");
-                Ok(())
-            }
+            CommandBody::Check => match self.sync().await {
+                Ok(()) => {
+                    self.ok(tag, None, "CHECK completed");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
             CommandBody::Unselect => {
                 self.unselect(tag);
                 Ok(())
@@ -562,10 +641,49 @@ impl<T: Transport> Session<T> {
                 sequence_set,
                 macro_or_item_names,
                 uid,
-                ..
+                modifiers,
             } => {
-                self.fetch(tag, &sequence_set, macro_or_item_names, uid)
+                let changed_since = modifiers.iter().find_map(|m| match m {
+                    FetchModifier::ChangedSince(n) => Some(n.get()),
+                    FetchModifier::Vanished => None,
+                });
+                self.fetch(tag, &sequence_set, macro_or_item_names, uid, changed_since)
                     .await
+            }
+            body @ CommandBody::Store { .. } => self.store(tag, body).await,
+            CommandBody::Copy {
+                sequence_set,
+                mailbox,
+                uid,
+            } => {
+                self.copy_or_move(tag, &sequence_set, &mailbox, uid, false)
+                    .await
+            }
+            CommandBody::Move {
+                sequence_set,
+                mailbox,
+                uid,
+            } => {
+                self.copy_or_move(tag, &sequence_set, &mailbox, uid, true)
+                    .await
+            }
+            CommandBody::Expunge => self.expunge(tag, None).await,
+            CommandBody::ExpungeUid { sequence_set } => {
+                self.expunge(tag, Some(&sequence_set)).await
+            }
+            CommandBody::Close => self.close(tag).await,
+            CommandBody::Search {
+                charset,
+                criteria,
+                uid,
+            } => {
+                let cmd = SearchCmd {
+                    charset,
+                    criteria,
+                    uid,
+                    ret: None,
+                };
+                self.search(tag, cmd).await
             }
             _ => {
                 self.bad(Some(tag), "Command not supported");
@@ -738,6 +856,16 @@ impl<T: Transport> Session<T> {
         );
     }
 
+    /// Параметры `SELECT`/`EXAMINE`: `CONDSTORE` включает CONDSTORE (RFC 7162, 3.1.8).
+    fn select_params(&mut self, parameters: &[SelectParameter]) {
+        if parameters
+            .iter()
+            .any(|p| matches!(p, SelectParameter::CondStore))
+        {
+            self.condstore = true;
+        }
+    }
+
     fn enable(&mut self, tag: &Tag<'static>, capabilities: Vec1<CapabilityEnable<'static>>) {
         if self.selected.is_some() {
             self.bad(Some(tag), "ENABLE is not allowed in selected state");
@@ -745,8 +873,12 @@ impl<T: Transport> Session<T> {
         }
         let mut enabled = Vec::new();
         for c in capabilities.into_iter() {
-            if c.to_string().eq_ignore_ascii_case("IMAP4rev2") {
+            let name = c.to_string();
+            if name.eq_ignore_ascii_case("IMAP4rev2") {
                 self.rev2 = true;
+                enabled.push(c);
+            } else if name.eq_ignore_ascii_case("CONDSTORE") {
+                self.condstore = true;
                 enabled.push(c);
             }
         }
@@ -757,7 +889,7 @@ impl<T: Transport> Session<T> {
     }
 }
 
-fn io_error(e: std::io::Error) -> Error {
+pub(crate) fn io_error(e: std::io::Error) -> Error {
     tracing::debug!(error = %e, "imap: ошибка ввода-вывода");
     Error::UNAVAILABLE
 }

@@ -1,6 +1,7 @@
 //! Команды IMAP4rev2, которых нет в грамматике imap-codec (IMAP4rev1 и расширения):
 //! расширенный `LIST` (RFC 5258: опции выбора, несколько шаблонов, `RETURN`; RFC 5819 `STATUS`;
-//! RFC 6154 `SPECIAL-USE`), `CREATE … (USE (…))` (RFC 6154) и `STATUS` с `SIZE` (RFC 8438).
+//! RFC 6154 `SPECIAL-USE`), `CREATE … (USE (…))` (RFC 6154), `STATUS` с `SIZE` (RFC 8438) и `SEARCH RETURN (…)`
+//! (ESEARCH, RFC 4731): параметры `RETURN` вырезаются, критерии разбирает imap-codec.
 //!
 //! Разбирается сообщение, которое imap-codec не принял, целиком (строки и литералы уже собраны
 //! нарезкой потока); прочие команды — `None`, сессия отвечает `BAD`.
@@ -162,8 +163,58 @@ fn status_items(p: &mut P) -> Option<Vec<StatusItem>> {
     (!items.is_empty()).then_some(items)
 }
 
+/// `tag [UID] SEARCH RETURN (opts) criteria`: без `RETURN (…)` — обычный `SEARCH` для imap-codec.
+fn search_return(msg: &[u8]) -> Option<Command> {
+    use imap_codec::CommandCodec;
+    use imap_codec::decode::Decoder;
+
+    let word = |s: &[u8], w: &[u8]| s.len() >= w.len() && s[..w.len()].eq_ignore_ascii_case(w);
+    let mut i = msg.iter().position(|&b| b == b' ')? + 1;
+    if word(&msg[i..], b"UID ") {
+        i += 4;
+    }
+    if !word(&msg[i..], b"SEARCH RETURN (") {
+        return None;
+    }
+    let head = i + "SEARCH ".len();
+    let open = i + "SEARCH RETURN (".len();
+    let close = open + msg[open..].iter().position(|&b| b == b')')?;
+    let ret = std::str::from_utf8(&msg[open..close])
+        .ok()?
+        .split_ascii_whitespace()
+        .map(super::SearchReturn::parse)
+        .collect::<Option<Vec<_>>>()?;
+    let rest = msg.get(close + 1..)?.strip_prefix(b" ")?;
+    let mut plain = msg[..head].to_vec();
+    plain.extend_from_slice(rest);
+    let (remainder, cmd) = CommandCodec::default().decode(&plain).ok()?;
+    if !remainder.is_empty() {
+        return None;
+    }
+    let cmd = cmd.into_static();
+    match cmd.body {
+        super::types::command::CommandBody::Search {
+            charset,
+            criteria,
+            uid,
+        } => Some(Command {
+            tag: cmd.tag,
+            body: Body::ESearch {
+                charset,
+                criteria,
+                uid,
+                ret,
+            },
+        }),
+        _ => None,
+    }
+}
+
 /// Разбор команды IMAP4rev2, которую не принял imap-codec.
 pub(super) fn parse(msg: &[u8]) -> Option<Command> {
+    if let Some(cmd) = search_return(msg) {
+        return Some(cmd);
+    }
     let mut p = P {
         toks: tokens(msg)?.into_iter(),
         peeked: None,
@@ -334,6 +385,36 @@ mod tests {
                 items: vec![StatusItem::Messages, StatusItem::Size],
             }
         );
+    }
+
+    #[test]
+    fn search_return_rfc4731() {
+        use crate::proto::SearchReturn;
+        // RFC 4731, 3.1, примеры.
+        let c =
+            cmd("A282 SEARCH RETURN (MIN COUNT) FLAGGED SINCE 1-Feb-1994 NOT FROM \"Smith\"\r\n")
+                .expect("parsed");
+        let Body::ESearch {
+            criteria, uid, ret, ..
+        } = c.body
+        else {
+            panic!("not esearch")
+        };
+        assert!(!uid);
+        assert_eq!(ret, vec![SearchReturn::Min, SearchReturn::Count]);
+        assert_eq!(criteria.as_ref().len(), 3);
+        // Литерал в критериях, пустой RETURN, регистр.
+        let c =
+            cmd("A284 uid search return () CHARSET UTF-8 SUBJECT {8}\r\nтест\r\n").expect("parsed");
+        let Body::ESearch {
+            charset, uid, ret, ..
+        } = c.body
+        else {
+            panic!("not esearch")
+        };
+        assert!(uid && ret.is_empty() && charset.is_some());
+        assert!(cmd("a SEARCH RETURN (FOO) ALL\r\n").is_none());
+        assert!(cmd("a SEARCH RETURN (MIN)\r\n").is_none());
     }
 
     #[test]

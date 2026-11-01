@@ -271,14 +271,39 @@ async fn delete_and_rename() {
             .starts_with("C4 NO [CANNOT]")
     );
     assert!(
-        c.cmd("C5 RENAME INBOX Old")
-            .await
-            .starts_with("C5 NO [CANNOT]")
-    );
-    assert!(
         c.cmd("C6 RENAME Nope X")
             .await
             .starts_with("C6 NO [NONEXISTENT]")
     );
     assert!(c.cmd("C7 DELETE Work").await.contains("C7 OK"));
+}
+
+#[tokio::test]
+async fn rename_inbox_moves_messages() {
+    let (env, mut c) = env_client().await;
+    let inbox = env.mailbox(SpecialUse::Inbox);
+    for _ in 0..2 {
+        env.deliver(inbox, PLAIN, Default::default()).await;
+    }
+    assert!(c.cmd("A1 CREATE INBOX/Lists").await.contains("A1 OK"));
+    assert!(c.cmd("A2 SELECT INBOX").await.contains("* 2 EXISTS"));
+    // RFC 9051, 6.3.6: письма — в новую папку, INBOX пуст, вложенные не переименовываются.
+    assert_eq!(
+        c.cmd("A3 RENAME INBOX INBOX/Old").await,
+        "* 2 EXPUNGE\r\n* 1 EXPUNGE\r\nA3 OK RENAME completed\r\n"
+    );
+    let r = c.cmd("A4 STATUS INBOX/Old (MESSAGES)").await;
+    assert!(r.contains("(MESSAGES 2)"), "{r}");
+    let r = c.cmd("A5 STATUS INBOX (MESSAGES)").await;
+    assert!(r.contains("(MESSAGES 0)"), "{r}");
+    assert!(
+        c.cmd("A6 LIST \"\" INBOX/Lists")
+            .await
+            .contains("INBOX/Lists")
+    );
+    assert!(
+        c.cmd("A7 RENAME INBOX INBOX/Old")
+            .await
+            .starts_with("A7 NO [ALREADYEXISTS]")
+    );
 }

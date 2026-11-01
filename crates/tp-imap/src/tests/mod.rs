@@ -12,17 +12,22 @@ use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse};
 use tp_contracts::{DomainId, Error, MailboxId, Result, TenantId};
 use tp_mailstore::Store;
+use tp_testkit::SearchDoc;
 use tp_testkit::{
-    Clock, FakeAuthenticator, FakeSasl, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata,
-    MemQuota, MemTrash, SystemClock,
+    Clock, FakeAuthenticator, FakeSasl, FakeSearch, MemBlobIndex, MemBlobStore, MemEventBus,
+    MemMetadata, MemQuota, MemTrash, SystemClock,
 };
 
 use crate::config::ImapConfig;
 use crate::session::{Deps, Session, SessionCtx, Transport};
 
 mod fetch;
+mod idle;
 mod mailbox;
+mod search;
 mod session;
+mod store;
+mod write;
 
 pub(crate) const LOGIN: &str = "user@example.org";
 pub(crate) const PASSWORD: &str = "secret";
@@ -57,6 +62,8 @@ pub(crate) struct Env {
     pub meta: MemMetadata,
     pub store: Store,
     pub auth: FakeAuthenticator,
+    pub search: FakeSearch,
+    pub bus: MemEventBus,
     pub principal: Principal,
     pub config: ImapConfig,
     pub shutdown: CancellationToken,
@@ -68,6 +75,7 @@ impl Env {
         let blobs = MemBlobStore::new(clock.clone());
         let index = MemBlobIndex::new(clock.clone());
         let meta = MemMetadata::new(clock).with_blob_index(index.clone());
+        let bus = MemEventBus::default();
         let store = Store::new(tp_mailstore::Deps {
             blobs: Arc::new(blobs),
             index: Arc::new(index),
@@ -75,7 +83,7 @@ impl Env {
             changes: Arc::new(meta.clone()),
             trash: Arc::new(MemTrash::new(&meta)),
             quota: Arc::new(MemQuota::new(&meta)),
-            bus: Arc::new(MemEventBus::default()),
+            bus: Arc::new(bus.clone()),
             hooks: DecisionHooks::default(),
         });
         let tenant = TenantId::DEFAULT;
@@ -106,6 +114,8 @@ impl Env {
             meta,
             store,
             auth,
+            search: FakeSearch::default(),
+            bus,
             principal,
             config: ImapConfig::default(),
             shutdown: CancellationToken::new(),
@@ -128,6 +138,9 @@ impl Env {
                 mailboxes: Arc::new(self.meta.clone()),
                 messages: Arc::new(self.meta.clone()),
                 store: Arc::new(self.store.clone()),
+                search: Arc::new(self.search.clone()),
+                changes: Arc::new(self.meta.clone()),
+                bus: Arc::new(self.bus.clone()),
             },
             shutdown: self.shutdown.clone(),
         })
@@ -176,7 +189,13 @@ impl Env {
             }],
             received_at: OffsetDateTime::from_unix_timestamp(1_790_000_000).expect("time"),
         };
-        self.store.ingest(req).await.expect("ingest").delivered[0]
+        let received = req.received_at;
+        let d = self.store.ingest(req).await.expect("ingest").delivered[0];
+        // Индекс поиска — как после индексатора.
+        if let Ok(doc) = SearchDoc::parse(d.message, mailbox, received, raw) {
+            self.search.index(self.scope(), doc);
+        }
+        d
     }
 }
 
