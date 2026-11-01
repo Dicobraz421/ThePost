@@ -5,6 +5,7 @@
 //! Иерархия — `parent` папок хранилища, разделитель `/`; полное имя строит протокол, `INBOX` — папка
 //! с назначением «Входящие» (имя без учёта регистра). Имена — в UTF-8 после `ENABLE IMAP4rev2`, иначе
 //! в модифицированном UTF-7 (IMAP4rev1). `CREATE` и `RENAME` создают недостающие промежуточные папки.
+//! `RENAME INBOX` переносит письма «Входящих» в новую папку (RFC 9051, 6.3.6).
 //! Удаление папки с вложенными — `NO [HASCHILDREN]` (хранилище удаляет поддерево только по подтверждению,
 //! которого в IMAP нет); системные папки не удаляются (`NO [CANNOT]`).
 
@@ -656,14 +657,6 @@ impl<T: Transport> Session<T> {
         let Some(parts) = self.split_name(tag, to) else {
             return Ok(());
         };
-        if node.path == "INBOX" {
-            self.no(
-                tag,
-                Some(proto::code("CANNOT")),
-                "Renaming INBOX is not supported",
-            );
-            return Ok(());
-        }
         let tree = self.tree().await?;
         let path = parts.join(&DELIMITER.to_string());
         if tree.find(&path).is_some() {
@@ -673,6 +666,9 @@ impl<T: Transport> Session<T> {
                 "Mailbox already exists",
             );
             return Ok(());
+        }
+        if node.path == "INBOX" {
+            return self.rename_inbox(tag, &node, &tree, &parts).await;
         }
         if path.starts_with(&format!("{}{DELIMITER}", node.path)) {
             self.no(
@@ -706,6 +702,59 @@ impl<T: Transport> Session<T> {
             }
             Err(e) => return Err(e),
         }
+        Ok(())
+    }
+
+    /// `RENAME INBOX`: письма «Входящих» переносятся в новую папку, «Входящие» остаются пустыми,
+    /// вложенные папки не переименовываются (RFC 9051, 6.3.6).
+    async fn rename_inbox(
+        &mut self,
+        tag: &Tag<'static>,
+        inbox: &Node,
+        tree: &Tree,
+        parts: &[String],
+    ) -> Result<()> {
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let (last, prefix) = refs.split_last().ok_or(Error::NotFound)?;
+        let parent = self.ensure_parents(tree, prefix).await?;
+        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let data = NewMailbox {
+            parent,
+            name: (*last).to_owned(),
+            role: None,
+        };
+        let created = match self.ctx.deps.mailboxes.create(scope, data).await {
+            Ok(m) => m,
+            Err(Error::Conflict) => {
+                self.no(
+                    tag,
+                    Some(proto::code("ALREADYEXISTS")),
+                    "Mailbox already exists",
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let limit = self.ctx.config.limits.max_mailbox_messages;
+        let ids: Vec<_> = self
+            .ctx
+            .deps
+            .messages
+            .list(scope, inbox.mailbox.id, MessageQuery::All, limit)
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        let batch = self.ctx.config.limits.fetch_batch.max(1);
+        for chunk in ids.chunks(batch) {
+            self.ctx
+                .deps
+                .store
+                .move_to(scope, chunk, created.id)
+                .await?;
+        }
+        self.after_change(inbox.mailbox.id).await?;
+        self.ok(tag, None, "RENAME completed");
         Ok(())
     }
 
