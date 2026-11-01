@@ -45,6 +45,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "distribution groups",
         include_str!("../migrations/0010_distribution_groups.sql"),
     ),
+    (
+        11,
+        "delivery and audit logs",
+        include_str!("../migrations/0011_delivery_audit.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

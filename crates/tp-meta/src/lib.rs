@@ -10,6 +10,7 @@ pub mod app_passwords;
 pub mod blob_index;
 pub mod changelog;
 pub mod credentials;
+pub mod delivery;
 pub mod doctor;
 pub mod events;
 pub mod groups;
@@ -34,6 +35,7 @@ use sqlx::PgPool;
 use tp_contracts::Result;
 use tp_contracts::config::duration;
 
+use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
 use crate::retention::RetentionConfig;
@@ -51,6 +53,8 @@ use crate::retention::RetentionConfig;
 ///     timeout: 10s
 ///   retention:
 ///     trash_retention: 30d
+///   delivery:
+///     retention: 30d
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -71,6 +75,8 @@ pub struct MetaConfig {
     pub doctor: DoctorConfig,
     /// Значения по умолчанию политик хранения: срок корзины, квота.
     pub retention: RetentionConfig,
+    /// Журнал доставки: срок хранения.
+    pub delivery: DeliveryLogConfig,
 }
 
 impl MetaConfig {
@@ -87,6 +93,7 @@ impl Default for MetaConfig {
             events: EventsConfig::default(),
             doctor: DoctorConfig::default(),
             retention: RetentionConfig::default(),
+            delivery: DeliveryLogConfig::default(),
         }
     }
 }
@@ -129,6 +136,7 @@ mod tests {
     use tp_contracts::config::duration::PATTERN;
 
     use super::MetaConfig;
+    use crate::delivery::DeliveryLogConfig;
     use crate::doctor::DoctorConfig;
     use crate::events::EventsConfig;
     use crate::pool::PoolConfig;
@@ -197,6 +205,12 @@ meta:
         let s = parse("meta:\n  events: {}\n  doctor: {}\n").expect("yaml");
         assert_eq!(s.meta.events, EventsConfig::default());
         assert_eq!(s.meta.doctor, DoctorConfig::default());
+        assert_eq!(s.meta.delivery, DeliveryLogConfig::default());
+        let s = parse("meta:\n  delivery:\n    retention: 7d\n").expect("yaml");
+        assert_eq!(
+            s.meta.delivery.retention,
+            Duration::from_secs(7 * 24 * 3600)
+        );
         // Без секций — тоже значения по умолчанию.
         let s = parse("{}").expect("yaml");
         assert_eq!(s.meta, MetaConfig::default());
