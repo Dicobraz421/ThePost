@@ -1054,7 +1054,7 @@ impl DoctorReport {
         self.checks.iter().find(|c| c.id == id)
     }
 
-    fn push(
+    pub(crate) fn push(
         &mut self,
         id: &'static str,
         status: DoctorStatus,

@@ -49,6 +49,16 @@ impl Problem {
         }
     }
 
+    /// Ошибка HTTP вне запроса API (загрузка, скачивание, push): код и описание, тип `about:blank`.
+    pub fn http(status: u16, detail: impl Into<String>) -> Self {
+        Self {
+            status,
+            kind: "about:blank".into(),
+            detail: detail.into(),
+            limit: None,
+        }
+    }
+
     /// Тело problem details.
     pub fn to_json(&self) -> Value {
         let mut v = json!({ "type": self.kind, "status": self.status, "detail": self.detail });

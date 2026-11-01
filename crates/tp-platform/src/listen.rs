@@ -22,6 +22,7 @@ use tokio_rustls::server::TlsStream;
 use tp_contracts::Error;
 use tp_contracts::config::duration;
 
+use crate::privileges::InheritedSockets;
 use crate::tls::TlsCerts;
 
 /// Параметры слушателя; встраивается в секцию крейта протокола (`imap.listeners`, `smtp.submission` и т. п.).
@@ -210,6 +211,31 @@ impl Listener {
         };
         let tcp = tp_sys::bind_tcp(cfg.listen, &socket)
             .map_err(|e| Error::Invalid(format!("listen {}: {e}", cfg.listen)))?;
+        Self::from_tcp(tcp, cfg, tls)
+    }
+
+    /// Слушатель на сокете, переданном systemd для `cfg.listen` (PLT-16), иначе — новый сокет, как [`Listener::bind`].
+    /// Отказ привязки порта ниже 1024 — ошибка с подсказкой: активация сокетов systemd или `CAP_NET_BIND_SERVICE`.
+    /// Требует контекста tokio-рантайма.
+    pub fn open(
+        cfg: &EndpointConfig,
+        tls: Option<Arc<TlsCerts>>,
+        inherited: &mut InheritedSockets,
+    ) -> tp_contracts::Result<Self> {
+        let Some(passed) = inherited.take(cfg.listen) else {
+            return Self::bind(cfg, tls).map_err(|e| match e {
+                Error::Invalid(m) if cfg.listen.port() < 1024 && m.contains("ermission denied") => {
+                    Error::Invalid(format!(
+                        "{m}; ports below 1024 need systemd socket activation (LISTEN_FDS) or CAP_NET_BIND_SERVICE"
+                    ))
+                }
+                e => e,
+            });
+        };
+        let tcp = passed
+            .set_nonblocking(true)
+            .and_then(|()| TcpListener::from_std(passed))
+            .map_err(|e| Error::Invalid(format!("listen {} (systemd): {e}", cfg.listen)))?;
         Self::from_tcp(tcp, cfg, tls)
     }
 

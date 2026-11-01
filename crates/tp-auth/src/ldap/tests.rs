@@ -733,3 +733,275 @@ async fn live_ldap() {
     let _ = ldap.unbind().await;
     result.expect("live LDAP");
 }
+
+// ---------- Группы рассылки из каталога (AUTH-07) ----------
+
+mod group_sync {
+    use tp_contracts::groups::{
+        DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
+    };
+    use tp_contracts::{AccountId, BlobHash, BlobKey, Gen, HeldId};
+    use tp_testkit::{Clock, MemGroups, SystemClock};
+
+    use super::*;
+
+    const STAFF: &str = "00000000-0000-0000-0000-0000000000e1";
+    const DEVS: &str = "00000000-0000-0000-0000-0000000000e2";
+    const STAFF_DN: &str = "cn=staff,ou=groups,dc=example,dc=org";
+    const DEVS_DN: &str = "cn=devs,ou=groups,dc=example,dc=org";
+    const ALICE_DN: &str = "uid=alice,ou=people,dc=example,dc=org";
+    const CAROL_DN: &str = "uid=carol,ou=people,dc=example,dc=org";
+
+    impl Fake {
+        fn set_all(&self, dn: &str, attr: &str, vals: &[&str]) {
+            let mut entries = self.entries.lock().expect("lock");
+            let e = entries
+                .iter_mut()
+                .find(|e| e.dn.eq_ignore_ascii_case(dn))
+                .expect("entry");
+            e.attrs.insert(
+                attr.to_owned(),
+                vals.iter().map(|v| (*v).to_owned()).collect(),
+            );
+        }
+
+        fn delete(&self, dn: &str) {
+            self.entries
+                .lock()
+                .expect("lock")
+                .retain(|e| !e.dn.eq_ignore_ascii_case(dn));
+        }
+    }
+
+    struct Env {
+        sync: GroupSync,
+        fake: Arc<Fake>,
+        groups: MemGroups,
+        alice: AccountId,
+        carol: AccountId,
+    }
+
+    async fn env(cfg: LdapConfig) -> Env {
+        let fake = Fake::new(include_str!("openldap.ldif"));
+        let dir = LdapDirectory::with_source(T, cfg, fake.clone());
+        let (meta, _, ids) = crate::testutil::meta_accounts(&[
+            ("alice@example.org", true),
+            ("carol@example.org", true),
+        ])
+        .await;
+        let groups = MemGroups::new();
+        Env {
+            sync: GroupSync::new(dir, Arc::new(meta), Arc::new(groups.clone())),
+            fake,
+            groups,
+            alice: ids[0],
+            carol: ids[1],
+        }
+    }
+
+    async fn group(groups: &MemGroups, external_id: &str) -> DistributionGroup {
+        groups
+            .by_external_id(T, external_id)
+            .await
+            .expect("by_external_id")
+            .expect("group")
+    }
+
+    fn sorted<V: Ord>(mut v: Vec<V>) -> Vec<V> {
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn nested_group_and_member_removal() {
+        let Env {
+            sync,
+            fake,
+            groups,
+            alice,
+            carol,
+        } = env(openldap_cfg()).await;
+        let full = sync.run(None).await.expect("full");
+        assert_eq!((full.upserted, full.removed, full.skipped), (2, 0, 0));
+        assert!(!full.full);
+        // staff ссылается на devs раньше её записи (порядок modifyTimestamp): заготовка, затем заполнение;
+        // uid=ghost не разрешается и пропускается.
+        let staff = group(&groups, STAFF).await;
+        let devs = group(&groups, DEVS).await;
+        assert_eq!(
+            staff.members,
+            sorted(vec![
+                GroupMember::Account(alice),
+                GroupMember::Group(devs.id)
+            ])
+        );
+        assert_eq!(staff.address.as_deref(), Some("staff@example.org"));
+        assert_eq!(devs.name, "devs");
+        assert_eq!(devs.address, None);
+        assert_eq!(
+            devs.members,
+            sorted(vec![
+                GroupMember::Account(alice),
+                GroupMember::Account(carol)
+            ])
+        );
+        assert_eq!(
+            groups.expand(T, staff.id).await.expect("expand"),
+            sorted(vec![alice, carol])
+        );
+        assert_eq!(groups.list(T).await.expect("list").len(), 2);
+
+        // Удаление участника: carol выходит из devs — и из staff через вложенность.
+        fake.set_all(DEVS_DN, "member", &[ALICE_DN]);
+        fake.set(DEVS_DN, "modifyTimestamp", "20261005000000Z");
+        let inc = sync.run(Some(&full.cursor)).await.expect("incremental");
+        assert_eq!((inc.upserted, inc.removed), (1, 0));
+        let devs2 = group(&groups, DEVS).await;
+        assert_eq!(devs2.id, devs.id, "идентификатор группы сохраняется");
+        assert_eq!(devs2.members, [GroupMember::Account(alice)]);
+        assert_eq!(groups.expand(T, staff.id).await.expect("expand"), [alice]);
+        let idle = sync.run(Some(&inc.cursor)).await.expect("idle");
+        assert_eq!((idle.upserted, idle.removed), (0, 0));
+
+        // Удалённую группу (режим modifyTimestamp) выявляет полная выгрузка; письма её очереди
+        // модерации возвращаются вызывающему.
+        let held = HeldMessage {
+            id: HeldId::new(),
+            group: devs.id,
+            sender: "x@example.net".into(),
+            sender_account: None,
+            message_id: None,
+            blob: BlobKey {
+                tenant: T,
+                hash: BlobHash([7; 32]),
+                generation: Gen(1),
+            },
+            size: 10,
+            held_at: SystemClock.now(),
+        };
+        groups.hold(T, held.clone()).await.expect("hold");
+        fake.delete(DEVS_DN);
+        let again = sync.run(None).await.expect("full again");
+        assert_eq!((again.upserted, again.removed), (1, 1));
+        assert_eq!(again.held, [held]);
+        assert_eq!(groups.get(T, devs.id).await.expect("get"), None);
+        assert_eq!(
+            group(&groups, STAFF).await.members,
+            [GroupMember::Account(alice)]
+        );
+    }
+
+    #[tokio::test]
+    async fn restrictions_moderators_and_hiding_from_directory() {
+        let flag = |attribute: &str| {
+            Some(FlagRule {
+                attribute: attribute.into(),
+                value: Some("TRUE".into()),
+                flag: None,
+            })
+        };
+        let cfg = LdapConfig {
+            groups: GroupMap {
+                moderators: Some("tpModerator".into()),
+                senders: vec!["tpSender".into()],
+                internal_only: flag("tpInternal"),
+                hidden: flag("tpHidden"),
+                ..GroupMap::default()
+            },
+            ..openldap_cfg()
+        };
+        cfg.check(Profile::Prod).expect("check");
+        let Env {
+            sync,
+            fake,
+            groups,
+            alice,
+            carol,
+        } = env(cfg.clone()).await;
+        fake.set(STAFF_DN, "tpHidden", "true");
+        fake.set(STAFF_DN, "tpModerator", CAROL_DN);
+        fake.set_all(STAFF_DN, "tpSender", &[ALICE_DN, DEVS_DN]);
+        fake.set(DEVS_DN, "tpInternal", "TRUE");
+        sync.run(None).await.expect("sync");
+        let staff = group(&groups, STAFF).await;
+        let devs = group(&groups, DEVS).await;
+        assert!(staff.hidden_from_gal);
+        assert_eq!(staff.moderators, [carol]);
+        assert!(staff.requires_moderation(Some(alice)));
+        assert_eq!(
+            staff.senders,
+            SenderRestriction::Only {
+                accounts: vec![alice],
+                groups: vec![devs.id],
+            }
+        );
+        // carol — участник devs из списка отправителей; внешний — нет.
+        assert!(
+            groups
+                .sender_allowed(T, &staff, Some(carol))
+                .await
+                .expect("carol")
+        );
+        assert!(
+            !groups
+                .sender_allowed(T, &staff, None)
+                .await
+                .expect("external")
+        );
+        assert_eq!(devs.senders, SenderRestriction::Internal);
+        assert!(!devs.hidden_from_gal);
+        assert!(devs.moderators.is_empty());
+
+        // Признак с value и flag сразу — ошибка секции.
+        let mut bad = cfg;
+        bad.groups.hidden = Some(FlagRule {
+            attribute: "tpHidden".into(),
+            value: Some("TRUE".into()),
+            flag: Some(1),
+        });
+        assert!(matches!(bad.check(Profile::Prod), Err(Error::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn unmapped_fields_keep_admin_settings() {
+        let Env {
+            sync,
+            fake,
+            groups,
+            alice,
+            ..
+        } = env(openldap_cfg()).await;
+        let full = sync.run(None).await.expect("full");
+        // Настройки Admin API (ADM-07) для полей без сопоставления в секции.
+        let mut staff = group(&groups, STAFF).await;
+        staff.hidden_from_gal = true;
+        staff.moderators = vec![alice];
+        staff.senders = SenderRestriction::Internal;
+        groups.put(staff).await.expect("put");
+        fake.set(STAFF_DN, "cn", "Staff All");
+        fake.set(STAFF_DN, "modifyTimestamp", "20261005000000Z");
+        sync.run(Some(&full.cursor)).await.expect("incremental");
+        let after = group(&groups, STAFF).await;
+        assert_eq!(after.name, "Staff All");
+        assert!(after.hidden_from_gal);
+        assert_eq!(after.moderators, [alice]);
+        assert_eq!(after.senders, SenderRestriction::Internal);
+    }
+
+    #[tokio::test]
+    async fn stale_cursor_and_empty_listing() {
+        let Env {
+            sync, fake, groups, ..
+        } = env(openldap_cfg()).await;
+        let junk = DirCursor("not a cursor".into());
+        let r = sync.run(Some(&junk)).await.expect("resync");
+        assert!(r.full);
+        assert_eq!(r.upserted, 2);
+        // Пустая выгрузка (неверная база, фильтр) не стирает группы.
+        fake.delete(STAFF_DN);
+        fake.delete(DEVS_DN);
+        let empty = sync.run(None).await.expect("empty");
+        assert_eq!(empty.removed, 0);
+        assert_eq!(groups.list(T).await.expect("list").len(), 2);
+    }
+}

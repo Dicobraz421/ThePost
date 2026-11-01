@@ -52,6 +52,8 @@ flate2 = "1.1.10"
 futures = "0.3.34"
 hex = "0.4.3"
 imap-codec = { version = "2.0.0-alpha.9", features = ["starttls", "ext_id", "ext_condstore_qresync", "ext_namespace"] }
+# Сигнатуры форматов для пропуска сжатия BLOB (BLOB-13); без std: OLE-документы не распознаются, они сжимаемы.
+infer = { version = "0.22.0", default-features = false, features = ["alloc"] }
 insta = { version = "1.49.0", features = ["json"] }
 instant-acme = "0.8.5"
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
@@ -83,6 +85,7 @@ rsasl = { version = "2.3.1", default-features = false, features = ["config_build
 rustls = "0.23.46"
 rustls-native-certs = "0.8.5"
 rustls-pemfile = "2.2.0"
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["alloc"] }
 schemars = "1.2.3"
 seccompiler = "0.5.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -98,6 +101,8 @@ thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["serde"] }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = "0.26.6"
+# Клиент WebSocket для тестов JMAP push (RFC 8887); та же версия, что у axum (фича `ws`).
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
 tokio-util = "0.7.20"
 tower = "0.5.3"
 tracing = "0.1.44"
@@ -106,6 +111,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 utoipa = "6.0.0"
 uuid = { version = "1.29.0", features = ["v7", "serde"] }
 zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
+zstd = { version = "0.14.3", default-features = false }
 
 [profile.dev]
 debug = "line-tables-only"

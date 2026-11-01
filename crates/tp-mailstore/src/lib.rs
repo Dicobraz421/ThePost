@@ -14,12 +14,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use time::OffsetDateTime;
 use tp_contracts::blob::{BlobIndex, BlobStore, ByteStream};
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::ext::DecisionHooks;
+use tp_contracts::mailstore::Delivered;
 use tp_contracts::mailstore::{IngestRequest, Ingested, MailStore};
 use tp_contracts::meta::{
-    AccountScope, ChangeLog, FlagOp, FlagsUpdate, Inserted, MailboxStore, MessageStore,
+    AccountScope, ChangeLog, FlagOp, Flags, FlagsUpdate, Inserted, MailboxStore, MessageStore,
 };
 use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::{MailboxId, MessageId, ModSeq, Result};
@@ -154,9 +156,21 @@ impl Store {
 impl MailStore for Store {
     async fn ingest(&self, req: IngestRequest) -> Result<Ingested> {
         let tenant = req.tenant;
-        let (ingested, pending) = self.ingest_inner(req, false).await?;
+        let (ingested, pending) = self.ingest_impl(req, false).await?;
         self.warn_quota(tenant, &pending).await;
         Ok(ingested)
+    }
+
+    async fn append(
+        &self,
+        scope: AccountScope,
+        mailbox: MailboxId,
+        raw: ByteStream,
+        flags: Flags,
+        received_at: OffsetDateTime,
+    ) -> Result<Delivered> {
+        self.append_impl(scope, mailbox, raw, flags, received_at)
+            .await
     }
 
     async fn fetch_raw(

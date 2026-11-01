@@ -35,6 +35,8 @@ use tp_contracts::secrets::{Secret, SecretLease, SecretRef, SecretStore};
 use tp_contracts::tls::Profile;
 
 use crate::acme::AcmeConfig;
+use crate::load::{LOAD, LoadConfig};
+use crate::privileges::{CONFINE, PRIVILEGES, PrivilegesConfig};
 use crate::ratelimit::RateLimitConfig;
 use crate::reload::ReloadConfig;
 use crate::roles::RuntimeConfig;
@@ -160,7 +162,7 @@ impl Default for SectionRegistry {
 
 impl SectionRegistry {
     /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`, `tls`, `ratelimit`, `acme`,
-    /// `secrets`.
+    /// `secrets`, `resources` (SYS-06), `load` (PLT-15), `privileges` (PLT-16), `confine` (SYS-07).
     pub fn new() -> Self {
         let mut r = Self {
             sections: BTreeMap::new(),
@@ -176,6 +178,11 @@ impl SectionRegistry {
         r.sections.insert("ratelimit", def::<RateLimitConfig>());
         r.sections.insert("acme", def::<AcmeConfig>());
         r.sections.insert("secrets", def::<SecretsConfig>());
+        r.sections
+            .insert("resources", def::<tp_sys::ResourcesConfig>());
+        r.sections.insert(LOAD, def::<LoadConfig>());
+        r.sections.insert(PRIVILEGES, def::<PrivilegesConfig>());
+        r.sections.insert(CONFINE, def::<tp_sys::ConfineConfig>());
         r.checks
             .entry("service_http")
             .or_default()
@@ -184,6 +191,10 @@ impl SectionRegistry {
             .entry("secrets")
             .or_default()
             .push(check_fn(SecretsConfig::check));
+        r.checks
+            .entry(LOAD)
+            .or_default()
+            .push(check_fn(LoadConfig::check));
         r
     }
 
@@ -1340,6 +1351,37 @@ mod tests {
         assert_eq!(e, "smtp.relays[1].extra: unknown parameter");
         let e = err(&format!("{MINIMAL}profile: staging\n"));
         assert!(e.starts_with("profile: unknown variant"), "{e}");
+    }
+
+    /// Приёмка PLT-18: служебный HTTP по умолчанию на loopback; публичный адрес и все интерфейсы без явного
+    /// списка внутренних сетей — ошибка `config check`.
+    #[test]
+    fn service_http_internal_only() {
+        let cfg = strict(MINIMAL).expect("default");
+        let http = cfg
+            .section::<ServiceHttpConfig>("service_http")
+            .expect("service_http");
+        assert!(http.listen.ip().is_loopback(), "{}", http.listen);
+
+        for listen in ["\"0.0.0.0:8081\"", "\"[::]:8081\"", "\"203.0.113.5:8081\""] {
+            let e = lines(
+                strict(&format!("{MINIMAL}service_http: {{ listen: {listen} }}\n"))
+                    .expect_err(listen),
+            );
+            assert!(
+                e.iter().any(|l| l.starts_with("service_http: listen")
+                    && l.contains("not an internal address")),
+                "{listen}: {e:#?}"
+            );
+        }
+        for ok in [
+            "{ listen: \"10.1.2.3:8081\" }",
+            "{ listen: \"[fd00::1]:8081\" }",
+            "{ listen: \"0.0.0.0:8081\", internal_networks: [0.0.0.0/32] }",
+            "{ listen: \"203.0.113.5:8081\", internal_networks: [203.0.113.0/24] }",
+        ] {
+            strict(&format!("{MINIMAL}service_http: {ok}\n")).expect(ok);
+        }
     }
 
     /// Приёмка PLT-09: один файл с неизвестными полями (секция, модуль, верхний уровень), ошибкой типа

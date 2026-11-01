@@ -32,7 +32,7 @@ pub mod sasl;
 
 pub use authz::AclAuthorizer;
 pub use gssapi::{Gssapi, GssapiConfig, KerberosAuthenticator};
-pub use ldap::{LdapConfig, LdapDirectory};
+pub use ldap::{GroupSync, GroupSyncReport, LdapConfig, LdapDirectory};
 pub use oidc::{OidcAuthenticator, OidcConfig};
 pub use password::{AppPasswords, PasswordAuthenticator, PasswordCheck, PasswordConfig};
 pub use sasl::AuthSasl;

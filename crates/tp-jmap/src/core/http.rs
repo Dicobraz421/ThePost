@@ -1,6 +1,7 @@
 //! HTTP JMAP (RFC 8620 §2, §3.1): `/.well-known/jmap` и `/jmap/session` — объект сессии,
 //! `POST /jmap/api` — запрос API. Аутентификация — `Authorization: Bearer` (OAuth 2.0) или
 //! `Basic` (пароль приложения) через [`Authenticator`](tp_contracts::auth::Authenticator).
+//! Загрузка и скачивание blob — `crate::blob`, push (EventSource, WebSocket) — `crate::push`.
 
 use std::sync::Arc;
 
@@ -25,6 +26,13 @@ impl Jmap {
             .route("/.well-known/jmap", get(session))
             .route("/jmap/session", get(session))
             .route("/jmap/api", post(api))
+            .route("/jmap/upload/{account}/", post(crate::blob::upload))
+            .route(
+                "/jmap/download/{account}/{blob}/{name}",
+                get(crate::blob::download),
+            )
+            .route("/jmap/eventsource/", get(crate::push::eventsource))
+            .route("/jmap/ws", get(crate::push::websocket))
             .with_state(self)
     }
 
@@ -52,7 +60,7 @@ impl Jmap {
         self.d.auth.verify(creds).await
     }
 
-    fn base_url(&self, headers: &HeaderMap) -> String {
+    pub(crate) fn base_url(&self, headers: &HeaderMap) -> String {
         match &self.cfg.public_url {
             Some(url) => url.trim_end_matches('/').to_owned(),
             None => {
@@ -66,7 +74,7 @@ impl Jmap {
     }
 }
 
-fn json(status: StatusCode, content_type: &'static str, body: &Value) -> Response {
+pub(crate) fn json(status: StatusCode, content_type: &'static str, body: &Value) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
@@ -75,12 +83,12 @@ fn json(status: StatusCode, content_type: &'static str, body: &Value) -> Respons
         .into_response()
 }
 
-fn problem(p: &Problem) -> Response {
+pub(crate) fn problem(p: &Problem) -> Response {
     let status = StatusCode::from_u16(p.status).unwrap_or(StatusCode::BAD_REQUEST);
     json(status, "application/problem+json", &p.to_json())
 }
 
-fn auth_error(e: &Error) -> Response {
+pub(crate) fn auth_error(e: &Error) -> Response {
     if e.is_retryable() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }

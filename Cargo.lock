@@ -1954,6 +1954,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4200d433cbd5178df7797c9c2e75b348b728e39631cf14520d1e2fc424201f4"
+
+[[package]]
 name = "inout"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4771,12 +4777,18 @@ dependencies = [
  "axum",
  "bytes",
  "futures",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "rustls",
+ "rustls-native-certs",
  "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tp-auth",
  "tp-contracts",
@@ -4820,6 +4832,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "infer",
  "moka",
  "object_store",
  "proptest",
@@ -4835,6 +4848,7 @@ dependencies = [
  "tp-contracts",
  "tp-testkit",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -4926,6 +4940,7 @@ dependencies = [
  "base64 0.23.1",
  "futures",
  "insta",
+ "mail-builder 1.0.0",
  "mail-parser",
  "schemars",
  "serde",
@@ -4934,6 +4949,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-tungstenite",
  "tp-contracts",
  "tp-mailstore",
  "tp-testkit",
@@ -4957,6 +4973,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tp-blob",
  "tp-contracts",
  "tp-testkit",
  "tracing",
@@ -5064,8 +5081,12 @@ dependencies = [
  "mail-builder 1.0.0",
  "mail-parser",
  "mail-send",
+ "prometheus-client",
+ "reqwest",
+ "rustls-webpki",
  "schemars",
  "serde",
+ "sha2 0.11.1",
  "smtp-proto",
  "thiserror 2.0.21",
  "time",

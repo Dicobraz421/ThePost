@@ -21,6 +21,8 @@ use super::session::push;
 use super::tls::serve_conn;
 use super::{Handler, Mode, SessionCtx, reply};
 use crate::config::SmtpConfig;
+use crate::limits::SendLimits;
+use crate::metrics::SmtpMetrics;
 
 /// Зависимости ролей SMTP, выбранные приложением.
 #[derive(Clone)]
@@ -33,6 +35,10 @@ pub struct ServerDeps {
     pub limiter: Option<Arc<RateLimiter>>,
     /// Сертификаты для STARTTLS и неявного TLS.
     pub tls: Option<Arc<TlsCerts>>,
+    /// Лимиты отправки учётной записи в час (submission).
+    pub send_limits: Option<Arc<SendLimits>>,
+    /// Метрики SMTP.
+    pub metrics: Option<Arc<SmtpMetrics>>,
 }
 
 impl fmt::Debug for ServerDeps {
@@ -176,6 +182,9 @@ async fn connection(
             .map(|_| reply(421, [4, 7, 0], "Too many connections from your address"))
     };
     if let Some(r) = refuse {
+        if let Some(m) = &deps.metrics {
+            m.refused(mode);
+        }
         let mut out = Vec::new();
         push(&mut out, &r);
         let _ = conn.stream.write_all(&out).await;
@@ -188,6 +197,9 @@ async fn connection(
         handler: deps.handler,
         sasl: deps.sasl,
         limiter: deps.limiter,
+        send_limits: deps.send_limits,
+        metrics: deps.metrics.clone(),
     };
+    let _session = deps.metrics.as_ref().map(|m| m.session(mode));
     serve_conn(ctx, conn).await;
 }

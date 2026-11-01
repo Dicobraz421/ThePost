@@ -5,6 +5,7 @@ use std::ops::Range;
 use tp_contracts::{Error, Result};
 
 pub mod cache;
+pub mod compress;
 mod config;
 pub mod gc;
 pub mod local;
@@ -15,6 +16,7 @@ mod worker;
 pub mod writer;
 
 pub use cache::{BlobCache, CacheConfig};
+pub use compress::{CompressionConfig, Decompressing};
 pub use gc::{GcConfig, GcMetrics, GcPass, GcWorker};
 pub use local::{LocalConfig, LocalStore};
 pub use orphans::{OrphanConfig, OrphanMetrics, OrphanPass, OrphanSweeper};

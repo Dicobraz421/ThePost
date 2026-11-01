@@ -8,6 +8,12 @@
 //!
 //! Политики — таблица `policies`, одна строка на уровень цепочки ([`PolicyTarget`]); [`PolicyResolver`]
 //! накладывает уровни по порядку ([`Policy::overlay`]).
+//!
+//! «Очистить корзину» (`trash.purge`, решение 2026-11-01-trash-purge): правило администратора — колонки
+//! `trash_purge*` в `policies`, выбор пользователя — `accounts.trash_purge`. Скрытое письмо — строка корзины
+//! с `hidden_at`: остаётся в папке корзины со сроком, но не видно пользователю (`MessageStore`, счётчики папки,
+//! квота); журнал изменений показывает его удалённым. Стирание (`erase`) — после `before_final_delete` вне
+//! транзакции; запрет (Legal Hold) или ошибка хука — скрыть.
 
 use std::time::Duration;
 
@@ -17,12 +23,22 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
 use time::OffsetDateTime;
 use tp_contracts::config::duration;
-use tp_contracts::meta::{AccountScope, MessageStore, Policy, PolicyResolver, QuotaUsage};
-use tp_contracts::retention::{Quota, Restored, TrashItem, TrashObject, TrashStore};
-use tp_contracts::{AccountId, DomainId, Error, MailboxId, MessageId, Result, TenantId};
+use tp_contracts::events::CoreEventKind;
+use tp_contracts::ext::{Decision, DecisionHooks, FinalDelete};
+use tp_contracts::meta::{
+    AccountScope, Inserted, MessageStore, Policy, PolicyResolver, QuotaUsage, SpecialUse,
+};
+use tp_contracts::retention::{
+    PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule,
+    TrashPurgeSetting, TrashStore,
+};
+use tp_contracts::{AccountId, DomainId, Error, MailboxId, MessageId, Result, TenantId, Uid};
 use uuid::Uuid;
 
 use crate::PgMeta;
+use crate::changelog::{self, Change, Op};
+use crate::mailboxes::{alloc_uids, by_role, touch};
+use crate::messages::adjust_refs;
 use crate::schema::{begin, begin_system, db_err, to_i64, to_u32, to_u64};
 
 /// Значения по умолчанию политик хранения (секция `meta.retention`): действуют, когда уровень
@@ -96,6 +112,22 @@ fn from_micros(v: i64) -> Result<Duration> {
     to_u64(v).map(Duration::from_micros)
 }
 
+/// Значение `trash.purge` в БД.
+fn purge_str(mode: TrashPurge) -> &'static str {
+    match mode {
+        TrashPurge::Hide => "hide",
+        TrashPurge::Erase => "erase",
+    }
+}
+
+fn parse_purge(s: &str) -> Result<TrashPurge> {
+    match s {
+        "hide" => Ok(TrashPurge::Hide),
+        "erase" => Ok(TrashPurge::Erase),
+        other => Err(Error::internal(format!("trash.purge: {other}"))),
+    }
+}
+
 #[derive(FromRow)]
 struct PolicyRow {
     level: String,
@@ -106,6 +138,8 @@ struct PolicyRow {
     max_recipients: Option<i64>,
     dkim_selector: Option<String>,
     milter_profile: Option<String>,
+    trash_purge: Option<String>,
+    trash_purge_user_can_choose: Option<bool>,
 }
 
 impl PolicyRow {
@@ -127,12 +161,23 @@ impl PolicyRow {
             max_recipients: self.max_recipients.map(to_u32).transpose()?,
             dkim_selector: self.dkim_selector,
             milter_profile: self.milter_profile,
+            trash_purge: self
+                .trash_purge
+                .as_deref()
+                .map(|mode| {
+                    Ok::<_, Error>(TrashPurgeRule {
+                        mode: parse_purge(mode)?,
+                        user_can_choose: self.trash_purge_user_can_choose.unwrap_or(false),
+                    })
+                })
+                .transpose()?,
         })
     }
 }
 
 const POLICY_COLUMNS: &str = "level, quota_bytes, trash_retention_us, retention_us, send_per_hour, \
-                              max_recipients, dkim_selector, milter_profile";
+                              max_recipients, dkim_selector, milter_profile, trash_purge, \
+                              trash_purge_user_can_choose";
 
 /// Действующая политика в открытой транзакции организации: заданные уровни по порядку цепочки.
 async fn resolve_in(
@@ -199,13 +244,15 @@ impl PgMeta {
         } else {
             sqlx::query(
                 "INSERT INTO policies (tenant_id, level, object_id, quota_bytes, trash_retention_us, retention_us,
-                                       send_per_hour, max_recipients, dkim_selector, milter_profile)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                                       send_per_hour, max_recipients, dkim_selector, milter_profile,
+                                       trash_purge, trash_purge_user_can_choose)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                  ON CONFLICT (tenant_id, level, object_id) DO UPDATE SET
                      quota_bytes = EXCLUDED.quota_bytes, trash_retention_us = EXCLUDED.trash_retention_us,
                      retention_us = EXCLUDED.retention_us, send_per_hour = EXCLUDED.send_per_hour,
                      max_recipients = EXCLUDED.max_recipients, dkim_selector = EXCLUDED.dkim_selector,
-                     milter_profile = EXCLUDED.milter_profile, updated_at = now()",
+                     milter_profile = EXCLUDED.milter_profile, trash_purge = EXCLUDED.trash_purge,
+                     trash_purge_user_can_choose = EXCLUDED.trash_purge_user_can_choose, updated_at = now()",
             )
             .bind(tenant.as_uuid())
             .bind(target.level())
@@ -217,6 +264,8 @@ impl PgMeta {
             .bind(policy.max_recipients.map(i64::from))
             .bind(&policy.dkim_selector)
             .bind(&policy.milter_profile)
+            .bind(policy.trash_purge.map(|r| purge_str(r.mode)))
+            .bind(policy.trash_purge.map(|r| r.user_can_choose))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -241,6 +290,74 @@ impl PolicyResolver for PgMeta {
         tx.commit().await.map_err(db_err)?;
         Ok(p)
     }
+
+    /// Правило — по цепочке «организация → домен → ящик», выбор пользователя — `accounts.trash_purge`.
+    async fn trash_purge(&self, scope: AccountScope) -> Result<TrashPurgeSetting> {
+        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
+            "SELECT domain_id, trash_purge FROM accounts WHERE tenant_id = $1 AND account_id = $2",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let (domain, user) = row.ok_or(Error::NotFound)?;
+        let rule = account_rule(&mut tx, scope, domain).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(TrashPurgeSetting {
+            rule,
+            user: user.as_deref().map(parse_purge).transpose()?,
+        })
+    }
+
+    async fn set_user_trash_purge(
+        &self,
+        scope: AccountScope,
+        mode: Option<TrashPurge>,
+    ) -> Result<()> {
+        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let domain: Option<Uuid> = sqlx::query_scalar(
+            "SELECT domain_id FROM accounts WHERE tenant_id = $1 AND account_id = $2 FOR UPDATE",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let domain = domain.ok_or(Error::NotFound)?;
+        if mode.is_some() && !account_rule(&mut tx, scope, domain).await?.user_can_choose {
+            return Err(Error::Forbidden);
+        }
+        sqlx::query(
+            "UPDATE accounts SET trash_purge = $3 WHERE tenant_id = $1 AND account_id = $2",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(mode.map(purge_str))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+}
+
+/// Действующее правило `trash.purge` учётной записи домена `domain`; не задано — `TrashPurgeRule::default()`.
+async fn account_rule(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    domain: Uuid,
+) -> Result<TrashPurgeRule> {
+    let policy = resolve_in(
+        tx,
+        scope.tenant,
+        Some(DomainId::from_uuid(domain)),
+        Some(scope.account),
+        None,
+    )
+    .await?;
+    Ok(policy.trash_purge.unwrap_or_default())
 }
 
 // ---------- Корзина ----------
@@ -295,6 +412,223 @@ fn limit_arg(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
+/// Элементы корзины учётной записи: видимые или скрытые, новые первыми.
+async fn trash_page(
+    meta: &PgMeta,
+    scope: AccountScope,
+    hidden: bool,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<TrashItem>> {
+    let mut tx = begin(&meta.pool, scope.tenant).await?;
+    let rows: Vec<TrashRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {TRASH_COLUMNS} FROM messages
+         WHERE tenant_id = $1 AND account_id = $2 AND trashed_at IS NOT NULL AND (hidden_at IS NOT NULL) = $5
+         ORDER BY trashed_at DESC, message_id DESC OFFSET $3 LIMIT $4"
+    )))
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(limit_arg(offset))
+    .bind(limit_arg(limit))
+    .bind(hidden)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    rows.into_iter().map(TrashItem::try_from).collect()
+}
+
+/// Письмо, видимое в корзине: кандидат «очистить корзину».
+#[derive(FromRow)]
+struct PurgeRow {
+    message_id: Uuid,
+    trashed_from: Option<Uuid>,
+    received_at: OffsetDateTime,
+}
+
+/// Убранное из корзины письмо: идентификатор, папка, UID.
+type Removed = (Uuid, Uuid, i64);
+
+impl PgMeta {
+    /// Скрывает `hide` и стирает `erase` (письма, всё ещё видимые в корзине) одним изменением `ModSeq`.
+    async fn apply_purge(
+        &self,
+        scope: AccountScope,
+        hide: &[Uuid],
+        erase: &[Uuid],
+    ) -> Result<PurgeOutcome> {
+        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let current = changelog::lock_modseq(&mut tx, scope).await?;
+        // Под блокировкой `ModSeq` учётной записи: восстановленные и уже скрытые параллельно пропускаются.
+        let still: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT message_id FROM messages
+             WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
+               AND trashed_at IS NOT NULL AND hidden_at IS NULL",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind([hide, erase].concat())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let keep = |ids: &[Uuid]| -> Vec<Uuid> {
+            ids.iter()
+                .copied()
+                .filter(|id| still.contains(id))
+                .collect()
+        };
+        let (hide, erase) = (keep(hide), keep(erase));
+        if hide.is_empty() && erase.is_empty() {
+            tx.commit().await.map_err(db_err)?;
+            return Ok(PurgeOutcome {
+                hidden: Vec::new(),
+                erased: Vec::new(),
+                modseq: current,
+            });
+        }
+        let ms = changelog::bump_modseq(&mut tx, scope).await?;
+        let hidden: Vec<Removed> = sqlx::query_as(
+            "UPDATE messages SET hidden_at = now(), modseq = $4
+             WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
+             RETURNING message_id, mailbox_id, uid",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(&hide)
+        .bind(to_i64(ms.0)?)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        adjust_refs(&mut tx, scope, &erase, -1).await?;
+        let erased: Vec<Removed> = sqlx::query_as(
+            "DELETE FROM messages WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
+             RETURNING message_id, mailbox_id, uid",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(&erase)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let mut boxes: Vec<Uuid> = hidden.iter().chain(&erased).map(|r| r.1).collect();
+        boxes.sort_unstable();
+        boxes.dedup();
+        touch(&mut tx, scope, ms, &boxes).await?;
+        let mut changes = Vec::with_capacity(hidden.len() + erased.len() + boxes.len());
+        let mut events = Vec::with_capacity(hidden.len() + erased.len());
+        for (rows, purged) in [(&hidden, false), (&erased, true)] {
+            for (id, mb, uid) in rows {
+                let mailbox = MailboxId::from_uuid(*mb);
+                changes.push(Change::message(
+                    *id,
+                    Op::Destroyed,
+                    mailbox,
+                    Uid(to_u32(*uid)?),
+                ));
+                let message = MessageId::from_uuid(*id);
+                let kind = if purged {
+                    CoreEventKind::Purged { message }
+                } else {
+                    CoreEventKind::Trashed { message }
+                };
+                events.push(changelog::event(scope, Some(mailbox), kind));
+            }
+        }
+        changes.extend(
+            boxes
+                .iter()
+                .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
+        );
+        changelog::log(&mut tx, scope, ms, &changes).await?;
+        changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
+        tx.commit().await.map_err(db_err)?;
+        // Порядок — как в запросе.
+        let done = |ids: Vec<Uuid>, rows: &[Removed]| -> Vec<MessageId> {
+            ids.into_iter()
+                .filter(|id| rows.iter().any(|r| r.0 == *id))
+                .map(MessageId::from_uuid)
+                .collect()
+        };
+        Ok(PurgeOutcome {
+            hidden: done(hide, &hidden),
+            erased: done(erase, &erased),
+            modseq: ms,
+        })
+    }
+
+    /// Восстанавливает скрытое письмо (администратор): в исходную папку, её нет — во «Входящие»; тот же
+    /// `MessageId`, новый UID. Для пользователя письмо появляется вновь (журнал — создание). Скрытого нет — `None`.
+    async fn restore_hidden(&self, scope: AccountScope, id: MessageId) -> Result<Option<Restored>> {
+        let mut tx = begin(&self.pool, scope.tenant).await?;
+        changelog::lock_modseq(&mut tx, scope).await?;
+        let target: Option<(Option<Uuid>,)> = sqlx::query_as(
+            "SELECT mb.mailbox_id FROM messages m
+             LEFT JOIN mailboxes mb ON mb.tenant_id = m.tenant_id AND mb.account_id = m.account_id
+                                   AND mb.mailbox_id = m.trashed_from
+             WHERE m.tenant_id = $1 AND m.account_id = $2 AND m.message_id = $3 AND m.hidden_at IS NOT NULL",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some((target,)) = target else {
+            tx.commit().await.map_err(db_err)?;
+            return Ok(None);
+        };
+        let trash = by_role(&mut tx, scope, SpecialUse::Trash)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let to = match target {
+            Some(mb) => MailboxId::from_uuid(mb),
+            None => by_role(&mut tx, scope, SpecialUse::Inbox)
+                .await?
+                .ok_or(Error::NotFound)?,
+        };
+        let ms = changelog::bump_modseq(&mut tx, scope).await?;
+        let uid = alloc_uids(&mut tx, scope, to, 1, ms).await?;
+        sqlx::query(
+            "UPDATE messages SET mailbox_id = $4, uid = $5, modseq = $6, trashed_from = NULL, trashed_at = NULL,
+                                 trash_expires_at = NULL, hidden_at = NULL
+             WHERE tenant_id = $1 AND account_id = $2 AND message_id = $3",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(id.as_uuid())
+        .bind(to.as_uuid())
+        .bind(i64::from(uid.0))
+        .bind(to_i64(ms.0)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let changes = [
+            Change::message(*id.as_uuid(), Op::Created, to, uid),
+            Change::mailbox(to, Op::Updated),
+        ];
+        changelog::log(&mut tx, scope, ms, &changes).await?;
+        let ev = changelog::event(
+            scope,
+            Some(to),
+            CoreEventKind::Moved {
+                from_message: id,
+                from_mailbox: trash,
+                message: id,
+            },
+        );
+        changelog::append_events(&mut tx, self.cfg.event_partitions, &[ev]).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(Restored::Message {
+            mailbox: to,
+            inserted: Inserted {
+                id,
+                uid,
+                modseq: ms,
+            },
+        }))
+    }
+}
+
 #[async_trait]
 impl TrashStore for PgMeta {
     async fn list(
@@ -303,25 +637,71 @@ impl TrashStore for PgMeta {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<TrashItem>> {
+        trash_page(self, scope, false, offset, limit).await
+    }
+
+    async fn list_hidden(
+        &self,
+        scope: AccountScope,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<TrashItem>> {
+        trash_page(self, scope, true, offset, limit).await
+    }
+
+    async fn purge(
+        &self,
+        scope: AccountScope,
+        ids: &[MessageId],
+        hooks: &DecisionHooks,
+    ) -> Result<PurgeOutcome> {
+        let mode = PolicyResolver::trash_purge(self, scope).await?.effective();
+        // Письма, видимые в корзине, в порядке `ids` без повторов.
         let mut tx = begin(&self.pool, scope.tenant).await?;
-        let rows: Vec<TrashRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT {TRASH_COLUMNS} FROM messages
-             WHERE tenant_id = $1 AND account_id = $2 AND trashed_at IS NOT NULL
-             ORDER BY trashed_at DESC, message_id DESC OFFSET $3 LIMIT $4"
-        )))
+        let rows: Vec<PurgeRow> = sqlx::query_as(
+            "SELECT m.message_id, m.trashed_from, m.received_at
+             FROM (SELECT id, min(ord) AS ord FROM unnest($3::uuid[]) WITH ORDINALITY AS d(id, ord) GROUP BY id) d
+             JOIN messages m ON m.tenant_id = $1 AND m.account_id = $2 AND m.message_id = d.id
+             WHERE m.trashed_at IS NOT NULL AND m.hidden_at IS NULL
+             ORDER BY d.ord",
+        )
         .bind(scope.tenant.as_uuid())
         .bind(scope.account.as_uuid())
-        .bind(limit_arg(offset))
-        .bind(limit_arg(limit))
+        .bind(ids.iter().map(|i| *i.as_uuid()).collect::<Vec<_>>())
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        rows.into_iter().map(TrashItem::try_from).collect()
+        // Точки принятия решений — вне транзакции БД.
+        let (mut hide, mut erase) = (Vec::new(), Vec::new());
+        for r in rows {
+            let allowed = match (mode, r.trashed_from) {
+                (TrashPurge::Erase, Some(origin)) => {
+                    let op = FinalDelete {
+                        scope,
+                        mailbox: MailboxId::from_uuid(origin),
+                        message: MessageId::from_uuid(r.message_id),
+                        received_at: r.received_at,
+                    };
+                    // Запрет (Legal Hold) и ошибка точки принятия решений — скрыть: стирание необратимо.
+                    matches!(hooks.before_final_delete(&op).await, Ok(Decision::Allow))
+                }
+                _ => false,
+            };
+            if allowed {
+                erase.push(r.message_id);
+            } else {
+                hide.push(r.message_id);
+            }
+        }
+        self.apply_purge(scope, &hide, &erase).await
     }
 
     async fn restore(&self, scope: AccountScope, object: TrashObject) -> Result<Restored> {
         let id = message_of(object)?;
+        if let Some(restored) = self.restore_hidden(scope, id).await? {
+            return Ok(restored);
+        }
         // Письмо не в корзине (в том числе восстановлено параллельно) — элемента нет.
         let inserted = match MessageStore::restore(self, scope, &[id]).await {
             Err(Error::Invalid(_)) => return Err(Error::NotFound),
@@ -389,7 +769,7 @@ impl TrashStore for PgMeta {
 
 #[async_trait]
 impl Quota for PgMeta {
-    /// Использование — сумма размеров писем учётной записи, включая корзину; лимит — политика
+    /// Использование — сумма размеров писем учётной записи, включая корзину, без скрытых; лимит — политика
     /// учётной записи по цепочке, иначе [`RetentionConfig::quota_bytes`].
     async fn usage(&self, scope: AccountScope) -> Result<QuotaUsage> {
         let mut tx = begin(&self.pool, scope.tenant).await?;
@@ -397,6 +777,7 @@ impl Quota for PgMeta {
             "SELECT a.domain_id, coalesce(sum(m.size), 0)::bigint, count(m.message_id)
              FROM accounts a
              LEFT JOIN messages m ON m.tenant_id = a.tenant_id AND m.account_id = a.account_id
+                                 AND m.hidden_at IS NULL
              WHERE a.tenant_id = $1 AND a.account_id = $2
              GROUP BY a.domain_id",
         )
@@ -458,6 +839,8 @@ mod tests {
             max_recipients: None,
             dkim_selector: None,
             milter_profile: None,
+            trash_purge: None,
+            trash_purge_user_can_choose: None,
         };
         let ranks: Vec<u8> = ["tenant", "domain", "account", "mailbox"]
             .iter()
@@ -465,5 +848,13 @@ mod tests {
             .collect();
         assert_eq!(ranks, [0, 1, 2, 3]);
         assert_eq!(PolicyTarget::Tenant.object(t), *t.as_uuid());
+    }
+
+    #[test]
+    fn trash_purge_values() {
+        for mode in [TrashPurge::Hide, TrashPurge::Erase] {
+            assert_eq!(parse_purge(purge_str(mode)).expect("parse"), mode);
+        }
+        assert!(parse_purge("keep").is_err());
     }
 }

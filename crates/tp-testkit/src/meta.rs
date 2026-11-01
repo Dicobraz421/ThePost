@@ -4,7 +4,8 @@
 //! `to_trash` и `restore` сохраняют `MessageId` (меняются папка и UID), `copy` и `move_to` создают новые.
 //! Изменяющая операция сначала проверяет все условия, затем меняет состояние под одной блокировкой:
 //! журнал изменений, события ядра ([`MemEventLog`]) и ссылки на объекты ([`MemBlobIndex`], если подключён)
-//! меняются вместе с данными.
+//! меняются вместе с данными. Скрытые письма корзины (`TrashStore::purge`, `hide`) лежат отдельно от писем
+//! учётной записи: операции `MessageStore`, счётчики папок и квота их не видят.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
@@ -19,6 +20,7 @@ use tp_contracts::meta::{
     FlagsUpdate, Inserted, Mailbox, MailboxStatus, MailboxStore, Message, MessageChange,
     MessageQuery, MessageStore, NewMailbox, NewMessage, QuotaUsage, SpecialUse,
 };
+use tp_contracts::retention::{PurgeOutcome, Restored};
 use tp_contracts::{
     AccountId, BlobKey, DomainId, Error, MailboxId, MessageId, ModSeq, Result, TenantId, Uid,
     UidValidity,
@@ -91,6 +93,8 @@ pub(crate) struct TrashRow {
     pub(crate) origin: MailboxId,
     pub(crate) deleted_at: OffsetDateTime,
     pub(crate) expires_at: OffsetDateTime,
+    /// Скрыто пользователем (`TrashStore::purge`, `hide`).
+    pub(crate) hidden: bool,
 }
 
 /// Изменения вне данных учётной записи, применяемые вместе с ней.
@@ -107,6 +111,8 @@ struct AccountData {
     uid_validity_last: u32,
     mailboxes: BTreeMap<MailboxId, MailboxRow>,
     messages: HashMap<MessageId, MessageRow>,
+    /// Скрытые письма корзины: не видны пользователю, не в квоте; `trashed` задан.
+    hidden: HashMap<MessageId, MessageRow>,
     msg_log: Vec<MsgLog>,
     mbx_log: Vec<(ModSeq, MailboxId, Op)>,
     /// Журнал старше этого состояния удалён: `since` меньше — `Conflict`.
@@ -514,18 +520,135 @@ impl MemMetadata {
             .filter(|(k, _)| scope.is_none_or(|s| (s.tenant, s.account) == **k))
             .flat_map(|(&(tenant, account), acc)| {
                 let trash = acc.by_role(SpecialUse::Trash).ok();
-                acc.messages.values().filter_map(move |row| {
+                let row_of = move |row: &MessageRow, hidden: bool| {
                     let t = row.trashed?;
-                    (Some(row.message.mailbox) == trash).then(|| TrashRow {
+                    (hidden || Some(row.message.mailbox) == trash).then(|| TrashRow {
                         scope: AccountScope { tenant, account },
                         message: row.message.clone(),
                         origin: t.from,
                         deleted_at: t.deleted_at,
                         expires_at: t.expires_at,
+                        hidden,
                     })
-                })
+                };
+                acc.messages
+                    .values()
+                    .filter_map(move |row| row_of(row, false))
+                    .chain(acc.hidden.values().filter_map(move |row| row_of(row, true)))
             })
             .collect()
+    }
+
+    /// Скрывает (`hide`) и стирает (`erase`) письма, видимые в корзине `scope`, одним изменением (`ModSeq`);
+    /// остальные пропускает. Скрытое уходит из писем учётной записи: журнал — удаление из корзины, событие `Trashed`.
+    pub(crate) fn purge_trash(
+        &self,
+        scope: AccountScope,
+        hide: &[MessageId],
+        erase: &[MessageId],
+    ) -> Result<PurgeOutcome> {
+        self.with_account(scope, |acc, fx| {
+            let trash = acc.by_role(SpecialUse::Trash)?;
+            let visible = |acc: &AccountData, ids: &[MessageId]| -> Vec<MessageId> {
+                acc.existing(ids)
+                    .into_iter()
+                    .filter(|id| {
+                        let row = &acc.messages[id];
+                        row.message.mailbox == trash && row.trashed.is_some()
+                    })
+                    .collect()
+            };
+            let hidden = visible(acc, hide);
+            let erased: Vec<_> = visible(acc, erase)
+                .into_iter()
+                .filter(|id| !hidden.contains(id))
+                .collect();
+            if hidden.is_empty() && erased.is_empty() {
+                return Ok(PurgeOutcome {
+                    hidden,
+                    erased,
+                    modseq: acc.modseq,
+                });
+            }
+            let ms = acc.bump();
+            for id in &hidden {
+                if let Some(row) = acc.messages.remove(id) {
+                    acc.msg_log.push(MsgLog {
+                        modseq: ms,
+                        id: *id,
+                        op: Op::Destroyed,
+                        mailbox: trash,
+                        uid: row.message.uid,
+                        from: None,
+                    });
+                    acc.hidden.insert(*id, row);
+                    fx.events
+                        .push((Some(trash), CoreEventKind::Trashed { message: *id }));
+                }
+            }
+            for id in &erased {
+                if let Some(m) = acc.remove(ms, *id) {
+                    fx.refs.extend(blob_keys(&m).map(|k| (k, -1)));
+                    fx.events
+                        .push((Some(trash), CoreEventKind::Purged { message: *id }));
+                }
+            }
+            acc.touch(ms, [trash]);
+            Ok(PurgeOutcome {
+                hidden,
+                erased,
+                modseq: ms,
+            })
+        })
+    }
+
+    /// Восстанавливает скрытое письмо в исходную папку (её нет — во «Входящие») с тем же `MessageId`
+    /// и новым UID; скрытого письма нет — `NotFound`.
+    pub(crate) fn restore_hidden(&self, scope: AccountScope, id: MessageId) -> Result<Restored> {
+        self.with_account(scope, |acc, fx| {
+            let trash = acc.by_role(SpecialUse::Trash)?;
+            let inbox = acc.by_role(SpecialUse::Inbox)?;
+            let row = acc.hidden.get(&id).ok_or(Error::NotFound)?;
+            let to = row
+                .trashed
+                .map(|t| t.from)
+                .filter(|m| acc.mailboxes.contains_key(m))
+                .unwrap_or(inbox);
+            acc.check_uids(to, 1)?;
+            let ms = acc.bump();
+            let uid = acc.alloc_uid(to)?;
+            let mut row = acc.hidden.remove(&id).ok_or(Error::NotFound)?;
+            row.trashed = None;
+            row.message.mailbox = to;
+            row.message.uid = uid;
+            row.message.modseq = ms;
+            acc.messages.insert(id, row);
+            acc.msg_log.push(MsgLog {
+                modseq: ms,
+                id,
+                op: Op::Created,
+                mailbox: to,
+                uid,
+                from: None,
+            });
+            acc.touch(ms, [to]);
+            fx.events.push((
+                Some(to),
+                CoreEventKind::Moved {
+                    from_message: id,
+                    from_mailbox: trash,
+                    message: id,
+                },
+            ));
+            Ok(Restored::Message {
+                mailbox: to,
+                inserted: Inserted {
+                    id,
+                    uid,
+                    modseq: ms,
+                },
+            })
+        })
     }
 
     /// Переносит срок окончательного удаления письма в корзине; письма в корзине нет — `NotFound`.
@@ -541,11 +664,11 @@ impl MemMetadata {
             .get_mut(&(scope.tenant, scope.account))
             .ok_or(Error::NotFound)?;
         let trash = acc.by_role(SpecialUse::Trash)?;
-        let row = acc
-            .messages
-            .get_mut(&id)
-            .filter(|r| r.message.mailbox == trash)
-            .ok_or(Error::NotFound)?;
+        let row = match acc.messages.get_mut(&id) {
+            Some(r) => Some(r).filter(|r| r.message.mailbox == trash),
+            None => acc.hidden.get_mut(&id),
+        }
+        .ok_or(Error::NotFound)?;
         let t = row.trashed.as_mut().ok_or(Error::NotFound)?;
         t.expires_at = until;
         Ok(())
@@ -690,6 +813,7 @@ impl AccountStore for MemMetadata {
             uid_validity_last: 0,
             mailboxes: BTreeMap::new(),
             messages: HashMap::new(),
+            hidden: HashMap::new(),
             msg_log: Vec::new(),
             mbx_log: Vec::new(),
             floor: ModSeq::ZERO,
@@ -1176,7 +1300,15 @@ impl MessageStore for MemMetadata {
     async fn expunge_final(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
         self.with_account(scope, |acc, fx| {
             // Только письма в корзине: восстановленные после `TrashStore::expired` и прочие пропускаются.
+            // Скрытые пользователь уже не видит: удаляются без записи в журнал изменений.
             let trash = acc.by_role(SpecialUse::Trash).ok();
+            for id in ids {
+                if let Some(row) = acc.hidden.remove(id) {
+                    fx.refs.extend(blob_keys(&row.message).map(|k| (k, -1)));
+                    fx.events
+                        .push((trash, CoreEventKind::Purged { message: *id }));
+                }
+            }
             let src: Vec<_> = acc
                 .existing(ids)
                 .into_iter()

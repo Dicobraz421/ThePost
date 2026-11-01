@@ -7,6 +7,7 @@
 //! текстом до рукопожатия, не исполняются после него (RFC 3207, 4.2).
 
 use std::io;
+use std::time::Instant;
 
 use bytes::Bytes;
 use smtp_proto::request::receiver::{
@@ -23,6 +24,7 @@ use tp_contracts::auth::Principal;
 use tp_platform::ConnInfo;
 
 use super::{Envelope, Mode, Reply, SessionCtx, is_positive, next_id, reply};
+use crate::limits::SendLimits;
 
 /// Чем закончилась работа сессии над потоком.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +349,20 @@ impl Session {
             push(out, &r);
             return;
         }
+        if let Some((l, account)) = self.send_account()
+            && !l.allow_message_at(&self.ctx.config.limits, account, Instant::now())
+        {
+            self.limited("messages");
+            push(
+                out,
+                &reply(
+                    451,
+                    [4, 7, 1],
+                    "Hourly message limit exceeded, try again later",
+                ),
+            );
+            return;
+        }
         self.tx = Some(Tx {
             mail_from: from.address,
             rcpts: Vec::new(),
@@ -373,6 +389,24 @@ impl Session {
         }
         if tx.rcpts.len() >= self.ctx.config.limits.max_recipients {
             return push(out, &reply(452, [4, 5, 3], "Too many recipients"));
+        }
+        if let Some((l, account)) = self.send_account()
+            && !l.allow_rcpts_at(
+                &self.ctx.config.limits,
+                account,
+                tx.rcpts.len() + 1,
+                Instant::now(),
+            )
+        {
+            self.limited("recipients");
+            return push(
+                out,
+                &reply(
+                    452,
+                    [4, 5, 3],
+                    "Hourly recipient limit exceeded, try again later",
+                ),
+            );
         }
         let env = self.envelope(tx);
         let r = self.ctx.handler.rcpt(&env, &address).await;
@@ -495,6 +529,18 @@ impl Session {
         };
         let env = self.envelope(&tx);
         let r = self.ctx.handler.data(&env, Bytes::from(tx.body)).await;
+        let accepted = is_positive(&r);
+        if let Some(m) = &self.ctx.metrics {
+            m.message(env.mode, accepted);
+        }
+        if accepted && let Some((l, account)) = self.send_account() {
+            l.record_at(
+                &self.ctx.config.limits,
+                account,
+                env.rcpts.len(),
+                Instant::now(),
+            );
+        }
         tracing::info!(
             id = %env.id,
             role = env.mode.name(),
@@ -504,6 +550,19 @@ impl Session {
             "smtp: письмо"
         );
         r
+    }
+
+    /// Лимиты отправки и учётная запись (submission после AUTH).
+    fn send_account(&self) -> Option<(&SendLimits, &str)> {
+        let limits = self.ctx.send_limits.as_deref()?;
+        let p = self.principal.as_ref()?;
+        Some((limits, p.login.as_str()))
+    }
+
+    fn limited(&self, kind: &'static str) {
+        if let Some(m) = &self.ctx.metrics {
+            m.limited(kind);
+        }
     }
 
     fn starttls(&mut self, out: &mut Vec<u8>) {

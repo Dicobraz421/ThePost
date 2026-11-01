@@ -209,7 +209,7 @@ impl Store {
         let now = OffsetDateTime::now_utc();
         let raw = warning_letter(&self.cfg.quota.from, threshold, used, limit, now);
         let chunk: Result<bytes::Bytes> = Ok(bytes::Bytes::from(raw));
-        self.ingest_inner(
+        self.ingest_impl(
             IngestRequest {
                 tenant: scope.tenant,
                 mail_from: String::new(),
@@ -348,6 +348,7 @@ fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use futures::TryStreamExt;
+    use time::OffsetDateTime;
     use tp_contracts::Error;
     use tp_contracts::mailstore::{Delivery, IngestRequest, Ingested, MailStore};
     use tp_contracts::meta::{
@@ -669,6 +670,34 @@ mod tests {
         f.env.quota.set_default_limit(Some(2 * f.size()));
         f.env.store.copy(f.scope, &[a], to).await.expect("copy");
         assert_eq!(f.warnings(to).await, ["Почтовый ящик заполнен на 95 %"]);
+    }
+
+    #[tokio::test]
+    async fn append_checks_quota_and_warns() {
+        let f = fixture_with(Env::with_config(no_interval(), true)).await;
+        let sent = f
+            .env
+            .meta
+            .mailbox_by_role(f.scope, SpecialUse::Sent)
+            .expect("sent");
+        f.env
+            .quota
+            .set_default_limit(Some(f.size() + f.size() / 10));
+        let append = || {
+            f.env.store.append(
+                f.scope,
+                sent,
+                stream(&f.raw, 4096),
+                Flags::new(),
+                OffsetDateTime::now_utc(),
+            )
+        };
+        append().await.expect("append");
+        assert_eq!(
+            f.warnings(f.inbox).await,
+            ["Почтовый ящик заполнен на 80 %"]
+        );
+        assert_eq!(append().await, Err(Error::QuotaExceeded));
     }
 
     #[tokio::test]
