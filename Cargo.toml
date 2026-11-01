@@ -99,6 +99,8 @@ thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["serde"] }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = "0.26.6"
+# Клиент WebSocket для тестов JMAP push (RFC 8887); та же версия, что у axum (фича `ws`).
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
 tokio-util = "0.7.20"
 tower = "0.5.3"
 tracing = "0.1.44"
