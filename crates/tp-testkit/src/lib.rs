@@ -14,6 +14,7 @@ pub mod infra;
 pub mod load;
 pub mod membership;
 pub mod meta;
+pub mod policies;
 pub mod secrets;
 pub mod suite;
 
@@ -31,4 +32,5 @@ pub use infra::{Clock, ManualClock, MemEventBus, MemEventLog, MemLease, SystemCl
 pub use load::MemLoadMonitor;
 pub use membership::MemMembership;
 pub use meta::MemMetadata;
+pub use policies::{MemPolicies, PolicyLevel};
 pub use secrets::MemSecretStore;

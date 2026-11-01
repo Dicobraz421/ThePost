@@ -31,6 +31,7 @@ use crate::config::{QueueConfig, SmtpConfig};
 use crate::deliver::Outbound;
 use crate::dkim_sign::DkimSign;
 use crate::dsn::{self, DsnSink};
+use crate::metrics::{RcptOutcome, SmtpMetrics};
 
 pub mod send;
 
@@ -249,6 +250,7 @@ pub struct QueueWorker {
     transport: Arc<dyn Transport>,
     hostname: String,
     dsn: Arc<dyn DsnSink>,
+    metrics: Option<Arc<SmtpMetrics>>,
 }
 
 impl fmt::Debug for QueueWorker {
@@ -271,7 +273,14 @@ impl QueueWorker {
             deps,
             transport,
             hostname: hostname.into(),
+            metrics: None,
         }
+    }
+
+    /// Метрики очереди (SMTP-11).
+    pub fn with_metrics(mut self, metrics: Arc<SmtpMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Куда отправлять уведомления о доставке (по умолчанию — в эту же очередь; локальному отправителю
@@ -290,10 +299,17 @@ impl QueueWorker {
             .claim(now, cfg.batch.max(1), cfg.lease)
             .await?;
         let n = claimed.len();
+        if let Some(m) = &self.metrics {
+            m.claimed(n);
+        }
         futures::stream::iter(claimed)
             .for_each_concurrent(cfg.concurrency.max(1), |c| async move {
                 let id = c.claim.id;
-                match self.process(cfg, c).await {
+                let m = self.metrics.as_deref();
+                m.inspect(|m| m.inflight(1));
+                let res = self.process(cfg, c).await;
+                m.inspect(|m| m.inflight(-1));
+                match res {
                     Ok(()) => {}
                     Err(Error::Conflict) => {
                         tracing::info!(%id, "smtp: захват записи очереди устарел, запись у другого узла");
@@ -381,6 +397,15 @@ impl QueueWorker {
         let mut delayed = Vec::new();
         let mut delivered = Vec::new();
         for (r, res) in outcome {
+            if let Some(m) = &self.metrics {
+                let kind = match &res {
+                    RcptResult::Delivered(_) => RcptOutcome::Delivered,
+                    RcptResult::Permanent(_) => RcptOutcome::Failed,
+                    RcptResult::Temporary(_) if expired => RcptOutcome::Failed,
+                    RcptResult::Temporary(_) => RcptOutcome::Deferred,
+                };
+                m.rcpt(kind, age.as_seconds_f64());
+            }
             let address = r.rcpt.address.as_str();
             let notify = r.rcpt.notify.unwrap_or(DsnNotify {
                 success: false,

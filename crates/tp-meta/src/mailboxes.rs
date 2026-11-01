@@ -229,7 +229,7 @@ pub(crate) async fn relocate(
                       WHERE m.tenant_id = $1 AND m.account_id = $2)
          UPDATE messages m SET mailbox_id = $4, uid = $5 + src.ord - 1, modseq = $6,
                                trashed_from = CASE WHEN $7 THEN old.mailbox_id END,
-                               trashed_at = CASE WHEN $7 THEN now() END,
+                               trashed_at = CASE WHEN $7 THEN now() END, hidden_at = NULL,
                                trash_expires_at = CASE WHEN $7 THEN now() + coalesce(
                                    tp_trash_retention_us(m.tenant_id, m.account_id, old.mailbox_id), $8
                                ) * interval '1 microsecond' END
@@ -435,7 +435,7 @@ impl MailboxStore for PgMeta {
         // Письма — в корзину (SRS 4.7); восстановление без исходной папки — во «Входящие».
         let ids: Vec<Uuid> = sqlx::query_scalar(
             "SELECT message_id FROM messages
-             WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = ANY($3)
+             WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = ANY($3) AND hidden_at IS NULL
              ORDER BY array_position($3, mailbox_id), uid",
         )
         .bind(scope.tenant.as_uuid())
@@ -531,7 +531,7 @@ impl MailboxStore for PgMeta {
                                    coalesce(sum(m.size), 0)::bigint AS size
                             FROM messages m
                             WHERE m.tenant_id = mb.tenant_id AND m.account_id = mb.account_id
-                              AND m.mailbox_id = mb.mailbox_id) s
+                              AND m.mailbox_id = mb.mailbox_id AND m.hidden_at IS NULL) s
               WHERE mb.tenant_id = $1 AND mb.account_id = $2 AND mb.mailbox_id = $3",
         )
         .bind(scope.tenant.as_uuid())

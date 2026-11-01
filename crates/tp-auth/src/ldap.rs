@@ -27,8 +27,15 @@
 //! groups:
 //!   filter: (&(objectClass=group)(mail=*))
 //!   id: objectGUID
+//!   moderators: msExchModeratedByLink
+//!   senders: [authOrig, dLMemSubmitPerms]
+//!   internal_only: { attribute: msExchRequireAuthToSendTo, value: "TRUE" }
+//!   hidden: { attribute: msExchHideFromAddressLists, value: "TRUE" }
 //! domains: [{ name: corp.example, default: true }]
 //! ```
+//!
+//! Группы рассылки из каталога — [`GroupSync`] (AUTH-07): участники, вложенность, ограничения отправителей,
+//! модераторы и скрытие из GAL по сопоставлению [`GroupMap`] в [`GroupStore`](tp_contracts::groups::GroupStore).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -55,6 +62,10 @@ use tp_contracts::{Error, Result, TenantId};
 
 use crate::{GroupSource, check_channel, plaintext_warning};
 
+mod sync;
+
+pub use sync::{GroupSync, GroupSyncReport};
+
 /// Контроль Active Directory «Show Deleted»: выдача удалённых записей (надгробий).
 const SHOW_DELETED: &str = "1.2.840.113556.1.4.417";
 /// Код результата LDAP `noSuchObject`: базы поиска нет — пустой результат.
@@ -75,19 +86,34 @@ pub enum SyncMode {
     Usn,
 }
 
-/// Признак отключённой учётной записи.
+/// Признак записи по атрибуту: отключённая учётная запись, скрытая группа и т. п. Задаётся ровно одно из
+/// `value`, `flag`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct DisabledRule {
-    /// Атрибут (`nsAccountLock`, `userAccountControl`).
+pub struct FlagRule {
+    /// Атрибут (`nsAccountLock`, `userAccountControl`, `msExchHideFromAddressLists`).
     pub attribute: String,
-    /// Запись отключена, если значение равно этому (без учёта регистра), например `TRUE`.
+    /// Признак есть, если значение равно этому (без учёта регистра), например `TRUE`.
     #[serde(default)]
     pub value: Option<String>,
-    /// Запись отключена, если в числовом значении установлен бит (`2` — ACCOUNTDISABLE в AD).
+    /// Признак есть, если в числовом значении установлен бит (`2` — ACCOUNTDISABLE в AD).
     #[serde(default)]
     pub flag: Option<u64>,
 }
+
+impl FlagRule {
+    fn check(&self, what: &str) -> Result<()> {
+        if self.value.is_some() == self.flag.is_some() {
+            return Err(Error::invalid(format!(
+                "LDAP: {what} needs exactly one of value, flag"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Признак отключённой учётной записи (прежнее имя [`FlagRule`]).
+pub type DisabledRule = FlagRule;
 
 /// Сопоставление учётных записей.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -107,7 +133,7 @@ pub struct AccountMap {
     /// снимается, значения без `@` и с другими префиксами (`X500:`, `SIP:`) пропускаются.
     pub emails: Vec<String>,
     /// Признак отключённой записи; не задан — все записи включены.
-    pub disabled: Option<DisabledRule>,
+    pub disabled: Option<FlagRule>,
     /// Атрибуты адресной книги (GAL): имя в The Post → атрибут LDAP.
     pub gal: BTreeMap<String, String>,
     /// Фильтр удалённых записей (режим USN; у надгробий AD остаются `objectClass` и идентификатор).
@@ -148,6 +174,15 @@ pub struct GroupMap {
     pub member: String,
     /// Фильтр удалённых групп (режим USN).
     pub deleted_filter: String,
+    /// Атрибут с DN модераторов (AD `msExchModeratedByLink`); не задан — модераторы задаются через Admin API.
+    pub moderators: Option<String>,
+    /// Атрибуты с DN разрешённых отправителей — учётных записей и групп (AD `authOrig`, `dLMemSubmitPerms`).
+    /// Есть значения — писать могут только они; пусто и нет `internal_only` — ограничение задаётся через Admin API.
+    pub senders: Vec<String>,
+    /// Признак «только отправители организации» (AD `msExchRequireAuthToSendTo: TRUE`).
+    pub internal_only: Option<FlagRule>,
+    /// Признак скрытия из адресной книги (AD `msExchHideFromAddressLists: TRUE`); не задан — через Admin API.
+    pub hidden: Option<FlagRule>,
 }
 
 impl Default for GroupMap {
@@ -160,6 +195,10 @@ impl Default for GroupMap {
             email: "mail".into(),
             member: "member".into(),
             deleted_filter: "(objectClass=group)".into(),
+            moderators: None,
+            senders: Vec::new(),
+            internal_only: None,
+            hidden: None,
         }
     }
 }
@@ -272,12 +311,14 @@ impl LdapConfig {
         if self.page_size == 0 || i32::try_from(self.page_size).is_err() {
             return Err(Error::invalid("LDAP: invalid page_size"));
         }
-        if let Some(d) = &self.accounts.disabled
-            && d.value.is_some() == d.flag.is_some()
-        {
-            return Err(Error::invalid(
-                "LDAP: accounts.disabled needs exactly one of value, flag",
-            ));
+        if let Some(d) = &self.accounts.disabled {
+            d.check("accounts.disabled")?;
+        }
+        if let Some(d) = &self.groups.internal_only {
+            d.check("groups.internal_only")?;
+        }
+        if let Some(d) = &self.groups.hidden {
+            d.check("groups.hidden")?;
         }
         Ok(plaintext)
     }
@@ -557,6 +598,19 @@ struct Keyed<T> {
     change: DirChange<T>,
 }
 
+/// Группа каталога как есть: ссылки на записи — DN; признаки — `None`, если не сопоставлены в секции.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawGroup {
+    pub(crate) external_id: String,
+    pub(crate) name: String,
+    pub(crate) email: Option<String>,
+    pub(crate) members: Vec<String>,
+    pub(crate) moderators: Vec<String>,
+    pub(crate) senders: Vec<String>,
+    pub(crate) internal_only: Option<bool>,
+    pub(crate) hidden: Option<bool>,
+}
+
 impl LdapDirectory {
     /// Каталог организации `tenant`: проверяет секцию, читает пароль служебной учётной записи из `secrets`,
     /// готовит TLS. Соединения открываются на операцию.
@@ -805,7 +859,7 @@ impl LdapDirectory {
         }
         let enabled = match &m.disabled {
             None => true,
-            Some(rule) => !disabled(e, rule),
+            Some(rule) => !flagged(e, rule),
         };
         let attributes = m
             .gal
@@ -861,6 +915,47 @@ impl LdapDirectory {
             cache.insert(key, id);
         }
         Ok(())
+    }
+
+    /// Порция изменений групп после `cursor` со ссылками-DN и сопоставленными признаками.
+    pub(crate) async fn raw_groups_since(
+        &self,
+        cursor: Option<&DirCursor>,
+        limit: usize,
+    ) -> Result<DirPage<RawGroup>> {
+        let m = &self.cfg.groups;
+        let mut attrs = vec![m.name.clone(), m.email.clone(), m.member.clone()];
+        attrs.extend(m.moderators.iter().cloned());
+        attrs.extend(m.senders.iter().cloned());
+        attrs.extend(m.internal_only.iter().map(|r| r.attribute.clone()));
+        attrs.extend(m.hidden.iter().map(|r| r.attribute.clone()));
+        let spec = Spec {
+            base: self.base(&m.base),
+            filter: &m.filter,
+            deleted_filter: &m.deleted_filter,
+            id_attr: &m.id,
+            attrs,
+        };
+        let dns = |e: &SearchEntry, attr: &str| -> Vec<String> {
+            values(e, attr)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        self.page(cursor, limit, spec, |e, id| {
+            let name = first(e, &m.name)?;
+            Some(RawGroup {
+                external_id: id,
+                name,
+                email: first(e, &m.email),
+                members: dns(e, &m.member),
+                moderators: m.moderators.iter().flat_map(|a| dns(e, a)).collect(),
+                senders: m.senders.iter().flat_map(|a| dns(e, a)).collect(),
+                internal_only: m.internal_only.as_ref().map(|r| flagged(e, r)),
+                hidden: m.hidden.as_ref().map(|r| flagged(e, r)),
+            })
+        })
+        .await
     }
 
     /// DN учётной записи по имени входа; нет или неоднозначно — `None`.
@@ -930,57 +1025,40 @@ impl Directory for LdapDirectory {
         limit: usize,
     ) -> Result<DirPage<DirGroup>> {
         self.own(tenant)?;
-        let m = &self.cfg.groups;
-        let spec = Spec {
-            base: self.base(&m.base),
-            filter: &m.filter,
-            deleted_filter: &m.deleted_filter,
-            id_attr: &m.id,
-            attrs: vec![m.name.clone(), m.email.clone(), m.member.clone()],
-        };
-        let mut members: Vec<(String, Vec<String>)> = Vec::new();
-        let mut page = self
-            .page(cursor, limit, spec, |e, id| {
-                let name = first(e, &m.name)?;
-                members.push((
-                    id.clone(),
-                    values(e, &m.member).map(str::to_owned).collect(),
-                ));
-                Some(DirGroup {
-                    external_id: id,
-                    name,
-                    email: first(e, &m.email),
-                    members: Vec::new(),
-                })
-            })
-            .await?;
+        let raw = self.raw_groups_since(cursor, limit).await?;
         let mut cache = HashMap::new();
-        let wanted: HashSet<&str> = page
+        let dns: Vec<String> = raw
             .changes
             .iter()
             .filter_map(|c| match c {
-                DirChange::Upsert(g) => Some(g.external_id.as_str()),
+                DirChange::Upsert(g) => Some(g.members.iter().cloned()),
                 DirChange::Removed { .. } => None,
             })
-            .collect();
-        let dns: Vec<String> = members
-            .iter()
-            .filter(|(id, _)| wanted.contains(id.as_str()))
-            .flat_map(|(_, dns)| dns.iter().cloned())
+            .flatten()
             .collect();
         self.ids_of(dns, &mut cache).await?;
-        let by_group: HashMap<String, Vec<String>> = members.into_iter().collect();
-        for c in &mut page.changes {
-            if let DirChange::Upsert(g) = c {
-                g.members = by_group
-                    .get(&g.external_id)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|dn| cache.get(&dn.to_ascii_lowercase()).cloned().flatten())
-                    .collect();
-            }
-        }
-        Ok(page)
+        let changes = raw
+            .changes
+            .into_iter()
+            .map(|c| match c {
+                DirChange::Upsert(g) => DirChange::Upsert(DirGroup {
+                    members: g
+                        .members
+                        .iter()
+                        .filter_map(|dn| cache.get(&dn.to_ascii_lowercase()).cloned().flatten())
+                        .collect(),
+                    external_id: g.external_id,
+                    name: g.name,
+                    email: g.email,
+                }),
+                DirChange::Removed { external_id } => DirChange::Removed { external_id },
+            })
+            .collect();
+        Ok(DirPage {
+            changes,
+            next: raw.next,
+            has_more: raw.has_more,
+        })
     }
 
     async fn aliases(&self, tenant: TenantId) -> Result<Vec<DirAlias>> {
@@ -1135,7 +1213,7 @@ fn guid(b: &[u8]) -> Option<String> {
     ))
 }
 
-fn disabled(e: &SearchEntry, rule: &DisabledRule) -> bool {
+fn flagged(e: &SearchEntry, rule: &FlagRule) -> bool {
     values(e, &rule.attribute).any(|v| match (&rule.value, rule.flag) {
         (Some(want), _) => v.eq_ignore_ascii_case(want),
         (None, Some(flag)) => v

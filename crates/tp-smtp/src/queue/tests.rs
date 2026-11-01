@@ -16,6 +16,7 @@ use tp_testkit::{Clock, ManualClock, MemBlobIndex, MemBlobStore, MemQueue};
 
 use super::send::MxTransport;
 use super::*;
+use crate::config::OutboundTls;
 use crate::server::tests::{Recorder, conn_info};
 use crate::server::{Mode, Session, SessionCtx};
 use mail_auth::ResolverCache;
@@ -89,7 +90,8 @@ impl Env {
     }
 }
 
-const MAIL: &[u8] = b"From: alice@example.org\r\nTo: x@example.net\r\nSubject: hi\r\n\r\nbody\r\n";
+pub(crate) const MAIL: &[u8] =
+    b"From: alice@example.org\r\nTo: x@example.net\r\nSubject: hi\r\n\r\nbody\r\n";
 
 fn cfg() -> QueueConfig {
     QueueConfig::default()
@@ -189,6 +191,45 @@ async fn recipients_grouped_by_domain_and_final_statuses() {
 }
 
 #[tokio::test]
+async fn queue_metrics() {
+    let env = Env::new();
+    let t = Arc::new(Scripted::default());
+    let registry = tp_platform::Metrics::default();
+    let metrics = Arc::new(crate::SmtpMetrics::new());
+    metrics.register(&registry);
+    let worker =
+        QueueWorker::new(env.deps.clone(), t.clone(), "mx.example.org").with_metrics(metrics);
+    Queue::new(env.deps.clone())
+        .enqueue(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &[
+                "a@example.com".into(),
+                "b@example.com".into(),
+                "c@example.com".into(),
+            ],
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("enqueue");
+    t.push(RcptResult::Delivered("250 ok".into()));
+    t.push(RcptResult::Temporary("451 later".into()));
+    t.push(RcptResult::Permanent("550 no".into()));
+    assert_eq!(worker.run_once(&cfg()).await.expect("run"), 1);
+    let text = registry.encode().expect("encode");
+    for line in [
+        "tp_smtp_queue_claimed_total 1",
+        "tp_smtp_queue_inflight 0",
+        "tp_smtp_queue_recipients_total{result=\"delivered\"} 1",
+        "tp_smtp_queue_recipients_total{result=\"deferred\"} 1",
+        "tp_smtp_queue_recipients_total{result=\"failed\"} 1",
+        "tp_smtp_queue_delivery_seconds_count 1",
+    ] {
+        assert!(text.contains(line), "{line} in {text}");
+    }
+}
+
+#[tokio::test]
 async fn stale_claim_is_skipped() {
     let env = Env::new();
     let t = Arc::new(Scripted::default());
@@ -246,6 +287,11 @@ async fn enqueue_failure_releases_reference() {
 
 /// Тестовый SMTP-сервер (сессия `tp-smtp` с обработчиком-регистратором) на `127.0.0.1`.
 pub(crate) async fn smtp_server(rec: Arc<Recorder>) -> u16 {
+    smtp_server_with(rec, false).await
+}
+
+/// Тестовый сервер; `broken_tls` — предлагает STARTTLS, но после `220` закрывает соединение (сбой рукопожатия).
+pub(crate) async fn smtp_server_with(rec: Arc<Recorder>, broken_tls: bool) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move {
@@ -256,9 +302,11 @@ pub(crate) async fn smtp_server(rec: Arc<Recorder>) -> u16 {
                 handler: rec.clone(),
                 sasl: None,
                 limiter: None,
+                send_limits: None,
+                metrics: None,
             };
             tokio::spawn(async move {
-                let _ = Session::new(ctx, conn_info(false), false)
+                let _ = Session::new(ctx, conn_info(false), broken_tls)
                     .serve(&mut s, true)
                     .await;
             });
@@ -267,7 +315,7 @@ pub(crate) async fn smtp_server(rec: Arc<Recorder>) -> u16 {
     port
 }
 
-fn transport() -> MxTransport {
+pub(crate) fn transport() -> MxTransport {
     let resolver = MessageAuthenticator::new(
         ResolverConfig::from_name_servers(vec![]),
         ResolverOpts::default(),
@@ -278,7 +326,7 @@ fn transport() -> MxTransport {
 
 use mail_auth::MessageAuthenticator;
 
-fn mx(t: &MxTransport, domain: &str, hosts: &[(u16, &str)]) {
+pub(crate) fn mx(t: &MxTransport, domain: &str, hosts: &[(u16, &str)]) {
     let until = std::time::Instant::now() + Duration::from_secs(3600);
     let rrset: Arc<[MX]> = hosts
         .iter()
@@ -297,7 +345,7 @@ fn mx(t: &MxTransport, domain: &str, hosts: &[(u16, &str)]) {
     );
 }
 
-fn a(t: &MxTransport, host: &str, ip: std::net::Ipv4Addr) {
+pub(crate) fn a(t: &MxTransport, host: &str, ip: std::net::Ipv4Addr) {
     let until = std::time::Instant::now() + Duration::from_secs(3600);
     t.cache().ipv4.insert(
         format!("{host}.").into(),
@@ -309,7 +357,23 @@ fn a(t: &MxTransport, host: &str, ip: std::net::Ipv4Addr) {
     );
 }
 
-fn req<'a>(cfg: &'a QueueConfig, domain: &'a str, rcpts: &'a [String]) -> SendRequest<'a> {
+fn aaaa(t: &MxTransport, host: &str, ip: std::net::Ipv6Addr) {
+    let until = std::time::Instant::now() + Duration::from_secs(3600);
+    t.cache().ipv6.insert(
+        format!("{host}.").into(),
+        RecordSet {
+            rrset: Arc::from(vec![ip]),
+            dnssec_status: Default::default(),
+        },
+        until,
+    );
+}
+
+pub(crate) fn req<'a>(
+    cfg: &'a QueueConfig,
+    domain: &'a str,
+    rcpts: &'a [String],
+) -> SendRequest<'a> {
     SendRequest {
         cfg,
         helo: "out.example.org",
@@ -379,6 +443,66 @@ async fn null_mx_unknown_domain_and_unreachable_relay() {
     };
     let res = t.send(req(&cfg, "example.com", &rcpts)).await;
     assert!(matches!(&res[0], RcptResult::Temporary(_)), "{res:?}");
+}
+
+#[tokio::test]
+async fn opportunistic_tls_failure_falls_back_to_plain() {
+    let rec = Arc::new(Recorder::default());
+    let port = smtp_server_with(rec.clone(), true).await;
+    let t = transport();
+    mx(&t, "example.net", &[(10, "mx.example.net")]);
+    a(&t, "mx.example.net", [127, 0, 0, 1].into());
+    let rcpts = vec!["x@example.net".to_owned()];
+    // Обязательный TLS: сбой рукопожатия — временная неудача, письмо не передано.
+    let strict = QueueConfig {
+        port,
+        tls: OutboundTls::Require,
+        ..cfg()
+    };
+    let res = t.send(req(&strict, "example.net", &rcpts)).await;
+    assert!(matches!(&res[0], RcptResult::Temporary(_)), "{res:?}");
+    assert!(rec.mails().is_empty());
+    // Оппортунистический: повтор без TLS на том же адресе.
+    let cfg = QueueConfig { port, ..cfg() };
+    let res = t.send(req(&cfg, "example.net", &rcpts)).await;
+    assert!(matches!(&res[0], RcptResult::Delivered(_)), "{res:?}");
+    assert_eq!(rec.mails().len(), 1);
+}
+
+#[tokio::test]
+async fn egress_address_and_family() {
+    let rec = Arc::new(Recorder::default());
+    let port = smtp_server(rec.clone()).await;
+    let t = transport();
+    mx(&t, "example.net", &[(10, "mx.example.net")]);
+    a(&t, "mx.example.net", [127, 0, 0, 1].into());
+    mx(&t, "example.com", &[(10, "mx6.example.com")]);
+    aaaa(&t, "mx6.example.com", std::net::Ipv6Addr::LOCALHOST);
+    // A-записей нет (пустой ответ в кэше).
+    t.cache().ipv4.insert(
+        "mx6.example.com.".into(),
+        RecordSet {
+            rrset: Arc::from(Vec::new()),
+            dnssec_status: Default::default(),
+        },
+        std::time::Instant::now() + Duration::from_secs(3600),
+    );
+    let cfg = QueueConfig {
+        port,
+        source_ip: Some([127, 0, 0, 1].into()),
+        ..cfg()
+    };
+    let rcpts = vec!["x@example.net".to_owned()];
+    let res = t.send(req(&cfg, "example.net", &rcpts)).await;
+    assert!(matches!(&res[0], RcptResult::Delivered(_)), "{res:?}");
+    // Узел только с IPv6 при исходящем IPv4: временная неудача, а не «домен не найден».
+    let rcpts = vec!["x@example.com".to_owned()];
+    let res = t.send(req(&cfg, "example.com", &rcpts)).await;
+    assert!(
+        matches!(&res[0], RcptResult::Temporary(r) if r.contains("no IPv4 address")),
+        "{res:?}"
+    );
+    assert_eq!(rec.mails().len(), 1);
 }
 
 #[tokio::test]

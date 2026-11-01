@@ -17,6 +17,7 @@ use tp_contracts::ext::DecisionHooks;
 use tp_contracts::groups::{DistributionGroup, HeldMessage};
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, Flags, Policy, PolicyResolver, SpecialUse};
+use tp_contracts::retention::{TrashPurge, TrashPurgeSetting};
 use tp_contracts::{
     AccountId, DomainId, Error, GroupId, HeldId, MailboxId, MessageId, Result, TenantId,
 };
@@ -172,6 +173,19 @@ impl PolicyResolver for MemPolicies {
             p = p.overlay(self.policy(tenant, t).await?);
         }
         Ok(p)
+    }
+
+    // Настройка `trash.purge` в тестах Admin API — ADM-09 (CTR-26 добавил методы контракта).
+    async fn trash_purge(&self, _scope: AccountScope) -> Result<TrashPurgeSetting> {
+        Err(Error::internal("trash.purge: не реализовано (ADM-09)"))
+    }
+
+    async fn set_user_trash_purge(
+        &self,
+        _scope: AccountScope,
+        _mode: Option<TrashPurge>,
+    ) -> Result<()> {
+        Err(Error::internal("trash.purge: не реализовано (ADM-09)"))
     }
 }
 

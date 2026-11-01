@@ -60,6 +60,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "blob compression",
         include_str!("../migrations/0013_blob_compression.sql"),
     ),
+    (
+        14,
+        "trash purge",
+        include_str!("../migrations/0014_trash_purge.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

@@ -29,6 +29,7 @@ use crate::error::Result;
 use crate::ids::{
     AccountId, BlobKey, DomainId, MailboxId, MessageId, ModSeq, TenantId, Uid, UidValidity,
 };
+use crate::retention::{TrashPurge, TrashPurgeRule, TrashPurgeSetting};
 
 /// Контекст операций ящика: организация и учётная запись.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,7 +80,7 @@ pub struct AccountUpsert {
 /// Использование квоты учётной записи.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct QuotaUsage {
-    /// Занято байт (сумма размеров писем, включая корзину).
+    /// Занято байт (сумма размеров писем, включая корзину, без скрытых — `TrashStore::purge`).
     pub used_bytes: u64,
     /// Число писем.
     pub messages: u64,
@@ -552,6 +553,9 @@ pub struct Policy {
     pub dkim_selector: Option<String>,
     /// Профиль Milter.
     pub milter_profile: Option<String>,
+    /// Правило администратора `trash.purge` (решение 2026-11-01-trash-purge); вычисление с выбором пользователя —
+    /// [`PolicyResolver::trash_purge`].
+    pub trash_purge: Option<TrashPurgeRule>,
 }
 
 impl Policy {
@@ -565,12 +569,14 @@ impl Policy {
             max_recipients: over.max_recipients.or(self.max_recipients),
             dkim_selector: over.dkim_selector.or(self.dkim_selector),
             milter_profile: over.milter_profile.or(self.milter_profile),
+            trash_purge: over.trash_purge.or(self.trash_purge),
         }
     }
 }
 
 /// Разрешение политик по цепочке «организация → домен → ящик (→ папка)»: каждый следующий уровень
-/// переопределяет заданные поля предыдущего ([`Policy::overlay`]).
+/// переопределяет заданные поля предыдущего ([`Policy::overlay`]). Настройка `trash.purge` — правило администратора
+/// по цепочке и выбор пользователя ([`PolicyResolver::trash_purge`]; администратор приоритетнее).
 #[async_trait]
 pub trait PolicyResolver: Send + Sync + 'static {
     /// Действующая политика. `domain`/`account`/`mailbox` = `None` — разрешение до предыдущего уровня.
@@ -581,6 +587,20 @@ pub trait PolicyResolver: Send + Sync + 'static {
         account: Option<AccountId>,
         mailbox: Option<MailboxId>,
     ) -> Result<Policy>;
+
+    /// Настройка `trash.purge` учётной записи: правило администратора по цепочке «организация → домен → ящик»
+    /// (`Policy::trash_purge`, не задано — `TrashPurgeRule::default()`) и выбор пользователя; действующее значение —
+    /// [`TrashPurgeSetting::effective`]. Нет учётной записи — `Error::NotFound`.
+    async fn trash_purge(&self, scope: AccountScope) -> Result<TrashPurgeSetting>;
+
+    /// Задаёт выбор пользователя `trash.purge` (`None` — сбросить, действует значение администратора).
+    /// Выбор при действующем правиле без `user_can_choose` — `Error::Forbidden` (сброс разрешён всегда);
+    /// нет учётной записи — `Error::NotFound`.
+    async fn set_user_trash_purge(
+        &self,
+        scope: AccountScope,
+        mode: Option<TrashPurge>,
+    ) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -656,5 +676,16 @@ mod tests {
         assert_eq!(p.send_per_hour, Some(5));
         assert_eq!(p.dkim_selector.as_deref(), Some("s1"));
         assert_eq!(p.milter_profile, None);
+        assert_eq!(p.trash_purge, None);
+        let rule = TrashPurgeRule {
+            mode: TrashPurge::Erase,
+            user_can_choose: true,
+        };
+        let over = Policy {
+            trash_purge: Some(rule),
+            ..Policy::default()
+        };
+        assert_eq!(p.clone().overlay(over.clone()).trash_purge, Some(rule));
+        assert_eq!(over.overlay(p).trash_purge, Some(rule));
     }
 }

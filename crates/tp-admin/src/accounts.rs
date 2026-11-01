@@ -127,6 +127,8 @@ impl From<PolicyBody> for Policy {
             max_recipients: p.max_recipients,
             dkim_selector: p.dkim_selector,
             milter_profile: p.milter_profile,
+            // `trash.purge` в Admin API — ADM-09.
+            trash_purge: None,
         }
     }
 }

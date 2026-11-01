@@ -2,6 +2,15 @@
 //! «нулевой» MX RFC 7505 — отказ), адреса узла, соединение с `queue.source_ip`, STARTTLS по `queue.tls`,
 //! `MAIL`, `RCPT` каждому получателю, `DATA`. Сбой соединения или приветствия — следующий адрес или MX;
 //! все исчерпаны — временная неудача. `queue.relay` — все письма через узел-ретранслятор.
+//!
+//! Исходящий адрес `queue.source_ip` задаёт семейство адресов узлов: с IPv4-адреса пробуются только A-записи,
+//! с IPv6 — только AAAA; узел без адресов этого семейства — временная неудача, а не «домен не найден».
+//! Оппортунистический TLS (RFC 7435): сбой STARTTLS или рукопожатия — повтор на том же адресе без TLS,
+//! как уровень `may` Postfix; с `queue.tls: require` — сбой узла.
+//!
+//! С [`MxTransport::with_policy`] доставка на MX (не через ретранслятор) подчиняется MTA-STS и DANE
+//! ([`crate::policy`]): узлы вне политики `enforce` и узлы, не прошедшие проверку TLS, пропускаются; повтора
+//! открытым текстом для них нет.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -13,10 +22,12 @@ use smtp_proto::{EXT_SIZE, EXT_SMTP_UTF8, EXT_START_TLS, Response};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls;
+use tokio_rustls::rustls::pki_types::UnixTime;
 
 use super::{RcptResult, SendRequest, Transport};
 use crate::authcheck::DnsCache;
 use crate::config::OutboundTls;
+use crate::policy::{self, HostTls, StsMode, TlsPolicy};
 
 /// Отправка через DNS (MX) или ретранслятор.
 pub struct MxTransport {
@@ -24,6 +35,7 @@ pub struct MxTransport {
     cache: DnsCache,
     verified: TlsConnector,
     opportunistic: TlsConnector,
+    policy: Option<Arc<TlsPolicy>>,
 }
 
 impl std::fmt::Debug for MxTransport {
@@ -33,7 +45,17 @@ impl std::fmt::Debug for MxTransport {
 }
 
 /// Неудача соединения с узлом: пробуется следующий.
-struct HostError(String);
+struct HostError {
+    reason: String,
+    /// Сбой на шаге STARTTLS (команда или рукопожатие): при оппортунистическом TLS — повтор без TLS.
+    tls: bool,
+}
+
+impl HostError {
+    fn new(reason: String) -> Self {
+        Self { reason, tls: false }
+    }
+}
 
 impl MxTransport {
     /// Отправка с резолвером `resolver` (системный — `MessageAuthenticator::new_system_conf`) и кэшем
@@ -46,7 +68,21 @@ impl MxTransport {
             cache: DnsCache::new(cache_size),
             verified: mail_send::smtp::tls::build_tls_connector(false)?,
             opportunistic: mail_send::smtp::tls::build_tls_connector(true)?,
+            policy: None,
         })
+    }
+
+    /// Политики MTA-STS и DANE (SMTP-10) при доставке на MX.
+    pub fn with_policy(mut self, policy: Arc<TlsPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// TLS с проверкой сертификата (`queue.tls: require`, MTA-STS) — свои корни вместо системных (тесты,
+    /// частный УЦ).
+    pub fn with_verified_connector(mut self, connector: TlsConnector) -> Self {
+        self.verified = connector;
+        self
     }
 
     /// Кэш DNS (тесты заполняют его записями вместо сети).
@@ -97,14 +133,24 @@ impl MxTransport {
         }
     }
 
-    async fn addresses(&self, host: &str) -> Result<Vec<IpAddr>, mail_auth::Error> {
+    /// Адреса узла `host` семейства исходящего адреса `source` (`None` — IPv4, затем IPv6).
+    async fn addresses(
+        &self,
+        host: &str,
+        source: Option<IpAddr>,
+    ) -> Result<Vec<IpAddr>, mail_auth::Error> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![ip]);
         }
+        let strategy = match source {
+            None => IpLookupStrategy::Ipv4thenIpv6,
+            Some(IpAddr::V4(_)) => IpLookupStrategy::Ipv4Only,
+            Some(IpAddr::V6(_)) => IpLookupStrategy::Ipv6Only,
+        };
         self.resolver
             .ip_lookup(
                 host,
-                IpLookupStrategy::Ipv4thenIpv6,
+                strategy,
                 4,
                 Some(&self.cache.ipv4),
                 Some(&self.cache.ipv6),
@@ -112,15 +158,36 @@ impl MxTransport {
             .await
     }
 
-    /// Одна попытка на адрес `ip` узла `host`.
+    /// У узла есть адреса другого семейства, чем исходящий адрес `source`.
+    async fn other_family(&self, host: &str, source: IpAddr) -> bool {
+        let other = match source {
+            IpAddr::V4(_) => IpLookupStrategy::Ipv6Only,
+            IpAddr::V6(_) => IpLookupStrategy::Ipv4Only,
+        };
+        self.resolver
+            .ip_lookup(
+                host,
+                other,
+                1,
+                Some(&self.cache.ipv4),
+                Some(&self.cache.ipv6),
+            )
+            .await
+            .is_ok_and(|ips| !ips.is_empty())
+    }
+
+    /// Одна попытка на адрес `addr` узла `host` с требованием к TLS `want`; `plain` — без STARTTLS (повтор
+    /// после сбоя оппортунистического TLS).
     async fn attempt(
         &self,
         req: &SendRequest<'_>,
         host: &str,
         addr: SocketAddr,
+        want: &HostTls,
+        plain: bool,
     ) -> Result<Vec<RcptResult>, HostError> {
         let timeout = req.cfg.timeout;
-        let err = |e: mail_send::Error| HostError(format!("{host} [{}]: {e}", addr.ip()));
+        let err = |e: mail_send::Error| HostError::new(format!("{host} [{}]: {e}", addr.ip()));
         let mut client = match req.cfg.source_ip {
             Some(local) => SmtpClient::connect_using(local, addr, timeout).await,
             None => SmtpClient::connect(addr, timeout).await,
@@ -131,25 +198,40 @@ impl MxTransport {
             .map_err(|_| err(mail_send::Error::Timeout))?
             .map_err(err)?;
         if greeting.code / 100 != 2 {
-            return Err(HostError(format!(
+            return Err(HostError::new(format!(
                 "{host}: greeting {}",
                 fmt_reply(&greeting)
             )));
         }
         let ehlo = client.ehlo(req.helo).await.map_err(err)?;
-        if ehlo.has_capability(EXT_START_TLS) {
-            let connector = match req.cfg.tls {
-                OutboundTls::Require => &self.verified,
-                OutboundTls::Opportunistic => &self.opportunistic,
+        let required = *want != HostTls::Default || req.cfg.tls == OutboundTls::Require;
+        if ehlo.has_capability(EXT_START_TLS) && !plain {
+            let connector = match (want, req.cfg.tls) {
+                (HostTls::Dane(_), _) => &self.opportunistic,
+                (HostTls::Verified, _) | (HostTls::Default, OutboundTls::Require) => &self.verified,
+                (HostTls::Default, OutboundTls::Opportunistic) => &self.opportunistic,
             };
-            let mut tls = client.start_tls(connector, host).await.map_err(err)?;
+            let mut tls = client
+                .start_tls(connector, host)
+                .await
+                .map_err(|e| HostError {
+                    tls: true,
+                    ..err(e)
+                })?;
+            if let HostTls::Dane(records) = want {
+                let chain = tls.stream.get_ref().1.peer_certificates().unwrap_or(&[]);
+                if let Err(e) = policy::dane_verify(records, chain, host, UnixTime::now()) {
+                    let _ = tls.quit().await;
+                    return Err(HostError::new(format!("{host}: {e}")));
+                }
+            }
             let ehlo = tls.ehlo(req.helo).await.map_err(err)?;
             let out = transaction(&mut tls, req, ehlo.capabilities).await;
             let _ = tls.quit().await;
             out.map_err(err)
-        } else if req.cfg.tls == OutboundTls::Require {
+        } else if required {
             let _ = client.quit().await;
-            Err(HostError(format!("{host}: STARTTLS not offered")))
+            Err(HostError::new(format!("{host}: STARTTLS not offered")))
         } else {
             let out = transaction(&mut client, req, ehlo.capabilities).await;
             let _ = client.quit().await;
@@ -162,18 +244,64 @@ impl MxTransport {
 impl Transport for MxTransport {
     async fn send(&self, req: SendRequest<'_>) -> Vec<RcptResult> {
         let all = |r: RcptResult| vec![r; req.rcpts.len()];
-        let hosts = match self.hosts(&req).await {
+        let mut hosts = match self.hosts(&req).await {
             Ok(h) => h,
             Err(r) => return all(r),
         };
+        // Политики — для доставки на MX; ретранслятор — узел периметра со своими правилами.
+        let policy = self.policy.as_deref().filter(|_| req.cfg.relay.is_none());
+        let pcfg = &req.cfg.policy;
+        let sts = match policy {
+            Some(p) => p.mta_sts(pcfg, req.domain).await,
+            None => None,
+        };
+        if let Some(sts) = &sts {
+            let outside: Vec<&str> = hosts
+                .iter()
+                .filter(|(h, _)| !sts.allows(h))
+                .map(|(h, _)| h.as_str())
+                .collect();
+            if !outside.is_empty() {
+                tracing::warn!(domain = %req.domain, mode = ?sts.mode, hosts = ?outside, "smtp: MX вне политики MTA-STS");
+            }
+            if sts.mode == StsMode::Enforce {
+                hosts.retain(|(h, _)| sts.allows(h));
+                if hosts.is_empty() {
+                    return all(RcptResult::Temporary(format!(
+                        "451 4.7.5 MTA-STS: no MX of {} matches policy",
+                        req.domain
+                    )));
+                }
+            }
+        }
         let mut last = String::from("no hosts");
         let mut unknown = 0;
+        let source = req.cfg.source_ip;
         for (host, port) in &hosts {
-            let ips = match self.addresses(host).await {
+            let want = match policy {
+                Some(p) => match p.host_tls(pcfg, sts.as_deref(), host, *port).await {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::warn!(domain = %req.domain, error = %e, "smtp: узел пропущен");
+                        last = e;
+                        continue;
+                    }
+                },
+                None => HostTls::Default,
+            };
+            let ips = match self.addresses(host, source).await {
                 Ok(ips) if !ips.is_empty() => ips,
                 Ok(_) | Err(mail_auth::Error::Dns(DnsError::RecordNotFound(_))) => {
-                    unknown += 1;
-                    last = format!("{host}: no address");
+                    match source {
+                        Some(src) if self.other_family(host, src).await => {
+                            let family = if src.is_ipv4() { "IPv4" } else { "IPv6" };
+                            last = format!("{host}: no {family} address for egress {src}");
+                        }
+                        _ => {
+                            unknown += 1;
+                            last = format!("{host}: no address");
+                        }
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -182,11 +310,21 @@ impl Transport for MxTransport {
                 }
             };
             for ip in ips {
-                match self.attempt(&req, host, SocketAddr::new(ip, *port)).await {
+                let addr = SocketAddr::new(ip, *port);
+                let mut res = self.attempt(&req, host, addr, &want, false).await;
+                if let Err(e) = &res
+                    && e.tls
+                    && want == HostTls::Default
+                    && req.cfg.tls == OutboundTls::Opportunistic
+                {
+                    tracing::info!(domain = %req.domain, error = %e.reason, "smtp: сбой TLS, повтор без TLS");
+                    res = self.attempt(&req, host, addr, &want, true).await;
+                }
+                match res {
                     Ok(results) => return results,
-                    Err(HostError(e)) => {
-                        tracing::info!(domain = %req.domain, error = %e, "smtp: узел недоступен");
-                        last = e;
+                    Err(e) => {
+                        tracing::info!(domain = %req.domain, error = %e.reason, "smtp: узел недоступен");
+                        last = e.reason;
                     }
                 }
             }
