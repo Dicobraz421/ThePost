@@ -99,8 +99,6 @@ pub struct IndexStore {
     cfg: PersistConfig,
     /// Последняя сборка мусора ящика.
     last_gc: Mutex<HashMap<Key, Instant>>,
-    /// Ящики, чей индекс перестраивается на этом узле: файлы нового поколения ещё не в манифесте.
-    building: Mutex<HashSet<Key>>,
 }
 
 impl std::fmt::Debug for IndexStore {
@@ -117,7 +115,6 @@ enum Mode {
     /// Изменения индексатора: запрос перестройки сохраняется.
     Live,
     /// Завершение перестройки, начатой при запросе `request`; появился другой запрос — `Conflict`.
-    #[allow(dead_code)]
     Rebuilt(Option<RebuildRequest>),
 }
 
@@ -133,7 +130,6 @@ impl IndexStore {
             manifests,
             cfg,
             last_gc: Mutex::new(HashMap::new()),
-            building: Mutex::new(HashSet::new()),
         }
     }
 
@@ -153,6 +149,19 @@ impl IndexStore {
         let base = index.synced();
         let generation = generation(scope, &base).map_or_else(random_name, str::to_owned);
         self.upload(scope, index, &base, &generation, Mode::Live)
+            .await
+    }
+
+    /// Выгружает перестроенный индекс новым поколением и записывает манифест поверх `base` (действующий
+    /// манифест), снимая запрос перестройки `request`; появился другой запрос — `Error::Conflict`.
+    pub(crate) async fn publish_rebuilt(
+        &self,
+        scope: AccountScope,
+        index: &Arc<MailIndex>,
+        base: &IndexManifest,
+        request: Option<RebuildRequest>,
+    ) -> Result<IndexManifest> {
+        self.upload(scope, index, base, &random_name(), Mode::Rebuilt(request))
             .await
     }
 
@@ -264,12 +273,10 @@ impl IndexStore {
     }
 
     /// Удаляет файлы ящика в BlobStore, которых нет в манифесте `keep` и которые записаны раньше
-    /// `gc_delay`; не чаще раза в `gc_delay` и не во время перестройки индекса на этом узле.
+    /// `gc_delay`, не чаще раза в `gc_delay`. Новые файлы выгружаются под [`IndexManager::lock`] вместе с
+    /// записью манифеста, поэтому файлы перестройки до переключения сборка мусора не видит.
     async fn collect_garbage(&self, scope: AccountScope, keep: &IndexManifest) -> Result<()> {
         let key = (scope.tenant, scope.account);
-        if lock(&self.building).contains(&key) {
-            return Ok(());
-        }
         {
             let mut last = lock(&self.last_gc);
             if last

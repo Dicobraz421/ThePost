@@ -66,6 +66,9 @@ impl Default for IndexerConfig {
 pub trait DocumentSource: Send + Sync + 'static {
     /// Документ письма по текущему состоянию; письма уже нет — `None` (удаляется из индекса).
     async fn document(&self, scope: AccountScope, message: MessageId) -> Result<Option<IndexDoc>>;
+
+    /// Письма учётной записи по текущему состоянию (перестройка индекса, SRCH-08).
+    async fn messages(&self, scope: AccountScope) -> Result<Vec<MessageId>>;
 }
 
 /// Подписчик журнала событий, обновляющий индексы ящиков.
@@ -188,14 +191,27 @@ impl Indexer {
         };
         let index = match index {
             Some(index) => index,
-            None if !create => return Ok(None),
+            None if !create => {
+                if let Some(shadow) = self.indexes.shadow(scope) {
+                    blocking(move || shadow.apply(&ops)).await?;
+                }
+                return Ok(None);
+            }
             None => {
                 let m = self.indexes.clone();
                 blocking(move || m.open_or_create(scope)).await?
             }
         };
-        let i = index.clone();
-        blocking(move || i.apply(&ops)).await?;
+        // Идущая перестройка получает те же изменения, что и действующий индекс.
+        let (i, shadow) = (index.clone(), self.indexes.shadow(scope));
+        blocking(move || {
+            i.apply(&ops)?;
+            match shadow {
+                Some(shadow) => shadow.apply(&ops),
+                None => Ok(()),
+            }
+        })
+        .await?;
         if let Some(store) = &self.store {
             match store.publish(scope, &index).await {
                 Ok(_) => {}
@@ -296,6 +312,10 @@ mod tests {
                 tokio::time::sleep(self.delay).await;
             }
             Ok(self.docs.lock().expect("lock").get(&message).cloned())
+        }
+
+        async fn messages(&self, _: AccountScope) -> Result<Vec<MessageId>> {
+            Ok(self.docs.lock().expect("lock").keys().copied().collect())
         }
     }
 

@@ -6,7 +6,8 @@
 //! - [`indexer`] — роль indexer: подписчик журнала событий, пакетный коммит индекса;
 //! - [`persist`] — сегменты индекса в BlobStore и манифест версии, загрузка индекса на другом узле;
 //! - [`cache`] — LRU индексов на NVMe узла по размеру, холодная загрузка, метрики;
-//! - [`extract`] — текст вложений в изолированном подпроцессе (SYS-04).
+//! - [`extract`] — текст вложений в изолированном подпроцессе (SYS-04);
+//! - [`rebuild`] — перестройка индекса ящика рядом с действующим и атомарная замена манифеста.
 
 pub mod analyzers;
 pub mod cache;
@@ -15,6 +16,7 @@ pub mod index;
 pub mod indexer;
 pub mod persist;
 pub mod query;
+pub mod rebuild;
 
 pub use cache::{CacheConfig, CacheStats, IndexCache};
 pub use extract::{ExtractConfig, ExtractLimits, Extractor, NotExtracted};
@@ -22,6 +24,7 @@ pub use index::{IndexConfig, IndexDoc, IndexManager, IndexOp, MailIndex, SCHEMA_
 pub use indexer::{DocumentSource, Indexer, IndexerConfig, SUBSCRIBER};
 pub use persist::{IndexStore, PersistConfig};
 pub use query::{QueryConfig, Search};
+pub use rebuild::{RebuildConfig, Rebuilder};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -42,6 +45,8 @@ pub struct SearchConfig {
     pub cache: CacheConfig,
     /// Извлечение текста вложений (роль indexer).
     pub extract: ExtractConfig,
+    /// Перестройка индексов (роль indexer).
+    pub rebuild: RebuildConfig,
 }
 
 #[cfg(test)]

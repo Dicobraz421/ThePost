@@ -379,6 +379,14 @@ pub(crate) fn prune_dir(dir: &Path, keep: &HashSet<String>) -> Result<()> {
 
 type Key = (TenantId, AccountId);
 
+/// Удаляет каталог; его отсутствие — не ошибка. Блокирующий.
+fn remove_dir(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 /// Индексы учётных записей в каталоге [`IndexConfig::dir`]; открытые держит в памяти.
 #[derive(Debug)]
 pub struct IndexManager {
@@ -386,6 +394,8 @@ pub struct IndexManager {
     open: Mutex<HashMap<Key, Arc<MailIndex>>>,
     /// Последовательность изменений индекса учётной записи: запись и выгрузка, загрузка, вытеснение, замена.
     gates: Mutex<HashMap<Key, Arc<AsyncMutex<()>>>>,
+    /// Перестраиваемые индексы: строятся рядом с действующими и получают те же изменения индексатора.
+    shadows: Mutex<HashMap<Key, Arc<MailIndex>>>,
 }
 
 impl IndexManager {
@@ -395,7 +405,60 @@ impl IndexManager {
             cfg,
             open: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
+            shadows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Каталог перестраиваемого индекса учётной записи: рядом с действующим.
+    pub fn shadow_path(&self, scope: AccountScope) -> PathBuf {
+        self.cfg
+            .dir
+            .join(scope.tenant.to_string())
+            .join(format!("{}.rebuild", scope.account))
+    }
+
+    /// Перестраиваемый индекс учётной записи, если перестройка идёт.
+    pub fn shadow(&self, scope: AccountScope) -> Option<Arc<MailIndex>> {
+        lock(&self.shadows)
+            .get(&(scope.tenant, scope.account))
+            .cloned()
+    }
+
+    /// Начинает перестройку: пустой индекс в [`IndexManager::shadow_path`] (прежний каталог удаляется).
+    /// Блокирующий.
+    pub(crate) fn begin_shadow(&self, scope: AccountScope) -> Result<Arc<MailIndex>> {
+        let path = self.shadow_path(scope);
+        remove_dir(&path)?;
+        std::fs::create_dir_all(&path)?;
+        let index = Arc::new(MailIndex::open(&path, self.cfg.writer_memory_bytes)?);
+        lock(&self.shadows).insert((scope.tenant, scope.account), index.clone());
+        Ok(index)
+    }
+
+    /// Отменяет перестройку: перестраиваемый индекс и его каталог удаляются. Блокирующий.
+    pub(crate) fn drop_shadow(&self, scope: AccountScope) -> Result<()> {
+        lock(&self.shadows).remove(&(scope.tenant, scope.account));
+        remove_dir(&self.shadow_path(scope))
+    }
+
+    /// Заменяет действующий индекс перестроенным: каталог перестройки становится каталогом индекса.
+    /// Вызывать под [`IndexManager::lock`]. Блокирующий.
+    pub(crate) fn promote_shadow(&self, scope: AccountScope) -> Result<Arc<MailIndex>> {
+        let key = (scope.tenant, scope.account);
+        let shadow = lock(&self.shadows)
+            .remove(&key)
+            .ok_or_else(|| Error::internal("search index is not being rebuilt"))?;
+        let synced = shadow.synced();
+        drop(shadow);
+        let mut open = lock(&self.open);
+        open.remove(&key);
+        let path = self.path(scope);
+        remove_dir(&path)?;
+        std::fs::rename(self.shadow_path(scope), &path)?;
+        let index = Arc::new(MailIndex::open(&path, self.cfg.writer_memory_bytes)?);
+        index.set_synced(synced);
+        open.insert(key, index.clone());
+        Ok(index)
     }
 
     /// Захватывает индекс учётной записи для изменения (запись с выгрузкой, загрузка, вытеснение,
@@ -432,10 +495,7 @@ impl IndexManager {
     /// дорабатывают по открытым файлам. Блокирующий.
     pub fn evict(&self, scope: AccountScope) -> Result<()> {
         self.forget(scope);
-        match std::fs::remove_dir_all(self.path(scope)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
-        }
+        remove_dir(&self.path(scope))
     }
 
     /// Индекс учётной записи; нет — создаётся пустой. Блокирующий.
