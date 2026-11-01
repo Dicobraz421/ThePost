@@ -1,10 +1,14 @@
-//! `thepost serve`: сборка узла по config.yaml и работа до сигнала остановки (SRS 2.1, 2.7; APP-01).
+//! `thepost serve`: сборка узла по config.yaml и работа до сигнала остановки (SRS 2.1, 2.7; APP-01, APP-04).
 //!
 //! Порядок запуска: конфигурация (мягкий режим, неизвестные поля — предупреждение) → телеметрия → хранилище
 //! секретов (OpenBao/Vault по секции `secrets`; секреты конфигурации читаются при запуске и перечитывании) →
-//! PostgreSQL (с ротацией динамических учётных данных) и миграции → модули → членство узла и распределитель разделов журнала → BLOB, шина →
-//! роли → служебный HTTP (`/healthz/ready` — 200, когда готовы все роли узла). Остановка: роли проходят drain,
-//! узел покидает членство, служебный HTTP и фоновые задачи останавливаются последними.
+//! PostgreSQL (с ротацией динамических учётных данных) и миграции (от `database.owner`, если задан) → модули →
+//! членство узла и распределитель разделов журнала → BLOB, шина → сертификаты TLS → сервисы ролей (вход, хранилище
+//! писем, поиск, очередь SMTP; `services`) → монитор нагрузки узла → роли (`protocols`, `roles`) → служебный HTTP
+//! (`/healthz/ready` — 200, когда готовы все роли узла). Остановка: роли проходят drain, узел покидает членство,
+//! служебный HTTP и фоновые задачи останавливаются последними.
+//!
+//! Проверка учётной записи и ограничения ролей (seccomp, Landlock) — до рантайма tokio (`startup`, из `main`).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,7 +20,7 @@ use tp_cluster::{PartitionAssignerConfig, RendezvousAssigner};
 use tp_contracts::events::{EventLog, PartitionAssigner};
 use tp_contracts::lease::LeaseStore;
 use tp_contracts::membership::{Membership, NodeId};
-use tp_contracts::role::{CancellationToken, Role, fixed_config};
+use tp_contracts::role::{CancellationToken, Role, RoleService, fixed_config};
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
 use tp_meta::events::EventConsumer;
@@ -24,16 +28,22 @@ use tp_meta::{MetaConfig, PgMeta};
 use tp_platform::roles::RssGauge;
 use tp_platform::service_http;
 use tp_platform::{
-    Config, Health, Metrics, Reloader, RoleSpec, Roles, RolesReport, RuntimeConfig,
-    ServiceHttpConfig, Telemetry, TelemetryConfig, TlsCerts, TlsConfig,
+    Config, Health, LoadConfig, Metrics, NodeLoad, Reloader, RoleSpec, Roles, RolesReport,
+    RuntimeConfig, ServiceHttpConfig, Telemetry, TelemetryConfig, TlsCerts, TlsConfig,
+    section_watch,
 };
-use tp_sys::NodeResources;
+use tp_search::SearchConfig;
+use tp_smtp::dkim_sign::DkimSign;
+use tp_smtp::{Mode, SmtpConfig, SmtpOutService};
+use tp_sys::{NodeResources, ResourcesConfig};
 
 use crate::infra;
 use crate::modules;
+use crate::protocols::{Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, SmtpRole, Sockets};
 use crate::roles::{Maintenance, PendingRole};
 use crate::secrets;
-use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection};
+use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection, HttpSection};
+use crate::services::{Base, Services};
 
 /// Параметры запуска узла.
 pub struct ServeOptions {
@@ -67,6 +77,8 @@ pub struct Running {
     pub node: NodeId,
     /// Адрес служебного HTTP.
     pub service_addr: SocketAddr,
+    /// Фактические адреса слушателей ролей.
+    pub listeners: Bound,
     task: JoinHandle<RolesReport>,
 }
 
@@ -164,6 +176,56 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let bus = infra::open_bus(&cfg, store.as_ref()).await?;
     let counters = bus.counters.clone();
     metrics.register_bus(move || infra::bus_sample(counters.snapshot()));
+    let bus = bus.bus;
+
+    // Фоновые задачи узла живут дольше ролей: служебный HTTP отвечает 503 во время drain.
+    let aux = CancellationToken::new();
+    let service = (*cfg.section::<ServiceHttpConfig>("service_http")?).clone();
+    let tls = cfg.section::<TlsConfig>("tls")?;
+    // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
+    let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
+        let certs = Arc::new(TlsCerts::load(&tls).await.map_err(|e| {
+            infra::context(
+                "tls",
+                match e {
+                    Error::Invalid(m) => Error::Invalid(format!(
+                        "сертификаты TLS: {m} (служебный HTTP без TLS — только profile: dev и service_http.allow_plaintext)"
+                    )),
+                    other => other,
+                },
+            )
+        })?);
+        tokio::spawn(certs.clone().run(aux.clone()));
+        Some(certs)
+    } else {
+        None
+    };
+
+    let services = Services::build(Base {
+        cfg: &cfg,
+        meta: meta.clone(),
+        blob: blob.clone(),
+        bus: bus.clone(),
+        secrets: store.clone(),
+        ext: &ext,
+        metrics: &metrics,
+    })
+    .await?;
+    // Ротация ключей DKIM без перезапуска (SMTP-08).
+    tokio::spawn(apply_dkim(
+        reloader.subscribe(),
+        services.dkim.clone(),
+        aux.clone(),
+    ));
+
+    // Уровень нагрузки узла по ресурсам cgroups (PLT-15): роли читают его из `RoleCtx::load`.
+    let load = NodeLoad::start(
+        (*cfg.section::<LoadConfig>("load")?).clone(),
+        tp_sys::watch_resources(&*cfg.section::<ResourcesConfig>("resources")?).await,
+        Some(reloader.subscribe()),
+        &metrics,
+        aux.clone(),
+    );
 
     let holder = format!("{node}/{}", std::process::id());
     let runtime = (*cfg.section::<RuntimeConfig>("runtime")?).clone();
@@ -172,7 +234,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         cfg.roles().clone(),
         &NodeResources::detect(),
     )
-    .with_updates(reloader.subscribe());
+    .with_updates(reloader.subscribe())
+    .with_load(load.shared());
     let leases: Arc<dyn LeaseStore> = Arc::new(meta.clone());
     let events = EventConsumer::new(
         Arc::new(meta.clone()) as Arc<dyn EventLog>,
@@ -184,29 +247,36 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         Arc::new(assigner) as Arc<dyn PartitionAssigner>,
         node.clone(),
     );
-    let mut maintenance = Some(Maintenance {
+    let maintenance = Maintenance {
         index: Arc::new(meta.clone()),
         store: blob.clone(),
         leases,
         holder,
-        events,
+        events: events.clone(),
         sinks: ext.event_sinks().to_vec(),
         events_poll: cluster.events_poll_interval,
         gc: blob_cfg.gc.clone(),
         orphans: blob_cfg.orphans.clone(),
-    });
+    };
+    let bound = Bound::default();
+    let mut setup = RoleSetup {
+        cfg: &cfg,
+        services: &services,
+        ext: &ext,
+        certs: certs.clone(),
+        sockets: Sockets::new(bound.clone()),
+        bound: bound.clone(),
+        updates: reloader.subscribe(),
+        events,
+        events_poll: cluster.events_poll_interval,
+        maintenance: Some(maintenance),
+    };
     for role in Role::ALL.iter().copied() {
-        roles.add(role, |_limits| {
-            let service: Arc<dyn tp_contracts::role::RoleService> = match (role, maintenance.take())
-            {
-                (Role::Maintenance, Some(m)) => Arc::new(m),
-                _ => Arc::new(PendingRole(role)),
-            };
-            RoleSpec {
-                service,
-                config: fixed_config(()),
-            }
-        });
+        if !cfg.roles().contains(role) {
+            continue;
+        }
+        let spec = setup.spec(role)?;
+        roles.add(role, move |_limits| spec);
     }
     for role in ext.roles() {
         roles.add_module(RoleSpec {
@@ -214,35 +284,13 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             config: fixed_config(()),
         });
     }
-    // Шина нужна ролям протоколов (Ф1); до них её держит узел.
-    let bus = bus.bus;
+    drop(services);
 
-    // Фоновые задачи узла живут дольше ролей: служебный HTTP отвечает 503 во время drain.
-    let aux = CancellationToken::new();
     let health = Health::default();
-    let service = (*cfg.section::<ServiceHttpConfig>("service_http")?).clone();
     let listener = service_http::bind(&service)?;
     let service_addr = listener
         .local_addr()
         .map_err(|e| Error::Internal(format!("service_http: {e}")))?;
-    let certs = if service.allow_plaintext {
-        None
-    } else {
-        let tls = cfg.section::<TlsConfig>("tls")?;
-        let certs = Arc::new(TlsCerts::load(&tls).await.map_err(|e| {
-            infra::context(
-                "tls",
-                match e {
-                    Error::Invalid(m) => Error::Invalid(format!(
-                        "сертификаты служебного HTTP: {m} (открытый HTTP — только profile: dev и service_http.allow_plaintext)"
-                    )),
-                    other => other,
-                },
-            )
-        })?);
-        tokio::spawn(certs.clone().run(aux.clone()));
-        Some(certs)
-    };
     // Проверка секции и сертификатов — до запуска ролей: ошибка не оставляет полузапущенный узел.
     service
         .check(cfg.profile())
@@ -305,8 +353,128 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         metrics,
         node,
         service_addr,
+        listeners: bound,
         task,
     })
+}
+
+/// Сборка сервисов включённых ролей ядра.
+struct RoleSetup<'a> {
+    cfg: &'a Config,
+    services: &'a Services,
+    ext: &'a tp_contracts::ext::Registry,
+    certs: Option<Arc<TlsCerts>>,
+    sockets: Sockets,
+    bound: Bound,
+    updates: tokio::sync::watch::Receiver<Arc<Config>>,
+    events: EventConsumer,
+    events_poll: Duration,
+    maintenance: Option<Maintenance>,
+}
+
+impl RoleSetup<'_> {
+    /// Сервис роли `role` и источник её секции. Ленивая инициализация (SRS 2.7): только для включённых ролей.
+    fn spec(&mut self, role: Role) -> Result<RoleSpec> {
+        let section = |name: &str| section_watch(self.updates.clone(), name);
+        let smtp = || self.cfg.section::<SmtpConfig>(sections::SMTP);
+        let http = self.cfg.section::<HttpSection>(sections::HTTP)?;
+        let profile = self.cfg.profile();
+        let (service, config): (Arc<dyn RoleService>, _) = match role {
+            Role::SmtpIn | Role::Submission => {
+                let mode = if role == Role::SmtpIn {
+                    Mode::Inbound
+                } else {
+                    Mode::Submission
+                };
+                let deps = self.services.smtp_server(&*smtp()?, self.certs.clone())?;
+                (
+                    Arc::new(SmtpRole::new(mode, deps, self.sockets.clone())),
+                    section(sections::SMTP)?,
+                )
+            }
+            Role::SmtpOut => {
+                let worker = self.services.queue_worker(&*smtp()?)?;
+                (
+                    Arc::new(SmtpOutService::new(Arc::new(worker))),
+                    section(sections::SMTP)?,
+                )
+            }
+            Role::Imap => (
+                Arc::new(ImapRole::new(
+                    self.services.imap(),
+                    self.certs.clone(),
+                    self.sockets.clone(),
+                )),
+                section(sections::IMAP)?,
+            ),
+            Role::Jmap => {
+                let cfg = (*self.cfg.section::<tp_jmap::JmapConfig>(sections::JMAP)?).clone();
+                let jmap = Arc::new(self.services.jmap(self.ext, cfg)?);
+                let stop = jmap.clone();
+                let service = HttpRole::new(
+                    role,
+                    jmap.router(),
+                    http.jmap.clone(),
+                    profile,
+                    self.certs.clone(),
+                    self.bound.clone(),
+                )
+                .on_stop(Arc::new(move || stop.shutdown()));
+                (Arc::new(service), fixed_config(()))
+            }
+            Role::Admin => {
+                let cfg = (*self.cfg.section::<tp_admin::AdminConfig>(sections::ADMIN)?).clone();
+                let admin = Arc::new(self.services.admin(self.ext, cfg)?);
+                let service = HttpRole::new(
+                    role,
+                    admin.router(),
+                    http.admin.clone(),
+                    profile,
+                    self.certs.clone(),
+                    self.bound.clone(),
+                );
+                (Arc::new(service), fixed_config(()))
+            }
+            Role::Search => (Arc::new(InProcessRole(role)), fixed_config(())),
+            Role::Indexer => {
+                let search = self.cfg.section::<SearchConfig>(sections::SEARCH)?;
+                let service = IndexerRole::new(
+                    self.events.clone(),
+                    self.services.indexer(&search),
+                    self.services.rebuilder(&search),
+                    self.services.meta.clone(),
+                    self.events_poll,
+                    self.cfg.section::<ClusterSection>(CLUSTER)?.rebuild_scan,
+                );
+                (Arc::new(service), fixed_config(()))
+            }
+            Role::Maintenance => match self.maintenance.take() {
+                Some(m) => (Arc::new(m), fixed_config(())),
+                None => (Arc::new(PendingRole(role)), fixed_config(())),
+            },
+            _ => (Arc::new(PendingRole(role)), fixed_config(())),
+        };
+        Ok(RoleSpec { service, config })
+    }
+}
+
+/// Новые ключи и селекторы DKIM из перечитанной секции `smtp.dkim` (ротация без перезапуска, SMTP-08).
+async fn apply_dkim(
+    mut rx: tokio::sync::watch::Receiver<Arc<Config>>,
+    dkim: Arc<DkimSign>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            changed = rx.changed() => if changed.is_err() { return },
+        }
+        let section = rx.borrow_and_update().section::<SmtpConfig>(sections::SMTP);
+        match section {
+            Ok(smtp) => dkim.update(smtp.dkim.clone()),
+            Err(e) => tracing::warn!(error = %e, "секция smtp.dkim не применена"),
+        }
+    }
 }
 
 /// Продление записи узла с периодом `period` до остановки.

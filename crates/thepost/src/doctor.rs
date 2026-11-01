@@ -1,5 +1,6 @@
 //! `thepost doctor [--json]` (SRS 5.5, 3.1; APP-02): проверки окружения узла — конфигурация, хранилище секретов,
-//! СУБД (проверки `tp-meta`), BLOB (запись, чтение и удаление пробного объекта), синхронизация часов узла и СУБД.
+//! СУБД (проверки `tp-meta`), BLOB (запись, чтение и удаление пробного объекта), синхронизация часов узла и СУБД,
+//! минимальные привилегии процесса (PLT-16): учётная запись, capabilities, no_new_privs, seccomp, Landlock.
 //!
 //! Вывод — таблица или JSON; код возврата ≠ 0, если хотя бы одна проверка не пройдена (`fail`).
 
@@ -213,6 +214,11 @@ pub async fn check(cfg: &Config, store: Option<Arc<dyn SecretStore>>, report: &m
         .unwrap_or_default();
     // Хранилище секретов (PLT-12): `secrets_store` → `secrets.store` и т. д.
     for c in secrets::doctor(cfg).await.checks {
+        let id = c.id.replacen('_', ".", 1);
+        report.push(&id, c.status.into(), c.value, c.message);
+    }
+    // Привилегии процесса (PLT-16): `privileges_user` → `privileges.user` и т. д.
+    for c in tp_platform::privileges::doctor(cfg).await.checks {
         let id = c.id.replacen('_', ".", 1);
         report.push(&id, c.status.into(), c.value, c.message);
     }
