@@ -2,12 +2,15 @@
 //!
 //! - [`server`] — каркас: HTTP (`axum`), OpenAPI (`utoipa`), вход Bearer OIDC, роли администраторов с областью,
 //!   маршруты модулей, ошибки;
-//! - [`audit`] — журнал аудита изменений.
+//! - [`audit`] — журнал аудита изменений;
+//! - [`accounts`] — организация, домены, учётные записи, квоты и политики уровней.
 
+pub mod accounts;
 pub mod audit;
 pub mod server;
 #[cfg(test)]
 mod testenv;
 
+pub use accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
 pub use audit::{AuditRecord, AuditSink, LogAudit};
 pub use server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};

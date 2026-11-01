@@ -29,10 +29,13 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::ext::{AdminRequest, AdminRoutes};
+use tp_contracts::meta::{AccountStore, PolicyResolver};
+use tp_contracts::retention::Quota;
 use tp_contracts::{Error, Result, TenantId};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
+use crate::accounts::{DomainStore, PolicyStore};
 use crate::audit::{AuditRecord, AuditSink};
 
 /// Начало префикса маршрутов модуля.
@@ -159,6 +162,16 @@ pub struct Deps {
     pub audit: Arc<dyn AuditSink>,
     /// Маршруты модулей (`Registry::admin_routes`).
     pub modules: Vec<Arc<dyn AdminRoutes>>,
+    /// Учётные записи.
+    pub accounts: Arc<dyn AccountStore>,
+    /// Использование квот.
+    pub quota: Arc<dyn Quota>,
+    /// Запись политик уровней.
+    pub policies: Arc<dyn PolicyStore>,
+    /// Действующие политики.
+    pub resolver: Arc<dyn PolicyResolver>,
+    /// Домены.
+    pub domains: Arc<dyn DomainStore>,
 }
 
 impl fmt::Debug for Deps {
@@ -203,6 +216,7 @@ impl Admin {
     /// Маршруты Admin API; TLS, слушатель (по умолчанию — внутренние адреса) — у вызывающего (`tp-platform`).
     pub fn router(self: Arc<Self>) -> Router {
         let mut api: Router<Arc<Admin>> = Router::new().route("/api/v1/whoami", get(whoami));
+        api = crate::accounts::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -482,8 +496,15 @@ impl Modify for BearerAuth {
     }
 }
 
+/// Спецификация OpenAPI всех встроенных маршрутов.
+pub fn openapi_spec() -> utoipa::openapi::OpenApi {
+    let mut api = ApiDoc::openapi();
+    api.merge(crate::accounts::Doc::openapi());
+    api
+}
+
 async fn openapi() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+    Json(openapi_spec())
 }
 
 #[cfg(test)]
@@ -630,9 +651,8 @@ mod tests {
     #[test]
     fn module_prefixes_and_config() {
         let deps = |modules: Vec<Arc<dyn AdminRoutes>>| Deps {
-            auth: Arc::new(tp_testkit::FakeAuthenticator::default()),
-            audit: Arc::new(crate::LogAudit),
             modules,
+            ..crate::testenv::deps()
         };
         let twice: Vec<Arc<dyn AdminRoutes>> = vec![Arc::new(Echo), Arc::new(Echo)];
         assert_eq!(
