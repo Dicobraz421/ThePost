@@ -29,6 +29,7 @@ use tp_contracts::{BlobKey, Error, Result, TenantId};
 
 use crate::config::{QueueConfig, SmtpConfig};
 use crate::deliver::Outbound;
+use crate::dkim_sign::DkimSign;
 use crate::dsn::{self, DsnSink};
 
 pub mod send;
@@ -141,22 +142,47 @@ impl QueueDeps {
     }
 }
 
-/// Постановка в очередь исходящей почты ([`Outbound`] для доставки).
+/// Постановка в очередь исходящей почты ([`Outbound`] для доставки); с [`Queue::with_dkim`] письма
+/// подписываются DKIM перед постановкой.
 #[derive(Debug, Clone)]
 pub struct Queue {
     deps: QueueDeps,
+    dkim: Option<Arc<DkimSign>>,
 }
 
 impl Queue {
     /// Очередь поверх хранилищ `deps`.
     pub fn new(deps: QueueDeps) -> Self {
-        Self { deps }
+        Self { deps, dkim: None }
+    }
+
+    /// Подпись DKIM исходящих писем (SMTP-08).
+    pub fn with_dkim(mut self, dkim: Arc<DkimSign>) -> Self {
+        self.dkim = Some(dkim);
+        self
+    }
+
+    /// Письмо с подписью DKIM, если домен `From` подписывается.
+    async fn signed(&self, raw: Bytes) -> Result<Bytes> {
+        let Some(dkim) = &self.dkim else {
+            return Ok(raw);
+        };
+        Ok(match dkim.sign(&raw).await? {
+            Some(header) => {
+                let mut out = Vec::with_capacity(header.len() + raw.len());
+                out.extend_from_slice(header.as_bytes());
+                out.extend_from_slice(&raw);
+                Bytes::from(out)
+            }
+            None => raw,
+        })
     }
 }
 
 #[async_trait]
 impl DsnSink for Queue {
     async fn send_dsn(&self, tenant: TenantId, to: &str, raw: Bytes) -> Result<()> {
+        let raw = self.signed(raw).await?;
         self.deps.put(tenant, "", vec![OutRcpt::new(to)], raw).await
     }
 }
@@ -177,6 +203,7 @@ impl Outbound for Queue {
             .filter(|r| seen.insert(r.to_lowercase()))
             .map(OutRcpt::new)
             .collect();
+        let raw = self.signed(raw).await?;
         self.deps.put(tenant, mail_from, rcpts, raw).await
     }
 }
@@ -513,4 +540,4 @@ fn dsn_rcpt(r: &QueuedRcpt, action: dsn::Action, reply: &str) -> dsn::Recipient 
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

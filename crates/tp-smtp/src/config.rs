@@ -24,6 +24,13 @@
 //!   queue:
 //!     retry: [5m, 15m, 30m, 1h, 2h, 4h, 8h]
 //!     expire: 5d
+//!   dkim:
+//!     domains:
+//!       example.org:
+//!         selector: s2026
+//!         keys:
+//!           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim/example.org#s2026" } }
+//!           e2026: { algorithm: ed25519-sha256, key: { secret: "thepost/dkim/example.org#e2026" } }
 //! ```
 //!
 //! Слушатели (`inbound`, `submission`) применяются при запуске роли; лимиты и таймауты — к новым сессиям
@@ -59,6 +66,8 @@ pub struct SmtpConfig {
     pub milter: MilterConfig,
     /// Очередь исходящей почты и отправка (роль smtp-out).
     pub queue: QueueConfig,
+    /// DKIM-подпись исходящей почты.
+    pub dkim: DkimConfig,
 }
 
 impl Default for SmtpConfig {
@@ -73,6 +82,7 @@ impl Default for SmtpConfig {
             authcheck: AuthCheckConfig::default(),
             milter: MilterConfig::default(),
             queue: QueueConfig::default(),
+            dkim: DkimConfig::default(),
         }
     }
 }
@@ -311,4 +321,74 @@ pub enum OutboundTls {
     Opportunistic,
     /// Только STARTTLS с проверкой сертификата по системным корням; иначе — временная неудача.
     Require,
+}
+
+/// DKIM-подпись исходящей почты (RFC 6376). Применяется без перезапуска.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct DkimConfig {
+    /// Домены подписи (домен адреса `From`, нижний регистр) → селекторы и ключи.
+    pub domains: std::collections::BTreeMap<String, DkimDomain>,
+    /// Подписываемые заголовки.
+    pub headers: Vec<String>,
+    /// Время жизни разобранного ключа в кэше (затем перечитывается из хранилища секретов).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub key_refresh: Duration,
+}
+
+impl Default for DkimConfig {
+    fn default() -> Self {
+        Self {
+            domains: Default::default(),
+            headers: [
+                "From",
+                "To",
+                "Cc",
+                "Subject",
+                "Date",
+                "Message-ID",
+                "Reply-To",
+                "In-Reply-To",
+                "References",
+                "MIME-Version",
+                "Content-Type",
+                "Content-Transfer-Encoding",
+            ]
+            .map(String::from)
+            .to_vec(),
+            key_refresh: Duration::from_secs(3600),
+        }
+    }
+}
+
+/// Ключи домена.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DkimDomain {
+    /// Активный селектор: им подписываются письма (ротация — переключение на новый).
+    pub selector: String,
+    /// Ключи по селекторам (старые остаются для истории ротации).
+    pub keys: std::collections::BTreeMap<String, DkimKeyConfig>,
+}
+
+/// Ключ селектора.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DkimKeyConfig {
+    /// Алгоритм.
+    pub algorithm: DkimAlgorithm,
+    /// Закрытый ключ (PEM) в хранилище секретов.
+    pub key: tp_contracts::secrets::SecretRef,
+}
+
+/// Алгоритм подписи.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+pub enum DkimAlgorithm {
+    /// RSA-SHA256 (RFC 6376).
+    #[serde(rename = "rsa-sha256")]
+    RsaSha256,
+    /// Ed25519-SHA256 (RFC 8463).
+    #[serde(rename = "ed25519-sha256")]
+    Ed25519Sha256,
 }
