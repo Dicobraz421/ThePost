@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
 use time::OffsetDateTime;
-use tp_contracts::blob::{Acquire, ByteStream, Commit};
+use tp_contracts::blob::ByteStream;
 use tp_contracts::ext::{CopyTo, Decision, DeliveryInfo};
 use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, Ingested};
 use tp_contracts::meta::{AccountScope, Flags, NewMessage, PartRef};
@@ -294,7 +294,10 @@ impl Store {
         }
     }
 
-    /// Учитывает объект с `refs` ссылками и загружает его, если его ещё нет (SRS 3.4, шаги 2–3).
+    /// Учитывает объект с `refs` ссылками и загружает его, если его ещё нет (SRS 3.4, шаги 2–3), через
+    /// [`tp_blob::BlobWriter`]: хэш `hash` и размер — исходного содержимого, хранится сжатый вид, если сжатие
+    /// выгодно (BLOB-13). Тип части не передаётся: тела в кодировке передачи (base64), формат распознаётся по
+    /// сигнатуре, порог выигрыша решает остальное.
     async fn store_object(
         &self,
         tenant: TenantId,
@@ -302,39 +305,7 @@ impl Store {
         data: Bytes,
         refs: u32,
     ) -> Result<BlobKey> {
-        let mut generation = match self.d.index.acquire(tenant, &hash, refs).await? {
-            Acquire::Existing { generation } => {
-                return Ok(BlobKey {
-                    tenant,
-                    hash,
-                    generation,
-                });
-            }
-            Acquire::Absent { generation } => generation,
-        };
-        loop {
-            let key = BlobKey {
-                tenant,
-                hash,
-                generation,
-            };
-            self.d.blobs.put(&key, data.clone()).await?;
-            match self
-                .d
-                .index
-                .commit_new(tenant, &hash, generation, data.len() as u64, refs)
-                .await?
-            {
-                Commit::Done { generation } => {
-                    return Ok(BlobKey {
-                        tenant,
-                        hash,
-                        generation,
-                    });
-                }
-                Commit::Bumped { generation: next } => generation = next,
-            }
-        }
+        self.writer.write_part(tenant, hash, data, refs, None).await
     }
 
     /// Снимает ссылки (сбой приёма). Ошибка снятия — в журнал: объект останется до ручной сверки.
@@ -423,7 +394,7 @@ mod tests {
     use tp_testkit::Clock;
     use tp_testkit::{BlobOp, SystemClock};
 
-    use crate::testenv::{Env, stream};
+    use crate::testenv::{Env, object, stream};
 
     fn mail() -> Vec<u8> {
         tp_testkit::corpus::corpus_mail("mixed-three-attachments")
@@ -465,13 +436,13 @@ mod tests {
     /// Письмо, собранное из объектов хранилища (скелет + части по `PartRef`).
     async fn stored(env: &Env, scope: AccountScope, id: MessageId) -> Vec<u8> {
         let msg = env.meta.get(scope, id).await.expect("get").expect("msg");
-        let skel = env.blobs.bytes(&msg.skeleton.path()).expect("skeleton");
+        let skel = object(env, &msg.skeleton).await;
         let skel = crate::split::Skeleton::decode(skel).expect("decode");
-        skel.join(|path| {
-            let p = msg.parts.iter().find(|p| p.part == path)?;
-            env.blobs.bytes(&p.blob.path())
-        })
-        .expect("join")
+        let mut parts = HashMap::new();
+        for p in &msg.parts {
+            parts.insert(p.part.clone(), object(env, &p.blob).await);
+        }
+        skel.join(|path| parts.get(path).cloned()).expect("join")
     }
 
     async fn inbox_count(env: &Env, d: &Delivery) -> usize {
@@ -536,6 +507,102 @@ mod tests {
         for h in &unique {
             assert_eq!(env.index.row(TenantId::DEFAULT, h).expect("row").refcnt, 12);
         }
+    }
+
+    /// Приёмка MS-15: текстовая часть хранится сжатой (zstd), читается без изменений; хэш, размер и
+    /// дедупликация — по исходному содержимому.
+    #[tokio::test]
+    async fn text_part_stored_compressed() {
+        use tp_contracts::blob::{BlobIndex, Compression};
+
+        let env = Env::new();
+        let text = "Съешь же ещё этих мягких французских булок, да выпей чаю.\r\n".repeat(100);
+        let raw = format!(
+            "From: a@example.org\r\nTo: u0@example.org\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+             --b\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n\
+             {text}\r\n--b\r\nContent-Type: text/plain\r\n\r\nshort\r\n--b--\r\n"
+        )
+        .into_bytes();
+        let split = Split::new(Bytes::from(raw.clone()));
+        let cut = split
+            .cuts()
+            .iter()
+            .find(|c| split.body(c).len() >= text.len())
+            .expect("text part");
+        let ds = recipients(&env, 2).await;
+        let done = env
+            .store
+            .ingest(request(&raw, ds.clone()))
+            .await
+            .expect("ingest")
+            .delivered;
+        let scope = AccountScope {
+            tenant: TenantId::DEFAULT,
+            account: ds[0].account,
+        };
+        let msg = env
+            .meta
+            .get(scope, done[0].message)
+            .await
+            .expect("get")
+            .expect("msg");
+        let part = msg
+            .parts
+            .iter()
+            .find(|p| p.part == cut.path)
+            .expect("part ref");
+        assert_eq!(part.blob.hash, cut.hash, "хэш — исходного содержимого");
+        assert_eq!(part.blob.hash, split::hash(&split.body(cut)));
+        assert_eq!(
+            env.index
+                .compression(&part.blob)
+                .await
+                .expect("compression"),
+            Some(Compression::Zstd)
+        );
+        let kept = env.blobs.bytes(&part.blob.path()).expect("object");
+        assert!(
+            kept.len() < split.body(cut).len() / 2,
+            "сжато: {} из {}",
+            kept.len(),
+            split.body(cut).len()
+        );
+        assert_eq!(
+            env.index
+                .row(TenantId::DEFAULT, &cut.hash)
+                .expect("row")
+                .size,
+            split.body(cut).len() as u64,
+            "размер в учёте — исходный"
+        );
+        assert!(object(&env, &part.blob).await == split.body(cut));
+        let got: Vec<Bytes> = env
+            .store
+            .fetch_raw(scope, done[0].message, None)
+            .await
+            .expect("fetch")
+            .try_collect()
+            .await
+            .expect("read");
+        assert!(got.concat() == raw, "письмо читается без изменений");
+        let m = env.store.writer_metrics();
+        assert!(m.compressed >= 1, "{m:?}");
+
+        // Дедупликация: та же часть — без новых загрузок, ссылки добавляются.
+        let puts = env.blobs.calls(BlobOp::Put);
+        env.store
+            .ingest(request(&raw, ds[..1].to_vec()))
+            .await
+            .expect("again");
+        assert_eq!(env.blobs.calls(BlobOp::Put), puts);
+        assert_eq!(
+            env.index
+                .row(TenantId::DEFAULT, &cut.hash)
+                .expect("row")
+                .refcnt,
+            3
+        );
     }
 
     #[tokio::test]
