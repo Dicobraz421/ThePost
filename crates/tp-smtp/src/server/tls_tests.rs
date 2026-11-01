@@ -109,6 +109,7 @@ impl Server {
             shutdown: shutdown.clone(),
             drain_deadline: Duration::from_secs(1),
             ready: ReadyHandle::default(),
+            load: tp_contracts::load::fixed_load(tp_contracts::load::LoadLevel::Normal),
         };
         let task = tokio::spawn(async move { svc.serve(vec![listener], ctx).await });
         Self {
@@ -325,6 +326,7 @@ async fn submission_role_requires_certificates() {
         shutdown: CancellationToken::new(),
         drain_deadline: Duration::from_secs(1),
         ready: ReadyHandle::default(),
+        load: tp_contracts::load::fixed_load(tp_contracts::load::LoadLevel::Normal),
     };
     use tp_contracts::role::RoleService;
     assert!(matches!(

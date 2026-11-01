@@ -13,6 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+pub use crate::load::{LoadLevel, LoadMonitor, fixed_load};
 
 macro_rules! str_enum {
     ($(#[$m:meta])* $name:ident { $($(#[$vm:meta])* $v:ident = $s:literal,)+ }) => {
@@ -221,6 +222,9 @@ pub struct RoleCtx {
     pub drain_deadline: Duration,
     /// Признак готовности.
     pub ready: ReadyHandle,
+    /// Уровень нагрузки узла (SRS 6.3): на `Elevated` фоновые задания приостанавливаются,
+    /// на `High` новые сессии отклоняются или ограничиваются. Без источников — [`fixed_load`].
+    pub load: Arc<dyn LoadMonitor>,
 }
 
 impl RoleCtx {
@@ -240,6 +244,11 @@ impl RoleCtx {
             std::future::pending::<()>().await;
         }
     }
+
+    /// Текущий уровень нагрузки узла.
+    pub fn load_level(&self) -> LoadLevel {
+        self.load.level()
+    }
 }
 
 impl fmt::Debug for RoleCtx {
@@ -248,6 +257,7 @@ impl fmt::Debug for RoleCtx {
             .field("shutdown", &self.shutdown)
             .field("drain_deadline", &self.drain_deadline)
             .field("ready", &self.ready)
+            .field("load", &self.load.level())
             .finish_non_exhaustive()
     }
 }
@@ -342,6 +352,7 @@ mod tests {
             shutdown: shutdown.clone(),
             drain_deadline: Duration::from_secs(1),
             ready: ready.clone(),
+            load: fixed_load(LoadLevel::High),
         };
         assert!(!ctx.shutdown.is_cancelled());
         shutdown.cancel();
@@ -350,6 +361,8 @@ mod tests {
         assert!(ready.is_ready());
         assert_eq!(*ctx.config::<u32>().expect("u32"), 5);
         assert!(ctx.config::<String>().is_err());
+        assert_eq!(ctx.load_level(), LoadLevel::High);
+        assert!(format!("{ctx:?}").contains("High"));
     }
 
     #[test]
@@ -362,6 +375,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             drain_deadline: Duration::from_secs(1),
             ready: ReadyHandle::default(),
+            load: fixed_load(LoadLevel::Normal),
         };
         assert!(
             ctx.config_changed().now_or_never().is_none(),

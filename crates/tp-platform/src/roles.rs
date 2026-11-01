@@ -224,6 +224,7 @@ impl Slot {
             shutdown: shutdown.clone(),
             drain_deadline: deadline,
             ready: self.ready.clone(),
+            load: tp_contracts::load::fixed_load(tp_contracts::load::LoadLevel::Normal),
         };
         tasks
             .spawn(async move {

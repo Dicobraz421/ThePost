@@ -14,6 +14,14 @@
 //! 4. Метаданные письма фиксируются короткой транзакцией после успешной загрузки
 //!    и ссылаются на ключ с поколением из [`Commit::Done`] / [`Acquire::Existing`].
 //!
+//! # Сжатие (SRS 3.2)
+//!
+//! Писатель сжимает объект zstd перед [`BlobStore::put`], если это уменьшает размер; уже сжатые форматы
+//! (архивы, изображения, видео) не сжимает. Хэш и `size` в учёте — от исходного содержимого, признак сжатия
+//! ([`Compression`]) — в записи учёта: [`BlobIndex::commit_new_with`] при записи, [`BlobIndex::compression`]
+//! при чтении. Сжимать можно, только если [`BlobIndex::supports_compression`]. Новое поколение после
+//! [`Commit::Bumped`] записывается с тем же признаком.
+//!
 //! # Протокол удаления
 //!
 //! 1. Удаление пользователем переносит письмо в корзину; ссылки сохраняются.
@@ -75,7 +83,9 @@
 //! }
 //! ```
 
+use std::fmt;
 use std::ops::Range;
+use std::str::FromStr;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -83,7 +93,7 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ids::{BlobHash, BlobKey, Gen, TenantId};
 
 /// Поток байтов объекта.
@@ -152,6 +162,48 @@ pub trait BlobStore: Send + Sync + 'static {
     async fn delete_raw(&self, path: &str) -> Result<()>;
 }
 
+/// Сжатие объекта BLOB (SRS 3.2) — признак в записи учёта. Хэш и размер в учёте — от исходного содержимого.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    /// Объект хранится как есть.
+    #[default]
+    None,
+    /// Объект — кадр zstd исходного содержимого.
+    Zstd,
+}
+
+impl Compression {
+    /// Все значения в порядке объявления.
+    pub const ALL: &'static [Compression] = &[Compression::None, Compression::Zstd];
+
+    /// Строка хранения (`none`, `zstd`) — та же, что в JSON.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Compression::None => "none",
+            Compression::Zstd => "zstd",
+        }
+    }
+}
+
+impl fmt::Display for Compression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Compression {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Compression::ALL
+            .iter()
+            .copied()
+            .find(|c| c.as_str() == s)
+            .ok_or_else(|| Error::invalid(format!("unknown compression: {s}")))
+    }
+}
+
 /// Ответ [`BlobIndex::acquire`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Acquire {
@@ -196,7 +248,7 @@ pub trait BlobIndex: Send + Sync + 'static {
     async fn acquire(&self, tenant: TenantId, hash: &BlobHash, refs: u32) -> Result<Acquire>;
 
     /// Шаг 3 записи: после загрузки объекта `hash/generation` размером `size` создать запись `live`
-    /// с `refs` ссылками.
+    /// с `refs` ссылками. Объект не сжат — то же, что [`BlobIndex::commit_new_with`] с [`Compression::None`].
     async fn commit_new(
         &self,
         tenant: TenantId,
@@ -205,6 +257,34 @@ pub trait BlobIndex: Send + Sync + 'static {
         size: u64,
         refs: u32,
     ) -> Result<Commit>;
+
+    /// Учёт хранит признак сжатия — писатель может сжимать объекты. По умолчанию — нет.
+    fn supports_compression(&self) -> bool {
+        false
+    }
+
+    /// Шаг 3 записи для объекта, записанного со сжатием `compression`; `size` — размер исходного содержимого.
+    /// Создаваемая запись получает признак; при [`Commit::Done`] с поколением параллельно созданной записи
+    /// признак — её (читать [`BlobIndex::compression`] по ключу из ответа).
+    ///
+    /// По умолчанию: [`Compression::None`] — [`BlobIndex::commit_new`], иначе `Error::Internal`
+    /// (учёт без [`BlobIndex::supports_compression`]).
+    async fn commit_new_with(
+        &self,
+        tenant: TenantId,
+        hash: &BlobHash,
+        generation: Gen,
+        size: u64,
+        refs: u32,
+        compression: Compression,
+    ) -> Result<Commit> {
+        match compression {
+            Compression::None => self.commit_new(tenant, hash, generation, size, refs).await,
+            other => Err(Error::internal(format!(
+                "blob index does not store compression {other}"
+            ))),
+        }
+    }
 
     /// Уменьшить счётчик на `refs`; при обнулении зафиксировать `zero_since`.
     /// Уход счётчика ниже нуля — `Error::Conflict`.
@@ -230,6 +310,12 @@ pub trait BlobIndex: Send + Sync + 'static {
 
     /// Есть ли запись с совпадающими хэшем и поколением (поиск «сирот»).
     async fn exists(&self, key: &BlobKey) -> Result<bool>;
+
+    /// Признак сжатия объекта для чтения; `None` — записи с этим поколением нет (как [`BlobIndex::exists`]).
+    /// По умолчанию — [`Compression::None`] для существующей записи.
+    async fn compression(&self, key: &BlobKey) -> Result<Option<Compression>> {
+        Ok(self.exists(key).await?.then_some(Compression::None))
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +327,81 @@ mod tests {
     fn object_safe() {
         fn _store(_: Arc<dyn BlobStore>) {}
         fn _index(_: Arc<dyn BlobIndex>) {}
+    }
+
+    #[test]
+    fn compression_strings() {
+        for c in Compression::ALL {
+            assert_eq!(c.as_str().parse::<Compression>(), Ok(*c));
+            assert_eq!(serde_json::to_string(c).expect("ser"), format!("\"{c}\""));
+        }
+        assert_eq!(Compression::default(), Compression::None);
+        assert!("gzip".parse::<Compression>().is_err());
+    }
+
+    /// Учёт без признака сжатия: методы по умолчанию.
+    struct Plain;
+
+    #[async_trait]
+    impl BlobIndex for Plain {
+        async fn acquire(&self, _: TenantId, _: &BlobHash, _: u32) -> Result<Acquire> {
+            Ok(Acquire::Absent { generation: Gen(1) })
+        }
+        async fn commit_new(
+            &self,
+            _: TenantId,
+            _: &BlobHash,
+            generation: Gen,
+            _: u64,
+            _: u32,
+        ) -> Result<Commit> {
+            Ok(Commit::Done { generation })
+        }
+        async fn release(&self, _: TenantId, _: &BlobHash, _: Gen, _: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn gc_candidates(&self, _: OffsetDateTime, _: usize) -> Result<Vec<BlobKey>> {
+            Ok(Vec::new())
+        }
+        async fn mark_deleting(&self, _: &BlobKey, _: OffsetDateTime) -> Result<bool> {
+            Ok(false)
+        }
+        async fn finalize_delete(&self, _: &BlobKey) -> Result<bool> {
+            Ok(false)
+        }
+        async fn exists(&self, key: &BlobKey) -> Result<bool> {
+            Ok(key.generation == Gen(1))
+        }
+    }
+
+    #[test]
+    fn compression_defaults() {
+        futures::executor::block_on(async {
+            let (t, h) = (TenantId::DEFAULT, BlobHash([1; 32]));
+            assert!(!Plain.supports_compression());
+            assert_eq!(
+                Plain
+                    .commit_new_with(t, &h, Gen(1), 10, 1, Compression::None)
+                    .await,
+                Ok(Commit::Done { generation: Gen(1) })
+            );
+            assert!(matches!(
+                Plain
+                    .commit_new_with(t, &h, Gen(1), 10, 1, Compression::Zstd)
+                    .await,
+                Err(Error::Internal(_))
+            ));
+            let key = |g| BlobKey {
+                tenant: t,
+                hash: h,
+                generation: Gen(g),
+            };
+            assert_eq!(
+                Plain.compression(&key(1)).await,
+                Ok(Some(Compression::None))
+            );
+            assert_eq!(Plain.compression(&key(2)).await, Ok(None));
+        });
     }
 
     #[test]
