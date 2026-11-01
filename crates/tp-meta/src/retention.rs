@@ -17,8 +17,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
 use time::OffsetDateTime;
 use tp_contracts::config::duration;
+use tp_contracts::ext::DecisionHooks;
 use tp_contracts::meta::{AccountScope, MessageStore, Policy, PolicyResolver, QuotaUsage};
-use tp_contracts::retention::{Quota, Restored, TrashItem, TrashObject, TrashStore};
+use tp_contracts::retention::{
+    PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeSetting,
+    TrashStore,
+};
 use tp_contracts::{AccountId, DomainId, Error, MailboxId, MessageId, Result, TenantId};
 use uuid::Uuid;
 
@@ -127,6 +131,8 @@ impl PolicyRow {
             max_recipients: self.max_recipients.map(to_u32).transpose()?,
             dkim_selector: self.dkim_selector,
             milter_profile: self.milter_profile,
+            // Хранение правила `trash.purge` — META-29.
+            trash_purge: None,
         })
     }
 }
@@ -241,6 +247,19 @@ impl PolicyResolver for PgMeta {
         tx.commit().await.map_err(db_err)?;
         Ok(p)
     }
+
+    // Настройка `trash.purge` на PostgreSQL — META-29 (CTR-26 добавил методы контракта).
+    async fn trash_purge(&self, _scope: AccountScope) -> Result<TrashPurgeSetting> {
+        Err(Error::internal("trash.purge: не реализовано (META-29)"))
+    }
+
+    async fn set_user_trash_purge(
+        &self,
+        _scope: AccountScope,
+        _mode: Option<TrashPurge>,
+    ) -> Result<()> {
+        Err(Error::internal("trash.purge: не реализовано (META-29)"))
+    }
 }
 
 // ---------- Корзина ----------
@@ -318,6 +337,25 @@ impl TrashStore for PgMeta {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         rows.into_iter().map(TrashItem::try_from).collect()
+    }
+
+    // Скрытые письма и «очистить корзину» на PostgreSQL — META-29 (CTR-26 добавил методы контракта).
+    async fn list_hidden(
+        &self,
+        _scope: AccountScope,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<Vec<TrashItem>> {
+        Err(Error::internal("trash.purge: не реализовано (META-29)"))
+    }
+
+    async fn purge(
+        &self,
+        _scope: AccountScope,
+        _ids: &[MessageId],
+        _hooks: &DecisionHooks,
+    ) -> Result<PurgeOutcome> {
+        Err(Error::internal("trash.purge: не реализовано (META-29)"))
     }
 
     async fn restore(&self, scope: AccountScope, object: TrashObject) -> Result<Restored> {
