@@ -146,6 +146,7 @@ async fn policy_chain_resolution() {
             max_recipients: Some(50),
             dkim_selector: Some("s1".into()),
             milter_profile: Some("strict".into()),
+            trash_purge: None,
         }
     );
 

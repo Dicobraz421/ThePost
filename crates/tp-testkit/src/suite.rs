@@ -1,5 +1,6 @@
 //! Общие наборы тестов контрактов: in-memory реализации testkit и настоящие реализации полос
 //! (`tp-meta` — `Membership`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие `BlobIndex`,
+//! «очистить корзину» `TrashStore::purge` с настройкой `trash.purge`,
 //! `tp-platform` — `SecretStore`) проходят одни и те же проверки.
 //!
 //! Время в наборах идёт через [`Wait`]: для testkit — [`ManualClock`] (сдвиг без ожидания), для PostgreSQL
@@ -18,6 +19,7 @@
 //! # }
 //! ```
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,17 +31,27 @@ use tp_contracts::blob::{Acquire, BlobIndex, Commit, Compression};
 use tp_contracts::delivery::{
     DeliveryDecision, DeliveryEvent, DeliveryEventKind, DeliveryLog, DeliveryPage, DeliveryQuery,
 };
+use tp_contracts::ext::{Decision, DecisionHook, DecisionHooks, FinalDelete};
 use tp_contracts::groups::{
     DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
 };
 use tp_contracts::membership::{Membership, NodeId};
-use tp_contracts::meta::{AccountScope, MailboxStore, NewMailbox, SpecialUse};
+use tp_contracts::meta::{
+    AccountScope, MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, PolicyResolver,
+    SpecialUse,
+};
+use tp_contracts::retention::{
+    Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule, TrashPurgeSetting,
+    TrashStore,
+};
 use tp_contracts::secrets::{SecretLease, SecretRef, SecretStore};
 use tp_contracts::{
-    AccountId, BlobHash, BlobKey, Error, Gen, GroupId, HeldId, MailboxId, QueueId, TenantId,
+    AccountId, BlobHash, BlobKey, Error, Gen, GroupId, HeldId, MailboxId, MessageId, QueueId,
+    TenantId,
 };
 
 use crate::ManualClock;
+use crate::fakes::{HookCall, RecordingDecisionHook};
 
 /// Ход времени для наборов тестов.
 #[async_trait]
@@ -1009,4 +1021,328 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
     store.remove(t, inner.id).await.expect("remove");
     assert_eq!(store.expand(t, all.id).await, Ok(sorted(vec![a, b])));
     assert_eq!(store.held(t, Some(all.id), 10).await, Ok(vec![h3]));
+}
+
+// ---------- Trash: trash.purge ----------
+
+/// Запись правила администратора `trash.purge` уровня организации для [`trash_purge`]
+/// (запись политик уровней — вне контрактов до CTR-25: in-memory — `MemPolicies`, PostgreSQL — `PgMeta::set_policy`).
+/// Остальные поля политики уровня сохраняются.
+#[async_trait]
+pub trait TrashPurgeAdmin: Send + Sync {
+    /// Задаёт правило организации; `None` — снять.
+    async fn set_tenant_rule(&self, tenant: TenantId, rule: Option<TrashPurgeRule>);
+}
+
+/// Учётная запись для [`trash_purge`]: создаёт тест до запуска набора (системные папки). Набор меняет правило
+/// `trash.purge` её организации и в конце снимает его: другие тесты этой организации параллельно не запускать.
+#[derive(Debug, Clone, Copy)]
+pub struct TrashPurgeFixture {
+    /// Учётная запись.
+    pub scope: AccountScope,
+}
+
+/// Точка принятия решений, отвечающая ошибкой (модуль недоступен).
+struct FailingHook;
+
+#[async_trait]
+impl DecisionHook for FailingHook {
+    fn name(&self) -> &str {
+        "failing"
+    }
+
+    async fn before_final_delete(&self, _op: &FinalDelete) -> tp_contracts::Result<Decision> {
+        Err(Error::internal("hook unavailable"))
+    }
+}
+
+async fn role_folder(
+    mailboxes: &dyn MailboxStore,
+    scope: AccountScope,
+    role: SpecialUse,
+) -> MailboxId {
+    mailboxes
+        .list(scope)
+        .await
+        .expect("mailboxes")
+        .into_iter()
+        .find(|m| m.role == Some(role))
+        .expect("system folder")
+        .id
+}
+
+/// Момент приёма писем набора (целые секунды).
+fn purge_received_at() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("ts")
+}
+
+async fn put_message(
+    messages: &dyn MessageStore,
+    scope: AccountScope,
+    mailbox: MailboxId,
+    size: u64,
+) -> MessageId {
+    let mut hash = [0u8; 32];
+    hash[..16].copy_from_slice(MessageId::new().as_uuid().as_bytes());
+    let msg = NewMessage {
+        skeleton: BlobKey {
+            tenant: scope.tenant,
+            hash: BlobHash(hash),
+            generation: Gen::INITIAL,
+        },
+        parts: Vec::new(),
+        size,
+        received_at: purge_received_at(),
+        flags: Default::default(),
+        meta: Default::default(),
+    };
+    messages
+        .insert(scope, mailbox, msg)
+        .await
+        .expect("insert")
+        .id
+}
+
+/// Письма элементов корзины по возрастанию идентификатора.
+fn trash_ids(items: Vec<TrashItem>) -> Vec<MessageId> {
+    let mut ids: Vec<_> = items
+        .into_iter()
+        .filter_map(|i| match i.object {
+            TrashObject::Message(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn sorted_ids(mut ids: Vec<MessageId>) -> Vec<MessageId> {
+    ids.sort_unstable();
+    ids
+}
+
+/// Набор проверок «очистить корзину» (`TrashStore::purge`, `list_hidden`, `restore`) и настройки `trash.purge`
+/// (`PolicyResolver::trash_purge`, `set_user_trash_purge`): `hide` скрывает письмо (нет в `MessageStore`, в счётчиках
+/// корзины, в квоте), администратор его восстанавливает; `erase` стирает; Legal Hold и ошибка точки принятия решений
+/// не дают стереть; пользователь не меняет значение без `user_can_choose`, значение администратора приоритетнее.
+pub async fn trash_purge(
+    trash: &dyn TrashStore,
+    messages: &dyn MessageStore,
+    mailboxes: &dyn MailboxStore,
+    quota: &dyn Quota,
+    policies: &dyn PolicyResolver,
+    admin: &dyn TrashPurgeAdmin,
+    fx: &TrashPurgeFixture,
+) {
+    let s = fx.scope;
+    let none = DecisionHooks::default();
+    let inbox = role_folder(mailboxes, s, SpecialUse::Inbox).await;
+    let bin = role_folder(mailboxes, s, SpecialUse::Trash).await;
+    let rule = |mode, user_can_choose| {
+        Some(TrashPurgeRule {
+            mode,
+            user_can_choose,
+        })
+    };
+
+    admin.set_tenant_rule(s.tenant, None).await;
+    policies.set_user_trash_purge(s, None).await.expect("reset");
+    assert_eq!(
+        policies.trash_purge(s).await,
+        Ok(TrashPurgeSetting::default())
+    );
+    let base = quota.usage(s).await.expect("usage");
+
+    // По умолчанию — hide: письмо пропадает у пользователя и из квоты, администратор видит его скрытым.
+    let a = put_message(messages, s, inbox, 100).await;
+    let b = put_message(messages, s, inbox, 200).await;
+    let c = put_message(messages, s, inbox, 50).await;
+    messages.to_trash(s, &[a, b]).await.expect("to trash");
+    let out = trash
+        .purge(s, &[a, c, MessageId::new(), a], &none)
+        .await
+        .expect("purge");
+    assert_eq!(out.hidden, [a], "вне корзины и повтор — пропуск");
+    assert!(out.erased.is_empty());
+    assert_eq!(messages.get(s, a).await, Ok(None));
+    assert_eq!(
+        messages.get(s, c).await.expect("get").map(|m| m.mailbox),
+        Some(inbox)
+    );
+    let left: Vec<_> = messages
+        .list(s, bin, MessageQuery::All, 1000)
+        .await
+        .expect("list trash")
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(left, [b]);
+    assert_eq!(mailboxes.status(s, bin).await.expect("status").messages, 1);
+    assert_eq!(trash_ids(trash.list(s, 0, 100).await.expect("list")), [b]);
+    let hidden = trash.list_hidden(s, 0, 100).await.expect("hidden");
+    assert_eq!(trash_ids(hidden.clone()), [a]);
+    assert_eq!((hidden[0].origin, hidden[0].size), (inbox, 100));
+    let used = quota.usage(s).await.expect("usage");
+    assert_eq!(
+        (used.used_bytes, used.messages),
+        (base.used_bytes + 250, base.messages + 2),
+        "скрытое не в квоте"
+    );
+    let again = trash.purge(s, &[a], &none).await.expect("again");
+    assert!(
+        again.hidden.is_empty() && again.erased.is_empty(),
+        "уже скрытое — пропуск"
+    );
+    assert!(
+        messages.restore(s, &[a]).await.is_err(),
+        "пользователь скрытое не восстанавливает"
+    );
+
+    // Администратор восстанавливает скрытое в исходную папку с прежним идентификатором.
+    let Restored::Message { mailbox, inserted } = trash
+        .restore(s, TrashObject::Message(a))
+        .await
+        .expect("restore hidden")
+    else {
+        panic!("message expected");
+    };
+    assert_eq!((mailbox, inserted.id), (inbox, a));
+    assert_eq!(
+        messages.get(s, a).await.expect("get").map(|m| m.mailbox),
+        Some(inbox)
+    );
+    assert!(
+        trash
+            .list_hidden(s, 0, 100)
+            .await
+            .expect("hidden")
+            .is_empty()
+    );
+    assert_eq!(
+        quota.usage(s).await.expect("usage").used_bytes,
+        base.used_bytes + 350
+    );
+
+    // erase администратора: стирает сразу, восстановить нечего.
+    admin
+        .set_tenant_rule(s.tenant, rule(TrashPurge::Erase, false))
+        .await;
+    assert_eq!(
+        policies.trash_purge(s).await.expect("setting").effective(),
+        TrashPurge::Erase
+    );
+    messages.to_trash(s, &[a]).await.expect("to trash");
+    let out = trash.purge(s, &[a], &none).await.expect("erase");
+    assert_eq!(out.erased, [a]);
+    assert!(out.hidden.is_empty());
+    assert_eq!(messages.get(s, a).await, Ok(None));
+    assert!(
+        trash
+            .list_hidden(s, 0, 100)
+            .await
+            .expect("hidden")
+            .is_empty()
+    );
+    assert_eq!(
+        trash.restore(s, TrashObject::Message(a)).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        quota.usage(s).await.expect("usage").used_bytes,
+        base.used_bytes + 250
+    );
+
+    // Legal Hold (запрет точки принятия решений) и её ошибка: erase работает как hide.
+    let hold = RecordingDecisionHook::new("legal-hold");
+    hold.set_final_delete(Decision::Deny("legal hold".into()));
+    let held = DecisionHooks::new(vec![Arc::new(hold.clone())]);
+    let out = trash.purge(s, &[b], &held).await.expect("hold");
+    assert_eq!(out.hidden, [b]);
+    assert!(out.erased.is_empty());
+    assert_eq!(
+        hold.calls(),
+        [HookCall::FinalDelete(FinalDelete {
+            scope: s,
+            mailbox: inbox,
+            message: b,
+            received_at: purge_received_at(),
+        })]
+    );
+    messages.to_trash(s, &[c]).await.expect("to trash");
+    let failing = DecisionHooks::new(vec![Arc::new(FailingHook)]);
+    let out = trash.purge(s, &[c], &failing).await.expect("hook error");
+    assert_eq!(out.hidden, [c]);
+    assert_eq!(
+        trash_ids(trash.list_hidden(s, 0, 100).await.expect("hidden")),
+        sorted_ids(vec![b, c])
+    );
+
+    // Пользователь без user_can_choose значение не меняет; сброс разрешён.
+    assert_eq!(
+        policies
+            .set_user_trash_purge(s, Some(TrashPurge::Hide))
+            .await,
+        Err(Error::Forbidden)
+    );
+    assert_eq!(policies.set_user_trash_purge(s, None).await, Ok(()));
+    assert_eq!(
+        policies.trash_purge(s).await.expect("setting").effective(),
+        TrashPurge::Erase
+    );
+
+    // С user_can_choose действует выбор пользователя; без разрешения — значение администратора.
+    admin
+        .set_tenant_rule(s.tenant, rule(TrashPurge::Hide, true))
+        .await;
+    policies
+        .set_user_trash_purge(s, Some(TrashPurge::Erase))
+        .await
+        .expect("choose");
+    let setting = policies.trash_purge(s).await.expect("setting");
+    assert_eq!(
+        (setting.user, setting.effective()),
+        (Some(TrashPurge::Erase), TrashPurge::Erase)
+    );
+    let d = put_message(messages, s, inbox, 10).await;
+    messages.to_trash(s, &[d]).await.expect("to trash");
+    let out = trash.purge(s, &[d], &none).await.expect("user erase");
+    assert_eq!(out.erased, [d]);
+    admin
+        .set_tenant_rule(s.tenant, rule(TrashPurge::Hide, false))
+        .await;
+    assert_eq!(
+        policies.trash_purge(s).await.expect("setting").effective(),
+        TrashPurge::Hide
+    );
+    admin
+        .set_tenant_rule(s.tenant, rule(TrashPurge::Erase, true))
+        .await;
+    policies
+        .set_user_trash_purge(s, Some(TrashPurge::Hide))
+        .await
+        .expect("choose hide");
+    assert_eq!(
+        policies.trash_purge(s).await.expect("setting").effective(),
+        TrashPurge::Hide
+    );
+
+    // Другая учётная запись не видит и не восстанавливает скрытое.
+    let other = AccountScope {
+        tenant: s.tenant,
+        account: AccountId::new(),
+    };
+    assert!(
+        trash
+            .list_hidden(other, 0, 100)
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert_eq!(
+        trash.restore(other, TrashObject::Message(b)).await,
+        Err(Error::NotFound)
+    );
+
+    policies.set_user_trash_purge(s, None).await.expect("reset");
+    admin.set_tenant_rule(s.tenant, None).await;
 }

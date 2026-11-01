@@ -32,12 +32,15 @@ use tp_contracts::auth::{
     Authenticator, Credentials, DirAccount, DirAlias, DirChange, DirCursor, DirDomain, DirGroup,
     DirPage, Directory, Principal,
 };
+use tp_contracts::ext::DecisionHooks;
 use tp_contracts::ext::{Decision, DecisionHook, DeliveryInfo, FinalDelete, SubmissionInfo};
-use tp_contracts::meta::{AccountScope, AccountStore, MessageStore, QuotaUsage};
+use tp_contracts::meta::{AccountScope, AccountStore, MessageStore, PolicyResolver, QuotaUsage};
 use tp_contracts::queue::{
     Claimed, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt, RcptStatus,
 };
-use tp_contracts::retention::{Quota, Restored, TrashItem, TrashObject, TrashStore};
+use tp_contracts::retention::{
+    PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashStore,
+};
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslFailure, SaslServer, SaslSession, SaslStep};
 use tp_contracts::search::{
     IndexManifest, IndexManifestStore, ManifestUpdate, RebuildRequest, SearchIndex, SearchSort,
@@ -47,6 +50,7 @@ use tp_contracts::{AccountId, BlobKey, Error, MailboxId, MessageId, QueueId, Res
 
 use crate::infra::{Clock, lock};
 use crate::meta::{MemMetadata, TrashRow};
+use crate::policies::MemPolicies;
 
 // ---------- Authenticator ----------
 
@@ -1083,13 +1087,54 @@ impl QueueStore for MemQueue {
 
 /// [`TrashStore`] поверх [`MemMetadata`]: элементы — письма, перенесённые в корзину `to_trash`
 /// и удалением папки; срок — [`MemMetadata::with_trash_retention`] на момент переноса.
+/// Настройка `trash.purge` для `purge` — из [`MemPolicies`].
 #[derive(Debug, Clone)]
-pub struct MemTrash(MemMetadata);
+pub struct MemTrash {
+    meta: MemMetadata,
+    policies: MemPolicies,
+}
 
 impl MemTrash {
-    /// Корзина метаданных `meta` (разделяет с ними данные).
+    /// Корзина метаданных `meta` (разделяет с ними данные) с собственными политиками без заданных уровней
+    /// (`trash.purge` — `hide`).
     pub fn new(meta: &MemMetadata) -> Self {
-        Self(meta.clone())
+        Self {
+            meta: meta.clone(),
+            policies: MemPolicies::new(meta),
+        }
+    }
+
+    /// Настройка `trash.purge` — из `policies`.
+    pub fn with_policies(mut self, policies: MemPolicies) -> Self {
+        self.policies = policies;
+        self
+    }
+
+    /// Политики, по которым работает `purge`.
+    pub fn policies(&self) -> &MemPolicies {
+        &self.policies
+    }
+
+    /// Элементы корзины `scope`: видимые или скрытые, новые первыми, со смещения, не более `limit`.
+    fn page(
+        &self,
+        scope: AccountScope,
+        hidden: bool,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<TrashItem> {
+        let mut rows: Vec<_> = self
+            .meta
+            .trash_rows(Some(scope))
+            .into_iter()
+            .filter(|r| r.hidden == hidden)
+            .collect();
+        rows.sort_unstable_by_key(|r| std::cmp::Reverse((r.deleted_at, r.message.id)));
+        rows.into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(trash_item)
+            .collect()
     }
 }
 
@@ -1120,42 +1165,91 @@ impl TrashStore for MemTrash {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<TrashItem>> {
-        let mut rows = self.0.trash_rows(Some(scope));
-        rows.sort_unstable_by_key(|r| std::cmp::Reverse((r.deleted_at, r.message.id)));
-        Ok(rows
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(trash_item)
-            .collect())
+        Ok(self.page(scope, false, offset, limit))
+    }
+
+    async fn list_hidden(
+        &self,
+        scope: AccountScope,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<TrashItem>> {
+        Ok(self.page(scope, true, offset, limit))
     }
 
     async fn restore(&self, scope: AccountScope, object: TrashObject) -> Result<Restored> {
         let id = trashed_message(object)?;
-        if !self
-            .0
+        let Some(row) = self
+            .meta
             .trash_rows(Some(scope))
-            .iter()
-            .any(|r| r.message.id == id)
-        {
+            .into_iter()
+            .find(|r| r.message.id == id)
+        else {
             return Err(Error::NotFound);
+        };
+        if row.hidden {
+            return self.meta.restore_hidden(scope, id);
         }
         let inserted = self
-            .0
+            .meta
             .restore(scope, &[id])
             .await?
             .pop()
             .ok_or(Error::NotFound)?;
-        let mailbox = MessageStore::get(&self.0, scope, id)
+        let mailbox = MessageStore::get(&self.meta, scope, id)
             .await?
             .ok_or(Error::NotFound)?
             .mailbox;
         Ok(Restored::Message { mailbox, inserted })
     }
 
+    async fn purge(
+        &self,
+        scope: AccountScope,
+        ids: &[MessageId],
+        hooks: &DecisionHooks,
+    ) -> Result<PurgeOutcome> {
+        let mode = self.policies.trash_purge(scope).await?.effective();
+        let rows: HashMap<MessageId, TrashRow> = self
+            .meta
+            .trash_rows(Some(scope))
+            .into_iter()
+            .filter(|r| !r.hidden)
+            .map(|r| (r.message.id, r))
+            .collect();
+        let mut seen = HashSet::new();
+        let (mut hide, mut erase) = (Vec::new(), Vec::new());
+        for id in ids {
+            let Some(r) = rows.get(id).filter(|_| seen.insert(*id)) else {
+                continue;
+            };
+            let allowed = match mode {
+                TrashPurge::Hide => false,
+                // Запрет (Legal Hold) и ошибка точки принятия решений — скрыть: стирание необратимо.
+                TrashPurge::Erase => matches!(
+                    hooks
+                        .before_final_delete(&FinalDelete {
+                            scope,
+                            mailbox: r.origin,
+                            message: *id,
+                            received_at: r.message.received_at,
+                        })
+                        .await,
+                    Ok(Decision::Allow)
+                ),
+            };
+            if allowed {
+                erase.push(*id);
+            } else {
+                hide.push(*id);
+            }
+        }
+        self.meta.purge_trash(scope, &hide, &erase)
+    }
+
     async fn expired(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<TrashItem>> {
         let mut rows: Vec<_> = self
-            .0
+            .meta
             .trash_rows(None)
             .into_iter()
             .filter(|r| r.expires_at <= now)
@@ -1170,7 +1264,8 @@ impl TrashStore for MemTrash {
         object: TrashObject,
         until: OffsetDateTime,
     ) -> Result<()> {
-        self.0.defer_trash(scope, trashed_message(object)?, until)
+        self.meta
+            .defer_trash(scope, trashed_message(object)?, until)
     }
 }
 
@@ -2012,6 +2107,78 @@ mod tests {
             Err(Error::NotFound)
         );
         assert_eq!(trash.list(s, 0, 10).await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hidden_trash_changes_and_expiry() {
+        use tp_contracts::events::CoreEventKind;
+        use tp_contracts::meta::ChangeLog;
+
+        let clock = ManualClock::default();
+        let day = Duration::from_secs(24 * 3600);
+        let meta = MemMetadata::new(clock.shared()).with_trash_retention(day);
+        let s = meta.account("user@example.com").await.expect("account");
+        let inbox = meta.mailbox_by_role(s, SpecialUse::Inbox).expect("inbox");
+        let bin = meta.mailbox_by_role(s, SpecialUse::Trash).expect("trash");
+        let m = meta
+            .insert(s, inbox, new_message(1, 10))
+            .await
+            .expect("m")
+            .id;
+        let trashed = meta.to_trash(s, &[m]).await.expect("to trash");
+        let trash = MemTrash::new(&meta);
+        let out = trash
+            .purge(s, &[m], &DecisionHooks::default())
+            .await
+            .expect("hide");
+        assert_eq!(out.hidden, [m]);
+        assert!(out.modseq > trashed);
+
+        // Пользователь видит удаление из корзины; событие ядра — `Trashed`.
+        let ch = meta
+            .message_changes(s, Some(bin), trashed, 100)
+            .await
+            .expect("changes");
+        assert_eq!(ch.destroyed.iter().map(|c| c.id).collect::<Vec<_>>(), [m]);
+        assert_eq!(ch.new_state, out.modseq);
+        let last = meta.event_log().all().pop().expect("event").event;
+        assert_eq!(
+            (last.mailbox, last.kind),
+            (Some(bin), CoreEventKind::Trashed { message: m })
+        );
+        let status = tp_contracts::meta::MailboxStore::status(&meta, s, bin)
+            .await
+            .expect("status");
+        assert_eq!((status.messages, status.size), (0, 0));
+
+        // Срок корзины истекает и для скрытых: отсрочка и окончательное удаление.
+        let later = clock.now() + day * 2;
+        let expired = trash.expired(later, 10).await.expect("expired");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].object, TrashObject::Message(m));
+        trash
+            .defer(s, TrashObject::Message(m), later + day)
+            .await
+            .expect("defer hidden");
+        assert!(trash.expired(later, 10).await.expect("none").is_empty());
+        let ms = meta.expunge_final(s, &[m]).await.expect("expunge");
+        assert_eq!(
+            ms, out.modseq,
+            "скрытое удаляется без изменения для пользователя"
+        );
+        assert!(
+            trash
+                .list_hidden(s, 0, 10)
+                .await
+                .expect("hidden")
+                .is_empty()
+        );
+        let last = meta.event_log().all().pop().expect("event").event;
+        assert_eq!(last.kind, CoreEventKind::Purged { message: m });
+        assert_eq!(
+            trash.restore(s, TrashObject::Message(m)).await,
+            Err(Error::NotFound)
+        );
     }
 
     #[tokio::test]
