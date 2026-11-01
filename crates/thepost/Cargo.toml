@@ -34,6 +34,7 @@ clap.workspace = true
 futures.workspace = true
 mail-auth.workspace = true
 mail-parser.workspace = true
+prometheus-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

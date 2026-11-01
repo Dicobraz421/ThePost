@@ -4495,6 +4495,7 @@ dependencies = [
  "futures",
  "mail-auth 0.13.3",
  "mail-parser",
+ "prometheus-client",
  "schemars",
  "serde",
  "serde_json",
