@@ -7,6 +7,8 @@
 //!   с отзывом и пароль каталога. Защиту от перебора (`tp-platform`, PLT-07) вызывают
 //!   протоколы до проверки и по её результату;
 //! - [`oidc`] — [`Authenticator`] для токенов OpenID Connect (Bearer);
+//! - [`authz`] — [`Authorizer`](tp_contracts::auth::Authorizer) поверх ACL папок (RFC 4314), групп и
+//!   делегирования отправки (Send As / Send on Behalf);
 //! - [`sasl`] — механизмы SASL PLAIN, LOGIN, OAUTHBEARER, XOAUTH2 для smtp и imap; пароль и токен в одном
 //!   обмене проверяет [`CredentialsRouter`].
 
@@ -19,11 +21,13 @@ use tp_contracts::meta::{Account, AccountStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result, TenantId};
 
+pub mod authz;
 pub mod ldap;
 pub mod oidc;
 pub mod password;
 pub mod sasl;
 
+pub use authz::AclAuthorizer;
 pub use ldap::{LdapConfig, LdapDirectory};
 pub use oidc::{OidcAuthenticator, OidcConfig};
 pub use password::{AppPasswords, PasswordAuthenticator, PasswordCheck, PasswordConfig};
