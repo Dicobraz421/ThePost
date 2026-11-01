@@ -1,4 +1,4 @@
-//! Пароли приложений на PostgreSQL (CTR-21, CONTRACTS.md#Auth; SRS 5.1): таблица `app_passwords`, только хэши.
+//! Пароли приложений на PostgreSQL (CTR-22, CONTRACTS.md#Auth; SRS 5.1): таблица `app_passwords`, только хэши.
 
 use async_trait::async_trait;
 use sqlx::FromRow;

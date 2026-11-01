@@ -256,5 +256,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-10-31 — CTR-20 (решение 2026-10-31-atomic-delivery): `MessageStore::insert_batch` — все доставки приёма одной транзакцией.
 - 2026-10-31 — CTR-19 (x/contracts-08): `acl::{AclStore, AclEntry, SharedMailbox, SendDelegation, ANYONE, validate_identifier, effective_rights}`
   — ACL папок и делегирование отправки (META-11) за контрактом; реализации — `PgMeta`, `tp_testkit::MemAcl`, набор `suite::acl_store`.
-- 2026-11-01 — CTR-21 (x/contracts-10): `app_password::{AppPasswordStore, AppPassword}` вместо временного трейта `tp-auth` (AUTH-02);
+- 2026-11-01 — CTR-22 (x/contracts-11): `app_password::{AppPasswordStore, AppPassword}` вместо временного трейта `tp-auth` (AUTH-02);
   реализации — `PgMeta` (миграция `0009_app_passwords`), `tp_testkit::MemAppPasswords`, набор `suite::app_password_store`.

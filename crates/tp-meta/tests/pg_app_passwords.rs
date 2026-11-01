@@ -1,4 +1,4 @@
-//! CTR-21: пароли приложений на PostgreSQL — общий набор `tp_testkit::suite::app_password_store`.
+//! CTR-22: пароли приложений на PostgreSQL — общий набор `tp_testkit::suite::app_password_store`.
 
 mod common;
 
