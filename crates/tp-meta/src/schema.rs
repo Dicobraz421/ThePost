@@ -40,6 +40,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "app passwords",
         include_str!("../migrations/0009_app_passwords.sql"),
     ),
+    (
+        10,
+        "distribution groups",
+        include_str!("../migrations/0010_distribution_groups.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
