@@ -20,6 +20,8 @@ use tp_contracts::sasl::SaslServer;
 use tp_platform::{ConnInfo, RateLimiter};
 
 use crate::config::SmtpConfig;
+use crate::limits::SendLimits;
+use crate::metrics::SmtpMetrics;
 
 mod auth;
 pub mod listen;
@@ -134,6 +136,10 @@ pub struct SessionCtx {
     pub sasl: Option<Arc<dyn SaslServer>>,
     /// Ограничитель частоты узла.
     pub limiter: Option<Arc<RateLimiter>>,
+    /// Лимиты отправки учётной записи в час (submission).
+    pub send_limits: Option<Arc<SendLimits>>,
+    /// Метрики SMTP.
+    pub metrics: Option<Arc<SmtpMetrics>>,
 }
 
 impl fmt::Debug for SessionCtx {

@@ -269,6 +269,8 @@ async fn tls_smtp_server(rec: Arc<Recorder>) -> (u16, CancellationToken) {
             sasl: None,
             limiter: None,
             tls: Some(tls),
+            send_limits: None,
+            metrics: None,
         },
     );
     let shutdown = CancellationToken::new();

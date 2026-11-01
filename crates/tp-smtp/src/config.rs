@@ -102,6 +102,12 @@ pub struct Limits {
     /// Неудачных `AUTH` подряд; затем адрес клиента блокируется (`ratelimit.block_duration`) и соединение
     /// закрывается.
     pub max_auth_failures: u32,
+    /// Писем в час на учётную запись (submission, скользящее окно); `0` — без лимита.
+    pub messages_per_hour: u32,
+    /// Получателей в час на учётную запись (сумма по письмам); `0` — без лимита.
+    pub recipients_per_hour: u32,
+    /// Предел учётных записей со счётчиками лимитов отправки на узле.
+    pub max_tracked_accounts: usize,
 }
 
 impl Default for Limits {
@@ -112,6 +118,9 @@ impl Default for Limits {
             max_errors: 10,
             max_connections: 1000,
             max_auth_failures: 3,
+            messages_per_hour: 1000,
+            recipients_per_hour: 5000,
+            max_tracked_accounts: 100_000,
         }
     }
 }

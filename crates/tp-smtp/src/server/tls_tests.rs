@@ -76,6 +76,15 @@ impl Server {
         edit: impl FnOnce(&mut SmtpConfig),
         limiter: Option<Arc<RateLimiter>>,
     ) -> Self {
+        Self::with_deps(mode, implicit_tls, edit, |d| d.limiter = limiter).await
+    }
+
+    async fn with_deps(
+        mode: Mode,
+        implicit_tls: bool,
+        edit: impl FnOnce(&mut SmtpConfig),
+        edit_deps: impl FnOnce(&mut ServerDeps),
+    ) -> Self {
         let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = tcp.local_addr().expect("addr");
         let mut ep = EndpointConfig::new(addr);
@@ -89,15 +98,16 @@ impl Server {
             principal(TenantId::DEFAULT, "alice@example.org"),
         );
         let rec = Arc::new(Recorder::default());
-        let svc = SmtpService::new(
-            mode,
-            ServerDeps {
-                handler: rec.clone(),
-                sasl: Some(Arc::new(FakeSasl::new(Arc::new(auth)))),
-                limiter,
-                tls: Some(tls),
-            },
-        );
+        let mut deps = ServerDeps {
+            handler: rec.clone(),
+            sasl: Some(Arc::new(FakeSasl::new(Arc::new(auth)))),
+            limiter: None,
+            tls: Some(tls),
+            send_limits: None,
+            metrics: None,
+        };
+        edit_deps(&mut deps);
+        let svc = SmtpService::new(mode, deps);
         let mut cfg = SmtpConfig {
             hostname: "mx.example.org".into(),
             ..SmtpConfig::default()
@@ -296,6 +306,67 @@ async fn sending_rate_limit() {
 }
 
 #[tokio::test]
+async fn hourly_send_limits_and_metrics() {
+    let registry = tp_platform::Metrics::default();
+    let metrics = Arc::new(crate::SmtpMetrics::new());
+    metrics.register(&registry);
+    let m = metrics.clone();
+    let srv = Server::with_deps(
+        Mode::Submission,
+        true,
+        |c| {
+            c.limits.messages_per_hour = 1;
+            c.limits.recipients_per_hour = 2;
+        },
+        |d| {
+            d.send_limits = Some(Arc::new(crate::SendLimits::new()));
+            d.metrics = Some(m);
+        },
+    )
+    .await;
+    let mut c = Client::new(handshake(srv.connect().await).await);
+    assert_eq!(c.code().await, 220);
+    ehlo(&mut c).await;
+    assert_eq!(c.cmd(&plain("secret")).await, 235);
+    // Третий получатель за час — отказ 452, письмо двоим принимается.
+    assert_eq!(c.cmd("MAIL FROM:<alice@example.org>").await, 250);
+    assert_eq!(c.cmd("RCPT TO:<bob@example.org>").await, 250);
+    assert_eq!(c.cmd("RCPT TO:<carol@example.org>").await, 250);
+    c.send("RCPT TO:<dave@example.org>\r\n").await;
+    let (code, text) = c.reply().await;
+    assert_eq!(
+        (code, text[0].as_str()),
+        (
+            452,
+            "4.5.3 Hourly recipient limit exceeded, try again later"
+        )
+    );
+    assert_eq!(c.cmd("DATA").await, 354);
+    c.send("Subject: hi\r\n\r\nhello\r\n.\r\n").await;
+    assert_eq!(c.code().await, 250);
+    assert_eq!(srv.rec.mails()[0].0.rcpts.len(), 2);
+    // Второе письмо за час — отказ 451.
+    c.send("MAIL FROM:<alice@example.org>\r\n").await;
+    let (code, text) = c.reply().await;
+    assert_eq!(
+        (code, text[0].as_str()),
+        (451, "4.7.1 Hourly message limit exceeded, try again later")
+    );
+    let text = registry.encode().expect("encode");
+    for line in [
+        "tp_smtp_sessions_total{role=\"submission\"} 1",
+        "tp_smtp_sessions_active{role=\"submission\"} 1",
+        "tp_smtp_messages_total{role=\"submission\",result=\"accepted\"} 1",
+        "tp_smtp_send_limited_total{kind=\"recipients\"} 1",
+        "tp_smtp_send_limited_total{kind=\"messages\"} 1",
+    ] {
+        assert!(text.contains(line), "{line} in {text}");
+    }
+    assert_eq!(c.cmd("QUIT").await, 221);
+    srv.stop().await;
+}
+
+#[tokio::test]
 async fn connection_limit() {
     let srv = Server::start(Mode::Inbound, false, |c| c.limits.max_connections = 1).await;
     let mut first = Client::new(srv.connect().await);
@@ -315,6 +386,8 @@ async fn submission_role_requires_certificates() {
             sasl: None,
             limiter: None,
             tls: None,
+            send_limits: None,
+            metrics: None,
         },
     );
     let cfg = SmtpConfig {

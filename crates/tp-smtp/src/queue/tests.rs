@@ -191,6 +191,45 @@ async fn recipients_grouped_by_domain_and_final_statuses() {
 }
 
 #[tokio::test]
+async fn queue_metrics() {
+    let env = Env::new();
+    let t = Arc::new(Scripted::default());
+    let registry = tp_platform::Metrics::default();
+    let metrics = Arc::new(crate::SmtpMetrics::new());
+    metrics.register(&registry);
+    let worker =
+        QueueWorker::new(env.deps.clone(), t.clone(), "mx.example.org").with_metrics(metrics);
+    Queue::new(env.deps.clone())
+        .enqueue(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &[
+                "a@example.com".into(),
+                "b@example.com".into(),
+                "c@example.com".into(),
+            ],
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("enqueue");
+    t.push(RcptResult::Delivered("250 ok".into()));
+    t.push(RcptResult::Temporary("451 later".into()));
+    t.push(RcptResult::Permanent("550 no".into()));
+    assert_eq!(worker.run_once(&cfg()).await.expect("run"), 1);
+    let text = registry.encode().expect("encode");
+    for line in [
+        "tp_smtp_queue_claimed_total 1",
+        "tp_smtp_queue_inflight 0",
+        "tp_smtp_queue_recipients_total{result=\"delivered\"} 1",
+        "tp_smtp_queue_recipients_total{result=\"deferred\"} 1",
+        "tp_smtp_queue_recipients_total{result=\"failed\"} 1",
+        "tp_smtp_queue_delivery_seconds_count 1",
+    ] {
+        assert!(text.contains(line), "{line} in {text}");
+    }
+}
+
+#[tokio::test]
 async fn stale_claim_is_skipped() {
     let env = Env::new();
     let t = Arc::new(Scripted::default());
@@ -263,6 +302,8 @@ pub(crate) async fn smtp_server_with(rec: Arc<Recorder>, broken_tls: bool) -> u1
                 handler: rec.clone(),
                 sasl: None,
                 limiter: None,
+                send_limits: None,
+                metrics: None,
             };
             tokio::spawn(async move {
                 let _ = Session::new(ctx, conn_info(false), broken_tls)
