@@ -24,14 +24,19 @@ use mail_parser::{Encoding, HeaderValue, Message, MessageParser, MimeHeaders, Pa
 use time::{OffsetDateTime, UtcOffset};
 use tp_contracts::meta::{Address, BodyPart, Envelope, MessageMeta};
 
+pub use crate::split::MimeLimits;
+
 /// Предел превью, символов (JMAP `preview`, RFC 8621 4.1.4; CONTRACTS.md `MessageMeta::preview`).
 pub const PREVIEW_CHARS: usize = 256;
 
-/// Предел вложенности MIME (как в [`crate::split`]): глубже части не описываются.
-const MAX_DEPTH: usize = 64;
-
-/// Метаданные письма. Не падает на битом MIME: что не разобралось, остаётся пустым.
+/// Метаданные письма с пределами разбора по умолчанию.
 pub fn message_meta(raw: &[u8]) -> MessageMeta {
+    message_meta_with(raw, MimeLimits::default())
+}
+
+/// Метаданные письма. Не падает на битом MIME: что не разобралось, остаётся пустым; части глубже
+/// и сверх `limits` в `body` не описываются.
+pub fn message_meta_with(raw: &[u8], limits: MimeLimits) -> MessageMeta {
     let Some(msg) = MessageParser::default().parse(raw) else {
         return MessageMeta {
             body: leaf_default(String::new()),
@@ -40,7 +45,7 @@ pub fn message_meta(raw: &[u8]) -> MessageMeta {
     };
     MessageMeta {
         envelope: envelope(&msg),
-        body: message_body(&msg, "", 0),
+        body: message_body(&msg, "", 0, &mut Budget { limits, parts: 0 }),
         preview: preview(&msg),
         thread_key: thread_key(&msg),
         has_attachment: msg.attachment_count() > 0,
@@ -105,13 +110,20 @@ fn bracketed(ids: &[&str]) -> String {
         .join(" ")
 }
 
+/// Пределы описания частей: обойдено частей.
+struct Budget {
+    limits: MimeLimits,
+    parts: usize,
+}
+
 /// Корень письма (верхнего или вложенного с путём `base`).
-fn message_body(msg: &Message<'_>, base: &str, depth: usize) -> BodyPart {
+fn message_body(msg: &Message<'_>, base: &str, depth: usize, b: &mut Budget) -> BodyPart {
     let Some(root) = msg.parts.first() else {
+        b.parts += 1;
         return leaf_default(base.to_owned());
     };
     match &root.body {
-        PartType::Multipart(_) => node(msg, 0, base.to_owned(), base, depth),
+        PartType::Multipart(_) => node(msg, 0, base.to_owned(), base, depth, b),
         _ => {
             let body = child_path(base, 1);
             let path = if base.is_empty() {
@@ -119,14 +131,22 @@ fn message_body(msg: &Message<'_>, base: &str, depth: usize) -> BodyPart {
             } else {
                 body.clone()
             };
-            node(msg, 0, path, &body, depth)
+            node(msg, 0, path, &body, depth, b)
         }
     }
 }
 
 /// Узел части `id` с путём `path`; `base` — путь, от которого нумеруются дети составной части
 /// и части вложенного письма (у корня несоставного письма отличается от `path`, как в split).
-fn node(msg: &Message<'_>, id: usize, path: String, base: &str, depth: usize) -> BodyPart {
+fn node(
+    msg: &Message<'_>,
+    id: usize,
+    path: String,
+    base: &str,
+    depth: usize,
+    b: &mut Budget,
+) -> BodyPart {
+    b.parts += 1;
     let Some(part) = msg.parts.get(id) else {
         return leaf_default(path);
     };
@@ -149,7 +169,7 @@ fn node(msg: &Message<'_>, id: usize, path: String, base: &str, depth: usize) ->
     let lines = (media_type == "text" || (media_type == "message" && subtype == "rfc822"))
         .then(|| u32::try_from(body.iter().filter(|&&b| b == b'\n').count()).unwrap_or(u32::MAX));
     let mut children = Vec::new();
-    if depth < MAX_DEPTH {
+    if depth < b.limits.max_depth {
         match &part.body {
             PartType::Multipart(ids) => {
                 let mut n = 0;
@@ -159,12 +179,17 @@ fn node(msg: &Message<'_>, id: usize, path: String, base: &str, depth: usize) ->
                     if child <= id || child >= msg.parts.len() {
                         continue;
                     }
+                    if b.parts >= b.limits.max_parts {
+                        break;
+                    }
                     n += 1;
                     let p = child_path(base, n);
-                    children.push(node(msg, child, p.clone(), &p, depth + 1));
+                    children.push(node(msg, child, p.clone(), &p, depth + 1, b));
                 }
             }
-            PartType::Message(nested) => children.push(message_body(nested, base, depth + 1)),
+            PartType::Message(nested) if b.parts < b.limits.max_parts => {
+                children.push(message_body(nested, base, depth + 1, b));
+            }
             _ => {}
         }
     }

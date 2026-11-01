@@ -107,9 +107,10 @@ impl Store {
         }
 
         // Разбор — работа процессора на всё письмо: вне потоков асинхронного рантайма.
+        let limits = self.cfg.mime;
         let (split, meta) = tokio::task::spawn_blocking(move || {
-            let meta = meta::message_meta(&raw);
-            (Split::new(raw), meta)
+            let meta = meta::message_meta_with(&raw, limits);
+            (Split::with_limits(raw, limits), meta)
         })
         .await
         .map_err(|e| Error::internal(format!("ingest: разбор письма: {e}")))?;

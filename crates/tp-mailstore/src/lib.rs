@@ -25,6 +25,8 @@ use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::{MailboxId, MessageId, ModSeq, Result};
 
 mod fetch;
+#[doc(hidden)]
+pub mod fuzz;
 mod ingest;
 pub mod meta;
 mod ops;
@@ -33,6 +35,7 @@ pub mod split;
 pub mod trash;
 
 pub use quota::QuotaWarnConfig;
+pub use split::MimeLimits;
 pub use trash::{TrashConfig, TrashPass};
 
 /// Конфигурация хранилища (секция config.yaml; поля необязательны, неизвестное — ошибка).
@@ -46,6 +49,9 @@ pub use trash::{TrashConfig, TrashPass};
 ///   thresholds: [80, 95]
 ///   interval: 1d
 ///   from: postmaster@localhost
+/// mime:
+///   max_depth: 64
+///   max_parts: 10000
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -54,6 +60,8 @@ pub struct Config {
     pub trash: TrashConfig,
     /// Предупреждения о заполнении квоты.
     pub quota: QuotaWarnConfig,
+    /// Пределы разбора MIME.
+    pub mime: MimeLimits,
 }
 
 /// Зависимости [`Store`]: реализации контрактов, выбранные приложением.
