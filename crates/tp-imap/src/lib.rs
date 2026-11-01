@@ -8,10 +8,12 @@
 //! - `store` — STORE и CONDSTORE (`UNCHANGEDSINCE`, `MODSEQ`).
 //! - `search` — SEARCH и ESEARCH: метаданные и полнотекстовый индекс.
 //! - `write` — APPEND, COPY, MOVE, EXPUNGE, CLOSE (UIDPLUS).
+//! - `idle` — IDLE и уведомления о выбранной папке (`EXISTS`, `EXPUNGE`, `FETCH FLAGS`).
 //! - [`config`] — секция `imap` config.yaml.
 
 pub mod config;
 mod fetch;
+mod idle;
 mod mailbox;
 pub mod proto;
 mod search;

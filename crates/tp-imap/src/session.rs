@@ -22,11 +22,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
+use tp_contracts::bus::EventBus;
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountScope, MailboxStore, MessageStore};
+use tp_contracts::meta::{AccountScope, ChangeLog, MailboxStore, MessageStore};
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslFailure, SaslServer, SaslStep};
 use tp_contracts::search::SearchIndex;
-use tp_contracts::{Error, MailboxId, MessageId, Result, Uid, UidValidity};
+use tp_contracts::{Error, MailboxId, MessageId, ModSeq, Result, Uid, UidValidity};
 use tp_platform::{Conn, Listener};
 
 use crate::config::ImapConfig;
@@ -96,6 +97,10 @@ pub struct Deps {
     pub store: Arc<dyn MailStore>,
     /// Полнотекстовый поиск (`SEARCH BODY`, `TEXT`).
     pub search: Arc<dyn SearchIndex>,
+    /// Журнал изменений: что сообщить клиенту о выбранной папке (`EXISTS`, `EXPUNGE`, `FETCH`).
+    pub changes: Arc<dyn ChangeLog>,
+    /// Шина уведомлений: изменения папок для `IDLE`.
+    pub bus: Arc<dyn EventBus>,
 }
 
 impl fmt::Debug for Deps {
@@ -127,13 +132,15 @@ pub(crate) struct Selected {
     pub uid_validity: UidValidity,
     /// Письма по возрастанию UID; номер последовательности — индекс + 1.
     pub messages: Vec<(Uid, MessageId)>,
+    /// Изменения папки до этого `ModSeq` клиенту сообщены (или были в снимке при выборе).
+    pub modseq: ModSeq,
 }
 
 /// Сессия IMAP одного соединения.
 pub struct Session<T: Transport> {
     pub(crate) ctx: Arc<SessionCtx>,
-    conn: Option<T>,
-    reader: Reader,
+    pub(crate) conn: Option<T>,
+    pub(crate) reader: Reader,
     pub(crate) out: Vec<u8>,
     pub(crate) principal: Option<Principal>,
     pub(crate) selected: Option<Selected>,
@@ -145,7 +152,7 @@ pub struct Session<T: Transport> {
     errors: u32,
     auth_failures: u32,
     /// Сессия завершается после отправки накопленных ответов.
-    close: bool,
+    pub(crate) close: bool,
 }
 
 impl<T: Transport> fmt::Debug for Session<T> {
@@ -182,6 +189,7 @@ const EXTENSIONS: &[&str] = &[
     "ESEARCH",
     "UIDPLUS",
     "MOVE",
+    "IDLE",
 ];
 
 fn reader(config: &ImapConfig) -> Reader {
@@ -393,7 +401,7 @@ impl<T: Transport> Session<T> {
         })));
     }
 
-    fn bye(&mut self, code: Option<Code<'static>>, text: &str) {
+    pub(crate) fn bye(&mut self, code: Option<Code<'static>>, text: &str) {
         self.push(&Response::Status(Status::Bye(
             crate::proto::types::response::Bye {
                 code,
@@ -482,7 +490,15 @@ impl<T: Transport> Session<T> {
                 self.data(Data::Capability(caps));
                 self.ok(&tag, None, "CAPABILITY completed");
             }
-            CommandBody::Noop => self.ok(&tag, None, "NOOP completed"),
+            CommandBody::Noop => {
+                // NOOP — опрос изменений выбранной папки (RFC 9051, 6.1.2).
+                if self.selected.is_some()
+                    && let Err(e) = self.sync().await
+                {
+                    tracing::debug!(error = %e, "imap: изменения папки не получены");
+                }
+                self.ok(&tag, None, "NOOP completed");
+            }
             CommandBody::Logout => {
                 self.bye(None, "Logging out");
                 self.ok(&tag, None, "LOGOUT completed");
@@ -582,6 +598,7 @@ impl<T: Transport> Session<T> {
                     self.append(&tag, &mailbox, &flags, date.as_ref(), &message)
                         .await
                 }
+                CommandBody::Idle => self.idle(&tag).await,
                 CommandBody::Subscribe { mailbox } => {
                     self.subscribe(&tag, &proto::mailbox_bytes(&mailbox), true)
                         .await
@@ -609,10 +626,13 @@ impl<T: Transport> Session<T> {
             return;
         }
         let done = match body {
-            CommandBody::Check => {
-                self.ok(tag, None, "CHECK completed");
-                Ok(())
-            }
+            CommandBody::Check => match self.sync().await {
+                Ok(()) => {
+                    self.ok(tag, None, "CHECK completed");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
             CommandBody::Unselect => {
                 self.unselect(tag);
                 Ok(())
@@ -869,7 +889,7 @@ impl<T: Transport> Session<T> {
     }
 }
 
-fn io_error(e: std::io::Error) -> Error {
+pub(crate) fn io_error(e: std::io::Error) -> Error {
     tracing::debug!(error = %e, "imap: ошибка ввода-вывода");
     Error::UNAVAILABLE
 }

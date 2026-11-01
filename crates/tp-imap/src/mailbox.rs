@@ -479,6 +479,7 @@ impl<T: Transport> Session<T> {
             mailbox: id,
             read_only,
             uid_validity: st.uid_validity,
+            modseq: st.highest_modseq,
             messages: list.iter().map(|m| (m.uid, m.id)).collect(),
         });
         let (code, verb) = if read_only {

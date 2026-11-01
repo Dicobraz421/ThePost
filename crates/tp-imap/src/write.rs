@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use time::OffsetDateTime;
 use tp_contracts::mailstore::{Delivery, IngestRequest};
 use tp_contracts::meta::{Flag, Inserted, MessageQuery, SpecialUse};
-use tp_contracts::{Error, MailboxId, MessageId, Result, Uid};
+use tp_contracts::{Error, MailboxId, MessageId, Result};
 
 use crate::proto::types::core::{Tag, Vec1};
 use crate::proto::types::datetime::DateTime;
@@ -205,32 +205,11 @@ impl<T: Transport> Session<T> {
         Ok(())
     }
 
-    /// После изменения папки `mailbox`: если она выбрана — новые письма в снимок и `EXISTS`.
+    /// После изменения папки `mailbox`: если она выбрана — изменения клиенту (`EXISTS` и т. п.).
     pub(crate) async fn after_change(&mut self, mailbox: MailboxId) -> Result<()> {
-        let Some(selected) = self.selected.as_ref().filter(|s| s.mailbox == mailbox) else {
-            return Ok(());
-        };
-        let last = selected.messages.last().map_or(0, |m| m.0.0);
-        let scope = self.scope().ok_or(Error::Forbidden)?;
-        let limit = self.ctx.config.limits.max_mailbox_messages;
-        let range = Uid(last.saturating_add(1))..=Uid(u32::MAX);
-        let fresh = self
-            .ctx
-            .deps
-            .messages
-            .list(scope, mailbox, MessageQuery::Uids(vec![range]), limit)
-            .await?;
-        if fresh.is_empty() {
-            return Ok(());
+        if self.selected.as_ref().is_some_and(|s| s.mailbox == mailbox) {
+            self.sync().await?;
         }
-        let Some(selected) = self.selected.as_mut() else {
-            return Ok(());
-        };
-        selected
-            .messages
-            .extend(fresh.iter().map(|m| (m.uid, m.id)));
-        let n = u32::try_from(selected.messages.len()).unwrap_or(u32::MAX);
-        self.data(Data::Exists(n));
         Ok(())
     }
 

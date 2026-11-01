@@ -22,6 +22,7 @@ use crate::config::ImapConfig;
 use crate::session::{Deps, Session, SessionCtx, Transport};
 
 mod fetch;
+mod idle;
 mod mailbox;
 mod search;
 mod session;
@@ -62,6 +63,7 @@ pub(crate) struct Env {
     pub store: Store,
     pub auth: FakeAuthenticator,
     pub search: FakeSearch,
+    pub bus: MemEventBus,
     pub principal: Principal,
     pub config: ImapConfig,
     pub shutdown: CancellationToken,
@@ -73,6 +75,7 @@ impl Env {
         let blobs = MemBlobStore::new(clock.clone());
         let index = MemBlobIndex::new(clock.clone());
         let meta = MemMetadata::new(clock).with_blob_index(index.clone());
+        let bus = MemEventBus::default();
         let store = Store::new(tp_mailstore::Deps {
             blobs: Arc::new(blobs),
             index: Arc::new(index),
@@ -80,7 +83,7 @@ impl Env {
             changes: Arc::new(meta.clone()),
             trash: Arc::new(MemTrash::new(&meta)),
             quota: Arc::new(MemQuota::new(&meta)),
-            bus: Arc::new(MemEventBus::default()),
+            bus: Arc::new(bus.clone()),
             hooks: DecisionHooks::default(),
         });
         let tenant = TenantId::DEFAULT;
@@ -112,6 +115,7 @@ impl Env {
             store,
             auth,
             search: FakeSearch::default(),
+            bus,
             principal,
             config: ImapConfig::default(),
             shutdown: CancellationToken::new(),
@@ -135,6 +139,8 @@ impl Env {
                 messages: Arc::new(self.meta.clone()),
                 store: Arc::new(self.store.clone()),
                 search: Arc::new(self.search.clone()),
+                changes: Arc::new(self.meta.clone()),
+                bus: Arc::new(self.bus.clone()),
             },
             shutdown: self.shutdown.clone(),
         })
