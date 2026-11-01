@@ -4886,12 +4886,18 @@ dependencies = [
 name = "tp-jmap"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "base64 0.23.1",
  "futures",
+ "insta",
+ "mail-parser",
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tp-contracts",
  "tp-mailstore",
@@ -5014,6 +5020,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures",
+ "insta",
  "mail-auth 0.13.3",
  "mail-builder 1.0.0",
  "mail-parser",
