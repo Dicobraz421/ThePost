@@ -29,7 +29,7 @@ mod tls;
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(test)]
-mod tls_tests;
+pub(crate) mod tls_tests;
 
 pub use listen::{ServerDeps, SmtpService};
 pub use session::{Exit, Session};

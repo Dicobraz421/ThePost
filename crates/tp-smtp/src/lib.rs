@@ -6,6 +6,7 @@
 //! - [`dkim_sign`] — DKIM-подпись исходящей почты;
 //! - [`dsn`] — уведомления о доставке (RFC 3464);
 //! - [`milter`] — фильтры Milter (антиспам, антивирус) после приёма письма;
+//! - [`policy`] — MTA-STS и DANE при отправке на MX;
 //! - [`queue`] — очередь исходящей почты и роль smtp-out (отправка на MX через `mail-send`);
 //! - [`config`] — секция `smtp` config.yaml.
 
@@ -15,6 +16,7 @@ pub mod deliver;
 pub mod dkim_sign;
 pub mod dsn;
 pub mod milter;
+pub mod policy;
 pub mod queue;
 pub mod server;
 

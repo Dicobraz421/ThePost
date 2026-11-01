@@ -90,7 +90,8 @@ impl Env {
     }
 }
 
-const MAIL: &[u8] = b"From: alice@example.org\r\nTo: x@example.net\r\nSubject: hi\r\n\r\nbody\r\n";
+pub(crate) const MAIL: &[u8] =
+    b"From: alice@example.org\r\nTo: x@example.net\r\nSubject: hi\r\n\r\nbody\r\n";
 
 fn cfg() -> QueueConfig {
     QueueConfig::default()
@@ -273,7 +274,7 @@ pub(crate) async fn smtp_server_with(rec: Arc<Recorder>, broken_tls: bool) -> u1
     port
 }
 
-fn transport() -> MxTransport {
+pub(crate) fn transport() -> MxTransport {
     let resolver = MessageAuthenticator::new(
         ResolverConfig::from_name_servers(vec![]),
         ResolverOpts::default(),
@@ -284,7 +285,7 @@ fn transport() -> MxTransport {
 
 use mail_auth::MessageAuthenticator;
 
-fn mx(t: &MxTransport, domain: &str, hosts: &[(u16, &str)]) {
+pub(crate) fn mx(t: &MxTransport, domain: &str, hosts: &[(u16, &str)]) {
     let until = std::time::Instant::now() + Duration::from_secs(3600);
     let rrset: Arc<[MX]> = hosts
         .iter()
@@ -303,7 +304,7 @@ fn mx(t: &MxTransport, domain: &str, hosts: &[(u16, &str)]) {
     );
 }
 
-fn a(t: &MxTransport, host: &str, ip: std::net::Ipv4Addr) {
+pub(crate) fn a(t: &MxTransport, host: &str, ip: std::net::Ipv4Addr) {
     let until = std::time::Instant::now() + Duration::from_secs(3600);
     t.cache().ipv4.insert(
         format!("{host}.").into(),
@@ -327,7 +328,11 @@ fn aaaa(t: &MxTransport, host: &str, ip: std::net::Ipv6Addr) {
     );
 }
 
-fn req<'a>(cfg: &'a QueueConfig, domain: &'a str, rcpts: &'a [String]) -> SendRequest<'a> {
+pub(crate) fn req<'a>(
+    cfg: &'a QueueConfig,
+    domain: &'a str,
+    rcpts: &'a [String],
+) -> SendRequest<'a> {
     SendRequest {
         cfg,
         helo: "out.example.org",

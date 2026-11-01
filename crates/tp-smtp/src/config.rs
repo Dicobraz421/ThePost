@@ -278,6 +278,8 @@ pub struct QueueConfig {
     pub source_ip: Option<std::net::IpAddr>,
     /// TLS при отправке.
     pub tls: OutboundTls,
+    /// Политики TLS доменов назначения: MTA-STS и DANE (при доставке на MX, не через `relay`).
+    pub policy: PolicyConfig,
 }
 
 impl Default for QueueConfig {
@@ -297,6 +299,37 @@ impl Default for QueueConfig {
             max_mx: 5,
             source_ip: None,
             tls: OutboundTls::default(),
+            policy: PolicyConfig::default(),
+        }
+    }
+}
+
+/// MTA-STS (RFC 8461) и DANE (RFC 7672) при отправке. Применяется без перезапуска.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// Соблюдать политики MTA-STS доменов назначения.
+    pub mta_sts: bool,
+    /// Проверять сертификаты MX по записям TLSA, подписанным DNSSEC.
+    pub dane: bool,
+    /// Ожидание ответа HTTPS при получении политики MTA-STS.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub fetch_timeout: Duration,
+    /// Наибольший размер политики MTA-STS, байт.
+    pub max_policy_size: usize,
+    /// Доменов с политикой MTA-STS в кэше узла.
+    pub cache_size: usize,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            mta_sts: true,
+            dane: true,
+            fetch_timeout: Duration::from_secs(10),
+            max_policy_size: 64 * 1024,
+            cache_size: 10_000,
         }
     }
 }

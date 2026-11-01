@@ -22,13 +22,13 @@ use super::tests::{Client, Recorder};
 use super::*;
 use crate::config::SmtpConfig;
 
-fn testdata(name: &str) -> PathBuf {
+pub(crate) fn testdata(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src/server/testdata")
         .join(name)
 }
 
-async fn certs() -> Arc<TlsCerts> {
+pub(crate) async fn certs() -> Arc<TlsCerts> {
     let cfg = TlsConfig {
         cert_file: testdata("cert.pem"),
         key_file: testdata("key.pem"),
@@ -37,7 +37,7 @@ async fn certs() -> Arc<TlsCerts> {
     Arc::new(TlsCerts::load(&cfg).await.expect("certs"))
 }
 
-fn connector() -> TlsConnector {
+pub(crate) fn connector() -> TlsConnector {
     let mut roots = RootCertStore::empty();
     let pem = std::fs::read(testdata("cert.pem")).expect("cert");
     roots
