@@ -18,9 +18,10 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use schemars::JsonSchema;
 use serde::Serialize;
-use tp_contracts::blob::{BlobIndex, BlobStore};
+use tp_contracts::blob::{BlobIndex, BlobStore, Compression};
 use tp_contracts::{BlobKey, Error, Result};
 
+use crate::compress::stored_content_size;
 use crate::orphans::orphan_key;
 use crate::worker::{Now, Pacer, before};
 
@@ -233,13 +234,29 @@ impl Verifier {
         Ok(())
     }
 
+    /// Размер объекта для сверки с учётом. Сжатый объект (признак [`Compression::Zstd`]) сверяется
+    /// по размеру исходного содержимого из заголовка кадра zstd: хранилище знает только сжатый размер.
+    async fn stored_size(&self, rec: &IndexedBlob) -> Result<Option<u64>> {
+        let size = self.store.head(&rec.key).await?;
+        if size.is_none_or(|s| s == rec.size)
+            || self.index.compression(&rec.key).await? != Some(Compression::Zstd)
+        {
+            return Ok(size);
+        }
+        match stored_content_size(self.store.as_ref(), &rec.key).await {
+            // Битый заголовок кадра — расхождение размера (сжатый размер в отчёте).
+            Err(Error::Internal(_)) => Ok(size),
+            other => other,
+        }
+    }
+
     async fn records(&self, fix: bool, pacer: &mut Pacer, report: &mut VerifyReport) -> Result<()> {
         let mut live = self.inventory.live();
         while let Some(rec) = live.next().await {
             let rec = rec?;
             report.records_checked += 1;
             pacer.wait().await;
-            let actual = match self.store.head(&rec.key).await {
+            let actual = match self.stored_size(&rec).await {
                 Ok(size) => size,
                 Err(e) => {
                     report.errors += 1;
@@ -386,6 +403,31 @@ mod tests {
             .expect("вызов");
         e.inventory.keys.lock().expect("lock").push(key);
         key
+    }
+
+    /// Сжимаемое тело: писатель по умолчанию хранит его сжатым.
+    static TEXT: [u8; 4096] = [b'a'; 4096];
+
+    #[tokio::test]
+    async fn compressed_objects_by_content_size() {
+        let e = env(10);
+        let ok = write(&e, &TEXT).await;
+        let broken = write(&e, &TEXT[1..]).await;
+        assert!(e.store.bytes(&ok.path()).expect("объект").len() < TEXT.len());
+        e.store.delete(&broken).await.expect("вызов");
+        e.store
+            .put(&broken, Bytes::from_static(b"not zstd at all"))
+            .await
+            .expect("вызов");
+        e.clock.advance(Duration::from_secs(GRACE + 1));
+        let report = e.verifier.run(false).await.expect("вызов");
+        assert_eq!(
+            (report.records_checked, report.damaged),
+            (2, 1),
+            "{report:?}"
+        );
+        assert_eq!(report.damaged_blobs[0].path, broken.path());
+        assert_eq!(report.damaged_blobs[0].actual_size, Some(15));
     }
 
     #[tokio::test]
