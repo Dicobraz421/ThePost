@@ -110,12 +110,12 @@
 | ci-03 | CI-03, CI-04 | B | ci-01 | 4 |
 | ✅ platform-06 | PLT-15, PLT-16 | A | sys-03, contracts-10 | 2 |
 | ✅ meta-08 | META-21, META-22, META-23, META-24 | B | contracts-10 | 3 |
-| blob-06 | BLOB-13 | A | meta-08 | 4 |
+| ✅ blob-06 | BLOB-13 | A | meta-08 | 4 |
 | mailstore-07 | MS-12, MS-13 | A | mailstore-06 | 1 |
 | smtp-04 | SMTP-12, SMTP-13, SMTP-14, SMTP-15 | A | smtp-03, contracts-13 | 4 |
 | smtp-05 | SMTP-16, SMTP-17, SMTP-18, SMTP-19 | A | smtp-04, meta-08, mailstore-07 | 4 |
 | ✅ auth-03 | AUTH-07 | A | auth-02, meta-08 | 1 |
-| admin-02 | ADM-05, ADM-06, ADM-07 | A | admin-01, meta-08 | 3 |
+| ✅ admin-02 | ADM-05, ADM-06, ADM-07 | A | admin-01, meta-08 | 3 |
 | imap-04 | IMAP-13 | A | imap-03 | 2 |
 | jmap-03 | JMAP-09 | A | jmap-02 | 3 |
 | deploy-05 | DEP-08 | A | deploy-02, meta-08, platform-06 | 4 |
@@ -153,9 +153,9 @@
 |---|---|---|---|---|
 | ✅ contracts-14 (ветка `x/contracts-14`) | CTR-26 | B | contracts-07 | 1 |
 | ✅ contracts-15 (ветка `x/contracts-15`) | CTR-27 | B | contracts-09 | 1 |
-| meta-12 | META-29 | B | contracts-14, meta-03 | 3 |
-| imap-05 | IMAP-14 | A | contracts-14, contracts-15, imap-02 | 2 |
-| jmap-05 | JMAP-11 | A | contracts-14, contracts-15, jmap-02 | 3 |
+| ✅ meta-12 | META-29 | B | contracts-14, meta-03 | 3 |
+| ✅ imap-05 | IMAP-14 | A | contracts-14, contracts-15, imap-02 | 2 |
+| ✅ jmap-05 | JMAP-11 | A | contracts-14, contracts-15, jmap-02 | 3 |
 | admin-04 | ADM-09 | A | contracts-14, admin-01 | 3 |
 
 ### Отчёт jmap-02 (PR #164)
@@ -171,10 +171,18 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| platform-08 | PLT-18 | A | platform-06 | 2 |
+| ✅ platform-08 | PLT-18 | A | platform-06 | 2 |
 | contracts-19 (ветка `x/contracts-19`) | CTR-31 | B | contracts-10, admin-02 | 1 |
 | contracts-20 (ветка `x/contracts-20`) | CTR-32 | B | auth-03 | 1 |
-| mailstore-09 | MS-15 | A | blob-06 | 4 |
+| ✅ mailstore-09 | MS-15 | A | blob-06 | 4 |
+
+### Остаток 2026-11-01 (отчёты imap-05, mailstore-09, app-02)
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| contracts-21 (ветка `x/contracts-21`) | CTR-33 | B | contracts-14 | 1 |
+| app-06 | APP-10 | A | app-02, imap-05, jmap-05, mailstore-09 | 2 |
+| jmap-07 | JMAP-13 | A | jmap-02, mailstore-09 | 3 |
 
 Выход Ф1: MVP SMB — критерии `docs/spec/APP-D.md#Д.7` для профиля SMB на стенде DEP-04.
 

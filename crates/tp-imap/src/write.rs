@@ -1,18 +1,21 @@
 //! Изменение содержимого папок (RFC 9051, 6.3.12, 6.4.3, 6.4.7, 6.4.8; RFC 6851 MOVE; RFC 4315 UIDPLUS):
 //! `APPEND`, `COPY`, `MOVE`, `EXPUNGE`, `UID EXPUNGE`, `CLOSE`.
 //!
-//! - `APPEND` — приём письма почтовым хранилищем (`MailStore::ingest`) с одной доставкой в папку учётной
-//!   записи: разбор, объекты частей, квота и метаданные — как у входящей почты; ответ `[APPENDUID]`.
+//! - `APPEND` — письмо клиента в папку учётной записи (`MailStore::append`): разбор, объекты частей, квота
+//!   и метаданные — как у входящей почты, но это не доставка (решение 2026-11-01-trash-purge): точки принятия
+//!   решений доставки не вызываются, письмо хранится побайтово; ответ `[APPENDUID]`.
 //! - `COPY` и `MOVE` — `MailStore::copy`/`move_to`, ответ `[COPYUID]`. `MOVE` в корзину — удаление
 //!   (`MailStore::delete_to_trash`, SRS 4.7): письмо сохраняет идентификатор и исходную папку для восстановления.
-//! - `EXPUNGE` — письма с `\Deleted` переносятся в корзину. В самой корзине `EXPUNGE` писем не удаляет:
-//!   окончательное удаление — по сроку корзины с точкой принятия решений (Legal Hold), ответ `NO [CANNOT]`.
+//! - `EXPUNGE` — письма с `\Deleted` переносятся в корзину. В самой корзине `EXPUNGE` (и `CLOSE`) — «очистить
+//!   корзину» (`TrashStore::purge`, решение 2026-11-01-trash-purge): по настройке `trash.purge` письмо скрывается
+//!   до конца срока корзины или стирается (под Legal Hold — скрывается). Хранилище корзины в шину не пишет:
+//!   `MailboxChanged` корзины публикует сессия.
 
 use std::collections::HashSet;
 
 use time::OffsetDateTime;
-use tp_contracts::mailstore::{Delivery, IngestRequest};
-use tp_contracts::meta::{Flag, Inserted, MessageQuery, SpecialUse};
+use tp_contracts::bus::{Event, EventKind};
+use tp_contracts::meta::{AccountScope, Flag, Inserted, MessageQuery, SpecialUse};
 use tp_contracts::{Error, MailboxId, MessageId, Result};
 
 use crate::proto::types::core::{Tag, Vec1};
@@ -66,7 +69,6 @@ impl<T: Transport> Session<T> {
         let Some(node) = self.target(tag, &proto::mailbox_bytes(mailbox)).await? else {
             return Ok(());
         };
-        let principal = self.principal.clone().ok_or(Error::Forbidden)?;
         let scope = self.scope().ok_or(Error::Forbidden)?;
         let data = match message {
             LiteralOrLiteral8::Literal(l) => l.data().to_vec(),
@@ -75,20 +77,14 @@ impl<T: Transport> Session<T> {
         let received_at = date
             .and_then(|d| OffsetDateTime::from_unix_timestamp(d.as_ref().timestamp()).ok())
             .unwrap_or_else(OffsetDateTime::now_utc);
-        let req = IngestRequest {
-            tenant: principal.tenant,
-            // Письмо кладёт сам владелец ящика (черновик, копия отправленного).
-            mail_from: principal.login.clone(),
-            raw: Box::pin(futures::stream::iter([Ok(bytes::Bytes::from(data))])),
-            deliveries: vec![Delivery {
-                account: principal.account,
-                mailbox: node.mailbox.id,
-                extra_headers: Vec::new(),
-                flags,
-            }],
-            received_at,
-        };
-        let ingested = self.ctx.deps.store.ingest(req).await?;
+        // Письмо кладёт сам владелец ящика (черновик, копия отправленного): не доставка.
+        let raw = Box::pin(futures::stream::iter([Ok(bytes::Bytes::from(data))]));
+        let appended = self
+            .ctx
+            .deps
+            .store
+            .append(scope, node.mailbox.id, raw, flags, received_at)
+            .await?;
         let st = self
             .ctx
             .deps
@@ -96,11 +92,11 @@ impl<T: Transport> Session<T> {
             .status(scope, node.mailbox.id)
             .await?;
         self.after_change(node.mailbox.id).await?;
-        let code = ingested.delivered.first().map(|d| Code::AppendUid {
+        let code = Code::AppendUid {
             uid_validity: proto::nz(st.uid_validity.0),
-            uid: proto::nz(d.uid.0),
-        });
-        self.ok(tag, code, "APPEND completed");
+            uid: proto::nz(appended.uid.0),
+        };
+        self.ok(tag, Some(code), "APPEND completed");
         Ok(())
     }
 
@@ -267,6 +263,33 @@ impl<T: Transport> Session<T> {
         Ok(mb.is_some_and(|m| m.role == Some(SpecialUse::Trash)))
     }
 
+    /// «Очистить корзину»: письма `ids` корзины `trash` — `TrashStore::purge` по настройке `trash.purge`;
+    /// `MailboxChanged` корзины — здесь (хранилище корзины в шину не пишет). Возвращает убранные у пользователя.
+    async fn purge(
+        &self,
+        scope: AccountScope,
+        trash: MailboxId,
+        ids: &[MessageId],
+    ) -> Result<HashSet<MessageId>> {
+        let deps = &self.ctx.deps;
+        let out = deps.trash.purge(scope, ids, &deps.hooks).await?;
+        let gone: HashSet<MessageId> = out.hidden.into_iter().chain(out.erased).collect();
+        if !gone.is_empty() {
+            let event = Event {
+                tenant: scope.tenant,
+                account: Some(scope.account),
+                kind: EventKind::MailboxChanged {
+                    mailbox: trash,
+                    modseq: out.modseq,
+                },
+            };
+            if let Err(e) = deps.bus.publish(event).await {
+                tracing::warn!(error = %e, "imap: уведомление об очистке корзины не опубликовано");
+            }
+        }
+        Ok(gone)
+    }
+
     /// `EXPUNGE` и `UID EXPUNGE` (`set` — набор UID).
     pub(crate) async fn expunge(
         &mut self,
@@ -301,35 +324,41 @@ impl<T: Transport> Session<T> {
             self.ok(tag, None, &format!("{verb} completed"));
             return Ok(());
         }
-        if self.in_trash(mailbox).await? {
-            self.no(
-                tag,
-                Some(proto::code("CANNOT")),
-                "Messages in Trash are removed after the retention period",
-            );
-            return Ok(());
-        }
         let scope = self.scope().ok_or(Error::Forbidden)?;
         let ids: Vec<MessageId> = found.iter().map(|f| f.1).collect();
-        self.ctx.deps.store.delete_to_trash(scope, &ids).await?;
-        let indexes: Vec<usize> = found.iter().map(|f| f.0).collect();
+        let indexes: Vec<usize> = if self.in_trash(mailbox).await? {
+            let gone = self.purge(scope, mailbox, &ids).await?;
+            found
+                .iter()
+                .filter(|f| gone.contains(&f.1))
+                .map(|f| f.0)
+                .collect()
+        } else {
+            self.ctx.deps.store.delete_to_trash(scope, &ids).await?;
+            found.iter().map(|f| f.0).collect()
+        };
         self.expunged(&indexes);
         self.ok(tag, None, &format!("{verb} completed"));
         Ok(())
     }
 
-    /// `CLOSE`: письма с `\Deleted` — в корзину без ответов `EXPUNGE`, папка закрывается.
+    /// `CLOSE`: письма с `\Deleted` — в корзину (в самой корзине — «очистить корзину») без ответов `EXPUNGE`,
+    /// папка закрывается.
     pub(crate) async fn close(&mut self, tag: &Tag<'static>) -> Result<()> {
         let Some(selected) = self.selected.as_ref() else {
             return Ok(());
         };
         let (mailbox, read_only) = (selected.mailbox, selected.read_only);
-        if !read_only && !self.in_trash(mailbox).await? {
+        if !read_only {
             let found = self.deleted(None).await?;
             if !found.is_empty() {
                 let scope = self.scope().ok_or(Error::Forbidden)?;
                 let ids: Vec<MessageId> = found.iter().map(|f| f.1).collect();
-                self.ctx.deps.store.delete_to_trash(scope, &ids).await?;
+                if self.in_trash(mailbox).await? {
+                    self.purge(scope, mailbox, &ids).await?;
+                } else {
+                    self.ctx.deps.store.delete_to_trash(scope, &ids).await?;
+                }
             }
         }
         self.selected = None;

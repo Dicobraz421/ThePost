@@ -5,6 +5,8 @@
 //! `to_trash` и `restore` сохраняют `MessageId` (меняются папка и UID), `copy` и `move_to` создают новые.
 //! `insert_batch` — все доставки приёма одной транзакцией (решение 2026-10-31-atomic-delivery).
 //! Ссылки на объекты BLOB: `copy` добавляет, `expunge_final` снимает — в той же транзакции.
+//! Скрытые письма корзины (`hidden_at`, `TrashStore::purge`) пользователю не видны: все операции, кроме
+//! `expunge_final`, обходят их как отсутствующие.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -130,7 +132,7 @@ macro_rules! select_messages {
     ($tail:literal) => {
         concat!(
             "SELECT message_id, mailbox_id, uid, modseq, size, received_at, flags, skeleton_hash, skeleton_gen, meta
-             FROM messages WHERE tenant_id = $1 AND account_id = $2 ",
+             FROM messages WHERE tenant_id = $1 AND account_id = $2 AND hidden_at IS NULL ",
             $tail
         )
     };
@@ -185,28 +187,32 @@ fn uuids(ids: &[MessageId]) -> Vec<Uuid> {
     ids.iter().map(|i| *i.as_uuid()).collect()
 }
 
-/// Существующие письма из `ids` в порядке `ids` (без повторов): идентификатор и папка.
+/// Существующие письма из `ids` в порядке `ids` (без повторов): идентификатор и папка;
+/// скрытые — только при `with_hidden`.
 async fn existing(
     tx: &mut PgConnection,
     scope: AccountScope,
     ids: &[Uuid],
+    with_hidden: bool,
 ) -> Result<Vec<(Uuid, Uuid)>> {
     sqlx::query_as(
         "SELECT m.message_id, m.mailbox_id
          FROM (SELECT id, min(ord) AS ord FROM unnest($3::uuid[]) WITH ORDINALITY AS d(id, ord) GROUP BY id) d
          JOIN messages m ON m.tenant_id = $1 AND m.account_id = $2 AND m.message_id = d.id
+         WHERE $4 OR m.hidden_at IS NULL
          ORDER BY d.ord",
     )
     .bind(scope.tenant.as_uuid())
     .bind(scope.account.as_uuid())
     .bind(ids)
+    .bind(with_hidden)
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)
 }
 
 /// Ссылки писем `ids` на объекты BLOB изменяются на `delta` (каждое письмо — по ссылке на каждый объект).
-async fn adjust_refs(
+pub(crate) async fn adjust_refs(
     tx: &mut PgConnection,
     scope: AccountScope,
     ids: &[Uuid],
@@ -307,7 +313,7 @@ async fn require_all(
     ids: &[MessageId],
 ) -> Result<Vec<(Uuid, Uuid)>> {
     let wanted: HashSet<&MessageId> = ids.iter().collect();
-    let found = existing(tx, scope, &uuids(ids)).await?;
+    let found = existing(tx, scope, &uuids(ids), false).await?;
     if found.len() != wanted.len() {
         return Err(Error::NotFound);
     }
@@ -533,7 +539,8 @@ impl MessageStore for PgMeta {
         let current = changelog::lock_modseq(&mut tx, scope).await?;
         let rows: Vec<(Uuid, Uuid, i64, i64, Vec<String>)> = sqlx::query_as(
             "SELECT message_id, mailbox_id, uid, modseq, flags FROM messages
-             WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3) ORDER BY message_id",
+             WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3) AND hidden_at IS NULL
+             ORDER BY message_id",
         )
         .bind(scope.tenant.as_uuid())
         .bind(scope.account.as_uuid())
@@ -703,7 +710,7 @@ impl MessageStore for PgMeta {
             .await?
             .ok_or(Error::NotFound)?;
         // Отсутствующие и уже лежащие в корзине письма пропускаются.
-        let src: Vec<Uuid> = existing(&mut tx, scope, &uuids(ids))
+        let src: Vec<Uuid> = existing(&mut tx, scope, &uuids(ids), false)
             .await?
             .into_iter()
             .filter(|(_, mb)| mb != trash.as_uuid())
@@ -811,10 +818,10 @@ impl MessageStore for PgMeta {
     async fn expunge_final(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
         let mut tx = begin(&self.pool, scope.tenant).await?;
         let current = changelog::lock_modseq(&mut tx, scope).await?;
-        // Только письма в корзине (под блокировкой `ModSeq` учётной записи, как и `restore`):
+        // Только письма в корзине, включая скрытые (под блокировкой `ModSeq` учётной записи, как и `restore`):
         // восстановленные после `TrashStore::expired` и прочие пропускаются.
         let trash = by_role(&mut tx, scope, SpecialUse::Trash).await?;
-        let src: Vec<Uuid> = existing(&mut tx, scope, &uuids(ids))
+        let src: Vec<Uuid> = existing(&mut tx, scope, &uuids(ids), true)
             .await?
             .into_iter()
             .filter(|(_, mb)| trash.is_some_and(|t| mb == t.as_uuid()))
@@ -826,9 +833,9 @@ impl MessageStore for PgMeta {
         }
         let ms = changelog::bump_modseq(&mut tx, scope).await?;
         adjust_refs(&mut tx, scope, &src, -1).await?;
-        let removed: Vec<(Uuid, Uuid, i64)> = sqlx::query_as(
+        let removed: Vec<(Uuid, Uuid, i64, bool)> = sqlx::query_as(
             "DELETE FROM messages WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
-             RETURNING message_id, mailbox_id, uid",
+             RETURNING message_id, mailbox_id, uid, hidden_at IS NOT NULL",
         )
         .bind(scope.tenant.as_uuid())
         .bind(scope.account.as_uuid())
@@ -836,20 +843,23 @@ impl MessageStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        let mut boxes: Vec<Uuid> = removed.iter().map(|r| r.1).collect();
+        // Скрытые пользователь уже не видит (журнал показал их удалёнными при скрытии): без записи в журнал.
+        let mut boxes: Vec<Uuid> = removed.iter().filter(|r| !r.3).map(|r| r.1).collect();
         boxes.sort_unstable();
         boxes.dedup();
         touch(&mut tx, scope, ms, &boxes).await?;
         let mut changes = Vec::with_capacity(removed.len() + boxes.len());
         let mut events = Vec::with_capacity(removed.len());
-        for (id, mb, uid) in removed {
+        for (id, mb, uid, hidden) in removed {
             let mailbox = MailboxId::from_uuid(mb);
-            changes.push(Change::message(
-                id,
-                Op::Destroyed,
-                mailbox,
-                Uid(to_u32(uid)?),
-            ));
+            if !hidden {
+                changes.push(Change::message(
+                    id,
+                    Op::Destroyed,
+                    mailbox,
+                    Uid(to_u32(uid)?),
+                ));
+            }
             let message = MessageId::from_uuid(id);
             events.push(changelog::event(
                 scope,

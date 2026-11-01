@@ -15,7 +15,7 @@ use tp_contracts::{MailboxId, MessageId};
 use tp_contracts::{Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, FakeSearch, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata,
-    MemQuota, MemTrash, SearchDoc, SystemClock,
+    MemPolicies, MemQuota, MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
 use crate::{Deps, Jmap, JmapConfig, Outbound};
@@ -92,6 +92,12 @@ pub struct Env {
     pub principal: Principal,
     pub authz: Arc<TestAuthz>,
     pub outbound: Arc<TestOutbound>,
+    pub bus: MemEventBus,
+    /// Корзина (`purge`); настройка `trash.purge` — из `policies`.
+    pub trash: MemTrash,
+    pub policies: MemPolicies,
+    /// Точка принятия решений хранилища и сервера (Legal Hold, доставка).
+    pub hook: RecordingDecisionHook,
     pub jmap: Arc<Jmap>,
 }
 
@@ -106,15 +112,19 @@ impl Env {
         let index = MemBlobIndex::new(clock.clone());
         let meta = MemMetadata::new(clock).with_blob_index(index.clone());
         let bus = MemEventBus::default();
+        let policies = MemPolicies::new(&meta);
+        let trash = MemTrash::new(&meta).with_policies(policies.clone());
+        let hook = RecordingDecisionHook::new("test");
+        let hooks = DecisionHooks::new(vec![Arc::new(hook.clone())]);
         let store = tp_mailstore::Store::new(tp_mailstore::Deps {
             blobs: Arc::new(blobs.clone()),
             index: Arc::new(index.clone()),
             messages: Arc::new(meta.clone()),
             changes: Arc::new(meta.clone()),
-            trash: Arc::new(MemTrash::new(&meta)),
+            trash: Arc::new(trash.clone()),
             quota: Arc::new(MemQuota::new(&meta)),
             bus: Arc::new(bus.clone()),
-            hooks: DecisionHooks::default(),
+            hooks: hooks.clone(),
         });
         let scope = meta.account("user@example.org").await.expect("account");
         let principal = Principal {
@@ -137,6 +147,8 @@ impl Env {
                 messages: Arc::new(meta.clone()),
                 changes: Arc::new(meta.clone()),
                 store: Arc::new(store.clone()),
+                trash: Arc::new(trash.clone()),
+                policies: Arc::new(policies.clone()),
                 search: Arc::new(search.clone()),
                 blobs: Arc::new(blobs),
                 blob_index: Arc::new(index),
@@ -144,7 +156,7 @@ impl Env {
                 accounts: Arc::new(meta.clone()),
                 authz: authz.clone(),
                 outbound: Some(outbound.clone()),
-                hooks: DecisionHooks::default(),
+                hooks,
                 capabilities: caps,
             },
             cfg,
@@ -159,6 +171,10 @@ impl Env {
             principal,
             authz,
             outbound,
+            bus,
+            trash,
+            policies,
+            hook,
             jmap: Arc::new(jmap),
         }
     }

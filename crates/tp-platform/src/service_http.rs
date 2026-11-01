@@ -7,11 +7,15 @@
 //! (файлы, секреты Kubernetes, ACME — с перечитыванием без перезапуска, как у слушателей протоколов).
 //! Открытый HTTP — только `profile: dev` с `service_http.allow_plaintext: true` и предупреждением в лог при
 //! каждом запуске; вне dev — ошибка конфигурации.
+//!
+//! Адрес — только внутренний (SRS 6.8, PLT-18): по умолчанию `127.0.0.1:8081`; loopback, частные и локальные
+//! диапазоны разрешены всегда, остальные адреса (в том числе `0.0.0.0` / `[::]` — все интерфейсы) — только из
+//! явного списка `service_http.internal_networks`, иначе ошибка проверки конфигурации.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -31,6 +35,7 @@ use tp_contracts::config::duration;
 use tp_contracts::role::{CancellationToken, ReadyHandle};
 use tp_contracts::tls::Profile;
 
+use crate::listen::Cidr;
 use crate::telemetry::Metrics;
 use crate::tls::TlsCerts;
 
@@ -41,8 +46,15 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServiceHttpConfig {
-    /// Адрес служебного HTTP (метрики и проверки доступности). Требует перезапуска.
+    /// Адрес служебного HTTP (метрики и проверки доступности), только внутренний (`127.0.0.1:8081`).
+    /// Требует перезапуска.
     pub listen: SocketAddr,
+    /// Сети, которые считаются внутренними сверх loopback и частных диапазонов (`10.0.0.0/8`, `172.16.0.0/12`,
+    /// `192.168.0.0/16`, `169.254.0.0/16`, `fc00::/7`, `fe80::/10`). `listen` вне них — ошибка проверки.
+    /// Все интерфейсы (`0.0.0.0`, `[::]`) — только если адрес явно входит в список (`0.0.0.0/32`), например за
+    /// межсетевым экраном или в поде Kubernetes. Требует перезапуска.
+    #[schemars(with = "Vec<String>")]
+    pub internal_networks: Vec<Cidr>,
     /// Открытый HTTP без TLS. Только `profile: dev`, с предупреждением в лог; иначе — ошибка конфигурации.
     /// Требует перезапуска.
     pub allow_plaintext: bool,
@@ -57,7 +69,8 @@ pub struct ServiceHttpConfig {
 impl Default for ServiceHttpConfig {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::from(([0, 0, 0, 0], 8081)),
+            listen: SocketAddr::from(([127, 0, 0, 1], 8081)),
+            internal_networks: Vec::new(),
             allow_plaintext: false,
             handshake_timeout: Duration::from_secs(10),
             max_handshakes: 128,
@@ -66,8 +79,16 @@ impl Default for ServiceHttpConfig {
 }
 
 impl ServiceHttpConfig {
-    /// Проверка секции (`thepost config check` и запуск): `allow_plaintext` — только в профиле dev.
+    /// Проверка секции (`thepost config check` и запуск): адрес — только внутренний, `allow_plaintext` — только
+    /// в профиле dev.
     pub fn check(&self, profile: Profile) -> tp_contracts::Result<()> {
+        let ip = self.listen.ip();
+        if !is_internal(ip) && !self.internal_networks.iter().any(|n| n.contains(ip)) {
+            return Err(Error::Invalid(format!(
+                "listen {}: not an internal address; /metrics and /healthz listen only on internal addresses (loopback, private ranges or service_http.internal_networks)",
+                self.listen
+            )));
+        }
         if self.allow_plaintext && profile != Profile::Dev {
             return Err(Error::Invalid(
                 "allow_plaintext is allowed only with profile: dev; /metrics and /healthz are served over TLS"
@@ -88,6 +109,15 @@ impl ServiceHttpConfig {
     /// Предупреждение для лога при открытом служебном HTTP.
     pub fn plaintext_warning() -> &'static str {
         "service http (/metrics, /healthz) is NOT encrypted (service_http.allow_plaintext, profile dev); never use in production"
+    }
+}
+
+/// Адрес внутренний без настройки: loopback, частные и локальные диапазоны IPv4 и IPv6.
+/// Неуказанный адрес (`0.0.0.0`, `::`) — все интерфейсы, в том числе публичные, — не внутренний.
+fn is_internal(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
     }
 }
 
@@ -530,6 +560,69 @@ mod tests {
         );
         trigger.cancel();
         server.await.expect("join").expect("serve");
+    }
+
+    #[test]
+    fn listen_internal_only() {
+        assert_eq!(
+            ServiceHttpConfig::default().listen,
+            SocketAddr::from(([127, 0, 0, 1], 8081))
+        );
+        assert!(ServiceHttpConfig::default().check(Profile::Prod).is_ok());
+        let at = |listen: &str, nets: &[&str]| ServiceHttpConfig {
+            listen: listen.parse().expect("addr"),
+            internal_networks: nets.iter().map(|n| n.parse().expect("cidr")).collect(),
+            ..ServiceHttpConfig::default()
+        };
+        for ok in [
+            "127.0.0.1:1",
+            "10.0.0.1:1",
+            "172.31.0.1:1",
+            "192.168.1.1:1",
+            "169.254.0.1:1",
+            "[::1]:1",
+            "[fd12::1]:1",
+            "[fe80::1]:1",
+            "[::ffff:10.0.0.1]:1",
+        ] {
+            assert!(at(ok, &[]).check(Profile::Prod).is_ok(), "{ok}");
+        }
+        for bad in [
+            "0.0.0.0:8081",
+            "[::]:8081",
+            "8.8.8.8:1",
+            "[2001:db8::1]:1",
+            "172.32.0.1:1",
+        ] {
+            let e = at(bad, &[]).check(Profile::Dev).expect_err(bad);
+            assert!(
+                matches!(&e, Error::Invalid(m) if m.contains("not an internal address")),
+                "{bad}: {e:?}"
+            );
+        }
+        assert!(
+            at("0.0.0.0:8081", &["0.0.0.0/32"])
+                .check(Profile::Prod)
+                .is_ok()
+        );
+        assert!(at("[::]:8081", &["::/128"]).check(Profile::Prod).is_ok());
+        assert!(
+            at("8.8.8.8:1", &["8.8.8.0/24"])
+                .check(Profile::Prod)
+                .is_ok()
+        );
+        assert!(
+            at("8.8.8.8:1", &["8.8.4.0/24"])
+                .check(Profile::Prod)
+                .is_err()
+        );
+
+        let cfg: ServiceHttpConfig = serde_yaml_ng::from_str(
+            "listen: 0.0.0.0:8081\ninternal_networks: [0.0.0.0/32, 10.0.0.0/8]\n",
+        )
+        .expect("yaml");
+        assert_eq!(cfg.internal_networks.len(), 2);
+        assert!(cfg.check(Profile::Prod).is_ok());
     }
 
     #[test]

@@ -14,6 +14,9 @@
 //! До шага 4 ничего не раскладывается. Сбой загрузки или транзакции снимает добавленные ссылки и не оставляет
 //! метаданных: запрос выполняется целиком или не выполняется (вызывающий может повторить).
 //!
+//! После вставки — предупреждения о заполнении квоты ([`crate::quota`]); служебное письмо-предупреждение
+//! принимается без проверки квоты.
+//!
 //! Письмо клиента (`MailStore::append`: IMAP APPEND, JMAP `Email/import`; решение 2026-11-01-trash-purge) — не доставка:
 //! шаги 2–3 общие с приёмом, но без точек принятия решений и копий (шаг 1 — только квота), метаданные —
 //! `MessageStore::insert`.
@@ -23,12 +26,13 @@ use std::collections::HashMap;
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
 use time::OffsetDateTime;
-use tp_contracts::blob::{Acquire, ByteStream, Commit};
+use tp_contracts::blob::ByteStream;
 use tp_contracts::ext::{CopyTo, Decision, DeliveryInfo};
 use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, Ingested};
 use tp_contracts::meta::{AccountScope, Flags, NewMessage, PartRef};
 use tp_contracts::{BlobHash, BlobKey, Error, MailboxId, Result, TenantId};
 
+use crate::quota::Pending;
 use crate::split::{self, Split};
 use crate::{Store, meta};
 
@@ -47,10 +51,18 @@ struct Staged {
     items: Vec<(AccountScope, MailboxId, NewMessage)>,
     /// Добавленные ссылки на объекты: снимаются, если вставка метаданных не удалась.
     held: Vec<(BlobKey, u32)>,
+    /// Проверенные добавления квоты — для предупреждений после вставки.
+    pending: Vec<Pending>,
 }
 
 impl Store {
-    pub(crate) async fn ingest_impl(&self, req: IngestRequest) -> Result<Ingested> {
+    /// Приём; `service` — служебное письмо (предупреждение о квоте): без проверки квоты. Возвращает и проверенные
+    /// добавления квоты — для предупреждений после приёма ([`Store::warn_quota`]).
+    pub(crate) async fn ingest_impl(
+        &self,
+        req: IngestRequest,
+        service: bool,
+    ) -> Result<(Ingested, Vec<Pending>)> {
         let IngestRequest {
             tenant,
             mail_from,
@@ -89,8 +101,12 @@ impl Store {
             }
         }
 
-        let Staged { items, held } = self
-            .stage(tenant, raw, &deliveries, &common, received_at)
+        let Staged {
+            items,
+            held,
+            pending,
+        } = self
+            .stage(tenant, raw, &deliveries, &common, received_at, service)
             .await?;
         let inserted = match self.d.messages.insert_batch(tenant, items).await {
             Ok(inserted) => inserted,
@@ -116,10 +132,11 @@ impl Store {
         }
         // Доставки сверх запроса (копии точек принятия решений) вызывающему не возвращаются.
         done.truncate(info.deliveries.len());
-        Ok(Ingested {
+        let ingested = Ingested {
             delivered: done,
             forward,
-        })
+        };
+        Ok((ingested, pending))
     }
 
     /// Письмо клиента (IMAP APPEND, JMAP `Email/import`): те же шаги 1–3, что у приёма, без точек принятия решений,
@@ -139,8 +156,12 @@ impl Store {
             extra_headers: Vec::new(),
             flags,
         };
-        let Staged { mut items, held } = self
-            .stage(scope.tenant, raw, &[delivery], &[], received_at)
+        let Staged {
+            mut items,
+            held,
+            pending,
+        } = self
+            .stage(scope.tenant, raw, &[delivery], &[], received_at, false)
             .await?;
         let inserted = match items.pop() {
             Some((_, _, msg)) => self.d.messages.insert(scope, mailbox, msg).await,
@@ -154,6 +175,7 @@ impl Store {
             }
         };
         self.notify(scope, [mailbox], ins.modseq).await;
+        self.warn_quota(scope.tenant, &pending).await;
         Ok(Delivered {
             account: scope.account,
             mailbox,
@@ -163,7 +185,8 @@ impl Store {
     }
 
     /// Шаги 1–3 для доставок `deliveries` с общими заголовками `common`: проверка заголовков, квота (до разбора
-    /// и загрузки), разбор, загрузка и учёт объектов. Метаданные не раскладываются; сбой загрузки снимает ссылки.
+    /// и загрузки; `service` — без неё), разбор, загрузка и учёт объектов. Метаданные не раскладываются;
+    /// сбой загрузки снимает ссылки.
     async fn stage(
         &self,
         tenant: TenantId,
@@ -171,6 +194,7 @@ impl Store {
         deliveries: &[Delivery],
         common: &[(String, String)],
         received_at: OffsetDateTime,
+        service: bool,
     ) -> Result<Staged> {
         check_headers(common)?;
         for d in deliveries {
@@ -184,12 +208,23 @@ impl Store {
                 (d.account, size as u64)
             })
             .collect();
-        self.check_quota(tenant, &demands).await?;
+        let mut pending = if service {
+            Vec::new()
+        } else {
+            self.check_quotas(tenant, &demands).await?
+        };
+        for p in &mut pending {
+            p.fallback = deliveries
+                .iter()
+                .find(|d| d.account == p.account)
+                .map(|d| d.mailbox);
+        }
 
         // Разбор — работа процессора на всё письмо: вне потоков асинхронного рантайма.
+        let limits = self.cfg.mime;
         let (split, meta) = tokio::task::spawn_blocking(move || {
-            let meta = meta::message_meta(&raw);
-            (Split::new(raw), meta)
+            let meta = meta::message_meta_with(&raw, limits);
+            (Split::with_limits(raw, limits), meta)
         })
         .await
         .map_err(|e| Error::internal(format!("ingest: разбор письма: {e}")))?;
@@ -286,7 +321,11 @@ impl Store {
             Ok::<_, Error>(items)
         })();
         match items {
-            Ok(items) => Ok(Staged { items, held }),
+            Ok(items) => Ok(Staged {
+                items,
+                held,
+                pending,
+            }),
             Err(e) => {
                 self.release(&held).await;
                 Err(e)
@@ -294,7 +333,10 @@ impl Store {
         }
     }
 
-    /// Учитывает объект с `refs` ссылками и загружает его, если его ещё нет (SRS 3.4, шаги 2–3).
+    /// Учитывает объект с `refs` ссылками и загружает его, если его ещё нет (SRS 3.4, шаги 2–3), через
+    /// [`tp_blob::BlobWriter`]: хэш `hash` и размер — исходного содержимого, хранится сжатый вид, если сжатие
+    /// выгодно (BLOB-13). Тип части не передаётся: тела в кодировке передачи (base64), формат распознаётся по
+    /// сигнатуре, порог выигрыша решает остальное.
     async fn store_object(
         &self,
         tenant: TenantId,
@@ -302,39 +344,7 @@ impl Store {
         data: Bytes,
         refs: u32,
     ) -> Result<BlobKey> {
-        let mut generation = match self.d.index.acquire(tenant, &hash, refs).await? {
-            Acquire::Existing { generation } => {
-                return Ok(BlobKey {
-                    tenant,
-                    hash,
-                    generation,
-                });
-            }
-            Acquire::Absent { generation } => generation,
-        };
-        loop {
-            let key = BlobKey {
-                tenant,
-                hash,
-                generation,
-            };
-            self.d.blobs.put(&key, data.clone()).await?;
-            match self
-                .d
-                .index
-                .commit_new(tenant, &hash, generation, data.len() as u64, refs)
-                .await?
-            {
-                Commit::Done { generation } => {
-                    return Ok(BlobKey {
-                        tenant,
-                        hash,
-                        generation,
-                    });
-                }
-                Commit::Bumped { generation: next } => generation = next,
-            }
-        }
+        self.writer.write_part(tenant, hash, data, refs, None).await
     }
 
     /// Снимает ссылки (сбой приёма). Ошибка снятия — в журнал: объект останется до ручной сверки.
@@ -423,7 +433,7 @@ mod tests {
     use tp_testkit::Clock;
     use tp_testkit::{BlobOp, SystemClock};
 
-    use crate::testenv::{Env, stream};
+    use crate::testenv::{Env, object, stream};
 
     fn mail() -> Vec<u8> {
         tp_testkit::corpus::corpus_mail("mixed-three-attachments")
@@ -465,13 +475,13 @@ mod tests {
     /// Письмо, собранное из объектов хранилища (скелет + части по `PartRef`).
     async fn stored(env: &Env, scope: AccountScope, id: MessageId) -> Vec<u8> {
         let msg = env.meta.get(scope, id).await.expect("get").expect("msg");
-        let skel = env.blobs.bytes(&msg.skeleton.path()).expect("skeleton");
+        let skel = object(env, &msg.skeleton).await;
         let skel = crate::split::Skeleton::decode(skel).expect("decode");
-        skel.join(|path| {
-            let p = msg.parts.iter().find(|p| p.part == path)?;
-            env.blobs.bytes(&p.blob.path())
-        })
-        .expect("join")
+        let mut parts = HashMap::new();
+        for p in &msg.parts {
+            parts.insert(p.part.clone(), object(env, &p.blob).await);
+        }
+        skel.join(|path| parts.get(path).cloned()).expect("join")
     }
 
     async fn inbox_count(env: &Env, d: &Delivery) -> usize {
@@ -536,6 +546,102 @@ mod tests {
         for h in &unique {
             assert_eq!(env.index.row(TenantId::DEFAULT, h).expect("row").refcnt, 12);
         }
+    }
+
+    /// Приёмка MS-15: текстовая часть хранится сжатой (zstd), читается без изменений; хэш, размер и
+    /// дедупликация — по исходному содержимому.
+    #[tokio::test]
+    async fn text_part_stored_compressed() {
+        use tp_contracts::blob::{BlobIndex, Compression};
+
+        let env = Env::new();
+        let text = "Съешь же ещё этих мягких французских булок, да выпей чаю.\r\n".repeat(100);
+        let raw = format!(
+            "From: a@example.org\r\nTo: u0@example.org\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+             --b\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n\
+             {text}\r\n--b\r\nContent-Type: text/plain\r\n\r\nshort\r\n--b--\r\n"
+        )
+        .into_bytes();
+        let split = Split::new(Bytes::from(raw.clone()));
+        let cut = split
+            .cuts()
+            .iter()
+            .find(|c| split.body(c).len() >= text.len())
+            .expect("text part");
+        let ds = recipients(&env, 2).await;
+        let done = env
+            .store
+            .ingest(request(&raw, ds.clone()))
+            .await
+            .expect("ingest")
+            .delivered;
+        let scope = AccountScope {
+            tenant: TenantId::DEFAULT,
+            account: ds[0].account,
+        };
+        let msg = env
+            .meta
+            .get(scope, done[0].message)
+            .await
+            .expect("get")
+            .expect("msg");
+        let part = msg
+            .parts
+            .iter()
+            .find(|p| p.part == cut.path)
+            .expect("part ref");
+        assert_eq!(part.blob.hash, cut.hash, "хэш — исходного содержимого");
+        assert_eq!(part.blob.hash, split::hash(&split.body(cut)));
+        assert_eq!(
+            env.index
+                .compression(&part.blob)
+                .await
+                .expect("compression"),
+            Some(Compression::Zstd)
+        );
+        let kept = env.blobs.bytes(&part.blob.path()).expect("object");
+        assert!(
+            kept.len() < split.body(cut).len() / 2,
+            "сжато: {} из {}",
+            kept.len(),
+            split.body(cut).len()
+        );
+        assert_eq!(
+            env.index
+                .row(TenantId::DEFAULT, &cut.hash)
+                .expect("row")
+                .size,
+            split.body(cut).len() as u64,
+            "размер в учёте — исходный"
+        );
+        assert!(object(&env, &part.blob).await == split.body(cut));
+        let got: Vec<Bytes> = env
+            .store
+            .fetch_raw(scope, done[0].message, None)
+            .await
+            .expect("fetch")
+            .try_collect()
+            .await
+            .expect("read");
+        assert!(got.concat() == raw, "письмо читается без изменений");
+        let m = env.store.writer_metrics();
+        assert!(m.compressed >= 1, "{m:?}");
+
+        // Дедупликация: та же часть — без новых загрузок, ссылки добавляются.
+        let puts = env.blobs.calls(BlobOp::Put);
+        env.store
+            .ingest(request(&raw, ds[..1].to_vec()))
+            .await
+            .expect("again");
+        assert_eq!(env.blobs.calls(BlobOp::Put), puts);
+        assert_eq!(
+            env.index
+                .row(TenantId::DEFAULT, &cut.hash)
+                .expect("row")
+                .refcnt,
+            3
+        );
     }
 
     #[tokio::test]

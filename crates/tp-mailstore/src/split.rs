@@ -30,14 +30,40 @@ use std::ops::Range;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use mail_parser::{Encoding, Message, MessageParser, PartType};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tp_contracts::{BlobHash, Error, Result};
 
 /// Заголовок формата скелета.
 const MAGIC: &[u8; 5] = b"TPSK\x01";
 
-/// Предел вложенности MIME при разборе: глубже части остаются в скелете.
-const MAX_DEPTH: usize = 64;
+/// Пределы разбора MIME (секция `mime` конфигурации хранилища; SRS 6.8): защита от писем-бомб.
+///
+/// Части глубже `max_depth` и сверх `max_parts` не вырезаются ([`Split`]: остаются в скелете, письмо
+/// собирается побайтово) и не описываются в BODYSTRUCTURE ([`crate::meta`]).
+///
+/// ```yaml
+/// max_depth: 64
+/// max_parts: 10000
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct MimeLimits {
+    /// Глубина вложенности: составные части и вложенные письма.
+    pub max_depth: usize,
+    /// Частей MIME на письмо, включая вложенные письма.
+    pub max_parts: usize,
+}
+
+impl Default for MimeLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 64,
+            max_parts: 10_000,
+        }
+    }
+}
 
 /// Вырезанная часть письма: тело листовой части MIME.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,10 +94,17 @@ pub struct Split {
 }
 
 impl Split {
-    /// Разбирает письмо. Не падает на битом MIME: что не разобралось, остаётся в скелете.
+    /// Разбирает письмо с пределами по умолчанию.
     pub fn new(raw: Bytes) -> Self {
+        Self::with_limits(raw, MimeLimits::default())
+    }
+
+    /// Разбирает письмо. Не падает на битом MIME: что не разобралось или вышло за `limits`, остаётся в скелете.
+    pub fn with_limits(raw: Bytes, limits: MimeLimits) -> Self {
         let mut walk = Walk {
             len: raw.len() as u64,
+            limits,
+            parts: 0,
             cuts: Vec::new(),
             sections: Vec::new(),
         };
@@ -220,7 +253,16 @@ impl Skeleton {
 
     /// Собирает письмо в памяти (тесты, малые письма); `part` — тело части по пути.
     pub fn join(&self, mut part: impl FnMut(&str) -> Option<Bytes>) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(usize::try_from(self.size).unwrap_or(0));
+        // Заранее — только байты скелета: `size` битого объекта может быть любым.
+        let inline: usize = self
+            .segments
+            .iter()
+            .map(|s| match s {
+                Segment::Inline { data, .. } => data.len(),
+                Segment::Part { .. } => 0,
+            })
+            .sum();
+        let mut out = Vec::with_capacity(inline);
         for seg in &self.segments {
             match seg {
                 Segment::Inline { data, .. } => out.extend_from_slice(data),
@@ -364,6 +406,9 @@ fn decode(data: Bytes) -> std::result::Result<Skeleton, DecodeError> {
 /// Обход дерева MIME: пути IMAP, разделы, кандидаты на вырезание.
 struct Walk {
     len: u64,
+    limits: MimeLimits,
+    /// Обойдено частей.
+    parts: usize,
     cuts: Vec<(String, Range<u64>)>,
     sections: Vec<Section>,
 }
@@ -387,7 +432,7 @@ impl Walk {
     /// Письмо (верхнее или вложенное `message/rfc822` с путём `base`): дети составного корня —
     /// `base.1`, `base.2`, ...; тело несоставного корня — `base.1`.
     fn message(&mut self, msg: &Message<'_>, base: &str, depth: usize) {
-        if depth > MAX_DEPTH {
+        if depth > self.limits.max_depth {
             return;
         }
         let Some(root) = msg.parts.first() else {
@@ -420,9 +465,10 @@ impl Walk {
     }
 
     fn part(&mut self, msg: &Message<'_>, id: usize, path: &str, depth: usize) {
-        if depth > MAX_DEPTH {
+        if depth > self.limits.max_depth || self.parts >= self.limits.max_parts {
             return;
         }
+        self.parts += 1;
         let Some(part) = msg.parts.get(id) else {
             return;
         };
@@ -480,7 +526,7 @@ fn len_u32(n: usize) -> u32 {
 }
 
 fn put_str(out: &mut BytesMut, s: &str) {
-    // Пути IMAP короткие: глубина ограничена MAX_DEPTH, номера — десятичные.
+    // Пути IMAP короткие при разумной глубине (`MimeLimits::max_depth`); длиннее — обрезаются.
     let b = &s.as_bytes()[..s.len().min(usize::from(u16::MAX))];
     out.put_u16_le(b.len() as u16);
     out.put_slice(b);

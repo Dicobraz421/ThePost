@@ -1,0 +1,40 @@
+# Цели fuzz разбора MIME (MS-13), в каталоге crates/tp-mailstore:
+#   cargo +nightly fuzz run <цель> fuzz/corpus/<цель> ../tp-testkit/corpus -- -max_total_time=600
+# Цели: split — скелет и части, meta — ENVELOPE и BODYSTRUCTURE, skeleton — объект-скелет из хранилища.
+# Начальный корпус — письма KIT-04 (crates/tp-testkit/corpus), новые входы — в fuzz/corpus/<цель> (не в git).
+# Отдельный workspace: в сборку и Cargo.lock основного workspace не входит.
+[package]
+name = "tp-mailstore-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tp-mailstore = { path = ".." }
+
+[[bin]]
+name = "split"
+path = "fuzz_targets/split.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "meta"
+path = "fuzz_targets/meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "skeleton"
+path = "fuzz_targets/skeleton.rs"
+test = false
+doc = false
+bench = false

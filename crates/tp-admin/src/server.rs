@@ -4,15 +4,18 @@
 //! `OidcAuthenticator`); многофакторную аутентификацию обеспечивает поставщик удостоверений. Роли администраторов
 //! назначает секция `admin` config.yaml по имени входа или группе каталога ([`RoleBinding`]):
 //! - [`AdminRole::InstallationAdmin`] — все организации;
-//! - [`AdminRole::OrganizationAdmin`] — только организация администратора.
+//! - [`AdminRole::OrganizationAdmin`] — только организация администратора;
+//! - [`AdminRole::Operator`] — оператор только для чтения (`GET`/`HEAD`) своей организации, кроме журнала аудита;
+//! - [`AdminRole::Auditor`] — аудитор: только чтение журнала аудита своей организации.
 //!
 //! Ресурсы организации — под `/api/v1/orgs/{org}/...`: слой доступа ([`guard`]) проверяет вход, роль и область
-//! роли до обработчика и пишет каждое изменение (не `GET`/`HEAD`), включая отказ, в журнал аудита
-//! ([`crate::audit`]). Маршруты модулей (`AdminRoutes`, CONTRACTS.md#Extension points) — под тем же слоем,
+//! роли до обработчика ([`Caller::permits`]) и пишет каждое изменение (не `GET`/`HEAD`), включая отказ, в журнал
+//! аудита ([`crate::audit`]). Слушатель по умолчанию — только внутренние адреса ([`AdminConfig::listen`]). Маршруты модулей (`AdminRoutes`, CONTRACTS.md#Extension points) — под тем же слоем,
 //! префикс `/api/v1/modules/<имя>`. Ошибки — `application/problem+json` (RFC 9457) по `tp_contracts::Error`.
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -28,7 +31,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
+use tp_contracts::delivery::DeliveryLog;
 use tp_contracts::ext::{AdminRequest, AdminRoutes};
+use tp_contracts::groups::GroupStore;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountStore, PolicyResolver};
 use tp_contracts::retention::{Quota, TrashStore};
@@ -37,7 +42,9 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
 use crate::accounts::{DomainStore, PolicyStore};
-use crate::audit::{AuditRecord, AuditSink};
+use crate::audit::{AUDIT_ROUTE, AuditLog, AuditRecord, AuditSink};
+use crate::export::AuditExportConfig;
+use crate::groups::Moderation;
 
 /// Начало префикса маршрутов модуля.
 pub const MODULE_PREFIX: &str = "/api/v1/modules/";
@@ -63,7 +70,38 @@ pub enum AdminRole {
     InstallationAdmin,
     /// Администратор организации: только своя организация.
     OrganizationAdmin,
+    /// Оператор только для чтения: `GET`/`HEAD` своей организации, кроме журнала аудита.
+    Operator,
+    /// Аудитор: только чтение журнала аудита своей организации.
+    Auditor,
 }
+
+impl AdminRole {
+    /// Роль допускает запрос `method` к шаблону маршрута `route` в организации `tenant` (`None` — вне
+    /// организаций: `whoami`, модули) от субъекта организации `own`.
+    pub fn permits(
+        self,
+        own: TenantId,
+        tenant: Option<TenantId>,
+        method: &Method,
+        route: &str,
+    ) -> bool {
+        let read = *method == Method::GET || *method == Method::HEAD;
+        let own_scope = tenant.is_none_or(|t| t == own);
+        let audit = route == AUDIT_ROUTE;
+        match self {
+            AdminRole::InstallationAdmin => true,
+            AdminRole::OrganizationAdmin => own_scope,
+            AdminRole::Operator => own_scope && read && !audit,
+            AdminRole::Auditor => {
+                read && (route == WHOAMI_ROUTE || (audit && tenant.is_some_and(|t| t == own)))
+            }
+        }
+    }
+}
+
+/// Маршрут `whoami` (доступен любой роли).
+pub const WHOAMI_ROUTE: &str = "/api/v1/whoami";
 
 /// Назначение роли: имена входа и группы каталога (`Principal::groups`), получающие роль.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -89,6 +127,11 @@ pub struct RoleBinding {
 ///   - role: organization_admin
 ///     logins: [admin@example.org]
 ///     groups: [mail-admins]
+///   - role: auditor
+///     groups: [security]
+/// listen: 127.0.0.1:8443
+/// audit:
+///   syslog: { address: "siem.example.org:6514" }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -103,6 +146,12 @@ pub struct AdminConfig {
     pub max_page_size: usize,
     /// Наибольший размер тела запроса, байт.
     pub max_body_size: usize,
+    /// Адрес слушателя (связывает `tp-platform`); по умолчанию — только loopback.
+    pub listen: SocketAddr,
+    /// Разрешить внешний адрес слушателя (не loopback, не частный, `0.0.0.0`/`::`); по умолчанию — нет (SRS 6.8).
+    pub allow_external: bool,
+    /// Экспорт журнала аудита во внешнюю SIEM (syslog, OTLP); по умолчанию выключен.
+    pub audit: AuditExportConfig,
 }
 
 impl Default for AdminConfig {
@@ -113,13 +162,40 @@ impl Default for AdminConfig {
             page_size: 100,
             max_page_size: 1_000,
             max_body_size: 1_048_576,
+            listen: SocketAddr::from(([127, 0, 0, 1], 8443)),
+            allow_external: false,
+            audit: AuditExportConfig::default(),
         }
     }
 }
 
+/// Внутренний адрес: loopback, частные сети IPv4 (RFC 1918), link-local, уникальные локальные IPv6 (fc00::/7).
+/// Неуказанный (`0.0.0.0`, `::`) — внешний: слушает все интерфейсы.
+pub fn is_internal(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_internal(IpAddr::V4(v4)),
+            None => {
+                let seg = v6.segments()[0];
+                v6.is_loopback() || (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+            }
+        },
+    }
+}
+
 impl AdminConfig {
-    /// Проверяет значения: страница от 1 до `max_page_size`, у назначения есть имя входа или группа.
+    /// Проверяет значения: страница от 1 до `max_page_size`, у назначения есть имя входа или группа,
+    /// слушатель — внутренний адрес (или `allow_external`), секции экспорта аудита.
     pub fn check(&self) -> Result<()> {
+        if !self.allow_external && !is_internal(self.listen.ip()) {
+            return Err(Error::invalid(format!(
+                "admin: listen {} — внешний адрес; Admin API по умолчанию слушает только внутренние адреса \
+                 (allow_external: true — явно разрешить)",
+                self.listen
+            )));
+        }
+        self.audit.check()?;
         if self.page_size == 0 || self.page_size > self.max_page_size {
             return Err(Error::invalid("admin: page_size — от 1 до max_page_size"));
         }
@@ -151,11 +227,11 @@ pub struct Caller {
 }
 
 impl Caller {
-    /// Роль позволяет работать с организацией `tenant`.
-    pub fn can_access(&self, tenant: TenantId) -> bool {
-        self.roles.contains(&AdminRole::InstallationAdmin)
-            || (self.roles.contains(&AdminRole::OrganizationAdmin)
-                && tenant == self.principal.tenant)
+    /// Одна из ролей допускает запрос ([`AdminRole::permits`]); ролей нет — нет.
+    pub fn permits(&self, tenant: Option<TenantId>, method: &Method, route: &str) -> bool {
+        self.roles
+            .iter()
+            .any(|r| r.permits(self.principal.tenant, tenant, method, route))
     }
 }
 
@@ -164,8 +240,16 @@ impl Caller {
 pub struct Deps {
     /// Проверка Bearer-токенов (OIDC).
     pub auth: Arc<dyn Authenticator>,
-    /// Журнал аудита.
+    /// Журнал аудита: запись (хранилище и экспорт — [`crate::export::Fanout`]).
     pub audit: Arc<dyn AuditSink>,
+    /// Журнал аудита: чтение; `None` — не подключено (маршрут отвечает 503).
+    pub audit_log: Option<Arc<dyn AuditLog>>,
+    /// Журнал доставки: поиск.
+    pub delivery: Arc<dyn DeliveryLog>,
+    /// Группы рассылки и очередь модерации.
+    pub groups: Arc<dyn GroupStore>,
+    /// Решения модерации: доставка одобренного, уведомление об отказе.
+    pub moderation: Arc<dyn Moderation>,
     /// Маршруты модулей (`Registry::admin_routes`).
     pub modules: Vec<Arc<dyn AdminRoutes>>,
     /// Учётные записи.
@@ -227,10 +311,13 @@ impl Admin {
 
     /// Маршруты Admin API; TLS, слушатель (по умолчанию — внутренние адреса) — у вызывающего (`tp-platform`).
     pub fn router(self: Arc<Self>) -> Router {
-        let mut api: Router<Arc<Admin>> = Router::new().route("/api/v1/whoami", get(whoami));
+        let mut api: Router<Arc<Admin>> = Router::new().route(WHOAMI_ROUTE, get(whoami));
         api = crate::accounts::routes(api);
         api = crate::retention::routes(api);
         api = crate::app_passwords::routes(api);
+        api = crate::audit::routes(api);
+        api = crate::delivery::routes(api);
+        api = crate::groups::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -317,7 +404,7 @@ async fn guard(
         .extensions()
         .get::<MatchedPath>()
         .map_or_else(|| path.clone(), |m| m.as_str().to_owned());
-    let allowed = !caller.roles.is_empty() && tenant.is_none_or(|t| caller.can_access(t));
+    let allowed = caller.permits(tenant, &method, &route);
     let resp = if allowed {
         req.extensions_mut().insert(caller.clone());
         next.run(req).await
@@ -516,6 +603,9 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     api.merge(crate::accounts::Doc::openapi());
     api.merge(crate::retention::Doc::openapi());
     api.merge(crate::app_passwords::Doc::openapi());
+    api.merge(crate::audit::Doc::openapi());
+    api.merge(crate::delivery::Doc::openapi());
+    api.merge(crate::groups::Doc::openapi());
     api
 }
 
@@ -702,5 +792,41 @@ mod tests {
             serde_json::from_value(json!({"roles": [{"role": "installation_admin"}]}))
                 .expect("config");
         assert!(empty.check().is_err());
+    }
+
+    /// ADM-06: Admin API по умолчанию слушает только внутренние адреса.
+    #[test]
+    fn listen_internal_by_default() {
+        assert!(AdminConfig::default().listen.ip().is_loopback());
+        config().check().expect("default");
+        for (addr, internal) in [
+            ("127.0.0.1:8443", true),
+            ("10.1.2.3:8443", true),
+            ("192.168.0.1:8443", true),
+            ("169.254.0.1:8443", true),
+            ("[::1]:8443", true),
+            ("[fd00::1]:8443", true),
+            ("[fe80::1]:8443", true),
+            ("[::ffff:10.0.0.1]:8443", true),
+            ("0.0.0.0:8443", false),
+            ("[::]:8443", false),
+            ("203.0.113.5:8443", false),
+            ("[2001:db8::1]:8443", false),
+        ] {
+            let cfg = AdminConfig {
+                listen: addr.parse().expect("addr"),
+                ..config()
+            };
+            assert_eq!(cfg.check().is_ok(), internal, "{addr}");
+            let explicit = AdminConfig {
+                allow_external: true,
+                ..cfg
+            };
+            explicit.check().expect("allow_external");
+        }
+        let cfg: AdminConfig =
+            serde_json::from_value(json!({"listen": "0.0.0.0:9443", "allow_external": true}))
+                .expect("config");
+        assert_eq!(cfg.listen.port(), 9443);
     }
 }
