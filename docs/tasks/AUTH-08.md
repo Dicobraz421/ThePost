@@ -1,16 +1,15 @@
-# AUTH-08: пароли приложений на контракте AppPasswordStore
+# AUTH-08: блокировки перебора на всех узлах
 
 lane: auth
-deps: [CTR-22]
+deps: [META-27]
 class: A
-files: [crates/tp-auth/src/password.rs, crates/tp-auth/src/lib.rs]
-read: [docs/CONTRACTS.md#Auth]
+files: [crates/tp-auth/src/*]
+read: [docs/decisions/2026-11-01-interaction-db-ha.md, docs/spec/S6.md#6.3]
 checks: [nextest]
 manual: no
 
 ## Сделать
-- `tp-auth` — на контракт `tp_contracts::app_password::AppPasswordStore` (CTR-22, PR #145): удалить свой трейт и `AppPassword`, тестовую `MemAppPasswords` заменить на `tp_testkit::MemAppPasswords`.
-- Владелец — `AccountScope` вместо пары (организация, учётная запись); время — `OffsetDateTime` (`SystemTime::now().into()`).
+- Счётчики попыток — на узле; при превышении порога — `AbuseBlocks::block`; проверка блокировки — локальный набор, обновляемый по сигналу `Blocked` и при `Resync`.
 
 ## Приёмка
-- Тесты паролей приложений (выпуск, предел, отзыв) проходят на `tp_testkit::MemAppPasswords`.
+- Тест на двух экземплярах testkit: блокировка на одном узле действует на другом.
