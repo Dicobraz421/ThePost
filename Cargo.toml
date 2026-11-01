@@ -57,7 +57,8 @@ instant-acme = "0.8.5"
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 libgssapi = "0.11.0"
-lopdf = "0.46.0"
+# Без rayon: извлечение текста PDF — в подпроцессе под seccomp, где потоки запрещены (SRCH-07).
+lopdf = { version = "0.46.0", default-features = false }
 mail-auth = "0.13.3"
 mail-builder = "1.0.0"
 mail-parser = "0.11.9"
