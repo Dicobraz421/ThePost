@@ -22,7 +22,8 @@ use tp_contracts::search::{SearchIndex, SearchSort, Snippet, TextField, TextQuer
 use tp_contracts::{Error, MailboxId, MessageId, Result};
 
 use crate::analyzers;
-use crate::index::{Fields, IndexManager, MailIndex, tantivy_err};
+use crate::cache::IndexCache;
+use crate::index::{Fields, IndexManager, MailIndex, blocking, tantivy_err};
 
 /// Выполнение запросов (секция `search.query`; поля необязательны, неизвестное — ошибка).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -42,25 +43,41 @@ impl Default for QueryConfig {
 #[derive(Debug, Clone)]
 pub struct Search {
     indexes: Arc<IndexManager>,
+    cache: Option<Arc<IndexCache>>,
     cfg: QueryConfig,
 }
 
 impl Search {
     /// Исполнитель запросов по индексам `indexes`.
     pub fn new(indexes: Arc<IndexManager>, cfg: QueryConfig) -> Self {
-        Self { indexes, cfg }
+        Self {
+            indexes,
+            cache: None,
+            cfg,
+        }
     }
-}
 
-/// Выполняет блокирующую работу с индексом учётной записи вне потоков async.
-async fn blocking<T: Send + 'static>(
-    indexes: Arc<IndexManager>,
-    scope: AccountScope,
-    f: impl FnOnce(Option<Arc<MailIndex>>) -> Result<T> + Send + 'static,
-) -> Result<T> {
-    tokio::task::spawn_blocking(move || f(indexes.open(scope)?))
-        .await
-        .map_err(|e| Error::internal(format!("search task: {e}")))?
+    /// Индексы — через кэш узла с загрузкой из BlobStore (роль search, SRCH-06).
+    pub fn with_cache(mut self, cache: Arc<IndexCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Выполняет блокирующую работу с индексом учётной записи вне потоков async.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        scope: AccountScope,
+        f: impl FnOnce(Option<Arc<MailIndex>>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let index = match &self.cache {
+            Some(cache) => cache.get(scope).await?,
+            None => {
+                let indexes = self.indexes.clone();
+                blocking(move || indexes.open(scope)).await?
+            }
+        };
+        blocking(move || f(index)).await
+    }
 }
 
 #[async_trait]
@@ -77,7 +94,7 @@ impl SearchIndex for Search {
             return Ok(Vec::new());
         }
         let (mailboxes, q) = (mailboxes.to_vec(), q.clone());
-        blocking(self.indexes.clone(), scope, move |index| {
+        self.blocking(scope, move |index| {
             let Some(index) = index else {
                 return Ok(Vec::new());
             };
@@ -93,7 +110,7 @@ impl SearchIndex for Search {
         q: &TextQuery,
     ) -> Result<Snippet> {
         let (q, preview_chars) = (q.clone(), self.cfg.preview_chars);
-        blocking(self.indexes.clone(), scope, move |index| {
+        self.blocking(scope, move |index| {
             let index = index.ok_or(Error::NotFound)?;
             snippet(&index, message, &q, preview_chars)
         })

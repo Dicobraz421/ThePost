@@ -8,9 +8,9 @@
 //! `spawn_blocking`. Изменяет индекс один индексатор (лиза раздела журнала), внутри процесса записи
 //! индекса упорядочены.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use schemars::JsonSchema;
@@ -24,7 +24,9 @@ use tantivy::{
     DateTime, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term,
 };
 use time::OffsetDateTime;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tp_contracts::meta::AccountScope;
+use tp_contracts::search::IndexManifest;
 use tp_contracts::{AccountId, Error, MailboxId, MessageId, Result, TenantId};
 
 use crate::analyzers::{self, TOKENIZER};
@@ -145,8 +147,33 @@ pub(crate) fn tantivy_err(e: tantivy::TantivyError) -> Error {
     Error::internal(format!("search index: {e}"))
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Блокирующая работа (файлы индекса) вне потоков async.
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::internal(format!("search task: {e}")))?
+}
+
+/// Имя файла сегмента Tantivy: `{uuid без дефисов}.{расширение}`.
+pub(crate) fn is_segment_file(name: &str) -> bool {
+    name.len() > 33
+        && name.as_bytes()[32] == b'.'
+        && name.as_bytes()[..32].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Зафиксированное состояние индекса: файлы сегментов (без `meta.json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexFiles {
+    /// Opstamp последнего коммита.
+    pub(crate) opstamp: u64,
+    /// Файл сегмента и число документов (у первого по имени файла сегмента, у остальных 0).
+    pub(crate) files: Vec<(String, u64)>,
 }
 
 /// Индекс одной учётной записи.
@@ -157,6 +184,10 @@ pub struct MailIndex {
     writer_memory: usize,
     /// Записи индекса в процессе — по одной (блокировка каталога Tantivy).
     write: Mutex<()>,
+    /// Каталог индекса.
+    path: PathBuf,
+    /// Манифест, которому соответствуют локальные файлы (`version == 0` — индекс не сохранялся).
+    synced: Mutex<IndexManifest>,
 }
 
 impl fmt::Debug for MailIndex {
@@ -168,7 +199,8 @@ impl fmt::Debug for MailIndex {
 }
 
 impl MailIndex {
-    fn open(dir: MmapDirectory, writer_memory: usize) -> Result<MailIndex> {
+    fn open(path: &Path, writer_memory: usize) -> Result<MailIndex> {
+        let dir = MmapDirectory::open(path).map_err(|e| Error::internal(format!("{e}")))?;
         let (schema, fields) = schema();
         let index = Index::open_or_create(dir, schema).map_err(tantivy_err)?;
         analyzers::register(&index);
@@ -183,7 +215,69 @@ impl MailIndex {
             fields,
             writer_memory: writer_memory.max(MIN_WRITER_MEMORY),
             write: Mutex::new(()),
+            path: path.to_path_buf(),
+            synced: Mutex::new(IndexManifest::default()),
         })
+    }
+
+    /// Каталог индекса.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Манифест, которому соответствуют локальные файлы.
+    pub fn synced(&self) -> IndexManifest {
+        lock(&self.synced).clone()
+    }
+
+    pub(crate) fn set_synced(&self, manifest: IndexManifest) {
+        *lock(&self.synced) = manifest;
+    }
+
+    /// Перечитывает `meta.json` (после загрузки файлов из BlobStore). Блокирующий.
+    pub(crate) fn reload(&self) -> Result<()> {
+        self.reader.reload().map_err(tantivy_err)
+    }
+
+    /// Файлы последнего коммита. Блокирующий.
+    pub(crate) fn files(&self) -> Result<IndexFiles> {
+        let _write = lock(&self.write);
+        let meta = self.index.load_metas().map_err(tantivy_err)?;
+        let docs: HashMap<String, u64> = meta
+            .segments
+            .iter()
+            .map(|s| (s.id().uuid_string(), u64::from(s.num_docs())))
+            .collect();
+        let mut names: Vec<String> = meta
+            .list_segment_files()
+            .into_iter()
+            .filter_map(|p| p.to_str().map(str::to_owned))
+            .filter(|name| self.path.join(name).is_file())
+            .collect();
+        names.sort();
+        let mut seen = HashSet::new();
+        let files = names
+            .into_iter()
+            .map(|name| {
+                let uuid = name.get(..32).unwrap_or_default().to_owned();
+                let n = if seen.insert(uuid.clone()) {
+                    docs.get(&uuid).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                (name, n)
+            })
+            .collect();
+        Ok(IndexFiles {
+            opstamp: meta.opstamp,
+            files,
+        })
+    }
+
+    /// Удаляет из каталога файлы сегментов не из `keep` (выпавшие после слияний и загрузок). Блокирующий.
+    pub(crate) fn prune(&self, keep: &HashSet<String>) -> Result<()> {
+        let _write = lock(&self.write);
+        prune_dir(&self.path, keep)
     }
 
     pub(crate) fn fields(&self) -> &Fields {
@@ -224,7 +318,8 @@ impl MailIndex {
             }
         }
         writer.commit().map_err(tantivy_err)?;
-        drop(writer);
+        // Слияния — до возврата: набор файлов коммита не меняется, пока его выгружают в BlobStore.
+        writer.wait_merging_threads().map_err(tantivy_err)?;
         self.reader.reload().map_err(tantivy_err)
     }
 
@@ -269,11 +364,38 @@ impl MailIndex {
     }
 }
 
+/// Удаляет из каталога `dir` файлы сегментов не из `keep`. Блокирующий.
+pub(crate) fn prune_dir(dir: &Path, keep: &HashSet<String>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if is_segment_file(name) && !keep.contains(name) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+type Key = (TenantId, AccountId);
+
+/// Удаляет каталог; его отсутствие — не ошибка. Блокирующий.
+fn remove_dir(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 /// Индексы учётных записей в каталоге [`IndexConfig::dir`]; открытые держит в памяти.
 #[derive(Debug)]
 pub struct IndexManager {
     cfg: IndexConfig,
-    open: Mutex<HashMap<(TenantId, AccountId), Arc<MailIndex>>>,
+    open: Mutex<HashMap<Key, Arc<MailIndex>>>,
+    /// Последовательность изменений индекса учётной записи: запись и выгрузка, загрузка, вытеснение, замена.
+    gates: Mutex<HashMap<Key, Arc<AsyncMutex<()>>>>,
+    /// Перестраиваемые индексы: строятся рядом с действующими и получают те же изменения индексатора.
+    shadows: Mutex<HashMap<Key, Arc<MailIndex>>>,
 }
 
 impl IndexManager {
@@ -282,7 +404,71 @@ impl IndexManager {
         Self {
             cfg,
             open: Mutex::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
+            shadows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Каталог перестраиваемого индекса учётной записи: рядом с действующим.
+    pub fn shadow_path(&self, scope: AccountScope) -> PathBuf {
+        self.cfg
+            .dir
+            .join(scope.tenant.to_string())
+            .join(format!("{}.rebuild", scope.account))
+    }
+
+    /// Перестраиваемый индекс учётной записи, если перестройка идёт.
+    pub fn shadow(&self, scope: AccountScope) -> Option<Arc<MailIndex>> {
+        lock(&self.shadows)
+            .get(&(scope.tenant, scope.account))
+            .cloned()
+    }
+
+    /// Начинает перестройку: пустой индекс в [`IndexManager::shadow_path`] (прежний каталог удаляется).
+    /// Блокирующий.
+    pub(crate) fn begin_shadow(&self, scope: AccountScope) -> Result<Arc<MailIndex>> {
+        let path = self.shadow_path(scope);
+        remove_dir(&path)?;
+        std::fs::create_dir_all(&path)?;
+        let index = Arc::new(MailIndex::open(&path, self.cfg.writer_memory_bytes)?);
+        lock(&self.shadows).insert((scope.tenant, scope.account), index.clone());
+        Ok(index)
+    }
+
+    /// Отменяет перестройку: перестраиваемый индекс и его каталог удаляются. Блокирующий.
+    pub(crate) fn drop_shadow(&self, scope: AccountScope) -> Result<()> {
+        lock(&self.shadows).remove(&(scope.tenant, scope.account));
+        remove_dir(&self.shadow_path(scope))
+    }
+
+    /// Заменяет действующий индекс перестроенным: каталог перестройки становится каталогом индекса.
+    /// Вызывать под [`IndexManager::lock`]. Блокирующий.
+    pub(crate) fn promote_shadow(&self, scope: AccountScope) -> Result<Arc<MailIndex>> {
+        let key = (scope.tenant, scope.account);
+        let shadow = lock(&self.shadows)
+            .remove(&key)
+            .ok_or_else(|| Error::internal("search index is not being rebuilt"))?;
+        let synced = shadow.synced();
+        drop(shadow);
+        let mut open = lock(&self.open);
+        open.remove(&key);
+        let path = self.path(scope);
+        remove_dir(&path)?;
+        std::fs::rename(self.shadow_path(scope), &path)?;
+        let index = Arc::new(MailIndex::open(&path, self.cfg.writer_memory_bytes)?);
+        index.set_synced(synced);
+        open.insert(key, index.clone());
+        Ok(index)
+    }
+
+    /// Захватывает индекс учётной записи для изменения (запись с выгрузкой, загрузка, вытеснение,
+    /// замена перестроенным): такие операции над одним индексом выполняются по одной.
+    pub async fn lock(&self, scope: AccountScope) -> OwnedMutexGuard<()> {
+        let gate = lock(&self.gates)
+            .entry((scope.tenant, scope.account))
+            .or_default()
+            .clone();
+        gate.lock_owned().await
     }
 
     /// Каталог индекса учётной записи.
@@ -291,6 +477,25 @@ impl IndexManager {
             .dir
             .join(scope.tenant.to_string())
             .join(scope.account.to_string())
+    }
+
+    /// Открытый в памяти индекс учётной записи (без обращения к диску).
+    pub fn cached(&self, scope: AccountScope) -> Option<Arc<MailIndex>> {
+        lock(&self.open)
+            .get(&(scope.tenant, scope.account))
+            .cloned()
+    }
+
+    /// Забывает открытый индекс (файлы остаются): следующее открытие перечитает каталог.
+    pub fn forget(&self, scope: AccountScope) -> Option<Arc<MailIndex>> {
+        lock(&self.open).remove(&(scope.tenant, scope.account))
+    }
+
+    /// Закрывает индекс и удаляет его каталог (вытеснение, замена). Запросы, уже получившие индекс,
+    /// дорабатывают по открытым файлам. Блокирующий.
+    pub fn evict(&self, scope: AccountScope) -> Result<()> {
+        self.forget(scope);
+        remove_dir(&self.path(scope))
     }
 
     /// Индекс учётной записи; нет — создаётся пустой. Блокирующий.
@@ -314,8 +519,7 @@ impl IndexManager {
             return Ok(None);
         }
         std::fs::create_dir_all(&path)?;
-        let dir = MmapDirectory::open(&path).map_err(|e| Error::internal(format!("{e}")))?;
-        let index = Arc::new(MailIndex::open(dir, self.cfg.writer_memory_bytes)?);
+        let index = Arc::new(MailIndex::open(&path, self.cfg.writer_memory_bytes)?);
         open.insert((scope.tenant, scope.account), index.clone());
         Ok(Some(index))
     }
