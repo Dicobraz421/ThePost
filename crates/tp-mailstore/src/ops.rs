@@ -40,10 +40,14 @@ impl Store {
         ids: &[MessageId],
         to: MailboxId,
     ) -> Result<Vec<Inserted>> {
-        self.check_copy_quota(scope, ids).await?;
+        let mut pending = self.check_copy_quota(scope, ids).await?;
+        for p in &mut pending {
+            p.fallback = Some(to);
+        }
         let inserted = self.d.messages.copy(scope, ids, to).await?;
         if let Some(modseq) = inserted.first().map(|i| i.modseq) {
             self.notify(scope, [to], modseq).await;
+            self.warn_quota(scope.tenant, &pending).await;
         }
         Ok(inserted)
     }

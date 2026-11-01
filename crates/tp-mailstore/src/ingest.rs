@@ -14,6 +14,9 @@
 //! До шага 4 ничего не раскладывается. Сбой загрузки или транзакции снимает добавленные ссылки и не оставляет
 //! метаданных: запрос выполняется целиком или не выполняется (вызывающий может повторить).
 //!
+//! После вставки — предупреждения о заполнении квоты ([`crate::quota`]); служебное письмо-предупреждение
+//! принимается без проверки квоты.
+//!
 //! Письмо клиента (`MailStore::append`: IMAP APPEND, JMAP `Email/import`; решение 2026-11-01-trash-purge) — не доставка:
 //! шаги 2–3 общие с приёмом, но без точек принятия решений и копий (шаг 1 — только квота), метаданные —
 //! `MessageStore::insert`.
@@ -29,6 +32,7 @@ use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, Ingested};
 use tp_contracts::meta::{AccountScope, Flags, NewMessage, PartRef};
 use tp_contracts::{BlobHash, BlobKey, Error, MailboxId, Result, TenantId};
 
+use crate::quota::Pending;
 use crate::split::{self, Split};
 use crate::{Store, meta};
 
@@ -47,10 +51,18 @@ struct Staged {
     items: Vec<(AccountScope, MailboxId, NewMessage)>,
     /// Добавленные ссылки на объекты: снимаются, если вставка метаданных не удалась.
     held: Vec<(BlobKey, u32)>,
+    /// Проверенные добавления квоты — для предупреждений после вставки.
+    pending: Vec<Pending>,
 }
 
 impl Store {
-    pub(crate) async fn ingest_impl(&self, req: IngestRequest) -> Result<Ingested> {
+    /// Приём; `service` — служебное письмо (предупреждение о квоте): без проверки квоты. Возвращает и проверенные
+    /// добавления квоты — для предупреждений после приёма ([`Store::warn_quota`]).
+    pub(crate) async fn ingest_impl(
+        &self,
+        req: IngestRequest,
+        service: bool,
+    ) -> Result<(Ingested, Vec<Pending>)> {
         let IngestRequest {
             tenant,
             mail_from,
@@ -89,8 +101,12 @@ impl Store {
             }
         }
 
-        let Staged { items, held } = self
-            .stage(tenant, raw, &deliveries, &common, received_at)
+        let Staged {
+            items,
+            held,
+            pending,
+        } = self
+            .stage(tenant, raw, &deliveries, &common, received_at, service)
             .await?;
         let inserted = match self.d.messages.insert_batch(tenant, items).await {
             Ok(inserted) => inserted,
@@ -116,10 +132,11 @@ impl Store {
         }
         // Доставки сверх запроса (копии точек принятия решений) вызывающему не возвращаются.
         done.truncate(info.deliveries.len());
-        Ok(Ingested {
+        let ingested = Ingested {
             delivered: done,
             forward,
-        })
+        };
+        Ok((ingested, pending))
     }
 
     /// Письмо клиента (IMAP APPEND, JMAP `Email/import`): те же шаги 1–3, что у приёма, без точек принятия решений,
@@ -139,8 +156,12 @@ impl Store {
             extra_headers: Vec::new(),
             flags,
         };
-        let Staged { mut items, held } = self
-            .stage(scope.tenant, raw, &[delivery], &[], received_at)
+        let Staged {
+            mut items,
+            held,
+            pending,
+        } = self
+            .stage(scope.tenant, raw, &[delivery], &[], received_at, false)
             .await?;
         let inserted = match items.pop() {
             Some((_, _, msg)) => self.d.messages.insert(scope, mailbox, msg).await,
@@ -154,6 +175,7 @@ impl Store {
             }
         };
         self.notify(scope, [mailbox], ins.modseq).await;
+        self.warn_quota(scope.tenant, &pending).await;
         Ok(Delivered {
             account: scope.account,
             mailbox,
@@ -163,7 +185,8 @@ impl Store {
     }
 
     /// Шаги 1–3 для доставок `deliveries` с общими заголовками `common`: проверка заголовков, квота (до разбора
-    /// и загрузки), разбор, загрузка и учёт объектов. Метаданные не раскладываются; сбой загрузки снимает ссылки.
+    /// и загрузки; `service` — без неё), разбор, загрузка и учёт объектов. Метаданные не раскладываются;
+    /// сбой загрузки снимает ссылки.
     async fn stage(
         &self,
         tenant: TenantId,
@@ -171,6 +194,7 @@ impl Store {
         deliveries: &[Delivery],
         common: &[(String, String)],
         received_at: OffsetDateTime,
+        service: bool,
     ) -> Result<Staged> {
         check_headers(common)?;
         for d in deliveries {
@@ -184,12 +208,23 @@ impl Store {
                 (d.account, size as u64)
             })
             .collect();
-        self.check_quota(tenant, &demands).await?;
+        let mut pending = if service {
+            Vec::new()
+        } else {
+            self.check_quotas(tenant, &demands).await?
+        };
+        for p in &mut pending {
+            p.fallback = deliveries
+                .iter()
+                .find(|d| d.account == p.account)
+                .map(|d| d.mailbox);
+        }
 
         // Разбор — работа процессора на всё письмо: вне потоков асинхронного рантайма.
+        let limits = self.cfg.mime;
         let (split, meta) = tokio::task::spawn_blocking(move || {
-            let meta = meta::message_meta(&raw);
-            (Split::new(raw), meta)
+            let meta = meta::message_meta_with(&raw, limits);
+            (Split::with_limits(raw, limits), meta)
         })
         .await
         .map_err(|e| Error::internal(format!("ingest: разбор письма: {e}")))?;
@@ -286,7 +321,11 @@ impl Store {
             Ok::<_, Error>(items)
         })();
         match items {
-            Ok(items) => Ok(Staged { items, held }),
+            Ok(items) => Ok(Staged {
+                items,
+                held,
+                pending,
+            }),
             Err(e) => {
                 self.release(&held).await;
                 Err(e)
