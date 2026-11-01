@@ -140,8 +140,10 @@ fn node(msg: &Message<'_>, id: usize, path: String, base: &str, depth: usize) ->
         ),
         None => ("text".to_owned(), "plain".to_owned(), Vec::new()),
     };
+    // Смещения частей — в буфере `raw_message` (у вложенного письма без кодирования передачи — буфер
+    // верхнего письма), а `raw_message()` — лишь срез этого письма: по нему строки вложенных частей терялись.
     let body = msg
-        .raw_message()
+        .raw_message
         .get(part.offset_body as usize..part.offset_end as usize)
         .unwrap_or_default();
     let lines = (media_type == "text" || (media_type == "message" && subtype == "rfc822"))
@@ -348,6 +350,40 @@ mod tests {
         let anon = message_meta(b"Subject: Fwd: Re: Plan \r\n\r\nx\r\n");
         assert_eq!(anon.thread_key, "subject:plan");
         assert_eq!(message_meta(b"\r\n\r\n").thread_key, "");
+    }
+
+    #[test]
+    fn nested_parts_count_lines() {
+        let inner = "Subject: in
+
+one
+two
+";
+        let wrap = |cte: &str, body: &str| {
+            format!(
+                "Content-Type: multipart/mixed; boundary=b
+
+--b
+                 Content-Type: message/rfc822
+{cte}
+{body}
+--b--
+"
+            )
+        };
+        let plain = message_meta(wrap("", inner).as_bytes());
+        assert_eq!(plain.body.children[0].children[0].lines, Some(2));
+        // Вложение в base64: смещения — в декодированных байтах вложения.
+        let b64 = "U3ViamVjdDogaW4NCg0Kb25lDQp0d28NCg==";
+        let encoded = message_meta(
+            wrap(
+                "Content-Transfer-Encoding: base64
+",
+                b64,
+            )
+            .as_bytes(),
+        );
+        assert_eq!(encoded.body.children[0].children[0].lines, Some(2));
     }
 
     #[test]
