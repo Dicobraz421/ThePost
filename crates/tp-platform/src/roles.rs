@@ -24,6 +24,7 @@ use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::Instant;
 use tp_contracts::Error;
 use tp_contracts::config::duration;
+use tp_contracts::load::{LoadLevel, LoadMonitor, fixed_load};
 use tp_contracts::role::{
     CancellationToken, ConfigRx, ReadyHandle, Role, RoleCtx, RoleService, RoleSet,
 };
@@ -198,6 +199,7 @@ pub struct Roles {
     limits: BTreeMap<Role, RoleLimits>,
     specs: Vec<RoleSpec>,
     updates: Option<watch::Receiver<Arc<Config>>>,
+    load: Arc<dyn LoadMonitor>,
 }
 
 /// Запущенная роль: всё для перезапуска и история падений.
@@ -217,6 +219,7 @@ impl Slot {
         shutdown: &CancellationToken,
         deadline: Duration,
         delay: Duration,
+        load: &Arc<dyn LoadMonitor>,
     ) -> Id {
         let service = self.service.clone();
         let ctx = RoleCtx {
@@ -224,7 +227,7 @@ impl Slot {
             shutdown: shutdown.clone(),
             drain_deadline: deadline,
             ready: self.ready.clone(),
-            load: tp_contracts::load::fixed_load(tp_contracts::load::LoadLevel::Normal),
+            load: load.clone(),
         };
         tasks
             .spawn(async move {
@@ -272,7 +275,15 @@ impl Roles {
             limits,
             specs: Vec::new(),
             updates: None,
+            load: fixed_load(LoadLevel::Normal),
         }
+    }
+
+    /// Монитор нагрузки узла для `RoleCtx::load` (PLT-15, [`crate::load::NodeLoad`]); по умолчанию — постоянный
+    /// [`LoadLevel::Normal`].
+    pub fn with_load(mut self, load: Arc<dyn LoadMonitor>) -> Self {
+        self.load = load;
+        self
     }
 
     /// Новые `runtime.restart` и `runtime.drain_deadline` применяются на ходу из перечитанной конфигурации.
@@ -322,6 +333,7 @@ impl Roles {
     ) -> RolesReport {
         let mut cfg = self.cfg;
         let mut updates = self.updates;
+        let load = self.load;
         let running = Gauge::<i64>::default();
         metrics.register("tp_roles_running", "Running role tasks", running.clone());
         let restarts = Family::<Vec<(String, String)>, Counter>::default();
@@ -349,6 +361,7 @@ impl Roles {
                 &role_shutdown,
                 cfg.drain_deadline,
                 Duration::ZERO,
+                &load,
             );
             ids.insert(id, slots.len());
             slots.push(slot);
@@ -393,7 +406,7 @@ impl Roles {
                         .get_or_create(&vec![("role".to_owned(), slot.name.clone())])
                         .inc();
                     *report.restarts.entry(slot.name.clone()).or_default() += 1;
-                    let id = slot.spawn(&mut tasks, &role_shutdown, cfg.drain_deadline, delay);
+                    let id = slot.spawn(&mut tasks, &role_shutdown, cfg.drain_deadline, delay, &load);
                     ids.insert(id, idx);
                     running.set(tasks.len() as i64);
                 }
@@ -815,6 +828,51 @@ mod tests {
         assert_eq!(report.completed, ["dav"]);
         assert_eq!(report.cancelled, ["imap"]);
         assert!(hung_dropped.load(Ordering::SeqCst), "hung task dropped");
+    }
+
+    /// Роль, которая сообщает уровень нагрузки из своего `RoleCtx`.
+    struct LoadProbe(tokio::sync::mpsc::UnboundedSender<LoadLevel>);
+
+    impl RoleService for LoadProbe {
+        fn name(&self) -> &str {
+            "maintenance"
+        }
+
+        fn run<'life0, 'async_trait>(
+            &'life0 self,
+            ctx: RoleCtx,
+        ) -> Pin<Box<dyn Future<Output = tp_contracts::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                let _ = self.0.send(ctx.load_level());
+                ctx.shutdown.cancelled().await;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn roles_get_node_load_monitor() {
+        let mem = tp_testkit::MemLoadMonitor::new(LoadLevel::Elevated);
+        let mut roles = runtime(1_000, &[Role::Maintenance]).with_load(mem.shared());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        roles.add(Role::Maintenance, |_| RoleSpec {
+            service: Arc::new(LoadProbe(tx)),
+            config: fixed_config(()),
+        });
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
+        let run = tokio::spawn(async move {
+            roles
+                .run(&Health::default(), &Metrics::default(), shutdown)
+                .await
+        });
+        assert_eq!(rx.recv().await, Some(LoadLevel::Elevated));
+        trigger.cancel();
+        run.await.expect("join");
     }
 
     #[test]
