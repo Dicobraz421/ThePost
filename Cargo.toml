@@ -55,6 +55,7 @@ imap-codec = { version = "2.0.0-alpha.9", features = ["starttls", "ext_id", "ext
 insta = { version = "1.49.0", features = ["json"] }
 instant-acme = "0.8.5"
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
+landlock = "0.4.7"
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 libgssapi = "0.11.0"
 # Без rayon: извлечение текста PDF — в подпроцессе под seccomp, где потоки запрещены (SRCH-07).

@@ -11,13 +11,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-schemars.workspace = true
-serde.workspace = true
+landlock.workspace = true
 nix = { workspace = true, features = ["sched"] }
+schemars.workspace = true
 seccompiler.workspace = true
+serde.workspace = true
 socket2 = { workspace = true, features = ["all"] }
 thiserror.workspace = true
 tokio.workspace = true
+tp-contracts.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
