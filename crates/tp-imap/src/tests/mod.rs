@@ -15,7 +15,7 @@ use tp_mailstore::Store;
 use tp_testkit::SearchDoc;
 use tp_testkit::{
     Clock, FakeAuthenticator, FakeSasl, FakeSearch, MemBlobIndex, MemBlobStore, MemEventBus,
-    MemMetadata, MemQuota, MemTrash, SystemClock,
+    MemMetadata, MemPolicies, MemQuota, MemTrash, RecordingDecisionHook, SystemClock,
 };
 
 use crate::config::ImapConfig;
@@ -64,6 +64,11 @@ pub(crate) struct Env {
     pub auth: FakeAuthenticator,
     pub search: FakeSearch,
     pub bus: MemEventBus,
+    /// Корзина (`purge`), настройка `trash.purge` — из `policies`.
+    pub trash: MemTrash,
+    pub policies: MemPolicies,
+    /// Точка принятия решений хранилища и сессии (Legal Hold, доставка).
+    pub hook: RecordingDecisionHook,
     pub principal: Principal,
     pub config: ImapConfig,
     pub shutdown: CancellationToken,
@@ -76,15 +81,18 @@ impl Env {
         let index = MemBlobIndex::new(clock.clone());
         let meta = MemMetadata::new(clock).with_blob_index(index.clone());
         let bus = MemEventBus::default();
+        let policies = MemPolicies::new(&meta);
+        let trash = MemTrash::new(&meta).with_policies(policies.clone());
+        let hook = RecordingDecisionHook::new("test");
         let store = Store::new(tp_mailstore::Deps {
             blobs: Arc::new(blobs),
             index: Arc::new(index),
             messages: Arc::new(meta.clone()),
             changes: Arc::new(meta.clone()),
-            trash: Arc::new(MemTrash::new(&meta)),
+            trash: Arc::new(trash.clone()),
             quota: Arc::new(MemQuota::new(&meta)),
             bus: Arc::new(bus.clone()),
-            hooks: DecisionHooks::default(),
+            hooks: DecisionHooks::new(vec![Arc::new(hook.clone())]),
         });
         let tenant = TenantId::DEFAULT;
         let account = meta
@@ -116,6 +124,9 @@ impl Env {
             auth,
             search: FakeSearch::default(),
             bus,
+            trash,
+            policies,
+            hook,
             principal,
             config: ImapConfig::default(),
             shutdown: CancellationToken::new(),
@@ -141,6 +152,8 @@ impl Env {
                 search: Arc::new(self.search.clone()),
                 changes: Arc::new(self.meta.clone()),
                 bus: Arc::new(self.bus.clone()),
+                trash: Arc::new(self.trash.clone()),
+                hooks: DecisionHooks::new(vec![Arc::new(self.hook.clone())]),
             },
             shutdown: self.shutdown.clone(),
         })
