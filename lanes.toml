@@ -3,7 +3,7 @@
 
 [common]
 # Разрешено в любом PR: свои карточки, ручные проверки, решения.
-paths = ["docs/tasks/*", "docs/manual-tests/*", "docs/decisions/*"]
+paths = ["docs/tasks/*", "docs/manual-tests/*", "docs/decisions/*", "docs/metrics/*"]
 
 [lane.contracts]
 # Класс B: межкрейтовые контракты.

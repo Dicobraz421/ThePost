@@ -6,6 +6,7 @@
 
 pub mod accounts;
 pub mod acl;
+pub mod app_passwords;
 pub mod blob_index;
 pub mod changelog;
 pub mod credentials;
