@@ -524,3 +524,30 @@ async fn submission_decision_hook() {
     assert_eq!(env.inbox("bob@example.org").await.len(), 1);
     assert_eq!(env.queue.0.lock().expect("lock").len(), 1);
 }
+
+#[tokio::test]
+async fn bounce_for_full_mailbox_after_accept() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let d = env.delivery(true);
+    env.quota
+        .set_limit(env.scope("bob@example.org").await, Some(1));
+    let e = envelope(Mode::Inbound, &["bob@example.org", "carol@example.org"]);
+    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    assert_eq!(env.inbox("carol@example.org").await.len(), 1);
+    let queued = env.queue.0.lock().expect("lock").clone();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].0, "");
+    assert_eq!(queued[0].1, ["sender@example.net"]);
+    let dsn = String::from_utf8_lossy(&queued[0].2).into_owned();
+    assert!(
+        dsn.contains("Final-Recipient: rfc822; bob@example.org\r\nAction: failed\r\nStatus: 5.2.2"),
+        "{dsn}"
+    );
+    // Локальному отправителю уведомление — во «Входящие».
+    let mut e = envelope(Mode::Submission, &["bob@example.org", "carol@example.org"]);
+    e.mail_from = "alice@example.org".into();
+    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    let inbox = env.inbox("alice@example.org").await;
+    assert_eq!(inbox.len(), 1);
+    assert!(inbox[0].contains("Subject: Undelivered Mail Returned to Sender"));
+}

@@ -1,0 +1,56 @@
+---
+source: crates/tp-smtp/src/dsn/tests.rs
+expression: text
+---
+From: "Mail Delivery System" <MAILER-DAEMON@mx.example.org>
+To: <alice@example.org>
+Subject: Undelivered Mail Returned to Sender
+Date: Thu, 1 Jan 2026 14:00:00 +0000
+Message-ID: <dsn-0001@mx.example.org>
+Auto-Submitted: auto-replied
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type="delivery-status";
+ boundary="dsn-0001"
+
+
+--dsn-0001
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: base64
+
+0J/QuNGB0YzQvNC+INC90LUg0LTQvtGB0YLQsNCy0LvQtdC90L4g0YHQu9C10LTRg9GO0YnQuNC8
+INC/0L7Qu9GD0YfQsNGC0LXQu9GP0Lw6DQpZb3VyIG1lc3NhZ2UgY291bGQgbm90IGJlIGRlbGl2
+ZXJlZCB0byB0aGUgZm9sbG93aW5nIHJlY2lwaWVudHM6DQoNCiAgPHhAZXhhbXBsZS5uZXQ+OiA1
+NTAgNS4xLjEgPHhAZXhhbXBsZS5uZXQ+OiBubyBzdWNoIHVzZXINCiAgPHlAZXhhbXBsZS5uZXQ+
+OiBjb25uZWN0aW9uIHJlZnVzZWQNCg0KLS0gDQpUaGUgUG9zdCwgbXguZXhhbXBsZS5vcmcNCg==
+
+--dsn-0001
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Reporting-MTA: dns; mx.example.org
+Original-Envelope-Id: QQ314159
+Arrival-Date: Thu, 1 Jan 2026 10:00:00 +0000
+
+Final-Recipient: rfc822; x@example.net
+Action: failed
+Status: 5.1.1
+Diagnostic-Code: smtp; 550 5.1.1 <x@example.net>: no such user
+Last-Attempt-Date: Thu, 1 Jan 2026 14:00:00 +0000
+
+Original-Recipient: rfc822;y@example.net
+Final-Recipient: rfc822; y@example.net
+Action: failed
+Status: 5.0.0
+Last-Attempt-Date: Thu, 1 Jan 2026 14:00:00 +0000
+
+--dsn-0001
+Content-Type: text/rfc822-headers
+Content-Transfer-Encoding: 7bit
+
+From: alice@example.org
+To: x@example.net
+Subject: hello
+Message-ID: <m1@example.org>
+
+
+--dsn-0001--

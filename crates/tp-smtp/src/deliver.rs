@@ -28,11 +28,13 @@ use tp_contracts::auth::{DirChange, DirCursor, Directory};
 use tp_contracts::ext::{CopyTo, Decision, DecisionHooks, SubmissionInfo};
 use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested, MailStore};
 use tp_contracts::meta::{Account, AccountScope, AccountStore, MailboxStore, SpecialUse};
+use tp_contracts::queue::DsnRet;
 use tp_contracts::retention::Quota;
 use tp_contracts::{Error, MailboxId, Result, TenantId};
 
 use crate::authcheck::AuthCheck;
 use crate::config::{DeliveryConfig, SmtpConfig};
+use crate::dsn::{self, DsnSink};
 use crate::milter::{Milters, Verdict};
 use crate::server::{Envelope, Handler, Mode, Reply, reply};
 
@@ -130,6 +132,8 @@ impl fmt::Debug for Delivery {
 struct Prepared {
     deliveries: Vec<(String, MailDelivery)>,
     external: Vec<String>,
+    /// Получатели, которым письмо не доставлено после приёма (уведомление отправителю).
+    failed: Vec<dsn::Recipient>,
 }
 
 impl Delivery {
@@ -313,6 +317,7 @@ impl Delivery {
         let mut out = Prepared {
             deliveries: Vec::new(),
             external: Vec::new(),
+            failed: Vec::new(),
         };
         for rcpt in &env.rcpts {
             match self.resolve(rcpt).await? {
@@ -338,10 +343,15 @@ impl Delivery {
                     }
                 }
                 Resolved::External => out.external.push(rcpt.clone()),
-                // Получатель принят на RCPT, но исчез из каталога: письмо ему не доставляется.
-                // TODO(SMTP-07): уведомление о недоставке.
+                // Получатель принят на RCPT, но исчез из каталога: письмо ему не доставляется,
+                // отправителю — уведомление.
                 Resolved::Unknown => {
                     tracing::warn!(id = %env.id, "smtp: получатель исчез после RCPT");
+                    out.failed.push(dsn::Recipient::new(
+                        rcpt.clone(),
+                        dsn::Action::Failed,
+                        "550 5.1.1 mailbox unavailable",
+                    ));
                 }
             }
         }
@@ -406,18 +416,18 @@ impl Delivery {
             .await
     }
 
-    /// `ingest`; превышение квоты — повтор без переполненных ящиков (они получают отказ, SMTP-07).
+    /// `ingest`; превышение квоты — повтор без переполненных ящиков (их адреса — в `failed`, отправителю
+    /// уведомление).
     async fn ingest_all(
         &self,
         env: &Envelope,
         raw: Bytes,
-        mut deliveries: Vec<MailDelivery>,
+        mut deliveries: Vec<(String, MailDelivery)>,
         received_at: OffsetDateTime,
+        failed: &mut Vec<dsn::Recipient>,
     ) -> Result<Ingested> {
-        match self
-            .ingest(env, raw.clone(), deliveries.clone(), received_at)
-            .await
-        {
+        let all = deliveries.iter().map(|(_, d)| d.clone()).collect();
+        match self.ingest(env, raw.clone(), all, received_at).await {
             Err(Error::QuotaExceeded) => {}
             other => return other,
         }
@@ -425,7 +435,8 @@ impl Delivery {
             return Err(Error::QuotaExceeded);
         };
         let mut fits = Vec::new();
-        for d in deliveries.drain(..) {
+        let mut full = Vec::new();
+        for (rcpt, d) in deliveries.drain(..) {
             let scope = AccountScope {
                 tenant: self.deps.tenant,
                 account: d.account,
@@ -433,8 +444,11 @@ impl Delivery {
             match quota.check(scope, raw.len() as u64).await {
                 Ok(()) => fits.push(d),
                 Err(Error::QuotaExceeded) => {
-                    // TODO(SMTP-07): уведомление о недоставке отправителю.
                     tracing::warn!(id = %env.id, account = %d.account, "smtp: ящик переполнен, письмо не доставлено");
+                    // Копия точки принятия решений (без адреса) уведомления не даёт.
+                    if !rcpt.is_empty() && !full.contains(&rcpt) {
+                        full.push(rcpt);
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -442,7 +456,12 @@ impl Delivery {
         if fits.is_empty() {
             return Err(Error::QuotaExceeded);
         }
-        self.ingest(env, raw, fits, received_at).await
+        let out = self.ingest(env, raw, fits, received_at).await?;
+        failed.extend(
+            full.into_iter()
+                .map(|r| dsn::Recipient::new(r, dsn::Action::Failed, "552 5.2.2 mailbox full")),
+        );
+        Ok(out)
     }
 
     /// Ставит в очередь исходящей почты внешних получателей и пересылки.
@@ -560,17 +579,102 @@ impl Delivery {
             }
         }
         let mut forward = Vec::new();
+        let mut failed = prepared.failed;
         if !prepared.deliveries.is_empty() {
-            let deliveries = prepared.deliveries.into_iter().map(|(_, d)| d).collect();
             forward = self
-                .ingest_all(env, full.clone(), deliveries, received_at)
+                .ingest_all(
+                    env,
+                    full.clone(),
+                    prepared.deliveries,
+                    received_at,
+                    &mut failed,
+                )
                 .await?
                 .forward;
         }
         let mut rcpts = prepared.external;
         rcpts.extend(forward);
-        self.enqueue(env, rcpts, full).await?;
+        self.enqueue(env, rcpts, full.clone()).await?;
+        if !failed.is_empty() && !env.mail_from.is_empty() {
+            self.bounce(env, &failed, &full, received_at).await;
+        }
         Ok(None)
+    }
+
+    /// Уведомление о недоставке после приёма (`250` уже не отменить); сбой — только в журнал.
+    async fn bounce(
+        &self,
+        env: &Envelope,
+        rcpts: &[dsn::Recipient],
+        original: &[u8],
+        received_at: OffsetDateTime,
+    ) {
+        let raw = dsn::build(&dsn::Report {
+            hostname: &self.hostname,
+            to: &env.mail_from,
+            envid: None,
+            arrival: received_at,
+            now: OffsetDateTime::now_utc(),
+            retry_until: None,
+            rcpts,
+            original,
+            ret: DsnRet::Headers,
+            id: &env.id,
+        });
+        if let Err(e) = self
+            .send_dsn(self.deps.tenant, &env.mail_from, Bytes::from(raw))
+            .await
+        {
+            tracing::warn!(id = %env.id, error = %e, "smtp: уведомление о недоставке не отправлено");
+        }
+    }
+}
+
+/// Уведомление о доставке: локальному адресату — во «Входящие», внешнему — в очередь исходящей почты.
+#[async_trait]
+impl DsnSink for Delivery {
+    async fn send_dsn(&self, tenant: TenantId, to: &str, raw: Bytes) -> Result<()> {
+        match self.resolve(to).await? {
+            Resolved::Local(accounts) => {
+                let mut deliveries = Vec::new();
+                for acc in accounts {
+                    let scope = AccountScope {
+                        tenant: acc.tenant,
+                        account: acc.id,
+                    };
+                    deliveries.push(MailDelivery {
+                        account: acc.id,
+                        mailbox: self.mailbox(scope, false).await?,
+                        extra_headers: Vec::new(),
+                        flags: Default::default(),
+                    });
+                }
+                self.deps
+                    .store
+                    .ingest(IngestRequest {
+                        tenant,
+                        mail_from: String::new(),
+                        raw: Box::pin(futures::stream::once(async move { Ok(raw) })),
+                        deliveries,
+                        received_at: OffsetDateTime::now_utc(),
+                    })
+                    .await
+                    .map(|_| ())
+            }
+            Resolved::External => match &self.deps.outbound {
+                Some(q) => q.enqueue(tenant, "", &[to.to_owned()], raw).await,
+                None => {
+                    tracing::warn!(
+                        "smtp: уведомление внешнему адресу без очереди исходящей почты не отправлено"
+                    );
+                    Ok(())
+                }
+            },
+            Resolved::Unknown => {
+                tracing::warn!("smtp: адресат уведомления о доставке не найден");
+                Ok(())
+            }
+        }
     }
 }
 

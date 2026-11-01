@@ -1,0 +1,48 @@
+---
+source: crates/tp-smtp/src/dsn/tests.rs
+expression: "String::from_utf8(raw.clone()).expect(\"utf8\")"
+---
+From: "Mail Delivery System" <MAILER-DAEMON@mx.example.org>
+To: <alice@example.org>
+Subject: Successful Mail Delivery Report
+Date: Thu, 1 Jan 2026 14:00:00 +0000
+Message-ID: <dsn-0001@mx.example.org>
+Auto-Submitted: auto-replied
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type="delivery-status";
+ boundary="dsn-0001"
+
+
+--dsn-0001
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: base64
+
+0J/QuNGB0YzQvNC+INC00L7RgdGC0LDQstC70LXQvdC+Og0KWW91ciBtZXNzYWdlIHdhcyBkZWxp
+dmVyZWQgdG86DQoNCiAgPHhAZXhhbXBsZS5uZXQ+OiAyNTAgMi4wLjAgT0sNCg0KLS0gDQpUaGUg
+UG9zdCwgbXguZXhhbXBsZS5vcmcNCg==
+
+--dsn-0001
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Reporting-MTA: dns; mx.example.org
+Original-Envelope-Id: QQ314159
+Arrival-Date: Thu, 1 Jan 2026 10:00:00 +0000
+
+Final-Recipient: rfc822; x@example.net
+Action: delivered
+Status: 2.0.0
+Diagnostic-Code: smtp; 250 2.0.0 OK
+
+--dsn-0001
+Content-Type: message/rfc822
+Content-Transfer-Encoding: 7bit
+
+From: alice@example.org
+To: x@example.net
+Subject: hello
+Message-ID: <m1@example.org>
+
+body
+
+--dsn-0001--

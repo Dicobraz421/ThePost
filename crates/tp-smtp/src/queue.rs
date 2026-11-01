@@ -7,6 +7,7 @@
 //!   2xx — `complete(Delivered)`, 5xx или истёк `queue.expire` — `complete(Failed)`, 4xx и сбой соединения —
 //!   `reschedule` через `queue.retry`. Когда запись завершена (`complete` = `true`), ссылка на объект снимается.
 //!   Устаревший захват (`Conflict`: лиза истекла, запись взял другой узел) — запись пропускается.
+//!   Уведомления отправителю (DSN: отказ, задержка, успех) — [`crate::dsn`].
 //! - [`SmtpOutService`] — роль smtp-out: опрос очереди до остановки.
 //!
 //! Время попыток — из [`Now`] (тесты — управляемые часы), очередь сама времени не берёт.
@@ -20,12 +21,15 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use time::OffsetDateTime;
 use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, Commit};
-use tp_contracts::queue::{Claimed, OutMessage, OutRcpt, QueueStore, RcptStatus};
+use tp_contracts::queue::{
+    Claimed, DsnNotify, DsnRet, OutMessage, OutRcpt, QueueStore, QueuedRcpt, RcptStatus,
+};
 use tp_contracts::role::{RoleCtx, RoleService};
 use tp_contracts::{BlobKey, Error, Result, TenantId};
 
 use crate::config::{QueueConfig, SmtpConfig};
 use crate::deliver::Outbound;
+use crate::dsn::{self, DsnSink};
 
 pub mod send;
 
@@ -151,6 +155,13 @@ impl Queue {
 }
 
 #[async_trait]
+impl DsnSink for Queue {
+    async fn send_dsn(&self, tenant: TenantId, to: &str, raw: Bytes) -> Result<()> {
+        self.deps.put(tenant, "", vec![OutRcpt::new(to)], raw).await
+    }
+}
+
+#[async_trait]
 impl Outbound for Queue {
     async fn enqueue(
         &self,
@@ -210,6 +221,7 @@ pub struct QueueWorker {
     deps: QueueDeps,
     transport: Arc<dyn Transport>,
     hostname: String,
+    dsn: Arc<dyn DsnSink>,
 }
 
 impl fmt::Debug for QueueWorker {
@@ -228,10 +240,18 @@ impl QueueWorker {
         hostname: impl Into<String>,
     ) -> Self {
         Self {
+            dsn: Arc::new(Queue::new(deps.clone())),
             deps,
             transport,
             hostname: hostname.into(),
         }
+    }
+
+    /// Куда отправлять уведомления о доставке (по умолчанию — в эту же очередь; локальному отправителю
+    /// удобнее [`crate::Delivery`]).
+    pub fn with_dsn(mut self, sink: Arc<dyn DsnSink>) -> Self {
+        self.dsn = sink;
+        self
     }
 
     /// Один проход: захват записей со сроком попытки и их обработка. Возвращает число записей.
@@ -268,7 +288,7 @@ impl QueueWorker {
                 for r in &c.rcpts {
                     outcome.push((r, RcptResult::Temporary(reason.clone())));
                 }
-                return self.finish(cfg, &c, outcome).await;
+                return self.finish(cfg, &c, &[], outcome).await;
             }
         };
         // Получатели по доменам: одно соединение на домен.
@@ -313,34 +333,59 @@ impl QueueWorker {
                     .await?;
             }
         }
-        self.finish(cfg, &c, outcome).await
+        self.finish(cfg, &c, &message, outcome).await
     }
 
-    /// Записывает итоги попытки: завершение, отказ или повтор.
+    /// Записывает итоги попытки: завершение, повтор, отказ — и уведомления отправителю (RFC 3464):
+    /// об успехе — только по `NOTIFY=SUCCESS`, о задержке — однажды после `queue.delay_notify`, об отказе —
+    /// до `complete(Failed)` (сбой постановки уведомления — ошибка записи, отказ повторится после лизы).
+    /// Письму с пустым отправителем (само уведомление) уведомлений нет.
     async fn finish(
         &self,
         cfg: &QueueConfig,
         c: &Claimed,
-        outcome: Vec<(&tp_contracts::queue::QueuedRcpt, RcptResult)>,
+        message: &[u8],
+        outcome: Vec<(&QueuedRcpt, RcptResult)>,
     ) -> Result<()> {
         let now = (self.deps.now)();
-        let expired = now >= c.queued_at + cfg.expire;
+        let age = now - c.queued_at;
+        let expired = age >= cfg.expire;
         let mut failed = Vec::new();
+        let mut delayed = Vec::new();
+        let mut delivered = Vec::new();
         for (r, res) in outcome {
             let address = r.rcpt.address.as_str();
+            let notify = r.rcpt.notify.unwrap_or(DsnNotify {
+                success: false,
+                failure: true,
+                delay: true,
+            });
             match res {
                 RcptResult::Delivered(reply) => {
                     tracing::info!(id = %c.claim.id, %reply, "smtp: доставлено");
+                    if notify.success {
+                        delivered.push(dsn_rcpt(r, dsn::Action::Delivered, &reply));
+                    }
                     self.complete(c, address, RcptStatus::Delivered { reply })
                         .await?;
                 }
-                RcptResult::Permanent(reply) => failed.push((r, reply)),
+                RcptResult::Permanent(reply) => failed.push((r, reply, None)),
                 RcptResult::Temporary(reason) if expired => {
-                    failed.push((r, format!("delivery time expired, last error: {reason}")));
+                    let reply = format!("delivery time expired, last error: {reason}");
+                    failed.push((r, reply, Some("4.4.7")));
                 }
                 RcptResult::Temporary(reason) => {
                     let at = now + cfg.retry_after(r.attempts + 1);
                     tracing::info!(id = %c.claim.id, %reason, attempt = r.attempts + 1, "smtp: временная неудача, повтор");
+                    // Порог задержки пересечён этой попыткой (предыдущая была раньше порога).
+                    let prev = if r.attempts == 0 {
+                        time::Duration::ZERO
+                    } else {
+                        age - cfg.retry_after(r.attempts)
+                    };
+                    if notify.delay && age >= cfg.delay_notify && prev < cfg.delay_notify {
+                        delayed.push(dsn_rcpt(r, dsn::Action::Delayed, &reason));
+                    }
                     self.deps
                         .store
                         .reschedule(&c.claim, address, at, &reason)
@@ -348,12 +393,57 @@ impl QueueWorker {
                 }
             }
         }
-        for (r, reply) in failed {
+        // Уведомления об успехе и задержке — справочные: сбой их постановки только в журнал.
+        for (rcpts, retry_until) in [(delivered, None), (delayed, Some(c.queued_at + cfg.expire))] {
+            if let Err(e) = self.notify(c, message, &rcpts, retry_until).await {
+                tracing::warn!(id = %c.claim.id, error = %e, "smtp: уведомление о доставке не поставлено");
+            }
+        }
+        let notify_failed: Vec<_> = failed
+            .iter()
+            .filter(|(r, _, _)| r.rcpt.notify.is_none_or(|n| n.failure))
+            .map(|(r, reply, status)| {
+                let mut x = dsn_rcpt(r, dsn::Action::Failed, reply);
+                if let Some(s) = status {
+                    x.status = (*s).to_owned();
+                }
+                x
+            })
+            .collect();
+        self.notify(c, message, &notify_failed, None).await?;
+        for (r, reply, _) in failed {
             tracing::info!(id = %c.claim.id, %reply, "smtp: окончательный отказ");
             self.complete(c, &r.rcpt.address, RcptStatus::Failed { reply })
                 .await?;
         }
         Ok(())
+    }
+
+    /// Уведомление отправителю записи `c` о получателях `rcpts` (пусто или пустой отправитель — ничего).
+    async fn notify(
+        &self,
+        c: &Claimed,
+        message: &[u8],
+        rcpts: &[dsn::Recipient],
+        retry_until: Option<OffsetDateTime>,
+    ) -> Result<()> {
+        if rcpts.is_empty() || c.from.is_empty() {
+            return Ok(());
+        }
+        let id = c.claim.id.to_string();
+        let raw = dsn::build(&dsn::Report {
+            hostname: &self.hostname,
+            to: &c.from,
+            envid: c.dsn.envid.as_deref(),
+            arrival: c.queued_at,
+            now: (self.deps.now)(),
+            retry_until,
+            rcpts,
+            original: message,
+            ret: c.dsn.ret.unwrap_or(DsnRet::Headers),
+            id: &id,
+        });
+        self.dsn.send_dsn(c.tenant, &c.from, Bytes::from(raw)).await
     }
 
     async fn complete(&self, c: &Claimed, rcpt: &str, status: RcptStatus) -> Result<()> {
@@ -412,6 +502,13 @@ impl RoleService for SmtpOutService {
         }
         ctx.ready.set(false);
         Ok(())
+    }
+}
+
+fn dsn_rcpt(r: &QueuedRcpt, action: dsn::Action, reply: &str) -> dsn::Recipient {
+    dsn::Recipient {
+        orcpt: r.rcpt.orcpt.clone(),
+        ..dsn::Recipient::new(&r.rcpt.address, action, reply)
     }
 }
 

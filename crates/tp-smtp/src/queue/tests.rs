@@ -9,7 +9,8 @@ use bytes::Bytes;
 use mail_auth::hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use mail_auth::{MX, RecordSet};
 use tokio::net::TcpListener;
-use tp_contracts::queue::QueueStore;
+use tp_contracts::config::duration::HumanDuration;
+use tp_contracts::queue::{DsnNotify, QueueStore};
 use tp_contracts::{BlobKey, TenantId};
 use tp_testkit::{Clock, ManualClock, MemBlobIndex, MemBlobStore, MemQueue};
 
@@ -163,14 +164,28 @@ async fn recipients_grouped_by_domain_and_final_statuses() {
     let calls = t.calls.lock().expect("lock").clone();
     assert_eq!(calls[0].1, ["a@example.com", "c@example.com"]);
     assert_eq!(calls[1].1, ["b@example.net"]);
-    assert_eq!(env.queue.len(), 1);
+    // Запись ждёт повтора для c; уведомление об отказе a — отдельной записью.
+    assert_eq!(env.queue.len(), 2);
     assert_eq!(env.refs(&blob), 1);
-    // Срок доставки истёк: временная неудача становится отказом, запись завершается.
+    // Срок доставки истёк: временная неудача становится отказом, запись завершается. По сроку попытки
+    // первым идёт уведомление (доставлено), затем письмо.
     env.clock.advance(cfg.expire);
+    t.push(RcptResult::Delivered("250 ok".into()));
     t.push(RcptResult::Temporary("452 4.2.2 full".into()));
-    assert_eq!(worker.run_once(&cfg).await.expect("run"), 1);
-    assert!(env.queue.is_empty());
+    let one = QueueConfig {
+        concurrency: 1,
+        ..cfg.clone()
+    };
+    assert_eq!(worker.run_once(&one).await.expect("run"), 2);
     assert_eq!(env.refs(&blob), 0);
+    // Осталось уведомление об отказе c.
+    let left = due(&env).await;
+    assert_eq!(left.len(), 1);
+    assert!(
+        left[0]
+            .2
+            .contains("c@example.com\r\nAction: failed\r\nStatus: 4.4.7")
+    );
 }
 
 #[tokio::test]
@@ -389,4 +404,135 @@ async fn worker_delivers_through_relay() {
     assert!(env.queue.is_empty());
     // По соединению на домен.
     assert_eq!(rec.mails().len(), 2);
+}
+
+// ---------- Уведомления ----------
+
+/// Записи очереди со сроком попытки сейчас: (отправитель, получатели, письмо).
+async fn due(env: &Env) -> Vec<(String, Vec<String>, String)> {
+    let claimed = env
+        .queue
+        .claim(env.clock.now(), 100, Duration::from_secs(1))
+        .await
+        .expect("claim");
+    let mut out = Vec::new();
+    for c in claimed {
+        let raw = env.deps.read(&c.blob).await.expect("read");
+        out.push((
+            c.from.clone(),
+            c.rcpts.iter().map(|r| r.rcpt.address.clone()).collect(),
+            String::from_utf8_lossy(&raw).into_owned(),
+        ));
+    }
+    out
+}
+
+#[tokio::test]
+async fn failure_dsn_is_queued_before_completion() {
+    let env = Env::new();
+    let t = Arc::new(Scripted::default());
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "mx.example.org");
+    Queue::new(env.deps.clone())
+        .enqueue(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &["x@example.net".into()],
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("enqueue");
+    t.push(RcptResult::Permanent("550 5.1.1 no such user".into()));
+    worker.run_once(&cfg()).await.expect("run");
+    let dsn = due(&env).await;
+    assert_eq!(dsn.len(), 1);
+    assert_eq!(dsn[0].0, "", "уведомление — с пустым отправителем");
+    assert_eq!(dsn[0].1, ["alice@example.org"]);
+    assert!(dsn[0].2.contains("Action: failed\r\nStatus: 5.1.1\r\n"));
+    assert!(
+        dsn[0].2.contains("Subject: hi\r\n"),
+        "заголовки исходного письма"
+    );
+    // Уведомление не доставлено — уведомления о нём нет (пустой отправитель).
+    env.clock.advance(Duration::from_secs(1));
+    t.push(RcptResult::Permanent("550 5.1.1 no such user".into()));
+    worker.run_once(&cfg()).await.expect("run");
+    assert!(env.queue.is_empty());
+}
+
+#[tokio::test]
+async fn delay_dsn_once_and_expiry_status() {
+    let env = Env::new();
+    let t = Arc::new(Scripted::default());
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "mx.example.org");
+    Queue::new(env.deps.clone())
+        .enqueue(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &["x@example.net".into()],
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("enqueue");
+    let cfg = QueueConfig {
+        retry: vec![HumanDuration(Duration::from_secs(600))],
+        delay_notify: Duration::from_secs(25 * 60),
+        expire: Duration::from_secs(50 * 60),
+        ..cfg()
+    };
+    let mut delays = 0;
+    let mut failures = 0;
+    // Попытки в 0, 10, 20, 30, 40, 50 мин: задержка — после 30-й минуты, отказ — на 50-й.
+    for _ in 0..6 {
+        for _ in 0..2 {
+            t.push(RcptResult::Temporary("451 4.3.0 busy".into()));
+        }
+        worker.run_once(&cfg).await.expect("run");
+        for (from, _, raw) in due(&env).await {
+            assert_eq!(from, "");
+            if raw.contains("Action: delayed") {
+                delays += 1;
+                assert!(raw.contains("Will-Retry-Until: "));
+            } else {
+                failures += 1;
+                assert!(raw.contains("Action: failed\r\nStatus: 4.4.7\r\n"), "{raw}");
+            }
+        }
+        env.clock.advance(Duration::from_secs(600));
+    }
+    assert_eq!((delays, failures), (1, 1));
+}
+
+#[tokio::test]
+async fn success_dsn_only_on_request() {
+    let env = Env::new();
+    let t = Arc::new(Scripted::default());
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "mx.example.org");
+    let rcpts = vec![
+        OutRcpt {
+            notify: Some(DsnNotify {
+                success: true,
+                ..DsnNotify::default()
+            }),
+            ..OutRcpt::new("x@example.net")
+        },
+        OutRcpt::new("y@example.net"),
+    ];
+    env.deps
+        .put(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            rcpts,
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("put");
+    worker.run_once(&cfg()).await.expect("run");
+    let dsn = due(&env).await;
+    assert_eq!(dsn.len(), 1);
+    assert!(
+        dsn[0]
+            .2
+            .contains("Final-Recipient: rfc822; x@example.net\r\nAction: delivered")
+    );
+    assert!(!dsn[0].2.contains("y@example.net\r\nAction"));
 }
