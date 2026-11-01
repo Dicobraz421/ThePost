@@ -161,7 +161,7 @@ fn header_ids(v: &HeaderValue<'_>) -> Value {
     }
 }
 
-async fn collect(s: ByteStream) -> Result<Vec<u8>> {
+pub(crate) async fn collect(s: ByteStream) -> Result<Vec<u8>> {
     s.try_fold(Vec::new(), |mut acc, chunk| async move {
         acc.extend_from_slice(&chunk);
         Ok(acc)
@@ -182,12 +182,12 @@ fn mime(bp: &BodyPart) -> String {
     format!("{}/{}", bp.media_type, bp.subtype)
 }
 
-fn is_multipart(bp: &BodyPart) -> bool {
+pub(crate) fn is_multipart(bp: &BodyPart) -> bool {
     bp.media_type == "multipart"
 }
 
 /// Путь листовой части для `fetch_part`: тело несоставного письма — `1`.
-fn leaf_path(bp: &BodyPart) -> String {
+pub(crate) fn leaf_path(bp: &BodyPart) -> String {
     if bp.part.is_empty() {
         "1".into()
     } else {
