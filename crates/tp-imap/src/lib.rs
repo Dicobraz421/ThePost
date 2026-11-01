@@ -6,12 +6,14 @@
 //!   DELETE, RENAME, SUBSCRIBE.
 //! - `fetch` — FETCH: метаданные, разделы BODY[], BINARY, частичная выборка.
 //! - `store` — STORE и CONDSTORE (`UNCHANGEDSINCE`, `MODSEQ`).
+//! - `search` — SEARCH и ESEARCH: метаданные и полнотекстовый индекс.
 //! - [`config`] — секция `imap` config.yaml.
 
 pub mod config;
 mod fetch;
 mod mailbox;
 pub mod proto;
+mod search;
 pub mod session;
 mod store;
 

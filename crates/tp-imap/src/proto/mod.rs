@@ -66,6 +66,45 @@ pub enum Body {
         /// Запрошенные элементы.
         items: Vec<StatusItem>,
     },
+    /// `SEARCH RETURN (…)` (ESEARCH, RFC 4731, RFC 9051, 6.4.4); критерии разобраны imap-codec.
+    ESearch {
+        /// `CHARSET`.
+        charset: Option<types::core::Charset<'static>>,
+        /// Критерии (все должны выполняться).
+        criteria: types::core::Vec1<types::search::SearchKey<'static>>,
+        /// `UID SEARCH`.
+        uid: bool,
+        /// Параметры результата; пустой список — `ALL`.
+        ret: Vec<SearchReturn>,
+    },
+}
+
+/// Параметр результата `SEARCH RETURN (…)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReturn {
+    /// `MIN`.
+    Min,
+    /// `MAX`.
+    Max,
+    /// `ALL`.
+    All,
+    /// `COUNT`.
+    Count,
+    /// `SAVE` (RFC 5182, SEARCHRES).
+    Save,
+}
+
+impl SearchReturn {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_uppercase().as_str() {
+            "MIN" => Self::Min,
+            "MAX" => Self::Max,
+            "ALL" => Self::All,
+            "COUNT" => Self::Count,
+            "SAVE" => Self::Save,
+            _ => return None,
+        })
+    }
 }
 
 /// `LIST`/`LSUB` с опциями расширенного `LIST`.

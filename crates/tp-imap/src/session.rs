@@ -25,6 +25,7 @@ use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountScope, MailboxStore, MessageStore};
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslFailure, SaslServer, SaslStep};
+use tp_contracts::search::SearchIndex;
 use tp_contracts::{Error, MailboxId, MessageId, Result, Uid, UidValidity};
 use tp_platform::{Conn, Listener};
 
@@ -40,6 +41,7 @@ use crate::proto::types::response::{
 };
 use crate::proto::types::secret::Secret;
 use crate::proto::{self, Body, Command, Expect, Input, Reader};
+use crate::search::SearchCmd;
 
 /// Канал сессии: поток байтов, признак TLS, апгрейд STARTTLS.
 pub trait Transport: Send + Sized + 'static {
@@ -92,6 +94,8 @@ pub struct Deps {
     pub messages: Arc<dyn MessageStore>,
     /// Почтовое хранилище (содержимое, флаги).
     pub store: Arc<dyn MailStore>,
+    /// Полнотекстовый поиск (`SEARCH BODY`, `TEXT`).
+    pub search: Arc<dyn SearchIndex>,
 }
 
 impl fmt::Debug for Deps {
@@ -175,6 +179,7 @@ const EXTENSIONS: &[&str] = &[
     "STATUS=SIZE",
     "BINARY",
     "CONDSTORE",
+    "ESEARCH",
 ];
 
 fn reader(config: &ImapConfig) -> Reader {
@@ -524,6 +529,24 @@ impl<T: Transport> Session<T> {
             Body::List(cmd) => self.list(&tag, cmd).await,
             Body::Status { mailbox, items } => self.status(&tag, &mailbox, &items).await,
             Body::Create { mailbox, uses } => self.create(&tag, &mailbox, &uses).await,
+            Body::ESearch {
+                charset,
+                criteria,
+                uid,
+                ret,
+            } => {
+                if self.selected.is_none() {
+                    self.bad(Some(&tag), "No mailbox selected");
+                    return Ok(());
+                }
+                let cmd = SearchCmd {
+                    charset,
+                    criteria,
+                    uid,
+                    ret: Some(ret),
+                };
+                self.search(&tag, cmd).await
+            }
             Body::Std(body) => match body {
                 CommandBody::Select {
                     mailbox,
@@ -597,6 +620,19 @@ impl<T: Transport> Session<T> {
                     .await
             }
             body @ CommandBody::Store { .. } => self.store(tag, body).await,
+            CommandBody::Search {
+                charset,
+                criteria,
+                uid,
+            } => {
+                let cmd = SearchCmd {
+                    charset,
+                    criteria,
+                    uid,
+                    ret: None,
+                };
+                self.search(tag, cmd).await
+            }
             _ => {
                 self.bad(Some(tag), "Command not supported");
                 Ok(())
