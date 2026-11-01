@@ -13,16 +13,21 @@
 //!
 //! До шага 4 ничего не раскладывается. Сбой загрузки или транзакции снимает добавленные ссылки и не оставляет
 //! метаданных: запрос выполняется целиком или не выполняется (вызывающий может повторить).
+//!
+//! Письмо клиента (`MailStore::append`: IMAP APPEND, JMAP `Email/import`; решение 2026-11-01-trash-purge) — не доставка:
+//! шаги 2–3 общие с приёмом, но без точек принятия решений и копий (шаг 1 — только квота), метаданные —
+//! `MessageStore::insert`.
 
 use std::collections::HashMap;
 
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
+use time::OffsetDateTime;
 use tp_contracts::blob::{Acquire, ByteStream, Commit};
 use tp_contracts::ext::{CopyTo, Decision, DeliveryInfo};
 use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, Ingested};
-use tp_contracts::meta::{AccountScope, NewMessage, PartRef};
-use tp_contracts::{BlobHash, BlobKey, Error, Result, TenantId};
+use tp_contracts::meta::{AccountScope, Flags, NewMessage, PartRef};
+use tp_contracts::{BlobHash, BlobKey, Error, MailboxId, Result, TenantId};
 
 use crate::split::{self, Split};
 use crate::{Store, meta};
@@ -34,6 +39,14 @@ struct SkeletonGroup {
     /// Индексы доставок группы.
     members: Vec<usize>,
     key: Option<BlobKey>,
+}
+
+/// Письмо, подготовленное к раскладке: объекты загружены и учтены, метаданные ещё не вставлены.
+struct Staged {
+    /// Метаданные доставок в их порядке.
+    items: Vec<(AccountScope, MailboxId, NewMessage)>,
+    /// Добавленные ссылки на объекты: снимаются, если вставка метаданных не удалась.
+    held: Vec<(BlobKey, u32)>,
 }
 
 impl Store {
@@ -75,15 +88,99 @@ impl Store {
                 }
             }
         }
-        check_headers(&common)?;
-        for d in &deliveries {
+
+        let Staged { items, held } = self
+            .stage(tenant, raw, &deliveries, &common, received_at)
+            .await?;
+        let inserted = match self.d.messages.insert_batch(tenant, items).await {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                self.release(&held).await;
+                return Err(e);
+            }
+        };
+
+        let mut done: Vec<Delivered> = Vec::with_capacity(deliveries.len());
+        for (d, ins) in deliveries.iter().zip(inserted) {
+            let scope = AccountScope {
+                tenant,
+                account: d.account,
+            };
+            self.notify(scope, [d.mailbox], ins.modseq).await;
+            done.push(Delivered {
+                account: d.account,
+                mailbox: d.mailbox,
+                message: ins.id,
+                uid: ins.uid,
+            });
+        }
+        // Доставки сверх запроса (копии точек принятия решений) вызывающему не возвращаются.
+        done.truncate(info.deliveries.len());
+        Ok(Ingested {
+            delivered: done,
+            forward,
+        })
+    }
+
+    /// Письмо клиента (IMAP APPEND, JMAP `Email/import`): те же шаги 1–3, что у приёма, без точек принятия решений,
+    /// копий и добавленных заголовков; метаданные — `MessageStore::insert`.
+    pub(crate) async fn append_impl(
+        &self,
+        scope: AccountScope,
+        mailbox: MailboxId,
+        raw: ByteStream,
+        flags: Flags,
+        received_at: OffsetDateTime,
+    ) -> Result<Delivered> {
+        let raw = read_all(raw).await?;
+        let delivery = Delivery {
+            account: scope.account,
+            mailbox,
+            extra_headers: Vec::new(),
+            flags,
+        };
+        let Staged { mut items, held } = self
+            .stage(scope.tenant, raw, &[delivery], &[], received_at)
+            .await?;
+        let inserted = match items.pop() {
+            Some((_, _, msg)) => self.d.messages.insert(scope, mailbox, msg).await,
+            None => Err(Error::Conflict),
+        };
+        let ins = match inserted {
+            Ok(ins) => ins,
+            Err(e) => {
+                self.release(&held).await;
+                return Err(e);
+            }
+        };
+        self.notify(scope, [mailbox], ins.modseq).await;
+        Ok(Delivered {
+            account: scope.account,
+            mailbox,
+            message: ins.id,
+            uid: ins.uid,
+        })
+    }
+
+    /// Шаги 1–3 для доставок `deliveries` с общими заголовками `common`: проверка заголовков, квота (до разбора
+    /// и загрузки), разбор, загрузка и учёт объектов. Метаданные не раскладываются; сбой загрузки снимает ссылки.
+    async fn stage(
+        &self,
+        tenant: TenantId,
+        raw: Bytes,
+        deliveries: &[Delivery],
+        common: &[(String, String)],
+        received_at: OffsetDateTime,
+    ) -> Result<Staged> {
+        check_headers(common)?;
+        for d in deliveries {
             check_headers(&d.extra_headers)?;
         }
         // Квота — до разбора и загрузки: превышение у одного получателя отклоняет весь запрос.
         let demands: Vec<_> = deliveries
             .iter()
             .map(|d| {
-                let size = header_block(&d.extra_headers, &common).len() + raw.len();
+                let size = header_block(&d.extra_headers, common).len() + raw.len();
                 (d.account, size as u64)
             })
             .collect();
@@ -99,7 +196,7 @@ impl Store {
 
         let mut groups: Vec<SkeletonGroup> = Vec::new();
         for (i, d) in deliveries.iter().enumerate() {
-            let prefix = header_block(&d.extra_headers, &common);
+            let prefix = header_block(&d.extra_headers, common);
             match groups.iter_mut().find(|g| {
                 g.members
                     .first()
@@ -155,7 +252,7 @@ impl Store {
             return Err(e);
         }
 
-        let inserted = async {
+        let items = (|| {
             let mut parts = Vec::with_capacity(split.cuts().len());
             for cut in split.cuts() {
                 parts.push(PartRef {
@@ -179,44 +276,22 @@ impl Store {
                 let msg = NewMessage {
                     skeleton: skeleton.ok_or(Error::Conflict)?,
                     parts: parts.clone(),
-                    size: message_size(&split, &d.extra_headers, &common),
+                    size: message_size(&split, &d.extra_headers, common),
                     received_at,
                     flags: d.flags.clone(),
                     meta: meta.clone(),
                 };
                 items.push((scope, d.mailbox, msg));
             }
-            self.d.messages.insert_batch(tenant, items).await
-        }
-        .await;
-        let inserted = match inserted {
-            Ok(inserted) => inserted,
+            Ok::<_, Error>(items)
+        })();
+        match items {
+            Ok(items) => Ok(Staged { items, held }),
             Err(e) => {
                 self.release(&held).await;
-                return Err(e);
+                Err(e)
             }
-        };
-
-        let mut done: Vec<Delivered> = Vec::with_capacity(deliveries.len());
-        for (d, ins) in deliveries.iter().zip(inserted) {
-            let scope = AccountScope {
-                tenant,
-                account: d.account,
-            };
-            self.notify(scope, [d.mailbox], ins.modseq).await;
-            done.push(Delivered {
-                account: d.account,
-                mailbox: d.mailbox,
-                message: ins.id,
-                uid: ins.uid,
-            });
         }
-        // Доставки сверх запроса (копии точек принятия решений) вызывающему не возвращаются.
-        done.truncate(info.deliveries.len());
-        Ok(Ingested {
-            delivered: done,
-            forward,
-        })
     }
 
     /// Учитывает объект с `refs` ссылками и загружает его, если его ещё нет (SRS 3.4, шаги 2–3).
@@ -654,6 +729,120 @@ mod tests {
         for h in split.cuts().iter().map(|c| c.hash).chain([skeleton]) {
             assert_eq!(env.index.row(TenantId::DEFAULT, &h).expect("row").refcnt, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn append_is_not_a_delivery() {
+        use futures::StreamExt;
+        use tp_contracts::bus::{EventBus, EventKind};
+        use tp_contracts::meta::Flags;
+
+        let env = Env::new();
+        // Точка принятия решений доставки запрещает всё: APPEND её не вызывает.
+        let hook = tp_testkit::RecordingDecisionHook::new("journal");
+        hook.set_delivery(Decision::Deny("policy".into()));
+        let store = crate::Store::new(crate::Deps {
+            hooks: DecisionHooks::new(vec![Arc::new(hook.clone())]),
+            ..env.store.d.clone()
+        });
+        let scope = env.meta.account("client@example.org").await.expect("acc");
+        let drafts = env
+            .meta
+            .mailbox_by_role(scope, SpecialUse::Drafts)
+            .expect("drafts");
+        let mut events = env.bus.subscribe(scope).await.expect("sub");
+        let raw = mail();
+        let flags: Flags = [Flag::Draft, Flag::Seen].into();
+        let at = SystemClock.now();
+        let done = store
+            .append(scope, drafts, stream(&raw, 777), flags.clone(), at)
+            .await
+            .expect("append");
+        assert_eq!((done.account, done.mailbox), (scope.account, drafts));
+        assert!(hook.calls().is_empty(), "on_delivery не вызывается");
+        assert_eq!(
+            stored(&env, scope, done.message).await,
+            raw,
+            "побайтово, без добавленных заголовков"
+        );
+        let msg = env
+            .meta
+            .get(scope, done.message)
+            .await
+            .expect("get")
+            .expect("msg");
+        assert_eq!(
+            (msg.uid, msg.flags, msg.size, msg.received_at),
+            (done.uid, flags, raw.len() as u64, at)
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("event in time")
+            .expect("event");
+        assert_eq!(
+            event.kind,
+            EventKind::MailboxChanged {
+                mailbox: drafts,
+                modseq: msg.modseq
+            }
+        );
+        // Копий в другие ящики нет: письмо одно, только в папке назначения.
+        assert_eq!(
+            env.meta
+                .list(scope, drafts, MessageQuery::All, 10)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn append_checks_quota_and_mailbox() {
+        let env = Env::new();
+        let scope = env.meta.account("client@example.org").await.expect("acc");
+        let inbox = env
+            .meta
+            .mailbox_by_role(scope, SpecialUse::Inbox)
+            .expect("inbox");
+        let raw = mail();
+        let at = SystemClock.now();
+        env.quota.set_limit(scope, Some(raw.len() as u64 - 1));
+        let puts = env.blobs.calls(BlobOp::Put);
+        let err = env
+            .store
+            .append(scope, inbox, stream(&raw, 1000), Default::default(), at)
+            .await;
+        assert_eq!(err, Err(Error::QuotaExceeded));
+        assert_eq!(env.blobs.calls(BlobOp::Put), puts, "квота — до загрузки");
+
+        env.quota.set_limit(scope, Some(raw.len() as u64));
+        let err = env
+            .store
+            .append(
+                scope,
+                tp_contracts::MailboxId::new(),
+                stream(&raw, 1000),
+                Default::default(),
+                at,
+            )
+            .await;
+        assert_eq!(err, Err(Error::NotFound), "нет папки");
+        let split = Split::new(Bytes::from(raw.clone()));
+        let skeleton = split::hash(&split.skeleton(b""));
+        for h in split.cuts().iter().map(|c| c.hash).chain([skeleton]) {
+            assert_eq!(
+                env.index.row(TenantId::DEFAULT, &h).expect("row").refcnt,
+                0,
+                "ссылки сняты"
+            );
+        }
+        let done = env
+            .store
+            .append(scope, inbox, stream(&raw, 1000), Default::default(), at)
+            .await
+            .expect("append within quota");
+        assert_eq!(stored(&env, scope, done.message).await, raw);
     }
 
     #[test]

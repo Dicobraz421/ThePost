@@ -81,6 +81,9 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
   на всех получателей; квота одного получателя — `QuotaExceeded` на весь запрос. `mail_from` — отправитель конверта (SMTP `MAIL FROM`,
   пустой — уведомление о недоставке), из заголовков не выводится. `forward` — внешние адреса `CopyTo::Address` от точек принятия
   решений: в очередь исходящей почты их ставит вызывающий (smtp, jmap), копии `CopyTo::Mailbox` делает хранилище.
+- `append(AccountScope, mailbox, raw: ByteStream, flags, received_at) -> Delivered` — письмо клиента (IMAP APPEND, JMAP `Email/import`;
+  решение 2026-11-01-trash-purge): разбор и загрузка, как у `ingest`, квота (`QuotaExceeded` до загрузки), `MessageStore::insert`,
+  событие в `EventBus`. Не доставка: без `DecisionHook::on_delivery`, без копий и добавленных заголовков; нет папки — `NotFound`.
 - `fetch_raw(AccountScope, message, Option<Range>) -> ByteStream`; `fetch_part(AccountScope, message, part_path)` — тело в кодировке передачи.
 - `set_flags`, `copy`, `move_to`, `delete_to_trash`, `restore` (по `AccountScope`) — публикуют событие в `EventBus` после фиксации.
 
@@ -341,6 +344,8 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   и поле `RoleCtx::load`; `delivery::{DeliveryLog, DeliveryEvent, DeliveryQuery, DeliveryPage}`; `groups::{GroupStore,
   DistributionGroup, HeldMessage}`, `GroupId`, `HeldId`. In-memory — `MemBlobIndex` (признак), `MemLoadMonitor`, `MemDeliveryLog`,
   `MemGroups`; наборы `suite::{blob_compression, delivery_log, group_store}`.
+- 2026-11-01 — CTR-27 (x/contracts-15, решение 2026-11-01-trash-purge): `MailStore::append` — письмо клиента без точек принятия решений
+  доставки и копий; реализация `tp-mailstore` — общие с `ingest` шаги разбора, квоты и загрузки.
 - 2026-11-01 — решение «Взаимодействие компонентов и требования к СУБД»: сигналы через PostgreSQL LISTEN/NOTIFY, `Rpc`, `AbuseBlocks`,
   `NodeInfo`; канал и шина Valkey удаляются (реализация — CTR-23, CLU-09).
 - 2026-11-01 — решение «Состав функций транспорта и внешний MTA»: `transport::{TransportStore, MailFlow}`, `EventKind::TransportChanged`
