@@ -15,6 +15,12 @@
 //!   timeouts:
 //!     command: 5m
 //!     data: 10m
+//!   milter:
+//!     filters:
+//!       - name: rspamd
+//!         address: "127.0.0.1:11332"
+//!         submission: true
+//!         on_failure: accept
 //! ```
 //!
 //! Слушатели (`inbound`, `submission`) применяются при запуске роли; лимиты и таймауты — к новым сессиям
@@ -45,6 +51,8 @@ pub struct SmtpConfig {
     pub delivery: DeliveryConfig,
     /// Проверки SPF, DKIM, DMARC, ARC.
     pub authcheck: AuthCheckConfig,
+    /// Фильтры Milter (антиспам, антивирус).
+    pub milter: MilterConfig,
 }
 
 impl Default for SmtpConfig {
@@ -57,6 +65,7 @@ impl Default for SmtpConfig {
             timeouts: Timeouts::default(),
             delivery: DeliveryConfig::default(),
             authcheck: AuthCheckConfig::default(),
+            milter: MilterConfig::default(),
         }
     }
 }
@@ -148,4 +157,66 @@ impl Default for AuthCheckConfig {
             dns_cache_size: 10_000,
         }
     }
+}
+
+/// Фильтры Milter (SRS 4.1): цепочка в порядке перечисления.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct MilterConfig {
+    /// Фильтры; пусто — письма не фильтруются.
+    pub filters: Vec<MilterFilter>,
+}
+
+/// Фильтр Milter.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct MilterFilter {
+    /// Имя (журнал, заголовок о недоступности).
+    pub name: String,
+    /// Адрес `хост:порт` (TCP).
+    pub address: String,
+    /// Проверять входящую почту (smtp-in).
+    pub inbound: bool,
+    /// Проверять почту пользователей (submission).
+    pub submission: bool,
+    /// Ожидание соединения с фильтром.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub connect_timeout: Duration,
+    /// Ожидание ответа на команду.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub command_timeout: Duration,
+    /// Ожидание итога после конца письма (`progress` фильтра продлевает ожидание).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub end_timeout: Duration,
+    /// Что делать, если фильтр недоступен.
+    pub on_failure: MilterOnFailure,
+}
+
+impl Default for MilterFilter {
+    fn default() -> Self {
+        Self {
+            name: "milter".into(),
+            address: "127.0.0.1:11332".into(),
+            inbound: true,
+            submission: false,
+            connect_timeout: Duration::from_secs(5),
+            command_timeout: Duration::from_secs(10),
+            end_timeout: Duration::from_secs(60),
+            on_failure: MilterOnFailure::default(),
+        }
+    }
+}
+
+/// Политика при недоступности фильтра.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MilterOnFailure {
+    /// Принять с пометкой: заголовок `X-ThePost-Milter: <имя>; unavailable`.
+    #[default]
+    Accept,
+    /// Временный отказ (`451 4.7.1`), отправитель повторит.
+    Tempfail,
 }

@@ -11,7 +11,8 @@
 //! Каталог (псевдонимы, адреса учётных записей, группы) читается полным снимком и кэшируется на
 //! `delivery.directory_refresh`; учётная запись — [`AccountStore::by_login`]. Проверки SPF, DKIM, DMARC и ARC
 //! входящей почты — [`crate::authcheck`]: их заголовки добавляются к письму, письмо с проваленным DMARC
-//! (`quarantine`, `reject`) доставляется в «Спам».
+//! (`quarantine`, `reject`) доставляется в «Спам». Затем письмо проверяют фильтры Milter ([`crate::milter`]):
+//! отказ фильтра — ответ на `DATA`, карантин — «Спам» (smtp-in) или отказ (submission).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -29,6 +30,7 @@ use tp_contracts::{Error, MailboxId, Result, TenantId};
 
 use crate::authcheck::AuthCheck;
 use crate::config::{DeliveryConfig, SmtpConfig};
+use crate::milter::{Milters, Verdict};
 use crate::server::{Envelope, Handler, Mode, Reply, reply};
 
 /// Очередь исходящей почты: внешние получатели submission и пересылки модулей.
@@ -66,6 +68,8 @@ pub struct Deps {
     pub outbound: Option<Arc<dyn Outbound>>,
     /// Проверки SPF, DKIM, DMARC, ARC входящей почты (smtp-in); `None` — без проверок.
     pub authcheck: Option<Arc<AuthCheck>>,
+    /// Фильтры Milter; `None` — без фильтров.
+    pub milter: Option<Arc<Milters>>,
 }
 
 impl fmt::Debug for Deps {
@@ -75,6 +79,7 @@ impl fmt::Debug for Deps {
             .field("directory", &self.directory.is_some())
             .field("outbound", &self.outbound.is_some())
             .field("authcheck", &self.authcheck.is_some())
+            .field("milter", &self.milter.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -459,15 +464,15 @@ impl Delivery {
         }
     }
 
-    async fn accept(&self, env: &Envelope, raw: Bytes) -> Result<()> {
+    /// Принимает письмо: проверки, фильтры, доставка и очередь. Ответ фильтра (отказ, отброс) — `Ok(Some)`.
+    async fn accept(&self, env: &Envelope, raw: Bytes) -> Result<Option<Reply>> {
         let received_at = OffsetDateTime::now_utc();
         let check = match (&self.deps.authcheck, env.mode) {
             (Some(ac), Mode::Inbound) => Some(ac.check(env, &raw).await),
             _ => None,
         };
         // DMARC не пройден при политике quarantine/reject — в «Спам».
-        let junk = check.as_ref().is_some_and(|c| c.junk);
-        let prepared = self.prepare(env, junk).await?;
+        let mut junk = check.as_ref().is_some_and(|c| c.junk);
         let mut headers = self.trace_headers(env, received_at);
         if let Some(c) = &check {
             // Authentication-Results и Received-SPF — выше Received этого узла (RFC 8601, 7208).
@@ -476,7 +481,32 @@ impl Delivery {
         let mut full = Vec::with_capacity(headers.len() + raw.len());
         full.extend_from_slice(headers.as_bytes());
         full.extend_from_slice(&raw);
-        let full = Bytes::from(full);
+        let mut full = Bytes::from(full);
+        if let Some(m) = self.deps.milter.as_ref().filter(|m| m.applies(env.mode)) {
+            let out = m.check(env, full).await;
+            match out.verdict {
+                Verdict::Accept => {}
+                Verdict::Refuse(r) => return Ok(Some(r)),
+                Verdict::Discard => {
+                    return Ok(Some(reply(250, [2, 0, 0], format!("OK id={}", env.id))));
+                }
+            }
+            if let Some(reason) = &out.quarantine {
+                tracing::info!(id = %env.id, %reason, "smtp: письмо в карантине фильтра");
+                match env.mode {
+                    Mode::Inbound => junk = true,
+                    Mode::Submission => {
+                        return Ok(Some(reply(
+                            550,
+                            [5, 7, 1],
+                            "Message held by content filter",
+                        )));
+                    }
+                }
+            }
+            full = out.message;
+        }
+        let prepared = self.prepare(env, junk).await?;
         let mut forward = Vec::new();
         if !prepared.deliveries.is_empty() {
             let deliveries = prepared.deliveries.into_iter().map(|(_, d)| d).collect();
@@ -487,7 +517,8 @@ impl Delivery {
         }
         let mut rcpts = prepared.external;
         rcpts.extend(forward);
-        self.enqueue(env, rcpts, full).await
+        self.enqueue(env, rcpts, full).await?;
+        Ok(None)
     }
 }
 
@@ -528,7 +559,8 @@ impl Handler for Delivery {
 
     async fn data(&self, env: &Envelope, raw: Bytes) -> Reply {
         match self.accept(env, raw).await {
-            Ok(()) => reply(250, [2, 0, 0], format!("OK id={}", env.id)),
+            Ok(Some(r)) => r,
+            Ok(None) => reply(250, [2, 0, 0], format!("OK id={}", env.id)),
             Err(Error::QuotaExceeded) => reply(552, [5, 2, 2], "Mailbox full"),
             Err(Error::Invalid(m)) => {
                 tracing::info!(id = %env.id, error = %m, "smtp: письмо отклонено");

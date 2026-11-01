@@ -153,6 +153,7 @@ impl Env {
                 quota: Some(Arc::new(self.quota.clone())),
                 outbound: outbound.then(|| self.queue.clone() as Arc<dyn Outbound>),
                 authcheck: None,
+                milter: None,
             },
             &cfg,
         )

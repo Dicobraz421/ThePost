@@ -3,14 +3,17 @@
 //! - [`server`] — сессия SMTP (RFC 5321) на `smtp-proto`, роли smtp-in и submission, STARTTLS, `AUTH`;
 //! - [`authcheck`] — SPF, DKIM, DMARC, ARC входящей почты на `mail-auth`;
 //! - [`deliver`] — локальная доставка: разрешение получателей, `Received`, `MailStore::ingest`;
+//! - [`milter`] — фильтры Milter (антиспам, антивирус) после приёма письма;
 //! - [`config`] — секция `smtp` config.yaml.
 
 pub mod authcheck;
 pub mod config;
 pub mod deliver;
+pub mod milter;
 pub mod server;
 
 pub use authcheck::AuthCheck;
 pub use config::SmtpConfig;
 pub use deliver::{Delivery, Outbound};
+pub use milter::Milters;
 pub use server::{Envelope, Handler, Mode, Reply, ServerDeps, Session, SessionCtx, SmtpService};
