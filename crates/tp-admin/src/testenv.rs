@@ -14,16 +14,20 @@ use tower::ServiceExt;
 use tp_contracts::auth::Principal;
 use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
+use tp_contracts::groups::{DistributionGroup, HeldMessage};
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, Flags, Policy, PolicyResolver, SpecialUse};
-use tp_contracts::{AccountId, DomainId, Error, MailboxId, MessageId, Result, TenantId};
+use tp_contracts::{
+    AccountId, DomainId, Error, GroupId, HeldId, MailboxId, MessageId, Result, TenantId,
+};
 use tp_testkit::{
-    Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemEventBus,
-    MemMetadata, MemQuota, MemTrash, SystemClock,
+    Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
+    MemEventBus, MemGroups, MemMetadata, MemQuota, MemTrash, SystemClock,
 };
 
 use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
-use crate::audit::{AuditRecord, AuditSink};
+use crate::audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink};
+use crate::groups::Moderation;
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 
 /// Журнал аудита в памяти.
@@ -50,8 +54,74 @@ impl AuditSink for MemAudit {
     }
 }
 
+#[async_trait]
+impl AuditLog for MemAudit {
+    async fn search(&self, tenant: TenantId, q: &AuditQuery) -> Result<AuditPage> {
+        let entries: Vec<AuditEntry> = lock(&self.0)
+            .iter()
+            .enumerate()
+            .map(|(i, r)| AuditEntry {
+                seq: i as u64 + 1,
+                record: r.clone(),
+            })
+            .filter(|e| {
+                e.record.tenant == Some(tenant)
+                    && q.after.is_none_or(|a| e.seq > a)
+                    && q.since.is_none_or(|t| e.record.at >= t)
+                    && q.until.is_none_or(|t| e.record.at < t)
+            })
+            .take(q.limit)
+            .collect();
+        let next = (entries.len() == q.limit)
+            .then(|| entries.last().map(|e| e.seq))
+            .flatten();
+        Ok(AuditPage { entries, next })
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Решение модерации, переданное [`MemModeration`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Deliver(HeldId, GroupId),
+    Reject(HeldId, String),
+}
+
+/// Решения модерации в памяти; `fail_next` — ошибка следующего решения.
+#[derive(Debug, Clone, Default)]
+pub struct MemModeration(Arc<Mutex<(Vec<Decision>, Option<Error>)>>);
+
+impl MemModeration {
+    pub fn decisions(&self) -> Vec<Decision> {
+        lock(&self.0).0.clone()
+    }
+
+    pub fn fail_next(&self, e: Error) {
+        lock(&self.0).1 = Some(e);
+    }
+
+    fn push(&self, d: Decision) -> Result<()> {
+        let mut st = lock(&self.0);
+        if let Some(e) = st.1.take() {
+            return Err(e);
+        }
+        st.0.push(d);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Moderation for MemModeration {
+    async fn deliver(&self, _: TenantId, group: &DistributionGroup, m: &HeldMessage) -> Result<()> {
+        self.push(Decision::Deliver(m.id, group.id))
+    }
+
+    async fn reject(&self, _: TenantId, m: &HeldMessage, reason: &str) -> Result<()> {
+        self.push(Decision::Reject(m.id, reason.to_owned()))
+    }
 }
 
 /// Политики уровней в памяти; разрешение — наложение организация → домен → учётная запись.
@@ -151,6 +221,9 @@ pub struct Stores {
     pub quota: MemQuota,
     pub store: tp_mailstore::Store,
     pub passwords: MemAppPasswords,
+    pub groups: MemGroups,
+    pub delivery: MemDeliveryLog,
+    pub moderation: MemModeration,
 }
 
 impl Stores {
@@ -175,6 +248,9 @@ impl Stores {
             quota,
             store,
             passwords,
+            groups: MemGroups::new(),
+            delivery: MemDeliveryLog::new(),
+            moderation: MemModeration::default(),
         }
     }
 
@@ -193,6 +269,10 @@ impl Stores {
         Deps {
             auth: Arc::new(FakeAuthenticator::default()),
             audit: Arc::new(MemAudit::default()),
+            audit_log: None,
+            delivery: Arc::new(self.delivery.clone()),
+            groups: Arc::new(self.groups.clone()),
+            moderation: Arc::new(self.moderation.clone()),
             modules: Vec::new(),
             accounts: Arc::new(self.meta.clone()),
             quota: Arc::new(self.quota.clone()),
@@ -212,10 +292,14 @@ pub fn deps() -> Deps {
 }
 
 /// Токены: `root` — администратор инсталляции, `org` — администратор организации по умолчанию,
-/// `user` — без роли (организация по умолчанию), `other` — администратор организации по имени входа в другой организации.
+/// `user` — без роли (организация по умолчанию), `other` — администратор организации по имени входа в другой организации,
+/// `operator` и `auditor` — оператор и аудитор организации по умолчанию.
 pub struct Env {
     pub auth: FakeAuthenticator,
     pub audit: MemAudit,
+    pub groups: MemGroups,
+    pub delivery: MemDeliveryLog,
+    pub moderation: MemModeration,
     pub meta: MemMetadata,
     pub quota: MemQuota,
     pub store: tp_mailstore::Store,
@@ -252,6 +336,16 @@ pub fn config() -> AdminConfig {
                 logins: vec!["Admin@Example.org".into()],
                 groups: vec![],
             },
+            RoleBinding {
+                role: AdminRole::Operator,
+                logins: vec![],
+                groups: vec!["mail-ops".into()],
+            },
+            RoleBinding {
+                role: AdminRole::Auditor,
+                logins: vec![],
+                groups: vec!["security".into()],
+            },
         ],
         ..AdminConfig::default()
     }
@@ -270,12 +364,15 @@ impl Env {
         auth.add_token("org", subject(d, "admin@example.org", &["staff"]));
         auth.add_token("user", subject(d, "user@example.org", &["staff"]));
         auth.add_token("other", subject(other_tenant, "admin@example.org", &[]));
+        auth.add_token("operator", subject(d, "ops@example.org", &["mail-ops"]));
+        auth.add_token("auditor", subject(d, "sec@example.org", &["security"]));
         let audit = MemAudit::default();
         let stores = Stores::new();
         let admin = Admin::new(
             Deps {
                 auth: Arc::new(auth.clone()),
                 audit: Arc::new(audit.clone()),
+                audit_log: Some(Arc::new(audit.clone())),
                 modules,
                 ..stores.deps()
             },
@@ -284,11 +381,20 @@ impl Env {
         .expect("admin");
         let app_passwords = stores.app_passwords();
         let Stores {
-            meta, quota, store, ..
+            meta,
+            quota,
+            store,
+            groups,
+            delivery,
+            moderation,
+            ..
         } = stores;
         Self {
             auth,
             audit,
+            groups,
+            delivery,
+            moderation,
             meta,
             quota,
             store,
