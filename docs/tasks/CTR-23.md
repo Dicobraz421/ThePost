@@ -1,17 +1,19 @@
-# CTR-23: контракты настроек транспорта и правил потока
+# CTR-23: контракты взаимодействия: сигналы, Rpc, NodeInfo, AbuseBlocks
 
 lane: contracts
 deps: [CTR-22]
 class: B
 files: [crates/tp-contracts/src/*, crates/tp-testkit/src/*, docs/CONTRACTS.md]
-read: [docs/decisions/2026-11-01-transport-scope-external-mta.md, docs/spec/S4.md#4.1, docs/CONTRACTS.md]
+read: [docs/decisions/2026-11-01-interaction-db-ha.md, docs/spec/S2.md#2.8, docs/CONTRACTS.md]
 checks: [nextest]
 manual: no
 
 ## Сделать
-- `transport::{TransportStore, ClusterTransport, TenantTransport, AcceptedDomain, DomainKind, TrustedSource, SourceMatch, SourceKind, DestinationPolicy, FlowRule, Condition, Action, RuleMode}`.
-- `MailFlow`, `FlowInput`, `FlowOutcome`; `EventKind::TransportChanged { tenant: Option<TenantId> }`.
-- In-memory `MemTransport` в `tp-testkit`, набор `suite::transport_store`.
+- `EventKind`: `LogAppended { partition }`, `MembersChanged`, `Blocked { subject }`, `Resync`; системные виды — в `subscribe_system()`.
+- `NodeInfo { id, roles, addr }`, `Membership::live_info()`, регистрация ролей и адреса в `heartbeat`.
+- `Rpc`/`RpcHandler` (ошибки `Busy`, `Timeout`, `Unavailable`), `AbuseBlocks`.
+- Удалить `InternalChannel::Valkey`.
+- In-memory реализации в `tp-testkit`.
 
 ## Приёмка
-- Conformance-тесты: запись с устаревшей `version` — `Conflict`; снимок организации не видит данных другой; CHANGELOG в CONTRACTS.md.
+- Conformance-тесты testkit для новых трейтов; CHANGELOG в CONTRACTS.md.

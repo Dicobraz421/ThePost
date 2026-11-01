@@ -112,7 +112,7 @@
 | meta-08 | META-21, META-22, META-23, META-24 | B | contracts-10 | 3 |
 | blob-06 | BLOB-13 | A | meta-08 | 4 |
 | mailstore-07 | MS-12, MS-13 | A | mailstore-06 | 1 |
-| smtp-04 | SMTP-12, SMTP-13, SMTP-14, SMTP-15 | A | smtp-03, contracts-12 | 4 |
+| smtp-04 | SMTP-12, SMTP-13, SMTP-14, SMTP-15 | A | smtp-03, contracts-13 | 4 |
 | smtp-05 | SMTP-16, SMTP-17, SMTP-18, SMTP-19 | A | smtp-04, meta-08, mailstore-07 | 4 |
 | auth-03 | AUTH-07 | A | auth-02, meta-08 | 1 |
 | admin-02 | ADM-05, ADM-06, ADM-07 | A | admin-01, meta-08 | 3 |
@@ -124,10 +124,10 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-11 (ветка `x/contracts-11`) | CTR-22 | B | contracts-10 | 1 |
+| contracts-12 (ветка `x/contracts-12`) | CTR-23 | B | contracts-11 | 1 |
 | meta-09 | META-25 | A | meta-08 | 3 |
-| meta-10 | META-26, META-27 | A | meta-09, contracts-11 | 3 |
-| cluster-06 | CLU-09, CLU-10, CLU-11 | A | contracts-11 | 4 |
+| meta-10 | META-26, META-27 | A | meta-09, contracts-12 | 3 |
+| cluster-06 | CLU-09, CLU-10, CLU-11 | A | contracts-12 | 4 |
 | app-04 | APP-08 | A | meta-10, cluster-06 | 2 |
 | platform-07 | PLT-17 | A | platform-06 | 2 |
 | mailstore-08 | MS-14 | A | mailstore-07 | 1 |
@@ -140,11 +140,11 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-12 (ветка `x/contracts-12`) | CTR-23 | B | contracts-11 | 1 |
-| meta-11 | META-28 | A | meta-10, contracts-12 | 3 |
-| smtp-06 | SMTP-20, SMTP-21, SMTP-22, SMTP-23 | A | smtp-05, contracts-12 | 4 |
-| admin-03 | ADM-08 | A | admin-02, contracts-12 | 3 |
-| jmap-04 | JMAP-10 | A | jmap-03, contracts-12 | 3 |
+| contracts-13 (ветка `x/contracts-13`) | CTR-24 | B | contracts-12 | 1 |
+| meta-11 | META-28 | A | meta-10, contracts-13 | 3 |
+| smtp-06 | SMTP-20, SMTP-21, SMTP-22, SMTP-23 | A | smtp-05, contracts-13 | 4 |
+| admin-03 | ADM-08 | A | admin-02, contracts-13 | 3 |
+| jmap-04 | JMAP-10 | A | jmap-03, contracts-13 | 3 |
 | app-05 | APP-09 | A | meta-11, smtp-06, admin-03, jmap-04 | 2 |
 
 Выход Ф1: MVP SMB — критерии `docs/spec/APP-D.md#Д.7` для профиля SMB на стенде DEP-04.

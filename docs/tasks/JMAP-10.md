@@ -1,7 +1,7 @@
 # JMAP-10: правила потока в EmailSubmission
 
 lane: jmap
-deps: [JMAP-07, CTR-23]
+deps: [JMAP-07, CTR-24]
 class: A
 files: [crates/tp-jmap/src/*]
 read: [docs/decisions/2026-11-01-transport-scope-external-mta.md, docs/spec/S4.md#4.1, docs/CONTRACTS.md]

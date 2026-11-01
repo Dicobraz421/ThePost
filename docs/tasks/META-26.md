@@ -1,7 +1,7 @@
 # META-26: сигналы через LISTEN/NOTIFY
 
 lane: meta
-deps: [CTR-22, META-25]
+deps: [CTR-23, META-25]
 class: A
 files: [crates/tp-meta/src/*]
 read: [docs/decisions/2026-11-01-interaction-db-ha.md, docs/spec/S2.md#2.8, docs/CONTRACTS.md]

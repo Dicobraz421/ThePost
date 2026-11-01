@@ -1,7 +1,7 @@
 # META-28: хранение настроек транспорта
 
 lane: meta
-deps: [CTR-23, META-26]
+deps: [CTR-24, META-26]
 class: A
 files: [crates/tp-meta/src/*, crates/tp-meta/migrations/*]
 read: [docs/decisions/2026-11-01-transport-scope-external-mta.md, docs/spec/S4.md#4.1, docs/spec/S2.md#2.8, docs/CONTRACTS.md]

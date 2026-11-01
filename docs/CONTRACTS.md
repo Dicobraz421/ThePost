@@ -81,7 +81,7 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
 SRS 2.1. `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`. `Event { tenant, account: Option, kind }`,
 `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded`.
 Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер; решение 2026-11-01, SRS 2.8). Доставка — at-most-once;
-клиент после переподключения сверяется по `ModSeq`. Публикация — только после фиксации, вне транзакции изменения. CTR-22: `kind` дополняется
+клиент после переподключения сверяется по `ModSeq`. Публикация — только после фиксации, вне транзакции изменения. CTR-23: `kind` дополняется
 `LogAppended { partition }`, `MembersChanged`, `Blocked { subject }`, `Resync` (переполнение буфера подписчика — сверка с хранилищем);
 `subscribe_system()` получает системные виды. Valkey удаляется (CLU-09).
 
@@ -107,17 +107,17 @@ watch::Receiver<Vec<NodeId>>` (новое значение — пересчит�
 `leave(&NodeId)` — удалить (штатная остановка; отсутствующая — не ошибка), `live() -> Vec<NodeId>` — узлы с непросроченной записью,
 по возрастанию. Время — часы хранилища (PostgreSQL). `NodeId` — имя экземпляра, не пустое, без пробелов, ≤ 255 байт (строка в JSON).
 Реализация — `tp-meta` (META-16), in-memory — `tp-testkit`. Код — `membership.rs`.
-CTR-22: запись узла дополняется ролями и адресом служебного канала (`NodeInfo { id, roles, addr }`, `live_info()`); вход и выход узла
+CTR-23: запись узла дополняется ролями и адресом служебного канала (`NodeInfo { id, roles, addr }`, `live_info()`); вход и выход узла
 публикуются сигналом `MembersChanged`; `PartitionAssigner::members()` обновляется по сигналу, а не опросом.
 
 ## Rpc
-Решение 2026-11-01, SRS 2.8 (CTR-22). Запрос узел → узел: `Rpc::call(service, key, body, deadline) -> Result<Bytes>`; `service` — роль и имя
+Решение 2026-11-01, SRS 2.8 (CTR-23). Запрос узел → узел: `Rpc::call(service, key, body, deadline) -> Result<Bytes>`; `service` — роль и имя
 службы, маршрут — `live_info()` с нужной ролью, владелец ключа — rendezvous-хэширование, при отказе — следующий. Ошибки: `Busy` (параллельность
 превышена), `Timeout`, `Unavailable`. Обработчик — `RpcHandler` регистрируется ролью; матрица разрешений «роль → службы» проверяется
 на принимающем узле по сертификату вызывающего. Транспорт — HTTPS/2 с mTLS (`InternalChannel::Node`). Реализация — `tp-cluster`.
 
 ## AbuseBlocks
-Решение 2026-11-01, SRS 6.3 (CTR-22). Блокировки источников и учётных записей: `block(tenant, subject, until, reason)`,
+Решение 2026-11-01, SRS 6.3 (CTR-23). Блокировки источников и учётных записей: `block(tenant, subject, until, reason)`,
 `blocked(tenant, subject) -> Option<until>`; `subject` — IP, подсеть или учётная запись. Счётчики попыток — на узле (`tp-auth`);
 факт блокировки — в PostgreSQL (`tp-meta`) и сигнал `Blocked`.
 
@@ -199,7 +199,7 @@ SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, S3, узел ↔ у
 `InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
 
 ## Transport (Ф1)
-SRS 4.1, 2.6. Код — `transport.rs` (CTR-23). Настройки транспорта — данные в PostgreSQL; узлы держат снимок в памяти и перечитывают его
+SRS 4.1, 2.6. Код — `transport.rs` (CTR-24). Настройки транспорта — данные в PostgreSQL; узлы держат снимок в памяти и перечитывают его
 по сигналу `TransportChanged { tenant: Option<TenantId> }` (`None` — уровень кластера) и при `Resync`.
 `TransportStore`: `cluster() -> ClusterTransport { version, domains: Vec<AcceptedDomain { id: DomainId, tenant, name, kind: DomainKind::{
 Authoritative, InternalRelay { next_hop } } }>, sources: Vec<TrustedSource { name, matcher: SourceMatch::{ Networks(Vec<IpNet>),
@@ -284,6 +284,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-10-31 — CTR-19 (x/contracts-08): `acl::{AclStore, AclEntry, SharedMailbox, SendDelegation, ANYONE, validate_identifier, effective_rights}`
   — ACL папок и делегирование отправки (META-11) за контрактом; реализации — `PgMeta`, `tp_testkit::MemAcl`, набор `suite::acl_store`.
 - 2026-11-01 — решение «Взаимодействие компонентов и требования к СУБД»: сигналы через PostgreSQL LISTEN/NOTIFY, `Rpc`, `AbuseBlocks`,
-  `NodeInfo`; канал и шина Valkey удаляются (реализация — CTR-22, CLU-09).
+  `NodeInfo`; канал и шина Valkey удаляются (реализация — CTR-23, CLU-09).
 - 2026-11-01 — решение «Состав функций транспорта и внешний MTA»: `transport::{TransportStore, MailFlow}`, `EventKind::TransportChanged`
-  (реализация — CTR-23).
+  (реализация — CTR-24).

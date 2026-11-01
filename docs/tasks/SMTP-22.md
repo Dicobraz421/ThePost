@@ -1,7 +1,7 @@
 # SMTP-22: правила потока почты
 
 lane: smtp
-deps: [CTR-23, SMTP-05, SMTP-16, SMTP-17]
+deps: [CTR-24, SMTP-05, SMTP-16, SMTP-17]
 class: A
 files: [crates/tp-smtp/src/*]
 read: [docs/decisions/2026-11-01-transport-scope-external-mta.md, docs/spec/S4.md#4.1, docs/spec/S4.md#4.5, docs/CONTRACTS.md]

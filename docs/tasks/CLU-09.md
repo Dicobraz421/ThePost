@@ -1,7 +1,7 @@
 # CLU-09: удалить шину Valkey
 
 lane: cluster
-deps: [CTR-22]
+deps: [CTR-23]
 class: A
 files: [crates/tp-cluster/*, docs/DEV.md]
 read: [docs/decisions/2026-11-01-interaction-db-ha.md]

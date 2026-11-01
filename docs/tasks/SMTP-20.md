@@ -1,7 +1,7 @@
 # SMTP-20: доверенные источники: шлюз и приложения
 
 lane: smtp
-deps: [CTR-23, SMTP-12, SMTP-04]
+deps: [CTR-24, SMTP-12, SMTP-04]
 class: A
 files: [crates/tp-smtp/src/*]
 read: [docs/decisions/2026-11-01-transport-scope-external-mta.md, docs/spec/S4.md#4.1, docs/spec/S2.md#2.6]

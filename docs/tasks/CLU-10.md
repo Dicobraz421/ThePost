@@ -1,7 +1,7 @@
 # CLU-10: состав кластера и разделы по сигналу
 
 lane: cluster
-deps: [CTR-22]
+deps: [CTR-23]
 class: A
 files: [crates/tp-cluster/src/*]
 read: [docs/decisions/2026-11-01-interaction-db-ha.md, docs/spec/S2.md#2.8]

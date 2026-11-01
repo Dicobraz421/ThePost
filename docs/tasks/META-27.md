@@ -1,7 +1,7 @@
 # META-27: состав кластера с ролями и блокировки
 
 lane: meta
-deps: [CTR-22, META-16]
+deps: [CTR-23, META-16]
 class: A
 files: [crates/tp-meta/src/*, crates/tp-meta/migrations/*]
 read: [docs/decisions/2026-11-01-interaction-db-ha.md, docs/spec/S2.md#2.8, docs/spec/S6.md#6.3, docs/CONTRACTS.md]
