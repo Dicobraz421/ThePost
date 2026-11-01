@@ -121,6 +121,8 @@ pub struct BlobSection {
     pub gc: GcConfig,
     /// Поиск «сирот» (роль maintenance) — секция `tp-blob`.
     pub orphans: OrphanConfig,
+    /// Сжатие объектов писем zstd при записи (BLOB-13, MS-15) — секция `tp-blob`.
+    pub compression: tp_blob::CompressionConfig,
 }
 
 /// Где лежат объекты: разобранный `blob.url`.
@@ -372,7 +374,7 @@ impl AuthSection {
 pub struct HttpSection {
     /// JMAP (`/.well-known/jmap`, `/jmap/*`).
     pub jmap: Option<HttpListener>,
-    /// Admin API (`/api/*`); адрес — внутренний.
+    /// Admin API (`/api/*`); адрес — только внутренний (loopback, частные сети).
     pub admin: Option<HttpListener>,
 }
 
@@ -405,10 +407,18 @@ impl Default for HttpListener {
 }
 
 impl HttpListener {
-    /// Параметры сервера HTTP платформы (`tp_platform::service_http::serve`).
-    pub fn server(&self) -> ServiceHttpConfig {
+    /// Параметры сервера HTTP платформы (`tp_platform::service_http::serve`). `public` — роль для клиентов
+    /// (jmap): адрес слушателя разрешён явно; иначе (admin) — только внутренние адреса, как у служебного HTTP.
+    pub fn server(&self, public: bool) -> ServiceHttpConfig {
+        let ip = self.listen.ip();
+        let prefix = if ip.is_ipv4() { 32 } else { 128 };
         ServiceHttpConfig {
             listen: self.listen,
+            internal_networks: if public {
+                vec![tp_platform::Cidr::new(ip, prefix)]
+            } else {
+                Vec::new()
+            },
             allow_plaintext: self.allow_plaintext,
             handshake_timeout: self.handshake_timeout,
             max_handshakes: self.max_handshakes,
@@ -417,11 +427,11 @@ impl HttpListener {
 }
 
 impl HttpSection {
-    /// Проверка: открытый HTTP — только в dev, ненулевые таймауты.
+    /// Проверка: открытый HTTP — только в dev, ненулевые таймауты, Admin API — только на внутреннем адресе.
     pub fn check(&self, profile: Profile) -> Result<()> {
-        for (name, l) in [("jmap", &self.jmap), ("admin", &self.admin)] {
+        for (name, l, public) in [("jmap", &self.jmap, true), ("admin", &self.admin, false)] {
             if let Some(l) = l {
-                l.server().check(profile).map_err(|e| sub(name, e))?;
+                l.server(public).check(profile).map_err(|e| sub(name, e))?;
             }
         }
         Ok(())

@@ -122,7 +122,16 @@ impl Services {
         let tenant = TenantId::DEFAULT;
         let profile = cfg.profile();
         let hooks = ext.decision_hooks();
-        let store: Arc<dyn MailStore> = Arc::new(tp_mailstore::Store::with_config(
+        // Запись — со сжатием по `blob.compression`; чтение распаковывает само хранилище (MS-15): остальным
+        // (jmap upload/download) — `blob` без обёртки `Decompressing`.
+        let writer = tp_blob::WriterConfig {
+            compression: cfg
+                .section::<crate::sections::BlobSection>(crate::sections::BLOB)?
+                .compression
+                .clone(),
+            ..tp_blob::WriterConfig::default()
+        };
+        let store: Arc<dyn MailStore> = Arc::new(tp_mailstore::Store::with_writer(
             tp_mailstore::Deps {
                 blobs: blob.clone(),
                 index: Arc::new(meta.clone()),
@@ -134,6 +143,7 @@ impl Services {
                 hooks: hooks.clone(),
             },
             (*cfg.section::<tp_mailstore::Config>(MAILSTORE)?).clone(),
+            writer,
         ));
 
         // Вход: пароль приложения или каталога, Bearer OIDC, Kerberos; права — ACL папок.
@@ -320,6 +330,8 @@ impl Services {
             search: self.search.clone(),
             changes: Arc::new(self.meta.clone()),
             bus: self.bus.clone(),
+            trash: Arc::new(self.meta.clone()),
+            hooks: self.hooks.clone(),
         }
     }
 
@@ -340,6 +352,8 @@ impl Services {
             outbound: Some(Arc::new(JmapOutbound(self.queue.clone()))),
             hooks: self.hooks.clone(),
             capabilities: ext.jmap_capabilities().to_vec(),
+            trash: Arc::new(self.meta.clone()),
+            policies: Arc::new(self.meta.clone()),
         };
         tp_jmap::Jmap::new(deps, cfg).map_err(|e| infra::context("jmap", e))
     }
@@ -349,6 +363,11 @@ impl Services {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
             audit: Arc::new(tp_admin::LogAudit),
+            // TODO(ADM-05): чтение журнала аудита — нет реализации `AuditLog` поверх `audit_log` (META-22).
+            audit_log: None,
+            delivery: Arc::new(self.meta.clone()),
+            groups: Arc::new(self.meta.clone()),
+            moderation: Arc::new(NoModeration),
             modules: ext.admin_routes().to_vec(),
             accounts: Arc::new(self.meta.clone()),
             quota: Arc::new(self.meta.clone()),
@@ -440,6 +459,32 @@ impl tp_admin::PolicyStore for PgPolicies {
         self.0
             .set_policy(tenant, policy_target(target), policy)
             .await
+    }
+}
+
+/// Решения модерации групп: доставки одобренного письма участникам и DSN отказа в сборке ещё нет.
+struct NoModeration;
+
+const NO_MODERATION: &str = "модерация групп рассылки: доставка решений ещё не подключена";
+
+#[async_trait]
+impl tp_admin::groups::Moderation for NoModeration {
+    async fn deliver(
+        &self,
+        _tenant: TenantId,
+        _group: &tp_contracts::groups::DistributionGroup,
+        _message: &tp_contracts::groups::HeldMessage,
+    ) -> Result<()> {
+        Err(Error::Internal(NO_MODERATION.to_owned()))
+    }
+
+    async fn reject(
+        &self,
+        _tenant: TenantId,
+        _message: &tp_contracts::groups::HeldMessage,
+        _reason: &str,
+    ) -> Result<()> {
+        Err(Error::Internal(NO_MODERATION.to_owned()))
     }
 }
 

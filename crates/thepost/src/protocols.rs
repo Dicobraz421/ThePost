@@ -271,7 +271,7 @@ impl RoleService for HttpRole {
         let Some(listener) = &self.listener else {
             return idle(self.name(), &ctx).await;
         };
-        let server = listener.server();
+        let server = listener.server(self.role != Role::Admin);
         let tcp = service_http::bind(&server)
             .map_err(|e| crate::infra::context(&format!("http.{}", self.name()), e))?;
         if let Ok(addr) = tcp.local_addr() {
