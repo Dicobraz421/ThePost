@@ -65,11 +65,11 @@
 <rect x="510" y="118" width="176" height="52" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.6"/>
 <text x="598.0" y="134" font-size="13" text-anchor="middle" fill="#1A1A1A" font-weight="bold">smtp-in</text>
 <text x="598.0" y="149" font-size="10.5" text-anchor="middle" fill="#262626">25 · SPF, DKIM, DMARC, ARC</text>
-<text x="598.0" y="163" font-size="9.5" text-anchor="middle" fill="#262626">Milter, правила, Sieve, доставка</text>
+<text x="598.0" y="163" font-size="10.5" text-anchor="middle" fill="#262626">Milter, Sieve, доставка</text>
 <rect x="510" y="176" width="176" height="50" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.6"/>
 <text x="598.0" y="192" font-size="13" text-anchor="middle" fill="#1A1A1A" font-weight="bold">submission</text>
 <text x="598.0" y="207" font-size="10.5" text-anchor="middle" fill="#262626">587 / 465 · SASL</text>
-<text x="598.0" y="220" font-size="10.5" text-anchor="middle" fill="#262626">лимит частоты, правила</text>
+<text x="598.0" y="220" font-size="10.5" text-anchor="middle" fill="#262626">лимит частоты отправки</text>
 <rect x="698" y="118" width="176" height="108" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.6"/>
 <text x="786.0" y="138" font-size="14" font-weight="bold" text-anchor="middle" fill="#1A1A1A">smtp-out</text>
 <text x="786.0" y="155" font-size="11" text-anchor="middle" fill="#262626">очередь (в PostgreSQL)</text>
@@ -92,8 +92,8 @@
 <text x="786.0" y="307" font-size="11" text-anchor="middle" fill="#262626">VTODO — транспорт</text>
 <rect x="886" y="240" width="176" height="108" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.6"/>
 <text x="974.0" y="260" font-size="14" font-weight="bold" text-anchor="middle" fill="#1A1A1A">admin</text>
-<text x="974.0" y="277" font-size="11" text-anchor="middle" fill="#262626">REST API (OpenAPI)</text>
-<text x="974.0" y="292" font-size="11" text-anchor="middle" fill="#262626">экспорт/импорт ящиков</text>
+<text x="974.0" y="277" font-size="11" text-anchor="middle" fill="#262626">REST API (OpenAPI), экспорт</text>
+<text x="974.0" y="292" font-size="11" text-anchor="middle" fill="#262626">CLI, веб-консоль (Refine)</text>
 <text x="974.0" y="307" font-size="11" text-anchor="middle" fill="#262626">операции модулей</text>
 <rect x="510" y="362" width="176" height="108" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.6"/>
 <text x="598.0" y="382" font-size="14" font-weight="bold" text-anchor="middle" fill="#1A1A1A">search</text>
@@ -246,6 +246,6 @@
 <rect x="20" y="1080" width="1560" height="112" rx="6" fill="#DCE9F5" stroke="#2E75B6" stroke-width="1.6" stroke-dasharray="6 4"/>
 <text x="36" y="1102" font-size="12" text-anchor="start" fill="#1F4E79" font-weight="bold">ДОПОЛНИТЕЛЬНЫЕ МОДУЛИ — открытый код, включаются в config.yaml (modules.&lt;имя&gt;), подключаются только через точки расширения ядра</text>
 <text x="36" y="1126" font-size="11.5" text-anchor="start" fill="#262626">Мультитенантность · Соответствие требованиям (политики хранения, Legal Hold, журналирование, eDiscovery) · Шардирование и перенос ящиков · Миграция бэкенда без остановки</text>
-<text x="36" y="1148" font-size="11.5" text-anchor="start" fill="#262626">Межсайтовый DR · Развёртывание (графический редактор топологии → Ansible / Helm) · Веб-клиент (JMAP, SAML) · Миграция с внешних систем (EWS, PST, IMAP)</text>
-<text x="36" y="1170" font-size="11.5" text-anchor="start" fill="#262626">Генератор нагрузки · ГОСТ-TLS · Правила потока почты (дисклеймеры, блокировка, модерация, копии)</text>
+<text x="36" y="1148" font-size="11.5" text-anchor="start" fill="#262626">Геораспределение · Развёртывание (графический редактор топологии → Ansible / Helm) · Веб-клиент (JMAP, SAML) · Миграция с внешних систем (EWS, PST, IMAP)</text>
+<text x="36" y="1170" font-size="11.5" text-anchor="start" fill="#262626">Генератор нагрузки · ГОСТ-TLS · Правила потока почты (дисклеймеры, блокировка, модерация, копии) · Коннектор событий</text>
 </svg>

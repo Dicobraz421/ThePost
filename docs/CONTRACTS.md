@@ -53,6 +53,11 @@ SRS 3.4. Учёт объектов в метаданных. Реализация
 
 ## Metadata
 SRS 3.1, 3.6. Все операции ящика принимают `AccountScope { tenant, account }`; без связей между ящиками.
+Шарды (решение 2026-11-01-scale-shards-geo-admin): все хранилища ящика получают пул через `ShardResolver::pool_for(scope, intent)` (`tp-meta`);
+один шард — вырожденный случай без запроса к справочнику. `ReadIntent::{ Primary, Stale }`: `Stale` — только закрытый список фоновых чтений
+(экспорт, отчёты, eDiscovery, verify, «сироты», первичная индексация), реплика шарда при отставании не больше порога, иначе primary;
+реализации для фоновых ролей собираются с `Stale` (`PgMeta::with_intent`), контракты трейтов не меняются.
+CTR-25: раздел журнала событий — `Partition { shard, index }`; разделы перечисляются по всем шардам справочника.
 `ModSeq` выдаётся из одного счётчика учётной записи: монотонен в папке (CONDSTORE) и в учётной записи (состояние JMAP).
 - `AccountStore`: `get`, `by_login`, `upsert` (из LDAP), `quota`.
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
@@ -117,7 +122,8 @@ watch::Receiver<Vec<NodeId>>` (новое значение — пересчит�
 `leave(&NodeId)` — удалить (штатная остановка; отсутствующая — не ошибка), `live() -> Vec<NodeId>` — узлы с непросроченной записью,
 по возрастанию. Время — часы хранилища (PostgreSQL). `NodeId` — имя экземпляра, не пустое, без пробелов, ≤ 255 байт (строка в JSON).
 Реализация — `tp-meta` (META-16), in-memory — `tp-testkit`. Код — `membership.rs`.
-CTR-23: запись узла дополняется ролями и адресом служебного канала (`NodeInfo { id, roles, addr }`, `live_info()`); вход и выход узла
+CTR-23: запись узла дополняется ролями, адресом служебного канала и площадкой (`NodeInfo { id, roles, addr, site }`, `live_info()`;
+`site` — из конфигурации узла, по умолчанию `default`); вход и выход узла
 публикуются сигналом `MembersChanged`; `PartitionAssigner::members()` обновляется по сигналу, а не опросом.
 
 ## Rpc
@@ -259,15 +265,13 @@ SRS 4.1, 2.6. Код — `transport.rs` (CTR-24). Настройки транс�
 Authoritative, InternalRelay { next_hop } } }>, sources: Vec<TrustedSource { name, matcher: SourceMatch::{ Networks(Vec<IpNet>),
 ClientCert { subject } }, kind: SourceKind::{ Gateway { xclient, authserv_id: Option<String> }, Application { senders: Vec<AddressPattern>,
 external: bool } } }> }` — для выбора организации и источника до аутентификации; `tenant(tenant) -> TenantTransport { version,
-routes: Vec<DestinationPolicy { pattern ("*" — все внешние), tls: TlsRequirement, smart_host?, egress_ip? }>, rules: Vec<FlowRule> }`.
+routes: Vec<DestinationPolicy { pattern ("*" — все внешние), tls: TlsRequirement, smart_host?, egress_ip? }> }`.
 Запись — `put_*`/`delete_*` с проверкой `version` (устаревшая — `Conflict`), публикация сигнала — после фиксации.
-`FlowRule { id, priority, enabled, mode: RuleMode::{ Enforce, Audit }, conditions: Vec<Condition>, exceptions: Vec<Condition>,
-actions: Vec<Action>, stop: bool }`; `Condition` — отправитель или получатель (адрес, домен, группа, `Internal`/`External`), заголовок,
-тема и текст (слова, регулярное выражение), вложение (тип, имя, размер), размер письма; `Action::{ Reject { text }, Drop, AddHeader,
-RemoveHeader, PrependSubject, Disclaimer { text, html }, Copy(address), Redirect(address), Moderate, Route(pattern) }`.
-`MailFlow` (реализация — `tp-smtp`): `apply(&FlowInput { tenant, direction: Inbound | Submission, envelope, message: BlobRef })
--> FlowOutcome { verdict: Accept | Reject(text) | Drop | Moderate, envelope, message: Option<BlobRef>, route?, matched: Vec<RuleId> }`
-— один раз на письмо, до `DecisionHooks`; изменённое тело — новый объект BLOB (ссылку учитывает вызывающий); `Audit` — только `matched`.
+`MailFlow` — точка расширения правил потока почты (реализация — модуль «Правила потока почты», `Registry::set_mail_flow`; без модуля
+не вызывается): `apply(&FlowInput { tenant, direction: Inbound | Submission, envelope, message: BlobRef }) -> FlowOutcome { verdict:
+Accept | Reject(text) | Drop | Moderate, envelope, message: Option<BlobRef>, route?, matched: Vec<String> }` — один раз на письмо
+(smtp-in после Milter, submission, JMAP EmailSubmission), до `DecisionHooks`; изменённое тело — новый объект BLOB (ссылку учитывает
+вызывающий); `route` — шаблон политики домена назначения. Правила, их хранение (схема `mod_mailflow`) и Admin API — модуль.
 
 ## Queue (Ф1)
 SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организаций; время передаёт вызывающий):
@@ -361,6 +365,8 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `NodeInfo`; канал и шина Valkey удаляются (реализация — CTR-23, CLU-09).
 - 2026-11-01 — решение «Состав функций транспорта и внешний MTA»: `transport::{TransportStore, MailFlow}`, `EventKind::TransportChanged`
   (реализация — CTR-24).
+- 2026-11-01 — решение «Масштабирование, шарды, геораспределение»: `NodeInfo::site` (CTR-23), `Partition { shard, index }` (CTR-25),
+  `ReadIntent` (tp-meta); `MailFlow` — точка расширения модуля, `FlowRule` и хранение правил — в модуле.
 - 2026-11-01 — CTR-26 (x/contracts-14, решение 2026-11-01-trash-purge): `retention::{TrashPurge, TrashPurgeRule, TrashPurgeSetting,
   PurgeOutcome}`, `TrashStore::purge`/`list_hidden` (скрытые письма; `list` — без них, `restore`/`defer`/`expired` — и для скрытых),
   `Policy::trash_purge`, `PolicyResolver::trash_purge`/`set_user_trash_purge`; квота без скрытых. In-memory — `MemPolicies`,
