@@ -45,6 +45,9 @@ use crate::session::{Session, Transport};
 /// Начало письма, в котором ищется конец заголовка, байт.
 const HEAD_PROBE: u64 = 64 * 1024;
 
+/// Элементы `BINARY[…]<origin>` ответа: номер элемента и начало диапазона (imap-types его не хранит).
+type Origins = Vec<(usize, u32)>;
+
 /// Ошибка выборки одного письма, прерывающая команду.
 enum Fail {
     /// `NO [UNKNOWN-CTE]`.
@@ -689,8 +692,9 @@ impl<T: Transport> Session<T> {
                     Err(Fail::Store(e)) => return Err(e),
                 };
                 let seq = proto::nz(u32::try_from(i + 1).unwrap_or(u32::MAX));
+                let (data, origins) = data;
                 if let Ok(items) = Vec1::try_from(data) {
-                    self.fetch_data(seq, items, &[]);
+                    self.fetch_data(seq, items, &origins);
                 }
                 self.maybe_flush().await?;
             }
@@ -706,12 +710,13 @@ impl<T: Transport> Session<T> {
         msg: &Message,
         items: &[MessageDataItemName<'static>],
         seen_changed: bool,
-    ) -> std::result::Result<Vec<MessageDataItem<'static>>, Fail> {
+    ) -> std::result::Result<(Vec<MessageDataItem<'static>>, Origins), Fail> {
         let scope = self.scope().ok_or(Error::Forbidden)?;
         let store = &self.ctx.deps.store;
         let rev2 = self.rev2;
         let mut raw: Option<Vec<u8>> = None;
         let mut out = Vec::new();
+        let mut origins = Origins::new();
         // Полное письмо загружается один раз, если нужно хотя бы одному элементу.
         macro_rules! raw {
             () => {{
@@ -828,6 +833,9 @@ impl<T: Transport> Session<T> {
                     } else {
                         NString8::NString(nstring_bytes(data))
                     };
+                    if let Some((origin, _)) = p {
+                        origins.push((out.len(), *origin));
+                    }
                     out.push(MessageDataItem::Binary {
                         section: section.clone(),
                         value,
@@ -846,7 +854,7 @@ impl<T: Transport> Session<T> {
         if seen_changed && !flags_done {
             out.push(MessageDataItem::Flags(imap_flags(&msg.flags)));
         }
-        Ok(out)
+        Ok((out, origins))
     }
 
     /// Заголовок письма: из начала письма, если конец заголовка в нём, иначе из полного письма.
