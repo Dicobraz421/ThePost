@@ -180,7 +180,7 @@ pub fn changes_response(
     old_state: &str,
     changes: &Changes<String>,
 ) -> Map<String, Value> {
-    let v = json!({
+    object(json!({
         "accountId": account_id,
         "oldState": old_state,
         "newState": state_string(changes.new_state),
@@ -188,11 +188,7 @@ pub fn changes_response(
         "created": changes.created,
         "updated": changes.updated,
         "destroyed": changes.destroyed,
-    });
-    match v {
-        Value::Object(m) => m,
-        _ => Map::new(),
-    }
+    }))
 }
 
 /// Аргументы `/query` (общая часть).
@@ -249,6 +245,25 @@ pub fn apply_window(
     Ok(())
 }
 
+/// Критерий сортировки `/query`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Comparator {
+    /// Свойство.
+    pub property: String,
+    /// По возрастанию (по умолчанию).
+    #[serde(default = "yes")]
+    pub is_ascending: bool,
+    /// Алгоритм сравнения строк (поддерживается сравнение без учёта регистра).
+    pub collation: Option<String>,
+    /// Ключевое слово для `hasKeyword` и подобных.
+    pub keyword: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
 /// Аргументы `/queryChanges` (общая часть).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,11 +295,8 @@ pub fn query_changes_response(
     changes: &Changes<String>,
     limit: usize,
 ) -> MethodResult<Map<String, Value>> {
-    if changes.has_more {
-        return Err(MethodError::new("cannotCalculateChanges"));
-    }
     let total = changes.created.len() + changes.updated.len() + changes.destroyed.len();
-    if total > limit {
+    if changes.has_more || total > limit {
         return Err(MethodError::new("tooManyChanges"));
     }
     let touched: HashSet<&String> = changes.created.iter().chain(&changes.updated).collect();

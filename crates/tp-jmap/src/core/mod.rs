@@ -116,6 +116,13 @@ impl Ctx<'_> {
         }
     }
 
+    /// Идентификатор из аргумента: `#cid` — объект, созданный ранее в этом запросе (RFC 8620 §5.3).
+    pub fn resolve_id<'b>(&'b self, id: &'b str) -> &'b str {
+        id.strip_prefix('#')
+            .and_then(|cid| self.created.get(cid))
+            .map_or(id, String::as_str)
+    }
+
     /// Текущее состояние учётной записи.
     pub async fn state(&self) -> MethodResult<ModSeq> {
         Ok(self.jmap.state(self.scope).await?)
@@ -383,6 +390,16 @@ impl Jmap {
         }
         Ok(out)
     }
+}
+
+/// Идентификатор цепочки письма (`threadId`): по ключу цепочки из метаданных; письмо без ключа — своя цепочка.
+pub(crate) fn thread_id(m: &Message) -> String {
+    let key = if m.meta.thread_key.is_empty() {
+        format!("id:{}", m.id)
+    } else {
+        m.meta.thread_key.clone()
+    };
+    format!("T{}", digest(key.as_bytes()))
 }
 
 /// Первые 12 байт SHA-256 в hex.

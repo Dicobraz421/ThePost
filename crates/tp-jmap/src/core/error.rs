@@ -122,6 +122,14 @@ impl From<Error> for MethodError {
     }
 }
 
+/// Ошибка журнала изменений: устаревшее или чужое состояние (`Conflict`) — `cannotCalculateChanges`.
+pub fn changes_error(e: Error) -> MethodError {
+    match e {
+        Error::Conflict => MethodError::new("cannotCalculateChanges"),
+        e => e.into(),
+    }
+}
+
 /// Результат метода.
 pub type MethodResult<T> = std::result::Result<T, MethodError>;
 
