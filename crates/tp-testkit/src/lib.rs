@@ -4,6 +4,7 @@
 //! тесты таймаутов используют [`ManualClock`]. Фейки Ф1 для протокольных полос — [`fakes`]. Общие наборы тестов контрактов — [`suite`].
 
 pub mod acl;
+pub mod app_passwords;
 pub mod blob;
 pub mod corpus;
 pub mod fakes;
@@ -14,6 +15,7 @@ pub mod secrets;
 pub mod suite;
 
 pub use acl::MemAcl;
+pub use app_passwords::MemAppPasswords;
 pub use blob::{BlobOp, MemBlobIndex, MemBlobStore};
 pub use corpus::{LoadModel, SyntheticMail, corpus, pg_schema, pg_url};
 pub use fakes::{

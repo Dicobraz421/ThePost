@@ -144,6 +144,11 @@ ACL (код — `acl.rs`, SRS 4.5, RFC 4314): `AclStore` — данные `Autho
 `shared_mailboxes(tenant, identifiers) -> Vec<SharedMailbox { account, mailbox, rights }>` — папки с правом `l`, по (`account`, `mailbox`).
 Делегирование: `send_delegations(owner) -> Vec<SendDelegation { delegate, right }>`, `set_send_delegation(owner, delegate, Option<SendRight>)`
 (`None` — отзыв; нет учётной записи — `NotFound`), `send_right_of(owner, identifiers) -> Option<SendRight>` — сильнейшее (Send As), без `anyone`.
+Пароли приложений (код — `app_password.rs`): `AppPasswordStore` — хранилище для `tp-auth` (выпуск, проверка argon2id и предел — там);
+`AppPassword { id, label, hash, created_at, revoked_at: Option<_> }` (хэш — PHC-строка, скрыт в `Debug`; `validate()`: id 1–64 байт без пробелов
+и управляющих, label ≤ 255 символов без управляющих, hash непустой → `Invalid`). `list(scope)` — включая отозванные, по (`created_at`, `id`);
+`insert(scope, AppPassword)` — нет учётной записи — `NotFound`, занятый id — `Conflict`; `revoke(scope, id, at)` — нет — `NotFound`,
+повторный отзыв сохраняет первый момент.
 
 ## Roles
 SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`; пресеты (`all`, `edge`, `transport`, `access`, `backend`, `mailbox`) раскрываются в набор ролей при загрузке конфигурации; режим edge — параметр smtp-in (SRS 2.6).
@@ -251,3 +256,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-10-31 — CTR-20 (решение 2026-10-31-atomic-delivery): `MessageStore::insert_batch` — все доставки приёма одной транзакцией.
 - 2026-10-31 — CTR-19 (x/contracts-08): `acl::{AclStore, AclEntry, SharedMailbox, SendDelegation, ANYONE, validate_identifier, effective_rights}`
   — ACL папок и делегирование отправки (META-11) за контрактом; реализации — `PgMeta`, `tp_testkit::MemAcl`, набор `suite::acl_store`.
+- 2026-11-01 — CTR-21 (x/contracts-10): `app_password::{AppPasswordStore, AppPassword}` вместо временного трейта `tp-auth` (AUTH-02);
+  реализации — `PgMeta` (миграция `0009_app_passwords`), `tp_testkit::MemAppPasswords`, набор `suite::app_password_store`.
