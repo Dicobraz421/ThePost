@@ -139,7 +139,7 @@ expression: meta
                 "language": [],
                 "location": null,
                 "size": 267,
-                "lines": 0,
+                "lines": 9,
                 "children": [
                   {
                     "part": "2.2.1",
