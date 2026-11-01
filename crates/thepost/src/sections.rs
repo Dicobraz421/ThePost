@@ -470,6 +470,14 @@ pub struct DoctorSection {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub blob_timeout: Duration,
+    /// Предел ожидания каждого запроса DNS (MX, SPF, DKIM, DMARC, MTA-STS, PTR).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub dns_timeout: Duration,
+    /// Сертификату `tls` осталось действовать меньше — предупреждение.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub cert_warn_before: Duration,
 }
 
 impl Default for DoctorSection {
@@ -478,6 +486,8 @@ impl Default for DoctorSection {
             warn_clock_skew: Duration::from_millis(500),
             max_clock_skew: Duration::from_secs(5),
             blob_timeout: Duration::from_secs(10),
+            dns_timeout: Duration::from_secs(5),
+            cert_warn_before: Duration::from_secs(21 * 86_400),
         }
     }
 }

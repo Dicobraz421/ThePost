@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod doctor;
+pub mod doctor_dns;
 pub mod infra;
 pub mod metrics;
 pub mod modules;

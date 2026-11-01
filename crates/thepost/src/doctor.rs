@@ -1,6 +1,7 @@
 //! `thepost doctor [--json]` (SRS 5.5, 3.1; APP-02): проверки окружения узла — конфигурация, хранилище секретов,
 //! СУБД (проверки `tp-meta`), BLOB (запись, чтение и удаление пробного объекта), синхронизация часов узла и СУБД,
-//! минимальные привилегии процесса (PLT-16): учётная запись, capabilities, no_new_privs, seccomp, Landlock.
+//! минимальные привилегии процесса (PLT-16): учётная запись, capabilities, no_new_privs, seccomp, Landlock;
+//! DNS почтового домена (MX, SPF, DKIM, DMARC, MTA-STS, PTR), сертификаты и PROXY v2 — `doctor_dns` (APP-06).
 //!
 //! Вывод — таблица или JSON; код возврата ≠ 0, если хотя бы одна проверка не пройдена (`fail`).
 
@@ -18,6 +19,7 @@ use tp_contracts::{Error, Result};
 use tp_meta::MetaConfig;
 use tp_platform::Config;
 
+use crate::doctor_dns::{self, Dns};
 use crate::infra;
 use crate::secrets;
 use crate::sections::{self, DOCTOR, DoctorSection};
@@ -95,7 +97,7 @@ pub struct Report {
 }
 
 impl Report {
-    fn push(
+    pub(crate) fn push(
         &mut self,
         id: &str,
         status: Status,
@@ -179,6 +181,15 @@ fn message(e: &Error) -> String {
 
 /// Проверки окружения по config.yaml `path`; `store` — хранилище секретов (`None` — не настроено).
 pub async fn run(path: &Path, store: Option<Arc<dyn SecretStore>>) -> Report {
+    run_with(path, store, None).await
+}
+
+/// То же с резолвером DNS `dns` (`None` — системный).
+pub async fn run_with(
+    path: &Path,
+    store: Option<Arc<dyn SecretStore>>,
+    dns: Option<&dyn Dns>,
+) -> Report {
     let mut report = Report::default();
     let loaded = sections::registry().and_then(|r| r.load(path));
     let cfg = match loaded {
@@ -202,12 +213,17 @@ pub async fn run(path: &Path, store: Option<Arc<dyn SecretStore>>) -> Report {
     for w in cfg.warnings() {
         report.push("config.unknown", Status::Warn, "", w.clone());
     }
-    check(&cfg, store, &mut report).await;
+    check(&cfg, store, dns, &mut report).await;
     report
 }
 
-/// Проверки по разобранной конфигурации.
-pub async fn check(cfg: &Config, store: Option<Arc<dyn SecretStore>>, report: &mut Report) {
+/// Проверки по разобранной конфигурации; `dns` — резолвер (`None` — системный).
+pub async fn check(
+    cfg: &Config,
+    store: Option<Arc<dyn SecretStore>>,
+    dns: Option<&dyn Dns>,
+    report: &mut Report,
+) {
     let doctor = cfg
         .section::<DoctorSection>(DOCTOR)
         .map(|d| (*d).clone())
@@ -263,6 +279,7 @@ pub async fn check(cfg: &Config, store: Option<Arc<dyn SecretStore>>, report: &m
             "хранилище секретов не настроено",
         ),
     }
+    doctor_dns::check_with(cfg, dns, &doctor, report).await;
 }
 
 fn blob_kind(cfg: &Config) -> String {
@@ -459,7 +476,7 @@ mod tests {
     async fn bad_config_fails_with_exit_code() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_config(dir.path(), "domain: example.org\n");
-        let report = run(&path, None).await;
+        let report = run_with(&path, None, Some(&crate::doctor_dns::MockDns::default())).await;
         assert_eq!(
             report.get("config.load").map(|c| c.status),
             Some(Status::Fail)
@@ -481,7 +498,7 @@ mod tests {
                 blob.display().to_string().replace('\\', "/")
             ),
         );
-        let report = run(&path, None).await;
+        let report = run_with(&path, None, Some(&crate::doctor_dns::MockDns::default())).await;
         assert_eq!(
             report.get("secrets.refs").map(|c| c.status),
             Some(Status::Fail)
@@ -509,7 +526,7 @@ mod tests {
                 blob.display().to_string().replace('\\', "/")
             ),
         );
-        let report = run(&path, None).await;
+        let report = run_with(&path, None, Some(&crate::doctor_dns::MockDns::default())).await;
         assert_eq!(
             report.get("database.connect").map(|c| c.status),
             Some(Status::Fail)
@@ -540,7 +557,7 @@ mod tests {
                 blob.display().to_string().replace('\\', "/")
             ),
         );
-        let report = run(&path, None).await;
+        let report = run_with(&path, None, Some(&crate::doctor_dns::MockDns::default())).await;
         assert_eq!(
             report.get("database.connect").map(|c| c.status),
             Some(Status::Ok),
