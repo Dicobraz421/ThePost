@@ -3,6 +3,8 @@
 //! [`Store`] реализует контракт [`MailStore`] (CONTRACTS.md#MailStore) поверх [`BlobStore`], [`BlobIndex`],
 //! [`MessageStore`] и [`ChangeLog`]: письмо хранится как объект-скелет и объекты частей ([`split`]),
 //! части дедуплицируются в пределах организации, объекты загружаются вне транзакций БД (SRS 3.4).
+//! Объекты пишет [`BlobWriter`] (сжатие zstd по правилам BLOB-13, хэш и дедупликация — по исходному
+//! содержимому), читает [`Decompressing`] (распаковка по признаку учёта) — MS-15.
 //! Изменяющие операции после фиксации публикуют `MailboxChanged` в [`EventBus`]; ошибка публикации
 //! не отменяет операцию (шина at-most-once, клиенты сверяются по `ModSeq`). Корзина и истечение её срока — [`trash`].
 
@@ -15,6 +17,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use time::OffsetDateTime;
+use tp_blob::{BlobWriter, Decompressing, WriterConfig, WriterMetrics};
 use tp_contracts::blob::{BlobIndex, BlobStore, ByteStream};
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::ext::DecisionHooks;
@@ -69,7 +72,8 @@ pub struct Config {
 /// Зависимости [`Store`]: реализации контрактов, выбранные приложением.
 #[derive(Clone)]
 pub struct Deps {
-    /// Объекты BLOB.
+    /// Объекты BLOB без распаковки (кэш или источник): хранилище само сжимает объекты при записи и
+    /// распаковывает при чтении, поэтому [`Decompressing`] сюда не передаётся.
     pub blobs: Arc<dyn BlobStore>,
     /// Учёт объектов BLOB.
     pub index: Arc<dyn BlobIndex>,
@@ -100,6 +104,10 @@ impl fmt::Debug for Deps {
 pub struct Store {
     d: Deps,
     cfg: Config,
+    /// Запись объектов писем: сжатие и протокол учёта (BLOB-13).
+    writer: Arc<BlobWriter>,
+    /// Чтение объектов писем с распаковкой.
+    reader: Arc<Decompressing>,
     /// Папки учётных записей: «Входящие» для предупреждений о квоте ([`Store::with_mailboxes`]).
     mailboxes: Option<Arc<dyn MailboxStore>>,
     warned: quota::Warned,
@@ -110,6 +118,7 @@ impl fmt::Debug for Store {
         f.debug_struct("Store")
             .field("d", &self.d)
             .field("cfg", &self.cfg)
+            .field("writer", &self.writer)
             .field("mailboxes", &self.mailboxes.is_some())
             .finish_non_exhaustive()
     }
@@ -123,12 +132,26 @@ impl Store {
 
     /// Хранилище поверх зависимостей с конфигурацией.
     pub fn with_config(deps: Deps, cfg: Config) -> Self {
+        Self::with_writer(deps, cfg, WriterConfig::default())
+    }
+
+    /// Хранилище с конфигурацией и параметрами записи объектов `writer` (сжатие — `writer.compression`).
+    pub fn with_writer(deps: Deps, cfg: Config, writer: WriterConfig) -> Self {
+        let reader = Decompressing::new(deps.blobs.clone(), deps.index.clone());
+        let writer = BlobWriter::new(deps.index.clone(), deps.blobs.clone(), writer);
         Self {
             d: deps,
             cfg,
+            writer: Arc::new(writer),
+            reader: Arc::new(reader),
             mailboxes: None,
             warned: quota::Warned::default(),
         }
+    }
+
+    /// Метрики записи объектов писем: загрузки, дедупликация, сжатие.
+    pub fn writer_metrics(&self) -> WriterMetrics {
+        self.writer.metrics()
     }
 
     /// Публикует `MailboxChanged` для папок учётной записи (каждой — один раз).
@@ -253,15 +276,25 @@ pub(crate) mod testenv {
         }
 
         pub fn with_hooks(hooks: DecisionHooks) -> Self {
-            Self::build(hooks, Config::default(), false)
+            Self::build(hooks, Config::default(), false, WriterConfig::default())
+        }
+
+        /// Окружение с параметрами записи объектов.
+        pub fn with_writer(writer: WriterConfig) -> Self {
+            Self::build(DecisionHooks::default(), Config::default(), false, writer)
         }
 
         /// Конфигурация хранилища; `mailboxes` — [`Store::with_mailboxes`] поверх метаданных.
         pub fn with_config(cfg: Config, mailboxes: bool) -> Self {
-            Self::build(DecisionHooks::default(), cfg, mailboxes)
+            Self::build(
+                DecisionHooks::default(),
+                cfg,
+                mailboxes,
+                WriterConfig::default(),
+            )
         }
 
-        fn build(hooks: DecisionHooks, cfg: Config, mailboxes: bool) -> Self {
+        fn build(hooks: DecisionHooks, cfg: Config, mailboxes: bool, writer: WriterConfig) -> Self {
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let blobs = MemBlobStore::new(clock.clone()).with_chunk_size(4096);
             let index = MemBlobIndex::new(clock.clone());
@@ -269,7 +302,7 @@ pub(crate) mod testenv {
             let bus = MemEventBus::default();
             let trash = MemTrash::new(&meta);
             let quota = MemQuota::new(&meta);
-            let mut store = Store::with_config(
+            let mut store = Store::with_writer(
                 Deps {
                     blobs: Arc::new(blobs.clone()),
                     index: Arc::new(index.clone()),
@@ -281,6 +314,7 @@ pub(crate) mod testenv {
                     hooks,
                 },
                 cfg,
+                writer,
             );
             if mailboxes {
                 store = store.with_mailboxes(Arc::new(meta.clone()));
@@ -295,6 +329,21 @@ pub(crate) mod testenv {
                 store,
             }
         }
+    }
+
+    /// Исходное содержимое объекта (с распаковкой).
+    pub async fn object(env: &Env, key: &tp_contracts::BlobKey) -> bytes::Bytes {
+        use futures::TryStreamExt;
+        let chunks: Vec<bytes::Bytes> = env
+            .store
+            .reader
+            .get(key, None)
+            .await
+            .expect("get")
+            .try_collect()
+            .await
+            .expect("read");
+        bytes::Bytes::from(chunks.concat())
     }
 
     /// Поток байтов из буфера кусками по `chunk`.

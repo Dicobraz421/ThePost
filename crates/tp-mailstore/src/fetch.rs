@@ -56,8 +56,7 @@ impl Store {
             .await?
             .ok_or(Error::NotFound)?;
         let data = self
-            .d
-            .blobs
+            .reader
             .get(&msg.skeleton, None)
             .await
             .map_err(missing_object)?
@@ -97,7 +96,7 @@ impl Store {
                 }
             }
         }
-        let blobs: Arc<dyn BlobStore> = self.d.blobs.clone();
+        let blobs: Arc<dyn BlobStore> = self.reader.clone();
         Ok(stream::iter(pieces)
             .then(move |piece| {
                 let blobs = blobs.clone();
@@ -145,6 +144,8 @@ mod tests {
     use tp_contracts::meta::SpecialUse;
     use tp_testkit::blob::read_all;
     use tp_testkit::{BlobOp, Clock, LoadModel, SyntheticMail, SystemClock};
+
+    use tp_blob::{CompressionConfig, WriterConfig};
 
     use crate::testenv::{Env, stream as input};
 
@@ -234,7 +235,14 @@ mod tests {
 
     #[tokio::test]
     async fn large_attachment_streams() {
-        let env = Env::new();
+        // Куски хранилища видны на несжатом объекте; сжатый отдаётся шагами распаковки (MS-15, ниже).
+        let env = Env::with_writer(WriterConfig {
+            compression: CompressionConfig {
+                enabled: false,
+                ..CompressionConfig::default()
+            },
+            ..WriterConfig::default()
+        });
         let model = LoadModel {
             avg_body: 2048,
             attachment_ratio: 1.0,
@@ -271,6 +279,17 @@ mod tests {
         let got = raw(&env, scope, id, None).await;
         assert!(got.as_ref() == mail.as_slice());
         let r = (start as u64 + 1000)..(start as u64 + 2_000_000);
+        let got = raw(&env, scope, id, Some(r.clone())).await;
+        assert!(got.as_ref() == &mail[r.start as usize..r.end as usize]);
+
+        // То же письмо со сжатием: тело и диапазоны — по исходному содержимому.
+        let env = Env::new();
+        let (scope, id) = deliver(&env, &mail).await;
+        assert!(env.store.writer_metrics().compressed >= 1);
+        let body = read_all(env.store.fetch_part(scope, id, "2").await.expect("part"))
+            .await
+            .expect("read");
+        assert!(body.as_ref() == &mail[start..end], "тело сжатой части");
         let got = raw(&env, scope, id, Some(r.clone())).await;
         assert!(got.as_ref() == &mail[r.start as usize..r.end as usize]);
     }

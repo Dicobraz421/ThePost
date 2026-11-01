@@ -17,7 +17,9 @@ use tp_contracts::ext::{DecisionHooks, JmapCapability};
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{
     AccountScope, AccountStore, ChangeLog, MailboxStore, Message, MessageQuery, MessageStore,
+    PolicyResolver,
 };
+use tp_contracts::retention::TrashStore;
 use tp_contracts::search::SearchIndex;
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Result, TenantId};
 
@@ -42,9 +44,11 @@ pub const MAIL: &str = "urn:ietf:params:jmap:mail";
 pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 /// Capability WebSocket (RFC 8887).
 pub const WEBSOCKET: &str = "urn:ietf:params:jmap:websocket";
+/// Capability настроек пользователя The Post (`UserSettings`: `trash.purge`).
+pub const SETTINGS: &str = "urn:thepost:params:jmap:settings";
 
 /// Встроенные capability.
-const BUILTIN: [&str; 4] = [CORE, MAIL, SUBMISSION, WEBSOCKET];
+const BUILTIN: [&str; 5] = [CORE, MAIL, SUBMISSION, WEBSOCKET, SETTINGS];
 
 /// Зависимости сервера JMAP: реализации контрактов, выбранные приложением.
 #[derive(Clone)]
@@ -59,6 +63,10 @@ pub struct Deps {
     pub changes: Arc<dyn ChangeLog>,
     /// Почтовое хранилище (тела писем).
     pub store: Arc<dyn MailStore>,
+    /// Корзина: `Email/set destroy` в корзине — «очистить корзину» (`TrashStore::purge`).
+    pub trash: Arc<dyn TrashStore>,
+    /// Политики: настройка `trash.purge` пользователя (`UserSettings`).
+    pub policies: Arc<dyn PolicyResolver>,
     /// Полнотекстовый поиск.
     pub search: Arc<dyn SearchIndex>,
     /// Объекты BLOB: загруженные файлы (upload).
@@ -73,7 +81,7 @@ pub struct Deps {
     pub authz: Arc<dyn Authorizer>,
     /// Очередь исходящей почты; `None` — узел не отправляет (EmailSubmission — `forbiddenToSend`).
     pub outbound: Option<Arc<dyn Outbound>>,
-    /// Точки принятия решений модулей (`on_submission`).
+    /// Точки принятия решений модулей (`on_submission`; `before_final_delete` при очистке корзины).
     pub hooks: DecisionHooks,
     /// Capability модулей (`Registry::jmap_capabilities`).
     pub capabilities: Vec<Arc<dyn JmapCapability>>,
@@ -249,6 +257,7 @@ impl Jmap {
         );
         caps.insert(MAIL.into(), json!({}));
         caps.insert(SUBMISSION.into(), json!({}));
+        caps.insert(SETTINGS.into(), json!({}));
         let ws = base
             .strip_prefix("https://")
             .map(|h| format!("wss://{h}"))
@@ -274,9 +283,11 @@ impl Jmap {
             SUBMISSION.into(),
             json!({ "maxDelayedSend": 0, "submissionExtensions": {} }),
         );
+        account_caps.insert(SETTINGS.into(), json!({}));
         let mut primary = Map::new();
         primary.insert(MAIL.into(), json!(account));
         primary.insert(SUBMISSION.into(), json!(account));
+        primary.insert(SETTINGS.into(), json!(account));
         for cap in &self.d.capabilities {
             caps.insert(cap.uri().into(), cap.session_object());
             account_caps.insert(cap.uri().into(), json!({}));

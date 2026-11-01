@@ -23,8 +23,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::bus::EventBus;
+use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountScope, ChangeLog, MailboxStore, MessageStore};
+use tp_contracts::retention::TrashStore;
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslFailure, SaslServer, SaslStep};
 use tp_contracts::search::SearchIndex;
 use tp_contracts::{Error, MailboxId, MessageId, ModSeq, Result, Uid, UidValidity};
@@ -101,6 +103,10 @@ pub struct Deps {
     pub changes: Arc<dyn ChangeLog>,
     /// Шина уведомлений: изменения папок для `IDLE`.
     pub bus: Arc<dyn EventBus>,
+    /// Корзина: `EXPUNGE` в корзине — «очистить корзину» (`TrashStore::purge`).
+    pub trash: Arc<dyn TrashStore>,
+    /// Точки принятия решений модулей: Legal Hold перед стиранием при `trash.purge = erase`.
+    pub hooks: DecisionHooks,
 }
 
 impl fmt::Debug for Deps {
