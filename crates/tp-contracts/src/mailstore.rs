@@ -6,6 +6,8 @@
 //! Модель «скелет + части»: письмо = объект-скелет (заголовки, границы MIME, ссылки на части) + объекты частей.
 //! Исходное письмо восстанавливается из них побайтово. Части дедуплицируются в пределах организации:
 //! [`MailStore::ingest`] загружает каждую часть один раз на всех получателей (`refs` = число доставок).
+//! Письмо, которое кладёт клиент (IMAP APPEND, JMAP `Email/import`), — не доставка: [`MailStore::append`]
+//! (решение 2026-11-01-trash-purge).
 //!
 //! Изменяющие операции публикуют уведомление в [`EventBus`](crate::bus::EventBus) после фиксации транзакции.
 
@@ -95,6 +97,19 @@ pub trait MailStore: Send + Sync + 'static {
     /// Превышение квоты одного получателя — `Error::QuotaExceeded` для всего запроса
     /// (вызывающий исключает получателя и повторяет).
     async fn ingest(&self, req: IngestRequest) -> Result<Ingested>;
+
+    /// Кладёт письмо клиента в папку учётной записи (IMAP APPEND, JMAP `Email/import`; решение 2026-11-01-trash-purge):
+    /// разбор и загрузка объектов, как у `ingest`, квота (`Error::QuotaExceeded` до загрузки), `MessageStore::insert`,
+    /// уведомление в шину. Это не доставка: точки принятия решений доставки (`DecisionHook::on_delivery`) не вызываются,
+    /// копий (журнал, пересылка) нет, заголовки не добавляются — письмо хранится побайтово. Нет папки — `Error::NotFound`.
+    async fn append(
+        &self,
+        scope: AccountScope,
+        mailbox: MailboxId,
+        raw: ByteStream,
+        flags: Flags,
+        received_at: OffsetDateTime,
+    ) -> Result<Delivered>;
 
     /// Исходное письмо побайтово или диапазон его байтов (IMAP `BODY[]<partial>`, JMAP blob).
     async fn fetch_raw(

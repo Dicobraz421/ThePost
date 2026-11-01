@@ -1,7 +1,10 @@
 //! Секция `jmap` config.yaml: адрес сервера и лимиты RFC 8620 (`urn:ietf:params:jmap:core`).
 
+use std::time::Duration;
+
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tp_contracts::config::duration;
 
 /// Конфигурация JMAP (поля необязательны, неизвестное — ошибка). Применяется при создании [`crate::Jmap`].
 ///
@@ -37,6 +40,12 @@ pub struct JmapConfig {
     pub max_search_results: u32,
     /// Сколько первых байтов письма читать для заголовков (`references`, `headers`, `header:*`).
     pub header_window: u64,
+    /// Получателей конверта в одной отправке `EmailSubmission/set`; больше — `tooManyRecipients`.
+    pub max_submission_recipients: u32,
+    /// Наименьший период `ping` EventSource (RFC 8620 §7.3): меньший период клиента увеличивается до него.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub push_min_ping: Duration,
 }
 
 impl Default for JmapConfig {
@@ -54,6 +63,8 @@ impl Default for JmapConfig {
             max_query_limit: 1_000,
             max_search_results: 10_000,
             header_window: 262_144,
+            max_submission_recipients: 100,
+            push_min_ping: Duration::from_secs(10),
         }
     }
 }

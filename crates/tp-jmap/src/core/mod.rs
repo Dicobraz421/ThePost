@@ -1,5 +1,7 @@
 //! Ядро JMAP (RFC 8620): объект сессии, запрос API, ссылки на результаты, ошибки, лимиты,
 //! аутентификация Bearer и Basic, реестр capability (встроенные и модулей, CONTRACTS.md#Extension points).
+//!
+//! Остановка узла (SRS 4.2): [`Jmap::shutdown`] закрывает долгоживущие соединения push (EventSource, WebSocket).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -7,14 +9,19 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tp_contracts::auth::{Authenticator, Principal};
-use tp_contracts::ext::JmapCapability;
+use tokio::sync::watch;
+use tp_contracts::auth::{Authenticator, Authorizer, Principal};
+use tp_contracts::blob::{BlobIndex, BlobStore};
+use tp_contracts::bus::EventBus;
+use tp_contracts::ext::{DecisionHooks, JmapCapability};
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{
-    AccountScope, ChangeLog, MailboxStore, Message, MessageQuery, MessageStore,
+    AccountScope, AccountStore, ChangeLog, MailboxStore, Message, MessageQuery, MessageStore,
 };
 use tp_contracts::search::SearchIndex;
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Result, TenantId};
+
+use crate::submission::Outbound;
 
 pub mod config;
 pub mod error;
@@ -31,6 +38,13 @@ pub use request::{Invocation, Request, Response};
 pub const CORE: &str = "urn:ietf:params:jmap:core";
 /// Capability почты (RFC 8621).
 pub const MAIL: &str = "urn:ietf:params:jmap:mail";
+/// Capability отправки (RFC 8621 §7).
+pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
+/// Capability WebSocket (RFC 8887).
+pub const WEBSOCKET: &str = "urn:ietf:params:jmap:websocket";
+
+/// Встроенные capability.
+const BUILTIN: [&str; 4] = [CORE, MAIL, SUBMISSION, WEBSOCKET];
 
 /// Зависимости сервера JMAP: реализации контрактов, выбранные приложением.
 #[derive(Clone)]
@@ -47,6 +61,20 @@ pub struct Deps {
     pub store: Arc<dyn MailStore>,
     /// Полнотекстовый поиск.
     pub search: Arc<dyn SearchIndex>,
+    /// Объекты BLOB: загруженные файлы (upload).
+    pub blobs: Arc<dyn BlobStore>,
+    /// Учёт объектов BLOB: загруженный файл живёт без ссылок до сборки мусора по окну.
+    pub blob_index: Arc<dyn BlobIndex>,
+    /// Шина уведомлений: push (EventSource, WebSocket).
+    pub bus: Arc<dyn EventBus>,
+    /// Учётные записи: отображаемое имя в Identity.
+    pub accounts: Arc<dyn AccountStore>,
+    /// Права отправки от адреса `From` (Send As, Send on Behalf).
+    pub authz: Arc<dyn Authorizer>,
+    /// Очередь исходящей почты; `None` — узел не отправляет (EmailSubmission — `forbiddenToSend`).
+    pub outbound: Option<Arc<dyn Outbound>>,
+    /// Точки принятия решений модулей (`on_submission`).
+    pub hooks: DecisionHooks,
     /// Capability модулей (`Registry::jmap_capabilities`).
     pub capabilities: Vec<Arc<dyn JmapCapability>>,
 }
@@ -54,6 +82,7 @@ pub struct Deps {
 impl fmt::Debug for Deps {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Deps")
+            .field("outbound", &self.outbound.is_some())
             .field(
                 "capabilities",
                 &self
@@ -70,7 +99,9 @@ impl fmt::Debug for Deps {
 pub struct Jmap {
     pub(crate) d: Deps,
     pub(crate) cfg: JmapConfig,
-    inflight: Mutex<HashMap<(TenantId, AccountId), u32>>,
+    inflight: Slots,
+    uploads: Slots,
+    stop: watch::Sender<bool>,
 }
 
 impl fmt::Debug for Jmap {
@@ -89,6 +120,8 @@ pub(crate) struct Ctx<'a> {
     pub scope: AccountScope,
     /// Созданные в запросе объекты: creation id → id (ссылки `#cid`).
     pub created: &'a mut HashMap<String, String>,
+    /// Ответы неявных вызовов (`EmailSubmission/set` → `Email/set`): после ответа метода, с тем же callId.
+    pub implicit: Vec<(String, Map<String, Value>)>,
 }
 
 impl Ctx<'_> {
@@ -129,19 +162,17 @@ impl Ctx<'_> {
     }
 }
 
-/// Слот одновременного запроса учётной записи; освобождается при удалении.
-struct Inflight<'a> {
-    jmap: &'a Jmap,
+type Slots = Mutex<HashMap<(TenantId, AccountId), u32>>;
+
+/// Слот одновременного запроса или загрузки учётной записи; освобождается при удалении.
+pub(crate) struct Inflight<'a> {
+    slots: &'a Slots,
     key: (TenantId, AccountId),
 }
 
 impl Drop for Inflight<'_> {
     fn drop(&mut self) {
-        let mut map = self
-            .jmap
-            .inflight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut map = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(n) = map.get_mut(&self.key) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -155,7 +186,7 @@ impl Jmap {
     /// Сервер поверх зависимостей. URI capability модуля, совпадающий со встроенным или другим модулем,
     /// и повтор имени метода — `Error::Conflict`.
     pub fn new(d: Deps, cfg: JmapConfig) -> Result<Self> {
-        let mut uris = vec![CORE, MAIL];
+        let mut uris = BUILTIN.to_vec();
         let mut methods: Vec<&str> = crate::METHODS.iter().map(|(m, _)| *m).collect();
         for cap in &d.capabilities {
             if uris.contains(&cap.uri()) {
@@ -173,7 +204,20 @@ impl Jmap {
             d,
             cfg,
             inflight: Mutex::new(HashMap::new()),
+            uploads: Mutex::new(HashMap::new()),
+            stop: watch::channel(false).0,
         })
+    }
+
+    /// Остановка узла: закрывает соединения push (EventSource завершается, WebSocket получает Close).
+    /// Запросы API обслуживаются до остановки слушателя вызывающим.
+    pub fn shutdown(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// Признак остановки для соединений push.
+    pub(crate) fn stopping(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
     }
 
     /// Конфигурация.
@@ -182,7 +226,7 @@ impl Jmap {
     }
 
     fn known_capability(&self, uri: &str) -> bool {
-        uri == CORE || uri == MAIL || self.d.capabilities.iter().any(|c| c.uri() == uri)
+        BUILTIN.contains(&uri) || self.d.capabilities.iter().any(|c| c.uri() == uri)
     }
 
     /// Объект сессии (RFC 8620 §2) для субъекта; `base` — внешний адрес сервера без `/` в конце.
@@ -204,6 +248,16 @@ impl Jmap {
             }),
         );
         caps.insert(MAIL.into(), json!({}));
+        caps.insert(SUBMISSION.into(), json!({}));
+        let ws = base
+            .strip_prefix("https://")
+            .map(|h| format!("wss://{h}"))
+            .or_else(|| base.strip_prefix("http://").map(|h| format!("ws://{h}")))
+            .unwrap_or_else(|| base.to_owned());
+        caps.insert(
+            WEBSOCKET.into(),
+            json!({ "url": format!("{ws}/jmap/ws"), "supportsPush": true }),
+        );
         let mut account_caps = Map::new();
         account_caps.insert(
             MAIL.into(),
@@ -216,8 +270,13 @@ impl Jmap {
                 "mayCreateTopLevelMailbox": true,
             }),
         );
+        account_caps.insert(
+            SUBMISSION.into(),
+            json!({ "maxDelayedSend": 0, "submissionExtensions": {} }),
+        );
         let mut primary = Map::new();
         primary.insert(MAIL.into(), json!(account));
+        primary.insert(SUBMISSION.into(), json!(account));
         for cap in &self.d.capabilities {
             caps.insert(cap.uri().into(), cap.session_object());
             account_caps.insert(cap.uri().into(), json!({}));
@@ -256,14 +315,12 @@ impl Jmap {
     }
 
     fn enter(&self, p: &Principal) -> Option<Inflight<'_>> {
-        let key = (p.tenant, p.account);
-        let mut map = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
-        let n = map.entry(key).or_insert(0);
-        if *n >= self.cfg.max_concurrent_requests {
-            return None;
-        }
-        *n += 1;
-        Some(Inflight { jmap: self, key })
+        slot(&self.inflight, p, self.cfg.max_concurrent_requests)
+    }
+
+    /// Слот загрузки (`maxConcurrentUpload`); `None` — лимит исчерпан.
+    pub(crate) fn enter_upload(&self, p: &Principal) -> Option<Inflight<'_>> {
+        slot(&self.uploads, p, self.cfg.max_concurrent_upload)
     }
 
     /// Выполняет запрос API (тело POST `apiUrl`). Ошибка всего запроса — [`Problem`].
@@ -296,15 +353,24 @@ impl Jmap {
                     account: p.account,
                 },
                 created: &mut created,
+                implicit: Vec::new(),
             };
             let result = match request::resolve_references(args, &responses) {
                 Ok(args) => self.call(&mut ctx, &name, args, &req.using).await,
                 Err(e) => Err(e),
             };
+            let implicit = std::mem::take(&mut ctx.implicit);
             responses.push(match result {
-                Ok(out) => Invocation(name, out, call_id),
-                Err(e) => Invocation("error".into(), request::object(e.to_json()), call_id),
+                Ok(out) => Invocation(name, out, call_id.clone()),
+                Err(e) => Invocation(
+                    "error".into(),
+                    request::object(e.to_json()),
+                    call_id.clone(),
+                ),
             });
+            for (name, out) in implicit {
+                responses.push(Invocation(name, out, call_id.clone()));
+            }
         }
         Ok(Response {
             method_responses: responses,
@@ -390,6 +456,17 @@ impl Jmap {
         }
         Ok(out)
     }
+}
+
+fn slot<'a>(slots: &'a Slots, p: &Principal, max: u32) -> Option<Inflight<'a>> {
+    let key = (p.tenant, p.account);
+    let mut map = slots.lock().unwrap_or_else(PoisonError::into_inner);
+    let n = map.entry(key).or_insert(0);
+    if *n >= max {
+        return None;
+    }
+    *n += 1;
+    Some(Inflight { slots, key })
 }
 
 /// Идентификатор цепочки письма (`threadId`): по ключу цепочки из метаданных; письмо без ключа — своя цепочка.

@@ -6,14 +6,15 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tp_contracts::meta::{Address, Message};
-use tp_contracts::search::{SearchSort, TextField, TextQuery};
-use tp_contracts::{MailboxId, MessageId};
+use tp_contracts::search::{SearchSort, Snippet, TextField, TextQuery};
+use tp_contracts::{Error, MailboxId, MessageId};
 
 use crate::core::error::{MethodError, MethodResult, changes_error};
 use crate::core::request::{
@@ -410,6 +411,89 @@ pub(crate) async fn query_changes(
         return Err(MethodError::new("cannotCalculateChanges"));
     }
     query_changes_response(&qc, &ids, &c, limit)
+}
+
+/// Текстовая часть фильтра: термы условий в дереве операторов; нетекстовые условия отбрасываются.
+fn text_of(f: &Filter) -> Option<TextQuery> {
+    match f {
+        Filter::Cond(c) => {
+            let mut terms: Vec<TextQuery> = c
+                .terms
+                .iter()
+                .map(|(field, text)| TextQuery::term(field.clone(), text.clone()))
+                .collect();
+            match terms.len() {
+                0 => None,
+                1 => terms.pop(),
+                _ => Some(TextQuery::And(terms)),
+            }
+        }
+        Filter::Op(op, fs) => {
+            let qs: Vec<TextQuery> = fs.iter().filter_map(text_of).collect();
+            if qs.is_empty() {
+                return None;
+            }
+            Some(match op {
+                Op::And => TextQuery::And(qs),
+                Op::Or => TextQuery::Or(qs),
+                Op::Not => TextQuery::Not(Box::new(TextQuery::Or(qs))),
+            })
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippetArgs {
+    account_id: String,
+    filter: Option<Value>,
+    email_ids: Vec<String>,
+}
+
+/// `SearchSnippet/get` (RFC 8621 §5): фрагменты с `<mark>` от `SearchIndex::snippet` по текстовой части фильтра.
+pub(crate) async fn snippet_get(
+    ctx: &mut Ctx<'_>,
+    args: Map<String, Value>,
+) -> MethodResult<Map<String, Value>> {
+    let a: SnippetArgs = parse_args(args)?;
+    ctx.check_account(&a.account_id)?;
+    if a.email_ids.len() > ctx.jmap.cfg.max_objects_in_get as usize {
+        return Err(MethodError::new("requestTooLarge"));
+    }
+    let q = a
+        .filter
+        .as_ref()
+        .map(parse_filter)
+        .transpose()?
+        .as_ref()
+        .and_then(text_of);
+    let d = &ctx.jmap.d;
+    let (mut list, mut not_found) = (Vec::new(), Vec::new());
+    for id in a.email_ids {
+        let msg = match MessageId::from_str(ctx.resolve_id(&id)) {
+            Ok(mid) => d.messages.get(ctx.scope, mid).await?,
+            Err(_) => None,
+        };
+        let Some(m) = msg else {
+            not_found.push(id);
+            continue;
+        };
+        let s = match &q {
+            Some(q) => match d.search.snippet(ctx.scope, m.id, q).await {
+                Ok(s) => s,
+                // Письмо ещё не проиндексировано.
+                Err(Error::NotFound) => Snippet::default(),
+                Err(e) => return Err(e.into()),
+            },
+            None => Snippet::default(),
+        };
+        list.push(json!({"emailId": id, "subject": s.subject, "preview": s.preview}));
+    }
+    Ok(object(json!({
+        "accountId": a.account_id,
+        "list": list,
+        "notFound": if not_found.is_empty() { Value::Null } else { json!(not_found) },
+    })))
 }
 
 #[cfg(test)]

@@ -417,6 +417,8 @@ async fn session_delivers_to_several_recipients() {
         handler: Arc::new(env.delivery(false)),
         sasl: None,
         limiter: None,
+        send_limits: None,
+        metrics: None,
     };
     let (client, mut server) = tokio::io::duplex(64 * 1024);
     let task = tokio::spawn(async move {

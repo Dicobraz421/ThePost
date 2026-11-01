@@ -11,6 +11,10 @@
 //! `commit_new`. Поэтому перед загрузкой [`BlobStore::head`]: занятый ключ — следующее поколение
 //! (`commit_new` принимает поколение больше выданного). Загрузка по свободному ключу создаёт новый
 //! объект с текущим моментом записи — он моложе периода ожидания и в листинг «сирот» не попадёт.
+//!
+//! Сжатие ([`crate::compress`]): после `acquire` с ответом [`Acquire::Absent`] объект сжимается zstd, если учёт
+//! хранит признак и выигрыш достаточен; загружается сжатый вид, `commit_new_with` получает исходный размер
+//! и признак. Новое поколение после `Bumped` или занятого ключа загружается в том же виде.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,8 +23,13 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use schemars::JsonSchema;
 use sha2::{Digest, Sha256};
-use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, ByteStream, Commit};
+use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, ByteStream, Commit, Compression};
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, Result, TenantId};
+
+use crate::compress::{CompressionConfig, Skip};
+
+/// Байтов начала объекта для распознавания формата по сигнатуре.
+const SNIFF_BYTES: usize = 8192;
 
 /// Конфигурация писателя.
 #[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -31,6 +40,8 @@ pub struct WriterConfig {
     /// Предел размера объекта при записи из потока, байт: поток держится в памяти,
     /// пока не известен хэш.
     pub max_stream_bytes: u64,
+    /// Сжатие объектов zstd.
+    pub compression: CompressionConfig,
 }
 
 impl Default for WriterConfig {
@@ -38,6 +49,7 @@ impl Default for WriterConfig {
         Self {
             max_bumps: 8,
             max_stream_bytes: 256 << 20,
+            compression: CompressionConfig::default(),
         }
     }
 }
@@ -93,8 +105,16 @@ pub struct WriterMetrics {
     pub dedup: u64,
     /// Загрузок объектов.
     pub uploads: u64,
-    /// Загружено байтов.
+    /// Загружено байтов (сжатый вид для сжатых объектов).
     pub upload_bytes: u64,
+    /// Исходный размер загруженных объектов, байт: коэффициент сжатия — `upload_bytes / original_bytes`.
+    pub original_bytes: u64,
+    /// Загрузок в сжатом виде.
+    pub compressed: u64,
+    /// Загрузок без сжатия: уже сжатый формат (тип MIME или сигнатура).
+    pub skipped_type: u64,
+    /// Загрузок без сжатия: выигрыш меньше порога.
+    pub skipped_gain: u64,
     /// Ответов `Commit::Bumped`.
     pub bumps: u64,
     /// Ключей, по которым объект уже лежал (след оборванной записи): взято следующее поколение.
@@ -105,12 +125,27 @@ pub struct WriterMetrics {
     pub errors: u64,
 }
 
+impl WriterMetrics {
+    /// Коэффициент сжатия загрузок: загружено к исходному размеру (1.0 — без сжатия).
+    pub fn compression_ratio(&self) -> f64 {
+        if self.original_bytes == 0 {
+            1.0
+        } else {
+            self.upload_bytes as f64 / self.original_bytes as f64
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Counters {
     writes: AtomicU64,
     dedup: AtomicU64,
     uploads: AtomicU64,
     upload_bytes: AtomicU64,
+    original_bytes: AtomicU64,
+    compressed: AtomicU64,
+    skipped_type: AtomicU64,
+    skipped_gain: AtomicU64,
     bumps: AtomicU64,
     occupied: AtomicU64,
     stale_uploads: AtomicU64,
@@ -158,6 +193,10 @@ impl BlobWriter {
             dedup: get(&c.dedup),
             uploads: get(&c.uploads),
             upload_bytes: get(&c.upload_bytes),
+            original_bytes: get(&c.original_bytes),
+            compressed: get(&c.compressed),
+            skipped_type: get(&c.skipped_type),
+            skipped_gain: get(&c.skipped_gain),
             bumps: get(&c.bumps),
             occupied: get(&c.occupied),
             stale_uploads: get(&c.stale_uploads),
@@ -194,7 +233,7 @@ impl BlobWriter {
         }
         let size = hasher.len();
         let hash = hasher.finish();
-        self.run(tenant, hash, size, refs, Body::Chunks(chunks))
+        self.run(tenant, hash, size, refs, Body::Chunks(chunks), None)
             .await
     }
 
@@ -206,8 +245,22 @@ impl BlobWriter {
         data: Bytes,
         refs: u32,
     ) -> Result<BlobKey> {
+        self.write_part(tenant, hash, data, refs, None).await
+    }
+
+    /// Сохраняет часть письма с уже вычисленным хэшем; `media_type` — тип MIME части: уже сжатые
+    /// форматы не сжимаются (сигнатура проверяется и без него).
+    pub async fn write_part(
+        &self,
+        tenant: TenantId,
+        hash: BlobHash,
+        data: Bytes,
+        refs: u32,
+        media_type: Option<&str>,
+    ) -> Result<BlobKey> {
         let size = data.len() as u64;
-        self.run(tenant, hash, size, refs, Body::Whole(data)).await
+        self.run(tenant, hash, size, refs, Body::Whole(data), media_type)
+            .await
     }
 
     async fn run(
@@ -217,9 +270,12 @@ impl BlobWriter {
         size: u64,
         refs: u32,
         body: Body,
+        media_type: Option<&str>,
     ) -> Result<BlobKey> {
         add(&self.counters.writes, 1);
-        let res = self.protocol(tenant, hash, size, refs, &body).await;
+        let res = self
+            .protocol(tenant, hash, size, refs, body, media_type)
+            .await;
         if let Err(e) = &res {
             add(&self.counters.errors, 1);
             tracing::warn!(%tenant, %hash, error = %e, "запись BLOB не удалась");
@@ -233,7 +289,8 @@ impl BlobWriter {
         hash: BlobHash,
         size: u64,
         refs: u32,
-        body: &Body,
+        body: Body,
+        media_type: Option<&str>,
     ) -> Result<BlobKey> {
         let key = |generation| BlobKey {
             tenant,
@@ -247,6 +304,7 @@ impl BlobWriter {
             }
             Acquire::Absent { generation } => generation,
         };
+        let (body, compression) = self.prepare(body, size, media_type).await;
         let mut bumps = 0;
         loop {
             while self.store.head(&key(generation)).await?.is_some() {
@@ -254,10 +312,10 @@ impl BlobWriter {
                 self.bump(&mut bumps)?;
                 generation = generation.next();
             }
-            self.upload(&key(generation), body, size).await?;
+            self.upload(&key(generation), &body, size).await?;
             match self
                 .index
-                .commit_new(tenant, &hash, generation, size, refs)
+                .commit_new_with(tenant, &hash, generation, size, refs, compression)
                 .await?
             {
                 Commit::Done { generation: done } => {
@@ -285,8 +343,49 @@ impl BlobWriter {
         Ok(())
     }
 
+    /// Вид объекта для загрузки: сжатый, если учёт хранит признак, формат не сжат и выигрыш достаточен.
+    async fn prepare(
+        &self,
+        body: Body,
+        size: u64,
+        media_type: Option<&str>,
+    ) -> (Body, Compression) {
+        let cfg = &self.cfg.compression;
+        let skip = if self.index.supports_compression() {
+            cfg.precheck(size, media_type, &body.head(SNIFF_BYTES))
+        } else {
+            Some(Skip::Off)
+        };
+        let skip = match skip {
+            Some(skip) => skip,
+            None => {
+                let chunks = body.chunks();
+                let cfg = cfg.clone();
+                match tokio::task::spawn_blocking(move || cfg.compress(&chunks, size)).await {
+                    Ok(Ok(zipped)) => {
+                        add(&self.counters.compressed, 1);
+                        return (Body::Whole(zipped), Compression::Zstd);
+                    }
+                    Ok(Err(skip)) => skip,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "сжатие объекта BLOB прервано, хранится как есть");
+                        Skip::Off
+                    }
+                }
+            }
+        };
+        match skip {
+            Skip::Type => add(&self.counters.skipped_type, 1),
+            Skip::Gain => add(&self.counters.skipped_gain, 1),
+            Skip::Off => {}
+        }
+        (body, Compression::None)
+    }
+
     /// Загрузка вне транзакций БД; повторная загрузка того же ключа идемпотентна.
-    async fn upload(&self, key: &BlobKey, body: &Body, size: u64) -> Result<()> {
+    /// `original` — размер исходного содержимого (метрики).
+    async fn upload(&self, key: &BlobKey, body: &Body, original: u64) -> Result<()> {
+        let size = body.len();
         match body {
             Body::Whole(data) => self.store.put(key, data.clone()).await?,
             Body::Chunks(chunks) => {
@@ -296,6 +395,7 @@ impl BlobWriter {
         }
         add(&self.counters.uploads, 1);
         add(&self.counters.upload_bytes, size);
+        add(&self.counters.original_bytes, original);
         Ok(())
     }
 }
@@ -310,6 +410,36 @@ fn next_generation(current: Gen, bumped: Gen) -> Gen {
 enum Body {
     Whole(Bytes),
     Chunks(Vec<Bytes>),
+}
+
+impl Body {
+    fn len(&self) -> u64 {
+        match self {
+            Body::Whole(data) => data.len() as u64,
+            Body::Chunks(chunks) => chunks.iter().map(|c| c.len() as u64).sum(),
+        }
+    }
+
+    /// Части тела (без копирования байтов).
+    fn chunks(&self) -> Vec<Bytes> {
+        match self {
+            Body::Whole(data) => vec![data.clone()],
+            Body::Chunks(chunks) => chunks.clone(),
+        }
+    }
+
+    /// Начало тела, не длиннее `n` байт.
+    fn head(&self, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        for c in self.chunks() {
+            let take = (n - out.len()).min(c.len());
+            out.extend_from_slice(&c[..take]);
+            if out.len() == n {
+                break;
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

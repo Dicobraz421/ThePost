@@ -19,7 +19,7 @@
 ## Tenant
 SRS 3.8. Все операции хранилищ выполняются в контексте `TenantId` (параметр или контекст вызова). PostgreSQL — RLS по `tenant_id`,
 параметр сеанса `app.tenant_id` через `SET LOCAL` в начале каждой транзакции. Политики (квоты, срок корзины, лимиты отправки,
-ключи DKIM, профиль Milter) — `PolicyResolver::resolve(tenant, domain, account, mailbox?) -> Policy` по цепочке организация → домен → ящик (→ папка).
+ключи DKIM, профиль Milter, правило `trash.purge`) — `PolicyResolver::resolve(tenant, domain, account, mailbox?) -> Policy` по цепочке организация → домен → ящик (→ папка).
 
 ## BlobStore
 SRS 3.2. Объекты неизменяемы, запись идемпотентна.
@@ -81,6 +81,9 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
   на всех получателей; квота одного получателя — `QuotaExceeded` на весь запрос. `mail_from` — отправитель конверта (SMTP `MAIL FROM`,
   пустой — уведомление о недоставке), из заголовков не выводится. `forward` — внешние адреса `CopyTo::Address` от точек принятия
   решений: в очередь исходящей почты их ставит вызывающий (smtp, jmap), копии `CopyTo::Mailbox` делает хранилище.
+- `append(AccountScope, mailbox, raw: ByteStream, flags, received_at) -> Delivered` — письмо клиента (IMAP APPEND, JMAP `Email/import`;
+  решение 2026-11-01-trash-purge): разбор и загрузка, как у `ingest`, квота (`QuotaExceeded` до загрузки), `MessageStore::insert`,
+  событие в `EventBus`. Не доставка: без `DecisionHook::on_delivery`, без копий и добавленных заголовков; нет папки — `NotFound`.
 - `fetch_raw(AccountScope, message, Option<Range>) -> ByteStream`; `fetch_part(AccountScope, message, part_path)` — тело в кодировке передачи.
 - `set_flags`, `copy`, `move_to`, `delete_to_trash`, `restore` (по `AccountScope`) — публикуют событие в `EventBus` после фиксации.
 
@@ -279,12 +282,23 @@ SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организа
 ## Trash, Retention, Quota (Ф1)
 SRS 4.7, 3.8. Код — `retention.rs`. `TrashStore`: `list(scope, offset, limit) -> Vec<TrashItem { scope, object: TrashObject::Message(id), origin, size,
 received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Message { mailbox, inserted }`,
-`expired(now, limit)` (все организации, по `expires_at`), `defer(scope, object, until)`.
+`expired(now, limit)` (все организации, по `expires_at`, включая скрытые), `defer(scope, object, until)`.
+«Очистить корзину» (решение 2026-11-01-trash-purge): `purge(scope, ids, &DecisionHooks) -> PurgeOutcome { hidden, erased, modseq }` —
+письма, видимые в корзине, по настройке `trash.purge`: `TrashPurge::Hide` (по умолчанию) — скрыть, `Erase` — для каждого
+`before_final_delete` вне транзакции: `Allow` — стереть (как `expunge_final`), `Deny` (Legal Hold) или ошибка хука — скрыть;
+прочие письма — пропуск. Скрытое письмо не видно пользователю: нет в `MessageStore::get`/`list` и операциях над письмами,
+в счётчиках папки, в квоте (`Quota`, `AccountStore::quota`); `ChangeLog` — удалено из корзины, событие ядра — `Trashed`.
+Администратор: `list_hidden(scope, offset, limit)`, `restore` (видимые и скрытые; исходная папка или «Входящие», прежний `MessageId`);
+`list` — только видимые. Срок корзины для скрытых — как для остальных (`expired` → хук → `expunge_final`).
+Настройка: `Policy::trash_purge: Option<TrashPurgeRule { mode, user_can_choose }>` (администратор, уровни цепочки; не задано —
+`hide` без выбора пользователя); `PolicyResolver::trash_purge(scope) -> TrashPurgeSetting { rule, user }`,
+`effective()` — выбор пользователя только при `user_can_choose`, иначе значение администратора;
+`set_user_trash_purge(scope, Option<TrashPurge>)` — без `user_can_choose` выбор `Forbidden`, сброс (`None`) разрешён.
 Срок корзины — `PolicyResolver` (`trash_retention`, по умолчанию 30 суток из конфигурации): хранилище вычисляет `expires_at`
 при переносе в корзину; изменение политики действует на элементы, удалённые после него.
 Истечение: `expired` → `DecisionHooks::before_final_delete` (`FinalDelete::mailbox` = `origin`) → `MessageStore::expunge_final`; `Deny` — `defer`.
 `expunge_final` удаляет только письма, которые всё ещё в корзине; восстановленные между `expired` и `expunge_final` и прочие — пропуск, не ошибка.
-`Quota`: `usage(scope) -> QuotaUsage` (лимит — `PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded`
+`Quota`: `usage(scope) -> QuotaUsage` (письма, включая корзину, без скрытых; лимит — `PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded`
 (по умолчанию через `usage` и `QuotaUsage::allows`).
 Политики хранения и Legal Hold — модуль «Соответствие требованиям» через `DecisionHook::before_final_delete`.
 
@@ -341,7 +355,13 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   и поле `RoleCtx::load`; `delivery::{DeliveryLog, DeliveryEvent, DeliveryQuery, DeliveryPage}`; `groups::{GroupStore,
   DistributionGroup, HeldMessage}`, `GroupId`, `HeldId`. In-memory — `MemBlobIndex` (признак), `MemLoadMonitor`, `MemDeliveryLog`,
   `MemGroups`; наборы `suite::{blob_compression, delivery_log, group_store}`.
+- 2026-11-01 — CTR-27 (x/contracts-15, решение 2026-11-01-trash-purge): `MailStore::append` — письмо клиента без точек принятия решений
+  доставки и копий; реализация `tp-mailstore` — общие с `ingest` шаги разбора, квоты и загрузки.
 - 2026-11-01 — решение «Взаимодействие компонентов и требования к СУБД»: сигналы через PostgreSQL LISTEN/NOTIFY, `Rpc`, `AbuseBlocks`,
   `NodeInfo`; канал и шина Valkey удаляются (реализация — CTR-23, CLU-09).
 - 2026-11-01 — решение «Состав функций транспорта и внешний MTA»: `transport::{TransportStore, MailFlow}`, `EventKind::TransportChanged`
   (реализация — CTR-24).
+- 2026-11-01 — CTR-26 (x/contracts-14, решение 2026-11-01-trash-purge): `retention::{TrashPurge, TrashPurgeRule, TrashPurgeSetting,
+  PurgeOutcome}`, `TrashStore::purge`/`list_hidden` (скрытые письма; `list` — без них, `restore`/`defer`/`expired` — и для скрытых),
+  `Policy::trash_purge`, `PolicyResolver::trash_purge`/`set_user_trash_purge`; квота без скрытых. In-memory — `MemPolicies`,
+  `MemTrash` (скрытые в `MemMetadata`); набор `suite::trash_purge`. PostgreSQL — META-29 (в `PgMeta` пока заглушки).
