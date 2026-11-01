@@ -14,7 +14,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt, stream};
 use time::OffsetDateTime;
 use tp_contracts::blob::{
-    Acquire, BlobIndex, BlobStore, ByteStream, Commit, ObjectEntry, ObjectStream,
+    Acquire, BlobIndex, BlobStore, ByteStream, Commit, Compression, ObjectEntry, ObjectStream,
 };
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, Result, TenantId};
 
@@ -342,6 +342,8 @@ pub struct BlobRow {
     pub size: u64,
     /// Момент обнуления счётчика.
     pub zero_since: Option<OffsetDateTime>,
+    /// Признак сжатия объекта.
+    pub compression: Compression,
 }
 
 /// Учёт объектов в памяти; клоны разделяют данные. Каждый метод атомарен (одна блокировка),
@@ -436,6 +438,23 @@ impl BlobIndex for MemBlobIndex {
         size: u64,
         refs: u32,
     ) -> Result<Commit> {
+        self.commit_new_with(tenant, hash, generation, size, refs, Compression::None)
+            .await
+    }
+
+    fn supports_compression(&self) -> bool {
+        true
+    }
+
+    async fn commit_new_with(
+        &self,
+        tenant: TenantId,
+        hash: &BlobHash,
+        generation: Gen,
+        size: u64,
+        refs: u32,
+        compression: Compression,
+    ) -> Result<Commit> {
         let refs = refs_arg(refs)?;
         let live = BlobRow {
             generation,
@@ -443,6 +462,7 @@ impl BlobIndex for MemBlobIndex {
             state: BlobState::Live,
             size,
             zero_since: None,
+            compression,
         };
         let mut rows = lock(&self.rows);
         let Some(r) = rows.get_mut(&(tenant, *hash)) else {
@@ -546,6 +566,13 @@ impl BlobIndex for MemBlobIndex {
             .get(&(key.tenant, key.hash))
             .is_some_and(|r| r.generation == key.generation && r.state != BlobState::Deleted))
     }
+
+    async fn compression(&self, key: &BlobKey) -> Result<Option<Compression>> {
+        Ok(lock(&self.rows)
+            .get(&(key.tenant, key.hash))
+            .filter(|r| r.generation == key.generation && r.state != BlobState::Deleted)
+            .map(|r| r.compression))
+    }
 }
 
 #[cfg(test)]
@@ -628,6 +655,41 @@ mod tests {
                 .await
                 .expect("ok")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn compression_suite_and_tombstone() {
+        let (clock, idx) = setup();
+        crate::suite::blob_compression(&idx, TenantId::DEFAULT).await;
+
+        // Надгробие скрывает признак; следующее поколение получает свой.
+        let h = hash(42);
+        let g = match idx
+            .commit_new_with(TenantId::DEFAULT, &h, Gen(1), 5, 1, Compression::Zstd)
+            .await
+            .expect("commit")
+        {
+            Commit::Done { generation } => generation,
+            other => panic!("{other:?}"),
+        };
+        idx.release(TenantId::DEFAULT, &h, g, 1)
+            .await
+            .expect("release");
+        clock.advance(W * 2);
+        let k = key(42, g);
+        assert!(idx.mark_deleting(&k, clock.now() - W).await.expect("mark"));
+        assert!(idx.finalize_delete(&k).await.expect("finalize"));
+        assert_eq!(idx.compression(&k).await, Ok(None));
+        assert_eq!(
+            idx.commit_new(TenantId::DEFAULT, &h, g.next(), 5, 1).await,
+            Ok(Commit::Done {
+                generation: g.next()
+            })
+        );
+        assert_eq!(
+            idx.compression(&key(42, g.next())).await,
+            Ok(Some(Compression::None))
         );
     }
 

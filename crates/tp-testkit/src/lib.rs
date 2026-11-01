@@ -7,8 +7,11 @@ pub mod acl;
 pub mod app_passwords;
 pub mod blob;
 pub mod corpus;
+pub mod delivery;
 pub mod fakes;
+pub mod groups;
 pub mod infra;
+pub mod load;
 pub mod membership;
 pub mod meta;
 pub mod secrets;
@@ -18,11 +21,14 @@ pub use acl::MemAcl;
 pub use app_passwords::MemAppPasswords;
 pub use blob::{BlobOp, MemBlobIndex, MemBlobStore};
 pub use corpus::{LoadModel, SyntheticMail, corpus, pg_schema, pg_url};
+pub use delivery::MemDeliveryLog;
 pub use fakes::{
     FakeAuthenticator, FakeDirectory, FakeSasl, FakeSearch, HookCall, MemIndexManifests, MemQueue,
     MemQuota, MemTrash, RecordingDecisionHook, SearchDoc, principal,
 };
+pub use groups::MemGroups;
 pub use infra::{Clock, ManualClock, MemEventBus, MemEventLog, MemLease, SystemClock};
+pub use load::MemLoadMonitor;
 pub use membership::MemMembership;
 pub use meta::MemMetadata;
 pub use secrets::MemSecretStore;
