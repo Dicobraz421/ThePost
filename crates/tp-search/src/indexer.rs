@@ -11,6 +11,10 @@
 //! копятся и фиксируются коммитом индекса пакетом: набралось [`IndexerConfig::commit_docs`] или с первого
 //! изменения прошло [`IndexerConfig::commit_interval`], и в конце пачки — до возврата `Ok`, после которого
 //! журнал фиксирует позицию. Сбой до фиксации — пачка придёт снова; обработка идемпотентна.
+//!
+//! С хранилищем сегментов ([`Indexer::with_store`]) индекс перед записью сверяется с манифестом (нет на узле —
+//! загружается из BlobStore), а после коммита выгружается и манифест записывается (SRCH-05). Манифест изменил
+//! другой узел — индекс на узле забывается и `Conflict`: повтор пачки начнётся с загрузки.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -26,7 +30,8 @@ use tp_contracts::events::{CoreEventKind, EventSink, LoggedEvent};
 use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Error, MessageId, Result, TenantId};
 
-use crate::index::{IndexDoc, IndexManager, IndexOp};
+use crate::index::{IndexDoc, IndexManager, IndexOp, blocking};
+use crate::persist::IndexStore;
 
 /// Имя подписчика журнала событий (ключ позиций и лиз разделов).
 pub const SUBSCRIBER: &str = "indexer";
@@ -65,6 +70,7 @@ pub trait DocumentSource: Send + Sync + 'static {
 pub struct Indexer {
     indexes: Arc<IndexManager>,
     source: Arc<dyn DocumentSource>,
+    store: Option<Arc<IndexStore>>,
     cfg: IndexerConfig,
 }
 
@@ -90,8 +96,15 @@ impl Indexer {
         Self {
             indexes,
             source,
+            store: None,
             cfg,
         }
+    }
+
+    /// Индексы сохраняются в BlobStore с манифестом (SRCH-05).
+    pub fn with_store(mut self, store: Arc<IndexStore>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Изменения индекса по событию.
@@ -133,29 +146,47 @@ impl Indexer {
 
     /// Коммит накопленных изменений: по коммиту на учётную запись.
     async fn flush(&self, pending: &mut Pending) -> Result<()> {
-        if pending.is_empty() {
-            return Ok(());
+        for ((tenant, account), ops) in std::mem::take(pending) {
+            self.commit(AccountScope { tenant, account }, ops).await?;
         }
-        let batch = std::mem::take(pending);
-        let indexes = self.indexes.clone();
-        tokio::task::spawn_blocking(move || {
-            for ((tenant, account), ops) in batch {
-                let scope = AccountScope { tenant, account };
-                // Только удаления — индекс не создаётся, если его ещё нет.
-                let index = if ops.iter().all(|op| matches!(op, IndexOp::Delete(_))) {
-                    match indexes.open(scope)? {
-                        Some(index) => index,
-                        None => continue,
-                    }
-                } else {
-                    indexes.open_or_create(scope)?
-                };
-                index.apply(&ops)?;
+        Ok(())
+    }
+
+    /// Коммит изменений индекса учётной записи и его выгрузка.
+    async fn commit(&self, scope: AccountScope, ops: Vec<IndexOp>) -> Result<()> {
+        let _gate = self.indexes.lock(scope).await;
+        // Только удаления — индекс не создаётся, если его ещё нет.
+        let create = !ops.iter().all(|op| matches!(op, IndexOp::Delete(_)));
+        let index = match (self.indexes.cached(scope), &self.store) {
+            // Индекс пишет только этот узел (лиза): выгруженный ранее не сверяется с манифестом.
+            (Some(index), Some(_)) if index.synced().version > 0 => Some(index),
+            (_, Some(store)) => store.sync(&self.indexes, scope, create).await?,
+            (_, None) => {
+                let m = self.indexes.clone();
+                blocking(move || m.open(scope)).await?
             }
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::internal(format!("indexer task: {e}")))?
+        };
+        let index = match index {
+            Some(index) => index,
+            None if !create => return Ok(()),
+            None => {
+                let m = self.indexes.clone();
+                blocking(move || m.open_or_create(scope)).await?
+            }
+        };
+        let i = index.clone();
+        blocking(move || i.apply(&ops)).await?;
+        if let Some(store) = &self.store {
+            match store.publish(scope, &index).await {
+                Ok(_) => {}
+                Err(Error::Conflict) => {
+                    self.indexes.forget(scope);
+                    return Err(Error::Conflict);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -494,5 +525,64 @@ mod tests {
         assert_eq!(c.commit_interval, Duration::from_millis(500));
         assert!(crate::tests::from_pairs::<IndexerConfig>(&[("commit_interval", "5")]).is_err());
         assert!(crate::tests::from_pairs::<IndexerConfig>(&[("batch", "5")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn indexer_publishes_and_fails_over() {
+        use crate::persist::tests::{node, store};
+        let (_, _, store) = store();
+        let source = Arc::new(MemSource::default());
+        let indexer_on = |n: &crate::persist::tests::Node| {
+            Indexer::new(n.indexes.clone(), source.clone(), IndexerConfig::default())
+                .with_store(store.clone())
+        };
+        let (a, b) = (node(), node());
+        let (on_a, on_b) = (indexer_on(&a), indexer_on(&b));
+        let (log, leases) = (MemEventLog::new(2), MemLease::default());
+        let scope = scope();
+        let inbox = MailboxId::new();
+        let deliver = |d: &IndexDoc| {
+            source.put(d.clone());
+            log.append(event(
+                scope,
+                inbox,
+                CoreEventKind::Delivered { message: d.message },
+            ));
+        };
+
+        let report = mail(inbox, "Квартальный отчёт");
+        deliver(&report);
+        assert_eq!(drain(&log, &leases, &on_a).await, 1);
+        assert_eq!(store.manifest(scope).await.expect("manifest").docs(), 1);
+
+        // Отказ узла A: узел B загружает индекс из BlobStore и продолжает индексацию.
+        let invoice = mail(inbox, "Счёт на оплату");
+        deliver(&invoice);
+        assert_eq!(drain(&log, &leases, &on_b).await, 1);
+        assert_eq!(subjects(&b.search, scope, "отчет").await, [report.message]);
+        assert_eq!(subjects(&b.search, scope, "счет").await, [invoice.message]);
+        assert_eq!(store.manifest(scope).await.expect("manifest").docs(), 2);
+
+        // Узел A вернулся с устаревшим индексом: конфликт, повтор пачки начинается с загрузки.
+        let late = mail(inbox, "Позднее письмо");
+        deliver(&late);
+        let mut retried = false;
+        for p in 0..log.partitions() {
+            let p = Partition(p);
+            let after = log.position(SUBSCRIBER, p).await.expect("position");
+            let batch = log.read(p, after, 100).await.expect("read");
+            let Some(last) = batch.last().map(|e| e.pos) else {
+                continue;
+            };
+            assert!(matches!(on_a.handle(&batch).await, Err(Error::Conflict)));
+            on_a.handle(&batch).await.expect("retry");
+            log.commit(SUBSCRIBER, p, last).await.expect("commit");
+            retried = true;
+        }
+        assert!(retried);
+        let m = store.manifest(scope).await.expect("manifest");
+        assert_eq!(m.docs(), 3);
+        assert_eq!(subjects(&a.search, scope, "письмо").await, [late.message]);
+        assert_eq!(subjects(&a.search, scope, "счет").await, [invoice.message]);
     }
 }

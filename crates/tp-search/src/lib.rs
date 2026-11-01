@@ -3,15 +3,18 @@
 //! - [`index`] — схема индекса ящика и менеджер индексов в каталоге;
 //! - [`analyzers`] — анализатор текста: слова, регистр, «ё», стеммеры Snowball (ru, en);
 //! - [`query`] — исполнитель запросов [`tp_contracts::search::SearchIndex`];
-//! - [`indexer`] — роль indexer: подписчик журнала событий, пакетный коммит индекса.
+//! - [`indexer`] — роль indexer: подписчик журнала событий, пакетный коммит индекса;
+//! - [`persist`] — сегменты индекса в BlobStore и манифест версии, загрузка индекса на другом узле.
 
 pub mod analyzers;
 pub mod index;
 pub mod indexer;
+pub mod persist;
 pub mod query;
 
 pub use index::{IndexConfig, IndexDoc, IndexManager, IndexOp, MailIndex, SCHEMA_VERSION};
 pub use indexer::{DocumentSource, Indexer, IndexerConfig, SUBSCRIBER};
+pub use persist::{IndexStore, PersistConfig};
 pub use query::{QueryConfig, Search};
 
 use schemars::JsonSchema;
@@ -27,6 +30,8 @@ pub struct SearchConfig {
     pub indexer: IndexerConfig,
     /// Выполнение запросов (роль search).
     pub query: QueryConfig,
+    /// Сегменты в BlobStore.
+    pub persist: PersistConfig,
 }
 
 #[cfg(test)]
