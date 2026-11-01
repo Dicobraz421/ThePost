@@ -24,6 +24,7 @@ use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, Ingested};
 use tp_contracts::meta::{AccountScope, NewMessage, PartRef};
 use tp_contracts::{BlobHash, BlobKey, Error, Result, TenantId};
 
+use crate::quota::Pending;
 use crate::split::{self, Split};
 use crate::{Store, meta};
 
@@ -37,7 +38,13 @@ struct SkeletonGroup {
 }
 
 impl Store {
-    pub(crate) async fn ingest_impl(&self, req: IngestRequest) -> Result<Ingested> {
+    /// Приём; `service` — служебное письмо (предупреждение о квоте): без проверки квоты. Возвращает и проверенные
+    /// добавления квоты — для предупреждений после приёма ([`Store::warn_quota`]).
+    pub(crate) async fn ingest_inner(
+        &self,
+        req: IngestRequest,
+        service: bool,
+    ) -> Result<(Ingested, Vec<Pending>)> {
         let IngestRequest {
             tenant,
             mail_from,
@@ -87,7 +94,17 @@ impl Store {
                 (d.account, size as u64)
             })
             .collect();
-        self.check_quota(tenant, &demands).await?;
+        let mut pending = if service {
+            Vec::new()
+        } else {
+            self.check_quotas(tenant, &demands).await?
+        };
+        for p in &mut pending {
+            p.fallback = deliveries
+                .iter()
+                .find(|d| d.account == p.account)
+                .map(|d| d.mailbox);
+        }
 
         // Разбор — работа процессора на всё письмо: вне потоков асинхронного рантайма.
         let (split, meta) = tokio::task::spawn_blocking(move || {
@@ -213,10 +230,11 @@ impl Store {
         }
         // Доставки сверх запроса (копии точек принятия решений) вызывающему не возвращаются.
         done.truncate(info.deliveries.len());
-        Ok(Ingested {
+        let ingested = Ingested {
             delivered: done,
             forward,
-        })
+        };
+        Ok((ingested, pending))
     }
 
     /// Учитывает объект с `refs` ссылками и загружает его, если его ещё нет (SRS 3.4, шаги 2–3).

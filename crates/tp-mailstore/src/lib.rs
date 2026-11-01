@@ -18,7 +18,9 @@ use tp_contracts::blob::{BlobIndex, BlobStore, ByteStream};
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{IngestRequest, Ingested, MailStore};
-use tp_contracts::meta::{AccountScope, ChangeLog, FlagOp, FlagsUpdate, Inserted, MessageStore};
+use tp_contracts::meta::{
+    AccountScope, ChangeLog, FlagOp, FlagsUpdate, Inserted, MailboxStore, MessageStore,
+};
 use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::{MailboxId, MessageId, ModSeq, Result};
 
@@ -30,6 +32,7 @@ pub mod quota;
 pub mod split;
 pub mod trash;
 
+pub use quota::QuotaWarnConfig;
 pub use trash::{TrashConfig, TrashPass};
 
 /// Конфигурация хранилища (секция config.yaml; поля необязательны, неизвестное — ошибка).
@@ -39,12 +42,18 @@ pub use trash::{TrashConfig, TrashPass};
 ///   interval: 1h
 ///   batch: 500
 ///   defer: 1d
+/// quota:
+///   thresholds: [80, 95]
+///   interval: 1d
+///   from: postmaster@localhost
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Истечение срока корзины.
     pub trash: TrashConfig,
+    /// Предупреждения о заполнении квоты.
+    pub quota: QuotaWarnConfig,
 }
 
 /// Зависимости [`Store`]: реализации контрактов, выбранные приложением.
@@ -77,10 +86,23 @@ impl fmt::Debug for Deps {
 }
 
 /// Почтовое хранилище (реализация [`MailStore`]).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Store {
     d: Deps,
     cfg: Config,
+    /// Папки учётных записей: «Входящие» для предупреждений о квоте ([`Store::with_mailboxes`]).
+    mailboxes: Option<Arc<dyn MailboxStore>>,
+    warned: quota::Warned,
+}
+
+impl fmt::Debug for Store {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Store")
+            .field("d", &self.d)
+            .field("cfg", &self.cfg)
+            .field("mailboxes", &self.mailboxes.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Store {
@@ -91,7 +113,12 @@ impl Store {
 
     /// Хранилище поверх зависимостей с конфигурацией.
     pub fn with_config(deps: Deps, cfg: Config) -> Self {
-        Self { d: deps, cfg }
+        Self {
+            d: deps,
+            cfg,
+            mailboxes: None,
+            warned: quota::Warned::default(),
+        }
     }
 
     /// Публикует `MailboxChanged` для папок учётной записи (каждой — один раз).
@@ -118,7 +145,10 @@ impl Store {
 #[async_trait]
 impl MailStore for Store {
     async fn ingest(&self, req: IngestRequest) -> Result<Ingested> {
-        self.ingest_impl(req).await
+        let tenant = req.tenant;
+        let (ingested, pending) = self.ingest_inner(req, false).await?;
+        self.warn_quota(tenant, &pending).await;
+        Ok(ingested)
     }
 
     async fn fetch_raw(
@@ -201,6 +231,15 @@ pub(crate) mod testenv {
         }
 
         pub fn with_hooks(hooks: DecisionHooks) -> Self {
+            Self::build(hooks, Config::default(), false)
+        }
+
+        /// Конфигурация хранилища; `mailboxes` — [`Store::with_mailboxes`] поверх метаданных.
+        pub fn with_config(cfg: Config, mailboxes: bool) -> Self {
+            Self::build(DecisionHooks::default(), cfg, mailboxes)
+        }
+
+        fn build(hooks: DecisionHooks, cfg: Config, mailboxes: bool) -> Self {
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let blobs = MemBlobStore::new(clock.clone()).with_chunk_size(4096);
             let index = MemBlobIndex::new(clock.clone());
@@ -208,16 +247,22 @@ pub(crate) mod testenv {
             let bus = MemEventBus::default();
             let trash = MemTrash::new(&meta);
             let quota = MemQuota::new(&meta);
-            let store = Store::new(Deps {
-                blobs: Arc::new(blobs.clone()),
-                index: Arc::new(index.clone()),
-                messages: Arc::new(meta.clone()),
-                changes: Arc::new(meta.clone()),
-                trash: Arc::new(trash.clone()),
-                quota: Arc::new(quota.clone()),
-                bus: Arc::new(bus.clone()),
-                hooks,
-            });
+            let mut store = Store::with_config(
+                Deps {
+                    blobs: Arc::new(blobs.clone()),
+                    index: Arc::new(index.clone()),
+                    messages: Arc::new(meta.clone()),
+                    changes: Arc::new(meta.clone()),
+                    trash: Arc::new(trash.clone()),
+                    quota: Arc::new(quota.clone()),
+                    bus: Arc::new(bus.clone()),
+                    hooks,
+                },
+                cfg,
+            );
+            if mailboxes {
+                store = store.with_mailboxes(Arc::new(meta.clone()));
+            }
             Self {
                 blobs,
                 index,
