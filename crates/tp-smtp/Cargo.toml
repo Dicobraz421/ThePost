@@ -22,8 +22,12 @@ mail-auth = { workspace = true, features = ["arc"] }
 mail-builder.workspace = true
 mail-parser.workspace = true
 mail-send.workspace = true
+prometheus-client.workspace = true
+reqwest.workspace = true
+rustls-webpki.workspace = true
 schemars.workspace = true
 serde.workspace = true
+sha2.workspace = true
 smtp-proto.workspace = true
 thiserror.workspace = true
 time.workspace = true
