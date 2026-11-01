@@ -1,5 +1,7 @@
 //! Проверки СУБД для `thepost doctor` (SRS 3.1): структурированный отчёт, вывод — забота приложения.
 //! Проверка `tls` сообщает режим канала до СУБД (CTR-12, META-14): `sslmode` пула и TLS соединения на сервере.
+//! Проверка `node_role` (META-23): узел работает не от владельца схемы, а от роли с минимальными правами
+//! (`thepost_app`, `thepost_reader`; SRS 2.7, 3.1).
 
 use std::time::Duration;
 
@@ -59,7 +61,7 @@ pub enum Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     /// Идентификатор: `server_version`, `sync_replication`, `max_connections`, `timezone`,
-    /// `log_timezone`, `rls`, `tls`.
+    /// `log_timezone`, `rls`, `node_role`, `tls`.
     pub id: &'static str,
     /// Итог.
     pub status: Status,
@@ -113,6 +115,10 @@ struct Settings {
     log_timezone: String,
     rolsuper: bool,
     rolbypassrls: bool,
+    login: String,
+    schema_owner: Option<String>,
+    owns_schema: Option<bool>,
+    node_roles: Vec<String>,
     ssl: Option<bool>,
     ssl_version: Option<String>,
     ssl_cipher: Option<String>,
@@ -158,7 +164,14 @@ pub async fn check(pool: &PgPool, cfg: &DoctorConfig) -> Result<Report> {
                 current_setting('synchronous_commit') AS sync_commit,
                 current_setting('TimeZone') AS timezone,
                 current_setting('log_timezone') AS log_timezone,
-                r.rolsuper, r.rolbypassrls,
+                r.rolsuper, r.rolbypassrls, current_user::text AS login,
+                (SELECT o.rolname::text FROM pg_class c JOIN pg_roles o ON o.oid = c.relowner
+                 WHERE c.oid = to_regclass('public.accounts')) AS schema_owner,
+                (SELECT pg_has_role(current_user, c.relowner, 'MEMBER') FROM pg_class c
+                 WHERE c.oid = to_regclass('public.accounts')) AS owns_schema,
+                ARRAY(SELECT g.rolname::text FROM pg_roles g
+                      WHERE g.rolname IN ('thepost_app', 'thepost_reader')
+                        AND pg_has_role(current_user, g.oid, 'USAGE') ORDER BY 1) AS node_roles,
                 ss.ssl, ss.version AS ssl_version, ss.cipher AS ssl_cipher
          FROM pg_roles r LEFT JOIN pg_stat_ssl ss ON ss.pid = pg_backend_pid()
          WHERE r.rolname = current_user",
@@ -291,6 +304,31 @@ fn evaluate(s: &Settings, cfg: &DoctorConfig, pool_max: u32, ssl_mode: PgSslMode
         },
     );
 
+    let value = format!(
+        "роль = {}, владелец схемы = {}, роли узла: {}",
+        s.login,
+        s.schema_owner.as_deref().unwrap_or("—"),
+        if s.node_roles.is_empty() {
+            "нет".to_owned()
+        } else {
+            s.node_roles.join(", ")
+        }
+    );
+    let (status, message) = match s.owns_schema {
+        None => (Status::Skipped, "схема не применена: роль не проверяется"),
+        Some(true) => (
+            Status::Fail,
+            "узел работает от владельца схемы: владелец — только для миграций, узлу нужна роль \
+             thepost_app или thepost_reader",
+        ),
+        Some(false) if s.node_roles.is_empty() => (
+            Status::Warn,
+            "роль не входит в thepost_app и thepost_reader: права выданы вручную",
+        ),
+        Some(false) => (Status::Ok, "роль узла с минимальными правами"),
+    };
+    r.push("node_role", status, value, message);
+
     // Сервер видит своё соединение: через PgBouncer — участок PgBouncer → PostgreSQL.
     let server_tls = s.ssl == Some(true);
     let mut value = format!("sslmode={}", sslmode_name(ssl_mode));
@@ -333,6 +371,10 @@ mod tests {
             log_timezone: "Etc/UTC".into(),
             rolsuper: false,
             rolbypassrls: false,
+            login: "thepost_node".into(),
+            schema_owner: Some("thepost_owner".into()),
+            owns_schema: Some(false),
+            node_roles: vec!["thepost_app".into()],
             ssl: Some(true),
             ssl_version: Some("TLSv1.3".into()),
             ssl_cipher: Some("TLS_AES_256_GCM_SHA384".into()),
@@ -367,7 +409,11 @@ mod tests {
             PgSslMode::VerifyFull,
         );
         assert_eq!(r.status(), Status::Ok);
-        assert_eq!(r.checks.len(), 7);
+        assert_eq!(r.checks.len(), 8);
+        assert_eq!(
+            r.get("node_role").map(|c| c.value.as_str()),
+            Some("роль = thepost_node, владелец схемы = thepost_owner, роли узла: thepost_app")
+        );
         assert_eq!(
             r.get("tls").map(|c| c.value.as_str()),
             Some("sslmode=verify-full, TLSv1.3, TLS_AES_256_GCM_SHA384")
@@ -412,6 +458,26 @@ mod tests {
             r.get("sync_replication").map(|c| c.status),
             Some(Status::Fail)
         );
+    }
+
+    #[test]
+    fn node_role() {
+        let cfg = DoctorConfig::default();
+        let role = |s: &Settings| {
+            evaluate(s, &cfg, 32, PgSslMode::VerifyFull)
+                .get("node_role")
+                .map(|c| c.status)
+        };
+        let mut s = settings();
+        assert_eq!(role(&s), Some(Status::Ok));
+        s.owns_schema = Some(true);
+        assert_eq!(role(&s), Some(Status::Fail), "владелец схемы");
+        s.owns_schema = Some(false);
+        s.node_roles.clear();
+        assert_eq!(role(&s), Some(Status::Warn), "права вручную");
+        s.owns_schema = None;
+        s.schema_owner = None;
+        assert_eq!(role(&s), Some(Status::Skipped), "схемы нет");
     }
 
     #[test]
