@@ -2,6 +2,11 @@
 //! «нулевой» MX RFC 7505 — отказ), адреса узла, соединение с `queue.source_ip`, STARTTLS по `queue.tls`,
 //! `MAIL`, `RCPT` каждому получателю, `DATA`. Сбой соединения или приветствия — следующий адрес или MX;
 //! все исчерпаны — временная неудача. `queue.relay` — все письма через узел-ретранслятор.
+//!
+//! Исходящий адрес `queue.source_ip` задаёт семейство адресов узлов: с IPv4-адреса пробуются только A-записи,
+//! с IPv6 — только AAAA; узел без адресов этого семейства — временная неудача, а не «домен не найден».
+//! Оппортунистический TLS (RFC 7435): сбой STARTTLS или рукопожатия — повтор на том же адресе без TLS,
+//! как уровень `may` Postfix; с `queue.tls: require` — сбой узла.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -33,7 +38,17 @@ impl std::fmt::Debug for MxTransport {
 }
 
 /// Неудача соединения с узлом: пробуется следующий.
-struct HostError(String);
+struct HostError {
+    reason: String,
+    /// Сбой на шаге STARTTLS (команда или рукопожатие): при оппортунистическом TLS — повтор без TLS.
+    tls: bool,
+}
+
+impl HostError {
+    fn new(reason: String) -> Self {
+        Self { reason, tls: false }
+    }
+}
 
 impl MxTransport {
     /// Отправка с резолвером `resolver` (системный — `MessageAuthenticator::new_system_conf`) и кэшем
@@ -97,14 +112,24 @@ impl MxTransport {
         }
     }
 
-    async fn addresses(&self, host: &str) -> Result<Vec<IpAddr>, mail_auth::Error> {
+    /// Адреса узла `host` семейства исходящего адреса `source` (`None` — IPv4, затем IPv6).
+    async fn addresses(
+        &self,
+        host: &str,
+        source: Option<IpAddr>,
+    ) -> Result<Vec<IpAddr>, mail_auth::Error> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![ip]);
         }
+        let strategy = match source {
+            None => IpLookupStrategy::Ipv4thenIpv6,
+            Some(IpAddr::V4(_)) => IpLookupStrategy::Ipv4Only,
+            Some(IpAddr::V6(_)) => IpLookupStrategy::Ipv6Only,
+        };
         self.resolver
             .ip_lookup(
                 host,
-                IpLookupStrategy::Ipv4thenIpv6,
+                strategy,
                 4,
                 Some(&self.cache.ipv4),
                 Some(&self.cache.ipv6),
@@ -112,15 +137,34 @@ impl MxTransport {
             .await
     }
 
-    /// Одна попытка на адрес `ip` узла `host`.
+    /// У узла есть адреса другого семейства, чем исходящий адрес `source`.
+    async fn other_family(&self, host: &str, source: IpAddr) -> bool {
+        let other = match source {
+            IpAddr::V4(_) => IpLookupStrategy::Ipv6Only,
+            IpAddr::V6(_) => IpLookupStrategy::Ipv4Only,
+        };
+        self.resolver
+            .ip_lookup(
+                host,
+                other,
+                1,
+                Some(&self.cache.ipv4),
+                Some(&self.cache.ipv6),
+            )
+            .await
+            .is_ok_and(|ips| !ips.is_empty())
+    }
+
+    /// Одна попытка на адрес `addr` узла `host`; `plain` — без STARTTLS (повтор после сбоя TLS).
     async fn attempt(
         &self,
         req: &SendRequest<'_>,
         host: &str,
         addr: SocketAddr,
+        plain: bool,
     ) -> Result<Vec<RcptResult>, HostError> {
         let timeout = req.cfg.timeout;
-        let err = |e: mail_send::Error| HostError(format!("{host} [{}]: {e}", addr.ip()));
+        let err = |e: mail_send::Error| HostError::new(format!("{host} [{}]: {e}", addr.ip()));
         let mut client = match req.cfg.source_ip {
             Some(local) => SmtpClient::connect_using(local, addr, timeout).await,
             None => SmtpClient::connect(addr, timeout).await,
@@ -131,25 +175,31 @@ impl MxTransport {
             .map_err(|_| err(mail_send::Error::Timeout))?
             .map_err(err)?;
         if greeting.code / 100 != 2 {
-            return Err(HostError(format!(
+            return Err(HostError::new(format!(
                 "{host}: greeting {}",
                 fmt_reply(&greeting)
             )));
         }
         let ehlo = client.ehlo(req.helo).await.map_err(err)?;
-        if ehlo.has_capability(EXT_START_TLS) {
+        if ehlo.has_capability(EXT_START_TLS) && !plain {
             let connector = match req.cfg.tls {
                 OutboundTls::Require => &self.verified,
                 OutboundTls::Opportunistic => &self.opportunistic,
             };
-            let mut tls = client.start_tls(connector, host).await.map_err(err)?;
+            let mut tls = client
+                .start_tls(connector, host)
+                .await
+                .map_err(|e| HostError {
+                    tls: true,
+                    ..err(e)
+                })?;
             let ehlo = tls.ehlo(req.helo).await.map_err(err)?;
             let out = transaction(&mut tls, req, ehlo.capabilities).await;
             let _ = tls.quit().await;
             out.map_err(err)
         } else if req.cfg.tls == OutboundTls::Require {
             let _ = client.quit().await;
-            Err(HostError(format!("{host}: STARTTLS not offered")))
+            Err(HostError::new(format!("{host}: STARTTLS not offered")))
         } else {
             let out = transaction(&mut client, req, ehlo.capabilities).await;
             let _ = client.quit().await;
@@ -168,12 +218,21 @@ impl Transport for MxTransport {
         };
         let mut last = String::from("no hosts");
         let mut unknown = 0;
+        let source = req.cfg.source_ip;
         for (host, port) in &hosts {
-            let ips = match self.addresses(host).await {
+            let ips = match self.addresses(host, source).await {
                 Ok(ips) if !ips.is_empty() => ips,
                 Ok(_) | Err(mail_auth::Error::Dns(DnsError::RecordNotFound(_))) => {
-                    unknown += 1;
-                    last = format!("{host}: no address");
+                    match source {
+                        Some(src) if self.other_family(host, src).await => {
+                            let family = if src.is_ipv4() { "IPv4" } else { "IPv6" };
+                            last = format!("{host}: no {family} address for egress {src}");
+                        }
+                        _ => {
+                            unknown += 1;
+                            last = format!("{host}: no address");
+                        }
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -182,11 +241,20 @@ impl Transport for MxTransport {
                 }
             };
             for ip in ips {
-                match self.attempt(&req, host, SocketAddr::new(ip, *port)).await {
+                let addr = SocketAddr::new(ip, *port);
+                let mut res = self.attempt(&req, host, addr, false).await;
+                if let Err(e) = &res
+                    && e.tls
+                    && req.cfg.tls == OutboundTls::Opportunistic
+                {
+                    tracing::info!(domain = %req.domain, error = %e.reason, "smtp: сбой TLS, повтор без TLS");
+                    res = self.attempt(&req, host, addr, true).await;
+                }
+                match res {
                     Ok(results) => return results,
-                    Err(HostError(e)) => {
-                        tracing::info!(domain = %req.domain, error = %e, "smtp: узел недоступен");
-                        last = e;
+                    Err(e) => {
+                        tracing::info!(domain = %req.domain, error = %e.reason, "smtp: узел недоступен");
+                        last = e.reason;
                     }
                 }
             }
