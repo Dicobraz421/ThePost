@@ -371,3 +371,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   PurgeOutcome}`, `TrashStore::purge`/`list_hidden` (скрытые письма; `list` — без них, `restore`/`defer`/`expired` — и для скрытых),
   `Policy::trash_purge`, `PolicyResolver::trash_purge`/`set_user_trash_purge`; квота без скрытых. In-memory — `MemPolicies`,
   `MemTrash` (скрытые в `MemMetadata`); набор `suite::trash_purge`. PostgreSQL — META-29 (в `PgMeta` пока заглушки).
+- 2026-11-04 — решение «Соответствие функциям Exchange» (CTR-35): `MailboxAudit`, `SenderLists`, контакты, динамические группы и оргструктура в `Directory`,
+  срок выпуска и отмена в `QueueStore`, выборка журнала доставки по отправке, `AccountState`.
