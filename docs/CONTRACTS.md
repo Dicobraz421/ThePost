@@ -373,3 +373,4 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `MemTrash` (скрытые в `MemMetadata`); набор `suite::trash_purge`. PostgreSQL — META-29 (в `PgMeta` пока заглушки).
 - 2026-11-04 — решение «Соответствие функциям Exchange» (CTR-35): `MailboxAudit`, `SenderLists`, контакты, динамические группы и оргструктура в `Directory`,
   срок выпуска и отмена в `QueueStore`, выборка журнала доставки по отправке, `AccountState`.
+- 2026-11-04 — решение «Внешние встречи» (CTR-36): `AvailabilitySource`, `Registry::add_availability_source`, `CalendarPublications`.
