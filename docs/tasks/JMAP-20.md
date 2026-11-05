@@ -11,5 +11,11 @@ manual: no
 ## Сделать
 - Capability `urn:thepost:calendarpublish`: `CalendarPublication/get`, `/set` (создать, отозвать); уровень не выше политики; запись в аудит.
 
+## Формат (клиент Postman уже такой, S8-45)
+- `CalendarPublication/get` — стандартный `/get` (`state`, `list`): `{ id, calendarId, detail, expires }`, `detail`: `freeBusy` или
+  `details`, `expires` — UTCDate или `null`. Адреса в списке нет: хранится только хэш токена (META-34).
+- `CalendarPublication/set` — стандартный `/set`: `create: { new: { calendarId, detail, expires? } }` → в `created.new` есть
+  `id` и `url`, адрес отдаётся только здесь; `destroy: [id]` — отзыв; сверх политики — `notCreated`.
+
 ## Приёмка
 - Тесты: создание, отзыв, отказ сверх политики.
