@@ -1,11 +1,12 @@
-//! Общее для фоновых работ BLOB (GC, поиск «сирот»): часы, ограничение скорости,
-//! периодический проход под лизой лидера.
+//! Общее для фоновых работ BLOB (GC, поиск «сирот»): часы и таймер, ограничение скорости,
+//! проход под лизой лидера (по расписанию из конфигурации или по сроку).
 
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use time::OffsetDateTime;
+use futures::future::BoxFuture;
+use time::{OffsetDateTime, PrimitiveDateTime};
 use tokio::time::Instant;
 use tp_contracts::Result;
 use tp_contracts::lease::{Lease, LeaseStore};
@@ -16,6 +17,29 @@ pub type Now = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 /// Системные часы UTC.
 pub fn system_now() -> Now {
     Arc::new(OffsetDateTime::now_utc)
+}
+
+/// Таймер: футура завершается не раньше момента `at` (UTC). В работе — tokio по системным часам,
+/// в тестах — по часам testkit.
+pub(crate) type Sleep = Arc<dyn Fn(OffsetDateTime) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// Таймер tokio до момента `at` по часам `now`.
+pub(crate) fn system_sleep(now: Now) -> Sleep {
+    Arc::new(move |at| {
+        let wait = Duration::try_from(at - now()).unwrap_or(Duration::ZERO);
+        Box::pin(tokio::time::sleep(wait))
+    })
+}
+
+/// Момент позже любого срока.
+const FAR: OffsetDateTime = PrimitiveDateTime::MAX.assume_utc();
+
+/// `t + d`; вне диапазона — [`FAR`].
+pub(crate) fn after(t: OffsetDateTime, d: Duration) -> OffsetDateTime {
+    time::Duration::try_from(d)
+        .ok()
+        .and_then(|d| t.checked_add(d))
+        .unwrap_or(FAR)
 }
 
 /// `t - d` с насыщением.
@@ -87,16 +111,26 @@ pub(crate) async fn keep(leader: &mut Option<&mut Leader<'_>>) -> Result<bool> {
     }
 }
 
-/// Параметры периодического прохода под лизой.
+/// Параметры прохода под лизой.
 #[derive(Clone, Copy)]
 pub(crate) struct Schedule<'a> {
     pub leases: &'a dyn LeaseStore,
     pub name: &'a str,
     pub holder: &'a str,
     pub ttl: Duration,
-    pub interval: Duration,
     /// Имя работы для логов.
     pub what: &'static str,
+}
+
+/// Итог попытки прохода под лизой.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tick {
+    /// Проход выполнен.
+    Done,
+    /// Лиза у другого узла или потеряна во время прохода.
+    NotLeader,
+    /// Лиза недоступна или проход прерван ошибкой.
+    Failed,
 }
 
 /// Проход фоновой работы под лизой. Футура — `Send`: `run` воркеров запускается через `tokio::spawn`
@@ -105,11 +139,13 @@ pub(crate) trait LeasedPass: Sync {
     fn leased_pass(&self, leader: &mut Leader<'_>) -> impl Future<Output = Result<()>> + Send;
 }
 
-/// Каждые `interval` захватывает (или продлевает) лизу `name` и выполняет проход `pass`;
-/// узел без лизы пропускает проход. Завершается по `shutdown` и освобождает лизу.
-/// Прерывание прохода на точке ожидания безопасно: каждый шаг протокола идемпотентен.
+/// По расписанию из конфигурации (SRS 2.8, таймер 4) каждые `interval` захватывает (или продлевает)
+/// лизу `name` и выполняет проход `pass`; узел без лизы пропускает проход. Завершается по `shutdown`
+/// и освобождает лизу ([`release`]). Прерывание прохода на точке ожидания безопасно: каждый шаг
+/// протокола идемпотентен.
 pub(crate) async fn run_leased(
     s: Schedule<'_>,
+    interval: Duration,
     shutdown: impl Future<Output = ()>,
     pass: &impl LeasedPass,
 ) {
@@ -119,14 +155,19 @@ pub(crate) async fn run_leased(
         tokio::select! {
             biased;
             () = &mut shutdown => break,
-            () = tick(s, &mut held, pass) => {}
+            _ = tick(s, &mut held, pass) => {}
         }
         tokio::select! {
             biased;
             () = &mut shutdown => break,
-            () = tokio::time::sleep(s.interval) => {}
+            () = tokio::time::sleep(interval) => {}
         }
     }
+    release(s, held).await;
+}
+
+/// Освобождает лизу, удержанную между проходами.
+pub(crate) async fn release(s: Schedule<'_>, held: Option<Lease>) {
     if let Some(lease) = held
         && let Err(e) = s.leases.release(&lease).await
     {
@@ -134,17 +175,27 @@ pub(crate) async fn run_leased(
     }
 }
 
-async fn tick(s: Schedule<'_>, held: &mut Option<Lease>, pass: &impl LeasedPass) {
-    let lease = match held.take() {
+/// Продлевает удержанную лизу (истёкшую и занятую другим — захватывает заново) и выполняет проход.
+pub(crate) async fn tick(
+    s: Schedule<'_>,
+    held: &mut Option<Lease>,
+    pass: &impl LeasedPass,
+) -> Tick {
+    let renewed = match held.take() {
         Some(lease) => s.leases.renew(&lease, s.ttl).await,
-        None => s.leases.try_acquire(s.name, s.holder, s.ttl).await,
+        None => Ok(None),
+    };
+    let lease = match renewed {
+        Ok(Some(lease)) => Ok(Some(lease)),
+        Ok(None) => s.leases.try_acquire(s.name, s.holder, s.ttl).await,
+        Err(e) => Err(e),
     };
     let lease = match lease {
         Ok(Some(lease)) => lease,
-        Ok(None) => return,
+        Ok(None) => return Tick::NotLeader,
         Err(e) => {
             tracing::warn!(what = s.what, error = %e, "лиза лидера недоступна");
-            return;
+            return Tick::Failed;
         }
     };
     let mut leader = Leader {
@@ -153,13 +204,19 @@ async fn tick(s: Schedule<'_>, held: &mut Option<Lease>, pass: &impl LeasedPass)
         ttl: s.ttl,
         lost: false,
     };
-    if let Err(e) = pass.leased_pass(&mut leader).await {
+    let res = pass.leased_pass(&mut leader).await;
+    if let Err(e) = &res {
         tracing::warn!(what = s.what, error = %e, "проход прерван ошибкой");
     }
     if leader.lost {
         tracing::info!(what = s.what, "лиза лидера потеряна");
+        return Tick::NotLeader;
+    }
+    *held = Some(leader.lease);
+    if res.is_ok() {
+        Tick::Done
     } else {
-        *held = Some(leader.lease);
+        Tick::Failed
     }
 }
 
