@@ -32,7 +32,9 @@ use tp_contracts::search::SearchIndex;
 use tp_contracts::{Error, MailboxId, MessageId, ModSeq, Result, Uid, UidValidity};
 use tp_platform::{Conn, Listener};
 
+use crate::compress::Deflate;
 use crate::config::ImapConfig;
+use crate::ext::Extensions;
 use crate::proto::types::auth::AuthMechanism;
 use crate::proto::types::command::{CommandBody, FetchModifier, SelectParameter};
 use crate::proto::types::core::{AString, Atom, IString, NString, Tag, Vec1};
@@ -44,6 +46,7 @@ use crate::proto::types::response::{
 };
 use crate::proto::types::secret::Secret;
 use crate::proto::{self, Body, Command, Expect, Input, Reader};
+use crate::qresync::QResync;
 use crate::search::SearchCmd;
 
 /// Канал сессии: поток байтов, признак TLS, апгрейд STARTTLS.
@@ -129,6 +132,8 @@ pub struct SessionCtx {
 /// Выбранная папка (`SELECT`/`EXAMINE`): снимок писем для номеров последовательности.
 #[derive(Debug, Clone)]
 pub(crate) struct Selected {
+    /// Владелец папки (общая папка — другая учётная запись).
+    pub owner: AccountScope,
     /// Папка.
     pub mailbox: MailboxId,
     /// `EXAMINE`: только чтение.
@@ -155,6 +160,12 @@ pub struct Session<T: Transport> {
     /// CONDSTORE включён (`ENABLE CONDSTORE` или команда с `MODSEQ`, RFC 7162, 3.1): `MODSEQ` в ответах
     /// `FETCH` и `HIGHESTMODSEQ` при выборе папки.
     pub(crate) condstore: bool,
+    /// QRESYNC включён (`ENABLE QRESYNC`, RFC 7162, 3.2.3): `VANISHED` вместо `EXPUNGE`.
+    pub(crate) qresync: bool,
+    /// Необязательные зависимости расширений (QUOTA, ACL).
+    pub(crate) ext: Extensions,
+    /// Сжатие потока (`COMPRESS DEFLATE`).
+    pub(crate) deflate: Option<Deflate>,
     errors: u32,
     auth_failures: u32,
     /// Сессия завершается после отправки накопленных ответов.
@@ -192,10 +203,12 @@ const EXTENSIONS: &[&str] = &[
     "STATUS=SIZE",
     "BINARY",
     "CONDSTORE",
+    "QRESYNC",
     "ESEARCH",
     "UIDPLUS",
     "MOVE",
     "IDLE",
+    "NAMESPACE",
 ];
 
 fn reader(config: &ImapConfig) -> Reader {
@@ -216,10 +229,19 @@ impl<T: Transport> Session<T> {
             selected: None,
             rev2: false,
             condstore: false,
+            qresync: false,
+            ext: Extensions::default(),
+            deflate: None,
             errors: 0,
             auth_failures: 0,
             close: false,
         }
+    }
+
+    /// Подключает зависимости расширений (QUOTA, ACL, общие папки).
+    pub fn with_extensions(mut self, ext: Extensions) -> Self {
+        self.ext = ext;
+        self
     }
 
     /// Ведёт сессию до `LOGOUT`, закрытия клиентом, таймаута или остановки узла.
@@ -253,8 +275,14 @@ impl<T: Transport> Session<T> {
             self.out.clear();
             return Ok(());
         };
+        let compressed = match self.deflate.as_mut() {
+            Some(d) => Some(d.compress(&self.out)?),
+            None => None,
+        };
         let io = conn.io();
-        io.write_all(&self.out).await.map_err(io_error)?;
+        io.write_all(compressed.as_deref().unwrap_or(&self.out))
+            .await
+            .map_err(io_error)?;
         io.flush().await.map_err(io_error)?;
         self.out.clear();
         Ok(())
@@ -309,7 +337,13 @@ impl<T: Transport> Session<T> {
                     return self.end().await;
                 }
                 Some(Ok(Ok(0))) => return Ok(None),
-                Some(Ok(Ok(n))) => self.reader.push(&buf[..n]),
+                Some(Ok(Ok(n))) => {
+                    if let Err(e) = self.received(&buf[..n]) {
+                        tracing::debug!(error = %e, "imap: сжатый поток повреждён");
+                        self.close = true;
+                        return Ok(None);
+                    }
+                }
                 Some(Ok(Err(e))) => return Err(io_error(e)),
             }
         }
@@ -434,7 +468,18 @@ impl<T: Transport> Session<T> {
     }
 
     pub(crate) fn capabilities(&self) -> Vec1<Capability<'static>> {
-        let mut caps: Vec<Capability<'static>> = EXTENSIONS.iter().map(|c| cap(c)).collect();
+        let mut caps: Vec<Capability<'static>> = EXTENSIONS
+            .iter()
+            .chain(&self.ext.capabilities())
+            .chain(
+                self.ctx
+                    .config
+                    .compress
+                    .enabled
+                    .then_some(&"COMPRESS=DEFLATE"),
+            )
+            .map(|c| cap(c))
+            .collect();
         if self.principal.is_none() {
             let conn = self.conn.as_ref();
             if conn.is_some_and(Transport::can_starttls) {
@@ -451,6 +496,15 @@ impl<T: Transport> Session<T> {
             }
         }
         Vec1::try_from(caps).unwrap_or_else(|_| Vec1::from(Capability::Imap4Rev1))
+    }
+
+    /// Контекст операций с выбранной папкой: владелец папки (общая папка — другая учётная запись),
+    /// без выбранной папки — [`Session::scope`].
+    pub(crate) fn mailbox_scope(&self) -> Option<AccountScope> {
+        match &self.selected {
+            Some(s) => self.principal.as_ref().map(|_| s.owner),
+            None => self.scope(),
+        }
     }
 
     /// Контекст операций хранилища; `None` — не выполнен вход.
@@ -551,6 +605,20 @@ impl<T: Transport> Session<T> {
                 Ok(())
             }
             Body::List(cmd) => self.list(&tag, cmd).await,
+            Body::Acl(cmd) => self.acl_command(&tag, cmd).await,
+            Body::Std(CommandBody::Compress { algorithm }) => self.compress(&tag, algorithm).await,
+            Body::Std(CommandBody::Namespace) => {
+                self.namespace(&tag);
+                Ok(())
+            }
+            Body::Std(CommandBody::GetQuota { root }) => self.get_quota(&tag, &root).await,
+            Body::Std(CommandBody::GetQuotaRoot { mailbox }) => {
+                self.get_quota_root(&tag, &mailbox).await
+            }
+            Body::Std(CommandBody::SetQuota { .. }) => {
+                self.set_quota(&tag);
+                Ok(())
+            }
             Body::Status { mailbox, items } => self.status(&tag, &mailbox, &items).await,
             Body::Create { mailbox, uses } => self.create(&tag, &mailbox, &uses).await,
             Body::ESearch {
@@ -576,16 +644,20 @@ impl<T: Transport> Session<T> {
                     mailbox,
                     parameters,
                 } => {
-                    self.select_params(&parameters);
-                    self.select(&tag, &proto::mailbox_bytes(&mailbox), false)
+                    let Some(q) = self.select_params(&tag, parameters) else {
+                        return Ok(());
+                    };
+                    self.select(&tag, &proto::mailbox_bytes(&mailbox), false, q.as_ref())
                         .await
                 }
                 CommandBody::Examine {
                     mailbox,
                     parameters,
                 } => {
-                    self.select_params(&parameters);
-                    self.select(&tag, &proto::mailbox_bytes(&mailbox), true)
+                    let Some(q) = self.select_params(&tag, parameters) else {
+                        return Ok(());
+                    };
+                    self.select(&tag, &proto::mailbox_bytes(&mailbox), true, q.as_ref())
                         .await
                 }
                 CommandBody::Delete { mailbox } => {
@@ -653,8 +725,38 @@ impl<T: Transport> Session<T> {
                     FetchModifier::ChangedSince(n) => Some(n.get()),
                     FetchModifier::Vanished => None,
                 });
-                self.fetch(tag, &sequence_set, macro_or_item_names, uid, changed_since)
-                    .await
+                let vanished = modifiers
+                    .iter()
+                    .any(|m| matches!(m, FetchModifier::Vanished));
+                // RFC 7162, 3.2.6: `VANISHED` — только в `UID FETCH` с `CHANGEDSINCE` после `ENABLE QRESYNC`.
+                match (vanished, changed_since) {
+                    (true, Some(since)) if uid && self.qresync => {
+                        match self.fetch_vanished(&sequence_set, since).await {
+                            Ok(()) => {
+                                self.fetch(
+                                    tag,
+                                    &sequence_set,
+                                    macro_or_item_names,
+                                    uid,
+                                    changed_since,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    (true, _) => {
+                        self.bad(
+                            Some(tag),
+                            "VANISHED requires UID FETCH with CHANGEDSINCE and QRESYNC",
+                        );
+                        Ok(())
+                    }
+                    (false, _) => {
+                        self.fetch(tag, &sequence_set, macro_or_item_names, uid, changed_since)
+                            .await
+                    }
+                }
             }
             body @ CommandBody::Store { .. } => self.store(tag, body).await,
             CommandBody::Copy {
@@ -862,14 +964,36 @@ impl<T: Transport> Session<T> {
         );
     }
 
-    /// Параметры `SELECT`/`EXAMINE`: `CONDSTORE` включает CONDSTORE (RFC 7162, 3.1.8).
-    fn select_params(&mut self, parameters: &[SelectParameter]) {
-        if parameters
-            .iter()
-            .any(|p| matches!(p, SelectParameter::CondStore))
-        {
-            self.condstore = true;
+    /// Параметры `SELECT`/`EXAMINE`: `CONDSTORE` включает CONDSTORE (RFC 7162, 3.1.8); `QRESYNC` —
+    /// ресинхронизация (только после `ENABLE QRESYNC`, иначе `BAD`). `None` — ответ `BAD` записан.
+    fn select_params(
+        &mut self,
+        tag: &Tag<'static>,
+        parameters: Vec<SelectParameter>,
+    ) -> Option<Option<QResync>> {
+        let mut qresync = None;
+        for p in parameters {
+            match p {
+                SelectParameter::CondStore => self.condstore = true,
+                SelectParameter::QResync {
+                    uid_validity,
+                    mod_sequence_value,
+                    known_uids,
+                    seq_match_data: _,
+                } => {
+                    if !self.qresync {
+                        self.bad(Some(tag), "QRESYNC is not enabled");
+                        return None;
+                    }
+                    qresync = Some(QResync {
+                        uid_validity: uid_validity.get(),
+                        modseq: mod_sequence_value.get(),
+                        known_uids,
+                    });
+                }
+            }
         }
+        Some(qresync)
     }
 
     fn enable(&mut self, tag: &Tag<'static>, capabilities: Vec1<CapabilityEnable<'static>>) {
@@ -884,6 +1008,11 @@ impl<T: Transport> Session<T> {
                 self.rev2 = true;
                 enabled.push(c);
             } else if name.eq_ignore_ascii_case("CONDSTORE") {
+                self.condstore = true;
+                enabled.push(c);
+            } else if name.eq_ignore_ascii_case("QRESYNC") {
+                // RFC 7162, 3.2.3: QRESYNC включает и CONDSTORE.
+                self.qresync = true;
                 self.condstore = true;
                 enabled.push(c);
             }
@@ -904,12 +1033,22 @@ pub(crate) fn io_error(e: std::io::Error) -> Error {
 #[derive(Debug, Clone)]
 pub struct Server {
     ctx: Arc<SessionCtx>,
+    ext: Extensions,
 }
 
 impl Server {
     /// Сервер с контекстом сессий.
     pub fn new(ctx: SessionCtx) -> Self {
-        Self { ctx: Arc::new(ctx) }
+        Self {
+            ctx: Arc::new(ctx),
+            ext: Extensions::default(),
+        }
+    }
+
+    /// Подключает зависимости расширений (QUOTA, ACL, общие папки) для новых сессий.
+    pub fn with_extensions(mut self, ext: Extensions) -> Self {
+        self.ext = ext;
+        self
     }
 
     /// Принимает соединения до остановки узла, затем ждёт сессии не дольше `timeouts.drain`
@@ -931,6 +1070,7 @@ impl Server {
                     };
                     let full = sessions.len() >= self.ctx.config.limits.max_connections;
                     let ctx = self.ctx.clone();
+                    let ext = self.ext.clone();
                     let task = async move {
                         let peer = incoming.peer();
                         let conn = match incoming.establish().await {
@@ -945,7 +1085,7 @@ impl Server {
                             return;
                         }
                         let client = conn.info.client;
-                        if let Err(e) = Session::new(ctx, conn).run().await {
+                        if let Err(e) = Session::new(ctx, conn).with_extensions(ext).run().await {
                             tracing::debug!(%client, error = %e, "imap: сессия прервана");
                         }
                     };

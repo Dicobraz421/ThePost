@@ -138,7 +138,16 @@ impl<T: Transport> Session<T> {
             self.ok(tag, None, &format!("{verb} completed"));
             return Ok(());
         }
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
+        // Письма общей папки другой учётной записи не копируются: хранилище работает в одной учётной записи.
+        if Some(scope) != self.scope() {
+            self.no(
+                tag,
+                Some(proto::code("NOPERM")),
+                "Copying from a shared mailbox is not supported",
+            );
+            return Ok(());
+        }
         let ids: Vec<MessageId> = targets.iter().map(|t| t.2).collect();
         let to = node.mailbox.id;
         let to_trash = mv && node.mailbox.role == Some(SpecialUse::Trash) && to != source;
@@ -210,19 +219,25 @@ impl<T: Transport> Session<T> {
     }
 
     /// Убирает письма (индексы снимка) из выбранной папки и сообщает `EXPUNGE` (по убыванию номеров,
-    /// чтобы номера ещё не сообщённых писем не сдвигались).
+    /// чтобы номера ещё не сообщённых писем не сдвигались) или `VANISHED` (QRESYNC).
     pub(crate) fn expunged(&mut self, indexes: &[usize]) {
         let mut sorted = indexes.to_vec();
         sorted.sort_unstable_by(|a, b| b.cmp(a));
         sorted.dedup();
         let mut seqs = Vec::new();
+        let mut uids = Vec::new();
         if let Some(selected) = self.selected.as_mut() {
             for i in sorted {
                 if i < selected.messages.len() {
-                    selected.messages.remove(i);
+                    uids.push(selected.messages.remove(i).0.0);
                     seqs.push(u32::try_from(i + 1).unwrap_or(u32::MAX));
                 }
             }
+        }
+        // После `ENABLE QRESYNC` — `VANISHED` вместо `EXPUNGE` (RFC 7162, 3.2.10).
+        if self.qresync {
+            self.vanished_now(&uids);
+            return;
         }
         for seq in seqs {
             self.data(Data::Expunge(proto::nz(seq)));
@@ -234,7 +249,7 @@ impl<T: Transport> Session<T> {
         let Some(selected) = self.selected.as_ref() else {
             return Ok(Vec::new());
         };
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let limit = self.ctx.config.limits.max_mailbox_messages;
         let list = self
             .ctx
@@ -258,7 +273,7 @@ impl<T: Transport> Session<T> {
 
     /// Выбранная папка — корзина.
     async fn in_trash(&self, mailbox: MailboxId) -> Result<bool> {
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let mb = self.ctx.deps.mailboxes.get(scope, mailbox).await?;
         Ok(mb.is_some_and(|m| m.role == Some(SpecialUse::Trash)))
     }
@@ -324,7 +339,7 @@ impl<T: Transport> Session<T> {
             self.ok(tag, None, &format!("{verb} completed"));
             return Ok(());
         }
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let ids: Vec<MessageId> = found.iter().map(|f| f.1).collect();
         let indexes: Vec<usize> = if self.in_trash(mailbox).await? {
             let gone = self.purge(scope, mailbox, &ids).await?;
@@ -352,7 +367,7 @@ impl<T: Transport> Session<T> {
         if !read_only {
             let found = self.deleted(None).await?;
             if !found.is_empty() {
-                let scope = self.scope().ok_or(Error::Forbidden)?;
+                let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
                 let ids: Vec<MessageId> = found.iter().map(|f| f.1).collect();
                 if self.in_trash(mailbox).await? {
                     self.purge(scope, mailbox, &ids).await?;

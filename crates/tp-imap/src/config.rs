@@ -13,6 +13,16 @@
 //!     autologout: 30m
 //!     idle: 30m
 //!     drain: 30s
+//!   namespace:
+//!     other_users: Other Users
+//!   compress:
+//!     enabled: true
+//!     level: 6
+//!   pop3:
+//!     enabled: false
+//!     listeners:
+//!       - listen: "[::]:995"
+//!         implicit_tls: true
 //! ```
 //!
 //! Слушатели применяются при запуске роли; лимиты и таймауты — к новым сессиям без перезапуска.
@@ -34,6 +44,91 @@ pub struct ImapConfig {
     pub limits: Limits,
     /// Таймауты сессии.
     pub timeouts: Timeouts,
+    /// Пространства имён (RFC 2342).
+    pub namespace: NamespaceConfig,
+    /// Сжатие `COMPRESS=DEFLATE` (RFC 4978).
+    pub compress: CompressConfig,
+    /// POP3 (RFC 1939) для устаревших устройств; выключен по умолчанию.
+    pub pop3: Pop3Config,
+}
+
+/// POP3 (RFC 1939, STLS — RFC 2595, AUTH — RFC 5034). Слушатели применяются при запуске роли.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Pop3Config {
+    /// POP3 включён.
+    pub enabled: bool,
+    /// Слушатели: 110 со STLS и 995 с неявным TLS. Требует перезапуска.
+    pub listeners: Vec<EndpointConfig>,
+    /// Наибольшая строка команды (с `AUTH` и ответами SASL), байт; длиннее — `-ERR` и закрытие.
+    pub max_line: usize,
+    /// Ошибочных команд за сессию; затем закрытие.
+    pub max_errors: u32,
+    /// Неудачных попыток входа за сессию; затем закрытие.
+    pub max_auth_failures: u32,
+    /// Одновременных соединений на слушатель; сверх лимита — `-ERR` и закрытие.
+    pub max_connections: usize,
+    /// Наибольшее число писем во «Входящих» для POP3; больше — вход отклоняется.
+    pub max_messages: usize,
+    /// Бездействие до входа.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub login_timeout: Duration,
+    /// Бездействие после входа (не меньше 10 минут по RFC 1939, 3).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub autologout: Duration,
+}
+
+impl Default for Pop3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listeners: Vec::new(),
+            max_line: 8 * 1024,
+            max_errors: 10,
+            max_auth_failures: 3,
+            max_connections: 1000,
+            max_messages: 100_000,
+            login_timeout: Duration::from_secs(60),
+            autologout: Duration::from_secs(10 * 60),
+        }
+    }
+}
+
+/// Сжатие потока IMAP (RFC 4978).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompressConfig {
+    /// `COMPRESS=DEFLATE` разрешён.
+    pub enabled: bool,
+    /// Уровень сжатия DEFLATE, 0–9.
+    pub level: u32,
+}
+
+impl Default for CompressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: 6,
+        }
+    }
+}
+
+/// Пространства имён IMAP (RFC 2342): общие папки других пользователей — `<other_users>/<имя входа>/<папка>`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct NamespaceConfig {
+    /// Корень папок других пользователей, открытых по ACL (без разделителя `/`).
+    pub other_users: String,
+}
+
+impl Default for NamespaceConfig {
+    fn default() -> Self {
+        Self {
+            other_users: "Other Users".into(),
+        }
+    }
 }
 
 /// Лимиты сессии IMAP.
