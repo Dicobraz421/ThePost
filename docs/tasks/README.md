@@ -336,11 +336,23 @@
 | [APP-10](APP-10.md) | подключение после app-02 — корзина, сжатие, нагрузка | app | A | app-06 | ready | APP-04,IMAP-14,JMAP-11,MS-15 |
 | [JMAP-13](JMAP-13.md) | загрузка, совпавшая со сжатой частью письма | jmap | A | jmap-07 | ready | JMAP-06,MS-15 |
 
+## Ф1 · Находки CMP-01: проверка клиентом Postman 2026-11-05 (приоритет)
+
+| Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
+|---|---|---|---|---|---|---|
+| [CMP-01](CMP-01.md) | эталон `--profile smb` принимает соединения | deploy | A | deploy-08 | ready | — |
+| [CMP-02](CMP-02.md) | каталоги ролей создаются до наложения Landlock | app | A | app-09 | ready | — |
+| [CMP-06](CMP-06.md) | индексатор — повтор после ошибки с нарастающей паузой | search | A | search-03 | ready | — |
+| [CMP-03](CMP-03.md) | EmailSubmission/query и queryChanges | jmap | A | jmap-10 | ready | — |
+| [CMP-04](CMP-04.md) | отправка локальному адресату — доставка сразу, без внешней очереди | smtp | A | smtp-08 | ready | — |
+| [CMP-05](CMP-05.md) | системные папки при создании учётной записи и при первом входе | meta | A | meta-17 | ready | — |
+| [CMP-08](CMP-08.md) | `Outbound` JMAP со статусами по получателям | jmap | A | jmap-11 | todo | CMP-03 |
+| [CMP-07](CMP-07.md) | отправка из JMAP через `Delivery` — локальным адресатам сразу | app | A | app-10 | todo | CMP-04,CMP-08 |
+
 ## Вне волн
 
 | Задача | Суть | Полоса | Класс | Зависит |
 |---|---|---|---|---|
 | [AUTH-09](AUTH-09.md) | пароли приложений на контракте AppPasswordStore | auth | A | CTR-22 |
-| [CMP-01](CMP-01.md) | находки проверки клиентом Postman | deploy | A | — |
 | [CTR-22](CTR-22.md) | контракт AppPasswordStore (пароли приложений) | contracts | B | CTR-19,AUTH-02 |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней, домены, журнал аудита | contracts | B | ADM-02,CTR-24,META-22 |
