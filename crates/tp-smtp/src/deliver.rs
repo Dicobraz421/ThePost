@@ -19,7 +19,8 @@
 //! (CMP-04): локальные получатели доставляются сразу тем же `ingest`, внешние — в очередь (без очереди —
 //! `RcptStatus::Failed` с `451 4.3.0`, SMTP-28); статус по получателю.
 //!
-//! Адресация ([`crate::address`]): получатели переписываются до разрешения, отправитель — после проверок;
+//! Адресация ([`crate::address`]): получатели переписываются до разрешения, отправитель — после проверок, по
+//! таблице организации из снимка настроек транспорта ([`Delivery::with_transport`], `TenantTransport::rewrites`);
 //! подадрес `user+tag` доставляется в ящик `user` с `Delivered-To: user+tag@…`, неизвестный адрес домена — на
 //! адрес для всей почты домена (псевдоним каталога `@domain`), если он задан.
 //!
@@ -44,14 +45,16 @@ use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested,
 use tp_contracts::meta::{Account, AccountScope, AccountStore, MailboxStore, SpecialUse};
 use tp_contracts::queue::DsnRet;
 use tp_contracts::retention::Quota;
+use tp_contracts::transport::EnvelopeSide;
 use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
 
-use crate::address::{Addressing, Side};
+use crate::address::Addressing;
 use crate::authcheck::AuthCheck;
 use crate::config::{DeliveryConfig, QuotaReject, SmtpConfig};
 use crate::dsn::{self, DsnSink};
 use crate::groups::{Groups, Hold};
 use crate::milter::{Milters, Verdict};
+use crate::routes::Routes;
 use crate::server::{Envelope, Handler, Mode, Reply, is_positive, reply};
 use crate::tracking::{self, Mail, Step, Tracking, Trail};
 use tp_contracts::delivery::{DeliveryDecision as Dd, DeliveryEventKind as Ek};
@@ -131,7 +134,7 @@ const MAX_GROUP_DEPTH: usize = 8;
 
 /// Получатель после переписывания и разрешения.
 struct Target {
-    /// Адрес после переписывания ([`Addressing::rewrite`]).
+    /// Адрес после переписывания (`TenantTransport::rewrite`).
     address: String,
     resolved: Resolved,
     /// Подадрес (`user+tag`): полный адрес для заголовка `Delivered-To` копии.
@@ -156,6 +159,8 @@ pub struct Delivery {
     hostname: String,
     cfg: DeliveryConfig,
     addressing: Addressing,
+    /// Снимки настроек транспорта: таблица переписывания адресов организации.
+    transport: Option<Arc<Routes>>,
     snapshot: Mutex<Option<(Instant, Arc<Snapshot>)>>,
     groups: Option<Groups>,
     tracking: Option<Tracking>,
@@ -191,6 +196,7 @@ impl Delivery {
             hostname: cfg.hostname.clone(),
             cfg: cfg.delivery.clone(),
             addressing: Addressing::new(&cfg.addressing),
+            transport: None,
             snapshot: Mutex::new(None),
             groups: None,
             tracking: None,
@@ -217,6 +223,28 @@ impl Delivery {
         }
     }
 
+    /// Таблица переписывания адресов конверта организации (SMTP-29): `TenantTransport::rewrites` из снимков
+    /// `routes`. Снимок перечитывается после сигнала `TransportChanged` — [`Routes::watch`] запускает владелец
+    /// снимков (один на узел, общий со smtp-out). Без снимков адреса не переписываются; снимок недоступен —
+    /// временная ошибка (правило может направлять получателя в другой ящик).
+    pub fn with_transport(mut self, routes: Arc<Routes>) -> Self {
+        self.transport = Some(routes);
+        self
+    }
+
+    /// Адрес конверта `address` организации `tenant` после переписывания для стороны `side`; `None` — правила нет.
+    async fn rewrite(
+        &self,
+        tenant: TenantId,
+        address: &str,
+        side: EnvelopeSide,
+    ) -> Result<Option<String>> {
+        match &self.transport {
+            None => Ok(None),
+            Some(routes) => Ok(routes.tenant(tenant).await?.rewrite(address, side)),
+        }
+    }
+
     /// Группы рассылки с ограничениями отправителей и модерацией (SMTP-16, [`crate::groups`]).
     pub fn with_groups(mut self, groups: Groups) -> Self {
         self.groups = Some(groups);
@@ -231,8 +259,8 @@ impl Delivery {
 
     async fn target(&self, address: &str) -> Result<Target> {
         let address = self
-            .addressing
-            .rewrite(address, Side::Recipient)
+            .rewrite(self.deps.tenant, address, EnvelopeSide::Recipient)
+            .await?
             .unwrap_or_else(|| address.to_owned());
         let lower = address.to_lowercase();
         let target = |resolved, delivered_to| Target {
@@ -798,8 +826,8 @@ impl Delivery {
         };
         // Отправитель конверта переписывается после проверок (SPF — по исходному).
         let rewritten = self
-            .addressing
-            .rewrite(&env.mail_from, Side::Sender)
+            .rewrite(self.deps.tenant, &env.mail_from, EnvelopeSide::Sender)
+            .await?
             .map(|mail_from| Envelope {
                 mail_from,
                 ..env.clone()
@@ -990,7 +1018,9 @@ impl Delivery {
         raw: Bytes,
     ) -> Result<Submitted> {
         let id = crate::server::next_id();
-        let rewritten = self.addressing.rewrite(mail_from, Side::Sender);
+        let rewritten = self
+            .rewrite(tenant, mail_from, EnvelopeSide::Sender)
+            .await?;
         let mail_from = rewritten.as_deref().unwrap_or(mail_from);
         if tenant != self.deps.tenant {
             let status = match &self.deps.outbound {

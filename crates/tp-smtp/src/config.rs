@@ -36,8 +36,6 @@
 //!           e2026: { algorithm: ed25519-sha256, key: { secret: "thepost/dkim/example.org#e2026" } }
 //!   addressing:
 //!     subaddress_separators: "+"
-//!     rewrite:
-//!       - { from: "@old.example.org", to: "@example.org" }
 //!   screen:
 //!     mode: enforce
 //!     greet_delay: 6s
@@ -147,42 +145,49 @@ impl Default for LearnConfig {
 }
 
 /// Адресация (SRS 4.1; [`crate::address`]). Применяется без перезапуска (к новым сессиям).
+///
+/// Таблица переписывания адресов конверта — в настройках транспорта организации (Admin API,
+/// `TenantTransport::rewrites`, SMTP-29); ключ `rewrite` — ошибка разбора с подсказкой.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct AddressingConfig {
     /// Разделители подадреса `user+tag` (любой из символов); пусто — подадреса выключены.
     pub subaddress_separators: String,
-    /// Переписывание адресов конверта по таблице.
-    pub rewrite: Vec<RewriteRule>,
+    /// Упразднённый ключ `rewrite`: любое значение — ошибка разбора с подсказкой (в схеме — `deprecated`, чтобы
+    /// разбор, а не отбрасывание неизвестного параметра, сообщил, куда перенесена таблица).
+    #[serde(deserialize_with = "rewrite_moved")]
+    #[schemars(schema_with = "rewrite_moved_schema")]
+    pub rewrite: RewriteMoved,
 }
 
 impl Default for AddressingConfig {
     fn default() -> Self {
         Self {
             subaddress_separators: "+".into(),
-            rewrite: Vec::new(),
+            rewrite: RewriteMoved,
         }
     }
 }
 
-/// Правило переписывания адреса конверта.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RewriteRule {
-    /// Адрес (`old@example.org`) или домен (`@old.example`).
-    pub from: String,
-    /// Новый адрес или домен (`@new.example` — локальная часть сохраняется).
-    pub to: String,
-    /// Переписывать отправителя конверта.
-    #[serde(default = "yes")]
-    pub sender: bool,
-    /// Переписывать получателей.
-    #[serde(default = "yes")]
-    pub recipient: bool,
+/// Упразднённый ключ `smtp.addressing.rewrite` (SMTP-29): значения нет, задать его в config.yaml нельзя.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RewriteMoved;
+
+/// Сообщение разбора для упразднённого ключа `smtp.addressing.rewrite`.
+const REWRITE_MOVED: &str = "smtp.addressing.rewrite is no longer supported: envelope address rewrite rules \
+     are per-organization transport settings, manage them through the Admin API (TenantTransport::rewrites)";
+
+fn rewrite_moved_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "deprecated": true,
+        "description": "Removed: envelope address rewrite rules are managed through the Admin API.",
+    })
 }
 
-fn yes() -> bool {
-    true
+fn rewrite_moved<'de, D: serde::Deserializer<'de>>(
+    _: D,
+) -> std::result::Result<RewriteMoved, D::Error> {
+    Err(serde::de::Error::custom(REWRITE_MOVED))
 }
 
 /// Экран соединений smtp-in (SRS 4.1, модель postscreen Postfix; [`crate::screen`]). Применяется к новым
@@ -679,4 +684,49 @@ pub enum DkimAlgorithm {
     /// Ed25519-SHA256 (RFC 8463).
     #[serde(rename = "ed25519-sha256")]
     Ed25519Sha256,
+}
+
+#[cfg(test)]
+mod tests {
+    use tp_platform::SectionRegistry;
+
+    use super::*;
+
+    const BASE: &str = "database: { url: postgres://db/thepost }\nblob: { url: file:///var/lib/thepost }\ndomain: example.com\n";
+
+    fn registry() -> SectionRegistry {
+        let mut r = SectionRegistry::new();
+        r.add_section::<SmtpConfig>("smtp").expect("smtp");
+        r
+    }
+
+    #[test]
+    fn addressing_rewrite_key_is_an_error_with_hint() {
+        let ok = registry()
+            .parse(
+                &format!("{BASE}smtp:\n  addressing:\n    subaddress_separators: \"+-\"\n"),
+                Vec::new(),
+            )
+            .expect("parse");
+        let smtp = ok.section::<SmtpConfig>("smtp").expect("smtp");
+        assert_eq!(smtp.addressing.subaddress_separators, "+-");
+        // Ключ таблицы переписывания — ошибка разбора (и в мягком режиме), подсказка — Admin API.
+        for value in [
+            "\n      - { from: \"@old.example.org\", to: \"@example.org\" }",
+            " []",
+        ] {
+            let src = format!("{BASE}smtp:\n  addressing:\n    rewrite:{value}\n");
+            for strict in [false, true] {
+                let r = registry();
+                let res = if strict {
+                    r.parse_strict(&src, Vec::new())
+                } else {
+                    r.parse(&src, Vec::new())
+                };
+                let err = res.expect_err("rewrite key must fail").to_string();
+                assert!(err.contains("Admin API"), "{err}");
+                assert!(err.contains("smtp.addressing.rewrite"), "{err}");
+            }
+        }
+    }
 }

@@ -10,7 +10,7 @@ use mail_auth::hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use mail_auth::{MX, RecordSet};
 use tokio::net::TcpListener;
 use tp_contracts::config::duration::HumanDuration;
-use tp_contracts::queue::{DsnNotify, QueueStore};
+use tp_contracts::queue::{DsnNotify, QueueClaim, QueueStore};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::transport::{DestinationPolicy, TlsRequirement, TransportStore};
 use tp_contracts::{BlobKey, TenantId};
@@ -777,12 +777,9 @@ async fn unreachable_domain_does_not_delay_others() {
         .flat_map(|c| c.rcpts.iter().map(|r| r.rcpt.address.as_str()))
         .collect();
     assert_eq!(rcpts, ["c@dead.example"]);
-    assert!(
-        claimed[0].rcpts[0]
-            .last_error
-            .as_deref()
-            .is_some_and(|e| e.contains("unreachable"))
-    );
+    // Перенос без попытки (`postpone`): попытки и причина неудачи не меняются.
+    assert_eq!(claimed[0].rcpts[0].attempts, 0);
+    assert_eq!(claimed[0].rcpts[0].last_error, None);
     // Пауза удваивается с каждой неудачей подряд.
     env.clock
         .advance(cfg.scheduler.backoff_min + Duration::from_secs(5));
@@ -806,6 +803,114 @@ async fn unreachable_domain_does_not_delay_others() {
         .await
         .expect("claim");
     assert_eq!(claimed[0].rcpts[0].rcpt.address, "e@dead.example");
+}
+
+/// Очередь без переноса планировщиком: `postpone` — реализация по умолчанию (`Error::Internal`).
+struct NoPostpone(MemQueue);
+
+#[async_trait]
+impl QueueStore for NoPostpone {
+    async fn enqueue(&self, msg: OutMessage) -> Result<tp_contracts::QueueId> {
+        self.0.enqueue(msg).await
+    }
+
+    async fn claim(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+        lease: Duration,
+    ) -> Result<Vec<Claimed>> {
+        self.0.claim(now, limit, lease).await
+    }
+
+    async fn renew(&self, claim: &QueueClaim, until: OffsetDateTime) -> Result<()> {
+        self.0.renew(claim, until).await
+    }
+
+    async fn reschedule(
+        &self,
+        claim: &QueueClaim,
+        rcpt: &str,
+        at: OffsetDateTime,
+        reason: &str,
+    ) -> Result<()> {
+        self.0.reschedule(claim, rcpt, at, reason).await
+    }
+
+    async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
+        self.0.complete(claim, rcpt, status).await
+    }
+}
+
+#[tokio::test]
+async fn deferred_recipients_are_postponed_without_attempt() {
+    let env = Env::new();
+    let t = Arc::new(Timed {
+        down: vec!["dead.example".into()],
+        ..Timed::default()
+    });
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "out.example.org");
+    let cfg = QueueConfig {
+        concurrency: 1,
+        ..cfg()
+    };
+    enqueue(&env, &["a@dead.example"]).await;
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 1);
+    // Письмо в домен на паузе — перенос на её конец без попытки: `attempts` и причина неудачи не меняются.
+    enqueue(&env, &["b@dead.example"]).await;
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 1);
+    assert_eq!(t.calls("dead.example"), 1);
+    let left = env
+        .queue
+        .claim(
+            env.clock.now() + cfg.scheduler.backoff_max,
+            10,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim");
+    let b: Vec<_> = left
+        .iter()
+        .flat_map(|c| c.rcpts.iter())
+        .filter(|r| r.rcpt.address == "b@dead.example")
+        .collect();
+    assert_eq!(b.len(), 1);
+    assert_eq!((b[0].attempts, b[0].last_error.as_deref()), (0, None));
+    // Очередь без переноса: повтор как после неудачи (тот же срок, попытка учтена).
+    let queue = MemQueue::new(env.clock.shared());
+    let deps = QueueDeps {
+        store: Arc::new(NoPostpone(queue.clone())),
+        ..env.deps.clone()
+    };
+    // Тот же планировщик: домен ещё на паузе.
+    let mut other = QueueWorker::new(deps.clone(), t.clone(), "out.example.org");
+    other.sched = worker.sched.clone();
+    Queue::new(deps)
+        .enqueue(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &["c@dead.example".to_owned()],
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("enqueue");
+    assert_eq!(other.run_once(&cfg).await.expect("run"), 1);
+    assert_eq!(t.calls("dead.example"), 1);
+    let left = queue
+        .claim(
+            env.clock.now() + cfg.scheduler.backoff_max,
+            10,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim");
+    assert_eq!(left[0].rcpts[0].attempts, 1);
+    assert!(
+        left[0].rcpts[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("unreachable"))
+    );
 }
 
 #[tokio::test]

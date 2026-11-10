@@ -7,7 +7,8 @@
 //!   2xx — `complete(Delivered)`, 5xx или истёк `queue.expire` — `complete(Failed)`, 4xx и сбой соединения —
 //!   `reschedule` через `queue.retry`. Когда запись завершена (`complete` = `true`), ссылка на объект снимается.
 //!   Отправки — под планировщиком по доменам ([`sched`]): параллельность, скорость, медленный старт,
-//!   отложенная обработка недоступных доменов, раздельные пулы внутренней и внешней доставки.
+//!   отложенная обработка недоступных доменов, раздельные пулы внутренней и внешней доставки; получатели,
+//!   отложенные планировщиком без соединения, — `postpone` (без увеличения `attempts`, SMTP-29).
 //!   Политики доменов назначения организаций ([`crate::routes`], [`QueueWorker::with_routes`]) — в
 //!   [`SendRequest::route`].
 //!   Устаревший захват (`Conflict`: лиза истекла, запись взял другой узел) — запись пропускается.
@@ -530,13 +531,6 @@ impl QueueWorker {
         let mut delayed = Vec::new();
         let mut delivered = Vec::new();
         for (r, res) in outcome {
-            // Перенос планировщиком — временная неудача со своим сроком повтора.
-            let (res, until) = match res {
-                RcptResult::Deferred { reason, until } => {
-                    (RcptResult::Temporary(reason), Some(until))
-                }
-                res => (res, None),
-            };
             if let Some(m) = &self.metrics {
                 let kind = match &res {
                     RcptResult::Delivered(_) => RcptOutcome::Delivered,
@@ -570,8 +564,18 @@ impl QueueWorker {
                     let reply = format!("delivery time expired, last error: {reason}");
                     failed.push((r, reply, Some("4.4.7")));
                 }
-                RcptResult::Temporary(reason) | RcptResult::Deferred { reason, .. } => {
-                    let at = until.unwrap_or_else(|| now + cfg.retry_after(r.attempts + 1));
+                // Перенос планировщиком: попытки не было — `attempts` и причина прошлой неудачи не меняются,
+                // уведомления о задержке нет (его порог проверит следующая попытка).
+                RcptResult::Deferred { reason, until } => {
+                    tracing::info!(id = %c.claim.id, %reason, "smtp: получатель перенесён планировщиком");
+                    steps.push(
+                        Step::new(Ek::Relay, Dd::Defer, vec![address.to_owned()])
+                            .reason(reason.clone()),
+                    );
+                    self.postpone(c, address, until, &reason).await?;
+                }
+                RcptResult::Temporary(reason) => {
+                    let at = now + cfg.retry_after(r.attempts + 1);
                     tracing::info!(id = %c.claim.id, %reason, attempt = r.attempts + 1, "smtp: временная неудача, повтор");
                     steps.push(
                         Step::new(Ek::Relay, Dd::Defer, vec![address.to_owned()])
@@ -653,6 +657,24 @@ impl QueueWorker {
             id: &id,
         });
         self.dsn.send_dsn(c.tenant, &c.from, Bytes::from(raw)).await
+    }
+
+    /// Перенос получателя планировщиком без попытки доставки ([`QueueStore::postpone`]). Хранилище без переноса
+    /// (`Error::Internal`) — повтор как после временной неудачи ([`QueueStore::reschedule`]) с тем же сроком.
+    async fn postpone(
+        &self,
+        c: &Claimed,
+        rcpt: &str,
+        at: OffsetDateTime,
+        reason: &str,
+    ) -> Result<()> {
+        match self.deps.store.postpone(&c.claim, rcpt, at).await {
+            Err(Error::Internal(e)) => {
+                tracing::debug!(id = %c.claim.id, error = %e, "smtp: перенос без попытки не поддержан очередью, повтор как после неудачи");
+                self.deps.store.reschedule(&c.claim, rcpt, at, reason).await
+            }
+            res => res,
+        }
     }
 
     async fn complete(&self, c: &Claimed, rcpt: &str, status: RcptStatus) -> Result<()> {
