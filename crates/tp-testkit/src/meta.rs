@@ -32,13 +32,15 @@ use crate::infra::{Clock, MemEventLog, SystemClock, lock};
 /// Срок хранения в корзине по умолчанию (как в конфигурации хранилища).
 pub const DEFAULT_TRASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
 
-/// Системные папки новой учётной записи (как в `tp-meta`).
-pub const SYSTEM_FOLDERS: [(&str, SpecialUse); 5] = [
+/// Системные папки учётной записи (как в `tp-meta`): создаются у новой записи и дополняются
+/// при `upsert` и `list`, если их недостаёт.
+pub const SYSTEM_FOLDERS: [(&str, SpecialUse); 6] = [
     ("INBOX", SpecialUse::Inbox),
-    ("Sent", SpecialUse::Sent),
     ("Drafts", SpecialUse::Drafts),
-    ("Trash", SpecialUse::Trash),
+    ("Sent", SpecialUse::Sent),
     ("Junk", SpecialUse::Junk),
+    ("Trash", SpecialUse::Trash),
+    ("Archive", SpecialUse::Archive),
 ];
 
 /// Вид изменения в журнале. `Moved` — письмо сменило папку с тем же идентификатором (корзина).
@@ -182,6 +184,41 @@ impl AccountData {
             },
         );
         mailbox
+    }
+
+    /// Системные папки, которых недостаёт: нет папки с той же ролью и нет папки верхнего уровня
+    /// с тем же именем (без учёта регистра), как в `tp-meta`.
+    fn missing_system(&self) -> Vec<(&'static str, SpecialUse)> {
+        SYSTEM_FOLDERS
+            .into_iter()
+            .filter(|(name, role)| {
+                !self.mailboxes.values().any(|m| {
+                    m.mailbox.role == Some(*role)
+                        || (m.mailbox.parent.is_none() && m.mailbox.name.eq_ignore_ascii_case(name))
+                })
+            })
+            .collect()
+    }
+
+    /// Дополняет учётную запись недостающими системными папками: один номер изменения, записи
+    /// журнала и события `MailboxCreated`. Возвращает число созданных папок.
+    fn ensure_system(&mut self, now: i64, fx: &mut Effects) -> usize {
+        let missing = self.missing_system();
+        if missing.is_empty() {
+            return 0;
+        }
+        let ms = self.bump();
+        for (name, role) in &missing {
+            let data = NewMailbox {
+                parent: None,
+                name: (*name).to_owned(),
+                role: Some(*role),
+            };
+            let mb = self.create_mailbox(&data, now, ms);
+            self.mbx_log.push((ms, mb.id, Op::Created));
+            fx.events.push((Some(mb.id), CoreEventKind::MailboxCreated));
+        }
+        missing.len()
     }
 
     /// Отмечает изменение папок номером `ms`.
@@ -474,6 +511,12 @@ impl MemMetadata {
             .ok_or(Error::NotFound)?;
         let mut fx = Effects::default();
         let out = f(acc, &mut fx)?;
+        self.apply(scope, fx);
+        Ok(out)
+    }
+
+    /// Применяет эффекты операции над учётной записью `scope`: события ядра и ссылки на объекты.
+    fn apply(&self, scope: AccountScope, fx: Effects) {
         let at = self.clock.now();
         for (mailbox, kind) in fx.events {
             self.events.append(CoreEvent {
@@ -489,7 +532,6 @@ impl MemMetadata {
                 blobs.adjust(&[key], delta);
             }
         }
-        Ok(out)
     }
 
     fn read<R>(&self, scope: AccountScope, f: impl FnOnce(&AccountData) -> Result<R>) -> Result<R> {
@@ -796,7 +838,18 @@ impl AccountStore for MemMetadata {
             a.display_name = data.display_name;
             a.external_id = data.external_id.or(a.external_id.take());
             a.enabled = data.enabled;
-            return Ok(a.clone());
+            let out = a.clone();
+            // Прежняя запись без части системных папок — дополняется (как вход в `tp-meta`).
+            let mut fx = Effects::default();
+            acc.ensure_system(now, &mut fx);
+            self.apply(
+                AccountScope {
+                    tenant,
+                    account: id,
+                },
+                fx,
+            );
+            return Ok(out);
         }
         let account = Account {
             id: AccountId::new(),
@@ -844,7 +897,10 @@ impl AccountStore for MemMetadata {
 #[async_trait]
 impl MailboxStore for MemMetadata {
     async fn list(&self, scope: AccountScope) -> Result<Vec<Mailbox>> {
-        self.read(scope, |acc| {
+        // Первое открытие ящика без части системных папок — дополняются, как в `tp-meta`.
+        let now = self.now_unix();
+        self.with_account(scope, |acc, fx| {
+            acc.ensure_system(now, fx);
             Ok(acc.mailboxes.values().map(|m| m.mailbox.clone()).collect())
         })
     }
@@ -1913,10 +1969,127 @@ mod tests {
         );
     }
 
+    /// Роли и имена папок верхнего уровня.
+    async fn roles(meta: &MemMetadata, scope: AccountScope) -> Vec<(Option<SpecialUse>, String)> {
+        let mut v: Vec<_> = MailboxStore::list(meta, scope)
+            .await
+            .expect("ok")
+            .into_iter()
+            .filter(|m| m.parent.is_none())
+            .map(|m| (m.role, m.name))
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v
+    }
+
+    /// Убирает папки учётной записи, оставляя `keep` (запись заведена в базе без папок).
+    fn strip_mailboxes(meta: &MemMetadata, scope: AccountScope, keep: impl Fn(&Mailbox) -> bool) {
+        let mut st = lock(&meta.state);
+        let acc = st
+            .accounts
+            .get_mut(&(scope.tenant, scope.account))
+            .expect("запись");
+        acc.mailboxes.retain(|_, m| keep(&m.mailbox));
+    }
+
+    #[tokio::test]
+    async fn system_folders_new_account() {
+        let (meta, scope, _) = setup().await;
+        let mut want: Vec<_> = SYSTEM_FOLDERS
+            .iter()
+            .map(|(n, r)| (Some(*r), (*n).to_owned()))
+            .collect();
+        want.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(want.len(), 6);
+        assert_eq!(roles(&meta, scope).await, want);
+        assert!(meta.mailbox_by_role(scope, SpecialUse::Archive).is_ok());
+        // Повторный `upsert` и `list` не дублируют.
+        meta.account("user@example.com").await.expect("ok");
+        assert_eq!(roles(&meta, scope).await, want);
+    }
+
+    #[tokio::test]
+    async fn system_folders_supplemented_on_list() {
+        let (meta, scope, _) = setup().await;
+        strip_mailboxes(&meta, scope, |_| false);
+        let before = meta.event_log().all().len();
+        let ms0 = meta.read(scope, |a| Ok(a.modseq)).expect("ok");
+        assert_eq!(roles(&meta, scope).await.len(), 6);
+        // Один номер изменения, записи журнала и события на каждую папку.
+        let changes = meta.mailbox_changes(scope, ms0, 100).await.expect("ok");
+        assert_eq!(changes.created.len(), 6);
+        let created = meta.event_log().all()[before..]
+            .iter()
+            .filter(|e| matches!(e.event.kind, CoreEventKind::MailboxCreated))
+            .count();
+        assert_eq!(created, 6);
+        assert_eq!(meta.read(scope, |a| Ok(a.modseq)).expect("ok"), ms0.next());
+        // Повторное открытие — без изменений.
+        assert_eq!(roles(&meta, scope).await.len(), 6);
+        assert_eq!(meta.read(scope, |a| Ok(a.modseq)).expect("ok"), ms0.next());
+    }
+
+    #[tokio::test]
+    async fn system_folders_no_duplicates() {
+        let (meta, scope, _) = setup().await;
+        // Остались INBOX и Sent; есть «junk» без роли (то же имя без учёта регистра)
+        // и «Архив» с ролью Archive — ни Junk, ни Archive не создаются.
+        strip_mailboxes(&meta, scope, |m| {
+            matches!(m.role, Some(SpecialUse::Inbox | SpecialUse::Sent))
+        });
+        let new = |name: &str, role| NewMailbox {
+            parent: None,
+            name: name.into(),
+            role,
+        };
+        {
+            let now = meta.now_unix();
+            let mut st = lock(&meta.state);
+            let acc = st
+                .accounts
+                .get_mut(&(scope.tenant, scope.account))
+                .expect("запись");
+            acc.create_mailbox(&new("junk", None), now, ModSeq::ZERO);
+            acc.create_mailbox(&new("Архив", Some(SpecialUse::Archive)), now, ModSeq::ZERO);
+        }
+        // Вложенная «Trash» не мешает создать системную верхнего уровня.
+        let inbox = meta.mailbox_by_role(scope, SpecialUse::Inbox).expect("ok");
+        meta.create(
+            scope,
+            NewMailbox {
+                parent: Some(inbox),
+                name: "Trash".into(),
+                role: None,
+            },
+        )
+        .await
+        .expect("ok");
+        let got = roles(&meta, scope).await;
+        let names: Vec<_> = got.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, ["Drafts", "INBOX", "Sent", "Trash", "junk", "Архив"]);
+        assert!(meta.mailbox_by_role(scope, SpecialUse::Junk).is_err());
+        assert!(meta.mailbox_by_role(scope, SpecialUse::Trash).is_ok());
+    }
+
+    #[tokio::test]
+    async fn system_folders_supplemented_on_upsert() {
+        let (meta, scope, _) = setup().await;
+        strip_mailboxes(&meta, scope, |m| m.role == Some(SpecialUse::Inbox));
+        let before = meta.event_log().all().len();
+        let again = meta.account("user@example.com").await.expect("ok");
+        assert_eq!(again, scope);
+        // Дополнено при `upsert`, до `list`.
+        assert_eq!(meta.read(scope, |a| Ok(a.mailboxes.len())).expect("ok"), 6);
+        assert_eq!(meta.event_log().all().len() - before, 5);
+    }
+
     #[tokio::test]
     async fn mailboxes_and_accounts() {
         let (meta, scope, inbox) = setup().await;
-        assert_eq!(MailboxStore::list(&meta, scope).await.expect("ok").len(), 5);
+        assert_eq!(
+            MailboxStore::list(&meta, scope).await.expect("ok").len(),
+            SYSTEM_FOLDERS.len()
+        );
         assert_eq!(meta.delete(scope, inbox, true).await, Err(Error::Forbidden));
         assert_eq!(
             meta.rename(scope, inbox, None, "X").await,

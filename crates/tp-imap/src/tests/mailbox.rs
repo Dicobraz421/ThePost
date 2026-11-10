@@ -21,7 +21,8 @@ async fn list_system_folders() {
     );
     assert_eq!(
         c.cmd("A2 LIST \"\" *").await,
-        "* LIST (\\HasNoChildren \\Drafts) \"/\" Drafts\r\n\
+        "* LIST (\\HasNoChildren \\Archive) \"/\" Archive\r\n\
+         * LIST (\\HasNoChildren \\Drafts) \"/\" Drafts\r\n\
          * LIST (\\HasNoChildren) \"/\" INBOX\r\n\
          * LIST (\\HasNoChildren \\Junk) \"/\" Junk\r\n\
          * LIST (\\HasNoChildren \\Sent) \"/\" Sent\r\n\
@@ -102,10 +103,14 @@ async fn create_hierarchy_and_names() {
 #[tokio::test]
 async fn create_special_use() {
     let (_env, mut c) = env_client().await;
+    // Все роли RFC 6154 заняты системными папками (Archive — с KIT-07): вторая с той же ролью — отказ.
     let r = c.cmd("A1 CREATE Old (USE (\\Archive))").await;
-    assert_eq!(r, "A1 OK CREATE completed\r\n");
-    let r = c.cmd("A2 LIST \"\" Old").await;
-    assert!(r.contains("(\\HasNoChildren \\Archive) \"/\" Old"), "{r}");
+    assert!(r.starts_with("A1 NO [USEATTR]"), "{r}");
+    let r = c.cmd("A2 LIST \"\" Archive").await;
+    assert!(
+        r.contains("(\\HasNoChildren \\Archive) \"/\" Archive"),
+        "{r}"
+    );
     let r = c.cmd("A3 CREATE MySent (USE (\\Sent))").await;
     assert!(r.starts_with("A3 NO [USEATTR]"), "{r}");
     let r = c.cmd("A4 CREATE X (USE (\\Important))").await;
@@ -125,6 +130,7 @@ async fn subscriptions_and_list_extended() {
         "A6 UNSUBSCRIBE Junk",
         "A7 UNSUBSCRIBE Sent",
         "A8 UNSUBSCRIBE Trash",
+        "A9 UNSUBSCRIBE Archive",
     ] {
         assert!(c.cmd(cmd).await.contains(" OK "), "{cmd}");
     }

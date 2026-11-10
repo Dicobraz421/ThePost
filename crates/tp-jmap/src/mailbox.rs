@@ -637,7 +637,7 @@ mod tests {
             .await;
         assert_eq!(
             names(&r["list"]),
-            ["Drafts", "INBOX", "Junk", "Sent", "Trash"]
+            ["Archive", "Drafts", "INBOX", "Junk", "Sent", "Trash"]
         );
         assert!(r["state"].is_string());
         let id = inbox.to_string();
