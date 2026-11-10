@@ -9,7 +9,7 @@ checks: [nextest]
 manual: no
 
 ## Сделать
-- `imap::Deps` `trash`, `hooks` (#181); `jmap::Deps` `trash`, `policies` (#183); `Store::with_writer` (MS-15, #182), в `jmap::Deps::blobs` — хранилище без `Decompressing`.
+- `imap::Deps` `trash`, `hooks` (#181); `jmap::Deps` `trash`, `policies` (#183); `Store::with_writer` (MS-15, #182), в `jmap::Deps::blobs` — хранилище без `Decompressing` (с APP-13 — через `Decompressing`, JMAP-13).
 - Истечение корзины (`TrashStore::expired` → точка принятия решений → `expunge_final`) — фоновая задача роли.
 - `NodeLoad::inputs` (диски кэша — `LoadInputs::set_cache_disk`).
 

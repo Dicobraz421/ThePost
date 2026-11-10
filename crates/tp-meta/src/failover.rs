@@ -200,6 +200,8 @@ struct Inner {
     /// Обнаружен отказ primary, новый ещё не найден.
     down_since: Mutex<Option<Instant>>,
     counters: Counters,
+    /// Номер переключения для наблюдателей ([`Failover::switches`]).
+    switched: tokio::sync::watch::Sender<u64>,
 }
 
 /// Состояние повторов одной операции.
@@ -274,12 +276,19 @@ impl Failover {
             search: tokio::sync::Mutex::new(()),
             down_since: Mutex::new(None),
             counters,
+            switched: tokio::sync::watch::Sender::new(0),
         }))
     }
 
     /// Пул узла (новые соединения — к текущему primary).
     pub fn pool(&self) -> &PgPool {
         &self.0.pool
+    }
+
+    /// Номер переключения primary: новое значение — пул перенаправлен к другому адресу (слушатель сигналов
+    /// переподключается, [`crate::signals`]). Выбор primary при запуске — тоже переключение.
+    pub fn switches(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.0.switched.subscribe()
     }
 
     /// Снимок метрик переключения.
@@ -508,7 +517,8 @@ impl Inner {
         self.reset
             .replace(&self.pool, |cur| retarget(cur.clone(), target));
         self.counters.primary.store(i, Ordering::Relaxed);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.switched.send_replace(epoch);
         if count {
             self.counters.switches.fetch_add(1, Ordering::Relaxed);
         }

@@ -199,6 +199,7 @@ async fn sasl_auth() {
         c.pop(&format!("AUTH PLAIN {creds}")).await,
         "+OK Logged in, 2 messages\r\n"
     );
+    assert_eq!(c.pop("QUIT").await, "+OK Bye\r\n");
     // Ответ на вызов `+ `; отмена `*`.
     let mut c = pop(&env, true).await;
     assert_eq!(c.pop("AUTH PLAIN").await, "+ \r\n");
@@ -241,4 +242,33 @@ async fn long_line_closes_session() {
     let long = "X".repeat(env.config.pop3.max_line + 10);
     assert_eq!(c.pop(&long).await, "-ERR Line too long\r\n");
     assert_eq!(c.rest().await, "");
+}
+
+/// Вход в уже открытой сессии; ответ на `PASS`.
+async fn login(c: &mut Client) -> String {
+    assert!(c.pop(&format!("USER {LOGIN}")).await.starts_with("+OK"));
+    c.pop(&format!("PASS {PASSWORD}")).await
+}
+
+#[tokio::test]
+async fn maildrop_locked_per_session() {
+    let env = two().await;
+    let mut first = logged_in(&env).await;
+    // Вторая сессия той же учётной записи — `[IN-USE]` (RFC 2449, 8.1.1), остаётся в AUTHORIZATION.
+    let mut second = pop(&env, true).await;
+    assert_eq!(
+        login(&mut second).await,
+        "-ERR [IN-USE] Mailbox is locked by another POP3 session\r\n"
+    );
+    assert!(second.pop("STAT").await.starts_with("-ERR"));
+    assert_eq!(first.pop("QUIT").await, "+OK Bye\r\n");
+    assert_eq!(first.rest().await, "");
+    // После QUIT ящик свободен.
+    assert_eq!(login(&mut second).await, "+OK Logged in, 2 messages\r\n");
+    // Обрыв соединения тоже снимает блокировку.
+    let Client { io, task } = second;
+    drop(io);
+    task.await.expect("join").expect("session");
+    let mut third = pop(&env, true).await;
+    assert_eq!(login(&mut third).await, "+OK Logged in, 2 messages\r\n");
 }

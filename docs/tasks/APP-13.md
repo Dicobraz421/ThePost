@@ -15,3 +15,9 @@ manual: no
 - POP3: запуск `Pop3Server` по секции `imap.pop3` (слушатели, STLS) в роли access.
 - Нагрузка: `tp_sys::watch_resources` → `pressure::watch_resources`, `rss.run` → `rss.run_on` (PSI по событиям, секция `pressure`).
 - Тест сборки сервисов: роль `all` — IMAP объявляет QUOTA и ACL; POP3 отвечает `+OK` при включённой секции.
+
+## Сделать (дополнение)
+По отчётам волн, отдельными коммитами под APP-13.
+- JMAP-13: `jmap::Deps::blobs` — `tp_blob::Decompressing::new(blob, index)`: загрузка, совпавшая по содержимому со
+  сжатой частью письма, читается распакованной (было `Internal`).
+- META-35: `IndexerRole` ждёт ближайший срок повтора раздела `PollReport::retry_in`, если он раньше тика опроса.

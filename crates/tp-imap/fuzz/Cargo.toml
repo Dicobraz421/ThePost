@@ -1,4 +1,8 @@
-# Цель fuzz парсера IMAP (IMAP-01): `cargo +nightly fuzz run command` в каталоге crates/tp-imap.
+# Цели fuzz разбора IMAP (IMAP-01, IMAP-13), в каталоге crates/tp-imap:
+#   cargo +nightly fuzz run <цель> fuzz/corpus/<цель> -- -max_total_time=600
+# Цели: command — поток команд IMAP4rev2 и сериализация обратно, literals — литералы и нарезка потока,
+# search — критерии SEARCH/ESEARCH, fetch — атрибуты FETCH по письму (атрибуты, NUL, письмо).
+# Проверки — tp_imap::fuzz; новые входы — в fuzz/corpus/<цель> (не в git).
 # Отдельный workspace: в сборку и Cargo.lock основного workspace не входит.
 [package]
 name = "tp-imap-fuzz"
@@ -18,6 +22,27 @@ tp-imap = { path = ".." }
 [[bin]]
 name = "command"
 path = "fuzz_targets/command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "literals"
+path = "fuzz_targets/literals.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "search"
+path = "fuzz_targets/search.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fetch"
+path = "fuzz_targets/fetch.rs"
 test = false
 doc = false
 bench = false

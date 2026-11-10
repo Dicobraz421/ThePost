@@ -6,11 +6,14 @@
 //! - `DELE` помечает письмо; при `QUIT` помеченные переносятся в корзину (`MailStore::delete_to_trash`,
 //!   SRS 4.7), как `EXPUNGE` в IMAP. Обрыв соединения без `QUIT` ничего не удаляет (RFC 1939, 6).
 //! - `UIDL` — идентификатор письма (`MessageId`): не меняется между сессиями.
-//! - Эксклюзивная блокировка ящика (RFC 1939, 8) не берётся: параллельные сессии IMAP и JMAP допустимы,
-//!   письмо, удалённое другой сессией, — `-ERR` на `RETR`.
+//! - Ящик блокируется на сессию (RFC 1939, 8) в пределах узла: вторая сессия POP3 той же учётной записи —
+//!   `-ERR [IN-USE]` (RFC 2449, 8.1.1), сессия остаётся в состоянии AUTHORIZATION. Блокировка снимается с концом
+//!   сессии (`QUIT`, обрыв, таймаут). Между узлами блокировки нет (лизы ящика в контрактах нет). Параллельные
+//!   сессии IMAP и JMAP допустимы: письмо, удалённое другой сессией, — `-ERR` на `RETR`.
 
+use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -33,11 +36,41 @@ struct Item {
     deleted: bool,
 }
 
+/// Ящики, открытые сессиями POP3 этого узла.
+static LOCKED: LazyLock<Mutex<HashSet<AccountScope>>> = LazyLock::new(Mutex::default);
+
+/// Исключительная блокировка ящика POP3 учётной записи на узле; снимается при освобождении.
+#[derive(Debug)]
+struct MaildropLock(AccountScope);
+
+impl MaildropLock {
+    /// Блокирует ящик; `None` — ящик открыт другой сессией POP3 узла.
+    fn acquire(scope: AccountScope) -> Option<Self> {
+        let inserted = LOCKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(scope);
+        // Блокировка создаётся только при успехе: её `Drop` снимает блокировку ящика.
+        inserted.then(|| Self(scope))
+    }
+}
+
+impl Drop for MaildropLock {
+    fn drop(&mut self) {
+        LOCKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
 /// Ящик POP3 после входа.
 #[derive(Debug)]
 struct Maildrop {
     scope: AccountScope,
     items: Vec<Item>,
+    /// Блокировка ящика на время сессии.
+    _lock: MaildropLock,
 }
 
 impl Maildrop {
@@ -464,11 +497,15 @@ impl<T: Transport> Pop3Session<T> {
         self.reply(false, "[SYS/TEMP] Authentication temporarily unavailable");
     }
 
-    /// После входа — список писем «Входящих».
+    /// После входа — блокировка ящика и список писем «Входящих».
     async fn logged_in(&mut self, p: Principal) -> Result<()> {
         let scope = AccountScope {
             tenant: p.tenant,
             account: p.account,
+        };
+        let Some(lock) = MaildropLock::acquire(scope) else {
+            self.reply(false, "[IN-USE] Mailbox is locked by another POP3 session");
+            return Ok(());
         };
         let deps = &self.ctx.deps;
         let inbox = match deps.mailboxes.list(scope).await {
@@ -508,7 +545,11 @@ impl<T: Transport> Pop3Session<T> {
             })
             .collect();
         let n = items.len();
-        self.drop = Some(Maildrop { scope, items });
+        self.drop = Some(Maildrop {
+            scope,
+            items,
+            _lock: lock,
+        });
         self.reply(true, &format!("Logged in, {n} messages"));
         Ok(())
     }

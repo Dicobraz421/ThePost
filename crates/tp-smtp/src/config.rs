@@ -24,6 +24,9 @@
 //!   queue:
 //!     retry: [5m, 15m, 30m, 1h, 2h, 4h, 8h]
 //!     expire: 5d
+//!     scheduler:
+//!       domain_concurrency: 20
+//!       backoff_min: 1m
 //!   dkim:
 //!     domains:
 //!       example.org:
@@ -31,6 +34,14 @@
 //!         keys:
 //!           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim/example.org#s2026" } }
 //!           e2026: { algorithm: ed25519-sha256, key: { secret: "thepost/dkim/example.org#e2026" } }
+//!   addressing:
+//!     subaddress_separators: "+"
+//!     rewrite:
+//!       - { from: "@old.example.org", to: "@example.org" }
+//!   screen:
+//!     mode: enforce
+//!     greet_delay: 6s
+//!     exempt: ["127.0.0.0/8", "10.0.0.0/8"]
 //! ```
 //!
 //! Слушатели (`inbound`, `submission`) применяются при запуске роли; лимиты и таймауты — к новым сессиям
@@ -68,6 +79,10 @@ pub struct SmtpConfig {
     pub queue: QueueConfig,
     /// DKIM-подпись исходящей почты.
     pub dkim: DkimConfig,
+    /// Экран соединений smtp-in (postscreen).
+    pub screen: ScreenConfig,
+    /// Адресация: подадреса, переписывание адресов конверта.
+    pub addressing: AddressingConfig,
 }
 
 impl Default for SmtpConfig {
@@ -83,8 +98,113 @@ impl Default for SmtpConfig {
             milter: MilterConfig::default(),
             queue: QueueConfig::default(),
             dkim: DkimConfig::default(),
+            screen: ScreenConfig::default(),
+            addressing: AddressingConfig::default(),
         }
     }
+}
+
+/// Адресация (SRS 4.1; [`crate::address`]). Применяется без перезапуска (к новым сессиям).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AddressingConfig {
+    /// Разделители подадреса `user+tag` (любой из символов); пусто — подадреса выключены.
+    pub subaddress_separators: String,
+    /// Переписывание адресов конверта по таблице.
+    pub rewrite: Vec<RewriteRule>,
+}
+
+impl Default for AddressingConfig {
+    fn default() -> Self {
+        Self {
+            subaddress_separators: "+".into(),
+            rewrite: Vec::new(),
+        }
+    }
+}
+
+/// Правило переписывания адреса конверта.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteRule {
+    /// Адрес (`old@example.org`) или домен (`@old.example`).
+    pub from: String,
+    /// Новый адрес или домен (`@new.example` — локальная часть сохраняется).
+    pub to: String,
+    /// Переписывать отправителя конверта.
+    #[serde(default = "yes")]
+    pub sender: bool,
+    /// Переписывать получателей.
+    #[serde(default = "yes")]
+    pub recipient: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Экран соединений smtp-in (SRS 4.1, модель postscreen Postfix; [`crate::screen`]). Применяется к новым
+/// соединениям без перезапуска.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScreenConfig {
+    /// Экран включён.
+    pub enabled: bool,
+    /// Что делать с нарушителем.
+    pub mode: ScreenMode,
+    /// Задержка приветствия: после первой строки `220-` сервер ждёт; клиент, заговоривший раньше, нарушает
+    /// протокол. `0` — без проверки.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub greet_delay: Duration,
+    /// Проверять конвейер команд без PIPELINING (до `EHLO`, после `HELO`, вслед за `EHLO`).
+    pub pipelining: bool,
+    /// Соединений с адреса за `rate_window`; сверх — отказ. `0` — без проверки.
+    pub max_rate: u32,
+    /// Окно подсчёта частоты соединений.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub rate_window: Duration,
+    /// Срок, на который адрес, прошедший проверки, освобождается от них.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub pass_ttl: Duration,
+    /// Срок, на который нарушитель отклоняется без проверки (режим `enforce`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub reject_ttl: Duration,
+    /// Адресов в кэше результатов и в таблице частоты.
+    pub cache_size: usize,
+    /// Сети без проверок (CIDR или адрес): узлы организации, доверенные шлюзы.
+    pub exempt: Vec<String>,
+}
+
+impl Default for ScreenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: ScreenMode::default(),
+            greet_delay: Duration::from_secs(6),
+            pipelining: true,
+            max_rate: 60,
+            rate_window: Duration::from_secs(60),
+            pass_ttl: Duration::from_secs(24 * 3600),
+            reject_ttl: Duration::from_secs(10 * 60),
+            cache_size: 100_000,
+            exempt: vec!["127.0.0.0/8".into(), "::1/128".into()],
+        }
+    }
+}
+
+/// Действие экрана при нарушении.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenMode {
+    /// Отказ и закрытие соединения; адрес запоминается на `reject_ttl`.
+    #[default]
+    Enforce,
+    /// Только журнал и метрика: сессия продолжается.
+    Log,
 }
 
 /// Лимиты сессии SMTP.
@@ -277,18 +397,26 @@ pub struct QueueConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub timeout: Duration,
-    /// Узел-ретранслятор `хост:порт` (smarthost) вместо MX получателя.
+    /// Узел-ретранслятор `хост:порт` (smarthost) вместо MX получателя; политика домена назначения со своим
+    /// `smart_host` (в том числе `*`) точнее.
     pub relay: Option<String>,
     /// Порт MX.
     pub port: u16,
     /// MX-узлов, которые пробуются за попытку.
     pub max_mx: usize,
-    /// Исходящий адрес (egress-IP, согласованный с PTR и SPF); `None` — выбирает система.
+    /// Исходящий адрес (egress-IP, согласованный с PTR и SPF); `None` — выбирает система. `egress_ip` политики
+    /// домена назначения точнее.
     pub source_ip: Option<std::net::IpAddr>,
     /// TLS при отправке.
     pub tls: OutboundTls,
     /// Политики TLS доменов назначения: MTA-STS и DANE (при доставке на MX, не через `relay`).
     pub policy: PolicyConfig,
+    /// Планировщик по доменам назначения.
+    pub scheduler: SchedulerConfig,
+    /// Пауза перед повторной подпиской на сигналы настроек транспорта (политики доменов назначения).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub resubscribe: Duration,
 }
 
 impl Default for QueueConfig {
@@ -309,6 +437,68 @@ impl Default for QueueConfig {
             source_ip: None,
             tls: OutboundTls::default(),
             policy: PolicyConfig::default(),
+            scheduler: SchedulerConfig::default(),
+            resubscribe: Duration::from_secs(5),
+        }
+    }
+}
+
+/// Планировщик исходящей очереди по доменам назначения (SRS 4.1, модель qmgr Postfix;
+/// [`crate::queue::sched`]). Применяется без перезапуска.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulerConfig {
+    /// Одновременных отправок в один домен (предел окна медленного старта).
+    pub domain_concurrency: usize,
+    /// Начальное окно нового домена (медленный старт): +1 после каждой отправки с ответом сервера.
+    pub initial_concurrency: usize,
+    /// Отправок в домен за `rate_window`; `0` — без лимита.
+    pub domain_rate: u32,
+    /// Окно лимита скорости.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub rate_window: Duration,
+    /// Ожидание места в домене или пуле; затем получатели переносятся на `busy_delay`.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub wait: Duration,
+    /// Перенос получателей занятого домена.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub busy_delay: Duration,
+    /// Первая пауза недоступного домена; удваивается с каждой неудачей подряд.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub backoff_min: Duration,
+    /// Наибольшая пауза недоступного домена.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub backoff_max: Duration,
+    /// Одновременных отправок внутренней доставки (домены кластера, `internal_domains`).
+    pub internal_concurrency: usize,
+    /// Одновременных отправок внешней доставки.
+    pub external_concurrency: usize,
+    /// Внутренние домены сверх принятых доменов кластера.
+    pub internal_domains: Vec<String>,
+    /// Доменов с состоянием планировщика на узле.
+    pub max_domains: usize,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            domain_concurrency: 20,
+            initial_concurrency: 5,
+            domain_rate: 0,
+            rate_window: Duration::from_secs(60),
+            wait: Duration::from_secs(10),
+            busy_delay: Duration::from_secs(60),
+            backoff_min: Duration::from_secs(60),
+            backoff_max: Duration::from_secs(3600),
+            internal_concurrency: 16,
+            external_concurrency: 64,
+            internal_domains: Vec::new(),
+            max_domains: 10_000,
         }
     }
 }

@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use tp_contracts::ModSeq;
 use tp_contracts::meta::Changes;
 
-use super::error::{MethodError, MethodResult};
+use super::error::{MethodError, MethodResult, Problem};
 
 /// Вызов метода или ответ: `[имя, аргументы, callId]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +41,17 @@ pub struct Response {
     pub session_state: String,
 }
 
+/// Тело запроса API как [`Request`]: не больше `max_size` байт (`maxSizeRequest`), JSON (`notJSON`),
+/// объект Request (`notRequest`).
+pub fn parse(body: &[u8], max_size: u64) -> Result<Request, Problem> {
+    if body.len() as u64 > max_size {
+        return Err(Problem::limit("maxSizeRequest"));
+    }
+    let value: Value =
+        serde_json::from_slice(body).map_err(|e| Problem::not_json(e.to_string()))?;
+    serde_json::from_value(value).map_err(|e| Problem::not_request(e.to_string()))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ResultReference {
@@ -53,12 +64,17 @@ fn bad_ref(why: &str) -> MethodError {
     MethodError::with("invalidResultReference", why)
 }
 
-/// Заменяет аргументы `#имя` значениями из предыдущих ответов (RFC 8620 §3.7).
+/// Заменяет аргументы `#имя` значениями из предыдущих ответов (RFC 8620 §3.7). `budget` — сколько байт JSON
+/// ещё можно подставить в этом запросе: подстановка копирует результат, и без предела цепочка ссылок на весь
+/// предыдущий ответ (`Core/echo`) растёт экспоненциально. Превышение — `invalidResultReference`; бюджет
+/// уменьшается, только если подстановка удалась.
 pub fn resolve_references(
     args: Map<String, Value>,
     responses: &[Invocation],
+    budget: &mut u64,
 ) -> MethodResult<Map<String, Value>> {
     let mut out = Map::new();
+    let mut left = *budget;
     for (key, value) in &args {
         let Some(name) = key.strip_prefix('#') else {
             out.insert(key.clone(), value.clone());
@@ -78,9 +94,31 @@ pub fn resolve_references(
         }
         let found = pointer(&Value::Object(resp.1.clone()), &r.path)
             .ok_or_else(|| bad_ref("path not found"))?;
+        left = left
+            .checked_sub(json_size(&found))
+            .ok_or_else(|| bad_ref("resolved values exceed maxSizeRequest"))?;
         out.insert(name.to_owned(), found);
     }
+    *budget = left;
     Ok(out)
+}
+
+/// Размер `value` в JSON, байт.
+fn json_size(value: &Value) -> u64 {
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // `Value` записывается всегда, счётчик не отказывает.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
 }
 
 /// JSON Pointer (RFC 6901) с расширением JMAP: `*` применяет остаток пути к каждому элементу массива,
@@ -224,7 +262,10 @@ pub fn apply_window(
                 .iter()
                 .position(|id| id == anchor)
                 .ok_or(MethodError::new("anchorNotFound"))?;
-            (i64::try_from(at).unwrap_or(i64::MAX) + w.anchor_offset).max(0)
+            i64::try_from(at)
+                .unwrap_or(i64::MAX)
+                .saturating_add(w.anchor_offset)
+                .max(0)
         }
         None if w.position < 0 => (len + w.position).max(0),
         None => w.position,

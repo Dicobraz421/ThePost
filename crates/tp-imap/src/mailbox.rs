@@ -15,6 +15,7 @@ use tp_contracts::auth::Rights;
 use tp_contracts::meta::{AccountScope, Flag, Mailbox, MessageQuery, NewMailbox, SpecialUse};
 use tp_contracts::{Error, MailboxId, Result};
 
+use crate::ext::{flag_rights, has_any, may_set};
 use crate::proto::types::core::{Atom, QuotedChar, Tag};
 use crate::proto::types::flag::{Flag as ImapFlag, FlagNameAttribute, FlagPerm};
 use crate::proto::types::mailbox::Mailbox as ImapMailbox;
@@ -22,6 +23,7 @@ use crate::proto::types::response::{Code, Data, StatusKind};
 use crate::proto::{self, ListCommand, StatusItem};
 use crate::qresync::QResync;
 use crate::session::{Selected, Session, Transport};
+use crate::store::contract_flags;
 
 /// Разделитель иерархии.
 pub(crate) const DELIMITER: char = '/';
@@ -217,20 +219,31 @@ impl<T: Transport> Session<T> {
         Ok(None)
     }
 
-    /// Папка назначения `APPEND`/`COPY`/`MOVE`; нет — `NO [TRYCREATE]` (RFC 9051, 6.3.12) уже записан.
-    pub(crate) async fn target(&mut self, tag: &Tag<'static>, raw: &[u8]) -> Result<Option<Node>> {
+    /// Папка назначения `APPEND`/`COPY`/`MOVE` и права на неё (своя — все); общая — при праве `i`
+    /// (RFC 4314, 4), иначе `NO [NOPERM]`; нет — `NO [TRYCREATE]` (RFC 9051, 6.3.12). Ответ уже записан.
+    pub(crate) async fn target(
+        &mut self,
+        tag: &Tag<'static>,
+        raw: &[u8],
+    ) -> Result<Option<(Node, Rights)>> {
         let Some(name) = self.decode_name(raw) else {
             self.bad(Some(tag), "Invalid mailbox name");
             return Ok(None);
         };
         let tree = self.tree().await?;
-        match tree.find(&name) {
-            Some(n) => Ok(Some(n.clone())),
-            None => {
-                self.no(tag, Some(Code::TryCreate), "No such mailbox");
-                Ok(None)
-            }
+        if let Some(n) = tree.find(&name) {
+            return Ok(Some((n.clone(), Rights::ALL)));
         }
+        let Some(n) = self.shared_node(&name).await? else {
+            self.no(tag, Some(Code::TryCreate), "No such mailbox");
+            return Ok(None);
+        };
+        let rights = self.shared_rights(&n).await?;
+        if !rights.contains(Rights::INSERT) {
+            self.no(tag, Some(proto::code("NOPERM")), "Permission denied");
+            return Ok(None);
+        }
+        Ok(Some((n, rights)))
     }
 
     // ---------- LIST ----------
@@ -443,16 +456,22 @@ impl<T: Transport> Session<T> {
         let Some(node) = self.resolve_any(tag, mailbox).await? else {
             return Ok(());
         };
-        // Общая папка: нужно право `r`; выбирается только для чтения.
-        let (scope, read_only) = match node.owner {
+        // Общая папка: нужно право `r`; для записи — хотя бы одно из `s`, `w`, `t`, `e` (RFC 4314, 4).
+        let (scope, read_only, rights) = match node.owner {
             Some(owner) => {
-                if !self.shared_rights(&node).await?.contains(Rights::READ) {
+                let rights = self.shared_rights(&node).await?;
+                if !rights.contains(Rights::READ) {
                     self.no(tag, Some(proto::code("NOPERM")), "Permission denied");
                     return Ok(());
                 }
-                (owner, true)
+                let write = has_any(rights, flag_rights() | Rights::EXPUNGE);
+                (owner, read_only || !write, rights)
             }
-            None => (self.scope().ok_or(Error::Forbidden)?, read_only),
+            None => (
+                self.scope().ok_or(Error::Forbidden)?,
+                read_only,
+                Rights::ALL,
+            ),
         };
         let id = node.mailbox.id;
         let limit = self.ctx.config.limits.max_mailbox_messages;
@@ -472,9 +491,18 @@ impl<T: Transport> Session<T> {
         let permanent = if read_only {
             Vec::new()
         } else {
-            let mut p: Vec<FlagPerm<'static>> =
-                system_flags().into_iter().map(FlagPerm::Flag).collect();
-            p.push(FlagPerm::Asterisk);
+            // Только флаги, которые субъект вправе менять; `\*` — с правом `w` (RFC 4314, 4).
+            let mut p: Vec<FlagPerm<'static>> = system_flags()
+                .into_iter()
+                .filter(|f| {
+                    contract_flags(std::slice::from_ref(f))
+                        .is_some_and(|c| c.iter().all(|c| may_set(rights, c)))
+                })
+                .map(FlagPerm::Flag)
+                .collect();
+            if rights.contains(Rights::WRITE) {
+                p.push(FlagPerm::Asterisk);
+            }
             p
         };
         self.untagged(

@@ -5,14 +5,17 @@ mod common;
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
+use tp_contracts::bus::EventKind;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::meta::{
     AccountScope, ChangeLog, MailboxStore, MessageStore, NewMessage, Policy, SpecialUse,
 };
-use tp_contracts::retention::{Quota, TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
+use tp_contracts::retention::{
+    Quota, TrashObject, TrashPurge, TrashPurgeRule, TrashStore, trash_changed,
+};
 use tp_contracts::{BlobHash, BlobKey, Gen, MailboxId, TenantId};
-use tp_meta::PgMeta;
 use tp_meta::retention::PolicyTarget;
+use tp_meta::{MetaConfig, PgMeta};
 use tp_testkit::suite::{TrashPurgeAdmin, TrashPurgeFixture, trash_purge};
 
 /// Правило организации — через `PgMeta::set_policy`, прочие поля уровня сохраняются.
@@ -194,4 +197,44 @@ async fn hidden_changes_expiry_and_final_delete() {
         "скрытое стирается без повторного удаления в журнале"
     );
     db.drop_db().await;
+}
+
+/// META-36: `purge` публикует `TrashChanged` после фиксации, если что-то скрыто или стёрто.
+#[tokio::test]
+async fn purge_signals_trash_changed() {
+    let Some(pool) = common::pool().await else {
+        return;
+    };
+    let rec = std::sync::Arc::new(common::RecordingBus::default());
+    let meta = PgMeta::new(pool, MetaConfig::default()).with_bus(rec.clone());
+    let scope = common::account(&meta).await;
+    let inbox = folder(&meta, scope, SpecialUse::Inbox).await;
+    let m = meta
+        .insert(scope, inbox, message(scope, 40))
+        .await
+        .expect("insert")
+        .id;
+    meta.to_trash(scope, &[m]).await.expect("trash");
+    rec.take();
+    let trash = |rec: &common::RecordingBus| {
+        rec.take()
+            .into_iter()
+            .filter(|e| matches!(e.kind, EventKind::TrashChanged { .. }))
+            .collect::<Vec<_>>()
+    };
+
+    let out = meta
+        .purge(scope, &[m], &DecisionHooks::default())
+        .await
+        .expect("purge");
+    assert_eq!(out.hidden, [m]);
+    assert_eq!(trash(&rec), [trash_changed(scope)]);
+
+    // Повтор: уже скрыто — ничего не изменено, сигнала нет.
+    let out = meta
+        .purge(scope, &[m], &DecisionHooks::default())
+        .await
+        .expect("purge again");
+    assert!(out.hidden.is_empty() && out.erased.is_empty());
+    assert!(rec.take().is_empty(), "без изменений — без сигналов");
 }

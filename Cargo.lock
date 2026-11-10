@@ -5058,6 +5058,7 @@ name = "tp-meta"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "proptest",
  "schemars",
  "serde",

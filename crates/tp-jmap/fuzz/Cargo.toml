@@ -1,0 +1,42 @@
+# Цели fuzz разбора JMAP (JMAP-09), в каталоге crates/tp-jmap:
+#   cargo +nightly fuzz run <цель> fuzz/corpus/<цель> -- -max_total_time=600
+# Цели: request — тело запроса API, вызовы методов как Core/echo и ссылки на результаты; reference — путь
+# JSON Pointer ссылки по ответу (ответ, NUL, байты выбора пути); query — аргументы Email/query: фильтры,
+# сортировка, collapseThreads, окно на письмах-образцах.
+# Проверки — tp_jmap::fuzz; новые входы — в fuzz/corpus/<цель> (не в git).
+# Отдельный workspace: в сборку и Cargo.lock основного workspace не входит.
+[package]
+name = "tp-jmap-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tp-jmap = { path = ".." }
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reference"
+path = "fuzz_targets/reference.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query"
+path = "fuzz_targets/query.rs"
+test = false
+doc = false
+bench = false
