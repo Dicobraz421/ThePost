@@ -19,7 +19,8 @@
 //! шины (`EventBus::subscribe_system`; публикуют `delete_to_trash` любого узла через `retention::trash_changed`
 //! и `TrashStore::purge`), `Resync` этой подписки и сигнал в памяти процесса после фиксации `delete_to_trash`
 //! этого [`Store`] (и его клонов). Подписка оформляется до сверки срока, поэтому сигнал между ними не теряется;
-//! поток завершился — переподписка и сверка, подписка не оформлена — повтор не позже [`TrashConfig::retry`].
+//! поток завершился — переподписка и сверка; поток закрылся быстрее [`TrashConfig::retry`] после оформления
+//! или подписка не оформлена — следующая попытка через [`TrashConfig::retry`] (без частых переподписок).
 //! Ожидание не дольше [`TrashConfig::max_wait`]: по его истечении срок сверяется заново (без прохода, если ничего
 //! не истекло) — страховка от потерянного сигнала (шина at-most-once). После ошибки хранилища — повтор не раньше
 //! [`TrashConfig::retry`] (SRS 2.8, таймер 2).
@@ -203,13 +204,19 @@ impl Store {
         let mut not_before: Option<OffsetDateTime> = None;
         // Системные сигналы шины; `None` — подписка не оформлена.
         let mut events: Option<EventStream> = None;
+        // Момент оформления текущей подписки и следующая попытка подписаться: поток, закрывшийся быстрее
+        // `retry` после оформления, или ошибка подписки — повтор не раньше чем через `retry`.
+        let mut opened = timer.now();
+        let mut resubscribe = opened;
         loop {
             // До сверки срока: сигнал между сверкой и подпиской не теряется.
-            if events.is_none() {
+            if events.is_none() && timer.now() >= resubscribe {
+                opened = timer.now();
                 events = match self.d.bus.subscribe_system().await {
                     Ok(s) => Some(s),
                     Err(e) => {
                         tracing::warn!(error = %e, "mailstore: подписка на сигналы корзины не оформлена");
+                        resubscribe = after(opened, self.cfg.trash.retry);
                         None
                     }
                 };
@@ -223,13 +230,11 @@ impl Store {
                     Some(at)
                 }
             };
-            // Не дольше `max_wait` (без подписки — `retry`): по истечении — только сверка срока.
-            let wait = if events.is_some() {
-                self.cfg.trash.max_wait
-            } else {
-                self.cfg.trash.max_wait.min(self.cfg.trash.retry)
-            };
-            let cap = after(timer.now(), wait);
+            // Не дольше `max_wait` (без подписки — до следующей попытки): по истечении — только сверка срока.
+            let mut cap = after(timer.now(), self.cfg.trash.max_wait);
+            if events.is_none() {
+                cap = cap.min(resubscribe);
+            }
             let (at, pass) = match due {
                 Some(at) if at <= cap => (at, true),
                 _ => (cap, false),
@@ -248,6 +253,9 @@ impl Store {
                         // Поток завершился (потеря связи): переподписка и сверка.
                         None => {
                             events = None;
+                            let now = timer.now();
+                            let soon = after(opened, self.cfg.trash.retry);
+                            resubscribe = if now < soon { after(now, self.cfg.trash.retry) } else { now };
                             break false;
                         }
                     },
@@ -951,7 +959,9 @@ mod tests {
         })
         .await;
 
-        // Потеря связи: воркер переподписывается и снова получает сигналы.
+        // Потеря связи после `retry` с оформления: воркер сразу переподписывается и снова получает сигналы.
+        let t1 = after(t0, r.store.cfg.trash.retry);
+        r.clock.set(t1);
         r.env.bus.disconnect();
         until("переподписка", async || {
             r.env.bus.subscribers() == 1
@@ -961,7 +971,7 @@ mod tests {
             .delete_to_trash(r.scope, &ids[1..])
             .await
             .expect("trash");
-        let b_due = t0 + time::Duration::minutes(10);
+        let b_due = t1 + time::Duration::minutes(10);
         until(
             "перевзвод после переподписки",
             async || distinct(&r.armed).last() == Some(&b_due),
@@ -976,6 +986,78 @@ mod tests {
         assert_eq!(r.passed(), 1);
         assert!(r.exists(ids[0]).await);
         r.shutdown().await;
+    }
+
+    /// Шина, чьи системные подписки закрываются сразу; считает подписки.
+    struct Closing {
+        inner: tp_testkit::MemEventBus,
+        subs: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventBus for Closing {
+        async fn publish(&self, event: tp_contracts::bus::Event) -> Result<()> {
+            self.inner.publish(event).await
+        }
+
+        async fn subscribe(&self, scope: AccountScope) -> Result<tp_contracts::bus::EventStream> {
+            self.inner.subscribe(scope).await
+        }
+
+        async fn subscribe_system(&self) -> Result<tp_contracts::bus::EventStream> {
+            *self.subs.lock().expect("lock") += 1;
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_resubscribes_with_pause() {
+        let clock = tp_testkit::ManualClock::default();
+        let t0 = tp_testkit::Clock::now(&clock);
+        let env = Env::with_clock(clock.shared());
+        let subs = Arc::new(Mutex::new(0usize));
+        let mut store = env.store.clone();
+        store.d.bus = Arc::new(Closing {
+            inner: env.bus.clone(),
+            subs: subs.clone(),
+        });
+        let retry = store.cfg.trash.retry;
+        let armed = Arc::new(Mutex::new(Vec::new()));
+        let timer = TestTimer {
+            clock: clock.clone(),
+            armed: armed.clone(),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let worker = tokio::spawn(async move {
+            store
+                .trash_worker(&timer, async {
+                    let _ = stopped.await;
+                })
+                .await;
+        });
+        let count = || *subs.lock().expect("lock");
+
+        until(
+            "таймер на следующую попытку",
+            async || distinct(&armed).last() == Some(&after(t0, retry)),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(count(), 1, "поток закрылся сразу — без частых переподписок");
+
+        clock.set(after(t0, retry));
+        until("переподписка через retry", async || {
+            count() == 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(count(), 2);
+
+        stop.send(()).expect("stop");
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("worker stopped")
+            .expect("join");
     }
 
     #[tokio::test]
