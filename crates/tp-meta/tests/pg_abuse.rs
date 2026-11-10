@@ -100,14 +100,16 @@ async fn expired_rows_are_purged() {
     };
     let meta = PgMeta::new(pool, MetaConfig::default());
     let tenant = TenantId::new();
-    let now = db_now(&meta).await;
+    // Срок — с запасом на нагрузку CI: пять записей должны успеть до него (было 300 мс — «срок в прошлом»).
+    let short = Duration::from_secs(2);
+    let until = db_now(&meta).await + short;
     for i in 0..5u8 {
         let s = BlockSubject::Ip(format!("192.0.2.{i}").parse().expect("ip"));
-        meta.block(tenant, &s, now + Duration::from_millis(300), "short")
-            .await
-            .expect("block");
+        meta.block(tenant, &s, until, "short").await.expect("block");
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    while db_now(&meta).await <= until + Duration::from_millis(100) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     let s = BlockSubject::Ip("192.0.2.100".parse().expect("ip"));
     meta.block(
         tenant,
