@@ -1,10 +1,14 @@
 //! IDLE и уведомления (IMAP-08): изменения другой сессии и доставка приходят в IDLE; NOOP; таймаут; BYE.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::meta::SpecialUse;
+use tp_testkit::MemEventBus;
 
-use super::{Client, Env};
+use super::{Client, Env, LOGIN, PASSWORD};
+use crate::ext::Extensions;
 
 const PLAIN: &[u8] = b"From: a@example.org\r\nTo: b@example.org\r\nSubject: hi\r\n\r\nHello\r\n";
 
@@ -88,6 +92,43 @@ async fn noop_reports_changes_and_bus_reconnect() {
     assert_eq!(line(&mut a).await, "+ idling\r\n");
     a.send("NOOP\r\n").await;
     assert!(line(&mut a).await.starts_with("I2 BAD"));
+}
+
+/// IMAP-17: подписчик шины отстал — вместо пропущенных `MailboxChanged` пришёл `Resync`; IDLE сверяется с журналом.
+#[tokio::test]
+async fn idle_resync_reports_missed_changes() {
+    let env = Env::new().await;
+    let inbox = env.mailbox(SpecialUse::Inbox);
+    env.deliver(inbox, PLAIN, Default::default()).await;
+    // Шина сессии отдельно от шины хранилища: `MailboxChanged` доставок до сессии не доходят,
+    // буфер на один сигнал — два подряд дают `Resync`.
+    let bus = MemEventBus::new(1);
+    let mut ctx = (*env.ctx()).clone();
+    ctx.deps.bus = Arc::new(bus.clone());
+    let mut a = Env::client_ctx(Arc::new(ctx), true, Extensions::default()).await;
+    assert!(
+        a.cmd(&format!("L1 LOGIN {LOGIN} {PASSWORD}"))
+            .await
+            .contains("L1 OK")
+    );
+    assert!(a.cmd("S1 SELECT INBOX").await.contains("S1 OK"));
+    let mut b = selected(&env).await;
+    a.send("I1 IDLE\r\n").await;
+    assert_eq!(line(&mut a).await, "+ idling\r\n");
+    env.deliver(inbox, PLAIN, Default::default()).await;
+    b.cmd("B1 STORE 1 +FLAGS.SILENT (\\Seen)").await;
+    let lost = Event {
+        tenant: env.principal.tenant,
+        account: Some(env.principal.account),
+        kind: EventKind::MailboxListChanged,
+    };
+    // Без точки ожидания между публикациями: сессия не успевает прочитать первый сигнал.
+    bus.publish(lost.clone()).await.expect("publish");
+    bus.publish(lost).await.expect("publish");
+    assert_eq!(line(&mut a).await, "* 2 EXISTS\r\n");
+    assert_eq!(line(&mut a).await, "* 1 FETCH (FLAGS (\\Seen) UID 1)\r\n");
+    a.send("DONE\r\n").await;
+    assert_eq!(line(&mut a).await, "I1 OK IDLE terminated\r\n");
 }
 
 #[tokio::test]

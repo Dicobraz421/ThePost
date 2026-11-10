@@ -6,7 +6,8 @@
 //! выбранную папку. Журнал старше хранимого — сверка со списком писем папки.
 //!
 //! В `IDLE` сессия подписана на шину (`EventBus`, уведомления учётной записи): `MailboxChanged` выбранной
-//! папки — `sync`. Шина at-most-once: при обрыве потока сессия переподписывается и сверяется с журналом.
+//! папки — `sync`. Шина at-most-once: при обрыве потока сессия переподписывается и сверяется с журналом; `Resync`
+//! (сигналы потеряны) своей учётной записи или системный — тоже `sync`.
 //! `IDLE` длится не дольше [`Timeouts::idle`](crate::config::Timeouts), затем `BYE`; остановка узла — `BYE`.
 
 use std::borrow::Cow;
@@ -15,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 use tp_contracts::bus::{Event, EventKind, EventStream};
-use tp_contracts::meta::{Message, MessageQuery};
+use tp_contracts::meta::{AccountScope, Message, MessageQuery};
 use tp_contracts::{Error, MessageId, ModSeq, Result, Uid};
 
 use crate::proto::types::core::{Tag, Vec1};
@@ -31,6 +32,15 @@ enum Wake {
     Timeout,
     Event(Option<Event>),
     Read(std::io::Result<usize>),
+}
+
+/// `Resync` касается подписки `scope`: своей организации и учётной записи или системный (`account = None`).
+fn resync_applies(ev: &Event, scope: AccountScope) -> bool {
+    ev.kind == EventKind::Resync
+        && match ev.account {
+            None => true,
+            Some(account) => ev.tenant == scope.tenant && account == scope.account,
+        }
 }
 
 /// Изменения папки для клиента.
@@ -266,6 +276,10 @@ impl<T: Transport> Session<T> {
                         (EventKind::MailboxChanged { mailbox, modseq }, Some(s)) => {
                             *mailbox == s.mailbox && *modseq > s.modseq
                         }
+                        // Сигналы потеряны (отставание, переподключение шины): сверка с журналом.
+                        (EventKind::Resync, Some(_)) => self
+                            .mailbox_scope()
+                            .is_some_and(|scope| resync_applies(&ev, scope)),
                         _ => false,
                     };
                     if relevant && let Err(e) = self.sync().await {
@@ -293,5 +307,43 @@ impl<T: Transport> Session<T> {
                 Wake::Read(Err(e)) => return Err(io_error(e)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tp_contracts::{AccountId, TenantId};
+
+    use super::*;
+
+    #[test]
+    fn resync_scope() {
+        let scope = AccountScope {
+            tenant: TenantId::DEFAULT,
+            account: AccountId::new(),
+        };
+        let ev = |tenant, account| Event {
+            tenant,
+            account,
+            kind: EventKind::Resync,
+        };
+        assert!(resync_applies(
+            &ev(scope.tenant, Some(scope.account)),
+            scope
+        ));
+        assert!(resync_applies(&ev(TenantId::DEFAULT, None), scope));
+        assert!(!resync_applies(
+            &ev(scope.tenant, Some(AccountId::new())),
+            scope
+        ));
+        assert!(!resync_applies(
+            &ev(TenantId::new(), Some(scope.account)),
+            scope
+        ));
+        let other = Event {
+            kind: EventKind::MailboxListChanged,
+            ..ev(scope.tenant, Some(scope.account))
+        };
+        assert!(!resync_applies(&other, scope));
     }
 }
