@@ -12,6 +12,7 @@
 //!
 //! Проверка учётной записи и ограничения ролей (seccomp, Landlock) — до рантайма tokio (`startup`, из `main`).
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use tokio::task::JoinHandle;
 use tp_cluster::{PartitionAssignerConfig, RendezvousAssigner};
 use tp_contracts::events::{EventLog, PartitionAssigner};
 use tp_contracts::lease::LeaseStore;
-use tp_contracts::membership::{Membership, NodeId};
+use tp_contracts::membership::{Membership, NodeId, NodeInfo};
 use tp_contracts::role::{CancellationToken, Role, RoleService, fixed_config};
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
@@ -80,6 +81,8 @@ pub struct Running {
     pub metrics: Metrics,
     /// Имя узла в членстве.
     pub node: NodeId,
+    /// Членство кластера (состав живых узлов).
+    pub members: Arc<dyn Membership>,
     /// Адрес служебного HTTP.
     pub service_addr: SocketAddr,
     /// Фактические адреса слушателей ролей.
@@ -159,15 +162,9 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     // Членство: запись узла до чтения состава, иначе узлу не достанется ни одного раздела.
     let node = infra::node_id(&cfg)?;
     let cluster = cfg.section::<ClusterSection>(CLUSTER)?;
-    let mut role_names: Vec<String> = cfg
-        .roles()
-        .roles
-        .iter()
-        .map(|r| r.as_str().to_owned())
-        .collect();
-    role_names.extend(ext.roles().iter().map(|r| r.name().to_owned()));
-    meta.heartbeat_roles(&node, &role_names, events_cfg.node_ttl)
-        .await?;
+    // Роли модулей в записи узла не объявляются (`NodeInfo::roles` — роли ядра).
+    let info = node_info(node.clone(), &cfg.roles().roles, &cluster)?;
+    Membership::heartbeat(&meta, &info, events_cfg.node_ttl).await?;
     let assigner = RendezvousAssigner::start(
         Arc::new(meta.clone()) as Arc<dyn Membership>,
         &PartitionAssignerConfig {
@@ -328,8 +325,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
 
     tokio::spawn(heartbeat(
         meta.clone(),
-        node.clone(),
-        role_names,
+        info,
         events_cfg.node_ttl,
         events_cfg.heartbeat_interval(),
         aux.clone(),
@@ -345,6 +341,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     tokio::spawn(reloader.run(aux.clone()));
 
     drop(aux_guard.disarm());
+    let members: Arc<dyn Membership> = Arc::new(meta.clone());
     let task = {
         let health = health.clone();
         let metrics = metrics.clone();
@@ -374,6 +371,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         health,
         metrics,
         node,
+        members,
         service_addr,
         listeners: bound,
         task,
@@ -504,11 +502,20 @@ async fn apply_dkim(
     }
 }
 
+/// Запись узла в членстве: роли ядра, внутренний адрес и площадка из секции `cluster`.
+fn node_info(id: NodeId, roles: &BTreeSet<Role>, cluster: &ClusterSection) -> Result<NodeInfo> {
+    Ok(NodeInfo {
+        id,
+        roles: roles.clone(),
+        addr: cluster.addr.clone(),
+        site: cluster.site_id().map_err(|e| infra::context(CLUSTER, e))?,
+    })
+}
+
 /// Продление записи узла с периодом `period` до остановки.
 async fn heartbeat(
     meta: PgMeta,
-    node: NodeId,
-    roles: Vec<String>,
+    node: NodeInfo,
     ttl: Duration,
     period: Duration,
     shutdown: CancellationToken,
@@ -521,7 +528,7 @@ async fn heartbeat(
             () = shutdown.cancelled() => return,
             _ = tick.tick() => {}
         }
-        if let Err(e) = meta.heartbeat_roles(&node, &roles, ttl).await {
+        if let Err(e) = Membership::heartbeat(&meta, &node, ttl).await {
             tracing::warn!(error = %e, "запись узла в членстве не продлена");
         }
     }
@@ -610,6 +617,33 @@ mod tests {
         line
     }
 
+    #[test]
+    fn node_info_takes_roles_addr_and_site_from_config() {
+        let id = NodeId::new("node-a").expect("node");
+        let roles: BTreeSet<Role> = [Role::Imap, Role::SmtpIn].into_iter().collect();
+        let info = node_info(id.clone(), &roles, &ClusterSection::default()).expect("info");
+        assert_eq!(info.id, id);
+        assert_eq!(info.roles, roles);
+        assert_eq!(info.site.as_str(), "default");
+        assert!(info.addr.is_empty());
+
+        let cluster = ClusterSection {
+            site: "dc-2".into(),
+            addr: "https://10.0.0.2:7443".into(),
+            ..ClusterSection::default()
+        };
+        let info = node_info(id.clone(), &roles, &cluster).expect("info");
+        assert_eq!(info.site.as_str(), "dc-2");
+        assert_eq!(info.addr, "https://10.0.0.2:7443");
+
+        let bad = ClusterSection {
+            site: "dc 2".into(),
+            ..ClusterSection::default()
+        };
+        let e = node_info(id, &roles, &bad).expect_err("site").to_string();
+        assert!(e.contains("cluster") && e.contains("site"), "{e}");
+    }
+
     #[tokio::test]
     async fn secret_reference_without_store_is_explicit_error() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -658,7 +692,7 @@ mod tests {
                  database:\n  url: \"{url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
                  bus:\n  valkey:\n    password: {{ secret: \"{valkey}\" }}\n\
                  meta:\n  events:\n    node_ttl: 3s\n\
-                 cluster:\n  node_id: {node}\n\
+                 cluster:\n  node_id: {node}\n  site: dc-test\n  addr: https://127.0.0.1:7443\n\
                  runtime:\n  drain_deadline: 5s\n\
                  imap:\n  listeners:\n    - listen: 127.0.0.1:0\n  pop3:\n    enabled: true\n    listeners:\n      - listen: 127.0.0.1:0\n\
                  blob:\n  url: file://{}\n",
@@ -708,6 +742,15 @@ mod tests {
         }
         let pop3 = running.listeners.get(crate::protocols::POP3);
         assert!(first_line(pop3[0]).await.starts_with("+OK"));
+        // APP-15: запись узла в членстве — роли ядра, адрес и площадка из секции `cluster`.
+        let live = running.members.live_info().await.expect("live_info");
+        let me = live
+            .iter()
+            .find(|n| n.id == running.node)
+            .expect("узел в составе");
+        assert_eq!(me.roles, Role::ALL.iter().copied().collect(), "{me:?}");
+        assert_eq!(me.site.as_str(), "dc-test");
+        assert_eq!(me.addr, "https://127.0.0.1:7443");
         let metrics = running.metrics.encode().expect("metrics");
         assert!(metrics.contains("tp_bus_connected"), "{metrics}");
         assert!(metrics.contains("tp_roles_running"), "{metrics}");
