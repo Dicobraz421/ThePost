@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+# pg_auto_failover ({{ 'монитор' if pgaf_is_monitor else 'узел данных' }}): сокет — postgres (peer); по сети — только TLS
+# (решение 2026-10-30) и SCRAM, открытый канал отклоняется. pg_autoctl правила не меняет (--skip-pg-hba).
+# TYPE    DATABASE  USER  ADDRESS  METHOD
+local     all       postgres       peer
+local     all       all            peer
+{% if pgaf_is_monitor %}
+{% for net in pgaf_cluster_networks %}
+hostssl   {{ pgaf_monitor_db }}  autoctl_node  {{ net }}  scram-sha-256
+{% endfor %}
+{% else %}
+{% for net in pgaf_cluster_networks %}
+hostssl   replication  pgautofailover_replicator  {{ net }}  scram-sha-256
+hostssl   postgres     pgautofailover_replicator  {{ net }}  scram-sha-256
+hostssl   postgres     pgautofailover_monitor     {{ net }}  scram-sha-256
+{% endfor %}
+{% for net in pgaf_app_networks %}
+{% for role in pgaf_app_roles %}
+hostssl   {{ pgaf_app_db }}  {{ role }}  {{ net }}  scram-sha-256
+{% endfor %}
+{% endfor %}
+{% endif %}
+hostnossl all       all   0.0.0.0/0  reject
+hostnossl all       all   ::/0       reject

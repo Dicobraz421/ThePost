@@ -1,0 +1,105 @@
+# Узел pg_auto_failover (монитор или узел данных) для The Post, Debian / Ubuntu. Повторный прогон ничего не меняет.
+# Узлы данных — по одному (плейбук pg-ha.yml, serial: 1): первый становится primary, следующие — репликами.
+---
+- name: Check OS family
+  ansible.builtin.assert:
+    that: ansible_os_family == 'Debian'
+    fail_msg: "Роль pg_auto_failover эталона Enterprise-ВМ поддерживает Debian и Ubuntu"
+
+- name: Check parameters
+  ansible.builtin.assert:
+    that:
+      - groups[pgaf_monitor_group] | default([]) | length == 1
+      - pgaf_cluster_networks | length > 0
+      - pgaf_tls_ca_src | length > 0 and pgaf_tls_cert_src | length > 0 and pgaf_tls_key_src | length > 0
+      - pgaf_autoctl_password | length > 0
+      - pgaf_replicator_password | length > 0
+      - pgaf_monitor_password | length > 0
+    fail_msg: >-
+      Нужны: один монитор в группе {{ pgaf_monitor_group }}, pgaf_cluster_networks, файлы TLS (pgaf_tls_ca_src,
+      pgaf_tls_cert_src, pgaf_tls_key_src) и пароли pgaf_autoctl_password, pgaf_replicator_password,
+      pgaf_monitor_password (ansible-vault или OpenBao)
+  no_log: true
+
+- name: Select node kind
+  ansible.builtin.set_fact:
+    pgaf_is_monitor: "{{ inventory_hostname in groups[pgaf_monitor_group] }}"
+    pgaf_monitor_host: "{{ groups[pgaf_monitor_group] | first }}"
+
+- name: Add PGDG repository
+  ansible.builtin.deb822_repository:
+    name: pgdg
+    uris: "{{ pgaf_pgdg_uri }}"
+    suites: "{{ ansible_distribution_release }}-pgdg"
+    components: [main]
+    signed_by: "{{ pgaf_pgdg_key_url }}"
+  when: pgaf_pgdg_repo
+  register: pgaf_repo
+
+- name: Install postgresql-common
+  ansible.builtin.apt:
+    name: postgresql-common
+    state: present
+    update_cache: "{{ pgaf_repo is changed }}"
+
+# Кластер создаёт pg_autoctl; кластер Debian main (pg_ctlcluster, Perl) не нужен.
+- name: Disable creation of the Debian main cluster
+  ansible.builtin.lineinfile:
+    path: /etc/postgresql-common/createcluster.conf
+    regexp: '^#?\s*create_main_cluster\s*='
+    line: create_main_cluster = false
+
+- name: Install PostgreSQL and pg_auto_failover
+  ansible.builtin.apt:
+    name: "{{ pgaf_packages + ['python3-psycopg2', 'acl'] }}"
+    state: present
+
+- name: Create TLS directory
+  ansible.builtin.file:
+    path: "{{ pgaf_tls_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+
+- name: Copy TLS files
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ pgaf_tls_dir }}/{{ item.dest }}"
+    owner: postgres
+    group: postgres
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: "{{ pgaf_tls_ca_src }}", dest: ca.pem, mode: "0644" }
+    - { src: "{{ pgaf_tls_cert_src }}", dest: server.pem, mode: "0644" }
+    - { src: "{{ pgaf_tls_key_src }}", dest: server.key, mode: "0600" }
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: Reload pgautofailover
+
+# Пароли служебных учётных записей — для libpq (pg_autoctl, walreceiver, pg_rewind, проверки монитора).
+- name: Write .pgpass
+  ansible.builtin.template:
+    src: pgpass.j2
+    dest: "{{ pgaf_home }}/.pgpass"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  no_log: true
+
+- name: Write pgautofailover unit
+  ansible.builtin.template:
+    src: pgautofailover.service.j2
+    dest: "/etc/systemd/system/{{ pgaf_service }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  register: pgaf_unit
+
+- name: Monitor
+  ansible.builtin.include_tasks: monitor.yml
+  when: pgaf_is_monitor
+
+- name: Data node
+  ansible.builtin.include_tasks: node.yml
+  when: not pgaf_is_monitor

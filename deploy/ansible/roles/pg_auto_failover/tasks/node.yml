@@ -1,0 +1,173 @@
+# Узел данных pg_auto_failover: первый в формации — primary, следующие — синхронные реплики (pg_basebackup с primary).
+---
+- name: Monitor address
+  ansible.builtin.set_fact:
+    pgaf_monitor_uri: >-
+      postgres://autoctl_node@{{ hostvars[pgaf_monitor_host].pgaf_hostname
+      | default(hostvars[pgaf_monitor_host].ansible_host | default(pgaf_monitor_host)) }}:{{ pgaf_port }}/{{
+      pgaf_monitor_db }}?sslmode=verify-full&sslrootcert={{ pgaf_tls_dir }}/ca.pem
+
+- name: Create data node
+  ansible.builtin.command:
+    argv:
+      - "{{ pgaf_bin_dir }}/pg_autoctl"
+      - create
+      - postgres
+      - --pgdata
+      - "{{ pgaf_pgdata }}"
+      - --pgctl
+      - "{{ pgaf_bin_dir }}/pg_ctl"
+      - --pgport
+      - "{{ pgaf_port }}"
+      - --hostname
+      - "{{ pgaf_hostname }}"
+      - --name
+      - "{{ pgaf_name }}"
+      - --formation
+      - "{{ pgaf_formation }}"
+      - --dbname
+      - "{{ pgaf_app_db }}"
+      - --monitor
+      - "{{ pgaf_monitor_uri }}"
+      - --auth
+      - scram-sha-256
+      - --ssl-ca-file
+      - "{{ pgaf_tls_dir }}/ca.pem"
+      - --server-cert
+      - "{{ pgaf_tls_dir }}/server.pem"
+      - --server-key
+      - "{{ pgaf_tls_dir }}/server.key"
+      - --ssl-mode
+      - verify-full
+      - --skip-pg-hba
+      - --candidate-priority
+      - "{{ pgaf_candidate_priority }}"
+      - --replication-quorum
+      - "{{ pgaf_replication_quorum | bool | string | lower }}"
+    creates: "{{ pgaf_home }}/.config/pg_autoctl{{ pgaf_pgdata }}/pg_autoctl.cfg"
+  become: true
+  become_user: postgres
+
+# Реплика получает каталог данных копией primary (те же pg_hba.conf и thepost.conf): шаблоны совпадают на всех узлах.
+- name: Write node pg_hba.conf
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: "{{ pgaf_pgdata }}/pg_hba.conf"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Reload pgautofailover
+
+- name: Include The Post settings
+  ansible.builtin.lineinfile:
+    path: "{{ pgaf_pgdata }}/postgresql.conf"
+    line: "include_if_exists = 'thepost.conf'"
+  notify: Reload pgautofailover
+
+- name: Write The Post settings
+  ansible.builtin.template:
+    src: thepost.conf.j2
+    dest: "{{ pgaf_pgdata }}/thepost.conf"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Reload pgautofailover
+
+- name: Read keeper network partition timeout
+  ansible.builtin.command:
+    argv:
+      - "{{ pgaf_bin_dir }}/pg_autoctl"
+      - config
+      - get
+      - --pgdata
+      - "{{ pgaf_pgdata }}"
+      - timeout.network_partition_timeout
+  register: pgaf_partition_timeout
+  changed_when: false
+  become: true
+  become_user: postgres
+
+- name: Set keeper network partition timeout
+  ansible.builtin.command:
+    argv:
+      - "{{ pgaf_bin_dir }}/pg_autoctl"
+      - config
+      - set
+      - --pgdata
+      - "{{ pgaf_pgdata }}"
+      - timeout.network_partition_timeout
+      - "{{ pgaf_network_partition_timeout }}"
+  when: pgaf_partition_timeout.stdout | trim != pgaf_network_partition_timeout | string
+  changed_when: true
+  notify: Reload pgautofailover
+  become: true
+  become_user: postgres
+
+- name: Start data node
+  ansible.builtin.systemd_service:
+    name: "{{ pgaf_service }}"
+    state: started
+    enabled: true
+    daemon_reload: "{{ pgaf_unit is changed }}"
+
+- name: Apply pending reload
+  ansible.builtin.meta: flush_handlers
+
+# Реплика готова после pg_basebackup с primary.
+- name: Wait for node PostgreSQL
+  ansible.builtin.command:
+    argv: ["{{ pgaf_bin_dir }}/pg_isready", -q, -h, /var/run/postgresql, -p, "{{ pgaf_port }}"]
+  register: pgaf_ready
+  until: pgaf_ready.rc == 0
+  retries: 180
+  delay: 5
+  changed_when: false
+
+- name: Check recovery mode
+  community.postgresql.postgresql_query:
+    query: SELECT pg_is_in_recovery() AS standby
+    port: "{{ pgaf_port }}"
+  register: pgaf_recovery
+  changed_when: false
+  become: true
+  become_user: postgres
+
+# Пароли служебных ролей задаются на primary и попадают на реплики репликацией.
+- name: Set passwords of pg_auto_failover roles on primary
+  community.postgresql.postgresql_user:
+    name: "{{ item.name }}"
+    password: "{{ item.password }}"
+    update_password: always
+    port: "{{ pgaf_port }}"
+  loop:
+    - { name: pgautofailover_replicator, password: "{{ pgaf_replicator_password }}" }
+    - { name: pgautofailover_monitor, password: "{{ pgaf_monitor_password }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  when: not pgaf_recovery.query_result[0].standby
+  become: true
+  become_user: postgres
+  no_log: true
+
+# Следующий узел формации — после того как этот дошёл до назначенного монитором состояния.
+- name: Wait for assigned state
+  community.postgresql.postgresql_query:
+    db: "{{ pgaf_monitor_db }}"
+    query: >-
+      SELECT reportedstate::text AS reported, goalstate::text AS goal FROM pgautofailover.node
+      WHERE formationid = %(formation)s AND nodename = %(name)s
+    named_args:
+      formation: "{{ pgaf_formation }}"
+      name: "{{ pgaf_name }}"
+    port: "{{ pgaf_port }}"
+  delegate_to: "{{ pgaf_monitor_host }}"
+  register: pgaf_state
+  until: >-
+    pgaf_state.query_result | length == 1
+    and pgaf_state.query_result[0].reported == pgaf_state.query_result[0].goal
+    and pgaf_state.query_result[0].reported in ['single', 'wait_primary', 'primary', 'secondary']
+  retries: 120
+  delay: 5
+  changed_when: false
+  become: true
+  become_user: postgres

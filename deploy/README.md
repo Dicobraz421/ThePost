@@ -9,8 +9,8 @@
 | `compose/postgres/app-role.sh` | Учётные записи PostgreSQL: владелец схемы `thepost_owner`, узел `thepost`, только чтение `thepost_readonly` |
 | `openbao/thepost-policy.hcl` | Политика узла `thepost` в OpenBao (общая для compose, Helm, Ansible) |
 | `helm/openbao/` | Значения чарта `openbao/openbao` и настройка Kubernetes auth (`bootstrap.sh`) |
-| `helm/thepost/` | Чарт узла: не root, корневая ФС только для чтения, без capabilities, seccomp `RuntimeDefault` |
-| `ansible/` | Эталон SMB одной командой (`smb.yml`: роли `thepost_pki`, `openbao`, `postgresql`, `rspamd`, `clamav_milter`, `thepost`); OpenBao отдельно (`openbao.yml`) |
+| `helm/thepost/` | Чарт узла: не root, корневая ФС только для чтения, без capabilities, seccomp `RuntimeDefault`; PostgreSQL — CloudNativePG (`cnpg.enabled`) |
+| `ansible/` | Эталон SMB одной командой (`smb.yml`: роли `thepost_pki`, `openbao`, `postgresql`, `rspamd`, `clamav_milter`, `thepost`); OpenBao отдельно (`openbao.yml`); СУБД Enterprise-ВМ — pg_auto_failover (`pg-ha.yml`) |
 | `stand/` | Стенд SMB и базовая нагрузка (APP-D): ВМ SMB + генератор, imaptest, smtp-source, k6, отчёт |
 | `systemd/` | Юнит `thepost.service` с hardening, сокеты `thepost-*.socket` (порты ниже 1024), пользователь `thepost` (sysusers) |
 | `config/` | Примеры `config.yaml` для пресетов `all` (SMB), `mailbox` (Enterprise-ВМ), `edge` (DMZ) |
@@ -144,7 +144,8 @@ ansible-playbook -i inventory.yml deploy/ansible/smb.yml
 ```
 Порядок: внутренний CA (`thepost_pki`, `/etc/thepost/pki`: внутренние каналы PostgreSQL и OpenBao — только TLS, на
 loopback) → OpenBao (`https://localhost:8200`, пароли `thepost/db`, `thepost/db-owner`, `thepost/db-readonly`, AppRole)
-→ PostgreSQL (`hostssl` только для учётных записей The Post, без SUPERUSER и BYPASSRLS) → Rspamd (Milter `127.0.0.1:11332`) → clamav-milter (`127.0.0.1:7357`) →
+→ PostgreSQL (`hostssl` только для учётных записей The Post, без SUPERUSER и BYPASSRLS; `postgres` запускается
+юнитом напрямую, без `pg_ctlcluster` на Perl) → Rspamd (Milter `127.0.0.1:11332`) → clamav-milter (`127.0.0.1:7357`) →
 `thepost` (sysusers, юнит и сокеты, `config.yaml` из шаблона с проверкой `thepost config check`, ожидание
 `/healthz/ready`). Порты ниже 1024 — `thepost_socket_activation`: `true` — сокеты systemd, у процесса нет capabilities;
 `false` (по умолчанию, пока узел не принимает сокеты systemd — TODO(PLT-16)) — `CAP_NET_BIND_SERVICE`.
@@ -208,6 +209,50 @@ TP_DB_OWNER_PASSWORD=$(bao kv get -mount=thepost -field=password db-owner) \
 TP_DB_READONLY_PASSWORD=$(bao kv get -mount=thepost -field=password db-readonly) \
 PGHOST=<адрес> PGUSER=postgres sh deploy/compose/postgres/app-role.sh
 ```
+
+## PostgreSQL: высокая доступность (Enterprise)
+Продукт кластером СУБД не управляет: подходит любой механизм заказчика с синхронной репликой (RPO = 0) и
+автоматическим переключением без второго primary (RTO ≤ 30 с), SRS 3.1, решение 2026-11-01. Узел находит primary
+сам — список адресов `database.url` + `database.urls` (первый доступный для записи), единый адрес (VIP, DNS) или
+Service Kubernetes; при переключении сбрасывает пул и повторяет идемпотентные операции (`database.failover`:
+`retry_initial`, `retry_max`, `retry_for`, `probe_timeout`), дольше `retry_for` — временный отказ (SMTP 4xx).
+Метрики — `tp_db_failover_*` в `/metrics`. Эталонные стенды — без интерпретаторов в работе (SRS 7.1):
+
+| Профиль | Эталон | Адрес primary в config.yaml |
+|---|---|---|
+| Enterprise-ВМ | pg_auto_failover: монитор + 3 узла данных (`ansible/pg-ha.yml`) | `url` + `urls` — узлы данных (`config/mailbox.yaml`) |
+| Enterprise-K8s | CloudNativePG: Cluster (3 экземпляра) + Pooler (`helm/thepost`, `cnpg.enabled`) | служба `<выпуск>-db-rw`, PgBouncer — `<выпуск>-db-pooler-rw` |
+
+### Enterprise-ВМ (Ansible, pg_auto_failover)
+```bash
+ansible-galaxy collection install -r deploy/ansible/requirements.yml
+cp deploy/ansible/inventory-ha.example.yml inventory-ha.yml   # монитор, узлы, сети, файлы TLS; пароли — ansible-vault
+ansible-playbook -i inventory-ha.yml deploy/ansible/pg-ha.yml --ask-vault-pass
+```
+Роль `pg_auto_failover`: PostgreSQL 16 и pg_auto_failover из PGDG, кластер Debian `main` не создаётся; `pg_autoctl`
+и `postgres` — бинарные файлы, юнит `pgautofailover.service` (без `pg_wrapper`/`pg_ctlcluster` на Perl). Узлы данных
+ставятся по одному: первый — primary, следующие — реплики; `number_sync_standbys: 1` (фиксация ждёт одну из двух
+реплик). Сроки переключения — `pgaf_monitor_settings`, `pgaf_network_partition_timeout` (RTO ≈ 10 с + 15 с; значения
+pg_auto_failover по умолчанию дают ≈ 50 с). Только TLS (`verify-full`, `pg_hba` — `hostssl`, открытый канал
+отклоняется), служебные пароли — `~postgres/.pgpass`. Учётные записи и БД The Post — на primary, как в эталоне SMB.
+Узел `thepost` (роль `thepost`): `thepost_db_url` — первый узел, `thepost_db_urls` — остальные,
+`thepost_db_failover` — `database.failover`. Шард 2 — узел своей формации (`pgaf_formation`).
+Без PgBouncer: с `pgbouncer: true` слушатель сигналов и миграции идут на `direct_url` — один адрес, `urls` к нему не
+применяется. Миграции (`database.owner`) подключаются только к `url`.
+
+### Enterprise-K8s (Helm, CloudNativePG)
+```bash
+helm repo add cnpg https://cloudnative-pg.github.io/charts
+helm install cnpg cnpg/cloudnative-pg -n cnpg-system --create-namespace          # оператор 1.26+
+kubectl -n thepost create secret generic thepost-db-owner --type=kubernetes.io/basic-auth \
+  --from-literal=username=thepost_owner --from-literal=password="$(bao kv get -mount=thepost -field=password db-owner)"
+# так же thepost-db (thepost, thepost/db) и thepost-db-readonly (thepost_readonly, thepost/db-readonly)
+helm install thepost deploy/helm/thepost -n thepost --set cnpg.enabled=true -f <свои значения>
+```
+Cluster: 3 экземпляра на разных узлах Kubernetes, синхронная репликация `ANY 1` с `dataDurability: required`,
+без суперпользователя, `pg_hba` — только `hostssl`; образ `minimal` (без barman-cloud на Python). Pooler —
+PgBouncer в режиме transaction; чарт сам задаёт `database.url` (Pooler), `pgbouncer: true` и `direct_url` (служба
+primary) и монтирует CA сервера (`<выпуск>-db-ca`, только `ca.crt`).
 
 ## OpenBao (хранилище секретов)
 Эталонная поставка включает OpenBao (MPL-2.0; подходит и существующий HashiCorp Vault заказчика): хранилище Raft,

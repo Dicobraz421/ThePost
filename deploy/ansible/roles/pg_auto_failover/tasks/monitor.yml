@@ -1,0 +1,114 @@
+# Монитор pg_auto_failover: состояние формаций, решение о переключении (SRS 3.1). Отказ монитора не останавливает
+# primary, но до его возврата переключения нет.
+---
+- name: Create monitor
+  ansible.builtin.command:
+    argv:
+      - "{{ pgaf_bin_dir }}/pg_autoctl"
+      - create
+      - monitor
+      - --pgdata
+      - "{{ pgaf_pgdata }}"
+      - --pgctl
+      - "{{ pgaf_bin_dir }}/pg_ctl"
+      - --pgport
+      - "{{ pgaf_port }}"
+      - --hostname
+      - "{{ pgaf_hostname }}"
+      - --auth
+      - scram-sha-256
+      - --ssl-ca-file
+      - "{{ pgaf_tls_dir }}/ca.pem"
+      - --server-cert
+      - "{{ pgaf_tls_dir }}/server.pem"
+      - --server-key
+      - "{{ pgaf_tls_dir }}/server.key"
+      - --ssl-mode
+      - verify-full
+      - --skip-pg-hba
+    creates: "{{ pgaf_home }}/.config/pg_autoctl{{ pgaf_pgdata }}/pg_autoctl.cfg"
+  become: true
+  become_user: postgres
+
+- name: Write monitor pg_hba.conf
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: "{{ pgaf_pgdata }}/pg_hba.conf"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Reload pgautofailover
+
+- name: Start monitor
+  ansible.builtin.systemd_service:
+    name: "{{ pgaf_service }}"
+    state: started
+    enabled: true
+    daemon_reload: "{{ pgaf_unit is changed }}"
+
+- name: Apply pending reload
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for monitor PostgreSQL
+  ansible.builtin.command:
+    argv: ["{{ pgaf_bin_dir }}/pg_isready", -q, -h, /var/run/postgresql, -p, "{{ pgaf_port }}"]
+  register: pgaf_ready
+  until: pgaf_ready.rc == 0
+  retries: 30
+  delay: 2
+  changed_when: false
+
+- name: Set autoctl_node password
+  community.postgresql.postgresql_user:
+    name: autoctl_node
+    password: "{{ pgaf_autoctl_password }}"
+    update_password: always
+    db: "{{ pgaf_monitor_db }}"
+    port: "{{ pgaf_port }}"
+  become: true
+  become_user: postgres
+  no_log: true
+
+# Сроки проверок и переключения (RTO ≤ 30 с): ALTER SYSTEM и перечитывание конфигурации.
+- name: Set failover timeouts
+  community.postgresql.postgresql_set:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    port: "{{ pgaf_port }}"
+  loop: "{{ pgaf_monitor_settings | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+  become: true
+  become_user: postgres
+
+# Формации узлов данных (кроме default — её создаёт монитор).
+- name: Find formations
+  community.postgresql.postgresql_query:
+    db: "{{ pgaf_monitor_db }}"
+    query: SELECT formationid FROM pgautofailover.formation
+    port: "{{ pgaf_port }}"
+  register: pgaf_formations_found
+  changed_when: false
+  become: true
+  become_user: postgres
+
+- name: Create formations
+  ansible.builtin.command:
+    argv:
+      - "{{ pgaf_bin_dir }}/pg_autoctl"
+      - create
+      - formation
+      - --pgdata
+      - "{{ pgaf_pgdata }}"
+      - --formation
+      - "{{ item }}"
+      - --kind
+      - pgsql
+      - --dbname
+      - "{{ pgaf_app_db }}"
+  loop: >-
+    {{ groups['pgaf_nodes'] | default([]) | map('extract', hostvars) | map(attribute='pgaf_formation', default='default')
+       | unique | difference(pgaf_formations_found.query_result | map(attribute='formationid')) }}
+  changed_when: true
+  become: true
+  become_user: postgres

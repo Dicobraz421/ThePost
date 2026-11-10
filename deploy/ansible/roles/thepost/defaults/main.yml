@@ -31,6 +31,11 @@ thepost_acme_directory_url: ""
 thepost_internal_ca_file: "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/ca.pem"
 thepost_db_url: >-
   postgres://thepost@localhost:5432/thepost?sslmode=verify-full&sslrootcert={{ thepost_internal_ca_file }}
+# Другие адреса кластера PostgreSQL (database.urls): узел выбирает первый доступный для записи из thepost_db_url и
+# списка (Enterprise-ВМ — узлы данных pg_auto_failover, deploy/ansible/pg-ha.yml); пусто — единственный адрес.
+# Сроки повтора и поиска primary — thepost_db_failover (database.failover, например { retry_for: 30s }).
+thepost_db_urls: []
+thepost_db_failover: {}
 thepost_secrets_url: "{{ openbao_api_addr | default('https://localhost:8200') }}"
 thepost_secrets_role_id_file: "{{ openbao_thepost_role_id_file | default('/etc/thepost/openbao/role_id') }}"
 

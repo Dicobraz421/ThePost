@@ -1,0 +1,127 @@
+{{- if .Values.cnpg.enabled }}
+{{- $cluster := include "thepost.dbCluster" . }}
+{{- $pooler := include "thepost.dbPooler" . }}
+{{- $db := .Values.cnpg.database }}
+# PostgreSQL — CloudNativePG (эталон Enterprise-K8s, SRS 3.1; решение 2026-11-01 «Требования к СУБД»): primary и
+# синхронные реплики, автоматическое переключение оператором без второго primary; узел — через службу <кластер>-rw.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $cluster }}
+  labels:
+    {{- include "thepost.labels" . | nindent 4 }}
+spec:
+  instances: {{ .Values.cnpg.instances }}
+  imageName: {{ .Values.cnpg.imageName | quote }}
+  enableSuperuserAccess: false
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+  failoverDelay: {{ .Values.cnpg.failoverDelay }}
+  switchoverDelay: {{ .Values.cnpg.switchoverDelay }}
+  postgresql:
+    synchronous:
+      {{- toYaml .Values.cnpg.synchronous | nindent 6 }}
+    parameters:
+      password_encryption: scram-sha-256
+      ssl_min_protocol_version: TLSv1.2
+      {{- with .Values.cnpg.parameters }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+    # По сети — только TLS (решение 2026-10-30): учётные записи The Post — SCRAM, открытый канал отклоняется
+    # (правила оператора для streaming_replica и PgBouncer — раньше этих).
+    pg_hba:
+      - hostssl {{ $db }} thepost,thepost_owner,thepost_readonly all scram-sha-256
+      - hostnossl all all all reject
+  # БД и учётные записи — как в эталоне SMB (DEP-08): владелец схемы, узел (thepost_app), только чтение
+  # (thepost_reader); права на таблицы выдают миграции (tp_grant_roles). Пароли — секреты basic-auth с теми же
+  # значениями, что в OpenBao (thepost/db-owner, thepost/db, thepost/db-readonly).
+  bootstrap:
+    initdb:
+      database: {{ $db }}
+      owner: thepost_owner
+      secret:
+        name: {{ .Values.cnpg.secrets.owner }}
+      postInitApplicationSQL:
+        - CREATE ROLE thepost_app NOLOGIN
+        - CREATE ROLE thepost_reader NOLOGIN
+        - REVOKE ALL ON DATABASE {{ $db }} FROM PUBLIC
+        - GRANT CONNECT ON DATABASE {{ $db }} TO thepost_app, thepost_reader
+  managed:
+    roles:
+      - { name: thepost_app, ensure: present, login: false, superuser: false, createdb: false, createrole: false, replication: false, bypassrls: false }
+      - { name: thepost_reader, ensure: present, login: false, superuser: false, createdb: false, createrole: false, replication: false, bypassrls: false }
+      - name: thepost_owner
+        ensure: present
+        login: true
+        superuser: false
+        createdb: false
+        createrole: false
+        replication: false
+        bypassrls: false
+        passwordSecret: { name: {{ .Values.cnpg.secrets.owner }} }
+      - name: thepost
+        ensure: present
+        login: true
+        superuser: false
+        createdb: false
+        createrole: false
+        replication: false
+        bypassrls: false
+        inRoles: [thepost_app]
+        passwordSecret: { name: {{ .Values.cnpg.secrets.app }} }
+      - name: thepost_readonly
+        ensure: present
+        login: true
+        superuser: false
+        createdb: false
+        createrole: false
+        replication: false
+        bypassrls: false
+        inRoles: [thepost_reader]
+        passwordSecret: { name: {{ .Values.cnpg.secrets.readonly }} }
+  {{- $certs := deepCopy (default (dict) .Values.cnpg.certificates) }}
+  {{- if .Values.cnpg.pooler.enabled }}
+  {{- $ns := .Release.Namespace }}
+  {{- $_ := set $certs "serverAltDNSNames" (concat (default (list) $certs.serverAltDNSNames) (list $pooler (printf "%s.%s" $pooler $ns) (printf "%s.%s.svc" $pooler $ns))) }}
+  {{- end }}
+  {{- with $certs }}
+  # Сертификат сервера — и для PgBouncer (Pooler): имя службы Pooler — в SAN (verify-full).
+  certificates:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: required
+  storage:
+    size: {{ .Values.cnpg.storage.size }}
+    {{- with .Values.cnpg.storage.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+  {{- with .Values.cnpg.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- if .Values.cnpg.pooler.enabled }}
+---
+# PgBouncer в режиме transaction (SRS 3.1, Enterprise): узел — database.url; слушатель сигналов и миграции —
+# database.direct_url мимо PgBouncer (служба primary <кластер>-rw).
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: {{ $pooler }}
+  labels:
+    {{- include "thepost.labels" . | nindent 4 }}
+spec:
+  cluster:
+    name: {{ $cluster }}
+  instances: {{ .Values.cnpg.pooler.instances }}
+  type: rw
+  pgbouncer:
+    poolMode: transaction
+    {{- with .Values.cnpg.pooler.parameters }}
+    parameters:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- end }}
+{{- end }}

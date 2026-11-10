@@ -47,6 +47,12 @@
     }},
   },
 } -%}
+{%- if thepost_db_urls | length > 0 -%}
+{%-   set base = base | combine({'database': {'urls': thepost_db_urls}}, recursive=true) -%}
+{%- endif -%}
+{%- if thepost_db_failover | length > 0 -%}
+{%-   set base = base | combine({'database': {'failover': thepost_db_failover}}, recursive=true) -%}
+{%- endif -%}
 {%- if acme -%}
 {%-   set acme_section = {'enabled': true, 'domains': thepost_tls_names, 'contact': ['mailto:' ~ thepost_acme_email],
                           'state_dir': '/var/lib/thepost/acme'} -%}

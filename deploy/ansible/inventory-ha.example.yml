@@ -1,0 +1,29 @@
+# Пример инвентаря эталона СУБД Enterprise-ВМ (deploy/ansible/pg-ha.yml): монитор и три узла данных шарда 1
+# (primary и две синхронные реплики), шард 2 — один узел своей формации (APP-D Д.2). Пароли — ansible-vault
+# (group_vars/all/vault.yml), значения thepost_db_* — те же, что в OpenBao.
+#   ansible-playbook -i inventory-ha.yml deploy/ansible/pg-ha.yml --ask-vault-pass
+---
+all:
+  vars:
+    ansible_user: admin
+    # Сеть СУБД (VLAN данных): репликация, проверки монитора; сеть узлов thepost.
+    pgaf_cluster_networks: ["10.0.20.0/24"]
+    pgaf_app_networks: ["10.0.10.0/24"]
+    # CA и сертификаты узлов (SAN — имя узла) на управляющей машине.
+    pgaf_tls_ca_src: pki/ca.pem
+    pgaf_tls_cert_src: "pki/{{ inventory_hostname }}.pem"
+    pgaf_tls_key_src: "pki/{{ inventory_hostname }}.key"
+    # В vault: pgaf_autoctl_password, pgaf_replicator_password, pgaf_monitor_password,
+    #          thepost_db_password, thepost_db_owner_password, thepost_db_readonly_password.
+  children:
+    pgaf_monitor:
+      hosts:
+        pgmon.example.ru:
+    pgaf_nodes:
+      hosts:
+        pg1.example.ru:
+        pg2.example.ru:
+        pg3.example.ru:
+        pg4.example.ru:
+          pgaf_formation: shard2
+          pgaf_number_sync_standbys: 0

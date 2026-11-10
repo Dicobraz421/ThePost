@@ -14,7 +14,7 @@ spec:
       labels:
         {{- include "thepost.labels" . | nindent 8 }}
       annotations:
-        checksum/config: {{ toYaml .Values.config | sha256sum }}
+        checksum/config: {{ include "thepost.config" . | sha256sum }}
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       # Токен сервисного аккаунта — вход в OpenBao (secrets.auth.kubernetes.jwt_file).
@@ -50,6 +50,10 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/thepost/config.yaml, subPath: config.yaml, readOnly: true }
             - { name: tls, mountPath: /etc/thepost/tls, readOnly: true }
+            {{- if .Values.cnpg.enabled }}
+            # CA сервера PostgreSQL (CloudNativePG): sslmode=verify-full.
+            - { name: db-ca, mountPath: /etc/thepost/db-ca, readOnly: true }
+            {{- end }}
             # Запись — только каталог данных узла (кэш, при file:// — BLOB) и /tmp в памяти.
             - { name: state, mountPath: /var/lib/thepost }
             - { name: tmp, mountPath: /tmp }
@@ -60,6 +64,14 @@ spec:
         - name: tls
           secret:
             secretName: {{ .Values.tls.secretName }}
+        {{- if .Values.cnpg.enabled }}
+        # Только сертификат CA (ключ CA в под не попадает).
+        - name: db-ca
+          secret:
+            secretName: {{ include "thepost.dbCASecret" . }}
+            items:
+              - { key: ca.crt, path: ca.crt }
+        {{- end }}
         - name: state
           emptyDir: {}
         - name: tmp

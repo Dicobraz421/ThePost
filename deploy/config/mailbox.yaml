@@ -3,16 +3,27 @@
 
 domain: example.ru
 
-# Кластер PostgreSQL через PgBouncer.
-# Узел — роль thepost (thepost_app); миграции — владелец схемы thepost_owner в обход PgBouncer (DEP-08).
+# Кластер PostgreSQL (эталон — pg_auto_failover, deploy/ansible/pg-ha.yml; SRS 3.1): узел сам находит primary —
+# первый доступный для записи из url и urls (target_session_attrs=read-write), при переключении сбрасывает пул и
+# повторяет идемпотентные операции (database.failover), дольше retry_for — временный отказ (SMTP 4xx).
+# Учётные данные и параметры TLS — из url, из адресов urls — только хост, порт и БД.
+# Узел — роль thepost (thepost_app); миграции — владелец схемы thepost_owner (DEP-08). Миграции подключаются только к
+# url, без поиска primary: после переключения — meta.migrate_on_start: false или url — текущий primary.
 database:
-  url: postgres://thepost@pgbouncer.example.ru:6432/thepost?sslmode=verify-full
+  url: postgres://thepost@pg1.example.ru:5432/thepost?sslmode=verify-full
+  urls:
+    - postgres://thepost@pg2.example.ru:5432/thepost
+    - postgres://thepost@pg3.example.ru:5432/thepost
+  failover: { retry_initial: 100ms, retry_max: 2s, retry_for: 30s, probe_timeout: 3s }
   password: { secret: "thepost/db#password" }
-  pgbouncer: true
-  direct_url: postgres://thepost@postgres.example.ru:5432/thepost?sslmode=verify-full
   owner:
     user: thepost_owner
     password: { secret: "thepost/db-owner#password" }
+  # Через PgBouncer (transaction): url — PgBouncer, pgbouncer: true; слушатель сигналов и миграции — direct_url мимо
+  # PgBouncer, один адрес (список urls к нему не применяется) — VIP или DNS, следующий за primary.
+  #   url: postgres://thepost@pgbouncer.example.ru:6432/thepost?sslmode=verify-full
+  #   pgbouncer: true
+  #   direct_url: postgres://thepost@pg-primary.example.ru:5432/thepost?sslmode=verify-full
 
 # S3 (эталон — SeaweedFS); ключи доступа — ссылки на секрет thepost/s3 в секции BLOB-хранилища.
 blob:

@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+# Кластер {{ postgresql_version }}/{{ postgresql_cluster }} без pg_ctlcluster (Perl): postgres запускается напрямую
+# (SRS 7.1, решение 2026-11-01 «Требования к СУБД»). Остановка — fast (SIGINT), перечитывание настроек — SIGHUP.
+[Service]
+Type=notify
+User=postgres
+Group=postgres
+PIDFile=
+ExecStartPre=
+ExecStart=
+ExecStart={{ postgresql_bin_dir }}/postgres -D {{ postgresql_data_dir }} -c config_file={{ postgresql_conf_dir }}/postgresql.conf
+ExecStop=
+ExecReload=
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStartSec=infinity
