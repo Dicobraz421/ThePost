@@ -660,3 +660,219 @@ async fn success_dsn_only_on_request() {
     );
     assert!(!dsn[0].2.contains("y@example.net\r\nAction"));
 }
+
+// ---------- Планировщик по доменам ----------
+
+/// Домен → (отправок сейчас, наибольшее); домены вызовов по порядку.
+type TimedState = (
+    std::collections::HashMap<String, (usize, usize)>,
+    Vec<String>,
+);
+
+/// Отправка с задержкой `delay`; домены из `down` недоступны. Учёт одновременных отправок по доменам.
+#[derive(Default)]
+struct Timed {
+    delay: Duration,
+    down: Vec<String>,
+    state: Mutex<TimedState>,
+}
+
+impl Timed {
+    /// Наибольшее число одновременных отправок в домен.
+    fn peak(&self, domain: &str) -> usize {
+        self.state
+            .lock()
+            .expect("lock")
+            .0
+            .get(domain)
+            .map_or(0, |d| d.1)
+    }
+
+    /// Домены вызовов по порядку.
+    fn calls(&self, domain: &str) -> usize {
+        let st = self.state.lock().expect("lock");
+        st.1.iter().filter(|d| *d == domain).count()
+    }
+}
+
+#[async_trait]
+impl Transport for Timed {
+    async fn send(&self, req: SendRequest<'_>) -> Vec<RcptResult> {
+        {
+            let mut st = self.state.lock().expect("lock");
+            st.1.push(req.domain.to_owned());
+            let d = st.0.entry(req.domain.to_owned()).or_default();
+            d.0 += 1;
+            d.1 = d.1.max(d.0);
+        }
+        tokio::time::sleep(self.delay).await;
+        self.state
+            .lock()
+            .expect("lock")
+            .0
+            .get_mut(req.domain)
+            .expect("domain")
+            .0 -= 1;
+        let r = if self.down.iter().any(|d| d == req.domain) {
+            RcptResult::Temporary(format!("{}: connection refused", req.domain))
+        } else {
+            RcptResult::Delivered("250 2.0.0 OK".into())
+        };
+        vec![r; req.rcpts.len()]
+    }
+}
+
+async fn enqueue(env: &Env, rcpts: &[&str]) {
+    let rcpts: Vec<String> = rcpts.iter().map(|r| (*r).to_owned()).collect();
+    Queue::new(env.deps.clone())
+        .enqueue(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &rcpts,
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("enqueue");
+}
+
+#[tokio::test]
+async fn unreachable_domain_does_not_delay_others() {
+    let env = Env::new();
+    let t = Arc::new(Timed {
+        down: vec!["dead.example".into()],
+        ..Timed::default()
+    });
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "out.example.org");
+    enqueue(&env, &["a@dead.example", "b@ok.example"]).await;
+    enqueue(&env, &["c@dead.example"]).await;
+    enqueue(&env, &["d@ok.example"]).await;
+    let cfg = QueueConfig {
+        concurrency: 1,
+        ..cfg()
+    };
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 3);
+    // Недоступный домен — одна попытка, затем перенос без соединения; другой домен доставлен.
+    assert_eq!(t.calls("dead.example"), 1);
+    assert_eq!(t.calls("ok.example"), 2);
+    let left = due(&env).await;
+    assert!(left.is_empty(), "до конца паузы попыток нет");
+    let claimed = env
+        .queue
+        .claim(
+            env.clock.now() + cfg.scheduler.backoff_min,
+            10,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim");
+    // Перенесённый получатель — на конец паузы, получивший попытку — по расписанию повторов (5 мин).
+    let rcpts: Vec<&str> = claimed
+        .iter()
+        .flat_map(|c| c.rcpts.iter().map(|r| r.rcpt.address.as_str()))
+        .collect();
+    assert_eq!(rcpts, ["c@dead.example"]);
+    assert!(
+        claimed[0].rcpts[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("unreachable"))
+    );
+    // Пауза удваивается с каждой неудачей подряд.
+    env.clock
+        .advance(cfg.scheduler.backoff_min + Duration::from_secs(5));
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 1);
+    assert_eq!(t.calls("dead.example"), 2);
+    // Новое письмо в домен в течение паузы 2 мин — перенос на её конец.
+    enqueue(&env, &["e@dead.example"]).await;
+    env.clock.advance(Duration::from_secs(60));
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 1);
+    assert_eq!(t.calls("dead.example"), 2);
+    let at = env.clock.now() + Duration::from_secs(60);
+    let claimed = env
+        .queue
+        .claim(at - Duration::from_secs(1), 10, Duration::from_secs(1))
+        .await
+        .expect("claim");
+    assert!(claimed.is_empty());
+    let claimed = env
+        .queue
+        .claim(at, 10, Duration::from_secs(1))
+        .await
+        .expect("claim");
+    assert_eq!(claimed[0].rcpts[0].rcpt.address, "e@dead.example");
+}
+
+#[tokio::test]
+async fn domain_concurrency_limit_and_slow_start() {
+    let env = Env::new();
+    let t = Arc::new(Timed {
+        delay: Duration::from_millis(50),
+        ..Timed::default()
+    });
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "out.example.org");
+    for i in 0..12 {
+        enqueue(
+            &env,
+            &[
+                &format!("u{i}@busy.example"),
+                &format!("u{i}@other.example"),
+            ],
+        )
+        .await;
+    }
+    let mut cfg = QueueConfig {
+        concurrency: 12,
+        ..cfg()
+    };
+    cfg.scheduler.domain_concurrency = 3;
+    cfg.scheduler.initial_concurrency = 1;
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 12);
+    assert!(env.queue.is_empty());
+    assert_eq!(t.calls("busy.example"), 12);
+    assert_eq!(t.peak("busy.example"), 3, "лимит параллельности домена");
+    // Без ожидания места: медленный старт нового домена — одна отправка, остальные перенесены.
+    for i in 0..4 {
+        enqueue(&env, &[&format!("u{i}@new.example")]).await;
+    }
+    cfg.scheduler.wait = Duration::ZERO;
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 4);
+    assert_eq!(t.calls("new.example"), 1);
+    assert_eq!(env.queue.len(), 3);
+    let claimed = env
+        .queue
+        .claim(
+            env.clock.now() + cfg.scheduler.busy_delay,
+            10,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 3, "перенос на busy_delay");
+}
+
+#[tokio::test]
+async fn internal_pool_is_separate() {
+    let env = Env::new();
+    let t = Arc::new(Timed {
+        delay: Duration::from_millis(50),
+        ..Timed::default()
+    });
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "out.example.org");
+    for i in 0..3 {
+        enqueue(&env, &[&format!("u{i}@ext{i}.example")]).await;
+    }
+    enqueue(&env, &["x@corp.example"]).await;
+    let mut cfg = QueueConfig {
+        concurrency: 8,
+        ..cfg()
+    };
+    cfg.scheduler.wait = Duration::ZERO;
+    cfg.scheduler.external_concurrency = 1;
+    cfg.scheduler.internal_domains = vec!["corp.example".into()];
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 4);
+    // Пул внешней доставки занят одной отправкой, внутренняя — в своём пуле.
+    assert_eq!(t.calls("corp.example"), 1);
+    let external: usize = (0..3).map(|i| t.calls(&format!("ext{i}.example"))).sum();
+    assert_eq!(external, 1);
+    assert_eq!(env.queue.len(), 2);
+}

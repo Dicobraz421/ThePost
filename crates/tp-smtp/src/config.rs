@@ -24,6 +24,9 @@
 //!   queue:
 //!     retry: [5m, 15m, 30m, 1h, 2h, 4h, 8h]
 //!     expire: 5d
+//!     scheduler:
+//!       domain_concurrency: 20
+//!       backoff_min: 1m
 //!   dkim:
 //!     domains:
 //!       example.org:
@@ -406,6 +409,8 @@ pub struct QueueConfig {
     pub tls: OutboundTls,
     /// Политики TLS доменов назначения: MTA-STS и DANE (при доставке на MX, не через `relay`).
     pub policy: PolicyConfig,
+    /// Планировщик по доменам назначения.
+    pub scheduler: SchedulerConfig,
 }
 
 impl Default for QueueConfig {
@@ -426,6 +431,67 @@ impl Default for QueueConfig {
             source_ip: None,
             tls: OutboundTls::default(),
             policy: PolicyConfig::default(),
+            scheduler: SchedulerConfig::default(),
+        }
+    }
+}
+
+/// Планировщик исходящей очереди по доменам назначения (SRS 4.1, модель qmgr Postfix;
+/// [`crate::queue::sched`]). Применяется без перезапуска.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulerConfig {
+    /// Одновременных отправок в один домен (предел окна медленного старта).
+    pub domain_concurrency: usize,
+    /// Начальное окно нового домена (медленный старт): +1 после каждой отправки с ответом сервера.
+    pub initial_concurrency: usize,
+    /// Отправок в домен за `rate_window`; `0` — без лимита.
+    pub domain_rate: u32,
+    /// Окно лимита скорости.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub rate_window: Duration,
+    /// Ожидание места в домене или пуле; затем получатели переносятся на `busy_delay`.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub wait: Duration,
+    /// Перенос получателей занятого домена.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub busy_delay: Duration,
+    /// Первая пауза недоступного домена; удваивается с каждой неудачей подряд.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub backoff_min: Duration,
+    /// Наибольшая пауза недоступного домена.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub backoff_max: Duration,
+    /// Одновременных отправок внутренней доставки (домены кластера, `internal_domains`).
+    pub internal_concurrency: usize,
+    /// Одновременных отправок внешней доставки.
+    pub external_concurrency: usize,
+    /// Внутренние домены сверх принятых доменов кластера.
+    pub internal_domains: Vec<String>,
+    /// Доменов с состоянием планировщика на узле.
+    pub max_domains: usize,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            domain_concurrency: 20,
+            initial_concurrency: 5,
+            domain_rate: 0,
+            rate_window: Duration::from_secs(60),
+            wait: Duration::from_secs(10),
+            busy_delay: Duration::from_secs(60),
+            backoff_min: Duration::from_secs(60),
+            backoff_max: Duration::from_secs(3600),
+            internal_concurrency: 16,
+            external_concurrency: 64,
+            internal_domains: Vec::new(),
+            max_domains: 10_000,
         }
     }
 }
