@@ -9,8 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqlx::FromRow;
 use time::OffsetDateTime;
+use tp_contracts::bus::{Event, EventKind};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo};
-use tp_contracts::{Error, Result};
+use tp_contracts::{Error, Result, TenantId};
 
 use crate::PgMeta;
 use crate::schema::db_err;
@@ -84,21 +85,37 @@ impl PgMeta {
     ) -> Result<()> {
         // Просроченная запись начинается заново (joined_at — время возвращения узла). Имена узлов постоянны,
         // поэтому просроченные записи не копятся: их число не больше числа когда-либо запущенных узлов.
-        sqlx::query(
-            "INSERT INTO nodes (node_id, roles, expires_at)
+        // Возвращается признак входа узла в состав: записи не было или она истекла.
+        let joined: bool = sqlx::query_scalar(
+            "WITH old AS (SELECT expires_at > now() AS alive FROM nodes WHERE node_id = $1)
+             INSERT INTO nodes (node_id, roles, expires_at)
              VALUES ($1, coalesce($2, '{}'::text[]), now() + $3 * interval '1 microsecond')
              ON CONFLICT (node_id) DO UPDATE SET
                  roles = coalesce($2, nodes.roles),
                  joined_at = CASE WHEN nodes.expires_at > now() THEN nodes.joined_at ELSE now() END,
-                 expires_at = EXCLUDED.expires_at",
+                 expires_at = EXCLUDED.expires_at
+             RETURNING NOT coalesce((SELECT alive FROM old), false)",
         )
         .bind(node.as_str())
         .bind(roles)
         .bind(ttl_arg(ttl)?)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
+        if joined {
+            self.members_changed().await;
+        }
         Ok(())
+    }
+
+    /// Сигнал `MembersChanged` (после фиксации).
+    async fn members_changed(&self) {
+        self.signal(Event {
+            tenant: TenantId::DEFAULT,
+            account: None,
+            kind: EventKind::MembersChanged,
+        })
+        .await;
     }
 }
 
@@ -110,11 +127,16 @@ impl Membership for PgMeta {
     }
 
     async fn leave(&self, node: &NodeId) -> Result<()> {
-        sqlx::query("DELETE FROM nodes WHERE node_id = $1")
-            .bind(node.as_str())
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
+        // Выход живого узла — сигнал; удаление истёкшей записи состав не меняет.
+        let was_live: Option<bool> =
+            sqlx::query_scalar("DELETE FROM nodes WHERE node_id = $1 RETURNING expires_at > now()")
+                .bind(node.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        if was_live == Some(true) {
+            self.members_changed().await;
+        }
         Ok(())
     }
 

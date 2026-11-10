@@ -396,12 +396,15 @@ impl MailboxStore for PgMeta {
         let mut tx = begin(&self.pool, scope.tenant).await?;
         let mut rows = select_all(&mut tx, scope).await?;
         // Первое открытие ящика без части системных папок (запись заведена в базе, вход без `upsert`).
-        if !missing_rows(&rows)?.is_empty()
-            && ensure_system(&mut tx, scope, self.cfg.event_partitions).await? > 0
-        {
+        let created = !missing_rows(&rows)?.is_empty()
+            && ensure_system(&mut tx, scope, self.cfg.event_partitions).await? > 0;
+        if created {
             rows = select_all(&mut tx, scope).await?;
         }
         tx.commit().await.map_err(db_err)?;
+        if created {
+            self.signal_log([scope.account]).await;
+        }
         rows.into_iter().map(MailboxRow::into_mailbox).collect()
     }
 
@@ -426,6 +429,7 @@ impl MailboxStore for PgMeta {
         let ev = changelog::event(scope, Some(mb.id), CoreEventKind::MailboxCreated);
         changelog::append_events(&mut tx, self.cfg.event_partitions, &[ev]).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         Ok(mb)
     }
 
@@ -581,6 +585,7 @@ impl MailboxStore for PgMeta {
         );
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         Ok(())
     }
 
