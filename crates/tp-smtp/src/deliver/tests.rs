@@ -139,10 +139,16 @@ impl Env {
     }
 
     fn delivery(&self, outbound: bool) -> Delivery {
-        let cfg = SmtpConfig {
-            hostname: "mx.example.org".into(),
-            ..SmtpConfig::default()
-        };
+        self.delivery_with(
+            outbound,
+            SmtpConfig {
+                hostname: "mx.example.org".into(),
+                ..SmtpConfig::default()
+            },
+        )
+    }
+
+    fn delivery_with(&self, outbound: bool, cfg: SmtpConfig) -> Delivery {
         Delivery::new(
             Deps {
                 tenant: TenantId::DEFAULT,
@@ -253,6 +259,97 @@ async fn resolves_accounts_aliases_and_groups() {
         Resolved::External
     );
     assert_eq!(d.resolve("no-domain").await.expect("r"), Resolved::Unknown);
+}
+
+#[tokio::test]
+async fn subaddress_catch_all_and_rewrite() {
+    use crate::config::{AddressingConfig, RewriteRule};
+    let env = Env::new(DecisionHooks::default()).await;
+    env.dir.set_aliases(
+        TenantId::DEFAULT,
+        vec![DirAlias {
+            address: "@example.org".into(),
+            target: "b".into(),
+        }],
+    );
+    let rule = |from: &str, to: &str| RewriteRule {
+        from: from.into(),
+        to: to.into(),
+        sender: true,
+        recipient: true,
+    };
+    let d = env.delivery_with(
+        true,
+        SmtpConfig {
+            hostname: "mx.example.org".into(),
+            addressing: AddressingConfig {
+                subaddress_separators: "+".into(),
+                rewrite: vec![
+                    rule("@old.example.org", "@example.org"),
+                    rule("partner@example.net", "partner@example.com"),
+                ],
+            },
+            ..SmtpConfig::default()
+        },
+    );
+    let logins = |r: Resolved| match r {
+        Resolved::Local(a) => a.into_iter().map(|a| a.login).collect::<Vec<_>>(),
+        other => panic!("not local: {other:?}"),
+    };
+    // Подадрес — ящик без тега; адрес учётной записи точнее catch-all.
+    assert_eq!(
+        logins(d.resolve("Alice+News@example.org").await.expect("r")),
+        ["alice@example.org"]
+    );
+    assert_eq!(
+        logins(d.resolve("carol@example.org").await.expect("r")),
+        ["carol@example.org"]
+    );
+    // Неизвестный адрес домена (и неизвестный с тегом) — catch-all.
+    for a in ["nobody@example.org", "nobody+x@example.org"] {
+        assert_eq!(logins(d.resolve(a).await.expect("r")), ["bob@example.org"]);
+    }
+    // Получатель старого домена переписан до разрешения.
+    assert_eq!(
+        logins(d.resolve("alice@old.example.org").await.expect("r")),
+        ["alice@example.org"]
+    );
+    assert_eq!(
+        d.resolve("x@example.net").await.expect("r"),
+        Resolved::External
+    );
+    // Письмо: тег — в Delivered-To копии, отправитель и внешний получатель переписаны.
+    let mut e = envelope(
+        Mode::Submission,
+        &["alice+news@example.org", "partner@example.net"],
+    );
+    e.mail_from = "sender@old.example.org".into();
+    let r = d.data(&e, Bytes::from_static(MAIL)).await;
+    assert_eq!(r.code, 250, "{r:?}");
+    let inbox = env.inbox("alice@example.org").await;
+    assert_eq!(inbox.len(), 1);
+    assert!(
+        inbox[0].starts_with("Delivered-To: alice+news@example.org\r\n"),
+        "{}",
+        inbox[0]
+    );
+    assert!(inbox[0].contains("Return-Path: <sender@example.org>"));
+    let queued = env.queue.0.lock().expect("lock").clone();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].0, "sender@example.org");
+    assert_eq!(queued[0].1, ["partner@example.com"]);
+    // Отправка вне сессии: статус — по исходному адресу.
+    let sent = d
+        .submit(
+            TenantId::DEFAULT,
+            "sender@old.example.org",
+            &["partner@example.net".into()],
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("submit");
+    assert_eq!(sent.rcpts[0].1, RcptStatus::Queued);
+    assert_eq!(env.queue.0.lock().expect("lock")[1].0, "sender@example.org");
 }
 
 #[tokio::test]

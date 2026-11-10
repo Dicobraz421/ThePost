@@ -31,6 +31,10 @@
 //!         keys:
 //!           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim/example.org#s2026" } }
 //!           e2026: { algorithm: ed25519-sha256, key: { secret: "thepost/dkim/example.org#e2026" } }
+//!   addressing:
+//!     subaddress_separators: "+"
+//!     rewrite:
+//!       - { from: "@old.example.org", to: "@example.org" }
 //!   screen:
 //!     mode: enforce
 //!     greet_delay: 6s
@@ -74,6 +78,8 @@ pub struct SmtpConfig {
     pub dkim: DkimConfig,
     /// Экран соединений smtp-in (postscreen).
     pub screen: ScreenConfig,
+    /// Адресация: подадреса, переписывание адресов конверта.
+    pub addressing: AddressingConfig,
 }
 
 impl Default for SmtpConfig {
@@ -90,8 +96,48 @@ impl Default for SmtpConfig {
             queue: QueueConfig::default(),
             dkim: DkimConfig::default(),
             screen: ScreenConfig::default(),
+            addressing: AddressingConfig::default(),
         }
     }
+}
+
+/// Адресация (SRS 4.1; [`crate::address`]). Применяется без перезапуска (к новым сессиям).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AddressingConfig {
+    /// Разделители подадреса `user+tag` (любой из символов); пусто — подадреса выключены.
+    pub subaddress_separators: String,
+    /// Переписывание адресов конверта по таблице.
+    pub rewrite: Vec<RewriteRule>,
+}
+
+impl Default for AddressingConfig {
+    fn default() -> Self {
+        Self {
+            subaddress_separators: "+".into(),
+            rewrite: Vec::new(),
+        }
+    }
+}
+
+/// Правило переписывания адреса конверта.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteRule {
+    /// Адрес (`old@example.org`) или домен (`@old.example`).
+    pub from: String,
+    /// Новый адрес или домен (`@new.example` — локальная часть сохраняется).
+    pub to: String,
+    /// Переписывать отправителя конверта.
+    #[serde(default = "yes")]
+    pub sender: bool,
+    /// Переписывать получателей.
+    #[serde(default = "yes")]
+    pub recipient: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Экран соединений smtp-in (SRS 4.1, модель postscreen Postfix; [`crate::screen`]). Применяется к новым
