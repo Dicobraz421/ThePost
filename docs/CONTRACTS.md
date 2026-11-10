@@ -107,13 +107,13 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 ## EventBus
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
-LogAppended { partition } | MembersChanged | Blocked { subject } | TransportChanged { tenant } | TrashChanged { account } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
 `MailboxListChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
-`MembersChanged` — с `TenantId::DEFAULT`, `Blocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
+`MembersChanged` — с `TenantId::DEFAULT`, `Blocked`, `Unblocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
 Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер); in-memory — `MemEventBus` (отставание — `Resync`).
 Доставка — at-most-once; клиент при запуске, после переподключения и по `Resync` сверяется с хранилищем. Публикация — только после фиксации,
-вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`. Набор `suite::signals`.
+вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`. Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
 ## Lease
@@ -143,8 +143,8 @@ CTR-23 (решение 2026-11-01): `heartbeat(&NodeInfo, ttl)` — запись
 правила имени — как у `NodeId`); продление заменяет роли, адрес и площадку. `live_info() -> Vec<NodeInfo>` — живые записи по возрастанию `id`;
 `live()` — их идентификаторы (метод по умолчанию). Новая запись (и после истечения), изменение записи и выход живого узла — сигнал
 `MembersChanged` после фиксации; истечение — без сигнала (срок аренды). `PartitionAssigner::members()` обновляется по сигналу, а не опросом
-(CLU-10). In-memory — `MemMembership` (`with_bus` — сигналы); наборы `suite::membership`, `suite::membership_info`. В `PgMeta` роли, адрес
-и площадка и `live_info()` — META-27 (пока заглушка).
+(CLU-10). In-memory — `MemMembership` (`with_bus` — сигналы); наборы `suite::membership`, `suite::membership_info`. В `PgMeta` роли, адрес,
+площадка и `live_info()` — META-27.
 
 ## Rpc
 Решение 2026-11-01, SRS 2.8 (CTR-23). Запрос узел → узел: `Rpc::call(&RpcService, key, body: Bytes, deadline: Duration) -> Result<Bytes, RpcError>`;
@@ -164,7 +164,9 @@ rendezvous-хэширование, при отказе узла — следую
 ошибка), `active(tenant) -> Vec<AbuseBlock { subject, until, reason }>` (локальный набор узла при запуске и `Resync`). `BlockSubject:
 Ip(IpAddr) | Net { addr, prefix } | Account(AccountId)`; подсеть — `BlockSubject::net(addr, prefix)` (биты узла обнулены), `covers()`.
 Время — часы хранилища. Счётчики попыток — на узле (`tp-auth`, AUTH-08); факт блокировки — в PostgreSQL (`tp-meta`, META-27), после
-фиксации `block` реализация публикует `Blocked { subject }`. In-memory — `MemAbuseBlocks` (`with_bus`), набор `suite::abuse_blocks`.
+фиксации `block` реализация публикует `Blocked { subject }`, после фиксации `unblock` — `Unblocked { subject }` (CTR-39: узлы убирают
+субъект из локального набора, не дожидаясь срока; для отсутствующей блокировки сигнал не обязателен; истечение — без сигнала).
+In-memory — `MemAbuseBlocks` (`with_bus`), наборы `suite::abuse_blocks`, `suite::abuse_blocks_signals`.
 
 ## DeliveryLog
 SRS 5.2, решение 2026-11-01-borrowings-security (CTR-21; код — `delivery.rs`). Журнал доставки (message tracking): только добавление
@@ -449,3 +451,7 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   писем, с уведомлением (Admin API — не через `TrashStore::restore`). Методы по умолчанию — реализации собираются без правки.
   In-memory — `MemBlobIndex`; наборы `suite::{blob_gc_due, blob_uploads}`. PostgreSQL (`tp-meta`), переход `tp-blob`, `tp-jmap`,
   `tp-mailstore`, `tp-admin` — волны полос.
+- 2026-11-10 — CTR-39 (x/contracts-27): системный сигнал `EventKind::Unblocked { subject }` — после `AbuseBlocks::unblock`
+  (раньше узлы держали снятую блокировку до срока). In-memory — `MemAbuseBlocks::with_bus`; наборы `suite::abuse_blocks_signals`,
+  `suite::signals`; в `suite::abuse_blocks` база сроков округляется вверх до секунды. Публикация в `tp-meta` (`PgMeta::unblock`) —
+  волна полосы meta. Пометка «заглушка до META-27» у `Membership` снята.

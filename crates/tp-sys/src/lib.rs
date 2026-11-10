@@ -17,4 +17,4 @@ pub use resources::{
     NodeResources, ResourceSnapshot, ResourcesConfig, watch_resources, watch_resources_in,
 };
 pub use signals::{Signal, Signals};
-pub use socket::{ListenerConfig, bind_tcp};
+pub use socket::{ListenerConfig, adopt_listen_fd, bind_tcp};
