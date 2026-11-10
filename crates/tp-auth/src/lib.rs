@@ -4,8 +4,9 @@
 //!   пароля привязкой (bind) к каталогу;
 //! - [`password`] — [`Authenticator`] для имени входа и пароля: пароли
 //!   приложений (argon2, хранилище — [`AppPasswordStore`](tp_contracts::app_password::AppPasswordStore))
-//!   с отзывом и пароль каталога. Защиту от перебора (`tp-platform`, PLT-07) вызывают
+//!   с отзывом и пароль каталога. Защиту от перебора ([`abuse`]) вызывают
 //!   протоколы до проверки и по её результату;
+//! - [`abuse`] — счётчики неудачных попыток узла и блокировки на всех узлах ([`AbuseGuard`]);
 //! - [`oidc`] — [`Authenticator`] для токенов OpenID Connect (Bearer);
 //! - [`authz`] — [`Authorizer`](tp_contracts::auth::Authorizer) поверх ACL папок (RFC 4314), групп и
 //!   делегирования отправки (Send As / Send on Behalf);
@@ -23,6 +24,7 @@ use tp_contracts::meta::{Account, AccountStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result, TenantId};
 
+pub mod abuse;
 pub mod authz;
 pub mod gssapi;
 pub mod ldap;
@@ -30,6 +32,7 @@ pub mod oidc;
 pub mod password;
 pub mod sasl;
 
+pub use abuse::{AbuseConfig, AbuseGuard, Attempt};
 pub use authz::AclAuthorizer;
 pub use gssapi::{Gssapi, GssapiConfig, KerberosAuthenticator};
 pub use ldap::{GroupSync, GroupSyncReport, LdapConfig, LdapDirectory};
