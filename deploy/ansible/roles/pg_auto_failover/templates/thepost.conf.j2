@@ -1,0 +1,8 @@
+# {{ ansible_managed }}
+# Узел данных pg_auto_failover для The Post (SRS 3.1): пароли — SCRAM, TLS не ниже 1.2. Параметры TLS и репликации —
+# у pg_autoctl (postgresql-auto-failover.conf).
+password_encryption = 'scram-sha-256'
+ssl_min_protocol_version = 'TLSv1.2'
+{% for name, value in pgaf_settings | dictsort %}
+{{ name }} = {{ value if value is number else "'" ~ value ~ "'" }}
+{% endfor %}

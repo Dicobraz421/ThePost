@@ -6,7 +6,10 @@ postgresql_version: 16
 postgresql_pgdg_repo: true
 postgresql_pgdg_uri: http://apt.postgresql.org/pub/repos/apt
 postgresql_pgdg_key_url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
-postgresql_conf_dir: "/etc/postgresql/{{ postgresql_version }}/main"
+postgresql_cluster: main
+postgresql_conf_dir: "/etc/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}"
+postgresql_data_dir: "/var/lib/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}"
+postgresql_bin_dir: "/usr/lib/postgresql/{{ postgresql_version }}/bin"
 postgresql_service: postgresql
 
 # Только локальные подключения: thepost на той же ВМ.

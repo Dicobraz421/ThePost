@@ -1,0 +1,31 @@
+# {{ ansible_managed }}
+# pg_auto_failover ({{ 'монитор' if pgaf_is_monitor else 'узел данных' }}) для The Post: pg_autoctl запускает и
+# ведёт PostgreSQL. Бинарные файлы PGDG напрямую, без pg_wrapper/pg_ctlcluster (SRS 7.1).
+[Unit]
+Description=pg_auto_failover {{ 'monitor' if pgaf_is_monitor else 'data node' }}
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=0
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+WorkingDirectory={{ pgaf_home }}
+Environment=PGDATA={{ pgaf_pgdata }}
+ExecStart={{ pgaf_bin_dir }}/pg_autoctl run --pgdata {{ pgaf_pgdata }}
+ExecReload={{ pgaf_bin_dir }}/pg_autoctl reload --pgdata {{ pgaf_pgdata }}
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+RuntimeDirectory=postgresql
+RuntimeDirectoryMode=2775
+RuntimeDirectoryPreserve=yes
+OOMScoreAdjust=-900
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

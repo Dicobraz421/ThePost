@@ -1,0 +1,35 @@
+# Параметры формаций на мониторе после подключения всех узлов данных (плейбук pg-ha.yml).
+# number_sync_standbys = 1 при двух репликах-кандидатах: фиксация ждёт подтверждения одной из них (RPO = 0).
+---
+- name: Read formation settings
+  community.postgresql.postgresql_query:
+    db: "{{ pgaf_monitor_db }}"
+    query: SELECT formationid, number_sync_standbys FROM pgautofailover.formation
+    port: "{{ pgaf_port }}"
+  register: pgaf_formation_settings
+  changed_when: false
+  become: true
+  become_user: postgres
+
+- name: Set number of synchronous standbys
+  community.postgresql.postgresql_query:
+    db: "{{ pgaf_monitor_db }}"
+    query: SELECT pgautofailover.set_formation_number_sync_standbys(%(formation)s, %(n)s)
+    named_args:
+      formation: "{{ item.formationid }}"
+      n: "{{ pgaf_formations_wanted[item.formationid] | int }}"
+    port: "{{ pgaf_port }}"
+  loop: "{{ pgaf_formation_settings.query_result }}"
+  loop_control:
+    label: "{{ item.formationid }}"
+  when:
+    - item.formationid in pgaf_formations_wanted
+    - item.number_sync_standbys | int != pgaf_formations_wanted[item.formationid] | int
+  become: true
+  become_user: postgres
+  vars:
+    # Формация → number_sync_standbys по узлам данных (pgaf_formation, pgaf_number_sync_standbys в инвентаре).
+    pgaf_nodes_vars: "{{ groups['pgaf_nodes'] | default([]) | map('extract', hostvars) | list }}"
+    pgaf_formations_wanted: >-
+      {{ dict(pgaf_nodes_vars | map(attribute='pgaf_formation', default='default')
+         | zip(pgaf_nodes_vars | map(attribute='pgaf_number_sync_standbys', default=pgaf_number_sync_standbys))) }}

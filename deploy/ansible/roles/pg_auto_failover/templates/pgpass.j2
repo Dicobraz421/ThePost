@@ -1,0 +1,10 @@
+# {{ ansible_managed }}
+{% macro pw(p) %}{{ p | replace('\\', '\\\\') | replace(':', '\\:') }}{% endmacro %}
+{% if pgaf_is_monitor %}
+# Проверки состояния узлов данных монитором.
+*:{{ pgaf_port }}:*:pgautofailover_monitor:{{ pw(pgaf_monitor_password) }}
+{% else %}
+# Вход в монитор (pg_autoctl), репликация и pg_rewind (pg_autoctl, walreceiver).
+*:{{ pgaf_port }}:{{ pgaf_monitor_db }}:autoctl_node:{{ pw(pgaf_autoctl_password) }}
+*:{{ pgaf_port }}:*:pgautofailover_replicator:{{ pw(pgaf_replicator_password) }}
+{% endif %}

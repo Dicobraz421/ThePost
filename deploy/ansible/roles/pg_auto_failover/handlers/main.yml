@@ -1,0 +1,6 @@
+---
+# Перечитывание конфигурации без перезапуска: перезапуск primary — переключение.
+- name: Reload pgautofailover
+  ansible.builtin.systemd_service:
+    name: "{{ pgaf_service }}"
+    state: reloaded

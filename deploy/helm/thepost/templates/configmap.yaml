@@ -6,4 +6,4 @@ metadata:
     {{- include "thepost.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    {{- toYaml .Values.config | nindent 4 }}
+    {{- include "thepost.config" . | nindent 4 }}

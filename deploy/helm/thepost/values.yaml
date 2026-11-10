@@ -57,6 +57,48 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# PostgreSQL — CloudNativePG (эталон Enterprise-K8s, SRS 3.1; решение 2026-11-01 «Требования к СУБД»): Cluster
+# (primary + синхронные реплики, RPO = 0, переключение оператором, RTO ≤ 30 с) и Pooler (PgBouncer, transaction).
+# Оператор CloudNativePG 1.26+ (synchronous.dataDurability) и его CRD — отдельно, до чарта:
+#   helm repo add cnpg https://cloudnative-pg.github.io/charts
+#   helm install cnpg cnpg/cloudnative-pg -n cnpg-system --create-namespace
+# С enabled: true адреса config.database (url, pgbouncer, direct_url) задаёт чарт: служба primary <выпуск>-db-rw
+# (единый адрес, список urls не нужен) и Pooler <выпуск>-db-pooler-rw; CA сервера — секрет <выпуск>-db-ca
+# (в под — только ca.crt). Секреты паролей (kubernetes.io/basic-auth: username, password) создаются до установки —
+# с теми же паролями, что в OpenBao: owner — thepost_owner (thepost/db-owner), app — thepost (thepost/db),
+# readonly — thepost_readonly (thepost/db-readonly).
+cnpg:
+  enabled: false
+  instances: 3            # primary + 2 реплики: два кандидата в синхронные (SRS 3.1)
+  # Образ без интерпретаторов (SRS 7.1): minimal — без barman-cloud (Python); резервные копии — отдельным средством.
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.9-minimal-bookworm
+  database: thepost
+  # Синхронная репликация: фиксация ждёт одну из реплик (ANY 1); required — без реплик запись ждёт, а не теряет RPO.
+  synchronous:
+    method: any
+    number: 1
+    dataDurability: required
+  failoverDelay: 0        # с: переключение сразу после отказа primary
+  switchoverDelay: 30     # с: остановка primary при плановом переключении
+  parameters: {}          # postgresql.conf (shared_buffers и т. п.)
+  storage:
+    size: 500Gi
+    storageClass: ""
+  resources: {}
+  # Свои сертификаты сервера (cert-manager и т. п.): serverCASecret, serverTLSSecret; пусто — CA оператора.
+  certificates: {}
+  secrets:
+    owner: thepost-db-owner
+    app: thepost-db
+    readonly: thepost-db-readonly
+  pooler:
+    enabled: true
+    instances: 2
+    parameters:
+      max_client_conn: "1000"
+      default_pool_size: "20"
+      max_prepared_statements: "200"
+
 # config.yaml узла (SRS 5.5; полный перечень — thepost config schema). Слушатели — на портах ports.*.container.
 # Admin API — только loopback пода (SRS 6.8; доступ — kubectl port-forward), в Service не входит.
 # Служебный HTTP (/healthz, /metrics) — на адресе пода для проб kubelet: 0.0.0.0 явно разрешён internal_networks.
@@ -64,7 +106,9 @@ config:
   domain: example.ru
   roles: [mailbox]
   database:
+    # Внешний кластер: единый адрес (VIP, DNS, Service) или url + urls (поиск primary); с cnpg.enabled — задаёт чарт.
     url: postgres://thepost@postgres.example.ru:5432/thepost?sslmode=verify-full&sslrootcert=/etc/thepost/tls/ca.crt
+    failover: { retry_initial: 100ms, retry_max: 2s, retry_for: 30s, probe_timeout: 3s }
     password: { secret: "thepost/db#password" }
     # Миграции — от владельца схемы (DEP-08); узел входит ролью thepost (thepost_app).
     owner:

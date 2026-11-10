@@ -73,6 +73,25 @@
     mode: "0640"
   notify: Reload postgresql
 
+# Без интерпретаторов в работе (SRS 7.1, решение 2026-11-01): юнит кластера Debian запускает pg_ctlcluster (Perl) —
+# drop-in запускает postgres напрямую (Type=notify; пакеты PGDG собраны с поддержкой systemd).
+- name: Create cluster unit drop-in directory
+  ansible.builtin.file:
+    path: "/etc/systemd/system/postgresql@{{ postgresql_version }}-{{ postgresql_cluster }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Run postgres without pg_ctlcluster
+  ansible.builtin.template:
+    src: no-interpreter.conf.j2
+    dest: "/etc/systemd/system/postgresql@{{ postgresql_version }}-{{ postgresql_cluster }}.service.d/thepost.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart postgresql
+
 - name: Start PostgreSQL
   ansible.builtin.systemd_service:
     name: "{{ postgresql_service }}"
@@ -82,116 +101,5 @@
 - name: Apply pending restart
   ansible.builtin.meta: flush_handlers
 
-# Групповые роли без входа: права на таблицы им выдаёт миграция (tp_grant_roles), владельцу схемы CREATEROLE не нужен.
-- name: Create group roles
-  community.postgresql.postgresql_user:
-    name: "{{ item }}"
-    role_attr_flags: NOLOGIN,NOSUPERUSER,NOBYPASSRLS,NOCREATEDB,NOCREATEROLE,NOREPLICATION
-    port: "{{ postgresql_port }}"
-  loop:
-    - "{{ postgresql_app_group }}"
-    - "{{ postgresql_reader_group }}"
-  register: postgresql_groups
-  become: true
-  become_user: postgres
-
-# Пароль задаётся при создании роли: повторный прогон его не сравнивает (SCRAM). Смена пароля — в OpenBao и
-# ALTER ROLE вручную или postgresql_update_password: always (прогон станет «changed»).
-- name: Create login roles
-  community.postgresql.postgresql_user:
-    name: "{{ item.name }}"
-    password: "{{ item.password }}"
-    role_attr_flags: LOGIN,NOSUPERUSER,NOBYPASSRLS,NOCREATEDB,NOCREATEROLE,NOREPLICATION
-    update_password: "{{ postgresql_update_password }}"
-    port: "{{ postgresql_port }}"
-  loop:
-    - { name: "{{ postgresql_owner_role }}", password: "{{ thepost_db_owner_password }}" }
-    - { name: "{{ postgresql_app_role }}", password: "{{ thepost_db_password }}" }
-    - { name: "{{ postgresql_readonly_role }}", password: "{{ thepost_db_readonly_password }}" }
-  loop_control:
-    label: "{{ item.name }}"
-  become: true
-  become_user: postgres
-  no_log: true
-
-- name: Grant group roles
-  community.postgresql.postgresql_membership:
-    groups: ["{{ item.group }}"]
-    target_roles: ["{{ item.role }}"]
-    state: present
-    port: "{{ postgresql_port }}"
-  loop:
-    - { group: "{{ postgresql_app_group }}", role: "{{ postgresql_app_role }}" }
-    - { group: "{{ postgresql_reader_group }}", role: "{{ postgresql_readonly_role }}" }
-  register: postgresql_memberships
-  become: true
-  become_user: postgres
-
-# Владелец БД — владелец схемы public (PostgreSQL 15+: pg_database_owner): миграции создают в ней таблицы.
-- name: Create database thepost
-  community.postgresql.postgresql_db:
-    name: "{{ postgresql_app_db }}"
-    owner: "{{ postgresql_owner_role }}"
-    port: "{{ postgresql_port }}"
-  become: true
-  become_user: postgres
-
-- name: Revoke database access from PUBLIC
-  community.postgresql.postgresql_privs:
-    db: "{{ postgresql_app_db }}"
-    type: database
-    objs: "{{ postgresql_app_db }}"
-    roles: PUBLIC
-    privs: ALL
-    state: absent
-    port: "{{ postgresql_port }}"
-  become: true
-  become_user: postgres
-
-- name: Grant CONNECT to group roles
-  community.postgresql.postgresql_privs:
-    db: "{{ postgresql_app_db }}"
-    type: database
-    objs: "{{ postgresql_app_db }}"
-    roles: "{{ postgresql_app_group }},{{ postgresql_reader_group }}"
-    privs: CONNECT
-    port: "{{ postgresql_port }}"
-  become: true
-  become_user: postgres
-
-# Обновление установки до DEP-08: таблицы принадлежали роли узла — передать их владельцу схемы.
-- name: Find objects owned by the node role
-  community.postgresql.postgresql_query:
-    db: "{{ postgresql_app_db }}"
-    query: >-
-      SELECT count(*) AS n FROM pg_shdepend d JOIN pg_database b ON b.oid = d.dbid
-      WHERE d.deptype = 'o' AND b.datname = current_database() AND d.refobjid = %(role)s::regrole
-    named_args:
-      role: "{{ postgresql_app_role }}"
-    port: "{{ postgresql_port }}"
-  register: postgresql_node_owned
-  changed_when: false
-  become: true
-  become_user: postgres
-
-- name: Reassign objects of the node role to the schema owner
-  community.postgresql.postgresql_query:
-    db: "{{ postgresql_app_db }}"
-    query: 'REASSIGN OWNED BY "{{ postgresql_app_role }}" TO "{{ postgresql_owner_role }}"'
-    port: "{{ postgresql_port }}"
-  when: postgresql_node_owned.query_result[0].n | int > 0
-  register: postgresql_reassigned
-  become: true
-  become_user: postgres
-
-# Права групповых ролей на существующие таблицы (новые выдают миграции). До первого запуска thepost схемы нет.
-- name: Grant table privileges to group roles
-  community.postgresql.postgresql_query:
-    db: "{{ postgresql_app_db }}"
-    query: >-
-      DO $$ BEGIN IF to_regprocedure('public.tp_grant_roles()') IS NOT NULL THEN PERFORM public.tp_grant_roles();
-      END IF; END $$
-    port: "{{ postgresql_port }}"
-  when: postgresql_groups is changed or postgresql_memberships is changed or postgresql_reassigned is changed
-  become: true
-  become_user: postgres
+- name: Accounts and database
+  ansible.builtin.import_tasks: accounts.yml

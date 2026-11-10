@@ -1,0 +1,73 @@
+# Роль pg_auto_failover: эталон СУБД Enterprise-ВМ (SRS 3.1, APP-D Д.2; решение 2026-11-01 «Требования к СУБД») —
+# монитор (группа pgaf_monitor) и узлы данных (группа pgaf_nodes) с синхронной репликой (RPO = 0) и автоматическим
+# переключением (RTO ≤ 30 с). PostgreSQL 16 из PGDG, только TLS с проверкой имени, пароли — SCRAM.
+# Без интерпретаторов в работе (SRS 7.1): pg_autoctl и postgres — бинарные файлы PGDG, запуск — свой юнит systemd
+# мимо pg_wrapper/pg_ctlcluster (Perl), основной кластер Debian не создаётся. Расширение pgautofailover — только в
+# БД монитора; на узлах данных расширений нет (SRS 3.1).
+---
+pgaf_pg_version: 16
+pgaf_pgdg_repo: true
+pgaf_pgdg_uri: http://apt.postgresql.org/pub/repos/apt
+pgaf_pgdg_key_url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+pgaf_packages:
+  - "postgresql-{{ pgaf_pg_version }}"
+  - "postgresql-{{ pgaf_pg_version }}-auto-failover"
+pgaf_bin_dir: "/usr/lib/postgresql/{{ pgaf_pg_version }}/bin"
+pgaf_service: pgautofailover
+pgaf_home: /var/lib/postgresql
+pgaf_pgdata: "{{ pgaf_home }}/{{ pgaf_pg_version }}/pgaf"
+pgaf_port: 5432
+
+# Имя узла для pg_auto_failover и клиентов (адрес в сертификате сервера, verify-full); по умолчанию — имя в инвентаре.
+pgaf_hostname: "{{ ansible_host | default(inventory_hostname) }}"
+# Имя узла в мониторе (pg_autoctl --name).
+pgaf_name: "{{ inventory_hostname_short }}"
+# Группа инвентаря монитора; адрес монитора — его pgaf_hostname.
+pgaf_monitor_group: pgaf_monitor
+pgaf_monitor_db: pg_auto_failover
+# Формация — один кластер (шард) с одним primary; шард 2 стенда — другая формация на том же мониторе.
+pgaf_formation: default
+# Синхронных реплик для фиксации (number_sync_standbys): 1 при двух репликах — два кандидата, RPO = 0 (SRS 3.1).
+pgaf_number_sync_standbys: 1
+# Узел — кандидат в primary (0 — никогда не становится primary) и участник кворума синхронной репликации.
+pgaf_candidate_priority: 50
+pgaf_replication_quorum: true
+
+# Сети узлов кластера (репликация, pg_rewind, проверки монитора) и узлов thepost (CIDR).
+pgaf_cluster_networks: []
+pgaf_app_networks: []
+
+# TLS (решение 2026-10-30): CA и сертификат узла — файлы на управляющей машине; SAN сертификата — pgaf_hostname.
+pgaf_tls_ca_src: ""
+pgaf_tls_cert_src: ""
+pgaf_tls_key_src: ""
+pgaf_tls_dir: "{{ pgaf_home }}/pgaf-tls"
+
+# Пароли служебных учётных записей pg_auto_failover (обязательны; ansible-vault или lookup из OpenBao, не в инвентаре
+# открытым текстом): autoctl_node — вход узлов в монитор, pgautofailover_replicator — репликация и pg_rewind,
+# pgautofailover_monitor — проверки состояния узлов монитором. Хранятся в ~postgres/.pgpass (0600).
+pgaf_autoctl_password: ""
+pgaf_replicator_password: ""
+pgaf_monitor_password: ""
+
+# Сроки переключения (RTO ≤ 30 с, решение 2026-11-01). Монитор признаёт primary недоступным через
+# node_considered_unhealthy_timeout и ждёт primary_demote_timeout, пока прежний primary сам перейдёт в режим только
+# чтения (keeper: network_partition_timeout без монитора и реплик) — второй primary исключён. Условие:
+# pgaf_network_partition_timeout < pgaf_primary_demote_timeout; RTO ≈ unhealthy_timeout + primary_demote_timeout.
+# Значения по умолчанию pg_auto_failover (20 с + 30 с) RTO ≤ 30 с не дают.
+pgaf_monitor_settings:
+  pgautofailover.health_check_period: 2000           # мс
+  pgautofailover.health_check_timeout: 2000          # мс
+  pgautofailover.health_check_max_retries: 2
+  pgautofailover.health_check_retry_delay: 1000      # мс
+  pgautofailover.node_considered_unhealthy_timeout: 10000  # мс
+  pgautofailover.primary_demote_timeout: 15000       # мс
+pgaf_network_partition_timeout: 10                   # с, keeper узла данных
+
+# Параметры postgresql.conf узлов данных (имя → значение); применяются перечитыванием, параметры с перезапуском
+# (shared_buffers и т. п.) — перезапуском узлов по одному, начиная с реплик (docs/manual-tests/DEP-09.md).
+pgaf_settings: {}
+
+# БД и учётные записи The Post (имена — как в роли postgresql; создаёт их плейбук pg-ha.yml на primary).
+pgaf_app_db: thepost
+pgaf_app_roles: [thepost, thepost_owner, thepost_readonly]

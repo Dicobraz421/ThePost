@@ -1,0 +1,64 @@
+# Эталон СУБД Enterprise-ВМ (SRS 3.1, APP-D Д.2; решение 2026-11-01 «Требования к СУБД»): PostgreSQL 16 с
+# pg_auto_failover — монитор (группа pgaf_monitor) и узлы данных (группа pgaf_nodes; формация на шард), синхронная
+# реплика (RPO = 0), автоматическое переключение без второго primary (RTO ≤ 30 с), только TLS.
+#   ansible-galaxy collection install -r deploy/ansible/requirements.yml
+#   ansible-playbook -i <инвентарь> deploy/ansible/pg-ha.yml --ask-vault-pass
+# Пример инвентаря — deploy/ansible/inventory-ha.example.yml; переменные — defaults ролей pg_auto_failover и postgresql.
+# Узлы thepost находят primary сами: database.url + database.urls — адреса узлов данных (deploy/config/mailbox.yaml).
+# Повторный прогон ничего не меняет; на работающем кластере primary не перезапускается.
+---
+- name: pg_auto_failover monitor
+  hosts: pgaf_monitor
+  become: true
+  roles:
+    - pg_auto_failover
+
+# По одному: первый узел формации — primary, следующие копируют его каталог данных и становятся репликами.
+- name: pg_auto_failover data nodes
+  hosts: pgaf_nodes
+  become: true
+  serial: 1
+  roles:
+    - pg_auto_failover
+
+- name: Formation settings
+  hosts: pgaf_monitor
+  become: true
+  tasks:
+    - name: Synchronous standbys
+      ansible.builtin.include_role:
+        name: pg_auto_failover
+        tasks_from: formation
+
+# Учётные записи и БД The Post (как в эталоне SMB, DEP-08) — на текущем primary каждой формации.
+- name: The Post accounts on primary
+  hosts: pgaf_nodes
+  become: true
+  tasks:
+    - name: Check PostgreSQL passwords
+      ansible.builtin.assert:
+        that:
+          - thepost_db_password is defined and thepost_db_password | length > 0
+          - thepost_db_owner_password is defined and thepost_db_owner_password | length > 0
+          - thepost_db_readonly_password is defined and thepost_db_readonly_password | length > 0
+        fail_msg: >-
+          Нет thepost_db_password, thepost_db_owner_password или thepost_db_readonly_password — те же значения, что в
+          OpenBao (thepost/db, thepost/db-owner, thepost/db-readonly)
+      no_log: true
+
+    - name: Check recovery mode
+      community.postgresql.postgresql_query:
+        query: SELECT pg_is_in_recovery() AS standby
+        port: "{{ pgaf_port | default(5432) }}"
+      register: pgaf_recovery
+      changed_when: false
+      become_user: postgres
+
+    - name: Accounts and database
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: accounts
+      vars:
+        postgresql_port: "{{ pgaf_port | default(5432) }}"
+        postgresql_app_db: "{{ pgaf_app_db | default('thepost') }}"
+      when: not pgaf_recovery.query_result[0].standby
