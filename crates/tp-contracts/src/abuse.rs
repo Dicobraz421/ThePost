@@ -2,7 +2,8 @@
 //!
 //! Счётчики попыток ведёт узел (`tp-auth`); при превышении порога — [`AbuseBlocks::block`]. Факт блокировки хранится
 //! в PostgreSQL (`tp-meta`, по организации) и после фиксации рассылается сигналом
-//! [`EventKind::Blocked`](crate::bus::EventKind::Blocked); узлы держат локальный набор блокировок, обновляемый
+//! [`EventKind::Blocked`](crate::bus::EventKind::Blocked), снятие ([`AbuseBlocks::unblock`]) — сигналом
+//! [`EventKind::Unblocked`](crate::bus::EventKind::Unblocked); узлы держат локальный набор блокировок, обновляемый
 //! по сигналу и при [`EventKind::Resync`](crate::bus::EventKind::Resync) ([`AbuseBlocks::active`]).
 //!
 //! ```
@@ -126,7 +127,8 @@ pub struct AbuseBlock {
 
 /// Хранилище блокировок организации. Время — часы хранилища (у PostgreSQL — часы СУБД). Реализация —
 /// `tp-meta` (META-27), in-memory — `tp-testkit`. Реализация после фиксации `block` публикует сигнал
-/// `Event { tenant, account: None, kind: Blocked { subject } }`.
+/// `Event { tenant, account: None, kind: Blocked { subject } }`, после фиксации `unblock` —
+/// `Event { tenant, account: None, kind: Unblocked { subject } }` (для отсутствующей блокировки — не обязательно).
 #[async_trait]
 pub trait AbuseBlocks: Send + Sync + 'static {
     /// Блокирует `subject` до `until`. Действующая блокировка того же субъекта продлевается до более
@@ -147,7 +149,8 @@ pub trait AbuseBlocks: Send + Sync + 'static {
         subject: &BlockSubject,
     ) -> Result<Option<OffsetDateTime>>;
 
-    /// Снимает блокировку именно этого субъекта (администратор); отсутствующая — не ошибка.
+    /// Снимает блокировку именно этого субъекта (администратор); отсутствующая — не ошибка. После фиксации —
+    /// сигнал `Unblocked { subject }`.
     async fn unblock(&self, tenant: TenantId, subject: &BlockSubject) -> Result<()>;
 
     /// Действующие блокировки организации (локальный набор узла после запуска и `Resync`), без порядка.

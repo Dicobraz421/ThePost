@@ -44,6 +44,12 @@ pub enum EventKind {
         /// Субъект блокировки.
         subject: BlockSubject,
     },
+    /// Снята блокировка именно этого субъекта организации `tenant` ([`crate::abuse::AbuseBlocks::unblock`]):
+    /// узел убирает `subject` из локального набора, не дожидаясь срока. Истечение срока сигналом не публикуется.
+    Unblocked {
+        /// Субъект снятой блокировки.
+        subject: BlockSubject,
+    },
     /// Изменились настройки транспорта ([`crate::transport::TransportStore`]): `tenant = None` — уровень кластера
     /// (принятые домены, доверенные источники; `Event::tenant` — `TenantId::DEFAULT`), иначе — организации.
     TransportChanged {
@@ -133,6 +139,9 @@ mod tests {
             },
             EventKind::MembersChanged,
             EventKind::Blocked {
+                subject: BlockSubject::Account(AccountId::new()),
+            },
+            EventKind::Unblocked {
                 subject: BlockSubject::Account(AccountId::new()),
             },
             EventKind::TransportChanged { tenant: None },

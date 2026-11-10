@@ -471,6 +471,7 @@ impl VaultStore {
         let base = parse_url(url)?;
         let auth = Auth::from_config(&cfg.auth)
             .ok_or_else(|| Error::invalid("secrets.auth: no method"))?;
+        crate::tls::install_crypto_provider();
         let builder = Client::builder()
             .timeout(cfg.request_timeout)
             .redirect(reqwest::redirect::Policy::none())

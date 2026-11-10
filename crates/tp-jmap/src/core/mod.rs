@@ -21,6 +21,7 @@ use tp_contracts::meta::{
 };
 use tp_contracts::retention::TrashStore;
 use tp_contracts::search::SearchIndex;
+use tp_contracts::transport::MailFlow;
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Result, TenantId};
 
 use crate::submission::Outbound;
@@ -113,6 +114,8 @@ pub struct Jmap {
     uploads: Slots,
     /// Загруженные файлы учётных записей (владелец blob `U…`).
     pub(crate) uploaded: crate::blob::Uploads,
+    /// Правила потока почты (модуль, `Registry::mail_flow`); `None` — правила не применяются.
+    pub(crate) mail_flow: Option<Arc<dyn MailFlow>>,
     stop: watch::Sender<bool>,
 }
 
@@ -121,6 +124,7 @@ impl fmt::Debug for Jmap {
         f.debug_struct("Jmap")
             .field("d", &self.d)
             .field("cfg", &self.cfg)
+            .field("mail_flow", &self.mail_flow.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -218,8 +222,18 @@ impl Jmap {
             inflight: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
             uploaded: crate::blob::Uploads::default(),
+            mail_flow: None,
             stop: watch::channel(false).0,
         })
+    }
+
+    /// Подключает правила потока почты (CONTRACTS.md#Transport, `Registry::mail_flow`): `EmailSubmission/set`
+    /// вызывает [`MailFlow::apply`] один раз на письмо до `DecisionHooks::on_submission` и очереди.
+    /// `None` — правила не применяются (модуль не подключён).
+    #[must_use]
+    pub fn with_mail_flow(mut self, flow: Option<Arc<dyn MailFlow>>) -> Self {
+        self.mail_flow = flow;
+        self
     }
 
     /// Остановка узла: закрывает соединения push (EventSource завершается, WebSocket получает Close).

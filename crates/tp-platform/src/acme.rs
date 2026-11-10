@@ -126,7 +126,9 @@ impl Http01Challenges {
             .cloned()
     }
 
-    fn insert(&self, token: String, key_authorization: String) {
+    /// Публикует ответ на токен. Заполняет [`Acme`]; открыт для тестов вызывающего (ответ HTTP-01 по токену).
+    #[doc(hidden)]
+    pub fn insert(&self, token: String, key_authorization: String) {
         self.0
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -187,6 +189,8 @@ impl Acme {
         challenges: Http01Challenges,
         certs: Option<Arc<TlsCerts>>,
     ) -> Self {
+        // Встроенный HTTP-клиент instant-acme берёт процессный провайдер rustls.
+        crate::tls::install_crypto_provider();
         Self {
             cfg,
             tls,
@@ -964,6 +968,36 @@ mod tests {
             }
         }
         server.abort();
+    }
+
+    /// Встроенный HTTP-клиент (без `with_http`): процессный провайдер rustls поставлен (без него при обоих
+    /// провайдерах в сборке instant-acme паникует), обращение к недоступному каталогу — ошибка, а не паника.
+    #[tokio::test]
+    async fn builtin_http_client_fails_without_panic() {
+        let dir = TempDir::new("acme-builtin");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let cfg = AcmeConfig {
+            enabled: true,
+            directory_url: format!("https://127.0.0.1:{port}/directory"),
+            domains: vec![DOMAIN.to_owned()],
+            state_dir: dir.0.join("acme"),
+            ..AcmeConfig::default()
+        };
+        let tls = TlsConfig {
+            cert_file: dir.0.join("tls/fullchain.pem"),
+            key_file: dir.0.join("tls/privkey.pem"),
+            ..TlsConfig::default()
+        };
+        let acme = Acme::new(cfg, tls.clone(), Http01Challenges::default(), None);
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        acme.issue().await.expect_err("directory unreachable");
+        assert!(!tls.cert_file.exists());
+        // Повторная установка — не ошибка.
+        crate::tls::install_crypto_provider();
     }
 
     #[test]
