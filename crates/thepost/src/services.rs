@@ -335,6 +335,16 @@ impl Services {
         }
     }
 
+    /// Зависимости расширений IMAP: QUOTA (учётные записи), ACL и общие папки (ACL папок, единый слой
+    /// авторизации). Без них `tp-imap` эти возможности не объявляет.
+    pub fn imap_extensions(&self) -> tp_imap::Extensions {
+        tp_imap::Extensions {
+            accounts: Some(Arc::new(self.meta.clone())),
+            acl: Some(Arc::new(self.meta.clone())),
+            authz: Some(self.authz.clone()),
+        }
+    }
+
     /// Сервер JMAP; отправка — через доставку SMTP (CMP-07): локальным адресатам — сразу в ящики, внешним — в
     /// очередь SMTP с DKIM-подписью.
     pub fn jmap(
