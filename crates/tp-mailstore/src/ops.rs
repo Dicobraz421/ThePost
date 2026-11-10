@@ -270,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn copy_adds_refs() {
         let f = fixture(2).await;
-        let to = folder(&f, "Archive").await;
+        let to = folder(&f, "Projects").await;
         let msg = message(&f, f.ids[0]).await;
         let refs = |f: &Fixture| {
             std::iter::once(msg.skeleton)
