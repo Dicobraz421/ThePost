@@ -8,15 +8,17 @@
 //! Подсекции `blob.local`, `blob.s3` и `bus.valkey` — секции крейтов `tp-blob` и `tp-cluster` как есть (BLOB-11,
 //! CLU-07): приложение подставляет только каталог, бакет и префикс из `blob.url`.
 //!
-//! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `imap`, `jmap`, `search`, `admin`, `mailstore`;
-//! приложение добавляет `auth` (каталог, OIDC, пароли приложений, Kerberos) и `http` (слушатели jmap и admin).
+//! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `imap`, `jmap`, `search`, `mailstore`; `admin` — секция
+//! `tp-admin` без `listen` (адрес Admin API — один ключ `http.admin.listen`, APP-16); приложение добавляет `auth`
+//! (каталог, OIDC, пароли приложений, Kerberos) и `http` (слушатели jmap и admin).
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use schemars::JsonSchema;
-use serde::Deserialize;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, Deserializer};
 use tp_blob::{GcConfig, LocalConfig, OrphanConfig, S3Config};
 use tp_cluster::{LocalBusConfig, ValkeyConfig};
 use tp_contracts::config::duration;
@@ -69,7 +71,7 @@ pub fn registry() -> Result<SectionRegistry> {
     r.add_section::<tp_imap::ImapConfig>(IMAP)?;
     r.add_section::<tp_jmap::JmapConfig>(JMAP)?;
     r.add_section::<tp_search::SearchConfig>(SEARCH)?;
-    r.add_section::<tp_admin::AdminConfig>(ADMIN)?;
+    r.add_section::<AdminSection>(ADMIN)?;
     r.add_section::<tp_mailstore::Config>(MAILSTORE)?;
     r.add_section::<AuthSection>(AUTH)?;
     r.add_section::<HttpSection>(HTTP)?;
@@ -79,7 +81,7 @@ pub fn registry() -> Result<SectionRegistry> {
     r.add_check::<BlobSection>(BLOB, BlobSection::check)?;
     r.add_check::<BusSection>(BUS, BusSection::check)?;
     r.add_check::<ClusterSection>(CLUSTER, |c, _| c.check())?;
-    r.add_check::<tp_admin::AdminConfig>(ADMIN, |c, _| c.check())?;
+    r.add_check::<AdminSection>(ADMIN, |c, _| c.0.check())?;
     r.add_check::<AuthSection>(AUTH, AuthSection::check)?;
     r.add_check::<HttpSection>(HTTP, HttpSection::check)?;
     modules::register_sections(&mut r)?;
@@ -492,6 +494,52 @@ fn sub(name: &str, e: Error) -> Error {
     }
 }
 
+// ---------- admin ----------
+
+/// Подсказка для `admin.listen`: адрес Admin API задаёт только `http.admin.listen` (SRS, APP-16).
+const ADMIN_LISTEN_HINT: &str = "admin.listen не используется: адрес Admin API задаётся в http.admin.listen \
+     (например, http: { admin: { listen: 127.0.0.1:8443 } })";
+
+/// Секция `admin`: секция `tp-admin` как есть, кроме `listen` — адрес слушателя задаёт `http.admin.listen`, ключ
+/// `admin.listen` — ошибка разбора с подсказкой (два ключа одного адреса расходились: проверялся один, слушал другой).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AdminSection(pub tp_admin::AdminConfig);
+
+impl<'de> Deserialize<'de> for AdminSection {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(d)?;
+        if value.is_null() {
+            return Ok(Self::default());
+        }
+        if value.get("listen").is_some() {
+            return Err(D::Error::custom(ADMIN_LISTEN_HINT));
+        }
+        tp_admin::AdminConfig::deserialize(value)
+            .map(Self)
+            .map_err(D::Error::custom)
+    }
+}
+
+impl JsonSchema for AdminSection {
+    fn schema_name() -> Cow<'static, str> {
+        "AdminSection".into()
+    }
+
+    /// Схема `tp-admin`; `listen` остаётся известным ключом (иначе мягкий режим отбросил бы его с предупреждением),
+    /// но не допускает значений.
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = tp_admin::AdminConfig::json_schema(generator);
+        if let Some(listen) = schema
+            .get_mut("properties")
+            .and_then(|p| p.get_mut("listen"))
+        {
+            *listen = serde_json::json!({ "description": ADMIN_LISTEN_HINT, "not": {} });
+        }
+        schema
+    }
+}
+
 // ---------- verify ----------
 
 /// Секция `verify`: сверка хранилища BLOB и учёта объектов (`thepost verify`).
@@ -787,5 +835,35 @@ blob:
         ] {
             assert!(schema.contains(key), "{key}");
         }
+    }
+
+    #[test]
+    fn admin_listen_is_rejected_with_hint() {
+        for r in [
+            parse(&format!("{MINIMAL_DEV}admin:\n  listen: 127.0.0.1:9443\n")),
+            strict(&format!("{MINIMAL_DEV}admin:\n  listen: 127.0.0.1:9443\n")),
+        ] {
+            let m = err(r);
+            assert!(m.contains("http.admin.listen"), "{m}");
+        }
+        let c = parse(&format!(
+            "{MINIMAL_DEV}admin:\n  page_size: 50\nhttp:\n  admin: {{ listen: 127.0.0.1:9443, allow_plaintext: true }}\n"
+        ))
+        .expect("config");
+        assert_eq!(
+            c.section::<AdminSection>(ADMIN).expect("admin").0.page_size,
+            50
+        );
+        let http = c.section::<HttpSection>(HTTP).expect("http");
+        assert_eq!(http.admin.as_ref().map(|l| l.listen.port()), Some(9443));
+        assert_eq!(
+            *parse(MINIMAL_DEV)
+                .expect("config")
+                .section::<AdminSection>(ADMIN)
+                .expect("admin"),
+            AdminSection::default()
+        );
+        let schema = registry().expect("registry").schema_json();
+        assert!(schema.contains("admin.listen не используется"));
     }
 }

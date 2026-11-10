@@ -31,7 +31,7 @@ use tp_smtp::{
 };
 
 use crate::infra;
-use crate::sections::{ADMIN, AUTH, AuthSection, JMAP, MAILSTORE, SEARCH, SMTP};
+use crate::sections::{ADMIN, AUTH, AdminSection, AuthSection, JMAP, MAILSTORE, SEARCH, SMTP};
 
 /// Общие сервисы ролей узла.
 pub struct Services {
@@ -238,7 +238,7 @@ impl Services {
 
         // Секции, читаемые ролями при запуске, проверяются здесь: ошибка — до запуска ролей.
         cfg.section::<tp_jmap::JmapConfig>(JMAP)?;
-        cfg.section::<tp_admin::AdminConfig>(ADMIN)?;
+        cfg.section::<AdminSection>(ADMIN)?;
 
         Ok(Self {
             tenant,
@@ -301,7 +301,8 @@ impl Services {
         })
     }
 
-    /// Обработчик очереди роли smtp-out: доставка на MX с MTA-STS и DANE, уведомления — в ту же очередь.
+    /// Обработчик очереди роли smtp-out: доставка на MX с MTA-STS и DANE, уведомления — в ту же очередь; политики
+    /// доменов назначения организаций (SMTP-15) — из `tp-meta`, перечитываются по сигналу шины `TransportChanged`.
     pub fn queue_worker(&self, smtp: &SmtpConfig) -> Result<QueueWorker> {
         let transport = tp_smtp::queue::send::MxTransport::new(
             system_resolver()?,
@@ -317,7 +318,11 @@ impl Services {
             smtp.hostname.clone(),
         )
         .with_dsn(self.queue.clone())
-        .with_metrics(self.smtp_metrics.clone()))
+        .with_metrics(self.smtp_metrics.clone())
+        .with_routes(
+            Arc::new(tp_smtp::routes::Routes::new(Arc::new(self.meta.clone()))),
+            Some(self.bus.clone()),
+        ))
     }
 
     /// Зависимости IMAP.

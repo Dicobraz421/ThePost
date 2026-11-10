@@ -19,7 +19,7 @@ use tp_contracts::{Error, Result};
 use tp_meta::PgMeta;
 use tp_meta::events::EventConsumer;
 use tp_platform::listen::EndpointConfig;
-use tp_platform::{InheritedSockets, Listener, TlsCerts, service_http};
+use tp_platform::{Config, InheritedSockets, Listener, TlsCerts, service_http};
 use tp_search::{Indexer, IndexerConfig, Rebuilder, SCHEMA_VERSION, SUBSCRIBER};
 use tp_smtp::{Mode, ServerDeps, SmtpConfig, SmtpService};
 
@@ -49,23 +49,112 @@ impl Bound {
     }
 }
 
-/// Открытие слушателей: сокет, переданный systemd для адреса, иначе — новый.
+/// Открытие слушателей: сокет, переданный systemd для адреса (активация сокетов, `privileges.socket_activation`),
+/// иначе — новый. Взятый сокет systemd остаётся у набора (копия дескриптора): перезапуск роли получает его снова,
+/// а не делает bind (порты ниже 1024 без `CAP_NET_BIND_SERVICE` не открылись бы).
 #[derive(Debug, Clone, Default)]
 pub struct Sockets {
-    // TODO(PLT-16): приём дескрипторов systemd (`listen_fds` → `InheritedSockets::adopt`) требует функции
-    // «номер дескриптора → TcpListener» с `unsafe` (`FromRawFd`): ей место в tp-sys (x/-PR) или зависимость
-    // `listenfd`. Пока набор пуст — `Listener::open` делает bind.
-    inherited: Arc<Mutex<InheritedSockets>>,
+    inner: Arc<Mutex<Inherited>>,
     bound: Bound,
 }
 
+/// Сокеты systemd: ещё не взятые и взятые (по адресу слушателя из конфигурации).
+#[derive(Debug, Default)]
+struct Inherited {
+    passed: InheritedSockets,
+    taken: HashMap<SocketAddr, std::net::TcpListener>,
+}
+
 impl Sockets {
-    /// Набор с реестром адресов `bound`.
+    /// Набор без сокетов systemd с реестром адресов `bound` (тесты).
     pub fn new(bound: Bound) -> Self {
         Self {
-            inherited: Arc::default(),
+            inner: Arc::default(),
             bound,
         }
+    }
+
+    /// Набор с сокетами, переданными systemd процессу (`LISTEN_FDS`; дескрипторы берёт во владение
+    /// `tp_sys::adopt_listen_fd`), по секции `privileges`. Вызывать один раз при старте, до открытия слушателей.
+    /// Ошибка — запуск прервать: дескриптор юнита не слушающий TCP-сокет.
+    pub fn adopt(cfg: &Config, bound: Bound) -> Result<Self> {
+        let passed = tp_platform::privileges::inherited_sockets(cfg, tp_sys::adopt_listen_fd)?;
+        Ok(Self::with_inherited(passed, bound))
+    }
+
+    /// Набор с готовыми сокетами `passed`.
+    pub fn with_inherited(passed: InheritedSockets, bound: Bound) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inherited {
+                passed,
+                taken: HashMap::new(),
+            })),
+            bound,
+        }
+    }
+
+    /// Реестр фактических адресов слушателей.
+    pub fn bound(&self) -> &Bound {
+        &self.bound
+    }
+
+    /// Сокеты systemd, которых не ждёт ни один адрес `wanted` (слушатели ролей узла), — в журнал (`warn`): лишние в
+    /// юните сокета, соединения на них не принимаются. Возвращает их адреса.
+    pub fn warn_unused(&self, wanted: &[SocketAddr]) -> Vec<SocketAddr> {
+        let unused: Vec<SocketAddr> = self
+            .lock()
+            .passed
+            .unused()
+            .into_iter()
+            .filter(|have| !wanted.iter().any(|want| serves(*want, *have)))
+            .collect();
+        for addr in &unused {
+            tracing::warn!(
+                %addr,
+                "сокет от systemd не нужен ни одному слушателю ролей узла: соединения на нём не принимаются \
+                 (уберите ListenStream из юнита сокета или задайте слушатель с этим адресом)"
+            );
+        }
+        unused
+    }
+
+    /// Сокет systemd для адреса `listen` (копия дескриптора; `None` — сокета нет), неблокирующий — для tokio.
+    pub fn take(&self, listen: SocketAddr) -> Result<Option<tokio::net::TcpListener>> {
+        let mut inner = self.lock();
+        let std = match inner.taken.get(&listen) {
+            Some(kept) => kept.try_clone(),
+            None => match inner.passed.take(listen) {
+                Some(passed) => {
+                    let copy = passed.try_clone();
+                    inner.taken.insert(listen, passed);
+                    copy
+                }
+                None => return Ok(None),
+            },
+        };
+        drop(inner);
+        std.and_then(|l| {
+            l.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(l)
+        })
+        .map(Some)
+        .map_err(|e| Error::Invalid(format!("listen {listen} (systemd): {e}")))
+    }
+
+    /// Сокет systemd для `listen`, иначе — `bind`.
+    pub fn take_or(
+        &self,
+        listen: SocketAddr,
+        bind: impl FnOnce() -> Result<tokio::net::TcpListener>,
+    ) -> Result<tokio::net::TcpListener> {
+        match self.take(listen)? {
+            Some(tcp) => Ok(tcp),
+            None => bind(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inherited> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Слушатели роли `role` по `endpoints`; фактические адреса — в реестр (нет слушателей — реестр не меняется).
@@ -78,16 +167,15 @@ impl Sockets {
         if endpoints.is_empty() {
             return Ok(Vec::new());
         }
-        let mut inherited = self
-            .inherited
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         let listeners = endpoints
             .iter()
-            .map(|ep| Listener::open(ep, tls.clone(), &mut inherited))
+            .map(|ep| match self.take(ep.listen)? {
+                Some(tcp) => Listener::from_tcp(tcp, ep, tls.clone()),
+                // Новый сокет; подсказка для портов ниже 1024 — у `Listener::open`.
+                None => Listener::open(ep, tls.clone(), &mut InheritedSockets::default()),
+            })
             .collect::<Result<Vec<_>>>()
             .map_err(|e| crate::infra::context(role, e))?;
-        drop(inherited);
         let addrs = listeners
             .iter()
             .filter_map(|l| l.local_addr().ok())
@@ -95,6 +183,13 @@ impl Sockets {
         self.bound.set(role, addrs);
         Ok(listeners)
     }
+}
+
+/// Слушатель с адресом `want` возьмёт сокет systemd `have` (правило `InheritedSockets::take`): тот же адрес или оба на
+/// всех адресах с одним портом.
+fn serves(want: SocketAddr, have: SocketAddr) -> bool {
+    want == have
+        || (want.ip().is_unspecified() && have.ip().is_unspecified() && want.port() == have.port())
 }
 
 /// Роль без слушателей: готова и ждёт остановки (узел с пресетом доходит до ready).
@@ -255,7 +350,7 @@ pub struct HttpRole {
     listener: Option<HttpListener>,
     profile: Profile,
     tls: Option<Arc<TlsCerts>>,
-    bound: Bound,
+    sockets: Sockets,
     on_stop: Option<OnStop>,
 }
 
@@ -269,14 +364,15 @@ impl std::fmt::Debug for HttpRole {
 }
 
 impl HttpRole {
-    /// Роль `role` с маршрутами `router` на слушателе `listener` (`None` — соединений не принимает).
+    /// Роль `role` с маршрутами `router` на слушателе `listener` (`None` — соединений не принимает); сокет — из
+    /// `sockets` (systemd или новый).
     pub fn new(
         role: Role,
         router: axum::Router,
         listener: Option<HttpListener>,
         profile: Profile,
         tls: Option<Arc<TlsCerts>>,
-        bound: Bound,
+        sockets: Sockets,
     ) -> Self {
         Self {
             role,
@@ -284,7 +380,7 @@ impl HttpRole {
             listener,
             profile,
             tls,
-            bound,
+            sockets,
             on_stop: None,
         }
     }
@@ -307,10 +403,12 @@ impl RoleService for HttpRole {
             return idle(self.name(), &ctx).await;
         };
         let server = listener.server(self.role != Role::Admin);
-        let tcp = service_http::bind(&server)
+        let tcp = self
+            .sockets
+            .take_or(server.listen, || service_http::bind(&server))
             .map_err(|e| crate::infra::context(&format!("http.{}", self.name()), e))?;
         if let Ok(addr) = tcp.local_addr() {
-            self.bound.set(self.name(), vec![addr]);
+            self.sockets.bound.set(self.name(), vec![addr]);
         }
         if let Some(stop) = self.on_stop.clone() {
             let shutdown = ctx.shutdown.clone();
@@ -725,5 +823,45 @@ mod tests {
         assert_eq!(log.ok(), 9);
         assert_eq!(log.ok(), 0);
         assert_eq!(log.fail(e(), t0 + 12 * s), Some(0));
+    }
+
+    /// Сокеты systemd: слушатель берёт сокет своего адреса (перезапуск роли — снова его же, не bind), лишние —
+    /// в предупреждение.
+    #[tokio::test]
+    async fn sockets_take_inherited_and_report_unused() {
+        let passed = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let extra = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let (addr, extra_addr) = (
+            passed.local_addr().expect("addr"),
+            extra.local_addr().expect("addr"),
+        );
+        let mut fds = vec![extra, passed];
+        let inherited = InheritedSockets::adopt(
+            vec![
+                tp_platform::privileges::InheritedFd { fd: 3, name: None },
+                tp_platform::privileges::InheritedFd { fd: 4, name: None },
+            ],
+            |_| fds.pop().ok_or_else(|| std::io::Error::other("fd")),
+        )
+        .expect("adopt");
+        let sockets = Sockets::with_inherited(inherited, Bound::default());
+        assert_eq!(sockets.warn_unused(&[addr]), vec![extra_addr]);
+
+        let endpoint = [EndpointConfig::new(addr)];
+        for _restart in 0..2 {
+            let listeners = sockets.open("smtp-in", &endpoint, None).expect("open");
+            assert_eq!(sockets.bound().get("smtp-in"), vec![addr]);
+            drop(listeners);
+        }
+        let any = SocketAddr::from(([0, 0, 0, 0], 0));
+        assert!(sockets.take(any).expect("take").is_none());
+        assert!(serves(
+            SocketAddr::from(([0, 0, 0, 0], 25)),
+            "[::]:25".parse().expect("addr")
+        ));
+        assert!(!serves(
+            SocketAddr::from(([0, 0, 0, 0], 25)),
+            SocketAddr::from(([127, 0, 0, 1], 25))
+        ));
     }
 }

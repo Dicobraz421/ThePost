@@ -14,10 +14,10 @@ use tp_contracts::{Error, Result};
 use tp_platform::acme::challenge_router;
 use tp_platform::{Acme, AcmeConfig, Config, Http01Challenges, TlsCerts, TlsConfig};
 
-use crate::protocols::Bound;
+use crate::protocols::Sockets;
 use crate::sections::{HTTP, HttpSection};
 
-/// Имя слушателя проверок HTTP-01 в реестре адресов [`Bound`].
+/// Имя слушателя проверок HTTP-01 в реестре адресов [`Bound`](crate::protocols::Bound).
 pub const ACME_HTTP: &str = "acme-http01";
 
 /// Клиент ACME узла: секция `acme`, ответы на проверки и слушатель HTTP-01.
@@ -30,11 +30,12 @@ pub struct NodeAcme {
     pub listener: JoinHandle<()>,
 }
 
-/// При `acme.enabled` — слушатель проверок HTTP-01 до сигнала `shutdown` (адрес — в `bound` под [`ACME_HTTP`]) и,
+/// При `acme.enabled` — слушатель проверок HTTP-01 до сигнала `shutdown` (сокет systemd из `sockets` или новый; адрес —
+/// в реестре `sockets` под [`ACME_HTTP`]) и,
 /// если файла сертификата `tls.cert_file` нет, первый выпуск сертификата; иначе `None`.
 pub async fn prepare(
     cfg: &Config,
-    bound: &Bound,
+    sockets: &Sockets,
     shutdown: CancellationToken,
 ) -> Result<Option<NodeAcme>> {
     let acme = cfg.section::<AcmeConfig>("acme")?;
@@ -44,8 +45,9 @@ pub async fn prepare(
     let http = cfg.section::<HttpSection>(HTTP)?;
     let tls = (*cfg.section::<TlsConfig>("tls")?).clone();
     let challenges = Http01Challenges::default();
-    let (addr, listener) = serve_challenges(http.acme.listen, challenges.clone(), shutdown)?;
-    bound.set(ACME_HTTP, vec![addr]);
+    let (addr, listener) =
+        serve_challenges(sockets, http.acme.listen, challenges.clone(), shutdown)?;
+    sockets.bound().set(ACME_HTTP, vec![addr]);
     let node = NodeAcme {
         cfg: (*acme).clone(),
         tls,
@@ -93,12 +95,17 @@ impl NodeAcme {
 
 /// Открытый HTTP на `listen` только с маршрутом проверок HTTP-01; фактический адрес и задача сервера.
 fn serve_challenges(
+    sockets: &Sockets,
     listen: SocketAddr,
     challenges: Http01Challenges,
     shutdown: CancellationToken,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
-    let listener = tp_sys::bind_tcp(listen, &tp_sys::ListenerConfig::default())
-        .map_err(|e| Error::Invalid(format!("http.acme.listen {listen}: {e}")))?;
+    let listener = sockets
+        .take_or(listen, || {
+            tp_sys::bind_tcp(listen, &tp_sys::ListenerConfig::default())
+                .map_err(|e| Error::Invalid(format!("http.acme.listen {listen}: {e}")))
+        })
+        .map_err(|e| crate::infra::context("http.acme.listen", e))?;
     let addr = listener
         .local_addr()
         .map_err(|e| Error::Internal(format!("http.acme: {e}")))?;
@@ -156,12 +163,12 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_without_section() {
-        let bound = Bound::default();
-        let acme = prepare(&config(BASE), &bound, CancellationToken::new())
+        let sockets = Sockets::default();
+        let acme = prepare(&config(BASE), &sockets, CancellationToken::new())
             .await
             .expect("prepare");
         assert!(acme.is_none());
-        assert!(bound.get(ACME_HTTP).is_empty());
+        assert!(sockets.bound().get(ACME_HTTP).is_empty());
     }
 
     /// Секция `acme` с готовым сертификатом: слушатель HTTP-01 открыт, отвечает только на
@@ -184,13 +191,13 @@ mod tests {
             path(&key),
             path(&dir.path().join("acme")),
         ));
-        let bound = Bound::default();
+        let sockets = Sockets::default();
         let shutdown = CancellationToken::new();
-        let acme = prepare(&cfg, &bound, shutdown.clone())
+        let acme = prepare(&cfg, &sockets, shutdown.clone())
             .await
             .expect("prepare")
             .expect("enabled");
-        let addr = bound.get(ACME_HTTP)[0];
+        let addr = sockets.bound().get(ACME_HTTP)[0];
         // Каталог ACME недоступен: продление не удаётся, слушатель и узел продолжают работу.
         let renew = acme.spawn(None, shutdown.clone());
         assert_eq!(
@@ -220,8 +227,8 @@ mod tests {
             path(&dir.path().join("key.pem")),
             path(&dir.path().join("acme")),
         ));
-        let bound = Bound::default();
-        let e = prepare(&cfg, &bound, CancellationToken::new())
+        let sockets = Sockets::default();
+        let e = prepare(&cfg, &sockets, CancellationToken::new())
             .await
             .expect_err("no acme server")
             .to_string();
