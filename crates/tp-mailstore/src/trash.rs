@@ -15,21 +15,27 @@
 //!
 //! Воркер не делает периодических проходов (SRS 2.8, таймер 4): один таймер на ближайший срок — первый элемент
 //! `TrashStore::expired` по возрастанию `expires_at` на дальний момент. Срок сверяется при запуске, после каждого
-//! прохода и по сигналу в памяти процесса после фиксации `delete_to_trash` этого [`Store`] (и его клонов):
-//! таймер перевзводится, если новый срок раньше. Ожидание не дольше [`TrashConfig::max_wait`]: по его истечении
-//! срок сверяется заново (без прохода, если ничего не истекло) — так подхватывается помещение в корзину на другом
-//! узле, сигнала о котором нет. После ошибки хранилища — повтор не раньше [`TrashConfig::retry`] (SRS 2.8, таймер 2).
+//! прохода и по сигналам: таймер перевзводится, если новый срок раньше. Сигналы — системный `TrashChanged`
+//! шины (`EventBus::subscribe_system`; публикуют `delete_to_trash` любого узла через `retention::trash_changed`
+//! и `TrashStore::purge`), `Resync` этой подписки и сигнал в памяти процесса после фиксации `delete_to_trash`
+//! этого [`Store`] (и его клонов). Подписка оформляется до сверки срока, поэтому сигнал между ними не теряется;
+//! поток завершился — переподписка и сверка, подписка не оформлена — повтор не позже [`TrashConfig::retry`].
+//! Ожидание не дольше [`TrashConfig::max_wait`]: по его истечении срок сверяется заново (без прохода, если ничего
+//! не истекло) — страховка от потерянного сигнала (шина at-most-once). После ошибки хранилища — повтор не раньше
+//! [`TrashConfig::retry`] (SRS 2.8, таймер 2).
 
 use std::future::Future;
 use std::time::Duration;
 
+use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use time::{OffsetDateTime, PrimitiveDateTime};
+use tp_contracts::bus::{EventKind, EventStream};
 use tp_contracts::config::duration;
 use tp_contracts::ext::{Decision, FinalDelete};
 use tp_contracts::meta::{AccountScope, Inserted};
-use tp_contracts::retention::{TrashItem, TrashObject};
+use tp_contracts::retention::{TrashItem, TrashObject, trash_changed};
 use tp_contracts::{MessageId, ModSeq, Result};
 
 use crate::Store;
@@ -45,7 +51,7 @@ use crate::Store;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct TrashConfig {
-    /// Наибольшее ожидание таймера: сверка ближайшего срока не реже (помещение в корзину на других узлах).
+    /// Наибольшее ожидание таймера: сверка ближайшего срока не реже (страховка от потерянного сигнала `TrashChanged`).
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub max_wait: Duration,
@@ -107,6 +113,14 @@ impl Timer for SystemTimer {
     }
 }
 
+/// Следующий сигнал подписки; без подписки — никогда.
+async fn next_event(events: &mut Option<EventStream>) -> Option<tp_contracts::bus::Event> {
+    match events {
+        Some(s) => s.next().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Момент позже любого срока: `TrashStore::expired` на него — элементы по возрастанию срока.
 const FAR: OffsetDateTime = PrimitiveDateTime::MAX.assume_utc();
 
@@ -126,9 +140,13 @@ impl Store {
     ) -> Result<ModSeq> {
         let sources = self.mailboxes_of(scope, ids).await?;
         let modseq = self.d.messages.to_trash(scope, ids).await?;
-        // После фиксации: воркер истечения сверит ближайший срок.
+        // После фиксации: воркер истечения этого узла сверит ближайший срок.
         self.trash_wake.notify_one();
         if !sources.is_empty() {
+            // Воркеры истечения других узлов (и этого — по шине).
+            if let Err(e) = self.d.bus.publish(trash_changed(scope)).await {
+                tracing::warn!(error = %e, "mailstore: сигнал корзины не опубликован");
+            }
             let trash = self.touched(scope, modseq, ids.len()).await;
             self.notify(scope, sources.into_iter().chain(trash), modseq)
                 .await;
@@ -183,7 +201,19 @@ impl Store {
         // После ошибки хранилища — не раньше этого момента (иначе истёкший необработанный элемент
         // взводил бы таймер в прошлое).
         let mut not_before: Option<OffsetDateTime> = None;
+        // Системные сигналы шины; `None` — подписка не оформлена.
+        let mut events: Option<EventStream> = None;
         loop {
+            // До сверки срока: сигнал между сверкой и подпиской не теряется.
+            if events.is_none() {
+                events = match self.d.bus.subscribe_system().await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "mailstore: подписка на сигналы корзины не оформлена");
+                        None
+                    }
+                };
+            }
             let due = match self.next_trash_expiry().await {
                 Ok(next) => next.map(|at| not_before.map_or(at, |nb| at.max(nb))),
                 Err(e) => {
@@ -193,37 +223,56 @@ impl Store {
                     Some(at)
                 }
             };
-            // Не дольше `max_wait`: по истечении — только сверка срока.
-            let cap = after(timer.now(), self.cfg.trash.max_wait);
+            // Не дольше `max_wait` (без подписки — `retry`): по истечении — только сверка срока.
+            let wait = if events.is_some() {
+                self.cfg.trash.max_wait
+            } else {
+                self.cfg.trash.max_wait.min(self.cfg.trash.retry)
+            };
+            let cap = after(timer.now(), wait);
             let (at, pass) = match due {
                 Some(at) if at <= cap => (at, true),
                 _ => (cap, false),
             };
-            tokio::select! {
-                () = &mut shutdown => return,
-                // Помещение в корзину: сверить срок и перевзвести таймер.
-                () = self.trash_wake.notified() => {}
-                () = timer.sleep_until(at), if !pass => {}
-                () = timer.sleep_until(at), if pass => {
-                    let now = timer.now();
-                    not_before = match self.expire_trash(now).await {
-                        Ok(p) => {
-                            if p.expired > 0 {
-                                tracing::info!(
-                                    purged = p.purged,
-                                    deferred = p.deferred,
-                                    failed = p.failed,
-                                    "mailstore: истечение корзины"
-                                );
-                            }
-                            (p.failed > 0).then(|| after(now, self.cfg.trash.retry))
+            let sleep = timer.sleep_until(at);
+            tokio::pin!(sleep);
+            let fire = loop {
+                tokio::select! {
+                    () = &mut shutdown => return,
+                    // Помещение в корзину этим узлом: сверить срок и перевзвести таймер.
+                    () = self.trash_wake.notified() => break false,
+                    ev = next_event(&mut events) => match ev.map(|e| e.kind) {
+                        // Корзина изменилась (на любом узле) или сигналы потеряны: сверить срок.
+                        Some(EventKind::TrashChanged { .. } | EventKind::Resync) => break false,
+                        Some(_) => {}
+                        // Поток завершился (потеря связи): переподписка и сверка.
+                        None => {
+                            events = None;
+                            break false;
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "mailstore: истечение корзины не выполнено");
-                            Some(after(now, self.cfg.trash.retry))
-                        }
-                    };
+                    },
+                    () = &mut sleep => break pass,
                 }
+            };
+            if fire {
+                let now = timer.now();
+                not_before = match self.expire_trash(now).await {
+                    Ok(p) => {
+                        if p.expired > 0 {
+                            tracing::info!(
+                                purged = p.purged,
+                                deferred = p.deferred,
+                                failed = p.failed,
+                                "mailstore: истечение корзины"
+                            );
+                        }
+                        (p.failed > 0).then(|| after(now, self.cfg.trash.retry))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "mailstore: истечение корзины не выполнено");
+                        Some(after(now, self.cfg.trash.retry))
+                    }
+                };
             }
         }
     }
@@ -301,12 +350,12 @@ impl Store {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use futures::StreamExt;
-    use tp_contracts::bus::{EventBus, EventKind, EventStream};
+    use tp_contracts::bus::EventBus;
     use tp_contracts::ext::{DecisionHook, DecisionHooks};
     use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
     use tp_contracts::meta::{Flags, MailboxStore, MessageStore, SpecialUse};
     use tp_contracts::retention::TrashStore;
+    use tp_contracts::retention::trash_changed;
     use tp_contracts::{MailboxId, TenantId};
 
     use super::*;
@@ -843,6 +892,89 @@ mod tests {
         )
         .await;
         assert_eq!(r.passed(), 2, "без промежуточных проходов");
+        r.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_publishes_trash_changed() {
+        let f = fixture(DecisionHooks::default(), 1).await;
+        let mut sys = f.env.bus.subscribe_system().await.expect("sub");
+        f.delete(&f.ids).await;
+        let ev = tokio::time::timeout(Duration::from_secs(5), sys.next())
+            .await
+            .expect("signal")
+            .expect("stream");
+        assert_eq!(ev, trash_changed(f.scope));
+        // Ничего не перенесено (письма нет) — сигнала нет.
+        let _ = f
+            .env
+            .store
+            .delete_to_trash(f.scope, &[MessageId::new()])
+            .await;
+        let none = tokio::time::timeout(Duration::from_millis(50), sys.next()).await;
+        assert!(none.is_err(), "лишний сигнал: {none:?}");
+    }
+
+    #[tokio::test]
+    async fn worker_follows_other_node() {
+        let max_wait = Duration::from_secs(365 * 86_400);
+        let r = rig(max_wait).await;
+        let (t0, ids) = (r.t0, r.ids.clone());
+        until("подписка воркера", async || {
+            r.env.bus.subscribers() == 1
+        })
+        .await;
+        until(
+            "пустая корзина — таймер на max_wait",
+            async || distinct(&r.armed) == [after(t0, max_wait)],
+        )
+        .await;
+
+        // «Другой узел»: свой `Store` (свой сигнал в памяти) над теми же метаданными и шиной.
+        let other = |secs| {
+            let mut d = r.env.store.d.clone();
+            d.messages = Arc::new(
+                r.env
+                    .meta
+                    .clone()
+                    .with_trash_retention(Duration::from_secs(secs)),
+            );
+            Store::new(d)
+        };
+        other(86_400)
+            .delete_to_trash(r.scope, &ids[..1])
+            .await
+            .expect("trash");
+        let a_due = t0 + days(1);
+        until("перевзвод по TrashChanged", async || {
+            distinct(&r.armed).last() == Some(&a_due)
+        })
+        .await;
+
+        // Потеря связи: воркер переподписывается и снова получает сигналы.
+        r.env.bus.disconnect();
+        until("переподписка", async || {
+            r.env.bus.subscribers() == 1
+        })
+        .await;
+        other(600)
+            .delete_to_trash(r.scope, &ids[1..])
+            .await
+            .expect("trash");
+        let b_due = t0 + time::Duration::minutes(10);
+        until(
+            "перевзвод после переподписки",
+            async || distinct(&r.armed).last() == Some(&b_due),
+        )
+        .await;
+
+        r.clock.set(b_due);
+        until("удаление в срок без max_wait", async || {
+            !r.exists(ids[1]).await
+        })
+        .await;
+        assert_eq!(r.passed(), 1);
+        assert!(r.exists(ids[0]).await);
         r.shutdown().await;
     }
 
