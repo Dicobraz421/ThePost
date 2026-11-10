@@ -12,8 +12,8 @@ use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountScope, MessageQuery, MessageStore, SpecialUse};
 use tp_contracts::{Result, TenantId};
 use tp_testkit::{
-    BlobOp, Clock, FakeDirectory, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata, MemQuota,
-    MemTrash, RecordingDecisionHook, SystemClock,
+    BlobOp, Clock, FakeDirectory, MemBlobIndex, MemBlobStore, MemEventBus, MemGroups, MemMetadata,
+    MemQuota, MemTrash, RecordingDecisionHook, SystemClock,
 };
 
 use super::*;
@@ -44,6 +44,8 @@ impl Outbound for Queue {
 struct Env {
     meta: MemMetadata,
     blobs: MemBlobStore,
+    index: MemBlobIndex,
+    groups: MemGroups,
     quota: MemQuota,
     store: Arc<dyn MailStore>,
     dir: FakeDirectory,
@@ -70,7 +72,7 @@ impl Env {
         let quota = MemQuota::new(&meta);
         let store = tp_mailstore::Store::new(tp_mailstore::Deps {
             blobs: Arc::new(blobs.clone()),
-            index: Arc::new(index),
+            index: Arc::new(index.clone()),
             messages: Arc::new(meta.clone()),
             changes: Arc::new(meta.clone()),
             trash: Arc::new(MemTrash::new(&meta)),
@@ -131,6 +133,8 @@ impl Env {
         Self {
             meta,
             blobs,
+            index,
+            groups: MemGroups::new(),
             quota,
             store: Arc::new(store),
             dir,
@@ -932,4 +936,376 @@ async fn submission_copy_to_local_address() {
     assert_eq!(env.inbox("alice@example.org").await.len(), 1);
     // Неизвестный адрес копии — без уведомления отправителю (адрес копии ему не раскрывается).
     assert!(env.inbox("carol@example.org").await.is_empty());
+}
+
+mod groups {
+    //! SMTP-16: квота до `DATA`, ограничения отправителей и модерация групп рассылки.
+
+    use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
+    use tp_contracts::{GroupId, TenantId};
+
+    use super::*;
+    use crate::config::{DeliveryConfig, QuotaReject};
+    use crate::groups::Groups;
+
+    impl Env {
+        fn with_groups(&self, d: Delivery) -> Delivery {
+            d.with_groups(Groups::new(
+                Arc::new(self.groups.clone()),
+                Arc::new(self.blobs.clone()),
+                Arc::new(self.index.clone()),
+            ))
+        }
+
+        async fn group(
+            &self,
+            address: &str,
+            members: &[&str],
+            senders: SenderRestriction,
+            moderators: &[&str],
+        ) -> DistributionGroup {
+            let mut ids = Vec::new();
+            for m in members {
+                ids.push(GroupMember::Account(self.scope(m).await.account));
+            }
+            let mut mods = Vec::new();
+            for m in moderators {
+                mods.push(self.scope(m).await.account);
+            }
+            let g = DistributionGroup {
+                id: GroupId::new(),
+                tenant: TenantId::DEFAULT,
+                name: address.into(),
+                address: Some(address.into()),
+                external_id: None,
+                members: ids,
+                senders,
+                moderators: mods,
+                hidden_from_gal: false,
+            };
+            self.groups.put(g.clone()).await.expect("put group");
+            g
+        }
+
+        async fn principal(&self, login: &str) -> tp_contracts::auth::Principal {
+            tp_contracts::auth::Principal {
+                account: self.scope(login).await.account,
+                ..tp_testkit::principal(TenantId::DEFAULT, login)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_mailbox_rejected_before_data() {
+        let env = Env::new(DecisionHooks::default()).await;
+        let bob = envelope(Mode::Inbound, &["bob@example.org"]);
+        let r = env
+            .delivery(false)
+            .data(&bob, Bytes::from_static(MAIL))
+            .await;
+        assert_eq!(r.code, 250);
+        env.quota
+            .set_limit(env.scope("bob@example.org").await, Some(1));
+        let inbound = envelope(Mode::Inbound, &[]);
+        // По умолчанию — временный отказ.
+        let r = env.delivery(false).rcpt(&inbound, "bob@example.org").await;
+        assert_eq!((r.code, r.esc), (452, [4, 2, 2]));
+        // Постоянный — по настройке.
+        let d = env.delivery_with(
+            false,
+            SmtpConfig {
+                delivery: DeliveryConfig {
+                    quota_reject: QuotaReject::Permanent,
+                    ..DeliveryConfig::default()
+                },
+                ..SmtpConfig::default()
+            },
+        );
+        let r = d.rcpt(&inbound, "bob@example.org").await;
+        assert_eq!((r.code, r.esc), (552, [5, 2, 2]));
+        // В сессии: получатель отклонён на RCPT, до DATA дело не доходит.
+        let ctx = SessionCtx {
+            mode: Mode::Inbound,
+            config: Arc::new(SmtpConfig::default()),
+            handler: Arc::new(d),
+            sasl: None,
+            limiter: None,
+            send_limits: None,
+            metrics: None,
+        };
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            Session::new(ctx, conn_info(false), false)
+                .serve(&mut server, true)
+                .await
+        });
+        let mut c = Client::new(client);
+        assert_eq!(c.code().await, 220);
+        assert_eq!(c.cmd("EHLO client.example.net").await, 250);
+        assert_eq!(c.cmd("MAIL FROM:<s@example.net>").await, 250);
+        assert_eq!(c.cmd("RCPT TO:<bob@example.org>").await, 552);
+        assert_eq!(c.cmd("DATA").await, 554);
+        assert_eq!(c.cmd("QUIT").await, 221);
+        task.await.expect("join").expect("io");
+        assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_group_rejects_external_sender() {
+        let env = Env::new(DecisionHooks::default()).await;
+        let d = env.with_groups(env.delivery(false));
+        env.group(
+            "staff@example.org",
+            &["alice@example.org", "bob@example.org"],
+            SenderRestriction::Internal,
+            &[],
+        )
+        .await;
+        let bob = env.scope("bob@example.org").await.account;
+        env.group(
+            "board@example.org",
+            &["alice@example.org"],
+            SenderRestriction::Only {
+                accounts: vec![bob],
+                groups: Vec::new(),
+            },
+            &[],
+        )
+        .await;
+        // Внешний отправитель (smtp-in) — отказ до DATA.
+        let inbound = envelope(Mode::Inbound, &[]);
+        let r = d.rcpt(&inbound, "staff@example.org").await;
+        assert_eq!((r.code, r.esc), (550, [5, 7, 1]));
+        // Пользователь организации — принят; группа раскрыта.
+        let mut sub = envelope(Mode::Submission, &[]);
+        sub.principal = Some(env.principal("carol@example.org").await);
+        assert_eq!(d.rcpt(&sub, "staff@example.org").await.code, 250);
+        // Список отправителей: carol не в нём, bob — в нём.
+        let r = d.rcpt(&sub, "board@example.org").await;
+        assert_eq!((r.code, r.esc), (550, [5, 7, 1]));
+        sub.principal = Some(env.principal("bob@example.org").await);
+        assert_eq!(d.rcpt(&sub, "board@example.org").await.code, 250);
+        sub.rcpts = vec!["staff@example.org".into()];
+        sub.mail_from = "bob@example.org".into();
+        assert_eq!(d.data(&sub, Bytes::from_static(MAIL)).await.code, 250);
+        assert_eq!(env.inbox("alice@example.org").await.len(), 1);
+        assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+        // Отправка вне сессии от внешнего адреса в закрытую группу — отказ с уведомлением.
+        let sent = d
+            .submit(
+                TenantId::DEFAULT,
+                "x@example.net",
+                &rcpts(&["staff@example.org"]),
+                Bytes::from_static(MAIL),
+            )
+            .await
+            .expect("submit");
+        assert!(
+            matches!(&sent.rcpts[0].1, RcptStatus::Failed(r) if r.starts_with("550 5.7.1")),
+            "{sent:?}"
+        );
+        assert_eq!(env.inbox("alice@example.org").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn moderated_group_holds_message() {
+        let env = Env::new(DecisionHooks::default()).await;
+        let d = env.with_groups(env.delivery(false));
+        let g = env
+            .group(
+                "news@example.org",
+                &["alice@example.org", "bob@example.org"],
+                SenderRestriction::Anyone,
+                &["carol@example.org"],
+            )
+            .await;
+        let mut e = envelope(Mode::Inbound, &["news@example.org", "bob@example.org"]);
+        assert_eq!(d.rcpt(&e, "news@example.org").await.code, 250);
+        let raw = b"From: sender@example.net\r\nMessage-ID: <m1@example.net>\r\n\r\nbody\r\n";
+        assert_eq!(d.data(&e, Bytes::from_static(raw)).await.code, 250);
+        // Группе — в очередь модерации, прямому получателю — сразу.
+        assert!(env.inbox("alice@example.org").await.is_empty());
+        assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+        let held = env
+            .groups
+            .held(TenantId::DEFAULT, Some(g.id), 10)
+            .await
+            .expect("held");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].sender, "sender@example.net");
+        assert_eq!(held[0].sender_account, None);
+        assert_eq!(held[0].message_id.as_deref(), Some("m1@example.net"));
+        assert!(env.blobs.contains(&held[0].blob));
+        let stored = env.blobs.bytes(&held[0].blob.path()).expect("blob");
+        assert!(stored.ends_with(raw));
+        // Письмо модератора не задерживается.
+        e.mode = Mode::Submission;
+        e.principal = Some(env.principal("carol@example.org").await);
+        e.mail_from = "carol@example.org".into();
+        e.rcpts = vec!["news@example.org".into()];
+        assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+        assert_eq!(env.inbox("alice@example.org").await.len(), 1);
+        // Отправка вне сессии не модератором — статус «в очереди», письмо ждёт модератора.
+        let sent = d
+            .submit(
+                TenantId::DEFAULT,
+                "alice@example.org",
+                &rcpts(&["news@example.org"]),
+                Bytes::from_static(MAIL),
+            )
+            .await
+            .expect("submit");
+        assert_eq!(sent.rcpts[0].1, RcptStatus::Queued);
+        let held = env
+            .groups
+            .held(TenantId::DEFAULT, Some(g.id), 10)
+            .await
+            .expect("held");
+        assert_eq!(held.len(), 2);
+        assert_eq!(
+            held[1].sender_account,
+            Some(env.scope("alice@example.org").await.account)
+        );
+    }
+}
+
+mod tracking {
+    //! SMTP-17: журнал доставки — сквозной путь smtp-in, submission, smtp-out на фейках.
+
+    use tp_contracts::delivery::{DeliveryDecision, DeliveryEvent, DeliveryEventKind};
+    use tp_contracts::membership::NodeId;
+    use tp_testkit::MemDeliveryLog;
+
+    use super::*;
+    use crate::config::QueueConfig;
+    use crate::queue::tests::Env as QueueEnv;
+    use crate::queue::{Queue as OutQueue, QueueWorker, RcptResult, SendRequest, Transport};
+    use crate::tracking::Tracking;
+
+    /// Принимающие серверы: `y@…` — постоянный отказ, остальные — приняты.
+    struct ByAddress;
+
+    #[async_trait]
+    impl Transport for ByAddress {
+        async fn send(&self, req: SendRequest<'_>) -> Vec<RcptResult> {
+            req.rcpts
+                .iter()
+                .map(|r| {
+                    if r.starts_with("y@") {
+                        RcptResult::Permanent("550 5.1.1 no such user".into())
+                    } else {
+                        RcptResult::Delivered("250 2.0.0 ok".into())
+                    }
+                })
+                .collect()
+        }
+    }
+
+    fn find<'a>(
+        events: &'a [DeliveryEvent],
+        kind: DeliveryEventKind,
+        rcpt: &str,
+    ) -> Vec<&'a DeliveryEvent> {
+        events
+            .iter()
+            .filter(|e| e.kind == kind && e.recipients.iter().any(|r| r == rcpt))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn all_events_recorded() {
+        let env = Env::new(DecisionHooks::default()).await;
+        let q = QueueEnv::new();
+        let log = MemDeliveryLog::new();
+        let tracking = Tracking::new(Arc::new(log.clone()), NodeId::new("node-1").expect("node"));
+        let d = Delivery::new(
+            Deps {
+                outbound: Some(Arc::new(OutQueue::new(q.deps.clone()))),
+                ..env.delivery(false).deps.clone()
+            },
+            &SmtpConfig {
+                hostname: "mx.example.org".into(),
+                ..SmtpConfig::default()
+            },
+        )
+        .with_tracking(tracking.clone());
+        // Отказ на RCPT.
+        let inbound = envelope(Mode::Inbound, &[]);
+        assert_eq!(d.rcpt(&inbound, "nobody@example.org").await.code, 550);
+        // Приём: carol доставлено, ящик bob переполнен — отказ получателю и уведомление отправителю.
+        assert_eq!(
+            d.data(
+                &envelope(Mode::Inbound, &["bob@example.org"]),
+                Bytes::from_static(MAIL)
+            )
+            .await
+            .code,
+            250
+        );
+        env.quota
+            .set_limit(env.scope("bob@example.org").await, Some(1));
+        let raw =
+            b"From: sender@example.net\r\nMessage-ID: <t1@example.net>\r\n\r\nsecret body\r\n";
+        let e = envelope(Mode::Inbound, &["bob@example.org", "carol@example.org"]);
+        assert_eq!(d.data(&e, Bytes::from_static(raw)).await.code, 250);
+        // Отправка наружу: одному получателю принято, другому — отказ (уведомление отправителю).
+        let mut sub = envelope(Mode::Submission, &["x@example.net", "y@example.net"]);
+        sub.mail_from = "alice@example.org".into();
+        let raw2 = b"From: alice@example.org\r\nMessage-ID: <t2@example.org>\r\n\r\nhello\r\n";
+        assert_eq!(d.data(&sub, Bytes::from_static(raw2)).await.code, 250);
+        let worker = QueueWorker::new(q.deps.clone(), Arc::new(ByAddress), "out.example.org")
+            .with_tracking(tracking);
+        worker.run_once(&QueueConfig::default()).await.expect("run");
+
+        let events = log.events();
+        let rej = find(&events, DeliveryEventKind::Reject, "nobody@example.org");
+        assert_eq!(rej.len(), 1);
+        assert_eq!(rej[0].decision, DeliveryDecision::Reject);
+        assert_eq!(
+            rej[0].reason.as_deref(),
+            Some("550 5.1.1 Mailbox unavailable")
+        );
+        assert_eq!(rej[0].sender, "sender@example.net");
+        assert_eq!(rej[0].node.as_str(), "node-1");
+        assert_eq!(rej[0].message_id, None);
+
+        let mine: Vec<_> = events
+            .iter()
+            .filter(|e| e.message_id.as_deref() == Some("t1@example.net"))
+            .collect();
+        let kinds: Vec<_> = mine.iter().map(|e| (e.kind, e.decision)).collect();
+        assert!(kinds.contains(&(DeliveryEventKind::Receive, DeliveryDecision::Accept)));
+        let deliver = find(&events, DeliveryEventKind::Deliver, "carol@example.org");
+        assert_eq!(deliver.len(), 1);
+        assert_eq!(deliver[0].recipients, ["carol@example.org"]);
+        let full = mine
+            .iter()
+            .find(|e| e.kind == DeliveryEventKind::Reject)
+            .expect("reject bob");
+        assert_eq!(full.recipients, ["bob@example.org"]);
+        assert_eq!(full.reason.as_deref(), Some("552 5.2.2 mailbox full"));
+        let dsn = mine
+            .iter()
+            .find(|e| e.kind == DeliveryEventKind::Dsn)
+            .expect("dsn");
+        assert_eq!(dsn.sender, "");
+        assert_eq!(dsn.recipients, ["sender@example.net"]);
+
+        // smtp-out: передача наружу с решением и причиной, запись очереди, уведомление об отказе.
+        let x = find(&events, DeliveryEventKind::Relay, "x@example.net");
+        assert_eq!(x.len(), 1);
+        assert_eq!(x[0].decision, DeliveryDecision::Accept);
+        assert_eq!(x[0].message_id.as_deref(), Some("t2@example.org"));
+        assert!(x[0].queue_id.is_some());
+        let y = find(&events, DeliveryEventKind::Relay, "y@example.net");
+        assert_eq!(y[0].decision, DeliveryDecision::Reject);
+        assert_eq!(y[0].reason.as_deref(), Some("550 5.1.1 no such user"));
+        let dsn = find(&events, DeliveryEventKind::Dsn, "alice@example.org");
+        assert_eq!(dsn.len(), 1);
+        assert_eq!(dsn[0].queue_id, x[0].queue_id);
+        assert!(find(&events, DeliveryEventKind::Receive, "x@example.net").len() == 1);
+        // Содержимое писем в журнал не попадает.
+        let dump = format!("{events:?}");
+        assert!(!dump.contains("secret body") && !dump.contains("hello"));
+    }
 }

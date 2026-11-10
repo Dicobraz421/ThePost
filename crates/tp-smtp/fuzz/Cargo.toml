@@ -1,0 +1,49 @@
+# Цели fuzz разборщиков SMTP (SMTP-19), в каталоге crates/tp-smtp:
+#   cargo +nightly fuzz run <цель> fuzz/corpus/<цель> -- -max_total_time=600
+# Цели: session — поток команд и данных сессии (smtp-in или submission по первому байту); esmtp — параметры
+# расширений ESMTP в MAIL FROM и RCPT TO; proxy_v2 — заголовок PROXY protocol v2 перед сессией smtp-in
+# (соединение loopback со слушателем tp-platform); milter — поток ответов фильтра Milter на проверку письма.
+# Проверки — tp_smtp::fuzz; новые входы — в fuzz/corpus/<цель> (не в git).
+# Отдельный workspace: в сборку и Cargo.lock основного workspace не входит.
+[package]
+name = "tp-smtp-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tp-smtp = { path = ".." }
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "esmtp"
+path = "fuzz_targets/esmtp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_v2"
+path = "fuzz_targets/proxy_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "milter"
+path = "fuzz_targets/milter.rs"
+test = false
+doc = false
+bench = false

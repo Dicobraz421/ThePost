@@ -37,8 +37,10 @@ use crate::dkim_sign::DkimSign;
 use crate::dsn::{self, DsnSink};
 use crate::metrics::{RcptOutcome, SmtpMetrics};
 use crate::routes::Routes;
+use crate::tracking::{self, Mail, Step, Tracking};
 use sched::{Admit, Scheduler};
 use tp_contracts::bus::EventBus;
+use tp_contracts::delivery::{DeliveryDecision as Dd, DeliveryEventKind as Ek};
 use tp_contracts::transport::DestinationPolicy;
 
 pub mod sched;
@@ -71,53 +73,66 @@ impl fmt::Debug for QueueDeps {
     }
 }
 
-impl QueueDeps {
-    /// Загружает письмо одним объектом с одной ссылкой (SRS 3.4, шаги 2–3).
-    async fn store_blob(&self, tenant: TenantId, data: Bytes) -> Result<BlobKey> {
-        let hash = tp_mailstore::split::hash(&data);
-        let mut generation = match self.index.acquire(tenant, &hash, 1).await? {
-            Acquire::Existing { generation } => {
+/// Загружает письмо одним объектом с одной ссылкой (SRS 3.4, шаги 2–3): очередь, очередь модерации.
+pub(crate) async fn store_blob(
+    blobs: &dyn BlobStore,
+    index: &dyn BlobIndex,
+    tenant: TenantId,
+    data: Bytes,
+) -> Result<BlobKey> {
+    let hash = tp_mailstore::split::hash(&data);
+    let mut generation = match index.acquire(tenant, &hash, 1).await? {
+        Acquire::Existing { generation } => {
+            return Ok(BlobKey {
+                tenant,
+                hash,
+                generation,
+            });
+        }
+        Acquire::Absent { generation } => generation,
+    };
+    loop {
+        let key = BlobKey {
+            tenant,
+            hash,
+            generation,
+        };
+        blobs.put(&key, data.clone()).await?;
+        match index
+            .commit_new(tenant, &hash, generation, data.len() as u64, 1)
+            .await?
+        {
+            Commit::Done { generation } => {
                 return Ok(BlobKey {
                     tenant,
                     hash,
                     generation,
                 });
             }
-            Acquire::Absent { generation } => generation,
-        };
-        loop {
-            let key = BlobKey {
-                tenant,
-                hash,
-                generation,
-            };
-            self.blobs.put(&key, data.clone()).await?;
-            match self
-                .index
-                .commit_new(tenant, &hash, generation, data.len() as u64, 1)
-                .await?
-            {
-                Commit::Done { generation } => {
-                    return Ok(BlobKey {
-                        tenant,
-                        hash,
-                        generation,
-                    });
-                }
-                Commit::Bumped { generation: next } => generation = next,
-            }
+            Commit::Bumped { generation: next } => generation = next,
         }
     }
+}
 
-    /// Снимает ссылку записи очереди на объект; ошибка — в журнал (объект найдёт сверка «сирот»).
+/// Снимает одну ссылку на объект; ошибка — в журнал (объект найдёт сверка «сирот»).
+pub(crate) async fn release_blob(index: &dyn BlobIndex, key: &BlobKey) {
+    if let Err(e) = index
+        .release(key.tenant, &key.hash, key.generation, 1)
+        .await
+    {
+        tracing::error!(error = %e, blob = %key.hash, "smtp: ссылка на письмо не снята");
+    }
+}
+
+impl QueueDeps {
+    /// Загружает письмо одним объектом с одной ссылкой (SRS 3.4, шаги 2–3).
+    async fn store_blob(&self, tenant: TenantId, data: Bytes) -> Result<BlobKey> {
+        store_blob(self.blobs.as_ref(), self.index.as_ref(), tenant, data).await
+    }
+
+    /// Снимает ссылку записи очереди на объект.
     async fn release(&self, key: &BlobKey) {
-        if let Err(e) = self
-            .index
-            .release(key.tenant, &key.hash, key.generation, 1)
-            .await
-        {
-            tracing::error!(error = %e, blob = %key.hash, "smtp: ссылка очереди на письмо не снята");
-        }
+        release_blob(self.index.as_ref(), key).await;
     }
 
     /// Ставит письмо `raw` в очередь получателям `rcpts`; первая попытка — сразу.
@@ -274,6 +289,8 @@ pub struct QueueWorker {
     routes: Option<Arc<Routes>>,
     /// Шина: перечитывание политик по сигналу.
     bus: Option<Arc<dyn EventBus>>,
+    /// Журнал доставки.
+    tracking: Option<Tracking>,
 }
 
 impl fmt::Debug for QueueWorker {
@@ -300,7 +317,14 @@ impl QueueWorker {
             sched: Arc::new(Scheduler::new()),
             routes: None,
             bus: None,
+            tracking: None,
         }
+    }
+
+    /// Журнал доставки (SMTP-17): передача наружу по каждому получателю и уведомления отправителю.
+    pub fn with_tracking(mut self, tracking: Tracking) -> Self {
+        self.tracking = Some(tracking);
+        self
     }
 
     /// Политики доменов назначения организаций (SMTP-15); с шиной `bus` роль smtp-out перечитывает их по
@@ -475,6 +499,30 @@ impl QueueWorker {
         message: &[u8],
         outcome: Vec<(&QueuedRcpt, RcptResult)>,
     ) -> Result<()> {
+        let mut steps = Vec::new();
+        let res = self.settle(cfg, c, message, outcome, &mut steps).await;
+        if let Some(t) = &self.tracking {
+            let message_id = tracking::message_id(message);
+            let mail = Mail {
+                tenant: c.tenant,
+                sender: &c.from,
+                message_id: message_id.as_deref(),
+                queue_id: Some(c.claim.id),
+                at: (self.deps.now)(),
+            };
+            t.write(&mail, steps).await;
+        }
+        res
+    }
+
+    async fn settle(
+        &self,
+        cfg: &QueueConfig,
+        c: &Claimed,
+        message: &[u8],
+        outcome: Vec<(&QueuedRcpt, RcptResult)>,
+        steps: &mut Vec<Step>,
+    ) -> Result<()> {
         let now = (self.deps.now)();
         let age = now - c.queued_at;
         let expired = age >= cfg.expire;
@@ -507,6 +555,10 @@ impl QueueWorker {
             match res {
                 RcptResult::Delivered(reply) => {
                     tracing::info!(id = %c.claim.id, %reply, "smtp: доставлено");
+                    steps.push(
+                        Step::new(Ek::Relay, Dd::Accept, vec![address.to_owned()])
+                            .reason(reply.clone()),
+                    );
                     if notify.success {
                         delivered.push(dsn_rcpt(r, dsn::Action::Delivered, &reply));
                     }
@@ -521,6 +573,10 @@ impl QueueWorker {
                 RcptResult::Temporary(reason) | RcptResult::Deferred { reason, .. } => {
                     let at = until.unwrap_or_else(|| now + cfg.retry_after(r.attempts + 1));
                     tracing::info!(id = %c.claim.id, %reason, attempt = r.attempts + 1, "smtp: временная неудача, повтор");
+                    steps.push(
+                        Step::new(Ek::Relay, Dd::Defer, vec![address.to_owned()])
+                            .reason(reason.clone()),
+                    );
                     // Порог задержки пересечён этой попыткой (предыдущая была раньше порога).
                     let prev = if r.attempts == 0 {
                         time::Duration::ZERO
@@ -539,8 +595,12 @@ impl QueueWorker {
         }
         // Уведомления об успехе и задержке — справочные: сбой их постановки только в журнал.
         for (rcpts, retry_until) in [(delivered, None), (delayed, Some(c.queued_at + cfg.expire))] {
-            if let Err(e) = self.notify(c, message, &rcpts, retry_until).await {
-                tracing::warn!(id = %c.claim.id, error = %e, "smtp: уведомление о доставке не поставлено");
+            match self.notify(c, message, &rcpts, retry_until).await {
+                Ok(()) => dsn_steps(steps, c, &rcpts, Dd::Accept),
+                Err(e) => {
+                    tracing::warn!(id = %c.claim.id, error = %e, "smtp: уведомление о доставке не поставлено");
+                    dsn_steps(steps, c, &rcpts, Dd::Defer);
+                }
             }
         }
         let notify_failed: Vec<_> = failed
@@ -555,8 +615,13 @@ impl QueueWorker {
             })
             .collect();
         self.notify(c, message, &notify_failed, None).await?;
+        dsn_steps(steps, c, &notify_failed, Dd::Accept);
         for (r, reply, _) in failed {
             tracing::info!(id = %c.claim.id, %reply, "smtp: окончательный отказ");
+            steps.push(
+                Step::new(Ek::Relay, Dd::Reject, vec![r.rcpt.address.clone()])
+                    .reason(reply.clone()),
+            );
             self.complete(c, &r.rcpt.address, RcptStatus::Failed { reply })
                 .await?;
         }
@@ -655,6 +720,22 @@ impl RoleService for SmtpOutService {
         ctx.ready.set(false);
         Ok(())
     }
+}
+
+/// Событие уведомления отправителю записи `c` о получателях `rcpts` (как [`QueueWorker::notify`]: пусто или
+/// пустой отправитель — ничего).
+fn dsn_steps(steps: &mut Vec<Step>, c: &Claimed, rcpts: &[dsn::Recipient], decision: Dd) {
+    let Some(first) = rcpts.first() else {
+        return;
+    };
+    if c.from.is_empty() {
+        return;
+    }
+    steps.push(
+        Step::new(Ek::Dsn, decision, vec![c.from.clone()])
+            .sender("")
+            .reason(format!("{} notification", first.action.as_str())),
+    );
 }
 
 fn dsn_rcpt(r: &QueuedRcpt, action: dsn::Action, reply: &str) -> dsn::Recipient {

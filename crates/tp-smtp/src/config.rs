@@ -42,6 +42,10 @@
 //!     mode: enforce
 //!     greet_delay: 6s
 //!     exempt: ["127.0.0.0/8", "10.0.0.0/8"]
+//!   learn:
+//!     enabled: true
+//!     url: "https://rspamd.example.org:11334"
+//!     password: { secret: "thepost/rspamd#controller" }
 //! ```
 //!
 //! Слушатели (`inbound`, `submission`) применяются при запуске роли; лимиты и таймауты — к новым сессиям
@@ -83,6 +87,8 @@ pub struct SmtpConfig {
     pub screen: ScreenConfig,
     /// Адресация: подадреса, переписывание адресов конверта.
     pub addressing: AddressingConfig,
+    /// Обучение антиспама по перемещению писем в «Спам» и из него.
+    pub learn: LearnConfig,
 }
 
 impl Default for SmtpConfig {
@@ -100,6 +106,42 @@ impl Default for SmtpConfig {
             dkim: DkimConfig::default(),
             screen: ScreenConfig::default(),
             addressing: AddressingConfig::default(),
+            learn: LearnConfig::default(),
+        }
+    }
+}
+
+/// Обучение антиспама (SRS 4.1, по модели imapsieve Dovecot; [`crate::learn`]): письмо, перенесённое
+/// пользователем в «Спам», — в Rspamd controller на `learnspam`, перенесённое из «Спама» (не в корзину) — на
+/// `learnham`. Выключено по умолчанию.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct LearnConfig {
+    /// Включено.
+    pub enabled: bool,
+    /// Адрес Rspamd controller: `https://…`; `http://` — только для адресов loopback (controller на том же узле).
+    pub url: Option<String>,
+    /// Пароль controller (заголовок `Password`) в хранилище секретов; `None` — без пароля.
+    pub password: Option<tp_contracts::secrets::SecretRef>,
+    /// Таймаут запроса к controller.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub timeout: Duration,
+    /// Письма крупнее (байт) на обучение не передаются.
+    pub max_message_size: u64,
+    /// Сколько последних обученных писем помнить, чтобы повтор пачки событий не обучал повторно.
+    pub remember: usize,
+}
+
+impl Default for LearnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: None,
+            password: None,
+            timeout: Duration::from_secs(30),
+            max_message_size: 10 * 1024 * 1024,
+            remember: 10_000,
         }
     }
 }
@@ -278,6 +320,8 @@ pub struct DeliveryConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub directory_refresh: Duration,
+    /// Ответ на `RCPT TO` получателю с переполненным ящиком (проверка до `250`, SRS 4.1).
+    pub quota_reject: QuotaReject,
 }
 
 impl Default for DeliveryConfig {
@@ -285,8 +329,20 @@ impl Default for DeliveryConfig {
         Self {
             local_domains: Vec::new(),
             directory_refresh: Duration::from_secs(5 * 60),
+            quota_reject: QuotaReject::default(),
         }
     }
+}
+
+/// Отказ получателю с переполненным ящиком.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaReject {
+    /// Временный отказ `452 4.2.2`: отправитель повторит, пока владелец освобождает место.
+    #[default]
+    Temporary,
+    /// Постоянный отказ `552 5.2.2`: отправитель сразу получает уведомление о недоставке.
+    Permanent,
 }
 
 /// Проверки SPF, DKIM, DMARC, ARC входящей почты.
