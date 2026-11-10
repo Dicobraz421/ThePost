@@ -1,0 +1,55 @@
+# Внутренний CA и сертификат внутренних служб (community.crypto). Выпуск других сертификатов этим CA —
+# include_role tasks_from: issue (переменные thepost_pki_issue_*).
+---
+- name: Install python3-cryptography for community.crypto
+  ansible.builtin.apt:
+    name: python3-cryptography
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create PKI directory
+  ansible.builtin.file:
+    path: "{{ thepost_pki_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create CA key
+  community.crypto.openssl_privatekey:
+    path: "{{ thepost_pki_dir }}/ca.key"
+    type: ECC
+    curve: secp256r1
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Create CA request
+  community.crypto.openssl_csr:
+    path: "{{ thepost_pki_dir }}/ca.csr"
+    privatekey_path: "{{ thepost_pki_dir }}/ca.key"
+    common_name: "{{ thepost_pki_ca_common_name }}"
+    use_common_name_for_san: false
+    basic_constraints: ["CA:TRUE"]
+    basic_constraints_critical: true
+    key_usage: [keyCertSign, cRLSign]
+    key_usage_critical: true
+    mode: "0644"
+
+- name: Create CA certificate
+  community.crypto.x509_certificate:
+    path: "{{ thepost_pki_dir }}/ca.pem"
+    csr_path: "{{ thepost_pki_dir }}/ca.csr"
+    privatekey_path: "{{ thepost_pki_dir }}/ca.key"
+    provider: selfsigned
+    selfsigned_not_after: "{{ thepost_pki_ca_not_after }}"
+    mode: "0644"
+
+- name: Issue certificate of internal services
+  ansible.builtin.include_tasks: issue.yml
+  vars:
+    thepost_pki_issue_name: internal
+    thepost_pki_issue_dir: "{{ thepost_pki_dir }}"
+    thepost_pki_issue_names: "{{ thepost_pki_internal_names }}"
+    thepost_pki_issue_key_group: root

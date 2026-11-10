@@ -1,0 +1,20 @@
+# Пример инвентаря эталона SMB: скопировать, указать адрес ВМ и параметры узла.
+#   ansible-playbook -i inventory.yml deploy/ansible/smb.yml
+---
+all:
+  children:
+    smb:
+      hosts:
+        mail.example.ru:
+          ansible_user: admin
+      vars:
+        thepost_domain: example.ru
+        thepost_hostname: mail.example.ru
+        # Let's Encrypt (certbot): порт 80 открыт, DNS mail.example.ru → ВМ.
+        thepost_tls_mode: certbot
+        thepost_acme_email: postmaster@example.ru
+        # Антивирус (clamav-milter) — по желанию.
+        thepost_clamav: false
+        # Бинарный файл: собранный на управляющей машине (cargo build --release) или релиз:
+        # thepost_binary_url: https://…/thepost-x86_64-linux
+        # thepost_binary_checksum: "sha256:…"

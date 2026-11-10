@@ -1,0 +1,14 @@
+# Свои PEM с управляющей машины (сертификат заказчика). Замена файлов — повторный прогон; thepost перечитывает их
+# без перезапуска (tls.reload_interval).
+---
+- name: Install certificate of client protocols (files)
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "/etc/thepost/tls/{{ item.dest }}"
+    owner: root
+    group: thepost
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: "{{ thepost_tls_cert_src }}", dest: fullchain.pem, mode: "0644" }
+    - { src: "{{ thepost_tls_key_src }}", dest: privkey.pem, mode: "0640" }
+  no_log: true

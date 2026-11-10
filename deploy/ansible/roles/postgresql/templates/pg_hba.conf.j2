@@ -1,0 +1,10 @@
+# {{ ansible_managed }}
+# Сокет — администратор postgres (peer); по сети — только TLS (решение 2026-10-30), открытый канал отклоняется.
+# TYPE    DATABASE  USER  ADDRESS  METHOD
+local     all       postgres       peer
+local     all       all            peer
+{% for net in postgresql_app_networks %}
+hostssl   {{ postgresql_app_db }}  {{ postgresql_app_role }}  {{ net }}  scram-sha-256
+{% endfor %}
+hostnossl all       all   0.0.0.0/0  reject
+hostnossl all       all   ::/0       reject

@@ -1,0 +1,53 @@
+# Let's Encrypt через certbot (ACME HTTP-01, --standalone): порт 80 узла открыт из интернета, имена
+# thepost_tls_names указывают на узел (DNS A/AAAA). Продление — certbot.timer пакета; deploy-hook копирует файлы,
+# thepost перечитывает их без перезапуска (tls.reload_interval). Смена списка имён — certbot certonly --expand вручную.
+---
+- name: Install certbot
+  ansible.builtin.apt:
+    name: certbot
+    state: present
+
+- name: Create certbot hook directory
+  ansible.builtin.file:
+    path: /etc/letsencrypt/renewal-hooks/deploy
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install certbot deploy hook
+  ansible.builtin.copy:
+    dest: /etc/letsencrypt/renewal-hooks/deploy/thepost.sh
+    content: |
+      #!/bin/sh
+      # {{ ansible_managed }}
+      # Копия продлённого сертификата thepost в пути секции tls.
+      set -eu
+      [ "${RENEWED_LINEAGE:-}" = /etc/letsencrypt/live/thepost ] || exit 0
+      install -o root -g thepost -m 0644 "$RENEWED_LINEAGE/fullchain.pem" /etc/thepost/tls/fullchain.pem
+      install -o root -g thepost -m 0640 "$RENEWED_LINEAGE/privkey.pem" /etc/thepost/tls/privkey.pem
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Issue certificate (certbot)
+  ansible.builtin.command:
+    argv: >-
+      {{ ['certbot', 'certonly', '--standalone', '--non-interactive', '--agree-tos',
+          '--email', thepost_acme_email, '--cert-name', 'thepost']
+         + (['--server', thepost_acme_directory_url] if thepost_acme_directory_url | length > 0 else [])
+         + (thepost_tls_names | map('regex_replace', '^', '--domain=') | list) }}
+    creates: /etc/letsencrypt/live/thepost/fullchain.pem
+
+- name: Install certificate of client protocols (certbot)
+  ansible.builtin.copy:
+    src: "/etc/letsencrypt/live/thepost/{{ item.name }}"
+    dest: "/etc/thepost/tls/{{ item.name }}"
+    remote_src: true
+    owner: root
+    group: thepost
+    mode: "{{ item.mode }}"
+  loop:
+    - { name: fullchain.pem, mode: "0644" }
+    - { name: privkey.pem, mode: "0640" }
+  no_log: true

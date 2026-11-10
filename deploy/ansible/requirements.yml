@@ -1,0 +1,8 @@
+# Коллекции Ansible для плейбуков deploy/ansible и deploy/stand:
+#   ansible-galaxy collection install -r deploy/ansible/requirements.yml
+---
+collections:
+  - name: community.crypto
+    version: ">=2.16.0"
+  - name: community.postgresql
+    version: ">=3.4.0"

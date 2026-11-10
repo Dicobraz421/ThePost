@@ -1,0 +1,9 @@
+# {{ ansible_managed }}
+# Milter для thepost (smtp.milter): проверка письма этим же экземпляром Rspamd.
+bind_socket = "{{ rspamd_milter_address }}";
+milter = yes;
+timeout = 120s;
+upstream "local" {
+  default = yes;
+  self_scan = yes;
+}

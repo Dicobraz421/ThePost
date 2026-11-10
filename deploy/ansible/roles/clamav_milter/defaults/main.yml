@@ -1,0 +1,9 @@
+# Роль clamav_milter (опционально, SRS 1.2): антивирус ClamAV через Milter — второй фильтр smtp.milter thepost.
+# Включается в плейбуке smb.yml переменной thepost_clamav: true.
+---
+clamav_milter_address: "127.0.0.1:7357"
+# Действие с заражённым письмом (clamav-milter.conf OnInfected): Reject, Quarantine, Blackhole, Accept.
+clamav_milter_on_infected: Reject
+# Ожидание первой загрузки баз freshclam (без баз clamd не запускается).
+clamav_db_wait_retries: 60
+clamav_db_wait_delay: 10

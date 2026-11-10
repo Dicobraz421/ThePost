@@ -1,0 +1,13 @@
+# Роль thepost_pki: внутренний CA узла SMB для внутренних каналов (PostgreSQL, OpenBao) — только TLS
+# (решение 2026-10-30). Повторный прогон ничего не меняет; новый CA — удалить {{ thepost_pki_dir }}.
+---
+thepost_pki_dir: /etc/thepost/pki
+thepost_pki_ca_common_name: "The Post internal CA ({{ inventory_hostname }})"
+thepost_pki_ca_not_after: "+3650d"
+thepost_pki_cert_not_after: "+825d"
+# Сертификат внутренних служб узла (internal.pem, internal.key): клиенты thepost подключаются к localhost.
+thepost_pki_internal_names:
+  - "DNS:localhost"
+  - "DNS:{{ ansible_fqdn }}"
+  - "IP:127.0.0.1"
+  - "IP:::1"
