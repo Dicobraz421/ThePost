@@ -966,7 +966,7 @@ mod tests {
         let acc = env.account();
         let key = env
             .jmap
-            .put_upload(env.scope.tenant, Bytes::from_static(b"%PDF-1.4 test"))
+            .put_upload(env.scope, Bytes::from_static(b"%PDF-1.4 test"))
             .await
             .expect("upload");
         let blob = crate::blob::upload_id(&key);
@@ -1041,7 +1041,7 @@ mod tests {
         let raw = mail("Imported", "a@x.test", "", "text");
         let key = env
             .jmap
-            .put_upload(env.scope.tenant, Bytes::from(raw.clone()))
+            .put_upload(env.scope, Bytes::from(raw.clone()))
             .await
             .expect("upload");
         let r = env
@@ -1094,7 +1094,7 @@ mod tests {
         let raw = mail("Imported", "a@x.test", "", "text");
         let key = env
             .jmap
-            .put_upload(env.scope.tenant, Bytes::from(raw.clone()))
+            .put_upload(env.scope, Bytes::from(raw.clone()))
             .await
             .expect("upload");
         let r = env
