@@ -22,9 +22,11 @@ Linux или WSL2 с Docker Engine / Docker Desktop, Compose v2. Команды 
    PGPASSWORD=$PW psql "postgres://thepost@localhost:5432/thepost?sslmode=verify-full&sslrootcert=deploy/compose/tls/ca.pem" \
      -c "select rolsuper, rolbypassrls, rolcreaterole from pg_roles where rolname = current_user" -c "create table t(x int); drop table t"
    ```
-   → `f | f | f`; таблица создаётся (роль — владелец БД `thepost`). С неверным паролем — `password authentication failed`.
+   → `f | f | f`; `create table` — `permission denied for schema public` (с DEP-08 владелец схемы — `thepost_owner`).
+   С неверным паролем — `password authentication failed`.
 5. Перезапуск: `docker compose -f $C restart openbao-tls` → через несколько секунд снова healthy, `"sealed":false` без ввода ключей.
-6. Повторный `docker compose -f $C up -d --wait` → `openbao-init-tls`: только «готово»; `postgres-role-tls`: «нового пароля нет».
+6. Повторный `docker compose -f $C up -d --wait` → `openbao-init-tls`: только «готово»; `postgres-role-tls` — `Exited (0)`,
+   пароли не меняются (файлов в томе `pg-bootstrap` нет).
 7. Старый том `tls` без SAN `openbao-tls` (стенд DEP-06): `up` → `tls-init`: «перевыпуск серверного сертификата», CA прежний.
 
 ## Профиль dev

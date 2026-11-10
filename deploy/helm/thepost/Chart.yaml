@@ -1,0 +1,8 @@
+# Чарт узла The Post для Kubernetes (Enterprise-K8s, SRS 1.2): Deployment, ConfigMap с config.yaml, Service,
+# сервисный аккаунт для Kubernetes auth OpenBao. Минимальные привилегии — SRS 2.7, DEP-08 (values.yaml).
+apiVersion: v2
+name: thepost
+description: The Post mail server node
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

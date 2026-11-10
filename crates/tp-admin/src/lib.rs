@@ -8,7 +8,8 @@
 //! - [`groups`] — группы рассылки: ограничения, скрытие из GAL, очередь модерации;
 //! - [`accounts`] — организация, домены, учётные записи, квоты и политики уровней;
 //! - [`retention`] — корзина ящика: список, восстановление, срок по политике, `trash.purge` и скрытые письма;
-//! - [`app_passwords`] — пароли приложений: выпуск (значение один раз), список, отзыв.
+//! - [`app_passwords`] — пароли приложений: выпуск (значение один раз), список, отзыв;
+//! - [`transport`] — настройки транспорта: принятые домены, доверенные источники, политики доменов назначения.
 
 pub mod accounts;
 pub mod app_passwords;
@@ -20,6 +21,7 @@ pub mod retention;
 pub mod server;
 #[cfg(test)]
 mod testenv;
+pub mod transport;
 
 pub use accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
 pub use audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink, LogAudit};

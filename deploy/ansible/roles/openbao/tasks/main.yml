@@ -197,10 +197,14 @@
       if ! bao auth list | grep -q '^approle/'; then bao auth enable approle; changed=yes; fi
       bao write auth/approle/role/thepost token_policies=thepost token_ttl={{ openbao_thepost_token_ttl | quote }} \
         token_max_ttl={{ openbao_thepost_token_max_ttl | quote }} secret_id_ttl=0 secret_id_num_uses=0 >/dev/null
-      if ! bao kv get -mount=thepost db >/dev/null 2>&1; then
-        head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' | bao kv put -mount=thepost db username=thepost password=- >/dev/null
-        changed=yes
-      fi
+      # Пароли учётных записей PostgreSQL (DEP-08): узел, владелец схемы, только чтение — случайные при создании.
+      for s in {% for k, v in openbao_thepost_db_secrets.items() %}{{ (k ~ ':' ~ v) | quote }} {% endfor %}; do
+        if ! bao kv get -mount=thepost "${s%%:*}" >/dev/null 2>&1; then
+          head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' \
+            | bao kv put -mount=thepost "${s%%:*}" username="${s#*:}" password=- >/dev/null
+          changed=yes
+        fi
+      done
       echo "changed=$changed"
     executable: /bin/bash
   environment: "{{ openbao_cli_env }}"
@@ -245,17 +249,21 @@
   environment: "{{ openbao_cli_env }}"
   no_log: true
 
-- name: Read PostgreSQL password of role thepost
-  ansible.builtin.command: bao kv get -mount=thepost -field=password db
+- name: Read PostgreSQL passwords
+  ansible.builtin.command: bao kv get -mount=thepost -field=password {{ item | quote }}
   environment: "{{ openbao_cli_env }}"
-  register: openbao_db_password
+  loop: "{{ openbao_thepost_db_secrets.keys() | list }}"
+  register: openbao_db_passwords
   changed_when: false
   no_log: true
 
-# Для роли PostgreSQL (DEP-05): CREATE ROLE thepost LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD … — владелец БД thepost.
-- name: Expose PostgreSQL password for the PostgreSQL role
+# Для роли PostgreSQL (DEP-05, DEP-08): учётные записи узла, владельца схемы и только чтения.
+- name: Expose PostgreSQL passwords for the PostgreSQL role
   ansible.builtin.set_fact:
-    thepost_db_password: "{{ openbao_db_password.stdout }}"
+    thepost_db_password: "{{ (openbao_db_passwords.results | selectattr('item', 'eq', 'db') | first).stdout }}"
+    thepost_db_owner_password: "{{ (openbao_db_passwords.results | selectattr('item', 'eq', 'db-owner') | first).stdout }}"
+    thepost_db_readonly_password: >-
+      {{ (openbao_db_passwords.results | selectattr('item', 'eq', 'db-readonly') | first).stdout }}
   no_log: true
 
 - name: Warn about unseal key in file

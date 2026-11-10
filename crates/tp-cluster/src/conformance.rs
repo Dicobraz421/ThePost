@@ -1,4 +1,4 @@
-//! Общий набор тестов поведения [`EventBus`]: шина в процессе и Valkey проходят одни и те же проверки.
+//! Общий набор тестов поведения [`EventBus`]: проверки шины в процессе.
 //!
 //! Проверки не полагаются на отсутствие уведомлений по таймауту: «чужое не пришло» проверяется тем,
 //! что первым пришло своё уведомление, опубликованное после чужого.
@@ -10,7 +10,7 @@ use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
 use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, MailboxId, ModSeq, TenantId};
 
-/// Сколько ждать уведомления, прошедшего через внешнюю шину.
+/// Сколько ждать уведомления.
 const WAIT: Duration = Duration::from_secs(5);
 
 pub(crate) fn scope() -> AccountScope {

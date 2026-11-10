@@ -207,20 +207,20 @@
 | [BLOB-13](BLOB-13.md) | сжатие объектов zstd | blob | A | blob-06 | done | META-24 |
 | [MS-12](MS-12.md) | предупреждения о заполнении квоты | mailstore | A | mailstore-07 | done | MS-06 |
 | [MS-13](MS-13.md) | фаззинг разбора MIME | mailstore | A | mailstore-07 | done | MS-11 |
-| [SMTP-12](SMTP-12.md) | экран соединений | smtp | A | smtp-04 | ready | SMTP-01 |
-| [SMTP-13](SMTP-13.md) | адресация: catch-all, подадреса, переписывание | smtp | A | smtp-04 | ready | SMTP-03,AUTH-01 |
-| [SMTP-14](SMTP-14.md) | планировщик исходящей очереди по доменам | smtp | A | smtp-04 | ready | SMTP-06,SMTP-09 |
-| [SMTP-15](SMTP-15.md) | политики по доменам назначения | smtp | A | smtp-04 | ready | SMTP-09,SMTP-10,CTR-24 |
-| [SMTP-16](SMTP-16.md) | проверки до 250: квота, группы рассылки | smtp | A | smtp-05 | todo | SMTP-13,MS-12,META-21 |
-| [SMTP-17](SMTP-17.md) | запись журнала доставки | smtp | A | smtp-05 | todo | SMTP-03,SMTP-09,META-22 |
-| [SMTP-18](SMTP-18.md) | обучение антиспама по перемещению в «Спам» | smtp | A | smtp-05 | todo | SMTP-05 |
-| [SMTP-19](SMTP-19.md) | фаззинг разборщиков SMTP | smtp | A | smtp-05 | todo | SMTP-01 |
+| [SMTP-12](SMTP-12.md) | экран соединений | smtp | A | smtp-04 | done | SMTP-01 |
+| [SMTP-13](SMTP-13.md) | адресация: catch-all, подадреса, переписывание | smtp | A | smtp-04 | done | SMTP-03,AUTH-01 |
+| [SMTP-14](SMTP-14.md) | планировщик исходящей очереди по доменам | smtp | A | smtp-04 | done | SMTP-06,SMTP-09 |
+| [SMTP-15](SMTP-15.md) | политики по доменам назначения | smtp | A | smtp-04 | done | SMTP-09,SMTP-10,CTR-24 |
+| [SMTP-16](SMTP-16.md) | проверки до 250: квота, группы рассылки | smtp | A | smtp-05 | ready | SMTP-13,MS-12,META-21 |
+| [SMTP-17](SMTP-17.md) | запись журнала доставки | smtp | A | smtp-05 | ready | SMTP-03,SMTP-09,META-22 |
+| [SMTP-18](SMTP-18.md) | обучение антиспама по перемещению в «Спам» | smtp | A | smtp-05 | ready | SMTP-05 |
+| [SMTP-19](SMTP-19.md) | фаззинг разборщиков SMTP | smtp | A | smtp-05 | ready | SMTP-01 |
 | [AUTH-07](AUTH-07.md) | группы рассылки из каталога | auth | A | auth-03 | done | AUTH-01,META-21 |
 | [ADM-05](ADM-05.md) | поиск в журнале доставки | admin | A | admin-02 | done | ADM-01,META-22 |
 | [ADM-06](ADM-06.md) | роли оператора и аудитора, экспорт аудита | admin | A | admin-02 | done | ADM-01 |
 | [ADM-07](ADM-07.md) | группы рассылки: модерация и настройки | admin | A | admin-02 | done | ADM-01,META-21 |
 | [IMAP-13](IMAP-13.md) | фаззинг разборщика IMAP | imap | A | imap-04 | done | IMAP-01 |
-| [JMAP-09](JMAP-09.md) | фаззинг разборщика JMAP | jmap | A | jmap-03 | ready | JMAP-01 |
+| [JMAP-09](JMAP-09.md) | фаззинг разборщика JMAP | jmap | A | jmap-03 | done | JMAP-01 |
 | [DEP-08](DEP-08.md) | минимальные привилегии в эталонной поставке | deploy | A | deploy-05 | ready | DEP-02,DEP-07,META-23,PLT-16 |
 
 ## Ф1 · Решение 2026-11-01: взаимодействие компонентов и требования к СУБД
@@ -231,14 +231,14 @@
 | [META-25](META-25.md) | поиск primary и поведение при переключении СУБД | meta | A | meta-09 | done | META-02 |
 | [META-26](META-26.md) | сигналы через LISTEN/NOTIFY | meta | A | meta-10 | done | CTR-23,META-25 |
 | [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-10 | done | CTR-23,META-16 |
-| [CLU-09](CLU-09.md) | удалить шину Valkey | cluster | A | cluster-06 | ready | CTR-23 |
-| [CLU-10](CLU-10.md) | состав кластера и разделы по сигналу | cluster | A | cluster-06 | ready | CTR-23 |
-| [CLU-11](CLU-11.md) | запросы узел → узел (Rpc) | cluster | A | cluster-06 | ready | CTR-23 |
-| [APP-08](APP-08.md) | сборка взаимодействия без опроса | app | A | app-04 | todo | META-26,CLU-09,CLU-10 |
+| [CLU-09](CLU-09.md) | удалить шину Valkey | cluster | A | cluster-06 | done | CTR-23 |
+| [CLU-10](CLU-10.md) | состав кластера и разделы по сигналу | cluster | A | cluster-06 | done | CTR-23 |
+| [CLU-11](CLU-11.md) | запросы узел → узел (Rpc) | cluster | A | cluster-06 | done | CTR-23 |
+| [APP-08](APP-08.md) | сборка взаимодействия без опроса | app | A | app-04 | ready | META-26,CLU-09,CLU-10 |
 | [PLT-17](PLT-17.md) | перечитывание конфигурации и сертификатов по событиям | platform | A | platform-07 | done | PLT-16 |
 | [MS-14](MS-14.md) | истечение корзины по ближайшему сроку | mailstore | A | mailstore-08 | done | MS-13 |
 | [BLOB-14](BLOB-14.md) | GC по ближайшему сроку отсрочки | blob | A | blob-07 | done | BLOB-13 |
-| [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | ready | META-27 |
+| [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | done | META-27 |
 | [CI-05](CI-05.md) | CI без Valkey, проверка отсутствия интерпретаторов | ci | B | ci-04 | todo | CLU-09 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-06 | todo | CLU-09 |
 
@@ -247,13 +247,13 @@
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
 | [CTR-24](CTR-24.md) | контракты настроек транспорта и точка расширения правил потока | contracts | B | contracts-13 | done | CTR-23 |
-| [META-28](META-28.md) | хранение настроек транспорта | meta | A | meta-11 | ready | CTR-24,META-26 |
+| [META-28](META-28.md) | хранение настроек транспорта | meta | A | meta-11 | done | CTR-24,META-26 |
 | [SMTP-20](SMTP-20.md) | доверенные источники: шлюз и приложения | smtp | A | smtp-06 | todo | CTR-24,SMTP-12,SMTP-04 |
 | [SMTP-21](SMTP-21.md) | принятые домены и внутренняя ретрансляция | smtp | A | smtp-06 | todo | CTR-24,SMTP-03,SMTP-09 |
 | [SMTP-22](SMTP-22.md) | точки вызова правил потока почты | smtp | A | smtp-06 | todo | CTR-24,SMTP-05,SMTP-16,SMTP-17 |
 | [SMTP-23](SMTP-23.md) | SRS и ARC-подпись при пересылке | smtp | A | smtp-06 | todo | SMTP-08,SMTP-13 |
 | [ADM-08](ADM-08.md) | Admin API настроек транспорта | admin | A | admin-03 | ready | ADM-01,CTR-24 |
-| [JMAP-10](JMAP-10.md) | правила потока в EmailSubmission | jmap | A | jmap-04 | todo | JMAP-07,CTR-24 |
+| [JMAP-10](JMAP-10.md) | правила потока в EmailSubmission | jmap | A | jmap-04 | done | JMAP-07,CTR-24 |
 | [APP-09](APP-09.md) | сборка настроек транспорта и точки правил потока | app | A | app-05 | todo | META-28,SMTP-22,JMAP-10,ADM-08 |
 
 ## Ф1 · Решение 2026-11-01: масштабирование, шарды, геораспределение, администрирование
@@ -357,19 +357,30 @@
 | [SYS-09](SYS-09.md) | ожидание событий PSI в tp-sys | sys | A | sys-04 | done | PLT-17 |
 | [CTR-37](CTR-37.md) | системный сигнал изменения корзины | contracts | B | contracts-25 | done | CTR-23 |
 | [IMAP-16](IMAP-16.md) | POP3 — блокировка ящика; запись в общие папки по ACL | imap | A | imap-07 | done | IMAP-12,IMAP-10 |
-| [APP-14](APP-14.md) | ACME и переключение СУБД в `serve` | app | A | app-13 | ready | META-25,DEP-05 |
+| [APP-14](APP-14.md) | ACME и переключение СУБД в `serve` | app | A | app-13 | done | META-25,DEP-05 |
 | [CTR-38](CTR-38.md) | контракты GC, владельца загрузки и восстановления скрытых писем | contracts | B | contracts-26 | done | CTR-23 |
 | [SMTP-28](SMTP-28.md) | `Delivery::submit` без очереди — ошибка только для внешних получателей | smtp | A | smtp-09 | done | CMP-04 |
-| [META-36](META-36.md) | `EventBus` для `PgSignalBus`; сигнал `TrashChanged` из PostgreSQL | meta | A | meta-19 | ready | META-26,CTR-37 |
+| [META-36](META-36.md) | `EventBus` для `PgSignalBus`; сигнал `TrashChanged` из PostgreSQL | meta | A | meta-19 | done | META-26,CTR-37 |
 | [MS-18](MS-18.md) | таймер корзины по сигналу `TrashChanged` | mailstore | A | mailstore-11 | ready | MS-14,CTR-37 |
-| [APP-15](APP-15.md) | сведения об узле в `heartbeat` | app | A | app-14 | todo | META-27 |
-| [CTR-39](CTR-39.md) | сигнал при снятии блокировки; пометка Membership | contracts | B | contracts-27 | ready | CTR-23 |
-| [SYS-10](SYS-10.md) | дескрипторы сокетов systemd в `TcpListener` | sys | A | sys-05 | ready | SYS-01 |
+| [APP-15](APP-15.md) | сведения об узле в `heartbeat` | app | A | app-14 | ready | META-27 |
+| [CTR-39](CTR-39.md) | сигнал при снятии блокировки; пометка Membership | contracts | B | contracts-27 | done | CTR-23 |
+| [SYS-10](SYS-10.md) | дескрипторы сокетов systemd в `TcpListener` | sys | A | sys-05 | done | SYS-01 |
 | [APP-16](APP-16.md) | сокеты systemd, политики доменов в очереди, согласование doctor | app | A | app-15 | todo | SYS-10,SMTP-15 |
-| [CTR-40](CTR-40.md) | адресация организации в данных; перенос получателей без попытки | contracts | B | contracts-28 | todo | CTR-24 |
-| [PLT-20](PLT-20.md) | процессный `CryptoProvider` rustls для ACME | platform | A | platform-10 | ready | PLT-11 |
-| [META-38](META-38.md) | `PgMeta` поверх `Failover` — повтор операций при переключении | meta | A | meta-21 | ready | META-25 |
-| [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-20 | ready | CTR-23,META-16 |
+| [CTR-40](CTR-40.md) | адресация организации в данных; перенос получателей без попытки | contracts | B | contracts-28 | ready | CTR-24 |
+| [PLT-20](PLT-20.md) | процессный `CryptoProvider` rustls для ACME | platform | A | platform-10 | done | PLT-11 |
+| [META-38](META-38.md) | `PgMeta` поверх `Failover` — повтор операций при переключении | meta | A | meta-21 | done | META-25 |
+| [META-39](META-39.md) | переписывание адресов, `postpone` и `Unblocked` в PostgreSQL | meta | A | meta-23 | todo | CTR-40,CTR-39 |
+| [META-40](META-40.md) | повтор записей по ключу при переключении СУБД | meta | A | meta-24 | ready | META-38 |
+| [SMTP-29](SMTP-29.md) | переписывание адресов из данных организации; `postpone` в планировщике | smtp | A | smtp-10 | todo | CTR-40,SMTP-13,SMTP-14 |
+| [CLU-12](CLU-12.md) | транспорт Rpc узел → узел (HTTPS/2, mTLS) | cluster | A | cluster-07 | ready | CLU-11 |
+| [CLU-13](CLU-13.md) | `LocalBus` — `Resync` при отставании подписчика | cluster | A | cluster-08 | ready | CLU-09 |
+| [DEP-11](DEP-11.md) | убрать Valkey из стенда разработки | deploy | A | deploy-09 | ready | CLU-09 |
+| [IMAP-17](IMAP-17.md) | IDLE — полная сверка по `Resync` | imap | A | imap-08 | todo | CLU-13 |
+| [JMAP-21](JMAP-21.md) | push — изменение всех типов по `Resync` | jmap | A | jmap-12 | todo | CLU-13 |
+| [SYS-11](SYS-11.md) | проба Landlock без `/sys/kernel/security` | sys | A | sys-06 | ready | SYS-07 |
+| [PLT-21](PLT-21.md) | doctor — проба Landlock; подпись метрики отставания шины | platform | A | platform-11 | todo | SYS-11,CLU-13 |
+| [APP-17](APP-17.md) | подключение журнала доставки, групп, обучения антиспама и защиты от перебора | app | A | app-16 | todo | SMTP-16,SMTP-17,SMTP-18,AUTH-08,APP-16 |
+| [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-20 | done | CTR-23,META-16 |
 
 ## Вне волн
 

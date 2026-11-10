@@ -93,6 +93,11 @@ impl Rendezvous {
             .collect()
     }
 
+    /// Все узлы по убыванию веса для произвольного ключа: владелец, затем следующие при отказе.
+    pub fn ranked_of(&self, key: &[u8]) -> Vec<&str> {
+        self.ranked(key).map(|(_, node)| node).collect()
+    }
+
     /// Узлы по убыванию веса; при равном весе раньше идёт меньшее имя.
     fn ranked(&self, key: &[u8]) -> impl Iterator<Item = (u64, &str)> {
         let mut ranked: Vec<(u64, &str)> = self

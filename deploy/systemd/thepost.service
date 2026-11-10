@@ -1,6 +1,11 @@
-# The Post: юнит systemd для профилей SMB и Enterprise-ВМ (SRS 1.2).
+# The Post: юнит systemd для профилей SMB и Enterprise-ВМ (SRS 1.2; минимальные привилегии — SRS 2.7, 6.8, DEP-08).
 # Установка: deploy/README.md. Локальные отличия — drop-in `systemctl edit thepost`
 # (например, ReadWritePaths= для BLOB-каталога вне /var/lib/thepost).
+#
+# Порты ниже 1024 (25, 465, 587, 143, 993, 443) слушает systemd: юниты thepost-*.socket передают процессу готовые
+# сокеты (LISTEN_FDS, имена — FileDescriptorName=), у процесса нет ни одной capability. Без активации сокетов —
+# drop-in thepost.service.d/bind-capability.conf (CAP_NET_BIND_SERVICE), юниты сокетов не включать.
+# Проверка: systemd-analyze security thepost.service (не хуже 2.0), thepost doctor (privileges_* — Ok).
 
 [Unit]
 Description=The Post mail server
@@ -31,16 +36,19 @@ UMask=0027
 # /run/credentials/thepost.service/openbao-secret-id. С TPM — LoadCredentialEncrypted= (systemd-creds encrypt --with-key=tpm2).
 LoadCredential=openbao-secret-id:/etc/thepost/credentials/openbao-secret-id
 
-# Порты <1024 (25, 465, 587, 143, 993, 80, 443) без root.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Привилегии: ни одной capability (сокеты портов ниже 1024 — от systemd), новые привилегии недоступны,
+# пространство пользователей — своё (в нём только root и thepost).
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
+PrivateUsers=yes
 
-# Изоляция.
+# Изоляция файловой системы и ядра.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+DevicePolicy=closed
 ProtectProc=invisible
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
@@ -48,16 +56,25 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RemoveIPC=yes
+KeyringMode=private
+
+# Сеть: только IP и сокеты Unix; netlink — адреса интерфейсов (getifaddrs).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Системные вызовы: набор служб без привилегированных, отладки, монтирования и смены часов. Профили seccomp
+# и Landlock ролей процесс накладывает сам поверх этого (секция confine, SYS-07). Пул подпроцессов с cgroup
+# (search.extract.sandbox.cgroup_dir) — drop-in с Delegate=yes.
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged
+# Свои профили процесс накладывает сам: seccomp и Landlock (в @system-service их нет).
+SystemCallFilter=seccomp landlock_create_ruleset landlock_add_rule landlock_restrict_self
+SystemCallFilter=~@privileged @debug @mount @clock @cpu-emulation @obsolete @raw-io @reboot @swap @module
 SystemCallErrorNumber=EPERM
 
 [Install]
