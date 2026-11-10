@@ -2,6 +2,10 @@
 {{- $cluster := include "thepost.dbCluster" . }}
 {{- $pooler := include "thepost.dbPooler" . }}
 {{- $db := .Values.cnpg.database }}
+{{- $durability := .Values.cnpg.db_durability | default "required" }}
+{{- if not (has $durability (list "required" "preferred")) }}
+{{- fail (printf "cnpg.db_durability: required или preferred, получено %q" $durability) }}
+{{- end }}
 # PostgreSQL — CloudNativePG (эталон Enterprise-K8s, SRS 3.1; решение 2026-11-01 «Требования к СУБД»): primary и
 # синхронные реплики, автоматическое переключение оператором без второго primary; узел — через службу <кластер>-rw.
 apiVersion: postgresql.cnpg.io/v1
@@ -19,8 +23,10 @@ spec:
   failoverDelay: {{ .Values.cnpg.failoverDelay }}
   switchoverDelay: {{ .Values.cnpg.switchoverDelay }}
   postgresql:
+    # Режим сохранности — cnpg.db_durability (решение #272): required — без синхронной реплики запись ждёт (RPO = 0),
+    # preferred — при потере реплик асинхронно.
     synchronous:
-      {{- toYaml .Values.cnpg.synchronous | nindent 6 }}
+      {{- toYaml (merge (dict "dataDurability" $durability) (omit .Values.cnpg.synchronous "dataDurability")) | nindent 6 }}
     parameters:
       password_encryption: scram-sha-256
       ssl_min_protocol_version: TLSv1.2

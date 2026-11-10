@@ -73,11 +73,15 @@ cnpg:
   # Образ без интерпретаторов (SRS 7.1): minimal — без barman-cloud (Python); резервные копии — отдельным средством.
   imageName: ghcr.io/cloudnative-pg/postgresql:16.9-minimal-bookworm
   database: thepost
-  # Синхронная репликация: фиксация ждёт одну из реплик (ANY 1); required — без реплик запись ждёт, а не теряет RPO.
+  # Режим сохранности (решение владельца #272) → synchronous.dataDurability оператора:
+  #   required  — RPO = 0 всегда: без синхронной реплики фиксация ждёт её возврата (запись стоит, чтение работает);
+  #   preferred — доступность важнее: пока реплика есть — синхронно, без реплик оператор снимает синхронность и
+  #               запись идёт асинхронно (отказ primary в это время теряет последние фиксации).
+  db_durability: required
+  # Синхронная репликация: фиксация ждёт одну из реплик (ANY 1); dataDurability задаёт db_durability.
   synchronous:
     method: any
     number: 1
-    dataDurability: required
   failoverDelay: 0        # с: переключение сразу после отказа primary
   switchoverDelay: 30     # с: остановка primary при плановом переключении
   parameters: {}          # postgresql.conf (shared_buffers и т. п.)

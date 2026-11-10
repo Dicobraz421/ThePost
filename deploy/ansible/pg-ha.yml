@@ -1,6 +1,7 @@
 # Эталон СУБД Enterprise-ВМ (SRS 3.1, APP-D Д.2; решение 2026-11-01 «Требования к СУБД»): PostgreSQL 16 с
 # pg_auto_failover — монитор (группа pgaf_monitor) и узлы данных (группа pgaf_nodes; формация на шард), синхронная
-# реплика (RPO = 0), автоматическое переключение без второго primary (RTO ≤ 30 с), только TLS.
+# реплика (RPO = 0; режим сохранности — db_durability, решение #272), автоматическое переключение без второго
+# primary (RTO ≤ 30 с), только TLS.
 #   ansible-galaxy collection install -r deploy/ansible/requirements.yml
 #   ansible-playbook -i <инвентарь> deploy/ansible/pg-ha.yml --ask-vault-pass
 # Пример инвентаря — deploy/ansible/inventory-ha.example.yml; переменные — defaults ролей pg_auto_failover и postgresql.

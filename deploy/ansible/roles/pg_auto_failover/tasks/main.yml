@@ -26,6 +26,17 @@
     pgaf_is_monitor: "{{ inventory_hostname in groups[pgaf_monitor_group] }}"
     pgaf_monitor_host: "{{ groups[pgaf_monitor_group] | first }}"
 
+# Режим сохранности (решение #272): required — number_sync_standbys ≥ 1 и узел в кворуме синхронной репликации.
+- name: Check durability mode
+  ansible.builtin.assert:
+    that:
+      - db_durability in ['required', 'preferred']
+      - db_durability == 'preferred' or pgaf_is_monitor
+        or (pgaf_number_sync_standbys | int >= 1 and pgaf_replication_quorum | bool)
+    fail_msg: >-
+      db_durability: required или preferred; при required — pgaf_number_sync_standbys ≥ 1 и
+      pgaf_replication_quorum: true (формация из одного узла — db_durability: preferred)
+
 - name: Add PGDG repository
   ansible.builtin.deb822_repository:
     name: pgdg

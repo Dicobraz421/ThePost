@@ -13,6 +13,9 @@ all:
     pgaf_tls_ca_src: pki/ca.pem
     pgaf_tls_cert_src: "pki/{{ inventory_hostname }}.pem"
     pgaf_tls_key_src: "pki/{{ inventory_hostname }}.key"
+    # Режим сохранности (решение #272): required — RPO = 0, без синхронной реплики запись ждёт (по умолчанию);
+    # preferred — при потере всех реплик запись асинхронная (доступность важнее RPO).
+    db_durability: required
     # В vault: pgaf_autoctl_password, pgaf_replicator_password, pgaf_monitor_password,
     #          thepost_db_password, thepost_db_owner_password, thepost_db_readonly_password.
   children:
@@ -26,4 +29,5 @@ all:
         pg3.example.ru:
         pg4.example.ru:
           pgaf_formation: shard2
-          pgaf_number_sync_standbys: 0
+          # Один узел без реплик — синхронно ждать некого (db_durability, решение #272).
+          db_durability: preferred

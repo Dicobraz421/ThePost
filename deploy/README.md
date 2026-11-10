@@ -231,8 +231,8 @@ ansible-playbook -i inventory-ha.yml deploy/ansible/pg-ha.yml --ask-vault-pass
 ```
 Роль `pg_auto_failover`: PostgreSQL 16 и pg_auto_failover из PGDG, кластер Debian `main` не создаётся; `pg_autoctl`
 и `postgres` — бинарные файлы, юнит `pgautofailover.service` (без `pg_wrapper`/`pg_ctlcluster` на Perl). Узлы данных
-ставятся по одному: первый — primary, следующие — реплики; `number_sync_standbys: 1` (фиксация ждёт одну из двух
-реплик). Сроки переключения — `pgaf_monitor_settings`, `pgaf_network_partition_timeout` (RTO ≈ 10 с + 15 с; значения
+ставятся по одному: первый — primary, следующие — реплики; при `db_durability: required` — `number_sync_standbys: 1`
+(фиксация ждёт одну из двух реплик), при `preferred` — `0` (см. «Режим сохранности»). Сроки переключения — `pgaf_monitor_settings`, `pgaf_network_partition_timeout` (RTO ≈ 10 с + 15 с; значения
 pg_auto_failover по умолчанию дают ≈ 50 с). Только TLS (`verify-full`, `pg_hba` — `hostssl`, открытый канал
 отклоняется), служебные пароли — `~postgres/.pgpass`. Учётные записи и БД The Post — на primary, как в эталоне SMB.
 Узел `thepost` (роль `thepost`): `thepost_db_url` — первый узел, `thepost_db_urls` — остальные,
@@ -249,10 +249,27 @@ kubectl -n thepost create secret generic thepost-db-owner --type=kubernetes.io/b
 # так же thepost-db (thepost, thepost/db) и thepost-db-readonly (thepost_readonly, thepost/db-readonly)
 helm install thepost deploy/helm/thepost -n thepost --set cnpg.enabled=true -f <свои значения>
 ```
-Cluster: 3 экземпляра на разных узлах Kubernetes, синхронная репликация `ANY 1` с `dataDurability: required`,
+Cluster: 3 экземпляра на разных узлах Kubernetes, синхронная репликация `ANY 1` с `dataDurability` из
+`cnpg.db_durability` (по умолчанию `required`, см. «Режим сохранности»),
 без суперпользователя, `pg_hba` — только `hostssl`; образ `minimal` (без barman-cloud на Python). Pooler —
 PgBouncer в режиме transaction; чарт сам задаёт `database.url` (Pooler), `pgbouncer: true` и `direct_url` (служба
 primary) и монтирует CA сервера (`<выпуск>-db-ca`, только `ca.crt`).
+
+### Режим сохранности: `db_durability` (решение владельца #272)
+Что делать, если primary остался без синхронной реплики (обе реплики отказали или отрезаны): ждать реплику или писать
+без неё. Переменная — Ansible `db_durability` (роль `pg_auto_failover`, по формации — значение на её узлах данных) и
+Helm `cnpg.db_durability`; по умолчанию `required` на ВМ и в K8s. Пока жива хотя бы одна реплика, оба режима
+одинаковы: фиксация ждёт её подтверждения (RPO = 0), отказ одной из двух реплик запись не останавливает.
+
+| Режим | Без синхронной реплики | RPO | Доступность записи | pg_auto_failover / CloudNativePG |
+|---|---|---|---|---|
+| `required` (по умолчанию) | фиксация ждёт возврата реплики: запись (SMTP, IMAP APPEND, JMAP) — временные отказы, чтение работает | 0 всегда | теряется до возврата реплики | `number_sync_standbys` = `pgaf_number_sync_standbys` (≥ 1, кворум — не меньше значения + 1 реплик), primary не переходит в `wait_primary` / `dataDurability: required` |
+| `preferred` | запись асинхронная, продолжается | 0, пока реплика есть; отказ primary без реплик теряет последние фиксации (письма, принятые с 250) | сохраняется | `number_sync_standbys: 0`: primary переходит в `wait_primary`, `synchronous_standby_names` пуст / `dataDurability: preferred` |
+
+`required` — RPO = 0 по SRS 3.1 ценой остановки записи при двойном отказе; `preferred` — для установок, где простой
+записи хуже потери последних секунд (и для формации из одного узла: роль требует `preferred`, ждать некого).
+Смена режима — повторный прогон `pg-ha.yml` (меняет `number_sync_standbys` формации на мониторе; primary применяет
+через `apply_settings`, без перезапуска) или `helm upgrade` (оператор меняет `synchronous_standby_names`). Проверка обоих режимов — `docs/manual-tests/DEP-09.md`.
 
 ## OpenBao (хранилище секретов)
 Эталонная поставка включает OpenBao (MPL-2.0; подходит и существующий HashiCorp Vault заказчика): хранилище Raft,
