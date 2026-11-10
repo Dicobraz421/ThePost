@@ -95,13 +95,13 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 ## EventBus
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
-LogAppended { partition } | MembersChanged | Blocked { subject } | TransportChanged { tenant } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+LogAppended { partition } | MembersChanged | Blocked { subject } | TransportChanged { tenant } | TrashChanged { account } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
 `MailboxListChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
-`MembersChanged` — с `TenantId::DEFAULT`, `Blocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
+`MembersChanged` — с `TenantId::DEFAULT`, `Blocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
 Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер); in-memory — `MemEventBus` (отставание — `Resync`).
 Доставка — at-most-once; клиент при запуске, после переподключения и по `Resync` сверяется с хранилищем. Публикация — только после фиксации,
-вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`. Набор `suite::signals`.
+вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`. Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
 ## Lease
@@ -339,6 +339,8 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 `set_user_trash_purge(scope, Option<TrashPurge>)` — без `user_can_choose` выбор `Forbidden`, сброс (`None`) разрешён.
 Срок корзины — `PolicyResolver` (`trash_retention`, по умолчанию 30 суток из конфигурации): хранилище вычисляет `expires_at`
 при переносе в корзину; изменение политики действует на элементы, удалённые после него.
+Сигнал `EventKind::TrashChanged { account }` (системный, `retention::trash_changed(scope)`; CTR-37) — после фиксации `MailStore::delete_to_trash`
+и `purge`, если что-то перенесено, скрыто или стёрто; maintenance пересчитывает по нему ближайший срок (`expired`), по `Resync` и при запуске — тоже.
 Истечение: `expired` → `DecisionHooks::before_final_delete` (`FinalDelete::mailbox` = `origin`) → `MessageStore::expunge_final`; `Deny` — `defer`.
 `expunge_final` удаляет только письма, которые всё ещё в корзине; восстановленные между `expired` и `expunge_final` и прочие — пропуск, не ошибка.
 `Quota`: `usage(scope) -> QuotaUsage` (письма, включая корзину, без скрытых; лимит — `PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded`
@@ -426,3 +428,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (источник приложения — организации); точка расширения `transport::{MailFlow, FlowInput, FlowOutcome, FlowVerdict, FlowDirection,
   FlowEnvelope, BlobRef}`, `Registry::set_mail_flow`/`mail_flow`; `EventKind::TransportChanged { tenant }`. In-memory — `MemTransport`
   (`with_bus`); набор `suite::transport_store`. PostgreSQL — `tp-meta` (отдельная карточка).
+- 2026-11-10 — CTR-37 (x/contracts-25): системный сигнал `EventKind::TrashChanged { account }` и `retention::trash_changed(scope)` —
+  после `MailStore::delete_to_trash` и `TrashStore::purge` (таймер истечения корзины в кластере, MS-14). In-memory — `MemTrash::with_bus`
+  (`purge`); набор `suite::signals`. Публикация в `tp-mailstore` (`delete_to_trash`) и `tp-meta` (`purge`) — волны полос.

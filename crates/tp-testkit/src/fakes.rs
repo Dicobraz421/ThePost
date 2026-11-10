@@ -32,6 +32,7 @@ use tp_contracts::auth::{
     Authenticator, Credentials, DirAccount, DirAlias, DirChange, DirCursor, DirDomain, DirGroup,
     DirPage, Directory, Principal,
 };
+use tp_contracts::bus::EventBus;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::ext::{Decision, DecisionHook, DeliveryInfo, FinalDelete, SubmissionInfo};
 use tp_contracts::meta::{AccountScope, AccountStore, MessageStore, PolicyResolver, QuotaUsage};
@@ -39,7 +40,7 @@ use tp_contracts::queue::{
     Claimed, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt, RcptStatus,
 };
 use tp_contracts::retention::{
-    PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashStore,
+    PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashStore, trash_changed,
 };
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslFailure, SaslServer, SaslSession, SaslStep};
 use tp_contracts::search::{
@@ -1087,11 +1088,23 @@ impl QueueStore for MemQueue {
 
 /// [`TrashStore`] поверх [`MemMetadata`]: элементы — письма, перенесённые в корзину `to_trash`
 /// и удалением папки; срок — [`MemMetadata::with_trash_retention`] на момент переноса.
-/// Настройка `trash.purge` для `purge` — из [`MemPolicies`].
-#[derive(Debug, Clone)]
+/// Настройка `trash.purge` для `purge` — из [`MemPolicies`]. С шиной ([`MemTrash::with_bus`]) `purge`
+/// публикует сигнал `TrashChanged`, как реализация `tp-meta`.
+#[derive(Clone)]
 pub struct MemTrash {
     meta: MemMetadata,
     policies: MemPolicies,
+    bus: Option<Arc<dyn EventBus>>,
+}
+
+impl std::fmt::Debug for MemTrash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemTrash")
+            .field("meta", &self.meta)
+            .field("policies", &self.policies)
+            .field("bus", &self.bus.is_some())
+            .finish()
+    }
 }
 
 impl MemTrash {
@@ -1101,7 +1114,14 @@ impl MemTrash {
         Self {
             meta: meta.clone(),
             policies: MemPolicies::new(meta),
+            bus: None,
         }
+    }
+
+    /// Публиковать `TrashChanged` в `bus` после `purge`, изменившего корзину.
+    pub fn with_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
+        self.bus = Some(bus);
+        self
     }
 
     /// Настройка `trash.purge` — из `policies`.
@@ -1244,7 +1264,14 @@ impl TrashStore for MemTrash {
                 hide.push(*id);
             }
         }
-        self.meta.purge_trash(scope, &hide, &erase)
+        let out = self.meta.purge_trash(scope, &hide, &erase)?;
+        if let Some(bus) = &self.bus
+            && !(out.hidden.is_empty() && out.erased.is_empty())
+        {
+            // Сигнал после «фиксации»; потеря сигнала не отменяет очистку.
+            let _ = bus.publish(trash_changed(scope)).await;
+        }
+        Ok(out)
     }
 
     async fn expired(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<TrashItem>> {
@@ -2107,6 +2134,39 @@ mod tests {
             Err(Error::NotFound)
         );
         assert_eq!(trash.list(s, 0, 10).await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn purge_publishes_trash_changed() {
+        use futures::StreamExt;
+        use tp_contracts::bus::EventKind;
+
+        let meta = MemMetadata::new(ManualClock::default().shared());
+        let s = meta.account("user@example.com").await.expect("account");
+        let inbox = meta.mailbox_by_role(s, SpecialUse::Inbox).expect("inbox");
+        let m = meta
+            .insert(s, inbox, new_message(1, 10))
+            .await
+            .expect("m")
+            .id;
+        meta.to_trash(s, &[m]).await.expect("to trash");
+        let bus = crate::MemEventBus::default();
+        let mut sys = bus.subscribe_system().await.expect("subscribe");
+        let trash = MemTrash::new(&meta).with_bus(Arc::new(bus.clone()));
+        let hooks = DecisionHooks::default();
+
+        // Ничего не изменено — без сигнала; первым приходит сигнал изменившей очистки.
+        trash
+            .purge(s, &[MessageId::new()], &hooks)
+            .await
+            .expect("noop");
+        assert_eq!(
+            trash.purge(s, &[m], &hooks).await.expect("hide").hidden,
+            [m]
+        );
+        let ev = sys.next().await.expect("signal");
+        assert_eq!(ev, trash_changed(s));
+        assert_eq!(ev.kind, EventKind::TrashChanged { account: s.account });
     }
 
     #[tokio::test]
