@@ -7,7 +7,7 @@
 //!   SearchSnippet/get (RFC 8621 §5);
 //! - `email_set` — Email/set (черновики, keywords, mailboxIds, удаление в корзину), Email/import, Email/copy (§4.6–4.8);
 //! - `blob` — загрузка и скачивание blob, Blob/copy (RFC 8620 §6);
-//! - [`submission`] — Identity/get, set и EmailSubmission/get, set → очередь [`Outbound`] (RFC 8621 §6–7);
+//! - [`submission`] — Identity/get, set и EmailSubmission/get, set, query, queryChanges → очередь [`Outbound`] (RFC 8621 §6–7);
 //! - `push` — EventSource и WebSocket (RFC 8620 §7, RFC 8887) по шине уведомлений;
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
@@ -56,6 +56,8 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("Identity/set", SUBMISSION),
     ("EmailSubmission/get", SUBMISSION),
     ("EmailSubmission/set", SUBMISSION),
+    ("EmailSubmission/query", SUBMISSION),
+    ("EmailSubmission/queryChanges", SUBMISSION),
     ("UserSettings/get", SETTINGS),
     ("UserSettings/set", SETTINGS),
 ];
@@ -91,6 +93,8 @@ pub(crate) async fn call_builtin(
         "Identity/set" => submission::identity_set(ctx, args).await,
         "EmailSubmission/get" => submission::submission_get(ctx, args).await,
         "EmailSubmission/set" => submission::submission_set(ctx, args).await,
+        "EmailSubmission/query" => submission::submission_query(ctx, args).await,
+        "EmailSubmission/queryChanges" => submission::submission_query_changes(ctx, args).await,
         "UserSettings/get" => settings::get(ctx, args).await,
         "UserSettings/set" => settings::set(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
