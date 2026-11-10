@@ -157,7 +157,11 @@ pub trait MailStore: Send + Sync + 'static {
     /// [`trash_changed`](crate::retention::trash_changed).
     async fn delete_to_trash(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq>;
 
-    /// Восстанавливает письма из корзины в исходные папки.
+    /// Восстанавливает письма из корзины в исходные папки (папки нет — во «Входящие»; прежний `MessageId`, новый UID),
+    /// в том числе скрытые «Очистить корзину» (`trash.purge: hide`; CTR-38): Admin API восстанавливает через этот
+    /// метод, а не через `TrashStore::restore`, чтобы клиенты получили уведомление. После фиксации — сигналы
+    /// `MailboxChanged` папок назначения (и корзины, если восстановлены видимые в ней письма).
+    /// Письмо не в корзине и не скрыто — `Error::Invalid`.
     async fn restore(&self, scope: AccountScope, ids: &[MessageId]) -> Result<Vec<Inserted>>;
 }
 
