@@ -191,7 +191,9 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let service = (*cfg.section::<ServiceHttpConfig>("service_http")?).clone();
     let tls = cfg.section::<TlsConfig>("tls")?;
     let bound = Bound::default();
-    let acme = acme::prepare(&cfg, &bound, aux.clone()).await?;
+    // Сокеты от systemd (активация сокетов) — до открытия любых слушателей.
+    let sockets = Sockets::adopt(&cfg, bound.clone())?;
+    let acme = acme::prepare(&cfg, &sockets, aux.clone()).await?;
     // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
     let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
         let certs = Arc::new(TlsCerts::load(&tls).await.map_err(|e| {
@@ -283,8 +285,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         metrics: &metrics,
         ext: &ext,
         certs: certs.clone(),
-        sockets: Sockets::new(bound.clone()),
-        bound: bound.clone(),
+        sockets: sockets.clone(),
         updates: reloader.subscribe(),
         events,
         events_poll: cluster.events_poll_interval,
@@ -306,7 +307,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     drop(services);
 
     let health = Health::default();
-    let listener = service_http::bind(&service)?;
+    sockets.warn_unused(&listen_addrs(&cfg));
+    let listener = sockets.take_or(service.listen, || service_http::bind(&service))?;
     let service_addr = listener
         .local_addr()
         .map_err(|e| Error::Internal(format!("service_http: {e}")))?;
@@ -388,7 +390,6 @@ struct RoleSetup<'a> {
     ext: &'a tp_contracts::ext::Registry,
     certs: Option<Arc<TlsCerts>>,
     sockets: Sockets,
-    bound: Bound,
     updates: tokio::sync::watch::Receiver<Arc<Config>>,
     events: EventConsumer,
     events_poll: Duration,
@@ -441,13 +442,17 @@ impl RoleSetup<'_> {
                     http.jmap.clone(),
                     profile,
                     self.certs.clone(),
-                    self.bound.clone(),
+                    self.sockets.clone(),
                 )
                 .on_stop(Arc::new(move || stop.shutdown()));
                 (Arc::new(service), fixed_config(()))
             }
             Role::Admin => {
-                let cfg = (*self.cfg.section::<tp_admin::AdminConfig>(sections::ADMIN)?).clone();
+                let cfg = self
+                    .cfg
+                    .section::<sections::AdminSection>(sections::ADMIN)?
+                    .0
+                    .clone();
                 let admin = Arc::new(self.services.admin(self.ext, cfg)?);
                 let service = HttpRole::new(
                     role,
@@ -455,7 +460,7 @@ impl RoleSetup<'_> {
                     http.admin.clone(),
                     profile,
                     self.certs.clone(),
-                    self.bound.clone(),
+                    self.sockets.clone(),
                 );
                 (Arc::new(service), fixed_config(()))
             }
@@ -534,6 +539,48 @@ async fn heartbeat(
             tracing::warn!(error = %e, "запись узла в членстве не продлена");
         }
     }
+}
+
+/// Адреса слушателей узла по конфигурации: служебный HTTP, HTTP-01 (`acme.enabled`) и слушатели включённых ролей
+/// (smtp-in, submission, imap и POP3, jmap, admin) — для проверки сокетов systemd ([`Sockets::warn_unused`]).
+fn listen_addrs(cfg: &Config) -> Vec<SocketAddr> {
+    let roles = cfg.roles();
+    let mut out = Vec::new();
+    if let Ok(s) = cfg.section::<ServiceHttpConfig>("service_http") {
+        out.push(s.listen);
+    }
+    if let Ok(http) = cfg.section::<HttpSection>(sections::HTTP) {
+        if cfg
+            .section::<tp_platform::AcmeConfig>("acme")
+            .is_ok_and(|a| a.enabled)
+        {
+            out.push(http.acme.listen);
+        }
+        for (role, l) in [(Role::Jmap, &http.jmap), (Role::Admin, &http.admin)] {
+            if let Some(l) = l.as_ref().filter(|_| roles.contains(role)) {
+                out.push(l.listen);
+            }
+        }
+    }
+    if let Ok(smtp) = cfg.section::<SmtpConfig>(sections::SMTP) {
+        for (role, eps) in [
+            (Role::SmtpIn, &smtp.inbound),
+            (Role::Submission, &smtp.submission),
+        ] {
+            if roles.contains(role) {
+                out.extend(eps.iter().map(|e| e.listen));
+            }
+        }
+    }
+    if roles.contains(Role::Imap)
+        && let Ok(imap) = cfg.section::<tp_imap::ImapConfig>(sections::IMAP)
+    {
+        out.extend(imap.listeners.iter().map(|e| e.listen));
+        if imap.pop3.enabled {
+            out.extend(imap.pop3.listeners.iter().map(|e| e.listen));
+        }
+    }
+    out
 }
 
 /// Новый уровень логов из перечитанной секции `telemetry`.

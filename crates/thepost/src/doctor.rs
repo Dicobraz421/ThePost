@@ -213,13 +213,17 @@ pub async fn run_with(
     for w in cfg.warnings() {
         report.push("config.unknown", Status::Warn, "", w.clone());
     }
-    check(&cfg, store, dns, &mut report).await;
+    let text = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    let confine = crate::startup::has_section(&text, tp_platform::privileges::CONFINE);
+    check(&cfg, confine, store, dns, &mut report).await;
     report
 }
 
-/// Проверки по разобранной конфигурации; `dns` — резолвер (`None` — системный).
+/// Проверки по разобранной конфигурации; `confine` — в файле есть секция `confine` (нет — seccomp в режиме `log`,
+/// как при запуске `serve`); `dns` — резолвер (`None` — системный).
 pub async fn check(
     cfg: &Config,
+    confine: bool,
     store: Option<Arc<dyn SecretStore>>,
     dns: Option<&dyn Dns>,
     report: &mut Report,
@@ -234,7 +238,12 @@ pub async fn check(
         report.push(&id, c.status.into(), c.value, c.message);
     }
     // Привилегии процесса (PLT-16): `privileges_user` → `privileges.user` и т. д.
-    for c in tp_platform::privileges::doctor(cfg).await.checks {
+    // TODO(SYS): Landlock проверяется по /sys/kernel/security/lsm, которого нет в контейнерах; проба
+    // `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` требует функции tp-sys (APP-16).
+    for mut c in tp_platform::privileges::doctor(cfg).await.checks {
+        if !confine {
+            seccomp_as_serve(&mut c);
+        }
         let id = c.id.replacen('_', ".", 1);
         report.push(&id, c.status.into(), c.value, c.message);
     }
@@ -280,6 +289,22 @@ pub async fn check(
         ),
     }
     doctor_dns::check_with(cfg, dns, &doctor, report).await;
+}
+
+/// Режим seccomp без секции `confine` — `log`, как при запуске `serve` (`startup::confine`): проверка
+/// `privileges_seccomp` по умолчанию секции (`enforce`) так не показывала бы итог запуска.
+fn seccomp_as_serve(c: &mut tp_platform::secrets::DoctorCheck) {
+    use tp_platform::secrets::DoctorStatus;
+    if c.id != "privileges_seccomp" || c.value != "enforce" {
+        return;
+    }
+    c.value = "log".to_owned();
+    if c.status == DoctorStatus::Ok {
+        c.status = DoctorStatus::Warn;
+        c.message = "секции confine нет: режим журнала, как при запуске — вызовы вне профиля не блокируются \
+                     (confine.seccomp: enforce — блокировать)"
+            .to_owned();
+    }
 }
 
 fn blob_kind(cfg: &Config) -> String {
@@ -464,6 +489,60 @@ mod tests {
         assert_eq!(skew_status(Duration::from_millis(10), &d).0, Status::Ok);
         assert_eq!(skew_status(Duration::from_secs(1), &d).0, Status::Warn);
         assert_eq!(skew_status(Duration::from_secs(60), &d).0, Status::Fail);
+    }
+
+    /// Без секции `confine` проверка seccomp показывает режим запуска `serve` — `log`.
+    #[test]
+    fn seccomp_without_confine_section_is_log() {
+        use tp_platform::secrets::{DoctorCheck, DoctorStatus};
+        let check = |id: &'static str, status, value: &str| DoctorCheck {
+            id,
+            status,
+            value: value.to_owned(),
+            message: "m".to_owned(),
+        };
+        let mut ok = check("privileges_seccomp", DoctorStatus::Ok, "enforce");
+        seccomp_as_serve(&mut ok);
+        assert_eq!((ok.status, ok.value.as_str()), (DoctorStatus::Warn, "log"));
+        assert!(ok.message.contains("confine"), "{}", ok.message);
+        let mut no_kernel = check("privileges_seccomp", DoctorStatus::Fail, "enforce");
+        seccomp_as_serve(&mut no_kernel);
+        assert_eq!(
+            (
+                no_kernel.status,
+                no_kernel.value.as_str(),
+                no_kernel.message.as_str()
+            ),
+            (DoctorStatus::Fail, "log", "m")
+        );
+        for mut same in [
+            check("privileges_seccomp", DoctorStatus::Warn, "off"),
+            check("privileges_landlock", DoctorStatus::Ok, "enforce"),
+        ] {
+            let before = same.clone();
+            seccomp_as_serve(&mut same);
+            assert_eq!(same, before);
+        }
+    }
+
+    /// `thepost doctor` без секции `confine` и с ней: режим seccomp — как у `serve` (Linux).
+    #[tokio::test]
+    async fn doctor_seccomp_mode_follows_serve() {
+        if !Path::new("/proc/self/status").exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = "domain: example.org\nprofile: dev\ndatabase:\n  url: postgres://thepost@127.0.0.1:1/thepost?sslmode=disable\n  acquire_timeout: 1s\n  tls: { allow_plaintext: true }\nblob:\n  url: file:///nonexistent/blob\n";
+        let dns = crate::doctor_dns::MockDns::default();
+        for (extra, mode) in [("", "log"), ("confine:\n  seccomp: enforce\n", "enforce")] {
+            let path = write_config(dir.path(), &format!("{base}{extra}"));
+            let report = run_with(&path, None, Some(&dns)).await;
+            assert_eq!(
+                report.get("privileges.seccomp").map(|c| c.value.as_str()),
+                Some(mode),
+                "{report:?}"
+            );
+        }
     }
 
     fn write_config(dir: &Path, yaml: &str) -> std::path::PathBuf {
