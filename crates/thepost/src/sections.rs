@@ -363,11 +363,13 @@ impl AuthSection {
 
 /// Секция `http`: слушатели HTTP ролей jmap и admin (TLS — секция `tls`; открытый HTTP — только `profile: dev`
 /// с `allow_plaintext`). Слушатель не задан — роль готова, но соединений не принимает. Требует перезапуска.
+/// `acme` — открытый HTTP для проверок ACME HTTP-01 (только при `acme.enabled`, APP-14).
 ///
 /// ```yaml
 /// http:
 ///   jmap: { listen: 0.0.0.0:443 }
 ///   admin: { listen: 127.0.0.1:8443 }
+///   acme: { listen: 0.0.0.0:80 }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -376,6 +378,24 @@ pub struct HttpSection {
     pub jmap: Option<HttpListener>,
     /// Admin API (`/api/*`); адрес — только внутренний (loopback, частные сети).
     pub admin: Option<HttpListener>,
+    /// Проверки ACME HTTP-01 (`/.well-known/acme-challenge/*`, остальное — 404) при `acme.enabled`.
+    pub acme: AcmeListener,
+}
+
+/// Слушатель проверок ACME HTTP-01: открытый HTTP (сервер ACME обращается на порт 80, RFC 8555 §8.3).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AcmeListener {
+    /// Адрес и порт.
+    pub listen: SocketAddr,
+}
+
+impl Default for AcmeListener {
+    fn default() -> Self {
+        Self {
+            listen: SocketAddr::from(([0, 0, 0, 0], 80)),
+        }
+    }
 }
 
 /// Слушатель HTTP роли.

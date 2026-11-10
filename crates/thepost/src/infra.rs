@@ -11,6 +11,7 @@ use tp_contracts::bus::EventBus;
 use tp_contracts::membership::NodeId;
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
+use tp_meta::failover::{self, Failover};
 use tp_meta::pool::{self, PoolConfig};
 use tp_platform::{BusSample, Config};
 
@@ -35,11 +36,13 @@ pub async fn connect_db(cfg: &Config, store: &dyn SecretStore) -> Result<PgPool>
         .map_err(|e| context("database", e))
 }
 
-/// Пул PostgreSQL узла (`serve`): с `database.dynamic_credentials` аренда учётных данных продлевается, при
-/// отказе — новые учётные данные для новых соединений (META-18).
-pub async fn connect_node_db(cfg: &Config, store: Arc<dyn SecretStore>) -> Result<PgPool> {
+/// Пул PostgreSQL узла (`serve`) с поиском primary по `database.url` + `database.urls` и повтором при
+/// переключении СУБД (META-25, `database.failover`); с `database.dynamic_credentials` аренда учётных данных
+/// продлевается, при отказе — новые учётные данные для новых соединений (META-18). Primary не найден за
+/// `database.failover.retry_for` — `Unavailable`. Метрики переключения — [`crate::metrics::register_failover`].
+pub async fn connect_node_db(cfg: &Config, store: Arc<dyn SecretStore>) -> Result<Failover> {
     let db = pool_config(cfg)?;
-    pool::connect_rotating(&db, store)
+    failover::connect_failover(&db, store)
         .await
         .map_err(|e| context("database", e))
 }
@@ -197,6 +200,64 @@ mod tests {
         assert!(bus.counters.snapshot().connected);
         assert!(bus_sample(bus.counters.snapshot()).connected);
         assert_eq!(node_id(&cfg).expect("node").as_str(), "node-a");
+    }
+
+    /// Пул узла — `connect_failover`: ни один адрес `url` + `urls` не принимает соединений — `Unavailable` за
+    /// `database.failover.retry_for`, без зависания.
+    #[tokio::test]
+    async fn node_db_without_primary_is_unavailable() {
+        let cfg = config(
+            "domain: example.org\nprofile: dev\ndatabase:\n  url: postgres://x@127.0.0.1:1/z?sslmode=disable\n  \
+             urls: [postgres://x@127.0.0.1:2/z]\n  tls: { allow_plaintext: true }\n  \
+             failover: { retry_initial: 10ms, retry_max: 20ms, retry_for: 100ms, probe_timeout: 200ms }\n\
+             blob:\n  url: file:///tmp/b\n",
+        );
+        let none: Arc<dyn SecretStore> = Arc::new(crate::secrets::NoSecretStore);
+        let started = std::time::Instant::now();
+        let e = connect_node_db(&cfg, none).await.expect_err("no primary");
+        assert!(matches!(e, Error::Unavailable { .. }), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// Пул узла на `connect_failover` против PostgreSQL: primary выбран (`url`), метрики в `/metrics` — без
+    /// переключений.
+    #[tokio::test]
+    async fn node_db_failover_pool() {
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let (url, password) = crate::testutil::split_password(&crate::testutil::dev_url(&url));
+        let mem = tp_testkit::MemSecretStore::default();
+        mem.set(
+            &"thepost/db#password".parse().expect("ref"),
+            password.unwrap_or_else(|| "unused".to_owned()),
+        );
+        let cfg = config(&format!(
+            "domain: example.org\nprofile: dev\ndatabase:\n  url: \"{url}\"\n  urls: [\"{url}\"]\n  \
+             password: {{ secret: \"thepost/db#password\" }}\n  tls: {{ allow_plaintext: true }}\n\
+             blob:\n  url: file:///tmp/b\n"
+        ));
+        let db = connect_node_db(&cfg, Arc::new(mem)).await.expect("pool");
+        let one: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(db.pool())
+            .await
+            .expect("select");
+        assert_eq!(one, 1);
+        let m = db.metrics();
+        assert_eq!((m.switches, m.primary, m.switching), (0, 0, false));
+        let metrics = tp_platform::Metrics::default();
+        crate::metrics::register_failover(&metrics, db.clone());
+        let text = metrics.encode().expect("encode");
+        for line in [
+            "tp_db_failover_switches_total 0",
+            "tp_db_failover_switching 0",
+            "tp_db_failover_primary 0",
+            "tp_db_failover_last_switch_seconds 0",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        db.pool().close().await;
     }
 
     #[tokio::test]
