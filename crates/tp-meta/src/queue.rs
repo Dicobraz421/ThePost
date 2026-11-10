@@ -165,6 +165,7 @@ async fn settle(tx: &mut PgConnection, id: QueueId) -> Result<bool> {
 #[async_trait]
 impl QueueStore for PgMeta {
     async fn enqueue(&self, msg: OutMessage) -> Result<QueueId> {
+        self.once(async move {
         if msg.rcpts.is_empty() {
             return Err(Error::invalid("письмо в очередь без получателей"));
         }
@@ -213,6 +214,7 @@ impl QueueStore for PgMeta {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(id)
+}).await
     }
 
     async fn claim(
@@ -221,6 +223,7 @@ impl QueueStore for PgMeta {
         limit: usize,
         lease: Duration,
     ) -> Result<Vec<Claimed>> {
+        self.once(async move {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -281,21 +284,26 @@ impl QueueStore for PgMeta {
                 e.into_claimed(list)
             })
             .collect()
+}).await
     }
 
     async fn renew(&self, claim: &QueueClaim, until: OffsetDateTime) -> Result<()> {
-        let mut tx = begin_system(&self.pool).await?;
-        let n =
-            sqlx::query("UPDATE queue SET lease_until = $3 WHERE queue_id = $1 AND fencing = $2")
-                .bind(claim.id.as_uuid())
-                .bind(to_i64(claim.fencing)?)
-                .bind(until)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?
-                .rows_affected();
-        tx.commit().await.map_err(db_err)?;
-        if n == 1 { Ok(()) } else { Err(Error::Conflict) }
+        self.once(async move {
+            let mut tx = begin_system(&self.pool).await?;
+            let n = sqlx::query(
+                "UPDATE queue SET lease_until = $3 WHERE queue_id = $1 AND fencing = $2",
+            )
+            .bind(claim.id.as_uuid())
+            .bind(to_i64(claim.fencing)?)
+            .bind(until)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            tx.commit().await.map_err(db_err)?;
+            if n == 1 { Ok(()) } else { Err(Error::Conflict) }
+        })
+        .await
     }
 
     async fn reschedule(
@@ -305,53 +313,59 @@ impl QueueStore for PgMeta {
         at: OffsetDateTime,
         reason: &str,
     ) -> Result<()> {
-        let mut tx = begin_system(&self.pool).await?;
-        lock_claim(&mut tx, claim).await?;
-        let n = sqlx::query(
-            "UPDATE queue_rcpts SET next_attempt = $3, attempts = attempts + 1, last_error = $4
+        self.once(async move {
+            let mut tx = begin_system(&self.pool).await?;
+            lock_claim(&mut tx, claim).await?;
+            let n = sqlx::query(
+                "UPDATE queue_rcpts SET next_attempt = $3, attempts = attempts + 1, last_error = $4
              WHERE queue_id = $1 AND address = $2 AND status = 'pending'",
-        )
-        .bind(claim.id.as_uuid())
-        .bind(rcpt)
-        .bind(at)
-        .bind(reason)
-        .execute(&mut *tx)
+            )
+            .bind(claim.id.as_uuid())
+            .bind(rcpt)
+            .bind(at)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            if n != 1 {
+                return Err(Error::NotFound);
+            }
+            settle(&mut tx, claim.id).await?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(())
+        })
         .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n != 1 {
-            return Err(Error::NotFound);
-        }
-        settle(&mut tx, claim.id).await?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(())
     }
 
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
-        let (state, reply) = match &status {
-            RcptStatus::Delivered { reply } => ("delivered", reply),
-            RcptStatus::Failed { reply } => ("failed", reply),
-        };
-        let mut tx = begin_system(&self.pool).await?;
-        lock_claim(&mut tx, claim).await?;
-        let n = sqlx::query(
-            "UPDATE queue_rcpts SET status = $3, reply = $4
+        self.once(async move {
+            let (state, reply) = match &status {
+                RcptStatus::Delivered { reply } => ("delivered", reply),
+                RcptStatus::Failed { reply } => ("failed", reply),
+            };
+            let mut tx = begin_system(&self.pool).await?;
+            lock_claim(&mut tx, claim).await?;
+            let n = sqlx::query(
+                "UPDATE queue_rcpts SET status = $3, reply = $4
              WHERE queue_id = $1 AND address = $2 AND status = 'pending'",
-        )
-        .bind(claim.id.as_uuid())
-        .bind(rcpt)
-        .bind(state)
-        .bind(reply)
-        .execute(&mut *tx)
+            )
+            .bind(claim.id.as_uuid())
+            .bind(rcpt)
+            .bind(state)
+            .bind(reply)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            if n != 1 {
+                return Err(Error::NotFound);
+            }
+            let pending = settle(&mut tx, claim.id).await?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(!pending)
+        })
         .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n != 1 {
-            return Err(Error::NotFound);
-        }
-        let pending = settle(&mut tx, claim.id).await?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(!pending)
     }
 }
 

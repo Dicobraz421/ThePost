@@ -74,18 +74,21 @@ fn expected_arg(v: u64) -> Result<i64> {
 #[async_trait]
 impl IndexManifestStore for PgMeta {
     async fn get_manifest(&self, scope: AccountScope) -> Result<IndexManifest> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let row: Option<ManifestRow> = sqlx::query_as(
-            "SELECT version, schema_version, segments, rebuild_requested_at, rebuild_reason
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let row: Option<ManifestRow> = sqlx::query_as(
+                "SELECT version, schema_version, segments, rebuild_requested_at, rebuild_reason
              FROM index_manifests WHERE tenant_id = $1 AND account_id = $2",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .fetch_optional(&mut *tx)
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            row.map_or(Ok(IndexManifest::default()), IndexManifest::try_from)
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        row.map_or(Ok(IndexManifest::default()), IndexManifest::try_from)
     }
 
     async fn put_manifest(
@@ -94,6 +97,7 @@ impl IndexManifestStore for PgMeta {
         expected: u64,
         update: ManifestUpdate,
     ) -> Result<u64> {
+        self.once(async move {
         let segments = Json(&update.segments);
         let schema = i64::from(update.schema);
         let mut tx = begin(&self.pool, scope.tenant).await?;
@@ -133,12 +137,14 @@ impl IndexManifestStore for PgMeta {
         let version = version.ok_or(Error::Conflict)?;
         tx.commit().await.map_err(db_err)?;
         to_u64(version)
+}).await
     }
 
     async fn request_rebuild(&self, scope: AccountScope, request: RebuildRequest) -> Result<u64> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let version: i64 = sqlx::query_scalar(
-            "INSERT INTO index_manifests (tenant_id, account_id, version, schema_version,
+        self.once(async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let version: i64 = sqlx::query_scalar(
+                "INSERT INTO index_manifests (tenant_id, account_id, version, schema_version,
                                           rebuild_requested_at, rebuild_reason)
              VALUES ($1, $2, 1, 0, $3, $4)
              ON CONFLICT (tenant_id, account_id) DO UPDATE SET
@@ -147,40 +153,45 @@ impl IndexManifestStore for PgMeta {
                  rebuild_reason = EXCLUDED.rebuild_reason,
                  updated_at = now()
              RETURNING version",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(request.requested_at)
-        .bind(reason_str(request.reason))
-        .fetch_one(&mut *tx)
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(request.requested_at)
+            .bind(reason_str(request.reason))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            to_u64(version)
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        to_u64(version)
     }
 
     async fn pending_rebuilds(&self, schema: u32, limit: usize) -> Result<Vec<AccountScope>> {
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut tx = begin_system(&self.pool).await?;
-        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
-            "SELECT tenant_id, account_id FROM index_manifests
+        self.idempotent(|| async move {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut tx = begin_system(&self.pool).await?;
+            let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+                "SELECT tenant_id, account_id FROM index_manifests
              WHERE rebuild_requested_at IS NOT NULL OR schema_version < $1
              ORDER BY rebuild_requested_at NULLS LAST, updated_at, tenant_id, account_id
              LIMIT $2",
-        )
-        .bind(i64::from(schema))
-        .bind(limit)
-        .fetch_all(&mut *tx)
+            )
+            .bind(i64::from(schema))
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(rows
+                .into_iter()
+                .map(|(t, a)| AccountScope {
+                    tenant: TenantId::from_uuid(t),
+                    account: AccountId::from_uuid(a),
+                })
+                .collect())
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|(t, a)| AccountScope {
-                tenant: TenantId::from_uuid(t),
-                account: AccountId::from_uuid(a),
-            })
-            .collect())
     }
 }
 

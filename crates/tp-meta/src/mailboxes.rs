@@ -393,44 +393,53 @@ pub(crate) async fn touch(
 #[async_trait]
 impl MailboxStore for PgMeta {
     async fn list(&self, scope: AccountScope) -> Result<Vec<Mailbox>> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let mut rows = select_all(&mut tx, scope).await?;
-        // Первое открытие ящика без части системных папок (запись заведена в базе, вход без `upsert`).
-        let created = !missing_rows(&rows)?.is_empty()
-            && ensure_system(&mut tx, scope, self.cfg.event_partitions).await? > 0;
-        if created {
-            rows = select_all(&mut tx, scope).await?;
-        }
-        tx.commit().await.map_err(db_err)?;
-        if created {
-            self.signal_log([scope.account]).await;
-        }
-        rows.into_iter().map(MailboxRow::into_mailbox).collect()
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut rows = select_all(&mut tx, scope).await?;
+            // Первое открытие ящика без части системных папок (запись заведена в базе, вход без `upsert`).
+            let created = !missing_rows(&rows)?.is_empty()
+                && ensure_system(&mut tx, scope, self.cfg.event_partitions).await? > 0;
+            if created {
+                rows = select_all(&mut tx, scope).await?;
+            }
+            tx.commit().await.map_err(db_err)?;
+            if created {
+                self.signal_log([scope.account]).await;
+            }
+            rows.into_iter().map(MailboxRow::into_mailbox).collect()
+        })
+        .await
     }
 
     async fn get(&self, scope: AccountScope, id: MailboxId) -> Result<Option<Mailbox>> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let mb = fetch(&mut tx, scope, id, false).await?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(mb)
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mb = fetch(&mut tx, scope, id, false).await?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(mb)
+        })
+        .await
     }
 
     async fn create(&self, scope: AccountScope, data: NewMailbox) -> Result<Mailbox> {
-        check_name(&data.name)?;
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        if let Some(parent) = data.parent {
-            fetch(&mut tx, scope, parent, false)
-                .await?
-                .ok_or(Error::NotFound)?;
-        }
-        let mb = insert(&mut tx, scope, &data, ms).await?;
-        changelog::log(&mut tx, scope, ms, &[Change::mailbox(mb.id, Op::Created)]).await?;
-        let ev = changelog::event(scope, Some(mb.id), CoreEventKind::MailboxCreated);
-        changelog::append_events(&mut tx, self.cfg.event_partitions, &[ev]).await?;
-        tx.commit().await.map_err(db_err)?;
-        self.signal_log([scope.account]).await;
-        Ok(mb)
+        self.once(async move {
+            check_name(&data.name)?;
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let ms = changelog::bump_modseq(&mut tx, scope).await?;
+            if let Some(parent) = data.parent {
+                fetch(&mut tx, scope, parent, false)
+                    .await?
+                    .ok_or(Error::NotFound)?;
+            }
+            let mb = insert(&mut tx, scope, &data, ms).await?;
+            changelog::log(&mut tx, scope, ms, &[Change::mailbox(mb.id, Op::Created)]).await?;
+            let ev = changelog::event(scope, Some(mb.id), CoreEventKind::MailboxCreated);
+            changelog::append_events(&mut tx, self.cfg.event_partitions, &[ev]).await?;
+            tx.commit().await.map_err(db_err)?;
+            self.signal_log([scope.account]).await;
+            Ok(mb)
+        })
+        .await
     }
 
     async fn rename(
@@ -440,6 +449,7 @@ impl MailboxStore for PgMeta {
         parent: Option<MailboxId>,
         name: &str,
     ) -> Result<()> {
+        self.once(async move {
         check_name(name)?;
         let mut tx = begin(&self.pool, scope.tenant).await?;
         let ms = changelog::bump_modseq(&mut tx, scope).await?;
@@ -490,9 +500,11 @@ impl MailboxStore for PgMeta {
         changelog::log(&mut tx, scope, ms, &[Change::mailbox(id, Op::Updated)]).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
+}).await
     }
 
     async fn delete(&self, scope: AccountScope, id: MailboxId, cascade: bool) -> Result<()> {
+        self.once(async move {
         let mut tx = begin(&self.pool, scope.tenant).await?;
         // Строка учётной записи заблокирована: иерархия папок не меняется до конца транзакции.
         let ms = changelog::bump_modseq(&mut tx, scope).await?;
@@ -587,35 +599,40 @@ impl MailboxStore for PgMeta {
         tx.commit().await.map_err(db_err)?;
         self.signal_log([scope.account]).await;
         Ok(())
+}).await
     }
 
     async fn set_subscribed(&self, scope: AccountScope, id: MailboxId, on: bool) -> Result<()> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let updated = sqlx::query(
-            "UPDATE mailboxes SET subscribed = $4, highest_modseq = $5
+        self.once(async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let ms = changelog::bump_modseq(&mut tx, scope).await?;
+            let updated = sqlx::query(
+                "UPDATE mailboxes SET subscribed = $4, highest_modseq = $5
              WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(id.as_uuid())
-        .bind(on)
-        .bind(to_i64(ms.0)?)
-        .execute(&mut *tx)
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(id.as_uuid())
+            .bind(on)
+            .bind(to_i64(ms.0)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            if updated == 0 {
+                return Err(Error::NotFound);
+            }
+            changelog::log(&mut tx, scope, ms, &[Change::mailbox(id, Op::Updated)]).await?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(())
+        })
         .await
-        .map_err(db_err)?
-        .rows_affected();
-        if updated == 0 {
-            return Err(Error::NotFound);
-        }
-        changelog::log(&mut tx, scope, ms, &[Change::mailbox(id, Op::Updated)]).await?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(())
     }
 
     async fn status(&self, scope: AccountScope, id: MailboxId) -> Result<MailboxStatus> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let row: Option<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let row: Option<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
             r"SELECT mb.uid_validity, mb.uid_next, mb.highest_modseq, s.messages, s.unseen, s.size
               FROM mailboxes mb,
                    LATERAL (SELECT count(*) AS messages,
@@ -632,17 +649,19 @@ impl MailboxStore for PgMeta {
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        let (uid_validity, uid_next, highest, messages, unseen, size) =
-            row.ok_or(Error::NotFound)?;
-        Ok(MailboxStatus {
-            messages: to_u32(messages)?,
-            unseen: to_u32(unseen)?,
-            uid_next: Uid(to_u32(uid_next)?),
-            uid_validity: UidValidity(to_u32(uid_validity)?),
-            highest_modseq: ModSeq(to_u64(highest)?),
-            size: to_u64(size)?,
+            tx.commit().await.map_err(db_err)?;
+            let (uid_validity, uid_next, highest, messages, unseen, size) =
+                row.ok_or(Error::NotFound)?;
+            Ok(MailboxStatus {
+                messages: to_u32(messages)?,
+                unseen: to_u32(unseen)?,
+                uid_next: Uid(to_u32(uid_next)?),
+                uid_validity: UidValidity(to_u32(uid_validity)?),
+                highest_modseq: ModSeq(to_u64(highest)?),
+                size: to_u64(size)?,
+            })
         })
+        .await
     }
 }
 

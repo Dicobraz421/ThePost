@@ -119,6 +119,7 @@ impl AbuseBlocks for PgMeta {
         until: OffsetDateTime,
         reason: &str,
     ) -> Result<()> {
+        self.once(async move {
         if reason.len() > REASON_MAX {
             return Err(Error::invalid("причина блокировки длиннее 1024 байт"));
         }
@@ -167,6 +168,7 @@ impl AbuseBlocks for PgMeta {
         })
         .await;
         Ok(())
+}).await
     }
 
     async fn blocked(
@@ -174,57 +176,66 @@ impl AbuseBlocks for PgMeta {
         tenant: TenantId,
         subject: &BlockSubject,
     ) -> Result<Option<OffsetDateTime>> {
-        let c = columns(subject);
-        let mut tx = begin(&self.pool, tenant).await?;
-        // Тот же субъект или подсеть, покрывающая адрес или подсеть (разные семейства адресов не совпадают).
-        let until: Option<OffsetDateTime> = sqlx::query_scalar(
-            "SELECT max(until) FROM abuse_blocks
+        self.idempotent(|| async move {
+            let c = columns(subject);
+            let mut tx = begin(&self.pool, tenant).await?;
+            // Тот же субъект или подсеть, покрывающая адрес или подсеть (разные семейства адресов не совпадают).
+            let until: Option<OffsetDateTime> = sqlx::query_scalar(
+                "SELECT max(until) FROM abuse_blocks
              WHERE tenant_id = $1 AND until > now()
                AND (subject = $2 OR (kind = 'net' AND $3::cidr IS NOT NULL AND net >>= $3::cidr))",
-        )
-        .bind(tenant.as_uuid())
-        .bind(&c.key)
-        .bind(c.net)
-        .fetch_one(&mut *tx)
+            )
+            .bind(tenant.as_uuid())
+            .bind(&c.key)
+            .bind(c.net)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(until)
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(until)
     }
 
     async fn unblock(&self, tenant: TenantId, subject: &BlockSubject) -> Result<()> {
-        let c = columns(subject);
-        let mut tx = begin(&self.pool, tenant).await?;
-        sqlx::query("DELETE FROM abuse_blocks WHERE tenant_id = $1 AND subject = $2")
-            .bind(tenant.as_uuid())
-            .bind(&c.key)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(())
+        self.once(async move {
+            let c = columns(subject);
+            let mut tx = begin(&self.pool, tenant).await?;
+            sqlx::query("DELETE FROM abuse_blocks WHERE tenant_id = $1 AND subject = $2")
+                .bind(tenant.as_uuid())
+                .bind(&c.key)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn active(&self, tenant: TenantId) -> Result<Vec<AbuseBlock>> {
-        let mut tx = begin(&self.pool, tenant).await?;
-        let rows: Vec<Row> = sqlx::query_as(
-            "SELECT kind, host(net) AS host, masklen(net) AS prefix, account_id, until, reason
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let rows: Vec<Row> = sqlx::query_as(
+                "SELECT kind, host(net) AS host, masklen(net) AS prefix, account_id, until, reason
              FROM abuse_blocks WHERE tenant_id = $1 AND until > now()",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        rows.into_iter()
-            .map(|r| {
-                Ok(AbuseBlock {
-                    subject: r.subject()?,
-                    until: r.until,
-                    reason: r.reason,
+            )
+            .bind(tenant.as_uuid())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            rows.into_iter()
+                .map(|r| {
+                    Ok(AbuseBlock {
+                        subject: r.subject()?,
+                        until: r.until,
+                        reason: r.reason,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
+        .await
     }
 }
 

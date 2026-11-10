@@ -189,21 +189,27 @@ async fn find(
     condition: &'static str,
     value: String,
 ) -> Result<Option<DistributionGroup>> {
-    with_tenant(&meta.pool, tenant, move |tx| {
-        Box::pin(async move {
-            let id: Option<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "SELECT group_id FROM groups WHERE tenant_id = $1 AND {condition}"
-            )))
-            .bind(tenant.as_uuid())
-            .bind(value)
-            .fetch_optional(&mut *tx)
+    meta.idempotent(|| {
+        let value = value.clone();
+        async move {
+            with_tenant(&meta.pool, tenant, move |tx| {
+                Box::pin(async move {
+                    let id: Option<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                        "SELECT group_id FROM groups WHERE tenant_id = $1 AND {condition}"
+                    )))
+                    .bind(tenant.as_uuid())
+                    .bind(value)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    match id {
+                        None => Ok(None),
+                        Some(id) => Ok(load(tx, tenant, Some(vec![id])).await?.into_iter().next()),
+                    }
+                })
+            })
             .await
-            .map_err(db_err)?;
-            match id {
-                None => Ok(None),
-                Some(id) => Ok(load(tx, tenant, Some(vec![id])).await?.into_iter().next()),
-            }
-        })
+        }
     })
     .await
 }
@@ -218,13 +224,16 @@ fn split(
 #[async_trait]
 impl GroupStore for PgMeta {
     async fn get(&self, tenant: TenantId, id: GroupId) -> Result<Option<DistributionGroup>> {
-        with_tenant(&self.pool, tenant, move |tx| {
-            Box::pin(async move {
-                Ok(load(tx, tenant, Some(vec![*id.as_uuid()]))
-                    .await?
-                    .into_iter()
-                    .next())
+        self.idempotent(|| async move {
+            with_tenant(&self.pool, tenant, move |tx| {
+                Box::pin(async move {
+                    Ok(load(tx, tenant, Some(vec![*id.as_uuid()]))
+                        .await?
+                        .into_iter()
+                        .next())
+                })
             })
+            .await
         })
         .await
     }
@@ -252,13 +261,17 @@ impl GroupStore for PgMeta {
     }
 
     async fn list(&self, tenant: TenantId) -> Result<Vec<DistributionGroup>> {
-        with_tenant(&self.pool, tenant, move |tx| {
-            Box::pin(async move { load(tx, tenant, None).await })
+        self.idempotent(|| async move {
+            with_tenant(&self.pool, tenant, move |tx| {
+                Box::pin(async move { load(tx, tenant, None).await })
+            })
+            .await
         })
         .await
     }
 
     async fn put(&self, group: DistributionGroup) -> Result<()> {
+        self.once(async move {
         group.validate()?;
         let tenant = group.tenant;
         with_tenant(&self.pool, tenant, move |tx| {
@@ -344,38 +357,43 @@ impl GroupStore for PgMeta {
             })
         })
         .await
+}).await
     }
 
     async fn remove(&self, tenant: TenantId, id: GroupId) -> Result<Vec<HeldMessage>> {
-        with_tenant(&self.pool, tenant, move |tx| {
-            Box::pin(async move {
-                let rows: Vec<HeldRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                    "WITH h AS (DELETE FROM group_held WHERE tenant_id = $1 AND group_id = $2
+        self.once(async move {
+            with_tenant(&self.pool, tenant, move |tx| {
+                Box::pin(async move {
+                    let rows: Vec<HeldRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                        "WITH h AS (DELETE FROM group_held WHERE tenant_id = $1 AND group_id = $2
                                 RETURNING {HELD_COLUMNS})
                      SELECT * FROM h ORDER BY held_at, held_id"
-                )))
-                .bind(tenant.as_uuid())
-                .bind(id.as_uuid())
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(db_err)?;
-                sqlx::query("DELETE FROM groups WHERE tenant_id = $1 AND group_id = $2")
+                    )))
                     .bind(tenant.as_uuid())
                     .bind(id.as_uuid())
-                    .execute(&mut *tx)
+                    .fetch_all(&mut *tx)
                     .await
                     .map_err(db_err)?;
-                rows.into_iter().map(|r| r.into_message(tenant)).collect()
+                    sqlx::query("DELETE FROM groups WHERE tenant_id = $1 AND group_id = $2")
+                        .bind(tenant.as_uuid())
+                        .bind(id.as_uuid())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                    rows.into_iter().map(|r| r.into_message(tenant)).collect()
+                })
             })
+            .await
         })
         .await
     }
 
     async fn expand(&self, tenant: TenantId, id: GroupId) -> Result<Vec<AccountId>> {
-        let (found, accounts): (bool, Vec<Uuid>) = with_tenant(&self.pool, tenant, move |tx| {
-            Box::pin(async move {
-                sqlx::query_as(
-                    "WITH RECURSIVE tree(g) AS (
+        self.idempotent(|| async move {
+            let (found, accounts): (bool, Vec<Uuid>) = with_tenant(&self.pool, tenant, move |tx| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "WITH RECURSIVE tree(g) AS (
                          SELECT group_id FROM groups WHERE tenant_id = $1 AND group_id = $2
                          UNION
                          SELECT m.member_group_id FROM tree
@@ -385,26 +403,30 @@ impl GroupStore for PgMeta {
                             ARRAY(SELECT DISTINCT m.account_id FROM tree
                                   JOIN group_members m ON m.tenant_id = $1 AND m.group_id = tree.g
                                   WHERE m.account_id IS NOT NULL ORDER BY 1)",
-                )
-                .bind(tenant.as_uuid())
-                .bind(id.as_uuid())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(db_err)
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(id.as_uuid())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)
+                })
             })
+            .await?;
+            if !found {
+                return Err(Error::NotFound);
+            }
+            let mut accounts: Vec<AccountId> =
+                accounts.into_iter().map(AccountId::from_uuid).collect();
+            // Порядок uuid в PostgreSQL совпадает с порядком байтов; сортировка — страховка контракта.
+            accounts.sort();
+            accounts.dedup();
+            Ok(accounts)
         })
-        .await?;
-        if !found {
-            return Err(Error::NotFound);
-        }
-        let mut accounts: Vec<AccountId> = accounts.into_iter().map(AccountId::from_uuid).collect();
-        // Порядок uuid в PostgreSQL совпадает с порядком байтов; сортировка — страховка контракта.
-        accounts.sort();
-        accounts.dedup();
-        Ok(accounts)
+        .await
     }
 
     async fn hold(&self, tenant: TenantId, message: HeldMessage) -> Result<()> {
+        self.once(async move {
         if message.blob.tenant != tenant {
             return Err(Error::invalid("объект письма другой организации"));
         }
@@ -438,6 +460,7 @@ impl GroupStore for PgMeta {
             return Err(Error::NotFound);
         }
         Ok(())
+}).await
     }
 
     async fn held(
@@ -446,27 +469,31 @@ impl GroupStore for PgMeta {
         group: Option<GroupId>,
         limit: usize,
     ) -> Result<Vec<HeldMessage>> {
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows: Vec<HeldRow> = with_tenant(&self.pool, tenant, move |tx| {
-            Box::pin(async move {
-                sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                    "SELECT {HELD_COLUMNS} FROM group_held
+        self.idempotent(|| async move {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let rows: Vec<HeldRow> = with_tenant(&self.pool, tenant, move |tx| {
+                Box::pin(async move {
+                    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                        "SELECT {HELD_COLUMNS} FROM group_held
                      WHERE tenant_id = $1 AND ($2::uuid IS NULL OR group_id = $2)
                      ORDER BY held_at, held_id LIMIT $3"
-                )))
-                .bind(tenant.as_uuid())
-                .bind(group.map(|g| *g.as_uuid()))
-                .bind(limit)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(db_err)
+                    )))
+                    .bind(tenant.as_uuid())
+                    .bind(group.map(|g| *g.as_uuid()))
+                    .bind(limit)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(db_err)
+                })
             })
+            .await?;
+            rows.into_iter().map(|r| r.into_message(tenant)).collect()
         })
-        .await?;
-        rows.into_iter().map(|r| r.into_message(tenant)).collect()
+        .await
     }
 
     async fn take_held(&self, tenant: TenantId, id: HeldId) -> Result<HeldMessage> {
+        self.once(async move {
         let row: Option<HeldRow> = with_tenant(&self.pool, tenant, move |tx| {
             Box::pin(async move {
                 sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -481,5 +508,6 @@ impl GroupStore for PgMeta {
         })
         .await?;
         row.ok_or(Error::NotFound)?.into_message(tenant)
+}).await
     }
 }

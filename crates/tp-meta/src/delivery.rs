@@ -204,6 +204,7 @@ impl PgMeta {
     }
 
     async fn insert_delivery(&self, tenant: TenantId, batch: Batch) -> Result<()> {
+        self.once(async move {
         with_tenant(&self.pool, tenant, move |tx| {
             Box::pin(async move {
                 sqlx::query("SELECT tp_delivery_partitions($1::date[])")
@@ -243,6 +244,7 @@ impl PgMeta {
             })
         })
         .await
+}).await
     }
 }
 
@@ -265,6 +267,7 @@ impl DeliveryLog for PgMeta {
     }
 
     async fn search(&self, tenant: TenantId, query: &DeliveryQuery) -> Result<DeliveryPage> {
+        self.idempotent(|| async move {
         query.validate()?;
         let after = query.after.as_ref().map(parse_cursor).transpose()?;
         let limit = i64::try_from(query.limit).unwrap_or(i64::MAX - 1);
@@ -315,23 +318,27 @@ impl DeliveryLog for PgMeta {
                 .collect::<Result<_>>()?,
             next,
         })
+}).await
     }
 
     async fn purge(&self, before: OffsetDateTime) -> Result<()> {
-        let dropped: i32 = with_system(&self.pool, move |tx| {
-            Box::pin(async move {
-                sqlx::query_scalar("SELECT tp_delivery_purge($1)")
-                    .bind(before)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(db_err)
+        self.once(async move {
+            let dropped: i32 = with_system(&self.pool, move |tx| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT tp_delivery_purge($1)")
+                        .bind(before)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(db_err)
+                })
             })
+            .await?;
+            if dropped > 0 {
+                tracing::info!(sections = dropped, %before, "журнал доставки: удалены секции");
+            }
+            Ok(())
         })
-        .await?;
-        if dropped > 0 {
-            tracing::info!(sections = dropped, %before, "журнал доставки: удалены секции");
-        }
-        Ok(())
+        .await
     }
 }
 
