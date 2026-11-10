@@ -163,14 +163,6 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     role_names.extend(ext.roles().iter().map(|r| r.name().to_owned()));
     meta.heartbeat_roles(&node, &role_names, events_cfg.node_ttl)
         .await?;
-    let assigner = RendezvousAssigner::start(
-        Arc::new(meta.clone()) as Arc<dyn Membership>,
-        &PartitionAssignerConfig {
-            poll_interval: cluster.assign_poll_interval,
-        },
-    )
-    .await?;
-
     let blob = match ext.blob_store() {
         Some(blob) => blob,
         None => infra::open_blob(&cfg, store.as_ref()).await?,
@@ -179,6 +171,16 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let counters = bus.counters.clone();
     metrics.register_bus(move || infra::bus_sample(counters.snapshot()));
     let bus = bus.bus;
+    // Состав — по сигналу `MembersChanged` и таймеру аренды записи узла (CLU-10).
+    let assigner = RendezvousAssigner::start(
+        Arc::new(meta.clone()) as Arc<dyn Membership>,
+        bus.clone(),
+        &PartitionAssignerConfig {
+            node_ttl: events_cfg.node_ttl,
+            ..PartitionAssignerConfig::default()
+        },
+    )
+    .await?;
 
     // Фоновые задачи узла живут дольше ролей: служебный HTTP отвечает 503 во время drain.
     let aux = CancellationToken::new();

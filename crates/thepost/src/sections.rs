@@ -257,10 +257,6 @@ impl BusSection {
 pub struct ClusterSection {
     /// Имя узла в членстве кластера, постоянное для узла; не задано — имя хоста. Требует перезапуска.
     pub node_id: Option<String>,
-    /// Период опроса живых узлов для назначения разделов журнала (не больше периода продления записи узла).
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub assign_poll_interval: Duration,
     /// Период опроса журнала событий подписчиками узла.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -274,7 +270,6 @@ impl Default for ClusterSection {
     fn default() -> Self {
         Self {
             node_id: None,
-            assign_poll_interval: Duration::from_secs(2),
             events_poll_interval: Duration::from_secs(1),
             rebuild_scan: 64,
         }
@@ -287,8 +282,8 @@ impl ClusterSection {
         if let Some(node) = &self.node_id {
             tp_contracts::membership::NodeId::new(node.clone())?;
         }
-        if self.assign_poll_interval.is_zero() || self.events_poll_interval.is_zero() {
-            return Err(Error::invalid("периоды опроса должны быть больше нуля"));
+        if self.events_poll_interval.is_zero() {
+            return Err(Error::invalid("период опроса должен быть больше нуля"));
         }
         Ok(())
     }
@@ -622,16 +617,16 @@ blob:
     #[test]
     fn durations_are_humantime() {
         let c = parse(&format!(
-            "{MINIMAL_DEV}cluster:\n  assign_poll_interval: 500ms\ndoctor:\n  max_clock_skew: 2s\n"
+            "{MINIMAL_DEV}cluster:\n  events_poll_interval: 500ms\ndoctor:\n  max_clock_skew: 2s\n"
         ))
         .expect("config");
         let cluster = c.section::<ClusterSection>(CLUSTER).expect("cluster");
-        assert_eq!(cluster.assign_poll_interval, Duration::from_millis(500));
+        assert_eq!(cluster.events_poll_interval, Duration::from_millis(500));
         let e = err(parse(&format!(
-            "{MINIMAL_DEV}cluster:\n  assign_poll_interval: 5\n"
+            "{MINIMAL_DEV}cluster:\n  events_poll_interval: 5\n"
         )));
         assert!(
-            e.contains("duration") || e.contains("assign_poll_interval"),
+            e.contains("duration") || e.contains("events_poll_interval"),
             "{e}"
         );
     }
