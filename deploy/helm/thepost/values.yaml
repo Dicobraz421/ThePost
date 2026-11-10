@@ -1,0 +1,103 @@
+# Узел The Post в Kubernetes:
+#   helm install thepost deploy/helm/thepost -n thepost --create-namespace -f <свои значения>
+# До установки — OpenBao (deploy/helm/openbao, bootstrap.sh: Kubernetes auth для сервисного аккаунта thepost),
+# секрет TLS клиентских протоколов (values.tls.secretName: tls.crt, tls.key; ca.crt — CA внутренних каналов).
+
+image:
+  repository: thepost
+  tag: ""          # пусто — appVersion чарта
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# Сервисный аккаунт — вход в OpenBao через Kubernetes auth (роль thepost, bootstrap.sh): токен монтируется в под.
+serviceAccount:
+  create: true
+  name: thepost
+
+tls:
+  secretName: thepost-tls
+
+# Минимальные привилегии (SRS 2.7, 6.8): не root, корневая ФС только для чтения, без повышения привилегий и без
+# capabilities; seccomp — RuntimeDefault и свой профиль ролей процесса (секция confine config.yaml). Свой
+# профиль узла (Localhost) — containerSecurityContext.seccompProfile: { type: Localhost, localhostProfile: … }.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
+
+# Порты контейнера — выше 1024 (привязка без capabilities); стандартные порты — у Service.
+ports:
+  smtp: { container: 2525, service: 25 }
+  submissions: { container: 4465, service: 465 }
+  submission: { container: 5587, service: 587 }
+  imap: { container: 1143, service: 143 }
+  imaps: { container: 1993, service: 993 }
+  https: { container: 4443, service: 443 }
+
+service:
+  type: LoadBalancer
+  annotations: {}
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# config.yaml узла (SRS 5.5; полный перечень — thepost config schema). Слушатели — на портах ports.*.container.
+# Admin API — только loopback пода (SRS 6.8; доступ — kubectl port-forward), в Service не входит.
+# Служебный HTTP (/healthz, /metrics) — на адресе пода для проб kubelet: 0.0.0.0 явно разрешён internal_networks.
+config:
+  domain: example.ru
+  roles: [mailbox]
+  database:
+    url: postgres://thepost@postgres.example.ru:5432/thepost?sslmode=verify-full&sslrootcert=/etc/thepost/tls/ca.crt
+    password: { secret: "thepost/db#password" }
+    # Миграции — от владельца схемы (DEP-08); узел входит ролью thepost (thepost_app).
+    owner:
+      user: thepost_owner
+      password: { secret: "thepost/db-owner#password" }
+  blob:
+    url: s3://thepost-blob
+  tls:
+    cert_file: /etc/thepost/tls/tls.crt
+    key_file: /etc/thepost/tls/tls.key
+  service_http:
+    listen: "0.0.0.0:8081"
+    internal_networks: ["0.0.0.0/32"]
+  http:
+    jmap: { listen: "0.0.0.0:4443" }
+    admin: { listen: "127.0.0.1:8443" }
+  imap:
+    listeners:
+      - listen: "0.0.0.0:1143"
+      - listen: "0.0.0.0:1993"
+        implicit_tls: true
+  smtp:
+    hostname: mail.example.ru
+    inbound:
+      - listen: "0.0.0.0:2525"
+    submission:
+      - listen: "0.0.0.0:5587"
+      - listen: "0.0.0.0:4465"
+        implicit_tls: true
+  secrets:
+    url: https://openbao.openbao.svc:8200
+    tls:
+      ca_file: /etc/thepost/tls/ca.crt
+    auth:
+      kubernetes:
+        role: thepost

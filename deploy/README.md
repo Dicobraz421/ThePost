@@ -6,12 +6,13 @@
 | `compose/dev.yml` | Зависимости: только TLS (профиль `tls`, по умолчанию) и открытые для тестов (`dev`); эталон SMB (`smb`) |
 | `compose/tls/` | Генерация самоподписанного CA (`gen-certs.sh`), `pg_hba.conf` (только `hostssl`) |
 | `compose/openbao/` | OpenBao в compose: конфигурация (Raft, TLS, seal `static`), запуск, начальная настройка (`init.sh`) |
-| `compose/postgres/app-role.sh` | Роль приложения `thepost` без SUPERUSER и BYPASSRLS — владелец БД `thepost` |
+| `compose/postgres/app-role.sh` | Учётные записи PostgreSQL: владелец схемы `thepost_owner`, узел `thepost`, только чтение `thepost_readonly` |
 | `openbao/thepost-policy.hcl` | Политика узла `thepost` в OpenBao (общая для compose, Helm, Ansible) |
 | `helm/openbao/` | Значения чарта `openbao/openbao` и настройка Kubernetes auth (`bootstrap.sh`) |
+| `helm/thepost/` | Чарт узла: не root, корневая ФС только для чтения, без capabilities, seccomp `RuntimeDefault` |
 | `ansible/` | Эталон SMB одной командой (`smb.yml`: роли `thepost_pki`, `openbao`, `postgresql`, `rspamd`, `clamav_milter`, `thepost`); OpenBao отдельно (`openbao.yml`) |
 | `stand/` | Стенд SMB и базовая нагрузка (APP-D): ВМ SMB + генератор, imaptest, smtp-source, k6, отчёт |
-| `systemd/` | Юнит `thepost.service` с hardening, пользователь `thepost` (sysusers) |
+| `systemd/` | Юнит `thepost.service` с hardening, сокеты `thepost-*.socket` (порты ниже 1024), пользователь `thepost` (sysusers) |
 | `config/` | Примеры `config.yaml` для пресетов `all` (SMB), `mailbox` (Enterprise-ВМ), `edge` (DMZ) |
 
 ## Чистая машина
@@ -50,12 +51,13 @@ AppRole `thepost` (`role_id`, `secret_id` — том `openbao-approle`, влад
 
 | Секрет | Поля | Значение |
 |---|---|---|
-| `thepost/db` | `username`, `password` | роль `thepost` в PostgreSQL; пароль случайный |
+| `thepost/db` | `username`, `password` | вход узла `thepost` в PostgreSQL; пароль случайный |
+| `thepost/db-owner` | `username`, `password` | владелец схемы `thepost_owner` (миграции, `database.owner`) |
+| `thepost/db-readonly` | `username`, `password` | только чтение `thepost_readonly`; узлу недоступен (политика `thepost`) |
 | `thepost/s3` | `access_key_id`, `secret_access_key` | ключи SeaweedFS (`compose/seaweedfs-s3.json`) |
 
-`postgres-role-tls` создаёт в PostgreSQL роль `thepost` (LOGIN, без SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE) —
-владельца БД `thepost`, миграции идут ею же; новый пароль берёт из `openbao-init-tls` через том `pg-bootstrap`
-и удаляет файл. Роль `postgres` — администратор стенда и тестов, приложению не выдаётся.
+`postgres-role-tls` создаёт в PostgreSQL учётные записи (раздел «PostgreSQL: учётные записи» ниже); новые пароли
+берёт из `openbao-init-tls` через том `pg-bootstrap` и удаляет файлы. Роль `postgres` — администратор стенда и тестов, приложению не выдаётся.
 Администрирование OpenBao стенда (root-токен из тома `openbao-admin`):
 ```bash
 docker compose -f deploy/compose/dev.yml run --rm --no-deps --entrypoint sh openbao-init-tls -c \
@@ -78,11 +80,11 @@ docker compose -f deploy/compose/dev.yml --profile dev ps   # postgres, seaweedf
 | SeaweedFS S3 | `http://localhost:8333` | ключ `thepost`, секрет `thepost-dev-secret` (`compose/seaweedfs-s3.json`); бакет `thepost-test` |
 | Valkey | `localhost:6379` | без пароля |
 | Rspamd | `http://localhost:11333` (проверка), `http://localhost:11334` (веб) | пароль веб-интерфейса `thepost-dev` |
-| PostgreSQL, роль приложения | `localhost:5432` | `thepost` / `thepost-dev`, БД `thepost` (без SUPERUSER и BYPASSRLS) |
+| PostgreSQL, учётные записи The Post | `localhost:5432` | узел `thepost` / `thepost-dev`, владелец схемы `thepost_owner` / `thepost-dev-owner`, только чтение `thepost_readonly` / `thepost-dev-readonly`; БД `thepost` |
 | OpenBao (dev-режим, в памяти) | `http://localhost:8200` | root-токен `thepost-dev-root`; AppRole `thepost`: `role_id` `thepost-dev`, `secret_id` `thepost-dev-secret-id` |
 
-OpenBao dev-режима — те же KV `thepost`, политика, AppRole и секреты стенда (`thepost/db` с паролем `thepost-dev`,
-`thepost/s3`); данные в памяти, после перезапуска контейнера их снова записывает `openbao-init`.
+OpenBao dev-режима — те же KV `thepost`, политика, AppRole и секреты стенда (`thepost/db`, `thepost/db-owner`,
+`thepost/db-readonly` с паролями выше, `thepost/s3`); данные в памяти, после перезапуска контейнера их снова записывает `openbao-init`.
 Учётные данные профиля `tls` — те же, кроме роли `thepost` и OpenBao (см. выше). Занятый порт хоста переопределяется
 переменной: `TP_PG_PORT`, `TP_S3_PORT`, `TP_VALKEY_PORT`, `TP_OPENBAO_PORT`, `TP_RSPAMD_PORT`, `TP_RSPAMD_UI_PORT`
 (например, `TP_PG_PORT=55432 docker compose -f deploy/compose/dev.yml --profile dev up -d`).
@@ -107,8 +109,10 @@ cargo nextest run -p <крейты> --no-tests=pass
 ## Эталон SMB в контейнерах (профиль smb)
 `thepost` (`roles: [all]`, локальный BLOB, шина в процессе) + PostgreSQL (TLS, `sslmode=verify-full`, CA из тома `tls`)
 + OpenBao (TLS, Raft, автоматическое распечатывание) + Rspamd; конфигурация — `compose/thepost-smb.yaml`.
-`thepost` подключается к PostgreSQL ролью `thepost` (без SUPERUSER и BYPASSRLS), пароль берёт из OpenBao
-(`{ secret: "thepost/db#password" }`), в OpenBao входит по AppRole (том `openbao-approle` → `/etc/thepost/openbao`).
+`thepost` подключается к PostgreSQL ролью `thepost` (член `thepost_app`, не владелец схемы), миграции — от владельца
+схемы `thepost_owner` (`database.owner`); пароли берёт из OpenBao (`thepost/db`, `thepost/db-owner`), в OpenBao входит
+по AppRole (том `openbao-approle` → `/etc/thepost/openbao`). Контейнер — nonroot 65532, `cap_drop: [ALL]`,
+`no-new-privileges`, корневая ФС только для чтения; Admin API — `127.0.0.1:8443` внутри контейнера (не публикуется).
 ```bash
 docker compose -f deploy/compose/dev.yml --profile smb up -d --build
 docker compose -f deploy/compose/dev.yml --profile smb run --rm thepost doctor   # без Fail (PLT-12, META-17)
@@ -142,9 +146,12 @@ cp deploy/ansible/inventory.example.yml inventory.yml   # адрес ВМ, до�
 ansible-playbook -i inventory.yml deploy/ansible/smb.yml
 ```
 Порядок: внутренний CA (`thepost_pki`, `/etc/thepost/pki`: внутренние каналы PostgreSQL и OpenBao — только TLS, на
-loopback) → OpenBao (`https://localhost:8200`, пароль `thepost/db`, AppRole) → PostgreSQL (`hostssl` только для
-`thepost`, без SUPERUSER и BYPASSRLS) → Rspamd (Milter `127.0.0.1:11332`) → clamav-milter (`127.0.0.1:7357`) →
-`thepost` (sysusers, юнит, `config.yaml` из шаблона с проверкой `thepost config check`, ожидание `/healthz/ready`).
+loopback) → OpenBao (`https://localhost:8200`, пароли `thepost/db`, `thepost/db-owner`, `thepost/db-readonly`, AppRole)
+→ PostgreSQL (`hostssl` только для учётных записей The Post, без SUPERUSER и BYPASSRLS) → Rspamd (Milter `127.0.0.1:11332`) → clamav-milter (`127.0.0.1:7357`) →
+`thepost` (sysusers, юнит и сокеты, `config.yaml` из шаблона с проверкой `thepost config check`, ожидание
+`/healthz/ready`). Порты ниже 1024 — `thepost_socket_activation`: `true` — сокеты systemd, у процесса нет capabilities;
+`false` (по умолчанию, пока узел не принимает сокеты systemd — TODO(PLT-16)) — `CAP_NET_BIND_SERVICE`.
+Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 Сертификат клиентских протоколов — `thepost_tls_mode`: `certbot` (Let's Encrypt HTTP-01, по умолчанию; порт 80
 открыт, DNS указывает на ВМ), `acme` (встроенный клиент thepost, секция `acme`), `internal` (внутренний CA — стенд),
 `files` (свои PEM). Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
@@ -155,12 +162,28 @@ loopback) → OpenBao (`https://localhost:8200`, пароль `thepost/db`, AppR
 sudo install -m 0755 target/release/thepost /usr/local/bin/thepost
 sudo install -m 0644 deploy/systemd/thepost.sysusers.conf /usr/lib/sysusers.d/thepost.conf && sudo systemd-sysusers
 sudo install -D -m 0640 -o root -g thepost deploy/config/all.yaml /etc/thepost/config.yaml   # задать domain, database.url
-sudo install -m 0644 deploy/systemd/thepost.service /etc/systemd/system/thepost.service
-sudo systemd-analyze verify /etc/systemd/system/thepost.service
-sudo systemctl daemon-reload && sudo systemctl enable --now thepost
+sudo install -m 0644 deploy/systemd/thepost.service deploy/systemd/thepost-*.socket /etc/systemd/system/
+sudo systemd-analyze verify /etc/systemd/system/thepost.service /etc/systemd/system/thepost-*.socket
+# Порты ниже 1024 — сокеты systemd (у процесса нет capabilities):
+sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submissions,submission,imap,imaps,https}.socket
+# …или без активации сокетов — CAP_NET_BIND_SERVICE (сокеты не включать):
+#   sudo install -D -m 0644 deploy/systemd/thepost.service.d/bind-capability.conf \
+#     /etc/systemd/system/thepost.service.d/bind-capability.conf && sudo systemctl daemon-reload
+sudo systemctl enable --now thepost
+systemd-analyze security thepost.service   # не хуже 2.0 (с сокетами — 1.2, с bind-capability.conf — 1.6)
 ```
+Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443.
+Узел берёт сокет systemd по адресу слушателя (`0.0.0.0:<порт>` или `[::]:<порт>` совпадает с `ListenStream=<порт>`),
+иначе открывает свой; перезапуск `thepost` не закрывает сокеты. Пока узел не принимает сокеты systemd (TODO(PLT-16)
+в `crates/thepost/src/protocols.rs`), рабочий вариант — `bind-capability.conf`.
+Hardening юнита: пустой `CapabilityBoundingSet=`, `NoNewPrivileges`, `PrivateUsers`, `ProtectSystem=strict`,
+`ProtectHome`, `PrivateTmp`, `PrivateDevices`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`,
+`SystemCallFilter=@system-service` без привилегированных вызовов (свои профили seccomp и Landlock процесс
+накладывает сам — секция `confine`).
+
 Данные — `/var/lib/thepost` (создаёт systemd). BLOB-каталог вне него — `systemctl edit thepost`:
-`[Service]` + `ReadWritePaths=/srv/thepost-blob`. Проверка окружения — `thepost doctor` (SRS 5.5).
+`[Service]` + `ReadWritePaths=/srv/thepost-blob`. Проверка окружения — `thepost doctor` (SRS 5.5); привилегии
+службы (`privileges.*`) — только в её окружении: `docs/manual-tests/DEP-08.md`.
 
 Секретов в `config.yaml` нет — только ссылки на OpenBao (секция `secrets`, `database.password`). Вход узла — AppRole:
 `role_id` — `/etc/thepost/openbao/role_id`, `secret_id` — `/etc/thepost/credentials/openbao-secret-id` (0600 root),
@@ -168,14 +191,25 @@ sudo systemctl daemon-reload && sudo systemctl enable --now thepost
 С TPM `secret_id` можно зашифровать: `systemd-creds encrypt --with-key=tpm2 --name=openbao-secret-id …`
 и заменить `LoadCredential=` на `LoadCredentialEncrypted=` (drop-in `systemctl edit thepost`).
 
-## PostgreSQL: роль приложения
-Роль `thepost` — LOGIN, без SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE, REPLICATION; владелец БД `thepost` (миграции —
-той же ролью). С SUPERUSER или BYPASSRLS RLS не изолирует организации, `thepost doctor` — `Fail` (решение #44).
-Пароль — только в OpenBao (`thepost/db`, поля `username`, `password`). Создание вручную (администратор СУБД):
+## PostgreSQL: учётные записи
+Раздельные учётные записи (SRS 2.7, 3.1; META-23, DEP-08), все — LOGIN без SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE,
+REPLICATION (с SUPERUSER или BYPASSRLS RLS не изолирует организации, `thepost doctor` — `Fail`, решение #44):
+
+| Учётная запись | Права | В config.yaml | Секрет OpenBao |
+|---|---|---|---|
+| `thepost_owner` | владелец БД `thepost` и схемы `public`; только миграции | `database.owner` | `thepost/db-owner` |
+| `thepost` | член `thepost_app`: DML в таблицах ядра, журналы — только добавление | `database.url` | `thepost/db` |
+| `thepost_readonly` | член `thepost_reader`: чтение метаданных (отчёты, проверки, роли search/indexer) | — | `thepost/db-readonly` |
+
+Групповые роли `thepost_app`, `thepost_reader` (без входа) создаёт администратор СУБД (скрипт ниже, роль Ansible
+`postgresql`), права на таблицы им выдаёт миграция (`tp_grant_roles`). Установка до DEP-08 (таблицы принадлежат
+`thepost`) переводится тем же скриптом: владелец — `thepost_owner`. Создание вручную (администратор СУБД):
 ```bash
 export BAO_ADDR=https://openbao.example.ru:8200 BAO_TOKEN=<токен администратора>
-TP_DB_PASSWORD=$(bao kv get -mount=thepost -field=password db) PGHOST=<адрес> PGUSER=postgres \
-  sh deploy/compose/postgres/app-role.sh
+TP_DB_PASSWORD=$(bao kv get -mount=thepost -field=password db) \
+TP_DB_OWNER_PASSWORD=$(bao kv get -mount=thepost -field=password db-owner) \
+TP_DB_READONLY_PASSWORD=$(bao kv get -mount=thepost -field=password db-readonly) \
+PGHOST=<адрес> PGUSER=postgres sh deploy/compose/postgres/app-role.sh
 ```
 
 ## OpenBao (хранилище секретов)
@@ -199,7 +233,8 @@ ansible-playbook -i <инвентарь> deploy/ansible/openbao.yml \
 (проверка по `checksums.txt`), пишет `/etc/openbao/openbao.hcl`, при первом прогоне — `bao operator init`
 (ключи восстановления и root-токен — `/root/openbao-init.json`, перенести в надёжное место; дальнейшие прогоны —
 `-e openbao_admin_token=…`), настраивает KV, политику и AppRole `thepost`, кладёт `role_id` и `secret_id` для
-`thepost.service`, создаёт случайный пароль `thepost/db` и отдаёт его фактом `thepost_db_password` роли PostgreSQL.
+`thepost.service`, создаёт случайные пароли `thepost/db`, `thepost/db-owner`, `thepost/db-readonly` и отдаёт их
+фактами `thepost_db_password`, `thepost_db_owner_password`, `thepost_db_readonly_password` роли PostgreSQL.
 Повторный прогон ничего не меняет.
 
 ### Kubernetes (Helm)
@@ -211,3 +246,13 @@ BAO_TOKEN=<root-токен> sh deploy/helm/openbao/bootstrap.sh openbao thepost
 ```
 До установки — секреты `openbao-tls` (сертификат, ключ, CA) и, без KMS/HSM, `openbao-unseal` (`helm/openbao/values.yaml`).
 Узел `thepost` входит через Kubernetes auth: сервисный аккаунт `thepost` в пространстве `thepost`, роль `thepost`.
+
+### Узел thepost (Helm)
+```bash
+helm install thepost deploy/helm/thepost -n thepost --create-namespace -f <свои значения>
+```
+Под — `runAsNonRoot` (65532), `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`,
+seccomp `RuntimeDefault` (свой профиль узла — `containerSecurityContext.seccompProfile` типа `Localhost`) и профили ролей
+процесса (секция `confine`). Слушатели — на портах выше 1024, стандартные порты (25, 465, 587, 143, 993, 443) — у Service.
+Admin API — `127.0.0.1:8443` в поде (`kubectl port-forward`), служебный HTTP — адрес пода для проб kubelet.
+До установки — секрет `thepost-tls` (`tls.crt`, `tls.key`, `ca.crt`) и OpenBao (`bootstrap.sh` выше).

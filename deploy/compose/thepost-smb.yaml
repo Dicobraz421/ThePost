@@ -1,9 +1,13 @@
 # Конфигурация thepost для профиля smb в compose (эталон — deploy/config/all.yaml).
 domain: example.test
-# Роль thepost без SUPERUSER и BYPASSRLS (postgres-role-tls); пароль — только из OpenBao.
+# Узел входит ролью thepost (член thepost_app, не владелец схемы, без SUPERUSER и BYPASSRLS); миграции — от владельца
+# схемы thepost_owner (postgres-role-tls, DEP-08). Пароли — только из OpenBao.
 database:
   url: postgres://thepost@postgres-tls:5432/thepost?sslmode=verify-full&sslrootcert=/etc/thepost/tls/ca.pem
   password: { secret: "thepost/db#password" }
+  owner:
+    user: thepost_owner
+    password: { secret: "thepost/db-owner#password" }
 blob:
   url: file:///var/lib/thepost/blob
 roles: [all]
@@ -16,8 +20,10 @@ tls:
 
 # Слушатели — на все адреса контейнера (IPv4: в контейнере Docker IPv6 по умолчанию выключен).
 # Порты хоста — в dev.yml (TP_SMTP_PORT и т. п.).
+# Admin API — только внутренний адрес (SRS 6.8): loopback контейнера, на хост не публикуется.
 http:
   jmap: { listen: "0.0.0.0:443" }
+  admin: { listen: "127.0.0.1:8443" }
 imap:
   listeners:
     - listen: "0.0.0.0:143"

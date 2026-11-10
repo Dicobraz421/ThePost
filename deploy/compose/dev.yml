@@ -1,7 +1,8 @@
 # Зависимости The Post для разработки и эталон SMB (SRS 1.2). Описание — deploy/README.md.
 #   tls (по умолчанию, см. .env): PostgreSQL 16, SeaweedFS (S3), Valkey, OpenBao — только TLS-подключения,
 #     самоподписанный CA (tls-init, tls/gen-certs.sh); бакет thepost-test; OpenBao — Raft, автоматическое
-#     распечатывание ключом из файла, политика и AppRole thepost; роль thepost в PostgreSQL без SUPERUSER/BYPASSRLS.
+#     распечатывание ключом из файла, политика и AppRole thepost; учётные записи PostgreSQL без SUPERUSER/BYPASSRLS:
+#     владелец схемы thepost_owner, узел thepost, только чтение thepost_readonly (postgres/app-role.sh).
 #   dev: те же зависимости и Rspamd с открытыми каналами — для интеграционных тестов; бакет thepost-test;
 #     OpenBao в dev-режиме с секретами стенда.
 #     docker compose -f deploy/compose/dev.yml --profile dev up -d
@@ -62,7 +63,8 @@ services:
       timeout: 3s
       retries: 30
 
-  # Роль приложения thepost и БД thepost; пароль — новый из openbao-init-tls (файл удаляется после применения).
+  # Учётные записи thepost_owner, thepost, thepost_readonly и БД thepost; пароли — новые из openbao-init-tls
+  # (файлы тома pg-bootstrap удаляются после применения).
   postgres-role-tls:
     image: postgres:16
     profiles: [tls, smb]
@@ -80,7 +82,7 @@ services:
       PGDATABASE: postgres
       PGSSLMODE: verify-full
       PGSSLROOTCERT: /certs/ca.pem
-      TP_DB_PASSWORD_FILE: /bootstrap/db-password
+      TP_DB_PASSWORD_DIR: /bootstrap
     volumes:
       - ./postgres/app-role.sh:/app-role.sh:ro
       - tls:/certs:ro
@@ -215,7 +217,8 @@ services:
       timeout: 3s
       retries: 30
 
-  # Роль приложения thepost (без SUPERUSER и BYPASSRLS) и БД thepost; тесты ходят ролью postgres.
+  # Учётные записи thepost_owner, thepost, thepost_readonly (без SUPERUSER и BYPASSRLS) и БД thepost;
+  # тесты ходят ролью postgres.
   postgres-role:
     image: postgres:16
     profiles: [dev]
@@ -230,6 +233,8 @@ services:
       PGPASSWORD: postgres
       PGDATABASE: postgres
       TP_DB_PASSWORD: thepost-dev
+      TP_DB_OWNER_PASSWORD: thepost-dev-owner
+      TP_DB_READONLY_PASSWORD: thepost-dev-readonly
     volumes:
       - ./postgres/app-role.sh:/app-role.sh:ro
 
@@ -261,6 +266,8 @@ services:
       BAO_ADDR: http://openbao:8200
       BAO_TOKEN: thepost-dev-root
       TP_DB_PASSWORD: thepost-dev
+      TP_DB_OWNER_PASSWORD: thepost-dev-owner
+      TP_DB_READONLY_PASSWORD: thepost-dev-readonly
       TP_APPROLE_ROLE_ID: thepost-dev
       TP_APPROLE_SECRET_ID: thepost-dev-secret-id
       TP_S3_ACCESS_KEY_ID: thepost
@@ -313,6 +320,17 @@ services:
       dockerfile: deploy/docker/Dockerfile
     image: thepost:dev
     profiles: [smb]
+    # Минимальные привилегии (SRS 2.7, DEP-08): nonroot 65532 (образ), без capabilities — порты ниже 1024
+    # доступны и так (Docker: net.ipv4.ip_unprivileged_port_start=0), без новых привилегий, корневая ФС только
+    # для чтения (запись — том /var/lib/thepost и /tmp в памяти), seccomp — профиль Docker по умолчанию и свой
+    # профиль ролей процесса (секция confine). Admin API — 127.0.0.1:8443 в контейнере, на хост не публикуется.
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     depends_on:
       postgres-role-tls:
         condition: service_completed_successfully

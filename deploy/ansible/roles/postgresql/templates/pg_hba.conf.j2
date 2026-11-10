@@ -4,7 +4,9 @@
 local     all       postgres       peer
 local     all       all            peer
 {% for net in postgresql_app_networks %}
-hostssl   {{ postgresql_app_db }}  {{ postgresql_app_role }}  {{ net }}  scram-sha-256
+{% for role in [postgresql_app_role, postgresql_owner_role, postgresql_readonly_role] %}
+hostssl   {{ postgresql_app_db }}  {{ role }}  {{ net }}  scram-sha-256
+{% endfor %}
 {% endfor %}
 hostnossl all       all   0.0.0.0/0  reject
 hostnossl all       all   ::/0       reject

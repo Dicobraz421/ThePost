@@ -4,9 +4,15 @@
 domain: example.ru
 
 # Кластер PostgreSQL через PgBouncer.
+# Узел — роль thepost (thepost_app); миграции — владелец схемы thepost_owner в обход PgBouncer (DEP-08).
 database:
   url: postgres://thepost@pgbouncer.example.ru:6432/thepost?sslmode=verify-full
   password: { secret: "thepost/db#password" }
+  pgbouncer: true
+  direct_url: postgres://thepost@postgres.example.ru:5432/thepost?sslmode=verify-full
+  owner:
+    user: thepost_owner
+    password: { secret: "thepost/db-owner#password" }
 
 # S3 (эталон — SeaweedFS); ключи доступа — ссылки на секрет thepost/s3 в секции BLOB-хранилища.
 blob:

@@ -4,6 +4,11 @@ path "thepost/data/*" {
   capabilities = ["read"]
 }
 
+# Пароль учётной записи PostgreSQL «только чтение» (thepost_readonly) — администратору и отчётам, не узлу (DEP-08).
+path "thepost/data/db-readonly" {
+  capabilities = ["deny"]
+}
+
 path "thepost/metadata/*" {
   capabilities = ["read", "list"]
 }

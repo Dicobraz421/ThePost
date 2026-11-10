@@ -4,10 +4,18 @@
 
 domain: example.ru
 
-# Роль thepost без SUPERUSER и BYPASSRLS — владелец БД; пароль — только ссылка на секрет в OpenBao.
+# Узел входит ролью thepost (член thepost_app, без SUPERUSER и BYPASSRLS, не владелец схемы); миграции — от владельца
+# схемы thepost_owner (DEP-08, deploy/README.md). Пароли — только ссылки на секреты в OpenBao.
 database:
   url: postgres://thepost@localhost:5432/thepost?sslmode=verify-full
   password: { secret: "thepost/db#password" }
+  owner:
+    user: thepost_owner
+    password: { secret: "thepost/db-owner#password" }
+
+# Admin API — только внутренний адрес (SRS 6.8).
+http:
+  admin: { listen: "127.0.0.1:8443" }
 
 # Локальная POSIX-директория; шина событий и кэш — в процессе.
 blob:

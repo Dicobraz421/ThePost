@@ -3,8 +3,8 @@
 # Повторный запуск ничего не меняет.
 #   Профиль dev: BAO_TOKEN задан (dev-режим), идентификаторы AppRole фиксированы (TP_APPROLE_ROLE_ID, TP_APPROLE_SECRET_ID).
 #   Профили tls и smb: первый запуск — `bao operator init`; ключ восстановления и root-токен — /admin/init.txt
-#   (только стенд); role_id и secret_id узла — /approle; новый пароль роли PostgreSQL — /bootstrap/db-password
-#   (его применяет и удаляет postgres-role-tls).
+#   (только стенд); role_id и secret_id узла — /approle; новые пароли учётных записей PostgreSQL —
+#   /bootstrap/db{,-owner,-readonly}-password (их применяет и удаляет postgres-role-tls).
 set -eu
 umask 077
 
@@ -67,13 +67,19 @@ if [ -d "$APPROLE" ]; then
   chmod 0400 "$APPROLE/role_id" "$APPROLE/secret_id"
 fi
 
-# Секреты стенда: пароль роли thepost в PostgreSQL (новый — случайный), ключи S3 (compose/seaweedfs-s3.json).
-if ! bao kv get -mount=thepost db >/dev/null 2>&1; then
-  pw=${TP_DB_PASSWORD:-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')}
-  printf %s "$pw" | bao kv put -mount=thepost db username=thepost password=- >/dev/null
-  if [ -d "$BOOTSTRAP" ]; then printf %s "$pw" > "$BOOTSTRAP/db-password"; fi
-  echo "openbao-init: записан секрет thepost/db"
-fi
+# Секреты стенда: пароли учётных записей PostgreSQL (новые — случайные; DEP-08) — узел thepost (thepost/db),
+# владелец схемы thepost_owner (thepost/db-owner), только чтение thepost_readonly (thepost/db-readonly);
+# ключи S3 (compose/seaweedfs-s3.json). Новый пароль — и в /bootstrap/<секрет>-password для postgres-role-tls.
+db_secret() { # <секрет> <роль> <пароль или пусто>
+  if bao kv get -mount=thepost "$1" >/dev/null 2>&1; then return 0; fi
+  pw=${3:-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')}
+  printf %s "$pw" | bao kv put -mount=thepost "$1" username="$2" password=- >/dev/null
+  if [ -d "$BOOTSTRAP" ]; then printf %s "$pw" > "$BOOTSTRAP/$1-password"; fi
+  echo "openbao-init: записан секрет thepost/$1"
+}
+db_secret db thepost "${TP_DB_PASSWORD:-}"
+db_secret db-owner thepost_owner "${TP_DB_OWNER_PASSWORD:-}"
+db_secret db-readonly thepost_readonly "${TP_DB_READONLY_PASSWORD:-}"
 if ! bao kv get -mount=thepost s3 >/dev/null 2>&1; then
   printf %s "$TP_S3_SECRET_ACCESS_KEY" \
     | bao kv put -mount=thepost s3 access_key_id="$TP_S3_ACCESS_KEY_ID" secret_access_key=- >/dev/null

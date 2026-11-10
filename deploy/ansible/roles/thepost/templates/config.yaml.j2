@@ -13,13 +13,17 @@
   'database': {
     'url': thepost_db_url,
     'password': {'secret': 'thepost/db#password'},
+    'owner': {'user': thepost_db_owner_role, 'password': {'secret': 'thepost/db-owner#password'}},
   },
   'blob': {'url': 'file:///var/lib/thepost/blob'},
   'tls': {
     'cert_file': tls_dir ~ '/fullchain.pem',
     'key_file': tls_dir ~ '/privkey.pem',
   },
-  'http': {'jmap': {'listen': thepost_listen_address ~ ':443'}},
+  'http': {
+    'jmap': {'listen': thepost_listen_address ~ ':443'},
+    'admin': {'listen': thepost_admin_listen},
+  },
   'imap': {'listeners': [
     {'listen': thepost_listen_address ~ ':143'},
     {'listen': thepost_listen_address ~ ':993', 'implicit_tls': true},

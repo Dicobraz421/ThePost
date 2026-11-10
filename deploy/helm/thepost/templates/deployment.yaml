@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "thepost.fullname" . }}
+  labels:
+    {{- include "thepost.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "thepost.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "thepost.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ toYaml .Values.config | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      # Токен сервисного аккаунта — вход в OpenBao (secrets.auth.kubernetes.jwt_file).
+      automountServiceAccountToken: true
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: thepost
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--config", "/etc/thepost/config.yaml"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            {{- range $name, $p := .Values.ports }}
+            - name: {{ $name }}
+              containerPort: {{ $p.container }}
+              protocol: TCP
+            {{- end }}
+            - name: service-http
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet: { path: /healthz/live, port: service-http, scheme: HTTPS }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz/ready, port: service-http, scheme: HTTPS }
+            periodSeconds: 5
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/thepost/config.yaml, subPath: config.yaml, readOnly: true }
+            - { name: tls, mountPath: /etc/thepost/tls, readOnly: true }
+            # Запись — только каталог данных узла (кэш, при file:// — BLOB) и /tmp в памяти.
+            - { name: state, mountPath: /var/lib/thepost }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "thepost.fullname" . }}-config
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        - name: state
+          emptyDir: {}
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 64Mi }
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
