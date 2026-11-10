@@ -20,7 +20,8 @@ use tp_contracts::meta::{AccountScope, Flags, Policy, SpecialUse};
 use tp_contracts::{AccountId, DomainId, Error, GroupId, HeldId, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
-    MemEventBus, MemGroups, MemMetadata, MemPolicies, MemQuota, MemTrash, PolicyLevel, SystemClock,
+    MemEventBus, MemGroups, MemMetadata, MemPolicies, MemQuota, MemTransport, MemTrash,
+    PolicyLevel, SystemClock,
 };
 
 use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
@@ -284,6 +285,7 @@ pub struct Env {
     pub policies: MemPolicies,
     pub trash: MemTrash,
     pub app_passwords: tp_auth::AppPasswords,
+    pub transport: MemTransport,
     pub router: Router,
     pub other_tenant: TenantId,
 }
@@ -336,7 +338,16 @@ impl Env {
         Self::with(config(), Vec::new())
     }
 
+    /// Без настроек транспорта (маршруты транспорта — 503).
+    pub fn without_transport() -> Self {
+        Self::build(config(), Vec::new(), false)
+    }
+
     pub fn with(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>) -> Self {
+        Self::build(cfg, modules, true)
+    }
+
+    fn build(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>, with_transport: bool) -> Self {
         let auth = FakeAuthenticator::default();
         let other_tenant = TenantId::new();
         let d = TenantId::DEFAULT;
@@ -359,6 +370,12 @@ impl Env {
             cfg,
         )
         .expect("admin");
+        let transport = MemTransport::new();
+        let admin = if with_transport {
+            admin.with_transport(Arc::new(transport.clone()))
+        } else {
+            admin
+        };
         let app_passwords = stores.app_passwords();
         let Stores {
             meta,
@@ -383,6 +400,7 @@ impl Env {
             policies,
             trash,
             app_passwords,
+            transport,
             router: Arc::new(admin).router(),
             other_tenant,
         }
