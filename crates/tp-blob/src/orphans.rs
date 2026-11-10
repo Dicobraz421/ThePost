@@ -7,7 +7,8 @@
 //! не занимает (`writer`), поэтому устаревший листинг не задевает новую запись.
 //! Пути, не являющиеся ключами BLOB (сегменты индексов
 //! `put_raw`), пропускаются. Работа низкого приоритета: проверки и удаления ограничены по скорости,
-//! один узел — держатель лизы.
+//! один узел — держатель лизы. Проходы — по расписанию из конфигурации ([`OrphanConfig::interval`];
+//! SRS 2.8, закрытый список таймеров, п. 4).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ pub struct OrphanConfig {
     pub max_deletes_per_sec: u32,
     /// Число проверенных объектов между продлениями лизы.
     pub renew_every: u64,
-    /// Пауза между проходами.
+    /// Расписание: пауза между проходами (SRS 2.8, таймер 4 — расписание фоновых работ из конфигурации).
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub interval: Duration,
@@ -179,7 +180,7 @@ impl OrphanSweeper {
         self.pass(None).await
     }
 
-    /// Периодические проходы под лизой до `shutdown`; `holder` — идентификатор узла.
+    /// Проходы под лизой по расписанию [`OrphanConfig::interval`] до `shutdown`; `holder` — идентификатор узла.
     /// Футура — `Send` (при `Send`-футуре `shutdown`): запускается через `tokio::spawn`.
     pub async fn run(
         &self,
@@ -192,10 +193,9 @@ impl OrphanSweeper {
             name: &self.cfg.lease_name,
             holder,
             ttl: self.cfg.lease_ttl,
-            interval: self.cfg.interval,
             what: "blob-orphans",
         };
-        run_leased(s, shutdown, self).await;
+        run_leased(s, self.cfg.interval, shutdown, self).await;
     }
 
     async fn pass(&self, mut leader: Option<&mut Leader<'_>>) -> Result<OrphanPass> {

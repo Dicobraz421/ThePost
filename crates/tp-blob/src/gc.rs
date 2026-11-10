@@ -5,6 +5,17 @@
 //! Окно W не меньше глубины самой старой точки восстановления (инвариант W). Работает один узел —
 //! держатель лизы лидера; лиза продлевается между пакетами, потеря лизы прекращает проход.
 //! Сбой удаления оставляет запись `deleting` — следующий проход повторит её.
+//!
+//! Воркер ([`GcWorker::run`]) не делает периодических проходов (SRS 2.8, таймер 4): один таймер на ближайший
+//! срок окончания отсрочки — `zero_since + W` самой ранней записи без ссылок. Контракт учёта сроков
+//! не отдаёт, поэтому срок находится делением пополам по [`BlobIndex::gc_candidates`] с пределом 1
+//! (запрос по индексу `zero_since`) с точностью [`GcConfig::precision`]; таймер взводится на верхнюю
+//! границу — объект удаляется не раньше срока и не позже чем через `precision` после него.
+//! Ожидание не дольше `min(max_wait, window)`: по его истечении срок сверяется заново (без прохода).
+//! Ссылки, обнулённые после взвода, дают срок не раньше `now + W`, то есть не раньше взведённого таймера, —
+//! поэтому обнуление на любом узле без сигнала не опаздывает; сигнал [`GcWorker::wake`] после фиксации
+//! обнуления в этом процессе перевзводит таймер сразу. Просроченное после прохода или ошибки — повтор
+//! не раньше [`GcConfig::retry`] (таймер 2), лиза у другого узла — не раньше [`GcConfig::lease_ttl`] (таймер 1).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -13,12 +24,17 @@ use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
+use time::OffsetDateTime;
+use tokio::sync::Notify;
 use tp_contracts::Result;
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::config::duration;
-use tp_contracts::lease::LeaseStore;
+use tp_contracts::lease::{Lease, LeaseStore};
 
-use crate::worker::{Leader, LeasedPass, Now, Pacer, Schedule, before, keep, run_leased};
+use crate::worker::{
+    Leader, LeasedPass, Now, Pacer, Schedule, Sleep, Tick, after, before, keep, release,
+    system_sleep, tick,
+};
 
 /// Конфигурация GC (секция config.yaml; поля необязательны, неизвестное — ошибка).
 ///
@@ -26,7 +42,9 @@ use crate::worker::{Leader, LeasedPass, Now, Pacer, Schedule, before, keep, run_
 /// window: 7d
 /// batch: 1000
 /// max_deletes_per_sec: 200
-/// interval: 5m
+/// max_wait: 1h
+/// precision: 1m
+/// retry: 5m
 /// lease_name: blob-gc
 /// lease_ttl: 2m
 /// ```
@@ -42,10 +60,19 @@ pub struct GcConfig {
     pub batch: usize,
     /// Предел удалений в секунду; 0 — без ограничения.
     pub max_deletes_per_sec: u32,
-    /// Пауза между проходами.
+    /// Наибольшее ожидание таймера (не больше `window`): по истечении ближайший срок сверяется заново.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
-    pub interval: Duration,
+    pub max_wait: Duration,
+    /// Точность поиска ближайшего срока: удаление не позже чем через столько после срока.
+    /// Меньше — точнее, но больше запросов к учёту на один взвод (log2(max_wait / precision)).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub precision: Duration,
+    /// Пауза перед повтором после ошибки или если кандидаты остались после прохода.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub retry: Duration,
     /// Имя лизы лидера GC.
     pub lease_name: String,
     /// Срок лизы; продлевается между пакетами.
@@ -60,7 +87,9 @@ impl Default for GcConfig {
             window: Duration::from_secs(7 * 24 * 3600),
             batch: 1000,
             max_deletes_per_sec: 200,
-            interval: Duration::from_secs(300),
+            max_wait: Duration::from_secs(3600),
+            precision: Duration::from_secs(60),
+            retry: Duration::from_secs(300),
             lease_name: "blob-gc".to_owned(),
             lease_ttl: Duration::from_secs(120),
         }
@@ -122,6 +151,8 @@ pub struct GcWorker {
     store: Arc<dyn BlobStore>,
     cfg: GcConfig,
     now: Now,
+    sleep: Sleep,
+    wake: Notify,
     counters: Counters,
 }
 
@@ -142,13 +173,30 @@ impl GcWorker {
         cfg: GcConfig,
         now: Now,
     ) -> Self {
+        let sleep = system_sleep(now.clone());
         Self {
             index,
             store,
             cfg,
             now,
+            sleep,
+            wake: Notify::new(),
             counters: Counters::default(),
         }
+    }
+
+    /// Таймер воркера (тесты: по часам testkit).
+    #[cfg(test)]
+    fn with_sleep(mut self, sleep: Sleep) -> Self {
+        self.sleep = sleep;
+        self
+    }
+
+    /// Сигнал после фиксации обнуления ссылок (или любого изменения учёта): воркер сверит ближайший
+    /// срок и перевзведёт таймер. Не обязателен для корректности — без сигнала срок сверяется
+    /// не реже `min(max_wait, window)`.
+    pub fn wake(&self) {
+        self.wake.notify_one();
     }
 
     /// Снимок метрик.
@@ -172,7 +220,7 @@ impl GcWorker {
         self.pass(None).await
     }
 
-    /// Периодические проходы под лизой лидера до `shutdown`; `holder` — идентификатор узла.
+    /// Проходы под лизой лидера по ближайшему сроку до `shutdown`; `holder` — идентификатор узла.
     /// Футура — `Send` (при `Send`-футуре `shutdown`): запускается через `tokio::spawn`.
     pub async fn run(
         &self,
@@ -185,10 +233,77 @@ impl GcWorker {
             name: &self.cfg.lease_name,
             holder,
             ttl: self.cfg.lease_ttl,
-            interval: self.cfg.interval,
             what: "blob-gc",
         };
-        run_leased(s, shutdown, self).await;
+        tokio::pin!(shutdown);
+        let mut held: Option<Lease> = None;
+        // Просроченное — не раньше этого момента (после прохода, ошибки или без лизы): иначе
+        // необработанный кандидат взводил бы таймер в прошлое.
+        let mut floor: Option<OffsetDateTime> = None;
+        loop {
+            let now = (self.now)();
+            let wait = self.cfg.max_wait.min(self.cfg.window);
+            let cap = after(now, wait.max(Duration::from_millis(1)));
+            let (at, pass) = match self.next_due(now, cap).await {
+                Ok(Some(due)) if due <= now => (floor.map_or(now, |f| f.max(now)), true),
+                Ok(Some(due)) => (due, true),
+                Ok(None) => (cap, false),
+                Err(e) => {
+                    inc(&self.counters.errors);
+                    tracing::warn!(error = %e, "ближайший срок GC BLOB не получен");
+                    (after(now, self.cfg.retry), false)
+                }
+            };
+            tokio::select! {
+                biased;
+                () = &mut shutdown => break,
+                // Изменение учёта в этом процессе: сверить срок и перевзвести таймер.
+                () = self.wake.notified() => {}
+                () = (self.sleep)(at), if !pass => {}
+                () = (self.sleep)(at), if pass => {
+                    let outcome = tick(s, &mut held, self).await;
+                    let now = (self.now)();
+                    floor = Some(match outcome {
+                        Tick::NotLeader => after(now, self.cfg.lease_ttl),
+                        Tick::Done | Tick::Failed => after(now, self.cfg.retry),
+                    });
+                }
+            }
+        }
+        release(s, held).await;
+    }
+
+    /// Ближайший срок удаления, если он не позже `cap`; просроченные кандидаты — срок `now`.
+    /// Срок записи — `zero_since + W`: при `zero_since < t` проход в момент `t + W` её удаляет.
+    async fn next_due(
+        &self,
+        now: OffsetDateTime,
+        cap: OffsetDateTime,
+    ) -> Result<Option<OffsetDateTime>> {
+        let w = self.cfg.window;
+        let any = |t: OffsetDateTime| async move {
+            Ok::<_, tp_contracts::Error>(!self.index.gc_candidates(t, 1).await?.is_empty())
+        };
+        let mut lo = before(now, w);
+        if any(lo).await? {
+            return Ok(Some(now));
+        }
+        let mut hi = before(cap, w);
+        if hi <= lo || !any(hi).await? {
+            return Ok(None);
+        }
+        // Нет записей с `zero_since < lo`, есть с `zero_since < hi`.
+        let step = time::Duration::try_from(self.cfg.precision.max(Duration::from_millis(1)))
+            .unwrap_or(time::Duration::SECOND);
+        while hi - lo > step {
+            let mid = lo + (hi - lo) / 2;
+            if any(mid).await? {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Ok(Some(after(hi, w)))
     }
 
     async fn pass(&self, mut leader: Option<&mut Leader<'_>>) -> Result<GcPass> {
@@ -450,10 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_under_lease() {
-        let e = env(GcConfig {
-            interval: Duration::from_secs(3600),
-            ..GcConfig::default()
-        });
+        let e = env(GcConfig::default());
         let key = put(&e, "leader", 1).await;
         e.index
             .release(T, &key.hash, key.generation, 1)
@@ -530,5 +642,219 @@ mod tests {
         task.await.expect("задача");
         assert!(!e.store.contains(&key));
         assert_eq!(leases.holder("blob-gc"), None);
+    }
+
+    /// Таймер на часах testkit: запоминает взведённые сроки.
+    fn test_sleep(
+        clock: &ManualClock,
+        armed: &Arc<std::sync::Mutex<Vec<OffsetDateTime>>>,
+    ) -> Sleep {
+        let (clock, armed) = (clock.clone(), armed.clone());
+        Arc::new(move |at| {
+            armed.lock().expect("lock").push(at);
+            let clock = clock.clone();
+            Box::pin(async move {
+                while clock.now() < at {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        })
+    }
+
+    async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+        let wait = async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap_or_else(|_| panic!("не дождались: {what}"));
+    }
+
+    /// Воркер под лизой на часах testkit.
+    struct Rig {
+        e: Env,
+        gc: Arc<GcWorker>,
+        armed: Arc<std::sync::Mutex<Vec<OffsetDateTime>>>,
+        stop: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Rig {
+        fn start(e: Env, cfg: GcConfig) -> Self {
+            let armed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let c = e.clock.clone();
+            let gc = Arc::new(
+                GcWorker::new(
+                    Arc::new(e.index.clone()),
+                    Arc::new(e.store.clone()),
+                    GcConfig {
+                        window: Duration::from_secs(W),
+                        max_deletes_per_sec: 0,
+                        ..cfg
+                    },
+                    Arc::new(move || c.now()),
+                )
+                .with_sleep(test_sleep(&e.clock, &armed)),
+            );
+            let leases = Arc::new(MemLease::new(e.clock.shared()));
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let w = gc.clone();
+            let task = tokio::spawn(async move {
+                w.run(&*leases, "node-a", async {
+                    stopped.await.ok();
+                })
+                .await;
+            });
+            Self {
+                e,
+                gc,
+                armed,
+                stop,
+                task,
+            }
+        }
+
+        fn armed(&self) -> Vec<OffsetDateTime> {
+            self.armed.lock().expect("lock").clone()
+        }
+
+        fn last(&self) -> Option<OffsetDateTime> {
+            self.armed().last().copied()
+        }
+
+        async fn shutdown(self) {
+            self.stop.send(()).ok();
+            tokio::time::timeout(Duration::from_secs(5), self.task)
+                .await
+                .expect("воркер остановлен")
+                .expect("задача");
+        }
+    }
+
+    async fn zeroed(e: &Env, body: &'static str) -> (BlobKey, OffsetDateTime) {
+        let key = put(e, body, 1).await;
+        e.index
+            .release(T, &key.hash, key.generation, 1)
+            .await
+            .expect("вызов");
+        (key, e.clock.now())
+    }
+
+    fn secs(n: u64) -> time::Duration {
+        time::Duration::try_from(Duration::from_secs(n)).expect("длительность")
+    }
+
+    /// Один таймер на ближайший срок: объект удаляется в срок (с точностью `precision`),
+    /// без периодических проходов.
+    #[tokio::test]
+    async fn timer_on_nearest_due() {
+        let e = env(GcConfig::default());
+        let (a, za) = zeroed(&e, "first").await;
+        e.clock.advance(Duration::from_secs(100));
+        let (b, zb) = zeroed(&e, "second").await;
+        let r = Rig::start(
+            e,
+            GcConfig {
+                max_wait: Duration::from_secs(100 * W),
+                precision: Duration::from_secs(1),
+                ..GcConfig::default()
+            },
+        );
+
+        // Таймер — на срок первого: не раньше `zero_since + W`, не позже на `precision`.
+        until("таймер на срок первого", || {
+            r.last()
+                .is_some_and(|t| t > za + secs(W) && t <= za + secs(W + 1))
+        })
+        .await;
+        let due_a = r.last().expect("срок");
+        r.e.clock.set(due_a - secs(1));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(r.e.store.contains(&a));
+        assert_eq!(r.gc.metrics().passes, 0);
+
+        r.e.clock.set(due_a);
+        until("первый удалён", || !r.e.store.contains(&a)).await;
+        assert!(r.e.store.contains(&b));
+        until("таймер на срок второго", || {
+            r.last()
+                .is_some_and(|t| t > zb + secs(W) && t <= zb + secs(W + 1))
+        })
+        .await;
+        assert_eq!(r.gc.metrics().passes, 1);
+
+        r.e.clock.set(r.last().expect("срок"));
+        until("второй удалён", || !r.e.store.contains(&b)).await;
+        // Кандидатов нет: таймер — только сверка не позже чем через `min(max_wait, window)`, без прохода.
+        let now = r.e.clock.now();
+        until("сверка через окно", || {
+            r.last() == Some(now + secs(W))
+        })
+        .await;
+        r.e.clock.advance(Duration::from_secs(W));
+        until("сверка повторена", || {
+            r.last() == Some(now + secs(2 * W))
+        })
+        .await;
+        assert_eq!(r.gc.metrics().passes, 2);
+        r.shutdown().await;
+    }
+
+    /// Сигнал `wake` — сверка срока без движения часов.
+    #[tokio::test]
+    async fn wake_rechecks_due() {
+        let e = env(GcConfig::default());
+        let r = Rig::start(
+            e,
+            GcConfig {
+                max_wait: Duration::from_secs(60),
+                ..GcConfig::default()
+            },
+        );
+        let t0 = r.e.clock.now();
+        until("сверка через max_wait", || {
+            r.last() == Some(t0 + secs(60))
+        })
+        .await;
+        let n = r.armed().len();
+        r.gc.wake();
+        until("перевзвод по сигналу", || {
+            r.armed().len() > n
+        })
+        .await;
+        assert_eq!(r.gc.metrics().passes, 0);
+        r.shutdown().await;
+    }
+
+    /// Ошибка хранилища в проходе: повтор не раньше `retry`, а не немедленно.
+    #[tokio::test]
+    async fn error_retried_after_retry() {
+        let e = env(GcConfig::default());
+        let (key, _) = zeroed(&e, "flaky").await;
+        e.clock.advance(Duration::from_secs(W + 1));
+        e.store.fail_next(BlobOp::Delete, Error::UNAVAILABLE);
+        let t0 = e.clock.now();
+        let r = Rig::start(
+            e,
+            GcConfig {
+                retry: Duration::from_secs(30),
+                ..GcConfig::default()
+            },
+        );
+        until("ошибка прохода", || r.gc.metrics().errors == 1).await;
+        until("повтор через retry", || {
+            r.last() == Some(t0 + secs(30))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(r.e.store.contains(&key));
+        r.e.clock.advance(Duration::from_secs(30));
+        until("удалён повтором", || {
+            !r.e.store.contains(&key)
+        })
+        .await;
+        r.shutdown().await;
     }
 }
