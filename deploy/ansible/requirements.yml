@@ -6,3 +6,6 @@ collections:
     version: ">=2.16.0"
   - name: community.postgresql
     version: ">=3.4.0"
+  # Стенд (deploy/stand): образ imaptest на генераторе.
+  - name: containers.podman
+    version: ">=1.10.0"

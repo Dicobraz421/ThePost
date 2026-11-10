@@ -1,0 +1,141 @@
+# Генератор нагрузки стенда SMB. Повторный прогон ничего не меняет.
+---
+- name: Check parameters
+  ansible.builtin.assert:
+    that:
+      - stand_user_password | length > 0
+      - stand_provision in ['none', 'ldif']
+    fail_msg: "Задайте stand_user_password (ansible-vault); stand_provision — none или ldif"
+
+- name: Install load tools
+  ansible.builtin.apt:
+    name: [postfix, swaks, podman, curl, python3]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# Postfix нужен только ради smtp-source и smtp-sink: свой MTA генератора не работает.
+- name: Stop Postfix MTA on generator
+  ansible.builtin.systemd_service:
+    name: postfix
+    state: stopped
+    enabled: false
+
+- name: Resolve SMB host name on generator
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "\\s{{ stand_smb_hostname | regex_escape }}$"
+    line: "{{ stand_smb_address }} {{ stand_smb_hostname }}"
+
+- name: Create stand directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ stand_etc_dir }}", mode: "0700" }
+    - { path: "{{ stand_dir }}", mode: "0755" }
+    - { path: "{{ stand_dir }}/corpus", mode: "0755" }
+    - { path: "{{ stand_dir }}/reports", mode: "0755" }
+    - { path: "{{ stand_dir }}/sink", mode: "0777" }
+
+- name: Read CA of SMB node (internal certificate)
+  ansible.builtin.slurp:
+    src: "{{ hostvars[stand_smb_host].thepost_pki_dir | default('/etc/thepost/pki') }}/ca.pem"
+  delegate_to: "{{ stand_smb_host }}"
+  register: stand_ca
+  when: hostvars[stand_smb_host].thepost_tls_mode | default('certbot') == 'internal'
+
+- name: Install CA of SMB node
+  ansible.builtin.copy:
+    content: "{{ stand_ca.content | b64decode }}"
+    dest: "{{ stand_etc_dir }}/ca.pem"
+    owner: root
+    group: root
+    mode: "0644"
+  when: stand_ca is not skipped
+
+- name: Download k6
+  ansible.builtin.get_url:
+    url: "{{ stand_k6_url }}"
+    checksum: "{{ stand_k6_checksum }}"
+    dest: "/var/cache/k6-v{{ stand_k6_version }}.tar.gz"
+    mode: "0644"
+
+- name: Unpack k6
+  ansible.builtin.unarchive:
+    src: "/var/cache/k6-v{{ stand_k6_version }}.tar.gz"
+    dest: /opt
+    remote_src: true
+    creates: "/opt/k6-v{{ stand_k6_version }}-linux-{{ stand_k6_arch }}/k6"
+
+- name: Link k6
+  ansible.builtin.file:
+    src: "/opt/k6-v{{ stand_k6_version }}-linux-{{ stand_k6_arch }}/k6"
+    dest: /usr/local/bin/k6
+    state: link
+
+- name: Pull imaptest image
+  containers.podman.podman_image:
+    name: "{{ stand_imaptest_image }}"
+
+- name: Install smtp-sink service (receiver of outgoing mail)
+  ansible.builtin.template:
+    src: thepost-stand-sink.service.j2
+    dest: /etc/systemd/system/thepost-stand-sink.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart smtp-sink
+
+- name: Start smtp-sink
+  ansible.builtin.systemd_service:
+    name: thepost-stand-sink
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Install stand scripts
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ stand_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: [make-corpus.py, jmap.js, run-scenario.sh]
+
+- name: Write stand parameters
+  ansible.builtin.template:
+    src: stand.env.j2
+    dest: "{{ stand_etc_dir }}/stand.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Write accounts for directory import (LDIF)
+  ansible.builtin.template:
+    src: users.ldif.j2
+    dest: "{{ stand_etc_dir }}/users.ldif"
+    owner: root
+    group: root
+    mode: "0600"
+  when: stand_provision == 'ldif'
+  no_log: true
+
+- name: Build message corpus (D.3)
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ stand_dir }}/make-corpus.py"
+      - "{{ stand_dir }}/corpus"
+      - "{{ stand_corpus_messages }}"
+      - "{{ stand_model.message_size_kb }}"
+      - "{{ stand_model.attachment_share }}"
+      - "{{ stand_model.attachment_size_kb }}"
+      - "{{ stand_model.mime_duplicate_share }}"
+    creates: "{{ stand_dir }}/corpus/imaptest.mbox"
