@@ -546,9 +546,15 @@ pub fn runs(nums: &[u32]) -> Vec<(u32, u32)> {
 
 /// Набор номеров (`1:3,7`) для кодов ответа (`MODIFIED`); пустой — `None`.
 pub fn sequence_set(nums: &[u32]) -> Option<types::sequence::SequenceSet> {
+    range_set(&runs(nums))
+}
+
+/// Набор номеров из отрезков (`VANISHED`); пустой — `None`.
+pub fn range_set(ranges: &[(u32, u32)]) -> Option<types::sequence::SequenceSet> {
     use types::sequence::{SeqOrUid, Sequence, SequenceSet};
-    let seqs: Vec<Sequence> = runs(nums)
-        .into_iter()
+    let seqs: Vec<Sequence> = ranges
+        .iter()
+        .copied()
         .map(|(a, b)| {
             let (a, b) = (SeqOrUid::Value(nz(a)), SeqOrUid::Value(nz(b)));
             if a == b {

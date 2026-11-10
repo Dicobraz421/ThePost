@@ -210,19 +210,25 @@ impl<T: Transport> Session<T> {
     }
 
     /// Убирает письма (индексы снимка) из выбранной папки и сообщает `EXPUNGE` (по убыванию номеров,
-    /// чтобы номера ещё не сообщённых писем не сдвигались).
+    /// чтобы номера ещё не сообщённых писем не сдвигались) или `VANISHED` (QRESYNC).
     pub(crate) fn expunged(&mut self, indexes: &[usize]) {
         let mut sorted = indexes.to_vec();
         sorted.sort_unstable_by(|a, b| b.cmp(a));
         sorted.dedup();
         let mut seqs = Vec::new();
+        let mut uids = Vec::new();
         if let Some(selected) = self.selected.as_mut() {
             for i in sorted {
                 if i < selected.messages.len() {
-                    selected.messages.remove(i);
+                    uids.push(selected.messages.remove(i).0.0);
                     seqs.push(u32::try_from(i + 1).unwrap_or(u32::MAX));
                 }
             }
+        }
+        // После `ENABLE QRESYNC` — `VANISHED` вместо `EXPUNGE` (RFC 7162, 3.2.10).
+        if self.qresync {
+            self.vanished_now(&uids);
+            return;
         }
         for seq in seqs {
             self.data(Data::Expunge(proto::nz(seq)));

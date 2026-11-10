@@ -19,6 +19,7 @@ use crate::proto::types::flag::{Flag as ImapFlag, FlagNameAttribute, FlagPerm};
 use crate::proto::types::mailbox::Mailbox as ImapMailbox;
 use crate::proto::types::response::{Code, Data, StatusKind};
 use crate::proto::{self, ListCommand, StatusItem};
+use crate::qresync::QResync;
 use crate::session::{Selected, Session, Transport};
 
 /// Разделитель иерархии.
@@ -397,6 +398,7 @@ impl<T: Transport> Session<T> {
         tag: &Tag<'static>,
         mailbox: &[u8],
         read_only: bool,
+        qresync: Option<&QResync>,
     ) -> Result<()> {
         // Неуспешный SELECT оставляет сессию без выбранной папки (RFC 9051, 6.3.2).
         if self.selected.take().is_some() {
@@ -483,6 +485,10 @@ impl<T: Transport> Session<T> {
             modseq: st.highest_modseq,
             messages: list.iter().map(|m| (m.uid, m.id)).collect(),
         });
+        if let Some(q) = qresync {
+            self.qresync_select(q, id, st.uid_validity, st.uid_next, &list)
+                .await?;
+        }
         let (code, verb) = if read_only {
             (Code::ReadOnly, "EXAMINE")
         } else {

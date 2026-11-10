@@ -8,6 +8,7 @@
 //! - `store` — STORE и CONDSTORE (`UNCHANGEDSINCE`, `MODSEQ`).
 //! - `search` — SEARCH и ESEARCH: метаданные и полнотекстовый индекс.
 //! - `write` — APPEND, COPY, MOVE, EXPUNGE, CLOSE (UIDPLUS).
+//! - `qresync` — QRESYNC: `SELECT … (QRESYNC …)`, `VANISHED`.
 //! - `idle` — IDLE и уведомления о выбранной папке (`EXISTS`, `EXPUNGE`, `FETCH FLAGS`).
 //! - [`config`] — секция `imap` config.yaml.
 
@@ -16,6 +17,7 @@ mod fetch;
 mod idle;
 mod mailbox;
 pub mod proto;
+mod qresync;
 mod search;
 pub mod session;
 mod store;

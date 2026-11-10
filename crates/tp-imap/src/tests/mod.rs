@@ -24,6 +24,7 @@ use crate::session::{Deps, Session, SessionCtx, Transport};
 mod fetch;
 mod idle;
 mod mailbox;
+mod qresync;
 mod search;
 mod session;
 mod store;
