@@ -11,6 +11,7 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use tp_contracts::Result;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::blob::{BlobIndex, BlobStore, ByteStream, Compression, ObjectStream};
 use tp_contracts::ext::{DecisionHooks, JmapCapability};
@@ -18,13 +19,12 @@ use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, Flags, SpecialUse};
 use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
-use tp_contracts::{Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, FakeSearch, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata,
-    MemPolicies, MemQuota, MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
+    MemOutbound, MemPolicies, MemQuota, MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
-use crate::{Deps, Jmap, JmapConfig, Outbound, RcptStatus, Submitted};
+use crate::{Deps, Jmap, JmapConfig};
 
 /// Права отправки: свой адрес — Send As, остальные — из таблицы.
 #[derive(Default)]
@@ -46,78 +46,6 @@ impl Authorizer for TestAuthz {
             .expect("lock")
             .get(&from.to_lowercase())
             .copied())
-    }
-}
-
-/// Поставленное в очередь письмо.
-#[derive(Debug, Clone)]
-pub struct Queued {
-    pub tenant: TenantId,
-    pub mail_from: String,
-    pub rcpts: Vec<String>,
-    pub raw: Bytes,
-}
-
-/// Очередь исходящей почты в памяти; `statuses` — статусы получателей для `submit` (остальные — в очереди).
-#[derive(Default)]
-pub struct TestOutbound(
-    pub Mutex<Vec<Queued>>,
-    pub Mutex<std::collections::HashMap<String, RcptStatus>>,
-);
-
-impl TestOutbound {
-    pub fn queued(&self) -> Vec<Queued> {
-        self.0.lock().expect("lock").clone()
-    }
-
-    /// Статус получателя `rcpt` для следующих отправок.
-    pub fn set_status(&self, rcpt: &str, status: RcptStatus) {
-        self.1
-            .lock()
-            .expect("lock")
-            .insert(rcpt.to_lowercase(), status);
-    }
-}
-
-#[async_trait]
-impl Outbound for TestOutbound {
-    async fn enqueue(
-        &self,
-        tenant: TenantId,
-        mail_from: &str,
-        rcpts: &[String],
-        raw: Bytes,
-    ) -> Result<()> {
-        self.0.lock().expect("lock").push(Queued {
-            tenant,
-            mail_from: mail_from.to_owned(),
-            rcpts: rcpts.to_vec(),
-            raw,
-        });
-        Ok(())
-    }
-
-    async fn submit(
-        &self,
-        tenant: TenantId,
-        mail_from: &str,
-        rcpts: &[String],
-        raw: Bytes,
-    ) -> Result<Submitted> {
-        self.enqueue(tenant, mail_from, rcpts, raw).await?;
-        let statuses = self.1.lock().expect("lock");
-        Ok(Submitted {
-            rcpts: rcpts
-                .iter()
-                .map(|r| {
-                    let st = statuses
-                        .get(&r.to_lowercase())
-                        .cloned()
-                        .unwrap_or(RcptStatus::Queued);
-                    (r.clone(), st)
-                })
-                .collect(),
-        })
     }
 }
 
@@ -198,7 +126,7 @@ pub struct Env {
     pub scope: AccountScope,
     pub principal: Principal,
     pub authz: Arc<TestAuthz>,
-    pub outbound: Arc<TestOutbound>,
+    pub outbound: Arc<MemOutbound>,
     pub bus: MemEventBus,
     /// Корзина (`purge`); настройка `trash.purge` — из `policies`.
     pub trash: MemTrash,
@@ -248,7 +176,7 @@ impl Env {
         auth.add_token("token-1", principal.clone());
         let search = FakeSearch::default();
         let authz = Arc::new(TestAuthz::default());
-        let outbound = Arc::new(TestOutbound::default());
+        let outbound = Arc::new(MemOutbound::default());
         let unpacking = Unpacking {
             inner: blobs,
             index: index.clone(),

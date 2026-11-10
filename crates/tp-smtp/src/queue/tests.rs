@@ -1015,3 +1015,13 @@ async fn smart_host_route_and_reload_on_signal() {
     assert_eq!(rec.mails().len(), 2);
     stop.cancel();
 }
+
+/// Контракт `Outbound` (CTR-28): `Queue` — все получатели в очереди, статусы в порядке запроса.
+#[tokio::test]
+async fn outbound_suite() {
+    let env = Env::new();
+    let q = Queue::new(env.deps.clone());
+    let rcpts = vec!["x@example.net".to_owned(), "Y@example.com".to_owned()];
+    tp_testkit::suite::outbound_submit(&q, TenantId::DEFAULT, &rcpts).await;
+    assert_eq!(env.queue.len(), 2);
+}

@@ -345,6 +345,12 @@ SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организа
 Устаревший захват — `Conflict`; не завершённые до истечения лизы получатели возвращаются в очередь без `attempts` + 1.
 Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
 Расписание повторов, срок доставки и DSN — `tp-smtp` (DSN ставится в очередь до `complete(.., Failed)`).
+Постановка письма протоколами — `Outbound` (CTR-28): `enqueue(tenant, mail_from, rcpts, raw: Bytes)`;
+`submit(..) -> Submitted { rcpts: Vec<(String, SubmitStatus::{ Delivered, Queued, Failed(reply) })> }` — статус по получателю в порядке
+запроса (по умолчанию — `enqueue`, все `Queued`). Реализации — `tp_smtp::queue::Queue` (тело в BLOB, ссылка, подпись DKIM `with_dkim`),
+`tp_smtp::Delivery` (локальные — сразу в ящики); потребители — submission SMTP, пересылки модулей, JMAP `EmailSubmission/set`.
+Маршрут правила потока (`FlowOutcome::route`) не передаётся — политика по домену назначения. In-memory — `MemOutbound`;
+набор `suite::outbound_submit`.
 
 ## Trash, Retention, Quota (Ф1)
 SRS 4.7, 3.8. Код — `retention.rs`. `TrashStore`: `list(scope, offset, limit) -> Vec<TrashItem { scope, object: TrashObject::Message(id), origin, size,
@@ -473,3 +479,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (`PgMeta` — пустая таблица до волны meta), переход `tp-smtp` — волны полос.
 - 2026-11-10 — CTR-40: ответ JMAP на `FlowVerdict::Reject` и `Decision::Deny` при отправке — `forbiddenToSend` (RFC 8621, как в JMAP-10),
   а не `forbidden`.
+- 2026-11-10 — CTR-28: `queue::Outbound` (`enqueue`, `submit`), `Submitted`, `SubmitStatus` — одно объявление вместо
+  `tp_smtp::deliver::Outbound` и `tp_jmap::Outbound`; `tp_smtp::{RcptStatus, Submitted}` (поле `id`) и `tp_jmap::{RcptStatus, Submitted}`
+  удалены. `FlowOutcome::route` в контракт не вошёл (очередь его не хранит). In-memory — `MemOutbound`; набор `suite::outbound_submit`.

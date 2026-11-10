@@ -352,7 +352,7 @@ async fn subaddress_catch_all_and_rewrite() {
         )
         .await
         .expect("submit");
-    assert_eq!(sent.rcpts[0].1, RcptStatus::Queued);
+    assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued);
     assert_eq!(env.queue.0.lock().expect("lock")[1].0, "sender@example.org");
 }
 
@@ -677,7 +677,7 @@ async fn submit_local_recipient_delivered_without_queue() {
         .expect("submit");
     assert_eq!(
         out.rcpts,
-        [("Bob@Example.org".to_owned(), RcptStatus::Delivered)]
+        [("Bob@Example.org".to_owned(), SubmitStatus::Delivered)]
     );
     let inbox = env.inbox("bob@example.org").await;
     assert_eq!(inbox.len(), 1);
@@ -716,9 +716,9 @@ async fn submit_mixed_recipients() {
     assert_eq!(
         out.rcpts,
         [
-            ("team@example.org".to_owned(), RcptStatus::Delivered),
-            ("x@example.net".to_owned(), RcptStatus::Queued),
-            ("postmaster@example.org".to_owned(), RcptStatus::Delivered),
+            ("team@example.org".to_owned(), SubmitStatus::Delivered),
+            ("x@example.net".to_owned(), SubmitStatus::Queued),
+            ("postmaster@example.org".to_owned(), SubmitStatus::Delivered),
         ]
     );
     // Группа и псевдоним: одна копия на учётную запись.
@@ -765,9 +765,9 @@ async fn submit_unknown_local_address_bounces() {
         [
             (
                 "nobody@example.org".to_owned(),
-                RcptStatus::Failed("550 5.1.1 mailbox unavailable".into())
+                SubmitStatus::Failed("550 5.1.1 mailbox unavailable".into())
             ),
-            ("bob@example.org".to_owned(), RcptStatus::Delivered),
+            ("bob@example.org".to_owned(), SubmitStatus::Delivered),
         ]
     );
     assert_eq!(env.inbox("bob@example.org").await.len(), 1);
@@ -799,7 +799,7 @@ async fn submit_full_mailbox_bounces() {
         out.rcpts,
         [(
             "bob@example.org".to_owned(),
-            RcptStatus::Failed("552 5.2.2 mailbox full".into())
+            SubmitStatus::Failed("552 5.2.2 mailbox full".into())
         )]
     );
     assert!(env.inbox("bob@example.org").await.is_empty());
@@ -828,10 +828,10 @@ async fn submit_mixed_without_queue() {
     assert_eq!(
         out.rcpts,
         [
-            ("bob@example.org".to_owned(), RcptStatus::Delivered),
+            ("bob@example.org".to_owned(), SubmitStatus::Delivered),
             (
                 "x@example.net".to_owned(),
-                RcptStatus::Failed("451 4.3.0 outbound queue unavailable".into())
+                SubmitStatus::Failed("451 4.3.0 outbound queue unavailable".into())
             ),
         ]
     );
@@ -868,7 +868,7 @@ async fn submit_mixed_without_queue() {
         )
         .await
         .expect("submit");
-    assert!(matches!(&out.rcpts[0].1, RcptStatus::Failed(r) if r.starts_with("451 4.3.0")));
+    assert!(matches!(&out.rcpts[0].1, SubmitStatus::Failed(r) if r.starts_with("451 4.3.0")));
 }
 
 #[tokio::test]
@@ -904,7 +904,7 @@ async fn forward_to_local_address_without_queue() {
         .expect("submit");
     assert_eq!(
         out.rcpts,
-        [("carol@example.org".to_owned(), RcptStatus::Delivered)]
+        [("carol@example.org".to_owned(), SubmitStatus::Delivered)]
     );
     assert_eq!(env.inbox("carol@example.org").await.len(), 2);
     assert_eq!(env.inbox("bob@example.org").await.len(), 2);
@@ -1101,7 +1101,7 @@ mod groups {
             .await
             .expect("submit");
         assert!(
-            matches!(&sent.rcpts[0].1, RcptStatus::Failed(r) if r.starts_with("550 5.7.1")),
+            matches!(&sent.rcpts[0].1, SubmitStatus::Failed(r) if r.starts_with("550 5.7.1")),
             "{sent:?}"
         );
         assert_eq!(env.inbox("alice@example.org").await.len(), 1);
@@ -1155,7 +1155,7 @@ mod groups {
             )
             .await
             .expect("submit");
-        assert_eq!(sent.rcpts[0].1, RcptStatus::Queued);
+        assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued);
         let held = env
             .groups
             .held(TenantId::DEFAULT, Some(g.id), 10)
@@ -1308,4 +1308,13 @@ mod tracking {
         let dump = format!("{events:?}");
         assert!(!dump.contains("secret body") && !dump.contains("hello"));
     }
+}
+
+/// Контракт `Outbound` (CTR-28): `Delivery` — локальные и внешние получатели, статусы в порядке запроса.
+#[tokio::test]
+async fn outbound_suite() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let d = env.delivery(true);
+    let list = rcpts(&["x@example.net", "team@example.org", "Bob@Example.org"]);
+    tp_testkit::suite::outbound_submit(&d, TenantId::DEFAULT, &list).await;
 }

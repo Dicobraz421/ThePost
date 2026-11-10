@@ -153,8 +153,8 @@ async fn unsigned_domains_and_missing_keys() {
 
 #[tokio::test]
 async fn queue_signs_before_enqueue() {
-    use crate::deliver::Outbound;
     use crate::queue::Queue;
+    use tp_contracts::queue::Outbound;
     let store = MemSecretStore::new(std::sync::Arc::new(SystemClock));
     store.set(&secret("rsa1"), RSA_PEM);
     let dkim = std::sync::Arc::new(DkimSign::new(std::sync::Arc::new(store), cfg("rsa1")));

@@ -16,8 +16,8 @@
 //!   локальные — сразу в ящики тем же `ingest` (SMTP-28), внешние — в очередь [`Outbound`].
 //!
 //! Отправка вне сессии SMTP (JMAP `EmailSubmission/set`) — [`Delivery::submit`] и `impl Outbound for Delivery`
-//! (CMP-04): локальные получатели доставляются сразу тем же `ingest`, внешние — в очередь (без очереди —
-//! `RcptStatus::Failed` с `451 4.3.0`, SMTP-28); статус по получателю.
+//! (CMP-04, контракт `tp_contracts::queue::Outbound`, CTR-28): локальные получатели доставляются сразу тем же
+//! `ingest`, внешние — в очередь (без очереди — `SubmitStatus::Failed` с `451 4.3.0`, SMTP-28); статус по получателю.
 //!
 //! Адресация ([`crate::address`]): получатели переписываются до разрешения, отправитель — после проверок;
 //! подадрес `user+tag` доставляется в ящик `user` с `Delivered-To: user+tag@…`, неизвестный адрес домена — на
@@ -42,7 +42,7 @@ use tp_contracts::ext::{CopyTo, Decision, DecisionHooks, SubmissionInfo};
 use tp_contracts::groups::DistributionGroup;
 use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested, MailStore};
 use tp_contracts::meta::{Account, AccountScope, AccountStore, MailboxStore, SpecialUse};
-use tp_contracts::queue::DsnRet;
+use tp_contracts::queue::{DsnRet, Outbound, SubmitStatus, Submitted};
 use tp_contracts::retention::Quota;
 use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
 
@@ -55,20 +55,6 @@ use crate::milter::{Milters, Verdict};
 use crate::server::{Envelope, Handler, Mode, Reply, is_positive, reply};
 use crate::tracking::{self, Mail, Step, Tracking, Trail};
 use tp_contracts::delivery::{DeliveryDecision as Dd, DeliveryEventKind as Ek};
-
-/// Очередь исходящей почты: внешние получатели submission и пересылки модулей. Реализация —
-/// [`crate::queue::Queue`] (`QueueStore` и `BlobStore`).
-#[async_trait]
-pub trait Outbound: Send + Sync + 'static {
-    /// Ставит письмо `raw` от `mail_from` получателям `rcpts` организации `tenant`.
-    async fn enqueue(
-        &self,
-        tenant: TenantId,
-        mail_from: &str,
-        rcpts: &[String],
-        raw: Bytes,
-    ) -> Result<()>;
-}
 
 /// Зависимости доставки, выбранные приложением.
 #[derive(Clone)]
@@ -700,7 +686,7 @@ impl Delivery {
             Some(q) => q.enqueue(self.deps.tenant, mail_from, &rcpts, raw).await,
             None => {
                 // Узел без очереди: внешних получателей submission не принимает (RCPT — 451, `submit` —
-                // `RcptStatus::Failed`), здесь остаются только внешние пересылки и копии модулей.
+                // `SubmitStatus::Failed`), здесь остаются только внешние пересылки и копии модулей.
                 tracing::warn!(
                     %id,
                     count = rcpts.len(),
@@ -976,9 +962,9 @@ impl Delivery {
     /// внешние — в очередь исходящей почты ([`Deps::outbound`]) письмом `raw` без изменений. Пересылки модулей
     /// на локальные адреса — сразу в ящики, на внешние — в очередь.
     ///
-    /// Неизвестный локальный адрес и переполненный ящик — статус [`RcptStatus::Failed`] и уведомление о
+    /// Неизвестный локальный адрес и переполненный ящик — статус [`SubmitStatus::Failed`] и уведомление о
     /// недоставке отправителю (как для входящей почты). Узел без очереди: внешние получатели —
-    /// `RcptStatus::Failed` с временной ошибкой [`NO_OUTBOUND`] без уведомления (статус получает отправитель),
+    /// `SubmitStatus::Failed` с временной ошибкой [`NO_OUTBOUND`] без уведомления (статус получает отправитель),
     /// локальные доставляются. Ошибка хранилища, каталога или очереди — `Err`.
     /// Другая организация (`tenant` ≠ `Deps::tenant`) — все получатели в очередь, как до CMP-04 (без очереди —
     /// все `Failed`).
@@ -996,17 +982,14 @@ impl Delivery {
             let status = match &self.deps.outbound {
                 Some(q) => {
                     q.enqueue(tenant, mail_from, rcpts, raw).await?;
-                    RcptStatus::Queued
+                    SubmitStatus::Queued
                 }
                 None => {
                     no_outbound(&id, rcpts.len());
-                    RcptStatus::Failed(NO_OUTBOUND.into())
+                    SubmitStatus::Failed(NO_OUTBOUND.into())
                 }
             };
-            return Ok(Submitted {
-                id,
-                rcpts: rcpts.iter().map(|r| (r.clone(), status.clone())).collect(),
-            });
+            return Ok(Submitted::all(rcpts, status));
         }
         let sender = self.sender_by_address(mail_from).await?;
         let prepared = self
@@ -1074,18 +1057,18 @@ impl Delivery {
             .map(|r| {
                 let status =
                     if let Some(f) = failed.iter().find(|f| f.address.eq_ignore_ascii_case(r)) {
-                        RcptStatus::Failed(f.reply.clone())
+                        SubmitStatus::Failed(f.reply.clone())
                     } else if prepared.held.iter().any(|(x, _)| x.eq_ignore_ascii_case(r)) {
                         // Ждёт решения модератора группы.
-                        RcptStatus::Queued
+                        SubmitStatus::Queued
                     } else if prepared.queued.iter().any(|x| x.eq_ignore_ascii_case(r)) {
                         if queue {
-                            RcptStatus::Queued
+                            SubmitStatus::Queued
                         } else {
-                            RcptStatus::Failed(NO_OUTBOUND.into())
+                            SubmitStatus::Failed(NO_OUTBOUND.into())
                         }
                     } else {
-                        RcptStatus::Delivered
+                        SubmitStatus::Delivered
                     };
                 (r.clone(), status)
             })
@@ -1104,10 +1087,7 @@ impl Delivery {
         self.track(mail_from, tracking::message_id(&raw).as_deref(), steps)
             .await;
         tracing::info!(%id, count = rcpts.len(), "smtp: отправка вне сессии обработана");
-        Ok(Submitted {
-            id,
-            rcpts: statuses,
-        })
+        Ok(Submitted { rcpts: statuses })
     }
 
     /// Заголовки трассировки письма, отправленного вне сессии SMTP ([`Delivery::submit`]).
@@ -1132,27 +1112,6 @@ impl Delivery {
     }
 }
 
-/// Статус доставки одному получателю при отправке вне сессии SMTP ([`Delivery::submit`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RcptStatus {
-    /// Доставлено в локальный ящик.
-    Delivered,
-    /// Поставлено в очередь исходящей почты (внешний адрес).
-    Queued,
-    /// Не доставлено: ответ SMTP. Неизвестный адрес, переполненный ящик — отправителю уведомление;
-    /// внешний адрес на узле без очереди — временная ошибка [`NO_OUTBOUND`], без уведомления.
-    Failed(String),
-}
-
-/// Итог [`Delivery::submit`]: идентификатор отправки и статус по каждому получателю в порядке запроса.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Submitted {
-    /// Идентификатор (журналы, заголовок `Received`).
-    pub id: String,
-    /// Получатель → статус.
-    pub rcpts: Vec<(String, RcptStatus)>,
-}
-
 /// Отправка через [`Delivery`]: локальные получатели — сразу в ящики, внешние — в очередь (CMP-04).
 /// Приложение подключает её вместо [`crate::queue::Queue`] для JMAP `EmailSubmission/set`.
 #[async_trait]
@@ -1164,14 +1123,24 @@ impl Outbound for Delivery {
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<()> {
-        let sent = self.submit(tenant, mail_from, rcpts, raw).await?;
+        let sent = Delivery::submit(self, tenant, mail_from, rcpts, raw).await?;
         // Узел без очереди и ни одной доставки: письмо никуда не попало — ошибка, повтор безопасен.
         // Иначе внешним получателям — только `Failed` в журнале (повтор задвоил бы локальную доставку).
-        let lost = |s: &RcptStatus| matches!(s, RcptStatus::Failed(r) if r == NO_OUTBOUND);
+        let lost = |s: &SubmitStatus| matches!(s, SubmitStatus::Failed(r) if r == NO_OUTBOUND);
         if !sent.rcpts.is_empty() && sent.rcpts.iter().all(|(_, s)| lost(s)) {
             return Err(Error::UNAVAILABLE);
         }
         Ok(())
+    }
+
+    async fn submit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<Submitted> {
+        Delivery::submit(self, tenant, mail_from, rcpts, raw).await
     }
 }
 

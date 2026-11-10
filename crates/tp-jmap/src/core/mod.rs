@@ -19,12 +19,11 @@ use tp_contracts::meta::{
     AccountScope, AccountStore, ChangeLog, MailboxStore, Message, MessageQuery, MessageStore,
     PolicyResolver,
 };
+use tp_contracts::queue::Outbound;
 use tp_contracts::retention::TrashStore;
 use tp_contracts::search::SearchIndex;
 use tp_contracts::transport::MailFlow;
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Result, TenantId};
-
-use crate::submission::Outbound;
 
 pub mod config;
 pub mod error;
