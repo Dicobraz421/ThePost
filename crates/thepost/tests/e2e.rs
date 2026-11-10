@@ -1,5 +1,6 @@
 //! Сквозной тест MVP (APP-05, SRS прил. Д.7): узел профиля SMB (`deploy/config/all.yaml`, все роли в одном процессе)
-//! против PostgreSQL — приём SMTP → IMAP FETCH и JMAP Email/get → поиск → удаление в корзину → восстановление.
+//! против PostgreSQL — приём SMTP → IMAP FETCH и JMAP Email/get → поиск → удаление в корзину → восстановление →
+//! отправка из JMAP локальному адресату (CMP-07).
 //!
 //! Без `TEST_DATABASE_URL` тест пропускается.
 
@@ -393,7 +394,11 @@ impl Jmap {
     /// Вызов одного метода; ответ метода (аргументы).
     async fn call(&self, method: &str, args: Value) -> Value {
         let req = json!({
-            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "using": [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:mail",
+                "urn:ietf:params:jmap:submission",
+            ],
             "methodCalls": [[method, args, "c0"]],
         });
         let (code, body) = http(self.addr, "POST", "/jmap/api", &self.auth, Some(&req)).await;
@@ -604,6 +609,84 @@ async fn mvp_mail_flow() {
     assert_eq!(exists(&imap.cmd("SELECT INBOX").await), 1);
     assert_eq!(jmap.query(json!({ "inMailbox": inbox })).await, ids);
     imap.cmd("LOGOUT").await;
+
+    // 7. Отправка из JMAP локальному адресату (CMP-07): письмо сразу во «Входящих» получателя — без DNS и очереди.
+    let bob_login = format!("bob@{domain}");
+    let bob = meta
+        .upsert(
+            tenant,
+            AccountUpsert {
+                domain: domain_id,
+                login: bob_login.clone(),
+                display_name: "Bob".into(),
+                external_id: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("bob");
+    let bob_scope = AccountScope {
+        tenant,
+        account: bob.id,
+    };
+    let (_, bob_secret) = apps.issue(bob_scope, "e2e").await.expect("issue bob");
+    let identities = jmap
+        .call("Identity/get", json!({ "accountId": jmap.account }))
+        .await;
+    let identity = identities["list"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("нет идентичности: {identities}"))
+        .to_owned();
+    let drafts = jmap.mailbox("drafts").await;
+    let sent_subject = "JMAP local submission";
+    let created = jmap
+        .call(
+            "Email/set",
+            json!({
+                "accountId": jmap.account,
+                "create": { "m": {
+                    "mailboxIds": { drafts: true },
+                    "from": [{ "name": "Alice", "email": login }],
+                    "to": [{ "name": "Bob", "email": bob_login }],
+                    "subject": sent_subject,
+                    "textBody": [{ "partId": "t", "type": "text/plain" }],
+                    "bodyValues": { "t": { "value": "Hello from JMAP.\n" } },
+                } },
+            }),
+        )
+        .await;
+    let email_id = created["created"]["m"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("черновик не создан: {created}"))
+        .to_owned();
+    let submitted = jmap
+        .call(
+            "EmailSubmission/set",
+            json!({
+                "accountId": jmap.account,
+                "create": { "s": { "identityId": identity, "emailId": email_id } },
+            }),
+        )
+        .await;
+    let status = &submitted["created"]["s"]["deliveryStatus"][&bob_login];
+    assert_eq!(status["delivered"], "yes", "{submitted}");
+    let bob_jmap = Jmap {
+        addr: jmap.addr,
+        auth: base64::engine::general_purpose::STANDARD
+            .encode(format!("{bob_login}:{}", bob_secret.expose())),
+        account: bob.id.to_string(),
+    };
+    let bob_inbox = bob_jmap.mailbox("inbox").await;
+    let got = bob_jmap.query(json!({ "inMailbox": bob_inbox })).await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    let got = bob_jmap
+        .call(
+            "Email/get",
+            json!({ "accountId": bob_jmap.account, "ids": got, "properties": ["subject", "from"] }),
+        )
+        .await;
+    assert_eq!(got["list"][0]["subject"], sent_subject, "{got}");
+    assert_eq!(got["list"][0]["from"][0]["email"], login, "{got}");
 
     shutdown.cancel();
     let report = running.wait().await.expect("wait");
