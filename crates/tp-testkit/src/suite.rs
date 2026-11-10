@@ -208,8 +208,8 @@ async fn next_signal(stream: &mut EventStream) -> Option<Event> {
         .expect("сигнал не пришёл")
 }
 
-/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37): `LogAppended`, `MembersChanged`, `Blocked`,
-/// `TrashChanged` приходят
+/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37, CTR-39): `LogAppended`, `MembersChanged`, `Blocked`,
+/// `Unblocked`, `TrashChanged` приходят
 /// в `subscribe_system()` и не приходят подписке учётной записи; `publish(Resync)` — `Invalid`.
 /// «Не пришло» проверяется тем, что первым пришёл сигнал, опубликованный позже.
 pub async fn signals(bus: &dyn EventBus) {
@@ -241,6 +241,12 @@ pub async fn signals(bus: &dyn EventBus) {
         system(
             scope.tenant,
             EventKind::Blocked {
+                subject: BlockSubject::Account(scope.account),
+            },
+        ),
+        system(
+            scope.tenant,
+            EventKind::Unblocked {
                 subject: BlockSubject::Account(scope.account),
             },
         ),
@@ -592,6 +598,46 @@ pub async fn abuse_blocks(
         blocks.blocked(tenant, &account).await,
         Ok(Some(at(ttl * 3)))
     );
+}
+
+/// Набор проверок сигналов `AbuseBlocks` (CTR-39): `blocks` публикует в `bus` (шину своей реализации)
+/// `Blocked { subject }` после `block` и `Unblocked { subject }` после `unblock` действующей блокировки, с
+/// организацией блокировки и `account = None`. `now` и `ttl` — как в [`abuse_blocks`]. Организация набора — новая.
+pub async fn abuse_blocks_signals(
+    blocks: &dyn AbuseBlocks,
+    bus: &dyn EventBus,
+    now: OffsetDateTime,
+    ttl: Duration,
+) {
+    let (base, _) = whole_second_after(now);
+    let tenant = TenantId::new();
+    let mut sys = bus.subscribe_system().await.expect("subscribe_system");
+    let signal = |kind| Event {
+        tenant,
+        account: None,
+        kind,
+    };
+    for subject in [
+        BlockSubject::Ip("203.0.113.9".parse().expect("ip")),
+        BlockSubject::net("2001:db8::".parse().expect("ip"), 48).expect("net"),
+        BlockSubject::Account(AccountId::new()),
+    ] {
+        blocks
+            .block(tenant, &subject, base + ttl, "signals")
+            .await
+            .expect("block");
+        assert_eq!(
+            next_signal(&mut sys).await,
+            Some(signal(EventKind::Blocked { subject }))
+        );
+        blocks.unblock(tenant, &subject).await.expect("unblock");
+        assert_eq!(
+            next_signal(&mut sys).await,
+            Some(signal(EventKind::Unblocked { subject })),
+            "снятие блокировки — сигнал"
+        );
+        assert_eq!(blocks.blocked(tenant, &subject).await, Ok(None));
+    }
 }
 
 // ---------- SecretStore ----------
