@@ -1,0 +1,18 @@
+# The Post: сокет порта 443 (JMAP/HTTPS) — его слушает systemd и передаёт thepost.service (LISTEN_FDS, SRS 2.7).
+# Адрес слушателя в config.yaml — 0.0.0.0:443, [::]:443 или ровно адрес ListenStream= (drop-in:
+# `systemctl edit thepost-https.socket`, «ListenStream=» и новый адрес). Перезапуск thepost не закрывает сокет:
+# соединения ждут в очереди.
+
+[Unit]
+Description=The Post JMAP/HTTPS socket (port 443)
+Documentation=https://github.com/Dicobraz421/ThePost
+
+[Socket]
+ListenStream=443
+BindIPv6Only=both
+FileDescriptorName=https
+Service=thepost.service
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target

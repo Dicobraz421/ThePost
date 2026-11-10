@@ -45,3 +45,9 @@ openbao_thepost_role_id_file: /etc/thepost/openbao/role_id
 openbao_thepost_secret_id_file: /etc/thepost/credentials/openbao-secret-id
 openbao_thepost_token_ttl: 1h
 openbao_thepost_token_max_ttl: 24h
+# Секреты KV thepost с паролями учётных записей PostgreSQL (путь → имя роли; DEP-08): db — узел (database.url),
+# db-owner — владелец схемы (database.owner, миграции), db-readonly — только чтение (узлу недоступен, политика).
+openbao_thepost_db_secrets:
+  db: thepost
+  db-owner: thepost_owner
+  db-readonly: thepost_readonly

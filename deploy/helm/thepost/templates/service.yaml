@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "thepost.fullname" . }}
+  labels:
+    {{- include "thepost.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "thepost.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- range $name, $p := .Values.ports }}
+    - name: {{ $name }}
+      port: {{ $p.service }}
+      targetPort: {{ $name }}
+      protocol: TCP
+    {{- end }}

@@ -1,0 +1,18 @@
+# The Post: сокет порта 993 (IMAP/TLS) — его слушает systemd и передаёт thepost.service (LISTEN_FDS, SRS 2.7).
+# Адрес слушателя в config.yaml — 0.0.0.0:993, [::]:993 или ровно адрес ListenStream= (drop-in:
+# `systemctl edit thepost-imaps.socket`, «ListenStream=» и новый адрес). Перезапуск thepost не закрывает сокет:
+# соединения ждут в очереди.
+
+[Unit]
+Description=The Post IMAP/TLS socket (port 993)
+Documentation=https://github.com/Dicobraz421/ThePost
+
+[Socket]
+ListenStream=993
+BindIPv6Only=both
+FileDescriptorName=imaps
+Service=thepost.service
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target

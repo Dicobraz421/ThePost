@@ -1,0 +1,18 @@
+# The Post: сокет порта 587 (submission) — его слушает systemd и передаёт thepost.service (LISTEN_FDS, SRS 2.7).
+# Адрес слушателя в config.yaml — 0.0.0.0:587, [::]:587 или ровно адрес ListenStream= (drop-in:
+# `systemctl edit thepost-submission.socket`, «ListenStream=» и новый адрес). Перезапуск thepost не закрывает сокет:
+# соединения ждут в очереди.
+
+[Unit]
+Description=The Post submission socket (port 587)
+Documentation=https://github.com/Dicobraz421/ThePost
+
+[Socket]
+ListenStream=587
+BindIPv6Only=both
+FileDescriptorName=submission
+Service=thepost.service
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Начальная настройка OpenBao в Kubernetes для The Post: KV v2 `thepost`, политика `thepost`
-# (deploy/openbao/thepost-policy.hcl), вход Kubernetes auth для сервисного аккаунта thepost, пароль роли PostgreSQL.
+# (deploy/openbao/thepost-policy.hcl), вход Kubernetes auth для сервисного аккаунта thepost, пароли учётных записей PostgreSQL.
 # Запуск — после `bao operator init` (ключи восстановления и root-токен остаются у администратора):
 #   BAO_TOKEN=<токен администратора> sh deploy/helm/openbao/bootstrap.sh [<пространство OpenBao> [<пространство thepost>]]
 # Повторный запуск ничего не меняет. Токен передаётся в под через stdin, не аргументами.
@@ -27,11 +27,16 @@ bao write auth/kubernetes/config kubernetes_host="https://$KUBERNETES_SERVICE_HO
 # Токен узла живёт час и продлевается до суток, затем — новый вход.
 bao write auth/kubernetes/role/thepost bound_service_account_names=thepost \
   bound_service_account_namespaces="$APP_NS" token_policies=thepost token_ttl=1h token_max_ttl=24h >/dev/null
-# Пароль роли thepost в PostgreSQL — случайный при первом запуске; в СУБД его задаёт администратор (deploy/README.md).
-if ! bao kv get -mount=thepost db >/dev/null 2>&1; then
-  head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' | bao kv put -mount=thepost db username=thepost password=- >/dev/null
-  echo "bootstrap: записан секрет thepost/db"
-fi
+# Пароли учётных записей PostgreSQL (DEP-08) — случайные при первом запуске: узел thepost (thepost/db), владелец
+# схемы thepost_owner (thepost/db-owner), только чтение thepost_readonly (thepost/db-readonly, узлу недоступен).
+# В СУБД их задаёт администратор (deploy/README.md, compose/postgres/app-role.sh).
+for s in db:thepost db-owner:thepost_owner db-readonly:thepost_readonly; do
+  if ! bao kv get -mount=thepost "${s%%:*}" >/dev/null 2>&1; then
+    head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' \
+      | bao kv put -mount=thepost "${s%%:*}" username="${s#*:}" password=- >/dev/null
+    echo "bootstrap: записан секрет thepost/${s%%:*}"
+  fi
+done
 echo "bootstrap: KV thepost, политика thepost, Kubernetes auth (роль thepost, пространство $APP_NS) — готово"
 EOF
 } | kubectl exec -i -n "$NS" "$POD" -- sh -s
