@@ -139,6 +139,19 @@ async fn collect_max(s: ByteStream, max: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Содержимое сжатого объекта после чтения через `Deps::blobs`: хэш должен совпасть с исходным содержимым,
+/// иначе `Error::Internal` — хранилище не распаковало объект (`Deps::blobs` без `Decompressing`), байты кадра
+/// zstd клиенту не отдаются.
+fn unpacked(key: &BlobKey, data: Vec<u8>) -> Result<Vec<u8>> {
+    if <[u8; 32]>::from(Sha256::digest(&data)) == key.hash.0 {
+        Ok(data)
+    } else {
+        Err(Error::internal(format!(
+            "blob {key}: сжатый объект не распакован (jmap::Deps::blobs без Decompressing)"
+        )))
+    }
+}
+
 impl Jmap {
     /// Содержимое blob учётной записи потоком; нет blob — `None`.
     pub(crate) async fn blob_stream(
@@ -168,8 +181,13 @@ impl Jmap {
             Some(BlobRef::Upload(key)) => match d.blob_index.compression(&key).await? {
                 None => Ok(None),
                 Some(Compression::None) => Ok(Some(d.blobs.get(&key, None).await?)),
-                // Загрузка пишет без сжатия; сжатым может быть только совпавший объект письма (CTR-21).
-                Some(c) => Err(Error::Internal(format!("сжатый объект загрузки ({c})"))),
+                // Загрузка пишет без сжатия; сжатым бывает совпавший по содержимому объект письма (CTR-21, MS-15):
+                // его распаковывает `Deps::blobs` (`Decompressing`).
+                Some(_) => {
+                    let data = collect_max(d.blobs.get(&key, None).await?, u64::MAX).await?;
+                    let data = Bytes::from(unpacked(&key, data)?);
+                    Ok(Some(stream::once(async move { Ok(data) }).boxed()))
+                }
             },
         }
     }
@@ -419,6 +437,7 @@ pub(crate) async fn copy(
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
+    use tp_contracts::blob::{BlobIndex, Compression};
     use tp_contracts::meta::{Flags, SpecialUse};
 
     use crate::JmapConfig;
@@ -574,6 +593,83 @@ mod tests {
         assert_eq!(body, b"secret");
         let (code, _, _) = http10(addr, &get_req(&format!("/jmap/download/{acc}/{blob}/x"))).await;
         assert_eq!(code, 200);
+    }
+
+    /// Загрузка файла, равного вложению принятого письма (MS-15: объект части сжат zstd), читается из объекта
+    /// письма с распаковкой (`Deps::blobs`) и скачивается без изменений; без распаковки — 500, не байты кадра.
+    #[tokio::test]
+    async fn upload_matches_compressed_part() {
+        let env = Env::new().await;
+        let addr = serve(env.jmap.clone()).await;
+        let acc = env.account();
+        let text: String = (0..200).map(|i| format!("строка отчёта {i}\r\n")).collect();
+        let raw = format!(
+            "From: a@x.test\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nтекст\r\n\
+             --b\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\
+             Content-Disposition: attachment; filename=r.txt\r\n\r\n{text}\r\n--b--\r\n"
+        );
+        let id = env
+            .deliver(env.mailbox(SpecialUse::Inbox), raw.as_bytes(), Flags::new())
+            .await;
+        let e = env
+            .call(
+                "Email/get",
+                json!({"accountId": acc, "ids": [id.to_string()], "properties": ["attachments"]}),
+                "Email/get",
+            )
+            .await;
+        let part = e["list"][0]["attachments"][0]["blobId"]
+            .as_str()
+            .expect("part blob");
+        let (code, _, file) = http10(
+            addr,
+            &get_req(&format!("/jmap/download/{acc}/{part}/r.txt")),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(file.len() > 1_000, "{}", file.len());
+
+        let (code, _, body) = http10(addr, &upload_req(&acc, "text/plain", &file)).await;
+        assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+        let up: Value = serde_json::from_slice(&body).expect("json");
+        let blob = up["blobId"].as_str().expect("blobId").to_owned();
+        let key = match super::parse_id(env.scope.tenant, &blob) {
+            Some(super::BlobRef::Upload(key)) => key,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            env.blobs
+                .index
+                .compression(&key)
+                .await
+                .expect("compression"),
+            Some(Compression::Zstd),
+            "загрузка совпала со сжатым объектом части"
+        );
+
+        // Хранилище без распаковки: ошибка, а не сжатые байты.
+        let (code, _, _) = http10(
+            addr,
+            &get_req(&format!("/jmap/download/{acc}/{blob}/r.txt")),
+        )
+        .await;
+        assert_eq!(code, 500);
+
+        env.blobs.known(&file);
+        let (code, _, body) = http10(
+            addr,
+            &get_req(&format!("/jmap/download/{acc}/{blob}/r.txt")),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(body, file);
+        let got = env
+            .jmap
+            .read_blob(env.scope, &blob, u64::MAX)
+            .await
+            .expect("read");
+        assert_eq!(got, Some(file));
     }
 
     /// По истечении `upload_ttl` загрузка недоступна и загрузившему.
