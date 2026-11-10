@@ -24,3 +24,10 @@
 1. `confine: { seccomp: log }`; перезапуск — предупреждение `seccomp в режиме журнала…`.
 2. `journalctl -k | grep 'type=1326'` — записи о вызовах вне профиля (если есть); узел работает.
    Найденные вызовы — в профиль (`crates/tp-sys/src/confine/seccomp.rs`) отдельной правкой.
+
+## Корневые сертификаты по ссылкам (SYS-08)
+1. Debian 12, `deploy/systemd/thepost.service`, секция `confine` по умолчанию; `ls -l /etc/ssl/certs/*.pem | head` —
+   ссылки в `/usr/share/ca-certificates`.
+2. `thepost doctor` — без ошибок корневых сертификатов (нет `EACCES`/`Permission denied`).
+3. Вход LDAP по TLS к серверу с публичным сертификатом (tp-auth) проходит; экспорт tp-admin с TLS — тоже.
+4. RHEL-семейство: то же с `/etc/pki/tls/certs/ca-bundle.crt` (ссылка в `/etc/pki/ca-trust/extracted`).

@@ -291,3 +291,82 @@ fn landlock_unsupported_is_warning() {
     };
     assert_eq!(thread_only.warnings().len(), 1);
 }
+
+/// Landlock проверяет цель ссылки: ссылка из разрешённого каталога на файл другого каталога
+/// читается, только если разрешён и он (SYS-08).
+#[test]
+fn landlock_follows_symlink_target() {
+    let dir = Dir::new("symlink");
+    let certs = dir.sub("certs", "local.pem");
+    let share = dir.sub("share", "ca.crt");
+    let link = certs.join("ca.pem");
+    std::os::unix::fs::symlink(share.join("ca.crt"), &link).expect("symlink");
+    let cfg = |system_read: Vec<PathBuf>| ConfineConfig {
+        system_read,
+        ..bare(SeccompMode::Off, true)
+    };
+
+    let c = Confinement::new(cfg(vec![certs.clone()]), edge(), RolePaths::default());
+    let l = link.clone();
+    confined(c, move |report| {
+        if report.landlock == LandlockOutcome::Unsupported {
+            return;
+        }
+        assert!(denied(std::fs::read(&l)), "цель ссылки вне списка");
+    });
+
+    let c = Confinement::new(
+        cfg(vec![certs.clone(), share.clone()]),
+        edge(),
+        RolePaths::default(),
+    );
+    confined(c, move |report| {
+        if report.landlock == LandlockOutcome::Unsupported {
+            return;
+        }
+        assert_eq!(std::fs::read(&link).expect("ссылка"), b"share");
+        assert!(std::fs::read_dir(&certs).expect("каталог ссылок").count() >= 2);
+    });
+}
+
+/// С настройками по умолчанию корневой сертификат читается по ссылке `/etc/ssl/certs/*.pem`
+/// (Debian/Ubuntu); без таких ссылок в системе — только состав списка.
+#[test]
+fn default_system_read_covers_ca_links() {
+    let cfg = ConfineConfig {
+        seccomp: SeccompMode::Off,
+        ..ConfineConfig::default()
+    };
+    for p in [
+        "/etc/ssl",
+        "/usr/share/ca-certificates",
+        "/usr/local/share/ca-certificates",
+        "/etc/pki",
+    ] {
+        assert!(cfg.system_read.contains(&PathBuf::from(p)), "{p}");
+    }
+    let allowed = cfg.system_read.clone();
+    let link = std::fs::read_dir("/etc/ssl/certs")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.extension().is_some_and(|e| e == "pem")
+                && p.is_symlink()
+                && std::fs::canonicalize(p).is_ok_and(|t| {
+                    !t.starts_with("/etc/ssl") && allowed.iter().any(|a| t.starts_with(a))
+                })
+        });
+    let Some(link) = link else {
+        return;
+    };
+    let c = Confinement::new(cfg, edge(), RolePaths::default());
+    confined(c, move |report| {
+        if report.landlock == LandlockOutcome::Unsupported {
+            return;
+        }
+        let pem = std::fs::read(&link).expect("корневой сертификат по ссылке");
+        assert!(!pem.is_empty(), "{}", link.display());
+    });
+}

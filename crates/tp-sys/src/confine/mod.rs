@@ -49,7 +49,9 @@ pub struct ConfineConfig {
     /// Ограничивать доступ к файловой системе через Landlock.
     pub landlock: bool,
     /// Служебные пути только для чтения для всех ролей: резолвер DNS, корневые сертификаты,
-    /// procfs и cgroups (SYS-06). Несуществующие пропускаются.
+    /// procfs и cgroups (SYS-06). Несуществующие пропускаются. Landlock проверяет цель символьной
+    /// ссылки: каталог, на который ссылаются файлы разрешённого, тоже должен быть в списке
+    /// (Debian/Ubuntu: `/etc/ssl/certs/*.pem` → `/usr/share/ca-certificates`).
     pub system_read: Vec<PathBuf>,
     /// Служебные пути для чтения и записи для всех ролей.
     pub system_rw: Vec<PathBuf>,
@@ -71,6 +73,10 @@ impl Default for ConfineConfig {
                 "/etc/host.conf",
                 "/etc/gai.conf",
                 "/etc/ssl",
+                // Цели ссылок `/etc/ssl/certs` (Debian/Ubuntu) и хранилище RHEL-семейства (SYS-08).
+                "/usr/share/ca-certificates",
+                "/usr/local/share/ca-certificates",
+                "/etc/pki",
                 "/proc/self",
                 "/proc/meminfo",
                 "/sys/fs/cgroup",
