@@ -1,5 +1,7 @@
-//! Hot reload конфигурации (SRS 5.5, CONTRACTS.md#Config): по SIGHUP, по запросу и по опросу mtime
-//! файл перечитывается, проверяется и рассылается через `watch`. Ошибка — прежняя версия остаётся в силе.
+//! Hot reload конфигурации (SRS 5.5, 2.8, CONTRACTS.md#Config): по событию ОС в каталоге файла (inotify,
+//! [`crate::fswatch`]; замена ConfigMap через символическую ссылку), по SIGHUP и по запросу файл перечитывается,
+//! проверяется и рассылается через `watch`. Опрос mtime — только если событий ОС нет. Ошибка — прежняя версия
+//! остаётся в силе.
 //!
 //! С хранилищем секретов ([`Reloader::with_secret_store`]) каждая версия рассылается с прочитанными секретами
 //! (`Config::secret`): секреты читаются при запуске и при каждом перечитывании — по SIGHUP и запросу даже без
@@ -21,12 +23,14 @@ use tp_contracts::role::{CancellationToken, ConfigRx, ConfigValue};
 use tp_contracts::secrets::{SecretLease, SecretStore};
 
 use crate::config::{CheckMode, Config, ConfigError, SectionRegistry};
+use crate::fswatch::{self, DirWatch, FsEvents};
 
 /// Секция `reload`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReloadConfig {
-    /// Период проверки mtime config.yaml (`5s`); `0s` — только по SIGHUP и запросу. Применяется без перезапуска.
+    /// Период запасного опроса mtime config.yaml (`5s`), только если события ОС (inotify) недоступны;
+    /// `0s` — без опроса, только по SIGHUP и запросу. Применяется без перезапуска.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub poll_interval: Duration,
@@ -72,6 +76,7 @@ pub struct Reloader {
     request: Arc<Notify>,
     secrets: Option<Store>,
     leases: Vec<Tracked>,
+    events: Arc<dyn FsEvents>,
 }
 
 /// Запрос перечитать конфигурацию (Admin API, тесты) — то же, что SIGHUP.
@@ -89,6 +94,7 @@ impl ReloadTrigger {
 enum Wake {
     Stop,
     Forced,
+    Fs,
     Poll,
     Lease,
 }
@@ -126,7 +132,14 @@ impl Reloader {
             request: Arc::new(Notify::new()),
             secrets: None,
             leases: Vec::new(),
+            events: fswatch::os_events(),
         })
+    }
+
+    /// Источник событий ОС об изменении каталога файла (по умолчанию — [`fswatch::os_events`]).
+    pub fn with_fs_events(mut self, events: Arc<dyn FsEvents>) -> Self {
+        self.events = events;
+        self
     }
 
     /// Подключает хранилище секретов: читает секреты текущей версии и рассылает её с ними; дальше секреты
@@ -201,21 +214,31 @@ impl Reloader {
         self.tx.send_replace(Arc::new(config));
     }
 
-    /// Работает до сигнала остановки: SIGHUP, [`ReloadTrigger`], опрос mtime с периодом `reload.poll_interval`
-    /// и сроки аренд секретов.
+    /// Работает до сигнала остановки: события ОС в каталоге файла, SIGHUP, [`ReloadTrigger`], сроки аренд
+    /// секретов; без событий ОС — опрос mtime с периодом `reload.poll_interval`.
     pub async fn run(mut self, shutdown: CancellationToken) {
         let mut hup = Hup::install();
+        let mut fs = DirWatch::new(self.events.clone());
         loop {
-            let poll = self
-                .current()
-                .section::<ReloadConfig>("reload")
-                .map(|c| c.poll_interval)
+            let path = self.path.clone();
+            let dirs = tokio::task::spawn_blocking(move || fswatch::dirs_of(&[&path]))
+                .await
                 .unwrap_or_default();
+            fs.ensure(dirs, "config");
+            let poll = if fs.active() {
+                Duration::ZERO
+            } else {
+                self.current()
+                    .section::<ReloadConfig>("reload")
+                    .map(|c| c.poll_interval)
+                    .unwrap_or_default()
+            };
             let lease_due = self.leases.iter().map(|t| t.due).min();
             let wake = tokio::select! {
                 () = shutdown.cancelled() => Wake::Stop,
                 () = self.request.notified() => Wake::Forced,
                 () = hup.recv() => Wake::Forced,
+                () = fs.changed() => Wake::Fs,
                 () = sleep_or_never(poll) => Wake::Poll,
                 () = sleep_until_or_never(lease_due) => Wake::Lease,
             };
@@ -227,6 +250,13 @@ impl Reloader {
                 }
                 Wake::Poll => {
                     if !self.file_changed().await {
+                        continue;
+                    }
+                }
+                Wake::Fs => {
+                    // Событие в каталоге может относиться к другому файлу: без изменения текста и секретов
+                    // секреты не перечитываются (они — по SIGHUP, запросу и срокам аренд).
+                    if !self.file_changed().await && !self.text_changed().await {
                         continue;
                     }
                 }
@@ -290,6 +320,14 @@ impl Reloader {
         }
     }
 
+    /// Текст файла отличается от применённого (ошибка чтения — тоже изменение: её покажет `reload`).
+    async fn text_changed(&self) -> bool {
+        match tokio::fs::read_to_string(&self.path).await {
+            Ok(text) => text != self.applied,
+            Err(_) => true,
+        }
+    }
+
     async fn file_changed(&mut self) -> bool {
         let stamp = tokio::fs::metadata(&self.path)
             .await
@@ -320,20 +358,20 @@ async fn sleep_or_never(period: Duration) {
 }
 
 /// SIGHUP процесса; без обработчика (ошибка установки) — никогда не срабатывает.
-struct Hup(Option<tp_sys::Signals>);
+pub(crate) struct Hup(Option<tp_sys::Signals>);
 
 impl Hup {
-    fn install() -> Self {
+    pub(crate) fn install() -> Self {
         match tp_sys::Signals::new() {
             Ok(s) => Self(Some(s)),
             Err(e) => {
-                tracing::warn!(error = %e, "SIGHUP handler not installed; reload by poll only");
+                tracing::warn!(error = %e, "SIGHUP handler not installed; reload by file events or poll only");
                 Self(None)
             }
         }
     }
 
-    async fn recv(&mut self) {
+    pub(crate) async fn recv(&mut self) {
         let Some(signals) = &mut self.0 else {
             return std::future::pending().await;
         };
@@ -391,6 +429,8 @@ mod tests {
     use tp_contracts::role::{CancellationToken, ReadyHandle};
 
     use super::*;
+    use crate::fswatch::NoFsEvents;
+    use crate::fswatch::tests::MemFsEvents;
 
     #[derive(Debug, Default, Deserialize, JsonSchema, PartialEq)]
     #[serde(default, deny_unknown_fields)]
@@ -472,11 +512,97 @@ mod tests {
         task.await.expect("join");
     }
 
+    /// Ждёт, пока цикл перечитывания поставит наблюдение.
+    async fn watched(events: &MemFsEvents) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.watches() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("watch installed");
+    }
+
+    /// Период опроса — час: изменение применяется только по событию.
+    const HOUR_MS: u64 = 3_600_000;
+
     #[tokio::test]
-    async fn poll_detects_mtime_change() {
+    async fn file_event_applies_without_waiting_for_poll() {
+        let file = TempFile::new("event", &cfg(1, HOUR_MS));
+        let events = Arc::new(MemFsEvents::default());
+        let reloader = Reloader::start_with(registry(), file.path().to_owned(), Vec::new())
+            .expect("start")
+            .with_fs_events(events.clone());
+        let mut rx = reloader.subscribe();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(reloader.run(shutdown.clone()));
+        watched(&events).await;
+
+        // Событие о другом файле каталога — версия не меняется.
+        let dir = file.path().parent().expect("dir");
+        assert_eq!(events.fire(dir), 1);
+        file.rewrite(&cfg(8, HOUR_MS), 0);
+        assert_eq!(events.fire(dir), 1);
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("in time")
+            .expect("changed");
+        assert_eq!(max(&rx.borrow_and_update()), 8);
+
+        shutdown.cancel();
+        task.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn configmap_symlink_swap_is_applied() {
+        let base = std::env::temp_dir().join(format!(
+            "tp-platform-configmap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let version = |name: &str, max_value: u32| {
+            let dir = base.join(name);
+            fs::create_dir_all(&dir).expect("dir");
+            fs::write(dir.join("config.yaml"), cfg(max_value, HOUR_MS)).expect("write");
+        };
+        // Раскладка kubelet: config.yaml -> ..data/config.yaml, ..data -> ..v1.
+        version("..v1", 1);
+        std::os::unix::fs::symlink("..v1", base.join("..data")).expect("data link");
+        std::os::unix::fs::symlink("..data/config.yaml", base.join("config.yaml"))
+            .expect("file link");
+
+        let events = Arc::new(MemFsEvents::default());
+        let reloader = Reloader::start_with(registry(), base.join("config.yaml"), Vec::new())
+            .expect("start")
+            .with_fs_events(events.clone());
+        let mut rx = reloader.subscribe();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(reloader.run(shutdown.clone()));
+        watched(&events).await;
+
+        // Атомарная подмена: новая версия, временная ссылка, rename поверх ..data.
+        version("..v2", 2);
+        std::os::unix::fs::symlink("..v2", base.join("..data_tmp")).expect("tmp link");
+        fs::rename(base.join("..data_tmp"), base.join("..data")).expect("swap");
+        assert!(events.fire(&base) >= 1, "parent directory is watched");
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("in time")
+            .expect("changed");
+        assert_eq!(max(&rx.borrow_and_update()), 2);
+
+        shutdown.cancel();
+        task.await.expect("join");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn poll_fallback_without_fs_events() {
         let file = TempFile::new("poll", &cfg(1, 20));
-        let reloader =
-            Reloader::start_with(registry(), file.path().to_owned(), Vec::new()).expect("start");
+        let reloader = Reloader::start_with(registry(), file.path().to_owned(), Vec::new())
+            .expect("start")
+            .with_fs_events(Arc::new(NoFsEvents));
         let mut rx = reloader.subscribe();
         let shutdown = CancellationToken::new();
         let stop = shutdown.clone();

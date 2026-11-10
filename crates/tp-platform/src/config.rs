@@ -36,6 +36,7 @@ use tp_contracts::tls::Profile;
 
 use crate::acme::AcmeConfig;
 use crate::load::{LOAD, LoadConfig};
+use crate::pressure::{PRESSURE, PressureConfig};
 use crate::privileges::{CONFINE, PRIVILEGES, PrivilegesConfig};
 use crate::ratelimit::RateLimitConfig;
 use crate::reload::ReloadConfig;
@@ -162,7 +163,7 @@ impl Default for SectionRegistry {
 
 impl SectionRegistry {
     /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`, `tls`, `ratelimit`, `acme`,
-    /// `secrets`, `resources` (SYS-06), `load` (PLT-15), `privileges` (PLT-16), `confine` (SYS-07).
+    /// `secrets`, `resources` (SYS-06), `load` (PLT-15), `privileges` (PLT-16), `confine` (SYS-07), `pressure` (PLT-17).
     pub fn new() -> Self {
         let mut r = Self {
             sections: BTreeMap::new(),
@@ -183,6 +184,7 @@ impl SectionRegistry {
         r.sections.insert(LOAD, def::<LoadConfig>());
         r.sections.insert(PRIVILEGES, def::<PrivilegesConfig>());
         r.sections.insert(CONFINE, def::<tp_sys::ConfineConfig>());
+        r.sections.insert(PRESSURE, def::<PressureConfig>());
         r.checks
             .entry("service_http")
             .or_default()
@@ -195,6 +197,10 @@ impl SectionRegistry {
             .entry(LOAD)
             .or_default()
             .push(check_fn(LoadConfig::check));
+        r.checks
+            .entry(PRESSURE)
+            .or_default()
+            .push(check_fn(PressureConfig::check));
         r
     }
 
