@@ -31,6 +31,10 @@
 //!         keys:
 //!           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim/example.org#s2026" } }
 //!           e2026: { algorithm: ed25519-sha256, key: { secret: "thepost/dkim/example.org#e2026" } }
+//!   screen:
+//!     mode: enforce
+//!     greet_delay: 6s
+//!     exempt: ["127.0.0.0/8", "10.0.0.0/8"]
 //! ```
 //!
 //! Слушатели (`inbound`, `submission`) применяются при запуске роли; лимиты и таймауты — к новым сессиям
@@ -68,6 +72,8 @@ pub struct SmtpConfig {
     pub queue: QueueConfig,
     /// DKIM-подпись исходящей почты.
     pub dkim: DkimConfig,
+    /// Экран соединений smtp-in (postscreen).
+    pub screen: ScreenConfig,
 }
 
 impl Default for SmtpConfig {
@@ -83,8 +89,73 @@ impl Default for SmtpConfig {
             milter: MilterConfig::default(),
             queue: QueueConfig::default(),
             dkim: DkimConfig::default(),
+            screen: ScreenConfig::default(),
         }
     }
+}
+
+/// Экран соединений smtp-in (SRS 4.1, модель postscreen Postfix; [`crate::screen`]). Применяется к новым
+/// соединениям без перезапуска.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScreenConfig {
+    /// Экран включён.
+    pub enabled: bool,
+    /// Что делать с нарушителем.
+    pub mode: ScreenMode,
+    /// Задержка приветствия: после первой строки `220-` сервер ждёт; клиент, заговоривший раньше, нарушает
+    /// протокол. `0` — без проверки.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub greet_delay: Duration,
+    /// Проверять конвейер команд без PIPELINING (до `EHLO`, после `HELO`, вслед за `EHLO`).
+    pub pipelining: bool,
+    /// Соединений с адреса за `rate_window`; сверх — отказ. `0` — без проверки.
+    pub max_rate: u32,
+    /// Окно подсчёта частоты соединений.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub rate_window: Duration,
+    /// Срок, на который адрес, прошедший проверки, освобождается от них.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub pass_ttl: Duration,
+    /// Срок, на который нарушитель отклоняется без проверки (режим `enforce`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub reject_ttl: Duration,
+    /// Адресов в кэше результатов и в таблице частоты.
+    pub cache_size: usize,
+    /// Сети без проверок (CIDR или адрес): узлы организации, доверенные шлюзы.
+    pub exempt: Vec<String>,
+}
+
+impl Default for ScreenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: ScreenMode::default(),
+            greet_delay: Duration::from_secs(6),
+            pipelining: true,
+            max_rate: 60,
+            rate_window: Duration::from_secs(60),
+            pass_ttl: Duration::from_secs(24 * 3600),
+            reject_ttl: Duration::from_secs(10 * 60),
+            cache_size: 100_000,
+            exempt: vec!["127.0.0.0/8".into(), "::1/128".into()],
+        }
+    }
+}
+
+/// Действие экрана при нарушении.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenMode {
+    /// Отказ и закрытие соединения; адрес запоминается на `reject_ttl`.
+    #[default]
+    Enforce,
+    /// Только журнал и метрика: сессия продолжается.
+    Log,
 }
 
 /// Лимиты сессии SMTP.

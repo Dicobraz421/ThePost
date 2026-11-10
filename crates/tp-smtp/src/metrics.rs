@@ -3,6 +3,8 @@
 //! - `tp_smtp_sessions_total{role}`, `tp_smtp_sessions_active{role}` — сессии smtp-in и submission;
 //! - `tp_smtp_connections_refused_total{role}` — отказ до сессии (лимит соединений, частота с адреса);
 //! - `tp_smtp_messages_total{role,result}` — письма после данных: `accepted` (2xx) или `rejected`;
+//! - `tp_smtp_screen_violations_total{reason,action}` — экран соединений: `pregreet`, `pipelining`, `rate`;
+//!   `rejected`, `logged` (режим журнала), `cached` (отказ по кэшу);
 //! - `tp_smtp_send_limited_total{kind}` — отказы по лимитам отправки (`messages`, `recipients`);
 //! - `tp_smtp_queue_claimed_total`, `tp_smtp_queue_inflight` — захваченные и обрабатываемые записи очереди;
 //! - `tp_smtp_queue_recipients_total{result}` — итоги попыток по получателям: `delivered`, `deferred`, `failed`;
@@ -28,6 +30,7 @@ pub struct SmtpMetrics {
     refused: Family<Labels1, Counter>,
     messages: Family<Labels2, Counter>,
     limited: Family<Labels1, Counter>,
+    screen: Family<Labels2, Counter>,
     claimed: Counter,
     inflight: Gauge,
     rcpts: Family<Labels1, Counter>,
@@ -42,6 +45,7 @@ impl Default for SmtpMetrics {
             refused: Family::default(),
             messages: Family::default(),
             limited: Family::default(),
+            screen: Family::default(),
             claimed: Counter::default(),
             inflight: Gauge::default(),
             rcpts: Family::default(),
@@ -110,6 +114,11 @@ impl SmtpMetrics {
             self.limited.clone(),
         );
         registry.register(
+            "tp_smtp_screen_violations",
+            "Нарушения, обнаруженные экраном соединений",
+            self.screen.clone(),
+        );
+        registry.register(
             "tp_smtp_queue_claimed",
             "Захваченные записи очереди исходящей почты",
             self.claimed.clone(),
@@ -156,6 +165,13 @@ impl SmtpMetrics {
     /// Отказ по лимиту отправки: `messages` или `recipients`.
     pub fn limited(&self, kind: &'static str) {
         self.limited.get_or_create(&[("kind", kind)]).inc();
+    }
+
+    /// Нарушение экрана соединений: `reason` — проверка, `action` — `rejected`, `logged`, `cached`.
+    pub fn screen(&self, reason: &'static str, action: &'static str) {
+        self.screen
+            .get_or_create(&[("reason", reason), ("action", action)])
+            .inc();
     }
 
     /// Захвачено `n` записей очереди.
