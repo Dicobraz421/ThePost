@@ -231,14 +231,14 @@
 | [META-25](META-25.md) | поиск primary и поведение при переключении СУБД | meta | A | meta-09 | done | META-02 |
 | [META-26](META-26.md) | сигналы через LISTEN/NOTIFY | meta | A | meta-10 | done | CTR-23,META-25 |
 | [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-10 | done | CTR-23,META-16 |
-| [CLU-09](CLU-09.md) | удалить шину Valkey | cluster | A | cluster-06 | ready | CTR-23 |
-| [CLU-10](CLU-10.md) | состав кластера и разделы по сигналу | cluster | A | cluster-06 | ready | CTR-23 |
-| [CLU-11](CLU-11.md) | запросы узел → узел (Rpc) | cluster | A | cluster-06 | ready | CTR-23 |
-| [APP-08](APP-08.md) | сборка взаимодействия без опроса | app | A | app-04 | todo | META-26,CLU-09,CLU-10 |
+| [CLU-09](CLU-09.md) | удалить шину Valkey | cluster | A | cluster-06 | done | CTR-23 |
+| [CLU-10](CLU-10.md) | состав кластера и разделы по сигналу | cluster | A | cluster-06 | done | CTR-23 |
+| [CLU-11](CLU-11.md) | запросы узел → узел (Rpc) | cluster | A | cluster-06 | done | CTR-23 |
+| [APP-08](APP-08.md) | сборка взаимодействия без опроса | app | A | app-04 | ready | META-26,CLU-09,CLU-10 |
 | [PLT-17](PLT-17.md) | перечитывание конфигурации и сертификатов по событиям | platform | A | platform-07 | done | PLT-16 |
 | [MS-14](MS-14.md) | истечение корзины по ближайшему сроку | mailstore | A | mailstore-08 | done | MS-13 |
 | [BLOB-14](BLOB-14.md) | GC по ближайшему сроку отсрочки | blob | A | blob-07 | done | BLOB-13 |
-| [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | ready | META-27 |
+| [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | done | META-27 |
 | [CI-05](CI-05.md) | CI без Valkey, проверка отсутствия интерпретаторов | ci | B | ci-04 | todo | CLU-09 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-06 | todo | CLU-09 |
 
@@ -368,13 +368,18 @@
 | [APP-16](APP-16.md) | сокеты systemd, политики доменов в очереди, согласование doctor | app | A | app-15 | todo | SYS-10,SMTP-15 |
 | [CTR-40](CTR-40.md) | адресация организации в данных; перенос получателей без попытки | contracts | B | contracts-28 | ready | CTR-24 |
 | [PLT-20](PLT-20.md) | процессный `CryptoProvider` rustls для ACME | platform | A | platform-10 | done | PLT-11 |
-| [META-38](META-38.md) | `PgMeta` поверх `Failover` — повтор операций при переключении | meta | A | meta-21 | ready | META-25 |
+| [META-38](META-38.md) | `PgMeta` поверх `Failover` — повтор операций при переключении | meta | A | meta-21 | done | META-25 |
 | [META-39](META-39.md) | переписывание адресов, `postpone` и `Unblocked` в PostgreSQL | meta | A | meta-23 | todo | CTR-40,CTR-39 |
-| [META-40](META-40.md) | повтор записей по ключу при переключении СУБД | meta | A | meta-24 | todo | META-38 |
+| [META-40](META-40.md) | повтор записей по ключу при переключении СУБД | meta | A | meta-24 | ready | META-38 |
 | [SMTP-29](SMTP-29.md) | переписывание адресов из данных организации; `postpone` в планировщике | smtp | A | smtp-10 | todo | CTR-40,SMTP-13,SMTP-14 |
-| [CLU-12](CLU-12.md) | транспорт Rpc узел → узел (HTTPS/2, mTLS) | cluster | A | cluster-07 | todo | CLU-11 |
-| [CLU-13](CLU-13.md) | `LocalBus` — `Resync` при отставании подписчика | cluster | A | cluster-08 | todo | CLU-09 |
-| [DEP-11](DEP-11.md) | убрать Valkey из стенда разработки | deploy | A | deploy-09 | todo | CLU-09 |
+| [CLU-12](CLU-12.md) | транспорт Rpc узел → узел (HTTPS/2, mTLS) | cluster | A | cluster-07 | ready | CLU-11 |
+| [CLU-13](CLU-13.md) | `LocalBus` — `Resync` при отставании подписчика | cluster | A | cluster-08 | ready | CLU-09 |
+| [DEP-11](DEP-11.md) | убрать Valkey из стенда разработки | deploy | A | deploy-09 | ready | CLU-09 |
+| [IMAP-17](IMAP-17.md) | IDLE — полная сверка по `Resync` | imap | A | imap-08 | todo | CLU-13 |
+| [JMAP-21](JMAP-21.md) | push — изменение всех типов по `Resync` | jmap | A | jmap-12 | todo | CLU-13 |
+| [SYS-11](SYS-11.md) | проба Landlock без `/sys/kernel/security` | sys | A | sys-06 | ready | SYS-07 |
+| [PLT-21](PLT-21.md) | doctor — проба Landlock; подпись метрики отставания шины | platform | A | platform-11 | todo | SYS-11,CLU-13 |
+| [APP-17](APP-17.md) | подключение журнала доставки, групп, обучения антиспама и защиты от перебора | app | A | app-16 | todo | SMTP-16,SMTP-17,SMTP-18,AUTH-08,APP-16 |
 | [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-20 | done | CTR-23,META-16 |
 
 ## Вне волн
