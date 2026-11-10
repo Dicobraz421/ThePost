@@ -16,8 +16,9 @@
 //! Воркер не делает периодических проходов (SRS 2.8, таймер 4): один таймер на ближайший срок — первый элемент
 //! `TrashStore::expired` по возрастанию `expires_at` на дальний момент. Срок сверяется при запуске, после каждого
 //! прохода и по сигналу в памяти процесса после фиксации `delete_to_trash` этого [`Store`] (и его клонов):
-//! таймер перевзводится, если новый срок раньше. После ошибки хранилища — повтор не раньше [`TrashConfig::retry`]
-//! (SRS 2.8, таймер 2).
+//! таймер перевзводится, если новый срок раньше. Ожидание не дольше [`TrashConfig::max_wait`]: по его истечении
+//! срок сверяется заново (без прохода, если ничего не истекло) — так подхватывается помещение в корзину на другом
+//! узле, сигнала о котором нет. После ошибки хранилища — повтор не раньше [`TrashConfig::retry`] (SRS 2.8, таймер 2).
 
 use std::future::Future;
 use std::time::Duration;
@@ -36,6 +37,7 @@ use crate::Store;
 /// Истечение срока корзины (секция `trash` конфигурации хранилища).
 ///
 /// ```yaml
+/// max_wait: 1h
 /// retry: 5m
 /// batch: 500
 /// defer: 1d
@@ -43,6 +45,10 @@ use crate::Store;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct TrashConfig {
+    /// Наибольшее ожидание таймера: сверка ближайшего срока не реже (помещение в корзину на других узлах).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub max_wait: Duration,
     /// Пауза перед повтором после ошибки хранилища (элементы с истёкшим сроком не обработаны).
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -58,6 +64,7 @@ pub struct TrashConfig {
 impl Default for TrashConfig {
     fn default() -> Self {
         Self {
+            max_wait: Duration::from_secs(3600),
             retry: Duration::from_secs(300),
             batch: 500,
             defer: Duration::from_secs(86_400),
@@ -186,11 +193,18 @@ impl Store {
                     Some(at)
                 }
             };
+            // Не дольше `max_wait`: по истечении — только сверка срока.
+            let cap = after(timer.now(), self.cfg.trash.max_wait);
+            let (at, pass) = match due {
+                Some(at) if at <= cap => (at, true),
+                _ => (cap, false),
+            };
             tokio::select! {
                 () = &mut shutdown => return,
                 // Помещение в корзину: сверить срок и перевзвести таймер.
                 () = self.trash_wake.notified() => {}
-                () = sleep_until(timer, due) => {
+                () = timer.sleep_until(at), if !pass => {}
+                () = timer.sleep_until(at), if pass => {
                     let now = timer.now();
                     not_before = match self.expire_trash(now).await {
                         Ok(p) => {
@@ -280,14 +294,6 @@ impl Store {
                 pass.failed += 1;
             }
         }
-    }
-}
-
-/// Таймер на `due`; срока нет — не завершается (ждём сигнала или остановки).
-async fn sleep_until(timer: &impl Timer, due: Option<OffsetDateTime>) {
-    match due {
-        Some(at) => timer.sleep_until(at).await,
-        None => std::future::pending().await,
     }
 }
 
@@ -664,8 +670,22 @@ mod tests {
         v
     }
 
-    #[tokio::test]
-    async fn worker_timer_on_nearest_expiry() {
+    /// Воркер на часах testkit поверх окружения с двумя письмами во «Входящих».
+    struct Rig {
+        env: Env,
+        clock: tp_testkit::ManualClock,
+        t0: OffsetDateTime,
+        scope: AccountScope,
+        ids: Vec<MessageId>,
+        /// Хранилище воркера (проходы считаются).
+        store: Store,
+        passes: Arc<Mutex<usize>>,
+        armed: Arc<Mutex<Vec<OffsetDateTime>>>,
+        stop: tokio::sync::oneshot::Sender<()>,
+        worker: tokio::task::JoinHandle<()>,
+    }
+
+    async fn rig(max_wait: Duration) -> Rig {
         let clock = tp_testkit::ManualClock::default();
         let t0 = tp_testkit::Clock::now(&clock);
         let env = Env::with_clock(clock.shared());
@@ -697,33 +717,14 @@ mod tests {
                 .expect("ingest");
             ids.push(done.delivered[0].message);
         }
-        let exists = async |id: MessageId| {
-            MessageStore::get(&env.meta, scope, id)
-                .await
-                .expect("get")
-                .is_some()
-        };
 
         let passes = Arc::new(Mutex::new(0usize));
-        let mut deps = env.store.d.clone();
-        deps.trash = Arc::new(Counting {
+        let mut store = env.store.clone();
+        store.d.trash = Arc::new(Counting {
             inner: env.trash.clone(),
             passes: passes.clone(),
         });
-        let store = Store {
-            d: deps.clone(),
-            ..env.store.clone()
-        };
-        // Тот же сигнал воркеру; политика изменилась — срок корзины 1 день.
-        let mut short = Store {
-            d: deps,
-            ..store.clone()
-        };
-        short.d.messages = Arc::new(
-            env.meta
-                .clone()
-                .with_trash_retention(Duration::from_secs(86_400)),
-        );
+        store.cfg.trash.max_wait = max_wait;
 
         let armed = Arc::new(Mutex::new(Vec::new()));
         let timer = TestTimer {
@@ -741,65 +742,144 @@ mod tests {
                     .await;
             })
         };
-        let passed = || *passes.lock().expect("lock");
+        Rig {
+            env,
+            clock,
+            t0,
+            scope,
+            ids,
+            store,
+            passes,
+            armed,
+            stop,
+            worker,
+        }
+    }
+
+    impl Rig {
+        fn passed(&self) -> usize {
+            *self.passes.lock().expect("lock")
+        }
+
+        async fn exists(&self, id: MessageId) -> bool {
+            MessageStore::get(&self.env.meta, self.scope, id)
+                .await
+                .expect("get")
+                .is_some()
+        }
+
+        async fn shutdown(self) {
+            self.stop.send(()).expect("stop");
+            tokio::time::timeout(Duration::from_secs(5), self.worker)
+                .await
+                .expect("worker stopped")
+                .expect("join");
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_timer_on_nearest_expiry() {
+        let max_wait = Duration::from_secs(365 * 86_400);
+        let r = rig(max_wait).await;
+        let (t0, ids) = (r.t0, r.ids.clone());
+        // Тот же сигнал воркеру; политика изменилась — срок корзины 1 день.
+        let mut short = r.store.clone();
+        short.d.messages = Arc::new(
+            r.env
+                .meta
+                .clone()
+                .with_trash_retention(Duration::from_secs(86_400)),
+        );
 
         let a_due = t0 + days(30);
-        store
-            .delete_to_trash(scope, &ids[..1])
+        r.store
+            .delete_to_trash(r.scope, &ids[..1])
             .await
             .expect("trash");
         until("таймер на срок первого", async || {
-            distinct(&armed).last() == Some(&a_due)
+            distinct(&r.armed).last() == Some(&a_due)
         })
         .await;
 
-        clock.set(t0 + days(1));
+        r.clock.set(t0 + days(1));
         let b_due = t0 + days(2);
         short
-            .delete_to_trash(scope, &ids[1..])
+            .delete_to_trash(r.scope, &ids[1..])
             .await
             .expect("trash");
         until(
             "перевзвод на более ранний срок",
-            async || distinct(&armed).last() == Some(&b_due),
+            async || distinct(&r.armed).last() == Some(&b_due),
         )
         .await;
 
-        clock.set(b_due - time::Duration::seconds(1));
+        r.clock.set(b_due - time::Duration::seconds(1));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(passed(), 0, "до срока проходов нет");
-        assert!(exists(ids[1]).await);
+        assert_eq!(r.passed(), 0, "до срока проходов нет");
+        assert!(r.exists(ids[1]).await);
 
-        clock.set(b_due);
+        r.clock.set(b_due);
         until("удаление второго в срок", async || {
-            !exists(ids[1]).await
+            !r.exists(ids[1]).await
         })
         .await;
         until(
             "таймер снова на срок первого",
-            async || distinct(&armed) == [a_due, b_due, a_due],
+            async || distinct(&r.armed) == [a_due, b_due, a_due],
         )
         .await;
-        assert_eq!(passed(), 1, "один проход на срок");
-        assert!(exists(ids[0]).await);
+        assert_eq!(r.passed(), 1, "один проход на срок");
+        assert!(r.exists(ids[0]).await);
 
-        clock.set(a_due);
+        r.clock.set(a_due);
         until("удаление первого в срок", async || {
-            !exists(ids[0]).await
+            !r.exists(ids[0]).await
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(passed(), 2, "без промежуточных проходов");
-        assert_eq!(
-            distinct(&armed),
-            [a_due, b_due, a_due],
-            "корзины пусты — таймер не взведён"
-        );
+        let cap = after(a_due, max_wait);
+        until(
+            "корзины пусты — таймер на max_wait",
+            async || distinct(&r.armed) == [a_due, b_due, a_due, cap],
+        )
+        .await;
+        assert_eq!(r.passed(), 2, "без промежуточных проходов");
+        r.shutdown().await;
+    }
 
-        stop.send(()).expect("stop");
-        tokio::time::timeout(Duration::from_secs(5), worker)
+    #[tokio::test]
+    async fn worker_wakes_within_max_wait() {
+        let hour = Duration::from_secs(3600);
+        let r = rig(hour).await;
+        let t0 = r.t0;
+        until(
+            "пустая корзина — таймер на max_wait",
+            async || distinct(&r.armed) == [after(t0, hour)],
+        )
+        .await;
+
+        // «Другой узел»: помещение в корзину мимо этого `Store` — сигнала нет; срок — 10 минут.
+        r.env
+            .meta
+            .clone()
+            .with_trash_retention(Duration::from_secs(600))
+            .to_trash(r.scope, &r.ids[..1])
             .await
-            .expect("worker stopped")
-            .expect("join");
+            .expect("trash");
+        let due = t0 + time::Duration::minutes(10);
+        r.clock.set(due);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(r.exists(r.ids[0]).await, "без сигнала — до max_wait");
+        assert_eq!(r.passed(), 0);
+
+        // Часы — на `t0 + max_wait`, это раньше `due + max_wait`.
+        r.clock.set(after(t0, hour));
+        until(
+            "удаление не позже срок + max_wait",
+            async || !r.exists(r.ids[0]).await,
+        )
+        .await;
+        assert_eq!(r.passed(), 1, "один проход после сверки");
+        assert!(r.exists(r.ids[1]).await);
+        r.shutdown().await;
     }
 }

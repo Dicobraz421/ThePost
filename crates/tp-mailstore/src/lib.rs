@@ -47,6 +47,7 @@ pub use trash::{TrashConfig, TrashPass};
 ///
 /// ```yaml
 /// trash:
+///   max_wait: 1h
 ///   retry: 5m
 ///   batch: 500
 ///   defer: 1d
