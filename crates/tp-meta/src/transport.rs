@@ -278,6 +278,8 @@ impl TransportStore for PgMeta {
                     .into_iter()
                     .map(RouteRow::into_policy)
                     .collect::<Result<_>>()?,
+                // Таблица переписывания (CTR-40) — волна полосы meta.
+                rewrites: Vec::new(),
             })
         })
         .await

@@ -1,7 +1,8 @@
 //! In-memory настройки транспорта (CONTRACTS.md#Transport; CTR-24).
 //!
 //! [`MemTransport`] — снимок кластера и снимки организаций с версиями; с шиной ([`MemTransport::with_bus`])
-//! запись публикует `TransportChanged`, как реализация `tp-meta`.
+//! запись публикует `TransportChanged`, как реализация `tp-meta`. Таблица переписывания адресов (CTR-40) —
+//! в снимке организации, с общей версией политик.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -10,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tp_contracts::bus::EventBus;
 use tp_contracts::transport::{
-    AcceptedDomain, ClusterTransport, DestinationPolicy, TenantTransport, TransportStore,
-    TrustedSource, transport_changed,
+    AcceptedDomain, AddressPattern, ClusterTransport, DestinationPolicy, RewriteRule,
+    TenantTransport, TransportStore, TrustedSource, transport_changed,
 };
 use tp_contracts::{DomainId, Error, Result, TenantId};
 
@@ -21,6 +22,7 @@ use crate::infra::lock;
 struct Routes {
     version: u64,
     routes: BTreeMap<String, DestinationPolicy>,
+    rewrites: BTreeMap<String, RewriteRule>,
 }
 
 #[derive(Debug, Default)]
@@ -92,12 +94,12 @@ impl MemTransport {
         Ok(version)
     }
 
-    /// Изменение политик организации под проверкой версии.
+    /// Изменение настроек организации (политики, переписывание) под проверкой версии.
     async fn tenant_write(
         &self,
         tenant: TenantId,
         expected: u64,
-        f: impl FnOnce(&mut BTreeMap<String, DestinationPolicy>) -> Result<()>,
+        f: impl FnOnce(&mut Routes) -> Result<()>,
     ) -> Result<u64> {
         let version = {
             let mut st = lock(&self.state);
@@ -106,7 +108,7 @@ impl MemTransport {
             if t.version != expected {
                 return Err(Error::Conflict);
             }
-            f(&mut t.routes)?;
+            f(t)?;
             t.version += 1;
             t.version
         };
@@ -142,6 +144,7 @@ impl TransportStore for MemTransport {
             .map(|t| TenantTransport {
                 version: t.version,
                 routes: t.routes.values().cloned().collect(),
+                rewrites: t.rewrites.values().cloned().collect(),
             })
             .unwrap_or_default())
     }
@@ -206,16 +209,45 @@ impl TransportStore for MemTransport {
         policy: &DestinationPolicy,
     ) -> Result<u64> {
         policy.validate()?;
-        self.tenant_write(tenant, expected, |routes| {
-            routes.insert(policy.pattern.clone(), policy.clone());
+        self.tenant_write(tenant, expected, |t| {
+            t.routes.insert(policy.pattern.clone(), policy.clone());
             Ok(())
         })
         .await
     }
 
     async fn delete_route(&self, tenant: TenantId, expected: u64, pattern: &str) -> Result<u64> {
-        self.tenant_write(tenant, expected, |routes| {
-            routes.remove(pattern).map(|_| ()).ok_or(Error::NotFound)
+        self.tenant_write(tenant, expected, |t| {
+            t.routes.remove(pattern).map(|_| ()).ok_or(Error::NotFound)
+        })
+        .await
+    }
+
+    async fn put_rewrite(
+        &self,
+        tenant: TenantId,
+        expected: u64,
+        rule: &RewriteRule,
+    ) -> Result<u64> {
+        rule.validate()?;
+        self.tenant_write(tenant, expected, |t| {
+            t.rewrites.insert(rule.from.to_string(), rule.clone());
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_rewrite(
+        &self,
+        tenant: TenantId,
+        expected: u64,
+        from: &AddressPattern,
+    ) -> Result<u64> {
+        self.tenant_write(tenant, expected, |t| {
+            t.rewrites
+                .remove(from.as_str())
+                .map(|_| ())
+                .ok_or(Error::NotFound)
         })
         .await
     }
@@ -233,6 +265,7 @@ mod tests {
     #[tokio::test]
     async fn passes_contract_suite() {
         suite::transport_store(&MemTransport::new()).await;
+        suite::transport_rewrites(&MemTransport::new()).await;
     }
 
     #[tokio::test]

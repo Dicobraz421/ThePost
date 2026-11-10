@@ -906,7 +906,7 @@ impl QueueEntry {
 }
 
 /// [`QueueStore`] в памяти. Время захвата передаёт вызывающий; `queued_at` — по часам [`Clock`].
-/// Когда все выданные захватом получатели завершены (`reschedule`/`complete`), лиза снимается.
+/// Когда все выданные захватом получатели завершены (`reschedule`/`postpone`/`complete`), лиза снимается.
 #[derive(Debug, Clone)]
 pub struct MemQueue {
     entries: Arc<Mutex<HashMap<QueueId, QueueEntry>>>,
@@ -1071,6 +1071,11 @@ impl QueueStore for MemQueue {
             r.last_error = Some(reason.to_owned());
         })
         .map(|_| ())
+    }
+
+    async fn postpone(&self, claim: &QueueClaim, rcpt: &str, at: OffsetDateTime) -> Result<()> {
+        self.with_claim(claim, rcpt, |r| r.next_attempt = at)
+            .map(|_| ())
     }
 
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
@@ -2009,6 +2014,12 @@ mod tests {
         );
         assert!(q.is_empty());
         assert_eq!(q.renew(&c3.claim, t0).await, Err(Error::Conflict));
+    }
+
+    #[tokio::test]
+    async fn queue_passes_postpone_suite() {
+        let clock = ManualClock::default();
+        crate::suite::queue_postpone(&MemQueue::new(clock.shared()), TenantId::new()).await;
     }
 
     #[tokio::test]

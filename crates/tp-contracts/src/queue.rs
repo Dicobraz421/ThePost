@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ids::{BlobKey, QueueId, TenantId};
 
 /// Что вернуть в уведомлении о недоставке (ESMTP `RET`, RFC 3461).
@@ -123,7 +123,7 @@ pub struct QueueClaim {
 pub struct QueuedRcpt {
     /// Получатель.
     pub rcpt: OutRcpt,
-    /// Число неудачных попыток (вызовов `reschedule`).
+    /// Число неудачных попыток (вызовов `reschedule`; `postpone` не считается).
     pub attempts: u32,
     /// Причина последней неудачи.
     pub last_error: Option<String>,
@@ -132,7 +132,7 @@ pub struct QueuedRcpt {
 /// Захваченная запись очереди.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claimed {
-    /// Захват: передаётся в `renew`, `reschedule`, `complete`.
+    /// Захват: передаётся в `renew`, `reschedule`, `postpone`, `complete`.
     pub claim: QueueClaim,
     /// Лиза записи действует до этого момента.
     pub until: OffsetDateTime,
@@ -155,7 +155,7 @@ pub struct Claimed {
 /// Очередь исходящей почты. Реализация — `tp-meta` (PostgreSQL), локальная очередь узла edge — `tp-smtp`;
 /// in-memory — `tp-testkit`.
 ///
-/// Каждый захваченный получатель завершается `reschedule` или `complete`; не завершённые до истечения лизы
+/// Каждый захваченный получатель завершается `reschedule`, `postpone` или `complete`; не завершённые до истечения лизы
 /// становятся доступны другим узлам без увеличения `attempts` (отказ узла).
 #[async_trait]
 pub trait QueueStore: Send + Sync + 'static {
@@ -185,6 +185,14 @@ pub trait QueueStore: Send + Sync + 'static {
         at: OffsetDateTime,
         reason: &str,
     ) -> Result<()>;
+
+    /// Перенос получателя планировщиком без попытки доставки (лимит соединений или скорости домена назначения,
+    /// нагрузка узла): следующая попытка в `at`, `attempts` и `last_error` не меняются. Ошибки — как у
+    /// `reschedule`. По умолчанию — `Error::Internal` (реализация без переноса).
+    async fn postpone(&self, claim: &QueueClaim, rcpt: &str, at: OffsetDateTime) -> Result<()> {
+        let _ = (claim, rcpt, at);
+        Err(Error::internal("queue store does not support postpone"))
+    }
 
     /// Конечный статус получателя. `true` — все получатели записи в конечном статусе: запись удалена,
     /// вызывающий освобождает ссылку на объект письма. Ошибки — как у `reschedule`.

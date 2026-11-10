@@ -211,6 +211,8 @@ rebuild: Option<RebuildRequest { requested_at, reason: RebuildReason::{ Admin, C
 SRS 5.1, 3.8. Каталог организации: `accounts_since(tenant, Option<&DirCursor>, limit)`, `groups_since` — инкрементально,
 `DirPage { changes: Vec<DirChange::{Upsert, Removed}>, next, has_more }`, устаревший курсор — `Conflict`;
 `aliases`, `domains`, `gal_attributes` (имена атрибутов GAL; значения — `DirAccount::attributes`) — полным списком.
+Адрес для всей почты домена (catch-all) — псевдоним `DirAlias { address: "@domain", .. }`: получатель на адрес домена, не найденный
+в каталоге; порядок разрешения — адрес целиком, адрес без подадреса (`user+tag`), `@domain`.
 Реализация — `tp-auth` (LDAP); модуль «Мультитенантность» подключает каталог на организацию. Код — `auth.rs`.
 
 ## Auth
@@ -295,8 +297,8 @@ SRS 4.1, 2.6; решения 2026-11-01-transport-scope-external-mta, 2026-11-01
 `TransportChanged { tenant: Option<TenantId> }` (`None` — уровень кластера, `Event::tenant` — `TenantId::DEFAULT`; сигнал —
 `transport::transport_changed(tenant)`) и при `Resync`. В config.yaml — только параметры узла.
 `TransportStore`: `cluster() -> ClusterTransport { version, domains: Vec<AcceptedDomain>, sources: Vec<TrustedSource> }` — для выбора
-организации и источника до аутентификации; `tenant(tenant) -> TenantTransport { version, routes: Vec<DestinationPolicy> }` (без записей —
-версия 0, пусто; чужие политики не видны). Списки — по возрастанию ключа.
+организации и источника до аутентификации; `tenant(tenant) -> TenantTransport { version, routes: Vec<DestinationPolicy>, rewrites: Vec<RewriteRule> }` (без записей —
+версия 0, пусто; чужие записи не видны). Списки — по возрастанию ключа.
 - `AcceptedDomain { id: DomainId, tenant, name, kind: DomainKind::{ Authoritative (по умолчанию), InternalRelay { next_hop } } }` — имя
   уникально в кластере, каноническое (`normalize_domain`: ASCII в нижнем регистре, без точки в конце, IDN — A-label);
   `ClusterTransport::domain(name)` — поиск без учёта регистра, поддомены — только явно.
@@ -310,11 +312,17 @@ SRS 4.1, 2.6; решения 2026-11-01-transport-scope-external-mta, 2026-11-01
   `pattern` — ключ в организации: `example.org`, `*.example.org` (только поддомены), `*` (все внешние, relayhost).
   `TenantTransport::route(domain)` — наиболее точный шаблон (домен → длинный суффикс → `*`), только для доменов вне принятых;
   `policy(pattern)` — по шаблону.
-Запись — `put_domain`/`delete_domain`/`put_source`/`delete_source(expected, ..)` (версия кластера) и `put_route`/`delete_route(tenant, expected, ..)`
-(версия организации) `-> новая версия` (строго больше). Устаревшая `expected` — `Conflict` (до проверки ключа), отсутствующий ключ при
+- `RewriteRule { from: AddressPattern (ключ), to: AddressPattern, sender, recipient (по умолчанию true) }` — таблица переписывания адресов
+  конверта организации (модель Postfix `canonical_maps`; не config.yaml): `to` = `@domain` сохраняет локальную часть; `validate()` —
+  хотя бы одна сторона, `to ≠ from`. `TenantTransport::rewrite(address, EnvelopeSide::{ Sender, Recipient })` — правило для адреса
+  точнее правила для домена, одно правило без цепочек; отправитель — после SPF, DKIM, DMARC, получатели — до разрешения в каталоге;
+  заголовки не меняются (это — `MailFlow`).
+Запись — `put_domain`/`delete_domain`/`put_source`/`delete_source(expected, ..)` (версия кластера) и `put_route`/`delete_route`/
+`put_rewrite`/`delete_rewrite(tenant, expected, ..)` (версия организации) `-> новая версия` (строго больше; `*_rewrite` по умолчанию —
+`Internal`). Устаревшая `expected` — `Conflict` (до проверки ключа), отсутствующий ключ при
 удалении — `NotFound`, поля — `validate()` типа (`Invalid`); имя домена занято другим `id` — `Conflict`; смена организации домена или
 источника — `Invalid`. После фиксации — `transport_changed` (домены и источники — `None`, политики — организация).
-Реализация — `tp-meta`, in-memory — `MemTransport` (`with_bus`); набор `suite::transport_store`.
+Реализация — `tp-meta`, in-memory — `MemTransport` (`with_bus`); наборы `suite::{transport_store, transport_rewrites}`.
 
 `MailFlow` — точка расширения правил потока почты (реализация — модуль «Правила потока почты», `Registry::set_mail_flow`; правила, их
 хранение в схеме `mod_mailflow` и Admin API — модуль; без модуля не вызывается): `apply(&FlowInput { tenant, direction: FlowDirection::{
@@ -323,7 +331,7 @@ rcpt_to }, message: BlobRef { key: BlobKey, size } }) -> FlowOutcome { verdict: 
 moderators } }, envelope, message: Option<BlobRef>, route: Option<String>, matched: Vec<String> }` (`FlowOutcome::unchanged(&input)`).
 Один раз на письмо (smtp-in после Milter, submission, JMAP EmailSubmission), до `DecisionHooks`, доставки или очереди; письмо с получателями
 нескольких организаций — вызов на организацию. Изменённое тело — новый объект BLOB, записанный модулем (ссылку учитывает вызывающий);
-`Accept` с пустым `rcpt_to` — как `Drop`; `route` — шаблон политики домена назначения организации (нет такой — обычный выбор);
+`Reject` — SMTP 550, JMAP `forbiddenToSend` (RFC 8621); `Accept` с пустым `rcpt_to` — как `Drop`; `route` — шаблон политики домена назначения организации (нет такой — обычный выбор);
 `matched` — сработавшие правила, включая режим проверки (журнал доставки). Ошибка — ошибка операции (`Unavailable` — временный отказ).
 
 ## Queue (Ф1)
@@ -331,6 +339,8 @@ SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организа
 `enqueue(OutMessage { tenant, blob, size, from, dsn: DsnParams { envid, ret }, rcpts: Vec<OutRcpt { address, notify, orcpt }>, next_attempt }) -> QueueId`
 (пусто или повтор адреса — `Invalid`); `claim(now, limit, lease) -> Vec<Claimed { claim: QueueClaim { id, fencing }, until, queued_at, .., rcpts: Vec<QueuedRcpt { rcpt, attempts, last_error }> }>`
 — записи с наступившим сроком попытки без действующей лизы; `renew(&claim, until)`, `reschedule(&claim, rcpt, at, reason)` (`attempts` + 1),
+`postpone(&claim, rcpt, at)` (перенос планировщиком без попытки — лимиты домена или узла: `attempts`, `last_error` не меняются; по
+умолчанию — `Internal`; набор `suite::queue_postpone`),
 `complete(&claim, rcpt, RcptStatus::{ Delivered { reply }, Failed { reply } }) -> bool` (`true` — все получатели завершены, запись удалена).
 Устаревший захват — `Conflict`; не завершённые до истечения лизы получатели возвращаются в очередь без `attempts` + 1.
 Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
@@ -455,3 +465,11 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (раньше узлы держали снятую блокировку до срока). In-memory — `MemAbuseBlocks::with_bus`; наборы `suite::abuse_blocks_signals`,
   `suite::signals`; в `suite::abuse_blocks` база сроков округляется вверх до секунды. Публикация в `tp-meta` (`PgMeta::unblock`) —
   волна полосы meta. Пометка «заглушка до META-27» у `Membership` снята.
+- 2026-11-10 — CTR-40 (x/contracts-28, отчёт smtp-04): таблица переписывания адресов конверта — данные организации
+  (`transport::{RewriteRule, EnvelopeSide}`, `TenantTransport::{rewrites, rewrite, rewrite_rule}`, `TransportStore::put_rewrite`/
+  `delete_rewrite` с версией организации; `AddressPattern::{is_domain, domain}`) вместо `smtp.addressing.rewrite`; catch-all —
+  псевдоним каталога `@domain` (`DirAlias::address`); `QueueStore::postpone` — перенос получателя без `attempts` + 1. Методы по умолчанию —
+  `Internal`. In-memory — `MemTransport`, `MemQueue`; наборы `suite::{transport_rewrites, queue_postpone}`. Хранение в `tp-meta`
+  (`PgMeta` — пустая таблица до волны meta), переход `tp-smtp` — волны полос.
+- 2026-11-10 — CTR-40: ответ JMAP на `FlowVerdict::Reject` и `Decision::Deny` при отправке — `forbiddenToSend` (RFC 8621, как в JMAP-10),
+  а не `forbidden`.

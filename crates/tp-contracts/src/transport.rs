@@ -26,6 +26,7 @@
 //!         policy("*", TlsRequirement::Opportunistic),
 //!         policy("*.partner.example", TlsRequirement::Required),
 //!     ],
+//!     rewrites: Vec::new(),
 //! };
 //! let route = snapshot.route("mx.partner.example").expect("route");
 //! assert_eq!(route.pattern, "*.partner.example");
@@ -204,6 +205,16 @@ impl AddressPattern {
     /// Шаблон как строка.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Шаблон `@domain` (все адреса домена).
+    pub fn is_domain(&self) -> bool {
+        self.0.starts_with('@')
+    }
+
+    /// Домен шаблона (каноническая форма).
+    pub fn domain(&self) -> &str {
+        self.0.rsplit_once('@').map_or("", |(_, d)| d)
     }
 
     /// Адрес подходит под шаблон (без учёта регистра ASCII, точка в конце домена не учитывается).
@@ -490,6 +501,73 @@ impl DestinationPolicy {
     }
 }
 
+/// Сторона конверта.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeSide {
+    /// Отправитель (`MAIL FROM`).
+    Sender,
+    /// Получатель (`RCPT TO`).
+    Recipient,
+}
+
+/// Правило переписывания адреса конверта (модель Postfix `canonical_maps`; таблица организации, Admin API).
+///
+/// Отправитель конверта переписывается после проверок SPF, DKIM, DMARC (они — по исходному адресу), получатели —
+/// до разрешения в каталоге; заголовки письма не меняются (это — правила потока почты, [`MailFlow`]). Одно
+/// правило на адрес, без цепочек ([`TenantTransport::rewrite`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewriteRule {
+    /// Исходный адрес (`old@example.org`) или домен (`@old.example`); ключ записи в организации.
+    pub from: AddressPattern,
+    /// Новый адрес или домен (`@new.example` — локальная часть исходного адреса сохраняется).
+    pub to: AddressPattern,
+    /// Переписывать отправителя конверта.
+    #[serde(default = "yes")]
+    pub sender: bool,
+    /// Переписывать получателей.
+    #[serde(default = "yes")]
+    pub recipient: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl RewriteRule {
+    /// Проверка: хотя бы одна сторона, `to` отличается от `from`. Иначе — `Invalid`.
+    pub fn validate(&self) -> Result<()> {
+        if !self.sender && !self.recipient {
+            return Err(Error::invalid("rewrite rule applies to no side"));
+        }
+        if self.from == self.to {
+            return Err(Error::invalid(format!(
+                "rewrite rule {} maps to itself",
+                self.from
+            )));
+        }
+        Ok(())
+    }
+
+    /// Правило применяется к стороне `side`.
+    pub fn applies(&self, side: EnvelopeSide) -> bool {
+        match side {
+            EnvelopeSide::Sender => self.sender,
+            EnvelopeSide::Recipient => self.recipient,
+        }
+    }
+
+    /// Адрес `address` после замены по правилу (без проверки совпадения с `from`); `None` — не адрес.
+    pub fn replace(&self, address: &str) -> Option<String> {
+        let (local, _) = address.rsplit_once('@')?;
+        Some(if self.to.is_domain() {
+            format!("{local}{}", self.to)
+        } else {
+            self.to.to_string()
+        })
+    }
+}
+
 /// Снимок настроек организации.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TenantTransport {
@@ -497,6 +575,9 @@ pub struct TenantTransport {
     pub version: u64,
     /// Политики доменов назначения по возрастанию шаблона.
     pub routes: Vec<DestinationPolicy>,
+    /// Таблица переписывания адресов конверта по возрастанию `from`.
+    #[serde(default)]
+    pub rewrites: Vec<RewriteRule>,
 }
 
 impl TenantTransport {
@@ -513,6 +594,25 @@ impl TenantTransport {
     /// Политика по шаблону (маршрут правила потока, [`FlowOutcome::route`]).
     pub fn policy(&self, pattern: &str) -> Option<&DestinationPolicy> {
         self.routes.iter().find(|p| p.pattern == pattern)
+    }
+
+    /// Адрес конверта `address` после переписывания для стороны `side`; `None` — правила нет. Правило для адреса
+    /// точнее правила для домена; сравнение — без учёта регистра ASCII.
+    pub fn rewrite(&self, address: &str, side: EnvelopeSide) -> Option<String> {
+        let candidates = || {
+            self.rewrites
+                .iter()
+                .filter(|r| r.applies(side) && r.from.matches(address))
+        };
+        candidates()
+            .find(|r| !r.from.is_domain())
+            .or_else(|| candidates().next())
+            .and_then(|r| r.replace(address))
+    }
+
+    /// Правило переписывания по ключу `from`.
+    pub fn rewrite_rule(&self, from: &AddressPattern) -> Option<&RewriteRule> {
+        self.rewrites.iter().find(|r| &r.from == from)
     }
 }
 
@@ -565,6 +665,33 @@ pub trait TransportStore: Send + Sync + 'static {
 
     /// Удаляет политику по шаблону; отсутствующая — `NotFound`.
     async fn delete_route(&self, tenant: TenantId, expected: u64, pattern: &str) -> Result<u64>;
+
+    /// Создаёт или заменяет правило переписывания адресов организации по `from` (версия организации, как у
+    /// политик). По умолчанию — `Error::Internal` (хранилище без таблицы переписывания).
+    async fn put_rewrite(
+        &self,
+        tenant: TenantId,
+        expected: u64,
+        rule: &RewriteRule,
+    ) -> Result<u64> {
+        let _ = (tenant, expected, rule);
+        Err(Error::internal(
+            "transport store does not store rewrite rules",
+        ))
+    }
+
+    /// Удаляет правило переписывания по `from`; отсутствующее — `NotFound`. По умолчанию — `Error::Internal`.
+    async fn delete_rewrite(
+        &self,
+        tenant: TenantId,
+        expected: u64,
+        from: &AddressPattern,
+    ) -> Result<u64> {
+        let _ = (tenant, expected, from);
+        Err(Error::internal(
+            "transport store does not store rewrite rules",
+        ))
+    }
 }
 
 // ---------- Правила потока почты ----------
@@ -621,7 +748,7 @@ pub enum FlowVerdict {
     /// Продолжить обработку (точки принятия решений модулей, доставка или очередь).
     #[default]
     Accept,
-    /// Отклонить с текстом: SMTP 550 при приёме и submission, JMAP `forbidden`.
+    /// Отклонить с текстом: SMTP 550 при приёме и submission, JMAP `forbiddenToSend` (RFC 8621).
     Reject(String),
     /// Принять и удалить без уведомления.
     Drop,
@@ -839,6 +966,7 @@ mod tests {
                 policy("*.eu.example.org"),
                 policy("example.org"),
             ],
+            rewrites: Vec::new(),
         };
         let route = |d: &str| snap.route(d).map(|p| p.pattern.as_str());
         assert_eq!(route("example.org"), Some("example.org"));
@@ -848,6 +976,65 @@ mod tests {
         assert_eq!(route("badexample.org"), Some("*"));
         assert!(snap.policy("*.example.org").is_some() && snap.policy("x").is_none());
         assert_eq!(TenantTransport::default().route("example.org"), None);
+    }
+
+    #[test]
+    fn rewrite_table() {
+        let rule = |from: &str, to: &str, sender, recipient| RewriteRule {
+            from: AddressPattern::new(from).expect("from"),
+            to: AddressPattern::new(to).expect("to"),
+            sender,
+            recipient,
+        };
+        let snap = TenantTransport {
+            rewrites: vec![
+                rule("@legacy.example", "@example.org", false, true),
+                rule("@old.example", "@example.org", true, true),
+                rule("boss@old.example", "ceo@example.org", true, true),
+            ],
+            ..TenantTransport::default()
+        };
+        let rw = |a: &str, side| snap.rewrite(a, side);
+        assert_eq!(
+            rw("Boss@Old.example", EnvelopeSide::Sender).as_deref(),
+            Some("ceo@example.org")
+        );
+        assert_eq!(
+            rw("Ann@OLD.example", EnvelopeSide::Recipient).as_deref(),
+            Some("Ann@example.org")
+        );
+        assert_eq!(
+            rw("x@legacy.example", EnvelopeSide::Recipient).as_deref(),
+            Some("x@example.org")
+        );
+        assert_eq!(rw("x@legacy.example", EnvelopeSide::Sender), None);
+        assert_eq!(rw("x@other.example", EnvelopeSide::Sender), None);
+        assert_eq!(rw("", EnvelopeSide::Sender), None);
+        assert!(
+            snap.rewrite_rule(&AddressPattern::new("@OLD.example").expect("p"))
+                .is_some()
+        );
+
+        assert_eq!(
+            rule("@a.example", "@b.example", true, false).validate(),
+            Ok(())
+        );
+        assert!(
+            rule("@a.example", "@b.example", false, false)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            rule("x@a.example", "X@a.example", true, true)
+                .validate()
+                .is_err()
+        );
+        let json = r#"{"from":"@Old.Example","to":"@example.org"}"#;
+        let parsed: RewriteRule = serde_json::from_str(json).expect("de");
+        assert_eq!(parsed, rule("@old.example", "@example.org", true, true));
+        let legacy: TenantTransport =
+            serde_json::from_str(r#"{"version":1,"routes":[]}"#).expect("de");
+        assert!(legacy.rewrites.is_empty());
     }
 
     #[test]
