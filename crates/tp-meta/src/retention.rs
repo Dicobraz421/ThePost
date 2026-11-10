@@ -542,6 +542,7 @@ impl PgMeta {
         changelog::log(&mut tx, scope, ms, &changes).await?;
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         // Порядок — как в запросе.
         let done = |ids: Vec<Uuid>, rows: &[Removed]| -> Vec<MessageId> {
             ids.into_iter()
@@ -618,6 +619,7 @@ impl PgMeta {
         );
         changelog::append_events(&mut tx, self.cfg.event_partitions, &[ev]).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         Ok(Some(Restored::Message {
             mailbox: to,
             inserted: Inserted {

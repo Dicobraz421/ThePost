@@ -65,6 +65,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "trash purge",
         include_str!("../migrations/0014_trash_purge.sql"),
     ),
+    (
+        15,
+        "node info and abuse blocks",
+        include_str!("../migrations/0015_node_info_abuse_blocks.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
