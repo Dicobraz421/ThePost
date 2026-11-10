@@ -14,9 +14,7 @@ use tp_platform::Config;
 use tp_platform::privileges;
 use tp_sys::{ConfineConfig, ConfineReport, Confinement, RolePaths, SeccompMode};
 
-use crate::sections::{
-    self, AUTH, AuthSection, BLOB, BUS, BlobLocation, BlobSection, BusSection, SEARCH,
-};
+use crate::sections::{self, AUTH, AuthSection, BLOB, BlobLocation, BlobSection, SEARCH};
 
 /// Учётная запись процесса и ограничения ролей для `thepost serve` по config.yaml `path`.
 pub fn prepare_serve(path: &Path) -> Result<ConfineReport> {
@@ -102,9 +100,6 @@ pub fn role_paths(cfg: &Config, config_file: &Path) -> RolePaths {
     }
     if let Ok(db) = cfg.section::<PoolConfig>(PoolConfig::SECTION) {
         tls_files(&db.tls, &mut paths.config);
-    }
-    if let Ok(bus) = cfg.section::<BusSection>(BUS) {
-        tls_files(&bus.valkey.tls, &mut paths.config);
     }
     if let Ok(auth) = cfg.section::<AuthSection>(AUTH) {
         if let Some(ldap) = &auth.ldap {

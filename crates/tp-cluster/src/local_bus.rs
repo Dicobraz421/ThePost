@@ -75,11 +75,7 @@ impl LocalBus {
     pub fn new(config: &LocalBusConfig) -> Self {
         let counters = BusCounters::default();
         counters.set_connected(true);
-        Self::with_counters(config, Arc::new(counters))
-    }
-
-    /// Шина со счётчиками внешней шины: считает выдачу подписчикам и отставания.
-    pub(crate) fn with_counters(config: &LocalBusConfig, counters: Arc<BusCounters>) -> Self {
+        let counters = Arc::new(counters);
         // broadcast::channel паникует на 0 и на ёмкости больше usize::MAX / 2.
         let capacity = config.capacity.clamp(1, usize::MAX >> 1);
         Self {
@@ -109,14 +105,14 @@ impl LocalBus {
     }
 
     /// Завершает потоки всех подписчиков (после уже накопленных уведомлений): они переподписываются
-    /// и сверяются с хранилищем. Используется при потере связи с внешней шиной.
+    /// и сверяются с хранилищем.
     pub fn close_all(&self) {
         self.inner.accounts().clear();
         *self.inner.system() = broadcast::channel(self.inner.capacity).0;
     }
 
     /// Раздаёт уведомление подписчикам этого процесса.
-    pub(crate) fn deliver(&self, event: Event) {
+    fn deliver(&self, event: Event) {
         match event.account {
             Some(account) => {
                 let key = (event.tenant, account);
@@ -136,7 +132,7 @@ impl LocalBus {
     }
 
     /// Подписка на учётную запись.
-    pub(crate) fn subscribe_account(&self, scope: AccountScope) -> EventStream {
+    fn subscribe_account(&self, scope: AccountScope) -> EventStream {
         let key = (scope.tenant, scope.account);
         let rx;
         let generation;
@@ -158,7 +154,7 @@ impl LocalBus {
     }
 
     /// Подписка на системные уведомления.
-    pub(crate) fn subscribe_system_now(&self) -> EventStream {
+    fn subscribe_system_now(&self) -> EventStream {
         into_stream(Subscription {
             rx: self.inner.system().subscribe(),
             counters: self.counters(),
@@ -366,10 +362,7 @@ mod tests {
 
         let m = counters.snapshot();
         assert_eq!((m.published, m.received, m.delivered), (2, 2, 3));
-        assert_eq!(
-            (m.publish_errors, m.decode_errors, m.reconnects, m.lagged),
-            (0, 0, 0, 0)
-        );
+        assert_eq!(m.lagged, 0);
         assert_eq!(bus.metrics(), m);
     }
 

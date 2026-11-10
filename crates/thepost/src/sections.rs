@@ -1,12 +1,11 @@
 //! Секции config.yaml приложения и реестр секций всех крейтов (SRS 5.5; APP-01, PLT-09).
 //!
 //! Приложение регистрирует секции полос (`database`, `meta`) и свои: `blob` — хранилище BLOB (локальный каталог
-//! или S3), `bus` — шина уведомлений (в процессе или Valkey), `cluster` — имя узла и опросы, `doctor` — пороги
+//! или S3), `bus` — шина уведомлений (в процессе), `cluster` — имя узла и опросы, `doctor` — пороги
 //! проверок окружения. Проверки открытых каналов подключаются через [`SectionRegistry::add_check`]: `thepost config
 //! check` (строгий режим) и запуск (мягкий режим) отвергают адрес без TLS вне профиля dev.
 //!
-//! Подсекции `blob.local`, `blob.s3` и `bus.valkey` — секции крейтов `tp-blob` и `tp-cluster` как есть (BLOB-11,
-//! CLU-07): приложение подставляет только каталог, бакет и префикс из `blob.url`.
+//! Подсекции `blob.local` и `blob.s3` — секции крейта `tp-blob` как есть (BLOB-11): приложение подставляет только каталог, бакет и префикс из `blob.url`.
 //!
 //! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `imap`, `jmap`, `search`, `admin`, `mailstore`;
 //! приложение добавляет `auth` (каталог, OIDC, пароли приложений, Kerberos) и `http` (слушатели jmap и admin).
@@ -18,7 +17,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tp_blob::{GcConfig, LocalConfig, OrphanConfig, S3Config};
-use tp_cluster::{LocalBusConfig, ValkeyConfig};
+use tp_cluster::LocalBusConfig;
 use tp_contracts::config::duration;
 use tp_contracts::tls::{InternalChannel, Profile};
 use tp_contracts::{Error, Result};
@@ -77,7 +76,6 @@ pub fn registry() -> Result<SectionRegistry> {
         pool_config(c, profile).check().map(drop)
     })?;
     r.add_check::<BlobSection>(BLOB, BlobSection::check)?;
-    r.add_check::<BusSection>(BUS, BusSection::check)?;
     r.add_check::<ClusterSection>(CLUSTER, |c, _| c.check())?;
     r.add_check::<tp_admin::AdminConfig>(ADMIN, |c, _| c.check())?;
     r.add_check::<AuthSection>(AUTH, AuthSection::check)?;
@@ -215,28 +213,22 @@ pub enum BusKind {
     /// В процессе: один узел (SMB).
     #[default]
     Local,
-    /// Valkey pub/sub: несколько узлов (Enterprise).
-    Valkey,
 }
 
-/// Секция `bus`: шина уведомлений между узлами (SRS 2.1). Требует перезапуска.
+/// Секция `bus`: шина уведомлений (SRS 2.8). Требует перезапуска. Шина Valkey удалена (CLU-09).
 ///
 /// ```yaml
 /// bus:
-///   kind: valkey
-///   valkey:
-///     url: rediss://valkey.internal:6379
-///     password: { secret: "thepost/valkey#password" }
+///   kind: local
+///   capacity: 256
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct BusSection {
-    /// Реализация: `local` — в процессе, `valkey` — Valkey.
+    /// Реализация: `local` — в процессе.
     pub kind: BusKind,
     /// Буфер подписчика шины в процессе: столько непрочитанных уведомлений до отключения отставшего.
     pub capacity: usize,
-    /// Параметры Valkey (`kind: valkey`) — секция `tp-cluster`.
-    pub valkey: ValkeyConfig,
 }
 
 impl Default for BusSection {
@@ -244,22 +236,11 @@ impl Default for BusSection {
         Self {
             kind: BusKind::Local,
             capacity: LocalBusConfig::default().capacity,
-            valkey: ValkeyConfig::default(),
         }
     }
 }
 
 impl BusSection {
-    /// Проверка: адрес Valkey `rediss://` (`redis://` — только dev с `valkey.tls.allow_plaintext`),
-    /// пароль — только ссылкой `valkey.password` (в адресе — только dev): `ValkeyConfig::check`.
-    pub fn check(&self, profile: Profile) -> Result<()> {
-        self.valkey.check_tls(profile)?;
-        if self.kind != BusKind::Valkey {
-            return Ok(());
-        }
-        self.valkey.check(profile).map(drop)
-    }
-
     /// Конфигурация шины в процессе.
     pub fn local(&self) -> LocalBusConfig {
         LocalBusConfig {
@@ -276,10 +257,6 @@ impl BusSection {
 pub struct ClusterSection {
     /// Имя узла в членстве кластера, постоянное для узла; не задано — имя хоста. Требует перезапуска.
     pub node_id: Option<String>,
-    /// Период опроса живых узлов для назначения разделов журнала (не больше периода продления записи узла).
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub assign_poll_interval: Duration,
     /// Период опроса журнала событий подписчиками узла.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -293,7 +270,6 @@ impl Default for ClusterSection {
     fn default() -> Self {
         Self {
             node_id: None,
-            assign_poll_interval: Duration::from_secs(2),
             events_poll_interval: Duration::from_secs(1),
             rebuild_scan: 64,
         }
@@ -306,8 +282,8 @@ impl ClusterSection {
         if let Some(node) = &self.node_id {
             tp_contracts::membership::NodeId::new(node.clone())?;
         }
-        if self.assign_poll_interval.is_zero() || self.events_poll_interval.is_zero() {
-            return Err(Error::invalid("периоды опроса должны быть больше нуля"));
+        if self.events_poll_interval.is_zero() {
+            return Err(Error::invalid("период опроса должен быть больше нуля"));
         }
         Ok(())
     }
@@ -600,26 +576,11 @@ blob:
         // S3 по http.
         let e = err(parse(&prod("").replace("https://s3", "http://s3")));
         assert!(e.contains("blob"), "{e}");
-        // Valkey без TLS и с паролем в адресе.
+        // Секции Valkey нет (CLU-09).
         let e = err(parse(&prod(
-            "bus:\n  kind: valkey\n  valkey:\n    url: redis://v:6379\n",
+            "bus:\n  kind: valkey\n  valkey:\n    url: rediss://v:6379\n",
         )));
-        assert!(e.contains("bus"), "{e}");
-        let e = err(parse(&prod(
-            "bus:\n  kind: valkey\n  valkey:\n    url: rediss://:pw@v:6379\n",
-        )));
-        assert!(e.contains("bus") && e.contains("пароль в адресе"), "{e}");
-        assert!(!e.contains("pw@"), "{e}");
-        // allow_plaintext вне dev — ошибка даже у невыбранной реализации.
-        let e = err(parse(&prod(
-            "bus:\n  valkey:\n    tls: { allow_plaintext: true }\n",
-        )));
-        assert!(e.contains("allow_plaintext"), "{e}");
-        // dev с явным разрешением — можно.
-        parse(&format!(
-            "{MINIMAL_DEV}bus:\n  kind: valkey\n  valkey:\n    url: redis://v:6379\n    tls: {{ allow_plaintext: true }}\n"
-        ))
-        .expect("dev plaintext");
+        assert!(e.contains("valkey"), "{e}");
     }
 
     #[test]
@@ -676,16 +637,16 @@ blob:
     #[test]
     fn durations_are_humantime() {
         let c = parse(&format!(
-            "{MINIMAL_DEV}cluster:\n  assign_poll_interval: 500ms\ndoctor:\n  max_clock_skew: 2s\n"
+            "{MINIMAL_DEV}cluster:\n  events_poll_interval: 500ms\ndoctor:\n  max_clock_skew: 2s\n"
         ))
         .expect("config");
         let cluster = c.section::<ClusterSection>(CLUSTER).expect("cluster");
-        assert_eq!(cluster.assign_poll_interval, Duration::from_millis(500));
+        assert_eq!(cluster.events_poll_interval, Duration::from_millis(500));
         let e = err(parse(&format!(
-            "{MINIMAL_DEV}cluster:\n  assign_poll_interval: 5\n"
+            "{MINIMAL_DEV}cluster:\n  events_poll_interval: 5\n"
         )));
         assert!(
-            e.contains("duration") || e.contains("assign_poll_interval"),
+            e.contains("duration") || e.contains("events_poll_interval"),
             "{e}"
         );
     }
@@ -694,7 +655,7 @@ blob:
     fn crate_sections_parse_and_url_owns_location() {
         let c = parse(&format!(
             "{MINIMAL_DEV}  local:\n    stale_tmp: 1h\n  s3:\n    request_timeout: 5s\n\
-             bus:\n  valkey:\n    url: rediss://v:6379\n    connect_timeout: 2s\n"
+             bus:\n  capacity: 64\n"
         ))
         .expect("config");
         let blob = c.section::<BlobSection>(BLOB).expect("blob");
@@ -707,7 +668,7 @@ blob:
         assert_eq!((s3.bucket.as_str(), s3.prefix.as_str()), ("b", "p"));
         assert_eq!(s3.request_timeout, Duration::from_secs(5));
         let bus = c.section::<BusSection>(BUS).expect("bus");
-        assert_eq!(bus.valkey.connect_timeout, Duration::from_secs(2));
+        assert_eq!(bus.local().capacity, 64);
         // Каталог и бакет — только в blob.url.
         let e = err(parse(&format!("{MINIMAL_DEV}  local:\n    root: /other\n")));
         assert!(e.contains("local.root"), "{e}");
