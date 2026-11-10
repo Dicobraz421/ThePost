@@ -34,6 +34,15 @@
 //! до удаления, получит в `commit_new` [`Commit::Bumped`], а не ссылку на удалённый объект.
 //! Надгробие удаляется по истечении срока, большего максимальной длительности загрузки.
 //!
+//! Срок следующего прохода — [`BlobIndex::next_gc_due`] (`MIN(zero_since) + W`): один таймер, без
+//! периодических проходов.
+//!
+//! # Загрузки (JMAP `uploadUrl`)
+//!
+//! Загруженный файл — объект без ссылок, ждущий GC по окну W или учёта в письме. Владелец загрузки — в учёте:
+//! [`BlobIndex::mark_upload`] после загрузки, [`BlobIndex::upload_owned`] (и [`BlobIndex::exists`]) при обращении
+//! по id, [`BlobIndex::prune_uploads`] — очистка истёкших отметок в проходе GC.
+//!
 //! Поиск «сирот»: [`BlobStore::list`] объектов старше периода ожидания, для которых
 //! [`BlobIndex::exists`] ложно, — удалить. Период ожидания больше максимальной длительности загрузки.
 //!
@@ -86,6 +95,7 @@
 use std::fmt;
 use std::ops::Range;
 use std::str::FromStr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -95,6 +105,7 @@ use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 use crate::ids::{BlobHash, BlobKey, Gen, TenantId};
+use crate::meta::AccountScope;
 
 /// Поток байтов объекта.
 pub type ByteStream = BoxStream<'static, Result<Bytes>>;
@@ -316,6 +327,70 @@ pub trait BlobIndex: Send + Sync + 'static {
     async fn compression(&self, key: &BlobKey) -> Result<Option<Compression>> {
         Ok(self.exists(key).await?.then_some(Compression::None))
     }
+
+    /// Ближайший срок GC: `MIN(zero_since) + window` среди записей, которые выдал бы
+    /// [`BlobIndex::gc_candidates`] (`refcnt = 0`, не надгробие; все организации). `None` — таких записей нет.
+    /// Срок может быть в прошлом — есть просроченные кандидаты. Таймер GC взводится на него (CTR-38).
+    ///
+    /// По умолчанию — деление пополам по `gc_candidates(.., 1)` с точностью до секунды: срок не раньше точного
+    /// и не позже его на секунду (записи с `zero_since` позже `now + 1 сутки` не видны). Реализации — запрос
+    /// `MIN(zero_since)` по индексу.
+    async fn next_gc_due(&self, window: Duration) -> Result<Option<OffsetDateTime>> {
+        let window = time::Duration::try_from(window).unwrap_or(time::Duration::MAX);
+        let mut lo = OffsetDateTime::UNIX_EPOCH;
+        let mut hi = OffsetDateTime::now_utc().saturating_add(time::Duration::DAY);
+        if self.gc_candidates(hi, 1).await?.is_empty() {
+            return Ok(None);
+        }
+        if !self.gc_candidates(lo, 1).await?.is_empty() {
+            hi = lo;
+        }
+        // Нет записей с `zero_since < lo`, есть с `zero_since < hi`.
+        while hi - lo > time::Duration::SECOND {
+            let mid = lo + (hi - lo) / 2;
+            if self.gc_candidates(mid, 1).await?.is_empty() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(Some(hi.saturating_add(window)))
+    }
+
+    /// Отмечает загрузку объекта `key` учётной записью `scope` до `until` (JMAP `uploadUrl`; CTR-38): объект
+    /// дедуплицируется в организации, поэтому загруженный файл без ссылок доступен только загрузившей учётной
+    /// записи. Повторная отметка продлевает срок до большего. Учёт общий для узлов и переживает перезапуск.
+    /// `key.tenant` не совпадает с `scope.tenant` — `Error::Invalid`.
+    ///
+    /// По умолчанию — `Error::Internal` (учёт не хранит владельцев загрузок).
+    async fn mark_upload(
+        &self,
+        scope: AccountScope,
+        key: &BlobKey,
+        until: OffsetDateTime,
+    ) -> Result<()> {
+        let _ = (scope, key, until);
+        Err(Error::internal("blob index does not store upload owners"))
+    }
+
+    /// Загружала ли учётная запись `scope` объект `key` и действует ли отметка (`until > now`).
+    /// Существование записи учёта не проверяет — это [`BlobIndex::exists`]. По умолчанию — `false`.
+    async fn upload_owned(
+        &self,
+        scope: AccountScope,
+        key: &BlobKey,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        let _ = (scope, key, now);
+        Ok(false)
+    }
+
+    /// Удаляет отметки загрузок с `until <= now` (все организации), не более `limit`; ответ — число удалённых.
+    /// Вызывает GC в каждом проходе (отметка живёт не дольше окна W). По умолчанию — `0`.
+    async fn prune_uploads(&self, now: OffsetDateTime, limit: usize) -> Result<usize> {
+        let _ = (now, limit);
+        Ok(0)
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +476,98 @@ mod tests {
                 Ok(Some(Compression::None))
             );
             assert_eq!(Plain.compression(&key(2)).await, Ok(None));
+        });
+    }
+
+    /// Учёт с записями без ссылок, обнулёнными в моменты `zeros`: остальное — методы по умолчанию.
+    struct Zeros(Vec<OffsetDateTime>);
+
+    #[async_trait]
+    impl BlobIndex for Zeros {
+        async fn acquire(&self, _: TenantId, _: &BlobHash, _: u32) -> Result<Acquire> {
+            Err(Error::NotFound)
+        }
+        async fn commit_new(
+            &self,
+            _: TenantId,
+            _: &BlobHash,
+            _: Gen,
+            _: u64,
+            _: u32,
+        ) -> Result<Commit> {
+            Err(Error::NotFound)
+        }
+        async fn release(&self, _: TenantId, _: &BlobHash, _: Gen, _: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn gc_candidates(
+            &self,
+            older_than: OffsetDateTime,
+            limit: usize,
+        ) -> Result<Vec<BlobKey>> {
+            let key = BlobKey {
+                tenant: TenantId::DEFAULT,
+                hash: BlobHash([1; 32]),
+                generation: Gen(1),
+            };
+            let n = self.0.iter().filter(|z| **z < older_than).count();
+            Ok(vec![key; n.min(limit)])
+        }
+        async fn mark_deleting(&self, _: &BlobKey, _: OffsetDateTime) -> Result<bool> {
+            Ok(false)
+        }
+        async fn finalize_delete(&self, _: &BlobKey) -> Result<bool> {
+            Ok(false)
+        }
+        async fn exists(&self, _: &BlobKey) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn next_gc_due_default() {
+        futures::executor::block_on(async {
+            let w = std::time::Duration::from_secs(3600);
+            assert_eq!(Zeros(Vec::new()).next_gc_due(w).await, Ok(None));
+            let now = OffsetDateTime::now_utc();
+            let z = now - time::Duration::days(3);
+            let due = Zeros(vec![now, z])
+                .next_gc_due(w)
+                .await
+                .expect("due")
+                .expect("some");
+            let exact = z + time::Duration::HOUR;
+            assert!(
+                due >= exact && due - exact <= time::Duration::SECOND,
+                "{due} vs {exact}"
+            );
+            let epoch = OffsetDateTime::UNIX_EPOCH - time::Duration::DAY;
+            assert_eq!(
+                Zeros(vec![epoch]).next_gc_due(w).await,
+                Ok(Some(OffsetDateTime::UNIX_EPOCH + time::Duration::HOUR))
+            );
+        });
+    }
+
+    #[test]
+    fn upload_defaults() {
+        futures::executor::block_on(async {
+            let scope = AccountScope {
+                tenant: TenantId::DEFAULT,
+                account: crate::ids::AccountId::new(),
+            };
+            let key = BlobKey {
+                tenant: TenantId::DEFAULT,
+                hash: BlobHash([1; 32]),
+                generation: Gen(1),
+            };
+            let now = OffsetDateTime::now_utc();
+            assert!(matches!(
+                Plain.mark_upload(scope, &key, now).await,
+                Err(Error::Internal(_))
+            ));
+            assert_eq!(Plain.upload_owned(scope, &key, now).await, Ok(false));
+            assert_eq!(Plain.prune_uploads(now, 10).await, Ok(0));
         });
     }
 
