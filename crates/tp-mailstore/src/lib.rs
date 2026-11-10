@@ -47,7 +47,7 @@ pub use trash::{TrashConfig, TrashPass};
 ///
 /// ```yaml
 /// trash:
-///   interval: 1h
+///   retry: 5m
 ///   batch: 500
 ///   defer: 1d
 /// quota:
@@ -111,6 +111,8 @@ pub struct Store {
     /// Папки учётных записей: «Входящие» для предупреждений о квоте ([`Store::with_mailboxes`]).
     mailboxes: Option<Arc<dyn MailboxStore>>,
     warned: quota::Warned,
+    /// Сигнал воркеру истечения корзины: помещение в корзину зафиксировано (общий для клонов).
+    trash_wake: Arc<tokio::sync::Notify>,
 }
 
 impl fmt::Debug for Store {
@@ -146,6 +148,7 @@ impl Store {
             reader: Arc::new(reader),
             mailboxes: None,
             warned: quota::Warned::default(),
+            trash_wake: Arc::default(),
         }
     }
 
@@ -294,8 +297,28 @@ pub(crate) mod testenv {
             )
         }
 
+        /// Окружение с часами `clock` (срок корзины — от их времени).
+        pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+            Self::build_with(
+                clock,
+                DecisionHooks::default(),
+                Config::default(),
+                false,
+                WriterConfig::default(),
+            )
+        }
+
         fn build(hooks: DecisionHooks, cfg: Config, mailboxes: bool, writer: WriterConfig) -> Self {
-            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            Self::build_with(Arc::new(SystemClock), hooks, cfg, mailboxes, writer)
+        }
+
+        fn build_with(
+            clock: Arc<dyn Clock>,
+            hooks: DecisionHooks,
+            cfg: Config,
+            mailboxes: bool,
+            writer: WriterConfig,
+        ) -> Self {
             let blobs = MemBlobStore::new(clock.clone()).with_chunk_size(4096);
             let index = MemBlobIndex::new(clock.clone());
             let meta = MemMetadata::new(clock).with_blob_index(index.clone());
