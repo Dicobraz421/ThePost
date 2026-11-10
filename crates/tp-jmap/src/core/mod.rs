@@ -69,7 +69,9 @@ pub struct Deps {
     pub policies: Arc<dyn PolicyResolver>,
     /// Полнотекстовый поиск.
     pub search: Arc<dyn SearchIndex>,
-    /// Объекты BLOB: загруженные файлы (upload).
+    /// Объекты BLOB: загруженные файлы (upload). Чтение — с распаковкой (`tp_blob::Decompressing` поверх
+    /// хранилища): загрузка, совпавшая по содержимому со сжатой частью письма, читается из её объекта (MS-15);
+    /// без распаковки такая загрузка — `Error::Internal` (проверка хэша), запись — как у хранилища.
     pub blobs: Arc<dyn BlobStore>,
     /// Учёт объектов BLOB: загруженный файл живёт без ссылок до сборки мусора по окну.
     pub blob_index: Arc<dyn BlobIndex>,
