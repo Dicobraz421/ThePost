@@ -292,6 +292,22 @@ fn landlock_unsupported_is_warning() {
     assert_eq!(thread_only.warnings().len(), 1);
 }
 
+/// Проба ABI не паникует и согласована с применением: ядро с Landlock — `Some(>=1)`,
+/// без него — `None` (SYS-11).
+#[test]
+fn landlock_abi_matches_enforcement() {
+    let abi = crate::landlock_abi();
+    assert!(abi.is_none_or(|v| v >= 1), "ABI {abi:?}");
+    let c = Confinement::new(bare(SeccompMode::Off, true), edge(), RolePaths::default());
+    let outcome = confined(c, |report| report.landlock);
+    assert_eq!(
+        abi.is_some(),
+        outcome != LandlockOutcome::Unsupported,
+        "ABI {abi:?}, итог {outcome:?}"
+    );
+    assert_eq!(crate::landlock_abi(), abi, "повторная проба");
+}
+
 /// Landlock проверяет цель ссылки: ссылка из разрешённого каталога на файл другого каталога
 /// читается, только если разрешён и он (SYS-08).
 #[test]

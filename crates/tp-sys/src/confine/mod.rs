@@ -26,6 +26,7 @@ use serde::Deserialize;
 use tp_contracts::role::{Role, RoleSet};
 
 use fs::Grant;
+pub use fs::landlock_abi;
 
 /// Режим seccomp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
