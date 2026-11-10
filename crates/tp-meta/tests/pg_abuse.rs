@@ -29,8 +29,9 @@ async fn conformance_abuse_blocks() {
     let Some(meta) = common::meta().await else {
         return;
     };
+    // Набор усекает сроки до секунды (до 1 с раньше `now`), поэтому `ttl / 2` должен быть с запасом больше секунды.
     let now = db_now(&meta).await;
-    suite::abuse_blocks(&meta, now, Duration::from_secs(2), &RealTime).await;
+    suite::abuse_blocks(&meta, now, Duration::from_secs(4), &RealTime).await;
 }
 
 #[tokio::test]
