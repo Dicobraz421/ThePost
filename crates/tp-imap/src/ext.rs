@@ -2,8 +2,12 @@
 //!
 //! - `NAMESPACE`: личное пространство `""`; при подключённых ACL — папки других пользователей
 //!   `<namespace.other_users>/<имя входа владельца>/<папка>` (папки, открытые субъекту по ACL с правом `l`:
-//!   [`AclStore::shared_mailboxes`]). Общая папка выбирается `SELECT`/`EXAMINE` при праве `r` и только для
-//!   чтения: `FETCH`, `SEARCH`, `STATUS`, `IDLE`; изменение писем и копирование из неё — не в этой волне.
+//!   [`AclStore::shared_mailboxes`]). Общая папка выбирается `SELECT`/`EXAMINE` при праве `r`; `SELECT` —
+//!   для записи, если есть хотя бы одно из прав `s`, `w`, `t`, `e`, иначе `[READ-ONLY]`. Изменения — по правам
+//!   (RFC 4314, 4), проверяются при каждой команде: `STORE` флага `\Seen` — `s`, `\Deleted` — `t`, прочих — `w`
+//!   (флаги без права пропускаются, ни одного — `NO [NOPERM]`; `PERMANENTFLAGS` — только разрешённые); `EXPUNGE` —
+//!   `e`; `APPEND`, `COPY`, `MOVE` в папку — `i` (флаги без права у копии не ставятся); `MOVE` из папки — `t` и `e`.
+//!   Письмо в папку другой учётной записи копируется побайтово (`MailStore::fetch_raw` и `append`).
 //! - `GETQUOTAROOT`/`GETQUOTA`: один корень `""` — учётная запись ([`AccountStore::quota`]), ресурс `STORAGE`
 //!   в КиБ; без лимита корней нет. `SETQUOTA` — `NO [NOPERM]`: квоты задаёт администратор (политики).
 //! - `GETACL`, `SETACL` (`+`/`-` — добавить/убрать права; устаревшие `c` и `d` — как `k` и `xte`, RFC 4314,
@@ -19,8 +23,8 @@ use std::sync::Arc;
 
 use tp_contracts::acl::{ANYONE, AclStore, validate_identifier};
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights};
-use tp_contracts::meta::{AccountScope, AccountStore};
-use tp_contracts::{Error, Result};
+use tp_contracts::meta::{AccountScope, AccountStore, Flag, Flags};
+use tp_contracts::{Error, MailboxId, Result};
 
 use crate::mailbox::{DELIMITER, Node, Tree, attr, canonical, matches};
 use crate::proto::types::core::{AString, IString, QuotedChar, Tag, Vec1};
@@ -95,6 +99,30 @@ fn parse_rights(raw: &str) -> Option<(char, Rights)> {
         })
         .collect();
     letters.parse().ok().map(|r| (mode, r))
+}
+
+/// Права на изменение флагов писем: `s`, `w`, `t`.
+pub(crate) fn flag_rights() -> Rights {
+    Rights::SEEN | Rights::WRITE | Rights::DELETE_MESSAGES
+}
+
+/// Есть хотя бы одно из прав `any`.
+pub(crate) fn has_any(rights: Rights, any: Rights) -> bool {
+    !(rights - (rights - any)).is_empty()
+}
+
+/// Право менять флаг (RFC 4314, 4): `\Seen` — `s`, `\Deleted` — `t`, прочие — `w`.
+pub(crate) fn may_set(rights: Rights, flag: &Flag) -> bool {
+    match flag {
+        Flag::Seen => rights.contains(Rights::SEEN),
+        Flag::Deleted => rights.contains(Rights::DELETE_MESSAGES),
+        _ => rights.contains(Rights::WRITE),
+    }
+}
+
+/// Флаги, которые субъект с правами `rights` может менять.
+pub(crate) fn allowed_flags(rights: Rights, flags: Flags) -> Flags {
+    flags.into_iter().filter(|f| may_set(rights, f)).collect()
 }
 
 /// Общая папка: путь без учёта регистра имени входа и `INBOX`.
@@ -185,13 +213,30 @@ impl<T: Transport> Session<T> {
 
     /// Действующие права субъекта на папку (своя — все права).
     pub(crate) async fn shared_rights(&self, node: &Node) -> Result<Rights> {
+        self.rights_of(node.owner, node.mailbox.id).await
+    }
+
+    /// Права субъекта на выбранную папку: своя — все права, общая — по ACL на момент вызова
+    /// (права могли измениться после `SELECT`); папка не выбрана — нет прав.
+    pub(crate) async fn selected_rights(&self) -> Result<Rights> {
+        let Some(s) = self.selected.as_ref() else {
+            return Ok(Rights::NONE);
+        };
+        if Some(s.owner) == self.scope() {
+            return Ok(Rights::ALL);
+        }
+        self.rights_of(Some(s.owner), s.mailbox).await
+    }
+
+    /// Права субъекта на папку `mailbox` владельца `owner` (`None` — своя).
+    async fn rights_of(&self, owner: Option<AccountScope>, mailbox: MailboxId) -> Result<Rights> {
         let p = self.principal.as_ref().ok_or(Error::Forbidden)?;
-        let owner = node.owner.map_or(p.account, |o| o.account);
+        let owner = owner.map_or(p.account, |o| o.account);
         match self.ext.authz.as_ref() {
             Some(authz) => {
                 let resource = Resource::Mailbox {
                     account: owner,
-                    mailbox: node.mailbox.id,
+                    mailbox,
                 };
                 authz.rights(p, &resource).await
             }

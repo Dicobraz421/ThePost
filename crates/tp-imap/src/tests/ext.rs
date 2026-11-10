@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tp_contracts::acl::AclStore;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountStore, AccountUpsert, MailboxStore, NewMailbox, QuotaUsage,
-    SpecialUse,
+    Account, AccountScope, AccountStore, AccountUpsert, Flag, Flags, MailboxStore, MessageQuery,
+    MessageStore, NewMailbox, QuotaUsage, SpecialUse,
 };
 use tp_contracts::{AccountId, DomainId, MailboxId, Result, TenantId};
 use tp_testkit::{MemAcl, MemMetadata};
@@ -155,6 +155,11 @@ impl Ext {
 
     /// Вторая учётная запись `bob`.
     async fn bob(&self) -> Client {
+        self.bob_with_scope().await.0
+    }
+
+    /// Вторая учётная запись `bob` и её контекст.
+    async fn bob_with_scope(&self) -> (Client, AccountScope) {
         let account = self
             .env
             .meta
@@ -178,7 +183,11 @@ impl Ext {
             scopes: None,
         };
         self.env.auth.add_password(BOB, "pw", p);
-        self.login(BOB, "pw").await
+        let scope = AccountScope {
+            tenant: TenantId::DEFAULT,
+            account: account.id,
+        };
+        (self.login(BOB, "pw").await, scope)
     }
 
     /// Папка `Projects` пользователя с одним письмом.
@@ -368,7 +377,10 @@ async fn shared_mailbox_read_only() {
     assert!(b.cmd("F1 FETCH 1 BODY[TEXT]").await.contains("Hello"));
     assert!(b.cmd("F2 SEARCH ALL").await.contains("* SEARCH 1\r\n"));
     assert!(b.cmd("F3 STORE 1 +FLAGS (\\Seen)").await.contains("F3 NO"));
-    assert!(b.cmd("F4 COPY 1 INBOX").await.contains("F4 NO [NOPERM]"));
+    // Копирование из общей папки к себе — по праву `r` на источник.
+    assert!(b.cmd("F4 COPY 1 INBOX").await.contains("F4 OK [COPYUID"));
+    // MOVE из папки — нужны `t` и `e`.
+    assert!(b.cmd("F5 MOVE 1 INBOX").await.contains("F5 NO"));
     assert_eq!(
         b.cmd(&format!("A1 MYRIGHTS {shared}")).await,
         format!("* MYRIGHTS {shared} lr\r\nA1 OK MYRIGHTS completed\r\n")
@@ -394,4 +406,139 @@ async fn shared_mailbox_read_only() {
             .await
             .contains("A4 NO [NOPERM]")
     );
+}
+
+/// Письма папки владельца `scope` с флагами.
+async fn messages(x: &Ext, scope: AccountScope, mailbox: MailboxId) -> Vec<Flags> {
+    MessageStore::list(&x.env.meta, scope, mailbox, MessageQuery::All, 100)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|m| m.flags)
+        .collect()
+}
+
+async fn share(x: &Ext, mailbox: MailboxId, rights: &str) {
+    x.acl
+        .set_acl(x.env.scope(), mailbox, BOB, rights.parse().expect("rights"))
+        .await
+        .expect("acl");
+}
+
+#[tokio::test]
+async fn shared_store_and_expunge_by_rights() {
+    let x = Ext::new(None).await;
+    let projects = x.projects().await;
+    let flagged: Flags = [Flag::Flagged].into_iter().collect();
+    x.env.deliver(projects, PLAIN, flagged).await;
+    share(&x, projects, "lrs").await;
+    let mut b = x.bob().await;
+    let shared = format!("\"Other Users/{LOGIN}/Projects\"");
+    // Право `s` — папка для записи, в PERMANENTFLAGS только `\Seen`.
+    let r = b.cmd(&format!("S1 SELECT {shared}")).await;
+    assert!(r.contains("* OK [PERMANENTFLAGS (\\Seen)]"), "{r}");
+    assert!(r.contains("S1 OK [READ-WRITE]"), "{r}");
+    // Флаг без права пропускается.
+    let r = b.cmd("T1 STORE 1 +FLAGS (\\Seen \\Flagged)").await;
+    assert!(r.contains("* 1 FETCH (FLAGS (\\Seen))"), "{r}");
+    assert!(r.contains("T1 OK"), "{r}");
+    // Ни одного разрешённого флага — NOPERM.
+    let r = b.cmd("T2 STORE 1 +FLAGS (\\Deleted)").await;
+    assert!(r.contains("T2 NO [NOPERM]"), "{r}");
+    // Замена набора не трогает флаги без права (`\Flagged` у письма 2 остаётся).
+    let r = b.cmd("T3 STORE 1:2 FLAGS (\\Seen)").await;
+    assert!(r.contains("* 2 FETCH (FLAGS (\\Seen \\Flagged))"), "{r}");
+    let r = b.cmd("T4 STORE 2 -FLAGS (\\Seen)").await;
+    assert!(r.contains("* 2 FETCH (FLAGS (\\Flagged))"), "{r}");
+    // EXPUNGE без `e` — NOPERM; CLOSE не удаляет.
+    assert!(b.cmd("E1 EXPUNGE").await.contains("E1 NO [NOPERM]"));
+    // Права расширены (`t`, `e`) — проверяются при каждой команде, без повторного SELECT.
+    share(&x, projects, "lrste").await;
+    let r = b.cmd("T5 STORE 1 +FLAGS.SILENT (\\Deleted)").await;
+    assert!(r.contains("T5 OK"), "{r}");
+    let r = b.cmd("E2 EXPUNGE").await;
+    assert!(r.contains("* 1 EXPUNGE\r\nE2 OK"), "{r}");
+    assert_eq!(messages(&x, x.env.scope(), projects).await.len(), 1);
+    let trash = x.env.mailbox(SpecialUse::Trash);
+    assert_eq!(messages(&x, x.env.scope(), trash).await.len(), 1);
+    // Права отозваны до `r` — запись отклоняется в уже выбранной папке.
+    share(&x, projects, "lr").await;
+    assert!(
+        b.cmd("T6 STORE 1 +FLAGS (\\Seen)")
+            .await
+            .contains("T6 NO [NOPERM]")
+    );
+    assert!(b.cmd("E3 EXPUNGE").await.contains("E3 NO [NOPERM]"));
+    // Только `e`: для записи, но STORE запрещён.
+    share(&x, projects, "lre").await;
+    let r = b.cmd(&format!("S2 SELECT {shared}")).await;
+    assert!(r.contains("* OK [PERMANENTFLAGS ()]"), "{r}");
+    assert!(r.contains("S2 OK [READ-WRITE]"), "{r}");
+    assert!(
+        b.cmd("T7 STORE 1 +FLAGS (\\Seen)")
+            .await
+            .contains("T7 NO [NOPERM]")
+    );
+}
+
+#[tokio::test]
+async fn shared_append_copy_move_by_insert_right() {
+    let x = Ext::new(None).await;
+    let projects = x.projects().await;
+    share(&x, projects, "lr").await;
+    let (mut b, bob) = x.bob_with_scope().await;
+    let shared = format!("\"Other Users/{LOGIN}/Projects\"");
+    let msg = std::str::from_utf8(PLAIN).expect("utf8");
+    let append = |tag: &str, flags: &str| {
+        format!(
+            "{tag} APPEND {shared} ({flags}) {{{}+}}\r\n{msg}",
+            PLAIN.len()
+        )
+    };
+    // Без `i` — APPEND и COPY в папку отклоняются.
+    let r = b.cmd(&append("A1", "")).await;
+    assert!(r.contains("A1 NO [NOPERM]"), "{r}");
+    assert_eq!(messages(&x, x.env.scope(), projects).await.len(), 1);
+    // С `i` (без `s`, `w`): письмо кладётся владельцу, флаги без права не ставятся.
+    share(&x, projects, "lri").await;
+    let r = b.cmd(&append("A2", "\\Seen \\Flagged")).await;
+    assert!(r.contains("A2 OK [APPENDUID"), "{r}");
+    let flags = messages(&x, x.env.scope(), projects).await;
+    assert_eq!(flags.len(), 2);
+    assert!(flags.iter().all(Flags::is_empty), "{flags:?}");
+    // COPY и MOVE из своей папки в общую.
+    let inbox = x
+        .env
+        .meta
+        .mailbox_by_role(bob, SpecialUse::Inbox)
+        .expect("inbox");
+    let own = format!("O1 APPEND INBOX (\\Seen) {{{}+}}\r\n{msg}", PLAIN.len());
+    assert!(b.cmd(&own).await.contains("O1 OK"));
+    let own = format!("O2 APPEND INBOX () {{{}+}}\r\n{msg}", PLAIN.len());
+    assert!(b.cmd(&own).await.contains("O2 OK"));
+    assert!(b.cmd("S1 SELECT INBOX").await.contains("S1 OK"));
+    let r = b.cmd(&format!("C1 COPY 1 {shared}")).await;
+    assert!(r.contains("C1 OK [COPYUID"), "{r}");
+    let r = b.cmd(&format!("C2 MOVE 2 {shared}")).await;
+    assert!(r.contains("* 2 EXPUNGE"), "{r}");
+    assert!(r.contains("C2 OK"), "{r}");
+    let flags = messages(&x, x.env.scope(), projects).await;
+    assert_eq!(flags.len(), 4);
+    assert!(flags.iter().all(Flags::is_empty), "{flags:?}");
+    assert_eq!(messages(&x, bob, inbox).await.len(), 1);
+    let bob_trash = x
+        .env
+        .meta
+        .mailbox_by_role(bob, SpecialUse::Trash)
+        .expect("trash");
+    assert_eq!(messages(&x, bob, bob_trash).await.len(), 1);
+    // С `s`: `\Seen` у копии сохраняется.
+    share(&x, projects, "lris").await;
+    assert!(
+        b.cmd(&format!("C3 COPY 1 {shared}"))
+            .await
+            .contains("C3 OK")
+    );
+    let flags = messages(&x, x.env.scope(), projects).await;
+    assert_eq!(flags.iter().filter(|f| f.contains(&Flag::Seen)).count(), 1);
 }

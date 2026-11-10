@@ -5,13 +5,15 @@
 //! шины). Ответ `FETCH` — по состоянию после изменения; `.SILENT` подавляет его, но при включённом
 //! CONDSTORE для изменённых писем `FETCH (MODSEQ …)` отправляется всё равно (RFC 7162, 3.1.3).
 //! Письма, не изменённые из-за `UNCHANGEDSINCE`, перечисляются в `OK [MODIFIED …]` (номера или UID).
+//! В общей папке — по правам ACL (RFC 4314, 4): флаги без права не меняются (`ext`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU64;
 
 use tp_contracts::meta::{Flag, FlagOp, Flags, Message, MessageQuery};
 use tp_contracts::{Error, MessageId, ModSeq, Result};
 
+use crate::ext::{allowed_flags, flag_rights, has_any, may_set};
 use crate::proto::types::command::{CommandBody, StoreModifier};
 use crate::proto::types::core::{Tag, Vec1};
 use crate::proto::types::fetch::MessageDataItem;
@@ -69,13 +71,25 @@ impl<T: Transport> Session<T> {
             self.bad(Some(tag), "Flag can't be stored");
             return Ok(());
         };
-        let Some(selected) = self.selected.as_ref() else {
+        let Some(read_only) = self.selected.as_ref().map(|s| s.read_only) else {
             return Ok(());
         };
-        if selected.read_only {
+        if read_only {
             self.no(tag, None, "Mailbox is read-only");
             return Ok(());
         }
+        // Общая папка: флаги без права пропускаются; ни одного разрешённого — `NO [NOPERM]` (RFC 4314, 4).
+        let rights = self.selected_rights().await?;
+        let full = rights.contains(flag_rights());
+        let requested = flags.len();
+        let flags = allowed_flags(rights, flags);
+        if !has_any(rights, flag_rights()) || (requested > 0 && flags.is_empty()) {
+            self.no(tag, Some(proto::code("NOPERM")), "Permission denied");
+            return Ok(());
+        }
+        let Some(selected) = self.selected.as_ref() else {
+            return Ok(());
+        };
         let mailbox = selected.mailbox;
         let targets: Vec<(usize, u32, MessageId)> = indexes
             .iter()
@@ -94,21 +108,44 @@ impl<T: Transport> Session<T> {
             self.ok(tag, None, &format!("{verb} completed"));
             return Ok(());
         }
-        let op = match kind {
-            StoreType::Add => FlagOp::Add(flags),
-            StoreType::Remove => FlagOp::Remove(flags),
-            StoreType::Replace => FlagOp::Replace(flags),
-        };
         let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let ids: Vec<MessageId> = targets.iter().map(|t| t.2).collect();
-        let update = self
-            .ctx
-            .deps
-            .store
-            .set_flags(scope, &ids, op, unchanged_since)
-            .await?;
-        let conflicts: HashSet<MessageId> = update.conflicts.iter().copied().collect();
-        let changed: HashSet<MessageId> = update.changed.iter().copied().collect();
+        let ops: Vec<(FlagOp, Vec<MessageId>)> = match kind {
+            StoreType::Add => vec![(FlagOp::Add(flags), ids)],
+            StoreType::Remove => vec![(FlagOp::Remove(flags), ids)],
+            StoreType::Replace if full => vec![(FlagOp::Replace(flags), ids)],
+            // Неполные права: флаги без права у каждого письма остаются как были.
+            StoreType::Replace => {
+                let list = self
+                    .ctx
+                    .deps
+                    .messages
+                    .list(scope, mailbox, MessageQuery::Ids(ids.clone()), ids.len())
+                    .await?;
+                let mut groups: BTreeMap<Flags, Vec<MessageId>> = BTreeMap::new();
+                for m in list {
+                    let kept = m.flags.into_iter().filter(|f| !may_set(rights, f));
+                    let new: Flags = kept.chain(flags.iter().cloned()).collect();
+                    groups.entry(new).or_default().push(m.id);
+                }
+                groups
+                    .into_iter()
+                    .map(|(f, ids)| (FlagOp::Replace(f), ids))
+                    .collect()
+            }
+        };
+        let mut conflicts: HashSet<MessageId> = HashSet::new();
+        let mut changed: HashSet<MessageId> = HashSet::new();
+        for (op, ids) in ops {
+            let update = self
+                .ctx
+                .deps
+                .store
+                .set_flags(scope, &ids, op, unchanged_since)
+                .await?;
+            conflicts.extend(update.conflicts);
+            changed.extend(update.changed);
+        }
         let silent = response == StoreResponse::Silent;
         if !silent || self.condstore {
             let batch = self.ctx.config.limits.fetch_batch.max(1);
