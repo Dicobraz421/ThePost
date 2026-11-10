@@ -26,7 +26,7 @@ pub mod server;
 
 pub use authcheck::AuthCheck;
 pub use config::SmtpConfig;
-pub use deliver::{Delivery, Outbound};
+pub use deliver::{Delivery, Outbound, RcptStatus, Submitted};
 pub use limits::SendLimits;
 pub use metrics::SmtpMetrics;
 pub use milter::Milters;

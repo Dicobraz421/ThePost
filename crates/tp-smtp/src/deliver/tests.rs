@@ -553,3 +553,176 @@ async fn bounce_for_full_mailbox_after_accept() {
     assert_eq!(inbox.len(), 1);
     assert!(inbox[0].contains("Subject: Undelivered Mail Returned to Sender"));
 }
+
+fn rcpts(list: &[&str]) -> Vec<String> {
+    list.iter().map(|r| (*r).to_owned()).collect()
+}
+
+const OWN: &[u8] = b"From: alice@example.org\r\nSubject: hi\r\n\r\nbody\r\n";
+
+#[tokio::test]
+async fn submit_local_recipient_delivered_without_queue() {
+    let env = Env::new(DecisionHooks::default()).await;
+    // Без очереди: локальная доставка не зависит от smtp-out (MX, DNS, MTA-STS, DANE).
+    let d = env.delivery(false);
+    let out = d
+        .submit(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &rcpts(&["Bob@Example.org"]),
+            Bytes::from_static(OWN),
+        )
+        .await
+        .expect("submit");
+    assert_eq!(
+        out.rcpts,
+        [("Bob@Example.org".to_owned(), RcptStatus::Delivered)]
+    );
+    let inbox = env.inbox("bob@example.org").await;
+    assert_eq!(inbox.len(), 1);
+    assert!(
+        inbox[0].starts_with(
+            "Return-Path: <alice@example.org>\r\nReceived: by mx.example.org (The Post) id "
+        ),
+        "{}",
+        inbox[0]
+    );
+    assert!(inbox[0].contains("\tfor <Bob@Example.org>;"));
+    assert!(inbox[0].ends_with("Subject: hi\r\n\r\nbody\r\n"));
+    assert!(env.queue.0.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn submit_mixed_recipients() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let d = env.delivery(true);
+    // Через `Outbound`, как подключает JMAP.
+    let ob: Arc<dyn Outbound> = Arc::new(env.delivery(true));
+    let list = rcpts(&[
+        "team@example.org",
+        "x@example.net",
+        "postmaster@example.org",
+    ]);
+    let out = d
+        .submit(
+            TenantId::DEFAULT,
+            "carol@example.org",
+            &list,
+            Bytes::from_static(OWN),
+        )
+        .await
+        .expect("submit");
+    assert_eq!(
+        out.rcpts,
+        [
+            ("team@example.org".to_owned(), RcptStatus::Delivered),
+            ("x@example.net".to_owned(), RcptStatus::Queued),
+            ("postmaster@example.org".to_owned(), RcptStatus::Delivered),
+        ]
+    );
+    // Группа и псевдоним: одна копия на учётную запись.
+    assert_eq!(env.inbox("alice@example.org").await.len(), 1);
+    assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+    assert_eq!(env.inbox("carol@example.org").await.len(), 1);
+    {
+        let queued = env.queue.0.lock().expect("lock");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "carol@example.org");
+        assert_eq!(queued[0].1, ["x@example.net"]);
+        // Во внешнюю очередь — письмо без заголовков локальной доставки (DKIM подписывает очередь).
+        assert_eq!(queued[0].2, Bytes::from_static(OWN));
+    }
+    ob.enqueue(
+        TenantId::DEFAULT,
+        "carol@example.org",
+        &rcpts(&["bob@example.org", "y@example.com"]),
+        Bytes::from_static(OWN),
+    )
+    .await
+    .expect("enqueue");
+    assert_eq!(env.inbox("bob@example.org").await.len(), 2);
+    let queued = env.queue.0.lock().expect("lock");
+    assert_eq!(queued.len(), 2);
+    assert_eq!(queued[1].1, ["y@example.com"]);
+}
+
+#[tokio::test]
+async fn submit_unknown_local_address_bounces() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let d = env.delivery(true);
+    let out = d
+        .submit(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &rcpts(&["nobody@example.org", "bob@example.org"]),
+            Bytes::from_static(OWN),
+        )
+        .await
+        .expect("submit");
+    assert_eq!(
+        out.rcpts,
+        [
+            (
+                "nobody@example.org".to_owned(),
+                RcptStatus::Failed("550 5.1.1 mailbox unavailable".into())
+            ),
+            ("bob@example.org".to_owned(), RcptStatus::Delivered),
+        ]
+    );
+    assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+    // Уведомление локальному отправителю — во «Входящие», не в очередь.
+    let inbox = env.inbox("alice@example.org").await;
+    assert_eq!(inbox.len(), 1);
+    assert!(inbox[0].contains(
+        "Final-Recipient: rfc822; nobody@example.org\r\nAction: failed\r\nStatus: 5.1.1"
+    ));
+    assert!(env.queue.0.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn submit_full_mailbox_bounces() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let d = env.delivery(true);
+    env.quota
+        .set_limit(env.scope("bob@example.org").await, Some(1));
+    let out = d
+        .submit(
+            TenantId::DEFAULT,
+            "sender@example.net",
+            &rcpts(&["bob@example.org"]),
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("submit");
+    assert_eq!(
+        out.rcpts,
+        [(
+            "bob@example.org".to_owned(),
+            RcptStatus::Failed("552 5.2.2 mailbox full".into())
+        )]
+    );
+    assert!(env.inbox("bob@example.org").await.is_empty());
+    let queued = env.queue.0.lock().expect("lock");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].0, "");
+    assert_eq!(queued[0].1, ["sender@example.net"]);
+    let dsn = String::from_utf8_lossy(&queued[0].2).into_owned();
+    assert!(dsn.contains("Status: 5.2.2"), "{dsn}");
+}
+
+#[tokio::test]
+async fn submit_external_without_queue_fails_before_delivery() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let d = env.delivery(false);
+    let err = d
+        .submit(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &rcpts(&["bob@example.org", "x@example.net"]),
+            Bytes::from_static(OWN),
+        )
+        .await
+        .expect_err("no queue");
+    assert!(err.is_retryable(), "{err}");
+    assert!(env.inbox("bob@example.org").await.is_empty());
+}
