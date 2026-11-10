@@ -11,12 +11,17 @@ use mail_auth::{MX, RecordSet};
 use tokio::net::TcpListener;
 use tp_contracts::config::duration::HumanDuration;
 use tp_contracts::queue::{DsnNotify, QueueStore};
+use tp_contracts::role::CancellationToken;
+use tp_contracts::transport::{DestinationPolicy, TlsRequirement, TransportStore};
 use tp_contracts::{BlobKey, TenantId};
-use tp_testkit::{Clock, ManualClock, MemBlobIndex, MemBlobStore, MemQueue};
+use tp_testkit::{
+    Clock, ManualClock, MemBlobIndex, MemBlobStore, MemEventBus, MemQueue, MemTransport,
+};
 
 use super::send::MxTransport;
 use super::*;
 use crate::config::OutboundTls;
+use crate::routes::Routes;
 use crate::server::tests::{Recorder, conn_info};
 use crate::server::{Mode, Session, SessionCtx};
 use mail_auth::ResolverCache;
@@ -381,6 +386,7 @@ pub(crate) fn req<'a>(
         from: "alice@example.org",
         rcpts,
         message: MAIL,
+        route: None,
     }
 }
 
@@ -659,4 +665,353 @@ async fn success_dsn_only_on_request() {
             .contains("Final-Recipient: rfc822; x@example.net\r\nAction: delivered")
     );
     assert!(!dsn[0].2.contains("y@example.net\r\nAction"));
+}
+
+// ---------- Планировщик по доменам ----------
+
+/// Домен → (отправок сейчас, наибольшее); домены вызовов по порядку.
+type TimedState = (
+    std::collections::HashMap<String, (usize, usize)>,
+    Vec<String>,
+);
+
+/// Отправка с задержкой `delay`; домены из `down` недоступны. Учёт одновременных отправок по доменам.
+#[derive(Default)]
+struct Timed {
+    delay: Duration,
+    down: Vec<String>,
+    state: Mutex<TimedState>,
+}
+
+impl Timed {
+    /// Наибольшее число одновременных отправок в домен.
+    fn peak(&self, domain: &str) -> usize {
+        self.state
+            .lock()
+            .expect("lock")
+            .0
+            .get(domain)
+            .map_or(0, |d| d.1)
+    }
+
+    /// Домены вызовов по порядку.
+    fn calls(&self, domain: &str) -> usize {
+        let st = self.state.lock().expect("lock");
+        st.1.iter().filter(|d| *d == domain).count()
+    }
+}
+
+#[async_trait]
+impl Transport for Timed {
+    async fn send(&self, req: SendRequest<'_>) -> Vec<RcptResult> {
+        {
+            let mut st = self.state.lock().expect("lock");
+            st.1.push(req.domain.to_owned());
+            let d = st.0.entry(req.domain.to_owned()).or_default();
+            d.0 += 1;
+            d.1 = d.1.max(d.0);
+        }
+        tokio::time::sleep(self.delay).await;
+        self.state
+            .lock()
+            .expect("lock")
+            .0
+            .get_mut(req.domain)
+            .expect("domain")
+            .0 -= 1;
+        let r = if self.down.iter().any(|d| d == req.domain) {
+            RcptResult::Temporary(format!("{}: connection refused", req.domain))
+        } else {
+            RcptResult::Delivered("250 2.0.0 OK".into())
+        };
+        vec![r; req.rcpts.len()]
+    }
+}
+
+async fn enqueue(env: &Env, rcpts: &[&str]) {
+    let rcpts: Vec<String> = rcpts.iter().map(|r| (*r).to_owned()).collect();
+    Queue::new(env.deps.clone())
+        .enqueue(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &rcpts,
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("enqueue");
+}
+
+#[tokio::test]
+async fn unreachable_domain_does_not_delay_others() {
+    let env = Env::new();
+    let t = Arc::new(Timed {
+        down: vec!["dead.example".into()],
+        ..Timed::default()
+    });
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "out.example.org");
+    enqueue(&env, &["a@dead.example", "b@ok.example"]).await;
+    enqueue(&env, &["c@dead.example"]).await;
+    enqueue(&env, &["d@ok.example"]).await;
+    let cfg = QueueConfig {
+        concurrency: 1,
+        ..cfg()
+    };
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 3);
+    // Недоступный домен — одна попытка, затем перенос без соединения; другой домен доставлен.
+    assert_eq!(t.calls("dead.example"), 1);
+    assert_eq!(t.calls("ok.example"), 2);
+    let left = due(&env).await;
+    assert!(left.is_empty(), "до конца паузы попыток нет");
+    let claimed = env
+        .queue
+        .claim(
+            env.clock.now() + cfg.scheduler.backoff_min,
+            10,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim");
+    // Перенесённый получатель — на конец паузы, получивший попытку — по расписанию повторов (5 мин).
+    let rcpts: Vec<&str> = claimed
+        .iter()
+        .flat_map(|c| c.rcpts.iter().map(|r| r.rcpt.address.as_str()))
+        .collect();
+    assert_eq!(rcpts, ["c@dead.example"]);
+    assert!(
+        claimed[0].rcpts[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("unreachable"))
+    );
+    // Пауза удваивается с каждой неудачей подряд.
+    env.clock
+        .advance(cfg.scheduler.backoff_min + Duration::from_secs(5));
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 1);
+    assert_eq!(t.calls("dead.example"), 2);
+    // Новое письмо в домен в течение паузы 2 мин — перенос на её конец.
+    enqueue(&env, &["e@dead.example"]).await;
+    env.clock.advance(Duration::from_secs(60));
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 1);
+    assert_eq!(t.calls("dead.example"), 2);
+    let at = env.clock.now() + Duration::from_secs(60);
+    let claimed = env
+        .queue
+        .claim(at - Duration::from_secs(1), 10, Duration::from_secs(1))
+        .await
+        .expect("claim");
+    assert!(claimed.is_empty());
+    let claimed = env
+        .queue
+        .claim(at, 10, Duration::from_secs(1))
+        .await
+        .expect("claim");
+    assert_eq!(claimed[0].rcpts[0].rcpt.address, "e@dead.example");
+}
+
+#[tokio::test]
+async fn domain_concurrency_limit_and_slow_start() {
+    let env = Env::new();
+    let t = Arc::new(Timed {
+        delay: Duration::from_millis(50),
+        ..Timed::default()
+    });
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "out.example.org");
+    for i in 0..12 {
+        enqueue(
+            &env,
+            &[
+                &format!("u{i}@busy.example"),
+                &format!("u{i}@other.example"),
+            ],
+        )
+        .await;
+    }
+    let mut cfg = QueueConfig {
+        concurrency: 12,
+        ..cfg()
+    };
+    cfg.scheduler.domain_concurrency = 3;
+    cfg.scheduler.initial_concurrency = 1;
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 12);
+    assert!(env.queue.is_empty());
+    assert_eq!(t.calls("busy.example"), 12);
+    assert_eq!(t.peak("busy.example"), 3, "лимит параллельности домена");
+    // Без ожидания места: медленный старт нового домена — одна отправка, остальные перенесены.
+    for i in 0..4 {
+        enqueue(&env, &[&format!("u{i}@new.example")]).await;
+    }
+    cfg.scheduler.wait = Duration::ZERO;
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 4);
+    assert_eq!(t.calls("new.example"), 1);
+    assert_eq!(env.queue.len(), 3);
+    let claimed = env
+        .queue
+        .claim(
+            env.clock.now() + cfg.scheduler.busy_delay,
+            10,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 3, "перенос на busy_delay");
+}
+
+#[tokio::test]
+async fn internal_pool_is_separate() {
+    let env = Env::new();
+    let t = Arc::new(Timed {
+        delay: Duration::from_millis(50),
+        ..Timed::default()
+    });
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "out.example.org");
+    for i in 0..3 {
+        enqueue(&env, &[&format!("u{i}@ext{i}.example")]).await;
+    }
+    enqueue(&env, &["x@corp.example"]).await;
+    let mut cfg = QueueConfig {
+        concurrency: 8,
+        ..cfg()
+    };
+    cfg.scheduler.wait = Duration::ZERO;
+    cfg.scheduler.external_concurrency = 1;
+    cfg.scheduler.internal_domains = vec!["corp.example".into()];
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 4);
+    // Пул внешней доставки занят одной отправкой, внутренняя — в своём пуле.
+    assert_eq!(t.calls("corp.example"), 1);
+    let external: usize = (0..3).map(|i| t.calls(&format!("ext{i}.example"))).sum();
+    assert_eq!(external, 1);
+    assert_eq!(env.queue.len(), 2);
+}
+
+// ---------- Политики доменов назначения ----------
+
+fn route(pattern: &str, tls: TlsRequirement, smart_host: Option<String>) -> DestinationPolicy {
+    DestinationPolicy {
+        pattern: pattern.into(),
+        tls,
+        smart_host,
+        egress_ip: None,
+    }
+}
+
+#[tokio::test]
+async fn required_tls_route_refuses_plain_server() {
+    let rec = Arc::new(Recorder::default());
+    let port = smtp_server(rec.clone()).await;
+    let t = transport();
+    mx(&t, "partner.example", &[(10, "mx.partner.example")]);
+    a(&t, "mx.partner.example", [127, 0, 0, 1].into());
+    let cfg = QueueConfig { port, ..cfg() };
+    let rcpts = vec!["x@partner.example".to_owned()];
+    // Сервер без STARTTLS: обязательный TLS — временная неудача, открытым текстом письмо не передаётся.
+    let p = route("partner.example", TlsRequirement::Required, None);
+    let res = t
+        .send(SendRequest {
+            route: Some(&p),
+            ..req(&cfg, "partner.example", &rcpts)
+        })
+        .await;
+    assert!(
+        matches!(&res[0], RcptResult::Temporary(r) if r.contains("STARTTLS not offered")),
+        "{res:?}"
+    );
+    let p = route(
+        "partner.example",
+        TlsRequirement::Pinned {
+            spki_sha256: vec!["0".repeat(64)],
+        },
+        None,
+    );
+    let res = t
+        .send(SendRequest {
+            route: Some(&p),
+            ..req(&cfg, "partner.example", &rcpts)
+        })
+        .await;
+    assert!(matches!(&res[0], RcptResult::Temporary(_)), "{res:?}");
+    assert!(rec.mails().is_empty());
+    // Оппортунистическая политика — доставка открытым текстом.
+    let p = route("partner.example", TlsRequirement::Opportunistic, None);
+    let res = t
+        .send(SendRequest {
+            route: Some(&p),
+            ..req(&cfg, "partner.example", &rcpts)
+        })
+        .await;
+    assert!(matches!(&res[0], RcptResult::Delivered(_)), "{res:?}");
+    assert_eq!(rec.mails().len(), 1);
+}
+
+#[tokio::test]
+async fn smart_host_route_and_reload_on_signal() {
+    let rec = Arc::new(Recorder::default());
+    let port = smtp_server(rec.clone()).await;
+    let env = Env::new();
+    let bus: Arc<dyn tp_contracts::bus::EventBus> = Arc::new(MemEventBus::default());
+    let store = MemTransport::new().with_bus(bus.clone());
+    let tenant = TenantId::DEFAULT;
+    // Все внешние домены — через промежуточный узел (relayhost); MX доменов неизвестны.
+    let v = store
+        .put_route(
+            tenant,
+            0,
+            &route(
+                "*",
+                TlsRequirement::Opportunistic,
+                Some(format!("127.0.0.1:{port}")),
+            ),
+        )
+        .await
+        .expect("route");
+    // Принятый домен кластера — внутренняя доставка без политики (его MX неизвестен: временная неудача).
+    store
+        .put_domain(
+            0,
+            &tp_contracts::transport::AcceptedDomain {
+                id: tp_contracts::DomainId::new(),
+                tenant: TenantId::new(),
+                name: "corp.example".into(),
+                kind: Default::default(),
+            },
+        )
+        .await
+        .expect("domain");
+    let routes = Arc::new(Routes::new(Arc::new(store.clone())));
+    let stop = CancellationToken::new();
+    tokio::spawn(
+        routes
+            .clone()
+            .watch(bus.clone(), stop.clone(), Duration::from_millis(50)),
+    );
+    let worker = QueueWorker::new(env.deps.clone(), Arc::new(transport()), "out.example.org")
+        .with_routes(routes.clone(), Some(bus));
+    enqueue(&env, &["x@example.net", "y@example.com", "z@corp.example"]).await;
+    let cfg = cfg();
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 1);
+    assert_eq!(rec.mails().len(), 2, "по соединению на внешний домен");
+    assert_eq!(env.queue.len(), 1, "внутренний домен ждёт повтора");
+    // Политика изменена: обязательный TLS на узле без STARTTLS — отказ после сигнала.
+    let v2 = store
+        .put_route(
+            tenant,
+            v,
+            &route(
+                "*",
+                TlsRequirement::Required,
+                Some(format!("127.0.0.1:{port}")),
+            ),
+        )
+        .await
+        .expect("route");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while routes.tenant(tenant).await.expect("tenant").version != v2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("политики перечитаны по сигналу");
+    enqueue(&env, &["w@example.org"]).await;
+    worker.run_once(&cfg).await.expect("run");
+    assert_eq!(rec.mails().len(), 2);
+    stop.cancel();
 }

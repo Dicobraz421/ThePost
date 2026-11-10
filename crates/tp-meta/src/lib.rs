@@ -28,6 +28,7 @@ pub mod retention;
 pub mod schema;
 pub mod shards;
 pub mod signals;
+pub mod transport;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,7 +131,8 @@ impl std::fmt::Debug for Signals {
 /// Хранилища метаданных на PostgreSQL.
 ///
 /// С шиной ([`PgMeta::with_bus`]) после фиксации публикуются сигналы: `LogAppended` — после записи событий
-/// в журнал ядра, `MembersChanged` — при изменении состава кластера, `Blocked` — после блокировки. Сигнал
+/// в журнал ядра, `MembersChanged` — при изменении состава кластера, `Blocked` — после блокировки,
+/// `TransportChanged` — после изменения настроек транспорта ([`transport`]). Сигнал
 /// at-most-once: ошибка публикации не отменяет зафиксированное изменение (только запись в журнал узла).
 #[derive(Debug, Clone)]
 pub struct PgMeta {

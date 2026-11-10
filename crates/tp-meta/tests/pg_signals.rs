@@ -1,5 +1,6 @@
 //! Сигналы через LISTEN/NOTIFY (META-26): доставка и фильтрация, склейка пачек под нагрузкой, переполнение
-//! буфера и переподключение слушателя — `Resync`; сигналы хранилищ после фиксации.
+//! буфера и переподключение слушателя — `Resync`; сигналы хранилищ после фиксации; контракт `EventBus` — общий
+//! набор `tp_testkit::suite::signals` (META-36).
 
 mod common;
 
@@ -7,9 +8,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use sqlx::PgPool;
 use tp_contracts::abuse::BlockSubject;
-use tp_contracts::bus::{Event, EventKind};
+use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::events::{Partition, partition_of};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo};
 use tp_contracts::meta::{AccountScope, MailboxStore, NewMailbox};
@@ -301,6 +303,50 @@ async fn reconnect_gives_resync() {
     assert_eq!(
         tokio::time::timeout(WAIT, sys.next()).await.expect("end"),
         None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passes_contract_suite() {
+    let Some((bus, _, _)) = bus(SignalsConfig::default()).await else {
+        return;
+    };
+    tp_testkit::suite::signals(&bus).await;
+}
+
+/// Поток контракта: `drop` удаляет подписку, остановка шины завершает поток.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn event_stream_lifecycle() {
+    let Some((bus, _, _)) = bus(SignalsConfig::default()).await else {
+        return;
+    };
+    let bus = Arc::new(bus);
+    let dyn_bus: Arc<dyn EventBus> = bus.clone();
+    let mut sys = dyn_bus.subscribe_system().await.expect("subscribe_system");
+    let acc = dyn_bus
+        .subscribe(AccountScope {
+            tenant: TenantId::new(),
+            account: AccountId::new(),
+        })
+        .await
+        .expect("subscribe");
+    assert_eq!(bus.subscribers(), 2);
+    drop(acc);
+    assert_eq!(bus.subscribers(), 1, "drop потока удаляет подписку");
+
+    dyn_bus.publish(log(3)).await.expect("publish");
+    let got = tokio::time::timeout(WAIT, sys.next())
+        .await
+        .expect("сигнал не пришёл");
+    assert_eq!(got, Some(log(3)));
+
+    drop(dyn_bus);
+    let bus = Arc::into_inner(bus).expect("единственная ссылка");
+    drop(bus);
+    assert_eq!(
+        tokio::time::timeout(WAIT, sys.next()).await.expect("end"),
+        None,
+        "остановка шины завершает поток"
     );
 }
 

@@ -12,7 +12,7 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 67/118 | 123/197 | в работе, 62 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 70/121 | 127/200 | в работе, 64 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
 | Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 0/0 | 0/0 | карточки — после Ф1 | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/0 | 0/0 | карточки — после Ф1 | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
@@ -144,7 +144,7 @@
 |---|---|---|---|---|
 | ✅ contracts-12 (ветка `x/contracts-12`) | CTR-23 | B | contracts-11 | 1 |
 | ✅ meta-09 | META-25 | A | meta-08 | 3 |
-| meta-10 | META-26, META-27 | A | meta-09, contracts-12 | 3 |
+| ✅ meta-10 | META-26, META-27 | A | meta-09, contracts-12 | 3 |
 | cluster-06 | CLU-09, CLU-10, CLU-11 | A | contracts-12 | 4 |
 | app-04 | APP-08 | A | meta-10, cluster-06 | 2 |
 | ✅ platform-07 | PLT-17 | A | platform-06 | 2 |
@@ -254,9 +254,9 @@
 | ✅ platform-09 | PLT-19 | A | platform-07 (и PR #209) | 2 |
 | ✅ sys-04 | SYS-08, SYS-09 | A | deploy-08, platform-07 | 2 |
 | ✅ contracts-25 (ветка `x/contracts-25`) | CTR-37 | B | contracts-12 | 1 |
-| imap-07 | IMAP-16 | A | imap-03 | 2 |
+| ✅ imap-07 | IMAP-16 | A | imap-03 | 2 |
 | app-13 | APP-14 | A | meta-09, deploy-02, app-12 | 2 |
-| contracts-26 (ветка `x/contracts-26`) | CTR-38 | B | contracts-25 | 1 |
+| ✅ contracts-26 (ветка `x/contracts-26`) | CTR-38 | B | contracts-25 | 1 |
 | ✅ smtp-09 | SMTP-28 | A | smtp-08 | 4 |
 | meta-19 | META-36 | A | meta-10, contracts-25 (и PR #231) | 3 |
 | mailstore-11 | MS-18 | A | mailstore-08, contracts-25 | 1 |
@@ -265,6 +265,9 @@
 | sys-05 | SYS-10 | A | sys-04 | 2 |
 | app-15 | APP-16 | A | sys-05, smtp-04, app-14 | 2 |
 | contracts-28 (ветка `x/contracts-28`) | CTR-40 | B | contracts-27 | 1 |
+| platform-10 | PLT-20 | A | platform-09 | 2 |
+| meta-21 | META-38 | A | meta-09 | 3 |
+| meta-20 | META-27 (тест) | A | meta-10 | 3 |
 
 Первая учётная запись SMB без провайдера OIDC (CMP-01, п. 5б) — вопрос владельцу, issue #193 (`решение`). Отложенная отправка и отмена (CMP-03) — issue #195.
 

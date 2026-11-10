@@ -18,11 +18,12 @@ use tp_platform::listen::Incoming;
 use tp_platform::{Listener, RateLimiter, TlsCerts};
 
 use super::session::push;
-use super::tls::serve_conn;
+use super::tls::serve_screened;
 use super::{Handler, Mode, SessionCtx, reply};
 use crate::config::SmtpConfig;
 use crate::limits::SendLimits;
 use crate::metrics::SmtpMetrics;
+use crate::screen::{Admission, Screen};
 
 /// Зависимости ролей SMTP, выбранные приложением.
 #[derive(Clone)]
@@ -55,12 +56,15 @@ impl fmt::Debug for ServerDeps {
 pub struct SmtpService {
     mode: Mode,
     deps: ServerDeps,
+    /// Экран соединений (smtp-in): кэш и частота по адресам — общие для слушателей роли.
+    screen: Arc<Screen>,
 }
 
 impl SmtpService {
     /// Сервис роли `mode`.
     pub fn new(mode: Mode, deps: ServerDeps) -> Self {
-        Self { mode, deps }
+        let screen = Arc::new(Screen::new(deps.metrics.clone()));
+        Self { mode, deps, screen }
     }
 
     /// Обслуживает готовые слушатели до `ctx.shutdown` (приложение — из [`RoleService::run`], тесты — на `127.0.0.1:0`).
@@ -71,6 +75,7 @@ impl SmtpService {
                 listener,
                 self.mode,
                 self.deps.clone(),
+                self.screen.clone(),
                 ctx.config.clone(),
                 ctx.shutdown.clone(),
                 ctx.drain_deadline,
@@ -117,6 +122,7 @@ async fn accept_loop(
     listener: Listener,
     mode: Mode,
     deps: ServerDeps,
+    screen: Arc<Screen>,
     config: ConfigRx,
     shutdown: CancellationToken,
     drain: Duration,
@@ -133,7 +139,14 @@ async fn accept_loop(
                         last = cfg;
                     }
                     let busy = sessions.len() >= last.limits.max_connections;
-                    sessions.spawn(connection(incoming, mode, deps.clone(), last.clone(), busy));
+                    sessions.spawn(connection(
+                        incoming,
+                        mode,
+                        deps.clone(),
+                        screen.clone(),
+                        last.clone(),
+                        busy,
+                    ));
                 }
                 Err(e) => {
                     // Нехватка дескрипторов и т. п.: не крутить цикл вхолостую.
@@ -162,6 +175,7 @@ async fn connection(
     incoming: Incoming,
     mode: Mode,
     deps: ServerDeps,
+    screen: Arc<Screen>,
     config: Arc<SmtpConfig>,
     busy: bool,
 ) {
@@ -173,13 +187,28 @@ async fn connection(
             return;
         }
     };
+    let ip = conn.info.client.ip();
+    let mut probe = None;
     let refuse = if busy {
         Some(reply(421, [4, 3, 2], "Too many connections, try later"))
+    } else if let Some(r) = deps
+        .limiter
+        .as_ref()
+        .filter(|l| !l.check_ip(ip).is_allowed())
+        .map(|_| reply(421, [4, 7, 0], "Too many connections from your address"))
+    {
+        Some(r)
+    } else if mode == Mode::Inbound {
+        match screen.admit(&config.screen, ip) {
+            Admission::Exempt | Admission::Passed => None,
+            Admission::Probe(p) => {
+                probe = Some(p);
+                None
+            }
+            Admission::Reject { violation, .. } => Some(violation.reply()),
+        }
     } else {
-        deps.limiter
-            .as_ref()
-            .filter(|l| !l.check_ip(conn.info.client.ip()).is_allowed())
-            .map(|_| reply(421, [4, 7, 0], "Too many connections from your address"))
+        None
     };
     if let Some(r) = refuse {
         if let Some(m) = &deps.metrics {
@@ -193,7 +222,7 @@ async fn connection(
     }
     let ctx = SessionCtx {
         mode,
-        config,
+        config: config.clone(),
         handler: deps.handler,
         sasl: deps.sasl,
         limiter: deps.limiter,
@@ -201,5 +230,8 @@ async fn connection(
         metrics: deps.metrics.clone(),
     };
     let _session = deps.metrics.as_ref().map(|m| m.session(mode));
-    serve_conn(ctx, conn).await;
+    let outcome = serve_screened(ctx, conn, probe).await;
+    if probe.is_some() {
+        screen.record(&config.screen, ip, outcome);
+    }
 }
