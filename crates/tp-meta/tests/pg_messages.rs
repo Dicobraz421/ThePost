@@ -628,8 +628,8 @@ async fn core_events_written_in_transaction() {
             _ => String::new(),
         })
         .collect();
-    // 5 системных папок, доставка, флаги, корзина — в одном разделе по возрастанию позиции.
-    assert_eq!(kinds.iter().filter(|k| *k == "MailboxCreated").count(), 5);
+    // 6 системных папок, доставка, флаги, корзина — в одном разделе по возрастанию позиции.
+    assert_eq!(kinds.iter().filter(|k| *k == "MailboxCreated").count(), 6);
     assert_eq!(
         kinds
             .iter()
@@ -793,7 +793,9 @@ async fn cascade_delete_moves_subtree_to_trash() {
 
     // Системная папка в поддереве — Forbidden даже с каскадом.
     let q = meta.create(scope, mk(None, "Q", None)).await.expect("q").id;
-    meta.create(scope, mk(Some(q), "Archive", Some(SpecialUse::Archive)))
+    // Все роли заняты системными папками: «Архив» переносится в поддерево.
+    let archive = folder(&meta, scope, SpecialUse::Archive).await;
+    meta.rename(scope, archive, Some(q), "Archive")
         .await
         .expect("archive");
     assert_eq!(meta.delete(scope, q, true).await, Err(Error::Forbidden));

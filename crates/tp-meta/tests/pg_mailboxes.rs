@@ -36,6 +36,7 @@ async fn upsert_creates_system_folders_and_matches() {
         roles,
         vec![
             SpecialUse::Inbox,
+            SpecialUse::Archive,
             SpecialUse::Drafts,
             SpecialUse::Junk,
             SpecialUse::Sent,
