@@ -9,7 +9,7 @@
 //!   которого назвал сертификат вызывающего;
 //! - [`RpcConfig`] — секция конфигурации.
 //!
-//! Транспорт HTTPS/2 с mTLS (axum + reqwest, `InternalChannel::Node`) — после добавления зависимостей крейта (CLU-11).
+//! Транспорт HTTPS с mTLS (`InternalChannel::Node`) — [`crate::node_rpc`] (CLU-12).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use tp_contracts::config::duration;
 use tp_contracts::membership::NodeInfo;
 use tp_contracts::role::Role;
 use tp_contracts::rpc::{RpcError, RpcService};
+use tp_contracts::tls::{InternalChannel, InternalTls, Profile};
 use tp_contracts::{Error, Result};
 
 use crate::hashing::Rendezvous;
@@ -31,6 +32,10 @@ use crate::hashing::Rendezvous;
 /// ```yaml
 /// max_in_flight: 64
 /// connect_timeout: 2s
+/// tls:
+///   ca_file: /etc/thepost/cluster-ca.pem
+///   cert_file: /etc/thepost/node.pem     # CN — идентификатор узла
+///   key_file: /etc/thepost/node-key.pem
 /// permissions:
 ///   jmap: [search/query]
 ///   admin: [admin/*]
@@ -47,6 +52,23 @@ pub struct RpcConfig {
     /// Матрица разрешений: роль вызывающего узла → службы `<роль>/<имя>` или все службы роли `<роль>/*`.
     /// Не указано — запрещено (минимальные привилегии, SRS 6.8).
     pub permissions: BTreeMap<Role, BTreeSet<String>>,
+    /// Срок рукопожатия mTLS входящего соединения.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub handshake_timeout: Duration,
+    /// Пауза после ошибки приёма соединения (нехватка дескрипторов и т. п.).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub accept_retry_delay: Duration,
+    /// Сколько использовать прочитанный состав кластера (маршрут и роли вызывающего); `0s` — читать каждый раз.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub members_ttl: Duration,
+    /// Наибольший размер запроса (ключ и тело), байт.
+    pub max_body_bytes: usize,
+    /// TLS внутреннего канала: УЦ узлов (`ca_file`), сертификат узла (`cert_file`, CN — идентификатор узла) и
+    /// ключ (`key_file`) — обязательны при запуске транспорта; открытый канал и `server_name` не допускаются.
+    pub tls: InternalTls,
 }
 
 impl Default for RpcConfig {
@@ -55,18 +77,36 @@ impl Default for RpcConfig {
             max_in_flight: 64,
             connect_timeout: Duration::from_secs(2),
             permissions: BTreeMap::new(),
+            handshake_timeout: Duration::from_secs(5),
+            accept_retry_delay: Duration::from_millis(100),
+            members_ttl: Duration::from_secs(1),
+            max_body_bytes: 16 << 20,
+            tls: InternalTls::default(),
         }
     }
 }
 
 impl RpcConfig {
-    /// Проверка: ненулевые пределы и разбираемая матрица разрешений.
+    /// Проверка: ненулевые пределы, разбираемая матрица разрешений, только TLS (открытый канал запрещён в любом
+    /// профиле: без сертификата нет идентичности вызывающего узла).
     pub fn check(&self) -> Result<()> {
         if self.max_in_flight == 0 {
             return Err(Error::invalid("rpc.max_in_flight must be at least 1"));
         }
         if self.connect_timeout.is_zero() {
             return Err(Error::invalid("rpc.connect_timeout must be positive"));
+        }
+        if self.handshake_timeout.is_zero() {
+            return Err(Error::invalid("rpc.handshake_timeout must be positive"));
+        }
+        if self.max_body_bytes == 0 {
+            return Err(Error::invalid("rpc.max_body_bytes must be at least 1"));
+        }
+        self.tls.validate(InternalChannel::Node, Profile::Prod)?;
+        if self.tls.server_name.is_some() {
+            return Err(Error::invalid(
+                "rpc.tls.server_name is not supported: the server name is the host of each node address",
+            ));
         }
         Permissions::from_config(self).map(drop)
     }
@@ -311,6 +351,11 @@ mod tests {
         for bad in [
             "max_in_flight: 0\n",
             "connect_timeout: 0s\n",
+            "handshake_timeout: 0s\n",
+            "max_body_bytes: 0\n",
+            "tls:\n  allow_plaintext: true\n",
+            "tls:\n  server_name: n1\n",
+            "tls:\n  cert_file: /x.pem\n",
             "permissions:\n  jmap: [query]\n",
             "permissions:\n  jmap: [nobody/query]\n",
             "permissions:\n  jmap: [search/Query]\n",
