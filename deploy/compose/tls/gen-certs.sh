@@ -8,7 +8,7 @@ set -eu
 DIR=${1:-/certs}
 OUT=${2:-}
 # Имена сервисов compose и адреса хоста — в SAN серверного сертификата.
-SAN="DNS:localhost,DNS:thepost,DNS:mail.example.test,DNS:postgres-tls,DNS:valkey-tls,DNS:seaweedfs-tls,DNS:openbao-tls,IP:127.0.0.1,IP:::1"
+SAN="DNS:localhost,DNS:thepost,DNS:mail.example.test,DNS:postgres-tls,DNS:seaweedfs-tls,DNS:openbao-tls,IP:127.0.0.1,IP:::1"
 
 mkdir -p "$DIR"
 cd "$DIR"
@@ -35,7 +35,7 @@ else
   echo "tls: создан сертификат ($SAN)"
 fi
 
-# Ключ — владельцу 999 (postgres и valkey в своих образах), 0600 — требование PostgreSQL.
+# Ключ — владельцу 999 (postgres в своём образе), 0600 — требование PostgreSQL.
 chmod 0644 ca.pem server.pem
 chmod 0600 server.key ca.key
 if [ "$(id -u)" = 0 ]; then chown 999:999 server.key; fi
