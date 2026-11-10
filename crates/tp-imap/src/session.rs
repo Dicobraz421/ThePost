@@ -33,6 +33,7 @@ use tp_contracts::{Error, MailboxId, MessageId, ModSeq, Result, Uid, UidValidity
 use tp_platform::{Conn, Listener};
 
 use crate::config::ImapConfig;
+use crate::ext::Extensions;
 use crate::proto::types::auth::AuthMechanism;
 use crate::proto::types::command::{CommandBody, FetchModifier, SelectParameter};
 use crate::proto::types::core::{AString, Atom, IString, NString, Tag, Vec1};
@@ -130,6 +131,8 @@ pub struct SessionCtx {
 /// Выбранная папка (`SELECT`/`EXAMINE`): снимок писем для номеров последовательности.
 #[derive(Debug, Clone)]
 pub(crate) struct Selected {
+    /// Владелец папки (общая папка — другая учётная запись).
+    pub owner: AccountScope,
     /// Папка.
     pub mailbox: MailboxId,
     /// `EXAMINE`: только чтение.
@@ -158,6 +161,8 @@ pub struct Session<T: Transport> {
     pub(crate) condstore: bool,
     /// QRESYNC включён (`ENABLE QRESYNC`, RFC 7162, 3.2.3): `VANISHED` вместо `EXPUNGE`.
     pub(crate) qresync: bool,
+    /// Необязательные зависимости расширений (QUOTA, ACL).
+    pub(crate) ext: Extensions,
     errors: u32,
     auth_failures: u32,
     /// Сессия завершается после отправки накопленных ответов.
@@ -200,6 +205,7 @@ const EXTENSIONS: &[&str] = &[
     "UIDPLUS",
     "MOVE",
     "IDLE",
+    "NAMESPACE",
 ];
 
 fn reader(config: &ImapConfig) -> Reader {
@@ -221,10 +227,17 @@ impl<T: Transport> Session<T> {
             rev2: false,
             condstore: false,
             qresync: false,
+            ext: Extensions::default(),
             errors: 0,
             auth_failures: 0,
             close: false,
         }
+    }
+
+    /// Подключает зависимости расширений (QUOTA, ACL, общие папки).
+    pub fn with_extensions(mut self, ext: Extensions) -> Self {
+        self.ext = ext;
+        self
     }
 
     /// Ведёт сессию до `LOGOUT`, закрытия клиентом, таймаута или остановки узла.
@@ -439,7 +452,11 @@ impl<T: Transport> Session<T> {
     }
 
     pub(crate) fn capabilities(&self) -> Vec1<Capability<'static>> {
-        let mut caps: Vec<Capability<'static>> = EXTENSIONS.iter().map(|c| cap(c)).collect();
+        let mut caps: Vec<Capability<'static>> = EXTENSIONS
+            .iter()
+            .chain(&self.ext.capabilities())
+            .map(|c| cap(c))
+            .collect();
         if self.principal.is_none() {
             let conn = self.conn.as_ref();
             if conn.is_some_and(Transport::can_starttls) {
@@ -456,6 +473,15 @@ impl<T: Transport> Session<T> {
             }
         }
         Vec1::try_from(caps).unwrap_or_else(|_| Vec1::from(Capability::Imap4Rev1))
+    }
+
+    /// Контекст операций с выбранной папкой: владелец папки (общая папка — другая учётная запись),
+    /// без выбранной папки — [`Session::scope`].
+    pub(crate) fn mailbox_scope(&self) -> Option<AccountScope> {
+        match &self.selected {
+            Some(s) => self.principal.as_ref().map(|_| s.owner),
+            None => self.scope(),
+        }
     }
 
     /// Контекст операций хранилища; `None` — не выполнен вход.
@@ -556,6 +582,19 @@ impl<T: Transport> Session<T> {
                 Ok(())
             }
             Body::List(cmd) => self.list(&tag, cmd).await,
+            Body::Acl(cmd) => self.acl_command(&tag, cmd).await,
+            Body::Std(CommandBody::Namespace) => {
+                self.namespace(&tag);
+                Ok(())
+            }
+            Body::Std(CommandBody::GetQuota { root }) => self.get_quota(&tag, &root).await,
+            Body::Std(CommandBody::GetQuotaRoot { mailbox }) => {
+                self.get_quota_root(&tag, &mailbox).await
+            }
+            Body::Std(CommandBody::SetQuota { .. }) => {
+                self.set_quota(&tag);
+                Ok(())
+            }
             Body::Status { mailbox, items } => self.status(&tag, &mailbox, &items).await,
             Body::Create { mailbox, uses } => self.create(&tag, &mailbox, &uses).await,
             Body::ESearch {
@@ -970,12 +1009,22 @@ pub(crate) fn io_error(e: std::io::Error) -> Error {
 #[derive(Debug, Clone)]
 pub struct Server {
     ctx: Arc<SessionCtx>,
+    ext: Extensions,
 }
 
 impl Server {
     /// Сервер с контекстом сессий.
     pub fn new(ctx: SessionCtx) -> Self {
-        Self { ctx: Arc::new(ctx) }
+        Self {
+            ctx: Arc::new(ctx),
+            ext: Extensions::default(),
+        }
+    }
+
+    /// Подключает зависимости расширений (QUOTA, ACL, общие папки) для новых сессий.
+    pub fn with_extensions(mut self, ext: Extensions) -> Self {
+        self.ext = ext;
+        self
     }
 
     /// Принимает соединения до остановки узла, затем ждёт сессии не дольше `timeouts.drain`
@@ -997,6 +1046,7 @@ impl Server {
                     };
                     let full = sessions.len() >= self.ctx.config.limits.max_connections;
                     let ctx = self.ctx.clone();
+                    let ext = self.ext.clone();
                     let task = async move {
                         let peer = incoming.peer();
                         let conn = match incoming.establish().await {
@@ -1011,7 +1061,7 @@ impl Server {
                             return;
                         }
                         let client = conn.info.client;
-                        if let Err(e) = Session::new(ctx, conn).run().await {
+                        if let Err(e) = Session::new(ctx, conn).with_extensions(ext).run().await {
                             tracing::debug!(%client, error = %e, "imap: сессия прервана");
                         }
                     };

@@ -11,7 +11,8 @@
 
 use std::num::NonZeroU64;
 
-use tp_contracts::meta::{Flag, Mailbox, MessageQuery, NewMailbox, SpecialUse};
+use tp_contracts::auth::Rights;
+use tp_contracts::meta::{AccountScope, Flag, Mailbox, MessageQuery, NewMailbox, SpecialUse};
 use tp_contracts::{Error, MailboxId, Result};
 
 use crate::proto::types::core::{Atom, QuotedChar, Tag};
@@ -32,6 +33,8 @@ pub(crate) struct Node {
     /// Полное имя (UTF-8), `INBOX` — в верхнем регистре.
     pub path: String,
     pub children: bool,
+    /// Владелец общей папки (пространство имён других пользователей); `None` — своя папка.
+    pub owner: Option<AccountScope>,
 }
 
 /// Папки учётной записи с полными именами.
@@ -39,7 +42,7 @@ pub(crate) struct Node {
 pub(crate) struct Tree(pub Vec<Node>);
 
 impl Tree {
-    fn new(mut boxes: Vec<Mailbox>) -> Self {
+    pub(crate) fn new(mut boxes: Vec<Mailbox>) -> Self {
         boxes.sort_by_key(|m| m.id);
         let path_of = |m: &Mailbox| -> String {
             let mut parts = Vec::new();
@@ -63,6 +66,7 @@ impl Tree {
                 mailbox: m.clone(),
                 path: path_of(m),
                 children: boxes.iter().any(|c| c.parent == Some(m.id)),
+                owner: None,
             })
             .collect();
         nodes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -75,7 +79,7 @@ impl Tree {
 }
 
 /// `INBOX` в начале имени — в верхнем регистре (RFC 9051, 5.1).
-fn canonical(path: &str) -> String {
+pub(crate) fn canonical(path: &str) -> String {
     let (head, tail) = match path.split_once(DELIMITER) {
         Some((h, t)) => (h, Some(t)),
         None => (path, None),
@@ -91,7 +95,7 @@ fn canonical(path: &str) -> String {
 }
 
 /// Сопоставление с шаблоном LIST: `*` — любые символы, `%` — любые, кроме разделителя.
-fn matches(pattern: &[char], name: &[char]) -> bool {
+pub(crate) fn matches(pattern: &[char], name: &[char]) -> bool {
     match pattern.split_first() {
         None => name.is_empty(),
         Some(('*', rest)) => (0..=name.len()).any(|i| matches(rest, &name[i..])),
@@ -126,7 +130,7 @@ fn role_from_attr(attr: &str) -> Option<SpecialUse> {
     .find(|r| role_attr(*r).is_some_and(|a| a.eq_ignore_ascii_case(attr)))
 }
 
-fn attr(name: &'static str) -> FlagNameAttribute<'static> {
+pub(crate) fn attr(name: &'static str) -> FlagNameAttribute<'static> {
     FlagNameAttribute::from(Atom::unvalidated(name))
 }
 
@@ -143,7 +147,7 @@ fn system_flags() -> Vec<ImapFlag<'static>> {
 
 impl<T: Transport> Session<T> {
     /// Имя от клиента: UTF-8 (IMAP4rev2) или модифицированный UTF-7.
-    fn decode_name(&self, raw: &[u8]) -> Option<String> {
+    pub(crate) fn decode_name(&self, raw: &[u8]) -> Option<String> {
         let name = if self.rev2 {
             String::from_utf8(raw.to_vec()).ok()?
         } else {
@@ -153,7 +157,7 @@ impl<T: Transport> Session<T> {
     }
 
     /// Имя для клиента.
-    fn encode_name(&self, path: &str) -> Vec<u8> {
+    pub(crate) fn encode_name(&self, path: &str) -> Vec<u8> {
         if self.rev2 {
             path.as_bytes().to_vec()
         } else {
@@ -161,7 +165,7 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    fn imap_mailbox(&self, path: &str) -> ImapMailbox<'static> {
+    pub(crate) fn imap_mailbox(&self, path: &str) -> ImapMailbox<'static> {
         if path == "INBOX" {
             return ImapMailbox::Inbox;
         }
@@ -189,6 +193,28 @@ impl<T: Transport> Session<T> {
                 Ok(None)
             }
         }
+    }
+
+    /// Своя или общая папка (пространство имён других пользователей) по имени от клиента;
+    /// иначе — ответ `NO`/`BAD` уже записан.
+    pub(crate) async fn resolve_any(
+        &mut self,
+        tag: &Tag<'static>,
+        raw: &[u8],
+    ) -> Result<Option<Node>> {
+        let Some(name) = self.decode_name(raw) else {
+            self.bad(Some(tag), "Invalid mailbox name");
+            return Ok(None);
+        };
+        let tree = self.tree().await?;
+        if let Some(n) = tree.find(&name) {
+            return Ok(Some(n.clone()));
+        }
+        if let Some(n) = self.shared_node(&name).await? {
+            return Ok(Some(n));
+        }
+        self.no(tag, Some(proto::code("NONEXISTENT")), "No such mailbox");
+        Ok(None)
     }
 
     /// Папка назначения `APPEND`/`COPY`/`MOVE`; нет — `NO [TRYCREATE]` (RFC 9051, 6.3.12) уже записан.
@@ -328,6 +354,9 @@ impl<T: Transport> Session<T> {
             }
             self.maybe_flush().await?;
         }
+        if !cmd.lsub && !extended_select {
+            self.list_shared(&patterns).await?;
+        }
         self.ok(tag, None, &format!("{verb} completed"));
         Ok(())
     }
@@ -335,7 +364,10 @@ impl<T: Transport> Session<T> {
     // ---------- STATUS ----------
 
     async fn status_response(&mut self, node: &Node, items: &[StatusItem]) -> Result<()> {
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = match node.owner {
+            Some(owner) => owner,
+            None => self.scope().ok_or(Error::Forbidden)?,
+        };
         let id = node.mailbox.id;
         let st = self.ctx.deps.mailboxes.status(scope, id).await?;
         let mut deleted = None;
@@ -383,7 +415,7 @@ impl<T: Transport> Session<T> {
         mailbox: &[u8],
         items: &[StatusItem],
     ) -> Result<()> {
-        let Some(node) = self.resolve(tag, mailbox).await? else {
+        let Some(node) = self.resolve_any(tag, mailbox).await? else {
             return Ok(());
         };
         self.status_response(&node, items).await?;
@@ -408,10 +440,20 @@ impl<T: Transport> Session<T> {
                 "Previous mailbox is now closed",
             );
         }
-        let Some(node) = self.resolve(tag, mailbox).await? else {
+        let Some(node) = self.resolve_any(tag, mailbox).await? else {
             return Ok(());
         };
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        // Общая папка: нужно право `r`; выбирается только для чтения.
+        let (scope, read_only) = match node.owner {
+            Some(owner) => {
+                if !self.shared_rights(&node).await?.contains(Rights::READ) {
+                    self.no(tag, Some(proto::code("NOPERM")), "Permission denied");
+                    return Ok(());
+                }
+                (owner, true)
+            }
+            None => (self.scope().ok_or(Error::Forbidden)?, read_only),
+        };
         let id = node.mailbox.id;
         let limit = self.ctx.config.limits.max_mailbox_messages;
         let list = self
@@ -479,6 +521,7 @@ impl<T: Transport> Session<T> {
             });
         }
         self.selected = Some(Selected {
+            owner: scope,
             mailbox: id,
             read_only,
             uid_validity: st.uid_validity,

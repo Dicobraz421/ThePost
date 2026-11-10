@@ -47,7 +47,7 @@ impl<T: Transport> Session<T> {
         let Some(selected) = self.selected.as_ref() else {
             return Ok(None);
         };
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let limit = self.ctx.config.limits.max_mailbox_messages;
         let mut delta = Delta::default();
         let mut since = selected.modseq;
@@ -83,7 +83,7 @@ impl<T: Transport> Session<T> {
         let Some(selected) = self.selected.as_ref() else {
             return Ok((Delta::default(), ModSeq(0)));
         };
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let limit = self.ctx.config.limits.max_mailbox_messages;
         let st = self
             .ctx
@@ -162,7 +162,7 @@ impl<T: Transport> Session<T> {
         if updated.is_empty() {
             return Ok(());
         }
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let batch = self.ctx.config.limits.fetch_batch.max(1);
         for chunk in updated.chunks(batch) {
             let list: Vec<Message> = self
@@ -200,7 +200,7 @@ impl<T: Transport> Session<T> {
     }
 
     async fn subscribe_bus(&self) -> Option<EventStream> {
-        let scope = self.scope()?;
+        let scope = self.mailbox_scope()?;
         match self.ctx.deps.bus.subscribe(scope).await {
             Ok(s) => Some(s),
             Err(e) => {

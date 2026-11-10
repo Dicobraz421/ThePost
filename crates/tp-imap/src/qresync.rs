@@ -107,7 +107,7 @@ impl<T: Transport> Session<T> {
         within: &[(u32, u32)],
         present: &[u32],
     ) -> Result<Vec<(u32, u32)>> {
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let limit = self.ctx.config.limits.max_mailbox_messages.max(1);
         let present_set: HashSet<u32> = present.iter().copied().collect();
         let mut uids = Vec::new();
@@ -198,7 +198,7 @@ impl<T: Transport> Session<T> {
         };
         let mailbox = selected.mailbox;
         let present: Vec<u32> = selected.messages.iter().map(|m| m.0.0).collect();
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let st = self.ctx.deps.mailboxes.status(scope, mailbox).await?;
         let largest = st.uid_next.0.saturating_sub(1).max(1);
         let within = set_ranges(set, largest);

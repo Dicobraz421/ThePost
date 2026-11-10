@@ -281,7 +281,7 @@ impl<T: Transport> Session<T> {
         };
         let mailbox = selected.mailbox;
         let snapshot = selected.messages.clone();
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let key = SearchKey::And(cmd.criteria);
         let modseq_used = uses_modseq(&key);
         // Критерий MODSEQ включает CONDSTORE (RFC 7162, 3.1).

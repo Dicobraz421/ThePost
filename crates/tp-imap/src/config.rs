@@ -13,6 +13,8 @@
 //!     autologout: 30m
 //!     idle: 30m
 //!     drain: 30s
+//!   namespace:
+//!     other_users: Other Users
 //! ```
 //!
 //! Слушатели применяются при запуске роли; лимиты и таймауты — к новым сессиям без перезапуска.
@@ -34,6 +36,24 @@ pub struct ImapConfig {
     pub limits: Limits,
     /// Таймауты сессии.
     pub timeouts: Timeouts,
+    /// Пространства имён (RFC 2342).
+    pub namespace: NamespaceConfig,
+}
+
+/// Пространства имён IMAP (RFC 2342): общие папки других пользователей — `<other_users>/<имя входа>/<папка>`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct NamespaceConfig {
+    /// Корень папок других пользователей, открытых по ACL (без разделителя `/`).
+    pub other_users: String,
+}
+
+impl Default for NamespaceConfig {
+    fn default() -> Self {
+        Self {
+            other_users: "Other Users".into(),
+        }
+    }
 }
 
 /// Лимиты сессии IMAP.

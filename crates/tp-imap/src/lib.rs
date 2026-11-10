@@ -10,9 +10,11 @@
 //! - `write` — APPEND, COPY, MOVE, EXPUNGE, CLOSE (UIDPLUS).
 //! - `qresync` — QRESYNC: `SELECT … (QRESYNC …)`, `VANISHED`.
 //! - `idle` — IDLE и уведомления о выбранной папке (`EXISTS`, `EXPUNGE`, `FETCH FLAGS`).
+//! - `ext` — NAMESPACE (общие папки), QUOTA, ACL ([`Extensions`]).
 //! - [`config`] — секция `imap` config.yaml.
 
 pub mod config;
+mod ext;
 mod fetch;
 mod idle;
 mod mailbox;
@@ -24,6 +26,7 @@ mod store;
 mod write;
 
 pub use config::ImapConfig;
+pub use ext::Extensions;
 pub use session::{Deps, Server, Session, SessionCtx, Transport};
 
 #[cfg(test)]

@@ -99,7 +99,7 @@ impl<T: Transport> Session<T> {
             StoreType::Remove => FlagOp::Remove(flags),
             StoreType::Replace => FlagOp::Replace(flags),
         };
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let ids: Vec<MessageId> = targets.iter().map(|t| t.2).collect();
         let update = self
             .ctx

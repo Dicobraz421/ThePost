@@ -19,8 +19,10 @@ use tp_testkit::{
 };
 
 use crate::config::ImapConfig;
+use crate::ext::Extensions;
 use crate::session::{Deps, Session, SessionCtx, Transport};
 
+mod ext;
 mod fetch;
 mod idle;
 mod mailbox;
@@ -162,8 +164,13 @@ impl Env {
 
     /// Клиент новой сессии; `tls` — канал считается защищённым.
     pub async fn client(&self, tls: bool) -> Client {
+        self.client_ext(tls, Extensions::default()).await
+    }
+
+    /// Клиент новой сессии с зависимостями расширений.
+    pub async fn client_ext(&self, tls: bool, ext: Extensions) -> Client {
         let (server, client) = tokio::io::duplex(1 << 20);
-        let session = Session::new(self.ctx(), TestConn { io: server, tls });
+        let session = Session::new(self.ctx(), TestConn { io: server, tls }).with_extensions(ext);
         let task = tokio::spawn(session.run());
         let mut c = Client {
             io: BufReader::new(client),
