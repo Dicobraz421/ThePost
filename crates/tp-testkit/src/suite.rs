@@ -472,6 +472,18 @@ pub async fn rpc(fx: &RpcFixture) {
 
 // ---------- AbuseBlocks ----------
 
+/// База сроков набора: `now`, округлённый вверх до целой секунды (PostgreSQL хранит микросекунды; база не раньше
+/// `now`, поэтому `base + ttl / 2` не в прошлом), и её опережение `now` (меньше секунды).
+fn whole_second_after(now: OffsetDateTime) -> (OffsetDateTime, Duration) {
+    let floor = now.replace_nanosecond(0).expect("ns");
+    let base = if floor == now {
+        now
+    } else {
+        floor + Duration::from_secs(1)
+    };
+    (base, (base - now).unsigned_abs())
+}
+
 /// Набор проверок `AbuseBlocks`. `now` — текущий момент по часам хранилища, `ttl` — срок блокировок набора
 /// (с [`RealTime`] — с запасом на задержки). Организации набора — новые.
 pub async fn abuse_blocks(
@@ -480,8 +492,8 @@ pub async fn abuse_blocks(
     ttl: Duration,
     wait: &dyn Wait,
 ) {
-    // Сроки — с точностью до секунды (PostgreSQL хранит микросекунды).
-    let at = |d: Duration| now.replace_nanosecond(0).expect("ns") + d;
+    let (base, lead) = whole_second_after(now);
+    let at = |d: Duration| base + d;
     let (tenant, other) = (TenantId::new(), TenantId::new());
     let ip = |s: &str| BlockSubject::Ip(s.parse().expect("ip"));
     let src = ip("203.0.113.7");
@@ -568,7 +580,7 @@ pub async fn abuse_blocks(
     assert_eq!(blocks.blocked(tenant, &in_net).await, Ok(Some(at(ttl))));
 
     // Истёкшие блокировки не действуют; новая блокировка после истечения — с новым сроком.
-    wait.wait(ttl + ttl / 4).await;
+    wait.wait(lead + ttl + ttl / 4).await;
     assert_eq!(blocks.blocked(tenant, &in_net).await, Ok(None));
     assert_eq!(blocks.blocked(tenant, &account).await, Ok(None));
     assert_eq!(blocks.active(tenant).await, Ok(Vec::new()));
