@@ -37,7 +37,7 @@ use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
 use tp_contracts::config::duration;
 use tp_contracts::meta::AccountScope;
 use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
-use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
+use tp_contracts::tls::{InternalTls, Profile, Transport};
 use tp_contracts::{AccountId, Error, ModSeq, Result, TenantId};
 
 use crate::local_bus::{LocalBus, LocalBusConfig};
@@ -147,6 +147,11 @@ impl ValkeyConfig {
         Ok(transport)
     }
 
+    /// Проверяет только секцию `tls` (правила `InternalTls::validate`; канал Valkey удалён из контрактов, CTR-23).
+    pub fn check_tls(&self, profile: Profile) -> Result<()> {
+        valkey_tls(&self.tls, profile)
+    }
+
     /// Пароль из хранилища секретов по ссылке `password`; `None` — пароль не задан. Отказ хранилища —
     /// `Unavailable` (ссылка и причина — в журнал, значение — нет).
     pub async fn password(&self, secrets: &dyn SecretStore) -> Result<Option<Secret>> {
@@ -164,9 +169,7 @@ impl ValkeyConfig {
 
     /// Адрес и TLS без правила о пароле (его проверяет [`Self::check`]).
     fn parse(&self, profile: Profile) -> Result<(ConnectionInfo, Transport)> {
-        let transport = self
-            .tls
-            .check_url(InternalChannel::Valkey, &self.url, profile)?;
+        let transport = valkey_transport(&self.tls, &self.url, profile)?;
         let info = self
             .url
             .as_str()
@@ -439,7 +442,9 @@ impl ValkeyBus {
         };
         match transport {
             Transport::Plaintext => {
-                tracing::warn!("{}", InternalChannel::Valkey.plaintext_warning());
+                tracing::warn!(
+                    "internal channel Valkey is NOT encrypted (tls.allow_plaintext, profile dev); never use in production"
+                );
             }
             Transport::Tls => {
                 install_crypto_provider();
@@ -517,7 +522,12 @@ impl EventBus for ValkeyBus {
             Some(account) => config.account_channel(event.tenant, account),
             None => config.system_channel(),
         };
-        let payload = encode(&event);
+        let Some(payload) = encode(&event) else {
+            return Err(Error::Invalid(format!(
+                "шина Valkey: вид сигнала {:?} не поддерживается (шина удаляется, CLU-09)",
+                event.kind
+            )));
+        };
         let mut conn = self.shared.publisher().await?;
         let sent = within(
             config.command_timeout,
@@ -704,11 +714,43 @@ async fn serve(
     }
 }
 
+/// Проверка секции TLS и схемы адреса Valkey по правилам `InternalTls::check_url`: канал `InternalChannel::Valkey`
+/// удалён из контрактов (CTR-23, решение 2026-11-01), сама шина удаляется в CLU-09.
+fn valkey_transport(tls: &InternalTls, url: &str, profile: Profile) -> Result<Transport> {
+    let invalid = |m: &str| Err(Error::Invalid(format!("Valkey: {m}")));
+    valkey_tls(tls, profile)?;
+    let scheme = url.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
+    match scheme.as_deref() {
+        Some("rediss" | "valkeys") => Ok(Transport::Tls),
+        Some("redis" | "valkey") if tls.allow_plaintext => Ok(Transport::Plaintext),
+        Some("redis" | "valkey") => invalid(
+            "address without TLS; use rediss:// (plaintext only with profile: dev and tls.allow_plaintext)",
+        ),
+        _ => invalid("unsupported address scheme"),
+    }
+}
+
+/// Правила секции TLS (`InternalTls::validate`) с сообщениями для канала Valkey.
+fn valkey_tls(tls: &InternalTls, profile: Profile) -> Result<()> {
+    let invalid = |m: &str| Err(Error::Invalid(format!("Valkey: {m}")));
+    if tls.allow_plaintext && profile != Profile::Dev {
+        return invalid("tls.allow_plaintext is allowed only with profile: dev");
+    }
+    if tls.cert_file.is_some() != tls.key_file.is_some() {
+        return invalid("tls.cert_file and tls.key_file must be set together");
+    }
+    if tls.server_name.as_deref().is_some_and(str::is_empty) {
+        return invalid("tls.server_name is empty");
+    }
+    Ok(())
+}
+
 /// Версия формата сообщения в канале.
 const WIRE_VERSION: &str = "1";
 
 /// Сообщение: `1|<tenant>|<account или ->|<вид>`, вид — `mc:<mailbox>:<modseq>`, `ml`, `qr`, `cr`.
-fn encode(event: &Event) -> String {
+/// Виды сигналов CTR-23 (`LogAppended`, `MembersChanged`, `Blocked`, `Resync`) шина Valkey не передаёт — `None`.
+fn encode(event: &Event) -> Option<String> {
     let account = event
         .account
         .map_or_else(|| "-".to_owned(), |a| a.to_string());
@@ -717,8 +759,9 @@ fn encode(event: &Event) -> String {
         EventKind::MailboxListChanged => "ml".to_owned(),
         EventKind::QueueReady => "qr".to_owned(),
         EventKind::ConfigReloaded => "cr".to_owned(),
+        _ => return None,
     };
-    format!("{WIRE_VERSION}|{}|{account}|{kind}", event.tenant)
+    Some(format!("{WIRE_VERSION}|{}|{account}|{kind}", event.tenant))
 }
 
 fn decode(payload: &[u8]) -> Option<Event> {
@@ -797,13 +840,16 @@ mod tests {
             conformance::system(EventKind::ConfigReloaded),
         ];
         for event in events {
-            assert_eq!(decode(encode(&event).as_bytes()), Some(event));
+            assert_eq!(
+                decode(encode(&event).expect("wire").as_bytes()),
+                Some(event)
+            );
         }
     }
 
     #[test]
     fn wire_rejects_garbage() {
-        let good = encode(&conformance::mailbox_changed(conformance::scope(), 1));
+        let good = encode(&conformance::mailbox_changed(conformance::scope(), 1)).expect("wire");
         assert!(decode(good.as_bytes()).is_some());
         let bad = [
             String::new(),

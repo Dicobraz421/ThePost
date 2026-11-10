@@ -1,7 +1,7 @@
 //! Общие наборы тестов контрактов: in-memory реализации testkit и настоящие реализации полос
-//! (`tp-meta` — `Membership`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие `BlobIndex`,
+//! (`tp-meta` — `Membership`, `AbuseBlocks`, сигналы `EventBus`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие `BlobIndex`,
 //! «очистить корзину» `TrashStore::purge` с настройкой `trash.purge`,
-//! `tp-platform` — `SecretStore`) проходят одни и те же проверки.
+//! `tp-platform` — `SecretStore`, `tp-cluster` — `Rpc`) проходят одни и те же проверки.
 //!
 //! Время в наборах идёт через [`Wait`]: для testkit — [`ManualClock`] (сдвиг без ожидания), для PostgreSQL
 //! и OpenBao — [`RealTime`] (сон), тогда сроки выбирают с запасом на задержки.
@@ -23,19 +23,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::StreamExt;
 use time::OffsetDateTime;
+use tp_contracts::abuse::{AbuseBlock, AbuseBlocks, BlockSubject};
 use tp_contracts::acl::{ANYONE, AclEntry, AclStore, SendDelegation, SharedMailbox};
 use tp_contracts::app_password::{AppPassword, AppPasswordStore};
 use tp_contracts::auth::{Rights, SendRight};
 use tp_contracts::blob::{Acquire, BlobIndex, Commit, Compression};
+use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
 use tp_contracts::delivery::{
     DeliveryDecision, DeliveryEvent, DeliveryEventKind, DeliveryLog, DeliveryPage, DeliveryQuery,
 };
+use tp_contracts::events::Partition;
 use tp_contracts::ext::{Decision, DecisionHook, DecisionHooks, FinalDelete};
 use tp_contracts::groups::{
     DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
 };
-use tp_contracts::membership::{Membership, NodeId};
+use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
     AccountScope, MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, PolicyResolver,
     SpecialUse,
@@ -44,6 +49,8 @@ use tp_contracts::retention::{
     Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule, TrashPurgeSetting,
     TrashStore,
 };
+use tp_contracts::role::Role;
+use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
 use tp_contracts::secrets::{SecretLease, SecretRef, SecretStore};
 use tp_contracts::{
     AccountId, BlobHash, BlobKey, Error, Gen, GroupId, HeldId, MailboxId, MessageId, QueueId,
@@ -101,10 +108,18 @@ pub async fn membership(m: &dyn Membership, ttl: Duration, wait: &dyn Wait) {
     assert!(ours().await.is_empty(), "до heartbeat узлов набора нет");
 
     // Создание записи и повторное продление без повторов в составе.
-    m.heartbeat(&c, ttl).await.expect("heartbeat c");
-    m.heartbeat(&a, ttl).await.expect("heartbeat a");
-    m.heartbeat(&b, ttl).await.expect("heartbeat b");
-    m.heartbeat(&a, ttl).await.expect("heartbeat a again");
+    m.heartbeat(&NodeInfo::new(c.clone()), ttl)
+        .await
+        .expect("heartbeat c");
+    m.heartbeat(&NodeInfo::new(a.clone()), ttl)
+        .await
+        .expect("heartbeat a");
+    m.heartbeat(&NodeInfo::new(b.clone()), ttl)
+        .await
+        .expect("heartbeat b");
+    m.heartbeat(&NodeInfo::new(a.clone()), ttl)
+        .await
+        .expect("heartbeat a again");
     assert_eq!(ours().await, vec![a.clone(), b.clone(), c.clone()]);
 
     // Выход — сразу, без ожидания срока; повторный выход и выход отсутствующего — не ошибка.
@@ -116,19 +131,449 @@ pub async fn membership(m: &dyn Membership, ttl: Duration, wait: &dyn Wait) {
     // Продление переносит срок: a продлевается каждые ttl/2, b — нет.
     let half = ttl / 2;
     wait.wait(half).await;
-    m.heartbeat(&a, ttl).await.expect("renew a");
+    m.heartbeat(&NodeInfo::new(a.clone()), ttl)
+        .await
+        .expect("renew a");
     wait.wait(half + ttl / 4).await;
     assert_eq!(ours().await, vec![a.clone()], "b истёк, a продлён");
 
     // Без продления истекает и a; продление после истечения возвращает узел.
     wait.wait(ttl).await;
     assert!(ours().await.is_empty(), "все записи набора истекли");
-    m.heartbeat(&b, ttl)
+    m.heartbeat(&NodeInfo::new(b.clone()), ttl)
         .await
         .expect("heartbeat b after expiry");
     assert_eq!(ours().await, vec![b.clone()]);
     m.leave(&b).await.expect("leave b");
     assert!(ours().await.is_empty());
+}
+
+/// Набор проверок записей узлов `Membership` ([`NodeInfo`]: роли, адрес, площадка) и `live_info()`.
+/// Требования к `ttl` и составу — как у [`membership`].
+pub async fn membership_info(m: &dyn Membership, ttl: Duration, wait: &dyn Wait) {
+    let prefix = format!("suite-info-{}", TenantId::new());
+    let ours = || async {
+        let live = m.live_info().await.expect("live_info");
+        let ids: Vec<NodeId> = live.iter().map(|n| n.id.clone()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids, sorted, "live_info(): по возрастанию id без повторов");
+        live.into_iter()
+            .filter(|n| n.id.as_str().starts_with(&prefix))
+            .collect::<Vec<_>>()
+    };
+    let mut a = NodeInfo::new(NodeId::new(format!("{prefix}-a")).expect("node id"));
+    a.roles = [Role::Search, Role::Indexer].into_iter().collect();
+    a.addr = "https://node-a.internal:7443".to_owned();
+    a.site = SiteId::new("site-1").expect("site");
+    let b = NodeInfo::new(NodeId::new(format!("{prefix}-b")).expect("node id"));
+
+    m.heartbeat(&b, ttl).await.expect("heartbeat b");
+    m.heartbeat(&a, ttl).await.expect("heartbeat a");
+    assert_eq!(ours().await, vec![a.clone(), b.clone()]);
+    let ids = m.live().await.expect("live");
+    assert!(
+        ids.contains(&a.id) && ids.contains(&b.id),
+        "live() — те же узлы"
+    );
+
+    // Продление заменяет роли, адрес и площадку.
+    let mut a2 = a.clone();
+    a2.roles = [Role::Admin].into_iter().collect();
+    a2.addr = "https://node-a.internal:8443".to_owned();
+    a2.site = SiteId::default();
+    m.heartbeat(&a2, ttl).await.expect("heartbeat a2");
+    assert_eq!(ours().await, vec![a2.clone(), b.clone()]);
+
+    // Выход и истечение убирают запись целиком.
+    m.leave(&b.id).await.expect("leave b");
+    assert_eq!(ours().await, vec![a2.clone()]);
+    wait.wait(ttl + ttl / 4).await;
+    assert!(ours().await.is_empty(), "запись a истекла");
+}
+
+// ---------- EventBus: сигналы ----------
+
+/// Сколько ждать сигнала в наборе [`signals`].
+const SIGNAL_WAIT: Duration = Duration::from_secs(5);
+
+async fn next_signal(stream: &mut EventStream) -> Option<Event> {
+    tokio::time::timeout(SIGNAL_WAIT, stream.next())
+        .await
+        .expect("сигнал не пришёл")
+}
+
+/// Набор проверок системных сигналов `EventBus` (CTR-23): `LogAppended`, `MembersChanged`, `Blocked` приходят
+/// в `subscribe_system()` и не приходят подписке учётной записи; `publish(Resync)` — `Invalid`.
+/// «Не пришло» проверяется тем, что первым пришёл сигнал, опубликованный позже.
+pub async fn signals(bus: &dyn EventBus) {
+    let scope = AccountScope {
+        tenant: TenantId::new(),
+        account: AccountId::new(),
+    };
+    let mut sys = bus.subscribe_system().await.expect("subscribe_system");
+    let mut acc = bus.subscribe(scope).await.expect("subscribe");
+    let system = |tenant, kind| Event {
+        tenant,
+        account: None,
+        kind,
+    };
+    let published = [
+        system(
+            TenantId::DEFAULT,
+            EventKind::LogAppended {
+                partition: Partition(7),
+            },
+        ),
+        system(TenantId::DEFAULT, EventKind::MembersChanged),
+        system(
+            scope.tenant,
+            EventKind::Blocked {
+                subject: BlockSubject::net("198.51.100.0".parse().expect("ip"), 24).expect("net"),
+            },
+        ),
+        system(
+            scope.tenant,
+            EventKind::Blocked {
+                subject: BlockSubject::Account(scope.account),
+            },
+        ),
+    ];
+    for e in &published {
+        assert!(e.kind.is_system());
+        bus.publish(e.clone()).await.expect("publish");
+    }
+    let mine = Event {
+        tenant: scope.tenant,
+        account: Some(scope.account),
+        kind: EventKind::MailboxListChanged,
+    };
+    bus.publish(mine.clone()).await.expect("publish");
+
+    assert_eq!(
+        next_signal(&mut acc).await,
+        Some(mine),
+        "системные — не подписке учётной записи"
+    );
+    for e in published {
+        assert_eq!(next_signal(&mut sys).await, Some(e));
+    }
+
+    for resync in [
+        system(TenantId::DEFAULT, EventKind::Resync),
+        Event {
+            account: Some(scope.account),
+            ..system(scope.tenant, EventKind::Resync)
+        },
+    ] {
+        assert!(
+            matches!(bus.publish(resync).await, Err(Error::Invalid(_))),
+            "Resync вставляет только шина"
+        );
+    }
+}
+
+// ---------- Rpc ----------
+
+/// Узлы для [`rpc`]: не меньше двух, у всех — роль `role` и предел параллельности `max_in_flight`,
+/// ни у одного — роли `absent_role`. Службы набора (`suite-*`) на узлах не зарегистрированы.
+#[derive(Clone)]
+pub struct RpcFixture {
+    /// Узлы и их `Rpc`.
+    pub nodes: Vec<(NodeId, Arc<dyn Rpc>)>,
+    /// Роль всех узлов.
+    pub role: Role,
+    /// Роль, которой нет ни у одного узла.
+    pub absent_role: Role,
+    /// Предел параллельности обработки на узле.
+    pub max_in_flight: usize,
+}
+
+impl std::fmt::Debug for RpcFixture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcFixture")
+            .field(
+                "nodes",
+                &self.nodes.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            )
+            .field("role", &self.role)
+            .field("absent_role", &self.absent_role)
+            .field("max_in_flight", &self.max_in_flight)
+            .finish()
+    }
+}
+
+/// Эхо: `<узел>|<вызывающий>|<ключ>|<тело>`.
+struct Echo(NodeId);
+
+#[async_trait]
+impl RpcHandler for Echo {
+    async fn handle(&self, r: RpcRequest) -> tp_contracts::Result<Bytes> {
+        let body = String::from_utf8_lossy(&r.body);
+        Ok(Bytes::from(format!(
+            "{}|{}|{}|{body}",
+            self.0, r.caller, r.key
+        )))
+    }
+}
+
+struct Fail;
+
+#[async_trait]
+impl RpcHandler for Fail {
+    async fn handle(&self, _: RpcRequest) -> tp_contracts::Result<Bytes> {
+        Err(Error::invalid("suite failure"))
+    }
+}
+
+/// Ждёт открытия ворот; `entered` — сколько обработчиков вошло.
+struct Gate {
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+    open: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl RpcHandler for Gate {
+    async fn handle(&self, _: RpcRequest) -> tp_contracts::Result<Bytes> {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _permit = self
+            .open
+            .acquire()
+            .await
+            .map_err(|_| Error::internal("gate closed"))?;
+        Ok(Bytes::from_static(b"done"))
+    }
+}
+
+/// Отвечает через `delay` (дольше срока вызова в наборе).
+struct Slow(Duration);
+
+#[async_trait]
+impl RpcHandler for Slow {
+    async fn handle(&self, _: RpcRequest) -> tp_contracts::Result<Bytes> {
+        tokio::time::sleep(self.0).await;
+        Ok(Bytes::new())
+    }
+}
+
+/// Набор проверок `Rpc`: маршрут к владельцу ключа (один и тот же с любого узла), ошибки обработчика,
+/// `Unavailable` без узлов роли, `Busy` при превышении параллельности, `Timeout`, повторная регистрация.
+/// Время — настоящее (короткие сроки, без долгого сна).
+pub async fn rpc(fx: &RpcFixture) {
+    assert!(fx.nodes.len() >= 2, "набору нужно не меньше двух узлов");
+    let svc = |name: &str| RpcService::new(fx.role, name).expect("service");
+    let (echo, fail, gate, slow) = (
+        svc("suite-echo"),
+        svc("suite-fail"),
+        svc("suite-gate"),
+        svc("suite-slow"),
+    );
+    let long = Duration::from_secs(10);
+    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let open = Arc::new(tokio::sync::Semaphore::new(0));
+    for (id, rpc) in &fx.nodes {
+        rpc.serve(echo.clone(), Arc::new(Echo(id.clone())))
+            .expect("serve echo");
+        rpc.serve(fail.clone(), Arc::new(Fail)).expect("serve fail");
+        rpc.serve(
+            gate.clone(),
+            Arc::new(Gate {
+                entered: entered.clone(),
+                open: open.clone(),
+            }),
+        )
+        .expect("serve gate");
+        rpc.serve(slow.clone(), Arc::new(Slow(Duration::from_millis(500))))
+            .expect("serve slow");
+    }
+    assert_eq!(
+        fx.nodes[0].1.serve(echo.clone(), Arc::new(Fail)),
+        Err(Error::Conflict),
+        "повторная регистрация службы"
+    );
+
+    // Маршрут: владелец ключа один и тот же с любого узла; ключи расходятся по разным узлам.
+    let mut owners = std::collections::BTreeSet::new();
+    for k in 0..24 {
+        let key = format!("suite/{k}");
+        let mut seen = None;
+        for (caller, rpc) in &fx.nodes {
+            let out = rpc
+                .call(&echo, &key, Bytes::from_static(b"ping"), long)
+                .await
+                .expect("echo");
+            let out = String::from_utf8(out.to_vec()).expect("utf8");
+            let parts: Vec<&str> = out.split('|').collect();
+            assert_eq!(parts.len(), 4, "{out}");
+            assert_eq!(parts[1..], [caller.as_str(), key.as_str(), "ping"], "{out}");
+            let owner = parts[0].to_owned();
+            assert!(
+                seen.get_or_insert_with(|| owner.clone()) == &owner,
+                "владелец {key} зависит от вызывающего"
+            );
+            owners.insert(owner);
+        }
+    }
+    assert!(
+        owners.len() > 1,
+        "24 ключа достались одному узлу: {owners:?}"
+    );
+
+    // Ошибка обработчика и отсутствие узлов роли.
+    let caller = &fx.nodes[0].1;
+    assert_eq!(
+        caller.call(&fail, "suite/x", Bytes::new(), long).await,
+        Err(RpcError::Failed(Error::invalid("suite failure")))
+    );
+    let none = RpcService::new(fx.absent_role, "suite-none").expect("service");
+    assert_eq!(
+        caller.call(&none, "suite/x", Bytes::new(), long).await,
+        Err(RpcError::Unavailable)
+    );
+
+    // Busy: владелец ключа занят `max_in_flight` запросами — следующий получает отказ «занят».
+    let mut pending = Vec::new();
+    for _ in 0..fx.max_in_flight {
+        let (rpc, gate) = (caller.clone(), gate.clone());
+        pending.push(tokio::spawn(async move {
+            rpc.call(&gate, "suite/busy", Bytes::new(), long).await
+        }));
+    }
+    let started = tokio::time::Instant::now();
+    while entered.load(std::sync::atomic::Ordering::SeqCst) < fx.max_in_flight {
+        assert!(started.elapsed() < long, "обработчики не начали работу");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        caller.call(&gate, "suite/busy", Bytes::new(), long).await,
+        Err(RpcError::Busy)
+    );
+    open.add_permits(fx.max_in_flight);
+    for p in pending {
+        assert_eq!(p.await.expect("join"), Ok(Bytes::from_static(b"done")));
+    }
+
+    // Timeout: обработчик отвечает позже срока.
+    assert_eq!(
+        caller
+            .call(&slow, "suite/slow", Bytes::new(), Duration::from_millis(50))
+            .await,
+        Err(RpcError::Timeout)
+    );
+}
+
+// ---------- AbuseBlocks ----------
+
+/// Набор проверок `AbuseBlocks`. `now` — текущий момент по часам хранилища, `ttl` — срок блокировок набора
+/// (с [`RealTime`] — с запасом на задержки). Организации набора — новые.
+pub async fn abuse_blocks(
+    blocks: &dyn AbuseBlocks,
+    now: OffsetDateTime,
+    ttl: Duration,
+    wait: &dyn Wait,
+) {
+    // Сроки — с точностью до секунды (PostgreSQL хранит микросекунды).
+    let at = |d: Duration| now.replace_nanosecond(0).expect("ns") + d;
+    let (tenant, other) = (TenantId::new(), TenantId::new());
+    let ip = |s: &str| BlockSubject::Ip(s.parse().expect("ip"));
+    let src = ip("203.0.113.7");
+    let in_net = ip("198.51.100.20");
+    let outside = ip("198.51.100.200");
+    let net = BlockSubject::net("198.51.100.0".parse().expect("ip"), 27).expect("net");
+    let account = BlockSubject::Account(AccountId::new());
+
+    assert_eq!(blocks.blocked(tenant, &src).await, Ok(None));
+    assert_eq!(blocks.active(tenant).await, Ok(Vec::new()));
+    assert!(matches!(
+        blocks
+            .block(
+                tenant,
+                &src,
+                at(Duration::ZERO) - Duration::from_secs(1),
+                "past"
+            )
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Блокировка видна только в своей организации; продление не сокращает срок.
+    blocks
+        .block(tenant, &src, at(ttl), "r1")
+        .await
+        .expect("block");
+    assert_eq!(blocks.blocked(tenant, &src).await, Ok(Some(at(ttl))));
+    assert_eq!(blocks.blocked(other, &src).await, Ok(None));
+    blocks
+        .block(tenant, &src, at(ttl / 2), "r2")
+        .await
+        .expect("shorter");
+    assert_eq!(blocks.blocked(tenant, &src).await, Ok(Some(at(ttl))));
+    blocks
+        .block(tenant, &src, at(ttl * 3), "r3")
+        .await
+        .expect("longer");
+    assert_eq!(blocks.blocked(tenant, &src).await, Ok(Some(at(ttl * 3))));
+
+    // Подсеть покрывает адреса внутри; учётная запись — только себя.
+    blocks
+        .block(tenant, &net, at(ttl), "net")
+        .await
+        .expect("net");
+    blocks
+        .block(tenant, &account, at(ttl), "acc")
+        .await
+        .expect("account");
+    assert_eq!(blocks.blocked(tenant, &in_net).await, Ok(Some(at(ttl))));
+    assert_eq!(blocks.blocked(tenant, &outside).await, Ok(None));
+    assert_eq!(blocks.blocked(tenant, &net).await, Ok(Some(at(ttl))));
+    assert_eq!(blocks.blocked(tenant, &account).await, Ok(Some(at(ttl))));
+    assert_eq!(
+        blocks
+            .blocked(tenant, &BlockSubject::Account(AccountId::new()))
+            .await,
+        Ok(None)
+    );
+    let mut active = blocks.active(tenant).await.expect("active");
+    active.sort_by_key(|b| b.subject.to_string());
+    let expect = |subject, until, reason: &str| AbuseBlock {
+        subject,
+        until,
+        reason: reason.to_owned(),
+    };
+    let mut want = vec![
+        expect(src, at(ttl * 3), "r3"),
+        expect(net, at(ttl), "net"),
+        expect(account, at(ttl), "acc"),
+    ];
+    want.sort_by_key(|b| b.subject.to_string());
+    assert_eq!(active, want);
+    assert_eq!(blocks.active(other).await, Ok(Vec::new()));
+
+    // Снятие — только этого субъекта; отсутствующего — не ошибка.
+    blocks.unblock(tenant, &src).await.expect("unblock");
+    blocks.unblock(tenant, &src).await.expect("unblock again");
+    blocks
+        .unblock(tenant, &in_net)
+        .await
+        .expect("unblock not blocked");
+    assert_eq!(blocks.blocked(tenant, &src).await, Ok(None));
+    assert_eq!(blocks.blocked(tenant, &in_net).await, Ok(Some(at(ttl))));
+
+    // Истёкшие блокировки не действуют; новая блокировка после истечения — с новым сроком.
+    wait.wait(ttl + ttl / 4).await;
+    assert_eq!(blocks.blocked(tenant, &in_net).await, Ok(None));
+    assert_eq!(blocks.blocked(tenant, &account).await, Ok(None));
+    assert_eq!(blocks.active(tenant).await, Ok(Vec::new()));
+    blocks
+        .block(tenant, &account, at(ttl * 3), "again")
+        .await
+        .expect("again");
+    assert_eq!(
+        blocks.blocked(tenant, &account).await,
+        Ok(Some(at(ttl * 3)))
+    );
 }
 
 // ---------- SecretStore ----------

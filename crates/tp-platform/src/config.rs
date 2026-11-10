@@ -1459,7 +1459,7 @@ mod tests {
         let mut r = registry();
         r.add_check::<ChannelConfig>("bus", |c, profile| {
             c.tls
-                .check_url(InternalChannel::Valkey, &c.url, profile)
+                .check_url(InternalChannel::S3, &c.url, profile)
                 .map(|_| ())
         })
         .expect("check");
@@ -1469,18 +1469,18 @@ mod tests {
         );
         let e = r
             .parse_with(
-                &format!("{MINIMAL}bus: {{ url: redis://cache }}\n"),
+                &format!("{MINIMAL}bus: {{ url: http://cache }}\n"),
                 Vec::new(),
                 CheckMode::Lenient,
             )
             .expect_err("plaintext")
             .to_string();
-        assert!(e.starts_with("bus: Valkey: address without TLS"), "{e}");
+        assert!(e.starts_with("bus: S3: address without TLS"), "{e}");
         // Секция с проверкой не просматривается общим поиском: одна ошибка, не две.
         let e = r
             .parse_with(
                 &format!(
-                    "{MINIMAL}bus: {{ url: rediss://cache, tls: {{ allow_plaintext: true }} }}\n"
+                    "{MINIMAL}bus: {{ url: https://cache, tls: {{ allow_plaintext: true }} }}\n"
                 ),
                 Vec::new(),
                 CheckMode::Strict,
@@ -1488,7 +1488,7 @@ mod tests {
             .expect_err("allow_plaintext");
         assert_eq!(lines(e).len(), 1);
         let ok = format!(
-            "{MINIMAL}profile: dev\nbus: {{ url: redis://cache, tls: {{ allow_plaintext: true }} }}\n"
+            "{MINIMAL}profile: dev\nbus: {{ url: http://cache, tls: {{ allow_plaintext: true }} }}\n"
         );
         assert!(r.parse_with(&ok, Vec::new(), CheckMode::Strict).is_ok());
     }
