@@ -9,7 +9,8 @@
 | `compose/postgres/app-role.sh` | Роль приложения `thepost` без SUPERUSER и BYPASSRLS — владелец БД `thepost` |
 | `openbao/thepost-policy.hcl` | Политика узла `thepost` в OpenBao (общая для compose, Helm, Ansible) |
 | `helm/openbao/` | Значения чарта `openbao/openbao` и настройка Kubernetes auth (`bootstrap.sh`) |
-| `ansible/` | Роль `openbao` и плейбук `openbao.yml` (ВМ: пакет, Raft, TLS, распечатывание, AppRole) |
+| `ansible/` | Эталон SMB одной командой (`smb.yml`: роли `thepost_pki`, `openbao`, `postgresql`, `rspamd`, `clamav_milter`, `thepost`); OpenBao отдельно (`openbao.yml`) |
+| `stand/` | Стенд SMB и базовая нагрузка (APP-D): ВМ SMB + генератор, imaptest, smtp-source, k6, отчёт |
 | `systemd/` | Юнит `thepost.service` с hardening, пользователь `thepost` (sysusers) |
 | `config/` | Примеры `config.yaml` для пресетов `all` (SMB), `mailbox` (Enterprise-ВМ), `edge` (DMZ) |
 
@@ -130,6 +131,24 @@ curl --cacert $CA -si https://localhost/.well-known/jmap | head -1              
 ```
 Письмо между двумя пользователями: учётные записи `a@example.test`, `b@example.test` (способ — issue #193), отправка
 через 587 с AUTH, получение через IMAP или JMAP — шаги в `docs/manual-tests/CMP-01.md` (после CMP-04, CMP-05).
+
+## Эталон SMB одной командой (Ansible)
+Чистая ВМ Debian 12 или Ubuntu 24.04 → PostgreSQL 16 (PGDG), OpenBao, Rspamd (clamav-milter — `thepost_clamav: true`)
+и `thepost` (все роли) под systemd (SRS 1.2, 5.6):
+```bash
+cargo build --release                                   # или thepost_binary_url + thepost_binary_checksum
+ansible-galaxy collection install -r deploy/ansible/requirements.yml
+cp deploy/ansible/inventory.example.yml inventory.yml   # адрес ВМ, домен, способ сертификата
+ansible-playbook -i inventory.yml deploy/ansible/smb.yml
+```
+Порядок: внутренний CA (`thepost_pki`, `/etc/thepost/pki`: внутренние каналы PostgreSQL и OpenBao — только TLS, на
+loopback) → OpenBao (`https://localhost:8200`, пароль `thepost/db`, AppRole) → PostgreSQL (`hostssl` только для
+`thepost`, без SUPERUSER и BYPASSRLS) → Rspamd (Milter `127.0.0.1:11332`) → clamav-milter (`127.0.0.1:7357`) →
+`thepost` (sysusers, юнит, `config.yaml` из шаблона с проверкой `thepost config check`, ожидание `/healthz/ready`).
+Сертификат клиентских протоколов — `thepost_tls_mode`: `certbot` (Let's Encrypt HTTP-01, по умолчанию; порт 80
+открыт, DNS указывает на ВМ), `acme` (встроенный клиент thepost, секция `acme`), `internal` (внутренний CA — стенд),
+`files` (свои PEM). Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
+Повторный прогон ничего не меняет. Ключи восстановления и root-токен OpenBao — `/root/openbao-init.json` (см. ниже).
 
 ## Установка под systemd (SMB, Enterprise-ВМ)
 ```bash

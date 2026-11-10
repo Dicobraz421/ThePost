@@ -1,0 +1,45 @@
+# Установка clamd, freshclam и clamav-milter (Debian, Ubuntu). Повторный прогон ничего не меняет.
+---
+- name: Check OS family
+  ansible.builtin.assert:
+    that: ansible_os_family == 'Debian'
+    fail_msg: "Роль clamav_milter эталона SMB поддерживает Debian и Ubuntu"
+
+- name: Install ClamAV
+  ansible.builtin.apt:
+    name: [clamav-daemon, clamav-freshclam, clamav-milter]
+    state: present
+
+- name: Start freshclam
+  ansible.builtin.systemd_service:
+    name: clamav-freshclam
+    state: started
+    enabled: true
+
+- name: Wait for virus databases
+  ansible.builtin.find:
+    paths: /var/lib/clamav
+    patterns: ["daily.cvd", "daily.cld"]
+  register: clamav_db
+  until: clamav_db.matched > 0
+  retries: "{{ clamav_db_wait_retries }}"
+  delay: "{{ clamav_db_wait_delay }}"
+
+- name: Configure clamav-milter
+  ansible.builtin.lineinfile:
+    path: /etc/clamav/clamav-milter.conf
+    regexp: "^#?{{ item.key }} "
+    line: "{{ item.key }} {{ item.value }}"
+  loop:
+    - { key: MilterSocket, value: "inet:{{ clamav_milter_address.split(':') | last }}@{{ clamav_milter_address.split(':') | first }}" }
+    - { key: ClamdSocket, value: "unix:/var/run/clamav/clamd.ctl" }
+    - { key: OnInfected, value: "{{ clamav_milter_on_infected }}" }
+    - { key: AddHeader, value: Replace }
+  notify: Restart clamav-milter
+
+- name: Start clamd and clamav-milter
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: [clamav-daemon, clamav-milter]

@@ -1,0 +1,12 @@
+# {{ ansible_managed }}
+# PostgreSQL для The Post (эталон SMB): только TLS по сети, пароли — SCRAM.
+listen_addresses = '{{ postgresql_listen_addresses }}'
+port = {{ postgresql_port }}
+password_encryption = 'scram-sha-256'
+ssl = on
+ssl_cert_file = '{{ postgresql_conf_dir }}/thepost-server.pem'
+ssl_key_file = '{{ postgresql_conf_dir }}/thepost-server.key'
+ssl_min_protocol_version = 'TLSv1.2'
+{% for name, value in postgresql_settings | dictsort %}
+{{ name }} = {{ value if value is number else "'" ~ value ~ "'" }}
+{% endfor %}

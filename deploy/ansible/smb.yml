@@ -1,0 +1,32 @@
+# Эталонная установка SMB одной командой (SRS 1.2, 5.6): PostgreSQL, OpenBao, Rspamd (clamav-milter — по желанию)
+# и thepost (все роли) на одной ВМ Debian 12 / Ubuntu 24.04.
+#   ansible-galaxy collection install -r deploy/ansible/requirements.yml
+#   ansible-playbook -i <инвентарь> deploy/ansible/smb.yml
+# Пример инвентаря — deploy/ansible/inventory.example.yml (группа smb); переменные — defaults ролей.
+# Повторный прогон ничего не меняет.
+---
+- name: The Post SMB (all-in-one)
+  hosts: smb
+  become: true
+  vars:
+    # OpenBao — только для thepost на этой ВМ: loopback, сертификат внутреннего CA (роль thepost_pki).
+    openbao_api_addr: https://localhost:8200
+    openbao_listen_address: "127.0.0.1:8200"
+    openbao_cluster_address: "127.0.0.1:8201"
+    openbao_tls_remote_src: true
+    openbao_tls_cert_src: "{{ thepost_pki_dir }}/internal.pem"
+    openbao_tls_key_src: "{{ thepost_pki_dir }}/internal.key"
+    openbao_tls_ca_src: "{{ thepost_pki_dir }}/ca.pem"
+  pre_tasks:
+    - name: Check platform
+      ansible.builtin.assert:
+        that: ansible_os_family == 'Debian'
+        fail_msg: "Эталон SMB — Debian 12 или Ubuntu 24.04"
+  roles:
+    - thepost_pki
+    - openbao
+    - postgresql
+    - rspamd
+    - role: clamav_milter
+      when: thepost_clamav | default(false) | bool
+    - thepost

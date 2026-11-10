@@ -1,0 +1,54 @@
+# Роль thepost: бинарный файл, пользователь, юнит systemd, config.yaml и сертификат клиентских протоколов
+# (эталон SMB, SRS 1.2, 5.6). Юнит и sysusers — deploy/systemd; пример конфигурации — deploy/config/all.yaml.
+---
+# Основной домен и имя узла (SMTP banner/HELO, сертификат клиентских протоколов).
+thepost_domain: example.ru
+thepost_hostname: "mail.{{ thepost_domain }}"
+thepost_local_domains: ["{{ thepost_domain }}"]
+
+# Бинарный файл: thepost_binary_url (+ thepost_binary_checksum "sha256:…") или файл на управляющей машине.
+thepost_binary_url: ""
+thepost_binary_checksum: ""
+thepost_binary_src: "{{ playbook_dir }}/../../target/release/thepost"
+thepost_binary_path: /usr/local/bin/thepost
+
+# Сертификат клиентских протоколов (SMTP, IMAP, JMAP, служебный HTTP):
+#   certbot  — Let's Encrypt (ACME HTTP-01, certbot --standalone на порту 80; продление — certbot.timer, deploy-hook
+#              копирует файлы, thepost перечитывает их без перезапуска — tls.reload_interval);
+#   acme     — встроенный клиент ACME thepost (секция acme, SRS 6.2; файлы — в /var/lib/thepost/tls);
+#   internal — внутренний CA роли thepost_pki (стенд, тест; клиентам нужен {{ thepost_pki_dir }}/ca.pem);
+#   files    — свои PEM с управляющей машины: thepost_tls_cert_src (цепочка), thepost_tls_key_src.
+thepost_tls_mode: certbot
+thepost_tls_names: ["{{ thepost_hostname }}"]
+thepost_tls_cert_src: ""
+thepost_tls_key_src: ""
+# ACME (certbot и acme): контакт учётной записи и каталог (пусто — Let's Encrypt; staging —
+# https://acme-staging-v02.api.letsencrypt.org/directory).
+thepost_acme_email: ""
+thepost_acme_directory_url: ""
+
+# Внутренние каналы — только TLS с проверкой имени (решение 2026-10-30): CA — роль thepost_pki.
+thepost_internal_ca_file: "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/ca.pem"
+thepost_db_url: >-
+  postgres://thepost@localhost:5432/thepost?sslmode=verify-full&sslrootcert={{ thepost_internal_ca_file }}
+thepost_secrets_url: "{{ openbao_api_addr | default('https://localhost:8200') }}"
+thepost_secrets_role_id_file: "{{ openbao_thepost_role_id_file | default('/etc/thepost/openbao/role_id') }}"
+
+# Слушатели клиентских протоколов (адрес без порта).
+thepost_listen_address: "0.0.0.0"
+
+# Фильтры Milter: Rspamd (роль rspamd) и, при thepost_clamav, clamav-milter (роль clamav_milter).
+thepost_rspamd_milter_address: "{{ rspamd_milter_address | default('127.0.0.1:11332') }}"
+thepost_clamav: false
+thepost_clamav_milter_address: "{{ clamav_milter_address | default('127.0.0.1:7357') }}"
+# Проверять и почту пользователей (submission), не только входящую.
+thepost_milter_submission: false
+
+# Дополнительные параметры config.yaml — рекурсивно поверх эталона (списки заменяются), например:
+#   thepost_config_extra: { auth: { ldap: { … } }, meta: { retention: { trash_retention: 15m } } }
+thepost_config_extra: {}
+
+# Ожидание готовности после запуска (/healthz/ready служебного HTTP, 127.0.0.1:8081).
+thepost_service_http_port: 8081
+thepost_ready_retries: 30
+thepost_ready_delay: 2

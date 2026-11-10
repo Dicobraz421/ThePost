@@ -1,0 +1,26 @@
+# Роль postgresql: одиночный PostgreSQL профиля SMB (SRS 1.2) — пакеты PGDG, только TLS по сети,
+# роль приложения thepost без SUPERUSER и BYPASSRLS — владелец БД thepost (как compose/postgres/app-role.sh).
+---
+# PostgreSQL 16+ (SRS); пакеты — репозиторий PGDG (apt.postgresql.org): в Debian 12 только 15.
+postgresql_version: 16
+postgresql_pgdg_repo: true
+postgresql_pgdg_uri: http://apt.postgresql.org/pub/repos/apt
+postgresql_pgdg_key_url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+postgresql_conf_dir: "/etc/postgresql/{{ postgresql_version }}/main"
+postgresql_service: postgresql
+
+# Только локальные подключения: thepost на той же ВМ.
+postgresql_listen_addresses: localhost
+postgresql_port: 5432
+# Сертификат сервера: по умолчанию — внутренний CA роли thepost_pki (на ВМ).
+postgresql_tls_cert_src: "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/internal.pem"
+postgresql_tls_key_src: "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/internal.key"
+# Дополнительные параметры postgresql.conf (имя → значение), например shared_buffers.
+postgresql_settings: {}
+
+# Роль приложения и БД; пароль — из OpenBao (роль openbao выставляет thepost_db_password).
+postgresql_app_role: thepost
+postgresql_app_db: thepost
+postgresql_app_networks: ["127.0.0.1/32", "::1/128"]
+# on_create — пароль задаётся при создании роли (повторный прогон без изменений); always — выставлять каждый раз.
+postgresql_update_password: on_create

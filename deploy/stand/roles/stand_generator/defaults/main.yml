@@ -1,0 +1,64 @@
+# Роль stand_generator: генератор нагрузки стенда SMB (APP-D Д.2, Д.4) — imaptest, smtp-source и smtp-sink
+# (Postfix), swaks, k6; корпус писем и сценарий по модели нагрузки Д.3.
+---
+stand_dir: /var/lib/thepost-stand
+stand_etc_dir: /etc/thepost-stand
+
+# Узел SMB: адрес и имя (имя — в сертификате клиентских протоколов; на генераторе — запись /etc/hosts).
+stand_smb_host: "{{ groups['smb'] | first }}"
+stand_smb_address: "{{ hostvars[stand_smb_host].ansible_host | default(stand_smb_host) }}"
+stand_smb_hostname: "{{ hostvars[stand_smb_host].thepost_hostname | default('mail.stand.test') }}"
+stand_domain: "{{ hostvars[stand_smb_host].thepost_domain | default('stand.test') }}"
+
+# Учётные записи стенда: <stand_user_prefix><n>@<домен>, n = 1 … stand_users (Д.3: SMB — 1 000 ящиков).
+stand_users: 1000
+stand_user_prefix: user
+stand_user_password: ""
+# Заведение учётных записей: none — уже есть (каталог LDAP / FreeIPA, Admin API); ldif — генератор кладёт
+# {{ stand_etc_dir }}/users.ldif (inetOrgPerson) для импорта в каталог (ldapadd), база — stand_ldap_base_dn.
+stand_provision: none
+stand_ldap_base_dn: "ou=people,dc=stand,dc=test"
+
+# Внешний мир: исходящая почта к внешним адресатам уходит через smtp.queue.relay на smtp-sink генератора.
+stand_external_domain: external.test
+stand_sink_port: 2525
+
+# Модель нагрузки на пользователя в рабочие сутки (Д.3).
+stand_model:
+  workday_hours: 8
+  inbound_per_day: 120
+  outbound_per_day: 30
+  outbound_internal_share: 0.5
+  message_size_kb: 75
+  attachment_share: 0.2
+  attachment_size_kb: 500
+  mime_duplicate_share: 0.3
+  online_share: 0.6
+  devices_per_user: 1.5
+  searches_per_day: 10
+  flag_changes_per_day: 200
+
+# Сценарии (Д.6): множитель к номинальной нагрузке и длительность (секунды).
+stand_scenarios:
+  base: { factor: 1, duration: 7200 }
+  peak: { factor: 2, duration: 3600 }
+  long: { factor: 1, duration: 259200 }
+# Короткий прогон для проверки стенда: -e stand_duration=300.
+stand_duration: ""
+stand_factor: ""
+
+# Корпус: число писем-образцов (плюс общие части для дублей MIME).
+stand_corpus_messages: 200
+
+# Инструменты.
+stand_k6_version: "1.0.0"
+stand_k6_arch: "{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+stand_k6_url: >-
+  https://github.com/grafana/k6/releases/download/v{{ stand_k6_version }}/k6-v{{ stand_k6_version }}-linux-{{ stand_k6_arch }}.tar.gz
+stand_k6_checksum: >-
+  sha256:https://github.com/grafana/k6/releases/download/v{{ stand_k6_version }}/k6-v{{ stand_k6_version }}-checksums.txt
+# imaptest — образ проекта Dovecot (пакета в Debian нет), запуск через podman.
+stand_imaptest_image: docker.io/dovecot/imaptest:latest
+# Набор команд imaptest (вероятности, см. документацию imaptest): письма доставляет smtp-source, IMAP — чтение,
+# флаги, поиск; IDLE держат подключённые клиенты.
+stand_imaptest_args: "ssl logout=0 delete=0 expunge=0 append=0"

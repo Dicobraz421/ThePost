@@ -1,0 +1,25 @@
+# Пример инвентаря стенда SMB (APP-D Д.2): узел SMB и генератор нагрузки (Debian 12 / Ubuntu 24.04).
+#   ansible-playbook -i inventory.yml deploy/stand/stand.yml                       # установка + базовый сценарий
+#   ansible-playbook -i inventory.yml deploy/stand/stand.yml -e stand_scenario=peak
+# Узел внешних интеграций (Rspamd + clamav-milter, FreeIPA) — в профиле SMB Rspamd и clamav-milter на узле SMB
+# (эталон), каталог учётных записей — по stand_provision (roles/stand_generator/defaults/main.yml).
+---
+all:
+  children:
+    smb:
+      hosts:
+        smb.stand.test:
+          ansible_host: 192.0.2.10
+      vars:
+        thepost_domain: stand.test
+        thepost_hostname: mail.stand.test
+        thepost_tls_mode: internal
+        thepost_clamav: true
+    generator:
+      hosts:
+        gen.stand.test:
+          ansible_host: 192.0.2.20
+  vars:
+    ansible_user: admin
+    # Пароль учётных записей стенда — ansible-vault (stand_user_password).
+    stand_users: 1000

@@ -38,6 +38,7 @@
   ansible.builtin.copy:
     src: "{{ item.src }}"
     dest: "{{ openbao_config_dir }}/tls/{{ item.dest }}"
+    remote_src: "{{ openbao_tls_remote_src }}"
     owner: root
     group: "{{ openbao_user }}"
     mode: "0644"
@@ -50,6 +51,7 @@
   ansible.builtin.copy:
     src: "{{ openbao_tls_key_src }}"
     dest: "{{ openbao_config_dir }}/tls/server.key"
+    remote_src: "{{ openbao_tls_remote_src }}"
     owner: root
     group: "{{ openbao_user }}"
     mode: "0640"

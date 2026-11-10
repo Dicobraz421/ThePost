@@ -1,0 +1,41 @@
+# Установка Rspamd для The Post (Debian, Ubuntu). Повторный прогон ничего не меняет.
+---
+- name: Check OS family
+  ansible.builtin.assert:
+    that: ansible_os_family == 'Debian'
+    fail_msg: "Роль rspamd эталона SMB поддерживает Debian и Ubuntu"
+
+- name: Add Rspamd repository
+  ansible.builtin.deb822_repository:
+    name: rspamd
+    uris: "{{ rspamd_repo_uri }}"
+    suites: "{{ ansible_distribution_release }}"
+    components: [main]
+    signed_by: "{{ rspamd_repo_key_url }}"
+  when: rspamd_official_repo
+  register: rspamd_repo
+
+- name: Install Rspamd
+  ansible.builtin.apt:
+    name: rspamd
+    state: present
+    update_cache: "{{ rspamd_repo is changed }}"
+
+- name: Write worker overrides
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/rspamd/override.d/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - worker-proxy.inc
+    - worker-normal.inc
+    - worker-controller.inc
+  notify: Restart rspamd
+
+- name: Start Rspamd
+  ansible.builtin.systemd_service:
+    name: "{{ rspamd_service }}"
+    state: started
+    enabled: true

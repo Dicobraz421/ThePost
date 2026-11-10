@@ -1,0 +1,56 @@
+{#- Эталон SMB: пресет all (deploy/config/all.yaml) + параметры узла; поверх — thepost_config_extra. -#}
+{%- set acme = thepost_tls_mode == 'acme' -%}
+{%- set tls_dir = '/var/lib/thepost/tls' if acme else '/etc/thepost/tls' -%}
+{%- set filters = [{'name': 'rspamd', 'address': thepost_rspamd_milter_address,
+                    'inbound': true, 'submission': thepost_milter_submission}] -%}
+{%- if thepost_clamav -%}
+{%-   set filters = filters + [{'name': 'clamav', 'address': thepost_clamav_milter_address,
+                               'inbound': true, 'submission': thepost_milter_submission}] -%}
+{%- endif -%}
+{%- set base = {
+  'domain': thepost_domain,
+  'roles': ['all'],
+  'database': {
+    'url': thepost_db_url,
+    'password': {'secret': 'thepost/db#password'},
+  },
+  'blob': {'url': 'file:///var/lib/thepost/blob'},
+  'tls': {
+    'cert_file': tls_dir ~ '/fullchain.pem',
+    'key_file': tls_dir ~ '/privkey.pem',
+  },
+  'http': {'jmap': {'listen': thepost_listen_address ~ ':443'}},
+  'imap': {'listeners': [
+    {'listen': thepost_listen_address ~ ':143'},
+    {'listen': thepost_listen_address ~ ':993', 'implicit_tls': true},
+  ]},
+  'smtp': {
+    'hostname': thepost_hostname,
+    'inbound': [{'listen': thepost_listen_address ~ ':25'}],
+    'submission': [
+      {'listen': thepost_listen_address ~ ':587'},
+      {'listen': thepost_listen_address ~ ':465', 'implicit_tls': true},
+    ],
+    'delivery': {'local_domains': thepost_local_domains},
+    'milter': {'filters': filters},
+  },
+  'secrets': {
+    'url': thepost_secrets_url,
+    'tls': {'ca_file': thepost_internal_ca_file},
+    'auth': {'approle': {
+      'role_id_file': thepost_secrets_role_id_file,
+      'secret_id_file': '/run/credentials/thepost.service/openbao-secret-id',
+    }},
+  },
+} -%}
+{%- if acme -%}
+{%-   set acme_section = {'enabled': true, 'domains': thepost_tls_names, 'contact': ['mailto:' ~ thepost_acme_email],
+                          'state_dir': '/var/lib/thepost/acme'} -%}
+{%-   if thepost_acme_directory_url | length > 0 -%}
+{%-     set acme_section = acme_section | combine({'directory_url': thepost_acme_directory_url}) -%}
+{%-   endif -%}
+{%-   set base = base | combine({'acme': acme_section}) -%}
+{%- endif -%}
+# {{ ansible_managed }}
+# The Post, профиль SMB (deploy/ansible/smb.yml): секретов здесь нет — только ссылки на OpenBao.
+{{ base | combine(thepost_config_extra, recursive=true, list_merge='replace') | to_nice_yaml(indent=2, width=120) }}

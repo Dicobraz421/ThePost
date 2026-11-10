@@ -1,0 +1,139 @@
+# Стенд SMB и базовая нагрузка (APP-D Д.2–Д.6) одной командой: узел SMB (эталон deploy/ansible/smb.yml) с порогами
+# стенда (Д.5, thresholds.yml), генератор нагрузки (imaptest, smtp-source, swaks, k6), сценарий по модели Д.3 и
+# сбор отчёта в deploy/stand/reports/<прогон>/.
+#   ansible-galaxy collection install -r deploy/ansible/requirements.yml
+#   ansible-playbook -i <инвентарь> deploy/stand/stand.yml [-e stand_scenario=peak] [-e stand_duration=300]
+# Только установка — --skip-tags run; только прогон — --tags run. Пример инвентаря — deploy/stand/inventory.example.yml.
+# Учётные записи stand_users заведены заранее (stand_provision; первая учётная запись SMB — issue #193).
+---
+- name: Stand parameters
+  hosts: smb:generator
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Load stand thresholds (D.5)
+      ansible.builtin.include_vars:
+        file: thresholds.yml
+
+    - name: Apply stand thresholds and relay of outgoing mail to smtp-sink
+      ansible.builtin.set_fact:
+        thepost_config_extra: >-
+          {{ stand_thresholds
+             | combine({'smtp': {'queue': {'relay': stand_relay}}}, recursive=true)
+             | combine(stand_config_extra | default({}), recursive=true, list_merge='replace') }}
+      vars:
+        stand_generator: "{{ groups['generator'] | first }}"
+        stand_relay: >-
+          {{ hostvars[stand_generator].ansible_host | default(stand_generator) }}:{{ stand_sink_port | default(2525) }}
+      when: inventory_hostname in groups['smb']
+
+- name: SMB node
+  ansible.builtin.import_playbook: ../ansible/smb.yml
+  tags: [install]
+
+- name: Load generator
+  hosts: generator
+  become: true
+  tags: [install]
+  roles:
+    - stand_generator
+
+- name: Run scenario
+  hosts: generator
+  become: true
+  tags: [run]
+  vars:
+    stand_scenario: base
+    stand_smb: "{{ groups['smb'] | first }}"
+    stand_remote_dir: /var/lib/thepost-stand
+    stand_local_reports: "{{ playbook_dir }}/reports/{{ stand_run }}-{{ stand_scenario }}"
+    stand_service_http: "https://127.0.0.1:{{ hostvars[stand_smb].thepost_service_http_port | default(8081) }}"
+  tasks:
+    - name: Fix run identifier
+      ansible.builtin.set_fact:
+        stand_run: "{{ lookup('ansible.builtin.pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: Read SMB clock before run
+      ansible.builtin.command: date -u +%s
+      delegate_to: "{{ stand_smb }}"
+      register: stand_smb_start
+      changed_when: false
+
+    # Служебный HTTP узла SMB — только loopback; имя в сертификате — thepost_hostname, не 127.0.0.1.
+    - name: Snapshot SMB metrics before run
+      ansible.builtin.uri:
+        url: "{{ stand_service_http }}/metrics"
+        validate_certs: false
+        return_content: true
+      delegate_to: "{{ stand_smb }}"
+      register: stand_metrics_before
+
+    # Пустые длительность и множитель — значения сценария (Д.6). Длинный сценарий — 72 ч: ожидание до 75 ч.
+    - name: Run scenario on generator
+      ansible.builtin.command:
+        argv:
+          - "{{ stand_remote_dir }}/run-scenario.sh"
+          - "{{ stand_scenario }}"
+          - "{{ stand_duration | default('') }}"
+          - "{{ stand_factor | default('') }}"
+      environment:
+        RUN_ID: "{{ stand_run }}"
+      register: stand_result
+      changed_when: true
+      async: 270000
+      poll: 60
+
+    - name: Snapshot SMB metrics after run
+      ansible.builtin.uri:
+        url: "{{ stand_service_http }}/metrics"
+        validate_certs: false
+        return_content: true
+      delegate_to: "{{ stand_smb }}"
+      register: stand_metrics_after
+
+    - name: Collect SMB journal warnings
+      ansible.builtin.command:
+        argv: [journalctl, -u, thepost, --since, "@{{ stand_smb_start.stdout }}", -p, warning, --no-pager]
+      delegate_to: "{{ stand_smb }}"
+      register: stand_journal
+      changed_when: false
+
+    - name: Create local report directory
+      ansible.builtin.file:
+        path: "{{ stand_local_reports }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Save SMB metrics and journal
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ stand_local_reports }}/{{ item.name }}"
+        mode: "0644"
+      loop:
+        - { name: smb-metrics-before.txt, content: "{{ stand_metrics_before.content }}" }
+        - { name: smb-metrics-after.txt, content: "{{ stand_metrics_after.content }}" }
+        - { name: smb-journal-warnings.txt, content: "{{ stand_journal.stdout }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: localhost
+      become: false
+
+    - name: List generator report files
+      ansible.builtin.find:
+        paths: "{{ stand_remote_dir }}/reports/{{ stand_run }}-{{ stand_scenario }}"
+      register: stand_files
+
+    - name: Fetch generator report
+      ansible.builtin.fetch:
+        src: "{{ item.path }}"
+        dest: "{{ stand_local_reports }}/"
+        flat: true
+      loop: "{{ stand_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Show summary
+      ansible.builtin.debug:
+        msg: "{{ stand_result.stdout_lines + ['Отчёт: ' ~ stand_local_reports] }}"

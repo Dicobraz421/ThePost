@@ -1,0 +1,3 @@
+# {{ ansible_managed }}
+# Веб-интерфейс и обучение — только loopback (без пароля доступ только с secure_ip, по умолчанию — localhost).
+bind_socket = "{{ rspamd_controller_address }}";

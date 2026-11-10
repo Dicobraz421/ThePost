@@ -1,0 +1,122 @@
+# Установка thepost на ВМ (эталон SMB). Повторный прогон ничего не меняет.
+---
+- name: Check parameters
+  ansible.builtin.assert:
+    that:
+      - thepost_tls_mode in ['certbot', 'acme', 'internal', 'files']
+      - thepost_tls_mode not in ['certbot', 'acme'] or thepost_acme_email | length > 0
+      - thepost_tls_mode != 'files' or (thepost_tls_cert_src | length > 0 and thepost_tls_key_src | length > 0)
+      - thepost_binary_url | length == 0 or thepost_binary_checksum | length > 0
+    fail_msg: >-
+      thepost_tls_mode — certbot, acme, internal или files; для certbot и acme нужен thepost_acme_email,
+      для files — thepost_tls_cert_src и thepost_tls_key_src; thepost_binary_url — с thepost_binary_checksum
+
+- name: Install system user (sysusers.d)
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../systemd/thepost.sysusers.conf"
+    dest: /usr/lib/sysusers.d/thepost.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: thepost_sysusers
+
+- name: Create system user thepost
+  ansible.builtin.command: systemd-sysusers /usr/lib/sysusers.d/thepost.conf
+  when: thepost_sysusers is changed  # noqa: no-handler — группа нужна следующим задачам
+  changed_when: true
+
+- name: Download thepost binary
+  ansible.builtin.get_url:
+    url: "{{ thepost_binary_url }}"
+    checksum: "{{ thepost_binary_checksum }}"
+    dest: "{{ thepost_binary_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: thepost_binary_url | length > 0
+  notify: Restart thepost
+
+- name: Copy thepost binary
+  ansible.builtin.copy:
+    src: "{{ thepost_binary_src }}"
+    dest: "{{ thepost_binary_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: thepost_binary_url | length == 0
+  notify: Restart thepost
+
+- name: Install systemd unit
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../systemd/thepost.service"
+    dest: /etc/systemd/system/thepost.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart thepost
+
+- name: Create unit drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/thepost.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Order thepost after local services (SMB)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/thepost.service.d/smb.conf
+    content: |
+      # {{ ansible_managed }}
+      # Эталон SMB: PostgreSQL, OpenBao и фильтры Milter — на этой же ВМ.
+      [Unit]
+      Wants=postgresql.service openbao.service rspamd.service{{ ' clamav-milter.service' if thepost_clamav else '' }}
+      After=postgresql.service openbao.service rspamd.service{{ ' clamav-milter.service' if thepost_clamav else '' }}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart thepost
+
+- name: Create configuration directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: thepost
+    mode: "0750"
+  loop:
+    - /etc/thepost
+    - /etc/thepost/tls
+
+- name: Certificate of client protocols
+  ansible.builtin.include_tasks: "tls-{{ thepost_tls_mode }}.yml"
+
+- name: Write config.yaml
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: /etc/thepost/config.yaml
+    owner: root
+    group: thepost
+    mode: "0640"
+    validate: "{{ thepost_binary_path }} config check --config %s"
+  notify: Restart thepost
+
+- name: Start thepost
+  ansible.builtin.systemd_service:
+    name: thepost
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Apply pending restart
+  ansible.builtin.meta: flush_handlers
+
+# Проверка готовности на loopback: имя в сертификате — thepost_hostname, не 127.0.0.1.
+- name: Wait for thepost readiness
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ thepost_service_http_port }}/healthz/ready"
+    validate_certs: false
+  register: thepost_ready
+  until: thepost_ready.status == 200
+  retries: "{{ thepost_ready_retries }}"
+  delay: "{{ thepost_ready_delay }}"

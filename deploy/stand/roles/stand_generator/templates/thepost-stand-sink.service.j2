@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# Приёмник исходящей почты стенда (Postfix smtp-sink): smtp.queue.relay узла SMB → этот порт; каждое письмо —
+# файл {{ stand_dir }}/sink/m.<hex> (счёт доставленных в отчёте).
+[Unit]
+Description=The Post stand: smtp-sink for outgoing mail
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/sbin/smtp-sink -u nobody -d {{ stand_dir }}/sink/m. 0.0.0.0:{{ stand_sink_port }} 1024
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

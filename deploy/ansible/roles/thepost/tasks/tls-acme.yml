@@ -1,0 +1,14 @@
+# Встроенный клиент ACME thepost (секция acme, SRS 6.2): сертификат выпускает и продлевает сам thepost в
+# /var/lib/thepost/tls (StateDirectory юнита — запись разрешена при ProtectSystem=strict).
+---
+- name: Create ACME directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: thepost
+    group: thepost
+    mode: "0750"
+  loop:
+    - /var/lib/thepost
+    - /var/lib/thepost/tls
+    - /var/lib/thepost/acme

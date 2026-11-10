@@ -18,10 +18,12 @@ openbao_data_dir: /opt/openbao/data
 openbao_api_addr: "https://{{ ansible_fqdn }}:8200"
 openbao_listen_address: "0.0.0.0:8200"
 openbao_cluster_address: "0.0.0.0:8201"
-# TLS обязателен: PEM на управляющей машине (ACME или свой CA) копируются в {{ openbao_config_dir }}/tls.
+# TLS обязателен: PEM на управляющей машине (ACME или свой CA) или на ВМ (openbao_tls_remote_src) копируются в {{ openbao_config_dir }}/tls.
 openbao_tls_cert_src: ""
 openbao_tls_key_src: ""
 openbao_tls_ca_src: ""
+# true — пути *_src на самой ВМ (эталон SMB: внутренний CA роли thepost_pki).
+openbao_tls_remote_src: false
 
 # Распечатывание после перезапуска (решение владельца 2026-10-30): автоматическое.
 #   pkcs11 — TPM или HSM через PKCS#11; awskms, gcpckms, azurekeyvault, ocikms, transit — KMS (параметры —

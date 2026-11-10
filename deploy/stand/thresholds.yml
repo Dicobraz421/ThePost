@@ -1,0 +1,38 @@
+# Пороговые значения стенда SMB (APP-D Д.5): механизмы, которые в эксплуатации срабатывают редко, срабатывают за
+# время испытания. Применяются поверх эталона SMB (thepost_config_extra); свои добавки — stand_config_extra.
+# Строки Д.5 без параметра в профиле SMB: HPA, PgBouncer, кэш moka/NVMe (только S3), HA СУБД, мигратор, перенос
+# ящиков, балансировщик; «соединений с IP» — параметра нет (есть только smtp/imap limits.max_connections на слушатель).
+---
+stand_thresholds:
+  meta:
+    # Срок хранения корзины: 30 сут → 15 мин.
+    retention:
+      trash_retention: 15m
+      # Квота ящика: 50 GB → 50 MB.
+      quota_bytes: 52428800
+    # Период ожидания GC (надгробие BLOB, поколения объектов): 24 ч → 5 мин.
+    blob_tombstone_ttl: 5m
+  blob:
+    gc:
+      # Окно W: ≥ окна PITR → 30 мин.
+      window: 30m
+    orphans:
+      # Интервал поиска «сирот»: → 2 мин; период ожидания — меньше длительности испытания.
+      interval: 2m
+      grace: 5m
+  database:
+    # Пул соединений узла: 20 → 3.
+    max_connections: 3
+  search:
+    indexer:
+      # Интервал коммита индекса: → 5 с.
+      commit_interval: 5s
+    cache:
+      # Кэш индексов на узле: → 1 GB.
+      max_bytes: 1073741824
+  smtp:
+    queue:
+      # Повторы очереди SMTP: 15 мин … 5 сут → 1 мин … 30 мин.
+      retry: [1m, 2m, 5m, 10m, 30m]
+      expire: 30m
+      delay_notify: 10m
