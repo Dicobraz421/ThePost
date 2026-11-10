@@ -22,6 +22,7 @@ use crate::config::ImapConfig;
 use crate::ext::Extensions;
 use crate::session::{Deps, Session, SessionCtx, Transport};
 
+mod compress;
 mod ext;
 mod fetch;
 mod idle;

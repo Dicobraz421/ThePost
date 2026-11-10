@@ -283,7 +283,13 @@ impl<T: Transport> Session<T> {
                     self.close = true;
                     return Ok(());
                 }
-                Wake::Read(Ok(n)) => self.reader.push(&buf[..n]),
+                Wake::Read(Ok(n)) => {
+                    if let Err(e) = self.received(&buf[..n]) {
+                        tracing::debug!(error = %e, "imap: сжатый поток повреждён");
+                        self.close = true;
+                        return Ok(());
+                    }
+                }
                 Wake::Read(Err(e)) => return Err(io_error(e)),
             }
         }

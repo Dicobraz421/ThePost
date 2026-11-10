@@ -15,6 +15,9 @@
 //!     drain: 30s
 //!   namespace:
 //!     other_users: Other Users
+//!   compress:
+//!     enabled: true
+//!     level: 6
 //! ```
 //!
 //! Слушатели применяются при запуске роли; лимиты и таймауты — к новым сессиям без перезапуска.
@@ -38,6 +41,27 @@ pub struct ImapConfig {
     pub timeouts: Timeouts,
     /// Пространства имён (RFC 2342).
     pub namespace: NamespaceConfig,
+    /// Сжатие `COMPRESS=DEFLATE` (RFC 4978).
+    pub compress: CompressConfig,
+}
+
+/// Сжатие потока IMAP (RFC 4978).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompressConfig {
+    /// `COMPRESS=DEFLATE` разрешён.
+    pub enabled: bool,
+    /// Уровень сжатия DEFLATE, 0–9.
+    pub level: u32,
+}
+
+impl Default for CompressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: 6,
+        }
+    }
 }
 
 /// Пространства имён IMAP (RFC 2342): общие папки других пользователей — `<other_users>/<имя входа>/<папка>`.

@@ -32,6 +32,7 @@ use tp_contracts::search::SearchIndex;
 use tp_contracts::{Error, MailboxId, MessageId, ModSeq, Result, Uid, UidValidity};
 use tp_platform::{Conn, Listener};
 
+use crate::compress::Deflate;
 use crate::config::ImapConfig;
 use crate::ext::Extensions;
 use crate::proto::types::auth::AuthMechanism;
@@ -163,6 +164,8 @@ pub struct Session<T: Transport> {
     pub(crate) qresync: bool,
     /// Необязательные зависимости расширений (QUOTA, ACL).
     pub(crate) ext: Extensions,
+    /// Сжатие потока (`COMPRESS DEFLATE`).
+    pub(crate) deflate: Option<Deflate>,
     errors: u32,
     auth_failures: u32,
     /// Сессия завершается после отправки накопленных ответов.
@@ -228,6 +231,7 @@ impl<T: Transport> Session<T> {
             condstore: false,
             qresync: false,
             ext: Extensions::default(),
+            deflate: None,
             errors: 0,
             auth_failures: 0,
             close: false,
@@ -271,8 +275,14 @@ impl<T: Transport> Session<T> {
             self.out.clear();
             return Ok(());
         };
+        let compressed = match self.deflate.as_mut() {
+            Some(d) => Some(d.compress(&self.out)?),
+            None => None,
+        };
         let io = conn.io();
-        io.write_all(&self.out).await.map_err(io_error)?;
+        io.write_all(compressed.as_deref().unwrap_or(&self.out))
+            .await
+            .map_err(io_error)?;
         io.flush().await.map_err(io_error)?;
         self.out.clear();
         Ok(())
@@ -327,7 +337,13 @@ impl<T: Transport> Session<T> {
                     return self.end().await;
                 }
                 Some(Ok(Ok(0))) => return Ok(None),
-                Some(Ok(Ok(n))) => self.reader.push(&buf[..n]),
+                Some(Ok(Ok(n))) => {
+                    if let Err(e) = self.received(&buf[..n]) {
+                        tracing::debug!(error = %e, "imap: сжатый поток повреждён");
+                        self.close = true;
+                        return Ok(None);
+                    }
+                }
                 Some(Ok(Err(e))) => return Err(io_error(e)),
             }
         }
@@ -455,6 +471,13 @@ impl<T: Transport> Session<T> {
         let mut caps: Vec<Capability<'static>> = EXTENSIONS
             .iter()
             .chain(&self.ext.capabilities())
+            .chain(
+                self.ctx
+                    .config
+                    .compress
+                    .enabled
+                    .then_some(&"COMPRESS=DEFLATE"),
+            )
             .map(|c| cap(c))
             .collect();
         if self.principal.is_none() {
@@ -583,6 +606,7 @@ impl<T: Transport> Session<T> {
             }
             Body::List(cmd) => self.list(&tag, cmd).await,
             Body::Acl(cmd) => self.acl_command(&tag, cmd).await,
+            Body::Std(CommandBody::Compress { algorithm }) => self.compress(&tag, algorithm).await,
             Body::Std(CommandBody::Namespace) => {
                 self.namespace(&tag);
                 Ok(())

@@ -11,8 +11,10 @@
 //! - `qresync` — QRESYNC: `SELECT … (QRESYNC …)`, `VANISHED`.
 //! - `idle` — IDLE и уведомления о выбранной папке (`EXISTS`, `EXPUNGE`, `FETCH FLAGS`).
 //! - `ext` — NAMESPACE (общие папки), QUOTA, ACL ([`Extensions`]).
+//! - `compress` — `COMPRESS=DEFLATE`.
 //! - [`config`] — секция `imap` config.yaml.
 
+mod compress;
 pub mod config;
 mod ext;
 mod fetch;
