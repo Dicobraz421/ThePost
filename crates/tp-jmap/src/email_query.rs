@@ -736,7 +736,9 @@ mod tests {
         let m = fixture(&env).await;
         let inbox = env.mailbox(SpecialUse::Inbox).to_string();
         let t0 = OffsetDateTime::now_utc() - time::Duration::days(10);
-        let day2 = crate::email_get::utc_date(t0 + time::Duration::days(2));
+        // Граница между письмами 1-го и 2-го дня (а не ровно 2-й день): `t0` фикстуры чуть раньше `t0` теста.
+        let day2 =
+            crate::email_get::utc_date(t0 + time::Duration::days(2) - time::Duration::hours(12));
         // По умолчанию — новые сверху.
         assert_eq!(ids(&env, json!({})).await, json!([m[3], m[2], m[1], m[0]]));
         assert_eq!(
