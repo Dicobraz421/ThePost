@@ -341,13 +341,7 @@ impl Jmap {
 
     /// Выполняет запрос API (тело POST `apiUrl`). Ошибка всего запроса — [`Problem`].
     pub async fn api(&self, p: &Principal, body: &[u8]) -> std::result::Result<Response, Problem> {
-        if body.len() as u64 > self.cfg.max_size_request {
-            return Err(Problem::limit("maxSizeRequest"));
-        }
-        let value: Value =
-            serde_json::from_slice(body).map_err(|e| Problem::not_json(e.to_string()))?;
-        let req: Request =
-            serde_json::from_value(value).map_err(|e| Problem::not_request(e.to_string()))?;
+        let req = request::parse(body, self.cfg.max_size_request)?;
         if let Some(uri) = req.using.iter().find(|u| !self.known_capability(u)) {
             return Err(Problem::unknown_capability(uri));
         }
@@ -360,6 +354,8 @@ impl Jmap {
         let echo_created = req.created_ids.is_some();
         let mut created = req.created_ids.unwrap_or_default();
         let mut responses: Vec<Invocation> = Vec::with_capacity(req.method_calls.len());
+        // Подстановки ссылок за запрос — не больше самого запроса по лимиту (`maxSizeRequest`).
+        let mut budget = self.cfg.max_size_request;
         for Invocation(name, args, call_id) in req.method_calls {
             let mut ctx = Ctx {
                 jmap: self,
@@ -371,7 +367,7 @@ impl Jmap {
                 created: &mut created,
                 implicit: Vec::new(),
             };
-            let result = match request::resolve_references(args, &responses) {
+            let result = match request::resolve_references(args, &responses, &mut budget) {
                 Ok(args) => self.call(&mut ctx, &name, args, &req.using).await,
                 Err(e) => Err(e),
             };
