@@ -19,6 +19,7 @@ pub mod policies;
 pub mod rpc;
 pub mod secrets;
 pub mod suite;
+pub mod transport;
 
 pub use abuse::MemAbuseBlocks;
 pub use acl::MemAcl;
@@ -38,3 +39,4 @@ pub use meta::MemMetadata;
 pub use policies::{MemPolicies, PolicyLevel};
 pub use rpc::{MemRpc, MemRpcNet};
 pub use secrets::MemSecretStore;
+pub use transport::MemTransport;

@@ -1,7 +1,7 @@
 //! Сигналы «изменилось X» между узлами (CONTRACTS.md#EventBus; SRS 2.8, решение 2026-11-01).
 //!
 //! Сигнал не несёт правды: получатель при запуске, после переподключения и по [`EventKind::Resync`] сверяется
-//! с хранилищем (по `ModSeq`, позиции журнала, составу узлов, списку блокировок), далее работает по сигналам.
+//! с хранилищем (по `ModSeq`, позиции журнала, составу узлов, списку блокировок, настройкам транспорта), далее работает по сигналам.
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -42,6 +42,12 @@ pub enum EventKind {
     Blocked {
         /// Субъект блокировки.
         subject: BlockSubject,
+    },
+    /// Изменились настройки транспорта ([`crate::transport::TransportStore`]): `tenant = None` — уровень кластера
+    /// (принятые домены, доверенные источники; `Event::tenant` — `TenantId::DEFAULT`), иначе — организации.
+    TransportChanged {
+        /// Организация; `None` — уровень кластера.
+        tenant: Option<TenantId>,
     },
     /// Сигналы подписки потеряны (переполнение буфера подписчика, переподключение слушателя): сверка с хранилищем.
     /// Шина вставляет его в поток подписки с `tenant`/`account` этой подписки (системная — `TenantId::DEFAULT`,
@@ -120,6 +126,10 @@ mod tests {
             EventKind::MembersChanged,
             EventKind::Blocked {
                 subject: BlockSubject::Account(AccountId::new()),
+            },
+            EventKind::TransportChanged { tenant: None },
+            EventKind::TransportChanged {
+                tenant: Some(TenantId::new()),
             },
         ] {
             assert!(kind.is_system(), "{kind:?}");
