@@ -98,7 +98,7 @@
 | ✅ smtp-03 | SMTP-09, SMTP-10, SMTP-11 | A | smtp-02 | 4 |
 | ✅ jmap-02 | JMAP-05, JMAP-06, JMAP-07, JMAP-08 | A | jmap-01, smtp-02 | 3 |
 | imap-03 | IMAP-09, IMAP-10, IMAP-11, IMAP-12 | A | imap-02, auth-02 | 2 |
-| app-02 | APP-04, APP-05, APP-06 | A | smtp-01, imap-01, jmap-01, search-01, admin-01 | 1 |
+| ✅ app-02 | APP-04, APP-05, APP-06 | A | smtp-01, imap-01, jmap-01, search-01, admin-01 | 1 |
 | deploy-02 | DEP-04, DEP-05 | A | app-02 | 4 |
 
 ### Решение 2026-11-01: заимствования и базовые принципы безопасности
@@ -111,7 +111,7 @@
 | ✅ platform-06 | PLT-15, PLT-16 | A | sys-03, contracts-10 | 2 |
 | ✅ meta-08 | META-21, META-22, META-23, META-24 | B | contracts-10 | 3 |
 | ✅ blob-06 | BLOB-13 | A | meta-08 | 4 |
-| mailstore-07 | MS-12, MS-13 | A | mailstore-06 | 1 |
+| ✅ mailstore-07 | MS-12, MS-13 | A | mailstore-06 | 1 |
 | smtp-04 | SMTP-12, SMTP-13, SMTP-14, SMTP-15 | A | smtp-03, contracts-13 | 4 |
 | smtp-05 | SMTP-16, SMTP-17, SMTP-18, SMTP-19 | A | smtp-04, meta-08, mailstore-07 | 4 |
 | ✅ auth-03 | AUTH-07 | A | auth-02, meta-08 | 1 |
@@ -216,6 +216,19 @@
 | contracts-21 (ветка `x/contracts-21`) | CTR-33 | B | contracts-14 | 1 |
 | app-06 | APP-10 | A | app-02, imap-05, jmap-05, mailstore-09 | 2 |
 | jmap-07 | JMAP-13 | A | jmap-02, mailstore-09 | 3 |
+
+### Находки CMP-01: проверка клиентом Postman 2026-11-05 (приоритет)
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| deploy-08 | CMP-01 | A | — | 4 |
+| app-09 | CMP-02 | A | — | 2 |
+| search-03 | CMP-06 | A | — | 1 |
+| jmap-10 | CMP-03 | A | — | 3 |
+| smtp-08 | CMP-04 | A | — | 4 |
+| meta-17 | CMP-05 | A | — | 3 |
+
+Первая учётная запись SMB без провайдера OIDC (CMP-01, п. 5б) — вопрос владельцу, issue с меткой `решение`.
 
 Выход Ф1: MVP SMB — критерии `docs/spec/APP-D.md#Д.7` для профиля SMB на стенде DEP-04.
 
