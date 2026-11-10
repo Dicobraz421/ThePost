@@ -385,3 +385,73 @@ async fn delivery_under_mta_sts() {
     );
     assert!(plain.mails().is_empty());
 }
+
+#[tokio::test]
+async fn destination_policy_pins_and_strictest_of_two() {
+    use tp_contracts::transport::{DestinationPolicy, TlsRequirement};
+    let rec = Arc::new(Recorder::default());
+    let (port, stop) = tls_smtp_server(rec.clone()).await;
+    let (dns, _http, p) = policy();
+    let t = sender(p);
+    let cfg = QueueConfig {
+        port,
+        ..QueueConfig::default()
+    };
+    let rcpts = vec!["x@example.net".to_owned()];
+    let key = spki(&test_cert());
+    let pin: String = Sha256::digest(&key)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let policy = |tls| DestinationPolicy {
+        pattern: "example.net".into(),
+        tls,
+        smart_host: None,
+        egress_ip: None,
+    };
+    let send = |route: DestinationPolicy| {
+        let t = &t;
+        let cfg = &cfg;
+        let rcpts = &rcpts;
+        async move {
+            t.send(crate::queue::SendRequest {
+                route: Some(&route),
+                ..req(cfg, "example.net", rcpts)
+            })
+            .await
+        }
+    };
+    // Закреплённый ключ совпал — доставлено; не совпал — узел пропущен.
+    let res = send(policy(TlsRequirement::Pinned {
+        spki_sha256: vec!["0".repeat(64), pin.clone()],
+    }))
+    .await;
+    assert!(matches!(&res[0], RcptResult::Delivered(_)), "{res:?}");
+    let res = send(policy(TlsRequirement::Pinned {
+        spki_sha256: vec!["0".repeat(64)],
+    }))
+    .await;
+    assert!(
+        matches!(&res[0], RcptResult::Temporary(r) if r.contains("pinned key")),
+        "{res:?}"
+    );
+    // DANE и закреплённый ключ — действуют оба: несовпадение TLSA отклоняет и при верном ключе.
+    dns.set_tlsa("localhost", Ok(Some(vec![tlsa(3, 1, 1, vec![0; 32])])));
+    let res = send(policy(TlsRequirement::Pinned {
+        spki_sha256: vec![pin],
+    }))
+    .await;
+    assert!(
+        matches!(&res[0], RcptResult::Temporary(r) if r.contains("DANE")),
+        "{res:?}"
+    );
+    // Обязательный TLS и совпавшая запись TLSA: проверка цепочки по корням и сверка с TLSA — доставлено.
+    dns.set_tlsa(
+        "localhost",
+        Ok(Some(vec![tlsa(3, 1, 1, Sha256::digest(&key).to_vec())])),
+    );
+    let res = send(policy(TlsRequirement::Required)).await;
+    assert!(matches!(&res[0], RcptResult::Delivered(_)), "{res:?}");
+    assert_eq!(rec.mails().len(), 2);
+    stop.cancel();
+}

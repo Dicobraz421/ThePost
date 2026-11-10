@@ -25,6 +25,7 @@ use tp_platform::ConnInfo;
 
 use super::{Envelope, Mode, Reply, SessionCtx, is_positive, next_id, reply};
 use crate::limits::SendLimits;
+use crate::screen::{Probe, Violation};
 
 /// Чем закончилась работа сессии над потоком.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +85,12 @@ pub struct Session {
     pub(super) auth_failures: u32,
     /// Сессия завершается после отправки накопленных ответов.
     pub(super) exit: Option<Exit>,
+    /// Проверки экрана соединений ([`crate::screen`]).
+    pub(super) screen: Option<Probe>,
+    /// Первое нарушение, обнаруженное экраном.
+    pub(super) violation: Option<Violation>,
+    /// Клиент прислал хотя бы одну команду.
+    pub(super) spoke: bool,
 }
 
 impl std::fmt::Debug for Session {
@@ -110,7 +117,48 @@ impl Session {
             errors: 0,
             auth_failures: 0,
             exit: None,
+            screen: None,
+            violation: None,
+            spoke: false,
         }
+    }
+
+    /// Проверки экрана соединений в начале сессии: задержка приветствия и конвейер без PIPELINING.
+    pub fn screening(&mut self, probe: Probe) {
+        self.screen = Some(probe);
+    }
+
+    /// Итог проверок экрана: `None` — проверок не было или клиент ушёл до первой команды.
+    pub fn screen_outcome(&self) -> Option<Result<(), Violation>> {
+        self.screen?;
+        match self.violation {
+            Some(v) => Some(Err(v)),
+            None if self.spoke => Some(Ok(())),
+            None => None,
+        }
+    }
+
+    /// Нарушение экрана: журнал, метрика; `true` — отказ (`enforce`), сессия закрывается после ответа.
+    fn screen_violation(&mut self, v: Violation, out: &mut Vec<u8>) -> bool {
+        let Some(p) = self.screen else {
+            return false;
+        };
+        if self.violation.is_some() {
+            // Режим журнала: нарушение сессии записывается однажды.
+            return false;
+        }
+        self.violation = Some(v);
+        crate::screen::violation(
+            self.ctx.metrics.as_deref(),
+            self.conn.client.ip(),
+            v,
+            p.enforce,
+        );
+        if p.enforce {
+            push(out, &v.reply());
+            self.exit = Some(Exit::Closed);
+        }
+        p.enforce
     }
 
     /// Аутентифицированный отправитель.
@@ -135,12 +183,29 @@ impl Session {
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let mut out = Vec::new();
-        if greet {
-            out.extend_from_slice(
-                format!("220 {} ESMTP The Post\r\n", self.ctx.config.hostname).as_bytes(),
-            );
-        }
         let mut buf = vec![0u8; 16 * 1024];
+        // Данные, пришедшие до конца приветствия (экран в режиме журнала): разбираются первыми.
+        let mut early = 0;
+        if greet {
+            let banner = format!("{} ESMTP The Post", self.ctx.config.hostname);
+            if let Some(p) = self.screen.filter(|p| !p.greet_delay.is_zero()) {
+                io.write_all(format!("220-{banner}\r\n").as_bytes()).await?;
+                io.flush().await?;
+                if let Ok(n) = tokio::time::timeout(p.greet_delay, io.read(&mut buf)).await {
+                    let n = n?;
+                    if n == 0 {
+                        return Ok(Exit::Closed);
+                    }
+                    if self.screen_violation(Violation::Pregreet, &mut out) {
+                        io.write_all(&out).await?;
+                        io.flush().await?;
+                        return Ok(Exit::Closed);
+                    }
+                    early = n;
+                }
+            }
+            out.extend_from_slice(format!("220 {banner}\r\n").as_bytes());
+        }
         let mut state = State::command();
         loop {
             if !out.is_empty() {
@@ -155,7 +220,14 @@ impl Session {
                 State::Command(_) | State::Auth(_) => self.ctx.config.timeouts.command,
                 _ => self.ctx.config.timeouts.data,
             };
-            let n = match tokio::time::timeout(wait, io.read(&mut buf)).await {
+            let n = match early {
+                0 => tokio::time::timeout(wait, io.read(&mut buf)).await,
+                n => {
+                    early = 0;
+                    Ok(Ok(n))
+                }
+            };
+            let n = match n {
                 Ok(n) => n?,
                 Err(_) => {
                     push(
@@ -177,9 +249,26 @@ impl Session {
                         match rx.ingest(&mut bytes) {
                             Ok(req) => {
                                 let req = req.into_owned();
-                                self.command(req, &mut out)
+                                self.spoke = true;
+                                // RFC 2920: без объявленного PIPELINING (до `EHLO`, после `HELO`) и вслед за
+                                // `EHLO`/`HELO` клиент ждёт ответа на каждую команду.
+                                let last =
+                                    matches!(req, Request::Ehlo { .. } | Request::Helo { .. });
+                                let negotiated = self.esmtp;
+                                let next = self
+                                    .command(req, &mut out)
                                     .await
-                                    .unwrap_or(State::Command(rx))
+                                    .unwrap_or(State::Command(rx));
+                                if (last || !negotiated)
+                                    && self.screen.is_some_and(|p| p.pipelining)
+                                    && self.exit.is_none()
+                                    && matches!(next, State::Command(_))
+                                    && !bytes.as_slice().is_empty()
+                                    && self.screen_violation(Violation::Pipelining, &mut out)
+                                {
+                                    bytes = [].iter();
+                                }
+                                next
                             }
                             Err(smtp_proto::Error::NeedsMoreData { .. }) => State::Command(rx),
                             Err(e) => {

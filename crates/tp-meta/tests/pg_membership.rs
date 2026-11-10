@@ -2,10 +2,15 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use tp_contracts::Error;
-use tp_contracts::membership::{Membership, NodeId, NodeInfo};
+use tp_contracts::bus::{Event, EventKind};
+use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
+use tp_contracts::role::Role;
+use tp_contracts::{Error, TenantId};
+use tp_meta::{MetaConfig, PgMeta};
+use tp_testkit::suite::{self, RealTime};
 use uuid::Uuid;
 
 /// Узлы теста: общий префикс, чтобы не видеть узлы параллельных тестов.
@@ -86,12 +91,18 @@ async fn roles_and_invalid_ttl() {
     let (_, ids) = nodes(1);
     let n = &ids[0];
     let ttl = Duration::from_secs(60);
-    let roles = vec!["imap".to_owned(), "indexer".to_owned()];
+    // Запись узла (META-27): роли, адрес, площадка; heartbeat_roles меняет только роли.
+    let mut info = NodeInfo::new(n.clone());
+    info.roles = [Role::Imap, Role::Search].into_iter().collect();
+    info.addr = "https://node.internal:7443".to_owned();
+    info.site = SiteId::new("dc-2").expect("site");
+    meta.heartbeat(&info, ttl).await.expect("heartbeat");
+    let roles = vec![
+        "imap".to_owned(),
+        "indexer".to_owned(),
+        "mod-archive".to_owned(),
+    ];
     meta.heartbeat_roles(n, &roles, ttl).await.expect("roles");
-    // Продление без ролей их не меняет.
-    meta.heartbeat(&NodeInfo::new(n.clone()), ttl)
-        .await
-        .expect("heartbeat");
     let rec = meta
         .nodes()
         .await
@@ -100,7 +111,21 @@ async fn roles_and_invalid_ttl() {
         .find(|r| &r.node == n)
         .expect("record");
     assert_eq!(rec.roles, roles);
+    assert_eq!(rec.addr, info.addr);
+    assert_eq!(rec.site, info.site);
     assert!(rec.expires_at > rec.joined_at);
+    // В live_info — только роли ядра (роль модуля не входит).
+    let live = meta.live_info().await.expect("live_info");
+    let got = live.iter().find(|i| &i.id == n).expect("live");
+    assert_eq!(got.roles, [Role::Imap, Role::Indexer].into_iter().collect());
+    assert_eq!(got.addr, info.addr);
+
+    let mut bad = info.clone();
+    bad.addr = "https://a b".to_owned();
+    assert!(matches!(
+        meta.heartbeat(&bad, ttl).await,
+        Err(Error::Invalid(_))
+    ));
 
     assert!(matches!(
         meta.heartbeat(&NodeInfo::new(n.clone()), Duration::ZERO)
@@ -108,4 +133,57 @@ async fn roles_and_invalid_ttl() {
         Err(Error::Invalid(_))
     ));
     meta.leave(n).await.expect("cleanup");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conformance_membership() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let ttl = Duration::from_secs(2);
+    suite::membership(&meta, ttl, &RealTime).await;
+    suite::membership_info(&meta, ttl, &RealTime).await;
+}
+
+#[tokio::test]
+async fn members_changed_on_change() {
+    let Some(pool) = common::pool().await else {
+        return;
+    };
+    let rec = Arc::new(common::RecordingBus::default());
+    let meta = PgMeta::new(pool, MetaConfig::default()).with_bus(rec.clone());
+    let (_, ids) = nodes(1);
+    let ttl = Duration::from_secs(60);
+    let members = Event {
+        tenant: TenantId::DEFAULT,
+        account: None,
+        kind: EventKind::MembersChanged,
+    };
+    let mut info = NodeInfo::new(ids[0].clone());
+    meta.heartbeat(&info, ttl).await.expect("join");
+    assert_eq!(rec.take(), vec![members.clone()], "вход");
+    meta.heartbeat(&info, ttl).await.expect("renew");
+    assert!(rec.take().is_empty(), "продление без изменений");
+    info.roles.insert(Role::Search);
+    meta.heartbeat(&info, ttl).await.expect("roles");
+    assert_eq!(rec.take(), vec![members.clone()], "роли");
+    info.addr = "https://n.internal:7443".to_owned();
+    meta.heartbeat(&info, ttl).await.expect("addr");
+    assert_eq!(rec.take(), vec![members.clone()], "адрес");
+    info.site = SiteId::new("dc-9").expect("site");
+    meta.heartbeat(&info, ttl).await.expect("site");
+    assert_eq!(rec.take(), vec![members.clone()], "площадка");
+    meta.heartbeat(&info, ttl).await.expect("renew");
+    assert!(rec.take().is_empty());
+    // Истёкшая запись: возвращение — вход.
+    meta.heartbeat(&info, Duration::from_millis(100))
+        .await
+        .expect("short");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    meta.leave(&info.id).await.expect("leave expired");
+    assert!(rec.take().is_empty(), "выход истёкшей записи — без сигнала");
+    meta.heartbeat(&info, ttl).await.expect("back");
+    assert_eq!(rec.take(), vec![members.clone()]);
+    meta.leave(&info.id).await.expect("leave");
+    assert_eq!(rec.take(), vec![members]);
 }

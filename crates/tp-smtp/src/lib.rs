@@ -1,6 +1,7 @@
 //! SMTP: приём, отправка, очередь, SPF/DKIM/DMARC/ARC, MTA-STS, DANE, Milter (SRS 4.1).
 //!
 //! - [`server`] — сессия SMTP (RFC 5321) на `smtp-proto`, роли smtp-in и submission, STARTTLS, `AUTH`;
+//! - [`address`] — адресация: подадреса `user+tag`, переписывание адресов конверта;
 //! - [`authcheck`] — SPF, DKIM, DMARC, ARC входящей почты на `mail-auth`;
 //! - [`deliver`] — локальная доставка: разрешение получателей, `Received`, `MailStore::ingest`;
 //! - [`dkim_sign`] — DKIM-подпись исходящей почты;
@@ -9,9 +10,13 @@
 //! - [`metrics`] — метрики сессий и очереди (`/metrics`);
 //! - [`milter`] — фильтры Milter (антиспам, антивирус) после приёма письма;
 //! - [`policy`] — MTA-STS и DANE при отправке на MX;
+//! - [`routes`] — политики доменов назначения организаций (обязательный TLS, закреплённый ключ, smart host,
+//!   egress-IP) с перечитыванием по сигналу;
+//! - [`screen`] — экран соединений smtp-in (postscreen): задержка приветствия, конвейер, частота, кэш по IP;
 //! - [`queue`] — очередь исходящей почты и роль smtp-out (отправка на MX через `mail-send`);
 //! - [`config`] — секция `smtp` config.yaml.
 
+pub mod address;
 pub mod authcheck;
 pub mod config;
 pub mod deliver;
@@ -22,6 +27,8 @@ pub mod metrics;
 pub mod milter;
 pub mod policy;
 pub mod queue;
+pub mod routes;
+pub mod screen;
 pub mod server;
 
 pub use authcheck::AuthCheck;

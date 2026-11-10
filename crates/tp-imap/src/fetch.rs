@@ -19,6 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures::StreamExt;
 use mail_parser::{MessageParser, MimeHeaders, PartType};
+use tp_contracts::auth::Rights;
 use tp_contracts::blob::ByteStream;
 use tp_contracts::meta::{Address, BodyPart, Envelope, Flag, FlagOp, Message, MessageQuery};
 use tp_contracts::{Error, MessageId, Result};
@@ -787,7 +788,10 @@ impl<T: Transport> Session<T> {
             return Ok(());
         };
         let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
-        let mark_seen = !selected.read_only && items.iter().any(sets_seen);
+        // Общая папка: `\Seen` ставится только при праве `s` (RFC 4314, 4).
+        let mark_seen = !selected.read_only
+            && items.iter().any(sets_seen)
+            && self.selected_rights().await?.contains(Rights::SEEN);
         let batch = self.ctx.config.limits.fetch_batch.max(1);
         for chunk in indexes.chunks(batch) {
             let ids: Vec<MessageId> = chunk.iter().map(|&i| selected.messages[i].1).collect();

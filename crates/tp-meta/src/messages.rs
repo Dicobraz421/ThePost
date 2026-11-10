@@ -20,7 +20,7 @@ use tp_contracts::meta::{
     NewMessage, PartRef, SpecialUse,
 };
 use tp_contracts::{
-    BlobHash, BlobKey, Error, Gen, MailboxId, MessageId, ModSeq, Result, TenantId, Uid,
+    AccountId, BlobHash, BlobKey, Error, Gen, MailboxId, MessageId, ModSeq, Result, TenantId, Uid,
 };
 use uuid::Uuid;
 
@@ -425,10 +425,12 @@ impl MessageStore for PgMeta {
     ) -> Result<Inserted> {
         check_new(scope, &msg)?;
         let partitions = self.cfg.event_partitions;
-        with_tenant(&self.pool, scope.tenant, |tx| {
+        let inserted = with_tenant(&self.pool, scope.tenant, |tx| {
             Box::pin(insert_one(tx, partitions, scope, mailbox, msg))
         })
-        .await
+        .await?;
+        self.signal_log([scope.account]).await;
+        Ok(inserted)
     }
 
     async fn insert_batch(
@@ -451,7 +453,11 @@ impl MessageStore for PgMeta {
         items
             .sort_by_key(|(_, (scope, mailbox, _))| (*scope.account.as_uuid(), *mailbox.as_uuid()));
         let partitions = self.cfg.event_partitions;
-        with_tenant(&self.pool, tenant, |tx| {
+        let accounts: Vec<AccountId> = items
+            .iter()
+            .map(|(_, (scope, _, _))| scope.account)
+            .collect();
+        let inserted = with_tenant(&self.pool, tenant, |tx| {
             Box::pin(async move {
                 let mut out = Vec::with_capacity(items.len());
                 for (i, (scope, mailbox, msg)) in items {
@@ -461,7 +467,9 @@ impl MessageStore for PgMeta {
                 Ok(out.into_iter().map(|(_, ins)| ins).collect())
             })
         })
-        .await
+        .await?;
+        self.signal_log(accounts).await;
+        Ok(inserted)
     }
 
     async fn get(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
@@ -612,6 +620,7 @@ impl MessageStore for PgMeta {
             .collect();
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         update.modseq = ms;
         update.changed = ids.into_iter().map(MessageId::from_uuid).collect();
         Ok(update)
@@ -641,6 +650,7 @@ impl MessageStore for PgMeta {
             .collect();
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         Ok(inserted)
     }
 
@@ -700,6 +710,7 @@ impl MessageStore for PgMeta {
         changelog::log(&mut tx, scope, ms, &changes).await?;
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         Ok(inserted)
     }
 
@@ -738,6 +749,7 @@ impl MessageStore for PgMeta {
         .collect();
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         Ok(ms)
     }
 
@@ -804,6 +816,7 @@ impl MessageStore for PgMeta {
         }
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         src.iter()
             .map(|id| {
                 Ok(Inserted {
@@ -875,6 +888,7 @@ impl MessageStore for PgMeta {
         changelog::log(&mut tx, scope, ms, &changes).await?;
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
+        self.signal_log([scope.account]).await;
         Ok(ms)
     }
 }

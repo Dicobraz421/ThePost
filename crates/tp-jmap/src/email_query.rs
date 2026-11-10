@@ -281,22 +281,7 @@ fn compare(c: &Comparator, x: &Message, y: &Message, ev: &Eval<'_>) -> Ordering 
 /// Результаты запроса: идентификаторы писем по порядку; `threads` — условия или сортировка по цепочкам.
 async fn run(ctx: &Ctx<'_>, a: &QueryArgs) -> MethodResult<(Vec<String>, bool)> {
     let filter = a.filter.as_ref().map(parse_filter).transpose()?;
-    let sort = a.sort.clone().unwrap_or_else(|| {
-        vec![Comparator {
-            property: "receivedAt".into(),
-            is_ascending: false,
-            collation: None,
-            keyword: None,
-        }]
-    });
-    for c in &sort {
-        if !SORT_OPTIONS.contains(&c.property.as_str()) {
-            return Err(MethodError::with("unsupportedSort", c.property.clone()));
-        }
-        if c.property.contains("Keyword") && c.keyword.is_none() {
-            return Err(MethodError::invalid("keyword required"));
-        }
-    }
+    let sort = sort_of(a)?;
     let mut conds = Vec::new();
     if let Some(f) = &filter {
         walk(f, &mut conds);
@@ -335,27 +320,61 @@ async fn run(ctx: &Ctx<'_>, a: &QueryArgs) -> MethodResult<(Vec<String>, bool)> 
             HashMap::new()
         },
     };
+    let ids = order(&msgs, filter.as_ref(), &sort, &ev, a.collapse_threads);
+    Ok((ids, uses_threads))
+}
+
+/// Сортировка запроса (по умолчанию — новые первыми); неизвестное свойство — `unsupportedSort`.
+fn sort_of(a: &QueryArgs) -> MethodResult<Vec<Comparator>> {
+    let sort = a.sort.clone().unwrap_or_else(|| {
+        vec![Comparator {
+            property: "receivedAt".into(),
+            is_ascending: false,
+            collation: None,
+            keyword: None,
+        }]
+    });
+    for c in &sort {
+        if !SORT_OPTIONS.contains(&c.property.as_str()) {
+            return Err(MethodError::with("unsupportedSort", c.property.clone()));
+        }
+        if c.property.contains("Keyword") && c.keyword.is_none() {
+            return Err(MethodError::invalid("keyword required"));
+        }
+    }
+    Ok(sort)
+}
+
+/// Порядок писем по критериям `sort`, при равенстве — по идентификатору.
+fn chain(sort: &[Comparator], x: &Message, y: &Message, ev: &Eval<'_>) -> Ordering {
+    for c in sort {
+        let o = compare(c, x, y, ev);
+        let o = if c.is_ascending { o } else { o.reverse() };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    x.id.cmp(&y.id)
+}
+
+/// Идентификаторы писем под фильтром по порядку `sort`; с `collapse` — первое письмо каждой цепочки.
+fn order(
+    msgs: &[Message],
+    filter: Option<&Filter>,
+    sort: &[Comparator],
+    ev: &Eval<'_>,
+    collapse: bool,
+) -> Vec<String> {
     let mut hits: Vec<&Message> = msgs
         .iter()
-        .filter(|m| filter.as_ref().is_none_or(|f| ev.matches(f, m)))
+        .filter(|m| filter.is_none_or(|f| ev.matches(f, m)))
         .collect();
-    hits.sort_by(|x, y| {
-        for c in &sort {
-            let o = compare(c, x, y, &ev);
-            let o = if c.is_ascending { o } else { o.reverse() };
-            if o != Ordering::Equal {
-                return o;
-            }
-        }
-        x.id.cmp(&y.id)
-    });
+    hits.sort_by(|x, y| chain(sort, x, y, ev));
     let mut seen = HashSet::new();
-    let ids = hits
-        .into_iter()
-        .filter(|m| !a.collapse_threads || seen.insert(thread_id(m)))
+    hits.into_iter()
+        .filter(|m| !collapse || seen.insert(thread_id(m)))
         .map(|m| m.id.to_string())
-        .collect();
-    Ok((ids, uses_threads))
+        .collect()
 }
 
 /// `Email/query`.
@@ -494,6 +513,141 @@ pub(crate) async fn snippet_get(
         "list": list,
         "notFound": if not_found.is_empty() { Value::Null } else { json!(not_found) },
     })))
+}
+
+/// Аргументы `Email/query` на письмах `msgs` без хранилища (цель fuzz `query`, [`crate::fuzz`]): текстовое
+/// условие находит письма, в теме которых есть его значение (без учёта регистра). Паника — нарушен инвариант:
+/// `NOT` не обращает фильтр, `AND`/`OR` из него же меняют результат, найдено не то или не в порядке
+/// сортировки, окно (`position`, `anchor`, `limit`) не часть результатов.
+pub(crate) fn fuzz(args: Map<String, Value>, msgs: &[Message], max_limit: u32) {
+    let Ok(a) = parse_args::<QueryArgs>(args) else {
+        return;
+    };
+    let Ok(filter) = a.filter.as_ref().map(parse_filter).transpose() else {
+        return;
+    };
+    let Ok(sort) = sort_of(&a) else {
+        return;
+    };
+    let mut conds = Vec::new();
+    if let Some(f) = &filter {
+        walk(f, &mut conds);
+    }
+    let mut text = HashMap::new();
+    for (field, value) in conds.iter().flat_map(|c| c.terms.iter()) {
+        let needle = value.to_lowercase();
+        let hits = msgs
+            .iter()
+            .filter(|m| {
+                let subject = m.meta.envelope.subject.as_deref().unwrap_or_default();
+                subject.to_lowercase().contains(&needle)
+            })
+            .map(|m| m.id)
+            .collect();
+        text.insert((field.clone(), value.clone()), hits);
+    }
+    let ev = Eval {
+        text,
+        threads: threads(msgs),
+    };
+    if let (Some(f), Some(v)) = (&filter, &a.filter) {
+        let _ = text_of(f);
+        for (op, conditions) in [
+            ("NOT", json!([v])),
+            ("AND", json!([v, v])),
+            ("OR", json!([v])),
+        ] {
+            let Ok(w) = parse_filter(&json!({ "operator": op, "conditions": conditions })) else {
+                panic!("{op} из разобранного фильтра не разобран: {v}");
+            };
+            for m in msgs {
+                let expect = ev.matches(f, m) != (op == "NOT");
+                assert_eq!(ev.matches(&w, m), expect, "{op}: {v}");
+            }
+        }
+    }
+    let ids = order(msgs, filter.as_ref(), &sort, &ev, a.collapse_threads);
+    let by_id: HashMap<String, &Message> = msgs.iter().map(|m| (m.id.to_string(), m)).collect();
+    let found: Vec<&Message> = ids
+        .iter()
+        .map(|id| *by_id.get(id).unwrap_or_else(|| panic!("чужое письмо {id}")))
+        .collect();
+    let matching: Vec<&Message> = msgs
+        .iter()
+        .filter(|m| filter.as_ref().is_none_or(|f| ev.matches(f, m)))
+        .collect();
+    let expected = if a.collapse_threads {
+        matching
+            .iter()
+            .map(|m| thread_id(m))
+            .collect::<HashSet<_>>()
+            .len()
+    } else {
+        matching.len()
+    };
+    assert_eq!(ids.len(), expected, "найдено писем");
+    assert_eq!(
+        ids.iter().collect::<HashSet<_>>().len(),
+        ids.len(),
+        "повтор"
+    );
+    for pair in found.windows(2) {
+        assert_eq!(
+            chain(&sort, pair[0], pair[1], &ev),
+            Ordering::Less,
+            "порядок"
+        );
+    }
+    window(&ids, &a.window, max_limit);
+}
+
+/// Окно `/query` над `ids`: страница — отрезок результатов с нужной позиции, не длиннее `limit`.
+fn window(ids: &[String], w: &QueryWindow, max_limit: u32) {
+    let mut out = Map::new();
+    if apply_window(ids, w, max_limit, &mut out).is_err() {
+        assert!(
+            w.anchor.as_ref().is_some_and(|x| !ids.contains(x)),
+            "ошибка окна без чужого якоря"
+        );
+        return;
+    }
+    let len = ids.len();
+    let pos = out
+        .get("position")
+        .and_then(Value::as_u64)
+        .and_then(|p| usize::try_from(p).ok())
+        .unwrap_or_else(|| panic!("position: {out:?}"));
+    let page: Vec<String> = out
+        .get("ids")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_else(|| panic!("ids: {out:?}"));
+    let cap = u64::from(max_limit);
+    let limit = usize::try_from(w.limit.unwrap_or(cap).min(cap)).unwrap_or(usize::MAX);
+    assert!(pos <= len, "position {pos} > {len}");
+    assert_eq!(
+        page,
+        ids[pos..len.min(pos.saturating_add(limit))],
+        "страница"
+    );
+    let signed = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    let expect = match &w.anchor {
+        Some(anchor) => ids
+            .iter()
+            .position(|id| id == anchor)
+            .map(|at| signed(at).saturating_add(w.anchor_offset)),
+        None if w.position < 0 => Some(signed(len).saturating_add(w.position)),
+        None => Some(w.position),
+    };
+    let expect = expect.map(|p| usize::try_from(p.max(0)).unwrap_or(usize::MAX).min(len));
+    assert_eq!(Some(pos), expect, "позиция окна");
+    assert_eq!(
+        out.get("total").and_then(Value::as_u64),
+        w.calculate_total.then_some(len as u64),
+        "total"
+    );
+    if w.limit.is_some_and(|l| l > cap) {
+        assert_eq!(out.get("limit").and_then(Value::as_u64), Some(cap), "limit");
+    }
 }
 
 #[cfg(test)]
