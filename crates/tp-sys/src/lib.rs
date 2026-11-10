@@ -10,7 +10,7 @@ pub mod socket;
 
 pub use confine::{
     ConfineConfig, ConfineError, ConfineReport, Confinement, LandlockOutcome, Profile, RolePaths,
-    SeccompMode,
+    SeccompMode, landlock_abi,
 };
 pub use psi::{PsiError, PsiFile, PsiStall, PsiThreshold, PsiTrigger};
 pub use resources::{
