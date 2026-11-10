@@ -7,6 +7,7 @@
 //! - [`dkim_sign`] — DKIM-подпись исходящей почты;
 //! - [`dsn`] — уведомления о доставке (RFC 3464);
 //! - [`groups`] — группы рассылки при приёме: ограничения отправителей, модерация, раскрытие;
+//! - [`learn`] — обучение антиспама (Rspamd controller) по перемещению писем в «Спам» и из него;
 //! - [`limits`] — лимиты отправки учётной записи в час;
 //! - [`metrics`] — метрики сессий и очереди (`/metrics`);
 //! - [`milter`] — фильтры Milter (антиспам, антивирус) после приёма письма;
@@ -25,6 +26,7 @@ pub mod deliver;
 pub mod dkim_sign;
 pub mod dsn;
 pub mod groups;
+pub mod learn;
 pub mod limits;
 pub mod metrics;
 pub mod milter;
