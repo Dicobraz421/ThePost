@@ -3,6 +3,7 @@
 //! Проверки: MX основного домена (и указывает ли он на `smtp.hostname`), SPF, DKIM по селекторам
 //! `smtp.dkim.domains`, DMARC, MTA-STS, PTR исходящих адресов (`smtp.queue.source_ip` или адреса
 //! `smtp.hostname`), срок и имена сертификата `tls`, слушатели с PROXY protocol v2 за балансировщиком.
+//! Имена зон RFC 6761 (`.test`, `.example`, `.invalid`, `.localhost`) — проверки DNS пропускаются (SKIP, CMP-09).
 //! DNS — через [`Dns`]: в работе — системный резолвер (`mail-auth`), в тестах — подстановка.
 
 use std::net::IpAddr;
@@ -147,6 +148,33 @@ fn tagged<'a>(records: &'a [String], tag: &str) -> Option<&'a String> {
         .find(|r| r.to_ascii_lowercase().contains(&tag))
 }
 
+/// Зоны для тестов и примеров (RFC 6761): в публичном DNS записей у их имён нет и не будет.
+const RESERVED_ZONES: [&str; 4] = ["test", "example", "invalid", "localhost"];
+
+/// Зона RFC 6761, в которой лежит имя `name`.
+fn reserved_zone(name: &str) -> Option<&'static str> {
+    let tld = name.trim_end_matches('.').rsplit('.').next()?;
+    RESERVED_ZONES
+        .into_iter()
+        .find(|z| tld.eq_ignore_ascii_case(z))
+}
+
+/// Имя `name` — в зарезервированной зоне: проверка `id` пропущена (`true`).
+fn skip_reserved(id: &str, name: &str, report: &mut Report) -> bool {
+    let Some(zone) = reserved_zone(name) else {
+        return false;
+    };
+    report.push(
+        id,
+        Status::Skipped,
+        name,
+        format!(
+            "зона .{zone} зарезервирована (RFC 6761): в публичном DNS записей нет, проверка пропущена"
+        ),
+    );
+    true
+}
+
 /// Все проверки DNS, сертификатов и PROXY v2.
 pub async fn check(cfg: &Config, dns: &dyn Dns, doctor: &DoctorSection, report: &mut Report) {
     let smtp = cfg
@@ -167,6 +195,9 @@ pub async fn check(cfg: &Config, dns: &dyn Dns, doctor: &DoctorSection, report: 
 
 async fn mx(domain: &str, smtp: &SmtpConfig, dns: &dyn Dns, t: Duration, report: &mut Report) {
     let id = "dns.mx";
+    if skip_reserved(id, domain, report) {
+        return;
+    }
     match query(t, dns.mx(domain)).await {
         Err(e) => report.push(id, Status::Fail, domain, format!("MX не получены: {e}")),
         Ok(list) if list.is_empty() => report.push(
@@ -206,6 +237,9 @@ async fn mx(domain: &str, smtp: &SmtpConfig, dns: &dyn Dns, t: Duration, report:
 
 async fn spf(domain: &str, dns: &dyn Dns, t: Duration, report: &mut Report) {
     let id = "dns.spf";
+    if skip_reserved(id, domain, report) {
+        return;
+    }
     match query(t, dns.txt(domain)).await {
         Err(e) => report.push(id, Status::Fail, domain, format!("TXT не получены: {e}")),
         Ok(list) => match tagged(&list, "v=spf1") {
@@ -239,6 +273,9 @@ async fn dkim(smtp: &SmtpConfig, dns: &dyn Dns, t: Duration, report: &mut Report
     for (domain, d) in &smtp.dkim.domains {
         let id = format!("dns.dkim.{domain}");
         let name = format!("{}._domainkey.{domain}", d.selector);
+        if skip_reserved(&id, &name, report) {
+            continue;
+        }
         match query(t, dns.txt(&name)).await {
             Err(e) => report.push(&id, Status::Fail, name, format!("TXT не получены: {e}")),
             Ok(list) if list.iter().any(|r| r.contains("p=")) => {
@@ -257,6 +294,9 @@ async fn dkim(smtp: &SmtpConfig, dns: &dyn Dns, t: Duration, report: &mut Report
 async fn dmarc(domain: &str, dns: &dyn Dns, t: Duration, report: &mut Report) {
     let id = "dns.dmarc";
     let name = format!("_dmarc.{domain}");
+    if skip_reserved(id, &name, report) {
+        return;
+    }
     match query(t, dns.txt(&name)).await {
         Err(e) => report.push(id, Status::Fail, name, format!("TXT не получены: {e}")),
         Ok(list) => match tagged(&list, "v=dmarc1") {
@@ -274,6 +314,9 @@ async fn dmarc(domain: &str, dns: &dyn Dns, t: Duration, report: &mut Report) {
 async fn mta_sts(domain: &str, dns: &dyn Dns, t: Duration, report: &mut Report) {
     let id = "dns.mta_sts";
     let name = format!("_mta-sts.{domain}");
+    if skip_reserved(id, &name, report) {
+        return;
+    }
     match query(t, dns.txt(&name)).await {
         Err(e) => report.push(id, Status::Fail, name, format!("TXT не получены: {e}")),
         Ok(list) => match tagged(&list, "v=stsv1") {
@@ -303,6 +346,9 @@ async fn ptr(smtp: &SmtpConfig, dns: &dyn Dns, t: Duration, report: &mut Report)
             host,
             "smtp.hostname не задан: приветствие и PTR не совпадут, почту узла примут за спам",
         );
+        return;
+    }
+    if skip_reserved(id, host, report) {
         return;
     }
     let ips = match smtp.queue.source_ip {
@@ -591,11 +637,15 @@ mod tests {
     const CERT: &[u8] = include_bytes!("testdata/cert.pem");
 
     fn config(extra: &str) -> Config {
+        config_for("example.org", extra)
+    }
+
+    fn config_for(domain: &str, extra: &str) -> Config {
         sections::registry()
             .expect("registry")
             .parse(
                 &format!(
-                    "domain: example.org\nprofile: dev\ndatabase:\n  url: postgres://x@y/z?sslmode=disable\n  tls: {{ allow_plaintext: true }}\n\
+                    "domain: {domain}\nprofile: dev\ndatabase:\n  url: postgres://x@y/z?sslmode=disable\n  tls: {{ allow_plaintext: true }}\n\
                      blob:\n  url: file:///tmp/b\n{extra}"
                 ),
                 Vec::new(),
@@ -656,6 +706,43 @@ mod tests {
             assert_eq!(status(&r, id), Some(Status::Ok), "{id}: {r:?}");
         }
         assert_eq!(status(&r, "proxy.v2"), Some(Status::Skipped));
+    }
+
+    #[tokio::test]
+    async fn reserved_zones_skipped() {
+        // Эталон `--profile smb`: домен и узел в зоне .test — проверки DNS пропущены, а не провалены.
+        let cfg = config_for(
+            "example.test",
+            "smtp:\n  hostname: mail.example.test\n  dkim:\n    domains:\n      example.test:\n        selector: s1\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n",
+        );
+        let failing = MockDns {
+            fail: Some("SERVFAIL".into()),
+            ..MockDns::default()
+        };
+        let r = run(&cfg, &failing).await;
+        for id in [
+            "dns.mx",
+            "dns.spf",
+            "dns.dkim.example.test",
+            "dns.dmarc",
+            "dns.mta_sts",
+            "dns.ptr",
+        ] {
+            assert_eq!(status(&r, id), Some(Status::Skipped), "{id}: {r:?}");
+        }
+        let mx = r.get("dns.mx").expect("mx");
+        assert!(mx.message.contains("RFC 6761"), "{mx:?}");
+
+        for (name, zone) in [
+            ("a.EXAMPLE.", Some("example")),
+            ("x.invalid", Some("invalid")),
+            ("app.localhost", Some("localhost")),
+            ("example.org", None),
+            ("testing.org", None),
+            ("", None),
+        ] {
+            assert_eq!(reserved_zone(name), zone, "{name}");
+        }
     }
 
     #[tokio::test]

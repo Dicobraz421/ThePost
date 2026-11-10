@@ -39,7 +39,9 @@ use tp_sys::{NodeResources, ResourcesConfig};
 
 use crate::infra;
 use crate::modules;
-use crate::protocols::{Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, SmtpRole, Sockets};
+use crate::protocols::{
+    Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, LogPause, SmtpRole, Sockets,
+};
 use crate::roles::{Maintenance, PendingRole};
 use crate::secrets;
 use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection, HttpSection};
@@ -262,6 +264,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let mut setup = RoleSetup {
         cfg: &cfg,
         services: &services,
+        metrics: &metrics,
         ext: &ext,
         certs: certs.clone(),
         sockets: Sockets::new(bound.clone()),
@@ -362,6 +365,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
 struct RoleSetup<'a> {
     cfg: &'a Config,
     services: &'a Services,
+    metrics: &'a Metrics,
     ext: &'a tp_contracts::ext::Registry,
     certs: Option<Arc<TlsCerts>>,
     sockets: Sockets,
@@ -438,13 +442,16 @@ impl RoleSetup<'_> {
             Role::Search => (Arc::new(InProcessRole(role)), fixed_config(())),
             Role::Indexer => {
                 let search = self.cfg.section::<SearchConfig>(sections::SEARCH)?;
+                let indexer = Arc::new(self.services.indexer(&search));
+                crate::metrics::register_indexer(self.metrics, indexer.clone());
                 let service = IndexerRole::new(
                     self.events.clone(),
-                    self.services.indexer(&search),
+                    indexer,
                     self.services.rebuilder(&search),
                     self.services.meta.clone(),
                     self.events_poll,
                     self.cfg.section::<ClusterSection>(CLUSTER)?.rebuild_scan,
+                    LogPause::from(&search.indexer),
                 );
                 (Arc::new(service), fixed_config(()))
             }
