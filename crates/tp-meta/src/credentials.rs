@@ -27,6 +27,7 @@ use tp_contracts::config::duration;
 use tp_contracts::secrets::{Secret, SecretLease, SecretRef, SecretStore};
 use tp_contracts::{Error, Result};
 
+use crate::failover::retarget;
 use crate::pool::{PoolConfig, fetch_secret};
 
 /// Секция `database.dynamic_credentials`: логин и пароль из одной выдачи database secrets engine.
@@ -131,13 +132,27 @@ pub(crate) async fn issue(dc: &DynamicCredentials, secrets: &dyn SecretStore) ->
     })
 }
 
-/// Время последней смены учётных данных: соединения, открытые раньше, пул закрывает при выдаче.
+/// Время последней смены параметров соединения (учётные данные, адрес primary — [`crate::failover`]):
+/// соединения, открытые раньше, пул закрывает при выдаче.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Rotated(Arc<Mutex<Option<Instant>>>);
 
 impl Rotated {
+    #[cfg(test)]
     fn mark(&self) {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// Новые соединения `pool` — с параметрами `next(текущие)`; открытые раньше закрываются при выдаче.
+    /// Смены учётных данных и адреса не теряют друг друга: чтение и запись параметров — под одной блокировкой.
+    pub(crate) fn replace(
+        &self,
+        pool: &PgPool,
+        next: impl FnOnce(&PgConnectOptions) -> PgConnectOptions,
+    ) {
+        let mut at = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        pool.set_connect_options(next(&pool.connect_options()));
+        *at = Some(Instant::now());
     }
 
     /// Соединение возрастом `age` открыто с текущими учётными данными.
@@ -252,8 +267,9 @@ impl Rotation {
         let opts = self
             .cfg
             .connect_options(&self.cfg.url, self.cfg.pgbouncer)?;
-        self.pool.set_connect_options(next.apply(opts));
-        self.rotated.mark();
+        // Адрес — текущего primary (после переключения он может отличаться от `url`).
+        self.rotated
+            .replace(&self.pool, |cur| retarget(next.apply(opts), cur));
         tracing::info!("database.dynamic_credentials: учётные данные обновлены");
         Ok(())
     }

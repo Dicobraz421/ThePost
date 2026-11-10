@@ -124,7 +124,8 @@ pub async fn begin_system(pool: &PgPool) -> Result<Transaction<'static, Postgres
     Ok(tx)
 }
 
-/// Ошибка sqlx → ошибка границы крейта.
+/// Ошибка sqlx → ошибка границы крейта. Обрыв, `25006` (сервер только для чтения — бывший primary) и
+/// `57P01` (остановка сервера) — `Unavailable`: признаки переключения СУБД ([`crate::failover`]).
 pub fn db_err(e: sqlx::Error) -> Error {
     match &e {
         sqlx::Error::RowNotFound => Error::NotFound,
@@ -138,7 +139,14 @@ pub fn db_err(e: sqlx::Error) -> Error {
                 if c.starts_with("08")
                     || matches!(
                         c,
-                        "40001" | "40P01" | "53300" | "55P03" | "57P01" | "57P02" | "57P03"
+                        "25006"
+                            | "40001"
+                            | "40P01"
+                            | "53300"
+                            | "55P03"
+                            | "57P01"
+                            | "57P02"
+                            | "57P03"
                     ) =>
             {
                 Error::UNAVAILABLE

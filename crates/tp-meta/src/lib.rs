@@ -13,6 +13,7 @@ pub mod credentials;
 pub mod delivery;
 pub mod doctor;
 pub mod events;
+pub mod failover;
 pub mod groups;
 pub mod index_manifest;
 pub mod lease;
