@@ -257,6 +257,11 @@ impl BusSection {
 pub struct ClusterSection {
     /// Имя узла в членстве кластера, постоянное для узла; не задано — имя хоста. Требует перезапуска.
     pub node_id: Option<String>,
+    /// Площадка (ЦОД) узла в членстве кластера; по умолчанию `default` (одна площадка).
+    pub site: String,
+    /// Внутренний адрес служебного канала узла для запросов узел → узел (`https://host:port`), объявляется в
+    /// записи узла; пусто — узел запросов не принимает.
+    pub addr: String,
     /// Период опроса журнала событий подписчиками узла.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -270,6 +275,8 @@ impl Default for ClusterSection {
     fn default() -> Self {
         Self {
             node_id: None,
+            site: tp_contracts::membership::SiteId::DEFAULT.to_owned(),
+            addr: String::new(),
             events_poll_interval: Duration::from_secs(1),
             rebuild_scan: 64,
         }
@@ -277,10 +284,29 @@ impl Default for ClusterSection {
 }
 
 impl ClusterSection {
-    /// Проверка: имя узла (если задано) и ненулевые периоды.
+    /// Площадка узла.
+    pub fn site_id(&self) -> Result<tp_contracts::membership::SiteId> {
+        tp_contracts::membership::SiteId::new(self.site.clone())
+            .map_err(|e| Error::invalid(format!("site: {e}")))
+    }
+
+    /// Проверка: имя узла (если задано), площадка, адрес (пусто или `https://host:port`) и ненулевые периоды.
     pub fn check(&self) -> Result<()> {
         if let Some(node) = &self.node_id {
             tp_contracts::membership::NodeId::new(node.clone())?;
+        }
+        self.site_id()?;
+        if !self.addr.is_empty() {
+            let host = self.addr.strip_prefix("https://").unwrap_or_default();
+            if host.is_empty()
+                || host.contains(['/', '?', '#'])
+                || host.chars().any(char::is_whitespace)
+            {
+                return Err(Error::invalid(format!(
+                    "addr: ожидается https://host:port, получено {:?}",
+                    self.addr
+                )));
+            }
         }
         if self.events_poll_interval.is_zero() {
             return Err(Error::invalid("период опроса должен быть больше нуля"));
@@ -631,6 +657,30 @@ blob:
         );
         for bad in ["", "file://relative", "s3://", "/var/lib", "http://x"] {
             assert!(loc(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cluster_site_and_addr_are_checked() {
+        let c = parse(&format!(
+            "{MINIMAL_DEV}cluster:\n  site: dc-1\n  addr: https://10.0.0.1:7443\n"
+        ))
+        .expect("config");
+        let cluster = c.section::<ClusterSection>(CLUSTER).expect("cluster");
+        assert_eq!(cluster.site_id().expect("site").as_str(), "dc-1");
+        assert_eq!(cluster.addr, "https://10.0.0.1:7443");
+        let d = ClusterSection::default();
+        assert_eq!(d.site_id().expect("site").as_str(), "default");
+        assert!(d.addr.is_empty());
+        for bad in [
+            "  site: \"dc 1\"\n",
+            "  site: \"\"\n",
+            "  addr: http://x:1\n",
+            "  addr: https://\n",
+            "  addr: https://x/p\n",
+        ] {
+            let e = err(parse(&format!("{MINIMAL_DEV}cluster:\n{bad}")));
+            assert!(e.contains("site") || e.contains("addr"), "{bad}: {e}");
         }
     }
 
