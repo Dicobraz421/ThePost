@@ -140,7 +140,7 @@ async fn add_mailbox(meta: &PgMeta, scope: AccountScope, name: &str) {
 async fn drain(a: (&EventConsumer, &Recorder), b: (&EventConsumer, &Recorder)) {
     for _ in 0..100 {
         let (ra, rb) = tokio::join!(a.0.poll(a.1), b.0.poll(b.1));
-        if ra.expect("poll a") == 0 && rb.expect("poll b") == 0 {
+        if ra.expect("poll a").handled == 0 && rb.expect("poll b").handled == 0 {
             return;
         }
     }
@@ -219,7 +219,7 @@ async fn partitions_follow_membership() {
     assigner.refresh().await;
     assert!(ca.assigned(&subscriber).is_empty(), "узел вне состава");
     // Следующий проход a отдаёт лизы снятых разделов, ничего не обрабатывая.
-    assert_eq!(ca.poll(&sa).await.expect("poll a"), 0);
+    assert_eq!(ca.poll(&sa).await.expect("poll a").handled, 0);
     assert!(ca.held(&subscriber).is_empty());
     assert_eq!(cb.assigned(&subscriber), parts);
     // b получает разделы a сразу, не дожидаясь срока лиз.

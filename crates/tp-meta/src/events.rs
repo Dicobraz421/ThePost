@@ -9,10 +9,13 @@
 //! позиция → пачка → [`EventSink::handle`] → продление лизы → фиксация позиции. Сбой до фиксации —
 //! пачка придёт снова (не менее одного раза); порядок внутри раздела, а значит и ящика, сохраняется.
 //! Между экземплярами разделы распределяет [`PartitionAssigner`] по живым узлам ([`crate::membership`]).
+//! Ошибка раздела в [`EventConsumer::poll`] не прерывает проход: раздел повторяется не раньше своего
+//! срока — пауза растёт вдвое от [`EventsConfig::retry_min`] до [`EventsConfig::retry_max`] (SRS 2.8),
+//! ближайший срок — в [`PollReport::retry_in`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -49,6 +52,15 @@ pub struct EventsConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub node_ttl: Duration,
+    /// Первая пауза перед повтором раздела, опрос которого завершился ошибкой; каждая следующая
+    /// ошибка подряд удваивает паузу (не больше [`EventsConfig::retry_max`]).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub retry_min: Duration,
+    /// Наибольшая пауза перед повтором раздела с ошибкой; ограничивает и `retry_after` ошибки.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub retry_max: Duration,
 }
 
 impl EventsConfig {
@@ -65,6 +77,8 @@ impl Default for EventsConfig {
             lease_ttl: Duration::from_secs(30),
             purge_batch: 10_000,
             node_ttl: Duration::from_secs(15),
+            retry_min: Duration::from_secs(1),
+            retry_max: Duration::from_secs(60),
         }
     }
 }
@@ -214,6 +228,45 @@ struct Assignment {
 /// Лизы разделов, которые держит экземпляр: (подписчик, раздел) → последняя полученная лиза.
 type Held = HashMap<(String, u32), Lease>;
 
+/// Повтор раздела с ошибкой: ошибок подряд и срок, раньше которого раздел не опрашивается.
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    failures: u32,
+    due: Instant,
+}
+
+/// Разделы с ошибкой: (подписчик, раздел) → повтор.
+type Retries = HashMap<(String, u32), Retry>;
+
+/// Итог прохода [`EventConsumer::poll`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PollReport {
+    /// Обработано и зафиксировано событий.
+    pub handled: usize,
+    /// Разделы, опрос которых в этом проходе завершился ошибкой (позиция не сдвинута).
+    pub failed: Vec<(Partition, Error)>,
+    /// Разделов с ошибкой, пропущенных до срока повтора.
+    pub deferred: usize,
+    /// Через сколько наступит ближайший срок повтора раздела с ошибкой; `None` — таких разделов нет.
+    pub retry_in: Option<Duration>,
+}
+
+/// Пауза перед повтором после `failures` ошибок подряд: `retry_min · 2^(failures−1)`, не меньше
+/// `retry_after` ошибки и не больше `retry_max`.
+fn retry_pause(cfg: &EventsConfig, failures: u32, err: &Error) -> Duration {
+    let factor = 1u32
+        .checked_shl(failures.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    let mut pause = cfg.retry_min.saturating_mul(factor);
+    if let Error::Unavailable {
+        retry_after: Some(after),
+    } = err
+    {
+        pause = pause.max(*after);
+    }
+    pause.min(cfg.retry_max.max(cfg.retry_min))
+}
+
 /// Обработчик разделов журнала для подписчиков одного экземпляра (узла и процесса).
 ///
 /// Раздел подписчика обрабатывает один экземпляр — держатель лизы; лиза не освобождается между
@@ -231,6 +284,7 @@ pub struct EventConsumer {
     cfg: EventsConfig,
     assignment: Option<Assignment>,
     held: Arc<Mutex<Held>>,
+    retries: Arc<Mutex<Retries>>,
 }
 
 impl std::fmt::Debug for EventConsumer {
@@ -258,6 +312,7 @@ impl EventConsumer {
             cfg,
             assignment: None,
             held: Arc::new(Mutex::new(HashMap::new())),
+            retries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -342,21 +397,77 @@ impl EventConsumer {
         Ok(Some(batch.len()))
     }
 
-    /// Одна пачка каждого раздела, назначенного этому экземпляру; возвращает число обработанных событий.
+    /// Одна пачка каждого раздела, назначенного этому экземпляру.
     /// Сначала отдаёт лизы разделов, снятых с экземпляра (их пачки уже зафиксированы предыдущим проходом).
-    /// Ошибка подписчика в разделе прерывает проход (разделы после него — в следующем).
-    pub async fn poll(&self, sink: &dyn EventSink) -> Result<usize> {
-        let assigned = self.assigned(sink.name());
-        for p in self.held(sink.name()) {
-            if assigned.binary_search(&p).is_err() {
-                self.release(sink.name(), p).await?;
+    ///
+    /// Ошибка раздела не прерывает проход: она попадает в [`PollReport::failed`] (и в `warn` — один раз
+    /// за попытку, то есть не чаще раза за паузу), позиция раздела не меняется, а сам раздел до срока
+    /// повтора пропускается (SRS 2.8; паузы — [`EventsConfig::retry_min`], [`EventsConfig::retry_max`]).
+    /// Успешный опрос раздела сбрасывает паузу. Ошибка всего прохода сейчас не возникает.
+    pub async fn poll(&self, sink: &dyn EventSink) -> Result<PollReport> {
+        let subscriber = sink.name();
+        let assigned = self.assigned(subscriber);
+        let mut report = PollReport::default();
+        for p in self.held(subscriber) {
+            if assigned.binary_search(&p).is_err()
+                && let Err(e) = self.release(subscriber, p).await
+            {
+                tracing::warn!(subscriber, partition = p.0, error = %e, "лиза раздела не отдана");
+                report.failed.push((p, e));
             }
         }
-        let mut total = 0;
+        // Разделы, снятые с экземпляра, больше не повторяются здесь.
+        self.retries_map()
+            .retain(|(s, p), _| s != subscriber || assigned.binary_search(&Partition(*p)).is_ok());
         for p in assigned {
-            total += self.poll_assigned(sink, p).await?.unwrap_or(0);
+            let key = (subscriber.to_owned(), p.0);
+            let now = Instant::now();
+            let retry = self.retries_map().get(&key).copied();
+            if let Some(r) = retry
+                && r.due > now
+            {
+                report.deferred += 1;
+                continue;
+            }
+            match self.poll_assigned(sink, p).await {
+                Ok(n) => {
+                    self.retries_map().remove(&key);
+                    report.handled += n.unwrap_or(0);
+                }
+                Err(e) => {
+                    let failures = retry.map_or(0, |r| r.failures).saturating_add(1);
+                    let pause = retry_pause(&self.cfg, failures, &e);
+                    tracing::warn!(
+                        subscriber,
+                        partition = p.0,
+                        failures,
+                        retry_in = ?pause,
+                        error = %e,
+                        "раздел журнала не обработан, повтор по сроку"
+                    );
+                    self.retries_map().insert(
+                        key,
+                        Retry {
+                            failures,
+                            due: Instant::now() + pause,
+                        },
+                    );
+                    report.failed.push((p, e));
+                }
+            }
         }
-        Ok(total)
+        report.retry_in = self.retry_in(subscriber);
+        Ok(report)
+    }
+
+    /// Через сколько наступит ближайший срок повтора раздела подписчика с ошибкой (`ZERO` — уже).
+    pub fn retry_in(&self, subscriber: &str) -> Option<Duration> {
+        let now = Instant::now();
+        self.retries_map()
+            .iter()
+            .filter(|((s, _), _)| s == subscriber)
+            .map(|(_, r)| r.due.saturating_duration_since(now))
+            .min()
     }
 
     /// Отдаёт все лизы подписчика (штатная остановка): разделы переходят к другим узлам без ожидания срока.
@@ -382,8 +493,141 @@ impl EventConsumer {
         Ok(())
     }
 
+    fn retries_map(&self) -> MutexGuard<'_, Retries> {
+        // Как и `held`: каждая правка карты — одна операция.
+        self.retries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn held_map(&self) -> MutexGuard<'_, Held> {
         // Карта согласована при любой панике держателя: каждая правка — одна операция.
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tp_contracts::events::partition_of;
+    use tp_testkit::infra::{MemEventLog, MemLease};
+
+    use super::*;
+
+    /// Подписчик, отказывающий в пачках раздела 0, пока `broken`.
+    struct Sink {
+        broken: AtomicBool,
+        seen: Mutex<Vec<LoggedEvent>>,
+    }
+
+    #[async_trait]
+    impl EventSink for Sink {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        async fn handle(&self, batch: &[LoggedEvent]) -> Result<()> {
+            if self.broken.load(Ordering::SeqCst) && batch.iter().any(|e| e.partition.0 == 0) {
+                return Err(Error::Unavailable {
+                    retry_after: Some(Duration::from_millis(1)),
+                });
+            }
+            self.seen.lock().expect("lock").extend_from_slice(batch);
+            Ok(())
+        }
+    }
+
+    fn event(account: AccountId) -> CoreEvent {
+        CoreEvent {
+            tenant: TenantId::new(),
+            account,
+            mailbox: None,
+            kind: CoreEventKind::MailboxCreated,
+            at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    /// Журнал с двумя разделами и событием в каждом.
+    fn log() -> Arc<MemEventLog> {
+        let log = Arc::new(MemEventLog::new(2));
+        let mut filled = [false; 2];
+        while filled != [true, true] {
+            let account = AccountId::new();
+            let p = partition_of(account, 2).0 as usize;
+            if !filled[p] {
+                log.append(event(account));
+                filled[p] = true;
+            }
+        }
+        log
+    }
+
+    fn consumer(log: Arc<MemEventLog>, retry_min: Duration) -> EventConsumer {
+        EventConsumer::new(
+            log,
+            Arc::new(MemLease::default()),
+            "a",
+            EventsConfig {
+                retry_min,
+                retry_max: retry_min * 4,
+                ..EventsConfig::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_partition_does_not_stop_pass() {
+        let sink = Sink {
+            broken: AtomicBool::new(true),
+            seen: Mutex::new(Vec::new()),
+        };
+        let c = consumer(log(), Duration::ZERO);
+        let r = c.poll(&sink).await.expect("poll");
+        assert_eq!(r.handled, 1);
+        assert_eq!(r.failed.len(), 1);
+        assert_eq!(r.failed[0].0, Partition(0));
+        assert_eq!(r.retry_in, Some(Duration::ZERO));
+
+        // Срок наступил — раздел повторяется; успех сбрасывает повтор.
+        sink.broken.store(false, Ordering::SeqCst);
+        let r = c.poll(&sink).await.expect("poll");
+        assert_eq!((r.handled, r.failed.len(), r.retry_in), (1, 0, None));
+        assert_eq!(sink.seen.lock().expect("lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_partition_waits_for_due() {
+        let sink = Sink {
+            broken: AtomicBool::new(true),
+            seen: Mutex::new(Vec::new()),
+        };
+        let c = consumer(log(), Duration::from_secs(3600));
+        assert_eq!(c.poll(&sink).await.expect("poll").failed.len(), 1);
+        sink.broken.store(false, Ordering::SeqCst);
+        let r = c.poll(&sink).await.expect("poll");
+        assert_eq!((r.handled, r.deferred, r.failed.len()), (0, 1, 0));
+        assert!(r.retry_in.expect("срок") > Duration::from_secs(3000));
+    }
+
+    #[test]
+    fn pause_doubles_up_to_max() {
+        let cfg = EventsConfig {
+            retry_min: Duration::from_secs(1),
+            retry_max: Duration::from_secs(5),
+            ..EventsConfig::default()
+        };
+        let e = Error::UNAVAILABLE;
+        let pauses: Vec<_> = (1..=5)
+            .map(|n| retry_pause(&cfg, n, &e).as_secs())
+            .collect();
+        assert_eq!(pauses, [1, 2, 4, 5, 5]);
+        assert_eq!(retry_pause(&cfg, 100, &e), Duration::from_secs(5));
+        let hinted = Error::Unavailable {
+            retry_after: Some(Duration::from_secs(3)),
+        };
+        assert_eq!(retry_pause(&cfg, 1, &hinted), Duration::from_secs(3));
+        let huge = Error::Unavailable {
+            retry_after: Some(Duration::from_secs(600)),
+        };
+        assert_eq!(retry_pause(&cfg, 1, &huge), Duration::from_secs(5));
     }
 }
