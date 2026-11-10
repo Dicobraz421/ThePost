@@ -3,7 +3,7 @@
 //! Модуль — набор крейтов под cargo feature, активируется `modules.<имя>.enabled` в config.yaml.
 //! Ядро не меняется: модуль при запуске регистрирует в [`Registry`] свои роли, capability JMAP,
 //! маршруты Admin API, подписчиков журнала событий ([`EventSink`]), точки принятия решений
-//! ([`DecisionHook`]) и реализации интерфейсов ядра ([`BlobStore`], [`Directory`], [`SearchIndex`], [`SecretStore`]).
+//! ([`DecisionHook`]), правила потока почты ([`MailFlow`]) и реализации интерфейсов ядра ([`BlobStore`], [`Directory`], [`SearchIndex`], [`SecretStore`]).
 //! Данные модуля — только в схеме PostgreSQL `mod_<имя>` с собственной последовательностью миграций.
 //!
 //! # Точки принятия решений
@@ -50,6 +50,7 @@ use crate::meta::AccountScope;
 use crate::role::{RoleService, watch};
 use crate::search::SearchIndex;
 use crate::secrets::SecretStore;
+use crate::transport::MailFlow;
 
 // ---------- Модуль ----------
 
@@ -357,6 +358,7 @@ pub struct Registry {
     directory: Option<Arc<dyn Directory>>,
     search_index: Option<Arc<dyn SearchIndex>>,
     secret_store: Option<Arc<dyn SecretStore>>,
+    mail_flow: Option<Arc<dyn MailFlow>>,
 }
 
 fn unique<T: ?Sized>(items: &[Arc<T>], key: impl Fn(&T) -> &str, new: &T) -> Result<()> {
@@ -431,6 +433,11 @@ impl Registry {
         set_once(&mut self.secret_store, store)
     }
 
+    /// Правила потока почты (модуль «Правила потока почты»); без них правила не применяются.
+    pub fn set_mail_flow(&mut self, flow: Arc<dyn MailFlow>) -> Result<()> {
+        set_once(&mut self.mail_flow, flow)
+    }
+
     /// Роли модулей.
     pub fn roles(&self) -> &[Arc<dyn RoleService>] {
         &self.roles
@@ -475,6 +482,11 @@ impl Registry {
     pub fn secret_store(&self) -> Option<Arc<dyn SecretStore>> {
         self.secret_store.clone()
     }
+
+    /// Правила потока почты, если зарегистрированы.
+    pub fn mail_flow(&self) -> Option<Arc<dyn MailFlow>> {
+        self.mail_flow.clone()
+    }
 }
 
 impl fmt::Debug for Registry {
@@ -501,6 +513,7 @@ impl fmt::Debug for Registry {
             .field("directory", &self.directory.is_some())
             .field("search_index", &self.search_index.is_some())
             .field("secret_store", &self.secret_store.is_some())
+            .field("mail_flow", &self.mail_flow.is_some())
             .finish()
     }
 }
@@ -639,6 +652,28 @@ mod tests {
         );
         assert!(reg.secret_store().is_some());
         assert!(format!("{reg:?}").contains("secret_store: true"));
+    }
+
+    struct NoRules;
+
+    #[async_trait]
+    impl MailFlow for NoRules {
+        async fn apply(
+            &self,
+            input: &crate::transport::FlowInput,
+        ) -> Result<crate::transport::FlowOutcome> {
+            Ok(crate::transport::FlowOutcome::unchanged(input))
+        }
+    }
+
+    #[test]
+    fn registry_mail_flow_once() {
+        let mut reg = Registry::default();
+        assert!(reg.mail_flow().is_none());
+        reg.set_mail_flow(Arc::new(NoRules)).expect("first");
+        assert_eq!(reg.set_mail_flow(Arc::new(NoRules)), Err(Error::Conflict));
+        assert!(reg.mail_flow().is_some());
+        assert!(format!("{reg:?}").contains("mail_flow: true"));
     }
 
     #[test]

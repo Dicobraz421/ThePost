@@ -95,13 +95,13 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 ## EventBus
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
-LogAppended { partition } | MembersChanged | Blocked { subject } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+LogAppended { partition } | MembersChanged | Blocked { subject } | TransportChanged { tenant } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
 `MailboxListChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
-`MembersChanged` — с `TenantId::DEFAULT`, `Blocked` — с организацией блокировки). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
+`MembersChanged` — с `TenantId::DEFAULT`, `Blocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
 Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер); in-memory — `MemEventBus` (отставание — `Resync`).
 Доставка — at-most-once; клиент при запуске, после переподключения и по `Resync` сверяется с хранилищем. Публикация — только после фиксации,
-вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked` — реализация `AbuseBlocks`. Набор `suite::signals`.
+вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`. Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
 ## Lease
@@ -276,19 +276,41 @@ SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, S3, узел ↔ у
 `InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
 
 ## Transport (Ф1)
-SRS 4.1, 2.6. Код — `transport.rs` (CTR-24). Настройки транспорта — данные в PostgreSQL; узлы держат снимок в памяти и перечитывают его
-по сигналу `TransportChanged { tenant: Option<TenantId> }` (`None` — уровень кластера) и при `Resync`.
-`TransportStore`: `cluster() -> ClusterTransport { version, domains: Vec<AcceptedDomain { id: DomainId, tenant, name, kind: DomainKind::{
-Authoritative, InternalRelay { next_hop } } }>, sources: Vec<TrustedSource { name, matcher: SourceMatch::{ Networks(Vec<IpNet>),
-ClientCert { subject } }, kind: SourceKind::{ Gateway { xclient, authserv_id: Option<String> }, Application { senders: Vec<AddressPattern>,
-external: bool } } }> }` — для выбора организации и источника до аутентификации; `tenant(tenant) -> TenantTransport { version,
-routes: Vec<DestinationPolicy { pattern ("*" — все внешние), tls: TlsRequirement, smart_host?, egress_ip? }> }`.
-Запись — `put_*`/`delete_*` с проверкой `version` (устаревшая — `Conflict`), публикация сигнала — после фиксации.
-`MailFlow` — точка расширения правил потока почты (реализация — модуль «Правила потока почты», `Registry::set_mail_flow`; без модуля
-не вызывается): `apply(&FlowInput { tenant, direction: Inbound | Submission, envelope, message: BlobRef }) -> FlowOutcome { verdict:
-Accept | Reject(text) | Drop | Moderate, envelope, message: Option<BlobRef>, route?, matched: Vec<String> }` — один раз на письмо
-(smtp-in после Milter, submission, JMAP EmailSubmission), до `DecisionHooks`; изменённое тело — новый объект BLOB (ссылку учитывает
-вызывающий); `route` — шаблон политики домена назначения. Правила, их хранение (схема `mod_mailflow`) и Admin API — модуль.
+SRS 4.1, 2.6; решения 2026-11-01-transport-scope-external-mta, 2026-11-01-scale-shards-geo-admin. Код — `transport.rs` (CTR-24).
+Настройки транспорта — данные основной БД PostgreSQL, Admin API; узлы держат снимки в памяти и перечитывают их по сигналу
+`TransportChanged { tenant: Option<TenantId> }` (`None` — уровень кластера, `Event::tenant` — `TenantId::DEFAULT`; сигнал —
+`transport::transport_changed(tenant)`) и при `Resync`. В config.yaml — только параметры узла.
+`TransportStore`: `cluster() -> ClusterTransport { version, domains: Vec<AcceptedDomain>, sources: Vec<TrustedSource> }` — для выбора
+организации и источника до аутентификации; `tenant(tenant) -> TenantTransport { version, routes: Vec<DestinationPolicy> }` (без записей —
+версия 0, пусто; чужие политики не видны). Списки — по возрастанию ключа.
+- `AcceptedDomain { id: DomainId, tenant, name, kind: DomainKind::{ Authoritative (по умолчанию), InternalRelay { next_hop } } }` — имя
+  уникально в кластере, каноническое (`normalize_domain`: ASCII в нижнем регистре, без точки в конце, IDN — A-label);
+  `ClusterTransport::domain(name)` — поиск без учёта регистра, поддомены — только явно.
+- `TrustedSource { name ([a-z0-9._-], ≤ 64), tenant: Option<TenantId> (None — источник кластера), matcher: SourceMatch::{ Networks(Vec<IpNet>),
+  ClientCert { subject } (dNSName проверенного сертификата mTLS) }, kind: SourceKind::{ Gateway { xclient, authserv_id: Option<String> },
+  Application { senders: Vec<AddressPattern>, external } } }`; источник приложения — только с организацией и непустыми `senders`.
+  `ClusterTransport::source(ip, cert_names)` — наиболее точный (`SourceMatch::score`: сертификат точнее подсети, длинный префикс точнее),
+  при равенстве — первый по имени. `IpNet` — подсеть со сброшенными битами узла, в JSON строка `"192.0.2.0/24"`; `AddressPattern` —
+  `user@domain` или `@domain` (все адреса домена), в JSON строка.
+- `DestinationPolicy { pattern, tls: TlsRequirement::{ Opportunistic (по умолчанию), Required, Pinned { spki_sha256 } }, smart_host?, egress_ip? }`;
+  `pattern` — ключ в организации: `example.org`, `*.example.org` (только поддомены), `*` (все внешние, relayhost).
+  `TenantTransport::route(domain)` — наиболее точный шаблон (домен → длинный суффикс → `*`), только для доменов вне принятых;
+  `policy(pattern)` — по шаблону.
+Запись — `put_domain`/`delete_domain`/`put_source`/`delete_source(expected, ..)` (версия кластера) и `put_route`/`delete_route(tenant, expected, ..)`
+(версия организации) `-> новая версия` (строго больше). Устаревшая `expected` — `Conflict` (до проверки ключа), отсутствующий ключ при
+удалении — `NotFound`, поля — `validate()` типа (`Invalid`); имя домена занято другим `id` — `Conflict`; смена организации домена или
+источника — `Invalid`. После фиксации — `transport_changed` (домены и источники — `None`, политики — организация).
+Реализация — `tp-meta`, in-memory — `MemTransport` (`with_bus`); набор `suite::transport_store`.
+
+`MailFlow` — точка расширения правил потока почты (реализация — модуль «Правила потока почты», `Registry::set_mail_flow`; правила, их
+хранение в схеме `mod_mailflow` и Admin API — модуль; без модуля не вызывается): `apply(&FlowInput { tenant, direction: FlowDirection::{
+Inbound, Submission }, principal: Option<Principal>, source: Option<String> (доверенный источник), envelope: FlowEnvelope { mail_from,
+rcpt_to }, message: BlobRef { key: BlobKey, size } }) -> FlowOutcome { verdict: FlowVerdict::{ Accept, Reject(text), Drop, Moderate {
+moderators } }, envelope, message: Option<BlobRef>, route: Option<String>, matched: Vec<String> }` (`FlowOutcome::unchanged(&input)`).
+Один раз на письмо (smtp-in после Milter, submission, JMAP EmailSubmission), до `DecisionHooks`, доставки или очереди; письмо с получателями
+нескольких организаций — вызов на организацию. Изменённое тело — новый объект BLOB, записанный модулем (ссылку учитывает вызывающий);
+`Accept` с пустым `rcpt_to` — как `Drop`; `route` — шаблон политики домена назначения организации (нет такой — обычный выбор);
+`matched` — сработавшие правила, включая режим проверки (журнал доставки). Ошибка — ошибка операции (`Unavailable` — временный отказ).
 
 ## Queue (Ф1)
 SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организаций; время передаёт вызывающий):
@@ -330,7 +352,8 @@ register(&mut Registry, &ModuleCtx) -> Result<()> }`; имя — `validate_modul
 типизированно — `ModuleCtx::config::<T: DeserializeOwned>() -> Result<T>` (ошибка полей — `Invalid`).
 `Registry`: `add_role(RoleService)`, `add_jmap_capability(JmapCapability { uri, session_object, methods, call })`,
 `add_admin_routes(AdminRoutes { prefix, handle(AdminRequest) -> AdminResponse })`, `add_event_sink`, `add_decision_hook`;
-`set_blob_store` / `set_directory` / `set_search_index` / `set_secret_store` — замена встроенной реализации. Повтор имени, URI, префикса, реализации — `Conflict`.
+`set_blob_store` / `set_directory` / `set_search_index` / `set_secret_store` — замена встроенной реализации; `set_mail_flow` — правила потока
+почты (`transport::MailFlow`, раздел Transport). Повтор имени, URI, префикса, реализации — `Conflict`.
 JSON в JMAP (`session_object`, аргументы и результат `call`) и тела Admin API модулей — `serde_json::Value`
 (`Null` — тела нет; ответ — `application/json`).
 `DecisionHook { name, before_final_delete(&FinalDelete), on_delivery(&DeliveryInfo), on_submission(&SubmissionInfo) }`, методы по умолчанию — `Allow`;
@@ -397,3 +420,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   BlockSubject}`; `InternalChannel::Valkey` удалён (проверка адреса шины Valkey — в `tp-cluster` до CLU-09). In-memory — `MemEventBus`
   (`Resync` при отставании), `MemMembership` (`NodeInfo`, `with_bus`), `MemRpcNet`/`MemRpc`, `MemAbuseBlocks`; наборы `suite::{signals,
   membership_info, rpc, abuse_blocks}`. `PgMeta::live_info` — заглушка до META-27.
+- 2026-11-10 — CTR-24 (x/contracts-13, решения 2026-11-01-transport-scope-external-mta и -scale-shards-geo-admin): `transport::{TransportStore,
+  ClusterTransport, TenantTransport, AcceptedDomain, DomainKind, TrustedSource, SourceMatch, SourceKind, DestinationPolicy, TlsRequirement,
+  IpNet, AddressPattern, normalize_domain, transport_changed}` — записи с версией снимка (устаревшая — `Conflict`); `TrustedSource::tenant`
+  (источник приложения — организации); точка расширения `transport::{MailFlow, FlowInput, FlowOutcome, FlowVerdict, FlowDirection,
+  FlowEnvelope, BlobRef}`, `Registry::set_mail_flow`/`mail_flow`; `EventKind::TransportChanged { tenant }`. In-memory — `MemTransport`
+  (`with_bus`); набор `suite::transport_store`. PostgreSQL — `tp-meta` (отдельная карточка).

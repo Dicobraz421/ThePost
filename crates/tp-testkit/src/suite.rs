@@ -1,6 +1,6 @@
 //! Общие наборы тестов контрактов: in-memory реализации testkit и настоящие реализации полос
 //! (`tp-meta` — `Membership`, `AbuseBlocks`, сигналы `EventBus`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие `BlobIndex`,
-//! «очистить корзину» `TrashStore::purge` с настройкой `trash.purge`,
+//! «очистить корзину» `TrashStore::purge` с настройкой `trash.purge`, `TransportStore`,
 //! `tp-platform` — `SecretStore`, `tp-cluster` — `Rpc`) проходят одни и те же проверки.
 //!
 //! Время в наборах идёт через [`Wait`]: для testkit — [`ManualClock`] (сдвиг без ожидания), для PostgreSQL
@@ -52,9 +52,13 @@ use tp_contracts::retention::{
 use tp_contracts::role::Role;
 use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
 use tp_contracts::secrets::{SecretLease, SecretRef, SecretStore};
+use tp_contracts::transport::{
+    AcceptedDomain, AddressPattern, DestinationPolicy, DomainKind, SourceKind, SourceMatch,
+    TenantTransport, TlsRequirement, TransportStore, TrustedSource,
+};
 use tp_contracts::{
-    AccountId, BlobHash, BlobKey, Error, Gen, GroupId, HeldId, MailboxId, MessageId, QueueId,
-    TenantId,
+    AccountId, BlobHash, BlobKey, DomainId, Error, Gen, GroupId, HeldId, MailboxId, MessageId,
+    QueueId, TenantId,
 };
 
 use crate::ManualClock;
@@ -1790,4 +1794,212 @@ pub async fn trash_purge(
 
     policies.set_user_trash_purge(s, None).await.expect("reset");
     admin.set_tenant_rule(s.tenant, None).await;
+}
+
+// ---------- TransportStore ----------
+
+/// Набор проверок `TransportStore` (CTR-24): версии снимков (устаревшая — `Conflict`), ключи записей, проверка полей,
+/// изоляция снимков организаций. Пустой кластер не требуется: домены и источники набора — с уникальными именами,
+/// набор удаляет их в конце. Набор пишет уровень кластера — параллельные писатели кластерных настроек дадут `Conflict`.
+pub async fn transport_store(store: &dyn TransportStore) {
+    let (tenant, other) = (TenantId::new(), TenantId::new());
+    let tag = tenant.to_string().replace('-', "");
+    let tag = &tag[tag.len() - 12..];
+    let name = |n: &str| format!("{n}-{tag}.example");
+    let domain = AcceptedDomain {
+        id: DomainId::new(),
+        tenant,
+        name: name("a"),
+        kind: DomainKind::Authoritative,
+    };
+
+    // Домены: версия растёт, устаревшая — Conflict, без изменения снимка.
+    let v0 = store.cluster().await.expect("cluster").version;
+    let v1 = store.put_domain(v0, &domain).await.expect("put domain");
+    assert!(v1 > v0);
+    let snap = store.cluster().await.expect("cluster");
+    assert_eq!(snap.version, v1);
+    assert_eq!(snap.domain(&domain.name), Some(&domain));
+    let relay = AcceptedDomain {
+        kind: DomainKind::InternalRelay {
+            next_hop: "old-mail.example:25".into(),
+        },
+        ..domain.clone()
+    };
+    assert_eq!(store.put_domain(v0, &relay).await, Err(Error::Conflict));
+    assert_eq!(
+        store.cluster().await.expect("cluster").domain(&domain.name),
+        Some(&domain)
+    );
+    let v2 = store.put_domain(v1, &relay).await.expect("replace domain");
+    assert!(v2 > v1);
+    assert_eq!(
+        store.cluster().await.expect("cluster").domain(&domain.name),
+        Some(&relay)
+    );
+
+    // Имя занято другим доменом — Conflict; смена организации — Invalid; неканоничное имя — Invalid.
+    let twin = AcceptedDomain {
+        id: DomainId::new(),
+        ..domain.clone()
+    };
+    assert_eq!(store.put_domain(v2, &twin).await, Err(Error::Conflict));
+    let moved = AcceptedDomain {
+        tenant: other,
+        ..domain.clone()
+    };
+    assert!(matches!(
+        store.put_domain(v2, &moved).await,
+        Err(Error::Invalid(_))
+    ));
+    let upper = AcceptedDomain {
+        id: DomainId::new(),
+        name: name("B"),
+        ..domain.clone()
+    };
+    assert!(matches!(
+        store.put_domain(v2, &upper).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(store.cluster().await.expect("cluster").version, v2);
+
+    // Источники.
+    let source = TrustedSource {
+        name: format!("mfu-{tag}"),
+        tenant: Some(tenant),
+        matcher: SourceMatch::Networks(vec!["192.0.2.0/28".parse().expect("net")]),
+        kind: SourceKind::Application {
+            senders: vec![AddressPattern::new(&format!("scanner@{}", domain.name)).expect("p")],
+            external: false,
+        },
+    };
+    let v3 = store.put_source(v2, &source).await.expect("put source");
+    assert!(v3 > v2);
+    let snap = store.cluster().await.expect("cluster");
+    assert!(snap.sources.contains(&source));
+    let foreign = TrustedSource {
+        tenant: Some(other),
+        ..source.clone()
+    };
+    assert!(matches!(
+        store.put_source(v3, &foreign).await,
+        Err(Error::Invalid(_))
+    ));
+    let orphan = TrustedSource {
+        tenant: None,
+        name: format!("orphan-{tag}"),
+        ..source.clone()
+    };
+    assert!(matches!(
+        store.put_source(v3, &orphan).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(
+        store.delete_source(v2, &source.name).await,
+        Err(Error::Conflict)
+    );
+
+    // Политики доменов назначения: версии организаций независимы, снимок не видит чужих политик.
+    assert_eq!(store.tenant(tenant).await, Ok(TenantTransport::default()));
+    let all = DestinationPolicy {
+        pattern: "*".into(),
+        tls: TlsRequirement::Opportunistic,
+        smart_host: Some("relay.example:587".into()),
+        egress_ip: Some("198.51.100.10".parse().expect("ip")),
+    };
+    let partner = DestinationPolicy {
+        pattern: "*.partner.example".into(),
+        tls: TlsRequirement::Pinned {
+            spki_sha256: vec!["0f".repeat(32)],
+        },
+        smart_host: None,
+        egress_ip: None,
+    };
+    let t1 = store
+        .put_route(tenant, 0, &partner)
+        .await
+        .expect("put route");
+    let t2 = store.put_route(tenant, t1, &all).await.expect("put route");
+    assert!(t2 > t1 && t1 > 0);
+    let snap = store.tenant(tenant).await.expect("tenant");
+    assert_eq!(snap.version, t2);
+    assert_eq!(snap.routes, vec![all.clone(), partner.clone()]);
+    assert_eq!(snap.route("mx.partner.example"), Some(&partner));
+    assert_eq!(store.tenant(other).await, Ok(TenantTransport::default()));
+    assert_eq!(
+        store.put_route(tenant, t1, &all).await,
+        Err(Error::Conflict)
+    );
+    assert!(matches!(
+        store
+            .put_route(
+                tenant,
+                t2,
+                &DestinationPolicy {
+                    pattern: "*.".into(),
+                    ..all.clone()
+                }
+            )
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let o1 = store
+        .put_route(other, 0, &partner)
+        .await
+        .expect("other route");
+    assert_eq!(
+        store.tenant(other).await.expect("other").routes,
+        vec![partner.clone()]
+    );
+    assert_eq!(store.tenant(tenant).await.expect("tenant").version, t2);
+    assert_eq!(
+        store.delete_route(tenant, t2, "x.example").await,
+        Err(Error::NotFound)
+    );
+    let t3 = store
+        .delete_route(tenant, t2, &partner.pattern)
+        .await
+        .expect("delete route");
+    assert_eq!(
+        store.tenant(tenant).await.expect("tenant").routes,
+        vec![all.clone()]
+    );
+    assert_eq!(
+        store.tenant(other).await.expect("other").routes,
+        vec![partner.clone()]
+    );
+    store
+        .delete_route(tenant, t3, &all.pattern)
+        .await
+        .expect("delete route");
+    store
+        .delete_route(other, o1, &partner.pattern)
+        .await
+        .expect("delete other route");
+
+    // Удаление: отсутствующий ключ — NotFound, устаревшая версия — Conflict.
+    let v4 = store
+        .delete_source(v3, &source.name)
+        .await
+        .expect("delete source");
+    assert_eq!(
+        store.delete_source(v4, &source.name).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        store.delete_domain(v3, domain.id).await,
+        Err(Error::Conflict)
+    );
+    let v5 = store
+        .delete_domain(v4, domain.id)
+        .await
+        .expect("delete domain");
+    assert!(v5 > v4);
+    assert_eq!(
+        store.delete_domain(v5, domain.id).await,
+        Err(Error::NotFound)
+    );
+    let snap = store.cluster().await.expect("cluster");
+    assert_eq!(snap.domain(&domain.name), None);
+    assert!(!snap.sources.iter().any(|s| s.name == source.name));
 }

@@ -86,14 +86,14 @@ impl fmt::Display for BlockSubject {
     }
 }
 
-const fn max_prefix(addr: IpAddr) -> u8 {
+pub(crate) const fn max_prefix(addr: IpAddr) -> u8 {
     match addr {
         IpAddr::V4(_) => 32,
         IpAddr::V6(_) => 128,
     }
 }
 
-fn mask(addr: IpAddr, prefix: u8) -> IpAddr {
+pub(crate) fn mask(addr: IpAddr, prefix: u8) -> IpAddr {
     match addr {
         IpAddr::V4(a) => {
             let m = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
@@ -107,7 +107,7 @@ fn mask(addr: IpAddr, prefix: u8) -> IpAddr {
 }
 
 /// `ip` в подсети `addr/prefix` (семейства адресов совпадают).
-fn in_net(addr: IpAddr, prefix: u8, ip: IpAddr) -> bool {
+pub(crate) fn in_net(addr: IpAddr, prefix: u8, ip: IpAddr) -> bool {
     addr.is_ipv4() == ip.is_ipv4()
         && prefix <= max_prefix(addr)
         && mask(addr, prefix) == mask(ip, prefix)
