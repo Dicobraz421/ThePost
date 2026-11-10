@@ -331,7 +331,7 @@ rcpt_to }, message: BlobRef { key: BlobKey, size } }) -> FlowOutcome { verdict: 
 moderators } }, envelope, message: Option<BlobRef>, route: Option<String>, matched: Vec<String> }` (`FlowOutcome::unchanged(&input)`).
 Один раз на письмо (smtp-in после Milter, submission, JMAP EmailSubmission), до `DecisionHooks`, доставки или очереди; письмо с получателями
 нескольких организаций — вызов на организацию. Изменённое тело — новый объект BLOB, записанный модулем (ссылку учитывает вызывающий);
-`Accept` с пустым `rcpt_to` — как `Drop`; `route` — шаблон политики домена назначения организации (нет такой — обычный выбор);
+`Reject` — SMTP 550, JMAP `forbiddenToSend` (RFC 8621); `Accept` с пустым `rcpt_to` — как `Drop`; `route` — шаблон политики домена назначения организации (нет такой — обычный выбор);
 `matched` — сработавшие правила, включая режим проверки (журнал доставки). Ошибка — ошибка операции (`Unavailable` — временный отказ).
 
 ## Queue (Ф1)
@@ -471,3 +471,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   псевдоним каталога `@domain` (`DirAlias::address`); `QueueStore::postpone` — перенос получателя без `attempts` + 1. Методы по умолчанию —
   `Internal`. In-memory — `MemTransport`, `MemQueue`; наборы `suite::{transport_rewrites, queue_postpone}`. Хранение в `tp-meta`
   (`PgMeta` — пустая таблица до волны meta), переход `tp-smtp` — волны полос.
+- 2026-11-10 — CTR-40: ответ JMAP на `FlowVerdict::Reject` и `Decision::Deny` при отправке — `forbiddenToSend` (RFC 8621, как в JMAP-10),
+  а не `forbidden`.

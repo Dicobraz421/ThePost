@@ -748,7 +748,7 @@ pub enum FlowVerdict {
     /// Продолжить обработку (точки принятия решений модулей, доставка или очередь).
     #[default]
     Accept,
-    /// Отклонить с текстом: SMTP 550 при приёме и submission, JMAP `forbidden`.
+    /// Отклонить с текстом: SMTP 550 при приёме и submission, JMAP `forbiddenToSend` (RFC 8621).
     Reject(String),
     /// Принять и удалить без уведомления.
     Drop,

@@ -215,7 +215,8 @@ pub enum Decision {
     /// Разрешить без изменений.
     #[default]
     Allow,
-    /// Запретить; причина — для журнала и ответа (SMTP 550, JMAP `forbidden`).
+    /// Запретить; причина — для журнала и ответа (SMTP 550; JMAP: отправка — `forbiddenToSend` по RFC 8621,
+    /// остальное — `forbidden`).
     Deny(String),
     /// Разрешить с дополнениями.
     Augment(Augment),
