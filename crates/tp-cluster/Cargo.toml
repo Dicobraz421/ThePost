@@ -15,8 +15,12 @@ tp-contracts.workspace = true
 schemars.workspace = true
 async-trait.workspace = true
 futures.workspace = true
-redis = { workspace = true, features = ["tokio-rustls-comp"] }
+reqwest.workspace = true
 rustls.workspace = true
+axum.workspace = true
+bytes.workspace = true
+tokio-rustls.workspace = true
+x509-parser.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
