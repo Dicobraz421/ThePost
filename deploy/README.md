@@ -116,6 +116,21 @@ docker compose -f deploy/compose/dev.yml --profile smb run --rm thepost doctor  
 `TP_SUBMISSION_PORT`, `TP_IMAP_PORT`, `TP_IMAPS_PORT`, `TP_HTTP_PORT`, `TP_HTTPS_PORT`.
 Отдельная сборка образа: `docker build -f deploy/docker/Dockerfile -t thepost .` (`--build-arg RUST_VERSION=…`).
 
+Слушатели эталона: SMTP 25 (STARTTLS), submission 587 (STARTTLS) и 465 (неявный TLS), IMAP 143 (STARTTLS) и 993,
+JMAP — HTTPS 443 (`http.jmap`); порт 80 публикуется, но не слушается. Домен — `example.test`
+(`smtp.delivery.local_domains`). Сертификат — `fullchain.pem`/`privkey.pem` тома `tls` от `tls-init`
+(SAN: `localhost`, `thepost`, `mail.example.test`), CA для клиентов — `deploy/compose/tls/ca.pem`.
+Проверка эталона (полная — `docs/manual-tests/CMP-01.md`):
+```bash
+CA=deploy/compose/tls/ca.pem
+openssl s_client -connect localhost:465 -CAfile $CA -verify_return_error </dev/null   # 220 mail.example.test, код 0
+openssl s_client -connect localhost:587 -starttls smtp -CAfile $CA </dev/null         # то же для 25
+openssl s_client -connect localhost:993 -CAfile $CA -verify_return_error </dev/null   # * OK; 143 — -starttls imap
+curl --cacert $CA -si https://localhost/.well-known/jmap | head -1                     # HTTP/1.1 401 без учётной записи
+```
+Письмо между двумя пользователями: учётные записи `a@example.test`, `b@example.test` (способ — issue #193), отправка
+через 587 с AUTH, получение через IMAP или JMAP — шаги в `docs/manual-tests/CMP-01.md` (после CMP-04, CMP-05).
+
 ## Установка под systemd (SMB, Enterprise-ВМ)
 ```bash
 sudo install -m 0755 target/release/thepost /usr/local/bin/thepost

@@ -109,6 +109,8 @@ pub struct Jmap {
     pub(crate) cfg: JmapConfig,
     inflight: Slots,
     uploads: Slots,
+    /// Загруженные файлы учётных записей (владелец blob `U…`).
+    pub(crate) uploaded: crate::blob::Uploads,
     stop: watch::Sender<bool>,
 }
 
@@ -213,6 +215,7 @@ impl Jmap {
             cfg,
             inflight: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
+            uploaded: crate::blob::Uploads::default(),
             stop: watch::channel(false).0,
         })
     }

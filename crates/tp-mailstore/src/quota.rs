@@ -448,7 +448,7 @@ mod tests {
                     self.scope,
                     NewMailbox {
                         parent: None,
-                        name: "Archive".into(),
+                        name: "Projects".into(),
                         role: None,
                     },
                 )
@@ -559,7 +559,7 @@ mod tests {
                 f.scope,
                 NewMailbox {
                     parent: None,
-                    name: "Archive".into(),
+                    name: "Projects".into(),
                     role: None,
                 },
             )

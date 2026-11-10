@@ -18,7 +18,7 @@ use tp_testkit::{
     MemPolicies, MemQuota, MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
-use crate::{Deps, Jmap, JmapConfig, Outbound};
+use crate::{Deps, Jmap, JmapConfig, Outbound, RcptStatus, Submitted};
 
 /// Права отправки: свой адрес — Send As, остальные — из таблицы.
 #[derive(Default)]
@@ -52,13 +52,24 @@ pub struct Queued {
     pub raw: Bytes,
 }
 
-/// Очередь исходящей почты в памяти.
+/// Очередь исходящей почты в памяти; `statuses` — статусы получателей для `submit` (остальные — в очереди).
 #[derive(Default)]
-pub struct TestOutbound(pub Mutex<Vec<Queued>>);
+pub struct TestOutbound(
+    pub Mutex<Vec<Queued>>,
+    pub Mutex<std::collections::HashMap<String, RcptStatus>>,
+);
 
 impl TestOutbound {
     pub fn queued(&self) -> Vec<Queued> {
         self.0.lock().expect("lock").clone()
+    }
+
+    /// Статус получателя `rcpt` для следующих отправок.
+    pub fn set_status(&self, rcpt: &str, status: RcptStatus) {
+        self.1
+            .lock()
+            .expect("lock")
+            .insert(rcpt.to_lowercase(), status);
     }
 }
 
@@ -78,6 +89,29 @@ impl Outbound for TestOutbound {
             raw,
         });
         Ok(())
+    }
+
+    async fn submit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<Submitted> {
+        self.enqueue(tenant, mail_from, rcpts, raw).await?;
+        let statuses = self.1.lock().expect("lock");
+        Ok(Submitted {
+            rcpts: rcpts
+                .iter()
+                .map(|r| {
+                    let st = statuses
+                        .get(&r.to_lowercase())
+                        .cloned()
+                        .unwrap_or(RcptStatus::Queued);
+                    (r.clone(), st)
+                })
+                .collect(),
+        })
     }
 }
 

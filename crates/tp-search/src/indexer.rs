@@ -16,10 +16,18 @@
 //! загружается из BlobStore), а после коммита выгружается и манифест записывается (SRCH-05). Манифест изменил
 //! другой узел — индекс на узле забывается и `Conflict`: повтор пачки начнётся с загрузки. С кэшем узла
 //! ([`Indexer::with_cache`]) записанный индекс учитывается в его размере (SRCH-06).
+//!
+//! Ошибка пачки — повтор по ближайшему сроку (SRS 2.8, CMP-06): следующая пачка раздела обрабатывается не раньше
+//! паузы, которая растёт от [`IndexerConfig::retry_initial`] вдвое до [`IndexerConfig::retry_max`] (с разбросом
+//! вниз до половины), успех её сбрасывает. Пауза выдерживается в начале следующей обработки — одним таймером на
+//! срок; ошибка пишется в журнал (`warn`) не чаще раза за паузу, число ошибок — в [`IndexerStats`].
 
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::fmt;
-use std::sync::Arc;
+use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,7 +35,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::time::Instant;
 use tp_contracts::config::duration;
-use tp_contracts::events::{CoreEventKind, EventSink, LoggedEvent};
+use tp_contracts::events::{CoreEventKind, EventSink, LoggedEvent, Partition};
 use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Error, MessageId, Result, TenantId};
 
@@ -49,6 +57,16 @@ pub struct IndexerConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub commit_interval: Duration,
+    /// Пауза перед повтором пачки раздела после первой ошибки (`1s`); каждая следующая ошибка подряд
+    /// удваивает её до [`Self::retry_max`].
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub retry_initial: Duration,
+    /// Предельная пауза перед повтором (`15s`; меньше — `retry_initial`). Пауза выдерживается под лизой раздела,
+    /// поэтому предел должен быть заметно меньше срока лизы (`events.lease_ttl`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub retry_max: Duration,
 }
 
 impl Default for IndexerConfig {
@@ -56,7 +74,73 @@ impl Default for IndexerConfig {
         Self {
             commit_docs: 1000,
             commit_interval: Duration::from_secs(2),
+            retry_initial: Duration::from_secs(1),
+            retry_max: Duration::from_secs(15),
         }
+    }
+}
+
+/// Счётчики индексатора (с запуска узла) — для метрик.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IndexerStats {
+    /// Пачек, обработка которых завершилась ошибкой.
+    pub failures: u64,
+    /// Разделов, ждущих повтора после ошибки.
+    pub retrying: u64,
+}
+
+/// Пауза перед повтором после `failures` ошибок подряд: `retry_initial · 2^(failures−1)` не больше `retry_max`,
+/// с разбросом вниз до половины (`r` из `[0, 1)`); рекомендованная ошибкой пауза (`hint`) — не меньше её, в пределе.
+fn pause(cfg: &IndexerConfig, failures: u32, hint: Option<Duration>, r: f64) -> Duration {
+    let max = cfg.retry_max.max(cfg.retry_initial);
+    let factor = 1u32
+        .checked_shl(failures.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    let base = cfg.retry_initial.saturating_mul(factor).min(max);
+    let jittered = base.mul_f64(1.0 - r.clamp(0.0, 1.0) / 2.0);
+    jittered.max(hint.unwrap_or_default()).min(max)
+}
+
+/// Случайное число из `[0, 1)` для разброса паузы (ключи `RandomState` случайны для каждого экземпляра).
+fn jitter() -> f64 {
+    let bits = RandomState::new().hash_one(0u8) >> 11;
+    bits as f64 / (1u64 << 53) as f64
+}
+
+/// Состояние повтора раздела после ошибок подряд.
+#[derive(Debug, Default)]
+struct Retry {
+    /// Ошибок подряд.
+    failures: u32,
+    /// Следующая попытка — не раньше.
+    deadline: Option<Instant>,
+    /// Текущая пауза.
+    pause: Duration,
+    /// Последняя записанная в журнал ошибка и когда.
+    logged: Option<(String, Instant)>,
+}
+
+impl Retry {
+    /// Учитывает ошибку попытки в `now` (`r` — разброс паузы); `true` — ошибку записать в журнал: она новая или
+    /// с прошлой записи той же ошибки прошло не меньше паузы.
+    fn fail(&mut self, cfg: &IndexerConfig, now: Instant, e: &Error, r: f64) -> bool {
+        let before = self.pause;
+        self.failures = self.failures.saturating_add(1);
+        let hint = match e {
+            Error::Unavailable { retry_after } => *retry_after,
+            _ => None,
+        };
+        self.pause = pause(cfg, self.failures, hint, r);
+        self.deadline = Some(now + self.pause);
+        let msg = e.to_string();
+        let log = match &self.logged {
+            Some((last, at)) if *last == msg => now.duration_since(*at) >= before,
+            _ => true,
+        };
+        if log {
+            self.logged = Some((msg, now));
+        }
+        log
     }
 }
 
@@ -78,6 +162,9 @@ pub struct Indexer {
     store: Option<Arc<IndexStore>>,
     cache: Option<Arc<IndexCache>>,
     cfg: IndexerConfig,
+    /// Разделы, ждущие повтора после ошибки.
+    retries: Mutex<HashMap<Partition, Retry>>,
+    failures: AtomicU64,
 }
 
 impl fmt::Debug for Indexer {
@@ -105,6 +192,49 @@ impl Indexer {
             store: None,
             cache: None,
             cfg,
+            retries: Mutex::default(),
+            failures: AtomicU64::new(0),
+        }
+    }
+
+    /// Счётчики для метрик.
+    pub fn stats(&self) -> IndexerStats {
+        IndexerStats {
+            failures: self.failures.load(Ordering::Relaxed),
+            retrying: self.retries().len() as u64,
+        }
+    }
+
+    fn retries(&self) -> std::sync::MutexGuard<'_, HashMap<Partition, Retry>> {
+        self.retries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Итог обработки пачки раздела: ошибка — пауза перед повтором растёт, успех — сбрасывает её.
+    fn record(&self, partition: Partition, result: &Result<()>) {
+        match result {
+            Ok(()) => {
+                if let Some(r) = self.retries().remove(&partition) {
+                    tracing::info!(
+                        partition = partition.0,
+                        failures = r.failures,
+                        "indexer: пачка обработана после ошибок"
+                    );
+                }
+            }
+            Err(e) => {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+                let mut retries = self.retries();
+                let r = retries.entry(partition).or_default();
+                if r.fail(&self.cfg, Instant::now(), e, jitter()) {
+                    tracing::warn!(
+                        partition = partition.0,
+                        failures = r.failures,
+                        pause = ?r.pause,
+                        error = %e,
+                        "indexer: пачка не обработана, повтор после паузы"
+                    );
+                }
+            }
         }
     }
 
@@ -233,6 +363,22 @@ impl EventSink for Indexer {
     }
 
     async fn handle(&self, batch: &[LoggedEvent]) -> Result<()> {
+        let Some(partition) = batch.first().map(|e| e.partition) else {
+            return Ok(());
+        };
+        let deadline = self.retries().get(&partition).and_then(|r| r.deadline);
+        if let Some(deadline) = deadline {
+            tokio::time::sleep_until(deadline).await;
+        }
+        let result = self.process(batch).await;
+        self.record(partition, &result);
+        result
+    }
+}
+
+impl Indexer {
+    /// Пачка событий → изменения индекса, коммит пакетами.
+    async fn process(&self, batch: &[LoggedEvent]) -> Result<()> {
         let mut pending = Pending::new();
         let (mut count, mut started) = (0, None::<Instant>);
         for logged in batch {
@@ -513,6 +659,7 @@ mod tests {
         let cfg = IndexerConfig {
             commit_docs: 10_000,
             commit_interval: interval,
+            ..IndexerConfig::default()
         };
         let indexer = Indexer::new(indexes.clone(), source.clone(), cfg);
         let inbox = MailboxId::new();
@@ -565,6 +712,155 @@ mod tests {
         assert_eq!(c.commit_interval, Duration::from_millis(500));
         assert!(crate::tests::from_pairs::<IndexerConfig>(&[("commit_interval", "5")]).is_err());
         assert!(crate::tests::from_pairs::<IndexerConfig>(&[("batch", "5")]).is_err());
+        let c = crate::tests::from_pairs::<IndexerConfig>(&[
+            ("retry_initial", "100ms"),
+            ("retry_max", "1m"),
+        ])
+        .expect("retry");
+        assert_eq!(
+            (c.retry_initial, c.retry_max),
+            (Duration::from_millis(100), Duration::from_secs(60))
+        );
+    }
+
+    /// Паузы N ошибок подряд растут вдвое (с разбросом вниз до половины) и не превышают предела; рекомендация
+    /// ошибки — не меньше её; после успеха — снова начальная. Время задаётся явно: без часов.
+    #[test]
+    fn retry_pause_grows_capped_and_resets() {
+        let cfg = IndexerConfig {
+            retry_initial: Duration::from_secs(1),
+            retry_max: Duration::from_secs(20),
+            ..IndexerConfig::default()
+        };
+        let e = Error::internal("диск переполнен");
+        for r in [0.0, 0.5, 0.999] {
+            let (mut retry, mut now) = (Retry::default(), Instant::now());
+            let mut pauses = Vec::new();
+            for _ in 0..12 {
+                retry.fail(&cfg, now, &e, r);
+                let deadline = retry.deadline.expect("deadline");
+                pauses.push(deadline - now);
+                now = deadline;
+            }
+            for (i, p) in pauses.iter().enumerate() {
+                let base = (cfg.retry_initial * (1 << i)).min(cfg.retry_max);
+                assert!(
+                    *p <= base && *p >= base / 2,
+                    "пауза {i}: {p:?}, база {base:?}"
+                );
+                assert!(*p <= cfg.retry_max);
+            }
+            assert!(pauses.windows(2).take(4).all(|w| w[0] < w[1]), "{pauses:?}");
+            assert!(pauses[5..].iter().all(|p| *p >= cfg.retry_max / 2));
+            // Успех сбрасывает состояние: следующая ошибка — начальная пауза.
+            let mut retry = Retry::default();
+            retry.fail(&cfg, now, &e, r);
+            assert!(retry.deadline.expect("deadline") - now <= cfg.retry_initial);
+        }
+        // Рекомендованная пауза `Unavailable` — не меньше её, но в пределе.
+        let hint = |d| Error::Unavailable {
+            retry_after: Some(d),
+        };
+        assert_eq!(
+            pause(&cfg, 1, Some(Duration::from_secs(5)), 0.0),
+            Duration::from_secs(5)
+        );
+        let mut retry = Retry::default();
+        retry.fail(&cfg, Instant::now(), &hint(Duration::from_secs(600)), 0.0);
+        assert_eq!(retry.pause, cfg.retry_max);
+        // Предел меньше начальной — пауза начальная; огромное число ошибок — без переполнения.
+        let tight = IndexerConfig {
+            retry_max: Duration::from_millis(10),
+            ..cfg.clone()
+        };
+        assert_eq!(pause(&tight, 1, None, 0.0), cfg.retry_initial);
+        assert_eq!(pause(&cfg, u32::MAX, None, 0.0), cfg.retry_max);
+        let r = jitter();
+        assert!((0.0..1.0).contains(&r));
+    }
+
+    /// Та же ошибка — в журнал не чаще раза за паузу; другая — сразу.
+    #[test]
+    fn same_error_logged_once_per_pause() {
+        let cfg = IndexerConfig::default();
+        let (disk, net) = (Error::internal("диск"), Error::UNAVAILABLE);
+        let (mut retry, now) = (Retry::default(), Instant::now());
+        assert!(retry.fail(&cfg, now, &disk, 0.0));
+        let pause = retry.pause;
+        assert!(!retry.fail(&cfg, now + pause / 2, &disk, 0.0));
+        assert!(retry.fail(&cfg, now + pause / 2, &net, 0.0));
+        assert!(!retry.fail(&cfg, now + pause / 2, &net, 0.0));
+        assert!(retry.fail(&cfg, now + pause * 10, &net, 0.0));
+    }
+
+    /// Содержимое писем недоступно `fails` раз: моменты обращений.
+    #[derive(Default)]
+    struct Flaky {
+        fails: Mutex<usize>,
+        calls: Mutex<Vec<Instant>>,
+    }
+
+    #[async_trait]
+    impl DocumentSource for Flaky {
+        async fn document(&self, _: AccountScope, _: MessageId) -> Result<Option<IndexDoc>> {
+            self.calls.lock().expect("lock").push(Instant::now());
+            let mut fails = self.fails.lock().expect("lock");
+            if *fails > 0 {
+                *fails -= 1;
+                return Err(Error::internal("индекс не записан"));
+            }
+            Ok(None)
+        }
+
+        async fn messages(&self, _: AccountScope) -> Result<Vec<MessageId>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Ошибка пачки — повтор раздела не раньше паузы, ошибки в счётчике; успех сбрасывает паузу.
+    #[tokio::test]
+    async fn handle_waits_after_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = Arc::new(Flaky::default());
+        *source.fails.lock().expect("lock") = 3;
+        let cfg = IndexerConfig {
+            retry_initial: Duration::from_millis(20),
+            retry_max: Duration::from_millis(60),
+            ..IndexerConfig::default()
+        };
+        let indexer = Indexer::new(Arc::new(manager(&dir)), source.clone(), cfg.clone());
+        let (log, a, inbox) = (MemEventLog::new(1), scope(), MailboxId::new());
+        // Письма уже нет: успешная обработка — удаление из индекса, которого нет (индекс не создаётся).
+        log.append(event(
+            a,
+            inbox,
+            CoreEventKind::Delivered {
+                message: MessageId::new(),
+            },
+        ));
+        let batch = log.read(Partition(0), EventPos(0), 10).await.expect("read");
+        for i in 1..=3 {
+            assert!(indexer.handle(&batch).await.is_err());
+            assert_eq!(
+                indexer.stats(),
+                IndexerStats {
+                    failures: i,
+                    retrying: 1
+                }
+            );
+        }
+        indexer.handle(&batch).await.expect("success");
+        assert_eq!(indexer.stats().retrying, 0);
+        let calls = source.calls.lock().expect("lock").clone();
+        assert_eq!(calls.len(), 4);
+        for (i, w) in calls.windows(2).enumerate() {
+            let base = (cfg.retry_initial * (1 << i)).min(cfg.retry_max);
+            assert!(w[1] - w[0] >= base / 2, "пауза {i}: {:?}", w[1] - w[0]);
+        }
+        // После успеха пауз нет.
+        let before = Instant::now();
+        indexer.handle(&batch).await.expect("again");
+        assert!(before.elapsed() < cfg.retry_max);
     }
 
     #[tokio::test]
@@ -573,8 +869,12 @@ mod tests {
         let (_, _, store) = store();
         let source = Arc::new(MemSource::default());
         let indexer_on = |n: &crate::persist::tests::Node| {
-            Indexer::new(n.indexes.clone(), source.clone(), IndexerConfig::default())
-                .with_store(store.clone())
+            // Повтор после конфликта — без заметной паузы.
+            let cfg = IndexerConfig {
+                retry_initial: Duration::from_millis(1),
+                ..IndexerConfig::default()
+            };
+            Indexer::new(n.indexes.clone(), source.clone(), cfg).with_store(store.clone())
         };
         let (a, b) = (node(), node());
         let (on_a, on_b) = (indexer_on(&a), indexer_on(&b));

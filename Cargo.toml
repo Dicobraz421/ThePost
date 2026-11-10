@@ -70,6 +70,7 @@ moka = { version = "0.12.16", features = ["future"] }
 nix = { version = "0.31.3", features = ["signal", "process", "resource", "socket"] }
 # imap-codec 2.0.0-alpha.9 использует nom::multi без фичи alloc: включаем её сами.
 nom = { version = "7.1.3", default-features = false, features = ["alloc"] }
+notify = { version = "8.2.0", default-features = false }
 object_store = { version = "0.14.2", features = ["aws"] }
 opentelemetry = "0.33.1"
 opentelemetry-otlp = "0.33.1"

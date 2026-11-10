@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use tp_contracts::Error;
-use tp_contracts::membership::{Membership, NodeId};
+use tp_contracts::membership::{Membership, NodeId, NodeInfo};
 use uuid::Uuid;
 
 /// Узлы теста: общий префикс, чтобы не видеть узлы параллельных тестов.
@@ -35,16 +35,22 @@ async fn heartbeat_expiry_and_leave() {
     let long = Duration::from_secs(60);
     // Порядок продлений не важен: состав — по возрастанию.
     for n in ids.iter().rev() {
-        meta.heartbeat(n, long).await.expect("heartbeat");
+        meta.heartbeat(&NodeInfo::new(n.clone()), long)
+            .await
+            .expect("heartbeat");
     }
     assert_eq!(live(&meta, &prefix).await, ids);
     // Повторное продление — та же запись.
-    meta.heartbeat(&ids[0], long).await.expect("heartbeat");
+    meta.heartbeat(&NodeInfo::new(ids[0].clone()), long)
+        .await
+        .expect("heartbeat");
     assert_eq!(live(&meta, &prefix).await, ids);
 
     // Запись с коротким сроком истекает по часам СУБД.
     let short = Duration::from_millis(300);
-    meta.heartbeat(&ids[1], short).await.expect("heartbeat");
+    meta.heartbeat(&NodeInfo::new(ids[1].clone()), short)
+        .await
+        .expect("heartbeat");
     let joined = |records: &[tp_meta::membership::NodeRecord], n: &NodeId| {
         records
             .iter()
@@ -56,7 +62,9 @@ async fn heartbeat_expiry_and_leave() {
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(live(&meta, &prefix).await, [ids[0].clone(), ids[2].clone()]);
     // Возвращение узла — новая запись.
-    meta.heartbeat(&ids[1], long).await.expect("heartbeat");
+    meta.heartbeat(&NodeInfo::new(ids[1].clone()), long)
+        .await
+        .expect("heartbeat");
     assert_eq!(live(&meta, &prefix).await, ids);
     assert!(joined(&meta.nodes().await.expect("nodes"), &ids[1]) > first);
 
@@ -81,7 +89,9 @@ async fn roles_and_invalid_ttl() {
     let roles = vec!["imap".to_owned(), "indexer".to_owned()];
     meta.heartbeat_roles(n, &roles, ttl).await.expect("roles");
     // Продление без ролей их не меняет.
-    meta.heartbeat(n, ttl).await.expect("heartbeat");
+    meta.heartbeat(&NodeInfo::new(n.clone()), ttl)
+        .await
+        .expect("heartbeat");
     let rec = meta
         .nodes()
         .await
@@ -93,7 +103,8 @@ async fn roles_and_invalid_ttl() {
     assert!(rec.expires_at > rec.joined_at);
 
     assert!(matches!(
-        meta.heartbeat(n, Duration::ZERO).await,
+        meta.heartbeat(&NodeInfo::new(n.clone()), Duration::ZERO)
+            .await,
         Err(Error::Invalid(_))
     ));
     meta.leave(n).await.expect("cleanup");

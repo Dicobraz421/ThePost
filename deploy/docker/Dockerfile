@@ -5,22 +5,24 @@
 ARG RUST_VERSION=1.97
 
 FROM rust:${RUST_VERSION}-bookworm AS build
-ARG RUST_VERSION
-# Тулчейн образа вместо channel из rust-toolchain.toml: сборка воспроизводима и без загрузки rustup.
-ENV RUSTUP_TOOLCHAIN=${RUST_VERSION} \
-    CARGO_TERM_COLOR=never
+ENV CARGO_TERM_COLOR=never
 WORKDIR /src
 COPY . .
+# Тулчейн образа вместо channel из rust-toolchain.toml: сборка воспроизводима и без загрузки rustup.
+# Имя — полное, из `rustup default` (1.97.1-x86_64-…): короткое `1.97` rustup не сопоставляет с установленным
+# 1.97.1 и идёт качать канал.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p thepost \
+    RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)" cargo build --release --locked -p thepost \
  && install -D -m 0755 target/release/thepost /out/bin/thepost \
- && install -d -m 0750 /out/state /out/etc
+ && install -d -m 0750 /out/state /out/etc \
+ && install -d -m 0700 /out/state/blob
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /out/bin/thepost /usr/local/bin/thepost
-# Каталоги создаются в сборке: в distroless нет оболочки, nonroot = 65532.
+# Каталоги создаются в сборке: в distroless нет оболочки, nonroot = 65532. Каталог BLOB (blob.url эталона smb)
+# нужен до наложения Landlock — пустой том копирует его из образа (до CMP-02 узел без него не запускается).
 COPY --from=build --chown=65532:65532 /out/state /var/lib/thepost
 COPY --from=build --chown=65532:65532 /out/etc /etc/thepost
 USER 65532:65532

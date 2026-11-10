@@ -5,6 +5,13 @@
 //! Срок задаётся политиками уровней ([`crate::accounts`]) и действует на элементы, удалённые после изменения.
 //! Восстановление — `MailStore::restore`: письмо возвращается в исходную папку (нет — во «Входящие») с тем же
 //! идентификатором, клиенты получают уведомление.
+//!
+//! «Очистить корзину» в клиенте — настройка `trash.purge` (решение 2026-11-01-trash-purge): правило администратора
+//! (`mode`, `user_can_choose`) — поле `trash_purge` политики уровня ([`crate::accounts`]), выбор пользователя
+//! действует, только если правило его разрешает (`TrashPurgeSetting::effective`); настройка ящика —
+//! `GET …/trash-purge`. Скрытые письма (`hide`) пользователь не видит, они хранятся до конца срока корзины:
+//! список — `TrashStore::list_hidden`, восстановление администратором — `TrashStore::restore` (в исходную папку,
+//! нет — во «Входящие»). Изменения записываются в журнал аудита каркасом ([`crate::server`]).
 
 use std::sync::Arc;
 
@@ -15,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tp_contracts::config::duration;
 use tp_contracts::meta::AccountScope;
-use tp_contracts::retention::{TrashItem, TrashObject};
+use tp_contracts::retention::{
+    Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule, TrashPurgeSetting,
+};
 use tp_contracts::{AccountId, Error, MessageId, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -80,6 +89,85 @@ pub struct RestoredMessage {
     pub modseq: u64,
 }
 
+/// Значение `trash.purge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PurgeMode {
+    /// Скрыть: письмо исчезает у пользователя, хранится до конца срока корзины, восстанавливает администратор.
+    #[default]
+    Hide,
+    /// Стереть сразу (под Legal Hold — как `hide`).
+    Erase,
+}
+
+impl From<TrashPurge> for PurgeMode {
+    fn from(m: TrashPurge) -> Self {
+        match m {
+            TrashPurge::Hide => Self::Hide,
+            TrashPurge::Erase => Self::Erase,
+        }
+    }
+}
+
+impl From<PurgeMode> for TrashPurge {
+    fn from(m: PurgeMode) -> Self {
+        match m {
+            PurgeMode::Hide => Self::Hide,
+            PurgeMode::Erase => Self::Erase,
+        }
+    }
+}
+
+/// Правило администратора `trash.purge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TrashPurgeRuleBody {
+    /// Значение администратора.
+    pub mode: PurgeMode,
+    /// Пользователь может выбрать своё значение; иначе действует `mode`.
+    #[serde(default)]
+    pub user_can_choose: bool,
+}
+
+impl From<TrashPurgeRule> for TrashPurgeRuleBody {
+    fn from(r: TrashPurgeRule) -> Self {
+        Self {
+            mode: r.mode.into(),
+            user_can_choose: r.user_can_choose,
+        }
+    }
+}
+
+impl From<TrashPurgeRuleBody> for TrashPurgeRule {
+    fn from(r: TrashPurgeRuleBody) -> Self {
+        Self {
+            mode: r.mode.into(),
+            user_can_choose: r.user_can_choose,
+        }
+    }
+}
+
+/// Настройка `trash.purge` ящика.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrashPurgeInfo {
+    /// Действующее правило администратора (цепочка организация → домен → ящик; не задано — `hide` без выбора).
+    pub rule: TrashPurgeRuleBody,
+    /// Выбор пользователя; `null` — не выбран. Хранится и без `user_can_choose`, но тогда не действует.
+    pub user: Option<PurgeMode>,
+    /// Действующее значение.
+    pub effective: PurgeMode,
+}
+
+impl From<TrashPurgeSetting> for TrashPurgeInfo {
+    fn from(s: TrashPurgeSetting) -> Self {
+        Self {
+            rule: s.rule.into(),
+            user: s.user.map(PurgeMode::from),
+            effective: s.effective().into(),
+        }
+    }
+}
+
 /// Маршруты корзины.
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
     r.route("/api/v1/orgs/{org}/accounts/{account}/trash", get(list))
@@ -87,13 +175,32 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
             "/api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore",
             post(restore),
         )
+        .route(
+            "/api/v1/orgs/{org}/accounts/{account}/trash/hidden",
+            get(list_hidden),
+        )
+        .route(
+            "/api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore",
+            post(restore_hidden),
+        )
+        .route(
+            "/api/v1/orgs/{org}/accounts/{account}/trash-purge",
+            get(trash_purge),
+        )
 }
 
 /// Спецификация OpenAPI маршрутов модуля.
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(list, restore),
-    components(schemas(TrashEntry, TrashPage, RestoredMessage))
+    paths(list, restore, list_hidden, restore_hidden, trash_purge),
+    components(schemas(
+        TrashEntry,
+        TrashPage,
+        RestoredMessage,
+        PurgeMode,
+        TrashPurgeRuleBody,
+        TrashPurgeInfo
+    ))
 )]
 pub(crate) struct Doc;
 
@@ -124,22 +231,37 @@ async fn list(
     Path((org, id)): Path<(TenantId, AccountId)>,
     Query(q): Query<PageQuery>,
 ) -> ApiResult<Json<TrashPage>> {
-    let acc = account(&a, org, id).await?;
+    Ok(Json(page(&a, org, id, &q, false).await?))
+}
+
+/// Страница видимых (`hidden = false`) или скрытых элементов корзины и действующий срок корзины.
+async fn page(
+    a: &Admin,
+    org: TenantId,
+    id: AccountId,
+    q: &PageQuery,
+    hidden: bool,
+) -> Result<TrashPage, Error> {
+    let acc = account(a, org, id).await?;
     let limit = a.cfg.page(q.limit);
     let scope = AccountScope {
         tenant: org,
         account: id,
     };
-    let items = a.d.trash.list(scope, q.offset, limit).await?;
+    let items = if hidden {
+        a.d.trash.list_hidden(scope, q.offset, limit).await?
+    } else {
+        a.d.trash.list(scope, q.offset, limit).await?
+    };
     let policy =
         a.d.resolver
             .resolve(org, Some(acc.domain), Some(id), None)
             .await?;
-    Ok(Json(TrashPage {
+    Ok(TrashPage {
         trash_retention: policy.trash_retention,
         next_offset: (items.len() == limit).then(|| q.offset + limit),
         items: items.into_iter().map(TrashEntry::from).collect(),
-    }))
+    })
 }
 
 /// Восстанавливает письмо из корзины; письмо не в корзине — 400.
@@ -166,12 +288,81 @@ async fn restore(
     }))
 }
 
+/// Скрытые письма ящика («очистить корзину» с `hide`): пользователь их не видит, хранятся до конца срока корзины.
+#[utoipa::path(get, path = "/api/v1/orgs/{org}/accounts/{account}/trash/hidden", tag = "trash",
+    params(("org" = String, Path, description = "Организация (UUID)"),
+        ("account" = String, Path, description = "Учётная запись (UUID)"), PageQuery),
+    responses((status = 200, body = TrashPage), (status = 404, body = Problem)))]
+async fn list_hidden(
+    State(a): State<Arc<Admin>>,
+    Path((org, id)): Path<(TenantId, AccountId)>,
+    Query(q): Query<PageQuery>,
+) -> ApiResult<Json<TrashPage>> {
+    Ok(Json(page(&a, org, id, &q, true).await?))
+}
+
+/// Восстанавливает скрытое (или видимое) письмо корзины в исходную папку (нет — во «Входящие»);
+/// письма нет в корзине — 404.
+#[utoipa::path(post, path = "/api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore", tag = "trash",
+    params(("org" = String, Path, description = "Организация (UUID)"),
+        ("account" = String, Path, description = "Учётная запись (UUID)"),
+        ("message" = String, Path, description = "Письмо (UUID)")),
+    responses((status = 200, body = RestoredMessage), (status = 404, body = Problem)))]
+async fn restore_hidden(
+    State(a): State<Arc<Admin>>,
+    Path((org, id, message)): Path<(TenantId, AccountId, MessageId)>,
+) -> ApiResult<Json<RestoredMessage>> {
+    account(&a, org, id).await?;
+    let scope = AccountScope {
+        tenant: org,
+        account: id,
+    };
+    match a
+        .d
+        .trash
+        .restore(scope, TrashObject::Message(message))
+        .await?
+    {
+        Restored::Message { inserted, .. } => Ok(Json(RestoredMessage {
+            message: inserted.id.to_string(),
+            uid: inserted.uid.0,
+            modseq: inserted.modseq.0,
+        })),
+        other => Err(Error::internal(format!(
+            "trash: неожиданный результат восстановления {other:?}"
+        ))
+        .into()),
+    }
+}
+
+/// Настройка `trash.purge` ящика: правило администратора, выбор пользователя, действующее значение.
+#[utoipa::path(get, path = "/api/v1/orgs/{org}/accounts/{account}/trash-purge", tag = "trash",
+    params(("org" = String, Path, description = "Организация (UUID)"),
+        ("account" = String, Path, description = "Учётная запись (UUID)")),
+    responses((status = 200, body = TrashPurgeInfo), (status = 404, body = Problem)))]
+async fn trash_purge(
+    State(a): State<Arc<Admin>>,
+    Path((org, id)): Path<(TenantId, AccountId)>,
+) -> ApiResult<Json<TrashPurgeInfo>> {
+    account(&a, org, id).await?;
+    let scope = AccountScope {
+        tenant: org,
+        account: id,
+    };
+    Ok(Json(a.d.resolver.trash_purge(scope).await?.into()))
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
     use serde_json::{Value, json};
     use tp_contracts::mailstore::MailStore;
     use tp_contracts::{AccountId, MessageId, TenantId};
+
+    use tp_contracts::Error;
+    use tp_contracts::ext::DecisionHooks;
+    use tp_contracts::meta::{MessageStore, PolicyResolver, SpecialUse};
+    use tp_contracts::retention::{TrashPurge, TrashStore};
 
     use crate::server::AdminConfig;
     use crate::testenv::{Env, config};
@@ -304,5 +495,153 @@ mod tests {
         );
         let (s, _, _) = env.call("GET", &other, Some("org"), None).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    /// Администратор задаёт `trash.purge`; без `user_can_choose` выбор пользователя не действует.
+    #[tokio::test]
+    async fn trash_purge_rule() {
+        let env = Env::new();
+        let scope = env.account("user@example.org").await;
+        let org = format!("/api/v1/orgs/{}", TenantId::DEFAULT);
+        let policy = format!("{org}/policy");
+        let setting = format!("{org}/accounts/{}/trash-purge", scope.account);
+        let get = || async { env.call("GET", &setting, Some("org"), None).await };
+
+        let (s, _, b) = get().await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            b,
+            json!({"rule": {"mode": "hide", "user_can_choose": false}, "user": null, "effective": "hide"})
+        );
+
+        let erase = json!({"trash_purge": {"mode": "erase"}});
+        let (s, _, b) = env
+            .call("PUT", &policy, Some("org"), Some(erase.clone()))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            b["trash_purge"],
+            json!({"mode": "erase", "user_can_choose": false})
+        );
+        let (_, _, b) = env.call("GET", &org, Some("org"), None).await;
+        assert_eq!(b["effective"]["trash_purge"]["mode"], "erase");
+        let denied = env
+            .policies
+            .set_user_trash_purge(scope, Some(TrashPurge::Hide))
+            .await;
+        assert!(matches!(denied, Err(Error::Forbidden)), "{denied:?}");
+        let (_, _, b) = get().await;
+        assert_eq!(b["user"], Value::Null);
+        assert_eq!(b["effective"], "erase");
+
+        let choose = json!({"trash_purge": {"mode": "erase", "user_can_choose": true}});
+        env.call("PUT", &policy, Some("org"), Some(choose)).await;
+        env.policies
+            .set_user_trash_purge(scope, Some(TrashPurge::Hide))
+            .await
+            .expect("user choice");
+        let (_, _, b) = get().await;
+        assert_eq!(b["user"], "hide");
+        assert_eq!(b["effective"], "hide");
+
+        // Администратор отозвал выбор: его значение приоритетнее сохранённого выбора пользователя.
+        env.call("PUT", &policy, Some("org"), Some(erase)).await;
+        let (_, _, b) = get().await;
+        assert_eq!(b["user"], "hide");
+        assert_eq!(b["effective"], "erase");
+        let id = env.deliver(scope, "gone").await;
+        env.store
+            .delete_to_trash(scope, &[id])
+            .await
+            .expect("trash");
+        let out = env
+            .trash
+            .purge(scope, &[id], &DecisionHooks::default())
+            .await
+            .expect("purge");
+        assert_eq!(out.erased, vec![id]);
+
+        for bad in [
+            json!({"trash_purge": {"mode": "drop"}}),
+            json!({"trash_purge": {"user_can_choose": true}}),
+            json!({"trash_purge": {"mode": "hide", "extra": 1}}),
+        ] {
+            let (s, _, _) = env.call("PUT", &policy, Some("org"), Some(bad)).await;
+            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let (s, _, _) = env.call("GET", &setting, Some("user"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let missing = format!("{org}/accounts/{}/trash-purge", AccountId::new());
+        let (s, _, _) = env.call("GET", &missing, Some("org"), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let log = env.audit.records();
+        assert!(log.iter().any(|r| r.path == policy && r.status == 200));
+    }
+
+    /// Скрытое «очисткой корзины» письмо видно администратору и восстанавливается в исходную папку.
+    #[tokio::test]
+    async fn hidden_list_and_restore() {
+        let env = Env::new();
+        let scope = env.account("user@example.org").await;
+        let (a, b) = (env.deliver(scope, "a").await, env.deliver(scope, "b").await);
+        env.store
+            .delete_to_trash(scope, &[a, b])
+            .await
+            .expect("trash");
+        let out = env
+            .trash
+            .purge(scope, &[a], &DecisionHooks::default())
+            .await
+            .expect("purge");
+        assert_eq!(out.hidden, vec![a]);
+        let base = format!(
+            "/api/v1/orgs/{}/accounts/{}/trash",
+            TenantId::DEFAULT,
+            scope.account
+        );
+        let hidden = format!("{base}/hidden");
+        let ids = |v: &Value| -> Vec<Value> {
+            v["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .map(|i| i["message"].clone())
+                .collect()
+        };
+
+        let (_, _, v) = env.call("GET", &base, Some("org"), None).await;
+        assert_eq!(ids(&v), vec![json!(b.to_string())]);
+        let (s, _, v) = env.call("GET", &hidden, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(ids(&v), vec![json!(a.to_string())]);
+        assert_eq!(v["next_offset"], Value::Null);
+
+        let restore = format!("{hidden}/{a}/restore");
+        let (s, _, v) = env.call("POST", &restore, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["message"], a.to_string());
+        let (_, _, v) = env.call("GET", &hidden, Some("org"), None).await;
+        assert!(ids(&v).is_empty());
+        let inbox = env
+            .meta
+            .mailbox_by_role(scope, SpecialUse::Inbox)
+            .expect("inbox");
+        let msg = MessageStore::get(&env.meta, scope, a)
+            .await
+            .expect("get")
+            .expect("restored");
+        assert_eq!(msg.mailbox, inbox);
+        let (s, _, _) = env.call("POST", &restore, Some("org"), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "письмо уже не в корзине");
+
+        let (s, _, _) = env.call("GET", &hidden, Some("user"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, _) = env.call("POST", &restore, Some("operator"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let log = env.audit.records();
+        let audited: Vec<_> = log.iter().filter(|r| r.path == restore).collect();
+        assert_eq!(audited.len(), 3);
+        assert_eq!(audited[0].status, 200);
+        assert_eq!(audited[0].tenant, Some(TenantId::DEFAULT));
     }
 }

@@ -42,13 +42,15 @@ mod tests {
         );
 
         let gc: GcConfig =
-            parse("window: 14d\nbatch: 10\ninterval: 10m\nlease_ttl: 90s\n").expect("gc");
+            parse("window: 14d\nbatch: 10\nmax_wait: 10m\nprecision: 5s\nlease_ttl: 90s\n")
+                .expect("gc");
         assert_eq!(
             gc,
             GcConfig {
                 window: Duration::from_secs(14 * 24 * 3600),
                 batch: 10,
-                interval: Duration::from_secs(600),
+                max_wait: Duration::from_secs(600),
+                precision: Duration::from_secs(5),
                 lease_ttl: Duration::from_secs(90),
                 ..GcConfig::default()
             }
@@ -120,6 +122,8 @@ mod tests {
             assert!(parse::<S3Config>(bad).is_err(), "{bad}");
         }
         assert!(parse::<GcConfig>("window_secs: 3600").is_err());
+        // Периодического прохода нет (BLOB-14): прежнее поле — ошибка разбора.
+        assert!(parse::<GcConfig>("interval: 5m").is_err());
         assert!(parse::<OrphanConfig>("grace: 5").is_err());
     }
 

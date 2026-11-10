@@ -36,6 +36,7 @@ use tp_contracts::tls::Profile;
 
 use crate::acme::AcmeConfig;
 use crate::load::{LOAD, LoadConfig};
+use crate::pressure::{PRESSURE, PressureConfig};
 use crate::privileges::{CONFINE, PRIVILEGES, PrivilegesConfig};
 use crate::ratelimit::RateLimitConfig;
 use crate::reload::ReloadConfig;
@@ -162,7 +163,7 @@ impl Default for SectionRegistry {
 
 impl SectionRegistry {
     /// Реестр с секциями платформы: `telemetry`, `service_http`, `reload`, `runtime`, `tls`, `ratelimit`, `acme`,
-    /// `secrets`, `resources` (SYS-06), `load` (PLT-15), `privileges` (PLT-16), `confine` (SYS-07).
+    /// `secrets`, `resources` (SYS-06), `load` (PLT-15), `privileges` (PLT-16), `confine` (SYS-07), `pressure` (PLT-17).
     pub fn new() -> Self {
         let mut r = Self {
             sections: BTreeMap::new(),
@@ -183,6 +184,7 @@ impl SectionRegistry {
         r.sections.insert(LOAD, def::<LoadConfig>());
         r.sections.insert(PRIVILEGES, def::<PrivilegesConfig>());
         r.sections.insert(CONFINE, def::<tp_sys::ConfineConfig>());
+        r.sections.insert(PRESSURE, def::<PressureConfig>());
         r.checks
             .entry("service_http")
             .or_default()
@@ -195,6 +197,10 @@ impl SectionRegistry {
             .entry(LOAD)
             .or_default()
             .push(check_fn(LoadConfig::check));
+        r.checks
+            .entry(PRESSURE)
+            .or_default()
+            .push(check_fn(PressureConfig::check));
         r
     }
 
@@ -1459,7 +1465,7 @@ mod tests {
         let mut r = registry();
         r.add_check::<ChannelConfig>("bus", |c, profile| {
             c.tls
-                .check_url(InternalChannel::Valkey, &c.url, profile)
+                .check_url(InternalChannel::S3, &c.url, profile)
                 .map(|_| ())
         })
         .expect("check");
@@ -1469,18 +1475,18 @@ mod tests {
         );
         let e = r
             .parse_with(
-                &format!("{MINIMAL}bus: {{ url: redis://cache }}\n"),
+                &format!("{MINIMAL}bus: {{ url: http://cache }}\n"),
                 Vec::new(),
                 CheckMode::Lenient,
             )
             .expect_err("plaintext")
             .to_string();
-        assert!(e.starts_with("bus: Valkey: address without TLS"), "{e}");
+        assert!(e.starts_with("bus: S3: address without TLS"), "{e}");
         // Секция с проверкой не просматривается общим поиском: одна ошибка, не две.
         let e = r
             .parse_with(
                 &format!(
-                    "{MINIMAL}bus: {{ url: rediss://cache, tls: {{ allow_plaintext: true }} }}\n"
+                    "{MINIMAL}bus: {{ url: https://cache, tls: {{ allow_plaintext: true }} }}\n"
                 ),
                 Vec::new(),
                 CheckMode::Strict,
@@ -1488,7 +1494,7 @@ mod tests {
             .expect_err("allow_plaintext");
         assert_eq!(lines(e).len(), 1);
         let ok = format!(
-            "{MINIMAL}profile: dev\nbus: {{ url: redis://cache, tls: {{ allow_plaintext: true }} }}\n"
+            "{MINIMAL}profile: dev\nbus: {{ url: http://cache, tls: {{ allow_plaintext: true }} }}\n"
         );
         assert!(r.parse_with(&ok, Vec::new(), CheckMode::Strict).is_ok());
     }

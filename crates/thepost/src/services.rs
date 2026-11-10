@@ -335,8 +335,15 @@ impl Services {
         }
     }
 
-    /// Сервер JMAP; отправка — в очередь SMTP с DKIM-подписью.
-    pub fn jmap(&self, ext: &Registry, cfg: tp_jmap::JmapConfig) -> Result<tp_jmap::Jmap> {
+    /// Сервер JMAP; отправка — через доставку SMTP (CMP-07): локальным адресатам — сразу в ящики, внешним — в
+    /// очередь SMTP с DKIM-подписью.
+    pub fn jmap(
+        &self,
+        ext: &Registry,
+        cfg: tp_jmap::JmapConfig,
+        smtp: &SmtpConfig,
+    ) -> Result<tp_jmap::Jmap> {
+        let outbound = Arc::new(JmapOutbound(self.delivery(smtp)?));
         let deps = tp_jmap::Deps {
             auth: self.authn.clone(),
             mailboxes: Arc::new(self.meta.clone()),
@@ -349,7 +356,7 @@ impl Services {
             bus: self.bus.clone(),
             accounts: Arc::new(self.meta.clone()),
             authz: self.authz.clone(),
-            outbound: Some(Arc::new(JmapOutbound(self.queue.clone()))),
+            outbound: Some(outbound),
             hooks: self.hooks.clone(),
             capabilities: ext.jmap_capabilities().to_vec(),
             trash: Arc::new(self.meta.clone()),
@@ -417,8 +424,10 @@ pub fn system_resolver() -> Result<mail_auth::MessageAuthenticator> {
         .map_err(|e| Error::Internal(format!("резолвер DNS: {e}")))
 }
 
-/// Отправка JMAP (`EmailSubmission/set`) — в очередь SMTP: `Queue` подписывает письмо DKIM при постановке.
-struct JmapOutbound(Arc<Queue>);
+/// Отправка JMAP (`EmailSubmission/set`) через [`Delivery`] (CMP-07): локальные получатели — сразу во «Входящие»
+/// (`MailStore::ingest`), внешние — в очередь SMTP (`Queue` подписывает письмо DKIM при постановке); статус по
+/// каждому получателю — в `deliveryStatus`.
+struct JmapOutbound(Arc<Delivery>);
 
 #[async_trait]
 impl tp_jmap::Outbound for JmapOutbound {
@@ -430,6 +439,32 @@ impl tp_jmap::Outbound for JmapOutbound {
         raw: Bytes,
     ) -> Result<()> {
         tp_smtp::Outbound::enqueue(self.0.as_ref(), tenant, mail_from, rcpts, raw).await
+    }
+
+    async fn submit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<tp_jmap::Submitted> {
+        let sent = self.0.submit(tenant, mail_from, rcpts, raw).await?;
+        Ok(tp_jmap::Submitted {
+            rcpts: sent
+                .rcpts
+                .into_iter()
+                .map(|(rcpt, status)| (rcpt, rcpt_status(status)))
+                .collect(),
+        })
+    }
+}
+
+/// Статус получателя доставки SMTP → статус `deliveryStatus` JMAP.
+fn rcpt_status(s: tp_smtp::RcptStatus) -> tp_jmap::RcptStatus {
+    match s {
+        tp_smtp::RcptStatus::Delivered => tp_jmap::RcptStatus::Delivered,
+        tp_smtp::RcptStatus::Queued => tp_jmap::RcptStatus::Queued,
+        tp_smtp::RcptStatus::Failed(reply) => tp_jmap::RcptStatus::Failed(reply),
     }
 }
 

@@ -77,6 +77,46 @@ pub enum Body {
         /// Параметры результата; пустой список — `ALL`.
         ret: Vec<SearchReturn>,
     },
+    /// Команды ACL (RFC 4314).
+    Acl(AclCommand),
+}
+
+/// Команда ACL (RFC 4314, 3); имена и идентификаторы — как передал клиент.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AclCommand {
+    /// `SETACL mailbox identifier mod-rights`.
+    Set {
+        /// Папка.
+        mailbox: Vec<u8>,
+        /// Идентификатор.
+        identifier: Vec<u8>,
+        /// Права с необязательным `+`/`-` в начале.
+        rights: Vec<u8>,
+    },
+    /// `DELETEACL mailbox identifier`.
+    Delete {
+        /// Папка.
+        mailbox: Vec<u8>,
+        /// Идентификатор.
+        identifier: Vec<u8>,
+    },
+    /// `GETACL mailbox`.
+    Get {
+        /// Папка.
+        mailbox: Vec<u8>,
+    },
+    /// `LISTRIGHTS mailbox identifier`.
+    ListRights {
+        /// Папка.
+        mailbox: Vec<u8>,
+        /// Идентификатор.
+        identifier: Vec<u8>,
+    },
+    /// `MYRIGHTS mailbox`.
+    MyRights {
+        /// Папка.
+        mailbox: Vec<u8>,
+    },
 }
 
 /// Параметр результата `SEARCH RETURN (…)`.
@@ -524,6 +564,34 @@ pub fn astring(bytes: Vec<u8>) -> Option<AString<'static>> {
     AString::try_from(bytes).ok()
 }
 
+/// `astring` для ответов, которые собираются вручную (`ACL`, `MYRIGHTS`): атом, строка в кавычках
+/// или литерал.
+pub fn astring_text(bytes: &[u8]) -> Vec<u8> {
+    let atom = |c: u8| {
+        (0x21..0x7f).contains(&c) && !matches!(c, b'(' | b')' | b'{' | b'%' | b'*' | b'"' | b'\\')
+    };
+    if !bytes.is_empty() && bytes.iter().all(|&c| atom(c)) {
+        return bytes.to_vec();
+    }
+    if bytes
+        .iter()
+        .all(|&c| c.is_ascii() && !matches!(c, 0 | b'\r' | b'\n'))
+    {
+        let mut out = vec![b'"'];
+        for &c in bytes {
+            if c == b'"' || c == b'\\' {
+                out.push(b'\\');
+            }
+            out.push(c);
+        }
+        out.push(b'"');
+        return out;
+    }
+    let mut out = format!("{{{}}}\r\n", bytes.len()).into_bytes();
+    out.extend_from_slice(bytes);
+    out
+}
+
 /// Ненулевое число для кодов ответа (`UIDNEXT`, `UIDVALIDITY`).
 pub fn nz(n: u32) -> NonZeroU32 {
     NonZeroU32::new(n).unwrap_or(NonZeroU32::MIN)
@@ -546,9 +614,15 @@ pub fn runs(nums: &[u32]) -> Vec<(u32, u32)> {
 
 /// Набор номеров (`1:3,7`) для кодов ответа (`MODIFIED`); пустой — `None`.
 pub fn sequence_set(nums: &[u32]) -> Option<types::sequence::SequenceSet> {
+    range_set(&runs(nums))
+}
+
+/// Набор номеров из отрезков (`VANISHED`); пустой — `None`.
+pub fn range_set(ranges: &[(u32, u32)]) -> Option<types::sequence::SequenceSet> {
     use types::sequence::{SeqOrUid, Sequence, SequenceSet};
-    let seqs: Vec<Sequence> = runs(nums)
-        .into_iter()
+    let seqs: Vec<Sequence> = ranges
+        .iter()
+        .copied()
         .map(|(a, b)| {
             let (a, b) = (SeqOrUid::Value(nz(a)), SeqOrUid::Value(nz(b)));
             if a == b {

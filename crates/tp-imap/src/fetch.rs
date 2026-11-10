@@ -633,7 +633,7 @@ impl<T: Transport> Session<T> {
         let Some(selected) = self.selected.clone() else {
             return Ok(());
         };
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let mark_seen = !selected.read_only && items.iter().any(sets_seen);
         let batch = self.ctx.config.limits.fetch_batch.max(1);
         for chunk in indexes.chunks(batch) {
@@ -711,7 +711,7 @@ impl<T: Transport> Session<T> {
         items: &[MessageDataItemName<'static>],
         seen_changed: bool,
     ) -> std::result::Result<(Vec<MessageDataItem<'static>>, Origins), Fail> {
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let store = &self.ctx.deps.store;
         let rev2 = self.rev2;
         let mut raw: Option<Vec<u8>> = None;
@@ -862,7 +862,7 @@ impl<T: Transport> Session<T> {
         let full = match raw {
             Some(r) => r.clone(),
             None => {
-                let scope = self.scope().ok_or(Error::Forbidden)?;
+                let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
                 let probe = HEAD_PROBE.min(msg.size);
                 let head = collect(
                     self.ctx
@@ -900,7 +900,7 @@ impl<T: Transport> Session<T> {
         if let Some(r) = raw {
             return Ok(r.clone());
         }
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let full = collect(self.ctx.deps.store.fetch_raw(scope, msg.id, None).await?).await?;
         *raw = Some(full.clone());
         Ok(full)
@@ -915,7 +915,7 @@ impl<T: Transport> Session<T> {
         if !leaf || path.is_empty() {
             return Ok(None);
         }
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         match self.ctx.deps.store.fetch_part(scope, msg.id, &path).await {
             Ok(stream) => Ok(Some(collect(stream).await?)),
             Err(Error::NotFound | Error::Invalid(_)) => Ok(None),
@@ -930,7 +930,7 @@ impl<T: Transport> Session<T> {
         p: Option<(u32, NonZeroU32)>,
         raw: &mut Option<Vec<u8>>,
     ) -> Result<Vec<u8>> {
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         match section {
             None => match (p, raw.as_ref()) {
                 // Диапазон всего письма — без загрузки целиком.

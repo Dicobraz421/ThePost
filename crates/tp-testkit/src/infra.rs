@@ -12,13 +12,13 @@ use async_trait::async_trait;
 use futures::stream;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
-use tp_contracts::bus::{Event, EventBus, EventStream};
+use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
 use tp_contracts::events::{
     CoreEvent, EventLog, EventPos, EventSink, LoggedEvent, Partition, partition_of,
 };
 use tp_contracts::lease::{Lease, LeaseStore};
 use tp_contracts::meta::AccountScope;
-use tp_contracts::{Error, Result};
+use tp_contracts::{Error, Result, TenantId};
 
 /// Блокировка без паники: отравление мьютекса (паника в другом тесте) не ломает данные testkit.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -97,10 +97,10 @@ impl Clock for ManualClock {
 
 // ---------- Шина уведомлений ----------
 
-/// Шина уведомлений в памяти процесса (at-most-once, как реализации `tp-cluster`).
+/// Шина сигналов в памяти процесса (at-most-once, как реализации `tp-cluster` и `tp-meta`).
 ///
-/// Отстающий подписчик теряет уведомления; [`MemEventBus::disconnect`] завершает все текущие потоки —
-/// имитация потери связи для тестов переподписки.
+/// Отстающий подписчик теряет сигналы и получает вместо них один `EventKind::Resync`;
+/// [`MemEventBus::disconnect`] завершает все текущие потоки — имитация потери связи для тестов переподписки.
 #[derive(Debug, Clone)]
 pub struct MemEventBus {
     tx: Arc<Mutex<broadcast::Sender<Event>>>,
@@ -128,16 +128,24 @@ impl MemEventBus {
         lock(&self.tx).receiver_count()
     }
 
-    fn stream(&self, filter: impl Fn(&Event) -> bool + Send + 'static) -> EventStream {
+    /// Поток подписки; `resync` — сигнал сверки этой подписки.
+    fn stream(
+        &self,
+        resync: Event,
+        filter: impl Fn(&Event) -> bool + Send + 'static,
+    ) -> EventStream {
         let rx = lock(&self.tx).subscribe();
         Box::pin(stream::unfold(
-            (rx, filter),
-            |(mut rx, filter)| async move {
+            (rx, filter, resync),
+            |(mut rx, filter, resync)| async move {
                 loop {
                     match rx.recv().await {
-                        Ok(ev) if filter(&ev) => return Some((ev, (rx, filter))),
-                        // Отставание: пропущенные уведомления потеряны (at-most-once).
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Ok(ev) if filter(&ev) => return Some((ev, (rx, filter, resync))),
+                        Ok(_) => {}
+                        // Отставание: пропущенные сигналы потеряны (at-most-once) — подписчик сверяется.
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            return Some((resync.clone(), (rx, filter, resync)));
+                        }
                         Err(broadcast::error::RecvError::Closed) => return None,
                     }
                 }
@@ -155,17 +163,34 @@ impl Default for MemEventBus {
 #[async_trait]
 impl EventBus for MemEventBus {
     async fn publish(&self, event: Event) -> Result<()> {
-        // Нет подписчиков — уведомление никому не нужно.
+        if event.kind == EventKind::Resync {
+            return Err(Error::invalid(
+                "Resync is inserted by the bus, not published",
+            ));
+        }
+        // Нет подписчиков — сигнал никому не нужен.
         let _ = lock(&self.tx).send(event);
         Ok(())
     }
 
     async fn subscribe(&self, scope: AccountScope) -> Result<EventStream> {
-        Ok(self.stream(move |e| e.tenant == scope.tenant && e.account == Some(scope.account)))
+        let resync = Event {
+            tenant: scope.tenant,
+            account: Some(scope.account),
+            kind: EventKind::Resync,
+        };
+        Ok(self.stream(resync, move |e| {
+            e.tenant == scope.tenant && e.account == Some(scope.account)
+        }))
     }
 
     async fn subscribe_system(&self) -> Result<EventStream> {
-        Ok(self.stream(|e| e.account.is_none()))
+        let resync = Event {
+            tenant: TenantId::DEFAULT,
+            account: None,
+            kind: EventKind::Resync,
+        };
+        Ok(self.stream(resync, |e| e.account.is_none()))
     }
 }
 
@@ -632,19 +657,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lagging_subscriber_loses_events() {
+    async fn lagging_subscriber_gets_resync() {
         let bus = MemEventBus::new(2);
         let mut sys = bus.subscribe_system().await.expect("ok");
+        let queue = Event {
+            tenant: TenantId::DEFAULT,
+            account: None,
+            kind: EventKind::QueueReady,
+        };
         for _ in 0..5 {
-            bus.publish(Event {
-                tenant: TenantId::DEFAULT,
-                account: None,
-                kind: EventKind::QueueReady,
-            })
-            .await
-            .expect("ok");
+            bus.publish(queue.clone()).await.expect("ok");
         }
         bus.disconnect();
-        assert_eq!(sys.by_ref().count().await, 2);
+        let got: Vec<Event> = sys.by_ref().collect().await;
+        let resync = Event {
+            kind: EventKind::Resync,
+            ..queue.clone()
+        };
+        assert_eq!(got, vec![resync, queue.clone(), queue]);
+    }
+
+    #[tokio::test]
+    async fn passes_signal_suite() {
+        crate::suite::signals(&MemEventBus::default()).await;
     }
 }

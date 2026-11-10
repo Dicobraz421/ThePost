@@ -1,5 +1,7 @@
 //! TLS сервера (SRS 6.2): конфигурация rustls из PEM-файлов (цепочка и ключ) с перечитыванием без перезапуска —
-//! по изменению файлов (опрос mtime), по новой версии секции и по запросу (например, после выпуска ACME).
+//! по событию ОС в каталогах файлов (inotify, [`crate::fswatch`]; замена Secret через символическую ссылку), по
+//! SIGHUP, по новой версии секции и по запросу (например, после выпуска ACME). Опрос mtime — только если событий
+//! ОС нет (SRS 2.8).
 //!
 //! Клиентский доступ — TLS 1.3; TLS 1.2 включается настройкой `min_version: "1.2"` для устаревших клиентов.
 //! Ошибка перечитывания оставляет в силе прежние сертификаты.
@@ -23,6 +25,9 @@ use tp_contracts::Error;
 use tp_contracts::config::duration;
 use tp_contracts::role::CancellationToken;
 
+use crate::fswatch::{self, DirWatch, FsEvents};
+use crate::reload::Hup;
+
 /// Секция `tls`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -33,7 +38,8 @@ pub struct TlsConfig {
     pub key_file: PathBuf,
     /// Минимальная версия TLS для клиентского доступа.
     pub min_version: TlsVersion,
-    /// Период проверки изменения файлов (`1m`); `0s` — только по новой версии секции и по запросу.
+    /// Период запасного опроса файлов (`1m`), только если события ОС (inotify) недоступны; `0s` — без опроса,
+    /// только по SIGHUP, новой версии секции и запросу.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub reload_interval: Duration,
@@ -173,24 +179,50 @@ impl TlsCerts {
         Ok(true)
     }
 
-    /// Проверяет файлы каждые `reload_interval` до сигнала остановки; ошибки пишет в лог.
+    /// Перечитывает файлы до сигнала остановки по событиям ОС ([`fswatch::os_events`]) и SIGHUP; без событий ОС —
+    /// опрос с периодом `reload_interval`. Ошибки пишет в лог.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
+        self.run_with(fswatch::os_events(), shutdown).await;
+    }
+
+    /// Как [`TlsCerts::run`] с источником событий `events`.
+    pub async fn run_with(self: Arc<Self>, events: Arc<dyn FsEvents>, shutdown: CancellationToken) {
+        let mut hup = Hup::install();
+        let mut fs = DirWatch::new(events);
         loop {
-            let interval = self.config().reload_interval;
-            // Опрос выключен: период могут включить новой версией секции.
-            let wait = if interval.is_zero() {
-                Duration::from_secs(60)
+            let cfg = self.config();
+            let files = [cfg.cert_file.clone(), cfg.key_file.clone()];
+            let dirs = tokio::task::spawn_blocking(move || {
+                fswatch::dirs_of(&[files[0].as_path(), files[1].as_path()])
+            })
+            .await
+            .unwrap_or_default();
+            fs.ensure(dirs, "tls");
+            // Без событий ОС и с выключенным опросом — ждать SIGHUP, запроса или новой секции (опрос могут включить).
+            let poll = if fs.active() {
+                None
+            } else if cfg.reload_interval.is_zero() {
+                Some((Duration::from_secs(60), false))
             } else {
-                interval
+                Some((cfg.reload_interval, true))
             };
-            tokio::select! {
+            let forced = tokio::select! {
                 () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(wait) => {}
-            }
-            if interval.is_zero() {
-                continue;
-            }
-            match self.reload_if_changed().await {
+                () = hup.recv() => true,
+                () = fs.changed() => false,
+                () = sleep_or_never(poll.map(|(wait, _)| wait)) => {
+                    if poll.is_some_and(|(_, check)| !check) {
+                        continue;
+                    }
+                    false
+                }
+            };
+            let result = if forced {
+                self.reload().await.map(|()| true)
+            } else {
+                self.reload_if_changed().await
+            };
+            match result {
                 Ok(true) => tracing::info!("tls certificates reloaded"),
                 Ok(false) => {}
                 Err(e) => {
@@ -284,6 +316,13 @@ pub(crate) fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> 
         .ok_or_else(|| TlsError::NoKey(path.to_owned()))
 }
 
+async fn sleep_or_never(wait: Option<Duration>) {
+    match wait {
+        Some(wait) => tokio::time::sleep(wait).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn stamp(cfg: &TlsConfig) -> Stamp {
     let one = |p: &Path| match std::fs::metadata(p) {
         Ok(m) => (m.modified().ok(), m.len()),
@@ -301,6 +340,8 @@ pub(crate) mod tests {
     use tokio_rustls::TlsConnector;
 
     use super::*;
+    use crate::fswatch::NoFsEvents;
+    use crate::fswatch::tests::MemFsEvents;
 
     pub(crate) const CERT_A: &str = include_str!("testdata/cert-a.pem");
     pub(crate) const KEY_A: &str = include_str!("testdata/key-a.pem");
@@ -439,6 +480,66 @@ pub(crate) mod tests {
         write_pair(&dir.0, CERT_B, KEY_B);
         assert!(certs.reload_if_changed().await.expect("changed"));
         assert_eq!(handshake(&certs, both()).await.expect("new").1, der(CERT_B));
+    }
+
+    /// Ждёт замены конфигурации rustls после `before`.
+    async fn replaced(certs: &TlsCerts, before: &Arc<ServerConfig>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::ptr_eq(&certs.server_config(), before) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("certificates replaced in time");
+    }
+
+    #[tokio::test]
+    async fn file_event_reloads_without_waiting_for_poll() {
+        let dir = TempDir::new("tls-event");
+        let mut cfg = write_pair(&dir.0, CERT_A, KEY_A);
+        cfg.reload_interval = Duration::from_secs(3600);
+        let certs = Arc::new(TlsCerts::load(&cfg).await.expect("load"));
+        let events = Arc::new(MemFsEvents::default());
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(certs.clone().run_with(events.clone(), shutdown.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.watches() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("watch installed");
+
+        let before = certs.server_config();
+        write_pair(&dir.0, CERT_B, KEY_B);
+        assert_eq!(events.fire(&dir.0), 1);
+        replaced(&certs, &before).await;
+        let both = connector(&[CERT_A, CERT_B], &[&rustls::version::TLS13]);
+        assert_eq!(handshake(&certs, both).await.expect("new").1, der(CERT_B));
+
+        shutdown.cancel();
+        task.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn poll_fallback_without_fs_events() {
+        let dir = TempDir::new("tls-poll");
+        let mut cfg = write_pair(&dir.0, CERT_A, KEY_A);
+        cfg.reload_interval = Duration::from_millis(20);
+        let certs = Arc::new(TlsCerts::load(&cfg).await.expect("load"));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(
+            certs
+                .clone()
+                .run_with(Arc::new(NoFsEvents), shutdown.clone()),
+        );
+
+        let before = certs.server_config();
+        write_pair(&dir.0, CERT_B, KEY_B);
+        replaced(&certs, &before).await;
+
+        shutdown.cancel();
+        task.await.expect("join");
     }
 
     #[tokio::test]

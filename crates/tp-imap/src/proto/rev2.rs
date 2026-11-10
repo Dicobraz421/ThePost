@@ -1,14 +1,14 @@
 //! Команды IMAP4rev2, которых нет в грамматике imap-codec (IMAP4rev1 и расширения):
 //! расширенный `LIST` (RFC 5258: опции выбора, несколько шаблонов, `RETURN`; RFC 5819 `STATUS`;
 //! RFC 6154 `SPECIAL-USE`), `CREATE … (USE (…))` (RFC 6154), `STATUS` с `SIZE` (RFC 8438) и `SEARCH RETURN (…)`
-//! (ESEARCH, RFC 4731): параметры `RETURN` вырезаются, критерии разбирает imap-codec.
+//! (ESEARCH, RFC 4731): параметры `RETURN` вырезаются, критерии разбирает imap-codec; команды ACL (RFC 4314).
 //!
 //! Разбирается сообщение, которое imap-codec не принял, целиком (строки и литералы уже собраны
 //! нарезкой потока); прочие команды — `None`, сессия отвечает `BAD`.
 
 use super::types::IntoStatic;
 use super::types::core::Tag;
-use super::{Body, Command, ListCommand, StatusItem};
+use super::{AclCommand, Body, Command, ListCommand, StatusItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
@@ -248,6 +248,25 @@ pub(super) fn parse(msg: &[u8]) -> Option<Command> {
                 items: status_items(&mut p)?,
             }
         }
+        "SETACL" => Body::Acl(AclCommand::Set {
+            mailbox: p.string()?,
+            identifier: p.string()?,
+            rights: p.string()?,
+        }),
+        "DELETEACL" => Body::Acl(AclCommand::Delete {
+            mailbox: p.string()?,
+            identifier: p.string()?,
+        }),
+        "GETACL" => Body::Acl(AclCommand::Get {
+            mailbox: p.string()?,
+        }),
+        "LISTRIGHTS" => Body::Acl(AclCommand::ListRights {
+            mailbox: p.string()?,
+            identifier: p.string()?,
+        }),
+        "MYRIGHTS" => Body::Acl(AclCommand::MyRights {
+            mailbox: p.string()?,
+        }),
         _ => return None,
     };
     p.done().then_some(Command { tag, body })

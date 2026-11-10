@@ -253,7 +253,7 @@ impl BusSection {
     /// Проверка: адрес Valkey `rediss://` (`redis://` — только dev с `valkey.tls.allow_plaintext`),
     /// пароль — только ссылкой `valkey.password` (в адресе — только dev): `ValkeyConfig::check`.
     pub fn check(&self, profile: Profile) -> Result<()> {
-        self.valkey.tls.validate(InternalChannel::Valkey, profile)?;
+        self.valkey.check_tls(profile)?;
         if self.kind != BusKind::Valkey {
             return Ok(());
         }

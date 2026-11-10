@@ -184,6 +184,7 @@ mod tests {
 
     use async_trait::async_trait;
     use tp_contracts::Error;
+    use tp_contracts::membership::NodeInfo;
 
     use super::*;
 
@@ -206,10 +207,10 @@ mod tests {
 
     #[async_trait]
     impl Membership for StubMembership {
-        async fn heartbeat(&self, node: &NodeId, _ttl: Duration) -> Result<()> {
+        async fn heartbeat(&self, node: &NodeInfo, _ttl: Duration) -> Result<()> {
             let mut live = self.live.lock().expect("lock");
-            if !live.contains(node) {
-                live.push(node.clone());
+            if !live.contains(&node.id) {
+                live.push(node.id.clone());
             }
             Ok(())
         }
@@ -224,6 +225,10 @@ mod tests {
                 return Err(Error::Unavailable { retry_after: None });
             }
             Ok(self.live.lock().expect("lock").clone())
+        }
+
+        async fn live_info(&self) -> Result<Vec<NodeInfo>> {
+            Ok(self.live().await?.into_iter().map(NodeInfo::new).collect())
         }
     }
 
@@ -413,7 +418,7 @@ mod tests {
         let mut rx = a.members();
         let all = a.assigned("indexer", &n1, 16);
 
-        m.heartbeat(&node("n2"), Duration::from_secs(30))
+        m.heartbeat(&NodeInfo::new(node("n2")), Duration::from_secs(30))
             .await
             .expect("heartbeat");
         assert_eq!(next(&mut rx).await, nodes(&["n1", "n2"]));

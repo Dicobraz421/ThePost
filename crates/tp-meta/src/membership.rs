@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqlx::FromRow;
 use time::OffsetDateTime;
-use tp_contracts::membership::{Membership, NodeId};
+use tp_contracts::membership::{Membership, NodeId, NodeInfo};
 use tp_contracts::{Error, Result};
 
 use crate::PgMeta;
@@ -104,8 +104,9 @@ impl PgMeta {
 
 #[async_trait]
 impl Membership for PgMeta {
-    async fn heartbeat(&self, node: &NodeId, ttl: Duration) -> Result<()> {
-        self.upsert_node(node, None, ttl).await
+    async fn heartbeat(&self, node: &NodeInfo, ttl: Duration) -> Result<()> {
+        // Роли, адрес и площадка записи узла (NodeInfo) — META-27; пока продлевается только срок.
+        self.upsert_node(&node.id, None, ttl).await
     }
 
     async fn leave(&self, node: &NodeId) -> Result<()> {
@@ -115,6 +116,13 @@ impl Membership for PgMeta {
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn live_info(&self) -> Result<Vec<NodeInfo>> {
+        // Заглушка до META-27 (адрес и площадка узла в таблице `nodes`).
+        Err(Error::internal(
+            "Membership::live_info: not implemented for PostgreSQL yet (META-27)",
+        ))
     }
 
     async fn live(&self) -> Result<Vec<NodeId>> {

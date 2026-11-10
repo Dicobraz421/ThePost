@@ -1,6 +1,6 @@
 //! Окружение тестов: Admin API поверх in-memory реализаций tp-testkit; запросы — `tower::ServiceExt::oneshot`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -16,14 +16,11 @@ use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::groups::{DistributionGroup, HeldMessage};
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
-use tp_contracts::meta::{AccountScope, Flags, Policy, PolicyResolver, SpecialUse};
-use tp_contracts::retention::{TrashPurge, TrashPurgeSetting};
-use tp_contracts::{
-    AccountId, DomainId, Error, GroupId, HeldId, MailboxId, MessageId, Result, TenantId,
-};
+use tp_contracts::meta::{AccountScope, Flags, Policy, SpecialUse};
+use tp_contracts::{AccountId, DomainId, Error, GroupId, HeldId, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
-    MemEventBus, MemGroups, MemMetadata, MemQuota, MemTrash, SystemClock,
+    MemEventBus, MemGroups, MemMetadata, MemPolicies, MemQuota, MemTrash, PolicyLevel, SystemClock,
 };
 
 use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
@@ -125,17 +122,11 @@ impl Moderation for MemModeration {
     }
 }
 
-/// Политики уровней в памяти; разрешение — наложение организация → домен → учётная запись.
-#[derive(Debug, Clone, Default)]
-pub struct MemPolicies(Arc<Mutex<HashMap<(TenantId, PolicyTarget), Policy>>>);
-
+/// Политики уровней — [`MemPolicies`] tp-testkit (разрешение цепочки и выбор пользователя `trash.purge`).
 #[async_trait]
 impl PolicyStore for MemPolicies {
     async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
-        Ok(lock(&self.0)
-            .get(&(tenant, target))
-            .cloned()
-            .unwrap_or_default())
+        Ok(MemPolicies::policy(self, tenant, level(target)))
     }
 
     async fn set_policy(
@@ -144,48 +135,16 @@ impl PolicyStore for MemPolicies {
         target: PolicyTarget,
         policy: &Policy,
     ) -> Result<()> {
-        let mut m = lock(&self.0);
-        if *policy == Policy::default() {
-            m.remove(&(tenant, target));
-        } else {
-            m.insert((tenant, target), policy.clone());
-        }
+        MemPolicies::set_policy(self, tenant, level(target), policy.clone());
         Ok(())
     }
 }
 
-#[async_trait]
-impl PolicyResolver for MemPolicies {
-    async fn resolve(
-        &self,
-        tenant: TenantId,
-        domain: Option<DomainId>,
-        account: Option<AccountId>,
-        _mailbox: Option<MailboxId>,
-    ) -> Result<Policy> {
-        let levels = [
-            Some(PolicyTarget::Tenant),
-            domain.map(PolicyTarget::Domain),
-            account.map(PolicyTarget::Account),
-        ];
-        let mut p = Policy::default();
-        for t in levels.into_iter().flatten() {
-            p = p.overlay(self.policy(tenant, t).await?);
-        }
-        Ok(p)
-    }
-
-    // Настройка `trash.purge` в тестах Admin API — ADM-09 (CTR-26 добавил методы контракта).
-    async fn trash_purge(&self, _scope: AccountScope) -> Result<TrashPurgeSetting> {
-        Err(Error::internal("trash.purge: не реализовано (ADM-09)"))
-    }
-
-    async fn set_user_trash_purge(
-        &self,
-        _scope: AccountScope,
-        _mode: Option<TrashPurge>,
-    ) -> Result<()> {
-        Err(Error::internal("trash.purge: не реализовано (ADM-09)"))
+fn level(target: PolicyTarget) -> PolicyLevel {
+    match target {
+        PolicyTarget::Tenant => PolicyLevel::Tenant,
+        PolicyTarget::Domain(d) => PolicyLevel::Domain(d),
+        PolicyTarget::Account(a) => PolicyLevel::Account(a),
     }
 }
 
@@ -238,6 +197,8 @@ pub struct Stores {
     pub groups: MemGroups,
     pub delivery: MemDeliveryLog,
     pub moderation: MemModeration,
+    pub policies: MemPolicies,
+    pub trash: MemTrash,
 }
 
 impl Stores {
@@ -246,12 +207,14 @@ impl Stores {
         let index = MemBlobIndex::new(clock.clone());
         let meta = MemMetadata::new(clock.clone()).with_blob_index(index.clone());
         let quota = MemQuota::new(&meta);
+        let policies = MemPolicies::new(&meta);
+        let trash = MemTrash::new(&meta).with_policies(policies.clone());
         let store = tp_mailstore::Store::new(tp_mailstore::Deps {
             blobs: Arc::new(MemBlobStore::new(clock)),
             index: Arc::new(index),
             messages: Arc::new(meta.clone()),
             changes: Arc::new(meta.clone()),
-            trash: Arc::new(MemTrash::new(&meta)),
+            trash: Arc::new(trash.clone()),
             quota: Arc::new(quota.clone()),
             bus: Arc::new(MemEventBus::default()),
             hooks: DecisionHooks::default(),
@@ -265,6 +228,8 @@ impl Stores {
             groups: MemGroups::new(),
             delivery: MemDeliveryLog::new(),
             moderation: MemModeration::default(),
+            policies,
+            trash,
         }
     }
 
@@ -279,7 +244,6 @@ impl Stores {
 
     /// Зависимости Admin API поверх хранилищ (без субъектов и модулей).
     pub fn deps(&self) -> Deps {
-        let policies = MemPolicies::default();
         Deps {
             auth: Arc::new(FakeAuthenticator::default()),
             audit: Arc::new(MemAudit::default()),
@@ -290,10 +254,10 @@ impl Stores {
             modules: Vec::new(),
             accounts: Arc::new(self.meta.clone()),
             quota: Arc::new(self.quota.clone()),
-            policies: Arc::new(policies.clone()),
-            resolver: Arc::new(policies),
+            policies: Arc::new(self.policies.clone()),
+            resolver: Arc::new(self.policies.clone()),
             domains: Arc::new(MemDomains::default()),
-            trash: Arc::new(MemTrash::new(&self.meta)),
+            trash: Arc::new(self.trash.clone()),
             store: Arc::new(self.store.clone()),
             app_passwords: self.app_passwords(),
         }
@@ -317,6 +281,8 @@ pub struct Env {
     pub meta: MemMetadata,
     pub quota: MemQuota,
     pub store: tp_mailstore::Store,
+    pub policies: MemPolicies,
+    pub trash: MemTrash,
     pub app_passwords: tp_auth::AppPasswords,
     pub router: Router,
     pub other_tenant: TenantId,
@@ -401,6 +367,8 @@ impl Env {
             groups,
             delivery,
             moderation,
+            policies,
+            trash,
             ..
         } = stores;
         Self {
@@ -412,6 +380,8 @@ impl Env {
             meta,
             quota,
             store,
+            policies,
+            trash,
             app_passwords,
             router: Arc::new(admin).router(),
             other_tenant,

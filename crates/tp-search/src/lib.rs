@@ -21,7 +21,7 @@ pub mod rebuild;
 pub use cache::{CacheConfig, CacheStats, IndexCache};
 pub use extract::{ExtractConfig, ExtractLimits, Extractor, NotExtracted};
 pub use index::{IndexConfig, IndexDoc, IndexManager, IndexOp, MailIndex, SCHEMA_VERSION};
-pub use indexer::{DocumentSource, Indexer, IndexerConfig, SUBSCRIBER};
+pub use indexer::{DocumentSource, Indexer, IndexerConfig, IndexerStats, SUBSCRIBER};
 pub use persist::{IndexStore, PersistConfig};
 pub use query::{QueryConfig, Search};
 pub use rebuild::{RebuildConfig, Rebuilder};

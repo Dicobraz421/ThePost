@@ -93,12 +93,16 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 - `set_flags`, `copy`, `move_to`, `delete_to_trash`, `restore` (по `AccountScope`) — публикуют событие в `EventBus` после фиксации.
 
 ## EventBus
-SRS 2.1. `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`. `Event { tenant, account: Option, kind }`,
-`kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded`.
-Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер; решение 2026-11-01, SRS 2.8). Доставка — at-most-once;
-клиент после переподключения сверяется по `ModSeq`. Публикация — только после фиксации, вне транзакции изменения. CTR-23: `kind` дополняется
-`LogAppended { partition }`, `MembersChanged`, `Blocked { subject }`, `Resync` (переполнение буфера подписчика — сверка с хранилищем);
-`subscribe_system()` получает системные виды. Valkey удаляется (CLU-09).
+SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
+`Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
+LogAppended { partition } | MembersChanged | Blocked { subject } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+`MailboxListChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
+`MembersChanged` — с `TenantId::DEFAULT`, `Blocked` — с организацией блокировки). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
+при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
+Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер); in-memory — `MemEventBus` (отставание — `Resync`).
+Доставка — at-most-once; клиент при запуске, после переподключения и по `Resync` сверяется с хранилищем. Публикация — только после фиксации,
+вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked` — реализация `AbuseBlocks`. Набор `suite::signals`.
+Шина Valkey удаляется (CLU-09).
 
 ## Lease
 `LeaseStore`: `try_acquire(name, holder, ttl) -> Option<Lease>`, `renew(&Lease, ttl) -> Option<Lease>`, `release`.
@@ -122,20 +126,33 @@ watch::Receiver<Vec<NodeId>>` (новое значение — пересчит�
 `leave(&NodeId)` — удалить (штатная остановка; отсутствующая — не ошибка), `live() -> Vec<NodeId>` — узлы с непросроченной записью,
 по возрастанию. Время — часы хранилища (PostgreSQL). `NodeId` — имя экземпляра, не пустое, без пробелов, ≤ 255 байт (строка в JSON).
 Реализация — `tp-meta` (META-16), in-memory — `tp-testkit`. Код — `membership.rs`.
-CTR-23: запись узла дополняется ролями, адресом служебного канала и площадкой (`NodeInfo { id, roles, addr, site }`, `live_info()`;
-`site` — из конфигурации узла, по умолчанию `default`); вход и выход узла
-публикуются сигналом `MembersChanged`; `PartitionAssigner::members()` обновляется по сигналу, а не опросом.
+CTR-23 (решение 2026-11-01): `heartbeat(&NodeInfo, ttl)` — запись узла `NodeInfo { id, roles: BTreeSet<Role>, addr, site: SiteId }`
+(роли, адрес служебного канала `https://host:port`, пусто — запросов не принимает; `SiteId` — из конфигурации узла, по умолчанию `default`,
+правила имени — как у `NodeId`); продление заменяет роли, адрес и площадку. `live_info() -> Vec<NodeInfo>` — живые записи по возрастанию `id`;
+`live()` — их идентификаторы (метод по умолчанию). Новая запись (и после истечения), изменение записи и выход живого узла — сигнал
+`MembersChanged` после фиксации; истечение — без сигнала (срок аренды). `PartitionAssigner::members()` обновляется по сигналу, а не опросом
+(CLU-10). In-memory — `MemMembership` (`with_bus` — сигналы); наборы `suite::membership`, `suite::membership_info`. В `PgMeta` роли, адрес
+и площадка и `live_info()` — META-27 (пока заглушка).
 
 ## Rpc
-Решение 2026-11-01, SRS 2.8 (CTR-23). Запрос узел → узел: `Rpc::call(service, key, body, deadline) -> Result<Bytes>`; `service` — роль и имя
-службы, маршрут — `live_info()` с нужной ролью, владелец ключа — rendezvous-хэширование, при отказе — следующий. Ошибки: `Busy` (параллельность
-превышена), `Timeout`, `Unavailable`. Обработчик — `RpcHandler` регистрируется ролью; матрица разрешений «роль → службы» проверяется
-на принимающем узле по сертификату вызывающего. Транспорт — HTTPS/2 с mTLS (`InternalChannel::Node`). Реализация — `tp-cluster`.
+Решение 2026-11-01, SRS 2.8 (CTR-23). Запрос узел → узел: `Rpc::call(&RpcService, key, body: Bytes, deadline: Duration) -> Result<Bytes, RpcError>`;
+`RpcService::new(role, name)` — роль и имя службы (`[a-z0-9._-]`, ≤ 64; `search/query`), маршрут — `live_info()` с ролью службы, владелец ключа —
+rendezvous-хэширование, при отказе узла — следующий. `RpcError`: `Busy` (параллельность на узле-владельце превышена; без повтора на другом
+узле), `Timeout` (срок), `Unavailable` (нет живых узлов роли или все недоступны), `Failed(Error)` (ошибка обработчика; `Forbidden` — матрица
+разрешений, `NotFound` — служба не зарегистрирована на узле); `Error::from(RpcError)`: первые три — `Unavailable` (временный отказ),
+`Failed(e)` — `e`. Обработчик — `RpcHandler::handle(RpcRequest { caller, key, body, deadline }) -> Result<Bytes>`, регистрируется ролью
+через `Rpc::serve(service, handler)` (повтор — `Conflict`); матрица разрешений «роль → службы» проверяется на принимающем узле по сертификату
+вызывающего. Транспорт — HTTPS/2 с mTLS (`InternalChannel::Node`). Реализация — `tp-cluster` (CLU-11), in-memory — `MemRpcNet`/`MemRpc`;
+набор `suite::rpc`.
 
 ## AbuseBlocks
-Решение 2026-11-01, SRS 6.3 (CTR-23). Блокировки источников и учётных записей: `block(tenant, subject, until, reason)`,
-`blocked(tenant, subject) -> Option<until>`; `subject` — IP, подсеть или учётная запись. Счётчики попыток — на узле (`tp-auth`);
-факт блокировки — в PostgreSQL (`tp-meta`) и сигнал `Blocked`.
+Решение 2026-11-01, SRS 6.3 (CTR-23). Блокировки источников и учётных записей организации: `block(tenant, &subject, until, reason)`
+(срок в прошлом — `Invalid`; действующая блокировка не сокращается, причина — последняя), `blocked(tenant, &subject) -> Option<until>`
+(наибольший действующий срок с учётом подсетей, покрывающих адрес), `unblock(tenant, &subject)` (только этот субъект; отсутствующий — не
+ошибка), `active(tenant) -> Vec<AbuseBlock { subject, until, reason }>` (локальный набор узла при запуске и `Resync`). `BlockSubject:
+Ip(IpAddr) | Net { addr, prefix } | Account(AccountId)`; подсеть — `BlockSubject::net(addr, prefix)` (биты узла обнулены), `covers()`.
+Время — часы хранилища. Счётчики попыток — на узле (`tp-auth`, AUTH-08); факт блокировки — в PostgreSQL (`tp-meta`, META-27), после
+фиксации `block` реализация публикует `Blocked { subject }`. In-memory — `MemAbuseBlocks` (`with_bus`), набор `suite::abuse_blocks`.
 
 ## DeliveryLog
 SRS 5.2, решение 2026-11-01-borrowings-security (CTR-21; код — `delivery.rs`). Журнал доставки (message tracking): только добавление
@@ -374,3 +391,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-04 — решение «Соответствие функциям Exchange» (CTR-35): `MailboxAudit`, `SenderLists`, контакты, динамические группы и оргструктура в `Directory`,
   срок выпуска и отмена в `QueueStore`, выборка журнала доставки по отправке, `AccountState`.
 - 2026-11-04 — решение «Внешние встречи» (CTR-36): `AvailabilitySource`, `Registry::add_availability_source`, `CalendarPublications`.
+- 2026-11-10 — CTR-23 (x/contracts-12, решение 2026-11-01-interaction-db-ha): `EventKind::{LogAppended, MembersChanged, Blocked, Resync}`,
+  `EventKind::is_system`, `publish(Resync)` — `Invalid`; `membership::{NodeInfo, SiteId}`, `Membership::heartbeat(&NodeInfo, ttl)`,
+  `live_info()` (`live()` — по умолчанию); `rpc::{Rpc, RpcHandler, RpcService, RpcRequest, RpcError}`; `abuse::{AbuseBlocks, AbuseBlock,
+  BlockSubject}`; `InternalChannel::Valkey` удалён (проверка адреса шины Valkey — в `tp-cluster` до CLU-09). In-memory — `MemEventBus`
+  (`Resync` при отставании), `MemMembership` (`NodeInfo`, `with_bus`), `MemRpcNet`/`MemRpc`, `MemAbuseBlocks`; наборы `suite::{signals,
+  membership_info, rpc, abuse_blocks}`. `PgMeta::live_info` — заглушка до META-27.

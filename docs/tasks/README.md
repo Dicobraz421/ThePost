@@ -179,10 +179,10 @@
 | [JMAP-06](JMAP-06.md) | Бинарные данные | jmap | A | jmap-02 | done | JMAP-01,MS-03 |
 | [JMAP-07](JMAP-07.md) | Identity и EmailSubmission | jmap | A | jmap-02 | done | JMAP-05,SMTP-06 |
 | [JMAP-08](JMAP-08.md) | Push и SearchSnippet | jmap | A | jmap-02 | done | JMAP-04,CLU-01 |
-| [IMAP-09](IMAP-09.md) | QRESYNC | imap | A | imap-03 | ready | IMAP-05 |
-| [IMAP-10](IMAP-10.md) | NAMESPACE, QUOTA, ACL | imap | A | imap-03 | ready | IMAP-03,AUTH-06,MS-06 |
-| [IMAP-11](IMAP-11.md) | COMPRESS и мелкие расширения | imap | A | imap-03 | ready | IMAP-02 |
-| [IMAP-12](IMAP-12.md) | POP3 | imap | A | imap-03 | ready | IMAP-04 |
+| [IMAP-09](IMAP-09.md) | QRESYNC | imap | A | imap-03 | done | IMAP-05 |
+| [IMAP-10](IMAP-10.md) | NAMESPACE, QUOTA, ACL | imap | A | imap-03 | done | IMAP-03,AUTH-06,MS-06 |
+| [IMAP-11](IMAP-11.md) | COMPRESS и мелкие расширения | imap | A | imap-03 | done | IMAP-02 |
+| [IMAP-12](IMAP-12.md) | POP3 | imap | A | imap-03 | done | IMAP-04 |
 | [APP-04](APP-04.md) | Профиль SMB | app | A | app-02 | done | APP-01,SMTP-04,IMAP-04,JMAP-04,SRCH-02,ADM-01 |
 | [APP-05](APP-05.md) | Сквозной тест MVP | app | A | app-02 | done | APP-04 |
 | [APP-06](APP-06.md) | doctor: DNS и сертификаты | app | A | app-02 | done | APP-02 |
@@ -219,7 +219,7 @@
 | [ADM-05](ADM-05.md) | поиск в журнале доставки | admin | A | admin-02 | done | ADM-01,META-22 |
 | [ADM-06](ADM-06.md) | роли оператора и аудитора, экспорт аудита | admin | A | admin-02 | done | ADM-01 |
 | [ADM-07](ADM-07.md) | группы рассылки: модерация и настройки | admin | A | admin-02 | done | ADM-01,META-21 |
-| [IMAP-13](IMAP-13.md) | фаззинг разборщика IMAP | imap | A | imap-04 | todo | IMAP-01 |
+| [IMAP-13](IMAP-13.md) | фаззинг разборщика IMAP | imap | A | imap-04 | ready | IMAP-01 |
 | [JMAP-09](JMAP-09.md) | фаззинг разборщика JMAP | jmap | A | jmap-03 | ready | JMAP-01 |
 | [DEP-08](DEP-08.md) | минимальные привилегии в эталонной поставке | deploy | A | deploy-05 | todo | DEP-02,DEP-07,META-23,PLT-16 |
 
@@ -227,15 +227,15 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-23](CTR-23.md) | контракты взаимодействия: сигналы, Rpc, NodeInfo, AbuseBlocks | contracts | B | contracts-12 | todo | CTR-22 |
+| [CTR-23](CTR-23.md) | контракты взаимодействия: сигналы, Rpc, NodeInfo, AbuseBlocks | contracts | B | contracts-12 | done | CTR-22 |
 | [META-25](META-25.md) | поиск primary и поведение при переключении СУБД | meta | A | meta-09 | ready | META-02 |
 | [META-26](META-26.md) | сигналы через LISTEN/NOTIFY | meta | A | meta-10 | todo | CTR-23,META-25 |
 | [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-10 | todo | CTR-23,META-16 |
-| [CLU-09](CLU-09.md) | удалить шину Valkey | cluster | A | cluster-06 | todo | CTR-23 |
-| [CLU-10](CLU-10.md) | состав кластера и разделы по сигналу | cluster | A | cluster-06 | todo | CTR-23 |
-| [CLU-11](CLU-11.md) | запросы узел → узел (Rpc) | cluster | A | cluster-06 | todo | CTR-23 |
+| [CLU-09](CLU-09.md) | удалить шину Valkey | cluster | A | cluster-06 | ready | CTR-23 |
+| [CLU-10](CLU-10.md) | состав кластера и разделы по сигналу | cluster | A | cluster-06 | ready | CTR-23 |
+| [CLU-11](CLU-11.md) | запросы узел → узел (Rpc) | cluster | A | cluster-06 | ready | CTR-23 |
 | [APP-08](APP-08.md) | сборка взаимодействия без опроса | app | A | app-04 | todo | META-26,CLU-09,CLU-10 |
-| [PLT-17](PLT-17.md) | перечитывание конфигурации и сертификатов по событиям | platform | A | platform-07 | ready | PLT-16 |
+| [PLT-17](PLT-17.md) | перечитывание конфигурации и сертификатов по событиям | platform | A | platform-07 | done | PLT-16 |
 | [MS-14](MS-14.md) | истечение корзины по ближайшему сроку | mailstore | A | mailstore-08 | ready | MS-13 |
 | [BLOB-14](BLOB-14.md) | GC по ближайшему сроку отсрочки | blob | A | blob-07 | ready | BLOB-13 |
 | [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | todo | META-27 |
@@ -246,7 +246,7 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-24](CTR-24.md) | контракты настроек транспорта и точка расширения правил потока | contracts | B | contracts-13 | todo | CTR-23 |
+| [CTR-24](CTR-24.md) | контракты настроек транспорта и точка расширения правил потока | contracts | B | contracts-13 | ready | CTR-23 |
 | [META-28](META-28.md) | хранение настроек транспорта | meta | A | meta-11 | todo | CTR-24,META-26 |
 | [SMTP-20](SMTP-20.md) | доверенные источники: шлюз и приложения | smtp | A | smtp-06 | todo | CTR-24,SMTP-12,SMTP-04 |
 | [SMTP-21](SMTP-21.md) | принятые домены и внутренняя ретрансляция | smtp | A | smtp-06 | todo | CTR-24,SMTP-03,SMTP-09 |
@@ -260,7 +260,7 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-34](CTR-34.md) | раздел журнала событий по шардам | contracts | B | contracts-22 | todo | CTR-23 |
+| [CTR-34](CTR-34.md) | раздел журнала событий по шардам | contracts | B | contracts-22 | ready | CTR-23 |
 | [META-30](META-30.md) | хранилища ящика через справочник шардов | meta | A | meta-13 | todo | META-29,META-27 |
 | [META-31](META-31.md) | журнал событий, очередь и учёт BLOB по шардам | meta | A | meta-13 | todo | META-30,CTR-34 |
 | [META-32](META-32.md) | чтение с реплик для фоновых задач | meta | A | meta-14 | todo | META-30 |
@@ -340,14 +340,26 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CMP-01](CMP-01.md) | эталон `--profile smb` принимает соединения | deploy | A | deploy-08 | ready | — |
-| [CMP-02](CMP-02.md) | каталоги ролей создаются до наложения Landlock | app | A | app-09 | ready | — |
-| [CMP-06](CMP-06.md) | индексатор — повтор после ошибки с нарастающей паузой | search | A | search-03 | ready | — |
-| [CMP-03](CMP-03.md) | EmailSubmission/query и queryChanges | jmap | A | jmap-10 | ready | — |
-| [CMP-04](CMP-04.md) | отправка локальному адресату — доставка сразу, без внешней очереди | smtp | A | smtp-08 | ready | — |
-| [CMP-05](CMP-05.md) | системные папки при создании учётной записи и при первом входе | meta | A | meta-17 | ready | — |
-| [CMP-08](CMP-08.md) | `Outbound` JMAP со статусами по получателям | jmap | A | jmap-11 | todo | CMP-03 |
-| [CMP-07](CMP-07.md) | отправка из JMAP через `Delivery` — локальным адресатам сразу | app | A | app-10 | todo | CMP-04,CMP-08 |
+| [CMP-01](CMP-01.md) | эталон `--profile smb` принимает соединения | deploy | A | deploy-08 | done | — |
+| [CMP-02](CMP-02.md) | каталоги ролей создаются до наложения Landlock | app | A | app-09 | done | — |
+| [CMP-06](CMP-06.md) | индексатор — повтор после ошибки с нарастающей паузой | search | A | search-03 | done | — |
+| [CMP-03](CMP-03.md) | EmailSubmission/query и queryChanges | jmap | A | jmap-10 | done | — |
+| [CMP-04](CMP-04.md) | отправка локальному адресату — доставка сразу, без внешней очереди | smtp | A | smtp-08 | done | — |
+| [CMP-05](CMP-05.md) | системные папки при создании учётной записи и при первом входе | meta | A | meta-17 | done | — |
+| [CMP-08](CMP-08.md) | `Outbound` JMAP со статусами по получателям | jmap | A | jmap-11 | done | CMP-03 |
+| [CMP-07](CMP-07.md) | отправка из JMAP через `Delivery` — локальным адресатам сразу | app | A | app-10 | done | CMP-04,CMP-08 |
+| [KIT-07](KIT-07.md) | in-memory ящик — 6 системных папок и дополнение при открытии | testkit | A | testkit-04 | ready | CMP-05 |
+| [META-35](META-35.md) | ошибка одного раздела журнала не прерывает опрос остальных | meta | A | meta-18 | ready | — |
+| [CMP-09](CMP-09.md) | метрики индексатора и doctor для служебных доменов | app | A | app-11 | ready | CMP-06 |
+| [APP-13](APP-13.md) | подключение расширений IMAP, POP3 и PSI в `serve` | app | A | app-12 | todo | IMAP-12,PLT-17 |
+| [PLT-19](PLT-19.md) | события файловой системы через `notify` | platform | A | platform-09 | ready | PLT-17 |
+| [SYS-08](SYS-08.md) | Landlock — корневые сертификаты по ссылкам Debian | sys | A | sys-04 | ready | SYS-07 |
+| [SYS-09](SYS-09.md) | ожидание событий PSI в tp-sys | sys | A | sys-04 | ready | PLT-17 |
+| [CTR-37](CTR-37.md) | системный сигнал изменения корзины | contracts | B | contracts-25 | ready | CTR-23 |
+| [IMAP-16](IMAP-16.md) | POP3 — блокировка ящика; запись в общие папки по ACL | imap | A | imap-07 | ready | IMAP-12,IMAP-10 |
+| [APP-14](APP-14.md) | ACME и переключение СУБД в `serve` | app | A | app-13 | todo | META-25,DEP-05 |
+| [CTR-38](CTR-38.md) | контракты GC, владельца загрузки и восстановления скрытых писем | contracts | B | contracts-26 | todo | CTR-23 |
+| [SMTP-28](SMTP-28.md) | `Delivery::submit` без очереди — ошибка только для внешних получателей | smtp | A | smtp-09 | ready | CMP-04 |
 
 ## Вне волн
 

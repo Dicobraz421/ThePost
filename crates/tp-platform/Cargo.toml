@@ -17,6 +17,7 @@ async-trait.workspace = true
 schemars.workspace = true
 axum.workspace = true
 instant-acme.workspace = true
+notify.workspace = true
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true

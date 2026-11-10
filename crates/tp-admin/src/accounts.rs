@@ -4,6 +4,8 @@
 //! - домены: список, создание, удаление, политика домена;
 //! - учётные записи приходят из каталога (LDAP): здесь — поиск по имени входа, чтение с использованием квоты и
 //!   только локальные атрибуты — политика ящика (квота, срок корзины, лимиты отправки);
+//! - правило `trash.purge` (`mode`, `user_can_choose`) — поле политики уровня; выбор пользователя и действующее
+//!   значение ящика — [`crate::retention`];
 //! - политика уровня задаётся целиком (`PUT`), поле `null` — не задано на уровне; действующая политика
 //!   (`effective`) — наложение цепочки организация → домен → ящик (`PolicyResolver`).
 //!
@@ -21,9 +23,11 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_contracts::config::duration;
 use tp_contracts::meta::{Account, Policy};
+use tp_contracts::retention::TrashPurgeRule;
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::retention::TrashPurgeRuleBody;
 use crate::server::{Admin, ApiResult, Problem};
 
 /// Уровень цепочки политик, задаваемый через Admin API.
@@ -101,6 +105,9 @@ pub struct PolicyBody {
     /// Профиль Milter.
     #[serde(default)]
     pub milter_profile: Option<String>,
+    /// Правило «очистить корзину» в клиенте (`trash.purge`, решение 2026-11-01-trash-purge).
+    #[serde(default)]
+    pub trash_purge: Option<TrashPurgeRuleBody>,
 }
 
 impl From<Policy> for PolicyBody {
@@ -113,6 +120,7 @@ impl From<Policy> for PolicyBody {
             max_recipients: p.max_recipients,
             dkim_selector: p.dkim_selector,
             milter_profile: p.milter_profile,
+            trash_purge: p.trash_purge.map(TrashPurgeRuleBody::from),
         }
     }
 }
@@ -127,8 +135,7 @@ impl From<PolicyBody> for Policy {
             max_recipients: p.max_recipients,
             dkim_selector: p.dkim_selector,
             milter_profile: p.milter_profile,
-            // `trash.purge` в Admin API — ADM-09.
-            trash_purge: None,
+            trash_purge: p.trash_purge.map(TrashPurgeRule::from),
         }
     }
 }

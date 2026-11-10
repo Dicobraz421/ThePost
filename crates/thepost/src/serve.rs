@@ -409,7 +409,7 @@ impl RoleSetup<'_> {
             ),
             Role::Jmap => {
                 let cfg = (*self.cfg.section::<tp_jmap::JmapConfig>(sections::JMAP)?).clone();
-                let jmap = Arc::new(self.services.jmap(self.ext, cfg)?);
+                let jmap = Arc::new(self.services.jmap(self.ext, cfg, &*smtp()?)?);
                 let stop = jmap.clone();
                 let service = HttpRole::new(
                     role,
