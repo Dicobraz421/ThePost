@@ -1168,3 +1168,144 @@ mod groups {
         );
     }
 }
+
+mod tracking {
+    //! SMTP-17: журнал доставки — сквозной путь smtp-in, submission, smtp-out на фейках.
+
+    use tp_contracts::delivery::{DeliveryDecision, DeliveryEvent, DeliveryEventKind};
+    use tp_contracts::membership::NodeId;
+    use tp_testkit::MemDeliveryLog;
+
+    use super::*;
+    use crate::config::QueueConfig;
+    use crate::queue::tests::Env as QueueEnv;
+    use crate::queue::{Queue as OutQueue, QueueWorker, RcptResult, SendRequest, Transport};
+    use crate::tracking::Tracking;
+
+    /// Принимающие серверы: `y@…` — постоянный отказ, остальные — приняты.
+    struct ByAddress;
+
+    #[async_trait]
+    impl Transport for ByAddress {
+        async fn send(&self, req: SendRequest<'_>) -> Vec<RcptResult> {
+            req.rcpts
+                .iter()
+                .map(|r| {
+                    if r.starts_with("y@") {
+                        RcptResult::Permanent("550 5.1.1 no such user".into())
+                    } else {
+                        RcptResult::Delivered("250 2.0.0 ok".into())
+                    }
+                })
+                .collect()
+        }
+    }
+
+    fn find<'a>(
+        events: &'a [DeliveryEvent],
+        kind: DeliveryEventKind,
+        rcpt: &str,
+    ) -> Vec<&'a DeliveryEvent> {
+        events
+            .iter()
+            .filter(|e| e.kind == kind && e.recipients.iter().any(|r| r == rcpt))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn all_events_recorded() {
+        let env = Env::new(DecisionHooks::default()).await;
+        let q = QueueEnv::new();
+        let log = MemDeliveryLog::new();
+        let tracking = Tracking::new(Arc::new(log.clone()), NodeId::new("node-1").expect("node"));
+        let d = Delivery::new(
+            Deps {
+                outbound: Some(Arc::new(OutQueue::new(q.deps.clone()))),
+                ..env.delivery(false).deps.clone()
+            },
+            &SmtpConfig {
+                hostname: "mx.example.org".into(),
+                ..SmtpConfig::default()
+            },
+        )
+        .with_tracking(tracking.clone());
+        // Отказ на RCPT.
+        let inbound = envelope(Mode::Inbound, &[]);
+        assert_eq!(d.rcpt(&inbound, "nobody@example.org").await.code, 550);
+        // Приём: carol доставлено, ящик bob переполнен — отказ получателю и уведомление отправителю.
+        assert_eq!(
+            d.data(
+                &envelope(Mode::Inbound, &["bob@example.org"]),
+                Bytes::from_static(MAIL)
+            )
+            .await
+            .code,
+            250
+        );
+        env.quota
+            .set_limit(env.scope("bob@example.org").await, Some(1));
+        let raw =
+            b"From: sender@example.net\r\nMessage-ID: <t1@example.net>\r\n\r\nsecret body\r\n";
+        let e = envelope(Mode::Inbound, &["bob@example.org", "carol@example.org"]);
+        assert_eq!(d.data(&e, Bytes::from_static(raw)).await.code, 250);
+        // Отправка наружу: одному получателю принято, другому — отказ (уведомление отправителю).
+        let mut sub = envelope(Mode::Submission, &["x@example.net", "y@example.net"]);
+        sub.mail_from = "alice@example.org".into();
+        let raw2 = b"From: alice@example.org\r\nMessage-ID: <t2@example.org>\r\n\r\nhello\r\n";
+        assert_eq!(d.data(&sub, Bytes::from_static(raw2)).await.code, 250);
+        let worker = QueueWorker::new(q.deps.clone(), Arc::new(ByAddress), "out.example.org")
+            .with_tracking(tracking);
+        worker.run_once(&QueueConfig::default()).await.expect("run");
+
+        let events = log.events();
+        let rej = find(&events, DeliveryEventKind::Reject, "nobody@example.org");
+        assert_eq!(rej.len(), 1);
+        assert_eq!(rej[0].decision, DeliveryDecision::Reject);
+        assert_eq!(
+            rej[0].reason.as_deref(),
+            Some("550 5.1.1 Mailbox unavailable")
+        );
+        assert_eq!(rej[0].sender, "sender@example.net");
+        assert_eq!(rej[0].node.as_str(), "node-1");
+        assert_eq!(rej[0].message_id, None);
+
+        let mine: Vec<_> = events
+            .iter()
+            .filter(|e| e.message_id.as_deref() == Some("t1@example.net"))
+            .collect();
+        let kinds: Vec<_> = mine.iter().map(|e| (e.kind, e.decision)).collect();
+        assert!(kinds.contains(&(DeliveryEventKind::Receive, DeliveryDecision::Accept)));
+        let deliver = find(&events, DeliveryEventKind::Deliver, "carol@example.org");
+        assert_eq!(deliver.len(), 1);
+        assert_eq!(deliver[0].recipients, ["carol@example.org"]);
+        let full = mine
+            .iter()
+            .find(|e| e.kind == DeliveryEventKind::Reject)
+            .expect("reject bob");
+        assert_eq!(full.recipients, ["bob@example.org"]);
+        assert_eq!(full.reason.as_deref(), Some("552 5.2.2 mailbox full"));
+        let dsn = mine
+            .iter()
+            .find(|e| e.kind == DeliveryEventKind::Dsn)
+            .expect("dsn");
+        assert_eq!(dsn.sender, "");
+        assert_eq!(dsn.recipients, ["sender@example.net"]);
+
+        // smtp-out: передача наружу с решением и причиной, запись очереди, уведомление об отказе.
+        let x = find(&events, DeliveryEventKind::Relay, "x@example.net");
+        assert_eq!(x.len(), 1);
+        assert_eq!(x[0].decision, DeliveryDecision::Accept);
+        assert_eq!(x[0].message_id.as_deref(), Some("t2@example.org"));
+        assert!(x[0].queue_id.is_some());
+        let y = find(&events, DeliveryEventKind::Relay, "y@example.net");
+        assert_eq!(y[0].decision, DeliveryDecision::Reject);
+        assert_eq!(y[0].reason.as_deref(), Some("550 5.1.1 no such user"));
+        let dsn = find(&events, DeliveryEventKind::Dsn, "alice@example.org");
+        assert_eq!(dsn.len(), 1);
+        assert_eq!(dsn[0].queue_id, x[0].queue_id);
+        assert!(find(&events, DeliveryEventKind::Receive, "x@example.net").len() == 1);
+        // Содержимое писем в журнал не попадает.
+        let dump = format!("{events:?}");
+        assert!(!dump.contains("secret body") && !dump.contains("hello"));
+    }
+}

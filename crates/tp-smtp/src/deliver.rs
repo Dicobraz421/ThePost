@@ -10,6 +10,8 @@
 //!   ([`Outbound`], [`crate::queue::Queue`]); узел без очереди (`Deps::outbound` = `None`) — `451 4.3.2`;
 //! - submission: до доставки и очереди — `DecisionHooks::on_submission` (`Deny` — `550 5.7.1`; дополнения:
 //!   заголовки в начало письма, копии в папки и внешним адресам);
+//! - журнал доставки ([`Delivery::with_tracking`], [`crate::tracking`]): приём, отказы, доставка, модерация,
+//!   уведомления;
 //! - адреса пересылки модулей (`Ingested::forward`, решение 2026-10-31-ingest-envelope; `CopyTo::Address`):
 //!   локальные — сразу в ящики тем же `ingest` (SMTP-28), внешние — в очередь [`Outbound`].
 //!
@@ -50,7 +52,9 @@ use crate::config::{DeliveryConfig, QuotaReject, SmtpConfig};
 use crate::dsn::{self, DsnSink};
 use crate::groups::{Groups, Hold};
 use crate::milter::{Milters, Verdict};
-use crate::server::{Envelope, Handler, Mode, Reply, reply};
+use crate::server::{Envelope, Handler, Mode, Reply, is_positive, reply};
+use crate::tracking::{self, Mail, Step, Tracking, Trail};
+use tp_contracts::delivery::{DeliveryDecision as Dd, DeliveryEventKind as Ek};
 
 /// Очередь исходящей почты: внешние получатели submission и пересылки модулей. Реализация —
 /// [`crate::queue::Queue`] (`QueueStore` и `BlobStore`).
@@ -154,6 +158,7 @@ pub struct Delivery {
     addressing: Addressing,
     snapshot: Mutex<Option<(Instant, Arc<Snapshot>)>>,
     groups: Option<Groups>,
+    tracking: Option<Tracking>,
 }
 
 impl fmt::Debug for Delivery {
@@ -188,6 +193,27 @@ impl Delivery {
             addressing: Addressing::new(&cfg.addressing),
             snapshot: Mutex::new(None),
             groups: None,
+            tracking: None,
+        }
+    }
+
+    /// Журнал доставки (SMTP-17, [`crate::tracking`]): приём, отказы, доставка, модерация, уведомления.
+    pub fn with_tracking(mut self, tracking: Tracking) -> Self {
+        self.tracking = Some(tracking);
+        self
+    }
+
+    /// Записывает события письма в журнал доставки (если подключён).
+    async fn track(&self, sender: &str, message_id: Option<&str>, steps: Vec<Step>) {
+        if let Some(t) = &self.tracking {
+            let mail = Mail {
+                tenant: self.deps.tenant,
+                sender,
+                message_id,
+                queue_id: None,
+                at: OffsetDateTime::now_utc(),
+            };
+            t.write(&mail, steps).await;
         }
     }
 
@@ -763,8 +789,9 @@ impl Delivery {
     }
 
     /// Принимает письмо: проверки, фильтры, доставка и очередь. Ответ фильтра (отказ, отброс) — `Ok(Some)`.
-    async fn accept(&self, env: &Envelope, raw: Bytes) -> Result<Option<Reply>> {
+    async fn accept(&self, env: &Envelope, raw: Bytes, trail: &mut Trail) -> Result<Option<Reply>> {
         let received_at = OffsetDateTime::now_utc();
+        trail.message_id = tracking::message_id(&raw);
         let check = match (&self.deps.authcheck, env.mode) {
             (Some(ac), Mode::Inbound) => Some(ac.check(env, &raw).await),
             _ => None,
@@ -795,6 +822,7 @@ impl Delivery {
                 Verdict::Accept => {}
                 Verdict::Refuse(r) => return Ok(Some(r)),
                 Verdict::Discard => {
+                    trail.decision = Some(Dd::Discard);
                     return Ok(Some(reply(250, [2, 0, 0], format!("OK id={}", env.id))));
                 }
             }
@@ -843,6 +871,9 @@ impl Delivery {
                 }
             }
         }
+        if junk {
+            trail.decision = Some(Dd::Quarantine);
+        }
         let sender = sender_account(env, self.deps.tenant);
         let mut prepared = self
             .prepare(&env.id, &env.rcpts, junk, Origin::Sender(sender))
@@ -869,6 +900,7 @@ impl Delivery {
             .await?;
         let mut rcpts = prepared.external;
         let mut failed = prepared.failed;
+        let local = local_rcpts(&prepared.deliveries);
         if !prepared.deliveries.is_empty() {
             let delivered = accounts_of(&prepared.deliveries);
             let forward = self
@@ -897,9 +929,12 @@ impl Delivery {
         }
         self.queue_out(&env.id, &env.mail_from, rcpts, full.clone())
             .await?;
+        outcome_steps(&mut trail.steps, &prepared.held, &local, &failed, junk);
         if !failed.is_empty() && !env.mail_from.is_empty() {
-            self.bounce(&env.id, &env.mail_from, &failed, &full, received_at)
+            let sent = self
+                .bounce(&env.id, &env.mail_from, &failed, &full, received_at)
                 .await;
+            trail.steps.push(dsn_step(&env.mail_from, sent));
         }
         Ok(None)
     }
@@ -912,7 +947,7 @@ impl Delivery {
         rcpts: &[dsn::Recipient],
         original: &[u8],
         received_at: OffsetDateTime,
-    ) {
+    ) -> bool {
         let raw = dsn::build(&dsn::Report {
             hostname: &self.hostname,
             to: mail_from,
@@ -930,7 +965,9 @@ impl Delivery {
             .await
         {
             tracing::warn!(%id, error = %e, "smtp: уведомление о недоставке не отправлено");
+            return false;
         }
+        true
     }
 
     /// Отправка от имени пользователя вне сессии SMTP (JMAP `EmailSubmission/set`, CMP-04): получатели в
@@ -984,6 +1021,7 @@ impl Delivery {
         }
         let mut failed = prepared.failed;
         let mut forward = Vec::new();
+        let local_list = local_rcpts(&prepared.deliveries);
         if !prepared.deliveries.is_empty() {
             let mut full = self
                 .submit_headers(&id, mail_from, rcpts, received_at)
@@ -1055,10 +1093,16 @@ impl Delivery {
         let mut out = if queue { prepared.external } else { Vec::new() };
         push_unique(&mut out, forward);
         self.queue_out(&id, mail_from, out, raw.clone()).await?;
+        let mut steps = vec![Step::new(Ek::Receive, Dd::Accept, rcpts.to_vec())];
+        outcome_steps(&mut steps, &prepared.held, &local_list, &failed, false);
         if !failed.is_empty() && !mail_from.is_empty() {
-            self.bounce(&id, mail_from, &failed, &raw, received_at)
+            let sent = self
+                .bounce(&id, mail_from, &failed, &raw, received_at)
                 .await;
+            steps.push(dsn_step(mail_from, sent));
         }
+        self.track(mail_from, tracking::message_id(&raw).as_deref(), steps)
+            .await;
         tracing::info!(%id, count = rcpts.len(), "smtp: отправка вне сессии обработана");
         Ok(Submitted {
             id,
@@ -1208,6 +1252,51 @@ impl DsnSink for Delivery {
 #[async_trait]
 impl Handler for Delivery {
     async fn rcpt(&self, env: &Envelope, rcpt: &str) -> Reply {
+        let r = self.check_rcpt(env, rcpt).await;
+        if !is_positive(&r) {
+            let step = Step::new(Ek::Reject, tracking::decision(&r), vec![rcpt.to_owned()])
+                .reason(tracking::reason(&r));
+            self.track(&env.mail_from, None, vec![step]).await;
+        }
+        r
+    }
+
+    async fn data(&self, env: &Envelope, raw: Bytes) -> Reply {
+        let mut trail = Trail::default();
+        let r = match self.accept(env, raw, &mut trail).await {
+            Ok(Some(r)) => r,
+            Ok(None) => reply(250, [2, 0, 0], format!("OK id={}", env.id)),
+            Err(Error::QuotaExceeded) => reply(552, [5, 2, 2], "Mailbox full"),
+            Err(Error::Invalid(m)) => {
+                tracing::info!(id = %env.id, error = %m, "smtp: письмо отклонено");
+                reply(554, [5, 6, 0], "Message rejected")
+            }
+            Err(Error::Forbidden) => reply(554, [5, 7, 1], "Message rejected"),
+            Err(e) => temporary(&e),
+        };
+        if self.tracking.is_some() {
+            let head = if is_positive(&r) {
+                Step::new(
+                    Ek::Receive,
+                    trail.decision.unwrap_or(Dd::Accept),
+                    env.rcpts.clone(),
+                )
+            } else {
+                Step::new(Ek::Reject, tracking::decision(&r), env.rcpts.clone())
+                    .reason(tracking::reason(&r))
+            };
+            let mut steps = vec![head];
+            steps.append(&mut trail.steps);
+            self.track(&env.mail_from, trail.message_id.as_deref(), steps)
+                .await;
+        }
+        r
+    }
+}
+
+impl Delivery {
+    /// Проверка получателя до ответа `250` (SRS 4.1): существование, группа рассылки, квота.
+    async fn check_rcpt(&self, env: &Envelope, rcpt: &str) -> Reply {
         let target = match self.target(rcpt).await {
             Ok(t) => t,
             Err(e) => return temporary(&e),
@@ -1262,20 +1351,71 @@ impl Handler for Delivery {
             Resolved::Unknown => reply(550, [5, 1, 1], "Mailbox unavailable"),
         }
     }
+}
 
-    async fn data(&self, env: &Envelope, raw: Bytes) -> Reply {
-        match self.accept(env, raw).await {
-            Ok(Some(r)) => r,
-            Ok(None) => reply(250, [2, 0, 0], format!("OK id={}", env.id)),
-            Err(Error::QuotaExceeded) => reply(552, [5, 2, 2], "Mailbox full"),
-            Err(Error::Invalid(m)) => {
-                tracing::info!(id = %env.id, error = %m, "smtp: письмо отклонено");
-                reply(554, [5, 6, 0], "Message rejected")
-            }
-            Err(Error::Forbidden) => reply(554, [5, 7, 1], "Message rejected"),
-            Err(e) => temporary(&e),
-        }
+/// Исходные адреса локальных получателей доставок без повторов (копии модулей — без адреса — не входят).
+fn local_rcpts(deliveries: &[(String, MailDelivery)]) -> Vec<String> {
+    let mut out = Vec::new();
+    push_unique(
+        &mut out,
+        deliveries
+            .iter()
+            .filter(|(r, _)| !r.is_empty())
+            .map(|(r, _)| r.clone())
+            .collect(),
+    );
+    out
+}
+
+/// События журнала доставки после приёма: модерация, доставка в ящики (`local` без `failed`), отказы
+/// получателям.
+fn outcome_steps(
+    steps: &mut Vec<Step>,
+    held: &[(String, DistributionGroup)],
+    local: &[String],
+    failed: &[dsn::Recipient],
+    junk: bool,
+) {
+    for (rcpt, _) in held {
+        steps.push(
+            Step::new(Ek::Deliver, Dd::Hold, vec![rcpt.clone()]).reason("held for moderation"),
+        );
     }
+    let delivered: Vec<String> = local
+        .iter()
+        .filter(|r| !failed.iter().any(|f| f.address.eq_ignore_ascii_case(r)))
+        .cloned()
+        .collect();
+    if !delivered.is_empty() {
+        let step = Step::new(Ek::Deliver, Dd::Accept, delivered);
+        steps.push(if junk {
+            step.reason("junk folder")
+        } else {
+            step
+        });
+    }
+    for f in failed {
+        steps.push(
+            Step::new(
+                Ek::Reject,
+                tracking::decision_of_line(&f.reply),
+                vec![f.address.clone()],
+            )
+            .reason(f.reply.clone()),
+        );
+    }
+}
+
+/// Событие уведомления о недоставке отправителю `to`: отправлено (`Accept`) или нет (`Defer`).
+fn dsn_step(to: &str, sent: bool) -> Step {
+    let (decision, reason) = if sent {
+        (Dd::Accept, "failure notification")
+    } else {
+        (Dd::Defer, "failure notification not sent")
+    };
+    Step::new(Ek::Dsn, decision, vec![to.to_owned()])
+        .sender("")
+        .reason(reason)
 }
 
 /// Отказ отправителю вне круга группы рассылки после приёма (уведомление о недоставке).

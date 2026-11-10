@@ -33,7 +33,7 @@ pub enum Action {
 }
 
 impl Action {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Action::Failed => "failed",
             Action::Delayed => "delayed",
