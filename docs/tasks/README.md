@@ -351,19 +351,22 @@
 | [KIT-07](KIT-07.md) | in-memory ящик — 6 системных папок и дополнение при открытии | testkit | A | testkit-04 | done | CMP-05 |
 | [META-35](META-35.md) | ошибка одного раздела журнала не прерывает опрос остальных | meta | A | meta-18 | done | — |
 | [CMP-09](CMP-09.md) | метрики индексатора и doctor для служебных доменов | app | A | app-11 | done | CMP-06 |
-| [APP-13](APP-13.md) | подключение расширений IMAP, POP3 и PSI в `serve` | app | A | app-12 | ready | IMAP-12,PLT-17 |
+| [APP-13](APP-13.md) | подключение расширений IMAP, POP3 и PSI в `serve` | app | A | app-12 | done | IMAP-12,PLT-17 |
 | [PLT-19](PLT-19.md) | события файловой системы через `notify` | platform | A | platform-09 | done | PLT-17 |
 | [SYS-08](SYS-08.md) | Landlock — корневые сертификаты по ссылкам Debian | sys | A | sys-04 | done | SYS-07 |
 | [SYS-09](SYS-09.md) | ожидание событий PSI в tp-sys | sys | A | sys-04 | done | PLT-17 |
 | [CTR-37](CTR-37.md) | системный сигнал изменения корзины | contracts | B | contracts-25 | done | CTR-23 |
 | [IMAP-16](IMAP-16.md) | POP3 — блокировка ящика; запись в общие папки по ACL | imap | A | imap-07 | ready | IMAP-12,IMAP-10 |
-| [APP-14](APP-14.md) | ACME и переключение СУБД в `serve` | app | A | app-13 | todo | META-25,DEP-05 |
+| [APP-14](APP-14.md) | ACME и переключение СУБД в `serve` | app | A | app-13 | ready | META-25,DEP-05 |
 | [CTR-38](CTR-38.md) | контракты GC, владельца загрузки и восстановления скрытых писем | contracts | B | contracts-26 | ready | CTR-23 |
 | [SMTP-28](SMTP-28.md) | `Delivery::submit` без очереди — ошибка только для внешних получателей | smtp | A | smtp-09 | done | CMP-04 |
 | [META-36](META-36.md) | `EventBus` для `PgSignalBus`; сигнал `TrashChanged` из PostgreSQL | meta | A | meta-19 | todo | META-26,CTR-37 |
 | [MS-18](MS-18.md) | таймер корзины по сигналу `TrashChanged` | mailstore | A | mailstore-11 | ready | MS-14,CTR-37 |
 | [APP-15](APP-15.md) | сведения об узле в `heartbeat` | app | A | app-14 | todo | META-27 |
 | [CTR-39](CTR-39.md) | сигнал при снятии блокировки; пометка Membership | contracts | B | contracts-27 | todo | CTR-23 |
+| [SYS-10](SYS-10.md) | дескрипторы сокетов systemd в `TcpListener` | sys | A | sys-05 | ready | SYS-01 |
+| [APP-16](APP-16.md) | сокеты systemd, политики доменов в очереди, согласование doctor | app | A | app-15 | todo | SYS-10,SMTP-15 |
+| [CTR-40](CTR-40.md) | адресация организации в данных; перенос получателей без попытки | contracts | B | contracts-28 | todo | CTR-24 |
 
 ## Вне волн
 
