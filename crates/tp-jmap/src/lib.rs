@@ -28,7 +28,7 @@ mod testenv;
 use serde_json::{Map, Value};
 
 pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
-pub use crate::submission::Outbound;
+pub use crate::submission::{Outbound, RcptStatus, Submitted};
 
 use crate::core::error::MethodResult;
 use crate::core::{CORE, Ctx, MAIL, SETTINGS, SUBMISSION};

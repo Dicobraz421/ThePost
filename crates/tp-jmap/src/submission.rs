@@ -6,8 +6,10 @@
 //!   `maxDelayedSend` = 0). Адрес `From` проверяет [`Authorizer::send_right`](tp_contracts::auth::Authorizer::send_right)
 //!   (свои адреса, Send As, Send on Behalf — с заголовком `Sender`). До очереди — `DecisionHooks::on_submission`
 //!   (`Deny` — `forbiddenToSend`; дополнения: заголовки в начало письма, копии в папки и внешним адресам).
-//!   Заголовок `Bcc` из отправляемого письма удаляется. Объекты EmailSubmission после ответа не хранятся:
-//!   `EmailSubmission/get` их не находит, отменить отправку нельзя (`cannotUnsend`).
+//!   Заголовок `Bcc` из отправляемого письма удаляется. В ответе `created` — `deliveryStatus` по каждому
+//!   получателю из [`Outbound::submit`] (доставлено локально — `yes`, в очереди — `queued`, отказ — `no` с ответом
+//!   SMTP). Объекты EmailSubmission после ответа не хранятся: `EmailSubmission/get` их не находит (статусы есть
+//!   только в ответе `set`), отменить отправку нельзя (`cannotUnsend`).
 //! - `EmailSubmission/query` и `queryChanges` проверяют фильтр и сортировку (RFC 8621 §7.3) и возвращают пустой
 //!   список; `queryState` — состояние учётной записи (меняется после отправки с переносом письма).
 
@@ -35,8 +37,28 @@ use crate::core::request::{
 use crate::core::{Ctx, digest};
 use crate::email_get::{collect, utc_date};
 
-/// Очередь исходящей почты для `EmailSubmission/set`. Сигнатура совпадает с `tp_smtp::deliver::Outbound`:
-/// приложение подключает очередь smtp (`tp_smtp::queue::Queue`, подпись DKIM при постановке) через обёртку.
+/// Статус доставки одному получателю при отправке ([`Outbound::submit`]); попадает в `deliveryStatus`
+/// EmailSubmission (RFC 8621 §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RcptStatus {
+    /// Доставлено в локальный ящик (`delivered: yes`).
+    Delivered,
+    /// Поставлено в очередь исходящей почты (`delivered: queued`).
+    Queued,
+    /// Не доставлено (`delivered: no`): ответ SMTP, например `550 5.1.1 No such user`.
+    Failed(String),
+}
+
+/// Итог [`Outbound::submit`]: статус по каждому получателю в порядке запроса.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Submitted {
+    /// Получатель → статус.
+    pub rcpts: Vec<(String, RcptStatus)>,
+}
+
+/// Очередь исходящей почты для `EmailSubmission/set`. Сигнатура [`Outbound::enqueue`] совпадает с
+/// `tp_smtp::deliver::Outbound`: приложение подключает очередь smtp (`tp_smtp::queue::Queue`, подпись DKIM при
+/// постановке) через обёртку; статусы по получателям — через [`Outbound::submit`] (`tp_smtp::Delivery::submit`).
 #[async_trait]
 pub trait Outbound: Send + Sync + 'static {
     /// Ставит письмо `raw` от `mail_from` получателям `rcpts` организации `tenant`.
@@ -47,6 +69,44 @@ pub trait Outbound: Send + Sync + 'static {
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<()>;
+
+    /// Отправляет письмо и возвращает статус по каждому получателю. По умолчанию — [`Outbound::enqueue`],
+    /// все получатели в очереди ([`RcptStatus::Queued`]).
+    async fn submit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<Submitted> {
+        self.enqueue(tenant, mail_from, rcpts, raw).await?;
+        Ok(Submitted {
+            rcpts: rcpts
+                .iter()
+                .map(|r| (r.clone(), RcptStatus::Queued))
+                .collect(),
+        })
+    }
+}
+
+/// `deliveryStatus` EmailSubmission (RFC 8621 §7): получатель → `smtpReply`, `delivered`, `displayed`.
+fn delivery_status(s: &Submitted) -> Value {
+    let mut m = Map::new();
+    for (rcpt, st) in &s.rcpts {
+        let (reply, delivered) = match st {
+            RcptStatus::Delivered => ("250 2.0.0 Delivered".to_owned(), "yes"),
+            RcptStatus::Queued => ("250 2.0.0 Queued".to_owned(), "queued"),
+            RcptStatus::Failed(r) if r.trim().is_empty() => {
+                ("550 5.0.0 Not delivered".to_owned(), "no")
+            }
+            RcptStatus::Failed(r) => (r.clone(), "no"),
+        };
+        m.insert(
+            rcpt.clone(),
+            json!({"smtpReply": reply, "delivered": delivered, "displayed": "unknown"}),
+        );
+    }
+    Value::Object(m)
 }
 
 fn or_null(m: Map<String, Value>) -> Value {
@@ -433,11 +493,11 @@ pub(crate) async fn forward(
     Ok(())
 }
 
-/// Одна отправка: `Ok(Ok((id, письмо)))` — в очереди, `Ok(Err(SetError))` — отказ по объекту.
+/// Одна отправка: `Ok(Ok((id, письмо, статусы)))` — отправлено, `Ok(Err(SetError))` — отказ по объекту.
 async fn submit_one(
     ctx: &Ctx<'_>,
     obj: Value,
-) -> MethodResult<std::result::Result<(String, MessageId), Value>> {
+) -> MethodResult<std::result::Result<(String, MessageId, Submitted), Value>> {
     let c: Create = match serde_json::from_value(obj) {
         Ok(c) => c,
         Err(e) => {
@@ -605,8 +665,8 @@ async fn submit_one(
             copies = a.copies;
         }
     }
-    outbound
-        .enqueue(p.tenant, &mail_from, &rcpts, Bytes::copy_from_slice(&raw))
+    let statuses = outbound
+        .submit(p.tenant, &mail_from, &rcpts, Bytes::copy_from_slice(&raw))
         .await?;
     let mut external = Vec::new();
     let mut boxes = Vec::new();
@@ -629,7 +689,7 @@ async fn submit_one(
             })
             .await?;
     }
-    Ok(Ok((format!("S{}", MessageId::new()), msg.id)))
+    Ok(Ok((format!("S{}", MessageId::new()), msg.id, statuses)))
 }
 
 /// `EmailSubmission/set`: создание — постановка в очередь; затем неявный `Email/set`
@@ -655,13 +715,14 @@ pub(crate) async fn submission_set(
     let mut sent: Vec<(String, String, MessageId)> = Vec::new();
     for (cid, obj) in a.create.unwrap_or_default() {
         match submit_one(ctx, obj).await? {
-            Ok((id, email)) => {
+            Ok((id, email, statuses)) => {
                 created.insert(
                     cid.clone(),
                     json!({
                         "id": id,
                         "undoStatus": "final",
                         "sendAt": utc_date(OffsetDateTime::now_utc()),
+                        "deliveryStatus": delivery_status(&statuses),
                     }),
                 );
                 ctx.created.insert(cid.clone(), id.clone());
@@ -833,6 +894,125 @@ mod tests {
         let raw = String::from_utf8_lossy(&q[0].raw);
         assert!(!raw.contains("hidden@external.test"), "{raw}");
         assert!(raw.contains("Subject: "), "{raw}");
+    }
+
+    /// Смешанный список получателей: статус каждого из `Outbound::submit` — в `deliveryStatus` ответа.
+    #[tokio::test]
+    async fn delivery_status_per_recipient() {
+        let env = Env::new().await;
+        let acc = env.account();
+        let identity = identity_id("user@example.org");
+        env.outbound
+            .set_status("local@example.org", RcptStatus::Delivered);
+        env.outbound.set_status(
+            "nobody@example.org",
+            RcptStatus::Failed("550 5.1.1 No such user".into()),
+        );
+        env.outbound
+            .set_status("full@example.org", RcptStatus::Failed(String::new()));
+        let rcpts = [
+            "local@example.org",
+            "rcpt@external.test",
+            "nobody@example.org",
+            "full@example.org",
+        ];
+        let envelope = json!({"mailFrom": {"email": "user@example.org"},
+            "rcptTo": rcpts.iter().map(|r| json!({"email": r})).collect::<Vec<_>>()});
+        let r = calls(
+            &env,
+            &env.jmap,
+            json!([
+                ["Email/set", {"accountId": acc, "create": {"d": draft(&env, "user@example.org")}}, "0"],
+                ["EmailSubmission/set", {"accountId": acc, "create": {"s": {
+                    "identityId": identity, "emailId": "#d", "envelope": envelope
+                }}}, "1"]
+            ]),
+        )
+        .await;
+        let ds = &r[1][1]["created"]["s"]["deliveryStatus"];
+        assert_eq!(ds.as_object().map(Map::len), Some(4), "{r:?}");
+        let st = |rcpt: &str| {
+            (
+                ds[rcpt]["delivered"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                ds[rcpt]["smtpReply"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                ds[rcpt]["displayed"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        };
+        assert_eq!(st("local@example.org").0, "yes");
+        assert!(st("local@example.org").1.starts_with("250 "));
+        assert_eq!(st("rcpt@external.test").0, "queued");
+        assert!(st("rcpt@external.test").1.starts_with("250 "));
+        assert_eq!(
+            st("nobody@example.org"),
+            (
+                "no".into(),
+                "550 5.1.1 No such user".into(),
+                "unknown".into()
+            )
+        );
+        assert_eq!(st("full@example.org").0, "no");
+        assert!(st("full@example.org").1.starts_with("550 "));
+        for rcpt in rcpts {
+            assert_eq!(st(rcpt).2, "unknown", "{rcpt}");
+        }
+        assert_eq!(env.outbound.queued()[0].rcpts, rcpts);
+    }
+
+    /// Очередь только с `enqueue` (реализация `submit` по умолчанию): все получатели — `queued`.
+    #[tokio::test]
+    async fn delivery_status_default_queued() {
+        struct Plain(crate::testenv::TestOutbound);
+        #[async_trait]
+        impl Outbound for Plain {
+            async fn enqueue(
+                &self,
+                tenant: TenantId,
+                mail_from: &str,
+                rcpts: &[String],
+                raw: Bytes,
+            ) -> Result<()> {
+                self.0.enqueue(tenant, mail_from, rcpts, raw).await
+            }
+        }
+        let env = Env::new().await;
+        let plain = Jmap::new(
+            Deps {
+                outbound: Some(std::sync::Arc::new(Plain(Default::default()))),
+                ..env.jmap.d.clone()
+            },
+            JmapConfig::default(),
+        )
+        .expect("jmap");
+        let acc = env.account();
+        let r = calls(
+            &env,
+            &plain,
+            json!([
+                ["Email/set", {"accountId": acc, "create": {"d": draft(&env, "user@example.org")}}, "0"],
+                ["EmailSubmission/set", {"accountId": acc, "create": {"s": {
+                    "identityId": identity_id("user@example.org"), "emailId": "#d"
+                }}}, "1"]
+            ]),
+        )
+        .await;
+        let ds = &r[1][1]["created"]["s"]["deliveryStatus"];
+        assert_eq!(
+            *ds,
+            json!({
+                "rcpt@external.test": {"smtpReply": "250 2.0.0 Queued", "delivered": "queued", "displayed": "unknown"},
+                "hidden@external.test": {"smtpReply": "250 2.0.0 Queued", "delivered": "queued", "displayed": "unknown"},
+            }),
+            "{r:?}"
+        );
     }
 
     /// Чужой адрес From: без права — forbiddenFrom; Send on Behalf — заголовок Sender; Send As — без него;
