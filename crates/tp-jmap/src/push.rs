@@ -1,7 +1,8 @@
 //! Push (RFC 8620 §7, RFC 8887): EventSource (`eventSourceUrl`) и WebSocket (`/jmap/ws`, подпротокол `jmap`).
 //!
 //! Изменения приходят из [`EventBus`](tp_contracts::bus::EventBus) подпиской на учётную запись: `MailboxChanged` —
-//! типы `Email`, `Thread`, `Mailbox`; `MailboxListChanged` — `Mailbox`. Состояние в `StateChange` — текущее
+//! типы `Email`, `Thread`, `Mailbox`; `MailboxListChanged` — `Mailbox`; `Resync` (шина потеряла сигналы) — все
+//! типы учётной записи ([`ALL_TYPES`]), даже при том же состоянии. Состояние в `StateChange` — текущее
 //! состояние учётной записи; повтор того же состояния не отправляется. Доставка шины — at-most-once: после
 //! переподключения клиент сверяется по `/changes`. При остановке узла ([`Jmap::shutdown`]) EventSource завершается,
 //! WebSocket получает Close 1001.
@@ -31,13 +32,23 @@ use crate::core::http::auth_error;
 use crate::core::request::state_string;
 use crate::core::{Jmap, Problem};
 
+/// Типы учётной записи, чьё состояние — состояние учётной записи (`Identity` и `UserSettings` ведут своё).
+const ALL_TYPES: &[&str] = &["Email", "Thread", "Mailbox", "EmailSubmission"];
+
 /// Типы данных, которые меняет уведомление шины.
 fn changed_types(kind: &EventKind) -> &'static [&'static str] {
     match kind {
         EventKind::MailboxChanged { .. } => &["Email", "Thread", "Mailbox"],
         EventKind::MailboxListChanged => &["Mailbox"],
+        // Сигналы потеряны — что изменилось, неизвестно: клиент перечитывает все типы.
+        EventKind::Resync => ALL_TYPES,
         _ => &[],
     }
+}
+
+/// Отправить `StateChange` и при том же состоянии: после `Resync` клиент мог пропустить изменения.
+fn forced(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Resync)
 }
 
 /// Подписка соединения push: фильтр типов и последнее отправленное состояние.
@@ -62,8 +73,8 @@ impl Watch {
             .collect()
     }
 
-    /// `StateChange` для типов `types`; нечего отправлять (фильтр, то же состояние, сбой) — `None`.
-    async fn change(&mut self, types: &[&str], push_state: bool) -> Option<Value> {
+    /// `StateChange` для типов `types`; нечего отправлять (фильтр, то же состояние без `force`, сбой) — `None`.
+    async fn change(&mut self, types: &[&str], push_state: bool, force: bool) -> Option<Value> {
         let types = self.wanted(types);
         if types.is_empty() {
             return None;
@@ -75,7 +86,7 @@ impl Watch {
                 return None;
             }
         };
-        if self.last.as_deref() == Some(state.as_str()) {
+        if !force && self.last.as_deref() == Some(state.as_str()) {
             return None;
         }
         self.last = Some(state.clone());
@@ -141,7 +152,11 @@ fn source_stream(src: Source) -> impl Stream<Item = Result<SseEvent, Infallible>
             };
             match next {
                 Some(ev) => {
-                    if let Some(change) = s.watch.change(changed_types(&ev.kind), false).await {
+                    if let Some(change) = s
+                        .watch
+                        .change(changed_types(&ev.kind), false, forced(&ev.kind))
+                        .await
+                    {
                         s.done = s.close_after_state;
                         let e = SseEvent::default().event("state").data(change.to_string());
                         return Some((Ok(e), s));
@@ -290,7 +305,7 @@ async fn ws_message(
                 // Клиент отстал: сразу сообщить текущее состояние всех типов.
                 Some(ps) => {
                     w.last = Some(ps.to_owned());
-                    if let Some(c) = w.change(&["Email", "Thread", "Mailbox"], true).await {
+                    if let Some(c) = w.change(ALL_TYPES, true, false).await {
                         out.push(c);
                     }
                 }
@@ -344,7 +359,7 @@ async fn ws_session(j: Arc<Jmap>, p: Principal, mut socket: WebSocket) {
             ev = events.next() => match ev {
                 None => return,
                 Some(ev) if push => {
-                    if let Some(c) = w.change(changed_types(&ev.kind), true).await {
+                    if let Some(c) = w.change(changed_types(&ev.kind), true, forced(&ev.kind)).await {
                         out.push(c);
                     }
                 }
@@ -375,8 +390,10 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
     use tokio_tungstenite::{WebSocketStream, client_async};
+    use tp_contracts::bus::{Event, EventBus, EventKind};
     use tp_contracts::meta::{Flags, SpecialUse};
 
+    use super::ALL_TYPES;
     use crate::testenv::{Env, mail, serve};
 
     const WAIT: Duration = Duration::from_secs(5);
@@ -416,6 +433,62 @@ mod tests {
         ws.send(WsMessage::Text(v.to_string().into()))
             .await
             .expect("send");
+    }
+
+    /// Переполняет буфер подписок шины без передачи управления: подписчики учётной записи получают `Resync`.
+    async fn flood(env: &Env) {
+        for _ in 0..1500 {
+            env.bus
+                .publish(Event {
+                    tenant: env.scope.tenant,
+                    account: Some(env.scope.account),
+                    kind: EventKind::MailboxListChanged,
+                })
+                .await
+                .expect("publish");
+        }
+    }
+
+    /// Открывает EventSource (`types=*&closeafter=state`) и дочитывает заголовки ответа.
+    async fn eventsource_open(addr: std::net::SocketAddr) -> (TcpStream, Vec<u8>) {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        s.write_all(
+            b"GET /jmap/eventsource/?types=*&closeafter=state&ping=0 HTTP/1.0\r\n\
+              Host: x\r\nAuthorization: Bearer token-1\r\n\r\n",
+        )
+        .await
+        .expect("write");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = tokio::time::timeout(WAIT, s.read(&mut chunk))
+                .await
+                .expect("timeout")
+                .expect("read");
+            assert!(n > 0, "closed before headers");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let head = String::from_utf8_lossy(&buf).to_lowercase();
+        assert!(head.contains("200 ok"), "{head}");
+        assert!(head.contains("text/event-stream"), "{head}");
+        (s, buf)
+    }
+
+    /// Дочитывает поток EventSource до закрытия; первое событие `state` — `StateChange`.
+    async fn eventsource_state_change(mut s: TcpStream, mut buf: Vec<u8>) -> Value {
+        tokio::time::timeout(WAIT, s.read_to_end(&mut buf))
+            .await
+            .expect("stream not closed")
+            .expect("read");
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("event: state"), "{text}");
+        let data = text
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("data");
+        let v: Value = serde_json::from_str(data).expect("json");
+        assert_eq!(v["@type"], "StateChange");
+        v
     }
 
     /// WebSocket: запрос API с requestId, изменение приходит StateChange после WebSocketPushEnable,
@@ -483,46 +556,63 @@ mod tests {
         let env = Env::new().await;
         let addr = serve(env.jmap.clone()).await;
         let acc = env.account();
-        let mut s = TcpStream::connect(addr).await.expect("connect");
-        s.write_all(
-            b"GET /jmap/eventsource/?types=*&closeafter=state&ping=0 HTTP/1.0\r\n\
-              Host: x\r\nAuthorization: Bearer token-1\r\n\r\n",
-        )
-        .await
-        .expect("write");
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 1024];
-        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = tokio::time::timeout(WAIT, s.read(&mut chunk))
-                .await
-                .expect("timeout")
-                .expect("read");
-            assert!(n > 0, "closed before headers");
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        let head = String::from_utf8_lossy(&buf).to_lowercase();
-        assert!(head.contains("200 ok"), "{head}");
-        assert!(head.contains("text/event-stream"), "{head}");
+        let (s, buf) = eventsource_open(addr).await;
         env.deliver(
             env.mailbox(SpecialUse::Inbox),
             &mail("Push", "a@x.test", "", "b"),
             Flags::new(),
         )
         .await;
-        tokio::time::timeout(WAIT, s.read_to_end(&mut buf))
-            .await
-            .expect("stream not closed")
-            .expect("read");
-        let text = String::from_utf8_lossy(&buf);
-        assert!(text.contains("event: state"), "{text}");
-        let data = text
-            .lines()
-            .find_map(|l| l.strip_prefix("data: "))
-            .expect("data");
-        let v: Value = serde_json::from_str(data).expect("json");
-        assert_eq!(v["@type"], "StateChange");
+        let v = eventsource_state_change(s, buf).await;
         assert!(v["changed"][&acc]["Email"].is_string(), "{v}");
         assert!(v["changed"][&acc]["Mailbox"].is_string(), "{v}");
+    }
+
+    /// Все типы учётной записи в `StateChange` с одним состоянием.
+    fn assert_all_types(c: &Value, acc: &str) {
+        let changed = c["changed"][acc].as_object().expect("account");
+        let mut got: Vec<&str> = changed.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        let mut want = ALL_TYPES.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "{c}");
+        let state = &changed["Email"];
+        assert!(changed.values().all(|v| v == state), "{c}");
+    }
+
+    /// `Resync` в шине → WebSocket получает `StateChange` со всеми типами, хотя состояние не менялось.
+    #[tokio::test]
+    async fn websocket_resync() {
+        let env = Env::new().await;
+        let addr = serve(env.jmap.clone()).await;
+        let mut ws = connect(addr).await;
+        let acc = env.account();
+        send(&mut ws, json!({"@type": "WebSocketPushEnable"})).await;
+        send(
+            &mut ws,
+            json!({"@type": "Request", "id": "r1", "using": ["urn:ietf:params:jmap:core"],
+                   "methodCalls": [["Core/echo", {}, "c"]]}),
+        )
+        .await;
+        assert_eq!(next_json(&mut ws).await["requestId"], "r1");
+
+        flood(&env).await;
+        let c = next_json(&mut ws).await;
+        assert_eq!(c["@type"], "StateChange", "{c}");
+        assert_all_types(&c, &acc);
+        assert_eq!(c["pushState"], c["changed"][&acc]["Email"], "{c}");
+    }
+
+    /// `Resync` в шине → EventSource отдаёт `StateChange` со всеми типами.
+    #[tokio::test]
+    async fn eventsource_resync() {
+        let env = Env::new().await;
+        let addr = serve(env.jmap.clone()).await;
+        let acc = env.account();
+        let (s, buf) = eventsource_open(addr).await;
+        flood(&env).await;
+        let v = eventsource_state_change(s, buf).await;
+        assert_all_types(&v, &acc);
     }
 
     /// SearchSnippet/get: подсветка по текстовой части фильтра; чужое письмо — notFound.
