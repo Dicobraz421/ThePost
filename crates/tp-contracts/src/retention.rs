@@ -19,11 +19,16 @@
 //! из корзины, событие ядра — `Trashed` (индексатор поиска по текущему состоянию удаляет документ). Видит и восстанавливает
 //! его администратор: [`TrashStore::list_hidden`], [`TrashStore::restore`]. Срок корзины для скрытых истекает как обычно
 //! (`expired` → `before_final_delete` → `expunge_final`).
+//!
+//! Таймер истечения в кластере (CTR-37): после `MailStore::delete_to_trash` и [`TrashStore::purge`] реализация
+//! публикует системный сигнал [`EventKind::TrashChanged`] ([`trash_changed`]); maintenance пересчитывает по нему
+//! ближайший срок (`expired`), по `Resync` и при запуске — тоже.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::bus::{Event, EventKind};
 use crate::error::{Error, Result};
 use crate::ext::DecisionHooks;
 use crate::ids::{MailboxId, MessageId, ModSeq};
@@ -120,6 +125,18 @@ pub struct PurgeOutcome {
     pub modseq: ModSeq,
 }
 
+/// Сигнал об изменении корзины учётной записи (системный, `account = None`, [`EventKind::TrashChanged`]).
+/// Публикуется после фиксации `MailStore::delete_to_trash` и [`TrashStore::purge`] (если что-то изменено).
+pub fn trash_changed(scope: AccountScope) -> Event {
+    Event {
+        tenant: scope.tenant,
+        account: None,
+        kind: EventKind::TrashChanged {
+            account: scope.account,
+        },
+    }
+}
+
 /// Корзина. Реализация — `tp-meta`; in-memory — `tp-testkit`.
 #[async_trait]
 pub trait TrashStore: Send + Sync + 'static {
@@ -150,6 +167,7 @@ pub trait TrashStore: Send + Sync + 'static {
     /// (`FinalDelete::mailbox` — исходная папка) вне транзакции БД: `Allow` — стереть (как `MessageStore::expunge_final`),
     /// `Deny` (Legal Hold, политика хранения) или ошибка хука — скрыть: стирание необратимо, при сомнении письмо
     /// сохраняется. Отсутствующие, лежащие вне корзины и уже скрытые письма пропускаются без ошибки.
+    /// Что-то скрыто или стёрто — после фиксации сигнал [`trash_changed`].
     async fn purge(
         &self,
         scope: AccountScope,
@@ -207,6 +225,23 @@ mod tests {
     fn object_safe() {
         fn _trash(_: Arc<dyn TrashStore>) {}
         fn _quota(_: Arc<dyn Quota>) {}
+    }
+
+    #[test]
+    fn trash_changed_is_system() {
+        let scope = AccountScope {
+            tenant: TenantId::new(),
+            account: AccountId::new(),
+        };
+        let ev = trash_changed(scope);
+        assert_eq!((ev.tenant, ev.account), (scope.tenant, None));
+        assert_eq!(
+            ev.kind,
+            EventKind::TrashChanged {
+                account: scope.account
+            }
+        );
+        assert!(ev.kind.is_system());
     }
 
     #[test]

@@ -47,7 +47,7 @@ use tp_contracts::meta::{
 };
 use tp_contracts::retention::{
     Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule, TrashPurgeSetting,
-    TrashStore,
+    TrashStore, trash_changed,
 };
 use tp_contracts::role::Role;
 use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
@@ -208,7 +208,8 @@ async fn next_signal(stream: &mut EventStream) -> Option<Event> {
         .expect("сигнал не пришёл")
 }
 
-/// Набор проверок системных сигналов `EventBus` (CTR-23): `LogAppended`, `MembersChanged`, `Blocked` приходят
+/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37): `LogAppended`, `MembersChanged`, `Blocked`,
+/// `TrashChanged` приходят
 /// в `subscribe_system()` и не приходят подписке учётной записи; `publish(Resync)` — `Invalid`.
 /// «Не пришло» проверяется тем, что первым пришёл сигнал, опубликованный позже.
 pub async fn signals(bus: &dyn EventBus) {
@@ -243,6 +244,7 @@ pub async fn signals(bus: &dyn EventBus) {
                 subject: BlockSubject::Account(scope.account),
             },
         ),
+        trash_changed(scope),
     ];
     for e in &published {
         assert!(e.kind.is_system());

@@ -153,6 +153,8 @@ pub trait MailStore: Send + Sync + 'static {
     ) -> Result<Vec<Inserted>>;
 
     /// Удаляет письма в корзину (SRS 4.7); окончательное удаление — maintenance по сроку корзины.
+    /// Что-то перенесено — после фиксации, кроме сигналов папок, системный сигнал
+    /// [`trash_changed`](crate::retention::trash_changed).
     async fn delete_to_trash(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq>;
 
     /// Восстанавливает письма из корзины в исходные папки.
