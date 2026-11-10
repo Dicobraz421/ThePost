@@ -18,7 +18,7 @@ pub mod tls;
 
 pub use acme::{Acme, AcmeConfig, Http01Challenges};
 pub use config::{CheckMode, Config, Section, SectionRegistry};
-pub use fswatch::{FsEvents, FsWatch, NoFsEvents};
+pub use fswatch::{FsEvents, FsWatch, NoFsEvents, NotifyFsEvents};
 pub use listen::{Cidr, Conn, ConnInfo, EndpointConfig, Listener};
 pub use load::{LoadConfig, LoadInputs, NodeLoad, background_allowed};
 pub use pressure::{PressureConfig, ResourceSource, ResourceWatch};
