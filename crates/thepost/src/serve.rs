@@ -26,12 +26,12 @@ use tp_contracts::{Error, Result};
 use tp_meta::events::EventConsumer;
 use tp_meta::{MetaConfig, PgMeta};
 use tp_platform::roles::RssGauge;
-use tp_platform::service_http;
 use tp_platform::{
-    Config, Health, LoadConfig, Metrics, NodeLoad, Reloader, RoleSpec, Roles, RolesReport,
-    RuntimeConfig, ServiceHttpConfig, Telemetry, TelemetryConfig, TlsCerts, TlsConfig,
+    Config, Health, LoadConfig, Metrics, NodeLoad, PressureConfig, Reloader, RoleSpec, Roles,
+    RolesReport, RuntimeConfig, ServiceHttpConfig, Telemetry, TelemetryConfig, TlsCerts, TlsConfig,
     section_watch,
 };
+use tp_platform::{pressure, service_http};
 use tp_search::SearchConfig;
 use tp_smtp::dkim_sign::DkimSign;
 use tp_smtp::{Mode, SmtpConfig, SmtpOutService};
@@ -39,7 +39,9 @@ use tp_sys::{NodeResources, ResourcesConfig};
 
 use crate::infra;
 use crate::modules;
-use crate::protocols::{Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, SmtpRole, Sockets};
+use crate::protocols::{
+    Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, LogPause, SmtpRole, Sockets,
+};
 use crate::roles::{Maintenance, PendingRole};
 use crate::secrets;
 use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection, HttpSection};
@@ -218,10 +220,16 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         aux.clone(),
     ));
 
-    // Уровень нагрузки узла по ресурсам cgroups (PLT-15): роли читают его из `RoleCtx::load`.
+    // Уровень нагрузки узла по ресурсам cgroups (PLT-15): роли читают его из `RoleCtx::load`. Снимки ресурсов —
+    // по триггерам PSI (секция `pressure`, PLT-17), без них — с интервалом секции `resources`.
+    let resources = pressure::watch_resources(
+        &*cfg.section::<ResourcesConfig>("resources")?,
+        &*cfg.section::<PressureConfig>(pressure::PRESSURE)?,
+    )
+    .await;
     let load = NodeLoad::start(
         (*cfg.section::<LoadConfig>("load")?).clone(),
-        tp_sys::watch_resources(&*cfg.section::<ResourcesConfig>("resources")?).await,
+        resources.subscribe(),
         Some(reloader.subscribe()),
         &metrics,
         aux.clone(),
@@ -262,6 +270,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let mut setup = RoleSetup {
         cfg: &cfg,
         services: &services,
+        metrics: &metrics,
         ext: &ext,
         certs: certs.clone(),
         sockets: Sockets::new(bound.clone()),
@@ -316,7 +325,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     ));
     let rss = RssGauge::register(&metrics);
     let rss_shutdown = aux.clone();
-    tokio::spawn(async move { rss.run(&runtime, rss_shutdown).await });
+    // RSS — с каждым снимком ресурсов по PSI, без PSI — с интервалом `runtime.rss_interval`.
+    tokio::spawn(async move { rss.run_on(&resources, &runtime, rss_shutdown).await });
     let telemetry = telemetry.map(Arc::new);
     let telemetry_task = telemetry
         .clone()
@@ -362,6 +372,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
 struct RoleSetup<'a> {
     cfg: &'a Config,
     services: &'a Services,
+    metrics: &'a Metrics,
     ext: &'a tp_contracts::ext::Registry,
     certs: Option<Arc<TlsCerts>>,
     sockets: Sockets,
@@ -402,6 +413,7 @@ impl RoleSetup<'_> {
             Role::Imap => (
                 Arc::new(ImapRole::new(
                     self.services.imap(),
+                    self.services.imap_extensions(),
                     self.certs.clone(),
                     self.sockets.clone(),
                 )),
@@ -438,13 +450,16 @@ impl RoleSetup<'_> {
             Role::Search => (Arc::new(InProcessRole(role)), fixed_config(())),
             Role::Indexer => {
                 let search = self.cfg.section::<SearchConfig>(sections::SEARCH)?;
+                let indexer = Arc::new(self.services.indexer(&search));
+                crate::metrics::register_indexer(self.metrics, indexer.clone());
                 let service = IndexerRole::new(
                     self.events.clone(),
-                    self.services.indexer(&search),
+                    indexer,
                     self.services.rebuilder(&search),
                     self.services.meta.clone(),
                     self.events_poll,
                     self.cfg.section::<ClusterSection>(CLUSTER)?.rebuild_scan,
+                    LogPause::from(&search.indexer),
                 );
                 (Arc::new(service), fixed_config(()))
             }
@@ -527,7 +542,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tp_contracts::secrets::SecretRef;
     use tp_testkit::MemSecretStore;
 
@@ -570,6 +585,17 @@ mod tests {
             .nth(1)
             .and_then(|c| c.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// Первая строка ответа сервера после соединения (приветствие).
+    async fn first_line(addr: SocketAddr) -> String {
+        let s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut line = String::new();
+        tokio::io::BufReader::new(s)
+            .read_line(&mut line)
+            .await
+            .expect("read");
+        line
     }
 
     #[tokio::test]
@@ -622,6 +648,7 @@ mod tests {
                  meta:\n  events:\n    node_ttl: 3s\n\
                  cluster:\n  node_id: {node}\n\
                  runtime:\n  drain_deadline: 5s\n\
+                 imap:\n  listeners:\n    - listen: 127.0.0.1:0\n  pop3:\n    enabled: true\n    listeners:\n      - listen: 127.0.0.1:0\n\
                  blob:\n  url: file://{}\n",
                 blob.display()
             ),
@@ -658,6 +685,17 @@ mod tests {
             http_status(running.service_addr, "/healthz/live").await,
             200
         );
+        // APP-13: IMAP объявляет QUOTA и ACL (расширения подключены), POP3 по секции `imap.pop3` отвечает `+OK`.
+        let imap = running.listeners.get(Role::Imap.as_str());
+        let greeting = first_line(imap[0]).await;
+        for cap in ["QUOTA", "ACL"] {
+            assert!(
+                greeting.split([' ', ']']).any(|c| c == cap),
+                "{cap}: {greeting}"
+            );
+        }
+        let pop3 = running.listeners.get(crate::protocols::POP3);
+        assert!(first_line(pop3[0]).await.starts_with("+OK"));
         let metrics = running.metrics.encode().expect("metrics");
         assert!(metrics.contains("tp_bus_connected"), "{metrics}");
         assert!(metrics.contains("tp_roles_running"), "{metrics}");

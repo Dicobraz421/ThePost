@@ -14,3 +14,12 @@ manual: no
 
 ## Приёмка
 - Тесты миграции и conformance testkit.
+
+## Состояние (meta-10)
+- Сделано: миграция `0015_node_info_abuse_blocks` (адрес и площадка в `nodes`, таблица `abuse_blocks` с RLS);
+  `Membership::heartbeat(&NodeInfo)` записывает роли, адрес, площадку, `live_info()` — роли ядра (имена ролей модулей
+  в `NodeInfo` не попадают); `MembersChanged` — вход, изменение записи, выход живого узла; `AbuseBlocks for PgMeta`
+  с сигналом `Blocked` после фиксации и удалением истёкших строк (`meta.abuse.purge_batch`). Тесты — `pg_abuse.rs`,
+  `pg_membership.rs` (наборы testkit `membership`, `membership_info`, `abuse_blocks`, миграция с 14-й версии).
+- Остаётся вне полосы: пометка «заглушка до META-27» в CONTRACTS.md#Membership (класс B); приложение пока продлевает
+  запись через `PgMeta::heartbeat_roles` (адрес и площадку не передаёт).

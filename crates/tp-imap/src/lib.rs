@@ -19,6 +19,8 @@ mod compress;
 pub mod config;
 mod ext;
 mod fetch;
+#[doc(hidden)]
+pub mod fuzz;
 mod idle;
 mod mailbox;
 pub mod pop3;

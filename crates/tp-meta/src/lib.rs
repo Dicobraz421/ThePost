@@ -4,6 +4,7 @@
 //! короткая транзакция в контексте организации ([`schema::begin`]); к BLOB и сети внутри транзакций
 //! реализация не обращается.
 
+pub mod abuse;
 pub mod accounts;
 pub mod acl;
 pub mod app_passwords;
@@ -26,6 +27,7 @@ pub mod queue;
 pub mod retention;
 pub mod schema;
 pub mod shards;
+pub mod signals;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,13 +35,17 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tp_contracts::Result;
+use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::config::duration;
+use tp_contracts::events::partition_of;
+use tp_contracts::{AccountId, Result, TenantId};
 
+use crate::abuse::AbuseBlocksConfig;
 use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
 use crate::retention::RetentionConfig;
+use crate::signals::SignalsConfig;
 
 /// Секция конфигурации контура метаданных `meta` (SRS 5.5); пул соединений — отдельная секция
 /// `database` ([`pool::PoolConfig`]). Все поля необязательны; неизвестное поле — ошибка разбора.
@@ -56,6 +62,8 @@ use crate::retention::RetentionConfig;
 ///     trash_retention: 30d
 ///   delivery:
 ///     retention: 30d
+///   signals:
+///     channel: tp_signals
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -78,6 +86,10 @@ pub struct MetaConfig {
     pub retention: RetentionConfig,
     /// Журнал доставки: срок хранения.
     pub delivery: DeliveryLogConfig,
+    /// Сигналы кластера через LISTEN/NOTIFY ([`signals::PgSignalBus`]).
+    pub signals: SignalsConfig,
+    /// Блокировки источников и учётных записей ([`abuse`]).
+    pub abuse: AbuseBlocksConfig,
 }
 
 impl MetaConfig {
@@ -95,15 +107,36 @@ impl Default for MetaConfig {
             doctor: DoctorConfig::default(),
             retention: RetentionConfig::default(),
             delivery: DeliveryLogConfig::default(),
+            signals: SignalsConfig::default(),
+            abuse: AbuseBlocksConfig::default(),
         }
     }
 }
 
+/// Шина, в которую хранилища публикуют сигналы после фиксации.
+#[derive(Clone, Default)]
+struct Signals(Option<Arc<dyn EventBus>>);
+
+impl std::fmt::Debug for Signals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Signals(bus)"
+        } else {
+            "Signals(none)"
+        })
+    }
+}
+
 /// Хранилища метаданных на PostgreSQL.
+///
+/// С шиной ([`PgMeta::with_bus`]) после фиксации публикуются сигналы: `LogAppended` — после записи событий
+/// в журнал ядра, `MembersChanged` — при изменении состава кластера, `Blocked` — после блокировки. Сигнал
+/// at-most-once: ошибка публикации не отменяет зафиксированное изменение (только запись в журнал узла).
 #[derive(Debug, Clone)]
 pub struct PgMeta {
     pool: PgPool,
     cfg: Arc<MetaConfig>,
+    bus: Signals,
 }
 
 impl PgMeta {
@@ -112,6 +145,44 @@ impl PgMeta {
         Self {
             pool,
             cfg: Arc::new(cfg),
+            bus: Signals::default(),
+        }
+    }
+
+    /// Те же хранилища с публикацией сигналов в `bus` после фиксации.
+    pub fn with_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
+        self.bus = Signals(Some(bus));
+        self
+    }
+
+    /// Публикует сигнал после фиксации; ошибка — только в журнал узла (сигнал at-most-once).
+    pub(crate) async fn signal(&self, event: Event) {
+        if let Some(bus) = &self.bus.0
+            && let Err(e) = bus.publish(event).await
+        {
+            tracing::warn!(error = %e, "сигнал не опубликован");
+        }
+    }
+
+    /// Сигналы `LogAppended` разделов журнала событий учётных записей `accounts` (события записаны и
+    /// зафиксированы).
+    pub(crate) async fn signal_log(&self, accounts: impl IntoIterator<Item = AccountId>) {
+        if self.bus.0.is_none() {
+            return;
+        }
+        let mut parts: Vec<_> = accounts
+            .into_iter()
+            .map(|a| partition_of(a, self.cfg.event_partitions))
+            .collect();
+        parts.sort();
+        parts.dedup();
+        for partition in parts {
+            self.signal(Event {
+                tenant: TenantId::DEFAULT,
+                account: None,
+                kind: EventKind::LogAppended { partition },
+            })
+            .await;
         }
     }
 

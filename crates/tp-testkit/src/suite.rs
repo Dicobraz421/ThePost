@@ -47,7 +47,7 @@ use tp_contracts::meta::{
 };
 use tp_contracts::retention::{
     Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule, TrashPurgeSetting,
-    TrashStore,
+    TrashStore, trash_changed,
 };
 use tp_contracts::role::Role;
 use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
@@ -208,7 +208,8 @@ async fn next_signal(stream: &mut EventStream) -> Option<Event> {
         .expect("сигнал не пришёл")
 }
 
-/// Набор проверок системных сигналов `EventBus` (CTR-23): `LogAppended`, `MembersChanged`, `Blocked` приходят
+/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37): `LogAppended`, `MembersChanged`, `Blocked`,
+/// `TrashChanged` приходят
 /// в `subscribe_system()` и не приходят подписке учётной записи; `publish(Resync)` — `Invalid`.
 /// «Не пришло» проверяется тем, что первым пришёл сигнал, опубликованный позже.
 pub async fn signals(bus: &dyn EventBus) {
@@ -243,6 +244,7 @@ pub async fn signals(bus: &dyn EventBus) {
                 subject: BlockSubject::Account(scope.account),
             },
         ),
+        trash_changed(scope),
     ];
     for e in &published {
         assert!(e.kind.is_system());
@@ -1080,12 +1082,7 @@ pub async fn app_password_store(store: &dyn AppPasswordStore, fx: &AppPasswordFi
 /// Набор проверок признака сжатия `BlobIndex` (`supports_compression`). Хэши набора — случайные:
 /// чужие записи учёта не мешают.
 pub async fn blob_compression(index: &dyn BlobIndex, tenant: TenantId) {
-    let fresh = || {
-        let mut h = [0u8; 32];
-        h[..16].copy_from_slice(AccountId::new().as_uuid().as_bytes());
-        h[16..].copy_from_slice(AccountId::new().as_uuid().as_bytes());
-        BlobHash(h)
-    };
+    let fresh = fresh_hash;
     let absent =
         async |hash: &BlobHash| match index.acquire(tenant, hash, 1).await.expect("acquire") {
             Acquire::Absent { generation } => generation,
@@ -1152,6 +1149,140 @@ pub async fn blob_compression(index: &dyn BlobIndex, tenant: TenantId) {
     );
     assert_eq!(index.compression(&key(fresh(), g)).await, Ok(None));
     assert_eq!(index.compression(&key(zstd, g.next())).await, Ok(None));
+}
+
+// ---------- BlobIndex: срок GC и загрузки ----------
+
+/// Случайный хэш: записи учёта других проверок не мешают.
+fn fresh_hash() -> BlobHash {
+    let mut h = [0u8; 32];
+    h[..16].copy_from_slice(AccountId::new().as_uuid().as_bytes());
+    h[16..].copy_from_slice(AccountId::new().as_uuid().as_bytes());
+    BlobHash(h)
+}
+
+/// Набор проверок `BlobIndex::next_gc_due` (CTR-38): срок — `MIN(zero_since) + window` кандидатов GC.
+/// Учёт может быть общим (записи других проверок): набор сверяет срок с `gc_candidates`, а не с часами.
+pub async fn blob_gc_due(index: &dyn BlobIndex, tenant: TenantId) {
+    const W: Duration = Duration::from_secs(3600);
+    let w = time::Duration::HOUR;
+    let hash = fresh_hash();
+    let generation = match index.acquire(tenant, &hash, 1).await.expect("acquire") {
+        Acquire::Absent { generation } => generation,
+        other => panic!("ожидался Absent: {other:?}"),
+    };
+    let generation = match index
+        .commit_new(tenant, &hash, generation, 1, 1)
+        .await
+        .expect("commit")
+    {
+        Commit::Done { generation } => generation,
+        other => panic!("ожидался Done: {other:?}"),
+    };
+    index
+        .release(tenant, &hash, generation, 1)
+        .await
+        .expect("release");
+
+    // Есть кандидат — есть срок; раньше `due - W` обнулённых записей нет, чуть позже — есть.
+    let due = index
+        .next_gc_due(W)
+        .await
+        .expect("next_gc_due")
+        .expect("есть запись без ссылок");
+    assert!(
+        index
+            .gc_candidates(due - w, 1)
+            .await
+            .expect("gc")
+            .is_empty(),
+        "запись с zero_since раньше срока - W"
+    );
+    assert!(
+        !index
+            .gc_candidates(due - w + time::Duration::SECOND, 1)
+            .await
+            .expect("gc")
+            .is_empty(),
+        "нет записи с zero_since = срок - W"
+    );
+    // Срок сдвигается вместе с окном.
+    let due2 = index
+        .next_gc_due(2 * W)
+        .await
+        .expect("next_gc_due")
+        .expect("срок");
+    assert_eq!(due2, due + w);
+}
+
+/// Набор проверок владельцев загрузок `BlobIndex` (`mark_upload`/`upload_owned`/`prune_uploads`; CTR-38).
+/// Моменты — текущие; `prune_uploads` — по всем организациям, поэтому число удалённых проверяется снизу.
+pub async fn blob_uploads(index: &dyn BlobIndex, tenant: TenantId, foreign_tenant: TenantId) {
+    let scope = AccountScope {
+        tenant,
+        account: AccountId::new(),
+    };
+    let other = AccountScope {
+        tenant,
+        account: AccountId::new(),
+    };
+    let key = |hash| BlobKey {
+        tenant,
+        hash,
+        generation: Gen::INITIAL,
+    };
+    let (a, b) = (key(fresh_hash()), key(fresh_hash()));
+    let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("ns");
+    let s = time::Duration::SECOND;
+
+    // Без отметки — не владелец; отметка — только для загрузившей учётной записи и до срока.
+    assert_eq!(index.upload_owned(scope, &a, now).await, Ok(false));
+    index
+        .mark_upload(scope, &a, now + 10 * s)
+        .await
+        .expect("mark");
+    assert_eq!(index.upload_owned(scope, &a, now).await, Ok(true));
+    assert_eq!(index.upload_owned(other, &a, now).await, Ok(false));
+    assert_eq!(index.upload_owned(scope, &b, now).await, Ok(false));
+    assert_eq!(
+        index.upload_owned(scope, &a, now + 10 * s).await,
+        Ok(false),
+        "срок истёк"
+    );
+    // Повторная отметка продлевает до большего срока, меньший срок не сокращает.
+    index
+        .mark_upload(scope, &a, now + 20 * s)
+        .await
+        .expect("extend");
+    index
+        .mark_upload(scope, &a, now + 5 * s)
+        .await
+        .expect("shorter");
+    assert_eq!(index.upload_owned(scope, &a, now + 15 * s).await, Ok(true));
+    // Объект другой организации — `Invalid`.
+    let foreign = BlobKey {
+        tenant: foreign_tenant,
+        ..a
+    };
+    assert!(matches!(
+        index.mark_upload(scope, &foreign, now + 10 * s).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Очистка удаляет истёкшие на момент `now` отметки, действующие остаются.
+    index
+        .mark_upload(other, &b, now + 5 * s)
+        .await
+        .expect("mark b");
+    let pruned = index
+        .prune_uploads(now + 5 * s, usize::MAX)
+        .await
+        .expect("prune");
+    assert!(pruned >= 1, "отметка b не удалена: {pruned}");
+    assert_eq!(index.upload_owned(other, &b, now).await, Ok(false));
+    assert_eq!(index.upload_owned(scope, &a, now).await, Ok(true));
+    assert_eq!(index.prune_uploads(now + 30 * s, 0).await, Ok(0));
+    assert_eq!(index.upload_owned(scope, &a, now).await, Ok(true));
 }
 
 // ---------- DeliveryLog ----------

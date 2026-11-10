@@ -3,14 +3,20 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use std::ops::Range;
+
 use async_trait::async_trait;
 use axum::body::Bytes;
+use futures::{StreamExt, stream};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
+use tp_contracts::blob::{BlobIndex, BlobStore, ByteStream, Compression, ObjectStream};
 use tp_contracts::ext::{DecisionHooks, JmapCapability};
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, Flags, SpecialUse};
+use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_contracts::{Result, TenantId};
 use tp_testkit::{
@@ -115,6 +121,73 @@ impl Outbound for TestOutbound {
     }
 }
 
+/// Двойник `tp_blob::Decompressing` (tp-blob — не зависимость полосы): объект с признаком [`Compression::Zstd`]
+/// читается как исходное содержимое, если оно отмечено [`Unpacking::known`]; иначе — как есть (сжатые байты,
+/// как хранилище без распаковки). Остальное — как у `inner`.
+#[derive(Debug, Clone)]
+pub struct Unpacking {
+    pub inner: MemBlobStore,
+    pub index: MemBlobIndex,
+    originals: Arc<Mutex<HashMap<BlobHash, Bytes>>>,
+}
+
+impl Unpacking {
+    /// Отмечает исходное содержимое сжатых объектов с хэшем `data`.
+    pub fn known(&self, data: &[u8]) {
+        let hash = BlobHash(Sha256::digest(data).into());
+        self.originals
+            .lock()
+            .expect("lock")
+            .insert(hash, Bytes::copy_from_slice(data));
+    }
+}
+
+#[async_trait]
+impl BlobStore for Unpacking {
+    async fn put(&self, key: &BlobKey, data: Bytes) -> Result<()> {
+        self.inner.put(key, data).await
+    }
+
+    async fn put_stream(&self, key: &BlobKey, data: ByteStream, hint: Option<u64>) -> Result<()> {
+        self.inner.put_stream(key, data, hint).await
+    }
+
+    async fn get(&self, key: &BlobKey, range: Option<Range<u64>>) -> Result<ByteStream> {
+        if self.index.compression(key).await? == Some(Compression::Zstd) {
+            let original = self.originals.lock().expect("lock").get(&key.hash).cloned();
+            if let Some(data) = original {
+                assert!(range.is_none(), "двойник: диапазон сжатого объекта");
+                return Ok(stream::once(async move { Ok(data) }).boxed());
+            }
+        }
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &BlobKey) -> Result<Option<u64>> {
+        self.inner.head(key).await
+    }
+
+    async fn delete(&self, key: &BlobKey) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    fn list(&self, prefix: &str, older_than: OffsetDateTime) -> ObjectStream {
+        self.inner.list(prefix, older_than)
+    }
+
+    async fn put_raw(&self, path: &str, data: Bytes) -> Result<()> {
+        self.inner.put_raw(path, data).await
+    }
+
+    async fn get_raw(&self, path: &str, range: Option<Range<u64>>) -> Result<ByteStream> {
+        self.inner.get_raw(path, range).await
+    }
+
+    async fn delete_raw(&self, path: &str) -> Result<()> {
+        self.inner.delete_raw(path).await
+    }
+}
+
 pub const USING: &[&str] = &["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
 
 pub struct Env {
@@ -132,6 +205,8 @@ pub struct Env {
     pub policies: MemPolicies,
     /// Точка принятия решений хранилища и сервера (Legal Hold, доставка).
     pub hook: RecordingDecisionHook,
+    /// Объекты BLOB сервера JMAP (`Deps::blobs`) и их учёт.
+    pub blobs: Unpacking,
     pub jmap: Arc<Jmap>,
 }
 
@@ -174,6 +249,11 @@ impl Env {
         let search = FakeSearch::default();
         let authz = Arc::new(TestAuthz::default());
         let outbound = Arc::new(TestOutbound::default());
+        let unpacking = Unpacking {
+            inner: blobs,
+            index: index.clone(),
+            originals: Arc::default(),
+        };
         let jmap = Jmap::new(
             Deps {
                 auth: Arc::new(auth.clone()),
@@ -184,7 +264,7 @@ impl Env {
                 trash: Arc::new(trash.clone()),
                 policies: Arc::new(policies.clone()),
                 search: Arc::new(search.clone()),
-                blobs: Arc::new(blobs),
+                blobs: Arc::new(unpacking.clone()),
                 blob_index: Arc::new(index),
                 bus: Arc::new(bus.clone()),
                 accounts: Arc::new(meta.clone()),
@@ -209,6 +289,7 @@ impl Env {
             trash,
             policies,
             hook,
+            blobs: unpacking,
             jmap: Arc::new(jmap),
         }
     }

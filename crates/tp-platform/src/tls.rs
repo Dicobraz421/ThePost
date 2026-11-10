@@ -197,7 +197,7 @@ impl TlsCerts {
             })
             .await
             .unwrap_or_default();
-            fs.ensure(dirs, "tls");
+            fs.ensure(dirs, "tls").await;
             // Без событий ОС и с выключенным опросом — ждать SIGHUP, запроса или новой секции (опрос могут включить).
             let poll = if fs.active() {
                 None

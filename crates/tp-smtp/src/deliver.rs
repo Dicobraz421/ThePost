@@ -7,11 +7,12 @@
 //!   ([`Outbound`], [`crate::queue::Queue`]); узел без очереди (`Deps::outbound` = `None`) — `451 4.3.2`;
 //! - submission: до доставки и очереди — `DecisionHooks::on_submission` (`Deny` — `550 5.7.1`; дополнения:
 //!   заголовки в начало письма, копии в папки и внешним адресам);
-//! - внешние адреса пересылки из результата `ingest` (`Ingested::forward`, решение 2026-10-31-ingest-envelope)
-//!   ставит в очередь [`Outbound`].
+//! - адреса пересылки модулей (`Ingested::forward`, решение 2026-10-31-ingest-envelope; `CopyTo::Address`):
+//!   локальные — сразу в ящики тем же `ingest` (SMTP-28), внешние — в очередь [`Outbound`].
 //!
 //! Отправка вне сессии SMTP (JMAP `EmailSubmission/set`) — [`Delivery::submit`] и `impl Outbound for Delivery`
-//! (CMP-04): локальные получатели доставляются сразу тем же `ingest`, внешние — в очередь; статус по получателю.
+//! (CMP-04): локальные получатели доставляются сразу тем же `ingest`, внешние — в очередь (без очереди —
+//! `RcptStatus::Failed` с `451 4.3.0`, SMTP-28); статус по получателю.
 //!
 //! Адресация ([`crate::address`]): получатели переписываются до разрешения, отправитель — после проверок;
 //! подадрес `user+tag` доставляется в ящик `user` с `Delivered-To: user+tag@…`, неизвестный адрес домена — на
@@ -37,7 +38,7 @@ use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested,
 use tp_contracts::meta::{Account, AccountScope, AccountStore, MailboxStore, SpecialUse};
 use tp_contracts::queue::DsnRet;
 use tp_contracts::retention::Quota;
-use tp_contracts::{Error, MailboxId, Result, TenantId};
+use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
 
 use crate::address::{Addressing, Side};
 use crate::authcheck::AuthCheck;
@@ -545,8 +546,8 @@ impl Delivery {
         match &self.deps.outbound {
             Some(q) => q.enqueue(self.deps.tenant, mail_from, &rcpts, raw).await,
             None => {
-                // Узел без очереди: внешних получателей submission не принимает (RCPT — 451), здесь остаются
-                // только пересылки модулей (`Ingested::forward`).
+                // Узел без очереди: внешних получателей submission не принимает (RCPT — 451, `submit` —
+                // `RcptStatus::Failed`), здесь остаются только внешние пересылки и копии модулей.
                 tracing::warn!(
                     %id,
                     count = rcpts.len(),
@@ -555,6 +556,83 @@ impl Delivery {
                 Ok(())
             }
         }
+    }
+
+    /// Копии точки принятия решений на адреса (`CopyTo::Address`): локальные — доставки в ящики (без адреса
+    /// получателя: копия уведомления отправителю не даёт и адрес ему не раскрывает), внешние — в очередь.
+    async fn add_copies(
+        &self,
+        id: &str,
+        prepared: &mut Prepared,
+        addresses: &[String],
+        junk: bool,
+    ) -> Result<()> {
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        let copies = self.prepare(id, addresses, junk).await?;
+        for (_, d) in copies.deliveries {
+            if !prepared
+                .deliveries
+                .iter()
+                .any(|(_, x)| x.account == d.account)
+            {
+                prepared.deliveries.push((String::new(), d));
+            }
+        }
+        push_unique(&mut prepared.external, copies.external);
+        Ok(())
+    }
+
+    /// Пересылки модулей (`Ingested::forward`): локальные адреса — сразу в ящики (CMP-04, SMTP-28), их
+    /// пересылки — так же, пока есть учётные записи, ещё не получившие письмо (`delivered`; защита от
+    /// петель). Неизвестный адрес и переполненный ящик — только в журнал: адрес пересылки отправителю не
+    /// раскрывается. Возвращает внешние адреса — для очереди.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward(
+        &self,
+        id: &str,
+        mail_from: &str,
+        raw: &Bytes,
+        mut forward: Vec<String>,
+        junk: bool,
+        received_at: OffsetDateTime,
+        mut delivered: HashSet<AccountId>,
+    ) -> Result<Vec<String>> {
+        let mut external = Vec::new();
+        while !forward.is_empty() {
+            let p = self.prepare(id, &forward, junk).await?;
+            push_unique(&mut external, p.external);
+            let deliveries: Vec<_> = p
+                .deliveries
+                .into_iter()
+                .filter(|(_, d)| delivered.insert(d.account))
+                .map(|(_, d)| (String::new(), d))
+                .collect();
+            if deliveries.is_empty() {
+                break;
+            }
+            let mut ignored = Vec::new();
+            forward = match self
+                .ingest_all(
+                    id,
+                    mail_from,
+                    raw.clone(),
+                    deliveries,
+                    received_at,
+                    &mut ignored,
+                )
+                .await
+            {
+                Ok(ingested) => ingested.forward,
+                Err(Error::QuotaExceeded) => {
+                    tracing::warn!(%id, "smtp: пересылка не доставлена, ящики переполнены");
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            };
+        }
+        Ok(external)
     }
 
     /// Принимает письмо: проверки, фильтры, доставка и очередь. Ответ фильтра (отказ, отброс) — `Ok(Some)`.
@@ -639,6 +717,7 @@ impl Delivery {
             }
         }
         let mut prepared = self.prepare(&env.id, &env.rcpts, junk).await?;
+        let mut copy_to = Vec::new();
         for copy in copies {
             match copy {
                 CopyTo::Mailbox(d) => {
@@ -650,17 +729,16 @@ impl Delivery {
                         prepared.deliveries.push((String::new(), d));
                     }
                 }
-                CopyTo::Address(a) => {
-                    if !prepared.external.iter().any(|x| x.eq_ignore_ascii_case(&a)) {
-                        prepared.external.push(a);
-                    }
-                }
+                CopyTo::Address(a) => copy_to.push(a),
             }
         }
-        let mut forward = Vec::new();
+        self.add_copies(&env.id, &mut prepared, &copy_to, junk)
+            .await?;
+        let mut rcpts = prepared.external;
         let mut failed = prepared.failed;
         if !prepared.deliveries.is_empty() {
-            forward = self
+            let delivered = accounts_of(&prepared.deliveries);
+            let forward = self
                 .ingest_all(
                     &env.id,
                     &env.mail_from,
@@ -671,9 +749,19 @@ impl Delivery {
                 )
                 .await?
                 .forward;
+            let external = self
+                .forward(
+                    &env.id,
+                    &env.mail_from,
+                    &full,
+                    forward,
+                    junk,
+                    received_at,
+                    delivered,
+                )
+                .await?;
+            push_unique(&mut rcpts, external);
         }
-        let mut rcpts = prepared.external;
-        rcpts.extend(forward);
         self.queue_out(&env.id, &env.mail_from, rcpts, full.clone())
             .await?;
         if !failed.is_empty() && !env.mail_from.is_empty() {
@@ -715,12 +803,15 @@ impl Delivery {
     /// Отправка от имени пользователя вне сессии SMTP (JMAP `EmailSubmission/set`, CMP-04): получатели в
     /// локальных доменах (`delivery.local_domains` и каталог: домены, адреса, псевдонимы, группы)
     /// доставляются сразу через [`MailStore::ingest`] — как входящая почта, без очереди, MX, MTA-STS и DANE;
-    /// внешние — в очередь исходящей почты ([`Deps::outbound`]) письмом `raw` без изменений.
+    /// внешние — в очередь исходящей почты ([`Deps::outbound`]) письмом `raw` без изменений. Пересылки модулей
+    /// на локальные адреса — сразу в ящики, на внешние — в очередь.
     ///
     /// Неизвестный локальный адрес и переполненный ящик — статус [`RcptStatus::Failed`] и уведомление о
-    /// недоставке отправителю (как для входящей почты). Ошибка хранилища, каталога или очереди — `Err`
-    /// (отправка не выполнена, повтор безопасен: локальные получатели обрабатываются первыми).
-    /// Другая организация (`tenant` ≠ `Deps::tenant`) — все получатели в очередь, как до CMP-04.
+    /// недоставке отправителю (как для входящей почты). Узел без очереди: внешние получатели —
+    /// `RcptStatus::Failed` с временной ошибкой [`NO_OUTBOUND`] без уведомления (статус получает отправитель),
+    /// локальные доставляются. Ошибка хранилища, каталога или очереди — `Err`.
+    /// Другая организация (`tenant` ≠ `Deps::tenant`) — все получатели в очередь, как до CMP-04 (без очереди —
+    /// все `Failed`).
     pub async fn submit(
         &self,
         tenant: TenantId,
@@ -732,19 +823,25 @@ impl Delivery {
         let rewritten = self.addressing.rewrite(mail_from, Side::Sender);
         let mail_from = rewritten.as_deref().unwrap_or(mail_from);
         if tenant != self.deps.tenant {
-            let q = self.deps.outbound.as_ref().ok_or_else(no_outbound)?;
-            q.enqueue(tenant, mail_from, rcpts, raw).await?;
+            let status = match &self.deps.outbound {
+                Some(q) => {
+                    q.enqueue(tenant, mail_from, rcpts, raw).await?;
+                    RcptStatus::Queued
+                }
+                None => {
+                    no_outbound(&id, rcpts.len());
+                    RcptStatus::Failed(NO_OUTBOUND.into())
+                }
+            };
             return Ok(Submitted {
                 id,
-                rcpts: rcpts
-                    .iter()
-                    .map(|r| (r.clone(), RcptStatus::Queued))
-                    .collect(),
+                rcpts: rcpts.iter().map(|r| (r.clone(), status.clone())).collect(),
             });
         }
         let prepared = self.prepare(&id, rcpts, false).await?;
-        if !prepared.external.is_empty() && self.deps.outbound.is_none() {
-            return Err(no_outbound());
+        let queue = self.deps.outbound.is_some();
+        if !queue && !prepared.external.is_empty() {
+            no_outbound(&id, prepared.external.len());
         }
         let received_at = OffsetDateTime::now_utc();
         let mut failed = prepared.failed;
@@ -754,19 +851,33 @@ impl Delivery {
                 .submit_headers(&id, mail_from, rcpts, received_at)
                 .into_bytes();
             full.extend_from_slice(&raw);
+            let full = Bytes::from(full);
             let local: Vec<String> = prepared.deliveries.iter().map(|(r, _)| r.clone()).collect();
+            let delivered = accounts_of(&prepared.deliveries);
             match self
                 .ingest_all(
                     &id,
                     mail_from,
-                    Bytes::from(full),
+                    full.clone(),
                     prepared.deliveries,
                     received_at,
                     &mut failed,
                 )
                 .await
             {
-                Ok(ingested) => forward = ingested.forward,
+                Ok(ingested) => {
+                    forward = self
+                        .forward(
+                            &id,
+                            mail_from,
+                            &full,
+                            ingested.forward,
+                            false,
+                            received_at,
+                            delivered,
+                        )
+                        .await?;
+                }
                 // Все ящики переполнены: письмо принято отправкой, отправителю — уведомление.
                 Err(Error::QuotaExceeded) => {
                     for r in local {
@@ -789,15 +900,19 @@ impl Delivery {
                     if let Some(f) = failed.iter().find(|f| f.address.eq_ignore_ascii_case(r)) {
                         RcptStatus::Failed(f.reply.clone())
                     } else if prepared.queued.iter().any(|x| x.eq_ignore_ascii_case(r)) {
-                        RcptStatus::Queued
+                        if queue {
+                            RcptStatus::Queued
+                        } else {
+                            RcptStatus::Failed(NO_OUTBOUND.into())
+                        }
                     } else {
                         RcptStatus::Delivered
                     };
                 (r.clone(), status)
             })
             .collect();
-        let mut out = prepared.external;
-        out.extend(forward);
+        let mut out = if queue { prepared.external } else { Vec::new() };
+        push_unique(&mut out, forward);
         self.queue_out(&id, mail_from, out, raw.clone()).await?;
         if !failed.is_empty() && !mail_from.is_empty() {
             self.bounce(&id, mail_from, &failed, &raw, received_at)
@@ -839,7 +954,8 @@ pub enum RcptStatus {
     Delivered,
     /// Поставлено в очередь исходящей почты (внешний адрес).
     Queued,
-    /// Не доставлено (неизвестный адрес, переполненный ящик): ответ SMTP; отправителю — уведомление.
+    /// Не доставлено: ответ SMTP. Неизвестный адрес, переполненный ящик — отправителю уведомление;
+    /// внешний адрес на узле без очереди — временная ошибка [`NO_OUTBOUND`], без уведомления.
     Failed(String),
 }
 
@@ -863,16 +979,41 @@ impl Outbound for Delivery {
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<()> {
-        self.submit(tenant, mail_from, rcpts, raw).await.map(|_| ())
+        let sent = self.submit(tenant, mail_from, rcpts, raw).await?;
+        // Узел без очереди и ни одной доставки: письмо никуда не попало — ошибка, повтор безопасен.
+        // Иначе внешним получателям — только `Failed` в журнале (повтор задвоил бы локальную доставку).
+        let lost = |s: &RcptStatus| matches!(s, RcptStatus::Failed(r) if r == NO_OUTBOUND);
+        if !sent.rcpts.is_empty() && sent.rcpts.iter().all(|(_, s)| lost(s)) {
+            return Err(Error::UNAVAILABLE);
+        }
+        Ok(())
     }
 }
 
-/// Внешний получатель на узле без очереди исходящей почты.
-fn no_outbound() -> Error {
+/// Статус внешнего получателя [`Delivery::submit`] на узле без очереди исходящей почты (временная ошибка).
+pub const NO_OUTBOUND: &str = "451 4.3.0 outbound queue unavailable";
+
+/// Внешние получатели на узле без очереди исходящей почты — в журнал.
+fn no_outbound(id: &str, count: usize) {
     tracing::warn!(
+        %id,
+        count,
         "smtp: очередь исходящей почты не подключена, внешним адресам отправка недоступна"
     );
-    Error::UNAVAILABLE
+}
+
+/// Учётные записи доставок.
+fn accounts_of(deliveries: &[(String, MailDelivery)]) -> HashSet<AccountId> {
+    deliveries.iter().map(|(_, d)| d.account).collect()
+}
+
+/// Дописывает адреса `more` в `list` без повторов (регистр не учитывается).
+fn push_unique(list: &mut Vec<String>, more: Vec<String>) {
+    for a in more {
+        if !list.iter().any(|x| x.eq_ignore_ascii_case(&a)) {
+            list.push(a);
+        }
+    }
 }
 
 /// Уведомление о доставке: локальному адресату — во «Входящие», внешнему — в очередь исходящей почты.

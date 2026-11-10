@@ -50,6 +50,15 @@ SRS 3.4. Учёт объектов в метаданных. Реализация
   Методы по умолчанию: `supports_compression = false`, `commit_new_with(None)` = `commit_new`, иное — `Internal`, `compression` —
   `None`-сжатие для существующей записи; `commit_new` = `commit_new_with(.., None)`. Реализация признака — `tp-meta` (META-24),
   in-memory — `MemBlobIndex`; набор — `suite::blob_compression`.
+- Срок GC (CTR-38): `next_gc_due(window) -> Option<OffsetDateTime>` — `MIN(zero_since) + window` среди кандидатов
+  `gc_candidates` (`deleting` — тоже; все организации), `None` — их нет; таймер GC взводится на него. По умолчанию — деление
+  пополам по `gc_candidates(.., 1)` с точностью до секунды (срок не раньше точного); реализации — запрос `MIN` по индексу.
+- Владелец загрузки (CTR-38, JMAP `uploadUrl`): загруженный файл без ссылок доступен только загрузившей учётной записи; учёт —
+  общий для узлов и переживает перезапуск. `mark_upload(AccountScope, &BlobKey, until)` (повтор — до большего срока;
+  `key.tenant` ≠ `scope.tenant` — `Invalid`), `upload_owned(scope, &key, now) -> bool` (`until > now`; существование —
+  `exists`), `prune_uploads(now, limit) -> usize` — удалить отметки с `until <= now` (все организации), вызывает GC в проходе.
+  По умолчанию: `mark_upload` — `Internal`, `upload_owned` — `false`, `prune_uploads` — `0`. In-memory — `MemBlobIndex`;
+  наборы — `suite::{blob_gc_due, blob_uploads}`.
 
 ## Metadata
 SRS 3.1, 3.6. Все операции ящика принимают `AccountScope { tenant, account }`; без связей между ящиками.
@@ -91,17 +100,20 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   событие в `EventBus`. Не доставка: без `DecisionHook::on_delivery`, без копий и добавленных заголовков; нет папки — `NotFound`.
 - `fetch_raw(AccountScope, message, Option<Range>) -> ByteStream`; `fetch_part(AccountScope, message, part_path)` — тело в кодировке передачи.
 - `set_flags`, `copy`, `move_to`, `delete_to_trash`, `restore` (по `AccountScope`) — публикуют событие в `EventBus` после фиксации.
+  `restore` восстанавливает и скрытые письма (`trash.purge: hide`; CTR-38) — в исходную папку или «Входящие», прежний `MessageId`;
+  Admin API восстанавливает через него, а не через `TrashStore::restore`, чтобы клиенты получили `MailboxChanged`.
+  Письмо не в корзине и не скрыто — `Invalid`.
 
 ## EventBus
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
-LogAppended { partition } | MembersChanged | Blocked { subject } | TransportChanged { tenant } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+LogAppended { partition } | MembersChanged | Blocked { subject } | TransportChanged { tenant } | TrashChanged { account } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
 `MailboxListChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
-`MembersChanged` — с `TenantId::DEFAULT`, `Blocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
+`MembersChanged` — с `TenantId::DEFAULT`, `Blocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
 Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер); in-memory — `MemEventBus` (отставание — `Resync`).
 Доставка — at-most-once; клиент при запуске, после переподключения и по `Resync` сверяется с хранилищем. Публикация — только после фиксации,
-вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`. Набор `suite::signals`.
+вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`. Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
 ## Lease
@@ -331,7 +343,8 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 `before_final_delete` вне транзакции: `Allow` — стереть (как `expunge_final`), `Deny` (Legal Hold) или ошибка хука — скрыть;
 прочие письма — пропуск. Скрытое письмо не видно пользователю: нет в `MessageStore::get`/`list` и операциях над письмами,
 в счётчиках папки, в квоте (`Quota`, `AccountStore::quota`); `ChangeLog` — удалено из корзины, событие ядра — `Trashed`.
-Администратор: `list_hidden(scope, offset, limit)`, `restore` (видимые и скрытые; исходная папка или «Входящие», прежний `MessageId`);
+Администратор: `list_hidden(scope, offset, limit)`, `restore` (видимые и скрытые; исходная папка или «Входящие», прежний `MessageId`;
+протоколы и Admin API — через `MailStore::restore`, с уведомлением клиентов);
 `list` — только видимые. Срок корзины для скрытых — как для остальных (`expired` → хук → `expunge_final`).
 Настройка: `Policy::trash_purge: Option<TrashPurgeRule { mode, user_can_choose }>` (администратор, уровни цепочки; не задано —
 `hide` без выбора пользователя); `PolicyResolver::trash_purge(scope) -> TrashPurgeSetting { rule, user }`,
@@ -339,6 +352,8 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 `set_user_trash_purge(scope, Option<TrashPurge>)` — без `user_can_choose` выбор `Forbidden`, сброс (`None`) разрешён.
 Срок корзины — `PolicyResolver` (`trash_retention`, по умолчанию 30 суток из конфигурации): хранилище вычисляет `expires_at`
 при переносе в корзину; изменение политики действует на элементы, удалённые после него.
+Сигнал `EventKind::TrashChanged { account }` (системный, `retention::trash_changed(scope)`; CTR-37) — после фиксации `MailStore::delete_to_trash`
+и `purge`, если что-то перенесено, скрыто или стёрто; maintenance пересчитывает по нему ближайший срок (`expired`), по `Resync` и при запуске — тоже.
 Истечение: `expired` → `DecisionHooks::before_final_delete` (`FinalDelete::mailbox` = `origin`) → `MessageStore::expunge_final`; `Deny` — `defer`.
 `expunge_final` удаляет только письма, которые всё ещё в корзине; восстановленные между `expired` и `expunge_final` и прочие — пропуск, не ошибка.
 `Quota`: `usage(scope) -> QuotaUsage` (письма, включая корзину, без скрытых; лимит — `PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded`
@@ -426,3 +441,11 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (источник приложения — организации); точка расширения `transport::{MailFlow, FlowInput, FlowOutcome, FlowVerdict, FlowDirection,
   FlowEnvelope, BlobRef}`, `Registry::set_mail_flow`/`mail_flow`; `EventKind::TransportChanged { tenant }`. In-memory — `MemTransport`
   (`with_bus`); набор `suite::transport_store`. PostgreSQL — `tp-meta` (отдельная карточка).
+- 2026-11-10 — CTR-37 (x/contracts-25): системный сигнал `EventKind::TrashChanged { account }` и `retention::trash_changed(scope)` —
+  после `MailStore::delete_to_trash` и `TrashStore::purge` (таймер истечения корзины в кластере, MS-14). In-memory — `MemTrash::with_bus`
+  (`purge`); набор `suite::signals`. Публикация в `tp-mailstore` (`delete_to_trash`) и `tp-meta` (`purge`) — волны полос.
+- 2026-11-10 — CTR-38 (x/contracts-26): `BlobIndex::next_gc_due` (вместо деления пополам в `tp-blob`); владелец загрузки в учёте —
+  `BlobIndex::{mark_upload, upload_owned, prune_uploads}` (вместо учёта в памяти узла `tp-jmap`); `MailStore::restore` — и для скрытых
+  писем, с уведомлением (Admin API — не через `TrashStore::restore`). Методы по умолчанию — реализации собираются без правки.
+  In-memory — `MemBlobIndex`; наборы `suite::{blob_gc_due, blob_uploads}`. PostgreSQL (`tp-meta`), переход `tp-blob`, `tp-jmap`,
+  `tp-mailstore`, `tp-admin` — волны полос.

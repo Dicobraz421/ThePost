@@ -4,8 +4,9 @@
 //! подменой символической ссылки `..data` в каталоге, файл по прежнему пути при этом не меняется. Получатель по
 //! событию сверяет файлы сам (текст, mtime и размер), поэтому лишние события в каталоге безвредны.
 //!
-//! Источник событий — [`FsEvents`] (inotify; в тестах — источник в памяти). Если событий нет (источник
-//! недоступен или наблюдение прекратилось), получатель переходит на запасной опрос с интервалом из своей секции.
+//! Источник событий — [`FsEvents`]: [`NotifyFsEvents`] (крейт `notify`, inotify на Linux; в тестах — источник в
+//! памяти). Если событий нет (источник недоступен, например исчерпан `fs.inotify.max_user_watches`, или наблюдение
+//! прекратилось), получатель пишет `warn` и переходит на запасной опрос с интервалом из своей секции.
 
 use std::fmt;
 use std::io;
@@ -37,13 +38,111 @@ impl FsEvents for NoFsEvents {
     }
 }
 
-/// Источник событий ОС процесса по умолчанию.
+/// События ОС через крейт `notify` (inotify на Linux), наблюдение без рекурсии.
 ///
-/// Привязка inotify требует системного вызова вне безопасного Rust: до появления привязки в зависимостях
-/// (`tp-sys` или крейт `notify`) — [`NoFsEvents`], то есть запасной опрос. Приложение может передать свой
-/// источник через [`crate::Reloader::with_fs_events`] и [`crate::TlsCerts::run_with`].
+/// Каждое наблюдение — свой экземпляр `notify` (на Linux — дескриптор inotify и поток чтения), он живёт, пока жив
+/// [`FsWatch`]. Открытие и чтение файлов событием не считаются (иначе сверка файлов будила бы сама себя);
+/// переполнение очереди ядра и ошибки чтения событий — событие (получатель сверит файлы). Удаление или переименование
+/// наблюдаемого каталога — событие и затем прекращение наблюдения: получатель сверит файлы и поставит наблюдение
+/// заново по новому набору каталогов. Требует среды выполнения tokio.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NotifyFsEvents;
+
+impl FsEvents for NotifyFsEvents {
+    fn watch(&self, dirs: &[PathBuf]) -> io::Result<FsWatch> {
+        use notify::Watcher as _;
+
+        let runtime = tokio::runtime::Handle::try_current().map_err(io::Error::other)?;
+        let roots = dirs
+            .iter()
+            .map(std::path::absolute)
+            .collect::<io::Result<Vec<_>>>()?;
+        let (tx, rx) = mpsc::channel(1);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let keep = tx.clone();
+        let mut stop_tx = Some(stop_tx);
+        let handler = move |event: notify::Result<notify::Event>| match event {
+            Ok(event) => match classify(&event, &roots) {
+                Change::Ignore => {}
+                Change::Files => {
+                    // Полный канал — событие уже ждёт чтения (склейка).
+                    let _ = tx.try_send(());
+                }
+                Change::RootGone => {
+                    let _ = tx.try_send(());
+                    if let Some(stop) = stop_tx.take() {
+                        let _ = stop.send(());
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "file change events error; rechecking files");
+                let _ = tx.try_send(());
+            }
+        };
+        let mut watcher =
+            notify::RecommendedWatcher::new(handler, notify::Config::default()).map_err(to_io)?;
+        for dir in dirs {
+            watcher
+                .watch(dir, notify::RecursiveMode::NonRecursive)
+                .map_err(to_io)?;
+        }
+        // Наблюдение живёт, пока получатель не закрыт и наблюдаемые каталоги на месте.
+        runtime.spawn(async move {
+            let _watcher = watcher;
+            tokio::select! {
+                () = keep.closed() => {}
+                _ = stop_rx => {}
+            }
+        });
+        Ok(rx)
+    }
+}
+
+/// Значение события `notify` для получателя.
+#[derive(Debug, PartialEq, Eq)]
+enum Change {
+    /// Открытие или чтение без записи.
+    Ignore,
+    /// Изменение в каталоге (или неизвестное): сверить файлы.
+    Files,
+    /// Наблюдаемый каталог удалён или переименован: сверить файлы и поставить наблюдение заново.
+    RootGone,
+}
+
+fn classify(event: &notify::Event, roots: &[PathBuf]) -> Change {
+    use notify::EventKind;
+    use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
+
+    match event.kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => Change::Files,
+        EventKind::Access(_) => Change::Ignore,
+        EventKind::Remove(_)
+        | EventKind::Modify(ModifyKind::Name(RenameMode::From | RenameMode::Any))
+            if event.paths.iter().any(|p| roots.contains(p)) =>
+        {
+            Change::RootGone
+        }
+        _ => Change::Files,
+    }
+}
+
+fn to_io(e: notify::Error) -> io::Error {
+    match e.kind {
+        notify::ErrorKind::Io(io) => io,
+        notify::ErrorKind::PathNotFound => io::Error::new(io::ErrorKind::NotFound, e.to_string()),
+        notify::ErrorKind::MaxFilesWatch => io::Error::new(
+            io::ErrorKind::QuotaExceeded,
+            "inotify watch limit reached (fs.inotify.max_user_watches)",
+        ),
+        _ => io::Error::other(e.to_string()),
+    }
+}
+
+/// Источник событий ОС процесса по умолчанию — [`NotifyFsEvents`]. Приложение может передать свой источник через
+/// [`crate::Reloader::with_fs_events`] и [`crate::TlsCerts::run_with`].
 pub fn os_events() -> Arc<dyn FsEvents> {
-    Arc::new(NoFsEvents)
+    Arc::new(NotifyFsEvents)
 }
 
 /// Каталоги наблюдения для файлов: каталог пути и каталог цели символической ссылки (без повторов).
@@ -88,14 +187,20 @@ impl DirWatch {
     }
 
     /// Ставит наблюдение за каталогами `dirs`, если набор изменился или прежнее наблюдение прекратилось.
-    pub(crate) fn ensure(&mut self, dirs: Vec<PathBuf>, what: &str) {
+    /// Постановка наблюдения — блокирующие системные вызовы, выполняется в `spawn_blocking`.
+    pub(crate) async fn ensure(&mut self, dirs: Vec<PathBuf>, what: &str) {
         if dirs == self.dirs && (self.rx.is_some() || dirs.is_empty()) {
             return;
         }
         let retry = dirs == self.dirs;
         self.dirs = dirs;
         self.rx = None;
-        match self.events.watch(&self.dirs) {
+        let events = self.events.clone();
+        let watch_dirs = self.dirs.clone();
+        let result = tokio::task::spawn_blocking(move || events.watch(&watch_dirs))
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(e)));
+        match result {
             Ok(rx) => {
                 tracing::debug!(what, dirs = ?self.dirs, "file change events enabled");
                 self.rx = Some(rx);
@@ -193,16 +298,106 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Временный каталог теста (удаляется при выходе).
+    pub(crate) struct TempDir(pub(crate) PathBuf);
+
+    impl TempDir {
+        pub(crate) fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let dir = std::env::temp_dir()
+                .join(format!("tp-platform-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Вычитывает накопившиеся события: `true`, если пришло хотя бы одно за `quiet`.
+    async fn drain(rx: &mut FsWatch, quiet: std::time::Duration) -> bool {
+        let mut any = false;
+        while let Ok(Some(())) = tokio::time::timeout(quiet, rx.recv()).await {
+            any = true;
+        }
+        any
+    }
+
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    const QUIET: std::time::Duration = std::time::Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn notify_reports_writes_but_not_reads() {
+        let dir = TempDir::new("notify-write");
+        let file = dir.0.join("cert.pem");
+        let mut rx = NotifyFsEvents
+            .watch(std::slice::from_ref(&dir.0))
+            .expect("inotify watch");
+
+        std::fs::write(&file, "v1").expect("write");
+        tokio::time::timeout(DEADLINE, rx.recv())
+            .await
+            .expect("event in time")
+            .expect("watch alive");
+        drain(&mut rx, QUIET).await;
+
+        // Сверка файлов получателем (открытие и чтение) событием не считается.
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "v1");
+        assert!(
+            !drain(&mut rx, QUIET).await,
+            "reads do not wake the receiver"
+        );
+
+        std::fs::write(&file, "v2").expect("write");
+        assert!(drain(&mut rx, QUIET).await, "rewrite is reported");
+    }
+
+    #[tokio::test]
+    async fn notify_stops_when_watched_dir_is_removed() {
+        let base = TempDir::new("notify-gone");
+        let dir = base.0.join("..v1");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut rx = NotifyFsEvents
+            .watch(std::slice::from_ref(&dir))
+            .expect("inotify watch");
+
+        std::fs::remove_dir_all(&dir).expect("remove");
+        let closed =
+            tokio::time::timeout(DEADLINE, async { while rx.recv().await.is_some() {} }).await;
+        assert!(closed.is_ok(), "watch ends after its directory is removed");
+    }
+
+    #[tokio::test]
+    async fn notify_missing_dir_is_an_error() {
+        let base = TempDir::new("notify-missing");
+        let err = NotifyFsEvents
+            .watch(&[base.0.join("absent")])
+            .expect_err("missing dir");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        let mut watch = DirWatch::new(Arc::new(NotifyFsEvents));
+        watch.ensure(vec![base.0.join("absent")], "test").await;
+        assert!(!watch.active(), "falls back to polling");
+        watch.ensure(vec![base.0.clone()], "test").await;
+        assert!(watch.active());
+    }
+
     #[tokio::test]
     async fn watch_falls_back_when_unavailable_or_stopped() {
         let mut none = DirWatch::new(Arc::new(NoFsEvents));
-        none.ensure(vec![PathBuf::from("/etc")], "test");
+        none.ensure(vec![PathBuf::from("/etc")], "test").await;
         assert!(!none.active());
 
         let events = Arc::new(MemFsEvents::default());
         let mut watch = DirWatch::new(events.clone());
-        watch.ensure(vec![PathBuf::from("/etc")], "test");
-        watch.ensure(vec![PathBuf::from("/etc")], "test");
+        watch.ensure(vec![PathBuf::from("/etc")], "test").await;
+        watch.ensure(vec![PathBuf::from("/etc")], "test").await;
         assert_eq!(events.watches(), 1, "same dirs are watched once");
         assert!(watch.active());
         assert_eq!(events.fire(Path::new("/etc")), 1);
@@ -212,7 +407,7 @@ pub(crate) mod tests {
         events.stop();
         watch.changed().await;
         assert!(!watch.active(), "stopped watch falls back to polling");
-        watch.ensure(vec![PathBuf::from("/etc")], "test");
+        watch.ensure(vec![PathBuf::from("/etc")], "test").await;
         assert!(watch.active(), "watch is re-established");
     }
 }

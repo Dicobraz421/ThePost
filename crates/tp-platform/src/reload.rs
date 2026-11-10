@@ -224,7 +224,7 @@ impl Reloader {
             let dirs = tokio::task::spawn_blocking(move || fswatch::dirs_of(&[&path]))
                 .await
                 .unwrap_or_default();
-            fs.ensure(dirs, "config");
+            fs.ensure(dirs, "config").await;
             let poll = if fs.active() {
                 Duration::ZERO
             } else {
@@ -595,6 +595,73 @@ mod tests {
         shutdown.cancel();
         task.await.expect("join");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Пишет новые версии, пока подписчик не получит изменение: наблюдение ставится асинхронно.
+    async fn until_applied(
+        rx: &mut watch::Receiver<Arc<Config>>,
+        mut write: impl FnMut(u32),
+    ) -> u32 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for version in 2.. {
+                write(version);
+                if tokio::time::timeout(Duration::from_millis(200), rx.changed())
+                    .await
+                    .is_ok()
+                {
+                    return version;
+                }
+            }
+            unreachable!("versions are unbounded")
+        })
+        .await
+        .expect("applied by an os event in time")
+    }
+
+    /// Настоящий inotify (источник по умолчанию): запись файла и подмена `..data` применяются без опроса.
+    #[tokio::test]
+    async fn os_events_apply_write_and_configmap_swap() {
+        let base = crate::fswatch::tests::TempDir::new("os-events");
+        let version = |name: &str, max_value: u32| {
+            let dir = base.0.join(name);
+            fs::create_dir_all(&dir).expect("dir");
+            fs::write(dir.join("config.yaml"), cfg(max_value, HOUR_MS)).expect("write");
+        };
+        version("..v1", 1);
+        std::os::unix::fs::symlink("..v1", base.0.join("..data")).expect("data link");
+        std::os::unix::fs::symlink("..data/config.yaml", base.0.join("config.yaml"))
+            .expect("file link");
+
+        let reloader = Reloader::start_with(registry(), base.0.join("config.yaml"), Vec::new())
+            .expect("start");
+        let mut rx = reloader.subscribe();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(reloader.run(shutdown.clone()));
+
+        // Запись поверх текущей версии.
+        let applied = until_applied(&mut rx, |v| {
+            fs::write(base.0.join("..v1/config.yaml"), cfg(v, HOUR_MS)).expect("write")
+        })
+        .await;
+        // Изменение пришло от одной из записанных версий (событие могло опоздать на шаг).
+        assert!((2..=applied).contains(&max(&rx.borrow_and_update())));
+
+        // Атомарная подмена ConfigMap: новая версия, временная ссылка, rename поверх ..data, удаление старой.
+        let mut previous = String::from("..v1");
+        let applied = until_applied(&mut rx, |v| {
+            let name = format!("..v{}", v + 100);
+            version(&name, v + 100);
+            let _ = fs::remove_file(base.0.join("..data_tmp"));
+            std::os::unix::fs::symlink(&name, base.0.join("..data_tmp")).expect("tmp link");
+            fs::rename(base.0.join("..data_tmp"), base.0.join("..data")).expect("swap");
+            let _ = fs::remove_dir_all(base.0.join(&previous));
+            previous = name;
+        })
+        .await;
+        assert!((102..=applied + 100).contains(&max(&rx.borrow_and_update())));
+
+        shutdown.cancel();
+        task.await.expect("join");
     }
 
     #[tokio::test]

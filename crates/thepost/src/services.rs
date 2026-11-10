@@ -122,8 +122,9 @@ impl Services {
         let tenant = TenantId::DEFAULT;
         let profile = cfg.profile();
         let hooks = ext.decision_hooks();
-        // Запись — со сжатием по `blob.compression`; чтение распаковывает само хранилище (MS-15): остальным
-        // (jmap upload/download) — `blob` без обёртки `Decompressing`.
+        // Запись — со сжатием по `blob.compression`; чтение распаковывает само хранилище (MS-15). JMAP
+        // (upload/download) читает объекты через `Decompressing` (JMAP-13): загрузка может совпасть по содержимому
+        // со сжатой частью письма.
         let writer = tp_blob::WriterConfig {
             compression: cfg
                 .section::<crate::sections::BlobSection>(crate::sections::BLOB)?
@@ -335,6 +336,16 @@ impl Services {
         }
     }
 
+    /// Зависимости расширений IMAP: QUOTA (учётные записи), ACL и общие папки (ACL папок, единый слой
+    /// авторизации). Без них `tp-imap` эти возможности не объявляет.
+    pub fn imap_extensions(&self) -> tp_imap::Extensions {
+        tp_imap::Extensions {
+            accounts: Some(Arc::new(self.meta.clone())),
+            acl: Some(Arc::new(self.meta.clone())),
+            authz: Some(self.authz.clone()),
+        }
+    }
+
     /// Сервер JMAP; отправка — через доставку SMTP (CMP-07): локальным адресатам — сразу в ящики, внешним — в
     /// очередь SMTP с DKIM-подписью.
     pub fn jmap(
@@ -351,7 +362,10 @@ impl Services {
             changes: Arc::new(self.meta.clone()),
             store: self.store.clone(),
             search: self.search.clone(),
-            blobs: self.blob.clone(),
+            blobs: Arc::new(tp_blob::Decompressing::new(
+                self.blob.clone(),
+                Arc::new(self.meta.clone()),
+            )),
             blob_index: Arc::new(self.meta.clone()),
             bus: self.bus.clone(),
             accounts: Arc::new(self.meta.clone()),

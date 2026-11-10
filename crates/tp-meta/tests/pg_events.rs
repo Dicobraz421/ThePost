@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tp_contracts::events::{
-    CoreEventKind, EventLog, EventPos, EventSink, LoggedEvent, Partition, partition_of,
+    CoreEventKind, EventLog, EventPos, EventSink, LoggedEvent, Partition, PartitionAssigner,
+    partition_of,
 };
+use tp_contracts::membership::NodeId;
 use tp_contracts::meta::{AccountScope, MailboxStore, NewMailbox};
 use tp_contracts::{Error, MailboxId, Result};
 use tp_meta::events::{EventConsumer, EventsConfig};
@@ -306,4 +308,113 @@ async fn partition_out_of_range() {
         meta.read(Partition(PARTITIONS), EventPos(0), 1).await,
         Err(Error::Invalid(_))
     ));
+}
+
+/// Распределитель, назначающий узлу ровно заданные разделы.
+struct Fixed(Vec<Partition>, tokio::sync::watch::Sender<Vec<NodeId>>);
+
+impl PartitionAssigner for Fixed {
+    fn assigned(&self, _: &str, _: &NodeId, _: u32) -> Vec<Partition> {
+        self.0.clone()
+    }
+
+    fn members(&self) -> tokio::sync::watch::Receiver<Vec<NodeId>> {
+        self.1.subscribe()
+    }
+}
+
+/// Подписчик, отказывающий в пачках раздела `broken`, пока тот не «починен».
+struct Picky {
+    name: String,
+    broken: Mutex<Option<Partition>>,
+    calls: AtomicUsize,
+    seen: Mutex<Vec<LoggedEvent>>,
+}
+
+#[async_trait]
+impl EventSink for Picky {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn handle(&self, batch: &[LoggedEvent]) -> Result<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let broken = *self.broken.lock().expect("lock");
+        if batch.iter().any(|e| Some(e.partition) == broken) {
+            return Err(Error::UNAVAILABLE);
+        }
+        self.seen.lock().expect("lock").extend_from_slice(batch);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn failed_partition_does_not_stop_others() {
+    let Some(meta) = meta().await else {
+        return;
+    };
+    let (first, pa) = account(&meta).await;
+    let (second, pb) = loop {
+        let (s, p) = account(&meta).await;
+        if p != pa {
+            break (s, p);
+        }
+    };
+    // Ошибка — в первом по порядку обхода разделе.
+    let (bad, good, good_scope) = if pa < pb {
+        (pa, pb, second)
+    } else {
+        (pb, pa, first)
+    };
+    let shared = Arc::new(meta.clone());
+    let (tx, _) = tokio::sync::watch::channel(Vec::new());
+    let c = EventConsumer::new(
+        shared.clone(),
+        shared,
+        "a",
+        EventsConfig {
+            batch: 1000,
+            retry_min: Duration::from_secs(3600),
+            retry_max: Duration::from_secs(3600),
+            ..EventsConfig::default()
+        },
+    )
+    .with_assigner(
+        Arc::new(Fixed(vec![bad.min(good), bad.max(good)], tx)),
+        NodeId::new("n1").expect("node"),
+    );
+    let sink = Picky {
+        name: subscriber(),
+        broken: Mutex::new(Some(bad)),
+        calls: AtomicUsize::new(0),
+        seen: Mutex::new(Vec::new()),
+    };
+
+    let r = c.poll(&sink).await.expect("poll");
+    assert_eq!(r.failed.len(), 1);
+    assert_eq!(r.failed[0].0, bad);
+    assert!(r.handled > 0);
+    let delivered = sink
+        .seen
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|e| e.event.account == good_scope.account)
+        .count();
+    assert_eq!(
+        i64::try_from(delivered).expect("len"),
+        account_events(&meta, good_scope).await,
+        "события второго раздела доставлены"
+    );
+    assert_eq!(
+        meta.position(&sink.name, bad).await.expect("pos"),
+        EventPos(0)
+    );
+    assert!(r.retry_in.expect("срок повтора") > Duration::from_secs(3000));
+
+    // До срока раздел с ошибкой не опрашивается.
+    let calls = sink.calls.load(Ordering::SeqCst);
+    let r = c.poll(&sink).await.expect("poll");
+    assert_eq!((r.deferred, r.failed.len()), (1, 0));
+    assert_eq!(sink.calls.load(Ordering::SeqCst), calls);
 }

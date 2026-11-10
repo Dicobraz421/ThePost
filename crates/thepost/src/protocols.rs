@@ -1,15 +1,17 @@
 //! Роли протоколов и индексатора (APP-04): слушатели открывает приложение (`Listener::open`), сервисы — крейты
-//! полос: smtp-in и submission (`tp-smtp`), imap (`tp-imap`), jmap и admin (HTTP платформы), indexer (`tp-search`
-//! с обработчиком журнала событий `tp-meta`). Роль без слушателей в конфигурации готова, но соединений не принимает.
+//! полос: smtp-in и submission (`tp-smtp`), imap (`tp-imap`: IMAP с QUOTA и ACL, POP3 по секции `imap.pop3`),
+//! jmap и admin (HTTP платформы), indexer (`tp-search` с обработчиком журнала событий `tp-meta`). Роль без
+//! слушателей в конфигурации готова, но соединений не принимает.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::task::JoinSet;
 use tp_contracts::events::{EventLog, EventSink, partition_of};
+use tp_contracts::meta::AccountScope;
 use tp_contracts::role::{Role, RoleCtx, RoleService};
 use tp_contracts::search::IndexManifestStore as _;
 use tp_contracts::tls::Profile;
@@ -18,7 +20,7 @@ use tp_meta::PgMeta;
 use tp_meta::events::EventConsumer;
 use tp_platform::listen::EndpointConfig;
 use tp_platform::{InheritedSockets, Listener, TlsCerts, service_http};
-use tp_search::{Indexer, Rebuilder, SCHEMA_VERSION, SUBSCRIBER};
+use tp_search::{Indexer, IndexerConfig, Rebuilder, SCHEMA_VERSION, SUBSCRIBER};
 use tp_smtp::{Mode, ServerDeps, SmtpConfig, SmtpService};
 
 use crate::sections::HttpListener;
@@ -66,13 +68,16 @@ impl Sockets {
         }
     }
 
-    /// Слушатели роли `role` по `endpoints`; фактические адреса — в реестр.
+    /// Слушатели роли `role` по `endpoints`; фактические адреса — в реестр (нет слушателей — реестр не меняется).
     fn open(
         &self,
         role: &str,
         endpoints: &[EndpointConfig],
         tls: Option<Arc<TlsCerts>>,
     ) -> Result<Vec<Listener>> {
+        if endpoints.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut inherited = self
             .inherited
             .lock()
@@ -152,18 +157,33 @@ impl RoleService for SmtpRole {
     }
 }
 
-/// Роль imap: секция `imap` (`listeners`), сервер `tp-imap`.
+/// Имя слушателей POP3 в реестре адресов ([`Bound`]): POP3 работает в роли imap (секция `imap.pop3`).
+pub const POP3: &str = "pop3";
+
+/// Роль imap: секция `imap` (`listeners`), сервер `tp-imap` с расширениями QUOTA, ACL и общими папками; POP3 —
+/// по секции `imap.pop3` (`enabled`, `listeners`; STLS — сертификаты секции `tls`).
 #[derive(Debug, Clone)]
 pub struct ImapRole {
     deps: tp_imap::Deps,
+    ext: tp_imap::Extensions,
     tls: Option<Arc<TlsCerts>>,
     sockets: Sockets,
 }
 
 impl ImapRole {
-    /// Роль с зависимостями сессий `deps`.
-    pub fn new(deps: tp_imap::Deps, tls: Option<Arc<TlsCerts>>, sockets: Sockets) -> Self {
-        Self { deps, tls, sockets }
+    /// Роль с зависимостями сессий `deps` и расширений `ext`.
+    pub fn new(
+        deps: tp_imap::Deps,
+        ext: tp_imap::Extensions,
+        tls: Option<Arc<TlsCerts>>,
+        sockets: Sockets,
+    ) -> Self {
+        Self {
+            deps,
+            ext,
+            tls,
+            sockets,
+        }
     }
 }
 
@@ -175,19 +195,34 @@ impl RoleService for ImapRole {
 
     async fn run(&self, ctx: RoleCtx) -> Result<()> {
         let cfg = ctx.config::<tp_imap::ImapConfig>()?;
-        if cfg.listeners.is_empty() {
+        let pop3 = &cfg.pop3;
+        match (pop3.enabled, pop3.listeners.is_empty()) {
+            (true, true) => tracing::warn!("imap.pop3: POP3 включён, но слушатели не заданы"),
+            (false, false) => tracing::info!("imap.pop3: слушатели заданы, но POP3 выключен"),
+            _ => {}
+        }
+        let pop3_endpoints: &[EndpointConfig] = if pop3.enabled { &pop3.listeners } else { &[] };
+        if cfg.listeners.is_empty() && pop3_endpoints.is_empty() {
             return idle(self.name(), &ctx).await;
         }
-        let listeners = self
+        // Все слушатели открываются до приёма соединений: ошибка любого — ошибка запуска роли.
+        let imap = self
             .sockets
             .open(self.name(), &cfg.listeners, self.tls.clone())?;
-        let server = tp_imap::Server::new(tp_imap::SessionCtx {
+        let pop3 = self.sockets.open(POP3, pop3_endpoints, self.tls.clone())?;
+        let session = || tp_imap::SessionCtx {
             config: cfg.clone(),
             deps: self.deps.clone(),
             shutdown: ctx.shutdown.clone(),
-        });
+        };
         let mut loops = JoinSet::new();
-        for listener in listeners {
+        let server = tp_imap::Server::new(session()).with_extensions(self.ext.clone());
+        for listener in imap {
+            let server = server.clone();
+            loops.spawn(async move { server.serve(listener).await });
+        }
+        let server = tp_imap::Pop3Server::new(session());
+        for listener in pop3 {
             let server = server.clone();
             loops.spawn(async move { server.serve(listener).await });
         }
@@ -300,6 +335,91 @@ impl RoleService for HttpRole {
     }
 }
 
+/// Пауза между записями в журнал одной и той же ошибки: первая — `initial`, каждая следующая вдвое больше,
+/// до `max` (как пауза повтора индексатора, `search.indexer.retry_initial`/`retry_max`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogPause {
+    /// Пауза после первой записи.
+    pub initial: Duration,
+    /// Предельная пауза (меньше `initial` — `initial`).
+    pub max: Duration,
+}
+
+impl From<&IndexerConfig> for LogPause {
+    fn from(cfg: &IndexerConfig) -> Self {
+        Self {
+            initial: cfg.retry_initial,
+            max: cfg.retry_max,
+        }
+    }
+}
+
+/// Повторяющаяся ошибка цикла роли: новая записывается в журнал сразу, та же — не чаще раза за паузу; пауза
+/// растёт от записи к записи, успех сбрасывает состояние.
+#[derive(Debug)]
+struct RepeatLog {
+    pause: LogPause,
+    /// Последняя записанная ошибка, когда и пауза до следующей записи той же ошибки.
+    last: Option<(String, Instant, Duration)>,
+    /// Ошибок подряд с первой записи.
+    failures: u64,
+    /// Повторов, не записанных с прошлой записи.
+    skipped: u64,
+}
+
+impl RepeatLog {
+    fn new(pause: LogPause) -> Self {
+        Self {
+            pause,
+            last: None,
+            failures: 0,
+            skipped: 0,
+        }
+    }
+
+    /// Ошибка `msg` в `now`: `Some(пропущено повторов)` — записать в журнал.
+    fn fail(&mut self, msg: String, now: Instant) -> Option<u64> {
+        self.failures = self.failures.saturating_add(1);
+        let max = self.pause.max.max(self.pause.initial);
+        let pause = match &self.last {
+            Some((last, at, pause)) if *last == msg => {
+                if now.duration_since(*at) < *pause {
+                    self.skipped = self.skipped.saturating_add(1);
+                    return None;
+                }
+                pause.saturating_mul(2).min(max)
+            }
+            _ => self.pause.initial.min(max),
+        };
+        self.last = Some((msg, now, pause));
+        Some(std::mem::take(&mut self.skipped))
+    }
+
+    /// Успешная попытка: ошибок подряд до неё (0 — ошибок не было); состояние сброшено.
+    fn ok(&mut self) -> u64 {
+        self.last = None;
+        self.skipped = 0;
+        std::mem::take(&mut self.failures)
+    }
+}
+
+/// Итог шага цикла роли с записью в журнал по [`RepeatLog`]: `what` — что за шаг.
+fn log_step(log: &mut RepeatLog, result: Result<()>, what: &str) {
+    match result {
+        Ok(()) => {
+            let failures = log.ok();
+            if failures > 0 {
+                tracing::info!(failures, "indexer: {what} — снова без ошибок");
+            }
+        }
+        Err(e) => {
+            if let Some(skipped) = log.fail(e.to_string(), Instant::now()) {
+                tracing::warn!(error = %e, skipped, "indexer: {what} — ошибка");
+            }
+        }
+    }
+}
+
 /// Роль indexer: подписчик `indexer` журнала событий с лизами разделов `events/indexer/{p}` (обработчик
 /// `tp-meta`), перестройка индексов по `pending_rebuilds` для ящиков своих разделов.
 pub struct IndexerRole {
@@ -309,6 +429,7 @@ pub struct IndexerRole {
     meta: PgMeta,
     poll: Duration,
     rebuild_batch: usize,
+    log_pause: LogPause,
 }
 
 impl std::fmt::Debug for IndexerRole {
@@ -320,31 +441,37 @@ impl std::fmt::Debug for IndexerRole {
 }
 
 impl IndexerRole {
-    /// Роль: журнал `events`, индексатор и перестройка; опрос журнала — каждые `poll`.
+    /// Роль: журнал `events`, индексатор и перестройка; опрос журнала — каждые `poll`, а раздел с ошибкой —
+    /// к сроку его повтора (`PollReport::retry_in`), если он раньше; повторяющиеся ошибки — в журнал не чаще
+    /// раза за паузу `log_pause`.
     pub fn new(
         events: EventConsumer,
-        indexer: Indexer,
+        indexer: Arc<Indexer>,
         rebuilder: Rebuilder,
         meta: PgMeta,
         poll: Duration,
         rebuild_batch: usize,
+        log_pause: LogPause,
     ) -> Self {
         Self {
             events,
-            indexer: Arc::new(indexer),
+            indexer,
             rebuilder: Arc::new(rebuilder),
             meta,
             poll,
             rebuild_batch,
+            log_pause,
         }
     }
 
-    /// Перестройка запрошенных индексов ящиков, чьи разделы журнала держит узел.
-    async fn rebuild_pending(&self) -> Result<()> {
+    /// Перестройка запрошенных индексов ящиков, чьи разделы журнала держит узел; `failed` — ошибки перестройки
+    /// по ящикам (остаются только ящики из текущего списка запросов).
+    async fn rebuild_pending(&self, failed: &mut HashMap<AccountScope, RepeatLog>) -> Result<()> {
         let pending = self
             .meta
             .pending_rebuilds(SCHEMA_VERSION, self.rebuild_batch.max(1))
             .await?;
+        failed.retain(|scope, _| pending.contains(scope));
         if pending.is_empty() {
             return Ok(());
         }
@@ -356,10 +483,16 @@ impl IndexerRole {
             }
             match self.rebuilder.rebuild(scope).await {
                 Ok(n) => {
+                    failed.remove(&scope);
                     tracing::info!(account = %scope.account, messages = n, "search: индекс перестроен")
                 }
                 Err(e) => {
-                    tracing::warn!(account = %scope.account, error = %e, "search: индекс не перестроен")
+                    let log = failed
+                        .entry(scope)
+                        .or_insert_with(|| RepeatLog::new(self.log_pause));
+                    if let Some(skipped) = log.fail(e.to_string(), Instant::now()) {
+                        tracing::warn!(account = %scope.account, error = %e, skipped, "search: индекс не перестроен")
+                    }
                 }
             }
         }
@@ -375,23 +508,29 @@ impl RoleService for IndexerRole {
 
     async fn run(&self, ctx: RoleCtx) -> Result<()> {
         ctx.ready.set(true);
-        let mut tick = tokio::time::interval(self.poll.max(Duration::from_millis(1)));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut poll_log = RepeatLog::new(self.log_pause);
+        let mut pending_log = RepeatLog::new(self.log_pause);
+        let mut rebuild_failed = HashMap::new();
+        let mut next = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 () = ctx.shutdown.cancelled() => break,
-                _ = tick.tick() => {}
+                () = tokio::time::sleep_until(next) => {}
             }
-            if let Err(e) = self
+            let started = tokio::time::Instant::now();
+            let polled = self
                 .events
                 .poll(self.indexer.as_ref() as &dyn EventSink)
-                .await
-            {
-                tracing::warn!(error = %e, "indexer: пачка журнала событий не обработана");
-            }
-            if let Err(e) = self.rebuild_pending().await {
-                tracing::warn!(error = %e, "indexer: запросы перестройки не прочитаны");
-            }
+                .await;
+            let retry_at = polled
+                .as_ref()
+                .ok()
+                .and_then(|r| r.retry_in)
+                .map(|r| tokio::time::Instant::now() + r);
+            log_step(&mut poll_log, polled.map(drop), "опрос журнала событий");
+            let pending = self.rebuild_pending(&mut rebuild_failed).await;
+            log_step(&mut pending_log, pending, "чтение запросов перестройки");
+            next = next_poll(started, self.poll, retry_at);
         }
         if let Err(e) = self.events.release_all(SUBSCRIBER).await {
             tracing::warn!(error = %e, "indexer: лизы разделов не отданы");
@@ -399,6 +538,19 @@ impl RoleService for IndexerRole {
         ctx.ready.set(false);
         Ok(())
     }
+}
+
+/// Срок следующего опроса журнала: тик `poll` от начала прохода `started`, а если ближайший срок повтора раздела
+/// с ошибкой `retry_at` (META-35) раньше — он; не раньше, чем через 1 мс после начала прохода.
+fn next_poll(
+    started: tokio::time::Instant,
+    poll: Duration,
+    retry_at: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let tick = started + poll;
+    retry_at
+        .map_or(tick, |r| r.min(tick))
+        .max(started + Duration::from_millis(1))
 }
 
 /// Роль, работа которой в этой сборке идёт в процессе других ролей (search: запросы выполняют imap и jmap
@@ -418,5 +570,160 @@ impl RoleService for InProcessRole {
         ctx.shutdown.cancelled().await;
         ctx.ready.set(false);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tp_contracts::ext::DecisionHooks;
+    use tp_contracts::load::{LoadLevel, fixed_load};
+    use tp_contracts::role::{CancellationToken, ReadyHandle, fixed_config};
+    use tp_testkit::{
+        Clock, FakeAuthenticator, FakeSasl, FakeSearch, MemAcl, MemBlobIndex, MemBlobStore,
+        MemEventBus, MemMetadata, MemQuota, MemTrash, SystemClock,
+    };
+
+    /// Роль imap на хранилищах testkit с расширениями, как собирает их узел (`Services::imap_extensions`).
+    fn imap_role(bound: Bound) -> ImapRole {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let index = MemBlobIndex::new(clock.clone());
+        let meta = MemMetadata::new(clock.clone()).with_blob_index(index.clone());
+        let bus = MemEventBus::default();
+        let trash = MemTrash::new(&meta);
+        let store = tp_mailstore::Store::new(tp_mailstore::Deps {
+            blobs: Arc::new(MemBlobStore::new(clock)),
+            index: Arc::new(index),
+            messages: Arc::new(meta.clone()),
+            changes: Arc::new(meta.clone()),
+            trash: Arc::new(trash.clone()),
+            quota: Arc::new(MemQuota::new(&meta)),
+            bus: Arc::new(bus.clone()),
+            hooks: DecisionHooks::default(),
+        });
+        let auth = Arc::new(FakeAuthenticator::default());
+        let deps = tp_imap::Deps {
+            sasl: Arc::new(FakeSasl::new(auth.clone())),
+            auth,
+            mailboxes: Arc::new(meta.clone()),
+            messages: Arc::new(meta.clone()),
+            store: Arc::new(store),
+            search: Arc::new(FakeSearch::default()),
+            changes: Arc::new(meta.clone()),
+            bus: Arc::new(bus),
+            trash: Arc::new(trash),
+            hooks: DecisionHooks::default(),
+        };
+        let acl = Arc::new(MemAcl::new(&meta));
+        let accounts = Arc::new(meta);
+        let ext = tp_imap::Extensions {
+            accounts: Some(accounts.clone()),
+            acl: Some(acl.clone()),
+            authz: Some(Arc::new(tp_auth::AclAuthorizer::new(acl, accounts))),
+        };
+        ImapRole::new(deps, ext, None, Sockets::new(bound))
+    }
+
+    async fn first_line(addr: SocketAddr) -> String {
+        let s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).await.expect("read");
+        line
+    }
+
+    /// APP-13: IMAP объявляет QUOTA и ACL, POP3 по секции `imap.pop3` отвечает `+OK`.
+    #[tokio::test]
+    async fn imap_role_announces_extensions_and_serves_pop3() {
+        let local = EndpointConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let cfg = tp_imap::ImapConfig {
+            listeners: vec![local.clone()],
+            pop3: tp_imap::config::Pop3Config {
+                enabled: true,
+                listeners: vec![local],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bound = Bound::default();
+        let role = imap_role(bound.clone());
+        let shutdown = CancellationToken::new();
+        let ready = ReadyHandle::default();
+        let ctx = RoleCtx {
+            config: fixed_config(cfg),
+            shutdown: shutdown.clone(),
+            drain_deadline: Duration::from_secs(1),
+            ready: ready.clone(),
+            load: fixed_load(LoadLevel::Normal),
+        };
+        let task = tokio::spawn(async move { role.run(ctx).await });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.is_ready() {
+            assert!(Instant::now() < deadline, "роль imap не готова");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let imap = bound.get(Role::Imap.as_str());
+        assert_eq!(imap.len(), 1, "{imap:?}");
+        let greeting = first_line(imap[0]).await;
+        assert!(greeting.starts_with("* OK [CAPABILITY "), "{greeting}");
+        for cap in ["QUOTA", "ACL", "RIGHTS=texk"] {
+            assert!(
+                greeting.split([' ', ']']).any(|c| c == cap),
+                "{cap}: {greeting}"
+            );
+        }
+
+        let pop3 = bound.get(POP3);
+        assert_eq!(pop3.len(), 1, "{pop3:?}");
+        let greeting = first_line(pop3[0]).await;
+        assert!(greeting.starts_with("+OK"), "{greeting}");
+
+        shutdown.cancel();
+        task.await.expect("join").expect("run");
+        assert!(!ready.is_ready());
+    }
+
+    #[test]
+    fn next_poll_waits_for_nearest_retry() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs(1);
+        // Без разделов с ошибкой и при сроке повтора позже тика — тик.
+        assert_eq!(next_poll(t0, 5 * s, None), t0 + 5 * s);
+        assert_eq!(next_poll(t0, 5 * s, Some(t0 + 9 * s)), t0 + 5 * s);
+        // Срок повтора раньше тика — он.
+        assert_eq!(next_poll(t0, 5 * s, Some(t0 + 2 * s)), t0 + 2 * s);
+        // Срок уже наступил или тик нулевой — не раньше 1 мс от начала прохода (без холостого цикла).
+        let floor = t0 + Duration::from_millis(1);
+        assert_eq!(next_poll(t0, 5 * s, Some(t0)), floor);
+        assert_eq!(next_poll(t0, Duration::ZERO, None), floor);
+    }
+
+    #[test]
+    fn repeated_error_logged_once_per_pause() {
+        let s = Duration::from_secs(1);
+        let mut log = RepeatLog::new(LogPause {
+            initial: s,
+            max: 4 * s,
+        });
+        let t0 = Instant::now();
+        let e = || "СУБД недоступна".to_owned();
+        // Первая — сразу; повтор внутри паузы — пропущен; после паузы — запись, пауза удвоена.
+        assert_eq!(log.fail(e(), t0), Some(0));
+        assert_eq!(log.fail(e(), t0 + s / 2), None);
+        assert_eq!(log.fail(e(), t0 + s), Some(1));
+        assert_eq!(log.fail(e(), t0 + 2 * s), None);
+        assert_eq!(log.fail(e(), t0 + 3 * s), Some(1));
+        // Пауза не больше предела.
+        assert_eq!(log.fail(e(), t0 + 7 * s), Some(0));
+        assert_eq!(log.fail(e(), t0 + 11 * s), Some(0));
+        // Другая ошибка — сразу, пауза — с начала.
+        assert_eq!(log.fail("другая".to_owned(), t0 + 11 * s), Some(0));
+        assert_eq!(log.fail("другая".to_owned(), t0 + 12 * s), Some(0));
+        // Успех: ошибок подряд, состояние сброшено.
+        assert_eq!(log.ok(), 9);
+        assert_eq!(log.ok(), 0);
+        assert_eq!(log.fail(e(), t0 + 12 * s), Some(0));
     }
 }

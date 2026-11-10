@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use tp_contracts::blob::{
     Acquire, BlobIndex, BlobStore, ByteStream, Commit, Compression, ObjectEntry, ObjectStream,
 };
+use tp_contracts::meta::AccountScope;
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, Result, TenantId};
 
 use crate::infra::{Clock, SystemClock, lock};
@@ -351,6 +352,8 @@ pub struct BlobRow {
 #[derive(Debug, Clone)]
 pub struct MemBlobIndex {
     rows: Arc<Mutex<HashMap<(TenantId, BlobHash), BlobRow>>>,
+    /// Отметки загрузок: владелец и ключ → срок.
+    uploads: Arc<Mutex<HashMap<(AccountScope, BlobKey), OffsetDateTime>>>,
     clock: Arc<dyn Clock>,
 }
 
@@ -359,6 +362,7 @@ impl MemBlobIndex {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             rows: Arc::default(),
+            uploads: Arc::default(),
             clock,
         }
     }
@@ -573,6 +577,56 @@ impl BlobIndex for MemBlobIndex {
             .filter(|r| r.generation == key.generation && r.state != BlobState::Deleted)
             .map(|r| r.compression))
     }
+
+    async fn next_gc_due(&self, window: Duration) -> Result<Option<OffsetDateTime>> {
+        let window = time::Duration::try_from(window).unwrap_or(time::Duration::MAX);
+        Ok(lock(&self.rows)
+            .values()
+            .filter(|r| r.refcnt == 0 && r.state != BlobState::Deleted)
+            .filter_map(|r| r.zero_since)
+            .min()
+            .map(|z| z.saturating_add(window)))
+    }
+
+    async fn mark_upload(
+        &self,
+        scope: AccountScope,
+        key: &BlobKey,
+        until: OffsetDateTime,
+    ) -> Result<()> {
+        if key.tenant != scope.tenant {
+            return Err(Error::invalid("объект другой организации"));
+        }
+        let mut uploads = lock(&self.uploads);
+        let t = uploads.entry((scope, *key)).or_insert(until);
+        *t = (*t).max(until);
+        Ok(())
+    }
+
+    async fn upload_owned(
+        &self,
+        scope: AccountScope,
+        key: &BlobKey,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        Ok(lock(&self.uploads)
+            .get(&(scope, *key))
+            .is_some_and(|t| *t > now))
+    }
+
+    async fn prune_uploads(&self, now: OffsetDateTime, limit: usize) -> Result<usize> {
+        let mut uploads = lock(&self.uploads);
+        let expired: Vec<_> = uploads
+            .iter()
+            .filter(|(_, t)| **t <= now)
+            .map(|(k, _)| *k)
+            .take(limit)
+            .collect();
+        for k in &expired {
+            uploads.remove(k);
+        }
+        Ok(expired.len())
+    }
 }
 
 #[cfg(test)]
@@ -691,6 +745,36 @@ mod tests {
             idx.compression(&key(42, g.next())).await,
             Ok(Some(Compression::None))
         );
+    }
+
+    #[tokio::test]
+    async fn gc_due_and_uploads_suites() {
+        let (clock, idx) = setup();
+        let t = TenantId::DEFAULT;
+        assert_eq!(idx.next_gc_due(W).await, Ok(None));
+        crate::suite::blob_gc_due(&idx, t).await;
+        crate::suite::blob_uploads(&idx, t, TenantId::new()).await;
+
+        // Срок — самое раннее обнуление; новая ссылка и надгробие его снимают.
+        let zero = clock.now();
+        assert_eq!(idx.next_gc_due(W).await, Ok(Some(zero + W)));
+        clock.advance(W);
+        let h = hash(9);
+        idx.commit_new(t, &h, Gen::INITIAL, 1, 1).await.expect("ok");
+        idx.release(t, &h, Gen::INITIAL, 1).await.expect("ok");
+        assert_eq!(idx.next_gc_due(W).await, Ok(Some(zero + W)));
+        let first = idx.gc_candidates(zero + W, 10).await.expect("gc");
+        assert_eq!(first.len(), 1);
+        assert!(idx.mark_deleting(&first[0], zero + W).await.expect("mark"));
+        assert_eq!(
+            idx.next_gc_due(W).await,
+            Ok(Some(zero + W)),
+            "deleting — кандидат"
+        );
+        assert!(idx.finalize_delete(&first[0]).await.expect("finalize"));
+        assert_eq!(idx.next_gc_due(W).await, Ok(Some(zero + 2 * W)));
+        idx.acquire(t, &h, 1).await.expect("ok");
+        assert_eq!(idx.next_gc_due(W).await, Ok(None));
     }
 
     #[tokio::test]
