@@ -8,6 +8,8 @@
 //!   (`Deny` — `forbiddenToSend`; дополнения: заголовки в начало письма, копии в папки и внешним адресам).
 //!   Заголовок `Bcc` из отправляемого письма удаляется. Объекты EmailSubmission после ответа не хранятся:
 //!   `EmailSubmission/get` их не находит, отменить отправку нельзя (`cannotUnsend`).
+//! - `EmailSubmission/query` и `queryChanges` проверяют фильтр и сортировку (RFC 8621 §7.3) и возвращают пустой
+//!   список; `queryState` — состояние учётной записи (меняется после отправки с переносом письма).
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -18,13 +20,18 @@ use mail_parser::MessageParser;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tp_contracts::auth::SendRight;
 use tp_contracts::ext::{CopyTo, Decision, SubmissionInfo};
 use tp_contracts::mailstore::IngestRequest;
+use tp_contracts::meta::Changes;
 use tp_contracts::{MessageId, Result, TenantId};
 
 use crate::core::error::{MethodError, MethodResult, set_error};
-use crate::core::request::{GetArgs, object, parse_args, select, state_string};
+use crate::core::request::{
+    Comparator, GetArgs, QueryChangesArgs, QueryWindow, apply_window, object, parse_args,
+    parse_state, query_changes_response, select, state_string,
+};
 use crate::core::{Ctx, digest};
 use crate::email_get::{collect, utc_date};
 
@@ -188,6 +195,114 @@ pub(crate) async fn submission_get(
         "list": [],
         "notFound": a.ids.unwrap_or_default(),
     })))
+}
+
+/// Свойства сортировки `EmailSubmission/query` (RFC 8621 §7.3).
+const SUBMISSION_SORT: &[&str] = &["emailId", "threadId", "sentAt"];
+
+/// Проверяет фильтр `EmailSubmission/query` (RFC 8621 §7.3): операторы `AND`/`OR`/`NOT` и условия
+/// `identityIds`, `emailIds`, `threadIds`, `undoStatus`, `before`, `after` (по `sendAt`).
+fn check_submission_filter(v: &Value) -> MethodResult<()> {
+    let unsupported = |why: &str| MethodError::with("unsupportedFilter", why);
+    let Value::Object(m) = v else {
+        return Err(unsupported("filter must be an object"));
+    };
+    if let Some(op) = m.get("operator") {
+        if !matches!(op.as_str(), Some("AND" | "OR" | "NOT")) {
+            return Err(unsupported("operator"));
+        }
+        let conds = m
+            .get("conditions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| unsupported("conditions"))?;
+        return conds.iter().try_for_each(check_submission_filter);
+    }
+    for (k, v) in m {
+        let ok = match k.as_str() {
+            "identityIds" | "emailIds" | "threadIds" => v
+                .as_array()
+                .is_some_and(|ids| ids.iter().all(Value::is_string)),
+            "undoStatus" => matches!(v.as_str(), Some("pending" | "final" | "canceled")),
+            "before" | "after" => v
+                .as_str()
+                .is_some_and(|s| OffsetDateTime::parse(s, &Rfc3339).is_ok()),
+            _ => return Err(unsupported(k)),
+        };
+        if !ok {
+            return Err(MethodError::invalid(format!("filter: bad {k}")));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmissionQueryArgs {
+    account_id: String,
+    filter: Option<Value>,
+    sort: Option<Vec<Comparator>>,
+    #[serde(flatten)]
+    window: QueryWindow,
+}
+
+/// Результаты `EmailSubmission/query`: отправки не хранятся, поэтому после проверки фильтра и сортировки
+/// список пуст при любом состоянии.
+fn submission_ids(a: &SubmissionQueryArgs) -> MethodResult<Vec<String>> {
+    if let Some(f) = &a.filter {
+        check_submission_filter(f)?;
+    }
+    for c in a.sort.iter().flatten() {
+        if !SUBMISSION_SORT.contains(&c.property.as_str()) {
+            return Err(MethodError::with("unsupportedSort", c.property.clone()));
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// `EmailSubmission/query` (RFC 8621 §7.3): `queryState` — состояние учётной записи.
+pub(crate) async fn submission_query(
+    ctx: &mut Ctx<'_>,
+    args: Map<String, Value>,
+) -> MethodResult<Map<String, Value>> {
+    let a: SubmissionQueryArgs = parse_args(args)?;
+    ctx.check_account(&a.account_id)?;
+    let ids = submission_ids(&a)?;
+    let state = state_string(ctx.state().await?);
+    let mut out = object(json!({
+        "accountId": a.account_id,
+        "queryState": state,
+        "canCalculateChanges": true,
+    }));
+    apply_window(&ids, &a.window, ctx.jmap.cfg.max_query_limit, &mut out)?;
+    Ok(out)
+}
+
+/// `EmailSubmission/queryChanges` (RFC 8620 §5.6): результаты пусты в любом состоянии, изменений нет.
+/// Чужая строка состояния или состояние новее текущего — `cannotCalculateChanges`.
+pub(crate) async fn submission_query_changes(
+    ctx: &mut Ctx<'_>,
+    args: Map<String, Value>,
+) -> MethodResult<Map<String, Value>> {
+    let qc: QueryChangesArgs = parse_args(args.clone())?;
+    ctx.check_account(&qc.account_id)?;
+    let mut q = args;
+    q.retain(|k, _| matches!(k.as_str(), "accountId" | "filter" | "sort"));
+    let a: SubmissionQueryArgs = parse_args(q)?;
+    let ids = submission_ids(&a)?;
+    let since = parse_state(&qc.since_query_state)?;
+    let limit = qc.limit(ctx.jmap.cfg.max_changes)?;
+    let now = ctx.state().await?;
+    if since > now {
+        return Err(MethodError::new("cannotCalculateChanges"));
+    }
+    let none = Changes {
+        created: Vec::new(),
+        updated: Vec::new(),
+        destroyed: Vec::new(),
+        new_state: now,
+        has_more: false,
+    };
+    query_changes_response(&qc, &ids, &none, limit)
 }
 
 #[derive(Debug, Deserialize)]
@@ -796,6 +911,118 @@ mod tests {
         )
         .await;
         assert_eq!(r[1][1]["notCreated"]["s"]["type"], "forbiddenToSend");
+    }
+
+    /// EmailSubmission/query: фильтры и сортировка RFC 8621 §7.3 принимаются, результат пуст;
+    /// неподдерживаемое — unsupportedFilter / unsupportedSort / anchorNotFound; без capability — unknownMethod.
+    #[tokio::test]
+    async fn submission_query_filters() {
+        let env = Env::new().await;
+        let acc = env.account();
+        let q = |id: &str, args: Value| json!(["EmailSubmission/query", args, id]);
+        let r = calls(
+            &env,
+            &env.jmap,
+            json!([
+                q("a", json!({"accountId": acc, "filter": {"undoStatus": "pending"}, "calculateTotal": true})),
+                q("b", json!({"accountId": acc,
+                    "filter": {"operator": "AND", "conditions": [
+                        {"after": "2026-01-01T00:00:00Z", "before": "2027-01-01T00:00:00Z"},
+                        {"operator": "NOT", "conditions": [{"identityIds": ["I1"], "emailIds": ["M1"], "threadIds": ["T1"]}]}
+                    ]},
+                    "sort": [{"property": "sentAt", "isAscending": false}, {"property": "emailId"}, {"property": "threadId"}],
+                    "position": 5, "limit": 10})),
+                q("c", json!({"accountId": acc, "filter": {"undoStatus": "sent"}})),
+                q("d", json!({"accountId": acc, "filter": {"sendAt": "2026-01-01T00:00:00Z"}})),
+                q("e", json!({"accountId": acc, "filter": {"before": "вчера"}})),
+                q("f", json!({"accountId": acc, "sort": [{"property": "size"}]})),
+                q("g", json!({"accountId": acc, "anchor": "S1"})),
+            ]),
+        )
+        .await;
+        assert_eq!(r[0][0], "EmailSubmission/query", "{:?}", r[0]);
+        assert_eq!(r[0][1]["ids"], json!([]));
+        assert_eq!(r[0][1]["total"], 0);
+        assert_eq!(r[0][1]["position"], 0);
+        assert_eq!(r[0][1]["canCalculateChanges"], true);
+        assert!(r[0][1]["queryState"].is_string());
+        assert_eq!(r[1][1]["ids"], json!([]), "{:?}", r[1]);
+        assert_eq!(r[1][1]["position"], 0);
+        assert_eq!(r[2][1]["type"], "invalidArguments");
+        assert_eq!(r[3][1]["type"], "unsupportedFilter");
+        assert_eq!(r[4][1]["type"], "invalidArguments");
+        assert_eq!(r[5][1]["type"], "unsupportedSort");
+        assert_eq!(r[6][1]["type"], "anchorNotFound");
+
+        let req = json!({"using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [q("a", json!({"accountId": acc}))]});
+        let v = serde_json::to_value(
+            env.jmap
+                .api(&env.principal, req.to_string().as_bytes())
+                .await
+                .expect("api"),
+        )
+        .expect("json");
+        assert_eq!(v["methodResponses"][0][1]["type"], "unknownMethod");
+    }
+
+    /// queryState меняется после EmailSubmission/set (письмо переносится в «Отправленные»);
+    /// queryChanges от старого состояния — без изменений, чужое или будущее состояние — cannotCalculateChanges.
+    #[tokio::test]
+    async fn submission_query_changes() {
+        let env = Env::new().await;
+        let acc = env.account();
+        let identity = identity_id("user@example.org");
+        let drafts = env.mailbox(SpecialUse::Drafts).to_string();
+        let sent = env.mailbox(SpecialUse::Sent).to_string();
+        let r = calls(
+            &env,
+            &env.jmap,
+            json!([
+                ["Email/set", {"accountId": acc, "create": {"d": draft(&env, "user@example.org")}}, "0"],
+                ["EmailSubmission/query", {"accountId": acc, "filter": {"undoStatus": "pending"}}, "q0"],
+                ["EmailSubmission/set", {
+                    "accountId": acc,
+                    "create": {"s": {"identityId": identity, "emailId": "#d"}},
+                    "onSuccessUpdateEmail": {"#s": {
+                        format!("mailboxIds/{drafts}"): null,
+                        format!("mailboxIds/{sent}"): true,
+                        "keywords/$draft": null
+                    }}
+                }, "1"],
+                ["EmailSubmission/query", {"accountId": acc, "filter": {"undoStatus": "pending"}}, "q1"]
+            ]),
+        )
+        .await;
+        assert_eq!(r[3][0], "Email/set", "{r:?}");
+        let (q0, q1) = (&r[1][1]["queryState"], &r[4][1]["queryState"]);
+        assert_eq!(r[4][1]["ids"], json!([]));
+        assert_ne!(q0, q1, "queryState после отправки");
+
+        let qc = |since: &Value, id: &str| {
+            json!(["EmailSubmission/queryChanges", {"accountId": acc, "sinceQueryState": since,
+                "filter": {"undoStatus": "pending"}, "calculateTotal": true}, id])
+        };
+        let r = calls(
+            &env,
+            &env.jmap,
+            json!([
+                qc(q0, "a"),
+                qc(&json!("чужое"), "b"),
+                qc(&json!("999999999"), "c"),
+                ["EmailSubmission/queryChanges", {"accountId": acc, "sinceQueryState": q0, "maxChanges": 0}, "d"]
+            ]),
+        )
+        .await;
+        assert_eq!(r[0][0], "EmailSubmission/queryChanges", "{:?}", r[0]);
+        assert_eq!(r[0][1]["oldQueryState"], *q0);
+        assert_eq!(r[0][1]["newQueryState"], *q1);
+        assert_eq!(r[0][1]["added"], json!([]));
+        assert_eq!(r[0][1]["removed"], json!([]));
+        assert_eq!(r[0][1]["total"], 0);
+        assert_eq!(r[1][1]["type"], "cannotCalculateChanges");
+        assert_eq!(r[2][1]["type"], "cannotCalculateChanges");
+        assert_eq!(r[3][1]["type"], "invalidArguments");
     }
 
     #[test]
