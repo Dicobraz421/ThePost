@@ -340,17 +340,23 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CMP-01](CMP-01.md) | эталон `--profile smb` принимает соединения | deploy | A | deploy-08 | ready | — |
-| [CMP-02](CMP-02.md) | каталоги ролей создаются до наложения Landlock | app | A | app-09 | ready | — |
-| [CMP-06](CMP-06.md) | индексатор — повтор после ошибки с нарастающей паузой | search | A | search-03 | ready | — |
+| [CMP-01](CMP-01.md) | эталон `--profile smb` принимает соединения | deploy | A | deploy-08 | done | — |
+| [CMP-02](CMP-02.md) | каталоги ролей создаются до наложения Landlock | app | A | app-09 | done | — |
+| [CMP-06](CMP-06.md) | индексатор — повтор после ошибки с нарастающей паузой | search | A | search-03 | done | — |
 | [CMP-03](CMP-03.md) | EmailSubmission/query и queryChanges | jmap | A | jmap-10 | done | — |
 | [CMP-04](CMP-04.md) | отправка локальному адресату — доставка сразу, без внешней очереди | smtp | A | smtp-08 | done | — |
-| [CMP-05](CMP-05.md) | системные папки при создании учётной записи и при первом входе | meta | A | meta-17 | ready | — |
-| [CMP-08](CMP-08.md) | `Outbound` JMAP со статусами по получателям | jmap | A | jmap-11 | ready | CMP-03 |
-| [CMP-07](CMP-07.md) | отправка из JMAP через `Delivery` — локальным адресатам сразу | app | A | app-10 | todo | CMP-04,CMP-08 |
-| [KIT-07](KIT-07.md) | in-memory ящик — 6 системных папок и дополнение при открытии | testkit | A | testkit-04 | todo | CMP-05 |
-| [META-35](META-35.md) | ошибка одного раздела журнала не прерывает опрос остальных | meta | A | meta-18 | todo | — |
+| [CMP-05](CMP-05.md) | системные папки при создании учётной записи и при первом входе | meta | A | meta-17 | done | — |
+| [CMP-08](CMP-08.md) | `Outbound` JMAP со статусами по получателям | jmap | A | jmap-11 | done | CMP-03 |
+| [CMP-07](CMP-07.md) | отправка из JMAP через `Delivery` — локальным адресатам сразу | app | A | app-10 | ready | CMP-04,CMP-08 |
+| [KIT-07](KIT-07.md) | in-memory ящик — 6 системных папок и дополнение при открытии | testkit | A | testkit-04 | ready | CMP-05 |
+| [META-35](META-35.md) | ошибка одного раздела журнала не прерывает опрос остальных | meta | A | meta-18 | ready | — |
 | [CMP-09](CMP-09.md) | метрики индексатора и doctor для служебных доменов | app | A | app-11 | todo | CMP-06 |
+| [APP-13](APP-13.md) | подключение расширений IMAP, POP3 и PSI в `serve` | app | A | app-12 | todo | IMAP-12,PLT-17 |
+| [PLT-19](PLT-19.md) | события файловой системы через `notify` | platform | A | platform-09 | todo | PLT-17 |
+| [SYS-08](SYS-08.md) | Landlock — корневые сертификаты по ссылкам Debian | sys | A | sys-04 | todo | SYS-07 |
+| [SYS-09](SYS-09.md) | ожидание событий PSI в tp-sys | sys | A | sys-04 | todo | PLT-17 |
+| [CTR-37](CTR-37.md) | системный сигнал изменения корзины | contracts | B | contracts-25 | todo | CTR-23 |
+| [IMAP-16](IMAP-16.md) | POP3 — блокировка ящика; запись в общие папки по ACL | imap | A | imap-07 | todo | IMAP-12,IMAP-10 |
 
 ## Вне волн
 
