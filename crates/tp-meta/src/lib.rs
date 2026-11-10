@@ -4,6 +4,7 @@
 //! короткая транзакция в контексте организации ([`schema::begin`]); к BLOB и сети внутри транзакций
 //! реализация не обращается.
 
+pub mod abuse;
 pub mod accounts;
 pub mod acl;
 pub mod app_passwords;
@@ -39,6 +40,7 @@ use tp_contracts::config::duration;
 use tp_contracts::events::partition_of;
 use tp_contracts::{AccountId, Result, TenantId};
 
+use crate::abuse::AbuseBlocksConfig;
 use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
@@ -86,6 +88,8 @@ pub struct MetaConfig {
     pub delivery: DeliveryLogConfig,
     /// Сигналы кластера через LISTEN/NOTIFY ([`signals::PgSignalBus`]).
     pub signals: SignalsConfig,
+    /// Блокировки источников и учётных записей ([`abuse`]).
+    pub abuse: AbuseBlocksConfig,
 }
 
 impl MetaConfig {
@@ -104,6 +108,7 @@ impl Default for MetaConfig {
             retention: RetentionConfig::default(),
             delivery: DeliveryLogConfig::default(),
             signals: SignalsConfig::default(),
+            abuse: AbuseBlocksConfig::default(),
         }
     }
 }
