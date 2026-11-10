@@ -20,14 +20,103 @@ use crate::changelog::{self, Change, Op};
 use crate::retention::micros;
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
 
-/// Системные папки новой учётной записи.
-pub(crate) const SYSTEM_FOLDERS: [(&str, SpecialUse); 5] = [
+/// Системные папки учётной записи (RFC 6154 и `INBOX`).
+pub(crate) const SYSTEM_FOLDERS: [(&str, SpecialUse); 6] = [
     ("INBOX", SpecialUse::Inbox),
-    ("Sent", SpecialUse::Sent),
     ("Drafts", SpecialUse::Drafts),
-    ("Trash", SpecialUse::Trash),
+    ("Sent", SpecialUse::Sent),
     ("Junk", SpecialUse::Junk),
+    ("Trash", SpecialUse::Trash),
+    ("Archive", SpecialUse::Archive),
 ];
+
+/// Системные папки, которых недостаёт: нет папки с той же ролью и нет папки верхнего уровня
+/// с тем же именем (без учёта регистра — `INBOX` по RFC 3501, остальные — чтобы не плодить «sent» и «Sent»).
+/// `existing` — роль, родитель и имя каждой папки.
+pub(crate) fn missing_system<'a>(
+    existing: impl IntoIterator<Item = (Option<SpecialUse>, bool, &'a str)> + Clone,
+) -> Vec<(&'static str, SpecialUse)> {
+    SYSTEM_FOLDERS
+        .into_iter()
+        .filter(|(name, role)| {
+            !existing
+                .clone()
+                .into_iter()
+                .any(|(r, top, n)| r == Some(*role) || (top && n.eq_ignore_ascii_case(name)))
+        })
+        .collect()
+}
+
+fn missing_rows(rows: &[MailboxRow]) -> Result<Vec<(&'static str, SpecialUse)>> {
+    let existing = rows
+        .iter()
+        .map(|r| {
+            Ok((
+                r.role.as_deref().map(parse_role).transpose()?,
+                r.parent_id.is_none(),
+                r.name.as_str(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(missing_system(existing.iter().copied()))
+}
+
+async fn select_all(tx: &mut PgConnection, scope: AccountScope) -> Result<Vec<MailboxRow>> {
+    sqlx::query_as(
+        "SELECT mailbox_id, parent_id, name, role, uid_validity, subscribed FROM mailboxes
+         WHERE tenant_id = $1 AND account_id = $2 ORDER BY created_at, name",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)
+}
+
+/// Дополняет учётную запись недостающими системными папками (новая запись, старая запись без части папок).
+/// Строка учётной записи блокируется: параллельные вызовы не создают папки дважды.
+/// Возвращает число созданных папок; учётной записи нет — 0.
+pub(crate) async fn ensure_system(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    event_partitions: u32,
+) -> Result<usize> {
+    let locked: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2 FOR UPDATE",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if locked.is_none() {
+        return Ok(0);
+    }
+    let missing = missing_rows(&select_all(tx, scope).await?)?;
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    let ms = changelog::bump_modseq(tx, scope).await?;
+    let mut changes = Vec::with_capacity(missing.len());
+    let mut events = Vec::with_capacity(missing.len());
+    for (name, role) in &missing {
+        let data = NewMailbox {
+            parent: None,
+            name: (*name).to_owned(),
+            role: Some(*role),
+        };
+        let mb = insert(tx, scope, &data, ms).await?;
+        changes.push(Change::mailbox(mb.id, Op::Created));
+        events.push(changelog::event(
+            scope,
+            Some(mb.id),
+            CoreEventKind::MailboxCreated,
+        ));
+    }
+    changelog::log(tx, scope, ms, &changes).await?;
+    changelog::append_events(tx, event_partitions, &events).await?;
+    Ok(missing.len())
+}
 
 pub(crate) fn role_str(role: SpecialUse) -> &'static str {
     match role {
@@ -305,15 +394,13 @@ pub(crate) async fn touch(
 impl MailboxStore for PgMeta {
     async fn list(&self, scope: AccountScope) -> Result<Vec<Mailbox>> {
         let mut tx = begin(&self.pool, scope.tenant).await?;
-        let rows: Vec<MailboxRow> = sqlx::query_as(
-            "SELECT mailbox_id, parent_id, name, role, uid_validity, subscribed FROM mailboxes
-             WHERE tenant_id = $1 AND account_id = $2 ORDER BY created_at, name",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
+        let mut rows = select_all(&mut tx, scope).await?;
+        // Первое открытие ящика без части системных папок (запись заведена в базе, вход без `upsert`).
+        if !missing_rows(&rows)?.is_empty()
+            && ensure_system(&mut tx, scope, self.cfg.event_partitions).await? > 0
+        {
+            rows = select_all(&mut tx, scope).await?;
+        }
         tx.commit().await.map_err(db_err)?;
         rows.into_iter().map(MailboxRow::into_mailbox).collect()
     }
@@ -551,5 +638,49 @@ impl MailboxStore for PgMeta {
             highest_modseq: ModSeq(to_u64(highest)?),
             size: to_u64(size)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roles(v: &[(&str, SpecialUse)]) -> Vec<SpecialUse> {
+        v.iter().map(|(_, r)| *r).collect()
+    }
+
+    #[test]
+    fn missing_system_all_for_empty() {
+        let none: [(Option<SpecialUse>, bool, &str); 0] = [];
+        let m = missing_system(none);
+        assert_eq!(m.len(), 6);
+        assert!(m.contains(&("Archive", SpecialUse::Archive)));
+        assert!(m.contains(&("INBOX", SpecialUse::Inbox)));
+    }
+
+    #[test]
+    fn missing_system_skips_same_role_or_name() {
+        let existing = [
+            (Some(SpecialUse::Inbox), true, "INBOX"),
+            // Роль та же, имя другое — не дублировать.
+            (Some(SpecialUse::Sent), true, "Отправленные"),
+            // Имя то же (без учёта регистра), роли нет — не дублировать.
+            (None, true, "junk"),
+            // Вложенная папка с тем же именем не мешает.
+            (None, false, "Trash"),
+        ];
+        assert_eq!(
+            roles(&missing_system(existing)),
+            vec![SpecialUse::Drafts, SpecialUse::Trash, SpecialUse::Archive]
+        );
+    }
+
+    #[test]
+    fn missing_system_none_when_complete() {
+        let existing: Vec<_> = SYSTEM_FOLDERS
+            .iter()
+            .map(|(n, r)| (Some(*r), true, *n))
+            .collect();
+        assert!(missing_system(existing).is_empty());
     }
 }
