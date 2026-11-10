@@ -15,6 +15,7 @@ pub mod infra;
 pub mod load;
 pub mod membership;
 pub mod meta;
+pub mod outbound;
 pub mod policies;
 pub mod rpc;
 pub mod secrets;
@@ -36,6 +37,7 @@ pub use infra::{Clock, ManualClock, MemEventBus, MemEventLog, MemLease, SystemCl
 pub use load::MemLoadMonitor;
 pub use membership::MemMembership;
 pub use meta::MemMetadata;
+pub use outbound::MemOutbound;
 pub use policies::{MemPolicies, PolicyLevel};
 pub use rpc::{MemRpc, MemRpcNet};
 pub use secrets::MemSecretStore;

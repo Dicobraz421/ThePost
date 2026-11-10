@@ -42,7 +42,7 @@ pub mod tracking;
 
 pub use authcheck::AuthCheck;
 pub use config::SmtpConfig;
-pub use deliver::{Delivery, Outbound, RcptStatus, Submitted};
+pub use deliver::Delivery;
 pub use groups::Groups;
 pub use limits::SendLimits;
 pub use metrics::SmtpMetrics;

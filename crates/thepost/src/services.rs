@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::TryStreamExt;
 use mail_parser::{MessageParser, MimeHeaders};
 use tp_contracts::auth::{Authenticator, Authorizer, Directory};
@@ -16,6 +15,7 @@ use tp_contracts::ext::{DecisionHooks, Registry};
 use tp_contracts::ids::{DomainId, MessageId};
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountScope, MailboxStore, MessageQuery, MessageStore, Policy};
+use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result, TenantId};
@@ -359,7 +359,8 @@ impl Services {
         cfg: tp_jmap::JmapConfig,
         smtp: &SmtpConfig,
     ) -> Result<tp_jmap::Jmap> {
-        let outbound = Arc::new(JmapOutbound(self.delivery(smtp)?));
+        // `Delivery` — `tp_contracts::queue::Outbound` (CTR-28): статус по получателю — в `deliveryStatus`.
+        let outbound: Arc<dyn Outbound> = self.delivery(smtp)?;
         let deps = tp_jmap::Deps {
             auth: self.authn.clone(),
             mailboxes: Arc::new(self.meta.clone()),
@@ -441,50 +442,6 @@ fn queue_deps(meta: &PgMeta, blob: &Arc<dyn BlobStore>) -> QueueDeps {
 pub fn system_resolver() -> Result<mail_auth::MessageAuthenticator> {
     mail_auth::MessageAuthenticator::new_system_conf()
         .map_err(|e| Error::Internal(format!("резолвер DNS: {e}")))
-}
-
-/// Отправка JMAP (`EmailSubmission/set`) через [`Delivery`] (CMP-07): локальные получатели — сразу во «Входящие»
-/// (`MailStore::ingest`), внешние — в очередь SMTP (`Queue` подписывает письмо DKIM при постановке); статус по
-/// каждому получателю — в `deliveryStatus`.
-struct JmapOutbound(Arc<Delivery>);
-
-#[async_trait]
-impl tp_jmap::Outbound for JmapOutbound {
-    async fn enqueue(
-        &self,
-        tenant: TenantId,
-        mail_from: &str,
-        rcpts: &[String],
-        raw: Bytes,
-    ) -> Result<()> {
-        tp_smtp::Outbound::enqueue(self.0.as_ref(), tenant, mail_from, rcpts, raw).await
-    }
-
-    async fn submit(
-        &self,
-        tenant: TenantId,
-        mail_from: &str,
-        rcpts: &[String],
-        raw: Bytes,
-    ) -> Result<tp_jmap::Submitted> {
-        let sent = self.0.submit(tenant, mail_from, rcpts, raw).await?;
-        Ok(tp_jmap::Submitted {
-            rcpts: sent
-                .rcpts
-                .into_iter()
-                .map(|(rcpt, status)| (rcpt, rcpt_status(status)))
-                .collect(),
-        })
-    }
-}
-
-/// Статус получателя доставки SMTP → статус `deliveryStatus` JMAP.
-fn rcpt_status(s: tp_smtp::RcptStatus) -> tp_jmap::RcptStatus {
-    match s {
-        tp_smtp::RcptStatus::Delivered => tp_jmap::RcptStatus::Delivered,
-        tp_smtp::RcptStatus::Queued => tp_jmap::RcptStatus::Queued,
-        tp_smtp::RcptStatus::Failed(reply) => tp_jmap::RcptStatus::Failed(reply),
-    }
 }
 
 /// Политики уровней Admin API поверх `PgMeta` (до контракта CTR-25).

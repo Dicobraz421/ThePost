@@ -13,10 +13,18 @@
 //! Вызывающий загружает письмо одним объектом и учитывает одну ссылку на него в `BlobIndex` до `enqueue`
 //! (ошибка `enqueue` — освободить ссылку). Когда все получатели в конечном статусе, [`QueueStore::complete`]
 //! возвращает `true`: запись удалена, вызывающий освобождает ссылку (`BlobIndex::release`) отдельной транзакцией.
+//!
+//! # Постановка письма
+//!
+//! [`Outbound`] — постановка письма в очередь протоколами (submission SMTP, пересылки модулей, JMAP
+//! `EmailSubmission/set`) поверх `QueueStore`: загрузка тела, учёт ссылки, подпись DKIM — в реализации
+//! (`tp_smtp::queue::Queue`). [`Outbound::submit`] возвращает статус по каждому получателю (`tp_smtp::Delivery`
+//! доставляет локальных получателей сразу).
 
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -199,15 +207,108 @@ pub trait QueueStore: Send + Sync + 'static {
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool>;
 }
 
+/// Статус получателя при отправке ([`Outbound::submit`]); JMAP — `deliveryStatus` EmailSubmission (RFC 8621 §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubmitStatus {
+    /// Доставлено в локальный ящик.
+    Delivered,
+    /// Поставлено в очередь исходящей почты (внешний адрес) или ждёт модерации.
+    Queued,
+    /// Не доставлено: ответ SMTP, например `550 5.1.1 No such user`; пустой — без подробностей.
+    Failed(String),
+}
+
+/// Итог [`Outbound::submit`]: статус по каждому получателю в порядке запроса.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Submitted {
+    /// Получатель → статус.
+    pub rcpts: Vec<(String, SubmitStatus)>,
+}
+
+impl Submitted {
+    /// Все получатели `rcpts` со статусом `status`.
+    pub fn all(rcpts: &[String], status: SubmitStatus) -> Self {
+        Submitted {
+            rcpts: rcpts.iter().map(|r| (r.clone(), status.clone())).collect(),
+        }
+    }
+}
+
+/// Постановка исходящего письма в очередь: submission SMTP и пересылки модулей (`tp-smtp`), JMAP
+/// `EmailSubmission/set` (`tp-jmap`). Реализации — `tp_smtp::queue::Queue` (подпись DKIM при постановке) и
+/// `tp_smtp::Delivery` (локальные получатели — сразу в ящики); in-memory — `tp-testkit`.
+///
+/// Маршрут правила потока (`FlowOutcome::route`) не передаётся: очередь выбирает политику по домену назначения.
+#[async_trait]
+pub trait Outbound: Send + Sync + 'static {
+    /// Ставит письмо `raw` (RFC 5322) от `mail_from` получателям `rcpts` организации `tenant`. Ошибка — письмо не
+    /// принято (`Unavailable` — повтор безопасен).
+    async fn enqueue(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<()>;
+
+    /// Отправляет письмо и возвращает статус по каждому получателю в порядке `rcpts`. По умолчанию —
+    /// [`Outbound::enqueue`], все получатели [`SubmitStatus::Queued`].
+    async fn submit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<Submitted> {
+        self.enqueue(tenant, mail_from, rcpts, raw).await?;
+        Ok(Submitted::all(rcpts, SubmitStatus::Queued))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ids::{BlobHash, Gen};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn object_safe() {
         fn _queue(_: Arc<dyn QueueStore>) {}
+        fn _outbound(_: Arc<dyn Outbound>) {}
+    }
+
+    /// `submit` по умолчанию: письмо в `enqueue`, все получатели в очереди в порядке запроса.
+    #[tokio::test]
+    async fn submit_default_queued() {
+        #[derive(Default)]
+        struct Plain(Mutex<Vec<Vec<String>>>);
+        #[async_trait]
+        impl Outbound for Plain {
+            async fn enqueue(
+                &self,
+                _: TenantId,
+                _: &str,
+                rcpts: &[String],
+                _: Bytes,
+            ) -> Result<()> {
+                self.0.lock().expect("lock").push(rcpts.to_vec());
+                Ok(())
+            }
+        }
+        let ob = Plain::default();
+        let rcpts = vec!["b@example.com".to_owned(), "a@example.org".to_owned()];
+        let sent = ob
+            .submit(TenantId::DEFAULT, "x@example.org", &rcpts, Bytes::new())
+            .await
+            .expect("submit");
+        assert_eq!(
+            sent.rcpts,
+            vec![
+                ("b@example.com".to_owned(), SubmitStatus::Queued),
+                ("a@example.org".to_owned(), SubmitStatus::Queued),
+            ]
+        );
+        assert_eq!(*ob.0.lock().expect("lock"), vec![rcpts]);
     }
 
     #[test]

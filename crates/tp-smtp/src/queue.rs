@@ -27,13 +27,12 @@ use futures::{StreamExt, TryStreamExt};
 use time::OffsetDateTime;
 use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, Commit};
 use tp_contracts::queue::{
-    Claimed, DsnNotify, DsnRet, OutMessage, OutRcpt, QueueStore, QueuedRcpt, RcptStatus,
+    Claimed, DsnNotify, DsnRet, OutMessage, OutRcpt, Outbound, QueueStore, QueuedRcpt, RcptStatus,
 };
 use tp_contracts::role::{RoleCtx, RoleService};
 use tp_contracts::{BlobKey, Error, Result, TenantId};
 
 use crate::config::{QueueConfig, SmtpConfig};
-use crate::deliver::Outbound;
 use crate::dkim_sign::DkimSign;
 use crate::dsn::{self, DsnSink};
 use crate::metrics::{RcptOutcome, SmtpMetrics};

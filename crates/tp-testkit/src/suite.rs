@@ -1,7 +1,7 @@
 //! Общие наборы тестов контрактов: in-memory реализации testkit и настоящие реализации полос
 //! (`tp-meta` — `Membership`, `AbuseBlocks`, сигналы `EventBus`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие `BlobIndex`,
 //! «очистить корзину» `TrashStore::purge` с настройкой `trash.purge`, `TransportStore` и его таблица переписывания,
-//! перенос получателей `QueueStore::postpone`,
+//! перенос получателей `QueueStore::postpone`, статусы `Outbound::submit` (`tp-smtp` — `Queue`, `Delivery`),
 //! `tp-platform` — `SecretStore`, `tp-cluster` — `Rpc`) проходят одни и те же проверки.
 //!
 //! Время в наборах идёт через [`Wait`]: для testkit — [`ManualClock`] (сдвиг без ожидания), для PostgreSQL
@@ -46,7 +46,9 @@ use tp_contracts::meta::{
     AccountScope, MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, PolicyResolver,
     SpecialUse,
 };
-use tp_contracts::queue::{DsnParams, OutMessage, OutRcpt, QueueStore, RcptStatus};
+use tp_contracts::queue::{
+    DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
+};
 use tp_contracts::retention::{
     Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule, TrashPurgeSetting,
     TrashStore, trash_changed,
@@ -2422,4 +2424,33 @@ pub async fn queue_postpone(queue: &dyn QueueStore, tenant: TenantId) {
         queue.complete(&c3.claim, "b@example.net", delivered).await,
         Ok(true)
     );
+}
+
+// ---------- Outbound ----------
+
+/// Набор проверок [`Outbound`] (CTR-28): `submit` возвращает ровно один статус на каждого получателя `rcpts`
+/// в порядке запроса (адреса как переданы); `enqueue` принимает то же письмо. `rcpts` — не пусто, адреса, которые
+/// реализация примет (для `tp_smtp::Delivery` — известные локальные или внешние при подключённой очереди).
+pub async fn outbound_submit(ob: &dyn Outbound, tenant: TenantId, rcpts: &[String]) {
+    assert!(!rcpts.is_empty(), "набор: нужен хотя бы один получатель");
+    let raw = Bytes::from_static(
+        b"From: suite@example.org\r\nTo: suite@example.org\r\nSubject: outbound suite\r\n\r\nbody\r\n",
+    );
+    let sent = ob
+        .submit(tenant, "suite@example.org", rcpts, raw.clone())
+        .await
+        .expect("submit");
+    let got: Vec<&str> = sent.rcpts.iter().map(|(r, _)| r.as_str()).collect();
+    let want: Vec<&str> = rcpts.iter().map(String::as_str).collect();
+    assert_eq!(got, want, "статусы — по получателю в порядке запроса");
+    assert!(
+        sent.rcpts
+            .iter()
+            .all(|(_, s)| !matches!(s, SubmitStatus::Failed(_))),
+        "принимаемые получатели не отклоняются: {:?}",
+        sent.rcpts
+    );
+    ob.enqueue(tenant, "suite@example.org", rcpts, raw)
+        .await
+        .expect("enqueue");
 }

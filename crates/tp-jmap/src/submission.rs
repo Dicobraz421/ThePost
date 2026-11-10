@@ -2,7 +2,7 @@
 //!
 //! - Identity — адрес учётной записи (имя входа) с отображаемым именем из `AccountStore`; адреса и подписи
 //!   ведёт каталог, поэтому `Identity/set` отвечает `forbidden`.
-//! - `EmailSubmission/set` ставит письмо в очередь исходящей почты ([`Outbound`]) сразу (`undoStatus` = `final`,
+//! - `EmailSubmission/set` ставит письмо в очередь исходящей почты ([`Outbound`](tp_contracts::queue::Outbound)) сразу (`undoStatus` = `final`,
 //!   `maxDelayedSend` = 0). Адрес `From` проверяет [`Authorizer::send_right`](tp_contracts::auth::Authorizer::send_right)
 //!   (свои адреса, Send As, Send on Behalf — с заголовком `Sender`). До очереди — `DecisionHooks::on_submission`
 //!   (`Deny` — `forbiddenToSend`; дополнения: заголовки в начало письма, копии в папки и внешним адресам).
@@ -10,7 +10,7 @@
 //!   `forbiddenToSend` с текстом правила, `Drop` — письмо принято и не отправлено (получатели `queued`), изменённые конверт
 //!   и тело — дальше вместо исходных.
 //!   Заголовок `Bcc` из отправляемого письма удаляется. В ответе `created` — `deliveryStatus` по каждому
-//!   получателю из [`Outbound::submit`] (доставлено локально — `yes`, в очереди — `queued`, отказ — `no` с ответом
+//!   получателю из [`Outbound::submit`](tp_contracts::queue::Outbound::submit) (доставлено локально — `yes`, в очереди — `queued`, отказ — `no` с ответом
 //!   SMTP). Объекты EmailSubmission после ответа не хранятся: `EmailSubmission/get` их не находит (статусы есть
 //!   только в ответе `set`), отменить отправку нельзя (`cannotUnsend`).
 //! - `EmailSubmission/query` и `queryChanges` проверяют фильтр и сортировку (RFC 8621 §7.3) и возвращают пустой
@@ -19,19 +19,19 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use async_trait::async_trait;
 use axum::body::Bytes;
 use mail_parser::MessageParser;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tp_contracts::MessageId;
 use tp_contracts::auth::SendRight;
 use tp_contracts::ext::{CopyTo, Decision, SubmissionInfo};
 use tp_contracts::mailstore::IngestRequest;
 use tp_contracts::meta::Changes;
+use tp_contracts::queue::{SubmitStatus, Submitted};
 use tp_contracts::transport::{BlobRef, FlowDirection, FlowEnvelope, FlowInput, FlowVerdict};
-use tp_contracts::{MessageId, Result, TenantId};
 
 use crate::core::error::{MethodError, MethodResult, set_error};
 use crate::core::request::{
@@ -41,69 +41,17 @@ use crate::core::request::{
 use crate::core::{Ctx, digest};
 use crate::email_get::{collect, utc_date};
 
-/// Статус доставки одному получателю при отправке ([`Outbound::submit`]); попадает в `deliveryStatus`
-/// EmailSubmission (RFC 8621 §7).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RcptStatus {
-    /// Доставлено в локальный ящик (`delivered: yes`).
-    Delivered,
-    /// Поставлено в очередь исходящей почты (`delivered: queued`).
-    Queued,
-    /// Не доставлено (`delivered: no`): ответ SMTP, например `550 5.1.1 No such user`.
-    Failed(String),
-}
-
-/// Итог [`Outbound::submit`]: статус по каждому получателю в порядке запроса.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Submitted {
-    /// Получатель → статус.
-    pub rcpts: Vec<(String, RcptStatus)>,
-}
-
-/// Очередь исходящей почты для `EmailSubmission/set`. Сигнатура [`Outbound::enqueue`] совпадает с
-/// `tp_smtp::deliver::Outbound`: приложение подключает очередь smtp (`tp_smtp::queue::Queue`, подпись DKIM при
-/// постановке) через обёртку; статусы по получателям — через [`Outbound::submit`] (`tp_smtp::Delivery::submit`).
-#[async_trait]
-pub trait Outbound: Send + Sync + 'static {
-    /// Ставит письмо `raw` от `mail_from` получателям `rcpts` организации `tenant`.
-    async fn enqueue(
-        &self,
-        tenant: TenantId,
-        mail_from: &str,
-        rcpts: &[String],
-        raw: Bytes,
-    ) -> Result<()>;
-
-    /// Отправляет письмо и возвращает статус по каждому получателю. По умолчанию — [`Outbound::enqueue`],
-    /// все получатели в очереди ([`RcptStatus::Queued`]).
-    async fn submit(
-        &self,
-        tenant: TenantId,
-        mail_from: &str,
-        rcpts: &[String],
-        raw: Bytes,
-    ) -> Result<Submitted> {
-        self.enqueue(tenant, mail_from, rcpts, raw).await?;
-        Ok(Submitted {
-            rcpts: rcpts
-                .iter()
-                .map(|r| (r.clone(), RcptStatus::Queued))
-                .collect(),
-        })
-    }
-}
-
 /// `deliveryStatus` EmailSubmission (RFC 8621 §7): получатель → `smtpReply`, `delivered`, `displayed`.
 fn delivery_status(s: &Submitted) -> Value {
     let mut m = Map::new();
     for (rcpt, st) in &s.rcpts {
         let (reply, delivered) = match st {
-            RcptStatus::Delivered => ("250 2.0.0 Delivered".to_owned(), "yes"),
-            RcptStatus::Queued => ("250 2.0.0 Queued".to_owned(), "queued"),
-            RcptStatus::Failed(r) if r.trim().is_empty() => {
+            SubmitStatus::Delivered => ("250 2.0.0 Delivered".to_owned(), "yes"),
+            SubmitStatus::Queued => ("250 2.0.0 Queued".to_owned(), "queued"),
+            SubmitStatus::Failed(r) if r.trim().is_empty() => {
                 ("550 5.0.0 Not delivered".to_owned(), "no")
             }
-            RcptStatus::Failed(r) => (r.clone(), "no"),
+            SubmitStatus::Failed(r) => (r.clone(), "no"),
         };
         m.insert(
             rcpt.clone(),
@@ -515,7 +463,8 @@ enum Flowed {
 /// на письмо до точек принятия решений и очереди. Тело передаётся объектом BLOB организации без ссылок (его, как и
 /// изменённое тело модуля, убирает сборка мусора по окну: в очередь уходят байты письма). `Reject` —
 /// `forbiddenToSend` с текстом правила; `Moderate` — `forbiddenToSend` (очереди модерации у JMAP нет);
-/// `route` не передаётся (у [`Outbound`] нет маршрута) — предупреждение в журнале.
+/// `route` не передаётся (контракт [`Outbound`](tp_contracts::queue::Outbound) без маршрута: очередь выбирает политику по домену) — предупреждение
+/// в журнале.
 async fn mail_flow(
     ctx: &Ctx<'_>,
     mail_from: String,
@@ -752,9 +701,7 @@ async fn submit_one(
             (mail_from, rcpts)
         }
         Flowed::Drop(rcpts) => {
-            let statuses = Submitted {
-                rcpts: rcpts.into_iter().map(|r| (r, RcptStatus::Queued)).collect(),
-            };
+            let statuses = Submitted::all(&rcpts, SubmitStatus::Queued);
             return Ok(Ok((format!("S{}", MessageId::new()), msg.id, statuses)));
         }
         Flowed::Refuse(e) => return Ok(Err(e)),
@@ -902,7 +849,10 @@ pub(crate) async fn submission_set(
 mod tests {
     use super::*;
 
+    use async_trait::async_trait;
     use tp_contracts::meta::SpecialUse;
+    use tp_contracts::queue::Outbound;
+    use tp_contracts::{Result, TenantId};
 
     use crate::JmapConfig;
     use crate::core::{Deps, Jmap};
@@ -1019,13 +969,13 @@ mod tests {
         let acc = env.account();
         let identity = identity_id("user@example.org");
         env.outbound
-            .set_status("local@example.org", RcptStatus::Delivered);
+            .set_status("local@example.org", SubmitStatus::Delivered);
         env.outbound.set_status(
             "nobody@example.org",
-            RcptStatus::Failed("550 5.1.1 No such user".into()),
+            SubmitStatus::Failed("550 5.1.1 No such user".into()),
         );
         env.outbound
-            .set_status("full@example.org", RcptStatus::Failed(String::new()));
+            .set_status("full@example.org", SubmitStatus::Failed(String::new()));
         let rcpts = [
             "local@example.org",
             "rcpt@external.test",
@@ -1086,7 +1036,7 @@ mod tests {
     /// Очередь только с `enqueue` (реализация `submit` по умолчанию): все получатели — `queued`.
     #[tokio::test]
     async fn delivery_status_default_queued() {
-        struct Plain(crate::testenv::TestOutbound);
+        struct Plain(tp_testkit::MemOutbound);
         #[async_trait]
         impl Outbound for Plain {
             async fn enqueue(

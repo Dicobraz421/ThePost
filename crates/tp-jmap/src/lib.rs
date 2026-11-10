@@ -7,7 +7,7 @@
 //!   SearchSnippet/get (RFC 8621 §5);
 //! - `email_set` — Email/set (черновики, keywords, mailboxIds, удаление в корзину), Email/import, Email/copy (§4.6–4.8);
 //! - `blob` — загрузка и скачивание blob, Blob/copy (RFC 8620 §6);
-//! - [`submission`] — Identity/get, set и EmailSubmission/get, set, query, queryChanges → очередь [`Outbound`] (RFC 8621 §6–7);
+//! - [`submission`] — Identity/get, set и EmailSubmission/get, set, query, queryChanges → очередь [`Outbound`](tp_contracts::queue::Outbound) (RFC 8621 §6–7);
 //! - `push` — EventSource и WebSocket (RFC 8620 §7, RFC 8887) по шине уведомлений;
 //! - `fuzz` — проверки разбора для целей cargo-fuzz `crates/tp-jmap/fuzz` (JMAP-09; не API);
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
@@ -31,7 +31,6 @@ mod testenv;
 use serde_json::{Map, Value};
 
 pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
-pub use crate::submission::{Outbound, RcptStatus, Submitted};
 
 use crate::core::error::MethodResult;
 use crate::core::{CORE, Ctx, MAIL, SETTINGS, SUBMISSION};
