@@ -70,6 +70,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "node info and abuse blocks",
         include_str!("../migrations/0015_node_info_abuse_blocks.sql"),
     ),
+    (
+        16,
+        "transport",
+        include_str!("../migrations/0016_transport.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
