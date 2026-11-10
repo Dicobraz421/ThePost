@@ -51,11 +51,12 @@ fn check_names(name: &str, holder: &str) -> Result<()> {
 #[async_trait]
 impl LeaseStore for PgMeta {
     async fn try_acquire(&self, name: &str, holder: &str, ttl: Duration) -> Result<Option<Lease>> {
-        check_names(name, holder)?;
-        // Свободная (истёкшая) лиза достаётся новому держателю с новым номером захвата;
-        // действующая лиза того же держателя только продлевается.
-        let row: Option<LeaseRow> = sqlx::query_as(
-            "INSERT INTO leases (name, holder, fencing, expires_at)
+        self.once(async move {
+            check_names(name, holder)?;
+            // Свободная (истёкшая) лиза достаётся новому держателю с новым номером захвата;
+            // действующая лиза того же держателя только продлевается.
+            let row: Option<LeaseRow> = sqlx::query_as(
+                "INSERT INTO leases (name, holder, fencing, expires_at)
              VALUES ($1, $2, 1, now() + $3 * interval '1 microsecond')
              ON CONFLICT (name) DO UPDATE SET
                  fencing = CASE WHEN leases.holder = EXCLUDED.holder AND leases.expires_at > now()
@@ -64,44 +65,52 @@ impl LeaseStore for PgMeta {
                  expires_at = EXCLUDED.expires_at
              WHERE leases.holder = EXCLUDED.holder OR leases.expires_at <= now()
              RETURNING name, holder, fencing, expires_at",
-        )
-        .bind(name)
-        .bind(holder)
-        .bind(ttl_arg(ttl)?)
-        .fetch_optional(&self.pool)
+            )
+            .bind(name)
+            .bind(holder)
+            .bind(ttl_arg(ttl)?)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            row.map(Lease::try_from).transpose()
+        })
         .await
-        .map_err(db_err)?;
-        row.map(Lease::try_from).transpose()
     }
 
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Option<Lease>> {
-        // Истёкшую, но никем не захваченную лизу (номер захвата не изменился) можно продлить.
-        let row: Option<LeaseRow> = sqlx::query_as(
-            "UPDATE leases SET expires_at = now() + $4 * interval '1 microsecond'
+        self.once(async move {
+            // Истёкшую, но никем не захваченную лизу (номер захвата не изменился) можно продлить.
+            let row: Option<LeaseRow> = sqlx::query_as(
+                "UPDATE leases SET expires_at = now() + $4 * interval '1 microsecond'
              WHERE name = $1 AND holder = $2 AND fencing = $3
              RETURNING name, holder, fencing, expires_at",
-        )
-        .bind(&lease.name)
-        .bind(&lease.holder)
-        .bind(to_i64(lease.fencing)?)
-        .bind(ttl_arg(ttl)?)
-        .fetch_optional(&self.pool)
+            )
+            .bind(&lease.name)
+            .bind(&lease.holder)
+            .bind(to_i64(lease.fencing)?)
+            .bind(ttl_arg(ttl)?)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            row.map(Lease::try_from).transpose()
+        })
         .await
-        .map_err(db_err)?;
-        row.map(Lease::try_from).transpose()
     }
 
     async fn release(&self, lease: &Lease) -> Result<()> {
-        sqlx::query(
-            "UPDATE leases SET expires_at = least(expires_at, now())
+        self.once(async move {
+            sqlx::query(
+                "UPDATE leases SET expires_at = least(expires_at, now())
              WHERE name = $1 AND holder = $2 AND fencing = $3",
-        )
-        .bind(&lease.name)
-        .bind(&lease.holder)
-        .bind(to_i64(lease.fencing)?)
-        .execute(&self.pool)
+            )
+            .bind(&lease.name)
+            .bind(&lease.holder)
+            .bind(to_i64(lease.fencing)?)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+            Ok(())
+        })
         .await
-        .map_err(db_err)?;
-        Ok(())
     }
 }

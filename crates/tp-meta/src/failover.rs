@@ -15,7 +15,9 @@
 //! вызывающему (SMTP 4xx, временная ошибка IMAP/JMAP): письма в памяти не накапливаются.
 //!
 //! Повторяются только идемпотентные операции — их вызывающий передаёт явно ([`Failover::retry`],
-//! [`Failover::with_tenant`]); остальные выполняются без повтора и отдают временный отказ. Исход фиксации
+//! [`Failover::with_tenant`]); остальные ([`Failover::once`]) выполняются без повтора и отдают временный
+//! отказ с рекомендуемой паузой. Хранилища [`crate::PgMeta::from_failover`] повторяют чтения, записи — без
+//! повтора. Исход фиксации
 //! при обрыве во время COMMIT устанавливается по ключу операции (идентификатор письма, ключ журнала
 //! событий): [`Failover::with_tenant_keyed`] перед повтором проверяет, применена ли операция.
 //!
@@ -344,6 +346,25 @@ impl Failover {
                 Ok(v) => return Ok(v),
                 Err(e) => r.after(e, seen).await?,
             }
+        }
+    }
+
+    /// Выполняет **неидемпотентную** операцию `op` (запись без ключа) один раз: временный отказ —
+    /// проверка primary (при переключении — поиск и сброс пула) и `Unavailable` с рекомендуемой паузой
+    /// `retry_max`; повторяет операцию вызывающий (SMTP 4xx, временная ошибка IMAP/JMAP).
+    pub async fn once<T, Fut>(&self, op: Fut) -> Result<T>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
+        let seen = self.0.epoch();
+        match op.await {
+            Err(e) if e.is_retryable() => {
+                self.0.recover(seen).await;
+                Err(Error::Unavailable {
+                    retry_after: Some(self.0.cfg.retry_max),
+                })
+            }
+            r => r,
         }
     }
 
