@@ -271,7 +271,9 @@ impl GroupStore for PgMeta {
     }
 
     async fn put(&self, group: DistributionGroup) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| {
+            let group = group.clone();
+            async move {
         group.validate()?;
         let tenant = group.tenant;
         with_tenant(&self.pool, tenant, move |tx| {
@@ -357,7 +359,7 @@ impl GroupStore for PgMeta {
             })
         })
         .await
-}).await
+}}).await
     }
 
     async fn remove(&self, tenant: TenantId, id: GroupId) -> Result<Vec<HeldMessage>> {
@@ -425,42 +427,62 @@ impl GroupStore for PgMeta {
         .await
     }
 
+    /// Ключ записи (META-40) — `HeldId` вызывающего: после обрыва во время COMMIT письмо поставлено, если
+    /// есть строка с этим идентификатором.
     async fn hold(&self, tenant: TenantId, message: HeldMessage) -> Result<()> {
-        self.once(async move {
         if message.blob.tenant != tenant {
             return Err(Error::invalid("объект письма другой организации"));
         }
         let size = to_i64(message.size)?;
-        let inserted = with_tenant(&self.pool, tenant, move |tx| {
-            Box::pin(async move {
-                Ok(sqlx::query(
-                    "INSERT INTO group_held (tenant_id, held_id, group_id, sender, sender_account, message_id,
-                                             blob_hash, blob_gen, size, held_at)
-                     SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-                     WHERE EXISTS (SELECT 1 FROM groups WHERE tenant_id = $1 AND group_id = $3)",
-                )
-                .bind(tenant.as_uuid())
-                .bind(message.id.as_uuid())
-                .bind(message.group.as_uuid())
-                .bind(&message.sender)
-                .bind(message.sender_account.map(|a| *a.as_uuid()))
-                .bind(&message.message_id)
-                .bind(message.blob.hash.as_bytes().as_slice())
-                .bind(i64::from(message.blob.generation.0))
-                .bind(size)
-                .bind(message.held_at)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?
-                .rows_affected())
-            })
-        })
-        .await?;
+        let held = *message.id.as_uuid();
+        let message = &message;
+        let inserted = self
+            .keyed(
+                tenant,
+                |tx| {
+                    let message = message.clone();
+                    Box::pin(async move {
+                        Ok(sqlx::query(
+                            "INSERT INTO group_held (tenant_id, held_id, group_id, sender, sender_account, message_id,
+                                                     blob_hash, blob_gen, size, held_at)
+                             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                             WHERE EXISTS (SELECT 1 FROM groups WHERE tenant_id = $1 AND group_id = $3)",
+                        )
+                        .bind(tenant.as_uuid())
+                        .bind(message.id.as_uuid())
+                        .bind(message.group.as_uuid())
+                        .bind(&message.sender)
+                        .bind(message.sender_account.map(|a| *a.as_uuid()))
+                        .bind(&message.message_id)
+                        .bind(message.blob.hash.as_bytes().as_slice())
+                        .bind(i64::from(message.blob.generation.0))
+                        .bind(size)
+                        .bind(message.held_at)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?
+                        .rows_affected())
+                    })
+                },
+                move |tx| {
+                    Box::pin(async move {
+                        let found: bool = sqlx::query_scalar(
+                            "SELECT EXISTS (SELECT 1 FROM group_held WHERE tenant_id = $1 AND held_id = $2)",
+                        )
+                        .bind(tenant.as_uuid())
+                        .bind(held)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                        Ok(found.then_some(1))
+                    })
+                },
+            )
+            .await?;
         if inserted == 0 {
             return Err(Error::NotFound);
         }
         Ok(())
-}).await
     }
 
     async fn held(

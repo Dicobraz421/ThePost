@@ -232,7 +232,7 @@ impl PgMeta {
         target: PolicyTarget,
         policy: &Policy,
     ) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
         let mut tx = begin(&self.pool, tenant).await?;
         if *policy == Policy::default() {
             sqlx::query(
@@ -326,7 +326,7 @@ impl PolicyResolver for PgMeta {
         scope: AccountScope,
         mode: Option<TrashPurge>,
     ) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
             let mut tx = begin(&self.pool, scope.tenant).await?;
             let domain: Option<Uuid> = sqlx::query_scalar(
             "SELECT domain_id FROM accounts WHERE tenant_id = $1 AND account_id = $2 FOR UPDATE",

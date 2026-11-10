@@ -137,7 +137,8 @@ impl PgMeta {
     }
 
     async fn upsert_node(&self, node: &NodeId, up: Upsert<'_>, ttl: Duration) -> Result<()> {
-        self.once(async move {
+        let up = &up;
+        self.rewrite(|| async move {
         if let Some(addr) = up.addr
             && (addr.len() > 2048 || addr.chars().any(|c| c.is_whitespace() || c.is_control()))
         {
@@ -164,7 +165,7 @@ impl PgMeta {
                                             AND o.site = nodes.site FROM old o), false)",
         )
         .bind(node.as_str())
-        .bind(up.roles)
+        .bind(&up.roles)
         .bind(up.addr)
         .bind(up.site)
         .bind(ttl_arg(ttl)?)
@@ -202,7 +203,7 @@ impl Membership for PgMeta {
     }
 
     async fn leave(&self, node: &NodeId) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
             // Выход живого узла — сигнал; удаление истёкшей записи состав не меняет.
             let was_live: Option<bool> = sqlx::query_scalar(
                 "DELETE FROM nodes WHERE node_id = $1 RETURNING expires_at > now()",

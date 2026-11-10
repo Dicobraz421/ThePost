@@ -88,7 +88,7 @@ impl AppPasswordStore for PgMeta {
     }
 
     async fn revoke(&self, scope: AccountScope, id: &str, at: OffsetDateTime) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
             let mut tx = begin(&self.pool, scope.tenant).await?;
             let updated = sqlx::query(
                 "UPDATE app_passwords SET revoked_at = COALESCE(revoked_at, $4)

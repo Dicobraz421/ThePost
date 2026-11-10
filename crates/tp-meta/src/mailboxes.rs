@@ -603,7 +603,7 @@ impl MailboxStore for PgMeta {
     }
 
     async fn set_subscribed(&self, scope: AccountScope, id: MailboxId, on: bool) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
             let mut tx = begin(&self.pool, scope.tenant).await?;
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
             let updated = sqlx::query(

@@ -6,15 +6,27 @@ mod common;
 
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Executor, PgPool};
+use time::OffsetDateTime;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tp_contracts::delivery::{
+    DeliveryDecision, DeliveryEvent, DeliveryEventKind, DeliveryLog, DeliveryQuery,
+};
+use tp_contracts::events::{EventLog, EventPos, Partition};
+use tp_contracts::groups::{DistributionGroup, GroupStore, HeldMessage, SenderRestriction};
 use tp_contracts::lease::LeaseStore;
-use tp_contracts::meta::AccountStore;
-use tp_contracts::{Error, TenantId};
+use tp_contracts::membership::NodeId;
+use tp_contracts::meta::{
+    AccountScope, AccountStore, Flags, MailboxStore, MessageQuery, MessageStore, NewMessage,
+    SpecialUse,
+};
+use tp_contracts::{BlobHash, BlobKey, Error, Gen, GroupId, HeldId, TenantId};
 use tp_meta::failover::{FailoverConfig, connect_failover};
 use tp_meta::schema::db_err;
 use tp_meta::{MetaConfig, PgMeta};
@@ -295,16 +307,14 @@ async fn meta_read_retried_on_new_primary() {
         .expect("connect_failover");
     let meta = PgMeta::from_failover(&fo, MetaConfig::default());
     assert_eq!(fo.metrics().primary, 0);
-    let before = meta
-        .get(scope.tenant, scope.account)
+    let before = AccountStore::get(&meta, scope.tenant, scope.account)
         .await
         .expect("чтение на первом primary");
     assert!(before.is_none(), "в первом экземпляре учётной записи нет");
 
     // Первый primary пропал: соединения оборваны, адрес не отвечает.
     proxy.kill();
-    let after = meta
-        .get(scope.tenant, scope.account)
+    let after = AccountStore::get(&meta, scope.tenant, scope.account)
         .await
         .expect("чтение повторено на новом primary");
     assert_eq!(after.map(|acc| acc.id), Some(scope.account));
@@ -347,5 +357,307 @@ async fn meta_read_retried_on_new_primary() {
             .execute(AssertSqlSafe(format!("DROP DATABASE {db} WITH (FORCE)")))
             .await
             .expect("drop database");
+    }
+}
+
+/// Прокси TCP, обрывающий соединение после COMMIT (META-40): COMMIT транзакции, в которой был запрос с
+/// `pattern`, доходит до сервера и фиксируется, ответ сервера клиенту не передаётся — исход клиенту
+/// неизвестен. Обрыв однократный: [`CommitCut::arm`] перед каждой проверяемой операцией.
+struct CommitCut {
+    addr: std::net::SocketAddr,
+    pattern: Arc<Mutex<Option<String>>>,
+    cuts: Arc<AtomicUsize>,
+    accept: tokio::task::AbortHandle,
+}
+
+impl CommitCut {
+    async fn start(upstream: String) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let pattern: Arc<Mutex<Option<String>>> = Arc::default();
+        let cuts = Arc::new(AtomicUsize::new(0));
+        let (p, c) = (pattern.clone(), cuts.clone());
+        let accept = tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let (upstream, p, c) = (upstream.clone(), p.clone(), c.clone());
+                tokio::spawn(async move {
+                    if let Ok(server) = TcpStream::connect(&upstream).await {
+                        let _ = cut_after_commit(client, server, p, c).await;
+                    }
+                });
+            }
+        });
+        Self {
+            addr,
+            pattern,
+            cuts,
+            accept: accept.abort_handle(),
+        }
+    }
+
+    /// Оборвать COMMIT ближайшей транзакции с запросом, содержащим `pattern`.
+    fn arm(&self, pattern: &str) {
+        *self.pattern.lock().expect("lock") = Some(pattern.to_owned());
+    }
+
+    fn cuts(&self) -> usize {
+        self.cuts.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for CommitCut {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+/// Пересылка сообщений протокола PostgreSQL (`sslmode=disable`) с обрывом после COMMIT.
+async fn cut_after_commit(
+    client: TcpStream,
+    server: TcpStream,
+    pattern: Arc<Mutex<Option<String>>>,
+    cuts: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    let (mut cr, mut cw) = client.into_split();
+    let (mut sr, mut sw) = server.into_split();
+    // Ответ на оборванный COMMIT клиенту не передаётся: получен — соединение закрывается.
+    let hold = Arc::new(AtomicBool::new(false));
+    let replied = Arc::new(tokio::sync::Notify::new());
+    let (h, r) = (hold.clone(), replied.clone());
+    let s2c = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = match sr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if h.load(Ordering::SeqCst) {
+                r.notify_one();
+                break;
+            }
+            if cw.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    });
+    // Стартовое сообщение — без типа.
+    let mut len = [0u8; 4];
+    cr.read_exact(&mut len).await?;
+    let mut body = vec![0u8; (u32::from_be_bytes(len) as usize).saturating_sub(4)];
+    cr.read_exact(&mut body).await?;
+    sw.write_all(&len).await?;
+    sw.write_all(&body).await?;
+    let mut marked = false;
+    loop {
+        let mut head = [0u8; 5];
+        cr.read_exact(&mut head).await?;
+        let n = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        let mut body = vec![0u8; n.saturating_sub(4)];
+        cr.read_exact(&mut body).await?;
+        let text = String::from_utf8_lossy(&body);
+        let sql = text.trim_end_matches('\0').trim();
+        let wanted = pattern.lock().expect("lock").clone();
+        if matches!(head[0], b'Q' | b'P') && wanted.as_deref().is_some_and(|p| sql.contains(p)) {
+            marked = true;
+        }
+        let end = head[0] == b'Q'
+            && (sql.eq_ignore_ascii_case("COMMIT") || sql.eq_ignore_ascii_case("ROLLBACK"));
+        if end
+            && marked
+            && sql.eq_ignore_ascii_case("COMMIT")
+            && pattern.lock().expect("lock").take().is_some()
+        {
+            hold.store(true, Ordering::SeqCst);
+            sw.write_all(&head).await?;
+            sw.write_all(&body).await?;
+            // Сервер ответил — COMMIT выполнен; соединение обрывается без ответа клиенту.
+            let _ = tokio::time::timeout(Duration::from_secs(10), replied.notified()).await;
+            cuts.fetch_add(1, Ordering::SeqCst);
+            s2c.abort();
+            return Ok(());
+        }
+        if end {
+            marked = false;
+        }
+        sw.write_all(&head).await?;
+        sw.write_all(&body).await?;
+    }
+}
+
+/// META-40: обрыв соединения после COMMIT — исход записи с ключом устанавливается по ключу, повтор не
+/// задваивает запись: вставка письма (одного и пачкой), журнал доставки, очередь модерации, позиция
+/// подписчика журнала событий.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyed_write_not_doubled_after_commit_cut() {
+    let Some(direct) = common::meta().await else {
+        return;
+    };
+    let url = common::pg_url().expect("url");
+    let opts = PgConnectOptions::from_str(&url).expect("url");
+    if opts.get_host().starts_with('/') {
+        eprintln!("TEST_DATABASE_URL — сокет Unix: прокси TCP невозможен, тест пропущен");
+        return;
+    }
+    let scope = common::account(&direct).await;
+    let tenant = scope.tenant;
+    let inbox = MailboxStore::list(&direct, scope)
+        .await
+        .expect("папки")
+        .into_iter()
+        .find(|m| m.role == Some(SpecialUse::Inbox))
+        .expect("входящие")
+        .id;
+
+    let cut = CommitCut::start(format!("{}:{}", opts.get_host(), opts.get_port())).await;
+    let mut cfg = common::dev_pool_config(&via(&url, cut.addr));
+    cfg.acquire_timeout = Duration::from_secs(5);
+    cfg.failover = FailoverConfig {
+        retry_initial: Duration::from_millis(50),
+        retry_max: Duration::from_millis(500),
+        retry_for: Duration::from_secs(30),
+        probe_timeout: Duration::from_secs(5),
+    };
+    let fo = connect_failover(&cfg, common::secrets())
+        .await
+        .expect("connect_failover");
+    let meta = PgMeta::from_failover(&fo, MetaConfig::default());
+
+    // Вставка письма.
+    cut.arm("INSERT INTO messages");
+    let one = meta
+        .insert(scope, inbox, new_message(scope))
+        .await
+        .expect("вставка переживает обрыв после COMMIT");
+    assert_eq!(cut.cuts(), 1, "COMMIT вставки оборван");
+    cut.arm("INSERT INTO messages");
+    let batch = meta
+        .insert_batch(
+            tenant,
+            vec![
+                (scope, inbox, new_message(scope)),
+                (scope, inbox, new_message(scope)),
+            ],
+        )
+        .await
+        .expect("пачка переживает обрыв после COMMIT");
+    assert_eq!(cut.cuts(), 2, "COMMIT пачки оборван");
+    let listed = MessageStore::list(&direct, scope, inbox, MessageQuery::All, 100)
+        .await
+        .expect("письма");
+    let got: Vec<_> = listed.iter().map(|m| (m.id, m.uid)).collect();
+    let want: Vec<_> = std::iter::once(&one)
+        .chain(&batch)
+        .map(|i| (i.id, i.uid))
+        .collect();
+    assert_eq!(
+        got, want,
+        "каждое письмо — один раз, результат — применённой вставки"
+    );
+    assert!(
+        listed
+            .iter()
+            .zip(std::iter::once(&one).chain(&batch))
+            .all(|(m, i)| m.modseq == i.modseq)
+    );
+
+    // Журнал доставки.
+    let message_id = format!("{}@meta40.test", Uuid::now_v7().simple());
+    cut.arm("INSERT INTO delivery_log");
+    meta.record(DeliveryEvent {
+        tenant,
+        at: OffsetDateTime::now_utc(),
+        node: NodeId::new("meta40-node").expect("node"),
+        kind: DeliveryEventKind::Deliver,
+        sender: "a@example.org".into(),
+        recipients: vec!["b@example.org".into()],
+        message_id: Some(message_id.clone()),
+        queue_id: None,
+        decision: DeliveryDecision::Accept,
+        reason: None,
+    })
+    .await
+    .expect("журнал доставки переживает обрыв после COMMIT");
+    assert_eq!(cut.cuts(), 3, "COMMIT журнала доставки оборван");
+    let mut q = DeliveryQuery::all(10);
+    q.message_id = Some(message_id);
+    let page = direct.search(tenant, &q).await.expect("поиск");
+    assert_eq!(page.events.len(), 1, "запись журнала доставки — одна");
+
+    // Очередь модерации.
+    let group = DistributionGroup {
+        id: GroupId::new(),
+        tenant,
+        name: "meta40".into(),
+        address: None,
+        external_id: None,
+        members: Vec::new(),
+        senders: SenderRestriction::Anyone,
+        moderators: Vec::new(),
+        hidden_from_gal: false,
+    };
+    GroupStore::put(&direct, group.clone())
+        .await
+        .expect("группа");
+    let held = HeldMessage {
+        id: HeldId::new(),
+        group: group.id,
+        sender: "a@example.org".into(),
+        sender_account: None,
+        message_id: None,
+        blob: blob_key(scope),
+        size: 10,
+        held_at: OffsetDateTime::now_utc(),
+    };
+    cut.arm("INSERT INTO group_held");
+    meta.hold(tenant, held.clone())
+        .await
+        .expect("очередь модерации переживает обрыв после COMMIT");
+    assert_eq!(cut.cuts(), 4, "COMMIT очереди модерации оборван");
+    let list = direct
+        .held(tenant, Some(group.id), 10)
+        .await
+        .expect("очередь");
+    assert_eq!(list.iter().map(|h| h.id).collect::<Vec<_>>(), vec![held.id]);
+
+    // Позиция подписчика журнала событий.
+    let subscriber = format!("meta40-{}", Uuid::now_v7().simple());
+    cut.arm("INSERT INTO event_cursors");
+    EventLog::commit(&meta, &subscriber, Partition(0), EventPos(7))
+        .await
+        .expect("позиция переживает обрыв после COMMIT");
+    assert_eq!(cut.cuts(), 5, "COMMIT позиции оборван");
+    assert_eq!(
+        direct
+            .position(&subscriber, Partition(0))
+            .await
+            .expect("позиция"),
+        EventPos(7)
+    );
+
+    let m = fo.metrics();
+    assert!(m.retries >= 5, "{m:?}");
+    assert_eq!((m.switches, m.gave_up), (0, 0), "{m:?}");
+    fo.pool().close().await;
+}
+
+fn blob_key(scope: AccountScope) -> BlobKey {
+    let mut h = [0u8; 32];
+    h[..16].copy_from_slice(Uuid::now_v7().as_bytes());
+    h[16..].copy_from_slice(Uuid::now_v7().as_bytes());
+    BlobKey {
+        tenant: scope.tenant,
+        hash: BlobHash(h),
+        generation: Gen::INITIAL,
+    }
+}
+
+fn new_message(scope: AccountScope) -> NewMessage {
+    NewMessage {
+        skeleton: blob_key(scope),
+        parts: Vec::new(),
+        size: 100,
+        received_at: OffsetDateTime::now_utc(),
+        flags: Flags::default(),
+        meta: Default::default(),
     }
 }

@@ -141,7 +141,7 @@ impl PgMeta {
     /// наименьшей зафиксированной; подписчик без позиции в разделе её не имеет — 0).
     /// Пустой список подписчиков ничего не удаляет. Возвращает число удалённых событий.
     pub async fn purge_events(&self, subscribers: &[&str], limit: usize) -> Result<u64> {
-        self.once(async move {
+        self.rewrite(|| async move {
         let mut tx = begin_system(&self.pool).await?;
         let done = sqlx::query(
             "WITH subs AS (SELECT DISTINCT unnest($1::text[]) AS subscriber),
@@ -213,21 +213,46 @@ impl EventLog for PgMeta {
         .await
     }
 
+    /// Ключ записи (META-40) — сама позиция: после обрыва во время COMMIT она зафиксирована, если
+    /// сохранённая не меньше (позиция только растёт).
     async fn commit(&self, subscriber: &str, partition: Partition, pos: EventPos) -> Result<()> {
-        self.once(async move {
-            sqlx::query(
-                "INSERT INTO event_cursors (subscriber, partition, pos) VALUES ($1, $2, $3)
-             ON CONFLICT (subscriber, partition) DO UPDATE
-             SET pos = greatest(event_cursors.pos, EXCLUDED.pos), updated_at = now()",
-            )
-            .bind(subscriber)
-            .bind(self.partition_arg(partition)?)
-            .bind(to_i64(pos.0)?)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-            Ok(())
-        })
+        let p = self.partition_arg(partition)?;
+        let pos = to_i64(pos.0)?;
+        self.keyed_system(
+            |tx| {
+                let subscriber = subscriber.to_owned();
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO event_cursors (subscriber, partition, pos) VALUES ($1, $2, $3)
+                         ON CONFLICT (subscriber, partition) DO UPDATE
+                         SET pos = greatest(event_cursors.pos, EXCLUDED.pos), updated_at = now()",
+                    )
+                    .bind(subscriber)
+                    .bind(p)
+                    .bind(pos)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    Ok(())
+                })
+            },
+            |tx| {
+                let subscriber = subscriber.to_owned();
+                Box::pin(async move {
+                    let done: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM event_cursors
+                                        WHERE subscriber = $1 AND partition = $2 AND pos >= $3)",
+                    )
+                    .bind(subscriber)
+                    .bind(p)
+                    .bind(pos)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    Ok(done.then_some(()))
+                })
+            },
+        )
         .await
     }
 }

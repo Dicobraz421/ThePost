@@ -27,7 +27,6 @@ use uuid::Uuid;
 use crate::PgMeta;
 use crate::changelog::{self, Change, Op};
 use crate::mailboxes::{self, alloc_uids, by_role, relocate, touch};
-use crate::pool::with_tenant;
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
 
 // ---------- Флаги ----------
@@ -331,19 +330,78 @@ fn check_new(scope: AccountScope, msg: &NewMessage) -> Result<()> {
     Ok(())
 }
 
-/// Вставка письма в открытой транзакции: новый `ModSeq`, UID, строки письма и частей, журнал изменений
+/// Исход вставки писем `keys` (учётная запись, письмо) одной транзакцией — по записям `created` журнала
+/// изменений (журнал не очищается; письмо после вставки могло быть перемещено или удалено): все
+/// вставлены — `Some` в порядке `keys`, ни одного — `None`. Сначала проверяется первое письмо: без
+/// него остальные не ищутся.
+async fn inserted_by_id(
+    tx: &mut PgConnection,
+    tenant: TenantId,
+    keys: &[(AccountId, MessageId)],
+) -> Result<Option<Vec<Inserted>>> {
+    async fn created(
+        tx: &mut PgConnection,
+        tenant: TenantId,
+        keys: &[(AccountId, MessageId)],
+    ) -> Result<Vec<(Uuid, i64, Option<i64>)>> {
+        let accounts: Vec<Uuid> = keys.iter().map(|(a, _)| *a.as_uuid()).collect();
+        let ids: Vec<Uuid> = keys.iter().map(|(_, m)| *m.as_uuid()).collect();
+        sqlx::query_as(
+            "SELECT k.message_id, c.modseq, c.uid
+             FROM unnest($2::uuid[], $3::uuid[]) WITH ORDINALITY AS k(account_id, message_id, n)
+             CROSS JOIN LATERAL (
+                 SELECT modseq, uid FROM changelog c
+                 WHERE c.tenant_id = $1 AND c.account_id = k.account_id AND c.object = 'message'
+                   AND c.object_id = k.message_id AND c.op = 'created'
+                 ORDER BY c.modseq DESC LIMIT 1) c
+             ORDER BY k.n",
+        )
+        .bind(tenant.as_uuid())
+        .bind(accounts)
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)
+    }
+    let first = created(tx, tenant, &keys[..keys.len().min(1)]).await?;
+    if first.is_empty() {
+        return Ok(None);
+    }
+    let rows = if keys.len() == 1 {
+        first
+    } else {
+        created(tx, tenant, keys).await?
+    };
+    if rows.len() != keys.len() {
+        return Err(Error::internal("вставка писем применена частично"));
+    }
+    rows.into_iter()
+        .map(|(id, modseq, uid)| {
+            Ok(Inserted {
+                id: MessageId::from_uuid(id),
+                uid: Uid(to_u32(
+                    uid.ok_or_else(|| Error::internal("changelog.uid"))?,
+                )?),
+                modseq: ModSeq(to_u64(modseq)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// Вставка письма `id` в открытой транзакции: новый `ModSeq`, UID, строки письма и частей, журнал изменений
 /// и событие доставки.
 async fn insert_one(
     tx: &mut PgConnection,
     partitions: u32,
     scope: AccountScope,
     mailbox: MailboxId,
+    id: MessageId,
     msg: NewMessage,
 ) -> Result<Inserted> {
     let meta = serde_json::to_value(&msg.meta).map_err(|e| Error::internal(e.to_string()))?;
     let ms = changelog::bump_modseq(tx, scope).await?;
     let uid = alloc_uids(tx, scope, mailbox, 1, ms).await?;
-    let id = MessageId::new();
     sqlx::query(
         "INSERT INTO messages (tenant_id, account_id, message_id, mailbox_id, uid, modseq, size, received_at,
                                flags, skeleton_hash, skeleton_gen, thread_key, meta)
@@ -423,17 +481,26 @@ impl MessageStore for PgMeta {
         mailbox: MailboxId,
         msg: NewMessage,
     ) -> Result<Inserted> {
-        self.once(async move {
-            check_new(scope, &msg)?;
-            let partitions = self.cfg.event_partitions;
-            let inserted = with_tenant(&self.pool, scope.tenant, |tx| {
-                Box::pin(insert_one(tx, partitions, scope, mailbox, msg))
-            })
+        check_new(scope, &msg)?;
+        let partitions = self.cfg.event_partitions;
+        // Ключ — идентификатор письма, выданный до транзакции (META-40).
+        let id = MessageId::new();
+        let keys = [(scope.account, id)];
+        let inserted = self
+            .keyed(
+                scope.tenant,
+                |tx| Box::pin(insert_one(tx, partitions, scope, mailbox, id, msg.clone())),
+                move |tx| {
+                    Box::pin(async move {
+                        Ok(inserted_by_id(tx, scope.tenant, &keys)
+                            .await?
+                            .and_then(|v| v.into_iter().next()))
+                    })
+                },
+            )
             .await?;
-            self.signal_log([scope.account]).await;
-            Ok(inserted)
-        })
-        .await
+        self.signal_log([scope.account]).await;
+        Ok(inserted)
     }
 
     async fn insert_batch(
@@ -441,42 +508,59 @@ impl MessageStore for PgMeta {
         tenant: TenantId,
         items: Vec<(AccountScope, MailboxId, NewMessage)>,
     ) -> Result<Vec<Inserted>> {
-        self.once(async move {
-            for (scope, _, msg) in &items {
-                if scope.tenant != tenant {
-                    return Err(Error::invalid("доставка другой организации"));
-                }
-                check_new(*scope, msg)?;
+        for (scope, _, msg) in &items {
+            if scope.tenant != tenant {
+                return Err(Error::invalid("доставка другой организации"));
             }
-            if items.is_empty() {
-                return Ok(Vec::new());
-            }
-            // Строки учётных записей и папок блокируются по порядку идентификаторов: встречные приёмы
-            // не ждут друг друга по кругу.
-            let mut items: Vec<_> = items.into_iter().enumerate().collect();
-            items.sort_by_key(|(_, (scope, mailbox, _))| {
-                (*scope.account.as_uuid(), *mailbox.as_uuid())
-            });
-            let partitions = self.cfg.event_partitions;
-            let accounts: Vec<AccountId> = items
-                .iter()
-                .map(|(_, (scope, _, _))| scope.account)
-                .collect();
-            let inserted = with_tenant(&self.pool, tenant, |tx| {
-                Box::pin(async move {
-                    let mut out = Vec::with_capacity(items.len());
-                    for (i, (scope, mailbox, msg)) in items {
-                        out.push((i, insert_one(tx, partitions, scope, mailbox, msg).await?));
-                    }
-                    out.sort_by_key(|(i, _)| *i);
-                    Ok(out.into_iter().map(|(_, ins)| ins).collect())
-                })
-            })
+            check_new(*scope, msg)?;
+        }
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Ключи — идентификаторы писем, выданные до транзакции, в порядке `items` (META-40).
+        let keys: Vec<(AccountId, MessageId)> = items
+            .iter()
+            .map(|(scope, _, _)| (scope.account, MessageId::new()))
+            .collect();
+        // Строки учётных записей и папок блокируются по порядку идентификаторов: встречные приёмы
+        // не ждут друг друга по кругу.
+        let mut items: Vec<_> = items
+            .into_iter()
+            .zip(&keys)
+            .enumerate()
+            .map(|(i, ((scope, mailbox, msg), (_, id)))| (i, scope, mailbox, *id, msg))
+            .collect();
+        items.sort_by_key(|(_, scope, mailbox, _, _)| {
+            (*scope.account.as_uuid(), *mailbox.as_uuid())
+        });
+        let partitions = self.cfg.event_partitions;
+        let items = &items;
+        let keys = &keys;
+        let inserted = self
+            .keyed(
+                tenant,
+                |tx| {
+                    let items = items.clone();
+                    Box::pin(async move {
+                        let mut out = Vec::with_capacity(items.len());
+                        for (i, scope, mailbox, id, msg) in items {
+                            out.push((
+                                i,
+                                insert_one(tx, partitions, scope, mailbox, id, msg).await?,
+                            ));
+                        }
+                        out.sort_by_key(|(i, _)| *i);
+                        Ok(out.into_iter().map(|(_, ins)| ins).collect())
+                    })
+                },
+                |tx| {
+                    let keys = keys.clone();
+                    Box::pin(async move { inserted_by_id(tx, tenant, &keys).await })
+                },
+            )
             .await?;
-            self.signal_log(accounts).await;
-            Ok(inserted)
-        })
-        .await
+        self.signal_log(keys.iter().map(|(a, _)| *a)).await;
+        Ok(inserted)
     }
 
     async fn get(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
