@@ -6,6 +6,7 @@
 //! - [`deliver`] — локальная доставка: разрешение получателей, `Received`, `MailStore::ingest`;
 //! - [`dkim_sign`] — DKIM-подпись исходящей почты;
 //! - [`dsn`] — уведомления о доставке (RFC 3464);
+//! - `fuzz` — проверки разборщиков для целей cargo-fuzz `crates/tp-smtp/fuzz` (SMTP-19; не API);
 //! - [`groups`] — группы рассылки при приёме: ограничения отправителей, модерация, раскрытие;
 //! - [`learn`] — обучение антиспама (Rspamd controller) по перемещению писем в «Спам» и из него;
 //! - [`limits`] — лимиты отправки учётной записи в час;
@@ -25,6 +26,8 @@ pub mod config;
 pub mod deliver;
 pub mod dkim_sign;
 pub mod dsn;
+#[doc(hidden)]
+pub mod fuzz;
 pub mod groups;
 pub mod learn;
 pub mod limits;

@@ -124,6 +124,31 @@ impl Milters {
 
     /// Проверяет письмо `raw` транзакции `env` фильтрами её режима по порядку.
     pub async fn check(&self, env: &Envelope, raw: Bytes) -> Outcome {
+        self.check_with(env, raw, |f| {
+            let address = f.address.clone();
+            let timeout = f.connect_timeout;
+            async move {
+                Ok(tokio::time::timeout(timeout, TcpStream::connect(address))
+                    .await
+                    .map_err(|_| ProtoError::Timeout)??)
+            }
+        })
+        .await
+    }
+
+    /// Проверка, в которой соединение с фильтром даёт `connect` (цель fuzz `milter` — готовые байты ответов
+    /// фильтра без сети, [`crate::fuzz::milter`]).
+    pub(crate) async fn check_with<S, F, Fut>(
+        &self,
+        env: &Envelope,
+        raw: Bytes,
+        connect: F,
+    ) -> Outcome
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        F: Fn(&MilterFilter) -> Fut,
+        Fut: std::future::Future<Output = Result<S, ProtoError>>,
+    {
         let mut out = Outcome {
             verdict: Verdict::Accept,
             message: raw,
@@ -131,9 +156,13 @@ impl Milters {
         };
         for f in self.cfg.filters.iter().filter(|f| f.applies(env.mode)) {
             let mut mods = Vec::new();
-            let res = self
-                .filter(f, env, &out.message, &mut mods, &mut out.quarantine)
-                .await;
+            let res = match connect(f).await {
+                Ok(stream) => {
+                    self.filter(f, stream, env, &out.message, &mut mods, &mut out.quarantine)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
             match res {
                 Ok(Filtered::Continue) => {
                     if !mods.is_empty() {
@@ -174,17 +203,15 @@ impl Milters {
         out
     }
 
-    async fn filter(
+    async fn filter<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         f: &MilterFilter,
+        stream: S,
         env: &Envelope,
         raw: &[u8],
         mods: &mut Vec<HeaderMod>,
         quarantine: &mut Option<String>,
     ) -> Result<Filtered, ProtoError> {
-        let stream = tokio::time::timeout(f.connect_timeout, TcpStream::connect(&f.address))
-            .await
-            .map_err(|_| ProtoError::Timeout)??;
         let mut s = Conversation {
             io: stream,
             filter: f,
