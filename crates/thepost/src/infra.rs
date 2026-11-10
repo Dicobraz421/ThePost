@@ -1,11 +1,11 @@
 //! Выбор реализаций по конфигурации: хранилище BLOB (локальный каталог / S3), шина уведомлений
-//! (в процессе / Valkey), пул PostgreSQL, имя узла (APP-01).
+//! (в процессе), пул PostgreSQL, имя узла (APP-01).
 
 use std::sync::Arc;
 
 use sqlx::PgPool;
 use tp_blob::{LocalStore, S3Store};
-use tp_cluster::{BusCounters, BusMetrics, LocalBus, ValkeyBus};
+use tp_cluster::{BusCounters, BusMetrics, LocalBus};
 use tp_contracts::blob::BlobStore;
 use tp_contracts::bus::EventBus;
 use tp_contracts::membership::NodeId;
@@ -101,21 +101,11 @@ impl std::fmt::Debug for Bus {
 }
 
 /// Шина по секции `bus`. Вызывать внутри runtime tokio.
-pub async fn open_bus(cfg: &Config, store: &dyn SecretStore) -> Result<Bus> {
+pub async fn open_bus(cfg: &Config, _store: &dyn SecretStore) -> Result<Bus> {
     let section = cfg.section::<BusSection>(BUS)?;
     match section.kind {
         BusKind::Local => {
             let bus = LocalBus::new(&section.local());
-            let counters = bus.counters();
-            Ok(Bus {
-                bus: Arc::new(bus),
-                counters,
-            })
-        }
-        BusKind::Valkey => {
-            let bus = ValkeyBus::connect(section.valkey.clone(), cfg.profile(), store)
-                .await
-                .map_err(|e| context("bus.valkey", e))?;
             let counters = bus.counters();
             Ok(Bus {
                 bus: Arc::new(bus),
@@ -130,11 +120,12 @@ pub fn bus_sample(m: BusMetrics) -> BusSample {
     BusSample {
         connected: m.connected,
         published: m.published,
-        publish_errors: m.publish_errors,
+        // Шины Valkey нет (CLU-09): в процессе ошибок публикации, разбора и переподключений не бывает.
+        publish_errors: 0,
         received: m.received,
         delivered: m.delivered,
-        decode_errors: m.decode_errors,
-        reconnects: m.reconnects,
+        decode_errors: 0,
+        reconnects: 0,
         lagged: m.lagged,
     }
 }
@@ -197,20 +188,5 @@ mod tests {
         assert!(bus.counters.snapshot().connected);
         assert!(bus_sample(bus.counters.snapshot()).connected);
         assert_eq!(node_id(&cfg).expect("node").as_str(), "node-a");
-    }
-
-    #[tokio::test]
-    async fn valkey_password_from_secret_store() {
-        let cfg = config(
-            "domain: example.org\nprofile: dev\ndatabase:\n  url: postgres://x@y/z?sslmode=disable\n  tls: { allow_plaintext: true }\n\
-             blob:\n  url: file:///tmp/b\nbus:\n  kind: valkey\n  valkey:\n    url: redis://127.0.0.1:1\n    password: { secret: \"thepost/valkey#password\" }\n    tls: { allow_plaintext: true }\n",
-        );
-        let mem = tp_testkit::MemSecretStore::default();
-        let e = open_bus(&cfg, &mem).await.expect_err("no secret");
-        assert!(e.is_retryable(), "{e}");
-        mem.set(&"thepost/valkey#password".parse().expect("ref"), "pw");
-        // Шина стартует (подключение — в фоне, адрес недоступен — переподключения).
-        let bus = open_bus(&cfg, &mem).await.expect("bus");
-        assert!(!bus.counters.snapshot().connected || bus.counters.snapshot().published == 0);
     }
 }
