@@ -1,7 +1,8 @@
-//! Системный слой Linux: сигналы, ресурсы узла, сокеты, sandbox (seccomp), ограничения ролей
-//! (seccomp, Landlock) (SRS 2.2, 2.7).
+//! Системный слой Linux: сигналы, ресурсы узла, триггеры PSI, сокеты, sandbox (seccomp), ограничения
+//! ролей (seccomp, Landlock) (SRS 2.2, 2.7).
 
 pub mod confine;
+pub mod psi;
 pub mod resources;
 pub mod sandbox;
 pub mod signals;
@@ -11,6 +12,7 @@ pub use confine::{
     ConfineConfig, ConfineError, ConfineReport, Confinement, LandlockOutcome, Profile, RolePaths,
     SeccompMode,
 };
+pub use psi::{PsiError, PsiFile, PsiStall, PsiThreshold, PsiTrigger};
 pub use resources::{
     NodeResources, ResourceSnapshot, ResourcesConfig, watch_resources, watch_resources_in,
 };
