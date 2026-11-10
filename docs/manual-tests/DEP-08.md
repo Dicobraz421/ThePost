@@ -5,8 +5,9 @@
 ## systemd: юнит и сокеты (без запуска)
 1. `systemd-analyze verify deploy/systemd/thepost.service deploy/systemd/thepost-*.socket` → замечаний нет
    (без установленного бинарного файла — только «/usr/local/bin/thepost is not executable»).
-2. `systemd-analyze security --offline=true deploy/systemd/thepost.service` → `Overall exposure level … 1.2 OK`
-   (не хуже 2.0). С drop-in без активации сокетов:
+2. Юнит отдельно (каталог `deploy/systemd/thepost.service.d` рядом systemd-analyze подхватывает как drop-in):
+   `T=$(mktemp -d); cp deploy/systemd/thepost.service $T/; systemd-analyze security --offline=true $T/thepost.service | tail -1`
+   → `Overall exposure level … 1.2 OK` (не хуже 2.0). С drop-in без активации сокетов:
    ```bash
    R=$(mktemp -d); mkdir -p $R/etc/systemd/system/thepost.service.d
    cp deploy/systemd/thepost.service $R/etc/systemd/system/
