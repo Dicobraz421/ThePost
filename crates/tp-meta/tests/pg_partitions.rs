@@ -12,7 +12,7 @@ use tp_contracts::Result;
 use tp_contracts::events::{
     EventLog, EventPos, EventSink, LoggedEvent, Partition, PartitionAssigner, partition_of,
 };
-use tp_contracts::membership::{Membership, NodeId};
+use tp_contracts::membership::{Membership, NodeId, NodeInfo};
 use tp_contracts::meta::{AccountScope, MailboxStore, NewMailbox};
 use tp_contracts::{AccountId, Error};
 use tp_meta::events::{EventConsumer, EventsConfig};
@@ -170,8 +170,12 @@ async fn partitions_follow_membership() {
         NodeId::new(format!("{prefix}-b")).expect("b"),
     );
     let ttl = Duration::from_secs(60);
-    meta.heartbeat(&a, ttl).await.expect("heartbeat a");
-    meta.heartbeat(&b, ttl).await.expect("heartbeat b");
+    meta.heartbeat(&NodeInfo::new(a.clone()), ttl)
+        .await
+        .expect("heartbeat a");
+    meta.heartbeat(&NodeInfo::new(b.clone()), ttl)
+        .await
+        .expect("heartbeat b");
     let assigner = Arc::new(TestAssigner {
         meta: meta.clone(),
         prefix: prefix.clone(),

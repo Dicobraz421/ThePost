@@ -3,6 +3,7 @@
 //! Реализации разделяют состояние между клонами (`Arc` внутри) и берут время из [`Clock`]:
 //! тесты таймаутов используют [`ManualClock`]. Фейки Ф1 для протокольных полос — [`fakes`]. Общие наборы тестов контрактов — [`suite`].
 
+pub mod abuse;
 pub mod acl;
 pub mod app_passwords;
 pub mod blob;
@@ -15,9 +16,11 @@ pub mod load;
 pub mod membership;
 pub mod meta;
 pub mod policies;
+pub mod rpc;
 pub mod secrets;
 pub mod suite;
 
+pub use abuse::MemAbuseBlocks;
 pub use acl::MemAcl;
 pub use app_passwords::MemAppPasswords;
 pub use blob::{BlobOp, MemBlobIndex, MemBlobStore};
@@ -33,4 +36,5 @@ pub use load::MemLoadMonitor;
 pub use membership::MemMembership;
 pub use meta::MemMetadata;
 pub use policies::{MemPolicies, PolicyLevel};
+pub use rpc::{MemRpc, MemRpcNet};
 pub use secrets::MemSecretStore;

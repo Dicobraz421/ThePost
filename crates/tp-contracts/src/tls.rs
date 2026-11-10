@@ -1,6 +1,6 @@
 //! TLS внутренних каналов (CONTRACTS.md#Internal TLS; SRS 6.2, решение 2026-10-30).
 //!
-//! Узел ↔ PostgreSQL, Valkey, S3 и узел ↔ узел — только TLS. Секция [`InternalTls`] одна для всех
+//! Узел ↔ PostgreSQL, S3 и узел ↔ узел — только TLS. Секция [`InternalTls`] одна для всех
 //! каналов: крейт канала вкладывает её полем `tls` своей секции и при загрузке конфигурации и запуске
 //! вызывает [`InternalTls::check_url`]. Открытый канал — только в профиле [`Profile::Dev`] с
 //! `allow_plaintext: true`; тогда крейт пишет [`InternalChannel::plaintext_warning`] в лог на каждом запуске.
@@ -11,14 +11,14 @@
 //! let tls = InternalTls::default();
 //! let url = "postgres://thepost@db.internal/thepost?sslmode=verify-full";
 //! assert_eq!(tls.check_url(InternalChannel::Postgres, url, Profile::Prod)?, Transport::Tls);
-//! assert!(tls.check_url(InternalChannel::Valkey, "redis://cache:6379", Profile::Prod).is_err());
+//! assert!(tls.check_url(InternalChannel::S3, "http://s3.internal:9000", Profile::Prod).is_err());
 //!
 //! let dev = InternalTls { allow_plaintext: true, ..InternalTls::default() };
 //! assert_eq!(
-//!     dev.check_url(InternalChannel::Valkey, "redis://cache:6379", Profile::Dev)?,
+//!     dev.check_url(InternalChannel::S3, "http://s3.internal:9000", Profile::Dev)?,
 //!     Transport::Plaintext
 //! );
-//! assert!(dev.check_url(InternalChannel::Valkey, "redis://cache:6379", Profile::Prod).is_err());
+//! assert!(dev.check_url(InternalChannel::S3, "http://s3.internal:9000", Profile::Prod).is_err());
 //! # Ok::<(), tp_contracts::Error>(())
 //! ```
 
@@ -46,8 +46,6 @@ pub enum Profile {
 pub enum InternalChannel {
     /// PostgreSQL: `postgres://`/`postgresql://`, TLS — `sslmode=verify-full` (или без `sslmode`).
     Postgres,
-    /// Valkey: `rediss://`/`valkeys://`; открытый — `redis://`/`valkey://`.
-    Valkey,
     /// S3: `https://`; открытый — `http://`.
     S3,
     /// Узел ↔ узел (SMTP edge → mailbox, mTLS по SRS 2.6): `https://`/`smtps://`; открытый — `http://`/`smtp://`.
@@ -59,7 +57,6 @@ impl InternalChannel {
     pub const fn as_str(self) -> &'static str {
         match self {
             InternalChannel::Postgres => "PostgreSQL",
-            InternalChannel::Valkey => "Valkey",
             InternalChannel::S3 => "S3",
             InternalChannel::Node => "node-to-node",
         }
@@ -69,7 +66,6 @@ impl InternalChannel {
     const fn tls_hint(self) -> &'static str {
         match self {
             InternalChannel::Postgres => "sslmode=verify-full",
-            InternalChannel::Valkey => "rediss://",
             InternalChannel::S3 => "https://",
             InternalChannel::Node => "https:// or smtps://",
         }
@@ -92,12 +88,12 @@ impl InternalChannel {
             (InternalChannel::Postgres, "postgres" | "postgresql") => {
                 return postgres_transport(rest);
             }
-            (InternalChannel::Valkey, "rediss" | "valkeys")
-            | (InternalChannel::S3, "https")
-            | (InternalChannel::Node, "https" | "smtps") => Transport::Tls,
-            (InternalChannel::Valkey, "redis" | "valkey")
-            | (InternalChannel::S3, "http")
-            | (InternalChannel::Node, "http" | "smtp") => Transport::Plaintext,
+            (InternalChannel::S3, "https") | (InternalChannel::Node, "https" | "smtps") => {
+                Transport::Tls
+            }
+            (InternalChannel::S3, "http") | (InternalChannel::Node, "http" | "smtp") => {
+                Transport::Plaintext
+            }
             _ => {
                 return Err(Error::Invalid(format!(
                     "{self}: unsupported address scheme {scheme}://"
@@ -240,35 +236,37 @@ mod tests {
         let tls = InternalTls::default();
         for profile in [Profile::Prod, Profile::Dev] {
             let e = tls
-                .check_url(Valkey, "redis://cache:6379", profile)
+                .check_url(S3, "http://minio:9000", profile)
                 .expect_err("plaintext without allow");
             assert!(
-                matches!(&e, Error::Invalid(m) if m.contains("rediss://")),
+                matches!(&e, Error::Invalid(m) if m.contains("https://")),
                 "{e:?}"
             );
         }
         assert_eq!(
-            dev().check_url(Valkey, "redis://cache:6379", Profile::Dev),
+            dev().check_url(Node, "smtp://mailbox-1:25", Profile::Dev),
             Ok(Transport::Plaintext)
         );
         assert_eq!(
             dev().check_url(S3, "http://minio:9000", Profile::Dev),
             Ok(Transport::Plaintext)
         );
-        assert!(Valkey.plaintext_warning().contains("NOT encrypted"));
+        assert!(S3.plaintext_warning().contains("NOT encrypted"));
     }
 
     #[test]
     fn schemes_per_channel() {
         let tls = InternalTls::default();
         let ok = |c, url| tls.check_url(c, url, Profile::Prod);
-        assert_eq!(ok(Valkey, "rediss://cache:6380/0"), Ok(Transport::Tls));
-        assert_eq!(ok(Valkey, "VALKEYS://cache"), Ok(Transport::Tls));
+        assert_eq!(ok(S3, "HTTPS://s3.internal"), Ok(Transport::Tls));
         assert_eq!(ok(S3, "https://s3.example.org/bucket"), Ok(Transport::Tls));
         assert_eq!(ok(Node, "smtps://mailbox-1:465"), Ok(Transport::Tls));
         assert_eq!(ok(Node, "https://mailbox-1:8443"), Ok(Transport::Tls));
         assert!(ok(S3, "file:///var/lib/thepost").is_err());
-        assert!(ok(Valkey, "cache:6379").is_err());
+        assert!(ok(S3, "s3.internal:9000").is_err());
+        // Канала Valkey нет (решение 2026-11-01): адрес rediss:// не подходит ни одному каналу.
+        assert!(ok(S3, "rediss://cache:6380").is_err());
+        assert!(ok(Node, "rediss://cache:6380").is_err());
         assert!(ok(Postgres, "https://db").is_err());
     }
 
