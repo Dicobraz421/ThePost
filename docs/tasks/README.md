@@ -385,6 +385,19 @@
 | [CLU-14](CLU-14.md) | Rpc — идентичность узла по SAN, HTTP/2 | cluster | A | cluster-09 | todo | CLU-12 |
 | [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-20 | done | CTR-23,META-16 |
 
+## Ф1 · Ответы владельца 2026-11-10 (#193, #195, #205, #253, #272)
+
+| Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
+|---|---|---|---|---|---|---|
+| [CTR-41](CTR-41.md) | локальный токен первого администратора | contracts | B | contracts-29 | todo | CTR-23 |
+| [ADM-11](ADM-11.md) | `thepost admin init` — первый администратор | admin | A | admin-06 | todo | CTR-41 |
+| [APP-19](APP-19.md) | команда `thepost admin init` и локальный сокет | app | A | app-18 | todo | ADM-11 |
+| [CTR-42](CTR-42.md) | хранилище отправок JMAP (отложенная отправка и отмена) | contracts | B | contracts-30 | todo | CTR-28 |
+| [META-42](META-42.md) | системные папки — только по роли, суффикс при совпадении имени | meta | A | meta-26 | todo | CMP-05 |
+| [KIT-08](KIT-08.md) | фейк ящика — системные папки только по роли | testkit | A | testkit-05 | ready | KIT-07 |
+| [AUTH-11](AUTH-11.md) | `auth.abuse.fail_closed` | auth | A | auth-06 | ready | AUTH-08 |
+| [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-10 | todo | CLU-09 |
+
 ## Вне волн
 
 | Задача | Суть | Полоса | Класс | Зависит |
