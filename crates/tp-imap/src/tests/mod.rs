@@ -27,6 +27,7 @@ mod ext;
 mod fetch;
 mod idle;
 mod mailbox;
+mod pop3;
 mod qresync;
 mod search;
 mod session;
