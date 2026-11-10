@@ -1,7 +1,8 @@
 //! In-memory блокировки источников и учётных записей (CONTRACTS.md#AbuseBlocks; решение 2026-11-01).
 //!
 //! [`MemAbuseBlocks`] — блокировки по организациям со сроком по [`Clock`]; с шиной
-//! ([`MemAbuseBlocks::with_bus`]) `block` публикует сигнал `Blocked`, как реализация `tp-meta`.
+//! ([`MemAbuseBlocks::with_bus`]) `block` публикует сигнал `Blocked`, `unblock` снятой блокировки — `Unblocked`,
+//! как реализация `tp-meta`.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -48,7 +49,7 @@ impl MemAbuseBlocks {
         }
     }
 
-    /// Публиковать `Blocked` в `bus` после `block`.
+    /// Публиковать `Blocked` в `bus` после `block` и `Unblocked` — после `unblock` действующей или истёкшей записи.
     pub fn with_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
         self.bus = Some(bus);
         self
@@ -132,9 +133,21 @@ impl AbuseBlocks for MemAbuseBlocks {
     }
 
     async fn unblock(&self, tenant: TenantId, subject: &BlockSubject) -> Result<()> {
-        let mut st = lock(&self.state);
-        fault(&mut st)?;
-        st.blocks.remove(&(tenant, *subject));
+        let removed = {
+            let mut st = lock(&self.state);
+            fault(&mut st)?;
+            st.blocks.remove(&(tenant, *subject)).is_some()
+        };
+        if removed && let Some(bus) = &self.bus {
+            // Сигнал после «фиксации»; потеря сигнала не отменяет снятие.
+            let _ = bus
+                .publish(Event {
+                    tenant,
+                    account: None,
+                    kind: EventKind::Unblocked { subject: *subject },
+                })
+                .await;
+        }
         Ok(())
     }
 
@@ -167,6 +180,14 @@ mod tests {
         let clock = ManualClock::default();
         let blocks = MemAbuseBlocks::new(clock.shared());
         suite::abuse_blocks(&blocks, clock.now(), Duration::from_secs(60), &clock).await;
+    }
+
+    #[tokio::test]
+    async fn passes_contract_suite_with_bus() {
+        let clock = ManualClock::default();
+        let bus = MemEventBus::default();
+        let blocks = MemAbuseBlocks::new(clock.shared()).with_bus(Arc::new(bus.clone()));
+        suite::abuse_blocks_signals(&blocks, &bus, clock.now(), Duration::from_secs(60)).await;
     }
 
     #[tokio::test]

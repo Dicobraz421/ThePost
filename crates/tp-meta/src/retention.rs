@@ -209,6 +209,7 @@ async fn resolve_in(
 impl PgMeta {
     /// Политика одного уровня цепочки (без наложения); не задана — все поля `None`.
     pub async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
+        self.idempotent(|| async move {
         let mut tx = begin(&self.pool, tenant).await?;
         let row: Option<PolicyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {POLICY_COLUMNS} FROM policies WHERE tenant_id = $1 AND level = $2 AND object_id = $3"
@@ -221,6 +222,7 @@ impl PgMeta {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         row.map_or(Ok(Policy::default()), PolicyRow::into_policy)
+}).await
     }
 
     /// Задаёт политику уровня целиком (Admin API); политика без заданных полей удаляет уровень.
@@ -230,6 +232,7 @@ impl PgMeta {
         target: PolicyTarget,
         policy: &Policy,
     ) -> Result<()> {
+        self.once(async move {
         let mut tx = begin(&self.pool, tenant).await?;
         if *policy == Policy::default() {
             sqlx::query(
@@ -272,6 +275,7 @@ impl PgMeta {
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
+}).await
     }
 }
 
@@ -285,16 +289,20 @@ impl PolicyResolver for PgMeta {
         account: Option<AccountId>,
         mailbox: Option<MailboxId>,
     ) -> Result<Policy> {
-        let mut tx = begin(&self.pool, tenant).await?;
-        let p = resolve_in(&mut tx, tenant, domain, account, mailbox).await?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(p)
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let p = resolve_in(&mut tx, tenant, domain, account, mailbox).await?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(p)
+        })
+        .await
     }
 
     /// Правило — по цепочке «организация → домен → ящик», выбор пользователя — `accounts.trash_purge`.
     async fn trash_purge(&self, scope: AccountScope) -> Result<TrashPurgeSetting> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
             "SELECT domain_id, trash_purge FROM accounts WHERE tenant_id = $1 AND account_id = $2",
         )
         .bind(scope.tenant.as_uuid())
@@ -302,13 +310,15 @@ impl PolicyResolver for PgMeta {
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
-        let (domain, user) = row.ok_or(Error::NotFound)?;
-        let rule = account_rule(&mut tx, scope, domain).await?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(TrashPurgeSetting {
-            rule,
-            user: user.as_deref().map(parse_purge).transpose()?,
+            let (domain, user) = row.ok_or(Error::NotFound)?;
+            let rule = account_rule(&mut tx, scope, domain).await?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(TrashPurgeSetting {
+                rule,
+                user: user.as_deref().map(parse_purge).transpose()?,
+            })
         })
+        .await
     }
 
     async fn set_user_trash_purge(
@@ -316,8 +326,9 @@ impl PolicyResolver for PgMeta {
         scope: AccountScope,
         mode: Option<TrashPurge>,
     ) -> Result<()> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let domain: Option<Uuid> = sqlx::query_scalar(
+        self.once(async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let domain: Option<Uuid> = sqlx::query_scalar(
             "SELECT domain_id FROM accounts WHERE tenant_id = $1 AND account_id = $2 FOR UPDATE",
         )
         .bind(scope.tenant.as_uuid())
@@ -325,21 +336,23 @@ impl PolicyResolver for PgMeta {
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
-        let domain = domain.ok_or(Error::NotFound)?;
-        if mode.is_some() && !account_rule(&mut tx, scope, domain).await?.user_can_choose {
-            return Err(Error::Forbidden);
-        }
-        sqlx::query(
-            "UPDATE accounts SET trash_purge = $3 WHERE tenant_id = $1 AND account_id = $2",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(mode.map(purge_str))
-        .execute(&mut *tx)
+            let domain = domain.ok_or(Error::NotFound)?;
+            if mode.is_some() && !account_rule(&mut tx, scope, domain).await?.user_can_choose {
+                return Err(Error::Forbidden);
+            }
+            sqlx::query(
+                "UPDATE accounts SET trash_purge = $3 WHERE tenant_id = $1 AND account_id = $2",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(mode.map(purge_str))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(())
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(())
     }
 }
 
@@ -420,6 +433,7 @@ async fn trash_page(
     offset: usize,
     limit: usize,
 ) -> Result<Vec<TrashItem>> {
+    meta.idempotent(|| async move {
     let mut tx = begin(&meta.pool, scope.tenant).await?;
     let rows: Vec<TrashRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {TRASH_COLUMNS} FROM messages
@@ -436,6 +450,7 @@ async fn trash_page(
     .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
     rows.into_iter().map(TrashItem::try_from).collect()
+}).await
 }
 
 /// Письмо, видимое в корзине: кандидат «очистить корзину».
@@ -457,50 +472,51 @@ impl PgMeta {
         hide: &[Uuid],
         erase: &[Uuid],
     ) -> Result<PurgeOutcome> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let current = changelog::lock_modseq(&mut tx, scope).await?;
-        // Под блокировкой `ModSeq` учётной записи: восстановленные и уже скрытые параллельно пропускаются.
-        let still: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT message_id FROM messages
+        self.once(async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let current = changelog::lock_modseq(&mut tx, scope).await?;
+            // Под блокировкой `ModSeq` учётной записи: восстановленные и уже скрытые параллельно пропускаются.
+            let still: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT message_id FROM messages
              WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
                AND trashed_at IS NOT NULL AND hidden_at IS NULL",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind([hide, erase].concat())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let keep = |ids: &[Uuid]| -> Vec<Uuid> {
-            ids.iter()
-                .copied()
-                .filter(|id| still.contains(id))
-                .collect()
-        };
-        let (hide, erase) = (keep(hide), keep(erase));
-        if hide.is_empty() && erase.is_empty() {
-            tx.commit().await.map_err(db_err)?;
-            return Ok(PurgeOutcome {
-                hidden: Vec::new(),
-                erased: Vec::new(),
-                modseq: current,
-            });
-        }
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let hidden: Vec<Removed> = sqlx::query_as(
-            "UPDATE messages SET hidden_at = now(), modseq = $4
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind([hide, erase].concat())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let keep = |ids: &[Uuid]| -> Vec<Uuid> {
+                ids.iter()
+                    .copied()
+                    .filter(|id| still.contains(id))
+                    .collect()
+            };
+            let (hide, erase) = (keep(hide), keep(erase));
+            if hide.is_empty() && erase.is_empty() {
+                tx.commit().await.map_err(db_err)?;
+                return Ok(PurgeOutcome {
+                    hidden: Vec::new(),
+                    erased: Vec::new(),
+                    modseq: current,
+                });
+            }
+            let ms = changelog::bump_modseq(&mut tx, scope).await?;
+            let hidden: Vec<Removed> = sqlx::query_as(
+                "UPDATE messages SET hidden_at = now(), modseq = $4
              WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
              RETURNING message_id, mailbox_id, uid",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(&hide)
-        .bind(to_i64(ms.0)?)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        adjust_refs(&mut tx, scope, &erase, -1).await?;
-        let erased: Vec<Removed> = sqlx::query_as(
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(&hide)
+            .bind(to_i64(ms.0)?)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            adjust_refs(&mut tx, scope, &erase, -1).await?;
+            let erased: Vec<Removed> = sqlx::query_as(
             "DELETE FROM messages WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
              RETURNING message_id, mailbox_id, uid",
         )
@@ -510,58 +526,61 @@ impl PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        let mut boxes: Vec<Uuid> = hidden.iter().chain(&erased).map(|r| r.1).collect();
-        boxes.sort_unstable();
-        boxes.dedup();
-        touch(&mut tx, scope, ms, &boxes).await?;
-        let mut changes = Vec::with_capacity(hidden.len() + erased.len() + boxes.len());
-        let mut events = Vec::with_capacity(hidden.len() + erased.len());
-        for (rows, purged) in [(&hidden, false), (&erased, true)] {
-            for (id, mb, uid) in rows {
-                let mailbox = MailboxId::from_uuid(*mb);
-                changes.push(Change::message(
-                    *id,
-                    Op::Destroyed,
-                    mailbox,
-                    Uid(to_u32(*uid)?),
-                ));
-                let message = MessageId::from_uuid(*id);
-                let kind = if purged {
-                    CoreEventKind::Purged { message }
-                } else {
-                    CoreEventKind::Trashed { message }
-                };
-                events.push(changelog::event(scope, Some(mailbox), kind));
+            let mut boxes: Vec<Uuid> = hidden.iter().chain(&erased).map(|r| r.1).collect();
+            boxes.sort_unstable();
+            boxes.dedup();
+            touch(&mut tx, scope, ms, &boxes).await?;
+            let mut changes = Vec::with_capacity(hidden.len() + erased.len() + boxes.len());
+            let mut events = Vec::with_capacity(hidden.len() + erased.len());
+            for (rows, purged) in [(&hidden, false), (&erased, true)] {
+                for (id, mb, uid) in rows {
+                    let mailbox = MailboxId::from_uuid(*mb);
+                    changes.push(Change::message(
+                        *id,
+                        Op::Destroyed,
+                        mailbox,
+                        Uid(to_u32(*uid)?),
+                    ));
+                    let message = MessageId::from_uuid(*id);
+                    let kind = if purged {
+                        CoreEventKind::Purged { message }
+                    } else {
+                        CoreEventKind::Trashed { message }
+                    };
+                    events.push(changelog::event(scope, Some(mailbox), kind));
+                }
             }
-        }
-        changes.extend(
-            boxes
-                .iter()
-                .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
-        );
-        changelog::log(&mut tx, scope, ms, &changes).await?;
-        changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-        tx.commit().await.map_err(db_err)?;
-        self.signal_log([scope.account]).await;
-        // Что-то скрыто или стёрто: таймер истечения корзины пересчитывает ближайший срок.
-        self.signal(trash_changed(scope)).await;
-        // Порядок — как в запросе.
-        let done = |ids: Vec<Uuid>, rows: &[Removed]| -> Vec<MessageId> {
-            ids.into_iter()
-                .filter(|id| rows.iter().any(|r| r.0 == *id))
-                .map(MessageId::from_uuid)
-                .collect()
-        };
-        Ok(PurgeOutcome {
-            hidden: done(hide, &hidden),
-            erased: done(erase, &erased),
-            modseq: ms,
+            changes.extend(
+                boxes
+                    .iter()
+                    .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
+            );
+            changelog::log(&mut tx, scope, ms, &changes).await?;
+            changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
+            tx.commit().await.map_err(db_err)?;
+            self.signal_log([scope.account]).await;
+            // Что-то скрыто или стёрто: таймер истечения корзины пересчитывает ближайший срок.
+            self.signal(trash_changed(scope)).await;
+            // Порядок — как в запросе.
+            let done = |ids: Vec<Uuid>, rows: &[Removed]| -> Vec<MessageId> {
+                ids.into_iter()
+                    .filter(|id| rows.iter().any(|r| r.0 == *id))
+                    .map(MessageId::from_uuid)
+                    .collect()
+            };
+            Ok(PurgeOutcome {
+                hidden: done(hide, &hidden),
+                erased: done(erase, &erased),
+                modseq: ms,
+            })
         })
+        .await
     }
 
     /// Восстанавливает скрытое письмо (администратор): в исходную папку, её нет — во «Входящие»; тот же
     /// `MessageId`, новый UID. Для пользователя письмо появляется вновь (журнал — создание). Скрытого нет — `None`.
     async fn restore_hidden(&self, scope: AccountScope, id: MessageId) -> Result<Option<Restored>> {
+        self.once(async move {
         let mut tx = begin(&self.pool, scope.tenant).await?;
         changelog::lock_modseq(&mut tx, scope).await?;
         let target: Option<(Option<Uuid>,)> = sqlx::query_as(
@@ -630,6 +649,7 @@ impl PgMeta {
                 modseq: ms,
             },
         }))
+}).await
     }
 }
 
@@ -659,6 +679,7 @@ impl TrashStore for PgMeta {
         ids: &[MessageId],
         hooks: &DecisionHooks,
     ) -> Result<PurgeOutcome> {
+        self.once(async move {
         let mode = PolicyResolver::trash_purge(self, scope).await?.effective();
         // Письма, видимые в корзине, в порядке `ids` без повторов.
         let mut tx = begin(&self.pool, scope.tenant).await?;
@@ -699,9 +720,11 @@ impl TrashStore for PgMeta {
             }
         }
         self.apply_purge(scope, &hide, &erase).await
+}).await
     }
 
     async fn restore(&self, scope: AccountScope, object: TrashObject) -> Result<Restored> {
+        self.once(async move {
         let id = message_of(object)?;
         if let Some(restored) = self.restore_hidden(scope, id).await? {
             return Ok(restored);
@@ -726,22 +749,26 @@ impl TrashStore for PgMeta {
             mailbox: MailboxId::from_uuid(mailbox.ok_or(Error::NotFound)?),
             inserted,
         })
+}).await
     }
 
     async fn expired(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<TrashItem>> {
-        let mut tx = begin_system(&self.pool).await?;
-        let rows: Vec<TrashRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT {TRASH_COLUMNS} FROM messages
+        self.idempotent(|| async move {
+            let mut tx = begin_system(&self.pool).await?;
+            let rows: Vec<TrashRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT {TRASH_COLUMNS} FROM messages
              WHERE trash_expires_at <= $1
              ORDER BY trash_expires_at, tenant_id, account_id, message_id LIMIT $2"
-        )))
-        .bind(now)
-        .bind(limit_arg(limit))
-        .fetch_all(&mut *tx)
+            )))
+            .bind(now)
+            .bind(limit_arg(limit))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            rows.into_iter().map(TrashItem::try_from).collect()
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        rows.into_iter().map(TrashItem::try_from).collect()
     }
 
     async fn defer(
@@ -750,6 +777,7 @@ impl TrashStore for PgMeta {
         object: TrashObject,
         until: OffsetDateTime,
     ) -> Result<()> {
+        self.once(async move {
         let id = message_of(object)?;
         let mut tx = begin(&self.pool, scope.tenant).await?;
         let n = sqlx::query(
@@ -766,6 +794,7 @@ impl TrashStore for PgMeta {
         .rows_affected();
         tx.commit().await.map_err(db_err)?;
         if n == 1 { Ok(()) } else { Err(Error::NotFound) }
+}).await
     }
 }
 
@@ -776,35 +805,38 @@ impl Quota for PgMeta {
     /// Использование — сумма размеров писем учётной записи, включая корзину, без скрытых; лимит — политика
     /// учётной записи по цепочке, иначе [`RetentionConfig::quota_bytes`].
     async fn usage(&self, scope: AccountScope) -> Result<QuotaUsage> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let row: Option<(Uuid, i64, i64)> = sqlx::query_as(
-            "SELECT a.domain_id, coalesce(sum(m.size), 0)::bigint, count(m.message_id)
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let row: Option<(Uuid, i64, i64)> = sqlx::query_as(
+                "SELECT a.domain_id, coalesce(sum(m.size), 0)::bigint, count(m.message_id)
              FROM accounts a
              LEFT JOIN messages m ON m.tenant_id = a.tenant_id AND m.account_id = a.account_id
                                  AND m.hidden_at IS NULL
              WHERE a.tenant_id = $1 AND a.account_id = $2
              GROUP BY a.domain_id",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let (domain, used, messages) = row.ok_or(Error::NotFound)?;
-        let policy = resolve_in(
-            &mut tx,
-            scope.tenant,
-            Some(DomainId::from_uuid(domain)),
-            Some(scope.account),
-            None,
-        )
-        .await?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(QuotaUsage {
-            used_bytes: to_u64(used)?,
-            messages: to_u64(messages)?,
-            limit_bytes: policy.quota_bytes.or(self.cfg.retention.quota_bytes),
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let (domain, used, messages) = row.ok_or(Error::NotFound)?;
+            let policy = resolve_in(
+                &mut tx,
+                scope.tenant,
+                Some(DomainId::from_uuid(domain)),
+                Some(scope.account),
+                None,
+            )
+            .await?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(QuotaUsage {
+                used_bytes: to_u64(used)?,
+                messages: to_u64(messages)?,
+                limit_bytes: policy.quota_bytes.or(self.cfg.retention.quota_bytes),
+            })
         })
+        .await
     }
 }
 

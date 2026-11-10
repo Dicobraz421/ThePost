@@ -339,6 +339,7 @@ impl PgMeta {
         since: ModSeq,
         limit: usize,
     ) -> Result<(Vec<LogRow>, ModSeq, bool)> {
+        self.idempotent(|| async move {
         let limit = limit.max(1);
         let mut tx = begin(&self.pool, scope.tenant).await?;
         let (current, floor): (i64, i64) = sqlx::query_as(
@@ -391,6 +392,7 @@ impl PgMeta {
         };
         tx.commit().await.map_err(db_err)?;
         Ok(out)
+}).await
     }
 }
 

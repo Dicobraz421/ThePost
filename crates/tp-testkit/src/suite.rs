@@ -208,8 +208,8 @@ async fn next_signal(stream: &mut EventStream) -> Option<Event> {
         .expect("сигнал не пришёл")
 }
 
-/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37): `LogAppended`, `MembersChanged`, `Blocked`,
-/// `TrashChanged` приходят
+/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37, CTR-39): `LogAppended`, `MembersChanged`, `Blocked`,
+/// `Unblocked`, `TrashChanged` приходят
 /// в `subscribe_system()` и не приходят подписке учётной записи; `publish(Resync)` — `Invalid`.
 /// «Не пришло» проверяется тем, что первым пришёл сигнал, опубликованный позже.
 pub async fn signals(bus: &dyn EventBus) {
@@ -241,6 +241,12 @@ pub async fn signals(bus: &dyn EventBus) {
         system(
             scope.tenant,
             EventKind::Blocked {
+                subject: BlockSubject::Account(scope.account),
+            },
+        ),
+        system(
+            scope.tenant,
+            EventKind::Unblocked {
                 subject: BlockSubject::Account(scope.account),
             },
         ),
@@ -472,6 +478,18 @@ pub async fn rpc(fx: &RpcFixture) {
 
 // ---------- AbuseBlocks ----------
 
+/// База сроков набора: `now`, округлённый вверх до целой секунды (PostgreSQL хранит микросекунды; база не раньше
+/// `now`, поэтому `base + ttl / 2` не в прошлом), и её опережение `now` (меньше секунды).
+fn whole_second_after(now: OffsetDateTime) -> (OffsetDateTime, Duration) {
+    let floor = now.replace_nanosecond(0).expect("ns");
+    let base = if floor == now {
+        now
+    } else {
+        floor + Duration::from_secs(1)
+    };
+    (base, (base - now).unsigned_abs())
+}
+
 /// Набор проверок `AbuseBlocks`. `now` — текущий момент по часам хранилища, `ttl` — срок блокировок набора
 /// (с [`RealTime`] — с запасом на задержки). Организации набора — новые.
 pub async fn abuse_blocks(
@@ -480,8 +498,8 @@ pub async fn abuse_blocks(
     ttl: Duration,
     wait: &dyn Wait,
 ) {
-    // Сроки — с точностью до секунды (PostgreSQL хранит микросекунды).
-    let at = |d: Duration| now.replace_nanosecond(0).expect("ns") + d;
+    let (base, lead) = whole_second_after(now);
+    let at = |d: Duration| base + d;
     let (tenant, other) = (TenantId::new(), TenantId::new());
     let ip = |s: &str| BlockSubject::Ip(s.parse().expect("ip"));
     let src = ip("203.0.113.7");
@@ -568,7 +586,7 @@ pub async fn abuse_blocks(
     assert_eq!(blocks.blocked(tenant, &in_net).await, Ok(Some(at(ttl))));
 
     // Истёкшие блокировки не действуют; новая блокировка после истечения — с новым сроком.
-    wait.wait(ttl + ttl / 4).await;
+    wait.wait(lead + ttl + ttl / 4).await;
     assert_eq!(blocks.blocked(tenant, &in_net).await, Ok(None));
     assert_eq!(blocks.blocked(tenant, &account).await, Ok(None));
     assert_eq!(blocks.active(tenant).await, Ok(Vec::new()));
@@ -580,6 +598,46 @@ pub async fn abuse_blocks(
         blocks.blocked(tenant, &account).await,
         Ok(Some(at(ttl * 3)))
     );
+}
+
+/// Набор проверок сигналов `AbuseBlocks` (CTR-39): `blocks` публикует в `bus` (шину своей реализации)
+/// `Blocked { subject }` после `block` и `Unblocked { subject }` после `unblock` действующей блокировки, с
+/// организацией блокировки и `account = None`. `now` и `ttl` — как в [`abuse_blocks`]. Организация набора — новая.
+pub async fn abuse_blocks_signals(
+    blocks: &dyn AbuseBlocks,
+    bus: &dyn EventBus,
+    now: OffsetDateTime,
+    ttl: Duration,
+) {
+    let (base, _) = whole_second_after(now);
+    let tenant = TenantId::new();
+    let mut sys = bus.subscribe_system().await.expect("subscribe_system");
+    let signal = |kind| Event {
+        tenant,
+        account: None,
+        kind,
+    };
+    for subject in [
+        BlockSubject::Ip("203.0.113.9".parse().expect("ip")),
+        BlockSubject::net("2001:db8::".parse().expect("ip"), 48).expect("net"),
+        BlockSubject::Account(AccountId::new()),
+    ] {
+        blocks
+            .block(tenant, &subject, base + ttl, "signals")
+            .await
+            .expect("block");
+        assert_eq!(
+            next_signal(&mut sys).await,
+            Some(signal(EventKind::Blocked { subject }))
+        );
+        blocks.unblock(tenant, &subject).await.expect("unblock");
+        assert_eq!(
+            next_signal(&mut sys).await,
+            Some(signal(EventKind::Unblocked { subject })),
+            "снятие блокировки — сигнал"
+        );
+        assert_eq!(blocks.blocked(tenant, &subject).await, Ok(None));
+    }
 }
 
 // ---------- SecretStore ----------

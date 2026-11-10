@@ -423,14 +423,17 @@ impl MessageStore for PgMeta {
         mailbox: MailboxId,
         msg: NewMessage,
     ) -> Result<Inserted> {
-        check_new(scope, &msg)?;
-        let partitions = self.cfg.event_partitions;
-        let inserted = with_tenant(&self.pool, scope.tenant, |tx| {
-            Box::pin(insert_one(tx, partitions, scope, mailbox, msg))
+        self.once(async move {
+            check_new(scope, &msg)?;
+            let partitions = self.cfg.event_partitions;
+            let inserted = with_tenant(&self.pool, scope.tenant, |tx| {
+                Box::pin(insert_one(tx, partitions, scope, mailbox, msg))
+            })
+            .await?;
+            self.signal_log([scope.account]).await;
+            Ok(inserted)
         })
-        .await?;
-        self.signal_log([scope.account]).await;
-        Ok(inserted)
+        .await
     }
 
     async fn insert_batch(
@@ -438,52 +441,59 @@ impl MessageStore for PgMeta {
         tenant: TenantId,
         items: Vec<(AccountScope, MailboxId, NewMessage)>,
     ) -> Result<Vec<Inserted>> {
-        for (scope, _, msg) in &items {
-            if scope.tenant != tenant {
-                return Err(Error::invalid("доставка другой организации"));
-            }
-            check_new(*scope, msg)?;
-        }
-        if items.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Строки учётных записей и папок блокируются по порядку идентификаторов: встречные приёмы
-        // не ждут друг друга по кругу.
-        let mut items: Vec<_> = items.into_iter().enumerate().collect();
-        items
-            .sort_by_key(|(_, (scope, mailbox, _))| (*scope.account.as_uuid(), *mailbox.as_uuid()));
-        let partitions = self.cfg.event_partitions;
-        let accounts: Vec<AccountId> = items
-            .iter()
-            .map(|(_, (scope, _, _))| scope.account)
-            .collect();
-        let inserted = with_tenant(&self.pool, tenant, |tx| {
-            Box::pin(async move {
-                let mut out = Vec::with_capacity(items.len());
-                for (i, (scope, mailbox, msg)) in items {
-                    out.push((i, insert_one(tx, partitions, scope, mailbox, msg).await?));
+        self.once(async move {
+            for (scope, _, msg) in &items {
+                if scope.tenant != tenant {
+                    return Err(Error::invalid("доставка другой организации"));
                 }
-                out.sort_by_key(|(i, _)| *i);
-                Ok(out.into_iter().map(|(_, ins)| ins).collect())
+                check_new(*scope, msg)?;
+            }
+            if items.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Строки учётных записей и папок блокируются по порядку идентификаторов: встречные приёмы
+            // не ждут друг друга по кругу.
+            let mut items: Vec<_> = items.into_iter().enumerate().collect();
+            items.sort_by_key(|(_, (scope, mailbox, _))| {
+                (*scope.account.as_uuid(), *mailbox.as_uuid())
+            });
+            let partitions = self.cfg.event_partitions;
+            let accounts: Vec<AccountId> = items
+                .iter()
+                .map(|(_, (scope, _, _))| scope.account)
+                .collect();
+            let inserted = with_tenant(&self.pool, tenant, |tx| {
+                Box::pin(async move {
+                    let mut out = Vec::with_capacity(items.len());
+                    for (i, (scope, mailbox, msg)) in items {
+                        out.push((i, insert_one(tx, partitions, scope, mailbox, msg).await?));
+                    }
+                    out.sort_by_key(|(i, _)| *i);
+                    Ok(out.into_iter().map(|(_, ins)| ins).collect())
+                })
             })
+            .await?;
+            self.signal_log(accounts).await;
+            Ok(inserted)
         })
-        .await?;
-        self.signal_log(accounts).await;
-        Ok(inserted)
+        .await
     }
 
     async fn get(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let rows: Vec<MessageRow> = sqlx::query_as(select_messages!("AND message_id = $3"))
-            .bind(scope.tenant.as_uuid())
-            .bind(scope.account.as_uuid())
-            .bind(id.as_uuid())
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        let msg = assemble(&mut tx, scope, rows).await?.pop();
-        tx.commit().await.map_err(db_err)?;
-        Ok(msg)
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let rows: Vec<MessageRow> = sqlx::query_as(select_messages!("AND message_id = $3"))
+                .bind(scope.tenant.as_uuid())
+                .bind(scope.account.as_uuid())
+                .bind(id.as_uuid())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            let msg = assemble(&mut tx, scope, rows).await?.pop();
+            tx.commit().await.map_err(db_err)?;
+            Ok(msg)
+        })
+        .await
     }
 
     async fn list(
@@ -493,6 +503,8 @@ impl MessageStore for PgMeta {
         query: MessageQuery,
         limit: usize,
     ) -> Result<Vec<Message>> {
+        let query = &query;
+        self.idempotent(|| async move {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut tx = begin(&self.pool, scope.tenant).await?;
         let base = |sql| {
@@ -502,7 +514,7 @@ impl MessageStore for PgMeta {
                 .bind(mailbox.as_uuid())
                 .bind(limit)
         };
-        let q = match &query {
+        let q = match query {
             MessageQuery::All => base(select_messages!("AND mailbox_id = $3 ORDER BY uid LIMIT $4")),
             MessageQuery::Uids(ranges) => base(select_messages!(
                 "AND mailbox_id = $3 AND EXISTS (SELECT 1 FROM unnest($5::int8[], $6::int8[]) AS r(lo, hi)
@@ -531,6 +543,7 @@ impl MessageStore for PgMeta {
         let out = assemble(&mut tx, scope, rows).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(out)
+}).await
     }
 
     async fn set_flags(
@@ -540,90 +553,94 @@ impl MessageStore for PgMeta {
         op: FlagOp,
         unchanged_since: Option<ModSeq>,
     ) -> Result<FlagsUpdate> {
-        match &op {
-            FlagOp::Add(f) | FlagOp::Remove(f) | FlagOp::Replace(f) => check_flags(f)?,
-        }
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let current = changelog::lock_modseq(&mut tx, scope).await?;
-        let rows: Vec<(Uuid, Uuid, i64, i64, Vec<String>)> = sqlx::query_as(
-            "SELECT message_id, mailbox_id, uid, modseq, flags FROM messages
+        self.once(async move {
+            match &op {
+                FlagOp::Add(f) | FlagOp::Remove(f) | FlagOp::Replace(f) => check_flags(f)?,
+            }
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let current = changelog::lock_modseq(&mut tx, scope).await?;
+            let rows: Vec<(Uuid, Uuid, i64, i64, Vec<String>)> = sqlx::query_as(
+                "SELECT message_id, mailbox_id, uid, modseq, flags FROM messages
              WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3) AND hidden_at IS NULL
              ORDER BY message_id",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(uuids(ids))
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let mut update = FlagsUpdate {
-            modseq: current,
-            ..FlagsUpdate::default()
-        };
-        let mut changed = Vec::new();
-        for (id, mailbox, uid, modseq, flags) in rows {
-            let old: Flags = flags.into_iter().map(parse_flag).collect();
-            if unchanged_since.is_some_and(|u| modseq > i64::try_from(u.0).unwrap_or(i64::MAX)) {
-                update.conflicts.push(MessageId::from_uuid(id));
-                continue;
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(uuids(ids))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let mut update = FlagsUpdate {
+                modseq: current,
+                ..FlagsUpdate::default()
+            };
+            let mut changed = Vec::new();
+            for (id, mailbox, uid, modseq, flags) in rows {
+                let old: Flags = flags.into_iter().map(parse_flag).collect();
+                if unchanged_since.is_some_and(|u| modseq > i64::try_from(u.0).unwrap_or(i64::MAX))
+                {
+                    update.conflicts.push(MessageId::from_uuid(id));
+                    continue;
+                }
+                let new = apply(&op, &old);
+                if new != old {
+                    changed.push((id, MailboxId::from_uuid(mailbox), Uid(to_u32(uid)?), new));
+                }
             }
-            let new = apply(&op, &old);
-            if new != old {
-                changed.push((id, MailboxId::from_uuid(mailbox), Uid(to_u32(uid)?), new));
+            if changed.is_empty() {
+                tx.commit().await.map_err(db_err)?;
+                return Ok(update);
             }
-        }
-        if changed.is_empty() {
-            tx.commit().await.map_err(db_err)?;
-            return Ok(update);
-        }
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let ids: Vec<Uuid> = changed.iter().map(|c| c.0).collect();
-        // Флаги не содержат пробелов (check_flags): набор передаётся строкой.
-        let joined: Vec<String> = changed.iter().map(|c| flags_vec(&c.3).join(" ")).collect();
-        sqlx::query(
-            "UPDATE messages m SET flags = string_to_array(d.f, ' '), modseq = $5
+            let ms = changelog::bump_modseq(&mut tx, scope).await?;
+            let ids: Vec<Uuid> = changed.iter().map(|c| c.0).collect();
+            // Флаги не содержат пробелов (check_flags): набор передаётся строкой.
+            let joined: Vec<String> = changed.iter().map(|c| flags_vec(&c.3).join(" ")).collect();
+            sqlx::query(
+                "UPDATE messages m SET flags = string_to_array(d.f, ' '), modseq = $5
              FROM unnest($3::uuid[], $4::text[]) AS d(id, f)
              WHERE m.tenant_id = $1 AND m.account_id = $2 AND m.message_id = d.id",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(&ids)
-        .bind(joined)
-        .bind(to_i64(ms.0)?)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let mut boxes: Vec<Uuid> = changed.iter().map(|c| *c.1.as_uuid()).collect();
-        boxes.sort_unstable();
-        boxes.dedup();
-        touch(&mut tx, scope, ms, &boxes).await?;
-        let mut changes: Vec<Change> = changed
-            .iter()
-            .map(|(id, mailbox, uid, _)| Change::message(*id, Op::Updated, *mailbox, *uid))
-            .collect();
-        changes.extend(
-            boxes
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(&ids)
+            .bind(joined)
+            .bind(to_i64(ms.0)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let mut boxes: Vec<Uuid> = changed.iter().map(|c| *c.1.as_uuid()).collect();
+            boxes.sort_unstable();
+            boxes.dedup();
+            touch(&mut tx, scope, ms, &boxes).await?;
+            let mut changes: Vec<Change> = changed
                 .iter()
-                .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
-        );
-        changelog::log(&mut tx, scope, ms, &changes).await?;
-        let events: Vec<_> = changed
-            .iter()
-            .map(|(id, mailbox, _, _)| {
-                let message = MessageId::from_uuid(*id);
-                changelog::event(
-                    scope,
-                    Some(*mailbox),
-                    CoreEventKind::FlagsChanged { message },
-                )
-            })
-            .collect();
-        changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-        tx.commit().await.map_err(db_err)?;
-        self.signal_log([scope.account]).await;
-        update.modseq = ms;
-        update.changed = ids.into_iter().map(MessageId::from_uuid).collect();
-        Ok(update)
+                .map(|(id, mailbox, uid, _)| Change::message(*id, Op::Updated, *mailbox, *uid))
+                .collect();
+            changes.extend(
+                boxes
+                    .iter()
+                    .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
+            );
+            changelog::log(&mut tx, scope, ms, &changes).await?;
+            let events: Vec<_> = changed
+                .iter()
+                .map(|(id, mailbox, _, _)| {
+                    let message = MessageId::from_uuid(*id);
+                    changelog::event(
+                        scope,
+                        Some(*mailbox),
+                        CoreEventKind::FlagsChanged { message },
+                    )
+                })
+                .collect();
+            changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
+            tx.commit().await.map_err(db_err)?;
+            self.signal_log([scope.account]).await;
+            update.modseq = ms;
+            update.changed = ids.into_iter().map(MessageId::from_uuid).collect();
+            Ok(update)
+        })
+        .await
     }
 
     async fn copy(
@@ -632,26 +649,31 @@ impl MessageStore for PgMeta {
         ids: &[MessageId],
         to: MailboxId,
     ) -> Result<Vec<Inserted>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let src: Vec<Uuid> = require_all(&mut tx, scope, ids)
-            .await?
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        let inserted = clone_into(&mut tx, scope, ms, &src, to).await?;
-        adjust_refs(&mut tx, scope, &src, 1).await?;
-        let events: Vec<_> = inserted
-            .iter()
-            .map(|i| changelog::event(scope, Some(to), CoreEventKind::Delivered { message: i.id }))
-            .collect();
-        changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-        tx.commit().await.map_err(db_err)?;
-        self.signal_log([scope.account]).await;
-        Ok(inserted)
+        self.once(async move {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let ms = changelog::bump_modseq(&mut tx, scope).await?;
+            let src: Vec<Uuid> = require_all(&mut tx, scope, ids)
+                .await?
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let inserted = clone_into(&mut tx, scope, ms, &src, to).await?;
+            adjust_refs(&mut tx, scope, &src, 1).await?;
+            let events: Vec<_> = inserted
+                .iter()
+                .map(|i| {
+                    changelog::event(scope, Some(to), CoreEventKind::Delivered { message: i.id })
+                })
+                .collect();
+            changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
+            tx.commit().await.map_err(db_err)?;
+            self.signal_log([scope.account]).await;
+            Ok(inserted)
+        })
+        .await
     }
 
     async fn move_to(
@@ -660,16 +682,17 @@ impl MessageStore for PgMeta {
         ids: &[MessageId],
         to: MailboxId,
     ) -> Result<Vec<Inserted>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let found = require_all(&mut tx, scope, ids).await?;
-        let src: Vec<Uuid> = found.iter().map(|(id, _)| *id).collect();
-        let inserted = clone_into(&mut tx, scope, ms, &src, to).await?;
-        // Ссылки на объекты переходят к новым письмам; исходные удаляются (части — каскадом).
-        let removed: Vec<(Uuid, Uuid, i64)> = sqlx::query_as(
+        self.once(async move {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let ms = changelog::bump_modseq(&mut tx, scope).await?;
+            let found = require_all(&mut tx, scope, ids).await?;
+            let src: Vec<Uuid> = found.iter().map(|(id, _)| *id).collect();
+            let inserted = clone_into(&mut tx, scope, ms, &src, to).await?;
+            // Ссылки на объекты переходят к новым письмам; исходные удаляются (части — каскадом).
+            let removed: Vec<(Uuid, Uuid, i64)> = sqlx::query_as(
             "DELETE FROM messages WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
              RETURNING message_id, mailbox_id, uid",
         )
@@ -679,174 +702,183 @@ impl MessageStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        let removed: HashMap<Uuid, (MailboxId, Uid)> = removed
-            .into_iter()
-            .map(|(id, mb, uid)| Ok((id, (MailboxId::from_uuid(mb), Uid(to_u32(uid)?)))))
-            .collect::<Result<_>>()?;
-        let mut boxes: Vec<Uuid> = found.iter().map(|(_, mb)| *mb).collect();
-        boxes.sort_unstable();
-        boxes.dedup();
-        touch(&mut tx, scope, ms, &boxes).await?;
-        let mut changes = Vec::with_capacity(src.len() + boxes.len());
-        let mut events = Vec::with_capacity(src.len());
-        for (old, new) in src.iter().zip(&inserted) {
-            let (from_mailbox, from_uid) = removed.get(old).copied().ok_or(Error::Conflict)?;
-            changes.push(Change::message(*old, Op::Destroyed, from_mailbox, from_uid));
-            events.push(changelog::event(
-                scope,
-                Some(to),
-                CoreEventKind::Moved {
-                    from_message: MessageId::from_uuid(*old),
-                    from_mailbox,
-                    message: new.id,
-                },
-            ));
-        }
-        changes.extend(
-            boxes
-                .iter()
-                .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
-        );
-        changelog::log(&mut tx, scope, ms, &changes).await?;
-        changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-        tx.commit().await.map_err(db_err)?;
-        self.signal_log([scope.account]).await;
-        Ok(inserted)
+            let removed: HashMap<Uuid, (MailboxId, Uid)> = removed
+                .into_iter()
+                .map(|(id, mb, uid)| Ok((id, (MailboxId::from_uuid(mb), Uid(to_u32(uid)?)))))
+                .collect::<Result<_>>()?;
+            let mut boxes: Vec<Uuid> = found.iter().map(|(_, mb)| *mb).collect();
+            boxes.sort_unstable();
+            boxes.dedup();
+            touch(&mut tx, scope, ms, &boxes).await?;
+            let mut changes = Vec::with_capacity(src.len() + boxes.len());
+            let mut events = Vec::with_capacity(src.len());
+            for (old, new) in src.iter().zip(&inserted) {
+                let (from_mailbox, from_uid) = removed.get(old).copied().ok_or(Error::Conflict)?;
+                changes.push(Change::message(*old, Op::Destroyed, from_mailbox, from_uid));
+                events.push(changelog::event(
+                    scope,
+                    Some(to),
+                    CoreEventKind::Moved {
+                        from_message: MessageId::from_uuid(*old),
+                        from_mailbox,
+                        message: new.id,
+                    },
+                ));
+            }
+            changes.extend(
+                boxes
+                    .iter()
+                    .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
+            );
+            changelog::log(&mut tx, scope, ms, &changes).await?;
+            changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
+            tx.commit().await.map_err(db_err)?;
+            self.signal_log([scope.account]).await;
+            Ok(inserted)
+        })
+        .await
     }
 
     async fn to_trash(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let current = changelog::lock_modseq(&mut tx, scope).await?;
-        let trash = by_role(&mut tx, scope, SpecialUse::Trash)
-            .await?
-            .ok_or(Error::NotFound)?;
-        // Отсутствующие и уже лежащие в корзине письма пропускаются.
-        let src: Vec<Uuid> = existing(&mut tx, scope, &uuids(ids), false)
+        self.once(async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let current = changelog::lock_modseq(&mut tx, scope).await?;
+            let trash = by_role(&mut tx, scope, SpecialUse::Trash)
+                .await?
+                .ok_or(Error::NotFound)?;
+            // Отсутствующие и уже лежащие в корзине письма пропускаются.
+            let src: Vec<Uuid> = existing(&mut tx, scope, &uuids(ids), false)
+                .await?
+                .into_iter()
+                .filter(|(_, mb)| mb != trash.as_uuid())
+                .map(|(id, _)| id)
+                .collect();
+            if src.is_empty() {
+                tx.commit().await.map_err(db_err)?;
+                return Ok(current);
+            }
+            let ms = changelog::bump_modseq(&mut tx, scope).await?;
+            let events: Vec<_> = relocate(
+                &mut tx,
+                scope,
+                ms,
+                &src,
+                trash,
+                Some(self.cfg.retention.trash_retention),
+            )
             .await?
             .into_iter()
-            .filter(|(_, mb)| mb != trash.as_uuid())
-            .map(|(id, _)| id)
+            .map(|m| {
+                let message = MessageId::from_uuid(m.id);
+                changelog::event(scope, Some(trash), CoreEventKind::Trashed { message })
+            })
             .collect();
-        if src.is_empty() {
+            changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
             tx.commit().await.map_err(db_err)?;
-            return Ok(current);
-        }
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let events: Vec<_> = relocate(
-            &mut tx,
-            scope,
-            ms,
-            &src,
-            trash,
-            Some(self.cfg.retention.trash_retention),
-        )
-        .await?
-        .into_iter()
-        .map(|m| {
-            let message = MessageId::from_uuid(m.id);
-            changelog::event(scope, Some(trash), CoreEventKind::Trashed { message })
+            self.signal_log([scope.account]).await;
+            Ok(ms)
         })
-        .collect();
-        changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-        tx.commit().await.map_err(db_err)?;
-        self.signal_log([scope.account]).await;
-        Ok(ms)
+        .await
     }
 
     /// Письма возвращаются в исходные папки с теми же `MessageId` и новыми UID; если исходной папки
     /// больше нет — во «Входящие». Письмо не в корзине — `Error::Invalid`.
     async fn restore(&self, scope: AccountScope, ids: &[MessageId]) -> Result<Vec<Inserted>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        let trash = by_role(&mut tx, scope, SpecialUse::Trash)
-            .await?
-            .ok_or(Error::NotFound)?;
-        let inbox = by_role(&mut tx, scope, SpecialUse::Inbox)
-            .await?
-            .ok_or(Error::NotFound)?;
-        let found = require_all(&mut tx, scope, ids).await?;
-        if found.iter().any(|(_, mb)| mb != trash.as_uuid()) {
-            return Err(Error::invalid("письмо не в корзине"));
-        }
-        let src: Vec<Uuid> = found.iter().map(|(id, _)| *id).collect();
-        let targets: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
-            "SELECT m.message_id, mb.mailbox_id FROM messages m
+        self.once(async move {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let ms = changelog::bump_modseq(&mut tx, scope).await?;
+            let trash = by_role(&mut tx, scope, SpecialUse::Trash)
+                .await?
+                .ok_or(Error::NotFound)?;
+            let inbox = by_role(&mut tx, scope, SpecialUse::Inbox)
+                .await?
+                .ok_or(Error::NotFound)?;
+            let found = require_all(&mut tx, scope, ids).await?;
+            if found.iter().any(|(_, mb)| mb != trash.as_uuid()) {
+                return Err(Error::invalid("письмо не в корзине"));
+            }
+            let src: Vec<Uuid> = found.iter().map(|(id, _)| *id).collect();
+            let targets: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+                "SELECT m.message_id, mb.mailbox_id FROM messages m
              LEFT JOIN mailboxes mb ON mb.tenant_id = m.tenant_id AND mb.account_id = m.account_id
                                    AND mb.mailbox_id = m.trashed_from
              WHERE m.tenant_id = $1 AND m.account_id = $2 AND m.message_id = ANY($3)",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(&src)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let target: HashMap<Uuid, MailboxId> = targets
-            .into_iter()
-            .map(|(id, mb)| (id, mb.map_or(inbox, MailboxId::from_uuid)))
-            .collect();
-        // Группы по папке назначения в порядке первого появления.
-        let mut groups: Vec<(MailboxId, Vec<Uuid>)> = Vec::new();
-        for id in &src {
-            let to = target.get(id).copied().unwrap_or(inbox);
-            match groups.iter_mut().find(|(g, _)| *g == to) {
-                Some((_, v)) => v.push(*id),
-                None => groups.push((to, vec![*id])),
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(&src)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let target: HashMap<Uuid, MailboxId> = targets
+                .into_iter()
+                .map(|(id, mb)| (id, mb.map_or(inbox, MailboxId::from_uuid)))
+                .collect();
+            // Группы по папке назначения в порядке первого появления.
+            let mut groups: Vec<(MailboxId, Vec<Uuid>)> = Vec::new();
+            for id in &src {
+                let to = target.get(id).copied().unwrap_or(inbox);
+                match groups.iter_mut().find(|(g, _)| *g == to) {
+                    Some((_, v)) => v.push(*id),
+                    None => groups.push((to, vec![*id])),
+                }
             }
-        }
-        let mut uids = HashMap::new();
-        let mut events = Vec::with_capacity(src.len());
-        for (to, group) in groups {
-            for m in relocate(&mut tx, scope, ms, &group, to, None).await? {
-                uids.insert(m.id, m.uid);
-                let message = MessageId::from_uuid(m.id);
-                events.push(changelog::event(
-                    scope,
-                    Some(to),
-                    CoreEventKind::Moved {
-                        from_message: message,
-                        from_mailbox: trash,
-                        message,
-                    },
-                ));
+            let mut uids = HashMap::new();
+            let mut events = Vec::with_capacity(src.len());
+            for (to, group) in groups {
+                for m in relocate(&mut tx, scope, ms, &group, to, None).await? {
+                    uids.insert(m.id, m.uid);
+                    let message = MessageId::from_uuid(m.id);
+                    events.push(changelog::event(
+                        scope,
+                        Some(to),
+                        CoreEventKind::Moved {
+                            from_message: message,
+                            from_mailbox: trash,
+                            message,
+                        },
+                    ));
+                }
             }
-        }
-        changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-        tx.commit().await.map_err(db_err)?;
-        self.signal_log([scope.account]).await;
-        src.iter()
-            .map(|id| {
-                Ok(Inserted {
-                    id: MessageId::from_uuid(*id),
-                    uid: uids.get(id).copied().ok_or(Error::Conflict)?,
-                    modseq: ms,
+            changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
+            tx.commit().await.map_err(db_err)?;
+            self.signal_log([scope.account]).await;
+            src.iter()
+                .map(|id| {
+                    Ok(Inserted {
+                        id: MessageId::from_uuid(*id),
+                        uid: uids.get(id).copied().ok_or(Error::Conflict)?,
+                        modseq: ms,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
+        .await
     }
 
     async fn expunge_final(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let current = changelog::lock_modseq(&mut tx, scope).await?;
-        // Только письма в корзине, включая скрытые (под блокировкой `ModSeq` учётной записи, как и `restore`):
-        // восстановленные после `TrashStore::expired` и прочие пропускаются.
-        let trash = by_role(&mut tx, scope, SpecialUse::Trash).await?;
-        let src: Vec<Uuid> = existing(&mut tx, scope, &uuids(ids), true)
-            .await?
-            .into_iter()
-            .filter(|(_, mb)| trash.is_some_and(|t| mb == t.as_uuid()))
-            .map(|(id, _)| id)
-            .collect();
-        if src.is_empty() {
-            tx.commit().await.map_err(db_err)?;
-            return Ok(current);
-        }
-        let ms = changelog::bump_modseq(&mut tx, scope).await?;
-        adjust_refs(&mut tx, scope, &src, -1).await?;
-        let removed: Vec<(Uuid, Uuid, i64, bool)> = sqlx::query_as(
+        self.once(async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let current = changelog::lock_modseq(&mut tx, scope).await?;
+            // Только письма в корзине, включая скрытые (под блокировкой `ModSeq` учётной записи, как и `restore`):
+            // восстановленные после `TrashStore::expired` и прочие пропускаются.
+            let trash = by_role(&mut tx, scope, SpecialUse::Trash).await?;
+            let src: Vec<Uuid> = existing(&mut tx, scope, &uuids(ids), true)
+                .await?
+                .into_iter()
+                .filter(|(_, mb)| trash.is_some_and(|t| mb == t.as_uuid()))
+                .map(|(id, _)| id)
+                .collect();
+            if src.is_empty() {
+                tx.commit().await.map_err(db_err)?;
+                return Ok(current);
+            }
+            let ms = changelog::bump_modseq(&mut tx, scope).await?;
+            adjust_refs(&mut tx, scope, &src, -1).await?;
+            let removed: Vec<(Uuid, Uuid, i64, bool)> = sqlx::query_as(
             "DELETE FROM messages WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
              RETURNING message_id, mailbox_id, uid, hidden_at IS NOT NULL",
         )
@@ -856,40 +888,42 @@ impl MessageStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        // Скрытые пользователь уже не видит (журнал показал их удалёнными при скрытии): без записи в журнал.
-        let mut boxes: Vec<Uuid> = removed.iter().filter(|r| !r.3).map(|r| r.1).collect();
-        boxes.sort_unstable();
-        boxes.dedup();
-        touch(&mut tx, scope, ms, &boxes).await?;
-        let mut changes = Vec::with_capacity(removed.len() + boxes.len());
-        let mut events = Vec::with_capacity(removed.len());
-        for (id, mb, uid, hidden) in removed {
-            let mailbox = MailboxId::from_uuid(mb);
-            if !hidden {
-                changes.push(Change::message(
-                    id,
-                    Op::Destroyed,
-                    mailbox,
-                    Uid(to_u32(uid)?),
+            // Скрытые пользователь уже не видит (журнал показал их удалёнными при скрытии): без записи в журнал.
+            let mut boxes: Vec<Uuid> = removed.iter().filter(|r| !r.3).map(|r| r.1).collect();
+            boxes.sort_unstable();
+            boxes.dedup();
+            touch(&mut tx, scope, ms, &boxes).await?;
+            let mut changes = Vec::with_capacity(removed.len() + boxes.len());
+            let mut events = Vec::with_capacity(removed.len());
+            for (id, mb, uid, hidden) in removed {
+                let mailbox = MailboxId::from_uuid(mb);
+                if !hidden {
+                    changes.push(Change::message(
+                        id,
+                        Op::Destroyed,
+                        mailbox,
+                        Uid(to_u32(uid)?),
+                    ));
+                }
+                let message = MessageId::from_uuid(id);
+                events.push(changelog::event(
+                    scope,
+                    Some(mailbox),
+                    CoreEventKind::Purged { message },
                 ));
             }
-            let message = MessageId::from_uuid(id);
-            events.push(changelog::event(
-                scope,
-                Some(mailbox),
-                CoreEventKind::Purged { message },
-            ));
-        }
-        changes.extend(
-            boxes
-                .iter()
-                .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
-        );
-        changelog::log(&mut tx, scope, ms, &changes).await?;
-        changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-        tx.commit().await.map_err(db_err)?;
-        self.signal_log([scope.account]).await;
-        Ok(ms)
+            changes.extend(
+                boxes
+                    .iter()
+                    .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
+            );
+            changelog::log(&mut tx, scope, ms, &changes).await?;
+            changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
+            tx.commit().await.map_err(db_err)?;
+            self.signal_log([scope.account]).await;
+            Ok(ms)
+        })
+        .await
     }
 }
 

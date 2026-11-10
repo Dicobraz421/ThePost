@@ -2,8 +2,10 @@
 //!
 //! Порядок запуска: конфигурация (мягкий режим, неизвестные поля — предупреждение) → телеметрия → хранилище
 //! секретов (OpenBao/Vault по секции `secrets`; секреты конфигурации читаются при запуске и перечитывании) →
-//! PostgreSQL (с ротацией динамических учётных данных) и миграции (от `database.owner`, если задан) → модули →
-//! членство узла и распределитель разделов журнала → BLOB, шина → сертификаты TLS → сервисы ролей (вход, хранилище
+//! PostgreSQL (поиск primary по `database.url` + `urls`, ротация динамических учётных данных; метрики переключения —
+//! в `/metrics`) и миграции (от `database.owner`, если задан) → модули → членство узла и распределитель разделов
+//! журнала → BLOB, шина → ACME (при `acme.enabled`: слушатель HTTP-01, первый выпуск) → сертификаты TLS (продление
+//! ACME — в фоне) → сервисы ролей (вход, хранилище
 //! писем, поиск, очередь SMTP; `services`) → монитор нагрузки узла → роли (`protocols`, `roles`) → служебный HTTP
 //! (`/healthz/ready` — 200, когда готовы все роли узла). Остановка: роли проходят drain, узел покидает членство,
 //! служебный HTTP и фоновые задачи останавливаются последними.
@@ -37,6 +39,7 @@ use tp_smtp::dkim_sign::DkimSign;
 use tp_smtp::{Mode, SmtpConfig, SmtpOutService};
 use tp_sys::{NodeResources, ResourcesConfig};
 
+use crate::acme;
 use crate::infra;
 use crate::modules;
 use crate::protocols::{
@@ -138,7 +141,9 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         "запуск узла"
     );
 
-    let pool = infra::connect_node_db(&cfg, store.clone()).await?;
+    let db = infra::connect_node_db(&cfg, store.clone()).await?;
+    crate::metrics::register_failover(&metrics, db.clone());
+    let pool = db.pool().clone();
     let meta_cfg = (*cfg.section::<MetaConfig>(MetaConfig::SECTION)?).clone();
     let migrations = infra::migration_pool(&cfg, store.as_ref(), &pool).await?;
     if meta_cfg.migrate_on_start {
@@ -182,10 +187,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     )
     .await?;
 
-    // Фоновые задачи узла живут дольше ролей: служебный HTTP отвечает 503 во время drain.
+    // Фоновые задачи узла живут дольше ролей: служебный HTTP отвечает 503 во время drain. Ошибка запуска
+    // останавливает уже запущенные (слушатель HTTP-01, перечитывание сертификатов).
     let aux = CancellationToken::new();
+    let aux_guard = aux.clone().drop_guard();
     let service = (*cfg.section::<ServiceHttpConfig>("service_http")?).clone();
     let tls = cfg.section::<TlsConfig>("tls")?;
+    let bound = Bound::default();
+    let acme = acme::prepare(&cfg, &bound, aux.clone()).await?;
     // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
     let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
         let certs = Arc::new(TlsCerts::load(&tls).await.map_err(|e| {
@@ -204,6 +213,9 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     } else {
         None
     };
+    if let Some(acme) = &acme {
+        acme.spawn(certs.clone(), aux.clone());
+    }
 
     let services = Services::build(Base {
         cfg: &cfg,
@@ -268,7 +280,6 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         gc: blob_cfg.gc.clone(),
         orphans: blob_cfg.orphans.clone(),
     };
-    let bound = Bound::default();
     let mut setup = RoleSetup {
         cfg: &cfg,
         services: &services,
@@ -335,6 +346,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         .map(|t| tokio::spawn(apply_telemetry(reloader.subscribe(), t, aux.clone())));
     tokio::spawn(reloader.run(aux.clone()));
 
+    drop(aux_guard.disarm());
     let task = {
         let health = health.clone();
         let metrics = metrics.clone();

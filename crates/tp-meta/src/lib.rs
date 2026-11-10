@@ -30,6 +30,7 @@ pub mod shards;
 pub mod signals;
 pub mod transport;
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,7 @@ use crate::abuse::AbuseBlocksConfig;
 use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
+use crate::failover::Failover;
 use crate::retention::RetentionConfig;
 use crate::signals::SignalsConfig;
 
@@ -134,11 +136,17 @@ impl std::fmt::Debug for Signals {
 /// в журнал ядра, `MembersChanged` — при изменении состава кластера, `Blocked` — после блокировки,
 /// `TransportChanged` — после изменения настроек транспорта ([`transport`]). Сигнал
 /// at-most-once: ошибка публикации не отменяет зафиксированное изменение (только запись в журнал узла).
+///
+/// Над [`Failover`] ([`PgMeta::from_failover`]) хранилища переживают переключение СУБД: чтения при временном
+/// отказе повторяются с нарастающей паузой до `database.failover.retry_for` (поиск primary и сброс пула —
+/// [`failover`]), записи выполняются один раз — временный отказ (`Unavailable` с `retry_after`) отдаётся
+/// вызывающему, а следующая операция идёт к найденному primary.
 #[derive(Debug, Clone)]
 pub struct PgMeta {
     pool: PgPool,
     cfg: Arc<MetaConfig>,
     bus: Signals,
+    failover: Option<Failover>,
 }
 
 impl PgMeta {
@@ -148,6 +156,45 @@ impl PgMeta {
             pool,
             cfg: Arc::new(cfg),
             bus: Signals::default(),
+            failover: None,
+        }
+    }
+
+    /// Хранилища над пулом `failover` с повтором чтений при переключении СУБД; схема должна быть применена.
+    pub fn from_failover(failover: &Failover, cfg: MetaConfig) -> Self {
+        Self {
+            failover: Some(failover.clone()),
+            ..Self::new(failover.pool().clone(), cfg)
+        }
+    }
+
+    /// Как [`from_failover`](Self::from_failover); при `migrate_on_start` — применение миграций ядра.
+    pub async fn open_failover(failover: &Failover, cfg: MetaConfig) -> Result<Self> {
+        if cfg.migrate_on_start {
+            schema::migrate(failover.pool()).await?;
+        }
+        Ok(Self::from_failover(failover, cfg))
+    }
+
+    /// **Идемпотентная** операция (чтение): над [`Failover`] временный отказ — повтор с нарастающей паузой
+    /// ([`Failover::retry`]), иначе — один раз.
+    pub(crate) async fn idempotent<T, F, Fut>(&self, mut op: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        match &self.failover {
+            Some(fo) => fo.retry(|_| op()).await,
+            None => op().await,
+        }
+    }
+
+    /// Неидемпотентная операция (запись без ключа): один раз; над [`Failover`] временный отказ — проверка
+    /// primary и `Unavailable` с `retry_after` ([`Failover::once`]).
+    pub(crate) async fn once<T>(&self, op: impl Future<Output = Result<T>>) -> Result<T> {
+        match &self.failover {
+            Some(fo) => fo.once(op).await,
+            None => op.await,
         }
     }
 
