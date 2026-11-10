@@ -315,3 +315,14 @@ async fn claim_scenarios() {
     concurrent_claim_once(Arc::new(db.meta.clone())).await;
     db.drop_db().await;
 }
+
+/// Набор `QueueStore::postpone` (META-39, CTR-40) — на своей чистой БД: захват видит записи всех организаций.
+#[tokio::test]
+async fn conformance_postpone() {
+    let Some(db) = common::fresh_meta().await else {
+        return;
+    };
+    let tenant = common::tenant(db.meta.pool()).await;
+    tp_testkit::suite::queue_postpone(&db.meta, tenant).await;
+    db.drop_db().await;
+}

@@ -75,6 +75,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "transport",
         include_str!("../migrations/0016_transport.sql"),
     ),
+    (
+        17,
+        "transport rewrites",
+        include_str!("../migrations/0017_transport_rewrites.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
