@@ -31,6 +31,7 @@ use tp_contracts::role::{
 use tp_sys::NodeResources;
 
 use crate::config::Config;
+use crate::pressure::{ResourceSource, ResourceWatch};
 use crate::service_http::Health;
 use crate::telemetry::Metrics;
 
@@ -52,7 +53,8 @@ pub struct RuntimeConfig {
     pub db_pool_max: u32,
     /// Явные лимиты отдельных ролей вместо рассчитанных. Требует перезапуска.
     pub limits: BTreeMap<Role, RoleLimitsOverride>,
-    /// Период обновления метрики RSS процесса (`15s`); `0s` — метрика не обновляется.
+    /// Период обновления метрики RSS процесса (`15s`), если снимки ресурсов не приходят по триггерам PSI
+    /// ([`RssGauge::run_on`]); `0s` — метрика не обновляется по интервалу.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub rss_interval: Duration,
@@ -540,6 +542,34 @@ impl RssGauge {
             tokio::select! {
                 () = shutdown.cancelled() => return,
                 _ = tick.tick() => {
+                    self.update().await;
+                }
+            }
+        }
+    }
+}
+
+impl RssGauge {
+    /// Обновляет метрику с каждым новым снимком ресурсов, если они приходят по триггерам PSI
+    /// ([`ResourceSource::Pressure`]); иначе (и когда снимки прекратились) — каждые `cfg.rss_interval`.
+    pub async fn run_on(
+        self,
+        resources: &ResourceWatch,
+        cfg: &RuntimeConfig,
+        shutdown: CancellationToken,
+    ) {
+        if resources.source() != ResourceSource::Pressure {
+            return self.run(cfg, shutdown).await;
+        }
+        let mut rx = resources.subscribe();
+        self.update().await;
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return self.run(cfg, shutdown).await;
+                    }
                     self.update().await;
                 }
             }
