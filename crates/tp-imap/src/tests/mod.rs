@@ -171,8 +171,13 @@ impl Env {
 
     /// Клиент новой сессии с зависимостями расширений.
     pub async fn client_ext(&self, tls: bool, ext: Extensions) -> Client {
+        Self::client_ctx(self.ctx(), tls, ext).await
+    }
+
+    /// Клиент новой сессии над заданным контекстом (например, с другой шиной).
+    pub async fn client_ctx(ctx: Arc<SessionCtx>, tls: bool, ext: Extensions) -> Client {
         let (server, client) = tokio::io::duplex(1 << 20);
-        let session = Session::new(self.ctx(), TestConn { io: server, tls }).with_extensions(ext);
+        let session = Session::new(ctx, TestConn { io: server, tls }).with_extensions(ext);
         let task = tokio::spawn(session.run());
         let mut c = Client {
             io: BufReader::new(client),
