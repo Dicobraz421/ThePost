@@ -1,6 +1,7 @@
 //! Общие наборы тестов контрактов: in-memory реализации testkit и настоящие реализации полос
 //! (`tp-meta` — `Membership`, `AbuseBlocks`, сигналы `EventBus`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие `BlobIndex`,
-//! «очистить корзину» `TrashStore::purge` с настройкой `trash.purge`, `TransportStore`,
+//! «очистить корзину» `TrashStore::purge` с настройкой `trash.purge`, `TransportStore` и его таблица переписывания,
+//! перенос получателей `QueueStore::postpone`,
 //! `tp-platform` — `SecretStore`, `tp-cluster` — `Rpc`) проходят одни и те же проверки.
 //!
 //! Время в наборах идёт через [`Wait`]: для testkit — [`ManualClock`] (сдвиг без ожидания), для PostgreSQL
@@ -45,6 +46,7 @@ use tp_contracts::meta::{
     AccountScope, MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, PolicyResolver,
     SpecialUse,
 };
+use tp_contracts::queue::{DsnParams, OutMessage, OutRcpt, QueueStore, RcptStatus};
 use tp_contracts::retention::{
     Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule, TrashPurgeSetting,
     TrashStore, trash_changed,
@@ -53,8 +55,8 @@ use tp_contracts::role::Role;
 use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
 use tp_contracts::secrets::{SecretLease, SecretRef, SecretStore};
 use tp_contracts::transport::{
-    AcceptedDomain, AddressPattern, DestinationPolicy, DomainKind, SourceKind, SourceMatch,
-    TenantTransport, TlsRequirement, TransportStore, TrustedSource,
+    AcceptedDomain, AddressPattern, DestinationPolicy, DomainKind, EnvelopeSide, RewriteRule,
+    SourceKind, SourceMatch, TenantTransport, TlsRequirement, TransportStore, TrustedSource,
 };
 use tp_contracts::{
     AccountId, BlobHash, BlobKey, DomainId, Error, Gen, GroupId, HeldId, MailboxId, MessageId,
@@ -2191,4 +2193,233 @@ pub async fn transport_store(store: &dyn TransportStore) {
     let snap = store.cluster().await.expect("cluster");
     assert_eq!(snap.domain(&domain.name), None);
     assert!(!snap.sources.iter().any(|s| s.name == source.name));
+}
+
+/// Набор проверок таблицы переписывания адресов `TransportStore` (CTR-40): правила — в снимке организации по
+/// возрастанию `from`, общая версия с политиками доменов назначения, ключ — `from` (без учёта регистра),
+/// проверка полей, изоляция организаций. Пишет только две новые организации.
+pub async fn transport_rewrites(store: &dyn TransportStore) {
+    let (tenant, other) = (TenantId::new(), TenantId::new());
+    let pattern = |p: &str| AddressPattern::new(p).expect("pattern");
+    let rule = |from: &str, to: &str| RewriteRule {
+        from: pattern(from),
+        to: pattern(to),
+        sender: true,
+        recipient: true,
+    };
+    let domain = rule("@old.example", "@example.org");
+    let boss = RewriteRule {
+        recipient: false,
+        ..rule("boss@old.example", "ceo@example.org")
+    };
+
+    let t1 = store
+        .put_rewrite(tenant, 0, &domain)
+        .await
+        .expect("put rewrite");
+    assert!(t1 > 0);
+    let route = DestinationPolicy {
+        pattern: "*".into(),
+        tls: TlsRequirement::Opportunistic,
+        smart_host: None,
+        egress_ip: None,
+    };
+    let t2 = store.put_route(tenant, t1, &route).await.expect("route");
+    let t3 = store.put_rewrite(tenant, t2, &boss).await.expect("put");
+    assert!(t3 > t2 && t2 > t1);
+    let snap = store.tenant(tenant).await.expect("tenant");
+    assert_eq!(snap.version, t3);
+    assert_eq!(snap.routes, vec![route.clone()]);
+    assert_eq!(snap.rewrites, vec![domain.clone(), boss.clone()]);
+    assert_eq!(
+        snap.rewrite("Boss@Old.Example", EnvelopeSide::Sender)
+            .as_deref(),
+        Some("ceo@example.org")
+    );
+    assert_eq!(
+        snap.rewrite("boss@old.example", EnvelopeSide::Recipient)
+            .as_deref(),
+        Some("boss@example.org")
+    );
+    assert_eq!(store.tenant(other).await, Ok(TenantTransport::default()));
+
+    // Устаревшая версия — Conflict, поля — Invalid; снимок не меняется.
+    assert_eq!(
+        store.put_rewrite(tenant, t2, &domain).await,
+        Err(Error::Conflict)
+    );
+    let nowhere = RewriteRule {
+        sender: false,
+        recipient: false,
+        ..domain.clone()
+    };
+    assert!(matches!(
+        store.put_rewrite(tenant, t3, &nowhere).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        store
+            .put_rewrite(tenant, t3, &rule("@old.example", "@OLD.example"))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(store.tenant(tenant).await.expect("tenant").version, t3);
+
+    // Замена по ключу `from` (шаблон канонический: регистр не создаёт второго правила).
+    let renamed = rule("@OLD.Example", "@new.example");
+    let t4 = store
+        .put_rewrite(tenant, t3, &renamed)
+        .await
+        .expect("replace");
+    let snap = store.tenant(tenant).await.expect("tenant");
+    assert_eq!(snap.rewrites, vec![renamed.clone(), boss.clone()]);
+    assert_eq!(
+        snap.rewrite("ann@old.example", EnvelopeSide::Recipient)
+            .as_deref(),
+        Some("ann@new.example")
+    );
+
+    // Чужая организация не видит правил; удаление — NotFound для отсутствующего ключа.
+    let o1 = store.put_rewrite(other, 0, &boss).await.expect("other");
+    assert_eq!(
+        store.tenant(other).await.expect("other").rewrites,
+        vec![boss.clone()]
+    );
+    assert_eq!(
+        store
+            .delete_rewrite(tenant, t4, &pattern("x@old.example"))
+            .await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        store.delete_rewrite(tenant, t3, &boss.from).await,
+        Err(Error::Conflict)
+    );
+    let t5 = store
+        .delete_rewrite(tenant, t4, &boss.from)
+        .await
+        .expect("delete");
+    assert_eq!(
+        store.tenant(tenant).await.expect("tenant").rewrites,
+        vec![renamed.clone()]
+    );
+    assert_eq!(
+        store.tenant(other).await.expect("other").rewrites,
+        vec![boss.clone()]
+    );
+    let t6 = store
+        .delete_rewrite(tenant, t5, &renamed.from)
+        .await
+        .expect("delete");
+    store
+        .delete_route(tenant, t6, &route.pattern)
+        .await
+        .expect("delete route");
+    store
+        .delete_rewrite(other, o1, &boss.from)
+        .await
+        .expect("delete other");
+}
+
+// ---------- QueueStore ----------
+
+/// Набор проверок `QueueStore::postpone` (CTR-40): перенос получателя без попытки — `attempts` и `last_error`
+/// не меняются, срок — новый; устаревший захват — `Conflict`, чужой или завершённый получатель — `NotFound`.
+/// Очередь общая: записи набора — со сроками в 1971 году (раньше записей других проверок), захваты набора
+/// берут только свою запись по `id`, лиза — 30 с.
+pub async fn queue_postpone(queue: &dyn QueueStore, tenant: TenantId) {
+    let t0 = OffsetDateTime::UNIX_EPOCH + time::Duration::days(365);
+    let sec = time::Duration::seconds;
+    let lease = Duration::from_secs(30);
+    let id = queue
+        .enqueue(OutMessage {
+            tenant,
+            blob: BlobKey {
+                tenant,
+                hash: fresh_hash(),
+                generation: Gen::INITIAL,
+            },
+            size: 100,
+            from: "a@example.org".into(),
+            dsn: DsnParams::default(),
+            rcpts: vec![OutRcpt::new("b@example.net"), OutRcpt::new("c@example.net")],
+            next_attempt: t0,
+        })
+        .await
+        .expect("enqueue");
+    let claim_own = async |now: OffsetDateTime| {
+        queue
+            .claim(now, 1000, lease)
+            .await
+            .expect("claim")
+            .into_iter()
+            .find(|c| c.claim.id == id)
+    };
+
+    let c1 = claim_own(t0).await.expect("claimed");
+    assert_eq!(c1.rcpts.len(), 2);
+    queue
+        .reschedule(&c1.claim, "b@example.net", t0 + sec(60), "451 later")
+        .await
+        .expect("reschedule");
+    queue
+        .postpone(&c1.claim, "c@example.net", t0 + sec(60))
+        .await
+        .expect("postpone");
+    assert_eq!(
+        queue.postpone(&c1.claim, "x@example.net", t0).await,
+        Err(Error::NotFound)
+    );
+    assert!(claim_own(t0 + sec(45)).await.is_none(), "not due yet");
+
+    let c2 = claim_own(t0 + sec(60)).await.expect("due");
+    let mut got: Vec<_> = c2
+        .rcpts
+        .iter()
+        .map(|r| (r.rcpt.address.as_str(), r.attempts, r.last_error.as_deref()))
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        [
+            ("b@example.net", 1, Some("451 later")),
+            ("c@example.net", 0, None)
+        ]
+    );
+    assert_eq!(
+        queue
+            .postpone(&c1.claim, "b@example.net", t0 + sec(120))
+            .await,
+        Err(Error::Conflict)
+    );
+
+    // Перенос после неудачи сохраняет причину и число попыток; завершённый получатель — NotFound.
+    queue
+        .postpone(&c2.claim, "b@example.net", t0 + sec(120))
+        .await
+        .expect("postpone failed rcpt");
+    let delivered = RcptStatus::Delivered {
+        reply: "250 ok".into(),
+    };
+    assert_eq!(
+        queue
+            .complete(&c2.claim, "c@example.net", delivered.clone())
+            .await,
+        Ok(false)
+    );
+    assert!(claim_own(t0 + sec(100)).await.is_none(), "postponed");
+    let c3 = claim_own(t0 + sec(120)).await.expect("due again");
+    assert_eq!(c3.rcpts.len(), 1);
+    assert_eq!(
+        (c3.rcpts[0].attempts, c3.rcpts[0].last_error.as_deref()),
+        (1, Some("451 later"))
+    );
+    assert_eq!(
+        queue.postpone(&c3.claim, "c@example.net", t0).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        queue.complete(&c3.claim, "b@example.net", delivered).await,
+        Ok(true)
+    );
 }

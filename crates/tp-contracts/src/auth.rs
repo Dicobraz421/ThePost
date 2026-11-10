@@ -76,9 +76,13 @@ pub struct DirGroup {
 }
 
 /// Дополнительный адрес, не принадлежащий записи каталога напрямую (`postmaster@`, перенаправления).
+///
+/// Адрес для всей почты домена (catch-all) — псевдоним с адресом `@domain` (пустая локальная часть): получает
+/// письма на адреса домена, не найденные в каталоге. Порядок разрешения получателя: адрес целиком, адрес без
+/// подадреса (`user+tag` → `user`), `@domain`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirAlias {
-    /// Адрес.
+    /// Адрес `user@domain` или `@domain` (catch-all).
     pub address: String,
     /// `external_id` учётной записи или группы-получателя.
     pub target: String,
