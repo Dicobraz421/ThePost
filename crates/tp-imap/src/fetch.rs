@@ -424,6 +424,27 @@ fn message_at<'m, 'x>(
     }
 }
 
+/// Конверты вложенных `message/rfc822` по путям частей `paths`.
+fn nested_envelopes(
+    parsed: &mail_parser::Message<'_>,
+    body: &BodyPart,
+    paths: Vec<String>,
+) -> HashMap<String, Envelope> {
+    let mut nested = HashMap::new();
+    for p in paths {
+        let nums: Option<Vec<NonZeroU32>> = p.split('.').map(|n| n.parse().ok()).collect();
+        let section = nums.and_then(|n| Vec1::try_from(n).ok()).map(Part);
+        let data = section
+            .and_then(|s| section_bytes(parsed, &Section::Part(s)))
+            .unwrap_or_default();
+        // Вложение в base64 или quoted-printable — конверт по раскодированному.
+        let cte = find_part(body, &p).and_then(|b| b.encoding.clone());
+        let data = decode_cte(cte.as_deref(), &data).unwrap_or(data);
+        nested.insert(p, tp_mailstore::meta::message_meta(&data).envelope);
+    }
+    nested
+}
+
 /// Поля заголовка с именами из `names` (`not` — кроме них) и пустая строка в конце.
 fn header_fields(header: &[u8], names: &[Vec<u8>], not: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -558,6 +579,138 @@ fn internal_date(d: time::OffsetDateTime) -> Option<DateTime> {
     let utc = chrono::FixedOffset::east_opt(0)?;
     let dt = chrono::DateTime::from_timestamp(d.unix_timestamp(), 0)?.with_timezone(&utc);
     DateTime::try_from(dt).ok()
+}
+
+/// Элементы `FETCH` по письму `raw` без хранилища — как в [`Session::fetch`] при загруженном письме (цель fuzz
+/// `fetch`, [`crate::fuzz`]). Паника — нарушен инвариант: диапазон вне данных, ответ не `* 1 FETCH (…)`.
+pub(crate) fn fuzz(items: MacroOrMessageDataItemNames<'static>, uid: bool, raw: &[u8]) {
+    let rev2 = uid;
+    let items = expand(items, uid);
+    let meta = tp_mailstore::meta::message_meta(raw);
+    let parsed = MessageParser::default().parse(raw);
+    let mut paths = Vec::new();
+    rfc822_parts(&meta.body, &mut paths);
+    let nested = parsed
+        .as_ref()
+        .map(|m| nested_envelopes(m, &meta.body, paths))
+        .unwrap_or_default();
+    let ranged = |full: Vec<u8>, p: Option<(u32, NonZeroU32)>| {
+        let data = partial(full.clone(), p);
+        if let Some((origin, len)) = p {
+            let start = (origin as usize).min(full.len());
+            assert!(
+                data.len() <= len.get() as usize,
+                "диапазон длиннее запрошенного"
+            );
+            assert!(full[start..].starts_with(&data), "диапазон не из данных");
+        }
+        data
+    };
+    let binary = |section: &[NonZeroU32]| match (section.is_empty(), &parsed) {
+        (true, _) => Ok(raw.to_vec()),
+        (false, Some(m)) => decode_part(m, section),
+        (false, None) => Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    let mut origins = Origins::new();
+    for item in &items {
+        match item {
+            MessageDataItemName::Flags => out.push(MessageDataItem::Flags(Vec::new())),
+            MessageDataItemName::Uid => out.push(MessageDataItem::Uid(NonZeroU32::MIN)),
+            MessageDataItemName::InternalDate => {}
+            MessageDataItemName::Rfc822Size => out.push(MessageDataItem::Rfc822Size(
+                u32::try_from(raw.len()).unwrap_or(u32::MAX),
+            )),
+            MessageDataItemName::ModSeq => out.push(MessageDataItem::ModSeq(NonZeroU64::MIN)),
+            MessageDataItemName::Envelope => {
+                out.push(MessageDataItem::Envelope(envelope(&meta.envelope, rev2)));
+            }
+            MessageDataItemName::BodyStructure => out.push(MessageDataItem::BodyStructure(
+                body_structure(&meta.body, true, rev2, &nested),
+            )),
+            MessageDataItemName::Body => out.push(MessageDataItem::Body(body_structure(
+                &meta.body, false, rev2, &nested,
+            ))),
+            MessageDataItemName::Rfc822 => {
+                out.push(MessageDataItem::Rfc822(nstring_bytes(raw.to_vec())));
+            }
+            MessageDataItemName::Rfc822Header | MessageDataItemName::Rfc822Text => {
+                let (header, text) = parsed
+                    .as_ref()
+                    .map(|m| Ent::top(m).header_and_text())
+                    .unwrap_or_default();
+                out.push(if *item == MessageDataItemName::Rfc822Header {
+                    MessageDataItem::Rfc822Header(nstring_bytes(header))
+                } else {
+                    MessageDataItem::Rfc822Text(nstring_bytes(text))
+                });
+            }
+            MessageDataItemName::BodyExt {
+                section,
+                partial: p,
+                ..
+            } => {
+                let full = match (section, &parsed) {
+                    (None, _) => raw.to_vec(),
+                    (Some(s), Some(m)) => match section_bytes(m, s) {
+                        Some(data) => {
+                            if matches!(s, Section::HeaderFields(..) | Section::HeaderFieldsNot(..))
+                            {
+                                assert!(data.ends_with(b"\r\n"), "HEADER.FIELDS без пустой строки");
+                            }
+                            data
+                        }
+                        None => Vec::new(),
+                    },
+                    (Some(_), None) => Vec::new(),
+                };
+                out.push(MessageDataItem::BodyExt {
+                    section: section.clone(),
+                    origin: p.map(|(o, _)| o),
+                    data: nstring_bytes(ranged(full, *p)),
+                });
+            }
+            MessageDataItemName::Binary {
+                section,
+                partial: p,
+                ..
+            } => {
+                // Неизвестная кодировка — `NO [UNKNOWN-CTE]` на всю команду.
+                let Ok(full) = binary(section) else { return };
+                let data = ranged(full, *p);
+                let value = if data.contains(&0) {
+                    NString8::Literal8(Literal8 {
+                        data: data.into(),
+                        mode: LiteralMode::Sync,
+                    })
+                } else {
+                    NString8::NString(nstring_bytes(data))
+                };
+                if let Some((origin, _)) = p {
+                    origins.push((out.len(), *origin));
+                }
+                out.push(MessageDataItem::Binary {
+                    section: section.clone(),
+                    value,
+                });
+            }
+            MessageDataItemName::BinarySize { section } => {
+                let Ok(size) = binary(section) else { return };
+                out.push(MessageDataItem::BinarySize {
+                    section: section.clone(),
+                    size: u32::try_from(size.len()).unwrap_or(u32::MAX),
+                });
+            }
+        }
+    }
+    let Ok(items) = Vec1::try_from(out) else {
+        return;
+    };
+    let line = proto::fetch_line(NonZeroU32::MIN, items, &origins);
+    assert!(
+        line.starts_with(b"* 1 FETCH (") && line.ends_with(b")\r\n"),
+        "ответ FETCH"
+    );
 }
 
 impl<T: Transport> Session<T> {
@@ -739,18 +892,7 @@ impl<T: Transport> Session<T> {
             if !paths.is_empty() {
                 let bytes = raw!().to_vec();
                 if let Some(parsed) = MessageParser::default().parse(&bytes) {
-                    for p in paths {
-                        let nums: Option<Vec<NonZeroU32>> =
-                            p.split('.').map(|n| n.parse().ok()).collect();
-                        let section = nums.and_then(|n| Vec1::try_from(n).ok()).map(Part);
-                        let body = section
-                            .and_then(|s| section_bytes(&parsed, &Section::Part(s)))
-                            .unwrap_or_default();
-                        // Вложение в base64 или quoted-printable — конверт по раскодированному.
-                        let cte = find_part(&msg.meta.body, &p).and_then(|b| b.encoding.clone());
-                        let body = decode_cte(cte.as_deref(), &body).unwrap_or(body);
-                        nested.insert(p, tp_mailstore::meta::message_meta(&body).envelope);
-                    }
+                    nested = nested_envelopes(&parsed, &msg.meta.body, paths);
                 }
             }
         }
