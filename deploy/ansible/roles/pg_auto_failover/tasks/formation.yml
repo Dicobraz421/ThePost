@@ -1,5 +1,8 @@
 # Параметры формаций на мониторе после подключения всех узлов данных (плейбук pg-ha.yml).
-# number_sync_standbys = 1 при двух репликах-кандидатах: фиксация ждёт подтверждения одной из них (RPO = 0).
+# Режим сохранности формации (db_durability, решение #272) задаёт number_sync_standbys:
+#   required  → pgaf_number_sync_standbys (1 при двух репликах): без синхронной реплики primary остаётся primary,
+#               фиксация ждёт реплику (RPO = 0);
+#   preferred → 0: без реплик primary переходит в wait_primary, synchronous_standby_names пуст, запись асинхронная.
 ---
 - name: Read formation settings
   community.postgresql.postgresql_query:
@@ -17,19 +20,23 @@
     query: SELECT pgautofailover.set_formation_number_sync_standbys(%(formation)s, %(n)s)
     named_args:
       formation: "{{ item.formationid }}"
-      n: "{{ pgaf_formations_wanted[item.formationid] | int }}"
+      n: "{{ pgaf_sync_wanted }}"
     port: "{{ pgaf_port }}"
   loop: "{{ pgaf_formation_settings.query_result }}"
   loop_control:
     label: "{{ item.formationid }}"
   when:
     - item.formationid in pgaf_formations_wanted
-    - item.number_sync_standbys | int != pgaf_formations_wanted[item.formationid] | int
+    - item.number_sync_standbys | int != pgaf_sync_wanted | int
   become: true
   become_user: postgres
   vars:
-    # Формация → number_sync_standbys по узлам данных (pgaf_formation, pgaf_number_sync_standbys в инвентаре).
+    # Формация → (db_durability, pgaf_number_sync_standbys) по узлам данных (значения инвентаря, иначе defaults).
     pgaf_nodes_vars: "{{ groups['pgaf_nodes'] | default([]) | map('extract', hostvars) | list }}"
     pgaf_formations_wanted: >-
       {{ dict(pgaf_nodes_vars | map(attribute='pgaf_formation', default='default')
-         | zip(pgaf_nodes_vars | map(attribute='pgaf_number_sync_standbys', default=pgaf_number_sync_standbys))) }}
+         | zip(pgaf_nodes_vars | map(attribute='db_durability', default=db_durability)
+               | zip(pgaf_nodes_vars | map(attribute='pgaf_number_sync_standbys', default=pgaf_number_sync_standbys)))) }}
+    pgaf_sync_wanted: >-
+      {{ (pgaf_formations_wanted[item.formationid][0] == 'required')
+         | ternary(pgaf_formations_wanted[item.formationid][1] | int, 0) }}

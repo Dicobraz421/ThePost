@@ -11,6 +11,9 @@
    оператором CloudNativePG 1.26+) → Cluster `t-db`, Pooler `t-db-pooler-rw`; в ConfigMap `database.url` — Pooler,
    `pgbouncer: true`, `direct_url` — `t-db-rw`. С `--set cnpg.pooler.enabled=false` — `url` — `t-db-rw`, без `pgbouncer`.
 4. `helm template t deploy/helm/thepost` (по умолчанию) → ресурсов CloudNativePG нет, `database.url` — из values.
+5. Режим сохранности (решение #272): `helm template t deploy/helm/thepost --set cnpg.enabled=true` → в Cluster
+   `synchronous.dataDurability: required`; с `--set cnpg.db_durability=preferred` → `preferred`; с
+   `--set cnpg.db_durability=x` → ошибка «cnpg.db_durability: required или preferred».
 
 ## Enterprise-ВМ: pg_auto_failover
 1. Инвентарь по `deploy/ansible/inventory-ha.example.yml` (монитор, pg1–pg3, сертификаты с SAN — имя узла), пароли в
@@ -36,6 +39,19 @@
    управления) → через ≈ 10 с прежний primary — только чтение (`SHOW transaction_read_only` → `on`), новый primary —
    на другом узле не раньше, чем через `primary_demote_timeout` (15 с).
 8. Плановое переключение: `pg_autoctl perform switchover --pgdata …` на мониторе → узлы thepost продолжают работу.
+9. Режим сохранности `required` (по умолчанию, решение #272): `pg_autoctl show settings` → `number_sync_standbys 1`
+   у формации `default`, `0` у `shard2` (`db_durability: preferred`, один узел). Остановить одну реплику
+   (`systemctl stop pgautofailover` на pg3) → запись идёт. Остановить вторую (pg2) → `pg_autoctl show state`: primary
+   остаётся `primary` (не `wait_primary`), `SHOW synchronous_standby_names` на primary — не пусто;
+   на primary `sudo -u postgres psql -c 'SELECT txid_current()'` висит на фиксации (Ctrl+C — «canceling wait for
+   synchronous replication»), узлы thepost — SMTP 4xx на приём, IMAP/JMAP-чтение работает. Запустить pg2 →
+   висящие фиксации завершаются, приём писем возобновляется, писем не потеряно.
+10. Режим `preferred`: `db_durability: preferred` в инвентаре, повторный прогон `pg-ha.yml` → `number_sync_standbys 0`
+    (`changed` только у задачи «Set number of synchronous standbys»). Остановить обе реплики → primary — `wait_primary`,
+    `synchronous_standby_names` пуст, запись и приём писем продолжаются. Запустить реплики → после догоняния primary —
+    `primary`, `synchronous_standby_names` — `ANY 1 (…)`. Вернуть `required`, прогон → `number_sync_standbys 1`.
+11. Неверные значения: `db_durability: x` или `required` с `pgaf_number_sync_standbys: 0` → прогон останавливается на
+    задаче «Check durability mode».
 
 ## Enterprise-K8s: CloudNativePG
 1. Оператор (`helm install cnpg cnpg/cloudnative-pg …`), секреты `thepost-db-owner`, `thepost-db`,
@@ -46,6 +62,13 @@
    `tp_db_failover_last_switch_seconds` ≤ 30 (или время недоступности службы `thepost-db-rw`), узлы thepost
    продолжают работу, писем не потеряно.
 4. Плановое: `kubectl cnpg promote thepost-db thepost-db-2` → то же.
+5. Режим `required` (по умолчанию): `kubectl get cluster thepost-db -o jsonpath='{.spec.postgresql.synchronous}'` →
+   `dataDurability: required`. Остановить обе реплики (`kubectl cnpg fencing on thepost-db thepost-db-2`, то же для
+   `-3`) → фиксации на primary ждут (`SHOW synchronous_standby_names` не пусто), thepost — SMTP 4xx, чтение работает;
+   `fencing off` → фиксации завершаются, писем не потеряно.
+6. Режим `preferred`: `helm upgrade … --set cnpg.db_durability=preferred` → `dataDurability: preferred`; те же реплики
+   под fencing → `synchronous_standby_names` пуст, запись и приём писем продолжаются; `fencing off` → снова
+   `ANY 1 (…)`. Вернуть `required`.
 
 ## SMB: PostgreSQL без pg_ctlcluster
 1. `ansible-playbook -i inventory.yml deploy/ansible/smb.yml` поверх существующей установки → PostgreSQL перезапущен
