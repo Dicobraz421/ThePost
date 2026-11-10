@@ -10,6 +10,9 @@
 //! - внешние адреса пересылки из результата `ingest` (`Ingested::forward`, решение 2026-10-31-ingest-envelope)
 //!   ставит в очередь [`Outbound`].
 //!
+//! Отправка вне сессии SMTP (JMAP `EmailSubmission/set`) — [`Delivery::submit`] и `impl Outbound for Delivery`
+//! (CMP-04): локальные получатели доставляются сразу тем же `ingest`, внешние — в очередь; статус по получателю.
+//!
 //! Каталог (псевдонимы, адреса учётных записей, группы) читается полным снимком и кэшируется на
 //! `delivery.directory_refresh`; учётная запись — [`AccountStore::by_login`]. Проверки SPF, DKIM, DMARC и ARC
 //! входящей почты — [`crate::authcheck`]: их заголовки добавляются к письму, письмо с проваленным DMARC
@@ -313,13 +316,13 @@ impl Delivery {
     }
 
     /// Разрешает всех получателей конверта: доставки (по одной на учётную запись) и внешние адреса.
-    async fn prepare(&self, env: &Envelope, junk: bool) -> Result<Prepared> {
+    async fn prepare(&self, id: &str, rcpts: &[String], junk: bool) -> Result<Prepared> {
         let mut out = Prepared {
             deliveries: Vec::new(),
             external: Vec::new(),
             failed: Vec::new(),
         };
-        for rcpt in &env.rcpts {
+        for rcpt in rcpts {
             match self.resolve(rcpt).await? {
                 Resolved::Local(accounts) => {
                     for acc in accounts {
@@ -342,11 +345,15 @@ impl Delivery {
                         ));
                     }
                 }
-                Resolved::External => out.external.push(rcpt.clone()),
-                // Получатель принят на RCPT, но исчез из каталога: письмо ему не доставляется,
-                // отправителю — уведомление.
+                Resolved::External => {
+                    if !out.external.iter().any(|x| x.eq_ignore_ascii_case(rcpt)) {
+                        out.external.push(rcpt.clone());
+                    }
+                }
+                // Получатель принят на RCPT, но исчез из каталога (или неизвестен при отправке из JMAP):
+                // письмо ему не доставляется, отправителю — уведомление.
                 Resolved::Unknown => {
-                    tracing::warn!(id = %env.id, "smtp: получатель исчез после RCPT");
+                    tracing::warn!(%id, "smtp: локальный получатель не найден");
                     out.failed.push(dsn::Recipient::new(
                         rcpt.clone(),
                         dsn::Action::Failed,
@@ -399,7 +406,7 @@ impl Delivery {
 
     async fn ingest(
         &self,
-        env: &Envelope,
+        mail_from: &str,
         raw: Bytes,
         deliveries: Vec<MailDelivery>,
         received_at: OffsetDateTime,
@@ -408,7 +415,7 @@ impl Delivery {
             .store
             .ingest(IngestRequest {
                 tenant: self.deps.tenant,
-                mail_from: env.mail_from.clone(),
+                mail_from: mail_from.to_owned(),
                 raw: Box::pin(futures::stream::once(async move { Ok(raw) })),
                 deliveries,
                 received_at,
@@ -420,14 +427,15 @@ impl Delivery {
     /// уведомление).
     async fn ingest_all(
         &self,
-        env: &Envelope,
+        id: &str,
+        mail_from: &str,
         raw: Bytes,
         mut deliveries: Vec<(String, MailDelivery)>,
         received_at: OffsetDateTime,
         failed: &mut Vec<dsn::Recipient>,
     ) -> Result<Ingested> {
         let all = deliveries.iter().map(|(_, d)| d.clone()).collect();
-        match self.ingest(env, raw.clone(), all, received_at).await {
+        match self.ingest(mail_from, raw.clone(), all, received_at).await {
             Err(Error::QuotaExceeded) => {}
             other => return other,
         }
@@ -444,7 +452,7 @@ impl Delivery {
             match quota.check(scope, raw.len() as u64).await {
                 Ok(()) => fits.push(d),
                 Err(Error::QuotaExceeded) => {
-                    tracing::warn!(id = %env.id, account = %d.account, "smtp: ящик переполнен, письмо не доставлено");
+                    tracing::warn!(%id, account = %d.account, "smtp: ящик переполнен, письмо не доставлено");
                     // Копия точки принятия решений (без адреса) уведомления не даёт.
                     if !rcpt.is_empty() && !full.contains(&rcpt) {
                         full.push(rcpt);
@@ -456,7 +464,7 @@ impl Delivery {
         if fits.is_empty() {
             return Err(Error::QuotaExceeded);
         }
-        let out = self.ingest(env, raw, fits, received_at).await?;
+        let out = self.ingest(mail_from, raw, fits, received_at).await?;
         failed.extend(
             full.into_iter()
                 .map(|r| dsn::Recipient::new(r, dsn::Action::Failed, "552 5.2.2 mailbox full")),
@@ -465,20 +473,23 @@ impl Delivery {
     }
 
     /// Ставит в очередь исходящей почты внешних получателей и пересылки.
-    async fn enqueue(&self, env: &Envelope, rcpts: Vec<String>, raw: Bytes) -> Result<()> {
+    async fn queue_out(
+        &self,
+        id: &str,
+        mail_from: &str,
+        rcpts: Vec<String>,
+        raw: Bytes,
+    ) -> Result<()> {
         if rcpts.is_empty() {
             return Ok(());
         }
         match &self.deps.outbound {
-            Some(q) => {
-                q.enqueue(self.deps.tenant, &env.mail_from, &rcpts, raw)
-                    .await
-            }
+            Some(q) => q.enqueue(self.deps.tenant, mail_from, &rcpts, raw).await,
             None => {
                 // Узел без очереди: внешних получателей submission не принимает (RCPT — 451), здесь остаются
                 // только пересылки модулей (`Ingested::forward`).
                 tracing::warn!(
-                    id = %env.id,
+                    %id,
                     count = rcpts.len(),
                     "smtp: очередь исходящей почты не подключена, пересылка не выполнена"
                 );
@@ -559,7 +570,7 @@ impl Delivery {
                 }
             }
         }
-        let mut prepared = self.prepare(env, junk).await?;
+        let mut prepared = self.prepare(&env.id, &env.rcpts, junk).await?;
         for copy in copies {
             match copy {
                 CopyTo::Mailbox(d) => {
@@ -583,7 +594,8 @@ impl Delivery {
         if !prepared.deliveries.is_empty() {
             forward = self
                 .ingest_all(
-                    env,
+                    &env.id,
+                    &env.mail_from,
                     full.clone(),
                     prepared.deliveries,
                     received_at,
@@ -594,9 +606,11 @@ impl Delivery {
         }
         let mut rcpts = prepared.external;
         rcpts.extend(forward);
-        self.enqueue(env, rcpts, full.clone()).await?;
+        self.queue_out(&env.id, &env.mail_from, rcpts, full.clone())
+            .await?;
         if !failed.is_empty() && !env.mail_from.is_empty() {
-            self.bounce(env, &failed, &full, received_at).await;
+            self.bounce(&env.id, &env.mail_from, &failed, &full, received_at)
+                .await;
         }
         Ok(None)
     }
@@ -604,14 +618,15 @@ impl Delivery {
     /// Уведомление о недоставке после приёма (`250` уже не отменить); сбой — только в журнал.
     async fn bounce(
         &self,
-        env: &Envelope,
+        id: &str,
+        mail_from: &str,
         rcpts: &[dsn::Recipient],
         original: &[u8],
         received_at: OffsetDateTime,
     ) {
         let raw = dsn::build(&dsn::Report {
             hostname: &self.hostname,
-            to: &env.mail_from,
+            to: mail_from,
             envid: None,
             arrival: received_at,
             now: OffsetDateTime::now_utc(),
@@ -619,15 +634,175 @@ impl Delivery {
             rcpts,
             original,
             ret: DsnRet::Headers,
-            id: &env.id,
+            id,
         });
         if let Err(e) = self
-            .send_dsn(self.deps.tenant, &env.mail_from, Bytes::from(raw))
+            .send_dsn(self.deps.tenant, mail_from, Bytes::from(raw))
             .await
         {
-            tracing::warn!(id = %env.id, error = %e, "smtp: уведомление о недоставке не отправлено");
+            tracing::warn!(%id, error = %e, "smtp: уведомление о недоставке не отправлено");
         }
     }
+
+    /// Отправка от имени пользователя вне сессии SMTP (JMAP `EmailSubmission/set`, CMP-04): получатели в
+    /// локальных доменах (`delivery.local_domains` и каталог: домены, адреса, псевдонимы, группы)
+    /// доставляются сразу через [`MailStore::ingest`] — как входящая почта, без очереди, MX, MTA-STS и DANE;
+    /// внешние — в очередь исходящей почты ([`Deps::outbound`]) письмом `raw` без изменений.
+    ///
+    /// Неизвестный локальный адрес и переполненный ящик — статус [`RcptStatus::Failed`] и уведомление о
+    /// недоставке отправителю (как для входящей почты). Ошибка хранилища, каталога или очереди — `Err`
+    /// (отправка не выполнена, повтор безопасен: локальные получатели обрабатываются первыми).
+    /// Другая организация (`tenant` ≠ `Deps::tenant`) — все получатели в очередь, как до CMP-04.
+    pub async fn submit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<Submitted> {
+        let id = crate::server::next_id();
+        if tenant != self.deps.tenant {
+            let q = self.deps.outbound.as_ref().ok_or_else(no_outbound)?;
+            q.enqueue(tenant, mail_from, rcpts, raw).await?;
+            return Ok(Submitted {
+                id,
+                rcpts: rcpts
+                    .iter()
+                    .map(|r| (r.clone(), RcptStatus::Queued))
+                    .collect(),
+            });
+        }
+        let prepared = self.prepare(&id, rcpts, false).await?;
+        if !prepared.external.is_empty() && self.deps.outbound.is_none() {
+            return Err(no_outbound());
+        }
+        let received_at = OffsetDateTime::now_utc();
+        let mut failed = prepared.failed;
+        let mut forward = Vec::new();
+        if !prepared.deliveries.is_empty() {
+            let mut full = self
+                .submit_headers(&id, mail_from, rcpts, received_at)
+                .into_bytes();
+            full.extend_from_slice(&raw);
+            let local: Vec<String> = prepared.deliveries.iter().map(|(r, _)| r.clone()).collect();
+            match self
+                .ingest_all(
+                    &id,
+                    mail_from,
+                    Bytes::from(full),
+                    prepared.deliveries,
+                    received_at,
+                    &mut failed,
+                )
+                .await
+            {
+                Ok(ingested) => forward = ingested.forward,
+                // Все ящики переполнены: письмо принято отправкой, отправителю — уведомление.
+                Err(Error::QuotaExceeded) => {
+                    for r in local {
+                        if !failed.iter().any(|f| f.address == r) {
+                            failed.push(dsn::Recipient::new(
+                                r,
+                                dsn::Action::Failed,
+                                "552 5.2.2 mailbox full",
+                            ));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let statuses = rcpts
+            .iter()
+            .map(|r| {
+                let status =
+                    if let Some(f) = failed.iter().find(|f| f.address.eq_ignore_ascii_case(r)) {
+                        RcptStatus::Failed(f.reply.clone())
+                    } else if prepared.external.iter().any(|x| x.eq_ignore_ascii_case(r)) {
+                        RcptStatus::Queued
+                    } else {
+                        RcptStatus::Delivered
+                    };
+                (r.clone(), status)
+            })
+            .collect();
+        let mut out = prepared.external;
+        out.extend(forward);
+        self.queue_out(&id, mail_from, out, raw.clone()).await?;
+        if !failed.is_empty() && !mail_from.is_empty() {
+            self.bounce(&id, mail_from, &failed, &raw, received_at)
+                .await;
+        }
+        tracing::info!(%id, count = rcpts.len(), "smtp: отправка вне сессии обработана");
+        Ok(Submitted {
+            id,
+            rcpts: statuses,
+        })
+    }
+
+    /// Заголовки трассировки письма, отправленного вне сессии SMTP ([`Delivery::submit`]).
+    fn submit_headers(
+        &self,
+        id: &str,
+        mail_from: &str,
+        rcpts: &[String],
+        received_at: OffsetDateTime,
+    ) -> String {
+        let date = mail_builder::headers::date::Date::new(received_at.unix_timestamp()).to_rfc822();
+        let mut h = format!(
+            "Return-Path: <{}>\r\nReceived: by {} (The Post) id {id}",
+            clean(mail_from),
+            self.hostname,
+        );
+        if let [rcpt] = rcpts {
+            h.push_str(&format!("\r\n\tfor <{}>", clean(rcpt)));
+        }
+        h.push_str(&format!(";\r\n\t{date}\r\n"));
+        h
+    }
+}
+
+/// Статус доставки одному получателю при отправке вне сессии SMTP ([`Delivery::submit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RcptStatus {
+    /// Доставлено в локальный ящик.
+    Delivered,
+    /// Поставлено в очередь исходящей почты (внешний адрес).
+    Queued,
+    /// Не доставлено (неизвестный адрес, переполненный ящик): ответ SMTP; отправителю — уведомление.
+    Failed(String),
+}
+
+/// Итог [`Delivery::submit`]: идентификатор отправки и статус по каждому получателю в порядке запроса.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submitted {
+    /// Идентификатор (журналы, заголовок `Received`).
+    pub id: String,
+    /// Получатель → статус.
+    pub rcpts: Vec<(String, RcptStatus)>,
+}
+
+/// Отправка через [`Delivery`]: локальные получатели — сразу в ящики, внешние — в очередь (CMP-04).
+/// Приложение подключает её вместо [`crate::queue::Queue`] для JMAP `EmailSubmission/set`.
+#[async_trait]
+impl Outbound for Delivery {
+    async fn enqueue(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<()> {
+        self.submit(tenant, mail_from, rcpts, raw).await.map(|_| ())
+    }
+}
+
+/// Внешний получатель на узле без очереди исходящей почты.
+fn no_outbound() -> Error {
+    tracing::warn!(
+        "smtp: очередь исходящей почты не подключена, внешним адресам отправка недоступна"
+    );
+    Error::UNAVAILABLE
 }
 
 /// Уведомление о доставке: локальному адресату — во «Входящие», внешнему — в очередь исходящей почты.
