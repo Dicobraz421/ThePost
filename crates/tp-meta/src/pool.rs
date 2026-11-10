@@ -15,6 +15,9 @@
 //! без пароля, значение читается из [`SecretStore`] при создании пула. Пароль в адресе — только профиль dev.
 //! Динамические учётные данные (database secrets engine, [`PoolConfig::dynamic_credentials`], META-18) —
 //! пул [`connect_rotating`] с продлением аренды и сменой учётных данных без остановки ролей ([`crate::credentials`]).
+//!
+//! Адрес primary — `url` или список `url` + [`PoolConfig::urls`] (первый доступный для записи); поведение при
+//! переключении СУБД ([`PoolConfig::failover`]) — [`crate::failover`] (META-25).
 
 use std::fmt;
 use std::future::Future;
@@ -33,6 +36,7 @@ use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{Error, Result, TenantId};
 
 use crate::credentials::{self, DynamicCredentials, Rotated, Rotation};
+use crate::failover::{FailoverConfig, Target};
 use crate::schema::{begin, begin_system, db_err};
 
 /// Секция конфигурации пула соединений `database` (SRS 5.5). Все параметры требуют перезапуска.
@@ -50,6 +54,13 @@ pub struct PoolConfig {
     /// Адрес PostgreSQL или PgBouncer без пароля (`postgres://user@host:port/db`); обязателен.
     /// Пароль в адресе — только профиль dev.
     pub url: String,
+    /// Другие адреса кластера (без пароля): узел выбирает первый доступный для записи из `url` и `urls`
+    /// (семантика `target_session_attrs=read-write`, [`crate::failover`]); из адресов списка берутся хост,
+    /// порт и имя БД, учётные данные и параметры — из `url`. Пусто — единственный адрес `url` (VIP, DNS,
+    /// прокси, Service Kubernetes).
+    pub urls: Vec<String>,
+    /// Повтор операций и поиск primary при переключении СУБД (`database.failover`).
+    pub failover: FailoverConfig,
     /// Пароль роли — ссылка на секрет в хранилище (`{ secret: "<путь>#<поле>" }`), общий для `url` и
     /// `direct_url`. Не задан — вход без пароля (сертификат клиента; `trust` в dev).
     pub password: Option<SecretRef>,
@@ -95,6 +106,8 @@ impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             url: String::new(),
+            urls: Vec::new(),
+            failover: FailoverConfig::default(),
             password: None,
             dynamic_credentials: None,
             direct_url: None,
@@ -117,6 +130,8 @@ impl fmt::Debug for PoolConfig {
     // Адрес в dev может содержать пароль — в журнал не попадает; ссылка на секрет — не секрет.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PoolConfig")
+            .field("urls", &self.urls.len())
+            .field("failover", &self.failover)
             .field("password", &self.password)
             .field("dynamic_credentials", &self.dynamic_credentials)
             .field("owner", &self.owner)
@@ -159,13 +174,27 @@ impl PoolConfig {
     /// `Transport::Plaintext` — хотя бы один адрес открыт (только профиль dev с `tls.allow_plaintext`).
     pub fn check(&self) -> Result<Transport> {
         self.check_credentials()?;
+        self.failover.check()?;
         let (_, mut transport) = self.options(&self.url, self.pgbouncer)?;
+        for url in &self.urls {
+            if self.options(url, self.pgbouncer)?.1 == Transport::Plaintext {
+                transport = Transport::Plaintext;
+            }
+        }
         if let Some(direct) = &self.direct_url
             && self.options(direct, false)?.1 == Transport::Plaintext
         {
             transport = Transport::Plaintext;
         }
         Ok(transport)
+    }
+
+    /// Адреса кандидатов в primary: `url`, затем `urls`.
+    pub(crate) fn targets(&self) -> Result<Vec<Target>> {
+        std::iter::once(&self.url)
+            .chain(&self.urls)
+            .map(|url| Ok(Target::new(self.options(url, self.pgbouncer)?.0)))
+            .collect()
     }
 
     /// Пароль и динамические учётные данные не заданы вместе; параметры ротации; имя владельца схемы.
@@ -342,7 +371,15 @@ pub async fn connect(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Result<PgPo
 /// Пул узла: как [`connect`], а с [`PoolConfig::dynamic_credentials`] — с задачей ротации учётных данных
 /// ([`crate::credentials`]): аренда продлевается, при отказе — новые учётные данные для новых соединений без
 /// остановки ролей. Задача завершается с закрытием пула ([`PgPool::close`]).
+///
+/// С [`PoolConfig::urls`] — к первому доступному для записи адресу (выбор при запуске); повтор операций при
+/// переключении СУБД — пул [`crate::failover::connect_failover`].
 pub async fn connect_rotating(cfg: &PoolConfig, secrets: Arc<dyn SecretStore>) -> Result<PgPool> {
+    if !cfg.urls.is_empty() {
+        return crate::failover::connect_failover(cfg, secrets)
+            .await
+            .map(|f| f.pool().clone());
+    }
     if cfg.dynamic_credentials.is_none() {
         return connect(cfg, secrets.as_ref()).await;
     }
@@ -359,22 +396,46 @@ pub(crate) async fn rotating_pool(
     cfg: &PoolConfig,
     secrets: Arc<dyn SecretStore>,
 ) -> Result<PgPool> {
+    rotating_pool_with(cfg, secrets, Rotated::default()).await
+}
+
+/// Пул узла без открытия соединения: соединения, открытые до отметки `reset` (смена учётных данных или
+/// адреса primary), закрываются при выдаче; с динамическими учётными данными — с задачей ротации.
+pub(crate) async fn node_pool(
+    cfg: &PoolConfig,
+    secrets: Arc<dyn SecretStore>,
+    reset: Rotated,
+) -> Result<PgPool> {
+    if cfg.dynamic_credentials.is_some() {
+        return rotating_pool_with(cfg, secrets, reset).await;
+    }
+    let opts = credentials_options(cfg, &cfg.url, cfg.pgbouncer, secrets.as_ref()).await?;
+    Ok(hooked_pool(cfg, opts, reset))
+}
+
+/// Ленивый пул с закрытием соединений, открытых до отметки `reset`.
+fn hooked_pool(cfg: &PoolConfig, opts: PgConnectOptions, reset: Rotated) -> PgPool {
+    cfg.pool_options()
+        .before_acquire(move |_conn, meta| {
+            let keep = reset.current(meta.age);
+            Box::pin(async move { Ok(keep) })
+        })
+        .connect_lazy_with(opts)
+}
+
+async fn rotating_pool_with(
+    cfg: &PoolConfig,
+    secrets: Arc<dyn SecretStore>,
+    rotated: Rotated,
+) -> Result<PgPool> {
     cfg.check_credentials()?;
     let Some(dc) = cfg.dynamic_credentials.clone() else {
         return Err(Error::invalid("database.dynamic_credentials не задан"));
     };
     let issued = credentials::issue(&dc, secrets.as_ref()).await?;
     let opts = issued.apply(cfg.open_options(&cfg.url, cfg.pgbouncer, None)?);
-    let rotated = Rotated::default();
-    let hook = rotated.clone();
     // Соединение, открытое до смены учётных данных, закрывается при выдаче из пула (занятые — дорабатывают).
-    let pool = cfg
-        .pool_options()
-        .before_acquire(move |_conn, meta| {
-            let keep = hook.current(meta.age);
-            Box::pin(async move { Ok(keep) })
-        })
-        .connect_lazy_with(opts);
+    let pool = hooked_pool(cfg, opts, rotated.clone());
     let rotation = Rotation {
         cfg: cfg.clone(),
         dc,
