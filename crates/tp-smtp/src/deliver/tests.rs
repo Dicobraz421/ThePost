@@ -711,10 +711,10 @@ async fn submit_full_mailbox_bounces() {
 }
 
 #[tokio::test]
-async fn submit_external_without_queue_fails_before_delivery() {
+async fn submit_mixed_without_queue() {
     let env = Env::new(DecisionHooks::default()).await;
     let d = env.delivery(false);
-    let err = d
+    let out = d
         .submit(
             TenantId::DEFAULT,
             "alice@example.org",
@@ -722,7 +722,117 @@ async fn submit_external_without_queue_fails_before_delivery() {
             Bytes::from_static(OWN),
         )
         .await
+        .expect("submit");
+    // Локальный доставлен, внешнему — временная ошибка; уведомления отправителю нет (статус — у него).
+    assert_eq!(
+        out.rcpts,
+        [
+            ("bob@example.org".to_owned(), RcptStatus::Delivered),
+            (
+                "x@example.net".to_owned(),
+                RcptStatus::Failed("451 4.3.0 outbound queue unavailable".into())
+            ),
+        ]
+    );
+    assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+    assert!(env.inbox("alice@example.org").await.is_empty());
+    // Через `Outbound`: часть доставлена — `Ok`; только внешние — ошибка (повтор безопасен).
+    let ob: Arc<dyn Outbound> = Arc::new(env.delivery(false));
+    ob.enqueue(
+        TenantId::DEFAULT,
+        "alice@example.org",
+        &rcpts(&["bob@example.org", "x@example.net"]),
+        Bytes::from_static(OWN),
+    )
+    .await
+    .expect("enqueue");
+    assert_eq!(env.inbox("bob@example.org").await.len(), 2);
+    let err = ob
+        .enqueue(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &rcpts(&["x@example.net"]),
+            Bytes::from_static(OWN),
+        )
+        .await
         .expect_err("no queue");
     assert!(err.is_retryable(), "{err}");
-    assert!(env.inbox("bob@example.org").await.is_empty());
+    // Другая организация без очереди — все получатели `Failed`.
+    let out = d
+        .submit(
+            TenantId::new(),
+            "alice@example.org",
+            &rcpts(&["bob@example.org"]),
+            Bytes::from_static(OWN),
+        )
+        .await
+        .expect("submit");
+    assert!(matches!(&out.rcpts[0].1, RcptStatus::Failed(r) if r.starts_with("451 4.3.0")));
+}
+
+#[tokio::test]
+async fn forward_to_local_address_without_queue() {
+    // Пересылка модуля на локальный адрес — сразу в ящик, без очереди. Хук пересылает каждую доставку
+    // (и саму пересылку) — повторно в ящик, уже получивший письмо, она не доставляется.
+    let hook = Arc::new(RecordingDecisionHook::new("forward"));
+    hook.set_delivery(Decision::Augment(Augment {
+        headers: vec![],
+        copies: vec![CopyTo::Address("Bob@example.org".into())],
+    }));
+    let env = Env::new(DecisionHooks::new(vec![hook])).await;
+    let d = env.delivery(false);
+    let e = envelope(Mode::Inbound, &["carol@example.org"]);
+    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    assert_eq!(env.inbox("carol@example.org").await.len(), 1);
+    let bob = env.inbox("bob@example.org").await;
+    assert_eq!(bob.len(), 1);
+    assert!(
+        bob[0].starts_with("Return-Path: <sender@example.net>\r\n"),
+        "{}",
+        bob[0]
+    );
+    // Отправка вне сессии: пересылка на локальный адрес — так же сразу.
+    let out = d
+        .submit(
+            TenantId::DEFAULT,
+            "alice@example.org",
+            &rcpts(&["carol@example.org"]),
+            Bytes::from_static(OWN),
+        )
+        .await
+        .expect("submit");
+    assert_eq!(
+        out.rcpts,
+        [("carol@example.org".to_owned(), RcptStatus::Delivered)]
+    );
+    assert_eq!(env.inbox("carol@example.org").await.len(), 2);
+    assert_eq!(env.inbox("bob@example.org").await.len(), 2);
+    assert!(env.queue.0.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn submission_copy_to_local_address() {
+    // Копия точки принятия решений на локальный адрес — в ящик, не в очередь.
+    let hook = Arc::new(RecordingDecisionHook::new("journal"));
+    hook.set_submission(Decision::Augment(Augment {
+        headers: vec![],
+        copies: vec![
+            CopyTo::Address("postmaster@example.org".into()),
+            CopyTo::Address("nobody@example.org".into()),
+        ],
+    }));
+    let env = Env::new(DecisionHooks::default()).await;
+    let mut d = env.delivery(false);
+    d.deps.hooks = DecisionHooks::new(vec![hook]);
+    let mut e = envelope(Mode::Submission, &["bob@example.org"]);
+    e.principal = Some(tp_testkit::principal(
+        TenantId::DEFAULT,
+        "carol@example.org",
+    ));
+    e.mail_from = "carol@example.org".into();
+    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+    assert_eq!(env.inbox("alice@example.org").await.len(), 1);
+    // Неизвестный адрес копии — без уведомления отправителю (адрес копии ему не раскрывается).
+    assert!(env.inbox("carol@example.org").await.is_empty());
 }
