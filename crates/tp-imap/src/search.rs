@@ -245,6 +245,57 @@ fn esearch_line(
     line.into_bytes()
 }
 
+/// Критерии на письмах папки без хранилища (цель fuzz `search`, [`crate::fuzz`]): текстовые условия
+/// «находит» каждое второе письмо. Паника — нарушен инвариант: найденные номера не совпали с `ALL` ответа.
+pub(crate) fn fuzz(
+    criteria: Vec1<SearchKey<'static>>,
+    uid: bool,
+    ret: &[SearchReturn],
+    list: &[Message],
+) {
+    let key = SearchKey::And(criteria);
+    let mut queries = Vec::new();
+    collect_text(&key, &mut queries);
+    let half: HashSet<MessageId> = list.iter().step_by(2).map(|m| m.id).collect();
+    let largest = |n: Option<u32>| NonZeroU32::new(n.unwrap_or(1)).unwrap_or(NonZeroU32::MIN);
+    let ctx = Ctx {
+        last_seq: largest(u32::try_from(list.len()).ok()),
+        last_uid: largest(list.last().map(|m| m.uid.0)),
+        text: queries.into_iter().map(|q| (q, half.clone())).collect(),
+    };
+    let mut nums = Vec::new();
+    for (i, m) in list.iter().enumerate() {
+        let seq = u32::try_from(i + 1).unwrap_or(u32::MAX);
+        let hit = matches(&key, m, seq, &ctx);
+        assert_eq!(
+            matches(&SearchKey::Not(Box::new(key.clone())), m, seq, &ctx),
+            !hit,
+            "NOT не обратил критерий"
+        );
+        if hit {
+            nums.push(if uid { m.uid.0 } else { seq });
+        }
+    }
+    let modseq = uses_modseq(&key).then_some(1);
+    let line = esearch_line(&Tag::unvalidated("a"), uid, ret, &nums, modseq);
+    let line = String::from_utf8(line).unwrap_or_default();
+    assert!(line.ends_with("\r\n"), "ESEARCH без CRLF");
+    // `ALL` — набор номеров, который разбирается обратно в те же номера.
+    if let Some(all) = line.split(" ALL ").nth(1) {
+        let set = all
+            .split([' ', '\r'])
+            .next()
+            .and_then(|s| SequenceSet::try_from(s).ok());
+        let Some(set) = set else {
+            panic!("ALL не разбирается: {line}");
+        };
+        let top = largest(nums.iter().max().copied());
+        for n in 1..=top.get() {
+            assert_eq!(in_set(&set, n, top), nums.contains(&n), "ALL: {line}");
+        }
+    }
+}
+
 impl<T: Transport> Session<T> {
     /// `SEARCH`/`UID SEARCH`, в том числе с `RETURN`.
     pub(crate) async fn search(&mut self, tag: &Tag<'static>, cmd: SearchCmd) -> Result<()> {
