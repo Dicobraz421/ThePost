@@ -441,8 +441,9 @@ impl std::fmt::Debug for IndexerRole {
 }
 
 impl IndexerRole {
-    /// Роль: журнал `events`, индексатор и перестройка; опрос журнала — каждые `poll`; повторяющиеся ошибки —
-    /// в журнал не чаще раза за паузу `log_pause`.
+    /// Роль: журнал `events`, индексатор и перестройка; опрос журнала — каждые `poll`, а раздел с ошибкой —
+    /// к сроку его повтора (`PollReport::retry_in`), если он раньше; повторяющиеся ошибки — в журнал не чаще
+    /// раза за паузу `log_pause`.
     pub fn new(
         events: EventConsumer,
         indexer: Arc<Indexer>,
@@ -507,24 +508,29 @@ impl RoleService for IndexerRole {
 
     async fn run(&self, ctx: RoleCtx) -> Result<()> {
         ctx.ready.set(true);
-        let mut tick = tokio::time::interval(self.poll.max(Duration::from_millis(1)));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut poll_log = RepeatLog::new(self.log_pause);
         let mut pending_log = RepeatLog::new(self.log_pause);
         let mut rebuild_failed = HashMap::new();
+        let mut next = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 () = ctx.shutdown.cancelled() => break,
-                _ = tick.tick() => {}
+                () = tokio::time::sleep_until(next) => {}
             }
+            let started = tokio::time::Instant::now();
             let polled = self
                 .events
                 .poll(self.indexer.as_ref() as &dyn EventSink)
-                .await
-                .map(drop);
-            log_step(&mut poll_log, polled, "опрос журнала событий");
+                .await;
+            let retry_at = polled
+                .as_ref()
+                .ok()
+                .and_then(|r| r.retry_in)
+                .map(|r| tokio::time::Instant::now() + r);
+            log_step(&mut poll_log, polled.map(drop), "опрос журнала событий");
             let pending = self.rebuild_pending(&mut rebuild_failed).await;
             log_step(&mut pending_log, pending, "чтение запросов перестройки");
+            next = next_poll(started, self.poll, retry_at);
         }
         if let Err(e) = self.events.release_all(SUBSCRIBER).await {
             tracing::warn!(error = %e, "indexer: лизы разделов не отданы");
@@ -532,6 +538,19 @@ impl RoleService for IndexerRole {
         ctx.ready.set(false);
         Ok(())
     }
+}
+
+/// Срок следующего опроса журнала: тик `poll` от начала прохода `started`, а если ближайший срок повтора раздела
+/// с ошибкой `retry_at` (META-35) раньше — он; не раньше, чем через 1 мс после начала прохода.
+fn next_poll(
+    started: tokio::time::Instant,
+    poll: Duration,
+    retry_at: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let tick = started + poll;
+    retry_at
+        .map_or(tick, |r| r.min(tick))
+        .max(started + Duration::from_millis(1))
 }
 
 /// Роль, работа которой в этой сборке идёт в процессе других ролей (search: запросы выполняют imap и jmap
@@ -664,6 +683,21 @@ mod tests {
         shutdown.cancel();
         task.await.expect("join").expect("run");
         assert!(!ready.is_ready());
+    }
+
+    #[test]
+    fn next_poll_waits_for_nearest_retry() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs(1);
+        // Без разделов с ошибкой и при сроке повтора позже тика — тик.
+        assert_eq!(next_poll(t0, 5 * s, None), t0 + 5 * s);
+        assert_eq!(next_poll(t0, 5 * s, Some(t0 + 9 * s)), t0 + 5 * s);
+        // Срок повтора раньше тика — он.
+        assert_eq!(next_poll(t0, 5 * s, Some(t0 + 2 * s)), t0 + 2 * s);
+        // Срок уже наступил или тик нулевой — не раньше 1 мс от начала прохода (без холостого цикла).
+        let floor = t0 + Duration::from_millis(1);
+        assert_eq!(next_poll(t0, 5 * s, Some(t0)), floor);
+        assert_eq!(next_poll(t0, Duration::ZERO, None), floor);
     }
 
     #[test]
