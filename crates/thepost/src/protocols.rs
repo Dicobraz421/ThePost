@@ -30,7 +30,7 @@ use crate::sections::HttpListener;
 pub struct Bound(Arc<Mutex<BTreeMap<String, Vec<SocketAddr>>>>);
 
 impl Bound {
-    fn set(&self, role: &str, addrs: Vec<SocketAddr>) {
+    pub(crate) fn set(&self, role: &str, addrs: Vec<SocketAddr>) {
         tracing::info!(role, ?addrs, "роль принимает соединения");
         self.0
             .lock()

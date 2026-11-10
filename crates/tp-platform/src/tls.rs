@@ -262,6 +262,16 @@ pub fn server_config(
     Ok(build(chain, key, min_version)?)
 }
 
+/// Ставит процессный [`CryptoProvider`] rustls (aws-lc-rs), если он ещё не задан. В сборке включены оба
+/// провайдера (aws-lc-rs и ring), и без процессного клиенты, берущие его неявно (instant-acme, reqwest),
+/// паникуют. Повторный вызов и гонка с другим потоком — не ошибка: используется уже установленный.
+pub fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // Ошибка — провайдер успел поставить другой поток; используется он.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 fn build(
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,

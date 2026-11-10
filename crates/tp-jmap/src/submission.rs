@@ -6,6 +6,9 @@
 //!   `maxDelayedSend` = 0). Адрес `From` проверяет [`Authorizer::send_right`](tp_contracts::auth::Authorizer::send_right)
 //!   (свои адреса, Send As, Send on Behalf — с заголовком `Sender`). До очереди — `DecisionHooks::on_submission`
 //!   (`Deny` — `forbiddenToSend`; дополнения: заголовки в начало письма, копии в папки и внешним адресам).
+//!   Ещё раньше — правила потока почты ([`Jmap::with_mail_flow`](crate::Jmap::with_mail_flow), CTR-24): `Reject` —
+//!   `forbiddenToSend` с текстом правила, `Drop` — письмо принято и не отправлено (получатели `queued`), изменённые конверт
+//!   и тело — дальше вместо исходных.
 //!   Заголовок `Bcc` из отправляемого письма удаляется. В ответе `created` — `deliveryStatus` по каждому
 //!   получателю из [`Outbound::submit`] (доставлено локально — `yes`, в очереди — `queued`, отказ — `no` с ответом
 //!   SMTP). Объекты EmailSubmission после ответа не хранятся: `EmailSubmission/get` их не находит (статусы есть
@@ -27,6 +30,7 @@ use tp_contracts::auth::SendRight;
 use tp_contracts::ext::{CopyTo, Decision, SubmissionInfo};
 use tp_contracts::mailstore::IngestRequest;
 use tp_contracts::meta::Changes;
+use tp_contracts::transport::{BlobRef, FlowDirection, FlowEnvelope, FlowInput, FlowVerdict};
 use tp_contracts::{MessageId, Result, TenantId};
 
 use crate::core::error::{MethodError, MethodResult, set_error};
@@ -493,6 +497,101 @@ pub(crate) async fn forward(
     Ok(())
 }
 
+/// Итог правил потока для отправки.
+enum Flowed {
+    /// Отправить: конверт и тело после действий правил.
+    Send {
+        mail_from: String,
+        rcpts: Vec<String>,
+        raw: Vec<u8>,
+    },
+    /// Принять без отправки и без уведомления (`Drop`, `Accept` без получателей): исходные получатели — `queued`.
+    Drop(Vec<String>),
+    /// Отказ по объекту (SetError).
+    Refuse(Value),
+}
+
+/// Правила потока почты (CONTRACTS.md#Transport): один вызов [`MailFlow::apply`](tp_contracts::transport::MailFlow::apply)
+/// на письмо до точек принятия решений и очереди. Тело передаётся объектом BLOB организации без ссылок (его, как и
+/// изменённое тело модуля, убирает сборка мусора по окну: в очередь уходят байты письма). `Reject` —
+/// `forbiddenToSend` с текстом правила; `Moderate` — `forbiddenToSend` (очереди модерации у JMAP нет);
+/// `route` не передаётся (у [`Outbound`] нет маршрута) — предупреждение в журнале.
+async fn mail_flow(
+    ctx: &Ctx<'_>,
+    mail_from: String,
+    rcpts: Vec<String>,
+    raw: Vec<u8>,
+) -> MethodResult<Flowed> {
+    let Some(flow) = &ctx.jmap.mail_flow else {
+        return Ok(Flowed::Send {
+            mail_from,
+            rcpts,
+            raw,
+        });
+    };
+    let p = ctx.principal;
+    let size = raw.len() as u64;
+    let key = ctx
+        .jmap
+        .put_object(p.tenant, Bytes::copy_from_slice(&raw))
+        .await?;
+    let input = FlowInput {
+        tenant: p.tenant,
+        direction: FlowDirection::Submission,
+        principal: Some(p.clone()),
+        source: None,
+        envelope: FlowEnvelope {
+            mail_from,
+            rcpt_to: rcpts,
+        },
+        message: BlobRef { key, size },
+    };
+    let out = flow.apply(&input).await?;
+    if !out.matched.is_empty() {
+        tracing::info!(rules = ?out.matched, "jmap: сработали правила потока почты");
+    }
+    match out.verdict {
+        FlowVerdict::Reject(text) => {
+            tracing::info!(reason = %text, "jmap: отправка отклонена правилом потока почты");
+            Ok(Flowed::Refuse(set_error(
+                "forbiddenToSend",
+                Some(&text),
+                &[],
+            )))
+        }
+        FlowVerdict::Moderate { .. } => {
+            tracing::warn!(
+                "jmap: правило потока требует модерации — у отправки JMAP её нет, отказ"
+            );
+            Ok(Flowed::Refuse(set_error(
+                "forbiddenToSend",
+                Some("message requires moderation"),
+                &[],
+            )))
+        }
+        FlowVerdict::Drop => Ok(Flowed::Drop(input.envelope.rcpt_to)),
+        FlowVerdict::Accept if out.envelope.rcpt_to.is_empty() => {
+            Ok(Flowed::Drop(input.envelope.rcpt_to))
+        }
+        FlowVerdict::Accept => {
+            if out.route.is_some() {
+                tracing::warn!(
+                    "jmap: маршрут правила потока не применён — очередь выбирает его по домену"
+                );
+            }
+            let raw = match out.message {
+                None => raw,
+                Some(m) => collect(ctx.jmap.d.blobs.get(&m.key, None).await?).await?,
+            };
+            Ok(Flowed::Send {
+                mail_from: out.envelope.mail_from,
+                rcpts: out.envelope.rcpt_to,
+                raw,
+            })
+        }
+    }
+}
+
 /// Одна отправка: `Ok(Ok((id, письмо, статусы)))` — отправлено, `Ok(Err(SetError))` — отказ по объекту.
 async fn submit_one(
     ctx: &Ctx<'_>,
@@ -643,6 +742,23 @@ async fn submit_one(
     }
 
     raw = prepend_headers(strip_header(&raw, "Bcc"), &add);
+    let (mail_from, rcpts) = match mail_flow(ctx, mail_from, rcpts, raw).await? {
+        Flowed::Send {
+            mail_from,
+            rcpts,
+            raw: changed,
+        } => {
+            raw = changed;
+            (mail_from, rcpts)
+        }
+        Flowed::Drop(rcpts) => {
+            let statuses = Submitted {
+                rcpts: rcpts.into_iter().map(|r| (r, RcptStatus::Queued)).collect(),
+            };
+            return Ok(Ok((format!("S{}", MessageId::new()), msg.id, statuses)));
+        }
+        Flowed::Refuse(e) => return Ok(Err(e)),
+    };
     let info = SubmissionInfo {
         principal: p.clone(),
         mail_from: mail_from.clone(),
@@ -1221,5 +1337,181 @@ mod tests {
         assert!(!valid_address("@c"));
         assert!(!valid_address("a@"));
         assert!(!valid_address("<a@b>"));
+    }
+
+    /// Заглушка правил потока почты: записывает входы (с телом из BLOB) и возвращает заданный итог;
+    /// `rewrite` — изменённые конверт и тело (новый объект BLOB).
+    struct StubFlow {
+        blobs: crate::testenv::Unpacking,
+        verdict: FlowVerdict,
+        rewrite: bool,
+        inputs: std::sync::Mutex<Vec<(FlowInput, Vec<u8>)>>,
+    }
+
+    impl StubFlow {
+        fn new(env: &Env, verdict: FlowVerdict, rewrite: bool) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                blobs: env.blobs.clone(),
+                verdict,
+                rewrite,
+                inputs: Default::default(),
+            })
+        }
+
+        fn inputs(&self) -> Vec<(FlowInput, Vec<u8>)> {
+            self.inputs.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl tp_contracts::transport::MailFlow for StubFlow {
+        async fn apply(&self, input: &FlowInput) -> Result<tp_contracts::transport::FlowOutcome> {
+            use tp_contracts::blob::BlobStore;
+            let body = collect(self.blobs.get(&input.message.key, None).await?).await?;
+            self.inputs
+                .lock()
+                .expect("lock")
+                .push((input.clone(), body.clone()));
+            let mut out = tp_contracts::transport::FlowOutcome::unchanged(input);
+            out.verdict = self.verdict.clone();
+            out.matched = vec!["rule-1".into()];
+            if self.rewrite {
+                use sha2::Digest;
+                let end = header_end(&body);
+                let mut changed = b"X-Flow: disclaimer\r\n".to_vec();
+                changed.extend_from_slice(&body[..end]);
+                changed.extend_from_slice(b"-- disclaimer --\r\n");
+                changed.extend_from_slice(&body[end..]);
+                let key = tp_contracts::BlobKey {
+                    tenant: input.tenant,
+                    hash: tp_contracts::BlobHash(sha2::Sha256::digest(&changed).into()),
+                    generation: tp_contracts::Gen(1),
+                };
+                self.blobs.put(&key, Bytes::from(changed.clone())).await?;
+                out.message = Some(BlobRef {
+                    key,
+                    size: changed.len() as u64,
+                });
+                out.envelope.rcpt_to = vec!["copy@external.test".into()];
+            }
+            Ok(out)
+        }
+    }
+
+    fn with_flow(env: &Env, flow: std::sync::Arc<StubFlow>) -> Jmap {
+        Jmap::new(env.jmap.d.clone(), JmapConfig::default())
+            .expect("jmap")
+            .with_mail_flow(Some(flow))
+    }
+
+    async fn submit(env: &Env, jmap: &Jmap) -> Vec<Value> {
+        let acc = env.account();
+        calls(
+            env,
+            jmap,
+            json!([
+                ["Email/set", {"accountId": acc, "create": {"d": draft(env, "user@example.org")}}, "0"],
+                ["EmailSubmission/set", {"accountId": acc, "create": {"s": {
+                    "identityId": identity_id("user@example.org"), "emailId": "#d"
+                }}}, "1"]
+            ]),
+        )
+        .await
+    }
+
+    /// Правило потока отклоняет письмо: `forbiddenToSend` с текстом правила, очередь и точки принятия решений
+    /// не вызываются; вход правил — отправка пользователя с конвертом и телом без Bcc.
+    #[tokio::test]
+    async fn mail_flow_reject() {
+        let env = Env::new().await;
+        let flow = StubFlow::new(
+            &env,
+            FlowVerdict::Reject("Внешняя отправка запрещена".into()),
+            false,
+        );
+        let jmap = with_flow(&env, flow.clone());
+        let r = submit(&env, &jmap).await;
+        let e = &r[1][1]["notCreated"]["s"];
+        assert_eq!(e["type"], "forbiddenToSend", "{r:?}");
+        assert_eq!(e["description"], "Внешняя отправка запрещена");
+        assert!(env.outbound.queued().is_empty());
+        assert!(
+            !env.hook
+                .calls()
+                .iter()
+                .any(|c| matches!(c, tp_testkit::fakes::HookCall::Submission(_))),
+            "точки принятия решений — после правил потока"
+        );
+        let inputs = flow.inputs();
+        assert_eq!(inputs.len(), 1, "один вызов на письмо");
+        let (input, body) = &inputs[0];
+        assert_eq!(input.tenant, env.scope.tenant);
+        assert_eq!(input.direction, FlowDirection::Submission);
+        assert_eq!(input.principal.as_ref(), Some(&env.principal));
+        assert_eq!(input.source, None);
+        assert_eq!(input.envelope.mail_from, "user@example.org");
+        assert_eq!(
+            input.envelope.rcpt_to,
+            vec!["rcpt@external.test", "hidden@external.test"]
+        );
+        assert_eq!(input.message.size, body.len() as u64);
+        let text = String::from_utf8_lossy(body);
+        assert!(text.contains("Subject: "), "{text}");
+        assert!(!text.contains("hidden@external.test"), "{text}");
+    }
+
+    /// Изменённые правилом тело и конверт уходят в очередь и в точку принятия решений вместо исходных.
+    #[tokio::test]
+    async fn mail_flow_changed_body() {
+        let env = Env::new().await;
+        let flow = StubFlow::new(&env, FlowVerdict::Accept, true);
+        let jmap = with_flow(&env, flow.clone());
+        let r = submit(&env, &jmap).await;
+        assert_eq!(
+            r[1][1]["created"]["s"]["deliveryStatus"],
+            json!({"copy@external.test": {"smtpReply": "250 2.0.0 Queued", "delivered": "queued", "displayed": "unknown"}}),
+            "{r:?}"
+        );
+        let q = env.outbound.queued();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].rcpts, vec!["copy@external.test"]);
+        let raw = String::from_utf8_lossy(&q[0].raw);
+        assert!(raw.starts_with("X-Flow: disclaimer\r\n"), "{raw}");
+        assert!(raw.contains("-- disclaimer --\r\n"), "{raw}");
+        let sub = env
+            .hook
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                tp_testkit::fakes::HookCall::Submission(i) => Some(i),
+                _ => None,
+            })
+            .expect("on_submission");
+        assert_eq!(sub.rcpt_to, vec!["copy@external.test"]);
+        assert_eq!(sub.size, q[0].raw.len() as u64);
+        assert_eq!(flow.inputs().len(), 1);
+    }
+
+    /// `Drop` — принято без отправки, получатели `queued`; модерация — `forbiddenToSend`.
+    #[tokio::test]
+    async fn mail_flow_drop_and_moderate() {
+        let env = Env::new().await;
+        let jmap = with_flow(&env, StubFlow::new(&env, FlowVerdict::Drop, false));
+        let r = submit(&env, &jmap).await;
+        let ds = &r[1][1]["created"]["s"]["deliveryStatus"];
+        assert_eq!(ds["rcpt@external.test"]["delivered"], "queued", "{r:?}");
+        assert_eq!(ds["hidden@external.test"]["delivered"], "queued", "{r:?}");
+        assert!(env.outbound.queued().is_empty());
+
+        let moderate = FlowVerdict::Moderate {
+            moderators: vec![env.scope.account],
+        };
+        let jmap = with_flow(&env, StubFlow::new(&env, moderate, false));
+        let r = submit(&env, &jmap).await;
+        assert_eq!(
+            r[1][1]["notCreated"]["s"]["type"], "forbiddenToSend",
+            "{r:?}"
+        );
+        assert!(env.outbound.queued().is_empty());
     }
 }
