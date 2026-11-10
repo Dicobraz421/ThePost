@@ -125,19 +125,23 @@ impl PgMeta {
 
     /// Последняя выданная позиция раздела: подписчик, которому не нужна история, начинает с неё.
     pub async fn head(&self, partition: Partition) -> Result<EventPos> {
-        let pos: Option<i64> =
-            sqlx::query_scalar("SELECT last_pos FROM event_partitions WHERE partition = $1")
-                .bind(self.partition_arg(partition)?)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
-        Ok(EventPos(to_u64(pos.unwrap_or(0))?))
+        self.idempotent(|| async move {
+            let pos: Option<i64> =
+                sqlx::query_scalar("SELECT last_pos FROM event_partitions WHERE partition = $1")
+                    .bind(self.partition_arg(partition)?)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(db_err)?;
+            Ok(EventPos(to_u64(pos.unwrap_or(0))?))
+        })
+        .await
     }
 
     /// Удаляет не более `limit` событий, обработанных всеми `subscribers` (позиция не больше
     /// наименьшей зафиксированной; подписчик без позиции в разделе её не имеет — 0).
     /// Пустой список подписчиков ничего не удаляет. Возвращает число удалённых событий.
     pub async fn purge_events(&self, subscribers: &[&str], limit: usize) -> Result<u64> {
+        self.once(async move {
         let mut tx = begin_system(&self.pool).await?;
         let done = sqlx::query(
             "WITH subs AS (SELECT DISTINCT unnest($1::text[]) AS subscriber),
@@ -159,6 +163,7 @@ impl PgMeta {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(done.rows_affected())
+}).await
     }
 }
 
@@ -174,47 +179,56 @@ impl EventLog for PgMeta {
         after: EventPos,
         limit: usize,
     ) -> Result<Vec<LoggedEvent>> {
-        let p = self.partition_arg(partition)?;
-        let mut tx = begin_system(&self.pool).await?;
-        let rows: Vec<EventRow> = sqlx::query_as(
-            "SELECT pos, tenant_id, account_id, mailbox_id, kind::text AS kind, at FROM events
+        self.idempotent(|| async move {
+            let p = self.partition_arg(partition)?;
+            let mut tx = begin_system(&self.pool).await?;
+            let rows: Vec<EventRow> = sqlx::query_as(
+                "SELECT pos, tenant_id, account_id, mailbox_id, kind::text AS kind, at FROM events
              WHERE partition = $1 AND pos > $2 ORDER BY pos LIMIT $3",
-        )
-        .bind(p)
-        .bind(to_i64(after.0)?)
-        .bind(limit_arg(limit)?)
-        .fetch_all(&mut *tx)
+            )
+            .bind(p)
+            .bind(to_i64(after.0)?)
+            .bind(limit_arg(limit)?)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            rows.into_iter().map(|r| r.into_logged(partition)).collect()
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        rows.into_iter().map(|r| r.into_logged(partition)).collect()
     }
 
     async fn position(&self, subscriber: &str, partition: Partition) -> Result<EventPos> {
-        let pos: Option<i64> = sqlx::query_scalar(
-            "SELECT pos FROM event_cursors WHERE subscriber = $1 AND partition = $2",
-        )
-        .bind(subscriber)
-        .bind(self.partition_arg(partition)?)
-        .fetch_optional(&self.pool)
+        self.idempotent(|| async move {
+            let pos: Option<i64> = sqlx::query_scalar(
+                "SELECT pos FROM event_cursors WHERE subscriber = $1 AND partition = $2",
+            )
+            .bind(subscriber)
+            .bind(self.partition_arg(partition)?)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            Ok(EventPos(to_u64(pos.unwrap_or(0))?))
+        })
         .await
-        .map_err(db_err)?;
-        Ok(EventPos(to_u64(pos.unwrap_or(0))?))
     }
 
     async fn commit(&self, subscriber: &str, partition: Partition, pos: EventPos) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO event_cursors (subscriber, partition, pos) VALUES ($1, $2, $3)
+        self.once(async move {
+            sqlx::query(
+                "INSERT INTO event_cursors (subscriber, partition, pos) VALUES ($1, $2, $3)
              ON CONFLICT (subscriber, partition) DO UPDATE
              SET pos = greatest(event_cursors.pos, EXCLUDED.pos), updated_at = now()",
-        )
-        .bind(subscriber)
-        .bind(self.partition_arg(partition)?)
-        .bind(to_i64(pos.0)?)
-        .execute(&self.pool)
+            )
+            .bind(subscriber)
+            .bind(self.partition_arg(partition)?)
+            .bind(to_i64(pos.0)?)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+            Ok(())
+        })
         .await
-        .map_err(db_err)?;
-        Ok(())
     }
 }
 

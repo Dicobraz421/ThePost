@@ -74,6 +74,7 @@ async fn find_for_upsert(
 
 impl PgMeta {
     async fn upsert_once(&self, tenant: TenantId, data: &AccountUpsert) -> Result<Account> {
+        self.once(async move {
         if data.login.is_empty() {
             return Err(Error::invalid("пустое имя входа"));
         }
@@ -116,39 +117,46 @@ impl PgMeta {
             self.signal_log([scope.account]).await;
         }
         Ok(account)
+}).await
     }
 }
 
 #[async_trait]
 impl AccountStore for PgMeta {
     async fn get(&self, tenant: TenantId, id: AccountId) -> Result<Option<Account>> {
-        let mut tx = begin(&self.pool, tenant).await?;
-        let row: Option<AccountRow> = sqlx::query_as(
-            "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let row: Option<AccountRow> = sqlx::query_as(
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
              FROM accounts WHERE tenant_id = $1 AND account_id = $2",
-        )
-        .bind(tenant.as_uuid())
-        .bind(id.as_uuid())
-        .fetch_optional(&mut *tx)
+            )
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(row.map(Account::from))
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(row.map(Account::from))
     }
 
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
-        let mut tx = begin(&self.pool, tenant).await?;
-        let row: Option<AccountRow> = sqlx::query_as(
-            "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let row: Option<AccountRow> = sqlx::query_as(
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
              FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2)",
-        )
-        .bind(tenant.as_uuid())
-        .bind(login)
-        .fetch_optional(&mut *tx)
+            )
+            .bind(tenant.as_uuid())
+            .bind(login)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(row.map(Account::from))
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(row.map(Account::from))
     }
 
     async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account> {
@@ -161,26 +169,29 @@ impl AccountStore for PgMeta {
 
     /// Лимит (`limit_bytes`) разрешает `PolicyResolver`; здесь — только использование.
     async fn quota(&self, tenant: TenantId, id: AccountId) -> Result<QuotaUsage> {
-        let mut tx = begin(&self.pool, tenant).await?;
-        let row: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT coalesce(sum(m.size), 0)::bigint, count(m.message_id)
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let row: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT coalesce(sum(m.size), 0)::bigint, count(m.message_id)
              FROM accounts a
              LEFT JOIN messages m ON m.tenant_id = a.tenant_id AND m.account_id = a.account_id
                                  AND m.hidden_at IS NULL
              WHERE a.tenant_id = $1 AND a.account_id = $2
              GROUP BY a.account_id",
-        )
-        .bind(tenant.as_uuid())
-        .bind(id.as_uuid())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        let (used, messages) = row.ok_or(Error::NotFound)?;
-        Ok(QuotaUsage {
-            used_bytes: to_u64(used)?,
-            messages: to_u64(messages)?,
-            limit_bytes: None,
+            )
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            let (used, messages) = row.ok_or(Error::NotFound)?;
+            Ok(QuotaUsage {
+                used_bytes: to_u64(used)?,
+                messages: to_u64(messages)?,
+                limit_bytes: None,
+            })
         })
+        .await
     }
 }

@@ -222,6 +222,7 @@ fn removed(done: sqlx::postgres::PgQueryResult) -> Result<()> {
 #[async_trait]
 impl TransportStore for PgMeta {
     async fn cluster(&self) -> Result<ClusterTransport> {
+        self.idempotent(|| async move {
         let mut tx = begin_system(&self.pool).await?;
         // FOR SHARE ждёт фиксации писателя; следующие запросы видят все изменения до этой версии и только их.
         let version: i64 = sqlx::query_scalar("SELECT version FROM transport_cluster FOR SHARE")
@@ -249,18 +250,20 @@ impl TransportStore for PgMeta {
                 .collect::<Result<_>>()?,
             sources: sources.into_iter().map(TrustedSource::from).collect(),
         })
+}).await
     }
 
     async fn tenant(&self, tenant: TenantId) -> Result<TenantTransport> {
-        let mut tx = begin(&self.pool, tenant).await?;
-        let version: Option<i64> = sqlx::query_scalar(
-            "SELECT version FROM transport_versions WHERE tenant_id = $1 FOR SHARE",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let routes: Vec<RouteRow> = sqlx::query_as(
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let version: Option<i64> = sqlx::query_scalar(
+                "SELECT version FROM transport_versions WHERE tenant_id = $1 FOR SHARE",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let routes: Vec<RouteRow> = sqlx::query_as(
             "SELECT pattern, tls, smart_host, host(egress_ip) AS egress_ip FROM transport_routes
              WHERE tenant_id = $1 ORDER BY pattern COLLATE \"C\"",
         )
@@ -268,19 +271,22 @@ impl TransportStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(TenantTransport {
-            version: to_u64(version.unwrap_or(0))?,
-            routes: routes
-                .into_iter()
-                .map(RouteRow::into_policy)
-                .collect::<Result<_>>()?,
-            // Таблица переписывания (CTR-40) — волна полосы meta.
-            rewrites: Vec::new(),
+            tx.commit().await.map_err(db_err)?;
+            Ok(TenantTransport {
+                version: to_u64(version.unwrap_or(0))?,
+                routes: routes
+                    .into_iter()
+                    .map(RouteRow::into_policy)
+                    .collect::<Result<_>>()?,
+                // Таблица переписывания (CTR-40) — волна полосы meta.
+                rewrites: Vec::new(),
+            })
         })
+        .await
     }
 
     async fn put_domain(&self, expected: u64, domain: &AcceptedDomain) -> Result<u64> {
+        self.once(async move {
         domain.validate()?;
         let (kind, next_hop) = match &domain.kind {
             DomainKind::Authoritative => (AUTHORITATIVE, None),
@@ -311,35 +317,40 @@ impl TransportStore for PgMeta {
         .await
         .map_err(db_err)?;
         self.cluster_commit(tx).await
+}).await
     }
 
     async fn delete_domain(&self, expected: u64, id: DomainId) -> Result<u64> {
-        let mut tx = self.cluster_begin(expected).await?;
-        // Домен с учётными записями не удаляется (внешний ключ — `Invalid`).
-        removed(
-            sqlx::query("DELETE FROM domains WHERE domain_id = $1")
-                .bind(id.as_uuid())
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?,
-        )?;
-        self.cluster_commit(tx).await
+        self.once(async move {
+            let mut tx = self.cluster_begin(expected).await?;
+            // Домен с учётными записями не удаляется (внешний ключ — `Invalid`).
+            removed(
+                sqlx::query("DELETE FROM domains WHERE domain_id = $1")
+                    .bind(id.as_uuid())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?,
+            )?;
+            self.cluster_commit(tx).await
+        })
+        .await
     }
 
     async fn put_source(&self, expected: u64, source: &TrustedSource) -> Result<u64> {
-        source.validate()?;
-        let tenant = source.tenant.map(|t| *t.as_uuid());
-        let mut tx = self.cluster_begin(expected).await?;
-        let owner: Option<Option<Uuid>> =
-            sqlx::query_scalar("SELECT tenant_id FROM transport_sources WHERE name = $1")
-                .bind(&source.name)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        if owner.is_some_and(|t| t != tenant) {
-            return Err(Error::invalid("организацию источника менять нельзя"));
-        }
-        sqlx::query(
+        self.once(async move {
+            source.validate()?;
+            let tenant = source.tenant.map(|t| *t.as_uuid());
+            let mut tx = self.cluster_begin(expected).await?;
+            let owner: Option<Option<Uuid>> =
+                sqlx::query_scalar("SELECT tenant_id FROM transport_sources WHERE name = $1")
+                    .bind(&source.name)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            if owner.is_some_and(|t| t != tenant) {
+                return Err(Error::invalid("организацию источника менять нельзя"));
+            }
+            sqlx::query(
             "INSERT INTO transport_sources (name, tenant_id, matcher, kind) VALUES ($1, $2, $3, $4)
              ON CONFLICT (name) DO UPDATE
                  SET matcher = EXCLUDED.matcher, kind = EXCLUDED.kind, updated_at = now()",
@@ -351,19 +362,24 @@ impl TransportStore for PgMeta {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        self.cluster_commit(tx).await
+            self.cluster_commit(tx).await
+        })
+        .await
     }
 
     async fn delete_source(&self, expected: u64, name: &str) -> Result<u64> {
-        let mut tx = self.cluster_begin(expected).await?;
-        removed(
-            sqlx::query("DELETE FROM transport_sources WHERE name = $1")
-                .bind(name)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?,
-        )?;
-        self.cluster_commit(tx).await
+        self.once(async move {
+            let mut tx = self.cluster_begin(expected).await?;
+            removed(
+                sqlx::query("DELETE FROM transport_sources WHERE name = $1")
+                    .bind(name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?,
+            )?;
+            self.cluster_commit(tx).await
+        })
+        .await
     }
 
     async fn put_route(
@@ -372,37 +388,43 @@ impl TransportStore for PgMeta {
         expected: u64,
         policy: &DestinationPolicy,
     ) -> Result<u64> {
-        policy.validate()?;
-        let egress = policy.egress_ip.map(|ip| ip.to_string());
-        let mut tx = self.tenant_begin(tenant, expected).await?;
-        sqlx::query(
-            "INSERT INTO transport_routes (tenant_id, pattern, tls, smart_host, egress_ip)
+        self.once(async move {
+            policy.validate()?;
+            let egress = policy.egress_ip.map(|ip| ip.to_string());
+            let mut tx = self.tenant_begin(tenant, expected).await?;
+            sqlx::query(
+                "INSERT INTO transport_routes (tenant_id, pattern, tls, smart_host, egress_ip)
              VALUES ($1, $2, $3, $4, $5::inet)
              ON CONFLICT (tenant_id, pattern) DO UPDATE
                  SET tls = EXCLUDED.tls, smart_host = EXCLUDED.smart_host,
                      egress_ip = EXCLUDED.egress_ip, updated_at = now()",
-        )
-        .bind(tenant.as_uuid())
-        .bind(&policy.pattern)
-        .bind(Json(&policy.tls))
-        .bind(policy.smart_host.as_deref())
-        .bind(egress.as_deref())
-        .execute(&mut *tx)
+            )
+            .bind(tenant.as_uuid())
+            .bind(&policy.pattern)
+            .bind(Json(&policy.tls))
+            .bind(policy.smart_host.as_deref())
+            .bind(egress.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            self.tenant_commit(tx, tenant, expected).await
+        })
         .await
-        .map_err(db_err)?;
-        self.tenant_commit(tx, tenant, expected).await
     }
 
     async fn delete_route(&self, tenant: TenantId, expected: u64, pattern: &str) -> Result<u64> {
-        let mut tx = self.tenant_begin(tenant, expected).await?;
-        removed(
-            sqlx::query("DELETE FROM transport_routes WHERE tenant_id = $1 AND pattern = $2")
-                .bind(tenant.as_uuid())
-                .bind(pattern)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?,
-        )?;
-        self.tenant_commit(tx, tenant, expected).await
+        self.once(async move {
+            let mut tx = self.tenant_begin(tenant, expected).await?;
+            removed(
+                sqlx::query("DELETE FROM transport_routes WHERE tenant_id = $1 AND pattern = $2")
+                    .bind(tenant.as_uuid())
+                    .bind(pattern)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?,
+            )?;
+            self.tenant_commit(tx, tenant, expected).await
+        })
+        .await
     }
 }

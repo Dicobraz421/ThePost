@@ -1,19 +1,25 @@
-//! Назначение разделов журнала событий узлам (CONTRACTS.md#EventLog; решение 2026-10-30, #45).
+//! Назначение разделов журнала событий узлам (CONTRACTS.md#EventLog; решения 2026-10-30, #45, и 2026-11-01).
 //!
 //! Раздел `p` подписчика `s` достаётся узлу-владельцу ключа `s/p` по [`Rendezvous`] над живыми узлами
-//! ([`Membership::live`]). Состав опрашивается с интервалом из [`PartitionAssignerConfig`]; новое значение
-//! уходит в [`PartitionAssigner::members`], и подписчик пересчитывает свои разделы. Узел берёт лизы только
-//! назначенных разделов и отдаёт лизы снятых ([`AssignmentChange`]); с одним узлом ему назначены все разделы.
+//! ([`Membership::live`]). Состав перечитывается по сигналу [`EventKind::MembersChanged`] (вход, выход узла),
+//! по [`EventKind::Resync`] и после переподписки на сигналы (SRS 2.8, правило 3); опроса нет. Истечение записи
+//! узла сигналом не публикуется — его ловит единственный таймер, таймер аренды: узел, живой при чтении состава,
+//! истекает не позже чем через срок записи `node_ttl`, поэтому состав перечитывается через `node_ttl` после
+//! последнего чтения. Новое значение уходит в [`PartitionAssigner::members`], и подписчик пересчитывает свои
+//! разделы. Узел берёт лизы только назначенных разделов и отдаёт лизы снятых ([`AssignmentChange`]); с одним
+//! узлом ему назначены все разделы.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::Instant;
 use tp_contracts::Result;
+use tp_contracts::bus::{EventBus, EventKind, EventStream};
 use tp_contracts::config::duration;
 use tp_contracts::events::{Partition, PartitionAssigner};
 use tp_contracts::membership::{Membership, NodeId};
@@ -24,17 +30,22 @@ use crate::hashing::Rendezvous;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct PartitionAssignerConfig {
-    /// Интервал опроса живых узлов (`2s`, `500ms`; ноль считается за 1 мс). Смена состава замечается
-    /// не позже чем через интервал; разумно — не больше периода продления записи узла (`ttl / 3`).
+    /// Срок записи узла в членстве (тот же, с которым узлы продлевают запись, `meta.events.node_ttl`):
+    /// через столько после чтения состава он перечитывается, чтобы заметить истёкшие записи (ноль — 1 мс).
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
-    pub poll_interval: Duration,
+    pub node_ttl: Duration,
+    /// Пауза перед повтором чтения состава или подписки на сигналы после временной ошибки (ноль — 1 мс).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub retry_delay: Duration,
 }
 
 impl Default for PartitionAssignerConfig {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_secs(2),
+            node_ttl: Duration::from_secs(15),
+            retry_delay: Duration::from_secs(1),
         }
     }
 }
@@ -65,44 +76,53 @@ fn normalize(mut members: Vec<NodeId>) -> Vec<NodeId> {
 
 /// Назначение разделов rendezvous-хэшированием по живым узлам.
 ///
-/// При ошибке опроса состав не меняется (последний известный): единственность обработки раздела
-/// и в переходный период гарантирует лиза с номером захвата. Фоновый опрос останавливается вместе
-/// с последней копией значения.
+/// При ошибке чтения состава он не меняется (последний известный) до успешного повтора: единственность
+/// обработки раздела и в переходный период гарантирует лиза с номером захвата. Фоновое слежение за составом
+/// останавливается вместе с последней копией значения.
 #[derive(Debug)]
 pub struct RendezvousAssigner {
     members: watch::Sender<Vec<NodeId>>,
-    poller: Option<JoinHandle<()>>,
+    follower: Option<JoinHandle<()>>,
 }
 
 impl RendezvousAssigner {
-    /// Читает живые узлы и запускает их опрос с интервалом `config.poll_interval`.
-    /// Ошибка первого чтения состава возвращается: без состава узлу нечего назначить.
+    /// Подписывается на системные сигналы `bus`, читает живые узлы и следит за составом (см. модуль).
+    /// Ошибка подписки или первого чтения состава возвращается: без состава узлу нечего назначить.
     pub async fn start(
         membership: Arc<dyn Membership>,
+        bus: Arc<dyn EventBus>,
         config: &PartitionAssignerConfig,
     ) -> Result<Self> {
+        // Сначала подписка, затем чтение: изменение между ними придёт сигналом.
+        let signals = bus.subscribe_system().await?;
         let members = watch::Sender::new(normalize(membership.live().await?));
-        let period = config.poll_interval.max(Duration::from_millis(1));
-        let poller = tokio::spawn(poll(membership, members.clone(), period));
+        let follower = Follower {
+            membership,
+            bus,
+            members: members.clone(),
+            node_ttl: config.node_ttl.max(Duration::from_millis(1)),
+            retry_delay: config.retry_delay.max(Duration::from_millis(1)),
+        };
+        let follower = tokio::spawn(follower.run(signals));
         Ok(Self {
             members,
-            poller: Some(poller),
+            follower: Some(follower),
         })
     }
 
-    /// Неизменный состав без опроса (проверки, утилиты).
+    /// Неизменный состав без слежения (проверки, утилиты).
     pub fn fixed(members: Vec<NodeId>) -> Self {
         Self {
             members: watch::Sender::new(normalize(members)),
-            poller: None,
+            follower: None,
         }
     }
 }
 
 impl Drop for RendezvousAssigner {
     fn drop(&mut self) {
-        if let Some(poller) = self.poller.take() {
-            poller.abort();
+        if let Some(follower) = self.follower.take() {
+            follower.abort();
         }
     }
 }
@@ -117,22 +137,61 @@ impl PartitionAssigner for RendezvousAssigner {
     }
 }
 
-/// Опрос состава: новое значение отправляется, только если состав изменился.
-async fn poll(
+/// Фоновое слежение за составом: сигналы, переподписка и таймер аренды.
+struct Follower {
     membership: Arc<dyn Membership>,
+    bus: Arc<dyn EventBus>,
     members: watch::Sender<Vec<NodeId>>,
-    period: Duration,
-) {
-    let mut tick = tokio::time::interval(period);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // Первый тик срабатывает сразу, а состав уже прочитан при запуске.
-    tick.tick().await;
-    loop {
-        tick.tick().await;
-        match membership.live().await {
+    node_ttl: Duration,
+    retry_delay: Duration,
+}
+
+impl Follower {
+    async fn run(self, signals: EventStream) {
+        let mut signals = Some(signals);
+        // Состав прочитан при запуске: следующее чтение — по сигналу или по истечении аренды.
+        let mut wake = Instant::now() + self.node_ttl;
+        loop {
+            if signals.is_none() {
+                match self.bus.subscribe_system().await {
+                    Ok(stream) => {
+                        signals = Some(stream);
+                        // После переподписки — сверка с хранилищем: сигналы могли потеряться.
+                        wake = self.refresh().await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "нет подписки на сигналы состава, повтор");
+                        tokio::time::sleep(self.retry_delay).await;
+                        continue;
+                    }
+                }
+            }
+            let Some(stream) = signals.as_mut() else {
+                continue;
+            };
+            tokio::select! {
+                event = stream.next() => match event {
+                    Some(e) if matches!(e.kind, EventKind::MembersChanged | EventKind::Resync) => {
+                        wake = self.refresh().await;
+                    }
+                    Some(_) => {}
+                    None => {
+                        tracing::debug!("поток сигналов состава завершён, переподписка");
+                        signals = None;
+                    }
+                },
+                () = tokio::time::sleep_until(wake) => wake = self.refresh().await,
+            }
+        }
+    }
+
+    /// Перечитывает состав; новое значение отправляется, только если состав изменился. Возвращает срок
+    /// следующего чтения: истечение аренды после успеха или повтор после ошибки.
+    async fn refresh(&self) -> Instant {
+        match self.membership.live().await {
             Ok(live) => {
                 let live = normalize(live);
-                members.send_if_modified(|current| {
+                self.members.send_if_modified(|current| {
                     if *current == live {
                         return false;
                     }
@@ -140,8 +199,12 @@ async fn poll(
                     *current = live;
                     true
                 });
+                Instant::now() + self.node_ttl
             }
-            Err(e) => tracing::warn!(error = %e, "не удалось прочитать живые узлы, состав прежний"),
+            Err(e) => {
+                tracing::warn!(error = %e, "не удалось прочитать живые узлы, состав прежний");
+                Instant::now() + self.retry_delay
+            }
         }
     }
 }
@@ -180,57 +243,13 @@ impl AssignmentChange {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use async_trait::async_trait;
     use tp_contracts::Error;
+    use tp_contracts::TenantId;
+    use tp_contracts::bus::Event;
     use tp_contracts::membership::NodeInfo;
+    use tp_testkit::{ManualClock, MemEventBus, MemMembership};
 
     use super::*;
-
-    /// Членство в памяти для тестов полосы (до `MemMembership` из tp-testkit).
-    #[derive(Default)]
-    struct StubMembership {
-        live: Mutex<Vec<NodeId>>,
-        fail: Mutex<bool>,
-    }
-
-    impl StubMembership {
-        fn set(&self, names: &[&str]) {
-            *self.live.lock().expect("lock") = nodes(names);
-        }
-
-        fn fail(&self, fail: bool) {
-            *self.fail.lock().expect("lock") = fail;
-        }
-    }
-
-    #[async_trait]
-    impl Membership for StubMembership {
-        async fn heartbeat(&self, node: &NodeInfo, _ttl: Duration) -> Result<()> {
-            let mut live = self.live.lock().expect("lock");
-            if !live.contains(&node.id) {
-                live.push(node.id.clone());
-            }
-            Ok(())
-        }
-
-        async fn leave(&self, node: &NodeId) -> Result<()> {
-            self.live.lock().expect("lock").retain(|n| n != node);
-            Ok(())
-        }
-
-        async fn live(&self) -> Result<Vec<NodeId>> {
-            if *self.fail.lock().expect("lock") {
-                return Err(Error::Unavailable { retry_after: None });
-            }
-            Ok(self.live.lock().expect("lock").clone())
-        }
-
-        async fn live_info(&self) -> Result<Vec<NodeInfo>> {
-            Ok(self.live().await?.into_iter().map(NodeInfo::new).collect())
-        }
-    }
 
     fn node(name: &str) -> NodeId {
         NodeId::new(name).expect("node")
@@ -293,20 +312,15 @@ mod tests {
     #[test]
     fn parses_yaml_section() {
         let c: PartitionAssignerConfig =
-            serde_yaml_ng::from_str("poll_interval: 1m30s").expect("yaml");
-        assert_eq!(c.poll_interval, Duration::from_secs(90));
-        let c: PartitionAssignerConfig =
-            serde_yaml_ng::from_str("poll_interval: 500ms").expect("yaml");
-        assert_eq!(c.poll_interval, Duration::from_millis(500));
+            serde_yaml_ng::from_str("node_ttl: 1m30s\nretry_delay: 500ms").expect("yaml");
+        assert_eq!(c.node_ttl, Duration::from_secs(90));
+        assert_eq!(c.retry_delay, Duration::from_millis(500));
         assert_eq!(
             serde_yaml_ng::from_str::<PartitionAssignerConfig>("{}").expect("empty"),
             PartitionAssignerConfig::default()
         );
-        for bad in [
-            "poll_interval: 2000",
-            "poll_interval: 2 s",
-            "poll_interval_ms: 2000",
-        ] {
+        // Периода опроса больше нет (CLU-10).
+        for bad in ["node_ttl: 2000", "retry_delay: 2 s", "poll_interval: 2s"] {
             assert!(
                 serde_yaml_ng::from_str::<PartitionAssignerConfig>(bad).is_err(),
                 "{bad}"
@@ -315,16 +329,20 @@ mod tests {
     }
 
     #[test]
-    fn config_interval_is_humantime() {
+    fn config_durations_are_humantime() {
+        let d = PartitionAssignerConfig::default();
         assert_eq!(
-            PartitionAssignerConfig::default().poll_interval,
-            Duration::from_secs(2)
+            (d.node_ttl, d.retry_delay),
+            (Duration::from_secs(15), Duration::from_secs(1))
         );
         let schema = schemars::schema_for!(PartitionAssignerConfig)
             .as_value()
             .to_string();
-        assert!(schema.contains("poll_interval"), "{schema}");
-        assert!(!schema.contains("poll_interval_ms"), "{schema}");
+        assert!(
+            schema.contains("node_ttl") && schema.contains("retry_delay"),
+            "{schema}"
+        );
+        assert!(!schema.contains("poll_interval"), "{schema}");
         assert!(schema.contains("\"type\":\"string\""), "{schema}");
     }
 
@@ -402,25 +420,46 @@ mod tests {
         rx.borrow_and_update().clone()
     }
 
-    #[tokio::test]
-    async fn polls_membership_and_notifies_on_change() {
-        let m = Arc::new(StubMembership::default());
-        m.set(&["n1"]);
-        let config = PartitionAssignerConfig {
-            poll_interval: Duration::from_millis(10),
-        };
-        let a = RendezvousAssigner::start(m.clone(), &config)
-            .await
-            .expect("start");
-        let n1 = node("n1");
-        // Один живой узел — ему назначены все разделы.
-        assert_eq!(a.assigned("indexer", &n1, 16).len(), 16);
-        let mut rx = a.members();
-        let all = a.assigned("indexer", &n1, 16);
+    /// Срок записей узлов и аренды в тестах: дольше теста, чтобы изменения приходили только сигналом.
+    const LONG: Duration = Duration::from_secs(3600);
 
-        m.heartbeat(&NodeInfo::new(node("n2")), Duration::from_secs(30))
+    fn config(node_ttl: Duration) -> PartitionAssignerConfig {
+        PartitionAssignerConfig {
+            node_ttl,
+            retry_delay: Duration::from_millis(10),
+        }
+    }
+
+    async fn join(m: &MemMembership, name: &str, ttl: Duration) {
+        m.heartbeat(&NodeInfo::new(node(name)), ttl)
             .await
             .expect("heartbeat");
+    }
+
+    async fn start(m: &MemMembership, bus: &MemEventBus, node_ttl: Duration) -> RendezvousAssigner {
+        RendezvousAssigner::start(
+            Arc::new(m.clone()),
+            Arc::new(bus.clone()),
+            &config(node_ttl),
+        )
+        .await
+        .expect("start")
+    }
+
+    #[tokio::test]
+    async fn join_and_leave_reassign_by_signal() {
+        let bus = MemEventBus::default();
+        let m = MemMembership::default().with_bus(Arc::new(bus.clone()));
+        join(&m, "n1", LONG).await;
+        // Аренда — час: изменения видны только по сигналу, без ожидания периода.
+        let a = start(&m, &bus, LONG).await;
+        let n1 = node("n1");
+        // Один живой узел — ему назначены все разделы.
+        let all = a.assigned("indexer", &n1, 16);
+        assert_eq!(all.len(), 16);
+        let mut rx = a.members();
+
+        join(&m, "n2", LONG).await;
         assert_eq!(next(&mut rx).await, nodes(&["n1", "n2"]));
         let change = AssignmentChange::between(&all, &a.assigned("indexer", &n1, 16));
         assert!(change.taken.is_empty());
@@ -429,33 +468,98 @@ mod tests {
             "n1 должен отдать часть разделов"
         );
 
-        // Ошибка опроса не меняет состав; после восстановления изменения снова видны.
-        m.fail(true);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!rx.has_changed().expect("open"));
-        assert_eq!(*rx.borrow(), nodes(&["n1", "n2"]));
-        m.fail(false);
         m.leave(&node("n2")).await.expect("leave");
         assert_eq!(next(&mut rx).await, nodes(&["n1"]));
         assert_eq!(a.assigned("indexer", &n1, 16), all);
 
-        // Без изменений состава уведомлений нет.
+        // Продление без изменений записи сигнала не даёт — и уведомления о составе тоже.
+        join(&m, "n1", LONG).await;
+        bus.publish(Event {
+            tenant: TenantId::DEFAULT,
+            account: None,
+            kind: EventKind::MembersChanged,
+        })
+        .await
+        .expect("publish");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!rx.has_changed().expect("open"));
 
-        // Опрос останавливается вместе с назначением.
+        // Слежение останавливается вместе с назначением.
         drop(a);
         tokio::time::timeout(Duration::from_secs(5), rx.changed())
             .await
-            .expect("опрос не остановился")
+            .expect("слежение не остановилось")
             .expect_err("канал закрыт");
     }
 
     #[tokio::test]
+    async fn expiry_is_caught_by_lease_timer() {
+        let bus = MemEventBus::default();
+        let clock = ManualClock::default();
+        let m = MemMembership::new(clock.shared()).with_bus(Arc::new(bus.clone()));
+        join(&m, "n1", LONG).await;
+        join(&m, "n2", Duration::from_secs(15)).await;
+        let a = start(&m, &bus, Duration::from_millis(20)).await;
+        let mut rx = a.members();
+        assert_eq!(*rx.borrow(), nodes(&["n1", "n2"]));
+        // Запись n2 истекла: сигнала нет, состав перечитывается по таймеру аренды.
+        clock.advance(Duration::from_secs(16));
+        assert_eq!(next(&mut rx).await, nodes(&["n1"]));
+    }
+
+    #[tokio::test]
+    async fn resync_and_resubscribe_reread_membership() {
+        // Без шины у членства: изменения состава приходят только сверкой.
+        let bus = MemEventBus::new(1);
+        let m = MemMembership::default();
+        join(&m, "n1", LONG).await;
+        let a = start(&m, &bus, LONG).await;
+        let mut rx = a.members();
+
+        // Переполнение буфера подписчика — Resync — сверка.
+        join(&m, "n2", LONG).await;
+        for _ in 0..3 {
+            bus.publish(Event {
+                tenant: TenantId::DEFAULT,
+                account: None,
+                kind: EventKind::QueueReady,
+            })
+            .await
+            .expect("publish");
+        }
+        assert_eq!(next(&mut rx).await, nodes(&["n1", "n2"]));
+
+        // Потеря связи — переподписка — сверка.
+        m.leave(&node("n2")).await.expect("leave");
+        bus.disconnect();
+        assert_eq!(next(&mut rx).await, nodes(&["n1"]));
+        assert_eq!(bus.subscribers(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_error_keeps_members_and_retries() {
+        let bus = MemEventBus::default();
+        let m = MemMembership::default().with_bus(Arc::new(bus.clone()));
+        join(&m, "n1", LONG).await;
+        let a = start(&m, &bus, LONG).await;
+        let mut rx = a.members();
+        // Сигнал уже в буфере; чтение по нему завершится ошибкой, состав прежний до повтора.
+        join(&m, "n2", LONG).await;
+        m.fail_next(Error::UNAVAILABLE);
+        assert_eq!(next(&mut rx).await, nodes(&["n1", "n2"]));
+    }
+
+    #[tokio::test]
     async fn start_fails_without_membership() {
-        let m = Arc::new(StubMembership::default());
-        m.fail(true);
-        let r = RendezvousAssigner::start(m, &PartitionAssignerConfig::default()).await;
+        let bus = MemEventBus::default();
+        let m = MemMembership::default();
+        m.fail_next(Error::UNAVAILABLE);
+        let r = RendezvousAssigner::start(
+            Arc::new(m),
+            Arc::new(bus),
+            &PartitionAssignerConfig::default(),
+        )
+        .await;
         assert!(r.is_err());
     }
 }

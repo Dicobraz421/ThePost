@@ -168,14 +168,6 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     role_names.extend(ext.roles().iter().map(|r| r.name().to_owned()));
     meta.heartbeat_roles(&node, &role_names, events_cfg.node_ttl)
         .await?;
-    let assigner = RendezvousAssigner::start(
-        Arc::new(meta.clone()) as Arc<dyn Membership>,
-        &PartitionAssignerConfig {
-            poll_interval: cluster.assign_poll_interval,
-        },
-    )
-    .await?;
-
     let blob = match ext.blob_store() {
         Some(blob) => blob,
         None => infra::open_blob(&cfg, store.as_ref()).await?,
@@ -184,6 +176,16 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let counters = bus.counters.clone();
     metrics.register_bus(move || infra::bus_sample(counters.snapshot()));
     let bus = bus.bus;
+    // Состав — по сигналу `MembersChanged` и таймеру аренды записи узла (CLU-10).
+    let assigner = RendezvousAssigner::start(
+        Arc::new(meta.clone()) as Arc<dyn Membership>,
+        bus.clone(),
+        &PartitionAssignerConfig {
+            node_ttl: events_cfg.node_ttl,
+            ..PartitionAssignerConfig::default()
+        },
+    )
+    .await?;
 
     // Фоновые задачи узла живут дольше ролей: служебный HTTP отвечает 503 во время drain. Ошибка запуска
     // останавливает уже запущенные (слушатель HTTP-01, перечитывание сертификатов).
@@ -646,8 +648,6 @@ mod tests {
         let secrets = Arc::new(MemSecretStore::default());
         // Без пароля в адресе (trust) пароль серверу не нужен, но ссылка всё равно разрешается.
         let db: SecretRef = "thepost/db#password".parse().expect("ref");
-        secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
-        let valkey: SecretRef = "thepost/valkey#password".parse().expect("ref");
         let node = format!("app-test-{}", std::process::id());
         let blob = dir.path().join("blob");
         let path = write_config(
@@ -656,7 +656,6 @@ mod tests {
                 "domain: example.org\nprofile: dev\nroles: [all]\n\
                  service_http:\n  listen: 127.0.0.1:0\n  allow_plaintext: true\n\
                  database:\n  url: \"{url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
-                 bus:\n  valkey:\n    password: {{ secret: \"{valkey}\" }}\n\
                  meta:\n  events:\n    node_ttl: 3s\n\
                  cluster:\n  node_id: {node}\n\
                  runtime:\n  drain_deadline: 5s\n\
@@ -665,12 +664,11 @@ mod tests {
                 blob.display()
             ),
         );
-        // Секреты конфигурации читаются все при запуске: пароля Valkey (шиной в процессе он не используется)
-        // нет в хранилище — узел не стартует.
+        // Секреты конфигурации читаются все при запуске: пароля базы нет в хранилище — узел не стартует.
         let (o, _) = opts(path.clone(), Some(secrets.clone()));
-        let e = start(o).await.expect_err("no valkey secret").to_string();
-        assert!(e.contains("thepost/valkey#password"), "{e}");
-        secrets.set(&valkey, "pw");
+        let e = start(o).await.expect_err("no db secret").to_string();
+        assert!(e.contains("thepost/db#password"), "{e}");
+        secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
         let (o, shutdown) = opts(path, Some(secrets));
         let running = start(o).await.expect("start");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);

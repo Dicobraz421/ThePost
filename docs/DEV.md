@@ -4,7 +4,7 @@
 - Linux x86_64/AArch64 (на Windows — WSL2 Ubuntu). Rust stable (`rust-toolchain.toml`), `cargo-nextest`.
 - Зависимости для интеграционных тестов: `docker compose -f deploy/compose/dev.yml up -d` (после DEP-01).
 - Переменные: `TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres`,
-  `TEST_S3_URL`, `TEST_VALKEY_URL`, `TEST_LDAP_URL` — тесты без переменной пропускаются (`tp_testkit::pg_url()`).
+  `TEST_S3_URL`, `TEST_LDAP_URL` — тесты без переменной пропускаются (`tp_testkit::pg_url()`).
 
 ## Проверки (конец волны)
 ```

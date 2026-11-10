@@ -81,6 +81,7 @@ async fn mailbox_exists(
 #[async_trait]
 impl AclStore for PgMeta {
     async fn acl(&self, owner: AccountScope, mailbox: MailboxId) -> Result<Vec<AclEntry>> {
+        self.idempotent(|| async move {
         let mut tx = begin(&self.pool, owner.tenant).await?;
         if !mailbox_exists(&mut tx, owner, mailbox).await? {
             return Err(Error::NotFound);
@@ -104,6 +105,7 @@ impl AclStore for PgMeta {
                 })
             })
             .collect()
+}).await
     }
 
     async fn set_acl(
@@ -113,25 +115,26 @@ impl AclStore for PgMeta {
         identifier: &str,
         rights: Rights,
     ) -> Result<()> {
-        validate_identifier(identifier, true)?;
-        let mut tx = begin(&self.pool, owner.tenant).await?;
-        if !mailbox_exists(&mut tx, owner, mailbox).await? {
-            return Err(Error::NotFound);
-        }
-        if rights.is_empty() {
-            sqlx::query(
-                "DELETE FROM mailbox_acl
+        self.once(async move {
+            validate_identifier(identifier, true)?;
+            let mut tx = begin(&self.pool, owner.tenant).await?;
+            if !mailbox_exists(&mut tx, owner, mailbox).await? {
+                return Err(Error::NotFound);
+            }
+            if rights.is_empty() {
+                sqlx::query(
+                    "DELETE FROM mailbox_acl
                  WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3 AND identifier = $4",
-            )
-            .bind(owner.tenant.as_uuid())
-            .bind(owner.account.as_uuid())
-            .bind(mailbox.as_uuid())
-            .bind(identifier)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        } else {
-            sqlx::query(
+                )
+                .bind(owner.tenant.as_uuid())
+                .bind(owner.account.as_uuid())
+                .bind(mailbox.as_uuid())
+                .bind(identifier)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            } else {
+                sqlx::query(
                 "INSERT INTO mailbox_acl (tenant_id, account_id, mailbox_id, identifier, rights)
                  VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (tenant_id, account_id, mailbox_id, identifier)
@@ -145,9 +148,11 @@ impl AclStore for PgMeta {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        }
-        tx.commit().await.map_err(db_err)?;
-        Ok(())
+            }
+            tx.commit().await.map_err(db_err)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn acl_rights(
@@ -156,23 +161,26 @@ impl AclStore for PgMeta {
         mailbox: MailboxId,
         identifiers: &[String],
     ) -> Result<Rights> {
-        let (pos, neg) = with_negatives(identifiers)?;
-        let mut tx = begin(&self.pool, owner.tenant).await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT identifier, rights FROM mailbox_acl
+        self.idempotent(|| async move {
+            let (pos, neg) = with_negatives(identifiers)?;
+            let mut tx = begin(&self.pool, owner.tenant).await?;
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT identifier, rights FROM mailbox_acl
              WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3
                AND (identifier = ANY($4) OR identifier = ANY($5))",
-        )
-        .bind(owner.tenant.as_uuid())
-        .bind(owner.account.as_uuid())
-        .bind(mailbox.as_uuid())
-        .bind(&pos)
-        .bind(&neg)
-        .fetch_all(&mut *tx)
+            )
+            .bind(owner.tenant.as_uuid())
+            .bind(owner.account.as_uuid())
+            .bind(mailbox.as_uuid())
+            .bind(&pos)
+            .bind(&neg)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            effective(rows)
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        effective(rows)
     }
 
     async fn shared_mailboxes(
@@ -180,11 +188,12 @@ impl AclStore for PgMeta {
         tenant: TenantId,
         identifiers: &[String],
     ) -> Result<Vec<SharedMailbox>> {
-        let (pos, neg) = with_negatives(identifiers)?;
-        let mut tx = begin(&self.pool, tenant).await?;
-        // Папки с положительной записью субъекта, затем все его записи на эти папки.
-        let rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
-            "WITH boxes AS (
+        self.idempotent(|| async move {
+            let (pos, neg) = with_negatives(identifiers)?;
+            let mut tx = begin(&self.pool, tenant).await?;
+            // Папки с положительной записью субъекта, затем все его записи на эти папки.
+            let rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+                "WITH boxes AS (
                  SELECT DISTINCT account_id, mailbox_id FROM mailbox_acl
                  WHERE tenant_id = $1 AND identifier = ANY($2)
              )
@@ -192,61 +201,66 @@ impl AclStore for PgMeta {
              FROM mailbox_acl a JOIN boxes b USING (account_id, mailbox_id)
              WHERE a.tenant_id = $1 AND (a.identifier = ANY($2) OR a.identifier = ANY($3))
              ORDER BY a.account_id, a.mailbox_id",
-        )
-        .bind(tenant.as_uuid())
-        .bind(&pos)
-        .bind(&neg)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        let mut out: Vec<SharedMailbox> = Vec::new();
-        let mut group: Vec<(String, String)> = Vec::new();
-        let mut current: Option<(Uuid, Uuid)> = None;
-        let mut flush = |key: Option<(Uuid, Uuid)>, group: &mut Vec<(String, String)>| {
-            if let Some((account, mailbox)) = key {
-                let rights = effective(std::mem::take(group))?;
-                if rights.contains(Rights::LOOKUP) {
-                    out.push(SharedMailbox {
-                        account: AccountId::from_uuid(account),
-                        mailbox: MailboxId::from_uuid(mailbox),
-                        rights,
-                    });
+            )
+            .bind(tenant.as_uuid())
+            .bind(&pos)
+            .bind(&neg)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            let mut out: Vec<SharedMailbox> = Vec::new();
+            let mut group: Vec<(String, String)> = Vec::new();
+            let mut current: Option<(Uuid, Uuid)> = None;
+            let mut flush = |key: Option<(Uuid, Uuid)>, group: &mut Vec<(String, String)>| {
+                if let Some((account, mailbox)) = key {
+                    let rights = effective(std::mem::take(group))?;
+                    if rights.contains(Rights::LOOKUP) {
+                        out.push(SharedMailbox {
+                            account: AccountId::from_uuid(account),
+                            mailbox: MailboxId::from_uuid(mailbox),
+                            rights,
+                        });
+                    }
                 }
+                Ok::<(), Error>(())
+            };
+            for (account, mailbox, id, rights) in rows {
+                if current != Some((account, mailbox)) {
+                    flush(current, &mut group)?;
+                    current = Some((account, mailbox));
+                }
+                group.push((id, rights));
             }
-            Ok::<(), Error>(())
-        };
-        for (account, mailbox, id, rights) in rows {
-            if current != Some((account, mailbox)) {
-                flush(current, &mut group)?;
-                current = Some((account, mailbox));
-            }
-            group.push((id, rights));
-        }
-        flush(current, &mut group)?;
-        Ok(out)
+            flush(current, &mut group)?;
+            Ok(out)
+        })
+        .await
     }
 
     async fn send_delegations(&self, owner: AccountScope) -> Result<Vec<SendDelegation>> {
-        let mut tx = begin(&self.pool, owner.tenant).await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT delegate, kind FROM send_delegations
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, owner.tenant).await?;
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT delegate, kind FROM send_delegations
              WHERE tenant_id = $1 AND account_id = $2 ORDER BY delegate COLLATE \"C\"",
-        )
-        .bind(owner.tenant.as_uuid())
-        .bind(owner.account.as_uuid())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        rows.into_iter()
-            .map(|(delegate, kind)| {
-                Ok(SendDelegation {
-                    delegate,
-                    right: parse_kind(&kind)?,
+            )
+            .bind(owner.tenant.as_uuid())
+            .bind(owner.account.as_uuid())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            rows.into_iter()
+                .map(|(delegate, kind)| {
+                    Ok(SendDelegation {
+                        delegate,
+                        right: parse_kind(&kind)?,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
+        .await
     }
 
     async fn set_send_delegation(
@@ -255,6 +269,7 @@ impl AclStore for PgMeta {
         delegate: &str,
         right: Option<SendRight>,
     ) -> Result<()> {
+        self.once(async move {
         validate_identifier(delegate, false)?;
         let mut tx = begin(&self.pool, owner.tenant).await?;
         let found: Option<i32> =
@@ -296,6 +311,7 @@ impl AclStore for PgMeta {
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
+}).await
     }
 
     async fn send_right_of(
@@ -303,30 +319,33 @@ impl AclStore for PgMeta {
         owner: AccountScope,
         identifiers: &[String],
     ) -> Result<Option<SendRight>> {
-        for id in identifiers {
-            validate_identifier(id, false)?;
-        }
-        let mut tx = begin(&self.pool, owner.tenant).await?;
-        let kinds: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT kind FROM send_delegations
+        self.idempotent(|| async move {
+            for id in identifiers {
+                validate_identifier(id, false)?;
+            }
+            let mut tx = begin(&self.pool, owner.tenant).await?;
+            let kinds: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT kind FROM send_delegations
              WHERE tenant_id = $1 AND account_id = $2 AND delegate = ANY($3)",
-        )
-        .bind(owner.tenant.as_uuid())
-        .bind(owner.account.as_uuid())
-        .bind(identifiers)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        let rights = kinds
-            .iter()
-            .map(|k| parse_kind(k))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(if rights.contains(&SendRight::SendAs) {
-            Some(SendRight::SendAs)
-        } else {
-            rights.first().copied()
+            )
+            .bind(owner.tenant.as_uuid())
+            .bind(owner.account.as_uuid())
+            .bind(identifiers)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            let rights = kinds
+                .iter()
+                .map(|k| parse_kind(k))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(if rights.contains(&SendRight::SendAs) {
+                Some(SendRight::SendAs)
+            } else {
+                rights.first().copied()
+            })
         })
+        .await
     }
 }
 

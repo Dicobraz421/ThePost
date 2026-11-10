@@ -225,8 +225,15 @@ impl Jmap {
     /// Сохраняет загруженный файл как объект BLOB организации без ссылок (протокол SRS 3.4)
     /// и отмечает его доступным учётной записи на `upload_ttl`.
     pub(crate) async fn put_upload(&self, scope: AccountScope, data: Bytes) -> Result<BlobKey> {
+        let key = self.put_object(scope.tenant, data).await?;
+        self.uploaded.record(scope, key, self.cfg.upload_ttl);
+        Ok(key)
+    }
+
+    /// Записывает объект BLOB организации без ссылок (протокол SRS 3.4): объект ждёт сборки мусора по окну
+    /// или учёта в письме.
+    pub(crate) async fn put_object(&self, tenant: TenantId, data: Bytes) -> Result<BlobKey> {
         let d = &self.d;
-        let tenant = scope.tenant;
         let hash = BlobHash(Sha256::digest(&data).into());
         let generation = match d.blob_index.acquire(tenant, &hash, 1).await? {
             Acquire::Existing { generation } => generation,
@@ -250,15 +257,13 @@ impl Jmap {
                 }
             }
         };
-        // Ссылка загрузки снимается: объект ждёт сборки мусора по окну или учёта в письме.
+        // Ссылка записи снимается: объект ждёт сборки мусора по окну или учёта в письме.
         d.blob_index.release(tenant, &hash, generation, 1).await?;
-        let key = BlobKey {
+        Ok(BlobKey {
             tenant,
             hash,
             generation,
-        };
-        self.uploaded.record(scope, key, self.cfg.upload_ttl);
-        Ok(key)
+        })
     }
 }
 

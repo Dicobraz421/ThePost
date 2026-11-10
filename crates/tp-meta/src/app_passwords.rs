@@ -35,22 +35,26 @@ impl From<Row> for AppPassword {
 #[async_trait]
 impl AppPasswordStore for PgMeta {
     async fn list(&self, scope: AccountScope) -> Result<Vec<AppPassword>> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let rows: Vec<Row> = sqlx::query_as(
-            "SELECT password_id, label, hash, created_at, revoked_at FROM app_passwords
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let rows: Vec<Row> = sqlx::query_as(
+                "SELECT password_id, label, hash, created_at, revoked_at FROM app_passwords
              WHERE tenant_id = $1 AND account_id = $2
              ORDER BY created_at, password_id COLLATE \"C\"",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .fetch_all(&mut *tx)
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(rows.into_iter().map(AppPassword::from).collect())
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(rows.into_iter().map(AppPassword::from).collect())
     }
 
     async fn insert(&self, scope: AccountScope, password: AppPassword) -> Result<()> {
+        self.once(async move {
         password.validate()?;
         let mut tx = begin(&self.pool, scope.tenant).await?;
         let found: Option<i32> =
@@ -80,26 +84,30 @@ impl AppPasswordStore for PgMeta {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
+}).await
     }
 
     async fn revoke(&self, scope: AccountScope, id: &str, at: OffsetDateTime) -> Result<()> {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let updated = sqlx::query(
-            "UPDATE app_passwords SET revoked_at = COALESCE(revoked_at, $4)
+        self.once(async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let updated = sqlx::query(
+                "UPDATE app_passwords SET revoked_at = COALESCE(revoked_at, $4)
              WHERE tenant_id = $1 AND account_id = $2 AND password_id = $3",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(id)
-        .bind(at)
-        .execute(&mut *tx)
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            tx.commit().await.map_err(db_err)?;
+            if updated == 0 {
+                return Err(Error::NotFound);
+            }
+            Ok(())
+        })
         .await
-        .map_err(db_err)?
-        .rows_affected();
-        tx.commit().await.map_err(db_err)?;
-        if updated == 0 {
-            return Err(Error::NotFound);
-        }
-        Ok(())
     }
 }

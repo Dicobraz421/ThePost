@@ -70,61 +70,68 @@ impl PgMeta {
     /// Страница короче `limit` — последняя. Каждая страница — своя короткая транзакция по первичному ключу:
     /// записи, добавленные или удалённые во время перечисления, могут попасть или не попасть в него.
     pub async fn live_blobs(&self, after: Option<&BlobKey>, limit: usize) -> Result<Vec<LiveBlob>> {
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        // Нулевой uuid и пустой хэш меньше любого ключа таблицы (хэш — 32 байта).
-        let (tenant, hash) = after.map_or((Uuid::nil(), Vec::new()), |k| {
-            (*k.tenant.as_uuid(), k.hash.as_bytes().to_vec())
-        });
-        let mut tx = begin_system(&self.pool).await?;
-        let rows: Vec<(Uuid, Vec<u8>, i64, i64, bool, String)> = sqlx::query_as(
-            "SELECT tenant_id, hash, gen, size, damaged_at IS NOT NULL, compression FROM blobs
+        self.idempotent(|| async move {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            // Нулевой uuid и пустой хэш меньше любого ключа таблицы (хэш — 32 байта).
+            let (tenant, hash) = after.map_or((Uuid::nil(), Vec::new()), |k| {
+                (*k.tenant.as_uuid(), k.hash.as_bytes().to_vec())
+            });
+            let mut tx = begin_system(&self.pool).await?;
+            let rows: Vec<(Uuid, Vec<u8>, i64, i64, bool, String)> = sqlx::query_as(
+                "SELECT tenant_id, hash, gen, size, damaged_at IS NOT NULL, compression FROM blobs
              WHERE (tenant_id, hash) > ($1, $2) AND state = 'live'
              ORDER BY tenant_id, hash LIMIT $3",
-        )
-        .bind(tenant)
-        .bind(hash)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        rows.into_iter()
-            .map(|(tenant, hash, g, size, damaged, compression)| {
-                Ok(LiveBlob {
-                    key: key_of(tenant, hash, g)?,
-                    size: u64::try_from(size).map_err(|_| Error::internal("размер в blobs"))?,
-                    damaged,
-                    compression: compression_of(&compression)?,
+            )
+            .bind(tenant)
+            .bind(hash)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            rows.into_iter()
+                .map(|(tenant, hash, g, size, damaged, compression)| {
+                    Ok(LiveBlob {
+                        key: key_of(tenant, hash, g)?,
+                        size: u64::try_from(size).map_err(|_| Error::internal("размер в blobs"))?,
+                        damaged,
+                        compression: compression_of(&compression)?,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
+        .await
     }
 
     /// Помечает запись `live` поколения `key` повреждённой: объекта нет в хранилище или он испорчен (SRS 3.5).
     /// Повторная пометка сохраняет время первой. `false` — такой записи нет (объект удалён или
     /// загружен заново другим поколением): помечать нечего.
     pub async fn mark_blob_damaged(&self, key: &BlobKey) -> Result<bool> {
-        let mut tx = begin(&self.pool, key.tenant).await?;
-        let marked = sqlx::query(
-            "UPDATE blobs SET damaged_at = coalesce(damaged_at, now())
+        self.once(async move {
+            let mut tx = begin(&self.pool, key.tenant).await?;
+            let marked = sqlx::query(
+                "UPDATE blobs SET damaged_at = coalesce(damaged_at, now())
              WHERE tenant_id = $1 AND hash = $2 AND gen = $3 AND state = 'live'",
-        )
-        .bind(key.tenant.as_uuid())
-        .bind(key.hash.as_bytes().as_slice())
-        .bind(i64::from(key.generation.0))
-        .execute(&mut *tx)
+            )
+            .bind(key.tenant.as_uuid())
+            .bind(key.hash.as_bytes().as_slice())
+            .bind(i64::from(key.generation.0))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+                == 1;
+            tx.commit().await.map_err(db_err)?;
+            Ok(marked)
+        })
         .await
-        .map_err(db_err)?
-        .rows_affected()
-            == 1;
-        tx.commit().await.map_err(db_err)?;
-        Ok(marked)
     }
 }
 
 #[async_trait]
 impl BlobIndex for PgMeta {
     async fn acquire(&self, tenant: TenantId, hash: &BlobHash, refs: u32) -> Result<Acquire> {
+        self.once(async move {
         let refs = refs_arg(refs)?;
         let mut tx = begin(&self.pool, tenant).await?;
         // Вложенный SELECT видит снимок до UPDATE: поколение записи в любом состоянии.
@@ -154,6 +161,7 @@ impl BlobIndex for PgMeta {
                 generation: Gen::INITIAL,
             },
         })
+}).await
     }
 
     async fn commit_new(
@@ -181,6 +189,7 @@ impl BlobIndex for PgMeta {
         refs: u32,
         compression: Compression,
     ) -> Result<Commit> {
+        self.once(async move {
         let refs = refs_arg(refs)?;
         let size = crate::schema::to_i64(size)?;
         let mut tx = begin(&self.pool, tenant).await?;
@@ -224,6 +233,7 @@ impl BlobIndex for PgMeta {
                 generation: g.next(),
             }
         })
+}).await
     }
 
     async fn release(
@@ -233,10 +243,11 @@ impl BlobIndex for PgMeta {
         generation: Gen,
         refs: u32,
     ) -> Result<()> {
-        let refs = refs_arg(refs)?;
-        let mut tx = begin(&self.pool, tenant).await?;
-        let (released, present): (bool, bool) = sqlx::query_as(
-            "WITH up AS (
+        self.once(async move {
+            let refs = refs_arg(refs)?;
+            let mut tx = begin(&self.pool, tenant).await?;
+            let (released, present): (bool, bool) = sqlx::query_as(
+                "WITH up AS (
                  UPDATE blobs SET refcnt = refcnt - $4,
                                   zero_since = CASE WHEN refcnt = $4 THEN now() ELSE zero_since END
                  WHERE tenant_id = $1 AND hash = $2 AND gen = $3 AND state = 'live' AND refcnt >= $4
@@ -244,20 +255,22 @@ impl BlobIndex for PgMeta {
              SELECT EXISTS (SELECT 1 FROM up),
                     EXISTS (SELECT 1 FROM blobs WHERE tenant_id = $1 AND hash = $2 AND gen = $3
                                                   AND state = 'live')",
-        )
-        .bind(tenant.as_uuid())
-        .bind(hash.as_bytes().as_slice())
-        .bind(i64::from(generation.0))
-        .bind(refs)
-        .fetch_one(&mut *tx)
+            )
+            .bind(tenant.as_uuid())
+            .bind(hash.as_bytes().as_slice())
+            .bind(i64::from(generation.0))
+            .bind(refs)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            match (released, present) {
+                (true, _) => Ok(()),
+                (false, true) => Err(Error::Conflict),
+                (false, false) => Err(Error::NotFound),
+            }
+        })
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        match (released, present) {
-            (true, _) => Ok(()),
-            (false, true) => Err(Error::Conflict),
-            (false, false) => Err(Error::NotFound),
-        }
     }
 
     async fn gc_candidates(
@@ -265,6 +278,7 @@ impl BlobIndex for PgMeta {
         older_than: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<BlobKey>> {
+        self.idempotent(|| async move {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut tx = begin_system(&self.pool).await?;
         sqlx::query(
@@ -292,47 +306,55 @@ impl BlobIndex for PgMeta {
         rows.into_iter()
             .map(|(tenant, hash, g)| key_of(tenant, hash, g))
             .collect()
+}).await
     }
 
     async fn mark_deleting(&self, key: &BlobKey, older_than: OffsetDateTime) -> Result<bool> {
-        let mut tx = begin(&self.pool, key.tenant).await?;
-        let marked = sqlx::query(
-            "UPDATE blobs SET state = 'deleting'
+        self.once(async move {
+            let mut tx = begin(&self.pool, key.tenant).await?;
+            let marked = sqlx::query(
+                "UPDATE blobs SET state = 'deleting'
              WHERE tenant_id = $1 AND hash = $2 AND gen = $3 AND refcnt = 0
                AND state IN ('live', 'deleting') AND zero_since < $4",
-        )
-        .bind(key.tenant.as_uuid())
-        .bind(key.hash.as_bytes().as_slice())
-        .bind(i64::from(key.generation.0))
-        .bind(older_than)
-        .execute(&mut *tx)
+            )
+            .bind(key.tenant.as_uuid())
+            .bind(key.hash.as_bytes().as_slice())
+            .bind(i64::from(key.generation.0))
+            .bind(older_than)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+                == 1;
+            tx.commit().await.map_err(db_err)?;
+            Ok(marked)
+        })
         .await
-        .map_err(db_err)?
-        .rows_affected()
-            == 1;
-        tx.commit().await.map_err(db_err)?;
-        Ok(marked)
     }
 
     async fn finalize_delete(&self, key: &BlobKey) -> Result<bool> {
-        let mut tx = begin(&self.pool, key.tenant).await?;
-        let done = sqlx::query(
-            "UPDATE blobs SET state = 'deleted', zero_since = now()
+        self.once(async move {
+            let mut tx = begin(&self.pool, key.tenant).await?;
+            let done = sqlx::query(
+                "UPDATE blobs SET state = 'deleted', zero_since = now()
              WHERE tenant_id = $1 AND hash = $2 AND gen = $3 AND state = 'deleting'",
-        )
-        .bind(key.tenant.as_uuid())
-        .bind(key.hash.as_bytes().as_slice())
-        .bind(i64::from(key.generation.0))
-        .execute(&mut *tx)
+            )
+            .bind(key.tenant.as_uuid())
+            .bind(key.hash.as_bytes().as_slice())
+            .bind(i64::from(key.generation.0))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+                == 1;
+            tx.commit().await.map_err(db_err)?;
+            Ok(done)
+        })
         .await
-        .map_err(db_err)?
-        .rows_affected()
-            == 1;
-        tx.commit().await.map_err(db_err)?;
-        Ok(done)
     }
 
     async fn exists(&self, key: &BlobKey) -> Result<bool> {
+        self.idempotent(|| async move {
         let mut tx = begin(&self.pool, key.tenant).await?;
         let found: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM blobs
@@ -346,25 +368,29 @@ impl BlobIndex for PgMeta {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(found)
+}).await
     }
 
     async fn compression(&self, key: &BlobKey) -> Result<Option<Compression>> {
-        let key = *key;
-        let found: Option<String> = with_tenant(&self.pool, key.tenant, move |tx| {
-            Box::pin(async move {
-                sqlx::query_scalar(
-                    "SELECT compression FROM blobs
+        self.idempotent(|| async move {
+            let key = *key;
+            let found: Option<String> = with_tenant(&self.pool, key.tenant, move |tx| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT compression FROM blobs
                      WHERE tenant_id = $1 AND hash = $2 AND gen = $3 AND state <> 'deleted'",
-                )
-                .bind(key.tenant.as_uuid())
-                .bind(key.hash.as_bytes().as_slice())
-                .bind(i64::from(key.generation.0))
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)
+                    )
+                    .bind(key.tenant.as_uuid())
+                    .bind(key.hash.as_bytes().as_slice())
+                    .bind(i64::from(key.generation.0))
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)
+                })
             })
+            .await?;
+            found.as_deref().map(compression_of).transpose()
         })
-        .await?;
-        found.as_deref().map(compression_of).transpose()
+        .await
     }
 }

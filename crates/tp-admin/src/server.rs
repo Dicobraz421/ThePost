@@ -37,6 +37,7 @@ use tp_contracts::groups::GroupStore;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountStore, PolicyResolver};
 use tp_contracts::retention::{Quota, TrashStore};
+use tp_contracts::transport::TransportStore;
 use tp_contracts::{Error, Result, TenantId};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
@@ -66,7 +67,7 @@ pub const MODULE_PREFIX: &str = "/api/v1/modules/";
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AdminRole {
-    /// Администратор инсталляции: все организации.
+    /// Администратор инсталляции: все организации и уровень кластера (`/api/v1/transport...`).
     InstallationAdmin,
     /// Администратор организации: только своя организация.
     OrganizationAdmin,
@@ -89,10 +90,11 @@ impl AdminRole {
         let read = *method == Method::GET || *method == Method::HEAD;
         let own_scope = tenant.is_none_or(|t| t == own);
         let audit = route == AUDIT_ROUTE;
+        let cluster = route.starts_with(crate::transport::CLUSTER_PREFIX);
         match self {
             AdminRole::InstallationAdmin => true,
-            AdminRole::OrganizationAdmin => own_scope,
-            AdminRole::Operator => own_scope && read && !audit,
+            AdminRole::OrganizationAdmin => own_scope && !cluster,
+            AdminRole::Operator => own_scope && read && !audit && !cluster,
             AdminRole::Auditor => {
                 read && (route == WHOAMI_ROUTE || (audit && tenant.is_some_and(|t| t == own)))
             }
@@ -282,10 +284,21 @@ impl fmt::Debug for Deps {
 }
 
 /// Сервер Admin API; HTTP — [`Admin::router`].
-#[derive(Debug)]
 pub struct Admin {
     pub(crate) d: Deps,
     pub(crate) cfg: AdminConfig,
+    /// Настройки транспорта; `None` — не подключено (маршруты отвечают 503).
+    pub(crate) transport: Option<Arc<dyn TransportStore>>,
+}
+
+impl fmt::Debug for Admin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Admin")
+            .field("d", &self.d)
+            .field("cfg", &self.cfg)
+            .field("transport", &self.transport.is_some())
+            .finish()
+    }
 }
 
 impl Admin {
@@ -306,7 +319,17 @@ impl Admin {
                 return Err(Error::Conflict);
             }
         }
-        Ok(Self { d, cfg })
+        Ok(Self {
+            d,
+            cfg,
+            transport: None,
+        })
+    }
+
+    /// Подключает настройки транспорта ([`crate::transport`]).
+    pub fn with_transport(mut self, transport: Arc<dyn TransportStore>) -> Self {
+        self.transport = Some(transport);
+        self
     }
 
     /// Маршруты Admin API; TLS, слушатель (по умолчанию — внутренние адреса) — у вызывающего (`tp-platform`).
@@ -318,6 +341,7 @@ impl Admin {
         api = crate::audit::routes(api);
         api = crate::delivery::routes(api);
         api = crate::groups::routes(api);
+        api = crate::transport::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -606,6 +630,7 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     api.merge(crate::audit::Doc::openapi());
     api.merge(crate::delivery::Doc::openapi());
     api.merge(crate::groups::Doc::openapi());
+    api.merge(crate::transport::Doc::openapi());
     api
 }
 

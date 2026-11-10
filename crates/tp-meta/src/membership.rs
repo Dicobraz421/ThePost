@@ -112,28 +112,32 @@ impl PgMeta {
 
     /// Все записи узлов, включая просроченные, по имени узла.
     pub async fn nodes(&self) -> Result<Vec<NodeRecord>> {
-        let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT node_id, roles, addr, site, joined_at, expires_at FROM nodes
+        self.idempotent(|| async move {
+            let rows: Vec<NodeRow> = sqlx::query_as(
+                r#"SELECT node_id, roles, addr, site, joined_at, expires_at FROM nodes
                ORDER BY node_id COLLATE "C""#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        rows.into_iter()
-            .map(|r| {
-                Ok(NodeRecord {
-                    node: node_id(r.node_id)?,
-                    roles: r.roles,
-                    addr: r.addr,
-                    site: site_id(r.site)?,
-                    joined_at: r.joined_at,
-                    expires_at: r.expires_at,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            rows.into_iter()
+                .map(|r| {
+                    Ok(NodeRecord {
+                        node: node_id(r.node_id)?,
+                        roles: r.roles,
+                        addr: r.addr,
+                        site: site_id(r.site)?,
+                        joined_at: r.joined_at,
+                        expires_at: r.expires_at,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
+        .await
     }
 
     async fn upsert_node(&self, node: &NodeId, up: Upsert<'_>, ttl: Duration) -> Result<()> {
+        self.once(async move {
         if let Some(addr) = up.addr
             && (addr.len() > 2048 || addr.chars().any(|c| c.is_whitespace() || c.is_control()))
         {
@@ -171,6 +175,7 @@ impl PgMeta {
             self.members_changed().await;
         }
         Ok(())
+}).await
     }
 
     /// Сигнал `MembersChanged` (после фиксации).
@@ -197,38 +202,48 @@ impl Membership for PgMeta {
     }
 
     async fn leave(&self, node: &NodeId) -> Result<()> {
-        // Выход живого узла — сигнал; удаление истёкшей записи состав не меняет.
-        let was_live: Option<bool> =
-            sqlx::query_scalar("DELETE FROM nodes WHERE node_id = $1 RETURNING expires_at > now()")
-                .bind(node.as_str())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
-        if was_live == Some(true) {
-            self.members_changed().await;
-        }
-        Ok(())
+        self.once(async move {
+            // Выход живого узла — сигнал; удаление истёкшей записи состав не меняет.
+            let was_live: Option<bool> = sqlx::query_scalar(
+                "DELETE FROM nodes WHERE node_id = $1 RETURNING expires_at > now()",
+            )
+            .bind(node.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            if was_live == Some(true) {
+                self.members_changed().await;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn live_info(&self) -> Result<Vec<NodeInfo>> {
-        // Порядок `COLLATE "C"` — побайтовый, как `Ord` у `NodeId`.
-        let rows: Vec<InfoRow> = sqlx::query_as(
-            r#"SELECT node_id, roles, addr, site FROM nodes WHERE expires_at > now()
+        self.idempotent(|| async move {
+            // Порядок `COLLATE "C"` — побайтовый, как `Ord` у `NodeId`.
+            let rows: Vec<InfoRow> = sqlx::query_as(
+                r#"SELECT node_id, roles, addr, site FROM nodes WHERE expires_at > now()
                ORDER BY node_id COLLATE "C""#,
-        )
-        .fetch_all(&self.pool)
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            rows.into_iter().map(InfoRow::into_info).collect()
+        })
         .await
-        .map_err(db_err)?;
-        rows.into_iter().map(InfoRow::into_info).collect()
     }
 
     async fn live(&self) -> Result<Vec<NodeId>> {
-        let names: Vec<String> = sqlx::query_scalar(
+        self.idempotent(|| async move {
+            let names: Vec<String> = sqlx::query_scalar(
             r#"SELECT node_id FROM nodes WHERE expires_at > now() ORDER BY node_id COLLATE "C""#,
         )
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        names.into_iter().map(node_id).collect()
+            names.into_iter().map(node_id).collect()
+        })
+        .await
     }
 }
