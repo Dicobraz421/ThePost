@@ -71,53 +71,66 @@ impl fmt::Debug for QueueDeps {
     }
 }
 
-impl QueueDeps {
-    /// Загружает письмо одним объектом с одной ссылкой (SRS 3.4, шаги 2–3).
-    async fn store_blob(&self, tenant: TenantId, data: Bytes) -> Result<BlobKey> {
-        let hash = tp_mailstore::split::hash(&data);
-        let mut generation = match self.index.acquire(tenant, &hash, 1).await? {
-            Acquire::Existing { generation } => {
+/// Загружает письмо одним объектом с одной ссылкой (SRS 3.4, шаги 2–3): очередь, очередь модерации.
+pub(crate) async fn store_blob(
+    blobs: &dyn BlobStore,
+    index: &dyn BlobIndex,
+    tenant: TenantId,
+    data: Bytes,
+) -> Result<BlobKey> {
+    let hash = tp_mailstore::split::hash(&data);
+    let mut generation = match index.acquire(tenant, &hash, 1).await? {
+        Acquire::Existing { generation } => {
+            return Ok(BlobKey {
+                tenant,
+                hash,
+                generation,
+            });
+        }
+        Acquire::Absent { generation } => generation,
+    };
+    loop {
+        let key = BlobKey {
+            tenant,
+            hash,
+            generation,
+        };
+        blobs.put(&key, data.clone()).await?;
+        match index
+            .commit_new(tenant, &hash, generation, data.len() as u64, 1)
+            .await?
+        {
+            Commit::Done { generation } => {
                 return Ok(BlobKey {
                     tenant,
                     hash,
                     generation,
                 });
             }
-            Acquire::Absent { generation } => generation,
-        };
-        loop {
-            let key = BlobKey {
-                tenant,
-                hash,
-                generation,
-            };
-            self.blobs.put(&key, data.clone()).await?;
-            match self
-                .index
-                .commit_new(tenant, &hash, generation, data.len() as u64, 1)
-                .await?
-            {
-                Commit::Done { generation } => {
-                    return Ok(BlobKey {
-                        tenant,
-                        hash,
-                        generation,
-                    });
-                }
-                Commit::Bumped { generation: next } => generation = next,
-            }
+            Commit::Bumped { generation: next } => generation = next,
         }
     }
+}
 
-    /// Снимает ссылку записи очереди на объект; ошибка — в журнал (объект найдёт сверка «сирот»).
+/// Снимает одну ссылку на объект; ошибка — в журнал (объект найдёт сверка «сирот»).
+pub(crate) async fn release_blob(index: &dyn BlobIndex, key: &BlobKey) {
+    if let Err(e) = index
+        .release(key.tenant, &key.hash, key.generation, 1)
+        .await
+    {
+        tracing::error!(error = %e, blob = %key.hash, "smtp: ссылка на письмо не снята");
+    }
+}
+
+impl QueueDeps {
+    /// Загружает письмо одним объектом с одной ссылкой (SRS 3.4, шаги 2–3).
+    async fn store_blob(&self, tenant: TenantId, data: Bytes) -> Result<BlobKey> {
+        store_blob(self.blobs.as_ref(), self.index.as_ref(), tenant, data).await
+    }
+
+    /// Снимает ссылку записи очереди на объект.
     async fn release(&self, key: &BlobKey) {
-        if let Err(e) = self
-            .index
-            .release(key.tenant, &key.hash, key.generation, 1)
-            .await
-        {
-            tracing::error!(error = %e, blob = %key.hash, "smtp: ссылка очереди на письмо не снята");
-        }
+        release_blob(self.index.as_ref(), key).await;
     }
 
     /// Ставит письмо `raw` в очередь получателям `rcpts`; первая попытка — сразу.

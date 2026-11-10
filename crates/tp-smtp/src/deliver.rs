@@ -3,6 +3,9 @@
 //!
 //! [`Delivery`] — обработчик сессий ([`Handler`]) обеих ролей:
 //! - получатель в локальном домене — учётные записи, на которые он разрешается; неизвестный — `550 5.1.1`;
+//!   переполненный ящик — `452 4.2.2` или `552 5.2.2` (`delivery.quota_reject`) до `DATA`;
+//! - группа рассылки ([`Delivery::with_groups`], [`crate::groups`]): отправитель вне круга — `550 5.7.1` на `RCPT`,
+//!   письмо модерируемой группы — в очередь модерации, иначе группа раскрывается;
 //! - внешний получатель: smtp-in — `550 5.7.1` (не открытый релей), submission — в очередь исходящей почты
 //!   ([`Outbound`], [`crate::queue::Queue`]); узел без очереди (`Deps::outbound` = `None`) — `451 4.3.2`;
 //! - submission: до доставки и очереди — `DecisionHooks::on_submission` (`Deny` — `550 5.7.1`; дополнения:
@@ -34,6 +37,7 @@ use bytes::Bytes;
 use time::OffsetDateTime;
 use tp_contracts::auth::{DirChange, DirCursor, Directory};
 use tp_contracts::ext::{CopyTo, Decision, DecisionHooks, SubmissionInfo};
+use tp_contracts::groups::DistributionGroup;
 use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested, MailStore};
 use tp_contracts::meta::{Account, AccountScope, AccountStore, MailboxStore, SpecialUse};
 use tp_contracts::queue::DsnRet;
@@ -42,8 +46,9 @@ use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
 
 use crate::address::{Addressing, Side};
 use crate::authcheck::AuthCheck;
-use crate::config::{DeliveryConfig, SmtpConfig};
+use crate::config::{DeliveryConfig, QuotaReject, SmtpConfig};
 use crate::dsn::{self, DsnSink};
+use crate::groups::{Groups, Hold};
 use crate::milter::{Milters, Verdict};
 use crate::server::{Envelope, Handler, Mode, Reply, reply};
 
@@ -127,6 +132,18 @@ struct Target {
     resolved: Resolved,
     /// Подадрес (`user+tag`): полный адрес для заголовка `Delivered-To` копии.
     delivered_to: Option<String>,
+    /// Адрес — группа рассылки [`Groups`] (ограничения отправителей, модерация).
+    group: Option<DistributionGroup>,
+}
+
+/// Чьё письмо разрешается: отправителя (ограничения и модерация групп) или модуля (копии и пересылки точек
+/// принятия решений — группы только раскрываются).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// Отправитель: учётная запись организации или `None` — внешний.
+    Sender(Option<AccountId>),
+    /// Копия или пересылка модуля.
+    Module,
 }
 
 /// Локальная доставка и обработчик транзакций SMTP.
@@ -136,6 +153,7 @@ pub struct Delivery {
     cfg: DeliveryConfig,
     addressing: Addressing,
     snapshot: Mutex<Option<(Instant, Arc<Snapshot>)>>,
+    groups: Option<Groups>,
 }
 
 impl fmt::Debug for Delivery {
@@ -154,6 +172,8 @@ struct Prepared {
     external: Vec<String>,
     /// Внешние получатели в исходной записи (статусы отправки).
     queued: Vec<String>,
+    /// Модерируемые группы: исходный адрес получателя и группа (по одной записи на группу).
+    held: Vec<(String, DistributionGroup)>,
     /// Получатели, которым письмо не доставлено после приёма (уведомление отправителю).
     failed: Vec<dsn::Recipient>,
 }
@@ -167,7 +187,14 @@ impl Delivery {
             cfg: cfg.delivery.clone(),
             addressing: Addressing::new(&cfg.addressing),
             snapshot: Mutex::new(None),
+            groups: None,
         }
+    }
+
+    /// Группы рассылки с ограничениями отправителей и модерацией (SMTP-16, [`crate::groups`]).
+    pub fn with_groups(mut self, groups: Groups) -> Self {
+        self.groups = Some(groups);
+        self
     }
 
     /// Разрешает адрес получателя: переписывание ([`crate::address`]), затем адрес целиком, адрес без тега
@@ -186,6 +213,7 @@ impl Delivery {
             address: address.clone(),
             resolved,
             delivered_to,
+            group: None,
         };
         let Some((_, domain)) = lower.rsplit_once('@') else {
             return Ok(target(Resolved::Unknown, None));
@@ -193,6 +221,22 @@ impl Delivery {
         let snap = self.snapshot().await?;
         if !snap.domains.contains(domain) {
             return Ok(target(Resolved::External, None));
+        }
+        if let Some(groups) = &self.groups
+            && let Some(group) = groups.by_address(self.deps.tenant, &lower).await?
+        {
+            let mut accounts = Vec::new();
+            for id in groups.members(self.deps.tenant, &group).await? {
+                if let Some(acc) = self.deps.accounts.get(self.deps.tenant, id).await?
+                    && acc.enabled
+                {
+                    accounts.push(acc);
+                }
+            }
+            return Ok(Target {
+                group: Some(group),
+                ..target(Resolved::Local(accounts), None)
+            });
         }
         if let Some(accounts) = self.lookup(&snap, &lower).await? {
             return Ok(target(Resolved::Local(accounts), None));
@@ -364,16 +408,42 @@ impl Delivery {
         found.ok_or_else(|| Error::Internal(format!("account {} has no inbox", scope.account)))
     }
 
-    /// Разрешает всех получателей конверта: доставки (по одной на учётную запись) и внешние адреса.
-    async fn prepare(&self, id: &str, rcpts: &[String], junk: bool) -> Result<Prepared> {
+    /// Разрешает всех получателей конверта: доставки (по одной на учётную запись), внешние адреса,
+    /// модерируемые группы. Отправитель вне круга группы (принят на `RCPT` до изменения группы, отправка
+    /// из JMAP) — в `failed`.
+    async fn prepare(
+        &self,
+        id: &str,
+        rcpts: &[String],
+        junk: bool,
+        origin: Origin,
+    ) -> Result<Prepared> {
         let mut out = Prepared {
             deliveries: Vec::new(),
             external: Vec::new(),
             queued: Vec::new(),
+            held: Vec::new(),
             failed: Vec::new(),
         };
         for rcpt in rcpts {
             let target = self.target(rcpt).await?;
+            if let (Some(group), Origin::Sender(sender)) = (&target.group, origin) {
+                if !self.group_allows(group, sender).await? {
+                    tracing::info!(%id, group = %group.id, "smtp: отправитель вне круга группы рассылки");
+                    out.failed.push(dsn::Recipient::new(
+                        rcpt.clone(),
+                        dsn::Action::Failed,
+                        GROUP_DENIED,
+                    ));
+                    continue;
+                }
+                if group.requires_moderation(sender) {
+                    if !out.held.iter().any(|(_, g)| g.id == group.id) {
+                        out.held.push((rcpt.clone(), group.clone()));
+                    }
+                    continue;
+                }
+            }
             match target.resolved {
                 Resolved::Local(accounts) => {
                     for acc in accounts {
@@ -423,6 +493,63 @@ impl Delivery {
             }
         }
         Ok(out)
+    }
+
+    /// Может ли `sender` писать в группу (без [`Groups`] групп-адресатов нет — да).
+    async fn group_allows(
+        &self,
+        group: &DistributionGroup,
+        sender: Option<AccountId>,
+    ) -> Result<bool> {
+        match &self.groups {
+            Some(g) => g.allowed(self.deps.tenant, group, sender).await,
+            None => Ok(true),
+        }
+    }
+
+    /// Учётная запись отправителя по адресу (отправка вне сессии SMTP: адрес проверил вызывающий):
+    /// ровно одна учётная запись организации, иначе — внешний.
+    async fn sender_by_address(&self, mail_from: &str) -> Result<Option<AccountId>> {
+        if mail_from.is_empty() {
+            return Ok(None);
+        }
+        Ok(match self.target(mail_from).await? {
+            Target {
+                resolved: Resolved::Local(accounts),
+                group: None,
+                ..
+            } if accounts.len() == 1 => Some(accounts[0].id),
+            _ => None,
+        })
+    }
+
+    /// Ставит письмо `raw` в очереди модерации групп `held`.
+    async fn hold_all(
+        &self,
+        held: &[(String, DistributionGroup)],
+        mail_from: &str,
+        sender: Option<AccountId>,
+        raw: &Bytes,
+        at: OffsetDateTime,
+    ) -> Result<()> {
+        let Some(groups) = &self.groups else {
+            return Ok(());
+        };
+        for (_, group) in held {
+            let id = groups
+                .hold(Hold {
+                    tenant: self.deps.tenant,
+                    group,
+                    sender: mail_from,
+                    sender_account: sender,
+                    message_id: crate::tracking::message_id(raw),
+                    raw: raw.clone(),
+                    at,
+                })
+                .await?;
+            tracing::info!(group = %group.id, held = %id, "smtp: письмо ждёт решения модератора группы");
+        }
+        Ok(())
     }
 
     /// Заголовки трассировки (RFC 5321, 4.4): `Return-Path` и `Received`.
@@ -570,7 +697,7 @@ impl Delivery {
         if addresses.is_empty() {
             return Ok(());
         }
-        let copies = self.prepare(id, addresses, junk).await?;
+        let copies = self.prepare(id, addresses, junk, Origin::Module).await?;
         for (_, d) in copies.deliveries {
             if !prepared
                 .deliveries
@@ -601,7 +728,7 @@ impl Delivery {
     ) -> Result<Vec<String>> {
         let mut external = Vec::new();
         while !forward.is_empty() {
-            let p = self.prepare(id, &forward, junk).await?;
+            let p = self.prepare(id, &forward, junk, Origin::Module).await?;
             push_unique(&mut external, p.external);
             let deliveries: Vec<_> = p
                 .deliveries
@@ -716,7 +843,13 @@ impl Delivery {
                 }
             }
         }
-        let mut prepared = self.prepare(&env.id, &env.rcpts, junk).await?;
+        let sender = sender_account(env, self.deps.tenant);
+        let mut prepared = self
+            .prepare(&env.id, &env.rcpts, junk, Origin::Sender(sender))
+            .await?;
+        // Очередь модерации — до доставки: её сбой — временный отказ без частичной доставки.
+        self.hold_all(&prepared.held, &env.mail_from, sender, &full, received_at)
+            .await?;
         let mut copy_to = Vec::new();
         for copy in copies {
             match copy {
@@ -838,12 +971,17 @@ impl Delivery {
                 rcpts: rcpts.iter().map(|r| (r.clone(), status.clone())).collect(),
             });
         }
-        let prepared = self.prepare(&id, rcpts, false).await?;
+        let sender = self.sender_by_address(mail_from).await?;
+        let prepared = self
+            .prepare(&id, rcpts, false, Origin::Sender(sender))
+            .await?;
+        let received_at = OffsetDateTime::now_utc();
+        self.hold_all(&prepared.held, mail_from, sender, &raw, received_at)
+            .await?;
         let queue = self.deps.outbound.is_some();
         if !queue && !prepared.external.is_empty() {
             no_outbound(&id, prepared.external.len());
         }
-        let received_at = OffsetDateTime::now_utc();
         let mut failed = prepared.failed;
         let mut forward = Vec::new();
         if !prepared.deliveries.is_empty() {
@@ -899,6 +1037,9 @@ impl Delivery {
                 let status =
                     if let Some(f) = failed.iter().find(|f| f.address.eq_ignore_ascii_case(r)) {
                         RcptStatus::Failed(f.reply.clone())
+                    } else if prepared.held.iter().any(|(x, _)| x.eq_ignore_ascii_case(r)) {
+                        // Ждёт решения модератора группы.
+                        RcptStatus::Queued
                     } else if prepared.queued.iter().any(|x| x.eq_ignore_ascii_case(r)) {
                         if queue {
                             RcptStatus::Queued
@@ -1067,8 +1208,27 @@ impl DsnSink for Delivery {
 #[async_trait]
 impl Handler for Delivery {
     async fn rcpt(&self, env: &Envelope, rcpt: &str) -> Reply {
-        match self.resolve(rcpt).await {
-            Ok(Resolved::Local(accounts)) => {
+        let target = match self.target(rcpt).await {
+            Ok(t) => t,
+            Err(e) => return temporary(&e),
+        };
+        if let Some(group) = &target.group {
+            let sender = sender_account(env, self.deps.tenant);
+            match self.group_allows(group, sender).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(id = %env.id, group = %group.id, "smtp: отправитель вне круга группы рассылки");
+                    return reply(550, [5, 7, 1], "Sender not allowed to send to this group");
+                }
+                Err(e) => return temporary(&e),
+            }
+            // Письмо модерируемой группы ждёт решения модератора: квоты членов не проверяются.
+            if group.requires_moderation(sender) {
+                return reply(250, [2, 1, 5], "OK");
+            }
+        }
+        match target.resolved {
+            Resolved::Local(accounts) => {
                 if let Some(quota) = &self.deps.quota {
                     for acc in &accounts {
                         let scope = AccountScope {
@@ -1077,8 +1237,13 @@ impl Handler for Delivery {
                         };
                         match quota.check(scope, 0).await {
                             Ok(()) => {}
-                            Err(Error::QuotaExceeded) if accounts.len() == 1 => {
-                                return reply(452, [4, 2, 2], "Mailbox full");
+                            Err(Error::QuotaExceeded)
+                                if accounts.len() == 1 && target.group.is_none() =>
+                            {
+                                return match self.cfg.quota_reject {
+                                    QuotaReject::Temporary => reply(452, [4, 2, 2], "Mailbox full"),
+                                    QuotaReject::Permanent => reply(552, [5, 2, 2], "Mailbox full"),
+                                };
                             }
                             // Группа: переполненный ящик одного члена не отклоняет адрес.
                             Err(Error::QuotaExceeded) => {}
@@ -1088,14 +1253,13 @@ impl Handler for Delivery {
                 }
                 reply(250, [2, 1, 5], "OK")
             }
-            Ok(Resolved::External) => match env.mode {
+            Resolved::External => match env.mode {
                 Mode::Inbound => reply(550, [5, 7, 1], "Relaying denied"),
                 Mode::Submission if self.deps.outbound.is_some() => reply(250, [2, 1, 5], "OK"),
                 // Узел без очереди исходящей почты внешних получателей не принимает.
                 Mode::Submission => reply(451, [4, 3, 2], "Outbound delivery not available"),
             },
-            Ok(Resolved::Unknown) => reply(550, [5, 1, 1], "Mailbox unavailable"),
-            Err(e) => temporary(&e),
+            Resolved::Unknown => reply(550, [5, 1, 1], "Mailbox unavailable"),
         }
     }
 
@@ -1112,6 +1276,17 @@ impl Handler for Delivery {
             Err(e) => temporary(&e),
         }
     }
+}
+
+/// Отказ отправителю вне круга группы рассылки после приёма (уведомление о недоставке).
+const GROUP_DENIED: &str = "550 5.7.1 sender not allowed to send to this group";
+
+/// Учётная запись отправителя транзакции: аутентифицированный пользователь организации; smtp-in — внешний.
+fn sender_account(env: &Envelope, tenant: TenantId) -> Option<AccountId> {
+    env.principal
+        .as_ref()
+        .filter(|p| env.mode == Mode::Submission && p.tenant == tenant)
+        .map(|p| p.account)
 }
 
 /// Временная ошибка (`451 4.3.0`): хранилище или каталог недоступны.

@@ -6,6 +6,7 @@
 //! - [`deliver`] — локальная доставка: разрешение получателей, `Received`, `MailStore::ingest`;
 //! - [`dkim_sign`] — DKIM-подпись исходящей почты;
 //! - [`dsn`] — уведомления о доставке (RFC 3464);
+//! - [`groups`] — группы рассылки при приёме: ограничения отправителей, модерация, раскрытие;
 //! - [`limits`] — лимиты отправки учётной записи в час;
 //! - [`metrics`] — метрики сессий и очереди (`/metrics`);
 //! - [`milter`] — фильтры Milter (антиспам, антивирус) после приёма письма;
@@ -14,6 +15,7 @@
 //!   egress-IP) с перечитыванием по сигналу;
 //! - [`screen`] — экран соединений smtp-in (postscreen): задержка приветствия, конвейер, частота, кэш по IP;
 //! - [`queue`] — очередь исходящей почты и роль smtp-out (отправка на MX через `mail-send`);
+//! - [`tracking`] — журнал доставки (message tracking);
 //! - [`config`] — секция `smtp` config.yaml.
 
 pub mod address;
@@ -22,6 +24,7 @@ pub mod config;
 pub mod deliver;
 pub mod dkim_sign;
 pub mod dsn;
+pub mod groups;
 pub mod limits;
 pub mod metrics;
 pub mod milter;
@@ -30,10 +33,12 @@ pub mod queue;
 pub mod routes;
 pub mod screen;
 pub mod server;
+pub mod tracking;
 
 pub use authcheck::AuthCheck;
 pub use config::SmtpConfig;
 pub use deliver::{Delivery, Outbound, RcptStatus, Submitted};
+pub use groups::Groups;
 pub use limits::SendLimits;
 pub use metrics::SmtpMetrics;
 pub use milter::Milters;

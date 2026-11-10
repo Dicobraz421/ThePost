@@ -278,6 +278,8 @@ pub struct DeliveryConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub directory_refresh: Duration,
+    /// Ответ на `RCPT TO` получателю с переполненным ящиком (проверка до `250`, SRS 4.1).
+    pub quota_reject: QuotaReject,
 }
 
 impl Default for DeliveryConfig {
@@ -285,8 +287,20 @@ impl Default for DeliveryConfig {
         Self {
             local_domains: Vec::new(),
             directory_refresh: Duration::from_secs(5 * 60),
+            quota_reject: QuotaReject::default(),
         }
     }
+}
+
+/// Отказ получателю с переполненным ящиком.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaReject {
+    /// Временный отказ `452 4.2.2`: отправитель повторит, пока владелец освобождает место.
+    #[default]
+    Temporary,
+    /// Постоянный отказ `552 5.2.2`: отправитель сразу получает уведомление о недоставке.
+    Permanent,
 }
 
 /// Проверки SPF, DKIM, DMARC, ARC входящей почты.
