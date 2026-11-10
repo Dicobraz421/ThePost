@@ -20,8 +20,6 @@ blob:
 
 roles: [mailbox]
 
-# Шина событий и кэш — Valkey (секция задаётся платформой, см. thepost config schema).
-
 # Секреты — только из хранилища (OpenBao или Vault), канал — TLS; поля секции — по PLT-12.
 secrets:
   url: https://openbao.example.ru:8200

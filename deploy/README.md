@@ -29,7 +29,7 @@
 
 ### Профиль tls (по умолчанию)
 ```bash
-docker compose -f deploy/compose/dev.yml up -d --wait   # tls-init, postgres-tls, seaweedfs-tls, valkey-tls, openbao-tls
+docker compose -f deploy/compose/dev.yml up -d --wait   # tls-init, postgres-tls, seaweedfs-tls, openbao-tls
 ```
 Профиль `tls` выбран по умолчанию в `compose/.env`. Сервис `tls-init` при первом запуске создаёт самоподписанный CA
 и серверный сертификат (SAN: `localhost`, `127.0.0.1`, имена сервисов) в томе `tls`; копия CA — `compose/tls/ca.pem`.
@@ -40,7 +40,6 @@ docker compose -f deploy/compose/dev.yml up -d --wait   # tls-init, postgres-tls
 |---|---|---|
 | PostgreSQL 16 | `localhost:5432` | только TLS (`pg_hba`: `hostnossl … reject`): `sslmode=verify-full&sslrootcert=deploy/compose/tls/ca.pem` |
 | SeaweedFS S3 | `https://localhost:8333` | только https; CA — `compose/tls/ca.pem`; бакет `thepost-test` |
-| Valkey | `rediss://localhost:6379` | только TLS (`--port 0`), сертификат клиента не нужен |
 | OpenBao 2.7 | `https://localhost:8200` | только TLS; CA — `compose/tls/ca.pem`; вход узла — AppRole `thepost` |
 
 OpenBao профилей `tls` и `smb` — хранилище Raft (том `openbao-data`), распечатывание после перезапуска —
@@ -67,7 +66,7 @@ docker compose -f deploy/compose/dev.yml run --rm --no-deps --entrypoint sh open
 ### Профиль dev (открытые каналы, интеграционные тесты)
 ```bash
 docker compose -f deploy/compose/dev.yml --profile dev up -d --wait
-docker compose -f deploy/compose/dev.yml --profile dev ps   # postgres, seaweedfs, valkey, openbao — healthy
+docker compose -f deploy/compose/dev.yml --profile dev ps   # postgres, seaweedfs, openbao — healthy
 ```
 Подключение к этим сервисам — открытый канал: в конфигурации `thepost` он допускается только явной настройкой
 `allow_plaintext: true` в секции канала с предупреждением в лог при каждом запуске (настройку вводят полосы каналов).
@@ -78,7 +77,6 @@ docker compose -f deploy/compose/dev.yml --profile dev ps   # postgres, seaweedf
 |---|---|---|
 | PostgreSQL 16 | `localhost:5432` | `postgres` / `postgres`, БД `postgres` |
 | SeaweedFS S3 | `http://localhost:8333` | ключ `thepost`, секрет `thepost-dev-secret` (`compose/seaweedfs-s3.json`); бакет `thepost-test` |
-| Valkey | `localhost:6379` | без пароля |
 | Rspamd | `http://localhost:11333` (проверка), `http://localhost:11334` (веб) | пароль веб-интерфейса `thepost-dev` |
 | PostgreSQL, учётные записи The Post | `localhost:5432` | узел `thepost` / `thepost-dev`, владелец схемы `thepost_owner` / `thepost-dev-owner`, только чтение `thepost_readonly` / `thepost-dev-readonly`; БД `thepost` |
 | OpenBao (dev-режим, в памяти) | `http://localhost:8200` | root-токен `thepost-dev-root`; AppRole `thepost`: `role_id` `thepost-dev`, `secret_id` `thepost-dev-secret-id` |
@@ -86,7 +84,7 @@ docker compose -f deploy/compose/dev.yml --profile dev ps   # postgres, seaweedf
 OpenBao dev-режима — те же KV `thepost`, политика, AppRole и секреты стенда (`thepost/db`, `thepost/db-owner`,
 `thepost/db-readonly` с паролями выше, `thepost/s3`); данные в памяти, после перезапуска контейнера их снова записывает `openbao-init`.
 Учётные данные профиля `tls` — те же, кроме роли `thepost` и OpenBao (см. выше). Занятый порт хоста переопределяется
-переменной: `TP_PG_PORT`, `TP_S3_PORT`, `TP_VALKEY_PORT`, `TP_OPENBAO_PORT`, `TP_RSPAMD_PORT`, `TP_RSPAMD_UI_PORT`
+переменной: `TP_PG_PORT`, `TP_S3_PORT`, `TP_OPENBAO_PORT`, `TP_RSPAMD_PORT`, `TP_RSPAMD_UI_PORT`
 (например, `TP_PG_PORT=55432 docker compose -f deploy/compose/dev.yml --profile dev up -d`).
 
 ## Интеграционные тесты
@@ -96,7 +94,6 @@ OpenBao dev-режима — те же KV `thepost`, политика, AppRole �
 export TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
 export TEST_S3_URL=http://localhost:8333
 export AWS_ACCESS_KEY_ID=thepost AWS_SECRET_ACCESS_KEY=thepost-dev-secret AWS_REGION=us-east-1
-export TEST_VALKEY_URL=redis://localhost:6379
 export TEST_OPENBAO_URL=http://localhost:8200 TEST_OPENBAO_TOKEN=thepost-dev-root
 # TEST_LDAP_URL — каталога в compose пока нет; тесты LDAP пропускаются.
 ```

@@ -10,7 +10,7 @@ if [ ! -s "$SEAL" ]; then
   echo "openbao: создан ключ распечатывания $SEAL"
 fi
 
-# Ключ сервера в томе tls принадлежит 999 (postgres, valkey); OpenBao работает пользователем openbao.
+# Ключ сервера в томе tls принадлежит 999 (postgres); OpenBao работает пользователем openbao.
 mkdir -p /openbao/tls
 cp /certs/server.pem /certs/server.key /openbao/tls/
 chown -R openbao:openbao /openbao/tls /openbao/seal /openbao/data

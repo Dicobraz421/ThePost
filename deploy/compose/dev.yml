@@ -1,5 +1,5 @@
 # Зависимости The Post для разработки и эталон SMB (SRS 1.2). Описание — deploy/README.md.
-#   tls (по умолчанию, см. .env): PostgreSQL 16, SeaweedFS (S3), Valkey, OpenBao — только TLS-подключения,
+#   tls (по умолчанию, см. .env): PostgreSQL 16, SeaweedFS (S3), OpenBao — только TLS-подключения,
 #     самоподписанный CA (tls-init, tls/gen-certs.sh); бакет thepost-test; OpenBao — Raft, автоматическое
 #     распечатывание ключом из файла, политика и AppRole thepost; учётные записи PostgreSQL без SUPERUSER/BYPASSRLS:
 #     владелец схемы thepost_owner, узел thepost, только чтение thepost_readonly (postgres/app-role.sh).
@@ -168,36 +168,6 @@ services:
       timeout: 3s
       retries: 30
 
-  valkey-tls:
-    image: valkey/valkey:8.1
-    profiles: [tls]
-    depends_on:
-      tls-init:
-        condition: service_completed_successfully
-    command:
-      - valkey-server
-      - --port
-      - "0"
-      - --tls-port
-      - "6379"
-      - --tls-cert-file
-      - /certs/server.pem
-      - --tls-key-file
-      - /certs/server.key
-      - --tls-ca-cert-file
-      - /certs/ca.pem
-      - --tls-auth-clients
-      - "no"
-    ports:
-      - "${TP_VALKEY_PORT:-6379}:6379"
-    volumes:
-      - tls:/certs:ro
-    healthcheck:
-      test: ["CMD", "valkey-cli", "--tls", "--cacert", "/certs/ca.pem", "-h", "localhost", "ping"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-
   # --- Профиль dev: открытые каналы (клиенту — явный allow_plaintext) ---
 
   postgres:
@@ -290,17 +260,6 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/ready && wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
       interval: 3s
-      timeout: 3s
-      retries: 30
-
-  valkey:
-    image: valkey/valkey:8.1
-    profiles: [dev]
-    ports:
-      - "${TP_VALKEY_PORT:-6379}:6379"
-    healthcheck:
-      test: ["CMD", "valkey-cli", "ping"]
-      interval: 2s
       timeout: 3s
       retries: 30
 
