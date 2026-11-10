@@ -397,13 +397,15 @@ pub struct QueueConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub timeout: Duration,
-    /// Узел-ретранслятор `хост:порт` (smarthost) вместо MX получателя.
+    /// Узел-ретранслятор `хост:порт` (smarthost) вместо MX получателя; политика домена назначения со своим
+    /// `smart_host` (в том числе `*`) точнее.
     pub relay: Option<String>,
     /// Порт MX.
     pub port: u16,
     /// MX-узлов, которые пробуются за попытку.
     pub max_mx: usize,
-    /// Исходящий адрес (egress-IP, согласованный с PTR и SPF); `None` — выбирает система.
+    /// Исходящий адрес (egress-IP, согласованный с PTR и SPF); `None` — выбирает система. `egress_ip` политики
+    /// домена назначения точнее.
     pub source_ip: Option<std::net::IpAddr>,
     /// TLS при отправке.
     pub tls: OutboundTls,
@@ -411,6 +413,10 @@ pub struct QueueConfig {
     pub policy: PolicyConfig,
     /// Планировщик по доменам назначения.
     pub scheduler: SchedulerConfig,
+    /// Пауза перед повторной подпиской на сигналы настроек транспорта (политики доменов назначения).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub resubscribe: Duration,
 }
 
 impl Default for QueueConfig {
@@ -432,6 +438,7 @@ impl Default for QueueConfig {
             tls: OutboundTls::default(),
             policy: PolicyConfig::default(),
             scheduler: SchedulerConfig::default(),
+            resubscribe: Duration::from_secs(5),
         }
     }
 }

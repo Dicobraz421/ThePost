@@ -8,6 +8,8 @@
 //!   `reschedule` через `queue.retry`. Когда запись завершена (`complete` = `true`), ссылка на объект снимается.
 //!   Отправки — под планировщиком по доменам ([`sched`]): параллельность, скорость, медленный старт,
 //!   отложенная обработка недоступных доменов, раздельные пулы внутренней и внешней доставки.
+//!   Политики доменов назначения организаций ([`crate::routes`], [`QueueWorker::with_routes`]) — в
+//!   [`SendRequest::route`].
 //!   Устаревший захват (`Conflict`: лиза истекла, запись взял другой узел) — запись пропускается.
 //!   Уведомления отправителю (DSN: отказ, задержка, успех) — [`crate::dsn`].
 //! - [`SmtpOutService`] — роль smtp-out: опрос очереди до остановки.
@@ -34,7 +36,10 @@ use crate::deliver::Outbound;
 use crate::dkim_sign::DkimSign;
 use crate::dsn::{self, DsnSink};
 use crate::metrics::{RcptOutcome, SmtpMetrics};
+use crate::routes::Routes;
 use sched::{Admit, Scheduler};
+use tp_contracts::bus::EventBus;
+use tp_contracts::transport::DestinationPolicy;
 
 pub mod sched;
 pub mod send;
@@ -246,6 +251,8 @@ pub struct SendRequest<'a> {
     pub rcpts: &'a [String],
     /// Письмо.
     pub message: &'a [u8],
+    /// Политика домена назначения организации ([`crate::routes`]); `None` — по секции `smtp.queue`.
+    pub route: Option<&'a DestinationPolicy>,
 }
 
 /// Отправка письма принимающему серверу.
@@ -263,6 +270,10 @@ pub struct QueueWorker {
     dsn: Arc<dyn DsnSink>,
     metrics: Option<Arc<SmtpMetrics>>,
     sched: Arc<Scheduler>,
+    /// Политики доменов назначения.
+    routes: Option<Arc<Routes>>,
+    /// Шина: перечитывание политик по сигналу.
+    bus: Option<Arc<dyn EventBus>>,
 }
 
 impl fmt::Debug for QueueWorker {
@@ -287,7 +298,17 @@ impl QueueWorker {
             hostname: hostname.into(),
             metrics: None,
             sched: Arc::new(Scheduler::new()),
+            routes: None,
+            bus: None,
         }
+    }
+
+    /// Политики доменов назначения организаций (SMTP-15); с шиной `bus` роль smtp-out перечитывает их по
+    /// сигналу `TransportChanged` ([`Routes::watch`]).
+    pub fn with_routes(mut self, routes: Arc<Routes>, bus: Option<Arc<dyn EventBus>>) -> Self {
+        self.routes = Some(routes);
+        self.bus = bus;
+        self
     }
 
     /// Метрики очереди (SMTP-11).
@@ -358,10 +379,29 @@ impl QueueWorker {
                 .to_lowercase();
             domains.entry(domain).or_default().push(i);
         }
+        // Политики организации и принятые домены кластера; недоступны — попытка откладывается (политика может
+        // требовать TLS).
+        let (tenant, cluster) = match &self.routes {
+            None => (None, None),
+            Some(routes) => match (routes.tenant(c.tenant).await, routes.cluster().await) {
+                (Ok(t), Ok(cl)) => (Some(t), Some(cl)),
+                (Err(e), _) | (_, Err(e)) => {
+                    let reason = format!("transport settings unavailable: {e}");
+                    let outcome = c
+                        .rcpts
+                        .iter()
+                        .map(|r| (r, RcptResult::Temporary(reason.clone())))
+                        .collect();
+                    return self.finish(cfg, &c, &message, outcome).await;
+                }
+            },
+        };
+        let accepted = |d: &str| cluster.as_ref().is_some_and(|cl| cl.domain(d).is_some());
         // Домены — параллельно, каждый под планировщиком: недоступный домен не задерживает остальные.
         let sends = domains.iter().map(|(domain, idx)| {
             let message = &message;
             let c = &c;
+            let tenant = &tenant;
             async move {
                 let rcpts: Vec<String> = idx
                     .iter()
@@ -373,7 +413,12 @@ impl QueueWorker {
                         rcpts.len()
                     ];
                 }
-                let class = Scheduler::class(&cfg.scheduler, domain, |_| false);
+                let class = Scheduler::class(&cfg.scheduler, domain, accepted);
+                // Политики — для внешних доменов (вне принятых доменов кластера).
+                let route = tenant
+                    .as_deref()
+                    .filter(|_| !accepted(domain))
+                    .and_then(|t| t.route(domain));
                 match self
                     .sched
                     .acquire(&cfg.scheduler, domain, class, &self.deps.now)
@@ -393,6 +438,7 @@ impl QueueWorker {
                                 from: &c.from,
                                 rcpts: &rcpts,
                                 message,
+                                route,
                             })
                             .await;
                         permit.done(&results);
@@ -572,6 +618,14 @@ impl RoleService for SmtpOutService {
     }
 
     async fn run(&self, ctx: RoleCtx) -> Result<()> {
+        if let (Some(routes), Some(bus)) = (&self.worker.routes, &self.worker.bus) {
+            let retry = ctx.config::<SmtpConfig>()?.queue.resubscribe;
+            tokio::spawn(
+                routes
+                    .clone()
+                    .watch(bus.clone(), ctx.shutdown.clone(), retry),
+            );
+        }
         ctx.ready.set(true);
         loop {
             let cfg = ctx.config::<SmtpConfig>()?;

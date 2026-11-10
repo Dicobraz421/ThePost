@@ -10,6 +10,8 @@
 //! - [`metrics`] — метрики сессий и очереди (`/metrics`);
 //! - [`milter`] — фильтры Milter (антиспам, антивирус) после приёма письма;
 //! - [`policy`] — MTA-STS и DANE при отправке на MX;
+//! - [`routes`] — политики доменов назначения организаций (обязательный TLS, закреплённый ключ, smart host,
+//!   egress-IP) с перечитыванием по сигналу;
 //! - [`screen`] — экран соединений smtp-in (postscreen): задержка приветствия, конвейер, частота, кэш по IP;
 //! - [`queue`] — очередь исходящей почты и роль smtp-out (отправка на MX через `mail-send`);
 //! - [`config`] — секция `smtp` config.yaml.
@@ -25,6 +27,7 @@ pub mod metrics;
 pub mod milter;
 pub mod policy;
 pub mod queue;
+pub mod routes;
 pub mod screen;
 pub mod server;
 

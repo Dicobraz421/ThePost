@@ -432,6 +432,23 @@ impl TlsPolicy {
     }
 }
 
+/// Закреплённый ключ (политика домена назначения `pinned`): SHA-256 SubjectPublicKeyInfo сертификата сервера —
+/// один из `pins` (hex, регистр не важен). Цепочка, имя и срок не проверяются.
+pub fn pin_verify(pins: &[String], chain: &[CertificateDer<'_>]) -> Result<(), String> {
+    let leaf = chain
+        .first()
+        .ok_or("pinned key: server sent no certificate")?;
+    let cert = webpki::EndEntityCert::try_from(leaf)
+        .map_err(|e| format!("pinned key: bad server certificate: {e}"))?;
+    let digest = Sha256::digest(cert.subject_public_key_info().as_ref());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    if pins.iter().any(|p| p.eq_ignore_ascii_case(&hex)) {
+        Ok(())
+    } else {
+        Err("pinned key: server key does not match policy".into())
+    }
+}
+
 /// Сверка цепочки сертификатов сервера `chain` (первый — сертификат сервера) с записями TLSA узла `host`.
 pub fn dane_verify(
     records: &[Tlsa],

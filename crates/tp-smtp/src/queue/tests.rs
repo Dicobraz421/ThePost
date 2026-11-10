@@ -11,12 +11,17 @@ use mail_auth::{MX, RecordSet};
 use tokio::net::TcpListener;
 use tp_contracts::config::duration::HumanDuration;
 use tp_contracts::queue::{DsnNotify, QueueStore};
+use tp_contracts::role::CancellationToken;
+use tp_contracts::transport::{DestinationPolicy, TlsRequirement, TransportStore};
 use tp_contracts::{BlobKey, TenantId};
-use tp_testkit::{Clock, ManualClock, MemBlobIndex, MemBlobStore, MemQueue};
+use tp_testkit::{
+    Clock, ManualClock, MemBlobIndex, MemBlobStore, MemEventBus, MemQueue, MemTransport,
+};
 
 use super::send::MxTransport;
 use super::*;
 use crate::config::OutboundTls;
+use crate::routes::Routes;
 use crate::server::tests::{Recorder, conn_info};
 use crate::server::{Mode, Session, SessionCtx};
 use mail_auth::ResolverCache;
@@ -381,6 +386,7 @@ pub(crate) fn req<'a>(
         from: "alice@example.org",
         rcpts,
         message: MAIL,
+        route: None,
     }
 }
 
@@ -875,4 +881,137 @@ async fn internal_pool_is_separate() {
     let external: usize = (0..3).map(|i| t.calls(&format!("ext{i}.example"))).sum();
     assert_eq!(external, 1);
     assert_eq!(env.queue.len(), 2);
+}
+
+// ---------- Политики доменов назначения ----------
+
+fn route(pattern: &str, tls: TlsRequirement, smart_host: Option<String>) -> DestinationPolicy {
+    DestinationPolicy {
+        pattern: pattern.into(),
+        tls,
+        smart_host,
+        egress_ip: None,
+    }
+}
+
+#[tokio::test]
+async fn required_tls_route_refuses_plain_server() {
+    let rec = Arc::new(Recorder::default());
+    let port = smtp_server(rec.clone()).await;
+    let t = transport();
+    mx(&t, "partner.example", &[(10, "mx.partner.example")]);
+    a(&t, "mx.partner.example", [127, 0, 0, 1].into());
+    let cfg = QueueConfig { port, ..cfg() };
+    let rcpts = vec!["x@partner.example".to_owned()];
+    // Сервер без STARTTLS: обязательный TLS — временная неудача, открытым текстом письмо не передаётся.
+    let p = route("partner.example", TlsRequirement::Required, None);
+    let res = t
+        .send(SendRequest {
+            route: Some(&p),
+            ..req(&cfg, "partner.example", &rcpts)
+        })
+        .await;
+    assert!(
+        matches!(&res[0], RcptResult::Temporary(r) if r.contains("STARTTLS not offered")),
+        "{res:?}"
+    );
+    let p = route(
+        "partner.example",
+        TlsRequirement::Pinned {
+            spki_sha256: vec!["0".repeat(64)],
+        },
+        None,
+    );
+    let res = t
+        .send(SendRequest {
+            route: Some(&p),
+            ..req(&cfg, "partner.example", &rcpts)
+        })
+        .await;
+    assert!(matches!(&res[0], RcptResult::Temporary(_)), "{res:?}");
+    assert!(rec.mails().is_empty());
+    // Оппортунистическая политика — доставка открытым текстом.
+    let p = route("partner.example", TlsRequirement::Opportunistic, None);
+    let res = t
+        .send(SendRequest {
+            route: Some(&p),
+            ..req(&cfg, "partner.example", &rcpts)
+        })
+        .await;
+    assert!(matches!(&res[0], RcptResult::Delivered(_)), "{res:?}");
+    assert_eq!(rec.mails().len(), 1);
+}
+
+#[tokio::test]
+async fn smart_host_route_and_reload_on_signal() {
+    let rec = Arc::new(Recorder::default());
+    let port = smtp_server(rec.clone()).await;
+    let env = Env::new();
+    let bus: Arc<dyn tp_contracts::bus::EventBus> = Arc::new(MemEventBus::default());
+    let store = MemTransport::new().with_bus(bus.clone());
+    let tenant = TenantId::DEFAULT;
+    // Все внешние домены — через промежуточный узел (relayhost); MX доменов неизвестны.
+    let v = store
+        .put_route(
+            tenant,
+            0,
+            &route(
+                "*",
+                TlsRequirement::Opportunistic,
+                Some(format!("127.0.0.1:{port}")),
+            ),
+        )
+        .await
+        .expect("route");
+    // Принятый домен кластера — внутренняя доставка без политики (его MX неизвестен: временная неудача).
+    store
+        .put_domain(
+            0,
+            &tp_contracts::transport::AcceptedDomain {
+                id: tp_contracts::DomainId::new(),
+                tenant: TenantId::new(),
+                name: "corp.example".into(),
+                kind: Default::default(),
+            },
+        )
+        .await
+        .expect("domain");
+    let routes = Arc::new(Routes::new(Arc::new(store.clone())));
+    let stop = CancellationToken::new();
+    tokio::spawn(
+        routes
+            .clone()
+            .watch(bus.clone(), stop.clone(), Duration::from_millis(50)),
+    );
+    let worker = QueueWorker::new(env.deps.clone(), Arc::new(transport()), "out.example.org")
+        .with_routes(routes.clone(), Some(bus));
+    enqueue(&env, &["x@example.net", "y@example.com", "z@corp.example"]).await;
+    let cfg = cfg();
+    assert_eq!(worker.run_once(&cfg).await.expect("run"), 1);
+    assert_eq!(rec.mails().len(), 2, "по соединению на внешний домен");
+    assert_eq!(env.queue.len(), 1, "внутренний домен ждёт повтора");
+    // Политика изменена: обязательный TLS на узле без STARTTLS — отказ после сигнала.
+    let v2 = store
+        .put_route(
+            tenant,
+            v,
+            &route(
+                "*",
+                TlsRequirement::Required,
+                Some(format!("127.0.0.1:{port}")),
+            ),
+        )
+        .await
+        .expect("route");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while routes.tenant(tenant).await.expect("tenant").version != v2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("политики перечитаны по сигналу");
+    enqueue(&env, &["w@example.org"]).await;
+    worker.run_once(&cfg).await.expect("run");
+    assert_eq!(rec.mails().len(), 2);
+    stop.cancel();
 }
