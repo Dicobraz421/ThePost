@@ -119,7 +119,7 @@ impl AbuseBlocks for PgMeta {
         until: OffsetDateTime,
         reason: &str,
     ) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
         if reason.len() > REASON_MAX {
             return Err(Error::invalid("причина блокировки длиннее 1024 байт"));
         }
@@ -198,7 +198,7 @@ impl AbuseBlocks for PgMeta {
     }
 
     async fn unblock(&self, tenant: TenantId, subject: &BlockSubject) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
             let c = columns(subject);
             let mut tx = begin(&self.pool, tenant).await?;
             sqlx::query("DELETE FROM abuse_blocks WHERE tenant_id = $1 AND subject = $2")

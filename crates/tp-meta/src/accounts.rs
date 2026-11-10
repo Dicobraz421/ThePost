@@ -74,7 +74,7 @@ async fn find_for_upsert(
 
 impl PgMeta {
     async fn upsert_once(&self, tenant: TenantId, data: &AccountUpsert) -> Result<Account> {
-        self.once(async move {
+        self.rewrite(|| async move {
         if data.login.is_empty() {
             return Err(Error::invalid("пустое имя входа"));
         }

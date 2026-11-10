@@ -107,7 +107,7 @@ impl PgMeta {
     /// Повторная пометка сохраняет время первой. `false` — такой записи нет (объект удалён или
     /// загружен заново другим поколением): помечать нечего.
     pub async fn mark_blob_damaged(&self, key: &BlobKey) -> Result<bool> {
-        self.once(async move {
+        self.rewrite(|| async move {
             let mut tx = begin(&self.pool, key.tenant).await?;
             let marked = sqlx::query(
                 "UPDATE blobs SET damaged_at = coalesce(damaged_at, now())

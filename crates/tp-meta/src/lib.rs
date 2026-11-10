@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::config::duration;
 use tp_contracts::events::partition_of;
@@ -47,6 +47,7 @@ use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
 use crate::failover::Failover;
+use crate::pool::TxFuture;
 use crate::retention::RetentionConfig;
 use crate::signals::SignalsConfig;
 
@@ -137,9 +138,17 @@ impl std::fmt::Debug for Signals {
 /// `TransportChanged` — после изменения настроек транспорта ([`transport`]). Сигнал
 /// at-most-once: ошибка публикации не отменяет зафиксированное изменение (только запись в журнал узла).
 ///
-/// Над [`Failover`] ([`PgMeta::from_failover`]) хранилища переживают переключение СУБД: чтения при временном
-/// отказе повторяются с нарастающей паузой до `database.failover.retry_for` (поиск primary и сброс пула —
-/// [`failover`]), записи выполняются один раз — временный отказ (`Unavailable` с `retry_after`) отдаётся
+/// Над [`Failover`] ([`PgMeta::from_failover`]) хранилища переживают переключение СУБД: при временном отказе
+/// операция повторяется с нарастающей паузой до `database.failover.retry_for` (поиск primary и сброс пула —
+/// [`failover`]). Повторяются чтения, записи с ключом и записи, идемпотентные по сути:
+/// - **с ключом** (исход обрыва во время COMMIT — по ключу, [`Failover::with_tenant_keyed`], META-40): вставка
+///   письма по его id (`MessageStore::insert`, `insert_batch`; ключ — запись `created` журнала изменений),
+///   журнал доставки (`DeliveryLog::record*`; ключ — номера `seq`, выданные до транзакции), очередь
+///   модерации (`GroupStore::hold`; ключ — `HeldId` вызывающего), позиция подписчика (`EventLog::commit`;
+///   ключ — позиция не меньше заданной);
+/// - **идемпотентные по сути** — список у [`PgMeta::rewrite`].
+///
+/// Остальные записи выполняются один раз: временный отказ (`Unavailable` с `retry_after`) отдаётся
 /// вызывающему, а следующая операция идёт к найденному primary.
 #[derive(Debug, Clone)]
 pub struct PgMeta {
@@ -160,7 +169,8 @@ impl PgMeta {
         }
     }
 
-    /// Хранилища над пулом `failover` с повтором чтений при переключении СУБД; схема должна быть применена.
+    /// Хранилища над пулом `failover` с повтором чтений и записей с ключом или идемпотентных при переключении
+    /// СУБД; схема должна быть применена.
     pub fn from_failover(failover: &Failover, cfg: MetaConfig) -> Self {
         Self {
             failover: Some(failover.clone()),
@@ -186,6 +196,57 @@ impl PgMeta {
         match &self.failover {
             Some(fo) => fo.retry(|_| op()).await,
             None => op().await,
+        }
+    }
+
+    /// Запись, **идемпотентная по сути**: повторное применение после обрыва во время COMMIT даёт то же
+    /// состояние, поэтому над [`Failover`] она повторяется, как чтение ([`Failover::retry`]). Список с
+    /// обоснованием (META-40):
+    /// - upsert по значению: `AbuseBlocks::block` (срок — `greatest`, действующая блокировка не
+    ///   сокращается), `AccountStore::upsert` (поиск по имени входа, системные папки — `ensure_system`),
+    ///   `AclStore::set_acl`, `set_send_delegation`, `GroupStore::put` (группа заменяется целиком),
+    ///   `Membership::heartbeat` (`upsert_node`), `set_policy`, `set_user_trash_purge`;
+    /// - `set_*` по значению: `MailboxStore::set_subscribed` (повтор лишь добавляет запись `updated` в
+    ///   журнал изменений), `AppPasswords::revoke` (`COALESCE` — время первого отзыва),
+    ///   `mark_blob_damaged` (`coalesce` — время первой пометки);
+    /// - удаление по ключу без возврата удалённого: `AbuseBlocks::unblock`, `Membership::leave`,
+    ///   `DeliveryLog::purge` (секции суток), `purge_events` (число удалённых при повторе — только
+    ///   оставшиеся).
+    ///
+    /// Не повторяются: CAS по версии (`transport`, `put_manifest`) и номеру захвата (лизы, очередь) —
+    /// повтор применённой записи отвечает `Conflict`; счётчики ссылок BLOB, UID и `ModSeq` писем,
+    /// выдача идентификаторов внутри операции (`enqueue`, `create`, `copy`), удаление с возвратом
+    /// удалённого (`take_held`, `GroupStore::remove`) — повтор вернул бы другое.
+    pub(crate) async fn rewrite<T, F, Fut>(&self, op: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        self.idempotent(op).await
+    }
+
+    /// Запись с ключом в транзакции организации `tenant`: над [`Failover`] — повтор с установлением исхода
+    /// обрыва во время COMMIT проверкой `committed` ([`Failover::with_tenant_keyed`]), иначе — один раз.
+    pub(crate) async fn keyed<T, F, C>(&self, tenant: TenantId, f: F, committed: C) -> Result<T>
+    where
+        F: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, T>,
+        C: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, Option<T>>,
+    {
+        match &self.failover {
+            Some(fo) => fo.with_tenant_keyed(tenant, f, committed).await,
+            None => pool::with_tenant(&self.pool, tenant, f).await,
+        }
+    }
+
+    /// Как [`keyed`](Self::keyed), но по всем организациям ([`Failover::with_system_keyed`]).
+    pub(crate) async fn keyed_system<T, F, C>(&self, f: F, committed: C) -> Result<T>
+    where
+        F: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, T>,
+        C: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, Option<T>>,
+    {
+        match &self.failover {
+            Some(fo) => fo.with_system_keyed(f, committed).await,
+            None => pool::with_system(&self.pool, f).await,
         }
     }
 

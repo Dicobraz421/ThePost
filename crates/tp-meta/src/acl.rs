@@ -115,7 +115,7 @@ impl AclStore for PgMeta {
         identifier: &str,
         rights: Rights,
     ) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
             validate_identifier(identifier, true)?;
             let mut tx = begin(&self.pool, owner.tenant).await?;
             if !mailbox_exists(&mut tx, owner, mailbox).await? {
@@ -269,7 +269,7 @@ impl AclStore for PgMeta {
         delegate: &str,
         right: Option<SendRight>,
     ) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
         validate_identifier(delegate, false)?;
         let mut tx = begin(&self.pool, owner.tenant).await?;
         let found: Option<i32> =

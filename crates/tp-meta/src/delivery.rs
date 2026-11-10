@@ -8,6 +8,7 @@
 //! Позиция страницы — `<момент в микросекундах>.<номер записи>` последней записи страницы.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -203,48 +204,95 @@ impl PgMeta {
         self.purge(before).await
     }
 
+    /// Пачка организации `tenant` одной транзакцией. Ключ записи (META-40) — номера `seq`, выданные до
+    /// транзакции (`nextval` вне транзакции не откатывается): после обрыва во время COMMIT пачка
+    /// записана, если есть её первая запись.
     async fn insert_delivery(&self, tenant: TenantId, batch: Batch) -> Result<()> {
-        self.once(async move {
-        with_tenant(&self.pool, tenant, move |tx| {
-            Box::pin(async move {
-                sqlx::query("SELECT tp_delivery_partitions($1::date[])")
-                    .bind(&batch.days)
+        let Some(&first_at) = batch.at.first() else {
+            return Ok(());
+        };
+        let n =
+            i64::try_from(batch.at.len()).map_err(|_| Error::invalid("слишком большая пачка"))?;
+        let mut seq: Vec<i64> = self
+            .idempotent(|| {
+                with_tenant(&self.pool, tenant, move |tx| {
+                    Box::pin(async move {
+                        sqlx::query_scalar(
+                            "SELECT nextval('delivery_log_seq') FROM generate_series(1, $1)",
+                        )
+                        .bind(n)
+                        .fetch_all(&mut *tx)
+                        .await
+                        .map_err(db_err)
+                    })
+                })
+            })
+            .await?;
+        // Порядок номеров — порядок записи пачки.
+        seq.sort_unstable();
+        let first_seq = *seq
+            .first()
+            .ok_or_else(|| Error::internal("delivery_log_seq: нет номеров"))?;
+        let batch = Arc::new((batch, seq));
+        self.keyed(
+            tenant,
+            move |tx| {
+                let batch = Arc::clone(&batch);
+                Box::pin(async move {
+                    let (batch, seq) = &*batch;
+                    sqlx::query("SELECT tp_delivery_partitions($1::date[])")
+                        .bind(&batch.days)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                    sqlx::query(
+                        "INSERT INTO delivery_log (tenant_id, at, seq, node, kind, sender, sender_key, recipients,
+                                                   rcpt_keys, message_id, queue_id, decision, reason)
+                         SELECT $1, u.at, u.seq, u.node, u.kind, u.sender, u.sender_key,
+                                ARRAY(SELECT r FROM jsonb_array_elements_text(u.rcpt) WITH ORDINALITY AS x(r, i) ORDER BY i),
+                                ARRAY(SELECT r FROM jsonb_array_elements_text(u.keys) WITH ORDINALITY AS x(r, i) ORDER BY i),
+                                u.message_id, u.queue_id, u.decision, u.reason
+                         FROM unnest($2::timestamptz[], $3::int8[], $4::text[], $5::text[], $6::text[], $7::text[],
+                                     $8::jsonb[], $9::jsonb[], $10::text[], $11::uuid[], $12::text[], $13::text[])
+                              WITH ORDINALITY AS u(at, seq, node, kind, sender, sender_key, rcpt, keys, message_id,
+                                                   queue_id, decision, reason, n)
+                         ORDER BY u.n",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(&batch.at)
+                    .bind(seq)
+                    .bind(&batch.node)
+                    .bind(&batch.kind)
+                    .bind(&batch.sender)
+                    .bind(&batch.sender_key)
+                    .bind(&batch.recipients)
+                    .bind(&batch.rcpt_keys)
+                    .bind(&batch.message_id)
+                    .bind(&batch.queue_id)
+                    .bind(&batch.decision)
+                    .bind(&batch.reason)
                     .execute(&mut *tx)
                     .await
                     .map_err(db_err)?;
-                sqlx::query(
-                    "INSERT INTO delivery_log (tenant_id, at, node, kind, sender, sender_key, recipients, rcpt_keys,
-                                               message_id, queue_id, decision, reason)
-                     SELECT $1, u.at, u.node, u.kind, u.sender, u.sender_key,
-                            ARRAY(SELECT r FROM jsonb_array_elements_text(u.rcpt) WITH ORDINALITY AS x(r, i) ORDER BY i),
-                            ARRAY(SELECT r FROM jsonb_array_elements_text(u.keys) WITH ORDINALITY AS x(r, i) ORDER BY i),
-                            u.message_id, u.queue_id, u.decision, u.reason
-                     FROM unnest($2::timestamptz[], $3::text[], $4::text[], $5::text[], $6::text[], $7::jsonb[],
-                                 $8::jsonb[], $9::text[], $10::uuid[], $11::text[], $12::text[])
-                          WITH ORDINALITY AS u(at, node, kind, sender, sender_key, rcpt, keys, message_id, queue_id,
-                                               decision, reason, n)
-                     ORDER BY u.n",
-                )
-                .bind(tenant.as_uuid())
-                .bind(&batch.at)
-                .bind(&batch.node)
-                .bind(&batch.kind)
-                .bind(&batch.sender)
-                .bind(&batch.sender_key)
-                .bind(&batch.recipients)
-                .bind(&batch.rcpt_keys)
-                .bind(&batch.message_id)
-                .bind(&batch.queue_id)
-                .bind(&batch.decision)
-                .bind(&batch.reason)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-                Ok(())
-            })
-        })
+                    Ok(())
+                })
+            },
+            move |tx| {
+                Box::pin(async move {
+                    let found: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM delivery_log WHERE tenant_id = $1 AND at = $2 AND seq = $3)",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(first_at)
+                    .bind(first_seq)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    Ok(found.then_some(()))
+                })
+            },
+        )
         .await
-}).await
     }
 }
 
@@ -322,7 +370,7 @@ impl DeliveryLog for PgMeta {
     }
 
     async fn purge(&self, before: OffsetDateTime) -> Result<()> {
-        self.once(async move {
+        self.rewrite(|| async move {
             let dropped: i32 = with_system(&self.pool, move |tx| {
                 Box::pin(async move {
                     sqlx::query_scalar("SELECT tp_delivery_purge($1)")
