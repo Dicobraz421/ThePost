@@ -8,7 +8,7 @@ set -eu
 DIR=${1:-/certs}
 OUT=${2:-}
 # Имена сервисов compose и адреса хоста — в SAN серверного сертификата.
-SAN="DNS:localhost,DNS:postgres-tls,DNS:valkey-tls,DNS:seaweedfs-tls,DNS:openbao-tls,IP:127.0.0.1,IP:::1"
+SAN="DNS:localhost,DNS:thepost,DNS:mail.example.test,DNS:postgres-tls,DNS:valkey-tls,DNS:seaweedfs-tls,DNS:openbao-tls,IP:127.0.0.1,IP:::1"
 
 mkdir -p "$DIR"
 cd "$DIR"
@@ -40,5 +40,13 @@ chmod 0644 ca.pem server.pem
 chmod 0600 server.key ca.key
 if [ "$(id -u)" = 0 ]; then chown 999:999 server.key; fi
 
+# Сертификат и ключ thepost под путями секции tls (fullchain.pem, privkey.pem): ключ — владельцу nonroot 65532
+# (образ distroless), server.key остаётся у 999. Копируются при каждом запуске — вслед за перевыпуском.
+cp server.pem fullchain.pem
+cp server.key privkey.pem
+chmod 0644 fullchain.pem
+chmod 0600 privkey.pem
+if [ "$(id -u)" = 0 ]; then chown 65532:65532 privkey.pem; fi
+
 # Копия CA для клиентов на хосте (sslrootcert, --cacert).
-if [ -n "$OUT" ]; then cp ca.pem "$OUT/ca.pem"; fi
+if [ -n "$OUT" ]; then cp ca.pem "$OUT/ca.pem" && chmod 0644 "$OUT/ca.pem"; fi
