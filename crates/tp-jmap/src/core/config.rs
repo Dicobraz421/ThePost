@@ -18,7 +18,8 @@ pub struct JmapConfig {
     /// Внешний адрес для URL в объекте сессии (`https://mail.example.org`, без `/` в конце);
     /// не задан — `https://` + заголовок `Host` запроса.
     pub public_url: Option<String>,
-    /// `maxSizeRequest`: размер тела запроса API, байт.
+    /// `maxSizeRequest`: размер тела запроса API, байт; столько же байт за запрос — значений, подставленных
+    /// по ссылкам на результаты.
     pub max_size_request: u64,
     /// `maxConcurrentRequests`: одновременных запросов API на учётную запись.
     pub max_concurrent_requests: u32,

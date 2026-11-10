@@ -278,3 +278,40 @@ pub async fn fresh_meta() -> Option<FreshDb> {
         .expect("open");
     Some(FreshDb { meta, admin, name })
 }
+
+/// Шина, запоминающая опубликованные сигналы (подписка не поддерживается).
+#[derive(Debug, Default)]
+pub struct RecordingBus(Mutex<Vec<tp_contracts::bus::Event>>);
+
+impl RecordingBus {
+    /// Опубликованные сигналы (с очисткой).
+    pub fn take(&self) -> Vec<tp_contracts::bus::Event> {
+        std::mem::take(&mut *self.0.lock().expect("lock"))
+    }
+}
+
+#[async_trait]
+impl tp_contracts::bus::EventBus for RecordingBus {
+    async fn publish(&self, event: tp_contracts::bus::Event) -> tp_contracts::Result<()> {
+        if event.kind == tp_contracts::bus::EventKind::Resync {
+            return Err(tp_contracts::Error::invalid("Resync"));
+        }
+        self.0.lock().expect("lock").push(event);
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        _: tp_contracts::meta::AccountScope,
+    ) -> tp_contracts::Result<tp_contracts::bus::EventStream> {
+        Err(tp_contracts::Error::internal(
+            "RecordingBus: no subscriptions",
+        ))
+    }
+
+    async fn subscribe_system(&self) -> tp_contracts::Result<tp_contracts::bus::EventStream> {
+        Err(tp_contracts::Error::internal(
+            "RecordingBus: no subscriptions",
+        ))
+    }
+}

@@ -110,8 +110,11 @@ impl PgMeta {
             tenant,
             account: account.id,
         };
-        mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
+        let created = mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
         tx.commit().await.map_err(db_err)?;
+        if created > 0 {
+            self.signal_log([scope.account]).await;
+        }
         Ok(account)
     }
 }

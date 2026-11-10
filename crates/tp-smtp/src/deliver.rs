@@ -14,6 +14,10 @@
 //! (CMP-04): локальные получатели доставляются сразу тем же `ingest`, внешние — в очередь (без очереди —
 //! `RcptStatus::Failed` с `451 4.3.0`, SMTP-28); статус по получателю.
 //!
+//! Адресация ([`crate::address`]): получатели переписываются до разрешения, отправитель — после проверок;
+//! подадрес `user+tag` доставляется в ящик `user` с `Delivered-To: user+tag@…`, неизвестный адрес домена — на
+//! адрес для всей почты домена (псевдоним каталога `@domain`), если он задан.
+//!
 //! Каталог (псевдонимы, адреса учётных записей, группы) читается полным снимком и кэшируется на
 //! `delivery.directory_refresh`; учётная запись — [`AccountStore::by_login`]. Проверки SPF, DKIM, DMARC и ARC
 //! входящей почты — [`crate::authcheck`]: их заголовки добавляются к письму, письмо с проваленным DMARC
@@ -36,6 +40,7 @@ use tp_contracts::queue::DsnRet;
 use tp_contracts::retention::Quota;
 use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
 
+use crate::address::{Addressing, Side};
 use crate::authcheck::AuthCheck;
 use crate::config::{DeliveryConfig, SmtpConfig};
 use crate::dsn::{self, DsnSink};
@@ -115,11 +120,21 @@ struct Snapshot {
 /// Наибольшая глубина вложенности групп каталога.
 const MAX_GROUP_DEPTH: usize = 8;
 
+/// Получатель после переписывания и разрешения.
+struct Target {
+    /// Адрес после переписывания ([`Addressing::rewrite`]).
+    address: String,
+    resolved: Resolved,
+    /// Подадрес (`user+tag`): полный адрес для заголовка `Delivered-To` копии.
+    delivered_to: Option<String>,
+}
+
 /// Локальная доставка и обработчик транзакций SMTP.
 pub struct Delivery {
     deps: Deps,
     hostname: String,
     cfg: DeliveryConfig,
+    addressing: Addressing,
     snapshot: Mutex<Option<(Instant, Arc<Snapshot>)>>,
 }
 
@@ -135,7 +150,10 @@ impl fmt::Debug for Delivery {
 /// Письмо, подготовленное к доставке.
 struct Prepared {
     deliveries: Vec<(String, MailDelivery)>,
+    /// Внешние адреса (после переписывания).
     external: Vec<String>,
+    /// Внешние получатели в исходной записи (статусы отправки).
+    queued: Vec<String>,
     /// Получатели, которым письмо не доставлено после приёма (уведомление отправителю).
     failed: Vec<dsn::Recipient>,
 }
@@ -147,23 +165,57 @@ impl Delivery {
             deps,
             hostname: cfg.hostname.clone(),
             cfg: cfg.delivery.clone(),
+            addressing: Addressing::new(&cfg.addressing),
             snapshot: Mutex::new(None),
         }
     }
 
-    /// Разрешает адрес получателя.
+    /// Разрешает адрес получателя: переписывание ([`crate::address`]), затем адрес целиком, адрес без тега
+    /// подадреса, адрес для всей почты домена (псевдоним каталога `@domain`).
     pub async fn resolve(&self, address: &str) -> Result<Resolved> {
-        let address = address.to_lowercase();
-        let Some((_, domain)) = address.rsplit_once('@') else {
-            return Ok(Resolved::Unknown);
+        Ok(self.target(address).await?.resolved)
+    }
+
+    async fn target(&self, address: &str) -> Result<Target> {
+        let address = self
+            .addressing
+            .rewrite(address, Side::Recipient)
+            .unwrap_or_else(|| address.to_owned());
+        let lower = address.to_lowercase();
+        let target = |resolved, delivered_to| Target {
+            address: address.clone(),
+            resolved,
+            delivered_to,
+        };
+        let Some((_, domain)) = lower.rsplit_once('@') else {
+            return Ok(target(Resolved::Unknown, None));
         };
         let snap = self.snapshot().await?;
         if !snap.domains.contains(domain) {
-            return Ok(Resolved::External);
+            return Ok(target(Resolved::External, None));
         }
-        let logins = match snap.addresses.get(&address) {
+        if let Some(accounts) = self.lookup(&snap, &lower).await? {
+            return Ok(target(Resolved::Local(accounts), None));
+        }
+        if let Some((base, _tag)) = self.addressing.split(&lower)
+            && let Some(accounts) = self.lookup(&snap, &base).await?
+        {
+            return Ok(target(Resolved::Local(accounts), Some(address.clone())));
+        }
+        let catch_all = format!("@{domain}");
+        if snap.addresses.contains_key(&catch_all)
+            && let Some(accounts) = self.lookup(&snap, &catch_all).await?
+        {
+            return Ok(target(Resolved::Local(accounts), None));
+        }
+        Ok(target(Resolved::Unknown, None))
+    }
+
+    /// Включённые учётные записи адреса `address` (нижний регистр): по снимку каталога или как имя входа.
+    async fn lookup(&self, snap: &Snapshot, address: &str) -> Result<Option<Vec<Account>>> {
+        let logins = match snap.addresses.get(address) {
             Some(logins) => logins.iter().cloned().collect(),
-            None => vec![address.clone()],
+            None => vec![address.to_owned()],
         };
         let mut accounts = Vec::new();
         for login in logins {
@@ -178,11 +230,7 @@ impl Delivery {
                 accounts.push(acc);
             }
         }
-        Ok(if accounts.is_empty() {
-            Resolved::Unknown
-        } else {
-            Resolved::Local(accounts)
-        })
+        Ok((!accounts.is_empty()).then_some(accounts))
     }
 
     async fn snapshot(&self) -> Result<Arc<Snapshot>> {
@@ -321,10 +369,12 @@ impl Delivery {
         let mut out = Prepared {
             deliveries: Vec::new(),
             external: Vec::new(),
+            queued: Vec::new(),
             failed: Vec::new(),
         };
         for rcpt in rcpts {
-            match self.resolve(rcpt).await? {
+            let target = self.target(rcpt).await?;
+            match target.resolved {
                 Resolved::Local(accounts) => {
                     for acc in accounts {
                         if out.deliveries.iter().any(|(_, d)| d.account == acc.id) {
@@ -340,16 +390,25 @@ impl Delivery {
                             MailDelivery {
                                 account: acc.id,
                                 mailbox,
-                                extra_headers: Vec::new(),
+                                extra_headers: target
+                                    .delivered_to
+                                    .iter()
+                                    .map(|a| ("Delivered-To".to_owned(), clean(a)))
+                                    .collect(),
                                 flags: Default::default(),
                             },
                         ));
                     }
                 }
                 Resolved::External => {
-                    if !out.external.iter().any(|x| x.eq_ignore_ascii_case(rcpt)) {
-                        out.external.push(rcpt.clone());
+                    if !out
+                        .external
+                        .iter()
+                        .any(|x| x.eq_ignore_ascii_case(&target.address))
+                    {
+                        out.external.push(target.address);
                     }
+                    out.queued.push(rcpt.clone());
                 }
                 // Получатель принят на RCPT, но исчез из каталога (или неизвестен при отправке из JMAP):
                 // письмо ему не доставляется, отправителю — уведомление.
@@ -583,6 +642,15 @@ impl Delivery {
             (Some(ac), Mode::Inbound) => Some(ac.check(env, &raw).await),
             _ => None,
         };
+        // Отправитель конверта переписывается после проверок (SPF — по исходному).
+        let rewritten = self
+            .addressing
+            .rewrite(&env.mail_from, Side::Sender)
+            .map(|mail_from| Envelope {
+                mail_from,
+                ..env.clone()
+            });
+        let env = rewritten.as_ref().unwrap_or(env);
         // DMARC не пройден при политике quarantine/reject — в «Спам».
         let mut junk = check.as_ref().is_some_and(|c| c.junk);
         let mut headers = self.trace_headers(env, received_at);
@@ -752,6 +820,8 @@ impl Delivery {
         raw: Bytes,
     ) -> Result<Submitted> {
         let id = crate::server::next_id();
+        let rewritten = self.addressing.rewrite(mail_from, Side::Sender);
+        let mail_from = rewritten.as_deref().unwrap_or(mail_from);
         if tenant != self.deps.tenant {
             let status = match &self.deps.outbound {
                 Some(q) => {
@@ -829,7 +899,7 @@ impl Delivery {
                 let status =
                     if let Some(f) = failed.iter().find(|f| f.address.eq_ignore_ascii_case(r)) {
                         RcptStatus::Failed(f.reply.clone())
-                    } else if prepared.external.iter().any(|x| x.eq_ignore_ascii_case(r)) {
+                    } else if prepared.queued.iter().any(|x| x.eq_ignore_ascii_case(r)) {
                         if queue {
                             RcptStatus::Queued
                         } else {

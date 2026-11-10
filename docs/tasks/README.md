@@ -229,8 +229,8 @@
 |---|---|---|---|---|---|---|
 | [CTR-23](CTR-23.md) | контракты взаимодействия: сигналы, Rpc, NodeInfo, AbuseBlocks | contracts | B | contracts-12 | done | CTR-22 |
 | [META-25](META-25.md) | поиск primary и поведение при переключении СУБД | meta | A | meta-09 | done | META-02 |
-| [META-26](META-26.md) | сигналы через LISTEN/NOTIFY | meta | A | meta-10 | ready | CTR-23,META-25 |
-| [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-10 | ready | CTR-23,META-16 |
+| [META-26](META-26.md) | сигналы через LISTEN/NOTIFY | meta | A | meta-10 | done | CTR-23,META-25 |
+| [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-10 | done | CTR-23,META-16 |
 | [CLU-09](CLU-09.md) | удалить шину Valkey | cluster | A | cluster-06 | ready | CTR-23 |
 | [CLU-10](CLU-10.md) | состав кластера и разделы по сигналу | cluster | A | cluster-06 | ready | CTR-23 |
 | [CLU-11](CLU-11.md) | запросы узел → узел (Rpc) | cluster | A | cluster-06 | ready | CTR-23 |
@@ -238,7 +238,7 @@
 | [PLT-17](PLT-17.md) | перечитывание конфигурации и сертификатов по событиям | platform | A | platform-07 | done | PLT-16 |
 | [MS-14](MS-14.md) | истечение корзины по ближайшему сроку | mailstore | A | mailstore-08 | done | MS-13 |
 | [BLOB-14](BLOB-14.md) | GC по ближайшему сроку отсрочки | blob | A | blob-07 | done | BLOB-13 |
-| [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | todo | META-27 |
+| [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | ready | META-27 |
 | [CI-05](CI-05.md) | CI без Valkey, проверка отсутствия интерпретаторов | ci | B | ci-04 | todo | CLU-09 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-06 | todo | CLU-09 |
 
@@ -247,7 +247,7 @@
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
 | [CTR-24](CTR-24.md) | контракты настроек транспорта и точка расширения правил потока | contracts | B | contracts-13 | done | CTR-23 |
-| [META-28](META-28.md) | хранение настроек транспорта | meta | A | meta-11 | todo | CTR-24,META-26 |
+| [META-28](META-28.md) | хранение настроек транспорта | meta | A | meta-11 | ready | CTR-24,META-26 |
 | [SMTP-20](SMTP-20.md) | доверенные источники: шлюз и приложения | smtp | A | smtp-06 | todo | CTR-24,SMTP-12,SMTP-04 |
 | [SMTP-21](SMTP-21.md) | принятые домены и внутренняя ретрансляция | smtp | A | smtp-06 | todo | CTR-24,SMTP-03,SMTP-09 |
 | [SMTP-22](SMTP-22.md) | точки вызова правил потока почты | smtp | A | smtp-06 | todo | CTR-24,SMTP-05,SMTP-16,SMTP-17 |
@@ -351,19 +351,25 @@
 | [KIT-07](KIT-07.md) | in-memory ящик — 6 системных папок и дополнение при открытии | testkit | A | testkit-04 | done | CMP-05 |
 | [META-35](META-35.md) | ошибка одного раздела журнала не прерывает опрос остальных | meta | A | meta-18 | done | — |
 | [CMP-09](CMP-09.md) | метрики индексатора и doctor для служебных доменов | app | A | app-11 | done | CMP-06 |
-| [APP-13](APP-13.md) | подключение расширений IMAP, POP3 и PSI в `serve` | app | A | app-12 | ready | IMAP-12,PLT-17 |
+| [APP-13](APP-13.md) | подключение расширений IMAP, POP3 и PSI в `serve` | app | A | app-12 | done | IMAP-12,PLT-17 |
 | [PLT-19](PLT-19.md) | события файловой системы через `notify` | platform | A | platform-09 | done | PLT-17 |
 | [SYS-08](SYS-08.md) | Landlock — корневые сертификаты по ссылкам Debian | sys | A | sys-04 | done | SYS-07 |
 | [SYS-09](SYS-09.md) | ожидание событий PSI в tp-sys | sys | A | sys-04 | done | PLT-17 |
 | [CTR-37](CTR-37.md) | системный сигнал изменения корзины | contracts | B | contracts-25 | done | CTR-23 |
-| [IMAP-16](IMAP-16.md) | POP3 — блокировка ящика; запись в общие папки по ACL | imap | A | imap-07 | ready | IMAP-12,IMAP-10 |
-| [APP-14](APP-14.md) | ACME и переключение СУБД в `serve` | app | A | app-13 | todo | META-25,DEP-05 |
-| [CTR-38](CTR-38.md) | контракты GC, владельца загрузки и восстановления скрытых писем | contracts | B | contracts-26 | ready | CTR-23 |
+| [IMAP-16](IMAP-16.md) | POP3 — блокировка ящика; запись в общие папки по ACL | imap | A | imap-07 | done | IMAP-12,IMAP-10 |
+| [APP-14](APP-14.md) | ACME и переключение СУБД в `serve` | app | A | app-13 | ready | META-25,DEP-05 |
+| [CTR-38](CTR-38.md) | контракты GC, владельца загрузки и восстановления скрытых писем | contracts | B | contracts-26 | done | CTR-23 |
 | [SMTP-28](SMTP-28.md) | `Delivery::submit` без очереди — ошибка только для внешних получателей | smtp | A | smtp-09 | done | CMP-04 |
-| [META-36](META-36.md) | `EventBus` для `PgSignalBus`; сигнал `TrashChanged` из PostgreSQL | meta | A | meta-19 | todo | META-26,CTR-37 |
+| [META-36](META-36.md) | `EventBus` для `PgSignalBus`; сигнал `TrashChanged` из PostgreSQL | meta | A | meta-19 | ready | META-26,CTR-37 |
 | [MS-18](MS-18.md) | таймер корзины по сигналу `TrashChanged` | mailstore | A | mailstore-11 | ready | MS-14,CTR-37 |
 | [APP-15](APP-15.md) | сведения об узле в `heartbeat` | app | A | app-14 | todo | META-27 |
-| [CTR-39](CTR-39.md) | сигнал при снятии блокировки; пометка Membership | contracts | B | contracts-27 | todo | CTR-23 |
+| [CTR-39](CTR-39.md) | сигнал при снятии блокировки; пометка Membership | contracts | B | contracts-27 | ready | CTR-23 |
+| [SYS-10](SYS-10.md) | дескрипторы сокетов systemd в `TcpListener` | sys | A | sys-05 | ready | SYS-01 |
+| [APP-16](APP-16.md) | сокеты systemd, политики доменов в очереди, согласование doctor | app | A | app-15 | todo | SYS-10,SMTP-15 |
+| [CTR-40](CTR-40.md) | адресация организации в данных; перенос получателей без попытки | contracts | B | contracts-28 | todo | CTR-24 |
+| [PLT-20](PLT-20.md) | процессный `CryptoProvider` rustls для ACME | platform | A | platform-10 | ready | PLT-11 |
+| [META-38](META-38.md) | `PgMeta` поверх `Failover` — повтор операций при переключении | meta | A | meta-21 | ready | META-25 |
+| [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-20 | ready | CTR-23,META-16 |
 
 ## Вне волн
 

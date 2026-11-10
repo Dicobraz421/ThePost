@@ -8,10 +8,23 @@ use tokio::io::AsyncWriteExt;
 use tp_platform::Conn;
 
 use super::{Exit, Session, SessionCtx};
+use crate::screen::{Probe, Violation};
 
 /// Ведёт сессию SMTP соединения `conn` до завершения, выполняя STARTTLS по запросу клиента.
-pub async fn serve_conn(ctx: SessionCtx, mut conn: Conn) {
+pub async fn serve_conn(ctx: SessionCtx, conn: Conn) {
+    serve_screened(ctx, conn, None).await;
+}
+
+/// [`serve_conn`] с проверками экрана `probe`; итог проверок — [`Session::screen_outcome`].
+pub(crate) async fn serve_screened(
+    ctx: SessionCtx,
+    mut conn: Conn,
+    probe: Option<Probe>,
+) -> Option<Result<(), Violation>> {
     let mut session = Session::new(ctx, conn.info, conn.can_starttls());
+    if let Some(p) = probe {
+        session.screening(p);
+    }
     let mut greet = true;
     loop {
         match session.serve(&mut conn.stream, greet).await {
@@ -23,15 +36,16 @@ pub async fn serve_conn(ctx: SessionCtx, mut conn: Conn) {
                 }
                 Err(e) => {
                     tracing::debug!(client = %session.conn.client, error = %e, "smtp: STARTTLS не удался");
-                    return;
+                    return session.screen_outcome();
                 }
             },
             Ok(Exit::Quit | Exit::Closed) => break,
             Err(e) => {
                 tracing::debug!(client = %session.conn.client, error = %e, "smtp: соединение прервано");
-                return;
+                return session.screen_outcome();
             }
         }
     }
     let _ = conn.stream.shutdown().await;
+    session.screen_outcome()
 }

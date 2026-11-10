@@ -17,3 +17,12 @@ manual: no
 
 ## Приёмка
 - Conformance-тесты `EventBus` (как у шины в процессе) при `TEST_DATABASE_URL`; тест склейки под нагрузкой.
+
+## Состояние (meta-10)
+- Сделано: `tp_meta::signals::PgSignalBus` (публикатор со склейкой, слушатель мимо PgBouncer — `connect_listener`,
+  переподключение через `Failover` с `Resync`, фильтрация по интересам, буфер подписчика с `Resync`, метрики
+  `SignalMetrics`); `PgMeta::with_bus` — `LogAppended` после фиксации событий журнала, `MembersChanged` при входе и
+  выходе узла. Тесты — `tests/pg_signals.rs` (при `TEST_DATABASE_URL`).
+- Не сделано: `impl EventBus for PgSignalBus` и прогон `tp_testkit::suite::signals` — у `tp-meta` нет зависимости
+  `futures` (поток `EventStream` не собрать). Нужен PR `x/meta-dep` (`futures.workspace = true` в `tp-meta`), затем —
+  обёртка `Subscription` в `futures::stream::unfold` (несколько строк) и conformance-тест набором testkit.

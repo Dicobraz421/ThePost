@@ -6,6 +6,10 @@
 //!   через [`Transport`] (по умолчанию — [`send::MxTransport`] на `mail-send`), затем по каждому получателю:
 //!   2xx — `complete(Delivered)`, 5xx или истёк `queue.expire` — `complete(Failed)`, 4xx и сбой соединения —
 //!   `reschedule` через `queue.retry`. Когда запись завершена (`complete` = `true`), ссылка на объект снимается.
+//!   Отправки — под планировщиком по доменам ([`sched`]): параллельность, скорость, медленный старт,
+//!   отложенная обработка недоступных доменов, раздельные пулы внутренней и внешней доставки.
+//!   Политики доменов назначения организаций ([`crate::routes`], [`QueueWorker::with_routes`]) — в
+//!   [`SendRequest::route`].
 //!   Устаревший захват (`Conflict`: лиза истекла, запись взял другой узел) — запись пропускается.
 //!   Уведомления отправителю (DSN: отказ, задержка, успех) — [`crate::dsn`].
 //! - [`SmtpOutService`] — роль smtp-out: опрос очереди до остановки.
@@ -32,7 +36,12 @@ use crate::deliver::Outbound;
 use crate::dkim_sign::DkimSign;
 use crate::dsn::{self, DsnSink};
 use crate::metrics::{RcptOutcome, SmtpMetrics};
+use crate::routes::Routes;
+use sched::{Admit, Scheduler};
+use tp_contracts::bus::EventBus;
+use tp_contracts::transport::DestinationPolicy;
 
+pub mod sched;
 pub mod send;
 
 /// Источник текущего времени (UTC).
@@ -218,6 +227,13 @@ pub enum RcptResult {
     Temporary(String),
     /// Окончательный отказ (5xx); ответ сервера.
     Permanent(String),
+    /// Отложено планировщиком без соединения (домен недоступен или занят): повтор в `until`.
+    Deferred {
+        /// Причина.
+        reason: String,
+        /// Срок следующей попытки.
+        until: OffsetDateTime,
+    },
 }
 
 /// Попытка отправки письма получателям одного домена.
@@ -235,6 +251,8 @@ pub struct SendRequest<'a> {
     pub rcpts: &'a [String],
     /// Письмо.
     pub message: &'a [u8],
+    /// Политика домена назначения организации ([`crate::routes`]); `None` — по секции `smtp.queue`.
+    pub route: Option<&'a DestinationPolicy>,
 }
 
 /// Отправка письма принимающему серверу.
@@ -251,6 +269,11 @@ pub struct QueueWorker {
     hostname: String,
     dsn: Arc<dyn DsnSink>,
     metrics: Option<Arc<SmtpMetrics>>,
+    sched: Arc<Scheduler>,
+    /// Политики доменов назначения.
+    routes: Option<Arc<Routes>>,
+    /// Шина: перечитывание политик по сигналу.
+    bus: Option<Arc<dyn EventBus>>,
 }
 
 impl fmt::Debug for QueueWorker {
@@ -274,7 +297,18 @@ impl QueueWorker {
             transport,
             hostname: hostname.into(),
             metrics: None,
+            sched: Arc::new(Scheduler::new()),
+            routes: None,
+            bus: None,
         }
+    }
+
+    /// Политики доменов назначения организаций (SMTP-15); с шиной `bus` роль smtp-out перечитывает их по
+    /// сигналу `TransportChanged` ([`Routes::watch`]).
+    pub fn with_routes(mut self, routes: Arc<Routes>, bus: Option<Arc<dyn EventBus>>) -> Self {
+        self.routes = Some(routes);
+        self.bus = bus;
+        self
     }
 
     /// Метрики очереди (SMTP-11).
@@ -345,35 +379,86 @@ impl QueueWorker {
                 .to_lowercase();
             domains.entry(domain).or_default().push(i);
         }
-        let mut outcome = Vec::new();
-        for (domain, idx) in &domains {
-            let rcpts: Vec<String> = idx
-                .iter()
-                .map(|i| c.rcpts[*i].rcpt.address.clone())
-                .collect();
-            let results = if domain.is_empty() {
-                vec![RcptResult::Permanent("501 5.1.3 bad recipient address".into()); rcpts.len()]
-            } else {
-                self.transport
-                    .send(SendRequest {
-                        cfg,
-                        helo: &self.hostname,
-                        domain,
-                        from: &c.from,
-                        rcpts: &rcpts,
-                        message: &message,
-                    })
+        // Политики организации и принятые домены кластера; недоступны — попытка откладывается (политика может
+        // требовать TLS).
+        let (tenant, cluster) = match &self.routes {
+            None => (None, None),
+            Some(routes) => match (routes.tenant(c.tenant).await, routes.cluster().await) {
+                (Ok(t), Ok(cl)) => (Some(t), Some(cl)),
+                (Err(e), _) | (_, Err(e)) => {
+                    let reason = format!("transport settings unavailable: {e}");
+                    let outcome = c
+                        .rcpts
+                        .iter()
+                        .map(|r| (r, RcptResult::Temporary(reason.clone())))
+                        .collect();
+                    return self.finish(cfg, &c, &message, outcome).await;
+                }
+            },
+        };
+        let accepted = |d: &str| cluster.as_ref().is_some_and(|cl| cl.domain(d).is_some());
+        // Домены — параллельно, каждый под планировщиком: недоступный домен не задерживает остальные.
+        let sends = domains.iter().map(|(domain, idx)| {
+            let message = &message;
+            let c = &c;
+            let tenant = &tenant;
+            async move {
+                let rcpts: Vec<String> = idx
+                    .iter()
+                    .map(|i| c.rcpts[*i].rcpt.address.clone())
+                    .collect();
+                if domain.is_empty() {
+                    return vec![
+                        RcptResult::Permanent("501 5.1.3 bad recipient address".into());
+                        rcpts.len()
+                    ];
+                }
+                let class = Scheduler::class(&cfg.scheduler, domain, accepted);
+                // Политики — для внешних доменов (вне принятых доменов кластера).
+                let route = tenant
+                    .as_deref()
+                    .filter(|_| !accepted(domain))
+                    .and_then(|t| t.route(domain));
+                match self
+                    .sched
+                    .acquire(&cfg.scheduler, domain, class, &self.deps.now)
                     .await
-            };
+                {
+                    Admit::Defer { reason, until } => {
+                        tracing::info!(id = %c.claim.id, %domain, %reason, "smtp: получатели отложены планировщиком");
+                        vec![RcptResult::Deferred { reason, until }; rcpts.len()]
+                    }
+                    Admit::Go(permit) => {
+                        let results = self
+                            .transport
+                            .send(SendRequest {
+                                cfg,
+                                helo: &self.hostname,
+                                domain,
+                                from: &c.from,
+                                rcpts: &rcpts,
+                                message,
+                                route,
+                            })
+                            .await;
+                        permit.done(&results);
+                        results
+                    }
+                }
+            }
+        });
+        let results = futures::future::join_all(sends).await;
+        // Долгая доставка нескольким доменам: лиза продлевается до записи итогов.
+        if domains.len() > 1 {
+            self.deps
+                .store
+                .renew(&c.claim, (self.deps.now)() + cfg.lease)
+                .await?;
+        }
+        let mut outcome = Vec::new();
+        for (idx, results) in domains.values().zip(results) {
             for (i, res) in idx.iter().zip(results) {
                 outcome.push((&c.rcpts[*i], res));
-            }
-            // Долгая доставка нескольким доменам: лиза продлевается после каждого.
-            if domains.len() > 1 {
-                self.deps
-                    .store
-                    .renew(&c.claim, (self.deps.now)() + cfg.lease)
-                    .await?;
             }
         }
         self.finish(cfg, &c, &message, outcome).await
@@ -397,12 +482,19 @@ impl QueueWorker {
         let mut delayed = Vec::new();
         let mut delivered = Vec::new();
         for (r, res) in outcome {
+            // Перенос планировщиком — временная неудача со своим сроком повтора.
+            let (res, until) = match res {
+                RcptResult::Deferred { reason, until } => {
+                    (RcptResult::Temporary(reason), Some(until))
+                }
+                res => (res, None),
+            };
             if let Some(m) = &self.metrics {
                 let kind = match &res {
                     RcptResult::Delivered(_) => RcptOutcome::Delivered,
                     RcptResult::Permanent(_) => RcptOutcome::Failed,
                     RcptResult::Temporary(_) if expired => RcptOutcome::Failed,
-                    RcptResult::Temporary(_) => RcptOutcome::Deferred,
+                    RcptResult::Temporary(_) | RcptResult::Deferred { .. } => RcptOutcome::Deferred,
                 };
                 m.rcpt(kind, age.as_seconds_f64());
             }
@@ -422,12 +514,12 @@ impl QueueWorker {
                         .await?;
                 }
                 RcptResult::Permanent(reply) => failed.push((r, reply, None)),
-                RcptResult::Temporary(reason) if expired => {
+                RcptResult::Temporary(reason) | RcptResult::Deferred { reason, .. } if expired => {
                     let reply = format!("delivery time expired, last error: {reason}");
                     failed.push((r, reply, Some("4.4.7")));
                 }
-                RcptResult::Temporary(reason) => {
-                    let at = now + cfg.retry_after(r.attempts + 1);
+                RcptResult::Temporary(reason) | RcptResult::Deferred { reason, .. } => {
+                    let at = until.unwrap_or_else(|| now + cfg.retry_after(r.attempts + 1));
                     tracing::info!(id = %c.claim.id, %reason, attempt = r.attempts + 1, "smtp: временная неудача, повтор");
                     // Порог задержки пересечён этой попыткой (предыдущая была раньше порога).
                     let prev = if r.attempts == 0 {
@@ -526,6 +618,14 @@ impl RoleService for SmtpOutService {
     }
 
     async fn run(&self, ctx: RoleCtx) -> Result<()> {
+        if let (Some(routes), Some(bus)) = (&self.worker.routes, &self.worker.bus) {
+            let retry = ctx.config::<SmtpConfig>()?.queue.resubscribe;
+            tokio::spawn(
+                routes
+                    .clone()
+                    .watch(bus.clone(), ctx.shutdown.clone(), retry),
+            );
+        }
         ctx.ready.set(true);
         loop {
             let cfg = ctx.config::<SmtpConfig>()?;

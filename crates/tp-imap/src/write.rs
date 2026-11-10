@@ -10,14 +10,20 @@
 //!   корзину» (`TrashStore::purge`, решение 2026-11-01-trash-purge): по настройке `trash.purge` письмо скрывается
 //!   до конца срока корзины или стирается (под Legal Hold — скрывается). Хранилище корзины в шину не пишет:
 //!   `MailboxChanged` корзины публикует сессия.
+//! - Общие папки — по правам ACL (RFC 4314, 4; `ext`): `APPEND`, `COPY` и `MOVE` в папку — `i`, флаги без права
+//!   у нового письма не ставятся; `MOVE` из папки — `t` и `e`; `EXPUNGE` — `e` (`CLOSE` без `e` не удаляет).
+//!   Между учётными записями письмо копируется побайтово: `MailStore::fetch_raw` и `append` в папку владельца
+//!   назначения (квота — его), `MOVE` затем удаляет исходные в корзину владельца источника.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use time::OffsetDateTime;
+use tp_contracts::auth::Rights;
 use tp_contracts::bus::{Event, EventKind};
-use tp_contracts::meta::{AccountScope, Flag, Inserted, MessageQuery, SpecialUse};
+use tp_contracts::meta::{AccountScope, Flag, Inserted, Message, MessageQuery, SpecialUse};
 use tp_contracts::{Error, MailboxId, MessageId, Result};
 
+use crate::ext::{allowed_flags, flag_rights};
 use crate::proto::types::core::{Tag, Vec1};
 use crate::proto::types::datetime::DateTime;
 use crate::proto::types::extensions::binary::LiteralOrLiteral8;
@@ -66,10 +72,14 @@ impl<T: Transport> Session<T> {
             self.bad(Some(tag), "Flag can't be stored");
             return Ok(());
         };
-        let Some(node) = self.target(tag, &proto::mailbox_bytes(mailbox)).await? else {
+        let Some((node, rights)) = self.target(tag, &proto::mailbox_bytes(mailbox)).await? else {
             return Ok(());
         };
-        let scope = self.scope().ok_or(Error::Forbidden)?;
+        let flags = allowed_flags(rights, flags);
+        let scope = match node.owner {
+            Some(owner) => owner,
+            None => self.scope().ok_or(Error::Forbidden)?,
+        };
         let data = match message {
             LiteralOrLiteral8::Literal(l) => l.data().to_vec(),
             LiteralOrLiteral8::Literal8(l) => l.data.to_vec(),
@@ -77,7 +87,7 @@ impl<T: Transport> Session<T> {
         let received_at = date
             .and_then(|d| OffsetDateTime::from_unix_timestamp(d.as_ref().timestamp()).ok())
             .unwrap_or_else(OffsetDateTime::now_utc);
-        // Письмо кладёт сам владелец ящика (черновик, копия отправленного): не доставка.
+        // Письмо кладёт клиент (черновик, копия отправленного; в общую папку — по праву `i`): не доставка.
         let raw = Box::pin(futures::stream::iter([Ok(bytes::Bytes::from(data))]));
         let appended = self
             .ctx
@@ -113,9 +123,11 @@ impl<T: Transport> Session<T> {
             self.bad(Some(tag), "Invalid message sequence number");
             return Ok(());
         };
-        let Some(node) = self.target(tag, &proto::mailbox_bytes(mailbox)).await? else {
+        let Some((node, to_rights)) = self.target(tag, &proto::mailbox_bytes(mailbox)).await?
+        else {
             return Ok(());
         };
+        let from_rights = self.selected_rights().await?;
         let Some(selected) = self.selected.as_ref() else {
             return Ok(());
         };
@@ -129,6 +141,10 @@ impl<T: Transport> Session<T> {
             self.no(tag, None, "Mailbox is read-only");
             return Ok(());
         }
+        if mv && !from_rights.contains(Rights::DELETE_MESSAGES | Rights::EXPUNGE) {
+            self.no(tag, Some(proto::code("NOPERM")), "Permission denied");
+            return Ok(());
+        }
         let source = selected.mailbox;
         let targets: Vec<(usize, u32, MessageId)> = indexes
             .iter()
@@ -139,20 +155,33 @@ impl<T: Transport> Session<T> {
             return Ok(());
         }
         let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
-        // Письма общей папки другой учётной записи не копируются: хранилище работает в одной учётной записи.
-        if Some(scope) != self.scope() {
-            self.no(
-                tag,
-                Some(proto::code("NOPERM")),
-                "Copying from a shared mailbox is not supported",
-            );
-            return Ok(());
-        }
+        let to_scope = match node.owner {
+            Some(owner) => owner,
+            None => self.scope().ok_or(Error::Forbidden)?,
+        };
         let ids: Vec<MessageId> = targets.iter().map(|t| t.2).collect();
         let to = node.mailbox.id;
-        let to_trash = mv && node.mailbox.role == Some(SpecialUse::Trash) && to != source;
+        let same = scope == to_scope;
+        let to_trash = same && mv && node.mailbox.role == Some(SpecialUse::Trash) && to != source;
         // Пары (исходный UID, новый UID) в порядке писем.
-        let pairs: Vec<(u32, u32)> = if to_trash {
+        let pairs: Vec<(u32, u32)> = if !same || !(to_trash || to_rights.contains(flag_rights())) {
+            // Другая учётная запись или не все флаги разрешены: побайтовая копия с разрешёнными флагами.
+            let pairs = self
+                .copy_raw(scope, source, &targets, to_scope, to, to_rights)
+                .await?;
+            if mv {
+                let done: HashSet<u32> = pairs.iter().map(|p| p.0).collect();
+                let moved: Vec<MessageId> = targets
+                    .iter()
+                    .filter(|t| done.contains(&t.1))
+                    .map(|t| t.2)
+                    .collect();
+                if !moved.is_empty() {
+                    self.ctx.deps.store.delete_to_trash(scope, &moved).await?;
+                }
+            }
+            pairs
+        } else if to_trash {
             self.ctx.deps.store.delete_to_trash(scope, &ids).await?;
             // В корзине письмо сохраняет MessageId: новый UID — по нему.
             let moved = self
@@ -177,7 +206,7 @@ impl<T: Transport> Session<T> {
                 .map(|(t, ins)| (t.1, ins.uid.0))
                 .collect()
         };
-        let st = self.ctx.deps.mailboxes.status(scope, to).await?;
+        let st = self.ctx.deps.mailboxes.status(to_scope, to).await?;
         let src: Vec<u32> = pairs.iter().map(|p| p.0).collect();
         let dst: Vec<u32> = pairs.iter().map(|p| p.1).collect();
         let code = uid_set(&src)
@@ -208,6 +237,43 @@ impl<T: Transport> Session<T> {
             self.ok(tag, code, &format!("{verb} completed"));
         }
         Ok(())
+    }
+
+    /// Копирует письма `targets` папки `source` учётной записи `scope` в папку `to` учётной записи `to_scope`
+    /// побайтово (`fetch_raw` и `append`), с флагами, разрешёнными правами `rights` на папку назначения.
+    /// Письма, удалённые другой сессией, пропускаются. Возвращает пары (исходный UID, новый UID).
+    async fn copy_raw(
+        &self,
+        scope: AccountScope,
+        source: MailboxId,
+        targets: &[(usize, u32, MessageId)],
+        to_scope: AccountScope,
+        to: MailboxId,
+        rights: Rights,
+    ) -> Result<Vec<(u32, u32)>> {
+        let deps = &self.ctx.deps;
+        let ids: Vec<MessageId> = targets.iter().map(|t| t.2).collect();
+        let list = deps
+            .messages
+            .list(scope, source, MessageQuery::Ids(ids), targets.len())
+            .await?;
+        let by_id: HashMap<MessageId, Message> = list.into_iter().map(|m| (m.id, m)).collect();
+        let mut pairs = Vec::with_capacity(targets.len());
+        for &(_, uid, id) in targets {
+            let Some(m) = by_id.get(&id) else { continue };
+            let raw = match deps.store.fetch_raw(scope, id, None).await {
+                Ok(raw) => raw,
+                Err(Error::NotFound) => continue,
+                Err(e) => return Err(e),
+            };
+            let flags = allowed_flags(rights, m.flags.clone());
+            let added = deps
+                .store
+                .append(to_scope, to, raw, flags, m.received_at)
+                .await?;
+            pairs.push((uid, added.uid.0));
+        }
+        Ok(pairs)
     }
 
     /// После изменения папки `mailbox`: если она выбрана — изменения клиенту (`EXISTS` и т. п.).
@@ -329,6 +395,10 @@ impl<T: Transport> Session<T> {
             return Ok(());
         }
         let mailbox = selected.mailbox;
+        if !self.selected_rights().await?.contains(Rights::EXPUNGE) {
+            self.no(tag, Some(proto::code("NOPERM")), "Permission denied");
+            return Ok(());
+        }
         let verb = if set.is_some() {
             "UID EXPUNGE"
         } else {
@@ -364,7 +434,8 @@ impl<T: Transport> Session<T> {
             return Ok(());
         };
         let (mailbox, read_only) = (selected.mailbox, selected.read_only);
-        if !read_only {
+        // Без права `e` письма не удаляются, папка закрывается (RFC 4314, 4).
+        if !read_only && self.selected_rights().await?.contains(Rights::EXPUNGE) {
             let found = self.deleted(None).await?;
             if !found.is_empty() {
                 let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
