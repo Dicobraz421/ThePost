@@ -2,8 +2,9 @@
 //!
 //! На учётную запись — свой `broadcast`-канал с ограниченным буфером, системные уведомления — в
 //! общем канале. Канал учётной записи создаётся первой подпиской и удаляется с последним подписчиком.
-//! Подписчик, отставший больше чем на буфер, получает `Lagged`: его поток завершается, и подписчик,
-//! переподписавшись, сверяется с хранилищем по `ModSeq` (доставка at-most-once).
+//! Подписчик, отставший больше чем на буфер, теряет накопленные уведомления и получает вместо них один
+//! `EventKind::Resync` (сверка с хранилищем, доставка at-most-once); поток не завершается, буфер подписчика
+//! освобождается, и дальше идут новые уведомления.
 //! Счётчики — [`BusCounters`] (метрики платформы).
 
 use std::collections::HashMap;
@@ -15,9 +16,9 @@ use futures::{StreamExt, stream};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
-use tp_contracts::bus::{Event, EventBus, EventStream};
+use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
 use tp_contracts::meta::AccountScope;
-use tp_contracts::{AccountId, Result, TenantId};
+use tp_contracts::{AccountId, Error, Result, TenantId};
 
 use crate::metrics::{BusCounters, BusMetrics, inc};
 
@@ -26,7 +27,7 @@ use crate::metrics::{BusCounters, BusMetrics, inc};
 #[serde(default, deny_unknown_fields)]
 pub struct LocalBusConfig {
     /// Буфер канала учётной записи и системного канала: сколько непрочитанных уведомлений
-    /// подписчик может накопить, прежде чем отстанет и будет отключён (не меньше 1).
+    /// подписчик может накопить, прежде чем отстанет и получит `Resync` (не меньше 1).
     pub capacity: usize,
 }
 
@@ -89,7 +90,7 @@ impl LocalBus {
         }
     }
 
-    /// Сколько раз подписчики отстали и были отключены.
+    /// Сколько раз подписчики отстали и получили `Resync`.
     pub fn lagged(&self) -> u64 {
         self.inner.counters.lagged.load(Ordering::Relaxed)
     }
@@ -147,6 +148,11 @@ impl LocalBus {
         }
         into_stream(Subscription {
             rx,
+            resync: Event {
+                tenant: scope.tenant,
+                account: Some(scope.account),
+                kind: EventKind::Resync,
+            },
             counters: self.counters(),
             inner: Arc::downgrade(&self.inner),
             channel: Some((key, generation)),
@@ -157,6 +163,11 @@ impl LocalBus {
     fn subscribe_system_now(&self) -> EventStream {
         into_stream(Subscription {
             rx: self.inner.system().subscribe(),
+            resync: Event {
+                tenant: TenantId::DEFAULT,
+                account: None,
+                kind: EventKind::Resync,
+            },
             counters: self.counters(),
             inner: Arc::downgrade(&self.inner),
             channel: None,
@@ -178,6 +189,11 @@ impl Default for LocalBus {
 #[async_trait]
 impl EventBus for LocalBus {
     async fn publish(&self, event: Event) -> Result<()> {
+        if event.kind == EventKind::Resync {
+            return Err(Error::invalid(
+                "Resync is inserted by the bus, not published",
+            ));
+        }
         let counters = &self.inner.counters;
         inc(&counters.published);
         inc(&counters.received);
@@ -198,6 +214,8 @@ impl EventBus for LocalBus {
 #[derive(Debug)]
 struct Subscription {
     rx: broadcast::Receiver<Event>,
+    /// Сигнал сверки этой подписки.
+    resync: Event,
     counters: Arc<BusCounters>,
     inner: Weak<Inner>,
     channel: Option<(Key, u64)>,
@@ -227,9 +245,13 @@ fn into_stream(sub: Subscription) -> EventStream {
                 Some((event, sub))
             }
             Err(RecvError::Lagged(skipped)) => {
+                // Оставшиеся в буфере уведомления сверка всё равно покроет: буфер освобождается
+                // (получатель с хвоста канала), и `Resync` приходит один раз на переполнение.
+                sub.rx = sub.rx.resubscribe();
                 inc(&sub.counters.lagged);
-                tracing::debug!(skipped, "шина: подписчик отстал, поток завершён");
-                None
+                tracing::debug!(skipped, "шина: подписчик отстал, Resync");
+                let resync = sub.resync.clone();
+                Some((resync, sub))
             }
             Err(RecvError::Closed) => None,
         }
@@ -268,8 +290,29 @@ mod tests {
         }
     }
 
+    fn resync(scope: AccountScope) -> Event {
+        Event {
+            tenant: scope.tenant,
+            account: Some(scope.account),
+            kind: EventKind::Resync,
+        }
+    }
+
+    /// Следующее уведомление, если оно уже в буфере.
+    async fn ready(stream: &mut EventStream) -> Option<Event> {
+        tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+            .await
+            .ok()
+            .flatten()
+    }
+
     #[tokio::test]
-    async fn lagging_subscriber_is_cut_and_resubscribes() {
+    async fn signals_suite() {
+        tp_testkit::suite::signals(&LocalBus::default()).await;
+    }
+
+    #[tokio::test]
+    async fn lagging_subscriber_gets_resync_then_new_events() {
         let bus = LocalBus::new(&LocalBusConfig { capacity: 2 });
         let scope = conformance::scope();
         let mut slow = bus.subscribe(scope).await.expect("subscribe");
@@ -279,20 +322,28 @@ mod tests {
             // Быстрый подписчик читает сразу и не отстаёт.
             assert_eq!(fast.next().await, Some(changed(scope, i)));
         }
-        // Медленный отстал больше чем на буфер: поток завершается без уведомлений.
-        assert_eq!(slow.next().await, None);
+        // Медленный отстал больше чем на буфер: один `Resync` вместо потерянных, буфер освобождён.
+        assert_eq!(slow.next().await, Some(resync(scope)));
+        assert_eq!(ready(&mut slow).await, None, "Resync один, старых нет");
         assert_eq!(bus.lagged(), 1);
-        drop(slow);
 
-        // Переподписка — и уведомления снова идут (после сверки по ModSeq у подписчика).
-        let mut again = bus.subscribe(scope).await.expect("subscribe");
+        // Поток жив: дальше — новые уведомления.
         bus.publish(changed(scope, 6)).await.expect("publish");
-        assert_eq!(again.next().await, Some(changed(scope, 6)));
+        assert_eq!(slow.next().await, Some(changed(scope, 6)));
         assert_eq!(fast.next().await, Some(changed(scope, 6)));
+
+        // Новое переполнение — новый `Resync`.
+        for i in 7..=10 {
+            bus.publish(changed(scope, i)).await.expect("publish");
+        }
+        assert_eq!(slow.next().await, Some(resync(scope)));
+        assert_eq!(bus.lagged(), 2);
+        bus.publish(changed(scope, 11)).await.expect("publish");
+        assert_eq!(slow.next().await, Some(changed(scope, 11)));
     }
 
     #[tokio::test]
-    async fn lagging_system_subscriber_is_cut() {
+    async fn lagging_system_subscriber_gets_resync() {
         let bus = LocalBus::new(&LocalBusConfig { capacity: 1 });
         let mut sys = bus.subscribe_system().await.expect("subscribe");
         for _ in 0..3 {
@@ -300,8 +351,32 @@ mod tests {
                 .await
                 .expect("publish");
         }
-        assert_eq!(sys.next().await, None);
+        let resync = Event {
+            tenant: TenantId::DEFAULT,
+            account: None,
+            kind: EventKind::Resync,
+        };
+        assert_eq!(sys.next().await, Some(resync));
+        assert_eq!(ready(&mut sys).await, None);
         assert_eq!(bus.lagged(), 1);
+        bus.publish(conformance::system(EventKind::ConfigReloaded))
+            .await
+            .expect("publish");
+        assert_eq!(
+            sys.next().await,
+            Some(conformance::system(EventKind::ConfigReloaded))
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_resync_is_invalid() {
+        let bus = LocalBus::default();
+        let scope = conformance::scope();
+        assert!(matches!(
+            bus.publish(resync(scope)).await,
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(bus.metrics().published, 0);
     }
 
     #[tokio::test]
