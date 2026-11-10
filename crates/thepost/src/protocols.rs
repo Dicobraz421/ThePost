@@ -2,14 +2,15 @@
 //! полос: smtp-in и submission (`tp-smtp`), imap (`tp-imap`), jmap и admin (HTTP платформы), indexer (`tp-search`
 //! с обработчиком журнала событий `tp-meta`). Роль без слушателей в конфигурации готова, но соединений не принимает.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::task::JoinSet;
 use tp_contracts::events::{EventLog, EventSink, partition_of};
+use tp_contracts::meta::AccountScope;
 use tp_contracts::role::{Role, RoleCtx, RoleService};
 use tp_contracts::search::IndexManifestStore as _;
 use tp_contracts::tls::Profile;
@@ -18,7 +19,7 @@ use tp_meta::PgMeta;
 use tp_meta::events::EventConsumer;
 use tp_platform::listen::EndpointConfig;
 use tp_platform::{InheritedSockets, Listener, TlsCerts, service_http};
-use tp_search::{Indexer, Rebuilder, SCHEMA_VERSION, SUBSCRIBER};
+use tp_search::{Indexer, IndexerConfig, Rebuilder, SCHEMA_VERSION, SUBSCRIBER};
 use tp_smtp::{Mode, ServerDeps, SmtpConfig, SmtpService};
 
 use crate::sections::HttpListener;
@@ -300,6 +301,91 @@ impl RoleService for HttpRole {
     }
 }
 
+/// Пауза между записями в журнал одной и той же ошибки: первая — `initial`, каждая следующая вдвое больше,
+/// до `max` (как пауза повтора индексатора, `search.indexer.retry_initial`/`retry_max`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogPause {
+    /// Пауза после первой записи.
+    pub initial: Duration,
+    /// Предельная пауза (меньше `initial` — `initial`).
+    pub max: Duration,
+}
+
+impl From<&IndexerConfig> for LogPause {
+    fn from(cfg: &IndexerConfig) -> Self {
+        Self {
+            initial: cfg.retry_initial,
+            max: cfg.retry_max,
+        }
+    }
+}
+
+/// Повторяющаяся ошибка цикла роли: новая записывается в журнал сразу, та же — не чаще раза за паузу; пауза
+/// растёт от записи к записи, успех сбрасывает состояние.
+#[derive(Debug)]
+struct RepeatLog {
+    pause: LogPause,
+    /// Последняя записанная ошибка, когда и пауза до следующей записи той же ошибки.
+    last: Option<(String, Instant, Duration)>,
+    /// Ошибок подряд с первой записи.
+    failures: u64,
+    /// Повторов, не записанных с прошлой записи.
+    skipped: u64,
+}
+
+impl RepeatLog {
+    fn new(pause: LogPause) -> Self {
+        Self {
+            pause,
+            last: None,
+            failures: 0,
+            skipped: 0,
+        }
+    }
+
+    /// Ошибка `msg` в `now`: `Some(пропущено повторов)` — записать в журнал.
+    fn fail(&mut self, msg: String, now: Instant) -> Option<u64> {
+        self.failures = self.failures.saturating_add(1);
+        let max = self.pause.max.max(self.pause.initial);
+        let pause = match &self.last {
+            Some((last, at, pause)) if *last == msg => {
+                if now.duration_since(*at) < *pause {
+                    self.skipped = self.skipped.saturating_add(1);
+                    return None;
+                }
+                pause.saturating_mul(2).min(max)
+            }
+            _ => self.pause.initial.min(max),
+        };
+        self.last = Some((msg, now, pause));
+        Some(std::mem::take(&mut self.skipped))
+    }
+
+    /// Успешная попытка: ошибок подряд до неё (0 — ошибок не было); состояние сброшено.
+    fn ok(&mut self) -> u64 {
+        self.last = None;
+        self.skipped = 0;
+        std::mem::take(&mut self.failures)
+    }
+}
+
+/// Итог шага цикла роли с записью в журнал по [`RepeatLog`]: `what` — что за шаг.
+fn log_step(log: &mut RepeatLog, result: Result<()>, what: &str) {
+    match result {
+        Ok(()) => {
+            let failures = log.ok();
+            if failures > 0 {
+                tracing::info!(failures, "indexer: {what} — снова без ошибок");
+            }
+        }
+        Err(e) => {
+            if let Some(skipped) = log.fail(e.to_string(), Instant::now()) {
+                tracing::warn!(error = %e, skipped, "indexer: {what} — ошибка");
+            }
+        }
+    }
+}
+
 /// Роль indexer: подписчик `indexer` журнала событий с лизами разделов `events/indexer/{p}` (обработчик
 /// `tp-meta`), перестройка индексов по `pending_rebuilds` для ящиков своих разделов.
 pub struct IndexerRole {
@@ -309,6 +395,7 @@ pub struct IndexerRole {
     meta: PgMeta,
     poll: Duration,
     rebuild_batch: usize,
+    log_pause: LogPause,
 }
 
 impl std::fmt::Debug for IndexerRole {
@@ -320,31 +407,36 @@ impl std::fmt::Debug for IndexerRole {
 }
 
 impl IndexerRole {
-    /// Роль: журнал `events`, индексатор и перестройка; опрос журнала — каждые `poll`.
+    /// Роль: журнал `events`, индексатор и перестройка; опрос журнала — каждые `poll`; повторяющиеся ошибки —
+    /// в журнал не чаще раза за паузу `log_pause`.
     pub fn new(
         events: EventConsumer,
-        indexer: Indexer,
+        indexer: Arc<Indexer>,
         rebuilder: Rebuilder,
         meta: PgMeta,
         poll: Duration,
         rebuild_batch: usize,
+        log_pause: LogPause,
     ) -> Self {
         Self {
             events,
-            indexer: Arc::new(indexer),
+            indexer,
             rebuilder: Arc::new(rebuilder),
             meta,
             poll,
             rebuild_batch,
+            log_pause,
         }
     }
 
-    /// Перестройка запрошенных индексов ящиков, чьи разделы журнала держит узел.
-    async fn rebuild_pending(&self) -> Result<()> {
+    /// Перестройка запрошенных индексов ящиков, чьи разделы журнала держит узел; `failed` — ошибки перестройки
+    /// по ящикам (остаются только ящики из текущего списка запросов).
+    async fn rebuild_pending(&self, failed: &mut HashMap<AccountScope, RepeatLog>) -> Result<()> {
         let pending = self
             .meta
             .pending_rebuilds(SCHEMA_VERSION, self.rebuild_batch.max(1))
             .await?;
+        failed.retain(|scope, _| pending.contains(scope));
         if pending.is_empty() {
             return Ok(());
         }
@@ -356,10 +448,16 @@ impl IndexerRole {
             }
             match self.rebuilder.rebuild(scope).await {
                 Ok(n) => {
+                    failed.remove(&scope);
                     tracing::info!(account = %scope.account, messages = n, "search: индекс перестроен")
                 }
                 Err(e) => {
-                    tracing::warn!(account = %scope.account, error = %e, "search: индекс не перестроен")
+                    let log = failed
+                        .entry(scope)
+                        .or_insert_with(|| RepeatLog::new(self.log_pause));
+                    if let Some(skipped) = log.fail(e.to_string(), Instant::now()) {
+                        tracing::warn!(account = %scope.account, error = %e, skipped, "search: индекс не перестроен")
+                    }
                 }
             }
         }
@@ -377,21 +475,22 @@ impl RoleService for IndexerRole {
         ctx.ready.set(true);
         let mut tick = tokio::time::interval(self.poll.max(Duration::from_millis(1)));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut poll_log = RepeatLog::new(self.log_pause);
+        let mut pending_log = RepeatLog::new(self.log_pause);
+        let mut rebuild_failed = HashMap::new();
         loop {
             tokio::select! {
                 () = ctx.shutdown.cancelled() => break,
                 _ = tick.tick() => {}
             }
-            if let Err(e) = self
+            let polled = self
                 .events
                 .poll(self.indexer.as_ref() as &dyn EventSink)
                 .await
-            {
-                tracing::warn!(error = %e, "indexer: пачка журнала событий не обработана");
-            }
-            if let Err(e) = self.rebuild_pending().await {
-                tracing::warn!(error = %e, "indexer: запросы перестройки не прочитаны");
-            }
+                .map(drop);
+            log_step(&mut poll_log, polled, "опрос журнала событий");
+            let pending = self.rebuild_pending(&mut rebuild_failed).await;
+            log_step(&mut pending_log, pending, "чтение запросов перестройки");
         }
         if let Err(e) = self.events.release_all(SUBSCRIBER).await {
             tracing::warn!(error = %e, "indexer: лизы разделов не отданы");
@@ -418,5 +517,37 @@ impl RoleService for InProcessRole {
         ctx.shutdown.cancelled().await;
         ctx.ready.set(false);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_error_logged_once_per_pause() {
+        let s = Duration::from_secs(1);
+        let mut log = RepeatLog::new(LogPause {
+            initial: s,
+            max: 4 * s,
+        });
+        let t0 = Instant::now();
+        let e = || "СУБД недоступна".to_owned();
+        // Первая — сразу; повтор внутри паузы — пропущен; после паузы — запись, пауза удвоена.
+        assert_eq!(log.fail(e(), t0), Some(0));
+        assert_eq!(log.fail(e(), t0 + s / 2), None);
+        assert_eq!(log.fail(e(), t0 + s), Some(1));
+        assert_eq!(log.fail(e(), t0 + 2 * s), None);
+        assert_eq!(log.fail(e(), t0 + 3 * s), Some(1));
+        // Пауза не больше предела.
+        assert_eq!(log.fail(e(), t0 + 7 * s), Some(0));
+        assert_eq!(log.fail(e(), t0 + 11 * s), Some(0));
+        // Другая ошибка — сразу, пауза — с начала.
+        assert_eq!(log.fail("другая".to_owned(), t0 + 11 * s), Some(0));
+        assert_eq!(log.fail("другая".to_owned(), t0 + 12 * s), Some(0));
+        // Успех: ошибок подряд, состояние сброшено.
+        assert_eq!(log.ok(), 9);
+        assert_eq!(log.ok(), 0);
+        assert_eq!(log.fail(e(), t0 + 12 * s), Some(0));
     }
 }
