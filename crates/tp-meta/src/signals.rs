@@ -14,6 +14,9 @@
 //!   системные сигналы всех организаций. У подписчика ограниченный буфер ([`SignalsConfig::subscriber_buffer`]):
 //!   при переполнении накопленные сигналы заменяются одним `Resync`.
 //!
+//! Контракт [`EventBus`] (META-36): подписка — поток [`EventStream`] над [`Subscription`]; поток завершается при
+//! остановке шины, `drop` потока удаляет подписку.
+//!
 //! Метрики — [`PgSignalBus::metrics`]: задержка сигнала (от постановки в очередь до приёма слушателем, по
 //! часам узлов), размер пачек, время NOTIFY.
 //!
@@ -30,12 +33,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgListener;
 use time::OffsetDateTime;
 use tokio::sync::{Notify, watch};
-use tp_contracts::bus::{Event, EventKind};
+use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
 use tp_contracts::config::duration;
 use tp_contracts::meta::AccountScope;
 use tp_contracts::secrets::SecretStore;
@@ -370,6 +374,13 @@ impl Subscription {
             self.sub.notify.notified().await;
         }
     }
+
+    /// Подписка как поток контракта [`EventStream`]: завершается вместе с подпиской, `drop` потока удаляет её.
+    pub fn into_stream(self) -> EventStream {
+        Box::pin(futures::stream::unfold(self, |mut sub| async move {
+            sub.next().await.map(|e| (e, sub))
+        }))
+    }
 }
 
 impl Drop for Subscription {
@@ -679,6 +690,21 @@ impl PgSignalBus {
             overflows: g(&c.overflows),
             reconnects: g(&c.reconnects),
         }
+    }
+}
+
+#[async_trait]
+impl EventBus for PgSignalBus {
+    async fn publish(&self, event: Event) -> Result<()> {
+        PgSignalBus::publish(self, event).await
+    }
+
+    async fn subscribe(&self, scope: AccountScope) -> Result<EventStream> {
+        Ok(PgSignalBus::subscribe(self, scope).await?.into_stream())
+    }
+
+    async fn subscribe_system(&self) -> Result<EventStream> {
+        Ok(PgSignalBus::subscribe_system(self).await?.into_stream())
     }
 }
 

@@ -30,7 +30,7 @@ use tp_contracts::meta::{
 };
 use tp_contracts::retention::{
     PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule,
-    TrashPurgeSetting, TrashStore,
+    TrashPurgeSetting, TrashStore, trash_changed,
 };
 use tp_contracts::{AccountId, DomainId, Error, MailboxId, MessageId, Result, TenantId, Uid};
 use uuid::Uuid;
@@ -543,6 +543,8 @@ impl PgMeta {
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
         tx.commit().await.map_err(db_err)?;
         self.signal_log([scope.account]).await;
+        // Что-то скрыто или стёрто: таймер истечения корзины пересчитывает ближайший срок.
+        self.signal(trash_changed(scope)).await;
         // Порядок — как в запросе.
         let done = |ids: Vec<Uuid>, rows: &[Removed]| -> Vec<MessageId> {
             ids.into_iter()
