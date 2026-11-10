@@ -46,6 +46,11 @@ pub struct JmapConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub push_min_ping: Duration,
+    /// Сколько загруженный файл (`U…`) доступен загрузившей учётной записи; по умолчанию — как окно
+    /// сборки мусора BLOB (`blob.gc.window`), после которого объект без ссылок может быть удалён.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub upload_ttl: Duration,
 }
 
 impl Default for JmapConfig {
@@ -65,6 +70,7 @@ impl Default for JmapConfig {
             header_window: 262_144,
             max_submission_recipients: 100,
             push_min_ping: Duration::from_secs(10),
+            upload_ttl: Duration::from_secs(7 * 24 * 3600),
         }
     }
 }

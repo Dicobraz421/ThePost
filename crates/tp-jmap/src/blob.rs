@@ -4,10 +4,14 @@
 //! - `M<письмо>` — исходное письмо, `M<письмо>_<путь части через _>` — тело части, декодированное из кодировки передачи;
 //! - `U<хэш>_<поколение>` — загруженный файл: объект BLOB организации (протокол SRS 3.4). Ссылка, взятая на время
 //!   загрузки, сразу снимается: объект без ссылок живёт до сборки мусора по окну и учитывается заново, когда
-//!   попадает в письмо (`Email/import`, вложение черновика).
+//!   попадает в письмо (`Email/import`, вложение черновика). Объект дедуплицируется в пределах организации,
+//!   поэтому id доступен только загрузившей учётной записи: учёт «учётная запись → загруженные ключи»
+//!   ([`Uploads`]) в памяти узла с окном жизни `upload_ttl` (как окно сборки мусора); чужой id — `notFound`.
 
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Path, Query, State};
@@ -36,6 +40,44 @@ pub(crate) enum BlobRef {
     Part(MessageId, String),
     /// Загруженный файл.
     Upload(BlobKey),
+}
+
+/// Учёт загрузок: какой учётной записи какой объект доступен и до какого момента.
+///
+/// В памяти узла: на другом узле кластера и после перезапуска загрузка недоступна (нужен учёт в контракте).
+#[derive(Debug, Default)]
+pub(crate) struct Uploads {
+    inner: Mutex<UploadsInner>,
+}
+
+#[derive(Debug, Default)]
+struct UploadsInner {
+    until: HashMap<(AccountScope, BlobKey), Instant>,
+    /// Размер после последней очистки просроченных: очистка — когда учёт вырос вдвое (амортизированно).
+    pruned_len: usize,
+}
+
+impl Uploads {
+    /// Отмечает загрузку учётной записью на `ttl` (повторная загрузка продлевает).
+    fn record(&self, scope: AccountScope, key: BlobKey, ttl: Duration) {
+        let now = Instant::now();
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if g.until.len() >= 2 * g.pruned_len.max(64) {
+            g.until.retain(|_, t| *t > now);
+            g.pruned_len = g.until.len();
+        }
+        if let Some(t) = now.checked_add(ttl) {
+            g.until.insert((scope, key), t);
+        }
+    }
+
+    /// Загружала ли учётная запись объект и не истёк ли срок.
+    fn owns(&self, scope: AccountScope, key: &BlobKey) -> bool {
+        let g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        g.until
+            .get(&(scope, *key))
+            .is_some_and(|t| *t > Instant::now())
+    }
 }
 
 /// Идентификатор blob загруженного файла.
@@ -122,6 +164,7 @@ impl Jmap {
                 let data = Bytes::from(decode_transfer(bp, raw));
                 Ok(Some(stream::once(async move { Ok(data) }).boxed()))
             }
+            Some(BlobRef::Upload(key)) if !self.uploaded.owns(scope, &key) => Ok(None),
             Some(BlobRef::Upload(key)) => match d.blob_index.compression(&key).await? {
                 None => Ok(None),
                 Some(Compression::None) => Ok(Some(d.blobs.get(&key, None).await?)),
@@ -155,13 +198,17 @@ impl Jmap {
                 .get(scope, m)
                 .await?
                 .is_some_and(|msg| find_part(&msg.meta.body, &path).is_some()),
-            Some(BlobRef::Upload(key)) => d.blob_index.exists(&key).await?,
+            Some(BlobRef::Upload(key)) => {
+                self.uploaded.owns(scope, &key) && d.blob_index.exists(&key).await?
+            }
         })
     }
 
-    /// Сохраняет загруженный файл как объект BLOB организации без ссылок (протокол SRS 3.4).
-    pub(crate) async fn put_upload(&self, tenant: TenantId, data: Bytes) -> Result<BlobKey> {
+    /// Сохраняет загруженный файл как объект BLOB организации без ссылок (протокол SRS 3.4)
+    /// и отмечает его доступным учётной записи на `upload_ttl`.
+    pub(crate) async fn put_upload(&self, scope: AccountScope, data: Bytes) -> Result<BlobKey> {
         let d = &self.d;
+        let tenant = scope.tenant;
         let hash = BlobHash(Sha256::digest(&data).into());
         let generation = match d.blob_index.acquire(tenant, &hash, 1).await? {
             Acquire::Existing { generation } => generation,
@@ -187,11 +234,13 @@ impl Jmap {
         };
         // Ссылка загрузки снимается: объект ждёт сборки мусора по окну или учёта в письме.
         d.blob_index.release(tenant, &hash, generation, 1).await?;
-        Ok(BlobKey {
+        let key = BlobKey {
             tenant,
             hash,
             generation,
-        })
+        };
+        self.uploaded.record(scope, key, self.cfg.upload_ttl);
+        Ok(key)
     }
 }
 
@@ -233,7 +282,11 @@ pub(crate) async fn upload(
         .unwrap_or("application/octet-stream")
         .to_owned();
     let size = data.len();
-    match j.put_upload(p.tenant, data).await {
+    let scope = AccountScope {
+        tenant: p.tenant,
+        account: p.account,
+    };
+    match j.put_upload(scope, data).await {
         Ok(key) => json_response(
             StatusCode::CREATED,
             "application/json",
@@ -468,6 +521,82 @@ mod tests {
         assert_eq!(code, 401);
     }
 
+    /// Загрузку видит только загрузившая учётная запись: другая в той же организации — `notFound`
+    /// (скачивание 404, `Blob/copy` — notCopied), даже загрузив то же содержимое, видит только свою отметку.
+    #[tokio::test]
+    async fn upload_owner_only() {
+        let env = Env::new().await;
+        let addr = serve(env.jmap.clone()).await;
+        let acc = env.account();
+        let (code, _, body) = http10(addr, &upload_req(&acc, "text/plain", b"secret")).await;
+        assert_eq!(code, 201);
+        let up: Value = serde_json::from_slice(&body).expect("json");
+        let blob = up["blobId"].as_str().expect("blobId").to_owned();
+
+        let other = env
+            .meta
+            .account("other@example.org")
+            .await
+            .expect("account");
+        assert_eq!(other.tenant, env.scope.tenant);
+        let mut p2 = env.principal.clone();
+        p2.account = other.account;
+        p2.login = "other@example.org".into();
+        env.auth.add_token("token-2", p2.clone());
+        let acc2 = other.account.to_string();
+        let get2 = |path: String| {
+            format!("GET {path} HTTP/1.0\r\nHost: x\r\nAuthorization: Bearer token-2\r\n\r\n")
+                .into_bytes()
+        };
+        let (code, _, _) = http10(addr, &get2(format!("/jmap/download/{acc2}/{blob}/x"))).await;
+        assert_eq!(code, 404);
+        let req = json!({"using": crate::testenv::USING, "methodCalls": [["Blob/copy",
+            {"fromAccountId": &acc2, "accountId": &acc2, "blobIds": [&blob]}, "c0"]]});
+        let r = env
+            .jmap
+            .api(&p2, req.to_string().as_bytes())
+            .await
+            .expect("api");
+        let r = serde_json::to_value(r).expect("json");
+        let r = &r["methodResponses"][0][1];
+        assert_eq!(r["notCopied"][&blob]["type"], "notFound", "{r}");
+        assert_eq!(r["copied"], Value::Null);
+
+        // Своя загрузка того же содержимого (тот же id после дедупликации) — доступна обоим.
+        let key = env
+            .jmap
+            .put_upload(other, axum::body::Bytes::from_static(b"secret"))
+            .await
+            .expect("upload");
+        assert_eq!(super::upload_id(&key), blob);
+        let (code, _, body) = http10(addr, &get2(format!("/jmap/download/{acc2}/{blob}/x"))).await;
+        assert_eq!(code, 200);
+        assert_eq!(body, b"secret");
+        let (code, _, _) = http10(addr, &get_req(&format!("/jmap/download/{acc}/{blob}/x"))).await;
+        assert_eq!(code, 200);
+    }
+
+    /// По истечении `upload_ttl` загрузка недоступна и загрузившему.
+    #[tokio::test]
+    async fn upload_ttl_expires() {
+        let cfg = JmapConfig {
+            upload_ttl: std::time::Duration::ZERO,
+            ..JmapConfig::default()
+        };
+        let env = Env::with(cfg, Vec::new()).await;
+        let key = env
+            .jmap
+            .put_upload(env.scope, axum::body::Bytes::from_static(b"x"))
+            .await
+            .expect("upload");
+        let got = env
+            .jmap
+            .read_blob(env.scope, &super::upload_id(&key), u64::MAX)
+            .await
+            .expect("read");
+        assert_eq!(got, None);
+    }
+
     /// Blob/copy: своя учётная запись — тот же id; нет blob — notCopied; чужая — fromAccountNotFound.
     #[tokio::test]
     async fn blob_copy() {
@@ -475,7 +604,7 @@ mod tests {
         let acc = env.account();
         let key = env
             .jmap
-            .put_upload(env.scope.tenant, axum::body::Bytes::from_static(b"x"))
+            .put_upload(env.scope, axum::body::Bytes::from_static(b"x"))
             .await
             .expect("upload");
         let blob = super::upload_id(&key);
