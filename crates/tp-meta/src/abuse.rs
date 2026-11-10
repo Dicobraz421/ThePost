@@ -3,7 +3,8 @@
 //!
 //! Таблица `abuse_blocks` организации (RLS): субъект — ключ строки, адрес и подсеть — также `cidr` для поиска
 //! покрывающих подсетей (`>>=`). Срок — часы СУБД. После фиксации [`AbuseBlocks::block`] публикуется сигнал
-//! `Blocked { subject }` ([`PgMeta::with_bus`]); узлы держат локальный набор ([`AbuseBlocks::active`]).
+//! `Blocked { subject }`, после фиксации [`AbuseBlocks::unblock`] снятия действующей блокировки — `Unblocked { subject }`
+//! (META-39; [`PgMeta::with_bus`]); узлы держат локальный набор ([`AbuseBlocks::active`]).
 //! Истёкшие строки не действуют; [`AbuseBlocks::block`] удаляет до [`AbuseBlocksConfig::purge_batch`] истёкших
 //! строк организации в той же транзакции — таблица не растёт от разовых источников.
 
@@ -198,6 +199,7 @@ impl AbuseBlocks for PgMeta {
     }
 
     async fn unblock(&self, tenant: TenantId, subject: &BlockSubject) -> Result<()> {
+        // Удаление по ключу идемпотентно ([`PgMeta::rewrite`]): повтор после обрыва во время COMMIT удалит ноль строк.
         self.rewrite(|| async move {
             let c = columns(subject);
             let mut tx = begin(&self.pool, tenant).await?;
@@ -210,7 +212,16 @@ impl AbuseBlocks for PgMeta {
             tx.commit().await.map_err(db_err)?;
             Ok(())
         })
-        .await
+        .await?;
+        // Сигнал — один раз после фиксации, и когда строки не было (контракт это допускает): повтор после обрыва во
+        // время COMMIT удалённой строки уже не видит, а сигнал терять нельзя; лишний `Unblocked` узлу безвреден.
+        self.signal(Event {
+            tenant,
+            account: None,
+            kind: EventKind::Unblocked { subject: *subject },
+        })
+        .await;
+        Ok(())
     }
 
     async fn active(&self, tenant: TenantId) -> Result<Vec<AbuseBlock>> {

@@ -2,7 +2,7 @@
 //!
 //! Таблицы `queue` (письмо, лиза записи) и `queue_rcpts` (получатели и их состояние). Захват — одна
 //! системная транзакция `UPDATE … FOR UPDATE SKIP LOCKED`: конкурентные узлы не получают одну запись дважды,
-//! номер захвата (`fencing`) растёт при каждом захвате. Операции захвата (`renew`, `reschedule`,
+//! номер захвата (`fencing`) растёт при каждом захвате. Операции захвата (`renew`, `reschedule`, `postpone`,
 //! `complete`) проверяют номер под блокировкой строки записи: устаревший — `Conflict`.
 //!
 //! Сроки попыток и лизы сравниваются с `now` вызывающего: часы СУБД не участвуют (кроме `queued_at`).
@@ -324,6 +324,32 @@ impl QueueStore for PgMeta {
             .bind(rcpt)
             .bind(at)
             .bind(reason)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            if n != 1 {
+                return Err(Error::NotFound);
+            }
+            settle(&mut tx, claim.id).await?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn postpone(&self, claim: &QueueClaim, rcpt: &str, at: OffsetDateTime) -> Result<()> {
+        self.once(async move {
+            let mut tx = begin_system(&self.pool).await?;
+            lock_claim(&mut tx, claim).await?;
+            // Перенос планировщиком — не попытка: `attempts` и `last_error` не меняются (META-39, CTR-40).
+            let n = sqlx::query(
+                "UPDATE queue_rcpts SET next_attempt = $3
+                 WHERE queue_id = $1 AND address = $2 AND status = 'pending'",
+            )
+            .bind(claim.id.as_uuid())
+            .bind(rcpt)
+            .bind(at)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?

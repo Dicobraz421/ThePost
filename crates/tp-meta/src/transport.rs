@@ -4,9 +4,11 @@
 //! Уровень кластера: принятые домены — таблица `domains` (вид — столбцы `kind`, `next_hop`), доверенные источники —
 //! `transport_sources`, версия снимка — строка `transport_cluster`. Запись — системная транзакция (домены всех
 //! организаций: имя уникально в кластере), версия блокируется `FOR UPDATE` до фиксации; снимок читается под
-//! `FOR SHARE` — версия и записи согласованы. Уровень организации: политики доменов назначения `transport_routes`
-//! и версия `transport_versions` — транзакция организации (RLS). После фиксации — сигнал
-//! [`transport_changed`] ([`PgMeta::with_bus`]).
+//! `FOR SHARE` — версия и записи согласованы. Уровень организации: политики доменов назначения `transport_routes`,
+//! таблица переписывания адресов `transport_rewrites` (META-39, CTR-40; ключ — канонический `from`) и общая для них
+//! версия `transport_versions` — транзакция организации (RLS). После фиксации — сигнал
+//! [`transport_changed`] ([`PgMeta::with_bus`]). Записи — CAS по версии, выполняются один раз ([`PgMeta::once`]):
+//! повтор применённой записи ответил бы `Conflict`.
 
 use std::net::IpAddr;
 
@@ -14,8 +16,9 @@ use async_trait::async_trait;
 use sqlx::types::Json;
 use sqlx::{FromRow, Postgres, Transaction};
 use tp_contracts::transport::{
-    AcceptedDomain, ClusterTransport, DestinationPolicy, DomainKind, SourceKind, SourceMatch,
-    TenantTransport, TlsRequirement, TransportStore, TrustedSource, transport_changed,
+    AcceptedDomain, AddressPattern, ClusterTransport, DestinationPolicy, DomainKind, RewriteRule,
+    SourceKind, SourceMatch, TenantTransport, TlsRequirement, TransportStore, TrustedSource,
+    transport_changed,
 };
 use tp_contracts::{DomainId, Error, Result, TenantId};
 use uuid::Uuid;
@@ -98,6 +101,29 @@ impl RouteRow {
             tls: self.tls.0,
             smart_host: self.smart_host,
             egress_ip,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct RewriteRow {
+    from_addr: String,
+    to_addr: String,
+    sender: bool,
+    recipient: bool,
+}
+
+impl RewriteRow {
+    fn into_rule(self) -> Result<RewriteRule> {
+        let pattern = |p: &str| {
+            AddressPattern::new(p)
+                .map_err(|_| Error::internal(format!("правило переписывания: неверный шаблон {p}")))
+        };
+        Ok(RewriteRule {
+            from: pattern(&self.from_addr)?,
+            to: pattern(&self.to_addr)?,
+            sender: self.sender,
+            recipient: self.recipient,
         })
     }
 }
@@ -271,6 +297,14 @@ impl TransportStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
+            let rewrites: Vec<RewriteRow> = sqlx::query_as(
+                "SELECT from_addr, to_addr, sender, recipient FROM transport_rewrites
+                 WHERE tenant_id = $1 ORDER BY from_addr COLLATE \"C\"",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
             tx.commit().await.map_err(db_err)?;
             Ok(TenantTransport {
                 version: to_u64(version.unwrap_or(0))?,
@@ -278,8 +312,10 @@ impl TransportStore for PgMeta {
                     .into_iter()
                     .map(RouteRow::into_policy)
                     .collect::<Result<_>>()?,
-                // Таблица переписывания (CTR-40) — волна полосы meta.
-                rewrites: Vec::new(),
+                rewrites: rewrites
+                    .into_iter()
+                    .map(RewriteRow::into_rule)
+                    .collect::<Result<_>>()?,
             })
         })
         .await
@@ -422,6 +458,58 @@ impl TransportStore for PgMeta {
                     .execute(&mut *tx)
                     .await
                     .map_err(db_err)?,
+            )?;
+            self.tenant_commit(tx, tenant, expected).await
+        })
+        .await
+    }
+
+    async fn put_rewrite(
+        &self,
+        tenant: TenantId,
+        expected: u64,
+        rule: &RewriteRule,
+    ) -> Result<u64> {
+        self.once(async move {
+            rule.validate()?;
+            let mut tx = self.tenant_begin(tenant, expected).await?;
+            sqlx::query(
+                "INSERT INTO transport_rewrites (tenant_id, from_addr, to_addr, sender, recipient)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (tenant_id, from_addr) DO UPDATE
+                     SET to_addr = EXCLUDED.to_addr, sender = EXCLUDED.sender,
+                         recipient = EXCLUDED.recipient, updated_at = now()",
+            )
+            .bind(tenant.as_uuid())
+            .bind(rule.from.as_str())
+            .bind(rule.to.as_str())
+            .bind(rule.sender)
+            .bind(rule.recipient)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            self.tenant_commit(tx, tenant, expected).await
+        })
+        .await
+    }
+
+    async fn delete_rewrite(
+        &self,
+        tenant: TenantId,
+        expected: u64,
+        from: &AddressPattern,
+    ) -> Result<u64> {
+        self.once(async move {
+            let mut tx = self.tenant_begin(tenant, expected).await?;
+            removed(
+                sqlx::query(
+                    "DELETE FROM transport_rewrites WHERE tenant_id = $1 AND from_addr = $2",
+                )
+                .bind(tenant.as_uuid())
+                .bind(from.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?,
             )?;
             self.tenant_commit(tx, tenant, expected).await
         })

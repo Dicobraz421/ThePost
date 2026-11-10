@@ -1,4 +1,4 @@
-//! Настройки транспорта на PostgreSQL (META-28; CONTRACTS.md#Transport, CTR-24).
+//! Настройки транспорта на PostgreSQL (META-28, META-39; CONTRACTS.md#Transport, CTR-24, CTR-40).
 //!
 //! Тесты записи уровня кластера — на чистой БД ([`common::fresh_meta`]): параллельные писатели версии кластера
 //! дали бы `Conflict`.
@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use tp_contracts::bus::{Event, EventKind};
 use tp_contracts::meta::{AccountStore, AccountUpsert};
 use tp_contracts::transport::{
-    AcceptedDomain, AddressPattern, ClusterTransport, DestinationPolicy, DomainKind, SourceKind,
-    SourceMatch, TenantTransport, TlsRequirement, TransportStore, TrustedSource,
+    AcceptedDomain, AddressPattern, ClusterTransport, DestinationPolicy, DomainKind, RewriteRule,
+    SourceKind, SourceMatch, TenantTransport, TlsRequirement, TransportStore, TrustedSource,
 };
 use tp_contracts::{DomainId, Error, Result, TenantId};
 use tp_meta::{PgMeta, schema};
@@ -78,6 +78,25 @@ impl TransportStore for WithTenants {
 
     async fn delete_route(&self, tenant: TenantId, expected: u64, pattern: &str) -> Result<u64> {
         self.0.delete_route(tenant, expected, pattern).await
+    }
+
+    async fn put_rewrite(
+        &self,
+        tenant: TenantId,
+        expected: u64,
+        rule: &RewriteRule,
+    ) -> Result<u64> {
+        self.ensure(tenant).await;
+        self.0.put_rewrite(tenant, expected, rule).await
+    }
+
+    async fn delete_rewrite(
+        &self,
+        tenant: TenantId,
+        expected: u64,
+        from: &AddressPattern,
+    ) -> Result<u64> {
+        self.0.delete_rewrite(tenant, expected, from).await
     }
 }
 
@@ -309,6 +328,94 @@ async fn tenant_routes_signals_and_isolation() {
     // Организации нет — Invalid (внешний ключ).
     assert!(matches!(
         meta.put_route(TenantId::new(), 0, &policy("*")).await,
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conformance_rewrites() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    suite::transport_rewrites(&WithTenants(meta)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrites_signals_and_isolation() {
+    let Some(pool) = common::pool().await else {
+        return;
+    };
+    let rec = Arc::new(common::RecordingBus::default());
+    let meta = PgMeta::new(pool, tp_meta::MetaConfig::default()).with_bus(rec.clone());
+    let (tenant, other) = (
+        common::tenant(meta.pool()).await,
+        common::tenant(meta.pool()).await,
+    );
+    let rule = RewriteRule {
+        from: AddressPattern::new("@old.example").expect("p"),
+        to: AddressPattern::new("@new.example").expect("p"),
+        sender: true,
+        recipient: false,
+    };
+    let changed = Event {
+        tenant,
+        account: None,
+        kind: EventKind::TransportChanged {
+            tenant: Some(tenant),
+        },
+    };
+
+    // Сигнал организации — после фиксации записи и удаления, без него — при Conflict и NotFound.
+    let v1 = meta.put_rewrite(tenant, 0, &rule).await.expect("put");
+    assert_eq!(rec.take(), vec![changed.clone()]);
+    assert_eq!(
+        meta.put_rewrite(tenant, 0, &rule).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        meta.delete_rewrite(
+            tenant,
+            v1,
+            &AddressPattern::new("x@old.example").expect("p")
+        )
+        .await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(rec.take(), vec![]);
+    assert_eq!(
+        meta.tenant(tenant).await.expect("tenant").rewrites,
+        vec![rule.clone()]
+    );
+
+    // RLS: правила организации не видны другой организации; чужое правило не записать.
+    let mut tx = app_tx(meta.pool(), other).await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM transport_rewrites WHERE tenant_id = $1")
+        .bind(tenant.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count");
+    assert_eq!(n, 0);
+    let err = sqlx::query(
+        "INSERT INTO transport_rewrites (tenant_id, from_addr, to_addr, sender, recipient)
+         VALUES ($1, '@a.example', '@b.example', true, true)",
+    )
+    .bind(tenant.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .expect_err("RLS");
+    assert!(err.to_string().contains("row-level security"), "{err}");
+    drop(tx);
+
+    let v2 = meta
+        .delete_rewrite(tenant, v1, &rule.from)
+        .await
+        .expect("delete");
+    assert!(v2 > v1);
+    assert_eq!(rec.take(), vec![changed]);
+
+    // Организации нет — Invalid (внешний ключ).
+    assert!(matches!(
+        meta.put_rewrite(TenantId::new(), 0, &rule).await,
         Err(Error::Invalid(_))
     ));
 }

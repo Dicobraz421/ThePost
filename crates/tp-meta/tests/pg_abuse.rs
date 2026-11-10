@@ -1,4 +1,4 @@
-//! Блокировки источников и учётных записей на PostgreSQL (META-27, CONTRACTS.md#AbuseBlocks); миграция записей
+//! Блокировки источников и учётных записей на PostgreSQL (META-27, META-39, CONTRACTS.md#AbuseBlocks); миграция записей
 //! узлов (адрес, площадка).
 
 mod common;
@@ -15,6 +15,7 @@ use tp_contracts::bus::{Event, EventKind};
 use tp_contracts::membership::{Membership, NodeId, SiteId};
 use tp_contracts::{AccountId, Error, TenantId};
 use tp_meta::{MetaConfig, PgMeta, schema};
+use tp_testkit::MemEventBus;
 use tp_testkit::suite::{self, RealTime};
 
 async fn db_now(meta: &PgMeta) -> OffsetDateTime {
@@ -32,6 +33,18 @@ async fn conformance_abuse_blocks() {
     // Набор усекает сроки до секунды (до 1 с раньше `now`), поэтому `ttl / 2` должен быть с запасом больше секунды.
     let now = db_now(&meta).await;
     suite::abuse_blocks(&meta, now, Duration::from_secs(4), &RealTime).await;
+}
+
+/// Сигналы `Blocked` и `Unblocked` (META-39, CTR-39): хранилище публикует в шину, набор читает её подписку.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conformance_abuse_blocks_signals() {
+    let Some(pool) = common::pool().await else {
+        return;
+    };
+    let bus = Arc::new(MemEventBus::default());
+    let meta = PgMeta::new(pool, MetaConfig::default()).with_bus(bus.clone());
+    let now = db_now(&meta).await;
+    suite::abuse_blocks_signals(&meta, bus.as_ref(), now, Duration::from_secs(60)).await;
 }
 
 #[tokio::test]
