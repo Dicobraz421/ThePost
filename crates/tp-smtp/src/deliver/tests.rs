@@ -13,7 +13,7 @@ use tp_contracts::meta::{AccountScope, MessageQuery, MessageStore, SpecialUse};
 use tp_contracts::{Result, TenantId};
 use tp_testkit::{
     BlobOp, Clock, FakeDirectory, MemBlobIndex, MemBlobStore, MemEventBus, MemGroups, MemMetadata,
-    MemQuota, MemTrash, RecordingDecisionHook, SystemClock,
+    MemQuota, MemTransport, MemTrash, RecordingDecisionHook, SystemClock,
 };
 
 use super::*;
@@ -265,9 +265,20 @@ async fn resolves_accounts_aliases_and_groups() {
     assert_eq!(d.resolve("no-domain").await.expect("r"), Resolved::Unknown);
 }
 
+/// Правило переписывания для обеих сторон конверта.
+fn rewrite_rule(from: &str, to: &str) -> tp_contracts::transport::RewriteRule {
+    use tp_contracts::transport::AddressPattern;
+    tp_contracts::transport::RewriteRule {
+        from: AddressPattern::new(from).expect("from"),
+        to: AddressPattern::new(to).expect("to"),
+        sender: true,
+        recipient: true,
+    }
+}
+
 #[tokio::test]
 async fn subaddress_catch_all_and_rewrite() {
-    use crate::config::{AddressingConfig, RewriteRule};
+    use tp_contracts::transport::TransportStore;
     let env = Env::new(DecisionHooks::default()).await;
     env.dir.set_aliases(
         TenantId::DEFAULT,
@@ -276,26 +287,27 @@ async fn subaddress_catch_all_and_rewrite() {
             target: "b".into(),
         }],
     );
-    let rule = |from: &str, to: &str| RewriteRule {
-        from: from.into(),
-        to: to.into(),
-        sender: true,
-        recipient: true,
-    };
-    let d = env.delivery_with(
-        true,
-        SmtpConfig {
-            hostname: "mx.example.org".into(),
-            addressing: AddressingConfig {
-                subaddress_separators: "+".into(),
-                rewrite: vec![
-                    rule("@old.example.org", "@example.org"),
-                    rule("partner@example.net", "partner@example.com"),
-                ],
+    // Таблица переписывания — в настройках транспорта организации (SMTP-29).
+    let transport = MemTransport::new();
+    let mut v = 0;
+    for (from, to) in [
+        ("@old.example.org", "@example.org"),
+        ("partner@example.net", "partner@example.com"),
+    ] {
+        v = transport
+            .put_rewrite(TenantId::DEFAULT, v, &rewrite_rule(from, to))
+            .await
+            .expect("rewrite");
+    }
+    let d = env
+        .delivery_with(
+            true,
+            SmtpConfig {
+                hostname: "mx.example.org".into(),
+                ..SmtpConfig::default()
             },
-            ..SmtpConfig::default()
-        },
-    );
+        )
+        .with_transport(Arc::new(Routes::new(Arc::new(transport))));
     let logins = |r: Resolved| match r {
         Resolved::Local(a) => a.into_iter().map(|a| a.login).collect::<Vec<_>>(),
         other => panic!("not local: {other:?}"),
@@ -354,6 +366,93 @@ async fn subaddress_catch_all_and_rewrite() {
         .expect("submit");
     assert_eq!(sent.rcpts[0].1, RcptStatus::Queued);
     assert_eq!(env.queue.0.lock().expect("lock")[1].0, "sender@example.org");
+}
+
+#[tokio::test]
+async fn rewrite_table_reloads_on_transport_signal() {
+    use std::time::Duration;
+    use tp_contracts::bus::EventBus;
+    use tp_contracts::role::CancellationToken;
+    use tp_contracts::transport::TransportStore;
+    let env = Env::new(DecisionHooks::default()).await;
+    let bus: Arc<dyn EventBus> = Arc::new(MemEventBus::default());
+    let transport = MemTransport::new().with_bus(bus.clone());
+    // Снимок недоступен и прежнего нет — ошибка (временный отказ), а не доставка без переписывания.
+    transport.fail_next(Error::Unavailable { retry_after: None });
+    let routes = Arc::new(Routes::new(Arc::new(transport.clone())));
+    let d = env.delivery(false).with_transport(routes.clone());
+    assert!(d.resolve("alice@old.example.org").await.is_err());
+    assert_eq!(
+        d.resolve("alice@old.example.org").await.expect("r"),
+        Resolved::External,
+        "правила ещё нет"
+    );
+    let stop = CancellationToken::new();
+    tokio::spawn(
+        routes
+            .clone()
+            .watch(bus.clone(), stop.clone(), Duration::from_millis(50)),
+    );
+    // Правило добавлено через хранилище (Admin API) — сигнал; до подписки — сверка при подписке.
+    let v = transport
+        .put_rewrite(
+            TenantId::DEFAULT,
+            0,
+            &rewrite_rule("@old.example.org", "@example.org"),
+        )
+        .await
+        .expect("rewrite");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while routes
+            .tenant(TenantId::DEFAULT)
+            .await
+            .expect("tenant")
+            .version
+            != v
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("таблица перечитана по сигналу");
+    match d.resolve("alice@old.example.org").await.expect("r") {
+        Resolved::Local(a) => assert_eq!(a[0].login, "alice@example.org"),
+        other => panic!("not local: {other:?}"),
+    }
+    // Правило только для отправителя к получателям не применяется.
+    let sender_only = tp_contracts::transport::RewriteRule {
+        recipient: false,
+        ..rewrite_rule("@old.example.org", "@example.org")
+    };
+    let v = transport
+        .put_rewrite(TenantId::DEFAULT, v, &sender_only)
+        .await
+        .expect("rewrite");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while routes
+            .tenant(TenantId::DEFAULT)
+            .await
+            .expect("tenant")
+            .version
+            != v
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("таблица перечитана по сигналу");
+    assert_eq!(
+        d.resolve("alice@old.example.org").await.expect("r"),
+        Resolved::External
+    );
+    // Перечитать не удалось — действует прежний снимок.
+    transport.fail_next(Error::Unavailable { retry_after: None });
+    routes.resync();
+    assert_eq!(
+        d.resolve("alice@old.example.org").await.expect("r"),
+        Resolved::External
+    );
+    stop.cancel();
 }
 
 #[tokio::test]

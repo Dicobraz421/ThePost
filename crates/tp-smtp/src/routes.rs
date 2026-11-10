@@ -7,6 +7,9 @@
 //! ([`Routes::watch`]). Перечитать не удалось — действует прежний снимок; снимка нет — ошибка (доставка
 //! откладывается: политика может требовать TLS).
 //!
+//! Таблица переписывания адресов конверта организации ([`TenantTransport::rewrites`], SMTP-29) — из того же
+//! снимка: её применяет доставка ([`crate::Delivery::with_transport`]) ролей smtp-in и submission.
+//!
 //! Применение политики — [`crate::queue::send::MxTransport`]: обязательный TLS, закреплённый ключ, промежуточный
 //! узел (smart host), egress-IP; с MTA-STS и DANE действуют требования обоих (строже из двух).
 
@@ -34,7 +37,7 @@ struct State {
     tenants: HashMap<TenantId, Snap<TenantTransport>>,
 }
 
-/// Снимки настроек транспорта узла smtp-out.
+/// Снимки настроек транспорта узла (smtp-out — политики, smtp-in и submission — переписывание адресов).
 pub struct Routes {
     store: Arc<dyn TransportStore>,
     state: Mutex<State>,
