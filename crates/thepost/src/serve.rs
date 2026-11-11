@@ -455,7 +455,7 @@ impl RoleSetup<'_> {
                     .clone();
                 let admin = Arc::new(crate::local_admin::attach(
                     self.services.admin(self.ext, cfg)?,
-                    &self.services,
+                    self.services,
                 ));
                 crate::local_admin::serve(admin.clone());
                 let service = HttpRole::new(
