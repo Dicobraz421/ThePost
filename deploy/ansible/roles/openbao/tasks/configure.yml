@@ -15,11 +15,13 @@
          else (openbao_init_saved.content | b64decode | from_json).root_token}) }}
   no_log: true
 
+# Распечатан и выбран активный узел Raft: сразу после перезапуска (например, перевыпуск сертификата thepost_pki)
+# распечатанный узел несколько секунд без лидера — запись в KV и политики отклоняется.
 - name: Wait for unseal
-  ansible.builtin.command: bao status
+  ansible.builtin.command: bao status -format=json
   environment: "{{ openbao_cli_env }}"
   register: openbao_status
-  until: openbao_status.rc == 0
+  until: openbao_status.rc == 0 and (openbao_status.stdout | from_json).leader_address | default('', true) | length > 0
   retries: 30
   delay: 2
   changed_when: false
