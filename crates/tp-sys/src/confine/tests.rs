@@ -386,3 +386,59 @@ fn default_system_read_covers_ca_links() {
         assert!(!pem.is_empty(), "{}", link.display());
     });
 }
+
+/// Ссылка `/etc/resolv.conf` → `/run/systemd/resolve/stub-resolv.conf` (Ubuntu 24.04, SYS-12):
+/// systemd-resolved заменяет файл переименованием (новый inode) при смене поисковых доменов.
+/// Правило на ссылку разрешает только прежний inode; с каталогом цели в списке новый файл читается.
+#[test]
+fn landlock_resolv_conf_replaced_by_resolved() {
+    let cfg = ConfineConfig::default();
+    for p in ["/etc/resolv.conf", "/run/systemd/resolve", "/etc/hostname"] {
+        assert!(cfg.system_read.contains(&PathBuf::from(p)), "{p}");
+    }
+
+    let dir = Dir::new("resolved");
+    let run = dir.sub("resolve", "stub-resolv.conf");
+    let etc = dir.sub("etc", "hosts");
+    let link = etc.join("resolv.conf");
+    std::os::unix::fs::symlink(run.join("stub-resolv.conf"), &link).expect("symlink");
+
+    // Ограничения на отдельном потоке; файл заменяет основной (неограниченный) поток.
+    let read_after_replace = |system_read: Vec<PathBuf>, content: &str| {
+        let c = Confinement::new(
+            ConfineConfig {
+                system_read,
+                ..bare(SeccompMode::Off, true)
+            },
+            edge(),
+            RolePaths::default(),
+        );
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let l = link.clone();
+        let thread = std::thread::spawn(move || {
+            let report = c.apply_scoped(false).expect("apply");
+            let before = std::fs::read(&l);
+            ready_tx.send(()).expect("ready");
+            go_rx.recv().expect("go");
+            (report, before, std::fs::read(&l))
+        });
+        ready_rx.recv().expect("ready");
+        let tmp = run.join(".stub-resolv.tmp");
+        std::fs::write(&tmp, content).expect("write");
+        std::fs::rename(&tmp, run.join("stub-resolv.conf")).expect("rename");
+        go_tx.send(()).expect("go");
+        thread.join().expect("поток теста")
+    };
+
+    let (report, before, after) = read_after_replace(vec![link.clone()], "search a.test");
+    if report.landlock == LandlockOutcome::Unsupported {
+        return;
+    }
+    assert_eq!(before.expect("до замены"), b"resolve");
+    assert!(denied(after), "новый inode вне правила на ссылку");
+
+    let (_, before, after) = read_after_replace(vec![link.clone(), run.clone()], "search b.test");
+    assert_eq!(before.expect("до замены"), b"search a.test");
+    assert_eq!(after.expect("после замены"), b"search b.test");
+}

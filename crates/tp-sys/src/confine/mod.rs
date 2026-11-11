@@ -52,7 +52,10 @@ pub struct ConfineConfig {
     /// Служебные пути только для чтения для всех ролей: резолвер DNS, корневые сертификаты,
     /// procfs и cgroups (SYS-06). Несуществующие пропускаются. Landlock проверяет цель символьной
     /// ссылки: каталог, на который ссылаются файлы разрешённого, тоже должен быть в списке
-    /// (Debian/Ubuntu: `/etc/ssl/certs/*.pem` → `/usr/share/ca-certificates`).
+    /// (Debian/Ubuntu: `/etc/ssl/certs/*.pem` → `/usr/share/ca-certificates`). Правило на файл —
+    /// это правило на его inode при запуске: файл, заменённый переименованием, разрешён, только
+    /// если разрешён его каталог (Ubuntu: `/etc/resolv.conf` → `/run/systemd/resolve/stub-resolv.conf`,
+    /// systemd-resolved пересоздаёт его при смене поисковых доменов; SYS-12).
     pub system_read: Vec<PathBuf>,
     /// Служебные пути для чтения и записи для всех ролей.
     pub system_rw: Vec<PathBuf>,
@@ -69,6 +72,10 @@ impl Default for ConfineConfig {
             landlock: true,
             system_read: paths(&[
                 "/etc/resolv.conf",
+                // Цель ссылки `/etc/resolv.conf` при systemd-resolved (Ubuntu 24.04, SYS-12).
+                "/run/systemd/resolve",
+                // Имя узла без `cluster.node_id` (служба systemd не задаёт `HOSTNAME`; SYS-12).
+                "/etc/hostname",
                 "/etc/hosts",
                 "/etc/nsswitch.conf",
                 "/etc/host.conf",
