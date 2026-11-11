@@ -69,7 +69,8 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
 реализации для фоновых ролей собираются с `Stale` (`PgMeta::with_intent`), контракты трейтов не меняются.
 CTR-25: раздел журнала событий — `Partition { shard, index }`; разделы перечисляются по всем шардам справочника.
 `ModSeq` выдаётся из одного счётчика учётной записи: монотонен в папке (CONDSTORE) и в учётной записи (состояние JMAP).
-- `AccountStore`: `get`, `by_login`, `upsert` (из LDAP), `quota`.
+- `AccountStore`: `get`, `by_login`, `by_external_id` (идентификатор каталога, точное совпадение; CTR-32 — синхронизация каталога
+  сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
   `delete` папки с вложенными без `cascade` — `Conflict`: решение («удалить вместе с вложенными?») принимает пользователь
   в клиенте, клиент повторяет вызов с `cascade = true`; письма всего поддерева — в корзину.
@@ -542,3 +543,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-11 — CTR-31 (x/contracts-19): `groups::{Moderation, check_delivery, validate_reject_reason, MAX_REJECT_REASON_LEN}` — решения
   модератора группы рассылки в контракте вместо временного трейта `tp-admin` (ADM-07; `tp_admin::groups::Moderation` — реэкспорт).
   In-memory — `MemModeration`, `ModerationDecision`; набор `suite::moderation`. Реализация в `tp-smtp` — волна полосы.
+- 2026-11-11 — CTR-32 (x/contracts-20): `AccountStore::by_external_id` (метод по умолчанию — `Internal`). Реализации — `PgMeta`,
+  `MemMetadata`; набор `suite::account_external_id` (переименование входа сохраняет членство в группе). Переход синхронизации групп
+  AUTH-07 (`tp-auth`) на сопоставление по `external_id` — волна полосы auth.

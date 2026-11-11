@@ -159,6 +159,24 @@ impl AccountStore for PgMeta {
         .await
     }
 
+    async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>> {
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let row: Option<AccountRow> = sqlx::query_as(
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+             FROM accounts WHERE tenant_id = $1 AND external_id = $2",
+            )
+            .bind(tenant.as_uuid())
+            .bind(external_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(row.map(Account::from))
+        })
+        .await
+    }
+
     async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account> {
         // Параллельное создание той же учётной записи: проигравший повторяет как обновление.
         match self.upsert_once(tenant, &data).await {
