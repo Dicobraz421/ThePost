@@ -600,7 +600,10 @@ async fn keyed_write_not_doubled_after_commit_cut() {
         .expect("группа");
     let held = HeldMessage {
         id: HeldId::new(),
-        group: group.id,
+        group: Some(group.id),
+        source: Default::default(),
+        moderators: Vec::new(),
+        recipients: Vec::new(),
         sender: "a@example.org".into(),
         sender_account: None,
         message_id: None,

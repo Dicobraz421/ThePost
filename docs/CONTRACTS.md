@@ -228,6 +228,16 @@ Vec<AccountId> (непусто — модерируемая), hidden_from_gal }`
 1–500 символов, иначе `Invalid`; пустой отправитель — без DSN). Письмо уже забрано `take_held`; успех освобождает ссылку на объект,
 ошибка — вызывающий возвращает письмо `hold`. Реализация — `tp-smtp` (карточка smtp), in-memory — `MemModeration` (запись решений,
 `fail_next`); набор `suite::moderation`.
+Одна очередь модерации для групп и правил потока (CTR-43, решение 2026-11-11-stage2-followups п. 9): `HeldMessage::group: Option<GroupId>`
+(`None` — письмо задержано правилом), `source: HoldSource::{Group, FlowRule { rule }}`, `moderators: Vec<Moderator::{Account, Group}>`
+(у правила — не пусто; у группы — снимок или пусто = модераторы группы), `recipients` — исходные получатели (у правила — не пусто);
+новые поля — `#[serde(default)]`; `HeldMessage::validate()` (источник и группа согласованы, имя правила 1–255 символов) — в `hold`
+(`Invalid`). `Moderation::deliver(tenant, group: Option<&DistributionGroup>, message)`: без группы — доставка исходным получателям;
+`check_delivery` — письмо группы без группы или правила с группой — `Invalid`. `ModerationDecision::Deliver(HeldId, Option<GroupId>)`; набор
+`suite::rule_moderation` (задержка правилом, одобрение — доставка получателям, отказ — DSN). Admin API: очередь модератора показывает
+`source`, `rule`, `moderators`, `recipients`, одобрение письма правила — `deliver(None)`. `PgMeta`: письма групп — как прежде (снимок
+модераторов и получателей не хранится), письмо правила — `Internal` до META-44 (колонка группы допускает NULL, модераторы, источник).
+Постановка правилом (`FlowVerdict::Moderate` → очередь вместо 451, имя правила — из `FlowOutcome::matched`) — SMTP-30.
 
 ## Search
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
@@ -648,3 +658,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (очередь со сроком выпуска, отмена до выпуска), `SubmissionStore::{query_submissions, submission_changes, expire_submissions}`,
   `SubmissionFilter`, `SubmissionChanges`; описание потока в `submission.rs` (воркер `due` только фиксирует наступившие). In-memory —
   `MemOutbound` (`Scheduled`, `release`), `MemSubmissions` (журнал изменений); наборы `suite::{submission_query, outbound_schedule}`.
+- 2026-11-11 — CTR-43 (x/contracts-31, решение 2026-11-11-stage2-followups п. 9): очередь модерации и для правил потока почты —
+  `HeldMessage::{group: Option<_>, source: HoldSource, moderators: Vec<Moderator>, recipients}`, `HeldMessage::validate`,
+  `Moderation::deliver(.., Option<&DistributionGroup>, ..)` (без группы — исходным получателям), `check_delivery` для обоих случаев. In-memory —
+  `MemGroups`, `MemModeration` (`Deliver(_, Option<GroupId>)`); набор `suite::rule_moderation`. `tp-admin` — источник в очереди модератора,
+  одобрение письма правила; `tp-meta` — чтение и запись писем групп (письмо правила — `Internal` до META-44); `tp-smtp`, `tp-auth`, `thepost` —
+  новые поля и сигнатура.

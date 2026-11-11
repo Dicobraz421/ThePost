@@ -867,7 +867,10 @@ mod group_sync {
         // модерации возвращаются вызывающему.
         let held = HeldMessage {
             id: HeldId::new(),
-            group: devs.id,
+            group: Some(devs.id),
+            source: Default::default(),
+            moderators: Vec::new(),
+            recipients: Vec::new(),
             sender: "x@example.net".into(),
             sender_account: None,
             message_id: None,
