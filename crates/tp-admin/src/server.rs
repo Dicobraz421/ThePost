@@ -42,7 +42,7 @@ use tp_contracts::{Error, Result, TenantId};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
-use crate::accounts::{AccountList, DomainStore, PolicyStore};
+use crate::accounts::{DomainStore, PolicyStore};
 use crate::audit::{AUDIT_ROUTE, AuditLog, AuditRecord, AuditSink};
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
@@ -297,8 +297,6 @@ pub struct Admin {
     pub(crate) transport: Option<Arc<dyn TransportStore>>,
     /// Локальный вход (`admin init`, сессии); `None` — не подключено (обмен отвечает 503).
     pub(crate) local: Option<Arc<Local>>,
-    /// Перечисление учётных записей (ADM-12); `None` — не подключено (список без `login` отвечает 503).
-    pub(crate) account_list: Option<Arc<dyn AccountList>>,
 }
 
 impl fmt::Debug for Admin {
@@ -308,7 +306,6 @@ impl fmt::Debug for Admin {
             .field("cfg", &self.cfg)
             .field("transport", &self.transport.is_some())
             .field("local", &self.local.is_some())
-            .field("account_list", &self.account_list.is_some())
             .finish()
     }
 }
@@ -336,20 +333,12 @@ impl Admin {
             cfg,
             transport: None,
             local: None,
-            account_list: None,
         })
     }
 
     /// Подключает настройки транспорта ([`crate::transport`]).
     pub fn with_transport(mut self, transport: Arc<dyn TransportStore>) -> Self {
         self.transport = Some(transport);
-        self
-    }
-
-    /// Подключает перечисление учётных записей: постраничный список `GET /api/v1/orgs/{org}/accounts` без `login`
-    /// ([`crate::accounts`]; временный трейт до метода контракта `AccountStore`).
-    pub fn with_account_list(mut self, list: Arc<dyn AccountList>) -> Self {
-        self.account_list = Some(list);
         self
     }
 

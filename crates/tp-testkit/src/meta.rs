@@ -822,6 +822,25 @@ impl AccountStore for MemMetadata {
             .map(|a| a.account.clone()))
     }
 
+    async fn list(
+        &self,
+        tenant: TenantId,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Account>> {
+        let mut found: Vec<(String, Account)> = lock(&self.state)
+            .accounts
+            .values()
+            .filter(|a| a.account.tenant == tenant)
+            .map(|a| (a.account.login.to_lowercase(), a.account.clone()))
+            .filter(|(l, _)| l.starts_with(prefix) && after.is_none_or(|x| l.as_str() > x))
+            .collect();
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found.truncate(limit);
+        Ok(found.into_iter().map(|(_, a)| a).collect())
+    }
+
     async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account> {
         if data.login.is_empty() {
             return Err(Error::invalid("пустое имя входа"));
@@ -1607,6 +1626,19 @@ mod tests {
     use tp_contracts::blob::BlobIndex;
     use tp_contracts::meta::{MessageMeta, PartRef};
     use tp_contracts::{BlobHash, Gen};
+
+    /// CTR-44: общий набор `AccountStore::list`.
+    #[tokio::test]
+    async fn account_list_suite() {
+        let fx = crate::suite::AccountListFixture {
+            tenant: TenantId::DEFAULT,
+            domain: DomainId::new(),
+            domain_name: "example.org".into(),
+            foreign_tenant: TenantId::new(),
+            foreign_domain: DomainId::new(),
+        };
+        crate::suite::account_list(&MemMetadata::default(), &fx).await;
+    }
 
     fn key(n: u8) -> BlobKey {
         BlobKey {

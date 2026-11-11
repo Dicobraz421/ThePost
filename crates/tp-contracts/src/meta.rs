@@ -107,6 +107,24 @@ pub trait AccountStore: Send + Sync + 'static {
         ))
     }
 
+    /// Учётные записи организации постранично (CTR-44, список Admin API): по возрастанию имени входа в нижнем
+    /// регистре (порядок сравнения строк хранилища), имя входа в нижнем регистре начинается с `prefix` (нижний
+    /// регистр; пусто — все) и строго больше `after` (нижний регистр; `None` — с начала); не более `limit`.
+    /// Курсор следующей страницы — имя входа последней записи в нижнем регистре.
+    /// По умолчанию — `Error::Internal` (реализации — `tp-meta`, `tp-testkit`).
+    async fn list(
+        &self,
+        tenant: TenantId,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Account>> {
+        let _ = (tenant, prefix, after, limit);
+        Err(Error::Internal(
+            "AccountStore::list не реализован".to_owned(),
+        ))
+    }
+
     /// Создаёт или обновляет учётную запись (из LDAP); при создании — системные папки.
     async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account>;
 
