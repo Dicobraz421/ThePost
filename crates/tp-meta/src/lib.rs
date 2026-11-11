@@ -7,6 +7,7 @@
 pub mod abuse;
 pub mod accounts;
 pub mod acl;
+pub mod admin_tokens;
 pub mod app_passwords;
 pub mod blob_index;
 pub mod changelog;
