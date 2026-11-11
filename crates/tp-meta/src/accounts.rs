@@ -209,7 +209,7 @@ impl PgMeta {
 impl AccountStore for PgMeta {
     async fn get(&self, tenant: TenantId, id: AccountId) -> Result<Option<Account>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, tenant).await?;
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
                 "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
              FROM accounts WHERE tenant_id = $1 AND account_id = $2",
@@ -227,7 +227,7 @@ impl AccountStore for PgMeta {
 
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, tenant).await?;
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
                 "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
              FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2)",
@@ -245,7 +245,7 @@ impl AccountStore for PgMeta {
 
     async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, tenant).await?;
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
                 "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
              FROM accounts WHERE tenant_id = $1 AND external_id = $2",
@@ -275,7 +275,7 @@ impl AccountStore for PgMeta {
         let next = prefix_next(prefix);
         let (next, after) = (next.as_deref(), after.unwrap_or(""));
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, tenant).await?;
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let sql = if next.is_some() {
                 LIST_PREFIX_SQL
             } else {

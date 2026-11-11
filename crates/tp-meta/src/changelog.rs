@@ -341,7 +341,7 @@ impl PgMeta {
     ) -> Result<(Vec<LogRow>, ModSeq, bool)> {
         self.idempotent(|| async move {
         let limit = limit.max(1);
-        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
+        let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
         let (current, floor): (i64, i64) = sqlx::query_as(
             "SELECT modseq, changelog_floor FROM mailbox_state WHERE tenant_id = $1 AND account_id = $2",
         )

@@ -435,11 +435,12 @@ pub(crate) async fn touch(
 impl MailboxStore for PgMeta {
     async fn list(&self, scope: AccountScope) -> Result<Vec<Mailbox>> {
         self.idempotent(|| async move {
-            let db = self.box_db(scope).await?;
+            let db = self.read_db(scope).await?;
             let mut tx = begin(&db.pool, scope.tenant).await?;
             let mut rows = select_all(&mut tx, scope).await?;
-            // Первое открытие ящика без части системных папок (запись заведена в базе, вход без `upsert`).
-            let missing = !missing_rows(&rows)?.is_empty();
+            // Первое открытие ящика без части системных папок (запись заведена в базе, вход без `upsert`);
+            // фоновое чтение (`Stale`) папок не создаёт.
+            let missing = !self.stale_attempt() && !missing_rows(&rows)?.is_empty();
             if missing && db.shard != ShardId::MAIN {
                 // Учётная запись есть в каталоге (её шард найден), состояние ящика на шарде — ещё нет.
                 ensure_state(&mut tx, scope).await?;
@@ -460,7 +461,7 @@ impl MailboxStore for PgMeta {
 
     async fn get(&self, scope: AccountScope, id: MailboxId) -> Result<Option<Mailbox>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
+            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
             let mb = fetch(&mut tx, scope, id, false).await?;
             tx.commit().await.map_err(db_err)?;
             Ok(mb)
@@ -680,7 +681,7 @@ impl MailboxStore for PgMeta {
 
     async fn status(&self, scope: AccountScope, id: MailboxId) -> Result<MailboxStatus> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
+            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
             let row: Option<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
             r"SELECT mb.uid_validity, mb.uid_next, mb.highest_modseq, s.messages, s.unseen, s.size
               FROM mailboxes mb,
