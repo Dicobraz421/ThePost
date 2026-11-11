@@ -51,6 +51,8 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
+      # Кластер — UTF8 с C.UTF-8 явно (решение 2026-11-11 №23; образ по умолчанию — en_US.utf8); только новый том.
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
     ports:
       - "${TP_PG_PORT:-5432}:5432"
     volumes:
@@ -177,6 +179,8 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
+      # Кластер — UTF8 с C.UTF-8 явно (решение 2026-11-11 №23; образ по умолчанию — en_US.utf8); только новый том.
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
     ports:
       - "${TP_PG_PORT:-5432}:5432"
     volumes:
