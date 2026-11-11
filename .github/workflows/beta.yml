@@ -2,6 +2,9 @@
 # Release-сборка x86_64 и aarch64 через cross (один образ glibc на обе цели), артефакты, GitHub pre-release.
 # Ручной запуск (workflow_dispatch) собирает бету всегда; повтор в тот же день — тег beta-YYYYMMDD.N.
 # Тег создаёт `gh release create` только после успешной сборки; тег от GITHUB_TOKEN не запускает ci.yml.
+# CI-03 (SRS 6.8): SBOM (SPDX, syft) в выпуске; архивы, SBOM и OCI-образ ghcr.io подписаны cosign без ключей
+# (OIDC GitHub, Rekor), проверка подписи — в описании выпуска; repro — вторая сборка с нуля на чистом раннере
+# и сравнение sha256 бинарника (выпуск не блокирует, расхождение — красный job).
 name: Beta
 
 on:
@@ -92,26 +95,168 @@ jobs:
             dist/${{ env.PKG }}.tar.gz.sha256
           if-no-files-found: error
 
-  release:
+  # OCI-образ из deploy/docker/Dockerfile (linux/amd64), push в ghcr.io и подпись cosign по digest.
+  image:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: name
+        shell: bash
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.name.outputs.image }}:${{ needs.plan.outputs.tag }}
+            ${{ steps.name.outputs.image }}:beta
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.tag }}
+      - uses: sigstore/cosign-installer@v4
+      - id: ref
+        name: Подпись образа
+        shell: bash
+        env:
+          REF: ${{ steps.name.outputs.image }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "$REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+  # Воспроизводимость: та же сборка с нуля (без rust-cache) на другом раннере, sha256 бинарника — как в build.
+  repro:
     needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    env:
+      PKG: thepost-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - run: cross build --release --locked -p thepost --target ${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ runner.temp }}/ref
+      - name: Сравнение хэшей
+        shell: bash
+        env:
+          REF: ${{ runner.temp }}/ref
+        run: |
+          tar -C "$REF" -xzf "$REF/$PKG.tar.gz"
+          a=$(sha256sum < "$REF/$PKG/thepost" | cut -d' ' -f1)
+          b=$(sha256sum < "target/${{ matrix.target }}/release/thepost" | cut -d' ' -f1)
+          echo "build: $a"; echo "repro: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::error::сборка ${{ matrix.target }} невоспроизводима: $a != $b"
+            echo "${{ matrix.target }}: невоспроизводима ($a / $b)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "${{ matrix.target }}: воспроизводима, sha256 $a" >> "$GITHUB_STEP_SUMMARY"
+
+  # Выпуск не ждёт образа: сбой ghcr.io — красный job image, бета выходит без раздела об образе.
+  release:
+    needs: [plan, build, image]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+    env:
+      DIST: ${{ runner.temp }}/dist
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: ${{ env.DIST }}
           merge-multiple: true
+      - name: SBOM (SPDX по Cargo.lock)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: ${{ env.DIST }}/thepost-${{ env.TAG }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: sigstore/cosign-installer@v4
+      - name: Подпись архивов и SBOM
+        shell: bash
+        working-directory: ${{ env.DIST }}
+        run: |
+          for f in *.tar.gz *.spdx.json; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
       - name: Pre-release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.plan.outputs.tag }}
           PREV: ${{ needs.plan.outputs.prev }}
           SHA: ${{ github.sha }}
+          IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
+          IMAGE: ${{ needs.image.outputs.ref }}
         run: |
-          ls -l dist
-          args=(--prerelease --target "$SHA" --title "$TAG" --generate-notes)
+          ls -l "$DIST"
+          # Описание выпуска: проверка подписи (CI-03); автозаметки GitHub добавляются после него.
+          cat > notes.md <<'EOF'
+          ## Проверка подписи
+
+          Архивы, SBOM и OCI-образ подписаны [cosign](https://docs.sigstore.dev/) без ключей (keyless):
+          сертификат выдан workflow `beta.yml` этого репозитория через OIDC GitHub, подпись записана
+          в журнал прозрачности Rekor. Рядом с каждым файлом — пакет подписи `<файл>.sigstore.json`.
+
+          ```sh
+          f=thepost-@TAG@-x86_64-unknown-linux-gnu.tar.gz   # или -aarch64-…, или thepost-@TAG@.spdx.json
+          cosign verify-blob "$f" --bundle "$f.sigstore.json" \
+            --certificate-identity '@IDENTITY@' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          sha256sum -c "$f.sha256"   # для архивов
+          ```
+
+          SBOM — `thepost-@TAG@.spdx.json` (SPDX JSON по `Cargo.lock`, syft).
+          EOF
+          if [ -n "$IMAGE" ]; then
+            cat >> notes.md <<'EOF'
+
+          ## OCI-образ
+
+          `@IMAGE@` (linux/amd64, теги `@TAG@` и `beta`):
+
+          ```sh
+          cosign verify '@IMAGE@' \
+            --certificate-identity '@IDENTITY@' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          ```
+          EOF
+          fi
+          sed -i -e "s|@TAG@|$TAG|g" -e "s|@IDENTITY@|$IDENTITY|g" -e "s|@IMAGE@|$IMAGE|g" notes.md
+          cat notes.md
+          args=(--prerelease --target "$SHA" --title "$TAG" --notes-file notes.md --generate-notes)
           if [ -n "$PREV" ]; then args+=(--notes-start-tag "$PREV"); fi
-          gh release create "$TAG" "${args[@]}" dist/*
+          gh release create "$TAG" "${args[@]}" "$DIST"/*
