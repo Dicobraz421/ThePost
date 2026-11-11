@@ -28,12 +28,15 @@ SCRIPT_EXT = re.compile(r"\.(sh|bash|py|pl|pm|rb|lua|php|tcl|js|mjs)$")
 BIN_DIR = re.compile(r"^(usr/(local/)?)?(s?bin|libexec)/")
 # Записи слоя контейнера от `docker create`/`docker export`, не образа.
 RUNTIME = re.compile(r"^(\.dockerenv|dev/.*|etc/(hostname|hosts|resolv\.conf))$")
-# Известные файлы базового образа, не исполняемые в работе (путь — причина).
+# Известные файлы базового образа distroless, не исполняемые в работе (шаблон пути — причина).
 ALLOW = {
-    # base-files Debian в distroless: сценарий запускает pam_motd при входе в систему;
-    # в образе нет ни оболочки, ни входа.
-    "etc/update-motd.d/10-uname": "motd base-files, исполняется только при входе",
+    # base-files Debian: сценарий запускает pam_motd при входе в систему; в образе нет ни оболочки, ни входа.
+    r"etc/update-motd\.d/10-uname": "motd base-files, исполняется только при входе",
+    # libstdc++6: модули отладчика gdb (pretty-printers); их загружает только gdb со своим python.
+    r"usr/share/gcc/python/libstdcxx/.*\.py": "модули gdb из libstdc++6",
+    r"usr/share/gdb/auto-load/.*-gdb\.py": "автозагрузка gdb из libstdc++6",
 }
+ALLOW_RE = re.compile("^(" + "|".join(ALLOW) + ")$")
 
 
 def violations(tar: tarfile.TarFile) -> list[str]:
@@ -43,8 +46,9 @@ def violations(tar: tarfile.TarFile) -> list[str]:
         base = name.rsplit("/", 1)[-1]
         if not (m.isfile() or m.issym() or m.islnk()) or RUNTIME.match(name):
             continue
-        if name in ALLOW:
-            print(f"исключение: {name} — {ALLOW[name]}")
+        if ALLOW_RE.match(name):
+            why = next(r for p, r in ALLOW.items() if re.fullmatch(p, name))
+            print(f"исключение: {name} — {why}")
             continue
         if INTERP.match(base):
             found.append(f"{name}: интерпретатор")
@@ -95,6 +99,7 @@ def self_test() -> int:
         ("usr/share/doc/README", b"text\n", 0o644, None),
         ("etc/ssl/certs/ca-certificates.crt", b"-----BEGIN", 0o755, None),
         ("etc/update-motd.d/10-uname", b"#!/bin/sh\nuname\n", 0o755, None),
+        ("usr/share/gcc/python/libstdcxx/v6/printers.py", b"import gdb\n", 0o755, None),
         (".dockerenv", b"", 0o755, None),
         ("etc/hosts", b"", 0o755, None),
     ]
