@@ -144,6 +144,15 @@ impl Env {
     }
 
     pub async fn with(cfg: JmapConfig, caps: Vec<Arc<dyn JmapCapability>>) -> Self {
+        Self::with_signer(cfg, caps, None).await
+    }
+
+    /// Окружение с подписью профиля `.mobileconfig`.
+    pub async fn with_signer(
+        cfg: JmapConfig,
+        caps: Vec<Arc<dyn JmapCapability>>,
+        signer: Option<Arc<dyn crate::ProfileSigner>>,
+    ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let blobs = MemBlobStore::new(clock.clone());
         let index = MemBlobIndex::new(clock.clone());
@@ -203,7 +212,8 @@ impl Env {
             },
             cfg,
         )
-        .expect("jmap");
+        .expect("jmap")
+        .with_profile_signer(signer);
         Self {
             meta,
             search,
