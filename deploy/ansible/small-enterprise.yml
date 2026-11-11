@@ -59,6 +59,13 @@
         small_masters: "{{ groups['small_data'] | map('regex_replace', '$', ':9333') | list }}"
         small_filers: "{{ groups['small_data'] | map('regex_replace', '$', ':8888') | list }}"
 
+# Синхронизация времени — до остальных ролей (решение 2026-11-11 №25).
+- name: Time synchronization
+  hosts: small_data:mailbox
+  become: true
+  roles:
+    - chrony
+
 - name: OpenBao cluster on data VMs
   hosts: small_data
   become: true
@@ -169,7 +176,7 @@
     - name: Check recovery mode
       community.postgresql.postgresql_query:
         query: SELECT pg_is_in_recovery() AS standby
-        port: "{{ pgaf_port | default(5432) }}"
+        login_port: "{{ pgaf_port | default(5432) }}"
       register: small_recovery
       changed_when: false
       become: true
@@ -186,7 +193,7 @@
             name: seaweedfs_filer
             password: "{{ seaweedfs_filer_db_password }}"
             role_attr_flags: LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE
-            port: "{{ pgaf_port | default(5432) }}"
+            login_port: "{{ pgaf_port | default(5432) }}"
           no_log: true
 
         - name: Grant CONNECT on database thepost
@@ -196,14 +203,14 @@
             objs: "{{ pgaf_app_db | default('thepost') }}"
             privs: CONNECT
             roles: seaweedfs_filer
-            port: "{{ pgaf_port | default(5432) }}"
+            login_port: "{{ pgaf_port | default(5432) }}"
 
         - name: Create schema seaweedfs
           community.postgresql.postgresql_schema:
             login_db: "{{ pgaf_app_db | default('thepost') }}"
             name: seaweedfs
             owner: seaweedfs_filer
-            port: "{{ pgaf_port | default(5432) }}"
+            login_port: "{{ pgaf_port | default(5432) }}"
 
 - name: SeaweedFS on data VMs
   hosts: small_data
