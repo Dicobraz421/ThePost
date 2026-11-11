@@ -229,6 +229,7 @@ async fn serve_until_signal(path: PathBuf) -> i32 {
         secrets: None,
         telemetry: true,
         shutdown: shutdown.clone(),
+        modules: crate::modules::BUILTIN,
     };
     let running = match serve::start(opts).await {
         Ok(r) => r,
