@@ -1,0 +1,8 @@
+---
+source: crates/tp-sieve/src/tests/parsing.rs
+expression: parsed(text).to_string()
+---
+require ["vacation", "fileinto"];
+if header :contains "subject" "отпуск" {
+  vacation :days 7 :subject "Я в отпуске" :from "anna@example.org" :addresses ["anna@example.org", "a.ivanova@example.org"] :handle "summer" "Здравствуйте!\n.Точка в начале строки удвоена.\nВернусь 20 июля.\n";
+}
