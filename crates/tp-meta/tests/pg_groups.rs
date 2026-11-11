@@ -7,7 +7,7 @@ use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRes
 use tp_contracts::meta::{AccountStore, AccountUpsert};
 use tp_contracts::{AccountId, Error, GroupId, TenantId};
 use tp_meta::PgMeta;
-use tp_testkit::suite::{GroupFixture, group_store};
+use tp_testkit::suite::{ExternalIdFixture, GroupFixture, account_external_id, group_store};
 
 async fn accounts(meta: &PgMeta, tenant: TenantId) -> [AccountId; 4] {
     let (domain, name) = common::domain(meta.pool(), tenant).await;
@@ -43,6 +43,23 @@ async fn passes_contract_suite() {
         foreign_tenant: common::tenant(meta.pool()).await,
     };
     group_store(&meta, &fx).await;
+}
+
+/// CTR-32: учётная запись по `external_id`; переименование входа не теряет членство в группе.
+#[tokio::test]
+async fn external_id_survives_rename() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let tenant = common::tenant(meta.pool()).await;
+    let (domain, domain_name) = common::domain(meta.pool(), tenant).await;
+    let fx = ExternalIdFixture {
+        tenant,
+        domain,
+        domain_name,
+        foreign_tenant: common::tenant(meta.pool()).await,
+    };
+    account_external_id(&meta, &meta, &fx).await;
 }
 
 fn group(tenant: TenantId, members: Vec<GroupMember>) -> DistributionGroup {

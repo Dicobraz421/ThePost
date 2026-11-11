@@ -787,6 +787,16 @@ impl AccountStore for MemMetadata {
             .map(|a| a.account.clone()))
     }
 
+    async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>> {
+        Ok(lock(&self.state)
+            .accounts
+            .values()
+            .find(|a| {
+                a.account.tenant == tenant && a.account.external_id.as_deref() == Some(external_id)
+            })
+            .map(|a| a.account.clone()))
+    }
+
     async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account> {
         if data.login.is_empty() {
             return Err(Error::invalid("пустое имя входа"));

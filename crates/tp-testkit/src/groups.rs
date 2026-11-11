@@ -255,6 +255,18 @@ mod tests {
     use tp_contracts::{BlobHash, BlobKey, Gen};
 
     #[tokio::test]
+    async fn external_id_survives_rename() {
+        let meta = crate::MemMetadata::default();
+        let fx = crate::suite::ExternalIdFixture {
+            tenant: TenantId::DEFAULT,
+            domain: tp_contracts::DomainId::new(),
+            domain_name: "example.org".into(),
+            foreign_tenant: TenantId::new(),
+        };
+        crate::suite::account_external_id(&meta, &MemGroups::new(), &fx).await;
+    }
+
+    #[tokio::test]
     async fn moderation_records_decisions() {
         let tenant = TenantId::DEFAULT;
         let group = DistributionGroup {

@@ -45,8 +45,8 @@ use tp_contracts::groups::{
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    AccountScope, MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, PolicyResolver,
-    SpecialUse,
+    AccountScope, AccountStore, AccountUpsert, MailboxStore, MessageQuery, MessageStore,
+    NewMailbox, NewMessage, PolicyResolver, SpecialUse,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -2078,6 +2078,111 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
     store.remove(t, inner.id).await.expect("remove");
     assert_eq!(store.expand(t, all.id).await, Ok(sorted(vec![a, b])));
     assert_eq!(store.held(t, Some(all.id), 10).await, Ok(vec![h3]));
+}
+
+// ---------- AccountStore: external_id ----------
+
+/// Данные набора [`account_external_id`]: домен организации `tenant` (`domain_name` — его имя для адресов входа)
+/// и другая организация.
+#[derive(Debug, Clone)]
+pub struct ExternalIdFixture {
+    /// Организация.
+    pub tenant: TenantId,
+    /// Домен организации.
+    pub domain: DomainId,
+    /// Имя домена.
+    pub domain_name: String,
+    /// Другая организация.
+    pub foreign_tenant: TenantId,
+}
+
+/// Набор проверок `AccountStore::by_external_id` (CTR-32): поиск по идентификатору каталога, переименование входа
+/// сохраняет учётную запись и её членство в группе, изоляция организаций.
+pub async fn account_external_id(
+    accounts: &dyn AccountStore,
+    groups: &dyn GroupStore,
+    fx: &ExternalIdFixture,
+) {
+    let run = AccountId::new();
+    let ext = format!("ext-{run}");
+    let login = |n: &str| format!("{n}-{run}@{}", fx.domain_name);
+    let upsert = |login: String| AccountUpsert {
+        domain: fx.domain,
+        login,
+        display_name: "Анна".into(),
+        external_id: Some(ext.clone()),
+        enabled: true,
+    };
+    assert_eq!(
+        accounts
+            .by_external_id(fx.tenant, &ext)
+            .await
+            .expect("none"),
+        None
+    );
+    let a = accounts
+        .upsert(fx.tenant, upsert(login("anna")))
+        .await
+        .expect("upsert");
+    assert_eq!(
+        accounts
+            .by_external_id(fx.tenant, &ext)
+            .await
+            .expect("by ext"),
+        Some(a.clone())
+    );
+    assert_eq!(
+        accounts
+            .by_external_id(fx.tenant, &ext.to_uppercase())
+            .await
+            .expect("case"),
+        None,
+        "точное совпадение"
+    );
+    assert_eq!(
+        accounts
+            .by_external_id(fx.foreign_tenant, &ext)
+            .await
+            .expect("foreign"),
+        None
+    );
+
+    // Группа с участником; переименование входа в каталоге — та же учётная запись, членство сохраняется.
+    let group = DistributionGroup {
+        id: GroupId::new(),
+        tenant: fx.tenant,
+        name: "Отдел".into(),
+        address: None,
+        external_id: None,
+        members: vec![GroupMember::Account(a.id)],
+        senders: SenderRestriction::Anyone,
+        moderators: Vec::new(),
+        hidden_from_gal: false,
+    };
+    groups.put(group.clone()).await.expect("group");
+    let renamed = accounts
+        .upsert(fx.tenant, upsert(login("anna.ivanova")))
+        .await
+        .expect("rename");
+    assert_eq!(renamed.id, a.id);
+    assert_eq!(renamed.login, login("anna.ivanova"));
+    let found = accounts
+        .by_external_id(fx.tenant, &ext)
+        .await
+        .expect("by ext")
+        .expect("found");
+    assert_eq!((found.id, found.login), (a.id, login("anna.ivanova")));
+    assert_eq!(
+        accounts
+            .by_login(fx.tenant, &login("anna"))
+            .await
+            .expect("old"),
+        None
+    );
+    assert_eq!(
+        groups.expand(fx.tenant, group.id).await.expect("expand"),
+        vec![a.id]
+    );
 }
 
 // ---------- Moderation ----------
