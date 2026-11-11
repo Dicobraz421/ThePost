@@ -105,36 +105,34 @@ sudo thepost admin init --email admin@example.ru
 
 ## Учётные записи
 
-Admin API слушает только локальный адрес сервера (`127.0.0.1:8443`), запросы — с самого сервера. Обменяйте
-токен на сессию (8 часов):
+Пользователи заводятся командой `thepost admin` на самом сервере: Admin API слушает только локальный адрес
+(`127.0.0.1:8443`), адрес команда берёт из `config.yaml`. Сначала обменяйте одноразовый токен на сессию (8 часов):
 
 ```bash
-A=https://127.0.0.1:8443/api/v1
-ORG=00000000-0000-0000-0000-000000000001        # организация по умолчанию
-curl -sk -X POST -H "Authorization: Bearer tpa_…" $A/session   # в ответе — "session": "tps_…"
-S=tps_…
+THEPOST_ADMIN_TOKEN=tpa_… thepost admin login --insecure     # выводит сессию tps_…
+export THEPOST_ADMIN_TOKEN=tps_…
 ```
 
-Создайте пользователя и пароль для его почтового клиента:
+`--insecure` — только для этого локального адреса, если сертификат узла выпущен на имя сервера (иначе — `--ca-file`).
+Дальше — пользователь и пароль для его почтового клиента:
 
 ```bash
-curl -sk -X POST -H "Authorization: Bearer $S" -H 'Content-Type: application/json' \
-  -d '{"login":"ivanov@example.ru"}' $A/orgs/$ORG/accounts            # в ответе — "id"
-curl -sk -X POST -H "Authorization: Bearer $S" -H 'Content-Type: application/json' \
-  -d '{"label":"Thunderbird"}' $A/orgs/$ORG/accounts/<id>/app-passwords   # в ответе — "password", один раз
+thepost admin account create ivanov@example.ru --name "Иван Иванов" --insecure
+thepost admin app-password create ivanov@example.ru --label Thunderbird --insecure   # пароль — один раз
+thepost admin account get ivanov@example.ru --insecure
+thepost admin domain list --insecure
 ```
 
-У каждого клиента может быть свой пароль приложения; отозвать его можно, не трогая остальные.
+У каждого клиента может быть свой пароль приложения: `app-password list` показывает их без значений,
+`app-password revoke` отзывает один, не трогая остальные. Вывод — таблица или `--json`.
 
-В Docker Compose те же запросы выполняются из контейнера в сети узла:
+В Docker Compose те же команды выполняются в контейнере узла:
 
 ```bash
 DC="docker compose -f deploy/compose/dev.yml --profile smb"
-ADM="docker run --rm --network container:$($DC ps -q thepost) curlimages/curl:8.11.1 -sk"
-$ADM -X POST -H "Authorization: Bearer tpa_…" https://127.0.0.1:8443/api/v1/session
+$DC exec -e THEPOST_ADMIN_TOKEN=tpa_… thepost thepost admin login --insecure
+$DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@example.test --insecure
 ```
-
-> Скоро вместо `curl` — команда `thepost admin` (учётные записи, домены, пароли).
 
 ## Настройка клиентов
 
