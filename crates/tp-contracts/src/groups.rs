@@ -12,6 +12,10 @@
 //! Решение модератора (CTR-31): письмо забирается из очереди ([`GroupStore::take_held`]) и передаётся [`Moderation`]
 //! (реализация — `tp-smtp`): одобрено — доставка участникам группы, отклонено — уведомление отправителю.
 //! Ошибка решения — вызывающий возвращает письмо в очередь ([`GroupStore::hold`]).
+//!
+//! Одна очередь модерации для групп и правил потока почты (CTR-43, решение 2026-11-11-stage2-followups п. 9): у письма
+//! источник задержки ([`HoldSource`]) и модераторы ([`Moderator`]); письмо правила — без группы, одобрение доставляет
+//! его исходным получателям ([`HeldMessage::recipients`]).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -106,13 +110,51 @@ impl DistributionGroup {
     }
 }
 
+/// Наибольшая длина имени правила потока в очереди модерации, символов.
+pub const MAX_RULE_NAME_LEN: usize = 255;
+
+/// Модератор задержанного письма (CTR-43).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Moderator {
+    /// Учётная запись.
+    Account(AccountId),
+    /// Участники группы (с раскрытием вложенных).
+    Group(GroupId),
+}
+
+/// Источник задержки письма (CTR-43).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldSource {
+    /// Модерируемая группа рассылки [`HeldMessage::group`].
+    #[default]
+    Group,
+    /// Правило потока почты (`FlowVerdict::Moderate`); письмо без группы.
+    FlowRule {
+        /// Имя правила (1–[`MAX_RULE_NAME_LEN`] символов без управляющих).
+        rule: String,
+    },
+}
+
 /// Письмо в очереди модерации. Ссылка на объект учтена вызывающим и освобождается им после решения.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldMessage {
     /// Идентификатор (назначает вызывающий, `HeldId::new()`).
     pub id: HeldId,
-    /// Группа-адресат.
-    pub group: GroupId,
+    /// Группа-адресат; `None` — письмо задержано правилом потока (CTR-43).
+    pub group: Option<GroupId>,
+    /// Источник задержки (CTR-43).
+    #[serde(default)]
+    pub source: HoldSource,
+    /// Модераторы (CTR-43): у письма правила — не пусто; у письма группы — снимок модераторов группы (пусто — модераторы
+    /// группы на момент решения).
+    #[serde(default)]
+    pub moderators: Vec<Moderator>,
+    /// Исходные получатели конверта (CTR-43): у письма правила — не пусто, им доставляется одобренное письмо; у письма
+    /// группы — адрес группы или пусто.
+    #[serde(default)]
+    pub recipients: Vec<String>,
     /// Отправитель конверта (`MAIL FROM`).
     pub sender: String,
     /// Учётная запись отправителя; `None` — внешний.
@@ -125,6 +167,36 @@ pub struct HeldMessage {
     pub size: u64,
     /// Момент постановки.
     pub held_at: OffsetDateTime,
+}
+
+impl HeldMessage {
+    /// Проверка источника (CTR-43): [`HoldSource::Group`] — группа задана; [`HoldSource::FlowRule`] — без группы, имя
+    /// правила 1–[`MAX_RULE_NAME_LEN`] символов без управляющих, модераторы и получатели не пусты. Иначе `Error::Invalid`.
+    pub fn validate(&self) -> Result<()> {
+        match &self.source {
+            HoldSource::Group if self.group.is_some() => Ok(()),
+            HoldSource::Group => Err(Error::invalid("письмо группы без группы")),
+            HoldSource::FlowRule { rule } => {
+                if self.group.is_some() {
+                    return Err(Error::invalid(
+                        "письмо правила потока не относится к группе",
+                    ));
+                }
+                if rule.trim().is_empty()
+                    || rule.chars().count() > MAX_RULE_NAME_LEN
+                    || rule.chars().any(char::is_control)
+                {
+                    return Err(Error::invalid("имя правила потока — 1..=255 символов"));
+                }
+                if self.moderators.is_empty() || self.recipients.is_empty() {
+                    return Err(Error::invalid(
+                        "у письма правила потока нет модераторов или получателей",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Группы рассылки организации и очередь модерации. Всё — в контексте `tenant`.
@@ -193,10 +265,11 @@ pub trait GroupStore: Send + Sync + 'static {
         Ok(false)
     }
 
-    /// Ставит письмо в очередь модерации. Нет группы — `Error::NotFound`; занятый `id` — `Error::Conflict`.
+    /// Ставит письмо в очередь модерации: письмо группы — нет группы — `Error::NotFound`; письмо правила потока
+    /// (CTR-43, без группы); [`HeldMessage::validate`] — `Error::Invalid`; занятый `id` — `Error::Conflict`.
     async fn hold(&self, tenant: TenantId, message: HeldMessage) -> Result<()>;
 
-    /// Очередь модерации организации или одной группы по (`held_at`, `id`), не более `limit`.
+    /// Очередь модерации организации (письма групп и правил) или одной группы по (`held_at`, `id`), не более `limit`.
     async fn held(
         &self,
         tenant: TenantId,
@@ -230,13 +303,13 @@ pub fn validate_reject_reason(reason: &str) -> Result<()> {
 /// успешное решение освобождает ссылку на объект письма, ошибка — письмо возвращают в очередь, ссылка остаётся.
 #[async_trait]
 pub trait Moderation: Send + Sync + 'static {
-    /// Одобрено: доставить письмо участникам `group` (раскрытие [`GroupStore::expand`] с вложенными, приём в ящики,
-    /// журнал доставки) без повторной модерации. `group` — не группа письма (`message.group`) или другой организации —
-    /// `Error::Invalid`.
+    /// Одобрено: доставить письмо без повторной модерации — участникам `group` (раскрытие [`GroupStore::expand`] с
+    /// вложенными, приём в ящики, журнал доставки) или, для письма правила потока (`group = None`, CTR-43), исходным
+    /// получателям [`HeldMessage::recipients`] (локальные — в ящики, внешние — в очередь). Проверка — [`check_delivery`].
     async fn deliver(
         &self,
         tenant: TenantId,
-        group: &DistributionGroup,
+        group: Option<&DistributionGroup>,
         message: &HeldMessage,
     ) -> Result<()>;
 
@@ -245,16 +318,23 @@ pub trait Moderation: Send + Sync + 'static {
     async fn reject(&self, tenant: TenantId, message: &HeldMessage, reason: &str) -> Result<()>;
 }
 
-/// Проверка аргументов [`Moderation::deliver`] для реализаций: группа письма и организация.
+/// Проверка аргументов [`Moderation::deliver`] для реализаций: группа письма и организация; без группы — письмо
+/// правила потока ([`HeldMessage::validate`]). Иначе `Error::Invalid`.
 pub fn check_delivery(
     tenant: TenantId,
-    group: &DistributionGroup,
+    group: Option<&DistributionGroup>,
     message: &HeldMessage,
 ) -> Result<()> {
-    if group.tenant != tenant || group.id != message.group {
-        return Err(Error::invalid("письмо очереди модерации — другой группы"));
+    match group {
+        Some(g) if g.tenant != tenant || Some(g.id) != message.group => {
+            Err(Error::invalid("письмо очереди модерации — другой группы"))
+        }
+        Some(_) => Ok(()),
+        None if message.group.is_some() => {
+            Err(Error::invalid("письмо группы: для доставки нужна группа"))
+        }
+        None => message.validate(),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -267,6 +347,76 @@ mod tests {
     fn object_safe() {
         fn _store(_: std::sync::Arc<dyn GroupStore>) {}
         fn _moderation(_: std::sync::Arc<dyn Moderation>) {}
+    }
+
+    fn held(group: Option<GroupId>, source: HoldSource) -> HeldMessage {
+        HeldMessage {
+            id: HeldId::new(),
+            group,
+            source,
+            moderators: vec![Moderator::Account(AccountId::new())],
+            recipients: vec!["a@example.org".into()],
+            sender: "x@example.com".into(),
+            sender_account: None,
+            message_id: None,
+            blob: BlobKey {
+                tenant: TenantId::DEFAULT,
+                hash: crate::ids::BlobHash([1; 32]),
+                generation: crate::ids::Gen::INITIAL,
+            },
+            size: 1,
+            held_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// CTR-43: источник задержки и проверка доставки письма без группы.
+    #[test]
+    fn held_source() {
+        let g = group("Все");
+        let rule = || HoldSource::FlowRule {
+            rule: "Внешние вложения".into(),
+        };
+        let by_group = held(Some(g.id), HoldSource::Group);
+        let by_rule = held(None, rule());
+        assert_eq!(by_group.validate(), Ok(()));
+        assert_eq!(by_rule.validate(), Ok(()));
+        assert!(held(None, HoldSource::Group).validate().is_err());
+        assert!(held(Some(g.id), rule()).validate().is_err());
+        let unnamed = held(None, HoldSource::FlowRule { rule: " ".into() });
+        assert!(unnamed.validate().is_err());
+        let nobody = HeldMessage {
+            moderators: Vec::new(),
+            ..by_rule.clone()
+        };
+        assert!(nobody.validate().is_err());
+        let nowhere = HeldMessage {
+            recipients: Vec::new(),
+            ..by_rule.clone()
+        };
+        assert!(nowhere.validate().is_err());
+
+        let t = TenantId::DEFAULT;
+        assert_eq!(check_delivery(t, Some(&g), &by_group), Ok(()));
+        assert_eq!(check_delivery(t, None, &by_rule), Ok(()));
+        assert!(check_delivery(t, None, &by_group).is_err());
+        assert!(check_delivery(t, Some(&g), &by_rule).is_err());
+        assert!(check_delivery(TenantId::new(), Some(&g), &by_group).is_err());
+
+        let json = serde_json::to_string(&by_rule).expect("json");
+        assert_eq!(
+            serde_json::from_str::<HeldMessage>(&json).expect("parse"),
+            by_rule
+        );
+        // Запись до CTR-43: группа задана, новых полей нет.
+        let mut old: serde_json::Value = serde_json::to_value(&by_group).expect("value");
+        for f in ["source", "moderators", "recipients"] {
+            old.as_object_mut().expect("object").remove(f);
+        }
+        let parsed: HeldMessage = serde_json::from_value(old).expect("old");
+        assert_eq!(
+            (parsed.source, parsed.moderators.len()),
+            (HoldSource::Group, 0)
+        );
     }
 
     #[test]
