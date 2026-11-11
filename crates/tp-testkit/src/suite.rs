@@ -795,6 +795,55 @@ pub async fn secret_store(store: &dyn SecretStore, fixture: &SecretFixture, wait
     assert!(again.lease().is_some_and(|l| l.id != lease.id));
 }
 
+// ---------- Системные папки ----------
+
+/// Набор проверок системных папок `MailboxStore::list` (KIT-08, META-42; решение #205): недостающая
+/// системная папка определяется только по роли и создаётся всегда; имя, занятое папкой пользователя
+/// верхнего уровня (без учёта регистра ASCII), получает наименьший свободный суффикс.
+///
+/// `scope` — учётная запись без папки с ролью Junk, с папками верхнего уровня «Junk» и «junk 1» без роли
+/// (остальные папки — любые).
+pub async fn system_folders_by_role(mailboxes: &dyn MailboxStore, scope: AccountScope) {
+    let first = mailboxes.list(scope).await.expect("list");
+    // Каждая роль — ровно у одной папки.
+    for role in [
+        SpecialUse::Inbox,
+        SpecialUse::Drafts,
+        SpecialUse::Sent,
+        SpecialUse::Junk,
+        SpecialUse::Trash,
+        SpecialUse::Archive,
+    ] {
+        assert_eq!(
+            first.iter().filter(|m| m.role == Some(role)).count(),
+            1,
+            "роль {role:?}"
+        );
+    }
+    // Системная Junk — верхнего уровня, с суффиксом после занятых «Junk» и «junk 1».
+    let junk = first
+        .iter()
+        .find(|m| m.role == Some(SpecialUse::Junk))
+        .expect("Junk");
+    assert_eq!((junk.parent, junk.name.as_str()), (None, "Junk 2"));
+    // Папки пользователя не тронуты: имя то же, роли нет.
+    for name in ["Junk", "junk 1"] {
+        let user = first
+            .iter()
+            .find(|m| m.parent.is_none() && m.name == name)
+            .expect("папка пользователя");
+        assert_eq!(user.role, None, "{name}");
+    }
+    // Повторное открытие — без новых папок.
+    let ids = |v: &[tp_contracts::meta::Mailbox]| {
+        let mut ids: Vec<MailboxId> = v.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        ids
+    };
+    let again = mailboxes.list(scope).await.expect("list");
+    assert_eq!(ids(&again), ids(&first));
+}
+
 // ---------- AclStore ----------
 
 /// Учётные записи для [`acl_store`]; создаёт тест до запуска набора (у каждой — системные папки).
