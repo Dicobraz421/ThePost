@@ -399,11 +399,16 @@
 | [AUTH-11](AUTH-11.md) | `auth.abuse.fail_closed` | auth | A | auth-06 | ready | AUTH-08 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-10 | done | CLU-09 |
 
-## Ф1 · Решение 2026-11-11: шарды, токен администратора, цепочка поставки (`docs/decisions/2026-11-11-contracts-ci-defaults.md`)
+## Ф1 · Решения 2026-11-11: шарды, токен администратора, цепочка поставки, отчёты этапа 2 (`docs/decisions/2026-11-11-contracts-ci-defaults.md`, `2026-11-11-stage2-followups.md`)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
 | [DEPS-01](DEPS-01.md) | обновить calamine и libsqlite3-sys, сократить пропуски cargo audit | deps | B | deps-01 | ready | CI-03 |
+| [DEPS-02](DEPS-02.md) | mail-auth ≥ 0.14 и mail-send 0.7 — без zip 8 | deps | B | deps-02 | todo | DEPS-01 |
+| [DEPS-03](DEPS-03.md) | зависимость cms для подписи профиля .mobileconfig | deps | B | deps-03 | todo | JMAP-14 |
+| [JMAP-22](JMAP-22.md) | подпись профиля .mobileconfig сертификатом сервера | jmap | A | jmap-15 | todo | JMAP-14,DEPS-03 |
+| [ADM-12](ADM-12.md) | постраничный список учётных записей в Admin API | admin | A | admin-07 | ready | ADM-11 |
+| [APP-20](APP-20.md) | fail_closed защиты от перебора в узле, устаревший TODO doctor | app | A | app-19 | todo | AUTH-11,APP-08 |
 
 ## Вне волн
 
