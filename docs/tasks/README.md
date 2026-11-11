@@ -234,12 +234,12 @@
 | [CLU-09](CLU-09.md) | удалить шину Valkey | cluster | A | cluster-06 | done | CTR-23 |
 | [CLU-10](CLU-10.md) | состав кластера и разделы по сигналу | cluster | A | cluster-06 | done | CTR-23 |
 | [CLU-11](CLU-11.md) | запросы узел → узел (Rpc) | cluster | A | cluster-06 | done | CTR-23 |
-| [APP-08](APP-08.md) | сборка взаимодействия без опроса | app | A | app-04 | ready | META-26,CLU-09,CLU-10 |
+| [APP-08](APP-08.md) | сборка взаимодействия без опроса | app | A | app-04 | done | META-26,CLU-09,CLU-10 |
 | [PLT-17](PLT-17.md) | перечитывание конфигурации и сертификатов по событиям | platform | A | platform-07 | done | PLT-16 |
 | [MS-14](MS-14.md) | истечение корзины по ближайшему сроку | mailstore | A | mailstore-08 | done | MS-13 |
 | [BLOB-14](BLOB-14.md) | GC по ближайшему сроку отсрочки | blob | A | blob-07 | done | BLOB-13 |
 | [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | done | META-27 |
-| [CI-05](CI-05.md) | CI без Valkey, проверка отсутствия интерпретаторов | ci | B | ci-04 | ready | CLU-09 |
+| [CI-05](CI-05.md) | CI без Valkey, проверка отсутствия интерпретаторов | ci | B | ci-04 | done | CLU-09 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-06 | done | CLU-09 |
 
 ## Ф1 · Решение 2026-11-01: состав функций транспорта и внешний MTA
@@ -248,13 +248,13 @@
 |---|---|---|---|---|---|---|
 | [CTR-24](CTR-24.md) | контракты настроек транспорта и точка расширения правил потока | contracts | B | contracts-13 | done | CTR-23 |
 | [META-28](META-28.md) | хранение настроек транспорта | meta | A | meta-11 | done | CTR-24,META-26 |
-| [SMTP-20](SMTP-20.md) | доверенные источники: шлюз и приложения | smtp | A | smtp-06 | ready | CTR-24,SMTP-12,SMTP-04 |
-| [SMTP-21](SMTP-21.md) | принятые домены и внутренняя ретрансляция | smtp | A | smtp-06 | ready | CTR-24,SMTP-03,SMTP-09 |
-| [SMTP-22](SMTP-22.md) | точки вызова правил потока почты | smtp | A | smtp-06 | ready | CTR-24,SMTP-05,SMTP-16,SMTP-17 |
-| [SMTP-23](SMTP-23.md) | SRS и ARC-подпись при пересылке | smtp | A | smtp-06 | ready | SMTP-08,SMTP-13 |
+| [SMTP-20](SMTP-20.md) | доверенные источники: шлюз и приложения | smtp | A | smtp-06 | done | CTR-24,SMTP-12,SMTP-04 |
+| [SMTP-21](SMTP-21.md) | принятые домены и внутренняя ретрансляция | smtp | A | smtp-06 | done | CTR-24,SMTP-03,SMTP-09 |
+| [SMTP-22](SMTP-22.md) | точки вызова правил потока почты | smtp | A | smtp-06 | done | CTR-24,SMTP-05,SMTP-16,SMTP-17 |
+| [SMTP-23](SMTP-23.md) | SRS и ARC-подпись при пересылке | smtp | A | smtp-06 | done | SMTP-08,SMTP-13 |
 | [ADM-08](ADM-08.md) | Admin API настроек транспорта | admin | A | admin-03 | done | ADM-01,CTR-24 |
 | [JMAP-10](JMAP-10.md) | правила потока в EmailSubmission | jmap | A | jmap-04 | done | JMAP-07,CTR-24 |
-| [APP-09](APP-09.md) | сборка настроек транспорта и точки правил потока | app | A | app-05 | todo | META-28,SMTP-22,JMAP-10,ADM-08 |
+| [APP-09](APP-09.md) | сборка настроек транспорта и точки правил потока | app | A | app-05 | done | META-28,SMTP-22,JMAP-10,ADM-08 |
 
 ## Ф1 · Решение 2026-11-01: масштабирование, шарды, геораспределение, администрирование — этап 3, кроме `app-07` (этап 2)
 
@@ -265,7 +265,7 @@
 | [META-31](META-31.md) | журнал событий, очередь и учёт BLOB по шардам | meta | A | meta-13 | ready | META-30,CTR-34 |
 | [META-32](META-32.md) | чтение с реплик для фоновых задач | meta | A | meta-14 | todo | META-30 |
 | [BLOB-15](BLOB-15.md) | сборка мусора по учёту ссылок всех шардов | blob | A | blob-08 | todo | META-31,BLOB-14 |
-| [APP-11](APP-11.md) | CLI thepost admin | app | A | app-07 | ready | ADM-01 |
+| [APP-11](APP-11.md) | CLI thepost admin | app | A | app-07 | done | ADM-01 |
 | [DEP-10](DEP-10.md) | HPA, VPA и эталон «малый Enterprise» | deploy | A | deploy-07 | ready | DEP-09 |
 
 ## Ф1 · Решение 2026-11-04: соответствие функциям Exchange — этап 3, кроме `jmap-14` (этап 2)
@@ -285,7 +285,7 @@
 | [JMAP-16](JMAP-16.md) | статус доставки EmailSubmission | jmap | A | jmap-08 | todo | CTR-35,JMAP-07 |
 | [JMAP-17](JMAP-17.md) | расширения: списки отправителей и оргструктура | jmap | A | jmap-08 | todo | CTR-35,JMAP-01 |
 | [JMAP-18](JMAP-18.md) | аудит доступа к ящику в JMAP | jmap | A | jmap-08 | todo | CTR-35,JMAP-05 |
-| [JMAP-14](JMAP-14.md) | автонастройка клиентов | jmap | A | jmap-14 | ready | JMAP-01 |
+| [JMAP-14](JMAP-14.md) | автонастройка клиентов | jmap | A | jmap-14 | done | JMAP-01 |
 | [IMAP-15](IMAP-15.md) | аудит доступа к ящику в IMAP | imap | A | imap-06 | todo | CTR-35,IMAP-07 |
 | [ADM-10](ADM-10.md) | Admin API: контакты, группы, оргструктура, отключённые ящики, аудит | admin | A | admin-05 | todo | CTR-35,ADM-07 |
 | [APP-12](APP-12.md) | сборка: соответствие Exchange и doctor автонастройки | app | A | app-08 | todo | META-33,AUTH-10,MS-17,SMTP-27,JMAP-18,IMAP-15,ADM-10 |
@@ -378,7 +378,7 @@
 | [IMAP-17](IMAP-17.md) | IDLE — полная сверка по `Resync` | imap | A | imap-08 | done | CLU-13 |
 | [JMAP-21](JMAP-21.md) | push — изменение всех типов по `Resync` | jmap | A | jmap-12 | done | CLU-13 |
 | [SYS-11](SYS-11.md) | проба Landlock без `/sys/kernel/security` | sys | A | sys-06 | done | SYS-07 |
-| [PLT-21](PLT-21.md) | doctor — проба Landlock; подпись метрики отставания шины | platform | A | platform-11 | ready | SYS-11,CLU-13 |
+| [PLT-21](PLT-21.md) | doctor — проба Landlock; подпись метрики отставания шины | platform | A | platform-11 | done | SYS-11,CLU-13 |
 | [APP-17](APP-17.md) | подключение журнала доставки, групп, обучения антиспама и защиты от перебора | app | A | app-16 | done | SMTP-16,SMTP-17,SMTP-18,AUTH-08,APP-16 |
 | [APP-18](APP-18.md) | подключение транспорта организации и Rpc узла | app | A | app-17 | ready | SMTP-29,CLU-12,APP-15 |
 | [META-41](META-41.md) | слушатель сигналов и миграции при списке адресов СУБД | meta | A | meta-25 | ready | META-38 |
@@ -396,27 +396,31 @@
 | [CTR-42](CTR-42.md) | хранилище отправок JMAP (отложенная отправка и отмена) | contracts | B | contracts-30 | ready | CTR-28 |
 | [META-42](META-42.md) | системные папки — только по роли, суффикс при совпадении имени | meta | A | meta-26 | done | CMP-05 |
 | [KIT-08](KIT-08.md) | фейк ящика — системные папки только по роли | testkit | A | testkit-05 | done | KIT-07 |
-| [AUTH-11](AUTH-11.md) | `auth.abuse.fail_closed` | auth | A | auth-06 | ready | AUTH-08 |
+| [AUTH-11](AUTH-11.md) | `auth.abuse.fail_closed` | auth | A | auth-06 | done | AUTH-08 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-10 | done | CLU-09 |
 
 ## Ф1 · Решения 2026-11-11: шарды, токен администратора, цепочка поставки, отчёты этапа 2 (`docs/decisions/2026-11-11-contracts-ci-defaults.md`, `2026-11-11-stage2-followups.md`)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [DEPS-01](DEPS-01.md) | обновить calamine и libsqlite3-sys, сократить пропуски cargo audit | deps | B | deps-01 | ready | CI-03 |
-| [DEPS-02](DEPS-02.md) | mail-auth ≥ 0.14 и mail-send 0.7 — без zip 8 | deps | B | deps-02 | todo | DEPS-01 |
-| [DEPS-03](DEPS-03.md) | зависимость cms для подписи профиля .mobileconfig | deps | B | deps-03 | todo | JMAP-14 |
-| [JMAP-22](JMAP-22.md) | подпись профиля .mobileconfig сертификатом сервера | jmap | A | jmap-15 | todo | JMAP-14,DEPS-03 |
-| [ADM-12](ADM-12.md) | постраничный список учётных записей в Admin API | admin | A | admin-07 | ready | ADM-11 |
-| [APP-20](APP-20.md) | fail_closed защиты от перебора в узле, устаревший TODO doctor | app | A | app-19 | todo | AUTH-11,APP-08 |
-| [APP-21](APP-21.md) | CLI thepost admin на структурах tp-admin | app | A | app-20 | todo | APP-11 |
-| [CTR-44](CTR-44.md) | AccountStore::list — постраничный список учётных записей | contracts | B | contracts-32 | todo | ADM-12 |
-| [ADM-13](ADM-13.md) | Serialize и Deserialize у структур Admin API | admin | A | admin-08 | todo | ADM-12 |
+| [DEPS-01](DEPS-01.md) | обновить calamine и libsqlite3-sys, сократить пропуски cargo audit | deps | B | deps-01 | done | CI-03 |
+| [DEPS-02](DEPS-02.md) | mail-auth ≥ 0.14 и mail-send 0.7 — без zip 8 | deps | B | deps-02 | done | DEPS-01 |
+| [DEPS-03](DEPS-03.md) | зависимость cms для подписи профиля .mobileconfig | deps | B | deps-03 | done | JMAP-14 |
+| [JMAP-22](JMAP-22.md) | подпись профиля .mobileconfig сертификатом сервера | jmap | A | jmap-15 | done | JMAP-14,DEPS-03 |
+| [ADM-12](ADM-12.md) | постраничный список учётных записей в Admin API | admin | A | admin-07 | done | ADM-11 |
+| [APP-20](APP-20.md) | fail_closed защиты от перебора в узле, устаревший TODO doctor | app | A | app-19 | done | AUTH-11,APP-08 |
+| [APP-21](APP-21.md) | CLI thepost admin на структурах tp-admin | app | A | app-20 | done | APP-11 |
+| [CTR-44](CTR-44.md) | AccountStore::list — постраничный список учётных записей | contracts | B | contracts-32 | ready | ADM-12 |
+| [ADM-13](ADM-13.md) | Serialize и Deserialize у структур Admin API | admin | A | admin-08 | ready | ADM-12 |
 | [APP-22](APP-22.md) | CLI thepost admin без копий структур | app | A | app-21 | todo | ADM-13,APP-21 |
-| [PLT-23](PLT-23.md) | текущая цепочка и ключ TLS для подписи | platform | A | platform-13 | todo | PLT-22 |
+| [PLT-23](PLT-23.md) | текущая цепочка и ключ TLS для подписи | platform | A | platform-13 | ready | PLT-22 |
 | [APP-23](APP-23.md) | подпись профиля .mobileconfig в узле | app | A | app-22 | todo | PLT-23,JMAP-22 |
-| [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | todo | SMTP-20 |
-| [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | todo | CTR-31,SMTP-22 |
+| [DEP-12](DEP-12.md) | стенд SMB — учётные записи через thepost admin и наполнение по Д.3 | deploy | A | deploy-12 | ready | DEP-04,APP-21 |
+| [DEP-13](DEP-13.md) | стенд SMB — замеры и отчёт по критериям Д.7 | deploy | A | deploy-12 | ready | DEP-12 |
+| [DEP-14](DEP-14.md) | стенд SMB — стресс, ×3, отказы и длительный прогон | deploy | A | deploy-12 | ready | DEP-13 |
+| [DEP-15](DEP-15.md) | резервное копирование SMB — pgBackRest и копия каталога писем | deploy | A | deploy-13 | ready | DEP-05 |
+| [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | done | SMTP-20 |
+| [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | ready | CTR-31,SMTP-22 |
 | [META-44](META-44.md) | очередь модерации без группы в PostgreSQL | meta | B | meta-28 | todo | CTR-43 |
 | [SMTP-30](SMTP-30.md) | исход Moderate правил потока — в очередь модерации | smtp | A | smtp-11 | todo | CTR-43,SMTP-22 |
 
