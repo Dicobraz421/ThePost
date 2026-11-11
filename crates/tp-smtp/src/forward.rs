@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use mail_auth::arc::ArcSealer;
-use mail_auth::common::crypto::DkimKey;
-use mail_auth::dkim::Done;
+use mail_auth::crypto::DkimKey;
+use mail_auth::signer::Ready;
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
 
@@ -22,7 +22,7 @@ use crate::dkim_sign::parse_key;
 use crate::srs::Srs;
 
 /// ARC-подпись узла.
-pub type Sealer = ArcSealer<DkimKey, Done>;
+pub type Sealer = ArcSealer<DkimKey, Ready>;
 
 #[derive(Default)]
 struct Cache {

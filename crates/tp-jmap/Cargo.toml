@@ -16,6 +16,7 @@ tp-mailstore.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
+cms.workspace = true
 futures.workspace = true
 mail-builder.workspace = true
 mail-parser = { workspace = true, features = ["full_encoding"] }
@@ -27,6 +28,7 @@ thiserror.workspace = true
 time = { workspace = true, features = ["formatting", "parsing"] }
 tokio.workspace = true
 tracing.workspace = true
+x509-cert.workspace = true
 
 [dev-dependencies]
 tp-testkit.workspace = true
