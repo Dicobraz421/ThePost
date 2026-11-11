@@ -70,7 +70,9 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
 CTR-25: раздел журнала событий — `Partition { shard, index }`; разделы перечисляются по всем шардам справочника.
 `ModSeq` выдаётся из одного счётчика учётной записи: монотонен в папке (CONDSTORE) и в учётной записи (состояние JMAP).
 - `AccountStore`: `get`, `by_login`, `by_external_id` (идентификатор каталога, точное совпадение; CTR-32 — синхронизация каталога
-  сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
+  сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; по умолчанию — `Internal`),
+  `list(tenant, prefix, after, limit)` (CTR-44, список Admin API: по возрастанию `lower(login)` в порядке сравнения строк хранилища,
+  префикс и курсор `after` — в нижнем регистре, строго больше; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
   `delete` папки с вложенными без `cascade` — `Conflict`: решение («удалить вместе с вложенными?») принимает пользователь
   в клиенте, клиент повторяет вызов с `cascade = true`; письма всего поддерева — в корзину.
@@ -549,3 +551,7 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   AUTH-07 (`tp-auth`) на сопоставление по `external_id` — волна полосы auth.
 - 2026-11-11 — CTR-33 (x/contracts-21, решение 2026-11-01-trash-purge, отчёт imap-05): перенос в корзину (`MessageStore::to_trash`,
   `MailStore::delete_to_trash`, удаление папки с письмами) снимает `\Deleted`. Реализации — `PgMeta` (`relocate`), `MemMetadata`.
+- 2026-11-11 — CTR-44 (x/contracts-32, решение 2026-11-11-stage2-followups п. 14): `AccountStore::list(tenant, prefix, after, limit)`
+  (метод по умолчанию — `Internal`). Реализации — `PgMeta` (курсор по индексу `accounts_login (tenant_id, lower(login))`, порядок — правило
+  сортировки базы по умолчанию), `MemMetadata` (побайтно); набор `suite::account_list`. `tp-admin`: список учётных записей — через
+  `AccountStore::list`; временный трейт `AccountList` и `Admin::with_account_list` (ADM-12) удалены.

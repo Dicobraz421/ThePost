@@ -13,8 +13,7 @@
 //!
 //! Записи политик и доменов в контрактах пока нет: [`PolicyStore`] и [`DomainStore`] — временные трейты полосы
 //! (как `AppPasswordStore` в AUTH-02 до CTR-22). `PolicyStore` повторяет `PgMeta::policy`/`set_policy`.
-//! Перечисления учётных записей в `AccountStore` тоже нет: [`AccountList`] — временный трейт полосы (ADM-12),
-//! подключается [`Admin::with_account_list`]; без него список без `login` отвечает 503, поиск по `login` работает.
+//! Список учётных записей — `AccountStore::list` (CTR-44).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,21 +58,6 @@ pub trait PolicyStore: Send + Sync + 'static {
         target: PolicyTarget,
         policy: &Policy,
     ) -> Result<()>;
-}
-
-/// Перечисление учётных записей организации (временный трейт до контракта; предлагаемый метод
-/// `AccountStore::list` — в отчёте ADM-12).
-#[async_trait]
-pub trait AccountList: Send + Sync + 'static {
-    /// Учётные записи организации по возрастанию имени входа в нижнем регистре: имя входа начинается с `prefix`
-    /// (нижний регистр; пусто — все), строго больше `after` (нижний регистр; `None` — с начала), не более `limit`.
-    async fn list(
-        &self,
-        tenant: TenantId,
-        prefix: &str,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<Account>>;
 }
 
 /// Почтовый домен организации.
@@ -507,14 +491,13 @@ async fn put_domain_policy(
 
 /// Учётные записи. С `login` — поиск: список из одной записи или пустой. Без `login` — страница по возрастанию
 /// имени входа (фильтр `prefix`); есть продолжение — заголовок `Link: <…&after=…>; rel="next"` (RFC 8288), нет
-/// заголовка — страница последняя. `login` вместе с параметрами списка — 400; перечисление учётных записей не
-/// подключено — 503.
+/// заголовка — страница последняя. `login` вместе с параметрами списка — 400.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/accounts", tag = "accounts",
     params(("org" = String, Path, description = "Организация (UUID)"), AccountQuery),
     responses(
         (status = 200, body = Vec<AccountInfo>, headers(("Link" = String,
             description = "Следующая страница списка: `<ссылка>; rel=\"next\"`; нет — страница последняя"))),
-        (status = 400, body = Problem), (status = 403, body = Problem), (status = 503, body = Problem)))]
+        (status = 400, body = Problem), (status = 403, body = Problem)))]
 async fn list_accounts(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
@@ -534,7 +517,6 @@ async fn list_accounts(
         }
         return Ok((headers, Json(out)));
     }
-    let list = a.account_list.as_deref().ok_or(Error::UNAVAILABLE)?;
     let limit = a.cfg.page(q.limit);
     let prefix = q
         .prefix
@@ -544,9 +526,10 @@ async fn list_accounts(
         .to_lowercase();
     let after = q.after.as_deref().map(str::to_lowercase);
     // На одну запись больше: продолжение есть, только если после страницы записи действительно есть.
-    let mut page = list
-        .list(org, &prefix, after.as_deref(), limit.saturating_add(1))
-        .await?;
+    let mut page =
+        a.d.accounts
+            .list(org, &prefix, after.as_deref(), limit.saturating_add(1))
+            .await?;
     if page.len() > limit {
         page.truncate(limit);
         if let Some(last) = page.last() {
@@ -1126,28 +1109,6 @@ mod tests {
         assert_eq!(s, StatusCode::FORBIDDEN);
         let (s, _, _) = env.call("GET", &other, Some("root"), None).await;
         assert_eq!(s, StatusCode::OK);
-    }
-
-    /// Перечисление не подключено: список — 503, поиск по `login` работает.
-    #[tokio::test]
-    async fn account_list_unavailable() {
-        let env = Env::without_account_list();
-        env.account("a@example.org").await;
-        let base = format!("{}/accounts", org());
-        let (s, _, _) = env.call("GET", &base, Some("org"), None).await;
-        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-        let (s, _, b) = env
-            .call(
-                "GET",
-                &format!("{base}?login=a@example.org"),
-                Some("org"),
-                None,
-            )
-            .await;
-        assert_eq!(
-            (s, logins(&b)),
-            (StatusCode::OK, vec!["a@example.org".to_owned()])
-        );
     }
 
     #[test]

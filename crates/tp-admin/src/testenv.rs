@@ -15,9 +15,7 @@ use tp_contracts::auth::Principal;
 use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
-use tp_contracts::meta::{
-    Account, AccountScope, AccountStore, AccountUpsert, Flags, Policy, QuotaUsage, SpecialUse,
-};
+use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, Policy, SpecialUse};
 use tp_contracts::{AccountId, DomainId, Error, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
@@ -25,7 +23,7 @@ use tp_testkit::{
     MemTrash, PolicyLevel, SystemClock,
 };
 
-use crate::accounts::{AccountList, Domain, DomainStore, PolicyStore, PolicyTarget};
+use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
 use crate::audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink};
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 
@@ -151,80 +149,9 @@ impl DomainStore for MemDomains {
     }
 }
 
-/// Учётные записи [`MemMetadata`] с перечислением ([`AccountList`]): запоминает созданные через `upsert`.
-#[derive(Debug, Clone)]
-pub struct MemAccounts {
-    meta: MemMetadata,
-    known: Arc<Mutex<BTreeSet<(TenantId, AccountId)>>>,
-}
-
-impl MemAccounts {
-    pub fn new(meta: &MemMetadata) -> Self {
-        Self {
-            meta: meta.clone(),
-            known: Arc::default(),
-        }
-    }
-}
-
-#[async_trait]
-impl AccountStore for MemAccounts {
-    async fn get(&self, tenant: TenantId, id: AccountId) -> Result<Option<Account>> {
-        self.meta.get(tenant, id).await
-    }
-
-    async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
-        self.meta.by_login(tenant, login).await
-    }
-
-    async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>> {
-        self.meta.by_external_id(tenant, external_id).await
-    }
-
-    async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account> {
-        let acc = self.meta.upsert(tenant, data).await?;
-        lock(&self.known).insert((tenant, acc.id));
-        Ok(acc)
-    }
-
-    async fn quota(&self, tenant: TenantId, id: AccountId) -> Result<QuotaUsage> {
-        self.meta.quota(tenant, id).await
-    }
-}
-
-#[async_trait]
-impl AccountList for MemAccounts {
-    async fn list(
-        &self,
-        tenant: TenantId,
-        prefix: &str,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<Account>> {
-        let ids: Vec<AccountId> = lock(&self.known)
-            .iter()
-            .filter(|(t, _)| *t == tenant)
-            .map(|(_, id)| *id)
-            .collect();
-        let mut out = Vec::new();
-        for id in ids {
-            if let Some(acc) = self.meta.get(tenant, id).await? {
-                let l = acc.login.to_lowercase();
-                if l.starts_with(prefix) && after.is_none_or(|a| l.as_str() > a) {
-                    out.push(acc);
-                }
-            }
-        }
-        out.sort_by_key(|a| a.login.to_lowercase());
-        out.truncate(limit);
-        Ok(out)
-    }
-}
-
 /// Хранилища в памяти: метаданные, квоты, почтовое хранилище.
 pub struct Stores {
     pub meta: MemMetadata,
-    pub accounts: MemAccounts,
     pub quota: MemQuota,
     pub store: tp_mailstore::Store,
     pub passwords: MemAppPasswords,
@@ -255,7 +182,6 @@ impl Stores {
         });
         let passwords = MemAppPasswords::new(&meta);
         Self {
-            accounts: MemAccounts::new(&meta),
             meta,
             quota,
             store,
@@ -287,7 +213,7 @@ impl Stores {
             groups: Arc::new(self.groups.clone()),
             moderation: Arc::new(self.moderation.clone()),
             modules: Vec::new(),
-            accounts: Arc::new(self.accounts.clone()),
+            accounts: Arc::new(self.meta.clone()),
             quota: Arc::new(self.quota.clone()),
             policies: Arc::new(self.policies.clone()),
             resolver: Arc::new(self.policies.clone()),
@@ -314,7 +240,6 @@ pub struct Env {
     pub delivery: MemDeliveryLog,
     pub moderation: MemModeration,
     pub meta: MemMetadata,
-    pub accounts: MemAccounts,
     pub quota: MemQuota,
     pub store: tp_mailstore::Store,
     pub policies: MemPolicies,
@@ -377,21 +302,16 @@ impl Env {
 
     /// Без настроек транспорта (маршруты транспорта — 503).
     pub fn without_transport() -> Self {
-        Self::build(config(), Vec::new(), false, true, true)
+        Self::build(config(), Vec::new(), false, true)
     }
 
     /// Без локального входа (`admin init` и обмен — 503).
     pub fn without_local() -> Self {
-        Self::build(config(), Vec::new(), true, false, true)
-    }
-
-    /// Без перечисления учётных записей (список без `login` — 503).
-    pub fn without_account_list() -> Self {
-        Self::build(config(), Vec::new(), true, true, false)
+        Self::build(config(), Vec::new(), true, false)
     }
 
     pub fn with(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>) -> Self {
-        Self::build(cfg, modules, true, true, true)
+        Self::build(cfg, modules, true, true)
     }
 
     fn build(
@@ -399,7 +319,6 @@ impl Env {
         modules: Vec<Arc<dyn AdminRoutes>>,
         with_transport: bool,
         with_local: bool,
-        with_account_list: bool,
     ) -> Self {
         let auth = FakeAuthenticator::default();
         let other_tenant = TenantId::new();
@@ -435,16 +354,10 @@ impl Env {
         } else {
             admin
         };
-        let admin = if with_account_list {
-            admin.with_account_list(Arc::new(stores.accounts.clone()))
-        } else {
-            admin
-        };
         let admin = Arc::new(admin);
         let app_passwords = stores.app_passwords();
         let Stores {
             meta,
-            accounts,
             quota,
             store,
             groups,
@@ -461,7 +374,6 @@ impl Env {
             delivery,
             moderation,
             meta,
-            accounts,
             quota,
             store,
             policies,
@@ -483,7 +395,7 @@ impl Env {
     /// Учётная запись организации `tenant` (новый домен, без каталога).
     pub async fn account_in(&self, tenant: TenantId, login: &str) -> AccountScope {
         let acc = self
-            .accounts
+            .meta
             .upsert(
                 tenant,
                 AccountUpsert {

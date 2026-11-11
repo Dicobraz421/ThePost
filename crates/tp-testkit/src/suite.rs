@@ -45,7 +45,7 @@ use tp_contracts::groups::{
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    AccountScope, AccountStore, AccountUpsert, MailboxStore, MessageQuery, MessageStore,
+    Account, AccountScope, AccountStore, AccountUpsert, MailboxStore, MessageQuery, MessageStore,
     NewMailbox, NewMessage, PolicyResolver, SpecialUse,
 };
 use tp_contracts::queue::{
@@ -2232,6 +2232,114 @@ pub async fn account_external_id(
         groups.expand(fx.tenant, group.id).await.expect("expand"),
         vec![a.id]
     );
+}
+
+// ---------- AccountStore: list ----------
+
+/// Данные набора [`account_list`]: организация `tenant` без учётных записей и её домен (`domain_name` — имя для
+/// адресов входа), другая организация `foreign_tenant` и её домен.
+#[derive(Debug, Clone)]
+pub struct AccountListFixture {
+    /// Организация без учётных записей.
+    pub tenant: TenantId,
+    /// Домен организации.
+    pub domain: DomainId,
+    /// Имя домена.
+    pub domain_name: String,
+    /// Другая организация.
+    pub foreign_tenant: TenantId,
+    /// Домен другой организации.
+    pub foreign_domain: DomainId,
+}
+
+/// Набор проверок `AccountStore::list` (CTR-44): порядок по имени входа в нижнем регистре, страницы и курсор
+/// `after` (строго больше, в том числе несуществующего имени), префикс, регистр, `limit = 0`, изоляция организаций.
+/// Имена входа различаются в первых буквах — порядок одинаков побайтно и по правилам сортировки базы.
+pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) {
+    let login = |n: &str| format!("{n}@{}", fx.domain_name);
+    let lower = |n: &str| login(n).to_lowercase();
+    let list = |tenant: TenantId, prefix: &'static str, after: Option<String>, limit: usize| async move {
+        accounts
+            .list(tenant, prefix, after.as_deref(), limit)
+            .await
+            .expect("list")
+    };
+    assert_eq!(list(fx.tenant, "", None, 10).await, Vec::new());
+
+    let mut created = std::collections::BTreeMap::new();
+    for n in ["boris", "Anton", "dina", "anna", "BELLA"] {
+        let acc = accounts
+            .upsert(
+                fx.tenant,
+                AccountUpsert {
+                    domain: fx.domain,
+                    login: login(n),
+                    display_name: n.into(),
+                    external_id: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("upsert");
+        created.insert(n, acc);
+    }
+    let foreign = accounts
+        .upsert(
+            fx.foreign_tenant,
+            AccountUpsert {
+                domain: fx.foreign_domain,
+                login: login("aaron"),
+                display_name: "aaron".into(),
+                external_id: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("upsert foreign");
+    let accs =
+        |names: &[&str]| -> Vec<Account> { names.iter().map(|n| created[n].clone()).collect() };
+
+    // Весь список: по возрастанию имени в нижнем регистре, без чужой организации.
+    assert_eq!(
+        list(fx.tenant, "", None, 10).await,
+        accs(&["anna", "Anton", "BELLA", "boris", "dina"])
+    );
+    // Страницы по курсору последней записи; после последней — пусто.
+    assert_eq!(list(fx.tenant, "", None, 2).await, accs(&["anna", "Anton"]));
+    assert_eq!(
+        list(fx.tenant, "", Some(lower("Anton")), 2).await,
+        accs(&["BELLA", "boris"])
+    );
+    assert_eq!(
+        list(fx.tenant, "", Some(lower("boris")), 2).await,
+        accs(&["dina"])
+    );
+    assert_eq!(
+        list(fx.tenant, "", Some(lower("dina")), 2).await,
+        Vec::new()
+    );
+    // Курсор — не обязательно существующее имя; строго больше.
+    assert_eq!(
+        list(fx.tenant, "", Some("b".into()), 10).await,
+        accs(&["BELLA", "boris", "dina"])
+    );
+    // Префикс в нижнем регистре находит имена в любом регистре; с курсором.
+    assert_eq!(
+        list(fx.tenant, "b", None, 10).await,
+        accs(&["BELLA", "boris"])
+    );
+    assert_eq!(
+        list(fx.tenant, "an", None, 10).await,
+        accs(&["anna", "Anton"])
+    );
+    assert_eq!(
+        list(fx.tenant, "an", Some(lower("anna")), 10).await,
+        accs(&["Anton"])
+    );
+    assert_eq!(list(fx.tenant, "x", None, 10).await, Vec::new());
+    assert_eq!(list(fx.tenant, "", None, 0).await, Vec::new());
+    // Другая организация видит только своё.
+    assert_eq!(list(fx.foreign_tenant, "", None, 10).await, vec![foreign]);
 }
 
 // ---------- Moderation ----------

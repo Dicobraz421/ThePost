@@ -177,6 +177,46 @@ impl AccountStore for PgMeta {
         .await
     }
 
+    /// Курсор по индексу `accounts_login (tenant_id, lower(login))`: порядок — сравнение строк базы
+    /// (правило сортировки по умолчанию), префикс — `starts_with` (побайтно).
+    async fn list(
+        &self,
+        tenant: TenantId,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Account>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let rows: Vec<AccountRow> = match after {
+                None => sqlx::query_as(
+                    "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+                 FROM accounts WHERE tenant_id = $1 AND starts_with(lower(login), $2)
+                 ORDER BY lower(login) LIMIT $3",
+                )
+                .bind(tenant.as_uuid())
+                .bind(prefix)
+                .bind(limit),
+                Some(after) => sqlx::query_as(
+                    "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+                 FROM accounts WHERE tenant_id = $1 AND starts_with(lower(login), $2) AND lower(login) > $4
+                 ORDER BY lower(login) LIMIT $3",
+                )
+                .bind(tenant.as_uuid())
+                .bind(prefix)
+                .bind(limit)
+                .bind(after),
+            }
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(rows.into_iter().map(Account::from).collect())
+        })
+        .await
+    }
+
     async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account> {
         // Параллельное создание той же учётной записи: проигравший повторяет как обновление.
         match self.upsert_once(tenant, &data).await {
