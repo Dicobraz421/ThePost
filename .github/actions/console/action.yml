@@ -40,7 +40,7 @@ runs:
     - if: steps.has.outputs.yes == 'true'
       shell: bash
       working-directory: console
-      run: npm ci --no-fund
+      run: npm ci --no-fund --no-audit
     - if: steps.has.outputs.yes == 'true' && inputs.checks == 'true'
       name: Типы, линтер, vitest
       shell: bash
