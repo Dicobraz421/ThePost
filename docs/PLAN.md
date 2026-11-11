@@ -12,7 +12,7 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 133/164 | 202/244 | в работе, 83 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 138/164 | 207/244 | в работе, 85 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
 | Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 0/0 | 0/0 | карточки — после Ф1 | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/0 | 0/0 | карточки — после Ф1 | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
@@ -336,12 +336,12 @@
 | ✅ admin-07 | ADM-12 | A | admin-06 | 3 |
 | ✅ app-19 | APP-20 | A | auth-06, app-04 | 2 |
 | ✅ app-20 | APP-21 | A | app-07, app-19 | 2 |
-| contracts-32 (ветка `x/contracts-32`) | CTR-44 | B | admin-07 | 1 |
+| ✅ contracts-32 (ветка `x/contracts-32`) | CTR-44 | B | admin-07 | 1 |
 | meta-29 (ветка `x/meta-29`) | META-45 | B | contracts-32 | 3 |
-| admin-08 | ADM-13 | A | admin-07 | 3 |
-| app-21 | APP-22 | A | admin-08, app-20 | 2 |
-| platform-13 | PLT-23 | A | platform-12 | 2 |
-| app-22 | APP-23 | A | platform-13, jmap-15 | 2 |
+| ✅ admin-08 | ADM-13 | A | admin-07 | 3 |
+| ✅ app-21 | APP-22 | A | admin-08, app-20 | 2 |
+| ✅ platform-13 | PLT-23 | A | platform-12 | 2 |
+| ✅ app-22 | APP-23 | A | platform-13, jmap-15 | 2 |
 | deploy-12 | DEP-12, DEP-13, DEP-14 | A | deploy-02, app-20 | 4 |
 | deploy-13 | DEP-15 | A | deploy-02 | 4 |
 | ✅ platform-12 | PLT-22 | A | smtp-06 | 2 |
