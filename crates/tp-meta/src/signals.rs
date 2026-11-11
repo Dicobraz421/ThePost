@@ -974,18 +974,19 @@ async fn run_listener(
     }
 }
 
-/// Пул прямого соединения слушателя сигналов: мимо PgBouncer (с [`PoolConfig::pgbouncer`] — адрес
-/// [`PoolConfig::direct_url`], обязателен), с поиском primary по `url` + `urls` и учётными данными узла.
+/// Пул прямого соединения слушателя сигналов с учётными данными узла: мимо PgBouncer (с [`PoolConfig::pgbouncer`]
+/// — поиск primary по прямым адресам [`PoolConfig::direct_url`] + [`PoolConfig::direct_urls`], хотя бы один
+/// обязателен), без PgBouncer — поиск primary по `url` + `urls`.
 pub async fn connect_listener(cfg: &PoolConfig, secrets: Arc<dyn SecretStore>) -> Result<Failover> {
     let mut c = cfg.clone();
     if cfg.pgbouncer {
-        let Some(direct) = &cfg.direct_url else {
+        let Some(mut direct) = cfg.direct_addresses() else {
             return Err(Error::invalid(
-                "database.direct_url обязателен с pgbouncer: слушатель сигналов подключается мимо PgBouncer",
+                "database.direct_url или direct_urls обязательны с pgbouncer: слушатель сигналов подключается мимо PgBouncer",
             ));
         };
-        c.url = direct.clone();
-        c.urls.clear();
+        c.url = direct.remove(0);
+        c.urls = direct;
         c.pgbouncer = false;
     }
     // Соединение слушателя (занято, сроки пула к нему не применяются) и проверка primary при переподключении;

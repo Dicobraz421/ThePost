@@ -254,6 +254,8 @@ impl ShardDirectory {
             password: rec.shard.credentials,
             dynamic_credentials: None,
             direct_url: None,
+            direct_urls: Vec::new(),
+            read_replica: None,
             owner: None,
             pgbouncer: false,
             ..self.cfg.clone()
