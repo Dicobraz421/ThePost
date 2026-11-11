@@ -224,8 +224,17 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         secrets: store.clone(),
         ext: &ext,
         metrics: &metrics,
+        node: node.clone(),
     })
     .await?;
+    // Блокировки перебора других узлов — по сигналам шины (AUTH-08).
+    let (abuse, abuse_bus, abuse_stop) = (services.abuse.clone(), bus.clone(), aux.clone());
+    tokio::spawn(async move {
+        tokio::select! {
+            () = abuse_stop.cancelled() => {}
+            () = abuse.listen(abuse_bus) => {}
+        }
+    });
     // Ротация ключей DKIM без перезапуска (SMTP-08).
     tokio::spawn(apply_dkim(
         reloader.subscribe(),
@@ -284,7 +293,12 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         leases,
         holder,
         events: events.clone(),
-        sinks: ext.event_sinks().to_vec(),
+        sinks: ext
+            .event_sinks()
+            .iter()
+            .cloned()
+            .chain(services.spam_learner(&*cfg.section::<SmtpConfig>(sections::SMTP)?)?)
+            .collect(),
         events_poll: cluster.events_poll_interval,
         gc: blob_cfg.gc.clone(),
         orphans: blob_cfg.orphans.clone(),
