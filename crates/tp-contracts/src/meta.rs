@@ -374,8 +374,8 @@ pub struct Message {
 /// Результат вставки, копирования, переноса.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inserted {
-    /// Идентификатор письма в папке назначения: новый у `insert`, `copy`, `move_to`;
-    /// у `restore` — прежний (корзина сохраняет `MessageId`).
+    /// Идентификатор письма в папке назначения: новый у `insert`, `copy`;
+    /// у `move_to` и `restore` — прежний (перенос и корзина сохраняют `MessageId`, CTR-29).
     pub id: MessageId,
     /// Новый UID в папке назначения.
     pub uid: Uid,
@@ -458,7 +458,9 @@ pub trait MessageStore: Send + Sync + 'static {
         to: MailboxId,
     ) -> Result<Vec<Inserted>>;
 
-    /// Переносит письма в папку (новые `MessageId` и `Uid`, исходные удаляются).
+    /// Переносит письма в папку: `MessageId` сохраняется (JMAP: id письма неизменен, RFC 8621), меняются папка,
+    /// UID и `ModSeq`; ссылки на объекты не меняются (CTR-29). Результат — в порядке первого появления в `ids`;
+    /// нет письма — `Error::NotFound`. Событие ядра — `Moved { from_message: id, message: id, .. }`.
     async fn move_to(
         &self,
         scope: AccountScope,

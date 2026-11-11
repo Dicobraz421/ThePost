@@ -1,7 +1,7 @@
 //! In-memory метаданные: учётные записи, папки, письма, журнал изменений (CONTRACTS.md#Metadata, #ChangeLog).
 //!
 //! Семантика — как у `tp-meta`: один счётчик `ModSeq` на учётную запись, UID из `uid_next` папки;
-//! `to_trash` и `restore` сохраняют `MessageId` (меняются папка и UID), `copy` и `move_to` создают новые.
+//! `move_to`, `to_trash` и `restore` сохраняют `MessageId` (меняются папка и UID; CTR-29), `copy` создаёт новые.
 //! Изменяющая операция сначала проверяет все условия, затем меняет состояние под одной блокировкой:
 //! журнал изменений, события ядра ([`MemEventLog`]) и ссылки на объекты ([`MemBlobIndex`], если подключён)
 //! меняются вместе с данными. Скрытые письма корзины (`TrashStore::purge`, `hide`) лежат отдельно от писем
@@ -1249,26 +1249,27 @@ impl MessageStore for MemMetadata {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Тот же `MessageId`, новый UID (CTR-29); ссылки на объекты не меняются.
         self.with_account(scope, |acc, fx| {
             let src = acc.require_all(ids)?;
             acc.check_uids(to, src.len())?;
             let ms = acc.bump();
-            let inserted = acc.clone_into(ms, &src, to)?;
-            // Ссылки на объекты переходят к новым письмам; исходные удаляются.
-            let mut boxes = Vec::new();
-            for (old, new) in src.iter().zip(&inserted) {
-                let removed = acc.remove(ms, *old).ok_or(Error::Conflict)?;
-                boxes.push(removed.mailbox);
+            let mut inserted = Vec::with_capacity(src.len());
+            for (message, from_mailbox, uid) in acc.relocate(ms, &src, to, None)? {
                 fx.events.push((
                     Some(to),
                     CoreEventKind::Moved {
-                        from_message: *old,
-                        from_mailbox: removed.mailbox,
-                        message: new.id,
+                        from_message: message,
+                        from_mailbox,
+                        message,
                     },
                 ));
+                inserted.push(Inserted {
+                    id: message,
+                    uid,
+                    modseq: ms,
+                });
             }
-            acc.touch(ms, boxes);
             Ok(inserted)
         })
     }
@@ -1885,18 +1886,26 @@ mod tests {
         let in_work = meta.status(scope, work).await.expect("ok");
         assert_eq!(in_work.highest_modseq, copied[0].modseq);
 
+        // Перенос сохраняет MessageId (CTR-29): меняются папка и UID, ссылки на объекты прежние.
         let moved = meta.move_to(scope, &[a.id], work).await.expect("ok");
+        assert_eq!(moved[0].id, a.id);
         assert!(moved[0].modseq > copied[0].modseq);
-        assert!(
-            MessageStore::get(&meta, scope, a.id)
-                .await
-                .expect("ok")
-                .is_none()
-        );
+        let got = MessageStore::get(&meta, scope, a.id)
+            .await
+            .expect("ok")
+            .expect("moved");
+        assert_eq!((got.mailbox, got.uid), (work, moved[0].uid));
         assert_eq!(meta.status(scope, inbox).await.expect("ok").messages, 0);
         assert!(meta.status(scope, inbox).await.expect("ok").highest_modseq == moved[0].modseq);
         assert_eq!(
-            meta.move_to(scope, &[a.id], work).await,
+            blobs
+                .row(TenantId::DEFAULT, &key(1).hash)
+                .expect("ok")
+                .refcnt,
+            2
+        );
+        assert_eq!(
+            meta.move_to(scope, &[MessageId::new()], work).await,
             Err(Error::NotFound)
         );
 

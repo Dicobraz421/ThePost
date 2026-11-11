@@ -1127,7 +1127,9 @@ mod tests {
                 "Email/changes",
             )
             .await;
-        assert_eq!(c["destroyed"], json!([b.to_string()]));
+        // Перенос сохраняет id (CTR-29): письмо изменено, не удалено.
+        assert_eq!(c["updated"], json!([b.to_string()]));
+        assert_eq!(c["destroyed"], json!([]));
         let r = env
             .calls(json!([["Thread/changes", {"accountId": acc, "sinceState": s2}, "x"]]))
             .await;

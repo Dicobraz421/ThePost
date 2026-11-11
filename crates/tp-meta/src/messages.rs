@@ -2,7 +2,7 @@
 //!
 //! Каждая изменяющая операция — одна транзакция: блокировка строки учётной записи и новый `ModSeq`,
 //! изменения строк писем, журнал изменений и события ядра. UID выдаются из `uid_next` строки папки.
-//! `to_trash` и `restore` сохраняют `MessageId` (меняются папка и UID), `copy` и `move_to` создают новые.
+//! `move_to`, `to_trash` и `restore` сохраняют `MessageId` (меняются папка и UID; CTR-29), `copy` создаёт новые.
 //! `insert_batch` — все доставки приёма одной транзакцией (решение 2026-10-31-atomic-delivery).
 //! Ссылки на объекты BLOB: `copy` добавляет, `expunge_final` снимает — в той же транзакции.
 //! Скрытые письма корзины (`hidden_at`, `TrashStore::purge`) пользователю не видны: все операции, кроме
@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::PgMeta;
 use crate::changelog::{self, Change, Op};
-use crate::mailboxes::{self, alloc_uids, by_role, relocate, touch};
+use crate::mailboxes::{self, Relocated, alloc_uids, by_role, relocate, touch};
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
 
 // ---------- Флаги ----------
@@ -760,6 +760,8 @@ impl MessageStore for PgMeta {
         .await
     }
 
+    /// Письма переходят в папку `to` с теми же `MessageId` и новыми UID (CTR-29), как `to_trash`/`restore`;
+    /// ссылки на объекты не меняются. Порядок результата — порядок первого появления в `ids`.
     async fn move_to(
         &self,
         scope: AccountScope,
@@ -772,49 +774,36 @@ impl MessageStore for PgMeta {
             }
             let mut tx = begin(&self.pool, scope.tenant).await?;
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
-            let found = require_all(&mut tx, scope, ids).await?;
-            let src: Vec<Uuid> = found.iter().map(|(id, _)| *id).collect();
-            let inserted = clone_into(&mut tx, scope, ms, &src, to).await?;
-            // Ссылки на объекты переходят к новым письмам; исходные удаляются (части — каскадом).
-            let removed: Vec<(Uuid, Uuid, i64)> = sqlx::query_as(
-            "DELETE FROM messages WHERE tenant_id = $1 AND account_id = $2 AND message_id = ANY($3)
-             RETURNING message_id, mailbox_id, uid",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(&src)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-            let removed: HashMap<Uuid, (MailboxId, Uid)> = removed
+            let src: Vec<Uuid> = require_all(&mut tx, scope, ids)
+                .await?
                 .into_iter()
-                .map(|(id, mb, uid)| Ok((id, (MailboxId::from_uuid(mb), Uid(to_u32(uid)?)))))
-                .collect::<Result<_>>()?;
-            let mut boxes: Vec<Uuid> = found.iter().map(|(_, mb)| *mb).collect();
-            boxes.sort_unstable();
-            boxes.dedup();
-            touch(&mut tx, scope, ms, &boxes).await?;
-            let mut changes = Vec::with_capacity(src.len() + boxes.len());
+                .map(|(id, _)| id)
+                .collect();
+            let moved: HashMap<Uuid, Relocated> = relocate(&mut tx, scope, ms, &src, to, None)
+                .await?
+                .into_iter()
+                .map(|m| (m.id, m))
+                .collect();
+            let mut inserted = Vec::with_capacity(src.len());
             let mut events = Vec::with_capacity(src.len());
-            for (old, new) in src.iter().zip(&inserted) {
-                let (from_mailbox, from_uid) = removed.get(old).copied().ok_or(Error::Conflict)?;
-                changes.push(Change::message(*old, Op::Destroyed, from_mailbox, from_uid));
+            for id in &src {
+                let m = moved.get(id).ok_or(Error::Conflict)?;
+                let message = MessageId::from_uuid(*id);
+                inserted.push(Inserted {
+                    id: message,
+                    uid: m.uid,
+                    modseq: ms,
+                });
                 events.push(changelog::event(
                     scope,
                     Some(to),
                     CoreEventKind::Moved {
-                        from_message: MessageId::from_uuid(*old),
-                        from_mailbox,
-                        message: new.id,
+                        from_message: message,
+                        from_mailbox: m.from,
+                        message,
                     },
                 ));
             }
-            changes.extend(
-                boxes
-                    .iter()
-                    .map(|b| Change::mailbox(MailboxId::from_uuid(*b), Op::Updated)),
-            );
-            changelog::log(&mut tx, scope, ms, &changes).await?;
             changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
             tx.commit().await.map_err(db_err)?;
             self.signal_log([scope.account]).await;

@@ -363,12 +363,14 @@ async fn move_trash_restore_expunge_and_changes() {
         .expect("b");
     let moved = meta.move_to(scope, &[b.id], x).await.expect("move");
     assert_eq!(moved.len(), 1);
-    assert_ne!(moved[0].id, b.id);
+    // Перенос сохраняет MessageId (CTR-29): меняются папка и UID.
+    assert_eq!(moved[0].id, b.id);
     assert_eq!(moved[0].uid, Uid(1));
-    assert_eq!(
-        MessageStore::get(&meta, scope, b.id).await.expect("get"),
-        None
-    );
+    let got = MessageStore::get(&meta, scope, b.id)
+        .await
+        .expect("get")
+        .expect("moved");
+    assert_eq!((got.mailbox, got.uid), (x, Uid(1)));
     let trashed_at = meta.to_trash(scope, &[a.id]).await.expect("trash");
     let in_trash = MessageStore::get(&meta, scope, a.id)
         .await

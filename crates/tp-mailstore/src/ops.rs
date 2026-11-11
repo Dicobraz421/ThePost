@@ -58,11 +58,12 @@ impl Store {
         ids: &[MessageId],
         to: MailboxId,
     ) -> Result<Vec<Inserted>> {
+        // Перенос сохраняет `MessageId` (CTR-29): журнал учётной записи показывает письмо в новой папке,
+        // поэтому исходные папки — до переноса, как у `delete_to_trash`.
+        let sources = self.mailboxes_of(scope, ids).await?;
         let inserted = self.d.messages.move_to(scope, ids, to).await?;
         if let Some(modseq) = inserted.first().map(|i| i.modseq) {
-            // Исходные письма удалены в той же транзакции: журнал хранит их прежние папки.
-            let boxes = self.touched(scope, modseq, inserted.len() * 2).await;
-            self.notify(scope, boxes.into_iter().chain([to]), modseq)
+            self.notify(scope, sources.into_iter().chain([to]), modseq)
                 .await;
         }
         Ok(inserted)
