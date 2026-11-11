@@ -388,6 +388,10 @@ impl AccountData {
             row.message.mailbox = to;
             row.message.uid = uid;
             row.message.modseq = ms;
+            if trash.is_some() {
+                // В корзину — без `\Deleted` (CTR-33).
+                row.message.flags.remove(&Flag::Deleted);
+            }
             self.msg_log.push(MsgLog {
                 modseq: ms,
                 id: *id,
@@ -1919,9 +1923,22 @@ mod tests {
             Err(Error::NotFound)
         );
 
-        // Корзина: тот же MessageId, новый UID и ModSeq.
+        // Корзина: тот же MessageId, новый UID и ModSeq; `\Deleted` снимается, остальные флаги — прежние (CTR-33).
         let m = moved[0].id;
+        meta.set_flags(
+            scope,
+            &[m],
+            FlagOp::Add([Flag::Deleted, Flag::Seen].into()),
+            None,
+        )
+        .await
+        .expect("flags");
         let ms = meta.to_trash(scope, &[m]).await.expect("ok");
+        let in_trash = MessageStore::get(&meta, scope, m)
+            .await
+            .expect("ok")
+            .expect("ok");
+        assert_eq!(in_trash.flags, Flags::from([Flag::Seen]));
         assert!(ms > moved[0].modseq);
         let t = MessageStore::get(&meta, scope, m)
             .await

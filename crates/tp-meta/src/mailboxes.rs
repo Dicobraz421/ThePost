@@ -295,7 +295,8 @@ pub(crate) struct Relocated {
 
 /// Переносит письма `ids` (в этом порядке) в папку `to` с сохранением идентификаторов и новыми UID;
 /// `trash` — перенос в корзину: запомнить исходную папку для восстановления и срок окончательного удаления
-/// (политика папки по цепочке, иначе `trash` — срок по умолчанию конфигурации; CTR-07).
+/// (политика папки по цепочке, иначе `trash` — срок по умолчанию конфигурации; CTR-07) и снять `\Deleted` (CTR-33:
+/// иначе первый же EXPUNGE в корзине стёр бы или скрыл письмо, удалённое из другой папки).
 /// Записывает изменения `Moved` и изменения папок.
 /// Отсутствующие письма пропускаются (в UID папки остаётся пропуск).
 pub(crate) async fn relocate(
@@ -317,6 +318,7 @@ pub(crate) async fn relocate(
               old AS (SELECT m.message_id, m.mailbox_id, m.uid FROM messages m JOIN src ON m.message_id = src.id
                       WHERE m.tenant_id = $1 AND m.account_id = $2)
          UPDATE messages m SET mailbox_id = $4, uid = $5 + src.ord - 1, modseq = $6,
+                               flags = CASE WHEN $7 THEN array_remove(m.flags, $9) ELSE m.flags END,
                                trashed_from = CASE WHEN $7 THEN old.mailbox_id END,
                                trashed_at = CASE WHEN $7 THEN now() END, hidden_at = NULL,
                                trash_expires_at = CASE WHEN $7 THEN now() + coalesce(
@@ -334,6 +336,7 @@ pub(crate) async fn relocate(
     .bind(ms)
     .bind(trash.is_some())
     .bind(trash.map(micros).transpose()?.unwrap_or(0))
+    .bind(r"\Deleted")
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)?;

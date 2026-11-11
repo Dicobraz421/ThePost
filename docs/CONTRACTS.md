@@ -80,7 +80,8 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   `set_flags(ids, FlagOp, unchanged_since) -> FlagsUpdate`, `copy`, `move_to`, `to_trash`, `restore`, `expunge_final`.
   `copy` создаёт новые `MessageId`; `move_to`, `to_trash`, `restore` сохраняют `MessageId` (меняются папка и UID; `move_to` — CTR-29,
   id письма JMAP неизменен по RFC 8621; событие `Moved { from_message = message }`);
-  `expunge_final` удаляет только письма в корзине (остальные пропускает).
+  `expunge_final` удаляет только письма в корзине (остальные пропускает). `to_trash` (и `delete_to_trash`, удаление папки в корзину) снимает
+  флаг `\Deleted`, остальные флаги сохраняет (CTR-33): EXPUNGE в корзине не трогает письмо, удалённое из другой папки.
 - `NewMessage`: `skeleton: BlobKey`, `parts: Vec<PartRef>`, `size`, `received_at`, `flags`, `meta: MessageMeta`
   (envelope, bodystructure, preview, thread key — вычисляются при приёме).
 
@@ -546,3 +547,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-11 — CTR-32 (x/contracts-20): `AccountStore::by_external_id` (метод по умолчанию — `Internal`). Реализации — `PgMeta`,
   `MemMetadata`; набор `suite::account_external_id` (переименование входа сохраняет членство в группе). Переход синхронизации групп
   AUTH-07 (`tp-auth`) на сопоставление по `external_id` — волна полосы auth.
+- 2026-11-11 — CTR-33 (x/contracts-21, решение 2026-11-01-trash-purge, отчёт imap-05): перенос в корзину (`MessageStore::to_trash`,
+  `MailStore::delete_to_trash`, удаление папки с письмами) снимает `\Deleted`. Реализации — `PgMeta` (`relocate`), `MemMetadata`.
