@@ -13,7 +13,18 @@
 //! - журнал доставки ([`Delivery::with_tracking`], [`crate::tracking`]): приём, отказы, доставка, модерация,
 //!   уведомления;
 //! - адреса пересылки модулей (`Ingested::forward`, решение 2026-10-31-ingest-envelope; `CopyTo::Address`):
-//!   локальные — сразу в ящики тем же `ingest` (SMTP-28), внешние — в очередь [`Outbound`].
+//!   локальные — сразу в ящики тем же `ingest` (SMTP-28), внешние — в очередь [`Outbound`] с отправителем SRS и
+//!   ARC-подписью ([`Delivery::with_forwarding`], [`crate::forward`]); уведомление на адрес SRS — обратно
+//!   исходному отправителю (подделанный или просроченный адрес — `550 5.1.1`);
+//! - принятые домены кластера ([`Delivery::with_transport`], `ClusterTransport`, SMTP-21): полномочный —
+//!   неизвестный адрес `550 5.1.1`; внутренняя ретрансляция — неизвестный адрес принимается и ставится в очередь
+//!   (smtp-out доставляет его на `next_hop` домена); домен другой организации — `451 4.3.0` (узел обслуживает
+//!   одну организацию);
+//! - доверенные источники ([`crate::sources`], SMTP-20): приложение — внешние получатели только при `external`,
+//!   без проверок SPF/DKIM/DMARC; шлюз без данных об исходном клиенте — результаты проверок шлюза;
+//! - правила потока почты ([`Delivery::with_mail_flow`], `MailFlow`, SMTP-22) — один раз на письмо: smtp-in после
+//!   Milter, submission и [`Delivery::submit`] — до точек принятия решений и очереди; `Reject` — `550 5.7.1`,
+//!   `Drop` — `250` без доставки, изменённые конверт и тело — дальше по ним, `matched` — в журнал доставки.
 //!
 //! Отправка вне сессии SMTP (JMAP `EmailSubmission/set`) — [`Delivery::submit`] и `impl Outbound for Delivery`
 //! (CMP-04, контракт `tp_contracts::queue::Outbound`, CTR-28): локальные получатели доставляются сразу тем же
@@ -39,23 +50,30 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
 use tp_contracts::auth::{DirChange, DirCursor, Directory};
+use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::ext::{CopyTo, Decision, DecisionHooks, SubmissionInfo};
 use tp_contracts::groups::DistributionGroup;
 use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested, MailStore};
 use tp_contracts::meta::{Account, AccountScope, AccountStore, MailboxStore, SpecialUse};
 use tp_contracts::queue::{DsnRet, Outbound, SubmitStatus, Submitted};
 use tp_contracts::retention::Quota;
-use tp_contracts::transport::EnvelopeSide;
+use tp_contracts::transport::{
+    AcceptedDomain, BlobRef, DomainKind, EnvelopeSide, FlowDirection, FlowEnvelope, FlowInput,
+    FlowOutcome, FlowVerdict, MailFlow,
+};
 use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
 
 use crate::address::Addressing;
 use crate::authcheck::AuthCheck;
 use crate::config::{DeliveryConfig, QuotaReject, SmtpConfig};
 use crate::dsn::{self, DsnSink};
+use crate::forward::Forwarding;
 use crate::groups::{Groups, Hold};
 use crate::milter::{Milters, Verdict};
 use crate::routes::Routes;
 use crate::server::{Envelope, Handler, Mode, Reply, is_positive, reply};
+use crate::sources;
+use crate::srs::SrsError;
 use crate::tracking::{self, Mail, Step, Tracking, Trail};
 use tp_contracts::delivery::{DeliveryDecision as Dd, DeliveryEventKind as Ek};
 
@@ -127,6 +145,18 @@ struct Target {
     delivered_to: Option<String>,
     /// Адрес — группа рассылки [`Groups`] (ограничения отправителей, модерация).
     group: Option<DistributionGroup>,
+    /// Неизвестный адрес домена внутренней ретрансляции: в очередь (на `next_hop` домена).
+    relay: bool,
+    /// Принятый домен другой организации.
+    foreign: bool,
+}
+
+/// Правила потока почты и хранилище объектов писем для них.
+#[derive(Clone)]
+struct FlowDeps {
+    flow: Arc<dyn MailFlow>,
+    blobs: Arc<dyn BlobStore>,
+    index: Arc<dyn BlobIndex>,
 }
 
 /// Чьё письмо разрешается: отправителя (ограничения и модерация групп) или модуля (копии и пересылки точек
@@ -150,6 +180,8 @@ pub struct Delivery {
     snapshot: Mutex<Option<(Instant, Arc<Snapshot>)>>,
     groups: Option<Groups>,
     tracking: Option<Tracking>,
+    forwarding: Option<Arc<Forwarding>>,
+    flow: Option<FlowDeps>,
 }
 
 impl fmt::Debug for Delivery {
@@ -166,6 +198,9 @@ struct Prepared {
     deliveries: Vec<(String, MailDelivery)>,
     /// Внешние адреса (после переписывания).
     external: Vec<String>,
+    /// Адреса для очереди без пересылки: неизвестные адреса доменов внутренней ретрансляции, исходные
+    /// отправители уведомлений на адреса SRS.
+    relayed: Vec<String>,
     /// Внешние получатели в исходной записи (статусы отправки).
     queued: Vec<String>,
     /// Модерируемые группы: исходный адрес получателя и группа (по одной записи на группу).
@@ -186,7 +221,75 @@ impl Delivery {
             snapshot: Mutex::new(None),
             groups: None,
             tracking: None,
+            forwarding: None,
+            flow: None,
         }
+    }
+
+    /// Пересылка наружу: SRS-переписывание отправителя и ARC-подпись ([`crate::forward`], SMTP-23); приём
+    /// уведомлений на адреса SRS.
+    pub fn with_forwarding(mut self, forwarding: Arc<Forwarding>) -> Self {
+        self.forwarding = Some(forwarding);
+        self
+    }
+
+    /// Правила потока почты (`Registry::mail_flow`, SMTP-22); тело письма передаётся модулю объектом `blobs`
+    /// (одна ссылка `index` на время вызова).
+    pub fn with_mail_flow(
+        mut self,
+        flow: Arc<dyn MailFlow>,
+        blobs: Arc<dyn BlobStore>,
+        index: Arc<dyn BlobIndex>,
+    ) -> Self {
+        self.flow = Some(FlowDeps { flow, blobs, index });
+        self
+    }
+
+    /// Принятый домен кластера по имени (снимок настроек транспорта); без снимков — `None`.
+    async fn accepted(&self, domain: &str) -> Result<Option<AcceptedDomain>> {
+        match &self.transport {
+            None => Ok(None),
+            Some(routes) => Ok(routes.cluster().await?.domain(domain).cloned()),
+        }
+    }
+
+    /// Домен — локальный (каталог, `delivery.local_domains`, принятые домены организации).
+    async fn local_domain(&self, domain: &str) -> Result<bool> {
+        let domain = domain.to_lowercase();
+        if self.snapshot().await?.domains.contains(&domain) {
+            return Ok(true);
+        }
+        Ok(self
+            .accepted(&domain)
+            .await?
+            .is_some_and(|d| d.tenant == self.deps.tenant))
+    }
+
+    /// Адрес SRS нашего домена: `Some(Ok)` — исходный адрес, `Some(Err)` — подделан или просрочен; `None` — не SRS.
+    async fn srs_reverse(
+        &self,
+        address: &str,
+    ) -> Result<Option<std::result::Result<String, SrsError>>> {
+        let Some(fwd) = &self.forwarding else {
+            return Ok(None);
+        };
+        let Some(domain) = fwd.srs_domain() else {
+            return Ok(None);
+        };
+        let looks = address.rsplit_once('@').is_some_and(|(l, d)| {
+            d.eq_ignore_ascii_case(domain)
+                && l.len() > 5
+                && l.get(..4).is_some_and(|t| {
+                    t.eq_ignore_ascii_case("SRS0") || t.eq_ignore_ascii_case("SRS1")
+                })
+        });
+        if !looks {
+            return Ok(None);
+        }
+        let Some(srs) = fwd.srs().await? else {
+            return Ok(None);
+        };
+        Ok(Some(srs.reverse(address, OffsetDateTime::now_utc())))
     }
 
     /// Журнал доставки (SMTP-17, [`crate::tracking`]): приём, отказы, доставка, модерация, уведомления.
@@ -254,12 +357,28 @@ impl Delivery {
             resolved,
             delivered_to,
             group: None,
+            relay: false,
+            foreign: false,
         };
         let Some((_, domain)) = lower.rsplit_once('@') else {
             return Ok(target(Resolved::Unknown, None));
         };
         let snap = self.snapshot().await?;
-        if !snap.domains.contains(domain) {
+        let accepted = self.accepted(domain).await?;
+        if accepted
+            .as_ref()
+            .is_some_and(|d| d.tenant != self.deps.tenant)
+        {
+            return Ok(Target {
+                foreign: true,
+                ..target(Resolved::External, None)
+            });
+        }
+        let relay = matches!(
+            accepted.as_ref().map(|d| &d.kind),
+            Some(DomainKind::InternalRelay { .. })
+        );
+        if !snap.domains.contains(domain) && accepted.is_none() {
             return Ok(target(Resolved::External, None));
         }
         if let Some(groups) = &self.groups
@@ -291,6 +410,13 @@ impl Delivery {
             && let Some(accounts) = self.lookup(&snap, &catch_all).await?
         {
             return Ok(target(Resolved::Local(accounts), None));
+        }
+        if relay {
+            // Адрес вне каталога в домене внутренней ретрансляции — на старый сервер (`next_hop`).
+            return Ok(Target {
+                relay: true,
+                ..target(Resolved::External, None)
+            });
         }
         Ok(target(Resolved::Unknown, None))
     }
@@ -461,11 +587,30 @@ impl Delivery {
         let mut out = Prepared {
             deliveries: Vec::new(),
             external: Vec::new(),
+            relayed: Vec::new(),
             queued: Vec::new(),
             held: Vec::new(),
             failed: Vec::new(),
         };
         for rcpt in rcpts {
+            match self.srs_reverse(rcpt).await? {
+                Some(Ok(original)) => {
+                    // Уведомление на адрес SRS — исходному отправителю.
+                    push_unique(&mut out.relayed, vec![original]);
+                    out.queued.push(rcpt.clone());
+                    continue;
+                }
+                Some(Err(e)) => {
+                    tracing::info!(%id, error = %e, "smtp: адрес SRS отклонён");
+                    out.failed.push(dsn::Recipient::new(
+                        rcpt.clone(),
+                        dsn::Action::Failed,
+                        BAD_SRS,
+                    ));
+                    continue;
+                }
+                None => {}
+            }
             let target = self.target(rcpt).await?;
             if let (Some(group), Origin::Sender(sender)) = (&target.group, origin) {
                 if !self.group_allows(group, sender).await? {
@@ -511,13 +656,12 @@ impl Delivery {
                     }
                 }
                 Resolved::External => {
-                    if !out
-                        .external
-                        .iter()
-                        .any(|x| x.eq_ignore_ascii_case(&target.address))
-                    {
-                        out.external.push(target.address);
-                    }
+                    let list = if target.relay {
+                        &mut out.relayed
+                    } else {
+                        &mut out.external
+                    };
+                    push_unique(list, vec![target.address]);
                     out.queued.push(rcpt.clone());
                 }
                 // Получатель принят на RCPT, но исчез из каталога (или неизвестен при отправке из JMAP):
@@ -737,7 +881,8 @@ impl Delivery {
         if addresses.is_empty() {
             return Ok(());
         }
-        let copies = self.prepare(id, addresses, junk, Origin::Module).await?;
+        let mut copies = self.prepare(id, addresses, junk, Origin::Module).await?;
+        copies.external.append(&mut copies.relayed);
         for (_, d) in copies.deliveries {
             if !prepared
                 .deliveries
@@ -770,6 +915,7 @@ impl Delivery {
         while !forward.is_empty() {
             let p = self.prepare(id, &forward, junk, Origin::Module).await?;
             push_unique(&mut external, p.external);
+            push_unique(&mut external, p.relayed);
             let deliveries: Vec<_> = p
                 .deliveries
                 .into_iter()
@@ -802,12 +948,99 @@ impl Delivery {
         Ok(external)
     }
 
+    /// Пересылка наружу (SMTP-23): отправитель конверта — SRS (кроме локальных отправителей и уведомлений),
+    /// письмо — с ARC-подписью узла; `ip` — адрес клиента, от которого письмо принято.
+    async fn queue_forward(
+        &self,
+        id: &str,
+        mail_from: &str,
+        rcpts: Vec<String>,
+        mut raw: Bytes,
+        ip: Option<std::net::IpAddr>,
+    ) -> Result<()> {
+        if rcpts.is_empty() {
+            return Ok(());
+        }
+        let Some(fwd) = &self.forwarding else {
+            return self.queue_out(id, mail_from, rcpts, raw).await;
+        };
+        let mut sender = mail_from.to_owned();
+        if let Some((_, domain)) = mail_from.rsplit_once('@')
+            && !self.local_domain(domain).await?
+            && let Some(srs) = fwd.srs().await?
+            && let Some(s) = srs.forward(mail_from, OffsetDateTime::now_utc())
+        {
+            sender = s;
+        }
+        if let (Some(sealer), Some(ac)) = (fwd.sealer().await?, &self.deps.authcheck)
+            && let Some(set) = ac.seal(&sealer, &raw, ip).await
+        {
+            let mut m = Vec::with_capacity(set.len() + raw.len());
+            m.extend_from_slice(set.as_bytes());
+            m.extend_from_slice(&raw);
+            raw = Bytes::from(m);
+        }
+        self.queue_out(id, &sender, rcpts, raw).await
+    }
+
+    /// Правила потока почты (SMTP-22): тело — объектом BLOB на время вызова; изменённое тело — прочитано, ссылка на
+    /// объект модуля снята. Без модуля — `None`.
+    async fn mail_flow(
+        &self,
+        mut input: FlowInput,
+        raw: &Bytes,
+    ) -> Result<Option<(FlowOutcome, Option<Bytes>)>> {
+        let Some(f) = &self.flow else {
+            return Ok(None);
+        };
+        let key = crate::queue::store_blob(
+            f.blobs.as_ref(),
+            f.index.as_ref(),
+            input.tenant,
+            raw.clone(),
+        )
+        .await?;
+        input.message = BlobRef {
+            key,
+            size: raw.len() as u64,
+        };
+        let outcome = f.flow.apply(&input).await;
+        crate::queue::release_blob(f.index.as_ref(), &key).await;
+        let outcome = outcome?;
+        let body = match &outcome.message {
+            Some(m) if m.key != key => {
+                let read = read_blob(f.blobs.as_ref(), &m.key).await;
+                crate::queue::release_blob(f.index.as_ref(), &m.key).await;
+                Some(read?)
+            }
+            _ => None,
+        };
+        if let Some(route) = &outcome.route {
+            // Очередь маршрут правила не хранит (CONTRACTS.md#Queue): политика — по домену назначения.
+            tracing::info!(%route, "smtp: маршрут правила потока не применён, политика — по домену назначения");
+        }
+        Ok(Some((outcome, body)))
+    }
+
     /// Принимает письмо: проверки, фильтры, доставка и очередь. Ответ фильтра (отказ, отброс) — `Ok(Some)`.
     async fn accept(&self, env: &Envelope, raw: Bytes, trail: &mut Trail) -> Result<Option<Reply>> {
         let received_at = OffsetDateTime::now_utc();
         trail.message_id = tracking::message_id(&raw);
+        let app = sources::application(env.source.as_deref()).is_some();
         let check = match (&self.deps.authcheck, env.mode) {
-            (Some(ac), Mode::Inbound) => Some(ac.check(env, &raw).await),
+            // Приложение организации: проверки отправителя не нужны.
+            (Some(_), Mode::Inbound) if app => None,
+            (Some(ac), Mode::Inbound) => {
+                // Шлюз без данных об исходном клиенте — результаты его проверок.
+                let gateway = match sources::gateway_authserv(env.source.as_deref()) {
+                    Some(id) if env.gateway.is_none() => ac.gateway(&raw, id).await,
+                    _ => None,
+                };
+                match gateway {
+                    Some(g) => Some(g),
+                    None => Some(ac.check(env, &raw).await),
+                }
+            }
             _ => None,
         };
         // Отправитель конверта переписывается после проверок (SPF — по исходному).
@@ -854,6 +1087,71 @@ impl Delivery {
                 }
             }
             full = out.message;
+        }
+        // Правила потока — после Milter, до точек принятия решений, доставки и очереди; один раз на письмо.
+        let input = FlowInput {
+            tenant: self.deps.tenant,
+            direction: match env.mode {
+                Mode::Inbound => FlowDirection::Inbound,
+                Mode::Submission => FlowDirection::Submission,
+            },
+            principal: env.principal.clone(),
+            source: env.source.as_ref().map(|s| s.name.clone()),
+            envelope: FlowEnvelope {
+                mail_from: env.mail_from.clone(),
+                rcpt_to: env.rcpts.clone(),
+            },
+            message: placeholder_blob(self.deps.tenant),
+        };
+        let flowed;
+        let mut env = env;
+        if let Some((outcome, body)) = self.mail_flow(input, &full).await? {
+            if !outcome.matched.is_empty() {
+                trail.steps.push(
+                    Step::new(Ek::Receive, Dd::Accept, env.rcpts.clone())
+                        .reason(format!("mail flow rules: {}", outcome.matched.join(", "))),
+                );
+            }
+            match outcome.verdict {
+                FlowVerdict::Accept if !outcome.envelope.rcpt_to.is_empty() => {}
+                FlowVerdict::Accept | FlowVerdict::Drop => {
+                    tracing::info!(id = %env.id, "smtp: письмо удалено правилом потока");
+                    trail.decision = Some(Dd::Discard);
+                    return Ok(Some(reply(250, [2, 0, 0], format!("OK id={}", env.id))));
+                }
+                FlowVerdict::Reject(text) => {
+                    tracing::info!(id = %env.id, "smtp: письмо отклонено правилом потока");
+                    let text = clean(&text);
+                    let text = if text.is_empty() {
+                        "Message rejected by mail flow rule".to_owned()
+                    } else {
+                        text
+                    };
+                    return Ok(Some(reply(550, [5, 7, 1], text)));
+                }
+                FlowVerdict::Moderate { .. } => {
+                    // Очередь модерации (GroupStore::hold) — только для групп рассылки: письмо правила потока
+                    // в неё не ставится (нужен контракт); временный отказ — письмо не теряется.
+                    tracing::warn!(id = %env.id, "smtp: модерация правилом потока не поддержана");
+                    return Ok(Some(reply(
+                        451,
+                        [4, 7, 0],
+                        "Moderation by mail flow rule is not available, try again later",
+                    )));
+                }
+            }
+            if let Some(body) = body {
+                full = body;
+            }
+            if outcome.envelope.mail_from != env.mail_from || outcome.envelope.rcpt_to != env.rcpts
+            {
+                flowed = Envelope {
+                    mail_from: outcome.envelope.mail_from,
+                    rcpts: outcome.envelope.rcpt_to,
+                    ..env.clone()
+                };
+                env = &flowed;
+            }
         }
         let mut copies = Vec::new();
         if env.mode == Mode::Submission
@@ -912,7 +1210,15 @@ impl Delivery {
         }
         self.add_copies(&env.id, &mut prepared, &copy_to, junk)
             .await?;
-        let mut rcpts = prepared.external;
+        // Внешние получатели smtp-in от обычного клиента — только перенаправления правил потока: пересылка.
+        let redirect = env.mode == Mode::Inbound && !app;
+        let mut forwarded = Vec::new();
+        let mut rcpts = prepared.relayed;
+        if redirect {
+            forwarded = prepared.external;
+        } else {
+            push_unique(&mut rcpts, prepared.external);
+        }
         let mut failed = prepared.failed;
         let local = local_rcpts(&prepared.deliveries);
         if !prepared.deliveries.is_empty() {
@@ -939,10 +1245,18 @@ impl Delivery {
                     delivered,
                 )
                 .await?;
-            push_unique(&mut rcpts, external);
+            push_unique(&mut forwarded, external);
         }
         self.queue_out(&env.id, &env.mail_from, rcpts, full.clone())
             .await?;
+        self.queue_forward(
+            &env.id,
+            &env.mail_from,
+            forwarded,
+            full.clone(),
+            Some(env.conn.client.ip()),
+        )
+        .await?;
         outcome_steps(&mut trail.steps, &prepared.held, &local, &failed, junk);
         if !failed.is_empty() && !env.mail_from.is_empty() {
             let sent = self
@@ -1001,9 +1315,51 @@ impl Delivery {
         tenant: TenantId,
         mail_from: &str,
         rcpts: &[String],
-        raw: Bytes,
+        mut raw: Bytes,
     ) -> Result<Submitted> {
         let id = crate::server::next_id();
+        let requested = rcpts;
+        let mut flowed_rcpts = None;
+        let input = FlowInput {
+            tenant,
+            direction: FlowDirection::Submission,
+            principal: None,
+            source: None,
+            envelope: FlowEnvelope {
+                mail_from: mail_from.to_owned(),
+                rcpt_to: rcpts.to_vec(),
+            },
+            message: placeholder_blob(tenant),
+        };
+        let mut flowed_from = None;
+        if let Some((outcome, body)) = self.mail_flow(input, &raw).await? {
+            let status = match outcome.verdict {
+                FlowVerdict::Accept if !outcome.envelope.rcpt_to.is_empty() => None,
+                FlowVerdict::Accept | FlowVerdict::Drop => Some(SubmitStatus::Delivered),
+                FlowVerdict::Reject(text) => {
+                    Some(SubmitStatus::Failed(format!("550 5.7.1 {}", clean(&text))))
+                }
+                FlowVerdict::Moderate { .. } => Some(SubmitStatus::Failed(
+                    "451 4.7.0 moderation by mail flow rule is not available".into(),
+                )),
+            };
+            if !outcome.matched.is_empty() {
+                let step = Step::new(Ek::Receive, Dd::Accept, rcpts.to_vec())
+                    .reason(format!("mail flow rules: {}", outcome.matched.join(", ")));
+                self.track(mail_from, tracking::message_id(&raw).as_deref(), vec![step])
+                    .await;
+            }
+            if let Some(status) = status {
+                return Ok(Submitted::all(rcpts, status));
+            }
+            if let Some(body) = body {
+                raw = body;
+            }
+            flowed_from = Some(outcome.envelope.mail_from);
+            flowed_rcpts = Some(outcome.envelope.rcpt_to);
+        }
+        let rcpts = flowed_rcpts.as_deref().unwrap_or(rcpts);
+        let mail_from = flowed_from.as_deref().unwrap_or(mail_from);
         let rewritten = self
             .rewrite(tenant, mail_from, EnvelopeSide::Sender)
             .await?;
@@ -1019,7 +1375,7 @@ impl Delivery {
                     SubmitStatus::Failed(NO_OUTBOUND.into())
                 }
             };
-            return Ok(Submitted::all(rcpts, status));
+            return Ok(Submitted::all(requested, status));
         }
         let sender = self.sender_by_address(mail_from).await?;
         let prepared = self
@@ -1104,8 +1460,12 @@ impl Delivery {
             })
             .collect();
         let mut out = if queue { prepared.external } else { Vec::new() };
-        push_unique(&mut out, forward);
+        if queue {
+            push_unique(&mut out, prepared.relayed);
+        }
         self.queue_out(&id, mail_from, out, raw.clone()).await?;
+        self.queue_forward(&id, mail_from, forward, raw.clone(), None)
+            .await?;
         let mut steps = vec![Step::new(Ek::Receive, Dd::Accept, rcpts.to_vec())];
         outcome_steps(&mut steps, &prepared.held, &local_list, &failed, false);
         if !failed.is_empty() && !mail_from.is_empty() {
@@ -1117,6 +1477,17 @@ impl Delivery {
         self.track(mail_from, tracking::message_id(&raw).as_deref(), steps)
             .await;
         tracing::info!(%id, count = rcpts.len(), "smtp: отправка вне сессии обработана");
+        // Статус — по получателям запроса: адрес, убранный правилом потока, считается обработанным.
+        let statuses = requested
+            .iter()
+            .map(|r| {
+                let status = statuses
+                    .iter()
+                    .find(|(x, _): &&(String, SubmitStatus)| x.eq_ignore_ascii_case(r))
+                    .map_or(SubmitStatus::Delivered, |(_, s)| s.clone());
+                (r.clone(), status)
+            })
+            .collect();
         Ok(Submitted { rcpts: statuses })
     }
 
@@ -1296,10 +1667,40 @@ impl Handler for Delivery {
 impl Delivery {
     /// Проверка получателя до ответа `250` (SRS 4.1): существование, группа рассылки, квота.
     async fn check_rcpt(&self, env: &Envelope, rcpt: &str) -> Reply {
+        let queue_ok = || {
+            if self.deps.outbound.is_some() {
+                reply(250, [2, 1, 5], "OK")
+            } else {
+                reply(451, [4, 3, 2], "Outbound delivery not available")
+            }
+        };
+        match self.srs_reverse(rcpt).await {
+            Ok(Some(Ok(_))) => return queue_ok(),
+            Ok(Some(Err(e))) => {
+                tracing::info!(id = %env.id, error = %e, "smtp: адрес SRS отклонён");
+                return reply(550, [5, 1, 1], "Bad SRS address");
+            }
+            Ok(None) => {}
+            Err(e) => return temporary(&e),
+        }
         let target = match self.target(rcpt).await {
             Ok(t) => t,
             Err(e) => return temporary(&e),
         };
+        if target.foreign {
+            tracing::warn!(id = %env.id, "smtp: принятый домен другой организации на этом узле не обслуживается");
+            return reply(451, [4, 3, 0], "Domain not served by this node");
+        }
+        if target.relay {
+            return queue_ok();
+        }
+        let app = sources::application(env.source.as_deref());
+        if let Some((s, _)) = app
+            && s.tenant != Some(self.deps.tenant)
+        {
+            tracing::warn!(id = %env.id, source = %s.name, "smtp: источник-приложение другой организации");
+            return reply(451, [4, 3, 0], "Source not served by this node");
+        }
         if let Some(group) = &target.group {
             let sender = sender_account(env, self.deps.tenant);
             match self.group_allows(group, sender).await {
@@ -1341,6 +1742,11 @@ impl Delivery {
                 }
                 reply(250, [2, 1, 5], "OK")
             }
+            // Приложение: внешние получатели — только по разрешению источника.
+            Resolved::External if app.is_some_and(|(_, external)| !external) => {
+                reply(550, [5, 7, 1], "Relaying denied for this source")
+            }
+            Resolved::External if app.is_some() => queue_ok(),
             Resolved::External => match env.mode {
                 Mode::Inbound => reply(550, [5, 7, 1], "Relaying denied"),
                 Mode::Submission if self.deps.outbound.is_some() => reply(250, [2, 1, 5], "OK"),
@@ -1419,6 +1825,28 @@ fn dsn_step(to: &str, sent: bool) -> Step {
 
 /// Отказ отправителю вне круга группы рассылки после приёма (уведомление о недоставке).
 const GROUP_DENIED: &str = "550 5.7.1 sender not allowed to send to this group";
+
+/// Отказ адресу SRS: подпись не сходится или срок истёк.
+const BAD_SRS: &str = "550 5.1.1 bad SRS address";
+
+/// Ссылка-заглушка до записи тела ([`Delivery::mail_flow`] заменяет её объектом письма).
+fn placeholder_blob(tenant: TenantId) -> BlobRef {
+    BlobRef {
+        key: tp_contracts::BlobKey {
+            tenant,
+            hash: tp_contracts::BlobHash([0; 32]),
+            generation: tp_contracts::Gen::INITIAL,
+        },
+        size: 0,
+    }
+}
+
+/// Объект BLOB целиком.
+async fn read_blob(blobs: &dyn BlobStore, key: &tp_contracts::BlobKey) -> Result<Bytes> {
+    use futures::TryStreamExt;
+    let chunks: Vec<Bytes> = blobs.get(key, None).await?.try_collect().await?;
+    Ok(chunks.concat().into())
+}
 
 /// Учётная запись отправителя транзакции: аутентифицированный пользователь организации; smtp-in — внешний.
 fn sender_account(env: &Envelope, tenant: TenantId) -> Option<AccountId> {
