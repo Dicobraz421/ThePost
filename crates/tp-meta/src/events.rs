@@ -12,8 +12,14 @@
 //! Ошибка раздела в [`EventConsumer::poll`] не прерывает проход: раздел повторяется не раньше своего
 //! срока — пауза растёт вдвое от [`EventsConfig::retry_min`] до [`EventsConfig::retry_max`] (SRS 2.8),
 //! ближайший срок — в [`PollReport::retry_in`].
+//!
+//! Шарды (META-31, CTR-34): журнал — на шарде ящика (события пишут транзакции ящика шарда), у каждого шарда
+//! свои разделы `0..N` и позиции подписчиков. Журналы шардов — [`PgShardLogs`] ([`PgMeta::shard_logs`],
+//! `ShardEventLogs`); раздел шарда обрабатывает [`EventConsumer`] этого шарда ([`EventConsumer::with_shard`]):
+//! назначение и имя лизы — по ключу `shard_subscriber` (для шарда 0 — прежние). `EventLog` хранилищ со
+//! справочником — журнал основной БД.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -25,11 +31,11 @@ use time::OffsetDateTime;
 use tp_contracts::config::duration;
 use tp_contracts::events::{
     CoreEvent, CoreEventKind, EventLog, EventPos, EventSink, LoggedEvent, Partition,
-    PartitionAssigner,
+    PartitionAssigner, ShardEventLogs, shard_subscriber,
 };
 use tp_contracts::lease::{Lease, LeaseStore};
 use tp_contracts::membership::NodeId;
-use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
+use tp_contracts::{AccountId, Error, MailboxId, Result, ShardId, TenantId};
 use uuid::Uuid;
 
 use crate::PgMeta;
@@ -140,7 +146,16 @@ impl PgMeta {
     /// Удаляет не более `limit` событий, обработанных всеми `subscribers` (позиция не больше
     /// наименьшей зафиксированной; подписчик без позиции в разделе её не имеет — 0).
     /// Пустой список подписчиков ничего не удаляет. Возвращает число удалённых событий.
+    ///
+    /// Со справочником шардов — на каждом шарде (позиции подписчиков у каждого шарда свои), `limit` — на шард.
     pub async fn purge_events(&self, subscribers: &[&str], limit: usize) -> Result<u64> {
+        if let Some(views) = self.shard_views().await? {
+            let mut done = 0;
+            for (_, view) in &views {
+                done += Box::pin(view.purge_events(subscribers, limit)).await?;
+            }
+            return Ok(done);
+        }
         self.rewrite(|| async move {
         let mut tx = begin_system(&self.pool).await?;
         let done = sqlx::query(
@@ -164,6 +179,55 @@ impl PgMeta {
         tx.commit().await.map_err(db_err)?;
         Ok(done.rows_affected())
 }).await
+    }
+}
+
+/// Журналы событий шардов справочника (`ShardEventLogs`): снимок списка шардов на момент
+/// [`PgMeta::shard_logs`]; после сигнала изменения справочника снимок строят заново.
+#[derive(Clone)]
+pub struct PgShardLogs {
+    logs: BTreeMap<ShardId, Arc<dyn EventLog>>,
+    partitions: u32,
+}
+
+impl std::fmt::Debug for PgShardLogs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgShardLogs")
+            .field("shards", &self.logs.keys().collect::<Vec<_>>())
+            .field("partitions", &self.partitions)
+            .finish()
+    }
+}
+
+impl ShardEventLogs for PgShardLogs {
+    fn shards(&self) -> Vec<ShardId> {
+        self.logs.keys().copied().collect()
+    }
+
+    fn log(&self, shard: ShardId) -> Option<Arc<dyn EventLog>> {
+        self.logs.get(&shard).cloned()
+    }
+
+    fn partitions(&self) -> u32 {
+        self.partitions
+    }
+}
+
+impl PgMeta {
+    /// Журналы событий всех шардов справочника (без справочника — один журнал основной БД).
+    pub async fn shard_logs(&self) -> Result<PgShardLogs> {
+        let ids = match self.shard_resolver() {
+            Some(r) => r.shards().await?,
+            None => vec![ShardId::MAIN],
+        };
+        let mut logs: BTreeMap<ShardId, Arc<dyn EventLog>> = BTreeMap::new();
+        for id in ids {
+            logs.insert(id, Arc::new(self.on_shard(id).await?));
+        }
+        Ok(PgShardLogs {
+            logs,
+            partitions: self.cfg.event_partitions,
+        })
     }
 }
 
@@ -321,6 +385,7 @@ pub struct EventConsumer {
     leases: Arc<dyn LeaseStore>,
     holder: String,
     cfg: EventsConfig,
+    shard: ShardId,
     assignment: Option<Assignment>,
     held: Arc<Mutex<Held>>,
     retries: Arc<Mutex<Retries>>,
@@ -330,6 +395,7 @@ impl std::fmt::Debug for EventConsumer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventConsumer")
             .field("holder", &self.holder)
+            .field("shard", &self.shard)
             .field("node", &self.assignment.as_ref().map(|a| &a.node))
             .field("cfg", &self.cfg)
             .finish_non_exhaustive()
@@ -349,6 +415,7 @@ impl EventConsumer {
             leases,
             holder: holder.into(),
             cfg,
+            shard: ShardId::MAIN,
             assignment: None,
             held: Arc::new(Mutex::new(HashMap::new())),
             retries: Arc::new(Mutex::new(HashMap::new())),
@@ -361,9 +428,26 @@ impl EventConsumer {
         self
     }
 
-    /// Имя лизы раздела подписчика.
+    /// Журнал `log` — журнал шарда `shard` (`ShardEventLogs::log`): назначение разделов и имена лиз — по ключу
+    /// подписчика шарда `shard_subscriber(subscriber, shard)`; шард 0 — прежние.
+    pub fn with_shard(mut self, shard: ShardId) -> Self {
+        self.shard = shard;
+        self
+    }
+
+    /// Шард журнала.
+    pub fn shard(&self) -> ShardId {
+        self.shard
+    }
+
+    /// Имя лизы раздела подписчика (журнал шарда 0).
     pub fn lease_name(subscriber: &str, partition: Partition) -> String {
         format!("events/{subscriber}/{}", partition.0)
+    }
+
+    /// Имя лизы раздела подписчика журнала этого обработчика: `events/{ключ подписчика шарда}/{раздел}`.
+    pub fn shard_lease_name(&self, subscriber: &str, partition: Partition) -> String {
+        Self::lease_name(&shard_subscriber(subscriber, self.shard), partition)
     }
 
     /// Разделы подписчика, назначенные этому экземпляру при текущем составе, по возрастанию.
@@ -371,7 +455,11 @@ impl EventConsumer {
         let partitions = self.log.partitions();
         match &self.assignment {
             None => (0..partitions).map(Partition).collect(),
-            Some(a) => a.assigner.assigned(subscriber, &a.node, partitions),
+            Some(a) => a.assigner.assigned(
+                &shard_subscriber(subscriber, self.shard),
+                &a.node,
+                partitions,
+            ),
         }
     }
 
@@ -408,7 +496,7 @@ impl EventConsumer {
         partition: Partition,
     ) -> Result<Option<usize>> {
         let key = (sink.name().to_owned(), partition.0);
-        let name = Self::lease_name(sink.name(), partition);
+        let name = self.shard_lease_name(sink.name(), partition);
         let ttl = self.cfg.lease_ttl;
         let Some(lease) = self.leases.try_acquire(&name, &self.holder, ttl).await? else {
             self.held_map().remove(&key);

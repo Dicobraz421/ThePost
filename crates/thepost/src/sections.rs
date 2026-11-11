@@ -268,7 +268,8 @@ impl BusSection {
 /// cluster:
 ///   node_id: mail-1
 ///   site: dc-1
-///   addr: https://mail-1.corp.example:7443   # слушатель запросов других узлов; пусто — не принимает
+///   addr: https://mail-1.corp.example:7443   # адрес узла для других узлов; пусто — запросов не принимает
+///   listen: 0.0.0.0:7443                     # где узел слушает; не задан — как в addr
 ///   rpc:                                     # секция tp-cluster (CLU-12): mTLS внутреннего канала
 ///     tls:
 ///       ca_file: /etc/thepost/cluster-ca.pem
@@ -285,9 +286,13 @@ pub struct ClusterSection {
     /// Площадка (ЦОД) узла в членстве кластера; по умолчанию `default` (одна площадка).
     pub site: String,
     /// Внутренний адрес служебного канала узла для запросов узел → узел (`https://host:port`): объявляется в
-    /// записи узла, на нём же узел слушает (`NodeRpc::listen`); пусто — узел запросов не принимает. Требует
-    /// `rpc.tls` и перезапуска.
+    /// записи узла, по нему другие узлы вызывают этот; пусто — узел запросов не принимает. Требует `rpc.tls` и
+    /// перезапуска.
     pub addr: String,
+    /// Адрес приёма запросов узел → узел (`host:port`, `0.0.0.0:port`, `[::]:port`): на нём узел слушает
+    /// (`NodeRpc::listen`), другим узлам объявляется `addr` — за NAT, пробросом порта или балансировщиком они
+    /// различаются. Не задан — как в `addr` (решение 36). Требует `addr` и перезапуска.
+    pub listen: String,
     /// Запросы узел → узел (секция `tp-cluster`, CLU-12): пределы, сроки, матрица разрешений и mTLS внутреннего
     /// канала (`rpc.tls`: УЦ узлов, сертификат с CN — имя узла, ключ). Транспорт включается адресом `addr` или
     /// сертификатом узла `rpc.tls.cert_file` (только исходящие запросы).
@@ -303,6 +308,7 @@ impl Default for ClusterSection {
             node_id: None,
             site: tp_contracts::membership::SiteId::DEFAULT.to_owned(),
             addr: String::new(),
+            listen: String::new(),
             rpc: RpcConfig::default(),
             rebuild_scan: 64,
         }
@@ -316,18 +322,38 @@ impl ClusterSection {
             .map_err(|e| Error::invalid(format!("site: {e}")))
     }
 
-    /// Проверка: имя узла (если задано), площадка, адрес (пусто или `https://host:port`), секция `rpc`; с
+    /// Проверка: имя узла (если задано), площадка, адрес (пусто или `https://host:port`), адрес приёма (пусто или
+    /// `host:port` с портом 1–65535, только вместе с `addr`), секция `rpc`; с
     /// включённым транспортом ([`ClusterSection::rpc_enabled`]) — файлы `rpc.tls` (УЦ, сертификат, ключ).
     pub fn check(&self) -> Result<()> {
         if let Some(node) = &self.node_id {
             tp_contracts::membership::NodeId::new(node.clone())?;
         }
         self.site_id()?;
-        if !self.addr.is_empty() && self.listen_addr().is_none() {
+        if !self.addr.is_empty()
+            && self
+                .addr
+                .strip_prefix("https://")
+                .and_then(host_port)
+                .is_none()
+        {
             return Err(Error::invalid(format!(
                 "addr: ожидается https://host:port, получено {:?}",
                 self.addr
             )));
+        }
+        if !self.listen.is_empty() {
+            if host_port(&self.listen).is_none() {
+                return Err(Error::invalid(format!(
+                    "listen: ожидается host:port с портом 1–65535 (0.0.0.0:7443), получено {:?}",
+                    self.listen
+                )));
+            }
+            if self.addr.is_empty() {
+                return Err(Error::invalid(
+                    "listen: задан без addr — другим узлам адрес этого узла не объявлен",
+                ));
+            }
         }
         if self.rpc_enabled() {
             let tls = &self.rpc.tls;
@@ -351,16 +377,34 @@ impl ClusterSection {
         !self.addr.is_empty() || self.rpc.tls.cert_file.is_some()
     }
 
-    /// Адрес слушателя запросов узел → узел (`host:port` из `addr`); `None` — адрес пуст или не `https://host:port`.
+    /// Адрес слушателя запросов узел → узел: `listen`, не задан — `host:port` из `addr`; `None` — адреса нет или он
+    /// неверен.
     pub fn listen_addr(&self) -> Option<&str> {
-        let host = self.addr.strip_prefix("https://")?;
-        let (name, port) = host.rsplit_once(':')?;
-        let valid = !name.is_empty()
-            && !host.contains(['/', '?', '#'])
-            && !host.chars().any(char::is_whitespace)
-            && port.parse::<u16>().is_ok_and(|p| p != 0);
-        valid.then_some(host)
+        if self.listen.is_empty() {
+            self.addr.strip_prefix("https://").and_then(host_port)
+        } else {
+            host_port(&self.listen)
+        }
     }
+
+    /// Ключ, из которого взят адрес слушателя (`cluster.listen` или `cluster.addr`), — для сообщений об ошибках.
+    pub fn listen_key(&self) -> &'static str {
+        if self.listen.is_empty() {
+            "cluster.addr"
+        } else {
+            "cluster.listen"
+        }
+    }
+}
+
+/// `host:port` без схемы и пути, имя непустое, порт 1–65535; иначе `None`.
+fn host_port(s: &str) -> Option<&str> {
+    let (name, port) = s.rsplit_once(':')?;
+    let valid = !name.is_empty()
+        && !s.contains(['/', '?', '#'])
+        && !s.chars().any(char::is_whitespace)
+        && port.parse::<u16>().is_ok_and(|p| p != 0);
+    valid.then_some(s)
 }
 
 // ---------- auth ----------
@@ -787,6 +831,7 @@ blob:
         assert_eq!(cluster.site_id().expect("site").as_str(), "dc-1");
         assert_eq!(cluster.addr, "https://10.0.0.1:7443");
         assert_eq!(cluster.listen_addr(), Some("10.0.0.1:7443"));
+        assert_eq!(cluster.listen_key(), "cluster.addr");
         assert!(cluster.rpc_enabled());
         let d = ClusterSection::default();
         assert_eq!(d.site_id().expect("site").as_str(), "default");
@@ -806,6 +851,47 @@ blob:
             let e = err(parse(&format!("{MINIMAL_DEV}cluster:\n{bad}{RPC_TLS}")));
             assert!(e.contains("site") || e.contains("addr"), "{bad}: {e}");
         }
+    }
+
+    /// APP-30: `cluster.listen` — где узел слушает, `cluster.addr` — что объявляет; без `listen` слушает `addr`
+    /// (решение 36); порт обязателен, `listen` без `addr` — ошибка.
+    #[test]
+    fn cluster_listen_is_separate_from_addr() {
+        let addr = "  addr: https://mail-1.corp.example:7443\n";
+        let c = parse(&format!(
+            "{MINIMAL_DEV}cluster:\n{addr}  listen: 0.0.0.0:7443\n{RPC_TLS}"
+        ))
+        .expect("config");
+        let cluster = c.section::<ClusterSection>(CLUSTER).expect("cluster");
+        assert_eq!(cluster.addr, "https://mail-1.corp.example:7443");
+        assert_eq!(cluster.listen_addr(), Some("0.0.0.0:7443"));
+        assert_eq!(cluster.listen_key(), "cluster.listen");
+        let c = parse(&format!(
+            "{MINIMAL_DEV}cluster:\n{addr}  listen: \"[::]:17443\"\n{RPC_TLS}"
+        ))
+        .expect("config");
+        let cluster = c.section::<ClusterSection>(CLUSTER).expect("cluster");
+        assert_eq!(cluster.listen_addr(), Some("[::]:17443"));
+        for bad in [
+            "0.0.0.0",
+            "0.0.0.0:0",
+            "0.0.0.0:70000",
+            ":7443",
+            "https://0.0.0.0:7443",
+            "0.0.0.0 :7443",
+        ] {
+            let e = err(parse(&format!(
+                "{MINIMAL_DEV}cluster:\n{addr}  listen: \"{bad}\"\n{RPC_TLS}"
+            )));
+            assert!(
+                e.contains("listen") && e.contains("host:port"),
+                "{bad}: {e}"
+            );
+        }
+        let e = err(parse(&format!(
+            "{MINIMAL_DEV}cluster:\n  listen: 0.0.0.0:7443\n{RPC_TLS}"
+        )));
+        assert!(e.contains("listen") && e.contains("addr"), "{e}");
     }
 
     /// APP-18: адрес узла (или сертификат для исходящих запросов) требует mTLS внутреннего канала

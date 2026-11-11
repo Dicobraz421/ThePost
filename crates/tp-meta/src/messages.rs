@@ -9,7 +9,7 @@
 //! `expunge_final`, обходят их как отсутствующие.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use async_trait::async_trait;
 use sqlx::{FromRow, PgConnection};
@@ -24,10 +24,11 @@ use tp_contracts::{
 };
 use uuid::Uuid;
 
-use crate::PgMeta;
 use crate::changelog::{self, Change, Op};
 use crate::mailboxes::{self, Relocated, alloc_uids, by_role, relocate, touch};
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
+use crate::shards::{ReadIntent, ShardId};
+use crate::{BoxDb, PgMeta};
 
 // ---------- Флаги ----------
 
@@ -473,6 +474,9 @@ async fn insert_one(
     })
 }
 
+/// Доставка пачки: номер в `items`, ящик, папка, id письма, письмо.
+type BatchItem = (usize, AccountScope, MailboxId, MessageId, NewMessage);
+
 #[async_trait]
 impl MessageStore for PgMeta {
     async fn insert(
@@ -486,8 +490,10 @@ impl MessageStore for PgMeta {
         // Ключ — идентификатор письма, выданный до транзакции (META-40).
         let id = MessageId::new();
         let keys = [(scope.account, id)];
+        let db = self.box_db(scope).await?;
         let inserted = self
-            .keyed(
+            .keyed_at(
+                &db,
                 scope.tenant,
                 |tx| Box::pin(insert_one(tx, partitions, scope, mailbox, id, msg.clone())),
                 move |tx| {
@@ -522,50 +528,67 @@ impl MessageStore for PgMeta {
             .iter()
             .map(|(scope, _, _)| (scope.account, MessageId::new()))
             .collect();
-        // Строки учётных записей и папок блокируются по порядку идентификаторов: встречные приёмы
-        // не ждут друг друга по кругу.
-        let mut items: Vec<_> = items
-            .into_iter()
-            .zip(&keys)
-            .enumerate()
-            .map(|(i, ((scope, mailbox, msg), (_, id)))| (i, scope, mailbox, *id, msg))
-            .collect();
-        items.sort_by_key(|(_, scope, mailbox, _, _)| {
-            (*scope.account.as_uuid(), *mailbox.as_uuid())
-        });
+        // Доставки группируются по шардам ящиков: одна транзакция на шард (атомарность — в пределах шарда).
+        let mut groups: BTreeMap<ShardId, Vec<BatchItem>> = BTreeMap::new();
+        for (i, ((scope, mailbox, msg), (_, id))) in items.into_iter().zip(&keys).enumerate() {
+            let shard = self.shard_of(scope).await?;
+            groups
+                .entry(shard)
+                .or_default()
+                .push((i, scope, mailbox, *id, msg));
+        }
         let partitions = self.cfg.event_partitions;
-        let items = &items;
-        let keys = &keys;
-        let inserted = self
-            .keyed(
-                tenant,
-                |tx| {
-                    let items = items.clone();
-                    Box::pin(async move {
-                        let mut out = Vec::with_capacity(items.len());
-                        for (i, scope, mailbox, id, msg) in items {
-                            out.push((
-                                i,
-                                insert_one(tx, partitions, scope, mailbox, id, msg).await?,
-                            ));
-                        }
-                        out.sort_by_key(|(i, _)| *i);
-                        Ok(out.into_iter().map(|(_, ins)| ins).collect())
-                    })
-                },
-                |tx| {
-                    let keys = keys.clone();
-                    Box::pin(async move { inserted_by_id(tx, tenant, &keys).await })
-                },
-            )
-            .await?;
+        let mut out: Vec<(usize, Inserted)> = Vec::with_capacity(keys.len());
+        for (shard, mut group) in groups {
+            // Строки учётных записей и папок блокируются по порядку идентификаторов: встречные приёмы
+            // не ждут друг друга по кругу.
+            group.sort_by_key(|(_, scope, mailbox, _, _)| {
+                (*scope.account.as_uuid(), *mailbox.as_uuid())
+            });
+            let db = BoxDb {
+                shard,
+                pool: self.shard_pool(shard, ReadIntent::Primary).await?,
+            };
+            let order: Vec<usize> = group.iter().map(|(i, ..)| *i).collect();
+            let group_keys: Vec<(AccountId, MessageId)> = group
+                .iter()
+                .map(|(_, s, _, id, _)| (s.account, *id))
+                .collect();
+            let group = &group;
+            let group_keys = &group_keys;
+            let inserted = self
+                .keyed_at(
+                    &db,
+                    tenant,
+                    |tx| {
+                        let items = group.clone();
+                        Box::pin(async move {
+                            let mut out = Vec::with_capacity(items.len());
+                            for (_, scope, mailbox, id, msg) in items {
+                                out.push(
+                                    insert_one(tx, partitions, scope, mailbox, id, msg).await?,
+                                );
+                            }
+                            Ok(out)
+                        })
+                    },
+                    |tx| {
+                        let keys = group_keys.clone();
+                        Box::pin(async move { inserted_by_id(tx, tenant, &keys).await })
+                    },
+                )
+                .await?;
+            out.extend(order.into_iter().zip(inserted));
+        }
+        out.sort_by_key(|(i, _)| *i);
+        let inserted: Vec<Inserted> = out.into_iter().map(|(_, ins)| ins).collect();
         self.signal_log(keys.iter().map(|(a, _)| *a)).await;
         Ok(inserted)
     }
 
     async fn get(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let rows: Vec<MessageRow> = sqlx::query_as(select_messages!("AND message_id = $3"))
                 .bind(scope.tenant.as_uuid())
                 .bind(scope.account.as_uuid())
@@ -590,7 +613,7 @@ impl MessageStore for PgMeta {
         let query = &query;
         self.idempotent(|| async move {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
         let base = |sql| {
             sqlx::query_as::<_, MessageRow>(sql)
                 .bind(scope.tenant.as_uuid())
@@ -641,7 +664,7 @@ impl MessageStore for PgMeta {
             match &op {
                 FlagOp::Add(f) | FlagOp::Remove(f) | FlagOp::Replace(f) => check_flags(f)?,
             }
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let current = changelog::lock_modseq(&mut tx, scope).await?;
             let rows: Vec<(Uuid, Uuid, i64, i64, Vec<String>)> = sqlx::query_as(
                 "SELECT message_id, mailbox_id, uid, modseq, flags FROM messages
@@ -737,7 +760,7 @@ impl MessageStore for PgMeta {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
             let src: Vec<Uuid> = require_all(&mut tx, scope, ids)
                 .await?
@@ -772,7 +795,7 @@ impl MessageStore for PgMeta {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
             let src: Vec<Uuid> = require_all(&mut tx, scope, ids)
                 .await?
@@ -814,7 +837,9 @@ impl MessageStore for PgMeta {
 
     async fn to_trash(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
         self.once(async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let db = self.box_db(scope).await?;
+            let trash_for = self.trash_retention(&db, scope).await?;
+            let mut tx = begin(&db.pool, scope.tenant).await?;
             let current = changelog::lock_modseq(&mut tx, scope).await?;
             let trash = by_role(&mut tx, scope, SpecialUse::Trash)
                 .await?
@@ -831,21 +856,14 @@ impl MessageStore for PgMeta {
                 return Ok(current);
             }
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
-            let events: Vec<_> = relocate(
-                &mut tx,
-                scope,
-                ms,
-                &src,
-                trash,
-                Some(self.cfg.retention.trash_retention),
-            )
-            .await?
-            .into_iter()
-            .map(|m| {
-                let message = MessageId::from_uuid(m.id);
-                changelog::event(scope, Some(trash), CoreEventKind::Trashed { message })
-            })
-            .collect();
+            let events: Vec<_> = relocate(&mut tx, scope, ms, &src, trash, Some(trash_for))
+                .await?
+                .into_iter()
+                .map(|m| {
+                    let message = MessageId::from_uuid(m.id);
+                    changelog::event(scope, Some(trash), CoreEventKind::Trashed { message })
+                })
+                .collect();
             changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
             tx.commit().await.map_err(db_err)?;
             self.signal_log([scope.account]).await;
@@ -861,7 +879,7 @@ impl MessageStore for PgMeta {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
             let trash = by_role(&mut tx, scope, SpecialUse::Trash)
                 .await?
@@ -934,7 +952,7 @@ impl MessageStore for PgMeta {
 
     async fn expunge_final(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
         self.once(async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let current = changelog::lock_modseq(&mut tx, scope).await?;
             // Только письма в корзине, включая скрытые (под блокировкой `ModSeq` учётной записи, как и `restore`):
             // восстановленные после `TrashStore::expired` и прочие пропускаются.

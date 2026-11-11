@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use tp_contracts::delivery::{
     DeliveryCursor, DeliveryEvent, DeliveryLog, DeliveryPage, DeliveryQuery,
 };
-use tp_contracts::{Error, Result, TenantId};
+use tp_contracts::{Error, QueueId, Result, TenantId};
 
 use crate::infra::lock;
 
@@ -119,6 +119,31 @@ impl DeliveryLog for MemDeliveryLog {
         st.events.retain(|(_, e)| e.at >= before);
         Ok(())
     }
+
+    async fn by_queue(
+        &self,
+        tenant: TenantId,
+        queue: QueueId,
+        limit: usize,
+    ) -> Result<Vec<DeliveryEvent>> {
+        if limit == 0 {
+            return Err(Error::invalid("delivery by_queue limit must be positive"));
+        }
+        let mut st = lock(&self.state);
+        fault(&mut st)?;
+        let mut found: Vec<_> = st
+            .events
+            .iter()
+            .filter(|(_, e)| e.tenant == tenant && e.queue_id == Some(queue))
+            .map(|(seq, e)| (position(e.at, *seq), e))
+            .collect();
+        found.sort_by_key(|(pos, _)| *pos);
+        Ok(found
+            .into_iter()
+            .take(limit)
+            .map(|(_, e)| e.clone())
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +156,19 @@ mod tests {
     #[tokio::test]
     async fn passes_contract_suite() {
         delivery_log(
+            &MemDeliveryLog::new(),
+            &DeliveryFixture {
+                tenant: TenantId::DEFAULT,
+                foreign_tenant: TenantId::new(),
+            },
+        )
+        .await;
+    }
+
+    /// CTR-35: выборка по записи очереди.
+    #[tokio::test]
+    async fn passes_by_queue_suite() {
+        crate::suite::delivery_by_queue(
             &MemDeliveryLog::new(),
             &DeliveryFixture {
                 tenant: TenantId::DEFAULT,

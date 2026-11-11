@@ -11,6 +11,7 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 use crate::ids::{AccountId, MailboxId, TenantId};
@@ -60,6 +61,46 @@ pub struct DirAccount {
     pub enabled: bool,
     /// Атрибуты адресной книги (GAL): имя из [`Directory::gal_attributes`] → значение.
     pub attributes: BTreeMap<String, String>,
+    /// Оргатрибуты (CTR-35): подразделение, должность, руководитель, старшинство.
+    #[serde(default)]
+    pub org: DirOrg,
+}
+
+/// Оргатрибуты учётной записи в каталоге (CTR-35); ссылки — `external_id` записей каталога.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DirOrg {
+    /// Подразделение: `external_id` из [`Directory::units`].
+    pub department: Option<String>,
+    /// Должность.
+    pub title: Option<String>,
+    /// Руководитель: `external_id` учётной записи.
+    pub manager: Option<String>,
+    /// Старшинство (атрибут каталога — настройка; больше — выше в списке).
+    pub seniority: Option<i32>,
+}
+
+/// Почтовый контакт в каталоге (CTR-35): класс объектов и ветка — настройка реализации.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirContact {
+    /// Идентификатор в каталоге, постоянный.
+    pub external_id: String,
+    /// Отображаемое имя.
+    pub display_name: String,
+    /// Внешний адрес.
+    pub email: String,
+    /// Атрибуты адресной книги: имя из [`Directory::gal_attributes`] → значение.
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// Подразделение в каталоге (CTR-35): из веток каталога или атрибутов — решает реализация.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirUnit {
+    /// Идентификатор в каталоге, постоянный.
+    pub external_id: String,
+    /// Название.
+    pub name: String,
+    /// Вышестоящее подразделение (`external_id`); `None` — корневое.
+    pub parent: Option<String>,
 }
 
 /// Группа (список рассылки, группа безопасности).
@@ -71,7 +112,7 @@ pub struct DirGroup {
     pub name: String,
     /// Адрес рассылки; `None` — группа без почты.
     pub email: Option<String>,
-    /// Члены: `external_id` учётных записей и вложенных групп.
+    /// Члены: `external_id` учётных записей, вложенных групп и почтовых контактов ([`DirContact`]).
     pub members: Vec<String>,
 }
 
@@ -125,6 +166,77 @@ pub trait Directory: Send + Sync + 'static {
 
     /// Имена атрибутов, публикуемых в адресной книге (`title`, `department`, `telephoneNumber`, ...).
     async fn gal_attributes(&self, tenant: TenantId) -> Result<Vec<String>>;
+
+    /// Изменения почтовых контактов после `cursor`, не более `limit` (CTR-35). По умолчанию — каталог без контактов:
+    /// пустая порция с прежним курсором.
+    async fn contacts_since(
+        &self,
+        tenant: TenantId,
+        cursor: Option<&DirCursor>,
+        limit: usize,
+    ) -> Result<DirPage<DirContact>> {
+        let _ = (tenant, limit);
+        Ok(DirPage {
+            changes: Vec::new(),
+            next: cursor.cloned().unwrap_or_else(|| DirCursor(String::new())),
+            has_more: false,
+        })
+    }
+
+    /// Подразделения (полный список, CTR-35). По умолчанию — пусто.
+    async fn units(&self, tenant: TenantId) -> Result<Vec<DirUnit>> {
+        let _ = tenant;
+        Ok(Vec::new())
+    }
+}
+
+// ---------- Порог массового удаления ----------
+
+/// Порог массового удаления по умолчанию, процентов от учётных записей организации.
+pub const MASS_REMOVAL_PERCENT: u64 = 5;
+
+/// Удаление `removed` из `total` учётных записей превышает порог `percent` процентов (`total = 0` — нет).
+pub fn exceeds_removal_threshold(removed: u64, total: u64, percent: u64) -> bool {
+    total > 0 && removed.saturating_mul(100) > total.saturating_mul(percent)
+}
+
+/// Синхронизация, остановленная массовым удалением учётных записей (CTR-35).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MassRemoval {
+    /// Учётных записей к отключению.
+    pub removed: u64,
+    /// Учётных записей в организации.
+    pub total: u64,
+    /// Момент обнаружения (последний `hold_sync`).
+    pub detected_at: OffsetDateTime,
+    /// Подтверждено администратором: следующая синхронизация выполняет отключение и снимает запись (`clear_sync`).
+    pub approved: bool,
+}
+
+/// Остановка синхронизации каталога при удалении больше порога учётных записей (решение 2026-11-04-exchange-parity):
+/// синхронизация (`tp-auth`) записывает `hold_sync` и оповещает, администратор подтверждает (`approve_sync`, Admin API),
+/// следующая синхронизация видит `approved` и после отключения вызывает `clear_sync`. Реализация — `tp-meta`, in-memory —
+/// `tp-testkit`.
+#[async_trait]
+pub trait SyncGate: Send + Sync + 'static {
+    /// Записывает остановку. Существующая запись обновляется; подтверждение сохраняется, только если `removed` не
+    /// выросло.
+    async fn hold_sync(
+        &self,
+        tenant: TenantId,
+        removed: u64,
+        total: u64,
+        at: OffsetDateTime,
+    ) -> Result<MassRemoval>;
+
+    /// Действующая остановка организации.
+    async fn pending_sync(&self, tenant: TenantId) -> Result<Option<MassRemoval>>;
+
+    /// Подтверждение администратора; нет остановки — `Error::NotFound`.
+    async fn approve_sync(&self, tenant: TenantId) -> Result<MassRemoval>;
+
+    /// Снимает остановку (отсутствующая — не ошибка).
+    async fn clear_sync(&self, tenant: TenantId) -> Result<()>;
 }
 
 // ---------- Аутентификация ----------
@@ -373,6 +485,7 @@ mod tests {
     #[test]
     fn object_safe() {
         fn _dir(_: Arc<dyn Directory>) {}
+        fn _gate(_: Arc<dyn SyncGate>) {}
         fn _authn(_: Arc<dyn Authenticator>) {}
         fn _authz(_: Arc<dyn Authorizer>) {}
     }
@@ -417,6 +530,14 @@ mod tests {
         let b = Credentials::Bearer("tok3n".into());
         let s = format!("{p:?} {b:?}");
         assert!(s.contains("user") && !s.contains("hunter2") && !s.contains("tok3n"));
+    }
+
+    #[test]
+    fn removal_threshold() {
+        assert!(!exceeds_removal_threshold(5, 100, MASS_REMOVAL_PERCENT));
+        assert!(exceeds_removal_threshold(6, 100, MASS_REMOVAL_PERCENT));
+        assert!(exceeds_removal_threshold(1, 10, MASS_REMOVAL_PERCENT));
+        assert!(!exceeds_removal_threshold(0, 0, MASS_REMOVAL_PERCENT));
     }
 
     #[test]

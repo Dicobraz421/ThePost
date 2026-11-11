@@ -16,9 +16,10 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tp_contracts::events::{CoreEvent, CoreEventKind};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountStore, AccountUpsert, ChangeLog, Changes, Flag, FlagOp, Flags,
-    FlagsUpdate, Inserted, Mailbox, MailboxStatus, MailboxStore, Message, MessageChange,
-    MessageQuery, MessageStore, NewMailbox, NewMessage, QuotaUsage, SpecialUse,
+    Account, AccountScope, AccountState, AccountStore, AccountUpsert, ChangeLog, Changes,
+    DisabledAccount, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Mailbox, MailboxStatus,
+    MailboxStore, Message, MessageChange, MessageQuery, MessageStore, NewMailbox, NewMessage,
+    QuotaUsage, SpecialUse,
 };
 use tp_contracts::retention::{PurgeOutcome, Restored};
 use tp_contracts::{
@@ -119,6 +120,8 @@ struct AccountData {
     mbx_log: Vec<(ModSeq, MailboxId, Op)>,
     /// Журнал старше этого состояния удалён: `since` меньше — `Conflict`.
     floor: ModSeq,
+    /// Состояние ящика (CTR-35).
+    state: AccountState,
 }
 
 fn blob_keys(m: &Message) -> impl Iterator<Item = BlobKey> + '_ {
@@ -924,6 +927,7 @@ impl AccountStore for MemMetadata {
             msg_log: Vec::new(),
             mbx_log: Vec::new(),
             floor: ModSeq::ZERO,
+            state: AccountState::Active,
         };
         for (name, role) in SYSTEM_FOLDERS {
             let data = NewMailbox {
@@ -945,6 +949,125 @@ impl AccountStore for MemMetadata {
             messages: acc.messages.len() as u64,
             limit_bytes: None,
         })
+    }
+
+    async fn account_state(&self, tenant: TenantId, id: AccountId) -> Result<AccountState> {
+        let st = lock(&self.state);
+        Ok(st.accounts.get(&(tenant, id)).ok_or(Error::NotFound)?.state)
+    }
+
+    async fn disable_account(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        until: OffsetDateTime,
+    ) -> Result<()> {
+        let mut st = lock(&self.state);
+        st.accounts
+            .get_mut(&(tenant, id))
+            .ok_or(Error::NotFound)?
+            .state = AccountState::Disabled { until };
+        Ok(())
+    }
+
+    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        let mut st = lock(&self.state);
+        st.accounts
+            .get_mut(&(tenant, id))
+            .ok_or(Error::NotFound)?
+            .state = AccountState::Active;
+        Ok(())
+    }
+
+    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
+        let st = lock(&self.state);
+        let mut out: Vec<DisabledAccount> = st
+            .accounts
+            .values()
+            .filter(|a| a.account.tenant == tenant)
+            .filter_map(|a| match a.state {
+                AccountState::Disabled { until } => Some(DisabledAccount {
+                    account: a.account.clone(),
+                    until,
+                }),
+                AccountState::Active => None,
+            })
+            .collect();
+        out.sort_by_key(|d| (d.until, d.account.id));
+        Ok(out)
+    }
+
+    async fn expired_accounts(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<AccountScope>> {
+        let st = lock(&self.state);
+        let mut out: Vec<(OffsetDateTime, AccountId, TenantId)> = st
+            .accounts
+            .values()
+            .filter_map(|a| match a.state {
+                AccountState::Disabled { until } if until <= now => {
+                    Some((until, a.account.id, a.account.tenant))
+                }
+                _ => None,
+            })
+            .collect();
+        out.sort_unstable();
+        Ok(out
+            .into_iter()
+            .take(limit)
+            .map(|(_, account, tenant)| AccountScope { tenant, account })
+            .collect())
+    }
+
+    async fn attach_account(
+        &self,
+        tenant: TenantId,
+        disabled: AccountId,
+        to: AccountId,
+    ) -> Result<Account> {
+        let mut st = lock(&self.state);
+        let from = st
+            .accounts
+            .get(&(tenant, disabled))
+            .ok_or(Error::NotFound)?;
+        let target = st.accounts.get(&(tenant, to)).ok_or(Error::NotFound)?;
+        if from.state == AccountState::Active || disabled == to {
+            return Err(Error::invalid("attach: mailbox is not disabled"));
+        }
+        if target.state != AccountState::Active
+            || !target.messages.is_empty()
+            || !target.hidden.is_empty()
+        {
+            return Err(Error::Conflict);
+        }
+        let identity = target.account.clone();
+        st.accounts.remove(&(tenant, to));
+        let acc = st
+            .accounts
+            .get_mut(&(tenant, disabled))
+            .ok_or_else(|| Error::internal("учётная запись пропала"))?;
+        acc.account.domain = identity.domain;
+        acc.account.login = identity.login;
+        acc.account.display_name = identity.display_name;
+        acc.account.external_id = identity.external_id;
+        acc.account.enabled = identity.enabled;
+        acc.state = AccountState::Active;
+        Ok(acc.account.clone())
+    }
+
+    async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        let mut st = lock(&self.state);
+        let acc = st.accounts.get(&(tenant, id)).ok_or(Error::NotFound)?;
+        if acc.state == AccountState::Active {
+            return Err(Error::invalid("remove_disabled: mailbox is active"));
+        }
+        if !acc.messages.is_empty() || !acc.hidden.is_empty() {
+            return Err(Error::Conflict);
+        }
+        st.accounts.remove(&(tenant, id));
+        Ok(())
     }
 }
 
@@ -1638,6 +1761,18 @@ mod tests {
             foreign_domain: DomainId::new(),
         };
         crate::suite::account_list(&MemMetadata::default(), &fx).await;
+    }
+
+    /// CTR-35: общий набор состояния ящика.
+    #[tokio::test]
+    async fn account_state_suite() {
+        let fx = crate::suite::AccountStateFixture {
+            tenant: TenantId::DEFAULT,
+            domain: DomainId::new(),
+            domain_name: "example.org".into(),
+        };
+        let meta = MemMetadata::default();
+        crate::suite::account_state(&meta, &meta, &meta, &fx).await;
     }
 
     fn key(n: u8) -> BlobKey {
