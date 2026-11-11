@@ -1,9 +1,8 @@
 //! Сервисы ролей ядра (SRS 2.1): maintenance — GC и «сироты» BLOB под лизой лидера, истечение срока корзины
 //! (`tp-mailstore`: таймер на ближайший срок → точка принятия решений → окончательное удаление), подписчики
-//! журнала событий; роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
+//! журнала событий (по сигналам, [`crate::log_reader`]); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use tp_blob::{GcConfig, GcWorker, OrphanConfig, OrphanSweeper, system_now};
@@ -13,6 +12,8 @@ use tp_contracts::events::EventSink;
 use tp_contracts::lease::LeaseStore;
 use tp_contracts::role::{CancellationToken, Role, RoleCtx, RoleService};
 use tp_meta::events::EventConsumer;
+
+use crate::log_reader::{LogReader, LogSignals};
 
 /// Роль ядра, реализация которой ещё не вошла в сборку (протоколы — этап Ф1): объявляет готовность
 /// и ждёт остановки, чтобы узел с пресетом `all` доходил до ready.
@@ -47,8 +48,8 @@ pub struct Maintenance {
     pub events: EventConsumer,
     /// Подписчики журнала событий (модули).
     pub sinks: Vec<Arc<dyn EventSink>>,
-    /// Период опроса журнала.
-    pub events_poll: Duration,
+    /// Сигналы, будящие подписчиков журнала (опроса нет).
+    pub signals: LogSignals,
     /// Сборка мусора объектов (`blob.gc`).
     pub gc: GcConfig,
     /// Поиск «сирот» (`blob.orphans`).
@@ -129,7 +130,7 @@ impl RoleService for Maintenance {
             consume(
                 self.events.clone(),
                 self.sinks.clone(),
-                self.events_poll,
+                self.signals.clone(),
                 ctx.shutdown.clone(),
             ),
         );
@@ -146,33 +147,26 @@ impl RoleService for Maintenance {
     }
 }
 
-/// Опрос журнала событий подписчиками до остановки; затем лизы разделов отдаются другим узлам.
+/// Чтение журнала событий подписчиками по сигналам до остановки; затем лизы разделов отдаются другим узлам.
 async fn consume(
     events: EventConsumer,
     sinks: Vec<Arc<dyn EventSink>>,
-    poll: Duration,
+    signals: LogSignals,
     shutdown: CancellationToken,
 ) {
     if sinks.is_empty() {
         return;
     }
-    let mut tick = tokio::time::interval(poll);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => break,
-            _ = tick.tick() => {}
-        }
+    let mut reader = LogReader::new(events, signals);
+    while let Some(work) = reader.wait(&shutdown).await {
         for sink in &sinks {
-            if let Err(e) = events.poll(sink.as_ref()).await {
+            if let Err(e) = reader.read(sink.as_ref(), &work).await {
                 tracing::warn!(subscriber = sink.name(), error = %e, "журнал событий: пачка не обработана");
             }
         }
     }
     for sink in &sinks {
-        if let Err(e) = events.release_all(sink.name()).await {
-            tracing::warn!(subscriber = sink.name(), error = %e, "журнал событий: лизы разделов не отданы");
-        }
+        reader.release(sink.as_ref()).await;
     }
 }
 
@@ -180,6 +174,7 @@ async fn consume(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use tp_contracts::events::{CoreEvent, CoreEventKind, EventLog, LoggedEvent};
     use tp_contracts::role::{ReadyHandle, fixed_config};
@@ -251,7 +246,14 @@ mod tests {
             holder: "node-a/1".into(),
             events,
             sinks: vec![sink.clone()],
-            events_poll: Duration::from_millis(10),
+            signals: LogSignals {
+                bus: Arc::new(tp_cluster::LocalBus::new(
+                    &tp_cluster::LocalBusConfig::default(),
+                )),
+                members: None,
+                lease_ttl: Duration::from_secs(30),
+                resubscribe: Duration::from_secs(1),
+            },
             gc: GcConfig::default(),
             orphans: OrphanConfig::default(),
             trash: None,

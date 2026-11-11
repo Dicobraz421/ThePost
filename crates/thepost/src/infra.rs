@@ -1,18 +1,20 @@
-//! Выбор реализаций по конфигурации: хранилище BLOB (локальный каталог / S3), шина уведомлений
-//! (в процессе), пул PostgreSQL, имя узла (APP-01).
+//! Выбор реализаций по конфигурации: хранилище BLOB (локальный каталог / S3), шина сигналов (в процессе или
+//! PostgreSQL LISTEN/NOTIFY, APP-08), пул PostgreSQL, имя узла (APP-01).
 
 use std::sync::Arc;
 
 use sqlx::PgPool;
 use tp_blob::{LocalStore, S3Store};
-use tp_cluster::{BusCounters, BusMetrics, LocalBus};
+use tp_cluster::{BusMetrics, LocalBus};
 use tp_contracts::blob::BlobStore;
 use tp_contracts::bus::EventBus;
 use tp_contracts::membership::NodeId;
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
+use tp_meta::MetaConfig;
 use tp_meta::failover::{self, Failover};
 use tp_meta::pool::{self, PoolConfig};
+use tp_meta::signals::{PgSignalBus, SignalMetrics};
 use tp_platform::{BusSample, Config};
 
 use crate::sections::{
@@ -87,24 +89,33 @@ pub async fn open_blob(cfg: &Config, store: &dyn SecretStore) -> Result<Arc<dyn 
     }
 }
 
-/// Шина уведомлений узла и её счётчики для метрик.
+/// Снимок метрик шины для реестра метрик платформы.
+pub type BusSampler = Arc<dyn Fn() -> BusSample + Send + Sync>;
+
+/// Шина сигналов узла и снимок её метрик (`tp_bus_*`).
 pub struct Bus {
     /// Шина.
     pub bus: Arc<dyn EventBus>,
-    /// Счётчики (метрики `tp_bus_*`).
-    pub counters: Arc<BusCounters>,
+    /// Снимок метрик.
+    pub sample: BusSampler,
 }
 
 impl std::fmt::Debug for Bus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bus")
-            .field("metrics", &self.counters.snapshot())
+            .field("metrics", &(self.sample)())
             .finish_non_exhaustive()
     }
 }
 
-/// Шина по секции `bus`. Вызывать внутри runtime tokio.
-pub async fn open_bus(cfg: &Config, _store: &dyn SecretStore) -> Result<Bus> {
+/// Шина по секции `bus`: `local` — в процессе; `postgres` — LISTEN/NOTIFY: публикатор на пуле узла `db`
+/// (обязателен), слушатель — прямое соединение с primary (`tp_meta::signals::connect_listener`), параметры —
+/// `meta.signals`. Вызывать внутри runtime tokio.
+pub async fn open_bus(
+    cfg: &Config,
+    db: Option<&Failover>,
+    store: Arc<dyn SecretStore>,
+) -> Result<Bus> {
     let section = cfg.section::<BusSection>(BUS)?;
     match section.kind {
         BusKind::Local => {
@@ -112,13 +123,47 @@ pub async fn open_bus(cfg: &Config, _store: &dyn SecretStore) -> Result<Bus> {
             let counters = bus.counters();
             Ok(Bus {
                 bus: Arc::new(bus),
-                counters,
+                sample: Arc::new(move || bus_sample(counters.snapshot())),
+            })
+        }
+        BusKind::Postgres => {
+            let db = db.ok_or_else(|| {
+                Error::invalid("bus: kind: postgres — шине нужен пул узла (только для serve)")
+            })?;
+            let signals = cfg
+                .section::<MetaConfig>(MetaConfig::SECTION)?
+                .signals
+                .clone();
+            let listen = tp_meta::signals::connect_listener(&pool_config(cfg)?, store)
+                .await
+                .map_err(|e| context("bus", e))?;
+            let bus = PgSignalBus::start(db.clone(), listen, signals)
+                .map_err(|e| context("meta.signals", e))?;
+            let probe = bus.clone();
+            Ok(Bus {
+                bus: Arc::new(bus),
+                sample: Arc::new(move || pg_bus_sample(probe.connected(), &probe.metrics())),
             })
         }
     }
 }
 
-/// Снимок счётчиков шины для реестра метрик платформы (PLT-10, CLU-05).
+/// Снимок метрик шины LISTEN/NOTIFY: отброшенные сигналы — ошибки публикации, `Resync` из-за переполнения —
+/// отставания подписчиков.
+pub fn pg_bus_sample(connected: bool, m: &SignalMetrics) -> BusSample {
+    BusSample {
+        connected,
+        published: m.published,
+        publish_errors: m.publish_errors + m.dropped,
+        received: m.received,
+        delivered: m.received,
+        decode_errors: 0,
+        reconnects: m.reconnects,
+        lagged: m.overflows,
+    }
+}
+
+/// Снимок счётчиков шины в процессе для реестра метрик платформы (PLT-10, CLU-05).
 pub fn bus_sample(m: BusMetrics) -> BusSample {
     BusSample {
         connected: m.connected,
@@ -187,9 +232,30 @@ mod tests {
             .await
             .expect("put");
         store.delete_raw("doctor/probe").await.expect("delete");
-        let bus = open_bus(&cfg, &none).await.expect("bus");
-        assert!(bus.counters.snapshot().connected);
-        assert!(bus_sample(bus.counters.snapshot()).connected);
+        let bus = open_bus(&cfg, None, Arc::new(crate::secrets::NoSecretStore))
+            .await
+            .expect("bus");
+        assert!((bus.sample)().connected);
+        // Шина PostgreSQL без пула узла (короткие команды) — ошибка конфигурации, а не паника.
+        let pg = config(&format!(
+            "domain: example.org\nprofile: dev\ndatabase:\n  url: postgres://x@y/z?sslmode=disable\n  tls: {{ allow_plaintext: true }}\n\
+             blob:\n  url: file://{}\nbus:\n  kind: postgres\n",
+            dir.path().display().to_string().replace('\\', "/")
+        ));
+        let e = open_bus(&pg, None, Arc::new(crate::secrets::NoSecretStore))
+            .await
+            .expect_err("без пула");
+        assert!(e.to_string().contains("postgres"), "{e}");
+        let s = pg_bus_sample(
+            true,
+            &SignalMetrics {
+                published: 3,
+                dropped: 1,
+                overflows: 2,
+                ..SignalMetrics::default()
+            },
+        );
+        assert_eq!((s.published, s.publish_errors, s.lagged), (3, 1, 2));
         assert_eq!(node_id(&cfg).expect("node").as_str(), "node-a");
     }
 

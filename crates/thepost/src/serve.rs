@@ -42,6 +42,7 @@ use tp_sys::{NodeResources, ResourceSnapshot, ResourcesConfig};
 
 use crate::acme;
 use crate::infra;
+use crate::log_reader::LogSignals;
 use crate::modules;
 use crate::protocols::{
     Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, LogPause, SmtpRole, Sockets,
@@ -154,7 +155,13 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     }
     let events_cfg = meta_cfg.events.clone();
     let blob_cfg = cfg.section::<BlobSection>(BLOB)?;
-    let meta = PgMeta::new(pool, meta_cfg);
+    // Шина сигналов — до хранилищ: после фиксации они публикуют `LogAppended` (будит читателей журнала событий),
+    // `MembersChanged`, `TransportChanged` и др. (APP-08, SRS 2.8).
+    let bus = infra::open_bus(&cfg, Some(&db), store.clone()).await?;
+    let sample = bus.sample.clone();
+    metrics.register_bus(move || sample());
+    let bus = bus.bus;
+    let meta = PgMeta::new(pool, meta_cfg).with_bus(bus.clone());
 
     let ext = modules::activate(&cfg, &migrations).await?;
     let store = ext.secret_store().unwrap_or(store);
@@ -169,10 +176,6 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         Some(blob) => blob,
         None => infra::open_blob(&cfg, store.as_ref()).await?,
     };
-    let bus = infra::open_bus(&cfg, store.as_ref()).await?;
-    let counters = bus.counters.clone();
-    metrics.register_bus(move || infra::bus_sample(counters.snapshot()));
-    let bus = bus.bus;
     // Состав — по сигналу `MembersChanged` и таймеру аренды записи узла (CLU-10).
     let assigner = RendezvousAssigner::start(
         Arc::new(meta.clone()) as Arc<dyn Membership>,
@@ -183,6 +186,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         },
     )
     .await?;
+    let assigner: Arc<dyn PartitionAssigner> = Arc::new(assigner);
+    // Читатели журнала событий — по сигналам и смене состава, без опроса (APP-08).
+    let signals = LogSignals {
+        bus: bus.clone(),
+        members: Some(assigner.members()),
+        lease_ttl: events_cfg.lease_ttl,
+        resubscribe: events_cfg.retry_min,
+    };
 
     // Фоновые задачи узла живут дольше ролей: служебный HTTP отвечает 503 во время drain. Ошибка запуска
     // останавливает уже запущенные (слушатель HTTP-01, перечитывание сертификатов).
@@ -283,10 +294,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         holder.clone(),
         events_cfg.clone(),
     )
-    .with_assigner(
-        Arc::new(assigner) as Arc<dyn PartitionAssigner>,
-        node.clone(),
-    );
+    .with_assigner(assigner, node.clone());
     let maintenance = Maintenance {
         index: Arc::new(meta.clone()),
         store: blob.clone(),
@@ -299,7 +307,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             .cloned()
             .chain(services.spam_learner(&*cfg.section::<SmtpConfig>(sections::SMTP)?)?)
             .collect(),
-        events_poll: cluster.events_poll_interval,
+        signals: signals.clone(),
         gc: blob_cfg.gc.clone(),
         orphans: blob_cfg.orphans.clone(),
         trash: Some(services.mail.clone()),
@@ -313,7 +321,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         sockets: sockets.clone(),
         updates: reloader.subscribe(),
         events,
-        events_poll: cluster.events_poll_interval,
+        signals,
         maintenance: Some(maintenance),
     };
     for role in Role::ALL.iter().copied() {
@@ -417,7 +425,7 @@ struct RoleSetup<'a> {
     sockets: Sockets,
     updates: tokio::sync::watch::Receiver<Arc<Config>>,
     events: EventConsumer,
-    events_poll: Duration,
+    signals: LogSignals,
     maintenance: Option<Maintenance>,
 }
 
@@ -503,7 +511,7 @@ impl RoleSetup<'_> {
                     indexer,
                     self.services.rebuilder(&search),
                     self.services.meta.clone(),
-                    self.events_poll,
+                    self.signals.clone(),
                     self.cfg.section::<ClusterSection>(CLUSTER)?.rebuild_scan,
                     LogPause::from(&search.indexer),
                 );

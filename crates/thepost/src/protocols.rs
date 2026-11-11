@@ -1,6 +1,7 @@
 //! Роли протоколов и индексатора (APP-04): слушатели открывает приложение (`Listener::open`), сервисы — крейты
 //! полос: smtp-in и submission (`tp-smtp`), imap (`tp-imap`: IMAP с QUOTA и ACL, POP3 по секции `imap.pop3`),
-//! jmap и admin (HTTP платформы), indexer (`tp-search` с обработчиком журнала событий `tp-meta`). Роль без
+//! jmap и admin (HTTP платформы), indexer (`tp-search` с обработчиком журнала событий `tp-meta`, чтение по сигналам —
+//! [`crate::log_reader`]). Роль без
 //! слушателей в конфигурации готова, но соединений не принимает.
 
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +24,7 @@ use tp_platform::{Config, InheritedSockets, Listener, TlsCerts, service_http};
 use tp_search::{Indexer, IndexerConfig, Rebuilder, SCHEMA_VERSION, SUBSCRIBER};
 use tp_smtp::{Mode, ServerDeps, SmtpConfig, SmtpService};
 
+use crate::log_reader::{LogReader, LogSignals};
 use crate::sections::HttpListener;
 
 /// Фактические адреса слушателей ролей узла (журнал, тесты: порт `0` — выбирает система).
@@ -525,7 +527,7 @@ pub struct IndexerRole {
     indexer: Arc<Indexer>,
     rebuilder: Arc<Rebuilder>,
     meta: PgMeta,
-    poll: Duration,
+    signals: LogSignals,
     rebuild_batch: usize,
     log_pause: LogPause,
 }
@@ -533,21 +535,21 @@ pub struct IndexerRole {
 impl std::fmt::Debug for IndexerRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexerRole")
-            .field("poll", &self.poll)
+            .field("signals", &self.signals)
             .finish_non_exhaustive()
     }
 }
 
 impl IndexerRole {
-    /// Роль: журнал `events`, индексатор и перестройка; опрос журнала — каждые `poll`, а раздел с ошибкой —
-    /// к сроку его повтора (`PollReport::retry_in`), если он раньше; повторяющиеся ошибки — в журнал не чаще
-    /// раза за паузу `log_pause`.
+    /// Роль: журнал `events`, индексатор и перестройка; журнал дочитывается по сигналам `signals` (раздел с
+    /// ошибкой — к сроку повтора), запросы перестройки — после каждого чтения; повторяющиеся ошибки — в журнал
+    /// не чаще раза за паузу `log_pause`, перестройка с ошибкой повторяется через `log_pause.initial`.
     pub fn new(
         events: EventConsumer,
         indexer: Arc<Indexer>,
         rebuilder: Rebuilder,
         meta: PgMeta,
-        poll: Duration,
+        signals: LogSignals,
         rebuild_batch: usize,
         log_pause: LogPause,
     ) -> Self {
@@ -556,7 +558,7 @@ impl IndexerRole {
             indexer,
             rebuilder: Arc::new(rebuilder),
             meta,
-            poll,
+            signals,
             rebuild_batch,
             log_pause,
         }
@@ -609,26 +611,17 @@ impl RoleService for IndexerRole {
         let mut poll_log = RepeatLog::new(self.log_pause);
         let mut pending_log = RepeatLog::new(self.log_pause);
         let mut rebuild_failed = HashMap::new();
-        let mut next = tokio::time::Instant::now();
-        loop {
-            tokio::select! {
-                () = ctx.shutdown.cancelled() => break,
-                () = tokio::time::sleep_until(next) => {}
-            }
-            let started = tokio::time::Instant::now();
-            let polled = self
-                .events
-                .poll(self.indexer.as_ref() as &dyn EventSink)
-                .await;
-            let retry_at = polled
-                .as_ref()
-                .ok()
-                .and_then(|r| r.retry_in)
-                .map(|r| tokio::time::Instant::now() + r);
-            log_step(&mut poll_log, polled.map(drop), "опрос журнала событий");
+        let mut reader = LogReader::new(self.events.clone(), self.signals.clone());
+        let sink = self.indexer.as_ref() as &dyn EventSink;
+        while let Some(work) = reader.wait(&ctx.shutdown).await {
+            let read = reader.read(sink, &work).await;
+            log_step(&mut poll_log, read, "чтение журнала событий");
             let pending = self.rebuild_pending(&mut rebuild_failed).await;
+            if pending.is_err() || !rebuild_failed.is_empty() {
+                // Повтор при временной ошибке — один таймер (SRS 2.8, закрытый список, п. 2).
+                reader.wake_in(self.log_pause.initial);
+            }
             log_step(&mut pending_log, pending, "чтение запросов перестройки");
-            next = next_poll(started, self.poll, retry_at);
         }
         if let Err(e) = self.events.release_all(SUBSCRIBER).await {
             tracing::warn!(error = %e, "indexer: лизы разделов не отданы");
@@ -636,19 +629,6 @@ impl RoleService for IndexerRole {
         ctx.ready.set(false);
         Ok(())
     }
-}
-
-/// Срок следующего опроса журнала: тик `poll` от начала прохода `started`, а если ближайший срок повтора раздела
-/// с ошибкой `retry_at` (META-35) раньше — он; не раньше, чем через 1 мс после начала прохода.
-fn next_poll(
-    started: tokio::time::Instant,
-    poll: Duration,
-    retry_at: Option<tokio::time::Instant>,
-) -> tokio::time::Instant {
-    let tick = started + poll;
-    retry_at
-        .map_or(tick, |r| r.min(tick))
-        .max(started + Duration::from_millis(1))
 }
 
 /// Роль, работа которой в этой сборке идёт в процессе других ролей (search: запросы выполняют imap и jmap
@@ -781,21 +761,6 @@ mod tests {
         shutdown.cancel();
         task.await.expect("join").expect("run");
         assert!(!ready.is_ready());
-    }
-
-    #[test]
-    fn next_poll_waits_for_nearest_retry() {
-        let t0 = tokio::time::Instant::now();
-        let s = Duration::from_secs(1);
-        // Без разделов с ошибкой и при сроке повтора позже тика — тик.
-        assert_eq!(next_poll(t0, 5 * s, None), t0 + 5 * s);
-        assert_eq!(next_poll(t0, 5 * s, Some(t0 + 9 * s)), t0 + 5 * s);
-        // Срок повтора раньше тика — он.
-        assert_eq!(next_poll(t0, 5 * s, Some(t0 + 2 * s)), t0 + 2 * s);
-        // Срок уже наступил или тик нулевой — не раньше 1 мс от начала прохода (без холостого цикла).
-        let floor = t0 + Duration::from_millis(1);
-        assert_eq!(next_poll(t0, 5 * s, Some(t0)), floor);
-        assert_eq!(next_poll(t0, Duration::ZERO, None), floor);
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod doctor_dns;
 pub mod infra;
 pub mod local_admin;
+pub mod log_reader;
 pub mod metrics;
 pub mod modules;
 pub mod protocols;

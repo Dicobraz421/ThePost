@@ -118,7 +118,6 @@ meta:
     node_ttl: 3s
 cluster:
   node_id: e2e-{pid}
-  events_poll_interval: 100ms
 runtime:
   drain_deadline: 5s
 smtp:
