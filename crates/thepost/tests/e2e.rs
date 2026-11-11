@@ -4,14 +4,21 @@
 //! настройке `trash.purge` → отправка из JMAP локальному адресату (CMP-07) → истечение срока корзины (роль
 //! maintenance). Вход — через защиту от перебора.
 //!
-//! Без `TEST_DATABASE_URL` тест пропускается.
+//! Настройки транспорта без перезапуска (APP-09): доверенный источник, созданный через Admin API (вход — `admin init`
+//! по локальному сокету и сессия), действует на следующую сессию SMTP; правила потока почты тестового модуля
+//! (`Registry::mail_flow`) вызываются один раз на письмо.
+//!
+//! Без `TEST_DATABASE_URL` тесты пропускаются.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{Value, json};
+use thepost::modules::Builtin;
 use thepost::serve::{Running, ServeOptions, start};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -21,13 +28,14 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 use tp_contracts::TenantId;
 use tp_contracts::delivery::{DeliveryEventKind, DeliveryLog, DeliveryQuery};
-use tp_contracts::ext::DecisionHooks;
+use tp_contracts::ext::{DecisionHooks, Migration, Module, ModuleCtx, Registry};
 use tp_contracts::ids::DomainId;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, MessageStore, Policy};
 use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::secrets::{SecretRef, SecretStore};
+use tp_contracts::transport::{FlowInput, FlowOutcome, MailFlow};
 use tp_meta::{MetaConfig, PgMeta};
 use tp_testkit::MemSecretStore;
 
@@ -332,18 +340,18 @@ fn exists(select: &str) -> u32 {
 
 // ---------- JMAP ----------
 
-/// Запрос HTTP/1.1 с Basic: код и тело (с разбором `chunked`).
+/// Запрос HTTP/1.1 с заголовком `Authorization` (`Basic …`, `Bearer …`): код и тело (с разбором `chunked`).
 async fn http(
     addr: std::net::SocketAddr,
     method: &str,
     path: &str,
-    auth: &str,
+    authorization: &str,
     body: Option<&Value>,
 ) -> (u16, Vec<u8>) {
     let body = body.map(|b| b.to_string()).unwrap_or_default();
     let mut s = TcpStream::connect(addr).await.expect("http connect");
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
@@ -403,7 +411,8 @@ impl Jmap {
             ],
             "methodCalls": [[method, args, "c0"]],
         });
-        let (code, body) = http(self.addr, "POST", "/jmap/api", &self.auth, Some(&req)).await;
+        let basic = format!("Basic {}", self.auth);
+        let (code, body) = http(self.addr, "POST", "/jmap/api", &basic, Some(&req)).await;
         assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
         let resp: Value = serde_json::from_slice(&body).expect("json");
         let call = &resp["methodResponses"][0];
@@ -469,6 +478,7 @@ async fn mvp_mail_flow() {
         secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
         telemetry: false,
         shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
     })
     .await
     .expect("start");
@@ -824,5 +834,191 @@ async fn mvp_mail_flow() {
     let report = running.wait().await.expect("wait");
     assert!(report.failed.is_empty(), "{report:?}");
     pool.close().await;
+    drop_database(&url, &db_name).await;
+}
+
+// ---------- настройки транспорта и правила потока почты (APP-09) ----------
+
+/// Вызовы правил потока почты тестового модуля.
+static FLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Правила потока почты: письмо без изменений, вызов учтён.
+#[derive(Debug)]
+struct CountingFlow;
+
+#[async_trait]
+impl MailFlow for CountingFlow {
+    async fn apply(&self, input: &FlowInput) -> tp_contracts::Result<FlowOutcome> {
+        FLOW_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(FlowOutcome::unchanged(input))
+    }
+}
+
+/// Модуль теста: регистрирует [`CountingFlow`] в `Registry`.
+#[derive(Debug)]
+struct FlowModule;
+
+impl Module for FlowModule {
+    fn name(&self) -> &str {
+        "flowcount"
+    }
+
+    fn migrations(&self) -> &[Migration] {
+        &[]
+    }
+
+    fn register(&self, registry: &mut Registry, _ctx: &ModuleCtx) -> tp_contracts::Result<()> {
+        registry.set_mail_flow(Arc::new(CountingFlow))
+    }
+}
+
+const FLOW_MODULES: &[Builtin] = &[Builtin {
+    name: "flowcount",
+    make: || Arc::new(FlowModule),
+}];
+
+/// Конфигурация [`config`] со слушателем Admin API, локальным сокетом `admin init` и модулем `flowcount`.
+fn transport_config(dir: &Path, db_url: &str, domain: &str, socket: &Path) -> String {
+    let jmap = "http:\n  jmap: { listen: \"127.0.0.1:0\", allow_plaintext: true }\n";
+    let base = config(dir, db_url, domain);
+    assert!(base.contains(jmap), "{base}");
+    let base = base.replace(
+        jmap,
+        &format!("{jmap}  admin: {{ listen: \"127.0.0.1:0\", allow_plaintext: true }}\n"),
+    );
+    format!(
+        "{base}admin:\n  init:\n    socket: \"{socket}\"\nmodules:\n  flowcount:\n    enabled: true\n",
+        socket = socket.display().to_string().replace('\\', "/"),
+    )
+}
+
+/// `thepost admin init` по локальному сокету узла: ответ узла (`status`, `token`, …).
+async fn admin_init(socket: &Path, email: &str) -> Value {
+    let mut s = tokio::net::UnixStream::connect(socket)
+        .await
+        .expect("admin init socket");
+    s.write_all(format!("{}\n", json!({ "email": email })).as_bytes())
+        .await
+        .expect("admin init write");
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.expect("admin init read");
+    serde_json::from_slice(&out).expect("admin init reply")
+}
+
+/// Новая сессия SMTP: код ответа на `MAIL FROM:<from>`.
+async fn mail_from_code(addr: std::net::SocketAddr, from: &str) -> u16 {
+    let mut s = TcpStream::connect(addr).await.expect("smtp connect");
+    assert_eq!(smtp_reply(&mut s).await, 220);
+    assert_eq!(smtp_cmd(&mut s, "EHLO app.test").await, 250);
+    let code = smtp_cmd(&mut s, &format!("MAIL FROM:<{from}>")).await;
+    assert_eq!(smtp_cmd(&mut s, "QUIT").await, 221);
+    code
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transport_settings_without_restart() {
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = Arc::new(MemSecretStore::default());
+    let db: SecretRef = "thepost/db#password".parse().expect("ref");
+    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+
+    let domain = "example.ru".to_owned();
+    let socket = dir.path().join("admin.sock");
+    let path = dir.path().join("config.yaml");
+    std::fs::write(
+        &path,
+        transport_config(dir.path(), &db_url, &domain, &socket),
+    )
+    .expect("config");
+    // Локальный сокет `admin init` открывается до запуска узла (как `startup::prepare_serve`).
+    let cfg = thepost::sections::registry_of(FLOW_MODULES)
+        .expect("registry")
+        .load(&path)
+        .expect("load config");
+    thepost::local_admin::bind(&cfg).expect("admin init socket");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: FLOW_MODULES,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+    let smtp = addr(&running, "smtp-in");
+    let admin = addr(&running, "admin");
+
+    // Первый администратор: учётная запись, принятый домен и одноразовый токен Admin API.
+    let login = format!("admin@{domain}");
+    let granted = admin_init(&socket, &login).await;
+    assert_eq!(granted["status"], "granted", "{granted}");
+    let token = granted["token"].as_str().expect("token").to_owned();
+
+    // До источника: соединение с 127.0.0.1 — обычный клиент, отправитель любой (снимок настроек прочитан).
+    assert_eq!(mail_from_code(smtp, "robot@other.test").await, 250);
+
+    // Admin API: сессия, версия снимка кластера, источник-приложение организации для 127.0.0.1.
+    let (code, body) = http(
+        admin,
+        "POST",
+        "/api/v1/session",
+        &format!("Bearer {token}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+    let session: Value = serde_json::from_slice(&body).expect("session");
+    let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
+    let (code, body) = http(admin, "GET", "/api/v1/transport", &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let cluster: Value = serde_json::from_slice(&body).expect("cluster");
+    let version = cluster["version"].as_u64().expect("version");
+    let source = json!({
+        "version": version,
+        "matcher": { "networks": ["127.0.0.1/32"] },
+        "kind": { "application": { "senders": ["@allowed.test"], "external": false } },
+    });
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &format!("/api/v1/orgs/{}/transport/sources/app", TenantId::DEFAULT),
+        &bearer,
+        Some(&source),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+
+    // Следующая сессия без перезапуска (сигнал `TransportChanged`): отправитель вне списка источника — отказ.
+    let until = deadline();
+    while mail_from_code(smtp, "robot@other.test").await != 550 {
+        retry(until, "доверенный источник действует на новую сессию").await;
+    }
+    assert_eq!(mail_from_code(smtp, "robot@allowed.test").await, 250);
+
+    // Письмо от приложения: правила потока почты модуля — ровно один вызов.
+    assert_eq!(FLOW_CALLS.load(Ordering::SeqCst), 0);
+    let message = format!(
+        "From: Robot <robot@allowed.test>\nTo: <{login}>\nSubject: transport settings\n\
+         Message-ID: <app09-{}@allowed.test>\n\nScanned document.\n",
+        std::process::id()
+    );
+    smtp_send(smtp, "robot@allowed.test", &login, &message).await;
+    assert_eq!(FLOW_CALLS.load(Ordering::SeqCst), 1);
+
+    shutdown.cancel();
+    let report = running.wait().await.expect("wait");
+    assert!(report.failed.is_empty(), "{report:?}");
     drop_database(&url, &db_name).await;
 }

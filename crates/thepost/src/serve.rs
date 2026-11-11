@@ -62,6 +62,8 @@ pub struct ServeOptions {
     pub telemetry: bool,
     /// Сигнал остановки узла.
     pub shutdown: CancellationToken,
+    /// Модули сборки (`modules::BUILTIN`; тесты — свои модули с точками расширения).
+    pub modules: &'static [modules::Builtin],
 }
 
 impl std::fmt::Debug for ServeOptions {
@@ -112,7 +114,7 @@ impl Running {
 /// Запускает узел и возвращается, когда все компоненты созданы и роли запущены.
 /// Ошибка конфигурации, секретов, СУБД, BLOB или служебного HTTP — до запуска ролей.
 pub async fn start(opts: ServeOptions) -> Result<Running> {
-    let registry = Arc::new(sections::registry()?);
+    let registry = Arc::new(sections::registry_of(opts.modules)?);
     let path = opts.config.clone();
     let reloader = tokio::task::spawn_blocking(move || Reloader::start(registry, path))
         .await
@@ -163,7 +165,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let bus = bus.bus;
     let meta = PgMeta::new(pool, meta_cfg).with_bus(bus.clone());
 
-    let ext = modules::activate(&cfg, &migrations).await?;
+    let ext = modules::activate_of(&cfg, &migrations, opts.modules).await?;
     let store = ext.secret_store().unwrap_or(store);
 
     // Членство: запись узла до чтения состава, иначе узлу не достанется ни одного раздела.
@@ -246,6 +248,12 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             () = abuse.listen(abuse_bus) => {}
         }
     });
+    // Настройки транспорта без перезапуска (APP-09): один снимок на узел, сигналы `TransportChanged` и `Resync`.
+    tokio::spawn(services.routes.clone().watch(
+        bus.clone(),
+        aux.clone(),
+        cfg.section::<SmtpConfig>(sections::SMTP)?.queue.resubscribe,
+    ));
     // Ротация ключей DKIM без перезапуска (SMTP-08).
     tokio::spawn(apply_dkim(
         reloader.subscribe(),
@@ -445,7 +453,10 @@ impl RoleSetup<'_> {
                 };
                 let deps = self.services.smtp_server(&*smtp()?, self.certs.clone())?;
                 (
-                    Arc::new(SmtpRole::new(mode, deps, self.sockets.clone())),
+                    Arc::new(
+                        SmtpRole::new(mode, deps, self.sockets.clone())
+                            .with_sources(self.services.sources()),
+                    ),
                     section(sections::SMTP)?,
                 )
             }
@@ -690,6 +701,7 @@ mod tests {
                 secrets,
                 telemetry: false,
                 shutdown: shutdown.clone(),
+                modules: crate::modules::BUILTIN,
             },
             shutdown,
         )

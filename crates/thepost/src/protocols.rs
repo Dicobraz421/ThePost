@@ -22,6 +22,7 @@ use tp_meta::events::EventConsumer;
 use tp_platform::listen::EndpointConfig;
 use tp_platform::{Config, InheritedSockets, Listener, TlsCerts, service_http};
 use tp_search::{Indexer, IndexerConfig, Rebuilder, SCHEMA_VERSION, SUBSCRIBER};
+use tp_smtp::sources::Sources;
 use tp_smtp::{Mode, ServerDeps, SmtpConfig, SmtpService};
 
 use crate::log_reader::{LogReader, LogSignals};
@@ -206,12 +207,14 @@ async fn idle(name: &str, ctx: &RoleCtx) -> Result<()> {
     Ok(())
 }
 
-/// Роль smtp-in или submission: секция `smtp` (`inbound`, `submission`), сервис `tp-smtp`.
+/// Роль smtp-in или submission: секция `smtp` (`inbound`, `submission`), сервис `tp-smtp`; доверенные источники
+/// приёма (шлюз, приложения) — из снимков настроек транспорта узла ([`SmtpRole::with_sources`]).
 #[derive(Debug, Clone)]
 pub struct SmtpRole {
     mode: Mode,
     deps: ServerDeps,
     sockets: Sockets,
+    sources: Option<Sources>,
 }
 
 impl SmtpRole {
@@ -221,7 +224,14 @@ impl SmtpRole {
             mode,
             deps,
             sockets,
+            sources: None,
         }
+    }
+
+    /// Доверенные источники приёма (SMTP-20): без них соединения — как от обычных клиентов.
+    pub fn with_sources(mut self, sources: Sources) -> Self {
+        self.sources = Some(sources);
+        self
     }
 }
 
@@ -248,9 +258,11 @@ impl RoleService for SmtpRole {
         let listeners = self
             .sockets
             .open(self.name(), endpoints, self.deps.tls.clone())?;
-        SmtpService::new(self.mode, self.deps.clone())
-            .serve(listeners, ctx)
-            .await
+        let mut service = SmtpService::new(self.mode, self.deps.clone());
+        if let Some(sources) = &self.sources {
+            service = service.with_sources(sources.clone());
+        }
+        service.serve(listeners, ctx).await
     }
 }
 

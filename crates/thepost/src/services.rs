@@ -6,6 +6,12 @@
 //! maintenance (`tp_smtp::learn::SpamLearner`, SMTP-18). Проверка учётных данных всех протоколов (SMTP AUTH, IMAP,
 //! POP3, JMAP, Admin API) — через защиту от перебора (`tp_auth::AbuseGuard`, AUTH-08): [`Guarded`].
 //!
+//! Настройки транспорта (APP-09, SRS 4.1) — один снимок на узел ([`Services::routes`], `tp_smtp::routes::Routes`
+//! поверх `PgMeta`): доверенные источники и принятые домены smtp-in и submission, переписывание адресов доставки,
+//! политики доменов назначения smtp-out; перечитывается по сигналам `TransportChanged` и `Resync`
+//! (`Routes::watch` запускает `serve`). Правила потока почты — модуль (`Registry::mail_flow`): один раз на письмо в
+//! доставке smtp-in и submission и в JMAP `EmailSubmission/set` (доставка JMAP их не применяет повторно).
+//!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
 use std::sync::Arc;
@@ -27,6 +33,7 @@ use tp_contracts::meta::{
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
+use tp_contracts::transport::MailFlow;
 use tp_contracts::{Error, Result, TenantId};
 use tp_meta::PgMeta;
 use tp_platform::{Config, Metrics, RateLimitConfig, RateLimiter, TlsCerts};
@@ -34,7 +41,10 @@ use tp_search::{
     DocumentSource, Extractor, IndexCache, IndexDoc, IndexManager, IndexStore, Indexer, Rebuilder,
     Search, SearchConfig,
 };
+use tp_smtp::forward::Forwarding;
 use tp_smtp::queue::{QueueDeps, system_now};
+use tp_smtp::routes::Routes;
+use tp_smtp::sources::Sources;
 use tp_smtp::{
     AuthCheck, Delivery, Groups, Milters, Queue, QueueWorker, SendLimits, SmtpConfig, SmtpMetrics,
     Tracking,
@@ -95,8 +105,13 @@ pub struct Services {
     /// Защита от перебора (AUTH-08): счётчики неудач узла, блокировки — на всех узлах; сигналы блокировок —
     /// `AbuseGuard::listen` (запускает `serve`).
     pub abuse: tp_auth::AbuseGuard,
-    /// Хранилище секретов узла (модуля, если подключён): пароль Rspamd controller.
+    /// Хранилище секретов узла (модуля, если подключён): пароль Rspamd controller, ключи SRS и ARC пересылки.
     pub secrets: Arc<dyn SecretStore>,
+    /// Снимки настроек транспорта узла (`PgMeta`), общие для smtp-in, submission, smtp-out и JMAP; сигналы
+    /// `TransportChanged` и `Resync` — `Routes::watch` (запускает `serve`).
+    pub routes: Arc<Routes>,
+    /// Правила потока почты модуля (`Registry::mail_flow`); `None` — модуль не включён.
+    pub mail_flow: Option<Arc<dyn MailFlow>>,
 }
 
 impl std::fmt::Debug for Services {
@@ -271,6 +286,7 @@ impl Services {
         cfg.section::<tp_jmap::JmapConfig>(JMAP)?;
         cfg.section::<AdminSection>(ADMIN)?;
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
+        let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
 
         Ok(Self {
             tenant,
@@ -298,12 +314,29 @@ impl Services {
             tracking,
             abuse,
             secrets,
+            routes,
+            mail_flow: ext.mail_flow(),
         })
     }
 
     /// Доставка и обработчик транзакций SMTP (smtp-in, submission): проверки SPF/DKIM/DMARC/ARC, Milter, очередь,
-    /// группы рассылки с модерацией и журнал доставки.
+    /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC) и правила потока
+    /// почты модуля (если включён).
     pub fn delivery(&self, smtp: &SmtpConfig) -> Result<Arc<Delivery>> {
+        let delivery = self.base_delivery(smtp)?;
+        Ok(Arc::new(match &self.mail_flow {
+            Some(flow) => delivery.with_mail_flow(
+                flow.clone(),
+                self.blob.clone(),
+                Arc::new(self.meta.clone()),
+            ),
+            None => delivery,
+        }))
+    }
+
+    /// Доставка без правил потока почты: JMAP применяет их сам до `DecisionHooks::on_submission`
+    /// (`Jmap::with_mail_flow`), повторный вызов нарушил бы «один раз на письмо».
+    fn base_delivery(&self, smtp: &SmtpConfig) -> Result<Delivery> {
         let resolver = system_resolver()?;
         let milter = (!smtp.milter.filters.is_empty())
             .then(|| Arc::new(Milters::new(smtp.milter.clone(), smtp.hostname.clone())));
@@ -324,11 +357,17 @@ impl Services {
             self.blob.clone(),
             Arc::new(self.meta.clone()),
         );
-        Ok(Arc::new(
-            Delivery::new(deps, smtp)
-                .with_groups(groups)
-                .with_tracking(self.tracking.clone()),
-        ))
+        let forwarding = Forwarding::new(self.secrets.clone(), smtp.forward.clone());
+        Ok(Delivery::new(deps, smtp)
+            .with_groups(groups)
+            .with_tracking(self.tracking.clone())
+            .with_transport(self.routes.clone())
+            .with_forwarding(Arc::new(forwarding)))
+    }
+
+    /// Доверенные источники приёма smtp-in и submission (шлюз, приложения) из снимков узла.
+    pub fn sources(&self) -> Sources {
+        Sources::new(self.routes.clone())
     }
 
     /// Зависимости ролей smtp-in и submission.
@@ -348,7 +387,8 @@ impl Services {
     }
 
     /// Обработчик очереди роли smtp-out: доставка на MX с MTA-STS и DANE, уведомления — в ту же очередь; политики
-    /// доменов назначения организаций (SMTP-15) — из `tp-meta`, перечитываются по сигналу шины `TransportChanged`.
+    /// доменов назначения организаций (SMTP-15) и внутренняя ретрансляция — из снимков узла [`Services::routes`]
+    /// (перечитывает их `Routes::watch` узла, у роли своей подписки нет).
     pub fn queue_worker(&self, smtp: &SmtpConfig) -> Result<QueueWorker> {
         let transport = tp_smtp::queue::send::MxTransport::new(
             system_resolver()?,
@@ -366,10 +406,7 @@ impl Services {
         .with_dsn(self.queue.clone())
         .with_metrics(self.smtp_metrics.clone())
         .with_tracking(self.tracking.clone())
-        .with_routes(
-            Arc::new(tp_smtp::routes::Routes::new(Arc::new(self.meta.clone()))),
-            Some(self.bus.clone()),
-        ))
+        .with_routes(self.routes.clone(), None))
     }
 
     /// Зависимости IMAP.
@@ -399,7 +436,7 @@ impl Services {
     }
 
     /// Сервер JMAP; отправка — через доставку SMTP (CMP-07): локальным адресатам — сразу в ящики, внешним — в
-    /// очередь SMTP с DKIM-подписью.
+    /// очередь SMTP с DKIM-подписью. Правила потока почты модуля — в `EmailSubmission/set` (`Jmap::with_mail_flow`).
     pub fn jmap(
         &self,
         ext: &Registry,
@@ -407,7 +444,7 @@ impl Services {
         smtp: &SmtpConfig,
     ) -> Result<tp_jmap::Jmap> {
         // `Delivery` — `tp_contracts::queue::Outbound` (CTR-28): статус по получателю — в `deliveryStatus`.
-        let outbound: Arc<dyn Outbound> = self.delivery(smtp)?;
+        let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
         let deps = tp_jmap::Deps {
             auth: self.authn.clone(),
             mailboxes: Arc::new(self.meta.clone()),
@@ -429,7 +466,9 @@ impl Services {
             trash: Arc::new(self.meta.clone()),
             policies: Arc::new(self.meta.clone()),
         };
-        tp_jmap::Jmap::new(deps, cfg).map_err(|e| infra::context("jmap", e))
+        Ok(tp_jmap::Jmap::new(deps, cfg)
+            .map_err(|e| infra::context("jmap", e))?
+            .with_mail_flow(self.mail_flow.clone()))
     }
 
     /// Admin API.

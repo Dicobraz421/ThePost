@@ -58,6 +58,11 @@ pub const HTTP: &str = "http";
 
 /// Реестр секций: платформа, `tp-meta`, приложение и встроенные модули; проверки каналов.
 pub fn registry() -> Result<SectionRegistry> {
+    registry_of(modules::BUILTIN)
+}
+
+/// Как [`registry`] с секциями модулей `builtin` (тесты — свои модули).
+pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     let mut r = SectionRegistry::new();
     r.add_section::<PoolConfig>(PoolConfig::SECTION)?;
     r.add_section::<MetaConfig>(MetaConfig::SECTION)?;
@@ -82,7 +87,7 @@ pub fn registry() -> Result<SectionRegistry> {
     r.add_check::<AdminSection>(ADMIN, |c, _| c.0.check())?;
     r.add_check::<AuthSection>(AUTH, AuthSection::check)?;
     r.add_check::<HttpSection>(HTTP, HttpSection::check)?;
-    modules::register_sections(&mut r)?;
+    modules::register_sections_of(&mut r, builtin)?;
     Ok(r)
 }
 
