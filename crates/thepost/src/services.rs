@@ -950,7 +950,7 @@ mod tests {
             .expect("registry")
             .parse(
                 "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
-                 database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n\
+                 database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\n\
                  blob:\n  url: file:///var/lib/thepost/blob\n",
                 Vec::new(),
             )
