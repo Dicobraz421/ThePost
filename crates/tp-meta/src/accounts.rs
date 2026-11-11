@@ -10,6 +10,40 @@ use crate::PgMeta;
 use crate::mailboxes;
 use crate::schema::{begin, db_err, to_u64};
 
+/// `AccountStore::list` без верхней границы префикса (пустой префикс или одни `U+10FFFF`): `$1` — организация,
+/// `$2` — префикс, `$3` — курсор (строго больше), `$4` — лимит. Открыт для проверки плана (`EXPLAIN`) в тестах.
+pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+    FROM accounts
+    WHERE tenant_id = $1 AND lower(login) COLLATE "C" >= $2 AND starts_with(lower(login), $2)
+      AND lower(login) COLLATE "C" > $3
+    ORDER BY lower(login) COLLATE "C" LIMIT $4"#;
+
+/// Как [`LIST_SQL`], префикс — диапазоном `>= $2 AND < $5` (`$5` — `prefix_next`), не `starts_with` и не `LIKE`
+/// (`%` и `_` в префиксе — обычные знаки).
+pub const LIST_PREFIX_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+    FROM accounts
+    WHERE tenant_id = $1 AND lower(login) COLLATE "C" >= $2 AND lower(login) COLLATE "C" < $5
+      AND lower(login) COLLATE "C" > $3
+    ORDER BY lower(login) COLLATE "C" LIMIT $4"#;
+
+/// Наименьшая строка больше всех строк с префиксом `prefix` в побайтном порядке (он совпадает с порядком кодовых
+/// точек UTF-8): последний знак меньше `U+10FFFF` заменяется следующим (суррогаты пропускаются), хвост
+/// отбрасывается. `None` — границы нет (пустой префикс или одни `U+10FFFF`).
+fn prefix_next(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(c) = chars.pop() {
+        let next = match c {
+            '\u{D7FF}' => Some('\u{E000}'),
+            c => char::from_u32(u32::from(c) + 1),
+        };
+        if let Some(next) = next {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
 #[derive(FromRow)]
 struct AccountRow {
     account_id: Uuid,
@@ -177,8 +211,9 @@ impl AccountStore for PgMeta {
         .await
     }
 
-    /// Курсор по индексу `accounts_login (tenant_id, lower(login))`: порядок — сравнение строк базы
-    /// (правило сортировки по умолчанию), префикс — `starts_with` (побайтно).
+    /// Побайтный порядок (`COLLATE "C"`, как хранилище в памяти) по индексу `accounts_login_c`: курсор и префикс —
+    /// границы диапазона по нему ([`LIST_SQL`], [`LIST_PREFIX_SQL`]). `after = None` — пустая строка: имена входа
+    /// не пусты.
     async fn list(
         &self,
         tenant: TenantId,
@@ -187,30 +222,24 @@ impl AccountStore for PgMeta {
         limit: usize,
     ) -> Result<Vec<Account>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let next = prefix_next(prefix);
+        let (next, after) = (next.as_deref(), after.unwrap_or(""));
         self.idempotent(|| async move {
             let mut tx = begin(&self.pool, tenant).await?;
-            let rows: Vec<AccountRow> = match after {
-                None => sqlx::query_as(
-                    "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
-                 FROM accounts WHERE tenant_id = $1 AND starts_with(lower(login), $2)
-                 ORDER BY lower(login) LIMIT $3",
-                )
+            let sql = if next.is_some() {
+                LIST_PREFIX_SQL
+            } else {
+                LIST_SQL
+            };
+            let mut q = sqlx::query_as(sql)
                 .bind(tenant.as_uuid())
                 .bind(prefix)
-                .bind(limit),
-                Some(after) => sqlx::query_as(
-                    "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
-                 FROM accounts WHERE tenant_id = $1 AND starts_with(lower(login), $2) AND lower(login) > $4
-                 ORDER BY lower(login) LIMIT $3",
-                )
-                .bind(tenant.as_uuid())
-                .bind(prefix)
-                .bind(limit)
-                .bind(after),
+                .bind(after)
+                .bind(limit);
+            if let Some(next) = next {
+                q = q.bind(next);
             }
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?;
+            let rows: Vec<AccountRow> = q.fetch_all(&mut *tx).await.map_err(db_err)?;
             tx.commit().await.map_err(db_err)?;
             Ok(rows.into_iter().map(Account::from).collect())
         })
@@ -251,5 +280,36 @@ impl AccountStore for PgMeta {
             })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_next;
+
+    #[test]
+    fn prefix_next_is_least_upper_bound() {
+        assert_eq!(prefix_next(""), None);
+        assert_eq!(prefix_next("ab").as_deref(), Some("ac"));
+        assert_eq!(prefix_next("a_").as_deref(), Some("a`"));
+        assert_eq!(prefix_next("a%").as_deref(), Some("a&"));
+        assert_eq!(prefix_next("é").as_deref(), Some("ê"));
+        assert_eq!(prefix_next("z\u{D7FF}").as_deref(), Some("z\u{E000}"));
+        assert_eq!(prefix_next("a\u{10FFFF}").as_deref(), Some("b"));
+        assert_eq!(prefix_next("\u{10FFFF}\u{10FFFF}"), None);
+        // Граница больше любой строки с префиксом и не больше следующей за ними.
+        for p in ["ab", "a.", "ю", "a\u{10FFFF}"] {
+            let next = prefix_next(p).expect("граница");
+            for s in [
+                p.to_owned(),
+                format!("{p}\u{10FFFF}zz"),
+                format!("{p}@d.test"),
+            ] {
+                assert!(
+                    s.as_bytes() >= p.as_bytes() && s.as_bytes() < next.as_bytes(),
+                    "{p:?} {s:?}"
+                );
+            }
+        }
     }
 }

@@ -2252,9 +2252,12 @@ pub struct AccountListFixture {
     pub foreign_domain: DomainId,
 }
 
-/// Набор проверок `AccountStore::list` (CTR-44): порядок по имени входа в нижнем регистре, страницы и курсор
-/// `after` (строго больше, в том числе несуществующего имени), префикс, регистр, `limit = 0`, изоляция организаций.
-/// Имена входа различаются в первых буквах — порядок одинаков побайтно и по правилам сортировки базы.
+/// Набор проверок `AccountStore::list` (CTR-44, META-45): побайтный порядок имени входа в нижнем регистре, страницы и
+/// курсор `after` (строго больше, в том числе несуществующего имени), префикс (обычные знаки, не шаблон `LIKE`),
+/// регистр, `limit = 0`, изоляция организаций. Имена различаются знаками `.`, `-`, `_` и не-ASCII: побайтно
+/// `-` < `.` < `@` < `_` < буквы < не-ASCII, правила сортировки базы (en_US) дали бы иной порядок. Не-ASCII — буквы
+/// с простым соответствием регистров (`É`, `Ю`): `str::to_lowercase` и `lower` PostgreSQL с UTF-8 `LC_CTYPE`
+/// совпадают; знаки с особыми правилами (`İ`, `Σ`) в набор не входят.
 pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) {
     let login = |n: &str| format!("{n}@{}", fx.domain_name);
     let lower = |n: &str| login(n).to_lowercase();
@@ -2267,7 +2270,10 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
     assert_eq!(list(fx.tenant, "", None, 10).await, Vec::new());
 
     let mut created = std::collections::BTreeMap::new();
-    for n in ["boris", "Anton", "dina", "anna", "BELLA"] {
+    for n in [
+        "boris", "Anton", "dina", "anna", "BELLA", "e_va", "eva", "e.va", "Юрий", "e", "Émile",
+        "e-va",
+    ] {
         let acc = accounts
             .upsert(
                 fx.tenant,
@@ -2299,11 +2305,12 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
     let accs =
         |names: &[&str]| -> Vec<Account> { names.iter().map(|n| created[n].clone()).collect() };
 
-    // Весь список: по возрастанию имени в нижнем регистре, без чужой организации.
-    assert_eq!(
-        list(fx.tenant, "", None, 10).await,
-        accs(&["anna", "Anton", "BELLA", "boris", "dina"])
-    );
+    // Весь список: побайтно по возрастанию имени в нижнем регистре, без чужой организации.
+    let all = [
+        "anna", "Anton", "BELLA", "boris", "dina", "e-va", "e.va", "e", "e_va", "eva", "Émile",
+        "Юрий",
+    ];
+    assert_eq!(list(fx.tenant, "", None, 20).await, accs(&all));
     // Страницы по курсору последней записи; после последней — пусто.
     assert_eq!(list(fx.tenant, "", None, 2).await, accs(&["anna", "Anton"]));
     assert_eq!(
@@ -2312,16 +2319,30 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
     );
     assert_eq!(
         list(fx.tenant, "", Some(lower("boris")), 2).await,
-        accs(&["dina"])
+        accs(&["dina", "e-va"])
     );
+    // Страницы по всему списку курсором последней записи дают весь список.
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let page = list(fx.tenant, "", after, 2).await;
+        let Some(last) = page.last() else { break };
+        after = Some(last.login.to_lowercase());
+        paged.extend(page);
+    }
+    assert_eq!(paged, accs(&all));
     assert_eq!(
-        list(fx.tenant, "", Some(lower("dina")), 2).await,
+        list(fx.tenant, "", Some(lower("Юрий")), 2).await,
         Vec::new()
     );
     // Курсор — не обязательно существующее имя; строго больше.
     assert_eq!(
-        list(fx.tenant, "", Some("b".into()), 10).await,
-        accs(&["BELLA", "boris", "dina"])
+        list(fx.tenant, "", Some("b".into()), 20).await,
+        accs(&all[2..])
+    );
+    assert_eq!(
+        list(fx.tenant, "", Some("e/".into()), 20).await,
+        accs(&["e", "e_va", "eva", "Émile", "Юрий"])
     );
     // Префикс в нижнем регистре находит имена в любом регистре; с курсором.
     assert_eq!(
@@ -2336,7 +2357,24 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
         list(fx.tenant, "an", Some(lower("anna")), 10).await,
         accs(&["Anton"])
     );
-    assert_eq!(list(fx.tenant, "x", None, 10).await, Vec::new());
+    // Префикс со знаками: `e` — без `é`; `_` и `%` — обычные знаки; не-ASCII в любом регистре.
+    assert_eq!(
+        list(fx.tenant, "e", None, 10).await,
+        accs(&["e-va", "e.va", "e", "e_va", "eva"])
+    );
+    assert_eq!(
+        list(fx.tenant, "e", Some(lower("e.va")), 10).await,
+        accs(&["e", "e_va", "eva"])
+    );
+    assert_eq!(list(fx.tenant, "e_", None, 10).await, accs(&["e_va"]));
+    assert_eq!(list(fx.tenant, "e.", None, 10).await, accs(&["e.va"]));
+    assert_eq!(list(fx.tenant, "e-", None, 10).await, accs(&["e-va"]));
+    assert_eq!(list(fx.tenant, "e@", None, 10).await, accs(&["e"]));
+    assert_eq!(list(fx.tenant, "é", None, 10).await, accs(&["Émile"]));
+    assert_eq!(list(fx.tenant, "юр", None, 10).await, accs(&["Юрий"]));
+    for none in ["x", "%", "e%", "_"] {
+        assert_eq!(list(fx.tenant, none, None, 10).await, Vec::new(), "{none}");
+    }
     assert_eq!(list(fx.tenant, "", None, 0).await, Vec::new());
     // Другая организация видит только своё.
     assert_eq!(list(fx.foreign_tenant, "", None, 10).await, vec![foreign]);

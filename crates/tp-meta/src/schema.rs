@@ -85,6 +85,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "local admin tokens",
         include_str!("../migrations/0018_local_admin_tokens.sql"),
     ),
+    (
+        19,
+        "accounts login c",
+        include_str!("../migrations/0019_accounts_login_c.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
