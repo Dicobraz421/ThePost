@@ -410,6 +410,9 @@
 | [ADM-12](ADM-12.md) | постраничный список учётных записей в Admin API | admin | A | admin-07 | ready | ADM-11 |
 | [APP-20](APP-20.md) | fail_closed защиты от перебора в узле, устаревший TODO doctor | app | A | app-19 | todo | AUTH-11,APP-08 |
 | [APP-21](APP-21.md) | CLI thepost admin на структурах tp-admin | app | A | app-20 | todo | APP-11 |
+| [CTR-44](CTR-44.md) | AccountStore::list — постраничный список учётных записей | contracts | B | contracts-32 | todo | ADM-12 |
+| [ADM-13](ADM-13.md) | Serialize и Deserialize у структур Admin API | admin | A | admin-08 | todo | ADM-12 |
+| [APP-22](APP-22.md) | CLI thepost admin без копий структур | app | A | app-21 | todo | ADM-13,APP-21 |
 | [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | todo | SMTP-20 |
 | [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | todo | CTR-31,SMTP-22 |
 | [META-44](META-44.md) | очередь модерации без группы в PostgreSQL | meta | B | meta-28 | todo | CTR-43 |
