@@ -386,7 +386,10 @@ async fn move_trash_restore_expunge_and_changes() {
         .expect("get")
         .expect("a");
     assert_eq!((in_trash.mailbox, in_trash.modseq), (trash, trashed_at));
-    assert_eq!(in_trash.flags, Flags::from([Flag::Seen]));
+    assert_eq!(
+        in_trash.flags,
+        Flags::from([Flag::Seen, Flag::Keyword("$Forwarded".into())])
+    );
     // Повтор и отсутствующие письма — без изменений.
     assert_eq!(
         meta.to_trash(scope, &[a.id, MessageId::new()])
