@@ -255,7 +255,7 @@ pub(crate) async fn mkcol(
     }
     let el = match cx.xml(body).await {
         Ok(el) => el,
-        Err(resp) => return Ok(resp),
+        Err(code) => return Ok(status(code)),
     };
     let set: Vec<&Element> = match &el {
         None => Vec::new(),

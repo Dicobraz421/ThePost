@@ -85,7 +85,7 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, body: Body) -> Result<R
     let el = match cx.xml(body).await {
         Ok(Some(el)) => el,
         Ok(None) => return Ok(status(StatusCode::BAD_REQUEST)),
-        Err(resp) => return Ok(resp),
+        Err(code) => return Ok(status(code)),
     };
     let req = match SyncRequest::parse(&el) {
         Ok(r) => r,

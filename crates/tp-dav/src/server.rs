@@ -113,7 +113,7 @@ impl Cx<'_> {
     }
 
     /// XML-тело запроса: пустое — `None`; больше лимита — 413, неверное — 400.
-    pub(crate) async fn xml(&self, body: Body) -> Result<Option<Element>, Response> {
+    pub(crate) async fn xml(&self, body: Body) -> Result<Option<Element>, StatusCode> {
         let bytes = read(body, self.dav.cfg.max_request_size).await?;
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return Ok(None);
@@ -122,17 +122,17 @@ impl Cx<'_> {
             Ok(el) => Ok(Some(el)),
             Err(e) => {
                 tracing::debug!(error = %e, "неверное XML-тело DAV");
-                Err(status(StatusCode::BAD_REQUEST))
+                Err(StatusCode::BAD_REQUEST)
             }
         }
     }
 }
 
 /// Тело не больше `limit` байт; больше — 413.
-pub(crate) async fn read(body: Body, limit: usize) -> Result<Bytes, Response> {
+pub(crate) async fn read(body: Body, limit: usize) -> Result<Bytes, StatusCode> {
     to_bytes(body, limit)
         .await
-        .map_err(|_| status(StatusCode::PAYLOAD_TOO_LARGE))
+        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)
 }
 
 async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {

@@ -275,7 +275,8 @@ fn collection_props(cx: &Cx<'_>, c: &Collection, me: &str, v: &mut Vec<(PropName
 fn groups(cx: &Cx<'_>, res: &Res<'_>, want: &Want) -> Vec<Group> {
     let all = properties(cx, res);
     let find = |n: &PropName| all.iter().find(|(k, _)| k == n).cloned();
-    let (mut ok, mut missing) = (Vec::new(), Vec::new());
+    let mut ok: Vec<(PropName, String)> = Vec::new();
+    let mut missing: Vec<(PropName, String)> = Vec::new();
     match want {
         Want::Names => {
             ok = all
@@ -342,7 +343,7 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
     };
     let el = match cx.xml(body).await {
         Ok(el) => el,
-        Err(resp) => return Ok(resp),
+        Err(code) => return Ok(status(code)),
     };
     let Some(want) = Want::parse(el.as_ref()) else {
         return Ok(status(StatusCode::BAD_REQUEST));
@@ -507,7 +508,7 @@ pub(crate) fn status_groups(results: Vec<(PropName, StatusCode)>) -> Vec<Group> 
 pub(crate) async fn proppatch(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Response> {
     let el = match cx.xml(body).await {
         Ok(el) => el,
-        Err(resp) => return Ok(resp),
+        Err(code) => return Ok(status(code)),
     };
     let Some(ops) = el.as_ref().and_then(updates) else {
         return Ok(status(StatusCode::BAD_REQUEST));

@@ -72,7 +72,7 @@ pub fn calendar(body: &str, opts: &IndexOptions) -> Result<ObjectIndex, IndexErr
     {
         return Err(IndexError::Calendar);
     }
-    let mut component = None;
+    let mut component: Option<Component> = None;
     let mut uid: Option<&str> = None;
     for comp in &ical.components {
         let c = match comp.component_type {
