@@ -68,18 +68,18 @@ async fn enqueue_validation() {
     let tenant = common::tenant(meta.pool()).await;
     let now = clock();
     assert!(matches!(
-        meta.enqueue(message(tenant, &[], now)).await,
+        meta.enqueue(None, message(tenant, &[], now)).await,
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        meta.enqueue(message(tenant, &["b@x.test", "b@x.test"], now))
+        meta.enqueue(None, message(tenant, &["b@x.test", "b@x.test"], now))
             .await,
         Err(Error::Invalid(_))
     ));
     let mut foreign = message(tenant, &["b@x.test"], now);
     foreign.blob.tenant = TenantId::new();
     assert!(matches!(
-        meta.enqueue(foreign).await,
+        meta.enqueue(None, foreign).await,
         Err(Error::Invalid(_))
     ));
 }
@@ -94,7 +94,7 @@ async fn claim_fencing_and_completion(meta: &PgMeta) {
         ..DsnNotify::default()
     });
     msg.rcpts[1].orcpt = Some("rfc822;c@x.test".into());
-    let id = meta.enqueue(msg.clone()).await.expect("enqueue");
+    let id = meta.enqueue(None, msg.clone()).await.expect("enqueue");
     let own: HashSet<QueueId> = [id].into();
 
     // До срока попытки запись не выдаётся.
@@ -198,7 +198,7 @@ async fn retry_by_time(meta: &PgMeta) {
     let tenant = common::tenant(meta.pool()).await;
     let now = clock() + time::Duration::days(2);
     let id = meta
-        .enqueue(message(tenant, &["b@x.test", "c@x.test"], now))
+        .enqueue(None, message(tenant, &["b@x.test", "c@x.test"], now))
         .await
         .expect("enqueue");
     let own: HashSet<QueueId> = [id].into();
@@ -265,7 +265,7 @@ async fn concurrent_claim_once(meta: Arc<PgMeta>) {
     for i in 0..40 {
         let at = now - time::Duration::seconds(i);
         own.insert(
-            meta.enqueue(message(tenant, &["b@x.test"], at))
+            meta.enqueue(None, message(tenant, &["b@x.test"], at))
                 .await
                 .expect("enqueue"),
         );

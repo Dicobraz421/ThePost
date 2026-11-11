@@ -1002,7 +1002,9 @@ impl MemQueue {
 
 #[async_trait]
 impl QueueStore for MemQueue {
-    async fn enqueue(&self, msg: OutMessage) -> Result<QueueId> {
+    async fn enqueue(&self, owner: Option<AccountId>, msg: OutMessage) -> Result<QueueId> {
+        // Очередь в памяти без шардов: учётная запись отправителя не используется (CTR-49).
+        let _ = owner;
         if msg.rcpts.is_empty() {
             return Err(Error::invalid("queue: no recipients"));
         }
@@ -1993,15 +1995,15 @@ mod tests {
         let sec = time::Duration::seconds;
         let lease = Duration::from_secs(300);
         assert!(matches!(
-            q.enqueue(out(&[], t0)).await,
+            q.enqueue(None, out(&[], t0)).await,
             Err(Error::Invalid(_))
         ));
         assert!(matches!(
-            q.enqueue(out(&["x@a", "x@a"], t0)).await,
+            q.enqueue(None, out(&["x@a", "x@a"], t0)).await,
             Err(Error::Invalid(_))
         ));
         let id = q
-            .enqueue(out(&["b@example.com", "c@example.com"], t0))
+            .enqueue(None, out(&["b@example.com", "c@example.com"], t0))
             .await
             .expect("enqueue");
         assert_eq!((q.len(), q.blobs().len()), (1, 1));
@@ -2119,10 +2121,10 @@ mod tests {
         let q = MemQueue::new(clock.shared());
         let t0 = clock.now();
         let late = q
-            .enqueue(out(&["a@x"], t0 + time::Duration::seconds(5)))
+            .enqueue(None, out(&["a@x"], t0 + time::Duration::seconds(5)))
             .await
             .expect("late");
-        let early = q.enqueue(out(&["a@x"], t0)).await.expect("early");
+        let early = q.enqueue(None, out(&["a@x"], t0)).await.expect("early");
         let now = t0 + time::Duration::seconds(10);
         let first = q
             .claim(now, 1, Duration::from_secs(60))

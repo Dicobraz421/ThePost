@@ -307,8 +307,8 @@ async fn next_signal(stream: &mut EventStream) -> Option<Event> {
         .expect("сигнал не пришёл")
 }
 
-/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37, CTR-39): `LogAppended`, `MembersChanged`, `Blocked`,
-/// `Unblocked`, `TrashChanged` приходят
+/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37, CTR-39, CTR-49): `LogAppended`, `MembersChanged`,
+/// `ShardsChanged`, `Blocked`, `Unblocked`, `TrashChanged` приходят
 /// в `subscribe_system()` и не приходят подписке учётной записи; `publish(Resync)` — `Invalid`.
 /// «Не пришло» проверяется тем, что первым пришёл сигнал, опубликованный позже.
 pub async fn signals(bus: &dyn EventBus) {
@@ -331,6 +331,7 @@ pub async fn signals(bus: &dyn EventBus) {
             },
         ),
         system(TenantId::DEFAULT, EventKind::MembersChanged),
+        system(TenantId::DEFAULT, EventKind::ShardsChanged),
         system(
             scope.tenant,
             EventKind::Blocked {
@@ -1627,11 +1628,14 @@ pub async fn submission_store(
 /// чужие записи учёта не мешают.
 pub async fn blob_compression(index: &dyn BlobIndex, tenant: TenantId) {
     let fresh = fresh_hash;
-    let absent =
-        async |hash: &BlobHash| match index.acquire(tenant, hash, 1).await.expect("acquire") {
-            Acquire::Absent { generation } => generation,
-            other => panic!("ожидался Absent: {other:?}"),
-        };
+    let absent = async |hash: &BlobHash| match index
+        .acquire(tenant, None, hash, 1)
+        .await
+        .expect("acquire")
+    {
+        Acquire::Absent { generation } => generation,
+        other => panic!("ожидался Absent: {other:?}"),
+    };
     let done = |c: Commit| match c {
         Commit::Done { generation } => generation,
         other => panic!("ожидался Done: {other:?}"),
@@ -1657,7 +1661,7 @@ pub async fn blob_compression(index: &dyn BlobIndex, tenant: TenantId) {
         Ok(Some(Compression::Zstd))
     );
     assert!(matches!(
-        index.acquire(tenant, &zstd, 1).await,
+        index.acquire(tenant, None, &zstd, 1).await,
         Ok(Acquire::Existing { generation }) if generation == g
     ));
     assert_eq!(
@@ -1711,7 +1715,11 @@ pub async fn blob_gc_due(index: &dyn BlobIndex, tenant: TenantId) {
     const W: Duration = Duration::from_secs(3600);
     let w = time::Duration::HOUR;
     let hash = fresh_hash();
-    let generation = match index.acquire(tenant, &hash, 1).await.expect("acquire") {
+    let generation = match index
+        .acquire(tenant, None, &hash, 1)
+        .await
+        .expect("acquire")
+    {
         Acquire::Absent { generation } => generation,
         other => panic!("ожидался Absent: {other:?}"),
     };
@@ -3120,19 +3128,22 @@ pub async fn queue_postpone(queue: &dyn QueueStore, tenant: TenantId) {
     let sec = time::Duration::seconds;
     let lease = Duration::from_secs(30);
     let id = queue
-        .enqueue(OutMessage {
-            tenant,
-            blob: BlobKey {
+        .enqueue(
+            None,
+            OutMessage {
                 tenant,
-                hash: fresh_hash(),
-                generation: Gen::INITIAL,
+                blob: BlobKey {
+                    tenant,
+                    hash: fresh_hash(),
+                    generation: Gen::INITIAL,
+                },
+                size: 100,
+                from: "a@example.org".into(),
+                dsn: DsnParams::default(),
+                rcpts: vec![OutRcpt::new("b@example.net"), OutRcpt::new("c@example.net")],
+                next_attempt: t0,
             },
-            size: 100,
-            from: "a@example.org".into(),
-            dsn: DsnParams::default(),
-            rcpts: vec![OutRcpt::new("b@example.net"), OutRcpt::new("c@example.net")],
-            next_attempt: t0,
-        })
+        )
         .await
         .expect("enqueue");
     let claim_own = async |now: OffsetDateTime| {
@@ -4163,7 +4174,7 @@ pub async fn queue_release(queue: &dyn QueueStore, tenant: TenantId) {
     let delayed = message(t0 + sec(3600));
     let blob = delayed.blob;
     assert_eq!(delayed.release_at(), t0 + sec(3600));
-    let id = queue.enqueue(delayed).await.expect("enqueue delayed");
+    let id = queue.enqueue(None, delayed).await.expect("enqueue delayed");
     assert!(claim_own(id, t0).await.is_none(), "not released yet");
     assert_eq!(
         queue.cancel_queued(TenantId::new(), id).await,
@@ -4173,7 +4184,10 @@ pub async fn queue_release(queue: &dyn QueueStore, tenant: TenantId) {
     assert_eq!(queue.cancel_queued(tenant, id).await, Err(Error::NotFound));
     assert!(claim_own(id, t0 + sec(7200)).await.is_none(), "canceled");
 
-    let id = queue.enqueue(message(t0 + sec(60))).await.expect("enqueue");
+    let id = queue
+        .enqueue(None, message(t0 + sec(60)))
+        .await
+        .expect("enqueue");
     let c = claim_own(id, t0 + sec(60)).await.expect("released");
     assert!(c.queued_at >= t0 + sec(60), "queued_at from release");
     assert_eq!(queue.cancel_queued(tenant, id).await, Err(Error::Conflict));

@@ -34,8 +34,11 @@ SRS 3.2. Объекты неизменяемы, запись идемпотен�
 
 ## BlobIndex
 SRS 3.4. Учёт объектов в метаданных. Реализация — `tp-meta`; in-memory — `tp-testkit`.
-- `acquire(tenant, hash, refs: u32) -> Result<Acquire>`; `Acquire::Existing { generation }` — ссылки добавлены,
-  загрузка не нужна; `Acquire::Absent { generation }` — загрузить по нему и вызвать `commit_new`.
+- `acquire(tenant, owner: Option<AccountId>, hash, refs: u32) -> Result<Acquire>`; `Acquire::Existing { generation }` — ссылки
+  добавлены, загрузка не нужна; `Acquire::Absent { generation }` — загрузить по нему и вызвать `commit_new`. `owner` (CTR-49,
+  решение 46) — учётная запись, для ящика или отправки которой берутся ссылки: хранилище с шардами выбирает по ней шард учёта;
+  `None` — владельца нет или ссылки на ящики нескольких учётных записей. Хранилища без шардов `owner` не используют; `tp-meta`
+  со справочником пока ведёт учёт в основной БД (`commit_new`, `release` учётной записи не получают).
 - `commit_new(tenant, hash, generation, size, refs) -> Result<Commit>`; `Commit::Done { generation }` (письмо ссылается
   на это поколение) или `Commit::Bumped { generation }` — запись была `deleting`: загрузить по новому `gen` и повторить `commit_new`.
 - `release(tenant, hash, generation, refs) -> Result<()>` — при обнулении фиксирует `zero_since`.
@@ -124,13 +127,16 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
 LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } |
-DavChanged { kind, collection, modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+ShardsChanged | DavChanged { kind, collection, modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
 `MailboxListChanged`, `DavChanged`, `SieveChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
-`MembersChanged` — с `TenantId::DEFAULT`, `Blocked`, `Unblocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
+`MembersChanged`, `ShardsChanged` — с `TenantId::DEFAULT`, `Blocked`, `Unblocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
 Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер); in-memory — `MemEventBus` (отставание — `Resync`).
 Доставка — at-most-once; клиент при запуске, после переподключения и по `Resync` сверяется с хранилищем. Публикация — только после фиксации,
-вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`, `DavChanged` — `DavStore`, `SieveChanged` — `SieveStore`. Набор `suite::signals`.
+вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`, `DavChanged` — `DavStore`, `SieveChanged` — `SieveStore`,
+`ShardsChanged` (CTR-49, решение 47) — тот, кто меняет справочник шардов (модуль «Шардирование», администрирование): добавлен или выведен
+шард, изменились адрес или реплика, учётная запись перенесена; узлы сбрасывают кэш справочника (`tp_meta::shards::ShardDirectory::follow`).
+Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
 ## Lease
@@ -441,8 +447,9 @@ moderators } }, envelope, message: Option<BlobRef>, route: Option<String>, match
 
 ## Queue (Ф1)
 SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организаций; время передаёт вызывающий):
-`enqueue(OutMessage { tenant, blob, size, from, dsn: DsnParams { envid, ret }, rcpts: Vec<OutRcpt { address, notify, orcpt }>, next_attempt }) -> QueueId`
-(пусто или повтор адреса — `Invalid`); `claim(now, limit, lease) -> Vec<Claimed { claim: QueueClaim { id, fencing }, until, queued_at, .., rcpts: Vec<QueuedRcpt { rcpt, attempts, last_error }> }>`
+`enqueue(owner: Option<AccountId>, OutMessage { tenant, blob, size, from, dsn: DsnParams { envid, ret }, rcpts: Vec<OutRcpt { address, notify, orcpt }>, next_attempt }) -> QueueId`
+(пусто или повтор адреса — `Invalid`; CTR-49, решение 46: `owner` — учётная запись отправителя, хранилище с шардами ставит запись на шард её ящика (`tp-meta`: неизвестная или `None` — основная
+БД), без шардов не используется; `Outbound` учётную запись не передаёт — `tp_smtp::queue::Queue` ставит с `None`); `claim(now, limit, lease) -> Vec<Claimed { claim: QueueClaim { id, fencing }, until, queued_at, .., rcpts: Vec<QueuedRcpt { rcpt, attempts, last_error }> }>`
 — записи с наступившим сроком попытки без действующей лизы; `renew(&claim, until)`, `reschedule(&claim, rcpt, at, reason)` (`attempts` + 1),
 `postpone(&claim, rcpt, at)` (перенос планировщиком без попытки — лимиты домена или узла: `attempts`, `last_error` не меняются; по
 умолчанию — `Internal`; набор `suite::queue_postpone`),
@@ -722,3 +729,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   RulesInput, RulesOutcome, KeepTo, MailboxRef, AutoReply, ReplyBody, sieve_changed}`, `EventKind::SieveChanged`. По сравнению с карточкой:
   `SieveStore::active`, `limits`, `state`; `MailboxRef::Inbox` для implicit keep; `AutoReply::references`. In-memory — `MemSieve`,
   `MemVacationLog`, `FakeRules`; наборы `suite::sieve`, `suite::sieve::{vacation_log, signals}`. Реализация в `tp-meta` — META-49, META-50.
+- 2026-11-12 — CTR-49 (x/contracts-36): `QueueStore::enqueue(owner: Option<AccountId>, msg)`, `BlobIndex::acquire(tenant, owner:
+  Option<AccountId>, hash, refs)` — учётная запись отправителя или владельца для выбора шарда (решение 46); `EventKind::ShardsChanged` —
+  системный сигнал изменения справочника шардов (решение 47). Вызовы в крейтах — `None` (учётная запись на этих путях неизвестна).
+  `tp-meta`: `enqueue` со справочником — на шард `owner`; `acquire` — по-прежнему основная БД (шард учёта BLOB требует учётной записи
+  и в `commit_new`/`release`); `ShardDirectory::follow` сбрасывает кэш по `ShardsChanged`. In-memory `owner` не используют; набор
+  `suite::signals` — с `ShardsChanged`.

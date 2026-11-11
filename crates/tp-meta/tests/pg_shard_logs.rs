@@ -149,11 +149,11 @@ async fn queue_jobs_of_both_shards_are_claimed() {
     let main = t.meta.on_shard(ShardId::MAIN).await.expect("main");
     let second = t.meta.on_shard(t.shard).await.expect("shard");
     let q0 = main
-        .enqueue(out(tenant, "r0@x.test"))
+        .enqueue(None, out(tenant, "r0@x.test"))
         .await
         .expect("enqueue");
     let q1 = second
-        .enqueue(out(tenant, "r1@x.test"))
+        .enqueue(None, out(tenant, "r1@x.test"))
         .await
         .expect("enqueue");
     let lease = Duration::from_secs(60);
@@ -204,6 +204,55 @@ async fn queue_jobs_of_both_shards_are_claimed() {
     t.drop_db().await;
 }
 
+/// CTR-49: `enqueue` хранилищ со справочником — на шард учётной записи отправителя; без неё и для неизвестной
+/// учётной записи — в основную БД.
+#[tokio::test]
+async fn queue_enqueue_goes_to_owner_shard() {
+    let Some(t) = common::two_shards().await else {
+        return;
+    };
+    let org = t.tenant().await;
+    let tenant = org.0;
+    let a = t.account_on(org.clone(), ShardId::MAIN).await;
+    let b = t.account_on(org, t.shard).await;
+    let on_b = t
+        .meta
+        .enqueue(Some(b.account), out(tenant, "b@x.test"))
+        .await
+        .expect("enqueue b");
+    let on_a = t
+        .meta
+        .enqueue(Some(a.account), out(tenant, "a@x.test"))
+        .await
+        .expect("enqueue a");
+    let unknown = t
+        .meta
+        .enqueue(Some(AccountId::new()), out(tenant, "u@x.test"))
+        .await
+        .expect("enqueue unknown");
+    let none = t
+        .meta
+        .enqueue(None, out(tenant, "n@x.test"))
+        .await
+        .expect("enqueue none");
+    let ids = |pool: PgPool| async move {
+        let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
+        let mut ids: Vec<uuid::Uuid> =
+            sqlx::query_scalar("SELECT queue_id FROM queue WHERE tenant_id = $1")
+                .bind(tenant.as_uuid())
+                .fetch_all(&mut *tx)
+                .await
+                .expect("ids");
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids(t.shard_pool.clone()).await, vec![*on_b.as_uuid()]);
+    let mut main = vec![*on_a.as_uuid(), *unknown.as_uuid(), *none.as_uuid()];
+    main.sort();
+    assert_eq!(ids(t.main.meta.pool().clone()).await, main);
+    t.drop_db().await;
+}
+
 async fn state(pool: &PgPool, key: &BlobKey) -> Option<(String, i64)> {
     let mut tx = tp_meta::schema::begin(pool, key.tenant)
         .await
@@ -234,7 +283,7 @@ async fn blob_referenced_on_another_shard_is_kept() {
     };
     // Основная БД: ссылка снята; второй шард: на тот же объект есть ссылка.
     assert_eq!(
-        main.acquire(tenant, &h, 1).await.expect("acquire"),
+        main.acquire(tenant, None, &h, 1).await.expect("acquire"),
         Acquire::Absent {
             generation: Gen::INITIAL
         }
@@ -289,7 +338,7 @@ async fn blob_referenced_on_another_shard_is_kept() {
         hash: h2,
         generation: Gen::INITIAL,
     };
-    main.acquire(tenant, &h2, 1).await.expect("acquire");
+    main.acquire(tenant, None, &h2, 1).await.expect("acquire");
     main.commit_new(tenant, &h2, Gen::INITIAL, 10, 1)
         .await
         .expect("commit");
@@ -298,7 +347,7 @@ async fn blob_referenced_on_another_shard_is_kept() {
         .expect("release");
     assert!(t.meta.mark_deleting(&key2, later).await.expect("mark"));
     assert_eq!(
-        second.acquire(tenant, &h2, 1).await.expect("acquire"),
+        second.acquire(tenant, None, &h2, 1).await.expect("acquire"),
         Acquire::Absent {
             generation: Gen(Gen::INITIAL.0 + 1)
         }

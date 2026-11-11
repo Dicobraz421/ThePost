@@ -811,8 +811,12 @@ struct NoPostpone(MemQueue);
 
 #[async_trait]
 impl QueueStore for NoPostpone {
-    async fn enqueue(&self, msg: OutMessage) -> Result<tp_contracts::QueueId> {
-        self.0.enqueue(msg).await
+    async fn enqueue(
+        &self,
+        owner: Option<tp_contracts::AccountId>,
+        msg: OutMessage,
+    ) -> Result<tp_contracts::QueueId> {
+        self.0.enqueue(owner, msg).await
     }
 
     async fn claim(

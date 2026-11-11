@@ -15,7 +15,9 @@
 //!
 //! Шарды (META-31): учёт ссылок — на шарде ящика (ссылки копий и удалений писем меняют транзакции ящика;
 //! загрузку на шарде учитывает вызывающий, знающий шард ящика, — [`PgMeta::on_shard`]). Хранилища со
-//! справочником ([`PgMeta::with_shards`]) ведут `acquire`, `commit_new`, `release` в основной БД, а сборку
+//! справочником ([`PgMeta::with_shards`]) ведут `acquire`, `commit_new`, `release` в основной БД (учётную запись
+//! `owner` из `acquire`, CTR-49, пока не используют: `commit_new` и `release` её не получают, а протокол
+//! поколений требует одного шарда на все три шага), а сборку
 //! мусора — по всем шардам: объект — кандидат, только если ссылок на него нет ни на одном шарде;
 //! `mark_deleting` под блокировкой строки каждого шарда по очереди ставит `deleting` (шарду без строки —
 //! надгробие того же поколения, чтобы параллельная загрузка на нём получила новое поколение) и откатывает
@@ -24,7 +26,7 @@
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tp_contracts::blob::{Acquire, BlobIndex, Commit, Compression};
-use tp_contracts::{BlobHash, BlobKey, Error, Gen, Result, TenantId};
+use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, Result, TenantId};
 use uuid::Uuid;
 
 use crate::PgMeta;
@@ -336,7 +338,15 @@ impl PgMeta {
 
 #[async_trait]
 impl BlobIndex for PgMeta {
-    async fn acquire(&self, tenant: TenantId, hash: &BlobHash, refs: u32) -> Result<Acquire> {
+    async fn acquire(
+        &self,
+        tenant: TenantId,
+        owner: Option<AccountId>,
+        hash: &BlobHash,
+        refs: u32,
+    ) -> Result<Acquire> {
+        // Шард по `owner` — после `commit_new`/`release` с учётной записью (см. описание модуля).
+        let _ = owner;
         self.once(async move {
         let refs = refs_arg(refs)?;
         let mut tx = begin(&self.pool, tenant).await?;
