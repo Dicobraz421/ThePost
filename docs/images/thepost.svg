@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="The Post">
+  <rect x="6" y="18" width="84" height="60" rx="10" fill="#1f6feb"/>
+  <path d="M10 26 L48 52 L86 26" fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="58" y="54" width="26" height="18" rx="3" fill="#ffffff"/>
+  <path d="M62 60 h18 M62 66 h12" stroke="#1f6feb" stroke-width="3" stroke-linecap="round"/>
+</svg>
