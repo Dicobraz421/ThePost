@@ -1036,10 +1036,10 @@ impl Delivery {
                     Some(id) if env.gateway.is_none() => ac.gateway(&raw, id).await,
                     _ => None,
                 };
-                match gateway {
-                    Some(g) => Some(g),
-                    None => Some(ac.check(env, &raw).await),
-                }
+                Some(match gateway {
+                    Some(g) => g,
+                    None => ac.check(env, &raw).await,
+                })
             }
             _ => None,
         };
@@ -1438,7 +1438,7 @@ impl Delivery {
                 Err(e) => return Err(e),
             }
         }
-        let statuses = rcpts
+        let statuses: Vec<(String, SubmitStatus)> = rcpts
             .iter()
             .map(|r| {
                 let status =
