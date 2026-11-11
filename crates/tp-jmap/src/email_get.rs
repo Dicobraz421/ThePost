@@ -1130,9 +1130,16 @@ mod tests {
         // Перенос сохраняет id (CTR-29): письмо изменено, не удалено.
         assert_eq!(c["updated"], json!([b.to_string()]));
         assert_eq!(c["destroyed"], json!([]));
+        // Удалённых писем нет — цепочки вычисляются: цепочка b изменена.
         let r = env
             .calls(json!([["Thread/changes", {"accountId": acc, "sinceState": s2}, "x"]]))
             .await;
-        assert_eq!(r[0][1]["type"], "cannotCalculateChanges");
+        assert_eq!(r[0][0], "Thread/changes", "{r:?}");
+        assert_eq!(
+            r[0][1]["updated"].as_array().map(Vec::len),
+            Some(1),
+            "{r:?}"
+        );
+        assert_eq!(r[0][1]["destroyed"], json!([]));
     }
 }

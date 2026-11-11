@@ -385,14 +385,14 @@ async fn move_trash_restore_expunge_and_changes() {
         trashed_at
     );
 
-    // Учётная запись: a создано (и перенесено), b создано и удалено, b' создано.
+    // Учётная запись: a и b созданы и перенесены (перенос сохраняет MessageId, CTR-29) — только created.
     let ch = meta
         .message_changes(scope, None, s0, 100)
         .await
         .expect("changes");
     let ids = |v: &[tp_contracts::meta::MessageChange]| v.iter().map(|c| c.id).collect::<Vec<_>>();
     assert_eq!(ids(&ch.created), vec![a.id, moved[0].id]);
-    assert_eq!(ids(&ch.destroyed), vec![b.id]);
+    assert!(ch.destroyed.is_empty());
     assert!(ch.updated.is_empty());
     assert_eq!(
         ch.created[0].mailbox, trash,
