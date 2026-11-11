@@ -1,0 +1,66 @@
+# chrony из пакета дистрибутива (Debian, Ubuntu): свои серверы — файл в sources.d, пул пакета при них закомментирован.
+---
+- name: Install chrony
+  ansible.builtin.apt:
+    name: chrony
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Write NTP servers
+  ansible.builtin.copy:
+    dest: /etc/chrony/sources.d/thepost.sources
+    content: |
+      # {{ ansible_managed }}
+      {% for server in thepost_ntp_servers %}
+      server {{ server }} iburst
+      {% endfor %}
+    owner: root
+    group: root
+    mode: "0644"
+  when: thepost_ntp_servers | length > 0
+  notify: Restart chrony
+
+- name: Remove NTP servers
+  ansible.builtin.file:
+    path: /etc/chrony/sources.d/thepost.sources
+    state: absent
+  when: thepost_ntp_servers | length == 0
+  notify: Restart chrony
+
+# Пул пакета (строки pool: Debian — chrony.conf, Ubuntu — sources.d/ubuntu-ntp-pools.sources) — только без своих
+# серверов: в закрытой сети он недоступен.
+- name: Find package sources
+  ansible.builtin.find:
+    paths: [/etc/chrony, /etc/chrony/sources.d]
+    patterns: [chrony.conf, "*.sources"]
+    excludes: [thepost.sources]
+  register: thepost_ntp_files
+
+- name: Disable package pool
+  ansible.builtin.replace:
+    path: "{{ item.path }}"
+    regexp: '^(pool\s.*)$'
+    replace: '#thepost: \1'
+  loop: "{{ thepost_ntp_files.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+  when: thepost_ntp_servers | length > 0
+  notify: Restart chrony
+
+- name: Enable package pool
+  ansible.builtin.replace:
+    path: "{{ item.path }}"
+    regexp: '^#thepost: (pool\s.*)$'
+    replace: '\1'
+  loop: "{{ thepost_ntp_files.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+  when: thepost_ntp_servers | length == 0
+  notify: Restart chrony
+
+- name: Start chrony
+  ansible.builtin.systemd_service:
+    name: chrony
+    state: started
+    enabled: true

@@ -47,7 +47,8 @@
   become_user: postgres
 
 # Языковая настройка (решение 2026-11-11 №23): БД в UTF8 с LC_CTYPE UTF-8 (C.UTF-8 или <язык>.UTF-8), иначе lower()
-# не переводит кириллицу в именах входа. Существующая БД с другой настройкой не пересоздаётся — ошибка.
+# не переводит кириллицу в именах входа. Существующая БД с другой настройкой не пересоздаётся и не переносится — ошибка
+# (решение 29: только чистые установки).
 - name: Read locale of database thepost
   community.postgresql.postgresql_query:
     db: postgres
@@ -69,9 +70,9 @@
       - item.ctype | lower is regex('[.]utf-?8$')
     fail_msg: >-
       БД {{ postgresql_app_db }}: кодировка {{ item.encoding }}, LC_CTYPE {{ item.ctype }} — нужны UTF8 и LC_CTYPE
-      UTF-8 (C.UTF-8 или <язык>.UTF-8): иначе lower() не переводит кириллицу в именах входа. Роль БД не пересоздаёт:
-      перенесите данные в новую БД (pg_dump, CREATE DATABASE ... ENCODING 'UTF8' LC_COLLATE 'C.UTF-8'
-      LC_CTYPE 'C.UTF-8' TEMPLATE template0, pg_restore) — docs/PREREQUISITES.md
+      UTF-8 (C.UTF-8 или <язык>.UTF-8): иначе lower() не переводит кириллицу в именах входа. Пересоздайте базу в UTF-8:
+      поддерживаются только чистые установки, переноса данных нет — docs/PREREQUISITES.md, «Пересоздать базу в
+      UTF-8»
     quiet: true
   loop: "{{ postgresql_db_locale.query_result }}"
   loop_control:

@@ -8,6 +8,13 @@
 # Узлы thepost находят primary сами: database.url + database.urls — адреса узлов данных (deploy/config/mailbox.yaml).
 # Повторный прогон ничего не меняет; на работающем кластере primary не перезапускается.
 ---
+# Синхронизация времени — до остальных ролей (решение 2026-11-11 №25).
+- name: Time synchronization
+  hosts: pgaf_monitor:pgaf_nodes
+  become: true
+  roles:
+    - chrony
+
 - name: pg_auto_failover monitor
   hosts: pgaf_monitor
   become: true
