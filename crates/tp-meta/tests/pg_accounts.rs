@@ -16,12 +16,13 @@ async fn passes_contract_suite() {
     };
     // Набор сравнивает с `str::to_lowercase` хранилища в памяти: `lower` базы для его не-ASCII букв — то же.
     let upper = "ÉMILE ЮРИЙ";
-    let (lowered, ctype): (String, String) =
-        sqlx::query_as("SELECT lower($1), current_setting('lc_ctype')")
-            .bind(upper)
-            .fetch_one(meta.pool())
-            .await
-            .expect("lower");
+    let (lowered, ctype): (String, String) = sqlx::query_as(
+        "SELECT lower($1), datctype::text FROM pg_database WHERE datname = current_database()",
+    )
+    .bind(upper)
+    .fetch_one(meta.pool())
+    .await
+    .expect("lower");
     assert_eq!(
         lowered,
         upper.to_lowercase(),
@@ -42,7 +43,7 @@ async fn passes_contract_suite() {
     account_list(&meta, &fx).await;
 }
 
-/// Оба запроса списка идут по `accounts_login_c` без сортировки; префикс — граница индекса, не фильтр.
+/// Оба запроса списка идут по `accounts_login_c` без сортировки; префикс — граница индекса (`Index Cond`).
 #[tokio::test]
 async fn list_uses_byte_order_index() {
     let Some(meta) = common::meta().await else {
@@ -79,6 +80,9 @@ async fn list_uses_byte_order_index() {
             .find(|l| l.contains("Index Cond"))
             .unwrap_or_default();
         assert!(cond.contains(">="), "{plan}");
-        assert_eq!(cond.contains('<'), next.is_some(), "{plan}");
+        // Без границы планировщик сам выводит её из `starts_with` для константы (C), с границей — наша `< $5`.
+        if next.is_some() {
+            assert!(cond.contains("< 'f'"), "{plan}");
+        }
     }
 }
