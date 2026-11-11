@@ -4,8 +4,10 @@
 //! блокирует строку `mailbox_state` (счётчик `ModSeq`, общий с письмами) до фиксации: номера изменений видны по
 //! порядку, проверки лимитов и UID не гоняются с параллельной записью. ETag — `ModSeq` записи.
 //!
-//! Надгробия старше `meta.dav.tombstone_ttl` удаляет [`PgMeta::purge_dav_tombstones`] (роль maintenance);
-//! граница очищенных — `mailbox_state.dav_floor`: `since` ниже неё — `Conflict` (RFC 6578 `valid-sync-token`).
+//! Надгробия старше `meta.dav.tombstone_ttl` удаляет [`PgMeta::purge_dav_tombstones`] (роль maintenance); граница
+//! очищенных — по виду (`mailbox_state.dav_*_floor`, для `collection_changes` и `account_changes`) и по коллекции
+//! (`dav_collections.tombstone_floor`, для `changes`): `since` ниже неё — `Conflict` (RFC 6578 `valid-sync-token`).
+//! Токен полной синхронизации — состояние вида или коллекции — не ниже своей границы.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
@@ -13,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgConnection};
+use sqlx::{FromRow, PgConnection, PgPool};
 use time::OffsetDateTime;
 use tp_contracts::config::duration;
 use tp_contracts::dav::{
@@ -22,7 +24,7 @@ use tp_contracts::dav::{
     TimeRange, dav_changed, valid_name,
 };
 use tp_contracts::meta::{AccountScope, Changes};
-use tp_contracts::{Error, ModSeq, Result};
+use tp_contracts::{AccountId, Error, ModSeq, Result, TenantId};
 use uuid::Uuid;
 
 use crate::PgMeta;
@@ -252,24 +254,47 @@ async fn select_objects<'q>(
     rows.into_iter().map(ObjectRow::into_object).collect()
 }
 
-/// Счётчик учётной записи и граница очищенных надгробий; нет состояния ящика — нули.
-async fn counters(tx: &mut PgConnection, scope: AccountScope) -> Result<(ModSeq, ModSeq)> {
-    let row: Option<(i64, i64)> = sqlx::query_as(
-        "SELECT modseq, dav_floor FROM mailbox_state WHERE tenant_id = $1 AND account_id = $2",
+/// Граница очищенных надгробий: вида учётной записи или коллекции.
+#[derive(Debug, Clone, Copy)]
+enum Floor {
+    Kind(CollectionKind),
+    Collection(CollectionId),
+}
+
+/// `since` больше счётчика учётной записи или старше очищенных надгробий `floor` — `Conflict`; коллекция удалена
+/// после выборки — `NotFound`. Вызывается после выборки изменений: очистка, зафиксированная между запросами,
+/// поднимет границу, а не потеряет надгробия молча.
+async fn check_since(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    since: ModSeq,
+    floor: Floor,
+) -> Result<()> {
+    let (calendar, collection) = match floor {
+        Floor::Kind(kind) => (kind == CollectionKind::Calendar, None),
+        Floor::Collection(id) => (false, Some(*id.as_uuid())),
+    };
+    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT s.modseq,
+                CASE WHEN $4::uuid IS NOT NULL THEN
+                         (SELECT c.tombstone_floor FROM dav_collections c
+                          WHERE c.tenant_id = $1 AND c.account_id = $2 AND c.collection_id = $4)
+                     WHEN $3 THEN s.dav_calendar_floor
+                     ELSE s.dav_addressbook_floor END
+         FROM mailbox_state s WHERE s.tenant_id = $1 AND s.account_id = $2",
     )
     .bind(scope.tenant.as_uuid())
     .bind(scope.account.as_uuid())
+    .bind(calendar)
+    .bind(collection)
     .fetch_optional(&mut *tx)
     .await
     .map_err(db_err)?;
-    let (m, f) = row.unwrap_or((0, 0));
-    Ok((modseq(m)?, modseq(f)?))
-}
-
-/// `since` больше счётчика или старше очищенных надгробий — `Conflict`. Вызывается после выборки изменений:
-/// очистка, зафиксированная между запросами, поднимет границу, а не потеряет надгробия молча.
-async fn check_since(tx: &mut PgConnection, scope: AccountScope, since: ModSeq) -> Result<()> {
-    let (counter, floor) = counters(tx, scope).await?;
+    let (counter, floor) = match row {
+        Some((counter, Some(floor))) => (modseq(counter)?, modseq(floor)?),
+        Some((_, None)) => return Err(Error::NotFound),
+        None => (ModSeq::ZERO, ModSeq::ZERO),
+    };
     if since > counter || (since != ModSeq::ZERO && since < floor) {
         return Err(Error::Conflict);
     }
@@ -386,39 +411,69 @@ impl PgMeta {
     }
 
     /// Удаляет надгробия DAV, удалённые раньше `before`, на всех шардах (см. [`PgMeta::purge_dav_tombstones`]).
+    /// Каждая учётная запись — своей транзакцией под блокировкой строки состояния ящика, как изменения DAV:
+    /// порядок блокировок тот же, границы поднимаются вместе с удалением.
     pub async fn purge_dav_tombstones_before(&self, before: OffsetDateTime) -> Result<u64> {
         // Повтор после обрыва удаляет только оставшееся: идемпотентно по сути.
         self.rewrite(|| async move {
             let mut total = 0u64;
             for db in self.all_shards().await? {
-                total += with_system(&db.pool, move |tx| {
+                let accounts: Vec<(Uuid, Uuid)> = with_system(&db.pool, move |tx| {
                     Box::pin(async move {
-                        let n: i64 = sqlx::query_scalar(
-                            "WITH gone AS (
-                                 DELETE FROM dav_tombstones WHERE deleted_at < $1
-                                 RETURNING tenant_id, account_id, modseq
-                             ), top AS (
-                                 SELECT tenant_id, account_id, max(modseq) AS floor, count(*) AS n
-                                 FROM gone GROUP BY tenant_id, account_id
-                             ), raised AS (
-                                 UPDATE mailbox_state s SET dav_floor = greatest(s.dav_floor, top.floor)
-                                 FROM top WHERE s.tenant_id = top.tenant_id AND s.account_id = top.account_id
-                             )
-                             SELECT coalesce(sum(n), 0)::int8 FROM top",
+                        sqlx::query_as(
+                            "SELECT DISTINCT tenant_id, account_id FROM dav_tombstones WHERE deleted_at < $1",
                         )
                         .bind(before)
-                        .fetch_one(&mut *tx)
+                        .fetch_all(&mut *tx)
                         .await
-                        .map_err(db_err)?;
-                        to_u64(n)
+                        .map_err(db_err)
                     })
                 })
                 .await?;
+                for (tenant, account) in accounts {
+                    let scope = AccountScope {
+                        tenant: TenantId::from_uuid(tenant),
+                        account: AccountId::from_uuid(account),
+                    };
+                    total += purge_account(&db.pool, scope, before).await?;
+                }
             }
             Ok(total)
         })
         .await
     }
+}
+
+/// Очистка надгробий учётной записи `scope` старше `before` с подъёмом границ вида и коллекций.
+async fn purge_account(pool: &PgPool, scope: AccountScope, before: OffsetDateTime) -> Result<u64> {
+    let mut tx = begin(pool, scope.tenant).await?;
+    lock_modseq(&mut tx, scope).await?;
+    let n: i64 = sqlx::query_scalar(
+        "WITH gone AS (
+             DELETE FROM dav_tombstones WHERE tenant_id = $1 AND account_id = $2 AND deleted_at < $3
+             RETURNING kind, collection_id, modseq
+         ), by_collection AS (
+             UPDATE dav_collections c SET tombstone_floor = greatest(c.tombstone_floor, g.floor)
+             FROM (SELECT collection_id, max(modseq) AS floor FROM gone GROUP BY collection_id) g
+             WHERE c.tenant_id = $1 AND c.account_id = $2 AND c.collection_id = g.collection_id
+         ), by_kind AS (
+             UPDATE mailbox_state s SET
+                 dav_calendar_floor = greatest(s.dav_calendar_floor,
+                     coalesce((SELECT max(modseq) FROM gone WHERE kind = 'calendar'), 0)),
+                 dav_addressbook_floor = greatest(s.dav_addressbook_floor,
+                     coalesce((SELECT max(modseq) FROM gone WHERE kind = 'address_book'), 0))
+             WHERE s.tenant_id = $1 AND s.account_id = $2
+         )
+         SELECT count(*) FROM gone",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(before)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    to_u64(n)
 }
 
 #[async_trait]
@@ -1096,7 +1151,7 @@ impl DavStore for PgMeta {
                 .await
                 .map_err(db_err)?;
             }
-            check_since(&mut tx, scope, since).await?;
+            check_since(&mut tx, scope, since, Floor::Collection(collection)).await?;
             tx.commit().await.map_err(db_err)?;
             page(rows, since, limit, c.state)
         })
@@ -1133,7 +1188,7 @@ impl DavStore for PgMeta {
                 .map_err(db_err)?;
             }
             let complete = kind_state(&mut tx, scope, kind).await?;
-            check_since(&mut tx, scope, since).await?;
+            check_since(&mut tx, scope, since, Floor::Kind(kind)).await?;
             tx.commit().await.map_err(db_err)?;
             let rows = rows
                 .into_iter()
@@ -1175,7 +1230,7 @@ impl DavStore for PgMeta {
                 .map_err(db_err)?;
             }
             let complete = kind_state(&mut tx, scope, kind).await?;
-            check_since(&mut tx, scope, since).await?;
+            check_since(&mut tx, scope, since, Floor::Kind(kind)).await?;
             tx.commit().await.map_err(db_err)?;
             let rows = rows
                 .into_iter()

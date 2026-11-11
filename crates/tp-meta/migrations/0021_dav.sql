@@ -5,9 +5,13 @@
 -- mailbox_state.modseq, общего с письмами; строка счётчика блокируется до фиксации, поэтому номера видны
 -- по порядку.
 
+-- Граница очищенных надгробий хранится по виду (учётная запись) и по коллекции: токен полной синхронизации
+-- (состояние вида или коллекции) не ниже своей границы, поэтому очистка одного вида или одной коллекции не
+-- делает устаревшими токены других.
 ALTER TABLE mailbox_state
-    -- Надгробия DAV с modseq <= dav_floor очищены: since ниже (кроме 0) — Conflict.
-    ADD COLUMN dav_floor bigint NOT NULL DEFAULT 0,
+    -- Надгробия вида с modseq <= границы очищены: since ниже (кроме 0) — Conflict.
+    ADD COLUMN dav_calendar_floor bigint NOT NULL DEFAULT 0,
+    ADD COLUMN dav_addressbook_floor bigint NOT NULL DEFAULT 0,
     -- Состояние вида (JMAP state): наибольший ModSeq изменений календарей и адресных книг.
     ADD COLUMN dav_calendar_state bigint NOT NULL DEFAULT 0,
     ADD COLUMN dav_addressbook_state bigint NOT NULL DEFAULT 0;
@@ -32,6 +36,8 @@ CREATE TABLE dav_collections (
     modseq         bigint NOT NULL,
     -- Число объектов (лимит meta.dav.max_objects без подсчёта строк).
     object_count   integer NOT NULL DEFAULT 0 CHECK (object_count >= 0),
+    -- Надгробия объектов коллекции с modseq <= границы очищены: since ниже (кроме 0) — Conflict.
+    tombstone_floor bigint NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, account_id, collection_id)
 );
 

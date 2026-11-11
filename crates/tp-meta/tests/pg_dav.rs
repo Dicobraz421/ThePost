@@ -57,7 +57,7 @@ fn card(uid: &str) -> ObjectIndex {
     }
 }
 
-async fn put_card(meta: &PgMeta, scope: AccountScope, book: &Collection, name: &str) {
+async fn put_card(meta: &PgMeta, scope: AccountScope, book: &Collection, name: &str) -> ModSeq {
     let out = meta
         .put_object(
             scope,
@@ -69,7 +69,10 @@ async fn put_card(meta: &PgMeta, scope: AccountScope, book: &Collection, name: &
         )
         .await
         .expect("put");
-    assert!(matches!(out, PutOutcome::Stored(_)), "{out:?}");
+    match out {
+        PutOutcome::Stored(p) => p.modseq,
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -299,9 +302,14 @@ async fn purge_tombstones_invalidates_old_tokens() {
         .create_collection(scope, book.clone())
         .await
         .expect("create");
-    for n in ["a.vcf", "b.vcf", "c.vcf"] {
-        put_card(meta, scope, &book, n).await;
-    }
+    put_card(meta, scope, &book, "a.vcf").await;
+    put_card(meta, scope, &book, "b.vcf").await;
+    let m_c = put_card(meta, scope, &book, "c.vcf").await;
+    let cal = Collection::new(CollectionKind::Calendar, "work");
+    let m_cal = meta
+        .create_collection(scope, cal.clone())
+        .await
+        .expect("calendar");
     let gone = Collection::new(CollectionKind::AddressBook, "old");
     meta.create_collection(scope, gone.clone())
         .await
@@ -339,10 +347,22 @@ async fn purge_tombstones_invalidates_old_tokens() {
         Err(Error::Conflict)
     );
     assert_eq!(
-        meta.changes(scope, book.id, m_del, 100).await,
+        meta.changes(scope, book.id, m_c, 100).await,
         Err(Error::Conflict),
         "токен до очистки"
     );
+    // Граница коллекции — её последнее очищенное надгробие: токен на ней действует.
+    let at_coll_floor = meta
+        .changes(scope, book.id, m_del, 100)
+        .await
+        .expect("на границе коллекции");
+    assert!(at_coll_floor.destroyed.is_empty() && at_coll_floor.created.is_empty());
+    // Очистка адресных книг не трогает токены календарей.
+    let cc = meta
+        .collection_changes(scope, CollectionKind::Calendar, m_cal, 100)
+        .await
+        .expect("календари");
+    assert_eq!(cc.new_state, m_cal);
     assert_eq!(
         meta.account_changes(scope, CollectionKind::AddressBook, m0, 100)
             .await,
@@ -362,6 +382,10 @@ async fn purge_tombstones_invalidates_old_tokens() {
     names.sort();
     assert_eq!(names, ["b.vcf", "c.vcf"]);
     assert!(full.destroyed.is_empty());
+    assert_eq!(
+        full.new_state, m_del,
+        "токен полной синхронизации — состояние коллекции"
+    );
     let at_floor = meta
         .account_changes(scope, CollectionKind::AddressBook, floor, 100)
         .await
