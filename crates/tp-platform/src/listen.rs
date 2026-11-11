@@ -3,10 +3,15 @@
 //!
 //! Цикл приёма не ждёт клиента: [`Listener::accept`] только принимает TCP, а чтение заголовка PROXY и
 //! TLS-рукопожатие выполняет [`Incoming::establish`] в задаче соединения с таймаутом.
+//!
+//! Слушатель с `client_ca_file` запрашивает в рукопожатии (неявный TLS и STARTTLS) необязательный сертификат
+//! клиента и проверяет его по этим CA (PLT-22): проверенная цепочка — `peer_certificates()` потока
+//! [`Stream::Tls`] (по ней SMTP распознаёт доверенный источник, SMTP-20).
 
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,7 +28,7 @@ use tp_contracts::Error;
 use tp_contracts::config::duration;
 
 use crate::privileges::InheritedSockets;
-use crate::tls::TlsCerts;
+use crate::tls::{ClientAuth, TlsCerts};
 
 /// Параметры слушателя; встраивается в секцию крейта протокола (`imap.listeners`, `smtp.submission` и т. п.).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -49,6 +54,11 @@ pub struct EndpointConfig {
     /// Длина очереди принятых соединений. Требует перезапуска.
     #[serde(default = "default_backlog")]
     pub backlog: u32,
+    /// PEM-файл доверенных CA сертификатов клиента (mTLS): слушатель запрашивает необязательный сертификат
+    /// клиента; от этих CA — принимается и доступен протоколу, от чужого — отказ рукопожатия, без сертификата —
+    /// соединение принимается. Не задан — сертификат клиента не запрашивается. Требует перезапуска.
+    #[serde(default)]
+    pub client_ca_file: Option<PathBuf>,
 }
 
 fn default_handshake_timeout() -> Duration {
@@ -69,6 +79,7 @@ impl EndpointConfig {
             trusted_proxies: Vec::new(),
             handshake_timeout: default_handshake_timeout(),
             backlog: default_backlog(),
+            client_ca_file: None,
         }
     }
 
@@ -190,6 +201,7 @@ pub struct Listener {
     tcp: TcpListener,
     cfg: Arc<EndpointConfig>,
     tls: Option<Arc<TlsCerts>>,
+    client_auth: Option<ClientAuth>,
 }
 
 impl fmt::Debug for Listener {
@@ -198,6 +210,7 @@ impl fmt::Debug for Listener {
             .field("listen", &self.cfg.listen)
             .field("implicit_tls", &self.cfg.implicit_tls)
             .field("proxy_protocol", &self.cfg.proxy_protocol)
+            .field("client_auth", &self.client_auth.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -239,7 +252,7 @@ impl Listener {
         Self::from_tcp(tcp, cfg, tls)
     }
 
-    /// Слушатель на готовом сокете (передача сокета systemd, тесты).
+    /// Слушатель на готовом сокете (передача сокета systemd, тесты). Файл `client_ca_file` читается здесь.
     pub fn from_tcp(
         tcp: TcpListener,
         cfg: &EndpointConfig,
@@ -251,10 +264,24 @@ impl Listener {
                 cfg.listen
             )));
         }
+        let client_auth = match &cfg.client_ca_file {
+            None => None,
+            Some(_) if tls.is_none() => {
+                return Err(Error::Invalid(format!(
+                    "listen {}: client_ca_file requires tls certificates",
+                    cfg.listen
+                )));
+            }
+            Some(path) => Some(
+                ClientAuth::load(path)
+                    .map_err(|e| Error::Invalid(format!("listen {}: {e}", cfg.listen)))?,
+            ),
+        };
         Ok(Self {
             tcp,
             cfg: Arc::new(cfg.clone()),
             tls,
+            client_auth,
         })
     }
 
@@ -273,6 +300,7 @@ impl Listener {
             local,
             cfg: self.cfg.clone(),
             tls: self.tls.clone(),
+            client_auth: self.client_auth.clone(),
         })
     }
 }
@@ -284,6 +312,7 @@ pub struct Incoming {
     local: SocketAddr,
     cfg: Arc<EndpointConfig>,
     tls: Option<Arc<TlsCerts>>,
+    client_auth: Option<ClientAuth>,
 }
 
 impl fmt::Debug for Incoming {
@@ -327,6 +356,7 @@ impl Incoming {
             info,
             stream: Stream::Plain(self.tcp),
             tls: self.tls,
+            client_auth: self.client_auth,
             timeout: self.cfg.handshake_timeout,
         };
         if self.cfg.implicit_tls {
@@ -356,6 +386,7 @@ pub struct Conn {
     /// Поток данных.
     pub stream: Stream,
     tls: Option<Arc<TlsCerts>>,
+    client_auth: Option<ClientAuth>,
     timeout: Duration,
 }
 
@@ -388,7 +419,10 @@ impl Conn {
             Stream::Plain(tcp) => tcp,
             Stream::Tls(_) => return Err(ListenError::AlreadyTls),
         };
-        let tls = certs.accept(tcp).await.map_err(ListenError::Tls)?;
+        let tls = certs
+            .accept_with(tcp, self.client_auth.as_ref())
+            .await
+            .map_err(ListenError::Tls)?;
         Ok(Conn {
             info: ConnInfo {
                 tls: true,
@@ -396,6 +430,7 @@ impl Conn {
             },
             stream: Stream::Tls(Box::new(tls)),
             tls: self.tls,
+            client_auth: self.client_auth,
             timeout: self.timeout,
         })
     }
@@ -484,12 +519,26 @@ async fn read_proxy_header(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use ppp::v2::{Builder, Protocol, Version};
-    use rustls::pki_types::ServerName;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use rustls::{ClientConfig, RootCertStore};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio_rustls::TlsConnector;
 
     use super::*;
-    use crate::tls::tests::{CERT_A, KEY_A, TempDir, connector, write_pair};
+    use crate::tls::tests::{
+        CA_CLIENT, CERT_A, CERT_B, CERT_GW, KEY_A, KEY_B, KEY_GW, TempDir, connector, der,
+        write_pair,
+    };
+
+    /// Самоподписанный сертификат клиента `thepost-node`: не выписан CA клиентов слушателя.
+    const CERT_NODE: &str = include_str!("testdata/cert-client.pem");
+    const KEY_NODE: &str = include_str!("testdata/key-client.pem");
+
+    /// Цепочка сертификата клиента, проверенная сервером (`None` — сертификата нет).
+    type Chain = Option<Vec<CertificateDer<'static>>>;
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().expect("addr")
@@ -620,6 +669,7 @@ mod tests {
                 info,
                 stream,
                 tls,
+                client_auth,
                 timeout,
             } = conn;
             let mut reader = BufReader::new(stream);
@@ -633,6 +683,7 @@ mod tests {
                 info,
                 stream,
                 tls,
+                client_auth,
                 timeout,
             }
             .starttls()
@@ -690,6 +741,165 @@ mod tests {
         assert_eq!(&payload, b"hello");
     }
 
+    fn private_key(pem: &str) -> PrivateKeyDer<'static> {
+        rustls_pemfile::private_key(&mut pem.as_bytes())
+            .expect("pem")
+            .expect("key")
+    }
+
+    /// Клиент TLS 1.3, доверяющий `CERT_A` и `CERT_B`, с сертификатом клиента `identity` (цепочка, ключ) или без.
+    fn mtls_client(identity: Option<(&str, &str)>) -> TlsConnector {
+        let mut roots = RootCertStore::empty();
+        for pem in [CERT_A, CERT_B] {
+            roots.add(der(pem)).expect("root");
+        }
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let builder = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("versions")
+            .with_root_certificates(roots);
+        let cfg = match identity {
+            Some((cert, key)) => builder
+                .with_client_auth_cert(vec![der(cert)], private_key(key))
+                .expect("client cert"),
+            None => builder.with_no_client_auth(),
+        };
+        TlsConnector::from(Arc::new(cfg))
+    }
+
+    /// Соединение клиента `client` со слушателем `l` (неявный TLS или STARTTLS сразу после соединения): итог
+    /// сервера — цепочка сертификата клиента у протокола или ошибка рукопожатия, и сертификат сервера у клиента.
+    async fn mtls_handshake(
+        l: &Arc<Listener>,
+        at: SocketAddr,
+        client: TlsConnector,
+    ) -> (tp_contracts::Result<Chain>, Option<CertificateDer<'static>>) {
+        let l = l.clone();
+        let server = tokio::spawn(async move {
+            let mut conn = l.accept().await.expect("accept").establish().await?;
+            if conn.can_starttls() {
+                conn = conn.starttls().await?;
+            }
+            let Stream::Tls(mut tls) = conn.stream else {
+                return Err(Error::Internal("tls expected".to_owned()));
+            };
+            let chain: Chain = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf)
+                .await
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            Ok::<Chain, Error>(chain)
+        });
+        let tcp = TcpStream::connect(at).await.expect("connect");
+        let name = ServerName::try_from("localhost").expect("name");
+        // TLS 1.3: клиент завершает рукопожатие раньше сервера — отказ сертификату клиента виден у сервера.
+        let Ok(mut tls) = client.connect(name, tcp).await else {
+            return (server.await.expect("join"), None);
+        };
+        let server_cert = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first().cloned());
+        let _ = tls.write_all(b"ping").await;
+        let _ = tls.flush().await;
+        (server.await.expect("join"), server_cert)
+    }
+
+    fn mtls_endpoint(implicit_tls: bool, ca: &Path) -> EndpointConfig {
+        let mut cfg = EndpointConfig::new(addr("127.0.0.1:0"));
+        cfg.implicit_tls = implicit_tls;
+        cfg.client_ca_file = Some(ca.to_owned());
+        cfg
+    }
+
+    #[tokio::test]
+    async fn optional_client_cert_is_verified_by_listener_ca() {
+        let dir = TempDir::new("mtls");
+        let certs = Arc::new(
+            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
+                .await
+                .expect("certs"),
+        );
+        let ca = dir.0.join("client-ca.pem");
+        std::fs::write(&ca, CA_CLIENT).expect("ca");
+        for implicit in [true, false] {
+            let (l, at) = listener(mtls_endpoint(implicit, &ca), Some(certs.clone())).await;
+            let l = Arc::new(l);
+            // Сертификат от CA слушателя: проверенная цепочка доступна протоколу.
+            let (chain, server) =
+                mtls_handshake(&l, at, mtls_client(Some((CERT_GW, KEY_GW)))).await;
+            let chain = chain.expect("trusted client").expect("client chain");
+            assert_eq!(chain[0], der(CERT_GW), "implicit_tls={implicit}");
+            assert_eq!(server, Some(der(CERT_A)));
+            // Без сертификата — соединение принимается.
+            let (chain, _) = mtls_handshake(&l, at, mtls_client(None)).await;
+            let chain = chain.expect("anonymous client");
+            assert!(
+                chain.unwrap_or_default().is_empty(),
+                "implicit_tls={implicit}"
+            );
+            // Сертификат от чужого CA — отказ рукопожатия.
+            let (chain, _) = mtls_handshake(&l, at, mtls_client(Some((CERT_NODE, KEY_NODE)))).await;
+            let err = chain.expect_err("foreign client cert");
+            assert!(err.to_string().contains("tls handshake"), "{err}");
+        }
+
+        // Новые сертификаты сервера: проверка сертификата клиента сохраняется.
+        let (l, at) = listener(mtls_endpoint(true, &ca), Some(certs.clone())).await;
+        let l = Arc::new(l);
+        let (chain, _) = mtls_handshake(&l, at, mtls_client(Some((CERT_GW, KEY_GW)))).await;
+        assert!(chain.is_ok());
+        write_pair(&dir.0, CERT_B, KEY_B);
+        certs.reload().await.expect("reload");
+        let (chain, server) = mtls_handshake(&l, at, mtls_client(Some((CERT_GW, KEY_GW)))).await;
+        assert_eq!(server, Some(der(CERT_B)));
+        assert_eq!(chain.expect("trusted").expect("chain")[0], der(CERT_GW));
+        let (chain, _) = mtls_handshake(&l, at, mtls_client(Some((CERT_NODE, KEY_NODE)))).await;
+        assert!(chain.is_err());
+    }
+
+    #[tokio::test]
+    async fn without_client_ca_client_cert_is_not_requested() {
+        let dir = TempDir::new("no-mtls");
+        let certs = Arc::new(
+            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
+                .await
+                .expect("certs"),
+        );
+        let mut cfg = EndpointConfig::new(addr("127.0.0.1:0"));
+        cfg.implicit_tls = true;
+        let (l, at) = listener(cfg, Some(certs.clone())).await;
+        let l = Arc::new(l);
+        for client in [
+            mtls_client(Some((CERT_GW, KEY_GW))),
+            mtls_client(Some((CERT_NODE, KEY_NODE))),
+        ] {
+            let (chain, server) = mtls_handshake(&l, at, client).await;
+            assert!(chain.expect("accepted").unwrap_or_default().is_empty());
+            assert_eq!(server, Some(der(CERT_A)));
+        }
+
+        // Ошибки настройки — при открытии слушателя.
+        let ca = dir.0.join("client-ca.pem");
+        std::fs::write(&ca, CA_CLIENT).expect("ca");
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let err = Listener::from_tcp(tcp, &mtls_endpoint(false, &ca), None).expect_err("no tls");
+        assert!(
+            err.to_string().contains("client_ca_file requires tls"),
+            "{err}"
+        );
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let absent = dir.0.join("absent-ca.pem");
+        let err = Listener::from_tcp(tcp, &mtls_endpoint(false, &absent), Some(certs.clone()))
+            .expect_err("absent ca");
+        assert!(err.to_string().contains("absent-ca.pem"), "{err}");
+        let empty = dir.0.join("empty-ca.pem");
+        std::fs::write(&empty, "").expect("empty");
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        assert!(Listener::from_tcp(tcp, &mtls_endpoint(false, &empty), Some(certs)).is_err());
+    }
+
     #[test]
     fn cidr_parse_and_contains() {
         let net: Cidr = "192.0.2.77/24".parse().expect("v4");
@@ -720,6 +930,15 @@ mod tests {
         assert!(cfg.implicit_tls && cfg.proxy_protocol);
         assert_eq!(cfg.trusted_proxies[0].to_string(), "10.0.0.0/8");
         assert_eq!(cfg.handshake_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.client_ca_file, None);
+        let mtls: EndpointConfig = serde_yaml_ng::from_str(
+            "listen: \"0.0.0.0:25\"\nclient_ca_file: /etc/thepost/tls/clients-ca.pem\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            mtls.client_ca_file,
+            Some(PathBuf::from("/etc/thepost/tls/clients-ca.pem"))
+        );
         let fast: EndpointConfig =
             serde_yaml_ng::from_str("listen: \"0.0.0.0:1\"\nhandshake_timeout: 250ms")
                 .expect("parse");

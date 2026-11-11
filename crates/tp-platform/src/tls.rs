@@ -5,6 +5,11 @@
 //!
 //! Клиентский доступ — TLS 1.3; TLS 1.2 включается настройкой `min_version: "1.2"` для устаревших клиентов.
 //! Ошибка перечитывания оставляет в силе прежние сертификаты.
+//!
+//! Сертификат клиента (mTLS, PLT-22) — по настройке слушателя ([`crate::EndpointConfig::client_ca_file`]):
+//! необязательный, проверяется по CA слушателя (`ClientAuth`); проверенная цепочка доступна протоколу через
+//! `peer_certificates()` соединения TLS. Сертификат от чужого CA — отказ рукопожатия, без сертификата —
+//! соединение принимается. Без настройки сертификат клиента не запрашивается.
 
 use std::fmt;
 use std::fs::File;
@@ -13,9 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
-use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::server::danger::ClientCertVerifier;
+use rustls::{RootCertStore, ServerConfig};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::net::TcpStream;
@@ -79,6 +86,8 @@ pub(crate) enum TlsError {
     NoCert(PathBuf),
     #[error("{0}: no private key found")]
     NoKey(PathBuf),
+    #[error("{path}: client CA: {reason}")]
+    ClientCa { path: PathBuf, reason: String },
     #[error("tls: {0}")]
     Rustls(#[from] rustls::Error),
     #[error("tls: loader task failed")]
@@ -100,8 +109,93 @@ type Stamp = [(Option<SystemTime>, u64); 2];
 /// Действующие сертификаты сервера. Разделяется слушателями через `Arc`; новые соединения
 /// получают текущую конфигурацию, установленные соединения не затрагиваются.
 pub struct TlsCerts {
-    current: RwLock<Arc<ServerConfig>>,
+    current: RwLock<Arc<Loaded>>,
     files: Mutex<(TlsConfig, Stamp)>,
+}
+
+/// Конфигурации с проверкой сертификата клиента по верификатору слушателя.
+type ClientVariants = Vec<(Arc<dyn ClientCertVerifier>, Arc<ServerConfig>)>;
+
+/// Загруженные цепочка и ключ: конфигурация без сертификата клиента и варианты с ним для слушателей с
+/// [`ClientAuth`] (строятся при первом рукопожатии и живут до перечитывания файлов).
+struct Loaded {
+    plain: Arc<ServerConfig>,
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    min_version: TlsVersion,
+    with_client: Mutex<ClientVariants>,
+}
+
+impl Loaded {
+    fn new(
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        min_version: TlsVersion,
+    ) -> Result<Self, TlsError> {
+        let plain = Arc::new(build(chain.clone(), key.clone_key(), min_version, None)?);
+        Ok(Self {
+            plain,
+            chain,
+            key,
+            min_version,
+            with_client: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Конфигурация с проверкой сертификата клиента `auth`.
+    fn for_client(&self, auth: &ClientAuth) -> Result<Arc<ServerConfig>, TlsError> {
+        let mut variants = self
+            .with_client
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, cfg)) = variants
+            .iter()
+            .find(|(v, _)| Arc::ptr_eq(v, &auth.verifier))
+        {
+            return Ok(cfg.clone());
+        }
+        let cfg = Arc::new(build(
+            self.chain.clone(),
+            self.key.clone_key(),
+            self.min_version,
+            Some(auth.verifier.clone()),
+        )?);
+        variants.push((auth.verifier.clone(), cfg.clone()));
+        Ok(cfg)
+    }
+}
+
+/// Проверка необязательного сертификата клиента слушателя по доверенным CA (mTLS, PLT-22): сертификат от этих
+/// CA принимается, от чужого — отказ рукопожатия, без сертификата — соединение принимается.
+#[derive(Clone)]
+pub(crate) struct ClientAuth {
+    verifier: Arc<dyn ClientCertVerifier>,
+}
+
+impl fmt::Debug for ClientAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientAuth").finish_non_exhaustive()
+    }
+}
+
+impl ClientAuth {
+    /// Доверенные CA из PEM-файла `ca_file` (один или несколько сертификатов). Блокирующий I/O: файл читается
+    /// один раз при открытии слушателя (запуск), как и привязка сокета.
+    pub(crate) fn load(ca_file: &Path) -> Result<Self, TlsError> {
+        let bad = |reason: String| TlsError::ClientCa {
+            path: ca_file.to_owned(),
+            reason,
+        };
+        let mut roots = RootCertStore::empty();
+        for ca in read_chain(ca_file)? {
+            roots.add(ca).map_err(|e| bad(e.to_string()))?;
+        }
+        let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
+            .allow_unauthenticated()
+            .build()
+            .map_err(|e| bad(e.to_string()))?;
+        Ok(Self { verifier })
+    }
 }
 
 impl fmt::Debug for TlsCerts {
@@ -118,19 +212,23 @@ impl TlsCerts {
     /// Загружает сертификаты по `cfg` (чтение файлов — в `spawn_blocking`).
     pub async fn load(cfg: &TlsConfig) -> tp_contracts::Result<Self> {
         let cfg = cfg.clone();
-        let (server, stamp, cfg) = tokio::task::spawn_blocking(move || {
-            read_config(&cfg).map(|(server, stamp)| (server, stamp, cfg))
+        let (loaded, stamp, cfg) = tokio::task::spawn_blocking(move || {
+            read_config(&cfg).map(|(loaded, stamp)| (loaded, stamp, cfg))
         })
         .await
         .map_err(|_| TlsError::Join)??;
         Ok(Self {
-            current: RwLock::new(Arc::new(server)),
+            current: RwLock::new(Arc::new(loaded)),
             files: Mutex::new((cfg, stamp)),
         })
     }
 
-    /// Текущая конфигурация rustls.
+    /// Текущая конфигурация rustls (без сертификата клиента).
     pub fn server_config(&self) -> Arc<ServerConfig> {
+        self.loaded().plain.clone()
+    }
+
+    fn loaded(&self) -> Arc<Loaded> {
         self.current
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -145,6 +243,23 @@ impl TlsCerts {
     /// TLS-рукопожатие поверх принятого соединения (неявный TLS или STARTTLS).
     pub async fn accept(&self, tcp: TcpStream) -> std::io::Result<TlsStream<TcpStream>> {
         self.acceptor().accept(tcp).await
+    }
+
+    /// TLS-рукопожатие с запросом необязательного сертификата клиента по `auth` (без `auth` — как
+    /// [`TlsCerts::accept`]).
+    pub(crate) async fn accept_with(
+        &self,
+        tcp: TcpStream,
+        auth: Option<&ClientAuth>,
+    ) -> std::io::Result<TlsStream<TcpStream>> {
+        let cfg = match auth {
+            Some(auth) => self
+                .loaded()
+                .for_client(auth)
+                .map_err(std::io::Error::other)?,
+            None => self.server_config(),
+        };
+        TlsAcceptor::from(cfg).accept(tcp).await
     }
 
     /// Перечитывает файлы текущей секции безусловно (например, после выпуска сертификата ACME).
@@ -241,12 +356,12 @@ impl TlsCerts {
     }
 
     async fn reload_with(&self, cfg: TlsConfig) -> tp_contracts::Result<()> {
-        let (server, stamp, cfg) = tokio::task::spawn_blocking(move || {
-            read_config(&cfg).map(|(server, stamp)| (server, stamp, cfg))
+        let (loaded, stamp, cfg) = tokio::task::spawn_blocking(move || {
+            read_config(&cfg).map(|(loaded, stamp)| (loaded, stamp, cfg))
         })
         .await
         .map_err(|_| TlsError::Join)??;
-        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(server);
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(loaded);
         *self.files.lock().unwrap_or_else(PoisonError::into_inner) = (cfg, stamp);
         Ok(())
     }
@@ -259,7 +374,7 @@ pub fn server_config(
     key: PrivateKeyDer<'static>,
     min_version: TlsVersion,
 ) -> tp_contracts::Result<ServerConfig> {
-    Ok(build(chain, key, min_version)?)
+    Ok(build(chain, key, min_version, None)?)
 }
 
 /// Ставит процессный [`CryptoProvider`] rustls (aws-lc-rs), если он ещё не задан. В сборке включены оба
@@ -272,31 +387,40 @@ pub fn install_crypto_provider() {
     }
 }
 
+/// Процессный провайдер криптографии, иначе aws-lc-rs.
+fn provider() -> Arc<CryptoProvider> {
+    CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+}
+
+/// Конфигурация сервера; `client` — проверка сертификата клиента, `None` — сертификат не запрашивается.
 fn build(
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     min_version: TlsVersion,
+    client: Option<Arc<dyn ClientCertVerifier>>,
 ) -> Result<ServerConfig, TlsError> {
-    let provider = CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
     let versions: &[&rustls::SupportedProtocolVersion] = match min_version {
         TlsVersion::Tls13 => &[&rustls::version::TLS13],
         TlsVersion::Tls12 => &[&rustls::version::TLS13, &rustls::version::TLS12],
     };
-    Ok(ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(versions)?
-        .with_no_client_auth()
-        .with_single_cert(chain, key)?)
+    let builder =
+        ServerConfig::builder_with_provider(provider()).with_protocol_versions(versions)?;
+    let builder = match client {
+        Some(verifier) => builder.with_client_cert_verifier(verifier),
+        None => builder.with_no_client_auth(),
+    };
+    Ok(builder.with_single_cert(chain, key)?)
 }
 
 /// Читает и проверяет файлы секции. Блокирующий I/O.
-fn read_config(cfg: &TlsConfig) -> Result<(ServerConfig, Stamp), TlsError> {
+fn read_config(cfg: &TlsConfig) -> Result<(Loaded, Stamp), TlsError> {
     // Отметка снимается до чтения: изменение во время чтения будет замечено следующим опросом.
     let stamp = stamp(cfg);
     let chain = read_chain(&cfg.cert_file)?;
     let key = read_key(&cfg.key_file)?;
-    Ok((build(chain, key, cfg.min_version)?, stamp))
+    Ok((Loaded::new(chain, key, cfg.min_version)?, stamp))
 }
 
 /// Цепочка сертификатов из PEM-файла. Блокирующий I/O.
@@ -357,6 +481,10 @@ pub(crate) mod tests {
     pub(crate) const KEY_A: &str = include_str!("testdata/key-a.pem");
     pub(crate) const CERT_B: &str = include_str!("testdata/cert-b.pem");
     pub(crate) const KEY_B: &str = include_str!("testdata/key-b.pem");
+    /// CA сертификатов клиента и выписанный им сертификат шлюза `gateway.example.test` (mTLS).
+    pub(crate) const CA_CLIENT: &str = include_str!("testdata/ca-client.pem");
+    pub(crate) const CERT_GW: &str = include_str!("testdata/cert-gw.pem");
+    pub(crate) const KEY_GW: &str = include_str!("testdata/key-gw.pem");
 
     /// Временный каталог теста; удаляется при drop.
     pub(crate) struct TempDir(pub(crate) PathBuf);
