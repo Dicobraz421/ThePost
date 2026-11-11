@@ -108,7 +108,7 @@ PTR задаёт владелец адреса (провайдер, хостин
 | Способ выпуска — `thepost_tls_mode`: `certbot` (порт 80, DNS на ВМ), `acme`, `files`, `internal` (только стенд) | прогон плейбука | плейбук отклоняет неверный режим или пустой `thepost_acme_email` | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
 | Клиенты — TLS 1.3; TLS 1.2 только настройкой `tls.min_version: "1.2"` | `openssl s_client -tls1_2 -connect <сервер>:993` | старые клиенты без TLS 1.3 не подключатся | [S6 п. 6.2](spec/S6.md), [`tls.rs`](../crates/tp-platform/src/tls.rs) |
 | Внутренние каналы (PostgreSQL, S3, OpenBao, служебный HTTP) — только TLS с проверкой имени | `database.tls`, `secrets.config` | открытый канал — только профиль `dev` (`allow_plaintext`) с `WARN` | [S6 п. 6.2](spec/S6.md), [решение 2026-10-30](decisions/2026-10-30-owner-answers.md) |
-| Эталон SMB: внутренний CA `thepost_pki` (CA — 10 лет, сертификат служб — 825 сут.) | `openssl x509 -enddate -noout -in /etc/thepost/pki/internal.pem` | по истечении — внутренние каналы не установятся (`doctor` этот срок не проверяет) | [роль `thepost_pki`](../deploy/ansible/roles/thepost_pki/defaults/main.yml) |
+| Эталон SMB: внутренний CA `thepost_pki` (CA — 10 лет, сертификат служб — 825 сут.). Прогон плейбука перевыпускает сертификат тем же CA, если до конца срока < 90 сут. (`thepost_pki_renew_before`); CA сам не перевыпускается: истёк — плейбук останавливается с инструкцией (удалить `/etc/thepost/pki`, повторить прогон, раздать новый `ca.pem` клиентам вне ВМ) | `openssl x509 -enddate -noout -in /etc/thepost/pki/internal.pem` | по истечении — внутренние каналы не установятся (проверка в `doctor` — APP-25) | [роль `thepost_pki`](../deploy/ansible/roles/thepost_pki/defaults/main.yml), [решение 27](decisions/2026-11-11-stage2-followups.md) |
 
 ## PostgreSQL
 
@@ -247,5 +247,4 @@ PostgreSQL) продукт отдельно не копирует ([S5 п. 5.3](
 6. **HashiCorp Vault**: поддерживаемые версии — не определены.
 7. **Файловая система каталога BLOB** (ext4, XFS, NFS для общего каталога) и запас inode — не определены.
 8. **Лимит открытых файлов** для Compose и Helm и связь с числом соединений — не определены.
-9. **Срок внутреннего сертификата `thepost_pki`** (825 сут.): процедура продления и проверка в `doctor` — не определены.
-10. **Железо Enterprise** — только после испытаний (приложение Д).
+9. **Железо Enterprise** — только после испытаний (приложение Д).
