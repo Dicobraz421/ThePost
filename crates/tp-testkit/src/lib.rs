@@ -9,6 +9,7 @@ pub mod admin_tokens;
 pub mod app_passwords;
 pub mod blob;
 pub mod corpus;
+pub mod dav;
 pub mod delivery;
 pub mod fakes;
 pub mod groups;
@@ -21,6 +22,7 @@ pub mod outbound;
 pub mod policies;
 pub mod rpc;
 pub mod secrets;
+pub mod sieve;
 pub mod suite;
 pub mod transport;
 
@@ -30,6 +32,7 @@ pub use admin_tokens::MemLocalAdminTokens;
 pub use app_passwords::MemAppPasswords;
 pub use blob::{BlobOp, MemBlobIndex, MemBlobStore};
 pub use corpus::{LoadModel, SyntheticMail, corpus, pg_schema, pg_url};
+pub use dav::MemDav;
 pub use delivery::MemDeliveryLog;
 pub use fakes::{
     FakeAuthenticator, FakeDirectory, FakeSasl, FakeSearch, HookCall, MemIndexManifests, MemQueue,
@@ -48,4 +51,5 @@ pub use outbound::MemOutbound;
 pub use policies::{MemPolicies, PolicyLevel};
 pub use rpc::{MemRpc, MemRpcNet};
 pub use secrets::MemSecretStore;
+pub use sieve::{FakeRules, MemSieve, MemVacationLog, RulesCall};
 pub use transport::MemTransport;
