@@ -2,8 +2,10 @@
 //! локальный токен Admin API).
 //!
 //! - [`serve_init`] — обработчик одного соединения локального сокета узла: запрос — одна строка JSON
-//!   ([`InitRequest`]), ответ — одна строка JSON ([`InitReply`]). Принимается только от root (`uid` 0 по
-//!   `SO_PEERCRED`; сокет и права на него — у вызывающего, `thepost`), [`serve_local`] — цикл приёма на Unix;
+//!   ([`InitRequest`]), ответ — одна строка JSON ([`InitReply`]). Принимается только от root или учётной записи
+//!   службы (`uid` собеседника по `SO_PEERCRED`; в контейнере без capabilities root не откроет сокет `0600`
+//!   службы, поэтому `docker compose exec thepost thepost admin init` идёт от учётной записи службы). Сокет
+//!   (`admin.init.socket`) и права на него — у вызывающего, `thepost`; [`serve_local`] — цикл приёма на Unix;
 //!   клиент — [`request`].
 //! - [`Admin::init`] — организация по умолчанию, принятый домен адреса (создаётся, если нет), учётная запись
 //!   администратора, пароль (пароль приложения: вход IMAP, SMTP, JMAP) и одноразовый токен Admin API со сроком
@@ -16,6 +18,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -69,6 +72,8 @@ pub struct InitConfig {
     pub max_sessions: usize,
     /// Наибольший размер запроса локального сокета, байт.
     pub max_request_bytes: usize,
+    /// Путь локального сокета узла (права `0600` учётной записи службы); каталог — доступный службе на запись.
+    pub socket: PathBuf,
 }
 
 impl Default for InitConfig {
@@ -78,6 +83,7 @@ impl Default for InitConfig {
             session_ttl: Duration::from_secs(8 * 3600),
             max_sessions: 64,
             max_request_bytes: 4096,
+            socket: PathBuf::from("/var/lib/thepost/admin.sock"),
         }
     }
 }
@@ -461,9 +467,14 @@ fn enabled(a: Account) -> AccountUpsert {
     }
 }
 
-/// Обслуживает одно соединение локального сокета: `peer_uid` — `uid` собеседника (`SO_PEERCRED`), не 0 — отказ.
-/// Ошибка — только ввода-вывода.
-pub async fn serve_init<S>(admin: &Admin, stream: S, peer_uid: Option<u32>) -> std::io::Result<()>
+/// Обслуживает одно соединение локального сокета: `peer_uid` — `uid` собеседника (`SO_PEERCRED`); принимается
+/// root (0) и `service_uid` (учётная запись службы), иначе — отказ. Ошибка — только ввода-вывода.
+pub async fn serve_init<S>(
+    admin: &Admin,
+    stream: S,
+    peer_uid: Option<u32>,
+    service_uid: Option<u32>,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -473,7 +484,8 @@ where
     BufReader::new(r.take(max as u64 + 1))
         .read_until(b'\n', &mut line)
         .await?;
-    let reply = if peer_uid != Some(0) {
+    let allowed = peer_uid.is_some_and(|u| u == 0 || Some(u) == service_uid);
+    let reply = if !allowed {
         admin
             .audit_local(nobody(), &format!("uid {peer_uid:?}"), "admin init", 403)
             .await;
@@ -497,19 +509,20 @@ where
     w.shutdown().await
 }
 
-/// Цикл приёма локального сокета: каждое соединение — [`serve_init`] с `uid` собеседника по `SO_PEERCRED`.
-/// Завершается при ошибке приёма.
+/// Цикл приёма локального сокета: каждое соединение — [`serve_init`] с `uid` собеседника по `SO_PEERCRED`;
+/// `service_uid` — учётная запись службы (владелец сокета). Завершается при ошибке приёма.
 #[cfg(unix)]
 pub async fn serve_local(
     admin: Arc<Admin>,
     listener: tokio::net::UnixListener,
+    service_uid: Option<u32>,
 ) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let admin = admin.clone();
         tokio::spawn(async move {
             let uid = stream.peer_cred().ok().map(|c| c.uid());
-            if let Err(e) = serve_init(&admin, stream, uid).await {
+            if let Err(e) = serve_init(&admin, stream, uid, service_uid).await {
                 tracing::warn!(error = %e, "admin init: соединение локального сокета");
             }
         });
@@ -905,7 +918,8 @@ mod tests {
             let admin = env.admin.clone();
             async move {
                 let (client, server) = tokio::io::duplex(8192);
-                let srv = tokio::spawn(async move { serve_init(&admin, server, uid).await });
+                let srv =
+                    tokio::spawn(async move { serve_init(&admin, server, uid, Some(65532)).await });
                 let (mut r, mut w) = tokio::io::split(client);
                 // Длинный запрос сервер дочитывает не до конца и закрывает соединение.
                 let _ = w.write_all(&body).await;
@@ -924,6 +938,17 @@ mod tests {
         assert!(matches!(r, InitReply::Refused { code: 403, .. }), "{r:?}");
         let r = call(None, line(&req("boss@example.test", false))).await;
         assert!(matches!(r, InitReply::Refused { code: 403, .. }), "{r:?}");
+        let r = call(
+            Some(65532),
+            b"{}
+"
+            .to_vec(),
+        )
+        .await;
+        assert!(
+            matches!(r, InitReply::Refused { code: 400, .. }),
+            "служба: {r:?}"
+        );
         let r = call(Some(0), b"{\"mail\": 1}\n".to_vec()).await;
         assert!(matches!(r, InitReply::Refused { code: 400, .. }), "{r:?}");
         let r = call(Some(0), vec![b'x'; 10_000]).await;
@@ -939,7 +964,7 @@ mod tests {
         // Клиент.
         let (client, server) = tokio::io::duplex(8192);
         let admin = env.admin.clone();
-        let srv = tokio::spawn(async move { serve_init(&admin, server, Some(0)).await });
+        let srv = tokio::spawn(async move { serve_init(&admin, server, Some(0), None).await });
         let r = request(client, &req("boss@example.test", true), 8192)
             .await
             .expect("request");

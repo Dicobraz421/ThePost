@@ -133,7 +133,7 @@ pub struct RoleBinding {
 ///   - role: auditor
 ///     groups: [security]
 /// listen: 127.0.0.1:8443
-/// init: { token_ttl: 10m, session_ttl: 8h }
+/// init: { token_ttl: 10m, session_ttl: 8h, socket: /var/lib/thepost/admin.sock }
 /// audit:
 ///   syslog: { address: "siem.example.org:6514" }
 /// ```
