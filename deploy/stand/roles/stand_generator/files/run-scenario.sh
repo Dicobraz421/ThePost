@@ -136,6 +136,8 @@ load() {
     wait "${jobs[$name]}" || code=$?
     echo "$name=$code" >>"$dir/exit-codes.txt"
   done
+  # imaptest пишет в журнал зависшие команды целиком, в том числе LOGIN с паролем.
+  if [ -e "$dir/imaptest.log" ]; then sed -i -E 's/(LOGIN ("[^"]*"|[^ "]+) )("[^"]*"|[^ "]+)/\1***/gI' "$dir/imaptest.log"; fi
 }
 
 PROBE_ARGS=(--accounts "$ACCOUNTS" --host "$SMB_HOST" --domain "$DOMAIN" --prefix "$USER_PREFIX" --users "$USERS"

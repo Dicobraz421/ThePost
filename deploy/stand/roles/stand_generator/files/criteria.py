@@ -179,7 +179,9 @@ def latency_rows(run, t0=None, t1=None, skip_faults=False):
             bad += b
             parts.append(f"{pr}: p{p}={fmt(pct(ok, p))} (n={len(ok)}, отказов {b})")
         if any(x is None for x in vals):
-            rows.append((name, crit, "; ".join(parts), NONE, "нет замеров зонда" + (f"; {note}" if note else "")))
+            # Нет ни одного удачного замера: отказы зонда — «не прошёл», иначе зонд не работал.
+            status, why = (FAIL, "нет удачных замеров зонда (отказы)") if bad else (NONE, "нет замеров зонда")
+            rows.append((name, crit, "; ".join(parts), status, why + (f"; {note}" if note else "")))
         else:
             good = all(x < limit for x in vals) and bad == 0
             rows.append((name, crit, "; ".join(parts), PASS if good else FAIL, note))
@@ -208,7 +210,8 @@ def search_rows(run, t0=None, t1=None, skip_faults=False):
     size = max(sel) if sel else None
     p95 = pct(ok, 95)
     if p95 is None:
-        fts = ("Полнотекстовый поиск, ящик 100 тыс. писем, p95", "< 1 с", "—", NONE, "нет замеров зонда fts")
+        fts = ("Полнотекстовый поиск, ящик 100 тыс. писем, p95", "< 1 с", f"fts: отказов {bad}",
+               FAIL if bad else NONE, "все замеры зонда fts — отказы" if bad else "нет замеров зонда fts")
     else:
         fts = ("Полнотекстовый поиск, ящик 100 тыс. писем, p95", "< 1 с", f"fts: p95={fmt(p95)} (n={len(ok)}, "
                f"отказов {bad})", PASS if p95 < 1000 and bad == 0 else FAIL,
@@ -217,7 +220,7 @@ def search_rows(run, t0=None, t1=None, skip_faults=False):
     ip95 = pct(iok, 95)
     idx = ("Задержка индексации, p95", "< 60 с",
            f"index: p95={fmt(ip95)} (n={len(iok)}, не найдено {ibad})" if ip95 is not None else "—",
-           NONE if ip95 is None else (PASS if ip95 < 60000 and ibad == 0 else FAIL),
+           (FAIL if ibad else NONE) if ip95 is None else (PASS if ip95 < 60000 and ibad == 0 else FAIL),
            "письмо с уникальным словом на 25 → находится Email/query text")
     return fts, idx
 
@@ -285,19 +288,29 @@ def restarts(run):
 
 
 def outages(run):
-    """Перерывы обслуживания после событий отказа: от события до первого успешного входа после отказа."""
+    """Перерывы после событий отказа: от события до первого успешного входа после отказа (name, t, с, восстановлен).
+
+    Без успешного входа до конца зондов — перерыв не меньше, чем до последнего замера (восстановлен = False).
+    """
     out = []
     for t, name, _ in run.faults():
-        worst = 0.0
+        worst, back_all = 0.0, True
         for probe in ("avail_imap", "avail_jmap"):
             recs = sorted((r["t"], r.get("ok")) for r in run.probes if r.get("probe") == probe and r["t"] >= t)
             failed_at = next((x for x, ok in recs if not ok and x <= t + 120), None)
             if failed_at is None:
                 continue
             back = next((x for x, ok in recs if ok and x > failed_at), None)
-            worst = max(worst, (back - t) if back else float("inf"))
-        out.append((name, t, worst))
+            if back is None:
+                back_all = False
+                back = recs[-1][0]
+            worst = max(worst, back - t)
+        out.append((name, t, worst, back_all))
     return out
+
+
+def outage_text(w, back):
+    return f"{w:.1f} с" if back else f"без переподключения до конца замеров (> {w:.0f} с)"
 
 
 def faults_row(run):
@@ -308,8 +321,8 @@ def faults_row(run):
     n_lost, note = lost(run)
     if not o:
         return (name, crit, "—", NONE, "нет событий отказа в events.txt")
-    text = "; ".join(f"{n}: {'нет переподключения' if w == float('inf') else f'{w:.1f} с'}" for n, _, w in o)
-    good = all(w <= 30 for _, _, w in o) and n_lost <= 0
+    text = "; ".join(f"{n}: {outage_text(w, b)}" for n, _, w, b in o)
+    good = all(b and w <= 30 for _, _, w, b in o) and n_lost <= 0
     return (name, crit, text, PASS if good else FAIL, note)
 
 
@@ -324,7 +337,7 @@ def x3_row(run):
     h5 = run.k6_5xx()
     n_lost, note = lost(run)
     text = (f"рестартов {nr if nr is not None else '—'} (PID: {pids}); отказы SMTP {lc['fail']} из {lc['ok'] + lc['fail']}"
-            f" {lc['codes'] or ''}; JMAP 5xx {h5}; потеряно {n_lost if n_lost is not None else '—'}")
+            f" {lc['codes'] or ''}; JMAP 5xx {h5}; потеряно {max(n_lost, 0) if n_lost is not None else '—'}")
     if nr is None or n_lost is None:
         return (name, crit, text, NONE, "нет срезов узла или сверки")
     good = nr == 0 and pids <= 1 and not bad and h5 == 0 and n_lost <= 0
@@ -518,8 +531,9 @@ def report(run):
                 sat = s
         ok = [s for s in steps if not s["violations"]]
         if sat:
-            lines += ["", f"Точка насыщения: ×{ok[-1]['factor'] if ok else '— (нарушение уже на первой ступени)'}; "
-                      f"первое нарушение — ×{sat['factor']}. Узкое место: {bottleneck(sat, pool)}."]
+            point = f"×{ok[-1]['factor']}" if ok else "нет — нарушение уже на первой ступени"
+            lines += ["", f"Точка насыщения: {point}; первое нарушение — ×{sat['factor']}. "
+                      f"Узкое место: {bottleneck(sat, pool)}."]
         else:
             lines += ["", f"Нарушений нет до ×{steps[-1]['factor']} (последняя ступень stand_stress_factors). "
                       f"Наиболее загружено: {bottleneck(steps[-1], pool)}."]
@@ -531,8 +545,8 @@ def report(run):
                          f"{fmt(w['smtp'])} | {fmt(w['jmap_query'])} | {fmt(w['select'])} |")
     if run.scenario == "faults":
         lines += ["", "## Отказы", ""]
-        for name, t, w in outages(run):
-            lines.append(f"- {name}: перерыв {'без переподключения' if w == float('inf') else f'{w:.1f} с'}")
+        for name, t, w, b in outages(run):
+            lines.append(f"- {name}: перерыв {outage_text(w, b)}")
     lines.append("")
     data = {
         "run": run.params.get("run"), "scenario": run.scenario, "users": run.users,
