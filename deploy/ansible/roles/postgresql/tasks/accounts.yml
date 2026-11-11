@@ -46,11 +46,47 @@
   become: true
   become_user: postgres
 
+# Языковая настройка (решение 2026-11-11 №23): БД в UTF8 с LC_CTYPE UTF-8 (C.UTF-8 или <язык>.UTF-8), иначе lower()
+# не переводит кириллицу в именах входа. Существующая БД с другой настройкой не пересоздаётся — ошибка.
+- name: Read locale of database thepost
+  community.postgresql.postgresql_query:
+    db: postgres
+    query: >-
+      SELECT pg_encoding_to_char(encoding) AS encoding, datctype::text AS ctype FROM pg_database
+      WHERE datname = %(db)s
+    named_args:
+      db: "{{ postgresql_app_db }}"
+    port: "{{ postgresql_port }}"
+  register: postgresql_db_locale
+  changed_when: false
+  become: true
+  become_user: postgres
+
+- name: Check locale of database thepost
+  ansible.builtin.assert:
+    that:
+      - item.encoding == 'UTF8'
+      - item.ctype | lower is regex('[.]utf-?8$')
+    fail_msg: >-
+      БД {{ postgresql_app_db }}: кодировка {{ item.encoding }}, LC_CTYPE {{ item.ctype }} — нужны UTF8 и LC_CTYPE
+      UTF-8 (C.UTF-8 или <язык>.UTF-8): иначе lower() не переводит кириллицу в именах входа. Роль БД не пересоздаёт:
+      перенесите данные в новую БД (pg_dump, CREATE DATABASE ... ENCODING 'UTF8' LC_COLLATE 'C.UTF-8'
+      LC_CTYPE 'C.UTF-8' TEMPLATE template0, pg_restore) — docs/PREREQUISITES.md
+    quiet: true
+  loop: "{{ postgresql_db_locale.query_result }}"
+  loop_control:
+    label: "{{ postgresql_app_db }}"
+
 # Владелец БД — владелец схемы public (PostgreSQL 15+: pg_database_owner): миграции создают в ней таблицы.
+# Языковая настройка — только при создании (template0: локаль кластера может отличаться).
 - name: Create database thepost
   community.postgresql.postgresql_db:
     name: "{{ postgresql_app_db }}"
     owner: "{{ postgresql_owner_role }}"
+    encoding: "{{ omit if postgresql_db_locale.query_result else postgresql_app_db_encoding }}"
+    lc_collate: "{{ omit if postgresql_db_locale.query_result else postgresql_app_db_locale }}"
+    lc_ctype: "{{ omit if postgresql_db_locale.query_result else postgresql_app_db_locale }}"
+    template: "{{ omit if postgresql_db_locale.query_result else 'template0' }}"
     port: "{{ postgresql_port }}"
   become: true
   become_user: postgres

@@ -420,9 +420,15 @@
 | [DEP-13](DEP-13.md) | стенд SMB — замеры и отчёт по критериям Д.7 | deploy | A | deploy-12 | ready | DEP-12 |
 | [DEP-14](DEP-14.md) | стенд SMB — стресс, ×3, отказы и длительный прогон | deploy | A | deploy-12 | ready | DEP-13 |
 | [DEP-15](DEP-15.md) | резервное копирование SMB — pgBackRest и копия каталога писем | deploy | A | deploy-13 | ready | DEP-05 |
-| [DOC-01](DOC-01.md) | docs/PREREQUISITES.md — требования и тонкости настройки окружения | docs | A | docs-01 | ready | — |
-| [APP-24](APP-24.md) | thepost doctor — кодировка и LC_CTYPE базы | app | A | app-23 | ready | — |
+| [DOC-01](DOC-01.md) | docs/PREREQUISITES.md — требования и тонкости настройки окружения | docs | A | docs-01 | done | — |
+| [APP-24](APP-24.md) | thepost doctor — кодировка и LC_CTYPE базы | app | A | app-23 | done | — |
 | [DEP-16](DEP-16.md) | эталоны задают кодировку UTF8 и LC_CTYPE UTF-8 базы | deploy | A | deploy-14 | ready | — |
+| [DEP-17](DEP-17.md) | эталон — UTC в PostgreSQL, chrony, текст ошибки «база не в UTF-8» | deploy | A | deploy-15 | todo | DEP-16 |
+| [DEP-18](DEP-18.md) | thepost_pki — перевыпуск внутреннего сертификата до конца срока | deploy | A | deploy-15 | todo | — |
+| [APP-25](APP-25.md) | thepost doctor — срок внутренних сертификатов | app | A | app-24 | ready | — |
+| [SYS-12](SYS-12.md) | Landlock — резолвер systemd-resolved (Ubuntu 24.04) | sys | A | sys-07 | ready | — |
+| [DEP-19](DEP-19.md) | эталон Ansible на Astra Linux SE 1.8 | deploy | A | deploy-16 | todo | DEP-15,DEP-17 |
+| [DEP-20](DEP-20.md) | эталон Ansible на РЕД ОС 8 | deploy | A | deploy-16 | todo | DEP-15,DEP-17 |
 | [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | done | SMTP-20 |
 | [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | ready | CTR-31,SMTP-22 |
 | [META-44](META-44.md) | очередь модерации без группы в PostgreSQL | meta | B | meta-28 | todo | CTR-43 |

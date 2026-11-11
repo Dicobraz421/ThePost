@@ -30,6 +30,10 @@ postgresql_owner_role: thepost_owner
 postgresql_app_role: thepost
 postgresql_readonly_role: thepost_readonly
 postgresql_app_db: thepost
+# Языковая настройка новой БД (решение 2026-11-11 №23): UTF8 и LC_CTYPE UTF-8 — иначе lower() не переводит кириллицу
+# в именах входа. Уже созданная БД не пересоздаётся: при другой настройке роль останавливается с ошибкой.
+postgresql_app_db_encoding: UTF8
+postgresql_app_db_locale: C.UTF-8
 postgresql_app_networks: ["127.0.0.1/32", "::1/128"]
 # Групповые роли без входа: права на таблицы выдаёт миграция (tp_grant_roles, crates/tp-meta/migrations/0012);
 # имена заданы миграцией — не менять.

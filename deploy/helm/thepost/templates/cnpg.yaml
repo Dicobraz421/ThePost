@@ -45,6 +45,11 @@ spec:
     initdb:
       database: {{ $db }}
       owner: thepost_owner
+      # UTF8 с LC_CTYPE UTF-8 (решение 2026-11-11 №23; по умолчанию оператор задаёт локаль C): иначе lower() не
+      # переводит кириллицу в именах входа. Действует только при создании кластера.
+      encoding: UTF8
+      localeCollate: C.UTF-8
+      localeCType: C.UTF-8
       secret:
         name: {{ .Values.cnpg.secrets.owner }}
       postInitApplicationSQL:
