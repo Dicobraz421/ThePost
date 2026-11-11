@@ -3,7 +3,8 @@
 //! `database.locale`, APP-24; сторонние расширения — `database.extensions`, APP-08), BLOB (запись, чтение и удаление
 //! пробного объекта), синхронизация часов узла и СУБД,
 //! минимальные привилегии процесса (PLT-16): учётная запись, capabilities, no_new_privs, seccomp, Landlock;
-//! DNS почтового домена (MX, SPF, DKIM, DMARC, MTA-STS, PTR), сертификаты и PROXY v2 — `doctor_dns` (APP-06).
+//! DNS почтового домена (MX, SPF, DKIM, DMARC, MTA-STS, PTR), сертификаты и PROXY v2 — `doctor_dns` (APP-06);
+//! сроки внутренних сертификатов (CA СУБД и OpenBao, сертификат узла от них) — `pki.*` (APP-25).
 //!
 //! Вывод — таблица или JSON; код возврата ≠ 0, если хотя бы одна проверка не пройдена (`fail`).
 
@@ -289,6 +290,7 @@ pub async fn check(
         ),
     }
     doctor_dns::check_with(cfg, dns, &doctor, report).await;
+    internal_pki(cfg, SystemTime::now(), report).await;
 }
 
 /// Режим seccomp без секции `confine` — `log`, как при запуске `serve` (`startup::confine`): проверка
@@ -554,6 +556,170 @@ pub async fn probe_blob(store: &dyn BlobStore, doctor: &DoctorSection, report: &
     }
 }
 
+/// Порог предупреждения о сроке внутренних сертификатов (решение 2026-11-11 №27): плейбук перевыпускает
+/// сертификат за 90 сут. (DEP-18), предупреждение за 60 — прогона не было.
+pub const PKI_WARN_BEFORE: Duration = Duration::from_secs(60 * 86_400);
+
+/// Как обновить сертификат узла от внутреннего CA.
+const PKI_RENEW_CERT: &str = "перевыпуск — повторный прогон плейбука (DEP-18)";
+/// Как обновить сам CA.
+const PKI_RENEW_CA: &str = "новый CA — удалить каталог роли thepost_pki (/etc/thepost/pki) и повторно прогнать \
+                            плейбук; клиентам — новый ca.pem";
+
+/// Сертификаты PEM-файла: ближайшее окончание срока, субъекты (DER) и издатель первого сертификата (DER).
+struct PemCerts {
+    not_after: SystemTime,
+    subjects: Vec<Vec<u8>>,
+    issuer: Vec<u8>,
+}
+
+fn pem_certs(pem: &[u8]) -> std::result::Result<PemCerts, String> {
+    let mut out: Option<PemCerts> = None;
+    for block in x509_parser::pem::Pem::iter_from_buffer(pem) {
+        let block = block.map_err(|e| e.to_string())?;
+        if block.label != "CERTIFICATE" {
+            continue;
+        }
+        let cert = block.parse_x509().map_err(|e| e.to_string())?;
+        let secs = cert.validity().not_after.timestamp();
+        let not_after = UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(0));
+        let subject = cert.subject().as_raw().to_vec();
+        match &mut out {
+            Some(c) => {
+                c.not_after = c.not_after.min(not_after);
+                c.subjects.push(subject);
+            }
+            None => {
+                out = Some(PemCerts {
+                    not_after,
+                    subjects: vec![subject],
+                    issuer: cert.issuer().as_raw().to_vec(),
+                });
+            }
+        }
+    }
+    out.ok_or_else(|| "сертификатов PEM нет".to_owned())
+}
+
+/// Системный набор CA: сроки публичных корней — забота ОС, не плейбука.
+fn not_system_bundle(
+    path: std::path::PathBuf,
+) -> std::result::Result<std::path::PathBuf, &'static str> {
+    if path == tp_platform::secrets::SecretsTlsConfig::default().ca_file {
+        Err("системный набор CA")
+    } else {
+        Ok(path)
+    }
+}
+
+/// CA для проверки СУБД: `database.tls.ca_file`, иначе `sslrootcert` адреса `database.url` / `database.urls`.
+fn database_ca(cfg: &Config) -> std::result::Result<std::path::PathBuf, &'static str> {
+    const NONE: &str = "CA не задан: системные корни";
+    let db = cfg
+        .section::<tp_meta::pool::PoolConfig>(tp_meta::pool::PoolConfig::SECTION)
+        .map_err(|_| NONE)?;
+    let from_url = || {
+        std::iter::once(&db.url).chain(&db.urls).find_map(|url| {
+            let (_, query) = url.split_once('?')?;
+            let parsed = reqwest::Url::parse(&format!("http://h/?{query}")).ok()?;
+            parsed
+                .query_pairs()
+                .find(|(k, v)| k == "sslrootcert" && !v.is_empty())
+                .map(|(_, v)| std::path::PathBuf::from(v.into_owned()))
+        })
+    };
+    not_system_bundle(db.tls.ca_file.clone().or_else(from_url).ok_or(NONE)?)
+}
+
+/// CA для проверки OpenBao: `secrets.tls.ca_file`, если хранилище настроено.
+fn secrets_ca(cfg: &Config) -> std::result::Result<std::path::PathBuf, &'static str> {
+    const NONE: &str = "OpenBao не настроен";
+    let s = cfg
+        .section::<tp_platform::secrets::SecretsConfig>(secrets::SECRETS)
+        .map_err(|_| NONE)?;
+    if s.url.is_none() {
+        return Err(NONE);
+    }
+    not_system_bundle(s.tls.ca_file.clone())
+}
+
+/// Итог по сроку `not_after` с порогом [`PKI_WARN_BEFORE`]; `renew` — как обновить.
+fn pki_expiry(not_after: SystemTime, now: SystemTime, renew: &str) -> (Status, String) {
+    let days = not_after.duration_since(now).unwrap_or_default().as_secs() / 86_400;
+    match doctor_dns::expiry_status(not_after, now, PKI_WARN_BEFORE) {
+        Status::Fail => (Status::Fail, format!("срок действия истёк: {renew}")),
+        Status::Warn => (Status::Warn, format!("истекает через {days} сут.: {renew}")),
+        s => (s, format!("действителен ещё {days} сут.")),
+    }
+}
+
+/// Срок CA из файла `path` (проверка `id`); субъекты CA — для сопоставления с издателем сертификата узла.
+async fn pki_ca(id: &str, path: &Path, now: SystemTime, report: &mut Report) -> Vec<Vec<u8>> {
+    let shown = path.display().to_string();
+    let certs = match tokio::fs::read(path).await {
+        Ok(pem) => pem_certs(&pem),
+        Err(e) => Err(format!("файл не прочитан: {e}")),
+    };
+    match certs {
+        Ok(c) => {
+            let (status, msg) = pki_expiry(c.not_after, now, PKI_RENEW_CA);
+            report.push(id, status, shown, msg);
+            c.subjects
+        }
+        Err(e) => {
+            report.push(id, Status::Warn, shown, e);
+            Vec::new()
+        }
+    }
+}
+
+/// Сроки внутренних сертификатов (решение 2026-11-11 №27, APP-25): CA СУБД (`pki.database_ca`), CA OpenBao
+/// (`pki.secrets_ca`) и сертификат узла `tls.cert_file`, если его выпустил один из этих CA (`pki.node`;
+/// сертификат другого издателя — проверка `tls.certificate`). `WARN` — за [`PKI_WARN_BEFORE`], `FAIL` — после срока.
+pub async fn internal_pki(cfg: &Config, now: SystemTime, report: &mut Report) {
+    let mut issuers = Vec::new();
+    match database_ca(cfg) {
+        Ok(path) => issuers.extend(pki_ca("pki.database_ca", &path, now, report).await),
+        Err(why) => report.push("pki.database_ca", Status::Skipped, "", why),
+    }
+    match secrets_ca(cfg) {
+        Ok(path) => issuers.extend(pki_ca("pki.secrets_ca", &path, now, report).await),
+        Err(why) => report.push("pki.secrets_ca", Status::Skipped, "", why),
+    }
+    let id = "pki.node";
+    let file = cfg
+        .section::<tp_platform::TlsConfig>("tls")
+        .map(|t| t.cert_file.clone())
+        .unwrap_or_default();
+    let shown = file.display().to_string();
+    if issuers.is_empty() {
+        report.push(id, Status::Skipped, shown, "внутреннего CA нет");
+        return;
+    }
+    let node = match tokio::fs::read(&file).await {
+        Ok(pem) => pem_certs(&pem),
+        Err(e) => Err(format!("файл не прочитан: {e}")),
+    };
+    match node {
+        Ok(c) if issuers.contains(&c.issuer) => {
+            let (status, msg) = pki_expiry(c.not_after, now, PKI_RENEW_CERT);
+            report.push(id, status, shown, msg);
+        }
+        Ok(_) => report.push(
+            id,
+            Status::Skipped,
+            shown,
+            "выпущен не внутренним CA: срок — проверка tls.certificate",
+        ),
+        Err(e) => report.push(
+            id,
+            Status::Skipped,
+            shown,
+            format!("{e}: см. tls.certificate"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +948,149 @@ mod tests {
         assert_eq!(
             extensions_status(&["pg_stat_statements".to_owned()]).0,
             Status::Warn
+        );
+    }
+
+    /// Внутренний CA (10 лет) и сертификат узла от него (825 сут.), как у роли thepost_pki.
+    const PKI_CA: &[u8] = include_bytes!("testdata/pki-ca.pem");
+    const PKI_NODE: &[u8] = include_bytes!("testdata/pki-node.pem");
+    /// Самоподписанный сертификат другого издателя.
+    const OTHER: &[u8] = include_bytes!("testdata/cert.pem");
+
+    fn pki_config(dir: &Path, db_ca: &str, secrets: &str, node: &Path) -> Config {
+        let slash = |p: &Path| p.display().to_string().replace('\\', "/");
+        sections::registry()
+            .expect("registry")
+            .parse(
+                &format!(
+                    "domain: example.org\nprofile: dev\ndatabase:\n  url: \"postgres://thepost@db:5432/thepost?sslmode=verify-full{db_ca}\"\n\
+                     blob:\n  url: file:///tmp/b\ntls:\n  cert_file: \"{node}\"\n  key_file: \"{node}\"\n{secrets}",
+                    node = slash(node),
+                ),
+                Vec::new(),
+            )
+            .unwrap_or_else(|e| panic!("config {}: {e}", dir.display()))
+    }
+
+    async fn pki_report(cfg: &Config, now: SystemTime) -> Report {
+        let mut report = Report::default();
+        internal_pki(cfg, now, &mut report).await;
+        report
+    }
+
+    fn pki_status(r: &Report, id: &str) -> Option<Status> {
+        r.get(id).map(|c| c.status)
+    }
+
+    /// Сроки внутренних сертификатов (APP-25): OK, WARN за 60 сут., FAIL после срока; издатель узла — другой CA.
+    #[tokio::test]
+    async fn internal_certificates_expiry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = dir.path().join("ca.pem");
+        let node = dir.path().join("fullchain.pem");
+        let other = dir.path().join("other.pem");
+        std::fs::write(&ca, PKI_CA).expect("ca");
+        std::fs::write(&node, PKI_NODE).expect("node");
+        std::fs::write(&other, OTHER).expect("other");
+        let slash = |p: &Path| p.display().to_string().replace('\\', "/");
+        let day = Duration::from_secs(86_400);
+        let node_end = pem_certs(PKI_NODE).expect("node").not_after;
+        let ca_end = pem_certs(PKI_CA).expect("ca").not_after;
+        assert!(ca_end > node_end + 365 * day, "CA дольше сертификата узла");
+
+        // SMB: CA СУБД — sslrootcert адреса, OpenBao — secrets.tls.ca_file.
+        let secrets = format!(
+            "secrets:\n  url: https://bao.internal:8200\n  tls:\n    ca_file: \"{}\"\n  auth:\n    token: {{ token_file: /run/thepost/openbao-token }}\n",
+            slash(&ca)
+        );
+        let cfg = pki_config(
+            dir.path(),
+            &format!("&sslrootcert={}", slash(&ca)),
+            &secrets,
+            &node,
+        );
+        for (now, node_status) in [
+            (node_end - 200 * day, Status::Ok),
+            (node_end - 59 * day, Status::Warn),
+            (node_end + day, Status::Fail),
+        ] {
+            let r = pki_report(&cfg, now).await;
+            assert_eq!(pki_status(&r, "pki.node"), Some(node_status), "{r:?}");
+            assert_eq!(pki_status(&r, "pki.database_ca"), Some(Status::Ok), "{r:?}");
+            assert_eq!(pki_status(&r, "pki.secrets_ca"), Some(Status::Ok), "{r:?}");
+            if node_status != Status::Ok {
+                let msg = &r.get("pki.node").expect("node").message;
+                assert!(msg.contains("плейбук"), "{msg}");
+            }
+        }
+        let r = pki_report(&cfg, node_end - 30 * day).await;
+        assert!(
+            r.get("pki.node")
+                .expect("node")
+                .message
+                .contains("через 30 сут."),
+            "{r:?}"
+        );
+        let r = pki_report(&cfg, ca_end - 10 * day).await;
+        assert_eq!(
+            pki_status(&r, "pki.database_ca"),
+            Some(Status::Warn),
+            "{r:?}"
+        );
+        let r = pki_report(&cfg, ca_end + day).await;
+        assert_eq!(
+            pki_status(&r, "pki.secrets_ca"),
+            Some(Status::Fail),
+            "{r:?}"
+        );
+        assert!(
+            r.get("pki.secrets_ca")
+                .expect("ca")
+                .message
+                .contains("thepost_pki"),
+            "{r:?}"
+        );
+        assert_eq!(r.exit_code(), 1);
+
+        // Сертификат узла другого издателя (ACME, коммерческий) — проверка tls.certificate.
+        let cfg = pki_config(
+            dir.path(),
+            &format!("&sslrootcert={}", slash(&ca)),
+            "",
+            &other,
+        );
+        let r = pki_report(&cfg, node_end - 59 * day).await;
+        assert_eq!(pki_status(&r, "pki.node"), Some(Status::Skipped), "{r:?}");
+        assert_eq!(
+            pki_status(&r, "pki.secrets_ca"),
+            Some(Status::Skipped),
+            "{r:?}"
+        );
+
+        // Без внутреннего CA и с системным набором — пропуск; нет файла CA — WARN.
+        let cfg = pki_config(dir.path(), "", "", &node);
+        let r = pki_report(&cfg, SystemTime::now()).await;
+        for id in ["pki.database_ca", "pki.secrets_ca", "pki.node"] {
+            assert_eq!(pki_status(&r, id), Some(Status::Skipped), "{id}: {r:?}");
+        }
+        let cfg = pki_config(
+            dir.path(),
+            "&sslrootcert=/etc/ssl/certs/ca-certificates.crt",
+            "",
+            &node,
+        );
+        let r = pki_report(&cfg, SystemTime::now()).await;
+        assert_eq!(
+            pki_status(&r, "pki.database_ca"),
+            Some(Status::Skipped),
+            "{r:?}"
+        );
+        let cfg = pki_config(dir.path(), "&sslrootcert=/nonexistent/ca.pem", "", &node);
+        let r = pki_report(&cfg, SystemTime::now()).await;
+        assert_eq!(
+            pki_status(&r, "pki.database_ca"),
+            Some(Status::Warn),
+            "{r:?}"
         );
     }
 }
