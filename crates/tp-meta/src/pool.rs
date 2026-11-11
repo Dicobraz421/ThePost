@@ -18,6 +18,9 @@
 //!
 //! Адрес primary — `url` или список `url` + [`PoolConfig::urls`] (первый доступный для записи); поведение при
 //! переключении СУБД ([`PoolConfig::failover`]) — [`crate::failover`] (META-25).
+//!
+//! Реплика для фоновых чтений ([`PoolConfig::read_replica`], `ReadIntent::Stale`, META-32) — [`connect_replica`],
+//! [`crate::replica`].
 
 use std::fmt;
 use std::future::Future;
@@ -69,6 +72,15 @@ pub struct PoolConfig {
     pub dynamic_credentials: Option<DynamicCredentials>,
     /// Адрес PostgreSQL в обход PgBouncer для миграций (без пароля); по умолчанию — `url`.
     pub direct_url: Option<String>,
+    /// Адрес реплики основной БД для фоновых чтений (`ReadIntent::Stale`: экспорт, отчёты, eDiscovery, verify,
+    /// «сироты» BLOB, первичная индексация) без пароля; учётные данные — как у `url`. Не задан — фоновые
+    /// чтения на primary. Реплики шардов — столбец `read_replica` справочника шардов.
+    pub read_replica: Option<String>,
+    /// Наибольшее отставание реплики (`now() - pg_last_xact_replay_timestamp()`) для фоновых чтений; больше,
+    /// неизвестно или реплика недоступна — чтение на primary.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub replica_max_lag: Duration,
     /// Владелец схемы — только для миграций ([`connect_direct`], `thepost migrate`); узлы входят ролями с
     /// минимальными правами (`thepost_app`, `thepost_reader`, META-23). Не задано — миграции от роли `url`.
     pub owner: Option<SchemaOwner>,
@@ -111,6 +123,8 @@ impl Default for PoolConfig {
             password: None,
             dynamic_credentials: None,
             direct_url: None,
+            read_replica: None,
+            replica_max_lag: Duration::from_secs(30),
             owner: None,
             pgbouncer: false,
             max_connections: 32,
@@ -134,6 +148,8 @@ impl fmt::Debug for PoolConfig {
             .field("failover", &self.failover)
             .field("password", &self.password)
             .field("dynamic_credentials", &self.dynamic_credentials)
+            .field("read_replica", &self.read_replica.is_some())
+            .field("replica_max_lag", &self.replica_max_lag)
             .field("owner", &self.owner)
             .field("pgbouncer", &self.pgbouncer)
             .field("max_connections", &self.max_connections)
@@ -183,6 +199,11 @@ impl PoolConfig {
         }
         if let Some(direct) = &self.direct_url
             && self.options(direct, false)?.1 == Transport::Plaintext
+        {
+            transport = Transport::Plaintext;
+        }
+        if let Some(replica) = &self.read_replica
+            && self.options(replica, self.pgbouncer)?.1 == Transport::Plaintext
         {
             transport = Transport::Plaintext;
         }
@@ -452,6 +473,25 @@ async fn rotating_pool_with(
 pub fn connect_lazy(cfg: &PoolConfig, url: &str, password: Option<&Secret>) -> Result<PgPool> {
     let opts = cfg.open_options(url, cfg.pgbouncer, password)?;
     Ok(cfg.pool_options().connect_lazy_with(opts))
+}
+
+/// Пул к реплике основной БД [`PoolConfig::read_replica`] (соединения — по требованию) с учётными данными
+/// `password`; `None` — реплика не задана. Динамические учётные данные для реплики не поддерживаются —
+/// `Invalid`.
+pub async fn connect_replica(
+    cfg: &PoolConfig,
+    secrets: &dyn SecretStore,
+) -> Result<Option<PgPool>> {
+    let Some(url) = &cfg.read_replica else {
+        return Ok(None);
+    };
+    if cfg.dynamic_credentials.is_some() {
+        return Err(Error::invalid(
+            "database.read_replica: динамические учётные данные для реплики не поддерживаются",
+        ));
+    }
+    let password = cfg.password(secrets).await?;
+    connect_lazy(cfg, url, password.as_ref()).map(Some)
 }
 
 /// Пул из одного соединения в обход PgBouncer для миграций ([`crate::schema::migrate`], модули): с
