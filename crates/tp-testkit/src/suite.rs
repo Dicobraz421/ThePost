@@ -40,7 +40,7 @@ use tp_contracts::delivery::{
 use tp_contracts::events::{Partition, PartitionAssigner, ShardEventLogs, ShardPartition};
 use tp_contracts::ext::{Decision, DecisionHook, DecisionHooks, FinalDelete};
 use tp_contracts::groups::{
-    DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
+    DistributionGroup, GroupMember, GroupStore, HeldMessage, Moderation, SenderRestriction,
 };
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
@@ -2078,6 +2078,51 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
     store.remove(t, inner.id).await.expect("remove");
     assert_eq!(store.expand(t, all.id).await, Ok(sorted(vec![a, b])));
     assert_eq!(store.held(t, Some(all.id), 10).await, Ok(vec![h3]));
+}
+
+// ---------- Moderation ----------
+
+/// Данные набора [`moderation`]: модерируемая группа организации `tenant` и письма её очереди, уже забранные
+/// ([`GroupStore::take_held`]): `approve` — для одобрения, `decline` — для отказа (их объекты существуют).
+#[derive(Debug, Clone)]
+pub struct ModerationFixture {
+    /// Организация.
+    pub tenant: TenantId,
+    /// Группа писем.
+    pub group: DistributionGroup,
+    /// Письмо для одобрения.
+    pub approve: HeldMessage,
+    /// Письмо для отказа.
+    pub decline: HeldMessage,
+}
+
+/// Набор проверок `Moderation` (CTR-31): чужая группа и чужая организация — `Invalid`, недопустимая причина —
+/// `Invalid`, одобрение и отказ проходят. Что доставлено и какое уведомление ушло — проверки реализации.
+pub async fn moderation(m: &dyn Moderation, fx: &ModerationFixture) {
+    let other = DistributionGroup {
+        id: GroupId::new(),
+        ..fx.group.clone()
+    };
+    assert!(matches!(
+        m.deliver(fx.tenant, &other, &fx.approve).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        m.deliver(TenantId::new(), &fx.group, &fx.approve).await,
+        Err(Error::Invalid(_))
+    ));
+    for bad in ["", "a\nb"] {
+        assert!(matches!(
+            m.reject(fx.tenant, &fx.decline, bad).await,
+            Err(Error::Invalid(_))
+        ));
+    }
+    m.deliver(fx.tenant, &fx.group, &fx.approve)
+        .await
+        .expect("deliver");
+    m.reject(fx.tenant, &fx.decline, "off-topic")
+        .await
+        .expect("reject");
 }
 
 // ---------- Trash: trash.purge ----------

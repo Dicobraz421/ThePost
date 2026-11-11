@@ -8,6 +8,10 @@
 //! группы при раскрытии их не проверяют.
 //!
 //! Реализация — `tp-meta` (META-21, рекурсивный CTE), in-memory — `tp-testkit`.
+//!
+//! Решение модератора (CTR-31): письмо забирается из очереди ([`GroupStore::take_held`]) и передаётся [`Moderation`]
+//! (реализация — `tp-smtp`): одобрено — доставка участникам группы, отклонено — уведомление отправителю.
+//! Ошибка решения — вызывающий возвращает письмо в очередь ([`GroupStore::hold`]).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -205,6 +209,54 @@ pub trait GroupStore: Send + Sync + 'static {
     async fn take_held(&self, tenant: TenantId, id: HeldId) -> Result<HeldMessage>;
 }
 
+/// Наибольшая длина причины отказа модератора, символов.
+pub const MAX_REJECT_REASON_LEN: usize = 500;
+
+/// Причина отказа: одна строка из 1–[`MAX_REJECT_REASON_LEN`] символов без управляющих; иначе — `Error::Invalid`.
+pub fn validate_reject_reason(reason: &str) -> Result<()> {
+    if reason.is_empty()
+        || reason.chars().count() > MAX_REJECT_REASON_LEN
+        || reason.chars().any(char::is_control)
+    {
+        return Err(Error::invalid(format!(
+            "причина отказа — одна строка из 1..={MAX_REJECT_REASON_LEN} символов"
+        )));
+    }
+    Ok(())
+}
+
+/// Решения модератора группы рассылки (CTR-31; вместо временного трейта `tp-admin`, ADM-07). Реализация — `tp-smtp`;
+/// in-memory (запись решений) — `tp-testkit`. Письмо вызывающий уже забрал из очереди ([`GroupStore::take_held`]);
+/// успешное решение освобождает ссылку на объект письма, ошибка — письмо возвращают в очередь, ссылка остаётся.
+#[async_trait]
+pub trait Moderation: Send + Sync + 'static {
+    /// Одобрено: доставить письмо участникам `group` (раскрытие [`GroupStore::expand`] с вложенными, приём в ящики,
+    /// журнал доставки) без повторной модерации. `group` — не группа письма (`message.group`) или другой организации —
+    /// `Error::Invalid`.
+    async fn deliver(
+        &self,
+        tenant: TenantId,
+        group: &DistributionGroup,
+        message: &HeldMessage,
+    ) -> Result<()>;
+
+    /// Отклонено: уведомить отправителя (DSN, RFC 3464) с причиной `reason` ([`validate_reject_reason`], иначе
+    /// `Error::Invalid`); пустой отправитель конверта — без уведомления.
+    async fn reject(&self, tenant: TenantId, message: &HeldMessage, reason: &str) -> Result<()>;
+}
+
+/// Проверка аргументов [`Moderation::deliver`] для реализаций: группа письма и организация.
+pub fn check_delivery(
+    tenant: TenantId,
+    group: &DistributionGroup,
+    message: &HeldMessage,
+) -> Result<()> {
+    if group.tenant != tenant || group.id != message.group {
+        return Err(Error::invalid("письмо очереди модерации — другой группы"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +266,23 @@ mod tests {
     #[test]
     fn object_safe() {
         fn _store(_: std::sync::Arc<dyn GroupStore>) {}
+        fn _moderation(_: std::sync::Arc<dyn Moderation>) {}
+    }
+
+    #[test]
+    fn reject_reason() {
+        assert_eq!(validate_reject_reason("off-topic"), Ok(()));
+        assert_eq!(
+            validate_reject_reason(&"я".repeat(MAX_REJECT_REASON_LEN)),
+            Ok(())
+        );
+        for bad in [
+            String::new(),
+            "a\nb".to_owned(),
+            "я".repeat(MAX_REJECT_REASON_LEN + 1),
+        ] {
+            assert!(validate_reject_reason(&bad).is_err(), "{bad:?}");
+        }
     }
 
     fn group(name: &str) -> DistributionGroup {

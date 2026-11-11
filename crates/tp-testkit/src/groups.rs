@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, HeldMessage};
+use tp_contracts::groups::{
+    DistributionGroup, GroupMember, GroupStore, HeldMessage, Moderation, check_delivery,
+    validate_reject_reason,
+};
 use tp_contracts::{AccountId, Error, GroupId, HeldId, Result, TenantId};
 
 use crate::infra::lock;
@@ -177,10 +180,130 @@ impl GroupStore for MemGroups {
     }
 }
 
+/// Решение модератора, записанное [`MemModeration`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModerationDecision {
+    /// Одобрено: письмо и группа доставки.
+    Deliver(HeldId, GroupId),
+    /// Отклонено: письмо и причина.
+    Reject(HeldId, String),
+}
+
+#[derive(Debug, Default)]
+struct ModerationState {
+    decisions: Vec<ModerationDecision>,
+    fail: Option<Error>,
+}
+
+/// Решения модератора в памяти (CTR-31): записывает решения, [`MemModeration::fail_next`] — ошибка следующего.
+/// Клоны разделяют данные.
+#[derive(Debug, Clone, Default)]
+pub struct MemModeration {
+    state: Arc<Mutex<ModerationState>>,
+}
+
+impl MemModeration {
+    /// Без решений.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Принятые решения по порядку.
+    pub fn decisions(&self) -> Vec<ModerationDecision> {
+        lock(&self.state).decisions.clone()
+    }
+
+    /// Следующее решение завершится ошибкой `e` (и не будет записано).
+    pub fn fail_next(&self, e: Error) {
+        lock(&self.state).fail = Some(e);
+    }
+
+    fn push(&self, d: ModerationDecision) -> Result<()> {
+        let mut st = lock(&self.state);
+        if let Some(e) = st.fail.take() {
+            return Err(e);
+        }
+        st.decisions.push(d);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Moderation for MemModeration {
+    async fn deliver(
+        &self,
+        tenant: TenantId,
+        group: &DistributionGroup,
+        message: &HeldMessage,
+    ) -> Result<()> {
+        check_delivery(tenant, group, message)?;
+        self.push(ModerationDecision::Deliver(message.id, group.id))
+    }
+
+    async fn reject(&self, _tenant: TenantId, message: &HeldMessage, reason: &str) -> Result<()> {
+        validate_reject_reason(reason)?;
+        self.push(ModerationDecision::Reject(message.id, reason.to_owned()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::suite::{GroupFixture, group_store};
+    use crate::suite::{GroupFixture, ModerationFixture, group_store, moderation};
+    use time::OffsetDateTime;
+    use tp_contracts::groups::SenderRestriction;
+    use tp_contracts::{BlobHash, BlobKey, Gen};
+
+    #[tokio::test]
+    async fn moderation_records_decisions() {
+        let tenant = TenantId::DEFAULT;
+        let group = DistributionGroup {
+            id: GroupId::new(),
+            tenant,
+            name: "Все".into(),
+            address: Some("all@example.org".into()),
+            external_id: None,
+            members: vec![GroupMember::Account(AccountId::new())],
+            senders: SenderRestriction::Anyone,
+            moderators: vec![AccountId::new()],
+            hidden_from_gal: false,
+        };
+        let held = || HeldMessage {
+            id: HeldId::new(),
+            group: group.id,
+            sender: "x@example.com".into(),
+            sender_account: None,
+            message_id: None,
+            blob: BlobKey {
+                tenant,
+                hash: BlobHash([1; 32]),
+                generation: Gen::INITIAL,
+            },
+            size: 10,
+            held_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let fx = ModerationFixture {
+            tenant,
+            group: group.clone(),
+            approve: held(),
+            decline: held(),
+        };
+        let m = MemModeration::new();
+        moderation(&m, &fx).await;
+        assert_eq!(
+            m.decisions(),
+            [
+                ModerationDecision::Deliver(fx.approve.id, group.id),
+                ModerationDecision::Reject(fx.decline.id, "off-topic".into()),
+            ]
+        );
+        m.fail_next(Error::UNAVAILABLE);
+        assert_eq!(
+            m.deliver(tenant, &group, &fx.approve).await,
+            Err(Error::UNAVAILABLE)
+        );
+        assert_eq!(m.decisions().len(), 2);
+    }
 
     #[tokio::test]
     async fn passes_contract_suite() {
