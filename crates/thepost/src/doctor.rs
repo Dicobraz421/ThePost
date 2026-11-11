@@ -239,8 +239,6 @@ pub async fn check(
         report.push(&id, c.status.into(), c.value, c.message);
     }
     // Привилегии процесса (PLT-16): `privileges_user` → `privileges.user` и т. д.
-    // TODO(SYS): Landlock проверяется по /sys/kernel/security/lsm, которого нет в контейнерах; проба
-    // `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` требует функции tp-sys (APP-16).
     for mut c in tp_platform::privileges::doctor(cfg).await.checks {
         if !confine {
             seccomp_as_serve(&mut c);

@@ -221,7 +221,7 @@ impl Services {
                 gssapi.clone(),
             )));
         }
-        // Защита от перебора (решение владельца #253: хранилище блокировок недоступно — вход проверяется).
+        // Защита от перебора; хранилище блокировок недоступно — по `auth.abuse.fail_closed` (решение владельца #253).
         let abuse = tp_auth::AbuseGuard::new(auth.abuse.clone(), Arc::new(meta.clone()));
         let authn: Arc<dyn Authenticator> = Arc::new(Guarded {
             inner: Arc::new(router),
@@ -551,8 +551,9 @@ pub fn system_resolver() -> Result<mail_auth::MessageAuthenticator> {
 /// `Authenticator` не передаёт — счётчики адреса и подсети ждут его в протоколах. Заблокированная попытка —
 /// `Forbidden` (протокол отвечает как на неверный пароль, учётные данные не проверяются).
 ///
-/// Хранилище блокировок недоступно — вход проверяется без него (решение владельца #253: `auth.abuse.fail_closed`,
-/// по умолчанию `false`; ключ появится с AUTH-11).
+/// Хранилище блокировок недоступно — решение по `auth.abuse.fail_closed` принимает `AbuseGuard` (AUTH-11,
+/// решение владельца #253): `false` (по умолчанию) — вход проверяется по блокировкам, известным узлу; `true` —
+/// ошибка `AbuseGuard::check` возвращается вызывающему (`Unavailable`: протокол отвечает временным отказом).
 struct Guarded {
     inner: Arc<dyn Authenticator>,
     guard: tp_auth::AbuseGuard,
@@ -587,9 +588,7 @@ impl Authenticator for Guarded {
         match self.guard.check(self.tenant, &attempt).await {
             Ok(Some(_)) => return Err(Error::Forbidden),
             Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "защита от перебора: хранилище блокировок недоступно, вход проверяется");
-            }
+            Err(e) => return Err(e),
         }
         match self.inner.verify(credentials).await {
             Ok(p) => {
@@ -844,7 +843,7 @@ mod tests {
         }
     }
 
-    async fn guarded(blocks: MemAbuseBlocks, account_failures: u32) -> Guarded {
+    async fn guarded(blocks: MemAbuseBlocks, account_failures: u32, fail_closed: bool) -> Guarded {
         let meta = MemMetadata::new(Arc::new(SystemClock));
         let scope = meta.account(LOGIN).await.expect("account");
         let fake = FakeAuthenticator::default();
@@ -861,6 +860,7 @@ mod tests {
         );
         let cfg = tp_auth::AbuseConfig {
             account_failures,
+            fail_closed,
             ..tp_auth::AbuseConfig::default()
         };
         Guarded {
@@ -875,7 +875,7 @@ mod tests {
     /// после которой отвергается и верный пароль.
     #[tokio::test]
     async fn guarded_blocks_account_after_failures() {
-        let g = guarded(MemAbuseBlocks::default(), 3).await;
+        let g = guarded(MemAbuseBlocks::default(), 3, false).await;
         for _ in 0..2 {
             assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
         }
@@ -892,13 +892,31 @@ mod tests {
         assert_eq!(g.verify(password("right")).await, Err(Error::Forbidden));
     }
 
-    /// Хранилище блокировок недоступно — вход проверяется (решение владельца #253, по умолчанию пускать).
+    /// Хранилище блокировок недоступно, `auth.abuse.fail_closed: false` — вход проверяется (решение владельца #253,
+    /// по умолчанию пускать).
     #[tokio::test]
     async fn guarded_lets_in_when_blocks_unavailable() {
         let blocks = MemAbuseBlocks::default();
         blocks.fail_next(Error::UNAVAILABLE);
-        let g = guarded(blocks, 3).await;
+        let g = guarded(blocks, 3, false).await;
         g.verify(password("right")).await.expect("login");
         assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+    }
+
+    /// Хранилище блокировок недоступно, `auth.abuse.fail_closed: true` — вход запрещён (временная ошибка, учётные
+    /// данные не проверяются); хранилище снова доступно — вход проверяется.
+    #[tokio::test]
+    async fn guarded_refuses_when_blocks_unavailable_and_fail_closed() {
+        let blocks = MemAbuseBlocks::default();
+        blocks.fail_next(Error::UNAVAILABLE);
+        let g = guarded(blocks, 3, true).await;
+        let refused = g.verify(password("right")).await;
+        assert!(
+            matches!(refused, Err(Error::Unavailable { .. })),
+            "{refused:?}"
+        );
+        g.verify(password("right"))
+            .await
+            .expect("login after store recovered");
     }
 }
