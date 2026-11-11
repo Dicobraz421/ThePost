@@ -91,6 +91,7 @@ fn ctx(mode: Mode) -> SessionCtx {
         limiter: None,
         send_limits: None,
         metrics: None,
+        screen: None,
     }
 }
 
@@ -278,6 +279,8 @@ fn milter_outcome(data: &[u8]) -> Vec<Verdict> {
         rcpts: vec!["b@example.org".into()],
         smtputf8: false,
         started_at: OffsetDateTime::UNIX_EPOCH,
+        source: None,
+        gateway: None,
     };
     let mut verdicts = Vec::new();
     for on_failure in [MilterOnFailure::Accept, MilterOnFailure::Tempfail] {

@@ -23,6 +23,7 @@ use mail_auth::{
 };
 
 use crate::config::SmtpConfig;
+use crate::forward::Sealer;
 use crate::server::Envelope;
 
 /// Итог проверок письма.
@@ -209,6 +210,97 @@ impl AuthCheck {
             junk,
         }
     }
+}
+
+impl AuthCheck {
+    /// Результаты проверок шлюза (SMTP-20) — письмо от доверенного шлюза без данных об исходном клиенте:
+    /// верхний заголовок `Authentication-Results` с authserv-id `authserv_id`, иначе — `ARC-Authentication-Results`
+    /// последнего звена цепочки ARC, если цепочка проходит проверку и звено поставил этот authserv-id. Признак
+    /// «в Спам» — DMARC `fail` при политике `quarantine` или `reject` в результатах шлюза. Заголовки не
+    /// добавляются (результаты шлюза уже в письме). `None` — результатов шлюза нет: проверки — как обычно.
+    pub async fn gateway(&self, raw: &[u8], authserv_id: &str) -> Option<Outcome> {
+        let results = match trusted_results(raw, authserv_id) {
+            Some(r) => r,
+            None => {
+                let msg = AuthenticatedMessage::parse(raw)?;
+                let arc = self.resolver.verify_arc(self.params(&msg)).await;
+                if !matches!(arc.result(), mail_auth::DkimResult::Pass) {
+                    return None;
+                }
+                let last = arc.sets().last()?;
+                let value = String::from_utf8_lossy(last.results.value).into_owned();
+                // `i=N; authserv-id; результаты`.
+                let (_, rest) = value.split_once(';')?;
+                let (id, results) = rest.split_once(';').unwrap_or((rest, ""));
+                if !id.trim().eq_ignore_ascii_case(authserv_id) {
+                    return None;
+                }
+                results.to_owned()
+            }
+        };
+        let lower = results.to_ascii_lowercase();
+        let junk = lower
+            .split([';', ' ', '\t', '\r', '\n'])
+            .any(|t| t == "dmarc=fail")
+            && (lower.contains("policy.dmarc=quarantine") || lower.contains("policy.dmarc=reject"));
+        Some(Outcome {
+            headers: String::new(),
+            junk,
+        })
+    }
+
+    /// Заголовки набора ARC (RFC 8617) узла для пересылаемого письма `raw` (с `\r\n`); `ip` — адрес клиента,
+    /// от которого письмо принято (неизвестен — не указывается). Цепочка письма уже нарушена — `None`.
+    pub(crate) async fn seal(
+        &self,
+        sealer: &Sealer,
+        raw: &[u8],
+        ip: Option<IpAddr>,
+    ) -> Option<String> {
+        let msg = AuthenticatedMessage::parse(raw)?;
+        let dkim = self.resolver.verify_dkim(self.params(&msg)).await;
+        let arc = self.resolver.verify_arc(self.params(&msg)).await;
+        let ar = AuthenticationResults::new(&self.hostname)
+            .with_dkim_results(&dkim, msg.from())
+            .with_arc_result(&arc, ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        match sealer.seal(&msg, &ar, &arc) {
+            Ok(set) => Some(set.to_header()),
+            Err(e) => {
+                tracing::info!(error = %e, "smtp: пересылаемое письмо не подписано ARC");
+                None
+            }
+        }
+    }
+}
+
+/// Результаты верхнего заголовка `Authentication-Results` с authserv-id `id` (без него).
+fn trusted_results(raw: &[u8], id: &str) -> Option<String> {
+    let head_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(raw.len());
+    let head = String::from_utf8_lossy(&raw[..head_end]);
+    // Развёрнутые заголовки: строка продолжения начинается с пробела или табуляции.
+    let mut headers: Vec<String> = Vec::new();
+    for line in head.split("\r\n") {
+        match headers.last_mut() {
+            Some(h) if line.starts_with([' ', '\t']) => {
+                h.push(' ');
+                h.push_str(line.trim());
+            }
+            _ => headers.push(line.to_owned()),
+        }
+    }
+    headers.iter().find_map(|h| {
+        let (name, value) = h.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case("Authentication-Results") {
+            return None;
+        }
+        let (serv, results) = value.split_once(';').unwrap_or((value, ""));
+        // authserv-id может сопровождаться версией (`id 1`).
+        let serv = serv.split_whitespace().next()?;
+        serv.eq_ignore_ascii_case(id).then(|| results.to_owned())
+    })
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

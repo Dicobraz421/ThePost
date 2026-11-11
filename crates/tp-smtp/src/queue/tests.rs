@@ -309,6 +309,7 @@ pub(crate) async fn smtp_server_with(rec: Arc<Recorder>, broken_tls: bool) -> u1
                 limiter: None,
                 send_limits: None,
                 metrics: None,
+                screen: None,
             };
             tokio::spawn(async move {
                 let _ = Session::new(ctx, conn_info(false), broken_tls)
@@ -1119,6 +1120,36 @@ async fn smart_host_route_and_reload_on_signal() {
     worker.run_once(&cfg).await.expect("run");
     assert_eq!(rec.mails().len(), 2);
     stop.cancel();
+}
+
+/// Домен внутренней ретрансляции (SMTP-21): получатели — на `next_hop` домена, MX не ищется.
+#[tokio::test]
+async fn internal_relay_goes_to_next_hop() {
+    let rec = Arc::new(Recorder::default());
+    let port = smtp_server(rec.clone()).await;
+    let env = Env::new();
+    let store = MemTransport::new();
+    store
+        .put_domain(
+            0,
+            &tp_contracts::transport::AcceptedDomain {
+                id: tp_contracts::DomainId::new(),
+                tenant: TenantId::DEFAULT,
+                name: "legacy.example".into(),
+                kind: tp_contracts::transport::DomainKind::InternalRelay {
+                    next_hop: format!("127.0.0.1:{port}"),
+                },
+            },
+        )
+        .await
+        .expect("domain");
+    let routes = Arc::new(Routes::new(Arc::new(store)));
+    let worker = QueueWorker::new(env.deps.clone(), Arc::new(transport()), "out.example.org")
+        .with_routes(routes, None);
+    enqueue(&env, &["old@legacy.example"]).await;
+    assert_eq!(worker.run_once(&cfg()).await.expect("run"), 1);
+    assert_eq!(rec.mails().len(), 1, "доставлено на next_hop");
+    assert_eq!(env.queue.len(), 0);
 }
 
 /// Контракт `Outbound` (CTR-28): `Queue` — все получатели в очереди, статусы в порядке запроса.

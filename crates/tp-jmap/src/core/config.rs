@@ -52,6 +52,8 @@ pub struct JmapConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub upload_ttl: Duration,
+    /// Автонастройка клиентов: серверы IMAP, SMTP, CalDAV и CardDAV в ответах (`crate::autoconfig`).
+    pub autoconfig: AutoconfigConfig,
 }
 
 impl Default for JmapConfig {
@@ -72,6 +74,75 @@ impl Default for JmapConfig {
             max_submission_recipients: 100,
             push_min_ping: Duration::from_secs(10),
             upload_ttl: Duration::from_secs(7 * 24 * 3600),
+            autoconfig: AutoconfigConfig::default(),
         }
     }
+}
+
+/// Секция `jmap.autoconfig`: что сообщать клиентам при автонастройке (Thunderbird, `.mobileconfig`,
+/// `/.well-known/caldav`, `/.well-known/carddav`).
+///
+/// ```yaml
+/// autoconfig:
+///   host: mail.example.org
+///   organization: ООО «Пример»
+///   imap: { port: 993, security: tls }
+///   submission: { port: 587, security: starttls }
+///   caldav: /dav/
+///   carddav: /dav/
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoconfigConfig {
+    /// Имя сервера IMAP и SMTP; не задано — узел из `public_url`, иначе заголовок `Host` без префикса `autoconfig.`.
+    pub host: Option<String>,
+    /// Название организации (имя поставщика у Thunderbird, `PayloadOrganization` профиля); не задано — домен.
+    pub organization: Option<String>,
+    /// IMAP (по умолчанию 993, TLS).
+    pub imap: MailEndpoint,
+    /// SMTP submission (по умолчанию 465, TLS; RFC 8314).
+    pub submission: MailEndpoint,
+    /// Контекст CalDAV (RFC 6764 §5): путь на этом сервере (от `public_url`) или полный URL.
+    pub caldav: String,
+    /// Контекст CardDAV (RFC 6764 §5): путь на этом сервере (от `public_url`) или полный URL.
+    pub carddav: String,
+}
+
+impl Default for AutoconfigConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            organization: None,
+            imap: MailEndpoint {
+                port: 993,
+                security: Security::Tls,
+            },
+            submission: MailEndpoint {
+                port: 465,
+                security: Security::Tls,
+            },
+            caldav: "/dav/".into(),
+            carddav: "/dav/".into(),
+        }
+    }
+}
+
+/// Порт и защита почтового сервера (поля обязательны).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MailEndpoint {
+    /// Порт.
+    pub port: u16,
+    /// Защита соединения.
+    pub security: Security,
+}
+
+/// Защита соединения почтового сервера; открытый текст не предлагается.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Security {
+    /// TLS с начала соединения (IMAPS 993, submissions 465).
+    Tls,
+    /// STARTTLS (IMAP 143, submission 587).
+    Starttls,
 }

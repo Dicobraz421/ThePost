@@ -110,7 +110,10 @@ impl DkimSign {
 }
 
 /// Закрытый ключ из PEM.
-fn parse_key(alg: DkimAlgorithm, pem: &str) -> std::result::Result<SigningKeyPair, String> {
+pub(crate) fn parse_key(
+    alg: DkimAlgorithm,
+    pem: &str,
+) -> std::result::Result<SigningKeyPair, String> {
     let der = PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(|e| e.to_string())?;
     Ok(match alg {
         DkimAlgorithm::RsaSha256 => {

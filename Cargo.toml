@@ -44,7 +44,7 @@ async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
-calamine = "0.37.0"
+calamine = "0.38.0"
 calcard = "0.3.14"
 chrono = { version = "0.4.45", default-features = false }
 clap = { version = "4.6.7", features = ["derive"] }

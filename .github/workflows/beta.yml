@@ -5,6 +5,8 @@
 # CI-03 (SRS 6.8): SBOM (SPDX, syft) в выпуске; архивы, SBOM и OCI-образ ghcr.io подписаны cosign без ключей
 # (OIDC GitHub, Rekor), проверка подписи — в описании выпуска; repro — вторая сборка с нуля на чистом раннере
 # и сравнение sha256 бинарника (выпуск не блокирует, расхождение — красный job).
+# CI-05 (решение 2026-11-01): архивы и образ проверяются на интерпретаторы и сценарии (.github/interp_check.py)
+# до публикации; нарушение — красный build (беты нет) или image (бета без образа).
 name: Beta
 
 on:
@@ -87,6 +89,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/thepost" LICENSE-APACHE LICENSE-MIT README.md "dist/$PKG/"
           tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
           (cd dist && sha256sum "$PKG.tar.gz" > "$PKG.tar.gz.sha256")
+      - name: Архив без интерпретаторов (CI-05)
+        run: python3 .github/interp_check.py "dist/$PKG.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PKG }}
@@ -118,6 +122,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # Сначала сборка в локальный docker и проверка (CI-05), публикация — повтор той же сборки из кэша buildx.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: thepost:check
+      - name: Образ без интерпретаторов (CI-05)
+        shell: bash
+        run: |
+          id=$(docker create thepost:check)
+          docker export "$id" | python3 .github/interp_check.py -
       - id: push
         uses: docker/build-push-action@v7
         with:
@@ -193,6 +210,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # Только архивы беты: build-push-action кладёт в прогон ещё запись сборки (*.dockerbuild),
+          # её загрузка падает и роняла выпуск (прогон 43046334824).
+          pattern: thepost-beta-*
           path: ${{ runner.temp }}/dist
           merge-multiple: true
       - name: SBOM (SPDX по Cargo.lock)

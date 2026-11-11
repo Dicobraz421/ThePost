@@ -13,3 +13,10 @@ manual: no
 
 ## Приёмка
 - Снимки ответов; подпись профиля проверяется.
+
+## Итог волны jmap-14
+- Маршруты (`crates/tp-jmap/src/autoconfig.rs`): `/.well-known/caldav`, `/.well-known/carddav` — 301 на контекст DAV (любой метод);
+  `/mail/config-v1.1.xml` и `/.well-known/autoconfig/mail/config-v1.1.xml` — Thunderbird (IMAP, SMTP, CardDAV, CalDAV);
+  `/mail/profile.mobileconfig` — профиль iOS/macOS вошедшего пользователя. `/.well-known/jmap` — с JMAP-01.
+- Серверы и порты — секция `jmap.autoconfig` (`host`, `organization`, `imap`, `submission`, `caldav`, `carddav`).
+- Профиль **без подписи**: подпись CMS требует новой зависимости (полоса deps) — решение владельца; приёмка «подпись проверяется» не выполнена.

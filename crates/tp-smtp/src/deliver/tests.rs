@@ -222,6 +222,8 @@ fn envelope(mode: Mode, rcpts: &[&str]) -> Envelope {
         rcpts: rcpts.iter().map(|r| (*r).to_owned()).collect(),
         smtputf8: false,
         started_at: OffsetDateTime::now_utc(),
+        source: None,
+        gateway: None,
     }
 }
 
@@ -619,6 +621,7 @@ async fn session_delivers_to_several_recipients() {
         limiter: None,
         send_limits: None,
         metrics: None,
+        screen: None,
     };
     let (client, mut server) = tokio::io::duplex(64 * 1024);
     let task = tokio::spawn(async move {
@@ -1131,6 +1134,7 @@ mod groups {
             limiter: None,
             send_limits: None,
             metrics: None,
+            screen: None,
         };
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let task = tokio::spawn(async move {
@@ -1417,3 +1421,5 @@ async fn outbound_suite() {
     let list = rcpts(&["x@example.net", "team@example.org", "Bob@Example.org"]);
     tp_testkit::suite::outbound_submit(&d, TenantId::DEFAULT, &list).await;
 }
+
+mod wave;

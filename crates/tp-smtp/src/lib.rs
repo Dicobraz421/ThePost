@@ -7,6 +7,7 @@
 //! - [`dkim_sign`] — DKIM-подпись исходящей почты;
 //! - [`dsn`] — уведомления о доставке (RFC 3464);
 //! - `fuzz` — проверки разборщиков для целей cargo-fuzz `crates/tp-smtp/fuzz` (SMTP-19; не API);
+//! - [`forward`] — пересылка наружу: SRS-переписывание отправителя ([`srs`]) и ARC-подпись;
 //! - [`groups`] — группы рассылки при приёме: ограничения отправителей, модерация, раскрытие;
 //! - [`learn`] — обучение антиспама (Rspamd controller) по перемещению писем в «Спам» и из него;
 //! - [`limits`] — лимиты отправки учётной записи в час;
@@ -15,8 +16,11 @@
 //! - [`policy`] — MTA-STS и DANE при отправке на MX;
 //! - [`routes`] — политики доменов назначения организаций (обязательный TLS, закреплённый ключ, smart host,
 //!   egress-IP) с перечитыванием по сигналу;
+//! - [`sources`] — доверенные источники приёма: шлюз (`XCLIENT`, `XFORWARD`, результаты проверок шлюза) и
+//!   приложения (отправка без SASL);
 //! - [`screen`] — экран соединений smtp-in (postscreen): задержка приветствия, конвейер, частота, кэш по IP;
 //! - [`queue`] — очередь исходящей почты и роль smtp-out (отправка на MX через `mail-send`);
+//! - [`srs`] — адреса SRS (Sender Rewriting Scheme) пересылки и их обратное преобразование;
 //! - [`tracking`] — журнал доставки (message tracking);
 //! - [`config`] — секция `smtp` config.yaml.
 
@@ -26,6 +30,7 @@ pub mod config;
 pub mod deliver;
 pub mod dkim_sign;
 pub mod dsn;
+pub mod forward;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod groups;
@@ -38,6 +43,8 @@ pub mod queue;
 pub mod routes;
 pub mod screen;
 pub mod server;
+pub mod sources;
+pub mod srs;
 pub mod tracking;
 
 pub use authcheck::AuthCheck;
