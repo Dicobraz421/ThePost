@@ -251,7 +251,10 @@ pub struct InboxMessage {
 impl InboxMessage {
     /// Проверяет UID и адрес; иначе — `Error::Invalid`.
     pub fn validate(&self) -> Result<()> {
-        if self.uid.is_empty() || self.uid.len() > MAX_UID_LEN || self.uid.chars().any(char::is_control) {
+        if self.uid.is_empty()
+            || self.uid.len() > MAX_UID_LEN
+            || self.uid.chars().any(char::is_control)
+        {
             return Err(Error::invalid("недопустимый UID сообщения"));
         }
         if !valid_address(&self.from) {
@@ -457,7 +460,12 @@ mod tests {
     #[test]
     fn addresses() {
         assert!(valid_address("anna@example.org"));
-        for bad in ["", "a b@example.org", "a\n@x", &"a".repeat(MAX_ADDRESS_LEN + 1)] {
+        for bad in [
+            "",
+            "a b@example.org",
+            "a\n@x",
+            &"a".repeat(MAX_ADDRESS_LEN + 1),
+        ] {
             assert!(!valid_address(bad), "{bad:?}");
         }
     }
@@ -560,7 +568,10 @@ mod tests {
             .is_err()
         );
         assert!(busy(9, 11, BusyKind::Busy).overlaps(&range));
-        assert!(!busy(12, 13, BusyKind::Busy).overlaps(&range), "конец не включён");
+        assert!(
+            !busy(12, 13, BusyKind::Busy).overlaps(&range),
+            "конец не включён"
+        );
         assert!(!busy(8, 10, BusyKind::Busy).overlaps(&range));
         assert_eq!(
             busy(9, 13, BusyKind::Tentative).clip(&range),

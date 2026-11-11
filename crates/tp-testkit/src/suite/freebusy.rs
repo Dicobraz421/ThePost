@@ -73,8 +73,18 @@ async fn event(
 pub async fn freebusy(dav: &dyn DavStore, fb: &dyn FreeBusy, fx: &DavFixture) {
     let (owner, peer) = (fx.owner, fx.peer);
     let tenant = owner.tenant;
-    let work = calendar(dav, owner, Collection::new(CollectionKind::Calendar, "work")).await;
-    let home = calendar(dav, owner, Collection::new(CollectionKind::Calendar, "home")).await;
+    let work = calendar(
+        dav,
+        owner,
+        Collection::new(CollectionKind::Calendar, "work"),
+    )
+    .await;
+    let home = calendar(
+        dav,
+        owner,
+        Collection::new(CollectionKind::Calendar, "home"),
+    )
+    .await;
     let holidays = Collection {
         transparent: true,
         ..Collection::new(CollectionKind::Calendar, "holidays")
@@ -90,12 +100,33 @@ pub async fn freebusy(dav: &dyn DavStore, fb: &dyn FreeBusy, fx: &DavFixture) {
         vec![busy(5, 6, BusyKind::Busy), busy(29, 30, BusyKind::Busy)],
     )
     .await;
-    event(dav, owner, work, "maybe", vec![busy(2, 4, BusyKind::Tentative)]).await;
+    event(
+        dav,
+        owner,
+        work,
+        "maybe",
+        vec![busy(2, 4, BusyKind::Tentative)],
+    )
+    .await;
     event(dav, owner, home, "b", vec![busy(3, 4, BusyKind::Busy)]).await;
     event(dav, owner, home, "free", Vec::new()).await;
-    event(dav, owner, holidays_id, "h", vec![busy(10, 12, BusyKind::Unavailable)]).await;
+    event(
+        dav,
+        owner,
+        holidays_id,
+        "h",
+        vec![busy(10, 12, BusyKind::Unavailable)],
+    )
+    .await;
     let peer_cal = calendar(dav, peer, Collection::new(CollectionKind::Calendar, "work")).await;
-    event(dav, peer, peer_cal, "p", vec![busy(2, 3, BusyKind::Unavailable)]).await;
+    event(
+        dav,
+        peer,
+        peer_cal,
+        "p",
+        vec![busy(2, 3, BusyKind::Unavailable)],
+    )
+    .await;
 
     let nobody = AccountId::new();
     let all = fb
@@ -182,9 +213,14 @@ pub async fn freebusy(dav: &dyn DavStore, fb: &dyn FreeBusy, fx: &DavFixture) {
     )
     .await
     .expect("opaque");
-    dav.delete_collection(owner, home).await.expect("delete home");
+    dav.delete_collection(owner, home)
+        .await
+        .expect("delete home");
     assert_eq!(
         fb.query(tenant, &[owner.account], period(0, 48)).await,
-        Ok(vec![(owner.account, vec![busy(10, 12, BusyKind::Unavailable)])])
+        Ok(vec![(
+            owner.account,
+            vec![busy(10, 12, BusyKind::Unavailable)]
+        )])
     );
 }

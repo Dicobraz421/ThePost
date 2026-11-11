@@ -687,7 +687,12 @@ impl DavStore for MemDav {
             .map_or(ModSeq::ZERO, |a| a.state(kind)))
     }
 
-    async fn inbox_put(&self, scope: AccountScope, name: &str, message: InboxMessage) -> Result<Put> {
+    async fn inbox_put(
+        &self,
+        scope: AccountScope,
+        name: &str,
+        message: InboxMessage,
+    ) -> Result<Put> {
         if !valid_name(name) {
             return Err(Error::invalid(format!(
                 "недопустимое имя ресурса: {name:?}"
@@ -705,7 +710,7 @@ impl DavStore for MemDav {
                 return Err(Error::QuotaExceeded);
             }
             let modseq = acc.bump();
-            let id = prev.unwrap_or_else(DavObjectId::new);
+            let id = prev.unwrap_or_default();
             let etag = modseq.to_string();
             acc.inbox.insert(
                 name.to_owned(),

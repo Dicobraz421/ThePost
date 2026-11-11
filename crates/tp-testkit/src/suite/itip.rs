@@ -70,7 +70,10 @@ pub async fn itip(store: &dyn DavStore, fx: &DavFixture) {
         .collect();
     assert_eq!(
         got,
-        vec![("a.ics", ItipMethod::Request), ("b.ics", ItipMethod::Cancel)]
+        vec![
+            ("a.ics", ItipMethod::Request),
+            ("b.ics", ItipMethod::Cancel)
+        ]
     );
     assert_eq!(inbox.items[0].id, a.id);
     assert_eq!(inbox.items[0].etag, a.etag);
@@ -155,7 +158,10 @@ pub async fn itip(store: &dyn DavStore, fx: &DavFixture) {
     for other in [fx.peer, fx.foreign] {
         let inbox = store.inbox_list(other).await.expect("list other");
         assert!(inbox.items.is_empty() && inbox.state == ModSeq::ZERO);
-        assert_eq!(store.inbox_delete(other, "a.ics").await, Err(Error::NotFound));
+        assert_eq!(
+            store.inbox_delete(other, "a.ics").await,
+            Err(Error::NotFound)
+        );
     }
 
     // Входящие не меняют состояние календарей и не ломают `since`.

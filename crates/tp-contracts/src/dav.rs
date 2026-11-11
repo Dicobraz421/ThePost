@@ -624,7 +624,12 @@ pub trait DavStore: Send + Sync + 'static {
     /// [`DavLimits::max_object_size`] или новый ресурс при [`DavLimits::max_objects`] сообщений — `QuotaExceeded`.
     /// `ModSeq` — из счётчика учётной записи; перезапись сохраняет `id`. После фиксации — сигнал
     /// [`crate::schedule::schedule_inbox_changed`]. По умолчанию — `Error::Internal`.
-    async fn inbox_put(&self, scope: AccountScope, name: &str, message: InboxMessage) -> Result<Put> {
+    async fn inbox_put(
+        &self,
+        scope: AccountScope,
+        name: &str,
+        message: InboxMessage,
+    ) -> Result<Put> {
         let _ = (scope, name, message);
         Err(Error::internal("dav store does not support schedule inbox"))
     }
@@ -795,8 +800,9 @@ mod tests {
         let mut v = serde_json::to_value(&c).expect("json");
         v.as_object_mut().expect("object").remove("transparent");
         assert_eq!(serde_json::from_value::<Collection>(v).expect("old"), c);
-        let old: ObjectIndex = serde_json::from_str(r#"{"component":"Event","uid":"u","span":null}"#)
-            .expect("old index");
+        let old: ObjectIndex =
+            serde_json::from_str(r#"{"component":"Event","uid":"u","span":null}"#)
+                .expect("old index");
         assert_eq!(old, ObjectIndex::new(Component::Event, "u", None));
         let e = dav_changed(
             AccountScope {
