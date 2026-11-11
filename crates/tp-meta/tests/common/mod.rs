@@ -315,3 +315,138 @@ impl tp_contracts::bus::EventBus for RecordingBus {
         ))
     }
 }
+
+/// Адрес `url` с базой `db` (путь адреса заменяется, параметры сохраняются).
+pub fn with_database(url: &str, db: &str) -> String {
+    let (scheme, rest) = url.split_once("://").expect("адрес");
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let query = tail.find('?').map_or("", |i| &tail[i..]);
+    format!("{scheme}://{authority}/{db}{query}")
+}
+
+/// Основная БД и второй шард — две чистые БД одного PostgreSQL; [`TwoShards::meta`] — хранилища над
+/// справочником шардов основной БД.
+pub struct TwoShards {
+    /// Основная БД (её `meta` — без справочника).
+    pub main: FreshDb,
+    /// Справочник шардов.
+    pub dir: Arc<tp_meta::shards::ShardDirectory>,
+    /// Хранилища через справочник.
+    pub meta: PgMeta,
+    /// Номер второго шарда.
+    pub shard: tp_meta::shards::ShardId,
+    /// Прямой пул ко второму шарду (проверки размещения).
+    pub shard_pool: PgPool,
+    shard_db: String,
+}
+
+impl TwoShards {
+    /// Адрес основной БД (с паролем тестовой БД, если он есть).
+    pub fn main_url(&self) -> String {
+        with_database(&pg_url().expect("TEST_DATABASE_URL"), &self.main.name)
+    }
+
+    /// Новая организация с доменом в основной БД.
+    pub async fn tenant(&self) -> (TenantId, DomainId, String) {
+        let tenant = tenant(self.main.meta.pool()).await;
+        let (domain, name) = domain(self.main.meta.pool(), tenant).await;
+        (tenant, domain, name)
+    }
+
+    /// Новая учётная запись организации на шарде `shard` (размещение — `accepts_new` справочника).
+    pub async fn account_on(
+        &self,
+        tenant: (TenantId, DomainId, String),
+        shard: tp_meta::shards::ShardId,
+    ) -> tp_contracts::meta::AccountScope {
+        use tp_contracts::meta::{AccountStore, AccountUpsert};
+        sqlx::query("UPDATE shards SET accepts_new = (shard_id = $1)")
+            .bind(shard.0)
+            .execute(self.main.meta.pool())
+            .await
+            .expect("accepts_new");
+        let acc = self
+            .meta
+            .upsert(
+                tenant.0,
+                AccountUpsert {
+                    domain: tenant.1,
+                    login: format!("u{}@{}", uuid::Uuid::now_v7().simple(), tenant.2),
+                    display_name: "User".into(),
+                    external_id: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("upsert");
+        tp_contracts::meta::AccountScope {
+            tenant: tenant.0,
+            account: acc.id,
+        }
+    }
+
+    /// Удаляет обе БД (в конце теста).
+    pub async fn drop_db(self) {
+        use sqlx::{AssertSqlSafe, Executor};
+        self.shard_pool.close().await;
+        self.main
+            .admin
+            .execute(AssertSqlSafe(format!(
+                "DROP DATABASE {} WITH (FORCE)",
+                self.shard_db
+            )))
+            .await
+            .expect("drop shard database");
+        self.main.drop_db().await;
+    }
+}
+
+/// Две чистые БД: основная со схемой и шард `1` в её справочнике (схема шарда — `ShardDirectory::migrate`).
+pub async fn two_shards() -> Option<TwoShards> {
+    use sqlx::{AssertSqlSafe, Executor};
+    use tp_meta::shards::{ShardDirectory, ShardId};
+    let url = pg_url()?;
+    let main = fresh_meta().await?;
+    let shard_db = format!("tp_shard_{}", uuid::Uuid::now_v7().simple());
+    main.admin
+        .execute(AssertSqlSafe(format!("CREATE DATABASE {shard_db}")))
+        .await
+        .expect("create shard database");
+    let (dsn, password) = split_password(&with_database(&url, &shard_db));
+    let credentials = password.map(|p| {
+        let r: SecretRef = format!("test/{shard_db}#password").parse().expect("ссылка");
+        secrets().set(&r, &p);
+        r
+    });
+    let shard = ShardId(1);
+    sqlx::query(
+        "INSERT INTO shards (shard_id, name, dsn, credentials, accepts_new, site) VALUES ($1, 'second', $2, $3, false, 'dc2')",
+    )
+    .bind(shard.0)
+    .bind(dev_url(&dsn))
+    .bind(credentials.map(|c| c.to_string()))
+    .execute(main.meta.pool())
+    .await
+    .expect("shard row");
+    let dir = Arc::new(ShardDirectory::new(
+        main.meta.pool().clone(),
+        dev_pool_config(&url),
+        secrets(),
+    ));
+    dir.migrate().await.expect("migrate shards");
+    let meta = main.meta.clone().with_shards(dir.clone());
+    let shard_pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&with_database(&url, &shard_db))
+        .await
+        .expect("подключение к шарду");
+    Some(TwoShards {
+        main,
+        dir,
+        meta,
+        shard,
+        shard_pool,
+        shard_db,
+    })
+}
