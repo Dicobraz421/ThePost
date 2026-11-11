@@ -371,12 +371,22 @@ async fn move_trash_restore_expunge_and_changes() {
         .expect("get")
         .expect("moved");
     assert_eq!((got.mailbox, got.uid), (x, Uid(1)));
+    // EXPUNGE в папке: письмо с флагом Deleted уходит в корзину без него (CTR-33), прочие флаги — прежние.
+    meta.set_flags(
+        scope,
+        &[a.id],
+        FlagOp::Add([Flag::Deleted, Flag::Seen].into()),
+        None,
+    )
+    .await
+    .expect("flags");
     let trashed_at = meta.to_trash(scope, &[a.id]).await.expect("trash");
     let in_trash = MessageStore::get(&meta, scope, a.id)
         .await
         .expect("get")
         .expect("a");
     assert_eq!((in_trash.mailbox, in_trash.modseq), (trash, trashed_at));
+    assert_eq!(in_trash.flags, Flags::from([Flag::Seen]));
     // Повтор и отсутствующие письма — без изменений.
     assert_eq!(
         meta.to_trash(scope, &[a.id, MessageId::new()])
