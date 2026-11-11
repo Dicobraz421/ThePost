@@ -1,0 +1,35 @@
+# {{ ansible_managed }}
+# Метаданные filer — PostgreSQL (приложение З.2): схема {{ seaweedfs_filer_db_schema }} БД {{ seaweedfs_filer_db_name }},
+# учётная запись {{ seaweedfs_filer_db_user }}; пароль — WEED_POSTGRES2_PASSWORD (seaweedfs.env, OpenBao). Узлы —
+# списком, filer выбирает доступный для записи (PGTARGETSESSIONATTRS=read-write), TLS verify-full.
+
+[postgres2]
+enabled = true
+createTable = """
+  CREATE TABLE IF NOT EXISTS "%s" (
+    dirhash   BIGINT,
+    name      VARCHAR(65535),
+    directory VARCHAR(65535),
+    meta      bytea,
+    PRIMARY KEY (dirhash, name)
+  );
+"""
+hostname = "{{ seaweedfs_filer_db_hosts | join(',') }}"
+port = {{ seaweedfs_filer_db_port }}
+username = "{{ seaweedfs_filer_db_user }}"
+database = "{{ seaweedfs_filer_db_name }}"
+schema = "{{ seaweedfs_filer_db_schema }}"
+sslmode = "verify-full"
+sslrootcert = "{{ seaweedfs_config_dir }}/tls/ca.pem"
+connection_max_idle = 10
+connection_max_open = 20
+connection_max_lifetime_seconds = 300
+pgbouncer_compatible = false
+enableUpsert = true
+upsertQuery = """
+  INSERT INTO "%[1]s" (dirhash, name, directory, meta)
+    VALUES($1, $2, $3, $4)
+    ON CONFLICT (dirhash, name) DO UPDATE SET
+      directory=EXCLUDED.directory,
+      meta=EXCLUDED.meta
+"""

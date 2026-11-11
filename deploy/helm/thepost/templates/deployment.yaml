@@ -5,7 +5,9 @@ metadata:
   labels:
     {{- include "thepost.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "thepost.selectorLabels" . | nindent 6 }}
@@ -84,7 +86,28 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- if .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if .Values.podAntiAffinity }}
+      # Поды — на разных узлах кластера (podAntiAffinity: {{ .Values.podAntiAffinity }}).
+      affinity:
+        podAntiAffinity:
+          {{- if eq .Values.podAntiAffinity "hard" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "thepost.selectorLabels" . | nindent 18 }}
+          {{- else if eq .Values.podAntiAffinity "soft" }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "thepost.selectorLabels" . | nindent 20 }}
+          {{- else }}
+          {{- fail "podAntiAffinity: soft, hard или пусто" }}
+          {{- end }}
       {{- end }}

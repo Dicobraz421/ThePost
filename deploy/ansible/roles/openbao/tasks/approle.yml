@@ -1,0 +1,56 @@
+# AppRole thepost для узла thepost на этой ВМ: role_id — в каталоге конфигурации, secret_id — для LoadCredential
+# (thepost.service). Команды bao выполняет узел OpenBao openbao_approle_from (его openbao_cli_env с токеном
+# администратора — после configure.yml); для узлов thepost на других ВМ (малый Enterprise):
+#   include_role: { name: openbao, tasks_from: approle }  с  openbao_approle_from: <узел инициализации OpenBao>
+---
+- name: Create thepost credential directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ openbao_thepost_role_id_file | dirname }}"
+    - "{{ openbao_thepost_secret_id_file | dirname }}"
+
+- name: Read AppRole role_id
+  ansible.builtin.command: bao read -field=role_id auth/approle/role/thepost/role-id
+  environment: "{{ hostvars[openbao_approle_from].openbao_cli_env }}"
+  delegate_to: "{{ openbao_approle_from }}"
+  register: openbao_role_id
+  changed_when: false
+  no_log: true
+
+- name: Write AppRole role_id
+  ansible.builtin.copy:
+    content: "{{ openbao_role_id.stdout }}"
+    dest: "{{ openbao_thepost_role_id_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Check AppRole secret_id
+  ansible.builtin.stat:
+    path: "{{ openbao_thepost_secret_id_file }}"
+  register: openbao_secret_id_stat
+
+# secret_id читает systemd (LoadCredential в thepost.service) — только root; свой secret_id у каждого узла.
+- name: Issue AppRole secret_id
+  ansible.builtin.command: bao write -f -field=secret_id auth/approle/role/thepost/secret-id
+  environment: "{{ hostvars[openbao_approle_from].openbao_cli_env }}"
+  delegate_to: "{{ openbao_approle_from }}"
+  register: openbao_secret_id
+  when: not openbao_secret_id_stat.stat.exists
+  changed_when: true
+  no_log: true
+
+- name: Write AppRole secret_id
+  ansible.builtin.copy:
+    content: "{{ openbao_secret_id.stdout }}"
+    dest: "{{ openbao_thepost_secret_id_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: not openbao_secret_id_stat.stat.exists
+  no_log: true

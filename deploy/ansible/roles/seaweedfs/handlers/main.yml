@@ -1,0 +1,7 @@
+---
+- name: Restart seaweedfs
+  ansible.builtin.systemd_service:
+    name: "seaweedfs-{{ item }}"
+    state: restarted
+    daemon_reload: true
+  loop: "{{ seaweedfs_components }}"

@@ -4,6 +4,13 @@
 storage "raft" {
   path    = "{{ openbao_data_dir }}"
   node_id = "{{ inventory_hostname_short }}"
+{% for peer in openbao_raft_peers %}
+
+  retry_join {
+    leader_api_addr     = "{{ peer }}"
+    leader_ca_cert_file = "{{ openbao_config_dir }}/tls/ca.pem"
+  }
+{% endfor %}
 }
 
 listener "tcp" {
@@ -17,7 +24,7 @@ listener "tcp" {
 {% if openbao_seal == 'static' %}
 # Ключ в файле: секреты защищены слабее, чем TPM/HSM или KMS (thepost doctor предупреждает).
 seal "static" {
-  current_key_id = "{{ inventory_hostname_short }}-1"
+  current_key_id = "{{ openbao_static_key_id }}"
   current_key    = "file://{{ openbao_static_key_file }}"
 }
 {% elif openbao_seal != 'shamir' %}

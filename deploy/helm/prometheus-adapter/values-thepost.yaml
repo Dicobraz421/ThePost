@@ -1,0 +1,42 @@
+# Значения чарта prometheus-adapter для HPA The Post по числу соединений (SRS 2.3; чарт thepost —
+# autoscaling.connections.enabled и metrics.podMonitor.enabled): метрика подов tp_load_connections (открытые
+# клиентские соединения узла) — в API custom.metrics.k8s.io.
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter -n monitoring \
+#     -f deploy/helm/prometheus-adapter/values-thepost.yaml
+# Проверка: kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/thepost/pods/*/tp_load_connections"
+#
+# Внутренний канал — только TLS: адрес Prometheus — https, CA — секрет prometheus-ca (ключ ca.crt) в пространстве
+# имён адаптера. Prometheus без TLS — заменить url и убрать extraArguments, extraVolumes, extraVolumeMounts.
+prometheus:
+  url: https://prometheus-operated.monitoring.svc
+  port: 9090
+
+extraArguments:
+  - --prometheus-ca-file=/etc/prometheus-ca/ca.crt
+
+extraVolumes:
+  - name: prometheus-ca
+    secret:
+      secretName: prometheus-ca
+      items:
+        - { key: ca.crt, path: ca.crt }
+
+extraVolumeMounts:
+  - name: prometheus-ca
+    mountPath: /etc/prometheus-ca
+    readOnly: true
+
+rules:
+  default: false
+  custom:
+    # Gauge узла (crates/tp-platform/src/load.rs); метки namespace и pod добавляет PodMonitor.
+    - seriesQuery: 'tp_load_connections{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: { resource: namespace }
+          pod: { resource: pod }
+      name:
+        matches: "^tp_load_connections$"
+        as: "tp_load_connections"
+      metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'

@@ -1,5 +1,6 @@
 # Чарт узла The Post для Kubernetes (Enterprise-K8s, SRS 1.2): Deployment, ConfigMap с config.yaml, Service,
-# сервисный аккаунт для Kubernetes auth OpenBao; PostgreSQL — CloudNativePG (cnpg.enabled: Cluster, Pooler; оператор
+# сервисный аккаунт для Kubernetes auth OpenBao; HPA, PodDisruptionBudget, VPA (рекомендации), anti-affinity по
+# узлам (SRS 2.3); PostgreSQL — CloudNativePG (cnpg.enabled: Cluster, Pooler; оператор
 # CloudNativePG 1.26+ — отдельно). Минимальные привилегии — SRS 2.7, DEP-08 (values.yaml).
 apiVersion: v2
 name: thepost
