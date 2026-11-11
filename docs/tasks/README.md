@@ -409,6 +409,10 @@
 | [JMAP-22](JMAP-22.md) | подпись профиля .mobileconfig сертификатом сервера | jmap | A | jmap-15 | todo | JMAP-14,DEPS-03 |
 | [ADM-12](ADM-12.md) | постраничный список учётных записей в Admin API | admin | A | admin-07 | ready | ADM-11 |
 | [APP-20](APP-20.md) | fail_closed защиты от перебора в узле, устаревший TODO doctor | app | A | app-19 | todo | AUTH-11,APP-08 |
+| [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | todo | SMTP-20 |
+| [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | todo | CTR-31,SMTP-22 |
+| [META-44](META-44.md) | очередь модерации без группы в PostgreSQL | meta | B | meta-28 | todo | CTR-43 |
+| [SMTP-30](SMTP-30.md) | исход Moderate правил потока — в очередь модерации | smtp | A | smtp-11 | todo | CTR-43,SMTP-22 |
 
 ## Вне волн
 
