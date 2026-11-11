@@ -18,6 +18,7 @@
 //!   egress-IP) с перечитыванием по сигналу;
 //! - [`sources`] — доверенные источники приёма: шлюз (`XCLIENT`, `XFORWARD`, результаты проверок шлюза) и
 //!   приложения (отправка без SASL);
+//! - [`sieve`] — правила Sieve при локальной доставке (`DeliveryRules`) и автоответ (RFC 3834);
 //! - [`screen`] — экран соединений smtp-in (postscreen): задержка приветствия, конвейер, частота, кэш по IP;
 //! - [`queue`] — очередь исходящей почты и роль smtp-out (отправка на MX через `mail-send`);
 //! - [`srs`] — адреса SRS (Sender Rewriting Scheme) пересылки и их обратное преобразование;
@@ -43,6 +44,7 @@ pub mod queue;
 pub mod routes;
 pub mod screen;
 pub mod server;
+pub mod sieve;
 pub mod sources;
 pub mod srs;
 pub mod tracking;
