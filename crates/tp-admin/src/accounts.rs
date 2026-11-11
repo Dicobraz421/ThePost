@@ -3,7 +3,8 @@
 //! - организация (`/api/v1/orgs/{org}`): чтение и политика уровня организации;
 //! - домены: список, создание, удаление, политика домена;
 //! - учётные записи приходят из каталога (LDAP): здесь — поиск по имени входа, чтение с использованием квоты и
-//!   только локальные атрибуты — политика ящика (квота, срок корзины, лимиты отправки);
+//!   только локальные атрибуты — политика ящика (квота, срок корзины, лимиты отправки); без каталога (SMB, решение
+//!   #193) — создание локальной учётной записи в принятом домене организации (пароль — пароль приложения);
 //! - правило `trash.purge` (`mode`, `user_can_choose`) — поле политики уровня; выбор пользователя и действующее
 //!   значение ящика — [`crate::retention`];
 //! - политика уровня задаётся целиком (`PUT`), поле `null` — не задано на уровне; действующая политика
@@ -22,8 +23,9 @@ use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_contracts::config::duration;
-use tp_contracts::meta::{Account, Policy};
+use tp_contracts::meta::{Account, AccountUpsert, Policy};
 use tp_contracts::retention::TrashPurgeRule;
+use tp_contracts::transport::normalize_domain;
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
@@ -222,6 +224,17 @@ pub struct AccountInfo {
     pub policies: Policies,
 }
 
+/// Новая локальная учётная запись (без каталога).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NewAccount {
+    /// Имя входа — адрес в принятом домене организации (приводится к нижнему регистру).
+    pub login: String,
+    /// Отображаемое имя; нет — имя входа.
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
 /// Поиск учётной записи.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
@@ -246,7 +259,10 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
             "/api/v1/orgs/{org}/domains/{domain}/policy",
             put(put_domain_policy),
         )
-        .route("/api/v1/orgs/{org}/accounts", get(find_account))
+        .route(
+            "/api/v1/orgs/{org}/accounts",
+            get(find_account).post(create_account),
+        )
         .route("/api/v1/orgs/{org}/accounts/{account}", get(get_account))
         .route(
             "/api/v1/orgs/{org}/accounts/{account}/policy",
@@ -266,6 +282,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         delete_domain,
         put_domain_policy,
         find_account,
+        create_account,
         get_account,
         put_account_policy
     ),
@@ -277,7 +294,8 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         DomainDetails,
         NewDomain,
         QuotaInfo,
-        AccountInfo
+        AccountInfo,
+        NewAccount
     ))
 )]
 pub(crate) struct Doc;
@@ -330,6 +348,22 @@ fn domain_name(name: &str) -> Result<String> {
         )));
     }
     Ok(name)
+}
+
+/// Имя входа (адрес) в нижнем регистре и его домен в канонической форме; не `имя@домен` — `Invalid`.
+pub(crate) fn split_login(login: &str) -> Result<(String, String)> {
+    let login = login.trim().to_ascii_lowercase();
+    match login.rsplit_once('@') {
+        Some((user, domain))
+            if !user.is_empty() && !login.chars().any(|c| c.is_whitespace() || c.is_control()) =>
+        {
+            let domain = normalize_domain(domain)?;
+            Ok((login, domain))
+        }
+        _ => Err(Error::invalid(format!(
+            "имя входа {login:?} — не адрес вида имя@домен"
+        ))),
+    }
 }
 
 /// Организация и её политика.
@@ -459,6 +493,56 @@ async fn find_account(
     Ok(Json(out))
 }
 
+/// Создаёт локальную учётную запись (без каталога) в принятом домене организации. Имя занято — 409; домен адреса
+/// не принят организацией — 400; настройки транспорта не подключены — 503. Пароль — пароль приложения
+/// (`POST .../app-passwords`).
+#[utoipa::path(post, path = "/api/v1/orgs/{org}/accounts", tag = "accounts",
+    params(("org" = String, Path, description = "Организация (UUID)")),
+    request_body = NewAccount,
+    responses((status = 201, body = AccountInfo), (status = 400, body = Problem), (status = 409, body = Problem),
+        (status = 503, body = Problem)))]
+async fn create_account(
+    State(a): State<Arc<Admin>>,
+    Path(org): Path<TenantId>,
+    Json(body): Json<NewAccount>,
+) -> ApiResult<(StatusCode, Json<AccountInfo>)> {
+    let (login, domain) = split_login(&body.login)?;
+    let t = a.transport.as_deref().ok_or(Error::UNAVAILABLE)?;
+    let snap = t.cluster().await?;
+    let d = snap
+        .domain(&domain)
+        .filter(|d| d.tenant == org)
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "домен {domain} не принят организацией: сначала POST /api/v1/orgs/{org}/transport/domains"
+            ))
+        })?;
+    if a.d.accounts.by_login(org, &login).await?.is_some() {
+        return Err(Error::Conflict.into());
+    }
+    let display_name = body
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(&login)
+        .to_owned();
+    let acc =
+        a.d.accounts
+            .upsert(
+                org,
+                AccountUpsert {
+                    domain: d.id,
+                    login,
+                    display_name,
+                    external_id: None,
+                    enabled: true,
+                },
+            )
+            .await?;
+    Ok((StatusCode::CREATED, Json(account_info(&a, acc).await?)))
+}
+
 async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo> {
     let scope = tp_contracts::meta::AccountScope {
         tenant: acc.tenant,
@@ -575,6 +659,71 @@ mod tests {
         assert_eq!(s, StatusCode::FORBIDDEN);
         let last = env.audit.records().pop().expect("audit");
         assert_eq!((last.tenant, last.status), (Some(env.other_tenant), 403));
+    }
+
+    /// Локальная учётная запись: только в принятом домене организации, имя не занято.
+    #[tokio::test]
+    async fn create_local_account() {
+        use tp_contracts::transport::{AcceptedDomain, DomainKind, TransportStore};
+
+        let env = Env::new();
+        let base = format!("{}/accounts", org());
+        let new = |login: &str| Some(json!({ "login": login, "display_name": "Анна" }));
+        let (s, _, b) = env
+            .call("POST", &base, Some("org"), new("a@example.test"))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        let c = env.transport.cluster().await.expect("cluster");
+        let d = AcceptedDomain {
+            id: tp_contracts::DomainId::new(),
+            tenant: TenantId::DEFAULT,
+            name: "example.test".into(),
+            kind: DomainKind::Authoritative,
+        };
+        env.transport
+            .put_domain(c.version, &d)
+            .await
+            .expect("domain");
+        let (s, _, _) = env
+            .call("POST", &base, Some("user"), new("a@example.test"))
+            .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, b) = env
+            .call("POST", &base, Some("org"), new(" A@Example.Test "))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(b["login"], "a@example.test");
+        assert_eq!(b["display_name"], "Анна");
+        assert_eq!(b["domain"], d.id.to_string());
+        assert_eq!(b["external_id"], Value::Null);
+        let (s, _, _) = env
+            .call("POST", &base, Some("org"), new("a@example.test"))
+            .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        for bad in ["a", "a b@example.test", "@example.test"] {
+            let (s, _, _) = env.call("POST", &base, Some("org"), new(bad)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let (_, _, list) = env
+            .call(
+                "GET",
+                &format!("{base}?login=a@example.test"),
+                Some("org"),
+                None,
+            )
+            .await;
+        assert_eq!(list[0]["login"], "a@example.test");
+
+        let other = format!("/api/v1/orgs/{}/accounts", env.other_tenant);
+        let (s, _, _) = env
+            .call("POST", &other, Some("other"), new("b@example.test"))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "домен чужой организации");
+        let env = Env::without_transport();
+        let (s, _, _) = env
+            .call("POST", &base, Some("org"), new("a@example.test"))
+            .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

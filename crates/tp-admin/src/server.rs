@@ -46,6 +46,7 @@ use crate::accounts::{DomainStore, PolicyStore};
 use crate::audit::{AUDIT_ROUTE, AuditLog, AuditRecord, AuditSink};
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
+use crate::init::{InitConfig, Local};
 
 /// Начало префикса маршрутов модуля.
 pub const MODULE_PREFIX: &str = "/api/v1/modules/";
@@ -132,6 +133,7 @@ pub struct RoleBinding {
 ///   - role: auditor
 ///     groups: [security]
 /// listen: 127.0.0.1:8443
+/// init: { token_ttl: 10m, session_ttl: 8h }
 /// audit:
 ///   syslog: { address: "siem.example.org:6514" }
 /// ```
@@ -154,6 +156,8 @@ pub struct AdminConfig {
     pub allow_external: bool,
     /// Экспорт журнала аудита во внешнюю SIEM (syslog, OTLP); по умолчанию выключен.
     pub audit: AuditExportConfig,
+    /// Первый администратор без OIDC (`thepost admin init`, [`crate::init`]).
+    pub init: InitConfig,
 }
 
 impl Default for AdminConfig {
@@ -167,6 +171,7 @@ impl Default for AdminConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 8443)),
             allow_external: false,
             audit: AuditExportConfig::default(),
+            init: InitConfig::default(),
         }
     }
 }
@@ -198,6 +203,7 @@ impl AdminConfig {
             )));
         }
         self.audit.check()?;
+        self.init.check()?;
         if self.page_size == 0 || self.page_size > self.max_page_size {
             return Err(Error::invalid("admin: page_size — от 1 до max_page_size"));
         }
@@ -289,6 +295,8 @@ pub struct Admin {
     pub(crate) cfg: AdminConfig,
     /// Настройки транспорта; `None` — не подключено (маршруты отвечают 503).
     pub(crate) transport: Option<Arc<dyn TransportStore>>,
+    /// Локальный вход (`admin init`, сессии); `None` — не подключено (обмен отвечает 503).
+    pub(crate) local: Option<Arc<Local>>,
 }
 
 impl fmt::Debug for Admin {
@@ -297,6 +305,7 @@ impl fmt::Debug for Admin {
             .field("d", &self.d)
             .field("cfg", &self.cfg)
             .field("transport", &self.transport.is_some())
+            .field("local", &self.local.is_some())
             .finish()
     }
 }
@@ -323,6 +332,7 @@ impl Admin {
             d,
             cfg,
             transport: None,
+            local: None,
         })
     }
 
@@ -355,26 +365,34 @@ impl Admin {
                 .route(&prefix, any(handler.clone()))
                 .route(&format!("{prefix}/{{*rest}}"), any(handler));
         }
-        api.route_layer(middleware::from_fn_with_state(self.clone(), guard))
+        let api = api.route_layer(middleware::from_fn_with_state(self.clone(), guard));
+        crate::init::routes(api)
             .route("/api/openapi.json", get(openapi))
             .layer(DefaultBodyLimit::max(self.cfg.max_body_size))
             .with_state(self)
     }
 
-    /// Субъект по заголовку `Authorization: Bearer`; нет заголовка, другая схема, неверный токен — `Forbidden`.
+    /// Субъект по заголовку `Authorization: Bearer` (токен OIDC); нет заголовка, другая схема, неверный токен —
+    /// `Forbidden`.
     pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal> {
-        let value = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or(Error::Forbidden)?;
-        let (scheme, token) = value.split_once(' ').ok_or(Error::Forbidden)?;
-        if !scheme.eq_ignore_ascii_case("bearer") {
-            return Err(Error::Forbidden);
-        }
+        let token = bearer(headers)?;
         self.d
             .auth
-            .verify(Credentials::Bearer(token.trim().to_owned()))
+            .verify(Credentials::Bearer(token.to_owned()))
             .await
+    }
+
+    /// Администратор запроса: сессия Admin API ([`crate::init`]) или токен OIDC с ролями по конфигурации.
+    /// Локальный токен `admin init` здесь не принимается — только обмен на сессию (`POST /api/v1/session`).
+    pub async fn identify(&self, headers: &HeaderMap) -> Result<Caller> {
+        let token = bearer(headers)?;
+        if let Some(c) = self.session_caller(token, OffsetDateTime::now_utc()) {
+            return c;
+        }
+        if tp_contracts::admin_token::is_local_admin_token(token) {
+            return Err(Error::Forbidden);
+        }
+        Ok(self.caller(self.authenticate(headers).await?))
     }
 
     /// Роли субъекта по назначениям конфигурации.
@@ -408,8 +426,8 @@ async fn guard(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let principal = match a.authenticate(req.headers()).await {
-        Ok(p) => p,
+    let caller = match a.identify(req.headers()).await {
+        Ok(c) => c,
         Err(e) => return auth_error(&e),
     };
     let org = params.ok().and_then(|p| {
@@ -421,7 +439,6 @@ async fn guard(
         Ok(t) => t,
         Err(e) => return ApiError(e).into_response(),
     };
-    let caller = a.caller(principal);
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let route = req
@@ -455,7 +472,21 @@ async fn guard(
     resp
 }
 
-fn auth_error(e: &Error) -> Response {
+/// Значение `Authorization: Bearer`; нет заголовка, другая схема — `Forbidden`.
+pub(crate) fn bearer(headers: &HeaderMap) -> Result<&str> {
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(Error::Forbidden)?;
+    let (scheme, token) = value.split_once(' ').ok_or(Error::Forbidden)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(Error::Forbidden);
+    }
+    Ok(token.trim())
+}
+
+/// Отказ входа: 401 с `WWW-Authenticate`; временная ошибка — её код.
+pub(crate) fn auth_error(e: &Error) -> Response {
     if e.is_retryable() {
         return ApiError(e.clone()).into_response();
     }
@@ -631,6 +662,7 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     api.merge(crate::delivery::Doc::openapi());
     api.merge(crate::groups::Doc::openapi());
     api.merge(crate::transport::Doc::openapi());
+    api.merge(crate::init::Doc::openapi());
     api
 }
 
