@@ -40,6 +40,16 @@
 //!     mode: enforce
 //!     greet_delay: 6s
 //!     exempt: ["127.0.0.0/8", "10.0.0.0/8"]
+//!   forward:
+//!     srs:
+//!       domain: example.org
+//!       key: { secret: "thepost/srs#key" }
+//!       max_age_days: 21
+//!     arc:
+//!       domain: example.org
+//!       selector: arc2026
+//!       algorithm: ed25519-sha256
+//!       key: { secret: "thepost/arc/example.org#arc2026" }
 //!   learn:
 //!     enabled: true
 //!     url: "https://rspamd.example.org:11334"
@@ -87,6 +97,8 @@ pub struct SmtpConfig {
     pub addressing: AddressingConfig,
     /// Обучение антиспама по перемещению писем в «Спам» и из него.
     pub learn: LearnConfig,
+    /// Пересылка наружу: SRS-переписывание отправителя и ARC-подпись.
+    pub forward: ForwardConfig,
 }
 
 impl Default for SmtpConfig {
@@ -105,8 +117,85 @@ impl Default for SmtpConfig {
             screen: ScreenConfig::default(),
             addressing: AddressingConfig::default(),
             learn: LearnConfig::default(),
+            forward: ForwardConfig::default(),
         }
     }
+}
+
+/// Пересылка наружу (SRS 4.1; [`crate::forward`]): перенаправление Sieve и правилом потока почты, пересылки модулей.
+/// Без секций письмо пересылается как раньше — с исходным отправителем и без ARC.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForwardConfig {
+    /// SRS-переписывание отправителя конверта; `None` — выключено.
+    pub srs: Option<SrsConfig>,
+    /// ARC-подпись пересылаемых писем (RFC 8617); `None` — выключена.
+    pub arc: Option<ArcConfig>,
+    /// Время жизни ключей в кэше (затем перечитываются из хранилища секретов).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub key_refresh: Duration,
+}
+
+impl Default for ForwardConfig {
+    fn default() -> Self {
+        Self {
+            srs: None,
+            arc: None,
+            key_refresh: Duration::from_secs(3600),
+        }
+    }
+}
+
+/// SRS: домен адресов (его MX — этот кластер), ключ подписи и срок адреса.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SrsConfig {
+    /// Домен адресов SRS (принятый домен организации).
+    pub domain: String,
+    /// Ключ подписи адресов в хранилище секретов.
+    pub key: tp_contracts::secrets::SecretRef,
+    /// Прежние ключи (ротация): адреса, подписанные ими, ещё принимаются.
+    #[serde(default)]
+    pub previous_keys: Vec<tp_contracts::secrets::SecretRef>,
+    /// Срок адреса SRS, дней (уведомления о недоставке позже — `550`).
+    #[serde(default = "srs_max_age")]
+    pub max_age_days: u32,
+}
+
+fn srs_max_age() -> u32 {
+    21
+}
+
+/// ARC-подпись: домен и селектор подписи (`<селектор>._domainkey.<домен>` в DNS), ключ.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArcConfig {
+    /// Домен подписи (`d=`).
+    pub domain: String,
+    /// Селектор (`s=`).
+    pub selector: String,
+    /// Алгоритм.
+    pub algorithm: DkimAlgorithm,
+    /// Закрытый ключ (PEM) в хранилище секретов.
+    pub key: tp_contracts::secrets::SecretRef,
+    /// Подписываемые заголовки.
+    #[serde(default = "arc_headers")]
+    pub headers: Vec<String>,
+}
+
+fn arc_headers() -> Vec<String> {
+    [
+        "From",
+        "To",
+        "Cc",
+        "Subject",
+        "Date",
+        "Message-ID",
+        "Reply-To",
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 /// Обучение антиспама (SRS 4.1, по модели imapsieve Dovecot; [`crate::learn`]): письмо, перенесённое
