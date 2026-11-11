@@ -215,21 +215,25 @@ pub enum BusKind {
     /// В процессе: один узел (SMB).
     #[default]
     Local,
+    /// PostgreSQL LISTEN/NOTIFY (`tp_meta::signals::PgSignalBus`): кластер из нескольких узлов. Канал, буферы и
+    /// очередь публикатора — секция `meta.signals`; слушатель — прямое соединение с primary (с PgBouncer —
+    /// `database.direct_url`).
+    Postgres,
 }
 
-/// Секция `bus`: шина уведомлений (SRS 2.8). Требует перезапуска. Шина Valkey удалена (CLU-09).
+/// Секция `bus`: шина сигналов (SRS 2.8). Требует перезапуска. Шина Valkey удалена (CLU-09).
 ///
 /// ```yaml
 /// bus:
-///   kind: local
+///   kind: local      # postgres — кластер (LISTEN/NOTIFY, параметры — meta.signals)
 ///   capacity: 256
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct BusSection {
-    /// Реализация: `local` — в процессе.
+    /// Реализация: `local` — в процессе, `postgres` — LISTEN/NOTIFY.
     pub kind: BusKind,
-    /// Буфер подписчика шины в процессе: столько непрочитанных уведомлений до отключения отставшего.
+    /// Буфер подписчика шины в процессе: столько непрочитанных уведомлений до отключения отставшего (`local`).
     pub capacity: usize,
 }
 
@@ -264,10 +268,6 @@ pub struct ClusterSection {
     /// Внутренний адрес служебного канала узла для запросов узел → узел (`https://host:port`), объявляется в
     /// записи узла; пусто — узел запросов не принимает.
     pub addr: String,
-    /// Период опроса журнала событий подписчиками узла.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub events_poll_interval: Duration,
     /// Запросов перестройки индексов, просматриваемых ролью indexer за проход (перестраиваются ящики своих
     /// разделов журнала).
     pub rebuild_scan: usize,
@@ -279,7 +279,6 @@ impl Default for ClusterSection {
             node_id: None,
             site: tp_contracts::membership::SiteId::DEFAULT.to_owned(),
             addr: String::new(),
-            events_poll_interval: Duration::from_secs(1),
             rebuild_scan: 64,
         }
     }
@@ -292,7 +291,7 @@ impl ClusterSection {
             .map_err(|e| Error::invalid(format!("site: {e}")))
     }
 
-    /// Проверка: имя узла (если задано), площадка, адрес (пусто или `https://host:port`) и ненулевые периоды.
+    /// Проверка: имя узла (если задано), площадка, адрес (пусто или `https://host:port`).
     pub fn check(&self) -> Result<()> {
         if let Some(node) = &self.node_id {
             tp_contracts::membership::NodeId::new(node.clone())?;
@@ -309,9 +308,6 @@ impl ClusterSection {
                     self.addr
                 )));
             }
-        }
-        if self.events_poll_interval.is_zero() {
-            return Err(Error::invalid("период опроса должен быть больше нуля"));
         }
         Ok(())
     }
@@ -753,19 +749,44 @@ blob:
 
     #[test]
     fn durations_are_humantime() {
-        let c = parse(&format!(
-            "{MINIMAL_DEV}cluster:\n  events_poll_interval: 500ms\ndoctor:\n  max_clock_skew: 2s\n"
-        ))
-        .expect("config");
-        let cluster = c.section::<ClusterSection>(CLUSTER).expect("cluster");
-        assert_eq!(cluster.events_poll_interval, Duration::from_millis(500));
+        let c = parse(&format!("{MINIMAL_DEV}doctor:\n  max_clock_skew: 2s\n")).expect("config");
+        let doctor = c.section::<DoctorSection>(DOCTOR).expect("doctor");
+        assert_eq!(doctor.max_clock_skew, Duration::from_secs(2));
         let e = err(parse(&format!(
-            "{MINIMAL_DEV}cluster:\n  events_poll_interval: 5\n"
+            "{MINIMAL_DEV}doctor:\n  max_clock_skew: 5\n"
         )));
         assert!(
-            e.contains("duration") || e.contains("events_poll_interval"),
+            e.contains("duration") || e.contains("max_clock_skew"),
             "{e}"
         );
+    }
+
+    /// APP-08: опроса журнала событий нет — ключ `cluster.events_poll_interval` неизвестен (строгая проверка).
+    #[test]
+    fn events_poll_interval_is_gone() {
+        let e = err(strict(&format!(
+            "{MINIMAL_DEV}cluster:\n  events_poll_interval: 1s\n"
+        )));
+        assert!(e.contains("events_poll_interval"), "{e}");
+    }
+
+    /// APP-08: шина — в процессе (по умолчанию) или PostgreSQL LISTEN/NOTIFY; Valkey — ошибка строгой проверки.
+    #[test]
+    fn bus_kinds() {
+        let c = parse(MINIMAL_DEV).expect("config");
+        assert_eq!(
+            c.section::<BusSection>(BUS).expect("bus").kind,
+            BusKind::Local
+        );
+        let c = strict(&format!("{MINIMAL_DEV}bus:\n  kind: postgres\n")).expect("postgres");
+        assert_eq!(
+            c.section::<BusSection>(BUS).expect("bus").kind,
+            BusKind::Postgres
+        );
+        let e = err(strict(&format!(
+            "{MINIMAL_DEV}bus:\n  kind: valkey\n  valkey:\n    url: rediss://v:6379\n"
+        )));
+        assert!(e.contains("valkey"), "{e}");
     }
 
     #[test]

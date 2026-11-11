@@ -1,5 +1,6 @@
 //! `thepost doctor [--json]` (SRS 5.5, 3.1; APP-02): проверки окружения узла — конфигурация, хранилище секретов,
-//! СУБД (проверки `tp-meta`), BLOB (запись, чтение и удаление пробного объекта), синхронизация часов узла и СУБД,
+//! СУБД (проверки `tp-meta`: версия, синхронная реплика, часовой пояс, RLS, TLS, роль узла; сторонние расширения —
+//! `database.extensions`, APP-08), BLOB (запись, чтение и удаление пробного объекта), синхронизация часов узла и СУБД,
 //! минимальные привилегии процесса (PLT-16): учётная запись, capabilities, no_new_privs, seccomp, Landlock;
 //! DNS почтового домена (MX, SPF, DKIM, DMARC, MTA-STS, PTR), сертификаты и PROXY v2 — `doctor_dns` (APP-06).
 //!
@@ -362,8 +363,54 @@ async fn database(
         }
         Err(e) => report.push("database.checks", Status::Fail, "", message(&e)),
     }
+    extensions(&pool, meta.timeout, report).await;
     clock_skew(&pool, meta.timeout, doctor, report).await;
     pool.close().await;
+}
+
+/// Расширения PostgreSQL базы узла, кроме встроенного `plpgsql` (по имени, по возрастанию).
+async fn extensions(pool: &PgPool, timeout: Duration, report: &mut Report) {
+    let id = "database.extensions";
+    let query = sqlx::query_scalar::<_, String>(
+        "SELECT extname::text FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY 1",
+    )
+    .fetch_all(pool);
+    let names = match tokio::time::timeout(timeout, query).await {
+        Ok(Ok(names)) => names,
+        Ok(Err(e)) => {
+            report.push(
+                id,
+                Status::Fail,
+                "",
+                format!("список расширений не получен: {e}"),
+            );
+            return;
+        }
+        Err(_) => {
+            report.push(
+                id,
+                Status::Fail,
+                "",
+                "список расширений не получен: нет ответа",
+            );
+            return;
+        }
+    };
+    let (status, msg) = extensions_status(&names);
+    report.push(id, status, names.join(", "), msg);
+}
+
+/// Итог по списку сторонних расширений: продукт работает без расширений (SRS 3.1, решение
+/// 2026-11-01-interaction-db-ha) — установленные не нужны и не должны требоваться механизмом HA.
+pub fn extensions_status(names: &[String]) -> (Status, &'static str) {
+    if names.is_empty() {
+        (Status::Ok, "сторонних расширений нет")
+    } else {
+        (
+            Status::Warn,
+            "установлены сторонние расширения: продукт их не использует; механизм HA и перенос базы не должны от них зависеть",
+        )
+    }
 }
 
 /// Расхождение часов узла и СУБД: момент СУБД сравнивается с серединой интервала запроса.
@@ -647,5 +694,19 @@ mod tests {
             "{report:?}"
         );
         assert!(report.get("time.clock_skew").is_some(), "{report:?}");
+        assert!(report.get("database.extensions").is_some(), "{report:?}");
+        assert!(
+            report.get("database.sync_replication").is_some(),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn third_party_extensions_warn() {
+        assert_eq!(extensions_status(&[]).0, Status::Ok);
+        assert_eq!(
+            extensions_status(&["pg_stat_statements".to_owned()]).0,
+            Status::Warn
+        );
     }
 }
