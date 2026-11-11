@@ -249,19 +249,160 @@ async fn net_and_account_thresholds() {
     );
 }
 
+/// Хранилище недоступно, `fail_closed = false`: вход пускается, блокировка действует на узле и после
+/// восстановления хранилища записывается туда (дальше — общая).
 #[tokio::test]
-async fn store_errors_propagate() {
+async fn fail_open_blocks_on_node_until_store_is_back() {
+    let cfg = AbuseConfig {
+        ip_failures: 2,
+        ..AbuseConfig::default()
+    };
     let clock = ManualClock::default();
     let store = MemAbuseBlocks::new(clock.shared());
-    let g = node(&AbuseConfig::default(), Arc::new(store.clone()), &clock);
+    let a = node(&cfg, Arc::new(store.clone()), &clock);
     let tenant = TenantId::new();
-    store.fail_next(tp_contracts::Error::Unavailable { retry_after: None });
-    assert!(g.check(tenant, &from_ip("192.0.2.1")).await.is_err());
-    // Следующая проверка перечитывает набор.
+    let bad = from_ip("192.0.2.1");
+    let subject = BlockSubject::Ip(ip("192.0.2.1"));
+
+    // Набор не загружается — проверка пускает.
+    store.fail_next(Error::UNAVAILABLE);
+    assert_eq!(a.check(tenant, &bad).await.expect("check"), None);
+    assert_eq!(a.failure(tenant, &bad).await.expect("fail"), None);
+    // Блокировка не записана в хранилище, но действует на узле.
+    store.fail_next(Error::UNAVAILABLE);
+    let until = a
+        .failure(tenant, &bad)
+        .await
+        .expect("fail")
+        .expect("blocked");
+    store.fail_next(Error::UNAVAILABLE);
+    assert_eq!(a.check(tenant, &bad).await.expect("check"), Some(until));
+    store.fail_next(Error::UNAVAILABLE);
     assert_eq!(
-        g.check(tenant, &from_ip("192.0.2.1")).await.expect("check"),
+        a.check(tenant, &from_ip("192.0.2.2")).await.expect("check"),
         None
     );
+    assert_eq!(
+        store.blocked(tenant, &subject).await.expect("blocked"),
+        None
+    );
+    // Другой узел её не знает: хранилища не было.
+    let b = node(&cfg, Arc::new(store.clone()), &clock);
+    assert_eq!(b.check(tenant, &bad).await.expect("check"), None);
+
+    // Хранилище вернулось: загрузка набора записывает блокировку узла — её видят новые узлы.
+    assert_eq!(a.check(tenant, &bad).await.expect("check"), Some(until));
+    assert!(
+        store
+            .blocked(tenant, &subject)
+            .await
+            .expect("blocked")
+            .is_some()
+    );
+    let c = node(&cfg, Arc::new(store.clone()), &clock);
+    assert!(c.check(tenant, &bad).await.expect("check").is_some());
+
+    // Срок — блокировка снимается.
+    clock.advance(cfg.block_for + Duration::from_secs(1));
+    assert_eq!(a.check(tenant, &bad).await.expect("check"), None);
+}
+
+/// Хранилище недоступно, `fail_closed = true`: отказ входа (`Unavailable`), блокировка узла всё равно ставится.
+#[tokio::test]
+async fn fail_closed_refuses_while_store_is_down() {
+    let cfg = AbuseConfig {
+        ip_failures: 1,
+        fail_closed: true,
+        ..AbuseConfig::default()
+    };
+    let clock = ManualClock::default();
+    let store = MemAbuseBlocks::new(clock.shared());
+    let g = node(&cfg, Arc::new(store.clone()), &clock);
+    let tenant = TenantId::new();
+    let bad = from_ip("198.51.100.1");
+
+    store.fail_next(Error::UNAVAILABLE);
+    let err = g.check(tenant, &bad).await.expect_err("refused");
+    assert!(err.is_retryable());
+    // Любая ошибка хранилища — `Unavailable`.
+    store.fail_next(Error::internal("broken"));
+    assert!(matches!(
+        g.check(tenant, &bad).await,
+        Err(Error::Unavailable { .. })
+    ));
+    store.fail_next(Error::UNAVAILABLE);
+    let until = g
+        .failure(tenant, &bad)
+        .await
+        .expect("fail")
+        .expect("blocked");
+    // Хранилище вернулось: вход проверяется, блокировка узла записана.
+    assert_eq!(g.check(tenant, &bad).await.expect("check"), Some(until));
+    assert_eq!(
+        g.check(tenant, &from_ip("198.51.100.2"))
+            .await
+            .expect("check"),
+        None
+    );
+    assert!(
+        store
+            .blocked(tenant, &BlockSubject::Ip(ip("198.51.100.1")))
+            .await
+            .expect("blocked")
+            .is_some()
+    );
+}
+
+/// Набор организации уже загружен: блокировка узла учитывается вместе с ним, записывается в хранилище при
+/// следующей удачной блокировке, снимается сигналом `Unblocked`.
+#[tokio::test]
+async fn node_blocks_with_loaded_set() {
+    let cfg = AbuseConfig {
+        ip_failures: 1,
+        net_failures: 0,
+        ..AbuseConfig::default()
+    };
+    let clock = ManualClock::default();
+    let store = MemAbuseBlocks::new(clock.shared());
+    let g = node(&cfg, Arc::new(store.clone()), &clock);
+    let tenant = TenantId::new();
+    let (p, q, r) = (
+        from_ip("203.0.113.1"),
+        from_ip("203.0.113.2"),
+        from_ip("203.0.113.3"),
+    );
+    let ps = BlockSubject::Ip(ip("203.0.113.1"));
+    assert_eq!(g.check(tenant, &p).await.expect("check"), None);
+
+    store.fail_next(Error::UNAVAILABLE);
+    let until = g.failure(tenant, &p).await.expect("fail").expect("blocked");
+    assert_eq!(g.check(tenant, &p).await.expect("check"), Some(until));
+    // Следующая блокировка записана — с ней и блокировка узла.
+    assert!(g.failure(tenant, &q).await.expect("fail").is_some());
+    assert!(store.blocked(tenant, &ps).await.expect("blocked").is_some());
+    // Сверка не теряет блокировок.
+    g.apply(&Event {
+        tenant: TenantId::DEFAULT,
+        account: None,
+        kind: EventKind::Resync,
+    })
+    .await;
+    assert!(g.check(tenant, &p).await.expect("check").is_some());
+    assert!(g.check(tenant, &q).await.expect("check").is_some());
+
+    // Снятие блокировки узла сигналом.
+    store.fail_next(Error::UNAVAILABLE);
+    assert!(g.failure(tenant, &r).await.expect("fail").is_some());
+    assert!(g.check(tenant, &r).await.expect("check").is_some());
+    g.apply(&Event {
+        tenant,
+        account: None,
+        kind: EventKind::Unblocked {
+            subject: BlockSubject::Ip(ip("203.0.113.3")),
+        },
+    })
+    .await;
+    assert_eq!(g.check(tenant, &r).await.expect("check"), None);
 }
 
 #[test]

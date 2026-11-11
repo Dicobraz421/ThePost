@@ -7,6 +7,19 @@
 //!
 //! Протокол спрашивает [`AbuseGuard::check`] до проверки учётных данных и сообщает о результате:
 //! [`AbuseGuard::failure`] — неудача, [`AbuseGuard::success`] — успех (сбрасывает счётчик учётной записи).
+//!
+//! ## Разделение с PLT-07 (решение владельца #253)
+//! Здесь — только неудачные входы и блокировки по ним (адрес, подсеть, учётная запись). Частоту запросов
+//! (соединения, команды) считает PLT-07; его счётчики сюда не попадают, и наоборот.
+//!
+//! ## Хранилище блокировок недоступно (`auth.abuse.fail_closed`)
+//! Счётчики всегда локальны для узла и от хранилища не зависят. Блокировка, которую не удалось записать в
+//! хранилище, действует на этом узле (собственный набор узла) до своего срока; после восстановления хранилища
+//! узел записывает её туда при следующей загрузке набора организации или следующей блокировке — дальше она
+//! общая для всех узлов. [`AbuseGuard::check`] при ошибке загрузки набора:
+//! - `fail_closed = false` (по умолчанию) — пускает к проверке учётных данных, учитывая блокировки,
+//!   известные узлу (ранее загруженный набор и собственный набор узла);
+//! - `fail_closed = true` — отказ входа ([`Error::Unavailable`]).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -51,6 +64,9 @@ pub struct AbuseConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub resubscribe_delay: Duration,
+    /// Хранилище блокировок недоступно: `false` — вход проверяется по блокировкам, известным узлу; `true` —
+    /// отказ входа (`Unavailable`). Решение владельца #253.
+    pub fail_closed: bool,
 }
 
 impl Default for AbuseConfig {
@@ -65,6 +81,7 @@ impl Default for AbuseConfig {
             block_for: Duration::from_secs(900),
             max_counters: 100_000,
             resubscribe_delay: Duration::from_secs(1),
+            fail_closed: false,
         }
     }
 }
@@ -100,10 +117,16 @@ pub struct Attempt {
 
 type Now = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
-/// Локальный набор блокировок узла: загруженные организации, субъект → срок.
+/// Набор блокировок организации: субъект → срок.
+type Set = HashMap<BlockSubject, SystemTime>;
+
+/// Локальный набор блокировок узла.
 #[derive(Debug, Default)]
 struct Local {
-    tenants: HashMap<TenantId, HashMap<BlockSubject, SystemTime>>,
+    /// Наборы из хранилища по загруженным организациям (сбрасываются сверкой).
+    tenants: HashMap<TenantId, Set>,
+    /// Блокировки узла, не записанные в хранилище (оно было недоступно); сверкой не сбрасываются.
+    own: HashMap<TenantId, Set>,
 }
 
 struct Inner {
@@ -152,22 +175,36 @@ impl AbuseGuard {
     }
 
     /// Срок блокировки попытки (наибольший из адреса, покрывающих подсетей и учётной записи); `None` — можно
-    /// проверять учётные данные. Ошибка загрузки набора организации — ошибка хранилища (решает протокол).
+    /// проверять учётные данные. Хранилище недоступно — по `fail_closed`: пускает с блокировками, известными
+    /// узлу, или отказывает (`Unavailable`).
     pub async fn check(&self, tenant: TenantId, attempt: &Attempt) -> Result<Option<SystemTime>> {
-        self.ensure_loaded(tenant).await?;
+        if let Err(e) = self.ensure_loaded(tenant).await {
+            if self.0.cfg.fail_closed {
+                tracing::warn!(%tenant, error = %e, "abuse blocks: store unavailable, login refused");
+                return Err(if e.is_retryable() {
+                    e
+                } else {
+                    Error::UNAVAILABLE
+                });
+            }
+            tracing::warn!(%tenant, error = %e, "abuse blocks: store unavailable, node blocks only");
+        }
         let now = (self.0.now)();
         let local = self.read();
-        let Some(set) = local.tenants.get(&tenant) else {
-            return Ok(None);
-        };
+        let sets = [local.tenants.get(&tenant), local.own.get(&tenant)];
         Ok(subjects_to_check(attempt)
-            .filter_map(|s| set.get(&s).copied())
+            .flat_map(|s| {
+                sets.iter()
+                    .flatten()
+                    .filter_map(move |set| set.get(&s).copied())
+            })
             .filter(|until| *until > now)
             .max())
     }
 
     /// Неудачная попытка: счётчики адреса, подсети и учётной записи; превышение порога блокирует субъект
-    /// на всех узлах. Возвращает срок блокировки, если попытка её вызвала.
+    /// на всех узлах (хранилище недоступно — на этом узле, см. описание модуля). Возвращает срок блокировки,
+    /// если попытка её вызвала.
     pub async fn failure(&self, tenant: TenantId, attempt: &Attempt) -> Result<Option<SystemTime>> {
         let cfg = &self.0.cfg;
         let mut counted = Vec::new();
@@ -241,9 +278,13 @@ impl AbuseGuard {
         match &event.kind {
             EventKind::Blocked { subject } => self.on_blocked(event.tenant, subject).await,
             // Снятая блокировка подсети могла продлевать сроки адресов в наборе — организация перечитывается.
-            EventKind::Unblocked { .. } => {
+            EventKind::Unblocked { subject } => {
                 self.bump();
-                self.write().tenants.remove(&event.tenant);
+                let mut local = self.write();
+                local.tenants.remove(&event.tenant);
+                if let Some(own) = local.own.get_mut(&event.tenant) {
+                    own.remove(subject);
+                }
             }
             EventKind::Resync => self.reset(),
             _ => {}
@@ -271,14 +312,70 @@ impl AbuseGuard {
             .checked_add(self.0.cfg.block_for)
             .ok_or_else(|| Error::invalid("abuse: block_for is too large"))?;
         let reason = format!("{n} failed attempts within {:?}", self.0.cfg.window);
-        self.0
+        match self
+            .0
             .store
             .block(tenant, subject, until.into(), &reason)
-            .await?;
-        tracing::warn!(%tenant, %subject, failures = n, "abuse: blocked");
-        // Свой узел — сразу, не дожидаясь сигнала.
-        self.insert(tenant, *subject, until);
+            .await
+        {
+            Ok(()) => {
+                tracing::warn!(%tenant, %subject, failures = n, "abuse: blocked");
+                // Свой узел — сразу, не дожидаясь сигнала.
+                self.insert(tenant, *subject, until);
+                // Хранилище снова доступно — блокировки узла становятся общими.
+                self.flush_own(tenant).await;
+            }
+            Err(e) => {
+                tracing::warn!(%tenant, %subject, failures = n, error = %e,
+                    "abuse: store unavailable, blocked on this node");
+                let now = (self.0.now)();
+                let mut local = self.write();
+                let own = local.own.entry(tenant).or_default();
+                own.retain(|_, u| *u > now);
+                let e = own.entry(*subject).or_insert(until);
+                *e = (*e).max(until);
+            }
+        }
         Ok(until)
+    }
+
+    /// Записывает в хранилище блокировки узла организации; первая ошибка — остаток ждёт следующей попытки.
+    async fn flush_own(&self, tenant: TenantId) {
+        let now = (self.0.now)();
+        let pending: Vec<(BlockSubject, SystemTime)> = {
+            let mut local = self.write();
+            let Some(own) = local.own.get_mut(&tenant) else {
+                return;
+            };
+            own.retain(|_, u| *u > now);
+            let pending = own.iter().map(|(s, u)| (*s, *u)).collect();
+            if own.is_empty() {
+                local.own.remove(&tenant);
+            }
+            pending
+        };
+        for (subject, until) in pending {
+            let reason = "blocked on node while the block store was unavailable";
+            if let Err(e) = self
+                .0
+                .store
+                .block(tenant, &subject, until.into(), reason)
+                .await
+            {
+                tracing::warn!(%tenant, error = %e, "abuse: node blocks not written yet");
+                return;
+            }
+            self.insert(tenant, subject, until);
+            let mut local = self.write();
+            if let Some(own) = local.own.get_mut(&tenant) {
+                if own.get(&subject).is_some_and(|u| *u <= until) {
+                    own.remove(&subject);
+                }
+                if own.is_empty() {
+                    local.own.remove(&tenant);
+                }
+            }
+        }
     }
 
     async fn ensure_loaded(&self, tenant: TenantId) -> Result<()> {
@@ -291,11 +388,15 @@ impl AbuseGuard {
             .into_iter()
             .map(|b| (b.subject, SystemTime::from(b.until)))
             .collect();
-        let mut local = self.write();
-        // Сигнал во время загрузки: снимок мог устареть — не кэшируем, перечитаем при следующей проверке.
-        if self.0.epoch.load(Ordering::Acquire) == epoch {
-            local.tenants.entry(tenant).or_insert(set);
+        {
+            let mut local = self.write();
+            // Сигнал во время загрузки: снимок мог устареть — не кэшируем, перечитаем при следующей проверке.
+            if self.0.epoch.load(Ordering::Acquire) == epoch {
+                local.tenants.entry(tenant).or_insert(set);
+            }
         }
+        // Хранилище доступно — блокировки узла, накопленные без него, становятся общими.
+        self.flush_own(tenant).await;
         Ok(())
     }
 
