@@ -95,6 +95,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "mailbox shards",
         include_str!("../migrations/0020_mailbox_shards.sql"),
     ),
+    (21, "dav", include_str!("../migrations/0021_dav.sql")),
 ];
 
 /// Мигратор схемы ядра.
