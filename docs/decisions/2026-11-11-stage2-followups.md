@@ -42,3 +42,5 @@
 17. **mail-parser 1.0 в коде** — этап 3: новый API (≈115 мест в 8 крейтах) меняет ответы IMAP и JMAP; calcard держит 0.11.
 18. **cms 0.2.3 без `builder`**: `builder` тянет `rsa` с RUSTSEC-2023-0071 без исправления; SignedData — на aws-lc-rs.
 19. **CA клиентов (PLT-22)** читается при открытии слушателя; смена — перезапуском.
+20. **Ключ подписи профиля `.mobileconfig`** — из tp-platform: `TlsCerts` отдаёт текущую цепочку и ключ и обновляет их
+    при перечитывании (ACME, inotify, SIGHUP) — PLT-23; узел передаёт их в tp-jmap (`ProfileSigner`) — APP-23.
