@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Dicobraz421/ThePost"
 publish = false
@@ -62,10 +62,11 @@ ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-
 libgssapi = "0.11.0"
 # Без rayon: извлечение текста PDF — в подпроцессе под seccomp, где потоки запрещены (SRCH-07).
 lopdf = { version = "0.46.0", default-features = false }
-mail-auth = "0.13.3"
+mail-auth = "0.14.1"
 mail-builder = "1.0.0"
+# 0.11 в коде крейтов; 1.0 (через mail-auth 0.14 и mail-send 0.7) меняет API разбора — отдельная карточка (DEPS-02).
 mail-parser = "0.11.9"
-mail-send = "0.6.2"
+mail-send = "0.7.0"
 moka = { version = "0.12.16", features = ["future"] }
 nix = { version = "0.31.3", features = ["signal", "process", "resource", "socket"] }
 # imap-codec 2.0.0-alpha.9 использует nom::multi без фичи alloc: включаем её сами.

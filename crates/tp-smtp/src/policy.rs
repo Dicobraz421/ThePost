@@ -23,12 +23,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mail_auth::common::parse::TxtRecordParser;
+use mail_auth::dns::TxtRecordParser;
 use mail_auth::hickory_resolver::TokioResolver;
 use mail_auth::hickory_resolver::config::ResolverOpts;
 use mail_auth::hickory_resolver::proto::dnssec::Proof;
 use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
-use mail_auth::mta_sts::MtaSts;
+use mail_auth::mta_sts::MtaStsRecord;
 use sha2::{Digest, Sha256, Sha512};
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::client::WebPkiServerVerifier;
@@ -211,7 +211,7 @@ impl PolicyDns for HickoryPolicyDns {
                 .iter()
                 .flat_map(|d| d.iter().copied())
                 .collect();
-            if let Ok(sts) = MtaSts::parse(&raw) {
+            if let Ok(sts) = MtaStsRecord::parse(&raw) {
                 if found.is_some() {
                     return Ok(None);
                 }

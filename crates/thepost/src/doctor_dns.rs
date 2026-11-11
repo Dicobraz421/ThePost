@@ -10,11 +10,10 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use mail_auth::{MX, MessageAuthenticator, RecordSet};
+use mail_auth::{MessageAuthenticator, NoCache};
 use tp_platform::listen::EndpointConfig;
 use tp_platform::{AcmeConfig, Config, TlsConfig};
 use tp_smtp::SmtpConfig;
-use tp_smtp::authcheck::MemCache;
 
 use crate::doctor::{Report, Status};
 use crate::sections::{DoctorSection, IMAP, SMTP};
@@ -57,31 +56,22 @@ fn absent<T>(r: mail_auth::Result<Vec<T>>) -> Result<Vec<T>, String> {
     }
 }
 
-type NoMxCache = MemCache<Box<str>, RecordSet<MX>>;
-type NoPtrCache = MemCache<IpAddr, RecordSet<Box<str>>>;
-type NoV4Cache = MemCache<Box<str>, RecordSet<std::net::Ipv4Addr>>;
-type NoV6Cache = MemCache<Box<str>, RecordSet<std::net::Ipv6Addr>>;
-
 #[async_trait]
 impl Dns for SystemDns {
     async fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>, String> {
-        let r = self
-            .0
-            .mx_lookup(domain, None::<&NoMxCache>)
-            .await
-            .map(|set| {
-                let mut out: Vec<(u16, String)> = set
-                    .rrset
-                    .iter()
-                    .flat_map(|mx| {
-                        mx.exchanges
-                            .iter()
-                            .map(move |h| (mx.preference, h.trim_end_matches('.').to_owned()))
-                    })
-                    .collect();
-                out.sort();
-                out
-            });
+        let r = self.0.mx_lookup(domain, None::<&NoCache>).await.map(|set| {
+            let mut out: Vec<(u16, String)> = set
+                .records
+                .iter()
+                .flat_map(|mx| {
+                    mx.exchanges
+                        .iter()
+                        .map(move |h| (mx.preference, h.trim_end_matches('.').to_owned()))
+                })
+                .collect();
+            out.sort();
+            out
+        });
         absent(r)
     }
 
@@ -102,16 +92,16 @@ impl Dns for SystemDns {
                     host,
                     mail_auth::IpLookupStrategy::Ipv4thenIpv6,
                     16,
-                    None::<&NoV4Cache>,
-                    None::<&NoV6Cache>,
+                    None::<&NoCache>,
+                    None::<&NoCache>,
                 )
                 .await,
         )
     }
 
     async fn ptr(&self, ip: IpAddr) -> Result<Vec<String>, String> {
-        let r = self.0.ptr_lookup(ip, None::<&NoPtrCache>).await.map(|set| {
-            set.rrset
+        let r = self.0.ptr_lookup(ip, None::<&NoCache>).await.map(|set| {
+            set.records
                 .iter()
                 .map(|h| h.trim_end_matches('.').to_owned())
                 .collect()

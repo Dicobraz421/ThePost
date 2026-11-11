@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use mail_auth::common::parse::TxtRecordParser;
-use mail_auth::common::verify::DomainKey;
-use mail_auth::{ResolverCache, Txt};
+use mail_auth::dkim::DomainKey;
+use mail_auth::dns::TxtRecordParser;
+use mail_auth::{ResolverCache, TxtRecord};
 use tp_contracts::secrets::SecretRef;
 use tp_testkit::{MemSecretStore, SystemClock};
 
@@ -69,7 +69,7 @@ fn publish(check: &crate::AuthCheck, selector: &str, k: &str, public: &str) {
     let record = format!("v=DKIM1; k={k}; p={}", public.trim());
     check.cache().txt.insert(
         format!("{selector}._domainkey.example.org.").into(),
-        Txt::from(DomainKey::parse(record.as_bytes())),
+        TxtRecord::from(DomainKey::parse(record.as_bytes())),
         Instant::now() + Duration::from_secs(3600),
     );
 }

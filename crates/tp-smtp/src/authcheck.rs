@@ -13,13 +13,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use mail_auth::common::headers::HeaderWriter;
 use mail_auth::dmarc::Policy;
 use mail_auth::dmarc::verify::DmarcParameters;
+use mail_auth::headers::HeaderWriter;
 use mail_auth::spf::verify::SpfParameters;
 use mail_auth::{
-    AuthenticatedMessage, AuthenticationResults, DmarcResult, MX, MessageAuthenticator, Parameters,
-    ReceivedSpf, RecordSet, ResolverCache, Txt,
+    AuthenticatedMessage, AuthenticationResults, DmarcResult, MessageAuthenticator, Mx, Negative,
+    Parameters, ReceivedSpf, RecordSet, ResolverCache, TxtRecord,
 };
 
 use crate::config::SmtpConfig;
@@ -93,19 +93,50 @@ impl<K: Hash + Eq, V: Clone> ResolverCache<K, V> for MemCache<K, V> {
     }
 }
 
+/// Ответ DNS в кэше: записи или отрицательный ответ (RFC 2308).
+pub type Answer<T> = Result<RecordSet<T>, Negative>;
+
 /// Кэш DNS-записей проверок (TXT: SPF, DKIM, DMARC; MX, A, AAAA, PTR — механизмы SPF).
 #[derive(Debug)]
 pub struct DnsCache {
     /// TXT.
-    pub txt: MemCache<Box<str>, Txt>,
+    pub txt: MemCache<Box<str>, TxtRecord>,
     /// MX.
-    pub mx: MemCache<Box<str>, RecordSet<MX>>,
+    pub mx: MemCache<Box<str>, Answer<Mx>>,
     /// A.
-    pub ipv4: MemCache<Box<str>, RecordSet<Ipv4Addr>>,
+    pub ipv4: MemCache<Box<str>, Answer<Ipv4Addr>>,
     /// AAAA.
-    pub ipv6: MemCache<Box<str>, RecordSet<Ipv6Addr>>,
+    pub ipv6: MemCache<Box<str>, Answer<Ipv6Addr>>,
     /// PTR.
-    pub ptr: MemCache<IpAddr, RecordSet<Box<str>>>,
+    pub ptr: MemCache<IpAddr, Answer<Box<str>>>,
+}
+
+impl mail_auth::DnsCache for DnsCache {
+    type Txt = MemCache<Box<str>, TxtRecord>;
+    type Mx = MemCache<Box<str>, Answer<Mx>>;
+    type Ipv4 = MemCache<Box<str>, Answer<Ipv4Addr>>;
+    type Ipv6 = MemCache<Box<str>, Answer<Ipv6Addr>>;
+    type Ptr = MemCache<IpAddr, Answer<Box<str>>>;
+
+    fn txt(&self) -> Option<&Self::Txt> {
+        Some(&self.txt)
+    }
+
+    fn mx(&self) -> Option<&Self::Mx> {
+        Some(&self.mx)
+    }
+
+    fn ipv4(&self) -> Option<&Self::Ipv4> {
+        Some(&self.ipv4)
+    }
+
+    fn ipv6(&self) -> Option<&Self::Ipv6> {
+        Some(&self.ipv6)
+    }
+
+    fn ptr(&self) -> Option<&Self::Ptr> {
+        Some(&self.ptr)
+    }
 }
 
 impl DnsCache {
@@ -137,15 +168,7 @@ impl fmt::Debug for AuthCheck {
 }
 
 /// Параметры проверки с кэшами `DnsCache`.
-type Cached<'x, P> = Parameters<
-    'x,
-    P,
-    MemCache<Box<str>, Txt>,
-    MemCache<Box<str>, RecordSet<MX>>,
-    MemCache<Box<str>, RecordSet<Ipv4Addr>>,
-    MemCache<Box<str>, RecordSet<Ipv6Addr>>,
-    MemCache<IpAddr, RecordSet<Box<str>>>,
->;
+type Cached<'x, P> = Parameters<'x, P, DnsCache>;
 
 impl AuthCheck {
     /// Проверки через резолвер `resolver` (системный — [`MessageAuthenticator::new_system_conf`]).
@@ -163,14 +186,7 @@ impl AuthCheck {
     }
 
     fn params<'x, P>(&'x self, p: P) -> Cached<'x, P> {
-        Parameters {
-            params: p,
-            cache_txt: Some(&self.cache.txt),
-            cache_mx: Some(&self.cache.mx),
-            cache_ptr: Some(&self.cache.ptr),
-            cache_ipv4: Some(&self.cache.ipv4),
-            cache_ipv6: Some(&self.cache.ipv6),
-        }
+        Parameters::new(p).with_cache(&self.cache)
     }
 
     /// Проверяет письмо `raw` транзакции `env`.
@@ -178,14 +194,12 @@ impl AuthCheck {
         let ip = env.conn.client.ip().to_canonical();
         let helo = env.helo.as_str();
         let mail_from = env.mail_from.as_str();
-        let spf = self
-            .resolver
-            .verify_spf(self.params(SpfParameters::verify(ip, helo, &self.hostname, mail_from)))
-            .await;
-        let received_spf = ReceivedSpf::new(&spf, ip, helo, mail_from, &self.hostname).to_header();
+        let spf_params = SpfParameters::helo_and_mail_from(ip, helo, &self.hostname, mail_from);
+        let spf = self.resolver.verify_spf(self.params(spf_params)).await;
+        let received_spf = ReceivedSpf::new(&spf, &spf_params).to_header();
         let ar = AuthenticationResults::new(&self.hostname);
         let Some(msg) = AuthenticatedMessage::parse(raw) else {
-            let ar = ar.with_spf_mailfrom_result(&spf, ip, mail_from, helo);
+            let ar = ar.with_spf_result(&spf, &spf_params);
             return Outcome {
                 headers: ar.to_header() + &received_spf,
                 junk: false,
@@ -201,8 +215,8 @@ impl AuthCheck {
         let junk = matches!(dmarc.result(), DmarcResult::Fail(_))
             && matches!(dmarc.policy(), Policy::Quarantine | Policy::Reject);
         let ar = ar
-            .with_dkim_results(&dkim, msg.from())
-            .with_spf_mailfrom_result(&spf, ip, mail_from, helo)
+            .with_dkim_results(&dkim, msg.first_from_address())
+            .with_spf_result(&spf, &spf_params)
             .with_arc_result(&arc, ip)
             .with_dmarc_result(&dmarc);
         Outcome {
@@ -227,7 +241,7 @@ impl AuthCheck {
                 if !matches!(arc.result(), mail_auth::DkimResult::Pass) {
                     return None;
                 }
-                let last = arc.sets().last()?;
+                let last = arc.chain().last()?;
                 let value = String::from_utf8_lossy(last.results.value).into_owned();
                 // `i=N; authserv-id; результаты`.
                 let (_, rest) = value.split_once(';')?;
@@ -261,7 +275,7 @@ impl AuthCheck {
         let dkim = self.resolver.verify_dkim(self.params(&msg)).await;
         let arc = self.resolver.verify_arc(self.params(&msg)).await;
         let ar = AuthenticationResults::new(&self.hostname)
-            .with_dkim_results(&dkim, msg.from())
+            .with_dkim_results(&dkim, msg.first_from_address())
             .with_arc_result(&arc, ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
         match sealer.seal(&msg, &ar, &arc) {
             Ok(set) => Some(set.to_header()),

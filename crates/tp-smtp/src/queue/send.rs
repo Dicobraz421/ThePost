@@ -166,7 +166,7 @@ impl MxTransport {
         {
             Ok(set) => {
                 let mut hosts = Vec::new();
-                for mx in set.rrset.iter() {
+                for mx in set.records.iter() {
                     for ex in mx.exchanges.iter() {
                         let name = ex.trim_end_matches('.');
                         if name.is_empty() {
