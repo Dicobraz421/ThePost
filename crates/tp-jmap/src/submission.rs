@@ -938,7 +938,9 @@ mod tests {
         assert_eq!(r[2][0], "Email/set", "неявный Email/set: {r:?}");
         assert_eq!(r[2][2], "1");
         let email = r[0][1]["created"]["d"]["id"].as_str().expect("email");
-        let moved = r[2][1]["updated"][email]["id"].as_str().expect("moved");
+        // Перенос сохраняет id (CTR-29): `updated` — `null`.
+        assert_eq!(r[2][1]["updated"], json!({email: null}), "{r:?}");
+        let moved = email;
         let e = env
             .call(
                 "Email/get",
