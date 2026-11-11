@@ -5,20 +5,26 @@
 //!   TLS, сертификат назвал другой узел) — следующий; срок вызова — [`RpcError::Timeout`]; узел маршрута — этот
 //!   же узел — вызов функции без сети;
 //! - сервер (axum, [`NodeRpc::listen`]) принимает только соединения с клиентским сертификатом внутреннего УЦ;
-//!   идентичность вызывающего узла — CN сертификата ([`node_identity`]), его роли — из состава кластера; дальше
-//!   матрица разрешений ([`Permissions`]), обработчик службы ([`Rpc::serve`]), предел параллельности
-//!   ([`Admission`]) и остаток срока вызова.
+//!   идентичность вызывающего узла — по SAN сертификата ([`node_identity`], [`NodeIdentity`]), его роли — из
+//!   состава кластера; дальше матрица разрешений ([`Permissions`]), обработчик службы ([`Rpc::serve`]), предел
+//!   параллельности ([`Admission`]) и остаток срока вызова.
+//!
+//! Идентичность узла по сертификату (CLU-14): URI `thepost:node:<id>` в SAN; без него — имена DNS и адреса IP
+//! из SAN, узел — тот, чей хост в `NodeInfo::addr` среди них (без масок `*.`); CN — только у сертификата без
+//! таких SAN (выпуск до CLU-14). Сертификаты перечитываются без перезапуска ([`NodeRpc::reload_tls`],
+//! [`NodeRpc::follow_tls`]): новые соединения — с новыми, установленные дорабатывают на прежних.
 //!
 //! Протокол: `POST /rpc/<роль>/<служба>`, тело — длина ключа (u32, big-endian), ключ, тело запроса; остаток срока —
 //! заголовок `x-thepost-rpc-deadline-ms`. Ответ — заголовок `x-thepost-rpc` (`ok` или вид ошибки), тело — ответ
 //! обработчика или текст ошибки (`invalid`, `internal`).
 //!
-//! ALPN — только `http/1.1`: у axum и reqwest крейта не включена фича `http2`; после её включения в ALPN
-//! добавляется `h2` ([`ALPN`]).
+//! ALPN — только `http/1.1`: у axum и reqwest в workspace не включена фича `http2`; после её включения в ALPN
+//! добавляется `h2` ([`ALPN`]). Объявить `h2` раньше нельзя: сервер без фичи не поймёт клиента, выбравшего `h2`.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -32,6 +38,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::serve::{IncomingStream, Listener};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::{Stream, StreamExt};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -48,7 +55,8 @@ use tp_contracts::role::Role;
 use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
 use tp_contracts::tls::InternalTls;
 use tp_contracts::{Error, Result};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+use x509_parser::extensions::GeneralName;
 
 use crate::rpc::{Admission, Permissions, RpcConfig, route};
 
@@ -64,27 +72,149 @@ const H_RETRY_AFTER: &str = "x-thepost-rpc-retry-after-ms";
 
 type StdResult<T, E> = std::result::Result<T, E>;
 
-/// Идентичность узла по его сертификату: единственный CN субъекта — [`NodeId`]. Иначе — `Invalid`.
-pub fn node_identity(cert: &CertificateDer<'_>) -> Result<NodeId> {
+/// Префикс URI узла в SAN сертификата: `thepost:node:<id>`.
+pub const NODE_URI_PREFIX: &str = "thepost:node:";
+
+/// Кого называет сертификат узла ([`node_identity`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeIdentity {
+    /// Узел по URI `thepost:node:<id>` в SAN или, у сертификата без SAN узла, по CN.
+    Node(NodeId),
+    /// Имена DNS (нижний регистр, без завершающей точки) и адреса IP из SAN: узел — тот, чей хост в
+    /// `NodeInfo::addr` среди них.
+    Hosts(Vec<String>),
+}
+
+impl NodeIdentity {
+    /// Называет ли сертификат узел `node`: по идентификатору или по хосту его адреса.
+    pub fn names(&self, node: &NodeInfo) -> bool {
+        match self {
+            Self::Node(id) => *id == node.id,
+            Self::Hosts(hosts) => addr_host(&node.addr).is_some_and(|h| hosts.contains(&h)),
+        }
+    }
+
+    /// Узел, которого называет сертификат, в составе `live`: по идентификатору — он сам; по хостам — единственный
+    /// узел состава с таким хостом (ни одного или несколько — `None`).
+    pub fn resolve(&self, live: &[NodeInfo]) -> Option<NodeId> {
+        match self {
+            Self::Node(id) => Some(id.clone()),
+            Self::Hosts(_) => {
+                let mut found = live.iter().filter(|n| self.names(n));
+                match (found.next(), found.next()) {
+                    (Some(n), None) => Some(n.id.clone()),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
+/// Хост адреса узла (`https://<хост>:<порт>`) в записи [`NodeIdentity::Hosts`].
+fn addr_host(addr: &str) -> Option<String> {
+    let url = reqwest::Url::parse(addr).ok()?;
+    let host = url.host_str()?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    Some(match bare.parse::<IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => dns_name(host),
+    })
+}
+
+fn dns_name(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Идентичность узла по его сертификату: единственный URI `thepost:node:<id>` в SAN; без него — имена DNS и
+/// адреса IP из SAN; без них — единственный CN субъекта. Иначе — `Invalid`.
+pub fn node_identity(cert: &CertificateDer<'_>) -> Result<NodeIdentity> {
     let (_, x509) = x509_parser::parse_x509_certificate(cert.as_ref())
         .map_err(|e| Error::Invalid(format!("node certificate: {e}")))?;
+    let san = x509
+        .subject_alternative_name()
+        .map_err(|e| Error::Invalid(format!("node certificate SAN: {e}")))?;
+    let (mut ids, mut hosts) = (Vec::new(), Vec::new());
+    for name in san.iter().flat_map(|s| s.value.general_names.iter()) {
+        match name {
+            GeneralName::URI(uri) => {
+                let id = uri
+                    .get(..NODE_URI_PREFIX.len())
+                    .filter(|p| p.eq_ignore_ascii_case(NODE_URI_PREFIX))
+                    .map(|_| &uri[NODE_URI_PREFIX.len()..]);
+                if let Some(id) = id
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+            GeneralName::DNSName(dns) => hosts.push(dns_name(dns)),
+            GeneralName::IPAddress(ip) => {
+                if let Ok(v4) = <[u8; 4]>::try_from(*ip) {
+                    hosts.push(IpAddr::from(v4).to_string());
+                } else if let Ok(v6) = <[u8; 16]>::try_from(*ip) {
+                    hosts.push(IpAddr::from(v6).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    match ids.as_slice() {
+        [id] => return NodeId::new(*id).map(NodeIdentity::Node),
+        [] => {}
+        _ => {
+            return Err(Error::invalid(
+                "node certificate: SAN names several nodes (thepost:node:<id>)",
+            ));
+        }
+    }
+    if !hosts.is_empty() {
+        hosts.sort();
+        hosts.dedup();
+        return Ok(NodeIdentity::Hosts(hosts));
+    }
     let mut names = x509.subject().iter_common_name();
     let (Some(cn), None) = (names.next(), names.next()) else {
         return Err(Error::invalid(
-            "node certificate: subject must have exactly one CN (node id)",
+            "node certificate: no thepost:node URI, DNS or IP in SAN and no single CN (node id)",
         ));
     };
     let cn = cn
         .as_str()
         .map_err(|e| Error::Invalid(format!("node certificate CN: {e}")))?;
-    NodeId::new(cn)
+    NodeId::new(cn).map(NodeIdentity::Node)
+}
+
+/// Сертификат `tls` годится узлу `id`: по идентификатору — только `id`; по хостам — проверяется по адресу в
+/// составе кластера при каждом соединении.
+fn check_identity(id: &NodeId, tls: &NodeIdentity) -> Result<()> {
+    match tls {
+        NodeIdentity::Node(cert) if cert != id => Err(Error::Invalid(format!(
+            "rpc.tls.cert_file names node {:?}, this node is {:?}",
+            cert.as_str(),
+            id.as_str()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Клиент reqwest с TLS `tls`.
+fn build_client(config: &RpcConfig, tls: ClientConfig) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .tls_info(true)
+        .https_only(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(config.connect_timeout)
+        .build()
+        .map_err(|e| Error::Internal(format!("rpc client: {e}")))
 }
 
 /// TLS внутреннего канала узла: сервер требует клиентский сертификат внутреннего УЦ, клиент предъявляет свой
 /// и проверяет сервер по тому же УЦ и имени хоста из адреса узла.
 #[derive(Clone)]
 pub struct NodeTls {
-    identity: NodeId,
+    identity: NodeIdentity,
     server: Arc<ServerConfig>,
     client: ClientConfig,
 }
@@ -161,8 +291,8 @@ impl NodeTls {
         })
     }
 
-    /// Узел, которого называет сертификат.
-    pub fn identity(&self) -> &NodeId {
+    /// Кого называет сертификат.
+    pub fn identity(&self) -> &NodeIdentity {
         &self.identity
     }
 }
@@ -196,13 +326,15 @@ impl Members {
 
 struct Inner {
     id: NodeId,
-    tls: Arc<ServerConfig>,
+    /// TLS сервера для новых соединений ([`NodeRpc::reload_tls`]).
+    tls: RwLock<Arc<ServerConfig>>,
     config: RpcConfig,
     permissions: Permissions,
     admission: Admission,
     members: Members,
     handlers: RwLock<HashMap<RpcService, Arc<dyn RpcHandler>>>,
-    client: reqwest::Client,
+    /// Клиент с текущим TLS; при замене сертификатов — новый (новые соединения).
+    client: RwLock<reqwest::Client>,
 }
 
 /// Запросы узел → узел поверх HTTPS с mTLS; клоны разделяют состояние.
@@ -228,7 +360,8 @@ enum Attempt {
 }
 
 impl NodeRpc {
-    /// Узел `id` с секцией `config`, TLS `tls` (сертификат должен называть `id`) и составом кластера `members`.
+    /// Узел `id` с секцией `config`, TLS `tls` и составом кластера `members`. Сертификат с URI узла (или CN)
+    /// должен называть `id`; сертификат с именами DNS/IP — хост адреса узла в составе (проверяют другие узлы).
     pub fn new(
         id: NodeId,
         config: &RpcConfig,
@@ -236,26 +369,12 @@ impl NodeRpc {
         members: Arc<dyn Membership>,
     ) -> Result<Self> {
         config.check()?;
-        if tls.identity != id {
-            return Err(Error::Invalid(format!(
-                "rpc.tls.cert_file names node {:?}, this node is {:?}",
-                tls.identity.as_str(),
-                id.as_str()
-            )));
-        }
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls.client)
-            .tls_info(true)
-            .https_only(true)
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(config.connect_timeout)
-            .build()
-            .map_err(|e| Error::Internal(format!("rpc client: {e}")))?;
+        check_identity(&id, &tls.identity)?;
+        let client = build_client(config, tls.client)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 id,
-                tls: tls.server,
+                tls: RwLock::new(tls.server),
                 permissions: Permissions::from_config(config)?,
                 admission: Admission::new(config.max_in_flight),
                 members: Members {
@@ -264,7 +383,7 @@ impl NodeRpc {
                     cached: Mutex::new(None),
                 },
                 handlers: RwLock::new(HashMap::new()),
-                client,
+                client: RwLock::new(client),
                 config: config.clone(),
             }),
         })
@@ -283,13 +402,7 @@ impl NodeRpc {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let (tx, rx) = mpsc::channel(self.inner.config.max_in_flight);
-        let accept = tokio::spawn(accept_loop(
-            listener,
-            TlsAcceptor::from(Arc::clone(&self.inner.tls)),
-            self.inner.config.handshake_timeout,
-            self.inner.config.accept_retry_delay,
-            tx,
-        ));
+        let accept = tokio::spawn(accept_loop(listener, Arc::clone(&self.inner), tx));
         let listener = TlsListener {
             rx,
             _accept: AbortOnDrop(accept),
@@ -303,9 +416,60 @@ impl NodeRpc {
             .await
             .map_err(Error::from)
     }
+
+    /// Заменяет сертификаты без перезапуска: новые соединения (сервера и клиента) — с `tls`, установленные
+    /// дорабатывают на прежних. Сертификат проверяется, как в [`NodeRpc::new`]; ошибка — прежние остаются.
+    pub fn reload_tls(&self, tls: NodeTls) -> Result<()> {
+        check_identity(&self.inner.id, &tls.identity)?;
+        let client = build_client(&self.inner.config, tls.client)?;
+        *self
+            .inner
+            .tls
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = tls.server;
+        *self
+            .inner
+            .client
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = client;
+        Ok(())
+    }
+
+    /// Перечитывает файлы секции `tls` ([`NodeTls::load`]) по каждому событию `events` до конца потока.
+    /// События — изменение каталога сертификатов, SIGHUP, запрос (источник — приложение, как у PLT-17/PLT-19).
+    /// Ошибка — `warn` в лог, прежние сертификаты остаются.
+    pub async fn follow_tls<S>(&self, tls: &InternalTls, events: S)
+    where
+        S: Stream<Item = ()>,
+    {
+        let mut events = std::pin::pin!(events);
+        while events.next().await.is_some() {
+            match NodeTls::load(tls).await.and_then(|t| self.reload_tls(t)) {
+                Ok(()) => info!(node = %self.inner.id, "rpc: tls certificates reloaded"),
+                Err(e) => warn!(
+                    node = %self.inner.id,
+                    error = %e,
+                    "rpc: tls reload failed, keeping previous certificates"
+                ),
+            }
+        }
+    }
 }
 
 impl Inner {
+    /// Вызывающий узел по сертификату соединения; по хостам — по составу кластера (не найден или неоднозначен —
+    /// `Forbidden`).
+    async fn caller(&self, identity: &NodeIdentity) -> StdResult<NodeId, RpcError> {
+        if let NodeIdentity::Node(id) = identity {
+            return Ok(id.clone());
+        }
+        let live = self.members.live().await.map_err(RpcError::Failed)?;
+        identity.resolve(&live).ok_or_else(|| {
+            debug!(peer = ?identity, "rpc: caller certificate names no single cluster node");
+            RpcError::Failed(Error::Forbidden)
+        })
+    }
+
     /// Обработка запроса на этом узле: роли вызывающего по составу кластера, матрица, обработчик, предел
     /// параллельности, срок.
     async fn dispatch(
@@ -410,8 +574,12 @@ impl Inner {
         }
         let url = format!("{addr}/rpc/{}/{}", service.role(), service.name());
         let deadline_ms = remaining.as_millis().max(1).to_string();
-        let sent = self
+        let client = self
             .client
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let sent = client
             .post(url)
             .header(H_DEADLINE, deadline_ms)
             .body(framed)
@@ -434,7 +602,7 @@ impl Inner {
             .and_then(|i| i.peer_certificate())
             .map(|der| node_identity(&CertificateDer::from(der)));
         match peer {
-            Some(Ok(id)) if id == node.id => {}
+            Some(Ok(id)) if id.names(node) => {}
             other => {
                 warn!(
                     node = %node.id,
@@ -504,7 +672,7 @@ impl Rpc for NodeRpc {
 /// Вызывающий узел соединения (по клиентскому сертификату).
 #[derive(Debug, Clone)]
 struct Peer {
-    node: NodeId,
+    identity: NodeIdentity,
 }
 
 impl Connected<IncomingStream<'_, TlsListener>> for Peer {
@@ -547,22 +715,25 @@ impl Listener for TlsListener {
 
 async fn accept_loop(
     listener: TcpListener,
-    acceptor: TlsAcceptor,
-    handshake_timeout: Duration,
-    retry_delay: Duration,
+    inner: Arc<Inner>,
     tx: mpsc::Sender<(TlsStream<TcpStream>, Peer)>,
 ) {
+    let handshake_timeout = inner.config.handshake_timeout;
     loop {
         let (tcp, remote) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 warn!(error = %e, "rpc: accept failed");
                 // Пауза при нехватке дескрипторов и т. п., чтобы не крутить цикл.
-                tokio::time::sleep(retry_delay).await;
+                tokio::time::sleep(inner.config.accept_retry_delay).await;
                 continue;
             }
         };
-        let (acceptor, tx) = (acceptor.clone(), tx.clone());
+        // Текущие сертификаты: замена ([`NodeRpc::reload_tls`]) действует на следующее соединение.
+        let acceptor = TlsAcceptor::from(Arc::clone(
+            &inner.tls.read().unwrap_or_else(PoisonError::into_inner),
+        ));
+        let tx = tx.clone();
         tokio::spawn(async move {
             match handshake(acceptor, tcp, handshake_timeout).await {
                 Ok(conn) => {
@@ -588,8 +759,8 @@ async fn handshake(
         .peer_certificates()
         .and_then(|c| c.first())
         .ok_or(Error::Forbidden)?;
-    let node = node_identity(leaf)?;
-    Ok((stream, Peer { node }))
+    let identity = node_identity(leaf)?;
+    Ok((stream, Peer { identity }))
 }
 
 async fn http_handle(
@@ -613,8 +784,8 @@ async fn http_handle(
             .ok_or_else(|| RpcError::Failed(Error::invalid("rpc: missing deadline")))?;
         let (key, body) = unframe(body)
             .ok_or_else(|| RpcError::Failed(Error::invalid("rpc: malformed request")))?;
-        rpc.dispatch(&peer.node, &service, key, body, deadline)
-            .await
+        let caller = rpc.caller(&peer.identity).await?;
+        rpc.dispatch(&caller, &service, key, body, deadline).await
     }
     .await;
     encode(out)
