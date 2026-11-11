@@ -429,10 +429,16 @@
 | [SYS-12](SYS-12.md) | Landlock — резолвер systemd-resolved (Ubuntu 24.04) | sys | A | sys-07 | ready | — |
 | [DEP-19](DEP-19.md) | эталон Ansible на Astra Linux SE 1.8 | deploy | A | deploy-16 | todo | DEP-15,DEP-17 |
 | [DEP-20](DEP-20.md) | эталон Ansible на РЕД ОС 8 | deploy | A | deploy-16 | todo | DEP-15,DEP-17 |
+| [APP-30](APP-30.md) | cluster.listen — адрес приёма межузловых вызовов отдельно от объявляемого | app | A | app-29 | todo | APP-18 |
+| [DEP-23](DEP-23.md) | резервная копия OpenBao — снимок Raft | deploy | A | deploy-19 | todo | DEP-15 |
 | [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | done | SMTP-20 |
 | [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | ready | CTR-31,SMTP-22 |
 | [META-44](META-44.md) | очередь модерации без группы в PostgreSQL | meta | B | meta-28 | todo | CTR-43 |
 | [SMTP-30](SMTP-30.md) | исход Moderate правил потока — в очередь модерации | smtp | A | smtp-11 | todo | CTR-43,SMTP-22 |
+| [DEPS-06](DEPS-06.md) | HTTP/2 для межузловых вызовов — фичи axum и reqwest | deps | B | deps-06 | todo | CLU-14 |
+| [CLU-15](CLU-15.md) | Rpc — h2 в ALPN | cluster | A | cluster-10 | todo | DEPS-06 |
+| [DEP-22](DEP-22.md) | сертификаты узлов с URI thepost:node:<id> | deploy | A | deploy-20 | todo | CLU-14 |
+| [PLT-24](PLT-24.md) | ключи TLS из OpenBao | platform | A | platform-14 | ready | PLT-23 |
 
 ## Ф2. Совместная работа (≈5 мес.)
 
