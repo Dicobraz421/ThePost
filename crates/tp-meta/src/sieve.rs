@@ -3,30 +3,39 @@
 //! Скрипты (`sieve_scripts`) и автоответ (`vacation`) — таблицы ящика на шарде учётной записи; скрипт организации
 //! (`sieve_org_scripts`) — в основной БД. Изменение блокирует строку `mailbox_state` и увеличивает её `sieve_state`
 //! (JMAP `state`): лимит числа скриптов и «один активный» не гоняются с параллельной записью.
+//!
+//! Журнал автоответов (`vacation_log`, [`VacationLog`]) — тоже на шарде учётной записи; записи старше
+//! `meta.sieve.vacation_log_ttl` удаляет [`PgMeta::purge_vacation_log`] (роль maintenance).
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
 use time::OffsetDateTime;
+use tp_contracts::config::duration;
 use tp_contracts::meta::AccountScope;
 use tp_contracts::sieve::{
-    ActiveScript, ScriptInfo, SieveLimits, SieveStore, Vacation, sieve_changed, valid_script_name,
+    ActiveScript, ScriptInfo, SieveLimits, SieveStore, Vacation, VacationLog, sieve_changed,
+    valid_script_name,
 };
 use tp_contracts::{Error, Result, TenantId};
 
 use crate::PgMeta;
 use crate::mailboxes::ensure_state;
+use crate::pool::with_system;
 use crate::schema::{begin, db_err, to_u64};
 use crate::shards::ShardId;
 
-/// Секция `meta.sieve`: лимиты хранилища скриптов ([`SieveLimits`]).
+/// Секция `meta.sieve`: лимиты хранилища скриптов ([`SieveLimits`]) и срок журнала автоответов.
 ///
 /// ```yaml
 /// meta:
 ///   sieve:
 ///     max_scripts: 16
 ///     max_script_size: 131072
+///     vacation_log_ttl: 90d
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -35,6 +44,11 @@ pub struct SieveConfig {
     pub max_scripts: usize,
     /// Размер текста скрипта (и скрипта организации), байт.
     pub max_script_size: usize,
+    /// Срок записей журнала автоответов — не меньше наибольшего периода `:days`, который допускает `tp-sieve`:
+    /// более старые записи удаляет [`PgMeta::purge_vacation_log`].
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub vacation_log_ttl: Duration,
 }
 
 impl SieveConfig {
@@ -46,19 +60,25 @@ impl SieveConfig {
         }
     }
 
-    /// Секция с лимитами `limits`.
+    /// Секция с лимитами `limits` и сроком журнала по умолчанию.
     pub fn with_limits(limits: SieveLimits) -> Self {
         Self {
             max_scripts: limits.max_scripts,
             max_script_size: limits.max_script_size,
+            ..Self::default()
         }
     }
 }
 
 impl Default for SieveConfig {
-    /// Лимиты [`SieveLimits::default`].
+    /// Лимиты [`SieveLimits::default`], журнал автоответов — 90 суток.
     fn default() -> Self {
-        Self::with_limits(SieveLimits::default())
+        let l = SieveLimits::default();
+        Self {
+            max_scripts: l.max_scripts,
+            max_script_size: l.max_script_size,
+            vacation_log_ttl: Duration::from_secs(90 * 24 * 3600),
+        }
     }
 }
 
@@ -122,8 +142,8 @@ struct VacationRow {
 
 impl PgMeta {
     /// Изменение скриптов или автоответа учётной записи в одной транзакции на её шарде: `f` получает соединение
-    /// с заблокированной строкой состояния и текущее состояние, возвращает `true`, если изменение было. Состояние
-    /// растёт, `SieveChanged` публикуется после фиксации.
+    /// с заблокированной строкой состояния и возвращает `true`, если изменение было (`create` — операция может
+    /// быть первой у учётной записи на шарде). Состояние растёт, `SieveChanged` публикуется после фиксации.
     async fn sieve_change<F>(&self, scope: AccountScope, create: bool, f: F) -> Result<u64>
     where
         F: for<'c> FnOnce(&'c mut PgConnection) -> crate::pool::TxFuture<'c, bool> + Send,
@@ -149,6 +169,76 @@ impl PgMeta {
             self.signal(sieve_changed(scope)).await;
         }
         Ok(state)
+    }
+
+    /// Удаляет записи журнала автоответов старше `meta.sieve.vacation_log_ttl` на всех шардах (задание роли
+    /// maintenance). Возвращает число удалённых.
+    pub async fn purge_vacation_log(&self) -> Result<u64> {
+        let ttl = time::Duration::try_from(self.cfg.sieve.vacation_log_ttl)
+            .map_err(|_| Error::invalid("meta.sieve.vacation_log_ttl вне диапазона"))?;
+        let before = OffsetDateTime::now_utc()
+            .checked_sub(ttl)
+            .ok_or_else(|| Error::invalid("meta.sieve.vacation_log_ttl вне диапазона"))?;
+        self.purge_vacation_log_before(before).await
+    }
+
+    /// Удаляет записи журнала автоответов, отмеченные раньше `before`, на всех шардах.
+    pub async fn purge_vacation_log_before(&self, before: OffsetDateTime) -> Result<u64> {
+        // Удаление по сроку: повтор после обрыва удаляет только оставшееся.
+        self.rewrite(|| async move {
+            let mut total = 0;
+            for db in self.all_shards().await? {
+                total += with_system(&db.pool, move |tx| {
+                    Box::pin(async move {
+                        let r = sqlx::query("DELETE FROM vacation_log WHERE replied_at < $1")
+                            .bind(before)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(db_err)?;
+                        Ok(r.rows_affected())
+                    })
+                })
+                .await?;
+            }
+            Ok(total)
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl VacationLog for PgMeta {
+    async fn seen(
+        &self,
+        scope: AccountScope,
+        sender: &str,
+        handle: &str,
+        period: Duration,
+    ) -> Result<bool> {
+        let period = i64::try_from(period.as_micros()).unwrap_or(i64::MAX);
+        // Одной вставкой: новая запись или запись старше периода — отметка и ответ; иначе ответ уже был. Параллельный
+        // вызов ждёт блокировку строки и проверяет период по зафиксированной отметке — ответ получает один.
+        self.once(async {
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
+            let marked: Option<i32> = sqlx::query_scalar(
+                "INSERT INTO vacation_log AS v (tenant_id, account_id, digest, replied_at)
+                 VALUES ($1, $2, sha256(convert_to($3, 'UTF8') || '\\x00'::bytea || convert_to($4, 'UTF8')), now())
+                 ON CONFLICT (tenant_id, account_id, digest) DO UPDATE SET replied_at = excluded.replied_at
+                 WHERE v.replied_at <= excluded.replied_at - $5::float8 * interval '1 microsecond'
+                 RETURNING 1",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(sender)
+            .bind(handle)
+            .bind(period)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(marked.is_none())
+        })
+        .await
     }
 }
 
@@ -495,6 +585,7 @@ mod tests {
                 max_script_size: 1024
             }
         );
+        assert_eq!(c.vacation_log_ttl, Duration::from_secs(30 * 24 * 3600));
         assert_eq!(SieveConfig::default().limits(), SieveLimits::default());
         assert!(serde_yaml_ng::from_str::<SieveConfig>("max_script: 1\n").is_err());
     }

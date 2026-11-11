@@ -4,16 +4,17 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::{AssertSqlSafe, PgPool};
 use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
-use tp_contracts::sieve::{SieveStore, Vacation};
+use tp_contracts::sieve::{SieveStore, Vacation, VacationLog};
 use tp_contracts::{DomainId, Error, TenantId};
 use tp_meta::sieve::SieveConfig;
 use tp_meta::{MetaConfig, PgMeta, schema};
 use tp_testkit::MemEventBus;
-use tp_testkit::suite;
 use tp_testkit::suite::sieve::{LIMITS, SieveFixture};
+use tp_testkit::suite::{self, RealTime};
 
 fn config() -> MetaConfig {
     MetaConfig {
@@ -188,4 +189,80 @@ async fn scripts_live_on_account_shard() {
     assert_eq!(active.text, "keep;");
     assert_eq!(t.meta.state(scope).await.expect("state"), 2);
     t.drop_db().await;
+}
+
+/// META-50: набор `suite::sieve::vacation_log` — повтор в периоде не отвечает, после периода — отвечает.
+#[tokio::test]
+async fn vacation_log_suite() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let (owner, peer) = two_accounts(&meta).await;
+    suite::sieve::vacation_log(&meta, owner, peer, &RealTime).await;
+}
+
+/// Параллельные вызовы `seen` для одного отправителя: ответ получает один.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vacation_log_concurrent_single_reply() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let scope = common::account(&meta).await;
+    let calls: Vec<_> = (0..16)
+        .map(|_| {
+            let meta = meta.clone();
+            tokio::spawn(async move {
+                meta.seen(scope, "boss@example.net", "", Duration::from_secs(3600))
+                    .await
+                    .expect("seen")
+            })
+        })
+        .collect();
+    let mut replies = 0;
+    for c in calls {
+        if !c.await.expect("join") {
+            replies += 1;
+        }
+    }
+    assert_eq!(replies, 1);
+}
+
+/// Очистка журнала старше срока: после неё отправителю снова отвечают. Своя БД: очистка — по всем организациям.
+#[tokio::test]
+async fn vacation_log_purge() {
+    let Some(db) = common::fresh_meta().await else {
+        return;
+    };
+    let meta = &db.meta;
+    let scope = common::account(meta).await;
+    let day = Duration::from_secs(24 * 3600);
+    assert!(
+        !meta
+            .seen(scope, "a@example.net", "", day)
+            .await
+            .expect("seen")
+    );
+    assert!(
+        meta.seen(scope, "a@example.net", "", day)
+            .await
+            .expect("seen")
+    );
+    assert_eq!(
+        meta.purge_vacation_log().await.expect("purge"),
+        0,
+        "срок 90 суток"
+    );
+    let purged = meta
+        .purge_vacation_log_before(time::OffsetDateTime::now_utc() + time::Duration::minutes(1))
+        .await
+        .expect("purge");
+    assert_eq!(purged, 1);
+    assert!(
+        !meta
+            .seen(scope, "a@example.net", "", day)
+            .await
+            .expect("seen"),
+        "после очистки — снова ответ"
+    );
+    db.drop_db().await;
 }
