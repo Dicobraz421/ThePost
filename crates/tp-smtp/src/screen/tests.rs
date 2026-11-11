@@ -33,6 +33,7 @@ fn ctx(metrics: Option<Arc<SmtpMetrics>>) -> SessionCtx {
         limiter: None,
         send_limits: None,
         metrics,
+        screen: None,
     }
 }
 

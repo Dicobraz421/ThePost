@@ -7,6 +7,8 @@
 //! текстом до рукопожатия, не исполняются после него (RFC 3207, 4.2).
 
 use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -21,11 +23,13 @@ use smtp_proto::{
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tp_contracts::auth::Principal;
+use tp_contracts::transport::TrustedSource;
 use tp_platform::ConnInfo;
 
 use super::{Envelope, Mode, Reply, SessionCtx, is_positive, next_id, reply};
 use crate::limits::SendLimits;
-use crate::screen::{Probe, Violation};
+use crate::screen::{Admission, Probe, Violation};
+use crate::sources::{self, Origin, XCommand};
 
 /// Чем закончилась работа сессии над потоком.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +95,14 @@ pub struct Session {
     pub(super) violation: Option<Violation>,
     /// Клиент прислал хотя бы одну команду.
     pub(super) spoke: bool,
+    /// Доверенный источник соединения ([`crate::sources`]).
+    pub(super) source: Option<Arc<TrustedSource>>,
+    /// Адрес шлюза после `XCLIENT` с адресом: `conn.client` — исходный клиент.
+    pub(super) gateway: Option<SocketAddr>,
+    /// Имя `HELO` исходного клиента из `XCLIENT`.
+    pub(super) origin_helo: Option<String>,
+    /// Атрибуты `XFORWARD` текущей транзакции.
+    pub(super) xforward: Option<Origin>,
 }
 
 impl std::fmt::Debug for Session {
@@ -120,7 +132,16 @@ impl Session {
             screen: None,
             violation: None,
             spoke: false,
+            source: None,
+            gateway: None,
+            origin_helo: None,
+            xforward: None,
         }
+    }
+
+    /// Доверенный источник соединения (при соединении и после STARTTLS — [`crate::sources::Sources`]).
+    pub fn set_source(&mut self, source: Option<Arc<TrustedSource>>) {
+        self.source = source;
     }
 
     /// Проверки экрана соединений в начале сессии: задержка приветствия и конвейер без PIPELINING.
@@ -168,6 +189,11 @@ impl Session {
 
     /// Канал защищён: сессия забывает всё, что узнала открытым текстом (RFC 3207, 4.2), и ждёт нового `EHLO`.
     pub fn tls_established(&mut self) {
+        if let Some(gw) = self.gateway.take() {
+            self.conn.client = gw;
+        }
+        self.origin_helo = None;
+        self.xforward = None;
         self.conn.tls = true;
         self.starttls = false;
         self.helo = None;
@@ -245,39 +271,43 @@ impl Session {
             while self.exit.is_none() && !bytes.as_slice().is_empty() {
                 state = match state {
                     State::Command(mut rx) => {
-                        let before = bytes.len();
-                        match rx.ingest(&mut bytes) {
-                            Ok(req) => {
-                                let req = req.into_owned();
-                                self.spoke = true;
-                                // RFC 2920: без объявленного PIPELINING (до `EHLO`, после `HELO`) и вслед за
-                                // `EHLO`/`HELO` клиент ждёт ответа на каждую команду.
-                                let last =
-                                    matches!(req, Request::Ehlo { .. } | Request::Helo { .. });
-                                let negotiated = self.esmtp;
-                                let next = self
-                                    .command(req, &mut out)
-                                    .await
-                                    .unwrap_or(State::Command(rx));
-                                if (last || !negotiated)
-                                    && self.screen.is_some_and(|p| p.pipelining)
-                                    && self.exit.is_none()
-                                    && matches!(next, State::Command(_))
-                                    && !bytes.as_slice().is_empty()
-                                    && self.screen_violation(Violation::Pipelining, &mut out)
-                                {
-                                    bytes = [].iter();
+                        if self.x_line(&mut rx, &mut bytes, &mut out) {
+                            State::Command(rx)
+                        } else {
+                            let before = bytes.len();
+                            match rx.ingest(&mut bytes) {
+                                Ok(req) => {
+                                    let req = req.into_owned();
+                                    self.spoke = true;
+                                    // RFC 2920: без объявленного PIPELINING (до `EHLO`, после `HELO`) и вслед за
+                                    // `EHLO`/`HELO` клиент ждёт ответа на каждую команду.
+                                    let last =
+                                        matches!(req, Request::Ehlo { .. } | Request::Helo { .. });
+                                    let negotiated = self.esmtp;
+                                    let next = self
+                                        .command(req, &mut out)
+                                        .await
+                                        .unwrap_or(State::Command(rx));
+                                    if (last || !negotiated)
+                                        && self.screen.is_some_and(|p| p.pipelining)
+                                        && self.exit.is_none()
+                                        && matches!(next, State::Command(_))
+                                        && !bytes.as_slice().is_empty()
+                                        && self.screen_violation(Violation::Pipelining, &mut out)
+                                    {
+                                        bytes = [].iter();
+                                    }
+                                    next
                                 }
-                                next
-                            }
-                            Err(smtp_proto::Error::NeedsMoreData { .. }) => State::Command(rx),
-                            Err(e) => {
-                                self.protocol_error(&e, &mut out);
-                                if bytes.len() == before {
-                                    // Разборщик не продвинулся: отбросить остаток, чтобы не зациклиться.
-                                    bytes = [].iter();
+                                Err(smtp_proto::Error::NeedsMoreData { .. }) => State::Command(rx),
+                                Err(e) => {
+                                    self.protocol_error(&e, &mut out);
+                                    if bytes.len() == before {
+                                        // Разборщик не продвинулся: отбросить остаток, чтобы не зациклиться.
+                                        bytes = [].iter();
+                                    }
+                                    State::Command(rx)
                                 }
-                                State::Command(rx)
                             }
                         }
                     }
@@ -352,6 +382,7 @@ impl Session {
             } => return self.bdat(chunk_size, is_last, out).await,
             Request::Rset => {
                 self.tx = None;
+                self.xforward = None;
                 push(out, &reply(250, [2, 0, 0], "OK"));
             }
             Request::Noop { .. } => push(out, &reply(250, [2, 0, 0], "OK")),
@@ -401,8 +432,22 @@ impl Session {
             ehlo.capabilities |= EXT_START_TLS;
         }
         self.advertise_auth(&mut ehlo);
+        let start = out.len();
         // Запись в Vec не завершается ошибкой.
         let _ = ehlo.write(&mut *out);
+        if sources::xclient_allowed(self.source.as_deref()) {
+            // Строки расширений шлюза — после первой строки ответа (smtp-proto их не знает).
+            if let Some(pos) = out[start..].windows(2).position(|w| w == b"\r\n") {
+                let at = start + pos + 2;
+                let lines: String = sources::EHLO_LINES
+                    .iter()
+                    .map(|l| format!("250-{l}\r\n"))
+                    .collect();
+                let tail = out.split_off(at);
+                out.extend_from_slice(lines.as_bytes());
+                out.extend_from_slice(&tail);
+            }
+        }
     }
 
     fn mail(&mut self, from: MailFrom<String>, out: &mut Vec<u8>) {
@@ -412,8 +457,21 @@ impl Session {
         if self.tx.is_some() {
             return self.fail(reply(503, [5, 5, 1], "Nested MAIL command"), out);
         }
-        if self.ctx.mode == Mode::Submission && self.principal.is_none() {
+        // Источник-приложение: имя и разрешён ли отправитель.
+        let app = sources::application(self.source.as_deref())
+            .map(|(s, _)| (s.name.clone(), sources::sender_allowed(s, &from.address)));
+        if self.ctx.mode == Mode::Submission && self.principal.is_none() && app.is_none() {
             return self.fail(reply(530, [5, 7, 0], "Authentication required"), out);
+        }
+        // Приложение без SASL — только с разрешённых адресов (аутентифицированный пользователь — как обычно).
+        if self.principal.is_none()
+            && let Some((name, false)) = &app
+        {
+            tracing::info!(source = %name, "smtp: отправитель не разрешён источнику-приложению");
+            return self.fail(
+                reply(550, [5, 7, 1], "Sender address not allowed for this source"),
+                out,
+            );
         }
         if from.flags & MAIL_BODY_BINARYMIME != 0 {
             return self.fail(reply(555, [5, 5, 4], "BODY=BINARYMIME not supported"), out);
@@ -617,6 +675,7 @@ impl Session {
             return reply(503, [5, 5, 1], "Need MAIL command");
         };
         let env = self.envelope(&tx);
+        self.xforward = None;
         let r = self.ctx.handler.data(&env, Bytes::from(tx.body)).await;
         let accepted = is_positive(&r);
         if let Some(m) = &self.ctx.metrics {
@@ -666,18 +725,133 @@ impl Session {
     }
 
     pub(super) fn envelope(&self, tx: &Tx) -> Envelope {
+        let mut conn = self.conn;
+        let mut gateway = self.gateway;
+        let mut helo = self.origin_helo.clone().or_else(|| self.helo.clone());
+        if let Some(x) = &self.xforward {
+            if let Some(addr) = x.socket() {
+                gateway = gateway.or(Some(self.conn.client));
+                conn.client = addr;
+            }
+            if x.helo.is_some() {
+                helo.clone_from(&x.helo);
+            }
+        }
         Envelope {
             id: next_id(),
             mode: self.ctx.mode,
-            conn: self.conn,
-            helo: self.helo.clone().unwrap_or_default(),
+            conn,
+            helo: helo.unwrap_or_default(),
             esmtp: self.esmtp,
             principal: self.principal.clone(),
             mail_from: tx.mail_from.clone(),
             rcpts: tx.rcpts.clone(),
             smtputf8: tx.smtputf8,
             started_at: tx.started_at,
+            source: self.source.clone(),
+            gateway,
         }
+    }
+
+    /// Строка `XCLIENT`/`XFORWARD` в начале входных данных (smtp-proto этих команд не знает): `true` — строка
+    /// взята сессией (исполнена или ждёт продолжения в буфере разборщика).
+    fn x_line(
+        &mut self,
+        rx: &mut RequestReceiver,
+        bytes: &mut std::slice::Iter<'_, u8>,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        let pending = rx.buf();
+        let rest = bytes.as_slice();
+        let head: Vec<u8> = pending
+            .iter()
+            .chain(rest)
+            .take(sources::X_HEAD)
+            .copied()
+            .collect();
+        let Some(cmd) = sources::x_command(&head) else {
+            return false;
+        };
+        let Some(pos) = rest.iter().position(|&b| b == b'\n') else {
+            if pending.len() + rest.len() > smtp_proto::request::receiver::MAX_LINE_LENGTH {
+                pending.clear();
+                *bytes = [].iter();
+                self.fail(reply(500, [5, 5, 6], "Line too long"), out);
+            } else {
+                pending.extend_from_slice(rest);
+                *bytes = [].iter();
+            }
+            return true;
+        };
+        let mut line = std::mem::take(pending);
+        line.extend_from_slice(&rest[..=pos]);
+        *bytes = rest[pos + 1..].iter();
+        self.spoke = true;
+        self.x_command(cmd, &String::from_utf8_lossy(&line), out);
+        true
+    }
+
+    /// `XCLIENT` и `XFORWARD` (протокол Postfix) — только от шлюза с `xclient: true`.
+    fn x_command(&mut self, cmd: XCommand, line: &str, out: &mut Vec<u8>) {
+        if !sources::xclient_allowed(self.source.as_deref()) {
+            tracing::info!(client = %self.conn.client, "smtp: XCLIENT/XFORWARD не от шлюза");
+            return self.fail(reply(550, [5, 7, 0], "Not authorized"), out);
+        }
+        if self.tx.is_some() {
+            return self.fail(reply(503, [5, 5, 1], "Mail transaction in progress"), out);
+        }
+        let origin = match sources::parse(cmd, line) {
+            Ok(o) => o,
+            Err(text) => return self.fail(reply(501, [5, 5, 4], text), out),
+        };
+        match cmd {
+            XCommand::Forward => {
+                self.xforward
+                    .get_or_insert_with(Origin::default)
+                    .merge(origin);
+                push(out, &reply(250, [2, 0, 0], "OK"));
+            }
+            XCommand::Client => {
+                if let Some(addr) = origin.socket() {
+                    if let Some(r) = self.origin_refused(addr) {
+                        return self.fail(r, out);
+                    }
+                    self.gateway = self.gateway.or(Some(self.conn.client));
+                    self.conn.client = addr;
+                }
+                if origin.helo.is_some() {
+                    self.origin_helo = origin.helo;
+                }
+                // Сессия — в начальном состоянии, как при соединении исходного клиента.
+                self.helo = None;
+                self.esmtp = false;
+                self.tx = None;
+                self.xforward = None;
+                let banner = format!("{} ESMTP The Post", self.ctx.config.hostname);
+                push(out, &reply(220, [2, 0, 0], banner));
+            }
+        }
+    }
+
+    /// Исходный клиент `XCLIENT` по лимиту соединений и кэшу экрана; `Some` — отказ.
+    fn origin_refused(&self, addr: SocketAddr) -> Option<Reply> {
+        let ip = addr.ip();
+        if let Some(l) = &self.ctx.limiter
+            && !l.check_ip(ip).is_allowed()
+        {
+            return Some(reply(
+                421,
+                [4, 7, 0],
+                "Too many connections from your address",
+            ));
+        }
+        if self.ctx.mode == Mode::Inbound
+            && let Some(screen) = &self.ctx.screen
+            && let Admission::Reject { violation, .. } = screen.admit(&self.ctx.config.screen, ip)
+        {
+            return Some(violation.reply());
+        }
+        None
     }
 }
 

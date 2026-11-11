@@ -9,6 +9,7 @@
 //! `AUTH` только по TLS, лимиты частоты соединений, попыток и отправки.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,11 +18,13 @@ use bytes::Bytes;
 use time::OffsetDateTime;
 use tp_contracts::auth::Principal;
 use tp_contracts::sasl::SaslServer;
+use tp_contracts::transport::TrustedSource;
 use tp_platform::{ConnInfo, RateLimiter};
 
 use crate::config::SmtpConfig;
 use crate::limits::SendLimits;
 use crate::metrics::SmtpMetrics;
+use crate::screen::Screen;
 
 mod auth;
 pub mod listen;
@@ -96,6 +99,11 @@ pub struct Envelope {
     pub smtputf8: bool,
     /// Начало транзакции (`MAIL`).
     pub started_at: OffsetDateTime,
+    /// Доверенный источник соединения (SMTP-20, [`crate::sources`]): шлюз или приложение.
+    pub source: Option<Arc<TrustedSource>>,
+    /// Адрес шлюза, сообщившего исходного клиента командой `XCLIENT` или `XFORWARD`; `conn.client` — тогда
+    /// исходный клиент (SPF, DMARC, экран и лимиты — по нему).
+    pub gateway: Option<SocketAddr>,
 }
 
 impl fmt::Debug for Envelope {
@@ -107,6 +115,8 @@ impl fmt::Debug for Envelope {
             .field("client", &self.conn.client)
             .field("tls", &self.conn.tls)
             .field("authenticated", &self.principal.is_some())
+            .field("source", &self.source.as_ref().map(|s| s.name.as_str()))
+            .field("gateway", &self.gateway)
             .field("rcpts", &self.rcpts.len())
             .finish_non_exhaustive()
     }
@@ -140,6 +150,8 @@ pub struct SessionCtx {
     pub send_limits: Option<Arc<SendLimits>>,
     /// Метрики SMTP.
     pub metrics: Option<Arc<SmtpMetrics>>,
+    /// Экран соединений роли: исходный клиент из `XCLIENT` проверяется по его кэшу ([`crate::sources`]).
+    pub screen: Option<Arc<Screen>>,
 }
 
 impl fmt::Debug for SessionCtx {
