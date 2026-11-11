@@ -25,7 +25,7 @@ pub mod server;
 mod testenv;
 pub mod transport;
 
-pub use accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
+pub use accounts::{AccountList, Domain, DomainStore, PolicyStore, PolicyTarget};
 pub use audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink, LogAudit};
 pub use export::{
     AuditExportConfig, Fanout, OtlpAudit, OtlpAuditConfig, SyslogAudit, SyslogConfig,
