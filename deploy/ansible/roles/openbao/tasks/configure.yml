@@ -35,12 +35,13 @@
 
 - name: Configure KV, policy and AppRole thepost
   ansible.builtin.shell:
+    # grep без -q: с -q он закрывает канал на первом совпадении, bao получает SIGPIPE, pipefail — ненулевой код.
     cmd: |
       set -euo pipefail
       changed=no
-      if ! bao secrets list | grep -q '^thepost/'; then bao secrets enable -path=thepost -version=2 kv; changed=yes; fi
+      if ! bao secrets list | grep '^thepost/' >/dev/null; then bao secrets enable -path=thepost -version=2 kv; changed=yes; fi
       bao policy write thepost {{ (openbao_config_dir ~ '/thepost-policy.hcl') | quote }} >/dev/null
-      if ! bao auth list | grep -q '^approle/'; then bao auth enable approle; changed=yes; fi
+      if ! bao auth list | grep '^approle/' >/dev/null; then bao auth enable approle; changed=yes; fi
       bao write auth/approle/role/thepost token_policies=thepost token_ttl={{ openbao_thepost_token_ttl | quote }} \
         token_max_ttl={{ openbao_thepost_token_max_ttl | quote }} secret_id_ttl=0 secret_id_num_uses=0 >/dev/null
       # Пароли учётных записей PostgreSQL (DEP-08): узел, владелец схемы, только чтение — случайные при создании.
@@ -87,7 +88,7 @@
   ansible.builtin.shell:
     cmd: |
       set -euo pipefail
-      if ! bao secrets list | grep -q '^{{ openbao_infra_mount }}/'; then
+      if ! bao secrets list | grep '^{{ openbao_infra_mount }}/' >/dev/null; then
         bao secrets enable -path={{ openbao_infra_mount | quote }} -version=2 kv >/dev/null
         echo changed
       fi
