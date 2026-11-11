@@ -270,6 +270,7 @@ impl Services {
         // Секции, читаемые ролями при запуске, проверяются здесь: ошибка — до запуска ролей.
         cfg.section::<tp_jmap::JmapConfig>(JMAP)?;
         cfg.section::<AdminSection>(ADMIN)?;
+        let tracking = Tracking::new(Arc::new(meta.clone()), node);
 
         Ok(Self {
             tenant,
@@ -294,7 +295,7 @@ impl Services {
             smtp_metrics,
             send_limits: Arc::new(SendLimits::new()),
             limiter,
-            tracking: Tracking::new(Arc::new(meta.clone()), node),
+            tracking,
             abuse,
             secrets,
         })
