@@ -11,7 +11,8 @@
 //!    ниже 1024: процессу не нужен `CAP_NET_BIND_SERVICE`.
 //!
 //! [`doctor`] — проверки `thepost doctor`: учётная запись, capabilities, `NoNewPrivs`, поддержка seccomp и Landlock ядром
-//! и режимы секции `confine`.
+//! и режимы секции `confine`. Landlock — пробой версии ABI ([`tp_sys::landlock_abi`]) без `/sys/kernel/security`, которого
+//! нет в контейнерах и подах (PLT-21).
 
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -410,18 +411,20 @@ pub fn inherited_sockets(
 
 // ---------- doctor ----------
 
+/// Версия ABI Landlock, с которой ограничения ролей применяются полностью (права, которые ограничивает tp-sys,
+/// SYS-07); на ядрах с меньшей версией — частично.
+const LANDLOCK_FULL_ABI: i32 = 5;
+
 /// Проверки `thepost doctor` по процессу проверки: `privileges_user`, `privileges_capabilities`,
 /// `privileges_no_new_privs`, `privileges_seccomp`, `privileges_landlock`. Не завершается ошибкой.
 pub async fn doctor(cfg: &Config) -> DoctorReport {
     let status = tokio::fs::read_to_string("/proc/self/status").await.ok();
-    let lsm = tokio::fs::read_to_string("/sys/kernel/security/lsm")
-        .await
-        .ok();
-    doctor_with(cfg, status.as_deref(), lsm.as_deref())
+    doctor_with(cfg, status.as_deref(), tp_sys::landlock_abi())
 }
 
-/// Проверки по тексту `/proc/self/status` и `/sys/kernel/security/lsm` (`None` — файл недоступен).
-pub fn doctor_with(cfg: &Config, status: Option<&str>, lsm: Option<&str>) -> DoctorReport {
+/// Проверки по тексту `/proc/self/status` (`None` — файл недоступен) и версии ABI Landlock ядра
+/// ([`tp_sys::landlock_abi`]; `None` — ядро без Landlock или Landlock выключен).
+pub fn doctor_with(cfg: &Config, status: Option<&str>, landlock_abi: Option<i32>) -> DoctorReport {
     let mut r = DoctorReport::default();
     let privileges = cfg
         .section::<PrivilegesConfig>(PRIVILEGES)
@@ -554,31 +557,34 @@ pub fn doctor_with(cfg: &Config, status: Option<&str>, lsm: Option<&str>) -> Doc
         ),
     }
 
-    let landlock = lsm.map(|l| l.trim().split(',').any(|m| m == "landlock"));
-    match (confine.landlock, landlock) {
+    match (confine.landlock, landlock_abi) {
         (false, _) => r.push(
             "privileges_landlock",
             DoctorStatus::Warn,
             "off",
             "Landlock выключен в confine.landlock",
         ),
-        (true, Some(true)) => r.push(
+        (true, Some(abi)) if abi >= LANDLOCK_FULL_ABI => r.push(
             "privileges_landlock",
             DoctorStatus::Ok,
-            "on",
+            format!("abi={abi}"),
             "ограничения файловой системы ролей применяются при запуске",
         ),
-        (true, Some(false)) => r.push(
+        (true, Some(abi)) => r.push(
             "privileges_landlock",
             DoctorStatus::Warn,
-            "unsupported",
-            "ядро не поддерживает Landlock (нет в /sys/kernel/security/lsm): доступ к файловой системе не ограничен",
+            format!("abi={abi}"),
+            format!(
+                "ядро с Landlock ABI v{abi}: ограничения файловой системы ролей применятся частично \
+                 (полностью — с ABI v{LANDLOCK_FULL_ABI}, ядро 6.10+)"
+            ),
         ),
         (true, None) => r.push(
             "privileges_landlock",
             DoctorStatus::Warn,
-            "unknown",
-            "не удалось прочитать /sys/kernel/security/lsm: поддержка Landlock не проверена",
+            "unsupported",
+            "Landlock недоступен (ядро без Landlock, Landlock не включён параметром ядра lsm= или вызов запрещён \
+             профилем seccomp контейнера): доступ к файловой системе не ограничен",
         ),
     }
     r
@@ -672,11 +678,7 @@ mod tests {
     #[test]
     fn doctor_reports_root() {
         let cfg = config("");
-        let r = doctor_with(
-            &cfg,
-            Some(&status(0, ALL, ALL, 0)),
-            Some("lockdown,capability,yama"),
-        );
+        let r = doctor_with(&cfg, Some(&status(0, ALL, ALL, 0)), None);
         let c = checks(&r);
         assert_eq!(c["privileges_user"], DoctorStatus::Fail);
         assert_eq!(c["privileges_capabilities"], DoctorStatus::Warn);
@@ -702,26 +704,32 @@ mod tests {
     #[test]
     fn doctor_hardened_service_is_ok() {
         let cfg = config("");
-        let r = doctor_with(
-            &cfg,
-            Some(&status(998, NONE, BIND, 1)),
-            Some("lockdown,capability,landlock,yama,bpf\n"),
-        );
+        let r = doctor_with(&cfg, Some(&status(998, NONE, BIND, 1)), Some(6));
         assert_eq!(r.status(), DoctorStatus::Ok, "{r:?}");
         assert_eq!(r.checks.len(), 5);
+        let landlock = r.get("privileges_landlock").expect("landlock");
+        assert_eq!(landlock.value, "abi=6");
+
+        let partial = doctor_with(&cfg, Some(&status(998, NONE, BIND, 1)), Some(3));
+        let landlock = partial.get("privileges_landlock").expect("landlock");
+        assert_eq!(landlock.status, DoctorStatus::Warn);
+        assert!(landlock.message.contains("частично"), "{landlock:?}");
+
+        let missing = doctor_with(&cfg, Some(&status(998, NONE, BIND, 1)), None);
+        let landlock = missing.get("privileges_landlock").expect("landlock");
+        assert_eq!(
+            (landlock.status, landlock.value.as_str()),
+            (DoctorStatus::Warn, "unsupported")
+        );
 
         let relaxed = config("confine: { seccomp: log, landlock: false }\n");
-        let r = doctor_with(
-            &relaxed,
-            Some(&status(998, NONE, BIND, 1)),
-            Some("landlock"),
-        );
+        let r = doctor_with(&relaxed, Some(&status(998, NONE, BIND, 1)), Some(6));
         let c = checks(&r);
         assert_eq!(c["privileges_seccomp"], DoctorStatus::Warn);
         assert_eq!(c["privileges_landlock"], DoctorStatus::Warn);
 
         let no_seccomp = status(998, NONE, BIND, 1).replace("Seccomp:\t0\n", "");
-        let r = doctor_with(&cfg, Some(&no_seccomp), Some("landlock"));
+        let r = doctor_with(&cfg, Some(&no_seccomp), Some(6));
         assert_eq!(checks(&r)["privileges_seccomp"], DoctorStatus::Fail);
 
         let r = doctor_with(&cfg, None, None);
