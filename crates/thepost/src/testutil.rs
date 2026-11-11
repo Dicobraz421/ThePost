@@ -60,3 +60,40 @@ fn password_split() {
         "postgres://h/db?sslmode=disable"
     );
 }
+
+/// Отдельная база для теста на сервере `url` (`TEST_DATABASE_URL` с `sslmode`): имя и адрес. Узлы и снимки
+/// настроек транспорта теста не видят чужих записей (организация по умолчанию, состав кластера).
+pub async fn create_database(url: &str) -> (String, String) {
+    let name = format!(
+        "app_{}",
+        tp_contracts::ids::DomainId::new().as_uuid().simple()
+    );
+    let admin = sqlx::PgPool::connect(url).await.expect("admin pool");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+        .execute(&admin)
+        .await
+        .expect("create database");
+    admin.close().await;
+    let (head, query) = match url.split_once('?') {
+        Some((h, q)) => (h, format!("?{q}")),
+        None => (url, String::new()),
+    };
+    let scheme_end = head.find("://").map_or(0, |i| i + 3);
+    let base = match head[scheme_end..].find('/') {
+        Some(i) => &head[..scheme_end + i],
+        None => head,
+    };
+    (name.clone(), format!("{base}/{name}{query}"))
+}
+
+/// Удаляет базу теста `name` (соединения узлов закрываются принудительно).
+pub async fn drop_database(url: &str, name: &str) {
+    if let Ok(admin) = sqlx::PgPool::connect(url).await {
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await;
+        admin.close().await;
+    }
+}
