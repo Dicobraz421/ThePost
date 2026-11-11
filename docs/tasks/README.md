@@ -411,6 +411,7 @@
 | [APP-20](APP-20.md) | fail_closed защиты от перебора в узле, устаревший TODO doctor | app | A | app-19 | done | AUTH-11,APP-08 |
 | [APP-21](APP-21.md) | CLI thepost admin на структурах tp-admin | app | A | app-20 | done | APP-11 |
 | [CTR-44](CTR-44.md) | AccountStore::list — постраничный список учётных записей | contracts | B | contracts-32 | ready | ADM-12 |
+| [META-45](META-45.md) | побайтный порядок списка учётных записей — индекс COLLATE "C" | meta | B | meta-29 | todo | CTR-44 |
 | [ADM-13](ADM-13.md) | Serialize и Deserialize у структур Admin API | admin | A | admin-08 | ready | ADM-12 |
 | [APP-22](APP-22.md) | CLI thepost admin без копий структур | app | A | app-21 | todo | ADM-13,APP-21 |
 | [PLT-23](PLT-23.md) | текущая цепочка и ключ TLS для подписи | platform | A | platform-13 | ready | PLT-22 |
