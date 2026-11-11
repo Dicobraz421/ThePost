@@ -4,9 +4,10 @@
 //! секретов (OpenBao/Vault по секции `secrets`; секреты конфигурации читаются при запуске и перечитывании) →
 //! PostgreSQL (поиск primary по `database.url` + `urls`, ротация динамических учётных данных; метрики переключения —
 //! в `/metrics`) и миграции (от `database.owner`, если задан) → модули → членство узла и распределитель разделов
-//! журнала → BLOB, шина → ACME (при `acme.enabled`: слушатель HTTP-01, первый выпуск) → сертификаты TLS (продление
-//! ACME — в фоне) → сервисы ролей (вход, хранилище писем, поиск, очередь SMTP; `services`) → монитор нагрузки
-//! узла (ресурсы cgroups, заполнение кэша индексов) → роли (`protocols`, `roles`; maintenance — и истечение срока
+//! журнала → BLOB, шина → запросы узел → узел (`cluster.rpc`, mTLS; слушатель — на `cluster.addr`) → ACME (при
+//! `acme.enabled`: слушатель HTTP-01, первый выпуск) → сертификаты TLS (продление ACME — в фоне) → сервисы ролей
+//! (вход, хранилище писем, поиск, очередь SMTP; `services`) → монитор нагрузки узла (ресурсы cgroups, заполнение
+//! кэша индексов) → роли (`protocols`, `roles`; maintenance — и истечение срока
 //! корзины) → служебный HTTP (`/healthz/ready` — 200, когда готовы все роли узла). Остановка: роли проходят drain,
 //! узел покидает членство, служебный HTTP и фоновые задачи останавливаются последними.
 //!
@@ -19,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-use tp_cluster::{PartitionAssignerConfig, RendezvousAssigner};
+use tp_cluster::{NodeRpc, NodeTls, PartitionAssignerConfig, RendezvousAssigner};
 use tp_contracts::events::{EventLog, PartitionAssigner};
 use tp_contracts::lease::LeaseStore;
 use tp_contracts::membership::{Membership, NodeId, NodeInfo};
@@ -90,6 +91,9 @@ pub struct Running {
     pub service_addr: SocketAddr,
     /// Фактические адреса слушателей ролей.
     pub listeners: Bound,
+    /// Запросы узел → узел (`cluster.rpc`, CLU-12); `None` — транспорт не включён (нет `cluster.addr` и
+    /// сертификата узла). Узел без `cluster.addr` запросов не принимает.
+    pub rpc: Option<NodeRpc>,
     task: JoinHandle<RolesReport>,
 }
 
@@ -206,6 +210,15 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let bound = Bound::default();
     // Сокеты от systemd (активация сокетов) — до открытия любых слушателей.
     let sockets = Sockets::adopt(&cfg, bound.clone())?;
+    // Запросы узел → узел (APP-18): после записи узла в членстве (маршрут и роли вызывающего — по составу).
+    let rpc = start_rpc(
+        &cluster,
+        &node,
+        Arc::new(meta.clone()),
+        &sockets,
+        aux.clone(),
+    )
+    .await?;
     let acme = acme::prepare(&cfg, &sockets, aux.clone()).await?;
     // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
     let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
@@ -419,6 +432,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         members,
         service_addr,
         listeners: bound,
+        rpc,
         task,
     })
 }
@@ -591,6 +605,49 @@ fn node_info(id: NodeId, roles: &BTreeSet<Role>, cluster: &ClusterSection) -> Re
     })
 }
 
+/// Транспорт запросов узел → узел (CLU-12) по секции `cluster`: mTLS внутреннего канала (`cluster.rpc.tls`,
+/// сертификат называет этот узел), слушатель — на `cluster.addr` (сокет systemd с тем же адресом или новый) до
+/// `shutdown`. Транспорт не включён ([`ClusterSection::rpc_enabled`]) — `None`; без адреса — только исходящие
+/// запросы. Ошибка сертификатов или слушателя — до запуска ролей.
+async fn start_rpc(
+    cluster: &ClusterSection,
+    node: &NodeId,
+    members: Arc<dyn Membership>,
+    sockets: &Sockets,
+    shutdown: CancellationToken,
+) -> Result<Option<NodeRpc>> {
+    if !cluster.rpc_enabled() {
+        return Ok(None);
+    }
+    let ctx = |e| infra::context("cluster.rpc", e);
+    let tls = NodeTls::load(&cluster.rpc.tls).await.map_err(ctx)?;
+    let rpc = NodeRpc::new(node.clone(), &cluster.rpc, tls, members).map_err(ctx)?;
+    let Some(listen) = cluster.listen_addr() else {
+        tracing::info!("cluster.rpc: адрес узла не задан — запросы других узлов не принимаются");
+        return Ok(Some(rpc));
+    };
+    let addr = tokio::net::lookup_host(listen)
+        .await
+        .ok()
+        .and_then(|mut a| a.next())
+        .ok_or_else(|| Error::Invalid(format!("cluster.addr: адрес {listen:?} не разрешается")))?;
+    let tcp = sockets.take_or(addr, || {
+        tp_sys::bind_tcp(addr, &tp_sys::ListenerConfig::default())
+            .map_err(|e| Error::Invalid(format!("cluster.addr {addr}: {e}")))
+    })?;
+    tracing::info!(%addr, "cluster.rpc: приём запросов других узлов");
+    let server = rpc.clone();
+    tokio::spawn(async move {
+        if let Err(e) = server
+            .listen(tcp, async move { shutdown.cancelled().await })
+            .await
+        {
+            tracing::error!(error = %e, "cluster.rpc: слушатель остановлен");
+        }
+    });
+    Ok(Some(rpc))
+}
+
 /// Продление записи узла с периодом `period` до остановки.
 async fn heartbeat(
     meta: PgMeta,
@@ -613,13 +670,20 @@ async fn heartbeat(
     }
 }
 
-/// Адреса слушателей узла по конфигурации: служебный HTTP, HTTP-01 (`acme.enabled`) и слушатели включённых ролей
-/// (smtp-in, submission, imap и POP3, jmap, admin) — для проверки сокетов systemd ([`Sockets::warn_unused`]).
+/// Адреса слушателей узла по конфигурации: служебный HTTP, запросы узел → узел (`cluster.addr`), HTTP-01
+/// (`acme.enabled`) и слушатели включённых ролей (smtp-in, submission, imap и POP3, jmap, admin) — для проверки
+/// сокетов systemd ([`Sockets::warn_unused`]).
 fn listen_addrs(cfg: &Config) -> Vec<SocketAddr> {
     let roles = cfg.roles();
     let mut out = Vec::new();
     if let Ok(s) = cfg.section::<ServiceHttpConfig>("service_http") {
         out.push(s.listen);
+    }
+    // Запросы узел → узел: адрес — IP (имя хоста разрешается при запуске).
+    if let Ok(c) = cfg.section::<ClusterSection>(CLUSTER)
+        && let Some(addr) = c.listen_addr().and_then(|a| a.parse().ok())
+    {
+        out.push(addr);
     }
     if let Ok(http) = cfg.section::<HttpSection>(sections::HTTP) {
         if cfg
@@ -811,7 +875,7 @@ mod tests {
                  service_http:\n  listen: 127.0.0.1:0\n  allow_plaintext: true\n\
                  database:\n  url: \"{url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
                  meta:\n  events:\n    node_ttl: 3s\n\
-                 cluster:\n  node_id: {node}\n  site: dc-test\n  addr: https://127.0.0.1:7443\n\
+                 cluster:\n  node_id: {node}\n  site: dc-test\n\
                  runtime:\n  drain_deadline: 5s\n\
                  imap:\n  listeners:\n    - listen: 127.0.0.1:0\n  pop3:\n    enabled: true\n    listeners:\n      - listen: 127.0.0.1:0\n\
                  blob:\n  url: file://{}\n",
@@ -860,7 +924,8 @@ mod tests {
         }
         let pop3 = running.listeners.get(crate::protocols::POP3);
         assert!(first_line(pop3[0]).await.starts_with("+OK"));
-        // APP-15: запись узла в членстве — роли ядра, адрес и площадка из секции `cluster`.
+        // APP-15: запись узла в членстве — роли ядра и площадка из секции `cluster`; без `cluster.addr` адреса
+        // нет и запросов других узлов узел не принимает (APP-18).
         let live = running.members.live_info().await.expect("live_info");
         let me = live
             .iter()
@@ -868,7 +933,8 @@ mod tests {
             .expect("узел в составе");
         assert_eq!(me.roles, Role::ALL.iter().copied().collect(), "{me:?}");
         assert_eq!(me.site.as_str(), "dc-test");
-        assert_eq!(me.addr, "https://127.0.0.1:7443");
+        assert!(me.addr.is_empty(), "{me:?}");
+        assert!(running.rpc.is_none());
         let metrics = running.metrics.encode().expect("metrics");
         assert!(metrics.contains("tp_bus_connected"), "{metrics}");
         assert!(metrics.contains("tp_roles_running"), "{metrics}");
@@ -877,5 +943,124 @@ mod tests {
         let report = running.wait().await.expect("wait");
         assert!(report.failed.is_empty(), "{report:?}");
         assert!(report.cancelled.is_empty(), "{report:?}");
+    }
+
+    /// Сертификаты узлов внутреннего УЦ из `tp-cluster` (CN `a`, `b`; SAN `127.0.0.1`).
+    fn cluster_testdata() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tp-cluster/src/testdata")
+    }
+
+    /// Свободный порт на 127.0.0.1 (адрес узла объявляется до запуска слушателя).
+    async fn free_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        l.local_addr().expect("addr").port()
+    }
+
+    struct Echo;
+
+    #[async_trait::async_trait]
+    impl tp_contracts::rpc::RpcHandler for Echo {
+        async fn handle(&self, r: tp_contracts::rpc::RpcRequest) -> Result<bytes::Bytes> {
+            Ok(bytes::Bytes::from(format!(
+                "{}|{}|{}",
+                r.caller,
+                r.key,
+                String::from_utf8_lossy(&r.body)
+            )))
+        }
+    }
+
+    /// APP-18: два узла в процессе над одной базой — `cluster.addr` объявлен в составе и слушается, вызов идёт по
+    /// HTTPS с mTLS на узел с ролью службы, вызывающий опознан по сертификату; матрица `cluster.rpc.permissions`
+    /// на принимающем узле отказывает роли без разрешения.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_nodes_call_each_other_over_rpc() {
+        use tp_contracts::rpc::{Rpc, RpcError, RpcService};
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let (db_url, password) = split_password(&url_db);
+        let secrets = Arc::new(MemSecretStore::default());
+        let db: SecretRef = "thepost/db#password".parse().expect("ref");
+        secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let certs = cluster_testdata();
+        let mut nodes = Vec::new();
+        // Узел `a` — maintenance (ему разрешены службы search), `b` — search. Запуск по очереди: миграции.
+        for (id, role) in [("a", "maintenance"), ("b", "search")] {
+            let port = free_port().await;
+            let home = dir.path().join(id);
+            std::fs::create_dir_all(&home).expect("dir");
+            let path = write_config(
+                &home,
+                &format!(
+                    "domain: example.org\nprofile: dev\nroles: [{role}]\n\
+                     service_http:\n  listen: 127.0.0.1:0\n  allow_plaintext: true\n\
+                     database:\n  url: \"{db_url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
+                     cluster:\n  node_id: {id}\n  addr: https://127.0.0.1:{port}\n  rpc:\n    members_ttl: 0s\n\
+                     \x20   permissions:\n      maintenance: [search/*]\n    tls:\n\
+                     \x20     ca_file: {c}/ca.pem\n      cert_file: {c}/node-{id}.pem\n      key_file: {c}/node-{id}-key.pem\n\
+                     runtime:\n  drain_deadline: 5s\n\
+                     blob:\n  url: file://{}\n",
+                    home.join("blob").display(),
+                    c = certs.display(),
+                ),
+            );
+            let (o, shutdown) = opts(path, Some(secrets.clone()));
+            let running = start(o).await.expect("start");
+            assert!(running.rpc.is_some(), "{id}: транспорт не запущен");
+            nodes.push((running, shutdown, port));
+        }
+        let rpc = |i: usize| nodes[i].0.rpc.clone().expect("rpc");
+        let (a, b) = (rpc(0), rpc(1));
+
+        // Адреса узлов — в составе кластера.
+        let live = nodes[0].0.members.live_info().await.expect("live_info");
+        for (running, _, port) in &nodes {
+            let me = live
+                .iter()
+                .find(|n| n.id == running.node)
+                .expect("узел в составе");
+            assert_eq!(me.addr, format!("https://127.0.0.1:{port}"));
+        }
+
+        let search = RpcService::new(Role::Search, "echo").expect("service");
+        b.serve(search.clone(), Arc::new(Echo)).expect("serve");
+        let out = a
+            .call(
+                &search,
+                "k1",
+                bytes::Bytes::from_static(b"ping"),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("call a -> b");
+        assert_eq!(&out[..], b"a|k1|ping");
+
+        // Роли search службы maintenance не разрешены: отказ на принимающем узле `a`.
+        let maintenance = RpcService::new(Role::Maintenance, "echo").expect("service");
+        a.serve(maintenance.clone(), Arc::new(Echo)).expect("serve");
+        let refused = b
+            .call(
+                &maintenance,
+                "k2",
+                bytes::Bytes::new(),
+                Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(refused, Err(RpcError::Failed(Error::Forbidden)));
+
+        for (running, shutdown, _) in nodes {
+            shutdown.cancel();
+            let report = running.wait().await.expect("wait");
+            assert!(report.failed.is_empty(), "{report:?}");
+        }
+        crate::testutil::drop_database(&url, &db_name).await;
     }
 }
