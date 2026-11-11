@@ -57,7 +57,9 @@
    «роль принимает соединения role=admin addrs=[127.0.0.1:8443]».
 2. `docker compose -f deploy/compose/dev.yml --profile smb run --rm --no-deps thepost doctor | grep -E 'privileges|node_role|rls'`
    → `privileges.user uid=65532`, `privileges.capabilities eff=- bnd=-`, `no_new_privs 1`, `seccomp enforce` — `OK`;
-   `privileges.landlock` — `WARN unknown` (в контейнере нет `/sys/kernel/security`); `database.node_role`, `database.rls` — `OK`.
+   `privileges.landlock` — `OK abi=<N>` (проба `landlock_create_ruleset`, PLT-21; Debian 13 — `abi=6`; `WARN abi=<N>` —
+   ядро старше 6.10, ограничения частичные; `WARN unsupported` — Landlock выключен в ядре или вызов запрещён профилем
+   seccomp Docker); `database.node_role`, `database.rls` — `OK`.
 3. `docker inspect thepost-thepost-1 --format '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}}'`
    → `true [ALL] [no-new-privileges:true]`.
 4. Узлу недоступен пароль только чтения: вход AppRole (как шаг 3 `DEP-07.md`) и `bao kv get -mount=thepost db-readonly`

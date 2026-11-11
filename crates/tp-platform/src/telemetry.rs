@@ -197,7 +197,11 @@ impl Collector for BusCollector {
                 "Bus connection losses (reconnects)",
                 s.reconnects,
             ),
-            ("tp_bus_lagged", "Subscribers dropped for lagging", s.lagged),
+            (
+                "tp_bus_lagged",
+                "Times subscribers lagged behind and received Resync",
+                s.lagged,
+            ),
         ];
         for (name, help, value) in counters {
             let counter = ConstCounter::new(value);
