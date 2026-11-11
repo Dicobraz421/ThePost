@@ -4,6 +4,7 @@
 
 pub mod abuse;
 pub mod acl;
+pub mod admin_token;
 pub mod app_password;
 pub mod auth;
 pub mod blob;

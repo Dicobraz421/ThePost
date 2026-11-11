@@ -29,6 +29,7 @@ use futures::StreamExt;
 use time::OffsetDateTime;
 use tp_contracts::abuse::{AbuseBlock, AbuseBlocks, BlockSubject};
 use tp_contracts::acl::{ANYONE, AclEntry, AclStore, SendDelegation, SharedMailbox};
+use tp_contracts::admin_token::{LocalAdminToken, LocalAdminTokens};
 use tp_contracts::app_password::{AppPassword, AppPasswordStore};
 use tp_contracts::auth::{Rights, SendRight};
 use tp_contracts::blob::{Acquire, BlobIndex, Commit, Compression};
@@ -1211,6 +1212,136 @@ pub async fn app_password_store(store: &dyn AppPasswordStore, fx: &AppPasswordFi
     assert_eq!(store.revoke(alien, "b", at(30)).await, Err(Error::NotFound));
     assert_eq!(store.insert(alien, pw("c", 0)).await, Err(Error::NotFound));
     assert_eq!(list(owner).await.len(), 4);
+}
+
+// ---------- LocalAdminTokens ----------
+
+/// Набор проверок `LocalAdminTokens` (CTR-41): выпуск, однократное погашение (в том числе параллельное), срок, отзыв,
+/// список организации и очистка. `tenant` — организация без токенов (новая для набора); идентификаторы и хэши —
+/// уникальные, чужие токены хранилища не мешают.
+pub async fn local_admin_tokens(store: &dyn LocalAdminTokens, tenant: TenantId) {
+    // Целые секунды: PostgreSQL хранит микросекунды.
+    let now = OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp())
+        .expect("now");
+    let ttl = Duration::from_secs(600);
+    let run = AccountId::new();
+    let account = AccountId::new();
+    let hash = || {
+        let (a, b) = (AccountId::new(), AccountId::new());
+        format!(
+            "{:032x}{:032x}",
+            a.as_uuid().as_u128(),
+            b.as_uuid().as_u128()
+        )
+    };
+    let token = |n: &str, created_at: OffsetDateTime| LocalAdminToken {
+        id: format!("{run}-{n}"),
+        tenant,
+        account,
+        hash: hash(),
+        created_at,
+        expires_at: created_at + ttl,
+        used_at: None,
+        revoked_at: None,
+    };
+
+    // Выпуск: занятые идентификатор и хэш — Conflict, недопустимые поля — Invalid.
+    let a = token("a", now);
+    store.issue(a.clone()).await.expect("issue");
+    let same_id = LocalAdminToken {
+        hash: hash(),
+        ..a.clone()
+    };
+    assert_eq!(store.issue(same_id).await, Err(Error::Conflict));
+    let same_hash = LocalAdminToken {
+        id: format!("{run}-a2"),
+        ..a.clone()
+    };
+    assert_eq!(store.issue(same_hash).await, Err(Error::Conflict));
+    let bad = LocalAdminToken {
+        hash: "not-a-hash".into(),
+        ..token("bad", now)
+    };
+    assert!(matches!(store.issue(bad).await, Err(Error::Invalid(_))));
+    let used = LocalAdminToken {
+        used_at: Some(now),
+        ..token("used", now)
+    };
+    assert!(matches!(store.issue(used).await, Err(Error::Invalid(_))));
+
+    // Погашение: один раз; неизвестный хэш — Forbidden.
+    assert_eq!(store.consume(&hash(), now).await, Err(Error::Forbidden));
+    let at = now + Duration::from_secs(5);
+    let got = store.consume(&a.hash, at).await.expect("consume");
+    assert_eq!(
+        got,
+        LocalAdminToken {
+            used_at: Some(at),
+            ..a.clone()
+        }
+    );
+    assert_eq!(store.consume(&a.hash, at).await, Err(Error::Forbidden));
+
+    // Параллельные погашения — успешно ровно одно.
+    let b = token("b", now + Duration::from_secs(1));
+    store.issue(b.clone()).await.expect("issue b");
+    let (r1, r2) = futures::join!(store.consume(&b.hash, at), store.consume(&b.hash, at));
+    assert_eq!(
+        [&r1, &r2].iter().filter(|r| r.is_ok()).count(),
+        1,
+        "{r1:?} {r2:?}"
+    );
+
+    // Срок: в момент expires_at и позже — Forbidden.
+    let c = token("c", now + Duration::from_secs(2));
+    store.issue(c.clone()).await.expect("issue c");
+    assert_eq!(
+        store.consume(&c.hash, c.expires_at).await,
+        Err(Error::Forbidden)
+    );
+
+    // Отзыв: нет — NotFound, повтор сохраняет первый момент, отозванный не погашается.
+    let d = token("d", now + Duration::from_secs(3));
+    store.issue(d.clone()).await.expect("issue d");
+    assert_eq!(
+        store.revoke(&format!("{run}-none"), at).await,
+        Err(Error::NotFound)
+    );
+    store.revoke(&d.id, at).await.expect("revoke");
+    store
+        .revoke(&d.id, at + Duration::from_secs(1))
+        .await
+        .expect("revoke again");
+    assert_eq!(store.consume(&d.hash, at).await, Err(Error::Forbidden));
+    store.revoke(&a.id, at).await.expect("revoke used");
+
+    // Список организации: все состояния, по (created_at, id); чужая организация не видит.
+    let list = store.list(tenant).await.expect("list");
+    let ids: Vec<&str> = list.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, [&a.id, &b.id, &c.id, &d.id]);
+    assert_eq!(list[3].revoked_at, Some(at));
+    assert_eq!(list[0].used_at, Some(at));
+    assert_eq!(list[0].revoked_at, Some(at));
+    assert!(list[1].used_at.is_some());
+    assert!(
+        store
+            .list(TenantId::new())
+            .await
+            .expect("foreign")
+            .is_empty()
+    );
+
+    // Очистка: удаляются только с expires_at < before.
+    let removed = store.prune(c.expires_at).await.expect("prune");
+    assert!(removed >= 2, "{removed}");
+    let ids: Vec<String> = store
+        .list(tenant)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(ids, [c.id.clone(), d.id.clone()]);
 }
 
 // ---------- BlobIndex: сжатие ----------
