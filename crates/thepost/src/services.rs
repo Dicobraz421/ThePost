@@ -45,6 +45,9 @@ pub struct Services {
     pub bus: Arc<dyn EventBus>,
     /// Почтовое хранилище.
     pub store: Arc<dyn MailStore>,
+    /// То же хранилище: воркер истечения корзины роли maintenance (`Store::run_trash_expiry`); клоны разделяют
+    /// сигнал о помещении в корзину этим узлом.
+    pub mail: tp_mailstore::Store,
     /// Точки принятия решений модулей.
     pub hooks: DecisionHooks,
     /// Проверка учётных данных: пароль, Bearer, Kerberos.
@@ -132,7 +135,7 @@ impl Services {
                 .clone(),
             ..tp_blob::WriterConfig::default()
         };
-        let store: Arc<dyn MailStore> = Arc::new(tp_mailstore::Store::with_writer(
+        let mail = tp_mailstore::Store::with_writer(
             tp_mailstore::Deps {
                 blobs: blob.clone(),
                 index: Arc::new(meta.clone()),
@@ -145,7 +148,8 @@ impl Services {
             },
             (*cfg.section::<tp_mailstore::Config>(MAILSTORE)?).clone(),
             writer,
-        ));
+        );
+        let store: Arc<dyn MailStore> = Arc::new(mail.clone());
 
         // Вход: пароль приложения или каталога, Bearer OIDC, Kerberos; права — ACL папок.
         let auth = cfg.section::<AuthSection>(AUTH)?;
@@ -246,6 +250,7 @@ impl Services {
             blob,
             bus,
             store,
+            mail,
             hooks,
             authn,
             sasl,

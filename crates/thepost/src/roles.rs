@@ -1,5 +1,6 @@
-//! Сервисы ролей ядра (SRS 2.1): maintenance — GC и «сироты» BLOB под лизой лидера, подписчики журнала событий;
-//! роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
+//! Сервисы ролей ядра (SRS 2.1): maintenance — GC и «сироты» BLOB под лизой лидера, истечение срока корзины
+//! (`tp-mailstore`: таймер на ближайший срок → точка принятия решений → окончательное удаление), подписчики
+//! журнала событий; роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,12 +53,16 @@ pub struct Maintenance {
     pub gc: GcConfig,
     /// Поиск «сирот» (`blob.orphans`).
     pub orphans: OrphanConfig,
+    /// Почтовое хранилище для истечения срока корзины (`TrashStore::expired` → `before_final_delete` →
+    /// `expunge_final`, секция `mailstore.trash`); `None` — истечение не выполняется (тесты).
+    pub trash: Option<tp_mailstore::Store>,
 }
 
 impl std::fmt::Debug for Maintenance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Maintenance")
             .field("holder", &self.holder)
+            .field("trash", &self.trash.is_some())
             .field(
                 "sinks",
                 &self.sinks.iter().map(|s| s.name()).collect::<Vec<_>>(),
@@ -104,10 +109,23 @@ impl RoleService for Maintenance {
                 .run(&*leases, &holder, token.cancelled_owned())
                 .await;
         });
+        // Окончательное удаление необратимо, повтор безопасен (`expunge_final` пропускает удалённое): воркер
+        // работает на каждом узле с ролью maintenance без лизы.
+        let trash = self.trash.clone().map(|store| {
+            let token = ctx.shutdown.clone();
+            tokio::spawn(async move { store.run_trash_expiry(token.cancelled_owned()).await })
+        });
         ctx.ready.set(true);
-        let (gc, orphans, ()) = tokio::join!(
+        let trash = async move {
+            match trash {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
+        let (gc, orphans, trash, ()) = tokio::join!(
             gc,
             orphans,
+            trash,
             consume(
                 self.events.clone(),
                 self.sinks.clone(),
@@ -115,7 +133,11 @@ impl RoleService for Maintenance {
                 ctx.shutdown.clone(),
             ),
         );
-        for (what, done) in [("blob-gc", gc), ("blob-orphans", orphans)] {
+        for (what, done) in [
+            ("blob-gc", gc),
+            ("blob-orphans", orphans),
+            ("trash-expiry", trash),
+        ] {
             if let Err(e) = done {
                 return Err(tp_contracts::Error::Internal(format!("{what}: {e}")));
             }
@@ -232,6 +254,7 @@ mod tests {
             events_poll: Duration::from_millis(10),
             gc: GcConfig::default(),
             orphans: OrphanConfig::default(),
+            trash: None,
         };
         let (ctx, shutdown, ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
