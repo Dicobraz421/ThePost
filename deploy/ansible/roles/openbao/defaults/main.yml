@@ -32,6 +32,23 @@ openbao_tls_remote_src: false
 openbao_seal: static
 openbao_seal_options: {}
 openbao_static_key_file: "{{ openbao_config_dir }}/unseal.key"
+openbao_static_key_id: "{{ inventory_hostname_short }}-1"
+# Кластер: узел, с которого копируется ключ static (у всех узлов один ключ и openbao_static_key_id); пусто — свой ключ.
+openbao_static_key_from: ""
+
+# Кластер Raft из нескольких ВМ (малый Enterprise, приложение З.2; кворум — 2 из 3): адреса API других узлов
+# (retry_join; имена — в SAN их сертификатов, CA — openbao_tls_ca_src). Пусто — один узел.
+openbao_raft_peers: []
+# Узел инициализирует кластер (bao operator init) и настраивает KV, политику и AppRole thepost; false — узел только
+# присоединяется к кластеру (retry_join) и распечатывается сам (seal не shamir).
+openbao_init_node: true
+# AppRole thepost на этой ВМ (role_id, secret_id): false — thepost работает на других ВМ (tasks_from: approle).
+openbao_thepost_local: true
+# Секреты служб инфраструктуры в отдельном KV (недоступен политике thepost): путь → список полей, значения случайные
+# при создании; результат — факт openbao_infra { путь: { поле: значение } } для других ролей. Пример:
+#   openbao_infra_secrets: { seaweedfs: [filer_db_password, jwt_signing_key] }
+openbao_infra_mount: infra
+openbao_infra_secrets: {}
 
 # Результат bao operator init (ключи восстановления, root-токен) — только root на этой ВМ; перенести в надёжное место.
 openbao_init_file: /root/openbao-init.json

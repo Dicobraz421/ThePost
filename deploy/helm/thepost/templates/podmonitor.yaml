@@ -1,0 +1,29 @@
+{{- /* Сбор /metrics (Prometheus Operator) — для HPA по соединениям (tp_load_connections). Только HTTPS. */ -}}
+{{- if .Values.metrics.podMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "thepost.fullname" . }}
+  labels:
+    {{- include "thepost.labels" . | nindent 4 }}
+    {{- with .Values.metrics.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "thepost.selectorLabels" . | nindent 6 }}
+  podMetricsEndpoints:
+    - port: service-http
+      path: /metrics
+      scheme: https
+      interval: {{ .Values.metrics.podMonitor.interval }}
+      tlsConfig:
+        ca:
+          secret:
+            name: {{ .Values.tls.secretName }}
+            key: ca.crt
+        {{- with .Values.metrics.podMonitor.serverName }}
+        serverName: {{ . }}
+        {{- end }}
+{{- end }}

@@ -1,0 +1,30 @@
+{{- /* VPA (приложение З.4): только рекомендации (updateMode Off) — поды не пересоздаются и не меняются. */ -}}
+{{- if .Values.vpa.enabled }}
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: {{ include "thepost.fullname" . }}
+  labels:
+    {{- include "thepost.labels" . | nindent 4 }}
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "thepost.fullname" . }}
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+      - containerName: thepost
+        controlledResources:
+          {{- toYaml .Values.vpa.controlledResources | nindent 10 }}
+        controlledValues: {{ .Values.vpa.controlledValues }}
+        {{- with .Values.vpa.minAllowed }}
+        minAllowed:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.vpa.maxAllowed }}
+        maxAllowed:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+{{- end }}

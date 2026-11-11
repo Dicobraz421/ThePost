@@ -1,0 +1,177 @@
+# Резервное копирование эталона SMB (DEP-15): pgBackRest + restic/rsync по таймерам systemd. Роль выполняется после
+# ролей openbao, postgresql и thepost (smb.yml). Повторный прогон ничего не меняет.
+---
+- name: Check backup parameters
+  ansible.builtin.assert:
+    that:
+      - thepost_backup_repo in ['posix', 's3']
+      - thepost_backup_blob_tool in ['restic', 'rsync']
+      - thepost_backup_repo != 's3' or (thepost_backup_s3_endpoint | length > 0 and thepost_backup_s3_bucket | length > 0)
+      - thepost_backup_s3_endpoint | length == 0 or thepost_backup_s3_endpoint is match('https://')
+      - thepost_backup_restic_repo is not match('s3:') or thepost_backup_restic_repo is match('s3:https://')
+      - thepost_backup_retention_days | int > 0
+      - openbao_cli_env is defined and openbao_cli_env.BAO_TOKEN is defined
+    fail_msg: >-
+      thepost_backup_repo — posix или s3 (с thepost_backup_s3_endpoint https://… и thepost_backup_s3_bucket),
+      thepost_backup_blob_tool — restic или rsync, S3 — только HTTPS; роль openbao выполняется раньше (секреты копий —
+      в OpenBao)
+
+# Инвариант W (SRS 3.5): объект удаляется не раньше окна W после обнуления ссылок, W не меньше глубины PITR
+# (срок хранения + интервал полных копий).
+- name: Check window W against PITR depth
+  ansible.builtin.assert:
+    that: thepost_blob_gc_window | regex_replace('d$', '') | int >= thepost_backup_retention_days | int + 7
+    fail_msg: >-
+      Окно W узла (thepost_blob_gc_window = {{ thepost_blob_gc_window }}) меньше глубины PITR
+      ({{ thepost_backup_retention_days }} сут. + неделя между полными копиями): восстановленные письма потеряют тела
+  when: thepost_blob_gc_window is defined and thepost_blob_gc_window is match('^[0-9]+d$')
+
+- name: Install backup tools
+  ansible.builtin.apt:
+    name: "{{ ['pgbackrest', thepost_backup_blob_tool] + (['openssh-client'] if thepost_backup_blob_tool == 'rsync' else []) }}"
+    state: present
+
+- name: Secrets and systemd credentials
+  ansible.builtin.import_tasks: secrets.yml
+
+- name: Create backup directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "{{ item.mode }}"
+  loop: >-
+    {{ [{'path': '/etc/pgbackrest', 'owner': 'root', 'mode': '0755'},
+        {'path': '/var/log/pgbackrest', 'owner': 'postgres', 'mode': '0750'}]
+       + ([{'path': thepost_backup_repo_path, 'owner': 'postgres', 'mode': '0750'}] if thepost_backup_repo == 'posix' else [])
+       + ([{'path': '/var/cache/restic', 'owner': 'root', 'mode': '0700'}] if thepost_backup_blob_tool == 'restic' else [])
+       + ([{'path': thepost_backup_rsync_dest, 'owner': 'root', 'mode': '0700'}]
+          if thepost_backup_blob_tool == 'rsync' and ':' not in thepost_backup_rsync_dest else []) }}
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Create local restic repository directory
+  ansible.builtin.file:
+    path: "{{ thepost_backup_restic_repo | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: thepost_backup_blob_tool == 'restic' and thepost_backup_restic_repo is not match('s3:')
+
+- name: Write pgBackRest configuration
+  ansible.builtin.template:
+    src: pgbackrest.conf.j2
+    dest: /etc/pgbackrest/pgbackrest.conf
+    owner: root
+    group: postgres
+    mode: "0640"
+
+- name: Load pgBackRest credentials into the PostgreSQL unit
+  ansible.builtin.template:
+    src: postgresql-credentials.conf.j2
+    dest: "/etc/systemd/system/{{ thepost_backup_pg_unit }}.d/pgbackrest.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart postgresql for pgbackrest
+
+- name: Enable WAL archiving
+  ansible.builtin.template:
+    src: postgresql-archive.conf.j2
+    dest: "{{ thepost_backup_pg_conf_dir }}/conf.d/pgbackrest.conf"
+    owner: postgres
+    group: postgres
+    mode: "0644"
+  notify: Restart postgresql for pgbackrest
+
+- name: Install backup command wrappers
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/usr/local/sbin/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ ['thepost-pgbackrest'] + (['thepost-restic'] if thepost_backup_blob_tool == 'restic' else []) }}"
+
+- name: Apply PostgreSQL restart
+  ansible.builtin.meta: flush_handlers
+
+# info: status.code 0 — stanza в порядке, 1 — нет stanza, 2 — нет копий (pgBackRest, команда info).
+- name: Read pgBackRest stanza state
+  ansible.builtin.command: thepost-pgbackrest --output=json info
+  register: thepost_backup_info
+  changed_when: false
+  failed_when: false
+
+- name: Create pgBackRest stanza
+  ansible.builtin.command: thepost-pgbackrest stanza-create
+  when: thepost_backup_info.rc != 0 or (thepost_backup_info.stdout | from_json)[0].status.code == 1
+  changed_when: true
+  register: thepost_backup_stanza_created
+
+- name: Check WAL archiving
+  ansible.builtin.command: thepost-pgbackrest check
+  when: thepost_backup_stanza_created is changed  # noqa: no-handler
+  changed_when: false
+
+- name: Check restic repository
+  ansible.builtin.command: thepost-restic cat config
+  register: thepost_backup_restic_config
+  changed_when: false
+  failed_when: false
+  when: thepost_backup_blob_tool == 'restic'
+
+- name: Initialize restic repository
+  ansible.builtin.command: thepost-restic init
+  when: thepost_backup_blob_tool == 'restic' and thepost_backup_restic_config.rc != 0
+  changed_when: true
+
+- name: Install backup units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [thepost-backup@.service, thepost-backup-blob.service]
+
+- name: Install backup timers
+  ansible.builtin.template:
+    src: thepost-backup.timer.j2
+    dest: "/etc/systemd/system/{{ item.name }}.timer"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ thepost_backup_timers }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# restore.yml ставит роль с thepost_backup_start_timers: false — таймеры запускает после восстановления.
+- name: Enable backup timers
+  ansible.builtin.systemd_service:
+    name: "{{ item.name }}.timer"
+    state: "{{ 'started' if thepost_backup_start_timers else omit }}"
+    enabled: true
+    daemon_reload: true
+  loop: "{{ thepost_backup_timers }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Disable blob timer without schedule
+  ansible.builtin.systemd_service:
+    name: thepost-backup-blob.timer
+    state: stopped
+    enabled: false
+  when: thepost_backup_blob_schedule | length == 0
+  failed_when: false
+
+# Без полной копии PITR недоступен до первого таймера; копия BLOB идёт следом (Wants= юнита).
+- name: Take initial full backup
+  ansible.builtin.systemd_service:
+    name: thepost-backup@full.service
+    state: started
+  when: >-
+    thepost_backup_initial and (thepost_backup_stanza_created is changed
+    or (thepost_backup_info.rc == 0 and (thepost_backup_info.stdout | from_json)[0].backup | length == 0))

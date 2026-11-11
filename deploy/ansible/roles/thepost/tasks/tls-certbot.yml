@@ -20,7 +20,7 @@
     dest: /etc/letsencrypt/renewal-hooks/deploy/thepost.sh
     content: |
       #!/bin/sh
-      # {{ ansible_managed }}
+      # Ansible: deploy/ansible/roles/thepost — не править вручную.
       # Копия продлённого сертификата thepost в пути секции tls.
       set -eu
       [ "${RENEWED_LINEAGE:-}" = /etc/letsencrypt/live/thepost ] || exit 0

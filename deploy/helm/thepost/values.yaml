@@ -52,10 +52,75 @@ service:
   type: LoadBalancer
   annotations: {}
 
+# Память — requests и limits (кэши занимают её до лимита, SRS 2.7); размеры — по рекомендациям VPA (vpa.enabled).
+# HPA по CPU считает загрузку от requests.cpu: с autoscaling.enabled он обязателен. Пример:
+#   resources: { requests: { cpu: "1", memory: 4Gi }, limits: { memory: 4Gi } }
 resources: {}
 nodeSelector: {}
 tolerations: []
+# Своё affinity заменяет anti-affinity по узлам (podAntiAffinity).
 affinity: {}
+# Anti-affinity подов по узлам кластера (SRS 2.3, приложение З.4) при пустом affinity: soft — по возможности на разных
+# узлах (preferred), hard — только на разных (required: подов не больше, чем узлов), "" — без правила.
+podAntiAffinity: soft
+
+# Масштабирование Enterprise-K8s (SRS 2.3, приложение З.4; решение 2026-11-01): HPA по загрузке CPU; по числу
+# соединений (tp_load_connections) — по выбору заказчика, через prometheus-adapter
+# (deploy/helm/prometheus-adapter/values-thepost.yaml). HPA по памяти не используется: память занята кэшами до
+# лимита и после пика не освобождается. С enabled: true число подов задаёт HPA (replicaCount не применяется).
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  cpu:
+    targetUtilization: 70          # % от resources.requests.cpu
+  # Среднее число открытых соединений на под (метрика Pods через custom.metrics.k8s.io): нужен prometheus-adapter
+  # с правилом для tp_load_connections и сбор /metrics подов (metrics.podMonitor). Целевое значение — ориентир,
+  # уточняется на стенде (приложение Д).
+  connections:
+    enabled: false
+    metric: tp_load_connections
+    targetAverageValue: "1000"
+  # Рост — сразу; сжатие — после окна стабилизации и по одному поду: колебания нагрузки не рвут долгоживущие
+  # соединения (IMAP IDLE, JMAP push).
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - { type: Pods, value: 2, periodSeconds: 60 }
+        - { type: Percent, value: 50, periodSeconds: 60 }
+    scaleDown:
+      stabilizationWindowSeconds: 1800   # 30 мин
+      selectPolicy: Min
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 600 }
+
+# PodDisruptionBudget (SRS 2.3): при плановых работах на узлах кластера (drain) недоступно не больше maxUnavailable
+# подов. Создаётся при двух и более подах (replicaCount или autoscaling.minReplicas): с одним подом бюджет
+# запретил бы drain.
+pdb:
+  enabled: true
+  maxUnavailable: 1
+
+# VPA — только рекомендации requests и limits (updateMode Off; автоматическое применение не используется,
+# приложение З.4): kubectl describe vpa <выпуск>. Нужен Vertical Pod Autoscaler (CRD autoscaling.k8s.io/v1) в кластере.
+vpa:
+  enabled: false
+  controlledResources: [cpu, memory]
+  controlledValues: RequestsAndLimits
+  minAllowed: {}                   # { cpu: 500m, memory: 1Gi }
+  maxAllowed: {}                   # { cpu: "8", memory: 32Gi }
+
+# Сбор /metrics подов Prometheus Operator (PodMonitor, CRD monitoring.coreos.com/v1) — для HPA по соединениям.
+# Канал — HTTPS служебного HTTP пода (порт service-http) с проверкой по CA внутренних каналов (ключ ca.crt секрета
+# tls.secretName в пространстве имён выпуска).
+metrics:
+  podMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+    serverName: ""                 # имя в сертификате пода (tls.secretName); пусто — проверка по адресу пода
 
 # PostgreSQL — CloudNativePG (эталон Enterprise-K8s, SRS 3.1; решение 2026-11-01 «Требования к СУБД»): Cluster
 # (primary + синхронные реплики, RPO = 0, переключение оператором, RTO ≤ 30 с) и Pooler (PgBouncer, transaction).

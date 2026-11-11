@@ -19,7 +19,7 @@ use std::time::Duration;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer};
 use tp_blob::{GcConfig, LocalConfig, OrphanConfig, S3Config};
-use tp_cluster::LocalBusConfig;
+use tp_cluster::{LocalBusConfig, RpcConfig};
 use tp_contracts::config::duration;
 use tp_contracts::tls::{InternalChannel, Profile};
 use tp_contracts::{Error, Result};
@@ -262,7 +262,21 @@ impl BusSection {
 
 // ---------- cluster ----------
 
-/// Секция `cluster`: узел в составе кластера (членство, разделы журнала событий).
+/// Секция `cluster`: узел в составе кластера (членство, разделы журнала событий, запросы узел → узел).
+///
+/// ```yaml
+/// cluster:
+///   node_id: mail-1
+///   site: dc-1
+///   addr: https://mail-1.corp.example:7443   # слушатель запросов других узлов; пусто — не принимает
+///   rpc:                                     # секция tp-cluster (CLU-12): mTLS внутреннего канала
+///     tls:
+///       ca_file: /etc/thepost/cluster-ca.pem
+///       cert_file: /etc/thepost/node.pem     # CN — node_id
+///       key_file: /etc/thepost/node-key.pem
+///     permissions:
+///       jmap: [search/query]
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClusterSection {
@@ -270,9 +284,14 @@ pub struct ClusterSection {
     pub node_id: Option<String>,
     /// Площадка (ЦОД) узла в членстве кластера; по умолчанию `default` (одна площадка).
     pub site: String,
-    /// Внутренний адрес служебного канала узла для запросов узел → узел (`https://host:port`), объявляется в
-    /// записи узла; пусто — узел запросов не принимает.
+    /// Внутренний адрес служебного канала узла для запросов узел → узел (`https://host:port`): объявляется в
+    /// записи узла, на нём же узел слушает (`NodeRpc::listen`); пусто — узел запросов не принимает. Требует
+    /// `rpc.tls` и перезапуска.
     pub addr: String,
+    /// Запросы узел → узел (секция `tp-cluster`, CLU-12): пределы, сроки, матрица разрешений и mTLS внутреннего
+    /// канала (`rpc.tls`: УЦ узлов, сертификат с CN — имя узла, ключ). Транспорт включается адресом `addr` или
+    /// сертификатом узла `rpc.tls.cert_file` (только исходящие запросы).
+    pub rpc: RpcConfig,
     /// Запросов перестройки индексов, просматриваемых ролью indexer за проход (перестраиваются ящики своих
     /// разделов журнала).
     pub rebuild_scan: usize,
@@ -284,6 +303,7 @@ impl Default for ClusterSection {
             node_id: None,
             site: tp_contracts::membership::SiteId::DEFAULT.to_owned(),
             addr: String::new(),
+            rpc: RpcConfig::default(),
             rebuild_scan: 64,
         }
     }
@@ -296,25 +316,50 @@ impl ClusterSection {
             .map_err(|e| Error::invalid(format!("site: {e}")))
     }
 
-    /// Проверка: имя узла (если задано), площадка, адрес (пусто или `https://host:port`).
+    /// Проверка: имя узла (если задано), площадка, адрес (пусто или `https://host:port`), секция `rpc`; с
+    /// включённым транспортом ([`ClusterSection::rpc_enabled`]) — файлы `rpc.tls` (УЦ, сертификат, ключ).
     pub fn check(&self) -> Result<()> {
         if let Some(node) = &self.node_id {
             tp_contracts::membership::NodeId::new(node.clone())?;
         }
         self.site_id()?;
-        if !self.addr.is_empty() {
-            let host = self.addr.strip_prefix("https://").unwrap_or_default();
-            if host.is_empty()
-                || host.contains(['/', '?', '#'])
-                || host.chars().any(char::is_whitespace)
-            {
-                return Err(Error::invalid(format!(
-                    "addr: ожидается https://host:port, получено {:?}",
-                    self.addr
-                )));
+        if !self.addr.is_empty() && self.listen_addr().is_none() {
+            return Err(Error::invalid(format!(
+                "addr: ожидается https://host:port, получено {:?}",
+                self.addr
+            )));
+        }
+        if self.rpc_enabled() {
+            let tls = &self.rpc.tls;
+            for (field, set) in [
+                ("ca_file", tls.ca_file.is_some()),
+                ("cert_file", tls.cert_file.is_some()),
+                ("key_file", tls.key_file.is_some()),
+            ] {
+                if !set {
+                    return Err(Error::invalid(format!(
+                        "rpc.tls.{field}: обязателен для запросов узел → узел (mTLS; задан addr или rpc.tls.cert_file)"
+                    )));
+                }
             }
         }
-        Ok(())
+        self.rpc.check()
+    }
+
+    /// Транспорт запросов узел → узел включён: задан адрес узла или его сертификат.
+    pub fn rpc_enabled(&self) -> bool {
+        !self.addr.is_empty() || self.rpc.tls.cert_file.is_some()
+    }
+
+    /// Адрес слушателя запросов узел → узел (`host:port` из `addr`); `None` — адрес пуст или не `https://host:port`.
+    pub fn listen_addr(&self) -> Option<&str> {
+        let host = self.addr.strip_prefix("https://")?;
+        let (name, port) = host.rsplit_once(':')?;
+        let valid = !name.is_empty()
+            && !host.contains(['/', '?', '#'])
+            && !host.chars().any(char::is_whitespace)
+            && port.parse::<u16>().is_ok_and(|p| p != 0);
+        valid.then_some(host)
     }
 }
 
@@ -728,28 +773,78 @@ blob:
         }
     }
 
+    /// mTLS внутреннего канала узла: файлы читаются при запуске транспорта, здесь — только наличие.
+    const RPC_TLS: &str = "  rpc:\n    tls:\n      ca_file: /etc/thepost/ca.pem\n      \
+                           cert_file: /etc/thepost/node.pem\n      key_file: /etc/thepost/node-key.pem\n";
+
     #[test]
     fn cluster_site_and_addr_are_checked() {
         let c = parse(&format!(
-            "{MINIMAL_DEV}cluster:\n  site: dc-1\n  addr: https://10.0.0.1:7443\n"
+            "{MINIMAL_DEV}cluster:\n  site: dc-1\n  addr: https://10.0.0.1:7443\n{RPC_TLS}"
         ))
         .expect("config");
         let cluster = c.section::<ClusterSection>(CLUSTER).expect("cluster");
         assert_eq!(cluster.site_id().expect("site").as_str(), "dc-1");
         assert_eq!(cluster.addr, "https://10.0.0.1:7443");
+        assert_eq!(cluster.listen_addr(), Some("10.0.0.1:7443"));
+        assert!(cluster.rpc_enabled());
         let d = ClusterSection::default();
         assert_eq!(d.site_id().expect("site").as_str(), "default");
         assert!(d.addr.is_empty());
+        assert_eq!(d.listen_addr(), None);
+        assert!(!d.rpc_enabled());
         for bad in [
             "  site: \"dc 1\"\n",
             "  site: \"\"\n",
             "  addr: http://x:1\n",
             "  addr: https://\n",
             "  addr: https://x/p\n",
+            "  addr: https://x\n",
+            "  addr: https://x:0\n",
+            "  addr: https://:7443\n",
         ] {
-            let e = err(parse(&format!("{MINIMAL_DEV}cluster:\n{bad}")));
+            let e = err(parse(&format!("{MINIMAL_DEV}cluster:\n{bad}{RPC_TLS}")));
             assert!(e.contains("site") || e.contains("addr"), "{bad}: {e}");
         }
+    }
+
+    /// APP-18: адрес узла (или сертификат для исходящих запросов) требует mTLS внутреннего канала
+    /// `cluster.rpc.tls`; открытого канала нет ни в одном профиле; матрица разрешений — при разборе.
+    #[test]
+    fn cluster_rpc_requires_internal_mtls() {
+        let addr = "  addr: https://[::1]:7443\n";
+        let c = parse(&format!("{MINIMAL_DEV}cluster:\n{addr}{RPC_TLS}")).expect("config");
+        let cluster = c.section::<ClusterSection>(CLUSTER).expect("cluster");
+        assert_eq!(cluster.listen_addr(), Some("[::1]:7443"));
+        for missing in ["ca_file", "cert_file", "key_file"] {
+            let tls: String = RPC_TLS
+                .lines()
+                .filter(|l| !l.contains(missing))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let e = err(parse(&format!("{MINIMAL_DEV}cluster:\n{addr}{tls}")));
+            assert!(
+                e.contains("rpc.tls") && e.contains(missing),
+                "{missing}: {e}"
+            );
+        }
+        // Только сертификат (исходящие запросы без слушателя) — тоже с УЦ.
+        let e = err(parse(&format!(
+            "{MINIMAL_DEV}cluster:\n  rpc:\n    tls:\n      cert_file: /n.pem\n      key_file: /k.pem\n"
+        )));
+        assert!(e.contains("ca_file"), "{e}");
+        let e = err(parse(&format!(
+            "{MINIMAL_DEV}cluster:\n{addr}{RPC_TLS}      allow_plaintext: true\n"
+        )));
+        assert!(e.contains("allow_plaintext"), "{e}");
+        let e = err(parse(&format!(
+            "{MINIMAL_DEV}cluster:\n{addr}{RPC_TLS}    permissions:\n      search: [nonsense]\n"
+        )));
+        assert!(e.contains("nonsense"), "{e}");
+        let e = err(parse(&format!(
+            "{MINIMAL_DEV}cluster:\n{addr}{RPC_TLS}    max_in_flight: 0\n"
+        )));
+        assert!(e.contains("max_in_flight"), "{e}");
     }
 
     #[test]

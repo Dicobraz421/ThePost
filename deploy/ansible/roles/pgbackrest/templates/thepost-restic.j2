@@ -1,0 +1,16 @@
+#!/bin/sh
+# {{ ansible_managed }}
+# restic для копии каталога BLOB с паролем репозитория (и ключами S3) из учётных данных systemd (источник — OpenBao):
+#   thepost-restic snapshots | check | restore latest --target / … (аргументы — как у restic).
+set -eu
+unit="thepost-restic-$$"
+exec systemd-run --quiet --wait --pipe --collect --service-type=exec --unit="$unit" \
+  -p LoadCredentialEncrypted=restic.password:{{ thepost_backup_creds_dir }}/restic-password.cred \
+{% if thepost_backup_restic_repo is match('s3:') %}
+  -p LoadCredentialEncrypted=restic.aws:{{ thepost_backup_creds_dir }}/restic-aws.cred \
+  -E AWS_SHARED_CREDENTIALS_FILE="/run/credentials/$unit.service/restic.aws" \
+{% endif %}
+  -E RESTIC_REPOSITORY={{ thepost_backup_restic_repo | quote }} \
+  -E RESTIC_PASSWORD_FILE="/run/credentials/$unit.service/restic.password" \
+  -E RESTIC_CACHE_DIR=/var/cache/restic \
+  /usr/bin/restic {{ thepost_backup_restic_opts }} "$@"

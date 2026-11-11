@@ -1,0 +1,17 @@
+{{- /* PodDisruptionBudget (SRS 2.3): только при двух и более подах — с одним подом бюджет запретил бы drain. */ -}}
+{{- $replicas := ternary .Values.autoscaling.minReplicas .Values.replicaCount .Values.autoscaling.enabled | int }}
+{{- if and .Values.pdb.enabled (ge $replicas 2) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "thepost.fullname" . }}
+  labels:
+    {{- include "thepost.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  # Неготовый под (не проходит readiness) можно вытеснить: он не обслуживает клиентов, а бюджет не блокирует drain.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "thepost.selectorLabels" . | nindent 6 }}
+{{- end }}

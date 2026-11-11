@@ -1,5 +1,9 @@
-//! Узлы `NodeRpc` в одном процессе: настоящие HTTPS с mTLS на 127.0.0.1. Сертификаты — `src/testdata` (УЦ, узлы
-//! `a`, `b`, `c` с SAN `localhost`/`127.0.0.1`; `rogue` — CN `a` от чужого УЦ), срок — 100 лет.
+//! Узлы `NodeRpc` в одном процессе: настоящие HTTPS с mTLS на 127.0.0.1. Сертификаты — `src/testdata`, срок —
+//! 100 лет, ключи P-256 (openssl; ключи УЦ не хранятся — новый сертификат требует нового набора):
+//! - `ca` — УЦ кластера; `ca2` — второй УЦ (смена УЦ); `rogue` — узел `a` от чужого УЦ;
+//! - `node-a`, `node-b` — SAN `thepost:node:<id>`, `localhost`, `127.0.0.1` и CN узла; `node-c` — то же, CN
+//!   `legacy-c` (URI важнее CN); `node-b2` — узел `b` от `ca2`; `node-d` — без CN, только SAN;
+//! - `host-dns` (SAN `localhost`) и `host-ip` (SAN `127.0.0.1`) — без CN и URI; `cn-only` — CN `e` без SAN.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,6 +15,7 @@ use super::*;
 const CA: &[u8] = include_bytes!("../testdata/ca.pem");
 const ROGUE: &[u8] = include_bytes!("../testdata/rogue.pem");
 const ROGUE_KEY: &[u8] = include_bytes!("../testdata/rogue-key.pem");
+const CA2: &[u8] = include_bytes!("../testdata/ca2.pem");
 
 /// С запасом: сроки, которые не должны истекать.
 const LONG: Duration = Duration::from_secs(20);
@@ -19,23 +24,36 @@ fn node(name: &str) -> NodeId {
     NodeId::new(name).expect("node")
 }
 
-fn tls(name: &str) -> NodeTls {
-    let (cert, key): (&[u8], &[u8]) = match name {
-        "a" => (
-            include_bytes!("../testdata/node-a.pem"),
-            include_bytes!("../testdata/node-a-key.pem"),
-        ),
-        "b" => (
-            include_bytes!("../testdata/node-b.pem"),
-            include_bytes!("../testdata/node-b-key.pem"),
-        ),
-        "c" => (
-            include_bytes!("../testdata/node-c.pem"),
-            include_bytes!("../testdata/node-c-key.pem"),
-        ),
+/// Сертификат и ключ: `a`, `b`, `c`, `d` — `node-<имя>`, иначе — файл `<имя>`.
+fn pem(name: &str) -> (&'static [u8], &'static [u8]) {
+    macro_rules! pair {
+        ($file:literal) => {
+            (
+                include_bytes!(concat!("../testdata/", $file, ".pem")).as_slice(),
+                include_bytes!(concat!("../testdata/", $file, "-key.pem")).as_slice(),
+            )
+        };
+    }
+    match name {
+        "a" => pair!("node-a"),
+        "b" => pair!("node-b"),
+        "c" => pair!("node-c"),
+        "d" => pair!("node-d"),
+        "node-b2" => pair!("node-b2"),
+        "host-dns" => pair!("host-dns"),
+        "host-ip" => pair!("host-ip"),
+        "cn-only" => pair!("cn-only"),
         _ => panic!("no certificate for {name}"),
-    };
+    }
+}
+
+fn tls(name: &str) -> NodeTls {
+    let (cert, key) = pem(name);
     NodeTls::from_pem(CA, cert, key).expect("tls")
+}
+
+fn named(id: &str) -> NodeIdentity {
+    NodeIdentity::Node(node(id))
 }
 
 fn svc(role: Role, name: &str) -> RpcService {
@@ -72,13 +90,25 @@ impl Cluster {
             .expect("heartbeat");
     }
 
-    /// Запускает узел `id` (сертификат `cert`) с ролями `roles` и объявляет его в составе.
+    /// Запускает узел `id` (сертификат `cert`) с ролями `roles` и объявляет его в составе (`127.0.0.1`).
     async fn start(
         &mut self,
         id: &str,
         cert: NodeTls,
         roles: &[Role],
         config: &RpcConfig,
+    ) -> NodeRpc {
+        self.start_at(id, cert, roles, config, "127.0.0.1").await
+    }
+
+    /// Как [`Cluster::start`], в адресе узла — хост `host` (слушает 127.0.0.1).
+    async fn start_at(
+        &mut self,
+        id: &str,
+        cert: NodeTls,
+        roles: &[Role],
+        config: &RpcConfig,
+        host: &str,
     ) -> NodeRpc {
         let rpc = NodeRpc::new(node(id), config, cert, self.members.clone()).expect("rpc");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -90,7 +120,7 @@ impl Cluster {
                 .await
                 .expect("listen");
         })));
-        self.announce(id, roles, format!("https://127.0.0.1:{port}"))
+        self.announce(id, roles, format!("https://{host}:{port}"))
             .await;
         rpc
     }
@@ -156,11 +186,49 @@ impl RpcHandler for Sleep {
 
 #[test]
 fn identity_from_certificate() {
-    for n in ["a", "b", "c"] {
-        assert_eq!(tls(n).identity(), &node(n));
+    // URI `thepost:node:<id>` в SAN; у `c` CN другой, у `d` CN нет.
+    for n in ["a", "b", "c", "d"] {
+        assert_eq!(tls(n).identity(), &named(n));
     }
+    // Без URI — имена DNS и адреса IP из SAN; без SAN — CN (выпуск до CLU-14).
+    assert_eq!(
+        tls("host-dns").identity(),
+        &NodeIdentity::Hosts(vec!["localhost".into()])
+    );
+    assert_eq!(
+        tls("host-ip").identity(),
+        &NodeIdentity::Hosts(vec!["127.0.0.1".into()])
+    );
+    assert_eq!(tls("cn-only").identity(), &named("e"));
     let rogue = NodeTls::from_pem(CA, ROGUE, ROGUE_KEY).expect("rogue");
-    assert_eq!(rogue.identity(), &node("a"));
+    assert_eq!(rogue.identity(), &named("a"));
+
+    // Узел по хостам: хост адреса из состава, без учёта регистра; два узла на хосте — неоднозначно.
+    let info = |id: &str, addr: &str| {
+        let mut n = NodeInfo::new(node(id));
+        n.addr = addr.to_owned();
+        n
+    };
+    let hosts = tls("host-dns").identity().clone();
+    let live = vec![
+        info("x", "https://LocalHost:7000"),
+        info("y", "https://127.0.0.1:7000"),
+    ];
+    assert!(hosts.names(&live[0]) && !hosts.names(&live[1]));
+    assert_eq!(hosts.resolve(&live), Some(node("x")));
+    let mut shared = live.clone();
+    shared.push(info("z", "https://localhost:7001/"));
+    assert_eq!(hosts.resolve(&shared), None);
+    assert_eq!(hosts.resolve(&live[1..]), None);
+    assert_eq!(named("q").resolve(&[]), Some(node("q")));
+    // Сертификат по хостам годится любому узлу: адрес проверяют другие узлы.
+    NodeRpc::new(
+        node("x"),
+        &RpcConfig::default(),
+        tls("host-dns"),
+        Arc::new(MemMembership::default()),
+    )
+    .expect("host identity");
     assert!(NodeTls::from_pem(b"", ROGUE, ROGUE_KEY).is_err());
     assert!(NodeTls::from_pem(CA, b"", ROGUE_KEY).is_err());
     assert!(NodeTls::from_pem(CA, ROGUE, b"").is_err());
@@ -421,7 +489,7 @@ async fn unavailable_nodes_and_identity() {
         Err(RpcError::Unavailable)
     );
 
-    // Клиент с сертификатом чужого УЦ (CN a): сервер не принимает соединение.
+    // Клиент с сертификатом чужого УЦ (узел a): сервер не принимает соединение.
     let mut cluster = Cluster::new();
     let b = cluster.start("b", tls("b"), &[Role::Search], &cfg).await;
     b.serve(echo.clone(), Arc::new(Echo("b"))).expect("echo");
@@ -455,4 +523,104 @@ async fn unavailable_nodes_and_identity() {
         c.call(&echo, "k", Bytes::new(), LONG).await,
         Err(RpcError::Unavailable)
     );
+}
+
+/// Сертификаты без CN: узел по URI (`d`) и по хосту адреса (`l` — `localhost`, `i` — `127.0.0.1`).
+#[tokio::test]
+async fn identity_by_san_without_cn() {
+    let mut cluster = Cluster::new();
+    let cfg = config("permissions:\n  jmap: [search/*]\n", 4);
+    let i = cluster
+        .start("i", tls("host-ip"), &[Role::Search], &cfg)
+        .await;
+    let l = cluster
+        .start_at("l", tls("host-dns"), &[Role::Jmap], &cfg, "localhost")
+        .await;
+    let d = cluster.start("d", tls("d"), &[Role::Jmap], &cfg).await;
+    let echo = svc(Role::Search, "echo");
+    i.serve(echo.clone(), Arc::new(Echo("i"))).expect("echo");
+    // Сервер `i` назван адресом 127.0.0.1, вызывающий `l` — единственный узел на `localhost`.
+    assert_eq!(
+        l.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("i|l|k|"))
+    );
+    assert_eq!(
+        d.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("i|d|k|"))
+    );
+    // Второй узел на `localhost`: вызывающий по хосту неоднозначен — отказ.
+    cluster
+        .announce("m", &[Role::Jmap], "https://localhost:1".to_owned())
+        .await;
+    assert_eq!(
+        l.call(&echo, "k", Bytes::new(), LONG).await,
+        Err(RpcError::Failed(Error::Forbidden))
+    );
+}
+
+/// Замена сертификатов без перезапуска: сервер — по событию из файлов, клиент — `reload_tls`; ошибка — прежние.
+#[tokio::test]
+async fn reloads_certificates_without_restart() {
+    let mut cluster = Cluster::new();
+    let cfg = config("permissions:\n  jmap: [search/*]\n", 4);
+    let a = cluster.start("a", tls("a"), &[Role::Jmap], &cfg).await;
+    let b = cluster.start("b", tls("b"), &[Role::Search], &cfg).await;
+    let echo = svc(Role::Search, "echo");
+    b.serve(echo.clone(), Arc::new(Echo("b"))).expect("echo");
+    assert_eq!(
+        a.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|a|k|"))
+    );
+
+    // Смена УЦ: b доверяет обоим УЦ, его сертификат — от второго.
+    let bundle = [CA, CA2].concat();
+    let dir = std::env::temp_dir().join(format!("tp-cluster-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let (b2, b2_key) = pem("node-b2");
+    for (file, data) in [
+        ("ca.pem", &bundle[..]),
+        ("b.pem", b2),
+        ("b-key.pem", b2_key),
+    ] {
+        std::fs::write(dir.join(file), data).expect("write");
+    }
+    let files = InternalTls {
+        ca_file: Some(dir.join("ca.pem")),
+        cert_file: Some(dir.join("b.pem")),
+        key_file: Some(dir.join("b-key.pem")),
+        ..InternalTls::default()
+    };
+    b.follow_tls(&files, futures::stream::iter([()])).await;
+
+    // Новый узел знает только прежний УЦ: сервер b не принят.
+    let c = cluster.start("c", tls("c"), &[Role::Jmap], &cfg).await;
+    assert_eq!(
+        c.call(&echo, "k", Bytes::new(), LONG).await,
+        Err(RpcError::Unavailable)
+    );
+    let (c_cert, c_key) = pem("c");
+    c.reload_tls(NodeTls::from_pem(&bundle, c_cert, c_key).expect("c tls"))
+        .expect("reload c");
+    assert_eq!(
+        c.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|c|k|"))
+    );
+
+    // Сертификат другого узла и нечитаемые файлы — отказ, прежние сертификаты в силе.
+    assert!(matches!(b.reload_tls(tls("a")), Err(Error::Invalid(_))));
+    let broken = InternalTls {
+        key_file: Some(dir.join("missing-key.pem")),
+        ..files
+    };
+    b.follow_tls(&broken, futures::stream::iter([()])).await;
+    let d = cluster.start("d", tls("d"), &[Role::Jmap], &cfg).await;
+    assert_eq!(
+        d.call(&echo, "k", Bytes::new(), LONG).await,
+        Err(RpcError::Unavailable)
+    );
+    assert_eq!(
+        c.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|c|k|"))
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }

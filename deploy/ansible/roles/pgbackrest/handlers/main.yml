@@ -1,0 +1,6 @@
+---
+- name: Restart postgresql for pgbackrest
+  ansible.builtin.systemd_service:
+    name: "{{ thepost_backup_pg_unit }}"
+    state: restarted
+    daemon_reload: true

@@ -1,0 +1,17 @@
+# DAV-15: приём iTIP — обработка приглашений и ответов
+
+lane: dav
+deps: [DAV-13]
+class: A
+files: [crates/tp-dav/src/*]
+read: [docs/spec/S4.md#4.4, docs/CONTRACTS.md]
+checks: [nextest]
+manual: no
+
+## Сделать
+- `impl ItipDelivery`: `REQUEST` — событие в календарь по умолчанию участника (`PARTSTAT=NEEDS-ACTION`) и запись во входящие
+  планирования; `REPLY` — `PARTSTAT` участника у организатора; `CANCEL` — статус `CANCELLED`; `REFRESH`, `COUNTER` — во входящие.
+- Защита: `REPLY` только от адреса участника; `REQUEST` с чужим `UID` организатора не перезаписывает событие другого организатора.
+
+## Приёмка
+- Тесты на in-memory: каждый метод, повторная доставка (идемпотентно), подделанный `REPLY` — `Ignored`.

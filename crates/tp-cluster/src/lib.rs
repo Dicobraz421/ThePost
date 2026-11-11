@@ -15,6 +15,6 @@ mod conformance;
 pub use hashing::Rendezvous;
 pub use local_bus::{LocalBus, LocalBusConfig};
 pub use metrics::{BusCounters, BusMetrics};
-pub use node_rpc::{NodeRpc, NodeTls};
+pub use node_rpc::{NodeIdentity, NodeRpc, NodeTls};
 pub use partitions::{AssignmentChange, PartitionAssignerConfig, RendezvousAssigner};
 pub use rpc::{Admission, Permissions, RpcConfig};

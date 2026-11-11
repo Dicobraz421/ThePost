@@ -922,4 +922,152 @@ mod tests {
             .await
             .expect("login after store recovered");
     }
+
+    /// APP-18: доставка из сборки сервисов переписывает адреса по таблице организации из `TransportStore`
+    /// (`PgMeta`), снимок узла ([`Services::routes`]) перечитывается по сигналу `TransportChanged` шины
+    /// (`Routes::watch`, как в `serve`). Отдельная база: организация по умолчанию и принятые домены — только теста.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_rewrites_addresses_from_transport_store() {
+        use std::time::Duration;
+
+        use tp_contracts::role::CancellationToken;
+        use tp_contracts::transport::{
+            AcceptedDomain, AddressPattern, DomainKind, RewriteRule, TransportStore,
+        };
+        use tp_smtp::deliver::Resolved;
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
+        let meta = PgMeta::new(pool, tp_meta::MetaConfig::default()).with_bus(bus.clone());
+        let cfg = crate::sections::registry_of(crate::modules::BUILTIN)
+            .expect("registry")
+            .parse(
+                "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
+                 database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\n\
+                 blob:\n  url: file:///var/lib/thepost/blob\n",
+                Vec::new(),
+            )
+            .expect("config");
+        let ext = Registry::default();
+        let metrics = tp_platform::Metrics::default();
+        let services = Services::build(Base {
+            cfg: &cfg,
+            meta: meta.clone(),
+            blob: Arc::new(tp_testkit::MemBlobStore::default()),
+            bus: bus.clone(),
+            secrets: Arc::new(tp_testkit::MemSecretStore::default()),
+            ext: &ext,
+            metrics: &metrics,
+            node: NodeId::new("app-18").expect("node"),
+        })
+        .await
+        .expect("services");
+        let stop = CancellationToken::new();
+        tokio::spawn(services.routes.clone().watch(
+            bus.clone(),
+            stop.clone(),
+            Duration::from_millis(50),
+        ));
+
+        // Полномочный домен организации; `legacy.example` — не принятый (внешний).
+        let version = TransportStore::cluster(&meta)
+            .await
+            .expect("cluster")
+            .version;
+        TransportStore::put_domain(
+            &meta,
+            version,
+            &AcceptedDomain {
+                id: DomainId::new(),
+                tenant: TenantId::DEFAULT,
+                name: "corp.example".into(),
+                kind: DomainKind::Authoritative,
+            },
+        )
+        .await
+        .expect("domain");
+        let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
+        let delivery = services.delivery(&smtp).expect("delivery");
+        assert_eq!(
+            delivery
+                .resolve("old@legacy.example")
+                .await
+                .expect("resolve"),
+            Resolved::External
+        );
+        assert_eq!(
+            delivery
+                .resolve("nobody@corp.example")
+                .await
+                .expect("resolve"),
+            Resolved::Unknown
+        );
+
+        // Правило организации: получатели `@legacy.example` — в `@corp.example`; снимок уже прочитан — новое
+        // правило видно после сигнала `TransportChanged`.
+        let version = TransportStore::tenant(&meta, TenantId::DEFAULT)
+            .await
+            .expect("tenant")
+            .version;
+        TransportStore::put_rewrite(
+            &meta,
+            TenantId::DEFAULT,
+            version,
+            &RewriteRule {
+                from: AddressPattern::new("@legacy.example").expect("from"),
+                to: AddressPattern::new("@corp.example").expect("to"),
+                sender: false,
+                recipient: true,
+            },
+        )
+        .await
+        .expect("rewrite");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let r = delivery
+                .resolve("old@legacy.example")
+                .await
+                .expect("resolve");
+            if r == Resolved::Unknown {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "правило не применилось: {r:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Отправитель по правилу только для получателей не переписывается: снимок — тот же.
+        let snap = services
+            .routes
+            .tenant(TenantId::DEFAULT)
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            snap.rewrite(
+                "old@legacy.example",
+                tp_contracts::transport::EnvelopeSide::Recipient
+            )
+            .as_deref(),
+            Some("old@corp.example")
+        );
+        assert_eq!(
+            snap.rewrite(
+                "old@legacy.example",
+                tp_contracts::transport::EnvelopeSide::Sender
+            ),
+            None
+        );
+
+        stop.cancel();
+        drop((services, delivery, meta));
+        crate::testutil::drop_database(&url, &db_name).await;
+    }
 }

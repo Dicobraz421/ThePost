@@ -1,0 +1,350 @@
+# Эталон «Малый Enterprise» (SRS 2.3, приложение З.2; решение 2026-11-01 «Масштабирование»): два узла thepost с
+# пресетом mailbox (группа mailbox; Rspamd и шлюз S3 на каждом, общий виртуальный адрес — keepalived) и три ВМ данных
+# (группа small_data): на двух — PostgreSQL primary и standby (pgaf_nodes), на третьей — монитор pg_auto_failover
+# (pgaf_monitor); на всех трёх — кластер OpenBao (Raft, кворум 2 из 3) и SeaweedFS (master, volume, filer; две копии
+# объекта на разных ВМ, метаданные filer — в том же PostgreSQL). Внутренние каналы — только TLS; секреты служб
+# генерирует и хранит OpenBao (KV thepost — узлам thepost, KV infra — службам), в инвентаре паролей нет.
+#   ansible-galaxy collection install -r deploy/ansible/requirements.yml
+#   ansible-playbook -i <инвентарь> deploy/ansible/small-enterprise.yml
+# Пример инвентаря — deploy/ansible/inventory-small.example.yml; проверка отказа ВМ — docs/manual-tests/DEP-10.md.
+# Повторный прогон ничего не меняет.
+---
+- name: Small Enterprise — checks and topology
+  hosts: small_data:mailbox
+  gather_facts: true
+  tasks:
+    - name: Check platform and groups
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == 'Debian'
+          - groups['small_data'] | default([]) | length == 3
+          - groups['pgaf_nodes'] | default([]) | length == 2
+          - groups['pgaf_monitor'] | default([]) | length == 1
+          - groups['pgaf_nodes'] | union(groups['pgaf_monitor']) | sort == groups['small_data'] | sort
+          - groups['mailbox'] | default([]) | length >= 2
+          - small_openbao_url | default('') | length > 0
+          - small_pki_dir is defined and small_bucket is defined
+          - small_data_networks | default([]) | length > 0 and small_mail_networks | default([]) | length > 0
+        fail_msg: >-
+          Малый Enterprise — Debian 12 или Ubuntu 24.04; small_data — три ВМ данных: две в pgaf_nodes (primary и
+          standby), одна в pgaf_monitor; mailbox — не меньше двух узлов; нужны small_openbao_url, small_pki_dir,
+          small_bucket, small_data_networks, small_mail_networks (deploy/ansible/inventory-small.example.yml)
+      run_once: true
+
+    - name: Check TLS files on the control machine
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ small_pki_dir }}/ca.pem"
+        - "{{ small_pki_dir }}/{{ inventory_hostname }}.pem"
+        - "{{ small_pki_dir }}/{{ inventory_hostname }}.key"
+      register: small_pki_files
+      delegate_to: localhost
+      become: false
+
+    - name: Require TLS files
+      ansible.builtin.assert:
+        that: small_pki_files.results | rejectattr('stat.exists') | list | length == 0
+        fail_msg: >-
+          Нет {{ small_pki_files.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}:
+          CA и сертификат узла (serverAuth и clientAuth; SAN — имя узла в инвентаре, у ВМ данных — и имя из
+          small_openbao_url, у узлов mailbox — и localhost)
+
+    # Общие значения для следующих сценариев (факты сохраняются между ними).
+    - name: Set topology facts
+      ansible.builtin.set_fact:
+        small_bao_init: "{{ groups['small_data'] | first }}"
+        # Имена узлов — как в инвентаре и в SAN сертификатов (TLS verify-full).
+        small_pg_hosts: "{{ groups['pgaf_nodes'] }}"
+        small_masters: "{{ groups['small_data'] | map('regex_replace', '$', ':9333') | list }}"
+        small_filers: "{{ groups['small_data'] | map('regex_replace', '$', ':8888') | list }}"
+
+- name: OpenBao cluster on data VMs
+  hosts: small_data
+  become: true
+  # По одному: первый узел инициализирует кластер, остальные присоединяются (retry_join) с тем же ключом static.
+  serial: 1
+  vars:
+    openbao_api_addr: "https://{{ inventory_hostname }}:8200"
+    openbao_tls_cert_src: "{{ small_pki_dir }}/{{ inventory_hostname }}.pem"
+    openbao_tls_key_src: "{{ small_pki_dir }}/{{ inventory_hostname }}.key"
+    openbao_tls_ca_src: "{{ small_pki_dir }}/ca.pem"
+    openbao_raft_peers: >-
+      {{ groups['small_data'] | difference([inventory_hostname]) | map('regex_replace', '^', 'https://')
+         | map('regex_replace', '$', ':8200') | list }}
+    openbao_static_key_id: thepost-small-1
+    openbao_static_key_from: "{{ small_bao_init }}"
+    openbao_init_node: "{{ inventory_hostname == small_bao_init }}"
+    # thepost — на узлах mailbox: AppRole выдаётся им (сценарий mailbox).
+    openbao_thepost_local: false
+    openbao_infra_secrets:
+      pgaf: [autoctl_password, replicator_password, monitor_password]
+      seaweedfs: [filer_db_password, jwt_signing_key, jwt_filer_signing_key]
+  roles:
+    - openbao
+  post_tasks:
+    # Ключи S3 узлов thepost (секрет thepost/s3 — ссылки blob.s3.credentials); копия — в s3.json шлюзов.
+    - name: Generate S3 keys of thepost
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          if ! bao kv get -mount=thepost s3 >/dev/null 2>&1; then
+            head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' \
+              | bao kv put -mount=thepost s3 access_key_id=thepost secret_access_key=- >/dev/null
+            echo changed
+          fi
+        executable: /bin/bash
+      environment: "{{ openbao_cli_env }}"
+      register: small_s3_bootstrap
+      changed_when: "'changed' in small_s3_bootstrap.stdout"
+      when: openbao_init_node
+      no_log: true
+
+    - name: Read S3 keys of thepost
+      ansible.builtin.command: bao kv get -mount=thepost -format=json s3
+      environment: "{{ openbao_cli_env }}"
+      register: small_s3_read
+      changed_when: false
+      when: openbao_init_node
+      no_log: true
+
+    - name: Expose S3 keys of thepost
+      ansible.builtin.set_fact:
+        small_s3_keys: "{{ (small_s3_read.stdout | from_json).data.data }}"
+      when: openbao_init_node
+      no_log: true
+
+# Значения из OpenBao — фактами на узлах, которым они нужны (без записи в инвентарь и на диск управляющей машины).
+- name: Secrets and settings from OpenBao
+  hosts: small_data:mailbox
+  gather_facts: false
+  tasks:
+    - name: Set PostgreSQL facts
+      ansible.builtin.set_fact:
+        pgaf_autoctl_password: "{{ hostvars[small_bao_init].openbao_infra.pgaf.autoctl_password }}"
+        pgaf_replicator_password: "{{ hostvars[small_bao_init].openbao_infra.pgaf.replicator_password }}"
+        pgaf_monitor_password: "{{ hostvars[small_bao_init].openbao_infra.pgaf.monitor_password }}"
+        thepost_db_password: "{{ hostvars[small_bao_init].thepost_db_password }}"
+        thepost_db_owner_password: "{{ hostvars[small_bao_init].thepost_db_owner_password }}"
+        thepost_db_readonly_password: "{{ hostvars[small_bao_init].thepost_db_readonly_password }}"
+        pgaf_hostname: "{{ inventory_hostname }}"
+        pgaf_tls_ca_src: "{{ small_pki_dir }}/ca.pem"
+        pgaf_tls_cert_src: "{{ small_pki_dir }}/{{ inventory_hostname }}.pem"
+        pgaf_tls_key_src: "{{ small_pki_dir }}/{{ inventory_hostname }}.key"
+        pgaf_cluster_networks: "{{ small_data_networks }}"
+        # Узлы thepost и filer SeaweedFS (на ВМ данных) — к БД thepost.
+        pgaf_app_networks: "{{ small_mail_networks | union(small_data_networks) }}"
+        pgaf_app_roles: [thepost, thepost_owner, thepost_readonly, seaweedfs_filer]
+        # Один кандидат синхронной реплики (исключение из SRS 3.1, приложение З.2): при отказе standby запись
+        # продолжается без синхронной реплики до его возврата.
+        db_durability: preferred
+      when: inventory_hostname in groups['small_data']
+      no_log: true
+
+    - name: Set SeaweedFS facts
+      ansible.builtin.set_fact:
+        seaweedfs_tls_ca_src: "{{ small_pki_dir }}/ca.pem"
+        seaweedfs_tls_cert_src: "{{ small_pki_dir }}/{{ inventory_hostname }}.pem"
+        seaweedfs_tls_key_src: "{{ small_pki_dir }}/{{ inventory_hostname }}.key"
+        seaweedfs_masters: "{{ small_masters }}"
+        seaweedfs_filers: "{{ small_filers }}"
+        seaweedfs_jwt_signing_key: "{{ hostvars[small_bao_init].openbao_infra.seaweedfs.jwt_signing_key }}"
+        seaweedfs_jwt_filer_signing_key: "{{ hostvars[small_bao_init].openbao_infra.seaweedfs.jwt_filer_signing_key }}"
+        seaweedfs_filer_db_password: "{{ hostvars[small_bao_init].openbao_infra.seaweedfs.filer_db_password }}"
+        seaweedfs_filer_db_hosts: "{{ small_pg_hosts }}"
+        seaweedfs_s3_identities:
+          - name: thepost
+            access_key: "{{ hostvars[small_bao_init].small_s3_keys.access_key_id }}"
+            secret_key: "{{ hostvars[small_bao_init].small_s3_keys.secret_access_key }}"
+            actions: "{{ ['Read', 'Write', 'List', 'Tagging'] | map('regex_replace', '$', ':' ~ small_bucket) | list }}"
+      no_log: true
+
+- name: PostgreSQL with pg_auto_failover
+  ansible.builtin.import_playbook: pg-ha.yml
+
+- name: SeaweedFS filer account on primary
+  hosts: pgaf_nodes
+  become: true
+  tasks:
+    - name: Check recovery mode
+      community.postgresql.postgresql_query:
+        query: SELECT pg_is_in_recovery() AS standby
+        port: "{{ pgaf_port | default(5432) }}"
+      register: small_recovery
+      changed_when: false
+      become: true
+      become_user: postgres
+
+    # Схема seaweedfs в БД thepost (pg_hba — БД thepost, pgaf_app_roles): права — только на свою схему.
+    - name: Filer account, schema and CONNECT
+      when: not small_recovery.query_result[0].standby
+      become: true
+      become_user: postgres
+      block:
+        - name: Create role seaweedfs_filer
+          community.postgresql.postgresql_user:
+            name: seaweedfs_filer
+            password: "{{ seaweedfs_filer_db_password }}"
+            role_attr_flags: LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE
+            port: "{{ pgaf_port | default(5432) }}"
+          no_log: true
+
+        - name: Grant CONNECT on database thepost
+          community.postgresql.postgresql_privs:
+            login_db: "{{ pgaf_app_db | default('thepost') }}"
+            type: database
+            objs: "{{ pgaf_app_db | default('thepost') }}"
+            privs: CONNECT
+            roles: seaweedfs_filer
+            port: "{{ pgaf_port | default(5432) }}"
+
+        - name: Create schema seaweedfs
+          community.postgresql.postgresql_schema:
+            login_db: "{{ pgaf_app_db | default('thepost') }}"
+            name: seaweedfs
+            owner: seaweedfs_filer
+            port: "{{ pgaf_port | default(5432) }}"
+
+- name: SeaweedFS on data VMs
+  hosts: small_data
+  become: true
+  vars:
+    seaweedfs_components: [master, volume, filer]
+  roles:
+    - seaweedfs
+  post_tasks:
+    - name: Bucket of thepost
+      ansible.builtin.include_role:
+        name: seaweedfs
+        tasks_from: buckets
+      vars:
+        seaweedfs_buckets: ["{{ small_bucket }}"]
+      run_once: true
+
+- name: The Post mailbox nodes
+  hosts: mailbox
+  become: true
+  vars:
+    seaweedfs_components: [s3]
+    small_ca_file: /etc/thepost/pki/ca.pem
+    small_db_tls: "sslmode=verify-full&sslrootcert={{ small_ca_file }}"
+    thepost_internal_ca_file: "{{ small_ca_file }}"
+    thepost_db_url: "postgres://thepost@{{ small_pg_hosts | first }}:5432/thepost?{{ small_db_tls }}"
+    thepost_db_urls: >-
+      {{ small_pg_hosts[1:] | map('regex_replace', '^', 'postgres://thepost@') | map('regex_replace', '$', ':5432/thepost')
+         | list }}
+    thepost_db_failover: { retry_initial: 100ms, retry_max: 2s, retry_for: 30s, probe_timeout: 3s }
+    thepost_secrets_url: "{{ small_openbao_url }}"
+    thepost_config_extra_small:
+      roles: [mailbox]
+      blob:
+        url: "s3://{{ small_bucket }}"
+        s3:
+          endpoint: "https://localhost:8333"
+          path_style: true
+          credentials:
+            access_key_id: { secret: "thepost/s3#access_key_id" }
+            secret_access_key: { secret: "thepost/s3#secret_access_key" }
+          tls: { ca_file: "{{ small_ca_file }}" }
+    thepost_config_extra: "{{ thepost_config_extra_small | combine(small_thepost_config_extra | default({}), recursive=true) }}"
+  pre_tasks:
+    - name: Create internal CA directory
+      ansible.builtin.file:
+        path: "{{ small_ca_file | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy internal CA
+      ansible.builtin.copy:
+        src: "{{ small_pki_dir }}/ca.pem"
+        dest: "{{ small_ca_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: AppRole thepost of this node
+      ansible.builtin.include_role:
+        name: openbao
+        tasks_from: approle
+      vars:
+        openbao_approle_from: "{{ small_bao_init }}"
+
+    - name: Create thepost unit drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/thepost.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Order thepost after local S3 gateway
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/thepost.service.d/seaweedfs-s3.conf
+        content: |
+          # Малый Enterprise: BLOB — через шлюз S3 на этом узле (https://localhost:8333).
+          [Unit]
+          Wants=seaweedfs-s3.service
+          After=seaweedfs-s3.service
+        owner: root
+        group: root
+        mode: "0644"
+  roles:
+    - seaweedfs
+    - rspamd
+    - role: clamav_milter
+      when: thepost_clamav | default(false) | bool
+    - thepost
+  post_tasks:
+    # Общий виртуальный адрес (VRRP): у узла, где работает thepost; без small_vip_address — балансировщик заказчика.
+    - name: Virtual address (keepalived)
+      when: small_vip_address | default('') | length > 0
+      block:
+        - name: Install keepalived
+          ansible.builtin.apt:
+            name: keepalived
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Write keepalived.conf
+          ansible.builtin.copy:
+            dest: /etc/keepalived/keepalived.conf
+            content: |
+              # {{ ansible_managed }}
+              # Малый Enterprise: виртуальный адрес узлов mailbox; переходит, если thepost на узле не работает.
+              global_defs {
+                enable_script_security
+                script_user nobody
+              }
+              vrrp_script thepost {
+                script "/usr/bin/systemctl is-active --quiet thepost.service"
+                interval 2
+                fall 2
+                rise 2
+              }
+              vrrp_instance thepost {
+                state BACKUP
+                nopreempt
+                interface {{ small_vip_interface }}
+                virtual_router_id {{ small_vip_router_id }}
+                priority {{ 150 - groups['mailbox'].index(inventory_hostname) * 10 }}
+                advert_int 1
+                virtual_ipaddress {
+                  {{ small_vip_address }}
+                }
+                track_script {
+                  thepost
+                }
+              }
+            owner: root
+            group: root
+            mode: "0644"
+          register: small_keepalived_conf
+
+        - name: Start keepalived
+          ansible.builtin.systemd_service:
+            name: keepalived
+            state: "{{ 'restarted' if small_keepalived_conf.changed else 'started' }}"
+            enabled: true

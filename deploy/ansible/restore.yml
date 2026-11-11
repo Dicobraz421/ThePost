@@ -1,0 +1,36 @@
+# Восстановление эталона SMB из резервных копий (DEP-15; SRS 3.5, 5.3): PITR PostgreSQL на момент T (pgBackRest),
+# возврат каталога BLOB (restic/rsync), сверка thepost verify — потерянных тел писем 0; затем новая полная копия.
+#   ansible-playbook -i <инвентарь> deploy/ansible/restore.yml -e thepost_restore_confirm=true \
+#     -e "thepost_restore_target='2026-11-11 18:00:00+03'"
+# Без thepost_restore_target — до конца архива WAL (последнее состояние). Параметры — роль pgbackrest (defaults),
+# порядок для новой ВМ — docs/INSTALL.md, «Резервное копирование и восстановление».
+---
+- name: The Post SMB restore
+  hosts: smb
+  become: true
+  vars:
+    # Как в smb.yml: OpenBao на loopback с сертификатом внутреннего CA.
+    openbao_api_addr: https://localhost:8200
+    openbao_listen_address: "127.0.0.1:8200"
+    openbao_cluster_address: "127.0.0.1:8201"
+    openbao_tls_remote_src: true
+    openbao_tls_cert_src: "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/internal.pem"
+    openbao_tls_key_src: "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/internal.key"
+    openbao_tls_ca_src: "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/ca.pem"
+  tasks:
+    # Токен администратора OpenBao и пароли учётных записей СУБД (сверка после PITR).
+    - name: OpenBao
+      ansible.builtin.include_role:
+        name: openbao
+    # Средства копирования и учётные данные (новая ВМ: ключи уже в OpenBao); таймеры — только после восстановления,
+    # иначе копия каталога писем, снятая после потери данных, станет последней.
+    - name: Backup tools
+      ansible.builtin.include_role:
+        name: pgbackrest
+      vars:
+        thepost_backup_initial: false
+        thepost_backup_start_timers: false
+    - name: Restore from backups
+      ansible.builtin.include_role:
+        name: pgbackrest
+        tasks_from: restore

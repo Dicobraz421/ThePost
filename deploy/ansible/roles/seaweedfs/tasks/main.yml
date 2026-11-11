@@ -1,0 +1,156 @@
+# Установка SeaweedFS на ВМ: бинарный файл, пользователь, TLS, security.toml, filer.toml, s3.json, юниты systemd.
+---
+- name: Check parameters
+  ansible.builtin.assert:
+    that:
+      - seaweedfs_components | difference(['master', 'volume', 'filer', 's3']) | length == 0
+      - seaweedfs_tls_ca_src | length > 0 and seaweedfs_tls_cert_src | length > 0 and seaweedfs_tls_key_src | length > 0
+      - "'s3' in seaweedfs_components or seaweedfs_masters | length > 0"
+      - "'filer' not in seaweedfs_components or
+         (seaweedfs_filer_db_hosts | length > 0 and seaweedfs_filer_db_password | length > 0)"
+      - "'s3' not in seaweedfs_components or seaweedfs_filers | length > 0"
+      - seaweedfs_components | intersect(['master', 'volume']) | length == 0 or seaweedfs_jwt_signing_key | length > 0
+      - seaweedfs_components | intersect(['filer', 's3']) | length == 0 or seaweedfs_jwt_filer_signing_key | length > 0
+    fail_msg: >-
+      Нужны: seaweedfs_components из master, volume, filer, s3; TLS (seaweedfs_tls_ca_src, seaweedfs_tls_cert_src,
+      seaweedfs_tls_key_src); seaweedfs_masters; для filer — seaweedfs_filer_db_hosts и seaweedfs_filer_db_password;
+      для s3 — seaweedfs_filers; ключи JWT (seaweedfs_jwt_signing_key, seaweedfs_jwt_filer_signing_key) из OpenBao
+  no_log: true
+
+- name: Create system user {{ seaweedfs_user }}
+  ansible.builtin.user:
+    name: "{{ seaweedfs_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ seaweedfs_data_dir }}"
+    create_home: false
+
+- name: Create directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ seaweedfs_user }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ seaweedfs_config_dir }}", owner: root, mode: "0750" }
+    - { path: "{{ seaweedfs_config_dir }}/tls", owner: root, mode: "0750" }
+    - { path: "{{ seaweedfs_data_dir }}", owner: "{{ seaweedfs_user }}", mode: "0750" }
+    - { path: "{{ seaweedfs_data_dir }}/master", owner: "{{ seaweedfs_user }}", mode: "0750" }
+    - { path: "{{ seaweedfs_data_dir }}/volume", owner: "{{ seaweedfs_user }}", mode: "0750" }
+    - { path: "{{ seaweedfs_data_dir }}/filer", owner: "{{ seaweedfs_user }}", mode: "0750" }
+
+- name: Download SeaweedFS {{ seaweedfs_version }}
+  ansible.builtin.get_url:
+    url: "{{ seaweedfs_archive_url }}"
+    checksum: "{{ seaweedfs_archive_checksum }}"
+    dest: "/var/cache/seaweedfs_{{ seaweedfs_version }}_{{ seaweedfs_arch }}.tar.gz"
+    mode: "0644"
+
+- name: Create unpack directory
+  ansible.builtin.file:
+    path: "/var/cache/seaweedfs_{{ seaweedfs_version }}_{{ seaweedfs_arch }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Unpack weed
+  ansible.builtin.unarchive:
+    src: "/var/cache/seaweedfs_{{ seaweedfs_version }}_{{ seaweedfs_arch }}.tar.gz"
+    dest: "/var/cache/seaweedfs_{{ seaweedfs_version }}_{{ seaweedfs_arch }}"
+    remote_src: true
+    include: [weed]
+    creates: "/var/cache/seaweedfs_{{ seaweedfs_version }}_{{ seaweedfs_arch }}/weed"
+
+- name: Install weed
+  ansible.builtin.copy:
+    src: "/var/cache/seaweedfs_{{ seaweedfs_version }}_{{ seaweedfs_arch }}/weed"
+    dest: "{{ seaweedfs_bin }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart seaweedfs
+
+- name: Copy TLS certificates and CA
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ seaweedfs_config_dir }}/tls/{{ item.dest }}"
+    owner: root
+    group: "{{ seaweedfs_user }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: "{{ seaweedfs_tls_ca_src }}", dest: ca.pem, mode: "0644" }
+    - { src: "{{ seaweedfs_tls_cert_src }}", dest: node.pem, mode: "0644" }
+    - { src: "{{ seaweedfs_tls_key_src }}", dest: node.key, mode: "0640" }
+    - { src: "{{ seaweedfs_s3_tls_cert_src }}", dest: s3.pem, mode: "0644" }
+    - { src: "{{ seaweedfs_s3_tls_key_src }}", dest: s3.key, mode: "0640" }
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: Restart seaweedfs
+
+- name: Write security.toml (TLS, JWT expiry)
+  ansible.builtin.template:
+    src: security.toml.j2
+    dest: "{{ seaweedfs_config_dir }}/security.toml"
+    owner: root
+    group: "{{ seaweedfs_user }}"
+    mode: "0640"
+  notify: Restart seaweedfs
+
+- name: Write filer.toml (store postgres2)
+  ansible.builtin.template:
+    src: filer.toml.j2
+    dest: "{{ seaweedfs_config_dir }}/filer.toml"
+    owner: root
+    group: "{{ seaweedfs_user }}"
+    mode: "0640"
+  when: "'filer' in seaweedfs_components"
+  notify: Restart seaweedfs
+
+# Секреты — переменными окружения WEED_* (SeaweedFS читает их поверх security.toml и filer.toml); файл читает только
+# systemd (root).
+- name: Write secrets environment
+  ansible.builtin.template:
+    src: seaweedfs.env.j2
+    dest: "{{ seaweedfs_config_dir }}/seaweedfs.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart seaweedfs
+
+- name: Write S3 identities
+  ansible.builtin.template:
+    src: s3.json.j2
+    dest: "{{ seaweedfs_config_dir }}/s3.json"
+    owner: root
+    group: "{{ seaweedfs_user }}"
+    mode: "0640"
+  when: "'s3' in seaweedfs_components"
+  no_log: true
+  notify: Restart seaweedfs
+
+- name: Install systemd units
+  ansible.builtin.template:
+    src: seaweedfs.service.j2
+    dest: "/etc/systemd/system/seaweedfs-{{ item }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ seaweedfs_components }}"
+  vars:
+    seaweedfs_component: "{{ item }}"
+  notify: Restart seaweedfs
+
+- name: Start SeaweedFS
+  ansible.builtin.systemd_service:
+    name: "seaweedfs-{{ item }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+  loop: "{{ seaweedfs_components }}"
+
+- name: Apply pending restart
+  ansible.builtin.meta: flush_handlers

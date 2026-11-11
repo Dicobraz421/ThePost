@@ -9,8 +9,9 @@
 | `compose/postgres/app-role.sh` | Учётные записи PostgreSQL: владелец схемы `thepost_owner`, узел `thepost`, только чтение `thepost_readonly` |
 | `openbao/thepost-policy.hcl` | Политика узла `thepost` в OpenBao (общая для compose, Helm, Ansible) |
 | `helm/openbao/` | Значения чарта `openbao/openbao` и настройка Kubernetes auth (`bootstrap.sh`) |
-| `helm/thepost/` | Чарт узла: не root, корневая ФС только для чтения, без capabilities, seccomp `RuntimeDefault`; PostgreSQL — CloudNativePG (`cnpg.enabled`) |
-| `ansible/` | Эталон SMB одной командой (`smb.yml`: роли `thepost_pki`, `openbao`, `postgresql`, `rspamd`, `clamav_milter`, `thepost`); OpenBao отдельно (`openbao.yml`); СУБД Enterprise-ВМ — pg_auto_failover (`pg-ha.yml`) |
+| `helm/thepost/` | Чарт узла: не root, корневая ФС только для чтения, без capabilities, seccomp `RuntimeDefault`; HPA по CPU, по соединениям — опция (`autoscaling`), PodDisruptionBudget, VPA в режиме рекомендаций, anti-affinity по узлам; PostgreSQL — CloudNativePG (`cnpg.enabled`) |
+| `helm/prometheus-adapter/` | Значения чарта prometheus-adapter: метрика `tp_load_connections` для HPA по соединениям |
+| `ansible/` | Эталон SMB одной командой (`smb.yml`: роли `thepost_pki`, `openbao`, `postgresql`, `rspamd`, `clamav_milter`, `thepost`); OpenBao отдельно (`openbao.yml`); СУБД Enterprise-ВМ — pg_auto_failover (`pg-ha.yml`); «Малый Enterprise» — 2 узла mailbox и 3 ВМ данных: pg_auto_failover, OpenBao (Raft), SeaweedFS с метаданными filer в PostgreSQL (`small-enterprise.yml`, роль `seaweedfs`) |
 | `stand/` | Стенд SMB и базовая нагрузка (APP-D): ВМ SMB + генератор, imaptest, smtp-source, k6, отчёт |
 | `systemd/` | Юнит `thepost.service` с hardening, сокеты `thepost-*.socket` (порты ниже 1024), пользователь `thepost` (sysusers) |
 | `config/` | Примеры `config.yaml` для пресетов `all` (SMB), `mailbox` (Enterprise-ВМ), `edge` (DMZ) |
@@ -154,6 +155,33 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 открыт, DNS указывает на ВМ), `acme` (встроенный клиент thepost, секция `acme`), `internal` (внутренний CA — стенд),
 `files` (свои PEM). Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
 Повторный прогон ничего не меняет. Ключи восстановления и root-токен OpenBao — `/root/openbao-init.json` (см. ниже).
+
+### Резервное копирование и восстановление (роль `pgbackrest`, DEP-15)
+`thepost_backup: true` (по умолчанию) — последняя роль `smb.yml`, готовые средства из пакетов дистрибутива и PGDG:
+- pgBackRest: `archive_command` (`conf.d/pgbackrest.conf`, `archive_timeout = 60`), stanza `thepost`, хранилище
+  `thepost_backup_repo` — `posix` (`/var/lib/pgbackrest`) или `s3` (HTTPS, свой CA — `thepost_backup_s3_ca_file`),
+  шифрование `aes-256-cbc`, срок `repo1-retention-full-type=time` (`thepost_backup_retention_days`); таймеры
+  `thepost-backup-full.timer` и `thepost-backup-diff.timer` → `thepost-backup@full|diff.service` (от `postgres`);
+- каталог BLOB — `thepost-backup-blob.service` после каждой копии СУБД (`Wants=` + `Before=`) и по
+  `thepost-backup-blob.timer` (`thepost_backup_blob_schedule`): restic (`backup`, `forget --keep-within --prune`)
+  или rsync (зеркало без `--delete`: объекты неизменяемы и удаляются после окна W — надмножество любого момента);
+- инвариант W (SRS 3.5): роль `thepost` пишет `blob.gc.window` = глубина PITR + 8 суток (`thepost_blob_gc_window`),
+  роль `pgbackrest` проверяет, что W не меньше глубины PITR;
+- секреты — KV `thepost-backup` в OpenBao (политика узла `thepost` его не видит): `pgbackrest#cipher_pass`,
+  `restic#password` (случайные при первом прогоне), `s3#access_key_id,secret_access_key` (заводит администратор).
+  На ВМ — только `systemd-creds encrypt` (`/etc/thepost/credentials/*.cred`; ключ ВМ и TPM2, если есть) и
+  `LoadCredentialEncrypted=` юнитов копий и drop-in `postgresql@16-main.service.d/pgbackrest.conf` (для
+  `archive_command` и `restore_command`). pgBackRest читает их через `--config-include-path=/run/credentials/<юнит>`,
+  restic — через `RESTIC_PASSWORD_FILE` и `AWS_SHARED_CREDENTIALS_FILE`. Вручную — `thepost-pgbackrest …` и
+  `thepost-restic …` (обёртки `systemd-run` с теми же учётными данными).
+
+Восстановление — `deploy/ansible/restore.yml` (`roles/pgbackrest/tasks/restore.yml`): роль `openbao` (токен
+администратора, пароли СУБД) → остановка таймеров и `thepost` → `pgbackrest restore --delta --type=time
+--target=<T> --target-action=promote` (без `thepost_restore_target` — `--type=default`) → ожидание конца
+восстановления → пароли учётных записей из OpenBao (`accounts.yml`, `always`) → `thepost-restic restore latest`
+(или rsync) поверх каталога → `thepost` → `thepost verify --json` (повреждённых и ошибок — 0, иначе отказ) →
+`thepost verify --fix` при «сиротах» → таймеры и новая полная копия. Подтверждение — `-e thepost_restore_confirm=true`.
+Порядок для администратора и для новой ВМ — [docs/INSTALL.md](../docs/INSTALL.md#резервное-копирование-и-восстановление).
 
 ## Установка под systemd (SMB, Enterprise-ВМ)
 ```bash

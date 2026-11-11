@@ -1,0 +1,35 @@
+# Бакеты S3 (seaweedfs_buckets) — на одном узле filer после запуска кластера: weed shell по gRPC с взаимным TLS
+# (security.toml узла). Существующие бакеты не меняются.
+---
+- name: Wait for filer
+  ansible.builtin.wait_for:
+    host: "{{ seaweedfs_address }}"
+    port: "{{ seaweedfs_filer_port }}"
+    timeout: 120
+
+- name: List buckets
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      echo s3.bucket.list | {{ seaweedfs_bin }} shell -master={{ seaweedfs_masters | join(',') | quote }}
+      -filer={{ (seaweedfs_address ~ ':' ~ seaweedfs_filer_port) | quote }}
+    executable: /bin/bash
+    chdir: "{{ seaweedfs_config_dir }}"
+  register: seaweedfs_bucket_list
+  retries: 30
+  delay: 4
+  until: seaweedfs_bucket_list.rc == 0
+  changed_when: false
+
+- name: Create buckets
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      echo s3.bucket.create -name {{ item | quote }} | {{ seaweedfs_bin }} shell
+      -master={{ seaweedfs_masters | join(',') | quote }}
+      -filer={{ (seaweedfs_address ~ ':' ~ seaweedfs_filer_port) | quote }}
+    executable: /bin/bash
+    chdir: "{{ seaweedfs_config_dir }}"
+  loop: "{{ seaweedfs_buckets }}"
+  when: seaweedfs_bucket_list.stdout_lines | map('trim') | map('regex_replace', '\s.*$', '') | select('eq', item) | list | length == 0
+  changed_when: true

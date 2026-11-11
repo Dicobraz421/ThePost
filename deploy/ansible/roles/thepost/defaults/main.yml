@@ -61,6 +61,12 @@ thepost_clamav_milter_address: "{{ clamav_milter_address | default('127.0.0.1:73
 # Проверять и почту пользователей (submission), не только входящую.
 thepost_milter_submission: false
 
+# Окно W (blob.gc.window, SRS 3.5): тело письма удаляется не раньше W после удаления последней ссылки; W не меньше
+# глубины самой старой точки восстановления. С резервным копированием (роль pgbackrest) — глубина PITR + неделя между
+# полными копиями + сутки запаса; пусто — значение узла по умолчанию (7d).
+thepost_blob_gc_window: >-
+  {{ (thepost_backup_retention_days | default(7) | int + 8) ~ 'd' if thepost_backup | default(true) | bool else '' }}
+
 # Дополнительные параметры config.yaml — рекурсивно поверх эталона (списки заменяются), например:
 #   thepost_config_extra: { auth: { ldap: { … } }, meta: { retention: { trash_retention: 15m } } }
 thepost_config_extra: {}
