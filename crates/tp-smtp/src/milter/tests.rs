@@ -140,6 +140,8 @@ fn envelope(mode: Mode) -> Envelope {
         rcpts: vec!["bob@example.org".into(), "carol@example.org".into()],
         smtputf8: false,
         started_at: OffsetDateTime::now_utc(),
+        source: None,
+        gateway: None,
     }
 }
 

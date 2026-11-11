@@ -144,6 +144,7 @@ async fn start(mode: Mode, cfg: Arc<SmtpConfig>) -> Env {
         limiter: None,
         send_limits: None,
         metrics: None,
+        screen: None,
     };
     let (client, mut server) = tokio::io::duplex(64 * 1024);
     let task = tokio::spawn(async move {

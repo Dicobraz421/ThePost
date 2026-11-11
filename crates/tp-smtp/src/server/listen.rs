@@ -24,6 +24,7 @@ use crate::config::SmtpConfig;
 use crate::limits::SendLimits;
 use crate::metrics::SmtpMetrics;
 use crate::screen::{Admission, Screen};
+use crate::sources::Sources;
 
 /// Зависимости ролей SMTP, выбранные приложением.
 #[derive(Clone)]
@@ -58,13 +59,26 @@ pub struct SmtpService {
     deps: ServerDeps,
     /// Экран соединений (smtp-in): кэш и частота по адресам — общие для слушателей роли.
     screen: Arc<Screen>,
+    /// Доверенные источники (SMTP-20); `None` — все соединения как от обычных клиентов.
+    sources: Option<Sources>,
 }
 
 impl SmtpService {
     /// Сервис роли `mode`.
     pub fn new(mode: Mode, deps: ServerDeps) -> Self {
         let screen = Arc::new(Screen::new(deps.metrics.clone()));
-        Self { mode, deps, screen }
+        Self {
+            mode,
+            deps,
+            screen,
+            sources: None,
+        }
+    }
+
+    /// Доверенные источники приёма (шлюз, приложения; [`crate::sources`]) из снимков настроек транспорта.
+    pub fn with_sources(mut self, sources: Sources) -> Self {
+        self.sources = Some(sources);
+        self
     }
 
     /// Обслуживает готовые слушатели до `ctx.shutdown` (приложение — из [`RoleService::run`], тесты — на `127.0.0.1:0`).
@@ -76,6 +90,7 @@ impl SmtpService {
                 self.mode,
                 self.deps.clone(),
                 self.screen.clone(),
+                self.sources.clone(),
                 ctx.config.clone(),
                 ctx.shutdown.clone(),
                 ctx.drain_deadline,
@@ -123,6 +138,7 @@ async fn accept_loop(
     mode: Mode,
     deps: ServerDeps,
     screen: Arc<Screen>,
+    sources: Option<Sources>,
     config: ConfigRx,
     shutdown: CancellationToken,
     drain: Duration,
@@ -144,6 +160,7 @@ async fn accept_loop(
                         mode,
                         deps.clone(),
                         screen.clone(),
+                        sources.clone(),
                         last.clone(),
                         busy,
                     ));
@@ -176,6 +193,7 @@ async fn connection(
     mode: Mode,
     deps: ServerDeps,
     screen: Arc<Screen>,
+    sources: Option<Sources>,
     config: Arc<SmtpConfig>,
     busy: bool,
 ) {
@@ -188,17 +206,24 @@ async fn connection(
         }
     };
     let ip = conn.info.client.ip();
+    let source = match &sources {
+        Some(s) => s.of(&conn).await,
+        None => None,
+    };
+    // Доверенный источник (шлюз многих клиентов, приложение) — без лимита частоты по адресу и экрана: они
+    // применяются к исходному клиенту (`XCLIENT`).
+    let trusted = source.is_some();
     let mut probe = None;
     let refuse = if busy {
         Some(reply(421, [4, 3, 2], "Too many connections, try later"))
     } else if let Some(r) = deps
         .limiter
         .as_ref()
-        .filter(|l| !l.check_ip(ip).is_allowed())
+        .filter(|l| !trusted && !l.check_ip(ip).is_allowed())
         .map(|_| reply(421, [4, 7, 0], "Too many connections from your address"))
     {
         Some(r)
-    } else if mode == Mode::Inbound {
+    } else if mode == Mode::Inbound && !trusted {
         match screen.admit(&config.screen, ip) {
             Admission::Exempt | Admission::Passed => None,
             Admission::Probe(p) => {
@@ -228,9 +253,10 @@ async fn connection(
         limiter: deps.limiter,
         send_limits: deps.send_limits,
         metrics: deps.metrics.clone(),
+        screen: Some(screen.clone()),
     };
     let _session = deps.metrics.as_ref().map(|m| m.session(mode));
-    let outcome = serve_screened(ctx, conn, probe).await;
+    let outcome = serve_screened(ctx, conn, probe, source, sources.as_ref()).await;
     if probe.is_some() {
         screen.record(&config.screen, ip, outcome);
     }

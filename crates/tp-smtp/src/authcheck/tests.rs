@@ -120,6 +120,8 @@ pub(crate) fn envelope(client: &str) -> Envelope {
         rcpts: vec!["bob@example.org".into()],
         smtputf8: false,
         started_at: OffsetDateTime::now_utc(),
+        source: None,
+        gateway: None,
     }
 }
 
@@ -227,4 +229,121 @@ fn cache_expires_and_evicts() {
     assert_eq!((c.get("a"), c.get("b")), (Some(1), Some(3)));
     assert_eq!(c.remove("a"), Some(1));
     assert_eq!(c.get("a"), None);
+}
+
+// ---------- Волна smtp-06: шлюз (SMTP-20) и ARC-подпись пересылки (SMTP-23) ----------
+
+#[tokio::test]
+async fn spf_by_original_client_of_gateway() {
+    let check = checker();
+    publish_sender(check.cache(), "reject");
+    // Шлюз 198.51.100.7 вне SPF отправителя; исходный клиент из XCLIENT/XFORWARD — в нём.
+    let mut env = envelope("192.0.2.20:1000");
+    env.gateway = Some("198.51.100.7:25".parse().expect("addr"));
+    let out = check.check(&env, MAIL.as_bytes()).await;
+    assert!(out.headers.contains("spf=pass"), "{}", out.headers);
+    assert!(out.headers.contains("192.0.2.20"), "{}", out.headers);
+    let out = check
+        .check(&envelope("198.51.100.7:25"), MAIL.as_bytes())
+        .await;
+    assert!(out.headers.contains("spf=fail"), "{}", out.headers);
+}
+
+#[tokio::test]
+async fn gateway_results_by_authserv_id() {
+    let check = checker();
+    let raw = format!(
+        "Authentication-Results: other.example; dmarc=pass\r\n\
+         Authentication-Results: GW.example.org 1;\r\n\tspf=fail smtp.mailfrom=example.com;\r\n\t\
+         dmarc=fail header.from=example.com policy.dmarc=reject\r\n{MAIL}"
+    );
+    let out = check
+        .gateway(raw.as_bytes(), "gw.example.org")
+        .await
+        .expect("results");
+    assert!(out.junk);
+    assert!(out.headers.is_empty());
+    let pass = format!("Authentication-Results: gw.example.org; dmarc=pass\r\n{MAIL}");
+    let out = check
+        .gateway(pass.as_bytes(), "gw.example.org")
+        .await
+        .expect("results");
+    assert!(!out.junk);
+    // Результатов шлюза нет — обычные проверки.
+    assert!(
+        check
+            .gateway(raw.as_bytes(), "mx.other.example")
+            .await
+            .is_none()
+    );
+    assert!(
+        check
+            .gateway(MAIL.as_bytes(), "gw.example.org")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn gateway_results_from_arc() {
+    let check = checker();
+    let gw = Signer::new("gw.example.org", "arc");
+    gw.publish(check.cache());
+    let msg = AuthenticatedMessage::parse(MAIL.as_bytes()).expect("parse");
+    let arc = check.resolver.verify_arc(check.params(&msg)).await;
+    let ar = AuthenticationResults::new("gw.example.org")
+        .with_arc_result(&arc, "192.0.2.10".parse().expect("ip"));
+    let set = ArcSealer::from_key(gw.key())
+        .domain("gw.example.org")
+        .selector("arc")
+        .headers(["From", "To", "Subject"])
+        .seal(&msg, &ar, &arc)
+        .expect("seal");
+    let sealed = format!("{}{MAIL}", set.to_header());
+    assert!(
+        check
+            .gateway(sealed.as_bytes(), "gw.example.org")
+            .await
+            .is_some()
+    );
+    // Звено поставил другой authserv-id — не доверяем.
+    assert!(
+        check
+            .gateway(sealed.as_bytes(), "other.example")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn forward_arc_seal_verifies() {
+    let check = checker();
+    let author = Signer::new("example.com", "s1");
+    author.publish(check.cache());
+    let node = Signer::new("example.org", "arc2026");
+    node.publish(check.cache());
+    let sealer = ArcSealer::from_key(mail_auth::common::crypto::DkimKey::Ed25519(node.key()))
+        .domain("example.org")
+        .selector("arc2026")
+        .headers(["From", "To", "Subject"]);
+    let signed = author.sign(MAIL);
+    let set = check
+        .seal(
+            &sealer,
+            signed.as_bytes(),
+            Some("192.0.2.10".parse().expect("ip")),
+        )
+        .await
+        .expect("sealed");
+    assert!(set.contains("ARC-Seal:"), "{set}");
+    let forwarded = format!("{set}{signed}");
+    // Получатель пересылки проверяет цепочку ARC (mail-auth).
+    let msg = AuthenticatedMessage::parse(forwarded.as_bytes()).expect("parse");
+    let arc = check.resolver.verify_arc(check.params(&msg)).await;
+    assert!(
+        matches!(arc.result(), mail_auth::DkimResult::Pass),
+        "{:?}",
+        arc.result()
+    );
+    assert_eq!(arc.sets().len(), 1);
 }
