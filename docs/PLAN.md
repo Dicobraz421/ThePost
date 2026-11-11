@@ -12,7 +12,7 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 102/145 | 167/223 | в работе, 75 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 117/146 | 183/224 | в работе, 82 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
 | Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 0/0 | 0/0 | карточки — после Ф1 | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/0 | 0/0 | карточки — после Ф1 | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
@@ -38,7 +38,7 @@
 1. **Этап 1 — «почта работает на стенде SMB»** (срочно). Установка `--profile smb`, первый администратор, учётные записи,
    письмо между двумя пользователями, IMAP и JMAP, корзина, защита входа.
    - Контракты (в очереди): `contracts-29` (CTR-41), `contracts-17` (CTR-29), `contracts-21` (CTR-33).
-   - `admin-06` (ADM-11) → `app-18` (APP-19, `thepost admin init`) — первый администратор без OIDC (#193).
+   - `admin-06` (ADM-11) → `app-18` (APP-19, `thepost admin init`) → `meta-27` (META-43, токены в PostgreSQL) — первый администратор без OIDC (#193).
    - `meta-26` (META-42) и `testkit-05` (KIT-08) — системные папки по роли.
    - `app-06` (APP-10) — корзина, сжатие и нагрузка в узле; `app-16` (APP-17) — журнал доставки, группы, обучение антиспама, защита от перебора.
    - Приёмка этапа: `docs/manual-tests/CMP-01.md` целиком на бете (стенд DEP-04), клиенты Thunderbird и Postman.
@@ -149,7 +149,7 @@
 |---|---|---|---|---|
 | ✅ contracts-10 (ветка `x/contracts-10`) | CTR-21 | B | contracts-09 | 1 |
 | ✅ sys-03 | SYS-06, SYS-07 | B | sys-01 | 2 |
-| ci-03 | CI-03, CI-04 | B | ci-01 | 4 |
+| ✅ ci-03 | CI-03, CI-04 | B | ci-01 | 4 |
 | ✅ platform-06 | PLT-15, PLT-16 | A | sys-03, contracts-10 | 2 |
 | ✅ meta-08 | META-21, META-22, META-23, META-24 | B | contracts-10 | 3 |
 | ✅ blob-06 | BLOB-13 | A | meta-08 | 4 |
@@ -193,7 +193,7 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-22 (ветка `x/contracts-22`) | CTR-34 | B | contracts-12 | 1 |
+| ✅ contracts-22 (ветка `x/contracts-22`) | CTR-34 | B | contracts-12 | 1 |
 | meta-13 | META-30, META-31 | A | meta-12, meta-10, contracts-22 | 3 |
 | meta-14 | META-32 | A | meta-13 | 3 |
 | blob-08 | BLOB-15 | A | blob-07, meta-13 | 4 |
@@ -239,8 +239,8 @@
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
 | ✅ contracts-16 (ветка `x/contracts-16`) | CTR-28 | B | smtp-02, jmap-02 | 1 |
-| contracts-17 (ветка `x/contracts-17`) | CTR-29 | B | jmap-02 | 1 |
-| contracts-18 (ветка `x/contracts-18`) | CTR-30 | B | contracts-16 | 1 |
+| ✅ contracts-17 (ветка `x/contracts-17`) | CTR-29 | B | jmap-02 | 1 |
+| ✅ contracts-18 (ветка `x/contracts-18`) | CTR-30 | B | contracts-16 | 1 |
 | ✅ jmap-06 | JMAP-12 | A | jmap-02 | 3 |
 
 ### Отчёты admin-02 (#174) и blob-06 (#175)
@@ -248,16 +248,16 @@
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
 | ✅ platform-08 | PLT-18 | A | platform-06 | 2 |
-| contracts-19 (ветка `x/contracts-19`) | CTR-31 | B | contracts-10, admin-02 | 1 |
-| contracts-20 (ветка `x/contracts-20`) | CTR-32 | B | auth-03 | 1 |
+| ✅ contracts-19 (ветка `x/contracts-19`) | CTR-31 | B | contracts-10, admin-02 | 1 |
+| ✅ contracts-20 (ветка `x/contracts-20`) | CTR-32 | B | auth-03 | 1 |
 | ✅ mailstore-09 | MS-15 | A | blob-06 | 4 |
 
 ### Остаток 2026-11-01 (отчёты imap-05, mailstore-09, app-02)
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-21 (ветка `x/contracts-21`) | CTR-33 | B | contracts-14 | 1 |
-| app-06 | APP-10 | A | app-02, imap-05, jmap-05, mailstore-09 | 2 |
+| ✅ contracts-21 (ветка `x/contracts-21`) | CTR-33 | B | contracts-14 | 1 |
+| ✅ app-06 | APP-10 | A | app-02, imap-05, jmap-05, mailstore-09 | 2 |
 | ✅ jmap-07 | JMAP-13 | A | jmap-02, mailstore-09 | 3 |
 
 ### Находки CMP-01: проверка клиентом Postman 2026-11-05 (приоритет)
@@ -302,7 +302,7 @@
 | ✅ jmap-12 | JMAP-21 | A | cluster-08 | 3 |
 | ✅ sys-06 | SYS-11 | A | sys-05 | 2 |
 | platform-11 | PLT-21 | A | sys-06, cluster-08 | 2 |
-| app-16 | APP-17 | A | smtp-05, auth-04, app-15 | 2 |
+| ✅ app-16 | APP-17 | A | smtp-05, auth-04, app-15 | 2 |
 | app-17 | APP-18 | A | smtp-10, cluster-07, app-16 | 2 |
 | meta-25 | META-41 | A | meta-21 | 3 |
 | cluster-09 | CLU-14 | A | cluster-07 | 4 |
@@ -312,12 +312,13 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-29 (ветка `x/contracts-29`) | CTR-41 | B | contracts-16 | 1 |
-| admin-06 | ADM-11 | A | contracts-29 | 3 |
-| app-18 | APP-19 | A | admin-06 | 2 |
+| ✅ contracts-29 (ветка `x/contracts-29`) | CTR-41 | B | contracts-16 | 1 |
+| ✅ admin-06 | ADM-11 | A | contracts-29 | 3 |
+| ✅ app-18 | APP-19 | A | admin-06 | 2 |
+| ✅ meta-27 (ветка `x/admin-tokens-pg`) | META-43 | B | admin-06, app-18 | 3 |
 | contracts-30 (ветка `x/contracts-30`) | CTR-42 | B | contracts-29 | 1 |
-| meta-26 | META-42 | A | meta-17 | 3 |
-| testkit-05 | KIT-08 | A | testkit-04 | 1 |
+| ✅ meta-26 | META-42 | A | meta-17 | 3 |
+| ✅ testkit-05 | KIT-08 | A | testkit-04 | 1 |
 | auth-06 | AUTH-11 | A | auth-04 | 1 |
 | ✅ deploy-10 | DEP-09 (`db_durability`, #272) | A | deploy-06 | 4 |
 

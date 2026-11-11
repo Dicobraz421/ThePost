@@ -196,8 +196,8 @@
 | [CTR-21](CTR-21.md) | контракты: сжатие BLOB, журнал доставки, уровни нагрузки, группы рассылки | contracts | B | contracts-10 | done | CTR-20 |
 | [SYS-06](SYS-06.md) | ресурсы узла по cgroups с перечитыванием | sys | A | sys-03 | done | SYS-02 |
 | [SYS-07](SYS-07.md) | seccomp и Landlock по ролям | sys | B | sys-03 | done | SYS-04,SYS-06 |
-| [CI-03](CI-03.md) | цепочка поставки: cargo-audit, подпись, воспроизводимость | ci | B | ci-03 | ready | CI-01 |
-| [CI-04](CI-04.md) | фаззинг в CI | ci | B | ci-03 | ready | CI-01 |
+| [CI-03](CI-03.md) | цепочка поставки: cargo-audit, подпись, воспроизводимость | ci | B | ci-03 | done | CI-01 |
+| [CI-04](CI-04.md) | фаззинг в CI | ci | B | ci-03 | done | CI-01 |
 | [PLT-15](PLT-15.md) | поведение под нагрузкой | platform | A | platform-06 | done | SYS-06,CTR-21,PLT-05 |
 | [PLT-16](PLT-16.md) | минимальные привилегии при запуске | platform | A | platform-06 | done | SYS-07,PLT-06 |
 | [META-21](META-21.md) | группы рассылки в PostgreSQL | meta | B | meta-08 | done | CTR-21,META-11 |
@@ -239,7 +239,7 @@
 | [MS-14](MS-14.md) | истечение корзины по ближайшему сроку | mailstore | A | mailstore-08 | done | MS-13 |
 | [BLOB-14](BLOB-14.md) | GC по ближайшему сроку отсрочки | blob | A | blob-07 | done | BLOB-13 |
 | [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | done | META-27 |
-| [CI-05](CI-05.md) | CI без Valkey, проверка отсутствия интерпретаторов | ci | B | ci-04 | todo | CLU-09 |
+| [CI-05](CI-05.md) | CI без Valkey, проверка отсутствия интерпретаторов | ci | B | ci-04 | ready | CLU-09 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-06 | done | CLU-09 |
 
 ## Ф1 · Решение 2026-11-01: состав функций транспорта и внешний MTA
@@ -260,9 +260,9 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-34](CTR-34.md) | раздел журнала событий по шардам | contracts | B | contracts-22 | ready | CTR-23 |
-| [META-30](META-30.md) | хранилища ящика через справочник шардов | meta | A | meta-13 | todo | META-29,META-27 |
-| [META-31](META-31.md) | журнал событий, очередь и учёт BLOB по шардам | meta | A | meta-13 | todo | META-30,CTR-34 |
+| [CTR-34](CTR-34.md) | раздел журнала событий по шардам | contracts | B | contracts-22 | done | CTR-23 |
+| [META-30](META-30.md) | хранилища ящика через справочник шардов | meta | A | meta-13 | ready | META-29,META-27 |
+| [META-31](META-31.md) | журнал событий, очередь и учёт BLOB по шардам | meta | A | meta-13 | ready | META-30,CTR-34 |
 | [META-32](META-32.md) | чтение с реплик для фоновых задач | meta | A | meta-14 | todo | META-30 |
 | [BLOB-15](BLOB-15.md) | сборка мусора по учёту ссылок всех шардов | blob | A | blob-08 | todo | META-31,BLOB-14 |
 | [APP-11](APP-11.md) | CLI thepost admin | app | A | app-07 | ready | ADM-01 |
@@ -272,7 +272,7 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-35](CTR-35.md) | контракты: соответствие Exchange | contracts | B | contracts-23 | todo | CTR-34 |
+| [CTR-35](CTR-35.md) | контракты: соответствие Exchange | contracts | B | contracts-23 | ready | CTR-34 |
 | [META-33](META-33.md) | хранение: списки, контакты, оргструктура, аудит, отключённые ящики | meta | A | meta-15 | todo | CTR-35,META-30 |
 | [AUTH-10](AUTH-10.md) | синхронизация каталога: контакты, оргструктура, отключение ящиков | auth | A | auth-05 | todo | CTR-35,AUTH-07 |
 | [MS-16](MS-16.md) | архив ящика | mailstore | A | mailstore-10 | todo | CTR-35,MS-14 |
@@ -315,8 +315,8 @@
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
 | [CTR-28](CTR-28.md) | Outbound в контрактах | contracts | B | contracts-16 | done | SMTP-06 |
-| [CTR-29](CTR-29.md) | move_to сохраняет MessageId | contracts | B | contracts-17 | ready | CTR-05 |
-| [CTR-30](CTR-30.md) | хранилище Identity и EmailSubmission | contracts | B | contracts-18 | ready | CTR-28 |
+| [CTR-29](CTR-29.md) | move_to сохраняет MessageId | contracts | B | contracts-17 | done | CTR-05 |
+| [CTR-30](CTR-30.md) | хранилище Identity и EmailSubmission | contracts | B | contracts-18 | done | CTR-28 |
 | [JMAP-12](JMAP-12.md) | владелец загруженного blob | jmap | A | jmap-06 | done | JMAP-06 |
 
 ## Ф1 · Отчёты admin-02 (#174) и blob-06 (#175)
@@ -324,16 +324,16 @@
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
 | [PLT-18](PLT-18.md) | служебный HTTP — только внутренние адреса | platform | A | platform-08 | done | PLT-06 |
-| [CTR-31](CTR-31.md) | модерация групп рассылки — доставка одобренного письма | contracts | B | contracts-19 | ready | CTR-21 |
-| [CTR-32](CTR-32.md) | поиск учётной записи по external_id | contracts | B | contracts-20 | ready | CTR-05 |
+| [CTR-31](CTR-31.md) | модерация групп рассылки — доставка одобренного письма | contracts | B | contracts-19 | done | CTR-21 |
+| [CTR-32](CTR-32.md) | поиск учётной записи по external_id | contracts | B | contracts-20 | done | CTR-05 |
 | [MS-15](MS-15.md) | объекты писем через BlobWriter (сжатие) | mailstore | A | mailstore-09 | done | BLOB-13 |
 
 ## Ф1 · Остаток 2026-11-01 (отчёты imap-05, mailstore-09, app-02)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-33](CTR-33.md) | перенос в корзину снимает \Deleted | contracts | B | contracts-21 | ready | CTR-26 |
-| [APP-10](APP-10.md) | подключение после app-02 — корзина, сжатие, нагрузка | app | A | app-06 | ready | APP-04,IMAP-14,JMAP-11,MS-15 |
+| [CTR-33](CTR-33.md) | перенос в корзину снимает \Deleted | contracts | B | contracts-21 | done | CTR-26 |
+| [APP-10](APP-10.md) | подключение после app-02 — корзина, сжатие, нагрузка | app | A | app-06 | done | APP-04,IMAP-14,JMAP-11,MS-15 |
 | [JMAP-13](JMAP-13.md) | загрузка, совпавшая со сжатой частью письма | jmap | A | jmap-07 | done | JMAP-06,MS-15 |
 
 ## Ф1 · Находки CMP-01: проверка клиентом Postman 2026-11-05 (приоритет)
@@ -379,8 +379,8 @@
 | [JMAP-21](JMAP-21.md) | push — изменение всех типов по `Resync` | jmap | A | jmap-12 | done | CLU-13 |
 | [SYS-11](SYS-11.md) | проба Landlock без `/sys/kernel/security` | sys | A | sys-06 | done | SYS-07 |
 | [PLT-21](PLT-21.md) | doctor — проба Landlock; подпись метрики отставания шины | platform | A | platform-11 | ready | SYS-11,CLU-13 |
-| [APP-17](APP-17.md) | подключение журнала доставки, групп, обучения антиспама и защиты от перебора | app | A | app-16 | ready | SMTP-16,SMTP-17,SMTP-18,AUTH-08,APP-16 |
-| [APP-18](APP-18.md) | подключение транспорта организации и Rpc узла | app | A | app-17 | todo | SMTP-29,CLU-12,APP-15 |
+| [APP-17](APP-17.md) | подключение журнала доставки, групп, обучения антиспама и защиты от перебора | app | A | app-16 | done | SMTP-16,SMTP-17,SMTP-18,AUTH-08,APP-16 |
+| [APP-18](APP-18.md) | подключение транспорта организации и Rpc узла | app | A | app-17 | ready | SMTP-29,CLU-12,APP-15 |
 | [META-41](META-41.md) | слушатель сигналов и миграции при списке адресов СУБД | meta | A | meta-25 | ready | META-38 |
 | [CLU-14](CLU-14.md) | Rpc — идентичность узла по SAN, HTTP/2 | cluster | A | cluster-09 | ready | CLU-12 |
 | [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-20 | done | CTR-23,META-16 |
@@ -389,12 +389,13 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-41](CTR-41.md) | локальный токен первого администратора | contracts | B | contracts-29 | ready | CTR-23 |
-| [ADM-11](ADM-11.md) | `thepost admin init` — первый администратор | admin | A | admin-06 | todo | CTR-41 |
-| [APP-19](APP-19.md) | команда `thepost admin init` и локальный сокет | app | A | app-18 | todo | ADM-11 |
-| [CTR-42](CTR-42.md) | хранилище отправок JMAP (отложенная отправка и отмена) | contracts | B | contracts-30 | todo | CTR-28 |
-| [META-42](META-42.md) | системные папки — только по роли, суффикс при совпадении имени | meta | A | meta-26 | ready | CMP-05 |
-| [KIT-08](KIT-08.md) | фейк ящика — системные папки только по роли | testkit | A | testkit-05 | ready | KIT-07 |
+| [CTR-41](CTR-41.md) | локальный токен первого администратора | contracts | B | contracts-29 | done | CTR-23 |
+| [ADM-11](ADM-11.md) | `thepost admin init` — первый администратор | admin | A | admin-06 | done | CTR-41 |
+| [APP-19](APP-19.md) | команда `thepost admin init` и локальный сокет | app | A | app-18 | done | ADM-11 |
+| [META-43](META-43.md) | локальные токены Admin API в PostgreSQL, подключение `admin init` | meta | B | meta-27 | done | CTR-41,ADM-11,APP-19 |
+| [CTR-42](CTR-42.md) | хранилище отправок JMAP (отложенная отправка и отмена) | contracts | B | contracts-30 | ready | CTR-28 |
+| [META-42](META-42.md) | системные папки — только по роли, суффикс при совпадении имени | meta | A | meta-26 | done | CMP-05 |
+| [KIT-08](KIT-08.md) | фейк ящика — системные папки только по роли | testkit | A | testkit-05 | done | KIT-07 |
 | [AUTH-11](AUTH-11.md) | `auth.abuse.fail_closed` | auth | A | auth-06 | ready | AUTH-08 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-10 | done | CLU-09 |
 
@@ -402,7 +403,7 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [DEPS-01](DEPS-01.md) | обновить calamine и libsqlite3-sys, сократить пропуски cargo audit | deps | B | deps-01 | todo | CI-03 |
+| [DEPS-01](DEPS-01.md) | обновить calamine и libsqlite3-sys, сократить пропуски cargo audit | deps | B | deps-01 | ready | CI-03 |
 
 ## Вне волн
 
