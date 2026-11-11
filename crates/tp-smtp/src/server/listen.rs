@@ -133,6 +133,7 @@ fn current(rx: &ConfigRx) -> Option<Arc<SmtpConfig>> {
     rx.borrow().clone().downcast::<SmtpConfig>().ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: Listener,
     mode: Mode,
