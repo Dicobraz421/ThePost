@@ -11,7 +11,7 @@
   ansible.builtin.copy:
     dest: /etc/chrony/sources.d/thepost.sources
     content: |
-      # {{ ansible_managed }}
+      # Управляется Ansible (роль chrony, thepost_ntp_servers).
       {% for server in thepost_ntp_servers %}
       server {{ server }} iburst
       {% endfor %}
