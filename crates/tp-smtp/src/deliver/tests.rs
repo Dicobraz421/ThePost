@@ -60,6 +60,7 @@ fn dir_account(id: &str, login: &str, emails: &[&str]) -> DirAccount {
         emails: emails.iter().map(|e| (*e).to_owned()).collect(),
         enabled: true,
         attributes: BTreeMap::new(),
+        org: Default::default(),
     }
 }
 

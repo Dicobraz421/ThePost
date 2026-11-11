@@ -77,6 +77,31 @@ pub struct AccountUpsert {
     pub enabled: bool,
 }
 
+/// Состояние ящика учётной записи (CTR-35, решение 2026-11-04-exchange-parity «Удалённые ящики»).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum AccountState {
+    /// Действует.
+    Active,
+    /// Отключён: учётная запись исчезла из каталога (или отключена администратором). Вход запрещён и почта не
+    /// принимается независимо от `Account::enabled`, ящика нет в GAL; ящик хранится до `until`, затем удаляется
+    /// окончательно (через `DecisionHooks::before_final_delete`), до срока — восстанавливается, подключается к другой
+    /// учётной записи или выгружается.
+    Disabled {
+        /// Срок хранения отключённого ящика (по умолчанию — 30 дней от отключения, политика синхронизации).
+        until: OffsetDateTime,
+    },
+}
+
+/// Отключённый ящик со сроком хранения.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisabledAccount {
+    /// Учётная запись.
+    pub account: Account,
+    /// Срок хранения.
+    pub until: OffsetDateTime,
+}
+
 /// Использование квоты учётной записи.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct QuotaUsage {
@@ -130,6 +155,85 @@ pub trait AccountStore: Send + Sync + 'static {
 
     /// Использование квоты.
     async fn quota(&self, tenant: TenantId, id: AccountId) -> Result<QuotaUsage>;
+
+    /// Состояние ящика (CTR-35); нет учётной записи — `Error::NotFound`. По умолчанию — через [`AccountStore::get`],
+    /// всегда [`AccountState::Active`] (хранилище без отключения ящиков).
+    async fn account_state(&self, tenant: TenantId, id: AccountId) -> Result<AccountState> {
+        match self.get(tenant, id).await? {
+            Some(_) => Ok(AccountState::Active),
+            None => Err(Error::NotFound),
+        }
+    }
+
+    /// Отключает ящик до `until` (повторно — срок заменяется); `upsert` состояние не меняет. Нет учётной записи —
+    /// `Error::NotFound`. По умолчанию — `Error::Internal`.
+    async fn disable_account(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        until: OffsetDateTime,
+    ) -> Result<()> {
+        let _ = (tenant, id, until);
+        Err(Error::internal(
+            "AccountStore::disable_account не реализован",
+        ))
+    }
+
+    /// Восстанавливает отключённый ящик ([`AccountState::Active`]; действующий — без изменений). Нет учётной записи —
+    /// `Error::NotFound`. По умолчанию — `Error::Internal`.
+    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        let _ = (tenant, id);
+        Err(Error::internal(
+            "AccountStore::restore_account не реализован",
+        ))
+    }
+
+    /// Отключённые ящики организации по (`until`, `id`) — список Admin API. По умолчанию — `Error::Internal`.
+    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
+        let _ = tenant;
+        Err(Error::internal(
+            "AccountStore::disabled_accounts не реализован",
+        ))
+    }
+
+    /// Отключённые ящики всех организаций со сроком хранения не позже `now`, по (`until`, `id`), не более `limit` —
+    /// окончательное удаление (роль maintenance). По умолчанию — `Error::Internal`.
+    async fn expired_accounts(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<AccountScope>> {
+        let _ = (now, limit);
+        Err(Error::internal(
+            "AccountStore::expired_accounts не реализован",
+        ))
+    }
+
+    /// Подключает отключённый ящик `disabled` к учётной записи `to` (Connect-Mailbox Exchange): `disabled` получает
+    /// домен, вход, имя, `external_id` и `enabled` учётной записи `to` и становится действующим (папки, письма, права —
+    /// прежние), запись `to` удаляется. `disabled` действует — `Error::Invalid`; `to` отключена или в её ящике есть
+    /// письма — `Error::Conflict`; нет любой из записей — `Error::NotFound`. По умолчанию — `Error::Internal`.
+    async fn attach_account(
+        &self,
+        tenant: TenantId,
+        disabled: AccountId,
+        to: AccountId,
+    ) -> Result<Account> {
+        let _ = (tenant, disabled, to);
+        Err(Error::internal(
+            "AccountStore::attach_account не реализован",
+        ))
+    }
+
+    /// Окончательно удаляет отключённый ящик (учётную запись и папки) после удаления писем вызывающим (`MailStore`,
+    /// освобождение ссылок BLOB). Действующий — `Error::Invalid`; остались письма — `Error::Conflict`; нет —
+    /// `Error::NotFound`. По умолчанию — `Error::Internal`.
+    async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        let _ = (tenant, id);
+        Err(Error::internal(
+            "AccountStore::remove_disabled не реализован",
+        ))
+    }
 }
 
 // ---------- Папки ----------

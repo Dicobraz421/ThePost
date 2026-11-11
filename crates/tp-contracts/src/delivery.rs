@@ -172,6 +172,19 @@ pub trait DeliveryLog: Send + Sync + 'static {
     /// Удаляет записи старше `before` по всем организациям (роль maintenance). Реализация может удалять
     /// целыми сутками (секции): записи суток, на которые приходится `before`, могут остаться.
     async fn purge(&self, before: OffsetDateTime) -> Result<()>;
+
+    /// События записи очереди `queue` организации `tenant` по возрастанию `at` (равные — в порядке записи), не более
+    /// `limit` (≥ 1, иначе `Error::Invalid`) — статус доставки отправки (JMAP `EmailSubmission.deliveryStatus`, CTR-35;
+    /// связь — `EmailSubmission::queue`). По умолчанию — `Error::Internal`.
+    async fn by_queue(
+        &self,
+        tenant: TenantId,
+        queue: QueueId,
+        limit: usize,
+    ) -> Result<Vec<DeliveryEvent>> {
+        let _ = (tenant, queue, limit);
+        Err(Error::internal("delivery log does not support by_queue"))
+    }
 }
 
 #[cfg(test)]
