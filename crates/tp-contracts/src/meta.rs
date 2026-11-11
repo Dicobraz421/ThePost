@@ -93,6 +93,22 @@ pub enum AccountState {
     },
 }
 
+/// Что сделать с содержимым ящика учётной записи при подключении к ней отключённого ящика
+/// ([`AccountStore::attach_account`]; CTR-50, решение 44). Выбирает администратор.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExistingContent {
+    /// Оставить: письма ящика учётной записи переносятся в подключаемый ящик. Письмо системной папки — в папку
+    /// подключаемого ящика с той же ролью, остальные папки переносятся с иерархией; имя, занятое у того же
+    /// родителя (без учёта регистра ASCII), получает наименьший свободный суффикс: «Проекты 1», «Проекты 2»…
+    /// Письма корзины остаются в корзине со своими сроками, скрытые — скрытыми.
+    Keep,
+    /// Удалить: письма ящика учётной записи переносятся в корзину подключаемого ящика со сроком корзины по
+    /// политике (как `MessageStore::to_trash`; уже лежавшие в корзине — со своими сроками), папки не переносятся.
+    /// До срока письма восстанавливаются (`MessageStore::restore`): в папку с той же ролью, иначе во «Входящие».
+    Delete,
+}
+
 /// Отключённый ящик со сроком хранения.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisabledAccount {
@@ -211,15 +227,20 @@ pub trait AccountStore: Send + Sync + 'static {
 
     /// Подключает отключённый ящик `disabled` к учётной записи `to` (Connect-Mailbox Exchange): `disabled` получает
     /// домен, вход, имя, `external_id` и `enabled` учётной записи `to` и становится действующим (папки, письма, права —
-    /// прежние), запись `to` удаляется. `disabled` действует — `Error::Invalid`; `to` отключена или в её ящике есть
-    /// письма — `Error::Conflict`; нет любой из записей — `Error::NotFound`. По умолчанию — `Error::Internal`.
+    /// прежние), запись `to` удаляется. Письма ящика `to` (в том числе в корзине и скрытые) — по режиму `existing`
+    /// ([`ExistingContent`]; CTR-50, решение 44): переносятся в подключаемый ящик или в его корзину; перенос — часть
+    /// операции (ссылки на объекты BLOB организации не меняются), долгую операцию над большим ящиком Admin API ведёт
+    /// фоновой задачей (ADM-10). Без режима (`None`) ящик `to` должен быть пуст, иначе — `Error::Invalid` с подсказкой
+    /// выбрать режим. `disabled` действует — `Error::Invalid`; `to` отключена — `Error::Conflict`; нет любой из
+    /// записей — `Error::NotFound`. По умолчанию — `Error::Internal`.
     async fn attach_account(
         &self,
         tenant: TenantId,
         disabled: AccountId,
         to: AccountId,
+        existing: Option<ExistingContent>,
     ) -> Result<Account> {
-        let _ = (tenant, disabled, to);
+        let _ = (tenant, disabled, to, existing);
         Err(Error::internal(
             "AccountStore::attach_account не реализован",
         ))
@@ -789,6 +810,21 @@ mod tests {
         let q = MessageQuery::Uids(vec![Uid(1)..=Uid(5)]);
         let s = serde_json::to_string(&q).expect("serialize");
         assert_eq!(serde_json::from_str::<MessageQuery>(&s).expect("parse"), q);
+    }
+
+    /// Режим подключения ящика в Admin API — строки `keep`, `delete` (CTR-50).
+    #[test]
+    fn existing_content_serde() {
+        for (mode, text) in [
+            (ExistingContent::Keep, "\"keep\""),
+            (ExistingContent::Delete, "\"delete\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).expect("serialize"), text);
+            assert_eq!(
+                serde_json::from_str::<ExistingContent>(text).expect("parse"),
+                mode
+            );
+        }
     }
 
     #[test]

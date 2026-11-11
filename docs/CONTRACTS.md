@@ -81,9 +81,14 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   `until` (по умолчанию 30 дней — политика синхронизации). `account_state` (по умолчанию — через `get`, всегда `Active`),
   `disable_account(tenant, id, until)` (повтор — срок заменяется; `upsert` состояние не меняет), `restore_account`, `disabled_accounts(tenant)
   -> Vec<DisabledAccount { account, until }>` по (`until`, `id`), `expired_accounts(now, limit) -> Vec<AccountScope>` — все организации
-  (окончательное удаление через `before_final_delete`), `attach_account(tenant, disabled, to)` — подключение к учётной записи каталога
-  (Connect-Mailbox: `disabled` получает домен, вход, имя, `external_id`, `enabled` записи `to`, запись `to` удаляется; `disabled` действует —
-  `Invalid`, у `to` есть письма или она отключена — `Conflict`), `remove_disabled` — после удаления писем вызывающим (действующий —
+  (окончательное удаление через `before_final_delete`), `attach_account(tenant, disabled, to, existing: Option<ExistingContent>)` —
+  подключение к учётной записи каталога (Connect-Mailbox: `disabled` получает домен, вход, имя, `external_id`, `enabled` записи `to`,
+  запись `to` удаляется; `disabled` действует — `Invalid`, `to` отключена — `Conflict`). Письма ящика `to` — по режиму администратора
+  (CTR-50, решение 44): `ExistingContent::Keep` — в подключаемый ящик (системная папка — в папку той же роли, остальные — с иерархией,
+  занятое у родителя имя — с суффиксом « 1», « 2»…; корзина и скрытые — со своими сроками), `Delete` — в корзину подключаемого ящика
+  со сроком по политике, папки не переносятся; `MessageId` сохраняются, UID новые, ссылки BLOB не меняются; без режима и с письмами
+  в `to` — `Invalid` с подсказкой выбрать режим. Перенос — часть операции; долгую операцию Admin API ведёт фоновой задачей (ADM-10).
+  `remove_disabled` — после удаления писем вызывающим (действующий —
   `Invalid`, остались письма — `Conflict`). Методы, кроме `account_state`, по умолчанию — `Internal`. In-memory — `MemMetadata`; набор
   `suite::account_state`. PostgreSQL — META-33.
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
@@ -735,3 +740,8 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `tp-meta`: `enqueue` со справочником — на шард `owner`; `acquire` — по-прежнему основная БД (шард учёта BLOB требует учётной записи
   и в `commit_new`/`release`); `ShardDirectory::follow` сбрасывает кэш по `ShardsChanged`. In-memory `owner` не используют; набор
   `suite::signals` — с `ShardsChanged`.
+- 2026-11-12 — CTR-50 (x/contracts-36): `meta::ExistingContent::{Keep, Delete}` и `AccountStore::attach_account(.., existing:
+  Option<ExistingContent>)` — содержимое ящика учётной записи при подключении отключённого (решение 44): перенос в подключаемый ящик
+  (папки с суффиксом при совпадении имён) или в его корзину; без режима и с письмами — `Invalid` с подсказкой (было `Conflict`).
+  По сравнению с карточкой: перенос — часть операции хранилища, фоновую задачу ведёт Admin API (ADM-10). In-memory — `MemMetadata`;
+  набор `suite::account_state`. PostgreSQL — META-33.
