@@ -1197,7 +1197,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use serde_json::{Value, json};
+    use serde_json::Value;
     use sqlx::types::time::OffsetDateTime;
     use tp_admin::accounts::PolicyBody;
     use tp_admin::{AdminConfig, AdminRole, Deps, InitRequest, RoleBinding};
