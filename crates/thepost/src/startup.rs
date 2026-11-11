@@ -23,6 +23,8 @@ pub fn prepare_serve(path: &Path) -> Result<ConfineReport> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let paths = role_paths(&cfg, path);
     create_role_dirs(&paths, &prepared_dirs(&cfg))?;
+    // Локальный сокет `admin init` — до Landlock (APP-19).
+    crate::local_admin::bind(&cfg)?;
     confine(&cfg, paths, has_section(&text, "confine"))
 }
 

@@ -478,7 +478,11 @@ impl RoleSetup<'_> {
                     .section::<sections::AdminSection>(sections::ADMIN)?
                     .0
                     .clone();
-                let admin = Arc::new(self.services.admin(self.ext, cfg)?);
+                let admin = Arc::new(crate::local_admin::attach(
+                    self.services.admin(self.ext, cfg)?,
+                    self.services,
+                ));
+                crate::local_admin::serve(admin.clone());
                 let service = HttpRole::new(
                     role,
                     admin.router(),

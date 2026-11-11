@@ -9,7 +9,7 @@ use tp_contracts::Error;
 use tp_contracts::role::CancellationToken;
 use tp_platform::config::ENV_CONFIG_PATH;
 
-use crate::{doctor, secrets, sections, serve, verify};
+use crate::{doctor, local_admin, secrets, sections, serve, verify};
 
 /// Путь к config.yaml по умолчанию.
 pub const DEFAULT_CONFIG: &str = "/etc/thepost/config.yaml";
@@ -58,6 +58,32 @@ pub enum Command {
         /// Отчёт в JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Администрирование узла через локальный сокет.
+    Admin {
+        /// Действие.
+        #[command(subcommand)]
+        action: AdminAction,
+    },
+}
+
+/// Действия администрирования.
+#[derive(Debug, Subcommand)]
+pub enum AdminAction {
+    /// Первый администратор без OIDC: учётная запись, пароль и одноразовый токен Admin API (выводятся один раз).
+    Init {
+        /// Адрес администратора (по умолчанию — admin@<domain из config.yaml>).
+        #[arg(long)]
+        email: Option<String>,
+        /// Отображаемое имя.
+        #[arg(long)]
+        name: Option<String>,
+        /// Повтор при уже заведённом администраторе (с записью в аудит).
+        #[arg(long)]
+        force: bool,
+        /// Путь сокета узла (по умолчанию — admin.init.socket).
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -158,6 +184,23 @@ pub async fn run(cli: Cli) -> i32 {
             }
             Err(e) => fail(&e),
         },
+        Command::Admin {
+            action:
+                AdminAction::Init {
+                    email,
+                    name,
+                    force,
+                    socket,
+                },
+        } => {
+            let args = local_admin::InitArgs {
+                email,
+                name,
+                force,
+                socket,
+            };
+            local_admin::command(&path, args).await
+        }
         Command::Serve => serve_until_signal(path).await,
         Command::SearchExtract => {
             // Подпроцесс запускается до рантайма (`main`): сюда приходит только вызов из кода.
