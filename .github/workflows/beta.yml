@@ -188,26 +188,25 @@ jobs:
       contents: write
       id-token: write
     env:
-      DIST: ${{ runner.temp }}/dist
       TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: ${{ env.DIST }}
+          path: ${{ runner.temp }}/dist
           merge-multiple: true
       - name: SBOM (SPDX по Cargo.lock)
         uses: anchore/sbom-action@v0
         with:
           path: .
           format: spdx-json
-          output-file: ${{ env.DIST }}/thepost-${{ env.TAG }}.spdx.json
+          output-file: ${{ runner.temp }}/dist/thepost-${{ env.TAG }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
       - uses: sigstore/cosign-installer@v4
       - name: Подпись архивов и SBOM
         shell: bash
-        working-directory: ${{ env.DIST }}
+        working-directory: ${{ runner.temp }}/dist
         run: |
           for f in *.tar.gz *.spdx.json; do
             cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
@@ -221,6 +220,7 @@ jobs:
           SHA: ${{ github.sha }}
           IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
           IMAGE: ${{ needs.image.outputs.ref }}
+          DIST: ${{ runner.temp }}/dist
         run: |
           ls -l "$DIST"
           # Описание выпуска: проверка подписи (CI-03); автозаметки GitHub добавляются после него.
