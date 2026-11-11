@@ -10,7 +10,6 @@
 - **Имя сервера** (например, `mail.example.ru`) и **почтовый домен** (`example.ru`), доступ к их DNS.
 - **Открытые порты**: 25 (приём почты), 465 и 587 (отправка), 993 и 143 (IMAP), 443 (JMAP, автонастройка),
   80 (только для выпуска сертификата Let's Encrypt).
-- Все требования к окружению и тонкости настройки (кодировка базы UTF-8 и др.) — [PREREQUISITES.md](PREREQUISITES.md).
 
 Все внутренние компоненты ставятся вместе с сервером: PostgreSQL (метаданные), OpenBao (секреты), Rspamd (антиспам).
 
@@ -181,97 +180,7 @@ smtp:
   миграции базы применятся сами.
 - **Docker Compose** — `git pull` и `… --profile smb up -d --build`.
 
-Перед обновлением рабочего сервера сделайте внеочередную копию: `sudo systemctl start thepost-backup@full` (см. ниже).
-
-## Резервное копирование и восстановление
-
-Плейбук `smb.yml` сам включает резервное копирование (`thepost_backup: true`, отключить — `false`) готовыми
-средствами по таймерам systemd:
-
-- **база** (PostgreSQL) — [pgBackRest](https://pgbackrest.org/): журнал изменений (WAL) уходит в копию непрерывно,
-  не реже раза в минуту; полная копия — в ночь на воскресенье, разностная — в остальные ночи. Восстановить можно
-  состояние на любой момент за последние `thepost_backup_retention_days` суток (по умолчанию 7);
-- **каталог писем** (`/var/lib/thepost/blob`, тела писем) — [restic](https://restic.net/) (по умолчанию: снимки,
-  шифрование) или rsync (`thepost_backup_blob_tool: rsync`, зеркало): каждый час и после каждой копии базы.
-
-Где лежат копии:
-
-| Параметр инвентаря | По умолчанию | Что это |
-|---|---|---|
-| `thepost_backup_repo` | `posix` | `posix` — каталог на сервере, `s3` — объектное хранилище S3 (только HTTPS) |
-| `thepost_backup_repo_path` | `/var/lib/pgbackrest` | каталог копий базы (или префикс в бакете S3) |
-| `thepost_backup_s3_endpoint`, `thepost_backup_s3_bucket` | — | адрес S3 (`https://…`) и бакет |
-| `thepost_backup_restic_repo` | `/var/backups/thepost/restic` | копии писем restic: каталог или `s3:https://<адрес>/<бакет>/<префикс>` |
-| `thepost_backup_rsync_dest` | `/var/backups/thepost/blob-mirror` | зеркало rsync: каталог или `user@host:каталог` (SSH) |
-| `thepost_backup_blob_schedule` | `hourly` | как часто копировать письма (пусто — только после копий базы) |
-
-**Копия на том же диске не спасёт при отказе диска**: подключите к этим каталогам отдельный диск или сетевой том,
-или храните копии в S3.
-
-**Ключи.** Копии базы шифруются (AES-256), репозиторий restic — тоже. Ключ шифрования и пароль restic плейбук
-создаёт в OpenBao при первом запуске (`thepost-backup/pgbackrest`, `thepost-backup/restic`; узлу The Post они
-недоступны), на сервере они лежат только зашифрованными (`systemd-creds`). Ключи S3 положите в OpenBao сами — на
-сервере, с токеном администратора OpenBao (root-токен — в `/root/openbao-init.json`, пока вы его не перенесли):
-
-```bash
-export BAO_ADDR=https://localhost:8200 BAO_CACERT=/etc/openbao/tls/ca.pem BAO_TOKEN=…
-bao kv put -mount=thepost-backup s3 access_key_id=… secret_access_key=…
-```
-
-**Сохраните ключ шифрования и пароль restic вне сервера** (рядом с ключами восстановления OpenBao): если сервер
-потерян целиком, без них копии не прочитать.
-
-```bash
-bao kv get -mount=thepost-backup -field=cipher_pass pgbackrest
-bao kv get -mount=thepost-backup -field=password restic
-```
-
-Проверка на сервере (от root):
-
-```bash
-systemctl list-timers 'thepost-backup*'      # расписание
-thepost-pgbackrest info                      # копии базы и архив WAL
-thepost-restic snapshots                     # снимки каталога писем
-journalctl -u 'thepost-backup*' --since today
-systemctl start thepost-backup@full          # внеочередная полная копия (затем — копия писем)
-```
-
-### Восстановление
-
-С управляющей машины — на момент `T` (время с часовым поясом; без `thepost_restore_target` — последнее состояние):
-
-```bash
-ansible-playbook -i inventory.yml deploy/ansible/restore.yml -e thepost_restore_confirm=true \
-  -e "thepost_restore_target='2026-11-11 18:00:00+03'"
-```
-
-Плейбук останавливает узел и таймеры копий, возвращает базу на момент `T`, кладёт каталог писем из первой копии,
-сделанной после `T` (без `T` — из последней; другой снимок — `-e thepost_restore_blob_snapshot=<ID>`), поверх текущего, выставляет пароли учётных записей СУБД из OpenBao, запускает узел и проверяет `thepost verify`:
-если у какого-то письма нет тела, плейбук остановится с ошибкой. Лишние тела (письма, пришедшие после `T`) удалит
-`thepost verify --fix` в том же прогоне, если им больше суток, иначе — позже сам узел (поиск «сирот»). В конце —
-новая полная копия.
-
-Почему копия писем, сделанная после `T`, подходит: тело письма удаляется с диска не раньше окна W после удаления
-последнего письма, которое на него ссылается (`blob.gc.window`, по умолчанию — глубина восстановления + 8 суток;
-SRS 3.5). Поэтому потерять можно только письма, пришедшие после последней копии каталога писем (по умолчанию —
-за последний час), и только при потере самого диска: `thepost verify` покажет их как повреждённые. Пустой или
-пропавший каталог писем таймер не копирует. При потере диска указывайте `T` — момент перед потерей.
-
-**Новый сервер вместо потерянного:**
-
-1. Установите The Post без копирования: `ansible-playbook … smb.yml -e thepost_backup=false`.
-2. Сделайте копии доступными по тем же путям (подключите диск с копиями) или укажите тот же S3.
-3. Положите сохранённые ключи в OpenBao нового сервера:
-
-   ```bash
-   bao secrets enable -path=thepost-backup -version=2 kv
-   bao kv put -mount=thepost-backup pgbackrest cipher_pass=…
-   bao kv put -mount=thepost-backup restic password=…
-   # S3 — как выше: bao kv put -mount=thepost-backup s3 …
-   ```
-
-4. Запустите `restore.yml`, как выше: он сам поставит средства копирования, восстановит базу и письма и включит
-   таймеры; дальше `smb.yml` — как обычно.
+Перед обновлением рабочего сервера сделайте резервную копию PostgreSQL и каталога писем.
 
 ## Проверка подписи
 
