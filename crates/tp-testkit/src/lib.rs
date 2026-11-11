@@ -49,7 +49,7 @@ pub use infra::{
 pub use load::MemLoadMonitor;
 pub use membership::MemMembership;
 pub use meta::MemMetadata;
-pub use outbound::MemOutbound;
+pub use outbound::{MemOutbound, Queued, Scheduled};
 pub use policies::{MemPolicies, PolicyLevel};
 pub use rpc::{MemRpc, MemRpcNet};
 pub use secrets::MemSecretStore;

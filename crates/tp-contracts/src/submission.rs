@@ -1,10 +1,19 @@
 //! Учёт отправок (JMAP EmailSubmission, RFC 8621 §7; CTR-30; CONTRACTS.md#Identity и EmailSubmission).
 //!
 //! Запись отправки: письмо, адрес отправителя ([`crate::identity::Identity`]), конверт, момент отправки, состояние
-//! отмены (`undoStatus`) и статусы получателей (`deliveryStatus`). Отправка с задержкой (`sendAt` в будущем) —
-//! [`UndoStatus::Pending`]: до момента отправки её можно отменить ([`SubmissionStore::cancel`]); воркер отложенной
-//! отправки берёт наступившие ([`SubmissionStore::due`]), ставит письмо в очередь ([`crate::queue::Outbound`]) и
-//! фиксирует [`SubmissionStore::finalize`]. Сразу отправленное письмо записывается с [`UndoStatus::Final`].
+//! отмены (`undoStatus`) и статусы получателей (`deliveryStatus`). Сразу отправленное письмо записывается с
+//! [`UndoStatus::Final`].
+//!
+//! # Отложенная отправка и отмена (CTR-42, решение владельца #195)
+//!
+//! Отправка с задержкой (`sendAt` в будущем, не дальше `maxDelayedSend` из конфигурации `tp-jmap`) ставит письмо в
+//! очередь сразу со сроком выпуска ([`crate::queue::Outbound::schedule`]) и записывается [`UndoStatus::Pending`] с
+//! `queue`. Отмена (`undoStatus: canceled`) — сначала [`crate::queue::Outbound::cancel_scheduled`] (письмо уже выпущено —
+//! `Conflict`, JMAP `cannotUnsend`), затем [`SubmissionStore::cancel`]. Наступившие отправки ([`SubmissionStore::due`])
+//! фиксирует [`SubmissionStore::finalize`]; статусы доставки — журнал доставки по записи очереди
+//! (`DeliveryLog::by_queue`). Выборка — [`SubmissionStore::query_submissions`] ([`SubmissionFilter`], RFC 8621 §7.3),
+//! изменения для `EmailSubmission/changes` и `queryChanges` — [`SubmissionStore::submission_changes`], срок хранения
+//! завершённых и отменённых — [`SubmissionStore::expire_submissions`] (роль maintenance).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -77,6 +86,53 @@ impl EmailSubmission {
     }
 }
 
+/// Условие выборки отправок (JMAP `EmailSubmission/query`, FilterCondition RFC 8621 §7.3); `None` — без условия,
+/// условия объединяются по «и». `threadIds` вызывающий переводит в `email_ids` (письма цепочки).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SubmissionFilter {
+    /// Адрес отправителя — один из (`identityIds`).
+    pub identity_ids: Option<Vec<String>>,
+    /// Письмо — одно из (`emailIds`, `threadIds`).
+    pub email_ids: Option<Vec<MessageId>>,
+    /// Состояние отмены (`undoStatus`).
+    pub undo_status: Option<UndoStatus>,
+    /// `send_at` раньше (`before`, не включительно).
+    pub before: Option<OffsetDateTime>,
+    /// `send_at` не раньше (`after`, включительно).
+    pub after: Option<OffsetDateTime>,
+}
+
+impl SubmissionFilter {
+    /// Отправка удовлетворяет условиям.
+    pub fn matches(&self, s: &EmailSubmission) -> bool {
+        self.identity_ids
+            .as_ref()
+            .is_none_or(|ids| ids.contains(&s.identity))
+            && self
+                .email_ids
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&s.email))
+            && self.undo_status.is_none_or(|u| u == s.undo_status)
+            && self.before.is_none_or(|t| s.send_at < t)
+            && self.after.is_none_or(|t| s.send_at >= t)
+    }
+}
+
+/// Изменения отправок учётной записи после состояния (JMAP `EmailSubmission/changes`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SubmissionChanges {
+    /// Созданные после `since` и существующие (по возрастанию).
+    pub created: Vec<String>,
+    /// Изменённые, существовавшие в `since` (по возрастанию).
+    pub updated: Vec<String>,
+    /// Удалённые, существовавшие в `since` (по возрастанию); созданные и удалённые после `since` не входят.
+    pub destroyed: Vec<String>,
+    /// Состояние, до которого учтены изменения.
+    pub new_state: u64,
+    /// Учтены не все изменения: повторить с `new_state`.
+    pub has_more: bool,
+}
+
 /// Хранилище отправок учётной записи. Реализация — `tp-meta` (карточка meta); in-memory — `tp-testkit`.
 #[async_trait]
 pub trait SubmissionStore: Send + Sync + 'static {
@@ -120,6 +176,43 @@ pub trait SubmissionStore: Send + Sync + 'static {
 
     /// Состояние отправок учётной записи (JMAP `state`): растёт при каждом изменении, у новой — 0.
     async fn state(&self, scope: AccountScope) -> Result<u64>;
+
+    /// Отправки учётной записи, удовлетворяющие `filter`, по `send_at`, затем по `id` (CTR-42; сортировка JMAP и
+    /// страницы — у вызывающего). По умолчанию — [`SubmissionStore::list`] с фильтром.
+    async fn query_submissions(
+        &self,
+        scope: AccountScope,
+        filter: &SubmissionFilter,
+    ) -> Result<Vec<EmailSubmission>> {
+        let mut all = self.list(scope).await?;
+        all.retain(|s| filter.matches(s));
+        Ok(all)
+    }
+
+    /// Изменения после состояния `since` (CTR-42): не более `limit` отправок (`limit` ≥ 1, иначе `Error::Invalid`),
+    /// остальные — `has_more`. Состояние больше текущего или старше хранимой истории — `Error::Conflict` (JMAP
+    /// `cannotCalculateChanges`). По умолчанию — `Error::Internal`.
+    async fn submission_changes(
+        &self,
+        scope: AccountScope,
+        since: u64,
+        limit: usize,
+    ) -> Result<SubmissionChanges> {
+        let _ = (scope, since, limit);
+        Err(Error::internal(
+            "SubmissionStore::submission_changes не реализован",
+        ))
+    }
+
+    /// Срок хранения (CTR-42): удаляет [`UndoStatus::Final`] и [`UndoStatus::Canceled`] с `send_at` раньше `before` во
+    /// всех организациях, не более `limit`; состояние учётных записей растёт, удалённые — в `destroyed` изменений.
+    /// Возвращает число удалённых. По умолчанию — `Error::Internal`.
+    async fn expire_submissions(&self, before: OffsetDateTime, limit: usize) -> Result<usize> {
+        let _ = (before, limit);
+        Err(Error::internal(
+            "SubmissionStore::expire_submissions не реализован",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +271,40 @@ mod tests {
         ];
         for s in bad {
             assert!(s.validate().is_err(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn filter() {
+        let s = submission();
+        assert!(SubmissionFilter::default().matches(&s));
+        let f = SubmissionFilter {
+            identity_ids: Some(vec!["home".into(), "work".into()]),
+            email_ids: Some(vec![s.email]),
+            undo_status: Some(UndoStatus::Pending),
+            before: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+            after: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+        assert!(f.matches(&s));
+        for bad in [
+            SubmissionFilter {
+                identity_ids: Some(vec!["home".into()]),
+                ..SubmissionFilter::default()
+            },
+            SubmissionFilter {
+                email_ids: Some(vec![]),
+                ..SubmissionFilter::default()
+            },
+            SubmissionFilter {
+                undo_status: Some(UndoStatus::Final),
+                ..SubmissionFilter::default()
+            },
+            SubmissionFilter {
+                before: Some(OffsetDateTime::UNIX_EPOCH),
+                ..SubmissionFilter::default()
+            },
+        ] {
+            assert!(!bad.matches(&s), "{bad:?}");
         }
     }
 

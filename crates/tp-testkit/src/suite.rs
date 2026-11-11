@@ -67,7 +67,7 @@ use tp_contracts::role::Role;
 use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
 use tp_contracts::secrets::{SecretLease, SecretRef, SecretStore};
 use tp_contracts::senders::{SenderList, SenderLists, SenderVerdict};
-use tp_contracts::submission::{EmailSubmission, SubmissionStore, UndoStatus};
+use tp_contracts::submission::{EmailSubmission, SubmissionFilter, SubmissionStore, UndoStatus};
 use tp_contracts::transport::{
     AcceptedDomain, AddressPattern, DestinationPolicy, DomainKind, EnvelopeSide, RewriteRule,
     SourceKind, SourceMatch, TenantTransport, TlsRequirement, TransportStore, TrustedSource,
@@ -4219,4 +4219,186 @@ pub async fn delivery_by_queue(log: &dyn DeliveryLog, fx: &DeliveryFixture) {
         .expect("foreign");
     let kinds: Vec<_> = foreign.iter().map(|e| e.kind).collect();
     assert_eq!(kinds, [K::Dsn]);
+}
+
+// ---------- Отложенная отправка JMAP (CTR-42) ----------
+
+/// Набор проверок выборки, изменений и срока хранения [`SubmissionStore`] (CTR-42): `query_submissions` по условиям
+/// RFC 8621 §7.3, `submission_changes` (созданные, изменённые, удалённые; созданные и удалённые после `since` не
+/// входят; `limit` и `has_more`; неизвестное состояние — `Conflict`), `expire_submissions` (только завершённые и
+/// отменённые старше срока). Моменты отправок — в 1971 году: срок хранения набора не задевает чужие записи.
+pub async fn submission_query(
+    store: &dyn SubmissionStore,
+    owner: AccountScope,
+    peer: AccountScope,
+) {
+    let t0 = OffsetDateTime::UNIX_EPOCH + time::Duration::days(400);
+    let day = time::Duration::days;
+    let sub =
+        |id: &str, identity: &str, send_at: OffsetDateTime, undo: UndoStatus| EmailSubmission {
+            id: id.into(),
+            identity: identity.into(),
+            email: MessageId::new(),
+            mail_from: "anna@example.org".into(),
+            rcpt_to: vec!["b@example.com".into()],
+            send_at,
+            undo_status: undo,
+            delivery: Vec::new(),
+            queue: Some(QueueId::new()),
+        };
+    let s0 = store.state(owner).await.expect("state");
+    let a = sub("a", "work", t0 + day(1), UndoStatus::Pending);
+    let b = sub("b", "work", t0, UndoStatus::Final);
+    let c = sub("c", "home", t0 + day(2), UndoStatus::Pending);
+    for s in [&a, &b, &c] {
+        store.insert(owner, s.clone()).await.expect("insert");
+    }
+    let ids = |v: Vec<EmailSubmission>| v.into_iter().map(|s| s.id).collect::<Vec<_>>();
+    let query =
+        async |f: SubmissionFilter| ids(store.query_submissions(owner, &f).await.expect("query"));
+    assert_eq!(query(SubmissionFilter::default()).await, ["b", "a", "c"]);
+    let pending = SubmissionFilter {
+        undo_status: Some(UndoStatus::Pending),
+        ..SubmissionFilter::default()
+    };
+    assert_eq!(query(pending).await, ["a", "c"]);
+    let home = SubmissionFilter {
+        identity_ids: Some(vec!["home".into()]),
+        ..SubmissionFilter::default()
+    };
+    assert_eq!(query(home).await, ["c"]);
+    let by_email = SubmissionFilter {
+        email_ids: Some(vec![b.email, c.email]),
+        ..SubmissionFilter::default()
+    };
+    assert_eq!(query(by_email).await, ["b", "c"]);
+    let window = SubmissionFilter {
+        after: Some(t0 + day(1)),
+        before: Some(t0 + day(2)),
+        ..SubmissionFilter::default()
+    };
+    assert_eq!(query(window).await, ["a"]);
+    let alien = store
+        .query_submissions(peer, &SubmissionFilter::default())
+        .await
+        .expect("peer");
+    assert!(
+        alien
+            .iter()
+            .all(|s| !["a", "b", "c"].contains(&s.id.as_str()))
+    );
+
+    // Изменения: созданные после s0.
+    let ch = store
+        .submission_changes(owner, s0, 100)
+        .await
+        .expect("changes");
+    assert_eq!(
+        (ch.created.as_slice(), ch.updated.len(), ch.destroyed.len()),
+        (["a", "b", "c"].map(String::from).as_slice(), 0, 0)
+    );
+    let s1 = store.state(owner).await.expect("s1");
+    assert_eq!((ch.new_state, ch.has_more), (s1, false));
+
+    // Отмена, фиксация, удаление; созданная и удалённая после s1 не входит.
+    store.cancel(owner, "a").await.expect("cancel");
+    store
+        .finalize(owner, "c", vec![], c.queue)
+        .await
+        .expect("finalize");
+    store.delete(owner, "b").await.expect("delete");
+    store
+        .insert(owner, sub("tmp", "work", t0, UndoStatus::Final))
+        .await
+        .expect("tmp");
+    store.delete(owner, "tmp").await.expect("delete tmp");
+    let ch = store
+        .submission_changes(owner, s1, 100)
+        .await
+        .expect("changes s1");
+    assert!(ch.created.is_empty());
+    assert_eq!(ch.updated, ["a", "c"]);
+    assert_eq!(ch.destroyed, ["b"]);
+    let s2 = store.state(owner).await.expect("s2");
+    assert_eq!(ch.new_state, s2);
+
+    // По одной: `has_more` до последней порции, итог — тот же.
+    let (mut since, mut all) = (s1, Vec::new());
+    loop {
+        let part = store
+            .submission_changes(owner, since, 1)
+            .await
+            .expect("part");
+        let n = part.created.len() + part.updated.len() + part.destroyed.len();
+        assert!(n <= 1, "limit 1: {part:?}");
+        all.extend(part.updated);
+        all.extend(part.destroyed);
+        since = part.new_state;
+        if !part.has_more {
+            break;
+        }
+    }
+    all.sort_unstable();
+    assert_eq!(all, ["a", "b", "c"]);
+    assert_eq!(since, s2);
+    assert_eq!(
+        store.submission_changes(owner, s2 + 1, 10).await,
+        Err(Error::Conflict)
+    );
+    assert!(matches!(
+        store.submission_changes(owner, s1, 0).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Срок хранения: отменённая `a` и завершённая `c` старше срока удаляются, ждущая и новая — нет.
+    let waiting = sub("w", "work", t0, UndoStatus::Pending);
+    store.insert(owner, waiting).await.expect("waiting");
+    let fresh = sub("fresh", "work", t0 + day(30), UndoStatus::Final);
+    store.insert(peer, fresh).await.expect("fresh");
+    let s3 = store.state(owner).await.expect("s3");
+    let removed = store
+        .expire_submissions(t0 + day(10), 10_000)
+        .await
+        .expect("expire");
+    assert!(removed >= 2, "removed {removed}");
+    assert_eq!(store.get(owner, "a").await.expect("a"), None);
+    assert_eq!(store.get(owner, "c").await.expect("c"), None);
+    assert!(store.get(owner, "w").await.expect("w").is_some());
+    assert!(store.get(peer, "fresh").await.expect("fresh").is_some());
+    let ch = store
+        .submission_changes(owner, s3, 100)
+        .await
+        .expect("after expire");
+    assert_eq!(ch.destroyed, ["a", "c"]);
+    store.cancel(owner, "w").await.expect("cleanup w");
+}
+
+/// Набор проверок отложенной отправки [`Outbound`] (CTR-42): `schedule` возвращает запись очереди, `cancel_scheduled`
+/// до выпуска удаляет её (повтор и чужая организация — `NotFound`). `release_at` — в будущем относительно часов
+/// реализации.
+pub async fn outbound_schedule(
+    ob: &dyn Outbound,
+    tenant: TenantId,
+    rcpts: &[String],
+    release_at: OffsetDateTime,
+) {
+    let raw = Bytes::from_static(b"Subject: later\r\n\r\nbody\r\n");
+    let id = ob
+        .schedule(tenant, "anna@example.org", rcpts, raw.clone(), release_at)
+        .await
+        .expect("schedule");
+    assert_eq!(
+        ob.cancel_scheduled(TenantId::new(), id).await,
+        Err(Error::NotFound)
+    );
+    ob.cancel_scheduled(tenant, id).await.expect("cancel");
+    assert_eq!(ob.cancel_scheduled(tenant, id).await, Err(Error::NotFound));
+    let other = ob
+        .schedule(tenant, "anna@example.org", rcpts, raw, release_at)
+        .await
+        .expect("schedule again");
+    assert_ne!(other, id);
+    ob.cancel_scheduled(tenant, other)
+        .await
+        .expect("cancel other");
 }
