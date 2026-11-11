@@ -256,6 +256,7 @@ blob:
                 .expect("parse");
         let Command::Admin {
             action: AdminAction::Init { email, force, .. },
+            ..
         } = cli.command
         else {
             panic!("{:?}", cli.command)

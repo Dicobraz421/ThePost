@@ -1,4 +1,4 @@
-//! Командная строка `thepost` (APP-01..03).
+//! Командная строка `thepost` (APP-01..03; `thepost admin` — APP-19, APP-11).
 //!
 //! Путь к config.yaml — `--config`, иначе переменная `THEPOST_CONFIG`, иначе `/etc/thepost/config.yaml`.
 
@@ -9,7 +9,7 @@ use tp_contracts::Error;
 use tp_contracts::role::CancellationToken;
 use tp_platform::config::ENV_CONFIG_PATH;
 
-use crate::{doctor, local_admin, secrets, sections, serve, verify};
+use crate::{admin_client, doctor, local_admin, secrets, sections, serve, verify};
 
 /// Путь к config.yaml по умолчанию.
 pub const DEFAULT_CONFIG: &str = "/etc/thepost/config.yaml";
@@ -59,8 +59,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Администрирование узла через локальный сокет.
+    /// Администрирование: первый администратор (локальный сокет узла) и команды Admin API.
     Admin {
+        /// Подключение к Admin API.
+        #[command(flatten)]
+        api: admin_client::ApiArgs,
         /// Действие.
         #[command(subcommand)]
         action: AdminAction,
@@ -85,6 +88,9 @@ pub enum AdminAction {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Команды Admin API: `thepost admin <ресурс> <действие>`.
+    #[command(flatten)]
+    Api(admin_client::ApiAction),
 }
 
 /// Действия с конфигурацией.
@@ -192,6 +198,7 @@ pub async fn run(cli: Cli) -> i32 {
                     force,
                     socket,
                 },
+            ..
         } => {
             let args = local_admin::InitArgs {
                 email,
@@ -201,6 +208,10 @@ pub async fn run(cli: Cli) -> i32 {
             };
             local_admin::command(&path, args).await
         }
+        Command::Admin {
+            api,
+            action: AdminAction::Api(action),
+        } => admin_client::command(&path, api, action).await,
         Command::Serve => serve_until_signal(path).await,
         Command::SearchExtract => {
             // Подпроцесс запускается до рантайма (`main`): сюда приходит только вызов из кода.
