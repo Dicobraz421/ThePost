@@ -13,7 +13,7 @@
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
 | Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 139/167 | 208/247 | в работе, 84 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
-| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 0/0 | 0/0 | карточки — после Ф1 | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
+| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 0/39 | 0/80 | не начат | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/0 | 0/0 | карточки — после Ф1 | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
 
@@ -54,6 +54,20 @@
    отключённые ящики, динамические группы, личные списки, отложенная отправка, аудит доступа), внешние встречи
    (`contracts-24`, `meta-16`, `jmap-09`), модерация правилами потока (`contracts-31`, `meta-28`, `smtp-11`), шарды (`meta-13`, `meta-14`, `blob-08`), Enterprise и HA (`deploy-07`,
    `meta-25`, `cluster-09`, `app-17`), сборка Exchange (`app-08`), `contracts-30`.
+
+4. **Этап 4 — Ф2 «совместная работа»** (раздел «Ф2. Совместная работа» ниже). Волны — на свободные полосы, когда в этапах 1–2
+   нет готовых, как этап 3; внутри этапа — по порядку пунктов.
+   - 4.1 Календари, контакты, автоответ: `contracts-33` (CTR-45, CTR-46) → `deps-04`; `dav-01` → `dav-02` (CalDAV) → `dav-03`
+     (CardDAV, GAL); `meta-30`, `meta-31`; `sieve-01` → `sieve-02`; `smtp-12`; `jmap-16` (VacationResponse, JMAP Sieve, Contacts);
+     `admin-09` → `app-24` (DAV в узле), `app-25` (Sieve и автоответ в узле) → `deploy-15`.
+     Приёмка: `docs/manual-tests/DAV-08.md`, `DAV-11.md`, `APP-25.md`, `APP-26.md` — Thunderbird, iOS и macOS, DAVx5, Postman.
+   - 4.2 Управление правилами, JMAP Calendars, консоль: `sieve-03` (ManageSieve), `jmap-17` → `app-26`; `ci-05` (полоса `console`)
+     → `console-01` → `console-02` → `console-03`, `deps-05` → `admin-10` (раздача консоли).
+   - 4.3 Встречи: `contracts-34` (CTR-47) → `meta-32`, `dav-04` (RFC 6638, iMIP, занятость), `smtp-13`, `jmap-18` → `app-27`.
+   - Приёмка этапа: `deploy-16` (CMP-10) — критерий Ф2 на бете.
+   - 4.4 «Рюшечки» Ф2 (после приёмки): `contracts-35` (общий доступ, представители, ресурсы) → `meta-33`, `auth-07`, `dav-05`,
+     `jmap-19`, `admin-11` → `console-04`; `dav-06` (публикация ICS, FBURL, оргструктура в GAL) — после `contracts-23`, `contracts-24`,
+     `meta-16`, `auth-05` этапа 3.
 
 ## Ф0. Основа (≈3 мес.)
 
@@ -357,11 +371,63 @@
 
 Выход Ф1: MVP SMB — критерии `docs/spec/APP-D.md#Д.7` для профиля SMB на стенде DEP-04.
 
+## Ф2. Совместная работа (≈5 мес.)
+
+Готовые библиотеки: iCalendar, vCard, JSCalendar, JSContact — `calcard`, XML — `quick-xml`, письма iMIP и автоответы — `mail-builder`
+(всё уже в workspace, SRS 7.4); интерпретатор Sieve — свой (SRS 4.3: sieve-rs под AGPL-3.0); консоль — Refine с Ant Design (MIT),
+встраивание статики — `rust-embed`. Объекты календарей и контактов — в PostgreSQL (SRS 3.1). ManageSieve — в роли `imap`.
+Полоса `console` (`console/*`) появляется с `ci-05`. `jmap-09` (этап 3, `Availability/get`) ждёт `jmap-18` (JMAP Calendars).
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| contracts-33 (ветка `x/contracts-33`) | CTR-45, CTR-46 | B | — | 1 |
+| deps-04 (ветка `x/deps-04`) | DEPS-04 | B | contracts-33 | 1 |
+| meta-30 | META-46, META-47, META-48 | A/B | contracts-33 | 3 |
+| meta-31 | META-49, META-50 | A/B | contracts-33 | 3 |
+| dav-01 | DAV-01, DAV-02, DAV-03, DAV-04 | A | deps-04 | 4 |
+| dav-02 | DAV-05, DAV-06, DAV-07, DAV-08 | A | dav-01 | 4 |
+| dav-03 | DAV-09, DAV-10, DAV-11, DAV-12 | A | dav-01 | 4 |
+| sieve-01 | SIEVE-01, SIEVE-02, SIEVE-03 | A | deps-04 | 2 |
+| sieve-02 | SIEVE-04, SIEVE-05, SIEVE-06, SIEVE-07 | A | sieve-01 | 2 |
+| smtp-12 | SMTP-31, SMTP-32 | A | contracts-33 | 1 |
+| jmap-16 | JMAP-23, JMAP-24, JMAP-25, JMAP-26 | A | deps-04, sieve-01, dav-01 | 3 |
+| admin-09 | ADM-14 | A | sieve-01 | 3 |
+| app-24 | APP-25 | A | dav-02, dav-03, meta-30 | 2 |
+| app-25 | APP-26 | A | sieve-02, smtp-12, meta-31, jmap-16, admin-09 | 2 |
+| deploy-15 | DEP-17 | A | app-24 | 4 |
+| sieve-03 | SIEVE-08, SIEVE-09 | A | sieve-02 | 2 |
+| jmap-17 | JMAP-27, JMAP-28, JMAP-29 | A | jmap-16, dav-01 | 3 |
+| app-26 | APP-27 | A | sieve-03, jmap-17, app-24, app-25 | 2 |
+| ci-05 (ветка `x/ci-05`) | CI-06 | B | — | 1 |
+| deps-05 (ветка `x/deps-05`) | DEPS-05 | B | ci-05 | 1 |
+| console-01 | UI-01, UI-02, UI-03 | A | ci-05 | 1 |
+| console-02 | UI-04, UI-05, UI-06 | A | console-01 | 1 |
+| console-03 | UI-07, UI-08, UI-09 | A | console-02, admin-09 | 1 |
+| admin-10 | ADM-15 | A | deps-05, console-01 | 3 |
+| contracts-34 (ветка `x/contracts-34`) | CTR-47 | B | contracts-33 | 1 |
+| meta-32 | META-51 | B | contracts-34, meta-30 | 3 |
+| dav-04 | DAV-13, DAV-14, DAV-15, DAV-16 | A | dav-02, contracts-34 | 4 |
+| smtp-13 | SMTP-33 | A | contracts-34, smtp-12 | 1 |
+| jmap-18 | JMAP-30, JMAP-31 | A | jmap-17, contracts-34, dav-04 | 3 |
+| app-27 | APP-28 | A | dav-04, smtp-13, meta-32, jmap-18, app-26 | 2 |
+| deploy-16 | CMP-10 | A | app-27, console-03, deploy-15 | 4 |
+| contracts-35 (ветка `x/contracts-35`) | CTR-48 | B | contracts-34 | 1 |
+| meta-33 | META-52 | B | contracts-35 | 3 |
+| auth-07 | AUTH-12 | A | contracts-35 | 1 |
+| dav-05 | DAV-17, DAV-18, DAV-19 | A | dav-04, auth-07 | 4 |
+| jmap-19 | JMAP-32, JMAP-33 | A | jmap-18, contracts-35 | 3 |
+| admin-11 | ADM-16 | A | contracts-35 | 3 |
+| console-04 | UI-10, UI-11 | A | console-03, admin-11 | 1 |
+| dav-06 | DAV-20, DAV-21, DAV-22 | A | dav-05, contracts-23, contracts-24, meta-16, auth-05 | 4 |
+
+Выход Ф2: `docs/manual-tests/CMP-10.md` на бете без «не прошёл» — календари, контакты, правила и автоответы проверены клиентами
+(Thunderbird, iOS и macOS, DAVx5, Evolution, Postman); консоль покрывает Admin API (`console/coverage-pending.txt` пуст, UI-09).
+
 ## Ф2–Ф4 базовой поставки (карточки — по завершении Ф1)
 
 | Этап | Полосы | Содержание |
 |---|---|---|
-| Ф2. Совместная работа (≈5 мес.) | dav, jmap, sieve, auth, console | CalDAV, CardDAV, GAL, scheduling, iTIP/iMIP, free/busy, ресурсы; JMAP Contacts/Calendars/Sieve; Sieve и ManageSieve; веб-консоль администратора на Refine (полоса `console`, статика вшита в бинарный файл, SRS 5.2); публикация календарей по ссылке, ссылки занятости FBURL, оргструктура в GAL (SRS 4.4) |
+| Ф2. Совместная работа (≈5 мес.; карточки и волны — раздел выше) | dav, jmap, sieve, auth, console | CalDAV, CardDAV, GAL, scheduling, iTIP/iMIP, free/busy, ресурсы; JMAP Contacts/Calendars/Sieve; Sieve и ManageSieve; веб-консоль администратора на Refine (полоса `console`, статика вшита в бинарный файл, SRS 5.2); публикация календарей по ссылке, ссылки занятости FBURL, оргструктура в GAL (SRS 4.4) |
 | Ф3. Enterprise (≈5 мес.) | smtp, blob, cluster, admin, app, deploy | Профиль S3, межузловые запросы для ролей search и admin (SRS 2.8), режим edge (без очереди, сквозная передача на transport, реплика получателей, SMTP mTLS, секреты edge — из хранилища по отдельной политике — SRS 2.6, решение 2026-11-01), пресеты transport/access/backend/mailbox, экспорт/импорт, эталонные Ansible-роли и Helm-чарт (SRS 5.6), стенд Enterprise и испытания Д.6 |
 | Ф4. Выпуск (≈3 мес.) | все | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора |
 
