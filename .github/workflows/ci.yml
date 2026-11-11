@@ -150,17 +150,11 @@ jobs:
         with:
           tool: cargo-deny,cargo-audit
       - run: cargo deny --locked check licenses bans sources
-      # cargo-audit (SRS 6.8, CI-03, DEPS-01): уязвимости RustSec в Cargo.lock. Пропуски — только известные:
-      # zip <9 через mail-auth 0.12/0.13 (RUSTSEC-2026-0367, -0368, -0369, -0429) — ждём перехода на выпуск
-      # mail-auth без zip 8 (mail-auth >=0.14 и mail-send 0.7 уже вышли, но меняют API — отдельная карточка deps);
+      # cargo-audit (SRS 6.8, CI-03, DEPS-01, DEPS-02): уязвимости RustSec в Cargo.lock. Пропуск — только известный:
       # libsqlite3-sys <0.39 (RUSTSEC-2026-0459, CVE SQLite) — только запись в Cargo.lock через sqlx-sqlite 0.9.0
       # (требует <0.38, в сборку не входит), ждём выпуска sqlx-sqlite на libsqlite3-sys >=0.39. Новые — валят job.
       - name: cargo audit
-        run: >-
-          cargo audit
-          --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368
-          --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429
-          --ignore RUSTSEC-2026-0459
+        run: cargo audit --ignore RUSTSEC-2026-0459
 
   # Только main, бета и ручной запуск: release-сборка и артефакт.
   release:

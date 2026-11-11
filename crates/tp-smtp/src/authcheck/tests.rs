@@ -6,13 +6,12 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use mail_auth::arc::ArcSealer;
-use mail_auth::common::crypto::Ed25519Key;
-use mail_auth::common::parse::TxtRecordParser;
-use mail_auth::common::verify::DomainKey;
-use mail_auth::dkim::DkimSigner;
-use mail_auth::dmarc::Dmarc;
+use mail_auth::crypto::Ed25519Key;
+use mail_auth::dkim::{DkimSigner, DomainKey};
+use mail_auth::dmarc::DmarcRecord;
+use mail_auth::dns::TxtRecordParser;
 use mail_auth::hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use mail_auth::spf::Spf;
+use mail_auth::spf::SpfRecord;
 use time::OffsetDateTime;
 
 use super::*;
@@ -48,7 +47,7 @@ impl Signer {
         txt(
             cache,
             &format!("{}._domainkey.{}.", self.selector, self.domain),
-            Txt::from(DomainKey::parse(record.as_bytes())),
+            TxtRecord::from(DomainKey::parse(record.as_bytes())),
         );
     }
 
@@ -64,7 +63,7 @@ impl Signer {
     }
 }
 
-fn txt(cache: &DnsCache, name: &str, value: Txt) {
+fn txt(cache: &DnsCache, name: &str, value: TxtRecord) {
     cache.txt.insert(
         name.into(),
         value,
@@ -88,16 +87,16 @@ pub(crate) fn checker() -> AuthCheck {
 
 /// Домен отправителя `example.com`: SPF — `192.0.2.0/24`, DMARC — политика `policy`.
 pub(crate) fn publish_sender(cache: &DnsCache, policy: &str) {
-    let spf = Txt::from(Spf::parse(b"v=spf1 ip4:192.0.2.0/24 -all"));
+    let spf = TxtRecord::from(SpfRecord::parse(b"v=spf1 ip4:192.0.2.0/24 -all"));
     txt(cache, "example.com.", spf);
     let dmarc = format!("v=DMARC1; p={policy}");
     txt(
         cache,
         "_dmarc.example.com.",
-        Txt::from(Dmarc::parse(dmarc.as_bytes())),
+        TxtRecord::from(DmarcRecord::parse(dmarc.as_bytes())),
     );
     // Обход дерева DMARC (DMARCbis) спрашивает и `_dmarc.com.`: записи нет.
-    let none = Txt::Error(mail_auth::Error::Dns(
+    let none = TxtRecord::Error(mail_auth::Error::Dns(
         mail_auth::DnsError::InvalidRecordType,
     ));
     txt(cache, "_dmarc.com.", none);
@@ -190,7 +189,7 @@ async fn arc_chain_of_forwarder_verifies() {
     let arc = check.resolver.verify_arc(check.params(&msg)).await;
     let dkim = check.resolver.verify_dkim(check.params(&msg)).await;
     let ar = AuthenticationResults::new("mx.forwarder.example")
-        .with_dkim_results(&dkim, msg.from())
+        .with_dkim_results(&dkim, msg.first_from_address())
         .with_arc_result(&arc, "192.0.2.10".parse().expect("ip"));
     let set = ArcSealer::from_key(forwarder.key())
         .domain("forwarder.example")
@@ -322,7 +321,7 @@ async fn forward_arc_seal_verifies() {
     author.publish(check.cache());
     let node = Signer::new("example.org", "arc2026");
     node.publish(check.cache());
-    let sealer = ArcSealer::from_key(mail_auth::common::crypto::DkimKey::Ed25519(node.key()))
+    let sealer = ArcSealer::from_key(mail_auth::crypto::DkimKey::Ed25519(node.key()))
         .domain("example.org")
         .selector("arc2026")
         .headers(["From", "To", "Subject"]);
@@ -345,5 +344,5 @@ async fn forward_arc_seal_verifies() {
         "{:?}",
         arc.result()
     );
-    assert_eq!(arc.sets().len(), 1);
+    assert_eq!(arc.chain().len(), 1);
 }

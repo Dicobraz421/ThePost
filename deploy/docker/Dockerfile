@@ -2,7 +2,7 @@
 # OCI-образ The Post: один бинарный файл, профиль — по config.yaml (SRS 1.2).
 # Сборка из корня репозитория: docker build -f deploy/docker/Dockerfile -t thepost .
 
-ARG RUST_VERSION=1.97
+ARG RUST_VERSION=1.98
 
 FROM rust:${RUST_VERSION}-bookworm AS build
 ENV CARGO_TERM_COLOR=never

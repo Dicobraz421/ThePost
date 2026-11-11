@@ -15,9 +15,10 @@ use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use mail_auth::common::crypto::{DkimKey as SigningKeyPair, Ed25519Key, RsaKey, Sha256};
-use mail_auth::common::headers::HeaderWriter;
-use mail_auth::dkim::{DkimSigner, Done};
+use mail_auth::crypto::{DkimKey as SigningKeyPair, Ed25519Key, RsaKey, Sha256};
+use mail_auth::dkim::DkimSigner;
+use mail_auth::headers::HeaderWriter;
+use mail_auth::signer::Ready;
 use mail_parser::MessageParser;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -26,7 +27,7 @@ use tp_contracts::{Error, Result};
 
 use crate::config::{DkimAlgorithm, DkimConfig};
 
-type Signer = DkimSigner<SigningKeyPair, Done>;
+type Signer = DkimSigner<SigningKeyPair, Ready>;
 
 /// Разобранные ключи: (домен, селектор) → (момент загрузки, подпись).
 type KeyCache = HashMap<(String, String), (Instant, Arc<Signer>)>;

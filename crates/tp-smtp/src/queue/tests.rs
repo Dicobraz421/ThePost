@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use mail_auth::hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use mail_auth::{MX, RecordSet};
+use mail_auth::{Mx, RecordSet};
 use tokio::net::TcpListener;
 use tp_contracts::config::duration::HumanDuration;
 use tp_contracts::queue::{DsnNotify, QueueClaim, QueueStore};
@@ -334,19 +334,19 @@ use mail_auth::MessageAuthenticator;
 
 pub(crate) fn mx(t: &MxTransport, domain: &str, hosts: &[(u16, &str)]) {
     let until = std::time::Instant::now() + Duration::from_secs(3600);
-    let rrset: Arc<[MX]> = hosts
+    let records: Arc<[Mx]> = hosts
         .iter()
-        .map(|(pref, h)| MX {
+        .map(|(pref, h)| Mx {
             preference: *pref,
             exchanges: vec![Box::<str>::from(*h)].into_boxed_slice(),
         })
         .collect();
     t.cache().mx.insert(
         format!("{domain}.").into(),
-        RecordSet {
-            rrset,
+        Ok(RecordSet {
+            records,
             dnssec_status: Default::default(),
-        },
+        }),
         until,
     );
 }
@@ -355,10 +355,10 @@ pub(crate) fn a(t: &MxTransport, host: &str, ip: std::net::Ipv4Addr) {
     let until = std::time::Instant::now() + Duration::from_secs(3600);
     t.cache().ipv4.insert(
         format!("{host}.").into(),
-        RecordSet {
-            rrset: Arc::from(vec![ip]),
+        Ok(RecordSet {
+            records: Arc::from(vec![ip]),
             dnssec_status: Default::default(),
-        },
+        }),
         until,
     );
 }
@@ -367,10 +367,10 @@ fn aaaa(t: &MxTransport, host: &str, ip: std::net::Ipv6Addr) {
     let until = std::time::Instant::now() + Duration::from_secs(3600);
     t.cache().ipv6.insert(
         format!("{host}.").into(),
-        RecordSet {
-            rrset: Arc::from(vec![ip]),
+        Ok(RecordSet {
+            records: Arc::from(vec![ip]),
             dnssec_status: Default::default(),
-        },
+        }),
         until,
     );
 }
@@ -488,10 +488,10 @@ async fn egress_address_and_family() {
     // A-записей нет (пустой ответ в кэше).
     t.cache().ipv4.insert(
         "mx6.example.com.".into(),
-        RecordSet {
-            rrset: Arc::from(Vec::new()),
+        Ok(RecordSet {
+            records: Arc::from(Vec::new()),
             dnssec_status: Default::default(),
-        },
+        }),
         std::time::Instant::now() + Duration::from_secs(3600),
     );
     let cfg = QueueConfig {
