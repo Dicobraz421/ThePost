@@ -1,0 +1,8 @@
+[global]
+{% if thepost_backup_cipher %}
+repo1-cipher-pass={{ thepost_backup_secret.pgbackrest.cipher_pass }}
+{% endif %}
+{% if thepost_backup_repo == 's3' %}
+repo1-s3-key={{ thepost_backup_secret.s3.access_key_id }}
+repo1-s3-key-secret={{ thepost_backup_secret.s3.secret_access_key }}
+{% endif %}

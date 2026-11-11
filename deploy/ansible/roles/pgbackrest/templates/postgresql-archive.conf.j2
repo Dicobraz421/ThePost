@@ -1,0 +1,5 @@
+# {{ ansible_managed }}
+# Архив WAL в pgBackRest (PITR, DEP-15): секреты — учётные данные systemd юнита кластера (drop-in pgbackrest.conf).
+archive_mode = on
+archive_command = 'pgbackrest --config-include-path=/run/credentials/{{ thepost_backup_pg_unit }} --stanza={{ thepost_backup_stanza }} archive-push %p'
+archive_timeout = 60
