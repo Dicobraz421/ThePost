@@ -343,8 +343,26 @@ pub mod wire {
 
     /// Параметры запроса поиска учётной записи (`tp_admin::accounts::AccountQuery`).
     pub fn account_query(q: tp_admin::accounts::AccountQuery) -> Vec<(&'static str, String)> {
-        let tp_admin::accounts::AccountQuery { login } = q;
-        vec![("login", login)]
+        let tp_admin::accounts::AccountQuery {
+            login,
+            prefix,
+            after,
+            limit,
+        } = q;
+        let mut out = Vec::new();
+        if let Some(login) = login {
+            out.push(("login", login));
+        }
+        if let Some(prefix) = prefix {
+            out.push(("prefix", prefix));
+        }
+        if let Some(after) = after {
+            out.push(("after", after));
+        }
+        if let Some(limit) = limit {
+            out.push(("limit", limit.to_string()));
+        }
+        out
     }
 
     /// Параметры запроса удаления по версии снимка (`tp_admin::transport::VersionQuery`).
@@ -1111,7 +1129,12 @@ async fn org(client: &Client, args: &ApiArgs) -> CliResult<String> {
 
 /// Учётные записи с именем входа `login`.
 async fn find_accounts(client: &Client, org: &str, login: String) -> CliResult<Vec<wire::Account>> {
-    let query = wire::account_query(tp_admin::accounts::AccountQuery { login });
+    let query = wire::account_query(tp_admin::accounts::AccountQuery {
+        login: Some(login),
+        prefix: None,
+        after: None,
+        limit: None,
+    });
     client.call(ACCOUNT_FIND, &[org], &query, NO_BODY).await
 }
 
@@ -1424,9 +1447,25 @@ mod tests {
         }
         assert_eq!(
             wire::account_query(accounts::AccountQuery {
-                login: "a@b.test".into()
+                login: Some("a@b.test".into()),
+                prefix: None,
+                after: None,
+                limit: None,
             }),
             vec![("login", "a@b.test".to_owned())]
+        );
+        assert_eq!(
+            wire::account_query(accounts::AccountQuery {
+                login: None,
+                prefix: Some("a".into()),
+                after: Some("a@b.test".into()),
+                limit: Some(10),
+            }),
+            vec![
+                ("prefix", "a".to_owned()),
+                ("after", "a@b.test".to_owned()),
+                ("limit", "10".to_owned())
+            ]
         );
         assert_eq!(
             wire::version_query(transport::VersionQuery { version: 3 }),
