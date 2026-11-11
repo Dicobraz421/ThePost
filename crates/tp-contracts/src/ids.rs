@@ -87,6 +87,14 @@ uuid_id!(
     QueueId
 );
 uuid_id!(
+    /// Коллекция календарей или контактов учётной записи (`dav::DavStore`, CTR-45).
+    CollectionId
+);
+uuid_id!(
+    /// Объект календаря или контакта в коллекции (`dav::DavStore`, CTR-45); JMAP id `CalendarEvent`, `ContactCard`.
+    DavObjectId
+);
+uuid_id!(
     /// Группа рассылки (`groups::GroupStore`).
     GroupId
 );

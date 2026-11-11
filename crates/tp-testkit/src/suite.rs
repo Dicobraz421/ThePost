@@ -288,6 +288,14 @@ pub async fn membership_info(m: &dyn Membership, ttl: Duration, wait: &dyn Wait)
     assert!(ours().await.is_empty(), "запись a истекла");
 }
 
+// ---------- Календари и контакты, Sieve (CTR-45, CTR-46) ----------
+
+pub mod dav;
+pub mod sieve;
+
+pub use dav::dav;
+pub use sieve::sieve;
+
 // ---------- EventBus: сигналы ----------
 
 /// Сколько ждать сигнала в наборе [`signals`].
