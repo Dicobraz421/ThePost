@@ -12,7 +12,7 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 117/161 | 183/239 | в работе, 77 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 133/163 | 202/243 | в работе, 83 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
 | Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 0/0 | 0/0 | карточки — после Ф1 | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/0 | 0/0 | карточки — после Ф1 | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
@@ -47,7 +47,9 @@
    - `smtp-06` (SMTP-20…23: доверенные источники, принятые домены, точки правил, SRS/ARC) → `app-05` (APP-09).
    - `app-04` (APP-08, взаимодействие без опроса), `platform-11` (PLT-21), `ci-03`, `ci-04`, `deps-01`;
      `deps-02` (DEPS-02), `deps-03` → `jmap-15` (JMAP-22, подпись профиля) → `platform-13` (PLT-23) → `app-22` (APP-23), `admin-07` (ADM-12), `app-19` (APP-20), `app-20` (APP-21, CLI на типах tp-admin), `contracts-32` (CTR-44, список учётных записей), `admin-08` (ADM-13) → `app-21` (APP-22), `platform-12` (PLT-22, mTLS источников).
-   - Приёмка этапа: критерии выхода Ф1 ниже (нагрузка Д.6 для SMB).
+   - Выход этапа: `deploy-12` (DEP-12…14 — учётные записи и наполнение стенда, отчёт по Д.7, стресс, отказы, 72 ч) и
+     `deploy-13` (DEP-15 — резервное копирование SMB: pgBackRest и копия каталога писем, восстановление с `thepost verify`).
+   - Приёмка этапа: критерии выхода Ф1 ниже (нагрузка Д.6 для SMB) — отчёт `criteria.md` DEP-13 без «не прошёл».
 3. **Этап 3 — после пилота** («рюшечки» и Enterprise): соответствие Exchange (`contracts-23` и зависящие: архив,
    отключённые ящики, динамические группы, личные списки, отложенная отправка, аудит доступа), внешние встречи
    (`contracts-24`, `meta-16`, `jmap-09`), модерация правилами потока (`contracts-31`, `meta-28`, `smtp-11`), шарды (`meta-13`, `meta-14`, `blob-08`), Enterprise и HA (`deploy-07`,
@@ -171,12 +173,12 @@
 | ✅ meta-09 | META-25 | A | meta-08 | 3 |
 | ✅ meta-10 | META-26, META-27 | A | meta-09, contracts-12 | 3 |
 | ✅ cluster-06 | CLU-09, CLU-10, CLU-11 | A | contracts-12 | 4 |
-| app-04 | APP-08 | A | meta-10, cluster-06 | 2 |
+| ✅ app-04 | APP-08 | A | meta-10, cluster-06 | 2 |
 | ✅ platform-07 | PLT-17 | A | platform-06 | 2 |
 | ✅ mailstore-08 | MS-14 | A | mailstore-07 | 1 |
 | ✅ blob-07 | BLOB-14 | A | blob-06 | 4 |
 | ✅ auth-04 | AUTH-08 | A | auth-03, meta-10 | 1 |
-| ci-04 | CI-05 | B | ci-03, cluster-06 | 4 |
+| ✅ ci-04 | CI-05 | B | ci-03, cluster-06 | 4 |
 | ✅ deploy-06 | DEP-09 | A | deploy-05, cluster-06 | 4 |
 
 ### Решение 2026-11-01: состав функций транспорта и внешний MTA
@@ -185,10 +187,10 @@
 |---|---|---|---|---|
 | ✅ contracts-13 (ветка `x/contracts-13`) | CTR-24 | B | contracts-12 | 1 |
 | ✅ meta-11 | META-28 | A | meta-10, contracts-13 | 3 |
-| smtp-06 | SMTP-20, SMTP-21, SMTP-22, SMTP-23 | A | smtp-05, contracts-13 | 4 |
+| ✅ smtp-06 | SMTP-20, SMTP-21, SMTP-22, SMTP-23 | A | smtp-05, contracts-13 | 4 |
 | ✅ admin-03 | ADM-08 | A | admin-02, contracts-13 | 3 |
 | ✅ jmap-04 | JMAP-10 | A | jmap-03, contracts-13 | 3 |
-| app-05 | APP-09 | A | meta-11, smtp-06, admin-03, jmap-04 | 2 |
+| ✅ app-05 | APP-09 | A | meta-11, smtp-06, admin-03, jmap-04 | 2 |
 
 ### Решение 2026-11-01: масштабирование, шарды, геораспределение, администрирование — этап 3, кроме `app-07` (этап 2)
 
@@ -198,7 +200,7 @@
 | meta-13 | META-30, META-31 | A | meta-12, meta-10, contracts-22 | 3 |
 | meta-14 | META-32 | A | meta-13 | 3 |
 | blob-08 | BLOB-15 | A | blob-07, meta-13 | 4 |
-| app-07 | APP-11 | A | admin-01 | 2 |
+| ✅ app-07 | APP-11 | A | admin-01 | 2 |
 | deploy-07 | DEP-10 | A | deploy-06 | 4 |
 
 ### Решение 2026-11-04: соответствие функциям Exchange — этап 3, кроме `jmap-14` (этап 2)
@@ -211,7 +213,7 @@
 | mailstore-10 | MS-16, MS-17 | A | mailstore-08, contracts-23 | 1 |
 | smtp-07 | SMTP-24, SMTP-25, SMTP-26, SMTP-27 | A | smtp-05, contracts-23 | 4 |
 | jmap-08 | JMAP-15, JMAP-16, JMAP-17, JMAP-18 | A | jmap-02, contracts-23 | 3 |
-| jmap-14 | JMAP-14 (этап 2) | A | jmap-02 | 3 |
+| ✅ jmap-14 | JMAP-14 (этап 2) | A | jmap-02 | 3 |
 | imap-06 | IMAP-15 | A | imap-02, contracts-23 | 2 |
 | admin-05 | ADM-10 | A | admin-02, contracts-23 | 3 |
 | app-08 | APP-12 | A | meta-15, auth-05, mailstore-10, smtp-07, jmap-08, imap-06, admin-05 | 2 |
@@ -302,7 +304,7 @@
 | ✅ imap-08 | IMAP-17 | A | cluster-08 | 2 |
 | ✅ jmap-12 | JMAP-21 | A | cluster-08 | 3 |
 | ✅ sys-06 | SYS-11 | A | sys-05 | 2 |
-| platform-11 | PLT-21 | A | sys-06, cluster-08 | 2 |
+| ✅ platform-11 | PLT-21 | A | sys-06, cluster-08 | 2 |
 | ✅ app-16 | APP-17 | A | smtp-05, auth-04, app-15 | 2 |
 | app-17 | APP-18 | A | smtp-10, cluster-07, app-16 | 2 |
 | meta-25 | META-41 | A | meta-21 | 3 |
@@ -320,26 +322,28 @@
 | contracts-30 (ветка `x/contracts-30`) | CTR-42 | B | contracts-29 | 1 |
 | ✅ meta-26 | META-42 | A | meta-17 | 3 |
 | ✅ testkit-05 | KIT-08 | A | testkit-04 | 1 |
-| auth-06 | AUTH-11 | A | auth-04 | 1 |
+| ✅ auth-06 | AUTH-11 | A | auth-04 | 1 |
 | ✅ deploy-10 | DEP-09 (`db_durability`, #272) | A | deploy-06 | 4 |
 
 ### Решения 2026-11-11: шарды, токен администратора, цепочка поставки, отчёты этапа 2 (`docs/decisions/2026-11-11-contracts-ci-defaults.md`, `2026-11-11-stage2-followups.md`)
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| deps-01 (ветка `x/deps-01`) | DEPS-01 | B | ci-03 | 1 |
-| deps-02 (ветка `x/deps-02`) | DEPS-02 | B | deps-01 | 1 |
-| deps-03 (ветка `x/deps-03`) | DEPS-03 | B | jmap-14 | 1 |
-| jmap-15 | JMAP-22 | A | jmap-14, deps-03 | 3 |
-| admin-07 | ADM-12 | A | admin-06 | 3 |
-| app-19 | APP-20 | A | auth-06, app-04 | 2 |
-| app-20 | APP-21 | A | app-07, app-19 | 2 |
+| ✅ deps-01 (ветка `x/deps-01`) | DEPS-01 | B | ci-03 | 1 |
+| ✅ deps-02 (ветка `x/deps-02`) | DEPS-02 | B | deps-01 | 1 |
+| ✅ deps-03 (ветка `x/deps-03`) | DEPS-03 | B | jmap-14 | 1 |
+| ✅ jmap-15 | JMAP-22 | A | jmap-14, deps-03 | 3 |
+| ✅ admin-07 | ADM-12 | A | admin-06 | 3 |
+| ✅ app-19 | APP-20 | A | auth-06, app-04 | 2 |
+| ✅ app-20 | APP-21 | A | app-07, app-19 | 2 |
 | contracts-32 (ветка `x/contracts-32`) | CTR-44 | B | admin-07 | 1 |
 | admin-08 | ADM-13 | A | admin-07 | 3 |
 | app-21 | APP-22 | A | admin-08, app-20 | 2 |
 | platform-13 | PLT-23 | A | platform-12 | 2 |
 | app-22 | APP-23 | A | platform-13, jmap-15 | 2 |
-| platform-12 | PLT-22 | A | smtp-06 | 2 |
+| deploy-12 | DEP-12, DEP-13, DEP-14 | A | deploy-02, app-20 | 4 |
+| deploy-13 | DEP-15 | A | deploy-02 | 4 |
+| ✅ platform-12 | PLT-22 | A | smtp-06 | 2 |
 | contracts-31 (ветка `x/contracts-31`) | CTR-43 | B | contracts-19, smtp-06 | 1 |
 | meta-28 (ветка `x/meta-28`) | META-44 | B | contracts-31 | 3 |
 | smtp-11 | SMTP-30 | A | contracts-31, meta-28 | 4 |
