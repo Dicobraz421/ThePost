@@ -1,0 +1,119 @@
+---
+source: crates/tp-jmap/src/autoconfig/tests.rs
+expression: plist
+---
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+	<key>PayloadIdentifier</key>
+	<string>org.example.mail.thepost.d159ef624ed86697.profile</string>
+	<key>PayloadUUID</key>
+	<string>EF1EA2C9-61D5-86AF-92FD-45C704B0A2E3</string>
+	<key>PayloadDisplayName</key>
+	<string>Почта, календари и контакты ООО «Рога &amp; Копыта»</string>
+	<key>PayloadDescription</key>
+	<string>Настройка почты, календарей и контактов user@example.org. Пароль запрашивается при установке.</string>
+	<key>PayloadOrganization</key>
+	<string>ООО «Рога &amp; Копыта»</string>
+	<key>PayloadRemovalDisallowed</key>
+	<false/>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadType</key>
+			<string>com.apple.mail.managed</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>PayloadIdentifier</key>
+			<string>org.example.mail.thepost.d159ef624ed86697.mail</string>
+			<key>PayloadUUID</key>
+			<string>E5B2529F-CA79-892D-A2DB-FAFB02BAEA91</string>
+			<key>PayloadDisplayName</key>
+			<string>Почта ООО «Рога &amp; Копыта»</string>
+			<key>EmailAccountDescription</key>
+			<string>ООО «Рога &amp; Копыта»</string>
+			<key>EmailAccountName</key>
+			<string>Иван &lt;Петров&gt;</string>
+			<key>EmailAccountType</key>
+			<string>EmailTypeIMAP</string>
+			<key>EmailAddress</key>
+			<string>user@example.org</string>
+			<key>IncomingMailServerAuthentication</key>
+			<string>EmailAuthPassword</string>
+			<key>IncomingMailServerHostName</key>
+			<string>mail.example.org</string>
+			<key>IncomingMailServerPortNumber</key>
+			<integer>993</integer>
+			<key>IncomingMailServerUseSSL</key>
+			<true/>
+			<key>IncomingMailServerUsername</key>
+			<string>user@example.org</string>
+			<key>OutgoingMailServerAuthentication</key>
+			<string>EmailAuthPassword</string>
+			<key>OutgoingMailServerHostName</key>
+			<string>mail.example.org</string>
+			<key>OutgoingMailServerPortNumber</key>
+			<integer>587</integer>
+			<key>OutgoingMailServerUseSSL</key>
+			<true/>
+			<key>OutgoingMailServerUsername</key>
+			<string>user@example.org</string>
+			<key>OutgoingPasswordSameAsIncomingPassword</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>PayloadType</key>
+			<string>com.apple.caldav.account</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>PayloadIdentifier</key>
+			<string>org.example.mail.thepost.d159ef624ed86697.caldav</string>
+			<key>PayloadUUID</key>
+			<string>A082CED0-D939-8B90-9940-16C57BB2867D</string>
+			<key>PayloadDisplayName</key>
+			<string>Календари ООО «Рога &amp; Копыта»</string>
+			<key>CalDAVAccountDescription</key>
+			<string>Календари ООО «Рога &amp; Копыта»</string>
+			<key>CalDAVHostName</key>
+			<string>mail.example.org</string>
+			<key>CalDAVPort</key>
+			<integer>443</integer>
+			<key>CalDAVUseSSL</key>
+			<true/>
+			<key>CalDAVUsername</key>
+			<string>user@example.org</string>
+			<key>CalDAVPrincipalURL</key>
+			<string>https://mail.example.org/dav/</string>
+		</dict>
+		<dict>
+			<key>PayloadType</key>
+			<string>com.apple.carddav.account</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>PayloadIdentifier</key>
+			<string>org.example.mail.thepost.d159ef624ed86697.carddav</string>
+			<key>PayloadUUID</key>
+			<string>8A33DEE6-FDE7-85DA-95F6-CA3FC0E639C9</string>
+			<key>PayloadDisplayName</key>
+			<string>Контакты ООО «Рога &amp; Копыта»</string>
+			<key>CardDAVAccountDescription</key>
+			<string>Контакты ООО «Рога &amp; Копыта»</string>
+			<key>CardDAVHostName</key>
+			<string>dav.example.org</string>
+			<key>CardDAVPort</key>
+			<integer>8443</integer>
+			<key>CardDAVUseSSL</key>
+			<true/>
+			<key>CardDAVUsername</key>
+			<string>user@example.org</string>
+			<key>CardDAVPrincipalURL</key>
+			<string>https://dav.example.org:8443/contacts/</string>
+		</dict>
+	</array>
+</dict>
+</plist>

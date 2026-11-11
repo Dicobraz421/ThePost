@@ -1,7 +1,8 @@
 //! HTTP JMAP (RFC 8620 §2, §3.1): `/.well-known/jmap` и `/jmap/session` — объект сессии,
 //! `POST /jmap/api` — запрос API. Аутентификация — `Authorization: Bearer` (OAuth 2.0) или
 //! `Basic` (пароль приложения) через [`Authenticator`](tp_contracts::auth::Authenticator).
-//! Загрузка и скачивание blob — `crate::blob`, push (EventSource, WebSocket) — `crate::push`.
+//! Загрузка и скачивание blob — `crate::blob`, push (EventSource, WebSocket) — `crate::push`;
+//! автонастройка клиентов (`/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`) — `crate::autoconfig`.
 
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
@@ -33,6 +34,17 @@ impl Jmap {
             )
             .route("/jmap/eventsource/", get(crate::push::eventsource))
             .route("/jmap/ws", get(crate::push::websocket))
+            .route("/.well-known/caldav", any(crate::autoconfig::caldav))
+            .route("/.well-known/carddav", any(crate::autoconfig::carddav))
+            .route("/mail/config-v1.1.xml", get(crate::autoconfig::thunderbird))
+            .route(
+                "/.well-known/autoconfig/mail/config-v1.1.xml",
+                get(crate::autoconfig::thunderbird),
+            )
+            .route(
+                "/mail/profile.mobileconfig",
+                get(crate::autoconfig::mobileconfig),
+            )
             .with_state(self)
     }
 

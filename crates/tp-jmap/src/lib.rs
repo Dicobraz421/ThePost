@@ -10,10 +10,12 @@
 //! - [`submission`] — Identity/get, set и EmailSubmission/get, set, query, queryChanges → очередь [`Outbound`](tp_contracts::queue::Outbound) (RFC 8621 §6–7);
 //! - `push` — EventSource и WebSocket (RFC 8620 §7, RFC 8887) по шине уведомлений;
 //! - `fuzz` — проверки разбора для целей cargo-fuzz `crates/tp-jmap/fuzz` (JMAP-09; не API);
+//! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`;
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
 //! Протокол — JSON поверх HTTP: типы запросов и ответов — `serde_json`, HTTP — `axum`.
 
+mod autoconfig;
 mod blob;
 pub mod core;
 mod email_get;
