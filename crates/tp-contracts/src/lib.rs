@@ -33,5 +33,5 @@ pub mod transport;
 pub use error::{Error, Result};
 pub use ids::{
     AccountId, BlobHash, BlobKey, DomainId, Gen, GroupId, HeldId, MailboxId, MessageId, ModSeq,
-    QueueId, TenantId, Uid, UidValidity,
+    QueueId, ShardId, TenantId, Uid, UidValidity,
 };
