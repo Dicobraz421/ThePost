@@ -74,7 +74,8 @@
 - name: Read static unseal key of {{ openbao_static_key_from }}
   ansible.builtin.slurp:
     src: "{{ openbao_static_key_file }}"
-  delegate_to: "{{ openbao_static_key_from }}"
+  # delegate_to вычисляется до when: пустое имя (один узел, smb.yml) — ошибка «Empty hostname».
+  delegate_to: "{{ openbao_static_key_from | default(inventory_hostname, true) }}"
   register: openbao_static_key_peer
   when: openbao_static_key_stat.stat is defined and not openbao_static_key_stat.stat.exists
   no_log: true

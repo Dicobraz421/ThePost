@@ -3,6 +3,9 @@
 # у pg_autoctl (postgresql-auto-failover.conf).
 password_encryption = 'scram-sha-256'
 ssl_min_protocol_version = 'TLSv1.2'
+# Время сеансов и журналов — UTC (решение 2026-11-11 №24; thepost doctor: database.timezone, database.log_timezone).
+timezone = 'UTC'
+log_timezone = 'UTC'
 {% for name, value in pgaf_settings | dictsort %}
 {{ name }} = {{ value if value is number else "'" ~ value ~ "'" }}
 {% endfor %}
