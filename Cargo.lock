@@ -4522,6 +4522,7 @@ dependencies = [
  "mail-auth 0.13.3",
  "mail-parser",
  "prometheus-client",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
