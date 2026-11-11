@@ -6,8 +6,11 @@ python interp_check.py --self-test
 Нарушение — запись архива:
 - интерпретатор по имени (файл, ссылка): оболочки, busybox, python, perl, ruby, node, lua, php, tcl, awk, pwsh;
 - обычный файл, начинающийся с `#!` (сценарий), при любых правах;
-- исполняемый обычный файл не ELF (сценарий без `#!` запускает оболочка).
-Каталоги библиотек и неисполняемые данные без `#!` не нарушение: без интерпретатора их нечем исполнить.
+- файл с расширением сценария (.sh, .bash, .py, .pl, .rb, .lua, .php, .tcl, .js) — сценарий без `#!`;
+- исполняемый файл не ELF в каталогах программ (bin, sbin, libexec) — его запускает оболочка.
+Права «исполняемый» вне этих каталогов не признак: в distroless 0755 стоит и у данных (сертификаты, os-release).
+Каталоги библиотек и данные без `#!` не нарушение: без интерпретатора их нечем исполнить.
+Не проверяются файлы, которые `docker create` сам кладёт в контейнер (RUNTIME). Исключения — ALLOW, с причиной.
 Код возврата 1 и `::error::` на каждое нарушение.
 """
 
@@ -21,6 +24,16 @@ INTERP = re.compile(
     r"|python[0-9.]*|pypy[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node|nodejs|deno|bun"
     r"|lua[0-9.]*|luajit|php[0-9.]*|tclsh[0-9.]*|wish[0-9.]*|[gmn]?awk)$"
 )
+SCRIPT_EXT = re.compile(r"\.(sh|bash|py|pl|pm|rb|lua|php|tcl|js|mjs)$")
+BIN_DIR = re.compile(r"^(usr/(local/)?)?(s?bin|libexec)/")
+# Записи слоя контейнера от `docker create`/`docker export`, не образа.
+RUNTIME = re.compile(r"^(\.dockerenv|dev/.*|etc/(hostname|hosts|resolv\.conf))$")
+# Известные файлы базового образа, не исполняемые в работе (путь — причина).
+ALLOW = {
+    # base-files Debian в distroless: сценарий запускает pam_motd при входе в систему;
+    # в образе нет ни оболочки, ни входа.
+    "etc/update-motd.d/10-uname": "motd base-files, исполняется только при входе",
+}
 
 
 def violations(tar: tarfile.TarFile) -> list[str]:
@@ -28,7 +41,10 @@ def violations(tar: tarfile.TarFile) -> list[str]:
     for m in tar:
         name = re.sub(r"^(\./)+|^/+", "", m.name)
         base = name.rsplit("/", 1)[-1]
-        if not (m.isfile() or m.issym() or m.islnk()):
+        if not (m.isfile() or m.issym() or m.islnk()) or RUNTIME.match(name):
+            continue
+        if name in ALLOW:
+            print(f"исключение: {name} — {ALLOW[name]}")
             continue
         if INTERP.match(base):
             found.append(f"{name}: интерпретатор")
@@ -39,7 +55,9 @@ def violations(tar: tarfile.TarFile) -> list[str]:
         head = f.read(4) if f else b""
         if head.startswith(b"#!"):
             found.append(f"{name}: сценарий (#!)")
-        elif m.mode & 0o111 and head != b"\x7fELF":
+        elif SCRIPT_EXT.search(base):
+            found.append(f"{name}: сценарий (расширение)")
+        elif BIN_DIR.match(name) and m.mode & 0o111 and head != b"\x7fELF":
             found.append(f"{name}: исполняемый файл не ELF")
     return found
 
@@ -75,11 +93,16 @@ def self_test() -> int:
         ("usr/lib/x86_64-linux-gnu/libc.so.6", elf, 0o755, None),
         ("etc/passwd", b"root:x:0:0::/root:/sbin/nologin\n", 0o644, None),
         ("usr/share/doc/README", b"text\n", 0o644, None),
+        ("etc/ssl/certs/ca-certificates.crt", b"-----BEGIN", 0o755, None),
+        ("etc/update-motd.d/10-uname", b"#!/bin/sh\nuname\n", 0o755, None),
+        (".dockerenv", b"", 0o755, None),
+        ("etc/hosts", b"", 0o755, None),
     ]
     bad = {
         "script.sh (#!, 0644)": ("opt/run.sh", b"#!/bin/sh\necho\n", 0o644, None),
         "script (#!, 0755)": ("usr/local/bin/hook", b"#!/usr/bin/env python3\n", 0o755, None),
-        "без #!, 0755": ("usr/local/bin/start", b"echo hi\n", 0o755, None),
+        "без #!, 0755 в bin": ("usr/local/bin/start", b"echo hi\n", 0o755, None),
+        "x.py без #!, 0644": ("opt/app/x.py", b"print(1)\n", 0o644, None),
         "bin/sh": ("bin/sh", elf, 0o755, None),
         "ссылка busybox": ("bin/ash", b"", 0o777, "busybox"),
         "python3.11": ("usr/bin/python3.11", elf, 0o755, None),
