@@ -272,6 +272,31 @@ pub trait Outbound: Send + Sync + 'static {
         raw: Bytes,
     ) -> Result<()>;
 
+    /// Отложенная отправка (CTR-42; JMAP `sendAt`): ставит письмо в очередь со сроком выпуска `release_at`
+    /// ([`OutMessage::next_attempt`]) для всех получателей — локальные доставляются при выпуске — и возвращает запись
+    /// очереди (`EmailSubmission::queue`). Ошибки — как у [`Outbound::enqueue`]. По умолчанию — `Error::Internal`.
+    async fn schedule(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+        release_at: OffsetDateTime,
+    ) -> Result<QueueId> {
+        let _ = (tenant, mail_from, rcpts, raw, release_at);
+        Err(Error::internal("outbound does not support schedule"))
+    }
+
+    /// Отмена отложенной отправки до выпуска (CTR-42; JMAP `undoStatus: canceled`): [`QueueStore::cancel_queued`] и
+    /// освобождение ссылки на тело. Уже выпущено — `Error::Conflict` (`cannotUnsend`); нет записи — `Error::NotFound`.
+    /// По умолчанию — `Error::Internal`.
+    async fn cancel_scheduled(&self, tenant: TenantId, queue: QueueId) -> Result<()> {
+        let _ = (tenant, queue);
+        Err(Error::internal(
+            "outbound does not support cancel_scheduled",
+        ))
+    }
+
     /// Отправляет письмо и возвращает статус по каждому получателю в порядке `rcpts`. По умолчанию —
     /// [`Outbound::enqueue`], все получатели [`SubmitStatus::Queued`].
     async fn submit(
@@ -329,7 +354,14 @@ mod tests {
                 ("a@example.org".to_owned(), SubmitStatus::Queued),
             ]
         );
-        assert_eq!(*ob.0.lock().expect("lock"), vec![rcpts]);
+        assert_eq!(*ob.0.lock().expect("lock"), vec![rcpts.clone()]);
+        let at = OffsetDateTime::UNIX_EPOCH;
+        let scheduled = ob
+            .schedule(TenantId::DEFAULT, "x@example.org", &rcpts, Bytes::new(), at)
+            .await;
+        assert!(matches!(scheduled, Err(Error::Internal(_))));
+        let canceled = ob.cancel_scheduled(TenantId::DEFAULT, QueueId::new()).await;
+        assert!(matches!(canceled, Err(Error::Internal(_))));
     }
 
     #[test]

@@ -2,15 +2,17 @@
 //!
 //! [`MemOutbound`] запоминает письма (`enqueue` и `submit`) и отвечает на `submit` статусами, заданными
 //! [`MemOutbound::set_status`] (остальные получатели — в очереди); [`MemOutbound::fail_next`] — ошибка следующего
-//! вызова.
+//! вызова. Отложенные письма ([`Outbound::schedule`], CTR-42) — [`MemOutbound::scheduled`]; [`MemOutbound::release`]
+//! имитирует выпуск (после него отмена — `Conflict`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use time::OffsetDateTime;
 use tp_contracts::queue::{Outbound, SubmitStatus, Submitted};
-use tp_contracts::{Error, Result, TenantId};
+use tp_contracts::{Error, QueueId, Result, TenantId};
 
 use crate::infra::lock;
 
@@ -27,9 +29,23 @@ pub struct Queued {
     pub raw: Bytes,
 }
 
+/// Отложенное письмо [`MemOutbound`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scheduled {
+    /// Запись очереди.
+    pub queue: QueueId,
+    /// Письмо.
+    pub message: Queued,
+    /// Срок выпуска.
+    pub release_at: OffsetDateTime,
+    /// Выпущено ([`MemOutbound::release`]).
+    pub released: bool,
+}
+
 #[derive(Debug, Default)]
 struct State {
     queued: Vec<Queued>,
+    scheduled: Vec<Scheduled>,
     statuses: HashMap<String, SubmitStatus>,
     faults: VecDeque<Error>,
 }
@@ -44,6 +60,23 @@ impl MemOutbound {
     /// Принятые письма в порядке вызовов.
     pub fn queued(&self) -> Vec<Queued> {
         lock(&self.state).queued.clone()
+    }
+
+    /// Отложенные письма (не отменённые) в порядке вызовов.
+    pub fn scheduled(&self) -> Vec<Scheduled> {
+        lock(&self.state).scheduled.clone()
+    }
+
+    /// Выпуск отложенного письма: дальше `cancel_scheduled` — `Conflict`. Нет записи — `false`.
+    pub fn release(&self, queue: QueueId) -> bool {
+        let mut st = lock(&self.state);
+        match st.scheduled.iter_mut().find(|s| s.queue == queue) {
+            Some(s) => {
+                s.released = true;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Статус получателя `rcpt` (без учёта регистра) в ответах `submit`.
@@ -89,6 +122,50 @@ impl Outbound for MemOutbound {
         raw: Bytes,
     ) -> Result<()> {
         self.accept(tenant, mail_from, rcpts, raw)
+    }
+
+    async fn schedule(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+        release_at: OffsetDateTime,
+    ) -> Result<QueueId> {
+        let mut st = lock(&self.state);
+        if let Some(e) = st.faults.pop_front() {
+            return Err(e);
+        }
+        let queue = QueueId::new();
+        st.scheduled.push(Scheduled {
+            queue,
+            message: Queued {
+                tenant,
+                mail_from: mail_from.to_owned(),
+                rcpts: rcpts.to_vec(),
+                raw,
+            },
+            release_at,
+            released: false,
+        });
+        Ok(queue)
+    }
+
+    async fn cancel_scheduled(&self, tenant: TenantId, queue: QueueId) -> Result<()> {
+        let mut st = lock(&self.state);
+        if let Some(e) = st.faults.pop_front() {
+            return Err(e);
+        }
+        let pos = st
+            .scheduled
+            .iter()
+            .position(|s| s.queue == queue && s.message.tenant == tenant)
+            .ok_or(Error::NotFound)?;
+        if st.scheduled[pos].released {
+            return Err(Error::Conflict);
+        }
+        st.scheduled.remove(pos);
+        Ok(())
     }
 
     async fn submit(
@@ -151,5 +228,24 @@ mod tests {
         );
         assert_eq!(ob.queued().len(), 3);
         assert_eq!(ob.queued()[2].rcpts, rcpts);
+    }
+
+    /// CTR-42: отложенная отправка, отмена до выпуска, после выпуска — `Conflict`.
+    #[tokio::test]
+    async fn schedule_and_cancel() {
+        let ob = MemOutbound::default();
+        let t = TenantId::DEFAULT;
+        let rcpts = vec!["b@example.org".to_owned()];
+        let at = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        suite::outbound_schedule(&ob, t, &rcpts, at).await;
+        assert!(ob.scheduled().is_empty());
+        let id = ob
+            .schedule(t, "x@example.org", &rcpts, Bytes::new(), at)
+            .await
+            .expect("schedule");
+        assert_eq!(ob.scheduled()[0].release_at, at);
+        assert!(ob.release(id));
+        assert_eq!(ob.cancel_scheduled(t, id).await, Err(Error::Conflict));
+        assert!(ob.queued().is_empty());
     }
 }

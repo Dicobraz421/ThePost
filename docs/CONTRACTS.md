@@ -465,6 +465,18 @@ queue) -> state` (`Final` со статусами; отменённая — `Con
 `delete -> state`, `due(now, limit)` — `Pending` с `send_at ≤ now` всех организаций (воркер отложенной отправки), `state(scope)`.
 Нет записи — `NotFound`. In-memory — `MemIdentities`, `MemSubmissions`; наборы `suite::{identity_store, submission_store}`. PostgreSQL — `tp-meta`
 (карточка meta), переход `tp-jmap` — волна полосы.
+Отложенная отправка и отмена (CTR-42, решение владельца #195): письмо с `sendAt` в будущем (предел — `maxDelayedSend` конфигурации
+`tp-jmap`) ставится в очередь сразу со сроком выпуска — `Outbound::schedule(tenant, mail_from, rcpts, raw, release_at) -> QueueId` (все
+получатели, локальные — при выпуске), отправка — `Pending` с `queue`; отмена — `Outbound::cancel_scheduled(tenant, queue)` (`QueueStore::cancel_queued`
+и освобождение тела; выпущено — `Conflict` = `cannotUnsend`, нет — `NotFound`), затем `SubmissionStore::cancel`; наступившие (`due`) — `finalize`;
+статусы — `DeliveryLog::by_queue`. Оба метода `Outbound` по умолчанию — `Internal`; in-memory — `MemOutbound` (`scheduled`, `release`), набор
+`suite::outbound_schedule`. `SubmissionStore` (CTR-42): `query_submissions(scope, &SubmissionFilter { identity_ids, email_ids, undo_status, before,
+after })` (RFC 8621 §7.3; `threadIds` вызывающий переводит в `email_ids`; по `send_at`, `id`; по умолчанию — `list` с фильтром),
+`submission_changes(scope, since, limit) -> SubmissionChanges { created, updated, destroyed, new_state, has_more }` (созданные и удалённые после
+`since` не входят; неизвестное или устаревшее состояние — `Conflict` = `cannotCalculateChanges`; `limit = 0` — `Invalid`), `expire_submissions(before,
+limit) -> usize` — срок хранения: `Final` и `Canceled` с `send_at < before` всех организаций (maintenance; срок — конфигурация); оба — по
+умолчанию `Internal`. Набор `suite::submission_query`. Далее: meta (таблица, RLS), smtp (выпуск по сроку, отмена), jmap (`maxDelayedSend`,
+`EmailSubmission/get|set|query|queryChanges`).
 
 ## Trash, Retention, Quota (Ф1)
 SRS 4.7, 3.8. Код — `retention.rs`. `TrashStore`: `list(scope, offset, limit) -> Vec<TrashItem { scope, object: TrashObject::Message(id), origin, size,
@@ -632,3 +644,7 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `MemMetadata`, `MemQueue`, `MemDeliveryLog`, `FakeDirectory`; наборы `suite::{mailbox_audit, sender_lists, contact_store, org_store,
   dynamic_groups, sync_gate, account_state, queue_release, delivery_by_queue}`. Реализации — META-33, AUTH-10, ADM-10, SMTP-24…26, JMAP-15…18,
   IMAP-15, MS-16/17.
+- 2026-11-11 — CTR-42 (x/contracts-30, решение владельца #195): отложенная отправка и отмена — `Outbound::{schedule, cancel_scheduled}`
+  (очередь со сроком выпуска, отмена до выпуска), `SubmissionStore::{query_submissions, submission_changes, expire_submissions}`,
+  `SubmissionFilter`, `SubmissionChanges`; описание потока в `submission.rs` (воркер `due` только фиксирует наступившие). In-memory —
+  `MemOutbound` (`Scheduled`, `release`), `MemSubmissions` (журнал изменений); наборы `suite::{submission_query, outbound_schedule}`.
