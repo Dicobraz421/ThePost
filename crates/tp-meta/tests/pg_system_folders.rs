@@ -1,4 +1,5 @@
-//! CMP-05: системные папки при создании учётной записи и при первом входе.
+//! CMP-05, META-42: системные папки при создании учётной записи и при первом входе; недостающая
+//! определяется только по роли, при совпадении имени с папкой пользователя — имя с суффиксом (#205).
 
 mod common;
 
@@ -115,7 +116,7 @@ async fn raw_account_with_inbox_filled_on_login() {
     let tenant = common::tenant(meta.pool()).await;
     let (domain, dname) = common::domain(meta.pool(), tenant).await;
     let login = format!("old@{dname}");
-    // INBOX с ролью, «Отправленные» с ролью под другим именем, «junk» без роли.
+    // INBOX с ролью, «Отправленные» с ролью под другим именем, «junk» без роли (Junk — «Junk 1»).
     let scope = raw_account(
         meta.pool(),
         tenant,
@@ -152,6 +153,7 @@ async fn raw_account_with_inbox_filled_on_login() {
             "Archive",
             "Drafts",
             "INBOX",
+            "Junk 1",
             "Trash",
             "junk",
             "Отправленные"
@@ -165,6 +167,7 @@ async fn raw_account_with_inbox_filled_on_login() {
             SpecialUse::Inbox,
             SpecialUse::Archive,
             SpecialUse::Drafts,
+            SpecialUse::Junk,
             SpecialUse::Sent,
             SpecialUse::Trash
         ]
@@ -184,6 +187,49 @@ async fn raw_account_with_inbox_filled_on_login() {
     .expect("upsert");
     assert_eq!(
         MailboxStore::list(&meta, scope).await.expect("list").len(),
-        6
+        7
     );
+}
+
+#[tokio::test]
+async fn user_folder_with_system_name_kept() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let tenant = common::tenant(meta.pool()).await;
+    let (domain, dname) = common::domain(meta.pool(), tenant).await;
+    // «Junk» и «Junk 1» без роли — папки пользователя; системная Junk создаётся как «Junk 2».
+    let scope = raw_account(
+        meta.pool(),
+        tenant,
+        domain,
+        &format!("junk@{dname}"),
+        &[("Junk", None), ("Junk 1", None)],
+    )
+    .await;
+    let before = MailboxStore::list(&meta, scope).await.expect("list");
+    assert_eq!(roles(&meta, scope).await, ALL);
+    let mut junk: Vec<_> = before
+        .iter()
+        .filter(|m| m.name.starts_with("Junk"))
+        .map(|m| (m.name.as_str(), m.role))
+        .collect();
+    junk.sort_unstable_by_key(|(n, _)| *n);
+    assert_eq!(
+        junk,
+        vec![
+            ("Junk", None),
+            ("Junk 1", None),
+            ("Junk 2", Some(SpecialUse::Junk))
+        ]
+    );
+    // Повторное открытие — без новых папок, папки пользователя не тронуты.
+    let again = MailboxStore::list(&meta, scope).await.expect("list");
+    assert_eq!(again.len(), 8);
+    let ids = |v: &[tp_contracts::meta::Mailbox]| {
+        let mut ids: Vec<_> = v.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(ids(&before), ids(&again));
 }

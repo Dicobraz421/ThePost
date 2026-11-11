@@ -30,24 +30,47 @@ pub(crate) const SYSTEM_FOLDERS: [(&str, SpecialUse); 6] = [
     ("Archive", SpecialUse::Archive),
 ];
 
-/// Системные папки, которых недостаёт: нет папки с той же ролью и нет папки верхнего уровня
-/// с тем же именем (без учёта регистра — `INBOX` по RFC 3501, остальные — чтобы не плодить «sent» и «Sent»).
+/// Системные папки, которых недостаёт, с именами для создания (решение #205: роль — атрибут, по имени
+/// не назначается). Недостающей считается роль, которой нет ни у одной папки. Имя — системное, а если
+/// оно занято папкой верхнего уровня (без учёта регистра — `INBOX` по RFC 3501, остальные — чтобы
+/// не плодить «sent» и «Sent»), — с наименьшим свободным суффиксом: «Junk 1», «Junk 2»…
 /// `existing` — роль, родитель и имя каждой папки.
 pub(crate) fn missing_system<'a>(
-    existing: impl IntoIterator<Item = (Option<SpecialUse>, bool, &'a str)> + Clone,
-) -> Vec<(&'static str, SpecialUse)> {
-    SYSTEM_FOLDERS
-        .into_iter()
-        .filter(|(name, role)| {
-            !existing
-                .clone()
-                .into_iter()
-                .any(|(r, top, n)| r == Some(*role) || (top && n.eq_ignore_ascii_case(name)))
-        })
-        .collect()
+    existing: impl IntoIterator<Item = (Option<SpecialUse>, bool, &'a str)>,
+) -> Vec<(String, SpecialUse)> {
+    let mut roles = Vec::new();
+    let mut taken = Vec::new();
+    for (role, top, name) in existing {
+        roles.extend(role);
+        if top {
+            taken.push(name.to_ascii_lowercase());
+        }
+    }
+    let mut out = Vec::new();
+    for (base, role) in SYSTEM_FOLDERS {
+        if roles.contains(&role) {
+            continue;
+        }
+        let name = free_name(base, &taken);
+        taken.push(name.to_ascii_lowercase());
+        out.push((name, role));
+    }
+    out
 }
 
-fn missing_rows(rows: &[MailboxRow]) -> Result<Vec<(&'static str, SpecialUse)>> {
+/// `base` или `base N` с наименьшим `N`, не занятое среди `taken` (имена в нижнем регистре).
+fn free_name(base: &str, taken: &[String]) -> String {
+    let free = |n: &str| !taken.contains(&n.to_ascii_lowercase());
+    if free(base) {
+        return base.to_owned();
+    }
+    (1u32..)
+        .map(|i| format!("{base} {i}"))
+        .find(|n| free(n))
+        .unwrap_or_else(|| base.to_owned())
+}
+
+fn missing_rows(rows: &[MailboxRow]) -> Result<Vec<(String, SpecialUse)>> {
     let existing = rows
         .iter()
         .map(|r| {
@@ -102,7 +125,7 @@ pub(crate) async fn ensure_system(
     for (name, role) in &missing {
         let data = NewMailbox {
             parent: None,
-            name: (*name).to_owned(),
+            name: name.clone(),
             role: Some(*role),
         };
         let mb = insert(tx, scope, &data, ms).await?;
@@ -669,8 +692,8 @@ impl MailboxStore for PgMeta {
 mod tests {
     use super::*;
 
-    fn roles(v: &[(&str, SpecialUse)]) -> Vec<SpecialUse> {
-        v.iter().map(|(_, r)| *r).collect()
+    fn named(v: &[(String, SpecialUse)]) -> Vec<(&str, SpecialUse)> {
+        v.iter().map(|(n, r)| (n.as_str(), *r)).collect()
     }
 
     #[test]
@@ -678,25 +701,41 @@ mod tests {
         let none: [(Option<SpecialUse>, bool, &str); 0] = [];
         let m = missing_system(none);
         assert_eq!(m.len(), 6);
-        assert!(m.contains(&("Archive", SpecialUse::Archive)));
-        assert!(m.contains(&("INBOX", SpecialUse::Inbox)));
+        assert!(m.contains(&("Archive".to_owned(), SpecialUse::Archive)));
+        assert!(m.contains(&("INBOX".to_owned(), SpecialUse::Inbox)));
     }
 
     #[test]
-    fn missing_system_skips_same_role_or_name() {
+    fn missing_system_by_role_only() {
         let existing = [
             (Some(SpecialUse::Inbox), true, "INBOX"),
             // Роль та же, имя другое — не дублировать.
             (Some(SpecialUse::Sent), true, "Отправленные"),
-            // Имя то же (без учёта регистра), роли нет — не дублировать.
+            // Имя то же (без учёта регистра), роли нет — системная создаётся с суффиксом.
             (None, true, "junk"),
             // Вложенная папка с тем же именем не мешает.
             (None, false, "Trash"),
+            // Занятые суффиксы пропускаются.
+            (None, true, "Archive"),
+            (None, true, "ARCHIVE 1"),
+            (None, false, "Archive 2"),
         ];
         assert_eq!(
-            roles(&missing_system(existing)),
-            vec![SpecialUse::Drafts, SpecialUse::Trash, SpecialUse::Archive]
+            named(&missing_system(existing)),
+            vec![
+                ("Drafts", SpecialUse::Drafts),
+                ("Junk 1", SpecialUse::Junk),
+                ("Trash", SpecialUse::Trash),
+                ("Archive 2", SpecialUse::Archive),
+            ]
         );
+    }
+
+    #[test]
+    fn free_name_skips_taken() {
+        let taken = ["junk".to_owned(), "junk 1".to_owned(), "junk 3".to_owned()];
+        assert_eq!(free_name("Junk", &taken), "Junk 2");
+        assert_eq!(free_name("Sent", &taken), "Sent");
     }
 
     #[test]
