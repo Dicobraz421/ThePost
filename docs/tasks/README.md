@@ -410,12 +410,12 @@
 | [ADM-12](ADM-12.md) | постраничный список учётных записей в Admin API | admin | A | admin-07 | done | ADM-11 |
 | [APP-20](APP-20.md) | fail_closed защиты от перебора в узле, устаревший TODO doctor | app | A | app-19 | done | AUTH-11,APP-08 |
 | [APP-21](APP-21.md) | CLI thepost admin на структурах tp-admin | app | A | app-20 | done | APP-11 |
-| [CTR-44](CTR-44.md) | AccountStore::list — постраничный список учётных записей | contracts | B | contracts-32 | ready | ADM-12 |
-| [META-45](META-45.md) | побайтный порядок списка учётных записей — индекс COLLATE "C" | meta | B | meta-29 | todo | CTR-44 |
-| [ADM-13](ADM-13.md) | Serialize и Deserialize у структур Admin API | admin | A | admin-08 | ready | ADM-12 |
-| [APP-22](APP-22.md) | CLI thepost admin без копий структур | app | A | app-21 | todo | ADM-13,APP-21 |
-| [PLT-23](PLT-23.md) | текущая цепочка и ключ TLS для подписи | platform | A | platform-13 | ready | PLT-22 |
-| [APP-23](APP-23.md) | подпись профиля .mobileconfig в узле | app | A | app-22 | todo | PLT-23,JMAP-22 |
+| [CTR-44](CTR-44.md) | AccountStore::list — постраничный список учётных записей | contracts | B | contracts-32 | done | ADM-12 |
+| [META-45](META-45.md) | побайтный порядок списка учётных записей — индекс COLLATE "C" | meta | B | meta-29 | ready | CTR-44 |
+| [ADM-13](ADM-13.md) | Serialize и Deserialize у структур Admin API | admin | A | admin-08 | done | ADM-12 |
+| [APP-22](APP-22.md) | CLI thepost admin без копий структур | app | A | app-21 | done | ADM-13,APP-21 |
+| [PLT-23](PLT-23.md) | текущая цепочка и ключ TLS для подписи | platform | A | platform-13 | done | PLT-22 |
+| [APP-23](APP-23.md) | подпись профиля .mobileconfig в узле | app | A | app-22 | done | PLT-23,JMAP-22 |
 | [DEP-12](DEP-12.md) | стенд SMB — учётные записи через thepost admin и наполнение по Д.3 | deploy | A | deploy-12 | ready | DEP-04,APP-21 |
 | [DEP-13](DEP-13.md) | стенд SMB — замеры и отчёт по критериям Д.7 | deploy | A | deploy-12 | ready | DEP-12 |
 | [DEP-14](DEP-14.md) | стенд SMB — стресс, ×3, отказы и длительный прогон | deploy | A | deploy-12 | ready | DEP-13 |
