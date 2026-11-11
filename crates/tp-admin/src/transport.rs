@@ -30,14 +30,14 @@ use crate::server::{Admin, ApiResult, Problem};
 pub const CLUSTER_PREFIX: &str = "/api/v1/transport";
 
 /// Новая версия снимка после записи.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Written {
     /// Версия снимка (кластера — домены и источники; организации — политики).
     pub version: u64,
 }
 
 /// Версия снимка, на котором основано удаление.
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 pub struct VersionQuery {
     /// Версия снимка из последнего чтения.
@@ -45,7 +45,7 @@ pub struct VersionQuery {
 }
 
 /// Принятые домены организации.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DomainList {
     /// Версия снимка кластера.
     pub version: u64,
@@ -56,7 +56,7 @@ pub struct DomainList {
 }
 
 /// Принятый домен: создание или замена.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DomainBody {
     /// Версия снимка кластера.
@@ -70,7 +70,7 @@ pub struct DomainBody {
 }
 
 /// Записанный домен.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DomainWritten {
     /// Новая версия снимка кластера.
     pub version: u64,

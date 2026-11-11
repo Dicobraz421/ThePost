@@ -548,7 +548,7 @@ where
 }
 
 /// Сессия Admin API: значение показывается один раз.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AdminSession {
     /// Значение для `Authorization: Bearer` (`tps_…`).
     pub session: String,
