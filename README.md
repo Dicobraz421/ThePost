@@ -84,4 +84,4 @@ Linux x86_64 или AArch64. Готовые файлы — на странице
 - [Установка и первые шаги](docs/INSTALL.md) — для администратора.
 - [План работ](docs/PLAN.md) и [план-график](https://github.com/orgs/Dicobraz421/projects/3) — что готово и что дальше.
 - [Для разработчиков](docs/DEV.md) — сборка, тесты, процесс; спецификация — [`docs/spec/`](docs/spec/README.md).
-- Лицензия — MIT или Apache 2.0 на выбор ([MIT](LICENSE-MIT), [Apache 2.0](LICENSE-APACHE)).
+- Лицензия — проприетарная, все права защищены: [LICENSE](LICENSE).

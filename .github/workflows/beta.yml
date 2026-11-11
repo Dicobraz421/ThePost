@@ -86,7 +86,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "dist/$PKG"
-          cp "target/${{ matrix.target }}/release/thepost" LICENSE-APACHE LICENSE-MIT README.md "dist/$PKG/"
+          cp "target/${{ matrix.target }}/release/thepost" LICENSE README.md "dist/$PKG/"
           tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
           (cd dist && sha256sum "$PKG.tar.gz" > "$PKG.tar.gz.sha256")
       - name: Архив без интерпретаторов (CI-05)
