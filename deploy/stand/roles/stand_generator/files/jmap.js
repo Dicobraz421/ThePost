@@ -1,11 +1,13 @@
 // Нагрузка JMAP стенда SMB (APP-D Д.3, Д.4) для k6: push (WebSocket, RFC 8887) подключённых устройств, поиск
 // (Email/query по тексту), изменение флагов (Email/set keywords). Параметры — переменные окружения от
-// run-scenario.sh: SMB_HOST, DOMAIN, USERS, USER_PREFIX, USER_PASSWORD, DURATION (с), PUSH_VUS, SEARCH_PER_MIN,
-// FLAGS_PER_MIN, WORDS_FILE. Вход — Basic (пароль учётной записи).
+// run-scenario.sh: SMB_HOST, DOMAIN, USERS, USER_PREFIX, ACCOUNTS (login:пароль), DURATION (с), PUSH_VUS,
+// SEARCH_PER_MIN, FLAGS_PER_MIN, WORDS_FILE. Вход — Basic (пароль приложения учётной записи). Ответы 5xx — счётчик
+// http_5xx (критерий ×3: отказы только 4xx).
 import http from 'k6/http';
 import ws from 'k6/ws';
 import encoding from 'k6/encoding';
 import { check } from 'k6';
+import { Counter } from 'k6/metrics';
 
 const E = __ENV;
 const BASE = `https://${E.SMB_HOST}`;
@@ -14,6 +16,14 @@ const DURATION = parseInt(E.DURATION, 10);
 const WORDS = open(E.WORDS_FILE).split('\n').filter((w) => w.length > 0);
 const USING = ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'];
 const END = Date.now() + DURATION * 1000;
+const PASS = {};
+open(E.ACCOUNTS)
+  .split('\n')
+  .forEach((line) => {
+    const i = line.indexOf(':');
+    if (i > 0) PASS[line.slice(0, i)] = line.slice(i + 1);
+  });
+const http5xx = new Counter('http_5xx');
 
 function arrival(perMin, exec) {
   // Дробная частота — число вызовов за час.
@@ -39,6 +49,8 @@ if (parseInt(E.PUSH_VUS, 10) > 0) {
 export const options = {
   scenarios,
   summaryTrendStats: ['avg', 'p(50)', 'p(95)', 'p(99)', 'max'],
+  // Порогов нет: оценка — criteria.py; запись нужна, чтобы счётчик попал в --summary-export.
+  thresholds: { http_5xx: ['count>=0'] },
 };
 
 function login(n) {
@@ -46,7 +58,7 @@ function login(n) {
 }
 
 function auth(n) {
-  return { Authorization: `Basic ${encoding.b64encode(`${login(n)}:${E.USER_PASSWORD}`)}` };
+  return { Authorization: `Basic ${encoding.b64encode(`${login(n)}:${PASS[login(n)]}`)}` };
 }
 
 function randomUser() {
@@ -73,6 +85,7 @@ function api(n, calls, name) {
     tags: { name },
   });
   check(r, { [`${name} 200`]: (x) => x.status === 200 });
+  if (r.status >= 500) http5xx.add(1);
   return r;
 }
 

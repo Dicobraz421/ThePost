@@ -1,0 +1,31 @@
+# Наполнение ящиков до прогона (DEP-12, Д.3): fill.py на генераторе; выполненный объём — {{ stand_dir }}/fill-state.json,
+# повтор досылает только недостающее. Полный объём SMB (1 000 × 1 500) — часы: ожидание до 48 ч.
+---
+- name: Fill mailboxes (D.3)
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ stand_dir }}/fill.py"
+      - --accounts={{ stand_etc_dir }}/accounts
+      - --corpus={{ stand_dir }}/corpus
+      - --host={{ stand_smb_hostname }}
+      - --ca={{ (stand_etc_dir ~ '/ca.pem') if hostvars[stand_smb_host].thepost_tls_mode | default('certbot') == 'internal' else '' }}
+      - --users={{ stand_users }}
+      - --prefix={{ stand_user_prefix }}
+      - --domain={{ stand_domain }}
+      - --messages={{ stand_fill_messages }}
+      - --big={{ stand_big_mailbox }}@{{ stand_domain }}
+      - --big-messages={{ stand_big_messages }}
+      - --parallel={{ stand_fill_parallel }}
+      - --rate={{ stand_fill_rate }}
+      - --state={{ stand_dir }}/fill-state.json
+      - --verify={{ stand_fill_verify }}
+      - --sender-domain={{ stand_external_domain }}
+  register: stand_fill
+  changed_when: "'planned=0 ' not in stand_fill.stdout"
+  async: 172800
+  poll: 30
+
+- name: Show fill result
+  ansible.builtin.debug:
+    msg: "{{ stand_fill.stdout_lines }}"

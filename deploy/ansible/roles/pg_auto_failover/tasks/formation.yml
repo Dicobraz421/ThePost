@@ -6,9 +6,9 @@
 ---
 - name: Read formation settings
   community.postgresql.postgresql_query:
-    db: "{{ pgaf_monitor_db }}"
+    login_db: "{{ pgaf_monitor_db }}"
     query: SELECT formationid, number_sync_standbys FROM pgautofailover.formation
-    port: "{{ pgaf_port }}"
+    login_port: "{{ pgaf_port }}"
   register: pgaf_formation_settings
   changed_when: false
   become: true
@@ -16,12 +16,12 @@
 
 - name: Set number of synchronous standbys
   community.postgresql.postgresql_query:
-    db: "{{ pgaf_monitor_db }}"
+    login_db: "{{ pgaf_monitor_db }}"
     query: SELECT pgautofailover.set_formation_number_sync_standbys(%(formation)s, %(n)s)
     named_args:
       formation: "{{ item.formationid }}"
       n: "{{ pgaf_sync_wanted }}"
-    port: "{{ pgaf_port }}"
+    login_port: "{{ pgaf_port }}"
   loop: "{{ pgaf_formation_settings.query_result }}"
   loop_control:
     label: "{{ item.formationid }}"

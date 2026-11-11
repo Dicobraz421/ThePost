@@ -1,12 +1,13 @@
 # {{ ansible_managed }}
 # Учётные записи стенда для импорта в каталог: ldapadd -x -D <админ> -W -f users.ldif (FreeIPA — ipa user-add).
-{% for n in range(1, stand_users | int + 1) %}
-dn: uid={{ stand_user_prefix }}{{ n }},{{ stand_ldap_base_dn }}
+{% for uid in range(1, stand_users | int + 1) | map('string') | map('regex_replace', '^', stand_user_prefix) | list
+   + stand_probe_accounts + [stand_big_mailbox] %}
+dn: uid={{ uid }},{{ stand_ldap_base_dn }}
 objectClass: inetOrgPerson
-uid: {{ stand_user_prefix }}{{ n }}
-cn: Stand User {{ n }}
-sn: User{{ n }}
-mail: {{ stand_user_prefix }}{{ n }}@{{ stand_domain }}
+uid: {{ uid }}
+cn: Stand {{ uid }}
+sn: {{ uid }}
+mail: {{ uid }}@{{ stand_domain }}
 userPassword: {{ stand_user_password }}
 
 {% endfor %}

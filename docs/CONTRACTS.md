@@ -73,6 +73,16 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; по умолчанию — `Internal`),
   `list(tenant, prefix, after, limit)` (CTR-44, список Admin API: по возрастанию `lower(login)` в порядке сравнения строк хранилища,
   префикс и курсор `after` — в нижнем регистре, строго больше; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
+  Состояние ящика (CTR-35, «Удалённые ящики» решения 2026-11-04-exchange-parity): `AccountState::{Active, Disabled { until }}` —
+  отключённый ящик (учётная запись исчезла из каталога): вход и приём почты запрещены независимо от `enabled`, нет в GAL, хранится до
+  `until` (по умолчанию 30 дней — политика синхронизации). `account_state` (по умолчанию — через `get`, всегда `Active`),
+  `disable_account(tenant, id, until)` (повтор — срок заменяется; `upsert` состояние не меняет), `restore_account`, `disabled_accounts(tenant)
+  -> Vec<DisabledAccount { account, until }>` по (`until`, `id`), `expired_accounts(now, limit) -> Vec<AccountScope>` — все организации
+  (окончательное удаление через `before_final_delete`), `attach_account(tenant, disabled, to)` — подключение к учётной записи каталога
+  (Connect-Mailbox: `disabled` получает домен, вход, имя, `external_id`, `enabled` записи `to`, запись `to` удаляется; `disabled` действует —
+  `Invalid`, у `to` есть письма или она отключена — `Conflict`), `remove_disabled` — после удаления писем вызывающим (действующий —
+  `Invalid`, остались письма — `Conflict`). Методы, кроме `account_state`, по умолчанию — `Internal`. In-memory — `MemMetadata`; набор
+  `suite::account_state`. PostgreSQL — META-33.
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
   `delete` папки с вложенными без `cascade` — `Conflict`: решение («удалить вместе с вложенными?») принимает пользователь
   в клиенте, клиент повторяет вызов с `cascade = true`; письма всего поддерева — в корзину.
@@ -113,13 +123,14 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 ## EventBus
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
-LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
-`MailboxListChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
+LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } |
+DavChanged { kind, collection, modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+`MailboxListChanged`, `DavChanged`, `SieveChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
 `MembersChanged` — с `TenantId::DEFAULT`, `Blocked`, `Unblocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
 Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер); in-memory — `MemEventBus` (отставание — `Resync`).
 Доставка — at-most-once; клиент при запуске, после переподключения и по `Resync` сверяется с хранилищем. Публикация — только после фиксации,
-вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`. Набор `suite::signals`.
+вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`, `DavChanged` — `DavStore`, `SieveChanged` — `SieveStore`. Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
 ## Lease
@@ -190,6 +201,8 @@ SRS 5.2, решение 2026-11-01-borrowings-security (CTR-21; код — `deli
 Relay, Dsn }`, `DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, Hold }` (строки в нижнем регистре).
 `DeliveryLog`: `record(event)`, `record_batch(Vec<_>)` (по умолчанию — по одной), `search(tenant, &DeliveryQuery) -> DeliveryPage
 { events, next: Option<DeliveryCursor> }`, `purge(before)` — по всем организациям (maintenance), можно целыми сутками-секциями.
+`by_queue(tenant, QueueId, limit)` (CTR-35) — события записи очереди по `at` (равные — в порядке записи), `limit ≥ 1`: статус доставки
+отправки JMAP (`EmailSubmission.deliveryStatus`, связь — `EmailSubmission::queue`); по умолчанию — `Internal`, набор `suite::delivery_by_queue`.
 `DeliveryQuery { sender, recipient, message_id, since, until, limit, after }`: условия по «и», адреса — точно без учёта регистра ASCII,
 Message-ID — точно, интервал `[since, until)`; `validate()` (`limit ≥ 1`, непустой интервал) и `matches(&event)` — в контракте;
 порядок — по `at`, равные — в порядке записи; некорректный запрос или позиция — `Invalid`. Срок хранения (по умолчанию 30 суток) —
@@ -216,6 +229,16 @@ Vec<AccountId> (непусто — модерируемая), hidden_from_gal }`
 1–500 символов, иначе `Invalid`; пустой отправитель — без DSN). Письмо уже забрано `take_held`; успех освобождает ссылку на объект,
 ошибка — вызывающий возвращает письмо `hold`. Реализация — `tp-smtp` (карточка smtp), in-memory — `MemModeration` (запись решений,
 `fail_next`); набор `suite::moderation`.
+Одна очередь модерации для групп и правил потока (CTR-43, решение 2026-11-11-stage2-followups п. 9): `HeldMessage::group: Option<GroupId>`
+(`None` — письмо задержано правилом), `source: HoldSource::{Group, FlowRule { rule }}`, `moderators: Vec<Moderator::{Account, Group}>`
+(у правила — не пусто; у группы — снимок или пусто = модераторы группы), `recipients` — исходные получатели (у правила — не пусто);
+новые поля — `#[serde(default)]`; `HeldMessage::validate()` (источник и группа согласованы, имя правила 1–255 символов) — в `hold`
+(`Invalid`). `Moderation::deliver(tenant, group: Option<&DistributionGroup>, message)`: без группы — доставка исходным получателям;
+`check_delivery` — письмо группы без группы или правила с группой — `Invalid`. `ModerationDecision::Deliver(HeldId, Option<GroupId>)`; набор
+`suite::rule_moderation` (задержка правилом, одобрение — доставка получателям, отказ — DSN). Admin API: очередь модератора показывает
+`source`, `rule`, `moderators`, `recipients`, одобрение письма правила — `deliver(None)`. `PgMeta`: письма групп — как прежде (снимок
+модераторов и получателей не хранится), письмо правила — `Internal` до META-44 (колонка группы допускает NULL, модераторы, источник).
+Постановка правилом (`FlowVerdict::Moderate` → очередь вместо 451, имя правила — из `FlowOutcome::matched`) — SMTP-30.
 
 ## Search
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
@@ -235,6 +258,57 @@ SRS 5.1, 3.8. Каталог организации: `accounts_since(tenant, Opt
 Адрес для всей почты домена (catch-all) — псевдоним `DirAlias { address: "@domain", .. }`: получатель на адрес домена, не найденный
 в каталоге; порядок разрешения — адрес целиком, адрес без подадреса (`user+tag`), `@domain`.
 Реализация — `tp-auth` (LDAP); модуль «Мультитенантность» подключает каталог на организацию. Код — `auth.rs`.
+CTR-35: `DirAccount::org: DirOrg { department (external_id подразделения), title, manager (external_id), seniority }` (`#[serde(default)]`);
+`contacts_since(tenant, cursor, limit) -> DirPage<DirContact { external_id, display_name, email, attributes }>` (класс и ветка — настройка;
+по умолчанию — пустая порция с прежним курсором), `units(tenant) -> Vec<DirUnit { external_id, name, parent }>` (по умолчанию — пусто);
+`DirGroup::members` — также `external_id` контактов. In-memory — `FakeDirectory` (`upsert_contact`, `remove_contact`, `set_units`).
+Порог массового удаления: `exceeds_removal_threshold(removed, total, percent)`, `MASS_REMOVAL_PERCENT` = 5; `SyncGate` — остановка
+синхронизации до подтверждения: `hold_sync(tenant, removed, total, at) -> MassRemoval { removed, total, detected_at, approved }` (подтверждение
+сохраняется, если `removed` не выросло), `pending_sync`, `approve_sync` (нет — `NotFound`; Admin API), `clear_sync` (синхронизация после
+отключения). In-memory — `MemSyncGate`; набор `suite::sync_gate`.
+
+## AddressBook
+SRS 4.5, 5.1, решение 2026-11-04-exchange-parity (CTR-35; код — `addressbook.rs`). Ids — `ContactId`, `OrgUnitId`. Состояние учётной записи
+не учитывается: отключённые ящики исключает вызывающий.
+- `ContactStore`: `MailContact { id, tenant, display_name, email, external_id: Option<_> (None — Admin API), attributes, groups: Vec<GroupId>,
+  hidden_from_gal }`, `validate()`; `contact`, `contact_by_address` (без учёта регистра), `contact_by_external_id`, `contacts(tenant)` (по `id`),
+  `put_contact` (замена целиком, `groups` — по возрастанию без повторов; занятый адрес или `external_id` — `Conflict`), `remove_contact`
+  (нет — `NotFound`), `group_contacts(tenant, group)` — внешние получатели при раскрытии группы.
+- `OrgStore`: `OrgUnit { id, tenant, name, parent, external_id }`, `check_unit` (неизвестный родитель, цикл — `Invalid`), `unit_path` (от корня —
+  `ORG` в vCard); `org_units`, `put_org_unit` (занятый `external_id` — `Conflict`), `remove_org_unit` (есть вложенные — `Conflict`; у учётных
+  записей `department` сбрасывается). `OrgAttributes { department, title, manager, seniority, attributes }` (`validate()`,
+  `filter_attributes()` — с `title`); `org` (не заданы — по умолчанию), `set_org` (неизвестное подразделение, руководитель — сама запись —
+  `Invalid`; значение по умолчанию удаляет запись), `org_members(tenant, unit?, subtree) -> Vec<OrgMember>` в порядке `sort_members`
+  (старшинство по убыванию, без него — в конце, затем `AccountId`; неизвестное подразделение — `NotFound`).
+- `DynamicGroupStore`: динамическая группа — `DistributionGroup` в `GroupStore` (адрес, отправители, модерация, GAL) без статических членов и
+  `DynamicGroup { group, tenant, filter: MemberFilter, contacts }`. `MemberFilter::{Equals, Prefix, Present, Unit { unit, subtree }, All, Any,
+  Not}` — атрибуты без учёта регистра ASCII, значения — без учёта регистра; `validate()` (≤ 64 узлов, глубина ≤ 8), `matches(FilterTarget
+  { attributes, units })`. `dynamic`, `dynamic_groups`, `put_dynamic` (`Invalid`; PostgreSQL может требовать группу — `NotFound`),
+  `remove_dynamic`, `expand_dynamic -> Members { accounts, contacts }` (по возрастанию; учётные записи с оргатрибутами и, если `contacts`, —
+  контакты; не динамическая — `NotFound`).
+In-memory — `MemAddressBook`; наборы `suite::{contact_store, org_store, dynamic_groups}`. PostgreSQL — META-33, синхронизация — AUTH-10,
+Admin API — ADM-10, доставка — SMTP-26, JMAP `urn:thepost:orgchart` — JMAP-17.
+
+## SenderLists
+SRS 4.1, решение 2026-11-04-exchange-parity (CTR-35; код — `senders.rs`). Личные списки ящика поверх вердикта антиспама: заблокированный —
+«Спам», надёжный — «Входящие» (SMTP-25). `SenderList { safe, blocked }`: записи — адрес или домен (`@domain` на входе), `normalize_entry`
+(нижний регистр ASCII), `normalized()` (по возрастанию без повторов, до `MAX_SENDER_ENTRIES` = 1024 в каждом; иначе `Invalid`),
+`verdict(from) -> Option<SenderVerdict::{Safe, Blocked}>` — адрес целиком, затем домен (только точное совпадение), на одном уровне надёжный
+приоритетнее. `SenderLists`: `sender_list(scope)` (нет — пусто), `put_sender_list(scope, list) -> state` (замена целиком), `sender_list_state`
+(у нового ящика 0), `sender_verdict` (по умолчанию — через `sender_list`). In-memory — `MemSenderLists`; набор `suite::sender_lists`.
+JMAP `urn:thepost:senderlists` — JMAP-17, Admin API — ADM-10, PostgreSQL — META-33.
+
+## MailboxAudit
+SRS 5.2, решение 2026-11-04-exchange-parity (CTR-35; код — `audit.rs`). `AuditEntry { scope (ящик), at, actor (вход или субъект OIDC),
+actor_account: Option<AccountId>, actor_kind: AuditActorKind::{Owner, Delegate, Admin}, action: AuditAction::{Login, Read, Move, Delete, Send,
+SendAs, SendOnBehalf, ChangeRights, ChangeRules, ChangeForwarding}, object: AuditObject { mailbox?, message?, detail? }, client? }`,
+`validate()` (у владельца `actor_account` — ящик). `AuditPolicy { non_owner (по умолчанию true), owner: BTreeSet<AuditAction> (по умолчанию
+пусто; только `AuditAction::OWNER`) }`, `records(kind, action)` — чтение владельцем не записывается никогда. `MailboxAudit`:
+`record_audit(entry) -> bool` — протоколы вызывают для каждого действия, политику применяет хранилище; `audit_policy(scope)` (ящик → организация
+→ по умолчанию), `set_audit_policy(tenant, account?, policy?)`, `search_audit(tenant, &AuditQuery { account, actor, actor_kind, action, since,
+until, limit, after })` -> `AuditPage` (как `DeliveryLog::search`), `purge_audit(before)` (maintenance, можно сутками). In-memory —
+`MemMailboxAudit` (`entries`, `fail_next`); набор `suite::mailbox_audit`. Запись — IMAP-15, JMAP-18; PostgreSQL (только добавление) — META-33;
+выгрузка в SIEM и выборка — ADM-10.
 
 ## Auth
 SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>` (неверные данные — `Forbidden`);
@@ -373,6 +447,10 @@ SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организа
 `postpone(&claim, rcpt, at)` (перенос планировщиком без попытки — лимиты домена или узла: `attempts`, `last_error` не меняются; по
 умолчанию — `Internal`; набор `suite::queue_postpone`),
 `complete(&claim, rcpt, RcptStatus::{ Delivered { reply }, Failed { reply } }) -> bool` (`true` — все получатели завершены, запись удалена).
+Срок выпуска (CTR-35): `OutMessage::next_attempt` (`release_at()`) — для отложенной отправки срок `sendAt`; `Claimed::queued_at` — не раньше
+срока выпуска (от него считается срок доставки). `cancel_queued(tenant, id) -> BlobKey` — отмена до первого захвата (запись удаляется,
+ссылку освобождает вызывающий; захвачена — `Conflict` = `cannotUnsend`, нет — `NotFound`; атомарна с `claim`; по умолчанию — `Internal`);
+набор `suite::queue_release`. Выпуск по таймеру ближайшего срока — SMTP-24, PostgreSQL — META-33.
 Устаревший захват — `Conflict`; не завершённые до истечения лизы получатели возвращаются в очередь без `attempts` + 1.
 Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
 Расписание повторов, срок доставки и DSN — `tp-smtp` (DSN ставится в очередь до `complete(.., Failed)`).
@@ -398,6 +476,18 @@ queue) -> state` (`Final` со статусами; отменённая — `Con
 `delete -> state`, `due(now, limit)` — `Pending` с `send_at ≤ now` всех организаций (воркер отложенной отправки), `state(scope)`.
 Нет записи — `NotFound`. In-memory — `MemIdentities`, `MemSubmissions`; наборы `suite::{identity_store, submission_store}`. PostgreSQL — `tp-meta`
 (карточка meta), переход `tp-jmap` — волна полосы.
+Отложенная отправка и отмена (CTR-42, решение владельца #195): письмо с `sendAt` в будущем (предел — `maxDelayedSend` конфигурации
+`tp-jmap`) ставится в очередь сразу со сроком выпуска — `Outbound::schedule(tenant, mail_from, rcpts, raw, release_at) -> QueueId` (все
+получатели, локальные — при выпуске), отправка — `Pending` с `queue`; отмена — `Outbound::cancel_scheduled(tenant, queue)` (`QueueStore::cancel_queued`
+и освобождение тела; выпущено — `Conflict` = `cannotUnsend`, нет — `NotFound`), затем `SubmissionStore::cancel`; наступившие (`due`) — `finalize`;
+статусы — `DeliveryLog::by_queue`. Оба метода `Outbound` по умолчанию — `Internal`; in-memory — `MemOutbound` (`scheduled`, `release`), набор
+`suite::outbound_schedule`. `SubmissionStore` (CTR-42): `query_submissions(scope, &SubmissionFilter { identity_ids, email_ids, undo_status, before,
+after })` (RFC 8621 §7.3; `threadIds` вызывающий переводит в `email_ids`; по `send_at`, `id`; по умолчанию — `list` с фильтром),
+`submission_changes(scope, since, limit) -> SubmissionChanges { created, updated, destroyed, new_state, has_more }` (созданные и удалённые после
+`since` не входят; неизвестное или устаревшее состояние — `Conflict` = `cannotCalculateChanges`; `limit = 0` — `Invalid`), `expire_submissions(before,
+limit) -> usize` — срок хранения: `Final` и `Canceled` с `send_at < before` всех организаций (maintenance; срок — конфигурация); оба — по
+умолчанию `Internal`. Набор `suite::submission_query`. Далее: meta (таблица, RLS), smtp (выпуск по сроку, отмена), jmap (`maxDelayedSend`,
+`EmailSubmission/get|set|query|queryChanges`).
 
 ## Trash, Retention, Quota (Ф1)
 SRS 4.7, 3.8. Код — `retention.rs`. `TrashStore`: `list(scope, offset, limit) -> Vec<TrashItem { scope, object: TrashObject::Message(id), origin, size,
@@ -424,6 +514,54 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 `Quota`: `usage(scope) -> QuotaUsage` (письма, включая корзину, без скрытых; лимит — `PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded`
 (по умолчанию через `usage` и `QuotaUsage::allows`).
 Политики хранения и Legal Hold — модуль «Соответствие требованиям» через `DecisionHook::before_final_delete`.
+
+## Dav
+SRS 4.4, 3.1; CTR-45. Код — `dav.rs`. Одно хранилище для CalDAV, CardDAV и JMAP Calendars/Contacts; тело объекта хранилище не разбирает —
+индекс вычисляет вызывающий (`tp_dav::index` поверх calcard). JMAP Calendars — по текущему черновику IETF (решение 35).
+`CollectionId`, `DavObjectId` (UUID v7, `ids.rs`); `CollectionKind::{Calendar, AddressBook}`; `Component::{Event, Todo, Journal, Card}`
+(`VEVENT`… `VCARD`, `fits(kind)`). `Collection { id, kind, name (сегмент URL, `valid_name`), display_name, description, color, order,
+timezone (IANA), components: BTreeSet, state: ModSeq }`, `Collection::new(kind, name)`, `validate()` (→ `Invalid`); `kind` и `name` не меняются.
+`DavObject { id, collection, name, etag (без кавычек, `valid_etag`), body: String, index: ObjectIndex { component, uid, span: Option<Span {
+start, end: Option }> } }` — интервал с развёрнутыми повторами, `end = None` — бесконечный; `span = None` — без дат (кандидат любого запроса).
+`TimeRange { start?, end? }`, `ObjectIndex::may_overlap` — кандидат time-range: `start < range.end`, `end ≥ range.start` (точную проверку
+RFC 4791 §9.9 делает вызывающий).
+`DavStore` (по `AccountScope`, чужая учётная запись или организация — как отсутствующие): `limits() -> DavLimits { max_object_size,
+max_objects (в коллекции), max_collections (учётной записи) }` (из конфигурации реализации; превышение — `QuotaExceeded`);
+коллекции — `list_collections(kind)` (по `order`, имени), `get_collection(id)`, `collection_by_name(kind, name)`, `create_collection`
+(занятые `id` или имя вида — `Conflict`), `update_collection` (свойства), `delete_collection` (сразу, без корзины; объекты и коллекция —
+в надгробия, каждый со своим `ModSeq`); объекты — `get_object(collection, name)`, `object_by_uid`, `list_objects -> Vec<ObjectRef { id, name,
+etag }>`, `multiget(names)`, `objects_by_id(ids)` (JMAP), `in_range(collection, TimeRange)`, `put_object(collection, name, body, index,
+Precondition::{Any, IfMatch(etag), IfNoneMatch}) -> PutOutcome::{Stored(Put { id, etag, modseq, created }), PreconditionFailed,
+UidConflict { name }}` (UID уникален в коллекции; компонент не из `components` — `Invalid`; перезапись сохраняет `id`),
+`delete_object(collection, name, Precondition) -> DeleteOutcome::{Deleted(ModSeq), PreconditionFailed}` (нет ресурса при `Any` — `NotFound`).
+Изменения: `ModSeq` — из счётчика учётной записи (как у писем), у каждого изменения свой; `Collection::state` — наибольший `ModSeq`
+коллекции (CTag). `changes(collection, since, limit) -> Changes<String>` (имена, RFC 6578; повторно созданное имя — не в `destroyed`),
+`collection_changes(kind, since, limit) -> Changes<CollectionId>` (JMAP `Calendar/changes`, `AddressBook/changes`),
+`account_changes(kind, since, limit) -> Changes<DavObjectId>` (JMAP `CalendarEvent/changes`, `ContactCard/changes`), `state(kind)`
+(JMAP `state`). `since = 0` — всё в `created`; `has_more` — `new_state` последнего возвращённого; `since` старше очищенных надгробий или
+больше счётчика — `Conflict`. Сигнал `DavChanged { kind, collection, modseq }` (`dav_changed`, учётная запись) — после фиксации каждого
+изменения. In-memory — `MemDav` (`with_limits`, `with_bus`, `purge_tombstones`); наборы `suite::dav` (лимиты `suite::dav::LIMITS`,
+`DavFixture`), `suite::dav::signals`. PostgreSQL — `tp-meta` (META-46…48).
+
+## Sieve
+SRS 4.3; CTR-46. Код — `sieve.rs`. Интерпретатор — свой крейт `tp-sieve` (sieve-rs под AGPL-3.0); ManageSieve — в роли `imap` (как POP3),
+секция `sieve` крейта `tp-sieve`; `Role` не меняется. `SieveStore` (по `AccountScope`; текст проверяет вызывающий): `limits() ->
+SieveLimits { max_scripts, max_script_size }` (из конфигурации реализации; превышение — `QuotaExceeded`), `list -> Vec<ScriptInfo { name,
+size, active }>` (по имени), `get(name)`, `active() -> Option<ActiveScript { name, text }>`, `put(name, text)` (имя — `valid_script_name`,
+RFC 5804; замена сохраняет активность), `rename(from, to)` (занято — `Conflict`, активность переходит), `delete` (активный — `Conflict`),
+`activate(Option<name>)` (активный не больше одного; `None` — снять), `org_script(tenant)` / `set_org_script(tenant, Option<text>)` (скрипт
+организации, выполняется до скрипта пользователя; без сигнала), `vacation()` / `set_vacation(Vacation { enabled, from, to, subject,
+text_body, html_body })` (JMAP `VacationResponse`, RFC 8621 §8; `validate()`, `is_active(now)`: `from ≤ now < to`), `state()` — растёт при
+каждом изменении скриптов и автоответа (JMAP `state`, версия для кэша программ). Изменяющие методы возвращают новое состояние.
+`VacationLog::seen(scope, sender, handle, period) -> bool` — атомарно «уже отвечали за период» или отметка (RFC 5230 `:days`).
+Точка правил доставки `DeliveryRules::evaluate(&RulesInput { scope, recipient (с подадресом), mail_from, message: Bytes, mailboxes })
+-> RulesOutcome { keep: Vec<KeepTo { mailbox: MailboxRef::{Inbox, Id, Name { name, create }}, flags }>, redirect, discard,
+vacation: Option<AutoReply { to, from, subject, body: ReplyBody::{Text, Html, Mime}, in_reply_to, references }>, errors }`;
+порядок — скрипт организации, автоответ, активный скрипт; ошибка скрипта — implicit keep (`RulesOutcome::failed`) и `errors` для журнала;
+`Err` — сбой хранилища: вызывающий доставляет во «Входящие». Нет правил — `RulesOutcome::implicit_keep()`. Письмо автоответа собирает
+`tp-smtp` (RFC 3834). Сигнал `SieveChanged` (`sieve_changed`, учётная запись) — после изменения скриптов и автоответа. In-memory — `MemSieve`
+(`with_limits`, `with_bus`), `MemVacationLog`, фейк `FakeRules` (итог по получателю, `fail_next`, `calls`); наборы `suite::sieve`
+(лимиты `suite::sieve::LIMITS`, `SieveFixture`), `suite::sieve::{vacation_log, signals}`. PostgreSQL — `tp-meta` (META-49, META-50).
 
 ## Extension points
 SRS 2.5, 1.3. Модуль — cargo feature + `modules.<имя>.enabled`. `Module { name(), schema() -> "mod_<имя>", migrations() -> &[Migration { version, name, sql }],
@@ -555,3 +693,32 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (метод по умолчанию — `Internal`). Реализации — `PgMeta` (курсор по индексу `accounts_login (tenant_id, lower(login))`, порядок — правило
   сортировки базы по умолчанию), `MemMetadata` (побайтно); набор `suite::account_list`. `tp-admin`: список учётных записей — через
   `AccountStore::list`; временный трейт `AccountList` и `Admin::with_account_list` (ADM-12) удалены.
+- 2026-11-11 — CTR-35 (x/contracts-23, решение 2026-11-04-exchange-parity): `audit::{MailboxAudit, AuditEntry, AuditPolicy, AuditQuery}` — аудит
+  доступа к ящику с политикой действий владельца; `senders::{SenderLists, SenderList, SenderVerdict}` — личные списки отправителей;
+  `addressbook::{ContactStore, OrgStore, DynamicGroupStore, MemberFilter}` — почтовые контакты, оргструктура, динамические группы; ids
+  `ContactId`, `OrgUnitId`; `Directory`: `DirAccount::org`, `contacts_since`, `units`, `SyncGate` и порог массового удаления; `AccountStore`:
+  `AccountState`, отключение, восстановление, подключение к другой учётной записи, окончательное удаление; `QueueStore`: срок выпуска
+  (`next_attempt`, `queued_at`), `cancel_queued`; `DeliveryLog::by_queue`. Новые методы существующих трейтов — по умолчанию (`Internal`,
+  `account_state` — `Active`, `Directory` — пусто). In-memory — `MemMailboxAudit`, `MemSenderLists`, `MemAddressBook`, `MemSyncGate`,
+  `MemMetadata`, `MemQueue`, `MemDeliveryLog`, `FakeDirectory`; наборы `suite::{mailbox_audit, sender_lists, contact_store, org_store,
+  dynamic_groups, sync_gate, account_state, queue_release, delivery_by_queue}`. Реализации — META-33, AUTH-10, ADM-10, SMTP-24…26, JMAP-15…18,
+  IMAP-15, MS-16/17.
+- 2026-11-11 — CTR-42 (x/contracts-30, решение владельца #195): отложенная отправка и отмена — `Outbound::{schedule, cancel_scheduled}`
+  (очередь со сроком выпуска, отмена до выпуска), `SubmissionStore::{query_submissions, submission_changes, expire_submissions}`,
+  `SubmissionFilter`, `SubmissionChanges`; описание потока в `submission.rs` (воркер `due` только фиксирует наступившие). In-memory —
+  `MemOutbound` (`Scheduled`, `release`), `MemSubmissions` (журнал изменений); наборы `suite::{submission_query, outbound_schedule}`.
+- 2026-11-11 — CTR-43 (x/contracts-31, решение 2026-11-11-stage2-followups п. 9): очередь модерации и для правил потока почты —
+  `HeldMessage::{group: Option<_>, source: HoldSource, moderators: Vec<Moderator>, recipients}`, `HeldMessage::validate`,
+  `Moderation::deliver(.., Option<&DistributionGroup>, ..)` (без группы — исходным получателям), `check_delivery` для обоих случаев. In-memory —
+  `MemGroups`, `MemModeration` (`Deliver(_, Option<GroupId>)`); набор `suite::rule_moderation`. `tp-admin` — источник в очереди модератора,
+  одобрение письма правила; `tp-meta` — чтение и запись писем групп (письмо правила — `Internal` до META-44); `tp-smtp`, `tp-auth`, `thepost` —
+  новые поля и сигнатура.
+- 2026-11-11 — CTR-45 (x/contracts-33): `dav::{DavStore, Collection, CollectionKind, Component, DavObject, ObjectIndex, Span, TimeRange,
+  Precondition, PutOutcome, DeleteOutcome, DavLimits, dav_changed}`, `CollectionId`, `DavObjectId`, `EventKind::DavChanged` — календари и
+  контакты Ф2. По сравнению с карточкой: методы с префиксами (`*_collection`, `*_object`), `collection_by_name`, `objects_by_id`,
+  `collection_changes`, `state(kind)` для JMAP; итог записи — `PutOutcome` (412 и `no-uid-conflict` с именем ресурса различимы, не `Conflict`);
+  UID — в `ObjectIndex`. In-memory — `MemDav`; наборы `suite::dav`, `suite::dav::signals`. Реализация в `tp-meta` — META-46…48.
+- 2026-11-11 — CTR-46 (x/contracts-33): `sieve::{SieveStore, ScriptInfo, ActiveScript, SieveLimits, Vacation, VacationLog, DeliveryRules,
+  RulesInput, RulesOutcome, KeepTo, MailboxRef, AutoReply, ReplyBody, sieve_changed}`, `EventKind::SieveChanged`. По сравнению с карточкой:
+  `SieveStore::active`, `limits`, `state`; `MailboxRef::Inbox` для implicit keep; `AutoReply::references`. In-memory — `MemSieve`,
+  `MemVacationLog`, `FakeRules`; наборы `suite::sieve`, `suite::sieve::{vacation_log, signals}`. Реализация в `tp-meta` — META-49, META-50.

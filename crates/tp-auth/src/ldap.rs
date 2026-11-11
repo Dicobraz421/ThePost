@@ -873,6 +873,7 @@ impl LdapDirectory {
             emails,
             enabled,
             attributes,
+            org: Default::default(),
         })
     }
 

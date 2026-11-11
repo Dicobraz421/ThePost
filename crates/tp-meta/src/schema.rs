@@ -90,6 +90,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "accounts login c",
         include_str!("../migrations/0019_accounts_login_c.sql"),
     ),
+    (
+        20,
+        "mailbox shards",
+        include_str!("../migrations/0020_mailbox_shards.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

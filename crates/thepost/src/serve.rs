@@ -606,9 +606,10 @@ fn node_info(id: NodeId, roles: &BTreeSet<Role>, cluster: &ClusterSection) -> Re
 }
 
 /// Транспорт запросов узел → узел (CLU-12) по секции `cluster`: mTLS внутреннего канала (`cluster.rpc.tls`,
-/// сертификат называет этот узел), слушатель — на `cluster.addr` (сокет systemd с тем же адресом или новый) до
-/// `shutdown`. Транспорт не включён ([`ClusterSection::rpc_enabled`]) — `None`; без адреса — только исходящие
-/// запросы. Ошибка сертификатов или слушателя — до запуска ролей.
+/// сертификат называет этот узел), слушатель — на `cluster.listen`, не задан — на `cluster.addr` (сокет systemd с
+/// тем же адресом или новый) до `shutdown`; другим узлам объявляется `cluster.addr`. Транспорт не включён
+/// ([`ClusterSection::rpc_enabled`]) — `None`; без адреса — только исходящие запросы. Ошибка сертификатов или
+/// слушателя — до запуска ролей.
 async fn start_rpc(
     cluster: &ClusterSection,
     node: &NodeId,
@@ -626,16 +627,17 @@ async fn start_rpc(
         tracing::info!("cluster.rpc: адрес узла не задан — запросы других узлов не принимаются");
         return Ok(Some(rpc));
     };
+    let key = cluster.listen_key();
     let addr = tokio::net::lookup_host(listen)
         .await
         .ok()
         .and_then(|mut a| a.next())
-        .ok_or_else(|| Error::Invalid(format!("cluster.addr: адрес {listen:?} не разрешается")))?;
+        .ok_or_else(|| Error::Invalid(format!("{key}: адрес {listen:?} не разрешается")))?;
     let tcp = sockets.take_or(addr, || {
         tp_sys::bind_tcp(addr, &tp_sys::ListenerConfig::default())
-            .map_err(|e| Error::Invalid(format!("cluster.addr {addr}: {e}")))
+            .map_err(|e| Error::Invalid(format!("{key} {addr}: {e}")))
     })?;
-    tracing::info!(%addr, "cluster.rpc: приём запросов других узлов");
+    tracing::info!(%addr, announced = %cluster.addr, "cluster.rpc: приём запросов других узлов");
     let server = rpc.clone();
     tokio::spawn(async move {
         if let Err(e) = server
@@ -670,9 +672,9 @@ async fn heartbeat(
     }
 }
 
-/// Адреса слушателей узла по конфигурации: служебный HTTP, запросы узел → узел (`cluster.addr`), HTTP-01
-/// (`acme.enabled`) и слушатели включённых ролей (smtp-in, submission, imap и POP3, jmap, admin) — для проверки
-/// сокетов systemd ([`Sockets::warn_unused`]).
+/// Адреса слушателей узла по конфигурации: служебный HTTP, запросы узел → узел (`cluster.listen`, не задан —
+/// `cluster.addr`), HTTP-01 (`acme.enabled`) и слушатели включённых ролей (smtp-in, submission, imap и POP3, jmap,
+/// admin) — для проверки сокетов systemd ([`Sockets::warn_unused`]).
 fn listen_addrs(cfg: &Config) -> Vec<SocketAddr> {
     let roles = cfg.roles();
     let mut out = Vec::new();
@@ -745,6 +747,7 @@ async fn apply_telemetry(
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tp_contracts::secrets::SecretRef;
@@ -958,6 +961,28 @@ mod tests {
         l.local_addr().expect("addr").port()
     }
 
+    /// Проброс порта: новый порт на 127.0.0.1, соединения с ним пересылаются на `127.0.0.1:to`; счётчик —
+    /// принятые соединения.
+    async fn forward_port(to: u16) -> (u16, Arc<AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = l.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if let Ok(mut out) = tokio::net::TcpStream::connect(("127.0.0.1", to)).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+                    }
+                });
+            }
+        });
+        (port, count)
+    }
+
     struct Echo;
 
     #[async_trait::async_trait]
@@ -974,7 +999,9 @@ mod tests {
 
     /// APP-18: два узла в процессе над одной базой — `cluster.addr` объявлен в составе и слушается, вызов идёт по
     /// HTTPS с mTLS на узел с ролью службы, вызывающий опознан по сертификату; матрица `cluster.rpc.permissions`
-    /// на принимающем узле отказывает роли без разрешения.
+    /// на принимающем узле отказывает роли без разрешения. APP-30: узел `b` слушает `cluster.listen`, а объявляет
+    /// `cluster.addr` с другим портом (проброс порта) — `a` вызывает `b` по объявленному адресу через проброс;
+    /// `a` без `listen` слушает свой `addr`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_nodes_call_each_other_over_rpc() {
         use tp_contracts::rpc::{Rpc, RpcError, RpcService};
@@ -993,8 +1020,17 @@ mod tests {
         let certs = cluster_testdata();
         let mut nodes = Vec::new();
         // Узел `a` — maintenance (ему разрешены службы search), `b` — search. Запуск по очереди: миграции.
+        let mut forwards = None;
         for (id, role) in [("a", "maintenance"), ("b", "search")] {
-            let port = free_port().await;
+            let (port, listen) = if id == "b" {
+                // Проброс: объявленный порт принимает пересылка на порт слушателя узла.
+                let listen = free_port().await;
+                let (port, count) = forward_port(listen).await;
+                forwards = Some(count);
+                (port, format!("  listen: 127.0.0.1:{listen}\n"))
+            } else {
+                (free_port().await, String::new())
+            };
             let home = dir.path().join(id);
             std::fs::create_dir_all(&home).expect("dir");
             let path = write_config(
@@ -1003,7 +1039,7 @@ mod tests {
                     "domain: example.org\nprofile: dev\nroles: [{role}]\n\
                      service_http:\n  listen: 127.0.0.1:0\n  allow_plaintext: true\n\
                      database:\n  url: \"{db_url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
-                     cluster:\n  node_id: {id}\n  addr: https://127.0.0.1:{port}\n  rpc:\n    members_ttl: 0s\n\
+                     cluster:\n  node_id: {id}\n  addr: https://127.0.0.1:{port}\n{listen}  rpc:\n    members_ttl: 0s\n\
                      \x20   permissions:\n      maintenance: [search/*]\n    tls:\n\
                      \x20     ca_file: {c}/ca.pem\n      cert_file: {c}/node-{id}.pem\n      key_file: {c}/node-{id}-key.pem\n\
                      runtime:\n  drain_deadline: 5s\n\
@@ -1042,6 +1078,9 @@ mod tests {
             .await
             .expect("call a -> b");
         assert_eq!(&out[..], b"a|k1|ping");
+        // Вызов дошёл по объявленному адресу `b` — через проброс на его `cluster.listen`.
+        let forwards = forwards.expect("проброс");
+        assert!(forwards.load(Ordering::SeqCst) > 0, "вызов мимо проброса");
 
         // Роли search службы maintenance не разрешены: отказ на принимающем узле `a`.
         let maintenance = RpcService::new(Role::Maintenance, "echo").expect("service");

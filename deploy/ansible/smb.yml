@@ -23,6 +23,7 @@
         that: ansible_os_family == 'Debian'
         fail_msg: "Эталон SMB — Debian 12 или Ubuntu 24.04"
   roles:
+    - chrony
     - thepost_pki
     - openbao
     - postgresql

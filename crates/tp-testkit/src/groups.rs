@@ -106,7 +106,7 @@ impl GroupStore for MemGroups {
         let ids: Vec<_> = st
             .held
             .iter()
-            .filter(|((t, _), h)| *t == tenant && h.group == id)
+            .filter(|((t, _), h)| *t == tenant && h.group == Some(id))
             .map(|(k, _)| *k)
             .collect();
         Ok(sorted(
@@ -143,8 +143,11 @@ impl GroupStore for MemGroups {
     }
 
     async fn hold(&self, tenant: TenantId, message: HeldMessage) -> Result<()> {
+        message.validate()?;
         let mut st = lock(&self.state);
-        if !st.groups.contains_key(&(tenant, message.group)) {
+        if let Some(g) = message.group
+            && !st.groups.contains_key(&(tenant, g))
+        {
             return Err(Error::NotFound);
         }
         if st.held.contains_key(&(tenant, message.id)) {
@@ -164,7 +167,7 @@ impl GroupStore for MemGroups {
         let mut found = sorted(
             st.held
                 .iter()
-                .filter(|((t, _), h)| *t == tenant && group.is_none_or(|g| h.group == g))
+                .filter(|((t, _), h)| *t == tenant && group.is_none_or(|g| h.group == Some(g)))
                 .map(|(_, h)| h.clone())
                 .collect(),
         );
@@ -183,8 +186,8 @@ impl GroupStore for MemGroups {
 /// Решение модератора, записанное [`MemModeration`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModerationDecision {
-    /// Одобрено: письмо и группа доставки.
-    Deliver(HeldId, GroupId),
+    /// Одобрено: письмо и группа доставки (`None` — письмо правила потока, исходным получателям; CTR-43).
+    Deliver(HeldId, Option<GroupId>),
     /// Отклонено: письмо и причина.
     Reject(HeldId, String),
 }
@@ -233,11 +236,11 @@ impl Moderation for MemModeration {
     async fn deliver(
         &self,
         tenant: TenantId,
-        group: &DistributionGroup,
+        group: Option<&DistributionGroup>,
         message: &HeldMessage,
     ) -> Result<()> {
         check_delivery(tenant, group, message)?;
-        self.push(ModerationDecision::Deliver(message.id, group.id))
+        self.push(ModerationDecision::Deliver(message.id, group.map(|g| g.id)))
     }
 
     async fn reject(&self, _tenant: TenantId, message: &HeldMessage, reason: &str) -> Result<()> {
@@ -251,7 +254,7 @@ mod tests {
     use super::*;
     use crate::suite::{GroupFixture, ModerationFixture, group_store, moderation};
     use time::OffsetDateTime;
-    use tp_contracts::groups::SenderRestriction;
+    use tp_contracts::groups::{HoldSource, SenderRestriction};
     use tp_contracts::{BlobHash, BlobKey, Gen};
 
     #[tokio::test]
@@ -282,7 +285,10 @@ mod tests {
         };
         let held = || HeldMessage {
             id: HeldId::new(),
-            group: group.id,
+            group: Some(group.id),
+            source: HoldSource::Group,
+            moderators: Vec::new(),
+            recipients: Vec::new(),
             sender: "x@example.com".into(),
             sender_account: None,
             message_id: None,
@@ -305,16 +311,36 @@ mod tests {
         assert_eq!(
             m.decisions(),
             [
-                ModerationDecision::Deliver(fx.approve.id, group.id),
+                ModerationDecision::Deliver(fx.approve.id, Some(group.id)),
                 ModerationDecision::Reject(fx.decline.id, "off-topic".into()),
             ]
         );
         m.fail_next(Error::UNAVAILABLE);
         assert_eq!(
-            m.deliver(tenant, &group, &fx.approve).await,
+            m.deliver(tenant, Some(&group), &fx.approve).await,
             Err(Error::UNAVAILABLE)
         );
         assert_eq!(m.decisions().len(), 2);
+    }
+
+    /// CTR-43: общий набор очереди модерации для правил потока.
+    #[tokio::test]
+    async fn rule_moderation_suite() {
+        let groups = MemGroups::new();
+        let m = MemModeration::new();
+        let fx = crate::suite::RuleModerationFixture {
+            tenant: TenantId::DEFAULT,
+            moderator: AccountId::new(),
+            recipients: vec!["a@example.org".into(), "b@example.net".into()],
+        };
+        let (approved, declined) = crate::suite::rule_moderation(&groups, &m, &fx).await;
+        assert_eq!(
+            m.decisions(),
+            [
+                ModerationDecision::Deliver(approved, None),
+                ModerationDecision::Reject(declined, "not allowed".into()),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -95,7 +95,10 @@ impl Groups {
         let id = HeldId::new();
         let message = HeldMessage {
             id,
-            group: h.group.id,
+            group: Some(h.group.id),
+            source: Default::default(),
+            moderators: Vec::new(),
+            recipients: Vec::new(),
             sender: h.sender.to_owned(),
             sender_account: h.sender_account,
             message_id: h.message_id,

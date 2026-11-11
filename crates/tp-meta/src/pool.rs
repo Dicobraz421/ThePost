@@ -4,7 +4,8 @@
 //! поэтому состояние сеанса не используется — контекст организации задаёт `SET LOCAL` ([`with_tenant`]),
 //! кэш подготовленных выражений отключён (безымянные выражения работают с любой версией PgBouncer).
 //! Миграции держат рекомендательную блокировку сеанса — их пул подключается в обход PgBouncer
-//! ([`PoolConfig::direct_url`], [`connect_direct`]).
+//! ([`PoolConfig::direct_url`], [`connect_direct`]). Прямые адреса — списком `direct_url` + [`PoolConfig::direct_urls`]
+//! (эталон Enterprise-ВМ за PgBouncer, META-41): миграции и слушатель сигналов ищут на нём primary.
 //!
 //! Канал до PostgreSQL — только TLS `sslmode=verify-full` с корнями и клиентским сертификатом из
 //! [`PoolConfig::tls`] (CTR-12, решение 2026-10-30); адрес без `sslmode` подключается так же. Открытый канал
@@ -18,6 +19,9 @@
 //!
 //! Адрес primary — `url` или список `url` + [`PoolConfig::urls`] (первый доступный для записи); поведение при
 //! переключении СУБД ([`PoolConfig::failover`]) — [`crate::failover`] (META-25).
+//!
+//! Реплика для фоновых чтений ([`PoolConfig::read_replica`], `ReadIntent::Stale`, META-32) — [`connect_replica`],
+//! [`crate::replica`].
 
 use std::fmt;
 use std::future::Future;
@@ -29,14 +33,14 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 use tp_contracts::config::duration;
 use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
 use tp_contracts::{Error, Result, TenantId};
 
 use crate::credentials::{self, DynamicCredentials, Rotated, Rotation};
-use crate::failover::{FailoverConfig, Target};
+use crate::failover::{FailoverConfig, Target, retarget, writable};
 use crate::schema::{begin, begin_system, db_err};
 
 /// Секция конфигурации пула соединений `database` (SRS 5.5). Все параметры требуют перезапуска.
@@ -67,8 +71,21 @@ pub struct PoolConfig {
     /// Логин и пароль из database secrets engine с арендой и ротацией (вместо `password`; логин из адреса
     /// не используется). Не задано — статический пароль `password`.
     pub dynamic_credentials: Option<DynamicCredentials>,
-    /// Адрес PostgreSQL в обход PgBouncer для миграций (без пароля); по умолчанию — `url`.
+    /// Адрес PostgreSQL в обход PgBouncer для миграций и слушателя сигналов (без пароля); по умолчанию — `url`.
     pub direct_url: Option<String>,
+    /// Другие прямые адреса кластера (без пароля): миграции и слушатель сигналов выбирают первый доступный для
+    /// записи из `direct_url` и `direct_urls` (как `url` и `urls` для пула узла); учётные данные и параметры —
+    /// из `url`. Пусто — единственный прямой адрес `direct_url`.
+    pub direct_urls: Vec<String>,
+    /// Адрес реплики основной БД для фоновых чтений (`ReadIntent::Stale`: экспорт, отчёты, eDiscovery, verify,
+    /// «сироты» BLOB, первичная индексация) без пароля; учётные данные — как у `url`. Не задан — фоновые
+    /// чтения на primary. Реплики шардов — столбец `read_replica` справочника шардов.
+    pub read_replica: Option<String>,
+    /// Наибольшее отставание реплики (`now() - pg_last_xact_replay_timestamp()`) для фоновых чтений; больше,
+    /// неизвестно или реплика недоступна — чтение на primary.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub replica_max_lag: Duration,
     /// Владелец схемы — только для миграций ([`connect_direct`], `thepost migrate`); узлы входят ролями с
     /// минимальными правами (`thepost_app`, `thepost_reader`, META-23). Не задано — миграции от роли `url`.
     pub owner: Option<SchemaOwner>,
@@ -111,6 +128,9 @@ impl Default for PoolConfig {
             password: None,
             dynamic_credentials: None,
             direct_url: None,
+            direct_urls: Vec::new(),
+            read_replica: None,
+            replica_max_lag: Duration::from_secs(30),
             owner: None,
             pgbouncer: false,
             max_connections: 32,
@@ -134,6 +154,9 @@ impl fmt::Debug for PoolConfig {
             .field("failover", &self.failover)
             .field("password", &self.password)
             .field("dynamic_credentials", &self.dynamic_credentials)
+            .field("direct_urls", &self.direct_urls.len())
+            .field("read_replica", &self.read_replica.is_some())
+            .field("replica_max_lag", &self.replica_max_lag)
             .field("owner", &self.owner)
             .field("pgbouncer", &self.pgbouncer)
             .field("max_connections", &self.max_connections)
@@ -181,8 +204,13 @@ impl PoolConfig {
                 transport = Transport::Plaintext;
             }
         }
-        if let Some(direct) = &self.direct_url
-            && self.options(direct, false)?.1 == Transport::Plaintext
+        for direct in self.direct_url.iter().chain(&self.direct_urls) {
+            if self.options(direct, false)?.1 == Transport::Plaintext {
+                transport = Transport::Plaintext;
+            }
+        }
+        if let Some(replica) = &self.read_replica
+            && self.options(replica, self.pgbouncer)?.1 == Transport::Plaintext
         {
             transport = Transport::Plaintext;
         }
@@ -195,6 +223,32 @@ impl PoolConfig {
             .chain(&self.urls)
             .map(|url| Ok(Target::new(self.options(url, self.pgbouncer)?.0)))
             .collect()
+    }
+
+    /// Прямые адреса мимо PgBouncer — `direct_url`, затем `direct_urls`; `None` — не заданы.
+    pub(crate) fn direct_addresses(&self) -> Option<Vec<String>> {
+        let list: Vec<String> = self
+            .direct_url
+            .iter()
+            .chain(&self.direct_urls)
+            .cloned()
+            .collect();
+        (!list.is_empty()).then_some(list)
+    }
+
+    /// Адреса соединений в обход PgBouncer (миграции): прямые адреса, иначе `url` + `urls` (через PgBouncer,
+    /// если он включён); второе значение — соединение через PgBouncer.
+    pub(crate) fn migration_addresses(&self) -> (Vec<String>, bool) {
+        match self.direct_addresses() {
+            Some(list) => (list, false),
+            None => (
+                std::iter::once(&self.url)
+                    .chain(&self.urls)
+                    .cloned()
+                    .collect(),
+                self.pgbouncer,
+            ),
+        }
     }
 
     /// Пароль и динамические учётные данные не заданы вместе; параметры ротации; имя владельца схемы.
@@ -256,7 +310,7 @@ impl PoolConfig {
     }
 
     /// Параметры нового пула с паролем из хранилища; открытый канал — предупреждение в лог.
-    fn open_options(
+    pub(crate) fn open_options(
         &self,
         url: &str,
         pgbouncer: bool,
@@ -454,13 +508,34 @@ pub fn connect_lazy(cfg: &PoolConfig, url: &str, password: Option<&Secret>) -> R
     Ok(cfg.pool_options().connect_lazy_with(opts))
 }
 
+/// Пул к реплике основной БД [`PoolConfig::read_replica`] (соединения — по требованию) с учётными данными
+/// `password`; `None` — реплика не задана. Динамические учётные данные для реплики не поддерживаются —
+/// `Invalid`.
+pub async fn connect_replica(
+    cfg: &PoolConfig,
+    secrets: &dyn SecretStore,
+) -> Result<Option<PgPool>> {
+    let Some(url) = &cfg.read_replica else {
+        return Ok(None);
+    };
+    if cfg.dynamic_credentials.is_some() {
+        return Err(Error::invalid(
+            "database.read_replica: динамические учётные данные для реплики не поддерживаются",
+        ));
+    }
+    let password = cfg.password(secrets).await?;
+    connect_lazy(cfg, url, password.as_ref()).map(Some)
+}
+
 /// Пул из одного соединения в обход PgBouncer для миграций ([`crate::schema::migrate`], модули): с
 /// [`PoolConfig::owner`] — от владельца схемы с его паролем, иначе — с учётными данными узла.
+///
+/// Адресов несколько (`direct_url` + `direct_urls`, иначе `url` + `urls`) — соединение с первым доступным для
+/// записи (поиск primary, как у пула узла; проверка адреса — не дольше `failover.probe_timeout`); ни один
+/// не доступен для записи — `Unavailable`.
 pub async fn connect_direct(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Result<PgPool> {
-    let (url, pgbouncer) = match &cfg.direct_url {
-        Some(url) => (url.as_str(), false),
-        None => (cfg.url.as_str(), cfg.pgbouncer),
-    };
+    let (addresses, pgbouncer) = cfg.migration_addresses();
+    let url = addresses[0].as_str();
     let opts = match &cfg.owner {
         Some(owner) => {
             cfg.check_credentials()?;
@@ -473,12 +548,43 @@ pub async fn connect_direct(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Resu
         }
         None => credentials_options(cfg, url, pgbouncer, secrets).await?,
     };
+    let opts = if addresses.len() == 1 {
+        opts
+    } else {
+        writable_address(cfg, &opts, &addresses, pgbouncer).await?
+    };
     PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(cfg.acquire_timeout)
         .connect_with(opts)
         .await
         .map_err(db_err)
+}
+
+/// Параметры `opts` (учётные данные — из них), перенесённые на первый из `addresses`, доступный для записи.
+async fn writable_address(
+    cfg: &PoolConfig,
+    opts: &PgConnectOptions,
+    addresses: &[String],
+    pgbouncer: bool,
+) -> Result<PgConnectOptions> {
+    for url in addresses {
+        let target = retarget(opts.clone(), &cfg.connect_options(url, pgbouncer)?);
+        let check = async {
+            let mut conn = PgConnection::connect_with(&target).await?;
+            let ok = writable(&mut conn).await;
+            let _ = conn.close().await;
+            ok
+        };
+        match tokio::time::timeout(cfg.failover.probe_timeout, check).await {
+            Ok(Ok(true)) => return Ok(target),
+            Ok(Ok(false)) => tracing::debug!("миграции: адрес только для чтения"),
+            Ok(Err(e)) => tracing::debug!(error = %e, "миграции: адрес недоступен"),
+            Err(_) => tracing::debug!("миграции: адрес не ответил"),
+        }
+    }
+    tracing::warn!("миграции: ни один адрес СУБД не доступен для записи");
+    Err(Error::UNAVAILABLE)
 }
 
 /// Будущее тела транзакции, заимствующее соединение.

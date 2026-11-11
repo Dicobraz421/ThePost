@@ -93,9 +93,9 @@ PTR задаёт владелец адреса (провайдер, хостин
 
 | Требование | Проверка | При нарушении | Источник |
 |---|---|---|---|
-| Часы узлов и сервера СУБД синхронизированы (NTP/chrony) | `time.clock_skew`: < 500 мс — `OK` (`doctor.warn_clock_skew`), ≥ 5 с — `FAIL` (`doctor.max_clock_skew`); `timedatectl` | лизы, сроки записей, DKIM, TOTP работают неверно | [`doctor.rs`](../crates/thepost/src/doctor.rs), [`sections.rs`](../crates/thepost/src/sections.rs) |
-| Часовой пояс сеанса СУБД — UTC | `database.timezone` | `FAIL` | [`tp-meta/src/doctor.rs`](../crates/tp-meta/src/doctor.rs) |
-| Журналы СУБД — в UTC (`log_timezone`) | `database.log_timezone` | `WARN`: время в журналах СУБД расходится с журналами The Post | там же |
+| Часы узлов и сервера СУБД синхронизированы (NTP/chrony). Эталоны Ansible (`smb.yml`, `pg-ha.yml`) ставят chrony первой ролью; серверы — `thepost_ntp_servers` (пусто — пул дистрибутива) | `time.clock_skew`: < 500 мс — `OK` (`doctor.warn_clock_skew`), ≥ 5 с — `FAIL` (`doctor.max_clock_skew`); `chronyc tracking` (`Leap status : Normal`), `timedatectl` | лизы, сроки записей, DKIM, TOTP работают неверно | [`doctor.rs`](../crates/thepost/src/doctor.rs), [`sections.rs`](../crates/thepost/src/sections.rs), [роль `chrony`](../deploy/ansible/roles/chrony/defaults/main.yml), [решение 25](decisions/2026-11-11-stage2-followups.md) |
+| Часовой пояс сеанса СУБД — UTC (эталоны Ansible задают `timezone = 'UTC'`) | `database.timezone`; `psql -Atc 'SHOW timezone'` → `UTC` | `FAIL` | [`tp-meta/src/doctor.rs`](../crates/tp-meta/src/doctor.rs), [решение 24](decisions/2026-11-11-stage2-followups.md) |
+| Журналы СУБД — в UTC (`log_timezone`; эталоны Ansible задают) | `database.log_timezone` | `WARN`: время в журналах СУБД расходится с журналами The Post | там же |
 
 Служба менять часы не может (`ProtectClock=yes`, без `@clock`): синхронизацию ведёт система.
 
@@ -108,14 +108,14 @@ PTR задаёт владелец адреса (провайдер, хостин
 | Способ выпуска — `thepost_tls_mode`: `certbot` (порт 80, DNS на ВМ), `acme`, `files`, `internal` (только стенд) | прогон плейбука | плейбук отклоняет неверный режим или пустой `thepost_acme_email` | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
 | Клиенты — TLS 1.3; TLS 1.2 только настройкой `tls.min_version: "1.2"` | `openssl s_client -tls1_2 -connect <сервер>:993` | старые клиенты без TLS 1.3 не подключатся | [S6 п. 6.2](spec/S6.md), [`tls.rs`](../crates/tp-platform/src/tls.rs) |
 | Внутренние каналы (PostgreSQL, S3, OpenBao, служебный HTTP) — только TLS с проверкой имени | `database.tls`, `secrets.config` | открытый канал — только профиль `dev` (`allow_plaintext`) с `WARN` | [S6 п. 6.2](spec/S6.md), [решение 2026-10-30](decisions/2026-10-30-owner-answers.md) |
-| Эталон SMB: внутренний CA `thepost_pki` (CA — 10 лет, сертификат служб — 825 сут.) | `openssl x509 -enddate -noout -in /etc/thepost/pki/internal.pem` | по истечении — внутренние каналы не установятся (`doctor` этот срок не проверяет) | [роль `thepost_pki`](../deploy/ansible/roles/thepost_pki/defaults/main.yml) |
+| Эталон SMB: внутренний CA `thepost_pki` (CA — 10 лет, сертификат служб — 825 сут.). Прогон плейбука перевыпускает сертификат тем же CA, если до конца срока < 90 сут. (`thepost_pki_renew_before`); CA сам не перевыпускается: истёк — плейбук останавливается с инструкцией (удалить `/etc/thepost/pki`, повторить прогон, раздать новый `ca.pem` клиентам вне ВМ) | `openssl x509 -enddate -noout -in /etc/thepost/pki/internal.pem` | по истечении — внутренние каналы не установятся (проверка в `doctor` — APP-25) | [роль `thepost_pki`](../deploy/ansible/roles/thepost_pki/defaults/main.yml), [решение 27](decisions/2026-11-11-stage2-followups.md) |
 
 ## PostgreSQL
 
 | Требование | Проверка | При нарушении | Источник |
 |---|---|---|---|
 | PostgreSQL 16+ (или совместимая по протоколу и диалекту СУБД) | `database.server_version` (порог `meta.doctor.min_server_version`, 160000) | `FAIL` | [S3 п. 3.1](spec/S3.md) |
-| Кодировка базы UTF8, `LC_CTYPE` UTF-8 (`C.UTF-8` или `<язык>.UTF-8`, не `C`/`POSIX`) | `psql -d thepost -Atc "SELECT pg_encoding_to_char(encoding), datctype FROM pg_database WHERE datname = current_database()"` → `UTF8\|C.UTF-8`; проверка в `doctor` — APP-24 | `lower()` не переводит кириллицу: порядок и уникальность имён входа расходятся. Кодировку базы после создания не сменить — только пересоздание | [решение 23](decisions/2026-11-11-stage2-followups.md) |
+| Кодировка базы UTF8, `LC_CTYPE` UTF-8 (`C.UTF-8` или `<язык>.UTF-8`, не `C`/`POSIX`) | `psql -d thepost -Atc "SELECT pg_encoding_to_char(encoding), datctype FROM pg_database WHERE datname = current_database()"` → `UTF8\|C.UTF-8`; проверка в `doctor` — APP-24 | `lower()` не переводит кириллицу: порядок и уникальность имён входа расходятся. Кодировку базы после создания не сменить — только [пересоздание](#пересоздать-базу-в-utf-8); эталоны останавливаются с ошибкой «Пересоздайте базу в UTF-8» | [решения 23, 29](decisions/2026-11-11-stage2-followups.md) |
 | Без сторонних расширений | `database.extensions` | `WARN`: продукт их не использует; HA и перенос базы не должны от них зависеть | [решение 1](decisions/2026-11-11-stage2-followups.md), [S3 п. 3.1](spec/S3.md) |
 | Канал — TLS с проверкой сервера: `sslmode=verify-full`, `pg_hba` — только `hostssl`, `scram-sha-256` | `database.tls` | `verify-full` без TLS на сервере — `FAIL` (участок PgBouncer → PostgreSQL открыт); другой `sslmode` — `WARN` | [`tp-meta/src/doctor.rs`](../crates/tp-meta/src/doctor.rs), [роль `postgresql`](../deploy/ansible/roles/postgresql/templates/pg_hba.conf.j2) |
 | Раздельные учётные записи: `thepost_owner` (миграции), `thepost` (член `thepost_app`), `thepost_readonly`; все без SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE, REPLICATION | `database.rls`, `database.node_role` | SUPERUSER или BYPASSRLS — `FAIL`: RLS не изолирует организации; узел от владельца схемы — `FAIL`; права вручную — `WARN` | [deploy/README](../deploy/README.md#postgresql-учётные-записи), [DEP-08](manual-tests/DEP-08.md) |
@@ -123,6 +123,23 @@ PTR задаёт владелец адреса (провайдер, хостин
 | Часовой пояс UTC | `database.timezone`, `database.log_timezone` | см. [Время](#время) | там же |
 | Enterprise: синхронная реплика, ≥ 2 кандидата (малый Enterprise — 1), `synchronous_commit` `on` или `remote_apply`, RPO = 0, RTO ≤ 30 с | `database.sync_replication` при `meta.doctor.sync_replication: true` | `FAIL`/`WARN` по числу кандидатов и `synchronous_commit` | [S3 п. 3.1](spec/S3.md), [deploy/README](../deploy/README.md#postgresql-высокая-доступность-enterprise) |
 | Enterprise: PgBouncer 1.21+ в режиме transaction; слушатель сигналов и миграции — напрямую к primary (`direct_url`) | конфигурация PgBouncer | сигналы и миграции через пул не работают | [S3 п. 3.1](spec/S3.md), [deploy/README](../deploy/README.md#enterprise-вм-ansible-pg_auto_failover) |
+
+### Пересоздать базу в UTF-8
+
+Поддерживаются только чистые установки ([решение 29](decisions/2026-11-11-stage2-followups.md)): базу не в UTF-8
+эталоны не переносят и не пересоздают — останавливаются с ошибкой «Пересоздайте базу в UTF-8». Пересоздание удаляет
+все данные базы `thepost`; если в ней уже есть почта и учётные записи, перенос (`pg_dump` → новая база →
+`pg_restore`) — на ответственности администратора, продукт его не проверяет.
+
+1. Остановить узлы: `systemctl stop thepost` (Compose — `docker compose stop thepost`).
+2. Удалить базу:
+   - Ansible (SMB, Enterprise-ВМ — на primary): `sudo -u postgres dropdb thepost`;
+   - Compose: `docker compose -f deploy/compose/dev.yml --profile <профиль> down`, затем
+     `docker volume rm thepost_pgdata-tls` (профиль `dev` — `thepost_pgdata`): удаляется весь кластер;
+   - Helm (CloudNativePG): `helm uninstall`, удалить PVC кластера (`kubectl delete pvc -l cnpg.io/cluster=<кластер>`).
+3. Повторить установку (плейбук, `docker compose up`, `helm install`): база создаётся с `ENCODING 'UTF8'`,
+   `LC_COLLATE`/`LC_CTYPE` `C.UTF-8` из `template0`, миграции применяются при запуске узла.
+4. Проверить: `psql -d thepost -Atc "SELECT pg_encoding_to_char(encoding), datctype FROM pg_database WHERE datname = current_database()"` → `UTF8|C.UTF-8`.
 
 ## OpenBao
 
