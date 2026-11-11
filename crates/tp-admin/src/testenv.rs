@@ -19,8 +19,8 @@ use tp_contracts::meta::{AccountScope, Flags, Policy, SpecialUse};
 use tp_contracts::{AccountId, DomainId, Error, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
-    MemEventBus, MemGroups, MemMetadata, MemPolicies, MemQuota, MemTransport, MemTrash,
-    PolicyLevel, SystemClock,
+    MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies, MemQuota, MemTransport,
+    MemTrash, PolicyLevel, SystemClock,
 };
 
 use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
@@ -246,6 +246,8 @@ pub struct Env {
     pub trash: MemTrash,
     pub app_passwords: tp_auth::AppPasswords,
     pub transport: MemTransport,
+    pub tokens: MemLocalAdminTokens,
+    pub admin: Arc<Admin>,
     pub router: Router,
     pub other_tenant: TenantId,
 }
@@ -300,14 +302,24 @@ impl Env {
 
     /// Без настроек транспорта (маршруты транспорта — 503).
     pub fn without_transport() -> Self {
-        Self::build(config(), Vec::new(), false)
+        Self::build(config(), Vec::new(), false, true)
+    }
+
+    /// Без локального входа (`admin init` и обмен — 503).
+    pub fn without_local() -> Self {
+        Self::build(config(), Vec::new(), true, false)
     }
 
     pub fn with(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>) -> Self {
-        Self::build(cfg, modules, true)
+        Self::build(cfg, modules, true, true)
     }
 
-    fn build(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>, with_transport: bool) -> Self {
+    fn build(
+        cfg: AdminConfig,
+        modules: Vec<Arc<dyn AdminRoutes>>,
+        with_transport: bool,
+        with_local: bool,
+    ) -> Self {
         let auth = FakeAuthenticator::default();
         let other_tenant = TenantId::new();
         let d = TenantId::DEFAULT;
@@ -336,6 +348,13 @@ impl Env {
         } else {
             admin
         };
+        let tokens = MemLocalAdminTokens::new();
+        let admin = if with_local {
+            admin.with_local_tokens(Arc::new(tokens.clone()))
+        } else {
+            admin
+        };
+        let admin = Arc::new(admin);
         let app_passwords = stores.app_passwords();
         let Stores {
             meta,
@@ -361,7 +380,9 @@ impl Env {
             trash,
             app_passwords,
             transport,
-            router: Arc::new(admin).router(),
+            tokens,
+            router: admin.clone().router(),
+            admin,
             other_tenant,
         }
     }

@@ -9,7 +9,8 @@
 //! - [`accounts`] — организация, домены, учётные записи, квоты и политики уровней;
 //! - [`retention`] — корзина ящика: список, восстановление, срок по политике, `trash.purge` и скрытые письма;
 //! - [`app_passwords`] — пароли приложений: выпуск (значение один раз), список, отзыв;
-//! - [`transport`] — настройки транспорта: принятые домены, доверенные источники, политики доменов назначения.
+//! - [`transport`] — настройки транспорта: принятые домены, доверенные источники, политики доменов назначения;
+//! - [`init`] — первый администратор без OIDC (`thepost admin init`): локальный сокет, одноразовый токен, сессия.
 
 pub mod accounts;
 pub mod app_passwords;
@@ -17,6 +18,7 @@ pub mod audit;
 pub mod delivery;
 pub mod export;
 pub mod groups;
+pub mod init;
 pub mod retention;
 pub mod server;
 #[cfg(test)]
@@ -29,4 +31,5 @@ pub use export::{
     AuditExportConfig, Fanout, OtlpAudit, OtlpAuditConfig, SyslogAudit, SyslogConfig,
 };
 pub use groups::Moderation;
+pub use init::{InitConfig, InitGranted, InitReply, InitRequest};
 pub use server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
