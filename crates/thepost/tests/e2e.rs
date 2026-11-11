@@ -1,6 +1,7 @@
 //! Сквозной тест MVP (APP-05, SRS прил. Д.7): узел профиля SMB (`deploy/config/all.yaml`, все роли в одном процессе)
-//! против PostgreSQL — приём SMTP → IMAP FETCH и JMAP Email/get → поиск → удаление в корзину → восстановление →
-//! отправка из JMAP локальному адресату (CMP-07).
+//! против PostgreSQL — приём SMTP (объекты письма хранятся сжатыми) → IMAP FETCH и JMAP Email/get → поиск → удаление
+//! в корзину → восстановление → «очистить корзину» в IMAP и JMAP по настройке `trash.purge` → отправка из JMAP
+//! локальному адресату (CMP-07) → истечение срока корзины (роль maintenance).
 //!
 //! Без `TEST_DATABASE_URL` тест пропускается.
 
@@ -21,8 +22,8 @@ use tp_contracts::TenantId;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::ids::DomainId;
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
-use tp_contracts::retention::{TrashObject, TrashStore};
+use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, MessageStore, Policy};
+use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::secrets::{SecretRef, SecretStore};
 use tp_meta::{MetaConfig, PgMeta};
@@ -520,7 +521,9 @@ async fn mvp_mail_flow() {
         "From: Bob <bob@sender.test>\nTo: Alice <{login}>\nSubject: {subject}\n\
          Message-ID: <e2e-{word}@sender.test>\nMIME-Version: 1.0\n\
          Content-Type: text/plain; charset=us-ascii\n\n\
-         Search must find this message by the word {word}.\n"
+         Search must find this message by the word {word}.\n{filler}",
+        // Тело больше `blob.compression.min_bytes` и хорошо сжимается: объект части хранится в zstd.
+        filler = "The quick brown fox jumps over the lazy dog.\n".repeat(40),
     );
     smtp_send(
         addr(&running, "smtp-in"),
@@ -539,6 +542,14 @@ async fn mvp_mail_flow() {
     let fetch = imap.cmd("FETCH 1 (BODY.PEEK[])").await;
     assert!(fetch.contains(&word), "{fetch}");
     assert!(fetch.contains("Subject:"), "{fetch}");
+    // Письмо хранится сжатым (MS-15, `blob.compression` по умолчанию), чтение распаковывает.
+    let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
+    let zstd: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs WHERE compression = 'zstd'")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("blobs");
+    tx.commit().await.expect("commit");
+    assert!(zstd >= 1, "нет сжатых объектов");
 
     // 3. JMAP Email/get.
     let auth = base64::engine::general_purpose::STANDARD.encode(format!("{login}:{app_password}"));
@@ -608,6 +619,65 @@ async fn mvp_mail_flow() {
     assert_eq!(restored.len(), 1);
     assert_eq!(exists(&imap.cmd("SELECT INBOX").await), 1);
     assert_eq!(jmap.query(json!({ "inMailbox": inbox })).await, ids);
+
+    // 6a. «Очистить корзину» в IMAP (EXPUNGE в корзине; решение 2026-11-01-trash-purge): по умолчанию `hide` —
+    // письмо исчезает у пользователя и хранится скрыто до конца срока корзины.
+    imap.cmd("STORE 1 +FLAGS.SILENT (\\Deleted)").await;
+    imap.cmd("EXPUNGE").await;
+    assert_eq!(exists(&imap.cmd("SELECT Trash").await), 1);
+    imap.cmd("STORE 1 +FLAGS.SILENT (\\Deleted)").await;
+    imap.cmd("EXPUNGE").await;
+    assert_eq!(exists(&imap.cmd("SELECT Trash").await), 0);
+    let visible = TrashStore::list(&meta, scope, 0, 10).await.expect("trash");
+    assert!(visible.is_empty(), "{visible:?}");
+    let hidden = TrashStore::list_hidden(&meta, scope, 0, 10)
+        .await
+        .expect("hidden");
+    assert_eq!(hidden.len(), 1, "{hidden:?}");
+    assert_eq!(hidden[0].object, TrashObject::Message(id));
+
+    // 6b. Администратор задаёт `trash.purge: erase`; скрытое письмо восстановлено. «Очистить корзину» в JMAP
+    // (`Email/set destroy` письма в корзине) стирает его сразу.
+    let erase = TrashPurgeRule {
+        mode: TrashPurge::Erase,
+        user_can_choose: false,
+    };
+    meta.set_policy(
+        tenant,
+        tp_meta::retention::PolicyTarget::Tenant,
+        &Policy {
+            trash_purge: Some(erase),
+            ..Policy::default()
+        },
+    )
+    .await
+    .expect("policy");
+    TrashStore::restore(&meta, scope, TrashObject::Message(id))
+        .await
+        .expect("restore hidden");
+    assert_eq!(jmap.query(json!({ "inMailbox": inbox })).await, ids);
+    let trash_box = jmap.mailbox("trash").await;
+    let destroy = json!({ "accountId": jmap.account, "destroy": ids });
+    let r = jmap.call("Email/set", destroy.clone()).await;
+    assert_eq!(r["destroyed"], json!(ids), "{r}");
+    assert_eq!(jmap.query(json!({ "inMailbox": trash_box })).await, ids);
+    let r = jmap.call("Email/set", destroy).await;
+    assert_eq!(r["destroyed"], json!(ids), "{r}");
+    assert!(
+        jmap.query(json!({ "inMailbox": trash_box }))
+            .await
+            .is_empty()
+    );
+    let hidden = TrashStore::list_hidden(&meta, scope, 0, 10)
+        .await
+        .expect("hidden");
+    assert!(hidden.is_empty(), "{hidden:?}");
+    assert!(
+        MessageStore::get(&meta, scope, id)
+            .await
+            .expect("get")
+            .is_none()
+    );
     imap.cmd("LOGOUT").await;
 
     // 7. Отправка из JMAP локальному адресату (CMP-07): письмо сразу во «Входящих» получателя — без DNS и очереди.
@@ -677,16 +747,59 @@ async fn mvp_mail_flow() {
         account: bob.id.to_string(),
     };
     let bob_inbox = bob_jmap.mailbox("inbox").await;
-    let got = bob_jmap.query(json!({ "inMailbox": bob_inbox })).await;
-    assert_eq!(got.len(), 1, "{got:?}");
+    let bob_ids = bob_jmap.query(json!({ "inMailbox": bob_inbox })).await;
+    assert_eq!(bob_ids.len(), 1, "{bob_ids:?}");
     let got = bob_jmap
         .call(
             "Email/get",
-            json!({ "accountId": bob_jmap.account, "ids": got, "properties": ["subject", "from"] }),
+            json!({ "accountId": bob_jmap.account, "ids": bob_ids, "properties": ["subject", "from"] }),
         )
         .await;
     assert_eq!(got["list"][0]["subject"], sent_subject, "{got}");
     assert_eq!(got["list"][0]["from"][0]["email"], login, "{got}");
+
+    // 8. Истечение срока корзины (роль maintenance, таймер на ближайший срок): срок организации 2 с — письмо,
+    // удалённое в корзину, окончательно удаляет воркер истечения узла.
+    meta.set_policy(
+        tenant,
+        tp_meta::retention::PolicyTarget::Tenant,
+        &Policy {
+            trash_purge: Some(erase),
+            trash_retention: Some(Duration::from_secs(2)),
+            ..Policy::default()
+        },
+    )
+    .await
+    .expect("policy");
+    let r = bob_jmap
+        .call(
+            "Email/set",
+            json!({ "accountId": bob_jmap.account, "destroy": bob_ids }),
+        )
+        .await;
+    assert_eq!(r["destroyed"], json!(bob_ids), "{r}");
+    let trashed = TrashStore::list(&meta, bob_scope, 0, 10)
+        .await
+        .expect("trash");
+    assert!(
+        trashed
+            .iter()
+            .all(|t| (t.expires_at - t.deleted_at).whole_seconds() == 2),
+        "{trashed:?}"
+    );
+    let until = deadline();
+    loop {
+        let visible = TrashStore::list(&meta, bob_scope, 0, 10)
+            .await
+            .expect("trash");
+        let hidden = TrashStore::list_hidden(&meta, bob_scope, 0, 10)
+            .await
+            .expect("hidden");
+        if visible.is_empty() && hidden.is_empty() {
+            break;
+        }
+        retry(until, "истечение срока корзины (maintenance)").await;
+    }
 
     shutdown.cancel();
     let report = running.wait().await.expect("wait");

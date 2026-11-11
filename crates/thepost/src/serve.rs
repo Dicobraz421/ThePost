@@ -5,10 +5,10 @@
 //! PostgreSQL (поиск primary по `database.url` + `urls`, ротация динамических учётных данных; метрики переключения —
 //! в `/metrics`) и миграции (от `database.owner`, если задан) → модули → членство узла и распределитель разделов
 //! журнала → BLOB, шина → ACME (при `acme.enabled`: слушатель HTTP-01, первый выпуск) → сертификаты TLS (продление
-//! ACME — в фоне) → сервисы ролей (вход, хранилище
-//! писем, поиск, очередь SMTP; `services`) → монитор нагрузки узла → роли (`protocols`, `roles`) → служебный HTTP
-//! (`/healthz/ready` — 200, когда готовы все роли узла). Остановка: роли проходят drain, узел покидает членство,
-//! служебный HTTP и фоновые задачи останавливаются последними.
+//! ACME — в фоне) → сервисы ролей (вход, хранилище писем, поиск, очередь SMTP; `services`) → монитор нагрузки
+//! узла (ресурсы cgroups, заполнение кэша индексов) → роли (`protocols`, `roles`; maintenance — и истечение срока
+//! корзины) → служебный HTTP (`/healthz/ready` — 200, когда готовы все роли узла). Остановка: роли проходят drain,
+//! узел покидает членство, служебный HTTP и фоновые задачи останавливаются последними.
 //!
 //! Проверка учётной записи и ограничения ролей (seccomp, Landlock) — до рантайма tokio (`startup`, из `main`).
 
@@ -30,15 +30,15 @@ use tp_meta::events::EventConsumer;
 use tp_meta::{MetaConfig, PgMeta};
 use tp_platform::roles::RssGauge;
 use tp_platform::{
-    Config, Health, LoadConfig, Metrics, NodeLoad, PressureConfig, Reloader, RoleSpec, Roles,
-    RolesReport, RuntimeConfig, ServiceHttpConfig, Telemetry, TelemetryConfig, TlsCerts, TlsConfig,
-    section_watch,
+    Config, Health, LoadConfig, LoadInputs, Metrics, NodeLoad, PressureConfig, Reloader, RoleSpec,
+    Roles, RolesReport, RuntimeConfig, ServiceHttpConfig, Telemetry, TelemetryConfig, TlsCerts,
+    TlsConfig, section_watch,
 };
 use tp_platform::{pressure, service_http};
-use tp_search::SearchConfig;
+use tp_search::{IndexCache, SearchConfig};
 use tp_smtp::dkim_sign::DkimSign;
 use tp_smtp::{Mode, SmtpConfig, SmtpOutService};
-use tp_sys::{NodeResources, ResourcesConfig};
+use tp_sys::{NodeResources, ResourceSnapshot, ResourcesConfig};
 
 use crate::acme;
 use crate::infra;
@@ -247,6 +247,16 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         &metrics,
         aux.clone(),
     );
+    // Диски кэша (APP-10): заполнение кэша индексов поиска относительно `search.cache.max_bytes`.
+    tokio::spawn(feed_cache_disk(
+        load.inputs(),
+        services.cache.clone(),
+        cfg.section::<SearchConfig>(sections::SEARCH)?
+            .cache
+            .max_bytes,
+        resources.subscribe(),
+        aux.clone(),
+    ));
 
     let holder = format!("{node}/{}", std::process::id());
     let runtime = (*cfg.section::<RuntimeConfig>("runtime")?).clone();
@@ -278,6 +288,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         events_poll: cluster.events_poll_interval,
         gc: blob_cfg.gc.clone(),
         orphans: blob_cfg.orphans.clone(),
+        trash: Some(services.mail.clone()),
     };
     let mut setup = RoleSetup {
         cfg: &cfg,
@@ -505,6 +516,26 @@ async fn apply_dkim(
         match section {
             Ok(smtp) => dkim.update(smtp.dkim.clone()),
             Err(e) => tracing::warn!(error = %e, "секция smtp.dkim не применена"),
+        }
+    }
+}
+
+/// Показатель «диски кэша» монитора нагрузки: свободно — `max_bytes` минус занятое кэшем индексов поиска на узле
+/// (`IndexCache::stats`), всего — `max_bytes` (сверх него кэш вытесняет индексы). Своего таймера нет (SRS 2.8):
+/// значение обновляется с каждым снимком ресурсов узла (по PSI или с интервалом секции `resources`).
+async fn feed_cache_disk(
+    inputs: LoadInputs,
+    cache: Arc<IndexCache>,
+    max_bytes: u64,
+    mut resources: tokio::sync::watch::Receiver<ResourceSnapshot>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        let used = cache.stats().bytes;
+        inputs.set_cache_disk(max_bytes.saturating_sub(used), max_bytes);
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            changed = resources.changed() => if changed.is_err() { return },
         }
     }
 }
