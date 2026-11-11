@@ -4,8 +4,10 @@
 
 pub mod abuse;
 pub mod acl;
+pub mod addressbook;
 pub mod admin_token;
 pub mod app_password;
+pub mod audit;
 pub mod auth;
 pub mod blob;
 pub mod bus;
@@ -29,12 +31,13 @@ pub mod rpc;
 pub mod sasl;
 pub mod search;
 pub mod secrets;
+pub mod senders;
 pub mod submission;
 pub mod tls;
 pub mod transport;
 
 pub use error::{Error, Result};
 pub use ids::{
-    AccountId, BlobHash, BlobKey, DomainId, Gen, GroupId, HeldId, MailboxId, MessageId, ModSeq,
-    QueueId, ShardId, TenantId, Uid, UidValidity,
+    AccountId, BlobHash, BlobKey, ContactId, DomainId, Gen, GroupId, HeldId, MailboxId, MessageId,
+    ModSeq, OrgUnitId, QueueId, ShardId, TenantId, Uid, UidValidity,
 };

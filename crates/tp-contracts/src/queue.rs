@@ -97,8 +97,17 @@ pub struct OutMessage {
     pub dsn: DsnParams,
     /// Получатели; пустой список — `Error::Invalid`.
     pub rcpts: Vec<OutRcpt>,
-    /// Первая попытка доставки (обычно — момент постановки).
+    /// Срок выпуска (`release_at`, CTR-35): первая попытка доставки не раньше этого момента — обычно момент постановки,
+    /// для отложенной отправки (JMAP `sendAt`) — срок отправки; до первого захвата запись можно отменить
+    /// ([`QueueStore::cancel_queued`]).
     pub next_attempt: OffsetDateTime,
+}
+
+impl OutMessage {
+    /// Срок выпуска письма (CTR-35) — [`OutMessage::next_attempt`].
+    pub fn release_at(&self) -> OffsetDateTime {
+        self.next_attempt
+    }
 }
 
 /// Конечный статус получателя ([`QueueStore::complete`]).
@@ -144,7 +153,8 @@ pub struct Claimed {
     pub claim: QueueClaim,
     /// Лиза записи действует до этого момента.
     pub until: OffsetDateTime,
-    /// Момент постановки в очередь (срок доставки считает `tp-smtp`).
+    /// Момент постановки в очередь, а для отложенного письма — срок выпуска, если он позже (CTR-35): от него
+    /// `tp-smtp` считает срок доставки.
     pub queued_at: OffsetDateTime,
     /// Организация.
     pub tenant: TenantId,
@@ -205,6 +215,17 @@ pub trait QueueStore: Send + Sync + 'static {
     /// Конечный статус получателя. `true` — все получатели записи в конечном статусе: запись удалена,
     /// вызывающий освобождает ссылку на объект письма. Ошибки — как у `reschedule`.
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool>;
+
+    /// Отмена отправки до выпуска (CTR-35; JMAP `undoStatus: canceled`): удаляет запись организации `tenant`, которую
+    /// ещё не захватывали (нет попыток и лизы), и возвращает объект письма — вызывающий освобождает ссылку. Запись уже
+    /// захвачена или были попытки — `Error::Conflict` (JMAP `cannotUnsend`); нет записи (в том числе доставлена) —
+    /// `Error::NotFound`. Отмена и `claim` атомарны между собой. По умолчанию — `Error::Internal`.
+    async fn cancel_queued(&self, tenant: TenantId, id: QueueId) -> Result<BlobKey> {
+        let _ = (tenant, id);
+        Err(Error::internal(
+            "queue store does not support cancel_queued",
+        ))
+    }
 }
 
 /// Статус получателя при отправке ([`Outbound::submit`]); JMAP — `deliveryStatus` EmailSubmission (RFC 8621 §7).

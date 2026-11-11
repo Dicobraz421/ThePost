@@ -73,6 +73,16 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; по умолчанию — `Internal`),
   `list(tenant, prefix, after, limit)` (CTR-44, список Admin API: по возрастанию `lower(login)` в порядке сравнения строк хранилища,
   префикс и курсор `after` — в нижнем регистре, строго больше; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
+  Состояние ящика (CTR-35, «Удалённые ящики» решения 2026-11-04-exchange-parity): `AccountState::{Active, Disabled { until }}` —
+  отключённый ящик (учётная запись исчезла из каталога): вход и приём почты запрещены независимо от `enabled`, нет в GAL, хранится до
+  `until` (по умолчанию 30 дней — политика синхронизации). `account_state` (по умолчанию — через `get`, всегда `Active`),
+  `disable_account(tenant, id, until)` (повтор — срок заменяется; `upsert` состояние не меняет), `restore_account`, `disabled_accounts(tenant)
+  -> Vec<DisabledAccount { account, until }>` по (`until`, `id`), `expired_accounts(now, limit) -> Vec<AccountScope>` — все организации
+  (окончательное удаление через `before_final_delete`), `attach_account(tenant, disabled, to)` — подключение к учётной записи каталога
+  (Connect-Mailbox: `disabled` получает домен, вход, имя, `external_id`, `enabled` записи `to`, запись `to` удаляется; `disabled` действует —
+  `Invalid`, у `to` есть письма или она отключена — `Conflict`), `remove_disabled` — после удаления писем вызывающим (действующий —
+  `Invalid`, остались письма — `Conflict`). Методы, кроме `account_state`, по умолчанию — `Internal`. In-memory — `MemMetadata`; набор
+  `suite::account_state`. PostgreSQL — META-33.
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
   `delete` папки с вложенными без `cascade` — `Conflict`: решение («удалить вместе с вложенными?») принимает пользователь
   в клиенте, клиент повторяет вызов с `cascade = true`; письма всего поддерева — в корзину.
@@ -190,6 +200,8 @@ SRS 5.2, решение 2026-11-01-borrowings-security (CTR-21; код — `deli
 Relay, Dsn }`, `DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, Hold }` (строки в нижнем регистре).
 `DeliveryLog`: `record(event)`, `record_batch(Vec<_>)` (по умолчанию — по одной), `search(tenant, &DeliveryQuery) -> DeliveryPage
 { events, next: Option<DeliveryCursor> }`, `purge(before)` — по всем организациям (maintenance), можно целыми сутками-секциями.
+`by_queue(tenant, QueueId, limit)` (CTR-35) — события записи очереди по `at` (равные — в порядке записи), `limit ≥ 1`: статус доставки
+отправки JMAP (`EmailSubmission.deliveryStatus`, связь — `EmailSubmission::queue`); по умолчанию — `Internal`, набор `suite::delivery_by_queue`.
 `DeliveryQuery { sender, recipient, message_id, since, until, limit, after }`: условия по «и», адреса — точно без учёта регистра ASCII,
 Message-ID — точно, интервал `[since, until)`; `validate()` (`limit ≥ 1`, непустой интервал) и `matches(&event)` — в контракте;
 порядок — по `at`, равные — в порядке записи; некорректный запрос или позиция — `Invalid`. Срок хранения (по умолчанию 30 суток) —
@@ -235,6 +247,57 @@ SRS 5.1, 3.8. Каталог организации: `accounts_since(tenant, Opt
 Адрес для всей почты домена (catch-all) — псевдоним `DirAlias { address: "@domain", .. }`: получатель на адрес домена, не найденный
 в каталоге; порядок разрешения — адрес целиком, адрес без подадреса (`user+tag`), `@domain`.
 Реализация — `tp-auth` (LDAP); модуль «Мультитенантность» подключает каталог на организацию. Код — `auth.rs`.
+CTR-35: `DirAccount::org: DirOrg { department (external_id подразделения), title, manager (external_id), seniority }` (`#[serde(default)]`);
+`contacts_since(tenant, cursor, limit) -> DirPage<DirContact { external_id, display_name, email, attributes }>` (класс и ветка — настройка;
+по умолчанию — пустая порция с прежним курсором), `units(tenant) -> Vec<DirUnit { external_id, name, parent }>` (по умолчанию — пусто);
+`DirGroup::members` — также `external_id` контактов. In-memory — `FakeDirectory` (`upsert_contact`, `remove_contact`, `set_units`).
+Порог массового удаления: `exceeds_removal_threshold(removed, total, percent)`, `MASS_REMOVAL_PERCENT` = 5; `SyncGate` — остановка
+синхронизации до подтверждения: `hold_sync(tenant, removed, total, at) -> MassRemoval { removed, total, detected_at, approved }` (подтверждение
+сохраняется, если `removed` не выросло), `pending_sync`, `approve_sync` (нет — `NotFound`; Admin API), `clear_sync` (синхронизация после
+отключения). In-memory — `MemSyncGate`; набор `suite::sync_gate`.
+
+## AddressBook
+SRS 4.5, 5.1, решение 2026-11-04-exchange-parity (CTR-35; код — `addressbook.rs`). Ids — `ContactId`, `OrgUnitId`. Состояние учётной записи
+не учитывается: отключённые ящики исключает вызывающий.
+- `ContactStore`: `MailContact { id, tenant, display_name, email, external_id: Option<_> (None — Admin API), attributes, groups: Vec<GroupId>,
+  hidden_from_gal }`, `validate()`; `contact`, `contact_by_address` (без учёта регистра), `contact_by_external_id`, `contacts(tenant)` (по `id`),
+  `put_contact` (замена целиком, `groups` — по возрастанию без повторов; занятый адрес или `external_id` — `Conflict`), `remove_contact`
+  (нет — `NotFound`), `group_contacts(tenant, group)` — внешние получатели при раскрытии группы.
+- `OrgStore`: `OrgUnit { id, tenant, name, parent, external_id }`, `check_unit` (неизвестный родитель, цикл — `Invalid`), `unit_path` (от корня —
+  `ORG` в vCard); `org_units`, `put_org_unit` (занятый `external_id` — `Conflict`), `remove_org_unit` (есть вложенные — `Conflict`; у учётных
+  записей `department` сбрасывается). `OrgAttributes { department, title, manager, seniority, attributes }` (`validate()`,
+  `filter_attributes()` — с `title`); `org` (не заданы — по умолчанию), `set_org` (неизвестное подразделение, руководитель — сама запись —
+  `Invalid`; значение по умолчанию удаляет запись), `org_members(tenant, unit?, subtree) -> Vec<OrgMember>` в порядке `sort_members`
+  (старшинство по убыванию, без него — в конце, затем `AccountId`; неизвестное подразделение — `NotFound`).
+- `DynamicGroupStore`: динамическая группа — `DistributionGroup` в `GroupStore` (адрес, отправители, модерация, GAL) без статических членов и
+  `DynamicGroup { group, tenant, filter: MemberFilter, contacts }`. `MemberFilter::{Equals, Prefix, Present, Unit { unit, subtree }, All, Any,
+  Not}` — атрибуты без учёта регистра ASCII, значения — без учёта регистра; `validate()` (≤ 64 узлов, глубина ≤ 8), `matches(FilterTarget
+  { attributes, units })`. `dynamic`, `dynamic_groups`, `put_dynamic` (`Invalid`; PostgreSQL может требовать группу — `NotFound`),
+  `remove_dynamic`, `expand_dynamic -> Members { accounts, contacts }` (по возрастанию; учётные записи с оргатрибутами и, если `contacts`, —
+  контакты; не динамическая — `NotFound`).
+In-memory — `MemAddressBook`; наборы `suite::{contact_store, org_store, dynamic_groups}`. PostgreSQL — META-33, синхронизация — AUTH-10,
+Admin API — ADM-10, доставка — SMTP-26, JMAP `urn:thepost:orgchart` — JMAP-17.
+
+## SenderLists
+SRS 4.1, решение 2026-11-04-exchange-parity (CTR-35; код — `senders.rs`). Личные списки ящика поверх вердикта антиспама: заблокированный —
+«Спам», надёжный — «Входящие» (SMTP-25). `SenderList { safe, blocked }`: записи — адрес или домен (`@domain` на входе), `normalize_entry`
+(нижний регистр ASCII), `normalized()` (по возрастанию без повторов, до `MAX_SENDER_ENTRIES` = 1024 в каждом; иначе `Invalid`),
+`verdict(from) -> Option<SenderVerdict::{Safe, Blocked}>` — адрес целиком, затем домен (только точное совпадение), на одном уровне надёжный
+приоритетнее. `SenderLists`: `sender_list(scope)` (нет — пусто), `put_sender_list(scope, list) -> state` (замена целиком), `sender_list_state`
+(у нового ящика 0), `sender_verdict` (по умолчанию — через `sender_list`). In-memory — `MemSenderLists`; набор `suite::sender_lists`.
+JMAP `urn:thepost:senderlists` — JMAP-17, Admin API — ADM-10, PostgreSQL — META-33.
+
+## MailboxAudit
+SRS 5.2, решение 2026-11-04-exchange-parity (CTR-35; код — `audit.rs`). `AuditEntry { scope (ящик), at, actor (вход или субъект OIDC),
+actor_account: Option<AccountId>, actor_kind: AuditActorKind::{Owner, Delegate, Admin}, action: AuditAction::{Login, Read, Move, Delete, Send,
+SendAs, SendOnBehalf, ChangeRights, ChangeRules, ChangeForwarding}, object: AuditObject { mailbox?, message?, detail? }, client? }`,
+`validate()` (у владельца `actor_account` — ящик). `AuditPolicy { non_owner (по умолчанию true), owner: BTreeSet<AuditAction> (по умолчанию
+пусто; только `AuditAction::OWNER`) }`, `records(kind, action)` — чтение владельцем не записывается никогда. `MailboxAudit`:
+`record_audit(entry) -> bool` — протоколы вызывают для каждого действия, политику применяет хранилище; `audit_policy(scope)` (ящик → организация
+→ по умолчанию), `set_audit_policy(tenant, account?, policy?)`, `search_audit(tenant, &AuditQuery { account, actor, actor_kind, action, since,
+until, limit, after })` -> `AuditPage` (как `DeliveryLog::search`), `purge_audit(before)` (maintenance, можно сутками). In-memory —
+`MemMailboxAudit` (`entries`, `fail_next`); набор `suite::mailbox_audit`. Запись — IMAP-15, JMAP-18; PostgreSQL (только добавление) — META-33;
+выгрузка в SIEM и выборка — ADM-10.
 
 ## Auth
 SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>` (неверные данные — `Forbidden`);
@@ -373,6 +436,10 @@ SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организа
 `postpone(&claim, rcpt, at)` (перенос планировщиком без попытки — лимиты домена или узла: `attempts`, `last_error` не меняются; по
 умолчанию — `Internal`; набор `suite::queue_postpone`),
 `complete(&claim, rcpt, RcptStatus::{ Delivered { reply }, Failed { reply } }) -> bool` (`true` — все получатели завершены, запись удалена).
+Срок выпуска (CTR-35): `OutMessage::next_attempt` (`release_at()`) — для отложенной отправки срок `sendAt`; `Claimed::queued_at` — не раньше
+срока выпуска (от него считается срок доставки). `cancel_queued(tenant, id) -> BlobKey` — отмена до первого захвата (запись удаляется,
+ссылку освобождает вызывающий; захвачена — `Conflict` = `cannotUnsend`, нет — `NotFound`; атомарна с `claim`; по умолчанию — `Internal`);
+набор `suite::queue_release`. Выпуск по таймеру ближайшего срока — SMTP-24, PostgreSQL — META-33.
 Устаревший захват — `Conflict`; не завершённые до истечения лизы получатели возвращаются в очередь без `attempts` + 1.
 Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
 Расписание повторов, срок доставки и DSN — `tp-smtp` (DSN ставится в очередь до `complete(.., Failed)`).
@@ -555,3 +622,13 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (метод по умолчанию — `Internal`). Реализации — `PgMeta` (курсор по индексу `accounts_login (tenant_id, lower(login))`, порядок — правило
   сортировки базы по умолчанию), `MemMetadata` (побайтно); набор `suite::account_list`. `tp-admin`: список учётных записей — через
   `AccountStore::list`; временный трейт `AccountList` и `Admin::with_account_list` (ADM-12) удалены.
+- 2026-11-11 — CTR-35 (x/contracts-23, решение 2026-11-04-exchange-parity): `audit::{MailboxAudit, AuditEntry, AuditPolicy, AuditQuery}` — аудит
+  доступа к ящику с политикой действий владельца; `senders::{SenderLists, SenderList, SenderVerdict}` — личные списки отправителей;
+  `addressbook::{ContactStore, OrgStore, DynamicGroupStore, MemberFilter}` — почтовые контакты, оргструктура, динамические группы; ids
+  `ContactId`, `OrgUnitId`; `Directory`: `DirAccount::org`, `contacts_since`, `units`, `SyncGate` и порог массового удаления; `AccountStore`:
+  `AccountState`, отключение, восстановление, подключение к другой учётной записи, окончательное удаление; `QueueStore`: срок выпуска
+  (`next_attempt`, `queued_at`), `cancel_queued`; `DeliveryLog::by_queue`. Новые методы существующих трейтов — по умолчанию (`Internal`,
+  `account_state` — `Active`, `Directory` — пусто). In-memory — `MemMailboxAudit`, `MemSenderLists`, `MemAddressBook`, `MemSyncGate`,
+  `MemMetadata`, `MemQueue`, `MemDeliveryLog`, `FakeDirectory`; наборы `suite::{mailbox_audit, sender_lists, contact_store, org_store,
+  dynamic_groups, sync_gate, account_state, queue_release, delivery_by_queue}`. Реализации — META-33, AUTH-10, ADM-10, SMTP-24…26, JMAP-15…18,
+  IMAP-15, MS-16/17.
