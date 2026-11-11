@@ -92,16 +92,10 @@ jobs:
         ports: ['5432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
-      # Шина tp-cluster (решение 2026-10-30, #38): интеграционные тесты идут в CI.
-      valkey:
-        image: valkey/valkey:8
-        ports: ['6379:6379']
-        options: >-
-          --health-cmd "valkey-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
     # Сервисы CI — профиль dev: открытые каналы на localhost раннера (TLS — профиль по умолчанию).
+    # Valkey исключён из поставки (решение 2026-11-01, CLU-09): сервиса нет.
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-      TEST_VALKEY_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -113,6 +107,38 @@ jobs:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --locked --profile ci --no-tests=pass
       - run: cargo test --doc --workspace --locked
+
+  # Поставка без интерпретаторов (решение 2026-11-01, SRS 7.2; CI-05): самопроверка interp_check.py и базовый
+  # образ последней стадии deploy/docker/Dockerfile. Готовый образ и архивы проверяет beta.yml до публикации.
+  interp:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 .github/interp_check.py --self-test
+      - name: Базовый образ поставки
+        shell: bash
+        run: |
+          base=$(grep -E '^FROM ' deploy/docker/Dockerfile | tail -n1 | awk '{print $2}')
+          echo "база: $base"
+          case "$base" in *'$'*|'') echo "::error::база последней стадии не разобрана: '$base'"; exit 1;; esac
+          docker pull -q "$base"
+          id=$(docker create "$base" none)  # команда не запускается: в distroless нет CMD
+          docker export "$id" | python3 .github/interp_check.py -
+          echo "base=$base" >> "$GITHUB_ENV"
+      - name: Подложенный в образ сценарий находится
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          printf '#!/bin/sh\necho\n' > hook.sh
+          printf 'FROM %s\nCOPY hook.sh /usr/local/bin/hook\n' "$base" > Dockerfile
+          docker build -q -t interp-neg .
+          id=$(docker create interp-neg none)
+          out=$(docker export "$id" | python3 "$GITHUB_WORKSPACE/.github/interp_check.py" - || true)
+          echo "${out//::error::/}"
+          grep -q 'usr/local/bin/hook: сценарий' <<< "$out" || { echo "::error::подложенный сценарий не найден"; exit 1; }
 
   deny:
     needs: changes
@@ -158,7 +184,7 @@ jobs:
 
   # Единственный required check: зелёный, если всё нужное прошло или было пропущено.
   gate:
-    needs: [changes, fmt, clippy, test, deny]
+    needs: [changes, fmt, clippy, test, interp, deny]
     if: always()
     runs-on: ubuntu-latest
     steps:
