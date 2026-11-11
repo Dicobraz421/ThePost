@@ -35,7 +35,7 @@ pub use fakes::{
     FakeAuthenticator, FakeDirectory, FakeSasl, FakeSearch, HookCall, MemIndexManifests, MemQueue,
     MemQuota, MemTrash, RecordingDecisionHook, SearchDoc, principal,
 };
-pub use groups::MemGroups;
+pub use groups::{MemGroups, MemModeration, ModerationDecision};
 pub use identity::{MemIdentities, MemSubmissions};
 pub use infra::{
     Clock, ManualClock, MemEventBus, MemEventLog, MemLease, MemPartitionAssigner,

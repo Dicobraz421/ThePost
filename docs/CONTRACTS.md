@@ -206,6 +206,12 @@ Vec<AccountId> (непусто — модерируемая), hidden_from_gal }`
 `hold` (нет группы — `NotFound`, занятый id — `Conflict`), `held(tenant, Option<GroupId>, limit)` по (`held_at`, `id`),
 `take_held(tenant, id)` — забрать для решения (повторно — `NotFound`). Синхронизация из каталога — `tp-auth` (AUTH-07), проверки
 при приёме — `tp-smtp` (SMTP-16), Admin API — ADM-07; реализация — `tp-meta` (META-21), in-memory — `MemGroups`; набор — `suite::group_store`.
+Решения модератора (CTR-31): `Moderation` (вместо временного трейта `tp-admin`) — `deliver(tenant, &group, &HeldMessage)` доставляет
+одобренное письмо участникам группы (раскрытие `expand`, приём в ящики, журнал доставки; другая группа или организация — `Invalid`,
+проверка — `check_delivery`), `reject(tenant, &HeldMessage, reason)` — DSN отправителю (`validate_reject_reason`: одна строка
+1–500 символов, иначе `Invalid`; пустой отправитель — без DSN). Письмо уже забрано `take_held`; успех освобождает ссылку на объект,
+ошибка — вызывающий возвращает письмо `hold`. Реализация — `tp-smtp` (карточка smtp), in-memory — `MemModeration` (запись решений,
+`fail_next`); набор `suite::moderation`.
 
 ## Search
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
@@ -533,3 +539,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-11 — CTR-30 (x/contracts-18): `identity::{IdentityStore, Identity, IdentityAddress, valid_address}`, `submission::{SubmissionStore,
   EmailSubmission, UndoStatus}` — адреса отправителя и учёт отправок JMAP (статус, отмена до отправки, наступившие отложенные). In-memory —
   `MemIdentities`, `MemSubmissions`; наборы `suite::{identity_store, submission_store}`. Реализация в `tp-meta` и переход `tp-jmap` — волны полос.
+- 2026-11-11 — CTR-31 (x/contracts-19): `groups::{Moderation, check_delivery, validate_reject_reason, MAX_REJECT_REASON_LEN}` — решения
+  модератора группы рассылки в контракте вместо временного трейта `tp-admin` (ADM-07; `tp_admin::groups::Moderation` — реэкспорт).
+  In-memory — `MemModeration`, `ModerationDecision`; набор `suite::moderation`. Реализация в `tp-smtp` — волна полосы.

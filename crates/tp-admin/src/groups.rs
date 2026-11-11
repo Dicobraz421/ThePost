@@ -8,14 +8,11 @@
 //!   нельзя;
 //! - очередь модерации (`/api/v1/orgs/{org}/moderation`): письма по времени постановки, одобрение — доставка
 //!   участникам, отклонение — уведомление отправителя с причиной. Письмо забирается из очереди
-//!   (`GroupStore::take_held`) и передаётся [`Moderation`]; ошибка доставки возвращает его в очередь.
-//!
-//! Доставки одобренного письма и уведомления об отказе в контрактах нет: [`Moderation`] — временный трейт полосы
-//! (реализация — `tp-smtp`: раскрытие группы, приём в ящики, DSN, журнал доставки).
+//!   (`GroupStore::take_held`) и передаётся [`Moderation`] (контракт, CTR-31; реализация — `tp-smtp`: раскрытие группы,
+//!   приём в ящики, DSN, журнал доставки); ошибка решения возвращает его в очередь.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -23,27 +20,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
-use tp_contracts::groups::{DistributionGroup, GroupMember, HeldMessage, SenderRestriction};
+pub use tp_contracts::groups::Moderation;
+use tp_contracts::groups::{
+    DistributionGroup, GroupMember, HeldMessage, SenderRestriction, validate_reject_reason,
+};
 use tp_contracts::{AccountId, Error, GroupId, HeldId, Result, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::server::{Admin, ApiResult, Problem};
-
-/// Решения модерации (временный трейт полосы до контракта).
-#[async_trait]
-pub trait Moderation: Send + Sync + 'static {
-    /// Одобрено: доставить письмо участникам `group` (раскрытие с вложенными, приём в ящики, журнал доставки)
-    /// и освободить ссылку на объект письма.
-    async fn deliver(
-        &self,
-        tenant: TenantId,
-        group: &DistributionGroup,
-        message: &HeldMessage,
-    ) -> Result<()>;
-
-    /// Отклонено: уведомить отправителя (DSN, RFC 3464) с причиной `reason`, освободить ссылку на объект письма.
-    async fn reject(&self, tenant: TenantId, message: &HeldMessage, reason: &str) -> Result<()>;
-}
 
 /// Группа рассылки.
 #[derive(Debug, Serialize, ToSchema)]
@@ -459,7 +443,7 @@ async fn reject(
         serde_json::from_slice(&body).map_err(|e| Error::invalid(format!("request body: {e}")))?
     };
     let reason = r.reason.unwrap_or_else(|| DEFAULT_REASON.to_owned());
-    if reason.is_empty() || reason.chars().count() > 500 || reason.chars().any(char::is_control) {
+    if validate_reject_reason(&reason).is_err() {
         return Err(Error::invalid("reason — one line of 1..=500 characters").into());
     }
     let h = a.d.groups.take_held(org, id).await?;

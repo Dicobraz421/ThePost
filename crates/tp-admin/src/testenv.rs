@@ -14,10 +14,9 @@ use tower::ServiceExt;
 use tp_contracts::auth::Principal;
 use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
-use tp_contracts::groups::{DistributionGroup, HeldMessage};
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, Flags, Policy, SpecialUse};
-use tp_contracts::{AccountId, DomainId, Error, GroupId, HeldId, MessageId, Result, TenantId};
+use tp_contracts::{AccountId, DomainId, Error, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
     MemEventBus, MemGroups, MemMetadata, MemPolicies, MemQuota, MemTransport, MemTrash,
@@ -26,7 +25,6 @@ use tp_testkit::{
 
 use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
 use crate::audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink};
-use crate::groups::Moderation;
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 
 /// Журнал аудита в памяти.
@@ -82,46 +80,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Решение модерации, переданное [`MemModeration`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Decision {
-    Deliver(HeldId, GroupId),
-    Reject(HeldId, String),
-}
-
-/// Решения модерации в памяти; `fail_next` — ошибка следующего решения.
-#[derive(Debug, Clone, Default)]
-pub struct MemModeration(Arc<Mutex<(Vec<Decision>, Option<Error>)>>);
-
-impl MemModeration {
-    pub fn decisions(&self) -> Vec<Decision> {
-        lock(&self.0).0.clone()
-    }
-
-    pub fn fail_next(&self, e: Error) {
-        lock(&self.0).1 = Some(e);
-    }
-
-    fn push(&self, d: Decision) -> Result<()> {
-        let mut st = lock(&self.0);
-        if let Some(e) = st.1.take() {
-            return Err(e);
-        }
-        st.0.push(d);
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Moderation for MemModeration {
-    async fn deliver(&self, _: TenantId, group: &DistributionGroup, m: &HeldMessage) -> Result<()> {
-        self.push(Decision::Deliver(m.id, group.id))
-    }
-
-    async fn reject(&self, _: TenantId, m: &HeldMessage, reason: &str) -> Result<()> {
-        self.push(Decision::Reject(m.id, reason.to_owned()))
-    }
-}
+/// Решения модерации — [`MemModeration`] tp-testkit (CTR-31).
+pub use tp_testkit::{MemModeration, ModerationDecision as Decision};
 
 /// Политики уровней — [`MemPolicies`] tp-testkit (разрешение цепочки и выбор пользователя `trash.purge`).
 #[async_trait]
