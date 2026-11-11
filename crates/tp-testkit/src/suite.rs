@@ -48,7 +48,8 @@ use tp_contracts::delivery::{
 use tp_contracts::events::{Partition, PartitionAssigner, ShardEventLogs, ShardPartition};
 use tp_contracts::ext::{Decision, DecisionHook, DecisionHooks, FinalDelete};
 use tp_contracts::groups::{
-    DistributionGroup, GroupMember, GroupStore, HeldMessage, Moderation, SenderRestriction,
+    DistributionGroup, GroupMember, GroupStore, HeldMessage, HoldSource, Moderation, Moderator,
+    SenderRestriction,
 };
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
@@ -2087,7 +2088,10 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
     let base = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("time");
     let held = |s: i64, group: GroupId| HeldMessage {
         id: HeldId::new(),
-        group,
+        group: Some(group),
+        source: HoldSource::Group,
+        moderators: Vec::new(),
+        recipients: Vec::new(),
         sender: format!("d-{tag}@example.org"),
         sender_account: Some(d),
         message_id: Some(format!("{s}.{tag}@example.org")),
@@ -2413,11 +2417,12 @@ pub async fn moderation(m: &dyn Moderation, fx: &ModerationFixture) {
         ..fx.group.clone()
     };
     assert!(matches!(
-        m.deliver(fx.tenant, &other, &fx.approve).await,
+        m.deliver(fx.tenant, Some(&other), &fx.approve).await,
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        m.deliver(TenantId::new(), &fx.group, &fx.approve).await,
+        m.deliver(TenantId::new(), Some(&fx.group), &fx.approve)
+            .await,
         Err(Error::Invalid(_))
     ));
     for bad in ["", "a\nb"] {
@@ -2426,7 +2431,11 @@ pub async fn moderation(m: &dyn Moderation, fx: &ModerationFixture) {
             Err(Error::Invalid(_))
         ));
     }
-    m.deliver(fx.tenant, &fx.group, &fx.approve)
+    assert!(matches!(
+        m.deliver(fx.tenant, None, &fx.approve).await,
+        Err(Error::Invalid(_))
+    ));
+    m.deliver(fx.tenant, Some(&fx.group), &fx.approve)
         .await
         .expect("deliver");
     m.reject(fx.tenant, &fx.decline, "off-topic")
@@ -4401,4 +4410,109 @@ pub async fn outbound_schedule(
     ob.cancel_scheduled(tenant, other)
         .await
         .expect("cancel other");
+}
+
+// ---------- Модерация правилом потока (CTR-43) ----------
+
+/// Окружение набора [`rule_moderation`].
+#[derive(Debug, Clone)]
+pub struct RuleModerationFixture {
+    /// Организация.
+    pub tenant: TenantId,
+    /// Модератор правила (учётная запись организации).
+    pub moderator: AccountId,
+    /// Исходные получатели писем (адреса, которые реализация `Moderation` доставит).
+    pub recipients: Vec<String>,
+}
+
+/// Общий набор очереди модерации для правил потока (CTR-43): письмо без группы ставится в очередь (`GroupStore::hold`,
+/// источник и модераторы сохраняются), видно в очереди организации, одобрение — `Moderation::deliver` без группы
+/// (доставка исходным получателям), отказ — `Moderation::reject` (DSN отправителю); письмо правила с группой и без
+/// модераторов — `Invalid`. Возвращает (одобренное, отклонённое) — что доставлено и какое уведомление ушло, проверяет
+/// реализация.
+pub async fn rule_moderation(
+    groups: &dyn GroupStore,
+    m: &dyn Moderation,
+    fx: &RuleModerationFixture,
+) -> (HeldId, HeldId) {
+    let t = fx.tenant;
+    let tag = AccountId::new().to_string();
+    let at = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("time");
+    let held = |s: i64| HeldMessage {
+        id: HeldId::new(),
+        group: None,
+        source: HoldSource::FlowRule {
+            rule: format!("Правило {tag}"),
+        },
+        moderators: vec![Moderator::Account(fx.moderator)],
+        recipients: fx.recipients.clone(),
+        sender: format!("s-{tag}@example.net"),
+        sender_account: None,
+        message_id: Some(format!("{s}.{tag}@example.net")),
+        blob: BlobKey {
+            tenant: t,
+            hash: fresh_hash(),
+            generation: Gen::INITIAL,
+        },
+        size: 100,
+        held_at: at + time::Duration::seconds(s),
+    };
+    let (approve, decline) = (held(1), held(2));
+    for h in [&approve, &decline] {
+        groups.hold(t, h.clone()).await.expect("hold by rule");
+    }
+    let unmoderated = HeldMessage {
+        moderators: Vec::new(),
+        ..held(3)
+    };
+    assert!(matches!(
+        groups.hold(t, unmoderated).await,
+        Err(Error::Invalid(_))
+    ));
+    let grouped = HeldMessage {
+        group: Some(GroupId::new()),
+        ..held(4)
+    };
+    assert!(matches!(
+        groups.hold(t, grouped).await,
+        Err(Error::Invalid(_))
+    ));
+    let queue: Vec<_> = groups
+        .held(t, None, 10_000)
+        .await
+        .expect("queue")
+        .into_iter()
+        .filter(|h| h.message_id.as_deref().is_some_and(|m| m.contains(&tag)))
+        .collect();
+    assert_eq!(queue, [approve.clone(), decline.clone()]);
+    let in_group = groups
+        .held(t, Some(GroupId::new()), 10_000)
+        .await
+        .expect("group queue");
+    assert!(in_group.iter().all(|h| h.id != approve.id));
+
+    let taken = groups.take_held(t, approve.id).await.expect("take");
+    assert_eq!(taken, approve);
+    let some_group = DistributionGroup {
+        id: GroupId::new(),
+        tenant: t,
+        name: "Другая".into(),
+        address: None,
+        external_id: None,
+        members: Vec::new(),
+        senders: SenderRestriction::Anyone,
+        moderators: Vec::new(),
+        hidden_from_gal: false,
+    };
+    assert!(matches!(
+        m.deliver(t, Some(&some_group), &taken).await,
+        Err(Error::Invalid(_))
+    ));
+    m.deliver(t, None, &taken).await.expect("deliver by rule");
+    let taken = groups.take_held(t, decline.id).await.expect("take decline");
+    m.reject(t, &taken, "not allowed").await.expect("reject");
+    assert_eq!(groups.take_held(t, approve.id).await, Err(Error::NotFound));
+    (approve.id, decline.id)
 }
