@@ -80,6 +80,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "transport rewrites",
         include_str!("../migrations/0017_transport_rewrites.sql"),
     ),
+    (
+        18,
+        "local admin tokens",
+        include_str!("../migrations/0018_local_admin_tokens.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

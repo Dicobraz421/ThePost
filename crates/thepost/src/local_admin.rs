@@ -4,7 +4,7 @@
 //! - [`bind`] — `serve` открывает сокет `admin.init.socket` до наложения Landlock (`startup::prepare_serve`): старый
 //!   файл сокета удаляется, права — `0600` учётной записи службы. Только если на узле есть роль admin.
 //! - [`attach`] — Admin API получает настройки транспорта (`PgMeta`: принятые домены для `admin init` и
-//!   учётных записей) и, когда будет реализация, хранилище локальных токенов.
+//!   учётных записей) и хранилище локальных токенов (`PgMeta`, META-43).
 //! - [`serve`] — роль admin начинает приём на открытом сокете: соединения принимаются от root и от учётной
 //!   записи службы (владельца сокета), остальные — отказ (`SO_PEERCRED`, `tp_admin::init::serve_local`).
 //! - [`command`] — `thepost admin init [--email] [--name] [--force]`: запрос узлу по сокету, пароль и токен —
@@ -74,12 +74,12 @@ pub fn bind(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Admin API с настройками транспорта и (когда будет реализация) хранилищем локальных токенов.
+/// Admin API с настройками транспорта и хранилищем локальных токенов (оба — `PgMeta`; in-memory на узле недопустим:
+/// токен — вход администратора инсталляции).
 pub fn attach(admin: tp_admin::Admin, services: &Services) -> tp_admin::Admin {
-    // TODO(META): `.with_local_tokens(Arc::new(services.meta.clone()))` — реализации `LocalAdminTokens` в PgMeta ещё
-    // нет; до неё `admin init` отвечает «узел не готов» (503), in-memory на узле недопустим (токен — вход
-    // администратора инсталляции).
-    admin.with_transport(Arc::new(services.meta.clone()))
+    admin
+        .with_transport(Arc::new(services.meta.clone()))
+        .with_local_tokens(Arc::new(services.meta.clone()))
 }
 
 /// Начинает приём на сокете, открытом [`bind`]; не открыт (тесты, нет роли admin) — ничего.

@@ -6,9 +6,6 @@
 в образе нет `curl`, поэтому запросы — из контейнера в сетевом пространстве `thepost`:
 `ADM="docker run --rm --network container:$($DC ps -q thepost) curlimages/curl:8.11.1 -sk"`.
 
-Пока в `tp-meta` нет хранилища локальных токенов (`LocalAdminTokens` в PostgreSQL, карточка META), шаг 2
-заканчивается отказом `503` («узел не готов»); остальные шаги — после неё.
-
 ## Сокет
 1. `$DC logs thepost | grep "локальный сокет открыт"` — путь `/var/lib/thepost/admin.sock` (`admin.init.socket`).
 2. `$DC exec thepost thepost admin init --email admin@example.test` (от учётной записи службы 65532) — вывод:
