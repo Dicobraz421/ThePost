@@ -273,8 +273,8 @@ impl LogReader {
         self.due = Some(self.due.map_or(at, |d| d.min(at)));
     }
 
-    /// Отдаёт лизы разделов подписчика (штатная остановка).
-    pub async fn release(&self, sink: &dyn EventSink) {
+    /// Отдаёт лизы разделов подписчика (штатная остановка). `&mut`: поток сигналов не `Sync`.
+    pub async fn release(&mut self, sink: &dyn EventSink) {
         if let Err(e) = self.events.release_all(sink.name()).await {
             tracing::warn!(subscriber = sink.name(), error = %e, "журнал событий: лизы разделов не отданы");
         }
