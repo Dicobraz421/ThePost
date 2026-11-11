@@ -10,7 +10,8 @@
 //!   отложенная обработка недоступных доменов, раздельные пулы внутренней и внешней доставки; получатели,
 //!   отложенные планировщиком без соединения, — `postpone` (без увеличения `attempts`, SMTP-29).
 //!   Политики доменов назначения организаций ([`crate::routes`], [`QueueWorker::with_routes`]) — в
-//!   [`SendRequest::route`].
+//!   [`SendRequest::route`]. Домен внутренней ретрансляции кластера (`DomainKind::InternalRelay`) — на его
+//!   `next_hop` (промежуточный узел, SMTP-21).
 //!   Устаревший захват (`Conflict`: лиза истекла, запись взял другой узел) — запись пропускается.
 //!   Уведомления отправителю (DSN: отказ, задержка, успех) — [`crate::dsn`].
 //! - [`SmtpOutService`] — роль smtp-out: опрос очереди до остановки.
@@ -41,7 +42,7 @@ use crate::tracking::{self, Mail, Step, Tracking};
 use sched::{Admit, Scheduler};
 use tp_contracts::bus::EventBus;
 use tp_contracts::delivery::{DeliveryDecision as Dd, DeliveryEventKind as Ek};
-use tp_contracts::transport::DestinationPolicy;
+use tp_contracts::transport::{DestinationPolicy, DomainKind, TlsRequirement};
 
 pub mod sched;
 pub mod send;
@@ -426,6 +427,7 @@ impl QueueWorker {
             let message = &message;
             let c = &c;
             let tenant = &tenant;
+            let cluster = &cluster;
             async move {
                 let rcpts: Vec<String> = idx
                     .iter()
@@ -438,11 +440,27 @@ impl QueueWorker {
                     ];
                 }
                 let class = Scheduler::class(&cfg.scheduler, domain, accepted);
+                // Домен внутренней ретрансляции (SMTP-21): неизвестные адреса — на `next_hop`, политики
+                // организации к нему не применяются.
+                let relay = cluster
+                    .as_ref()
+                    .and_then(|cl| cl.domain(domain))
+                    .and_then(|d| match &d.kind {
+                        DomainKind::InternalRelay { next_hop } => Some(DestinationPolicy {
+                            pattern: domain.clone(),
+                            tls: TlsRequirement::Opportunistic,
+                            smart_host: Some(next_hop.clone()),
+                            egress_ip: None,
+                        }),
+                        DomainKind::Authoritative => None,
+                    });
                 // Политики — для внешних доменов (вне принятых доменов кластера).
-                let route = tenant
-                    .as_deref()
-                    .filter(|_| !accepted(domain))
-                    .and_then(|t| t.route(domain));
+                let route = relay.as_ref().or_else(|| {
+                    tenant
+                        .as_deref()
+                        .filter(|_| !accepted(domain))
+                        .and_then(|t| t.route(domain))
+                });
                 match self
                     .sched
                     .acquire(&cfg.scheduler, domain, class, &self.deps.now)
