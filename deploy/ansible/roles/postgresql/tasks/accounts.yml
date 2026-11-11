@@ -6,7 +6,7 @@
   community.postgresql.postgresql_user:
     name: "{{ item }}"
     role_attr_flags: NOLOGIN,NOSUPERUSER,NOBYPASSRLS,NOCREATEDB,NOCREATEROLE,NOREPLICATION
-    port: "{{ postgresql_port }}"
+    login_port: "{{ postgresql_port }}"
   loop:
     - "{{ postgresql_app_group }}"
     - "{{ postgresql_reader_group }}"
@@ -21,8 +21,8 @@
     name: "{{ item.name }}"
     password: "{{ item.password }}"
     role_attr_flags: LOGIN,NOSUPERUSER,NOBYPASSRLS,NOCREATEDB,NOCREATEROLE,NOREPLICATION
-    update_password: "{{ postgresql_update_password }}"
-    port: "{{ postgresql_port }}"
+    no_password_changes: "{{ postgresql_update_password == 'on_create' }}"
+    login_port: "{{ postgresql_port }}"
   loop:
     - { name: "{{ postgresql_owner_role }}", password: "{{ thepost_db_owner_password }}" }
     - { name: "{{ postgresql_app_role }}", password: "{{ thepost_db_password }}" }
@@ -38,7 +38,7 @@
     groups: ["{{ item.group }}"]
     target_roles: ["{{ item.role }}"]
     state: present
-    port: "{{ postgresql_port }}"
+    login_port: "{{ postgresql_port }}"
   loop:
     - { group: "{{ postgresql_app_group }}", role: "{{ postgresql_app_role }}" }
     - { group: "{{ postgresql_reader_group }}", role: "{{ postgresql_readonly_role }}" }
@@ -51,13 +51,13 @@
 # (решение 29: только чистые установки).
 - name: Read locale of database thepost
   community.postgresql.postgresql_query:
-    db: postgres
+    login_db: postgres
     query: >-
       SELECT pg_encoding_to_char(encoding) AS encoding, datctype::text AS ctype FROM pg_database
       WHERE datname = %(db)s
     named_args:
       db: "{{ postgresql_app_db }}"
-    port: "{{ postgresql_port }}"
+    login_port: "{{ postgresql_port }}"
   register: postgresql_db_locale
   changed_when: false
   become: true
@@ -74,7 +74,8 @@
       поддерживаются только чистые установки, переноса данных нет — docs/PREREQUISITES.md, «Пересоздать базу в
       UTF-8»
     quiet: true
-  loop: "{{ postgresql_db_locale.query_result }}"
+  # Нет БД — пустой результат (community.postgresql 5.x — {}, раньше — []).
+  loop: "{{ postgresql_db_locale.query_result | default([], true) }}"
   loop_control:
     label: "{{ postgresql_app_db }}"
 
@@ -88,43 +89,43 @@
     lc_collate: "{{ omit if postgresql_db_locale.query_result else postgresql_app_db_locale }}"
     lc_ctype: "{{ omit if postgresql_db_locale.query_result else postgresql_app_db_locale }}"
     template: "{{ omit if postgresql_db_locale.query_result else 'template0' }}"
-    port: "{{ postgresql_port }}"
+    login_port: "{{ postgresql_port }}"
   become: true
   become_user: postgres
 
 - name: Revoke database access from PUBLIC
   community.postgresql.postgresql_privs:
-    db: "{{ postgresql_app_db }}"
+    login_db: "{{ postgresql_app_db }}"
     type: database
     objs: "{{ postgresql_app_db }}"
     roles: PUBLIC
     privs: ALL
     state: absent
-    port: "{{ postgresql_port }}"
+    login_port: "{{ postgresql_port }}"
   become: true
   become_user: postgres
 
 - name: Grant CONNECT to group roles
   community.postgresql.postgresql_privs:
-    db: "{{ postgresql_app_db }}"
+    login_db: "{{ postgresql_app_db }}"
     type: database
     objs: "{{ postgresql_app_db }}"
     roles: "{{ postgresql_app_group }},{{ postgresql_reader_group }}"
     privs: CONNECT
-    port: "{{ postgresql_port }}"
+    login_port: "{{ postgresql_port }}"
   become: true
   become_user: postgres
 
 # Обновление установки до DEP-08: таблицы принадлежали роли узла — передать их владельцу схемы.
 - name: Find objects owned by the node role
   community.postgresql.postgresql_query:
-    db: "{{ postgresql_app_db }}"
+    login_db: "{{ postgresql_app_db }}"
     query: >-
       SELECT count(*) AS n FROM pg_shdepend d JOIN pg_database b ON b.oid = d.dbid
       WHERE d.deptype = 'o' AND b.datname = current_database() AND d.refobjid = %(role)s::regrole
     named_args:
       role: "{{ postgresql_app_role }}"
-    port: "{{ postgresql_port }}"
+    login_port: "{{ postgresql_port }}"
   register: postgresql_node_owned
   changed_when: false
   become: true
@@ -132,9 +133,9 @@
 
 - name: Reassign objects of the node role to the schema owner
   community.postgresql.postgresql_query:
-    db: "{{ postgresql_app_db }}"
+    login_db: "{{ postgresql_app_db }}"
     query: 'REASSIGN OWNED BY "{{ postgresql_app_role }}" TO "{{ postgresql_owner_role }}"'
-    port: "{{ postgresql_port }}"
+    login_port: "{{ postgresql_port }}"
   when: postgresql_node_owned.query_result[0].n | int > 0
   register: postgresql_reassigned
   become: true
@@ -143,11 +144,11 @@
 # Права групповых ролей на существующие таблицы (новые выдают миграции). До первого запуска thepost схемы нет.
 - name: Grant table privileges to group roles
   community.postgresql.postgresql_query:
-    db: "{{ postgresql_app_db }}"
+    login_db: "{{ postgresql_app_db }}"
     query: >-
       DO $$ BEGIN IF to_regprocedure('public.tp_grant_roles()') IS NOT NULL THEN PERFORM public.tp_grant_roles();
       END IF; END $$
-    port: "{{ postgresql_port }}"
+    login_port: "{{ postgresql_port }}"
   when: postgresql_groups is changed or postgresql_memberships is changed or postgresql_reassigned is changed
   become: true
   become_user: postgres

@@ -62,19 +62,18 @@
   community.postgresql.postgresql_user:
     name: autoctl_node
     password: "{{ pgaf_autoctl_password }}"
-    update_password: always
-    db: "{{ pgaf_monitor_db }}"
-    port: "{{ pgaf_port }}"
+    login_db: "{{ pgaf_monitor_db }}"
+    login_port: "{{ pgaf_port }}"
   become: true
   become_user: postgres
   no_log: true
 
 # Сроки проверок и переключения (RTO ≤ 30 с): ALTER SYSTEM и перечитывание конфигурации.
 - name: Set failover timeouts
-  community.postgresql.postgresql_set:
-    name: "{{ item.key }}"
+  community.postgresql.postgresql_alter_system:
+    param: "{{ item.key }}"
     value: "{{ item.value }}"
-    port: "{{ pgaf_port }}"
+    login_port: "{{ pgaf_port }}"
   loop: "{{ pgaf_monitor_settings | dict2items }}"
   loop_control:
     label: "{{ item.key }}={{ item.value }}"
@@ -84,9 +83,9 @@
 # Формации узлов данных (кроме default — её создаёт монитор).
 - name: Find formations
   community.postgresql.postgresql_query:
-    db: "{{ pgaf_monitor_db }}"
+    login_db: "{{ pgaf_monitor_db }}"
     query: SELECT formationid FROM pgautofailover.formation
-    port: "{{ pgaf_port }}"
+    login_port: "{{ pgaf_port }}"
   register: pgaf_formations_found
   changed_when: false
   become: true

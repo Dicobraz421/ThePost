@@ -57,7 +57,7 @@
     - name: Check recovery mode
       community.postgresql.postgresql_query:
         query: SELECT pg_is_in_recovery() AS standby
-        port: "{{ pgaf_port | default(5432) }}"
+        login_port: "{{ pgaf_port | default(5432) }}"
       register: pgaf_recovery
       changed_when: false
       become_user: postgres
