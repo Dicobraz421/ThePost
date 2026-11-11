@@ -256,7 +256,7 @@
 | [JMAP-10](JMAP-10.md) | правила потока в EmailSubmission | jmap | A | jmap-04 | done | JMAP-07,CTR-24 |
 | [APP-09](APP-09.md) | сборка настроек транспорта и точки правил потока | app | A | app-05 | todo | META-28,SMTP-22,JMAP-10,ADM-08 |
 
-## Ф1 · Решение 2026-11-01: масштабирование, шарды, геораспределение, администрирование
+## Ф1 · Решение 2026-11-01: масштабирование, шарды, геораспределение, администрирование — этап 3, кроме `app-07` (этап 2)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
@@ -268,7 +268,7 @@
 | [APP-11](APP-11.md) | CLI thepost admin | app | A | app-07 | ready | ADM-01 |
 | [DEP-10](DEP-10.md) | HPA, VPA и эталон «малый Enterprise» | deploy | A | deploy-07 | ready | DEP-09 |
 
-## Ф1 · Решение 2026-11-04: соответствие функциям Exchange
+## Ф1 · Решение 2026-11-04: соответствие функциям Exchange — этап 3, кроме `jmap-14` (этап 2)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
@@ -281,16 +281,16 @@
 | [SMTP-25](SMTP-25.md) | личные списки отправителей при доставке | smtp | A | smtp-07 | todo | CTR-35,SMTP-16 |
 | [SMTP-26](SMTP-26.md) | раскрытие динамических групп и контактов | smtp | A | smtp-07 | todo | CTR-35,SMTP-16 |
 | [SMTP-27](SMTP-27.md) | профиль Milter для исходящей почты | smtp | A | smtp-07 | todo | SMTP-05 |
-| [JMAP-14](JMAP-14.md) | автонастройка клиентов | jmap | A | jmap-08 | todo | JMAP-01 |
 | [JMAP-15](JMAP-15.md) | отложенная отправка в EmailSubmission | jmap | A | jmap-08 | todo | CTR-35,JMAP-07 |
 | [JMAP-16](JMAP-16.md) | статус доставки EmailSubmission | jmap | A | jmap-08 | todo | CTR-35,JMAP-07 |
 | [JMAP-17](JMAP-17.md) | расширения: списки отправителей и оргструктура | jmap | A | jmap-08 | todo | CTR-35,JMAP-01 |
 | [JMAP-18](JMAP-18.md) | аудит доступа к ящику в JMAP | jmap | A | jmap-08 | todo | CTR-35,JMAP-05 |
+| [JMAP-14](JMAP-14.md) | автонастройка клиентов | jmap | A | jmap-14 | ready | JMAP-01 |
 | [IMAP-15](IMAP-15.md) | аудит доступа к ящику в IMAP | imap | A | imap-06 | todo | CTR-35,IMAP-07 |
 | [ADM-10](ADM-10.md) | Admin API: контакты, группы, оргструктура, отключённые ящики, аудит | admin | A | admin-05 | todo | CTR-35,ADM-07 |
 | [APP-12](APP-12.md) | сборка: соответствие Exchange и doctor автонастройки | app | A | app-08 | todo | META-33,AUTH-10,MS-17,SMTP-27,JMAP-18,IMAP-15,ADM-10 |
 
-## Ф1 · Решение 2026-11-04: внешние встречи — API занятости и публикации
+## Ф1 · Решение 2026-11-04: внешние встречи — API занятости и публикации — этап 3
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
@@ -393,7 +393,7 @@
 | [ADM-11](ADM-11.md) | `thepost admin init` — первый администратор | admin | A | admin-06 | todo | CTR-41 |
 | [APP-19](APP-19.md) | команда `thepost admin init` и локальный сокет | app | A | app-18 | todo | ADM-11 |
 | [CTR-42](CTR-42.md) | хранилище отправок JMAP (отложенная отправка и отмена) | contracts | B | contracts-30 | todo | CTR-28 |
-| [META-42](META-42.md) | системные папки — только по роли, суффикс при совпадении имени | meta | A | meta-26 | todo | CMP-05 |
+| [META-42](META-42.md) | системные папки — только по роли, суффикс при совпадении имени | meta | A | meta-26 | ready | CMP-05 |
 | [KIT-08](KIT-08.md) | фейк ящика — системные папки только по роли | testkit | A | testkit-05 | ready | KIT-07 |
 | [AUTH-11](AUTH-11.md) | `auth.abuse.fail_closed` | auth | A | auth-06 | ready | AUTH-08 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-10 | done | CLU-09 |
