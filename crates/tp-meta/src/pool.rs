@@ -256,7 +256,7 @@ impl PoolConfig {
     }
 
     /// Параметры нового пула с паролем из хранилища; открытый канал — предупреждение в лог.
-    fn open_options(
+    pub(crate) fn open_options(
         &self,
         url: &str,
         pgbouncer: bool,

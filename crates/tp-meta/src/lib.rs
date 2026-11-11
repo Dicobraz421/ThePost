@@ -41,6 +41,7 @@ use sqlx::{PgConnection, PgPool};
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::config::duration;
 use tp_contracts::events::partition_of;
+use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Result, TenantId};
 
 use crate::abuse::AbuseBlocksConfig;
@@ -50,6 +51,7 @@ use crate::events::EventsConfig;
 use crate::failover::Failover;
 use crate::pool::TxFuture;
 use crate::retention::RetentionConfig;
+use crate::shards::{ReadIntent, ShardId, ShardResolver};
 use crate::signals::SignalsConfig;
 
 /// Секция конфигурации контура метаданных `meta` (SRS 5.5); пул соединений — отдельная секция
@@ -132,7 +134,36 @@ impl std::fmt::Debug for Signals {
     }
 }
 
+/// Справочник шардов хранилищ ящика; `None` — один шард (основная БД) без справочника.
+#[derive(Clone, Default)]
+struct Shards(Option<Arc<dyn ShardResolver>>);
+
+impl std::fmt::Debug for Shards {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Shards(directory)"
+        } else {
+            "Shards(local)"
+        })
+    }
+}
+
+/// Пул шарда ящика.
+#[derive(Debug, Clone)]
+pub(crate) struct BoxDb {
+    /// Шард.
+    pub(crate) shard: ShardId,
+    /// Пул шарда (для [`ShardId::LOCAL`] — пул основной БД, с повтором над [`Failover`]).
+    pub(crate) pool: PgPool,
+}
+
 /// Хранилища метаданных на PostgreSQL.
+///
+/// Хранилища ящика (папки, письма, журнал изменений, ACL, корзина, манифест индекса) работают на шарде
+/// учётной записи через справочник ([`PgMeta::with_shards`], [`shards`]); каталог, политики, состав
+/// кластера, аренды, блокировки, транспорт — в основной БД. Без справочника — один шард (основная БД).
+/// Повтор при переключении СУБД ([`Failover`]) — для основной БД; операции на других шардах выполняются
+/// один раз, временный отказ отдаётся вызывающему.
 ///
 /// С шиной ([`PgMeta::with_bus`]) после фиксации публикуются сигналы: `LogAppended` — после записи событий
 /// в журнал ядра, `MembersChanged` — при изменении состава кластера, `Blocked` — после блокировки,
@@ -157,6 +188,7 @@ pub struct PgMeta {
     cfg: Arc<MetaConfig>,
     bus: Signals,
     failover: Option<Failover>,
+    shards: Shards,
 }
 
 impl PgMeta {
@@ -167,6 +199,7 @@ impl PgMeta {
             cfg: Arc::new(cfg),
             bus: Signals::default(),
             failover: None,
+            shards: Shards::default(),
         }
     }
 
@@ -264,6 +297,87 @@ impl PgMeta {
     pub fn with_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
         self.bus = Signals(Some(bus));
         self
+    }
+
+    /// Те же хранилища с хранилищами ящика на шардах справочника `resolver` (основная БД — шард
+    /// [`ShardId::LOCAL`], её пул — пул этих хранилищ). Схема шардов — [`shards::ShardDirectory::migrate`].
+    pub fn with_shards(mut self, resolver: Arc<dyn ShardResolver>) -> Self {
+        self.shards = Shards(Some(resolver));
+        self
+    }
+
+    /// Справочник шардов; `None` — один шард без справочника.
+    pub fn shard_resolver(&self) -> Option<&Arc<dyn ShardResolver>> {
+        self.shards.0.as_ref()
+    }
+
+    /// Шард учётной записи: без справочника и при единственном шарде — [`ShardId::LOCAL`] без запроса.
+    pub(crate) async fn shard_of(&self, scope: AccountScope) -> Result<ShardId> {
+        let Some(r) = &self.shards.0 else {
+            return Ok(ShardId::LOCAL);
+        };
+        if r.shards().await?.len() <= 1 {
+            return Ok(ShardId::LOCAL);
+        }
+        r.shard_of(scope).await
+    }
+
+    /// Пул шарда `shard`: основная БД — пул этих хранилищ.
+    pub(crate) async fn shard_pool(&self, shard: ShardId, intent: ReadIntent) -> Result<PgPool> {
+        match &self.shards.0 {
+            Some(r) if shard != ShardId::LOCAL => r.pool(shard, intent).await,
+            _ => Ok(self.pool.clone()),
+        }
+    }
+
+    /// Шард и пул ящика учётной записи.
+    pub(crate) async fn box_db(&self, scope: AccountScope) -> Result<BoxDb> {
+        let shard = self.shard_of(scope).await?;
+        Ok(BoxDb {
+            shard,
+            pool: self.shard_pool(shard, ReadIntent::Primary).await?,
+        })
+    }
+
+    /// Пул ящика учётной записи.
+    pub(crate) async fn box_pool(&self, scope: AccountScope) -> Result<PgPool> {
+        Ok(self.box_db(scope).await?.pool)
+    }
+
+    /// Пулы всех шардов по возрастанию номера (системные выборки по всем ящикам).
+    pub(crate) async fn all_shards(&self) -> Result<Vec<BoxDb>> {
+        let ids = match &self.shards.0 {
+            Some(r) => r.shards().await?,
+            None => vec![ShardId::LOCAL],
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for shard in ids {
+            out.push(BoxDb {
+                shard,
+                pool: self.shard_pool(shard, ReadIntent::Primary).await?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Запись с ключом в транзакции организации на шарде `db`: основная БД — [`keyed`](Self::keyed),
+    /// другой шард — один раз.
+    pub(crate) async fn keyed_at<T, F, C>(
+        &self,
+        db: &BoxDb,
+        tenant: TenantId,
+        f: F,
+        committed: C,
+    ) -> Result<T>
+    where
+        F: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, T>,
+        C: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, Option<T>>,
+    {
+        if db.shard == ShardId::LOCAL {
+            self.keyed(tenant, f, committed).await
+        } else {
+            pool::with_tenant(&db.pool, tenant, f).await
+        }
     }
 
     /// Публикует сигнал после фиксации; ошибка — только в журнал узла (сигнал at-most-once).

@@ -9,12 +9,15 @@ use tp_contracts::secrets::SecretRef;
 use tp_contracts::{AccountId, Error};
 use tp_meta::pool::PoolConfig;
 use tp_meta::schema::{self, db_err};
-use tp_meta::shards::{ShardDirectory, ShardId, ShardResolver};
+use tp_meta::shards::{ReadIntent, ShardDirectory, ShardId, ShardResolver};
 use uuid::Uuid;
 
 /// Вызывающий код: знает только резолвер.
 async fn count_mailboxes(resolver: &dyn ShardResolver, scope: AccountScope) -> i64 {
-    let pool = resolver.pool_for(scope).await.expect("pool_for");
+    let pool = resolver
+        .pool_for(scope, ReadIntent::Primary)
+        .await
+        .expect("pool_for");
     let mut tx = schema::begin(&pool, scope.tenant).await.expect("begin");
     let n = sqlx::query_scalar("SELECT count(*) FROM mailboxes WHERE account_id = $1")
         .bind(scope.account.as_uuid())
@@ -98,7 +101,10 @@ async fn resolve_known_account() {
         account: AccountId::new(),
     };
     assert_eq!(dir.shard_of(missing).await, Err(Error::NotFound));
-    assert!(matches!(dir.pool(ShardId(-1)).await, Err(Error::NotFound)));
+    assert!(matches!(
+        dir.pool(ShardId(-1), ReadIntent::Primary).await,
+        Err(Error::NotFound)
+    ));
 }
 
 #[tokio::test]
@@ -139,10 +145,19 @@ async fn new_shard_without_caller_changes() {
     .await
     .expect("shard");
     set_shard(&meta, scope, id).await;
+    // Кэш «учётная запись → шард» живёт до сигнала изменения справочника.
+    assert_eq!(
+        resolver.shard_of(scope).await.expect("shard_of"),
+        ShardId::LOCAL
+    );
+    resolver.invalidate();
 
     assert_eq!(resolver.shard_of(scope).await.expect("shard_of"), id);
     assert_eq!(count_mailboxes(resolver.as_ref(), scope).await, before);
-    let pool = resolver.pool_for(scope).await.expect("pool_for");
+    let pool = resolver
+        .pool_for(scope, ReadIntent::Primary)
+        .await
+        .expect("pool_for");
     let app: String = sqlx::query_scalar("SELECT current_setting('application_name')")
         .fetch_one(&pool)
         .await
@@ -191,7 +206,7 @@ async fn shard_password_from_secret_store() {
         .expect("shard");
 
     // Пул шарда подключается паролем из хранилища; справочник показывает ссылку, не значение.
-    let pool = dir.pool(id).await.expect("pool");
+    let pool = dir.pool(id, ReadIntent::Primary).await.expect("pool");
     let app: String = sqlx::query_scalar("SELECT current_setting('application_name')")
         .fetch_one(&pool)
         .await
@@ -206,12 +221,21 @@ async fn shard_password_from_secret_store() {
 
     // Отзыв секрета: кэшированный пул живёт до forget, затем — понятная ошибка Unavailable.
     store.revoke(&secret);
-    assert!(dir.pool(id).await.is_ok(), "пул из кэша");
+    assert!(
+        dir.pool(id, ReadIntent::Primary).await.is_ok(),
+        "пул из кэша"
+    );
     dir.forget(id);
-    assert_eq!(dir.pool(id).await.err(), Some(Error::UNAVAILABLE));
+    assert_eq!(
+        dir.pool(id, ReadIntent::Primary).await.err(),
+        Some(Error::UNAVAILABLE)
+    );
     // Новый секрет — пул пересоздаётся.
     store.set(&secret, password.as_deref().unwrap_or("unused"));
-    let pool = dir.pool(id).await.expect("pool после смены секрета");
+    let pool = dir
+        .pool(id, ReadIntent::Primary)
+        .await
+        .expect("pool после смены секрета");
     sqlx::query("SELECT 1")
         .execute(&pool)
         .await

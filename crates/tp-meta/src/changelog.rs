@@ -93,10 +93,10 @@ impl Change {
     }
 }
 
-/// Следующий `ModSeq` учётной записи; строка учётной записи блокируется до конца транзакции.
+/// Следующий `ModSeq` учётной записи; строка состояния ящика блокируется до конца транзакции.
 pub(crate) async fn bump_modseq(tx: &mut PgConnection, scope: AccountScope) -> Result<ModSeq> {
     let ms: Option<i64> = sqlx::query_scalar(
-        "UPDATE accounts SET modseq = modseq + 1
+        "UPDATE mailbox_state SET modseq = modseq + 1
          WHERE tenant_id = $1 AND account_id = $2 RETURNING modseq",
     )
     .bind(scope.tenant.as_uuid())
@@ -107,10 +107,10 @@ pub(crate) async fn bump_modseq(tx: &mut PgConnection, scope: AccountScope) -> R
     ms.ok_or(Error::NotFound).and_then(to_u64).map(ModSeq)
 }
 
-/// Текущий `ModSeq` учётной записи с блокировкой её строки до конца транзакции.
+/// Текущий `ModSeq` учётной записи с блокировкой строки состояния ящика до конца транзакции.
 pub(crate) async fn lock_modseq(tx: &mut PgConnection, scope: AccountScope) -> Result<ModSeq> {
     let ms: Option<i64> = sqlx::query_scalar(
-        "SELECT modseq FROM accounts WHERE tenant_id = $1 AND account_id = $2 FOR UPDATE",
+        "SELECT modseq FROM mailbox_state WHERE tenant_id = $1 AND account_id = $2 FOR UPDATE",
     )
     .bind(scope.tenant.as_uuid())
     .bind(scope.account.as_uuid())
@@ -341,9 +341,9 @@ impl PgMeta {
     ) -> Result<(Vec<LogRow>, ModSeq, bool)> {
         self.idempotent(|| async move {
         let limit = limit.max(1);
-        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
         let (current, floor): (i64, i64) = sqlx::query_as(
-            "SELECT modseq, changelog_floor FROM accounts WHERE tenant_id = $1 AND account_id = $2",
+            "SELECT modseq, changelog_floor FROM mailbox_state WHERE tenant_id = $1 AND account_id = $2",
         )
         .bind(scope.tenant.as_uuid())
         .bind(scope.account.as_uuid())

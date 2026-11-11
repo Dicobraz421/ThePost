@@ -17,6 +17,7 @@ pub use tp_contracts::acl::{ANYONE, AclEntry, SendDelegation, SharedMailbox};
 
 use crate::PgMeta;
 use crate::schema::{begin, db_err};
+use crate::shards::ShardId;
 
 fn parse_rights(s: &str) -> Result<Rights> {
     s.parse()
@@ -82,7 +83,7 @@ async fn mailbox_exists(
 impl AclStore for PgMeta {
     async fn acl(&self, owner: AccountScope, mailbox: MailboxId) -> Result<Vec<AclEntry>> {
         self.idempotent(|| async move {
-        let mut tx = begin(&self.pool, owner.tenant).await?;
+        let mut tx = begin(&self.box_pool(owner).await?, owner.tenant).await?;
         if !mailbox_exists(&mut tx, owner, mailbox).await? {
             return Err(Error::NotFound);
         }
@@ -117,7 +118,7 @@ impl AclStore for PgMeta {
     ) -> Result<()> {
         self.rewrite(|| async move {
             validate_identifier(identifier, true)?;
-            let mut tx = begin(&self.pool, owner.tenant).await?;
+            let mut tx = begin(&self.box_pool(owner).await?, owner.tenant).await?;
             if !mailbox_exists(&mut tx, owner, mailbox).await? {
                 return Err(Error::NotFound);
             }
@@ -163,7 +164,7 @@ impl AclStore for PgMeta {
     ) -> Result<Rights> {
         self.idempotent(|| async move {
             let (pos, neg) = with_negatives(identifiers)?;
-            let mut tx = begin(&self.pool, owner.tenant).await?;
+            let mut tx = begin(&self.box_pool(owner).await?, owner.tenant).await?;
             let rows: Vec<(String, String)> = sqlx::query_as(
                 "SELECT identifier, rights FROM mailbox_acl
              WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3
@@ -190,10 +191,13 @@ impl AclStore for PgMeta {
     ) -> Result<Vec<SharedMailbox>> {
         self.idempotent(|| async move {
             let (pos, neg) = with_negatives(identifiers)?;
-            let mut tx = begin(&self.pool, tenant).await?;
-            // Папки с положительной записью субъекта, затем все его записи на эти папки.
-            let rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
-                "WITH boxes AS (
+            // Ящики всех шардов; на каждом — папки с положительной записью субъекта, затем все его записи
+            // на эти папки.
+            let mut rows: Vec<(Uuid, Uuid, String, String)> = Vec::new();
+            for db in self.all_shards().await? {
+                let mut tx = begin(&db.pool, tenant).await?;
+                let part: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+                    "WITH boxes AS (
                  SELECT DISTINCT account_id, mailbox_id FROM mailbox_acl
                  WHERE tenant_id = $1 AND identifier = ANY($2)
              )
@@ -201,14 +205,18 @@ impl AclStore for PgMeta {
              FROM mailbox_acl a JOIN boxes b USING (account_id, mailbox_id)
              WHERE a.tenant_id = $1 AND (a.identifier = ANY($2) OR a.identifier = ANY($3))
              ORDER BY a.account_id, a.mailbox_id",
-            )
-            .bind(tenant.as_uuid())
-            .bind(&pos)
-            .bind(&neg)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+                )
+                .bind(tenant.as_uuid())
+                .bind(&pos)
+                .bind(&neg)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                tx.commit().await.map_err(db_err)?;
+                rows.extend(part);
+            }
+            // Порядок шарда — по папке; ящики разных шардов не пересекаются.
+            rows.sort_by_key(|(account, mailbox, _, _)| (*account, *mailbox));
             let mut out: Vec<SharedMailbox> = Vec::new();
             let mut group: Vec<(String, String)> = Vec::new();
             let mut current: Option<(Uuid, Uuid)> = None;
@@ -240,7 +248,7 @@ impl AclStore for PgMeta {
 
     async fn send_delegations(&self, owner: AccountScope) -> Result<Vec<SendDelegation>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, owner.tenant).await?;
+            let mut tx = begin(&self.box_pool(owner).await?, owner.tenant).await?;
             let rows: Vec<(String, String)> = sqlx::query_as(
                 "SELECT delegate, kind FROM send_delegations
              WHERE tenant_id = $1 AND account_id = $2 ORDER BY delegate COLLATE \"C\"",
@@ -271,16 +279,21 @@ impl AclStore for PgMeta {
     ) -> Result<()> {
         self.rewrite(|| async move {
         validate_identifier(delegate, false)?;
-        let mut tx = begin(&self.pool, owner.tenant).await?;
-        let found: Option<i32> =
-            sqlx::query_scalar("SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2")
-                .bind(owner.tenant.as_uuid())
-                .bind(owner.account.as_uuid())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        if found.is_none() {
-            return Err(Error::NotFound);
+        // На другом шарде учётную запись уже нашёл справочник (её шард).
+        let db = self.box_db(owner).await?;
+        let mut tx = begin(&db.pool, owner.tenant).await?;
+        if db.shard == ShardId::LOCAL {
+            let found: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2",
+            )
+            .bind(owner.tenant.as_uuid())
+            .bind(owner.account.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if found.is_none() {
+                return Err(Error::NotFound);
+            }
         }
         match right {
             None => {
@@ -323,7 +336,7 @@ impl AclStore for PgMeta {
             for id in identifiers {
                 validate_identifier(id, false)?;
             }
-            let mut tx = begin(&self.pool, owner.tenant).await?;
+            let mut tx = begin(&self.box_pool(owner).await?, owner.tenant).await?;
             let kinds: Vec<String> = sqlx::query_scalar(
                 "SELECT DISTINCT kind FROM send_delegations
              WHERE tenant_id = $1 AND account_id = $2 AND delegate = ANY($3)",

@@ -35,11 +35,12 @@ use tp_contracts::retention::{
 use tp_contracts::{AccountId, DomainId, Error, MailboxId, MessageId, Result, TenantId, Uid};
 use uuid::Uuid;
 
-use crate::PgMeta;
 use crate::changelog::{self, Change, Op};
 use crate::mailboxes::{alloc_uids, by_role, touch};
 use crate::messages::adjust_refs;
 use crate::schema::{begin, begin_system, db_err, to_i64, to_u32, to_u64};
+use crate::shards::ShardId;
+use crate::{BoxDb, PgMeta};
 
 /// Значения по умолчанию политик хранения (секция `meta.retention`): действуют, когда уровень
 /// цепочки политик их не задаёт.
@@ -279,6 +280,34 @@ impl PgMeta {
     }
 }
 
+impl PgMeta {
+    /// Срок корзины по умолчанию для переноса писем ящика `db`: в основной БД политики разрешает функция
+    /// `tp_trash_retention_us` в транзакции ящика (папка → учётная запись → домен → организация), здесь —
+    /// значение конфигурации; на другом шарде политик нет — срок учётной записи (учётная запись → домен →
+    /// организация) читается из каталога до транзакции ящика, политика уровня папки не применяется.
+    pub(crate) async fn trash_retention(
+        &self,
+        db: &BoxDb,
+        scope: AccountScope,
+    ) -> Result<Duration> {
+        let default = self.cfg.retention.trash_retention;
+        if db.shard == ShardId::LOCAL {
+            return Ok(default);
+        }
+        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let us: Option<i64> = sqlx::query_scalar("SELECT tp_trash_retention_us($1, $2, NULL)")
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        us.map(from_micros)
+            .transpose()
+            .map(|d| d.unwrap_or(default))
+    }
+}
+
 #[async_trait]
 impl PolicyResolver for PgMeta {
     /// Уровни, переданные как `None`, не участвуют; заданные накладываются по порядку цепочки.
@@ -434,7 +463,7 @@ async fn trash_page(
     limit: usize,
 ) -> Result<Vec<TrashItem>> {
     meta.idempotent(|| async move {
-    let mut tx = begin(&meta.pool, scope.tenant).await?;
+    let mut tx = begin(&meta.box_pool(scope).await?, scope.tenant).await?;
     let rows: Vec<TrashRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {TRASH_COLUMNS} FROM messages
          WHERE tenant_id = $1 AND account_id = $2 AND trashed_at IS NOT NULL AND (hidden_at IS NOT NULL) = $5
@@ -473,7 +502,7 @@ impl PgMeta {
         erase: &[Uuid],
     ) -> Result<PurgeOutcome> {
         self.once(async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let current = changelog::lock_modseq(&mut tx, scope).await?;
             // Под блокировкой `ModSeq` учётной записи: восстановленные и уже скрытые параллельно пропускаются.
             let still: Vec<Uuid> = sqlx::query_scalar(
@@ -581,7 +610,7 @@ impl PgMeta {
     /// `MessageId`, новый UID. Для пользователя письмо появляется вновь (журнал — создание). Скрытого нет — `None`.
     async fn restore_hidden(&self, scope: AccountScope, id: MessageId) -> Result<Option<Restored>> {
         self.once(async move {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
         changelog::lock_modseq(&mut tx, scope).await?;
         let target: Option<(Option<Uuid>,)> = sqlx::query_as(
             "SELECT mb.mailbox_id FROM messages m
@@ -682,7 +711,7 @@ impl TrashStore for PgMeta {
         self.once(async move {
         let mode = PolicyResolver::trash_purge(self, scope).await?.effective();
         // Письма, видимые в корзине, в порядке `ids` без повторов.
-        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
         let rows: Vec<PurgeRow> = sqlx::query_as(
             "SELECT m.message_id, m.trashed_from, m.received_at
              FROM (SELECT id, min(ord) AS ord FROM unnest($3::uuid[]) WITH ORDINALITY AS d(id, ord) GROUP BY id) d
@@ -734,7 +763,7 @@ impl TrashStore for PgMeta {
             Err(Error::Invalid(_)) => return Err(Error::NotFound),
             r => r?.into_iter().next().ok_or(Error::NotFound)?,
         };
-        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
         let mailbox: Option<Uuid> = sqlx::query_scalar(
             "SELECT mailbox_id FROM messages WHERE tenant_id = $1 AND account_id = $2 AND message_id = $3",
         )
@@ -752,20 +781,27 @@ impl TrashStore for PgMeta {
 }).await
     }
 
+    /// По всем шардам: первые `limit` по сроку каждого шарда, слияние в общем порядке.
     async fn expired(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<TrashItem>> {
         self.idempotent(|| async move {
-            let mut tx = begin_system(&self.pool).await?;
-            let rows: Vec<TrashRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT {TRASH_COLUMNS} FROM messages
-             WHERE trash_expires_at <= $1
-             ORDER BY trash_expires_at, tenant_id, account_id, message_id LIMIT $2"
-            )))
-            .bind(now)
-            .bind(limit_arg(limit))
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            let mut rows: Vec<TrashRow> = Vec::new();
+            for db in self.all_shards().await? {
+                let mut tx = begin_system(&db.pool).await?;
+                let part: Vec<TrashRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT {TRASH_COLUMNS} FROM messages
+                 WHERE trash_expires_at <= $1
+                 ORDER BY trash_expires_at, tenant_id, account_id, message_id LIMIT $2"
+                )))
+                .bind(now)
+                .bind(limit_arg(limit))
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                tx.commit().await.map_err(db_err)?;
+                rows.extend(part);
+            }
+            rows.sort_by_key(|r| (r.trash_expires_at, r.tenant_id, r.account_id, r.message_id));
+            rows.truncate(limit);
             rows.into_iter().map(TrashItem::try_from).collect()
         })
         .await
@@ -779,7 +815,7 @@ impl TrashStore for PgMeta {
     ) -> Result<()> {
         self.once(async move {
         let id = message_of(object)?;
-        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
         let n = sqlx::query(
             "UPDATE messages SET trash_expires_at = $4
              WHERE tenant_id = $1 AND account_id = $2 AND message_id = $3 AND trashed_at IS NOT NULL",
@@ -806,6 +842,10 @@ impl Quota for PgMeta {
     /// учётной записи по цепочке, иначе [`RetentionConfig::quota_bytes`].
     async fn usage(&self, scope: AccountScope) -> Result<QuotaUsage> {
         self.idempotent(|| async move {
+            let db = self.box_db(scope).await?;
+            if db.shard != ShardId::LOCAL {
+                return self.usage_remote(&db, scope).await;
+            }
             let mut tx = begin(&self.pool, scope.tenant).await?;
             let row: Option<(Uuid, i64, i64)> = sqlx::query_as(
                 "SELECT a.domain_id, coalesce(sum(m.size), 0)::bigint, count(m.message_id)
@@ -838,6 +878,53 @@ impl Quota for PgMeta {
         })
         .await
     }
+}
+
+impl PgMeta {
+    /// Квота ящика на другом шарде: учётная запись и политика — в каталоге, письма — на шарде.
+    async fn usage_remote(&self, db: &BoxDb, scope: AccountScope) -> Result<QuotaUsage> {
+        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let domain: Uuid = sqlx::query_scalar(
+            "SELECT domain_id FROM accounts WHERE tenant_id = $1 AND account_id = $2",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .ok_or(Error::NotFound)?;
+        let policy = resolve_in(
+            &mut tx,
+            scope.tenant,
+            Some(DomainId::from_uuid(domain)),
+            Some(scope.account),
+            None,
+        )
+        .await?;
+        tx.commit().await.map_err(db_err)?;
+        let (used, messages) = box_usage(&db.pool, scope).await?;
+        Ok(QuotaUsage {
+            used_bytes: used,
+            messages,
+            limit_bytes: policy.quota_bytes.or(self.cfg.retention.quota_bytes),
+        })
+    }
+}
+
+/// Размер и число писем ящика на шарде `pool`, включая корзину, без скрытых.
+pub(crate) async fn box_usage(pool: &sqlx::PgPool, scope: AccountScope) -> Result<(u64, u64)> {
+    let mut tx = begin(pool, scope.tenant).await?;
+    let (used, messages): (i64, i64) = sqlx::query_as(
+        "SELECT coalesce(sum(size), 0)::bigint, count(*) FROM messages
+         WHERE tenant_id = $1 AND account_id = $2 AND hidden_at IS NULL",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok((to_u64(used)?, to_u64(messages)?))
 }
 
 #[cfg(test)]

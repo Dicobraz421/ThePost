@@ -19,6 +19,7 @@ use crate::PgMeta;
 use crate::changelog::{self, Change, Op};
 use crate::retention::micros;
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
+use crate::shards::ShardId;
 
 /// Системные папки учётной записи (RFC 6154 и `INBOX`).
 pub(crate) const SYSTEM_FOLDERS: [(&str, SpecialUse); 6] = [
@@ -96,16 +97,30 @@ async fn select_all(tx: &mut PgConnection, scope: AccountScope) -> Result<Vec<Ma
     .map_err(db_err)
 }
 
+/// Состояние ящика учётной записи на шарде, кроме основной БД (там его создаёт триггер вставки в
+/// `accounts`): повтор — пустая операция.
+pub(crate) async fn ensure_state(tx: &mut PgConnection, scope: AccountScope) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO mailbox_state (tenant_id, account_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// Дополняет учётную запись недостающими системными папками (новая запись, старая запись без части папок).
-/// Строка учётной записи блокируется: параллельные вызовы не создают папки дважды.
-/// Возвращает число созданных папок; учётной записи нет — 0.
+/// Строка состояния ящика блокируется: параллельные вызовы не создают папки дважды.
+/// Возвращает число созданных папок; состояния ящика нет (учётной записи нет) — 0.
 pub(crate) async fn ensure_system(
     tx: &mut PgConnection,
     scope: AccountScope,
     event_partitions: u32,
 ) -> Result<usize> {
     let locked: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2 FOR UPDATE",
+        "SELECT 1 FROM mailbox_state WHERE tenant_id = $1 AND account_id = $2 FOR UPDATE",
     )
     .bind(scope.tenant.as_uuid())
     .bind(scope.account.as_uuid())
@@ -244,7 +259,7 @@ pub(crate) async fn insert(
 ) -> Result<Mailbox> {
     check_name(&data.name)?;
     let uid_validity: i64 = sqlx::query_scalar(
-        "UPDATE accounts SET uid_validity_last = greatest(uid_validity_last + 1, extract(epoch FROM now())::bigint)
+        "UPDATE mailbox_state SET uid_validity_last = greatest(uid_validity_last + 1, extract(epoch FROM now())::bigint)
          WHERE tenant_id = $1 AND account_id = $2 RETURNING uid_validity_last",
     )
     .bind(scope.tenant.as_uuid())
@@ -420,11 +435,17 @@ pub(crate) async fn touch(
 impl MailboxStore for PgMeta {
     async fn list(&self, scope: AccountScope) -> Result<Vec<Mailbox>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let db = self.box_db(scope).await?;
+            let mut tx = begin(&db.pool, scope.tenant).await?;
             let mut rows = select_all(&mut tx, scope).await?;
             // Первое открытие ящика без части системных папок (запись заведена в базе, вход без `upsert`).
-            let created = !missing_rows(&rows)?.is_empty()
-                && ensure_system(&mut tx, scope, self.cfg.event_partitions).await? > 0;
+            let missing = !missing_rows(&rows)?.is_empty();
+            if missing && db.shard != ShardId::LOCAL {
+                // Учётная запись есть в каталоге (её шард найден), состояние ящика на шарде — ещё нет.
+                ensure_state(&mut tx, scope).await?;
+            }
+            let created =
+                missing && ensure_system(&mut tx, scope, self.cfg.event_partitions).await? > 0;
             if created {
                 rows = select_all(&mut tx, scope).await?;
             }
@@ -439,7 +460,7 @@ impl MailboxStore for PgMeta {
 
     async fn get(&self, scope: AccountScope, id: MailboxId) -> Result<Option<Mailbox>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let mb = fetch(&mut tx, scope, id, false).await?;
             tx.commit().await.map_err(db_err)?;
             Ok(mb)
@@ -450,7 +471,7 @@ impl MailboxStore for PgMeta {
     async fn create(&self, scope: AccountScope, data: NewMailbox) -> Result<Mailbox> {
         self.once(async move {
             check_name(&data.name)?;
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
             if let Some(parent) = data.parent {
                 fetch(&mut tx, scope, parent, false)
@@ -477,7 +498,7 @@ impl MailboxStore for PgMeta {
     ) -> Result<()> {
         self.once(async move {
         check_name(name)?;
-        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
         let ms = changelog::bump_modseq(&mut tx, scope).await?;
         let mb = fetch(&mut tx, scope, id, true)
             .await?
@@ -531,8 +552,10 @@ impl MailboxStore for PgMeta {
 
     async fn delete(&self, scope: AccountScope, id: MailboxId, cascade: bool) -> Result<()> {
         self.once(async move {
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        // Строка учётной записи заблокирована: иерархия папок не меняется до конца транзакции.
+        let db = self.box_db(scope).await?;
+        let trash_for = self.trash_retention(&db, scope).await?;
+        let mut tx = begin(&db.pool, scope.tenant).await?;
+        // Строка состояния ящика заблокирована: иерархия папок не меняется до конца транзакции.
         let ms = changelog::bump_modseq(&mut tx, scope).await?;
         // Папка и все вложенные, предки раньше потомков.
         let subtree: Vec<(Uuid, Option<String>)> = sqlx::query_as(
@@ -584,7 +607,7 @@ impl MailboxStore for PgMeta {
                 ms,
                 &ids,
                 trash,
-                Some(self.cfg.retention.trash_retention),
+                Some(trash_for),
             )
             .await?
             {
@@ -630,7 +653,7 @@ impl MailboxStore for PgMeta {
 
     async fn set_subscribed(&self, scope: AccountScope, id: MailboxId, on: bool) -> Result<()> {
         self.rewrite(|| async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
             let updated = sqlx::query(
                 "UPDATE mailboxes SET subscribed = $4, highest_modseq = $5
@@ -657,7 +680,7 @@ impl MailboxStore for PgMeta {
 
     async fn status(&self, scope: AccountScope, id: MailboxId) -> Result<MailboxStatus> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let row: Option<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
             r"SELECT mb.uid_validity, mb.uid_next, mb.highest_modseq, s.messages, s.unseen, s.size
               FROM mailboxes mb,

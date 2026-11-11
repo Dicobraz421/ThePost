@@ -75,7 +75,7 @@ fn expected_arg(v: u64) -> Result<i64> {
 impl IndexManifestStore for PgMeta {
     async fn get_manifest(&self, scope: AccountScope) -> Result<IndexManifest> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let row: Option<ManifestRow> = sqlx::query_as(
                 "SELECT version, schema_version, segments, rebuild_requested_at, rebuild_reason
              FROM index_manifests WHERE tenant_id = $1 AND account_id = $2",
@@ -100,7 +100,7 @@ impl IndexManifestStore for PgMeta {
         self.once(async move {
         let segments = Json(&update.segments);
         let schema = i64::from(update.schema);
-        let mut tx = begin(&self.pool, scope.tenant).await?;
+        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
         let version: Option<i64> = if expected == 0 {
             // Индекса ещё нет: вставка; строка уже есть (запись или запрос перестройки) — версия не 0.
             sqlx::query_scalar(
@@ -142,7 +142,7 @@ impl IndexManifestStore for PgMeta {
 
     async fn request_rebuild(&self, scope: AccountScope, request: RebuildRequest) -> Result<u64> {
         self.once(async move {
-            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
             let version: i64 = sqlx::query_scalar(
                 "INSERT INTO index_manifests (tenant_id, account_id, version, schema_version,
                                           rebuild_requested_at, rebuild_reason)
@@ -167,25 +167,35 @@ impl IndexManifestStore for PgMeta {
         .await
     }
 
+    /// По всем шардам: первые `limit` каждого шарда, слияние в общем порядке.
     async fn pending_rebuilds(&self, schema: u32, limit: usize) -> Result<Vec<AccountScope>> {
         self.idempotent(|| async move {
-            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-            let mut tx = begin_system(&self.pool).await?;
-            let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
-                "SELECT tenant_id, account_id FROM index_manifests
-             WHERE rebuild_requested_at IS NOT NULL OR schema_version < $1
-             ORDER BY rebuild_requested_at NULLS LAST, updated_at, tenant_id, account_id
-             LIMIT $2",
-            )
-            .bind(i64::from(schema))
-            .bind(limit)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut rows: Vec<PendingRow> = Vec::new();
+            for db in self.all_shards().await? {
+                let mut tx = begin_system(&db.pool).await?;
+                let part: Vec<PendingRow> = sqlx::query_as(
+                    "SELECT rebuild_requested_at, updated_at, tenant_id, account_id FROM index_manifests
+                 WHERE rebuild_requested_at IS NOT NULL OR schema_version < $1
+                 ORDER BY rebuild_requested_at NULLS LAST, updated_at, tenant_id, account_id
+                 LIMIT $2",
+                )
+                .bind(i64::from(schema))
+                .bind(lim)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                tx.commit().await.map_err(db_err)?;
+                rows.extend(part);
+            }
+            // NULLS LAST: запрошенные перестройки раньше индексов старой схемы.
+            rows.sort_by_key(|(requested, updated, t, a)| {
+                (requested.is_none(), *requested, *updated, *t, *a)
+            });
+            rows.truncate(limit);
             Ok(rows
                 .into_iter()
-                .map(|(t, a)| AccountScope {
+                .map(|(_, _, t, a)| AccountScope {
                     tenant: TenantId::from_uuid(t),
                     account: AccountId::from_uuid(a),
                 })
@@ -194,6 +204,9 @@ impl IndexManifestStore for PgMeta {
         .await
     }
 }
+
+/// Строка `pending_rebuilds`: ключ порядка и учётная запись.
+type PendingRow = (Option<OffsetDateTime>, OffsetDateTime, Uuid, Uuid);
 
 #[cfg(test)]
 mod tests {
