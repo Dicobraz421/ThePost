@@ -10,6 +10,9 @@
 //! необязательный, проверяется по CA слушателя (`ClientAuth`); проверенная цепочка доступна протоколу через
 //! `peer_certificates()` соединения TLS. Сертификат от чужого CA — отказ рукопожатия, без сертификата —
 //! соединение принимается. Без настройки сертификат клиента не запрашивается.
+//!
+//! Текущие цепочка и ключ для подписи (профиль `.mobileconfig`, PLT-23) — [`TlsCerts::certified_key`]: то же, что
+//! у слушателей, включая перечитанное; ключ — `Arc<dyn SigningKey>` rustls, закрытый ключ наружу не выдаётся.
 
 use std::fmt;
 use std::fs::File;
@@ -22,6 +25,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;
+use rustls::sign::CertifiedKey;
 use rustls::{RootCertStore, ServerConfig};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -120,6 +124,8 @@ type ClientVariants = Vec<(Arc<dyn ClientCertVerifier>, Arc<ServerConfig>)>;
 /// [`ClientAuth`] (строятся при первом рукопожатии и живут до перечитывания файлов).
 struct Loaded {
     plain: Arc<ServerConfig>,
+    /// Цепочка и ключ подписи (ключ загружен провайдером криптографии слушателей).
+    certified: Arc<CertifiedKey>,
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     min_version: TlsVersion,
@@ -133,8 +139,14 @@ impl Loaded {
         min_version: TlsVersion,
     ) -> Result<Self, TlsError> {
         let plain = Arc::new(build(chain.clone(), key.clone_key(), min_version, None)?);
+        let certified = Arc::new(CertifiedKey::from_der(
+            chain.clone(),
+            key.clone_key(),
+            &provider(),
+        )?);
         Ok(Self {
             plain,
+            certified,
             chain,
             key,
             min_version,
@@ -226,6 +238,13 @@ impl TlsCerts {
     /// Текущая конфигурация rustls (без сертификата клиента).
     pub fn server_config(&self) -> Arc<ServerConfig> {
         self.loaded().plain.clone()
+    }
+
+    /// Текущие цепочка (сертификат узла первым) и ключ сервера — те же, что у слушателей, включая перечитанные
+    /// после ACME, события ОС и SIGHUP. Ключ — [`rustls::sign::SigningKey`]: подписывает, но закрытый ключ не
+    /// выдаёт. Вызывать на каждую подпись: после перечитывания отдаётся новая пара.
+    pub fn certified_key(&self) -> Arc<CertifiedKey> {
+        self.loaded().certified.clone()
     }
 
     fn loaded(&self) -> Arc<Loaded> {
@@ -618,6 +637,54 @@ pub(crate) mod tests {
         write_pair(&dir.0, CERT_B, KEY_B);
         assert!(certs.reload_if_changed().await.expect("changed"));
         assert_eq!(handshake(&certs, both()).await.expect("new").1, der(CERT_B));
+    }
+
+    /// Подпись `msg` ключом `ck` проверяется открытым ключом его сертификата узла (ECDSA P-256 тестовых пар).
+    fn signed_by_chain(ck: &CertifiedKey, msg: &[u8]) -> bool {
+        use rustls::SignatureScheme;
+        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+        let Some(signer) = ck.key.choose_scheme(&[scheme]) else {
+            return false;
+        };
+        let sig = signer.sign(msg).expect("sign");
+        // Открытый ключ P-256 — последние 65 байт SubjectPublicKeyInfo сертификата (несжатая точка).
+        let cert = rustls::server::ParsedCertificate::try_from(&ck.cert[0]).expect("parse cert");
+        let spki = cert.subject_public_key_info();
+        let point = &spki.as_ref()[spki.as_ref().len() - 65..];
+        let algs = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+        let (_, verifiers) = algs
+            .mapping
+            .iter()
+            .find(|(s, _)| *s == scheme)
+            .expect("p-256 verifier");
+        verifiers[0].verify_signature(point, msg, &sig).is_ok()
+    }
+
+    #[tokio::test]
+    async fn certified_key_follows_reload() {
+        let dir = TempDir::new("tls-certified");
+        let cfg = write_pair(&dir.0, CERT_A, KEY_A);
+        let certs = TlsCerts::load(&cfg).await.expect("load");
+        let a = certs.certified_key();
+        assert_eq!(a.cert, vec![der(CERT_A)]);
+        a.keys_match().expect("key matches cert a");
+        assert!(signed_by_chain(&a, b"profile"));
+
+        // Ошибка перечитывания — прежняя пара.
+        std::fs::write(&cfg.key_file, "garbage").expect("write");
+        assert!(certs.reload_if_changed().await.is_err());
+        assert_eq!(certs.certified_key().cert, vec![der(CERT_A)]);
+
+        write_pair(&dir.0, CERT_B, KEY_B);
+        certs.reload().await.expect("reload");
+        let b = certs.certified_key();
+        assert_eq!(b.cert, vec![der(CERT_B)]);
+        b.keys_match().expect("key matches cert b");
+        assert!(signed_by_chain(&b, b"profile"));
+        // Старая пара не подходит к новой цепочке.
+        let mixed = CertifiedKey::new(b.cert.clone(), a.key.clone());
+        assert!(mixed.keys_match().is_err());
+        assert!(!signed_by_chain(&mixed, b"profile"));
     }
 
     /// Ждёт замены конфигурации rustls после `before`.
