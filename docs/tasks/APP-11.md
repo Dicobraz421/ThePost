@@ -9,7 +9,7 @@ checks: [nextest]
 manual: no
 
 ## Сделать
-- Подкоманда `thepost admin <ресурс> <действие>`: клиент генерируется из OpenAPI Admin API (progenitor, сборка по `openapi.json`, который выгружает тест tp-admin); зависимость — PR `x/app-dep`.
+- Подкоманда `thepost admin <ресурс> <действие>`: клиент — reqwest, каждая команда сверяется тестом со спецификацией tp-admin (progenitor не читает OpenAPI 3.1 — решение `2026-11-11-stage2-followups.md`, п. 13; типы — APP-21); зависимость — PR `x/app-dep`.
 - Вход: токен OIDC (device flow или из переменной окружения), адрес — из конфигурации или ключа; вывод — таблица или JSON (`--json`).
 
 ## Приёмка
