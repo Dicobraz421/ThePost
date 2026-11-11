@@ -1,0 +1,21 @@
+# {{ ansible_managed }}
+# Копия PostgreSQL pgBackRest (%i — full или diff; таймеры thepost-backup-full/diff.timer), затем копия каталога
+# BLOB (thepost-backup-blob.service, инвариант W — SRS 3.5). Журнал — journalctl -u 'thepost-backup@*'.
+[Unit]
+Description=The Post: копия PostgreSQL (pgBackRest, %i)
+Wants=thepost-backup-blob.service
+Before=thepost-backup-blob.service
+After={{ thepost_backup_pg_unit }} network-online.target
+Requires={{ thepost_backup_pg_unit }}
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+LoadCredentialEncrypted=pgbackrest.conf:{{ thepost_backup_creds_dir }}/pgbackrest.cred
+ExecStart=/usr/bin/pgbackrest --config-include-path=/run/credentials/%n --stanza={{ thepost_backup_stanza }} --type=%i backup
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes

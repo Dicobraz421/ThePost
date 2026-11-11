@@ -1,0 +1,13 @@
+# {{ ansible_managed }}
+# Расписание резервного копирования The Post: {{ item.unit }} (DEP-15).
+[Unit]
+Description=The Post: расписание {{ item.unit }}
+
+[Timer]
+OnCalendar={{ item.schedule }}
+RandomizedDelaySec={{ thepost_backup_randomized_delay }}
+Persistent=true
+Unit={{ item.unit }}
+
+[Install]
+WantedBy=timers.target

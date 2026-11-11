@@ -1,5 +1,5 @@
 # Эталонная установка SMB одной командой (SRS 1.2, 5.6): PostgreSQL, OpenBao, Rspamd (clamav-milter — по желанию)
-# и thepost (все роли) на одной ВМ Debian 12 / Ubuntu 24.04.
+# и thepost (все роли) на одной ВМ Debian 12 / Ubuntu 24.04; резервное копирование — thepost_backup (по умолчанию да).
 #   ansible-galaxy collection install -r deploy/ansible/requirements.yml
 #   ansible-playbook -i <инвентарь> deploy/ansible/smb.yml
 # Пример инвентаря — deploy/ansible/inventory.example.yml (группа smb); переменные — defaults ролей.
@@ -30,3 +30,6 @@
     - role: clamav_milter
       when: thepost_clamav | default(false) | bool
     - thepost
+    # Резервное копирование (DEP-15): pgBackRest (архив WAL, PITR) и копия каталога BLOB; restore.yml — восстановление.
+    - role: pgbackrest
+      when: thepost_backup | default(true) | bool

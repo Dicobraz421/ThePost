@@ -1,0 +1,207 @@
+# Восстановление эталона SMB из копий (DEP-15; deploy/ansible/restore.yml): PITR PostgreSQL на момент T
+# (pgBackRest), возврат каталога BLOB (restic/rsync), сверка thepost verify — потерянных тел писем 0.
+# Перед задачами — роль openbao (токен администратора и пароли СУБД для сверки учётных записей).
+---
+- name: Check restore parameters
+  ansible.builtin.assert:
+    that:
+      - thepost_restore_confirm | default(false) | bool
+    fail_msg: >-
+      Восстановление заменяет текущую базу The Post состоянием на момент T. Запустите с -e thepost_restore_confirm=true
+      (и -e "thepost_restore_target='2026-11-11 18:00:00+03'"; без T — до конца архива WAL)
+
+- name: Check backup credentials
+  ansible.builtin.stat:
+    path: "{{ thepost_backup_creds_dir }}/pgbackrest.cred"
+  register: thepost_restore_cred
+
+- name: Require backup role on this VM
+  ansible.builtin.assert:
+    that: thepost_restore_cred.stat.exists
+    fail_msg: >-
+      Нет {{ thepost_backup_creds_dir }}/pgbackrest.cred: сначала smb.yml с thepost_backup: true (на новой ВМ — ключи
+      копий в OpenBao {{ thepost_backup_openbao_mount }}/, см. docs/INSTALL.md)
+
+- name: Show backups available
+  ansible.builtin.command: thepost-pgbackrest info
+  register: thepost_restore_info
+  changed_when: false
+
+- name: Print backups available
+  ansible.builtin.debug:
+    var: thepost_restore_info.stdout_lines
+
+# Таймеры копий и узел — остановить: копия во время восстановления и GC узла до возврата BLOB недопустимы.
+- name: Stop backup timers and services
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: stopped
+  loop: >-
+    {{ thepost_backup_timers | map(attribute='name') | map('regex_replace', '$', '.timer') | list
+       + ['thepost-backup@full.service', 'thepost-backup@diff.service', 'thepost-backup-blob.service'] }}
+
+- name: Stop thepost
+  ansible.builtin.systemd_service:
+    name: thepost
+    state: stopped
+
+- name: Stop PostgreSQL
+  ansible.builtin.systemd_service:
+    name: "{{ thepost_backup_pg_unit }}"
+    state: stopped
+
+- name: Ensure PostgreSQL data directory exists
+  ansible.builtin.file:
+    path: "{{ thepost_backup_pg_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+# --delta: файлы каталога данных сверяются с копией, совпадающие не переписываются. restore_command — с учётными
+# данными юнита кластера (секреты pgBackRest), не временного юнита восстановления.
+- name: Restore PostgreSQL (PITR)
+  ansible.builtin.command:
+    argv: >-
+      {{ ['thepost-pgbackrest', 'restore', '--delta', '--log-level-console=info',
+          '--recovery-option=restore_command=pgbackrest --config-include-path=/run/credentials/'
+          ~ thepost_backup_pg_unit ~ ' --stanza=' ~ thepost_backup_stanza ~ ' archive-get %f "%p"']
+         + (['--type=time', '--target=' ~ thepost_restore_target, '--target-action=promote']
+            if thepost_restore_target | length > 0 else ['--type=default'])
+         + (['--set=' ~ thepost_restore_set] if thepost_restore_set | length > 0 else []) }}
+  register: thepost_restore_pg
+  changed_when: true
+
+- name: Start PostgreSQL
+  ansible.builtin.systemd_service:
+    name: "{{ thepost_backup_pg_unit }}"
+    state: started
+
+- name: Wait for end of recovery
+  ansible.builtin.command: psql -p {{ thepost_backup_pg_port }} -XtAc "SELECT pg_is_in_recovery()"
+  become: true
+  become_user: postgres
+  register: thepost_restore_recovery
+  until: thepost_restore_recovery.rc == 0 and thepost_restore_recovery.stdout == 'f'
+  retries: 360
+  delay: 5
+  changed_when: false
+
+# Пароли учётных записей СУБД восстановлены вместе с базой: выставить текущие из OpenBao (новая ВМ — новые пароли).
+- name: Sync PostgreSQL account passwords from OpenBao
+  ansible.builtin.include_role:
+    name: postgresql
+    tasks_from: accounts
+  vars:
+    postgresql_update_password: always
+
+- name: Ensure BLOB directory exists
+  ansible.builtin.file:
+    path: "{{ thepost_backup_blob_dir }}"
+    state: directory
+    owner: thepost
+    group: thepost
+    mode: "0750"
+  when: thepost_restore_blob
+
+# Объекты неизменяемы и удаляются не раньше окна W после T (SRS 3.5), поэтому снимок, сделанный после T, содержит все
+# тела писем на момент T. Берётся первый такой снимок: более поздние могли застать каталог после потери данных.
+# Время снимков restic — местное время ВМ (как date -d). Нет снимка после T — последний (письма после него — потеряны).
+- name: Choose BLOB snapshot (restic)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      list=$(thepost-restic snapshots --compact --tag thepost-blob)
+      t={{ thepost_restore_target | quote }}
+      pick=
+      if [ -n "$t" ]; then
+        t=$(date -d "$t" +%s)
+        while read -r id d tm _; do
+          [[ $id =~ ^[0-9a-f]{8}$ ]] || continue
+          if [ "$(date -d "$d $tm" +%s)" -ge "$t" ]; then pick=$id; break; fi
+        done <<<"$list"
+      fi
+      if [ -z "$pick" ] && grep -Eq '^[0-9a-f]{8} ' <<<"$list"; then pick=latest; fi
+      echo "${pick:-none}"
+    executable: /bin/bash
+  register: thepost_restore_snapshot
+  changed_when: false
+  when: thepost_restore_blob and thepost_backup_blob_tool == 'restic' and thepost_restore_blob_snapshot | length == 0
+
+- name: Print BLOB snapshot
+  ansible.builtin.debug:
+    msg: "Снимок каталога писем: {{ thepost_restore_blob_snapshot or thepost_restore_snapshot.stdout }}"
+  when: thepost_restore_blob and thepost_backup_blob_tool == 'restic'
+
+- name: Restore BLOB directory (restic)
+  ansible.builtin.command:
+    argv: [thepost-restic, restore, "{{ snapshot }}", --tag, thepost-blob, --target, /]
+  vars:
+    snapshot: "{{ thepost_restore_blob_snapshot if thepost_restore_blob_snapshot | length > 0
+      else thepost_restore_snapshot.stdout }}"
+  when: thepost_restore_blob and thepost_backup_blob_tool == 'restic' and snapshot != 'none'
+  changed_when: true
+
+- name: Restore BLOB directory (rsync)
+  ansible.builtin.command:
+    argv: [rsync, -a, --numeric-ids, -e, ssh -o BatchMode=yes, "{{ thepost_backup_rsync_dest }}/", "{{ thepost_backup_blob_dir }}/"]
+  when: thepost_restore_blob and thepost_backup_blob_tool == 'rsync'
+  changed_when: true
+
+- name: Start thepost
+  ansible.builtin.systemd_service:
+    name: thepost
+    state: started
+
+- name: Wait for thepost readiness
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ thepost_service_http_port | default(8081) }}/healthz/ready"
+    validate_certs: false
+  register: thepost_restore_ready
+  until: thepost_restore_ready.status == 200
+  retries: 60
+  delay: 2
+
+# Сверка от имени узла: вход в OpenBao — secret_id из учётных данных работающего thepost.service.
+- name: Verify BLOB against metadata (thepost verify)
+  ansible.builtin.command:
+    argv: [runuser, -u, thepost, --, "{{ thepost_binary_path | default('/usr/local/bin/thepost') }}", verify, --json]
+  register: thepost_restore_verify
+  changed_when: false
+  failed_when: thepost_restore_verify.stdout | length == 0
+
+- name: Check verify report
+  ansible.builtin.assert:
+    that:
+      - (thepost_restore_verify.stdout | from_json).damaged | int == 0
+      - (thepost_restore_verify.stdout | from_json).errors | int == 0
+    fail_msg: >-
+      thepost verify: повреждённых записей {{ (thepost_restore_verify.stdout | from_json).damaged }}, ошибок
+      {{ (thepost_restore_verify.stdout | from_json).errors }} — тела части писем отсутствуют (копия BLOB старше T?).
+      Подробности — runuser -u thepost -- thepost verify; пометить повреждённые — thepost verify --fix
+    success_msg: >-
+      thepost verify: объектов {{ (thepost_restore_verify.stdout | from_json).objects_listed }}, записей
+      {{ (thepost_restore_verify.stdout | from_json).records_checked }}, потерянных 0,
+      «сирот» {{ (thepost_restore_verify.stdout | from_json).orphans }}
+
+- name: Delete orphans newer than T (thepost verify --fix)
+  ansible.builtin.command:
+    argv: [runuser, -u, thepost, --, "{{ thepost_binary_path | default('/usr/local/bin/thepost') }}", verify, --fix]
+  register: thepost_restore_fix
+  when: thepost_restore_verify_fix and (thepost_restore_verify.stdout | from_json).orphans | int > 0
+  changed_when: true
+
+- name: Start backup timers
+  ansible.builtin.systemd_service:
+    name: "{{ item.name }}.timer"
+    state: started
+  loop: "{{ thepost_backup_timers }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# После PITR PostgreSQL продолжает на новой линии времени: новая полная копия — опорная точка для следующих PITR.
+- name: Take full backup after restore
+  ansible.builtin.systemd_service:
+    name: thepost-backup@full.service
+    state: started
+  when: thepost_restore_full_backup

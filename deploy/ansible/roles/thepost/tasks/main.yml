@@ -76,7 +76,7 @@
   ansible.builtin.copy:
     dest: /etc/systemd/system/thepost.service.d/smb.conf
     content: |
-      # {{ ansible_managed }}
+      # Ansible: deploy/ansible/roles/thepost — не править вручную.
       # Эталон SMB: PostgreSQL, OpenBao и фильтры Milter — на этой же ВМ.
       [Unit]
       Wants=postgresql.service openbao.service rspamd.service{{ ' clamav-milter.service' if thepost_clamav else '' }}

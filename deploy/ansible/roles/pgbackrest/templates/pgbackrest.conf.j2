@@ -1,0 +1,31 @@
+# {{ ansible_managed }}
+# pgBackRest для The Post (эталон SMB). Секретов здесь нет: ключ шифрования и ключи S3 — учётные данные systemd
+# pgbackrest.conf (systemd-creds, источник — OpenBao {{ thepost_backup_openbao_mount }}/), подключаются
+# --config-include-path=/run/credentials/<юнит>. Вручную — thepost-pgbackrest <команда> (от root).
+[global]
+repo1-type={{ thepost_backup_repo }}
+repo1-path={{ thepost_backup_repo_path }}
+repo1-retention-full-type=time
+repo1-retention-full={{ thepost_backup_retention_days | int }}
+{% if thepost_backup_cipher %}
+repo1-cipher-type=aes-256-cbc
+{% endif %}
+{% if thepost_backup_repo == 's3' %}
+repo1-s3-endpoint={{ thepost_backup_s3_endpoint | regex_replace('^https://', '') }}
+repo1-s3-bucket={{ thepost_backup_s3_bucket }}
+repo1-s3-region={{ thepost_backup_s3_region }}
+repo1-s3-uri-style={{ thepost_backup_s3_uri_style }}
+repo1-storage-verify-tls=y
+{% if thepost_backup_s3_ca_file | length > 0 %}
+repo1-storage-ca-file={{ thepost_backup_s3_ca_file }}
+{% endif %}
+{% endif %}
+process-max={{ thepost_backup_process_max }}
+compress-type={{ thepost_backup_compress_type }}
+start-fast=y
+log-level-console=info
+log-level-file=detail
+
+[{{ thepost_backup_stanza }}]
+pg1-path={{ thepost_backup_pg_data_dir }}
+pg1-port={{ thepost_backup_pg_port }}

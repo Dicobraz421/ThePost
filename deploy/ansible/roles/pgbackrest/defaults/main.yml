@@ -1,0 +1,91 @@
+# Роль pgbackrest: резервное копирование эталона SMB (SRS 5.3, APP-Z З.1; DEP-15) готовыми средствами —
+# pgBackRest (архив WAL, полные и разностные копии PostgreSQL, PITR) и restic или rsync (копия каталога BLOB).
+# Расписание — таймеры systemd; секреты (ключи шифрования, ключи S3) — в OpenBao, на ВМ — только зашифрованные
+# учётные данные systemd (systemd-creds). Восстановление — deploy/ansible/restore.yml (tasks_from: restore).
+---
+# Хранилище копий СУБД (repo1 pgBackRest): posix — каталог на ВМ (отдельный диск или сетевой том, иначе копия
+# погибнет вместе с диском данных), s3 — объектное хранилище S3 (только HTTPS).
+thepost_backup_repo: posix
+thepost_backup_repo_path: /var/lib/pgbackrest
+# S3 (thepost_backup_repo: s3 и/или restic на S3): адрес API, бакет, регион, стиль адреса (host или path).
+# Ключи доступа — в OpenBao: bao kv put -mount=thepost-backup s3 access_key_id=… secret_access_key=…
+thepost_backup_s3_endpoint: ""
+thepost_backup_s3_bucket: ""
+thepost_backup_s3_region: us-east-1
+thepost_backup_s3_uri_style: host
+# Свой CA для S3 (файл PEM на ВМ); пусто — системные корневые сертификаты.
+thepost_backup_s3_ca_file: ""
+
+# Имя stanza pgBackRest.
+thepost_backup_stanza: thepost
+# Глубина PITR в сутках (repo1-retention-full-type=time): восстановление возможно на любой момент за эти сутки.
+# Окно W узла (blob.gc.window, SRS 3.5) не меньше глубины PITR: роль thepost по умолчанию берёт эти сутки + 8.
+thepost_backup_retention_days: 7
+# Расписание (OnCalendar systemd): полная копия — раз в неделю, разностная — в остальные дни.
+thepost_backup_full_schedule: "Sun *-*-* 01:30:00"
+thepost_backup_diff_schedule: "Mon..Sat *-*-* 01:30:00"
+thepost_backup_randomized_delay: 15min
+thepost_backup_process_max: 2
+thepost_backup_compress_type: zst
+# Шифрование копий СУБД (AES-256); ключ — OpenBao thepost-backup/pgbackrest#cipher_pass (создаётся при первом прогоне).
+thepost_backup_cipher: true
+
+# Копия каталога BLOB (тела писем): restic (снимки, шифрование, дедупликация; каталог или S3) или rsync (зеркало
+# в каталог или по SSH). Запускается после каждой копии СУБД и по своему расписанию.
+thepost_backup_blob_tool: restic
+thepost_backup_blob_dir: /var/lib/thepost/blob
+# Частота копии BLOB (OnCalendar; RPO тел писем); пусто — только после копий СУБД.
+thepost_backup_blob_schedule: hourly
+# restic: репозиторий — каталог или s3:https://<адрес>/<бакет>/<префикс>; пароль — OpenBao thepost-backup/restic.
+thepost_backup_restic_repo: /var/backups/thepost/restic
+# Снимки restic хранятся не меньше глубины PITR + неделя (последний снимок — всегда).
+thepost_backup_restic_keep_within: "{{ thepost_backup_retention_days | int + 8 }}d"
+# Общие параметры restic: свой CA для S3.
+thepost_backup_restic_opts: >-
+  {{ '--cacert ' ~ thepost_backup_s3_ca_file if thepost_backup_s3_ca_file | length > 0 else '' }}
+# rsync: каталог или [user@]host:каталог (SSH; ключ — у root на ВМ). Объекты BLOB неизменяемы и удаляются только
+# после окна W, поэтому зеркало без удаления — надмножество любого момента; true — удалять исчезнувшие (--delete).
+thepost_backup_rsync_dest: /var/backups/thepost/blob-mirror
+thepost_backup_rsync_delete: false
+
+# Секреты: KV v2 OpenBao, отдельный от thepost (узлу не доступен, политика thepost — только thepost/*).
+thepost_backup_openbao_mount: thepost-backup
+# Зашифрованные учётные данные systemd (systemd-creds encrypt): auto — TPM2 + ключ ВМ, если есть TPM, иначе ключ ВМ.
+thepost_backup_creds_dir: /etc/thepost/credentials
+thepost_backup_creds_key: auto
+
+# PostgreSQL (как в роли postgresql).
+thepost_backup_pg_version: "{{ postgresql_version | default(16) }}"
+thepost_backup_pg_cluster: "{{ postgresql_cluster | default('main') }}"
+thepost_backup_pg_data_dir: >-
+  {{ postgresql_data_dir | default('/var/lib/postgresql/' ~ thepost_backup_pg_version ~ '/' ~ thepost_backup_pg_cluster) }}
+thepost_backup_pg_conf_dir: >-
+  {{ postgresql_conf_dir | default('/etc/postgresql/' ~ thepost_backup_pg_version ~ '/' ~ thepost_backup_pg_cluster) }}
+thepost_backup_pg_port: "{{ postgresql_port | default(5432) }}"
+thepost_backup_pg_unit: "postgresql@{{ thepost_backup_pg_version }}-{{ thepost_backup_pg_cluster }}.service"
+# Первая полная копия сразу после установки (без неё PITR недоступен до первого таймера).
+thepost_backup_initial: true
+# Запускать таймеры копий (restore.yml — false до конца восстановления).
+thepost_backup_start_timers: true
+
+# Восстановление (deploy/ansible/restore.yml): момент T — время с поясом ('2026-11-11 18:00:00+03');
+# пусто — до конца архива WAL (последнее состояние).
+thepost_restore_target: ""
+# Набор копий (label pgBackRest); пусто — pgBackRest выберет последний подходящий для T.
+thepost_restore_set: ""
+# Вернуть каталог BLOB из копии (поверх существующих файлов: объекты неизменяемы, лишние удалит thepost verify --fix).
+thepost_restore_blob: true
+# Снимок restic: пусто — первый снимок не раньше T (по инварианту W в нём все тела на момент T, а снимки, сделанные
+# после потери каталога, не берутся), без T — последний; иначе — ID снимка (thepost-restic snapshots).
+thepost_restore_blob_snapshot: ""
+# После сверки удалить «сирот» (объекты новее T): thepost verify --fix.
+thepost_restore_verify_fix: true
+# Сразу после восстановления — новая полная копия (новая линия времени PostgreSQL).
+thepost_restore_full_backup: true
+
+# Таймеры (имя → юнит, расписание).
+thepost_backup_timers: >-
+  {{ [{'name': 'thepost-backup-full', 'unit': 'thepost-backup@full.service', 'schedule': thepost_backup_full_schedule},
+      {'name': 'thepost-backup-diff', 'unit': 'thepost-backup@diff.service', 'schedule': thepost_backup_diff_schedule}]
+     + ([{'name': 'thepost-backup-blob', 'unit': 'thepost-backup-blob.service', 'schedule': thepost_backup_blob_schedule}]
+        if thepost_backup_blob_schedule | length > 0 else []) }}

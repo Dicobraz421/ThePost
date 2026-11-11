@@ -18,3 +18,12 @@ all:
         # Бинарный файл: собранный на управляющей машине (cargo build --release) или релиз:
         # thepost_binary_url: https://…/thepost-x86_64-linux
         # thepost_binary_checksum: "sha256:…"
+        # Резервное копирование (pgBackRest + restic; восстановление — deploy/ansible/restore.yml). Каталоги копий —
+        # на отдельном диске или в S3; ключи S3 — в OpenBao (bao kv put -mount=thepost-backup s3 …), не здесь.
+        thepost_backup: true
+        thepost_backup_retention_days: 7
+        # thepost_backup_repo: s3
+        # thepost_backup_s3_endpoint: https://s3.example.ru
+        # thepost_backup_s3_bucket: thepost-backup
+        # thepost_backup_repo_path: /pgbackrest
+        # thepost_backup_restic_repo: s3:https://s3.example.ru/thepost-backup/blob
