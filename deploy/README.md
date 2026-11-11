@@ -9,8 +9,9 @@
 | `compose/postgres/app-role.sh` | Учётные записи PostgreSQL: владелец схемы `thepost_owner`, узел `thepost`, только чтение `thepost_readonly` |
 | `openbao/thepost-policy.hcl` | Политика узла `thepost` в OpenBao (общая для compose, Helm, Ansible) |
 | `helm/openbao/` | Значения чарта `openbao/openbao` и настройка Kubernetes auth (`bootstrap.sh`) |
-| `helm/thepost/` | Чарт узла: не root, корневая ФС только для чтения, без capabilities, seccomp `RuntimeDefault`; PostgreSQL — CloudNativePG (`cnpg.enabled`) |
-| `ansible/` | Эталон SMB одной командой (`smb.yml`: роли `thepost_pki`, `openbao`, `postgresql`, `rspamd`, `clamav_milter`, `thepost`); OpenBao отдельно (`openbao.yml`); СУБД Enterprise-ВМ — pg_auto_failover (`pg-ha.yml`) |
+| `helm/thepost/` | Чарт узла: не root, корневая ФС только для чтения, без capabilities, seccomp `RuntimeDefault`; HPA по CPU, по соединениям — опция (`autoscaling`), PodDisruptionBudget, VPA в режиме рекомендаций, anti-affinity по узлам; PostgreSQL — CloudNativePG (`cnpg.enabled`) |
+| `helm/prometheus-adapter/` | Значения чарта prometheus-adapter: метрика `tp_load_connections` для HPA по соединениям |
+| `ansible/` | Эталон SMB одной командой (`smb.yml`: роли `thepost_pki`, `openbao`, `postgresql`, `rspamd`, `clamav_milter`, `thepost`); OpenBao отдельно (`openbao.yml`); СУБД Enterprise-ВМ — pg_auto_failover (`pg-ha.yml`); «Малый Enterprise» — 2 узла mailbox и 3 ВМ данных: pg_auto_failover, OpenBao (Raft), SeaweedFS с метаданными filer в PostgreSQL (`small-enterprise.yml`, роль `seaweedfs`) |
 | `stand/` | Стенд SMB и базовая нагрузка (APP-D): ВМ SMB + генератор, imaptest, smtp-source, k6, отчёт |
 | `systemd/` | Юнит `thepost.service` с hardening, сокеты `thepost-*.socket` (порты ниже 1024), пользователь `thepost` (sysusers) |
 | `config/` | Примеры `config.yaml` для пресетов `all` (SMB), `mailbox` (Enterprise-ВМ), `edge` (DMZ) |

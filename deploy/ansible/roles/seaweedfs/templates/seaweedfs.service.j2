@@ -1,0 +1,55 @@
+# {{ ansible_managed }}
+# SeaweedFS {{ seaweedfs_component }} (роль seaweedfs): конфигурация — {{ seaweedfs_config_dir }} (security.toml,
+# filer.toml), секреты — seaweedfs.env (читает systemd). Без привилегий: порты выше 1024, без capabilities.
+{% set common = '-ip=' ~ seaweedfs_address ~ ' -ip.bind=0.0.0.0' %}
+{% set masters = seaweedfs_masters | join(',') %}
+[Unit]
+Description=SeaweedFS {{ seaweedfs_component }} (The Post BLOB)
+Wants=network-online.target
+After=network-online.target{{ ' seaweedfs-master.service' if seaweedfs_component != 'master' and 'master' in seaweedfs_components else '' }}
+
+[Service]
+Type=simple
+User={{ seaweedfs_user }}
+Group={{ seaweedfs_user }}
+WorkingDirectory={{ seaweedfs_data_dir }}
+EnvironmentFile={{ seaweedfs_config_dir }}/seaweedfs.env
+{% if seaweedfs_component == 'master' %}
+ExecStart={{ seaweedfs_bin }} master {{ common }} -port={{ seaweedfs_master_port }} -mdir={{ seaweedfs_data_dir }}/master -peers={{ masters }} -defaultReplication={{ seaweedfs_replication }}
+{% elif seaweedfs_component == 'volume' %}
+ExecStart={{ seaweedfs_bin }} volume {{ common }} -port={{ seaweedfs_volume_port }} -dir={{ seaweedfs_data_dir }}/volume -max={{ seaweedfs_volume_max }} -master={{ masters }}
+{% elif seaweedfs_component == 'filer' %}
+ExecStart={{ seaweedfs_bin }} filer {{ common }} -port={{ seaweedfs_filer_port }} -master={{ masters }} -defaultReplicaPlacement={{ seaweedfs_replication }}
+{% else %}
+ExecStart={{ seaweedfs_bin }} s3 -ip.bind={{ seaweedfs_s3_bind }} -port={{ seaweedfs_s3_port }} -filer={{ seaweedfs_filers | join(',') }} -cert.file={{ seaweedfs_config_dir }}/tls/s3.pem -key.file={{ seaweedfs_config_dir }}/tls/s3.key -config={{ seaweedfs_config_dir }}/s3.json -iam=false -port.iceberg=0 -port.lance=0
+{% endif %}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+TimeoutStopSec=60
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths={{ seaweedfs_data_dir }}
+
+[Install]
+WantedBy=multi-user.target

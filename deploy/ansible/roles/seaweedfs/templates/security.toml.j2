@@ -1,0 +1,39 @@
+# {{ ansible_managed }}
+# SeaweedFS: внутренние каналы — только TLS (решение 2026-10-30). gRPC — взаимный TLS (один CA, сертификат узла —
+# и сервер, и клиент), HTTP master, volume, filer — HTTPS, клиенты HTTP проверяют сертификат сервера по CA.
+# Ключи JWT — в seaweedfs.env (WEED_JWT_SIGNING_KEY, WEED_JWT_FILER_SIGNING_KEY), здесь — только сроки.
+{% set tls = seaweedfs_config_dir ~ '/tls' %}
+
+[jwt.signing]
+expires_after_seconds = 10
+
+[jwt.filer_signing]
+expires_after_seconds = 10
+
+[access]
+ui = false
+
+[filer.expose_directory_metadata]
+enabled = false
+
+[grpc]
+ca = "{{ tls }}/ca.pem"
+
+{% for c in ['master', 'volume', 'filer', 's3', 'client'] %}
+[grpc.{{ c }}]
+cert = "{{ tls }}/node.pem"
+key = "{{ tls }}/node.key"
+
+{% endfor %}
+[https.client]
+enabled = true
+cert = "{{ tls }}/node.pem"
+key = "{{ tls }}/node.key"
+ca = "{{ tls }}/ca.pem"
+
+{% for c in ['master', 'volume', 'filer'] %}
+[https.{{ c }}]
+cert = "{{ tls }}/node.pem"
+key = "{{ tls }}/node.key"
+
+{% endfor %}

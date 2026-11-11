@@ -1,0 +1,49 @@
+{{- /* HPA (SRS 2.3, приложение З.4): CPU; соединения — опция (prometheus-adapter); по памяти — нет. */ -}}
+{{- if .Values.autoscaling.enabled }}
+{{- $a := .Values.autoscaling }}
+{{- if not (or $a.cpu.targetUtilization $a.connections.enabled) }}
+{{- fail "autoscaling: нужен autoscaling.cpu.targetUtilization или autoscaling.connections.enabled" }}
+{{- end }}
+{{- if and $a.cpu.targetUtilization (not (dig "requests" "cpu" "" .Values.resources)) }}
+{{- fail "autoscaling: HPA по CPU считает загрузку от resources.requests.cpu — задайте его" }}
+{{- end }}
+{{- if gt (int $a.minReplicas) (int $a.maxReplicas) }}
+{{- fail "autoscaling: minReplicas больше maxReplicas" }}
+{{- end }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "thepost.fullname" . }}
+  labels:
+    {{- include "thepost.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "thepost.fullname" . }}
+  minReplicas: {{ $a.minReplicas }}
+  maxReplicas: {{ $a.maxReplicas }}
+  metrics:
+    {{- if $a.cpu.targetUtilization }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $a.cpu.targetUtilization }}
+    {{- end }}
+    {{- if $a.connections.enabled }}
+    # Среднее число соединений на под — custom.metrics.k8s.io (prometheus-adapter).
+    - type: Pods
+      pods:
+        metric:
+          name: {{ $a.connections.metric }}
+        target:
+          type: AverageValue
+          averageValue: {{ $a.connections.targetAverageValue | quote }}
+    {{- end }}
+  {{- with $a.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

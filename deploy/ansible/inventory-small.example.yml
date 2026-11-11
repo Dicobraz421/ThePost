@@ -1,0 +1,52 @@
+# Пример инвентаря эталона «Малый Enterprise» (deploy/ansible/small-enterprise.yml, приложение З.2): два узла mailbox
+# и три ВМ данных. Паролей и ключей здесь нет — их генерирует и хранит OpenBao.
+#   ansible-playbook -i inventory-small.yml deploy/ansible/small-enterprise.yml
+#
+# TLS внутренних каналов (решение 2026-10-30) — CA заказчика, файлы на управляющей машине в small_pki_dir:
+#   ca.pem; <имя узла>.pem (цепочка) и <имя узла>.key для каждого узла; расширения — serverAuth и clientAuth
+#   (взаимный TLS gRPC SeaweedFS). SAN: имя узла в инвентаре; у ВМ данных — и имя из small_openbao_url; у узлов
+#   mailbox — и localhost (шлюз S3 на узле).
+---
+all:
+  vars:
+    ansible_user: admin
+    small_pki_dir: "{{ playbook_dir }}/pki"
+    # Сеть ВМ данных (репликация PostgreSQL, Raft OpenBao, SeaweedFS) и сеть узлов mailbox.
+    small_data_networks: ["10.0.20.0/24"]
+    small_mail_networks: ["10.0.10.0/24"]
+    # Адрес OpenBao для thepost: DNS-имя с A-записями трёх ВМ данных (клиент перебирает адреса при отказе ВМ).
+    small_openbao_url: https://openbao.example.ru:8200
+    small_bucket: thepost-blob
+  children:
+    small_data:
+      hosts:
+        data1.example.ru:
+        data2.example.ru:
+        data3.example.ru:
+    # PostgreSQL: primary и standby (первый узел при установке — primary) и монитор — на третьей ВМ данных.
+    pgaf_nodes:
+      hosts:
+        data1.example.ru:
+        data2.example.ru:
+    pgaf_monitor:
+      hosts:
+        data3.example.ru:
+    mailbox:
+      hosts:
+        mail1.example.ru:
+        mail2.example.ru:
+      vars:
+        thepost_domain: example.ru
+        thepost_hostname: mail.example.ru
+        # Сертификат клиентских протоколов — общий для узлов (имя mail.example.ru → виртуальный адрес).
+        thepost_tls_mode: files
+        thepost_tls_cert_src: "{{ playbook_dir }}/pki/mail.example.ru.fullchain.pem"
+        thepost_tls_key_src: "{{ playbook_dir }}/pki/mail.example.ru.key"
+        # Виртуальный адрес (keepalived, оба узла в одном сегменте); пусто — балансировщик заказчика.
+        small_vip_address: 10.0.10.10/24
+        small_vip_interface: eth0
+        small_vip_router_id: 51
+        # Свои параметры config.yaml поверх эталона: small_thepost_config_extra: { … }
+        # Бинарный файл: собранный на управляющей машине (cargo build --release) или релиз:
+        # thepost_binary_url: https://…/thepost-x86_64-linux
+        # thepost_binary_checksum: "sha256:…"

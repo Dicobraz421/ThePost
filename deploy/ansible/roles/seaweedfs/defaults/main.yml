@@ -1,0 +1,65 @@
+# Роль seaweedfs: BLOB-хранилище The Post на ВМ (малый Enterprise, приложение З.2) — бинарный файл weed из релиза
+# SeaweedFS и юниты systemd по компонентам: master (кворум Raft — 2 из 3), volume (две копии объекта на разных ВМ),
+# filer (метаданные — PostgreSQL, store postgres2), шлюз S3. Внутренние каналы — только TLS: gRPC — взаимный TLS,
+# HTTP master, volume и filer — HTTPS, S3 — HTTPS (security.toml, решение 2026-10-30). Секреты (ключи JWT, пароль
+# filer, ключи S3) роль получает переменными из OpenBao (small-enterprise.yml), на диске — только root или 0640.
+# Повторный прогон ничего не меняет.
+---
+seaweedfs_version: "4.49"
+seaweedfs_arch: "{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+seaweedfs_release_url: "https://github.com/seaweedfs/seaweedfs/releases/download/{{ seaweedfs_version }}"
+seaweedfs_archive_url: "{{ seaweedfs_release_url }}/linux_{{ seaweedfs_arch }}.tar.gz"
+# SHA-256 архивов релиза (GitHub release assets digest); своя зеркальная копия — seaweedfs_archive_checksum.
+seaweedfs_checksums:
+  "4.49":
+    amd64: "sha256:3d10545b2317adc1587be02594f97e63420fe1aa7a5ba2af9c9760804574e397"
+    arm64: "sha256:a485c128d14f5cb7582769799b9faee9816bb3dbcce1a0b04fe6519502423253"
+seaweedfs_archive_checksum: "{{ seaweedfs_checksums[seaweedfs_version][seaweedfs_arch] }}"
+seaweedfs_bin: /usr/local/bin/weed
+seaweedfs_user: seaweedfs
+seaweedfs_config_dir: /etc/seaweedfs
+seaweedfs_data_dir: /var/lib/seaweedfs
+
+# Компоненты на этой ВМ: master, volume, filer, s3.
+seaweedfs_components: [master, volume, filer]
+# Адрес узла для кластера — имя из SAN сертификата узла (клиенты HTTPS проверяют имя).
+seaweedfs_address: "{{ inventory_hostname }}"
+seaweedfs_master_port: 9333
+seaweedfs_volume_port: 8080
+seaweedfs_filer_port: 8888
+seaweedfs_s3_port: 8333
+# Шлюз S3 — только на loopback узла thepost: thepost обращается к https://localhost:8333 (SAN сертификата — localhost).
+seaweedfs_s3_bind: 127.0.0.1
+# Узлы master ("имя:порт", нечётное число — кворум Raft) и filer для шлюза S3 (несколько — переключение при отказе).
+seaweedfs_masters: []
+seaweedfs_filers: []
+# Размещение копий: 001 — вторая копия на другом сервере (ВМ) той же стойки; объём — сумма дисков ВМ, делённая на 2.
+seaweedfs_replication: "001"
+# Число томов volume: 0 — по свободному месту на диске.
+seaweedfs_volume_max: 0
+
+# TLS: CA и сертификат узла (serverAuth и clientAuth — тот же сертификат у gRPC-клиента) на управляющей машине.
+seaweedfs_tls_ca_src: ""
+seaweedfs_tls_cert_src: ""
+seaweedfs_tls_key_src: ""
+# Сертификат шлюза S3 (SAN — localhost); по умолчанию — сертификат узла.
+seaweedfs_s3_tls_cert_src: "{{ seaweedfs_tls_cert_src }}"
+seaweedfs_s3_tls_key_src: "{{ seaweedfs_tls_key_src }}"
+
+# Метаданные filer — PostgreSQL (store postgres2): узлы кластера (pg_auto_failover — primary и standby; filer
+# подключается к доступному для записи, target_session_attrs=read-write), TLS verify-full по seaweedfs_tls_ca_src.
+seaweedfs_filer_db_hosts: []
+seaweedfs_filer_db_port: 5432
+seaweedfs_filer_db_name: thepost
+seaweedfs_filer_db_schema: seaweedfs
+seaweedfs_filer_db_user: seaweedfs_filer
+seaweedfs_filer_db_password: ""
+
+# Ключи JWT (OpenBao): запись на volume — по токену master, запись в filer — по токену шлюза S3.
+seaweedfs_jwt_signing_key: ""
+seaweedfs_jwt_filer_signing_key: ""
+
+# Учётные записи шлюза S3 (OpenBao): [{ name, access_key, secret_key, actions: ["Read:<бакет>", …] }].
+seaweedfs_s3_identities: []
+# Бакеты — создаёт первый узел группы filer (weed shell).
+seaweedfs_buckets: []

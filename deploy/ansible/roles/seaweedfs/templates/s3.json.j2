@@ -1,0 +1,7 @@
+{#- Учётные записи шлюза S3 (ключи — из OpenBao); права — по бакетам ("Read:<бакет>" и т. п.). -#}
+{%- set ids = [] -%}
+{%- for i in seaweedfs_s3_identities -%}
+{%-   set _ = ids.append({'name': i.name, 'credentials': [{'accessKey': i.access_key, 'secretKey': i.secret_key}],
+                          'actions': i.actions}) -%}
+{%- endfor -%}
+{{ {'identities': ids} | to_nice_json(indent=2) }}
