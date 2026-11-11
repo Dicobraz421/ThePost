@@ -437,11 +437,13 @@ impl Services {
 
     /// Сервер JMAP; отправка — через доставку SMTP (CMP-07): локальным адресатам — сразу в ящики, внешним — в
     /// очередь SMTP с DKIM-подписью. Правила потока почты модуля — в `EmailSubmission/set` (`Jmap::with_mail_flow`).
+    /// Профиль `.mobileconfig` подписывается текущим сертификатом TLS узла `certs` (APP-23); без TLS — без подписи.
     pub fn jmap(
         &self,
         ext: &Registry,
         cfg: tp_jmap::JmapConfig,
         smtp: &SmtpConfig,
+        certs: Option<Arc<TlsCerts>>,
     ) -> Result<tp_jmap::Jmap> {
         // `Delivery` — `tp_contracts::queue::Outbound` (CTR-28): статус по получателю — в `deliveryStatus`.
         let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
@@ -468,7 +470,8 @@ impl Services {
         };
         Ok(tp_jmap::Jmap::new(deps, cfg)
             .map_err(|e| infra::context("jmap", e))?
-            .with_mail_flow(self.mail_flow.clone()))
+            .with_mail_flow(self.mail_flow.clone())
+            .with_profile_signer(crate::profile_signer::profile_signer(certs)))
     }
 
     /// Admin API.

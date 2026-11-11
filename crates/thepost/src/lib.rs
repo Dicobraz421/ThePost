@@ -10,6 +10,7 @@ pub mod local_admin;
 pub mod log_reader;
 pub mod metrics;
 pub mod modules;
+pub mod profile_signer;
 pub mod protocols;
 pub mod roles;
 pub mod secrets;
