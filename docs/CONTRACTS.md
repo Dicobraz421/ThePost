@@ -77,7 +77,8 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   `insert_batch(tenant, Vec<(AccountScope, MailboxId, NewMessage)>) -> Vec<Inserted>` — все доставки одного приёма
   одной транзакцией: вставлены все или ни одного, события доставки — в ней же (решение 2026-10-31-atomic-delivery); `get`, `list(mailbox, MessageQuery, limit)`,
   `set_flags(ids, FlagOp, unchanged_since) -> FlagsUpdate`, `copy`, `move_to`, `to_trash`, `restore`, `expunge_final`.
-  `copy`/`move_to` создают новые `MessageId`; `to_trash`/`restore` сохраняют `MessageId` (меняются папка и UID);
+  `copy` создаёт новые `MessageId`; `move_to`, `to_trash`, `restore` сохраняют `MessageId` (меняются папка и UID; `move_to` — CTR-29,
+  id письма JMAP неизменен по RFC 8621; событие `Moved { from_message = message }`);
   `expunge_final` удаляет только письма в корзине (остальные пропускает).
 - `NewMessage`: `skeleton: BlobKey`, `parts: Vec<PartRef>`, `size`, `received_at`, `flags`, `meta: MessageMeta`
   (envelope, bodystructure, preview, thread key — вычисляются при приёме).
@@ -510,3 +511,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-11 — CTR-41 (x/contracts-29, решение #193): `admin_token::{LocalAdminTokens, LocalAdminToken, LocalTokenState,
   LOCAL_ADMIN_TOKEN_PREFIX, is_local_admin_token}` — локальный одноразовый токен Admin API (выдача, погашение, срок, отзыв, очистка; хранится
   хэш). In-memory — `MemLocalAdminTokens`; набор `suite::local_admin_tokens`. PostgreSQL (`tp-meta`) и вход в `tp-admin` (ADM-11) — волны полос.
+- 2026-11-11 — CTR-29 (x/contracts-17): `MessageStore::move_to` сохраняет `MessageId` (меняются папка, UID, `ModSeq`), как `to_trash`/`restore`;
+  `copy` — по-прежнему новый id. Реализации — `PgMeta`, `MemMetadata`; JMAP `Email/set` (`mailboxIds`) — `updated: null`; `tp-mailstore` уведомляет
+  исходные папки по состоянию до переноса.

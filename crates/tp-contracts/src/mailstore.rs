@@ -144,7 +144,7 @@ pub trait MailStore: Send + Sync + 'static {
         to: MailboxId,
     ) -> Result<Vec<Inserted>>;
 
-    /// Переносит письма в папку.
+    /// Переносит письма в папку с прежним `MessageId` (CTR-29); уведомляет исходные папки и папку назначения.
     async fn move_to(
         &self,
         scope: AccountScope,

@@ -1,8 +1,8 @@
 //! `Email/set`, `Email/import`, `Email/copy` (RFC 8621 §4.6–4.8).
 //!
 //! - Изменение: `keywords` (целиком или `keywords/<слово>`) — `MailStore::set_flags`; `mailboxIds` — одна папка
-//!   (`maxMailboxesPerEmail` = 1), перенос — `MailStore::move_to`. Перенос создаёт новое письмо (CONTRACTS.md#Metadata),
-//!   поэтому `updated` содержит новый `id`.
+//!   (`maxMailboxesPerEmail` = 1), перенос — `MailStore::move_to`. Перенос сохраняет `id` (RFC 8621; CTR-29),
+//!   поэтому `updated` — `null`.
 //! - Создание — черновик: MIME собирает `mail-builder` из адресов, темы, `textBody`/`htmlBody` (текст из `bodyValues`),
 //!   вложений из blob и полей `header:<имя>`; письмо кладёт `MailStore::append`. `bodyStructure` не поддерживается.
 //! - Удаление — в корзину (`MailStore::delete_to_trash`); письмо уже в корзине — «очистить корзину»
@@ -594,12 +594,8 @@ fn unescape(s: &str) -> String {
     s.replace("~1", "/").replace("~0", "~")
 }
 
-/// Изменение одного письма; `Ok(Ok(Some(id)))` — письмо перенесено и получило новый `id`.
-async fn update_one(
-    ctx: &Ctx<'_>,
-    id: &str,
-    patch: &Value,
-) -> MethodResult<Result<Option<MessageId>, Value>> {
+/// Изменение одного письма (перенос сохраняет `id`).
+async fn update_one(ctx: &Ctx<'_>, id: &str, patch: &Value) -> MethodResult<Result<(), Value>> {
     let d = &ctx.jmap.d;
     let msg = match MessageId::from_str(ctx.resolve_id(id)) {
         Ok(mid) => d.messages.get(ctx.scope, mid).await?,
@@ -694,13 +690,10 @@ async fn update_one(
             .set_flags(ctx.scope, &ids, FlagOp::Remove(remove), None)
             .await?;
     }
-    match to {
-        None => Ok(Ok(None)),
-        Some(to) => {
-            let moved = d.store.move_to(ctx.scope, &ids, to).await?;
-            Ok(Ok(moved.first().map(|i| i.id)))
-        }
+    if let Some(to) = to {
+        d.store.move_to(ctx.scope, &ids, to).await?;
     }
+    Ok(Ok(()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -747,11 +740,8 @@ pub(crate) async fn set(
     let (mut updated, mut not_updated) = (Map::new(), Map::new());
     for (id, patch) in a.update.unwrap_or_default() {
         match update_one(ctx, &id, &patch).await? {
-            Ok(None) => {
+            Ok(()) => {
                 updated.insert(id, Value::Null);
-            }
-            Ok(Some(new)) => {
-                updated.insert(id, json!({ "id": new.to_string() }));
             }
             Err(e) => {
                 not_updated.insert(id, e);
@@ -853,7 +843,7 @@ mod tests {
         env.call("Email/get", args, "Email/get").await["list"][0].clone()
     }
 
-    /// keywords (патч и целиком), перенос в другую папку — новый id в `updated`, ошибки mailboxIds.
+    /// keywords (патч и целиком), перенос в другую папку — прежний id (`updated` — `null`), ошибки mailboxIds.
     #[tokio::test]
     async fn update_keywords_and_mailbox() {
         let env = Env::new().await;
@@ -910,10 +900,10 @@ mod tests {
                 "Email/set",
             )
             .await;
-        let new = r["updated"][&id]["id"].as_str().expect("new id").to_owned();
-        assert_ne!(new, id);
+        // Перенос сохраняет id (RFC 8621, CTR-29).
+        assert_eq!(r["updated"], json!({&id: null}), "{r}");
         assert_eq!(
-            get(&env, &new).await["mailboxIds"],
+            get(&env, &id).await["mailboxIds"],
             json!({sent.to_string(): true})
         );
         assert_ne!(r["oldState"], r["newState"]);
