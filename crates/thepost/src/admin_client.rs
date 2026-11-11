@@ -8,7 +8,8 @@
 //! - Организация — `--org`, иначе `THEPOST_ADMIN_ORG`, иначе организация администратора (`GET /api/v1/whoami`).
 //! - Вывод — таблица или ответ API (`--json`); и то и другое — из типизированного ответа.
 //!
-//! Тела запросов и ответы — структуры tp-admin, из которых строится спецификация OpenAPI (APP-21, [`wire`]).
+//! Тела запросов, параметры и ответы — прямо структуры tp-admin, из которых строится спецификация OpenAPI
+//! (APP-21, APP-22; у них обе стороны serde — ADM-13).
 //! Операции клиента — [`OPERATIONS`]: тест сверяет каждую со спецификацией OpenAPI tp-admin
 //! (`tp_admin::server::openapi_spec`), команды проверяются против роутера tp-admin. Генератор клиента (progenitor)
 //! не используется: спецификация — OpenAPI 3.1, progenitor читает только 3.0.
@@ -17,11 +18,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, LINK};
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tp_admin::AdminRole;
+use tp_admin::accounts::{AccountInfo, AccountQuery, NewAccount};
+use tp_admin::app_passwords::{AppPasswordInfo, IssuedAppPassword, NewAppPassword};
+use tp_admin::init::AdminSession;
+use tp_admin::server::{Problem, WhoAmI};
+use tp_admin::transport::{DomainBody, DomainList, DomainWritten, VersionQuery, Written};
 use tp_contracts::admin_token::is_local_admin_token;
 use tp_contracts::transport::{AcceptedDomain, DomainKind};
 use tp_contracts::{AccountId, TenantId};
@@ -116,11 +122,17 @@ pub enum AccountAction {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Поиск по имени входа (полного списка Admin API пока не отдаёт).
+    /// Учётные записи по возрастанию имени входа (страницы Admin API — по ссылке Link rel="next"); --login — поиск одной.
     List {
-        /// Имя входа (без учёта регистра).
+        /// Поиск по имени входа (без учёта регистра); несовместимо с --prefix и --limit.
+        #[arg(long, conflicts_with_all = ["prefix", "limit"])]
+        login: Option<String>,
+        /// Имя входа начинается с префикса (без учёта регистра).
         #[arg(long)]
-        login: String,
+        prefix: Option<String>,
+        /// Не больше N записей (по умолчанию — все).
+        #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+        limit: Option<usize>,
     },
     /// Учётная запись по идентификатору или имени входа.
     Get {
@@ -193,7 +205,7 @@ pub const WHOAMI: Op = Op {
     method: "GET",
     path: "/api/v1/whoami",
 };
-/// Поиск учётной записи по имени входа.
+/// Поиск учётной записи по имени входа и страница списка.
 pub const ACCOUNT_FIND: Op = Op {
     method: "GET",
     path: "/api/v1/orgs/{org}/accounts",
@@ -254,370 +266,6 @@ pub const OPERATIONS: &[Op] = &[
     DOMAIN_REMOVE,
 ];
 
-/// Тела запросов и ответы Admin API — структуры tp-admin, из которых строится спецификация OpenAPI.
-///
-/// У структур запросов tp-admin есть только `Deserialize`, у структур ответов — только `Serialize` (стороны сервера).
-/// Клиенту нужны обратные, поэтому здесь — их отражения:
-/// - запрос клиент собирает структурой tp-admin и переводит в тело полной деструктуризацией (`From`);
-/// - ответ читается отражением; [`Mirror::fields`] полностью деструктурирует структуру ответа tp-admin.
-///
-/// Переименование, добавление или удаление поля структуры tp-admin ломает сборку CLI. Имена и форматы полей JSON
-/// сверяет тест: тело отражения читает структура запроса tp-admin (`deny_unknown_fields`), ответ, сериализованный
-/// tp-admin, читается отражением и сериализуется обратно без изменений. Типы с обеими сторонами (`AdminRole`,
-/// `PolicyBody`, `AcceptedDomain`) используются как есть.
-pub mod wire {
-    use serde::{Deserialize, Serialize};
-    use tp_admin::AdminRole;
-    use tp_admin::accounts::PolicyBody;
-    use tp_contracts::transport::{AcceptedDomain, DomainKind};
-
-    /// Ответ Admin API — отражение структуры ответа tp-admin `S` (у неё только `Serialize`).
-    pub trait Mirror<S> {
-        /// Полная деструктуризация `S`: проверка полей при сборке (не вызывается).
-        fn fields(s: S);
-    }
-
-    // ---------- запросы ----------
-
-    /// Тело `POST /api/v1/orgs/{org}/accounts` (`tp_admin::accounts::NewAccount`).
-    #[derive(Debug, Serialize)]
-    pub struct NewAccount {
-        /// Имя входа.
-        pub login: String,
-        /// Отображаемое имя.
-        pub display_name: Option<String>,
-    }
-
-    impl From<tp_admin::accounts::NewAccount> for NewAccount {
-        fn from(r: tp_admin::accounts::NewAccount) -> Self {
-            let tp_admin::accounts::NewAccount {
-                login,
-                display_name,
-            } = r;
-            Self {
-                login,
-                display_name,
-            }
-        }
-    }
-
-    /// Тело `POST …/app-passwords` (`tp_admin::app_passwords::NewAppPassword`).
-    #[derive(Debug, Serialize)]
-    pub struct NewAppPassword {
-        /// Подпись.
-        pub label: String,
-    }
-
-    impl From<tp_admin::app_passwords::NewAppPassword> for NewAppPassword {
-        fn from(r: tp_admin::app_passwords::NewAppPassword) -> Self {
-            let tp_admin::app_passwords::NewAppPassword { label } = r;
-            Self { label }
-        }
-    }
-
-    /// Тело `POST /api/v1/orgs/{org}/transport/domains` (`tp_admin::transport::DomainBody`).
-    #[derive(Debug, Serialize)]
-    pub struct DomainBody {
-        /// Версия снимка кластера.
-        pub version: u64,
-        /// Имя домена.
-        pub name: String,
-        /// Вид.
-        pub kind: DomainKind,
-    }
-
-    impl From<tp_admin::transport::DomainBody> for DomainBody {
-        fn from(r: tp_admin::transport::DomainBody) -> Self {
-            let tp_admin::transport::DomainBody {
-                version,
-                name,
-                kind,
-            } = r;
-            Self {
-                version,
-                name,
-                kind,
-            }
-        }
-    }
-
-    /// Параметры запроса поиска учётной записи (`tp_admin::accounts::AccountQuery`).
-    pub fn account_query(q: tp_admin::accounts::AccountQuery) -> Vec<(&'static str, String)> {
-        let tp_admin::accounts::AccountQuery {
-            login,
-            prefix,
-            after,
-            limit,
-        } = q;
-        let mut out = Vec::new();
-        if let Some(login) = login {
-            out.push(("login", login));
-        }
-        if let Some(prefix) = prefix {
-            out.push(("prefix", prefix));
-        }
-        if let Some(after) = after {
-            out.push(("after", after));
-        }
-        if let Some(limit) = limit {
-            out.push(("limit", limit.to_string()));
-        }
-        out
-    }
-
-    /// Параметры запроса удаления по версии снимка (`tp_admin::transport::VersionQuery`).
-    pub fn version_query(q: tp_admin::transport::VersionQuery) -> Vec<(&'static str, String)> {
-        let tp_admin::transport::VersionQuery { version } = q;
-        vec![("version", version.to_string())]
-    }
-
-    // ---------- ответы ----------
-
-    /// Сессия Admin API (`tp_admin::init::AdminSession`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct Session {
-        /// Значение для `Authorization: Bearer` (`tps_…`).
-        pub session: String,
-        /// Действует до (RFC 3339).
-        pub expires_at: String,
-        /// Организация.
-        pub tenant: String,
-        /// Учётная запись.
-        pub account: String,
-        /// Имя входа.
-        pub login: String,
-        /// Роли сессии.
-        pub roles: Vec<AdminRole>,
-    }
-
-    impl Mirror<tp_admin::init::AdminSession> for Session {
-        fn fields(s: tp_admin::init::AdminSession) {
-            let tp_admin::init::AdminSession {
-                session: _,
-                expires_at: _,
-                tenant: _,
-                account: _,
-                login: _,
-                roles: _,
-            } = s;
-        }
-    }
-
-    /// Текущий администратор (`tp_admin::server::WhoAmI`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct WhoAmI {
-        /// Организация.
-        pub tenant: String,
-        /// Учётная запись.
-        pub account: String,
-        /// Имя входа.
-        pub login: String,
-        /// Роли.
-        pub roles: Vec<AdminRole>,
-    }
-
-    impl Mirror<tp_admin::server::WhoAmI> for WhoAmI {
-        fn fields(s: tp_admin::server::WhoAmI) {
-            let tp_admin::server::WhoAmI {
-                tenant: _,
-                account: _,
-                login: _,
-                roles: _,
-            } = s;
-        }
-    }
-
-    /// Использование квоты (`tp_admin::accounts::QuotaInfo`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct Quota {
-        /// Занято байт, включая корзину.
-        pub used_bytes: u64,
-        /// Число писем.
-        pub messages: u64,
-        /// Лимит; `None` — без ограничения.
-        pub limit_bytes: Option<u64>,
-    }
-
-    impl Mirror<tp_admin::accounts::QuotaInfo> for Quota {
-        fn fields(s: tp_admin::accounts::QuotaInfo) {
-            let tp_admin::accounts::QuotaInfo {
-                used_bytes: _,
-                messages: _,
-                limit_bytes: _,
-            } = s;
-        }
-    }
-
-    /// Политика уровня и действующая (`tp_admin::accounts::Policies`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct Policies {
-        /// Заданное на этом уровне.
-        pub policy: PolicyBody,
-        /// Действующее с учётом вышестоящих уровней.
-        pub effective: PolicyBody,
-    }
-
-    impl Mirror<tp_admin::accounts::Policies> for Policies {
-        fn fields(s: tp_admin::accounts::Policies) {
-            let tp_admin::accounts::Policies {
-                policy: _,
-                effective: _,
-            } = s;
-        }
-    }
-
-    /// Учётная запись (`tp_admin::accounts::AccountInfo`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct Account {
-        /// Идентификатор.
-        pub id: String,
-        /// Основной домен.
-        pub domain: String,
-        /// Имя входа.
-        pub login: String,
-        /// Отображаемое имя.
-        pub display_name: String,
-        /// Идентификатор в каталоге; `None` — локальная запись.
-        pub external_id: Option<String>,
-        /// Вход разрешён.
-        pub enabled: bool,
-        /// Квота.
-        pub quota: Quota,
-        /// Политики ящика.
-        #[serde(flatten)]
-        pub policies: Policies,
-    }
-
-    impl Mirror<tp_admin::accounts::AccountInfo> for Account {
-        fn fields(s: tp_admin::accounts::AccountInfo) {
-            let tp_admin::accounts::AccountInfo {
-                id: _,
-                domain: _,
-                login: _,
-                display_name: _,
-                external_id: _,
-                enabled: _,
-                quota: _,
-                policies: _,
-            } = s;
-        }
-    }
-
-    /// Пароль приложения без значения (`tp_admin::app_passwords::AppPasswordInfo`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct AppPassword {
-        /// Идентификатор.
-        pub id: String,
-        /// Подпись.
-        pub label: String,
-        /// Выпущен (RFC 3339).
-        pub created_at: String,
-        /// Отозван (RFC 3339); `None` — действует.
-        pub revoked_at: Option<String>,
-    }
-
-    impl Mirror<tp_admin::app_passwords::AppPasswordInfo> for AppPassword {
-        fn fields(s: tp_admin::app_passwords::AppPasswordInfo) {
-            let tp_admin::app_passwords::AppPasswordInfo {
-                id: _,
-                label: _,
-                created_at: _,
-                revoked_at: _,
-            } = s;
-        }
-    }
-
-    /// Выпущенный пароль (`tp_admin::app_passwords::IssuedAppPassword`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct IssuedAppPassword {
-        /// Пароль.
-        #[serde(flatten)]
-        pub info: AppPassword,
-        /// Значение пароля.
-        pub password: String,
-    }
-
-    impl Mirror<tp_admin::app_passwords::IssuedAppPassword> for IssuedAppPassword {
-        fn fields(s: tp_admin::app_passwords::IssuedAppPassword) {
-            let tp_admin::app_passwords::IssuedAppPassword {
-                info: _,
-                password: _,
-            } = s;
-        }
-    }
-
-    /// Принятые домены организации (`tp_admin::transport::DomainList`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct DomainList {
-        /// Версия снимка кластера.
-        pub version: u64,
-        /// Домены.
-        pub domains: Vec<AcceptedDomain>,
-    }
-
-    impl Mirror<tp_admin::transport::DomainList> for DomainList {
-        fn fields(s: tp_admin::transport::DomainList) {
-            let tp_admin::transport::DomainList {
-                version: _,
-                domains: _,
-            } = s;
-        }
-    }
-
-    /// Записанный домен (`tp_admin::transport::DomainWritten`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct DomainWritten {
-        /// Новая версия снимка кластера.
-        pub version: u64,
-        /// Домен.
-        pub domain: AcceptedDomain,
-    }
-
-    impl Mirror<tp_admin::transport::DomainWritten> for DomainWritten {
-        fn fields(s: tp_admin::transport::DomainWritten) {
-            let tp_admin::transport::DomainWritten {
-                version: _,
-                domain: _,
-            } = s;
-        }
-    }
-
-    /// Новая версия снимка после записи (`tp_admin::transport::Written`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct Written {
-        /// Версия снимка.
-        pub version: u64,
-    }
-
-    impl Mirror<tp_admin::transport::Written> for Written {
-        fn fields(s: tp_admin::transport::Written) {
-            let tp_admin::transport::Written { version: _ } = s;
-        }
-    }
-
-    /// Ошибка RFC 9457 (`tp_admin::server::Problem`).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct Problem {
-        /// Код HTTP.
-        pub status: u16,
-        /// Краткое описание кода.
-        pub title: String,
-        /// Подробность.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub detail: Option<String>,
-    }
-
-    impl Mirror<tp_admin::server::Problem> for Problem {
-        fn fields(s: tp_admin::server::Problem) {
-            let tp_admin::server::Problem {
-                status: _,
-                title: _,
-                detail: _,
-            } = s;
-        }
-    }
-}
-
 /// Результат команды: текст для stdout или сообщение об ошибке.
 type CliResult<T> = std::result::Result<T, String>;
 
@@ -655,7 +303,7 @@ impl Client {
     }
 
     /// Адрес операции: параметры шаблона по порядку (кодируются как сегменты пути) и запрос `query`.
-    fn url(&self, op: Op, params: &[&str], query: &[(&str, String)]) -> CliResult<Url> {
+    fn url(&self, op: Op, params: &[&str], query: &[(String, String)]) -> CliResult<Url> {
         let mut url = self.base.clone();
         {
             let mut segs = url
@@ -680,15 +328,15 @@ impl Client {
         Ok(url)
     }
 
-    /// Запрос `op` с телом `body` (JSON); ответ 2xx — тело как есть, иначе — ошибка с кодом и причиной из
-    /// problem details.
+    /// Запрос `op` с телом `body` (JSON); ответ 2xx — заголовки и тело как есть, иначе — ошибка с кодом и причиной
+    /// из problem details.
     async fn send<B: Serialize + ?Sized>(
         &self,
         op: Op,
         params: &[&str],
-        query: &[(&str, String)],
+        query: &[(String, String)],
         body: Option<&B>,
-    ) -> CliResult<Vec<u8>> {
+    ) -> CliResult<(HeaderMap, Vec<u8>)> {
         let url = self.url(op, params, query)?;
         let method = Method::from_bytes(op.method.as_bytes()).map_err(|e| e.to_string())?;
         let mut req = self.http.request(method, url).bearer_auth(&self.token);
@@ -701,32 +349,56 @@ impl Client {
             .await
             .map_err(|e| format!("Admin API {}: {e}", self.base))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| format!("Admin API: ответ: {e}"))?;
         if status.is_success() {
-            Ok(bytes.to_vec())
+            Ok((headers, bytes.to_vec()))
         } else {
             Err(problem(op, status, &bytes))
         }
     }
 
-    /// Запрос `op`; ответ — отражение структуры ответа tp-admin `R` ([`wire`]).
+    /// Запрос `op`; ответ — структура ответа tp-admin `R`.
     pub async fn call<B: Serialize + ?Sized, R: DeserializeOwned>(
         &self,
         op: Op,
         params: &[&str],
-        query: &[(&str, String)],
+        query: &[(String, String)],
         body: Option<&B>,
     ) -> CliResult<R> {
-        let bytes = self.send(op, params, query, body).await?;
-        serde_json::from_slice(&bytes).map_err(|e| {
+        self.call_page(op, params, query, body)
+            .await
+            .map(|(r, _)| r)
+    }
+
+    /// Запрос `op`; ответ — структура ответа tp-admin `R` и цель ссылки `Link: <…>; rel="next"` (RFC 8288), если есть.
+    pub async fn call_page<B: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        op: Op,
+        params: &[&str],
+        query: &[(String, String)],
+        body: Option<&B>,
+    ) -> CliResult<(R, Option<String>)> {
+        let (headers, bytes) = self.send(op, params, query, body).await?;
+        let r = serde_json::from_slice(&bytes).map_err(|e| {
             format!(
                 "{} {}: ответ не по спецификации Admin API: {e}",
                 op.method, op.path
             )
-        })
+        })?;
+        Ok((r, next_link(&headers)))
+    }
+
+    /// Параметры запроса из ссылки Admin API (`/api/v1/…?…`, путь от корня Admin API).
+    fn link_query(&self, link: &str) -> CliResult<Vec<(String, String)>> {
+        let url = self
+            .base
+            .join(link)
+            .map_err(|e| format!("ссылка Link {link:?}: {e}"))?;
+        Ok(url.query_pairs().into_owned().collect())
     }
 
     /// Запрос `op` без тела ответа (`204`).
@@ -734,16 +406,64 @@ impl Client {
         &self,
         op: Op,
         params: &[&str],
-        query: &[(&str, String)],
+        query: &[(String, String)],
         body: Option<&B>,
     ) -> CliResult<()> {
         self.send(op, params, query, body).await.map(drop)
     }
 }
 
-/// Сообщение об отказе: код, описание и подробность ответа (RFC 9457, [`wire::Problem`]), подсказка для 401.
+/// Цель первой ссылки `rel="next"` заголовков `Link` (RFC 8288).
+fn next_link(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(LINK)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .find_map(|link| {
+            let (target, params) = link.trim().strip_prefix('<')?.split_once('>')?;
+            params
+                .split(';')
+                .filter_map(|p| p.trim().strip_prefix("rel="))
+                .any(|rel| {
+                    rel.trim_matches('"')
+                        .split_ascii_whitespace()
+                        .any(|r| r.eq_ignore_ascii_case("next"))
+                })
+                .then(|| target.to_owned())
+        })
+}
+
+/// Параметры запроса из структуры запроса tp-admin: поля объекта JSON, `null` пропускается.
+fn query<Q: Serialize>(q: &Q) -> CliResult<Vec<(String, String)>> {
+    match serde_json::to_value(q).map_err(|e| e.to_string())? {
+        serde_json::Value::Object(fields) => Ok(fields
+            .into_iter()
+            .filter_map(|(k, v)| match v {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => Some((k, s)),
+                other => Some((k, other.to_string())),
+            })
+            .collect()),
+        other => Err(format!("параметры запроса — не объект: {other}")),
+    }
+}
+
+/// Поле ответа `v` как в JSON Admin API (даты — RFC 3339, форматом tp-admin); `null` или нет поля — «—».
+fn json_field<T: Serialize>(v: &T, field: &str) -> String {
+    match serde_json::to_value(v) {
+        Ok(serde_json::Value::Object(mut fields)) => match fields.remove(field) {
+            Some(serde_json::Value::String(s)) => s,
+            None | Some(serde_json::Value::Null) => "—".to_owned(),
+            Some(other) => other.to_string(),
+        },
+        _ => "—".to_owned(),
+    }
+}
+
+/// Сообщение об отказе: код, описание и подробность ответа (RFC 9457, [`Problem`]), подсказка для 401.
 fn problem(op: Op, status: StatusCode, body: &[u8]) -> String {
-    let p = serde_json::from_slice::<wire::Problem>(body).ok();
+    let p = serde_json::from_slice::<Problem>(body).ok();
     let title = p
         .as_ref()
         .map(|p| p.title.as_str())
@@ -869,12 +589,12 @@ fn out<T: Serialize>(args: &ApiArgs, v: &T, text: String) -> CliResult<String> {
 pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliResult<String> {
     match action {
         ApiAction::Login => {
-            let s: wire::Session = client.call(SESSION, &[], &[], NO_BODY).await?;
+            let s: AdminSession = client.call(SESSION, &[], &[], NO_BODY).await?;
             let text = format!(
                 "{}Значение сессии показывается один раз. Дальше: export {ENV_TOKEN}=<сессия>\n",
                 record(&[
                     ("Сессия", s.session.clone()),
-                    ("Действует до", s.expires_at.clone()),
+                    ("Действует до", json_field(&s, "expires_at")),
                     ("Администратор", s.login.clone()),
                     ("Организация", s.tenant.clone()),
                     ("Роли", roles(&s.roles)),
@@ -883,30 +603,48 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
             out(args, &s, text)
         }
         ApiAction::Whoami => {
-            let w: wire::WhoAmI = client.call(WHOAMI, &[], &[], NO_BODY).await?;
+            let w: WhoAmI = client.call(WHOAMI, &[], &[], NO_BODY).await?;
             out(args, &w, whoami_record(&w))
         }
         ApiAction::Account { action } => {
             let org = org(client, args).await?;
             match action {
                 AccountAction::Create { login, name } => {
-                    let body = wire::NewAccount::from(tp_admin::accounts::NewAccount {
+                    let body = NewAccount {
                         login,
                         display_name: name,
-                    });
-                    let a: wire::Account = client
+                    };
+                    let a: AccountInfo = client
                         .call(ACCOUNT_CREATE, &[org.as_str()], &[], Some(&body))
                         .await?;
                     out(args, &a, account_record(&a))
                 }
-                AccountAction::List { login } => {
+                AccountAction::List {
+                    login: Some(login), ..
+                } => {
                     let found = find_accounts(client, &org, login).await?;
                     let rows: Vec<Vec<String>> = found.iter().map(account_row).collect();
                     out(args, &found, table(ACCOUNT_COLUMNS, &rows))
                 }
+                AccountAction::List {
+                    login: None,
+                    prefix,
+                    limit,
+                } => {
+                    let (found, more) = list_accounts(client, &org, prefix, limit).await?;
+                    let rows: Vec<Vec<String>> = found.iter().map(account_row).collect();
+                    let mut text = table(ACCOUNT_COLUMNS, &rows);
+                    if more {
+                        text.push_str(&format!(
+                            "Показаны первые {}; есть ещё — уточните --prefix или увеличьте --limit.\n",
+                            found.len()
+                        ));
+                    }
+                    out(args, &found, text)
+                }
                 AccountAction::Get { account } => {
                     let id = account_id(client, &org, &account).await?;
-                    let a: wire::Account = client
+                    let a: AccountInfo = client
                         .call(ACCOUNT_GET, &[org.as_str(), id.as_str()], &[], NO_BODY)
                         .await?;
                     out(args, &a, account_record(&a))
@@ -918,11 +656,8 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
             match action {
                 AppPasswordAction::Create { account, label } => {
                     let id = account_id(client, &org, &account).await?;
-                    let body =
-                        wire::NewAppPassword::from(tp_admin::app_passwords::NewAppPassword {
-                            label,
-                        });
-                    let p: wire::IssuedAppPassword = client
+                    let body = NewAppPassword { label };
+                    let p: IssuedAppPassword = client
                         .call(
                             APP_PASSWORD_CREATE,
                             &[org.as_str(), id.as_str()],
@@ -936,14 +671,14 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                             ("Пароль", p.password.clone()),
                             ("Идентификатор", p.info.id.clone()),
                             ("Подпись", or_dash(&p.info.label)),
-                            ("Выпущен", p.info.created_at.clone()),
+                            ("Выпущен", json_field(&p.info, "created_at")),
                         ])
                     );
                     out(args, &p, text)
                 }
                 AppPasswordAction::List { account } => {
                     let id = account_id(client, &org, &account).await?;
-                    let list: Vec<wire::AppPassword> = client
+                    let list: Vec<AppPasswordInfo> = client
                         .call(
                             APP_PASSWORD_LIST,
                             &[org.as_str(), id.as_str()],
@@ -957,8 +692,8 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                             vec![
                                 p.id.clone(),
                                 or_dash(&p.label),
-                                p.created_at.clone(),
-                                optional(p.revoked_at.as_ref()),
+                                json_field(p, "created_at"),
+                                json_field(p, "revoked_at"),
                             ]
                         })
                         .collect();
@@ -1001,12 +736,12 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                         Some(next_hop) => DomainKind::InternalRelay { next_hop },
                         None => DomainKind::Authoritative,
                     };
-                    let body = wire::DomainBody::from(tp_admin::transport::DomainBody {
+                    let body = DomainBody {
                         version,
                         name,
                         kind,
-                    });
-                    let w: wire::DomainWritten = client
+                    };
+                    let w: DomainWritten = client
                         .call(DOMAIN_ADD, &[org.as_str()], &[], Some(&body))
                         .await?;
                     let fields: Vec<(&str, String)> = DOMAIN_COLUMNS
@@ -1019,8 +754,8 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                 }
                 DomainAction::Remove { id } => {
                     let version = domains(client, &org).await?.version;
-                    let query = wire::version_query(tp_admin::transport::VersionQuery { version });
-                    let w: wire::Written = client
+                    let query = query(&VersionQuery { version })?;
+                    let w: Written = client
                         .call(DOMAIN_REMOVE, &[org.as_str(), id.as_str()], &query, NO_BODY)
                         .await?;
                     out(
@@ -1039,7 +774,7 @@ const ACCOUNT_COLUMNS: &[&str] = &["ИДЕНТИФИКАТОР", "ИМЯ ВХО�
 const DOMAIN_COLUMNS: &[&str] = &["ИДЕНТИФИКАТОР", "ДОМЕН", "ВИД"];
 
 /// Текущий администратор — строки «подпись: значение».
-fn whoami_record(w: &wire::WhoAmI) -> String {
+fn whoami_record(w: &WhoAmI) -> String {
     record(&[
         ("Администратор", w.login.clone()),
         ("Организация", w.tenant.clone()),
@@ -1049,7 +784,7 @@ fn whoami_record(w: &wire::WhoAmI) -> String {
 }
 
 /// Учётная запись — строки «подпись: значение».
-fn account_record(a: &wire::Account) -> String {
+fn account_record(a: &AccountInfo) -> String {
     record(&[
         ("Идентификатор", a.id.clone()),
         ("Имя входа", a.login.clone()),
@@ -1063,7 +798,7 @@ fn account_record(a: &wire::Account) -> String {
 }
 
 /// Учётная запись — строка таблицы [`ACCOUNT_COLUMNS`].
-fn account_row(a: &wire::Account) -> Vec<String> {
+fn account_row(a: &AccountInfo) -> Vec<String> {
     vec![
         a.id.clone(),
         a.login.clone(),
@@ -1118,7 +853,7 @@ async fn org(client: &Client, args: &ApiArgs) -> CliResult<String> {
     let org = match explicit {
         Some(o) => o,
         None => {
-            let w: wire::WhoAmI = client.call(WHOAMI, &[], &[], NO_BODY).await?;
+            let w: WhoAmI = client.call(WHOAMI, &[], &[], NO_BODY).await?;
             w.tenant
         }
     };
@@ -1128,14 +863,51 @@ async fn org(client: &Client, args: &ApiArgs) -> CliResult<String> {
 }
 
 /// Учётные записи с именем входа `login`.
-async fn find_accounts(client: &Client, org: &str, login: String) -> CliResult<Vec<wire::Account>> {
-    let query = wire::account_query(tp_admin::accounts::AccountQuery {
+async fn find_accounts(client: &Client, org: &str, login: String) -> CliResult<Vec<AccountInfo>> {
+    let query = query(&AccountQuery {
         login: Some(login),
-        prefix: None,
-        after: None,
-        limit: None,
-    });
+        ..AccountQuery::default()
+    })?;
     client.call(ACCOUNT_FIND, &[org], &query, NO_BODY).await
+}
+
+/// Список учётных записей: страницы Admin API по ссылке `rel="next"`, не больше `limit` записей (`None` — все);
+/// второе значение — остались записи сверх `limit`.
+async fn list_accounts(
+    client: &Client,
+    org: &str,
+    prefix: Option<String>,
+    limit: Option<usize>,
+) -> CliResult<(Vec<AccountInfo>, bool)> {
+    let mut query = query(&AccountQuery {
+        prefix,
+        limit,
+        ..AccountQuery::default()
+    })?;
+    let mut out = Vec::new();
+    loop {
+        let (page, next): (Vec<AccountInfo>, _) = client
+            .call_page(ACCOUNT_FIND, &[org], &query, NO_BODY)
+            .await?;
+        let empty = page.is_empty();
+        out.extend(page);
+        if let Some(limit) = limit.filter(|l| out.len() >= *l) {
+            let more = out.len() > limit || next.is_some();
+            out.truncate(limit);
+            return Ok((out, more));
+        }
+        match next {
+            // Пустая страница со ссылкой дальше — ошибка узла; без проверки — бесконечный цикл.
+            Some(_) if empty => {
+                return Err(format!(
+                    "{} {}: пустая страница со ссылкой rel=\"next\"",
+                    ACCOUNT_FIND.method, ACCOUNT_FIND.path
+                ));
+            }
+            Some(link) => query = client.link_query(&link)?,
+            None => return Ok((out, false)),
+        }
+    }
 }
 
 /// Идентификатор учётной записи: UUID как есть, иначе поиск по имени входа.
@@ -1152,7 +924,7 @@ async fn account_id(client: &Client, org: &str, account: &str) -> CliResult<Stri
 }
 
 /// Принятые домены организации и версия снимка кластера (для записи — из последнего чтения).
-async fn domains(client: &Client, org: &str) -> CliResult<wire::DomainList> {
+async fn domains(client: &Client, org: &str) -> CliResult<DomainList> {
     client.call(DOMAIN_LIST, &[org], &[], NO_BODY).await
 }
 
@@ -1221,8 +993,6 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::Value;
-    use sqlx::types::time::OffsetDateTime;
-    use tp_admin::accounts::PolicyBody;
     use tp_admin::{AdminConfig, AdminRole, Deps, InitRequest, RoleBinding};
     use tp_contracts::auth::Principal;
     use tp_contracts::ext::DecisionHooks;
@@ -1319,11 +1089,25 @@ mod tests {
             ],
             &["thepost", "admin", "domain", "list"],
             &["thepost", "admin", "account", "list", "--login", "a@b.test"],
+            &["thepost", "admin", "account", "list"],
+            &[
+                "thepost", "admin", "account", "list", "--prefix", "a", "--limit", "10",
+            ],
             &["thepost", "admin", "init", "--email", "a@b.test"],
         ] {
             Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
-        assert!(Cli::try_parse_from(["thepost", "admin", "account", "list"]).is_err());
+        for args in [
+            &[
+                "thepost", "admin", "account", "list", "--login", "a@b.test", "--prefix", "a",
+            ][..],
+            &[
+                "thepost", "admin", "account", "list", "--login", "a@b.test", "--limit", "1",
+            ],
+            &["thepost", "admin", "account", "list", "--limit", "0"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
@@ -1384,7 +1168,7 @@ mod tests {
             "нет записей
 "
         );
-        let w = wire::WhoAmI {
+        let w = WhoAmI {
             tenant: TenantId::DEFAULT.to_string(),
             account: AccountId::new().to_string(),
             login: "a".into(),
@@ -1397,154 +1181,69 @@ mod tests {
         );
     }
 
-    /// Тело запроса отражения читает структура запроса tp-admin (`deny_unknown_fields`) — тот же запрос.
-    fn request<W: Serialize, R: DeserializeOwned + std::fmt::Debug>(wire: W, original: String) {
-        let json = serde_json::to_value(&wire).expect("wire");
-        let parsed: R =
-            serde_json::from_value(json.clone()).unwrap_or_else(|e| panic!("{json}: {e}"));
-        assert_eq!(format!("{parsed:?}"), original, "{json}");
-    }
-
-    /// Ответ, сериализованный tp-admin, отражение читает и сериализует обратно без изменений.
-    fn response<S: Serialize, M: Serialize + DeserializeOwned>(server: S) {
-        let json = serde_json::to_value(&server).expect("server");
-        let mirror: M =
-            serde_json::from_value(json.clone()).unwrap_or_else(|e| panic!("{json}: {e}"));
-        assert_eq!(serde_json::to_value(&mirror).expect("mirror"), json);
-    }
-
-    /// Отражения [`wire`] совпадают со структурами tp-admin по JSON (поля при сборке — `From` и `Mirror`).
+    /// Параметры запроса — из структур запроса tp-admin; `null` пропускается.
     #[test]
-    fn wire_matches_tp_admin() {
-        use tp_admin::{accounts, app_passwords, init, server, transport};
-
-        for name in [Some("Анна"), None] {
-            let r = || accounts::NewAccount {
-                login: "a@b.test".into(),
-                display_name: name.map(str::to_owned),
-            };
-            request::<_, accounts::NewAccount>(wire::NewAccount::from(r()), format!("{:?}", r()));
-        }
-        let r = || app_passwords::NewAppPassword {
-            label: "Телефон".into(),
+    fn query_from_tp_admin_structs() {
+        let sorted = |mut v: Vec<(String, String)>| {
+            v.sort();
+            v
         };
-        request::<_, app_passwords::NewAppPassword>(
-            wire::NewAppPassword::from(r()),
-            format!("{:?}", r()),
-        );
-        for kind in [
-            DomainKind::Authoritative,
-            DomainKind::InternalRelay {
-                next_hop: "mx.old.test:25".into(),
-            },
-        ] {
-            let r = || transport::DomainBody {
-                version: 7,
-                name: "b.test".into(),
-                kind: kind.clone(),
-            };
-            request::<_, transport::DomainBody>(wire::DomainBody::from(r()), format!("{:?}", r()));
-        }
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
         assert_eq!(
-            wire::account_query(accounts::AccountQuery {
+            query(&AccountQuery {
                 login: Some("a@b.test".into()),
-                prefix: None,
-                after: None,
-                limit: None,
+                ..AccountQuery::default()
             }),
-            vec![("login", "a@b.test".to_owned())]
+            Ok(vec![pair("login", "a@b.test")])
         );
         assert_eq!(
-            wire::account_query(accounts::AccountQuery {
+            query(&AccountQuery {
                 login: None,
                 prefix: Some("a".into()),
                 after: Some("a@b.test".into()),
                 limit: Some(10),
-            }),
-            vec![
-                ("prefix", "a".to_owned()),
-                ("after", "a@b.test".to_owned()),
-                ("limit", "10".to_owned())
-            ]
+            })
+            .map(sorted),
+            Ok(vec![
+                pair("after", "a@b.test"),
+                pair("limit", "10"),
+                pair("prefix", "a")
+            ])
         );
         assert_eq!(
-            wire::version_query(transport::VersionQuery { version: 3 }),
-            vec![("version", "3".to_owned())]
+            query(&VersionQuery { version: 3 }),
+            Ok(vec![pair("version", "3")])
         );
+    }
 
-        let now = OffsetDateTime::now_utc();
-        let roles = vec![AdminRole::InstallationAdmin];
-        response::<_, wire::Session>(init::AdminSession {
-            session: "tps_x".into(),
-            expires_at: now,
-            tenant: TenantId::DEFAULT.to_string(),
-            account: AccountId::new().to_string(),
-            login: "admin@b.test".into(),
-            roles: roles.clone(),
-        });
-        response::<_, wire::WhoAmI>(server::WhoAmI {
-            tenant: TenantId::DEFAULT.to_string(),
-            account: AccountId::new().to_string(),
-            login: "admin@b.test".into(),
-            roles,
-        });
-        let account = || accounts::AccountInfo {
-            id: AccountId::new().to_string(),
-            domain: "b.test".into(),
-            login: "a@b.test".into(),
-            display_name: "Анна".into(),
-            external_id: Some("cn=a".into()),
-            enabled: true,
-            quota: accounts::QuotaInfo {
-                used_bytes: 10,
-                messages: 1,
-                limit_bytes: Some(100),
-            },
-            policies: accounts::Policies {
-                policy: PolicyBody {
-                    quota_bytes: Some(100),
-                    ..PolicyBody::default()
-                },
-                effective: PolicyBody::default(),
-            },
+    /// Ссылка `rel="next"` (RFC 8288): среди нескольких ссылок, `rel` с несколькими значениями, без кавычек.
+    #[test]
+    fn next_link_header() {
+        let headers = |values: &[&str]| {
+            let mut h = HeaderMap::new();
+            for v in values {
+                h.append(LINK, v.parse().expect("header"));
+            }
+            h
         };
-        response::<_, wire::Account>(account());
-        response::<_, Vec<wire::Account>>(vec![account(), account()]);
-        let info = |revoked_at| app_passwords::AppPasswordInfo {
-            id: "p1".into(),
-            label: "Телефон".into(),
-            created_at: now,
-            revoked_at,
-        };
-        response::<_, Vec<wire::AppPassword>>(vec![info(None), info(Some(now))]);
-        response::<_, wire::IssuedAppPassword>(app_passwords::IssuedAppPassword {
-            info: info(None),
-            password: "secret".into(),
-        });
-        let domain = || AcceptedDomain {
-            id: DomainId::new(),
-            tenant: TenantId::DEFAULT,
-            name: "b.test".into(),
-            kind: DomainKind::InternalRelay {
-                next_hop: "mx.old.test".into(),
-            },
-        };
-        response::<_, wire::DomainList>(transport::DomainList {
-            version: 2,
-            domains: vec![domain()],
-        });
-        response::<_, wire::DomainWritten>(transport::DomainWritten {
-            version: 3,
-            domain: domain(),
-        });
-        response::<_, wire::Written>(transport::Written { version: 4 });
-        for detail in [None, Some("плохое имя".to_owned())] {
-            response::<_, wire::Problem>(server::Problem {
-                status: 400,
-                title: "Bad Request".into(),
-                detail,
-            });
-        }
+        let next = "/api/v1/orgs/x/accounts?limit=2&after=b@b.test";
+        assert_eq!(
+            next_link(&headers(&[format!("<{next}>; rel=\"next\"").as_str()])),
+            Some(next.to_owned())
+        );
+        assert_eq!(
+            next_link(&headers(&[
+                "</first>; rel=\"first\"",
+                format!("<{next}>; title=\"x\"; rel=\"last next\"").as_str()
+            ])),
+            Some(next.to_owned())
+        );
+        assert_eq!(
+            next_link(&headers(&["</a>; rel=prev, </b>; rel=next"])),
+            Some("/b".to_owned())
+        );
+        assert_eq!(next_link(&headers(&["</a>; rel=\"prev\""])), None);
+        assert_eq!(next_link(&HeaderMap::new()), None);
     }
 
     /// Политики уровней: в тестах не задаются.
@@ -1585,7 +1284,7 @@ mod tests {
     }
 
     /// Admin API tp-admin на хранилищах testkit на loopback: локальный вход подключён, `oidc` — токен OIDC
-    /// администратора инсталляции.
+    /// администратора инсталляции; страница списков — 2 записи (переход по `Link` в каждом списке длиннее).
     async fn admin_api() -> (Arc<tp_admin::Admin>, Url) {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let index = MemBlobIndex::new(clock.clone());
@@ -1642,6 +1341,8 @@ mod tests {
                 logins: vec![],
                 groups: vec!["mail-root".into()],
             }],
+            page_size: 2,
+            max_page_size: 2,
             ..AdminConfig::default()
         };
         let admin = Arc::new(
@@ -1670,6 +1371,24 @@ mod tests {
             ..ApiArgs::default()
         };
         execute(c, &args, action).await
+    }
+
+    /// Имена входа `account list --json` без `--login`.
+    async fn list_logins(c: &Client, prefix: Option<&str>, limit: Option<usize>) -> Vec<String> {
+        let action = AccountAction::List {
+            login: None,
+            prefix: prefix.map(str::to_owned),
+            limit,
+        };
+        let json = exec(c, true, ApiAction::Account { action })
+            .await
+            .expect("account list");
+        let v: Value = serde_json::from_str(&json).expect("json");
+        v.as_array()
+            .expect("array")
+            .iter()
+            .map(|a| a["login"].as_str().expect("login").to_owned())
+            .collect()
     }
 
     /// Сценарий пилота без curl: admin init → login → домены, учётная запись, пароль приложения, whoami;
@@ -1766,13 +1485,75 @@ mod tests {
             false,
             ApiAction::Account {
                 action: AccountAction::List {
-                    login: "A@second.test".into(),
+                    login: Some("A@second.test".into()),
+                    prefix: None,
+                    limit: None,
                 },
             },
         )
         .await
         .expect("account list");
         assert_eq!(listed.lines().count(), 2, "{listed}");
+
+        // Список без --login: страницы по 2 записи по ссылке Link, префикс, предел.
+        for login in ["c@second.test", "B@second.test"] {
+            let action = AccountAction::Create {
+                login: login.into(),
+                name: None,
+            };
+            exec(&s, false, ApiAction::Account { action })
+                .await
+                .expect("account create");
+        }
+        assert_eq!(
+            list_logins(&s, None, None).await,
+            [
+                "a@second.test",
+                "admin@example.test",
+                "b@second.test",
+                "c@second.test"
+            ]
+        );
+        assert_eq!(
+            list_logins(&s, Some("A"), None).await,
+            ["a@second.test", "admin@example.test"]
+        );
+        assert_eq!(
+            list_logins(&s, None, Some(3)).await,
+            ["a@second.test", "admin@example.test", "b@second.test"]
+        );
+        let text = exec(
+            &s,
+            false,
+            ApiAction::Account {
+                action: AccountAction::List {
+                    login: None,
+                    prefix: None,
+                    limit: Some(3),
+                },
+            },
+        )
+        .await
+        .expect("limit text");
+        assert_eq!(text.lines().count(), 5, "{text}");
+        assert!(text.contains("есть ещё"), "{text}");
+        let text = exec(
+            &s,
+            false,
+            ApiAction::Account {
+                action: AccountAction::List {
+                    login: None,
+                    prefix: Some("c".into()),
+                    limit: None,
+                },
+            },
+        )
+        .await
+        .expect("prefix text");
+        assert!(
+            text.contains("c@second.test") && !text.contains("есть ещё"),
+            "{text}"
+        );
         let issued = exec(
             &s,
             true,
