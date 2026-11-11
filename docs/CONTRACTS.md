@@ -251,6 +251,16 @@ ACL (код — `acl.rs`, SRS 4.5, RFC 4314): `AclStore` — данные `Autho
 и управляющих, label ≤ 255 символов без управляющих, hash непустой → `Invalid`). `list(scope)` — включая отозванные, по (`created_at`, `id`);
 `insert(scope, AppPassword)` — нет учётной записи — `NotFound`, занятый id — `Conflict`; `revoke(scope, id, at)` — нет — `NotFound`,
 повторный отзыв сохраняет первый момент.
+Локальный токен Admin API (код — `admin_token.rs`, CTR-41, решение #193): первая учётная запись SMB без OIDC — `thepost admin init` на узле
+выпускает одноразовый токен с коротким сроком (`admin.init.token_ttl`); Admin API принимает его в `Authorization: Bearer` наравне с OIDC —
+значение с префиксом `LOCAL_ADMIN_TOKEN_PREFIX` (`"tpa_"`, `is_local_admin_token`). Значение выдаётся один раз, хранится хэш (hex SHA-256 в
+нижнем регистре); значение, хэш и проверку ведёт `tp-admin`. `LocalAdminToken { id, tenant, account, hash, created_at, expires_at, used_at?,
+revoked_at? }` (`Debug` без хэша; `validate()`: id 1–64 байт без пробелов и управляющих, хэш — 64 hex, срок позже выпуска → `Invalid`;
+`state(now) -> LocalTokenState::{Active, Used, Revoked, Expired}`). `LocalAdminTokens` (основная БД): `issue(token)` — занятые id или хэш —
+`Conflict`, `used_at`/`revoked_at` заданы — `Invalid`; `consume(hash, now) -> LocalAdminToken` — атомарное погашение (из параллельных успешен
+один), нет/погашен/отозван/истёк (`now ≥ expires_at`) — `Forbidden`; `revoke(id, at)` — нет — `NotFound`, повтор сохраняет первый момент;
+`list(tenant)` — все состояния по (`created_at`, `id`); `prune(before)` — удаляет с `expires_at < before`, возвращает число.
+In-memory — `MemLocalAdminTokens`; набор `suite::local_admin_tokens`. PostgreSQL — `tp-meta` (карточка meta).
 
 ## Roles
 SRS 2.1. `enum Role { SmtpIn, Submission, SmtpOut, Imap, Jmap, Dav, Admin, Search, Indexer, Maintenance }`; пресеты (`all`, `edge`, `transport`, `access`, `backend`, `mailbox`) раскрываются в набор ролей при загрузке конфигурации; режим edge — параметр smtp-in (SRS 2.6).
@@ -497,3 +507,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   прежнее поведение). `Partition` остался номером раздела шарда (`ShardPartition::index`) — реализации и вызовы собираются без правки.
   In-memory — `MemShardedEventLog`, `MemPartitionAssigner`; наборы `suite::{partition_assigner, shard_event_logs}`. Журналы шардов в `tp-meta`,
   переход подписчиков (`tp-meta::events`, `thepost`) и `LogAppended` с шардом — волны полос.
+- 2026-11-11 — CTR-41 (x/contracts-29, решение #193): `admin_token::{LocalAdminTokens, LocalAdminToken, LocalTokenState,
+  LOCAL_ADMIN_TOKEN_PREFIX, is_local_admin_token}` — локальный одноразовый токен Admin API (выдача, погашение, срок, отзыв, очистка; хранится
+  хэш). In-memory — `MemLocalAdminTokens`; набор `suite::local_admin_tokens`. PostgreSQL (`tp-meta`) и вход в `tp-admin` (ADM-11) — волны полос.

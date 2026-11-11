@@ -5,6 +5,7 @@
 
 pub mod abuse;
 pub mod acl;
+pub mod admin_tokens;
 pub mod app_passwords;
 pub mod blob;
 pub mod corpus;
@@ -24,6 +25,7 @@ pub mod transport;
 
 pub use abuse::MemAbuseBlocks;
 pub use acl::MemAcl;
+pub use admin_tokens::MemLocalAdminTokens;
 pub use app_passwords::MemAppPasswords;
 pub use blob::{BlobOp, MemBlobIndex, MemBlobStore};
 pub use corpus::{LoadModel, SyntheticMail, corpus, pg_schema, pg_url};
