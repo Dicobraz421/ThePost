@@ -413,6 +413,8 @@
 | [CTR-44](CTR-44.md) | AccountStore::list — постраничный список учётных записей | contracts | B | contracts-32 | todo | ADM-12 |
 | [ADM-13](ADM-13.md) | Serialize и Deserialize у структур Admin API | admin | A | admin-08 | todo | ADM-12 |
 | [APP-22](APP-22.md) | CLI thepost admin без копий структур | app | A | app-21 | todo | ADM-13,APP-21 |
+| [PLT-23](PLT-23.md) | текущая цепочка и ключ TLS для подписи | platform | A | platform-13 | todo | PLT-22 |
+| [APP-23](APP-23.md) | подпись профиля .mobileconfig в узле | app | A | app-22 | todo | PLT-23,JMAP-22 |
 | [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | todo | SMTP-20 |
 | [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | todo | CTR-31,SMTP-22 |
 | [META-44](META-44.md) | очередь модерации без группы в PostgreSQL | meta | B | meta-28 | todo | CTR-43 |

@@ -25,6 +25,8 @@ use tp_contracts::search::SearchIndex;
 use tp_contracts::transport::MailFlow;
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Result, TenantId};
 
+use crate::autoconfig::sign::ProfileSigner;
+
 pub mod config;
 pub mod error;
 pub mod http;
@@ -115,6 +117,8 @@ pub struct Jmap {
     pub(crate) uploaded: crate::blob::Uploads,
     /// Правила потока почты (модуль, `Registry::mail_flow`); `None` — правила не применяются.
     pub(crate) mail_flow: Option<Arc<dyn MailFlow>>,
+    /// Ключ подписи профиля `.mobileconfig`; `None` — профиль без подписи.
+    pub(crate) profile_signer: Option<Arc<dyn ProfileSigner>>,
     stop: watch::Sender<bool>,
 }
 
@@ -124,6 +128,7 @@ impl fmt::Debug for Jmap {
             .field("d", &self.d)
             .field("cfg", &self.cfg)
             .field("mail_flow", &self.mail_flow.is_some())
+            .field("profile_signer", &self.profile_signer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -222,6 +227,7 @@ impl Jmap {
             uploads: Mutex::new(HashMap::new()),
             uploaded: crate::blob::Uploads::default(),
             mail_flow: None,
+            profile_signer: None,
             stop: watch::channel(false).0,
         })
     }
@@ -232,6 +238,15 @@ impl Jmap {
     #[must_use]
     pub fn with_mail_flow(mut self, flow: Option<Arc<dyn MailFlow>>) -> Self {
         self.mail_flow = flow;
+        self
+    }
+
+    /// Подключает подпись профиля `.mobileconfig` (JMAP-22): CMS SignedData ключом и цепочкой TLS-сертификата
+    /// сервера, ключ — [`ProfileSigner::key`] на каждый запрос профиля. `None` — профиль без подписи
+    /// (предупреждение в журнале при выдаче).
+    #[must_use]
+    pub fn with_profile_signer(mut self, signer: Option<Arc<dyn ProfileSigner>>) -> Self {
+        self.profile_signer = signer;
         self
     }
 

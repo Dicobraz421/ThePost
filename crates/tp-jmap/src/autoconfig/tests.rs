@@ -7,7 +7,7 @@ use crate::JmapConfig;
 use crate::core::config::AutoconfigConfig;
 use crate::testenv::{Env, http10, serve};
 
-fn servers() -> Servers {
+pub(crate) fn servers() -> Servers {
     Servers {
         host: "mail.example.org".into(),
         caldav: "https://mail.example.org/dav/".into(),

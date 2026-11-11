@@ -6,13 +6,16 @@
 //!   Thunderbird: IMAP, SMTP submission, CardDAV и CalDAV; домен — из `?emailaddress=` или из имени `autoconfig.<домен>`,
 //!   без аутентификации (ответ не зависит от наличия учётной записи);
 //! - `/mail/profile.mobileconfig` — профиль iOS и macOS (почта, календари, контакты) для вошедшего пользователя
-//!   (Basic или Bearer, как API); пароль в профиль не входит — устройство спросит его при установке. Профиль без подписи.
+//!   (Basic или Bearer, как API); пароль в профиль не входит — устройство спросит его при установке. Профиль подписан
+//!   CMS SignedData ключом и цепочкой TLS-сертификата сервера ([`sign`], JMAP-22); ключа нет — без подписи
+//!   и предупреждение в журнале.
 //!
 //! `/.well-known/jmap` — объект сессии (`crate::core::http`). Серверы и порты — секция `jmap.autoconfig`
 //! ([`AutoconfigConfig`](crate::core::config::AutoconfigConfig)).
 
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -131,7 +134,9 @@ pub(crate) async fn mobileconfig(State(j): State<Arc<Jmap>>, headers: HeaderMap)
         .rsplit_once('@')
         .and_then(|(_, d)| valid_domain(d))
         .unwrap_or_else(|| servers.host.clone());
-    let body = mobileconfig_plist(&p.login, &name, &domain, &servers);
+    let body = j
+        .sign_profile(mobileconfig_plist(&p.login, &name, &domain, &servers))
+        .await;
     let disposition =
         HeaderValue::from_str(&format!("attachment; filename=\"{domain}.mobileconfig\""))
             .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
@@ -148,6 +153,28 @@ pub(crate) async fn mobileconfig(State(j): State<Arc<Jmap>>, headers: HeaderMap)
         body,
     )
         .into_response()
+}
+
+impl Jmap {
+    /// Подпись профиля ключом TLS ([`sign::sign`]); ключа нет или подпись не удалась — профиль без подписи
+    /// и предупреждение в журнале.
+    pub(crate) async fn sign_profile(&self, plist: String) -> Vec<u8> {
+        let Some(signer) = &self.profile_signer else {
+            tracing::warn!("профиль .mobileconfig без подписи: ключ TLS не подключён");
+            return plist.into_bytes();
+        };
+        let Some(key) = signer.key().await else {
+            tracing::warn!("профиль .mobileconfig без подписи: нет ключа TLS");
+            return plist.into_bytes();
+        };
+        match sign::sign(plist.as_bytes(), key.as_ref(), SystemTime::now()) {
+            Ok(der) => der,
+            Err(e) => {
+                tracing::warn!(error = %e, "профиль .mobileconfig без подписи: ошибка подписи");
+                plist.into_bytes()
+            }
+        }
+    }
 }
 
 fn redirect(location: &str) -> Response {
@@ -492,5 +519,6 @@ fn join(base: &str, path: &str) -> String {
     }
 }
 
+pub mod sign;
 #[cfg(test)]
 mod tests;
