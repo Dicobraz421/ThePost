@@ -42,6 +42,7 @@ use tp_contracts::ext::{Decision, DecisionHook, DecisionHooks, FinalDelete};
 use tp_contracts::groups::{
     DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
 };
+use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
     AccountScope, MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, PolicyResolver,
@@ -57,6 +58,7 @@ use tp_contracts::retention::{
 use tp_contracts::role::Role;
 use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
 use tp_contracts::secrets::{SecretLease, SecretRef, SecretStore};
+use tp_contracts::submission::{EmailSubmission, SubmissionStore, UndoStatus};
 use tp_contracts::transport::{
     AcceptedDomain, AddressPattern, DestinationPolicy, DomainKind, EnvelopeSide, RewriteRule,
     SourceKind, SourceMatch, TenantTransport, TlsRequirement, TransportStore, TrustedSource,
@@ -1342,6 +1344,214 @@ pub async fn local_admin_tokens(store: &dyn LocalAdminTokens, tenant: TenantId) 
         .map(|t| t.id)
         .collect();
     assert_eq!(ids, [c.id.clone(), d.id.clone()]);
+}
+
+// ---------- IdentityStore, SubmissionStore ----------
+
+/// Набор проверок `IdentityStore` (CTR-30). `owner`, `peer` — учётные записи без адресов отправителя.
+pub async fn identity_store(store: &dyn IdentityStore, owner: AccountScope, peer: AccountScope) {
+    let ident = |id: &str, email: &str| Identity {
+        id: id.into(),
+        name: "Анна".into(),
+        email: email.into(),
+        reply_to: vec![IdentityAddress {
+            name: Some("Продажи".into()),
+            email: "sales@example.org".into(),
+        }],
+        bcc: Vec::new(),
+        text_signature: "--\nАнна".into(),
+        html_signature: "<p>Анна</p>".into(),
+    };
+    assert_eq!(store.state(owner).await.expect("state"), 0);
+    assert!(store.list(owner).await.expect("list").is_empty());
+
+    let s1 = store
+        .put(owner, ident("work", "anna@example.org"))
+        .await
+        .expect("put");
+    let s2 = store
+        .put(owner, ident("home", "anna@example.net"))
+        .await
+        .expect("put");
+    assert!(s1 > 0 && s2 > s1);
+    let bad = Identity {
+        email: "anna".into(),
+        ..ident("bad", "x")
+    };
+    assert!(matches!(
+        store.put(owner, bad).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(store.state(owner).await.expect("state"), s2);
+
+    // Список по id; замена целиком.
+    let ids: Vec<String> = store
+        .list(owner)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(ids, ["home", "work"]);
+    let renamed = Identity {
+        name: "Анна Иванова".into(),
+        reply_to: Vec::new(),
+        ..ident("work", "anna@example.org")
+    };
+    let s3 = store.put(owner, renamed.clone()).await.expect("replace");
+    assert!(s3 > s2);
+    assert_eq!(store.get(owner, "work").await.expect("get"), Some(renamed));
+    assert_eq!(store.get(owner, "none").await.expect("get"), None);
+
+    // Учётные записи не видят адреса друг друга.
+    assert!(store.list(peer).await.expect("peer").is_empty());
+    assert_eq!(store.get(peer, "work").await.expect("peer"), None);
+    assert_eq!(store.delete(peer, "work").await, Err(Error::NotFound));
+    assert_eq!(store.state(peer).await.expect("peer"), 0);
+
+    // Удаление.
+    let s4 = store.delete(owner, "home").await.expect("delete");
+    assert!(s4 > s3);
+    assert_eq!(store.delete(owner, "home").await, Err(Error::NotFound));
+    assert_eq!(store.list(owner).await.expect("list").len(), 1);
+}
+
+/// Набор проверок `SubmissionStore` (CTR-30): запись, отмена до отправки, фиксация, удаление, наступившие отправки.
+/// `owner`, `peer` — учётные записи без отправок.
+pub async fn submission_store(
+    store: &dyn SubmissionStore,
+    owner: AccountScope,
+    peer: AccountScope,
+) {
+    // Целые секунды: PostgreSQL хранит микросекунды.
+    let now = OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp())
+        .expect("now");
+    let sub = |id: &str, send_at: OffsetDateTime, undo: UndoStatus| EmailSubmission {
+        id: id.into(),
+        identity: "work".into(),
+        email: MessageId::new(),
+        mail_from: "anna@example.org".into(),
+        rcpt_to: vec!["b@example.com".into(), "c@example.net".into()],
+        send_at,
+        undo_status: undo,
+        delivery: Vec::new(),
+        queue: None,
+    };
+    let later = now + Duration::from_secs(3600);
+    assert_eq!(store.state(owner).await.expect("state"), 0);
+
+    // Запись: сразу отправленная и две отложенные.
+    let sent = EmailSubmission {
+        delivery: vec![
+            ("b@example.com".into(), SubmitStatus::Queued),
+            ("c@example.net".into(), SubmitStatus::Delivered),
+        ],
+        queue: Some(QueueId::new()),
+        ..sub("now", now, UndoStatus::Final)
+    };
+    let s1 = store.insert(owner, sent.clone()).await.expect("insert");
+    let s2 = store
+        .insert(owner, sub("later", later, UndoStatus::Pending))
+        .await
+        .expect("insert");
+    let s3 = store
+        .insert(owner, sub("soon", now, UndoStatus::Pending))
+        .await
+        .expect("insert");
+    assert!(s1 > 0 && s2 > s1 && s3 > s2);
+    assert_eq!(
+        store
+            .insert(owner, sub("now", now, UndoStatus::Final))
+            .await,
+        Err(Error::Conflict)
+    );
+    assert!(matches!(
+        store
+            .insert(owner, sub("x", now, UndoStatus::Canceled))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let bad = EmailSubmission {
+        rcpt_to: Vec::new(),
+        ..sub("y", now, UndoStatus::Pending)
+    };
+    assert!(matches!(
+        store.insert(owner, bad).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(store.get(owner, "now").await.expect("get"), Some(sent));
+
+    // Список по (send_at, id); другая учётная запись не видит.
+    let ids: Vec<String> = store
+        .list(owner)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, ["now", "soon", "later"]);
+    assert!(store.list(peer).await.expect("peer").is_empty());
+    assert_eq!(store.cancel(peer, "later").await, Err(Error::NotFound));
+
+    // Наступившие: только Pending с send_at ≤ now.
+    let mine = |v: Vec<(AccountScope, EmailSubmission)>| -> Vec<String> {
+        v.into_iter()
+            .filter(|(s, _)| *s == owner)
+            .map(|(_, s)| s.id)
+            .collect()
+    };
+    assert_eq!(mine(store.due(now, 10_000).await.expect("due")), ["soon"]);
+    assert_eq!(
+        mine(store.due(later, 10_000).await.expect("due")),
+        ["soon", "later"]
+    );
+
+    // Отмена: Pending → Canceled, повтор — как есть, Final — Conflict.
+    let canceled = store.cancel(owner, "later").await.expect("cancel");
+    assert_eq!(canceled.undo_status, UndoStatus::Canceled);
+    let state = store.state(owner).await.expect("state");
+    assert!(state > s3);
+    assert_eq!(store.cancel(owner, "later").await, Ok(canceled));
+    assert_eq!(store.cancel(owner, "now").await, Err(Error::Conflict));
+    assert_eq!(store.cancel(owner, "none").await, Err(Error::NotFound));
+    assert_eq!(mine(store.due(later, 10_000).await.expect("due")), ["soon"]);
+
+    // Фиксация: Pending → Final со статусами; отменённую — Conflict.
+    let q = QueueId::new();
+    let delivery = vec![
+        ("b@example.com".to_owned(), SubmitStatus::Queued),
+        (
+            "c@example.net".to_owned(),
+            SubmitStatus::Failed("550 5.1.1".into()),
+        ),
+    ];
+    let s4 = store
+        .finalize(owner, "soon", delivery.clone(), Some(q))
+        .await
+        .expect("finalize");
+    assert!(s4 > state);
+    let soon = store.get(owner, "soon").await.expect("get").expect("soon");
+    assert_eq!(
+        (soon.undo_status, soon.delivery, soon.queue),
+        (UndoStatus::Final, delivery, Some(q))
+    );
+    assert_eq!(store.cancel(owner, "soon").await, Err(Error::Conflict));
+    assert_eq!(
+        store.finalize(owner, "later", Vec::new(), None).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        store.finalize(owner, "none", Vec::new(), None).await,
+        Err(Error::NotFound)
+    );
+    assert!(mine(store.due(later, 10_000).await.expect("due")).is_empty());
+
+    // Удаление.
+    let s5 = store.delete(owner, "later").await.expect("delete");
+    assert!(s5 > s4);
+    assert_eq!(store.delete(owner, "later").await, Err(Error::NotFound));
+    assert_eq!(store.list(owner).await.expect("list").len(), 2);
+    assert_eq!(store.state(peer).await.expect("peer"), 0);
 }
 
 // ---------- BlobIndex: сжатие ----------

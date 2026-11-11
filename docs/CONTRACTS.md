@@ -373,6 +373,22 @@ SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организа
 Маршрут правила потока (`FlowOutcome::route`) не передаётся — политика по домену назначения. In-memory — `MemOutbound`;
 набор `suite::outbound_submit`.
 
+## Identity и EmailSubmission
+CTR-30, RFC 8621 §6–7. Адреса отправителя (код — `identity.rs`): `Identity { id, name, email, reply_to, bcc: Vec<IdentityAddress { name?,
+email }>, text_signature, html_signature }`, `validate()` (id 1–64 байт без пробелов, имена ≤ 255 символов без управляющих, адреса —
+`valid_address`, до 100 в `reply_to`/`bcc`, подписи ≤ 64 КиБ → `Invalid`). `IdentityStore`: `list(scope)` (по id), `get`, `put(scope,
+identity) -> state` (создать или заменить целиком), `delete -> state` (нет — `NotFound`), `state(scope)` — растёт при каждом изменении,
+у новой учётной записи 0. Адрес входа хранилище не держит — его показывает `tp-jmap` (неудаляемый); право отправки от адреса проверяет
+вызывающий (`Authorizer::send_right`).
+Учёт отправок (код — `submission.rs`): `EmailSubmission { id, identity, email: MessageId, mail_from, rcpt_to, send_at, undo_status:
+UndoStatus::{Pending, Final, Canceled}, delivery: Vec<(String, SubmitStatus)>, queue: Option<QueueId> }`, `validate()`.
+`SubmissionStore`: `insert -> state` (занятый id — `Conflict`, `Canceled` — `Invalid`), `get`, `list` (по `send_at`, `id`), `cancel(scope, id)
+-> EmailSubmission` (`Pending` → `Canceled`; повтор — как есть; `Final` — `Conflict`, JMAP `cannotUnsend`), `finalize(scope, id, delivery,
+queue) -> state` (`Final` со статусами; отменённая — `Conflict`, письмо не ставить в очередь; отмена и фиксация атомарны между собой),
+`delete -> state`, `due(now, limit)` — `Pending` с `send_at ≤ now` всех организаций (воркер отложенной отправки), `state(scope)`.
+Нет записи — `NotFound`. In-memory — `MemIdentities`, `MemSubmissions`; наборы `suite::{identity_store, submission_store}`. PostgreSQL — `tp-meta`
+(карточка meta), переход `tp-jmap` — волна полосы.
+
 ## Trash, Retention, Quota (Ф1)
 SRS 4.7, 3.8. Код — `retention.rs`. `TrashStore`: `list(scope, offset, limit) -> Vec<TrashItem { scope, object: TrashObject::Message(id), origin, size,
 received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Message { mailbox, inserted }`,
@@ -514,3 +530,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-11 — CTR-29 (x/contracts-17): `MessageStore::move_to` сохраняет `MessageId` (меняются папка, UID, `ModSeq`), как `to_trash`/`restore`;
   `copy` — по-прежнему новый id. Реализации — `PgMeta`, `MemMetadata`; JMAP `Email/set` (`mailboxIds`) — `updated: null`; `tp-mailstore` уведомляет
   исходные папки по состоянию до переноса.
+- 2026-11-11 — CTR-30 (x/contracts-18): `identity::{IdentityStore, Identity, IdentityAddress, valid_address}`, `submission::{SubmissionStore,
+  EmailSubmission, UndoStatus}` — адреса отправителя и учёт отправок JMAP (статус, отмена до отправки, наступившие отложенные). In-memory —
+  `MemIdentities`, `MemSubmissions`; наборы `suite::{identity_store, submission_store}`. Реализация в `tp-meta` и переход `tp-jmap` — волны полос.
