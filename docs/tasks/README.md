@@ -398,6 +398,12 @@
 | [AUTH-11](AUTH-11.md) | `auth.abuse.fail_closed` | auth | A | auth-06 | ready | AUTH-08 |
 | [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-10 | done | CLU-09 |
 
+## Ф1 · Решение 2026-11-11: шарды, токен администратора, цепочка поставки (`docs/decisions/2026-11-11-contracts-ci-defaults.md`)
+
+| Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
+|---|---|---|---|---|---|---|
+| [DEPS-01](DEPS-01.md) | обновить calamine и libsqlite3-sys, сократить пропуски cargo audit | deps | B | deps-01 | todo | CI-03 |
+
 ## Вне волн
 
 | Задача | Суть | Полоса | Класс | Зависит |
