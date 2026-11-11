@@ -14,6 +14,16 @@
 //! только назначенного ему раздела и отдаёт лизы разделов, снятых с него, после фиксации текущей пачки.
 //! Лиза с номером захвата остаётся гарантией, что раздел обрабатывает один экземпляр, в том числе пока узлы
 //! видят разный состав (переходный период).
+//!
+//! Шарды (CTR-34, решение 2026-11-01-scale-shards-geo-admin, SRS 3.6): журнал событий ядра — на шарде ящика,
+//! у каждого шарда свои разделы `0..N` и свои позиции подписчиков. Раздел инсталляции — [`ShardPartition`]
+//! `{ shard, index }`: `index` = [`partition_of`]`(account, N)`, `shard` — шард учётной записи по справочнику шардов.
+//! Журналы шардов — [`ShardEventLogs`]; назначение пар (шард, раздел) — [`PartitionAssigner::assigned_sharded`].
+//! Один шард ([`ShardId::MAIN`]) — прежнее поведение: те же разделы, ключи назначения и имена лиз.
+
+use std::borrow::Cow;
+use std::fmt;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -21,7 +31,7 @@ use time::OffsetDateTime;
 use tokio::sync::watch;
 
 use crate::error::Result;
-use crate::ids::{AccountId, MailboxId, MessageId, TenantId};
+use crate::ids::{AccountId, MailboxId, MessageId, ShardId, TenantId};
 use crate::membership::NodeId;
 
 /// Вид события ядра.
@@ -82,10 +92,61 @@ pub struct CoreEvent {
     pub at: OffsetDateTime,
 }
 
-/// Номер раздела журнала: `0..N`.
+/// Номер раздела журнала шарда: `0..N` (`index` в [`ShardPartition`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Partition(pub u32);
+
+impl fmt::Display for Partition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// Раздел журнала инсталляции: раздел `index` журнала шарда `shard` (CTR-34).
+/// Порядок — по шарду, затем по разделу; `Display` — `"{shard}/{index}"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ShardPartition {
+    /// Шард, на котором хранится журнал.
+    pub shard: ShardId,
+    /// Раздел журнала шарда.
+    pub index: Partition,
+}
+
+impl ShardPartition {
+    /// Раздел `index` шарда `shard`.
+    pub const fn new(shard: ShardId, index: Partition) -> Self {
+        Self { shard, index }
+    }
+
+    /// Раздел учётной записи `account`, размещённой (по справочнику шардов) на шарде `shard`,
+    /// при `partitions` разделах на шард: `index` = [`partition_of`]`(account, partitions)`.
+    pub fn of(shard: ShardId, account: AccountId, partitions: u32) -> Self {
+        Self::new(shard, partition_of(account, partitions))
+    }
+
+    /// Ключ подписчика этого шарда для назначения разделов и имени лизы — [`shard_subscriber`].
+    pub fn subscriber_key<'a>(&self, subscriber: &'a str) -> Cow<'a, str> {
+        shard_subscriber(subscriber, self.shard)
+    }
+}
+
+impl fmt::Display for ShardPartition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.shard, self.index)
+    }
+}
+
+/// Ключ подписчика `subscriber` на шарде `shard`: для [`ShardId::MAIN`] — само имя (прежние ключи назначения
+/// и лизы `events/{subscriber}/{index}`), для остальных — `"{subscriber}@{shard}"`. Ключ передаётся в
+/// [`PartitionAssigner::assigned`] и в имя лизы раздела: `events/{ключ}/{index}`.
+pub fn shard_subscriber(subscriber: &str, shard: ShardId) -> Cow<'_, str> {
+    if shard == ShardId::MAIN {
+        Cow::Borrowed(subscriber)
+    } else {
+        Cow::Owned(format!("{subscriber}@{shard}"))
+    }
+}
 
 /// Позиция события в разделе: строго возрастает. `EventPos(0)` — до первого события.
 #[derive(
@@ -141,6 +202,49 @@ pub trait EventLog: Send + Sync + 'static {
     async fn commit(&self, subscriber: &str, partition: Partition, pos: EventPos) -> Result<()>;
 }
 
+/// Журналы событий шардов (CTR-34): у каждого шарда справочника — свой [`EventLog`] с одинаковым числом разделов
+/// и своими позициями подписчиков. Реализация — `tp-meta` (пулы шардов по справочнику), in-memory — `tp-testkit`
+/// (`MemShardedEventLog`); один журнал — [`SingleShard`].
+pub trait ShardEventLogs: Send + Sync + 'static {
+    /// Шарды справочника по возрастанию; всегда содержит [`ShardId::MAIN`]. Изменение справочника приходит
+    /// сигналом — после него список перечитывают.
+    fn shards(&self) -> Vec<ShardId>;
+
+    /// Журнал шарда; шард вне справочника — `None`.
+    fn log(&self, shard: ShardId) -> Option<Arc<dyn EventLog>>;
+
+    /// Число разделов журнала шарда (одинаково для всех шардов, постоянно для инсталляции).
+    fn partitions(&self) -> u32 {
+        self.log(ShardId::MAIN).map_or(1, |l| l.partitions())
+    }
+}
+
+/// Инсталляция с одним шардом: журнал [`ShardId::MAIN`] — прежнее поведение.
+#[derive(Clone)]
+pub struct SingleShard(pub Arc<dyn EventLog>);
+
+impl fmt::Debug for SingleShard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SingleShard")
+            .field("partitions", &self.0.partitions())
+            .finish()
+    }
+}
+
+impl ShardEventLogs for SingleShard {
+    fn shards(&self) -> Vec<ShardId> {
+        vec![ShardId::MAIN]
+    }
+
+    fn log(&self, shard: ShardId) -> Option<Arc<dyn EventLog>> {
+        (shard == ShardId::MAIN).then(|| Arc::clone(&self.0))
+    }
+
+    fn partitions(&self) -> u32 {
+        self.0.partitions()
+    }
+}
+
 /// Подписчик журнала событий (индексатор, модули; регистрация — `Registry::add_event_sink`).
 #[async_trait]
 pub trait EventSink: Send + Sync + 'static {
@@ -163,15 +267,39 @@ pub trait PartitionAssigner: Send + Sync + 'static {
 
     /// Текущий состав (по возрастанию); новое значение — повод пересчитать [`PartitionAssigner::assigned`].
     fn members(&self) -> watch::Receiver<Vec<NodeId>>;
+
+    /// Пары (шард, раздел) подписчика, назначенные узлу (CTR-34), по возрастанию; повторы в `shards` не важны.
+    /// Раздел шарда назначается по ключу [`shard_subscriber`]: каждый раздел каждого шарда — ровно одному узлу
+    /// состава, для [`ShardId::MAIN`] — как [`PartitionAssigner::assigned`]. Смена справочника шардов
+    /// не переносит разделы прежних шардов.
+    fn assigned_sharded(
+        &self,
+        subscriber: &str,
+        node: &NodeId,
+        shards: &[ShardId],
+        partitions: u32,
+    ) -> Vec<ShardPartition> {
+        let mut shards = shards.to_vec();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
+            .into_iter()
+            .flat_map(|shard| {
+                self.assigned(&shard_subscriber(subscriber, shard), node, partitions)
+                    .into_iter()
+                    .map(move |index| ShardPartition::new(shard, index))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn object_safe() {
+        fn _logs(_: Arc<dyn ShardEventLogs>) {}
         fn _log(_: Arc<dyn EventLog>) {}
         fn _sink(_: Arc<dyn EventSink>) {}
         fn _assigner(_: Arc<dyn PartitionAssigner>) {}
@@ -238,6 +366,57 @@ mod tests {
         assert!(a.assigned("indexer", &n1, 4).is_empty());
         assert_eq!(a.assigned("indexer", &n2, 4).len(), 4);
         check_cover(&a, 4);
+    }
+
+    #[test]
+    fn sharded_assignment_covers_every_shard() {
+        let members = nodes(&["n1", "n2", "n3"]);
+        let a = Modulo(watch::Sender::new(members.clone()));
+        let shards = [ShardId(2), ShardId::MAIN, ShardId(1), ShardId(2)];
+        let mut all: Vec<ShardPartition> = members
+            .iter()
+            .flat_map(|n| {
+                let mine = a.assigned_sharded("indexer", n, &shards, 5);
+                assert!(mine.windows(2).all(|w| w[0] < w[1]), "по возрастанию");
+                mine
+            })
+            .collect();
+        all.sort();
+        let expected: Vec<ShardPartition> = (0..3)
+            .flat_map(|s| (0..5).map(move |p| ShardPartition::new(ShardId(s), Partition(p))))
+            .collect();
+        assert_eq!(all, expected);
+        // Один шард — прежнее назначение.
+        for n in &members {
+            let main: Vec<Partition> = a
+                .assigned_sharded("indexer", n, &[ShardId::MAIN], 5)
+                .into_iter()
+                .map(|p| p.index)
+                .collect();
+            assert_eq!(main, a.assigned("indexer", n, 5));
+        }
+        let outsider = NodeId::new("n9").expect("n9");
+        assert!(
+            a.assigned_sharded("indexer", &outsider, &shards, 5)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shard_keys() {
+        assert_eq!(shard_subscriber("indexer", ShardId::MAIN), "indexer");
+        assert_eq!(shard_subscriber("indexer", ShardId(3)), "indexer@3");
+        let a = AccountId::from_uuid(uuid::Uuid::from_u128(0x0123_4567_89ab_cdef));
+        let p = ShardPartition::of(ShardId(3), a, 1024);
+        assert_eq!(p.index, Partition(PINNED));
+        assert_eq!(p.to_string(), format!("3/{PINNED}"));
+        assert_eq!(p.subscriber_key("indexer"), "indexer@3");
+        assert!(
+            ShardPartition::new(ShardId(0), Partition(9))
+                < ShardPartition::new(ShardId(1), Partition(0))
+        );
+        let json = serde_json::to_string(&p).expect("json");
+        assert_eq!(json, format!("{{\"shard\":3,\"index\":{PINNED}}}"));
     }
 
     #[test]

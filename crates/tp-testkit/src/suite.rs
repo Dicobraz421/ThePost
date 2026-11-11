@@ -36,7 +36,7 @@ use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
 use tp_contracts::delivery::{
     DeliveryDecision, DeliveryEvent, DeliveryEventKind, DeliveryLog, DeliveryPage, DeliveryQuery,
 };
-use tp_contracts::events::Partition;
+use tp_contracts::events::{Partition, PartitionAssigner, ShardEventLogs, ShardPartition};
 use tp_contracts::ext::{Decision, DecisionHook, DecisionHooks, FinalDelete};
 use tp_contracts::groups::{
     DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
@@ -62,7 +62,7 @@ use tp_contracts::transport::{
 };
 use tp_contracts::{
     AccountId, BlobHash, BlobKey, DomainId, Error, Gen, GroupId, HeldId, MailboxId, MessageId,
-    QueueId, TenantId,
+    QueueId, ShardId, TenantId,
 };
 
 use crate::ManualClock;
@@ -90,6 +90,80 @@ pub struct RealTime;
 impl Wait for RealTime {
     async fn wait(&self, d: Duration) {
         tokio::time::sleep(d).await;
+    }
+}
+
+// ---------- Разделы журнала по шардам ----------
+
+/// Набор проверок `PartitionAssigner` при текущем составе (CTR-34): каждый раздел `0..partitions` каждого шарда
+/// `shards` (и [`ShardId::MAIN`]) назначен ровно одному узлу состава, списки — по возрастанию, один шард —
+/// прежнее назначение `assigned`, узел вне состава — пусто.
+pub fn partition_assigner(a: &dyn PartitionAssigner, shards: &[ShardId], partitions: u32) {
+    let members = a.members().borrow().clone();
+    assert!(!members.is_empty(), "состав не пуст");
+    let mut wanted: Vec<ShardId> = shards.iter().copied().chain([ShardId::MAIN]).collect();
+    wanted.sort();
+    wanted.dedup();
+    for subscriber in ["indexer", "mod_x"] {
+        let mut all = Vec::new();
+        for node in &members {
+            let mine = a.assigned_sharded(subscriber, node, &wanted, partitions);
+            assert!(mine.windows(2).all(|w| w[0] < w[1]), "по возрастанию");
+            let main: Vec<Partition> = a
+                .assigned_sharded(subscriber, node, &[ShardId::MAIN], partitions)
+                .into_iter()
+                .map(|p| p.index)
+                .collect();
+            assert_eq!(
+                main,
+                a.assigned(subscriber, node, partitions),
+                "один шард — прежнее назначение"
+            );
+            all.extend(mine);
+        }
+        all.sort();
+        let expected: Vec<ShardPartition> = wanted
+            .iter()
+            .flat_map(|s| (0..partitions).map(|p| ShardPartition::new(*s, Partition(p))))
+            .collect();
+        assert_eq!(
+            all, expected,
+            "каждый раздел каждого шарда — ровно одному узлу"
+        );
+        let outsider = NodeId::new("suite-outsider-node").expect("node");
+        if !members.contains(&outsider) {
+            assert!(
+                a.assigned_sharded(subscriber, &outsider, &wanted, partitions)
+                    .is_empty()
+            );
+        }
+    }
+}
+
+/// Набор проверок `ShardEventLogs` (CTR-34): шарды по возрастанию с [`ShardId::MAIN`], журнал есть у каждого шарда
+/// справочника и только у них, число разделов одинаково; позиции нового подписчика — с начала.
+pub async fn shard_event_logs(logs: &dyn ShardEventLogs) {
+    let shards = logs.shards();
+    assert!(shards.contains(&ShardId::MAIN));
+    assert!(shards.windows(2).all(|w| w[0] < w[1]), "по возрастанию");
+    let partitions = logs.partitions();
+    assert!(partitions >= 1);
+    let subscriber = format!("suite-{}", AccountId::new());
+    for shard in &shards {
+        let log = logs.log(*shard).expect("журнал шарда справочника");
+        assert_eq!(log.partitions(), partitions);
+        for p in 0..partitions {
+            assert_eq!(
+                log.position(&subscriber, Partition(p))
+                    .await
+                    .expect("position"),
+                tp_contracts::events::EventPos(0)
+            );
+        }
+    }
+    let unknown = ShardId(shards.last().map_or(0, |s| s.0).saturating_add(1));
+    if !shards.contains(&unknown) {
+        assert!(logs.log(unknown).is_none());
     }
 }
 

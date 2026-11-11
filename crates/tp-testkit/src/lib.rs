@@ -33,7 +33,10 @@ pub use fakes::{
     MemQuota, MemTrash, RecordingDecisionHook, SearchDoc, principal,
 };
 pub use groups::MemGroups;
-pub use infra::{Clock, ManualClock, MemEventBus, MemEventLog, MemLease, SystemClock};
+pub use infra::{
+    Clock, ManualClock, MemEventBus, MemEventLog, MemLease, MemPartitionAssigner,
+    MemShardedEventLog, SystemClock,
+};
 pub use load::MemLoadMonitor;
 pub use membership::MemMembership;
 pub use meta::MemMetadata;

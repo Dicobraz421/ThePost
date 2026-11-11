@@ -7,6 +7,7 @@
 ## Ids
 - `TenantId`, `DomainId`, `AccountId`, `MailboxId`, `MessageId`, `QueueId`, `GroupId`, `HeldId` — newtype над `Uuid` (v7), `Copy`, `Serialize`; `TenantId::DEFAULT` = `00000000-0000-0000-0000-000000000001` — организация по умолчанию.
 - `Uid(u32)` — IMAP UID в ящике, монотонный; `UidValidity(u32)`.
+- `ShardId(i32)` — шард метаданных (кластер PostgreSQL, SRS 3.6); `ShardId::MAIN` = 0 — основная БД с каталогом (CTR-34); `tp_meta::shards::ShardId` переходит на него (волна meta).
 - `ModSeq(u64)` — монотонный на ящик (IMAP CONDSTORE, состояние JMAP).
 - `BlobHash([u8; 32])` — SHA-256, `Display` — hex. `Gen(u32)` — поколение объекта.
 - `BlobKey { tenant, hash, generation }` → путь объекта `"{tenant}/{hash[0..2]}/{hash}/{gen}"`; `BlobKey::parse_path`.
@@ -132,6 +133,15 @@ SRS 2.5. Журнал событий ядра (outbox): событие пише�
 watch::Receiver<Vec<NodeId>>` (новое значение — пересчитать). Для одного состава каждый раздел назначен ровно одному узлу; узел вне
 состава — пусто, единственный узел — все. Узел берёт лизу только назначенного ему раздела и отдаёт лизы снятых разделов после
 фиксации текущей пачки; лиза с `fencing` остаётся гарантией единственности, пока узлы видят разный состав.
+Шарды (CTR-34, решение 2026-11-01-scale-shards-geo-admin): журнал — на шарде ящика, у каждого шарда свои разделы `0..N` и позиции
+подписчиков. Раздел инсталляции — `ShardPartition { shard: ShardId, index: Partition }` (`ShardPartition::of(shard, account, N)`:
+`index` = `partition_of`, шард — по справочнику шардов; порядок — шард, затем раздел; `Display` — `"{shard}/{index}"`). Журналы шардов —
+`ShardEventLogs`: `shards()` (по возрастанию, всегда с `ShardId::MAIN`), `log(shard) -> Option<Arc<dyn EventLog>>`, `partitions()`
+(одинаково для всех шардов); один журнал — `SingleShard`. Назначение пар — `PartitionAssigner::assigned_sharded(subscriber, &NodeId,
+shards, N) -> Vec<ShardPartition>` (метод по умолчанию): раздел шарда назначается по ключу `shard_subscriber(subscriber, shard)` — для
+шарда 0 само имя, иначе `"{subscriber}@{shard}"`; лиза раздела — `events/{ключ}/{index}`. Каждый раздел каждого шарда — ровно одному
+узлу состава; один шард — прежние назначение и имена лиз. In-memory — `MemShardedEventLog` (`place` — справочник), `MemPartitionAssigner`;
+наборы `suite::partition_assigner`, `suite::shard_event_logs`. Сигнал `LogAppended { partition }` пока без шарда.
 
 ## Membership
 Решение 2026-10-30, #45. `Membership`: `heartbeat(&NodeId, ttl)` — создать или продлить запись узла (период ≈ `ttl / 3`),
@@ -482,3 +492,8 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-10 — CTR-28: `queue::Outbound` (`enqueue`, `submit`), `Submitted`, `SubmitStatus` — одно объявление вместо
   `tp_smtp::deliver::Outbound` и `tp_jmap::Outbound`; `tp_smtp::{RcptStatus, Submitted}` (поле `id`) и `tp_jmap::{RcptStatus, Submitted}`
   удалены. `FlowOutcome::route` в контракт не вошёл (очередь его не хранит). In-memory — `MemOutbound`; набор `suite::outbound_submit`.
+- 2026-11-11 — CTR-34 (x/contracts-22, решение 2026-11-01-scale-shards-geo-admin): журнал событий по шардам — `ShardId`,
+  `events::{ShardPartition, ShardEventLogs, SingleShard, shard_subscriber}`, `PartitionAssigner::assigned_sharded` (по умолчанию; один шард —
+  прежнее поведение). `Partition` остался номером раздела шарда (`ShardPartition::index`) — реализации и вызовы собираются без правки.
+  In-memory — `MemShardedEventLog`, `MemPartitionAssigner`; наборы `suite::{partition_assigner, shard_event_logs}`. Журналы шардов в `tp-meta`,
+  переход подписчиков (`tp-meta::events`, `thepost`) и `LogAppended` с шардом — волны полос.
