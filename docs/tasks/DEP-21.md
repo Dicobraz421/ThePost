@@ -1,7 +1,7 @@
-# DEP-17: стенд — CalDAV, CardDAV, ManageSieve
+# DEP-21: стенд — CalDAV, CardDAV, ManageSieve
 
 lane: deploy
-deps: [APP-25]
+deps: [APP-29]
 class: A
 files: [deploy/*]
 read: [docs/spec/S4.md#4.4, docs/spec/APP-D.md]

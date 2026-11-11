@@ -1,7 +1,7 @@
 # CMP-10: приёмка Ф2 — календари, контакты, правила, консоль
 
 lane: deploy
-deps: [APP-28, UI-09, DEP-17]
+deps: [APP-28, UI-09, DEP-21]
 class: A
 files: [deploy/*]
 read: [docs/spec/APP-G.md, docs/spec/S4.md#4.8, docs/spec/S5.md#5.2]

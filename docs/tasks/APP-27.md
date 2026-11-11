@@ -1,7 +1,7 @@
 # APP-27: ManageSieve и JMAP календари, контакты, Sieve в узле
 
 lane: app
-deps: [SIEVE-09, JMAP-29, APP-25, APP-26]
+deps: [SIEVE-09, JMAP-29, APP-29, APP-26]
 class: A
 files: [crates/thepost/src/*]
 read: [docs/spec/S4.md#4.3, docs/spec/S4.md#4.4]

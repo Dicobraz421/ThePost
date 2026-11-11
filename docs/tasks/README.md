@@ -466,15 +466,15 @@
 | [JMAP-25](JMAP-25.md) | JMAP Contacts — AddressBook (RFC 9610) | jmap | A | jmap-16 | todo | CTR-45,JMAP-02 |
 | [JMAP-26](JMAP-26.md) | JMAP Contacts — ContactCard | jmap | A | jmap-16 | todo | JMAP-25,DAV-03 |
 | [ADM-14](ADM-14.md) | Admin API — правила Sieve и автоответ | admin | A | admin-09 | todo | CTR-46,SIEVE-02 |
-| [APP-25](APP-25.md) | календари и контакты в узле — роль dav | app | A | app-24 | todo | DAV-08,DAV-11,DAV-12,META-48 |
+| [APP-29](APP-29.md) | календари и контакты в узле — роль dav | app | A | app-28 | todo | DAV-08,DAV-11,DAV-12,META-48 |
 | [APP-26](APP-26.md) | правила Sieve и автоответ в узле — доставка, Admin API, JMAP VacationResponse | app | A | app-25 | todo | SIEVE-07,SMTP-32,META-50,ADM-14,JMAP-23 |
-| [DEP-17](DEP-17.md) | стенд — CalDAV, CardDAV, ManageSieve | deploy | A | deploy-15 | todo | APP-25 |
+| [DEP-21](DEP-21.md) | стенд — CalDAV, CardDAV, ManageSieve | deploy | A | deploy-17 | todo | APP-29 |
 | [SIEVE-08](SIEVE-08.md) | ManageSieve — протокол и вход | sieve | A | sieve-03 | todo | SIEVE-02 |
 | [SIEVE-09](SIEVE-09.md) | ManageSieve — команды скриптов | sieve | A | sieve-03 | todo | SIEVE-08 |
 | [JMAP-27](JMAP-27.md) | JMAP Calendars — Calendar | jmap | A | jmap-17 | todo | CTR-45,DAV-03,JMAP-25 |
 | [JMAP-28](JMAP-28.md) | JMAP Calendars — CalendarEvent | jmap | A | jmap-17 | todo | JMAP-27 |
 | [JMAP-29](JMAP-29.md) | JMAP Calendars — CalendarEvent/query и развёртывание повторов | jmap | A | jmap-17 | todo | JMAP-28 |
-| [APP-27](APP-27.md) | ManageSieve и JMAP календари, контакты, Sieve в узле | app | A | app-26 | todo | SIEVE-09,JMAP-29,APP-25,APP-26 |
+| [APP-27](APP-27.md) | ManageSieve и JMAP календари, контакты, Sieve в узле | app | A | app-26 | todo | SIEVE-09,JMAP-29,APP-29,APP-26 |
 | [CI-06](CI-06.md) | полоса console и сборка веб-консоли в CI | ci | B | ci-05 | ready | — |
 | [DEPS-05](DEPS-05.md) | rust-embed — веб-консоль внутри бинарного файла | deps | B | deps-05 | todo | CI-06 |
 | [UI-01](UI-01.md) | каркас веб-консоли на Refine | console | A | console-01 | todo | CI-06 |
@@ -497,7 +497,7 @@
 | [JMAP-30](JMAP-30.md) | JMAP — Principal и занятость | jmap | A | jmap-18 | todo | JMAP-29,CTR-47 |
 | [JMAP-31](JMAP-31.md) | JMAP — приглашения на встречи | jmap | A | jmap-18 | todo | JMAP-30,DAV-13 |
 | [APP-28](APP-28.md) | планирование встреч в узле | app | A | app-27 | todo | DAV-16,SMTP-33,META-51,JMAP-31,APP-27 |
-| [CMP-10](CMP-10.md) | приёмка Ф2 — календари, контакты, правила, консоль | deploy | A | deploy-16 | todo | APP-28,UI-09,DEP-17 |
+| [CMP-10](CMP-10.md) | приёмка Ф2 — календари, контакты, правила, консоль | deploy | A | deploy-18 | todo | APP-28,UI-09,DEP-21 |
 | [CTR-48](CTR-48.md) | общий доступ к календарям и контактам, представители, ресурсы | contracts | B | contracts-35 | todo | CTR-45,CTR-47 |
 | [META-52](META-52.md) | права на коллекции, представители, правила ресурсов | meta | B | meta-33 | todo | CTR-48 |
 | [AUTH-12](AUTH-12.md) | Authorizer — права на календари и адресные книги | auth | A | auth-07 | todo | CTR-48,AUTH-07 |

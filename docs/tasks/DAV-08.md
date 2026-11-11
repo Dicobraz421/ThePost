@@ -11,7 +11,7 @@ manual: docs/manual-tests/DAV-08.md
 ## Сделать
 - Предусловия `PUT` (RFC 4791 §5.3.2): `valid-calendar-data` (разбор calcard), `valid-calendar-object-resource` (один UID, без `METHOD`),
   `supported-calendar-component`, `no-uid-conflict` (с `href` существующего), `max-resource-size`, `min/max-date-time`.
-- Ручная проверка календарей на стенде (после APP-25): Thunderbird, Календарь iOS и macOS, DAVx5 (Android), Evolution — создание,
+- Ручная проверка календарей на стенде (после APP-29): Thunderbird, Календарь iOS и macOS, DAVx5 (Android), Evolution — создание,
   правка, повтор, удаление, офлайн-правка и синхронизация, два устройства одновременно.
 
 ## Приёмка

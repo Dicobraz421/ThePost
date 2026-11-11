@@ -1,4 +1,4 @@
-# APP-25: календари и контакты в узле — роль dav
+# APP-29: календари и контакты в узле — роль dav
 
 lane: app
 deps: [DAV-08, DAV-11, DAV-12, META-48]
@@ -6,7 +6,7 @@ class: A
 files: [crates/thepost/src/*]
 read: [docs/spec/S4.md#4.4, docs/spec/S4.md#4.8]
 checks: [nextest]
-manual: docs/manual-tests/APP-25.md
+manual: docs/manual-tests/APP-29.md
 
 ## Сделать
 - Роль `dav`: маршруты `tp_dav::router` на HTTP-слушателе — `http.dav` или, если не задан, на `http.jmap` (один порт 443 с JMAP);
