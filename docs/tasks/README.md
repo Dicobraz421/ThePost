@@ -221,7 +221,7 @@
 | [ADM-07](ADM-07.md) | группы рассылки: модерация и настройки | admin | A | admin-02 | done | ADM-01,META-21 |
 | [IMAP-13](IMAP-13.md) | фаззинг разборщика IMAP | imap | A | imap-04 | done | IMAP-01 |
 | [JMAP-09](JMAP-09.md) | фаззинг разборщика JMAP | jmap | A | jmap-03 | done | JMAP-01 |
-| [DEP-08](DEP-08.md) | минимальные привилегии в эталонной поставке | deploy | A | deploy-05 | ready | DEP-02,DEP-07,META-23,PLT-16 |
+| [DEP-08](DEP-08.md) | минимальные привилегии в эталонной поставке | deploy | A | deploy-05 | done | DEP-02,DEP-07,META-23,PLT-16 |
 
 ## Ф1 · Решение 2026-11-01: взаимодействие компонентов и требования к СУБД
 
@@ -240,7 +240,7 @@
 | [BLOB-14](BLOB-14.md) | GC по ближайшему сроку отсрочки | blob | A | blob-07 | done | BLOB-13 |
 | [AUTH-08](AUTH-08.md) | блокировки перебора на всех узлах | auth | A | auth-04 | done | META-27 |
 | [CI-05](CI-05.md) | CI без Valkey, проверка отсутствия интерпретаторов | ci | B | ci-04 | todo | CLU-09 |
-| [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-06 | todo | CLU-09 |
+| [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-06 | done | CLU-09 |
 
 ## Ф1 · Решение 2026-11-01: состав функций транспорта и внешний MTA
 
@@ -252,7 +252,7 @@
 | [SMTP-21](SMTP-21.md) | принятые домены и внутренняя ретрансляция | smtp | A | smtp-06 | ready | CTR-24,SMTP-03,SMTP-09 |
 | [SMTP-22](SMTP-22.md) | точки вызова правил потока почты | smtp | A | smtp-06 | ready | CTR-24,SMTP-05,SMTP-16,SMTP-17 |
 | [SMTP-23](SMTP-23.md) | SRS и ARC-подпись при пересылке | smtp | A | smtp-06 | ready | SMTP-08,SMTP-13 |
-| [ADM-08](ADM-08.md) | Admin API настроек транспорта | admin | A | admin-03 | ready | ADM-01,CTR-24 |
+| [ADM-08](ADM-08.md) | Admin API настроек транспорта | admin | A | admin-03 | done | ADM-01,CTR-24 |
 | [JMAP-10](JMAP-10.md) | правила потока в EmailSubmission | jmap | A | jmap-04 | done | JMAP-07,CTR-24 |
 | [APP-09](APP-09.md) | сборка настроек транспорта и точки правил потока | app | A | app-05 | todo | META-28,SMTP-22,JMAP-10,ADM-08 |
 
@@ -266,7 +266,7 @@
 | [META-32](META-32.md) | чтение с реплик для фоновых задач | meta | A | meta-14 | todo | META-30 |
 | [BLOB-15](BLOB-15.md) | сборка мусора по учёту ссылок всех шардов | blob | A | blob-08 | todo | META-31,BLOB-14 |
 | [APP-11](APP-11.md) | CLI thepost admin | app | A | app-07 | ready | ADM-01 |
-| [DEP-10](DEP-10.md) | HPA, VPA и эталон «малый Enterprise» | deploy | A | deploy-07 | todo | DEP-09 |
+| [DEP-10](DEP-10.md) | HPA, VPA и эталон «малый Enterprise» | deploy | A | deploy-07 | ready | DEP-09 |
 
 ## Ф1 · Решение 2026-11-04: соответствие функциям Exchange
 
@@ -314,9 +314,9 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-28](CTR-28.md) | Outbound в контрактах | contracts | B | contracts-16 | ready | SMTP-06 |
+| [CTR-28](CTR-28.md) | Outbound в контрактах | contracts | B | contracts-16 | done | SMTP-06 |
 | [CTR-29](CTR-29.md) | move_to сохраняет MessageId | contracts | B | contracts-17 | ready | CTR-05 |
-| [CTR-30](CTR-30.md) | хранилище Identity и EmailSubmission | contracts | B | contracts-18 | todo | CTR-28 |
+| [CTR-30](CTR-30.md) | хранилище Identity и EmailSubmission | contracts | B | contracts-18 | ready | CTR-28 |
 | [JMAP-12](JMAP-12.md) | владелец загруженного blob | jmap | A | jmap-06 | done | JMAP-06 |
 
 ## Ф1 · Отчёты admin-02 (#174) и blob-06 (#175)
@@ -361,7 +361,7 @@
 | [CTR-38](CTR-38.md) | контракты GC, владельца загрузки и восстановления скрытых писем | contracts | B | contracts-26 | done | CTR-23 |
 | [SMTP-28](SMTP-28.md) | `Delivery::submit` без очереди — ошибка только для внешних получателей | smtp | A | smtp-09 | done | CMP-04 |
 | [META-36](META-36.md) | `EventBus` для `PgSignalBus`; сигнал `TrashChanged` из PostgreSQL | meta | A | meta-19 | done | META-26,CTR-37 |
-| [MS-18](MS-18.md) | таймер корзины по сигналу `TrashChanged` | mailstore | A | mailstore-11 | ready | MS-14,CTR-37 |
+| [MS-18](MS-18.md) | таймер корзины по сигналу `TrashChanged` | mailstore | A | mailstore-11 | done | MS-14,CTR-37 |
 | [APP-15](APP-15.md) | сведения об узле в `heartbeat` | app | A | app-14 | done | META-27 |
 | [CTR-39](CTR-39.md) | сигнал при снятии блокировки; пометка Membership | contracts | B | contracts-27 | done | CTR-23 |
 | [SYS-10](SYS-10.md) | дескрипторы сокетов systemd в `TcpListener` | sys | A | sys-05 | done | SYS-01 |
@@ -369,34 +369,34 @@
 | [CTR-40](CTR-40.md) | адресация организации в данных; перенос получателей без попытки | contracts | B | contracts-28 | done | CTR-24 |
 | [PLT-20](PLT-20.md) | процессный `CryptoProvider` rustls для ACME | platform | A | platform-10 | done | PLT-11 |
 | [META-38](META-38.md) | `PgMeta` поверх `Failover` — повтор операций при переключении | meta | A | meta-21 | done | META-25 |
-| [META-39](META-39.md) | переписывание адресов, `postpone` и `Unblocked` в PostgreSQL | meta | A | meta-23 | ready | CTR-40,CTR-39 |
+| [META-39](META-39.md) | переписывание адресов, `postpone` и `Unblocked` в PostgreSQL | meta | A | meta-23 | done | CTR-40,CTR-39 |
 | [META-40](META-40.md) | повтор записей по ключу при переключении СУБД | meta | A | meta-24 | done | META-38 |
-| [SMTP-29](SMTP-29.md) | переписывание адресов из данных организации; `postpone` в планировщике | smtp | A | smtp-10 | ready | CTR-40,SMTP-13,SMTP-14 |
-| [CLU-12](CLU-12.md) | транспорт Rpc узел → узел (HTTPS/2, mTLS) | cluster | A | cluster-07 | ready | CLU-11 |
+| [SMTP-29](SMTP-29.md) | переписывание адресов из данных организации; `postpone` в планировщике | smtp | A | smtp-10 | done | CTR-40,SMTP-13,SMTP-14 |
+| [CLU-12](CLU-12.md) | транспорт Rpc узел → узел (HTTPS/2, mTLS) | cluster | A | cluster-07 | done | CLU-11 |
 | [CLU-13](CLU-13.md) | `LocalBus` — `Resync` при отставании подписчика | cluster | A | cluster-08 | done | CLU-09 |
 | [DEP-11](DEP-11.md) | убрать Valkey из стенда разработки | deploy | A | deploy-09 | done | CLU-09 |
-| [IMAP-17](IMAP-17.md) | IDLE — полная сверка по `Resync` | imap | A | imap-08 | ready | CLU-13 |
-| [JMAP-21](JMAP-21.md) | push — изменение всех типов по `Resync` | jmap | A | jmap-12 | ready | CLU-13 |
+| [IMAP-17](IMAP-17.md) | IDLE — полная сверка по `Resync` | imap | A | imap-08 | done | CLU-13 |
+| [JMAP-21](JMAP-21.md) | push — изменение всех типов по `Resync` | jmap | A | jmap-12 | done | CLU-13 |
 | [SYS-11](SYS-11.md) | проба Landlock без `/sys/kernel/security` | sys | A | sys-06 | done | SYS-07 |
 | [PLT-21](PLT-21.md) | doctor — проба Landlock; подпись метрики отставания шины | platform | A | platform-11 | ready | SYS-11,CLU-13 |
 | [APP-17](APP-17.md) | подключение журнала доставки, групп, обучения антиспама и защиты от перебора | app | A | app-16 | ready | SMTP-16,SMTP-17,SMTP-18,AUTH-08,APP-16 |
 | [APP-18](APP-18.md) | подключение транспорта организации и Rpc узла | app | A | app-17 | todo | SMTP-29,CLU-12,APP-15 |
 | [META-41](META-41.md) | слушатель сигналов и миграции при списке адресов СУБД | meta | A | meta-25 | ready | META-38 |
-| [CLU-14](CLU-14.md) | Rpc — идентичность узла по SAN, HTTP/2 | cluster | A | cluster-09 | todo | CLU-12 |
+| [CLU-14](CLU-14.md) | Rpc — идентичность узла по SAN, HTTP/2 | cluster | A | cluster-09 | ready | CLU-12 |
 | [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-20 | done | CTR-23,META-16 |
 
 ## Ф1 · Ответы владельца 2026-11-10 (#193, #195, #205, #253, #272)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-41](CTR-41.md) | локальный токен первого администратора | contracts | B | contracts-29 | todo | CTR-23 |
+| [CTR-41](CTR-41.md) | локальный токен первого администратора | contracts | B | contracts-29 | ready | CTR-23 |
 | [ADM-11](ADM-11.md) | `thepost admin init` — первый администратор | admin | A | admin-06 | todo | CTR-41 |
 | [APP-19](APP-19.md) | команда `thepost admin init` и локальный сокет | app | A | app-18 | todo | ADM-11 |
 | [CTR-42](CTR-42.md) | хранилище отправок JMAP (отложенная отправка и отмена) | contracts | B | contracts-30 | todo | CTR-28 |
 | [META-42](META-42.md) | системные папки — только по роли, суффикс при совпадении имени | meta | A | meta-26 | todo | CMP-05 |
 | [KIT-08](KIT-08.md) | фейк ящика — системные папки только по роли | testkit | A | testkit-05 | ready | KIT-07 |
 | [AUTH-11](AUTH-11.md) | `auth.abuse.fail_closed` | auth | A | auth-06 | ready | AUTH-08 |
-| [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-10 | todo | CLU-09 |
+| [DEP-09](DEP-09.md) | стенды без Valkey, эталоны HA СУБД | deploy | A | deploy-10 | done | CLU-09 |
 
 ## Вне волн
 

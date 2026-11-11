@@ -12,7 +12,7 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 91/143 | 156/222 | в работе, 70 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 102/143 | 167/222 | в работе, 75 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
 | Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 0/0 | 0/0 | карточки — после Ф1 | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/0 | 0/0 | карточки — после Ф1 | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
@@ -136,7 +136,7 @@
 | ✅ admin-02 | ADM-05, ADM-06, ADM-07 | A | admin-01, meta-08 | 3 |
 | ✅ imap-04 | IMAP-13 | A | imap-03 | 2 |
 | ✅ jmap-03 | JMAP-09 | A | jmap-02 | 3 |
-| deploy-05 | DEP-08 | A | deploy-02, meta-08, platform-06 | 4 |
+| ✅ deploy-05 | DEP-08 | A | deploy-02, meta-08, platform-06 | 4 |
 
 ### Решение 2026-11-01: взаимодействие компонентов и требования к СУБД
 
@@ -152,7 +152,7 @@
 | ✅ blob-07 | BLOB-14 | A | blob-06 | 4 |
 | ✅ auth-04 | AUTH-08 | A | auth-03, meta-10 | 1 |
 | ci-04 | CI-05 | B | ci-03, cluster-06 | 4 |
-| deploy-06 | DEP-09 | A | deploy-05, cluster-06 | 4 |
+| ✅ deploy-06 | DEP-09 | A | deploy-05, cluster-06 | 4 |
 
 ### Решение 2026-11-01: состав функций транспорта и внешний MTA
 
@@ -161,7 +161,7 @@
 | ✅ contracts-13 (ветка `x/contracts-13`) | CTR-24 | B | contracts-12 | 1 |
 | ✅ meta-11 | META-28 | A | meta-10, contracts-13 | 3 |
 | smtp-06 | SMTP-20, SMTP-21, SMTP-22, SMTP-23 | A | smtp-05, contracts-13 | 4 |
-| admin-03 | ADM-08 | A | admin-02, contracts-13 | 3 |
+| ✅ admin-03 | ADM-08 | A | admin-02, contracts-13 | 3 |
 | ✅ jmap-04 | JMAP-10 | A | jmap-03, contracts-13 | 3 |
 | app-05 | APP-09 | A | meta-11, smtp-06, admin-03, jmap-04 | 2 |
 
@@ -213,7 +213,7 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-16 (ветка `x/contracts-16`) | CTR-28 | B | smtp-02, jmap-02 | 1 |
+| ✅ contracts-16 (ветка `x/contracts-16`) | CTR-28 | B | smtp-02, jmap-02 | 1 |
 | contracts-17 (ветка `x/contracts-17`) | CTR-29 | B | jmap-02 | 1 |
 | contracts-18 (ветка `x/contracts-18`) | CTR-30 | B | contracts-16 | 1 |
 | ✅ jmap-06 | JMAP-12 | A | jmap-02 | 3 |
@@ -259,7 +259,7 @@
 | ✅ contracts-26 (ветка `x/contracts-26`) | CTR-38 | B | contracts-25 | 1 |
 | ✅ smtp-09 | SMTP-28 | A | smtp-08 | 4 |
 | ✅ meta-19 | META-36 | A | meta-10, contracts-25 (и PR #231) | 3 |
-| mailstore-11 | MS-18 | A | mailstore-08, contracts-25 | 1 |
+| ✅ mailstore-11 | MS-18 | A | mailstore-08, contracts-25 | 1 |
 | ✅ app-14 | APP-15 | A | meta-10, app-13 | 2 |
 | ✅ contracts-27 (ветка `x/contracts-27`) | CTR-39 | B | contracts-26 | 1 |
 | ✅ sys-05 | SYS-10 | A | sys-04 | 2 |
@@ -267,14 +267,14 @@
 | ✅ contracts-28 (ветка `x/contracts-28`) | CTR-40 | B | contracts-27 | 1 |
 | ✅ platform-10 | PLT-20 | A | platform-09 | 2 |
 | ✅ meta-21 | META-38 | A | meta-09 | 3 |
-| meta-23 | META-39 | A | contracts-28, contracts-27 | 3 |
+| ✅ meta-23 | META-39 | A | contracts-28, contracts-27 | 3 |
 | ✅ meta-24 | META-40 | A | meta-21 | 3 |
-| smtp-10 | SMTP-29 | A | contracts-28, smtp-04 | 4 |
-| cluster-07 | CLU-12 | A | cluster-06 (и PR `x/cluster-dep`) | 4 |
+| ✅ smtp-10 | SMTP-29 | A | contracts-28, smtp-04 | 4 |
+| ✅ cluster-07 | CLU-12 | A | cluster-06 (и PR `x/cluster-dep`) | 4 |
 | ✅ cluster-08 | CLU-13 | A | cluster-06 | 4 |
 | ✅ deploy-09 | DEP-11 | A | cluster-06 | 4 |
-| imap-08 | IMAP-17 | A | cluster-08 | 2 |
-| jmap-12 | JMAP-21 | A | cluster-08 | 3 |
+| ✅ imap-08 | IMAP-17 | A | cluster-08 | 2 |
+| ✅ jmap-12 | JMAP-21 | A | cluster-08 | 3 |
 | ✅ sys-06 | SYS-11 | A | sys-05 | 2 |
 | platform-11 | PLT-21 | A | sys-06, cluster-08 | 2 |
 | app-16 | APP-17 | A | smtp-05, auth-04, app-15 | 2 |
@@ -294,7 +294,7 @@
 | meta-26 | META-42 | A | meta-25 | 3 |
 | testkit-05 | KIT-08 | A | testkit-04 | 1 |
 | auth-06 | AUTH-11 | A | auth-04 | 1 |
-| deploy-10 | DEP-09 (`db_durability`, #272) | A | deploy-06 | 4 |
+| ✅ deploy-10 | DEP-09 (`db_durability`, #272) | A | deploy-06 | 4 |
 
 
 Первая учётная запись SMB без провайдера OIDC (CMP-01, п. 5б) — вопрос владельцу, issue #193 (`решение`). Отложенная отправка и отмена (CMP-03) — issue #195.
