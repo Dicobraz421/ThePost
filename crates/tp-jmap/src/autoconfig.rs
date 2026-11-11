@@ -132,10 +132,9 @@ pub(crate) async fn mobileconfig(State(j): State<Arc<Jmap>>, headers: HeaderMap)
         .and_then(|(_, d)| valid_domain(d))
         .unwrap_or_else(|| servers.host.clone());
     let body = mobileconfig_plist(&p.login, &name, &domain, &servers);
-    let disposition = HeaderValue::from_str(&format!(
-        "attachment; filename=\"{domain}.mobileconfig\""
-    ))
-    .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    let disposition =
+        HeaderValue::from_str(&format!("attachment; filename=\"{domain}.mobileconfig\""))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
     (
         StatusCode::OK,
         [

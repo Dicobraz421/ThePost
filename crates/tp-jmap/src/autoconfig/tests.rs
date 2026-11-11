@@ -41,7 +41,12 @@ fn thunderbird_snapshot() {
 /// Снимок профиля `.mobileconfig`; UUID стабильны и различны.
 #[test]
 fn mobileconfig_snapshot() {
-    let plist = mobileconfig_plist("user@example.org", "Иван <Петров>", "example.org", &servers());
+    let plist = mobileconfig_plist(
+        "user@example.org",
+        "Иван <Петров>",
+        "example.org",
+        &servers(),
+    );
     assert!(plist.contains("Иван &lt;Петров&gt;"));
     let again = mobileconfig_plist("User@Example.org", "x", "example.org", &servers());
     let uuids = |p: &str| -> Vec<String> {
@@ -149,9 +154,21 @@ async fn http_endpoints() {
     };
 
     for (method, path, location) in [
-        ("GET", "/.well-known/caldav", "https://mail.example.org/dav/"),
-        ("PROPFIND", "/.well-known/caldav", "https://mail.example.org/dav/"),
-        ("GET", "/.well-known/carddav", "https://mail.example.org/dav/"),
+        (
+            "GET",
+            "/.well-known/caldav",
+            "https://mail.example.org/dav/",
+        ),
+        (
+            "PROPFIND",
+            "/.well-known/caldav",
+            "https://mail.example.org/dav/",
+        ),
+        (
+            "GET",
+            "/.well-known/carddav",
+            "https://mail.example.org/dav/",
+        ),
     ] {
         let (code, head, _) = http10(addr, &req(method, path, "mail.example.org", "")).await;
         assert_eq!(code, 301, "{method} {path}");
