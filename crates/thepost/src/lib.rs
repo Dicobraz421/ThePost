@@ -1,6 +1,7 @@
-//! The Post: сборка ролей узла по config.yaml (SRS 2.1), команды `serve`, `config`, `doctor`, `verify`, `admin init`.
+//! The Post: сборка ролей узла по config.yaml (SRS 2.1), команды `serve`, `config`, `doctor`, `verify`, `admin`.
 
 pub mod acme;
+pub mod admin_client;
 pub mod cli;
 pub mod doctor;
 pub mod doctor_dns;
