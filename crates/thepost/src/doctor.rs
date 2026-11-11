@@ -1,6 +1,7 @@
 //! `thepost doctor [--json]` (SRS 5.5, 3.1; APP-02): проверки окружения узла — конфигурация, хранилище секретов,
-//! СУБД (проверки `tp-meta`: версия, синхронная реплика, часовой пояс, RLS, TLS, роль узла; сторонние расширения —
-//! `database.extensions`, APP-08), BLOB (запись, чтение и удаление пробного объекта), синхронизация часов узла и СУБД,
+//! СУБД (проверки `tp-meta`: версия, синхронная реплика, часовой пояс, RLS, TLS, роль узла; кодировка и LC_CTYPE —
+//! `database.locale`, APP-24; сторонние расширения — `database.extensions`, APP-08), BLOB (запись, чтение и удаление
+//! пробного объекта), синхронизация часов узла и СУБД,
 //! минимальные привилегии процесса (PLT-16): учётная запись, capabilities, no_new_privs, seccomp, Landlock;
 //! DNS почтового домена (MX, SPF, DKIM, DMARC, MTA-STS, PTR), сертификаты и PROXY v2 — `doctor_dns` (APP-06).
 //!
@@ -361,9 +362,61 @@ async fn database(
         }
         Err(e) => report.push("database.checks", Status::Fail, "", message(&e)),
     }
+    locale(&pool, meta.timeout, report).await;
     extensions(&pool, meta.timeout, report).await;
     clock_skew(&pool, meta.timeout, doctor, report).await;
     pool.close().await;
+}
+
+/// Кодировка и `LC_CTYPE` базы узла (решение 2026-11-11 №23): `lower(login)` переводит кириллицу только в UTF8 с
+/// `LC_CTYPE` UTF-8.
+async fn locale(pool: &PgPool, timeout: Duration, report: &mut Report) {
+    let id = "database.locale";
+    let query = sqlx::query_as::<_, (String, String)>(
+        "SELECT pg_encoding_to_char(encoding)::text, datctype::text FROM pg_database \
+         WHERE datname = current_database()",
+    )
+    .fetch_one(pool);
+    let (encoding, ctype) = match tokio::time::timeout(timeout, query).await {
+        Ok(Ok(row)) => row,
+        Ok(Err(e)) => {
+            report.push(
+                id,
+                Status::Fail,
+                "",
+                format!("кодировка базы не получена: {e}"),
+            );
+            return;
+        }
+        Err(_) => {
+            report.push(
+                id,
+                Status::Fail,
+                "",
+                "кодировка базы не получена: нет ответа",
+            );
+            return;
+        }
+    };
+    let (status, msg) = locale_status(&encoding, &ctype);
+    report.push(id, status, format!("{encoding}, {ctype}"), msg);
+}
+
+/// Итог по кодировке (`pg_database.encoding`) и `LC_CTYPE` (`datctype`) базы: нужны UTF8 и `*.UTF-8`/`*.utf8`.
+pub fn locale_status(encoding: &str, ctype: &str) -> (Status, &'static str) {
+    let ctype = ctype.to_ascii_lowercase();
+    if encoding.eq_ignore_ascii_case("UTF8")
+        && (ctype.ends_with(".utf-8") || ctype.ends_with(".utf8"))
+    {
+        (Status::Ok, "кодировка UTF8, LC_CTYPE UTF-8")
+    } else {
+        (
+            Status::Fail,
+            "база не в UTF8 с LC_CTYPE UTF-8 (C.UTF-8 или <язык>.UTF-8): lower() не переводит кириллицу в именах входа \
+             в нижний регистр — ломаются регистронезависимая уникальность и поиск по префиксу; создайте базу \
+             с ENCODING 'UTF8' LC_CTYPE 'C.UTF-8' TEMPLATE template0 — docs/PREREQUISITES.md",
+        )
+    }
 }
 
 /// Расширения PostgreSQL базы узла, кроме встроенного `plpgsql` (по имени, по возрастанию).
@@ -693,10 +746,34 @@ mod tests {
         );
         assert!(report.get("time.clock_skew").is_some(), "{report:?}");
         assert!(report.get("database.extensions").is_some(), "{report:?}");
+        assert_eq!(
+            report.get("database.locale").map(|c| c.status),
+            Some(Status::Ok),
+            "{report:?}"
+        );
         assert!(
             report.get("database.sync_replication").is_some(),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn database_locale_needs_utf8() {
+        for (enc, ctype) in [
+            ("UTF8", "C.UTF-8"),
+            ("UTF8", "en_US.utf8"),
+            ("UTF8", "ru_RU.UTF-8"),
+        ] {
+            assert_eq!(locale_status(enc, ctype).0, Status::Ok, "{enc} {ctype}");
+        }
+        for (enc, ctype) in [
+            ("UTF8", "C"),
+            ("UTF8", "POSIX"),
+            ("SQL_ASCII", "C"),
+            ("LATIN1", "en_US.utf8"),
+        ] {
+            assert_eq!(locale_status(enc, ctype).0, Status::Fail, "{enc} {ctype}");
+        }
     }
 
     #[test]
