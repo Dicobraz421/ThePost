@@ -186,18 +186,39 @@ impl AccountData {
         mailbox
     }
 
-    /// Системные папки, которых недостаёт: нет папки с той же ролью и нет папки верхнего уровня
-    /// с тем же именем (без учёта регистра), как в `tp-meta`.
-    fn missing_system(&self) -> Vec<(&'static str, SpecialUse)> {
-        SYSTEM_FOLDERS
-            .into_iter()
-            .filter(|(name, role)| {
-                !self.mailboxes.values().any(|m| {
-                    m.mailbox.role == Some(*role)
-                        || (m.mailbox.parent.is_none() && m.mailbox.name.eq_ignore_ascii_case(name))
-                })
-            })
-            .collect()
+    /// Системные папки, которых недостаёт, с именами для создания, как в `tp-meta` (решение #205: роль —
+    /// атрибут, по имени не назначается). Недостающей считается роль, которой нет ни у одной папки. Имя —
+    /// системное, а если оно занято папкой верхнего уровня (без учёта регистра ASCII), — с наименьшим
+    /// свободным суффиксом: «Junk 1», «Junk 2»…; папка пользователя не трогается.
+    fn missing_system(&self) -> Vec<(String, SpecialUse)> {
+        let mut taken: Vec<String> = self
+            .mailboxes
+            .values()
+            .filter(|m| m.mailbox.parent.is_none())
+            .map(|m| m.mailbox.name.to_ascii_lowercase())
+            .collect();
+        let mut out = Vec::new();
+        for (base, role) in SYSTEM_FOLDERS {
+            if self
+                .mailboxes
+                .values()
+                .any(|m| m.mailbox.role == Some(role))
+            {
+                continue;
+            }
+            let free = |n: &str| !taken.contains(&n.to_ascii_lowercase());
+            let name = if free(base) {
+                base.to_owned()
+            } else {
+                (1u32..)
+                    .map(|i| format!("{base} {i}"))
+                    .find(|n| free(n))
+                    .unwrap_or_else(|| base.to_owned())
+            };
+            taken.push(name.to_ascii_lowercase());
+            out.push((name, role));
+        }
+        out
     }
 
     /// Дополняет учётную запись недостающими системными папками: один номер изменения, записи
@@ -211,7 +232,7 @@ impl AccountData {
         for (name, role) in &missing {
             let data = NewMailbox {
                 parent: None,
-                name: (*name).to_owned(),
+                name: name.clone(),
                 role: Some(*role),
             };
             let mb = self.create_mailbox(&data, now, ms);
@@ -2041,8 +2062,8 @@ mod tests {
     #[tokio::test]
     async fn system_folders_no_duplicates() {
         let (meta, scope, _) = setup().await;
-        // Остались INBOX и Sent; есть «junk» без роли (то же имя без учёта регистра)
-        // и «Архив» с ролью Archive — ни Junk, ни Archive не создаются.
+        // Остались INBOX и Sent; есть «junk» без роли (то же имя без учёта регистра) — системная
+        // создаётся как «Junk 1»; «Архив» с ролью Archive — Archive не создаётся.
         strip_mailboxes(&meta, scope, |m| {
             matches!(m.role, Some(SpecialUse::Inbox | SpecialUse::Sent))
         });
@@ -2075,9 +2096,49 @@ mod tests {
         .expect("ok");
         let got = roles(&meta, scope).await;
         let names: Vec<_> = got.iter().map(|(_, n)| n.as_str()).collect();
-        assert_eq!(names, ["Drafts", "INBOX", "Sent", "Trash", "junk", "Архив"]);
-        assert!(meta.mailbox_by_role(scope, SpecialUse::Junk).is_err());
+        assert_eq!(
+            names,
+            [
+                "Drafts",
+                "INBOX",
+                "Junk 1",
+                "Sent",
+                "Trash",
+                "junk",
+                "Архив"
+            ]
+        );
+        let junk = meta.mailbox_by_role(scope, SpecialUse::Junk).expect("ok");
+        let junk = MailboxStore::get(&meta, scope, junk)
+            .await
+            .expect("ok")
+            .expect("есть");
+        assert_eq!(junk.name, "Junk 1");
         assert!(meta.mailbox_by_role(scope, SpecialUse::Trash).is_ok());
+    }
+
+    #[tokio::test]
+    async fn system_folders_name_taken_passes_suite() {
+        let (meta, scope, _) = setup().await;
+        // Системной Junk нет; «Junk» и «junk 1» — папки пользователя без роли.
+        strip_mailboxes(&meta, scope, |m| m.role != Some(SpecialUse::Junk));
+        {
+            let now = meta.now_unix();
+            let mut st = lock(&meta.state);
+            let acc = st
+                .accounts
+                .get_mut(&(scope.tenant, scope.account))
+                .expect("запись");
+            for name in ["Junk", "junk 1"] {
+                let data = NewMailbox {
+                    parent: None,
+                    name: name.into(),
+                    role: None,
+                };
+                acc.create_mailbox(&data, now, ModSeq::ZERO);
+            }
+        }
+        crate::suite::system_folders_by_role(&meta, scope).await;
     }
 
     #[tokio::test]
