@@ -547,7 +547,7 @@ impl From<Error> for ApiError {
 }
 
 /// Ошибка (RFC 9457).
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Problem {
     /// Код HTTP.
     pub status: u16,
@@ -599,7 +599,7 @@ fn problem(status: StatusCode, detail: Option<String>) -> Response {
 }
 
 /// Текущий администратор.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct WhoAmI {
     /// Организация.
     pub tenant: String,
@@ -885,5 +885,143 @@ mod tests {
             serde_json::from_value(json!({"listen": "0.0.0.0:9443", "allow_external": true}))
                 .expect("config");
         assert_eq!(cfg.listen.port(), 9443);
+    }
+
+    /// ADM-13: структуры запросов и ответов Admin API пишутся и читаются одной структурой — JSON туда и обратно
+    /// даёт то же значение (клиент `thepost admin` пользуется ими напрямую).
+    #[test]
+    fn wire_structs_roundtrip() {
+        use std::fmt::Debug;
+        use std::time::Duration;
+
+        use serde::de::DeserializeOwned;
+        use time::OffsetDateTime;
+        use tp_contracts::transport::{AcceptedDomain, DomainKind};
+        use tp_contracts::{AccountId, DomainId};
+
+        use crate::accounts::{
+            AccountInfo, AccountQuery, NewAccount, Policies, PolicyBody, QuotaInfo,
+        };
+        use crate::app_passwords::{AppPasswordInfo, IssuedAppPassword, NewAppPassword};
+        use crate::init::AdminSession;
+        use crate::transport::{DomainBody, DomainList, DomainWritten, VersionQuery, Written};
+
+        fn roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(v: T) {
+            let json = serde_json::to_value(&v).expect("serialize");
+            let back: T = serde_json::from_value(json.clone()).expect("deserialize");
+            assert_eq!(back, v, "{json}");
+        }
+
+        let at = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("time");
+        let roles = vec![AdminRole::OrganizationAdmin, AdminRole::Operator];
+        let policies = Policies {
+            policy: PolicyBody {
+                quota_bytes: Some(1 << 30),
+                trash_retention: Some(Duration::from_secs(30 * 86_400)),
+                ..PolicyBody::default()
+            },
+            effective: PolicyBody::default(),
+        };
+        let domain = AcceptedDomain {
+            id: DomainId::new(),
+            tenant: TenantId::new(),
+            name: "example.org".into(),
+            kind: DomainKind::InternalRelay {
+                next_hop: "old.example.org:25".into(),
+            },
+        };
+        let password = AppPasswordInfo {
+            id: "p1".into(),
+            label: "Телефон".into(),
+            created_at: at,
+            revoked_at: Some(at),
+        };
+
+        // Запросы.
+        roundtrip(NewAccount {
+            login: "anna@example.org".into(),
+            display_name: Some("Анна".into()),
+        });
+        roundtrip(NewAccount {
+            login: "anna@example.org".into(),
+            display_name: None,
+        });
+        roundtrip(NewAppPassword {
+            label: "Thunderbird".into(),
+        });
+        roundtrip(DomainBody {
+            version: 7,
+            name: "example.org".into(),
+            kind: DomainKind::Authoritative,
+        });
+        roundtrip(AccountQuery {
+            login: None,
+            prefix: Some("an".into()),
+            after: Some("anna@example.org".into()),
+            limit: Some(50),
+        });
+        roundtrip(AccountQuery::default());
+        roundtrip(VersionQuery { version: 3 });
+
+        // Ответы.
+        roundtrip(AdminSession {
+            session: "tps_x".into(),
+            expires_at: at,
+            tenant: TenantId::DEFAULT.to_string(),
+            account: AccountId::new().to_string(),
+            login: "admin@example.org".into(),
+            roles: roles.clone(),
+        });
+        roundtrip(WhoAmI {
+            tenant: TenantId::DEFAULT.to_string(),
+            account: AccountId::new().to_string(),
+            login: "admin@example.org".into(),
+            roles,
+        });
+        roundtrip(AccountInfo {
+            id: AccountId::new().to_string(),
+            domain: DomainId::new().to_string(),
+            login: "anna@example.org".into(),
+            display_name: "Анна".into(),
+            external_id: Some("ext-1".into()),
+            enabled: true,
+            quota: QuotaInfo {
+                used_bytes: 10,
+                messages: 1,
+                limit_bytes: Some(1 << 30),
+            },
+            policies: policies.clone(),
+        });
+        roundtrip(QuotaInfo {
+            used_bytes: 0,
+            messages: 0,
+            limit_bytes: None,
+        });
+        roundtrip(policies);
+        roundtrip(password.clone());
+        roundtrip(AppPasswordInfo {
+            revoked_at: None,
+            ..password.clone()
+        });
+        roundtrip(IssuedAppPassword {
+            info: password,
+            password: "secret".into(),
+        });
+        roundtrip(DomainList {
+            version: 7,
+            domains: vec![domain.clone()],
+        });
+        roundtrip(DomainWritten { version: 8, domain });
+        roundtrip(Written { version: 9 });
+        roundtrip(Problem {
+            status: 400,
+            title: "Bad Request".into(),
+            detail: Some("плохо".into()),
+        });
+        roundtrip(Problem {
+            status: 404,
+            title: "Not Found".into(),
+            detail: None,
+        });
     }
 }

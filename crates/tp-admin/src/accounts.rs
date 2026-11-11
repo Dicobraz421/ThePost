@@ -145,7 +145,7 @@ impl From<PolicyBody> for Policy {
 }
 
 /// Политика уровня и действующая политика.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Policies {
     /// Заданное на этом уровне.
     pub policy: PolicyBody,
@@ -194,7 +194,7 @@ pub struct NewDomain {
 }
 
 /// Использование квоты.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QuotaInfo {
     /// Занято байт, включая корзину.
     pub used_bytes: u64,
@@ -205,7 +205,7 @@ pub struct QuotaInfo {
 }
 
 /// Учётная запись.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AccountInfo {
     /// Идентификатор.
     pub id: String,
@@ -227,7 +227,7 @@ pub struct AccountInfo {
 }
 
 /// Новая локальная учётная запись (без каталога).
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewAccount {
     /// Имя входа — адрес в принятом домене организации (приводится к нижнему регистру).
@@ -238,7 +238,7 @@ pub struct NewAccount {
 }
 
 /// Поиск по имени входа или страница списка учётных записей.
-#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 pub struct AccountQuery {
     /// Имя входа (без учёта регистра): поиск одной записи; несовместимо с `prefix`, `after`, `limit`.

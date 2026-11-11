@@ -22,7 +22,7 @@ use crate::accounts::account;
 use crate::server::{Admin, ApiResult, Problem};
 
 /// Пароль приложения (без значения).
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AppPasswordInfo {
     /// Идентификатор (для отзыва).
     pub id: String,
@@ -50,7 +50,7 @@ impl From<AppPassword> for AppPasswordInfo {
 }
 
 /// Выпуск пароля.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewAppPassword {
     /// Подпись («Телефон», «Thunderbird дома»), до 255 символов.
@@ -59,7 +59,7 @@ pub struct NewAppPassword {
 }
 
 /// Выпущенный пароль: значение показывается один раз.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct IssuedAppPassword {
     /// Пароль.
     #[serde(flatten)]
