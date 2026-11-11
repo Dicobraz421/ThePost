@@ -15,6 +15,7 @@ pub mod error;
 pub mod events;
 pub mod ext;
 pub mod groups;
+pub mod identity;
 pub mod ids;
 pub mod lease;
 pub mod load;
@@ -28,6 +29,7 @@ pub mod rpc;
 pub mod sasl;
 pub mod search;
 pub mod secrets;
+pub mod submission;
 pub mod tls;
 pub mod transport;
 
