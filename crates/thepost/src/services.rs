@@ -1,6 +1,11 @@
 //! Сервисы ролей узла (APP-04): реализации контрактов поверх `PgMeta`, хранилища писем, BLOB и шины, выбранные
 //! по config.yaml, — вход (каталог, OIDC, пароли приложений, ACL), поиск, очередь и доставка SMTP, JMAP, Admin API.
 //!
+//! Доставка SMTP пишет журнал доставки (`tp_smtp::Tracking`, SMTP-17) и раскрывает группы рассылки с модерацией
+//! (`tp_smtp::Groups`, SMTP-16); обучение антиспама по перемещению писем — подписчик журнала событий роли
+//! maintenance (`tp_smtp::learn::SpamLearner`, SMTP-18). Проверка учётных данных всех протоколов (SMTP AUTH, IMAP,
+//! POP3, JMAP, Admin API) — через защиту от перебора (`tp_auth::AbuseGuard`, AUTH-08): [`Guarded`].
+//!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
 use std::sync::Arc;
@@ -8,13 +13,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use mail_parser::{MessageParser, MimeHeaders};
-use tp_contracts::auth::{Authenticator, Authorizer, Directory};
+use tp_contracts::auth::{Authenticator, Authorizer, Credentials, Directory, Principal};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::bus::EventBus;
+use tp_contracts::events::EventSink;
 use tp_contracts::ext::{DecisionHooks, Registry};
 use tp_contracts::ids::{DomainId, MessageId};
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountScope, MailboxStore, MessageQuery, MessageStore, Policy};
+use tp_contracts::membership::NodeId;
+use tp_contracts::meta::{
+    AccountScope, AccountStore, MailboxStore, MessageQuery, MessageStore, Policy,
+};
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
@@ -27,7 +36,8 @@ use tp_search::{
 };
 use tp_smtp::queue::{QueueDeps, system_now};
 use tp_smtp::{
-    AuthCheck, Delivery, Milters, Queue, QueueWorker, SendLimits, SmtpConfig, SmtpMetrics,
+    AuthCheck, Delivery, Groups, Milters, Queue, QueueWorker, SendLimits, SmtpConfig, SmtpMetrics,
+    Tracking,
 };
 
 use crate::infra;
@@ -80,6 +90,13 @@ pub struct Services {
     pub send_limits: Arc<SendLimits>,
     /// Ограничитель частоты узла.
     pub limiter: Arc<RateLimiter>,
+    /// Журнал доставки (SMTP-17): события писем от имени узла.
+    pub tracking: Tracking,
+    /// Защита от перебора (AUTH-08): счётчики неудач узла, блокировки — на всех узлах; сигналы блокировок —
+    /// `AbuseGuard::listen` (запускает `serve`).
+    pub abuse: tp_auth::AbuseGuard,
+    /// Хранилище секретов узла (модуля, если подключён): пароль Rspamd controller.
+    pub secrets: Arc<dyn SecretStore>,
 }
 
 impl std::fmt::Debug for Services {
@@ -108,6 +125,8 @@ pub struct Base<'a> {
     pub ext: &'a Registry,
     /// Реестр метрик.
     pub metrics: &'a Metrics,
+    /// Имя узла (журнал доставки).
+    pub node: NodeId,
 }
 
 impl Services {
@@ -121,6 +140,7 @@ impl Services {
             secrets,
             ext,
             metrics,
+            node,
         } = b;
         let tenant = TenantId::DEFAULT;
         let profile = cfg.profile();
@@ -186,7 +206,14 @@ impl Services {
                 gssapi.clone(),
             )));
         }
-        let authn: Arc<dyn Authenticator> = Arc::new(router);
+        // Защита от перебора (решение владельца #253: хранилище блокировок недоступно — вход проверяется).
+        let abuse = tp_auth::AbuseGuard::new(auth.abuse.clone(), Arc::new(meta.clone()));
+        let authn: Arc<dyn Authenticator> = Arc::new(Guarded {
+            inner: Arc::new(router),
+            guard: abuse.clone(),
+            accounts: Arc::new(meta.clone()),
+            tenant,
+        });
         // TODO(AUTH-05): механизм GSSAPI (`AuthSasl::with_gssapi(Gssapi::system(..))`) — после включения feature
         // `gssapi` в сборке (нужна libkrb5 в CI и образе).
         let sasl: Arc<dyn SaslServer> = Arc::new(tp_auth::AuthSasl::new(authn.clone()));
@@ -267,10 +294,14 @@ impl Services {
             smtp_metrics,
             send_limits: Arc::new(SendLimits::new()),
             limiter,
+            tracking: Tracking::new(Arc::new(meta.clone()), node),
+            abuse,
+            secrets,
         })
     }
 
-    /// Доставка и обработчик транзакций SMTP (smtp-in, submission): проверки SPF/DKIM/DMARC/ARC, Milter, очередь.
+    /// Доставка и обработчик транзакций SMTP (smtp-in, submission): проверки SPF/DKIM/DMARC/ARC, Milter, очередь,
+    /// группы рассылки с модерацией и журнал доставки.
     pub fn delivery(&self, smtp: &SmtpConfig) -> Result<Arc<Delivery>> {
         let resolver = system_resolver()?;
         let milter = (!smtp.milter.filters.is_empty())
@@ -287,7 +318,16 @@ impl Services {
             authcheck: Some(Arc::new(AuthCheck::new(resolver, smtp))),
             milter,
         };
-        Ok(Arc::new(Delivery::new(deps, smtp)))
+        let groups = Groups::new(
+            Arc::new(self.meta.clone()),
+            self.blob.clone(),
+            Arc::new(self.meta.clone()),
+        );
+        Ok(Arc::new(
+            Delivery::new(deps, smtp)
+                .with_groups(groups)
+                .with_tracking(self.tracking.clone()),
+        ))
     }
 
     /// Зависимости ролей smtp-in и submission.
@@ -324,6 +364,7 @@ impl Services {
         )
         .with_dsn(self.queue.clone())
         .with_metrics(self.smtp_metrics.clone())
+        .with_tracking(self.tracking.clone())
         .with_routes(
             Arc::new(tp_smtp::routes::Routes::new(Arc::new(self.meta.clone()))),
             Some(self.bus.clone()),
@@ -413,6 +454,22 @@ impl Services {
         tp_admin::Admin::new(deps, cfg).map_err(|e| infra::context("admin", e))
     }
 
+    /// Обучение антиспама (подписчик журнала событий `smtp-learn` роли maintenance): письмо, перенесённое в «Спам»
+    /// или из него, — в Rspamd controller; пароль — из хранилища секретов узла. `smtp.learn.enabled: false` — `None`.
+    pub fn spam_learner(&self, smtp: &SmtpConfig) -> Result<Option<Arc<dyn EventSink>>> {
+        if !smtp.learn.enabled {
+            return Ok(None);
+        }
+        let controller = tp_smtp::learn::RspamdController::new(&smtp.learn)?;
+        Ok(Some(Arc::new(tp_smtp::learn::SpamLearner::new(
+            smtp.learn.clone(),
+            self.store.clone(),
+            Arc::new(self.meta.clone()),
+            Some(self.secrets.clone()),
+            Arc::new(controller),
+        ))))
+    }
+
     /// Индексатор журнала событий (подписчик `indexer`).
     pub fn indexer(&self, cfg: &SearchConfig) -> Indexer {
         Indexer::new(
@@ -447,6 +504,71 @@ fn queue_deps(meta: &PgMeta, blob: &Arc<dyn BlobStore>) -> QueueDeps {
 pub fn system_resolver() -> Result<mail_auth::MessageAuthenticator> {
     mail_auth::MessageAuthenticator::new_system_conf()
         .map_err(|e| Error::Internal(format!("резолвер DNS: {e}")))
+}
+
+/// Проверка учётных данных под защитой от перебора: `AbuseGuard::check` до проверки, `failure` после отказа
+/// (`Forbidden`), `success` после входа. Попытка — учётная запись по имени входа (пароль); адреса клиента контракт
+/// `Authenticator` не передаёт — счётчики адреса и подсети ждут его в протоколах. Заблокированная попытка —
+/// `Forbidden` (протокол отвечает как на неверный пароль, учётные данные не проверяются).
+///
+/// Хранилище блокировок недоступно — вход проверяется без него (решение владельца #253: `auth.abuse.fail_closed`,
+/// по умолчанию `false`; ключ появится с AUTH-11).
+struct Guarded {
+    inner: Arc<dyn Authenticator>,
+    guard: tp_auth::AbuseGuard,
+    accounts: Arc<dyn AccountStore>,
+    tenant: TenantId,
+}
+
+impl Guarded {
+    /// Попытка входа по предъявленным данным: для пароля — учётная запись по имени входа (нет или ошибка
+    /// каталога — без учётной записи); токен и Kerberos — субъект известен только после проверки.
+    async fn attempt(&self, credentials: &Credentials) -> tp_auth::Attempt {
+        let account = match credentials {
+            Credentials::Password { login, .. } => {
+                match self.accounts.by_login(self.tenant, login).await {
+                    Ok(a) => a.map(|a| a.id),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "защита от перебора: учётная запись не найдена");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        tp_auth::Attempt { ip: None, account }
+    }
+}
+
+#[async_trait]
+impl Authenticator for Guarded {
+    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
+        let attempt = self.attempt(&credentials).await;
+        match self.guard.check(self.tenant, &attempt).await {
+            Ok(Some(_)) => return Err(Error::Forbidden),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "защита от перебора: хранилище блокировок недоступно, вход проверяется");
+            }
+        }
+        match self.inner.verify(credentials).await {
+            Ok(p) => {
+                let ok = tp_auth::Attempt {
+                    ip: attempt.ip,
+                    account: Some(p.account),
+                };
+                self.guard.success(p.tenant, &ok).await;
+                Ok(p)
+            }
+            Err(Error::Forbidden) => {
+                if let Err(e) = self.guard.failure(self.tenant, &attempt).await {
+                    tracing::warn!(error = %e, "защита от перебора: блокировка не записана");
+                }
+                Err(Error::Forbidden)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Политики уровней Admin API поверх `PgMeta` (до контракта CTR-25).
@@ -663,5 +785,80 @@ fn parse(raw: &[u8]) -> Parsed {
         body: body.join("\n"),
         headers,
         attachments,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    use tp_testkit::{FakeAuthenticator, MemAbuseBlocks, MemMetadata, SystemClock};
+
+    const LOGIN: &str = "alice@example.org";
+
+    fn password(secret: &str) -> Credentials {
+        Credentials::Password {
+            login: LOGIN.into(),
+            secret: secret.into(),
+        }
+    }
+
+    async fn guarded(blocks: MemAbuseBlocks, account_failures: u32) -> Guarded {
+        let meta = MemMetadata::new(Arc::new(SystemClock));
+        let scope = meta.account(LOGIN).await.expect("account");
+        let fake = FakeAuthenticator::default();
+        fake.add_password(
+            LOGIN,
+            "right",
+            Principal {
+                tenant: scope.tenant,
+                account: scope.account,
+                login: LOGIN.into(),
+                groups: BTreeSet::new(),
+                scopes: None,
+            },
+        );
+        let cfg = tp_auth::AbuseConfig {
+            account_failures,
+            ..tp_auth::AbuseConfig::default()
+        };
+        Guarded {
+            inner: Arc::new(fake),
+            guard: tp_auth::AbuseGuard::new(cfg, Arc::new(blocks)),
+            accounts: Arc::new(meta),
+            tenant: TenantId::DEFAULT,
+        }
+    }
+
+    /// Неудачи считаются по учётной записи из имени входа; успешный вход сбрасывает счётчик; порог — блокировка,
+    /// после которой отвергается и верный пароль.
+    #[tokio::test]
+    async fn guarded_blocks_account_after_failures() {
+        let g = guarded(MemAbuseBlocks::default(), 3).await;
+        for _ in 0..2 {
+            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+        }
+        g.verify(password("right")).await.expect("login");
+        for _ in 0..2 {
+            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+        }
+        g.verify(password("right"))
+            .await
+            .expect("login after reset");
+        for _ in 0..3 {
+            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+        }
+        assert_eq!(g.verify(password("right")).await, Err(Error::Forbidden));
+    }
+
+    /// Хранилище блокировок недоступно — вход проверяется (решение владельца #253, по умолчанию пускать).
+    #[tokio::test]
+    async fn guarded_lets_in_when_blocks_unavailable() {
+        let blocks = MemAbuseBlocks::default();
+        blocks.fail_next(Error::UNAVAILABLE);
+        let g = guarded(blocks, 3).await;
+        g.verify(password("right")).await.expect("login");
+        assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
     }
 }

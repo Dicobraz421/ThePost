@@ -1,7 +1,8 @@
 //! Сквозной тест MVP (APP-05, SRS прил. Д.7): узел профиля SMB (`deploy/config/all.yaml`, все роли в одном процессе)
-//! против PostgreSQL — приём SMTP (объекты письма хранятся сжатыми) → IMAP FETCH и JMAP Email/get → поиск → удаление
-//! в корзину → восстановление → «очистить корзину» в IMAP и JMAP по настройке `trash.purge` → отправка из JMAP
-//! локальному адресату (CMP-07) → истечение срока корзины (роль maintenance).
+//! против PostgreSQL — приём SMTP (объекты письма хранятся сжатыми, приём и доставка — в журнале доставки) → IMAP
+//! FETCH и JMAP Email/get → поиск → удаление в корзину → восстановление → «очистить корзину» в IMAP и JMAP по
+//! настройке `trash.purge` → отправка из JMAP локальному адресату (CMP-07) → истечение срока корзины (роль
+//! maintenance). Вход — через защиту от перебора.
 //!
 //! Без `TEST_DATABASE_URL` тест пропускается.
 
@@ -19,6 +20,7 @@ use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 use tp_contracts::TenantId;
+use tp_contracts::delivery::{DeliveryEventKind, DeliveryLog, DeliveryQuery};
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::ids::DomainId;
 use tp_contracts::mailstore::MailStore;
@@ -550,6 +552,24 @@ async fn mvp_mail_flow() {
         .expect("blobs");
     tx.commit().await.expect("commit");
     assert!(zstd >= 1, "нет сжатых объектов");
+    // Журнал доставки (SMTP-17): приём и доставка письма в ящик.
+    let query = DeliveryQuery {
+        message_id: Some(format!("e2e-{word}@sender.test")),
+        ..DeliveryQuery::all(10)
+    };
+    let until = deadline();
+    loop {
+        let log = DeliveryLog::search(&meta, tenant, &query)
+            .await
+            .expect("delivery log");
+        let kinds: Vec<_> = log.events.iter().map(|e| e.kind).collect();
+        if kinds.contains(&DeliveryEventKind::Receive)
+            && kinds.contains(&DeliveryEventKind::Deliver)
+        {
+            break;
+        }
+        retry(until, "приём и доставка в журнале доставки").await;
+    }
 
     // 3. JMAP Email/get.
     let auth = base64::engine::general_purpose::STANDARD.encode(format!("{login}:{app_password}"));

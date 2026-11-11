@@ -319,7 +319,8 @@ impl ClusterSection {
 
 // ---------- auth ----------
 
-/// Секция `auth`: вход в протоколы (SRS 6.1) — каталог LDAP, OIDC (Bearer), пароли приложений, Kerberos.
+/// Секция `auth`: вход в протоколы (SRS 6.1) — каталог LDAP, OIDC (Bearer), пароли приложений, Kerberos, защита от
+/// перебора.
 ///
 /// ```yaml
 /// auth:
@@ -345,6 +346,8 @@ pub struct AuthSection {
     /// Kerberos (SASL GSSAPI). Keytab задаёт переменная `KRB5_KTNAME` (systemd `Environment=`): поле `keytab`
     /// только сверяется с ней. Требует перезапуска.
     pub gssapi: Option<tp_auth::GssapiConfig>,
+    /// Защита от перебора (`tp-auth`, AUTH-08): пороги неудачных входов, срок блокировки. Требует перезапуска.
+    pub abuse: tp_auth::AbuseConfig,
 }
 
 impl AuthSection {
@@ -359,6 +362,7 @@ impl AuthSection {
         if let Some(gssapi) = &self.gssapi {
             gssapi.check().map_err(|e| sub("gssapi", e))?;
         }
+        self.abuse.check()?;
         Ok(())
     }
 }
@@ -476,8 +480,21 @@ fn sub(name: &str, e: Error) -> Error {
 const ADMIN_LISTEN_HINT: &str = "admin.listen не используется: адрес Admin API задаётся в http.admin.listen \
      (например, http: { admin: { listen: 127.0.0.1:8443 } })";
 
+/// Подсказка для `admin.allow_external`: ключ без действия — Admin API слушает только внутренний адрес
+/// `http.admin.listen` (SRS 6.8), внешний адрес не разрешается ничем.
+const ADMIN_ALLOW_EXTERNAL_HINT: &str = "admin.allow_external не используется: Admin API принимает соединения \
+     только на внутреннем адресе http.admin.listen (loopback или частная сеть, SRS 6.8); внешний доступ — через \
+     обратный прокси или VPN";
+
+/// Ключи `tp-admin`, которые приложение не применяет, и подсказки к ним.
+const ADMIN_REJECTED: [(&str, &str); 2] = [
+    ("listen", ADMIN_LISTEN_HINT),
+    ("allow_external", ADMIN_ALLOW_EXTERNAL_HINT),
+];
+
 /// Секция `admin`: секция `tp-admin` как есть, кроме `listen` — адрес слушателя задаёт `http.admin.listen`, ключ
-/// `admin.listen` — ошибка разбора с подсказкой (два ключа одного адреса расходились: проверялся один, слушал другой).
+/// `admin.listen` — ошибка разбора с подсказкой (два ключа одного адреса расходились: проверялся один, слушал другой);
+/// `admin.allow_external` — тоже ошибка с подсказкой: ключ без действия (адрес проверяет `http.admin`, только внутренний).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AdminSection(pub tp_admin::AdminConfig);
 
@@ -488,8 +505,11 @@ impl<'de> Deserialize<'de> for AdminSection {
         if value.is_null() {
             return Ok(Self::default());
         }
-        if value.get("listen").is_some() {
-            return Err(D::Error::custom(ADMIN_LISTEN_HINT));
+        if let Some((_, hint)) = ADMIN_REJECTED
+            .iter()
+            .find(|(key, _)| value.get(key).is_some())
+        {
+            return Err(D::Error::custom(hint));
         }
         tp_admin::AdminConfig::deserialize(value)
             .map(Self)
@@ -502,15 +522,14 @@ impl JsonSchema for AdminSection {
         "AdminSection".into()
     }
 
-    /// Схема `tp-admin`; `listen` остаётся известным ключом (иначе мягкий режим отбросил бы его с предупреждением),
-    /// но не допускает значений.
+    /// Схема `tp-admin`; `listen` и `allow_external` остаются известными ключами (иначе мягкий режим отбросил бы
+    /// их с предупреждением), но не допускают значений.
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let mut schema = tp_admin::AdminConfig::json_schema(generator);
-        if let Some(listen) = schema
-            .get_mut("properties")
-            .and_then(|p| p.get_mut("listen"))
-        {
-            *listen = serde_json::json!({ "description": ADMIN_LISTEN_HINT, "not": {} });
+        for (key, hint) in ADMIN_REJECTED {
+            if let Some(prop) = schema.get_mut("properties").and_then(|p| p.get_mut(key)) {
+                *prop = serde_json::json!({ "description": hint, "not": {} });
+            }
         }
         schema
     }
@@ -826,5 +845,20 @@ blob:
         );
         let schema = registry().expect("registry").schema_json();
         assert!(schema.contains("admin.listen не используется"));
+    }
+
+    /// `admin.allow_external` — ключ без действия (APP-17): ошибка разбора с подсказкой в обоих режимах.
+    #[test]
+    fn admin_allow_external_is_rejected_with_hint() {
+        for value in ["true", "false"] {
+            let yaml = format!("{MINIMAL_DEV}admin:\n  allow_external: {value}\n");
+            for r in [parse(&yaml), strict(&yaml)] {
+                let m = err(r);
+                assert!(m.contains("admin.allow_external"), "{m}");
+                assert!(m.contains("http.admin.listen"), "{m}");
+            }
+        }
+        let schema = registry().expect("registry").schema_json();
+        assert!(schema.contains("admin.allow_external не используется"));
     }
 }
