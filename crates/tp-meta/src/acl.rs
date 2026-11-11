@@ -282,7 +282,7 @@ impl AclStore for PgMeta {
         // На другом шарде учётную запись уже нашёл справочник (её шард).
         let db = self.box_db(owner).await?;
         let mut tx = begin(&db.pool, owner.tenant).await?;
-        if db.shard == ShardId::LOCAL {
+        if db.shard == ShardId::MAIN {
             let found: Option<i32> = sqlx::query_scalar(
                 "SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2",
             )

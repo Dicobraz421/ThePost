@@ -291,7 +291,7 @@ impl PgMeta {
         scope: AccountScope,
     ) -> Result<Duration> {
         let default = self.cfg.retention.trash_retention;
-        if db.shard == ShardId::LOCAL {
+        if db.shard == ShardId::MAIN {
             return Ok(default);
         }
         let mut tx = begin(&self.pool, scope.tenant).await?;
@@ -843,7 +843,7 @@ impl Quota for PgMeta {
     async fn usage(&self, scope: AccountScope) -> Result<QuotaUsage> {
         self.idempotent(|| async move {
             let db = self.box_db(scope).await?;
-            if db.shard != ShardId::LOCAL {
+            if db.shard != ShardId::MAIN {
                 return self.usage_remote(&db, scope).await;
             }
             let mut tx = begin(&self.pool, scope.tenant).await?;

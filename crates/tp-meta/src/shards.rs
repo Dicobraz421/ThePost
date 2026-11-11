@@ -32,20 +32,8 @@ use tp_contracts::{AccountId, Error, Result, TenantId};
 use crate::pool::{PoolConfig, connect_lazy, fetch_secret, url_has_password};
 use crate::schema::{begin, db_err};
 
-/// Номер шарда.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ShardId(pub i32);
-
-impl ShardId {
-    /// Шард базовой поставки — основная БД.
-    pub const LOCAL: ShardId = ShardId(0);
-}
-
-impl From<i32> for ShardId {
-    fn from(v: i32) -> Self {
-        ShardId(v)
-    }
-}
+/// Номер шарда — тип контракта (CTR-34): [`ShardId::MAIN`] — основная БД.
+pub use tp_contracts::ShardId;
 
 /// Назначение чтения (SRS 3.1): протокольные чтения и все записи — `Primary`; `Stale` — только закрытый
 /// список фоновых чтений (экспорт, отчёты, eDiscovery, verify, «сироты» BLOB, первичная индексация).
@@ -141,7 +129,7 @@ pub trait ShardResolver: Send + Sync + 'static {
     /// Шард для новой учётной записи организации.
     async fn place(&self, tenant: TenantId) -> Result<ShardId>;
 
-    /// Все шарды справочника по возрастанию, всегда с [`ShardId::LOCAL`]. Вызывается на каждую операцию
+    /// Все шарды справочника по возрастанию, всегда с [`ShardId::MAIN`]. Вызывается на каждую операцию
     /// ящика: реализация кэширует список до сигнала изменения справочника.
     async fn shards(&self) -> Result<Vec<ShardId>>;
 
@@ -227,6 +215,29 @@ impl ShardDirectory {
                 }
             }
         }))
+    }
+
+    /// Секция пула для прямых соединений с шардом `shard` (слушатель и публикатор сигналов шарда): параметры
+    /// справочника, адрес — `dsn` шарда, пароль — секрет `credentials`; без PgBouncer, списка адресов и
+    /// динамических учётных данных. Шард 0 (основная БД) — `Invalid`: её секция — `database`.
+    pub async fn shard_pool_config(&self, shard: ShardId) -> Result<PoolConfig> {
+        let rec = self.row(shard).await?;
+        let Some(dsn) = rec.shard.dsn else {
+            return Err(Error::invalid(format!(
+                "шард {}: основная БД — секция database",
+                shard.0
+            )));
+        };
+        Ok(PoolConfig {
+            url: dsn,
+            urls: Vec::new(),
+            password: rec.shard.credentials,
+            dynamic_credentials: None,
+            direct_url: None,
+            owner: None,
+            pgbouncer: false,
+            ..self.cfg.clone()
+        })
     }
 
     /// Применяет миграции схемы ядра на каждом шарде справочника с адресом (основную БД мигрирует
@@ -410,8 +421,8 @@ impl ShardResolver for ShardDirectory {
                 .into_iter()
                 .map(ShardId)
                 .collect();
-        if !ids.contains(&ShardId::LOCAL) {
-            ids.insert(0, ShardId::LOCAL);
+        if !ids.contains(&ShardId::MAIN) {
+            ids.insert(0, ShardId::MAIN);
             ids.sort();
         }
         let mut c = self.cached();

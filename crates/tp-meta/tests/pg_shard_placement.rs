@@ -69,9 +69,9 @@ async fn mailboxes_of_two_shards_through_one_meta() {
         return;
     };
     let org = t.tenant().await;
-    let a = t.account_on(org.clone(), ShardId::LOCAL).await;
+    let a = t.account_on(org.clone(), ShardId::MAIN).await;
     let b = t.account_on(org, t.shard).await;
-    assert_eq!(t.dir.shard_of(a).await, Ok(ShardId::LOCAL));
+    assert_eq!(t.dir.shard_of(a).await, Ok(ShardId::MAIN));
     assert_eq!(t.dir.shard_of(b).await, Ok(t.shard));
     let shards = t.dir.list().await.expect("list");
     assert_eq!(shards[1].site.as_deref(), Some("dc2"));
@@ -233,7 +233,7 @@ async fn directory_signal_drops_cache() {
     .await
     .expect("publish");
     tokio::time::timeout(Duration::from_secs(10), async {
-        while t.dir.shard_of(b).await != Ok(ShardId::LOCAL) {
+        while t.dir.shard_of(b).await != Ok(ShardId::MAIN) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -253,7 +253,7 @@ struct OneShard {
 impl ShardResolver for OneShard {
     async fn shard_of(&self, _: AccountScope) -> Result<ShardId> {
         self.lookups.fetch_add(1, Ordering::SeqCst);
-        Ok(ShardId::LOCAL)
+        Ok(ShardId::MAIN)
     }
 
     async fn pool(&self, _: ShardId, _: ReadIntent) -> Result<PgPool> {
@@ -262,11 +262,11 @@ impl ShardResolver for OneShard {
     }
 
     async fn place(&self, _: TenantId) -> Result<ShardId> {
-        Ok(ShardId::LOCAL)
+        Ok(ShardId::MAIN)
     }
 
     async fn shards(&self) -> Result<Vec<ShardId>> {
-        Ok(vec![ShardId::LOCAL])
+        Ok(vec![ShardId::MAIN])
     }
 }
 

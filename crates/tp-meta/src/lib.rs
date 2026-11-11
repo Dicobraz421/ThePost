@@ -148,12 +148,21 @@ impl std::fmt::Debug for Shards {
     }
 }
 
+/// Маршруты по шардам, общие для копий [`PgMeta`]: шард записи очереди, с какого шарда начинать `claim`.
+#[derive(Debug, Default)]
+pub(crate) struct Routing {
+    /// Шард записи очереди (захваты этого экземпляра); нет записи — поиск по шардам.
+    pub(crate) queue: std::sync::Mutex<std::collections::HashMap<tp_contracts::QueueId, ShardId>>,
+    /// Номер прохода `claim`: шард, с которого начинается обход.
+    pub(crate) claim_turn: std::sync::atomic::AtomicUsize,
+}
+
 /// Пул шарда ящика.
 #[derive(Debug, Clone)]
 pub(crate) struct BoxDb {
     /// Шард.
     pub(crate) shard: ShardId,
-    /// Пул шарда (для [`ShardId::LOCAL`] — пул основной БД, с повтором над [`Failover`]).
+    /// Пул шарда (для [`ShardId::MAIN`] — пул основной БД, с повтором над [`Failover`]).
     pub(crate) pool: PgPool,
 }
 
@@ -189,6 +198,7 @@ pub struct PgMeta {
     bus: Signals,
     failover: Option<Failover>,
     shards: Shards,
+    routing: Arc<Routing>,
 }
 
 impl PgMeta {
@@ -200,6 +210,7 @@ impl PgMeta {
             bus: Signals::default(),
             failover: None,
             shards: Shards::default(),
+            routing: Arc::default(),
         }
     }
 
@@ -300,7 +311,7 @@ impl PgMeta {
     }
 
     /// Те же хранилища с хранилищами ящика на шардах справочника `resolver` (основная БД — шард
-    /// [`ShardId::LOCAL`], её пул — пул этих хранилищ). Схема шардов — [`shards::ShardDirectory::migrate`].
+    /// [`ShardId::MAIN`], её пул — пул этих хранилищ). Схема шардов — [`shards::ShardDirectory::migrate`].
     pub fn with_shards(mut self, resolver: Arc<dyn ShardResolver>) -> Self {
         self.shards = Shards(Some(resolver));
         self
@@ -311,13 +322,13 @@ impl PgMeta {
         self.shards.0.as_ref()
     }
 
-    /// Шард учётной записи: без справочника и при единственном шарде — [`ShardId::LOCAL`] без запроса.
+    /// Шард учётной записи: без справочника и при единственном шарде — [`ShardId::MAIN`] без запроса.
     pub(crate) async fn shard_of(&self, scope: AccountScope) -> Result<ShardId> {
         let Some(r) = &self.shards.0 else {
-            return Ok(ShardId::LOCAL);
+            return Ok(ShardId::MAIN);
         };
         if r.shards().await?.len() <= 1 {
-            return Ok(ShardId::LOCAL);
+            return Ok(ShardId::MAIN);
         }
         r.shard_of(scope).await
     }
@@ -325,7 +336,7 @@ impl PgMeta {
     /// Пул шарда `shard`: основная БД — пул этих хранилищ.
     pub(crate) async fn shard_pool(&self, shard: ShardId, intent: ReadIntent) -> Result<PgPool> {
         match &self.shards.0 {
-            Some(r) if shard != ShardId::LOCAL => r.pool(shard, intent).await,
+            Some(r) if shard != ShardId::MAIN => r.pool(shard, intent).await,
             _ => Ok(self.pool.clone()),
         }
     }
@@ -348,7 +359,7 @@ impl PgMeta {
     pub(crate) async fn all_shards(&self) -> Result<Vec<BoxDb>> {
         let ids = match &self.shards.0 {
             Some(r) => r.shards().await?,
-            None => vec![ShardId::LOCAL],
+            None => vec![ShardId::MAIN],
         };
         let mut out = Vec::with_capacity(ids.len());
         for shard in ids {
@@ -358,6 +369,46 @@ impl PgMeta {
             });
         }
         Ok(out)
+    }
+
+    /// Хранилища одного шарда `shard` без справочника: журнал событий, очередь и учёт BLOB этого шарда
+    /// (вызывающий, знающий шард ящика, — например, учёт ссылок BLOB при доставке). Шард
+    /// [`ShardId::MAIN`] — эти же хранилища над основной БД (с повтором над [`Failover`]).
+    pub async fn on_shard(&self, shard: ShardId) -> Result<PgMeta> {
+        let pool = self.shard_pool(shard, ReadIntent::Primary).await?;
+        Ok(Self {
+            pool,
+            cfg: self.cfg.clone(),
+            bus: self.bus.clone(),
+            failover: if shard == ShardId::MAIN {
+                self.failover.clone()
+            } else {
+                None
+            },
+            shards: Shards::default(),
+            routing: Arc::default(),
+        })
+    }
+
+    /// Хранилища каждого шарда по возрастанию номера; `None` — один шард (хранилища работают сами).
+    pub(crate) async fn shard_views(&self) -> Result<Option<Vec<(ShardId, PgMeta)>>> {
+        let Some(r) = &self.shards.0 else {
+            return Ok(None);
+        };
+        let ids = r.shards().await?;
+        if ids.len() <= 1 {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push((id, self.on_shard(id).await?));
+        }
+        Ok(Some(out))
+    }
+
+    /// Маршруты по шардам.
+    pub(crate) fn routing(&self) -> &Routing {
+        &self.routing
     }
 
     /// Запись с ключом в транзакции организации на шарде `db`: основная БД — [`keyed`](Self::keyed),
@@ -373,7 +424,7 @@ impl PgMeta {
         F: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, T>,
         C: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, Option<T>>,
     {
-        if db.shard == ShardId::LOCAL {
+        if db.shard == ShardId::MAIN {
             self.keyed(tenant, f, committed).await
         } else {
             pool::with_tenant(&db.pool, tenant, f).await

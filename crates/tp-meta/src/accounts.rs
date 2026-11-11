@@ -138,7 +138,7 @@ impl PgMeta {
         // Шард новой учётной записи — до транзакции каталога (справочник читает свой пул).
         let place = match self.shard_resolver() {
             Some(r) => r.place(tenant).await?,
-            None => ShardId::LOCAL,
+            None => ShardId::MAIN,
         };
         let mut tx = begin(&self.pool, tenant).await?;
         // Шард прежней учётной записи не меняется (перенос — модуль «Шардирование»).
@@ -180,7 +180,7 @@ impl PgMeta {
             tenant,
             account: account.id,
         };
-        let created = if shard == ShardId::LOCAL {
+        let created = if shard == ShardId::MAIN {
             let created =
                 mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
             tx.commit().await.map_err(db_err)?;
@@ -312,7 +312,7 @@ impl AccountStore for PgMeta {
                 account: id,
             };
             let db = self.box_db(scope).await?;
-            if db.shard != ShardId::LOCAL {
+            if db.shard != ShardId::MAIN {
                 // Учётная запись найдена в каталоге (её шард); письма — на шарде.
                 let (used_bytes, messages) = crate::retention::box_usage(&db.pool, scope).await?;
                 return Ok(QuotaUsage {

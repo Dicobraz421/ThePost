@@ -342,6 +342,11 @@ pub struct TwoShards {
 }
 
 impl TwoShards {
+    /// Адрес основной БД (с паролем тестовой БД, если он есть).
+    pub fn main_url(&self) -> String {
+        with_database(&pg_url().expect("TEST_DATABASE_URL"), &self.main.name)
+    }
+
     /// Новая организация с доменом в основной БД.
     pub async fn tenant(&self) -> (TenantId, DomainId, String) {
         let tenant = tenant(self.main.meta.pool()).await;

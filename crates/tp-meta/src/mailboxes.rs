@@ -440,7 +440,7 @@ impl MailboxStore for PgMeta {
             let mut rows = select_all(&mut tx, scope).await?;
             // Первое открытие ящика без части системных папок (запись заведена в базе, вход без `upsert`).
             let missing = !missing_rows(&rows)?.is_empty();
-            if missing && db.shard != ShardId::LOCAL {
+            if missing && db.shard != ShardId::MAIN {
                 // Учётная запись есть в каталоге (её шард найден), состояние ящика на шарде — ещё нет.
                 ensure_state(&mut tx, scope).await?;
             }

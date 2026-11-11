@@ -20,6 +20,11 @@
 //! Метрики — [`PgSignalBus::metrics`]: задержка сигнала (от постановки в очередь до приёма слушателем, по
 //! часам узлов), размер пачек, время NOTIFY.
 //!
+//! Шарды (META-31, решение 2026-11-01-scale-shards-geo-admin): сигнал шарда разделяет судьбу его данных —
+//! [`ShardedSignalBus`] держит шину [`PgSignalBus`] на primary каждого шарда справочника (слушатель и
+//! публикатор — прямые соединения с шардом); сигнал учётной записи публикуется на её шарде, системный — в
+//! основной БД; подписки получают сигналы всех шардов.
+//!
 //! Формат сообщения NOTIFY — JSON `{"t": <микросекунды UTC самого раннего сигнала>, "r": <сверка всем>,
 //! "e": [<Event>…]}`.
 //!
@@ -48,6 +53,7 @@ use tp_contracts::{AccountId, Error, Result, TenantId};
 use crate::failover::{Failover, connect_failover};
 use crate::pool::PoolConfig;
 use crate::schema::db_err;
+use crate::shards::{ShardDirectory, ShardId, ShardResolver};
 
 /// Подсекция `meta.signals` (SRS 5.5). Параметры требуют перезапуска.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -705,6 +711,132 @@ impl EventBus for PgSignalBus {
 
     async fn subscribe_system(&self) -> Result<EventStream> {
         Ok(PgSignalBus::subscribe_system(self).await?.into_stream())
+    }
+}
+
+/// Сигналы кластера по шардам справочника: шина [`PgSignalBus`] на primary каждого шарда (см. описание
+/// модуля). Шарды, добавленные в справочник после запуска, подключает [`ShardedSignalBus::refresh`]; до этого
+/// сигналы их учётных записей идут через основную БД.
+#[derive(Clone)]
+pub struct ShardedSignalBus {
+    dir: Arc<ShardDirectory>,
+    secrets: Arc<dyn SecretStore>,
+    cfg: SignalsConfig,
+    buses: Arc<Mutex<std::collections::BTreeMap<ShardId, PgSignalBus>>>,
+}
+
+impl std::fmt::Debug for ShardedSignalBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardedSignalBus")
+            .field(
+                "shards",
+                &lock(&self.buses).keys().copied().collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ShardedSignalBus {
+    /// Шина основной БД `main` и шины остальных шардов справочника `dir` (учётные данные — из `secrets`).
+    pub async fn start(
+        main: PgSignalBus,
+        dir: Arc<ShardDirectory>,
+        secrets: Arc<dyn SecretStore>,
+        cfg: SignalsConfig,
+    ) -> Result<Self> {
+        let mut buses = std::collections::BTreeMap::new();
+        buses.insert(ShardId::MAIN, main);
+        let bus = Self {
+            dir,
+            secrets,
+            cfg,
+            buses: Arc::new(Mutex::new(buses)),
+        };
+        bus.refresh().await?;
+        Ok(bus)
+    }
+
+    /// Подключает шины шардов справочника, которых ещё нет (после сигнала изменения справочника);
+    /// возвращает число подключённых. Шины удалённых из справочника шардов остаются до остановки.
+    pub async fn refresh(&self) -> Result<usize> {
+        let mut added = 0;
+        for shard in self.dir.shards().await? {
+            if lock(&self.buses).contains_key(&shard) {
+                continue;
+            }
+            let cfg = self.dir.shard_pool_config(shard).await?;
+            let publish = connect_failover(&cfg, Arc::clone(&self.secrets)).await?;
+            let listen = connect_listener(&cfg, Arc::clone(&self.secrets)).await?;
+            let bus = PgSignalBus::start(publish, listen, self.cfg.clone())?;
+            lock(&self.buses).entry(shard).or_insert(bus);
+            added += 1;
+        }
+        Ok(added)
+    }
+
+    /// Шарды с подключённой шиной по возрастанию.
+    pub fn shards(&self) -> Vec<ShardId> {
+        lock(&self.buses).keys().copied().collect()
+    }
+
+    /// Шина шарда; не подключённого — основной БД.
+    fn bus(&self, shard: ShardId) -> PgSignalBus {
+        let buses = lock(&self.buses);
+        match buses.get(&shard) {
+            Some(b) => b.clone(),
+            None => buses[&ShardId::MAIN].clone(),
+        }
+    }
+
+    fn all(&self) -> Vec<PgSignalBus> {
+        lock(&self.buses).values().cloned().collect()
+    }
+}
+
+#[async_trait]
+impl EventBus for ShardedSignalBus {
+    async fn publish(&self, event: Event) -> Result<()> {
+        let shard = match event.account {
+            Some(account) if self.dir.shards().await?.len() > 1 => {
+                let scope = AccountScope {
+                    tenant: event.tenant,
+                    account,
+                };
+                match self.dir.shard_of(scope).await {
+                    Ok(s) => s,
+                    // Учётной записи нет в каталоге — сигнал никому не нужен, но не теряется.
+                    Err(Error::NotFound) => ShardId::MAIN,
+                    Err(e) => return Err(e),
+                }
+            }
+            _ => ShardId::MAIN,
+        };
+        self.bus(shard).publish(event).await
+    }
+
+    /// Шина шарда учётной записи и основной БД (сигналы до подключения шины шарда).
+    async fn subscribe(&self, scope: AccountScope) -> Result<EventStream> {
+        let mut streams = vec![
+            self.bus(ShardId::MAIN)
+                .subscribe(scope)
+                .await?
+                .into_stream(),
+        ];
+        if self.dir.shards().await?.len() > 1 {
+            let shard = self.dir.shard_of(scope).await?;
+            if shard != ShardId::MAIN && lock(&self.buses).contains_key(&shard) {
+                streams.push(self.bus(shard).subscribe(scope).await?.into_stream());
+            }
+        }
+        Ok(Box::pin(futures::stream::select_all(streams)))
+    }
+
+    async fn subscribe_system(&self) -> Result<EventStream> {
+        let mut streams = Vec::new();
+        for bus in self.all() {
+            streams.push(bus.subscribe_system().await?.into_stream());
+        }
+        Ok(Box::pin(futures::stream::select_all(streams)))
     }
 }
 

@@ -12,6 +12,14 @@
 //! Для `thepost verify` (SRS 3.5) — постраничное перечисление записей `live` по всем организациям
 //! ([`PgMeta::live_blobs`]) и пометка повреждённых ([`PgMeta::mark_blob_damaged`]); в контракт [`BlobIndex`]
 //! они не входят.
+//!
+//! Шарды (META-31): учёт ссылок — на шарде ящика (ссылки копий и удалений писем меняют транзакции ящика;
+//! загрузку на шарде учитывает вызывающий, знающий шард ящика, — [`PgMeta::on_shard`]). Хранилища со
+//! справочником ([`PgMeta::with_shards`]) ведут `acquire`, `commit_new`, `release` в основной БД, а сборку
+//! мусора — по всем шардам: объект — кандидат, только если ссылок на него нет ни на одном шарде;
+//! `mark_deleting` под блокировкой строки каждого шарда по очереди ставит `deleting` (шарду без строки —
+//! надгробие того же поколения, чтобы параллельная загрузка на нём получила новое поколение) и откатывает
+//! пометки, если на каком-то шарде ссылки есть; `finalize_delete` — на всех шардах.
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -22,6 +30,172 @@ use uuid::Uuid;
 use crate::PgMeta;
 use crate::pool::with_tenant;
 use crate::schema::{begin, begin_system, db_err, to_u32};
+use crate::shards::ShardId;
+
+/// Пометка `deleting` строки шарда в [`mark_deleting_sharded`]: как откатить.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marked {
+    /// Строка была `live` — вернуть `live`.
+    Live,
+    /// Строка уже была `deleting` — оставить.
+    Deleting,
+    /// Строки не было — удалить надгробие.
+    Tombstone,
+}
+
+/// Исход проверки шарда.
+enum Check {
+    /// Шард помечен (или помечать нечего — другое поколение, уже удалён); `true` — строка поколения
+    /// объекта без ссылок, освобождённая раньше `older_than`.
+    Marked(Option<Marked>, bool),
+    /// На шарде есть ссылки или объект освобождён позже `older_than` — не удалять.
+    Busy,
+}
+
+/// Строка учёта шарда для [`mark_shard`]: поколение, ссылки, состояние, момент обнуления.
+type MarkRow = (i64, i64, String, Option<OffsetDateTime>);
+
+/// Помечает строку шарда `view` поколения `key` для удаления (см. описание модуля).
+async fn mark_shard(view: &PgMeta, key: &BlobKey, older_than: OffsetDateTime) -> Result<Check> {
+    let mut tx = begin(view.pool(), key.tenant).await?;
+    let row: Option<MarkRow> = sqlx::query_as(
+        "SELECT gen, refcnt, state, zero_since FROM blobs WHERE tenant_id = $1 AND hash = $2 FOR UPDATE",
+    )
+    .bind(key.tenant.as_uuid())
+    .bind(key.hash.as_bytes().as_slice())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let g = i64::from(key.generation.0);
+    let check = match row {
+        None => {
+            sqlx::query(
+                "INSERT INTO blobs (tenant_id, hash, gen, refcnt, state, size, zero_since)
+                 VALUES ($1, $2, $3, 0, 'deleting', 0, now())",
+            )
+            .bind(key.tenant.as_uuid())
+            .bind(key.hash.as_bytes().as_slice())
+            .bind(g)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            Check::Marked(Some(Marked::Tombstone), false)
+        }
+        Some((rg, refcnt, state, zero_since)) if rg == g && state != "deleted" => {
+            if refcnt > 0 || zero_since.is_none_or(|z| z >= older_than) {
+                Check::Busy
+            } else {
+                sqlx::query(
+                    "UPDATE blobs SET state = 'deleting' WHERE tenant_id = $1 AND hash = $2 AND gen = $3",
+                )
+                .bind(key.tenant.as_uuid())
+                .bind(key.hash.as_bytes().as_slice())
+                .bind(g)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                let was = if state == "live" {
+                    Marked::Live
+                } else {
+                    Marked::Deleting
+                };
+                Check::Marked(Some(was), true)
+            }
+        }
+        // Другое поколение — другой объект; надгробие удалённого — помечать нечего.
+        Some(_) => Check::Marked(None, false),
+    };
+    tx.commit().await.map_err(db_err)?;
+    Ok(check)
+}
+
+/// Откатывает пометку `marked` строки шарда `view`.
+async fn unmark_shard(view: &PgMeta, key: &BlobKey, marked: Marked) -> Result<()> {
+    let sql = match marked {
+        Marked::Deleting => return Ok(()),
+        Marked::Live => {
+            "UPDATE blobs SET state = 'live'
+             WHERE tenant_id = $1 AND hash = $2 AND gen = $3 AND state = 'deleting'"
+        }
+        Marked::Tombstone => {
+            "DELETE FROM blobs
+             WHERE tenant_id = $1 AND hash = $2 AND gen = $3 AND state = 'deleting' AND refcnt = 0"
+        }
+    };
+    let mut tx = begin(view.pool(), key.tenant).await?;
+    sqlx::query(sql)
+        .bind(key.tenant.as_uuid())
+        .bind(key.hash.as_bytes().as_slice())
+        .bind(i64::from(key.generation.0))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok(())
+}
+
+/// `mark_deleting` по всем шардам `views` (см. описание модуля): `true` — объект помечен хотя бы на одном
+/// шарде и ни на одном нет ссылок.
+async fn mark_deleting_sharded(
+    views: &[(ShardId, PgMeta)],
+    key: &BlobKey,
+    older_than: OffsetDateTime,
+) -> Result<bool> {
+    let mut done: Vec<(&PgMeta, Marked)> = Vec::new();
+    let mut eligible = false;
+    for (_, view) in views {
+        match mark_shard(view, key, older_than).await {
+            Ok(Check::Marked(m, e)) => {
+                if let Some(m) = m {
+                    done.push((view, m));
+                }
+                eligible |= e;
+            }
+            Ok(Check::Busy) => {
+                rollback_marks(&done, key).await;
+                return Ok(false);
+            }
+            Err(e) => {
+                rollback_marks(&done, key).await;
+                return Err(e);
+            }
+        }
+    }
+    if !eligible {
+        rollback_marks(&done, key).await;
+    }
+    Ok(eligible)
+}
+
+/// Откат пометок; ошибка отката — в журнал (строка `deleting` без ссылок — снова кандидат GC).
+async fn rollback_marks(done: &[(&PgMeta, Marked)], key: &BlobKey) {
+    for (view, m) in done {
+        if let Err(e) = unmark_shard(view, key, *m).await {
+            tracing::warn!(error = %e, "пометка удаления BLOB на шарде не откачена");
+        }
+    }
+}
+
+/// Ключи из `keys`, на которые есть ссылки на шарде `view` (строка того же поколения с `refcnt > 0`).
+async fn referenced(view: &PgMeta, keys: &[BlobKey]) -> Result<Vec<BlobKey>> {
+    let tenants: Vec<Uuid> = keys.iter().map(|k| *k.tenant.as_uuid()).collect();
+    let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.as_bytes().to_vec()).collect();
+    let gens: Vec<i64> = keys.iter().map(|k| i64::from(k.generation.0)).collect();
+    let mut tx = begin_system(view.pool()).await?;
+    let rows: Vec<(Uuid, Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT b.tenant_id, b.hash, b.gen FROM unnest($1::uuid[], $2::bytea[], $3::int8[]) AS k(t, h, g)
+         JOIN blobs b ON b.tenant_id = k.t AND b.hash = k.h AND b.gen = k.g
+         WHERE b.refcnt > 0",
+    )
+    .bind(tenants)
+    .bind(hashes)
+    .bind(gens)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    rows.into_iter().map(|(t, h, g)| key_of(t, h, g)).collect()
+}
 
 /// Число ссылок операции: не меньше одной.
 fn refs_arg(refs: u32) -> Result<i64> {
@@ -69,7 +243,32 @@ impl PgMeta {
     /// после `after` — ключа последней записи предыдущей страницы (`None` — с начала; поколение не учитывается).
     /// Страница короче `limit` — последняя. Каждая страница — своя короткая транзакция по первичному ключу:
     /// записи, добавленные или удалённые во время перечисления, могут попасть или не попасть в него.
+    ///
+    /// Со справочником шардов — слияние страниц всех шардов (запись с тем же ключом на нескольких шардах —
+    /// одна; повреждённая, если помечена хоть на одном).
     pub async fn live_blobs(&self, after: Option<&BlobKey>, limit: usize) -> Result<Vec<LiveBlob>> {
+        if let Some(views) = self.shard_views().await? {
+            let mut all: Vec<LiveBlob> = Vec::new();
+            for (_, view) in &views {
+                all.extend(Box::pin(view.live_blobs(after, limit)).await?);
+            }
+            all.sort_by(|a, b| {
+                (a.key.tenant, a.key.hash.as_bytes(), a.key.generation).cmp(&(
+                    b.key.tenant,
+                    b.key.hash.as_bytes(),
+                    b.key.generation,
+                ))
+            });
+            let mut out: Vec<LiveBlob> = Vec::with_capacity(all.len().min(limit));
+            for b in all {
+                match out.last_mut() {
+                    Some(last) if last.key == b.key => last.damaged |= b.damaged,
+                    _ => out.push(b),
+                }
+            }
+            out.truncate(limit);
+            return Ok(out);
+        }
         self.idempotent(|| async move {
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             // Нулевой uuid и пустой хэш меньше любого ключа таблицы (хэш — 32 байта).
@@ -107,6 +306,13 @@ impl PgMeta {
     /// Повторная пометка сохраняет время первой. `false` — такой записи нет (объект удалён или
     /// загружен заново другим поколением): помечать нечего.
     pub async fn mark_blob_damaged(&self, key: &BlobKey) -> Result<bool> {
+        if let Some(views) = self.shard_views().await? {
+            let mut marked = false;
+            for (_, view) in &views {
+                marked |= Box::pin(view.mark_blob_damaged(key)).await?;
+            }
+            return Ok(marked);
+        }
         self.rewrite(|| async move {
             let mut tx = begin(&self.pool, key.tenant).await?;
             let marked = sqlx::query(
@@ -278,6 +484,26 @@ impl BlobIndex for PgMeta {
         older_than: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<BlobKey>> {
+        if let Some(views) = self.shard_views().await? {
+            // Кандидаты всех шардов без тех, на которые ссылается какой-либо шард.
+            let mut keys: Vec<BlobKey> = Vec::new();
+            for (_, view) in &views {
+                for k in BlobIndex::gc_candidates(view, older_than, limit).await? {
+                    if !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
+            }
+            for (_, view) in &views {
+                if keys.is_empty() {
+                    break;
+                }
+                let busy = referenced(view, &keys).await?;
+                keys.retain(|k| !busy.contains(k));
+            }
+            keys.truncate(limit);
+            return Ok(keys);
+        }
         self.idempotent(|| async move {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut tx = begin_system(&self.pool).await?;
@@ -310,6 +536,9 @@ impl BlobIndex for PgMeta {
     }
 
     async fn mark_deleting(&self, key: &BlobKey, older_than: OffsetDateTime) -> Result<bool> {
+        if let Some(views) = self.shard_views().await? {
+            return mark_deleting_sharded(&views, key, older_than).await;
+        }
         self.once(async move {
             let mut tx = begin(&self.pool, key.tenant).await?;
             let marked = sqlx::query(
@@ -333,6 +562,13 @@ impl BlobIndex for PgMeta {
     }
 
     async fn finalize_delete(&self, key: &BlobKey) -> Result<bool> {
+        if let Some(views) = self.shard_views().await? {
+            let mut done = false;
+            for (_, view) in &views {
+                done |= BlobIndex::finalize_delete(view, key).await?;
+            }
+            return Ok(done);
+        }
         self.once(async move {
             let mut tx = begin(&self.pool, key.tenant).await?;
             let done = sqlx::query(
@@ -354,6 +590,14 @@ impl BlobIndex for PgMeta {
     }
 
     async fn exists(&self, key: &BlobKey) -> Result<bool> {
+        if let Some(views) = self.shard_views().await? {
+            for (_, view) in &views {
+                if BlobIndex::exists(view, key).await? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
         self.idempotent(|| async move {
         let mut tx = begin(&self.pool, key.tenant).await?;
         let found: bool = sqlx::query_scalar(
@@ -372,6 +616,14 @@ impl BlobIndex for PgMeta {
     }
 
     async fn compression(&self, key: &BlobKey) -> Result<Option<Compression>> {
+        if let Some(views) = self.shard_views().await? {
+            for (_, view) in &views {
+                if let Some(c) = BlobIndex::compression(view, key).await? {
+                    return Ok(Some(c));
+                }
+            }
+            return Ok(None);
+        }
         self.idempotent(|| async move {
             let key = *key;
             let found: Option<String> = with_tenant(&self.pool, key.tenant, move |tx| {

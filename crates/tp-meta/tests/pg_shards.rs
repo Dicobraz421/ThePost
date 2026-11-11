@@ -86,14 +86,11 @@ async fn resolve_known_account() {
         PoolConfig::default(),
         common::secrets(),
     );
-    assert_eq!(dir.shard_of(scope).await.expect("shard_of"), ShardId::LOCAL);
+    assert_eq!(dir.shard_of(scope).await.expect("shard_of"), ShardId::MAIN);
     assert!(count_mailboxes(&dir, scope).await > 0);
-    assert_eq!(
-        dir.place(scope.tenant).await.expect("place"),
-        ShardId::LOCAL
-    );
+    assert_eq!(dir.place(scope.tenant).await.expect("place"), ShardId::MAIN);
     let local = dir.list().await.expect("list");
-    assert_eq!(local[0].id, ShardId::LOCAL);
+    assert_eq!(local[0].id, ShardId::MAIN);
     assert!(local[0].dsn.is_none());
 
     let missing = AccountScope {
@@ -148,7 +145,7 @@ async fn new_shard_without_caller_changes() {
     // Кэш «учётная запись → шард» живёт до сигнала изменения справочника.
     assert_eq!(
         resolver.shard_of(scope).await.expect("shard_of"),
-        ShardId::LOCAL
+        ShardId::MAIN
     );
     resolver.invalidate();
 
@@ -165,10 +162,10 @@ async fn new_shard_without_caller_changes() {
     assert_eq!(app, marker, "запрос ушёл в пул нового шарда");
     assert_eq!(
         resolver.place(scope.tenant).await.expect("place"),
-        ShardId::LOCAL
+        ShardId::MAIN
     );
 
-    set_shard(&meta, scope, ShardId::LOCAL).await;
+    set_shard(&meta, scope, ShardId::MAIN).await;
     sqlx::query("DELETE FROM shards WHERE shard_id = $1")
         .bind(id.0)
         .execute(meta.pool())
