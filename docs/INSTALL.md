@@ -163,14 +163,13 @@ $DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@e
 | `TXT _dmarc` | `v=DMARC1; p=quarantine; rua=mailto:postmaster@example.ru` |
 | `TXT <селектор>._domainkey` (DKIM) | открытый ключ подписи, см. ниже |
 
-**Подпись DKIM.** Закрытый ключ хранится в OpenBao, в `config.yaml` — только ссылка на него:
+**Подпись DKIM.** Закрытый ключ хранится в OpenBao, в `config.yaml` — только ссылка на него. Каким селектором подписывать, задаёт политика организации или домена (Admin API, поле `dkim_selector`); без неё письмо подписывается всеми ключами домена:
 
 ```yaml
 smtp:
   dkim:
     domains:
       example.ru:
-        selector: s2026
         keys:
           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim#example.ru" } }
 ```

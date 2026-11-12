@@ -546,11 +546,15 @@
 | [SMTP-41](SMTP-41.md) | AUTH SMTP: перебор — только `AbuseGuard` | smtp | A | smtp-20 | ready | — |
 | [DEP-42](DEP-42.md) | эталоны без `smtp.delivery.local_domains` | deploy | A | deploy-31 | ready | — |
 | [DEP-44](DEP-44.md) | эталоны: ключи TLS в OpenBao | deploy | A | deploy-31 | ready | — |
+| [CI-13](CI-13.md) | бета выпускает тег версии образа | ci | B | ci-11 | ready | CI-01 |
+| [DEP-50](DEP-50.md) | Helm и Compose: закрытый образ и тег версии | deploy | A | deploy-36 | todo | CI-13 |
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | ready | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | todo | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | todo | — |
 | [CTR-68](CTR-68.md) | `InternalTls`: ключ только из хранилища секретов | contracts | B | contracts-46 | todo | CTR-52 |
 | [CTR-70](CTR-70.md) | `TenantTransport.rewrites` без `serde(default)` | contracts | B | contracts-46 | todo | — |
+| [CTR-79](CTR-79.md) | политика: лимит «получателей в час» | contracts | B | contracts-51 | todo | CTR-25 |
+| [SMTP-43](SMTP-43.md) | лимит «получателей в час» при отправке | smtp | A | smtp-24 | todo | CTR-79 |
 | [META-70](META-70.md) | `PolicyStore` и `AuditLog` в PostgreSQL | meta | A | meta-44 | todo | CTR-25 |
 | [ADM-34](ADM-34.md) | Admin API на контрактах CTR-25: политики и журнал аудита из БД | admin | B | admin-23 | todo | CTR-25,META-70 |
 | [ADM-36](ADM-36.md) | Admin API: проверка полей политики для SMTP | admin | A | admin-23 | todo | CTR-67 |
