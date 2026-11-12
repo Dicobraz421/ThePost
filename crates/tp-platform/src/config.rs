@@ -30,7 +30,7 @@ use serde::de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, Visito
 use serde::{Deserialize, Deserializer};
 use serde_yaml_ng::{Mapping, Value};
 use tp_contracts::Error;
-use tp_contracts::role::{RoleEntry, RolePreset, RoleSet};
+use tp_contracts::role::{Role, RoleEntry, RolePreset, RoleSet};
 use tp_contracts::secrets::{Secret, SecretLease, SecretRef, SecretStore};
 use tp_contracts::tls::Profile;
 
@@ -40,14 +40,49 @@ use crate::pressure::{PRESSURE, PressureConfig};
 use crate::privileges::{CONFINE, PRIVILEGES, PrivilegesConfig};
 use crate::ratelimit::{RATELIMIT, RateLimitConfig};
 use crate::reload::ReloadConfig;
-use crate::roles::RuntimeConfig;
+use crate::roles::{RuntimeConfig, uses_data_layer};
 use crate::secrets::SecretsConfig;
 use crate::service_http::ServiceHttpConfig;
 use crate::telemetry::TelemetryConfig;
 use crate::tls::TlsConfig;
 
-/// Обязательные параметры (SRS 5.5): адрес PostgreSQL, адрес BLOB-хранилища, основной домен.
-pub const REQUIRED: &[&str] = &["database.url", "blob.url", "domain"];
+/// Обязательный параметр конфигурации узла (SRS 5.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredParam {
+    /// Путь параметра по ключам: `["database", "url"]`.
+    pub key: Vec<&'static str>,
+    /// Роль узла, которой нужен параметр (первая по порядку ролей); `None` — нужен при любых ролях.
+    pub role: Option<Role>,
+}
+
+impl RequiredParam {
+    /// Путь параметра для сообщений: `database.url`.
+    pub fn path(&self) -> String {
+        self.key.join(".")
+    }
+}
+
+/// Обязательные параметры узла с ролями `roles` (SRS 5.5): адреса PostgreSQL и BLOB-хранилища — если хотя бы одна
+/// роль работает с метаданными и хранилищем писем ([`uses_data_layer`]; узлу edge не нужны), основной домен — всегда.
+pub fn required_params(roles: &RoleSet) -> Vec<RequiredParam> {
+    let mut out = Vec::new();
+    if let Some(role) = roles
+        .roles
+        .iter()
+        .copied()
+        .find(|r| uses_data_layer(roles, *r))
+    {
+        out.extend(URL_SECTIONS.iter().map(|section| RequiredParam {
+            key: vec![*section, "url"],
+            role: Some(role),
+        }));
+    }
+    out.push(RequiredParam {
+        key: vec!["domain"],
+        role: None,
+    });
+    out
+}
 
 /// Префикс переменных окружения, переопределяющих параметры: `THEPOST_SMTP__LIMITS__MAX_SIZE=10` → `smtp.limits.max_size`.
 pub const ENV_PREFIX: &str = "THEPOST_";
@@ -77,7 +112,8 @@ const PLAINTEXT_SECRET: &str =
 /// Ключи верхнего уровня, которыми владеет платформа.
 const CORE_KEYS: &[&str] = &["domain", "profile", "roles", "modules"];
 
-/// Секции с обязательным `url`, которые допускаются и без регистрации (их крейты регистрируются приложением).
+/// Секции слоя данных с `url`, обязательным для ролей с метаданными и хранилищем писем ([`required_params`]);
+/// допускаются и без регистрации (их крейты регистрируются приложением).
 const URL_SECTIONS: &[&str] = &["database", "blob"];
 
 /// Секция конфигурации крейта (CONTRACTS.md#Config).
@@ -113,6 +149,8 @@ pub(crate) enum ConfigError {
     Parse(#[from] serde_yaml_ng::Error),
     #[error("{0}: required parameter is missing")]
     Missing(String),
+    #[error("{path}: required parameter is missing (needed by role {role})")]
+    MissingForRole { path: String, role: Role },
     #[error("{0}: unknown parameter")]
     Unknown(String),
     #[error("modules.{0}: module is not built in")]
@@ -313,16 +351,29 @@ impl SectionRegistry {
             src
         };
 
-        for path in REQUIRED {
-            let key: Vec<&str> = path.split('.').collect();
-            match lookup(&tree, &key) {
+        // Обязательные параметры зависят от ролей; неверные `roles` проверяются как пресет `all`.
+        let profile: Profile = note(&mut errors, at(src, &["profile"]))
+            .flatten()
+            .unwrap_or_default();
+        let role_entries: Vec<RoleEntry> = note(&mut errors, at(src, &["roles"]))
+            .flatten()
+            .unwrap_or_else(|| vec![RoleEntry::Preset(RolePreset::All)]);
+        let roles = RoleSet::expand(&role_entries);
+
+        for param in required_params(&roles) {
+            match lookup(&tree, &param.key) {
                 Some(Value::String(s)) if !s.trim().is_empty() => {}
                 Some(Value::String(_)) | None | Some(Value::Null) => {
-                    errors.push(ConfigError::Missing((*path).to_owned()).to_string());
+                    let path = param.path();
+                    let e = match param.role {
+                        Some(role) => ConfigError::MissingForRole { path, role },
+                        None => ConfigError::Missing(path),
+                    };
+                    errors.push(e.to_string());
                 }
                 Some(_) => {
                     // Не строка: точное сообщение с позицией даст разбор строки.
-                    note(&mut errors, at::<String>(src, &key));
+                    note(&mut errors, at::<String>(src, &param.key));
                 }
             }
         }
@@ -332,13 +383,6 @@ impl SectionRegistry {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let profile: Profile = note(&mut errors, at(src, &["profile"]))
-            .flatten()
-            .unwrap_or_default();
-        let role_entries: Vec<RoleEntry> = note(&mut errors, at(src, &["roles"]))
-            .flatten()
-            .unwrap_or_else(|| vec![RoleEntry::Preset(RolePreset::All)]);
-        let roles = RoleSet::expand(&role_entries);
 
         let mut sections = BTreeMap::new();
         for (name, def) in &self.sections {
@@ -551,11 +595,34 @@ impl SectionRegistry {
             }),
         );
         let defs = generator.take_definitions(true);
+        // Узлу из пресета edge и ролей, не работающих в режиме edge со слоем данных, секции слоя данных не нужны.
+        let edge = RoleSet {
+            roles: BTreeSet::new(),
+            edge: true,
+        };
+        let without_data: Vec<&str> = std::iter::once(RolePreset::Edge.as_str())
+            .chain(
+                Role::ALL
+                    .iter()
+                    .filter(|r| !uses_data_layer(&edge, **r))
+                    .map(|r| r.as_str()),
+            )
+            .collect();
         json_schema!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "The Post config.yaml",
             "type": "object",
-            "required": ["database", "blob", "domain"],
+            "required": ["domain"],
+            "if": {
+                "required": ["roles"],
+                "properties": {
+                    "roles": {
+                        "items": { "enum": without_data },
+                        "contains": { "const": RolePreset::Edge.as_str() },
+                    },
+                },
+            },
+            "else": { "required": URL_SECTIONS },
             "properties": props,
             "additionalProperties": false,
             "$defs": defs,
@@ -1314,11 +1381,11 @@ mod tests {
     fn required_parameters() {
         assert_eq!(
             err("blob: { url: x }\ndomain: d"),
-            "database.url: required parameter is missing"
+            "database.url: required parameter is missing (needed by role smtp-in)"
         );
         assert_eq!(
             err("database: { url: x }\nblob: {}\ndomain: d"),
-            "blob.url: required parameter is missing"
+            "blob.url: required parameter is missing (needed by role smtp-in)"
         );
         assert_eq!(
             err("database: { url: x }\nblob: { url: y }\ndomain: ''"),
@@ -1327,7 +1394,50 @@ mod tests {
         // Все отсутствующие разом.
         assert_eq!(
             err(""),
-            "database.url: required parameter is missing\nblob.url: required parameter is missing\ndomain: required parameter is missing"
+            "database.url: required parameter is missing (needed by role smtp-in)\nblob.url: required parameter is missing (needed by role smtp-in)\ndomain: required parameter is missing"
+        );
+    }
+
+    /// Приёмка PLT-33: обязательные параметры по ролям — edge без слоя данных, mailbox и `all` — с ним.
+    #[test]
+    fn required_parameters_by_role() {
+        for roles in ["[edge]", "[edge, smtp-in]"] {
+            let cfg = strict(&format!("domain: d\nroles: {roles}\n")).expect(roles);
+            assert!(cfg.roles().edge, "{roles}");
+        }
+        assert_eq!(
+            err("roles: [edge]\n"),
+            "domain: required parameter is missing"
+        );
+        assert_eq!(
+            lines(strict("domain: d\nroles: [mailbox]\n").expect_err("mailbox")),
+            [
+                "database.url: required parameter is missing (needed by role smtp-in)",
+                "blob.url: required parameter is missing (needed by role smtp-in)",
+            ]
+        );
+        // Роль со слоем данных рядом с edge: нужны адреса, в сообщении — эта роль.
+        assert_eq!(
+            lines(strict("domain: d\nroles: [edge, admin]\n").expect_err("edge+admin")),
+            [
+                "database.url: required parameter is missing (needed by role admin)",
+                "blob.url: required parameter is missing (needed by role admin)",
+            ]
+        );
+        // smtp-in без edge (transport) работает со слоем данных.
+        assert_eq!(
+            lines(parse("domain: d\nroles: [smtp-in]\nblob: { url: y }\n").expect_err("smtp-in")),
+            ["database.url: required parameter is missing (needed by role smtp-in)"]
+        );
+        for roles in ["[all]", "[mailbox]", "[edge, transport]"] {
+            strict(&format!("{MINIMAL}roles: {roles}\n")).expect(roles);
+        }
+        assert_eq!(
+            required_params(&RoleSet::expand(&[RoleEntry::Preset(RolePreset::Edge)])),
+            [RequiredParam {
+                key: vec!["domain"],
+                role: None
+            }]
         );
     }
 
@@ -1596,7 +1706,12 @@ mod tests {
         }
         assert!(v["properties"]["modules"]["properties"]["archive"].is_object());
         assert_eq!(v["additionalProperties"], false);
-        assert_eq!(v["required"][0], "database");
+        assert_eq!(v["required"], serde_json::json!(["domain"]));
+        assert_eq!(v["else"]["required"], serde_json::json!(URL_SECTIONS));
+        assert_eq!(
+            v["if"]["properties"]["roles"]["items"]["enum"],
+            serde_json::json!(["edge", "smtp-in"])
+        );
         let json = r.schema_json();
         assert!(json.contains("\"$defs\""));
         assert!(json.contains("SmtpConfig"));

@@ -12,13 +12,15 @@
 //! `STATUS:TENTATIVE` — отдельным видом. Событие с `RRULE` или `RDATE` — [`ObjectIndex::recurring`], без индекса
 //! занятости: его повторы хранилище разворачивает при запросе (META-54, решение 59).
 
+use std::borrow::Cow;
+
 use calcard::common::timezone::Tz;
 use calcard::icalendar::dates::CalendarExpand;
 use calcard::icalendar::{
     ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarProperty, ICalendarStatus,
     ICalendarTransparency, ICalendarValue,
 };
-use calcard::vcard::{VCard, VCardProperty, VCardValue};
+use calcard::vcard::{VCard, VCardEntry, VCardProperty, VCardValue};
 use time::OffsetDateTime;
 use tp_contracts::dav::{CardSearch, CollectionKind, Component, ObjectIndex, Span};
 use tp_contracts::schedule::{BusyKind, BusyPeriod, MAX_BUSY_PERIODS, merge_busy};
@@ -76,16 +78,29 @@ pub fn card(body: &str) -> Result<ObjectIndex, IndexError> {
         .entries
         .iter()
         .filter(|e| searched.contains(&e.name))
-        .flat_map(|e| &e.values)
-        .flat_map(|value| match value {
-            VCardValue::Text(text) => std::slice::from_ref(text),
-            VCardValue::Component(parts) => parts.as_slice(),
-            _ => &[],
-        });
+        .flat_map(entry_parts);
     checked(ObjectIndex {
         search: CardSearch::new(strings),
         ..ObjectIndex::new(Component::Card, uid, None)
     })
+}
+
+/// Значения свойства vCard как текст — каждая часть составного значения (`N`, `ADR`) отдельно. Те же значения
+/// сравнивает `text-match` отчёта `addressbook-query` (и все части через `;`), поэтому подходящая фильтру карточка
+/// всегда — кандидат поиска по индексу.
+pub(crate) fn entry_parts(e: &VCardEntry) -> Vec<Cow<'_, str>> {
+    let mut parts: Vec<Cow<'_, str>> = Vec::new();
+    for v in &e.values {
+        match v {
+            VCardValue::Component(items) => {
+                parts.extend(items.iter().map(|s| Cow::Borrowed(s.as_str())));
+            }
+            VCardValue::Integer(i) => parts.push(Cow::Owned(i.to_string())),
+            VCardValue::Float(f) => parts.push(Cow::Owned(f.to_string())),
+            other => parts.extend(other.as_text().map(Cow::Borrowed)),
+        }
+    }
+    parts
 }
 
 /// Индекс iCalendar: один вид компонента и один UID на ресурс.

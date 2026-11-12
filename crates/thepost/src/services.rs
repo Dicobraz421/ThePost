@@ -606,6 +606,13 @@ impl Services {
             trash: Arc::new(self.meta.clone()),
             store: self.store.clone(),
             app_passwords: self.app_passwords.clone(),
+            // Соответствие Exchange (ADM-10): адресная книга, списки отправителей, аудит ящиков, остановка синхронизации.
+            contacts: Arc::new(self.meta.clone()),
+            org: Arc::new(self.meta.clone()),
+            dynamic: Arc::new(self.meta.clone()),
+            senders: Arc::new(self.meta.clone()),
+            mailbox_audit: Arc::new(self.meta.clone()),
+            sync: Arc::new(self.meta.clone()),
         };
         let limits = self.sieve_limits;
         let check = move |text: &str| match tp_sieve::compile(text.as_bytes(), &limits) {

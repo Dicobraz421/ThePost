@@ -11,7 +11,7 @@
 //!   (`…/accounts/{account}/audit-policy`, чтение — действующая), выборка журнала (`/api/v1/orgs/{org}/mailbox-audit`;
 //!   доступна аудитору, недоступна оператору).
 //!
-//! Хранилища списков, аудита и остановки — [`crate::server::ParityStores`] (не подключены — 503).
+//! Хранилища списков, аудита и остановки — поля [`crate::Deps`] `senders`, `mailbox_audit`, `sync`.
 
 use std::sync::Arc;
 
@@ -31,7 +31,6 @@ use tp_contracts::{AccountId, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::accounts::{AccountInfo, account, account_info};
-use crate::directory::stores;
 use crate::server::{Admin, ApiResult, Problem};
 
 /// Маршрут выборки журнала аудита ящиков (доступен аудитору).
@@ -337,12 +336,12 @@ async fn scope(a: &Admin, org: TenantId, id: AccountId) -> ApiResult<AccountScop
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/accounts/{account}/senders", tag = "mailboxes",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("account" = String, Path, description = "Учётная запись (UUID)")),
-    responses((status = 200, body = SenderListBody), (status = 404, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 200, body = SenderListBody), (status = 404, body = Problem)))]
 async fn get_senders(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, AccountId)>,
 ) -> ApiResult<Json<SenderListBody>> {
-    let s = stores(&a)?;
+    let s = &a.d;
     let scope = scope(&a, org, id).await?;
     Ok(Json(s.senders.sender_list(scope).await?.into()))
 }
@@ -352,14 +351,13 @@ async fn get_senders(
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("account" = String, Path, description = "Учётная запись (UUID)")),
     request_body = SenderListBody,
-    responses((status = 200, body = SenderListBody), (status = 400, body = Problem), (status = 404, body = Problem),
-        (status = 503, body = Problem)))]
+    responses((status = 200, body = SenderListBody), (status = 400, body = Problem), (status = 404, body = Problem)))]
 async fn put_senders(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, AccountId)>,
     Json(body): Json<SenderListBody>,
 ) -> ApiResult<Json<SenderListBody>> {
-    let s = stores(&a)?;
+    let s = &a.d;
     let scope = scope(&a, org, id).await?;
     let list = SenderList {
         safe: body.safe,
@@ -418,41 +416,40 @@ async fn attach_disabled(
 /// Остановленная синхронизация каталога; нет остановки — 404.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/sync-hold", tag = "mailboxes",
     params(("org" = String, Path, description = "Организация (UUID)")),
-    responses((status = 200, body = SyncHold), (status = 404, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 200, body = SyncHold), (status = 404, body = Problem)))]
 async fn get_sync_hold(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
 ) -> ApiResult<Json<SyncHold>> {
-    let hold = stores(&a)?
-        .sync
-        .pending_sync(org)
-        .await?
-        .ok_or(tp_contracts::Error::NotFound)?;
+    let hold =
+        a.d.sync
+            .pending_sync(org)
+            .await?
+            .ok_or(tp_contracts::Error::NotFound)?;
     Ok(Json(hold.into()))
 }
 
 /// Подтверждает отключение учётных записей сверх порога: следующая синхронизация его выполнит.
 #[utoipa::path(post, path = "/api/v1/orgs/{org}/sync-hold/approve", tag = "mailboxes",
     params(("org" = String, Path, description = "Организация (UUID)")),
-    responses((status = 200, body = SyncHold), (status = 404, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 200, body = SyncHold), (status = 404, body = Problem)))]
 async fn approve_sync(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
 ) -> ApiResult<Json<SyncHold>> {
-    Ok(Json(stores(&a)?.sync.approve_sync(org).await?.into()))
+    Ok(Json(a.d.sync.approve_sync(org).await?.into()))
 }
 
 /// Выборка журнала аудита доступа к ящикам организации.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/mailbox-audit", tag = "audit",
     params(("org" = String, Path, description = "Организация (UUID)"), MailboxAuditQuery),
-    responses((status = 200, body = MailboxAuditPage), (status = 400, body = Problem),
-        (status = 503, body = Problem)))]
+    responses((status = 200, body = MailboxAuditPage), (status = 400, body = Problem)))]
 async fn search_audit(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
     Query(q): Query<MailboxAuditQuery>,
 ) -> ApiResult<Json<MailboxAuditPage>> {
-    let s = stores(&a)?;
+    let s = &a.d;
     let query = AuditQuery {
         account: q.account,
         actor: q.actor,
@@ -479,7 +476,7 @@ async fn search_audit(
 #[utoipa::path(put, path = "/api/v1/orgs/{org}/mailbox-audit/policy", tag = "audit",
     params(("org" = String, Path, description = "Организация (UUID)")),
     request_body = AuditPolicyBody,
-    responses((status = 200, body = AuditPolicyBody), (status = 400, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 200, body = AuditPolicyBody), (status = 400, body = Problem)))]
 async fn put_org_audit_policy(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
@@ -487,8 +484,7 @@ async fn put_org_audit_policy(
 ) -> ApiResult<Json<AuditPolicyBody>> {
     let p = AuditPolicy::from(body);
     p.validate()?;
-    stores(&a)?
-        .mailbox_audit
+    a.d.mailbox_audit
         .set_audit_policy(org, None, Some(p.clone()))
         .await?;
     Ok(Json(p.into()))
@@ -497,15 +493,12 @@ async fn put_org_audit_policy(
 /// Сбрасывает политику аудита организации: действует политика по умолчанию (только действия не владельца).
 #[utoipa::path(delete, path = "/api/v1/orgs/{org}/mailbox-audit/policy", tag = "audit",
     params(("org" = String, Path, description = "Организация (UUID)")),
-    responses((status = 204), (status = 503, body = Problem)))]
+    responses((status = 204)))]
 async fn delete_org_audit_policy(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
 ) -> ApiResult<StatusCode> {
-    stores(&a)?
-        .mailbox_audit
-        .set_audit_policy(org, None, None)
-        .await?;
+    a.d.mailbox_audit.set_audit_policy(org, None, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -513,12 +506,12 @@ async fn delete_org_audit_policy(
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/accounts/{account}/audit-policy", tag = "audit",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("account" = String, Path, description = "Учётная запись (UUID)")),
-    responses((status = 200, body = AuditPolicyBody), (status = 404, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 200, body = AuditPolicyBody), (status = 404, body = Problem)))]
 async fn get_audit_policy(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, AccountId)>,
 ) -> ApiResult<Json<AuditPolicyBody>> {
-    let s = stores(&a)?;
+    let s = &a.d;
     let scope = scope(&a, org, id).await?;
     Ok(Json(s.mailbox_audit.audit_policy(scope).await?.into()))
 }
@@ -528,14 +521,13 @@ async fn get_audit_policy(
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("account" = String, Path, description = "Учётная запись (UUID)")),
     request_body = AuditPolicyBody,
-    responses((status = 200, body = AuditPolicyBody), (status = 400, body = Problem), (status = 404, body = Problem),
-        (status = 503, body = Problem)))]
+    responses((status = 200, body = AuditPolicyBody), (status = 400, body = Problem), (status = 404, body = Problem)))]
 async fn put_audit_policy(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, AccountId)>,
     Json(body): Json<AuditPolicyBody>,
 ) -> ApiResult<Json<AuditPolicyBody>> {
-    let s = stores(&a)?;
+    let s = &a.d;
     scope(&a, org, id).await?;
     let p = AuditPolicy::from(body);
     p.validate()?;
@@ -549,12 +541,12 @@ async fn put_audit_policy(
 #[utoipa::path(delete, path = "/api/v1/orgs/{org}/accounts/{account}/audit-policy", tag = "audit",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("account" = String, Path, description = "Учётная запись (UUID)")),
-    responses((status = 204), (status = 404, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 204), (status = 404, body = Problem)))]
 async fn delete_audit_policy(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, AccountId)>,
 ) -> ApiResult<StatusCode> {
-    let s = stores(&a)?;
+    let s = &a.d;
     scope(&a, org, id).await?;
     s.mailbox_audit
         .set_audit_policy(org, Some(id), None)

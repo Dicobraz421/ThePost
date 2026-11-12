@@ -107,7 +107,8 @@ cargo nextest run -p <крейты> --no-tests=pass
 
 ## Эталон SMB в контейнерах (профиль smb)
 `thepost` (`roles: [all]`, локальный BLOB, шина в процессе) + PostgreSQL (TLS, `sslmode=verify-full`, CA из тома `tls`)
-+ OpenBao (TLS, Raft, автоматическое распечатывание) + Rspamd; конфигурация — `compose/thepost-smb.yaml`.
++ OpenBao (TLS, Raft, автоматическое распечатывание) + Rspamd; конфигурация — пресет `config/all.yaml` и значения
+установки в переменных `THEPOST_*` (`compose/dev.yml`, служба `thepost`; см. «Одна конфигурация SMB»).
 `thepost` подключается к PostgreSQL ролью `thepost` (член `thepost_app`, не владелец схемы), миграции — от владельца
 схемы `thepost_owner` (`database.owner`); пароли берёт из OpenBao (`thepost/db`, `thepost/db-owner`), в OpenBao входит
 по AppRole (том `openbao-approle` → `/etc/thepost/openbao`). Контейнер — nonroot 65532, `cap_drop: [ALL]`,
@@ -139,14 +140,36 @@ curl --cacert $CA -si https://localhost/.well-known/jmap | head -1              
 Письмо между двумя пользователями: учётные записи `a@example.test`, `b@example.test` (способ — issue #193), отправка
 через 587 с AUTH, получение через IMAP или JMAP — шаги в `docs/manual-tests/CMP-01.md` (после CMP-04, CMP-05).
 
+## Одна конфигурация SMB (решение 105)
+Конфигурация эталона SMB — только пресет `deploy/config/all.yaml`: роли, хранилище, сертификат, слушатели, секреты.
+Compose и Ansible его не копируют, а подставляют значения своей установки — секции у них одинаковые:
+
+| Параметр | Пресет | Compose (`THEPOST_*`) | Ansible (инвентарь) |
+|---|---|---|---|
+| `domain` | `example.ru` | `example.test` | `thepost_domain` |
+| `database.url` | `localhost`, CA `/etc/thepost/pki` | `postgres-tls`, CA тома `tls` | `thepost_db_url` (+ `thepost_db_urls`) |
+| `database.owner.user` | `thepost_owner` | — | `thepost_db_owner_role` |
+| `smtp.hostname` | `mail.example.ru` | `mail.example.test` | `thepost_hostname` |
+| `smtp.milter` | — | — | `thepost_rspamd_milter_address`, `thepost_clamav` |
+| `http.admin.listen` | `127.0.0.1:8443` | — | `thepost_admin_listen` |
+| `secrets.url`, `secrets.tls.ca_file` | `localhost:8200`, `/etc/thepost/pki` | `openbao-tls:8200`, том `tls` | `thepost_secrets_url`, `thepost_internal_ca_file` |
+| `secrets.auth.approle` | `role_id` — `/etc/thepost/openbao`, `secret_id` — учётные данные systemd | `secret_id` — том `openbao-approle` | `thepost_secrets_role_id_file` |
+| `tls`, `acme` | цепочка `/etc/thepost/tls`, ключ — секрет `thepost/tls#key` | том `tls` | `thepost_tls_mode` |
+| `blob.gc.window` | по умолчанию | — | `thepost_blob_gc_window` |
+| `maintenance`, `dav`, `http.dav` | период очистки, лимиты DAV | — | `thepost_maintenance`, `thepost_dav`, `thepost_dav_listen` |
+
+Остальное (слушатели 25, 465, 587, 143, 993, 443, ManageSieve 4190, роли, BLOB) — из пресета без изменений; новый параметр эталона
+добавляется в пресет, а не в compose или шаблон роли. Проверка пресета — `thepost config check --config
+deploy/config/all.yaml`.
+
 ## Эталон SMB одной командой (Ansible)
 Чистая ВМ → PostgreSQL 16 (PGDG), OpenBao, Rspamd (clamav-milter — `thepost_clamav: true`) и `thepost` (все роли) под
 systemd (SRS 1.2, 5.6). ОС (решения 2026-11-11 №28, 51, 52; семейство — по менеджеру пакетов):
 - apt — Debian 13 (основа) и 12, Ubuntu 26.04 и 24.04, Astra Linux SE 1.8 (наборы PGDG и Rspamd — `bookworm`);
-- dnf — AlmaLinux 10 и 9 (совместимость с RHEL 9 и 10): PGDG yum, Rspamd `rspamd.com/rpm-stable`, restic и certbot —
+- dnf — AlmaLinux 10 и 9 (совместимость с RHEL 9 и 10): PGDG yum, Rspamd `rspamd.com/rpm-stable`, restic —
   EPEL (на самом RHEL EPEL подключает администратор); РЕД ОС 8 — PostgreSQL, Rspamd, pgBackRest и restic из
   репозиториев дистрибутива, ClamAV в них нет. Включённый firewalld — роль `thepost` открывает порты клиентских
-  протоколов (certbot — и 80); SELinux — контексты каталогов pgBackRest (роль `pgbackrest`, `tasks/selinux.yml`).
+  протоколов (ACME — и 80); SELinux — контексты каталогов pgBackRest (роль `pgbackrest`, `tasks/selinux.yml`).
 ```bash
 cargo build --release                                   # или thepost_binary_url + thepost_binary_checksum
 ansible-galaxy collection install -r deploy/ansible/requirements.yml
@@ -157,17 +180,18 @@ ansible-playbook -i inventory.yml deploy/ansible/smb.yml
 loopback) → OpenBao (`https://localhost:8200`, пароли `thepost/db`, `thepost/db-owner`, `thepost/db-readonly`, AppRole)
 → PostgreSQL (`hostssl` только для учётных записей The Post, без SUPERUSER и BYPASSRLS; `postgres` запускается
 юнитом напрямую, без `pg_ctlcluster` на Perl) → Rspamd (Milter `127.0.0.1:11332`) → clamav-milter (`127.0.0.1:7357`) →
-`thepost` (sysusers, юнит и сокеты, `config.yaml` из шаблона с проверкой `thepost config check`, ожидание
-`/healthz/ready`). Порты ниже 1024 — `thepost_socket_activation`: `true` — сокеты systemd, у процесса нет capabilities;
-`false` (по умолчанию, пока узел не принимает сокеты systemd — TODO(PLT-16)) — `CAP_NET_BIND_SERVICE`.
+`thepost` (sysusers, юнит и сокеты, `config.yaml` — пресет `deploy/config/all.yaml` со значениями инвентаря, с
+проверкой `thepost config check`, ожидание
+`/healthz/ready`). Порты ниже 1024 — только сокеты systemd (`thepost-*.socket`, решение 102), у процесса нет
+capabilities.
 Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
-Сертификат клиентских протоколов — `thepost_tls_mode`: `certbot` (Let's Encrypt HTTP-01, по умолчанию; порт 80
-открыт, DNS указывает на ВМ), `acme` (встроенный клиент thepost, секция `acme`), `internal` (внутренний CA — стенд),
-`files` (свои PEM). Ключ TLS — только в OpenBao (решение 100): секрет `thepost/tls#key`, в `config.yaml` —
-`tls.key: { secret: "thepost/tls#key" }`, на диске ВМ файла ключа нет (прежние `privkey.pem` роль удаляет); цепочка —
-файл `tls.cert_file`. Ключ записывает роль (`internal` — выпускает его в памяти, `files` — с управляющей машины,
-`certbot` — после выпуска и в deploy-hook продления через AppRole узла), при `acme` — сам узел (политика `thepost`
-разрешает ему запись только этого пути). Новая версия секрета узел подхватывает без перезапуска.
+Сертификат клиентских протоколов (решение 101) — `thepost_tls_mode`: `acme` (по умолчанию для публичного имени:
+встроенный клиент thepost, секция `acme`, Let's Encrypt HTTP-01 на порту 80 через `thepost-http.socket`; DNS указывает
+на ВМ), `internal` (внутренний CA — стенд), `files` (свои PEM). Ключ TLS — только в OpenBao (решение 100): секрет
+`thepost/tls#key`, в `config.yaml` (из пресета) — `tls.key: { secret: "thepost/tls#key" }`, на диске ВМ файла ключа
+нет (прежние `privkey.pem` роль удаляет); цепочка — файл `tls.cert_file`. Ключ записывает роль (`internal` — выпускает
+его в памяти, `files` — с управляющей машины), при `acme` — сам узел (политика `thepost` разрешает ему запись только
+этого пути). Новая версия секрета узел подхватывает без перезапуска.
 Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
 Повторный прогон ничего не меняет. Ключи восстановления и root-токен OpenBao — `/root/openbao-init.json` (см. ниже).
 
@@ -206,7 +230,7 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 путям, на перенесённом каталоге копий — `chown -R postgres:postgres /var/lib/pgbackrest` (uid `postgres` на новой ВМ
 может быть другим); в новом OpenBao — только `thepost-backup/restic#password` (и `s3`). Ключ TLS `thepost/tls` в
 снимке — прежний: после `restore.yml` — повторный `smb.yml` (`internal` перевыпускает сертификат к ключу из снимка,
-`files` и `certbot` записывают свой ключ новой версией).
+`files` записывает свой ключ новой версией, `acme` — выпускает новый сам).
 
 Восстановление — `deploy/ansible/restore.yml` (`roles/pgbackrest/tasks/restore.yml`): роль `openbao` (токен
 администратора, пароли СУБД) → остановка таймеров и `thepost` → `pgbackrest restore --delta --type=time
@@ -220,25 +244,23 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 ```bash
 sudo install -m 0755 target/release/thepost /usr/local/bin/thepost
 sudo install -m 0644 deploy/systemd/thepost.sysusers.conf /usr/lib/sysusers.d/thepost.conf && sudo systemd-sysusers
-sudo install -D -m 0640 -o root -g thepost deploy/config/all.yaml /etc/thepost/config.yaml   # задать domain, database.url
+sudo install -D -m 0640 -o root -g thepost deploy/config/all.yaml /etc/thepost/config.yaml   # domain, smtp.hostname, адреса
 sudo install -m 0644 deploy/systemd/thepost.service deploy/systemd/thepost-*.socket /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/thepost.service /etc/systemd/system/thepost-*.socket
-# Порты клиентских протоколов — сокеты systemd (у процесса нет capabilities):
+# Порты клиентских протоколов — только сокеты systemd (у процесса нет capabilities, решение 102):
 sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submissions,submission,imap,imaps,https,managesieve}.socket
-# …или без активации сокетов — CAP_NET_BIND_SERVICE (сокеты не включать):
-#   sudo install -D -m 0644 deploy/systemd/thepost.service.d/bind-capability.conf \
-#     /etc/systemd/system/thepost.service.d/bind-capability.conf && sudo systemctl daemon-reload
 # systemd < 254 (`systemctl --version`; Debian 12, AlmaLinux 9, РЕД ОС 8) — постоянная пауза перезапуска 30 с:
 #   sudo install -D -m 0644 deploy/systemd/thepost.service.d/restart-legacy.conf \
 #     /etc/systemd/system/thepost.service.d/restart-legacy.conf && sudo systemctl daemon-reload
 sudo systemctl enable --now thepost
-systemd-analyze security thepost.service   # не хуже 2.0 (с сокетами — 1.2, с bind-capability.conf — 1.6)
+systemd-analyze security thepost.service   # не хуже 2.0 (ожидается 1.2)
 ```
 Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443,
-`managesieve` 4190.
+`managesieve` 4190; `http` 80 — только проверки встроенного ACME (`acme.enabled`; `systemctl enable --now
+thepost-http.socket`).
 Узел берёт сокет systemd по адресу слушателя (`0.0.0.0:<порт>` или `[::]:<порт>` совпадает с `ListenStream=<порт>`),
-иначе открывает свой; перезапуск `thepost` не закрывает сокеты. Пока узел не принимает сокеты systemd (TODO(PLT-16)
-в `crates/thepost/src/protocols.rs`), рабочий вариант — `bind-capability.conf`.
+иначе открывает свой (порт ниже 1024 без сокета не откроется — capabilities у процесса нет); перезапуск `thepost` не
+закрывает сокеты: соединения ждут в очереди.
 Hardening юнита: пустой `CapabilityBoundingSet=`, `NoNewPrivileges`, `PrivateUsers`, `ProtectSystem=strict`,
 `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`,
 `SystemCallFilter=@system-service` без привилегированных вызовов (свои профили seccomp и Landlock процесс

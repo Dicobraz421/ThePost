@@ -10,6 +10,8 @@
 //!   `-ERR [IN-USE]` (RFC 2449, 8.1.1), сессия остаётся в состоянии AUTHORIZATION. Блокировка снимается с концом
 //!   сессии (`QUIT`, обрыв, таймаут). Между узлами блокировки нет (лизы ящика в контрактах нет). Параллельные
 //!   сессии IMAP и JMAP допустимы: письмо, удалённое другой сессией, — `-ERR` на `RETR`.
+//! - Вход учётной записи запрещён (сигнал `AccountDisabled`, IMAP-22): сессия отвечает `-ERR [SYS/PERM] Account
+//!   disabled` и закрывает соединение без `UPDATE` — помеченные `DELE` письма не удаляются.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -21,6 +23,7 @@ use base64::engine::general_purpose::STANDARD;
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tp_contracts::audit::AuditAction;
 use tp_contracts::auth::{Credentials, Principal};
 use tp_contracts::meta::{AccountScope, MessageQuery, SpecialUse};
@@ -29,7 +32,11 @@ use tp_contracts::{Error, MailboxId, MessageId, Result};
 use tp_platform::{Conn, Listener};
 
 use crate::audit::Audit;
+use crate::disable::{Registration, Sessions};
 use crate::session::{SessionCtx, Transport, io_error};
+
+/// Ответ сессии, вход учётной записи которой запрещён.
+const DISABLED: &str = "[SYS/PERM] Account disabled";
 
 /// Письмо ящика POP3.
 #[derive(Debug, Clone)]
@@ -142,6 +149,9 @@ pub struct Pop3Session<T: Transport> {
     user: Option<String>,
     drop: Option<Maildrop>,
     audit: Audit,
+    /// Открытые сессии сервера: регистрация после входа (закрытие по `AccountDisabled`).
+    sessions: Option<Sessions>,
+    registration: Option<Registration>,
     errors: u32,
     auth_failures: u32,
     close: bool,
@@ -187,10 +197,18 @@ impl<T: Transport> Pop3Session<T> {
             user: None,
             drop: None,
             audit,
+            sessions: None,
+            registration: None,
             errors: 0,
             auth_failures: 0,
             close: false,
         }
+    }
+
+    /// Регистрирует сессию после входа в открытых сессиях сервера: `AccountDisabled` её закрывает.
+    pub(crate) fn with_sessions(mut self, sessions: Sessions) -> Self {
+        self.sessions = Some(sessions);
+        self
     }
 
     /// Ведёт сессию до `QUIT`, закрытия клиентом, таймаута или остановки узла.
@@ -256,6 +274,14 @@ impl<T: Transport> Pop3Session<T> {
             cfg.login_timeout
         };
         let mut chunk = vec![0u8; 4096];
+        let disabled = self
+            .registration
+            .as_ref()
+            .map_or_else(CancellationToken::new, |r| r.token().clone());
+        if disabled.is_cancelled() {
+            self.reply(false, DISABLED);
+            return self.end().await;
+        }
         loop {
             match split_line(&mut self.buf, max) {
                 Ok(Some(line)) => return Ok(Some(line)),
@@ -273,21 +299,22 @@ impl<T: Transport> Pop3Session<T> {
             let io = conn.io();
             let read = tokio::select! {
                 biased;
-                _ = shutdown.cancelled() => None,
-                r = tokio::time::timeout(timeout, io.read(&mut chunk)) => Some(r),
+                _ = shutdown.cancelled() => Err("[SYS/TEMP] Server shutting down"),
+                _ = disabled.cancelled() => Err(DISABLED),
+                r = tokio::time::timeout(timeout, io.read(&mut chunk)) => Ok(r),
             };
             match read {
-                None => {
-                    self.reply(false, "[SYS/TEMP] Server shutting down");
+                Err(text) => {
+                    self.reply(false, text);
                     return self.end().await;
                 }
-                Some(Err(_)) => {
+                Ok(Err(_)) => {
                     self.reply(false, "Autologout: idle for too long");
                     return self.end().await;
                 }
-                Some(Ok(Ok(0))) => return Ok(None),
-                Some(Ok(Ok(n))) => self.buf.extend_from_slice(&chunk[..n]),
-                Some(Ok(Err(e))) => return Err(io_error(e)),
+                Ok(Ok(Ok(0))) => return Ok(None),
+                Ok(Ok(Ok(n))) => self.buf.extend_from_slice(&chunk[..n]),
+                Ok(Ok(Err(e))) => return Err(io_error(e)),
             }
         }
     }
@@ -559,6 +586,7 @@ impl<T: Transport> Pop3Session<T> {
             })
             .collect();
         let n = items.len();
+        self.registration = self.sessions.as_ref().map(|s| s.register(scope));
         self.drop = Some(Maildrop {
             scope,
             principal: p,
@@ -748,6 +776,7 @@ impl<T: Transport> Pop3Session<T> {
 #[derive(Clone)]
 pub struct Pop3Server {
     ctx: Arc<SessionCtx>,
+    sessions: Sessions,
 }
 
 impl fmt::Debug for Pop3Server {
@@ -759,17 +788,27 @@ impl fmt::Debug for Pop3Server {
 impl Pop3Server {
     /// Сервер с контекстом сессий (секция `imap.pop3`).
     pub fn new(ctx: SessionCtx) -> Self {
-        Self { ctx: Arc::new(ctx) }
+        Self {
+            ctx: Arc::new(ctx),
+            sessions: Sessions::default(),
+        }
     }
 
     /// Принимает соединения до остановки узла (POP3 выключен — сразу возвращает `Ok`), затем ждёт сессии
-    /// не дольше `imap.timeouts.drain` и прерывает оставшиеся.
+    /// не дольше `imap.timeouts.drain` и прерывает оставшиеся. Сигнал `AccountDisabled` закрывает сессии учётной
+    /// записи.
     pub async fn serve(&self, listener: Listener) -> Result<()> {
         if !self.ctx.config.pop3.enabled {
             return Ok(());
         }
         let mut sessions = JoinSet::new();
         let shutdown = self.ctx.shutdown.clone();
+        self.sessions.start(
+            self.ctx.deps.bus.clone(),
+            None,
+            self.ctx.config.timeouts.resubscribe,
+            shutdown.clone(),
+        );
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -784,6 +823,7 @@ impl Pop3Server {
                     };
                     let full = sessions.len() >= self.ctx.config.pop3.max_connections;
                     let ctx = self.ctx.clone();
+                    let open = self.sessions.clone();
                     let task = async move {
                         let conn = match incoming.establish().await {
                             Ok(conn) => conn,
@@ -796,7 +836,7 @@ impl Pop3Server {
                             reject(conn).await;
                             return;
                         }
-                        let session = Pop3Session::new(ctx, conn);
+                        let session = Pop3Session::new(ctx, conn).with_sessions(open);
                         if let Err(e) = session.run().await {
                             tracing::debug!(error = %e, "pop3: сессия прервана");
                         }

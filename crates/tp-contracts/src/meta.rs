@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::bus::{Event, EventKind};
 use crate::error::{Error, Result};
 use crate::ids::{
     AccountId, BlobKey, DomainId, MailboxId, MessageId, ModSeq, TenantId, Uid, UidValidity,
@@ -192,11 +193,40 @@ pub fn account_aliases<'a>(
     out
 }
 
+/// Сигнал «вход учётной записи запрещён» (системный, `account = None`, [`EventKind::AccountDisabled`]; CTR-64).
+/// Публикует реализация [`AccountStore`] после фиксации `enabled = false` (`upsert` разрешённой ранее записи) и
+/// [`AccountStore::disable_account`]; протоколы с долгими сеансами (IMAP, JMAP) закрывают сеансы учётной записи.
+pub fn account_disabled(scope: AccountScope) -> Event {
+    Event {
+        tenant: scope.tenant,
+        account: None,
+        kind: EventKind::AccountDisabled {
+            account: scope.account,
+        },
+    }
+}
+
 /// Учётные записи организации.
 #[async_trait]
 pub trait AccountStore: Send + Sync + 'static {
     /// Учётная запись по идентификатору.
     async fn get(&self, tenant: TenantId, id: AccountId) -> Result<Option<Account>>;
+
+    /// Учётные записи по списку идентификаторов (CTR-63; имена участников группы, Admin API): в порядке `ids`,
+    /// не найденные (и чужой организации) пропускаются, повтор идентификатора — одна запись (первое вхождение).
+    /// По умолчанию — [`AccountStore::get`] по одному; реализация одним запросом — `tp-meta` (META-66).
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if seen.insert(id)
+                && let Some(a) = self.get(tenant, id).await?
+            {
+                out.push(a);
+            }
+        }
+        Ok(out)
+    }
 
     /// Учётная запись по имени входа (без учёта регистра).
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>>;
@@ -259,21 +289,11 @@ pub trait AccountStore: Send + Sync + 'static {
     }
 
     /// Восстанавливает отключённый ящик ([`AccountState::Active`]; действующий — без изменений). Нет учётной записи —
-    /// `Error::NotFound`. По умолчанию — `Error::Internal`.
-    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
-        let _ = (tenant, id);
-        Err(Error::internal(
-            "AccountStore::restore_account не реализован",
-        ))
-    }
+    /// `Error::NotFound`.
+    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()>;
 
-    /// Отключённые ящики организации по (`until`, `id`) — список Admin API. По умолчанию — `Error::Internal`.
-    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
-        let _ = tenant;
-        Err(Error::internal(
-            "AccountStore::disabled_accounts не реализован",
-        ))
-    }
+    /// Отключённые ящики организации по (`until`, `id`) — список Admin API.
+    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>>;
 
     /// Отключённые ящики всех организаций со сроком хранения не позже `now`, по (`until`, `id`), не более `limit` —
     /// окончательное удаление (роль maintenance). По умолчанию — `Error::Internal`.
@@ -295,19 +315,14 @@ pub trait AccountStore: Send + Sync + 'static {
     /// операции (ссылки на объекты BLOB организации не меняются), долгую операцию над большим ящиком Admin API ведёт
     /// фоновой задачей (ADM-10). Без режима (`None`) ящик `to` должен быть пуст, иначе — `Error::Invalid` с подсказкой
     /// выбрать режим. `disabled` действует — `Error::Invalid`; `to` отключена — `Error::Conflict`; нет любой из
-    /// записей — `Error::NotFound`. По умолчанию — `Error::Internal`.
+    /// записей — `Error::NotFound`.
     async fn attach_account(
         &self,
         tenant: TenantId,
         disabled: AccountId,
         to: AccountId,
         existing: Option<ExistingContent>,
-    ) -> Result<Account> {
-        let _ = (tenant, disabled, to, existing);
-        Err(Error::internal(
-            "AccountStore::attach_account не реализован",
-        ))
-    }
+    ) -> Result<Account>;
 
     /// Окончательно удаляет отключённый ящик (учётную запись и папки) после удаления писем вызывающим (`MailStore`,
     /// освобождение ссылок BLOB). Действующий — `Error::Invalid`; остались письма — `Error::Conflict`; нет —

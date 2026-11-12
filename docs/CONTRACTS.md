@@ -111,6 +111,10 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   `remove_disabled` — после удаления писем вызывающим (действующий —
   `Invalid`, остались письма — `Conflict`). Методы, кроме `account_state`, по умолчанию — `Internal`. In-memory — `MemMetadata`; набор
   `suite::account_state`. PostgreSQL — META-33.
+  CTR-63: `by_ids(tenant, &[AccountId]) -> Vec<Account>` — в порядке запроса, не найденные и чужой организации пропускаются, повтор —
+  одна запись (первое вхождение); по умолчанию — `get` по одному, одним запросом — META-66; набор `suite::account_by_ids`.
+  CTR-64: после фиксации `enabled = false` (`upsert` разрешённой ранее записи) и `disable_account` реализация публикует
+  `account_disabled(scope)` — системный сигнал `AccountDisabled { account }` (раздел EventBus; `tp-meta` — META-67).
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
   `delete` папки с вложенными без `cascade` — `Conflict`: решение («удалить вместе с вложенными?») принимает пользователь
   в клиенте, клиент повторяет вызов с `cascade = true`; письма всего поддерева — в корзину.
@@ -161,7 +165,7 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
 LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } |
-ShardsChanged | DavChanged { kind, collection, modseq } | ScheduleInboxChanged { modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+ShardsChanged | AccountDisabled { account } | DavChanged { kind, collection, modseq } | ScheduleInboxChanged { modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
 `MailboxListChanged`, `DavChanged`, `ScheduleInboxChanged`, `SieveChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
 `MembersChanged`, `ShardsChanged` — с `TenantId::DEFAULT`, `Blocked`, `Unblocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
@@ -170,6 +174,8 @@ ShardsChanged | DavChanged { kind, collection, modseq } | ScheduleInboxChanged {
 вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`, `DavChanged` и `ScheduleInboxChanged` — `DavStore`, `SieveChanged` — `SieveStore`,
 `ShardsChanged` (CTR-49, решение 47) — тот, кто меняет справочник шардов (модуль «Шардирование», администрирование): добавлен или выведен
 шард, изменились адрес или реплика, учётная запись перенесена; узлы сбрасывают кэш справочника (`tp_meta::shards::ShardDirectory::follow`).
+`AccountDisabled` (CTR-64) — `AccountStore` после запрета входа (`enabled = false`, `disable_account`), с организацией учётной записи;
+протоколы с долгими сеансами (IMAP-22, JMAP-41) закрывают сеансы учётной записи.
 Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
@@ -308,7 +314,7 @@ CTR-35: `DirAccount::org: DirOrg { department (external_id подразделе�
 Порог массового удаления: `exceeds_removal_threshold(removed, total, percent)`, `MASS_REMOVAL_PERCENT` = 5; `SyncGate` — остановка
 синхронизации до подтверждения: `hold_sync(tenant, removed, total, at) -> MassRemoval { removed, total, detected_at, approved }` (подтверждение
 сохраняется, если `removed` не выросло), `pending_sync`, `approve_sync` (нет — `NotFound`; Admin API), `clear_sync` (синхронизация после
-отключения). In-memory — `MemSyncGate`; набор `suite::sync_gate`.
+отключения). PostgreSQL — `PgMeta` (`sync_holds`), in-memory — `MemSyncGate`; набор `suite::sync_gate`.
 CTR-58 (решение 79): `DirAccount::hidden_from_gal: bool` (`#[serde(default)]`, как у групп и почтовых контактов) — запись не попадает
 в адресную книгу (GAL), вход и приём почты не меняются. Заполняет каталог (LDAP — AUTH-16), учитывает построение GAL (DAV-27).
 
@@ -986,6 +992,15 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   организации (`SharingPolicy`, `SharingPolicyStore`). Вид учётной записи — поле `Account::kind` и `AccountUpsert::kind`
   (`meta::AccountKind`), хранится с учётной записью (`tp-meta` — миграция 0031 `accounts.kind`, `tp-testkit`); несовместимо: новые
   обязательные поля `Account` и `AccountUpsert`. Реализации новых хранилищ в памяти и наборы — отдельной волной `tp-testkit`.
+- 2026-11-12 — CTR-63, CTR-64 (волна contracts-44): `AccountStore::by_ids(tenant, &[AccountId])` — учётные записи по списку (порядок
+  запроса, не найденные пропускаются, повтор — одна запись; по умолчанию — `get` по одному, PostgreSQL одним запросом — META-66),
+  набор `suite::account_by_ids`; `EventKind::AccountDisabled { account }` — системный сигнал запрета входа и `meta::account_disabled`,
+  набор `suite::signals`. По сравнению с карточками: повторы в `by_ids` схлопываются; сигнал — и при `disable_account` (вход запрещён
+  и там). Публикация в `tp-meta` — META-67, подписчики — IMAP-22, JMAP-41.
+- 2026-11-12 — x/admin-parity (правило владельца 12.11 «старое рядом с новым не оставлять»): у `AccountStore::restore_account`,
+  `disabled_accounts`, `attach_account` нет тел по умолчанию (были `Internal`) — реализации `PgMeta`, `MemMetadata`. `SyncGate` на
+  PostgreSQL — `PgMeta` (миграция 0032 `sync_holds`), набор `suite::sync_gate`. `tp_admin::Deps` — хранилища CTR-35 обязательны
+  (`contacts`, `org`, `dynamic`, `senders`, `mailbox_audit`, `sync`) вместо `Admin::with_parity`.
 - 2026-11-12 — CTR-81 (волна contracts-53, решение 114): `AuditAction::Search` — поиск по тексту писем в чужом ящике; строка запроса —
   в `AuditObject::detail`, без найденных писем; в `AuditAction::OWNER` не входит (`AuditPolicy::records` для владельца — только действия
   из `OWNER`). Несовместимо: новый вариант `AuditAction`; исчерпывающих `match` по нему в коде нет. `tp-meta` — миграция 0033

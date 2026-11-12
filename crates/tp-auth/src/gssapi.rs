@@ -531,6 +531,37 @@ mod tests {
         assert!(!ticket_for("sieve/mx.example.org@CORP.EXAMPLE", "imap"));
     }
 
+    /// CTR-57, AUTH-14: адрес клиента из `SaslContext` доходит до проверки принципала — и при неизвестном
+    /// принципале (неудачу защита от перебора засчитывает адресу).
+    #[tokio::test]
+    async fn peer_reaches_authenticator() {
+        let fake = tp_testkit::FakeAuthenticator::default();
+        let alice = Principal {
+            tenant: tp_contracts::TenantId::DEFAULT,
+            account: tp_contracts::AccountId::new(),
+            login: "alice@example.org".into(),
+            groups: Default::default(),
+            scopes: None,
+        };
+        fake.add_kerberos("alice@CORP.EXAMPLE", alice.clone());
+        for (client, want) in [
+            ("alice@CORP.EXAMPLE", SaslStep::Done(alice)),
+            (
+                "ghost@CORP.EXAMPLE",
+                SaslStep::Fail(SaslFailure::Authentication),
+            ),
+        ] {
+            let gss = Gssapi::with_acceptors(Arc::new(Factory(client, Arc::default())));
+            let sasl = AuthSasl::new(Arc::new(fake.clone())).with_gssapi(gss);
+            let mut s = sasl.start(Mechanism::Gssapi, &IMAP).expect("start");
+            for token in [None, Some(b"t1".as_slice()), Some(b"t2"), Some(b"")] {
+                assert!(matches!(s.step(token).await, Ok(SaslStep::Challenge(_))));
+            }
+            assert_eq!(s.step(Some(b"W\x01\0\0\0")).await, Ok(want));
+        }
+        assert_eq!(fake.peers(), [crate::testutil::PEER; 2]);
+    }
+
     #[tokio::test]
     async fn rfc4752_exchange() {
         let SaslStep::Done(p) = exchange("alice@CORP.EXAMPLE", b"\x01\0\0\0")

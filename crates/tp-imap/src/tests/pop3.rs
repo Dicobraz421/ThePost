@@ -1,12 +1,18 @@
-//! POP3 (IMAP-12): сеанс RFC 1939 — USER/PASS, AUTH (RFC 5034), STAT, LIST, UIDL, RETR, TOP, DELE, RSET, QUIT.
+//! POP3 (IMAP-12): сеанс RFC 1939 — USER/PASS, AUTH (RFC 5034), STAT, LIST, UIDL, RETR, TOP, DELE, RSET, QUIT;
+//! адрес клиента в проверке учётных данных, в том числе за балансировщиком с PROXY protocol (IMAP-19).
+
+use std::net::IpAddr;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use tokio::io::AsyncWriteExt;
 use tp_contracts::meta::{MessageQuery, MessageStore, SpecialUse};
 
-use super::{Client, Env, LOGIN, PASSWORD, TestConn};
+use super::session::{PROXIED, connect_proxied, proxied_listener, read_line};
+use super::{Client, Env, LOGIN, PASSWORD, PEER, TestConn};
 use crate::config::Pop3Config;
-use crate::pop3::Pop3Session;
+use crate::pop3::{Pop3Server, Pop3Session};
+use crate::session::SessionCtx;
 
 const ONE: &[u8] = b"From: a@example.org\r\nSubject: one\r\n\r\n.hidden\r\nline2\r\nline3\r\n";
 const TWO: &[u8] = b"From: a@example.org\r\nSubject: two\r\n\r\nHello\r\n";
@@ -298,4 +304,57 @@ async fn quit_delete_audited_by_policy() {
     assert_eq!(e[0].action, AuditAction::Delete);
     assert_eq!(e[0].object.mailbox, Some(env.mailbox(SpecialUse::Inbox)));
     assert_eq!(e[0].client.as_deref(), Some("pop3 192.0.2.7"));
+}
+
+/// IMAP-19: `USER`/`PASS` и `AUTH` передают в проверку учётных данных адрес клиента сессии (и при неудаче).
+#[tokio::test]
+async fn login_passes_client_address() {
+    let env = two().await;
+    let mut c = pop(&env, true).await;
+    c.pop(&format!("USER {LOGIN}")).await;
+    assert!(c.pop("PASS wrong").await.starts_with("-ERR [AUTH]"));
+    assert!(login(&mut c).await.starts_with("+OK"));
+    // Ящик свободен для следующей сессии только после QUIT.
+    assert_eq!(c.pop("QUIT").await, "+OK Bye\r\n");
+    assert_eq!(c.rest().await, "");
+    let creds = STANDARD.encode(format!("\0{LOGIN}\0{PASSWORD}"));
+    let mut c = pop(&env, true).await;
+    assert!(
+        c.pop(&format!("AUTH PLAIN {creds}"))
+            .await
+            .starts_with("+OK")
+    );
+    assert_eq!(env.auth.peers(), [Some(PEER); 3]);
+}
+
+/// IMAP-19: за балансировщиком с PROXY protocol в проверку учётных данных приходит адрес клиента из заголовка,
+/// а не адрес балансировщика.
+#[tokio::test]
+async fn login_behind_proxy_passes_client_address() {
+    let mut env = Env::new().await;
+    env.config.pop3.enabled = true;
+    let (at, listener) = proxied_listener().await;
+    let server = Pop3Server::new(SessionCtx::clone(&env.ctx()));
+    let serve = tokio::spawn(async move { server.serve(listener).await });
+    let mut tls = connect_proxied(at).await;
+    assert!(read_line(&mut tls).await.starts_with("+OK"));
+    for (line, reply) in [
+        (format!("USER {LOGIN}"), "+OK"),
+        (format!("PASS {PASSWORD}"), "+OK Logged in"),
+        ("QUIT".to_owned(), "+OK Bye"),
+    ] {
+        tls.get_mut()
+            .write_all(format!("{line}\r\n").as_bytes())
+            .await
+            .expect("write");
+        let r = read_line(&mut tls).await;
+        assert!(r.starts_with(reply), "{line}: {r}");
+    }
+    assert_eq!(
+        env.auth.peers(),
+        [Some(IpAddr::V4(*PROXIED.ip()))],
+        "адрес клиента из заголовка PROXY, не балансировщика"
+    );
+    env.shutdown.cancel();
+    serve.await.expect("join").expect("serve");
 }

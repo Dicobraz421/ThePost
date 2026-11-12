@@ -297,6 +297,18 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:size=64m,mode=1777
+    # Конфигурация — пресет SMB deploy/config/all.yaml (единственный, решение 105); здесь — только значения этой
+    # установки (THEPOST_<секция>__<поле>). Домен example.test — принятый домен организации в БД (thepost admin init).
+    # Цепочка клиентских протоколов (fullchain.pem) и CA внутренних каналов — том tls от tls-init; ключ — в OpenBao
+    # (tls/gen-certs.sh, SAN: localhost, thepost, mail.example.test; ключ пишет openbao-init-tls); AppRole — том
+    # openbao-approle от openbao-init-tls.
+    environment:
+      THEPOST_DOMAIN: example.test
+      THEPOST_DATABASE__URL: "postgres://thepost@postgres-tls:5432/thepost?sslmode=verify-full&sslrootcert=/etc/thepost/tls/ca.pem"
+      THEPOST_SMTP__HOSTNAME: mail.example.test
+      THEPOST_SECRETS__URL: https://openbao-tls:8200
+      THEPOST_SECRETS__TLS__CA_FILE: /etc/thepost/tls/ca.pem
+      THEPOST_SECRETS__AUTH__APPROLE__SECRET_ID_FILE: /etc/thepost/openbao/secret_id
     depends_on:
       postgres-role-tls:
         condition: service_completed_successfully
@@ -305,7 +317,7 @@ services:
       rspamd:
         condition: service_started
     volumes:
-      - ./thepost-smb.yaml:/etc/thepost/config.yaml:ro
+      - ../config/all.yaml:/etc/thepost/config.yaml:ro
       - tls:/etc/thepost/tls:ro
       - openbao-approle:/etc/thepost/openbao:ro
       - tpdata:/var/lib/thepost
