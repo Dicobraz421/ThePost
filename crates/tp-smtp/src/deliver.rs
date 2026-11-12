@@ -59,12 +59,14 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
-use tp_contracts::auth::{DirChange, DirCursor, Directory};
+use tp_contracts::auth::{DirChange, DirCursor, Directory, Principal};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::ext::{CopyTo, Decision, DecisionHooks, SubmissionInfo};
 use tp_contracts::groups::DistributionGroup;
 use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested, MailStore};
-use tp_contracts::meta::{Account, AccountScope, AccountStore, Mailbox, MailboxStore, SpecialUse};
+use tp_contracts::meta::{
+    Account, AccountScope, AccountStore, Mailbox, MailboxStore, Policy, PolicyResolver, SpecialUse,
+};
 use tp_contracts::queue::{DsnRet, Outbound, SubmitStatus, Submitted};
 use tp_contracts::retention::Quota;
 use tp_contracts::schedule::{ItipDelivery, ItipMessage, ItipOutcome, ItipSource};
@@ -196,6 +198,8 @@ pub struct Delivery {
     flow: Option<FlowDeps>,
     rules: Option<Arc<dyn DeliveryRules>>,
     itip: Option<Arc<dyn ItipDelivery>>,
+    /// Политики организации (SMTP-40): профиль Milter, лимиты сеанса submission ([`Handler::policy`]).
+    policies: Option<Arc<dyn PolicyResolver>>,
     vacation_rate: VacationRate,
     /// `delivery.redirect_hops`.
     redirect_hops: u32,
@@ -244,6 +248,7 @@ impl Delivery {
             flow: None,
             rules: None,
             itip: None,
+            policies: None,
             vacation_rate: VacationRate::new(cfg.delivery.vacation_rate),
             redirect_hops: cfg.delivery.redirect_hops,
             redirect_total: cfg.delivery.redirect_total,
@@ -415,6 +420,39 @@ impl Delivery {
     pub fn with_transport(mut self, routes: Arc<Routes>) -> Self {
         self.transport = Some(routes);
         self
+    }
+
+    /// Политики организации (SMTP-40, решение 97): профиль Milter письма (`Policy::milter_profile`; submission —
+    /// цепочка учётной записи отправителя, smtp-in — уровень организации) и лимиты сеанса submission
+    /// ([`Handler::policy`]: `max_recipients`, `send_per_hour`). Без политик — умолчания полей `Policy`.
+    pub fn with_policies(mut self, policies: Arc<dyn PolicyResolver>) -> Self {
+        self.policies = Some(policies);
+        self
+    }
+
+    /// Политика учётной записи `account`: цепочка «организация → основной домен → учётная запись»; учётной
+    /// записи нет — уровень организации.
+    async fn account_policy(&self, tenant: TenantId, account: AccountId) -> Result<Policy> {
+        let Some(policies) = &self.policies else {
+            return Ok(Policy::default());
+        };
+        match self.deps.accounts.get(tenant, account).await? {
+            Some(a) => {
+                policies
+                    .resolve(tenant, Some(a.domain), Some(a.id), None)
+                    .await
+            }
+            None => policies.resolve(tenant, None, None, None).await,
+        }
+    }
+
+    /// Политика письма транзакции `env`: субъект AUTH — его учётная запись, иначе — организация узла.
+    async fn message_policy(&self, env: &Envelope) -> Result<Policy> {
+        match (&env.principal, &self.policies) {
+            (_, None) => Ok(Policy::default()),
+            (Some(p), Some(_)) => self.account_policy(p.tenant, p.account).await,
+            (None, Some(policies)) => policies.resolve(self.deps.tenant, None, None, None).await,
+        }
     }
 
     /// Адрес конверта `address` организации `tenant` после переписывания для стороны `side`; `None` — правила нет.
@@ -1137,7 +1175,8 @@ impl Delivery {
         full.extend_from_slice(&raw);
         let mut full = Bytes::from(full);
         if let Some(m) = self.deps.milter.as_ref().filter(|m| m.applies(env.mode)) {
-            let out = m.check(env, full).await;
+            let profile = self.message_policy(env).await?.milter_profile;
+            let out = m.check(env, full, profile.as_deref()).await;
             match out.verdict {
                 Verdict::Accept => {}
                 Verdict::Refuse(r) => return Ok(Some(r)),
@@ -2074,6 +2113,11 @@ impl DsnSink for Delivery {
 
 #[async_trait]
 impl Handler for Delivery {
+    async fn policy(&self, principal: &Principal) -> Result<Policy> {
+        self.account_policy(principal.tenant, principal.account)
+            .await
+    }
+
     async fn rcpt(&self, env: &Envelope, rcpt: &str) -> Reply {
         let r = self.check_rcpt(env, rcpt).await;
         if !is_positive(&r) {

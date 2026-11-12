@@ -170,10 +170,12 @@ smtp:
   dkim:
     domains:
       example.ru:
-        selector: s2026
         keys:
           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim#example.ru" } }
 ```
+
+Письма домена подписываются всеми его ключами; селектор подписи (при ротации ключей) выбирает политика организации
+домена (`dkim_selector`, Admin API `PUT …/policy`).
 
 `thepost doctor` проверяет MX, SPF, DKIM, DMARC, MTA-STS и PTR по публичному DNS и подсказывает, чего не хватает.
 
