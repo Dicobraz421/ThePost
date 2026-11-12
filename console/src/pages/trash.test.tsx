@@ -45,7 +45,7 @@ test("корзина: правило trash.purge, страницы по next_off
   expect(sent(calls, "GET", `${A}/trash?offset=0`)).toHaveLength(1);
 
   fireEvent.click(screen.getAllByRole("button", { name: "Восстановить" })[0]);
-  expect(await screen.findByText("Восстановить письмо в папку «Проекты»?")).toBeTruthy();
+  expect(await screen.findByText("Восстановить письмо в исходную папку?")).toBeTruthy();
   const buttons = screen.getAllByRole("button", { name: "Восстановить" });
   fireEvent.click(buttons[buttons.length - 1]);
   await waitFor(() => expect(sent(calls, "POST", `${A}/trash/m1/restore`)).toHaveLength(1));
@@ -69,7 +69,7 @@ test("скрытые письма: список и восстановление 
   fireEvent.click(await screen.findByRole("tab", { name: "Скрытые письма" }));
   expect(await screen.findByText("h1")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Восстановить" }));
-  await screen.findByText("Восстановить письмо в папку «INBOX»?");
+  await screen.findByText("Восстановить письмо в исходную папку?");
   const buttons = screen.getAllByRole("button", { name: "Восстановить" });
   fireEvent.click(buttons[buttons.length - 1]);
   await waitFor(() => expect(sent(calls, "POST", `${A}/trash/hidden/h1/restore`)).toHaveLength(1));

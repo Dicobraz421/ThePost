@@ -16,7 +16,7 @@ const empty = {
 const account = (id: string, login: string, more: object = {}) => ({
   id,
   login,
-  domain: "example.org",
+  domain: "d1",
   display_name: login,
   enabled: true,
   external_id: null,
@@ -83,10 +83,13 @@ test("учётная запись: политика ящика — PUT accounts/
       body: account("a1", "alice@example.org", { policy: { ...empty, quota_bytes: 100 }, effective: { ...empty, quota_bytes: 100 } }),
     },
     [`GET ${BASE}/accounts/a1/app-passwords`]: { body: [] },
+    [`GET ${BASE}/domains`]: { body: [{ id: "d1", name: "example.org" }] },
     [`PUT ${BASE}/accounts/a1/policy`]: (c) => ({ body: c.body }),
   });
   await waitFor(() => expect((screen.getByLabelText("Квота ящика, байт.") as HTMLInputElement).value).toBe("100"));
   expect(screen.getByText("Вход разрешён")).toBeTruthy();
+  // Основной домен — по имени, а не идентификатором.
+  expect(await screen.findByText("example.org")).toBeTruthy();
   fireEvent.change(screen.getByLabelText("Квота ящика, байт."), { target: { value: "200" } });
   fireEvent.click(screen.getByRole("button", { name: "Сохранить политику" }));
   await waitFor(() => expect(sent(calls, "PUT", `${BASE}/accounts/a1/policy`)[0]?.body).toEqual({ ...empty, quota_bytes: 200 }));

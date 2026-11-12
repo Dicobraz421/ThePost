@@ -161,12 +161,20 @@ function AppPasswords({ account }: { account: string }) {
 export function AccountShow() {
   const { result: account, query } = useShow<Account>();
   const { mutate, mutation } = useCustomMutation<Schemas["PolicyBody"]>();
+  // Узел отдаёт идентификатор основного домена: имя — из списка доменов организации; список недоступен —
+  // показывается идентификатор, без уведомления об ошибке.
+  const { result: domains } = useList<Schemas["DomainInfo"]>({
+    resource: "domains",
+    pagination: { mode: "off" },
+    errorNotification: false,
+  });
+  const domain = domains.data.find((d) => d.id === account?.domain)?.name ?? account?.domain;
   return (
     <Show title={account?.login ?? "Учётная запись"} isLoading={query.isLoading}>
       <Descriptions column={1}>
         <Descriptions.Item label="Имя входа">{account?.login}</Descriptions.Item>
         <Descriptions.Item label="Отображаемое имя">{account?.display_name}</Descriptions.Item>
-        <Descriptions.Item label="Основной домен">{account?.domain}</Descriptions.Item>
+        <Descriptions.Item label="Основной домен">{domain}</Descriptions.Item>
         <Descriptions.Item label="Источник">
           {account?.external_id ? `каталог (${account.external_id})` : "локальная запись"}
         </Descriptions.Item>
@@ -174,7 +182,11 @@ export function AccountShow() {
         <Descriptions.Item label="Занято">{account && `${quota(account)}, писем: ${account.quota.messages}`}</Descriptions.Item>
         <Descriptions.Item label="Идентификатор">{account?.id}</Descriptions.Item>
       </Descriptions>
-      {account && <Link to={`/accounts/${encodeURIComponent(account.id)}/trash`}>Корзина и скрытые письма</Link>}
+      {account && (
+        <Link to={`/accounts/${encodeURIComponent(account.id)}/trash`} style={{ display: "inline-block", marginTop: 8 }}>
+          Корзина и скрытые письма
+        </Link>
+      )}
       <Divider orientation="left">Политика ящика</Divider>
       <PolicyForm
         policies={account}
