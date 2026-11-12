@@ -28,6 +28,7 @@ use crate::session::{Deps, Session, SessionCtx, Transport};
 
 mod audit;
 mod compress;
+mod disable;
 mod ext;
 mod fetch;
 mod idle;
