@@ -23,7 +23,6 @@ use tp_testkit::{
     MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
 };
 
-use crate::export::Fanout;
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 use crate::sieve::ScriptError;
 
@@ -99,7 +98,6 @@ impl Stores {
         Deps {
             auth: Arc::new(FakeAuthenticator::default()),
             audit_log: Arc::new(MemAuditLog::new()),
-            audit: Arc::new(Fanout::default()),
             delivery: Arc::new(self.delivery.clone()),
             groups: Arc::new(self.groups.clone()),
             moderation: Arc::new(self.moderation.clone()),

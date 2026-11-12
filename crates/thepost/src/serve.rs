@@ -291,20 +291,6 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         services.dkim.clone(),
         aux.clone(),
     ));
-    // Экспорт журнала аудита в SIEM (`admin.audit`, APP-59) — у роли admin; новая секция — без перезапуска.
-    let audit = if cfg.roles().contains(Role::Admin) {
-        let audit = AuditExport::start(&cfg, store.as_ref())
-            .await
-            .map_err(|e| infra::context("admin.audit", e))?;
-        tokio::spawn(
-            audit
-                .clone()
-                .watch(reloader.subscribe(), store.clone(), aux.clone()),
-        );
-        Some(audit)
-    } else {
-        None
-    };
 
     // Уровень нагрузки узла по ресурсам cgroups (PLT-15): роли читают его из `RoleCtx::load`. Снимки ресурсов —
     // по триггерам PSI (секция `pressure`, PLT-17), без них — с интервалом секции `resources`.
@@ -354,6 +340,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         .page_size;
     // Показатели есть и при выключенной проверке: нулевые.
     let verify_probe = crate::metrics::register_verify(&metrics);
+    // Выгрузка журнала аудита из базы в SIEM (`admin.audit`, APP-59): роль maintenance, одна на кластер (лиза).
+    let audit_export = Arc::new(AuditExport::new(
+        Arc::new(meta.clone()),
+        leases.clone(),
+        holder.clone(),
+        store.clone(),
+        reloader.subscribe(),
+    ));
     let maintenance = Maintenance {
         index: Arc::new(meta.clone()),
         store: blob.clone(),
@@ -390,6 +384,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             probe: verify_probe,
             now: tp_blob::system_now(),
         }),
+        audit_export: Some(audit_export),
     };
     let mut setup = RoleSetup {
         cfg: &cfg,
@@ -402,7 +397,6 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         events,
         signals,
         maintenance: Some(maintenance),
-        audit,
     };
     for role in Role::ALL.iter().copied() {
         if !cfg.roles().contains(role) {
@@ -508,8 +502,6 @@ struct RoleSetup<'a> {
     events: EventConsumer,
     signals: LogSignals,
     maintenance: Option<Maintenance>,
-    /// Экспорт журнала аудита роли admin (`admin.audit`).
-    audit: Option<Arc<AuditExport>>,
 }
 
 impl RoleSetup<'_> {
@@ -589,12 +581,8 @@ impl RoleSetup<'_> {
                     .section::<sections::AdminSection>(sections::ADMIN)?
                     .0
                     .clone();
-                let audit: Arc<dyn tp_admin::AuditSink> = match &self.audit {
-                    Some(audit) => audit.clone(),
-                    None => Arc::new(tp_admin::Fanout::default()),
-                };
                 let admin = Arc::new(crate::local_admin::attach(
-                    self.services.admin(self.ext, cfg, &*smtp()?, audit)?,
+                    self.services.admin(self.ext, cfg, &*smtp()?)?,
                     self.services,
                 ));
                 crate::local_admin::serve(admin.clone());

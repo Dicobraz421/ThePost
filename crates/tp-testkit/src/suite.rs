@@ -4930,4 +4930,46 @@ pub async fn admin_audit_log(log: &dyn AuditLog, tenant: TenantId, foreign_tenan
         log.search(tenant, &reversed).await,
         Err(Error::Invalid(_))
     ));
+
+    // APP-59: выгрузка — все записи (и уровень инсталляции) по возрастанию номера после `after`; в общей базе
+    // между ними могут быть записи других тестов.
+    let all = log
+        .export_page(seqs[0] - 1, 10_000)
+        .await
+        .expect("export page");
+    let ours: Vec<AdminAuditEntry> = all
+        .iter()
+        .filter(|e| seqs.contains(&e.seq))
+        .cloned()
+        .collect();
+    assert_eq!(ours, (0..records.len()).map(entry).collect::<Vec<_>>());
+    assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+    let first = log.export_page(seqs[0] - 1, 1).await.expect("export page");
+    assert_eq!(first, vec![entry(0)]);
+    assert!(matches!(
+        log.export_page(0, 0).await,
+        Err(Error::Invalid(_))
+    ));
+    // Отметка доставки: 0 — ничего; сдвиг только с текущей; назад и на месте — `Invalid`.
+    let sink = format!("suite-{}", AccountId::new());
+    assert_eq!(log.export_mark(&sink).await, Ok(0));
+    assert_eq!(log.advance_export_mark(&sink, 0, seqs[1]).await, Ok(true));
+    assert_eq!(log.export_mark(&sink).await, Ok(seqs[1]));
+    assert_eq!(
+        log.advance_export_mark(&sink, 0, seqs[2]).await,
+        Ok(false),
+        "отметку уже сдвинули"
+    );
+    assert_eq!(
+        log.advance_export_mark(&sink, seqs[1], seqs[4]).await,
+        Ok(true)
+    );
+    assert_eq!(log.export_mark(&sink).await, Ok(seqs[4]));
+    for (from, to) in [(seqs[4], seqs[4]), (seqs[4], seqs[3])] {
+        assert!(matches!(
+            log.advance_export_mark(&sink, from, to).await,
+            Err(Error::Invalid(_))
+        ));
+    }
+    assert_eq!(log.export_mark(&format!("{sink}-other")).await, Ok(0));
 }

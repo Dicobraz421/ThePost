@@ -305,7 +305,9 @@ const OTLP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 async fn tcp_reachable(address: &str, timeout: Duration) -> Option<String> {
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(address)).await {
         Ok(Ok(_)) => None,
-        Ok(Err(e)) => Some(format!("нет подключения к {address}: {e}")),
+        Ok(Err(e)) => Some(format!(
+            "нет подключения к {address}: {e}; записи ждут в журнале до возврата приёмника"
+        )),
         Err(_) => Some(format!(
             "нет подключения к {address} за {}",
             tp_contracts::config::duration::format(timeout)
@@ -313,12 +315,13 @@ async fn tcp_reachable(address: &str, timeout: Duration) -> Option<String> {
     }
 }
 
-/// Экспорт журнала аудита в SIEM (`admin.audit`, APP-59) узла с ролью admin. `admin.audit.syslog` — подсекция
-/// собирается, как при запуске узла (проверка, ключ клиента `tls.key` из хранилища секретов, TLS), затем
-/// TCP-подключение к `address` за `connect_timeout`; `admin.audit.otlp` — TCP-подключение к узлу и порту
-/// `endpoint`. Нет подсекции — нет проверки. Рукопожатие TLS с приёмником syslog узел делает при первой записи.
+/// Выгрузка журнала аудита в SIEM (`admin.audit`, APP-59) узла с ролью maintenance (выгружает она).
+/// `admin.audit.syslog` — приёмник собирается, как при выгрузке (проверка, ключ клиента `tls.key` из хранилища
+/// секретов, TLS), затем подключение к `address` с рукопожатием TLS и проверкой сертификата приёмника за
+/// `connect_timeout`; `admin.audit.otlp` — TCP-подключение к узлу и порту `endpoint`. Нет подсекции — нет проверки.
+/// Пока приёмник недоступен, записи ждут в журнале и уходят после его возврата.
 pub async fn admin_audit(cfg: &Config, store: Option<&Arc<dyn SecretStore>>, report: &mut Report) {
-    if !cfg.roles().contains(tp_contracts::role::Role::Admin) {
+    if !cfg.roles().contains(tp_contracts::role::Role::Maintenance) {
         return;
     }
     let Ok(admin) = cfg.section::<sections::AdminSection>(sections::ADMIN) else {
@@ -340,9 +343,17 @@ pub async fn admin_audit(cfg: &Config, store: Option<&Arc<dyn SecretStore>>, rep
                     .await
                 {
                     Err(e) => report.push(id, Status::Fail, value, message(&e)),
-                    Ok(_) => match tcp_reachable(&syslog.address, syslog.connect_timeout).await {
-                        Some(why) => report.push(id, Status::Fail, value, why),
-                        None => report.push(
+                    Ok(sink) => match sink.probe().await {
+                        Err(e) => report.push(
+                            id,
+                            Status::Fail,
+                            value,
+                            format!(
+                                "нет подключения к {}: {e}; записи ждут в журнале до возврата приёмника",
+                                syslog.address
+                            ),
+                        ),
+                        Ok(()) => report.push(
                             id,
                             Status::Ok,
                             value,

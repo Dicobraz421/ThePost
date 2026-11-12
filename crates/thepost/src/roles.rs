@@ -122,6 +122,8 @@ pub struct Maintenance {
     pub purge: Option<Purge>,
     /// Проверка целостности BLOB по расписанию; `None` — выключена (`maintenance.verify.enabled: false`).
     pub verify: Option<ScheduledVerify>,
+    /// Выгрузка журнала аудита в SIEM (`admin.audit`, APP-59); `None` — не выполняется (тесты без PostgreSQL).
+    pub audit_export: Option<Arc<crate::audit_export::AuditExport>>,
 }
 
 /// Показатели проверки целостности BLOB по расписанию для `/metrics` (`crate::metrics::register_verify`).
@@ -487,7 +489,18 @@ impl RoleService for Maintenance {
                 ctx.shutdown.clone(),
             ))
         });
+        // Выгрузка журнала аудита: один узел кластера — держатель лизы (APP-59).
+        let audit_export = self.audit_export.clone().map(|export| {
+            let token = ctx.shutdown.clone();
+            tokio::spawn(async move { export.run(token).await })
+        });
         ctx.ready.set(true);
+        let audit_export = async move {
+            match audit_export {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
         let verify = async move {
             match verify {
                 Some(task) => task.await,
@@ -506,12 +519,13 @@ impl RoleService for Maintenance {
                 None => Ok(()),
             }
         };
-        let (gc, orphans, trash, purge, verify, ()) = tokio::join!(
+        let (gc, orphans, trash, purge, verify, audit_export, ()) = tokio::join!(
             gc,
             orphans,
             trash,
             purge,
             verify,
+            audit_export,
             consume(
                 self.events.clone(),
                 self.sinks.clone(),
@@ -525,6 +539,7 @@ impl RoleService for Maintenance {
             ("trash-expiry", trash),
             ("purge", purge),
             ("blob-verify", verify),
+            ("audit-export", audit_export),
         ] {
             if let Err(e) = done {
                 return Err(tp_contracts::Error::Internal(format!("{what}: {e}")));
@@ -647,6 +662,7 @@ mod tests {
             trash: None,
             purge: None,
             verify: None,
+            audit_export: None,
         };
         let (ctx, shutdown, ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -776,6 +792,7 @@ mod tests {
             trash: None,
             purge: None,
             verify: Some(verify),
+            audit_export: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -1032,6 +1049,7 @@ mod tests {
             trash: None,
             purge: Some(purge),
             verify: None,
+            audit_export: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });

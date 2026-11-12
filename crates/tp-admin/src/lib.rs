@@ -3,7 +3,7 @@
 //! - [`server`] — каркас: HTTP (`axum`), OpenAPI (`utoipa`), вход Bearer OIDC, роли администраторов с областью,
 //!   маршруты модулей, ошибки;
 //! - [`audit`] — журнал аудита изменений и его чтение;
-//! - [`export`] — экспорт журнала аудита в SIEM: syslog (RFC 5424 поверх TLS) и OTLP;
+//! - [`export`] — выгрузка журнала аудита из базы в SIEM: syslog (RFC 5424 поверх TLS) и OTLP;
 //! - [`delivery`] — поиск в журнале доставки;
 //! - [`groups`] — группы рассылки: ограничения, скрытие из GAL, очередь модерации;
 //! - [`accounts`] — организация, домены, учётные записи, квоты и политики уровней;
@@ -31,10 +31,11 @@ pub mod sieve;
 mod testenv;
 pub mod transport;
 
-pub use audit::{AuditEntry, AuditPage, AuditRecord, AuditSink};
+pub use audit::{AuditEntry, AuditPage, AuditRecord};
 pub use console::ConsoleConfig;
 pub use export::{
-    AuditExportConfig, Fanout, OtlpAudit, OtlpAuditConfig, SyslogAudit, SyslogConfig,
+    AuditExportConfig, ExportSink, OtlpAudit, OtlpAuditConfig, SyslogAudit, SyslogConfig,
+    export_pass,
 };
 pub use groups::Moderation;
 pub use init::{InitConfig, InitGranted, InitReply, InitRequest};
