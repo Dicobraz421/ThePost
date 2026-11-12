@@ -79,7 +79,10 @@ thepost_blob_gc_window: >-
 #   thepost_config_extra: { auth: { ldap: { … } }, meta: { retention: { trash_retention: 15m } } }
 thepost_config_extra: {}
 
-# Ожидание готовности после запуска (/healthz/ready служебного HTTP, 127.0.0.1:8081).
+# Ожидание готовности после запуска (/healthz/ready служебного HTTP, 127.0.0.1:8081). thepost_wait_ready: false —
+# не ждать: плейбук завершается успешно с предупреждением, если узел не готов (решение 79; новый сервер перед
+# restore.yml — ключи DKIM, SRS и ARC вернутся только из снимка OpenBao, docs/INSTALL.md).
+thepost_wait_ready: true
 thepost_service_http_port: 8081
 thepost_ready_retries: 30
 thepost_ready_delay: 2
