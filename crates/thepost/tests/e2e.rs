@@ -394,6 +394,30 @@ async fn http(
     (code, payload)
 }
 
+/// Запрос DAV без тела: ответ целиком (строка состояния, заголовки, тело как есть).
+async fn dav(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    authorization: &str,
+    depth: &str,
+) -> String {
+    let mut s = TcpStream::connect(addr).await.expect("dav connect");
+    let auth = if authorization.is_empty() {
+        String::new()
+    } else {
+        format!("Authorization: {authorization}\r\n")
+    };
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Depth: {depth}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.expect("dav write");
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await.expect("dav read");
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
 struct Jmap {
     addr: std::net::SocketAddr,
     auth: String,
@@ -605,6 +629,24 @@ async fn mvp_mail_flow() {
         got["list"][0]["from"][0]["email"], "bob@sender.test",
         "{got}"
     );
+
+    // 3а. Календари и контакты (APP-29): роль dav на слушателе JMAP, вход паролем приложения.
+    let basic = format!("Basic {}", jmap.auth);
+    let web = addr(&running, "jmap");
+    let found = dav(web, "GET", "/.well-known/caldav", "", "0").await;
+    assert!(found.starts_with("HTTP/1.1 301"), "{found}");
+    assert!(found.to_ascii_lowercase().contains("location: "), "{found}");
+    assert!(found.contains("/dav/"), "{found}");
+    let home = format!("/dav/calendars/{login}/");
+    let denied = dav(web, "PROPFIND", &home, "Basic bm9ib2R5Om5vcGU=", "1").await;
+    assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+    let listed = dav(web, "PROPFIND", &home, &basic, "1").await;
+    assert!(listed.starts_with("HTTP/1.1 207"), "{listed}");
+    // Дом и календарь по умолчанию (создаётся при первом обращении).
+    assert!(listed.matches("<d:response>").count() >= 2, "{listed}");
+    let books = format!("/dav/addressbooks/{login}/");
+    let listed = dav(web, "PROPFIND", &books, &basic, "1").await;
+    assert!(listed.starts_with("HTTP/1.1 207"), "{listed}");
 
     // 4. Поиск: индексатор обрабатывает журнал событий, запрос — по полнотекстовому индексу.
     let until = deadline();

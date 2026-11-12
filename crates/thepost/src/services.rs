@@ -493,6 +493,36 @@ impl Services {
             .with_sieve(Some(Arc::new(self.meta.clone()))))
     }
 
+    /// Маршруты календарей и контактов (CalDAV, CardDAV; APP-29): хранилище — `PgMeta`, вход — тот же, что у
+    /// JMAP (с защитой от перебора). С каталогом организации (`auth.ldap`) — глобальная адресная книга
+    /// «Организация» (группы, скрытые из адресной книги, в неё не попадают); без каталога её нет (SRS 4.4).
+    /// `well_known` — добавить перенаправления `/.well-known/caldav` и `/.well-known/carddav` на `/dav/`
+    /// (RFC 6764 §5): для слушателя без JMAP, который отдаёт их сам по `jmap.autoconfig`.
+    pub fn dav(&self, cfg: tp_dav::DavConfig, well_known: bool) -> axum::Router {
+        let deps = tp_dav::Deps {
+            auth: self.authn.clone(),
+            store: Arc::new(self.meta.clone()),
+        };
+        let router = match &self.directory {
+            Some(directory) => tp_dav::router_with_gal(
+                deps,
+                tp_dav::GalDeps {
+                    directory: directory.clone(),
+                    groups: Some(Arc::new(self.meta.clone())),
+                },
+                cfg,
+            ),
+            None => tp_dav::router(deps, cfg),
+        };
+        if !well_known {
+            return router;
+        }
+        let context = || async { axum::response::Redirect::permanent(tp_dav::PREFIX) };
+        router
+            .route("/.well-known/caldav", axum::routing::any(context))
+            .route("/.well-known/carddav", axum::routing::any(context))
+    }
+
     /// Admin API.
     pub fn admin(&self, ext: &Registry, cfg: tp_admin::AdminConfig) -> Result<tp_admin::Admin> {
         let deps = tp_admin::Deps {

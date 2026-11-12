@@ -461,6 +461,11 @@ struct RoleSetup<'a> {
 }
 
 impl RoleSetup<'_> {
+    /// Секция `dav` (лимиты CalDAV и CardDAV); применяется при создании маршрутов.
+    fn dav_config(&self) -> Result<tp_dav::DavConfig> {
+        Ok((*self.cfg.section::<tp_dav::DavConfig>(sections::DAV)?).clone())
+    }
+
     /// Сервис роли `role` и источник её секции. Ленивая инициализация (SRS 2.7): только для включённых ролей.
     fn spec(&mut self, role: Role) -> Result<RoleSpec> {
         let section = |name: &str| section_watch(self.updates.clone(), name);
@@ -507,9 +512,14 @@ impl RoleSetup<'_> {
                     .jmap(self.ext, cfg, &smtp, self.certs.clone())?;
                 let jmap = Arc::new(jmap);
                 let stop = jmap.clone();
+                // Календари и контакты без `http.dav` — на этом же слушателе (один порт с JMAP, APP-29).
+                let mut router = jmap.router();
+                if self.cfg.roles().contains(Role::Dav) && http.dav.is_none() {
+                    router = router.merge(self.services.dav(self.dav_config()?, false));
+                }
                 let service = HttpRole::new(
                     role,
-                    jmap.router(),
+                    router,
                     http.jmap.clone(),
                     profile,
                     self.certs.clone(),
@@ -539,6 +549,21 @@ impl RoleSetup<'_> {
                 );
                 (Arc::new(service), fixed_config(()))
             }
+            Role::Dav => match http.dav_listener(self.cfg.roles()) {
+                // Маршруты DAV — у роли jmap этого узла (ветка `Role::Jmap`).
+                (_, true) => (Arc::new(InProcessRole(role)), fixed_config(())),
+                (listener, false) => {
+                    let service = HttpRole::new(
+                        role,
+                        self.services.dav(self.dav_config()?, true),
+                        listener.cloned(),
+                        profile,
+                        self.certs.clone(),
+                        self.sockets.clone(),
+                    );
+                    (Arc::new(service), fixed_config(()))
+                }
+            },
             Role::Search => (Arc::new(InProcessRole(role)), fixed_config(())),
             Role::Indexer => {
                 let search = self.cfg.section::<SearchConfig>(sections::SEARCH)?;
@@ -559,7 +584,6 @@ impl RoleSetup<'_> {
                 Some(m) => (Arc::new(m), fixed_config(())),
                 None => (Arc::new(PendingRole(role)), fixed_config(())),
             },
-            _ => (Arc::new(PendingRole(role)), fixed_config(())),
         };
         Ok(RoleSpec { service, config })
     }
@@ -683,7 +707,7 @@ async fn heartbeat(
 
 /// Адреса слушателей узла по конфигурации: служебный HTTP, запросы узел → узел (`cluster.listen`, не задан —
 /// `cluster.addr`), HTTP-01 (`acme.enabled`) и слушатели включённых ролей (smtp-in, submission, imap и POP3, jmap,
-/// admin) — для проверки сокетов systemd ([`Sockets::warn_unused`]).
+/// dav, admin) — для проверки сокетов systemd ([`Sockets::warn_unused`]).
 fn listen_addrs(cfg: &Config) -> Vec<SocketAddr> {
     let roles = cfg.roles();
     let mut out = Vec::new();
@@ -707,6 +731,12 @@ fn listen_addrs(cfg: &Config) -> Vec<SocketAddr> {
             if let Some(l) = l.as_ref().filter(|_| roles.contains(role)) {
                 out.push(l.listen);
             }
+        }
+        // Роль dav: свой сокет — `http.dav` либо `http.jmap` на узле без роли jmap.
+        if roles.contains(Role::Dav)
+            && let (Some(l), false) = http.dav_listener(roles)
+        {
+            out.push(l.listen);
         }
     }
     if let Ok(smtp) = cfg.section::<SmtpConfig>(sections::SMTP) {
