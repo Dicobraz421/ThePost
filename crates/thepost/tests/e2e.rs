@@ -41,7 +41,9 @@ use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, MessageStore
 use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::secrets::{SecretRef, SecretStore};
-use tp_contracts::transport::{FlowInput, FlowOutcome, MailFlow};
+use tp_contracts::transport::{
+    AcceptedDomain, DomainKind, FlowInput, FlowOutcome, MailFlow, TransportStore,
+};
 use tp_meta::{MetaConfig, PgMeta};
 use tp_testkit::MemSecretStore;
 
@@ -138,8 +140,6 @@ smtp:
   hostname: localhost
   inbound:
     - {{ listen: \"127.0.0.1:0\" }}
-  delivery:
-    local_domains: [{domain}]
 imap:
   listeners:
     - {{ listen: \"127.0.0.1:0\", implicit_tls: true }}
@@ -205,6 +205,28 @@ async fn drop_database(url: &str, name: &str) {
         .await;
         admin.close().await;
     }
+}
+
+/// Принятый домен организации в БД (как `thepost admin domain add`): по нему SMTP доставляет
+/// локально (решение 96), настройки `smtp.delivery` доменов не задают.
+async fn accept_domain(meta: &PgMeta, tenant: TenantId, name: &str) -> DomainId {
+    let id = DomainId::new();
+    let version = TransportStore::cluster(meta)
+        .await
+        .expect("transport")
+        .version;
+    meta.put_domain(
+        version,
+        &AcceptedDomain {
+            id,
+            tenant,
+            name: name.to_owned(),
+            kind: DomainKind::Authoritative,
+        },
+    )
+    .await
+    .expect("accepted domain");
+    id
 }
 
 /// Адрес слушателя роли.
@@ -564,19 +586,10 @@ async fn mvp_mail_flow() {
     }
 
     // Учётная запись и пароль приложения — в той же БД (миграции выполнил узел).
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
-    let domain_id = DomainId::new();
-    let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
-    sqlx::query("INSERT INTO domains (tenant_id, domain_id, name) VALUES ($1, $2, $3)")
-        .bind(tenant.as_uuid())
-        .bind(domain_id.as_uuid())
-        .bind(&domain)
-        .execute(&mut *tx)
-        .await
-        .expect("domain");
-    tx.commit().await.expect("commit");
+    let domain_id = accept_domain(&meta, tenant, &domain).await;
     let login = format!("alice@{domain}");
     let account = meta
         .upsert(
@@ -1200,6 +1213,45 @@ async fn transport_settings_without_restart() {
     .await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
+    // ADM-34: политика организации — через контракт `PolicyStore` в PostgreSQL; изменения — в журнале аудита
+    // (`audit_log`), `GET …/audit` отдаёт их.
+    let org = format!("/api/v1/orgs/{}", TenantId::DEFAULT);
+    let policy = json!({ "max_recipients": 7 });
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &format!("{org}/policy"),
+        &bearer,
+        Some(&policy),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = http(admin, "GET", &org, &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let read: Value = serde_json::from_slice(&body).expect("org");
+    assert_eq!(read["policy"]["max_recipients"], 7, "{read}");
+    let (code, body) = http(admin, "GET", &format!("{org}/audit"), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let audit: Value = serde_json::from_slice(&body).expect("audit");
+    let changes: Vec<(&str, &str, u64)> = audit["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|e| {
+            Some((
+                e["method"].as_str()?,
+                e["route"].as_str()?,
+                e["status"].as_u64()?,
+            ))
+        })
+        .collect();
+    for change in [
+        ("PUT", "/api/v1/orgs/{org}/transport/sources/{name}", 200),
+        ("PUT", "/api/v1/orgs/{org}/policy", 200),
+    ] {
+        assert!(changes.contains(&change), "{change:?}: {audit}");
+    }
+
     // Следующая сессия без перезапуска (сигнал `TransportChanged`): отправитель вне списка источника — отказ.
     let until = deadline();
     while mail_from_code(smtp, "robot@other.test").await != 550 {
@@ -1226,7 +1278,13 @@ async fn transport_settings_without_restart() {
 // ---------- APP-26: правила Sieve и автоответ ----------
 
 /// Получатели очереди исходящей почты с адресом `address`.
-async fn queued(pool: &sqlx::PgPool, address: &str) -> i64 {
+/// Пул `tp-meta` к базе `url` без учёта ожидания соединения (наблюдатель-пустышка): метрик в тесте нет.
+async fn db_pool(url: &str) -> tp_meta::pool::DbPool {
+    let pool = sqlx::PgPool::connect(url).await.expect("pool");
+    tp_meta::pool::DbPool::new(pool, Arc::new(tp_meta::pool::NoAcquireObserver))
+}
+
+async fn queued(pool: &tp_meta::pool::DbPool, address: &str) -> i64 {
     let mut tx = tp_meta::schema::begin(pool, TenantId::DEFAULT)
         .await
         .expect("begin");
@@ -1304,7 +1362,7 @@ async fn sieve_rules_and_vacation() {
     let session: Value = serde_json::from_slice(&body).expect("session");
     let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
 
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let tenant = TenantId::DEFAULT;
     let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
     let account: sqlx::types::Uuid =
@@ -1566,19 +1624,10 @@ async fn meeting_scheduling() {
         retry(until, "узел готов").await;
     }
 
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
-    let domain_id = DomainId::new();
-    let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
-    sqlx::query("INSERT INTO domains (tenant_id, domain_id, name) VALUES ($1, $2, $3)")
-        .bind(tenant.as_uuid())
-        .bind(domain_id.as_uuid())
-        .bind(&domain)
-        .execute(&mut *tx)
-        .await
-        .expect("domain");
-    tx.commit().await.expect("commit");
+    let domain_id = accept_domain(&meta, tenant, &domain).await;
     let apps =
         tp_auth::AppPasswords::new(Arc::new(meta.clone()), tp_auth::PasswordConfig::default())
             .expect("app passwords");
@@ -1794,6 +1843,16 @@ async fn d7_metrics() {
     ] {
         assert!(text.contains(name), "{name}: {text}");
     }
+    // Ожидание соединения пулов учтено наблюдателем пула (META-55): узел уже получал соединения.
+    for pool in ["primary", "listener"] {
+        let series = format!("tp_db_pool_wait_seconds_count{{pool=\"{pool}\"}} ");
+        let waits: f64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix(series.as_str()))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{series}: {text}"));
+        assert!(waits >= 1.0, "{series}: {text}");
+    }
 
     shutdown.cancel();
     let report = running.wait().await.expect("report");
@@ -1801,8 +1860,9 @@ async fn d7_metrics() {
     drop_database(&url, &db_name).await;
 }
 
-/// FIX-03: домены организации в Admin API узла — принятые домены `TransportStore` (`PgMeta`). Список — 200 с
-/// доменом `admin init`; создание и удаление нового домена; удаление домена с учётной записью — 409.
+/// ADM-33: домены организации в Admin API узла — один ресурс `transport/domains` (`TransportStore` `PgMeta`). Список — 200
+/// с доменом `admin init`; создание, политика домена и удаление нового домена; удаление домена с учётной записью — отказ;
+/// прежнего ресурса `/orgs/{org}/domains` нет (404).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_domains() {
     let Some(url) = tp_testkit::pg_url() else {
@@ -1860,11 +1920,11 @@ async fn admin_domains() {
     assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
     let session: Value = serde_json::from_slice(&body).expect("session");
     let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
-    let base = format!("/api/v1/orgs/{}/domains", TenantId::DEFAULT);
+    let base = format!("/api/v1/orgs/{}/transport/domains", TenantId::DEFAULT);
     let list = || domain_list(admin, &base, &bearer);
 
     // Список: принятый домен `admin init`.
-    let domains = list().await;
+    let (version, domains) = list().await;
     let own = domains
         .iter()
         .find(|d| d["name"] == domain)
@@ -1873,43 +1933,69 @@ async fn admin_domains() {
         .expect("id")
         .to_owned();
 
-    // Создание: имя приводится к канонической форме; повтор — 409.
+    // Создание: имя приводится к канонической форме (`normalize_domain`); повтор — 409.
     let (code, body) = http(
         admin,
         "POST",
         &base,
         &bearer,
-        Some(&json!({ "name": "Corp.Example" })),
+        Some(&json!({ "version": version, "name": "Corp.Example" })),
     )
     .await;
     assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
     let created: Value = serde_json::from_slice(&body).expect("created");
-    assert_eq!(created["name"], "corp.example", "{created}");
-    let id = created["id"].as_str().expect("id").to_owned();
-    assert!(list().await.iter().any(|d| d["id"] == id));
+    assert_eq!(created["domain"]["name"], "corp.example", "{created}");
+    assert_eq!(created["domain"]["kind"], "authoritative", "{created}");
+    let id = created["domain"]["id"].as_str().expect("id").to_owned();
+    let (version, domains) = list().await;
+    assert!(domains.iter().any(|d| d["id"] == id));
     let (code, body) = http(
         admin,
         "POST",
         &base,
         &bearer,
-        Some(&json!({ "name": "corp.example" })),
+        Some(&json!({ "version": version, "name": "corp.example" })),
     )
     .await;
     assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
-    let (code, body) = http(admin, "GET", &format!("{base}/{id}"), &bearer, None).await;
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
-    // Удаление домена без учётных записей — 204, повтор — 404.
-    let (code, body) = http(admin, "DELETE", &format!("{base}/{id}"), &bearer, None).await;
-    assert_eq!(code, 204, "{}", String::from_utf8_lossy(&body));
-    assert!(!list().await.iter().any(|d| d["id"] == id));
-    let (code, body) = http(admin, "DELETE", &format!("{base}/{id}"), &bearer, None).await;
+    // Политика домена — на принятом домене: запись и чтение уровня «домен».
+    let policy = format!("{base}/{id}/policy");
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &policy,
+        &bearer,
+        Some(&json!({ "max_recipients": 50 })),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = http(admin, "GET", &policy, &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let read: Value = serde_json::from_slice(&body).expect("policy");
+    assert_eq!(read["policy"]["max_recipients"], 50, "{read}");
+    assert_eq!(read["effective"]["max_recipients"], 50, "{read}");
+
+    // Прежний ресурс доменов организации удалён.
+    let old = format!("/api/v1/orgs/{}/domains", TenantId::DEFAULT);
+    let (code, _) = http(admin, "GET", &old, &bearer, None).await;
+    assert_eq!(code, 404);
+    let (code, _) = http(admin, "GET", &format!("{old}/{id}"), &bearer, None).await;
+    assert_eq!(code, 404);
+
+    // Удаление домена без учётных записей — 200, повтор — 404.
+    let item = |version: u64, id: &str| format!("{base}/{id}?version={version}");
+    let (code, body) = http(admin, "DELETE", &item(version, &id), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let (version, domains) = list().await;
+    assert!(!domains.iter().any(|d| d["id"] == id));
+    let (code, body) = http(admin, "DELETE", &item(version, &id), &bearer, None).await;
     assert_eq!(code, 404, "{}", String::from_utf8_lossy(&body));
 
-    // Домен с учётной записью администратора не удаляется — 409, домен на месте.
-    let (code, body) = http(admin, "DELETE", &format!("{base}/{own}"), &bearer, None).await;
-    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
-    assert!(list().await.iter().any(|d| d["id"] == own));
+    // Домен с учётной записью администратора не удаляется (внешний ключ — 400), домен на месте.
+    let (code, body) = http(admin, "DELETE", &item(version, &own), &bearer, None).await;
+    assert_eq!(code, 400, "{}", String::from_utf8_lossy(&body));
+    assert!(list().await.1.iter().any(|d| d["id"] == own));
 
     shutdown.cancel();
     let report = running.wait().await.expect("wait");
@@ -1917,10 +2003,11 @@ async fn admin_domains() {
     drop_database(&url, &db_name).await;
 }
 
-/// `GET /api/v1/orgs/{org}/domains`: 200 и список доменов.
-async fn domain_list(addr: std::net::SocketAddr, path: &str, bearer: &str) -> Vec<Value> {
+/// `GET /api/v1/orgs/{org}/transport/domains`: 200, версия снимка кластера и принятые домены организации.
+async fn domain_list(addr: std::net::SocketAddr, path: &str, bearer: &str) -> (u64, Vec<Value>) {
     let (code, body) = http(addr, "GET", path, bearer, None).await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     let list: Value = serde_json::from_slice(&body).expect("domains");
-    list.as_array().expect("array").clone()
+    let version = list["version"].as_u64().expect("version");
+    (version, list["domains"].as_array().expect("array").clone())
 }

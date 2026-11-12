@@ -192,8 +192,9 @@ pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Packet, ProtoError>
 /// Ответ SMTP из пакета `y`: `"550 5.7.1 текст"`. Неверный код — `None`.
 pub fn parse_replycode(p: &Packet) -> Option<(u16, [u8; 3], String)> {
     let text = String::from_utf8_lossy(p.split().first().copied().unwrap_or_default()).into_owned();
-    // Многострочный ответ — первая строка.
-    let line = text.lines().next().unwrap_or_default();
+    // Многострочный ответ — первая строка; одиночный `\r` — тоже конец строки (FIX-08: иначе он уходил
+    // в ответ SMTP клиенту).
+    let line = text.split(['\r', '\n']).next().unwrap_or_default();
     let (code, rest) = line.split_at_checked(3)?;
     let code: u16 = code.parse().ok()?;
     if !(400..600).contains(&code) {
@@ -210,7 +211,12 @@ pub fn parse_replycode(p: &Packet) -> Option<(u16, [u8; 3], String)> {
             None => (default_esc(code), rest),
         },
     };
-    Some((code, esc, msg.to_owned()))
+    // Прочие управляющие символы (табуляция, `ESC` и т. п.) в строку ответа SMTP не попадают.
+    let msg = msg
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    Some((code, esc, msg))
 }
 
 fn parse_esc(s: &str) -> Option<[u8; 3]> {
@@ -227,3 +233,7 @@ fn default_esc(code: u16) -> [u8; 3] {
 pub fn take_u32(data: &mut Bytes) -> Option<u32> {
     (data.len() >= 4).then(|| data.get_u32())
 }
+
+#[cfg(test)]
+#[path = "fuzz_tests.rs"]
+mod fuzz_tests;

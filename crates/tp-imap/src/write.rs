@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 use time::OffsetDateTime;
+use tp_contracts::audit::AuditAction;
 use tp_contracts::auth::Rights;
 use tp_contracts::bus::{Event, EventKind};
 use tp_contracts::meta::{AccountScope, Flag, Inserted, Message, MessageQuery, SpecialUse};
@@ -163,6 +164,11 @@ impl<T: Transport> Session<T> {
         let to = node.mailbox.id;
         let same = scope == to_scope;
         let to_trash = same && mv && node.mailbox.role == Some(SpecialUse::Trash) && to != source;
+        // Письма чужой папки читаются копированием: запись до выдачи копии.
+        if Some(scope) != self.scope() {
+            self.audit(scope, AuditAction::Read, source, &ids, None)
+                .await?;
+        }
         // Пары (исходный UID, новый UID) в порядке писем.
         let pairs: Vec<(u32, u32)> = if !same || !(to_trash || to_rights.contains(flag_rights())) {
             // Другая учётная запись или не все флаги разрешены: побайтовая копия с разрешёнными флагами.
@@ -227,6 +233,18 @@ impl<T: Transport> Session<T> {
                 .filter(|t| moved.contains(&t.1))
                 .map(|t| t.0)
                 .collect();
+            let moved_ids: Vec<MessageId> = targets
+                .iter()
+                .filter(|t| moved.contains(&t.1))
+                .map(|t| t.2)
+                .collect();
+            let action = if to_trash {
+                AuditAction::Delete
+            } else {
+                AuditAction::Move
+            };
+            self.audit_done(scope, action, source, &moved_ids, Some(format!("to {to}")))
+                .await;
             self.expunged(&gone);
             if to != source {
                 self.after_change(to).await?;
@@ -411,17 +429,19 @@ impl<T: Transport> Session<T> {
         }
         let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let ids: Vec<MessageId> = found.iter().map(|f| f.1).collect();
-        let indexes: Vec<usize> = if self.in_trash(mailbox).await? {
+        let (indexes, removed): (Vec<usize>, Vec<MessageId>) = if self.in_trash(mailbox).await? {
             let gone = self.purge(scope, mailbox, &ids).await?;
             found
                 .iter()
                 .filter(|f| gone.contains(&f.1))
-                .map(|f| f.0)
-                .collect()
+                .copied()
+                .unzip()
         } else {
             self.ctx.deps.store.delete_to_trash(scope, &ids).await?;
-            found.iter().map(|f| f.0).collect()
+            found.iter().copied().unzip()
         };
+        self.audit_done(scope, AuditAction::Delete, mailbox, &removed, None)
+            .await;
         self.expunged(&indexes);
         self.ok(tag, None, &format!("{verb} completed"));
         Ok(())
@@ -440,11 +460,15 @@ impl<T: Transport> Session<T> {
             if !found.is_empty() {
                 let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
                 let ids: Vec<MessageId> = found.iter().map(|f| f.1).collect();
-                if self.in_trash(mailbox).await? {
-                    self.purge(scope, mailbox, &ids).await?;
+                let removed: Vec<MessageId> = if self.in_trash(mailbox).await? {
+                    let gone = self.purge(scope, mailbox, &ids).await?;
+                    ids.into_iter().filter(|id| gone.contains(id)).collect()
                 } else {
                     self.ctx.deps.store.delete_to_trash(scope, &ids).await?;
-                }
+                    ids
+                };
+                self.audit_done(scope, AuditAction::Delete, mailbox, &removed, None)
+                    .await;
             }
         }
         self.selected = None;

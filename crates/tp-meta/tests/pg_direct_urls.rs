@@ -2,7 +2,9 @@
 
 mod common;
 
-use tp_meta::pool::{PoolConfig, SchemaOwner, connect_direct};
+use std::sync::Arc;
+
+use tp_meta::pool::{NoAcquireObserver, PoolConfig, SchemaOwner, connect_direct};
 use tp_meta::schema;
 use tp_meta::signals::connect_listener;
 
@@ -21,9 +23,9 @@ fn behind_pgbouncer(url: &str) -> PoolConfig {
     }
 }
 
-async fn port_of(pool: &sqlx::PgPool) -> i32 {
+async fn port_of(pool: &tp_meta::pool::DbPool) -> i32 {
     sqlx::query_scalar("SELECT current_setting('port')::int")
-        .fetch_one(pool)
+        .fetch_one(&mut *common::conn(pool).await)
         .await
         .expect("port")
 }
@@ -34,7 +36,7 @@ async fn listener_searches_primary_in_direct_urls() {
         return;
     };
     let cfg = behind_pgbouncer(&url);
-    let listener = connect_listener(&cfg, common::secrets())
+    let listener = connect_listener(&cfg, common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("listener");
     assert_eq!(listener.metrics().primary, 1, "второй прямой адрес");
@@ -47,7 +49,7 @@ async fn listener_searches_primary_in_direct_urls() {
         ..cfg
     };
     assert!(matches!(
-        connect_listener(&none, common::secrets()).await,
+        connect_listener(&none, common::secrets(), Arc::new(NoAcquireObserver)).await,
         Err(tp_contracts::Error::Invalid(_))
     ));
 }
@@ -59,9 +61,13 @@ async fn migrations_search_primary_in_direct_urls() {
     };
     let cfg = behind_pgbouncer(&url);
     // С учётными данными узла.
-    let pool = connect_direct(&cfg, common::secrets().as_ref())
-        .await
-        .expect("direct");
+    let pool = connect_direct(
+        &cfg,
+        common::secrets().as_ref(),
+        Arc::new(NoAcquireObserver),
+    )
+    .await
+    .expect("direct");
     schema::migrate(&pool).await.expect("migrate");
     assert!(port_of(&pool).await > 1);
     pool.close().await;
@@ -79,9 +85,13 @@ async fn migrations_search_primary_in_direct_urls() {
         }),
         ..cfg.clone()
     };
-    let pool = connect_direct(&owner, common::secrets().as_ref())
-        .await
-        .expect("owner");
+    let pool = connect_direct(
+        &owner,
+        common::secrets().as_ref(),
+        Arc::new(NoAcquireObserver),
+    )
+    .await
+    .expect("owner");
     schema::migrate(&pool).await.expect("migrate");
     pool.close().await;
 
@@ -91,9 +101,13 @@ async fn migrations_search_primary_in_direct_urls() {
         ..cfg
     };
     assert_eq!(
-        connect_direct(&dead, common::secrets().as_ref())
-            .await
-            .err(),
+        connect_direct(
+            &dead,
+            common::secrets().as_ref(),
+            Arc::new(NoAcquireObserver)
+        )
+        .await
+        .err(),
         Some(tp_contracts::Error::UNAVAILABLE)
     );
 }

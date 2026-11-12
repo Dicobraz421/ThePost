@@ -6,22 +6,25 @@ Linux или WSL2 с Docker. Rspamd принимает Milter на воркер�
 
 ## Подготовка
 1. `docker run -d --name tp-rspamd -p 11332:11332 rspamd/rspamd:3.11.1` → контейнер запущен.
-2. config.yaml узла (роль smtp-in и submission, локальный домен `example.org`):
+2. config.yaml узла (роль smtp-in и submission):
    ```yaml
    smtp:
      hostname: mx.example.org
      inbound:
        - listen: "127.0.0.1:2525"
-     delivery:
-       local_domains: [example.org]
      milter:
        filters:
          - name: rspamd
            address: "127.0.0.1:11332"
-           submission: true
+           direction: inbound
+           on_failure: accept
+         - name: rspamd-out
+           address: "127.0.0.1:11332"
+           direction: outbound
            on_failure: accept
    ```
-3. `thepost serve` с этой конфигурацией; учётная запись `bob@example.org` существует.
+3. `thepost serve` с этой конфигурацией; `example.org` — принятый домен организации
+   (`thepost admin domain add example.org`), учётная запись `bob@example.org` существует.
 
 ## Сценарии
 1. Обычное письмо: `swaks --server 127.0.0.1:2525 --to bob@example.org --from a@example.net` → `250 2.0.0 OK`;
@@ -30,7 +33,7 @@ Linux или WSL2 с Docker. Rspamd принимает Milter на воркер�
    отказ `554 5.7.1` (действие `reject` Rspamd, ответ `replycode`), письмо не доставлено.
 3. Карантин: в `local.d/actions.conf` Rspamd задать `add_header = 0.1;` и `rewrite_subject = null;`, перезапустить —
    письмо из п. 1 приходит с `X-Spam: Yes`. Для `quarantine` (через модуль `force_actions`) — письмо в «Спам» bob;
-   то же письмо через submission — отказ `550 5.7.1 Message held by content filter`.
+   то же письмо через submission (фильтр направления `outbound`) — отказ `550 5.7.1 Message held by content filter`.
 4. Недоступность, `on_failure: accept`: `docker stop tp-rspamd`, письмо из п. 1 → `250`, в письме
    `X-ThePost-Milter: rspamd; unavailable`, в журнале узла — `milter: фильтр недоступен`.
 5. Недоступность, `on_failure: tempfail`: изменить политику (hot reload), повторить п. 4 → `451 4.7.1`.

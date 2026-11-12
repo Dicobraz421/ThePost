@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use sqlx::postgres::PgSslMode;
-use sqlx::{FromRow, PgPool};
 use tp_contracts::Result;
 use tp_contracts::config::duration;
 
+use crate::pool::DbPool;
 use crate::schema::db_err;
 
 /// Пороги проверок СУБД (SRS 3.1, 5.5): секция `meta.doctor`.
@@ -154,7 +155,7 @@ pub fn is_utc(tz: &str) -> bool {
 }
 
 /// Проверяет СУБД пула. Ошибка — только недоступность СУБД; несоответствия — в отчёте.
-pub async fn check(pool: &PgPool, cfg: &DoctorConfig) -> Result<Report> {
+pub async fn check(pool: &DbPool, cfg: &DoctorConfig) -> Result<Report> {
     let query = sqlx::query_as::<_, Settings>(
         "SELECT current_setting('server_version_num')::int AS version_num,
                 current_setting('server_version') AS version,
@@ -175,17 +176,21 @@ pub async fn check(pool: &PgPool, cfg: &DoctorConfig) -> Result<Report> {
                 ss.ssl, ss.version AS ssl_version, ss.cipher AS ssl_cipher
          FROM pg_roles r LEFT JOIN pg_stat_ssl ss ON ss.pid = pg_backend_pid()
          WHERE r.rolname = current_user",
-    )
-    .fetch_one(pool);
+    );
+    let query = async {
+        query
+            .fetch_one(&mut *pool.acquire().await?)
+            .await
+            .map_err(db_err)
+    };
     let s = tokio::time::timeout(cfg.timeout, query)
         .await
-        .map_err(|_| tp_contracts::Error::UNAVAILABLE)?
-        .map_err(db_err)?;
+        .map_err(|_| tp_contracts::Error::UNAVAILABLE)??;
     Ok(evaluate(
         &s,
         cfg,
-        pool.options().get_max_connections(),
-        pool.connect_options().get_ssl_mode(),
+        pool.snapshot().max,
+        pool.raw().connect_options().get_ssl_mode(),
     ))
 }
 

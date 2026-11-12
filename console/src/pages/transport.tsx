@@ -1,11 +1,13 @@
-// Транспорт (SRS 4.1): принятые домены, доверенные источники, политики доменов назначения (маршруты).
+// Транспорт (SRS 4.1): принятые домены — единственный ресурс доменов организации (решение 94) — и их политика,
+// доверенные источники, политики доменов назначения (маршруты).
 // Каждая запись несёт версию снимка из последнего чтения; расхождение — ответ 409, списки перечитываются.
 import { List } from "@refinedev/antd";
 import { type BaseRecord, type HttpError, useCustom, useCustomMutation, usePermissions } from "@refinedev/core";
-import { Button, Form, Input, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Typography } from "antd";
+import { Button, Form, Input, Modal, Popconfirm, Select, Space, Spin, Switch, Table, Tabs, Typography } from "antd";
 import { type ReactNode, useState } from "react";
 
 import type { Schemas } from "../api/client";
+import { PolicyForm } from "../components/policy-form";
 import { useReadOnly } from "../providers/access";
 
 // Схема OpenAPI описывает эти значения как произвольные объекты (`DomainList`, `SourceList`, `RouteList`,
@@ -43,6 +45,8 @@ type SectionProps<T, F> = {
   remove: (r: T) => Write;
   /** Нельзя изменить из этого раздела (чужая запись, только чтение). */
   locked?: (r: T) => boolean;
+  /** Дополнительное действие строки (доступно и только для чтения). */
+  extra?: (r: T) => ReactNode;
   readOnly: boolean;
   saving: boolean;
   run: Run;
@@ -61,29 +65,32 @@ function Section<T extends object, F extends object>(p: SectionProps<T, F>) {
       )}
       <Table<T> dataSource={p.rows} loading={p.loading} rowKey={p.rowKey} pagination={false}>
         {p.columns}
-        {!p.readOnly && (
+        {(!p.readOnly || p.extra) && (
           <Table.Column<T>
             title="Действия"
-            width={220}
-            render={(_, r) =>
-              !p.locked?.(r) && (
-                <Space>
-                  <Button size="small" onClick={() => setOpen({ row: r })}>
-                    Изменить
-                  </Button>
-                  <Popconfirm
-                    title={`Удалить ${p.what} ${p.rowKey(r)}?`}
-                    okText="Удалить"
-                    okButtonProps={{ danger: true }}
-                    onConfirm={() => p.run(p.remove(r), `Удалено: ${p.rowKey(r)}`)}
-                  >
-                    <Button size="small" danger>
-                      Удалить
+            width={p.extra ? 320 : 220}
+            render={(_, r) => (
+              <Space>
+                {p.extra?.(r)}
+                {!p.readOnly && !p.locked?.(r) && (
+                  <>
+                    <Button size="small" onClick={() => setOpen({ row: r })}>
+                      Изменить
                     </Button>
-                  </Popconfirm>
-                </Space>
-              )
-            }
+                    <Popconfirm
+                      title={`Удалить ${p.what} ${p.rowKey(r)}?`}
+                      okText="Удалить"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => p.run(p.remove(r), `Удалено: ${p.rowKey(r)}`)}
+                    >
+                      <Button size="small" danger>
+                        Удалить
+                      </Button>
+                    </Popconfirm>
+                  </>
+                )}
+              </Space>
+            )}
           />
         )}
       </Table>
@@ -142,6 +149,31 @@ function DomainFields() {
         </Form.Item>
       )}
     </>
+  );
+}
+
+/** Политика принятого домена — уровень «домен» цепочки организация → домен → ящик. */
+function DomainPolicy({ domain, onClose }: { domain: Domain; onClose: () => void }) {
+  const url = `${ORG}/domains/${enc(domain.id)}/policy`;
+  const { result, query } = useCustom<Schemas["Policies"]>({ url, method: "get" });
+  const { mutate, mutation } = useCustomMutation<Schemas["PolicyBody"]>();
+  return (
+    <Modal open title={`Политика домена ${domain.name}`} footer={null} width={720} onCancel={onClose} destroyOnHidden>
+      {query.isLoading ? (
+        <Spin />
+      ) : (
+        <PolicyForm
+          policies={result.data}
+          saving={mutation.isPending}
+          onSave={(values) =>
+            mutate(
+              { url, method: "put", values, successNotification: { type: "success", message: "Политика домена сохранена" } },
+              { onSuccess: () => void query.refetch() },
+            )
+          }
+        />
+      )}
+    </Modal>
   );
 }
 
@@ -309,6 +341,7 @@ export function TransportPage() {
   const routes = useCustom<{ version: number; routes: Route[] }>({ url: `${ORG}/routes`, method: "get" });
   const cluster = useCustom<{ version: number; domains: Domain[]; sources: Source[] }>({ url: CLUSTER, method: "get", queryOptions: { enabled: installation } });
   const { mutate, mutation } = useCustomMutation<BaseRecord, HttpError, unknown>();
+  const [policyOf, setPolicyOf] = useState<Domain | null>(null);
   const run: Run = (w, message, done) =>
     mutate(
       { ...w, values: w.values, successNotification: { type: "success", message } },
@@ -371,6 +404,11 @@ export function TransportPage() {
             },
           })}
           remove={(d) => ({ method: "delete", url: `${ORG}/domains/${enc(d.id)}?version=${clusterVersion}` })}
+          extra={(d) => (
+            <Button size="small" onClick={() => setPolicyOf(d)}>
+              Политика
+            </Button>
+          )}
         />
       ),
     },
@@ -444,6 +482,7 @@ export function TransportPage() {
   return (
     <List title="Транспорт" breadcrumb={false} headerButtons={() => null}>
       <Tabs destroyOnHidden items={items} />
+      {policyOf && <DomainPolicy domain={policyOf} onClose={() => setPolicyOf(null)} />}
     </List>
   );
 }

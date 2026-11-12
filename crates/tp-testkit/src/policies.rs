@@ -1,11 +1,13 @@
-//! In-memory политики: уровни цепочки и выбор пользователя `trash.purge` (CONTRACTS.md#Tenant,
-//! #Trash, Retention, Quota (Ф1); решение 2026-11-01-trash-purge).
+//! In-memory политики: уровни цепочки ([`PolicyStore`], CTR-25), разрешение ([`PolicyResolver`]) и выбор
+//! пользователя `trash.purge` (CONTRACTS.md#Tenant, #Trash, Retention, Quota (Ф1); решение 2026-11-01-trash-purge).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tp_contracts::meta::{AccountScope, AccountStore, Policy, PolicyResolver};
+use tp_contracts::meta::{
+    AccountScope, AccountStore, Policy, PolicyResolver, PolicyStore, PolicyTarget,
+};
 use tp_contracts::retention::{TrashPurge, TrashPurgeRule, TrashPurgeSetting};
 use tp_contracts::{AccountId, DomainId, Error, MailboxId, Result, TenantId};
 
@@ -13,26 +15,13 @@ use crate::infra::lock;
 use crate::meta::MemMetadata;
 use crate::suite::TrashPurgeAdmin;
 
-/// Уровень цепочки политик.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PolicyLevel {
-    /// Организация.
-    Tenant,
-    /// Домен.
-    Domain(DomainId),
-    /// Учётная запись (ящик).
-    Account(AccountId),
-    /// Папка.
-    Mailbox(MailboxId),
-}
-
 #[derive(Debug, Default)]
 struct PolicyState {
-    levels: HashMap<(TenantId, PolicyLevel), Policy>,
+    levels: HashMap<(TenantId, PolicyTarget), Policy>,
     users: HashMap<(TenantId, AccountId), TrashPurge>,
 }
 
-/// [`PolicyResolver`] в памяти: политики уровней задаёт тест, домен учётной записи — из [`MemMetadata`].
+/// [`PolicyStore`] и [`PolicyResolver`] в памяти; домен учётной записи — из [`MemMetadata`].
 /// Клоны разделяют данные.
 #[derive(Debug, Clone)]
 pub struct MemPolicies {
@@ -49,8 +38,7 @@ impl MemPolicies {
         }
     }
 
-    /// Политика уровня без наложения; не задана — все поля `None`.
-    pub fn policy(&self, tenant: TenantId, level: PolicyLevel) -> Policy {
+    fn level(&self, tenant: TenantId, level: PolicyTarget) -> Policy {
         lock(&self.state)
             .levels
             .get(&(tenant, level))
@@ -58,8 +46,7 @@ impl MemPolicies {
             .unwrap_or_default()
     }
 
-    /// Задаёт политику уровня целиком; политика без заданных полей удаляет уровень.
-    pub fn set_policy(&self, tenant: TenantId, level: PolicyLevel, policy: Policy) {
+    fn put(&self, tenant: TenantId, level: PolicyTarget, policy: Policy) {
         let mut st = lock(&self.state);
         if policy == Policy::default() {
             st.levels.remove(&(tenant, level));
@@ -72,12 +59,12 @@ impl MemPolicies {
     pub fn set_trash_purge_rule(
         &self,
         tenant: TenantId,
-        level: PolicyLevel,
+        level: PolicyTarget,
         rule: Option<TrashPurgeRule>,
     ) {
-        let mut policy = self.policy(tenant, level);
+        let mut policy = self.level(tenant, level);
         policy.trash_purge = rule;
-        self.set_policy(tenant, level, policy);
+        self.put(tenant, level, policy);
     }
 
     async fn domain_of(&self, scope: AccountScope) -> Result<DomainId> {
@@ -85,6 +72,23 @@ impl MemPolicies {
             .await?
             .ok_or(Error::NotFound)?
             .domain)
+    }
+}
+
+#[async_trait]
+impl PolicyStore for MemPolicies {
+    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
+        Ok(self.level(tenant, target))
+    }
+
+    async fn set_policy(
+        &self,
+        tenant: TenantId,
+        target: PolicyTarget,
+        policy: &Policy,
+    ) -> Result<()> {
+        self.put(tenant, target, policy.clone());
+        Ok(())
     }
 }
 
@@ -98,16 +102,16 @@ impl PolicyResolver for MemPolicies {
         mailbox: Option<MailboxId>,
     ) -> Result<Policy> {
         let levels = [
-            Some(PolicyLevel::Tenant),
-            domain.map(PolicyLevel::Domain),
-            account.map(PolicyLevel::Account),
-            mailbox.map(PolicyLevel::Mailbox),
+            Some(PolicyTarget::Tenant),
+            domain.map(PolicyTarget::Domain),
+            account.map(PolicyTarget::Account),
+            mailbox.map(PolicyTarget::Mailbox),
         ];
         Ok(levels
             .into_iter()
             .flatten()
             .fold(Policy::default(), |p, level| {
-                p.overlay(self.policy(tenant, level))
+                p.overlay(self.level(tenant, level))
             }))
     }
 
@@ -148,7 +152,7 @@ impl PolicyResolver for MemPolicies {
 #[async_trait]
 impl TrashPurgeAdmin for MemPolicies {
     async fn set_tenant_rule(&self, tenant: TenantId, rule: Option<TrashPurgeRule>) {
-        self.set_trash_purge_rule(tenant, PolicyLevel::Tenant, rule);
+        self.set_trash_purge_rule(tenant, PolicyTarget::Tenant, rule);
     }
 }
 
@@ -157,7 +161,7 @@ mod tests {
     use super::*;
     use crate::fakes::MemTrash;
     use crate::infra::ManualClock;
-    use crate::suite::{TrashPurgeFixture, trash_purge};
+    use crate::suite::{PolicyFixture, TrashPurgeFixture, policy_store, trash_purge};
     use crate::{MemMetadata, MemQuota};
 
     #[tokio::test]
@@ -180,14 +184,16 @@ mod tests {
         };
         p.set_policy(
             s.tenant,
-            PolicyLevel::Tenant,
-            Policy {
+            PolicyTarget::Tenant,
+            &Policy {
                 quota_bytes: Some(10),
                 ..Policy::default()
             },
-        );
-        p.set_trash_purge_rule(s.tenant, PolicyLevel::Tenant, Some(erase));
-        p.set_trash_purge_rule(s.tenant, PolicyLevel::Domain(domain), Some(choose));
+        )
+        .await
+        .expect("set");
+        p.set_trash_purge_rule(s.tenant, PolicyTarget::Tenant, Some(erase));
+        p.set_trash_purge_rule(s.tenant, PolicyTarget::Domain(domain), Some(choose));
         let resolved = p
             .resolve(s.tenant, Some(domain), Some(s.account), None)
             .await
@@ -207,7 +213,7 @@ mod tests {
         );
         // Ящик без выбора пользователя: значение администратора, выбор хранится, но не действует.
         let hide_only = TrashPurgeRule::default();
-        p.set_trash_purge_rule(s.tenant, PolicyLevel::Account(s.account), Some(hide_only));
+        p.set_trash_purge_rule(s.tenant, PolicyTarget::Account(s.account), Some(hide_only));
         let setting = p.trash_purge(s).await.expect("setting");
         assert_eq!(
             (setting.user, setting.effective()),
@@ -218,12 +224,12 @@ mod tests {
             Err(Error::Forbidden)
         );
         assert_eq!(p.set_user_trash_purge(s, None).await, Ok(()));
-        p.set_trash_purge_rule(s.tenant, PolicyLevel::Account(s.account), None);
-        p.set_trash_purge_rule(s.tenant, PolicyLevel::Domain(domain), None);
-        p.set_trash_purge_rule(s.tenant, PolicyLevel::Tenant, None);
+        p.set_trash_purge_rule(s.tenant, PolicyTarget::Account(s.account), None);
+        p.set_trash_purge_rule(s.tenant, PolicyTarget::Domain(domain), None);
+        p.set_trash_purge_rule(s.tenant, PolicyTarget::Tenant, None);
         assert_eq!(
-            p.policy(s.tenant, PolicyLevel::Domain(domain)),
-            Policy::default(),
+            p.policy(s.tenant, PolicyTarget::Domain(domain)).await,
+            Ok(Policy::default()),
             "пустой уровень удалён"
         );
         let other = AccountScope {
@@ -231,6 +237,20 @@ mod tests {
             account: AccountId::new(),
         };
         assert_eq!(p.trash_purge(other).await, Err(Error::NotFound));
+    }
+
+    #[tokio::test]
+    async fn suite_policy_store() {
+        let meta = MemMetadata::new(ManualClock::default().shared());
+        let p = MemPolicies::new(&meta);
+        let fx = PolicyFixture {
+            tenant: TenantId::new(),
+            foreign_tenant: TenantId::new(),
+            domain: DomainId::new(),
+            account: AccountId::new(),
+            mailbox: MailboxId::new(),
+        };
+        policy_store(&p, &p, &fx).await;
     }
 
     #[tokio::test]

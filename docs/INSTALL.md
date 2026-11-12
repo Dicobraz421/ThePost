@@ -25,8 +25,16 @@ git clone https://github.com/Dicobraz421/ThePost && cd ThePost
 docker compose -f deploy/compose/dev.yml --profile smb up -d --build
 ```
 
-Первая сборка образа идёт 20–30 минут (Rust собирается внутри Docker, на машине его ставить не нужно). Когда все
-контейнеры запущены, проверьте окружение:
+Первая сборка образа идёт 20–30 минут (Rust собирается внутри Docker, на машине его ставить не нужно). Без сборки —
+готовый образ выпуска из ghcr.io. Образ закрытый: сначала войдите в реестр токеном GitHub с правом `read:packages`
+(выдаёт владелец репозитория), `<версия>` — из выпуска (тег образа совпадает с `appVersion` чарта Helm):
+
+```bash
+docker login ghcr.io -u <логин GitHub>          # пароль — токен read:packages
+THEPOST_IMAGE=ghcr.io/dicobraz421/thepost:<версия> docker compose -f deploy/compose/dev.yml --profile smb up -d
+```
+
+Когда все контейнеры запущены, проверьте окружение:
 
 ```bash
 docker compose -f deploy/compose/dev.yml --profile smb run --rm --no-deps thepost doctor
@@ -177,11 +185,27 @@ smtp:
 
 `thepost doctor` проверяет MX, SPF, DKIM, DMARC, MTA-STS и PTR по публичному DNS и подсказывает, чего не хватает.
 
+## Kubernetes: Helm
+
+Чарт — `deploy/helm/thepost`, до него — OpenBao и секрет TLS (порядок — в
+[`deploy/README.md`](../deploy/README.md#kubernetes-helm)). Образ в ghcr.io закрытый: нужен секрет реестра с токеном
+GitHub (`read:packages`), без `imagePullSecrets` чарт не устанавливается и подсказывает, что сделать:
+
+```bash
+kubectl -n thepost create secret docker-registry ghcr --docker-server=ghcr.io   --docker-username=<логин GitHub> --docker-password=<токен read:packages>
+helm install thepost deploy/helm/thepost -n thepost --set 'imagePullSecrets[0].name=ghcr' -f <свои значения>
+```
+
+Тег образа по умолчанию — `appVersion` чарта: установка закреплена за выпуском. Другой тег — `--set image.tag=…`.
+
 ## Обновление
 
 - **Ansible** — скачайте новый выпуск и повторите `ansible-playbook … -e thepost_binary_src=…`: узел перезапустится,
   миграции базы применятся сами.
-- **Docker Compose** — `git pull` и `… --profile smb up -d --build`.
+- **Docker Compose** — `git pull` и `… --profile smb up -d --build` (с готовым образом — новая `<версия>` в
+  `THEPOST_IMAGE` и `… up -d`).
+- **Helm** — `git pull` и `helm upgrade thepost deploy/helm/thepost -n thepost --reuse-values`: тег образа — новый
+  `appVersion` чарта.
 
 Перед обновлением рабочего сервера сделайте внеочередную копию: `sudo systemctl start thepost-backup@full` (см. ниже).
 
@@ -280,8 +304,10 @@ SRS 3.5). Поэтому потерять можно только письма, 
 Копия OpenBao (секреты узла, в том числе ключи DKIM) снимается вместе с копией базы — снимок Raft в то же
 хранилище копий. Заранее храните **вне сервера**: `/root/openbao-init.json`, `/etc/openbao/unseal.key` и пароль restic.
 
-1. Установите новый сервер: `ansible-playbook … deploy/ansible/smb.yml -e thepost_backup=false`. Если в настройках
-   задан DKIM, прогон остановится на `Wait for thepost readiness` — это ожидаемо: ключ DKIM вернётся из снимка.
+1. Установите новый сервер без копирования и без ожидания готовности узла:
+   `ansible-playbook … deploy/ansible/smb.yml -e thepost_backup=false -e thepost_wait_ready=false`. Прогон завершится
+   успешно с предупреждением «thepost не готов»: узел ждёт секретов прежнего сервера (ключ DKIM и другие), они
+   вернутся из снимка OpenBao.
 2. Верните копии по тем же путям и выполните `chown -R postgres:postgres /var/lib/pgbackrest`.
 3. В новом OpenBao заведите только хранилище пароля копий:
    `bao secrets enable -path=thepost-backup -version=2 kv` и

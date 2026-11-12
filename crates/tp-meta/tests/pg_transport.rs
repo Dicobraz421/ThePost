@@ -102,7 +102,7 @@ impl TransportStore for WithTenants {
 
 /// Транзакция организации от имени роли приложения `thepost_app` (суперпользователь тестов обходит RLS).
 async fn app_tx(
-    pool: &sqlx::PgPool,
+    pool: &tp_meta::pool::DbPool,
     tenant: TenantId,
 ) -> sqlx::Transaction<'static, sqlx::Postgres> {
     let mut tx = schema::begin(pool, tenant).await.expect("begin");

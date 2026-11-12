@@ -1,12 +1,17 @@
 {#- Эталон SMB: пресет all (deploy/config/all.yaml) + параметры узла; поверх — thepost_config_extra. -#}
 {%- set acme = thepost_tls_mode == 'acme' -%}
 {%- set tls_dir = '/var/lib/thepost/tls' if acme else '/etc/thepost/tls' -%}
-{%- set filters = [{'name': 'rspamd', 'address': thepost_rspamd_milter_address,
-                    'inbound': true, 'submission': thepost_milter_submission}] -%}
-{%- if thepost_clamav -%}
-{%-   set filters = filters + [{'name': 'clamav', 'address': thepost_clamav_milter_address,
-                               'inbound': true, 'submission': thepost_milter_submission}] -%}
-{%- endif -%}
+{#- Фильтр Milter описывается отдельно на каждое направление: inbound — приём, outbound — почта пользователей. -#}
+{%- set milters = [('rspamd', thepost_rspamd_milter_address)]
+      + ([('clamav', thepost_clamav_milter_address)] if thepost_clamav else []) -%}
+{%- set directions = ['inbound'] + (['outbound'] if thepost_milter_submission else []) -%}
+{%- set filters = [] -%}
+{%- for direction in directions -%}
+{%-   for name, address in milters -%}
+{%-     set _ = filters.append({'name': name if direction == 'inbound' else name ~ '-outbound',
+                                'address': address, 'direction': direction}) -%}
+{%-   endfor -%}
+{%- endfor -%}
 {%- set base = {
   'domain': thepost_domain,
   'roles': ['all'],
@@ -35,7 +40,6 @@
       {'listen': thepost_listen_address ~ ':587'},
       {'listen': thepost_listen_address ~ ':465', 'implicit_tls': true},
     ],
-    'delivery': {'local_domains': thepost_local_domains},
     'milter': {'filters': filters},
   },
   'secrets': {

@@ -12,9 +12,10 @@ use crate::forward::Forwarding;
 
 // ---------- SMTP-21: принятые домены ----------
 
+/// Принятые домены `domains` сверх `example.org` окружения.
 async fn with_domains(env: &Env, domains: &[(&str, TenantId, DomainKind)]) -> Delivery {
-    let store = MemTransport::new();
-    let mut v = 0;
+    let store = env.transport.clone();
+    let mut v = store.cluster().await.expect("cluster").version;
     for (name, tenant, kind) in domains {
         v = store
             .put_domain(
@@ -30,7 +31,6 @@ async fn with_domains(env: &Env, domains: &[(&str, TenantId, DomainKind)]) -> De
             .expect("domain");
     }
     env.delivery(true)
-        .with_transport(Arc::new(Routes::new(Arc::new(store))))
 }
 
 #[tokio::test]
@@ -52,7 +52,7 @@ async fn accepted_domains_authoritative_relay_and_foreign() {
     // Полномочный домен (только в настройках транспорта): неизвестный адрес — 550 5.1.1.
     let r = d.rcpt(&e, "nobody@corp.example").await;
     assert_eq!((r.code, r.esc), (550, [5, 1, 1]));
-    // Домен каталога по-прежнему полномочный.
+    // Принятый домен окружения — тоже полномочный.
     assert_eq!(d.rcpt(&e, "nobody@example.org").await.code, 550);
     // Внутренняя ретрансляция: адрес вне каталога принимается и ставится в очередь (smtp-out — на next_hop).
     assert_eq!(d.rcpt(&e, "old.user@legacy.example").await.code, 250);

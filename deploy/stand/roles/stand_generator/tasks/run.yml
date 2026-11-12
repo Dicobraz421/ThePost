@@ -1,12 +1,83 @@
-# Прогон сценария (DEP-04, DEP-13, DEP-14): срезы узла SMB (smb-sampler.py) на всё время, run-scenario.sh на
-# генераторе; для faults — kill -9 узла и перезапуск PostgreSQL на 1/3 и 2/3 длительности. После нагрузки срезы
-# узла кладутся в каталог прогона генератора, run-scenario.sh строит criteria.md; отчёт — в
-# deploy/stand/reports/<прогон>-<сценарий>/. Задача падает, если в criteria.md есть «не прошёл».
+# Прогон сценария (DEP-04, DEP-13, DEP-14, DEP-25): профиль порогов узла (stand_profile) поверх конфигурации
+# установки, срезы узла SMB (smb-sampler.py) на всё время, run-scenario.sh на генераторе; для faults — kill -9 узла
+# и перезапуск PostgreSQL на 1/3 и 2/3 длительности. После нагрузки срезы узла кладутся в каталог прогона
+# генератора, run-scenario.sh строит criteria.md; отчёт — в deploy/stand/reports/<прогон>-<профиль>-<сценарий>/.
+# Задача падает, если в criteria.md есть «не прошёл».
 ---
-- name: Check scenario
+- name: Check scenario and profile
   ansible.builtin.assert:
-    that: stand_scenario in stand_scenarios
-    fail_msg: "Сценарий {{ stand_scenario }}: нет в stand_scenarios ({{ stand_scenarios | list | join(', ') }})"
+    that:
+      - stand_scenario in stand_scenarios
+      - stand_profile in stand_profiles
+    fail_msg: >-
+      Сценарий {{ stand_scenario }} ({{ stand_scenarios | list | join(', ') }}) или профиль {{ stand_profile }}
+      ({{ stand_profiles | list | join(', ') }}): нет такого
+
+# Профиль: stand_profiles[stand_profile] поверх конфигурации установки (config.stand-base.yaml — stand.yml
+# --tags install; нет — текущая config.yaml, она и становится основой). Смена профиля — перезапуск узла.
+- name: Apply stand profile on SMB node
+  delegate_to: "{{ stand_smb_host }}"
+  vars:
+    stand_node_binary: "{{ hostvars[stand_smb_host].thepost_binary_path | default('/usr/local/bin/thepost') }}"
+  block:
+    - name: Check base configuration
+      ansible.builtin.stat:
+        path: /etc/thepost/config.stand-base.yaml
+      register: stand_base_stat
+
+    - name: Save current configuration as base
+      ansible.builtin.copy:
+        src: /etc/thepost/config.yaml
+        dest: /etc/thepost/config.stand-base.yaml
+        remote_src: true
+        owner: root
+        group: thepost
+        mode: "0640"
+      when: not stand_base_stat.stat.exists
+
+    - name: Read base configuration
+      ansible.builtin.slurp:
+        src: /etc/thepost/config.stand-base.yaml
+      register: stand_base
+
+    - name: Write configuration of profile
+      ansible.builtin.copy:
+        content: |
+          # Стенд SMB: профиль {{ stand_profile }} (deploy/stand/thresholds.yml) поверх config.stand-base.yaml.
+          {{ stand_base.content | b64decode | from_yaml
+             | combine(stand_profiles[stand_profile], recursive=true, list_merge='replace')
+             | to_nice_yaml(indent=2, width=120) }}
+        dest: /etc/thepost/config.yaml
+        owner: root
+        group: thepost
+        mode: "0640"
+        validate: "{{ stand_node_binary }} config check --config %s"
+      register: stand_profile_config
+
+    - name: Restart node with profile
+      ansible.builtin.systemd_service:
+        name: thepost
+        state: restarted
+      when: stand_profile_config is changed
+
+    - name: Wait for node readiness
+      ansible.builtin.uri:
+        url: "https://127.0.0.1:{{ hostvars[stand_smb_host].thepost_service_http_port | default(8081) }}/healthz/ready"
+        validate_certs: false
+      register: stand_ready
+      until: stand_ready.status == 200
+      retries: 60
+      delay: 5
+
+# Сценарий, зонды и отчёт — версии из этого клона и без --tags install.
+- name: Install scenario scripts
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ stand_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: [jmap.js, probe.js, run-scenario.sh, probes.py, criteria.py]
 
 - name: Write stand parameters
   ansible.builtin.template:
@@ -18,7 +89,7 @@
 
 - name: Fix run identifier
   ansible.builtin.set_fact:
-    stand_run: "{{ lookup('ansible.builtin.pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+    stand_run: "{{ lookup('ansible.builtin.pipe', 'date -u +%Y%m%dT%H%M%SZ') }}-{{ stand_profile }}"
 
 - name: Set run paths
   ansible.builtin.set_fact:

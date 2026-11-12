@@ -22,7 +22,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::meta::{Account, AccountStore};
-use tp_contracts::tls::{InternalTls, Profile};
+use tp_contracts::secrets::{Secret, SecretStore};
+use tp_contracts::tls::{InternalTls, KeySource, Profile};
 use tp_contracts::{Error, Result, TenantId};
 
 pub mod abuse;
@@ -184,9 +185,14 @@ pub(crate) fn check_channel(
             "{what}: tls.allow_plaintext is allowed only with profile: dev"
         )));
     }
-    if tls.cert_file.is_some() != tls.key_file.is_some() {
+    if tls.key_file.is_some() {
         return Err(Error::Invalid(format!(
-            "{what}: tls.cert_file and tls.key_file must be set together"
+            "{what}: tls.key_file is not supported; set tls.key: {{ secret: \"<path>#<field>\" }}"
+        )));
+    }
+    if tls.cert_file.is_some() != tls.key.is_some() {
+        return Err(Error::Invalid(format!(
+            "{what}: tls.cert_file and tls.key must be set together"
         )));
     }
     if tls.server_name.is_some() {
@@ -285,9 +291,63 @@ pub(crate) mod testutil {
     }
 }
 
+/// Ключ клиентского сертификата канала (`tls.key`, PEM) из хранилища секретов; `None` — без mTLS.
+/// `tls.key_file` не поддерживается (решение 100) — [`Error::Invalid`].
+pub(crate) async fn client_key(
+    what: &str,
+    tls: &InternalTls,
+    secrets: &dyn SecretStore,
+) -> Result<Option<Secret>> {
+    match tls.key_source()? {
+        None => Ok(None),
+        Some(KeySource::File(_)) => Err(Error::Invalid(format!(
+            "{what}: tls.key_file is not supported; set tls.key: {{ secret: \"<path>#<field>\" }}"
+        ))),
+        Some(KeySource::Secret(r)) => match secrets.get(r).await {
+            Ok(key) => Ok(Some(key)),
+            Err(Error::NotFound) => Err(Error::Invalid(format!(
+                "{what}: tls.key: secret {}#{} not found in the secret store",
+                r.path(),
+                r.field()
+            ))),
+            Err(e) => Err(e),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_client_key() {
+        let (s, p) = (["ldaps"], ["ldap"]);
+        let key = tp_contracts::secrets::SecretRef::new("thepost/ldap", "tls_key").expect("ref");
+        let check =
+            |tls: &InternalTls| check_channel("LDAP", "ldaps://dc", &s, &p, tls, Profile::Prod);
+        let pair = InternalTls {
+            cert_file: Some("/c.pem".into()),
+            key: Some(key.clone()),
+            ..InternalTls::default()
+        };
+        assert_eq!(check(&pair), Ok(false));
+        let only_key = InternalTls {
+            key: Some(key),
+            ..InternalTls::default()
+        };
+        assert!(check(&only_key).is_err());
+        let only_cert = InternalTls {
+            cert_file: Some("/c.pem".into()),
+            ..InternalTls::default()
+        };
+        assert!(check(&only_cert).is_err());
+        let file = InternalTls {
+            cert_file: Some("/c.pem".into()),
+            key_file: Some("/k.pem".into()),
+            ..InternalTls::default()
+        };
+        assert!(matches!(check(&file), Err(Error::Invalid(m)) if m.contains("key_file")));
+    }
 
     #[test]
     fn channel_tls() {
