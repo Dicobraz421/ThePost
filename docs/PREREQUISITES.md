@@ -48,6 +48,7 @@
 | 25 | приём почты (STARTTLS) | `openssl s_client -connect <сервер>:25 -starttls smtp` | внешняя почта не приходит | [INSTALL](INSTALL.md#что-понадобится) |
 | 465, 587 | отправка с входом (TLS, STARTTLS) | `openssl s_client -connect <сервер>:465` | клиенты не отправляют | [INSTALL](INSTALL.md#настройка-клиентов) |
 | 993, 143 | IMAP (TLS, STARTTLS) | `openssl s_client -connect <сервер>:993` | клиенты не читают почту | [INSTALL](INSTALL.md#настройка-клиентов) |
+| 4190 | ManageSieve — правила фильтрации (STARTTLS) | `openssl s_client -connect <сервер>:4190 -starttls sieve` | клиенты не меняют правила фильтрации | [INSTALL](INSTALL.md#настройка-клиентов) |
 | 443 | JMAP, автонастройка | `curl -si https://<сервер>/.well-known/jmap` → `401` | JMAP-клиенты не подключаются | [deploy/README](../deploy/README.md#эталон-smb-в-контейнерах-профиль-smb) |
 | 80 | только выпуск сертификата Let's Encrypt (`certbot`, HTTP-01) | `curl -I http://<сервер>/` во время выпуска | сертификат не выпускается | [INSTALL](INSTALL.md#рабочий-сервер-ansible) |
 
