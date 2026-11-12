@@ -249,8 +249,8 @@ Dr.Web для почтовых серверов его поддерживают)
      smtp:
        milter:
          filters:
-           - { name: rspamd, address: "{{ thepost_rspamd_milter_address }}", inbound: true, submission: false }
-           - { name: antivirus, address: "127.0.0.1:7358", inbound: true, submission: false }
+           - { name: rspamd, address: "{{ thepost_rspamd_milter_address }}", profile: inbound }
+           - { name: antivirus, address: "127.0.0.1:7358", profile: inbound }
    ```
 3. Повторите `ansible-playbook … smb.yml`.
 4. Проверка: `sudo -u thepost thepost doctor` — фильтр `antivirus` доступен; тестовое письмо с EICAR отклоняется.
