@@ -748,8 +748,9 @@ mod tests {
         }
     }
 
-    /// Роль imap на хранилищах `stand` с расширениями, как собирает их узел (`Services::imap_extensions`).
-    fn imap_role(stand: &Stand, bound: Bound) -> ImapRole {
+    /// Роль imap на хранилищах `stand` с расширениями, как собирает их узел (`Services::imap_extensions`);
+    /// `tls` — сертификаты слушателей.
+    fn imap_role(stand: &Stand, tls: Option<Arc<TlsCerts>>, bound: Bound) -> ImapRole {
         let Stand {
             clock,
             index,
@@ -790,7 +791,7 @@ mod tests {
             acl: Some(acl.clone()),
             authz: Some(Arc::new(tp_auth::AclAuthorizer::new(acl, accounts))),
         };
-        ImapRole::new(deps, ext, None, Sockets::new(bound))
+        ImapRole::new(deps, ext, tls, Sockets::new(bound))
     }
 
     async fn first_line(addr: SocketAddr) -> String {
@@ -814,7 +815,7 @@ mod tests {
             ..Default::default()
         };
         let bound = Bound::default();
-        let role = imap_role(&Stand::new(), bound.clone());
+        let role = imap_role(&Stand::new(), None, bound.clone());
         let shutdown = CancellationToken::new();
         let ready = ReadyHandle::default();
         let ctx = RoleCtx {
@@ -856,13 +857,37 @@ mod tests {
     /// переподписки POP3 сверяет сеансы с `Extensions::accounts` и закрывает сеанс учётной записи.
     #[tokio::test]
     async fn pop3_session_closed_after_reconcile_with_account_store() {
-        use base64::Engine as _;
         use tokio::io::AsyncWriteExt;
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
         use tp_contracts::auth::Principal;
         use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
         use tp_contracts::{DomainId, TenantId};
+        use tp_platform::TlsConfig;
+        use tp_testkit::MemSecretStore;
 
+        type Pop3Conn = BufReader<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+        async fn line(c: &mut Pop3Conn) -> String {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), c.read_line(&mut line))
+                .await
+                .expect("no response in time")
+                .expect("read");
+            line
+        }
+        async fn send(c: &mut Pop3Conn, cmd: &str) {
+            let w = c.get_mut();
+            w.write_all(format!("{cmd}\r\n").as_bytes())
+                .await
+                .expect("write");
+            w.flush().await.expect("flush");
+        }
+
+        const CERT: &str = include_str!("testdata/cert.pem");
+        const KEY: &str = include_str!("testdata/key.pem");
         const LOGIN: &str = "pop3@example.org";
+        const PASSWORD: &str = "secret";
         let stand = Stand::new();
         let upsert = |enabled| AccountUpsert {
             domain: DomainId::new(),
@@ -886,19 +911,31 @@ mod tests {
             groups: Default::default(),
             scopes: None,
         };
-        stand.auth.add_token("pop3-token", principal);
+        stand.auth.add_password(LOGIN, PASSWORD, principal);
 
+        // USER/PASS — только по TLS: слушатель POP3 с неявным TLS.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tls = TlsConfig {
+            cert_file: dir.path().join("cert.pem"),
+            ..TlsConfig::default()
+        };
+        std::fs::write(&tls.cert_file, CERT).expect("cert");
+        let secrets = Arc::new(MemSecretStore::default());
+        secrets.set(&tls.key, KEY);
+        let certs = Arc::new(TlsCerts::load(&tls, secrets).await.expect("tls"));
+        let mut endpoint = EndpointConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        endpoint.implicit_tls = true;
         let mut cfg = tp_imap::ImapConfig {
             pop3: tp_imap::config::Pop3Config {
                 enabled: true,
-                listeners: vec![EndpointConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)))],
+                listeners: vec![endpoint],
                 ..Default::default()
             },
             ..Default::default()
         };
         cfg.timeouts.resubscribe = Duration::from_millis(10);
         let bound = Bound::default();
-        let role = imap_role(&stand, bound.clone());
+        let role = imap_role(&stand, Some(certs), bound.clone());
         let shutdown = CancellationToken::new();
         let ready = ReadyHandle::default();
         let ctx = RoleCtx {
@@ -917,26 +954,27 @@ mod tests {
 
         let pop3 = bound.get(POP3);
         assert_eq!(pop3.len(), 1, "{pop3:?}");
-        let stream = tokio::net::TcpStream::connect(pop3[0])
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(CERT.as_bytes()).expect("pem"))
+            .expect("root");
+        let client = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(pop3[0])
             .await
             .expect("connect");
-        let mut c = BufReader::new(stream);
-        async fn line(c: &mut BufReader<tokio::net::TcpStream>) -> String {
-            let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(5), c.read_line(&mut line))
-                .await
-                .expect("no response in time")
-                .expect("read");
-            line
-        }
-        assert!(line(&mut c).await.starts_with("+OK"));
-        // OAUTHBEARER не передаёт пароль и доступен без TLS.
-        let creds = base64::engine::general_purpose::STANDARD
-            .encode(format!("n,a={LOGIN},\x01auth=Bearer pop3-token\x01\x01"));
-        c.get_mut()
-            .write_all(format!("AUTH OAUTHBEARER {creds}\r\n").as_bytes())
+        let stream = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(ServerName::try_from("localhost").expect("name"), tcp)
             .await
-            .expect("write");
+            .expect("tls");
+        let mut c = BufReader::new(stream);
+        assert!(line(&mut c).await.starts_with("+OK"));
+        send(&mut c, &format!("USER {LOGIN}")).await;
+        assert!(line(&mut c).await.starts_with("+OK"));
+        send(&mut c, &format!("PASS {PASSWORD}")).await;
         assert_eq!(line(&mut c).await, "+OK Logged in, 0 messages\r\n");
 
         // Вход запрещён, сигнал не опубликован: поток шины оборвался — после переподписки сверка с хранилищем.
