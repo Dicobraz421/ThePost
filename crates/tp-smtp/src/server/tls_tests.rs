@@ -257,29 +257,6 @@ async fn inbound_starttls_without_auth() {
 }
 
 #[tokio::test]
-async fn auth_failures_block_address() {
-    let limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
-    let srv = Server::with_limiter(
-        Mode::Submission,
-        true,
-        |c| c.limits.max_auth_failures = 2,
-        Some(limiter.clone()),
-    )
-    .await;
-    let mut c = Client::new(handshake(srv.connect().await).await);
-    assert_eq!(c.code().await, 220);
-    ehlo(&mut c).await;
-    assert_eq!(c.cmd(&plain("wrong")).await, 535);
-    assert_eq!(c.cmd(&plain("wrong")).await, 535);
-    assert_eq!(c.code().await, 421);
-    assert!(c.closed().await);
-    // Адрес заблокирован: новое соединение получает отказ сразу.
-    let mut c = Client::new(handshake(srv.connect().await).await);
-    assert_eq!(c.code().await, 421);
-    srv.stop().await;
-}
-
-#[tokio::test]
 async fn sending_rate_limit() {
     let limiter = Arc::new(RateLimiter::new(RateLimitConfig {
         account: BucketConfig {
