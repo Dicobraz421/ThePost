@@ -1,14 +1,13 @@
-import { useGetIdentity, useLogout, usePermissions } from "@refinedev/core";
+import { useGetIdentity, usePermissions } from "@refinedev/core";
 import { useQueryClient } from "@tanstack/react-query";
-import { Button, Input, Layout, Space, Typography } from "antd";
+import { Input, Layout, Space, Typography } from "antd";
 
 import { getOrg, type Schemas, setOrg } from "../api/client";
 
-/** Шапка: кто вошёл, выбор организации (администратор инсталляции), выход. */
+/** Шапка: кто вошёл, выбор организации (администратор инсталляции); выход — в меню. */
 export function Header() {
   const { data: me } = useGetIdentity<Schemas["WhoAmI"]>();
   const { data: roles } = usePermissions<Schemas["AdminRole"][]>({});
-  const { mutate: logout } = useLogout();
   const queries = useQueryClient();
   const choose = (org: string) => {
     if (!org.trim()) return;
@@ -27,13 +26,12 @@ export function Header() {
             defaultValue={getOrg()}
             enterButton="Выбрать"
             onSearch={choose}
-            style={{ width: 520, verticalAlign: "middle" }}
+            style={{ width: 580, verticalAlign: "middle" }}
           />
         ) : (
           <Typography.Text type="secondary">Организация: {getOrg()}</Typography.Text>
         )}
         <Typography.Text strong>{me?.login}</Typography.Text>
-        <Button onClick={() => logout()}>Выход</Button>
       </Space>
     </Layout.Header>
   );

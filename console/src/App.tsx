@@ -3,7 +3,7 @@ import "dayjs/locale/ru";
 
 import { ErrorComponent, ThemedLayout, ThemedTitle, useNotificationProvider } from "@refinedev/antd";
 import { Authenticated, Refine } from "@refinedev/core";
-import routerProvider, { CatchAllNavigate, DocumentTitleHandler } from "@refinedev/react-router";
+import routerProvider, { CatchAllNavigate, DocumentTitleHandler, NavigateToResource } from "@refinedev/react-router";
 import { App as AntdApp, ConfigProvider } from "antd";
 import ruRU from "antd/locale/ru_RU";
 import dayjs from "dayjs";
@@ -11,7 +11,9 @@ import { Outlet, Route, Routes } from "react-router";
 
 import { Header } from "./components/header";
 import { i18nProvider } from "./i18n";
+import { DomainCreate, DomainList, DomainShow } from "./pages/domains";
 import { LoginPage } from "./pages/login";
+import { OrganizationPage } from "./pages/organization";
 import { authProvider } from "./providers/auth";
 import { dataProvider } from "./providers/data";
 
@@ -29,6 +31,16 @@ export function App() {
           authProvider={authProvider}
           i18nProvider={i18nProvider}
           notificationProvider={useNotificationProvider}
+          resources={[
+            { name: "organization", list: "/organization", meta: { label: "Организация" } },
+            {
+              name: "domains",
+              list: "/domains",
+              create: "/domains/create",
+              show: "/domains/:id",
+              meta: { label: "Домены" },
+            },
+          ]}
           // Без внешних обращений (SRS 5.2): телеметрия Refine выключена.
           options={{ disableTelemetry: true, syncWithLocation: true, warnWhenUnsavedChanges: true }}
         >
@@ -42,9 +54,23 @@ export function App() {
                 </Authenticated>
               }
             >
+              <Route index element={<NavigateToResource resource="organization" />} />
+              <Route path="/organization" element={<OrganizationPage />} />
+              <Route path="/domains">
+                <Route index element={<DomainList />} />
+                <Route path="create" element={<DomainCreate />} />
+                <Route path=":id" element={<DomainShow />} />
+              </Route>
               <Route path="*" element={<ErrorComponent />} />
             </Route>
-            <Route path="/login" element={<LoginPage />} />
+            <Route
+              path="/login"
+              element={
+                <Authenticated key="login" fallback={<LoginPage />}>
+                  <NavigateToResource resource="organization" />
+                </Authenticated>
+              }
+            />
           </Routes>
           <DocumentTitleHandler />
         </Refine>

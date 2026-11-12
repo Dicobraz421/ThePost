@@ -6,4 +6,11 @@
 export const covered: Record<string, string> = {
   "POST /api/v1/session": "pages/login.tsx",
   "GET /api/v1/whoami": "components/header.tsx",
+  "GET /api/v1/orgs/{org}": "pages/organization.tsx",
+  "PUT /api/v1/orgs/{org}/policy": "pages/organization.tsx",
+  "GET /api/v1/orgs/{org}/domains": "pages/domains.tsx",
+  "POST /api/v1/orgs/{org}/domains": "pages/domains.tsx",
+  "GET /api/v1/orgs/{org}/domains/{domain}": "pages/domains.tsx",
+  "DELETE /api/v1/orgs/{org}/domains/{domain}": "pages/domains.tsx",
+  "PUT /api/v1/orgs/{org}/domains/{domain}/policy": "pages/domains.tsx",
 };
