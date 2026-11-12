@@ -9,9 +9,11 @@ import ruRU from "antd/locale/ru_RU";
 import dayjs from "dayjs";
 import { Outlet, Route, Routes } from "react-router";
 
+import { Header } from "./components/header";
 import { i18nProvider } from "./i18n";
 import { LoginPage } from "./pages/login";
 import { authProvider } from "./providers/auth";
+import { dataProvider } from "./providers/data";
 
 dayjs.locale("ru");
 
@@ -23,6 +25,7 @@ export function App() {
       <AntdApp>
         <Refine
           routerProvider={routerProvider}
+          dataProvider={dataProvider}
           authProvider={authProvider}
           i18nProvider={i18nProvider}
           notificationProvider={useNotificationProvider}
@@ -33,7 +36,7 @@ export function App() {
             <Route
               element={
                 <Authenticated key="app" fallback={<CatchAllNavigate to="/login" />}>
-                  <ThemedLayout Title={Title}>
+                  <ThemedLayout Title={Title} Header={Header}>
                     <Outlet />
                   </ThemedLayout>
                 </Authenticated>
