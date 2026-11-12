@@ -10,6 +10,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use time::OffsetDateTime;
 use tp_contracts::bus::EventBus;
 use tp_contracts::dav::{
     Collection, CollectionId, CollectionKind, DavLimits, DavObject, DavObjectId, DavStore,
@@ -67,6 +68,10 @@ struct Account {
     inbox: BTreeMap<String, InboxItem>,
     /// `ModSeq` последнего изменения входящих.
     inbox_state: ModSeq,
+    /// `ModSeq` создания живых ресурсов входящих (CTR-65: `created` или `updated` в `inbox_changes`).
+    inbox_created: HashMap<DavObjectId, ModSeq>,
+    /// Надгробия входящих: идентификатор и `ModSeq` удаления.
+    inbox_gone: Vec<(DavObjectId, ModSeq)>,
 }
 
 impl Account {
@@ -228,6 +233,7 @@ impl MemDav {
         acc.horizon = acc.counter;
         acc.objects.clear();
         acc.deleted.clear();
+        acc.inbox_gone.clear();
     }
 
     async fn inbox_signal(&self, scope: AccountScope, modseq: ModSeq) {
@@ -843,13 +849,15 @@ impl DavStore for MemDav {
         let put = {
             let mut st = lock(&self.state);
             let acc = st.entry(scope).or_default();
-            let prev = acc.inbox.get(name).map(|i| i.id);
+            let prev = acc.inbox.get(name).map(|i| (i.id, i.received_at));
             if prev.is_none() && acc.inbox.len() >= self.limits.max_objects {
                 return Err(Error::QuotaExceeded);
             }
             let modseq = acc.bump();
-            let id = prev.unwrap_or_default();
+            let (id, received_at) =
+                prev.unwrap_or_else(|| (DavObjectId::new(), OffsetDateTime::now_utc()));
             let etag = modseq.to_string();
+            acc.inbox_created.entry(id).or_insert(modseq);
             acc.inbox.insert(
                 name.to_owned(),
                 InboxItem {
@@ -857,6 +865,7 @@ impl DavStore for MemDav {
                     name: name.to_owned(),
                     etag: etag.clone(),
                     modseq,
+                    received_at,
                     message,
                 },
             );
@@ -889,15 +898,52 @@ impl DavStore for MemDav {
         let modseq = {
             let mut st = lock(&self.state);
             let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
-            if acc.inbox.remove(name).is_none() {
-                return Err(Error::NotFound);
-            }
+            let item = acc.inbox.remove(name).ok_or(Error::NotFound)?;
             let modseq = acc.bump();
+            acc.inbox_created.remove(&item.id);
+            acc.inbox_gone.push((item.id, modseq));
             acc.inbox_state = modseq;
             modseq
         };
         self.inbox_signal(scope, modseq).await;
         Ok(modseq)
+    }
+
+    async fn inbox_state(&self, scope: AccountScope) -> Result<ModSeq> {
+        Ok(lock(&self.state)
+            .get(&scope)
+            .map_or(ModSeq::ZERO, |a| a.inbox_state))
+    }
+
+    async fn inbox_changes(
+        &self,
+        scope: AccountScope,
+        since: ModSeq,
+        limit: usize,
+    ) -> Result<Changes<DavObjectId>> {
+        let st = lock(&self.state);
+        let Some(acc) = st.get(&scope) else {
+            return untouched(since);
+        };
+        acc.check_since(since)?;
+        let mut all: Vec<(ModSeq, Change<DavObjectId>)> = acc
+            .inbox
+            .values()
+            .filter(|i| i.modseq > since)
+            .map(|i| {
+                let created = acc.inbox_created.get(&i.id).copied().unwrap_or(i.modseq);
+                (i.modseq, live(created, since, i.id))
+            })
+            .collect();
+        if since != ModSeq::ZERO {
+            all.extend(
+                acc.inbox_gone
+                    .iter()
+                    .filter(|(_, m)| *m > since)
+                    .map(|(id, m)| (*m, Change::Destroyed(*id))),
+            );
+        }
+        Ok(page(all, since, limit, acc.inbox_state))
     }
 }
 
@@ -1000,6 +1046,12 @@ mod tests {
         let bus = crate::MemEventBus::default();
         let store = MemDav::new().with_bus(Arc::new(bus.clone()));
         suite::itip::signals(&store, &bus, scope()).await;
+    }
+
+    #[tokio::test]
+    async fn suite_inbox_log() {
+        let store = MemDav::new().with_limits(suite::dav::LIMITS);
+        suite::itip::inbox_log(&store, scope()).await;
     }
 
     #[tokio::test]

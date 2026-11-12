@@ -16,7 +16,8 @@
 //! # Планирование (CTR-47)
 //!
 //! Входящие планирования (`schedule-inbox`, RFC 6638 §2.2) — отдельное хранилище учётной записи ([`DavStore::inbox_put`],
-//! [`DavStore::inbox_list`], [`DavStore::inbox_delete`]): UID в нём не уникален, в коллекции и их изменения не входит.
+//! [`DavStore::inbox_list`], [`DavStore::inbox_delete`]; изменения — [`DavStore::inbox_state`],
+//! [`DavStore::inbox_changes`], CTR-65): UID в нём не уникален, в коллекции и их изменения не входит.
 //! `Schedule-Tag` объекта (RFC 6638 §3.2) и индекс занятости — поля [`ObjectIndex`], их задаёт вызывающий; занятость
 //! читает [`crate::schedule::FreeBusy`].
 
@@ -856,7 +857,8 @@ pub trait DavStore: Send + Sync + 'static {
     /// Создаёт или перезаписывает ресурс `name` входящих планирования (RFC 6638 §2.2; кладёт `ItipDelivery`). Проверки
     /// по порядку: недопустимое имя ([`valid_name`]) или сообщение ([`InboxMessage::validate`]) — `Invalid`; тело больше
     /// [`DavLimits::max_object_size`] или новый ресурс при [`DavLimits::max_objects`] сообщений — `QuotaExceeded`.
-    /// `ModSeq` — из счётчика учётной записи; перезапись сохраняет `id`. После фиксации — сигнал
+    /// `ModSeq` — из счётчика учётной записи; перезапись сохраняет `id` и
+    /// [`crate::schedule::InboxItem::received_at`]. После фиксации — сигнал
     /// [`crate::schedule::schedule_inbox_changed`]. По умолчанию — `Error::Internal`.
     async fn inbox_put(
         &self,
@@ -875,13 +877,30 @@ pub trait DavStore: Send + Sync + 'static {
         Err(Error::internal("dav store does not support schedule inbox"))
     }
 
-    /// Удаляет ресурс входящих планирования (без надгробия: `CalendarEventNotification/changes` после удаления —
-    /// полная сверка по [`Inbox::state`]). Нет — `NotFound`. Возвращает `ModSeq` изменения; после фиксации — сигнал
+    /// Удаляет ресурс входящих планирования, оставляя надгробие для [`DavStore::inbox_changes`] (CTR-65). Нет —
+    /// `NotFound`. Возвращает `ModSeq` изменения; после фиксации — сигнал
     /// [`crate::schedule::schedule_inbox_changed`]. По умолчанию — `Error::Internal`.
     async fn inbox_delete(&self, scope: AccountScope, name: &str) -> Result<ModSeq> {
         let _ = (scope, name);
         Err(Error::internal("dav store does not support schedule inbox"))
     }
+
+    /// Состояние входящих планирования (CTR-65; JMAP `state` `CalendarEventNotification`) — то же, что
+    /// [`Inbox::state`] у [`DavStore::inbox_list`], без чтения ресурсов.
+    async fn inbox_state(&self, scope: AccountScope) -> Result<ModSeq>;
+
+    /// Изменения входящих планирования после `since` по идентификаторам (CTR-65; JMAP
+    /// `CalendarEventNotification/changes`), не более `limit`, по `ModSeq`: ресурс создан после `since` — `created`,
+    /// перезаписан — `updated`, удалён (надгробие) — `destroyed`; `since = ModSeq::ZERO` — все ресурсы в `created`,
+    /// `destroyed` пуст. Страницы и `new_state` — как у [`DavStore::account_changes`]: полный ответ —
+    /// [`DavStore::inbox_state`] (не меньше `since`). `since` старше очищенных надгробий или больше счётчика учётной
+    /// записи — `Conflict`.
+    async fn inbox_changes(
+        &self,
+        scope: AccountScope,
+        since: ModSeq,
+        limit: usize,
+    ) -> Result<Changes<DavObjectId>>;
 }
 
 #[cfg(test)]

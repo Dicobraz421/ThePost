@@ -341,3 +341,105 @@ pub async fn signals(store: &dyn DavStore, bus: &dyn EventBus, scope: AccountSco
         );
     }
 }
+
+/// Набор проверок журнала входящих планирования (CTR-65): `inbox_state` — как `Inbox::state`; `inbox_changes` —
+/// созданные, перезаписанные и удалённые (надгробия) после состояния, страницы, `since` больше счётчика — `Conflict`;
+/// `InboxItem::received_at` — время первой записи, перезапись его не меняет. `s` — учётная запись без данных; хватает
+/// лимитов [`LIMITS`].
+pub async fn inbox_log(store: &dyn DavStore, s: AccountScope) {
+    let changes = async |since: ModSeq, limit: usize| {
+        store
+            .inbox_changes(s, since, limit)
+            .await
+            .expect("inbox_changes")
+    };
+    assert_eq!(store.inbox_state(s).await, Ok(ModSeq::ZERO));
+    let none = changes(ModSeq::ZERO, 10).await;
+    assert!(none.created.is_empty() && none.destroyed.is_empty() && !none.has_more);
+    assert_eq!(none.new_state, ModSeq::ZERO);
+    assert!(matches!(
+        store.inbox_changes(s, ModSeq(5), 10).await,
+        Err(Error::Conflict)
+    ));
+
+    let before = OffsetDateTime::now_utc() - Duration::minutes(1);
+    let a = store
+        .inbox_put(s, "a.ics", message(ItipMethod::Request, "u1"))
+        .await
+        .expect("put a");
+    let b = store
+        .inbox_put(s, "b.ics", message(ItipMethod::Reply, "u2"))
+        .await
+        .expect("put b");
+    assert_eq!(store.inbox_state(s).await, Ok(b.modseq));
+    assert_eq!(
+        store.inbox_list(s).await.expect("list").state,
+        b.modseq,
+        "inbox_state — как Inbox::state"
+    );
+    let all = changes(ModSeq::ZERO, 10).await;
+    assert_eq!((all.created, all.new_state), (vec![a.id, b.id], b.modseq));
+    let received = |list: &tp_contracts::schedule::Inbox, name: &str| {
+        list.items
+            .iter()
+            .find(|i| i.name == name)
+            .map(|i| i.received_at)
+            .expect("ресурс")
+    };
+    let first = received(&store.inbox_list(s).await.expect("list"), "a.ics");
+    assert!(
+        first >= before && first <= OffsetDateTime::now_utc() + Duration::minutes(1),
+        "время поступления — время записи: {first}"
+    );
+
+    // Перезапись: прежние id и время поступления, в изменениях — updated.
+    let a2 = store
+        .inbox_put(s, "a.ics", message(ItipMethod::Cancel, "u1"))
+        .await
+        .expect("put a again");
+    assert_eq!(a2.id, a.id);
+    assert_eq!(
+        received(&store.inbox_list(s).await.expect("list"), "a.ics"),
+        first
+    );
+    let upd = changes(b.modseq, 10).await;
+    assert_eq!(
+        (upd.created, upd.updated, upd.destroyed, upd.new_state),
+        (Vec::new(), vec![a.id], Vec::new(), a2.modseq)
+    );
+
+    // Удаление — надгробие.
+    let d = store.inbox_delete(s, "b.ics").await.expect("delete b");
+    assert_eq!(store.inbox_state(s).await, Ok(d));
+    let del = changes(a2.modseq, 10).await;
+    assert_eq!(
+        (del.created, del.updated, del.destroyed, del.new_state),
+        (Vec::new(), Vec::new(), vec![b.id], d)
+    );
+    let since_a = changes(a.modseq, 10).await;
+    assert_eq!(
+        (since_a.updated, since_a.destroyed),
+        (vec![a.id], vec![b.id])
+    );
+    let full = changes(ModSeq::ZERO, 10).await;
+    assert_eq!((full.created, full.destroyed), (vec![a.id], Vec::new()));
+
+    // Страницы: has_more, new_state — ModSeq последнего возвращённого.
+    let c = store
+        .inbox_put(s, "c.ics", message(ItipMethod::Request, "u3"))
+        .await
+        .expect("put c");
+    let page = changes(a.modseq, 1).await;
+    assert!(page.has_more);
+    assert_eq!(page.new_state, a2.modseq);
+    let rest = changes(page.new_state, 10).await;
+    assert_eq!(
+        (rest.created, rest.destroyed, rest.has_more, rest.new_state),
+        (vec![c.id], vec![b.id], false, c.modseq)
+    );
+    // Календари входящие не меняют.
+    assert_eq!(
+        store.state(s, CollectionKind::Calendar).await,
+        Ok(ModSeq::ZERO)
+    );
+}

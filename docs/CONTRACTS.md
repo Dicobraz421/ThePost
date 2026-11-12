@@ -683,8 +683,13 @@ iMIP (RFC 6047), занятость. iCalendar контракты не разб�
 - Входящие планирования (`schedule-inbox`, RFC 6638 §2.2) в `DavStore` (методы с реализацией по умолчанию — `Internal`):
   `inbox_put(scope, name, InboxMessage { method, uid, from, body }) -> Put` (создать или перезаписать, `id` сохраняется; UID не уникален;
   имя — `valid_name`, `validate()` → `Invalid`; тело больше `max_object_size` или сообщений больше `max_objects` — `QuotaExceeded`),
-  `inbox_list(scope) -> Inbox { items: Vec<InboxItem { id, name, etag, modseq, message }> (по `ModSeq`), state }` (`state` — CTag
-  входящих и JMAP `state` `CalendarEventNotification`), `inbox_delete(scope, name) -> ModSeq` (без надгробия; нет — `NotFound`).
+  `inbox_list(scope) -> Inbox { items: Vec<InboxItem { id, name, etag, modseq, received_at, message }> (по `ModSeq`), state }` (`state` —
+  CTag входящих и JMAP `state` `CalendarEventNotification`), `inbox_delete(scope, name) -> ModSeq` (надгробие; нет — `NotFound`).
+  Журнал входящих (CTR-65; обязательные методы): `inbox_state(scope) -> ModSeq` — как `Inbox::state`; `inbox_changes(scope, since, limit)
+  -> Changes<DavObjectId>` (JMAP `CalendarEventNotification/changes`) — созданные, перезаписанные и удалённые (надгробия) после `since`,
+  страницы и `new_state` — как у `account_changes`, устаревший `since` — `Conflict`; `InboxItem::received_at` — время первой записи (UTC,
+  JMAP `created`), перезапись не меняет. Набор `suite::itip::inbox_log`; PostgreSQL — META-69 (до неё `PgMeta`: `inbox_changes` —
+  `Internal`, `received_at` — из UUID v7 идентификатора, надгробий нет).
   `ModSeq` — из счётчика учётной записи; `DavStore::state` и `*changes` календарей входящие не меняют. Сигнал
   `ScheduleInboxChanged { modseq }` (`schedule_inbox_changed`, учётная запись) — после каждого `inbox_put`, `inbox_delete`.
 - `Schedule-Tag` (RFC 6638 §3.2) — `ObjectIndex::schedule_tag` (как ETag, `valid_etag`): задаёт вызывающий — новый при изменении

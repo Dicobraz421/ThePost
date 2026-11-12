@@ -278,6 +278,9 @@ pub struct InboxItem {
     pub etag: String,
     /// `ModSeq` последней записи.
     pub modseq: ModSeq,
+    /// Время поступления (UTC; CTR-65, JMAP `CalendarEventNotification.created`): первой записи ресурса, перезапись его
+    /// не меняет. Задаёт хранилище.
+    pub received_at: OffsetDateTime,
     /// Сообщение.
     pub message: InboxMessage,
 }
