@@ -1,5 +1,7 @@
 //! Учётные записи на PostgreSQL (CONTRACTS.md#Metadata).
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use sqlx::postgres::PgArguments;
 use sqlx::query::QueryAs;
@@ -254,6 +256,39 @@ impl AccountStore for PgMeta {
             row.map(Account::try_from).transpose()
         })
         .await
+    }
+
+    /// Одним запросом (`account_id = ANY($2)`, по первичному ключу); порядок запроса и пропуск повторов — после
+    /// чтения. Чужая организация не видна (условие `tenant_id` и RLS).
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<Uuid> = ids.iter().map(|id| *id.as_uuid()).collect();
+        let keys = &keys;
+        let rows: Vec<AccountRow> = self
+            .idempotent(|| async move {
+                let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
+                let rows: Vec<AccountRow> = sqlx::query_as(
+                    "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind
+                 FROM accounts WHERE tenant_id = $1 AND account_id = ANY($2)",
+                )
+                .bind(tenant.as_uuid())
+                .bind(keys)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                crate::commits::commit(tx).await?;
+                Ok(rows)
+            })
+            .await?;
+        let mut found: HashMap<Uuid, AccountRow> =
+            rows.into_iter().map(|r| (r.account_id, r)).collect();
+        // `remove` — повтор идентификатора уже не найдёт запись (первое вхождение).
+        keys.iter()
+            .filter_map(|k| found.remove(k))
+            .map(Account::try_from)
+            .collect()
     }
 
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
