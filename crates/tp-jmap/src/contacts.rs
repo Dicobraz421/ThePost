@@ -2,8 +2,8 @@
 //! [`DavStore`] (вид [`CollectionKind::AddressBook`]) — те же коллекции, что у CardDAV.
 //!
 //! `name` — отображаемое имя коллекции, сегмент URL новой книги — её `id`. `myRights` — права владельца; общий
-//! доступ (`shareWith`) — JMAP-32. Книга по умолчанию (`isDefault`) — с сегментом URL `default`, иначе первая по
-//! порядку: контракт не хранит признак, поэтому `onSuccessSetIsDefault` для другой книги — `invalidArguments`.
+//! доступ (`shareWith`) — JMAP-32. Книга по умолчанию (`isDefault`) — назначенная (`onSuccessSetIsDefault`,
+//! [`Collection::is_default`]), иначе правило [`default_of`]; `isSubscribed` — [`Collection::subscribed`] (JMAP-36).
 //! Состояние — [`DavStore::state`] вида (общее для `AddressBook` и `ContactCard`); push — по `DavChanged`.
 
 use std::str::FromStr;
@@ -155,7 +155,11 @@ fn apply_props(c: &mut Collection, v: &Value, create: bool) -> Result<(), Value>
                 .and_then(|n| u32::try_from(n).ok())
                 .map(|n| c.order = n)
                 .is_some(),
-            ("isSubscribed", Value::Bool(true)) | ("shareWith", Value::Null) => true,
+            ("isSubscribed", Value::Bool(b)) => {
+                c.subscribed = *b;
+                true
+            }
+            ("shareWith", Value::Null) => true,
             _ => false,
         };
         if !ok {
@@ -184,7 +188,64 @@ pub(crate) fn store_error(e: Error) -> MethodResult<Value> {
     })
 }
 
-/// `AddressBook/set`: создание, изменение (имя, описание, порядок), удаление (`onDestroyRemoveContents`).
+/// `onSuccessSetIsDefault` (RFC 9610 §2.3, draft-ietf-jmap-calendars): после `/set` без ошибок назначает коллекцию
+/// `want` вида `kind` (`#<creation id>` — созданную этим вызовом) коллекцией по умолчанию; признак прежней снимает
+/// хранилище ([`DavStore::update_collection`]). Сменившийся `isDefault` обеих — в `created` или `updated` ответа.
+/// Нет такой коллекции — назначение пропускается без ошибки (RFC 9610 §2.3).
+pub(crate) async fn set_default(
+    ctx: &Ctx<'_>,
+    store: &dyn DavStore,
+    kind: CollectionKind,
+    want: Option<&str>,
+    out: &mut SetOutcome,
+) -> MethodResult<()> {
+    if !out.not_created.is_empty() || !out.not_updated.is_empty() || !out.not_destroyed.is_empty() {
+        return Ok(());
+    }
+    let Some(id) = want.and_then(|w| CollectionId::from_str(ctx.resolve_id(w)).ok()) else {
+        return Ok(());
+    };
+    let all = store.list_collections(ctx.scope, kind).await?;
+    let old = default_of(&all).map(|c| c.id);
+    let Some(mut c) = all.into_iter().find(|c| c.id == id) else {
+        return Ok(());
+    };
+    if !c.is_default {
+        c.is_default = true;
+        match store.update_collection(ctx.scope, c).await {
+            Ok(_) => {}
+            // Коллекцию удалили между запросами.
+            Err(Error::NotFound) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if old != Some(id) {
+        report_default(out, id, true);
+        if let Some(old) = old {
+            report_default(out, old, false);
+        }
+    }
+    Ok(())
+}
+
+/// Изменённый сервером `isDefault` коллекции `id` в ответе `/set`: в `created`, если она создана этим вызовом,
+/// иначе в `updated`.
+fn report_default(out: &mut SetOutcome, id: CollectionId, is_default: bool) {
+    let id = id.to_string();
+    let target = match out.created.values_mut().find(|v| v["id"] == id.as_str()) {
+        Some(v) => v,
+        None => out.updated.entry(id).or_insert(Value::Null),
+    };
+    if !target.is_object() {
+        *target = Value::Object(Map::new());
+    }
+    if let Value::Object(m) = target {
+        m.insert("isDefault".into(), Value::Bool(is_default));
+    }
+}
+
+/// `AddressBook/set`: создание, изменение (имя, описание, порядок, подписка), удаление (`onDestroyRemoveContents`),
+/// книга по умолчанию (`onSuccessSetIsDefault`).
 pub(crate) async fn set(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
@@ -202,21 +263,6 @@ pub(crate) async fn set(
     if a.if_in_state.as_ref().is_some_and(|s| *s != old) {
         return Err(MethodError::new("stateMismatch"));
     }
-    let before = store.list_collections(ctx.scope, KIND).await?;
-    if let Some(want) = &extra.on_success_set_is_default {
-        // Признак не хранится: допустимо только то, что и так станет книгой по умолчанию.
-        let ok = match want.strip_prefix('#') {
-            Some(cid) => {
-                before.is_empty() && a.create.as_ref().is_some_and(|c| c.contains_key(cid))
-            }
-            None => default_book(&before).is_some_and(|d| d.to_string() == *want),
-        };
-        if !ok {
-            return Err(MethodError::invalid(
-                "onSuccessSetIsDefault: changing the default address book is not supported",
-            ));
-        }
-    }
     let mut out = SetOutcome::default();
     for (cid, v) in a.create.unwrap_or_default() {
         let mut c = Collection::new(KIND, DEFAULT_NAME);
@@ -225,7 +271,7 @@ pub(crate) async fn set(
             out.not_created.insert(cid, e);
             continue;
         }
-        let id = c.id;
+        let (id, subscribed) = (c.id, c.subscribed);
         match store.create_collection(ctx.scope, c).await {
             Ok(_) => {
                 ctx.created.insert(cid.clone(), id.to_string());
@@ -235,7 +281,7 @@ pub(crate) async fn set(
                     json!({
                         "id": id.to_string(),
                         "isDefault": default_book(&books) == Some(id),
-                        "isSubscribed": true,
+                        "isSubscribed": subscribed,
                         "shareWith": null,
                         "myRights": rights(),
                     }),
@@ -296,6 +342,8 @@ pub(crate) async fn set(
             }
         }
     }
+    let want = extra.on_success_set_is_default.as_deref();
+    set_default(ctx, store.as_ref(), KIND, want, &mut out).await?;
     let new = state(store.as_ref(), ctx.scope).await?;
     Ok(out.response(&a.account_id, &old, &new))
 }
@@ -317,6 +365,17 @@ pub(crate) mod tests {
         let name = &resp["methodResponses"][0][0];
         assert!(name == method || name == "error", "{resp}");
         resp["methodResponses"][0][1].clone()
+    }
+
+    /// Идентификаторы объектов ответа `/get` с `isDefault`.
+    pub(crate) fn defaults(g: &Value) -> Vec<String> {
+        g["list"]
+            .as_array()
+            .expect("list")
+            .iter()
+            .filter(|x| x["isDefault"] == true)
+            .filter_map(|x| x["id"].as_str().map(str::to_owned))
+            .collect()
     }
 
     pub(crate) async fn create_book(env: &Env, name: &str) -> String {
@@ -506,36 +565,79 @@ pub(crate) mod tests {
         assert_eq!(destroyed, want, "{c}");
     }
 
+    /// Смена книги по умолчанию (`onSuccessSetIsDefault`) и подписка (JMAP-36).
     #[tokio::test]
-    async fn default_book() {
+    async fn default_book_and_subscription() {
         let env = Env::new().await;
         let acc = env.account();
         let a = create_book(&env, "A").await;
         let b = create_book(&env, "B").await;
         let g = call(&env, "AddressBook/get", json!({"accountId": acc})).await;
-        let defaults: Vec<&Value> = g["list"]
-            .as_array()
-            .expect("list")
-            .iter()
-            .filter(|x| x["isDefault"] == true)
-            .collect();
-        assert_eq!(defaults.len(), 1, "{g}");
-        let default = defaults[0]["id"].as_str().expect("id");
-        let other = if default == a { &b } else { &a };
+        let before = defaults(&g);
+        assert_eq!(before.len(), 1, "{g}");
+        let other = if before[0] == a { &b } else { &a };
+
+        // Та же книга — без изменений в ответе.
         let r = call(
             &env,
             "AddressBook/set",
-            json!({"accountId": acc, "onSuccessSetIsDefault": default}),
+            json!({"accountId": acc, "onSuccessSetIsDefault": before[0]}),
+        )
+        .await;
+        assert!(r["updated"].is_null(), "{r}");
+
+        let r = call(
+            &env,
+            "AddressBook/set",
+            json!({"accountId": acc, "update": {other: {"isSubscribed": false}},
+                   "onSuccessSetIsDefault": other}),
+        )
+        .await;
+        assert_eq!(r["updated"][other], json!({"isDefault": true}), "{r}");
+        assert_eq!(r["updated"][&before[0]], json!({"isDefault": false}), "{r}");
+        let g = call(&env, "AddressBook/get", json!({"accountId": acc})).await;
+        assert_eq!(defaults(&g), [other.clone()], "{g}");
+        let got = g["list"]
+            .as_array()
+            .expect("list")
+            .iter()
+            .find(|x| x["id"] == other.as_str())
+            .expect("book");
+        assert_eq!(got["isSubscribed"], false, "{g}");
+
+        // Новая книга по умолчанию в том же вызове: признак — в `created`.
+        let r = call(
+            &env,
+            "AddressBook/set",
+            json!({"accountId": acc, "create": {"n": {"name": "C", "isSubscribed": false}},
+                   "onSuccessSetIsDefault": "#n"}),
+        )
+        .await;
+        assert_eq!(r["created"]["n"]["isDefault"], true, "{r}");
+        assert_eq!(r["created"]["n"]["isSubscribed"], false, "{r}");
+        assert_eq!(r["updated"][other], json!({"isDefault": false}), "{r}");
+        let c = r["created"]["n"]["id"].as_str().expect("id").to_owned();
+        let g = call(&env, "AddressBook/get", json!({"accountId": acc})).await;
+        assert_eq!(defaults(&g), [c.clone()], "{g}");
+
+        // Неизвестная книга или ошибка в вызове — признак не меняется, ошибки метода нет.
+        let r = call(
+            &env,
+            "AddressBook/set",
+            json!({"accountId": acc, "onSuccessSetIsDefault": "nope"}),
         )
         .await;
         assert!(r["newState"].is_string(), "{r}");
         let r = call(
             &env,
             "AddressBook/set",
-            json!({"accountId": acc, "onSuccessSetIsDefault": other}),
+            json!({"accountId": acc, "update": {"nope": {"name": "x"}},
+                   "onSuccessSetIsDefault": a}),
         )
         .await;
-        assert_eq!(r["type"], "invalidArguments", "{r}");
+        assert_eq!(r["notUpdated"]["nope"]["type"], "notFound", "{r}");
+        let g = call(&env, "AddressBook/get", json!({"accountId": acc})).await;
+        assert_eq!(defaults(&g), [c], "{g}");
     }
 
     /// Изменение адресной книги → push `AddressBook`, `ContactCard`.

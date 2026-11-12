@@ -16,7 +16,9 @@
 //!   (контракт не переносит объект с сохранением `id`);
 //! - `isDraft` — всегда `false`; `isOrigin` — только по запросу в `properties`; `mayInviteSelf` и прочие права
 //!   участников не поддерживаются; отправка приглашений (`sendSchedulingMessages`) — `crate::scheduling`;
-//! - `useDefaultAlerts` хранится в событии, но оповещений календаря по умолчанию нет (`crate::calendars`);
+//! - `useDefaultAlerts`: `/get` отдаёт в `alerts` оповещения календаря по умолчанию (`defaultAlertsWithTime`, у
+//!   события `showWithoutTime` — `defaultAlertsWithoutTime`; нет — без `alerts`), собственные оповещения события
+//!   хранятся в iCalendar как есть (JMAP-36);
 //! - `utcStart`/`utcEnd` при записи, `recurrenceOverridesBefore`/`After`, `reduceParticipants` не поддерживаются;
 //! - `/copy` — между учётными записями, а доступна только своя: чужая — `fromAccountNotFound`;
 //! - `VTIMEZONE` в записываемый iCalendar не добавляется: пояс — идентификатор IANA в `TZID` (RFC 7809).
@@ -33,8 +35,8 @@ use serde_json::{Map, Value, json};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use tp_contracts::Error;
 use tp_contracts::dav::{
-    CollectionId, Component, DavObject, DavObjectId, DavStore, DeleteOutcome, ObjectIndex,
-    Precondition, Put, PutOutcome,
+    Collection, CollectionId, Component, DavObject, DavObjectId, DavStore, DeleteOutcome,
+    ObjectIndex, Precondition, Put, PutOutcome,
 };
 use tp_contracts::meta::AccountScope;
 use tp_dav::index::IndexOptions;
@@ -363,12 +365,13 @@ async fn find(
     Ok(obj.filter(|o| o.index.component == Component::Event))
 }
 
-/// Пояса календарей по умолчанию: время событий без пояса.
+/// Свойства календарей событий запроса: пояс по умолчанию (время событий без пояса) и оповещения по умолчанию.
 #[derive(Default)]
 pub(crate) struct Zones {
     /// Пояс запроса (`timeZone`): важнее пояса календаря.
     pub request: Option<Tz>,
-    known: HashMap<CollectionId, Tz>,
+    /// Прочитанные календари; `None` — календаря нет.
+    known: HashMap<CollectionId, Option<Collection>>,
 }
 
 impl Zones {
@@ -377,6 +380,20 @@ impl Zones {
             request,
             known: HashMap::new(),
         }
+    }
+
+    /// Календарь `cal` (один запрос к хранилищу на календарь); нет — `None`.
+    async fn calendar(
+        &mut self,
+        store: &dyn DavStore,
+        scope: AccountScope,
+        cal: CollectionId,
+    ) -> MethodResult<Option<&Collection>> {
+        if !self.known.contains_key(&cal) {
+            let c = store.get_collection(scope, cal).await?;
+            self.known.insert(cal, c);
+        }
+        Ok(self.known.get(&cal).and_then(Option::as_ref))
     }
 
     /// Пояс для времени без пояса в календаре `cal`: запроса, календаря или UTC.
@@ -389,15 +406,38 @@ impl Zones {
         if let Some(tz) = self.request {
             return Ok(tz);
         }
-        if let Some(tz) = self.known.get(&cal) {
-            return Ok(*tz);
+        let c = self.calendar(store, scope, cal).await?;
+        Ok(c.and_then(|c| tz_of(c.timezone.as_deref()))
+            .unwrap_or(Tz::UTC))
+    }
+
+    /// `useDefaultAlerts` (JMAP-36): `alerts` события `event` календаря `cal` — оповещения календаря по умолчанию
+    /// (`defaultAlertsWithoutTime` для события `showWithoutTime`, иначе `defaultAlertsWithTime`); нет — без `alerts`.
+    /// Событие без `useDefaultAlerts` не меняется.
+    async fn default_alerts(
+        &mut self,
+        store: &dyn DavStore,
+        scope: AccountScope,
+        cal: CollectionId,
+        event: &mut Map<String, Value>,
+    ) -> MethodResult<()> {
+        if event.get("useDefaultAlerts") != Some(&Value::Bool(true)) {
+            return Ok(());
         }
-        let c = store.get_collection(scope, cal).await?;
-        let tz = c
-            .and_then(|c| tz_of(c.timezone.as_deref()))
-            .unwrap_or(Tz::UTC);
-        self.known.insert(cal, tz);
-        Ok(tz)
+        let all_day = event.get("showWithoutTime") == Some(&Value::Bool(true));
+        let alerts = self.calendar(store, scope, cal).await?.and_then(|c| {
+            let text = if all_day {
+                c.alerts_without_time.as_deref()
+            } else {
+                c.alerts_with_time.as_deref()
+            };
+            serde_json::from_str::<Value>(text?).ok()
+        });
+        match alerts {
+            Some(a) => event.insert("alerts".into(), a),
+            None => event.remove("alerts"),
+        };
+        Ok(())
     }
 }
 
@@ -432,6 +472,9 @@ async fn get_one(
         return Ok(None);
     };
     let mut event = event_json(&obj);
+    zones
+        .default_alerts(store.as_ref(), ctx.scope, obj.collection, &mut event)
+        .await?;
     if with_origin {
         let origin = scheduling::is_origin(&obj.body, &scheduling::addresses(ctx));
         event.insert("isOrigin".into(), json!(origin));
@@ -1320,7 +1363,8 @@ pub(crate) mod tests {
             "Иначе"
         );
         assert_eq!(e["participants"]["p1"]["expectReply"], true);
-        assert_eq!(e["alerts"]["a1"]["trigger"]["offset"], "-PT10M");
+        // `useDefaultAlerts`: оповещения календаря (у него их нет), а не свои — те остаются в iCalendar.
+        assert!(e.get("alerts").is_none(), "{g}");
 
         // Изменение CalDAV видно в JMAP: `id` тот же, меняется состояние.
         let state = g["state"].clone();
