@@ -16,11 +16,12 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use serde::Serialize;
 use sqlx::PgPool;
+use tp_cluster::NodeTls;
 use tp_contracts::blob::BlobStore;
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
 use tp_meta::MetaConfig;
-use tp_platform::Config;
+use tp_platform::{Config, TlsCerts, TlsConfig};
 
 use crate::doctor_dns::{self, Dns};
 use crate::infra;
@@ -290,6 +291,7 @@ pub async fn check(
         ),
     }
     doctor_dns::check_with(cfg, dns, store.as_ref(), &doctor, report).await;
+    internal_keys(cfg, store.as_ref(), report).await;
     internal_pki(cfg, SystemTime::now(), report).await;
     dav_well_known(cfg, report);
 }
@@ -759,6 +761,99 @@ async fn pki_ca(id: &str, path: &Path, now: SystemTime, report: &mut Report) -> 
     }
 }
 
+/// Итог проверки закрытого ключа внутреннего канала `id`: `key` — ссылка на секрет (читается из хранилища
+/// `store`), иначе файл `key_file`; `load` — та же загрузка пары, что при запуске узла. В отчёте — путь или ссылка
+/// на секрет, значение ключа не выводится (правило APP-35).
+async fn internal_key<F, Fut>(
+    id: &str,
+    tls: &tp_contracts::tls::InternalTls,
+    store: Option<&Arc<dyn SecretStore>>,
+    load: F,
+    report: &mut Report,
+) where
+    F: FnOnce(Option<Arc<dyn SecretStore>>) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let (value, loaded) = match (&tls.key, store) {
+        (Some(secret), None) => {
+            report.push(
+                id,
+                Status::Skipped,
+                format!("секрет {secret}"),
+                "хранилище секретов не настроено",
+            );
+            return;
+        }
+        (Some(secret), Some(store)) => {
+            (format!("секрет {secret}"), load(Some(store.clone())).await)
+        }
+        (None, _) => (
+            tls.key_file
+                .as_ref()
+                .map(|f| f.display().to_string())
+                .unwrap_or_default(),
+            load(None).await,
+        ),
+    };
+    match loaded {
+        Ok(()) => report.push(id, Status::Ok, value, "ключ подходит к сертификату"),
+        Err(e) => report.push(id, Status::Fail, value, message(&e)),
+    }
+}
+
+/// Закрытые ключи внутренних каналов (APP-36) — по правилу `tls.key` (APP-35): ключ межузлового канала
+/// (`cluster.rpc.tls.key`; загрузка `NodeTls`, как при запуске) и ключ клиентского сертификата СУБД
+/// (`database.tls.key`) подходят к своим сертификатам. При ссылке на секрет файл `key_file` не читается; без
+/// хранилища секретов проверка пропускается. Канал без mTLS — проверка пропускается.
+pub async fn internal_keys(
+    cfg: &Config,
+    store: Option<&Arc<dyn SecretStore>>,
+    report: &mut Report,
+) {
+    let id = "cluster.rpc.tls.key";
+    match cfg.section::<sections::ClusterSection>(sections::CLUSTER) {
+        Ok(cluster) if cluster.rpc_enabled() => {
+            let tls = &cluster.rpc.tls;
+            let load = |store: Option<Arc<dyn SecretStore>>| async move {
+                match store {
+                    Some(store) => NodeTls::load_with_secrets(tls, store.as_ref()).await,
+                    None => NodeTls::load(tls).await,
+                }
+                .map(drop)
+            };
+            internal_key(id, tls, store, load, report).await;
+        }
+        _ => report.push(id, Status::Skipped, "", "запросы узел → узел не включены"),
+    }
+    let id = "database.tls.key";
+    let db = cfg.section::<tp_meta::pool::PoolConfig>(tp_meta::pool::PoolConfig::SECTION);
+    match db.as_ref().map(|db| (&db.tls, db.tls.cert_file.clone())) {
+        Ok((tls, Some(cert_file))) => {
+            // Пара «сертификат и ключ» проверяется готовой загрузкой сертификатов платформы.
+            let pair = TlsConfig {
+                cert_file,
+                key_file: tls.key_file.clone().unwrap_or_default(),
+                key: tls.key.clone(),
+                ..TlsConfig::default()
+            };
+            let load = |store: Option<Arc<dyn SecretStore>>| async move {
+                match store {
+                    Some(store) => TlsCerts::load_with_secrets(&pair, store).await,
+                    None => TlsCerts::load(&pair).await,
+                }
+                .map(drop)
+            };
+            internal_key(id, tls, store, load, report).await;
+        }
+        _ => report.push(
+            id,
+            Status::Skipped,
+            "",
+            "клиентский сертификат СУБД не задан",
+        ),
+    }
+}
+
 /// Сроки внутренних сертификатов (решение 2026-11-11 №27, APP-25): CA СУБД (`pki.database_ca`), CA OpenBao
 /// (`pki.secrets_ca`) и сертификат узла `tls.cert_file`, если его выпустил один из этих CA (`pki.node`;
 /// сертификат другого издателя — проверка `tls.certificate`). `WARN` — за [`PKI_WARN_BEFORE`], `FAIL` — после срока.
@@ -1123,6 +1218,84 @@ mod tests {
 
     fn pki_status(r: &Report, id: &str) -> Option<Status> {
         r.get(id).map(|c| c.status)
+    }
+
+    /// APP-36: ключи внутренних каналов по правилу APP-35 — ключ из хранилища секретов (файл не читается) и из
+    /// файла проверяются на пару с сертификатом; без хранилища секретов проверка пропускается; значение ключа в
+    /// отчёт не попадает.
+    #[tokio::test]
+    async fn internal_channel_keys() {
+        let certs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tp-cluster/src/testdata");
+        let c = certs.display();
+        let config = |rpc_key: &str, db_key: &str| {
+            sections::registry()
+                .expect("registry")
+                .parse(
+                    &format!(
+                        "domain: example.org\nprofile: dev\n\
+                         database:\n  url: postgres://x@y/z\n  tls:\n    ca_file: {c}/ca.pem\n    \
+                         cert_file: {c}/node-b.pem\n    {db_key}\n\
+                         blob:\n  url: file:///tmp/b\n\
+                         cluster:\n  rpc:\n    tls:\n      ca_file: {c}/ca.pem\n      \
+                         cert_file: {c}/node-b.pem\n      {rpc_key}\n"
+                    ),
+                    Vec::new(),
+                )
+                .expect("config")
+        };
+        let ids = ["cluster.rpc.tls.key", "database.tls.key"];
+        let statuses = |r: &Report| ids.map(|id| r.get(id).map(|c| c.status));
+
+        // Ключ в файле: хранилище не нужно.
+        let key_file = format!("key_file: {c}/node-b-key.pem");
+        let mut report = Report::default();
+        internal_keys(&config(&key_file, &key_file), None, &mut report).await;
+        assert_eq!(statuses(&report), [Some(Status::Ok); 2], "{report:?}");
+        // Чужой ключ в файле.
+        let other = format!("key_file: {c}/node-a-key.pem");
+        let mut report = Report::default();
+        internal_keys(&config(&other, &other), None, &mut report).await;
+        assert_eq!(statuses(&report), [Some(Status::Fail); 2], "{report:?}");
+
+        // Ключ по ссылке на секрет.
+        let by_secret = "key: { secret: \"thepost/node-b#key\" }";
+        let cfg = config(by_secret, by_secret);
+        let mut report = Report::default();
+        internal_keys(&cfg, None, &mut report).await;
+        assert_eq!(statuses(&report), [Some(Status::Skipped); 2], "{report:?}");
+        let mem = Arc::new(tp_testkit::MemSecretStore::default());
+        let key = "thepost/node-b#key".parse().expect("ref");
+        let pem = std::fs::read_to_string(certs.join("node-b-key.pem")).expect("key");
+        mem.set(&key, pem.clone());
+        let store: Arc<dyn SecretStore> = mem.clone();
+        let mut report = Report::default();
+        internal_keys(&cfg, Some(&store), &mut report).await;
+        assert_eq!(statuses(&report), [Some(Status::Ok); 2], "{report:?}");
+        for id in ids {
+            let check = report.get(id).expect("check");
+            assert_eq!(check.value, "секрет thepost/node-b#key", "{check:?}");
+        }
+        // Секрет с чужим ключом: FAIL, значение ключа в отчёт не попадает.
+        let wrong = std::fs::read_to_string(certs.join("node-a-key.pem")).expect("key");
+        mem.set(&key, wrong.clone());
+        let mut report = Report::default();
+        internal_keys(&cfg, Some(&store), &mut report).await;
+        assert_eq!(statuses(&report), [Some(Status::Fail); 2], "{report:?}");
+        let body = wrong.lines().nth(1).expect("key body");
+        assert!(!format!("{report:?}").contains(body), "ключ в отчёте");
+
+        // Каналы без mTLS: проверки пропущены.
+        let plain = sections::registry()
+            .expect("registry")
+            .parse(
+                "domain: example.org\nprofile: dev\ndatabase:\n  url: postgres://x@y/z\n\
+                 blob:\n  url: file:///tmp/b\n",
+                Vec::new(),
+            )
+            .expect("config");
+        let mut report = Report::default();
+        internal_keys(&plain, None, &mut report).await;
+        assert_eq!(statuses(&report), [Some(Status::Skipped); 2], "{report:?}");
     }
 
     /// Сроки внутренних сертификатов (APP-25): OK, WARN за 60 сут., FAIL после срока; издатель узла — другой CA.

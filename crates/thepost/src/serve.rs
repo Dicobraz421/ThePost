@@ -26,6 +26,7 @@ use tp_contracts::lease::LeaseStore;
 use tp_contracts::membership::{Membership, NodeId, NodeInfo};
 use tp_contracts::role::{CancellationToken, Role, RoleService, fixed_config};
 use tp_contracts::secrets::SecretStore;
+use tp_contracts::tls::InternalTls;
 use tp_contracts::{Error, Result};
 use tp_meta::events::EventConsumer;
 use tp_meta::{MetaConfig, PgMeta};
@@ -222,6 +223,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         &cluster,
         &node,
         Arc::new(meta.clone()),
+        store.clone(),
         &sockets,
         aux.clone(),
     )
@@ -652,10 +654,14 @@ fn node_info(id: NodeId, roles: &BTreeSet<Role>, cluster: &ClusterSection) -> Re
 /// тем же адресом или новый) до `shutdown`; другим узлам объявляется `cluster.addr`. Транспорт не включён
 /// ([`ClusterSection::rpc_enabled`]) — `None`; без адреса — только исходящие запросы. Ошибка сертификатов или
 /// слушателя — до запуска ролей.
+///
+/// Ключ сертификата узла — файл `rpc.tls.key_file` либо секрет `rpc.tls.key` из хранилища `store` (APP-36): на
+/// диск он не пишется. Сертификаты перечитываются без перезапуска ([`follow_rpc_tls`]).
 async fn start_rpc(
     cluster: &ClusterSection,
     node: &NodeId,
     members: Arc<dyn Membership>,
+    store: Arc<dyn SecretStore>,
     sockets: &Sockets,
     shutdown: CancellationToken,
 ) -> Result<Option<NodeRpc>> {
@@ -663,8 +669,19 @@ async fn start_rpc(
         return Ok(None);
     }
     let ctx = |e| infra::context("cluster.rpc", e);
-    let tls = NodeTls::load(&cluster.rpc.tls).await.map_err(ctx)?;
+    let tls = NodeTls::load_with_secrets(&cluster.rpc.tls, store.as_ref())
+        .await
+        .map_err(ctx)?;
     let rpc = NodeRpc::new(node.clone(), &cluster.rpc, tls, members).map_err(ctx)?;
+    if !cluster.rpc_tls_reload_interval.is_zero() {
+        tokio::spawn(follow_rpc_tls(
+            rpc.clone(),
+            cluster.rpc.tls.clone(),
+            store,
+            cluster.rpc_tls_reload_interval,
+            shutdown.clone(),
+        ));
+    }
     let Some(listen) = cluster.listen_addr() else {
         tracing::info!("cluster.rpc: адрес узла не задан — запросы других узлов не принимаются");
         return Ok(Some(rpc));
@@ -690,6 +707,59 @@ async fn start_rpc(
         }
     });
     Ok(Some(rpc))
+}
+
+/// Отпечаток источников сертификатов межузлового канала: содержимое файлов УЦ, сертификата и ключа и значение
+/// секрета ключа (`rpc.tls.key`). Недоступный источник — тоже состояние: его появление меняет отпечаток.
+/// Значения в отпечаток не восстановимы и никуда не выводятся.
+async fn rpc_tls_fingerprint(tls: &InternalTls, store: &dyn SecretStore) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for file in [&tls.ca_file, &tls.cert_file, &tls.key_file] {
+        match file {
+            Some(path) => tokio::fs::read(path).await.ok().hash(&mut hasher),
+            None => None::<Vec<u8>>.hash(&mut hasher),
+        }
+    }
+    match &tls.key {
+        Some(secret) => store
+            .get(secret)
+            .await
+            .ok()
+            .map(|s| s.expose().to_owned())
+            .hash(&mut hasher),
+        None => None::<String>.hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// Перечитывание сертификатов межузлового канала без перезапуска (APP-36, хвост CLU-16): раз в `period`
+/// сверяется отпечаток файлов и секрета ключа ([`rpc_tls_fingerprint`]); при изменении —
+/// `NodeRpc::follow_tls_with_secrets` читает новую пару (ошибка — `warn`, действует прежняя). До `shutdown`.
+async fn follow_rpc_tls(
+    rpc: NodeRpc,
+    tls: InternalTls,
+    store: Arc<dyn SecretStore>,
+    period: Duration,
+    shutdown: CancellationToken,
+) {
+    let seen = rpc_tls_fingerprint(&tls, store.as_ref()).await;
+    let state = (seen, tls.clone(), store.clone(), shutdown);
+    let changes =
+        futures::stream::unfold(state, move |(mut seen, tls, store, shutdown)| async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return None,
+                    () = tokio::time::sleep(period) => {}
+                }
+                let now = rpc_tls_fingerprint(&tls, store.as_ref()).await;
+                if now != seen {
+                    seen = now;
+                    return Some(((), (seen, tls, store, shutdown)));
+                }
+            }
+        });
+    rpc.follow_tls_with_secrets(&tls, store, changes).await;
 }
 
 /// Продление записи узла с периодом `period` до остановки.
@@ -1150,11 +1220,38 @@ mod tests {
         }
     }
 
+    /// APP-36: отпечаток источников сертификатов межузлового канала меняется при смене секрета ключа и файла и
+    /// не меняется без изменений; недоступный секрет — отдельное состояние.
+    #[tokio::test]
+    async fn rpc_tls_fingerprint_follows_files_and_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("node.pem");
+        std::fs::write(&cert, "cert-1").expect("cert");
+        let key: SecretRef = "thepost/node#key".parse().expect("ref");
+        let store = MemSecretStore::default();
+        let tls = InternalTls {
+            cert_file: Some(cert.clone()),
+            key: Some(key.clone()),
+            ..InternalTls::default()
+        };
+        let missing = rpc_tls_fingerprint(&tls, &store).await;
+        store.set(&key, "key-1".to_owned());
+        let first = rpc_tls_fingerprint(&tls, &store).await;
+        assert_ne!(missing, first);
+        assert_eq!(first, rpc_tls_fingerprint(&tls, &store).await);
+        store.set(&key, "key-2".to_owned());
+        let rotated = rpc_tls_fingerprint(&tls, &store).await;
+        assert_ne!(first, rotated);
+        std::fs::write(&cert, "cert-2").expect("cert");
+        assert_ne!(rotated, rpc_tls_fingerprint(&tls, &store).await);
+    }
+
     /// APP-18: два узла в процессе над одной базой — `cluster.addr` объявлен в составе и слушается, вызов идёт по
     /// HTTPS с mTLS на узел с ролью службы, вызывающий опознан по сертификату; матрица `cluster.rpc.permissions`
     /// на принимающем узле отказывает роли без разрешения. APP-30: узел `b` слушает `cluster.listen`, а объявляет
     /// `cluster.addr` с другим портом (проброс порта) — `a` вызывает `b` по объявленному адресу через проброс;
-    /// `a` без `listen` слушает свой `addr`.
+    /// `a` без `listen` слушает свой `addr`. APP-36: ключ узла `b` — из хранилища секретов
+    /// (`cluster.rpc.tls.key`), файла ключа у него нет; ключ узла `a` — в файле.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_nodes_call_each_other_over_rpc() {
         use tp_contracts::rpc::{Rpc, RpcError, RpcService};
@@ -1186,6 +1283,28 @@ mod tests {
             };
             let home = dir.path().join(id);
             std::fs::create_dir_all(&home).expect("dir");
+            let tls = if id == "b" {
+                // Ключ узла — в хранилище секретов; в каталоге узла — только УЦ и сертификат.
+                for file in ["ca.pem", "node-b.pem"] {
+                    std::fs::copy(certs.join(file), home.join(file)).expect("copy");
+                }
+                let key: SecretRef = "thepost/node-b#key".parse().expect("ref");
+                secrets.set(
+                    &key,
+                    std::fs::read_to_string(certs.join("node-b-key.pem")).expect("key"),
+                );
+                format!(
+                    "      ca_file: {h}/ca.pem\n      cert_file: {h}/node-b.pem\n      \
+                     key: {{ secret: \"{key}\" }}\n",
+                    h = home.display(),
+                )
+            } else {
+                format!(
+                    "      ca_file: {c}/ca.pem\n      cert_file: {c}/node-{id}.pem\n      \
+                     key_file: {c}/node-{id}-key.pem\n",
+                    c = certs.display(),
+                )
+            };
             let path = write_config(
                 &home,
                 &format!(
@@ -1193,12 +1312,10 @@ mod tests {
                      service_http:\n  listen: 127.0.0.1:0\n  allow_plaintext: true\n\
                      database:\n  url: \"{db_url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
                      cluster:\n  node_id: {id}\n  addr: https://127.0.0.1:{port}\n{listen}  rpc:\n    members_ttl: 0s\n\
-                     \x20   permissions:\n      maintenance: [search/*]\n    tls:\n\
-                     \x20     ca_file: {c}/ca.pem\n      cert_file: {c}/node-{id}.pem\n      key_file: {c}/node-{id}-key.pem\n\
+                     \x20   permissions:\n      maintenance: [search/*]\n    tls:\n{tls}\
                      runtime:\n  drain_deadline: 5s\n\
                      blob:\n  url: file://{}\n",
                     home.join("blob").display(),
-                    c = certs.display(),
                 ),
             );
             let (o, shutdown) = opts(path, Some(secrets.clone()));
@@ -1247,6 +1364,23 @@ mod tests {
             )
             .await;
         assert_eq!(refused, Err(RpcError::Failed(Error::Forbidden)));
+
+        // APP-36: у узла `b` закрытого ключа на диске нет — ни в конфигурации, ни в его каталоге.
+        fn private_keys(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    private_keys(&path, out);
+                } else if std::fs::read(&path)
+                    .is_ok_and(|b| String::from_utf8_lossy(&b).contains("PRIVATE KEY"))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        private_keys(&dir.path().join("b"), &mut found);
+        assert!(found.is_empty(), "{found:?}");
 
         for (running, shutdown, _) in nodes {
             shutdown.cancel();
