@@ -1,7 +1,8 @@
 //! Команды скриптов ManageSieve (RFC 5804 §2.5–2.12; SIEVE-09) поверх [`SieveStore`](tp_contracts::sieve::SieveStore).
 //!
 //! Все обращения — в контексте организации и учётной записи вошедшего субъекта. Текст проверяется до записи
-//! ([`compile`] с лимитами секции `sieve`): хранилище его не разбирает. Коды ответов — RFC 5804 §1.3.
+//! ([`compile`] с пределами действующей секции `sieve` узла — теми же, что у доставки и Admin API): хранилище его не
+//! разбирает. Коды ответов — RFC 5804 §1.3.
 
 use tp_contracts::Error;
 use tp_contracts::meta::AccountScope;
@@ -107,9 +108,18 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// Проверяет размер и текст скрипта; при ошибке отвечает `NO` (с позициями ошибок) и возвращает `false`.
+    /// Наибольший размер текста скрипта, байт: меньший из предела секции `sieve` узла (`max_script_size` — с ним же
+    /// проверяют текст доставка и Admin API) и предела хранилища.
+    fn max_script_size(&self) -> usize {
+        self.ctx
+            .config
+            .max_script_size
+            .min(self.ctx.deps.store.limits().max_script_size)
+    }
+
+    /// Проверяет размер и текст скрипта (пределы секции `sieve` узла); при ошибке отвечает `NO` (с позициями ошибок) и возвращает `false`.
     fn valid(&mut self, text: &str) -> bool {
-        if text.len() > self.ctx.deps.store.limits().max_script_size {
+        if text.len() > self.max_script_size() {
             self.no_code("QUOTA/MAXSIZE", "Script is too large");
             return false;
         }
@@ -153,14 +163,15 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// `HAVESPACE`: поместится ли скрипт `name` размера `size` (лимиты хранилища).
+    /// `HAVESPACE`: поместится ли скрипт `name` размера `size` (размер — [`Self::max_script_size`], число скриптов —
+    /// лимит хранилища).
     async fn have_space(&mut self, scope: AccountScope, name: &str, size: u64) {
         if !valid_script_name(name) {
             self.no("Invalid script name");
             return;
         }
         let limits = self.ctx.deps.store.limits();
-        if size > limits.max_script_size as u64 {
+        if size > self.max_script_size() as u64 {
             self.no_code("QUOTA/MAXSIZE", "Script is too large");
             return;
         }
