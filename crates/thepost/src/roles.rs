@@ -3,7 +3,7 @@
 //! журнала событий (по сигналам, [`crate::log_reader`]), очистка по сроку надгробий DAV, журнала автоответов,
 //! журнала доставки и токенов `admin init`
 //! ([`Purge`], решение 2026-11-11 п. 65), проверка целостности BLOB по расписанию под лизой лидера
-//! ([`ScheduledVerify`], APP-44); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
+//! ([`ScheduledVerify`], APP-44), однократный пересчёт поисковых строк старых контактов в фоне (APP-63); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -16,6 +16,7 @@ use tp_blob::{
 use tp_contracts::Result;
 use tp_contracts::admin_token::LocalAdminTokens;
 use tp_contracts::blob::{BlobIndex, BlobStore};
+use tp_contracts::dav::CardSearch;
 use tp_contracts::events::EventSink;
 use tp_contracts::lease::LeaseStore;
 use tp_contracts::role::{CancellationToken, Role, RoleCtx, RoleService};
@@ -125,6 +126,9 @@ pub struct Maintenance {
     pub verify: Option<ScheduledVerify>,
     /// Выгрузка журнала аудита в SIEM (`admin.audit`, APP-59); `None` — не выполняется (тесты без PostgreSQL).
     pub audit_export: Option<Arc<crate::audit_export::AuditExport>>,
+    /// Пересчёт поисковых строк контактов, записанных до миграции 0030 (`PgMeta::reindex_cards`, META-78, APP-63):
+    /// один раз в фоне при запуске роли; `None` — не выполняется (тесты без PostgreSQL).
+    pub card_reindex: Option<PgMeta>,
 }
 
 /// Показатели проверки целостности BLOB по расписанию для `/metrics` (`crate::metrics::register_verify`).
@@ -508,7 +512,31 @@ impl RoleService for Maintenance {
             let token = ctx.shutdown.clone();
             tokio::spawn(async move { export.run(token).await })
         });
+        // Пересчёт поисковых строк контактов (APP-63): старт роли не ждёт, ошибка — в журнал, прерванный
+        // пересчёт продолжит следующий запуск.
+        let card_reindex = self.card_reindex.clone().map(|meta| {
+            let token = ctx.shutdown.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = token.cancelled() => {}
+                    done = meta.reindex_cards(card_search) => {
+                        if let Err(e) = done {
+                            tracing::warn!(
+                                error = %e,
+                                "поисковые строки контактов не пересчитаны: повтор при следующем запуске роли"
+                            );
+                        }
+                    }
+                }
+            })
+        });
         ctx.ready.set(true);
+        let card_reindex = async move {
+            match card_reindex {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
         let audit_export = async move {
             match audit_export {
                 Some(task) => task.await,
@@ -533,13 +561,14 @@ impl RoleService for Maintenance {
                 None => Ok(()),
             }
         };
-        let (gc, orphans, trash, purge, verify, audit_export, ()) = tokio::join!(
+        let (gc, orphans, trash, purge, verify, audit_export, card_reindex, ()) = tokio::join!(
             gc,
             orphans,
             trash,
             purge,
             verify,
             audit_export,
+            card_reindex,
             consume(
                 self.events.clone(),
                 self.sinks.clone(),
@@ -554,6 +583,7 @@ impl RoleService for Maintenance {
             ("purge", purge),
             ("blob-verify", verify),
             ("audit-export", audit_export),
+            ("card-reindex", card_reindex),
         ] {
             if let Err(e) = done {
                 return Err(tp_contracts::Error::Internal(format!("{what}: {e}")));
@@ -561,6 +591,12 @@ impl RoleService for Maintenance {
         }
         Ok(())
     }
+}
+
+/// Поисковые строки тела контакта для пересчёта — по правилу индекса записи (`tp_dav::index::card`); тело не
+/// разбирается — `None`.
+fn card_search(body: &str) -> Option<CardSearch> {
+    tp_dav::index::card(body).ok().map(|i| i.search)
 }
 
 /// Чтение журнала событий подписчиками по сигналам до остановки; затем лизы разделов отдаются другим узлам.
@@ -677,6 +713,7 @@ mod tests {
             purge: None,
             verify: None,
             audit_export: None,
+            card_reindex: None,
         };
         let (ctx, shutdown, ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -807,6 +844,7 @@ mod tests {
             purge: None,
             verify: Some(verify),
             audit_export: None,
+            card_reindex: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -1066,6 +1104,7 @@ mod tests {
             purge: Some(purge),
             verify: None,
             audit_export: None,
+            card_reindex: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
