@@ -473,8 +473,8 @@ impl Admin {
                 .route(&format!("{prefix}/{{*rest}}"), any(handler));
         }
         let api = api.route_layer(middleware::from_fn_with_state(self.clone(), guard));
-        let api = crate::console::routes(api, &self.cfg.console, crate::console::embedded());
-        crate::init::routes(api)
+        let api = crate::cors::layer(crate::init::routes(api), &self.cfg.console.cors_origins);
+        crate::console::routes(api, &self.cfg.console, crate::console::embedded())
             .route("/api/openapi.json", get(openapi))
             .layer(DefaultBodyLimit::max(self.cfg.max_body_size))
             .with_state(self)
