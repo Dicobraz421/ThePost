@@ -245,7 +245,10 @@ Vec<AccountId> (непусто — модерируемая), hidden_from_gal }`
 `expand` (`None` — внешний). Ограничения и модерация — для группы-адресата, не для вложенных. Очередь модерации:
 `HeldMessage { id: HeldId, group, sender, sender_account, message_id, blob, size, held_at }` (ссылка на объект — у вызывающего);
 `hold` (нет группы — `NotFound`, занятый id — `Conflict`), `held(tenant, Option<GroupId>, limit)` по (`held_at`, `id`),
-`take_held(tenant, id)` — забрать для решения (повторно — `NotFound`). Синхронизация из каталога — `tp-auth` (AUTH-07), проверки
+`take_held(tenant, id)` — забрать для решения (повторно — `NotFound`). Продолжение очереди (CTR-55):
+`held_after(tenant, Option<GroupId>, after: Option<HeldCursor { held_at, id }>, limit)` — страница строго после курсора в том же порядке
+(`None` — с начала; курсор — `HeldCursor::of` последнего письма страницы; по умолчанию — `Internal`), правило — `groups::held_page`;
+`held` остаётся первой страницей (META-59, ADM-21). Синхронизация из каталога — `tp-auth` (AUTH-07), проверки
 при приёме — `tp-smtp` (SMTP-16), Admin API — ADM-07; реализация — `tp-meta` (META-21), in-memory — `MemGroups`; набор — `suite::group_store`.
 Решения модератора (CTR-31): `Moderation` (вместо временного трейта `tp-admin`) — `deliver(tenant, &group, &HeldMessage)` доставляет
 одобренное письмо участникам группы (раскрытие `expand`, приём в ящики, журнал доставки; другая группа или организация — `Invalid`,
@@ -825,3 +828,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   собирающий `InternalTls` перечислением всех полей, дополняется `key: None` (в репозитории таких мест нет).
 - 2026-11-12 — CTR-53 (волна contracts-38): `AccountStore::addresses(tenant, id)` — адреса учётной записи (основной и псевдонимы каталога
   без catch-all; по умолчанию — только основной через `get`), правило — `meta::account_addresses`.
+- 2026-11-12 — CTR-55 (волна contracts-38): `GroupStore::held_after(tenant, group, after, limit)` и `HeldCursor { held_at, id }` —
+  продолжение очереди модерации по курсору (по умолчанию — `Internal`); правило страницы — `groups::held_page`.
