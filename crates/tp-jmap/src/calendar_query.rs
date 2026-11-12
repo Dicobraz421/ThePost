@@ -14,7 +14,6 @@
 //! `/queryChanges` — без `expandRecurrences` (`canCalculateChanges` запроса с ним — `false`).
 
 use std::cmp::Ordering;
-use std::str::FromStr;
 
 use calcard::common::PartialDateTime;
 use calcard::common::timezone::Tz;
@@ -378,18 +377,13 @@ pub(crate) async fn query_changes(
     query_changes_response(&qc, &ids, &c, limit)
 }
 
-/// Пояс по имени (для тестов границ).
-#[cfg(test)]
-fn zone(name: &str) -> Tz {
-    Tz::from_str(name).unwrap_or(Tz::UTC)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{bound, zone};
+    use super::bound;
     use crate::calendar_event::tests::{by_uid, put_dataset};
+    use crate::calendar_event::tz_of;
     use crate::calendars::tests::{call, create_calendar};
     use crate::testenv::Env;
 
@@ -421,6 +415,10 @@ mod tests {
         let mut out = uids(env, json!({"filter": {"after": after, "before": before}})).await;
         out.sort();
         out
+    }
+
+    fn zone(name: &str) -> calcard::common::timezone::Tz {
+        tz_of(Some(name)).expect("zone")
     }
 
     #[test]
