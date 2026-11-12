@@ -50,11 +50,7 @@ async fn account_in(meta: &PgMeta, tenant: TenantId, domain: (DomainId, &str)) -
 }
 
 fn card(uid: &str) -> ObjectIndex {
-    ObjectIndex {
-        component: Component::Card,
-        uid: uid.into(),
-        span: None,
-    }
+    ObjectIndex::new(Component::Card, uid, None)
 }
 
 async fn put_card(meta: &PgMeta, scope: AccountScope, book: &Collection, name: &str) -> ModSeq {
