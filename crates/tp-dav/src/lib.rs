@@ -21,6 +21,7 @@
 //! - [`xml`] — разбор XML-тел с лимитами и запись `multistatus`;
 //! - [`fuzz`] — проверки разбора для цели cargo-fuzz `crates/tp-dav/fuzz` (не API).
 
+mod alarm;
 mod card;
 pub mod config;
 pub mod deliver;

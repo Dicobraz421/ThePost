@@ -16,9 +16,15 @@
 //! и 4.0), `max-resource-size`, `max-image-size` (Apple; `dav.max_photo_size`), `addressbook-description`.
 //! Глобальная адресная книга ([`crate::gal`]) — последней в списке дома, права — только чтение.
 //!
+//! Оповещения по умолчанию календаря (`default-alarm-vevent-datetime`, `default-alarm-vevent-date`; CTR-56) —
+//! компоненты VALARM из `Collection::alerts_with_time`, `alerts_without_time` ([`crate::alarm`]), те же, что JMAP
+//! `defaultAlertsWithTime`, `defaultAlertsWithoutTime`; не заданы — пустое значение. Календарь и книга, созданные
+//! при первом обращении, — коллекции по умолчанию своего вида (`Collection::is_default`).
+//!
 //! `PROPPATCH` — у коллекции: `displayname`, описание (`calendar-description`, `addressbook-description`), цвет и
 //! порядок календаря (`calendar-color`, `calendar-order`, Apple), часовой пояс календаря (`calendar-timezone` —
-//! VTIMEZONE, RFC 4791 §5.2.2; `calendar-timezone-id` — IANA, RFC 7809 §5.2; хранится идентификатор IANA). Изменения атомарны: ошибка одного свойства — оно
+//! VTIMEZONE, RFC 4791 §5.2.2; `calendar-timezone-id` — IANA, RFC 7809 §5.2; хранится идентификатор IANA),
+//! оповещения по умолчанию (VALARM; не разбирается — 409). Изменения атомарны: ошибка одного свойства — оно
 //! со своим статусом (403 — защищённое или неизвестное, 409 — недопустимое значение), остальные — 424, ничего не
 //! записано. Произвольные («мёртвые») свойства не хранятся.
 
@@ -39,12 +45,17 @@ use tp_contracts::meta::AccountScope;
 use tp_contracts::{Error, Result};
 
 use crate::config::DavConfig;
-use crate::gal;
 use crate::path::{self, Target};
 use crate::server::{Cx, multistatus, precondition, status};
 use crate::xml::{
     CALDAV, CARDDAV, CS, DAV, Element, Group, ICAL, Multistatus, PropName, href, text,
 };
+use crate::{alarm, gal};
+
+/// Оповещения по умолчанию для событий со временем (CTR-56, [`crate::alarm`]).
+const ALARM_DATETIME: &str = "default-alarm-vevent-datetime";
+/// Оповещения по умолчанию для событий на весь день.
+const ALARM_DATE: &str = "default-alarm-vevent-date";
 
 /// Префикс токена синхронизации (RFC 6578: токен — URI).
 pub(crate) const SYNC_PREFIX: &str = "urn:thepost:sync:";
@@ -81,7 +92,8 @@ const PRIV_READ: &str = concat!(
 pub(crate) enum Res<'a> {
     Root,
     Principals,
-    Principal,
+    /// Принципал вошедшего с адресами календарного пользователя (`calendar-user-address-set`).
+    Principal(&'a [String]),
     Home(CollectionKind),
     /// Ресурс планирования дома календарей: входящие (`inbox`) или исходящие.
     Schedule {
@@ -114,7 +126,7 @@ impl Res<'_> {
         match self {
             Res::Root => path::PREFIX.to_owned(),
             Res::Principals => path::PRINCIPALS.to_owned(),
-            Res::Principal => path::principal(login),
+            Res::Principal(_) => path::principal(login),
             Res::Home(k) => path::home(*k, login),
             Res::Schedule { inbox, .. } => schedule_href(login, *inbox),
             Res::InboxItem { name, .. } => {
@@ -207,7 +219,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
     let me = path::principal(login);
     let rt = match res {
         Res::Root | Res::Principals | Res::Home(_) => "<d:collection/>",
-        Res::Principal => "<d:collection/><d:principal/>",
+        Res::Principal(_) => "<d:collection/><d:principal/>",
         Res::Collection(c) => match c.kind {
             CollectionKind::Calendar => "<d:collection/><c:calendar/>",
             CollectionKind::AddressBook => "<d:collection/><card:addressbook/>",
@@ -218,7 +230,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
     };
     let mut v = vec![p(DAV, "resourcetype", rt.to_owned())];
     match res {
-        Res::Principal => {
+        Res::Principal(addresses) => {
             v.push(p(DAV, "displayname", text(login).into_owned()));
             v.push(p(DAV, "principal-URL", href(&me)));
             v.push(p(
@@ -231,10 +243,10 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
                 "addressbook-home-set",
                 href(&path::home(CollectionKind::AddressBook, login)),
             ));
-            let mut addrs = String::new();
-            if login.contains('@') {
-                addrs.push_str(&href(&format!("mailto:{login}")));
-            }
+            let mut addrs: String = addresses
+                .iter()
+                .map(|a| href(&format!("mailto:{a}")))
+                .collect();
             addrs.push_str(&href(&me));
             v.push(p(CALDAV, "calendar-user-address-set", addrs));
             v.push(p(
@@ -306,7 +318,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
     v.push(p(DAV, "current-user-principal", href(&me)));
     v.push(p(DAV, "principal-collection-set", href(path::PRINCIPALS)));
     let privs = match res {
-        Res::Root | Res::Principals | Res::Principal => PRIV_READ,
+        Res::Root | Res::Principals | Res::Principal(_) => PRIV_READ,
         Res::Collection(c) | Res::Object { coll: c, .. } if gal::is(c) => PRIV_READ,
         _ => PRIV_OWNER,
     };
@@ -373,6 +385,16 @@ fn collection_props(cx: &Cx<'_>, c: &Collection, me: &str, v: &mut Vec<(PropName
                     );
                     v.push(p(CALDAV, name, value));
                 }
+            }
+            for (name, alerts) in [
+                (ALARM_DATETIME, &c.alerts_with_time),
+                (ALARM_DATE, &c.alerts_without_time),
+            ] {
+                let value = alerts
+                    .as_deref()
+                    .and_then(alarm::to_valarms)
+                    .unwrap_or_default();
+                v.push(p(CALDAV, name, text(&value).into_owned()));
             }
             if let Some(tz) = &c.timezone {
                 v.push(p(CALDAV, "calendar-timezone-id", text(tz).into_owned()));
@@ -522,10 +544,14 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         Target::Principals => {
             emit(cx, &mut ms, &Res::Principals, &want);
             if depth1 {
-                emit(cx, &mut ms, &Res::Principal, &want);
+                let addresses = cx.addresses().await?;
+                emit(cx, &mut ms, &Res::Principal(&addresses), &want);
             }
         }
-        Target::Principal(_) => emit(cx, &mut ms, &Res::Principal, &want),
+        Target::Principal(_) => {
+            let addresses = cx.addresses().await?;
+            emit(cx, &mut ms, &Res::Principal(&addresses), &want);
+        }
         Target::Home(kind, _) => {
             ensure_defaults(cx, *kind).await?;
             emit(cx, &mut ms, &Res::Home(*kind), &want);
@@ -623,6 +649,7 @@ pub(crate) async fn defaults(
     if !store.list_collections(scope, kind).await?.is_empty() {
         return Ok(());
     }
+    // Имя, отображаемое имя, компонент; первая — коллекция по умолчанию вида (`Collection::is_default`).
     let defaults: &[(&str, &String, Component)] = match kind {
         CollectionKind::Calendar => &[
             (
@@ -647,6 +674,7 @@ pub(crate) async fn defaults(
             display_name: (*display).clone(),
             order,
             components: BTreeSet::from([*component]),
+            is_default: order == 0,
             ..Collection::new(kind, *name)
         };
         match store.create_collection(scope, c).await {
@@ -746,6 +774,20 @@ pub(crate) fn apply(c: &mut Collection, name: &PropName, value: Option<&Element>
             // Пояс, которого нет в базе IANA (своё определение клиента), не хранится: календарь остаётся в UTC.
             Some(ical) => c.timezone = timezone_of(&ical),
         },
+        (CALDAV, ALARM_DATETIME | ALARM_DATE) if calendar => {
+            let alerts = match v.filter(|s| !s.is_empty()) {
+                None => None,
+                Some(valarms) => match alarm::from_valarms(&valarms) {
+                    Some(json) => Some(json),
+                    None => return StatusCode::CONFLICT,
+                },
+            };
+            if name.name == ALARM_DATETIME {
+                c.alerts_with_time = alerts;
+            } else {
+                c.alerts_without_time = alerts;
+            }
+        }
         (CALDAV, "calendar-timezone-id") if calendar => match v.filter(|s| !s.is_empty()) {
             None => c.timezone = None,
             Some(id) => match Tz::from_str(&id).ok().and_then(|tz| tz.name()) {
