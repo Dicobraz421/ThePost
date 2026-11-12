@@ -12,6 +12,8 @@ Description=The Post mail server
 Documentation=https://github.com/Dicobraz421/ThePost
 Wants=network-online.target
 After=network-online.target postgresql.service
+# Без предела числа попыток перезапуска (решение 85): узел ждёт СУБД, OpenBao и сеть сколько нужно.
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -19,7 +21,13 @@ User=thepost
 Group=thepost
 ExecStart=/usr/local/bin/thepost serve --config /etc/thepost/config.yaml
 Restart=on-failure
-RestartSec=5s
+# Пауза перезапуска растёт с 10 с до 5 мин за 6 шагов (systemd 254+; решение 85, APP-31). После длинной серии сбоев
+# узел вернётся не позже чем через 5 минут после устранения причины; сразу — `systemctl restart thepost`.
+# systemd < 254 (Debian 12, AlmaLinux 9, РЕД ОС 8) ключи RestartSteps и RestartMaxDelaySec не знает и пропускает:
+# там пауза постоянная — drop-in thepost.service.d/restart-legacy.conf (30 с; роль Ansible ставит его сама).
+RestartSec=10s
+RestartSteps=6
+RestartMaxDelaySec=5min
 TimeoutStopSec=60s
 LimitNOFILE=1048576
 
