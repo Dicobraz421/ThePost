@@ -4,7 +4,8 @@
 #   Профиль dev: BAO_TOKEN задан (dev-режим), идентификаторы AppRole фиксированы (TP_APPROLE_ROLE_ID, TP_APPROLE_SECRET_ID).
 #   Профили tls и smb: первый запуск — `bao operator init`; ключ восстановления и root-токен — /admin/init.txt
 #   (только стенд); role_id и secret_id узла — /approle; новые пароли учётных записей PostgreSQL —
-#   /bootstrap/db{,-owner,-readonly}-password (их применяет и удаляет postgres-role-tls).
+#   /bootstrap/db{,-owner,-readonly}-password (их применяет и удаляет postgres-role-tls); ключ TLS узла
+#   (thepost/tls#key) — из /certs/server.key (tls-init), новая версия — после перевыпуска.
 set -eu
 umask 077
 
@@ -84,5 +85,10 @@ if ! bao kv get -mount=thepost s3 >/dev/null 2>&1; then
   printf %s "$TP_S3_SECRET_ACCESS_KEY" \
     | bao kv put -mount=thepost s3 access_key_id="$TP_S3_ACCESS_KEY_ID" secret_access_key=- >/dev/null
   echo "openbao-init: записан секрет thepost/s3"
+fi
+# Ключ TLS слушателей thepost (tls.key, решение 100): серверный ключ tls-init; другой — новая версия секрета.
+if [ -s /certs/server.key ]   && [ "$(bao kv get -mount=thepost -field=key tls 2>/dev/null || true)" != "$(cat /certs/server.key)" ]; then
+  bao kv put -mount=thepost tls key=@/certs/server.key >/dev/null
+  echo "openbao-init: записан ключ TLS thepost/tls"
 fi
 echo "openbao-init: готово"

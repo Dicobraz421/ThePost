@@ -238,12 +238,13 @@ async fn certs() -> Arc<TlsCerts> {
     let dir = temp_dir();
     let cfg = TlsConfig {
         cert_file: dir.join("cert.pem"),
-        key_file: dir.join("key.pem"),
         ..TlsConfig::default()
     };
     std::fs::write(&cfg.cert_file, CERT).expect("cert");
-    std::fs::write(&cfg.key_file, KEY).expect("key");
-    let certs = TlsCerts::load(&cfg).await.expect("load");
+    // Ключ — только секрет `tls.key` в хранилище секретов (PLT-31).
+    let store = Arc::new(tp_testkit::MemSecretStore::default());
+    store.set(&cfg.key, KEY);
+    let certs = TlsCerts::load(&cfg, store).await.expect("load");
     let _ = std::fs::remove_dir_all(dir);
     Arc::new(certs)
 }

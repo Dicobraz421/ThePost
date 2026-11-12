@@ -548,6 +548,10 @@
 | [DEP-44](DEP-44.md) | эталоны: ключи TLS в OpenBao | deploy | A | deploy-31 | ready | — |
 | [CI-13](CI-13.md) | бета выпускает тег версии образа | ci | B | ci-11 | ready | CI-01 |
 | [DEP-50](DEP-50.md) | Helm и Compose: закрытый образ и тег версии | deploy | A | deploy-36 | todo | CI-13 |
+| [CI-14](CI-14.md) | артефакт CI тем же путём, что выпуск; запуск на старом процессоре | ci | B | ci-12 | todo | CI-13 |
+| [DEP-51](DEP-51.md) | эталоны deploy/config: edge.yaml и порты IMAP, ManageSieve | deploy | A | deploy-37 | ready | DEP-37 |
+| [DEP-52](DEP-52.md) | стенд: доверенные подсети вместо выключенного ограничения частоты | deploy | A | deploy-38 | todo | PLT-32 |
+| [APP-60](APP-60.md) | thepost doctor: подсказки DNS для календарей и контактов | app | A | app-55 | ready | DEP-21 |
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | ready | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | todo | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | todo | — |

@@ -198,17 +198,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/testdata");
         let cert = dir.path().join("cert.pem");
-        let key = dir.path().join("key.pem");
         std::fs::copy(src.join("cert.pem"), &cert).expect("cert");
-        std::fs::copy(src.join("key.pem"), &key).expect("key");
         let path = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
         let cfg = config(&format!(
-            "{BASE}tls:\n  cert_file: {}\n  key_file: {}\n\
+            "{BASE}tls:\n  cert_file: {}\n\
              acme:\n  enabled: true\n  domains: [mail.example.org]\n  state_dir: {}\n  \
              directory_url: https://127.0.0.1:1/directory\n  retry_interval: 1h\n\
              http:\n  acme: {{ listen: 127.0.0.1:0 }}\n",
             path(&cert),
-            path(&key),
             path(&dir.path().join("acme")),
         ));
         let sockets = Sockets::default();
@@ -239,12 +236,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
         let cfg = config(&format!(
-            "{BASE}tls:\n  cert_file: {}\n  key_file: {}\n  key: {{ secret: \"thepost/tls#key\" }}\n\
+            "{BASE}tls:\n  cert_file: {}\n  key: {{ secret: \"thepost/tls#key\" }}\n\
              acme:\n  enabled: true\n  domains: [mail.example.org]\n  state_dir: {}\n  \
              directory_url: https://127.0.0.1:1/directory\n\
              http:\n  acme: {{ listen: 127.0.0.1:0 }}\n",
             path(&dir.path().join("cert.pem")),
-            path(&dir.path().join("key.pem")),
             path(&dir.path().join("acme")),
         ));
         let sockets = Sockets::default();

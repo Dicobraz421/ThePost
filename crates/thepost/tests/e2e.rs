@@ -59,6 +59,20 @@ fn testdata(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Хранилище секретов узла теста: пароль СУБД (`thepost/db#password`) и ключ TLS — только секрет `tls.key`
+/// (PLT-31; ссылка по умолчанию `thepost/tls#key`, ключ тестового сертификата).
+fn node_secrets(password: Option<String>) -> Arc<MemSecretStore> {
+    let secrets = Arc::new(MemSecretStore::default());
+    let db: SecretRef = "thepost/db#password".parse().expect("ref");
+    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let key: SecretRef = "thepost/tls#key".parse().expect("ref");
+    secrets.set(
+        &key,
+        std::fs::read_to_string(testdata("key.pem")).expect("key.pem"),
+    );
+    secrets
+}
+
 /// Адрес без `sslmode` — открытый канал (профиль dev).
 fn dev_url(url: &str) -> String {
     if url.contains("sslmode=") {
@@ -87,22 +101,31 @@ fn split_password(url: &str) -> (String, Option<String>) {
     }
 }
 
-/// config.yaml без секций верхнего уровня `names` (их задаёт тест).
-fn without_sections(text: &str, names: &[&str]) -> String {
+/// Пресет `preset` с секциями теста `own`: секции верхнего уровня, которые задаёт тест, и секции `drop` вырезаются
+/// из пресета целиком, поэтому новая секция пресета не даёт повторяющегося ключа. Комментарии с первой колонки
+/// остаются.
+fn with_sections(preset: &str, own: &str, drop: &[&str]) -> String {
+    let top = |line: &str| !line.starts_with([' ', '\t', '#']) && !line.trim().is_empty();
+    let names: Vec<&str> = own
+        .lines()
+        .filter(|l| top(l))
+        .filter_map(|l| l.split_once(':').map(|(name, _)| name))
+        .chain(drop.iter().copied())
+        .collect();
     let mut out = String::new();
     let mut skip = false;
-    for line in text.lines() {
-        let top = !line.starts_with([' ', '\t']) && !line.trim().is_empty();
-        if top {
+    for line in preset.lines() {
+        if top(line) {
             skip = names
                 .iter()
                 .any(|n| line.strip_prefix(n).is_some_and(|r| r.starts_with(':')));
         }
-        if !skip {
+        if !skip || line.starts_with('#') {
             out.push_str(line);
             out.push('\n');
         }
     }
+    out.push_str(own);
     out
 }
 
@@ -113,17 +136,9 @@ fn config(dir: &Path, db_url: &str, domain: &str) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/all.yaml"),
     )
     .expect("deploy/config/all.yaml");
-    let base = without_sections(
-        &all,
-        &[
-            "domain", "database", "blob", "secrets", "http", "tls", "smtp", "imap",
-        ],
-    );
-    assert!(base.contains("roles: [all]"), "{base}");
     let path = |p: PathBuf| p.display().to_string().replace('\\', "/");
-    format!(
-        "{base}\
-domain: {domain}
+    let own = format!(
+        "domain: {domain}
 profile: dev
 database:
   url: \"{db_url}\"
@@ -136,7 +151,6 @@ service_http:
   allow_plaintext: true
 tls:
   cert_file: \"{cert}\"
-  key_file: \"{key}\"
 meta:
   events:
     node_ttl: 3s
@@ -165,10 +179,12 @@ search:
 ",
         blob = path(dir.join("blob")),
         cert = path(testdata("cert.pem")),
-        key = path(testdata("key.pem")),
         index = path(dir.join("index")),
         pid = std::process::id(),
-    )
+    );
+    let text = with_sections(&all, &own, &["secrets"]);
+    assert!(text.contains("roles: [all]"), "{text}");
+    text
 }
 
 /// Срок ожидания шага: `WAIT` от текущего момента.
@@ -566,9 +582,7 @@ async fn mvp_mail_flow() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     // Домен профиля SMB из поставки (`deploy/config/all.yaml`).
     let domain = "example.ru".to_owned();
@@ -1146,9 +1160,7 @@ async fn transport_settings_without_restart() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let domain = "example.ru".to_owned();
     let socket = dir.path().join("admin.sock");
@@ -1317,9 +1329,7 @@ async fn sieve_rules_and_vacation() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let domain = "example.ru".to_owned();
     let socket = dir.path().join("admin.sock");
@@ -1605,9 +1615,7 @@ async fn meeting_scheduling() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let domain = "example.ru".to_owned();
     let path = dir.path().join("config.yaml");
@@ -1796,9 +1804,7 @@ async fn d7_metrics() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let path = dir.path().join("config.yaml");
     let text = config(dir.path(), &db_url, "example.ru")
@@ -1884,9 +1890,7 @@ async fn admin_domains() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let domain = "example.ru".to_owned();
     let socket = dir.path().join("admin.sock");
