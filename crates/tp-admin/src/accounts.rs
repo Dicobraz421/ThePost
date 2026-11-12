@@ -13,21 +13,19 @@
 //! - политика уровня задаётся целиком (`PUT`), поле `null` — не задано на уровне; действующая политика
 //!   (`effective`) — наложение цепочки организация → домен → ящик (`PolicyResolver`).
 //!
-//! Записи политик в контрактах пока нет: [`PolicyStore`] — временный трейт полосы (как `AppPasswordStore` в AUTH-02
-//! до CTR-22), повторяет `PgMeta::policy`/`set_policy`.
+//! Политики уровней — контракт `PolicyStore` (CTR-25; уровни организации, домена и ящика).
 //! Список учётных записей — `AccountStore::list` (CTR-44).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_contracts::config::duration;
-use tp_contracts::meta::{Account, AccountUpsert, Policy};
+use tp_contracts::meta::{Account, AccountUpsert, Policy, PolicyTarget};
 use tp_contracts::retention::TrashPurgeRule;
 use tp_contracts::transport::normalize_domain;
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
@@ -35,32 +33,6 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::retention::TrashPurgeRuleBody;
 use crate::server::{Admin, ApiResult, Problem, Refused};
-
-/// Уровень цепочки политик, задаваемый через Admin API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PolicyTarget {
-    /// Организация.
-    Tenant,
-    /// Домен.
-    Domain(DomainId),
-    /// Учётная запись (ящик).
-    Account(AccountId),
-}
-
-/// Политики уровней цепочки (временный трейт до контракта).
-#[async_trait]
-pub trait PolicyStore: Send + Sync + 'static {
-    /// Политика одного уровня без наложения; не задана — все поля `None`.
-    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy>;
-
-    /// Задаёт политику уровня целиком; политика без заданных полей удаляет уровень.
-    async fn set_policy(
-        &self,
-        tenant: TenantId,
-        target: PolicyTarget,
-        policy: &Policy,
-    ) -> Result<()>;
-}
 
 /// Политика уровня; `null` — не задано на уровне.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -80,6 +52,9 @@ pub struct PolicyBody {
     /// Лимит отправки, писем в час.
     #[serde(default)]
     pub send_per_hour: Option<u32>,
+    /// Лимит отправки, адресатов в час (сумма получателей писем за скользящий час).
+    #[serde(default)]
+    pub rcpts_per_hour: Option<u32>,
     /// Лимит получателей одного письма.
     #[serde(default)]
     pub max_recipients: Option<u32>,
@@ -101,6 +76,7 @@ impl From<Policy> for PolicyBody {
             trash_retention: p.trash_retention,
             retention: p.retention,
             send_per_hour: p.send_per_hour,
+            rcpts_per_hour: p.rcpts_per_hour,
             max_recipients: p.max_recipients,
             dkim_selector: p.dkim_selector,
             milter_profile: p.milter_profile,
@@ -116,6 +92,7 @@ impl From<PolicyBody> for Policy {
             trash_retention: p.trash_retention,
             retention: p.retention,
             send_per_hour: p.send_per_hour,
+            rcpts_per_hour: p.rcpts_per_hour,
             max_recipients: p.max_recipients,
             dkim_selector: p.dkim_selector,
             milter_profile: p.milter_profile,
@@ -466,7 +443,7 @@ async fn create_account(
     Ok((StatusCode::CREATED, Json(account_info(&a, acc).await?)))
 }
 
-async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo> {
+pub(crate) async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo> {
     let scope = tp_contracts::meta::AccountScope {
         tenant: acc.tenant,
         account: acc.id,
@@ -732,7 +709,7 @@ mod tests {
             .await;
         assert_eq!(list, json!([]));
 
-        let opolicy = json!({"quota_bytes": 100, "send_per_hour": 7});
+        let opolicy = json!({"quota_bytes": 100, "send_per_hour": 7, "rcpts_per_hour": 900});
         env.call(
             "PUT",
             &format!("{}/policy", org()),
@@ -754,6 +731,7 @@ mod tests {
         assert_eq!(b["policy"]["quota_bytes"], 2048);
         assert_eq!(b["effective"]["quota_bytes"], 2048);
         assert_eq!(b["effective"]["send_per_hour"], 7);
+        assert_eq!(b["effective"]["rcpts_per_hour"], 900);
 
         let missing = format!("{}/accounts/{}", org(), tp_contracts::AccountId::new());
         let (s, _, _) = env.call("GET", &missing, Some("org"), None).await;

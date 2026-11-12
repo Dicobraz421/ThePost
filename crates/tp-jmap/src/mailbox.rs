@@ -9,6 +9,7 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use tp_contracts::audit::{AuditAction, AuditObject};
 use tp_contracts::meta::{Flag, Mailbox, NewMailbox, SpecialUse};
 use tp_contracts::{Error, MailboxId};
 
@@ -588,11 +589,22 @@ async fn destroy_one(
     }) else {
         return Ok(Err(set_error("notFound", None, &[])));
     };
-    if !remove_emails && d.mailboxes.status(ctx.scope, mb.id).await?.messages > 0 {
+    let has_email = d.mailboxes.status(ctx.scope, mb.id).await?.messages > 0;
+    if !remove_emails && has_email {
         return Ok(Err(set_error("mailboxHasEmail", None, &[])));
     }
     Ok(match d.mailboxes.delete(ctx.scope, mb.id, false).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if has_email {
+                // Аудит ящика: письма папки удалены вместе с ней.
+                let object = AuditObject {
+                    mailbox: Some(mb.id),
+                    ..AuditObject::default()
+                };
+                crate::audit::owner(ctx, AuditAction::Delete, object).await;
+            }
+            Ok(())
+        }
         Err(Error::Conflict) => Err(set_error("mailboxHasChild", None, &[])),
         Err(Error::Forbidden) => Err(set_error("forbidden", None, &[])),
         Err(Error::NotFound) => Err(set_error("notFound", None, &[])),

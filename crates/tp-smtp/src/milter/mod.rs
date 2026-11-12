@@ -1,9 +1,13 @@
 //! Milter-клиент (SRS 4.1): антиспам и антивирус по протоколу Milter v6 (Rspamd, clamav-milter и др.).
 //!
-//! [`Milters`] — цепочка фильтров секции `smtp.milter`; письмо проходит фильтры по порядку после приёма
-//! (`DATA`/`BDAT`), до доставки и постановки в очередь. Набор фильтров письма — профиль `smtp.milter.profiles`,
-//! выбранный политикой организации (`Policy::milter_profile`, SMTP-40); профиль не задан — все фильтры режима,
-//! профиля нет в конфигурации — тоже все (предупреждение в журнал: фильтрация не пропускается). Каждому фильтру — отдельное соединение: согласование
+//! [`Milters`] — фильтры секции `smtp.milter` двух направлений (SMTP-27): приём (smtp-in) и исходящая почта
+//! (submission и отправка вне сессии SMTP — JMAP EmailSubmission; в частности, внешние системы DLP). Письмо
+//! проходит фильтры своего направления по порядку после приёма (`DATA`/`BDAT`, вызов отправки), до доставки и
+//! постановки в очередь. Набор фильтров письма сужает профиль `smtp.milter.profiles`, выбранный политикой
+//! организации (`Policy::milter_profile`, SMTP-40); профиль не задан — все фильтры направления, профиля нет в
+//! конфигурации — тоже все (предупреждение в журнал: фильтрация не пропускается). У письма JMAP соединения
+//! клиента нет: фильтру передаются имя узла и семейство адреса «неизвестно» (`SMFIA_UNKNOWN`). Каждому фильтру —
+//! отдельное соединение: согласование
 //! (`O`), макросы (`D`), `C`, `H`, `M`, `R`, `T`, заголовки (`L`), `N`, тело (`B`), `E`, `Q`; шаги, от
 //! которых фильтр отказался при согласовании (`SMFIP_NO*`, `SMFIP_NR_*`), не отправляются или идут без ответа.
 //!
@@ -13,8 +17,8 @@
 //! - `discard` — письмо принято (`250`) и никому не доставляется;
 //! - добавление, вставка и изменение заголовков (`h`, `i`, `m`) — применяются к письму, следующий фильтр
 //!   видит изменённое письмо;
-//! - `quarantine` — smtp-in доставляет письмо в «Спам», submission отклоняет (`550 5.7.1`): исходящее письмо
-//!   в карантине наружу не уходит.
+//! - `quarantine` — направление приёма доставляет письмо в «Спам», направление исходящей почты отклоняет (`550 5.7.1`):
+//!   исходящее письмо в карантине наружу не уходит.
 //!
 //! Отказ фильтра на шаге до конца тела (`MAIL`, `RCPT`, заголовки) отклоняет всё письмо: проверка идёт после
 //! приёма, ответить отказом отдельному получателю уже нельзя. Другие изменения (тело, получатели, отправитель)
@@ -22,8 +26,8 @@
 //!
 //! Таймауты — `connect_timeout`, `command_timeout` (ответ на команду), `end_timeout` (ответ на конец тела;
 //! `progress` фильтра продлевает ожидание). Недоступность фильтра (соединение, таймаут, нарушение протокола) —
-//! по `on_failure`: `accept` — письмо идёт дальше с заголовком `X-ThePost-Milter: <имя>; unavailable`,
-//! `tempfail` — `451 4.7.1`.
+//! по `on_failure` фильтра: `accept` — письмо идёт дальше с заголовком `X-ThePost-Milter: <имя>; unavailable`,
+//! `tempfail` — `451 4.7.1`. Не задано — по направлению: приём — `accept`, исходящая почта — `tempfail`.
 //!
 //! Готовый крейт клиента (`miltr-client`, MIT) не подошёл: не разбирает ответ `accept` (`SMFIR_ACCEPT`),
 //! не умеет отправлять макросы и по описанию автора — тестовый клиент; поэтому здесь минимальная реализация
@@ -36,7 +40,9 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::config::{MilterConfig, MilterFilter, MilterOnFailure};
+use std::net::SocketAddr;
+
+use crate::config::{MilterConfig, MilterDirection, MilterFilter, MilterOnFailure};
 use crate::server::{Envelope, Mode, Reply, reply};
 
 pub mod proto;
@@ -68,7 +74,41 @@ pub struct Outcome {
     pub quarantine: Option<String>,
 }
 
-/// Цепочка фильтров Milter.
+/// Письмо для проверки фильтрами.
+#[derive(Debug, Clone, Copy)]
+pub struct Mail<'a> {
+    /// Направление: чьи фильтры проверяют письмо.
+    pub direction: MilterDirection,
+    /// Идентификатор транзакции (макрос `i`, журнал).
+    pub id: &'a str,
+    /// Клиент SMTP: адрес и имя из `EHLO`; `None` — письмо отправлено не по SMTP (JMAP).
+    pub client: Option<(SocketAddr, &'a str)>,
+    /// Имя входа аутентифицированного отправителя (макрос `{auth_authen}`).
+    pub login: Option<&'a str>,
+    /// Отправитель конверта.
+    pub mail_from: &'a str,
+    /// Получатели конверта.
+    pub rcpts: &'a [String],
+}
+
+impl<'a> Mail<'a> {
+    /// Письмо транзакции SMTP: smtp-in — направление приёма, submission — направление исходящей почты.
+    pub fn of(env: &'a Envelope) -> Self {
+        Self {
+            direction: match env.mode {
+                Mode::Inbound => MilterDirection::Inbound,
+                Mode::Submission => MilterDirection::Outbound,
+            },
+            id: &env.id,
+            client: Some((env.conn.client, &env.helo)),
+            login: env.principal.as_ref().map(|p| p.login.as_str()),
+            mail_from: &env.mail_from,
+            rcpts: &env.rcpts,
+        }
+    }
+}
+
+/// Фильтры Milter обоих направлений.
 #[derive(Clone)]
 pub struct Milters {
     cfg: MilterConfig,
@@ -111,7 +151,7 @@ enum Filtered {
 }
 
 impl Milters {
-    /// Цепочка из секции `smtp.milter`; `hostname` — макрос `j`.
+    /// Фильтры секции `smtp.milter`; `hostname` — макрос `j`.
     pub fn new(cfg: MilterConfig, hostname: impl Into<String>) -> Self {
         for (profile, names) in &cfg.profiles {
             for name in names {
@@ -126,15 +166,15 @@ impl Milters {
         }
     }
 
-    /// Есть фильтры для режима `mode`.
-    pub fn applies(&self, mode: Mode) -> bool {
-        self.cfg.filters.iter().any(|f| f.applies(mode))
+    /// У направления `direction` есть фильтры.
+    pub fn applies(&self, direction: MilterDirection) -> bool {
+        self.cfg.filters.iter().any(|f| f.direction == direction)
     }
 
-    /// Фильтры режима `mode` профиля `profile` по порядку `filters`.
+    /// Фильтры направления `direction` профиля `profile` по порядку `filters`.
     fn selected<'a>(
         &'a self,
-        mode: Mode,
+        direction: MilterDirection,
         profile: Option<&str>,
     ) -> impl Iterator<Item = &'a MilterFilter> + 'a {
         let names = profile.and_then(|p| {
@@ -147,12 +187,12 @@ impl Milters {
         self.cfg
             .filters
             .iter()
-            .filter(move |f| f.applies(mode) && names.is_none_or(|n| n.contains(&f.name)))
+            .filter(move |f| f.direction == direction && names.is_none_or(|n| n.contains(&f.name)))
     }
 
-    /// Проверяет письмо `raw` транзакции `env` фильтрами её режима из профиля `profile` (`None` — все) по
+    /// Проверяет письмо `raw` фильтрами направления `env.direction` из профиля `profile` (`None` — все) по
     /// порядку.
-    pub async fn check(&self, env: &Envelope, raw: Bytes, profile: Option<&str>) -> Outcome {
+    pub async fn check(&self, env: &Mail<'_>, raw: Bytes, profile: Option<&str>) -> Outcome {
         self.check_with(env, raw, profile, |f| {
             let address = f.address.clone();
             let timeout = f.connect_timeout;
@@ -169,7 +209,7 @@ impl Milters {
     /// фильтра без сети, [`crate::fuzz::milter`]).
     pub(crate) async fn check_with<S, F, Fut>(
         &self,
-        env: &Envelope,
+        env: &Mail<'_>,
         raw: Bytes,
         profile: Option<&str>,
         connect: F,
@@ -184,7 +224,7 @@ impl Milters {
             message: raw,
             quarantine: None,
         };
-        for f in self.selected(env.mode, profile) {
+        for f in self.selected(env.direction, profile) {
             let mut mods = Vec::new();
             let res = match connect(f).await {
                 Ok(stream) => {
@@ -211,7 +251,7 @@ impl Milters {
                 }
                 Err(e) => {
                     tracing::warn!(id = %env.id, milter = %f.name, error = %e, "milter: фильтр недоступен");
-                    match f.on_failure {
+                    match f.failure_policy() {
                         MilterOnFailure::Accept => {
                             let h = format!("{UNAVAILABLE_HEADER}: {}; unavailable\r\n", f.name);
                             let mut m = BytesMut::from(h.as_bytes());
@@ -237,7 +277,7 @@ impl Milters {
         &self,
         f: &MilterFilter,
         stream: S,
-        env: &Envelope,
+        env: &Mail<'_>,
         raw: &[u8],
         mods: &mut Vec<HeaderMod>,
         quarantine: &mut Option<String>,
@@ -260,36 +300,42 @@ impl Milters {
     async fn converse<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         s: &mut Conversation<'_, S>,
-        env: &Envelope,
+        env: &Mail<'_>,
         raw: &[u8],
         mods: &mut Vec<HeaderMod>,
         quarantine: &mut Option<String>,
     ) -> Result<Filtered, ProtoError> {
         s.negotiate().await?;
-        let ip = env.conn.client.ip().to_canonical();
         let id = env.id.as_bytes();
-        let client_addr = ip.to_string();
-        s.macros(
-            proto::C_CONNECT,
-            &[
-                ("j", self.hostname.as_bytes()),
-                ("{daemon_name}", b"thepost"),
-                ("{client_addr}", client_addr.as_bytes()),
-                ("{client_name}", env.helo.as_bytes()),
-            ],
-        )
-        .await?;
+        // Без соединения клиента (JMAP): имя — узел, семейство адреса — «неизвестно».
+        let helo = env.client.map_or(self.hostname.as_str(), |(_, helo)| helo);
+        let ip = env.client.map(|(addr, _)| addr.ip().to_canonical());
+        let client_addr = ip.map(|ip| ip.to_string());
+        let mut connect_macros: Vec<(&str, &[u8])> = vec![
+            ("j", self.hostname.as_bytes()),
+            ("{daemon_name}", b"thepost"),
+            ("{client_name}", helo.as_bytes()),
+        ];
+        if let Some(a) = &client_addr {
+            connect_macros.push(("{client_addr}", a.as_bytes()));
+        }
+        s.macros(proto::C_CONNECT, &connect_macros).await?;
         let mut connect = BytesMut::new();
-        connect.extend_from_slice(env.helo.as_bytes());
+        connect.extend_from_slice(helo.as_bytes());
         connect.extend_from_slice(b"\0");
-        let (family, addr) = match ip {
-            std::net::IpAddr::V4(a) => (b'4', a.to_string()),
-            std::net::IpAddr::V6(a) => (b'6', a.to_string()),
-        };
-        connect.extend_from_slice(&[family]);
-        connect.extend_from_slice(&env.conn.client.port().to_be_bytes());
-        connect.extend_from_slice(addr.as_bytes());
-        connect.extend_from_slice(b"\0");
+        match (ip, env.client) {
+            (Some(ip), Some((client, _))) => {
+                let (family, addr) = match ip {
+                    std::net::IpAddr::V4(a) => (b'4', a.to_string()),
+                    std::net::IpAddr::V6(a) => (b'6', a.to_string()),
+                };
+                connect.extend_from_slice(&[family]);
+                connect.extend_from_slice(&client.port().to_be_bytes());
+                connect.extend_from_slice(addr.as_bytes());
+                connect.extend_from_slice(b"\0");
+            }
+            _ => connect.extend_from_slice(b"U"),
+        }
         step!(
             s.command(
                 Packet::new(proto::C_CONNECT, connect.freeze()),
@@ -300,13 +346,13 @@ impl Milters {
         );
         step!(
             s.command(
-                Packet::strings(proto::C_HELO, &[env.helo.as_bytes()]),
+                Packet::strings(proto::C_HELO, &[helo.as_bytes()]),
                 proto::P_NOHELO,
                 proto::P_NR_HELO
             )
             .await?
         );
-        let login = env.principal.as_ref().map(|p| p.login.as_bytes());
+        let login = env.login.map(str::as_bytes);
         let mut mail_macros: Vec<(&str, &[u8])> =
             vec![("i", id), ("{mail_addr}", env.mail_from.as_bytes())];
         if let Some(login) = login {
@@ -322,7 +368,7 @@ impl Milters {
             )
             .await?
         );
-        for rcpt in &env.rcpts {
+        for rcpt in env.rcpts {
             s.macros(proto::C_RCPT, &[("{rcpt_addr}", rcpt.as_bytes())])
                 .await?;
             let to = format!("<{rcpt}>");
@@ -654,15 +700,6 @@ fn apply(raw: &[u8], mods: &[HeaderMod]) -> Bytes {
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
     out.freeze()
-}
-
-impl MilterFilter {
-    fn applies(&self, mode: Mode) -> bool {
-        match mode {
-            Mode::Inbound => self.inbound,
-            Mode::Submission => self.submission,
-        }
-    }
 }
 
 #[cfg(test)]

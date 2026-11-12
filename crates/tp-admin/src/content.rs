@@ -2,7 +2,7 @@
 //!
 //! Содержимое отдаётся только по явному параметру запроса `include=subject` и только администратору организации
 //! или инсталляции (оператору «только чтение» — 403). Каждый такой запрос — запись журнала аудита о доступе к
-//! содержимому: кто, чей список (путь запроса), сколько писем ([`AuditRecord::content_messages`]); самих тем в
+//! содержимому: кто, чей список (путь запроса), сколько писем ([`AdminAuditRecord::content_messages`]); самих тем в
 //! записи и в `tracing` нет. Запись не сохранена — содержимое не отдаётся.
 //!
 //! Значения — из заголовков письма (`Subject`, `From`), декодированные (`tp_mailstore::meta`), без управляющих
@@ -12,10 +12,10 @@
 use axum::body::Body;
 use axum::http::Method;
 use time::OffsetDateTime;
+use tp_contracts::admin_audit::AdminAuditRecord;
 use tp_contracts::blob::ByteStream;
 use tp_contracts::{Error, Result, TenantId};
 
-use crate::audit::AuditRecord;
 use crate::server::{Admin, AdminConfig, Caller};
 
 /// Значение параметра `include`, включающее тему и отправителя.
@@ -60,20 +60,20 @@ impl Access<'_> {
     /// Запись аудита о доступе к содержимому `messages` писем; не сохранена — ошибка (содержимое не отдаётся).
     pub(crate) async fn record(&self, a: &Admin, status: u16, messages: usize) -> Result<()> {
         let p = &self.caller.principal;
-        let record = AuditRecord {
+        let record = AdminAuditRecord {
             at: OffsetDateTime::now_utc(),
             tenant: Some(self.org),
             actor_tenant: p.tenant,
             actor: p.account,
             actor_login: p.login.clone(),
-            roles: self.caller.roles.iter().copied().collect(),
+            roles: self.caller.audit_roles(),
             method: Method::GET.to_string(),
             route: self.route.to_owned(),
             path: self.path.to_owned(),
             status,
             content_messages: Some(u64::try_from(messages).unwrap_or(u64::MAX)),
         };
-        a.d.audit.record(&record).await
+        crate::audit::record(&a.d, &record).await
     }
 }
 

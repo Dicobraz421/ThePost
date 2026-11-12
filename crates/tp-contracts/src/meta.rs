@@ -710,6 +710,10 @@ pub struct Policy {
     /// Лимит отправки (submission), писем в час на учётную запись. Потребитель — SMTP (SMTP-40); не задано —
     /// [`Policy::DEFAULT_SEND_PER_HOUR`].
     pub send_per_hour: Option<u32>,
+    /// Лимит отправки, адресатов в час на учётную запись (скользящий час, сумма получателей всех писем; как
+    /// RecipientRateLimit в Exchange — решение 113). Потребитель — SMTP (SMTP-43); не задано —
+    /// [`Policy::DEFAULT_RCPTS_PER_HOUR`].
+    pub rcpts_per_hour: Option<u32>,
     /// Лимит получателей одного письма (`RCPT TO` сеанса submission). Потребитель — SMTP (SMTP-40); не задано —
     /// [`Policy::DEFAULT_MAX_RECIPIENTS`].
     pub max_recipients: Option<u32>,
@@ -727,12 +731,19 @@ pub struct Policy {
 impl Policy {
     /// Умолчание уровня организации для [`Policy::send_per_hour`], писем в час.
     pub const DEFAULT_SEND_PER_HOUR: u32 = 1000;
+    /// Умолчание уровня организации для [`Policy::rcpts_per_hour`], адресатов в час (решение 113).
+    pub const DEFAULT_RCPTS_PER_HOUR: u32 = 2000;
     /// Умолчание уровня организации для [`Policy::max_recipients`].
     pub const DEFAULT_MAX_RECIPIENTS: u32 = 100;
 
     /// Действующий лимит отправки, писем в час: заданный в цепочке или [`Policy::DEFAULT_SEND_PER_HOUR`].
     pub fn send_per_hour_or_default(&self) -> u32 {
         self.send_per_hour.unwrap_or(Self::DEFAULT_SEND_PER_HOUR)
+    }
+
+    /// Действующий лимит отправки, адресатов в час: заданный в цепочке или [`Policy::DEFAULT_RCPTS_PER_HOUR`].
+    pub fn rcpts_per_hour_or_default(&self) -> u32 {
+        self.rcpts_per_hour.unwrap_or(Self::DEFAULT_RCPTS_PER_HOUR)
     }
 
     /// Действующий лимит получателей письма: заданный в цепочке или [`Policy::DEFAULT_MAX_RECIPIENTS`].
@@ -747,6 +758,7 @@ impl Policy {
             trash_retention: over.trash_retention.or(self.trash_retention),
             retention: over.retention.or(self.retention),
             send_per_hour: over.send_per_hour.or(self.send_per_hour),
+            rcpts_per_hour: over.rcpts_per_hour.or(self.rcpts_per_hour),
             max_recipients: over.max_recipients.or(self.max_recipients),
             dkim_selector: over.dkim_selector.or(self.dkim_selector),
             milter_profile: over.milter_profile.or(self.milter_profile),
@@ -892,6 +904,7 @@ mod tests {
         };
         let domain = Policy {
             quota_bytes: Some(20),
+            rcpts_per_hour: Some(300),
             dkim_selector: Some("s1".into()),
             ..Policy::default()
         };
@@ -907,6 +920,7 @@ mod tests {
         assert_eq!(p.trash_purge, None);
         // Умолчания уровня организации полей SMTP (CTR-67).
         assert_eq!(p.send_per_hour_or_default(), 5);
+        assert_eq!(p.rcpts_per_hour_or_default(), 300);
         assert_eq!(
             p.max_recipients_or_default(),
             Policy::DEFAULT_MAX_RECIPIENTS
@@ -915,6 +929,7 @@ mod tests {
             Policy::default().send_per_hour_or_default(),
             Policy::DEFAULT_SEND_PER_HOUR
         );
+        assert_eq!(Policy::default().rcpts_per_hour_or_default(), 2000);
         let rule = TrashPurgeRule {
             mode: TrashPurge::Erase,
             user_can_choose: true,

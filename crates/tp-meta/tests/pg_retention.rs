@@ -7,7 +7,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tp_contracts::meta::{
     AccountScope, AccountStore, MailboxStore, MessageStore, NewMailbox, NewMessage, Policy,
-    PolicyResolver, PolicyTarget, SpecialUse,
+    PolicyResolver, PolicyStore, PolicyTarget, SpecialUse,
 };
 use tp_contracts::retention::{Quota, Restored, TrashObject, TrashStore};
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, MailboxId};
@@ -79,6 +79,7 @@ async fn policy_chain_resolution() {
         Policy {
             quota_bytes: Some(1000),
             trash_retention: Some(DAY * 10),
+            rcpts_per_hour: Some(3000),
             dkim_selector: Some("s1".into()),
             ..Policy::default()
         },
@@ -97,6 +98,7 @@ async fn policy_chain_resolution() {
         PolicyTarget::Account(scope.account),
         Policy {
             trash_retention: Some(DAY * 5),
+            rcpts_per_hour: Some(300),
             max_recipients: Some(50),
             ..Policy::default()
         },
@@ -116,6 +118,7 @@ async fn policy_chain_resolution() {
     let tenant_only = meta.resolve(t, None, None, None).await.expect("tenant");
     assert_eq!(tenant_only.quota_bytes, Some(1000));
     assert_eq!(tenant_only.send_per_hour, None);
+    assert_eq!(tenant_only.rcpts_per_hour, Some(3000));
     let dom = meta
         .resolve(t, Some(domain), None, None)
         .await
@@ -142,6 +145,7 @@ async fn policy_chain_resolution() {
             trash_retention: Some(DAY),
             retention: Some(DAY * 365),
             send_per_hour: Some(100),
+            rcpts_per_hour: Some(300),
             max_recipients: Some(50),
             dkim_selector: Some("s1".into()),
             milter_profile: Some("strict".into()),

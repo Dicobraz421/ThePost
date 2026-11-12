@@ -8,10 +8,10 @@
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
-use sqlx::PgPool;
 use tp_contracts::Result;
 use tp_contracts::ext::{Module, ModuleCtx, Registry, validate_module_name};
 use tp_contracts::role::watch;
+use tp_meta::pool::DbPool;
 use tp_platform::{Config, SectionRegistry};
 
 /// Секция `modules.<имя>` без ключа `enabled`: модуль разбирает её сам ([`ModuleCtx::config`]).
@@ -44,14 +44,14 @@ pub fn register_sections_of(r: &mut SectionRegistry, builtin: &[Builtin]) -> Res
 }
 
 /// Включённые модули сборки: миграции схем и регистрация расширений.
-pub async fn activate(cfg: &Config, migrations: &PgPool) -> Result<Registry> {
+pub async fn activate(cfg: &Config, migrations: &DbPool) -> Result<Registry> {
     activate_of(cfg, migrations, BUILTIN).await
 }
 
 /// Как [`activate`] для модулей `builtin`.
 pub async fn activate_of(
     cfg: &Config,
-    migrations: &PgPool,
+    migrations: &DbPool,
     builtin: &[Builtin],
 ) -> Result<Registry> {
     let mut registry = Registry::default();

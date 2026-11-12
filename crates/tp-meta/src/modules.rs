@@ -13,10 +13,11 @@
 
 use std::collections::HashMap;
 
-use sqlx::{AssertSqlSafe, FromRow, PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, FromRow, PgConnection};
 use tp_contracts::ext::{Migration, Module, validate_module_name};
 use tp_contracts::{Error, Result};
 
+use crate::pool::DbPool;
 use crate::schema::{db_err, to_u32};
 
 /// Таблица версий в схеме модуля.
@@ -75,9 +76,9 @@ async fn lock(tx: &mut PgConnection, schema: &str) -> Result<()> {
 }
 
 /// Применяет недостающие миграции модуля; возвращает число применённых.
-pub async fn migrate_module(pool: &PgPool, module: &dyn Module) -> Result<usize> {
+pub async fn migrate_module(pool: &DbPool, module: &dyn Module) -> Result<usize> {
     let schema = check_module(module)?;
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = pool.begin().await?;
     lock(&mut tx, &schema).await?;
     // Имя схемы проверено `validate_module_name`: только [a-z0-9_].
     sqlx::query(AssertSqlSafe(format!(
@@ -175,11 +176,11 @@ fn conflict(module: &dyn Module, version: i32, why: &str) -> Error {
 }
 
 /// Последняя применённая версия схемы модуля; `None` — схема не создана.
-pub async fn applied_version(pool: &PgPool, name: &str) -> Result<Option<u32>> {
+pub async fn applied_version(pool: &DbPool, name: &str) -> Result<Option<u32>> {
     let schema = schema_of(name)?;
     let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind(format!("{schema}.{VERSIONS}"))
-        .fetch_one(pool)
+        .fetch_one(&mut *pool.acquire().await?)
         .await
         .map_err(db_err)?;
     if !exists {
@@ -188,16 +189,16 @@ pub async fn applied_version(pool: &PgPool, name: &str) -> Result<Option<u32>> {
     let v: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT max(version) FROM {schema}.{VERSIONS}"
     )))
-    .fetch_one(pool)
+    .fetch_one(&mut *pool.acquire().await?)
     .await
     .map_err(db_err)?;
     v.map(|v| to_u32(i64::from(v))).transpose()
 }
 
 /// Удаляет схему модуля со всеми данными (удаление модуля). Схема ядра не меняется.
-pub async fn drop_module(pool: &PgPool, name: &str) -> Result<()> {
+pub async fn drop_module(pool: &DbPool, name: &str) -> Result<()> {
     let schema = schema_of(name)?;
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = pool.begin().await?;
     lock(&mut tx, &schema).await?;
     sqlx::query(AssertSqlSafe(format!(
         "DROP SCHEMA IF EXISTS {schema} CASCADE"

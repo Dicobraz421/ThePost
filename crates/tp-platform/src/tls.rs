@@ -7,6 +7,8 @@
 //! `key: { secret: "<путь>#<поле>" }` (PEM в поле секрета; на диск не пишется). Новая версия секрета подхватывается
 //! без перезапуска: секрет перечитывается с периодом `key_poll_interval`, по SIGHUP, по событию файла цепочки и по
 //! запросу; ключ, не подходящий к цепочке, отклоняется — действует прежняя пара, пока цепочка и ключ не совпадут.
+//! Сертификаты в PEM секрета ключа (внутренний сертификат PKI OpenBao, `…#bundle`, PLT-26) — цепочка, `cert_file`
+//! не читается: ключ и цепочка заменяются одним шагом, с продлением сертификата хранилищем без перезапуска.
 //!
 //! Клиентский доступ — TLS 1.3; TLS 1.2 включается настройкой `min_version: "1.2"` для устаревших клиентов.
 //! Ошибка перечитывания оставляет в силе прежние сертификаты.
@@ -59,6 +61,7 @@ pub struct TlsConfig {
     /// PEM-файл с закрытым ключом (PKCS#8, PKCS#1 или SEC1).
     pub key_file: PathBuf,
     /// Закрытый ключ из хранилища секретов вместо `key_file`: `{ secret: "<путь>#<поле>" }`, в поле — PEM.
+    /// Есть в PEM сертификаты (сертификат узла первым) — они цепочка, `cert_file` не читается.
     pub key: Option<SecretRef>,
     /// Минимальная версия TLS для клиентского доступа.
     pub min_version: TlsVersion,
@@ -678,16 +681,39 @@ fn build(
 fn read_config(cfg: &TlsConfig, secret: Option<&Secret>) -> Result<(Loaded, Stamp), TlsError> {
     // Отметка снимается до чтения: изменение во время чтения будет замечено следующим опросом.
     let stamp = stamp(cfg);
-    let chain = read_chain(&cfg.cert_file)?;
-    let key = match (&cfg.key, secret) {
-        (Some(r), Some(pem)) => rustls_pemfile::private_key(&mut pem.expose().as_bytes())
-            .ok()
-            .flatten()
-            .ok_or_else(|| TlsError::NoKeyInSecret(r.clone()))?,
+    let (chain, key) = match (&cfg.key, secret) {
+        (Some(r), Some(pem)) => {
+            let (chain, key) = parse_secret_pem(pem);
+            let key = key.ok_or_else(|| TlsError::NoKeyInSecret(r.clone()))?;
+            if chain.is_empty() {
+                (read_chain(&cfg.cert_file)?, key)
+            } else {
+                (chain, key)
+            }
+        }
         (Some(r), None) => return Err(TlsError::NoStore(r.clone())),
-        (None, _) => read_key(&cfg.key_file)?,
+        (None, _) => (read_chain(&cfg.cert_file)?, read_key(&cfg.key_file)?),
     };
     Ok((Loaded::new(chain, key, cfg.min_version)?, stamp))
+}
+
+/// Сертификаты (в порядке PEM) и первый закрытый ключ из PEM секрета; не PEM — ни того, ни другого.
+fn parse_secret_pem(
+    pem: &Secret,
+) -> (Vec<CertificateDer<'static>>, Option<PrivateKeyDer<'static>>) {
+    let mut chain = Vec::new();
+    let mut key = None;
+    for item in rustls_pemfile::read_all(&mut pem.expose().as_bytes()) {
+        match item {
+            Ok(rustls_pemfile::Item::X509Certificate(c)) => chain.push(c),
+            Ok(rustls_pemfile::Item::Pkcs8Key(k)) if key.is_none() => key = Some(k.into()),
+            Ok(rustls_pemfile::Item::Pkcs1Key(k)) if key.is_none() => key = Some(k.into()),
+            Ok(rustls_pemfile::Item::Sec1Key(k)) if key.is_none() => key = Some(k.into()),
+            Ok(_) => {}
+            Err(_) => return (Vec::new(), None),
+        }
+    }
+    (chain, key)
 }
 
 /// Цепочка сертификатов из PEM-файла. Блокирующий I/O.
@@ -1031,7 +1057,7 @@ pub(crate) mod tests {
     }
 
     /// Сертификат сервера, который слушатель с неявным TLS на `certs` отдаёт клиенту.
-    async fn listener_cert(certs: &Arc<TlsCerts>) -> CertificateDer<'static> {
+    pub(crate) async fn listener_cert(certs: &Arc<TlsCerts>) -> CertificateDer<'static> {
         use crate::listen::{EndpointConfig, Listener};
         let mut endpoint = EndpointConfig::new("127.0.0.1:0".parse().expect("addr"));
         endpoint.implicit_tls = true;

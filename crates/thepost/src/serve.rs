@@ -43,6 +43,7 @@ use tp_smtp::{Mode, SmtpConfig, SmtpOutService};
 use tp_sys::{NodeResources, ResourceSnapshot, ResourcesConfig};
 
 use crate::acme;
+use crate::audit_export::AuditExport;
 use crate::infra;
 use crate::log_reader::LogSignals;
 use crate::modules;
@@ -154,12 +155,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         "запуск узла"
     );
 
-    let db = infra::connect_node_db(&cfg, store.clone()).await?;
-    crate::metrics::register_failover(&metrics, db.clone());
+    // Метрики Д.7 (APP-34): пулы узла (ожидание соединения — наблюдатель пула, META-55), слушатель LISTEN, время
+    // фиксаций с NOTIFY.
     let db_metrics = DbMetrics::register(&metrics, &*cfg.section::<TelemetryConfig>("telemetry")?);
+    let db = infra::connect_node_db(&cfg, store.clone(), &db_metrics).await?;
+    crate::metrics::register_failover(&metrics, db.clone());
     let pool = db.pool().clone();
     let meta_cfg = (*cfg.section::<MetaConfig>(MetaConfig::SECTION)?).clone();
-    let migrations = infra::migration_pool(&cfg, store.as_ref(), &pool).await?;
+    let migrations = infra::migration_pool(&cfg, store.as_ref(), &pool, &db_metrics).await?;
     if meta_cfg.migrate_on_start {
         tp_meta::schema::migrate(&migrations).await?;
     }
@@ -174,13 +177,10 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let blob_cfg = cfg.section::<BlobSection>(BLOB)?;
     // Шина сигналов — до хранилищ: после фиксации они публикуют `LogAppended` (будит читателей журнала событий),
     // `MembersChanged`, `TransportChanged` и др. (APP-08, SRS 2.8).
-    let bus = infra::open_bus(&cfg, Some(&db), store.clone()).await?;
+    let bus = infra::open_bus(&cfg, Some(&db), store.clone(), &db_metrics).await?;
     let sample = bus.sample.clone();
     metrics.register_bus(move || sample());
-    // Метрики Д.7 (APP-34): пул узла, слушатель LISTEN, время фиксаций с NOTIFY.
-    // TODO(META-55): наблюдателя ожидания соединения передать пулу `tp-meta`, когда он начнёт его принимать, —
-    // до тех пор `tp_db_pool_waiting`, `tp_db_pool_wait_seconds` и `tp_db_pool_acquire_errors_total` нулевые.
-    let _pool_observer = crate::metrics::register_db(&metrics, &db_metrics, &db, bus.signals);
+    crate::metrics::register_db(&metrics, &db_metrics, bus.signals);
     let bus = bus.bus;
     let meta = PgMeta::new(pool, meta_cfg).with_bus(bus.clone());
 
@@ -235,7 +235,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         aux.clone(),
     )
     .await?;
-    let acme = acme::prepare(&cfg, &sockets, aux.clone()).await?;
+    let acme = acme::prepare(&cfg, store.clone(), &sockets, aux.clone()).await?;
     // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
     let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
         // Ключ по ссылке `tls.key` читается из хранилища секретов узла и перечитывается по новой версии (APP-35).
@@ -290,6 +290,13 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         services.dkim.clone(),
         aux.clone(),
     ));
+    // Лимиты частоты и доверенные подсети `ratelimit` без перезапуска (PLT-32).
+    tokio::spawn(
+        services
+            .limiter
+            .clone()
+            .follow(reloader.subscribe(), aux.clone()),
+    );
 
     // Уровень нагрузки узла по ресурсам cgroups (PLT-15): роли читают его из `RoleCtx::load`. Снимки ресурсов —
     // по триггерам PSI (секция `pressure`, PLT-17), без них — с интервалом секции `resources`.
@@ -339,6 +346,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         .page_size;
     // Показатели есть и при выключенной проверке: нулевые.
     let verify_probe = crate::metrics::register_verify(&metrics);
+    // Выгрузка журнала аудита из базы в SIEM (`admin.audit`, APP-59): роль maintenance, одна на кластер (лиза).
+    let audit_export = Arc::new(AuditExport::new(
+        Arc::new(meta.clone()),
+        leases.clone(),
+        holder.clone(),
+        store.clone(),
+        reloader.subscribe(),
+    ));
     let maintenance = Maintenance {
         index: Arc::new(meta.clone()),
         store: blob.clone(),
@@ -375,6 +390,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             probe: verify_probe,
             now: tp_blob::system_now(),
         }),
+        audit_export: Some(audit_export),
     };
     let mut setup = RoleSetup {
         cfg: &cfg,
@@ -695,7 +711,7 @@ async fn start_rpc(
         return Ok(None);
     }
     let ctx = |e| infra::context("cluster.rpc", e);
-    let tls = NodeTls::load_with_secrets(&cluster.rpc.tls, store.as_ref())
+    let tls = NodeTls::load(&cluster.rpc.tls, store.as_ref())
         .await
         .map_err(ctx)?;
     let rpc = NodeRpc::new(node.clone(), &cluster.rpc, tls, members).map_err(ctx)?;
@@ -735,10 +751,10 @@ async fn start_rpc(
     Ok(Some(rpc))
 }
 
-/// Отпечаток источников сертификатов межузлового канала: содержимое файлов УЦ, сертификата и ключа и значение
-/// секрета ключа (`rpc.tls.key`). Недоступный источник — тоже состояние: его появление меняет отпечаток.
-/// Значения в отпечаток не восстановимы и никуда не выводятся.
-async fn rpc_tls_fingerprint(tls: &InternalTls, store: &dyn SecretStore) -> u64 {
+/// Отпечаток файлов сертификатов межузлового канала: содержимое файлов УЦ, сертификата и ключа. Недоступный файл —
+/// тоже состояние: его появление меняет отпечаток. Секрет ключа (`rpc.tls.key`) опрашивает сам `tp-cluster`
+/// (`rpc.key_poll_interval`). Значения в отпечаток не восстановимы и никуда не выводятся.
+async fn rpc_tls_fingerprint(tls: &InternalTls) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for file in [&tls.ca_file, &tls.cert_file, &tls.key_file] {
@@ -747,21 +763,12 @@ async fn rpc_tls_fingerprint(tls: &InternalTls, store: &dyn SecretStore) -> u64 
             None => None::<Vec<u8>>.hash(&mut hasher),
         }
     }
-    match &tls.key {
-        Some(secret) => store
-            .get(secret)
-            .await
-            .ok()
-            .map(|s| s.expose().to_owned())
-            .hash(&mut hasher),
-        None => None::<String>.hash(&mut hasher),
-    }
     hasher.finish()
 }
 
 /// Перечитывание сертификатов межузлового канала без перезапуска (APP-36, хвост CLU-16): раз в `period`
-/// сверяется отпечаток файлов и секрета ключа ([`rpc_tls_fingerprint`]); при изменении —
-/// `NodeRpc::follow_tls_with_secrets` читает новую пару (ошибка — `warn`, действует прежняя). До `shutdown`.
+/// сверяется отпечаток файлов ([`rpc_tls_fingerprint`]); при изменении — `NodeRpc::follow_tls` читает новую пару
+/// (ошибка — `warn`, действует прежняя). Смену секрета ключа `NodeRpc::follow_tls` отслеживает сам. До `shutdown`.
 async fn follow_rpc_tls(
     rpc: NodeRpc,
     tls: InternalTls,
@@ -769,23 +776,22 @@ async fn follow_rpc_tls(
     period: Duration,
     shutdown: CancellationToken,
 ) {
-    let seen = rpc_tls_fingerprint(&tls, store.as_ref()).await;
-    let state = (seen, tls.clone(), store.clone(), shutdown);
-    let changes =
-        futures::stream::unfold(state, move |(mut seen, tls, store, shutdown)| async move {
-            loop {
-                tokio::select! {
-                    () = shutdown.cancelled() => return None,
-                    () = tokio::time::sleep(period) => {}
-                }
-                let now = rpc_tls_fingerprint(&tls, store.as_ref()).await;
-                if now != seen {
-                    seen = now;
-                    return Some(((), (seen, tls, store, shutdown)));
-                }
+    let seen = rpc_tls_fingerprint(&tls).await;
+    let state = (seen, tls.clone(), shutdown);
+    let changes = futures::stream::unfold(state, move |(mut seen, tls, shutdown)| async move {
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return None,
+                () = tokio::time::sleep(period) => {}
             }
-        });
-    rpc.follow_tls_with_secrets(&tls, store, changes).await;
+            let now = rpc_tls_fingerprint(&tls).await;
+            if now != seen {
+                seen = now;
+                return Some(((), (seen, tls, shutdown)));
+            }
+        }
+    });
+    rpc.follow_tls(&tls, store, changes).await;
 }
 
 /// Продление записи узла с периодом `period` до остановки.
@@ -1250,30 +1256,23 @@ mod tests {
         }
     }
 
-    /// APP-36: отпечаток источников сертификатов межузлового канала меняется при смене секрета ключа и файла и
-    /// не меняется без изменений; недоступный секрет — отдельное состояние.
+    /// APP-36: отпечаток файлов сертификатов межузлового канала меняется при смене файла и не меняется без
+    /// изменений; недоступный файл — отдельное состояние.
     #[tokio::test]
-    async fn rpc_tls_fingerprint_follows_files_and_secret() {
+    async fn rpc_tls_fingerprint_follows_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cert = dir.path().join("node.pem");
-        std::fs::write(&cert, "cert-1").expect("cert");
-        let key: SecretRef = "thepost/node#key".parse().expect("ref");
-        let store = MemSecretStore::default();
         let tls = InternalTls {
             cert_file: Some(cert.clone()),
-            key: Some(key.clone()),
             ..InternalTls::default()
         };
-        let missing = rpc_tls_fingerprint(&tls, &store).await;
-        store.set(&key, "key-1".to_owned());
-        let first = rpc_tls_fingerprint(&tls, &store).await;
+        let missing = rpc_tls_fingerprint(&tls).await;
+        std::fs::write(&cert, "cert-1").expect("cert");
+        let first = rpc_tls_fingerprint(&tls).await;
         assert_ne!(missing, first);
-        assert_eq!(first, rpc_tls_fingerprint(&tls, &store).await);
-        store.set(&key, "key-2".to_owned());
-        let rotated = rpc_tls_fingerprint(&tls, &store).await;
-        assert_ne!(first, rotated);
+        assert_eq!(first, rpc_tls_fingerprint(&tls).await);
         std::fs::write(&cert, "cert-2").expect("cert");
-        assert_ne!(rotated, rpc_tls_fingerprint(&tls, &store).await);
+        assert_ne!(first, rpc_tls_fingerprint(&tls).await);
     }
 
     /// APP-18: два узла в процессе над одной базой — `cluster.addr` объявлен в составе и слушается, вызов идёт по

@@ -37,7 +37,9 @@ use tp_contracts::delivery::{DeliveryEventKind, DeliveryLog, DeliveryQuery};
 use tp_contracts::ext::{DecisionHooks, Migration, Module, ModuleCtx, Registry};
 use tp_contracts::ids::DomainId;
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, MessageStore, Policy};
+use tp_contracts::meta::{
+    AccountScope, AccountStore, AccountUpsert, MessageStore, Policy, PolicyStore, PolicyTarget,
+};
 use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::secrets::{SecretRef, SecretStore};
@@ -110,7 +112,12 @@ fn config(dir: &Path, db_url: &str, domain: &str) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/all.yaml"),
     )
     .expect("deploy/config/all.yaml");
-    let base = without_sections(&all, &["domain", "database", "blob", "secrets", "http"]);
+    let base = without_sections(
+        &all,
+        &[
+            "domain", "database", "blob", "secrets", "http", "tls", "smtp", "imap",
+        ],
+    );
     assert!(base.contains("roles: [all]"), "{base}");
     let path = |p: PathBuf| p.display().to_string().replace('\\', "/");
     format!(
@@ -586,7 +593,7 @@ async fn mvp_mail_flow() {
     }
 
     // Учётная запись и пароль приложения — в той же БД (миграции выполнил узел).
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
     let domain_id = accept_domain(&meta, tenant, &domain).await;
@@ -870,7 +877,7 @@ async fn mvp_mail_flow() {
     };
     meta.set_policy(
         tenant,
-        tp_meta::retention::PolicyTarget::Tenant,
+        PolicyTarget::Tenant,
         &Policy {
             trash_purge: Some(erase),
             ..Policy::default()
@@ -988,7 +995,7 @@ async fn mvp_mail_flow() {
     // удалённое в корзину, окончательно удаляет воркер истечения узла.
     meta.set_policy(
         tenant,
-        tp_meta::retention::PolicyTarget::Tenant,
+        PolicyTarget::Tenant,
         &Policy {
             trash_purge: Some(erase),
             trash_retention: Some(Duration::from_secs(2)),
@@ -1211,6 +1218,45 @@ async fn transport_settings_without_restart() {
     .await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
+    // ADM-34: политика организации — через контракт `PolicyStore` в PostgreSQL; изменения — в журнале аудита
+    // (`audit_log`), `GET …/audit` отдаёт их.
+    let org = format!("/api/v1/orgs/{}", TenantId::DEFAULT);
+    let policy = json!({ "max_recipients": 7 });
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &format!("{org}/policy"),
+        &bearer,
+        Some(&policy),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = http(admin, "GET", &org, &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let read: Value = serde_json::from_slice(&body).expect("org");
+    assert_eq!(read["policy"]["max_recipients"], 7, "{read}");
+    let (code, body) = http(admin, "GET", &format!("{org}/audit"), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let audit: Value = serde_json::from_slice(&body).expect("audit");
+    let changes: Vec<(&str, &str, u64)> = audit["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|e| {
+            Some((
+                e["method"].as_str()?,
+                e["route"].as_str()?,
+                e["status"].as_u64()?,
+            ))
+        })
+        .collect();
+    for change in [
+        ("PUT", "/api/v1/orgs/{org}/transport/sources/{name}", 200),
+        ("PUT", "/api/v1/orgs/{org}/policy", 200),
+    ] {
+        assert!(changes.contains(&change), "{change:?}: {audit}");
+    }
+
     // Следующая сессия без перезапуска (сигнал `TransportChanged`): отправитель вне списка источника — отказ.
     let until = deadline();
     while mail_from_code(smtp, "robot@other.test").await != 550 {
@@ -1237,7 +1283,13 @@ async fn transport_settings_without_restart() {
 // ---------- APP-26: правила Sieve и автоответ ----------
 
 /// Получатели очереди исходящей почты с адресом `address`.
-async fn queued(pool: &sqlx::PgPool, address: &str) -> i64 {
+/// Пул `tp-meta` к базе `url` без учёта ожидания соединения (наблюдатель-пустышка): метрик в тесте нет.
+async fn db_pool(url: &str) -> tp_meta::pool::DbPool {
+    let pool = sqlx::PgPool::connect(url).await.expect("pool");
+    tp_meta::pool::DbPool::new(pool, Arc::new(tp_meta::pool::NoAcquireObserver))
+}
+
+async fn queued(pool: &tp_meta::pool::DbPool, address: &str) -> i64 {
     let mut tx = tp_meta::schema::begin(pool, TenantId::DEFAULT)
         .await
         .expect("begin");
@@ -1315,7 +1367,7 @@ async fn sieve_rules_and_vacation() {
     let session: Value = serde_json::from_slice(&body).expect("session");
     let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
 
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let tenant = TenantId::DEFAULT;
     let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
     let account: sqlx::types::Uuid =
@@ -1577,7 +1629,7 @@ async fn meeting_scheduling() {
         retry(until, "узел готов").await;
     }
 
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
     let domain_id = accept_domain(&meta, tenant, &domain).await;
@@ -1794,6 +1846,16 @@ async fn d7_metrics() {
         "tp_blob_orphans_remaining",
     ] {
         assert!(text.contains(name), "{name}: {text}");
+    }
+    // Ожидание соединения пулов учтено наблюдателем пула (META-55): узел уже получал соединения.
+    for pool in ["primary", "listener"] {
+        let series = format!("tp_db_pool_wait_seconds_count{{pool=\"{pool}\"}} ");
+        let waits: f64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix(series.as_str()))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{series}: {text}"));
+        assert!(waits >= 1.0, "{series}: {text}");
     }
 
     shutdown.cancel();

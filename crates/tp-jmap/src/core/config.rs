@@ -56,6 +56,36 @@ pub struct JmapConfig {
     pub autoconfig: AutoconfigConfig,
     /// Календари JMAP: развёртка повторов событий.
     pub calendars: CalendarsConfig,
+    /// Отправка: отложенная отправка и статус доставки (`EmailSubmission`).
+    pub submission: SubmissionConfig,
+}
+
+/// Секция `jmap.submission`: отложенная отправка и статус доставки `EmailSubmission` (SRS 4.1, 4.2).
+///
+/// ```yaml
+/// submission:
+///   max_delayed_send: 30d
+///   max_delivery_events: 1000
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubmissionConfig {
+    /// `maxDelayedSend`: на сколько вперёд можно отложить отправку (`sendAt`); `0s` — отложенная отправка
+    /// запрещена.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub max_delayed_send: Duration,
+    /// Сколько событий журнала доставки читать на одну отправку для `deliveryStatus`.
+    pub max_delivery_events: usize,
+}
+
+impl Default for SubmissionConfig {
+    fn default() -> Self {
+        Self {
+            max_delayed_send: Duration::from_secs(30 * 24 * 3600),
+            max_delivery_events: 1_000,
+        }
+    }
 }
 
 /// Секция `jmap.calendars`: лимиты развёртки повторов событий (JMAP Calendars).
@@ -127,6 +157,7 @@ impl Default for JmapConfig {
             upload_ttl: Duration::from_secs(7 * 24 * 3600),
             autoconfig: AutoconfigConfig::default(),
             calendars: CalendarsConfig::default(),
+            submission: SubmissionConfig::default(),
         }
     }
 }

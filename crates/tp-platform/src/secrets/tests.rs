@@ -108,6 +108,32 @@ fn section_from_yaml_and_checks() {
         "длительность без единицы"
     );
     assert!(serde_yaml_ng::from_str::<SecretsConfig>("auth: { ldap: {} }").is_err());
+
+    let pki: SecretsConfig = serde_yaml_ng::from_str(&format!(
+        "url: https://bao\n{token}pki:\n  pki/issue/node:\n    common_name: mx1.example.ru\n    uri_sans: [\"thepost:node:mx1\"]\n"
+    ))
+    .expect("pki");
+    assert!(pki.check(Profile::Prod).is_ok());
+    let node = &pki.pki["pki/issue/node"];
+    assert_eq!(node.ttl, Duration::from_secs(72 * 3600));
+    assert_eq!(node.uri_sans, ["thepost:node:mx1"]);
+    for bad in [
+        "pki/node: { common_name: a }",
+        "pki/issue/node/x: { common_name: a }",
+        "database/issue/node: { common_name: a }",
+        "pki/issue/..: { common_name: a }",
+        "pki/issue/node: {}",
+        "pki/issue/node: { common_name: a, ttl: 0s }",
+    ] {
+        assert!(
+            err(
+                &format!("url: https://bao\n{token}pki: {{ {bad} }}\n"),
+                Profile::Prod
+            )
+            .contains("pki."),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
@@ -146,6 +172,10 @@ fn url_forms() {
 struct MockState {
     /// `<mount>/<путь>` → поля KV v2.
     kv: HashMap<String, Map<String, Value>>,
+    /// `<mount>/<путь>` → текущая версия KV v2 (нет — 1 для заданных тестом).
+    kv_versions: HashMap<String, u64>,
+    /// Записи KV v2 (`POST …/data/…`).
+    kv_writes: u32,
     /// Путь динамического секрета → поля, срок аренды (с), продлеваемость.
     dynamic: HashMap<String, (Map<String, Value>, u64, bool)>,
     leases: HashMap<String, (Instant, u64)>,
@@ -161,6 +191,10 @@ struct MockState {
     logins: u32,
     renewals: u32,
     cert_logins: u32,
+    /// Очередь выпусков PKI: сертификат, ключ и срок (с) до конца.
+    pki: Vec<(&'static str, &'static str, u64)>,
+    /// Тела запросов выпуска PKI.
+    pki_requests: Vec<Value>,
 }
 
 impl MockState {
@@ -267,7 +301,15 @@ impl MockState {
                 if let Some((mount, sub)) = rest.split_once("/data/")
                     && let Some(fields) = self.kv.get(&format!("{mount}/{sub}"))
                 {
-                    return (200, json!({ "data": { "data": fields, "metadata": {} } }));
+                    let version = self
+                        .kv_versions
+                        .get(&format!("{mount}/{sub}"))
+                        .copied()
+                        .unwrap_or(1);
+                    return (
+                        200,
+                        json!({ "data": { "data": fields, "metadata": { "version": version } } }),
+                    );
                 }
                 if let Some((fields, ttl, renewable)) = self.dynamic.get(rest).cloned() {
                     self.issued += 1;
@@ -280,6 +322,58 @@ impl MockState {
                     );
                 }
                 (404, json!({ "errors": [] }))
+            }
+            ("POST", "/v1/pki/issue/node") => {
+                self.pki_requests.push(body.clone());
+                if self.pki.is_empty() {
+                    return (500, json!({ "errors": ["internal error"] }));
+                }
+                let (cert, key, ttl) = self.pki.remove(0);
+                let unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_secs();
+                (
+                    200,
+                    json!({ "data": {
+                        "certificate": cert,
+                        "private_key": key,
+                        "private_key_type": "ec",
+                        "issuing_ca": CERT_CLIENT,
+                        "ca_chain": [],
+                        "serial_number": format!("00:{:02x}", self.pki_requests.len()),
+                        "expiration": unix + ttl,
+                    } }),
+                )
+            }
+            ("POST", p) if p.starts_with("/v1/") && p.contains("/data/") => {
+                let rest = &p[4..];
+                if self.forbidden.iter().any(|f| rest.starts_with(f.as_str())) {
+                    return denied;
+                }
+                let Some((mount, sub)) = rest.split_once("/data/") else {
+                    return (404, json!({ "errors": [] }));
+                };
+                let key = format!("{mount}/{sub}");
+                let current = self
+                    .kv
+                    .contains_key(&key)
+                    .then(|| self.kv_versions.get(&key).copied().unwrap_or(1));
+                let cas = body["options"]["cas"].as_u64();
+                if cas.is_some() && cas != Some(current.unwrap_or(0)) {
+                    return (
+                        400,
+                        json!({ "errors": ["check-and-set parameter did not match the current version"] }),
+                    );
+                }
+                let Some(fields) = body["data"].as_object() else {
+                    return (400, json!({ "errors": ["no data provided"] }));
+                };
+                let version = current.unwrap_or(0) + 1;
+                self.kv.insert(key.clone(), fields.clone());
+                self.kv_versions.insert(key, version);
+                self.kv_writes += 1;
+                (200, json!({ "data": { "version": version } }))
             }
             _ => (405, json!({ "errors": ["unsupported"] })),
         }
@@ -516,6 +610,68 @@ async fn approle_store_passes_contract_suite() {
 }
 
 #[tokio::test]
+async fn put_writes_new_kv_version_and_keeps_other_fields() {
+    let mock = Mock::start().await;
+    mock.with(|st| {
+        st.kv.insert(
+            "thepost/tls".into(),
+            fields(&[("key", "old"), ("note", "keep")]),
+        );
+        st.kv_versions.insert("thepost/tls".into(), 3);
+        st.forbidden.push("thepost/data/admin".into());
+    });
+    let dir = TempDir::new("vault-put");
+    let mut cfg = mock.config(&dir, approle(&dir, "secret-1"));
+    cfg.dynamic_mounts = vec!["database".into()];
+    let store = VaultStore::new(&cfg, Profile::Prod).await.expect("store");
+
+    store
+        .put(&r("thepost/tls#key"), &Secret::new("new"))
+        .await
+        .expect("put");
+    assert_eq!(
+        store
+            .get(&r("thepost/tls#key"))
+            .await
+            .expect("get")
+            .expose(),
+        "new"
+    );
+    let (fields_now, version) =
+        mock.with(|st| (st.kv["thepost/tls"].clone(), st.kv_versions["thepost/tls"]));
+    assert_eq!(
+        fields_now["note"], "keep",
+        "остальные поля пути сохраняются"
+    );
+    assert_eq!(version, 4, "новая версия KV v2");
+
+    // Пути ещё нет — первая версия.
+    store
+        .put(&r("thepost/fresh#key"), &Secret::new("k"))
+        .await
+        .expect("put new path");
+    assert_eq!(mock.with(|st| st.kv_versions["thepost/fresh"]), 1);
+
+    assert_eq!(
+        store
+            .put(&r("thepost/admin#token"), &Secret::new("x"))
+            .await,
+        Err(Error::Forbidden)
+    );
+    assert!(matches!(
+        store
+            .put(&r("database/creds/x#password"), &Secret::new("x"))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        store.put(&r("thepost#key"), &Secret::new("x")).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(mock.with(|st| st.kv_writes), 2);
+}
+
+#[tokio::test]
 async fn dynamic_fields_share_one_lease() {
     let mock = Mock::start().await;
     mock.with(|st| {
@@ -563,6 +719,102 @@ async fn dynamic_fields_share_one_lease() {
         ..lease
     };
     assert_eq!(store.renew(&fixed).await, Err(Error::NotFound));
+}
+
+fn pki_config(mock: &Mock, dir: &TempDir) -> SecretsConfig {
+    let mut cfg = mock.config(dir, approle(dir, "secret-1"));
+    cfg.pki.insert(
+        "pki/issue/node".into(),
+        PkiIssueConfig {
+            common_name: "localhost".into(),
+            alt_names: vec!["mx1.example.ru".into()],
+            uri_sans: vec!["thepost:node:mx1".into()],
+            ttl: Duration::from_secs(6),
+            ..PkiIssueConfig::default()
+        },
+    );
+    cfg
+}
+
+/// Приёмка PLT-26: внутренний сертификат PKI продлевается до конца срока без перезапуска слушателя; отказ
+/// выпуска при действующем сертификате оставляет прежний.
+#[tokio::test]
+async fn pki_certificate_is_renewed_before_expiry_without_restart() {
+    use crate::tls::tests::{CERT_B, KEY_B, listener_cert};
+    use crate::tls::{TlsCerts, TlsConfig};
+
+    let mock = Mock::start().await;
+    mock.with(|st| st.pki.push((CERT_A, KEY_A, 6)));
+    let dir = TempDir::new("vault-pki");
+    let store: Arc<dyn SecretStore> = Arc::new(
+        VaultStore::new(&pki_config(&mock, &dir), Profile::Prod)
+            .await
+            .expect("store"),
+    );
+    let tls = TlsConfig {
+        cert_file: dir.0.join("absent-chain.pem"),
+        key_file: dir.0.join("absent-key.pem"),
+        key: Some(r("pki/issue/node#bundle")),
+        ..TlsConfig::default()
+    };
+    let certs = Arc::new(
+        TlsCerts::load_with_secrets(&tls, store.clone())
+            .await
+            .expect("load"),
+    );
+    assert_eq!(listener_cert(&certs).await, der(CERT_A));
+    let request = mock.with(|st| st.pki_requests[0].clone());
+    assert_eq!(
+        request,
+        json!({
+            "common_name": "localhost",
+            "alt_names": "mx1.example.ru",
+            "ip_sans": "",
+            "uri_sans": "thepost:node:mx1",
+            "ttl": "6s",
+        })
+    );
+    // Поля — из одного выпуска; повторное чтение до двух третей срока не выпускает новый.
+    let cert = store
+        .get(&r("pki/issue/node#certificate"))
+        .await
+        .expect("cert");
+    assert_eq!(cert.expose(), CERT_A);
+    let ca = store.get(&r("pki/issue/node#ca_chain")).await.expect("ca");
+    assert_eq!(ca.expose(), CERT_CLIENT, "без ca_chain — issuing_ca");
+    assert!(!certs.reload_if_changed().await.expect("fresh"));
+    assert_eq!(mock.with(|st| st.pki_requests.len()), 1);
+    let put = store
+        .put(&r("pki/issue/node#bundle"), &Secret::new("x"))
+        .await;
+    assert!(matches!(put, Err(Error::Invalid(_))), "{put:?}");
+
+    // Две трети срока (4 с из 5–6 с) прошли: отказ выпуска — действует прежний сертификат.
+    tokio::time::sleep(Duration::from_millis(4100)).await;
+    assert!(!certs.reload_if_changed().await.expect("kept"));
+    assert_eq!(mock.with(|st| st.pki_requests.len()), 2);
+    assert_eq!(listener_cert(&certs).await, der(CERT_A));
+
+    // Выпуск удался до конца срока — новая пара у слушателя без перезапуска.
+    mock.with(|st| st.pki.push((CERT_B, KEY_B, 6)));
+    assert!(certs.reload_if_changed().await.expect("renewed"));
+    assert_eq!(listener_cert(&certs).await, der(CERT_B));
+    certs.certified_key().keys_match().expect("pair b");
+}
+
+#[tokio::test]
+async fn pki_expired_or_failed_issue_is_an_error() {
+    let mock = Mock::start().await;
+    mock.with(|st| st.pki.push((CERT_A, KEY_A, 0)));
+    let dir = TempDir::new("vault-pki-expired");
+    let store = VaultStore::new(&pki_config(&mock, &dir), Profile::Prod)
+        .await
+        .expect("store");
+    let expired = store.get(&r("pki/issue/node#bundle")).await;
+    assert!(expired.is_err(), "сертификат с истёкшим сроком");
+    let failed = store.get(&r("pki/issue/node#bundle")).await;
+    assert!(failed.is_err(), "выпуска нет и прежнего нет");
+    assert_eq!(mock.with(|st| st.pki_requests.len()), 2);
 }
 
 #[tokio::test]
