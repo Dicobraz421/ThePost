@@ -12,10 +12,18 @@
 //! (полная синхронизация: RFC 6578 `valid-sync-token`, JMAP `cannotCalculateChanges`).
 //!
 //! После фиксации каждого изменения реализация публикует сигнал [`dav_changed`] ([`EventKind::DavChanged`]).
+//!
+//! # Планирование (CTR-47)
+//!
+//! Входящие планирования (`schedule-inbox`, RFC 6638 §2.2) — отдельное хранилище учётной записи ([`DavStore::inbox_put`],
+//! [`DavStore::inbox_list`], [`DavStore::inbox_delete`]): UID в нём не уникален, в коллекции и их изменения не входит.
+//! `Schedule-Tag` объекта (RFC 6638 §3.2) и индекс занятости — поля [`ObjectIndex`], их задаёт вызывающий; занятость
+//! читает [`crate::schedule::FreeBusy`].
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -26,6 +34,7 @@ use crate::error::{Error, Result};
 use crate::ids::ModSeq;
 pub use crate::ids::{CollectionId, DavObjectId};
 use crate::meta::{AccountScope, Changes};
+use crate::schedule::{BusyPeriod, Inbox, InboxMessage, validate_busy};
 
 /// Наибольшая длина имени коллекции и имени ресурса (сегмент URL), байт.
 pub const MAX_NAME_LEN: usize = 255;
@@ -149,6 +158,10 @@ pub struct Collection {
     /// Допустимые компоненты объектов (`supported-calendar-component-set`): у календаря — непустое подмножество
     /// `VEVENT`, `VTODO`, `VJOURNAL`, у адресной книги — `{VCARD}`.
     pub components: BTreeSet<Component>,
+    /// Календарь не влияет на занятость (RFC 6638 `schedule-calendar-transp: transparent`): его объекты не входят
+    /// в [`crate::schedule::FreeBusy::query`]. У адресной книги не используется.
+    #[serde(default)]
+    pub transparent: bool,
     /// Наибольший `ModSeq` изменений коллекции: свойств и объектов (CTag). Задаёт хранилище; при записи не учитывается.
     pub state: ModSeq,
 }
@@ -172,6 +185,7 @@ impl Collection {
             order: 0,
             timezone: None,
             components,
+            transparent: false,
             state: ModSeq::ZERO,
         }
     }
@@ -240,13 +254,41 @@ pub struct ObjectIndex {
     pub uid: String,
     /// Интервал; `None` — без дат (контакт, задача без `DTSTART`/`DUE`): кандидат любого запроса time-range.
     pub span: Option<Span>,
+    /// Индекс занятости (CTR-47): вхождения с развёрнутыми повторами и исключениями от начала объекта до момента записи
+    /// плюс [`DavLimits::busy_horizon`], не больше [`crate::schedule::MAX_BUSY_PERIODS`]. Вычисляет `tp-dav` (DAV-16):
+    /// `TRANSP:TRANSPARENT`, `STATUS:CANCELLED`, задачи и контакты — пусто, `STATUS:TENTATIVE` —
+    /// [`crate::schedule::BusyKind::Tentative`].
+    #[serde(default)]
+    pub busy: Vec<BusyPeriod>,
+    /// `Schedule-Tag` объекта планирования (RFC 6638 §3.2) без кавычек ([`valid_etag`]); `None` — объект без
+    /// планирования. Задаёт вызывающий: новый при изменении организатором, прежний — при изменении участником только
+    /// своего `PARTSTAT`. `If-Schedule-Tag-Match` проверяет вызывающий по прочитанному объекту и пишет с
+    /// [`Precondition::IfMatch`] его ETag.
+    #[serde(default)]
+    pub schedule_tag: Option<String>,
 }
 
 impl ObjectIndex {
-    /// Проверяет UID и интервал (конец не раньше начала); иначе — `Error::Invalid`.
+    /// Индекс без занятости и `Schedule-Tag`.
+    pub fn new(component: Component, uid: impl Into<String>, span: Option<Span>) -> Self {
+        Self {
+            component,
+            uid: uid.into(),
+            span,
+            busy: Vec::new(),
+            schedule_tag: None,
+        }
+    }
+
+    /// Проверяет UID, интервал (конец не раньше начала), занятость ([`validate_busy`]) и `Schedule-Tag`
+    /// ([`valid_etag`]); иначе — `Error::Invalid`.
     pub fn validate(&self) -> Result<()> {
         if self.uid.is_empty() || !plain(&self.uid, MAX_UID_LEN) {
             return Err(Error::invalid("недопустимый UID объекта"));
+        }
+        validate_busy(&self.busy)?;
+        if self.schedule_tag.as_deref().is_some_and(|t| !valid_etag(t)) {
+            return Err(Error::invalid("недопустимый Schedule-Tag объекта"));
         }
         if let Some(Span {
             start,
@@ -363,21 +405,25 @@ pub enum DeleteOutcome {
 /// в capabilities. Превышение — `Error::QuotaExceeded`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DavLimits {
-    /// Размер тела объекта, байт.
+    /// Размер тела объекта (и сообщения входящих планирования), байт.
     pub max_object_size: usize,
-    /// Объектов в коллекции.
+    /// Объектов в коллекции (и сообщений во входящих планирования).
     pub max_objects: usize,
     /// Коллекций учётной записи (всех видов).
     pub max_collections: usize,
+    /// Горизонт индекса занятости ([`ObjectIndex::busy`]) от момента записи объекта (CTR-47). Хранилище его не
+    /// проверяет; `tp-dav` разворачивает повторы до него.
+    pub busy_horizon: Duration,
 }
 
 impl Default for DavLimits {
-    /// 1 МиБ на объект, 20 000 объектов в коллекции, 100 коллекций.
+    /// 1 МиБ на объект, 20 000 объектов в коллекции, 100 коллекций, горизонт занятости 400 дней.
     fn default() -> Self {
         Self {
             max_object_size: 1024 * 1024,
             max_objects: 20_000,
             max_collections: 100,
+            busy_horizon: Duration::from_secs(400 * 24 * 3600),
         }
     }
 }
@@ -568,8 +614,40 @@ pub trait DavStore: Send + Sync + 'static {
     ) -> Result<Changes<DavObjectId>>;
 
     /// Состояние вида `kind` (JMAP `state`): наибольший `ModSeq` изменений коллекций и объектов этого вида,
-    /// у новой учётной записи — `ModSeq::ZERO`.
+    /// у новой учётной записи — `ModSeq::ZERO`. Входящие планирования не входят.
     async fn state(&self, scope: AccountScope, kind: CollectionKind) -> Result<ModSeq>;
+
+    // ---------- Входящие планирования (CTR-47) ----------
+
+    /// Создаёт или перезаписывает ресурс `name` входящих планирования (RFC 6638 §2.2; кладёт `ItipDelivery`). Проверки
+    /// по порядку: недопустимое имя ([`valid_name`]) или сообщение ([`InboxMessage::validate`]) — `Invalid`; тело больше
+    /// [`DavLimits::max_object_size`] или новый ресурс при [`DavLimits::max_objects`] сообщений — `QuotaExceeded`.
+    /// `ModSeq` — из счётчика учётной записи; перезапись сохраняет `id`. После фиксации — сигнал
+    /// [`crate::schedule::schedule_inbox_changed`]. По умолчанию — `Error::Internal`.
+    async fn inbox_put(
+        &self,
+        scope: AccountScope,
+        name: &str,
+        message: InboxMessage,
+    ) -> Result<Put> {
+        let _ = (scope, name, message);
+        Err(Error::internal("dav store does not support schedule inbox"))
+    }
+
+    /// Входящие планирования учётной записи: ресурсы по `ModSeq` и состояние ([`Inbox::state`]). По умолчанию —
+    /// `Error::Internal`.
+    async fn inbox_list(&self, scope: AccountScope) -> Result<Inbox> {
+        let _ = scope;
+        Err(Error::internal("dav store does not support schedule inbox"))
+    }
+
+    /// Удаляет ресурс входящих планирования (без надгробия: `CalendarEventNotification/changes` после удаления —
+    /// полная сверка по [`Inbox::state`]). Нет — `NotFound`. Возвращает `ModSeq` изменения; после фиксации — сигнал
+    /// [`crate::schedule::schedule_inbox_changed`]. По умолчанию — `Error::Internal`.
+    async fn inbox_delete(&self, scope: AccountScope, name: &str) -> Result<ModSeq> {
+        let _ = (scope, name);
+        Err(Error::internal("dav store does not support schedule inbox"))
+    }
 }
 
 #[cfg(test)]
@@ -650,11 +728,7 @@ mod tests {
     #[test]
     fn index_overlap() {
         let t = |h: u8| OffsetDateTime::UNIX_EPOCH + time::Duration::hours(h.into());
-        let idx = |start, end| ObjectIndex {
-            component: Component::Event,
-            uid: "u".into(),
-            span: Some(Span { start, end }),
-        };
+        let idx = |start, end| ObjectIndex::new(Component::Event, "u", Some(Span { start, end }));
         let range = TimeRange {
             start: Some(t(10)),
             end: Some(t(12)),
@@ -683,6 +757,33 @@ mod tests {
         assert!(
             ObjectIndex {
                 uid: String::new(),
+                ..no_span.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ObjectIndex {
+                schedule_tag: Some("a b".into()),
+                ..no_span.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        let busy = crate::schedule::BusyPeriod {
+            start: t(1),
+            end: t(2),
+            kind: crate::schedule::BusyKind::Busy,
+        };
+        let scheduled = ObjectIndex {
+            busy: vec![busy],
+            schedule_tag: Some("17".into()),
+            ..no_span.clone()
+        };
+        assert_eq!(scheduled.validate(), Ok(()));
+        assert!(
+            ObjectIndex {
+                busy: vec![crate::schedule::BusyPeriod { end: t(1), ..busy }],
                 ..no_span
             }
             .validate()
@@ -695,6 +796,14 @@ mod tests {
         let c = Collection::new(CollectionKind::Calendar, "work");
         let s = serde_json::to_string(&c).expect("json");
         assert_eq!(serde_json::from_str::<Collection>(&s).expect("parse"), c);
+        // Записи CTR-45 без полей CTR-47 читаются со значениями по умолчанию.
+        let mut v = serde_json::to_value(&c).expect("json");
+        v.as_object_mut().expect("object").remove("transparent");
+        assert_eq!(serde_json::from_value::<Collection>(v).expect("old"), c);
+        let old: ObjectIndex =
+            serde_json::from_str(r#"{"component":"Event","uid":"u","span":null}"#)
+                .expect("old index");
+        assert_eq!(old, ObjectIndex::new(Component::Event, "u", None));
         let e = dav_changed(
             AccountScope {
                 tenant: crate::TenantId::new(),

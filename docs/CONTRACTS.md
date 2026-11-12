@@ -132,13 +132,13 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
 LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } |
-ShardsChanged | DavChanged { kind, collection, modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
-`MailboxListChanged`, `DavChanged`, `SieveChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
+ShardsChanged | DavChanged { kind, collection, modseq } | ScheduleInboxChanged { modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+`MailboxListChanged`, `DavChanged`, `ScheduleInboxChanged`, `SieveChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
 `MembersChanged`, `ShardsChanged` — с `TenantId::DEFAULT`, `Blocked`, `Unblocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
 Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер); in-memory — `MemEventBus` (отставание — `Resync`).
 Доставка — at-most-once; клиент при запуске, после переподключения и по `Resync` сверяется с хранилищем. Публикация — только после фиксации,
-вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`, `DavChanged` — `DavStore`, `SieveChanged` — `SieveStore`,
+вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`, `DavChanged` и `ScheduleInboxChanged` — `DavStore`, `SieveChanged` — `SieveStore`,
 `ShardsChanged` (CTR-49, решение 47) — тот, кто меняет справочник шардов (модуль «Шардирование», администрирование): добавлен или выведен
 шард, изменились адрес или реплика, учётная запись перенесена; узлы сбрасывают кэш справочника (`tp_meta::shards::ShardDirectory::follow`).
 Набор `suite::signals`.
@@ -532,13 +532,16 @@ SRS 4.4, 3.1; CTR-45. Код — `dav.rs`. Одно хранилище для Ca
 индекс вычисляет вызывающий (`tp_dav::index` поверх calcard). JMAP Calendars — по текущему черновику IETF (решение 35).
 `CollectionId`, `DavObjectId` (UUID v7, `ids.rs`); `CollectionKind::{Calendar, AddressBook}`; `Component::{Event, Todo, Journal, Card}`
 (`VEVENT`… `VCARD`, `fits(kind)`). `Collection { id, kind, name (сегмент URL, `valid_name`), display_name, description, color, order,
-timezone (IANA), components: BTreeSet, state: ModSeq }`, `Collection::new(kind, name)`, `validate()` (→ `Invalid`); `kind` и `name` не меняются.
+timezone (IANA), components: BTreeSet, transparent (CTR-47: `schedule-calendar-transp`, не входит в занятость), state: ModSeq }`,
+`Collection::new(kind, name)`, `validate()` (→ `Invalid`); `kind` и `name` не меняются.
 `DavObject { id, collection, name, etag (без кавычек, `valid_etag`), body: String, index: ObjectIndex { component, uid, span: Option<Span {
-start, end: Option }> } }` — интервал с развёрнутыми повторами, `end = None` — бесконечный; `span = None` — без дат (кандидат любого запроса).
+start, end: Option }>, busy: Vec<BusyPeriod>, schedule_tag: Option<String> } }` — интервал с развёрнутыми повторами, `end = None` —
+бесконечный; `span = None` — без дат (кандидат любого запроса); `busy` и `schedule_tag` — раздел Schedule (CTR-47, `#[serde(default)]`);
+`ObjectIndex::new(component, uid, span)` — без них.
 `TimeRange { start?, end? }`, `ObjectIndex::may_overlap` — кандидат time-range: `start < range.end`, `end ≥ range.start` (точную проверку
 RFC 4791 §9.9 делает вызывающий).
 `DavStore` (по `AccountScope`, чужая учётная запись или организация — как отсутствующие): `limits() -> DavLimits { max_object_size,
-max_objects (в коллекции), max_collections (учётной записи) }` (из конфигурации реализации; превышение — `QuotaExceeded`);
+max_objects (в коллекции), max_collections (учётной записи), busy_horizon (CTR-47) }` (из конфигурации реализации; превышение — `QuotaExceeded`);
 коллекции — `list_collections(kind)` (по `order`, имени), `get_collection(id)`, `collection_by_name(kind, name)`, `create_collection`
 (занятые `id` или имя вида — `Conflict`), `update_collection` (свойства), `delete_collection` (сразу, без корзины; объекты и коллекция —
 в надгробия, каждый со своим `ModSeq`); объекты — `get_object(collection, name)`, `object_by_uid`, `list_objects -> Vec<ObjectRef { id, name,
@@ -552,8 +555,48 @@ UidConflict { name }}` (UID уникален в коллекции; компон
 `account_changes(kind, since, limit) -> Changes<DavObjectId>` (JMAP `CalendarEvent/changes`, `ContactCard/changes`), `state(kind)`
 (JMAP `state`). `since = 0` — всё в `created`; `has_more` — `new_state` последнего возвращённого; `since` старше очищенных надгробий или
 больше счётчика — `Conflict`. Сигнал `DavChanged { kind, collection, modseq }` (`dav_changed`, учётная запись) — после фиксации каждого
-изменения. In-memory — `MemDav` (`with_limits`, `with_bus`, `purge_tombstones`); наборы `suite::dav` (лимиты `suite::dav::LIMITS`,
-`DavFixture`), `suite::dav::signals`. PostgreSQL — `tp-meta` (META-46…48).
+изменения. Входящие планирования `inbox_put`, `inbox_list`, `inbox_delete` — раздел Schedule. In-memory — `MemDav` (`with_limits`,
+`with_bus`, `purge_tombstones`; и `FreeBusy`); наборы `suite::dav` (лимиты `suite::dav::LIMITS`, `DavFixture`), `suite::dav::signals`.
+PostgreSQL — `tp-meta` (META-46…48, планирование — META-51).
+
+## Schedule
+SRS 4.4; CTR-47. Код — `schedule.rs`, методы `inbox_*` — `dav.rs`. Планирование встреч: CalDAV Scheduling (RFC 6638), iTIP (RFC 5546),
+iMIP (RFC 6047), занятость. iCalendar контракты не разбирают: разбор и построение iTIP — `tp_dav::itip` поверх calcard (DAV-13), общий
+с JMAP (`sendSchedulingMessages`, JMAP-31; JMAP Calendars — по черновику IETF, решение 35). Адрес календарного пользователя —
+без `mailto:`, `valid_address` (1–320 байт, без пробелов и управляющих; нормализует вызывающий).
+- `ItipMethod::{Publish, Request, Reply, Add, Cancel, Refresh, Counter, DeclineCounter}` (`as_str`, `FromStr` без регистра, `from_organizer`).
+- `ItipDelivery::deliver(&ItipMessage { recipient: AccountScope, to, from, method, ics, source: ItipSource::{Internal, Imip} }) ->
+  ItipOutcome::{Applied, Ignored(reason)}` — приём iTIP учётной записью: `REQUEST`, `ADD` — событие в календаре по умолчанию
+  (`PARTSTAT=NEEDS-ACTION`), `REPLY` — статус участника у организатора, `CANCEL` — `STATUS:CANCELLED`, все — во входящие планирования.
+  `from` проверен вызывающим (iMIP — `From`, прошедший DMARC; внутри — адрес учётной записи). Недопустимое (`ItipMessage::validate`),
+  подделанный отправитель, устаревший `SEQUENCE`, чужой `UID` организатора — `Ok(Ignored)`; `Err` — сбой хранилища (идемпотентно,
+  повтор безопасен); письмо iMIP при любом итоге остаётся в ящике. Реализация — `tp-dav` (DAV-15); вызывают `tp-smtp` (SMTP-33,
+  `Delivery::with_itip`), `tp-dav` (DAV-13), `tp-jmap` (JMAP-31). Заглушка — `FakeItip` (`set(to, outcome)`, `fail_next`, `calls`).
+- `ItipSender::send(&ItipOutgoing { sender: AccountScope, from (ORGANIZER или ATTENDEE учётной записи), to: Vec (внешние), method, ics,
+  subject, text }) -> Submitted` — письмо iMIP (`multipart/alternative`: `text/plain` и `text/calendar; method=…`) через
+  `queue::Outbound::submit` (очередь и DKIM); `validate()` → `Invalid`. Реализация — `tp-dav` поверх `Outbound` (сборка — APP-28);
+  in-memory — `MemItipSender` (`sent`, `fail_next`; все `Queued`).
+- Входящие планирования (`schedule-inbox`, RFC 6638 §2.2) в `DavStore` (методы с реализацией по умолчанию — `Internal`):
+  `inbox_put(scope, name, InboxMessage { method, uid, from, body }) -> Put` (создать или перезаписать, `id` сохраняется; UID не уникален;
+  имя — `valid_name`, `validate()` → `Invalid`; тело больше `max_object_size` или сообщений больше `max_objects` — `QuotaExceeded`),
+  `inbox_list(scope) -> Inbox { items: Vec<InboxItem { id, name, etag, modseq, message }> (по `ModSeq`), state }` (`state` — CTag
+  входящих и JMAP `state` `CalendarEventNotification`), `inbox_delete(scope, name) -> ModSeq` (без надгробия; нет — `NotFound`).
+  `ModSeq` — из счётчика учётной записи; `DavStore::state` и `*changes` календарей входящие не меняют. Сигнал
+  `ScheduleInboxChanged { modseq }` (`schedule_inbox_changed`, учётная запись) — после каждого `inbox_put`, `inbox_delete`.
+- `Schedule-Tag` (RFC 6638 §3.2) — `ObjectIndex::schedule_tag` (как ETag, `valid_etag`): задаёт вызывающий — новый при изменении
+  организатором, прежний при изменении участником только `PARTSTAT`; `If-Schedule-Tag-Match` проверяет вызывающий по прочитанному объекту
+  и пишет с `Precondition::IfMatch(etag)`.
+- Занятость: `ObjectIndex::busy: Vec<BusyPeriod { start, end, kind: BusyKind::{Busy, Tentative, Unavailable} }>` (`[start, end)`, UTC;
+  `FBTYPE`) — вхождения с повторами и исключениями до момента записи плюс `DavLimits::busy_horizon` (по умолчанию 400 дней), не больше
+  `MAX_BUSY_PERIODS` (4096), `validate_busy` → `Invalid`. Вычисляет `tp-dav` (DAV-16): `TRANSP:TRANSPARENT`, `STATUS:CANCELLED` — пусто,
+  `STATUS:TENTATIVE` — `Tentative`. `FreeBusy::query(tenant, accounts, Period { start, end }) -> Vec<(AccountId, Vec<BusyPeriod>)>` —
+  календари учётной записи кроме `transparent`; запись на каждую учётную запись в порядке `accounts` (повторы — один раз), периоды,
+  пересекающиеся с интервалом, обрезаны по нему и нормализованы `merge_busy` (по `(start, end, kind)`, один вид склеен, разные — нет);
+  нет данных, чужая организация, несуществующая — пусто (существование и права «только занятость», CTR-48, проверяет вызывающий);
+  `end ≤ start` — `Invalid`. На нём строятся VFREEBUSY (RFC 6638 §5, DAV-16), `Principal/getAvailability` (JMAP-30) и
+  `Availability/get` (jmap-09). Реализации — хранилища: `MemDav`, `PgMeta` (META-51).
+- Наборы: `suite::itip` (входящие, `Schedule-Tag`, занятость в индексе, `transparent`; лимиты `suite::dav::LIMITS`, `DavFixture`),
+  `suite::itip::signals`, `suite::freebusy(dav, fb, fixture)`.
 
 ## Sieve
 SRS 4.3; CTR-46. Код — `sieve.rs`. Интерпретатор — свой крейт `tp-sieve` (sieve-rs под AGPL-3.0); ManageSieve — в роли `imap` (как POP3),
@@ -734,6 +777,16 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   RulesInput, RulesOutcome, KeepTo, MailboxRef, AutoReply, ReplyBody, sieve_changed}`, `EventKind::SieveChanged`. По сравнению с карточкой:
   `SieveStore::active`, `limits`, `state`; `MailboxRef::Inbox` для implicit keep; `AutoReply::references`. In-memory — `MemSieve`,
   `MemVacationLog`, `FakeRules`; наборы `suite::sieve`, `suite::sieve::{vacation_log, signals}`. Реализация в `tp-meta` — META-49, META-50.
+- 2026-11-12 — CTR-47 (x/contracts-34): `schedule::{ItipDelivery, ItipMessage, ItipMethod, ItipSource, ItipOutcome, ItipSender,
+  ItipOutgoing, InboxMessage, InboxItem, Inbox, FreeBusy, Period, BusyPeriod, BusyKind, merge_busy, validate_busy, valid_address,
+  schedule_inbox_changed}`, `DavStore::{inbox_put, inbox_list, inbox_delete}` (реализация по умолчанию — `Internal`),
+  `ObjectIndex::{busy, schedule_tag}` и `ObjectIndex::new`, `Collection::transparent`, `DavLimits::busy_horizon`,
+  `EventKind::ScheduleInboxChanged`. По сравнению с карточкой: в `ItipMessage` нет отдельного `tenant` (он в `recipient`), добавлены
+  `to` (адрес получателя) и `source`; `ItipOutgoing` с темой и текстом письма; интервал запроса — `Period`; результат `FreeBusy::query`
+  нормализован `merge_busy`; `Collection::transparent` (RFC 6638 `schedule-calendar-transp`) — для исключения из занятости; `Inbox::state`
+  и сигнал входящих — для CTag и JMAP `CalendarEventNotification`; горизонт занятости — в `DavLimits`. Новые поля индекса и коллекции —
+  `#[serde(default)]`. In-memory — `MemDav` (входящие, `FreeBusy`), `FakeItip`, `MemItipSender`; наборы `suite::itip`,
+  `suite::itip::signals`, `suite::freebusy`. Реализация в `tp-meta` — META-51, в `tp-dav` — DAV-13, DAV-15, DAV-16.
 - 2026-11-12 — CTR-49 (x/contracts-36): `QueueStore::enqueue(owner: Option<AccountId>, msg)`, `BlobIndex::acquire(tenant, owner:
   Option<AccountId>, hash, refs)` — учётная запись отправителя или владельца для выбора шарда (решение 46); `EventKind::ShardsChanged` —
   системный сигнал изменения справочника шардов (решение 47). Вызовы в крейтах — `None` (учётная запись на этих путях неизвестна).

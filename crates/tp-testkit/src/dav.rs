@@ -1,8 +1,9 @@
-//! [`DavStore`] в памяти (CONTRACTS.md#Dav, CTR-45).
+//! [`DavStore`] и [`FreeBusy`] в памяти (CONTRACTS.md#Dav, CONTRACTS.md#Schedule; CTR-45, CTR-47).
 //!
 //! `ModSeq` — свой счётчик учётной записи (у `PgMeta` — общий с письмами), ETag — `ModSeq` записи. С шиной
-//! ([`MemDav::with_bus`]) после каждого изменения публикуется `DavChanged`. [`MemDav::purge_tombstones`] имитирует
-//! очистку надгробий: прежние `since` после неё — `Conflict`.
+//! ([`MemDav::with_bus`]) после каждого изменения публикуется `DavChanged`, после изменения входящих планирования —
+//! `ScheduleInboxChanged`. [`MemDav::purge_tombstones`] имитирует очистку надгробий: прежние `since` после неё —
+//! `Conflict`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -16,7 +17,11 @@ use tp_contracts::dav::{
     valid_name,
 };
 use tp_contracts::meta::{AccountScope, Changes};
-use tp_contracts::{Error, ModSeq, Result};
+use tp_contracts::schedule::{
+    BusyPeriod, FreeBusy, Inbox, InboxItem, InboxMessage, Period, merge_busy,
+    schedule_inbox_changed,
+};
+use tp_contracts::{AccountId, Error, ModSeq, Result, TenantId};
 
 use crate::infra::lock;
 
@@ -55,6 +60,10 @@ struct Account {
     collections: HashMap<CollectionId, Coll>,
     objects: Vec<Tomb>,
     deleted: Vec<(CollectionId, CollectionKind, ModSeq)>,
+    /// Входящие планирования по имени.
+    inbox: BTreeMap<String, InboxItem>,
+    /// `ModSeq` последнего изменения входящих.
+    inbox_state: ModSeq,
 }
 
 impl Account {
@@ -196,6 +205,12 @@ impl MemDav {
         acc.horizon = acc.counter;
         acc.objects.clear();
         acc.deleted.clear();
+    }
+
+    async fn inbox_signal(&self, scope: AccountScope, modseq: ModSeq) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.publish(schedule_inbox_changed(scope, modseq)).await;
+        }
     }
 
     async fn signal(
@@ -671,6 +686,114 @@ impl DavStore for MemDav {
             .get(&scope)
             .map_or(ModSeq::ZERO, |a| a.state(kind)))
     }
+
+    async fn inbox_put(
+        &self,
+        scope: AccountScope,
+        name: &str,
+        message: InboxMessage,
+    ) -> Result<Put> {
+        if !valid_name(name) {
+            return Err(Error::invalid(format!(
+                "недопустимое имя ресурса: {name:?}"
+            )));
+        }
+        message.validate()?;
+        if message.body.len() > self.limits.max_object_size {
+            return Err(Error::QuotaExceeded);
+        }
+        let put = {
+            let mut st = lock(&self.state);
+            let acc = st.entry(scope).or_default();
+            let prev = acc.inbox.get(name).map(|i| i.id);
+            if prev.is_none() && acc.inbox.len() >= self.limits.max_objects {
+                return Err(Error::QuotaExceeded);
+            }
+            let modseq = acc.bump();
+            let id = prev.unwrap_or_default();
+            let etag = modseq.to_string();
+            acc.inbox.insert(
+                name.to_owned(),
+                InboxItem {
+                    id,
+                    name: name.to_owned(),
+                    etag: etag.clone(),
+                    modseq,
+                    message,
+                },
+            );
+            acc.inbox_state = modseq;
+            Put {
+                id,
+                etag,
+                modseq,
+                created: prev.is_none(),
+            }
+        };
+        self.inbox_signal(scope, put.modseq).await;
+        Ok(put)
+    }
+
+    async fn inbox_list(&self, scope: AccountScope) -> Result<Inbox> {
+        let st = lock(&self.state);
+        let Some(acc) = st.get(&scope) else {
+            return Ok(Inbox::default());
+        };
+        let mut items: Vec<InboxItem> = acc.inbox.values().cloned().collect();
+        items.sort_by_key(|i| i.modseq);
+        Ok(Inbox {
+            items,
+            state: acc.inbox_state,
+        })
+    }
+
+    async fn inbox_delete(&self, scope: AccountScope, name: &str) -> Result<ModSeq> {
+        let modseq = {
+            let mut st = lock(&self.state);
+            let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
+            if acc.inbox.remove(name).is_none() {
+                return Err(Error::NotFound);
+            }
+            let modseq = acc.bump();
+            acc.inbox_state = modseq;
+            modseq
+        };
+        self.inbox_signal(scope, modseq).await;
+        Ok(modseq)
+    }
+}
+
+#[async_trait]
+impl FreeBusy for MemDav {
+    async fn query(
+        &self,
+        tenant: TenantId,
+        accounts: &[AccountId],
+        range: Period,
+    ) -> Result<Vec<(AccountId, Vec<BusyPeriod>)>> {
+        range.validate()?;
+        let st = lock(&self.state);
+        let mut out: Vec<(AccountId, Vec<BusyPeriod>)> = Vec::new();
+        for &account in accounts {
+            if out.iter().any(|(a, _)| *a == account) {
+                continue;
+            }
+            let periods = st
+                .get(&AccountScope { tenant, account })
+                .map(|acc| {
+                    acc.collections
+                        .values()
+                        .filter(|c| c.meta.kind == CollectionKind::Calendar && !c.meta.transparent)
+                        .flat_map(|c| c.objects.values())
+                        .flat_map(|o| o.index.busy.iter())
+                        .filter_map(|p| p.clip(&range))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((account, merge_busy(periods)));
+        }
+        Ok(out)
+    }
 }
 
 /// Изменения учётной записи без изменений: счётчик нулевой, `since` больше нуля — `Conflict`.
@@ -710,6 +833,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suite_itip() {
+        let store = MemDav::new().with_limits(suite::dav::LIMITS);
+        suite::itip(&store, &suite::dav::DavFixture::new()).await;
+    }
+
+    #[tokio::test]
+    async fn suite_itip_signals() {
+        let bus = crate::MemEventBus::default();
+        let store = MemDav::new().with_bus(Arc::new(bus.clone()));
+        suite::itip::signals(&store, &bus, scope()).await;
+    }
+
+    #[tokio::test]
+    async fn suite_freebusy() {
+        let store = MemDav::new().with_limits(suite::dav::LIMITS);
+        suite::freebusy(&store, &store, &suite::dav::DavFixture::new()).await;
+    }
+
+    #[tokio::test]
     async fn stale_since_after_purge() {
         let store = MemDav::new();
         let s = scope();
@@ -718,11 +860,7 @@ mod tests {
             .create_collection(s, cal.clone())
             .await
             .expect("create");
-        let idx = ObjectIndex {
-            component: Component::Event,
-            uid: "u1".into(),
-            span: None,
-        };
+        let idx = ObjectIndex::new(Component::Event, "u1", None);
         store
             .put_object(s, cal.id, "a.ics", "x".into(), idx, Precondition::Any)
             .await
