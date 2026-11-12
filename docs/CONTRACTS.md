@@ -648,7 +648,9 @@ iMIP (RFC 6047), занятость. iCalendar контракты не разб�
 - `ItipDelivery::deliver(&ItipMessage { recipient: AccountScope, to, from, method, ics, source: ItipSource::{Internal, Imip} }) ->
   ItipOutcome::{Applied, Ignored(reason)}` — приём iTIP учётной записью: `REQUEST`, `ADD` — событие в календаре по умолчанию
   (`PARTSTAT=NEEDS-ACTION`), `REPLY` — статус участника у организатора, `CANCEL` — `STATUS:CANCELLED`, все — во входящие планирования.
-  `from` проверен вызывающим (iMIP — `From`, прошедший DMARC; внутри — адрес учётной записи). Недопустимое (`ItipMessage::validate`),
+  `from` проверен вызывающим (iMIP — `From`, прошедший DMARC; внутри — адрес учётной записи). CTR-59 (решение 78): `Internal` — также
+  приглашение из почтового клиента (submission, JMAP `EmailSubmission`; SMTP-36), если `From` письма принадлежит вошедшей учётной записи
+  (свой адрес, псевдоним, право Send As); иначе — письмо без доставки iTIP. Недопустимое (`ItipMessage::validate`),
   подделанный отправитель, устаревший `SEQUENCE`, чужой `UID` организатора — `Ok(Ignored)`; `Err` — сбой хранилища (идемпотентно,
   повтор безопасен); письмо iMIP при любом итоге остаётся в ящике. Реализация — `tp-dav` (DAV-15); вызывают `tp-smtp` (SMTP-33,
   `Delivery::with_itip`), `tp-dav` (DAV-13), `tp-jmap` (JMAP-31). Заглушка — `FakeItip` (`set(to, outcome)`, `fail_next`, `calls`).
@@ -913,6 +915,10 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — MS-19 (волна mailstore-12, класс B): `TrashStore::hidden_message(scope, id) -> Option<Message>` — метаданные скрытого
   письма для администратора без снятия скрытия (без реализации по умолчанию; `MemTrash`, `PgMeta`); набор `suite::trash_purge` проверяет
   его. Потребитель — Admin API: тема и отправитель скрытых писем на странице `trash/hidden` (из `Message::meta.envelope`, без чтения BLOB).
+- 2026-11-12 — CTR-59 (волна contracts-42, решения 59, 78): занятость повторяющихся событий — разворот при запросе — уже в контракте
+  по META-54 (`ObjectIndex::recurring`, `DavLimits::max_busy_instances`, удалён `DavLimits::busy_horizon`; набор
+  `suite::freebusy_recurring`: встреча без конца занята через 3 года, `EXDATE` свободна). Добавлено: `ItipSource::Internal` — и приглашение
+  из почтового клиента с `From` вошедшей учётной записи (SMTP-36). Код не меняется — только описание.
 - 2026-11-12 — CTR-53 (волна contracts-38): `Account::aliases`, `AccountUpsert::aliases` и `Account::addresses()` — адреса учётной
   записи (основной и псевдонимы каталога без catch-all); правила — `meta::account_addresses`, `meta::account_aliases`. Несовместимо:
   новые обязательные поля `Account` и `AccountUpsert`. `tp-meta` — миграция 0030 (`accounts.aliases`).
