@@ -1,7 +1,8 @@
 # Release-сборка thepost (решение 116, CI-14) — единственный путь: артефакт CI (ci.yml, release), выпуск и repro
 # (beta.yml). cross (образ glibc) под базовый x86-64 без AVX2; затем запуск x86_64 на эмуляции старого процессора
 # (qemu-user, Nehalem = x86-64-v2, без AVX): инструкции новее базового уровня — SIGILL, сборка падает.
-# Нативная сборка на ubuntu-latest дала C-код aws-lc-sys и ring под x86-64-v3, бинарь падал на стенде без AVX2.
+# Нативная сборка на ubuntu-latest (ubuntu-26.04: система собрана под x86-64-v3) дала C-код aws-lc-sys и ring
+# под x86-64-v3, бинарь падал на стенде без AVX2; образ cross собирает под базовый x86-64.
 # RUSTFLAGS сборки пустые в любом workflow (в ci.yml — `-D warnings`): бинарь CI совпадает с бинарём беты.
 name: release-build
 description: cross build --release thepost и запуск на старом процессоре
@@ -43,12 +44,20 @@ runs:
         ARGS: ${{ steps.console.outputs.cargo-args }}
         RUSTFLAGS: ''
       run: cross build --release --locked -p thepost --target "$TARGET" $ARGS
+    # Гостевая система для qemu — Debian 12 (glibc под базовый x86-64): glibc раннера ubuntu-26.04 собрана под
+    # x86-64-v3 и под Nehalem падает сама, ещё до бинаря.
     - name: Запуск на старом процессоре (qemu Nehalem, без AVX)
       if: inputs.target == 'x86_64-unknown-linux-gnu'
       shell: bash
       env:
         BIN: target/${{ inputs.target }}/release/thepost
+        GUEST: debian:12-slim
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq --no-install-recommends qemu-user >/dev/null
-        qemu-x86_64 -cpu Nehalem "$BIN" --version
+        root="$RUNNER_TEMP/guest"; mkdir -p "$root"
+        docker pull -q "$GUEST" >/dev/null
+        id=$(docker create "$GUEST")
+        docker export "$id" | tar -x -C "$root" --exclude=dev --exclude=proc --exclude=sys
+        docker rm "$id" >/dev/null
+        qemu-x86_64 -L "$root" -cpu Nehalem "$BIN" --version

@@ -185,7 +185,7 @@ jobs:
   release:
     needs: [changes, test]
     if: >-
-      always() && needs.test.result != 'failure' &&
+      !cancelled() && needs.test.result != 'failure' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 45
