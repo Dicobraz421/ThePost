@@ -15,6 +15,7 @@
 //! квота); журнал изменений показывает его удалённым. Стирание (`erase`) — после `before_final_delete` вне
 //! транзакции; запрет (Legal Hold) или ошибка хука — скрыть.
 
+use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -26,8 +27,8 @@ use tp_contracts::config::duration;
 use tp_contracts::events::CoreEventKind;
 use tp_contracts::ext::{Decision, DecisionHooks, FinalDelete};
 use tp_contracts::meta::{
-    AccountScope, Inserted, MessageStore, Policy, PolicyResolver, PolicyStore, QuotaUsage,
-    SpecialUse,
+    AccountScope, Inserted, MessageStore, Policy, PolicyResolver, PolicyStore, PolicyTarget,
+    QuotaUsage, SpecialUse,
 };
 use tp_contracts::retention::{
     PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule,
@@ -71,9 +72,6 @@ impl Default for RetentionConfig {
         }
     }
 }
-
-/// Уровень цепочки политик — тип контракта (CTR-25).
-pub use tp_contracts::meta::PolicyTarget;
 
 /// Колонка `policies.level` уровня.
 fn level(target: PolicyTarget) -> &'static str {
@@ -200,9 +198,11 @@ async fn resolve_in(
     )
 }
 
-impl PgMeta {
+/// Уровни цепочки для Admin API (CTR-25, META-70): единственный путь чтения и записи уровня (META-76).
+#[async_trait]
+impl PolicyStore for PgMeta {
     /// Политика одного уровня цепочки (без наложения); не задана — все поля `None`.
-    pub async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
+    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
         self.idempotent(|| async move {
         let mut tx = begin(&self.pool, tenant).await?;
         let row: Option<PolicyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -220,7 +220,7 @@ impl PgMeta {
     }
 
     /// Задаёт политику уровня целиком (Admin API); политика без заданных полей удаляет уровень.
-    pub async fn set_policy(
+    async fn set_policy(
         &self,
         tenant: TenantId,
         target: PolicyTarget,
@@ -274,48 +274,67 @@ impl PgMeta {
     }
 }
 
-/// Уровни цепочки для Admin API (CTR-25) — [`PgMeta::policy`] и [`PgMeta::set_policy`].
-#[async_trait]
-impl PolicyStore for PgMeta {
-    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
-        PgMeta::policy(self, tenant, target).await
-    }
-
-    async fn set_policy(
-        &self,
-        tenant: TenantId,
-        target: PolicyTarget,
-        policy: &Policy,
-    ) -> Result<()> {
-        PgMeta::set_policy(self, tenant, target, policy).await
-    }
+/// Срок корзины при переносе писем ящика (META-61): `folders` — срок уровня папки по цепочке «папка → учётная
+/// запись → домен → организация» для каждой исходной папки, `default` — для папок вне `folders`.
+///
+/// В основной БД `folders` пуст: цепочку разрешает `tp_trash_retention_us` в транзакции ящика, `default` —
+/// значение конфигурации. На другом шарде политик нет: цепочка читается из основной БД до транзакции ящика —
+/// для папок, где лежали письма (`folders`), и для учётной записи (`default`; папка, в которую письмо попало
+/// между чтением и транзакцией).
+#[derive(Debug, Clone)]
+pub(crate) struct TrashFor {
+    pub(crate) default: Duration,
+    pub(crate) folders: Vec<(Uuid, Duration)>,
 }
 
 impl PgMeta {
-    /// Срок корзины по умолчанию для переноса писем ящика `db`: в основной БД политики разрешает функция
-    /// `tp_trash_retention_us` в транзакции ящика (папка → учётная запись → домен → организация), здесь —
-    /// значение конфигурации; на другом шарде политик нет — срок учётной записи (учётная запись → домен →
-    /// организация) читается из каталога до транзакции ящика, политика уровня папки не применяется.
-    pub(crate) async fn trash_retention(
+    /// Срок корзины для переноса писем ящика `db` ([`TrashFor`]); `folders` — исходные папки, читаются из
+    /// БД ящика вне её транзакции и только на другом шарде.
+    pub(crate) async fn trash_retention<F, Fut>(
         &self,
         db: &BoxDb,
         scope: AccountScope,
-    ) -> Result<Duration> {
+        folders: F,
+    ) -> Result<TrashFor>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<Uuid>>>,
+    {
         let default = self.cfg.retention.trash_retention;
         if db.shard == ShardId::MAIN {
-            return Ok(default);
+            return Ok(TrashFor {
+                default,
+                folders: Vec::new(),
+            });
         }
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let us: Option<i64> = sqlx::query_scalar("SELECT tp_trash_retention_us($1, $2, NULL)")
+        let folders = &folders().await?;
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let account: Option<i64> =
+                sqlx::query_scalar("SELECT tp_trash_retention_us($1, $2, NULL)")
+                    .bind(scope.tenant.as_uuid())
+                    .bind(scope.account.as_uuid())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            let rows: Vec<(Uuid, Option<i64>)> = sqlx::query_as(
+                "SELECT f.id, tp_trash_retention_us($1, $2, f.id) FROM unnest($3::uuid[]) AS f(id)",
+            )
             .bind(scope.tenant.as_uuid())
             .bind(scope.account.as_uuid())
-            .fetch_one(&mut *tx)
+            .bind(folders)
+            .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-        crate::commits::commit(tx).await?;
-        us.map(from_micros)
-            .transpose()
-            .map(|d| d.unwrap_or(default))
+            crate::commits::commit(tx).await?;
+            let default = account.map(from_micros).transpose()?.unwrap_or(default);
+            let folders = rows
+                .into_iter()
+                .map(|(id, us)| Ok((id, us.map(from_micros).transpose()?.unwrap_or(default))))
+                .collect::<Result<_>>()?;
+            Ok(TrashFor { default, folders })
+        })
+        .await
     }
 }
 

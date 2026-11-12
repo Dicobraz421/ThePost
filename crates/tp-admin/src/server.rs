@@ -47,7 +47,7 @@ use tp_contracts::{Error, Result, TenantId};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
-use crate::audit::{AUDIT_ROUTE, AuditSink};
+use crate::audit::AUDIT_ROUTE;
 use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
@@ -176,7 +176,8 @@ pub struct AdminConfig {
     pub listen: SocketAddr,
     /// Разрешить внешний адрес слушателя (не loopback, не частный, `0.0.0.0`/`::`); по умолчанию — нет (SRS 6.8).
     pub allow_external: bool,
-    /// Экспорт журнала аудита во внешнюю SIEM (syslog, OTLP); по умолчанию выключен.
+    /// Выгрузка журнала аудита из базы во внешнюю SIEM (syslog, OTLP; выполняет роль maintenance узла); по
+    /// умолчанию выключена.
     pub audit: AuditExportConfig,
     /// Первый администратор без OIDC (`thepost admin init`, [`crate::init`]).
     pub init: InitConfig,
@@ -298,10 +299,8 @@ impl Caller {
 pub struct Deps {
     /// Проверка Bearer-токенов (OIDC).
     pub auth: Arc<dyn Authenticator>,
-    /// Журнал аудита: запись и чтение (CTR-25).
+    /// Журнал аудита: запись и чтение (CTR-25); выгрузку в SIEM из него делает [`crate::export`].
     pub audit_log: Arc<dyn AuditLog>,
-    /// Экспорт журнала аудита в SIEM ([`crate::export::Fanout`]; без экспорта — пустой).
-    pub audit: Arc<dyn AuditSink>,
     /// Журнал доставки: поиск.
     pub delivery: Arc<dyn DeliveryLog>,
     /// Группы рассылки и очередь модерации.

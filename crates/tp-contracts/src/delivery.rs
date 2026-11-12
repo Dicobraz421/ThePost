@@ -175,16 +175,13 @@ pub trait DeliveryLog: Send + Sync + 'static {
 
     /// События записи очереди `queue` организации `tenant` по возрастанию `at` (равные — в порядке записи), не более
     /// `limit` (≥ 1, иначе `Error::Invalid`) — статус доставки отправки (JMAP `EmailSubmission.deliveryStatus`, CTR-35;
-    /// связь — `EmailSubmission::queue`). По умолчанию — `Error::Internal`.
+    /// связь — `EmailSubmission::queue`).
     async fn by_queue(
         &self,
         tenant: TenantId,
         queue: QueueId,
         limit: usize,
-    ) -> Result<Vec<DeliveryEvent>> {
-        let _ = (tenant, queue, limit);
-        Err(Error::internal("delivery log does not support by_queue"))
-    }
+    ) -> Result<Vec<DeliveryEvent>>;
 }
 
 #[cfg(test)]

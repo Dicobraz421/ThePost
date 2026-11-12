@@ -4,8 +4,10 @@ use async_trait::async_trait;
 use sqlx::postgres::PgArguments;
 use sqlx::query::QueryAs;
 use sqlx::{FromRow, PgConnection, Postgres};
+use time::OffsetDateTime;
 use tp_contracts::meta::{
-    Account, AccountKind, AccountScope, AccountStore, AccountUpsert, QuotaUsage, account_aliases,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, DisabledAccount,
+    ExistingContent, QuotaUsage, account_aliases,
 };
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use uuid::Uuid;
@@ -50,16 +52,16 @@ fn prefix_next(prefix: &str) -> Option<String> {
 }
 
 #[derive(FromRow)]
-struct AccountRow {
-    account_id: Uuid,
-    tenant_id: Uuid,
-    domain_id: Uuid,
-    login: String,
-    display_name: String,
-    external_id: Option<String>,
-    enabled: bool,
-    aliases: Vec<String>,
-    kind: String,
+pub(crate) struct AccountRow {
+    pub(crate) account_id: Uuid,
+    pub(crate) tenant_id: Uuid,
+    pub(crate) domain_id: Uuid,
+    pub(crate) login: String,
+    pub(crate) display_name: String,
+    pub(crate) external_id: Option<String>,
+    pub(crate) enabled: bool,
+    pub(crate) aliases: Vec<String>,
+    pub(crate) kind: String,
 }
 
 /// Строка `upsert`: учётная запись и её шард.
@@ -373,6 +375,50 @@ impl AccountStore for PgMeta {
             })
         })
         .await
+    }
+
+    /// Состояние и срок хранения — [`crate::account_state`].
+    async fn account_state(&self, tenant: TenantId, id: AccountId) -> Result<AccountState> {
+        self.account_state_of(tenant, id).await
+    }
+
+    async fn disable_account(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        until: OffsetDateTime,
+    ) -> Result<()> {
+        self.set_disabled(tenant, id, Some(until)).await
+    }
+
+    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        self.set_disabled(tenant, id, None).await
+    }
+
+    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
+        self.disabled_of(tenant).await
+    }
+
+    async fn expired_accounts(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<AccountScope>> {
+        self.expired(now, limit).await
+    }
+
+    async fn attach_account(
+        &self,
+        tenant: TenantId,
+        disabled: AccountId,
+        to: AccountId,
+        existing: Option<ExistingContent>,
+    ) -> Result<Account> {
+        self.attach(tenant, disabled, to, existing).await
+    }
+
+    async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        self.remove_disabled_box(tenant, id).await
     }
 }
 

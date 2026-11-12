@@ -76,6 +76,10 @@ impl Transport for TestConn {
     async fn starttls(self) -> Result<Self> {
         Err(Error::invalid("no tls in tests"))
     }
+
+    fn client(&self) -> Option<std::net::IpAddr> {
+        Some(CLIENT_IP)
+    }
 }
 
 pub(crate) struct Env {
@@ -89,7 +93,7 @@ pub(crate) struct Env {
     pub policies: MemPolicies,
     /// Точка принятия решений хранилища и сессии (Legal Hold, доставка).
     pub hook: RecordingDecisionHook,
-    /// Журнал аудита ящиков: подключён к сессиям [`Env::client_ext`] (клиент [`CLIENT_IP`]).
+    /// Журнал аудита ящиков: подключён к сессиям [`Env::ctx`] (клиент [`CLIENT_IP`]).
     pub audit: MemMailboxAudit,
     pub principal: Principal,
     pub config: ImapConfig,
@@ -179,6 +183,7 @@ impl Env {
                 bus: Arc::new(self.bus.clone()),
                 trash: Arc::new(self.trash.clone()),
                 hooks: DecisionHooks::new(vec![Arc::new(self.hook.clone())]),
+                audit: Arc::new(self.audit.clone()),
             },
             shutdown: self.shutdown.clone(),
         })
@@ -192,13 +197,11 @@ impl Env {
     /// Клиент новой сессии с зависимостями расширений.
     pub async fn client_ext(&self, tls: bool, ext: Extensions) -> Client {
         let (server, client) = tokio::io::duplex(1 << 20);
-        let session = Session::new(self.ctx(), TestConn { io: server, tls })
-            .with_extensions(ext)
-            .with_audit(Arc::new(self.audit.clone()), Some(CLIENT_IP));
+        let session = Session::new(self.ctx(), TestConn { io: server, tls }).with_extensions(ext);
         Self::spawn(session, client).await
     }
 
-    /// Клиент новой сессии над заданным контекстом (например, с другой шиной), без аудита.
+    /// Клиент новой сессии над заданным контекстом (например, с другой шиной).
     pub async fn client_ctx(ctx: Arc<SessionCtx>, tls: bool, ext: Extensions) -> Client {
         let (server, client) = tokio::io::duplex(1 << 20);
         let session = Session::new(ctx, TestConn { io: server, tls }).with_extensions(ext);

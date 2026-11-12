@@ -222,7 +222,7 @@ fn openldap_cfg() -> LdapConfig {
     LdapConfig {
         base_dn: "dc=example,dc=org".into(),
         accounts: AccountMap {
-            disabled: Some(DisabledRule {
+            disabled: Some(FlagRule {
                 attribute: "nsAccountLock".into(),
                 value: Some("true".into()),
                 flag: None,
@@ -464,7 +464,7 @@ fn ad_cfg() -> LdapConfig {
             login: "userPrincipalName".into(),
             display_name: "displayName".into(),
             emails: vec!["mail".into(), "proxyAddresses".into()],
-            disabled: Some(DisabledRule {
+            disabled: Some(FlagRule {
                 attribute: "userAccountControl".into(),
                 value: None,
                 flag: Some(2),
@@ -734,6 +734,98 @@ async fn live_ldap() {
     result.expect("live LDAP");
 }
 
+// ---------- Контакты, подразделения, оргатрибуты (AUTH-10) ----------
+
+#[tokio::test]
+async fn contacts_units_and_org() {
+    const PEOPLE: &str = "00000000-0000-0000-0000-0000000000f0";
+    let fake = Fake::new(include_str!("openldap.ldif"));
+    fake.set(
+        "uid=alice,ou=people,dc=example,dc=org",
+        "manager",
+        "UID=carol,ou=people,dc=example,dc=org",
+    );
+    fake.set("uid=alice,ou=people,dc=example,dc=org", "seniority", " 7 ");
+    let mut cfg = openldap_cfg();
+    cfg.contacts = Some(ContactMap {
+        base: Some("ou=contacts,dc=example,dc=org".into()),
+        ..ContactMap::default()
+    });
+    cfg.units = Some(UnitMap::default());
+    cfg.accounts.org = OrgMap {
+        title: Some("title".into()),
+        manager: Some("manager".into()),
+        seniority: Some("seniority".into()),
+    };
+    let dir = LdapDirectory::with_source(T, cfg, fake.clone());
+
+    assert_eq!(
+        dir.units(T).await.expect("units"),
+        [DirUnit {
+            external_id: PEOPLE.into(),
+            name: "people".into(),
+            parent: None,
+        }]
+    );
+    let accounts = upserts(&dir.accounts_since(T, None, 100).await.expect("accounts"));
+    let alice = accounts
+        .iter()
+        .find(|a| a.login == "alice@example.org")
+        .expect("alice");
+    assert_eq!(
+        alice.org,
+        DirOrg {
+            department: Some(PEOPLE.into()),
+            title: Some("Engineer".into()),
+            manager: Some("00000000-0000-0000-0000-0000000000c1".into()),
+            seniority: Some(7),
+        }
+    );
+    let carol = accounts
+        .iter()
+        .find(|a| a.login == "carol@example.org")
+        .expect("carol");
+    assert_eq!(carol.org.manager, None);
+    assert_eq!(carol.org.department.as_deref(), Some(PEOPLE));
+
+    let contacts = dir.contacts_since(T, None, 100).await.expect("contacts");
+    assert_eq!(
+        upserts(&contacts),
+        [DirContact {
+            external_id: "00000000-0000-0000-0000-0000000000c0".into(),
+            display_name: "Vendor Support".into(),
+            email: "support@vendor.example".into(),
+            attributes: BTreeMap::from([("title".into(), "Supplier".into())]),
+        }]
+    );
+    let idle = dir
+        .contacts_since(T, Some(&contacts.next), 100)
+        .await
+        .expect("idle");
+    assert!(idle.changes.is_empty());
+
+    // Контакты не сопоставлены — каталог без контактов.
+    let plain = LdapDirectory::with_source(T, openldap_cfg(), fake);
+    assert!(
+        plain
+            .contacts_since(T, None, 10)
+            .await
+            .expect("none")
+            .changes
+            .is_empty()
+    );
+    assert!(plain.units(T).await.expect("none").is_empty());
+}
+
+#[test]
+fn parent_dn_escaped_comma() {
+    assert_eq!(
+        parent_dn(r"cn=Smith\, John,ou=people,dc=x"),
+        Some("ou=people,dc=x")
+    );
+    assert_eq!(parent_dn("dc=x"), None);
+}
+
 // ---------- Группы рассылки из каталога (AUTH-07) ----------
 
 mod group_sync {
@@ -741,7 +833,7 @@ mod group_sync {
         DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
     };
     use tp_contracts::{AccountId, BlobHash, BlobKey, Gen, HeldId};
-    use tp_testkit::{Clock, MemGroups, SystemClock};
+    use tp_testkit::{Clock, MemAddressBook, MemGroups, SystemClock};
 
     use super::*;
 
@@ -777,6 +869,7 @@ mod group_sync {
         sync: GroupSync,
         fake: Arc<Fake>,
         groups: MemGroups,
+        book: MemAddressBook,
         alice: AccountId,
         carol: AccountId,
     }
@@ -790,10 +883,17 @@ mod group_sync {
         ])
         .await;
         let groups = MemGroups::new();
+        let book = MemAddressBook::new();
         Env {
-            sync: GroupSync::new(dir, Arc::new(meta), Arc::new(groups.clone())),
+            sync: GroupSync::new(
+                dir,
+                Arc::new(meta),
+                Arc::new(groups.clone()),
+                Arc::new(book.clone()),
+            ),
             fake,
             groups,
+            book,
             alice: ids[0],
             carol: ids[1],
         }
@@ -820,6 +920,7 @@ mod group_sync {
             groups,
             alice,
             carol,
+            ..
         } = env(openldap_cfg()).await;
         let full = sync.run(None).await.expect("full");
         assert_eq!((full.upserted, full.removed, full.skipped), (2, 0, 0));
@@ -894,6 +995,60 @@ mod group_sync {
         );
     }
 
+    /// AUTH-10: почтовый контакт-участник группы — по `external_id` в адресной книге; выбыл — группа снимается.
+    #[tokio::test]
+    async fn contact_member() {
+        use tp_contracts::ContactId;
+        use tp_contracts::addressbook::{ContactStore, MailContact};
+
+        const VENDOR_DN: &str = "cn=vendor,ou=contacts,dc=example,dc=org";
+        let cfg = LdapConfig {
+            contacts: Some(ContactMap {
+                base: Some("ou=contacts,dc=example,dc=org".into()),
+                ..ContactMap::default()
+            }),
+            ..openldap_cfg()
+        };
+        let Env {
+            sync,
+            fake,
+            groups,
+            book,
+            ..
+        } = env(cfg).await;
+        let vendor = MailContact {
+            id: ContactId::new(),
+            tenant: T,
+            display_name: "Vendor".into(),
+            email: "support@vendor.example".into(),
+            external_id: Some("00000000-0000-0000-0000-0000000000c0".into()),
+            attributes: BTreeMap::new(),
+            groups: Vec::new(),
+            hidden_from_gal: false,
+        };
+        book.put_contact(vendor.clone()).await.expect("contact");
+        fake.set_all(DEVS_DN, "member", &[ALICE_DN, VENDOR_DN]);
+        let full = sync.run(None).await.expect("full");
+        let devs = group(&groups, DEVS).await;
+        let got = |book: MemAddressBook| async move {
+            book.contact(T, vendor.id)
+                .await
+                .expect("contact")
+                .expect("some")
+                .groups
+        };
+        assert_eq!(got(book.clone()).await, [devs.id]);
+        assert_eq!(
+            book.group_contacts(T, devs.id).await.expect("expand").len(),
+            1
+        );
+
+        fake.set_all(DEVS_DN, "member", &[ALICE_DN]);
+        fake.set(DEVS_DN, "modifyTimestamp", "20261005000000Z");
+        sync.run(Some(&full.cursor)).await.expect("incremental");
+        assert!(got(book.clone()).await.is_empty());
+    }
+
     /// Приёмка CTR-32: участник-учётная запись — по идентификатору каталога; переименование входа не теряет
     /// членство. Имя входа — только для учётной записи без `external_id`.
     #[tokio::test]
@@ -927,7 +1082,12 @@ mod group_sync {
             .expect("carol")
             .id;
         let groups = MemGroups::new();
-        let sync = GroupSync::new(dir, Arc::new(meta.clone()), Arc::new(groups.clone()));
+        let sync = GroupSync::new(
+            dir,
+            Arc::new(meta.clone()),
+            Arc::new(groups.clone()),
+            Arc::new(MemAddressBook::new()),
+        );
         let full = sync.run(None).await.expect("full");
         assert_eq!(
             group(&groups, DEVS).await.members,
@@ -996,6 +1156,7 @@ mod group_sync {
             groups,
             alice,
             carol,
+            ..
         } = env(cfg.clone()).await;
         fake.set(STAFF_DN, "tpHidden", "true");
         fake.set(STAFF_DN, "tpModerator", CAROL_DN);

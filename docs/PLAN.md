@@ -12,8 +12,8 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 160/249 | 234/359 | в работе, 65 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
-| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 14/101 | 35/173 | в работе, 20 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 161/254 | 235/364 | в работе, 65 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 14/105 | 35/177 | в работе, 20 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/2 | 0/2 | не начат | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
 
@@ -65,7 +65,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
    - Ручная проверка подписанного профиля `.mobileconfig` на iPhone и Mac — `docs/manual-tests/JMAP-22.md` на бете (JMAP-22, APP-23).
    - Хвосты облачных волн 12.11, п. 26–55: FIX-01…03 (срочно, выше); `imap-11` (зерно фазз-тестов), `platform-19` (ACME с
      `tls.key`, брошенные ожидания соединения), `cluster-12` (смена ключа межузлового канала без перезапуска), `auth-12` и
-     `admin-19` (ключ TLS LDAP, OIDC и syslog аудита из OpenBao); `platform-21` (PLT-32, доверенные подсети `ratelimit.trusted`).
+     `admin-19` (ключ TLS LDAP, OIDC и syslog аудита из OpenBao); `platform-21` (PLT-32, доверенные подсети `ratelimit.trusted`); `contracts-51` → `smtp-24` (лимит «получателей в час»), `ci-11` → `deploy-36` (тег версии образа, закрытый ghcr).
    - Аудит 12.11 «старое рядом с новым не оставлять» (решения 93–108). Сначала — разное поведение на живом узле:
      `console-07` → `admin-22` (один API доменов); `smtp-20` (перебор AUTH — только `AbuseGuard`); `deploy-31`, `app-47` →
      `smtp-21` (локальные домены — только принятые; политика в SMTP); `contracts-46` → `meta-44` → `admin-23` (журнал аудита
@@ -521,8 +521,13 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | admin-22 (ветка `x/admin-22`) | ADM-33 | B | console-07 | 3 |
 | smtp-20 | SMTP-41 | A | — | 4 |
 | deploy-31 | DEP-42, DEP-44 | A | — | 4 |
+| ci-11 (ветка `x/ci-11`) | CI-13 | B | ci-01 | 4 |
+| deploy-36 | DEP-50 | A | ci-11 | 4 |
 | app-47 | APP-54 | A | — | 2 |
 | contracts-46 (ветка `x/contracts-46`) | CTR-25, CTR-67, CTR-68, CTR-70 | B | contracts-37 | 1 |
+| contracts-51 (ветка `x/contracts-51`) | CTR-79 | B | contracts-46 | 1 |
+| smtp-24 | SMTP-43 | A | contracts-51 | 1 |
+| ✅ smtp-25 | SMTP-44 | A | smtp-24 | 1 |
 | meta-44 | META-70 | A | contracts-46 | 3 |
 | admin-23 (ветка `x/admin-23`) | ADM-34, ADM-36 | A/B | meta-44, admin-22 | 3 |
 | app-53 | APP-59 | A | admin-23 | 2 |
@@ -641,7 +646,11 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | admin-20 | ADM-30, ADM-31 | A | admin-17, admin-13, ci-06 | 3 |
 | contracts-44 (ветка `x/contracts-44`) | CTR-63, CTR-64 | B | — | 1 |
 | meta-42 | META-66, META-67 | A | contracts-44 | 3 |
-| mailstore-12 | MS-19 | A | — | 1 |
+| contracts-52 (ветка `x/contracts-52`) | CTR-80 | B | contracts-23 | 1 |
+| mailstore-12 | MS-19 | A | contracts-52 | 1 |
+| contracts-53 (ветка `x/contracts-53`) | CTR-81 | B | — | 3 |
+| imap-13 | IMAP-23 | A | contracts-53 | 3 |
+| jmap-26 | JMAP-43 | A | contracts-53 | 3 |
 | admin-21 | ADM-32 | A | contracts-44, mailstore-12, admin-13 | 3 |
 | imap-12 | IMAP-22 | A | contracts-44 | 2 |
 | jmap-24 | JMAP-41 | A | contracts-44 | 3 |

@@ -242,7 +242,7 @@ Relay, Dsn }`, `DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, H
 `DeliveryLog`: `record(event)`, `record_batch(Vec<_>)` (по умолчанию — по одной), `search(tenant, &DeliveryQuery) -> DeliveryPage
 { events, next: Option<DeliveryCursor> }`, `purge(before)` — по всем организациям (maintenance), можно целыми сутками-секциями.
 `by_queue(tenant, QueueId, limit)` (CTR-35) — события записи очереди по `at` (равные — в порядке записи), `limit ≥ 1`: статус доставки
-отправки JMAP (`EmailSubmission.deliveryStatus`, связь — `EmailSubmission::queue`); по умолчанию — `Internal`, набор `suite::delivery_by_queue`.
+отправки JMAP (`EmailSubmission.deliveryStatus`, связь — `EmailSubmission::queue`); обязателен, набор `suite::delivery_by_queue`.
 `DeliveryQuery { sender, recipient, message_id, since, until, limit, after }`: условия по «и», адреса — точно без учёта регистра ASCII,
 Message-ID — точно, интервал `[since, until)`; `validate()` (`limit ≥ 1`, непустой интервал) и `matches(&event)` — в контракте;
 порядок — по `at`, равные — в порядке записи; некорректный запрос или позиция — `Invalid`. Срок хранения (по умолчанию 30 суток) —
@@ -309,6 +309,8 @@ CTR-35: `DirAccount::org: DirOrg { department (external_id подразделе�
 синхронизации до подтверждения: `hold_sync(tenant, removed, total, at) -> MassRemoval { removed, total, detected_at, approved }` (подтверждение
 сохраняется, если `removed` не выросло), `pending_sync`, `approve_sync` (нет — `NotFound`; Admin API), `clear_sync` (синхронизация после
 отключения). In-memory — `MemSyncGate`; набор `suite::sync_gate`.
+CTR-58 (решение 79): `DirAccount::hidden_from_gal: bool` (`#[serde(default)]`, как у групп и почтовых контактов) — запись не попадает
+в адресную книгу (GAL), вход и приём почты не меняются. Заполняет каталог (LDAP — AUTH-16), учитывает построение GAL (DAV-27).
 
 ## AddressBook
 SRS 4.5, 5.1, решение 2026-11-04-exchange-parity (CTR-35; код — `addressbook.rs`). Ids — `ContactId`, `OrgUnitId`. Состояние учётной записи
@@ -359,8 +361,12 @@ SRS 5.2, 6.8, решение 98 (CTR-25; код — `admin_audit.rs`). Журн�
 content_messages? }` — без тела запроса и секретов. `AuditLog`: `append(&record) -> seq` (номер ≥ 1, растёт в порядке добавления);
 `search(tenant, &AdminAuditQuery { since?, until?, limit ≥ 1, after? }) -> AdminAuditPage { entries: Vec<AdminAuditEntry { seq, record }>,
 next? }` — только записи организации (без уровня инсталляции), по возрастанию `seq`, `at` в [`since`, `until`), `next` — у полной страницы;
-`AdminAuditQuery::validate` (неверный — `Invalid`). In-memory — `MemAuditLog` (`entries`); набор `suite::admin_audit_log`. PostgreSQL
-(таблица `audit_log`, META-22) — META-70; запись и `GET …/audit` — Admin API (ADM-34), экспорт в SIEM — там же.
+`AdminAuditQuery::validate` (неверный — `Invalid`). Выгрузка в SIEM (решение владельца 12.11: база + выгрузка из неё, APP-59):
+`export_page(after, limit ≥ 1) -> Vec<AdminAuditEntry>` — все записи (и уровень инсталляции) с `seq > after` по возрастанию; видимые записи —
+непрерывный префикс порядка добавления (меньший номер не появляется после бо́льшего); `export_mark(sink) -> seq` (0 — ничего не доставлено),
+`advance_export_mark(sink, from, to) -> bool` — сдвиг, только если отметка всё ещё `from` (`to > from`, иначе `Invalid`; `check_export_mark`).
+In-memory — `MemAuditLog` (`entries`); набор `suite::admin_audit_log`. PostgreSQL (таблицы `audit_log`, META-22, и `audit_export`, APP-59) —
+META-70; запись и `GET …/audit` — Admin API (ADM-34); выгрузка — роль maintenance узла под лизой (APP-59).
 
 ## Auth
 SRS 5.1. `Authenticator`: `verify(Credentials, peer: Option<IpAddr>) -> Result<Principal>` (неверные данные — `Forbidden`);
@@ -554,8 +560,8 @@ queue) -> state` (`Final` со статусами; отменённая — `Con
 after })` (RFC 8621 §7.3; `threadIds` вызывающий переводит в `email_ids`; по `send_at`, `id`; по умолчанию — `list` с фильтром),
 `submission_changes(scope, since, limit) -> SubmissionChanges { created, updated, destroyed, new_state, has_more }` (созданные и удалённые после
 `since` не входят; неизвестное или устаревшее состояние — `Conflict` = `cannotCalculateChanges`; `limit = 0` — `Invalid`), `expire_submissions(before,
-limit) -> usize` — срок хранения: `Final` и `Canceled` с `send_at < before` всех организаций (maintenance; срок — конфигурация); оба — по
-умолчанию `Internal`. Набор `suite::submission_query`. Далее: meta (таблица, RLS), smtp (выпуск по сроку, отмена), jmap (`maxDelayedSend`,
+limit) -> usize` — срок хранения: `Final` и `Canceled` с `send_at < before` всех организаций (maintenance; срок — конфигурация); оба
+обязательны. Набор `suite::submission_query`. Далее: meta (таблица, RLS), smtp (выпуск по сроку, отмена), jmap (`maxDelayedSend`,
 `EmailSubmission/get|set|query|queryChanges`).
 
 ## Trash, Retention, Quota (Ф1)
@@ -883,6 +889,8 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (очередь со сроком выпуска, отмена до выпуска), `SubmissionStore::{query_submissions, submission_changes, expire_submissions}`,
   `SubmissionFilter`, `SubmissionChanges`; описание потока в `submission.rs` (воркер `due` только фиксирует наступившие). In-memory —
   `MemOutbound` (`Scheduled`, `release`), `MemSubmissions` (журнал изменений); наборы `suite::{submission_query, outbound_schedule}`.
+- 2026-11-12 — x/jmap-08: `SubmissionStore::{submission_changes, expire_submissions}` и `DeliveryLog::by_queue` — обязательные (тела
+  по умолчанию с `Internal` удалены); реализации — `tp-meta` (PostgreSQL), `MemSubmissions`, `MemDeliveryLog`.
 - 2026-11-11 — CTR-43 (x/contracts-31, решение 2026-11-11-stage2-followups п. 9): очередь модерации и для правил потока почты —
   `HeldMessage::{group: Option<_>, source: HoldSource, moderators: Vec<Moderator>, recipients}`, `HeldMessage::validate`,
   `Moderation::deliver(.., Option<&DistributionGroup>, ..)` (без группы — исходным получателям), `check_delivery` для обоих случаев. In-memory —
@@ -942,17 +950,20 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   по цепочке организация → домен → ящик, `Policy::DEFAULT_RCPTS_PER_HOUR` = 2000, `rcpts_per_hour_or_default()`; потребитель — SMTP
   (SMTP-43). Хранение — столбец `policies.rcpts_per_hour` (миграция 0026), Admin API — поле `rcpts_per_hour` политики уровня. Код,
   собирающий `Policy` перечислением всех полей, дополняется `rcpts_per_hour`.
+- 2026-11-12 — CTR-58 (волна contracts-40, решение 79): `DirAccount::hidden_from_gal` (`#[serde(default)]`) — учётная запись скрыта
+  из адресной книги без запрета входа. Код, собирающий `DirAccount` перечислением всех полей, дополняется `hidden_from_gal` (в репозитории —
+  `tp-auth` и тесты `tp-testkit`, `tp-dav`, `tp-smtp`: `false`); чтение признака из LDAP — AUTH-16, фильтр GAL — DAV-27.
 - 2026-11-12 — CTR-53 (волна contracts-38): `Account::aliases`, `AccountUpsert::aliases` и `Account::addresses()` — адреса учётной
   записи (основной и псевдонимы каталога без catch-all); правила — `meta::account_addresses`, `meta::account_aliases`. Несовместимо:
-  новые обязательные поля `Account` и `AccountUpsert`. `tp-meta` — миграция 0028 (`accounts.aliases`).
+  новые обязательные поля `Account` и `AccountUpsert`. `tp-meta` — миграция 0030 (`accounts.aliases`).
 - 2026-11-12 — CTR-55 (волна contracts-38): `GroupStore::held(tenant, group, after, limit)` — очередь модерации страницами по курсору
   `HeldCursor { held_at, id }`; правило страницы — `groups::held_page`. Несовместимо: новый параметр `after` у `held`.
 - 2026-11-12 — CTR-54 (волна contracts-38): `DavStore::move_object` и `MoveOutcome`/`Moved` — перенос объекта между коллекциями с
   сохранением `id`; поиск контактов — `ObjectIndex::search: CardSearch` (пишется `put_object`) и `DavStore::find_cards`. Несовместимо:
-  оба метода обязательны для реализаций, новое поле `ObjectIndex`. `tp-meta` — миграция 0028 (`dav_objects.search`, `placed_modseq`).
+  оба метода обязательны для реализаций, новое поле `ObjectIndex`. `tp-meta` — миграция 0030 (`dav_objects.search`, `placed_modseq`).
 - 2026-11-12 — CTR-56 (волна contracts-38): поля `Collection` — `is_default`, `subscribed`, `visible`, `alerts_with_time`,
   `alerts_without_time`; признак по умолчанию переносится записью коллекции (`create_collection`, `update_collection`), правило
-  выбора — `dav::default_of`. Несовместимо: новые поля `Collection`. `tp-meta` — миграция 0028 (столбцы `dav_collections`).
+  выбора — `dav::default_of`. Несовместимо: новые поля `Collection`. `tp-meta` — миграция 0030 (столбцы `dav_collections`).
 - 2026-11-12 — CTR-57 (волна contracts-39): адрес клиента в проверке учётных данных — параметр `peer` у `Authenticator::verify` и поле
   `SaslContext::peer`. Несовместимо: новая сигнатура `verify`, новое поле `SaslContext`; все реализации и вызовы (`tp-auth`, `tp-imap`,
   `tp-smtp`, `tp-sieve`, `tp-jmap`, `tp-dav`, `tp-admin`, `tp-testkit`, `thepost`) переведены в том же PR; сервер HTTP
@@ -960,5 +971,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-48 (волна contracts-35): раздел Sharing, модуль `sharing` — `CollectionRights`, `CollectionAcl` (права на коллекции,
   `shared_with`), представители (`Delegate`, `DelegateStore`), ресурсы (`AccountKind`, `BookingPolicy::decide`, `ResourceStore`), политика
   организации (`SharingPolicy`, `SharingPolicyStore`). Вид учётной записи — поле `Account::kind` и `AccountUpsert::kind`
-  (`meta::AccountKind`), хранится с учётной записью (`tp-meta` — миграция 0029 `accounts.kind`, `tp-testkit`); несовместимо: новые
+  (`meta::AccountKind`), хранится с учётной записью (`tp-meta` — миграция 0031 `accounts.kind`, `tp-testkit`); несовместимо: новые
   обязательные поля `Account` и `AccountUpsert`. Реализации новых хранилищ в памяти и наборы — отдельной волной `tp-testkit`.

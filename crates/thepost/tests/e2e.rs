@@ -38,7 +38,8 @@ use tp_contracts::ext::{DecisionHooks, Migration, Module, ModuleCtx, Registry};
 use tp_contracts::ids::DomainId;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{
-    AccountKind, AccountScope, AccountStore, AccountUpsert, MessageStore, Policy,
+    AccountKind, AccountScope, AccountStore, AccountUpsert, MessageStore, Policy, PolicyStore,
+    PolicyTarget,
 };
 use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
@@ -112,7 +113,12 @@ fn config(dir: &Path, db_url: &str, domain: &str) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/all.yaml"),
     )
     .expect("deploy/config/all.yaml");
-    let base = without_sections(&all, &["domain", "database", "blob", "secrets", "http"]);
+    let base = without_sections(
+        &all,
+        &[
+            "domain", "database", "blob", "secrets", "http", "tls", "smtp", "imap",
+        ],
+    );
     assert!(base.contains("roles: [all]"), "{base}");
     let path = |p: PathBuf| p.display().to_string().replace('\\', "/");
     format!(
@@ -874,7 +880,7 @@ async fn mvp_mail_flow() {
     };
     meta.set_policy(
         tenant,
-        tp_meta::retention::PolicyTarget::Tenant,
+        PolicyTarget::Tenant,
         &Policy {
             trash_purge: Some(erase),
             ..Policy::default()
@@ -994,7 +1000,7 @@ async fn mvp_mail_flow() {
     // удалённое в корзину, окончательно удаляет воркер истечения узла.
     meta.set_policy(
         tenant,
-        tp_meta::retention::PolicyTarget::Tenant,
+        PolicyTarget::Tenant,
         &Policy {
             trash_purge: Some(erase),
             trash_retention: Some(Duration::from_secs(2)),
