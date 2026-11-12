@@ -74,8 +74,7 @@ PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamA
 
    | `thepost_tls_mode` | Сертификат |
    |---|---|
-   | `certbot` (по умолчанию) | Let's Encrypt; порт 80 открыт, DNS имени сервера указывает на ВМ |
-   | `acme` | Let's Encrypt встроенным клиентом The Post |
+   | `acme` (по умолчанию) | Let's Encrypt встроенным клиентом The Post; порт 80 открыт, DNS имени сервера указывает на ВМ; ключ — в OpenBao |
    | `files` | свои файлы PEM: `thepost_tls_cert_src`, `thepost_tls_key_src` |
    | `internal` | внутренний центр сертификации — только для стенда |
 
