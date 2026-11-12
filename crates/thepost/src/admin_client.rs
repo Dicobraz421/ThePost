@@ -23,11 +23,11 @@ use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tp_admin::AdminRole;
-use tp_admin::accounts::{AccountInfo, AccountQuery, NewAccount};
+use tp_admin::accounts::{AccountInfo, AccountPatch, AccountQuery, NewAccount};
 use tp_admin::app_passwords::{AppPasswordInfo, IssuedAppPassword, NewAppPassword};
 use tp_admin::init::AdminSession;
 use tp_admin::server::{Problem, WhoAmI};
-use tp_admin::sieve::{Script, ScriptBody, ScriptProblem, ScriptText};
+use tp_admin::sieve::{Script, ScriptBody, ScriptProblem, ScriptText, VacationBody};
 use tp_admin::transport::{DomainBody, DomainList, DomainWritten, VersionQuery, Written};
 use tp_contracts::admin_token::is_local_admin_token;
 use tp_contracts::transport::{AcceptedDomain, DomainKind};
@@ -116,6 +116,12 @@ pub enum ApiAction {
         #[command(subcommand)]
         action: SieveAction,
     },
+    /// Автоответ учётной записи: просмотр, включение и выключение за пользователя.
+    Vacation {
+        /// Действие.
+        #[command(subcommand)]
+        action: Box<VacationAction>,
+    },
 }
 
 /// Действия с учётными записями.
@@ -145,6 +151,24 @@ pub enum AccountAction {
     Get {
         /// Идентификатор (UUID) или имя входа.
         account: String,
+    },
+    /// Блокировка входа локальной учётной записи: новый вход запрещён, открытые сеансы не разрываются.
+    /// Запись каталога блокируется в каталоге (ответ 409).
+    Block {
+        /// Идентификатор (UUID) или имя входа.
+        account: String,
+    },
+    /// Снятие блокировки входа локальной учётной записи.
+    Unblock {
+        /// Идентификатор (UUID) или имя входа.
+        account: String,
+    },
+    /// Смена отображаемого имени локальной учётной записи (у записи каталога — 409).
+    Rename {
+        /// Идентификатор (UUID) или имя входа.
+        account: String,
+        /// Новое отображаемое имя (непустое, одна строка).
+        name: String,
     },
 }
 
@@ -230,6 +254,74 @@ pub enum SieveAction {
         /// Учётная запись: идентификатор (UUID) или имя входа.
         account: String,
     },
+    /// Удаление скрипта; активный не удаляется (409) — сначала `sieve deactivate`.
+    Delete {
+        /// Учётная запись: идентификатор (UUID) или имя входа.
+        account: String,
+        /// Имя скрипта (из `sieve list`).
+        name: String,
+    },
+    /// Скрипт организации: выполняется при доставке каждого письма до скрипта пользователя.
+    Org {
+        /// Действие.
+        #[command(subcommand)]
+        action: OrgSieveAction,
+    },
+}
+
+/// Действия со скриптом организации (решение 76); каждое изменение — в журнале аудита Admin API.
+#[derive(Debug, Clone, Subcommand)]
+pub enum OrgSieveAction {
+    /// Текст скрипта организации (в stdout — как записан); не задан — 404.
+    Get,
+    /// Запись скрипта организации: текст проверяется до записи.
+    ///
+    /// Скрипты организации и пользователя выполняются подряд, их действия копятся. Запрещающее правило
+    /// организации пишите как `discard; stop;` — после одного `discard;` скрипт пользователя всё равно
+    /// выполнится, и его `keep` отменит запрет.
+    Put {
+        /// Файл с текстом скрипта (UTF-8); `-` — stdin.
+        #[arg(long, value_name = "ПУТЬ")]
+        file: PathBuf,
+    },
+    /// Удаление скрипта организации; повторное удаление — не ошибка.
+    Delete,
+}
+
+/// Действия с автоответом учётной записи (модель JMAP VacationResponse); каждое изменение — в журнале аудита.
+#[derive(Debug, Clone, Subcommand)]
+pub enum VacationAction {
+    /// Автоответ учётной записи; не задан — выключен.
+    Get {
+        /// Учётная запись: идентификатор (UUID) или имя входа.
+        account: String,
+    },
+    /// Включение автоответа (`--off` — выключение). Незаданные параметры остаются прежними.
+    Set {
+        /// Учётная запись: идентификатор (UUID) или имя входа.
+        account: String,
+        /// Выключить автоответ; текст, тема и срок сохраняются.
+        #[arg(long)]
+        off: bool,
+        /// Начало действия, RFC 3339 (например, 2026-12-01T00:00:00Z); `-` — сразу.
+        #[arg(long, value_name = "ВРЕМЯ")]
+        from: Option<String>,
+        /// Конец действия (не включая), RFC 3339; `-` — бессрочно.
+        #[arg(long, value_name = "ВРЕМЯ")]
+        to: Option<String>,
+        /// Тема ответа; `-` — по умолчанию («Автоответ: <тема письма>»).
+        #[arg(long)]
+        subject: Option<String>,
+        /// Текст ответа.
+        #[arg(long, conflicts_with = "text_file")]
+        text: Option<String>,
+        /// Файл с текстом ответа (UTF-8); `-` — stdin.
+        #[arg(long, value_name = "ПУТЬ")]
+        text_file: Option<PathBuf>,
+        /// Файл с текстом ответа HTML (UTF-8).
+        #[arg(long, value_name = "ПУТЬ")]
+        html_file: Option<PathBuf>,
+    },
 }
 
 /// Операция Admin API: метод и шаблон пути, как в спецификации OpenAPI.
@@ -267,6 +359,11 @@ pub const ACCOUNT_GET: Op = Op {
     path: "/api/v1/orgs/{org}/accounts/{account}",
 };
 /// Пароли приложений учётной записи.
+/// Изменение учётной записи: отображаемое имя, блокировка входа.
+pub const ACCOUNT_PATCH: Op = Op {
+    method: "PATCH",
+    path: "/api/v1/orgs/{org}/accounts/{account}",
+};
 pub const APP_PASSWORD_LIST: Op = Op {
     method: "GET",
     path: "/api/v1/orgs/{org}/accounts/{account}/app-passwords",
@@ -321,6 +418,36 @@ pub const SIEVE_DEACTIVATE: Op = Op {
     method: "POST",
     path: "/api/v1/orgs/{org}/accounts/{account}/sieve/deactivate",
 };
+/// Удаление скрипта (активный — 409).
+pub const SIEVE_DELETE: Op = Op {
+    method: "DELETE",
+    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}",
+};
+/// Автоответ учётной записи.
+pub const VACATION_GET: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/accounts/{account}/vacation",
+};
+/// Замена автоответа учётной записи целиком.
+pub const VACATION_PUT: Op = Op {
+    method: "PUT",
+    path: "/api/v1/orgs/{org}/accounts/{account}/vacation",
+};
+/// Скрипт организации.
+pub const ORG_SIEVE_GET: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/sieve",
+};
+/// Запись скрипта организации.
+pub const ORG_SIEVE_PUT: Op = Op {
+    method: "PUT",
+    path: "/api/v1/orgs/{org}/sieve",
+};
+/// Удаление скрипта организации.
+pub const ORG_SIEVE_DELETE: Op = Op {
+    method: "DELETE",
+    path: "/api/v1/orgs/{org}/sieve",
+};
 
 /// Все операции клиента (сверка со спецификацией OpenAPI — тест).
 pub const OPERATIONS: &[Op] = &[
@@ -329,6 +456,7 @@ pub const OPERATIONS: &[Op] = &[
     ACCOUNT_FIND,
     ACCOUNT_CREATE,
     ACCOUNT_GET,
+    ACCOUNT_PATCH,
     APP_PASSWORD_LIST,
     APP_PASSWORD_CREATE,
     APP_PASSWORD_REVOKE,
@@ -340,6 +468,12 @@ pub const OPERATIONS: &[Op] = &[
     SIEVE_PUT,
     SIEVE_ACTIVATE,
     SIEVE_DEACTIVATE,
+    SIEVE_DELETE,
+    VACATION_GET,
+    VACATION_PUT,
+    ORG_SIEVE_GET,
+    ORG_SIEVE_PUT,
+    ORG_SIEVE_DELETE,
 ];
 
 /// Результат команды: текст для stdout или сообщение об ошибке.
@@ -733,6 +867,30 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                         .await?;
                     out(args, &a, account_record(&a))
                 }
+                AccountAction::Block { account } => {
+                    let patch = AccountPatch {
+                        enabled: Some(false),
+                        ..AccountPatch::default()
+                    };
+                    let a = patch_account(client, &org, &account, &patch).await?;
+                    out(args, &a, account_record(&a))
+                }
+                AccountAction::Unblock { account } => {
+                    let patch = AccountPatch {
+                        enabled: Some(true),
+                        ..AccountPatch::default()
+                    };
+                    let a = patch_account(client, &org, &account, &patch).await?;
+                    out(args, &a, account_record(&a))
+                }
+                AccountAction::Rename { account, name } => {
+                    let patch = AccountPatch {
+                        display_name: Some(name),
+                        ..AccountPatch::default()
+                    };
+                    let a = patch_account(client, &org, &account, &patch).await?;
+                    out(args, &a, account_record(&a))
+                }
             }
         }
         ApiAction::AppPassword { action } => {
@@ -918,9 +1076,157 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                         .await?;
                     out(args, &(), "Правила отключены.\n".to_owned())
                 }
+                SieveAction::Delete { account, name } => {
+                    let id = account_id(client, &org, &account).await?;
+                    client
+                        .call_empty(
+                            SIEVE_DELETE,
+                            &[org.as_str(), id.as_str(), name.as_str()],
+                            &[],
+                            NO_BODY,
+                        )
+                        .await?;
+                    out(args, &(), format!("Скрипт {name} удалён.\n"))
+                }
+                SieveAction::Org { action } => match action {
+                    OrgSieveAction::Get => {
+                        let script: ScriptText = client
+                            .call(ORG_SIEVE_GET, &[org.as_str()], &[], NO_BODY)
+                            .await?;
+                        let text = script.text.clone();
+                        out(args, &script, text)
+                    }
+                    OrgSieveAction::Put { file } => {
+                        let body = ScriptText {
+                            text: script_text(file).await?,
+                        };
+                        client
+                            .call_empty(ORG_SIEVE_PUT, &[org.as_str()], &[], Some(&body))
+                            .await?;
+                        out(args, &(), "Скрипт организации записан.\n".to_owned())
+                    }
+                    OrgSieveAction::Delete => {
+                        client
+                            .call_empty(ORG_SIEVE_DELETE, &[org.as_str()], &[], NO_BODY)
+                            .await?;
+                        out(args, &(), "Скрипт организации удалён.\n".to_owned())
+                    }
+                },
+            }
+        }
+        ApiAction::Vacation { action } => {
+            let org = org(client, args).await?;
+            match *action {
+                VacationAction::Get { account } => {
+                    let id = account_id(client, &org, &account).await?;
+                    let v: VacationBody = client
+                        .call(VACATION_GET, &[org.as_str(), id.as_str()], &[], NO_BODY)
+                        .await?;
+                    out(args, &v, vacation_record(&v))
+                }
+                VacationAction::Set {
+                    account,
+                    off,
+                    from,
+                    to,
+                    subject,
+                    text,
+                    text_file,
+                    html_file,
+                } => {
+                    let text = match text_file {
+                        Some(file) => Some(script_text(file).await?),
+                        None => text,
+                    };
+                    let html = match html_file {
+                        Some(file) => Some(script_text(file).await?),
+                        None => None,
+                    };
+                    let id = account_id(client, &org, &account).await?;
+                    let params = [org.as_str(), id.as_str()];
+                    let current: VacationBody =
+                        client.call(VACATION_GET, &params, &[], NO_BODY).await?;
+                    let change = VacationChange {
+                        enabled: !off,
+                        from,
+                        to,
+                        subject,
+                        text,
+                        html,
+                    };
+                    let body = change.apply(&current)?;
+                    let v: VacationBody =
+                        client.call(VACATION_PUT, &params, &[], Some(&body)).await?;
+                    out(args, &v, vacation_record(&v))
+                }
             }
         }
     }
+}
+
+/// Параметры `vacation set`: `None` — поле без изменений, `-` — сброс (`from`, `to`, `subject`).
+struct VacationChange {
+    enabled: bool,
+    from: Option<String>,
+    to: Option<String>,
+    subject: Option<String>,
+    text: Option<String>,
+    html: Option<String>,
+}
+
+impl VacationChange {
+    /// Автоответ `current` с изменениями; время разбирает сама структура tp-admin (RFC 3339).
+    fn apply(self, current: &VacationBody) -> CliResult<VacationBody> {
+        let mut v = serde_json::to_value(current).map_err(|e| e.to_string())?;
+        v["enabled"] = self.enabled.into();
+        let reset = |s: String| {
+            if s == "-" {
+                serde_json::Value::Null
+            } else {
+                s.into()
+            }
+        };
+        for (field, value) in [
+            ("from", self.from.map(reset)),
+            ("to", self.to.map(reset)),
+            ("subject", self.subject.map(reset)),
+            ("text_body", self.text.map(Into::into)),
+            ("html_body", self.html.map(Into::into)),
+        ] {
+            if let Some(value) = value {
+                v[field] = value;
+            }
+        }
+        serde_json::from_value(v).map_err(|e| {
+            format!("автоответ: {e} (время — RFC 3339, например 2026-12-01T00:00:00Z)")
+        })
+    }
+}
+
+/// Автоответ — строки «подпись: значение».
+fn vacation_record(v: &VacationBody) -> String {
+    let field = |name: &str| or_dash(&json_field(v, name));
+    record(&[
+        ("Включён", if v.enabled { "да" } else { "нет" }.to_owned()),
+        ("С", field("from")),
+        ("По", field("to")),
+        ("Тема", field("subject")),
+        ("Текст", field("text_body")),
+        ("Текст HTML", field("html_body")),
+    ])
+}
+
+/// `PATCH` учётной записи `account` (идентификатор или имя входа).
+async fn patch_account(
+    client: &Client,
+    org: &str,
+    account: &str,
+    patch: &AccountPatch,
+) -> CliResult<AccountInfo> {
+    let id = account_id(client, org, account).await?;
+    client
+        .call(ACCOUNT_PATCH, &[org, id.as_str()], &[], Some(patch))
+        .await
 }
 
 /// Текст скрипта из файла `file` (`-` — stdin); чтение — вне потоков async.
@@ -1159,7 +1465,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tp_admin::{AdminConfig, AdminRole, Deps, InitRequest, RoleBinding};
     use tp_contracts::auth::Principal;
     use tp_contracts::ext::DecisionHooks;
@@ -1262,6 +1568,32 @@ mod tests {
             ],
             &["thepost", "admin", "sieve", "activate", "a@b.test", "main"],
             &["thepost", "admin", "sieve", "deactivate", "a@b.test"],
+            &["thepost", "admin", "sieve", "delete", "a@b.test", "main"],
+            &["thepost", "admin", "sieve", "org", "get"],
+            &["thepost", "admin", "sieve", "org", "put", "--file", "-"],
+            &["thepost", "admin", "sieve", "org", "delete", "--json"],
+            &["thepost", "admin", "vacation", "get", "a@b.test"],
+            &["thepost", "admin", "vacation", "set", "a@b.test", "--off"],
+            &[
+                "thepost",
+                "admin",
+                "vacation",
+                "set",
+                "a@b.test",
+                "--from",
+                "2026-12-01T00:00:00Z",
+                "--to",
+                "-",
+                "--subject",
+                "Отпуск",
+                "--text-file",
+                "-",
+                "--html-file",
+                "a.html",
+            ],
+            &["thepost", "admin", "account", "block", "a@b.test"],
+            &["thepost", "admin", "account", "unblock", "a@b.test"],
+            &["thepost", "admin", "account", "rename", "a@b.test", "Анна"],
             &["thepost", "admin", "account", "list", "--login", "a@b.test"],
             &["thepost", "admin", "account", "list"],
             &[
@@ -1281,6 +1613,21 @@ mod tests {
             &["thepost", "admin", "account", "list", "--limit", "0"],
             &["thepost", "admin", "sieve", "put", "a@b.test", "main"],
             &["thepost", "admin", "sieve", "activate", "a@b.test"],
+            &["thepost", "admin", "sieve", "delete", "a@b.test"],
+            &["thepost", "admin", "sieve", "org", "put"],
+            &["thepost", "admin", "vacation", "set"],
+            &[
+                "thepost",
+                "admin",
+                "vacation",
+                "set",
+                "a@b.test",
+                "--text",
+                "а",
+                "--text-file",
+                "-",
+            ],
+            &["thepost", "admin", "account", "rename", "a@b.test"],
         ] {
             assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
         }
@@ -1935,5 +2282,228 @@ mod tests {
         });
         let err = exec(&c, false, on).await.expect_err("404");
         assert!(err.contains("404"), "{err}");
+
+        let bad_file = bad.clone();
+        // Удаление: активный скрипт — 409, после отключения удаляется; повторно — 404.
+        let on = sieve(SieveAction::Activate {
+            account: account(),
+            name: name(),
+        });
+        exec(&c, false, on).await.expect("activate");
+        let delete = || {
+            sieve(SieveAction::Delete {
+                account: account(),
+                name: name(),
+            })
+        };
+        let err = exec(&c, false, delete()).await.expect_err("409");
+        assert!(err.contains("409"), "{err}");
+        let off = sieve(SieveAction::Deactivate { account: account() });
+        exec(&c, false, off).await.expect("deactivate");
+        let done = exec(&c, false, delete()).await.expect("delete");
+        assert_eq!(done, "Скрипт пересылка удалён.\n");
+        let json = exec(&c, true, list()).await.expect("list");
+        assert_eq!(serde_json::from_str::<Value>(&json).ok(), Some(json!([])));
+        let err = exec(&c, false, delete()).await.expect_err("404");
+        assert!(err.contains("404"), "{err}");
+
+        // Автоответ: не задан — выключен; включение, выключение с сохранением текста, сброс срока.
+        let vacation = |action| ApiAction::Vacation {
+            action: Box::new(action),
+        };
+        let get = || vacation(VacationAction::Get { account: account() });
+        let set = || VacationChange {
+            enabled: true,
+            from: None,
+            to: None,
+            subject: None,
+            text: None,
+            html: None,
+        };
+        let apply = |off: bool, ch: VacationChange| {
+            vacation(VacationAction::Set {
+                account: account(),
+                off,
+                from: ch.from,
+                to: ch.to,
+                subject: ch.subject,
+                text: ch.text,
+                text_file: None,
+                html_file: None,
+            })
+        };
+        let shown = exec(&c, false, get()).await.expect("vacation get");
+        assert!(shown.starts_with("Включён"), "{shown}");
+        assert!(shown.lines().next().is_some_and(|l| l.ends_with("нет")));
+        let on = apply(
+            false,
+            VacationChange {
+                from: Some("2026-12-01T00:00:00Z".into()),
+                to: Some("2026-12-15T00:00:00+03:00".into()),
+                subject: Some("В отпуске".into()),
+                text: Some("Вернусь 15 декабря.".into()),
+                ..set()
+            },
+        );
+        let v: Value = serde_json::from_str(&exec(&c, true, on).await.expect("set")).expect("json");
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["subject"], "В отпуске");
+        assert_eq!(v["text_body"], "Вернусь 15 декабря.");
+        assert_eq!(v["from"], "2026-12-01T00:00:00Z");
+        let shown = exec(&c, false, get()).await.expect("vacation get");
+        assert!(
+            shown.contains("В отпуске") && shown.contains("2026-12-01"),
+            "{shown}"
+        );
+        let off = exec(&c, true, apply(true, set())).await.expect("off");
+        let v: Value = serde_json::from_str(&off).expect("json");
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["text_body"], "Вернусь 15 декабря.");
+        assert_eq!(v["from"], "2026-12-01T00:00:00Z");
+        let reset = apply(
+            false,
+            VacationChange {
+                from: Some("-".into()),
+                to: Some("-".into()),
+                subject: Some("-".into()),
+                ..set()
+            },
+        );
+        let v: Value =
+            serde_json::from_str(&exec(&c, true, reset).await.expect("reset")).expect("json");
+        assert_eq!(v["enabled"], true);
+        assert_eq!(
+            (&v["from"], &v["to"], &v["subject"]),
+            (&json!(null), &json!(null), &json!(null))
+        );
+        let bad = apply(
+            false,
+            VacationChange {
+                from: Some("завтра".into()),
+                ..set()
+            },
+        );
+        let err = exec(&c, false, bad).await.expect_err("время");
+        assert!(err.contains("RFC 3339"), "{err}");
+        // Текст из файла.
+        let reply = dir.path().join("reply.txt");
+        std::fs::write(&reply, "Из файла.\n").expect("write");
+        let from_file = vacation(VacationAction::Set {
+            account: account(),
+            off: false,
+            from: None,
+            to: None,
+            subject: None,
+            text: None,
+            text_file: Some(reply),
+            html_file: None,
+        });
+        let v: Value =
+            serde_json::from_str(&exec(&c, true, from_file).await.expect("file")).expect("json");
+        assert_eq!(v["text_body"], "Из файла.\n");
+
+        // Скрипт организации: не задан — 404; запись, чтение, 422 с позицией, удаление (повторное — не ошибка).
+        let org = |action| sieve(SieveAction::Org { action });
+        let err = exec(&c, false, org(OrgSieveAction::Get))
+            .await
+            .expect_err("404");
+        assert!(err.contains("404"), "{err}");
+        let rule = dir.path().join("org.sieve");
+        let org_text = "if address :is \"from\" \"spam@example.net\" { discard; stop; }\n";
+        std::fs::write(&rule, org_text).expect("write");
+        let put = |file: &Path| {
+            org(OrgSieveAction::Put {
+                file: file.to_owned(),
+            })
+        };
+        let done = exec(&c, false, put(&rule)).await.expect("org put");
+        assert_eq!(done, "Скрипт организации записан.\n");
+        assert_eq!(
+            exec(&c, false, org(OrgSieveAction::Get)).await.as_deref(),
+            Ok(org_text)
+        );
+        let err = exec(&c, false, put(&bad_file)).await.expect_err("422");
+        assert!(err.contains("422") && err.contains("строка 2"), "{err}");
+        assert_eq!(
+            exec(&c, false, org(OrgSieveAction::Get)).await.as_deref(),
+            Ok(org_text)
+        );
+        for _ in 0..2 {
+            let done = exec(&c, false, org(OrgSieveAction::Delete))
+                .await
+                .expect("org delete");
+            assert_eq!(done, "Скрипт организации удалён.\n");
+        }
+        let err = exec(&c, false, org(OrgSieveAction::Get))
+            .await
+            .expect_err("404");
+        assert!(err.contains("404"), "{err}");
+    }
+
+    #[test]
+    fn org_put_help_explains_order() {
+        use clap::CommandFactory;
+
+        let mut cmd = crate::cli::Cli::command();
+        let mut cmd = &mut cmd;
+        for name in ["admin", "sieve", "org", "put"] {
+            cmd = cmd.find_subcommand_mut(name).expect(name);
+        }
+        let help = cmd.render_long_help().to_string();
+        assert!(
+            help.contains("discard; stop;") && help.contains("подряд"),
+            "{help}"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_block_against_admin_api() {
+        let (_admin, url) = admin_api().await;
+        let c = client(&url, "oidc");
+        let login = || "a@block.test".to_owned();
+        let account = |action| ApiAction::Account { action };
+        for action in [
+            ApiAction::Domain {
+                action: DomainAction::Add {
+                    name: "block.test".into(),
+                    relay: None,
+                },
+            },
+            account(AccountAction::Create {
+                login: login(),
+                name: None,
+            }),
+        ] {
+            exec(&c, false, action).await.expect("подготовка");
+        }
+        let enabled = |out: CliResult<String>| {
+            let v: Value = serde_json::from_str(&out.expect("ответ")).expect("json");
+            (v["enabled"].clone(), v["display_name"].clone())
+        };
+        let block = account(AccountAction::Block { account: login() });
+        assert_eq!(enabled(exec(&c, true, block).await).0, false);
+        let get = || account(AccountAction::Get { account: login() });
+        let shown = exec(&c, false, get()).await.expect("get");
+        assert!(shown.contains("false"), "{shown}");
+        let unblock = account(AccountAction::Unblock { account: login() });
+        assert_eq!(enabled(exec(&c, true, unblock).await).0, true);
+        let rename = account(AccountAction::Rename {
+            account: login(),
+            name: "Анна".into(),
+        });
+        assert_eq!(
+            enabled(exec(&c, true, rename).await),
+            (json!(true), json!("Анна"))
+        );
+        let rename = account(AccountAction::Rename {
+            account: login(),
+            name: String::new(),
+        });
+        let err = exec(&c, false, rename).await.expect_err("400");
+        assert!(err.contains("400"), "{err}");
+        let missing = account(AccountAction::Block {
+            account: "нет@block.test".into(),
+        });
+        assert!(exec(&c, false, missing).await.is_err());
     }
 }

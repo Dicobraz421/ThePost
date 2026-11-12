@@ -174,3 +174,161 @@ impl Default for VacationConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> Result<SieveConfig, String> {
+        serde_yaml_ng::from_str(yaml).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn empty_section_is_default() {
+        assert_eq!(parse("{}"), Ok(SieveConfig::default()));
+        assert_eq!(
+            parse("vacation: {}\ncache: {}\nmanagesieve: {}"),
+            Ok(SieveConfig::default())
+        );
+    }
+
+    #[test]
+    fn all_fields() {
+        let yaml = r#"
+max_script_size: 65536
+max_nesting: 8
+max_list_len: 100
+max_commands: 500
+max_actions: 16
+max_steps: 200000
+max_redirects: 2
+max_body_scan: 32768
+max_received: 30
+max_node_hops: 2
+vacation:
+  default_days: 3
+  min_days: 2
+  max_days: 14
+cache:
+  programs: 0
+managesieve:
+  listen:
+    - listen: "[::]:4190"
+    - listen: "127.0.0.1:4191"
+      implicit_tls: true
+  max_line: 4096
+  max_literal: 131072
+  idle_timeout: 1m30s
+  max_connections: 64
+  max_auth_failures: 5
+"#;
+        let c = parse(yaml).expect("секция");
+        assert_eq!(
+            c.limits(),
+            Limits {
+                max_script_size: 65536,
+                max_nesting: 8,
+                max_list_len: 100,
+                max_commands: 500,
+                max_actions: 16,
+                max_steps: 200_000,
+                max_redirects: 2,
+                max_body_scan: 32768,
+            }
+        );
+        assert_eq!((c.max_received, c.max_node_hops), (30, 2));
+        assert_eq!(
+            c.vacation,
+            VacationConfig {
+                default_days: 3,
+                min_days: 2,
+                max_days: 14,
+            }
+        );
+        assert_eq!(c.cache, CacheConfig { programs: 0 });
+        let m = &c.managesieve;
+        let listen: Vec<(String, bool)> = m
+            .listen
+            .iter()
+            .map(|e| (e.listen.to_string(), e.implicit_tls))
+            .collect();
+        assert_eq!(
+            listen,
+            [
+                ("[::]:4190".to_owned(), false),
+                ("127.0.0.1:4191".to_owned(), true)
+            ]
+        );
+        assert_eq!(
+            (
+                m.max_line,
+                m.max_literal,
+                m.idle_timeout,
+                m.max_connections,
+                m.max_auth_failures
+            ),
+            (4096, 131_072, Duration::from_secs(90), 64, 5)
+        );
+    }
+
+    /// Примеры из документации [`SieveConfig`], [`ManageSieveConfig`] и [`VacationConfig`].
+    #[test]
+    fn documented_examples() {
+        let c = parse(
+            "max_steps: 10000000\nmax_redirects: 4\nvacation:\n  default_days: 7\ncache:\n  programs: 4096\n\
+             managesieve:\n  idle_timeout: 30m\n",
+        )
+        .expect("пример секции");
+        assert_eq!((c.max_steps, c.max_redirects), (10_000_000, 4));
+        assert_eq!(c.managesieve.idle_timeout, Duration::from_secs(30 * 60));
+
+        let m: ManageSieveConfig =
+            serde_yaml_ng::from_str("listen:\n  - listen: \"[::]:4190\"\nidle_timeout: 30m\n")
+                .expect("пример managesieve");
+        assert_eq!(m.listen.len(), 1);
+        assert_eq!(
+            serde_yaml_ng::from_str::<VacationConfig>(
+                "default_days: 7\nmin_days: 1\nmax_days: 30\n"
+            )
+            .expect("пример vacation"),
+            VacationConfig::default()
+        );
+    }
+
+    #[test]
+    fn unknown_field_is_named() {
+        for (yaml, field) in [
+            ("max_stepz: 1", "max_stepz"),
+            ("vacation:\n  days: 7", "days"),
+            ("cache:\n  size: 1", "size"),
+            ("managesieve:\n  port: 4190", "port"),
+            (
+                "managesieve:\n  listen:\n    - listen: \"[::]:4190\"\n      tls: true",
+                "tls",
+            ),
+        ] {
+            let e = parse(yaml).expect_err(yaml);
+            assert!(e.contains(&format!("`{field}`")), "{yaml}: {e}");
+        }
+    }
+
+    #[test]
+    fn bad_value_is_named() {
+        for (yaml, field) in [
+            (
+                "managesieve:\n  idle_timeout: soon",
+                "managesieve.idle_timeout",
+            ),
+            (
+                "managesieve:\n  idle_timeout: 30",
+                "managesieve.idle_timeout",
+            ),
+            ("managesieve:\n  max_line: -1", "managesieve.max_line"),
+            ("max_steps: many", "max_steps"),
+            ("vacation:\n  max_days: x", "vacation.max_days"),
+        ] {
+            let e = parse(yaml).expect_err(yaml);
+            assert!(e.contains(field), "{yaml}: {e}");
+        }
+    }
+}

@@ -37,7 +37,7 @@ use tp_contracts::meta::{
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
-use tp_contracts::transport::MailFlow;
+use tp_contracts::transport::{AcceptedDomain, DomainKind, MailFlow};
 use tp_contracts::{Error, Result, TenantId};
 use tp_meta::PgMeta;
 use tp_platform::{Config, Metrics, RateLimitConfig, RateLimiter, TlsCerts};
@@ -591,7 +591,7 @@ impl Services {
             quota: Arc::new(self.meta.clone()),
             policies: Arc::new(PgPolicies(self.meta.clone())),
             resolver: Arc::new(self.meta.clone()),
-            domains: Arc::new(NoDomains),
+            domains: Arc::new(PgDomains(self.meta.clone())),
             trash: Arc::new(self.meta.clone()),
             store: self.store.clone(),
             app_passwords: self.app_passwords.clone(),
@@ -785,23 +785,88 @@ impl tp_admin::groups::Moderation for NoModeration {
     }
 }
 
-/// Домены Admin API: хранения доменов организации в контрактах ещё нет (CTR-25) — операции недоступны.
-struct NoDomains;
+/// Домены Admin API поверх принятых доменов `TransportStore` (`PgMeta`, таблица `domains`; до контракта CTR-25):
+/// список — принятые домены организации, создание — полномочный домен, удаление — только без учётных записей.
+/// Версия снимка кластера устарела между чтением и записью — запись повторяется по свежему снимку.
+struct PgDomains(PgMeta);
 
-const NO_DOMAINS: &str = "домены организации: хранилище ещё не подключено (CTR-25)";
+/// Попыток записи при гонке версий снимка кластера.
+const DOMAIN_ATTEMPTS: usize = 5;
 
 #[async_trait]
-impl tp_admin::DomainStore for NoDomains {
-    async fn list(&self, _tenant: TenantId) -> Result<Vec<tp_admin::Domain>> {
-        Err(Error::Internal(NO_DOMAINS.to_owned()))
+impl tp_admin::DomainStore for PgDomains {
+    async fn list(&self, tenant: TenantId) -> Result<Vec<tp_admin::Domain>> {
+        let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
+        Ok(cluster
+            .domains
+            .into_iter()
+            .filter(|d| d.tenant == tenant)
+            .map(|d| tp_admin::Domain {
+                id: d.id,
+                name: d.name,
+            })
+            .collect())
     }
 
-    async fn create(&self, _tenant: TenantId, _name: &str) -> Result<tp_admin::Domain> {
-        Err(Error::Internal(NO_DOMAINS.to_owned()))
+    async fn create(&self, tenant: TenantId, name: &str) -> Result<tp_admin::Domain> {
+        let domain = AcceptedDomain {
+            id: DomainId::new(),
+            tenant,
+            name: name.to_owned(),
+            kind: DomainKind::Authoritative,
+        };
+        for _ in 0..DOMAIN_ATTEMPTS {
+            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
+            // Имя занято (в любой организации) — `Conflict`; иначе `Conflict` записи — устаревшая версия.
+            if cluster.domain(name).is_some() {
+                return Err(Error::Conflict);
+            }
+            match tp_contracts::transport::TransportStore::put_domain(
+                &self.0,
+                cluster.version,
+                &domain,
+            )
+            .await
+            {
+                Ok(_) => {
+                    return Ok(tp_admin::Domain {
+                        id: domain.id,
+                        name: domain.name,
+                    });
+                }
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
     }
 
-    async fn delete(&self, _tenant: TenantId, _id: DomainId) -> Result<()> {
-        Err(Error::Internal(NO_DOMAINS.to_owned()))
+    async fn delete(&self, tenant: TenantId, id: DomainId) -> Result<()> {
+        for _ in 0..DOMAIN_ATTEMPTS {
+            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
+            if !cluster
+                .domains
+                .iter()
+                .any(|d| d.id == id && d.tenant == tenant)
+            {
+                return Err(Error::NotFound);
+            }
+            match tp_contracts::transport::TransportStore::delete_domain(
+                &self.0,
+                cluster.version,
+                id,
+            )
+            .await
+            {
+                Ok(_) => return Ok(()),
+                // Устаревшая версия снимка — повтор по свежему.
+                Err(Error::Conflict) => continue,
+                // Внешний ключ `accounts` → `domains`: у домена есть учётные записи.
+                Err(Error::Invalid(_)) => return Err(Error::Conflict),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
     }
 }
 

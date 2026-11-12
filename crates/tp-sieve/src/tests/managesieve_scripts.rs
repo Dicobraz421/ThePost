@@ -3,6 +3,7 @@
 use tp_contracts::sieve::{ScriptInfo, SieveLimits, SieveStore};
 
 use super::managesieve::{Setup, Stand};
+use crate::SieveConfig;
 
 const SCRIPT: &str = "require \"fileinto\";\r\nif header :contains \"subject\" \"report\" {\r\n    fileinto \"Work\";\r\n}\r\n";
 
@@ -236,4 +237,56 @@ async fn requires_login_and_isolates_accounts() {
     // После UNAUTHENTICATE команды скриптов снова недоступны.
     s.cmd("UNAUTHENTICATE").await;
     assert_eq!(s.cmd("LISTSCRIPTS").await, "NO \"Authenticate first\"\r\n");
+}
+
+/// SIEVE-11: текст проверяется с пределами секции `sieve` узла, а не `SieveConfig::default()`.
+#[tokio::test]
+async fn section_limits() {
+    let check = format!("CHECKSCRIPT {{{}+}}\r\n{SCRIPT}", SCRIPT.len());
+
+    // Пределы по умолчанию: текст принимается.
+    let mut s = logged_in(Setup::tls()).await;
+    assert_eq!(s.cmd(&check).await, "OK \"Script is valid\"\r\n");
+    assert_eq!(
+        s.cmd(&put("main", SCRIPT)).await,
+        "OK \"Putscript completed\"\r\n"
+    );
+
+    // Уменьшен предел разбора (`max_commands`): тот же текст — `NO`, в хранилище не попадает.
+    let mut s = logged_in(Setup {
+        tls: true,
+        config: SieveConfig {
+            max_commands: 2,
+            ..SieveConfig::default()
+        },
+        ..Setup::default()
+    })
+    .await;
+    assert!(s.cmd(&check).await.starts_with("NO \""));
+    assert!(s.cmd(&put("main", SCRIPT)).await.starts_with("NO \""));
+    assert_eq!(s.store.list(s.scope).await.expect("list"), Vec::new());
+
+    // Уменьшен размер текста в секции (предел хранилища — по умолчанию): `QUOTA/MAXSIZE`, `HAVESPACE` — по нему же.
+    let mut s = logged_in(Setup {
+        tls: true,
+        config: SieveConfig {
+            max_script_size: SCRIPT.len() - 1,
+            ..SieveConfig::default()
+        },
+        ..Setup::default()
+    })
+    .await;
+    let too_large = "NO (QUOTA/MAXSIZE) \"Script is too large\"\r\n";
+    assert_eq!(s.cmd(&check).await, too_large);
+    assert_eq!(s.cmd(&put("main", SCRIPT)).await, too_large);
+    assert_eq!(
+        s.cmd(&format!("HAVESPACE \"main\" {}", SCRIPT.len())).await,
+        too_large
+    );
+    assert_eq!(
+        s.cmd(&format!("HAVESPACE \"main\" {}", SCRIPT.len() - 1))
+            .await,
+        "OK \"Havespace completed\"\r\n"
+    );
+    assert_eq!(s.store.list(s.scope).await.expect("list"), Vec::new());
 }
