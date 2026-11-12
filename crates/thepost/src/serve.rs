@@ -352,6 +352,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         purge: Some(Purge {
             meta: meta.clone(),
             interval: maintenance_cfg.purge_interval,
+            admin_token_retention: maintenance_cfg.admin_token_retention,
         }),
         verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {
             verifier: Arc::new(crate::verify::verifier(
