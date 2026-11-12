@@ -76,7 +76,7 @@ test("список: организация в пути, курсор after/limit
 
 test("чтение, создание, замена, удаление и произвольная операция", async () => {
   await signIn();
-  const base = `/api/v1/orgs/${ORG}/domains`;
+  const base = `/api/v1/orgs/${ORG}/groups`;
   const calls = stubApi({
     [`GET ${base}/d1`]: { body: { id: "d1", name: "example.org" } },
     [`POST ${base}`]: { status: 201, body: { id: "d2", name: "example.net" } },
@@ -84,10 +84,10 @@ test("чтение, создание, замена, удаление и прои
     [`DELETE ${base}/d1`]: { status: 204 },
     [`PUT /api/v1/orgs/${ORG}/policy`]: (c) => ({ body: c.body }),
   });
-  expect((await dataProvider.getOne({ resource: "domains", id: "d1" })).data).toEqual({ id: "d1", name: "example.org" });
-  expect((await dataProvider.create({ resource: "domains", variables: { name: "example.net" } })).data).toMatchObject({ id: "d2" });
-  await dataProvider.update({ resource: "domains", id: "d1", variables: {} });
-  await dataProvider.deleteOne({ resource: "domains", id: "d1" });
+  expect((await dataProvider.getOne({ resource: "groups", id: "d1" })).data).toEqual({ id: "d1", name: "example.org" });
+  expect((await dataProvider.create({ resource: "groups", variables: { name: "example.net" } })).data).toMatchObject({ id: "d2" });
+  await dataProvider.update({ resource: "groups", id: "d1", variables: {} });
+  await dataProvider.deleteOne({ resource: "groups", id: "d1" });
   const custom = await dataProvider.custom?.({ url: "/api/v1/orgs/{org}/policy", method: "put", payload: { quota_bytes: 5 } });
   expect(custom?.data).toEqual({ quota_bytes: 5 });
   expect(calls.map((c) => c.method)).toEqual(["GET", "POST", "PUT", "DELETE", "PUT"]);
@@ -96,9 +96,9 @@ test("чтение, создание, замена, удаление и прои
 
 test("ошибка API (RFC 9457) — HttpError для уведомления", async () => {
   await signIn();
-  stubApi({ [`POST /api/v1/orgs/${ORG}/domains`]: { status: 409, body: { status: 409, title: "Conflict", detail: "домен уже есть" } } });
-  await expect(dataProvider.create({ resource: "domains", variables: { name: "example.org" } })).rejects.toMatchObject({
-    message: "домен уже есть",
+  stubApi({ [`POST /api/v1/orgs/${ORG}/groups`]: { status: 409, body: { status: 409, title: "Conflict", detail: "группа уже есть" } } });
+  await expect(dataProvider.create({ resource: "groups", variables: { name: "all@example.org" } })).rejects.toMatchObject({
+    message: "группа уже есть",
     statusCode: 409,
   });
 });
