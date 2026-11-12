@@ -14,10 +14,10 @@ use crate::config::MilterConfig;
 use crate::milter::proto;
 use crate::milter::tests::{Mock, on_eob, reply_of};
 
-const ALICE: &str = "alice@example.org";
+pub(super) const ALICE: &str = "alice@example.org";
 
 /// Политика учётной записи alice (остальные уровни не заданы).
-async fn alice_policy(env: &Env, policy: Policy) -> MemPolicies {
+pub(super) async fn alice_policy(env: &Env, policy: Policy) -> MemPolicies {
     let policies = MemPolicies::new(&env.meta);
     let scope = env.scope(ALICE).await;
     policies
@@ -27,7 +27,7 @@ async fn alice_policy(env: &Env, policy: Policy) -> MemPolicies {
     policies
 }
 
-async fn principal(env: &Env) -> Principal {
+pub(super) async fn principal(env: &Env) -> Principal {
     let scope = env.scope(ALICE).await;
     Principal {
         tenant: scope.tenant,
@@ -39,7 +39,7 @@ async fn principal(env: &Env) -> Principal {
 }
 
 /// Сеанс submission по TLS с доставкой `d`; клиент уже вошёл как alice.
-async fn submission(
+pub(super) async fn submission(
     env: &Env,
     d: Delivery,
 ) -> (

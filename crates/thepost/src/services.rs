@@ -394,6 +394,7 @@ impl Services {
         Ok(Delivery::new(deps, smtp)
             .with_groups(groups)
             .with_tracking(self.tracking.clone())
+            .with_send_limits(self.send_limits.clone())
             .with_transport(self.routes.clone())
             .with_forwarding(Arc::new(forwarding))
             .with_rules(self.rules.clone()))
