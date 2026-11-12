@@ -79,6 +79,10 @@ pub struct CalendarsConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub max_expanded_query_duration: Duration,
+    /// `maxAvailabilityDuration`: наибольший интервал `Principal/getAvailability`.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub max_availability_duration: Duration,
 }
 
 impl CalendarsConfig {
@@ -98,6 +102,7 @@ impl Default for CalendarsConfig {
             expand_horizon: Duration::from_secs(730 * 24 * 3600),
             max_instances: 10_000,
             max_expanded_query_duration: Duration::from_secs(400 * 24 * 3600),
+            max_availability_duration: Duration::from_secs(400 * 24 * 3600),
         }
     }
 }

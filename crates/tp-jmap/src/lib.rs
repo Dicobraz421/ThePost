@@ -21,6 +21,8 @@
 //! - `contact_card` — ContactCard/get, changes, query, queryChanges, set, copy: vCard в `DavStore`, JSContact —
 //!   calcard, индекс — `tp_dav::index`;
 //! - `contacts` — AddressBook/get, changes, set (RFC 9610) поверх `DavStore`, [`Jmap::with_dav`];
+//! - `principal` — Principal/get, query (RFC 9670) и Principal/getAvailability поверх `AccountStore` и `FreeBusy`,
+//!   [`Jmap::with_freebusy`];
 //! - `sieve` — SieveScript/get, set, query, validate (RFC 9661) поверх `SieveStore` и проверки `tp_sieve`;
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
@@ -40,6 +42,7 @@ mod email_set;
 #[doc(hidden)]
 pub mod fuzz;
 mod mailbox;
+mod principal;
 mod push;
 mod settings;
 mod sieve;
@@ -54,7 +57,10 @@ pub use crate::autoconfig::sign::{ProfileSigner, SignatureAlgorithm, SigningKey}
 pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
 
 use crate::core::error::MethodResult;
-use crate::core::{CALENDARS, CONTACTS, CORE, Ctx, MAIL, SETTINGS, SIEVE, SUBMISSION, VACATION};
+use crate::core::{
+    AVAILABILITY, CALENDARS, CONTACTS, CORE, Ctx, MAIL, PRINCIPALS, SETTINGS, SIEVE, SUBMISSION,
+    VACATION,
+};
 
 /// Встроенные методы и их capability.
 pub(crate) const METHODS: &[(&str, &str)] = &[
@@ -98,6 +104,9 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("ContactCard/queryChanges", CONTACTS),
     ("ContactCard/set", CONTACTS),
     ("ContactCard/copy", CONTACTS),
+    ("Principal/get", PRINCIPALS),
+    ("Principal/query", PRINCIPALS),
+    ("Principal/getAvailability", AVAILABILITY),
     ("Calendar/get", CALENDARS),
     ("Calendar/changes", CALENDARS),
     ("Calendar/set", CALENDARS),
@@ -159,6 +168,9 @@ pub(crate) async fn call_builtin(
         "ContactCard/queryChanges" => contact_card::query_changes(ctx, args).await,
         "ContactCard/set" => contact_card::set(ctx, args).await,
         "ContactCard/copy" => contact_card::copy(ctx, args).await,
+        "Principal/get" => principal::get(ctx, args).await,
+        "Principal/query" => principal::query(ctx, args).await,
+        "Principal/getAvailability" => principal::get_availability(ctx, args).await,
         "Calendar/get" => calendars::get(ctx, args).await,
         "Calendar/changes" => calendars::changes(ctx, args).await,
         "Calendar/set" => calendars::set(ctx, args).await,
