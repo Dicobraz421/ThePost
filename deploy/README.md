@@ -115,12 +115,14 @@ cargo nextest run -p <крейты> --no-tests=pass
 docker compose -f deploy/compose/dev.yml --profile smb up -d --build
 docker compose -f deploy/compose/dev.yml --profile smb run --rm thepost doctor   # без Fail (PLT-12, META-17)
 ```
-Порты 25, 465, 587, 143, 993, 80, 443 публикуются на хост; переопределение — `TP_SMTP_PORT`, `TP_SUBMISSIONS_PORT`,
-`TP_SUBMISSION_PORT`, `TP_IMAP_PORT`, `TP_IMAPS_PORT`, `TP_HTTP_PORT`, `TP_HTTPS_PORT`.
+Порты 25, 465, 587, 143, 993, 4190, 80, 443 публикуются на хост; переопределение — `TP_SMTP_PORT`,
+`TP_SUBMISSIONS_PORT`, `TP_SUBMISSION_PORT`, `TP_IMAP_PORT`, `TP_IMAPS_PORT`, `TP_MANAGESIEVE_PORT`, `TP_HTTP_PORT`,
+`TP_HTTPS_PORT`.
 Отдельная сборка образа: `docker build -f deploy/docker/Dockerfile -t thepost .` (`--build-arg RUST_VERSION=…`).
 
 Слушатели эталона: SMTP 25 (STARTTLS), submission 587 (STARTTLS) и 465 (неявный TLS), IMAP 143 (STARTTLS) и 993,
-JMAP — HTTPS 443 (`http.jmap`); порт 80 публикуется, но не слушается. Домен — `example.test`
+ManageSieve 4190 (STARTTLS, `sieve.managesieve.listen`), JMAP — HTTPS 443 (`http.jmap`); порт 80 публикуется, но не
+слушается. Домен — `example.test`
 (принятый домен организации в БД: его заводит `thepost admin init`). Сертификат — `fullchain.pem`/`privkey.pem` тома `tls` от `tls-init`
 (SAN: `localhost`, `thepost`, `mail.example.test`), CA для клиентов — `deploy/compose/tls/ca.pem`.
 Проверка эталона (полная — `docs/manual-tests/CMP-01.md`):
@@ -129,6 +131,7 @@ CA=deploy/compose/tls/ca.pem
 openssl s_client -connect localhost:465 -CAfile $CA -verify_return_error </dev/null   # 220 mail.example.test, код 0
 openssl s_client -connect localhost:587 -starttls smtp -CAfile $CA </dev/null         # то же для 25
 openssl s_client -connect localhost:993 -CAfile $CA -verify_return_error </dev/null   # * OK; 143 — -starttls imap
+openssl s_client -connect localhost:4190 -starttls sieve -CAfile $CA </dev/null       # "IMPLEMENTATION" … OK
 curl --cacert $CA -si https://localhost/.well-known/jmap | head -1                     # HTTP/1.1 401 без учётной записи
 ```
 Письмо между двумя пользователями: учётные записи `a@example.test`, `b@example.test` (способ — issue #193), отправка
@@ -211,8 +214,8 @@ sudo install -m 0644 deploy/systemd/thepost.sysusers.conf /usr/lib/sysusers.d/th
 sudo install -D -m 0640 -o root -g thepost deploy/config/all.yaml /etc/thepost/config.yaml   # задать domain, database.url
 sudo install -m 0644 deploy/systemd/thepost.service deploy/systemd/thepost-*.socket /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/thepost.service /etc/systemd/system/thepost-*.socket
-# Порты ниже 1024 — сокеты systemd (у процесса нет capabilities):
-sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submissions,submission,imap,imaps,https}.socket
+# Порты клиентских протоколов — сокеты systemd (у процесса нет capabilities):
+sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submissions,submission,imap,imaps,https,managesieve}.socket
 # …или без активации сокетов — CAP_NET_BIND_SERVICE (сокеты не включать):
 #   sudo install -D -m 0644 deploy/systemd/thepost.service.d/bind-capability.conf \
 #     /etc/systemd/system/thepost.service.d/bind-capability.conf && sudo systemctl daemon-reload
@@ -222,7 +225,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submis
 sudo systemctl enable --now thepost
 systemd-analyze security thepost.service   # не хуже 2.0 (с сокетами — 1.2, с bind-capability.conf — 1.6)
 ```
-Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443.
+Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443,
+`managesieve` 4190.
 Узел берёт сокет systemd по адресу слушателя (`0.0.0.0:<порт>` или `[::]:<порт>` совпадает с `ListenStream=<порт>`),
 иначе открывает свой; перезапуск `thepost` не закрывает сокеты. Пока узел не принимает сокеты systemd (TODO(PLT-16)
 в `crates/thepost/src/protocols.rs`), рабочий вариант — `bind-capability.conf`.
@@ -368,6 +372,7 @@ helm install thepost deploy/helm/thepost -n thepost --create-namespace -f <св�
 ```
 Под — `runAsNonRoot` (65532), `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`,
 seccomp `RuntimeDefault` (свой профиль узла — `containerSecurityContext.seccompProfile` типа `Localhost`) и профили ролей
-процесса (секция `confine`). Слушатели — на портах выше 1024, стандартные порты (25, 465, 587, 143, 993, 443) — у Service.
+процесса (секция `confine`). Слушатели — на портах выше 1024, стандартные порты (25, 465, 587, 143, 993, 443) — у Service;
+ManageSieve — 4190 и в поде, и у Service.
 Admin API — `127.0.0.1:8443` в поде (`kubectl port-forward`), служебный HTTP — адрес пода для проб kubelet.
 До установки — секрет `thepost-tls` (`tls.crt`, `tls.key`, `ca.crt`) и OpenBao (`bootstrap.sh` выше).

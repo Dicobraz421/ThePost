@@ -588,7 +588,7 @@ async fn shared_access_audited() {
         assert_eq!(entry.actor_account, Some(bob.account));
         assert_eq!(entry.actor_kind, AuditActorKind::Delegate);
         assert_eq!(entry.object.mailbox, Some(projects));
-        assert_eq!(entry.client.as_deref(), Some("imap 192.0.2.1"));
+        assert_eq!(entry.client.as_deref(), Some("imap 192.0.2.7"));
     }
     assert!(e[1].object.message.is_some());
     assert_eq!(e[1].object.message, e[2].object.message);

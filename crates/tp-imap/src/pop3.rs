@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use base64::Engine;
@@ -176,7 +177,7 @@ fn split_line(buf: &mut Vec<u8>, max: usize) -> std::result::Result<Option<Vec<u
 impl<T: Transport> Pop3Session<T> {
     /// Сессия соединения.
     pub fn new(ctx: Arc<SessionCtx>, conn: T) -> Self {
-        let audit = Audit::new(ctx.deps.audit.clone(), "pop3", conn.client());
+        let audit = Audit::new(ctx.deps.audit.clone(), "pop3", Some(conn.peer()));
         Self {
             ctx,
             peer: conn.peer(),

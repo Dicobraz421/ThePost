@@ -41,10 +41,6 @@ mod write;
 
 pub(crate) const LOGIN: &str = "user@example.org";
 pub(crate) const PASSWORD: &str = "secret";
-/// Адрес клиента в записях аудита.
-pub(crate) const CLIENT_IP: std::net::IpAddr =
-    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
-
 /// Адрес клиента соединений стенда.
 pub(crate) const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7));
 
@@ -76,10 +72,6 @@ impl Transport for TestConn {
     async fn starttls(self) -> Result<Self> {
         Err(Error::invalid("no tls in tests"))
     }
-
-    fn client(&self) -> Option<std::net::IpAddr> {
-        Some(CLIENT_IP)
-    }
 }
 
 pub(crate) struct Env {
@@ -93,7 +85,7 @@ pub(crate) struct Env {
     pub policies: MemPolicies,
     /// Точка принятия решений хранилища и сессии (Legal Hold, доставка).
     pub hook: RecordingDecisionHook,
-    /// Журнал аудита ящиков: подключён к сессиям [`Env::ctx`] (клиент [`CLIENT_IP`]).
+    /// Журнал аудита ящиков: подключён к сессиям [`Env::ctx`] (клиент [`PEER`]).
     pub audit: MemMailboxAudit,
     pub principal: Principal,
     pub config: ImapConfig,

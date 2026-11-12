@@ -27,8 +27,8 @@ use tp_contracts::config::duration;
 use tp_contracts::events::CoreEventKind;
 use tp_contracts::ext::{Decision, DecisionHooks, FinalDelete};
 use tp_contracts::meta::{
-    AccountScope, Inserted, MessageStore, Policy, PolicyResolver, PolicyStore, PolicyTarget,
-    QuotaUsage, SpecialUse,
+    AccountScope, Inserted, Message, MessageStore, Policy, PolicyResolver, PolicyStore,
+    PolicyTarget, QuotaUsage, SpecialUse,
 };
 use tp_contracts::retention::{
     PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule,
@@ -730,6 +730,10 @@ impl TrashStore for PgMeta {
         limit: usize,
     ) -> Result<Vec<TrashItem>> {
         trash_page(self, scope, true, offset, limit).await
+    }
+
+    async fn hidden_message(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
+        crate::messages::hidden_message(self, scope, id).await
     }
 
     async fn purge(
