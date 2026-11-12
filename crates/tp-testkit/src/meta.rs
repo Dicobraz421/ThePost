@@ -19,7 +19,7 @@ use tp_contracts::meta::{
     Account, AccountScope, AccountState, AccountStore, AccountUpsert, ChangeLog, Changes,
     DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Mailbox,
     MailboxStatus, MailboxStore, Message, MessageChange, MessageQuery, MessageStore, NewMailbox,
-    NewMessage, QuotaUsage, SpecialUse,
+    NewMessage, QuotaUsage, SpecialUse, account_aliases,
 };
 use tp_contracts::retention::{PurgeOutcome, Restored};
 use tp_contracts::{
@@ -632,6 +632,7 @@ impl MemMetadata {
                     display_name: login.to_owned(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await?;
@@ -1029,6 +1030,7 @@ impl AccountStore for MemMetadata {
                 .ok_or_else(|| Error::internal("учётная запись пропала"))?;
             let a = &mut acc.account;
             a.domain = data.domain;
+            a.aliases = account_aliases(&data.login, data.aliases.iter().map(String::as_str));
             a.login = data.login;
             a.display_name = data.display_name;
             a.external_id = data.external_id.or(a.external_id.take());
@@ -1050,6 +1052,7 @@ impl AccountStore for MemMetadata {
             id: AccountId::new(),
             tenant,
             domain: data.domain,
+            aliases: account_aliases(&data.login, data.aliases.iter().map(String::as_str)),
             login: data.login,
             display_name: data.display_name,
             external_id: data.external_id,
@@ -2571,6 +2574,7 @@ mod tests {
             display_name: "N".into(),
             external_id: ext.map(Into::into),
             enabled: true,
+            aliases: Vec::new(),
         };
         let t = TenantId::DEFAULT;
         let x = meta

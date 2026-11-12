@@ -12,6 +12,9 @@ manual: no
 
 Подтверждено владельцем — решение 80 (`docs/decisions/2026-11-11-stage2-followups.md`).
 
+Решение владельца 2026-11-12 (PR #500): один путь — поисковые строки в `ObjectIndex::search`, запись — `put_object`; `move_object` и
+`find_cards` обязательны для реализаций (без реализаций по умолчанию). `tp-meta`, `tp-testkit`, `tp_dav::index::card` — в том же PR.
+
 ## Сделать
 - `DavStore::move_object(scope, from, name, to, pre)`: переносит ресурс в другую коллекцию учётной записи одной
   транзакцией; `DavObject::id`, тело и индекс сохраняются, ETag и `ModSeq` — новые; в исходной коллекции — надгробие

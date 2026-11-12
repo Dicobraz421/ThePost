@@ -107,6 +107,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "schedule",
         include_str!("../migrations/0024_schedule.sql"),
     ),
+    (
+        25,
+        "contracts 38",
+        include_str!("../migrations/0025_contracts_38.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

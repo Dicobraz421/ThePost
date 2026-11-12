@@ -39,6 +39,7 @@ async fn account_in(meta: &PgMeta, tenant: TenantId, domain: (DomainId, &str)) -
                 display_name: "User".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
             },
         )
         .await
@@ -90,6 +91,17 @@ async fn passes_contract_suite() {
         },
     };
     suite::dav(&meta, &fx).await;
+}
+
+/// CTR-54, CTR-56: коллекция по умолчанию и свойства, перенос объекта, поиск контактов — общий набор.
+#[tokio::test]
+async fn organize_suite() {
+    let Some(pool) = common::pool().await else {
+        return;
+    };
+    let meta = PgMeta::new(pool, config());
+    let scope = common::account(&meta).await;
+    suite::dav::organize(&meta, scope).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

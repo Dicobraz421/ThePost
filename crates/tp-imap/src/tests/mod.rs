@@ -109,6 +109,7 @@ impl Env {
                     display_name: "User".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await

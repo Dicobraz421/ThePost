@@ -87,6 +87,7 @@ mod tests {
                     display_name: "Foreign".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await

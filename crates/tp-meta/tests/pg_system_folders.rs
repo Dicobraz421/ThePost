@@ -139,6 +139,7 @@ async fn raw_account_with_inbox_filled_on_login() {
                 display_name: "Old".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
             },
         )
         .await
@@ -181,6 +182,7 @@ async fn raw_account_with_inbox_filled_on_login() {
             display_name: "Old".into(),
             external_id: None,
             enabled: true,
+            aliases: Vec::new(),
         },
     )
     .await

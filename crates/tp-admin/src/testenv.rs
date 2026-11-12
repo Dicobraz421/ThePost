@@ -431,6 +431,7 @@ impl Env {
                     display_name: login.to_owned(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await

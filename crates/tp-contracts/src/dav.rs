@@ -57,7 +57,7 @@ pub const MAX_CARD_SEARCH_STRINGS: usize = 64;
 /// Наибольшая длина поисковой строки контакта ([`CardSearch`]), байт.
 pub const MAX_CARD_SEARCH_LEN: usize = 255;
 
-/// Наибольший размер оповещений по умолчанию одного вида ([`CollectionPrefs`], CTR-56), байт.
+/// Наибольший размер оповещений по умолчанию одного вида ([`Collection::alerts_with_time`], CTR-56), байт.
 pub const MAX_DEFAULT_ALERTS_LEN: usize = 8192;
 
 /// Имя (сегмент URL) коллекции по умолчанию, пока она не назначена ([`default_of`]).
@@ -174,13 +174,39 @@ pub struct Collection {
     /// в [`crate::schedule::FreeBusy::query`]. У адресной книги не используется.
     #[serde(default)]
     pub transparent: bool,
+    /// Коллекция по умолчанию своего вида (CTR-56; JMAP `isDefault`, CalDAV `schedule-default-calendar-URL`): не больше
+    /// одной на вид у учётной записи — запись коллекции с признаком ([`DavStore::create_collection`],
+    /// [`DavStore::update_collection`]) снимает его с прежней той же операцией. Ни у одной — действует [`default_of`].
+    #[serde(default)]
+    pub is_default: bool,
+    /// Пользователь подписан на коллекцию (JMAP `isSubscribed`): клиенты показывают и синхронизируют её.
+    #[serde(default = "yes")]
+    pub subscribed: bool,
+    /// Коллекция показывается в клиенте (JMAP `isVisible`).
+    #[serde(default = "yes")]
+    pub visible: bool,
+    /// Оповещения по умолчанию для событий со временем (JMAP `defaultAlertsWithTime`; CalDAV
+    /// `default-alarm-vevent-datetime`): текст JSON-объекта `Id[Alert]` JSCalendar, не длиннее
+    /// [`MAX_DEFAULT_ALERTS_LEN`] байт; `None` — нет. Хранилище содержимое не разбирает; в `VALARM` и обратно
+    /// переводит вызывающий (`tp-dav`, calcard). Только у календаря.
+    #[serde(default)]
+    pub alerts_with_time: Option<String>,
+    /// То же для событий на весь день (JMAP `defaultAlertsWithoutTime`; CalDAV `default-alarm-vevent-date`).
+    #[serde(default)]
+    pub alerts_without_time: Option<String>,
     /// Наибольший `ModSeq` изменений коллекции: свойств и объектов (CTag). Задаёт хранилище; при записи не учитывается.
     pub state: ModSeq,
 }
 
+/// Значение по умолчанию при разборе: подписана и видима (как [`Collection::new`]).
+fn yes() -> bool {
+    true
+}
+
 impl Collection {
     /// Новая коллекция вида `kind` с именем `name`: отображаемое имя — `name`, компоненты по умолчанию —
-    /// `VEVENT`, `VTODO` (календарь) или `VCARD` (адресная книга), остальные свойства пусты.
+    /// `VEVENT`, `VTODO` (календарь) или `VCARD` (адресная книга); не по умолчанию, подписана и видима; остальные
+    /// свойства пусты.
     pub fn new(kind: CollectionKind, name: impl Into<String>) -> Self {
         let name = name.into();
         let components = match kind {
@@ -198,14 +224,20 @@ impl Collection {
             timezone: None,
             components,
             transparent: false,
+            is_default: false,
+            subscribed: true,
+            visible: true,
+            alerts_with_time: None,
+            alerts_without_time: None,
             state: ModSeq::ZERO,
         }
     }
 
     /// Проверяет поля: имя — [`valid_name`]; отображаемое имя — до [`MAX_DISPLAY_NAME_LEN`] символов, описание — до
     /// [`MAX_DESCRIPTION_LEN`] байт, цвет и часовой пояс — до [`MAX_PROPERTY_LEN`] байт, все без управляющих символов
-    /// (в описании допустимы перевод строки и табуляция); компоненты — непустые и подходят виду ([`Component::fits`]).
-    /// Иначе — `Error::Invalid`.
+    /// (в описании допустимы перевод строки и табуляция); компоненты — непустые и подходят виду ([`Component::fits`]);
+    /// оповещения по умолчанию — только у календаря, каждое — текст JSON-объекта не длиннее
+    /// [`MAX_DEFAULT_ALERTS_LEN`] байт. Иначе — `Error::Invalid`.
     pub fn validate(&self) -> Result<()> {
         if !valid_name(&self.name) {
             return Err(Error::invalid(format!(
@@ -235,55 +267,11 @@ impl Collection {
         if self.components.is_empty() || !self.components.iter().all(|c| c.fits(self.kind)) {
             return Err(Error::invalid("недопустимые компоненты коллекции"));
         }
-        Ok(())
-    }
-}
-
-/// Свойства коллекции сверх [`Collection`] (CTR-56): коллекция по умолчанию, подписка и видимость, оповещения по
-/// умолчанию. Хранятся с коллекцией, читаются и пишутся отдельными методами [`DavStore`]; отсутствующие поля при
-/// разборе — значения [`CollectionPrefs::default`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CollectionPrefs {
-    /// Коллекция по умолчанию своего вида (JMAP `isDefault`; CalDAV `schedule-default-calendar-URL`): не больше одной
-    /// на вид у учётной записи — назначение новой снимает признак с прежней той же операцией
-    /// ([`DavStore::set_collection_prefs`]).
-    pub is_default: bool,
-    /// Пользователь подписан на коллекцию (JMAP `isSubscribed`): клиенты показывают и синхронизируют её.
-    pub subscribed: bool,
-    /// Коллекция показывается в клиенте (JMAP `isVisible`).
-    pub visible: bool,
-    /// Оповещения по умолчанию для событий со временем (JMAP `defaultAlertsWithTime`; CalDAV
-    /// `default-alarm-vevent-datetime`): текст JSON-объекта `Id[Alert]` JSCalendar, не длиннее
-    /// [`MAX_DEFAULT_ALERTS_LEN`] байт; `None` — нет. Хранилище содержимое не разбирает; в `VALARM` и обратно
-    /// переводит вызывающий (`tp-dav`, calcard). Только у календаря.
-    pub alerts_with_time: Option<String>,
-    /// То же для событий на весь день (JMAP `defaultAlertsWithoutTime`; CalDAV `default-alarm-vevent-date`).
-    pub alerts_without_time: Option<String>,
-}
-
-impl Default for CollectionPrefs {
-    /// Не по умолчанию, подписана, видима, без оповещений — как коллекции, созданные до CTR-56.
-    fn default() -> Self {
-        Self {
-            is_default: false,
-            subscribed: true,
-            visible: true,
-            alerts_with_time: None,
-            alerts_without_time: None,
-        }
-    }
-}
-
-impl CollectionPrefs {
-    /// Проверяет оповещения коллекции вида `kind`: только у календаря, каждое — текст JSON-объекта не длиннее
-    /// [`MAX_DEFAULT_ALERTS_LEN`] байт. Иначе — `Error::Invalid`.
-    pub fn validate(&self, kind: CollectionKind) -> Result<()> {
         for alerts in [&self.alerts_with_time, &self.alerts_without_time]
             .into_iter()
             .flatten()
         {
-            if kind != CollectionKind::Calendar {
+            if self.kind != CollectionKind::Calendar {
                 return Err(Error::invalid(
                     "оповещения по умолчанию — только у календаря",
                 ));
@@ -301,13 +289,18 @@ impl CollectionPrefs {
     }
 }
 
-/// Коллекция по умолчанию, когда она не назначена ([`CollectionPrefs::is_default`]), — прежнее правило: с именем
-/// [`DEFAULT_COLLECTION_NAME`], иначе первая по порядку [`DavStore::list_collections`] (`order`, затем имя).
-/// `collections` — коллекции одного вида в любом порядке.
+/// Коллекция по умолчанию среди `collections` — коллекций одного вида в любом порядке (CTR-56): назначенная
+/// ([`Collection::is_default`]); не назначена — с именем [`DEFAULT_COLLECTION_NAME`], иначе первая по порядку
+/// [`DavStore::list_collections`] (`order`, затем имя).
 pub fn default_of(collections: &[Collection]) -> Option<&Collection> {
     collections
         .iter()
-        .find(|c| c.name == DEFAULT_COLLECTION_NAME)
+        .find(|c| c.is_default)
+        .or_else(|| {
+            collections
+                .iter()
+                .find(|c| c.name == DEFAULT_COLLECTION_NAME)
+        })
         .or_else(|| {
             collections
                 .iter()
@@ -316,7 +309,7 @@ pub fn default_of(collections: &[Collection]) -> Option<&Collection> {
 }
 
 /// Поисковые строки контакта (CTR-54): полное имя, части имени, адреса e-mail — в нижнем регистре. Вычисляет
-/// вызывающий из тела (`tp_dav::index::card`), хранилище хранит их с объектом ([`DavStore::put_card`]) и ищет по
+/// вызывающий из тела (`tp_dav::index::card`), хранилище хранит их с объектом ([`ObjectIndex::search`]) и ищет по
 /// вхождению подстроки ([`DavStore::find_cards`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -418,10 +411,14 @@ pub struct ObjectIndex {
     /// [`Precondition::IfMatch`] его ETag.
     #[serde(default)]
     pub schedule_tag: Option<String>,
+    /// Поисковые строки контакта (CTR-54) для [`DavStore::find_cards`]; у объектов календаря — пусто. Заменяются
+    /// при каждой записи объекта.
+    #[serde(default)]
+    pub search: CardSearch,
 }
 
 impl ObjectIndex {
-    /// Индекс без занятости и `Schedule-Tag`.
+    /// Индекс без занятости, `Schedule-Tag` и поисковых строк.
     pub fn new(component: Component, uid: impl Into<String>, span: Option<Span>) -> Self {
         Self {
             component,
@@ -429,11 +426,13 @@ impl ObjectIndex {
             span,
             busy: Vec::new(),
             schedule_tag: None,
+            search: CardSearch::default(),
         }
     }
 
-    /// Проверяет UID, интервал (конец не раньше начала), занятость ([`validate_busy`]) и `Schedule-Tag`
-    /// ([`valid_etag`]); иначе — `Error::Invalid`.
+    /// Проверяет UID, интервал (конец не раньше начала), занятость ([`validate_busy`]), `Schedule-Tag`
+    /// ([`valid_etag`]) и поисковые строки ([`CardSearch::validate`]; непустые — только у [`Component::Card`]);
+    /// иначе — `Error::Invalid`.
     pub fn validate(&self) -> Result<()> {
         if self.uid.is_empty() || !plain(&self.uid, MAX_UID_LEN) {
             return Err(Error::invalid("недопустимый UID объекта"));
@@ -441,6 +440,12 @@ impl ObjectIndex {
         validate_busy(&self.busy)?;
         if self.schedule_tag.as_deref().is_some_and(|t| !valid_etag(t)) {
             return Err(Error::invalid("недопустимый Schedule-Tag объекта"));
+        }
+        self.search.validate()?;
+        if self.component != Component::Card && !self.search.strings.is_empty() {
+            return Err(Error::invalid(
+                "поисковые строки — только у контакта (VCARD)",
+            ));
         }
         if let Some(Span {
             start,
@@ -553,18 +558,6 @@ pub enum DeleteOutcome {
     PreconditionFailed,
 }
 
-/// Записываемый контакт с поисковыми строками ([`DavStore::put_card`], CTR-54).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NewCard {
-    /// Тело vCard.
-    pub body: String,
-    /// Индекс объекта; компонент — [`Component::Card`].
-    pub index: ObjectIndex,
-    /// Поисковые строки.
-    #[serde(default)]
-    pub search: CardSearch,
-}
-
 /// Объект перенесён в другую коллекцию ([`DavStore::move_object`], CTR-54).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Moved {
@@ -671,7 +664,8 @@ pub trait DavStore: Send + Sync + 'static {
     ) -> Result<Option<Collection>>;
 
     /// Создаёт коллекцию; недопустимые поля ([`Collection::validate`]) — `Invalid`, занятый `id` или имя вида —
-    /// `Conflict`, коллекций уже [`DavLimits::max_collections`] — `QuotaExceeded`. Возвращает `ModSeq` изменения.
+    /// `Conflict`, коллекций уже [`DavLimits::max_collections`] — `QuotaExceeded`. [`Collection::is_default`] — как у
+    /// [`DavStore::update_collection`]. Возвращает `ModSeq` изменения.
     async fn create_collection(
         &self,
         scope: AccountScope,
@@ -679,8 +673,13 @@ pub trait DavStore: Send + Sync + 'static {
     ) -> Result<ModSeq>;
 
     /// Заменяет свойства коллекции `collection.id` (отображаемое имя, описание, цвет, порядок, часовой пояс,
-    /// компоненты); нет — `NotFound`, другие `kind` или `name` — `Invalid`. Объекты не проверяются заново.
-    /// Возвращает `ModSeq` изменения.
+    /// компоненты, признак по умолчанию, подписка, видимость, оповещения по умолчанию); нет — `NotFound`, другие
+    /// `kind` или `name`, недопустимые поля ([`Collection::validate`]) — `Invalid`. Объекты не проверяются заново.
+    /// [`Collection::is_default`]` = true` снимает признак с прежней коллекции по умолчанию того же вида в той же
+    /// транзакции (признак — не больше чем у одной): у прежней — своё изменение свойств (новый `ModSeq`,
+    /// [`Collection::state`], [`DavStore::collection_changes`], сигнал [`dav_changed`]) раньше изменения
+    /// `collection.id`; `false` у текущей — коллекция по умолчанию не назначена (действует [`default_of`]), как и после
+    /// удаления назначенной. Возвращает `ModSeq` изменения `collection.id`.
     async fn update_collection(
         &self,
         scope: AccountScope,
@@ -690,72 +689,6 @@ pub trait DavStore: Send + Sync + 'static {
     /// Удаляет коллекцию сразу, без корзины: её объекты и она сама — в надгробия, каждый со своим `ModSeq` (коллекция —
     /// последней; страницы `/changes` не делят одно изменение). Нет — `NotFound`. Возвращает `ModSeq` коллекции.
     async fn delete_collection(&self, scope: AccountScope, id: CollectionId) -> Result<ModSeq>;
-
-    /// Свойства коллекции сверх [`Collection`] (CTR-56). Нет коллекции — `NotFound`. По умолчанию — через
-    /// [`DavStore::get_collection`], всегда [`CollectionPrefs::default`] (хранилище без этих свойств).
-    async fn collection_prefs(
-        &self,
-        scope: AccountScope,
-        id: CollectionId,
-    ) -> Result<CollectionPrefs> {
-        match self.get_collection(scope, id).await? {
-            Some(_) => Ok(CollectionPrefs::default()),
-            None => Err(Error::NotFound),
-        }
-    }
-
-    /// Свойства всех коллекций вида `kind` в порядке [`DavStore::list_collections`] — одним запросом (список
-    /// календарей JMAP, `PROPFIND` дома коллекций). По умолчанию — [`CollectionPrefs::default`] для каждой.
-    async fn list_collection_prefs(
-        &self,
-        scope: AccountScope,
-        kind: CollectionKind,
-    ) -> Result<Vec<(CollectionId, CollectionPrefs)>> {
-        Ok(self
-            .list_collections(scope, kind)
-            .await?
-            .into_iter()
-            .map(|c| (c.id, CollectionPrefs::default()))
-            .collect())
-    }
-
-    /// Заменяет свойства [`CollectionPrefs`] коллекции `id`. Нет коллекции — `NotFound`;
-    /// [`CollectionPrefs::validate`] — `Invalid`. `is_default = true` снимает признак с прежней коллекции по умолчанию
-    /// того же вида в той же транзакции (признак — ровно у одной); `false` у текущей — коллекция по умолчанию не
-    /// назначена (действует [`default_of`]). Это изменение свойств коллекции: новый `ModSeq`,
-    /// [`Collection::state`], [`DavStore::collection_changes`] и сигнал [`dav_changed`] — у `id` и, раньше неё, у
-    /// прежней коллекции по умолчанию, если признак с неё снят. Возвращает `ModSeq` изменения `id`. Новая коллекция
-    /// ([`DavStore::create_collection`]) получает [`CollectionPrefs::default`]; удаление коллекции по умолчанию
-    /// оставляет вид без назначенной. По умолчанию — `Error::Internal` (реализации — `tp-meta`, `tp-testkit`).
-    async fn set_collection_prefs(
-        &self,
-        scope: AccountScope,
-        id: CollectionId,
-        prefs: CollectionPrefs,
-    ) -> Result<ModSeq> {
-        let _ = (scope, id, prefs);
-        Err(Error::internal(
-            "DavStore::set_collection_prefs не реализован",
-        ))
-    }
-
-    /// Коллекция по умолчанию вида `kind`: назначенная ([`CollectionPrefs::is_default`]), иначе по прежнему правилу
-    /// [`default_of`]; `None` — у учётной записи нет коллекций вида. По умолчанию — через
-    /// [`DavStore::list_collections`] и [`DavStore::list_collection_prefs`].
-    async fn default_collection(
-        &self,
-        scope: AccountScope,
-        kind: CollectionKind,
-    ) -> Result<Option<Collection>> {
-        let collections = self.list_collections(scope, kind).await?;
-        let prefs = self.list_collection_prefs(scope, kind).await?;
-        let assigned = prefs.iter().find(|(_, p)| p.is_default).map(|(id, _)| *id);
-        Ok(collections
-            .iter()
-            .find(|c| Some(c.id) == assigned)
-            .or_else(|| default_of(&collections))
-            .cloned())
-    }
 
     // ---------- Объекты ----------
 
@@ -833,7 +766,7 @@ pub trait DavStore: Send + Sync + 'static {
 
     /// Переносит ресурс `name` коллекции `from` в коллекцию `to` той же учётной записи одной транзакцией (CTR-54,
     /// решение 80; JMAP `ContactCard/set` и `CalendarEvent/set` со сменой коллекции, WebDAV `MOVE`). Имя ресурса,
-    /// [`DavObject::id`], тело, индекс и поисковые строки ([`CardSearch`]) сохраняются; ETag и `ModSeq` — новые: в `from`
+    /// [`DavObject::id`], тело и индекс (с поисковыми строками) сохраняются; ETag и `ModSeq` — новые: в `from`
     /// остаётся надгробие ([`Moved::removed`], видно в [`DavStore::changes`]), в `to` — создание ([`Moved::modseq`]);
     /// в [`DavStore::account_changes`] объект — в `updated` (идентификатор не менялся). Сигнал [`dav_changed`] — по
     /// обеим коллекциям. Проверки по порядку: нет любой из коллекций или ресурса при [`Precondition::Any`] —
@@ -841,8 +774,7 @@ pub trait DavStore: Send + Sync + 'static {
     /// целевой — `Invalid`; условие `pre` к исходному ресурсу ([`Precondition::IfMatch`] с другим ETag или без
     /// ресурса; [`Precondition::IfNoneMatch`] — как `Any`) и свободное имя `name` в `to` — иначе
     /// [`MoveOutcome::PreconditionFailed`]; UID у ресурса `to` — [`MoveOutcome::UidConflict`]; в `to` уже
-    /// [`DavLimits::max_objects`] — `QuotaExceeded`. По умолчанию — `Error::Internal` (реализации — `tp-meta`,
-    /// `tp-testkit`).
+    /// [`DavLimits::max_objects`] — `QuotaExceeded`.
     async fn move_object(
         &self,
         scope: AccountScope,
@@ -850,57 +782,20 @@ pub trait DavStore: Send + Sync + 'static {
         name: &str,
         to: CollectionId,
         pre: Precondition,
-    ) -> Result<MoveOutcome> {
-        let _ = (scope, from, name, to, pre);
-        Err(Error::internal("DavStore::move_object не реализован"))
-    }
-
-    /// [`DavStore::put_object`] для контакта с поисковыми строками [`NewCard::search`] (CTR-54): те же проверки и исходы, плюс
-    /// [`CardSearch::validate`] и компонент [`Component::Card`] — иначе `Invalid`. Строки заменяются при каждой
-    /// записи; запись через `put_object` оставляет объект без поисковых строк. По умолчанию — проверка и
-    /// `put_object`, строки не хранятся (хранилище без поискового индекса: [`DavStore::find_cards`] по умолчанию
-    /// возвращает все объекты).
-    async fn put_card(
-        &self,
-        scope: AccountScope,
-        collection: CollectionId,
-        name: &str,
-        card: NewCard,
-        pre: Precondition,
-    ) -> Result<PutOutcome> {
-        card.search.validate()?;
-        if card.index.component != Component::Card {
-            return Err(Error::invalid(
-                "поисковые строки — только у контакта (VCARD)",
-            ));
-        }
-        self.put_object(scope, collection, name, card.body, card.index, pre)
-            .await
-    }
+    ) -> Result<MoveOutcome>;
 
     /// Кандидаты поиска контактов (CTR-54; `addressbook-query` с `text-match`, JMAP `ContactCard/query`): объекты
-    /// коллекции, у которых какая-либо поисковая строка содержит `needle` ([`CardSearch::matches`]; пустой `needle` —
-    /// все), по имени, не более `limit`; ровно `limit` в ответе — выборка могла быть обрезана. Точную проверку
-    /// фильтра делает вызывающий по телу (как после [`DavStore::in_range`]). Объект без поисковых строк (записан
-    /// `put_object`) находится только пустым `needle`. Нет коллекции — `NotFound`. По умолчанию — хранилище без
-    /// поискового индекса: все объекты коллекции ([`DavStore::list_objects`] и [`DavStore::multiget`]), `needle` и
-    /// `limit` не применяются, чтобы не потерять совпадения.
+    /// коллекции, у которых какая-либо поисковая строка ([`ObjectIndex::search`]) содержит `needle`
+    /// ([`CardSearch::matches`]; пустой `needle` — все), по имени, не более `limit`; ровно `limit` в ответе — выборка
+    /// могла быть обрезана. Точную проверку фильтра делает вызывающий по телу (как после [`DavStore::in_range`]).
+    /// Нет коллекции — `NotFound`.
     async fn find_cards(
         &self,
         scope: AccountScope,
         collection: CollectionId,
         needle: &str,
         limit: usize,
-    ) -> Result<Vec<DavObject>> {
-        let _ = (needle, limit);
-        let names: Vec<String> = self
-            .list_objects(scope, collection)
-            .await?
-            .into_iter()
-            .map(|r| r.name)
-            .collect();
-        self.multiget(scope, collection, &names).await
-    }
+    ) -> Result<Vec<DavObject>>;
 
     // ---------- Изменения ----------
 
@@ -1053,42 +948,41 @@ mod tests {
 
     #[test]
     fn collection_prefs() {
-        // Отсутствующие поля — значения по умолчанию: подписана и видима.
-        let parsed = serde_json::from_str::<CollectionPrefs>("{}").ok();
-        assert_eq!(parsed, Some(CollectionPrefs::default()));
-        let prefs = CollectionPrefs::default();
-        assert!(prefs.subscribed && prefs.visible && !prefs.is_default);
-        assert_eq!(prefs.validate(CollectionKind::AddressBook), Ok(()));
+        // Новая коллекция: не по умолчанию, подписана и видима, без оповещений.
+        let book = Collection::new(CollectionKind::AddressBook, "book");
+        assert!(book.subscribed && book.visible && !book.is_default);
+        assert_eq!(book.validate(), Ok(()));
 
-        let alerts = CollectionPrefs {
+        let alerts = Collection {
             alerts_with_time: Some(
                 r#"{"a1":{"@type":"Alert","trigger":{"@type":"OffsetTrigger","offset":"-PT15M"}}}"#
                     .into(),
             ),
             alerts_without_time: Some("{}".into()),
-            ..CollectionPrefs::default()
+            ..Collection::new(CollectionKind::Calendar, "work")
         };
-        assert_eq!(alerts.validate(CollectionKind::Calendar), Ok(()));
+        assert_eq!(alerts.validate(), Ok(()));
         let text = serde_json::to_string(&alerts).unwrap_or_default();
         assert_eq!(
-            serde_json::from_str::<CollectionPrefs>(&text).ok(),
+            serde_json::from_str::<Collection>(&text).ok(),
             Some(alerts.clone())
         );
         // Оповещения — только у календаря, объект JSON в пределах размера.
-        assert!(alerts.validate(CollectionKind::AddressBook).is_err());
+        let in_book = Collection {
+            alerts_with_time: alerts.alerts_with_time.clone(),
+            ..book
+        };
+        assert!(in_book.validate().is_err());
         for bad in [
             "[]",
             "не json",
             &format!("{{\"a\":\"{}\"}}", "x".repeat(MAX_DEFAULT_ALERTS_LEN)),
         ] {
-            let prefs = CollectionPrefs {
+            let c = Collection {
                 alerts_without_time: Some(bad.to_owned()),
-                ..CollectionPrefs::default()
+                ..alerts.clone()
             };
-            assert!(
-                prefs.validate(CollectionKind::Calendar).is_err(),
-                "{bad:.20}"
-            );
+            assert!(c.validate().is_err(), "{bad:.20}");
         }
     }
 
@@ -1102,8 +996,11 @@ mod tests {
         // Без сегмента `default` — первая по порядку, затем по имени.
         let list = [named("work", 2), named("b", 1), named("a", 1)];
         assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("a"));
-        let list = [named("a", 0), named(DEFAULT_COLLECTION_NAME, 9)];
+        let mut list = [named("a", 0), named(DEFAULT_COLLECTION_NAME, 9)];
         assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("default"));
+        // Назначенная — раньше прежнего правила.
+        list[0].is_default = true;
+        assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("a"));
     }
 
     #[test]

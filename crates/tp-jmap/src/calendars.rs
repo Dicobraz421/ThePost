@@ -3,12 +3,12 @@
 //!
 //! Редакция: draft-ietf-jmap-calendars (текущий черновик IETF, SRS 4.4 «по мере стабилизации», решение 35) с
 //! JSCalendar 2.0 (draft-ietf-calext-jscalendarbis — его реализует calcard). Отличия от черновика:
-//! - `isSubscribed`, `isVisible` — всегда `true` (контракт не хранит; `false` — `invalidProperties`);
-//! - `isDefault` — календарь с сегментом URL `default`, иначе первый по порядку: признак не хранится, поэтому
-//!   `onSuccessSetIsDefault` для другого календаря — `invalidArguments`;
+//! - `isSubscribed`, `isVisible` — читаются из коллекции (CTR-56); запись `false` — `invalidProperties` (JMAP-36);
+//! - `isDefault` — назначенный календарь, иначе с сегментом URL `default`, иначе первый по порядку
+//!   (`tp_contracts::dav::default_of`); `onSuccessSetIsDefault` для другого календаря — `invalidArguments` (JMAP-36);
 //! - `includeInAvailability` — `all` или `none` (`schedule-calendar-transp` CalDAV, `Collection::transparent`);
 //!   `attending` — `invalidProperties`;
-//! - `defaultAlertsWithTime`, `defaultAlertsWithoutTime` — только `null` (контракт не хранит);
+//! - `defaultAlertsWithTime`, `defaultAlertsWithoutTime` — читаются из коллекции; запись — только `null` (JMAP-36);
 //! - `shareWith`, `myRights` — права владельца, общий доступ — JMAP-32; `participantIdentities`,
 //!   `CalendarEventNotification`, `Principal` — JMAP-30, JMAP-31.
 //!
@@ -21,7 +21,7 @@ use calcard::common::timezone::Tz;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore};
+use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore, default_of};
 use tp_contracts::meta::AccountScope;
 
 use crate::contacts::store_error;
@@ -36,7 +36,7 @@ use crate::core::request::{
 pub(crate) const KIND: CollectionKind = CollectionKind::Calendar;
 
 /// Сегмент URL календаря по умолчанию.
-const DEFAULT_NAME: &str = "default";
+const DEFAULT_NAME: &str = tp_contracts::dav::DEFAULT_COLLECTION_NAME;
 
 /// Значение capability учётной записи: событие — в одном календаре (объект CalDAV).
 pub(crate) fn account_capability(cfg: &CalendarsConfig) -> Value {
@@ -50,13 +50,15 @@ pub(crate) fn account_capability(cfg: &CalendarsConfig) -> Value {
     })
 }
 
-/// Календарь по умолчанию среди `books` (в порядке хранилища).
+/// Календарь по умолчанию среди `books` — правило контракта [`default_of`]: назначенный, иначе прежнее правило.
 pub(crate) fn default_calendar(books: &[Collection]) -> Option<CollectionId> {
-    books
-        .iter()
-        .find(|b| b.name == DEFAULT_NAME)
-        .or(books.first())
-        .map(|b| b.id)
+    default_of(books).map(|b| b.id)
+}
+
+/// Оповещения по умолчанию календаря (текст JSON-объекта `Id[Alert]`) — значением JMAP; нет — `null`.
+fn alerts(text: Option<&str>) -> Value {
+    text.and_then(|t| serde_json::from_str(t).ok())
+        .unwrap_or(Value::Null)
 }
 
 /// Текущее состояние календарей.
@@ -84,11 +86,11 @@ fn calendar_object(b: &Collection, default: Option<CollectionId>) -> Map<String,
         "sortOrder": b.order,
         "color": b.color,
         "isDefault": default == Some(b.id),
-        "isSubscribed": true,
-        "isVisible": true,
+        "isSubscribed": b.subscribed,
+        "isVisible": b.visible,
         "includeInAvailability": availability(b),
-        "defaultAlertsWithTime": null,
-        "defaultAlertsWithoutTime": null,
+        "defaultAlertsWithTime": alerts(b.alerts_with_time.as_deref()),
+        "defaultAlertsWithoutTime": alerts(b.alerts_without_time.as_deref()),
         "timeZone": b.timezone,
         "shareWith": null,
         "myRights": rights(),
