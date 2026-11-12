@@ -1,7 +1,7 @@
 //! Организация, домены, учётные записи и квоты (SRS 5.2, 3.8).
 //!
 //! - организация (`/api/v1/orgs/{org}`): чтение и политика уровня организации;
-//! - домены: список, создание, удаление, политика домена;
+//! - домены организации — принятые домены транспорта и политика домена ([`crate::transport`], CTR-24);
 //! - учётные записи приходят из каталога (LDAP): здесь — поиск по имени входа, постраничный список (по возрастанию
 //!   имени входа, фильтр по префиксу; продолжение — заголовок `Link` с `rel="next"`, RFC 8288), чтение с
 //!   использованием квоты и только локальные атрибуты — политика ящика (квота, срок корзины, лимиты отправки);
@@ -13,8 +13,8 @@
 //! - политика уровня задаётся целиком (`PUT`), поле `null` — не задано на уровне; действующая политика
 //!   (`effective`) — наложение цепочки организация → домен → ящик (`PolicyResolver`).
 //!
-//! Записи политик и доменов в контрактах пока нет: [`PolicyStore`] и [`DomainStore`] — временные трейты полосы
-//! (как `AppPasswordStore` в AUTH-02 до CTR-22). `PolicyStore` повторяет `PgMeta::policy`/`set_policy`.
+//! Записи политик в контрактах пока нет: [`PolicyStore`] — временный трейт полосы (как `AppPasswordStore` в AUTH-02
+//! до CTR-22), повторяет `PgMeta::policy`/`set_policy`.
 //! Список учётных записей — `AccountStore::list` (CTR-44).
 
 use std::sync::Arc;
@@ -60,28 +60,6 @@ pub trait PolicyStore: Send + Sync + 'static {
         target: PolicyTarget,
         policy: &Policy,
     ) -> Result<()>;
-}
-
-/// Почтовый домен организации.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Domain {
-    /// Идентификатор.
-    pub id: DomainId,
-    /// Имя (нижний регистр, A-label).
-    pub name: String,
-}
-
-/// Домены организаций (временный трейт до контракта).
-#[async_trait]
-pub trait DomainStore: Send + Sync + 'static {
-    /// Домены организации по имени.
-    async fn list(&self, tenant: TenantId) -> Result<Vec<Domain>>;
-
-    /// Создаёт домен; имя занято в инсталляции — `Conflict`.
-    async fn create(&self, tenant: TenantId, name: &str) -> Result<Domain>;
-
-    /// Удаляет домен; нет — `NotFound`, у домена есть учётные записи — `Conflict`.
-    async fn delete(&self, tenant: TenantId, id: DomainId) -> Result<()>;
 }
 
 /// Политика уровня; `null` — не задано на уровне.
@@ -167,34 +145,6 @@ pub struct Organization {
     pub policies: Policies,
 }
 
-/// Домен.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DomainInfo {
-    /// Идентификатор.
-    pub id: String,
-    /// Имя.
-    pub name: String,
-}
-
-/// Домен с политиками.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DomainDetails {
-    /// Домен.
-    #[serde(flatten)]
-    pub domain: DomainInfo,
-    /// Политики.
-    #[serde(flatten)]
-    pub policies: Policies,
-}
-
-/// Новый домен.
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct NewDomain {
-    /// Имя (A-label; приводится к нижнему регистру).
-    pub name: String,
-}
-
 /// Использование квоты.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QuotaInfo {
@@ -269,22 +219,10 @@ pub struct AccountQuery {
     pub limit: Option<usize>,
 }
 
-/// Маршруты организации, доменов и учётных записей.
+/// Маршруты организации и учётных записей.
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
     r.route("/api/v1/orgs/{org}", get(get_org))
         .route("/api/v1/orgs/{org}/policy", put(put_org_policy))
-        .route(
-            "/api/v1/orgs/{org}/domains",
-            get(list_domains).post(create_domain),
-        )
-        .route(
-            "/api/v1/orgs/{org}/domains/{domain}",
-            get(get_domain).delete(delete_domain),
-        )
-        .route(
-            "/api/v1/orgs/{org}/domains/{domain}/policy",
-            put(put_domain_policy),
-        )
         .route(
             "/api/v1/orgs/{org}/accounts",
             get(list_accounts).post(create_account),
@@ -305,11 +243,6 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
     paths(
         get_org,
         put_org_policy,
-        list_domains,
-        create_domain,
-        get_domain,
-        delete_domain,
-        put_domain_policy,
         list_accounts,
         create_account,
         get_account,
@@ -320,9 +253,6 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         PolicyBody,
         Policies,
         Organization,
-        DomainInfo,
-        DomainDetails,
-        NewDomain,
         QuotaInfo,
         AccountInfo,
         NewAccount,
@@ -336,16 +266,8 @@ pub(crate) async fn account(a: &Admin, org: TenantId, id: AccountId) -> Result<A
     a.d.accounts.get(org, id).await?.ok_or(Error::NotFound)
 }
 
-async fn domain(a: &Admin, org: TenantId, id: DomainId) -> Result<Domain> {
-    a.d.domains
-        .list(org)
-        .await?
-        .into_iter()
-        .find(|d| d.id == id)
-        .ok_or(Error::NotFound)
-}
-
-async fn policies(
+/// Политика уровня и действующая политика (цепочка организация → домен → ящик).
+pub(crate) async fn policies(
     a: &Admin,
     org: TenantId,
     target: PolicyTarget,
@@ -361,24 +283,6 @@ async fn policies(
             .await?
             .into(),
     })
-}
-
-/// Имя домена: A-label, 2–127 меток `[a-z0-9-]` до 63 символов без `-` по краям, всего до 253.
-fn domain_name(name: &str) -> Result<String> {
-    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
-    let label_ok = |l: &str| {
-        (1..=63).contains(&l.len())
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    };
-    if name.len() > 253 || name.split('.').count() < 2 || !name.split('.').all(label_ok) {
-        return Err(Error::invalid(format!(
-            "недопустимое имя домена {name:?} (нужен A-label, например xn--80a.example)"
-        )));
-    }
-    Ok(name)
 }
 
 /// Имя входа (адрес) в нижнем регистре и его домен в канонической форме; не `имя@домен` — `Invalid`.
@@ -424,86 +328,6 @@ async fn put_org_policy(
 ) -> ApiResult<Json<PolicyBody>> {
     a.d.policies
         .set_policy(org, PolicyTarget::Tenant, &body.clone().into())
-        .await?;
-    Ok(Json(body))
-}
-
-/// Домены организации.
-#[utoipa::path(get, path = "/api/v1/orgs/{org}/domains", tag = "domains",
-    params(("org" = String, Path, description = "Организация (UUID)")),
-    responses((status = 200, body = Vec<DomainInfo>), (status = 403, body = Problem)))]
-async fn list_domains(
-    State(a): State<Arc<Admin>>,
-    Path(org): Path<TenantId>,
-) -> ApiResult<Json<Vec<DomainInfo>>> {
-    let list = a.d.domains.list(org).await?;
-    Ok(Json(list.into_iter().map(DomainInfo::from).collect()))
-}
-
-impl From<Domain> for DomainInfo {
-    fn from(d: Domain) -> Self {
-        Self {
-            id: d.id.to_string(),
-            name: d.name,
-        }
-    }
-}
-
-/// Создаёт домен.
-#[utoipa::path(post, path = "/api/v1/orgs/{org}/domains", tag = "domains",
-    params(("org" = String, Path, description = "Организация (UUID)")),
-    request_body = NewDomain,
-    responses((status = 201, body = DomainInfo), (status = 400, body = Problem), (status = 409, body = Problem)))]
-async fn create_domain(
-    State(a): State<Arc<Admin>>,
-    Path(org): Path<TenantId>,
-    Json(body): Json<NewDomain>,
-) -> ApiResult<(StatusCode, Json<DomainInfo>)> {
-    let name = domain_name(&body.name)?;
-    let d = a.d.domains.create(org, &name).await?;
-    Ok((StatusCode::CREATED, Json(d.into())))
-}
-
-/// Домен и его политика.
-#[utoipa::path(get, path = "/api/v1/orgs/{org}/domains/{domain}", tag = "domains",
-    params(("org" = String, Path, description = "Организация (UUID)"), ("domain" = String, Path, description = "Домен (UUID)")),
-    responses((status = 200, body = DomainDetails), (status = 404, body = Problem)))]
-async fn get_domain(
-    State(a): State<Arc<Admin>>,
-    Path((org, id)): Path<(TenantId, DomainId)>,
-) -> ApiResult<Json<DomainDetails>> {
-    let d = domain(&a, org, id).await?;
-    Ok(Json(DomainDetails {
-        domain: d.into(),
-        policies: policies(&a, org, PolicyTarget::Domain(id), Some(id), None).await?,
-    }))
-}
-
-/// Удаляет домен без учётных записей.
-#[utoipa::path(delete, path = "/api/v1/orgs/{org}/domains/{domain}", tag = "domains",
-    params(("org" = String, Path, description = "Организация (UUID)"), ("domain" = String, Path, description = "Домен (UUID)")),
-    responses((status = 204), (status = 404, body = Problem), (status = 409, body = Problem)))]
-async fn delete_domain(
-    State(a): State<Arc<Admin>>,
-    Path((org, id)): Path<(TenantId, DomainId)>,
-) -> ApiResult<StatusCode> {
-    a.d.domains.delete(org, id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Задаёт политику домена целиком.
-#[utoipa::path(put, path = "/api/v1/orgs/{org}/domains/{domain}/policy", tag = "domains",
-    params(("org" = String, Path, description = "Организация (UUID)"), ("domain" = String, Path, description = "Домен (UUID)")),
-    request_body = PolicyBody,
-    responses((status = 200, body = PolicyBody), (status = 404, body = Problem)))]
-async fn put_domain_policy(
-    State(a): State<Arc<Admin>>,
-    Path((org, id)): Path<(TenantId, DomainId)>,
-    Json(body): Json<PolicyBody>,
-) -> ApiResult<Json<PolicyBody>> {
-    domain(&a, org, id).await?;
-    a.d.policies
-        .set_policy(org, PolicyTarget::Domain(id), &body.clone().into())
         .await?;
     Ok(Json(body))
 }
@@ -761,7 +585,7 @@ mod tests {
     use serde_json::{Value, json};
     use tp_contracts::TenantId;
 
-    use super::{AccountQuery, domain_name, encode_query};
+    use super::{AccountQuery, encode_query};
     use crate::server::AdminConfig;
     use crate::testenv::{Env, config};
 
@@ -827,6 +651,10 @@ mod tests {
             .call("POST", &base, Some("org"), new("a@example.test"))
             .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        // Домен не принят — подсказка на единственный API доменов организации.
+        let detail = b["detail"].as_str().expect("detail");
+        assert!(detail.contains("не принят организацией"), "{detail}");
+        assert!(detail.contains("/transport/domains"), "{detail}");
         let c = env.transport.cluster().await.expect("cluster");
         let d = AcceptedDomain {
             id: tp_contracts::DomainId::new(),
@@ -878,73 +706,6 @@ mod tests {
             .call("POST", &base, Some("org"), new("a@example.test"))
             .await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[tokio::test]
-    async fn domains_crud() {
-        let env = Env::new();
-        let base = format!("{}/domains", org());
-        let new = |name: &str| Some(json!({ "name": name }));
-        let (s, _, d) = env
-            .call("POST", &base, Some("org"), new("Example.ORG."))
-            .await;
-        assert_eq!(s, StatusCode::CREATED, "{d}");
-        assert_eq!(d["name"], "example.org");
-        let id = d["id"].as_str().expect("id").to_owned();
-        let (s, _, _) = env
-            .call("POST", &base, Some("root"), new("example.org"))
-            .await;
-        assert_eq!(s, StatusCode::CONFLICT);
-        let (s, _, b) = env.call("POST", &base, Some("org"), new("пример.рф")).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST);
-        assert!(b["detail"].as_str().expect("detail").contains("A-label"));
-        env.call("POST", &base, Some("org"), new("a.example")).await;
-        let (_, _, list) = env.call("GET", &base, Some("org"), None).await;
-        let names: Vec<_> = list
-            .as_array()
-            .expect("list")
-            .iter()
-            .map(|d| d["name"].clone())
-            .collect();
-        assert_eq!(names, vec![json!("a.example"), json!("example.org")]);
-
-        let one = format!("{base}/{id}");
-        let dpolicy = format!("{one}/policy");
-        let (s, _, _) = env
-            .call(
-                "PUT",
-                &dpolicy,
-                Some("org"),
-                Some(json!({"max_recipients": 50})),
-            )
-            .await;
-        assert_eq!(s, StatusCode::OK);
-        let opolicy = json!({"max_recipients": 10, "send_per_hour": 100});
-        env.call(
-            "PUT",
-            &format!("{}/policy", org()),
-            Some("org"),
-            Some(opolicy),
-        )
-        .await;
-        let (s, _, b) = env.call("GET", &one, Some("org"), None).await;
-        assert_eq!(s, StatusCode::OK);
-        assert_eq!(b["name"], "example.org");
-        assert_eq!(b["policy"]["max_recipients"], 50);
-        assert_eq!(b["policy"]["send_per_hour"], Value::Null);
-        assert_eq!(b["effective"]["max_recipients"], 50);
-        assert_eq!(b["effective"]["send_per_hour"], 100);
-
-        let (s, _, _) = env.call("DELETE", &one, Some("org"), None).await;
-        assert_eq!(s, StatusCode::NO_CONTENT);
-        let (s, _, _) = env.call("DELETE", &one, Some("org"), None).await;
-        assert_eq!(s, StatusCode::NOT_FOUND);
-        let (s, _, _) = env.call("GET", &one, Some("org"), None).await;
-        assert_eq!(s, StatusCode::NOT_FOUND);
-        let (s, _, _) = env
-            .call("PUT", &dpolicy, Some("org"), Some(json!({})))
-            .await;
-        assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1476,36 +1237,29 @@ mod tests {
         assert_eq!(encode_query("я"), "%D1%8F");
     }
 
-    #[test]
-    fn domain_names() {
-        let ok = |n: &str| domain_name(n).expect(n);
-        assert_eq!(ok(" Mail.Example.ORG "), "mail.example.org");
-        assert_eq!(ok("xn--80a1acny.xn--p1ai"), "xn--80a1acny.xn--p1ai");
-        let long = format!("{}.example", "a".repeat(64));
-        let bad = [
-            "",
-            "localhost",
-            "-a.example",
-            "a-.example",
-            "a..example",
-            "a_b.example",
-        ];
-        for n in bad.iter().copied().chain(["пример.рф", long.as_str()]) {
-            assert!(domain_name(n).is_err(), "{n:?}");
-        }
-    }
-
     #[tokio::test]
     async fn openapi_lists_routes() {
         let env = Env::new();
         let (_, _, b) = env.call("GET", "/api/openapi.json", None, None).await;
         let paths = [
             "/api/v1/orgs/{org}",
-            "/api/v1/orgs/{org}/domains/{domain}/policy",
+            "/api/v1/orgs/{org}/transport/domains/{id}/policy",
             "/api/v1/orgs/{org}/accounts/{account}",
         ];
         for p in paths {
             assert!(b["paths"][p].is_object(), "{p}");
+        }
+        // Домены организации — один ресурс `transport/domains` (решение 94): прежних операций в схеме нет.
+        let paths = b["paths"].as_object().expect("paths");
+        assert!(
+            !paths
+                .keys()
+                .any(|p| p.starts_with("/api/v1/orgs/{org}/domains")),
+            "{:?}",
+            paths.keys().collect::<Vec<_>>()
+        );
+        for name in ["DomainInfo", "DomainDetails", "NewDomain"] {
+            assert!(b["components"]["schemas"][name].is_null(), "{name}");
         }
         assert!(b["components"]["schemas"]["PolicyBody"].is_object());
         let list = &b["paths"]["/api/v1/orgs/{org}/accounts"]["get"];
