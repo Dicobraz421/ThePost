@@ -1,6 +1,6 @@
 //! Веб-консоль администратора (SRS 5.2): статика `console/dist`, вшитая в бинарный файл (`rust-embed`, фича `console`).
 //!
-//! `GET /console/*` — файл сборки; неизвестный путь без расширения — `index.html` (маршруты SPA); `/` → `/console/`.
+//! `GET /console/*` — файл сборки; неизвестный путь вне `assets/` — `index.html` (маршруты SPA); `/` → `/console/`.
 //! Ответы несут `Content-Security-Policy` без внешних источников и `X-Frame-Options: DENY`; файлы `assets/`
 //! (имя с хэшем содержимого) кэшируются надолго, остальное — с перепроверкой. Без фичи `console` или без сборки
 //! консоли — страница «консоль не собрана». `admin.console.enabled: false` — маршрутов нет (404).
@@ -174,12 +174,9 @@ fn resolve(lookup: Lookup, path: &str) -> Found {
                 body,
             };
         }
-        // Файл с расширением — не маршрут SPA: отсутствующий ресурс не подменяется страницей.
-        if path
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| name.contains('.'))
-        {
+        // Пропавший файл `assets/` не подменяется страницей. По расширению судить нельзя: в маршрутах SPA
+        // бывает точка (`domains/example.org`).
+        if path.starts_with("assets/") {
             return Found::Missing;
         }
     }
@@ -326,6 +323,12 @@ mod tests {
     async fn spa_route_and_missing_asset() {
         let cfg = ConsoleConfig::default();
         let (s, h, b) = call(&cfg, dist, "/console/orgs/example.org/accounts").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
+        assert!(b.starts_with(b"<!doctype html>"));
+
+        // Маршрут с точкой в последнем сегменте (карточка домена) — тоже страница, а не 404.
+        let (s, h, b) = call(&cfg, dist, "/console/domains/example.org").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
         assert!(b.starts_with(b"<!doctype html>"));
