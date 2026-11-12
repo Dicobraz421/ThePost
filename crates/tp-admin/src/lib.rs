@@ -43,5 +43,5 @@ pub use export::{
 };
 pub use groups::Moderation;
 pub use init::{InitConfig, InitGranted, InitReply, InitRequest};
-pub use server::{Admin, AdminConfig, AdminRole, Deps, ParityStores, RoleBinding};
+pub use server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 pub use sieve::{ScriptCheck, ScriptError};

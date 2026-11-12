@@ -144,6 +144,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "account kind",
         include_str!("../migrations/0031_account_kind.sql"),
     ),
+    (
+        32,
+        "sync holds",
+        include_str!("../migrations/0032_sync_holds.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

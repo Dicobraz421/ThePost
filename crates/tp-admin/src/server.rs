@@ -323,6 +323,18 @@ pub struct Deps {
     pub store: Arc<dyn MailStore>,
     /// Пароли приложений: выпуск, список, отзыв.
     pub app_passwords: tp_auth::AppPasswords,
+    /// Почтовые контакты адресной книги (CTR-35, [`crate::directory`]).
+    pub contacts: Arc<dyn ContactStore>,
+    /// Оргструктура: подразделения и оргатрибуты.
+    pub org: Arc<dyn OrgStore>,
+    /// Фильтры динамических групп.
+    pub dynamic: Arc<dyn DynamicGroupStore>,
+    /// Списки отправителей ящиков ([`crate::mailboxes`]).
+    pub senders: Arc<dyn SenderLists>,
+    /// Журнал и политика аудита ящиков.
+    pub mailbox_audit: Arc<dyn MailboxAudit>,
+    /// Остановка синхронизации каталога сверх порога удаления.
+    pub sync: Arc<dyn SyncGate>,
 }
 
 impl fmt::Debug for Deps {
@@ -333,30 +345,6 @@ impl fmt::Debug for Deps {
                 &self.modules.iter().map(|m| m.prefix()).collect::<Vec<_>>(),
             )
             .finish_non_exhaustive()
-    }
-}
-
-/// Хранилища соответствия Exchange (CTR-35): адресная книга, списки отправителей, аудит ящиков, остановка
-/// синхронизации каталога ([`crate::directory`], [`crate::mailboxes`]).
-#[derive(Clone)]
-pub struct ParityStores {
-    /// Почтовые контакты.
-    pub contacts: Arc<dyn ContactStore>,
-    /// Оргструктура: подразделения и оргатрибуты.
-    pub org: Arc<dyn OrgStore>,
-    /// Фильтры динамических групп.
-    pub dynamic: Arc<dyn DynamicGroupStore>,
-    /// Списки отправителей ящиков.
-    pub senders: Arc<dyn SenderLists>,
-    /// Журнал и политика аудита ящиков.
-    pub mailbox_audit: Arc<dyn MailboxAudit>,
-    /// Остановка синхронизации каталога сверх порога удаления.
-    pub sync: Arc<dyn SyncGate>,
-}
-
-impl fmt::Debug for ParityStores {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ParityStores").finish_non_exhaustive()
     }
 }
 
@@ -372,8 +360,6 @@ pub struct Admin {
     pub(crate) sieve: Option<crate::sieve::Sieve>,
     /// Объекты писем очереди модерации; `None` — не подключено (тема письма очереди — `null`).
     pub(crate) held_blobs: Option<Arc<dyn BlobStore>>,
-    /// Хранилища CTR-35; `None` — не подключено (маршруты адресной книги, списков, аудита ящиков — 503).
-    pub(crate) parity: Option<ParityStores>,
 }
 
 impl fmt::Debug for Admin {
@@ -385,7 +371,6 @@ impl fmt::Debug for Admin {
             .field("local", &self.local.is_some())
             .field("sieve", &self.sieve.is_some())
             .field("held_blobs", &self.held_blobs.is_some())
-            .field("parity", &self.parity.is_some())
             .finish()
     }
 }
@@ -415,7 +400,6 @@ impl Admin {
             local: None,
             sieve: None,
             held_blobs: None,
-            parity: None,
         })
     }
 
@@ -430,12 +414,6 @@ impl Admin {
     /// сжимает объекты, сюда передаётся читатель с распаковкой. Без него тема — `null`.
     pub fn with_held_blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
         self.held_blobs = Some(blobs);
-        self
-    }
-
-    /// Подключает хранилища соответствия Exchange ([`ParityStores`]).
-    pub fn with_parity(mut self, stores: ParityStores) -> Self {
-        self.parity = Some(stores);
         self
     }
 
