@@ -14,7 +14,7 @@
 | 6 | Письмо наружу (submission → `smtp.queue.relay`); подпись проверить открытым ключом DKIM | `DKIM-Signature: … s=s1`, проверка успешна |
 | 7 | `systemctl start thepost-backup@diff` | `thepost-backup-blob` и `thepost-backup-openbao` — `success`; второй снимок OpenBao |
 | 8 | Вне сервера: `/root/openbao-init.json`, `/etc/openbao/unseal.key`, пароль restic; прежнюю ВМ выключить | — |
-| 9 | Новая ВМ: `smb.yml -e thepost_backup=false`; копии — по тем же путям; в новый OpenBao — только пароль restic | узел не стартует (`secret thepost/dkim#…: not found`) — ожидаемо, секреты ещё у прежнего сервера |
+| 9 | Новая ВМ: `smb.yml -e thepost_backup=false -e thepost_wait_ready=false`; копии — по тем же путям; в новый OpenBao — только пароль restic (и ключи S3) | `failed=0`; `Warn that thepost is not ready` — предупреждение; узел не стартует (`secret thepost/dkim#…: not found`) — ожидаемо, секреты ещё у прежнего сервера |
 | 10 | `restore.yml -e thepost_restore_confirm=true -e thepost_restore_openbao=true -e thepost_restore_openbao_init_src=…` без ключа распечатывания | отказ на `Check OpenBao restore parameters`, службы не остановлены |
 | 11 | Шаг 10 с `-e thepost_restore_openbao_static_key_src=…` | `failed=0`; «Снимок OpenBao: <ID>…»; база и письма восстановлены, `verify` — потерянных 0; новая полная копия и снимок OpenBao |
 | 12 | Отпечаток `thepost/dkim` на новой ВМ; письмо наружу; проверка подписи прежним открытым ключом | отпечаток тот же; подпись успешна |
@@ -57,3 +57,5 @@
 - Шаг 9: на новой ВМ узел не стартует, пока не восстановлен OpenBao, если в `config.yaml` есть ссылки на секреты
   прежнего сервера (DKIM, SRS, ARC) — первый прогон `smb.yml` заканчивается на `Wait for thepost readiness`; все
   роли к этому моменту установлены, `restore.yml` продолжает.
+  С DEP-27 шаг 9 — с `-e thepost_wait_ready=false`: плейбук не ждёт готовности и завершается `failed=0` с
+  предупреждением (прогон 2026-11-12, S3 — `docs/manual-tests/DEP-15.md`, «Прогон S3»).

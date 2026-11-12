@@ -41,7 +41,9 @@ use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, MessageStore
 use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::secrets::{SecretRef, SecretStore};
-use tp_contracts::transport::{FlowInput, FlowOutcome, MailFlow};
+use tp_contracts::transport::{
+    AcceptedDomain, DomainKind, FlowInput, FlowOutcome, MailFlow, TransportStore,
+};
 use tp_meta::{MetaConfig, PgMeta};
 use tp_testkit::MemSecretStore;
 
@@ -138,8 +140,6 @@ smtp:
   hostname: localhost
   inbound:
     - {{ listen: \"127.0.0.1:0\" }}
-  delivery:
-    local_domains: [{domain}]
 imap:
   listeners:
     - {{ listen: \"127.0.0.1:0\", implicit_tls: true }}
@@ -205,6 +205,28 @@ async fn drop_database(url: &str, name: &str) {
         .await;
         admin.close().await;
     }
+}
+
+/// Принятый домен организации в БД (как `thepost admin domain add`): по нему SMTP доставляет
+/// локально (решение 96), настройки `smtp.delivery` доменов не задают.
+async fn accept_domain(meta: &PgMeta, tenant: TenantId, name: &str) -> DomainId {
+    let id = DomainId::new();
+    let version = TransportStore::cluster(meta)
+        .await
+        .expect("transport")
+        .version;
+    meta.put_domain(
+        version,
+        &AcceptedDomain {
+            id,
+            tenant,
+            name: name.to_owned(),
+            kind: DomainKind::Authoritative,
+        },
+    )
+    .await
+    .expect("accepted domain");
+    id
 }
 
 /// Адрес слушателя роли.
@@ -567,16 +589,7 @@ async fn mvp_mail_flow() {
     let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
-    let domain_id = DomainId::new();
-    let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
-    sqlx::query("INSERT INTO domains (tenant_id, domain_id, name) VALUES ($1, $2, $3)")
-        .bind(tenant.as_uuid())
-        .bind(domain_id.as_uuid())
-        .bind(&domain)
-        .execute(&mut *tx)
-        .await
-        .expect("domain");
-    tx.commit().await.expect("commit");
+    let domain_id = accept_domain(&meta, tenant, &domain).await;
     let login = format!("alice@{domain}");
     let account = meta
         .upsert(
@@ -1606,16 +1619,7 @@ async fn meeting_scheduling() {
     let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
-    let domain_id = DomainId::new();
-    let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
-    sqlx::query("INSERT INTO domains (tenant_id, domain_id, name) VALUES ($1, $2, $3)")
-        .bind(tenant.as_uuid())
-        .bind(domain_id.as_uuid())
-        .bind(&domain)
-        .execute(&mut *tx)
-        .await
-        .expect("domain");
-    tx.commit().await.expect("commit");
+    let domain_id = accept_domain(&meta, tenant, &domain).await;
     let apps =
         tp_auth::AppPasswords::new(Arc::new(meta.clone()), tp_auth::PasswordConfig::default())
             .expect("app passwords");
