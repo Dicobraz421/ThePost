@@ -5,13 +5,18 @@
 //! (тесты — `MemSecretStore`). Без `secrets.url` конфигурация со ссылками на секреты — явная ошибка запуска
 //! «хранилище секретов не настроено», без ссылок узел работает.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use tp_contracts::config::duration;
 use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::{Error, Result};
 use tp_platform::secrets::DoctorReport;
 use tp_platform::{Config, SecretsConfig, VaultStore};
+
+use crate::sections::{STARTUP, StartupSection};
 
 /// Имя секции хранилища секретов (регистрирует платформа).
 pub const SECRETS: &str = "secrets";
@@ -51,6 +56,101 @@ pub async fn store(
         return Err(Error::Invalid(not_configured(&refs)));
     }
     Ok(Arc::new(NoSecretStore))
+}
+
+/// Секреты конфигурации при запуске узла (APP-31, решение 2026-11-11 п. 58): пока хранилище временно недоступно
+/// (не запущено, запечатано, не отвечает), вход и чтение повторяются с растущей паузой до
+/// `startup.secrets_timeout`; в журнале — причина и время следующей попытки. Отказ, который повтор не исправит
+/// (нет секрета, нет прав, ошибка секции), завершает запуск сразу. По истечении срока — ошибка с причиной.
+pub async fn wait_ready(cfg: &Config, store: &dyn SecretStore) -> Result<()> {
+    let policy = (*cfg.section::<StartupSection>(STARTUP)?).clone();
+    let started = tokio::time::Instant::now();
+    let result = retry(
+        &policy,
+        || started.elapsed(),
+        tokio::time::sleep,
+        || async {
+            // Проба на копии: значения подключит `Reloader::with_secret_store`.
+            let mut probe = cfg.clone();
+            probe.resolve_secrets(store).await
+        },
+    )
+    .await;
+    match result {
+        Err(e) if e.is_retryable() => Err(Error::Internal(format!(
+            "хранилище секретов недоступно: за {} (startup.secrets_timeout) не удалось войти и прочитать              секреты конфигурации; причина: {}",
+            duration::format(policy.secrets_timeout),
+            cause(cfg).await
+        ))),
+        other => other,
+    }
+}
+
+/// Повторяет `op`, пока ошибка временная и не истёк `policy.secrets_timeout`: пауза растёт вдвое от
+/// `secrets_retry_initial` до `secrets_retry_max` (не меньше рекомендованной хранилищем `retry_after`) и не
+/// выходит за срок. Часы и ожидание — параметры (тесты — без реального времени).
+async fn retry<T, Op, OpFut, Sleep, SleepFut>(
+    policy: &StartupSection,
+    elapsed: impl Fn() -> Duration,
+    mut sleep: Sleep,
+    mut op: Op,
+) -> Result<T>
+where
+    Op: FnMut() -> OpFut,
+    OpFut: Future<Output = Result<T>>,
+    Sleep: FnMut(Duration) -> SleepFut,
+    SleepFut: Future<Output = ()>,
+{
+    let mut pause = policy.secrets_retry_initial;
+    let mut attempt = 1u32;
+    loop {
+        let e = match op().await {
+            Ok(v) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        attempt,
+                        waited = %duration::format(elapsed()),
+                        "хранилище секретов доступно, запуск продолжается"
+                    );
+                }
+                return Ok(v);
+            }
+            Err(e) => e,
+        };
+        let Error::Unavailable { retry_after } = &e else {
+            return Err(e);
+        };
+        let left = policy.secrets_timeout.saturating_sub(elapsed());
+        if left.is_zero() {
+            return Err(e);
+        }
+        let wait = pause
+            .max(retry_after.unwrap_or_default())
+            .min(policy.secrets_retry_max.max(policy.secrets_retry_initial))
+            .min(left);
+        tracing::warn!(
+            attempt,
+            next_attempt_in = %duration::format(wait),
+            give_up_in = %duration::format(left),
+            "хранилище секретов временно недоступно (не запущено, запечатано или не отвечает), \
+             запуск узла ждёт; причины по каждому секрету — в предупреждениях выше"
+        );
+        sleep(wait).await;
+        pause = pause.saturating_mul(2);
+        attempt += 1;
+    }
+}
+
+/// Причина недоступности хранилища для сообщения об ошибке: первая непройденная проверка `thepost doctor`.
+async fn cause(cfg: &Config) -> String {
+    use tp_platform::secrets::DoctorStatus;
+    doctor(cfg)
+        .await
+        .checks
+        .into_iter()
+        .find(|c| c.status == DoctorStatus::Fail)
+        .map(|c| format!("{}: {} ({})", c.id, c.message, c.value))
+        .unwrap_or_else(|| "хранилище не отвечает; подробности — thepost doctor".to_owned())
 }
 
 /// Проверки `thepost doctor` для хранилища секретов (PLT-12): секция, доступность, распечатывание, вход узла,
@@ -142,5 +242,119 @@ blob:
                 .map(|c| c.status),
             Some(DoctorStatus::Skipped)
         );
+    }
+
+    /// Виртуальные часы: ожидание только сдвигает время и вызывает `on_tick`.
+    async fn run_virtual(
+        policy: &StartupSection,
+        cfg: &Config,
+        store: &tp_testkit::MemSecretStore,
+        ready_at: Duration,
+    ) -> (Result<()>, Duration, Vec<Duration>) {
+        use std::cell::{Cell, RefCell};
+        let now = Cell::new(Duration::ZERO);
+        let pauses = RefCell::new(Vec::new());
+        store.seal();
+        let r = retry(
+            policy,
+            || now.get(),
+            |d| {
+                now.set(now.get() + d);
+                pauses.borrow_mut().push(d);
+                if now.get() >= ready_at {
+                    store.unseal();
+                }
+                std::future::ready(())
+            },
+            || async {
+                let mut probe = cfg.clone();
+                probe.resolve_secrets(store).await
+            },
+        )
+        .await;
+        (r, now.get(), pauses.into_inner())
+    }
+
+    fn mem_store() -> tp_testkit::MemSecretStore {
+        let store = tp_testkit::MemSecretStore::new(Arc::new(tp_testkit::SystemClock));
+        store.set(&"thepost/db#password".parse().expect("ref"), "pw");
+        store
+    }
+
+    /// Приёмка APP-31: хранилище отвечает через 20 с — запуск дожидается его без ошибки (и без перезапуска).
+    #[tokio::test]
+    async fn slow_store_is_awaited() {
+        let cfg = parse(DEV);
+        let policy = StartupSection::default();
+        let store = mem_store();
+        let (r, waited, pauses) = run_virtual(&policy, &cfg, &store, Duration::from_secs(20)).await;
+        r.expect("start after 20s");
+        assert!(waited >= Duration::from_secs(20) && waited < policy.secrets_timeout);
+        // Пауза растёт вдвое и ограничена сверху.
+        let secs: Vec<u64> = pauses.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 15]);
+    }
+
+    #[tokio::test]
+    async fn store_down_longer_than_timeout_fails() {
+        let cfg = parse(DEV);
+        let policy = StartupSection::default();
+        let store = mem_store();
+        let (r, waited, _) = run_virtual(&policy, &cfg, &store, Duration::from_secs(600)).await;
+        assert!(r.expect_err("timeout").is_retryable());
+        assert_eq!(waited, policy.secrets_timeout);
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_is_not_retried() {
+        let cfg = parse(DEV);
+        let store = mem_store();
+        store.forbid("thepost/db");
+        let (r, waited, pauses) = {
+            let policy = StartupSection::default();
+            let now = std::cell::Cell::new(Duration::ZERO);
+            let pauses = std::cell::RefCell::new(Vec::new());
+            let r: Result<()> = retry(
+                &policy,
+                || now.get(),
+                |d| {
+                    pauses.borrow_mut().push(d);
+                    std::future::ready(())
+                },
+                || async {
+                    let mut probe = cfg.clone();
+                    probe.resolve_secrets(&store).await
+                },
+            )
+            .await;
+            (r, now.get(), pauses.into_inner())
+        };
+        let e = r.expect_err("forbidden").to_string();
+        assert!(e.contains("thepost/db#password"), "{e}");
+        assert!(pauses.is_empty() && waited.is_zero());
+    }
+
+    /// Узел целиком: `wait_ready` на настоящих часах с короткими паузами; истёкший срок — понятная ошибка.
+    #[tokio::test]
+    async fn wait_ready_real_clock() {
+        let fast = "startup:\n  secrets_timeout: 300ms\n  secrets_retry_initial: 20ms\n  secrets_retry_max: 50ms\n";
+        let cfg = parse(&format!("{DEV}{fast}"));
+        let store = mem_store();
+        store.seal();
+        let unseal = store.clone();
+        let t = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            unseal.unseal();
+        });
+        wait_ready(&cfg, &store).await.expect("ready");
+        t.await.expect("join");
+
+        store.seal();
+        let e = wait_ready(&cfg, &store)
+            .await
+            .expect_err("timeout")
+            .to_string();
+        assert!(e.contains("хранилище секретов недоступно"), "{e}");
+        assert!(e.contains("startup.secrets_timeout"), "{e}");
     }
 }

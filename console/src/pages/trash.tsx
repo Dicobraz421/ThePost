@@ -28,7 +28,8 @@ function TrashTable({ account, hidden }: { account: string; hidden?: boolean }) 
     <>
       <Table<Entry> dataSource={page?.items} loading={query.isLoading} rowKey="message" pagination={false}>
         <Table.Column dataIndex="message" title="Письмо" />
-        <Table.Column dataIndex="origin" title="Исходная папка" />
+        {/* Узел отдаёт идентификатор папки; имён папок ящика в Admin API нет. */}
+        <Table.Column dataIndex="origin" title="Исходная папка (идентификатор)" />
         <Table.Column<Entry> title="Размер" render={(_, e) => bytes(e.size)} />
         <Table.Column<Entry> title="Принято" render={(_, e) => when(e.received_at)} />
         <Table.Column<Entry> title="Удалено" render={(_, e) => when(e.deleted_at)} />
@@ -38,7 +39,8 @@ function TrashTable({ account, hidden }: { account: string; hidden?: boolean }) 
           width={160}
           render={(_, e) => (
             <Popconfirm
-              title={`Восстановить письмо в папку «${e.origin}»?`}
+              title="Восстановить письмо в исходную папку?"
+              description="Исходной папки уже нет — письмо вернётся во «Входящие»."
               okText="Восстановить"
               onConfirm={() =>
                 mutate(

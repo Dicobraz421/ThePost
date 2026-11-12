@@ -71,7 +71,7 @@ fn to_vcard(mut card: Map<String, Value>) -> Result<(String, ObjectIndex), Value
 }
 
 /// Единственная адресная книга из `addressBookIds`; иначе — `None`.
-fn single_book(v: &Value) -> Option<&str> {
+pub(crate) fn single_book(v: &Value) -> Option<&str> {
     let m = v.as_object()?;
     let mut on = m.iter().filter(|(_, v)| **v == Value::Bool(true));
     let (id, _) = on.next()?;
@@ -79,7 +79,7 @@ fn single_book(v: &Value) -> Option<&str> {
 }
 
 /// Карточки книг `books` (в порядке книг и имён ресурсов).
-async fn load(
+pub(crate) async fn load(
     store: &dyn DavStore,
     scope: AccountScope,
     books: &[CollectionId],
@@ -202,7 +202,7 @@ fn strings(v: &Value, out: &mut Vec<String>) {
 }
 
 /// Есть ли `needle` (в нижнем регистре) в строках свойств `props` карточки.
-fn contains(card: &Map<String, Value>, props: &[&str], needle: &str) -> bool {
+pub(crate) fn contains(card: &Map<String, Value>, props: &[&str], needle: &str) -> bool {
     let mut all = Vec::new();
     for p in props {
         if let Some(v) = card.get(*p) {
@@ -416,7 +416,10 @@ pub(crate) async fn query_changes(
 
 /// Патч RFC 8620 §5.3: путь — указатель JSON без ведущего `/`, `null` удаляет свойство. Путь через массив или
 /// несуществующее свойство — `invalidPatch`.
-fn apply_patch(card: &mut Map<String, Value>, patch: &Map<String, Value>) -> Result<(), Value> {
+pub(crate) fn apply_patch(
+    card: &mut Map<String, Value>,
+    patch: &Map<String, Value>,
+) -> Result<(), Value> {
     for (path, val) in patch {
         let parts: Vec<String> = path
             .split('/')
@@ -638,7 +641,7 @@ pub(crate) async fn copy(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use base64::Engine;
@@ -677,7 +680,7 @@ mod tests {
     ];
 
     /// Сервер CardDAV поверх того же хранилища и входа.
-    async fn dav(env: &Env) -> std::net::SocketAddr {
+    pub(crate) async fn dav(env: &Env) -> std::net::SocketAddr {
         let app = tp_dav::router(
             tp_dav::Deps {
                 auth: Arc::new(env.auth.clone()),

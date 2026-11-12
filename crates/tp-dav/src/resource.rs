@@ -7,7 +7,8 @@
 //! (RFC 4791 §5.3.4). Предусловия (403 с `<d:error>`): `valid-calendar-data` / `valid-address-data` (тело не
 //! разбирается calcard), `valid-calendar-object-resource` (один UID и один вид компонента, без `METHOD`),
 //! `supported-calendar-component`, `no-uid-conflict` (с `href` ресурса с тем же UID), `max-resource-size`,
-//! `min-date-time` / `max-date-time` (`dav.min_date_year`, `dav.max_date_year`); нет коллекции — 409.
+//! `min-date-time` / `max-date-time` (`dav.min_date_year`, `dav.max_date_year`); нет коллекции — 409. Проверка
+//! карточек (версия, размер фото) и выдача `GET` в версии vCard из `Accept` — [`crate::card`].
 //!
 //! `MKCALENDAR` и `MKCOL` — коллекция с именем из последнего сегмента URL: в доме календарей — календарь, в доме
 //! адресных книг — адресная книга (`resourcetype` другого вида — 403 `valid-resourcetype`). Начальные свойства —
@@ -27,6 +28,8 @@ use tp_contracts::dav::{
 };
 use tp_contracts::{Error, Result};
 
+use crate::card;
+use crate::gal;
 use crate::index::{self, IndexError};
 use crate::path::Target;
 use crate::props::{self, content_type};
@@ -46,17 +49,31 @@ pub(crate) async fn get(cx: &Cx<'_>, target: &Target, head: bool) -> Result<Resp
     let Target::Object(kind, _, coll, name) = target else {
         return Ok(not_allowed());
     };
-    let Some(c) = by_name(cx, *kind, coll).await? else {
+    let o = if let Some(g) = gal::find(cx, *kind, coll).await? {
+        g.card(name).cloned()
+    } else {
+        let Some(c) = by_name(cx, *kind, coll).await? else {
+            return Ok(status(StatusCode::NOT_FOUND));
+        };
+        cx.store().get_object(cx.scope, c.id, name).await?
+    };
+    let Some(o) = o else {
         return Ok(status(StatusCode::NOT_FOUND));
     };
-    let Some(o) = cx.store().get_object(cx.scope, c.id, name).await? else {
-        return Ok(status(StatusCode::NOT_FOUND));
+    // Карточка — в версии vCard из `Accept`, если она названа (иначе — как хранится).
+    let version = match kind {
+        CollectionKind::AddressBook => cx.header("accept").and_then(card::accept_version),
+        CollectionKind::Calendar => None,
     };
-    let len = o.body.len();
+    let body = match version {
+        Some(v) => card::in_version(&o.body, v).into_owned(),
+        None => o.body,
+    };
+    let len = body.len();
     let mut resp = if head {
         Response::new(Body::empty())
     } else {
-        Response::new(Body::from(o.body))
+        Response::new(Body::from(body))
     };
     let h = resp.headers_mut();
     h.insert(
@@ -94,7 +111,11 @@ fn checked_index(
 ) -> std::result::Result<ObjectIndex, &'static str> {
     const RESOURCE: &str = "<c:valid-calendar-object-resource/>";
     let result = match kind {
-        CollectionKind::AddressBook => index::card(text).map_err(|e| (e, valid_data(kind))),
+        CollectionKind::AddressBook => {
+            return card::check_put(text, cx.dav.cfg.max_photo_size).inspect_err(|inner| {
+                tracing::debug!(precondition = inner, "DAV PUT: карточка не принята");
+            });
+        }
         CollectionKind::Calendar => match ICalendar::parse(text) {
             Err(_) => Err((IndexError::Calendar, valid_data(kind))),
             Ok(ical) => {

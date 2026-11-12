@@ -32,7 +32,7 @@ runs:
           echo yes=false >> "$GITHUB_OUTPUT"
         fi
     - if: steps.has.outputs.yes == 'true'
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7.1.0
       with:
         node-version: ${{ inputs.node-version }}
         cache: npm

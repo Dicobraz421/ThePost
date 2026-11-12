@@ -5,7 +5,8 @@ import { ErrorComponent, ThemedLayout, ThemedTitle, useNotificationProvider } fr
 import { Authenticated, Refine, usePermissions } from "@refinedev/core";
 import routerProvider, { CatchAllNavigate, DocumentTitleHandler, NavigateToResource } from "@refinedev/react-router";
 import { App as AntdApp, ConfigProvider } from "antd";
-import ruRU from "antd/locale/ru_RU";
+// ES-модуль: `antd/locale/ru_RU` (CommonJS) в сборке Vite приходит обёрткой без текстов — интерфейс остаётся английским.
+import ruRU from "antd/es/locale/ru_RU";
 import dayjs from "dayjs";
 import { Outlet, Route, Routes } from "react-router";
 

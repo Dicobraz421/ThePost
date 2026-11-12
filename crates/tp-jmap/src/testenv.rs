@@ -238,7 +238,10 @@ impl Env {
         .expect("jmap")
         .with_profile_signer(signer)
         .with_sieve(stores.then(|| Arc::new(sieve.clone()) as Arc<dyn SieveStore>))
-        .with_dav(stores.then(|| Arc::new(dav.clone()) as Arc<dyn DavStore>));
+        .with_dav(stores.then(|| Arc::new(dav.clone()) as Arc<dyn DavStore>))
+        .with_freebusy(
+            stores.then(|| Arc::new(dav.clone()) as Arc<dyn tp_contracts::schedule::FreeBusy>),
+        );
         Self {
             meta,
             search,

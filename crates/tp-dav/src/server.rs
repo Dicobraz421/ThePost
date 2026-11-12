@@ -3,7 +3,7 @@
 //! Вход — `Authorization: Basic` (пароль приложения) или `Bearer` (OAuth 2.0) через [`Authenticator`], как в JMAP;
 //! без данных или с неверными — 401 с `WWW-Authenticate: Basic realm="dav"`. `OPTIONS` отвечает без входа
 //! (клиенты узнают возможности сервера до запроса пароля). Доступ — только к своим ресурсам: логин в URL не
-//! совпадает с вошедшим — 403 (общий доступ — DAV-17).
+//! совпадает с вошедшим — 403 (общий доступ — DAV-17). Глобальная адресная книга ([`crate::gal`]) — только чтение.
 //!
 //! `/.well-known/caldav` и `/.well-known/carddav` перенаправляет на `/dav/` `tp-jmap` (секция `jmap.autoconfig`,
 //! по умолчанию `caldav: /dav/`, `carddav: /dav/`); здесь эти пути не обслуживаются.
@@ -21,15 +21,16 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use time::OffsetDateTime;
 use tp_contracts::Error;
-use tp_contracts::auth::{Authenticator, Credentials, Principal};
+use tp_contracts::auth::{Authenticator, Credentials, Directory, Principal};
 use tp_contracts::dav::DavStore;
+use tp_contracts::groups::GroupStore;
 use tp_contracts::meta::AccountScope;
 
 use crate::config::DavConfig;
 use crate::index::IndexOptions;
 use crate::path::Target;
 use crate::xml::{self, Element};
-use crate::{props, resource, sync};
+use crate::{gal, props, resource, sync};
 
 /// Значение заголовка `DAV` (RFC 4918 §10.1, RFC 3744, RFC 4791 §5.1, RFC 6352 §6.1, RFC 5689).
 pub const DAV_HEADER: &str = "1, 3, access-control, calendar-access, addressbook, extended-mkcol";
@@ -47,6 +48,22 @@ pub struct Deps {
     pub store: Arc<dyn DavStore>,
 }
 
+/// Источники глобальной адресной книги ([`router_with_gal`]).
+#[derive(Clone)]
+pub struct GalDeps {
+    /// Каталог организации: учётные записи и группы.
+    pub directory: Arc<dyn Directory>,
+    /// Группы рассылки: скрытые из адресной книги (`hidden_from_gal`) в неё не попадают; `None` — видны все
+    /// группы каталога.
+    pub groups: Option<Arc<dyn GroupStore>>,
+}
+
+impl fmt::Debug for GalDeps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GalDeps").finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for Deps {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Deps")
@@ -60,6 +77,10 @@ impl fmt::Debug for Deps {
 pub(crate) struct Dav {
     pub d: Deps,
     pub cfg: DavConfig,
+    /// Источники глобальной адресной книги; `None` — книги нет.
+    pub gal_deps: Option<GalDeps>,
+    /// Построенные глобальные адресные книги.
+    pub gal: gal::Cache,
 }
 
 impl Dav {
@@ -78,7 +99,22 @@ impl Dav {
 
 /// Маршруты DAV под `/dav/`; TLS, PROXY и слушатель — у вызывающего (`tp-platform`).
 pub fn router(d: Deps, cfg: DavConfig) -> Router {
-    let dav = Arc::new(Dav { d, cfg });
+    build(d, None, cfg)
+}
+
+/// Маршруты DAV с глобальной адресной книгой «Организация» из каталога `gal` (только чтение, в доме адресных
+/// книг каждого пользователя).
+pub fn router_with_gal(d: Deps, gal: GalDeps, cfg: DavConfig) -> Router {
+    build(d, Some(gal), cfg)
+}
+
+fn build(d: Deps, gal_deps: Option<GalDeps>, cfg: DavConfig) -> Router {
+    let dav = Arc::new(Dav {
+        d,
+        cfg,
+        gal_deps,
+        gal: gal::Cache::default(),
+    });
     Router::new()
         .route("/dav", any(handle))
         .route("/dav/", any(handle))
@@ -161,7 +197,15 @@ async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {
         },
         headers: &parts.headers,
     };
-    let result = match parts.method.as_str() {
+    let method = parts.method.as_str();
+    if matches!(
+        method,
+        "PUT" | "DELETE" | "PROPPATCH" | "MKCOL" | "MKCALENDAR"
+    ) && gal::is_target(&cx, &target)
+    {
+        return gal::read_only(&cx, &target);
+    }
+    let result = match method {
         "PROPFIND" => props::propfind(&cx, &target, body).await,
         "PROPPATCH" => props::proppatch(&cx, &target, body).await,
         "REPORT" => sync::report(&cx, &target, body).await,

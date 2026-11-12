@@ -44,6 +44,7 @@ use utoipa::{Modify, OpenApi, ToSchema};
 
 use crate::accounts::{DomainStore, PolicyStore};
 use crate::audit::{AUDIT_ROUTE, AuditLog, AuditRecord, AuditSink};
+use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
 use crate::init::{InitConfig, Local};
@@ -136,6 +137,7 @@ pub struct RoleBinding {
 /// init: { token_ttl: 10m, session_ttl: 8h, socket: /var/lib/thepost/admin.sock }
 /// audit:
 ///   syslog: { address: "siem.example.org:6514" }
+/// console: { enabled: true, connect_src: ["https://idp.example.org"] }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -158,6 +160,8 @@ pub struct AdminConfig {
     pub audit: AuditExportConfig,
     /// Первый администратор без OIDC (`thepost admin init`, [`crate::init`]).
     pub init: InitConfig,
+    /// Веб-консоль администратора ([`crate::console`]); по умолчанию раздаётся.
+    pub console: ConsoleConfig,
 }
 
 impl Default for AdminConfig {
@@ -172,6 +176,7 @@ impl Default for AdminConfig {
             allow_external: false,
             audit: AuditExportConfig::default(),
             init: InitConfig::default(),
+            console: ConsoleConfig::default(),
         }
     }
 }
@@ -204,6 +209,7 @@ impl AdminConfig {
         }
         self.audit.check()?;
         self.init.check()?;
+        self.console.check()?;
         if self.page_size == 0 || self.page_size > self.max_page_size {
             return Err(Error::invalid("admin: page_size — от 1 до max_page_size"));
         }
@@ -371,6 +377,7 @@ impl Admin {
                 .route(&format!("{prefix}/{{*rest}}"), any(handler));
         }
         let api = api.route_layer(middleware::from_fn_with_state(self.clone(), guard));
+        let api = crate::console::routes(api, &self.cfg.console, crate::console::embedded());
         crate::init::routes(api)
             .route("/api/openapi.json", get(openapi))
             .layer(DefaultBodyLimit::max(self.cfg.max_body_size))

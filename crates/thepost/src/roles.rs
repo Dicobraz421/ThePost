@@ -1,8 +1,10 @@
 //! Сервисы ролей ядра (SRS 2.1): maintenance — GC и «сироты» BLOB под лизой лидера, истечение срока корзины
 //! (`tp-mailstore`: таймер на ближайший срок → точка принятия решений → окончательное удаление), подписчики
-//! журнала событий (по сигналам, [`crate::log_reader`]); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
+//! журнала событий (по сигналам, [`crate::log_reader`]), очистка по сроку надгробий DAV и журнала автоответов
+//! ([`Purge`], решение 2026-11-11 п. 65); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tp_blob::{GcConfig, GcWorker, OrphanConfig, OrphanSweeper, system_now};
@@ -11,6 +13,7 @@ use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::events::EventSink;
 use tp_contracts::lease::LeaseStore;
 use tp_contracts::role::{CancellationToken, Role, RoleCtx, RoleService};
+use tp_meta::PgMeta;
 use tp_meta::events::EventConsumer;
 
 use crate::log_reader::{LogReader, LogSignals};
@@ -57,6 +60,76 @@ pub struct Maintenance {
     /// Почтовое хранилище для истечения срока корзины (`TrashStore::expired` → `before_final_delete` →
     /// `expunge_final`, секция `mailstore.trash`); `None` — истечение не выполняется (тесты).
     pub trash: Option<tp_mailstore::Store>,
+    /// Очистка по сроку надгробий DAV и журнала автоответов; `None` — не выполняется (тесты без PostgreSQL).
+    pub purge: Option<Purge>,
+}
+
+/// Очистка по сроку в роли maintenance (APP-32): надгробия DAV старше `meta.dav.tombstone_ttl` и записи журнала
+/// автоответов старше `meta.sieve.vacation_log_ttl` — сроки знает [`PgMeta`]. Удаление по сроку идемпотентно,
+/// повтор удаляет только оставшееся: как и истечение корзины, работает на каждом узле с ролью без лизы.
+#[derive(Clone)]
+pub struct Purge {
+    /// Метаданные: шаги `purge_dav_tombstones` и `purge_vacation_log`.
+    pub meta: PgMeta,
+    /// Период (`maintenance.purge_interval`); первый проход — при запуске роли.
+    pub interval: Duration,
+}
+
+/// Итог одного прохода [`Purge::step`]: число удалённых записей каждого шага.
+#[derive(Debug)]
+pub struct Purged {
+    /// Надгробия DAV.
+    pub dav_tombstones: Result<u64>,
+    /// Записи журнала автоответов.
+    pub vacation_log: Result<u64>,
+}
+
+impl std::fmt::Debug for Purge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Purge")
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Purge {
+    /// Один проход: оба шага независимы — ошибка одного не отменяет другой и ждёт следующего прохода.
+    pub async fn step(&self) -> Purged {
+        let done = Purged {
+            dav_tombstones: self.meta.purge_dav_tombstones().await,
+            vacation_log: self.meta.purge_vacation_log().await,
+        };
+        for (step, result) in [
+            ("purge_dav_tombstones", &done.dav_tombstones),
+            ("purge_vacation_log", &done.vacation_log),
+        ] {
+            match result {
+                Ok(0) => tracing::debug!(step, "очистка по сроку: удалять нечего"),
+                Ok(deleted) => tracing::info!(step, deleted, "очистка по сроку"),
+                Err(e) => {
+                    tracing::warn!(step, error = %e, "очистка по сроку не выполнена: повтор в следующий проход");
+                }
+            }
+        }
+        done
+    }
+
+    /// Проходы с периодом [`Purge::interval`] до остановки; остановка прерывает и идущий проход (незавершённая
+    /// транзакция откатывается, следующий запуск удалит оставшееся).
+    pub async fn run(self, shutdown: CancellationToken) {
+        let mut tick = tokio::time::interval(self.interval.max(Duration::from_millis(1)));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                _ = self.step() => {}
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Maintenance {
@@ -64,6 +137,7 @@ impl std::fmt::Debug for Maintenance {
         f.debug_struct("Maintenance")
             .field("holder", &self.holder)
             .field("trash", &self.trash.is_some())
+            .field("purge", &self.purge)
             .field(
                 "sinks",
                 &self.sinks.iter().map(|s| s.name()).collect::<Vec<_>>(),
@@ -116,6 +190,10 @@ impl RoleService for Maintenance {
             let token = ctx.shutdown.clone();
             tokio::spawn(async move { store.run_trash_expiry(token.cancelled_owned()).await })
         });
+        let purge = self
+            .purge
+            .clone()
+            .map(|purge| tokio::spawn(purge.run(ctx.shutdown.clone())));
         ctx.ready.set(true);
         let trash = async move {
             match trash {
@@ -123,10 +201,17 @@ impl RoleService for Maintenance {
                 None => Ok(()),
             }
         };
-        let (gc, orphans, trash, ()) = tokio::join!(
+        let purge = async move {
+            match purge {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
+        let (gc, orphans, trash, purge, ()) = tokio::join!(
             gc,
             orphans,
             trash,
+            purge,
             consume(
                 self.events.clone(),
                 self.sinks.clone(),
@@ -138,6 +223,7 @@ impl RoleService for Maintenance {
             ("blob-gc", gc),
             ("blob-orphans", orphans),
             ("trash-expiry", trash),
+            ("purge", purge),
         ] {
             if let Err(e) = done {
                 return Err(tp_contracts::Error::Internal(format!("{what}: {e}")));
@@ -257,6 +343,7 @@ mod tests {
             gc: GcConfig::default(),
             orphans: OrphanConfig::default(),
             trash: None,
+            purge: None,
         };
         let (ctx, shutdown, ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -271,5 +358,166 @@ mod tests {
         assert!(ready.is_ready());
         shutdown.cancel();
         task.await.expect("join").expect("run");
+    }
+
+    /// APP-32: проход очистки удаляет надгробия DAV и записи журнала автоответов старше срока из `meta`, свежие
+    /// остаются; роль maintenance выполняет проход при запуске. Отдельная база: очистка — по всем организациям.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purge_removes_expired_dav_tombstones_and_vacation_log() {
+        use tp_contracts::dav::{Collection, CollectionKind, DavStore};
+        use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+        use tp_contracts::sieve::VacationLog;
+        use tp_contracts::{DomainId, TenantId};
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let ttl = Duration::from_secs(2);
+        let mut cfg = tp_meta::MetaConfig::default();
+        cfg.dav.tombstone_ttl = ttl;
+        cfg.sieve.vacation_log_ttl = ttl;
+        let meta = PgMeta::new(pool.clone(), cfg);
+
+        let (tenant, domain) = (TenantId::new(), DomainId::new());
+        let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
+        sqlx::query("INSERT INTO tenants (tenant_id, name) VALUES ($1, 'test')")
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("tenant");
+        sqlx::query(
+            "INSERT INTO domains (tenant_id, domain_id, name) VALUES ($1, $2, 'purge.test')",
+        )
+        .bind(tenant.as_uuid())
+        .bind(domain.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("domain");
+        tx.commit().await.expect("commit");
+        let account = meta
+            .upsert(
+                tenant,
+                AccountUpsert {
+                    domain,
+                    login: "user@purge.test".into(),
+                    display_name: "User".into(),
+                    external_id: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("upsert");
+        let scope = AccountScope {
+            tenant,
+            account: account.id,
+        };
+        // Надгробие — удалённая коллекция; запись журнала — отметка об автоответе отправителю.
+        let tombstone = |name: &'static str| {
+            let meta = meta.clone();
+            async move {
+                let book = Collection::new(CollectionKind::AddressBook, name);
+                let id = book.id;
+                meta.create_collection(scope, book).await.expect("create");
+                meta.delete_collection(scope, id).await.expect("delete");
+            }
+        };
+        let tombstones = || {
+            let pool = pool.clone();
+            async move {
+                let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
+                let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM dav_tombstones")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("count");
+                n
+            }
+        };
+        let day = Duration::from_secs(24 * 3600);
+        tombstone("old").await;
+        assert!(
+            !meta
+                .seen(scope, "old@example.net", "", day)
+                .await
+                .expect("seen")
+        );
+        tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+        tombstone("fresh").await;
+        assert!(
+            !meta
+                .seen(scope, "fresh@example.net", "", day)
+                .await
+                .expect("seen")
+        );
+        assert_eq!(tombstones().await, 2);
+
+        let purge = Purge {
+            meta: meta.clone(),
+            interval: Duration::from_secs(3600),
+        };
+        let done = purge.step().await;
+        assert_eq!(done.dav_tombstones.expect("dav"), 1);
+        assert_eq!(done.vacation_log.expect("vacation"), 1);
+        assert_eq!(tombstones().await, 1, "свежее надгробие на месте");
+        assert!(
+            meta.seen(scope, "fresh@example.net", "", day)
+                .await
+                .expect("seen"),
+            "свежая запись журнала на месте"
+        );
+        assert!(
+            !meta
+                .seen(scope, "old@example.net", "", day)
+                .await
+                .expect("seen"),
+            "старая запись удалена: отправителю снова отвечают"
+        );
+
+        // Роль: проход при запуске — после срока уходит и второе надгробие.
+        tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+        let leases = MemLease::default();
+        let role = Maintenance {
+            index: Arc::new(MemBlobIndex::default()),
+            store: Arc::new(MemBlobStore::default()),
+            leases: Arc::new(leases.clone()),
+            holder: "node-a/1".into(),
+            events: EventConsumer::new(
+                Arc::new(MemEventLog::new(1)) as Arc<dyn EventLog>,
+                Arc::new(leases),
+                "node-a/1",
+                tp_meta::events::EventsConfig::default(),
+            ),
+            sinks: Vec::new(),
+            signals: LogSignals {
+                bus: Arc::new(tp_cluster::LocalBus::new(
+                    &tp_cluster::LocalBusConfig::default(),
+                )),
+                members: None,
+                lease_ttl: Duration::from_secs(30),
+                resubscribe: Duration::from_secs(1),
+            },
+            gc: GcConfig::default(),
+            orphans: OrphanConfig::default(),
+            trash: None,
+            purge: Some(purge),
+        };
+        let (ctx, shutdown, _ready) = ctx();
+        let task = tokio::spawn(async move { role.run(ctx).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tombstones().await != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "роль не выполнила очистку"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        shutdown.cancel();
+        task.await.expect("join").expect("run");
+        pool.close().await;
+        crate::testutil::drop_database(&url, &db_name).await;
     }
 }

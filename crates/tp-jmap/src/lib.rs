@@ -13,9 +13,16 @@
 //! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`
 //!   (подпись профиля ключом TLS — [`ProfileSigner`], [`Jmap::with_profile_signer`]);
 //! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
+//! - `calendar_event` — CalendarEvent/get, changes, set, copy: iCalendar в `DavStore`, JSCalendar — calcard,
+//!   индекс — `tp_dav::index`;
+//! - `calendar_query` — CalendarEvent/query, queryChanges: интервал по индексу и развёртке повторов calcard,
+//!   `expandRecurrences`;
+//! - `calendars` — Calendar/get, changes, set (draft-ietf-jmap-calendars) поверх `DavStore`, [`Jmap::with_dav`];
 //! - `contact_card` — ContactCard/get, changes, query, queryChanges, set, copy: vCard в `DavStore`, JSContact —
 //!   calcard, индекс — `tp_dav::index`;
 //! - `contacts` — AddressBook/get, changes, set (RFC 9610) поверх `DavStore`, [`Jmap::with_dav`];
+//! - `principal` — Principal/get, query (RFC 9670) и Principal/getAvailability поверх `AccountStore` и `FreeBusy`,
+//!   [`Jmap::with_freebusy`];
 //! - `sieve` — SieveScript/get, set, query, validate (RFC 9661) поверх `SieveStore` и проверки `tp_sieve`;
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
@@ -23,6 +30,9 @@
 
 mod autoconfig;
 mod blob;
+mod calendar_event;
+mod calendar_query;
+mod calendars;
 mod contact_card;
 mod contacts;
 pub mod core;
@@ -32,6 +42,7 @@ mod email_set;
 #[doc(hidden)]
 pub mod fuzz;
 mod mailbox;
+mod principal;
 mod push;
 mod settings;
 mod sieve;
@@ -46,7 +57,10 @@ pub use crate::autoconfig::sign::{ProfileSigner, SignatureAlgorithm, SigningKey}
 pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
 
 use crate::core::error::MethodResult;
-use crate::core::{CONTACTS, CORE, Ctx, MAIL, SETTINGS, SIEVE, SUBMISSION, VACATION};
+use crate::core::{
+    AVAILABILITY, CALENDARS, CONTACTS, CORE, Ctx, MAIL, PRINCIPALS, SETTINGS, SIEVE, SUBMISSION,
+    VACATION,
+};
 
 /// Встроенные методы и их capability.
 pub(crate) const METHODS: &[(&str, &str)] = &[
@@ -90,6 +104,18 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("ContactCard/queryChanges", CONTACTS),
     ("ContactCard/set", CONTACTS),
     ("ContactCard/copy", CONTACTS),
+    ("Principal/get", PRINCIPALS),
+    ("Principal/query", PRINCIPALS),
+    ("Principal/getAvailability", AVAILABILITY),
+    ("Calendar/get", CALENDARS),
+    ("Calendar/changes", CALENDARS),
+    ("Calendar/set", CALENDARS),
+    ("CalendarEvent/get", CALENDARS),
+    ("CalendarEvent/changes", CALENDARS),
+    ("CalendarEvent/query", CALENDARS),
+    ("CalendarEvent/queryChanges", CALENDARS),
+    ("CalendarEvent/set", CALENDARS),
+    ("CalendarEvent/copy", CALENDARS),
 ];
 
 /// Варианты сортировки `Email/query` (сессия, `emailQuerySortOptions`).
@@ -142,6 +168,18 @@ pub(crate) async fn call_builtin(
         "ContactCard/queryChanges" => contact_card::query_changes(ctx, args).await,
         "ContactCard/set" => contact_card::set(ctx, args).await,
         "ContactCard/copy" => contact_card::copy(ctx, args).await,
+        "Principal/get" => principal::get(ctx, args).await,
+        "Principal/query" => principal::query(ctx, args).await,
+        "Principal/getAvailability" => principal::get_availability(ctx, args).await,
+        "Calendar/get" => calendars::get(ctx, args).await,
+        "Calendar/changes" => calendars::changes(ctx, args).await,
+        "Calendar/set" => calendars::set(ctx, args).await,
+        "CalendarEvent/get" => calendar_event::get(ctx, args).await,
+        "CalendarEvent/changes" => calendar_event::changes(ctx, args).await,
+        "CalendarEvent/query" => calendar_query::query(ctx, args).await,
+        "CalendarEvent/queryChanges" => calendar_query::query_changes(ctx, args).await,
+        "CalendarEvent/set" => calendar_event::set(ctx, args).await,
+        "CalendarEvent/copy" => calendar_event::copy(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
 }
