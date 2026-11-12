@@ -3135,6 +3135,11 @@ export interface components {
              */
             quota_bytes?: number | null;
             /**
+             * Format: int32
+             * @description Лимит отправки, адресатов в час (сумма получателей писем за скользящий час).
+             */
+            rcpts_per_hour?: number | null;
+            /**
              * @description Срок хранения писем (политика хранения).
              * @example 365d
              */
