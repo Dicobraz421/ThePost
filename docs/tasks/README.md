@@ -264,7 +264,7 @@
 | [META-30](META-30.md) | хранилища ящика через справочник шардов | meta | A | meta-13 | done | META-29,META-27 |
 | [META-31](META-31.md) | журнал событий, очередь и учёт BLOB по шардам | meta | A | meta-13 | done | META-30,CTR-34 |
 | [META-32](META-32.md) | чтение с реплик для фоновых задач | meta | A | meta-14 | done | META-30 |
-| [BLOB-15](BLOB-15.md) | сборка мусора по учёту ссылок всех шардов | blob | A | blob-08 | ready | META-31,BLOB-14 |
+| [BLOB-15](BLOB-15.md) | сборка мусора по учёту ссылок всех шардов | blob | A | blob-08 | done | META-31,BLOB-14 |
 | [APP-11](APP-11.md) | CLI thepost admin | app | A | app-07 | done | ADM-01 |
 | [DEP-10](DEP-10.md) | HPA, VPA и эталон «малый Enterprise» | deploy | A | deploy-07 | done | DEP-09 |
 
@@ -272,13 +272,13 @@
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [SYS-13](SYS-13.md) | свободное место файловой системы (`statvfs`) | sys | A | sys-08 | ready | — |
-| [APP-45](APP-45.md) | межузловой канал: перечитывание сертификатов по событиям | app | A | app-40 | todo | CLU-14 |
-| [APP-46](APP-46.md) | службы ролей узла в Rpc | app | A | app-40 | todo | APP-18 |
-| [APP-47](APP-47.md) | шарды и реплики СУБД в узле | app | A | app-40 | todo | META-30,META-31,META-32,META-41 |
-| [APP-48](APP-48.md) | нагрузка узла: свободное место дисков кэша | app | A | app-40 | todo | SYS-13,APP-10 |
-| [META-61](META-61.md) | срок корзины уровня папки на шарде, отличном от основного | meta | A | meta-38 | ready | META-30 |
-| [META-62](META-62.md) | повтор `enqueue` и пароля приложения при переключении СУБД | meta | A | meta-38 | ready | META-40 |
+| [SYS-13](SYS-13.md) | свободное место файловой системы (`statvfs`) | sys | A | sys-08 | done | — |
+| [APP-45](APP-45.md) | межузловой канал: перечитывание сертификатов по событиям | app | A | app-40 | ready | CLU-14 |
+| [APP-46](APP-46.md) | службы ролей узла в Rpc | app | A | app-40 | ready | APP-18 |
+| [APP-47](APP-47.md) | шарды и реплики СУБД в узле | app | A | app-40 | ready | META-30,META-31,META-32,META-41 |
+| [APP-48](APP-48.md) | нагрузка узла: свободное место дисков кэша | app | A | app-40 | ready | SYS-13,APP-10 |
+| [META-61](META-61.md) | срок корзины уровня папки на шарде, отличном от основного | meta | A | meta-38 | done | META-30 |
+| [META-62](META-62.md) | повтор `enqueue` и пароля приложения при переключении СУБД | meta | A | meta-38 | done | META-40 |
 | [DEP-30](DEP-30.md) | эталоны: прямые адреса и реплики СУБД | deploy | A | deploy-24 | ready | META-41,META-32 |
 | [DEP-31](DEP-31.md) | прогон pg-ha и «малого Enterprise» после правки community.postgresql | deploy | A | deploy-24 | ready | DEP-17,DEP-18 |
 | [DEP-32](DEP-32.md) | «малый Enterprise» на 5 ВМ и отказ одной ВМ | deploy | A | deploy-24 | ready | DEP-10,DEP-31 |
@@ -297,29 +297,29 @@
 | [META-64](META-64.md) | сессии Admin API в PostgreSQL | meta | B | meta-40 | todo | CTR-61 |
 | [ADM-28](ADM-28.md) | сессии Admin API через хранилище | admin | A | admin-18 | todo | CTR-61 |
 | [APP-50](APP-50.md) | узел: сессии Admin API в PostgreSQL и их очистка | app | A | app-42 | todo | META-64,ADM-28 |
-| [DEP-36](DEP-36.md) | эталон: движок PKI OpenBao для внутренних сертификатов | deploy | A | deploy-26 | todo | PLT-26 |
+| [DEP-36](DEP-36.md) | эталон: движок PKI OpenBao для внутренних сертификатов | deploy | A | deploy-26 | ready | PLT-26 |
 
 ## Ф1 · Решение 2026-11-04: соответствие функциям Exchange — этап 3, кроме `jmap-14` (этап 2)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
 | [CTR-35](CTR-35.md) | контракты: соответствие Exchange | contracts | B | contracts-23 | done | CTR-34 |
-| [META-33](META-33.md) | хранение: списки, контакты, оргструктура, аудит, отключённые ящики | meta | A | meta-15 | ready | CTR-35,META-30 |
-| [AUTH-10](AUTH-10.md) | синхронизация каталога: контакты, оргструктура, отключение ящиков | auth | A | auth-05 | ready | CTR-35,AUTH-07 |
-| [MS-16](MS-16.md) | архив ящика | mailstore | A | mailstore-10 | ready | CTR-35,MS-14 |
-| [MS-17](MS-17.md) | хранение отключённых ящиков | mailstore | A | mailstore-10 | ready | CTR-35,MS-16 |
-| [SMTP-24](SMTP-24.md) | отложенная отправка и отмена | smtp | A | smtp-07 | ready | CTR-35,SMTP-14 |
-| [SMTP-25](SMTP-25.md) | личные списки отправителей при доставке | smtp | A | smtp-07 | ready | CTR-35,SMTP-16 |
-| [SMTP-26](SMTP-26.md) | раскрытие динамических групп и контактов | smtp | A | smtp-07 | ready | CTR-35,SMTP-16 |
-| [SMTP-27](SMTP-27.md) | профиль Milter для исходящей почты | smtp | A | smtp-07 | ready | SMTP-05 |
-| [JMAP-15](JMAP-15.md) | отложенная отправка в EmailSubmission | jmap | A | jmap-08 | ready | CTR-35,JMAP-07 |
-| [JMAP-16](JMAP-16.md) | статус доставки EmailSubmission | jmap | A | jmap-08 | ready | CTR-35,JMAP-07 |
-| [JMAP-17](JMAP-17.md) | расширения: списки отправителей и оргструктура | jmap | A | jmap-08 | ready | CTR-35,JMAP-01 |
-| [JMAP-18](JMAP-18.md) | аудит доступа к ящику в JMAP | jmap | A | jmap-08 | ready | CTR-35,JMAP-05 |
+| [META-33](META-33.md) | хранение: списки, контакты, оргструктура, аудит, отключённые ящики | meta | A | meta-15 | done | CTR-35,META-30 |
+| [AUTH-10](AUTH-10.md) | синхронизация каталога: контакты, оргструктура, отключение ящиков | auth | A | auth-05 | done | CTR-35,AUTH-07 |
+| [MS-16](MS-16.md) | архив ящика | mailstore | A | mailstore-10 | done | CTR-35,MS-14 |
+| [MS-17](MS-17.md) | хранение отключённых ящиков | mailstore | A | mailstore-10 | done | CTR-35,MS-16 |
+| [SMTP-24](SMTP-24.md) | отложенная отправка и отмена | smtp | A | smtp-07 | done | CTR-35,SMTP-14 |
+| [SMTP-25](SMTP-25.md) | личные списки отправителей при доставке | smtp | A | smtp-07 | done | CTR-35,SMTP-16 |
+| [SMTP-26](SMTP-26.md) | раскрытие динамических групп и контактов | smtp | A | smtp-07 | done | CTR-35,SMTP-16 |
+| [SMTP-27](SMTP-27.md) | профиль Milter для исходящей почты | smtp | A | smtp-07 | done | SMTP-05 |
+| [JMAP-15](JMAP-15.md) | отложенная отправка в EmailSubmission | jmap | A | jmap-08 | done | CTR-35,JMAP-07 |
+| [JMAP-16](JMAP-16.md) | статус доставки EmailSubmission | jmap | A | jmap-08 | done | CTR-35,JMAP-07 |
+| [JMAP-17](JMAP-17.md) | расширения: списки отправителей и оргструктура | jmap | A | jmap-08 | done | CTR-35,JMAP-01 |
+| [JMAP-18](JMAP-18.md) | аудит доступа к ящику в JMAP | jmap | A | jmap-08 | done | CTR-35,JMAP-05 |
 | [JMAP-14](JMAP-14.md) | автонастройка клиентов | jmap | A | jmap-14 | done | JMAP-01 |
-| [IMAP-15](IMAP-15.md) | аудит доступа к ящику в IMAP | imap | A | imap-06 | ready | CTR-35,IMAP-07 |
-| [ADM-10](ADM-10.md) | Admin API: контакты, группы, оргструктура, отключённые ящики, аудит | admin | A | admin-05 | ready | CTR-35,ADM-07 |
-| [APP-12](APP-12.md) | сборка: соответствие Exchange и doctor автонастройки | app | A | app-08 | todo | META-33,AUTH-10,MS-17,SMTP-27,JMAP-18,IMAP-15,ADM-10 |
+| [IMAP-15](IMAP-15.md) | аудит доступа к ящику в IMAP | imap | A | imap-06 | done | CTR-35,IMAP-07 |
+| [ADM-10](ADM-10.md) | Admin API: контакты, группы, оргструктура, отключённые ящики, аудит | admin | A | admin-05 | done | CTR-35,ADM-07 |
+| [APP-12](APP-12.md) | сборка: соответствие Exchange и doctor автонастройки | app | A | app-08 | ready | META-33,AUTH-10,MS-17,SMTP-27,JMAP-18,IMAP-15,ADM-10 |
 
 ## Ф1 · Решение 2026-11-04: внешние встречи — API занятости и публикации — этап 3
 
@@ -451,12 +451,12 @@
 | [DEP-13](DEP-13.md) | стенд SMB — замеры и отчёт по критериям Д.7 | deploy | A | deploy-12 | done | DEP-12 |
 | [DEP-14](DEP-14.md) | стенд SMB — стресс, ×3, отказы и длительный прогон | deploy | A | deploy-12 | done | DEP-13 |
 | [DEP-15](DEP-15.md) | резервное копирование SMB — pgBackRest и копия каталога писем | deploy | A | deploy-13 | done | DEP-05 |
-| [META-53](META-53.md) | метрика доли NOTIFY во времени фиксации primary | meta | A | meta-34 | ready | — |
-| [BLOB-16](BLOB-16.md) | метрика «сирот» после цикла GC | blob | A | blob-09 | todo | — |
-| [PLT-25](PLT-25.md) | метрики пула СУБД и слушателя сигналов | platform | A | platform-15 | ready | — |
-| [PLT-32](PLT-32.md) | ratelimit.trusted — доверенные подсети без ограничения частоты | platform | A | platform-21 | ready | — |
-| [APP-31](APP-31.md) | старт узла при медленном OpenBao | app | A | app-30 | ready | — |
-| [DEP-25](DEP-25.md) | стенд Д.6 — два прогона, квота 150 MB, генератор доверенный, сценарий перебора | deploy | A | deploy-21 | ready | DEP-14 |
+| [META-53](META-53.md) | метрика доли NOTIFY во времени фиксации primary | meta | A | meta-34 | done | — |
+| [BLOB-16](BLOB-16.md) | метрика «сирот» после цикла GC | blob | A | blob-09 | done | — |
+| [PLT-25](PLT-25.md) | метрики пула СУБД и слушателя сигналов | platform | A | platform-15 | done | — |
+| [PLT-32](PLT-32.md) | ratelimit.trusted — доверенные подсети без ограничения частоты | platform | A | platform-21 | done | — |
+| [APP-31](APP-31.md) | старт узла при медленном OpenBao | app | A | app-30 | done | — |
+| [DEP-25](DEP-25.md) | стенд Д.6 — два прогона, квота 150 MB, генератор доверенный, сценарий перебора | deploy | A | deploy-21 | done | DEP-14 |
 | [DOC-01](DOC-01.md) | docs/PREREQUISITES.md — требования и тонкости настройки окружения | docs | A | docs-01 | done | — |
 | [APP-24](APP-24.md) | thepost doctor — кодировка и LC_CTYPE базы | app | A | app-23 | done | — |
 | [DEP-16](DEP-16.md) | эталоны задают кодировку UTF8 и LC_CTYPE UTF-8 базы | deploy | A | deploy-14 | done | — |
@@ -464,11 +464,11 @@
 | [DEP-18](DEP-18.md) | thepost_pki — перевыпуск внутреннего сертификата до конца срока | deploy | A | deploy-15 | done | — |
 | [APP-25](APP-25.md) | thepost doctor — срок внутренних сертификатов | app | A | app-24 | done | — |
 | [SYS-12](SYS-12.md) | Landlock — резолвер systemd-resolved (Ubuntu 24.04) | sys | A | sys-07 | done | — |
-| [DEP-24](DEP-24.md) | эталон на Debian 13 и Ubuntu 26.04 | deploy | A | deploy-16 | ready | DEP-17 |
-| [DEP-19](DEP-19.md) | эталон Ansible на Astra Linux SE 1.8 | deploy | A | deploy-16 | ready | DEP-15,DEP-17 |
-| [DEP-20](DEP-20.md) | эталон Ansible на РЕД ОС 8 и семействе RHEL (AlmaLinux 9 и 10) | deploy | A | deploy-16 | ready | DEP-15,DEP-17 |
-| [DEP-40](DEP-40.md) | эталон на ВМ Astra Linux SE 1.8 | deploy | A | deploy-30 | todo | DEP-19 |
-| [DEP-41](DEP-41.md) | restore.yml на семействе RHEL — обёртки полным путём | deploy | A | deploy-30 | todo | DEP-23 |
+| [DEP-24](DEP-24.md) | эталон на Debian 13 и Ubuntu 26.04 | deploy | A | deploy-16 | done | DEP-17 |
+| [DEP-19](DEP-19.md) | эталон Ansible на Astra Linux SE 1.8 | deploy | A | deploy-16 | done | DEP-15,DEP-17 |
+| [DEP-20](DEP-20.md) | эталон Ansible на РЕД ОС 8 и семействе RHEL (AlmaLinux 9 и 10) | deploy | A | deploy-16 | done | DEP-15,DEP-17 |
+| [DEP-40](DEP-40.md) | эталон на ВМ Astra Linux SE 1.8 | deploy | A | deploy-30 | ready | DEP-19 |
+| [DEP-41](DEP-41.md) | restore.yml на семействе RHEL — обёртки полным путём | deploy | A | deploy-30 | ready | DEP-23 |
 | [APP-30](APP-30.md) | cluster.listen — адрес приёма межузловых вызовов отдельно от объявляемого | app | A | app-29 | done | APP-18 |
 | [DEP-23](DEP-23.md) | резервная копия OpenBao — снимок Raft | deploy | A | deploy-19 | done | DEP-15 |
 | [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | done | SMTP-20 |
@@ -481,103 +481,104 @@
 | [CLU-15](CLU-15.md) | Rpc — h2 в ALPN | cluster | A | cluster-10 | todo | DEPS-06 |
 | [DEP-22](DEP-22.md) | сертификаты узлов с URI thepost:node:<id> | deploy | A | deploy-20 | ready | CLU-14 |
 | [PLT-24](PLT-24.md) | ключи TLS из OpenBao | platform | A | platform-14 | done | PLT-23 |
-| [PLT-26](PLT-26.md) | внутренние сертификаты движком PKI OpenBao | platform | A | platform-16 | ready | PLT-24 |
+| [PLT-26](PLT-26.md) | внутренние сертификаты движком PKI OpenBao | platform | A | platform-16 | done | PLT-24 |
 
 ## Ф1 · Хвосты облачных волн 2026-11-12, этап 2: метрики Д.7 в узле, ключ TLS из OpenBao, юнит systemd, тест IMAP
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [APP-35](APP-35.md) | `tls.key` из OpenBao в работающем узле и `doctor` | app | A | app-32 | ready | PLT-24 |
-| [IMAP-18](IMAP-18.md) | нестабильный тест `fuzz::tests::mutated_examples` — расхождение разбора и записи FETCH | imap | A | imap-09 | ready | — |
-| [DEP-26](DEP-26.md) | юнит systemd — растущая пауза перезапуска | deploy | A | deploy-22 | todo | APP-31 |
-| [CTR-51](CTR-51.md) | наблюдатель ожидания соединения с СУБД | contracts | B | contracts-37 | todo | — |
-| [CTR-52](CTR-52.md) | `InternalTls.key` — ключ внутренних каналов из хранилища секретов | contracts | B | contracts-37 | todo | — |
-| [PLT-27](PLT-27.md) | `PoolMeter` — реализация наблюдателя ожидания соединения | platform | A | platform-17 | todo | CTR-51,PLT-25 |
-| [META-55](META-55.md) | замер ожидания соединения пула | meta | A | meta-36 | todo | CTR-51 |
-| [META-56](META-56.md) | ключ клиента TLS к СУБД из хранилища секретов | meta | A | meta-36 | todo | CTR-52 |
-| [CLU-16](CLU-16.md) | ключ mTLS межузлового канала из хранилища секретов | cluster | A | cluster-11 | todo | CTR-52 |
-| [APP-34](APP-34.md) | метрики Д.7 в `/metrics` узла — пул СУБД, слушатель, NOTIFY, «сироты» | app | A | app-33 | todo | PLT-25,PLT-27,META-53,META-55,BLOB-16 |
-| [APP-36](APP-36.md) | `InternalTls.key` в узле — межузловой канал и СУБД | app | A | app-34 | todo | CTR-52,CLU-16,META-56,APP-35 |
+| [APP-35](APP-35.md) | `tls.key` из OpenBao в работающем узле и `doctor` | app | A | app-32 | done | PLT-24 |
+| [IMAP-18](IMAP-18.md) | нестабильный тест `fuzz::tests::mutated_examples` — расхождение разбора и записи FETCH | imap | A | imap-09 | done | — |
+| [DEP-26](DEP-26.md) | юнит systemd — растущая пауза перезапуска | deploy | A | deploy-22 | done | APP-31 |
+| [CTR-51](CTR-51.md) | наблюдатель ожидания соединения с СУБД | contracts | B | contracts-37 | done | — |
+| [CTR-52](CTR-52.md) | `InternalTls.key` — ключ внутренних каналов из хранилища секретов | contracts | B | contracts-37 | done | — |
+| [PLT-27](PLT-27.md) | `PoolMeter` — реализация наблюдателя ожидания соединения | platform | A | platform-17 | done | CTR-51,PLT-25 |
+| [META-55](META-55.md) | замер ожидания соединения пула | meta | A | meta-36 | done | CTR-51 |
+| [META-56](META-56.md) | ключ клиента TLS к СУБД из хранилища секретов | meta | A | meta-36 | done | CTR-52 |
+| [CLU-16](CLU-16.md) | ключ mTLS межузлового канала из хранилища секретов | cluster | A | cluster-11 | done | CTR-52 |
+| [APP-34](APP-34.md) | метрики Д.7 в `/metrics` узла — пул СУБД, слушатель, NOTIFY, «сироты» | app | A | app-33 | done | PLT-25,PLT-27,META-53,META-55,BLOB-16 |
+| [APP-36](APP-36.md) | `InternalTls.key` в узле — межузловой канал и СУБД | app | A | app-34 | done | CTR-52,CLU-16,META-56,APP-35 |
 
 ## Ф1 · Хвосты PR 10–12.11 — этапы 1 и 2: защита от перебора по адресу, очистка журналов, CLI, эталон SMB
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-57](CTR-57.md) | адрес клиента в проверке учётных данных | contracts | B | contracts-39 | ready | — |
-| [AUTH-14](AUTH-14.md) | SASL передаёт адрес клиента в проверку учётных данных | auth | A | auth-09 | todo | CTR-57 |
-| [SMTP-35](SMTP-35.md) | адрес клиента в AUTH SMTP | smtp | A | smtp-15 | todo | CTR-57 |
-| [IMAP-19](IMAP-19.md) | адрес клиента во входе IMAP и POP3 | imap | A | imap-10 | todo | CTR-57 |
-| [IMAP-20](IMAP-20.md) | тест: EXPUNGE в корзине не трогает письмо, перенесённое из INBOX с `\Deleted` | imap | A | imap-10 | todo | — |
-| [JMAP-37](JMAP-37.md) | адрес клиента во входе JMAP по HTTP | jmap | A | jmap-21 | todo | CTR-57 |
-| [APP-39](APP-39.md) | maintenance: срок журнала доставки и токенов `admin init` | app | A | app-37 | ready | META-22,META-43 |
-| [APP-40](APP-40.md) | защита от перебора по адресу и подсети в узле | app | A | app-38 | todo | CTR-57 |
-| [ADM-23](ADM-23.md) | тест: `AccountQuery` из строки запроса | admin | A | admin-16 | ready | ADM-13 |
-| [APP-41](APP-41.md) | CLI `thepost admin account list --after` | app | A | app-39 | ready | APP-22 |
-| [APP-42](APP-42.md) | CLI `thepost admin`: вход через OIDC device flow | app | A | app-39 | ready | APP-11 |
-| [APP-43](APP-43.md) | CLI `thepost admin`: остальные операции Admin API | app | A | app-39 | ready | APP-22 |
-| [APP-44](APP-44.md) | maintenance: проверка целостности `verify` по расписанию | app | A | app-39 | ready | BLOB-14 |
-| [AUTH-15](AUTH-15.md) | синхронизация групп LDAP: участники по `external_id` | auth | A | auth-10 | ready | CTR-32 |
-| [DEP-27](DEP-27.md) | роль thepost: не ждать готовности узла; копия OpenBao в deploy/README | deploy | A | deploy-23 | ready | DEP-23 |
-| [DEP-28](DEP-28.md) | Helm: образ узла из ghcr.io | deploy | A | deploy-23 | ready | CI-03 |
-| [DEP-29](DEP-29.md) | ручная проверка: резервные копии SMB в S3 | deploy | A | deploy-23 | ready | DEP-15 |
-| [DOC-02](DOC-02.md) | INSTALL: новый сервер без ожидания готовности узла | docs | A | docs-02 | todo | DEP-27 |
-| [PLT-28](PLT-28.md) | списки отзыва (CRL) для сертификатов клиентов | platform | A | platform-18 | ready | PLT-22 |
+| [CTR-57](CTR-57.md) | адрес клиента в проверке учётных данных | contracts | B | contracts-39 | done | — |
+| [AUTH-14](AUTH-14.md) | SASL передаёт адрес клиента в проверку учётных данных | auth | A | auth-09 | ready | CTR-57 |
+| [SMTP-35](SMTP-35.md) | адрес клиента в AUTH SMTP | smtp | A | smtp-15 | done | CTR-57 |
+| [IMAP-19](IMAP-19.md) | адрес клиента во входе IMAP и POP3 | imap | A | imap-10 | ready | CTR-57 |
+| [IMAP-20](IMAP-20.md) | тест: EXPUNGE в корзине не трогает письмо, перенесённое из INBOX с `\Deleted` | imap | A | imap-10 | ready | — |
+| [JMAP-37](JMAP-37.md) | адрес клиента во входе JMAP по HTTP | jmap | A | jmap-21 | done | CTR-57 |
+| [APP-39](APP-39.md) | maintenance: срок журнала доставки и токенов `admin init` | app | A | app-37 | done | META-22,META-43 |
+| [APP-40](APP-40.md) | защита от перебора по адресу и подсети в узле | app | A | app-38 | done | CTR-57 |
+| [ADM-23](ADM-23.md) | тест: `AccountQuery` из строки запроса | admin | A | admin-16 | done | ADM-13 |
+| [APP-41](APP-41.md) | CLI `thepost admin account list --after` | app | A | app-39 | done | APP-22 |
+| [APP-42](APP-42.md) | CLI `thepost admin`: вход через OIDC device flow | app | A | app-39 | done | APP-11 |
+| [APP-43](APP-43.md) | CLI `thepost admin`: остальные операции Admin API | app | A | app-39 | done | APP-22 |
+| [APP-44](APP-44.md) | maintenance: проверка целостности `verify` по расписанию | app | A | app-39 | done | BLOB-14 |
+| [AUTH-15](AUTH-15.md) | синхронизация групп LDAP: участники по `external_id` | auth | A | auth-10 | done | CTR-32 |
+| [DEP-27](DEP-27.md) | роль thepost: не ждать готовности узла; копия OpenBao в deploy/README | deploy | A | deploy-23 | done | DEP-23 |
+| [DEP-28](DEP-28.md) | Helm: образ узла из ghcr.io | deploy | A | deploy-23 | done | CI-03 |
+| [DEP-29](DEP-29.md) | ручная проверка: резервные копии SMB в S3 | deploy | A | deploy-23 | done | DEP-15 |
+| [DOC-02](DOC-02.md) | INSTALL: новый сервер без ожидания готовности узла | docs | A | docs-02 | done | DEP-27 |
+| [PLT-28](PLT-28.md) | списки отзыва (CRL) для сертификатов клиентов | platform | A | platform-18 | done | PLT-22 |
 
 ## Ф1 · Хвосты облачных волн 12.11, п. 26–55 — этап 2 (FIX — срочно)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [FIX-03](FIX-03.md) | узел: домены организации в Admin API вместо `NoDomains` | app | A | app-43 | ready | — |
-| [FIX-01](FIX-01.md) | модерация групп: доставка одобренного письма и отказ отправителю | smtp | A | smtp-17 | ready | CTR-31 |
-| [FIX-02](FIX-02.md) | узел: решения модерации через `tp-smtp` вместо `NoModeration` | app | A | app-44 | todo | FIX-01 |
-| [IMAP-21](IMAP-21.md) | фазз-тесты разбора IMAP — постоянное зерно | imap | A | imap-11 | todo | IMAP-18 |
-| [PLT-29](PLT-29.md) | встроенный ACME сохраняет полученный ключ в OpenBao | platform | A | platform-19 | todo | PLT-24 |
-| [PLT-30](PLT-30.md) | метрика брошенных ожиданий соединения с СУБД | platform | A | platform-19 | todo | PLT-27 |
-| [CLU-17](CLU-17.md) | межузловой канал: смена ключа в хранилище без перезапуска | cluster | A | cluster-12 | todo | CLU-16 |
-| [AUTH-17](AUTH-17.md) | ключ TLS клиентов LDAP и OIDC из хранилища секретов | auth | A | auth-12 | todo | CTR-52 |
-| [ADM-29](ADM-29.md) | ключ TLS экспорта аудита в syslog из хранилища секретов | admin | A | admin-19 | todo | CTR-52 |
+| [FIX-03](FIX-03.md) | узел: домены организации в Admin API вместо `NoDomains` | app | A | app-43 | done | — |
+| [FIX-01](FIX-01.md) | модерация групп: доставка одобренного письма и отказ отправителю | smtp | A | smtp-17 | done | CTR-31 |
+| [FIX-02](FIX-02.md) | узел: решения модерации через `tp-smtp` вместо `NoModeration` | app | A | app-44 | done | FIX-01 |
+| [IMAP-21](IMAP-21.md) | фазз-тесты разбора IMAP — постоянное зерно | imap | A | imap-11 | done | IMAP-18 |
+| [PLT-29](PLT-29.md) | встроенный ACME сохраняет полученный ключ в OpenBao | platform | A | platform-19 | done | PLT-24 |
+| [PLT-30](PLT-30.md) | метрика брошенных ожиданий соединения с СУБД | platform | A | platform-19 | done | PLT-27 |
+| [CLU-17](CLU-17.md) | межузловой канал: смена ключа в хранилище без перезапуска | cluster | A | cluster-12 | done | CLU-16 |
+| [AUTH-17](AUTH-17.md) | ключ TLS клиентов LDAP и OIDC из хранилища секретов | auth | A | auth-12 | done | CTR-52 |
+| [ADM-29](ADM-29.md) | ключ TLS экспорта аудита в syslog из хранилища секретов | admin | A | admin-19 | done | CTR-52 |
 
 ## Ф1 · Аудит 12.11: старое рядом с новым — этап 2 (решения 93–108)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [UI-16](UI-16.md) | консоль: домены — только принятые домены транспорта | console | A | console-07 | ready | — |
-| [ADM-33](ADM-33.md) | один API доменов: удалить `/orgs/{org}/domains` | admin | B | admin-22 | todo | UI-16 |
-| [SMTP-41](SMTP-41.md) | AUTH SMTP: перебор — только `AbuseGuard` | smtp | A | smtp-20 | ready | — |
-| [DEP-42](DEP-42.md) | эталоны без `smtp.delivery.local_domains` | deploy | A | deploy-31 | ready | — |
-| [DEP-44](DEP-44.md) | эталоны: ключи TLS в OpenBao | deploy | A | deploy-31 | ready | — |
-| [CI-13](CI-13.md) | бета выпускает тег версии образа | ci | B | ci-11 | ready | CI-01 |
-| [DEP-50](DEP-50.md) | Helm и Compose: закрытый образ и тег версии | deploy | A | deploy-36 | todo | CI-13 |
-| [CI-14](CI-14.md) | артефакт CI тем же путём, что выпуск; запуск на старом процессоре | ci | B | ci-12 | todo | CI-13 |
-| [DEP-51](DEP-51.md) | эталоны deploy/config: edge.yaml и порты IMAP, ManageSieve | deploy | A | deploy-37 | ready | DEP-37 |
+| [UI-16](UI-16.md) | консоль: домены — только принятые домены транспорта | console | A | console-07 | done | — |
+| [ADM-33](ADM-33.md) | один API доменов: удалить `/orgs/{org}/domains` | admin | B | admin-22 | done | UI-16 |
+| [SMTP-41](SMTP-41.md) | AUTH SMTP: перебор — только `AbuseGuard` | smtp | A | smtp-20 | done | — |
+| [DEP-42](DEP-42.md) | эталоны без `smtp.delivery.local_domains` | deploy | A | deploy-31 | done | — |
+| [DEP-44](DEP-44.md) | эталоны: ключи TLS в OpenBao | deploy | A | deploy-31 | done | — |
+| [CI-13](CI-13.md) | бета выпускает тег версии образа | ci | B | ci-11 | done | CI-01 |
+| [DEP-50](DEP-50.md) | Helm и Compose: закрытый образ и тег версии | deploy | A | deploy-36 | done | CI-13 |
+| [CI-14](CI-14.md) | артефакт CI тем же путём, что выпуск; запуск на старом процессоре | ci | B | ci-12 | done | CI-13 |
+| [DEP-51](DEP-51.md) | эталоны deploy/config: edge.yaml и порты IMAP, ManageSieve | deploy | A | deploy-37 | done | DEP-37 |
 | [DEP-52](DEP-52.md) | стенд: доверенные подсети вместо выключенного ограничения частоты | deploy | A | deploy-38 | todo | PLT-32 |
-| [APP-60](APP-60.md) | thepost doctor: подсказки DNS для календарей и контактов | app | A | app-55 | ready | DEP-21 |
-| [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | ready | — |
-| [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | todo | ADM-02,CTR-24,META-22 |
-| [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | todo | — |
-| [CTR-68](CTR-68.md) | `InternalTls`: ключ только из хранилища секретов | contracts | B | contracts-46 | todo | CTR-52,AUTH-17 |
-| [CTR-70](CTR-70.md) | `TenantTransport.rewrites` без `serde(default)` | contracts | B | contracts-46 | todo | — |
-| [CTR-79](CTR-79.md) | политика: лимит «получателей в час» | contracts | B | contracts-51 | todo | CTR-25 |
-| [SMTP-43](SMTP-43.md) | лимит «получателей в час» при отправке | smtp | A | smtp-24 | todo | CTR-79 |
+| [APP-60](APP-60.md) | thepost doctor: подсказки DNS для календарей и контактов | app | A | app-55 | done | DEP-21 |
+| [PLT-33](PLT-33.md) | обязательные параметры по ролям — edge без базы данных | platform | A | platform-22 | ready | — |
+| [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | done | — |
+| [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | done | ADM-02,CTR-24,META-22 |
+| [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | done | — |
+| [CTR-68](CTR-68.md) | `InternalTls`: ключ только из хранилища секретов | contracts | B | contracts-46 | done | CTR-52,AUTH-17 |
+| [CTR-70](CTR-70.md) | `TenantTransport.rewrites` без `serde(default)` | contracts | B | contracts-46 | done | — |
+| [CTR-79](CTR-79.md) | политика: лимит «получателей в час» | contracts | B | contracts-51 | done | CTR-25 |
+| [SMTP-43](SMTP-43.md) | лимит «получателей в час» при отправке | smtp | A | smtp-24 | done | CTR-79 |
 | [SMTP-44](SMTP-44.md) | лимиты при отложенной отправке, один путь отправки | smtp | A | smtp-25 | done | SMTP-43 |
-| [META-70](META-70.md) | `PolicyStore` и `AuditLog` в PostgreSQL | meta | A | meta-44 | todo | CTR-25 |
-| [ADM-34](ADM-34.md) | Admin API на контрактах CTR-25: политики и журнал аудита из БД | admin | B | admin-23 | todo | CTR-25,META-70 |
-| [ADM-36](ADM-36.md) | Admin API: проверка полей политики для SMTP | admin | A | admin-23 | todo | CTR-67 |
-| [APP-59](APP-59.md) | узел запускает экспорт журнала аудита в syslog/OTLP | app | A | app-53 | todo | ADM-34 |
-| [META-76](META-76.md) | убрать старые PgMeta::policy/set_policy и реэкспорт PolicyTarget | meta | A | meta-49 | todo | META-70 |
-| [META-77](META-77.md) | проверка номеров миграций — подряд, без повторов, совпадают с именами файлов | meta | A | meta-50 | ready | — |
+| [META-70](META-70.md) | `PolicyStore` и `AuditLog` в PostgreSQL | meta | A | meta-44 | done | CTR-25 |
+| [ADM-34](ADM-34.md) | Admin API на контрактах CTR-25: политики и журнал аудита из БД | admin | B | admin-23 | done | CTR-25,META-70 |
+| [ADM-36](ADM-36.md) | Admin API: проверка полей политики для SMTP | admin | A | admin-23 | done | CTR-67 |
+| [APP-59](APP-59.md) | узел запускает экспорт журнала аудита в syslog/OTLP | app | A | app-53 | done | ADM-34 |
+| [META-76](META-76.md) | убрать старые PgMeta::policy/set_policy и реэкспорт PolicyTarget | meta | A | meta-49 | done | META-70 |
+| [META-77](META-77.md) | проверка номеров миграций — подряд, без повторов, совпадают с именами файлов | meta | A | meta-50 | done | — |
 | [ADM-35](ADM-35.md) | CLI: проверка скрипта Sieve без `tp_sieve::check` | admin | A | admin-24 | todo | JMAP-35 |
-| [SIEVE-13](SIEVE-13.md) | одна проверка скрипта: удалить `tp_sieve::check` | sieve | A | sieve-06 | todo | SIEVE-11,JMAP-35,ADM-35 |
-| [DEP-43](DEP-43.md) | эталоны: лимиты, селектор DKIM и Milter — политикой организации | deploy | A | deploy-32 | todo | CTR-67 |
-| [SMTP-39](SMTP-39.md) | локальные домены — только принятые домены организации | smtp | A | smtp-21 | todo | DEP-42,APP-54 |
-| [SMTP-40](SMTP-40.md) | политика организации в SMTP вместо настроек config.yaml | smtp | A | smtp-21 | todo | CTR-67,DEP-43 |
-| [APP-55](APP-55.md) | узел: политика организации в SMTP | app | A | app-48 | todo | SMTP-40 |
-| [PLT-31](PLT-31.md) | ключ TLS слушателей — только из хранилища секретов | platform | B | platform-20 | todo | DEP-44 |
-| [DEP-45](DEP-45.md) | эталон: только встроенный ACME, certbot удалить | deploy | A | deploy-33 | todo | PLT-29 |
-| [DEP-46](DEP-46.md) | эталон: только сокеты systemd, без CAP_NET_BIND_SERVICE | deploy | A | deploy-33 | todo | — |
-| [DEP-48](DEP-48.md) | одна конфигурация SMB — из пресета | deploy | A | deploy-33 | todo | — |
+| [SIEVE-13](SIEVE-13.md) | одна проверка скрипта: удалить `tp_sieve::check` | sieve | A | sieve-06 | done | SIEVE-11,JMAP-35,ADM-35 |
+| [DEP-43](DEP-43.md) | эталоны: лимиты, селектор DKIM и Milter — политикой организации | deploy | A | deploy-32 | ready | CTR-67 |
+| [SMTP-39](SMTP-39.md) | локальные домены — только принятые домены организации | smtp | A | smtp-21 | done | DEP-42,APP-54 |
+| [SMTP-40](SMTP-40.md) | политика организации в SMTP вместо настроек config.yaml | smtp | A | smtp-21 | done | CTR-67,DEP-43 |
+| [APP-55](APP-55.md) | узел: политика организации в SMTP | app | A | app-48 | done | SMTP-40 |
+| [PLT-31](PLT-31.md) | ключ TLS слушателей — только из хранилища секретов | platform | B | platform-20 | done | DEP-44 |
+| [DEP-45](DEP-45.md) | эталон: только встроенный ACME, certbot удалить | deploy | A | deploy-33 | ready | PLT-29 |
+| [DEP-46](DEP-46.md) | эталон: только сокеты systemd, без CAP_NET_BIND_SERVICE | deploy | A | deploy-33 | ready | — |
+| [DEP-48](DEP-48.md) | одна конфигурация SMB — из пресета | deploy | A | deploy-33 | ready | — |
 | [DOC-04](DOC-04.md) | INSTALL и PREREQUISITES: ACME, ключи в OpenBao, сокеты systemd | docs | A | docs-04 | todo | DEP-44,DEP-45,DEP-46 |
-| [AUTH-18](AUTH-18.md) | LDAP: удалить псевдоним `DisabledRule` | auth | A | auth-13 | ready | — |
+| [AUTH-18](AUTH-18.md) | LDAP: удалить псевдоним `DisabledRule` | auth | A | auth-13 | done | — |
 
 ## Ф2. Совместная работа (≈5 мес.)
 
@@ -599,10 +600,10 @@
 | [DAV-06](DAV-06.md) | CalDAV — calendar-query и free-busy-query | dav | A | dav-02 | done | DAV-05 |
 | [DAV-07](DAV-07.md) | CalDAV — calendar-multiget и задачи VTODO | dav | A | dav-02 | done | DAV-05 |
 | [DAV-08](DAV-08.md) | CalDAV — проверка объектов и ручная проверка клиентами | dav | A | dav-02 | done | DAV-06,DAV-07 |
-| [DAV-09](DAV-09.md) | CardDAV — дом адресных книг и свойства | dav | A | dav-03 | ready | DAV-04 |
-| [DAV-10](DAV-10.md) | CardDAV — addressbook-query и addressbook-multiget | dav | A | dav-03 | ready | DAV-09 |
-| [DAV-11](DAV-11.md) | CardDAV — версии vCard и проверка карточек | dav | A | dav-03 | ready | DAV-10 |
-| [DAV-12](DAV-12.md) | глобальная адресная книга (GAL) только для чтения | dav | A | dav-03 | ready | DAV-09 |
+| [DAV-09](DAV-09.md) | CardDAV — дом адресных книг и свойства | dav | A | dav-03 | done | DAV-04 |
+| [DAV-10](DAV-10.md) | CardDAV — addressbook-query и addressbook-multiget | dav | A | dav-03 | done | DAV-09 |
+| [DAV-11](DAV-11.md) | CardDAV — версии vCard и проверка карточек | dav | A | dav-03 | done | DAV-10 |
+| [DAV-12](DAV-12.md) | глобальная адресная книга (GAL) только для чтения | dav | A | dav-03 | done | DAV-09 |
 | [SIEVE-01](SIEVE-01.md) | разбор скриптов Sieve — лексер и грамматика | sieve | A | sieve-01 | done | DEPS-04 |
 | [SIEVE-02](SIEVE-02.md) | проверка скрипта — require, аргументы, сообщения об ошибках | sieve | A | sieve-01 | done | SIEVE-01 |
 | [SIEVE-03](SIEVE-03.md) | интерпретатор — управление, тесты ядра, сравнения | sieve | A | sieve-01 | done | SIEVE-02 |
@@ -617,117 +618,117 @@
 | [JMAP-25](JMAP-25.md) | JMAP Contacts — AddressBook (RFC 9610) | jmap | A | jmap-16 | done | CTR-45,JMAP-02 |
 | [JMAP-26](JMAP-26.md) | JMAP Contacts — ContactCard | jmap | A | jmap-16 | done | JMAP-25,DAV-03 |
 | [ADM-14](ADM-14.md) | Admin API — правила Sieve и автоответ | admin | A | admin-09 | done | CTR-46,SIEVE-02 |
-| [APP-29](APP-29.md) | календари и контакты в узле — роль dav | app | A | app-28 | todo | DAV-08,DAV-11,DAV-12,META-48 |
-| [APP-26](APP-26.md) | правила Sieve и автоответ в узле — доставка, Admin API, JMAP VacationResponse | app | A | app-25 | ready | SIEVE-07,SMTP-32,META-50,ADM-14,JMAP-23 |
-| [DEP-21](DEP-21.md) | стенд — CalDAV, CardDAV, ManageSieve | deploy | A | deploy-17 | todo | APP-29 |
-| [SIEVE-08](SIEVE-08.md) | ManageSieve — протокол и вход | sieve | A | sieve-03 | ready | SIEVE-02 |
-| [SIEVE-09](SIEVE-09.md) | ManageSieve — команды скриптов | sieve | A | sieve-03 | ready | SIEVE-08 |
-| [JMAP-27](JMAP-27.md) | JMAP Calendars — Calendar | jmap | A | jmap-17 | ready | CTR-45,DAV-03,JMAP-25 |
-| [JMAP-28](JMAP-28.md) | JMAP Calendars — CalendarEvent | jmap | A | jmap-17 | ready | JMAP-27 |
-| [JMAP-29](JMAP-29.md) | JMAP Calendars — CalendarEvent/query и развёртывание повторов | jmap | A | jmap-17 | ready | JMAP-28 |
-| [APP-27](APP-27.md) | ManageSieve и JMAP календари, контакты, Sieve в узле | app | A | app-26 | todo | SIEVE-09,JMAP-29,APP-29,APP-26,AUTH-13 |
+| [APP-29](APP-29.md) | календари и контакты в узле — роль dav | app | A | app-28 | done | DAV-08,DAV-11,DAV-12,META-48 |
+| [APP-26](APP-26.md) | правила Sieve и автоответ в узле — доставка, Admin API, JMAP VacationResponse | app | A | app-25 | done | SIEVE-07,SMTP-32,META-50,ADM-14,JMAP-23 |
+| [DEP-21](DEP-21.md) | стенд — CalDAV, CardDAV, ManageSieve | deploy | A | deploy-17 | done | APP-29 |
+| [SIEVE-08](SIEVE-08.md) | ManageSieve — протокол и вход | sieve | A | sieve-03 | done | SIEVE-02 |
+| [SIEVE-09](SIEVE-09.md) | ManageSieve — команды скриптов | sieve | A | sieve-03 | done | SIEVE-08 |
+| [JMAP-27](JMAP-27.md) | JMAP Calendars — Calendar | jmap | A | jmap-17 | done | CTR-45,DAV-03,JMAP-25 |
+| [JMAP-28](JMAP-28.md) | JMAP Calendars — CalendarEvent | jmap | A | jmap-17 | done | JMAP-27 |
+| [JMAP-29](JMAP-29.md) | JMAP Calendars — CalendarEvent/query и развёртывание повторов | jmap | A | jmap-17 | done | JMAP-28 |
+| [APP-27](APP-27.md) | ManageSieve и JMAP календари, контакты, Sieve в узле | app | A | app-26 | done | SIEVE-09,JMAP-29,APP-29,APP-26,AUTH-13 |
 | [CI-06](CI-06.md) | полоса console и сборка веб-консоли в CI | ci | B | ci-05 | done | — |
-| [DEPS-05](DEPS-05.md) | rust-embed — веб-консоль внутри бинарного файла | deps | B | deps-05 | ready | CI-06 |
+| [DEPS-05](DEPS-05.md) | rust-embed — веб-консоль внутри бинарного файла | deps | B | deps-05 | done | CI-06 |
 | [UI-01](UI-01.md) | каркас веб-консоли на Refine | console | A | console-01 | done | CI-06 |
 | [UI-02](UI-02.md) | вход, провайдер данных, типы из OpenAPI, покрытие API | console | A | console-01 | done | UI-01 |
 | [UI-03](UI-03.md) | организации, домены и политики | console | A | console-01 | done | UI-02 |
-| [UI-04](UI-04.md) | учётные записи и пароли приложений | console | A | console-02 | ready | UI-03 |
-| [UI-05](UI-05.md) | группы рассылки и модерация | console | A | console-02 | ready | UI-03 |
-| [UI-06](UI-06.md) | корзина учётной записи | console | A | console-02 | ready | UI-04 |
-| [UI-07](UI-07.md) | транспорт — принятые домены, источники, маршруты | console | A | console-03 | todo | UI-03 |
-| [UI-08](UI-08.md) | журнал доставки и журнал аудита | console | A | console-03 | todo | UI-03 |
-| [UI-09](UI-09.md) | правила и автоответ пользователя; покрытие Admin API | console | A | console-03 | todo | UI-04,UI-05,UI-06,UI-07,UI-08,ADM-14 |
-| [ADM-15](ADM-15.md) | раздача веб-консоли ролью admin | admin | A | admin-10 | todo | DEPS-05,UI-01 |
+| [UI-04](UI-04.md) | учётные записи и пароли приложений | console | A | console-02 | done | UI-03 |
+| [UI-05](UI-05.md) | группы рассылки и модерация | console | A | console-02 | done | UI-03 |
+| [UI-06](UI-06.md) | корзина учётной записи | console | A | console-02 | done | UI-04 |
+| [UI-07](UI-07.md) | транспорт — принятые домены, источники, маршруты | console | A | console-03 | done | UI-03 |
+| [UI-08](UI-08.md) | журнал доставки и журнал аудита | console | A | console-03 | done | UI-03 |
+| [UI-09](UI-09.md) | правила и автоответ пользователя; покрытие Admin API | console | A | console-03 | done | UI-04,UI-05,UI-06,UI-07,UI-08,ADM-14 |
+| [ADM-15](ADM-15.md) | раздача веб-консоли ролью admin | admin | A | admin-10 | done | DEPS-05,UI-01 |
 | [CTR-47](CTR-47.md) | планирование встреч — iTIP и занятость | contracts | B | contracts-34 | done | CTR-45 |
-| [META-54](META-54.md) | занятость повторяющихся событий — разворот при запросе | meta | B | meta-35 | todo | CTR-47,CTR-59,META-51 |
-| [SMTP-34](SMTP-34.md) | пересылка правилами и автоответ — через правила получателя с проверкой петли | smtp | A | smtp-14 | ready | SMTP-31 |
-| [ADM-17](ADM-17.md) | Sieve-скрипты пользователя в Admin API и CLI | admin | A | admin-12 | ready | — |
-| [APP-32](APP-32.md) | очистка надгробий DAV и журнала автоответов в роли maintenance | app | A | app-31 | ready | META-48,META-50 |
-| [META-51](META-51.md) | входящие планирования и индекс занятости | meta | B | meta-32 | ready | CTR-47,META-47 |
-| [DAV-13](DAV-13.md) | планирование внутри организации — RFC 6638 | dav | A | dav-04 | ready | DAV-08,CTR-47 |
-| [DAV-14](DAV-14.md) | iMIP наружу — приглашения внешним участникам | dav | A | dav-04 | ready | DAV-13 |
-| [DAV-15](DAV-15.md) | приём iTIP — обработка приглашений и ответов | dav | A | dav-04 | ready | DAV-13 |
-| [DAV-16](DAV-16.md) | занятость — VFREEBUSY и реализация FreeBusy | dav | A | dav-04 | ready | DAV-13 |
-| [SMTP-33](SMTP-33.md) | приём iMIP — приглашения и ответы извне | smtp | A | smtp-13 | ready | CTR-47,SMTP-31 |
-| [JMAP-30](JMAP-30.md) | JMAP — Principal и занятость | jmap | A | jmap-18 | todo | JMAP-29,CTR-47 |
-| [JMAP-31](JMAP-31.md) | JMAP — приглашения на встречи | jmap | A | jmap-18 | todo | JMAP-30,DAV-13 |
-| [APP-28](APP-28.md) | планирование встреч в узле | app | A | app-27 | todo | DAV-16,SMTP-33,META-51,JMAP-31,APP-27 |
-| [CMP-10](CMP-10.md) | приёмка Ф2 — календари, контакты, правила, консоль | deploy | A | deploy-18 | todo | APP-28,UI-09,DEP-21 |
-| [CTR-48](CTR-48.md) | общий доступ к календарям и контактам, представители, ресурсы | contracts | B | contracts-35 | ready | CTR-45,CTR-47 |
-| [META-52](META-52.md) | права на коллекции, представители, правила ресурсов | meta | B | meta-33 | todo | CTR-48 |
-| [AUTH-12](AUTH-12.md) | Authorizer — права на календари и адресные книги | auth | A | auth-07 | todo | CTR-48,AUTH-07 |
+| [META-54](META-54.md) | занятость повторяющихся событий — разворот при запросе | meta | B | meta-35 | done | CTR-47,CTR-59,META-51 |
+| [SMTP-34](SMTP-34.md) | пересылка правилами и автоответ — через правила получателя с проверкой петли | smtp | A | smtp-14 | done | SMTP-31 |
+| [ADM-17](ADM-17.md) | Sieve-скрипты пользователя в Admin API и CLI | admin | A | admin-12 | done | — |
+| [APP-32](APP-32.md) | очистка надгробий DAV и журнала автоответов в роли maintenance | app | A | app-31 | done | META-48,META-50 |
+| [META-51](META-51.md) | входящие планирования и индекс занятости | meta | B | meta-32 | done | CTR-47,META-47 |
+| [DAV-13](DAV-13.md) | планирование внутри организации — RFC 6638 | dav | A | dav-04 | done | DAV-08,CTR-47 |
+| [DAV-14](DAV-14.md) | iMIP наружу — приглашения внешним участникам | dav | A | dav-04 | done | DAV-13 |
+| [DAV-15](DAV-15.md) | приём iTIP — обработка приглашений и ответов | dav | A | dav-04 | done | DAV-13 |
+| [DAV-16](DAV-16.md) | занятость — VFREEBUSY и реализация FreeBusy | dav | A | dav-04 | done | DAV-13 |
+| [SMTP-33](SMTP-33.md) | приём iMIP — приглашения и ответы извне | smtp | A | smtp-13 | done | CTR-47,SMTP-31 |
+| [JMAP-30](JMAP-30.md) | JMAP — Principal и занятость | jmap | A | jmap-18 | done | JMAP-29,CTR-47 |
+| [JMAP-31](JMAP-31.md) | JMAP — приглашения на встречи | jmap | A | jmap-18 | done | JMAP-30,DAV-13 |
+| [APP-28](APP-28.md) | планирование встреч в узле | app | A | app-27 | done | DAV-16,SMTP-33,META-51,JMAP-31,APP-27 |
+| [CMP-10](CMP-10.md) | приёмка Ф2 — календари, контакты, правила, консоль | deploy | A | deploy-18 | ready | APP-28,UI-09,DEP-21 |
+| [CTR-48](CTR-48.md) | общий доступ к календарям и контактам, представители, ресурсы | contracts | B | contracts-35 | done | CTR-45,CTR-47 |
+| [META-52](META-52.md) | права на коллекции, представители, правила ресурсов | meta | B | meta-33 | ready | CTR-48 |
+| [AUTH-12](AUTH-12.md) | Authorizer — права на календари и адресные книги | auth | A | auth-07 | ready | CTR-48,AUTH-07 |
 | [DAV-17](DAV-17.md) | общий доступ к календарям и адресным книгам | dav | A | dav-05 | todo | DAV-16,CTR-48,AUTH-12 |
 | [DAV-18](DAV-18.md) | представители — calendar-proxy | dav | A | dav-05 | todo | DAV-17 |
 | [DAV-19](DAV-19.md) | ресурсы — бронирование переговорных | dav | A | dav-05 | todo | DAV-17 |
-| [JMAP-32](JMAP-32.md) | JMAP — общий доступ к календарям и адресным книгам | jmap | A | jmap-19 | todo | JMAP-31,CTR-48 |
-| [JMAP-33](JMAP-33.md) | JMAP Tasks поверх VTODO | jmap | A | jmap-19 | todo | JMAP-29 |
-| [ADM-16](ADM-16.md) | Admin API — ресурсы, представители, общий доступ | admin | A | admin-11 | todo | CTR-48 |
+| [JMAP-32](JMAP-32.md) | JMAP — общий доступ к календарям и адресным книгам | jmap | A | jmap-19 | ready | JMAP-31,CTR-48 |
+| [JMAP-33](JMAP-33.md) | JMAP Tasks поверх VTODO | jmap | A | jmap-19 | ready | JMAP-29 |
+| [ADM-16](ADM-16.md) | Admin API — ресурсы, представители, общий доступ | admin | A | admin-11 | ready | CTR-48 |
 | [UI-10](UI-10.md) | ресурсы, представители, общий доступ | console | A | console-04 | todo | UI-09,ADM-16 |
 | [UI-11](UI-11.md) | массовые операции — импорт учётных записей из CSV | console | A | console-04 | todo | UI-09 |
 | [DAV-20](DAV-20.md) | публикация календаря по ссылке ICS | dav | A | dav-06 | todo | DAV-17,CTR-36,META-34 |
 | [DAV-21](DAV-21.md) | ссылка занятости FBURL | dav | A | dav-06 | todo | DAV-20,DAV-16 |
 | [DAV-22](DAV-22.md) | оргструктура в глобальной адресной книге | dav | A | dav-06 | todo | DAV-12,CTR-35,AUTH-10 |
-| [AUTH-13](AUTH-13.md) | служба SASL `sieve` для ManageSieve | auth | A | auth-08 | todo | SIEVE-08 |
-| [DEPS-08](DEPS-08.md) | `serde_yaml_ng` в dev-зависимостях `tp-sieve` | deps | B | deps-08 | ready | SIEVE-07 |
-| [SIEVE-10](SIEVE-10.md) | тест чтения секции `sieve` из YAML | sieve | A | sieve-04 | todo | DEPS-08,SIEVE-07 |
-| [SIEVE-11](SIEVE-11.md) | ManageSieve — проверка скрипта с пределами секции `sieve` | sieve | A | sieve-04 | todo | SIEVE-09,SIEVE-07 |
-| [KIT-09](KIT-09.md) | корпус vCard | testkit | A | testkit-06 | ready | — |
-| [APP-37](APP-37.md) | `thepost admin openapi` — выгрузка схемы Admin API без запуска узла | app | A | app-35 | ready | — |
-| [ADM-18](ADM-18.md) | изменение и блокировка учётной записи — `PATCH …/accounts/{account}` | admin | A | admin-13 | todo | — |
-| [ADM-19](ADM-19.md) | тема и отправитель письма в корзине и очереди модерации | admin | A | admin-13 | todo | — |
-| [ADM-20](ADM-20.md) | группы — имена участников одним ответом и точная схема `GroupInfo` | admin | A | admin-13 | todo | — |
-| [CI-07](CI-07.md) | `admin_client.rs` — в полосу admin | ci | B | ci-06 | todo | ADM-17 |
-| [ADM-22](ADM-22.md) | CLI — удаление скрипта, автоответ и скрипт организации | admin | A | admin-14 | todo | ADM-17,CI-07 |
-| [DEPS-07](DEPS-07.md) | фича `console` в крейте `thepost` | deps | B | deps-07 | todo | DEPS-05 |
-| [CI-08](CI-08.md) | выпуск, бета и образ с консолью через фичу `thepost/console` | ci | B | ci-07 | todo | DEPS-07,ADM-15,DEP-35 |
-| [CTR-53](CTR-53.md) | адреса учётной записи — основной и псевдонимы | contracts | B | contracts-38 | ready | — |
-| [CTR-54](CTR-54.md) | `DavStore` — перенос объекта между коллекциями и поиск контактов по индексу | contracts | B | contracts-38 | ready | CTR-45 |
-| [CTR-55](CTR-55.md) | очередь модерации — продолжение по курсору | contracts | B | contracts-38 | ready | CTR-43 |
-| [CTR-56](CTR-56.md) | `Collection` — по умолчанию, подписка и видимость, оповещения по умолчанию | contracts | B | contracts-38 | ready | CTR-45 |
-| [META-57](META-57.md) | адреса учётной записи в PostgreSQL | meta | A | meta-37 | todo | CTR-53 |
-| [META-58](META-58.md) | перенос объекта DAV и индекс поиска контактов | meta | B | meta-37 | todo | CTR-54,META-46 |
-| [META-59](META-59.md) | очередь модерации — страница по курсору | meta | A | meta-37 | todo | CTR-55 |
-| [META-60](META-60.md) | поля `Collection` — по умолчанию, подписка, оповещения | meta | B | meta-37 | todo | CTR-56,META-46 |
-| [DAV-23](DAV-23.md) | `calendar-user-address-set` — псевдонимы учётной записи | dav | A | dav-07 | todo | CTR-53,DAV-05 |
-| [DAV-24](DAV-24.md) | CardDAV — поисковые строки контакта и `addressbook-query` по индексу | dav | A | dav-07 | todo | CTR-54,DAV-10 |
-| [DAV-25](DAV-25.md) | CalDAV и CardDAV — оповещения по умолчанию и коллекция по умолчанию | dav | A | dav-07 | todo | CTR-56,DAV-05 |
-| [JMAP-34](JMAP-34.md) | ContactCard — перенос между книгами, запрос по индексу, тесты на корпусе vCard | jmap | A | jmap-20 | todo | CTR-54,KIT-09,JMAP-26 |
-| [JMAP-35](JMAP-35.md) | `SieveScript/validate` и `/set` — проверка с пределами секции `sieve` | jmap | A | jmap-20 | todo | JMAP-24,APP-26 |
-| [JMAP-36](JMAP-36.md) | Calendar и AddressBook — `isDefault`, `isSubscribed`, `isVisible`, оповещения по умолчанию | jmap | A | jmap-20 | todo | CTR-56,JMAP-27,JMAP-25 |
+| [AUTH-13](AUTH-13.md) | служба SASL `sieve` для ManageSieve | auth | A | auth-08 | done | SIEVE-08 |
+| [DEPS-08](DEPS-08.md) | `serde_yaml_ng` в dev-зависимостях `tp-sieve` | deps | B | deps-08 | done | SIEVE-07 |
+| [SIEVE-10](SIEVE-10.md) | тест чтения секции `sieve` из YAML | sieve | A | sieve-04 | done | DEPS-08,SIEVE-07 |
+| [SIEVE-11](SIEVE-11.md) | ManageSieve — проверка скрипта с пределами секции `sieve` | sieve | A | sieve-04 | done | SIEVE-09,SIEVE-07 |
+| [KIT-09](KIT-09.md) | корпус vCard | testkit | A | testkit-06 | done | — |
+| [APP-37](APP-37.md) | `thepost admin openapi` — выгрузка схемы Admin API без запуска узла | app | A | app-35 | done | — |
+| [ADM-18](ADM-18.md) | изменение и блокировка учётной записи — `PATCH …/accounts/{account}` | admin | A | admin-13 | done | — |
+| [ADM-19](ADM-19.md) | тема и отправитель письма в корзине и очереди модерации | admin | A | admin-13 | done | — |
+| [ADM-20](ADM-20.md) | группы — имена участников одним ответом и точная схема `GroupInfo` | admin | A | admin-13 | done | — |
+| [CI-07](CI-07.md) | `admin_client.rs` — в полосу admin | ci | B | ci-06 | done | ADM-17 |
+| [ADM-22](ADM-22.md) | CLI — удаление скрипта, автоответ и скрипт организации | admin | A | admin-14 | done | ADM-17,CI-07 |
+| [DEPS-07](DEPS-07.md) | фича `console` в крейте `thepost` | deps | B | deps-07 | done | DEPS-05 |
+| [CI-08](CI-08.md) | выпуск, бета и образ с консолью через фичу `thepost/console` | ci | B | ci-07 | ready | DEPS-07,ADM-15,DEP-35 |
+| [CTR-53](CTR-53.md) | адреса учётной записи — основной и псевдонимы | contracts | B | contracts-38 | done | — |
+| [CTR-54](CTR-54.md) | `DavStore` — перенос объекта между коллекциями и поиск контактов по индексу | contracts | B | contracts-38 | done | CTR-45 |
+| [CTR-55](CTR-55.md) | очередь модерации — продолжение по курсору | contracts | B | contracts-38 | done | CTR-43 |
+| [CTR-56](CTR-56.md) | `Collection` — по умолчанию, подписка и видимость, оповещения по умолчанию | contracts | B | contracts-38 | done | CTR-45 |
+| [META-57](META-57.md) | адреса учётной записи в PostgreSQL | meta | A | meta-37 | ready | CTR-53 |
+| [META-58](META-58.md) | перенос объекта DAV и индекс поиска контактов | meta | B | meta-37 | ready | CTR-54,META-46 |
+| [META-59](META-59.md) | очередь модерации — страница по курсору | meta | A | meta-37 | ready | CTR-55 |
+| [META-60](META-60.md) | поля `Collection` — по умолчанию, подписка, оповещения | meta | B | meta-37 | ready | CTR-56,META-46 |
+| [DAV-23](DAV-23.md) | `calendar-user-address-set` — псевдонимы учётной записи | dav | A | dav-07 | ready | CTR-53,DAV-05 |
+| [DAV-24](DAV-24.md) | CardDAV — поисковые строки контакта и `addressbook-query` по индексу | dav | A | dav-07 | ready | CTR-54,DAV-10 |
+| [DAV-25](DAV-25.md) | CalDAV и CardDAV — оповещения по умолчанию и коллекция по умолчанию | dav | A | dav-07 | ready | CTR-56,DAV-05 |
+| [JMAP-34](JMAP-34.md) | ContactCard — перенос между книгами, запрос по индексу, тесты на корпусе vCard | jmap | A | jmap-20 | ready | CTR-54,KIT-09,JMAP-26 |
+| [JMAP-35](JMAP-35.md) | `SieveScript/validate` и `/set` — проверка с пределами секции `sieve` | jmap | A | jmap-20 | ready | JMAP-24,APP-26 |
+| [JMAP-36](JMAP-36.md) | Calendar и AddressBook — `isDefault`, `isSubscribed`, `isVisible`, оповещения по умолчанию | jmap | A | jmap-20 | ready | CTR-56,JMAP-27,JMAP-25 |
 | [ADM-21](ADM-21.md) | очередь модерации — страницы по курсору | admin | A | admin-15 | todo | CTR-55,META-59 |
 | [APP-38](APP-38.md) | подключения хвостов Ф2 в узле — адреса для CalDAV, темы писем, пределы Sieve в JMAP | app | A | app-36 | todo | DAV-23,META-57,ADM-19,JMAP-35,APP-29,APP-27 |
-| [CTR-58](CTR-58.md) | признак «скрыта из GAL» у учётной записи каталога | contracts | B | contracts-40 | ready | — |
-| [AUTH-16](AUTH-16.md) | LDAP: атрибут «скрыта из GAL» у учётной записи | auth | A | auth-11 | todo | CTR-58 |
-| [DAV-26](DAV-26.md) | адрес клиента во входе CalDAV и CardDAV | dav | A | dav-08 | todo | CTR-57 |
-| [DAV-27](DAV-27.md) | GAL: скрытые учётные записи не попадают в книгу «Организация» | dav | A | dav-08 | todo | CTR-58,DAV-12 |
-| [DAV-28](DAV-28.md) | GAL: ETag карточки — хэш её содержимого | dav | A | dav-08 | todo | DAV-12 |
-| [SIEVE-12](SIEVE-12.md) | адрес клиента во входе ManageSieve | sieve | A | sieve-05 | todo | CTR-57 |
-| [JMAP-38](JMAP-38.md) | JMAP Principal: тип `resource` для переговорных и оборудования | jmap | A | jmap-22 | todo | JMAP-30,CTR-48 |
-| [CTR-60](CTR-60.md) | `DavStore` — глобальная адресная книга организации | contracts | B | contracts-41 | todo | CTR-45,CTR-58 |
+| [CTR-58](CTR-58.md) | признак «скрыта из GAL» у учётной записи каталога | contracts | B | contracts-40 | done | — |
+| [AUTH-16](AUTH-16.md) | LDAP: атрибут «скрыта из GAL» у учётной записи | auth | A | auth-11 | ready | CTR-58 |
+| [DAV-26](DAV-26.md) | адрес клиента во входе CalDAV и CardDAV | dav | A | dav-08 | ready | CTR-57 |
+| [DAV-27](DAV-27.md) | GAL: скрытые учётные записи не попадают в книгу «Организация» | dav | A | dav-08 | ready | CTR-58,DAV-12 |
+| [DAV-28](DAV-28.md) | GAL: ETag карточки — хэш её содержимого | dav | A | dav-08 | ready | DAV-12 |
+| [SIEVE-12](SIEVE-12.md) | адрес клиента во входе ManageSieve | sieve | A | sieve-05 | ready | CTR-57 |
+| [JMAP-38](JMAP-38.md) | JMAP Principal: тип `resource` для переговорных и оборудования | jmap | A | jmap-22 | ready | JMAP-30,CTR-48 |
+| [CTR-60](CTR-60.md) | `DavStore` — глобальная адресная книга организации | contracts | B | contracts-41 | ready | CTR-45,CTR-58 |
 | [META-63](META-63.md) | книга GAL в PostgreSQL | meta | B | meta-39 | todo | CTR-60 |
 | [DAV-29](DAV-29.md) | CardDAV: книга GAL из `DavStore` | dav | A | dav-09 | todo | CTR-60,DAV-27,DAV-28 |
 | [JMAP-39](JMAP-39.md) | JMAP Contacts: книга GAL | jmap | A | jmap-23 | todo | CTR-60,JMAP-34 |
 | [APP-49](APP-49.md) | узел: заполнение книги GAL | app | A | app-41 | todo | DAV-29,META-63,JMAP-39 |
-| [DEPS-10](DEPS-10.md) | `tower-http` (CORS) для `tp-admin` | deps | B | deps-10 | todo | DEPS-05 |
-| [ADM-24](ADM-24.md) | CORS в Admin API для консоли на отдельном веб-сервере | admin | A | admin-17 | todo | ADM-15,DEPS-10 |
-| [ADM-25](ADM-25.md) | `GET /api/v1/session` — настройки входа OIDC для консоли | admin | A | admin-17 | todo | ADM-15 |
-| [ADM-26](ADM-26.md) | `GET /api/v1/orgs` — список организаций | admin | A | admin-17 | todo | ADM-15 |
-| [ADM-27](ADM-27.md) | уникальные `operationId` в схеме Admin API | admin | A | admin-17 | todo | ADM-15 |
+| [DEPS-10](DEPS-10.md) | `tower-http` (CORS) для `tp-admin` | deps | B | deps-10 | done | DEPS-05 |
+| [ADM-24](ADM-24.md) | CORS в Admin API для консоли на отдельном веб-сервере | admin | A | admin-17 | ready | ADM-15,DEPS-10 |
+| [ADM-25](ADM-25.md) | `GET /api/v1/session` — настройки входа OIDC для консоли | admin | A | admin-17 | ready | ADM-15 |
+| [ADM-26](ADM-26.md) | `GET /api/v1/orgs` — список организаций | admin | A | admin-17 | ready | ADM-15 |
+| [ADM-27](ADM-27.md) | уникальные `operationId` в схеме Admin API | admin | A | admin-17 | ready | ADM-15 |
 | [UI-12](UI-12.md) | адрес Admin API в конфигурации консоли | console | A | console-05 | todo | UI-03,ADM-24 |
 | [UI-13](UI-13.md) | консоль: список организаций и типы по новой схеме | console | A | console-05 | todo | ADM-25,ADM-26,ADM-27 |
 | [CI-10](CI-10.md) | архив `console/dist` в выпуске и бете | ci | B | ci-09 | todo | CI-06 |
 | [CI-11](CI-11.md) | сверка схемы Admin API с копией консоли на PR | ci | B | ci-09 | todo | APP-37 |
-| [DEP-35](DEP-35.md) | Dockerfile: образ с веб-консолью | deploy | A | deploy-25 | todo | DEPS-07 |
-| [CTR-59](CTR-59.md) | занятость повторяющихся событий — правка контракта CTR-47 под разворот при запросе | contracts | B | contracts-42 | ready | CTR-47 |
-| [SMTP-36](SMTP-36.md) | приглашения из почтового клиента — в календарь коллеги | smtp | A | smtp-16 | todo | SMTP-33,CTR-53 |
+| [DEP-35](DEP-35.md) | Dockerfile: образ с веб-консолью | deploy | A | deploy-25 | done | DEPS-07 |
+| [CTR-59](CTR-59.md) | занятость повторяющихся событий — правка контракта CTR-47 под разворот при запросе | contracts | B | contracts-42 | done | CTR-47 |
+| [SMTP-36](SMTP-36.md) | приглашения из почтового клиента — в календарь коллеги | smtp | A | smtp-16 | ready | SMTP-33,CTR-53 |
 | [META-65](META-65.md) | каталог `Directory` поверх учётных записей PostgreSQL | meta | A | meta-41 | todo | CTR-60 |
 | [APP-51](APP-51.md) | узел: книга «Организация» без LDAP | app | A | app-45 | todo | META-65,APP-49 |
 | [APP-52](APP-52.md) | maintenance: метрики очистки по сроку | app | A | app-45 | todo | APP-32 |
-| [DEP-37](DEP-37.md) | примеры секций `maintenance` и `dav` в `deploy/config` | deploy | A | deploy-27 | todo | APP-32,APP-29 |
-| [DEPS-11](DEPS-11.md) | `calcard` в dev-зависимостях `tp-testkit` | deps | B | deps-11 | todo | KIT-09 |
+| [DEP-37](DEP-37.md) | примеры секций `maintenance` и `dav` в `deploy/config` | deploy | A | deploy-27 | done | APP-32,APP-29 |
+| [DEPS-11](DEPS-11.md) | `calcard` в dev-зависимостях `tp-testkit` | deps | B | deps-11 | ready | KIT-09 |
 | [KIT-10](KIT-10.md) | корпус vCard: проверка разбором и новые образцы | testkit | A | testkit-07 | todo | DEPS-11 |
-| [DEP-38](DEP-38.md) | ManageSieve в поставке: секция и порт 4190 | deploy | A | deploy-28 | todo | APP-27 |
-| [DEPS-12](DEPS-12.md) | фича `gssapi` в сборке узла | deps | B | deps-12 | todo | AUTH-13 |
+| [DEP-38](DEP-38.md) | ManageSieve в поставке: секция и порт 4190 | deploy | A | deploy-28 | done | APP-27 |
+| [DEPS-12](DEPS-12.md) | фича `gssapi` в сборке узла | deps | B | deps-12 | ready | AUTH-13 |
 | [CI-12](CI-12.md) | libkrb5 в CI, выпуск и бета с GSSAPI | ci | B | ci-10 | todo | DEPS-12 |
 | [DEP-39](DEP-39.md) | образ и эталоны: libkrb5 для GSSAPI | deploy | A | deploy-29 | todo | DEPS-12 |
 | [DOC-03](DOC-03.md) | PREREQUISITES: Kerberos — принципалы служб и keytab | docs | A | docs-03 | todo | DEP-39 |
@@ -737,8 +738,8 @@
 | [CTR-64](CTR-64.md) | сигнал `AccountDisabled` — вход учётной записи запрещён | contracts | B | contracts-44 | ready | — |
 | [META-66](META-66.md) | `by_ids` в PostgreSQL | meta | A | meta-42 | todo | CTR-63 |
 | [META-67](META-67.md) | публикация `AccountDisabled` при блокировке | meta | A | meta-42 | todo | CTR-64 |
-| [CTR-80](CTR-80.md) | заголовки скрытого письма корзины для администратора | contracts | B | contracts-52 | ready | CTR-35 |
-| [MS-19](MS-19.md) | заголовки скрытого письма корзины | mailstore | A | mailstore-12 | todo | CTR-80 |
+| [CTR-80](CTR-80.md) | заголовки скрытого письма корзины для администратора | contracts | B | contracts-52 | done | CTR-35 |
+| [MS-19](MS-19.md) | заголовки скрытого письма корзины | mailstore | A | mailstore-12 | done | CTR-80 |
 | [CTR-81](CTR-81.md) | действие «поиск» в журнале аудита ящика | contracts | B | contracts-53 | ready | CTR-35 |
 | [IMAP-23](IMAP-23.md) | поиск по тексту в чужом ящике — в журнал аудита | imap | A | imap-13 | todo | CTR-81 |
 | [JMAP-43](JMAP-43.md) | Email/query по тексту в чужом ящике — в журнал аудита | jmap | A | jmap-26 | todo | CTR-81 |
@@ -747,9 +748,9 @@
 | [JMAP-41](JMAP-41.md) | заблокированная учётная запись — закрытие push JMAP | jmap | A | jmap-24 | todo | CTR-64 |
 | [UI-14](UI-14.md) | консоль: страница «нет доступа» | console | A | console-06 | todo | UI-09 |
 | [UI-15](UI-15.md) | консоль: блокировка учётной записи, темы писем, имена участников | console | A | console-06 | todo | UI-13,ADM-18,ADM-19,ADM-20 |
-| [CTR-62](CTR-62.md) | `AccountStore::by_address` с псевдонимами и адресами групп | contracts | B | contracts-45 | todo | CTR-53 |
-| [CTR-65](CTR-65.md) | входящие планирования: журнал изменений и время получения | contracts | B | contracts-45 | todo | — |
-| [CTR-66](CTR-66.md) | журнал доставки: событие iTIP | contracts | B | contracts-45 | todo | — |
+| [CTR-62](CTR-62.md) | `AccountStore::by_address` с псевдонимами и адресами групп | contracts | B | contracts-45 | ready | CTR-53 |
+| [CTR-65](CTR-65.md) | входящие планирования: журнал изменений и время получения | contracts | B | contracts-45 | ready | — |
+| [CTR-66](CTR-66.md) | журнал доставки: событие iTIP | contracts | B | contracts-45 | ready | — |
 | [META-68](META-68.md) | `by_address` в PostgreSQL | meta | A | meta-43 | todo | CTR-62 |
 | [META-69](META-69.md) | журнал входящих планирования в PostgreSQL | meta | A | meta-43 | todo | CTR-65,META-51 |
 | [DAV-30](DAV-30.md) | планирование: участник по псевдониму и адресу группы | dav | A | dav-10 | todo | CTR-62,DAV-15 |
@@ -759,13 +760,13 @@
 | [JMAP-42](JMAP-42.md) | `CalendarEventNotification/query` и изменения по журналу входящих | jmap | A | jmap-25 | todo | CTR-65,JMAP-31 |
 | [SMTP-37](SMTP-37.md) | журнал доставки: запись о приёме iTIP | smtp | A | smtp-18 | todo | CTR-66,SMTP-33 |
 | [APP-53](APP-53.md) | узел: планирование в JMAP и очистка входящих | app | A | app-46 | todo | JMAP-31,DAV-32 |
-| [SMTP-38](SMTP-38.md) | iMIP: отправитель «от имени» (`SENT-BY`) | smtp | A | smtp-19 | todo | SMTP-33,CTR-48 |
+| [SMTP-38](SMTP-38.md) | iMIP: отправитель «от имени» (`SENT-BY`) | smtp | A | smtp-19 | ready | SMTP-33,CTR-48 |
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CI-09](CI-09.md) | фаззинг `tp-sieve` под libFuzzer | ci | B | ci-08 | ready | SIEVE-07 |
+| [CI-09](CI-09.md) | фаззинг `tp-sieve` под libFuzzer | ci | B | ci-08 | done | SIEVE-07 |
 | [META-71](META-71.md) | миграции — одна базовая схема перед выпуском 1.0 | meta | B | meta-45 | ready | — |
 
 ## Вне волн
