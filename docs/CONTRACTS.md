@@ -341,6 +341,10 @@ until, limit, after })` -> `AuditPage` (как `DeliveryLog::search`), `purge_au
 SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>` (неверные данные — `Forbidden`);
 `Credentials::{ Password { login, secret }, Bearer(token), Gssapi { principal, authzid } }`, секреты скрыты в `Debug`.
 `Principal { tenant, account, login, groups, scopes: Option<_> }` (`None` — без ограничений).
+Адрес клиента (CTR-57; SRS 6.3 — счётчики попыток по адресу, подсети и учётной записи): `Authenticator::verify_from(Credentials,
+peer: Option<IpAddr>) -> Result<Principal>` — проверка с адресом клиента соединения; реализация с защитой от перебора ведёт по нему
+счётчики и отказывает заблокированному источнику (`Forbidden`); `None` — адрес неизвестен, счётчики по адресу и подсети не ведутся;
+по умолчанию — `verify`, адрес не используется. Протоколы и HTTP (Basic, Bearer) вызывают `verify_from`.
 `Authorizer`: `rights(&Principal, &Resource) -> Rights`, `check(.., required)` (по умолчанию через `rights`),
 `send_right(&Principal, from) -> Option<SendRight::{SendAs, SendOnBehalf}>`; `Resource::{ Account, Mailbox }`.
 `Rights` — RFC 4314, строка `lrswipkxtea` в каноническом порядке; `c`/`d` (RFC 2086) разворачивает IMAP.
@@ -349,6 +353,10 @@ SASL (код — `sasl.rs`, RFC 4422): механизмы `Mechanism::{ Plain, L
 start(mech, &SaslContext { service, tls }) }` → `SaslSession::step(Option<&[u8]>) -> SaslStep::{ Challenge(bytes), Done(Principal), Fail(SaslFailure) }`
 (`None` — нет начального ответа; `SaslFailure::{ Authentication, Authorization, Expired }` — коды RFC 5530 / SMTP 535).
 Неизвестный или недоступный механизм, нарушение формата — `Invalid`; base64 и отмена `*` — протокол.
+`SaslServer::start_from(mech, &SaslContext, peer: Option<IpAddr>)` (CTR-57) — `start` с адресом клиента соединения: сеанс передаёт его в
+`Authenticator::verify_from`; по умолчанию — `start`, адрес не используется. `SaslContext` не меняется (код, собирающий его перечислением
+полей, остаётся как есть). Передача настоящего адреса — AUTH-14 (`tp-auth`: `start_from`, счётчики), SMTP-35, IMAP-19, SIEVE-12 (вызов
+`start_from`), JMAP-37, DAV-26 (вызов `verify_from`); фейк, запоминающий адрес, — `tp-testkit`.
 ACL (код — `acl.rs`, SRS 4.5, RFC 4314): `AclStore` — данные `Authorizer`, IMAP ACL, JMAP и Admin API. Идентификаторы — имя входа, группа,
 `ANYONE` (`"anyone"`), с `-` в начале — отрицательные права; `validate_identifier(id, negative)` (≤ 255 байт, без пробелов и управляющих, не `-`)
 → `Invalid`. Права владельца на свои папки — правило `Authorizer`, в ACL не хранятся.
@@ -865,3 +873,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-56 (волна contracts-38): `CollectionPrefs` — коллекция по умолчанию, подписка и видимость, оповещения по умолчанию;
   `DavStore::{collection_prefs, list_collection_prefs, set_collection_prefs, default_collection}`, правило без назначенной —
   `dav::default_of`. По сравнению с карточкой: свойства — отдельная структура, а не поля `Collection` (существующий код не меняется).
+- 2026-11-12 — CTR-57 (волна contracts-39): адрес клиента в проверке учётных данных — `Authenticator::verify_from(credentials, peer)`
+  (по умолчанию — `verify`) и `SaslServer::start_from(mechanism, ctx, peer)` (по умолчанию — `start`). По сравнению с карточкой: адрес —
+  параметр `start_from`, а не поле `SaslContext` (существующий код не меняется).

@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::IpAddr;
 use std::ops::{BitOr, BitOrAssign, Sub};
 use std::str::FromStr;
 
@@ -307,6 +308,21 @@ impl Principal {
 pub trait Authenticator: Send + Sync + 'static {
     /// Проверяет учётные данные и возвращает субъекта.
     async fn verify(&self, credentials: Credentials) -> Result<Principal>;
+
+    /// Проверка с адресом клиента соединения (CTR-57; SRS 6.3): реализация с защитой от перебора ведёт счётчики
+    /// неудачных попыток по адресу, подсети и учётной записи и отказывает заблокированному источнику
+    /// (`Error::Forbidden`, как при неверных данных). `peer = None` — адрес неизвестен (внутренний вызов, доверенный
+    /// посредник без адреса клиента): счётчики по адресу и подсети не ведутся. Протоколы вызывают этот метод;
+    /// по умолчанию — [`Authenticator::verify`], адрес не используется (реализации без защиты от перебора не
+    /// меняются).
+    async fn verify_from(
+        &self,
+        credentials: Credentials,
+        peer: Option<IpAddr>,
+    ) -> Result<Principal> {
+        let _ = peer;
+        self.verify(credentials).await
+    }
 }
 
 // SASL — модуль `sasl`.
