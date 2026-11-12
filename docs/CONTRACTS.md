@@ -165,7 +165,7 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
 LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } |
-ShardsChanged | AccountDisabled { account } | DavChanged { kind, collection, modseq } | ScheduleInboxChanged { modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+ShardsChanged | AccountDisabled { account } | GalChanged { collection, modseq } | DavChanged { kind, collection, modseq } | ScheduleInboxChanged { modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
 `MailboxListChanged`, `DavChanged`, `ScheduleInboxChanged`, `SieveChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
 `MembersChanged`, `ShardsChanged` — с `TenantId::DEFAULT`, `Blocked`, `Unblocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
@@ -176,6 +176,7 @@ ShardsChanged | AccountDisabled { account } | DavChanged { kind, collection, mod
 шард, изменились адрес или реплика, учётная запись перенесена; узлы сбрасывают кэш справочника (`tp_meta::shards::ShardDirectory::follow`).
 `AccountDisabled` (CTR-64) — `AccountStore` после запрета входа (`enabled = false`, `disable_account`), с организацией учётной записи;
 протоколы с долгими сеансами (IMAP-22, JMAP-41) закрывают сеансы учётной записи.
+`GalChanged` (CTR-60) — `DavStore::sync_gal`, изменивший книгу GAL, с организацией книги (`dav::gal_changed`).
 Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
@@ -651,7 +652,22 @@ PreconditionFailed, UidConflict { name }}` — одной транзакцией
 `account_changes(kind, since, limit) -> Changes<DavObjectId>` (JMAP `CalendarEvent/changes`, `ContactCard/changes`), `state(kind)`
 (JMAP `state`). `since = 0` — всё в `created`; `has_more` — `new_state` последнего возвращённого; `since` старше очищенных надгробий или
 больше счётчика — `Conflict`. Сигнал `DavChanged { kind, collection, modseq }` (`dav_changed`, учётная запись) — после фиксации каждого
-изменения. Входящие планирования `inbox_put`, `inbox_list`, `inbox_delete` — раздел Schedule. In-memory — `MemDav` (`with_limits`,
+изменения. Входящие планирования `inbox_put`, `inbox_list`, `inbox_delete` — раздел Schedule.
+Книга GAL (CTR-60, решение 72) — одна адресная книга организации с именем `GAL_COLLECTION_NAME` = `gal` (`Collection::is_gal`; имя
+зарезервировано: `create_collection` адресной книги с ним — `Conflict`), общая для CardDAV и JMAP. Появляется при первом
+`sync_gal(tenant, display_name, Vec<GalCard { name, body, index }>) -> ModSeq` — служебной записи полного набора одной транзакцией
+(проверка — `dav::validate_gal`: имя и индекс карточки, только `VCARD`, имена и UID без повторов — `Invalid`; `max_object_size`,
+`max_objects` — `QuotaExceeded`; ничего не изменено). Карточка с прежним именем и тем же телом и индексом не меняется (ETag и `ModSeq`
+прежние, в `changes` не попадает), с другим — перезапись (прежний `id`, новые ETag и `ModSeq`), с новым именем — создание, отсутствующая
+в наборе — надгробие; новое отображаемое имя — изменение свойств книги; возвращается `Collection::state` книги (без изменений —
+прежний). Счётчик `ModSeq` — свой у книги. Книга — среди коллекций каждой учётной записи организации (`list_collections`,
+`get_collection`, `collection_by_name`; не выбирается `default_of`), читается как своя (`get_object`, `object_by_uid`, `list_objects`,
+`multiget`, `in_range`, `find_cards`, `changes` по счётчику книги, `objects_by_id`); запись пользователя — `put_object`,
+`delete_object`, `move_object` (из неё или в неё), `update_collection`, `delete_collection` — `Forbidden`. В `collection_changes`,
+`account_changes` и `state` учётной записи книга не входит; изменения карточек по идентификаторам (JMAP `ContactCard/changes`) —
+`gal_changes(tenant, since, limit) -> Changes<DavObjectId>` (нет книги — как у новой учётной записи). После записи с изменениями —
+системный сигнал `GalChanged { collection, modseq }` (`dav::gal_changed`). Наборы `suite::dav::gal`, `suite::dav::gal_signals`;
+PostgreSQL — META-63, потребители — DAV-29, JMAP-39, APP-49. In-memory — `MemDav` (`with_limits`,
 `with_bus`, `purge_tombstones`; и `FreeBusy`); наборы `suite::dav` (лимиты `suite::dav::LIMITS`, `DavFixture`), `suite::dav::signals`.
 PostgreSQL — `tp-meta` (META-46…48, планирование — META-51).
 
@@ -995,3 +1011,11 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   набор `suite::account_by_ids`; `EventKind::AccountDisabled { account }` — системный сигнал запрета входа и `meta::account_disabled`,
   набор `suite::signals`. По сравнению с карточками: повторы в `by_ids` схлопываются; сигнал — и при `disable_account` (вход запрещён
   и там). Публикация в `tp-meta` — META-67, подписчики — IMAP-22, JMAP-41.
+- 2026-11-13 — CTR-60 (волна contracts-41, решение 72): книга GAL организации в `DavStore` — `sync_gal(tenant, display_name, cards)`
+  (полный набор `GalCard` одной транзакцией; неизменная карточка сохраняет ETag и `ModSeq`, исчезнувшая — надгробие),
+  `gal_changes(tenant, since, limit)`, `GAL_COLLECTION_NAME`, `Collection::is_gal`, `validate_gal`; книга видна каждой учётной записи
+  организации, запись пользователя — `Forbidden`, имя `gal` у адресной книги зарезервировано (`Conflict`), `default_of` её не выбирает;
+  сигнал `EventKind::GalChanged { collection, modseq }` (`dav::gal_changed`). Несовместимо: новые обязательные методы `DavStore`
+  (без реализации по умолчанию) — `MemDav` реализует, `PgMeta` до META-63 возвращает `Internal`. По сравнению с карточкой: параметр
+  `display_name` у `sync_gal`, метод `gal_changes` и сигнал `GalChanged` — для JMAP-39 (изменения по идентификаторам при своём счётчике
+  книги) и push. Наборы `suite::dav::gal`, `suite::dav::gal_signals`.

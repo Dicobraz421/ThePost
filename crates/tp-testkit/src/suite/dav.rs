@@ -6,8 +6,8 @@ use time::{Duration, OffsetDateTime};
 use tp_contracts::bus::{EventBus, EventKind};
 use tp_contracts::dav::{
     CardSearch, Collection, CollectionId, CollectionKind, Component, DavLimits, DavStore,
-    DeleteOutcome, MoveOutcome, ObjectIndex, Precondition, Put, PutOutcome, Span, TimeRange,
-    default_of,
+    DeleteOutcome, GAL_COLLECTION_NAME, GalCard, MoveOutcome, ObjectIndex, Precondition, Put,
+    PutOutcome, Span, TimeRange, default_of,
 };
 use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Error, ModSeq, TenantId};
@@ -1293,4 +1293,382 @@ pub async fn organize(store: &dyn DavStore, s: AccountScope) {
             .await,
         Err(Error::Invalid(_))
     ));
+}
+
+// ---------- Книга GAL (CTR-60) ----------
+
+fn gal_card(name: &str, uid: &str, full_name: &str) -> GalCard {
+    GalCard {
+        name: name.to_owned(),
+        body: format!("BEGIN:VCARD\r\nVERSION:3.0\r\nUID:{uid}\r\nFN:{full_name}\r\nEND:VCARD\r\n"),
+        index: ObjectIndex {
+            search: CardSearch::new([full_name]),
+            ..ObjectIndex::new(Component::Card, uid, None)
+        },
+    }
+}
+
+/// Набор проверок книги GAL [`DavStore`] (CTR-60): до первой [`DavStore::sync_gal`] книги нет, имя
+/// [`GAL_COLLECTION_NAME`] зарезервировано; книга видна каждой учётной записи организации и не видна другой, не книга
+/// по умолчанию; чтение — как у обычной книги; повтор набора без изменений не меняет ETag, `ModSeq` и `changes`;
+/// изменённая карточка — новый ETag с прежним идентификатором, исчезнувшая — надгробие (`changes`, `gal_changes`);
+/// запись пользователя — `Forbidden`; изменения и состояние учётной записи книгу не включают; отображаемое имя;
+/// недопустимый набор ничего не меняет. `fx.owner`, `fx.peer` — без коллекций, у организации книги GAL нет;
+/// хранилище — с лимитами [`LIMITS`].
+pub async fn gal(store: &dyn DavStore, fx: &DavFixture) {
+    let (s, peer, tenant) = (fx.owner, fx.peer, fx.owner.tenant);
+    let book = CollectionKind::AddressBook;
+    assert_eq!(store.limits(), LIMITS, "набор требует лимиты LIMITS");
+
+    // До первой записи книги нет; имя зарезервировано.
+    assert!(
+        store
+            .list_collections(s, book)
+            .await
+            .expect("list")
+            .is_empty()
+    );
+    let none = store
+        .gal_changes(tenant, ModSeq::ZERO, 10)
+        .await
+        .expect("gal_changes");
+    assert!(none.created.is_empty() && !none.has_more);
+    assert_eq!(none.new_state, ModSeq::ZERO);
+    assert!(matches!(
+        store.gal_changes(tenant, ModSeq(1), 10).await,
+        Err(Error::Conflict)
+    ));
+    assert_eq!(
+        store
+            .create_collection(s, Collection::new(book, GAL_COLLECTION_NAME))
+            .await,
+        Err(Error::Conflict)
+    );
+
+    // ---------- Первая запись ----------
+    let a = gal_card("a.vcf", "uid-a", "Анна Петрова");
+    let b = gal_card("b.vcf", "uid-b", "Борис Иванов");
+    let m1 = store
+        .sync_gal(tenant, "Организация", vec![a.clone(), b.clone()])
+        .await
+        .expect("sync_gal");
+    let gal = store
+        .collection_by_name(s, book, GAL_COLLECTION_NAME)
+        .await
+        .expect("collection_by_name")
+        .expect("книга GAL");
+    assert!(gal.is_gal());
+    assert_eq!((gal.display_name.as_str(), gal.state), ("Организация", m1));
+    for scope in [s, peer] {
+        let list = store.list_collections(scope, book).await.expect("list");
+        assert_eq!(
+            list,
+            std::slice::from_ref(&gal),
+            "книга видна каждой учётной записи"
+        );
+        assert_eq!(default_of(&list), None, "книга GAL — не книга по умолчанию");
+        assert_eq!(
+            store.get_collection(scope, gal.id).await.expect("get"),
+            Some(gal.clone())
+        );
+    }
+    let foreign = fx.foreign;
+    assert!(
+        store
+            .list_collections(foreign, book)
+            .await
+            .expect("list")
+            .is_empty()
+    );
+    assert_eq!(store.get_collection(foreign, gal.id).await, Ok(None));
+    assert_eq!(
+        store.list_objects(foreign, gal.id).await,
+        Err(Error::NotFound)
+    );
+
+    // Чтение — как у обычной книги.
+    let refs = store
+        .list_objects(peer, gal.id)
+        .await
+        .expect("list_objects");
+    assert_eq!(
+        refs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["a.vcf", "b.vcf"]
+    );
+    let (id_a, id_b) = (refs[0].id, refs[1].id);
+    let got = store
+        .get_object(peer, gal.id, "a.vcf")
+        .await
+        .expect("get_object")
+        .expect("карточка a");
+    assert_eq!((&got.body, &got.index), (&a.body, &a.index));
+    assert_eq!(
+        names(&store.find_cards(s, gal.id, "петр", 10).await.expect("find")),
+        ["a.vcf"]
+    );
+    assert_eq!(
+        names(&store.objects_by_id(peer, &[id_b]).await.expect("by id")),
+        ["b.vcf"]
+    );
+    let full = store
+        .changes(s, gal.id, ModSeq::ZERO, 10)
+        .await
+        .expect("changes");
+    assert_eq!(full.created, ["a.vcf", "b.vcf"]);
+    assert_eq!(full.new_state, m1);
+    let full = store
+        .gal_changes(tenant, ModSeq::ZERO, 10)
+        .await
+        .expect("gal_changes");
+    assert_eq!((full.created, full.new_state), (vec![id_a, id_b], m1));
+
+    // ---------- Повтор без изменений ----------
+    assert_eq!(
+        store
+            .sync_gal(tenant, "Организация", vec![b.clone(), a.clone()])
+            .await,
+        Ok(m1)
+    );
+    assert_eq!(store.list_objects(s, gal.id).await.expect("list"), refs);
+    let same = store.changes(s, gal.id, m1, 10).await.expect("changes");
+    assert!(same.created.is_empty() && same.updated.is_empty() && same.destroyed.is_empty());
+    assert_eq!(same.new_state, m1);
+    let same = store
+        .gal_changes(tenant, m1, 10)
+        .await
+        .expect("gal_changes");
+    assert!(same.created.is_empty() && same.updated.is_empty() && same.destroyed.is_empty());
+
+    // ---------- Изменённая, исчезнувшая, новая ----------
+    let a2 = gal_card("a.vcf", "uid-a", "Анна Сидорова");
+    let c = gal_card("c.vcf", "uid-c", "Вера Смирнова");
+    let m2 = store
+        .sync_gal(tenant, "Организация", vec![a2.clone(), c.clone()])
+        .await
+        .expect("sync_gal");
+    assert!(m2 > m1);
+    let refs2 = store.list_objects(s, gal.id).await.expect("list");
+    assert_eq!(
+        refs2.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["a.vcf", "c.vcf"]
+    );
+    assert_eq!(refs2[0].id, id_a, "карточка с прежним именем — прежний id");
+    assert_ne!(refs2[0].etag, refs[0].etag, "изменённая — новый ETag");
+    let id_c = refs2[1].id;
+    let ch = store.changes(s, gal.id, m1, 10).await.expect("changes");
+    assert_eq!(
+        (ch.created, ch.updated, ch.destroyed, ch.new_state),
+        (
+            vec!["c.vcf".to_owned()],
+            vec!["a.vcf".to_owned()],
+            vec!["b.vcf".to_owned()],
+            m2
+        )
+    );
+    let ch = store
+        .gal_changes(tenant, m1, 10)
+        .await
+        .expect("gal_changes");
+    assert_eq!(
+        (ch.created, ch.updated, ch.destroyed, ch.new_state),
+        (vec![id_c], vec![id_a], vec![id_b], m2)
+    );
+    let page = store.gal_changes(tenant, m1, 1).await.expect("gal_changes");
+    assert!(page.has_more && page.new_state < m2);
+    assert_eq!(
+        store
+            .get_collection(s, gal.id)
+            .await
+            .expect("get")
+            .map(|g| g.state),
+        Some(m2)
+    );
+
+    // ---------- Запись пользователя — Forbidden ----------
+    let own = Collection::new(book, "contacts");
+    store
+        .create_collection(s, own.clone())
+        .await
+        .expect("create");
+    let x = gal_card("x.vcf", "uid-x", "Свой Контакт");
+    let put_x = stored(
+        store
+            .put_object(
+                s,
+                own.id,
+                "x.vcf",
+                x.body.clone(),
+                x.index.clone(),
+                Precondition::Any,
+            )
+            .await
+            .expect("put"),
+    );
+    assert_eq!(
+        store
+            .put_object(
+                s,
+                gal.id,
+                "x.vcf",
+                x.body.clone(),
+                x.index.clone(),
+                Precondition::Any
+            )
+            .await,
+        Err(Error::Forbidden)
+    );
+    assert_eq!(
+        store
+            .delete_object(s, gal.id, "a.vcf", Precondition::Any)
+            .await,
+        Err(Error::Forbidden)
+    );
+    let renamed = Collection {
+        display_name: "Моя".into(),
+        ..gal.clone()
+    };
+    assert_eq!(
+        store.update_collection(s, renamed).await,
+        Err(Error::Forbidden)
+    );
+    assert_eq!(
+        store.delete_collection(s, gal.id).await,
+        Err(Error::Forbidden)
+    );
+    for (from, name, to) in [(own.id, "x.vcf", gal.id), (gal.id, "a.vcf", own.id)] {
+        assert_eq!(
+            store
+                .move_object(s, from, name, to, Precondition::Any)
+                .await,
+            Err(Error::Forbidden)
+        );
+    }
+    assert_eq!(store.list_objects(s, gal.id).await.expect("list"), refs2);
+
+    // ---------- Учётная запись: изменения и состояние без книги GAL ----------
+    let list = store.list_collections(s, book).await.expect("list");
+    assert_eq!(list.len(), 2);
+    assert_eq!(default_of(&list).map(|c| c.id), Some(own.id));
+    let acc = store
+        .account_changes(s, book, ModSeq::ZERO, 10)
+        .await
+        .expect("account_changes");
+    assert_eq!(acc.created, [put_x.id]);
+    let colls = store
+        .collection_changes(s, book, ModSeq::ZERO, 10)
+        .await
+        .expect("collection_changes");
+    assert_eq!(colls.created, [own.id]);
+    assert_eq!(store.state(s, book).await, Ok(put_x.modseq));
+    assert_eq!(store.state(peer, book).await, Ok(ModSeq::ZERO));
+
+    // ---------- Отображаемое имя ----------
+    let m3 = store
+        .sync_gal(tenant, "Компания", vec![a2.clone(), c.clone()])
+        .await
+        .expect("sync_gal");
+    assert!(m3 > m2);
+    let renamed = store
+        .get_collection(peer, gal.id)
+        .await
+        .expect("get")
+        .expect("книга GAL");
+    assert_eq!(
+        (renamed.display_name.as_str(), renamed.state),
+        ("Компания", m3)
+    );
+    let ch = store.changes(s, gal.id, m2, 10).await.expect("changes");
+    assert!(ch.created.is_empty() && ch.updated.is_empty() && ch.destroyed.is_empty());
+    assert_eq!(ch.new_state, m3);
+
+    // ---------- Недопустимый набор — ничего не изменено ----------
+    let event = GalCard {
+        index: ObjectIndex::new(Component::Event, "uid-e", None),
+        ..gal_card("e.ics", "uid-e", "Событие")
+    };
+    let invalid = [
+        vec![a2.clone(), a2.clone()],
+        vec![
+            a2.clone(),
+            GalCard {
+                name: "d.vcf".into(),
+                ..a2.clone()
+            },
+        ],
+        vec![event],
+        vec![GalCard {
+            name: "a/b".into(),
+            ..a2.clone()
+        }],
+    ];
+    for cards in invalid {
+        assert!(
+            matches!(
+                store.sync_gal(tenant, "Компания", cards).await,
+                Err(Error::Invalid(_))
+            ),
+            "недопустимый набор"
+        );
+    }
+    assert!(matches!(
+        store.sync_gal(tenant, "a\u{7}", vec![a2.clone()]).await,
+        Err(Error::Invalid(_))
+    ));
+    let many: Vec<GalCard> = (0..=LIMITS.max_objects)
+        .map(|i| gal_card(&format!("{i}.vcf"), &format!("uid-{i}"), "Имя"))
+        .collect();
+    let big = GalCard {
+        body: "x".repeat(LIMITS.max_object_size + 1),
+        ..a2.clone()
+    };
+    for cards in [many, vec![big]] {
+        assert_eq!(
+            store.sync_gal(tenant, "Компания", cards).await,
+            Err(Error::QuotaExceeded)
+        );
+    }
+    assert_eq!(store.list_objects(s, gal.id).await.expect("list"), refs2);
+    assert_eq!(
+        store.get_collection(s, gal.id).await.expect("get"),
+        Some(renamed)
+    );
+}
+
+/// Набор проверок сигнала книги GAL (CTR-60): [`DavStore::sync_gal`], изменивший книгу, публикует системный
+/// `GalChanged` с `ModSeq` книги; повтор без изменений — без сигнала. «Не пришло» проверяется тем, что первым пришёл
+/// сигнал следующей записи. У организации `tenant` книги GAL нет.
+pub async fn gal_signals(store: &dyn DavStore, bus: &dyn EventBus, tenant: TenantId) {
+    let mut sys = bus.subscribe_system().await.expect("subscribe_system");
+    let scope = AccountScope {
+        tenant,
+        account: AccountId::new(),
+    };
+    let a = gal_card("a.vcf", "uid-a", "Анна Петрова");
+    let m1 = store
+        .sync_gal(tenant, "Организация", vec![a.clone()])
+        .await
+        .expect("sync_gal");
+    let gal = store
+        .collection_by_name(scope, CollectionKind::AddressBook, GAL_COLLECTION_NAME)
+        .await
+        .expect("collection_by_name")
+        .expect("книга GAL");
+    let mut expect = async |modseq: ModSeq| {
+        let e = next_signal(&mut sys).await.expect("сигнал");
+        assert_eq!((e.tenant, e.account), (tenant, None));
+        assert_eq!(
+            e.kind,
+            EventKind::GalChanged {
+                collection: gal.id,
+                modseq
+            }
+        );
+    };
+    expect(m1).await;
+    assert_eq!(store.sync_gal(tenant, "Организация", vec![a]).await, Ok(m1));
+    let m2 = store
+        .sync_gal(tenant, "Организация", Vec::new())
+        .await
+        .expect("sync_gal");
+    expect(m2).await;
 }

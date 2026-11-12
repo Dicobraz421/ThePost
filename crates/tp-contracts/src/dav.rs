@@ -19,6 +19,16 @@
 //! [`DavStore::inbox_list`], [`DavStore::inbox_delete`]): UID в нём не уникален, в коллекции и их изменения не входит.
 //! `Schedule-Tag` объекта (RFC 6638 §3.2) и индекс занятости — поля [`ObjectIndex`], их задаёт вызывающий; занятость
 //! читает [`crate::schedule::FreeBusy`].
+//!
+//! # Книга GAL (CTR-60, решение 72)
+//!
+//! Глобальная адресная книга — одна коллекция организации: адресная книга с именем [`GAL_COLLECTION_NAME`]
+//! ([`Collection::is_gal`]), видна в доме адресных книг каждой учётной записи организации и только читается. Появляется
+//! при первом [`DavStore::sync_gal`] — служебной операции, которая заменяет весь набор карточек одной транзакцией.
+//! Чтение — обычными методами по её идентификатору (`list_objects`, `get_object`, `multiget`, `find_cards`,
+//! `changes`, `objects_by_id`…); запись пользователя — `Error::Forbidden`. У книги свой счётчик `ModSeq` организации:
+//! её изменения не входят в `collection_changes`, `account_changes` и `state` учётной записи, изменения карточек
+//! по идентификаторам — [`DavStore::gal_changes`], сигнал — [`gal_changed`] ([`EventKind::GalChanged`]).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -30,8 +40,8 @@ use time::OffsetDateTime;
 
 use crate::bus::{Event, EventKind};
 use crate::error::{Error, Result};
-use crate::ids::ModSeq;
 pub use crate::ids::{CollectionId, DavObjectId};
+use crate::ids::{ModSeq, TenantId};
 use crate::meta::{AccountScope, Changes};
 use crate::schedule::{BusyPeriod, Inbox, InboxMessage, validate_busy};
 
@@ -61,6 +71,10 @@ pub const MAX_DEFAULT_ALERTS_LEN: usize = 8192;
 
 /// Имя (сегмент URL) коллекции по умолчанию, пока она не назначена ([`default_of`]).
 pub const DEFAULT_COLLECTION_NAME: &str = "default";
+
+/// Имя (сегмент URL) книги GAL организации среди адресных книг (CTR-60; [`Collection::is_gal`]). Зарезервировано:
+/// адресная книга учётной записи с этим именем не создаётся ([`DavStore::create_collection`] — `Conflict`).
+pub const GAL_COLLECTION_NAME: &str = "gal";
 
 /// Вид коллекции.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -232,6 +246,11 @@ impl Collection {
         }
     }
 
+    /// Книга GAL организации (CTR-60): адресная книга с именем [`GAL_COLLECTION_NAME`]; только чтение.
+    pub fn is_gal(&self) -> bool {
+        self.kind == CollectionKind::AddressBook && self.name == GAL_COLLECTION_NAME
+    }
+
     /// Проверяет поля: имя — [`valid_name`]; отображаемое имя — до [`MAX_DISPLAY_NAME_LEN`] символов, описание — до
     /// [`MAX_DESCRIPTION_LEN`] байт, цвет и часовой пояс — до [`MAX_PROPERTY_LEN`] байт, все без управляющих символов
     /// (в описании допустимы перевод строки и табуляция); компоненты — непустые и подходят виду ([`Component::fits`]);
@@ -290,20 +309,14 @@ impl Collection {
 
 /// Коллекция по умолчанию среди `collections` — коллекций одного вида в любом порядке (CTR-56): назначенная
 /// ([`Collection::is_default`]); не назначена — с именем [`DEFAULT_COLLECTION_NAME`], иначе первая по порядку
-/// [`DavStore::list_collections`] (`order`, затем имя).
+/// [`DavStore::list_collections`] (`order`, затем имя). Книга GAL ([`Collection::is_gal`]) не выбирается.
 pub fn default_of(collections: &[Collection]) -> Option<&Collection> {
-    collections
-        .iter()
+    let own = || collections.iter().filter(|c| !c.is_gal());
+    own()
         .find(|c| c.is_default)
+        .or_else(|| own().find(|c| c.name == DEFAULT_COLLECTION_NAME))
         .or_else(|| {
-            collections
-                .iter()
-                .find(|c| c.name == DEFAULT_COLLECTION_NAME)
-        })
-        .or_else(|| {
-            collections
-                .iter()
-                .min_by(|a, b| (a.order, a.name.as_bytes()).cmp(&(b.order, b.name.as_bytes())))
+            own().min_by(|a, b| (a.order, a.name.as_bytes()).cmp(&(b.order, b.name.as_bytes())))
         })
 }
 
@@ -642,9 +655,70 @@ pub fn dav_changed(
     }
 }
 
+/// Карточка книги GAL ([`DavStore::sync_gal`], CTR-60): строит вызывающий из каталога (`tp_dav::gal`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GalCard {
+    /// Имя ресурса ([`valid_name`]), уникально в наборе; карточка с прежним именем сохраняет [`DavObject::id`].
+    pub name: String,
+    /// Тело: vCard.
+    pub body: String,
+    /// Индекс: компонент [`Component::Card`], UID уникален в наборе, поисковые строки — для [`DavStore::find_cards`].
+    pub index: ObjectIndex,
+}
+
+/// Проверяет набор [`DavStore::sync_gal`]: отображаемое имя — как у [`Collection::validate`]; у каждой карточки имя
+/// ([`valid_name`]) и индекс ([`ObjectIndex::validate`]), компонент — [`Component::Card`], имена и UID без повторов —
+/// иначе `Error::Invalid`; тело больше [`DavLimits::max_object_size`] или карточек больше [`DavLimits::max_objects`] —
+/// `Error::QuotaExceeded`.
+pub fn validate_gal(display_name: &str, cards: &[GalCard], limits: &DavLimits) -> Result<()> {
+    Collection {
+        display_name: display_name.to_owned(),
+        ..Collection::new(CollectionKind::AddressBook, GAL_COLLECTION_NAME)
+    }
+    .validate()?;
+    let mut names = BTreeSet::new();
+    let mut uids = BTreeSet::new();
+    for card in cards {
+        if !valid_name(&card.name) || !names.insert(card.name.as_str()) {
+            return Err(Error::invalid(format!(
+                "недопустимое или повторное имя карточки GAL: {:?}",
+                card.name
+            )));
+        }
+        card.index.validate()?;
+        if card.index.component != Component::Card {
+            return Err(Error::invalid("карточка GAL — только VCARD"));
+        }
+        if !uids.insert(card.index.uid.as_str()) {
+            return Err(Error::invalid(format!(
+                "повторный UID карточки GAL: {:?}",
+                card.index.uid
+            )));
+        }
+        if card.body.len() > limits.max_object_size {
+            return Err(Error::QuotaExceeded);
+        }
+    }
+    if cards.len() > limits.max_objects {
+        return Err(Error::QuotaExceeded);
+    }
+    Ok(())
+}
+
+/// Сигнал об изменении книги GAL `collection` организации `tenant` ([`EventKind::GalChanged`], системный):
+/// публикуется после фиксации [`DavStore::sync_gal`], изменившего книгу.
+pub fn gal_changed(tenant: TenantId, collection: CollectionId, modseq: ModSeq) -> Event {
+    Event {
+        tenant,
+        account: None,
+        kind: EventKind::GalChanged { collection, modseq },
+    }
+}
+
 /// Хранилище календарей и контактов учётной записи. Реализация — `tp-meta` (META-47; тела — в PostgreSQL, SRS 3.1);
 /// in-memory — `tp-testkit`. Коллекция или объект чужой учётной записи (другой `scope`) — как отсутствующие.
-/// Удаление учётной записи удаляет её коллекции.
+/// Удаление учётной записи удаляет её коллекции. Книга GAL организации `scope.tenant` (CTR-60, раздел модуля
+/// «Книга GAL») — среди коллекций каждой её учётной записи: читается, как своя, запись — `Forbidden`.
 #[async_trait]
 pub trait DavStore: Send + Sync + 'static {
     /// Лимиты хранилища.
@@ -652,7 +726,8 @@ pub trait DavStore: Send + Sync + 'static {
 
     // ---------- Коллекции ----------
 
-    /// Коллекции вида `kind` по `order`, затем по имени (побайтно).
+    /// Коллекции вида `kind` по `order`, затем по имени (побайтно); адресные книги — с книгой GAL организации, если
+    /// она есть.
     async fn list_collections(
         &self,
         scope: AccountScope,
@@ -674,8 +749,8 @@ pub trait DavStore: Send + Sync + 'static {
         name: &str,
     ) -> Result<Option<Collection>>;
 
-    /// Создаёт коллекцию; недопустимые поля ([`Collection::validate`]) — `Invalid`, занятый `id` или имя вида —
-    /// `Conflict`, коллекций уже [`DavLimits::max_collections`] — `QuotaExceeded`. [`Collection::is_default`] — как у
+    /// Создаёт коллекцию; недопустимые поля ([`Collection::validate`]) — `Invalid`, занятый `id` или имя вида, имя
+    /// [`GAL_COLLECTION_NAME`] у адресной книги — `Conflict`, коллекций уже [`DavLimits::max_collections`] — `QuotaExceeded`. [`Collection::is_default`] — как у
     /// [`DavStore::update_collection`]. Возвращает `ModSeq` изменения.
     async fn create_collection(
         &self,
@@ -690,7 +765,7 @@ pub trait DavStore: Send + Sync + 'static {
     /// транзакции (признак — не больше чем у одной): у прежней — своё изменение свойств (новый `ModSeq`,
     /// [`Collection::state`], [`DavStore::collection_changes`], сигнал [`dav_changed`]) раньше изменения
     /// `collection.id`; `false` у текущей — коллекция по умолчанию не назначена (действует [`default_of`]), как и после
-    /// удаления назначенной. Возвращает `ModSeq` изменения `collection.id`.
+    /// удаления назначенной. Книга GAL — `Forbidden`. Возвращает `ModSeq` изменения `collection.id`.
     async fn update_collection(
         &self,
         scope: AccountScope,
@@ -698,7 +773,8 @@ pub trait DavStore: Send + Sync + 'static {
     ) -> Result<ModSeq>;
 
     /// Удаляет коллекцию сразу, без корзины: её объекты и она сама — в надгробия, каждый со своим `ModSeq` (коллекция —
-    /// последней; страницы `/changes` не делят одно изменение). Нет — `NotFound`. Возвращает `ModSeq` коллекции.
+    /// последней; страницы `/changes` не делят одно изменение). Нет — `NotFound`, книга GAL — `Forbidden`. Возвращает
+    /// `ModSeq` коллекции.
     async fn delete_collection(&self, scope: AccountScope, id: CollectionId) -> Result<ModSeq>;
 
     // ---------- Объекты ----------
@@ -735,7 +811,8 @@ pub trait DavStore: Send + Sync + 'static {
         names: &[String],
     ) -> Result<Vec<DavObject>>;
 
-    /// Объекты учётной записи по идентификаторам (JMAP `/get`) в порядке `ids`; отсутствующие пропускаются.
+    /// Объекты учётной записи и книги GAL организации по идентификаторам (JMAP `/get`) в порядке `ids`; отсутствующие
+    /// пропускаются.
     async fn objects_by_id(
         &self,
         scope: AccountScope,
@@ -751,7 +828,7 @@ pub trait DavStore: Send + Sync + 'static {
     ) -> Result<Vec<DavObject>>;
 
     /// Создаёт или перезаписывает ресурс `name` коллекции при условии `pre`. Проверки по порядку: нет коллекции —
-    /// `NotFound`; недопустимое имя или индекс ([`ObjectIndex::validate`]), компонент не из
+    /// `NotFound`; книга GAL — `Forbidden`; недопустимое имя или индекс ([`ObjectIndex::validate`]), компонент не из
     /// [`Collection::components`] — `Invalid`; тело больше [`DavLimits::max_object_size`] — `QuotaExceeded`; условие —
     /// [`PutOutcome::PreconditionFailed`]; UID у другого ресурса — [`PutOutcome::UidConflict`]; новый ресурс при
     /// [`DavLimits::max_objects`] — `QuotaExceeded`. Перезапись сохраняет `id`, ETag и `ModSeq` — новые.
@@ -765,7 +842,8 @@ pub trait DavStore: Send + Sync + 'static {
         pre: Precondition,
     ) -> Result<PutOutcome>;
 
-    /// Удаляет ресурс при условии `pre`, оставляя надгробие. Нет коллекции или ресурса при `Any` — `NotFound`;
+    /// Удаляет ресурс при условии `pre`, оставляя надгробие. Нет коллекции или ресурса при `Any` — `NotFound`; книга
+    /// GAL — `Forbidden`;
     /// `IfMatch` с другим ETag или без ресурса, `IfNoneMatch` при существующем — [`DeleteOutcome::PreconditionFailed`].
     async fn delete_object(
         &self,
@@ -781,7 +859,7 @@ pub trait DavStore: Send + Sync + 'static {
     /// остаётся надгробие ([`Moved::removed`], видно в [`DavStore::changes`]), в `to` — создание ([`Moved::modseq`]);
     /// в [`DavStore::account_changes`] объект — в `updated` (идентификатор не менялся). Сигнал [`dav_changed`] — по
     /// обеим коллекциям. Проверки по порядку: нет любой из коллекций или ресурса при [`Precondition::Any`] —
-    /// `NotFound`; `from == to`, коллекции разного вида или компонент объекта не из [`Collection::components`]
+    /// `NotFound`; книга GAL среди `from`, `to` — `Forbidden`; `from == to`, коллекции разного вида или компонент объекта не из [`Collection::components`]
     /// целевой — `Invalid`; условие `pre` к исходному ресурсу ([`Precondition::IfMatch`] с другим ETag или без
     /// ресурса; [`Precondition::IfNoneMatch`] — как `Any`) и свободное имя `name` в `to` — иначе
     /// [`MoveOutcome::PreconditionFailed`]; UID у ресурса `to` — [`MoveOutcome::UidConflict`]; в `to` уже
@@ -816,7 +894,7 @@ pub trait DavStore: Send + Sync + 'static {
     /// изменений). Каждое изменение — свой `ModSeq`; неполный ответ (`has_more`): `new_state` — `ModSeq` последнего
     /// возвращённого. Полный ответ: `new_state` —
     /// наибольшее из `since` и [`Collection::state`]. `since` старше очищенных надгробий или больше счётчика
-    /// учётной записи — `Conflict`. Нет коллекции — `NotFound`.
+    /// учётной записи (у книги GAL — её счётчика) — `Conflict`. Нет коллекции — `NotFound`.
     async fn changes(
         &self,
         scope: AccountScope,
@@ -827,7 +905,7 @@ pub trait DavStore: Send + Sync + 'static {
 
     /// Изменения коллекций вида `kind` после `since` (JMAP `Calendar/changes`, `AddressBook/changes`): создание,
     /// свойства, удаление; изменения объектов сюда не входят. Полный ответ: `new_state` — [`DavStore::state`] вида
-    /// (не меньше `since`). Устаревший `since` — `Conflict`.
+    /// (не меньше `since`). Устаревший `since` — `Conflict`. Книга GAL не входит.
     async fn collection_changes(
         &self,
         scope: AccountScope,
@@ -838,7 +916,8 @@ pub trait DavStore: Send + Sync + 'static {
 
     /// Изменения объектов всех коллекций вида `kind` после `since` (JMAP `CalendarEvent/changes`,
     /// `ContactCard/changes`), включая объекты удалённых коллекций. Полный ответ: `new_state` — [`DavStore::state`]
-    /// вида (не меньше `since`). Устаревший `since` — `Conflict`.
+    /// вида (не меньше `since`). Устаревший `since` — `Conflict`. Карточки книги GAL не входят
+    /// ([`DavStore::gal_changes`]).
     async fn account_changes(
         &self,
         scope: AccountScope,
@@ -848,8 +927,37 @@ pub trait DavStore: Send + Sync + 'static {
     ) -> Result<Changes<DavObjectId>>;
 
     /// Состояние вида `kind` (JMAP `state`): наибольший `ModSeq` изменений коллекций и объектов этого вида,
-    /// у новой учётной записи — `ModSeq::ZERO`. Входящие планирования не входят.
+    /// у новой учётной записи — `ModSeq::ZERO`. Входящие планирования и книга GAL (её [`Collection::state`]) не
+    /// входят.
     async fn state(&self, scope: AccountScope, kind: CollectionKind) -> Result<ModSeq>;
+
+    // ---------- Книга GAL (CTR-60) ----------
+
+    /// Заменяет набор карточек книги GAL организации `tenant` одной транзакцией (служебная операция построения GAL из
+    /// каталога, `tp_dav::gal`). Набор и отображаемое имя книги проверяет [`validate_gal`] (`Invalid`,
+    /// `QuotaExceeded`; ничего не изменено). Нет книги — создаётся (адресная книга [`GAL_COLLECTION_NAME`] с
+    /// `display_name`). Карточка с прежним именем и тем же телом и индексом не меняется (ETag, `ModSeq` прежние, в
+    /// [`DavStore::changes`] не попадает); с другим — перезапись (прежний `id`, новые ETag и `ModSeq`); с новым
+    /// именем — создание; прежняя, которой нет в наборе, — надгробие. Новое отображаемое имя — изменение свойств
+    /// книги. Каждое изменение — свой `ModSeq` из счётчика книги ([`Collection::state`]). Изменения были — после
+    /// фиксации сигнал [`gal_changed`]. Возвращает [`Collection::state`] книги после записи (без изменений — прежний).
+    async fn sync_gal(
+        &self,
+        tenant: TenantId,
+        display_name: &str,
+        cards: Vec<GalCard>,
+    ) -> Result<ModSeq>;
+
+    /// Изменения карточек книги GAL организации `tenant` после `since` по идентификаторам (JMAP `ContactCard/changes`
+    /// вместе с [`DavStore::account_changes`]) — как у `account_changes`, по счётчику книги: полный ответ —
+    /// `new_state` = [`Collection::state`] книги (не меньше `since`). Нет книги — как у новой учётной записи
+    /// (`since = ModSeq::ZERO` — пусто, иначе `Conflict`); устаревший `since` — `Conflict`.
+    async fn gal_changes(
+        &self,
+        tenant: TenantId,
+        since: ModSeq,
+        limit: usize,
+    ) -> Result<Changes<DavObjectId>>;
 
     // ---------- Входящие планирования (CTR-47) ----------
 
@@ -1012,6 +1120,66 @@ mod tests {
         // Назначенная — раньше прежнего правила.
         list[0].is_default = true;
         assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn gal_rules() {
+        let gal = Collection::new(CollectionKind::AddressBook, GAL_COLLECTION_NAME);
+        assert!(gal.is_gal());
+        assert!(!Collection::new(CollectionKind::Calendar, GAL_COLLECTION_NAME).is_gal());
+        // Книга GAL не выбирается книгой по умолчанию.
+        assert_eq!(default_of(std::slice::from_ref(&gal)), None);
+        let own = Collection {
+            order: 9,
+            ..Collection::new(CollectionKind::AddressBook, "work")
+        };
+        let list = [gal, own];
+        assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("work"));
+
+        let card = |name: &str, uid: &str| GalCard {
+            name: name.into(),
+            body: "BEGIN:VCARD\r\nEND:VCARD\r\n".into(),
+            index: ObjectIndex::new(Component::Card, uid, None),
+        };
+        let limits = DavLimits::default();
+        assert_eq!(
+            validate_gal(
+                "Организация",
+                &[card("a.vcf", "a"), card("b.vcf", "b")],
+                &limits
+            ),
+            Ok(())
+        );
+        let event = GalCard {
+            index: ObjectIndex::new(Component::Event, "e", None),
+            ..card("e.ics", "e")
+        };
+        for bad in [
+            vec![card("a.vcf", "a"), card("a.vcf", "b")],
+            vec![card("a.vcf", "a"), card("b.vcf", "a")],
+            vec![card("..", "a")],
+            vec![event],
+        ] {
+            assert!(
+                validate_gal("Организация", &bad, &limits).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(validate_gal("a\u{7}", &[], &limits).is_err());
+        let small = DavLimits {
+            max_objects: 1,
+            max_object_size: 8,
+            ..limits
+        };
+        for big in [
+            vec![card("a.vcf", "a"), card("b.vcf", "b")],
+            vec![card("a.vcf", "a")],
+        ] {
+            assert_eq!(
+                validate_gal("Организация", &big, &small),
+                Err(Error::QuotaExceeded)
+            );
+        }
     }
 
     #[test]
