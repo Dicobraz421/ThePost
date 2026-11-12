@@ -35,17 +35,17 @@ pub fn command(data: &[u8]) {
     }
 }
 
-/// Сериализация imap-codec и разбор обратно дают ту же команду.
+/// Сериализация imap-codec и разбор обратно дают ту же команду — с точностью до записи наборов номеров.
+///
+/// imap-codec при записи нормализует наборы номеров (`quirk_always_normalize_sequence_sets`: `1:1` → `1`,
+/// `*:*` → `*`, `2:1` → `1:2`, `3,1` → `1,3`, слияние пересечений), поэтому разобранная обратно команда
+/// может отличаться от исходной только этой записью: её сериализация обязана совпасть байт в байт.
+/// Разбор наборы не меняет — их смысл раскрывает сессия (IMAP-18).
 fn round_trip(cmd: Command) {
     let Body::Std(body) = &cmd.body else {
         return;
     };
-    let bytes = CommandCodec::default()
-        .encode(&ImapCommand {
-            tag: cmd.tag.clone(),
-            body: body.clone(),
-        })
-        .dump();
+    let bytes = encode(&cmd.tag, body);
     let mut reader = Reader::new(u32::MAX);
     reader.push(&bytes);
     let back = loop {
@@ -54,12 +54,31 @@ fn round_trip(cmd: Command) {
             other => break other,
         }
     };
+    let shown = String::from_utf8_lossy(&bytes);
+    let Some(Input::Command(back)) = back else {
+        panic!("сериализация не разбирается: {shown:?}: {back:?}");
+    };
+    if back == cmd {
+        return;
+    }
+    let Body::Std(again) = &back.body else {
+        panic!("сериализация: {shown:?}: {back:?} вместо {cmd:?}");
+    };
     assert_eq!(
-        back,
-        Some(Input::Command(cmd)),
-        "сериализация: {:?}",
-        String::from_utf8_lossy(&bytes)
+        String::from_utf8_lossy(&encode(&back.tag, again)),
+        shown,
+        "сериализация: {back:?} вместо {cmd:?}"
     );
+}
+
+/// Запись команды кодеком imap-codec.
+fn encode(tag: &Tag<'static>, body: &CommandBody<'static>) -> Vec<u8> {
+    CommandCodec::default()
+        .encode(&ImapCommand {
+            tag: tag.clone(),
+            body: body.clone(),
+        })
+        .dump()
 }
 
 /// Литералы: первый байт — лимит сообщения и отказы в литералах, остальное — поток клиента.
@@ -264,6 +283,7 @@ fn samples() -> Vec<Message> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::num::NonZeroU32;
 
     /// Примеры RFC 9051 и расширений — начальный корпус целей cargo-fuzz.
     const EXAMPLES: &[&str] = &[
@@ -275,7 +295,15 @@ mod tests {
         "a APPEND INBOX (\\Seen) {5+}\r\nhello\r\n",
         "a AUTHENTICATE PLAIN\r\nAGFAYg==\r\na IDLE\r\nDONE\r\n",
         "a LOGIN {4}\r\nuser {6}\r\nsecret\r\n",
+        // IMAP-18: наборы номеров, которые imap-codec при записи нормализует.
+        "a FETCH *:* (BODY.PEEK[1.2.MIME]<0.100> BINARY[2] UID)\r\n",
+        "a FETCH 1:1 (BODY.PEEK[1.2.MIME]<0.100> BINARY[2] UID)\r\n",
+        "a UID FETCH 4,2:1,3:3,7:*,6 (UID)\r\n",
+        "a UID SEARCH UID 5:5,9:3 NOT 2:2\r\n",
     ];
+
+    /// Зерно proptest-тестов: в CI они детерминированы, случайный поиск — ночной `fuzz.yml` (IMAP-18).
+    const SEED: u64 = 0x494d_4150_3138;
 
     #[test]
     fn examples_pass_checks() {
@@ -321,7 +349,36 @@ mod tests {
         crate::search::fuzz(criteria, false, &ret, &list);
     }
 
+    /// IMAP-18: вырожденный диапазон `n:n` разбирается как диапазон (разбор набор не переписывает),
+    /// а проверка обратной записи на нём не падает.
+    #[test]
+    fn degenerate_range_round_trips() {
+        use crate::proto::types::sequence::{SeqOrUid, Sequence};
+        for (set, edge) in [
+            ("*:*", SeqOrUid::Asterisk),
+            ("1:1", SeqOrUid::from(NonZeroU32::MIN)),
+        ] {
+            let line = format!("a FETCH {set} (BODY.PEEK[1.2.MIME]<0.100> BINARY[2] UID)\r\n");
+            let Some(Command {
+                body: Body::Std(CommandBody::Fetch { sequence_set, .. }),
+                ..
+            }) = parse(b"", line.trim_end().as_bytes())
+            else {
+                panic!("FETCH {set}");
+            };
+            assert_eq!(sequence_set.0.as_ref(), [Sequence::Range(edge, edge)]);
+            command(line.as_bytes());
+            literals(line.as_bytes());
+        }
+    }
+
     proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(SEED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
         #[test]
         fn arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 0..512)) {
             command(&data);
