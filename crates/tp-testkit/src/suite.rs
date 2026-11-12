@@ -57,9 +57,9 @@ use tp_contracts::groups::{
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountState, AccountStore, AccountUpsert, ExistingContent,
-    MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, Policy, PolicyResolver,
-    PolicyStore, PolicyTarget, SpecialUse,
+    Account, AccountScope, AccountState, AccountStore, AccountUpsert, Envelope, ExistingContent,
+    MailboxStore, MessageMeta, MessageQuery, MessageStore, NewMailbox, NewMessage, Policy,
+    PolicyResolver, PolicyStore, PolicyTarget, SpecialUse,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -2471,7 +2471,7 @@ pub async fn moderation(m: &dyn Moderation, fx: &ModerationFixture) {
 // ---------- Trash: trash.purge ----------
 
 /// Запись правила администратора `trash.purge` уровня организации для [`trash_purge`]
-/// (запись политик уровней — вне контрактов до CTR-25: in-memory — `MemPolicies`, PostgreSQL — `PgMeta::set_policy`).
+/// (запись политик уровней — контракт `PolicyStore`: in-memory — `MemPolicies`, PostgreSQL — `PgMeta`).
 /// Остальные поля политики уровня сохраняются.
 #[async_trait]
 pub trait TrashPurgeAdmin: Send + Sync {
@@ -2539,7 +2539,13 @@ async fn put_message(
         size,
         received_at: purge_received_at(),
         flags: Default::default(),
-        meta: Default::default(),
+        meta: MessageMeta {
+            envelope: Envelope {
+                subject: Some(format!("размер {size}")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     };
     messages
         .insert(scope, mailbox, msg)
@@ -2566,7 +2572,7 @@ fn sorted_ids(mut ids: Vec<MessageId>) -> Vec<MessageId> {
     ids
 }
 
-/// Набор проверок «очистить корзину» (`TrashStore::purge`, `list_hidden`, `restore`) и настройки `trash.purge`
+/// Набор проверок «очистить корзину» (`TrashStore::purge`, `list_hidden`, `hidden_message`, `restore`) и настройки `trash.purge`
 /// (`PolicyResolver::trash_purge`, `set_user_trash_purge`): `hide` скрывает письмо (нет в `MessageStore`, в счётчиках
 /// корзины, в квоте), администратор его восстанавливает; `erase` стирает; Legal Hold и ошибка точки принятия решений
 /// не дают стереть; пользователь не меняет значение без `user_can_choose`, значение администратора приоритетнее.
@@ -2603,6 +2609,7 @@ pub async fn trash_purge(
     let b = put_message(messages, s, inbox, 200).await;
     let c = put_message(messages, s, inbox, 50).await;
     messages.to_trash(s, &[a, b]).await.expect("to trash");
+    let shown = messages.get(s, a).await.expect("get").expect("trashed");
     let out = trash
         .purge(s, &[a, c, MessageId::new(), a], &none)
         .await
@@ -2627,6 +2634,44 @@ pub async fn trash_purge(
     let hidden = trash.list_hidden(s, 0, 100).await.expect("hidden");
     assert_eq!(trash_ids(hidden.clone()), [a]);
     assert_eq!((hidden[0].origin, hidden[0].size), (inbox, 100));
+    // Администратор читает метаданные скрытого письма, скрытие не снимается.
+    let seen = trash
+        .hidden_message(s, a)
+        .await
+        .expect("hidden message")
+        .expect("hidden");
+    assert_eq!(
+        (
+            seen.id,
+            seen.skeleton,
+            seen.size,
+            seen.received_at,
+            &seen.meta
+        ),
+        (a, shown.skeleton, 100, shown.received_at, &shown.meta)
+    );
+    assert_eq!(seen.meta.envelope.subject.as_deref(), Some("размер 100"));
+    assert_eq!(messages.get(s, a).await, Ok(None), "остаётся скрытым");
+    assert_eq!(
+        trash_ids(trash.list_hidden(s, 0, 100).await.expect("hidden")),
+        [a]
+    );
+    for other in [b, c, MessageId::new()] {
+        assert_eq!(
+            trash.hidden_message(s, other).await,
+            Ok(None),
+            "видимое в корзине, вне корзины и отсутствующее — не скрытые"
+        );
+    }
+    let stranger = AccountScope {
+        tenant: s.tenant,
+        account: AccountId::new(),
+    };
+    assert_eq!(
+        trash.hidden_message(stranger, a).await,
+        Ok(None),
+        "чужая учётная запись"
+    );
     let used = quota.usage(s).await.expect("usage");
     assert_eq!(
         (used.used_bytes, used.messages),
@@ -2652,6 +2697,11 @@ pub async fn trash_purge(
         panic!("message expected");
     };
     assert_eq!((mailbox, inserted.id), (inbox, a));
+    assert_eq!(
+        trash.hidden_message(s, a).await,
+        Ok(None),
+        "восстановленное не скрыто"
+    );
     assert_eq!(
         messages.get(s, a).await.expect("get").map(|m| m.mailbox),
         Some(inbox)
@@ -4943,4 +4993,46 @@ pub async fn admin_audit_log(log: &dyn AuditLog, tenant: TenantId, foreign_tenan
         log.search(tenant, &reversed).await,
         Err(Error::Invalid(_))
     ));
+
+    // APP-59: выгрузка — все записи (и уровень инсталляции) по возрастанию номера после `after`; в общей базе
+    // между ними могут быть записи других тестов.
+    let all = log
+        .export_page(seqs[0] - 1, 10_000)
+        .await
+        .expect("export page");
+    let ours: Vec<AdminAuditEntry> = all
+        .iter()
+        .filter(|e| seqs.contains(&e.seq))
+        .cloned()
+        .collect();
+    assert_eq!(ours, (0..records.len()).map(entry).collect::<Vec<_>>());
+    assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+    let first = log.export_page(seqs[0] - 1, 1).await.expect("export page");
+    assert_eq!(first, vec![entry(0)]);
+    assert!(matches!(
+        log.export_page(0, 0).await,
+        Err(Error::Invalid(_))
+    ));
+    // Отметка доставки: 0 — ничего; сдвиг только с текущей; назад и на месте — `Invalid`.
+    let sink = format!("suite-{}", AccountId::new());
+    assert_eq!(log.export_mark(&sink).await, Ok(0));
+    assert_eq!(log.advance_export_mark(&sink, 0, seqs[1]).await, Ok(true));
+    assert_eq!(log.export_mark(&sink).await, Ok(seqs[1]));
+    assert_eq!(
+        log.advance_export_mark(&sink, 0, seqs[2]).await,
+        Ok(false),
+        "отметку уже сдвинули"
+    );
+    assert_eq!(
+        log.advance_export_mark(&sink, seqs[1], seqs[4]).await,
+        Ok(true)
+    );
+    assert_eq!(log.export_mark(&sink).await, Ok(seqs[4]));
+    for (from, to) in [(seqs[4], seqs[4]), (seqs[4], seqs[3])] {
+        assert!(matches!(
+            log.advance_export_mark(&sink, from, to).await,
+            Err(Error::Invalid(_))
+        ));
+    }
+    assert_eq!(log.export_mark(&format!("{sink}-other")).await, Ok(0));
 }

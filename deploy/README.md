@@ -55,6 +55,7 @@ AppRole `thepost` (`role_id`, `secret_id` — том `openbao-approle`, влад
 | `thepost/db-owner` | `username`, `password` | владелец схемы `thepost_owner` (миграции, `database.owner`) |
 | `thepost/db-readonly` | `username`, `password` | только чтение `thepost_readonly`; узлу недоступен (политика `thepost`) |
 | `thepost/s3` | `access_key_id`, `secret_access_key` | ключи SeaweedFS (`compose/seaweedfs-s3.json`) |
+| `thepost/tls` | `key` | ключ TLS слушателей узла (`tls.key`) — `server.key` тома `tls`; после перевыпуска — новая версия |
 
 `postgres-role-tls` создаёт в PostgreSQL учётные записи (раздел «PostgreSQL: учётные записи» ниже); новые пароли
 берёт из `openbao-init-tls` через том `pg-bootstrap` и удаляет файлы. Роль `postgres` — администратор стенда и тестов, приложению не выдаётся.
@@ -115,20 +116,24 @@ cargo nextest run -p <крейты> --no-tests=pass
 docker compose -f deploy/compose/dev.yml --profile smb up -d --build
 docker compose -f deploy/compose/dev.yml --profile smb run --rm thepost doctor   # без Fail (PLT-12, META-17)
 ```
-Порты 25, 465, 587, 143, 993, 80, 443 публикуются на хост; переопределение — `TP_SMTP_PORT`, `TP_SUBMISSIONS_PORT`,
-`TP_SUBMISSION_PORT`, `TP_IMAP_PORT`, `TP_IMAPS_PORT`, `TP_HTTP_PORT`, `TP_HTTPS_PORT`.
+Порты 25, 465, 587, 143, 993, 4190, 80, 443 публикуются на хост; переопределение — `TP_SMTP_PORT`,
+`TP_SUBMISSIONS_PORT`, `TP_SUBMISSION_PORT`, `TP_IMAP_PORT`, `TP_IMAPS_PORT`, `TP_MANAGESIEVE_PORT`, `TP_HTTP_PORT`,
+`TP_HTTPS_PORT`.
 Отдельная сборка образа: `docker build -f deploy/docker/Dockerfile -t thepost .` (`--build-arg RUST_VERSION=…`).
 
 Слушатели эталона: SMTP 25 (STARTTLS), submission 587 (STARTTLS) и 465 (неявный TLS), IMAP 143 (STARTTLS) и 993,
-JMAP — HTTPS 443 (`http.jmap`); порт 80 публикуется, но не слушается. Домен — `example.test`
-(принятый домен организации в БД: его заводит `thepost admin init`). Сертификат — `fullchain.pem`/`privkey.pem` тома `tls` от `tls-init`
-(SAN: `localhost`, `thepost`, `mail.example.test`), CA для клиентов — `deploy/compose/tls/ca.pem`.
+ManageSieve 4190 (STARTTLS, `sieve.managesieve.listen`), JMAP — HTTPS 443 (`http.jmap`); порт 80 публикуется, но не
+слушается. Домен — `example.test`
+(принятый домен организации в БД: его заводит `thepost admin init`). Сертификат — `fullchain.pem` тома `tls` от `tls-init`
+(SAN: `localhost`, `thepost`, `mail.example.test`), ключ — только секрет `thepost/tls#key` в OpenBao (`tls.key`,
+решение 100; записывает `openbao-init-tls`), CA для клиентов — `deploy/compose/tls/ca.pem`.
 Проверка эталона (полная — `docs/manual-tests/CMP-01.md`):
 ```bash
 CA=deploy/compose/tls/ca.pem
 openssl s_client -connect localhost:465 -CAfile $CA -verify_return_error </dev/null   # 220 mail.example.test, код 0
 openssl s_client -connect localhost:587 -starttls smtp -CAfile $CA </dev/null         # то же для 25
 openssl s_client -connect localhost:993 -CAfile $CA -verify_return_error </dev/null   # * OK; 143 — -starttls imap
+openssl s_client -connect localhost:4190 -starttls sieve -CAfile $CA </dev/null       # "IMPLEMENTATION" … OK
 curl --cacert $CA -si https://localhost/.well-known/jmap | head -1                     # HTTP/1.1 401 без учётной записи
 ```
 Письмо между двумя пользователями: учётные записи `a@example.test`, `b@example.test` (способ — issue #193), отправка
@@ -158,7 +163,12 @@ loopback) → OpenBao (`https://localhost:8200`, пароли `thepost/db`, `the
 Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 Сертификат клиентских протоколов — `thepost_tls_mode`: `certbot` (Let's Encrypt HTTP-01, по умолчанию; порт 80
 открыт, DNS указывает на ВМ), `acme` (встроенный клиент thepost, секция `acme`), `internal` (внутренний CA — стенд),
-`files` (свои PEM). Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
+`files` (свои PEM). Ключ TLS — только в OpenBao (решение 100): секрет `thepost/tls#key`, в `config.yaml` —
+`tls.key: { secret: "thepost/tls#key" }`, на диске ВМ файла ключа нет (прежние `privkey.pem` роль удаляет); цепочка —
+файл `tls.cert_file`. Ключ записывает роль (`internal` — выпускает его в памяти, `files` — с управляющей машины,
+`certbot` — после выпуска и в deploy-hook продления через AppRole узла), при `acme` — сам узел (политика `thepost`
+разрешает ему запись только этого пути). Новая версия секрета узел подхватывает без перезапуска.
+Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
 Повторный прогон ничего не меняет. Ключи восстановления и root-токен OpenBao — `/root/openbao-init.json` (см. ниже).
 
 ### Резервное копирование и восстановление (роль `pgbackrest`, DEP-15)
@@ -194,7 +204,9 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 ставится до восстановления СУБД. Новая ВМ: первый `smb.yml -e thepost_backup=false -e thepost_wait_ready=false`
 (узел ждёт секретов из снимка — плейбук не ждёт `/healthz/ready`, завершается с предупреждением); копии — по тем же
 путям, на перенесённом каталоге копий — `chown -R postgres:postgres /var/lib/pgbackrest` (uid `postgres` на новой ВМ
-может быть другим); в новом OpenBao — только `thepost-backup/restic#password` (и `s3`).
+может быть другим); в новом OpenBao — только `thepost-backup/restic#password` (и `s3`). Ключ TLS `thepost/tls` в
+снимке — прежний: после `restore.yml` — повторный `smb.yml` (`internal` перевыпускает сертификат к ключу из снимка,
+`files` и `certbot` записывают свой ключ новой версией).
 
 Восстановление — `deploy/ansible/restore.yml` (`roles/pgbackrest/tasks/restore.yml`): роль `openbao` (токен
 администратора, пароли СУБД) → остановка таймеров и `thepost` → `pgbackrest restore --delta --type=time
@@ -211,8 +223,8 @@ sudo install -m 0644 deploy/systemd/thepost.sysusers.conf /usr/lib/sysusers.d/th
 sudo install -D -m 0640 -o root -g thepost deploy/config/all.yaml /etc/thepost/config.yaml   # задать domain, database.url
 sudo install -m 0644 deploy/systemd/thepost.service deploy/systemd/thepost-*.socket /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/thepost.service /etc/systemd/system/thepost-*.socket
-# Порты ниже 1024 — сокеты systemd (у процесса нет capabilities):
-sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submissions,submission,imap,imaps,https}.socket
+# Порты клиентских протоколов — сокеты systemd (у процесса нет capabilities):
+sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submissions,submission,imap,imaps,https,managesieve}.socket
 # …или без активации сокетов — CAP_NET_BIND_SERVICE (сокеты не включать):
 #   sudo install -D -m 0644 deploy/systemd/thepost.service.d/bind-capability.conf \
 #     /etc/systemd/system/thepost.service.d/bind-capability.conf && sudo systemctl daemon-reload
@@ -222,7 +234,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submis
 sudo systemctl enable --now thepost
 systemd-analyze security thepost.service   # не хуже 2.0 (с сокетами — 1.2, с bind-capability.conf — 1.6)
 ```
-Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443.
+Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443,
+`managesieve` 4190.
 Узел берёт сокет systemd по адресу слушателя (`0.0.0.0:<порт>` или `[::]:<порт>` совпадает с `ListenStream=<порт>`),
 иначе открывает свой; перезапуск `thepost` не закрывает сокеты. Пока узел не принимает сокеты systemd (TODO(PLT-16)
 в `crates/thepost/src/protocols.rs`), рабочий вариант — `bind-capability.conf`.
@@ -239,7 +252,8 @@ Hardening юнита: пустой `CapabilityBoundingSet=`, `NoNewPrivileges`, 
 `[Service]` + `ReadWritePaths=/srv/thepost-blob`. Проверка окружения — `thepost doctor` (SRS 5.5); привилегии
 службы (`privileges.*`) — только в её окружении: `docs/manual-tests/DEP-08.md`.
 
-Секретов в `config.yaml` нет — только ссылки на OpenBao (секция `secrets`, `database.password`). Вход узла — AppRole:
+Секретов в `config.yaml` нет — только ссылки на OpenBao (секция `secrets`, `database.password`, ключ TLS `tls.key` —
+секрет `thepost/tls#key`: `bao kv put -mount=thepost tls key=@privkey.pem`, файл ключа на ВМ не нужен). Вход узла — AppRole:
 `role_id` — `/etc/thepost/openbao/role_id`, `secret_id` — `/etc/thepost/credentials/openbao-secret-id` (0600 root),
 процессу его передаёт systemd (`LoadCredential=` в `thepost.service`). Оба файла создаёт роль Ansible `openbao`.
 С TPM `secret_id` можно зашифровать: `systemd-creds encrypt --with-key=tpm2 --name=openbao-secret-id …`
@@ -329,8 +343,8 @@ Helm `cnpg.db_durability`; по умолчанию `required` на ВМ и в K8
 
 ## OpenBao (хранилище секретов)
 Эталонная поставка включает OpenBao (MPL-2.0; подходит и существующий HashiCorp Vault заказчика): хранилище Raft,
-канал — только TLS, KV v2 `thepost`, политика `thepost` (`openbao/thepost-policy.hcl`: только чтение `thepost/*`
-и продление своего токена). Распечатывание после перезапуска — автоматическое (решение владельца 2026-10-30):
+канал — только TLS, KV v2 `thepost`, политика `thepost` (`openbao/thepost-policy.hcl`: чтение `thepost/*`, запись —
+только ключа TLS `thepost/tls` для встроенного ACME, продление своего токена). Распечатывание после перезапуска — автоматическое (решение владельца 2026-10-30):
 
 | Способ | Когда | Настройка |
 |---|---|---|
@@ -357,7 +371,7 @@ ansible-playbook -i <инвентарь> deploy/ansible/openbao.yml \
 helm repo add openbao https://openbao.github.io/openbao-helm
 helm install openbao openbao/openbao --version 0.30.6 -n openbao --create-namespace -f deploy/helm/openbao/values.yaml
 kubectl -n openbao exec -it openbao-0 -- bao operator init   # ключи восстановления и root-токен — администратору
-BAO_TOKEN=<root-токен> sh deploy/helm/openbao/bootstrap.sh openbao thepost
+BAO_TOKEN=<root-токен> TLS_KEY=tls.key sh deploy/helm/openbao/bootstrap.sh openbao thepost   # ключ — thepost/tls#key
 ```
 До установки — секреты `openbao-tls` (сертификат, ключ, CA) и, без KMS/HSM, `openbao-unseal` (`helm/openbao/values.yaml`).
 Узел `thepost` входит через Kubernetes auth: сервисный аккаунт `thepost` в пространстве `thepost`, роль `thepost`.
@@ -368,6 +382,8 @@ helm install thepost deploy/helm/thepost -n thepost --create-namespace -f <св�
 ```
 Под — `runAsNonRoot` (65532), `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`,
 seccomp `RuntimeDefault` (свой профиль узла — `containerSecurityContext.seccompProfile` типа `Localhost`) и профили ролей
-процесса (секция `confine`). Слушатели — на портах выше 1024, стандартные порты (25, 465, 587, 143, 993, 443) — у Service.
+процесса (секция `confine`). Слушатели — на портах выше 1024, стандартные порты (25, 465, 587, 143, 993, 443) — у Service;
+ManageSieve — 4190 и в поде, и у Service.
 Admin API — `127.0.0.1:8443` в поде (`kubectl port-forward`), служебный HTTP — адрес пода для проб kubelet.
-До установки — секрет `thepost-tls` (`tls.crt`, `tls.key`, `ca.crt`) и OpenBao (`bootstrap.sh` выше).
+До установки — секрет `thepost-tls` (`tls.crt`, `ca.crt`; в под монтируются только они) и OpenBao (`bootstrap.sh` выше,
+ключ TLS — `TLS_KEY`: секрет `thepost/tls#key`, в values — `config.tls.key`; смена ключа — повторный `bootstrap.sh`).

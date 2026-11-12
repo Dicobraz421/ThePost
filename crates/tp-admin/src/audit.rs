@@ -5,16 +5,15 @@
 //! доступ к содержимому писем (`include=subject` списков корзины и очереди модерации): запись с числом писем
 //! (`content_messages`), без тем.
 //!
-//! Журнал — контракт [`AuditLog`](tp_contracts::admin_audit::AuditLog) (CTR-25; в узле — таблица `audit_log`, META-70): каждая запись сначала
-//! добавляется в него (`record`), затем уходит в экспорт в SIEM ([`AuditSink`]: syslog RFC 5424 поверх TLS, OTLP —
-//! [`crate::export`], вместе — [`crate::export::Fanout`]). Ошибка экспорта записи не отменяет.
+//! Журнал — контракт [`AuditLog`](tp_contracts::admin_audit::AuditLog) (CTR-25; в узле — таблица `audit_log`, META-70): запись
+//! пишется только в него. В SIEM (syslog RFC 5424 поверх TLS, OTLP) записи выгружает из журнала [`crate::export`]
+//! от отметки доставки (решение владельца 12.11: база + выгрузка из неё, APP-59).
 //!
 //! Чтение — `GET /api/v1/orgs/{org}/audit` (`AuditLog::search`): администраторы и аудитор организации, оператор —
 //! нет. В ответе и в экспорте запись — [`AuditRecord`] (момент — RFC 3339).
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -119,20 +118,9 @@ impl From<AdminAuditPage> for AuditPage {
     }
 }
 
-/// Экспорт журнала аудита в SIEM: только добавление.
-#[async_trait]
-pub trait AuditSink: Send + Sync + 'static {
-    /// Передаёт запись.
-    async fn record(&self, record: &AdminAuditRecord) -> Result<()>;
-}
-
-/// Записывает `record` в журнал ([`Deps::audit_log`]), затем в экспорт ([`Deps::audit`]). Не записано в журнал —
-/// ошибка; ошибка экспорта — `ERROR` в журнал событий узла.
+/// Записывает `record` в журнал ([`Deps::audit_log`]); не записано — ошибка.
 pub(crate) async fn record(d: &Deps, record: &AdminAuditRecord) -> Result<()> {
     d.audit_log.append(record).await?;
-    if let Err(e) = d.audit.record(record).await {
-        tracing::error!(error = %e, route = %record.route, "admin: экспорт записи аудита не удался");
-    }
     Ok(())
 }
 

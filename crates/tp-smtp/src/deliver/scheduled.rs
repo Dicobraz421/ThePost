@@ -16,8 +16,10 @@ use super::{Delivery, Flowed, Pre, Resolved};
 use crate::queue::{LocalRelease, RcptResult};
 
 impl Delivery {
-    /// Ставит письмо в очередь со сроком выпуска `release_at` (`Outbound::schedule`). Письмо, отклонённое фильтром
-    /// Milter или правилом потока, — `Error::Forbidden`, временный отказ и узел без очереди — `Error::Unavailable`.
+    /// Ставит письмо в очередь со сроком выпуска `release_at` (`Outbound::schedule`). Лимиты отправки в час — те же,
+    /// что у [`Delivery::submit`] (SMTP-43): письмо учитывается при постановке, сверх предела — `Error::Unavailable`
+    /// и событие отказа в журнале доставки. Письмо, отклонённое фильтром Milter или правилом потока, —
+    /// `Error::Forbidden`, временный отказ и узел без очереди — `Error::Unavailable`.
     /// Письмо, удалённое фильтром или правилом потока, в очередь не ставится: возвращается идентификатор без записи (отмена такой
     /// отправки — `NotFound`, как у уже доставленной).
     pub(super) async fn schedule(
@@ -31,6 +33,13 @@ impl Delivery {
         let Some(outbound) = &self.deps.outbound else {
             return Err(Error::UNAVAILABLE);
         };
+        if self
+            .over_send_limit(tenant, mail_from, rcpts, &raw)
+            .await?
+            .is_some()
+        {
+            return Err(Error::UNAVAILABLE);
+        }
         let Flowed {
             mail_from,
             rcpts,

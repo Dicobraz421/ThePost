@@ -351,8 +351,12 @@ SRS 5.2, 6.8, решение 98 (CTR-25; код — `admin_audit.rs`). Журн�
 content_messages? }` — без тела запроса и секретов. `AuditLog`: `append(&record) -> seq` (номер ≥ 1, растёт в порядке добавления);
 `search(tenant, &AdminAuditQuery { since?, until?, limit ≥ 1, after? }) -> AdminAuditPage { entries: Vec<AdminAuditEntry { seq, record }>,
 next? }` — только записи организации (без уровня инсталляции), по возрастанию `seq`, `at` в [`since`, `until`), `next` — у полной страницы;
-`AdminAuditQuery::validate` (неверный — `Invalid`). In-memory — `MemAuditLog` (`entries`); набор `suite::admin_audit_log`. PostgreSQL
-(таблица `audit_log`, META-22) — META-70; запись и `GET …/audit` — Admin API (ADM-34), экспорт в SIEM — там же.
+`AdminAuditQuery::validate` (неверный — `Invalid`). Выгрузка в SIEM (решение владельца 12.11: база + выгрузка из неё, APP-59):
+`export_page(after, limit ≥ 1) -> Vec<AdminAuditEntry>` — все записи (и уровень инсталляции) с `seq > after` по возрастанию; видимые записи —
+непрерывный префикс порядка добавления (меньший номер не появляется после бо́льшего); `export_mark(sink) -> seq` (0 — ничего не доставлено),
+`advance_export_mark(sink, from, to) -> bool` — сдвиг, только если отметка всё ещё `from` (`to > from`, иначе `Invalid`; `check_export_mark`).
+In-memory — `MemAuditLog` (`entries`); набор `suite::admin_audit_log`. PostgreSQL (таблицы `audit_log`, META-22, и `audit_export`, APP-59) —
+META-70; запись и `GET …/audit` — Admin API (ADM-34); выгрузка — роль maintenance узла под лизой (APP-59).
 
 ## Auth
 SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>` (неверные данные — `Forbidden`);
@@ -551,7 +555,9 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 `before_final_delete` вне транзакции: `Allow` — стереть (как `expunge_final`), `Deny` (Legal Hold) или ошибка хука — скрыть;
 прочие письма — пропуск. Скрытое письмо не видно пользователю: нет в `MessageStore::get`/`list` и операциях над письмами,
 в счётчиках папки, в квоте (`Quota`, `AccountStore::quota`); `ChangeLog` — удалено из корзины, событие ядра — `Trashed`.
-Администратор: `list_hidden(scope, offset, limit)`, `restore` (видимые и скрытые; исходная папка или «Входящие», прежний `MessageId`;
+Администратор: `list_hidden(scope, offset, limit)`, `hidden_message(scope, id) -> Option<Message>` (скрытое письмо — метаданные как у
+`MessageStore::get`, тема/отправитель/дата — в `meta.envelope`; скрытие не снимается; нет или не скрыто — `None`; аудит — у вызывающего),
+`restore` (видимые и скрытые; исходная папка или «Входящие», прежний `MessageId`;
 протоколы и Admin API — через `MailStore::restore`, с уведомлением клиентов);
 `list` — только видимые. Срок корзины для скрытых — как для остальных (`expired` → хук → `expunge_final`).
 Настройка: `Policy::trash_purge: Option<TrashPurgeRule { mode, user_can_choose }>` (администратор, уровни цепочки; не задано —
@@ -873,6 +879,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-58 (волна contracts-40, решение 79): `DirAccount::hidden_from_gal` (`#[serde(default)]`) — учётная запись скрыта
   из адресной книги без запрета входа. Код, собирающий `DirAccount` перечислением всех полей, дополняется `hidden_from_gal` (в репозитории —
   `tp-auth` и тесты `tp-testkit`, `tp-dav`, `tp-smtp`: `false`); чтение признака из LDAP — AUTH-16, фильтр GAL — DAV-27.
+- 2026-11-12 — MS-19 (волна mailstore-12, класс B): `TrashStore::hidden_message(scope, id) -> Option<Message>` — метаданные скрытого
+  письма для администратора без снятия скрытия (без реализации по умолчанию; `MemTrash`, `PgMeta`); набор `suite::trash_purge` проверяет
+  его. Потребитель — Admin API: тема и отправитель скрытых писем на странице `trash/hidden` (из `Message::meta.envelope`, без чтения BLOB).
 - 2026-11-12 — CTR-59 (волна contracts-42, решения 59, 78): занятость повторяющихся событий — разворот при запросе — уже в контракте
   по META-54 (`ObjectIndex::recurring`, `DavLimits::max_busy_instances`, удалён `DavLimits::busy_horizon`; набор
   `suite::freebusy_recurring`: встреча без конца занята через 3 года, `EXDATE` свободна). Добавлено: `ItipSource::Internal` — и приглашение
