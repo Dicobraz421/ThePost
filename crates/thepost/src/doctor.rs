@@ -846,8 +846,8 @@ pub async fn internal_keys(
             let tls = &cluster.rpc.tls;
             let load = |store: Option<Arc<dyn SecretStore>>| async move {
                 match store {
-                    Some(store) => NodeTls::load_with_secrets(tls, store.as_ref()).await,
-                    None => NodeTls::load(tls).await,
+                    Some(store) => NodeTls::load(tls, store.as_ref()).await,
+                    None => NodeTls::load(tls, &crate::secrets::NoSecretStore).await,
                 }
                 .map(drop)
             };
