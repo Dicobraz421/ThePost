@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tp_contracts::audit::AuditAction;
 use tp_contracts::bus::{Event, EventKind};
 use tp_contracts::meta::{Flag, FlagOp, Flags, SpecialUse};
 use tp_contracts::{Error, MailboxId, MessageId};
@@ -692,6 +693,7 @@ async fn update_one(ctx: &Ctx<'_>, id: &str, patch: &Value) -> MethodResult<Resu
     }
     if let Some(to) = to {
         d.store.move_to(ctx.scope, &ids, to).await?;
+        crate::audit::owner_messages(ctx, AuditAction::Move, &[(to, msg.id)]).await;
     }
     Ok(Ok(()))
 }
@@ -770,13 +772,15 @@ pub(crate) async fn set(
             }
             Some(m) if Some(m.mailbox) == trash => to_purge.push((id, m.id)),
             Some(m) => {
-                to_trash.push(m.id);
+                to_trash.push((m.mailbox, m.id));
                 destroyed.push(id);
             }
         }
     }
     if !to_trash.is_empty() {
-        d.store.delete_to_trash(ctx.scope, &to_trash).await?;
+        let ids: Vec<MessageId> = to_trash.iter().map(|t| t.1).collect();
+        d.store.delete_to_trash(ctx.scope, &ids).await?;
+        crate::audit::owner_messages(ctx, AuditAction::Delete, &to_trash).await;
     }
     if let (Some(trash), false) = (trash, to_purge.is_empty()) {
         let ids: Vec<MessageId> = to_purge.iter().map(|p| p.1).collect();
@@ -795,6 +799,8 @@ pub(crate) async fn set(
                 tracing::warn!(error = %e, "jmap: уведомление об очистке корзины не опубликовано");
             }
         }
+        let purged: Vec<(MailboxId, MessageId)> = gone.iter().map(|m| (trash, *m)).collect();
+        crate::audit::owner_messages(ctx, AuditAction::Delete, &purged).await;
         for (id, mid) in to_purge {
             if gone.contains(&mid) {
                 destroyed.push(id);

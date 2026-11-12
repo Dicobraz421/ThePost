@@ -119,6 +119,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "rcpts per hour",
         include_str!("../migrations/0026_rcpts_per_hour.sql"),
     ),
+    (
+        27,
+        "submissions mailbox audit",
+        include_str!("../migrations/0027_submissions_mailbox_audit.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

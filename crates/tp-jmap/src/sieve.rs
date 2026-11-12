@@ -9,6 +9,7 @@
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tp_contracts::Error;
+use tp_contracts::audit::{AuditAction, AuditObject};
 use tp_contracts::meta::AccountScope;
 use tp_contracts::sieve::{
     MAX_SCRIPT_NAME_LEN, ScriptInfo, SieveLimits, SieveStore, valid_script_name,
@@ -188,6 +189,15 @@ fn script_props(v: &Value) -> Result<(Option<Option<String>>, Option<String>), V
 }
 
 /// Ошибка хранилища как `SetError`; прочие — ошибка метода.
+/// Аудит ящика: изменены серверные правила (скрипт `what`, автоответ).
+pub(crate) async fn rules_changed(ctx: &Ctx<'_>, what: &str) {
+    let object = AuditObject {
+        detail: crate::audit::detail(what),
+        ..AuditObject::default()
+    };
+    crate::audit::owner(ctx, AuditAction::ChangeRules, object).await;
+}
+
 fn store_error(e: Error) -> MethodResult<Value> {
     Ok(match e {
         Error::QuotaExceeded => set_error("overQuota", None, &[]),
@@ -226,6 +236,7 @@ async fn create_one(ctx: &Ctx<'_>, v: &Value) -> MethodResult<Result<Value, Valu
     if let Err(e) = store.put(ctx.scope, &name, text).await {
         return Ok(Err(store_error(e)?));
     }
+    rules_changed(ctx, &name).await;
     let mut created = json!({ "id": script_id(&name), "blobId": blob_id, "isActive": false });
     if named.is_none() {
         created["name"] = json!(name);
@@ -264,11 +275,13 @@ async fn update_one(ctx: &Ctx<'_>, id: &str, patch: &Value) -> MethodResult<Resu
         if let Err(e) = store.put(ctx.scope, &cur.name, text).await {
             return Ok(Err(store_error(e)?));
         }
+        rules_changed(ctx, &cur.name).await;
     }
     if let Some(n) = &new_name {
         if let Err(e) = store.rename(ctx.scope, &cur.name, n).await {
             return Ok(Err(store_error(e)?));
         }
+        rules_changed(ctx, n).await;
         changed.insert("id".into(), json!(script_id(n)));
         if !changed.contains_key("blobId") {
             let text = store.get(ctx.scope, n).await?.unwrap_or_default();
@@ -334,7 +347,10 @@ pub(crate) async fn set(
             None => Some(set_error("notFound", None, &[])),
             Some(s) if s.active => Some(set_error("sieveIsActive", None, &[])),
             Some(s) => match store.delete(ctx.scope, &s.name).await {
-                Ok(_) => None,
+                Ok(_) => {
+                    rules_changed(ctx, &s.name).await;
+                    None
+                }
                 Err(Error::Conflict) => Some(set_error("sieveIsActive", None, &[])),
                 Err(e) => Some(store_error(e)?),
             },
@@ -368,6 +384,7 @@ pub(crate) async fn set(
             store
                 .activate(ctx.scope, target.map(|s| s.name.as_str()))
                 .await?;
+            rules_changed(ctx, target.map_or("", |s| s.name.as_str())).await;
             for (s, active) in [(was, false), (target, true)] {
                 let Some(s) = s else { continue };
                 let id = script_id(&s.name);
