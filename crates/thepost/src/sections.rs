@@ -60,6 +60,8 @@ pub const ADMIN: &str = "admin";
 pub const MAILSTORE: &str = "mailstore";
 /// Имя секции роли maintenance.
 pub const MAINTENANCE: &str = "maintenance";
+/// Имя секции командной строки `thepost admin`.
+pub const CLI: &str = "cli";
 /// Имя секции входа: каталог, OIDC, пароли приложений, Kerberos.
 pub const AUTH: &str = "auth";
 /// Имя секции слушателей HTTP ролей jmap, dav и admin.
@@ -82,6 +84,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     r.add_section::<VerifySection>(VERIFY)?;
     r.add_section::<StartupSection>(STARTUP)?;
     r.add_section::<MaintenanceSection>(MAINTENANCE)?;
+    r.add_section::<CliSection>(CLI)?;
     r.add_section::<tp_smtp::SmtpConfig>(SMTP)?;
     r.add_section::<tp_sieve::SieveConfig>(SIEVE)?;
     r.add_section::<tp_imap::ImapConfig>(IMAP)?;
@@ -98,6 +101,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     r.add_check::<BlobSection>(BLOB, BlobSection::check)?;
     r.add_check::<StartupSection>(STARTUP, |c, _| c.check())?;
     r.add_check::<MaintenanceSection>(MAINTENANCE, |c, _| c.check())?;
+    r.add_check::<CliSection>(CLI, |c, _| c.oidc.check())?;
     r.add_check::<ClusterSection>(CLUSTER, |c, _| c.check())?;
     r.add_check::<AdminSection>(ADMIN, |c, _| c.0.check())?;
     r.add_check::<AuthSection>(AUTH, AuthSection::check)?;
@@ -752,6 +756,9 @@ impl StartupSection {
 /// ```yaml
 /// maintenance:
 ///   purge_interval: 1h
+///   verify:
+///     at: "03:00"
+///     interval: 24h
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -761,22 +768,189 @@ pub struct MaintenanceSection {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub purge_interval: Duration,
+    /// Проверка целостности BLOB по расписанию (`thepost verify` без `--fix`, APP-44).
+    pub verify: VerifySchedule,
 }
 
 impl Default for MaintenanceSection {
     fn default() -> Self {
         Self {
             purge_interval: Duration::from_secs(3600),
+            verify: VerifySchedule::default(),
         }
     }
 }
 
 impl MaintenanceSection {
-    /// Период положителен.
+    /// Периоды положительны, расписание проверки целостности согласовано.
     pub fn check(&self) -> Result<()> {
         if self.purge_interval.is_zero() {
             return Err(Error::invalid(
                 "maintenance: purge_interval must be positive",
+            ));
+        }
+        self.verify.check()
+    }
+}
+
+/// `maintenance.verify`: расписание проверки целостности BLOB в роли maintenance (APP-44). Проход — сверка
+/// `thepost verify` без `--fix`: ничего не удаляет и не помечает, итог — в журнал узла и `/metrics`
+/// (`tp_blob_verify_*`); исправление — только вручную (`thepost verify --fix`). В кластере проход выполняет один
+/// узел — держатель лизы `lease_name`. Требует перезапуска.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerifySchedule {
+    /// Выполнять проверку по расписанию (`true`).
+    pub enabled: bool,
+    /// Время прохода, UTC, `ЧЧ:ММ` (`03:00`); при `interval` не в целых сутках — сдвиг сетки проходов от
+    /// полуночи UTC 1970-01-01.
+    #[serde(deserialize_with = "time_of_day::deserialize")]
+    #[schemars(with = "String")]
+    pub at: Duration,
+    /// Период проходов (`24h` — раз в сутки в `at`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub interval: Duration,
+    /// Имя лизы лидера (`blob-verify`).
+    pub lease_name: String,
+    /// Срок лизы (`2m`): продлевается, пока идёт проход; после прохода держится до истечения, чтобы узел с
+    /// отстающими часами не повторил проход, — срок должен покрывать расхождение часов узлов.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub lease_ttl: Duration,
+}
+
+impl Default for VerifySchedule {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            at: Duration::from_secs(3 * 3600),
+            interval: Duration::from_secs(24 * 3600),
+            lease_name: "blob-verify".to_owned(),
+            lease_ttl: Duration::from_secs(120),
+        }
+    }
+}
+
+impl VerifySchedule {
+    /// Период и срок лизы положительны, имя лизы задано.
+    pub fn check(&self) -> Result<()> {
+        if self.interval.is_zero() {
+            return Err(Error::invalid(
+                "maintenance: verify.interval must be positive",
+            ));
+        }
+        if self.lease_ttl.is_zero() {
+            return Err(Error::invalid(
+                "maintenance: verify.lease_ttl must be positive",
+            ));
+        }
+        if self.lease_name.is_empty() {
+            return Err(Error::invalid("maintenance: verify.lease_name is empty"));
+        }
+        Ok(())
+    }
+
+    /// Сколько ждать от момента `now` (от начала эпохи Unix, UTC) до следующего прохода: ближайший момент
+    /// сетки `at + k·interval` строго после `now`.
+    pub fn until_next(&self, now: Duration) -> Duration {
+        let interval = self.interval.as_nanos().max(1);
+        let phase = self.at.as_nanos() % interval;
+        let since = (now.as_nanos() + interval - phase) % interval;
+        let wait = interval - since;
+        Duration::new(
+            u64::try_from(wait / 1_000_000_000).unwrap_or(u64::MAX),
+            u32::try_from(wait % 1_000_000_000).unwrap_or(0),
+        )
+    }
+}
+
+/// Время суток `ЧЧ:ММ` (UTC) как смещение от полуночи.
+mod time_of_day {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Duration, D::Error> {
+        use serde::de::Error as _;
+        let raw = String::deserialize(d)?;
+        let parsed = raw.split_once(':').and_then(|(h, m)| {
+            let two_digits = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit());
+            if !two_digits(h) || !two_digits(m) {
+                return None;
+            }
+            let (h, m) = (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?);
+            (h < 24 && m < 60).then(|| Duration::from_secs(h * 3600 + m * 60))
+        });
+        parsed
+            .ok_or_else(|| D::Error::custom(format!("время суток {raw:?}: ожидается ЧЧ:ММ (UTC)")))
+    }
+}
+
+// ---------- cli ----------
+
+/// Секция `cli`: командная строка `thepost admin` (APP-42).
+///
+/// ```yaml
+/// cli:
+///   oidc:
+///     client_id: thepost-cli
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CliSection {
+    /// Вход администратора через поставщика `auth.oidc` с устройства без браузера (RFC 8628).
+    pub oidc: CliOidc,
+}
+
+/// `cli.oidc`: клиент OAuth командной строки у поставщика `auth.oidc` и опрос токена при входе с устройства.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CliOidc {
+    /// Идентификатор открытого клиента (public client) с разрешённым Device Authorization Grant; не задан —
+    /// вход с устройства недоступен. Токен клиента должен содержать получателя из `auth.oidc.audience`.
+    pub client_id: Option<String>,
+    /// Запрашиваемые области доступа через пробел (`openid`).
+    pub scope: String,
+    /// Пауза между опросами токена, если поставщик не задал `interval` (`5s`, RFC 8628).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub poll_interval: Duration,
+    /// Прибавка к паузе на ответ `slow_down` (`5s`, RFC 8628).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub slow_down_step: Duration,
+    /// Наибольшее время ожидания подтверждения (`15m`), даже если код поставщика действует дольше.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub max_wait: Duration,
+}
+
+impl Default for CliOidc {
+    fn default() -> Self {
+        Self {
+            client_id: None,
+            scope: "openid".to_owned(),
+            poll_interval: Duration::from_secs(5),
+            slow_down_step: Duration::from_secs(5),
+            max_wait: Duration::from_secs(15 * 60),
+        }
+    }
+}
+
+impl CliOidc {
+    /// Клиент и области доступа не пусты, паузы и время ожидания положительны.
+    pub fn check(&self) -> Result<()> {
+        if self.client_id.as_deref().is_some_and(str::is_empty) {
+            return Err(Error::invalid("cli: oidc.client_id is empty"));
+        }
+        if self.scope.trim().is_empty() {
+            return Err(Error::invalid("cli: oidc.scope is empty"));
+        }
+        if self.poll_interval.is_zero() || self.slow_down_step.is_zero() || self.max_wait.is_zero()
+        {
+            return Err(Error::invalid(
+                "cli: oidc.poll_interval, slow_down_step and max_wait must be positive",
             ));
         }
         Ok(())
@@ -1131,6 +1305,75 @@ blob:
             "{MINIMAL_DEV}maintenance:\n  purge_interval: 0s\n"
         )));
         assert!(e.contains("purge_interval"), "{e}");
+    }
+
+    /// APP-44: расписание проверки целостности — раз в сутки в 03:00 UTC по умолчанию; время и период из
+    /// config.yaml; неверное время и нулевой период — ошибки.
+    #[test]
+    fn maintenance_verify_schedule() {
+        let config = |yaml: &str| parse(&format!("{MINIMAL_DEV}maintenance:\n  verify:\n{yaml}"));
+        let section = |yaml: &str| {
+            config(yaml)
+                .expect("config")
+                .section::<MaintenanceSection>(MAINTENANCE)
+                .expect("section")
+                .verify
+                .clone()
+        };
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        let v = parse(MINIMAL_DEV)
+            .expect("config")
+            .section::<MaintenanceSection>(MAINTENANCE)
+            .expect("section")
+            .verify
+            .clone();
+        assert_eq!(v, VerifySchedule::default());
+        assert!(v.enabled);
+        assert_eq!((v.at, v.interval), (hours(3), hours(24)));
+        // Сутки: до 03:00 — в тот же день, в 03:00 и позже — на следующий.
+        let day = 20_000 * hours(24);
+        assert_eq!(v.until_next(day + hours(1)), hours(2));
+        assert_eq!(v.until_next(day + hours(3)), hours(24));
+        assert_eq!(v.until_next(day + hours(23)), hours(4));
+
+        let v = section("    at: \"23:30\"\n    interval: 12h\n    enabled: false\n");
+        assert!(!v.enabled);
+        assert_eq!(v.at, Duration::from_secs(23 * 3600 + 30 * 60));
+        assert_eq!(
+            v.until_next(day + hours(11)),
+            Duration::from_secs(30 * 60),
+            "период 12h: проходы в 11:30 и 23:30"
+        );
+
+        for bad in ["24:00", "3:00", "03:60", "ночью"] {
+            let e = err(config(&format!("    at: \"{bad}\"\n")));
+            assert!(e.contains("ЧЧ:ММ"), "{bad}: {e}");
+        }
+        let e = err(config("    interval: 0s\n"));
+        assert!(e.contains("verify.interval"), "{e}");
+        let e = err(config("    lease_ttl: 0s\n"));
+        assert!(e.contains("verify.lease_ttl"), "{e}");
+    }
+
+    /// APP-42: секция `cli` — клиент входа с устройства не задан по умолчанию; паузы из config.yaml; пустой
+    /// клиент и нулевая пауза — ошибки.
+    #[test]
+    fn cli_oidc_section() {
+        let config = |yaml: &str| parse(&format!("{MINIMAL_DEV}cli:\n  oidc:\n{yaml}"));
+        let c = parse(MINIMAL_DEV).expect("config");
+        let cli = c.section::<CliSection>(CLI).expect("section");
+        assert_eq!(cli.oidc, CliOidc::default());
+        assert_eq!(cli.oidc.client_id, None);
+        let c = config("    client_id: thepost-cli\n    scope: openid email\n    max_wait: 5m\n")
+            .expect("config");
+        let cli = c.section::<CliSection>(CLI).expect("section");
+        assert_eq!(cli.oidc.client_id.as_deref(), Some("thepost-cli"));
+        assert_eq!(cli.oidc.scope, "openid email");
+        assert_eq!(cli.oidc.max_wait, Duration::from_secs(300));
+        let e = err(config("    client_id: \"\"\n"));
+        assert!(e.contains("client_id"), "{e}");
+        let e = err(config("    poll_interval: 0s\n"));
+        assert!(e.contains("poll_interval"), "{e}");
     }
 
     /// APP-08: шина — в процессе (по умолчанию) или PostgreSQL LISTEN/NOTIFY; Valkey — ошибка строгой проверки.

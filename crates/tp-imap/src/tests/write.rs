@@ -5,10 +5,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use tp_contracts::bus::{EventBus, EventKind, EventStream};
 use tp_contracts::ext::Decision;
-use tp_contracts::meta::{MailboxStore, MessageQuery, MessageStore, SpecialUse};
+use tp_contracts::meta::{MailboxStore, MessageQuery, MessageStore, PolicyTarget, SpecialUse};
 use tp_contracts::retention::{TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::{MailboxId, ModSeq};
-use tp_testkit::{HookCall, PolicyLevel};
+use tp_testkit::HookCall;
 
 use super::{Client, Env};
 
@@ -247,7 +247,7 @@ async fn trash_uid_expunge_erases_unless_legal_hold() {
         user_can_choose: false,
     };
     env.policies
-        .set_trash_purge_rule(env.scope().tenant, PolicyLevel::Tenant, Some(rule));
+        .set_trash_purge_rule(env.scope().tenant, PolicyTarget::Tenant, Some(rule));
     c.cmd("E1 STORE 1:3 +FLAGS.SILENT (\\Deleted)").await;
     // `erase`: только указанные UID, перед стиранием — точка принятия решений.
     assert_eq!(

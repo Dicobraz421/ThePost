@@ -4,13 +4,13 @@
 use proptest::prelude::*;
 use tp_testkit::corpus::corpus_mail;
 
-use crate::{Action, Context, Limits, Outcome, check, run};
+use crate::{Action, Context, Limits, Outcome, compile, run};
 
 const ENV_FROM: &str = "alice@example.com";
 const ENV_TO: &str = "bob+lists@example.org";
 
 pub(super) fn exec_raw(script: &str, message: &[u8], limits: &Limits) -> Outcome {
-    let program = match check(script) {
+    let program = match compile(script.as_bytes(), &Limits::default()) {
         Ok(p) => p,
         Err(d) => panic!("{script}: {d:?}"),
     };

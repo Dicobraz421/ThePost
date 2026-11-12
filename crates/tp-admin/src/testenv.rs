@@ -20,7 +20,7 @@ use tp_contracts::{AccountId, DomainId, Error, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
     MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies, MemQuota, MemSieve,
-    MemTransport, MemTrash, PolicyLevel, SystemClock,
+    MemTransport, MemTrash, SystemClock,
 };
 
 use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
@@ -88,7 +88,7 @@ pub use tp_testkit::{MemModeration, ModerationDecision as Decision};
 #[async_trait]
 impl PolicyStore for MemPolicies {
     async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
-        Ok(MemPolicies::policy(self, tenant, level(target)))
+        tp_contracts::meta::PolicyStore::policy(self, tenant, level(target)).await
     }
 
     async fn set_policy(
@@ -97,16 +97,16 @@ impl PolicyStore for MemPolicies {
         target: PolicyTarget,
         policy: &Policy,
     ) -> Result<()> {
-        MemPolicies::set_policy(self, tenant, level(target), policy.clone());
-        Ok(())
+        tp_contracts::meta::PolicyStore::set_policy(self, tenant, level(target), policy).await
     }
 }
 
-fn level(target: PolicyTarget) -> PolicyLevel {
+fn level(target: PolicyTarget) -> tp_contracts::meta::PolicyTarget {
+    use tp_contracts::meta::PolicyTarget as Level;
     match target {
-        PolicyTarget::Tenant => PolicyLevel::Tenant,
-        PolicyTarget::Domain(d) => PolicyLevel::Domain(d),
-        PolicyTarget::Account(a) => PolicyLevel::Account(a),
+        PolicyTarget::Tenant => Level::Tenant,
+        PolicyTarget::Domain(d) => Level::Domain(d),
+        PolicyTarget::Account(a) => Level::Account(a),
     }
 }
 

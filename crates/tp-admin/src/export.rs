@@ -2,7 +2,7 @@
 //!
 //! - [`SyslogAudit`] — сообщения RFC 5424 (`<PRI>1 TIMESTAMP HOST APP PROCID audit - BOM{json}`, facility по
 //!   умолчанию 13 «log audit», severity 5 «notice») кадрами с подсчётом октетов (RFC 5425) поверх TLS (CA из
-//!   файла или системные корни, mTLS). Отправка — фоновой задачей через ограниченную очередь: запрос администратора
+//!   файла или системные корни, mTLS: ключ клиента — только из хранилища секретов, решение 100). Отправка — фоновой задачей через ограниченную очередь: запрос администратора
 //!   не ждёт SIEM; при недоступности приёмника задача переподключается, переполнение очереди — потеря записи
 //!   с ошибкой в журнале узла (основная копия — в хранилище журнала аудита).
 //! - [`OtlpAudit`] — записи OTLP-логов (событие `thepost.admin.audit`, тело — запись JSON, атрибуты —
@@ -33,6 +33,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tp_contracts::config::duration;
+use tp_contracts::secrets::{Secret, SecretStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result};
 
@@ -62,12 +63,19 @@ impl AuditExportConfig {
         Ok(())
     }
 
-    /// Запускает экспорт по секции: приёмники для [`Fanout`] вместе с хранилищем журнала.
-    pub async fn start(&self, profile: Profile) -> Result<Vec<Arc<dyn AuditSink>>> {
+    /// Запускает экспорт по секции: приёмники для [`Fanout`] вместе с хранилищем журнала; ключ клиента syslog
+    /// (`tls.key`) читается из `secrets`.
+    pub async fn start(
+        &self,
+        profile: Profile,
+        secrets: &dyn SecretStore,
+    ) -> Result<Vec<Arc<dyn AuditSink>>> {
         self.check()?;
         let mut out: Vec<Arc<dyn AuditSink>> = Vec::new();
         if let Some(s) = &self.syslog {
-            out.push(Arc::new(SyslogAudit::start(s.clone(), profile).await?));
+            out.push(Arc::new(
+                SyslogAudit::start(s.clone(), profile, secrets).await?,
+            ));
         }
         if let Some(o) = self.otlp.clone() {
             // Клиент OTLP/HTTP блокирующий: создаётся вне async-контекста.
@@ -109,7 +117,10 @@ impl AuditSink for Fanout {
 ///
 /// ```yaml
 /// address: siem.example.org:6514
-/// tls: { ca_file: /etc/thepost/siem-ca.pem }
+/// tls:
+///   ca_file: /etc/thepost/siem-ca.pem
+///   cert_file: /etc/thepost/siem-client.pem
+///   key: { secret: "thepost/tls/siem#key" }
 /// hostname: mail1.example.org
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -117,8 +128,9 @@ impl AuditSink for Fanout {
 pub struct SyslogConfig {
     /// Приёмник `узел:порт` (syslog поверх TLS, обычно 6514).
     pub address: String,
-    /// TLS: CA приёмника (не задан — системные корни), сертификат клиента, `server_name`; `allow_plaintext` —
-    /// открытый TCP, только профиль dev.
+    /// TLS: CA приёмника (не задан — системные корни), сертификат клиента `cert_file` с ключом `key` (ссылка на
+    /// секрет, PEM; `key_file` не принимается — решение 100), `server_name`; `allow_plaintext` — открытый TCP,
+    /// только профиль dev.
     pub tls: InternalTls,
     /// Поле HOSTNAME; не задано — `-`.
     pub hostname: Option<String>,
@@ -164,7 +176,8 @@ fn header_field(what: &str, v: &str, max: usize) -> Result<()> {
 }
 
 impl SyslogConfig {
-    /// Проверяет подсекцию: адрес `узел:порт`, facility, поля заголовка, очередь, пара сертификат и ключ.
+    /// Проверяет подсекцию: адрес `узел:порт`, facility, поля заголовка, очередь, пара сертификат и ключ
+    /// (ключ — только `tls.key`).
     pub fn check(&self) -> Result<()> {
         if host_of(&self.address).is_none() {
             return Err(Error::invalid(
@@ -181,9 +194,14 @@ impl SyslogConfig {
         if self.queue == 0 {
             return Err(Error::invalid("admin.audit.syslog: queue must be positive"));
         }
-        if self.tls.cert_file.is_some() != self.tls.key_file.is_some() {
+        if self.tls.key_file.is_some() {
             return Err(Error::invalid(
-                "admin.audit.syslog: tls.cert_file and tls.key_file must be set together",
+                "admin.audit.syslog: tls.key_file is not supported, use tls.key: { secret: \"<path>#<field>\" }",
+            ));
+        }
+        if self.tls.cert_file.is_some() != self.tls.key.is_some() {
+            return Err(Error::invalid(
+                "admin.audit.syslog: tls.cert_file and tls.key must be set together",
             ));
         }
         Ok(())
@@ -236,9 +254,13 @@ pub struct SyslogAudit {
 type Conn = Box<dyn AsyncWrite + Send + Unpin>;
 
 impl SyslogAudit {
-    /// Проверяет подсекцию (открытый канал — только профиль dev), готовит TLS и запускает задачу отправки
-    /// (нужен runtime tokio). Подключение — при первой записи.
-    pub async fn start(cfg: SyslogConfig, profile: Profile) -> Result<Self> {
+    /// Проверяет подсекцию (открытый канал — только профиль dev), читает ключ клиента `tls.key` из `secrets`,
+    /// готовит TLS и запускает задачу отправки (нужен runtime tokio). Подключение — при первой записи.
+    pub async fn start(
+        cfg: SyslogConfig,
+        profile: Profile,
+        secrets: &dyn SecretStore,
+    ) -> Result<Self> {
         cfg.check()?;
         let tls = if cfg.tls.allow_plaintext {
             if profile != Profile::Dev {
@@ -259,8 +281,14 @@ impl SyslogAudit {
                 .unwrap_or_default();
             let name = ServerName::try_from(name)
                 .map_err(|e| Error::invalid(format!("admin.audit.syslog: server name: {e}")))?;
+            let key = match &cfg.tls.key {
+                Some(r) => Some(secrets.get(r).await.inspect_err(|e| {
+                    tracing::error!(error = %e, secret = %r, "audit syslog: tls.key: secret read failed");
+                })?),
+                None => None,
+            };
             let t = cfg.tls.clone();
-            let config = tokio::task::spawn_blocking(move || client_tls(&t))
+            let config = tokio::task::spawn_blocking(move || client_tls(&t, key.as_ref()))
                 .await
                 .map_err(|e| Error::internal(format!("admin.audit.syslog: tls: {e}")))??;
             Some((TlsConnector::from(Arc::new(config)), name))
@@ -345,8 +373,9 @@ async fn connect(
     }
 }
 
-/// Конфигурация rustls: CA из `tls.ca_file` или системные корни, сертификат клиента для mTLS. Блокирующий I/O.
-fn client_tls(tls: &InternalTls) -> Result<ClientConfig> {
+/// Конфигурация rustls: CA из `tls.ca_file` или системные корни, сертификат клиента `tls.cert_file` с ключом
+/// `key` (значение секрета `tls.key`, PEM) для mTLS. Блокирующий I/O.
+fn client_tls(tls: &InternalTls, key: Option<&Secret>) -> Result<ClientConfig> {
     let provider = rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
@@ -369,10 +398,14 @@ fn client_tls(tls: &InternalTls) -> Result<ClientConfig> {
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Invalid(format!("admin.audit.syslog: tls: {e}")))?
         .with_root_certificates(roots);
-    match (&tls.cert_file, &tls.key_file) {
+    match (&tls.cert_file, key) {
         (Some(cert), Some(key)) => {
-            let key = PrivateKeyDer::from_pem_file(key)
-                .map_err(|e| Error::Invalid(format!("admin.audit.syslog: tls.key_file: {e}")))?;
+            // Текст ошибки разбора не содержит значения ключа.
+            let key = PrivateKeyDer::from_pem_slice(key.expose().as_bytes()).map_err(|e| {
+                Error::Invalid(format!(
+                    "admin.audit.syslog: tls.key: not a PEM private key: {e}"
+                ))
+            })?;
             builder
                 .with_client_auth_cert(read_certs(cert)?, key)
                 .map_err(|e| Error::Invalid(format!("admin.audit.syslog: tls.cert_file: {e}")))
@@ -491,7 +524,9 @@ mod tests {
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
     use tokio::io::AsyncReadExt;
+    use tp_contracts::secrets::SecretRef;
     use tp_contracts::{AccountId, TenantId};
+    use tp_testkit::MemSecretStore;
 
     use super::*;
     use crate::server::AdminRole;
@@ -568,6 +603,29 @@ mod tests {
                 queue: 0,
                 ..ok.clone()
             },
+            // Ключ только из хранилища секретов (решение 100); сертификат и ключ — парой.
+            SyslogConfig {
+                tls: InternalTls {
+                    cert_file: Some("/etc/thepost/siem-client.pem".into()),
+                    key_file: Some("/etc/thepost/siem-client.key".into()),
+                    ..InternalTls::default()
+                },
+                ..ok.clone()
+            },
+            SyslogConfig {
+                tls: InternalTls {
+                    cert_file: Some("/etc/thepost/siem-client.pem".into()),
+                    ..InternalTls::default()
+                },
+                ..ok.clone()
+            },
+            SyslogConfig {
+                tls: InternalTls {
+                    key: Some(key_ref()),
+                    ..InternalTls::default()
+                },
+                ..ok.clone()
+            },
         ] {
             assert!(matches!(bad.check(), Err(Error::Invalid(_))), "{bad:?}");
         }
@@ -588,40 +646,42 @@ mod tests {
         assert!(
             serde_json::from_value::<AuditExportConfig>(serde_json::json!({"kafka": {}})).is_err()
         );
+        let cfg: AuditExportConfig = serde_json::from_value(serde_json::json!({
+            "syslog": {"address": "siem:6514", "tls": {
+                "cert_file": "/etc/thepost/siem-client.pem",
+                "key": {"secret": "thepost/tls/siem#key"}
+            }}
+        }))
+        .expect("parse key");
+        cfg.check().expect("check key");
     }
 
-    /// Открытый канал — только dev; кадры RFC 5425 приходят приёмнику по порядку.
-    #[tokio::test]
-    async fn syslog_export_frames() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let cfg = SyslogConfig {
-            address: listener.local_addr().expect("addr").to_string(),
-            tls: InternalTls {
-                allow_plaintext: true,
-                ..InternalTls::default()
-            },
-            ..SyslogConfig::default()
-        };
-        assert!(matches!(
-            SyslogAudit::start(cfg.clone(), Profile::Prod).await,
-            Err(Error::Invalid(_))
-        ));
-        let sink = SyslogAudit::start(cfg, Profile::Dev).await.expect("start");
-        sink.record(&record("/one")).await.expect("one");
-        sink.record(&record("/два")).await.expect("two");
-        let (mut sock, _) = listener.accept().await.expect("accept");
+    fn key_ref() -> SecretRef {
+        SecretRef::new("thepost/tls/siem", "key").expect("ref")
+    }
+
+    fn secrets() -> MemSecretStore {
+        MemSecretStore::new(Arc::new(tp_testkit::SystemClock))
+    }
+
+    fn testdata(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/testdata")
+            .join(name)
+    }
+
+    /// Маршруты из кадров RFC 5425, пока не придёт `n` кадров.
+    async fn read_routes(sock: &mut (impl tokio::io::AsyncRead + Unpin), n: usize) -> Vec<String> {
         let mut got = Vec::new();
         let mut buf = [0u8; 4096];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let routes = loop {
-            let n = tokio::time::timeout_at(deadline, sock.read(&mut buf))
+        loop {
+            let len = tokio::time::timeout_at(deadline, sock.read(&mut buf))
                 .await
                 .expect("timely")
                 .expect("read");
-            assert!(n > 0, "connection closed");
-            got.extend_from_slice(&buf[..n]);
+            assert!(len > 0, "connection closed");
+            got.extend_from_slice(&buf[..len]);
             let mut rest = got.as_slice();
             let mut routes = Vec::new();
             while let Some(sp) = rest.iter().position(|b| *b == b' ') {
@@ -639,11 +699,105 @@ mod tests {
                 routes.push(v["route"].as_str().expect("route").to_owned());
                 rest = &rest[sp + 1 + len..];
             }
-            if routes.len() == 2 {
-                break routes;
+            if routes.len() == n {
+                return routes;
             }
+        }
+    }
+
+    /// Открытый канал — только dev; кадры RFC 5425 приходят приёмнику по порядку.
+    #[tokio::test]
+    async fn syslog_export_frames() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let cfg = SyslogConfig {
+            address: listener.local_addr().expect("addr").to_string(),
+            tls: InternalTls {
+                allow_plaintext: true,
+                ..InternalTls::default()
+            },
+            ..SyslogConfig::default()
         };
+        let store = secrets();
+        assert!(matches!(
+            SyslogAudit::start(cfg.clone(), Profile::Prod, &store).await,
+            Err(Error::Invalid(_))
+        ));
+        let sink = SyslogAudit::start(cfg, Profile::Dev, &store)
+            .await
+            .expect("start");
+        sink.record(&record("/one")).await.expect("one");
+        sink.record(&record("/два")).await.expect("two");
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let routes = read_routes(&mut sock, 2).await;
         assert_eq!(routes, ["/one", "/два"]);
+    }
+
+    /// mTLS: ключ клиента — из хранилища секретов (`tls.key`); приёмник проверяет сертификат клиента.
+    #[tokio::test]
+    async fn syslog_export_tls_key_from_secrets() {
+        use rustls::server::WebPkiClientVerifier;
+
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(read_certs(&testdata("ca.pem")).expect("ca"));
+        let verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                .build()
+                .expect("verifier");
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                read_certs(&testdata("server.pem")).expect("server cert"),
+                PrivateKeyDer::from_pem_file(testdata("server-key.pem")).expect("server key"),
+            )
+            .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let cfg = SyslogConfig {
+            address: listener.local_addr().expect("addr").to_string(),
+            tls: InternalTls {
+                ca_file: Some(testdata("ca.pem")),
+                cert_file: Some(testdata("client.pem")),
+                key: Some(key_ref()),
+                server_name: Some("siem.test".into()),
+                ..InternalTls::default()
+            },
+            ..SyslogConfig::default()
+        };
+        let store = secrets();
+        // Нет секрета — ошибка хранилища; не PEM — ошибка без значения в тексте.
+        assert_eq!(
+            SyslogAudit::start(cfg.clone(), Profile::Prod, &store)
+                .await
+                .err(),
+            Some(Error::NotFound)
+        );
+        store.set(&key_ref(), "not-a-key-s3cr3t");
+        match SyslogAudit::start(cfg.clone(), Profile::Prod, &store).await {
+            Err(Error::Invalid(m)) => assert!(!m.contains("s3cr3t"), "{m}"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        store.set(&key_ref(), include_str!("testdata/client-key.pem"));
+        let sink = SyslogAudit::start(cfg, Profile::Prod, &store)
+            .await
+            .expect("start");
+        sink.record(&record("/tls")).await.expect("record");
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let mut sock = acceptor.accept(tcp).await.expect("handshake");
+        assert!(
+            sock.get_ref()
+                .1
+                .peer_certificates()
+                .is_some_and(|c| !c.is_empty()),
+            "client certificate"
+        );
+        assert_eq!(read_routes(&mut sock, 1).await, ["/tls"]);
     }
 
     /// Экспорт в память: записи текущего вызова.
