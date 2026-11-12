@@ -834,9 +834,9 @@ mod tests {
     use tp_contracts::bus::EventBus;
     use tp_contracts::ext::Decision;
     use tp_contracts::mailstore::MailStore;
-    use tp_contracts::meta::MailboxStore;
+    use tp_contracts::meta::{MailboxStore, PolicyTarget};
     use tp_contracts::retention::{TrashPurge, TrashPurgeRule, TrashStore};
-    use tp_testkit::{HookCall, PolicyLevel};
+    use tp_testkit::HookCall;
 
     async fn get(env: &Env, id: &str) -> Value {
         let args = json!({
@@ -1209,7 +1209,7 @@ mod tests {
             user_can_choose: true,
         };
         env.policies
-            .set_trash_purge_rule(env.scope.tenant, PolicyLevel::Tenant, Some(rule));
+            .set_trash_purge_rule(env.scope.tenant, PolicyTarget::Tenant, Some(rule));
         let r = env
             .request(json!({
                 "using": ["urn:ietf:params:jmap:core", "urn:thepost:params:jmap:settings"],
@@ -1237,7 +1237,7 @@ mod tests {
         // Администратор отнял выбор — действует его `hide`, точка принятия решений не вызывается.
         env.policies.set_trash_purge_rule(
             env.scope.tenant,
-            PolicyLevel::Tenant,
+            PolicyTarget::Tenant,
             Some(TrashPurgeRule::default()),
         );
         let r = destroy(&env, &[&ids[2]]).await;

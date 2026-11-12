@@ -49,7 +49,7 @@ use crate::modules;
 use crate::protocols::{
     Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, LogPause, SmtpRole, Sockets,
 };
-use crate::roles::{Maintenance, PendingRole, Purge};
+use crate::roles::{Maintenance, PendingRole, Purge, ScheduledVerify};
 use crate::secrets;
 use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection, HttpSection};
 use crate::services::{Base, Services};
@@ -162,6 +162,13 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let migrations = infra::migration_pool(&cfg, store.as_ref(), &pool).await?;
     if meta_cfg.migrate_on_start {
         tp_meta::schema::migrate(&migrations).await?;
+    }
+    // FIX-05: со вторым шардом GC BLOB удалит чужие объекты — роль maintenance не стартует до FIX-04.
+    if cfg.roles().contains(Role::Maintenance)
+        && let Some(reason) =
+            crate::roles::unsharded_gc(crate::roles::shard_count(&pool).await?.unwrap_or(1))
+    {
+        return Err(Error::invalid(reason));
     }
     let events_cfg = meta_cfg.events.clone();
     let blob_cfg = cfg.section::<BlobSection>(BLOB)?;
@@ -326,6 +333,12 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         events_cfg.clone(),
     )
     .with_assigner(assigner, node.clone());
+    let maintenance_cfg = cfg.section::<sections::MaintenanceSection>(sections::MAINTENANCE)?;
+    let verify_page_size = cfg
+        .section::<sections::VerifySection>(sections::VERIFY)?
+        .page_size;
+    // Показатели есть и при выключенной проверке: нулевые.
+    let verify_probe = crate::metrics::register_verify(&metrics);
     let maintenance = Maintenance {
         index: Arc::new(meta.clone()),
         store: blob.clone(),
@@ -345,9 +358,22 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         trash: Some(services.mail.clone()),
         purge: Some(Purge {
             meta: meta.clone(),
-            interval: cfg
-                .section::<sections::MaintenanceSection>(sections::MAINTENANCE)?
-                .purge_interval,
+            interval: maintenance_cfg.purge_interval,
+            admin_token_retention: maintenance_cfg.admin_token_retention,
+        }),
+        verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {
+            verifier: Arc::new(crate::verify::verifier(
+                Arc::new(meta.clone()),
+                Arc::new(crate::verify::PgInventory::new(
+                    meta.clone(),
+                    verify_page_size,
+                )),
+                blob.clone(),
+                tp_blob::VerifyConfig::default(),
+            )),
+            schedule: maintenance_cfg.verify.clone(),
+            probe: verify_probe,
+            now: tp_blob::system_now(),
         }),
     };
     let mut setup = RoleSetup {
@@ -989,7 +1015,10 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().expect("tempdir");
-        let (url, password) = split_password(&dev_url(&url));
+        // Своя база: шард, добавленный параллельным тестом в общую, остановил бы роль maintenance (FIX-05).
+        let admin_url = dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&admin_url).await;
+        let (url, password) = split_password(&url_db);
         let secrets = Arc::new(MemSecretStore::default());
         // Без пароля в адресе (trust) пароль серверу не нужен, но ссылка всё равно разрешается.
         let db: SecretRef = "thepost/db#password".parse().expect("ref");
@@ -1070,6 +1099,7 @@ mod tests {
         let report = running.wait().await.expect("wait");
         assert!(report.failed.is_empty(), "{report:?}");
         assert!(report.cancelled.is_empty(), "{report:?}");
+        crate::testutil::drop_database(&admin_url, &db_name).await;
     }
 
     /// TLS-соединение со слушателем, доверяя только сертификату `cert` (PEM): `true` — сервер предъявил его.

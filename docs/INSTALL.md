@@ -280,8 +280,10 @@ SRS 3.5). Поэтому потерять можно только письма, 
 Копия OpenBao (секреты узла, в том числе ключи DKIM) снимается вместе с копией базы — снимок Raft в то же
 хранилище копий. Заранее храните **вне сервера**: `/root/openbao-init.json`, `/etc/openbao/unseal.key` и пароль restic.
 
-1. Установите новый сервер: `ansible-playbook … deploy/ansible/smb.yml -e thepost_backup=false`. Если в настройках
-   задан DKIM, прогон остановится на `Wait for thepost readiness` — это ожидаемо: ключ DKIM вернётся из снимка.
+1. Установите новый сервер без копирования и без ожидания готовности узла:
+   `ansible-playbook … deploy/ansible/smb.yml -e thepost_backup=false -e thepost_wait_ready=false`. Прогон завершится
+   успешно с предупреждением «thepost не готов»: узел ждёт секретов прежнего сервера (ключ DKIM и другие), они
+   вернутся из снимка OpenBao.
 2. Верните копии по тем же путям и выполните `chown -R postgres:postgres /var/lib/pgbackrest`.
 3. В новом OpenBao заведите только хранилище пароля копий:
    `bao secrets enable -path=thepost-backup -version=2 kv` и

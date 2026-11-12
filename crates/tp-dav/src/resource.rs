@@ -159,9 +159,8 @@ fn checked_index(
                     .components
                     .first()
                     .is_some_and(|c| c.has_property(&ICalendarProperty::Method));
-                let limits = cx.store().limits();
                 let now = OffsetDateTime::now_utc();
-                match deliver::object_index(&cx.dav.cfg, &limits, &ical, now) {
+                match deliver::object_index(&cx.dav.cfg, &ical, now) {
                     Err(IndexError::Calendar) => Err((IndexError::Calendar, valid_data(kind))),
                     Err(e) => Err((e, RESOURCE)),
                     Ok(_) if method => Err((IndexError::Mixed, RESOURCE)),

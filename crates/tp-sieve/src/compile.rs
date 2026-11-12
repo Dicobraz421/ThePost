@@ -164,7 +164,8 @@ pub(crate) enum Transform {
     Content(Vec<String>),
 }
 
-/// Проверка с лимитами по умолчанию — для ManageSieve `CHECKSCRIPT`, JMAP `SieveScript/validate`, Admin API.
+/// Проверка с лимитами по умолчанию — устаревший путь: проверять [`compile`] с [`Limits`] секции `sieve`.
+/// Остаётся, пока её вызывают JMAP (`tp-jmap`, JMAP-35) и CLI (`thepost`, ADM-35); затем удаляется (SIEVE-13).
 pub fn check(text: &str) -> Result<Program, Vec<Diagnostic>> {
     compile(text.as_bytes(), &Limits::default())
 }

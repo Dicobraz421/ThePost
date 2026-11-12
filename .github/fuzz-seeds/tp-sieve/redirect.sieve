@@ -1,0 +1,1 @@
+redirect "a@example.net"; redirect "b@example.net"; redirect "c@example.net";

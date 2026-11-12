@@ -126,7 +126,6 @@ fn to_ical(
     mut group: Map<String, Value>,
     mut event: Map<String, Value>,
     opts: &IndexOptions,
-    busy_horizon: std::time::Duration,
 ) -> Result<(String, ObjectIndex), Value> {
     for p in JMAP_PROPS {
         event.remove(p);
@@ -145,8 +144,8 @@ fn to_ical(
             .into_icalendar()
     })
     .ok_or_else(|| invalid("JSCalendar cannot be converted to iCalendar", &[]))?;
-    let index = scheduling::object_index(&ical, opts, busy_horizon, OffsetDateTime::now_utc())
-        .map_err(|e| invalid(&e.to_string(), &["uid"]))?;
+    let index =
+        scheduling::object_index(&ical, opts).map_err(|e| invalid(&e.to_string(), &["uid"]))?;
     if index.span.is_none() {
         let why = "invalid start, duration or recurrence";
         return Err(invalid(why, &["start", "duration", "recurrenceRule"]));
@@ -628,12 +627,7 @@ async fn create_one(ctx: &Ctx<'_>, v: &Value, send: bool) -> MethodResult<Result
     event.insert("updated".into(), now.clone());
     let server_set = json!({ "uid": event["uid"], "created": event["created"], "updated": now });
     let group = object(json!({ "@type": "Group", "prodId": "-//The Post//JMAP//RU" }));
-    let (body, index) = match to_ical(
-        group,
-        event,
-        &index_options(ctx),
-        store.limits().busy_horizon,
-    ) {
+    let (body, index) = match to_ical(group, event, &index_options(ctx)) {
         Ok(x) => x,
         Err(e) => return Ok(Err(e)),
     };
@@ -781,12 +775,7 @@ async fn update_one(
     }
     let now = utc_date(OffsetDateTime::now_utc());
     event.insert("updated".into(), now.clone());
-    let (body, index) = match to_ical(
-        group,
-        event,
-        &index_options(ctx),
-        store.limits().busy_horizon,
-    ) {
+    let (body, index) = match to_ical(group, event, &index_options(ctx)) {
         Ok(x) => x,
         Err(e) => return Ok(Err(e)),
     };

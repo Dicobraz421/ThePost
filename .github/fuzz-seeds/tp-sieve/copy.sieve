@@ -1,0 +1,1 @@
+require "copy"; redirect :copy "a@example.net";

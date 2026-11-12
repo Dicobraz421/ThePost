@@ -1,0 +1,1 @@
+require ["body", "vacation"]; if body :contains "fox" { vacation "x"; discard; }

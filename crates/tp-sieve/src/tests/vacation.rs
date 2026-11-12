@@ -11,7 +11,7 @@ use tp_testkit::{ManualClock, MemVacationLog};
 
 use crate::run::parse_headers;
 use crate::vacation::{Source, reply, suppressed};
-use crate::{Action, Context, Limits, VacationAction, VacationConfig, check, run};
+use crate::{Action, Context, Limits, VacationAction, VacationConfig, compile, run};
 
 const MAIL: &str = "From: Alice <alice@example.com>\r\nTo: Bob <bob@example.org>\r\nSubject: =?utf-8?b?0J7RgtGH0ZHRgg==?=\r\n\
                     Message-ID: <m1@example.com>\r\nReferences: <r1@example.com> <r2@example.com>\r\n\r\nтекст";
@@ -33,7 +33,11 @@ fn input(mail: &str, mail_from: &str, recipient: &str) -> RulesInput {
 
 /// Параметры `vacation` из скрипта.
 fn action(script: &str) -> VacationAction {
-    let program = check(&format!("require \"vacation\"; {script}")).expect("script");
+    let program = compile(
+        format!("require \"vacation\"; {script}").as_bytes(),
+        &Limits::default(),
+    )
+    .expect("script");
     let o = run(&program, &Context::default(), &Limits::default());
     match o.actions.into_iter().next() {
         Some(Action::Vacation(v)) => v,

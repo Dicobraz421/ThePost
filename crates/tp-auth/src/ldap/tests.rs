@@ -623,7 +623,7 @@ async fn live_ldap() {
         } else {
             let t = tls.clone();
             Some(Arc::new(
-                tokio::task::spawn_blocking(move || client_tls(&t))
+                tokio::task::spawn_blocking(move || client_tls(&t, None))
                     .await
                     .expect("join")
                     .expect("tls"),
@@ -894,6 +894,80 @@ mod group_sync {
         );
     }
 
+    /// Приёмка CTR-32: участник-учётная запись — по идентификатору каталога; переименование входа не теряет
+    /// членство. Имя входа — только для учётной записи без `external_id`.
+    #[tokio::test]
+    async fn login_rename_keeps_membership() {
+        use tp_contracts::meta::{AccountStore, AccountUpsert};
+        use tp_testkit::MemMetadata;
+
+        const ALICE_ID: &str = "00000000-0000-0000-0000-0000000000a1";
+        let fake = Fake::new(include_str!("openldap.ldif"));
+        let dir = LdapDirectory::with_source(T, openldap_cfg(), fake.clone());
+        let meta = MemMetadata::new(Arc::new(SystemClock));
+        let domain = tp_contracts::DomainId::new();
+        let upsert = |login: &str, external_id: Option<&str>| AccountUpsert {
+            domain,
+            login: login.to_owned(),
+            display_name: login.to_owned(),
+            external_id: external_id.map(str::to_owned),
+            enabled: true,
+        };
+        let alice = meta
+            .upsert(T, upsert("alice@example.org", Some(ALICE_ID)))
+            .await
+            .expect("alice")
+            .id;
+        // carol заведена до синхронизации каталога (без `external_id`) — сопоставляется по имени входа.
+        let carol = meta
+            .upsert(T, upsert("carol@example.org", None))
+            .await
+            .expect("carol")
+            .id;
+        let groups = MemGroups::new();
+        let sync = GroupSync::new(dir, Arc::new(meta.clone()), Arc::new(groups.clone()));
+        let full = sync.run(None).await.expect("full");
+        assert_eq!(
+            group(&groups, DEVS).await.members,
+            sorted(vec![
+                GroupMember::Account(alice),
+                GroupMember::Account(carol)
+            ])
+        );
+
+        // Вход alice переименован в каталоге и в метаданных (синхронизация учётных записей — по `external_id`).
+        fake.set_all(ALICE_DN, "mail", &["liddell@example.org"]);
+        meta.upsert(T, upsert("liddell@example.org", Some(ALICE_ID)))
+            .await
+            .expect("rename");
+        fake.set(DEVS_DN, "modifyTimestamp", "20261005000000Z");
+        let inc = sync.run(Some(&full.cursor)).await.expect("incremental");
+        assert_eq!(inc.upserted, 1);
+        assert_eq!(
+            group(&groups, DEVS).await.members,
+            sorted(vec![
+                GroupMember::Account(alice),
+                GroupMember::Account(carol)
+            ])
+        );
+
+        // Запись каталога с тем же именем входа, но другим идентификатором — другой человек: учётная запись
+        // alice (со своим `external_id`) по имени входа не сопоставляется.
+        let devs = group(&groups, DEVS).await;
+        fake.set_all(
+            ALICE_DN,
+            "entryUUID",
+            &["00000000-0000-0000-0000-0000000000ff"],
+        );
+        fake.set(DEVS_DN, "modifyTimestamp", "20261006000000Z");
+        sync.run(Some(&inc.cursor)).await.expect("incremental");
+        assert_eq!(
+            group(&groups, DEVS).await.members,
+            [GroupMember::Account(carol)]
+        );
+        assert_eq!(group(&groups, DEVS).await.id, devs.id);
+    }
+
     #[tokio::test]
     async fn restrictions_moderators_and_hiding_from_directory() {
         let flag = |attribute: &str| {
@@ -1006,5 +1080,111 @@ mod group_sync {
         let empty = sync.run(None).await.expect("empty");
         assert_eq!(empty.removed, 0);
         assert_eq!(groups.list(T).await.expect("list").len(), 2);
+    }
+}
+
+/// Ключ клиентского сертификата LDAPS — из хранилища секретов (`tls.key`, решение 100).
+mod client_key_tls {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use rustls::SignatureScheme;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
+    use tp_contracts::Error;
+    use tp_contracts::secrets::SecretRef;
+    use tp_contracts::tls::InternalTls;
+    use tp_testkit::{MemSecretStore, SystemClock};
+
+    use super::super::client_tls;
+    use crate::client_key;
+
+    fn testdata(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/testdata")
+            .join(name)
+    }
+
+    fn tls(key: &SecretRef) -> InternalTls {
+        InternalTls {
+            cert_file: Some(testdata("client.crt")),
+            key: Some(key.clone()),
+            ..InternalTls::default()
+        }
+    }
+
+    fn store(key: &SecretRef, name: &str) -> MemSecretStore {
+        let s = MemSecretStore::new(Arc::new(SystemClock));
+        s.set(
+            key,
+            std::fs::read_to_string(testdata(name)).expect("testdata"),
+        );
+        s
+    }
+
+    #[tokio::test]
+    async fn key_from_secret_store_is_file_identity() {
+        let r = SecretRef::new("thepost/ldap", "tls_key").expect("ref");
+        let tls = tls(&r);
+        let key = client_key("LDAP", &tls, &store(&r, "client.key"))
+            .await
+            .expect("key")
+            .expect("some");
+        let cfg = client_tls(&tls, Some(&key)).expect("tls");
+        let got = cfg
+            .client_auth_cert_resolver
+            .resolve(&[], &[SignatureScheme::ECDSA_NISTP256_SHA256])
+            .expect("client cert");
+
+        let cert = std::fs::read(testdata("client.crt")).expect("cert");
+        let want_chain = rustls::pki_types::CertificateDer::pem_slice_iter(&cert)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("pem");
+        assert_eq!(got.cert, want_chain);
+        let file_key = PrivateKeyDer::from_pem_file(testdata("client.key")).expect("key file");
+        let want_key = rustls::crypto::aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(file_key)
+            .expect("load");
+        assert_eq!(got.key.public_key(), want_key.public_key());
+        assert!(got.keys_match().is_ok());
+    }
+
+    #[tokio::test]
+    async fn key_errors() {
+        let r = SecretRef::new("thepost/ldap", "tls_key").expect("ref");
+        // Нет секрета в хранилище — понятная ошибка с путём.
+        let empty = MemSecretStore::new(Arc::new(SystemClock));
+        match client_key("LDAP", &tls(&r), &empty).await {
+            Err(Error::Invalid(m)) => assert!(m.contains("thepost/ldap#tls_key"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // Ключ от другого сертификата.
+        let wrong = client_key("LDAP", &tls(&r), &store(&r, "other.key"))
+            .await
+            .expect("key");
+        assert!(matches!(
+            client_tls(&tls(&r), wrong.as_ref()),
+            Err(Error::Invalid(_))
+        ));
+        // Сертификат без ключа.
+        assert!(matches!(client_tls(&tls(&r), None), Err(Error::Invalid(_))));
+        // `key_file` не поддерживается.
+        let file = InternalTls {
+            cert_file: Some(testdata("client.crt")),
+            key_file: Some(testdata("client.key")),
+            ..InternalTls::default()
+        };
+        assert!(matches!(
+            client_key("LDAP", &file, &empty).await,
+            Err(Error::Invalid(_))
+        ));
+        // Без mTLS — ключ не читается.
+        assert_eq!(
+            client_key("LDAP", &InternalTls::default(), &empty)
+                .await
+                .map(|k| k.is_none()),
+            Ok(true)
+        );
     }
 }

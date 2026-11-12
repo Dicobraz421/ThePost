@@ -121,7 +121,7 @@ docker compose -f deploy/compose/dev.yml --profile smb run --rm thepost doctor  
 
 Слушатели эталона: SMTP 25 (STARTTLS), submission 587 (STARTTLS) и 465 (неявный TLS), IMAP 143 (STARTTLS) и 993,
 JMAP — HTTPS 443 (`http.jmap`); порт 80 публикуется, но не слушается. Домен — `example.test`
-(`smtp.delivery.local_domains`). Сертификат — `fullchain.pem`/`privkey.pem` тома `tls` от `tls-init`
+(принятый домен организации в БД: его заводит `thepost admin init`). Сертификат — `fullchain.pem`/`privkey.pem` тома `tls` от `tls-init`
 (SAN: `localhost`, `thepost`, `mail.example.test`), CA для клиентов — `deploy/compose/tls/ca.pem`.
 Проверка эталона (полная — `docs/manual-tests/CMP-01.md`):
 ```bash
@@ -178,7 +178,23 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
   `LoadCredentialEncrypted=` юнитов копий и drop-in `postgresql@16-main.service.d/pgbackrest.conf` (для
   `archive_command` и `restore_command`). pgBackRest читает их через `--config-include-path=/run/credentials/<юнит>`,
   restic — через `RESTIC_PASSWORD_FILE` и `AWS_SHARED_CREDENTIALS_FILE`. Вручную — `thepost-pgbackrest …` и
-  `thepost-restic …` (обёртки `systemd-run` с теми же учётными данными).
+  `thepost-restic …` (обёртки `systemd-run` с теми же учётными данными);
+- снимок Raft OpenBao (`thepost_backup_openbao: true`, DEP-23; все секреты The Post — DKIM, AppRole, пароли СУБД,
+  ключи копий) — `thepost-backup-openbao.service` после каждой копии СУБД (своё расписание —
+  `thepost_backup_openbao_schedule`) в то же хранилище: restic (тег `thepost-openbao`) или каталог rsync
+  (`thepost_backup_openbao_rsync_dest`). Вход — AppRole `thepost-backup-snapshot` с политикой только на
+  `sys/storage/raft/snapshot` (чтение) и `auth/token/revoke-self`; на ВМ — `/etc/thepost/credentials/openbao-snapshot.cred`
+  (`systemd-creds`). Снимок зашифрован ключом OpenBao: вне сервера храните `/root/openbao-init.json`,
+  `/etc/openbao/unseal.key` (seal `static`) и пароль restic.
+
+Восстановление OpenBao из снимка (новая ВМ или откат секретов) — `restore.yml -e thepost_restore_openbao=true`
+с `-e thepost_restore_openbao_init_src=<openbao-init.json прежней ВМ>` и ключом распечатывания прежней ВМ:
+`-e thepost_restore_openbao_static_key_src=<unseal.key>` (seal `static`) или `thepost_restore_openbao_unseal_keys`
+(Шамир); без ключа — отказ до остановки служб. Снимок (`thepost_restore_openbao_snapshot`, по умолчанию `latest`)
+ставится до восстановления СУБД. Новая ВМ: первый `smb.yml -e thepost_backup=false -e thepost_wait_ready=false`
+(узел ждёт секретов из снимка — плейбук не ждёт `/healthz/ready`, завершается с предупреждением); копии — по тем же
+путям, на перенесённом каталоге копий — `chown -R postgres:postgres /var/lib/pgbackrest` (uid `postgres` на новой ВМ
+может быть другим); в новом OpenBao — только `thepost-backup/restic#password` (и `s3`).
 
 Восстановление — `deploy/ansible/restore.yml` (`roles/pgbackrest/tasks/restore.yml`): роль `openbao` (токен
 администратора, пароли СУБД) → остановка таймеров и `thepost` → `pgbackrest restore --delta --type=time

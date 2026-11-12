@@ -6,6 +6,8 @@
 //! новая версия. Домены и источники — уровень кластера (одна версия на все организации), политики — уровень
 //! организации. Под `/api/v1/orgs/{org}/transport/...` видны и меняются только записи организации; источники
 //! кластера (общий шлюз) и полный снимок кластера — `/api/v1/transport...`, только администратор инсталляции.
+//! Принятые домены — единственный ресурс доменов организации (решение 94): у домена — политика уровня «домен»
+//! цепочки организация → домен → ящик (`…/transport/domains/{id}/policy`).
 //! Имена доменов и шаблоны приводятся к канонической форме (`normalize_domain`). Изменения узлы получают по
 //! сигналу `TransportChanged` (публикует хранилище). Правила потока почты — Admin API модуля.
 
@@ -24,6 +26,7 @@ use tp_contracts::transport::{
 use tp_contracts::{DomainId, Error, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::accounts::{Policies, PolicyBody, PolicyTarget, policies};
 use crate::server::{Admin, ApiResult, Problem};
 
 /// Префикс маршрутов уровня кластера (только администратор инсталляции, [`crate::AdminRole::permits`]).
@@ -166,6 +169,10 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         "/api/v1/orgs/{org}/transport/domains/{id}",
         put(replace_domain).delete(delete_domain),
     )
+    .route(
+        "/api/v1/orgs/{org}/transport/domains/{id}/policy",
+        get(get_domain_policy).put(put_domain_policy),
+    )
     .route("/api/v1/orgs/{org}/transport/sources", get(list_sources))
     .route(
         "/api/v1/orgs/{org}/transport/sources/{name}",
@@ -191,6 +198,8 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         create_domain,
         replace_domain,
         delete_domain,
+        get_domain_policy,
+        put_domain_policy,
         list_sources,
         put_org_source,
         delete_org_source,
@@ -324,6 +333,50 @@ async fn delete_domain(
     }
     let version = t.delete_domain(q.version, id).await?;
     Ok(Json(Written { version }))
+}
+
+/// Принятый домен организации в текущем снимке кластера; нет (или домен другой организации) — `NotFound`.
+async fn own_domain(a: &Admin, org: TenantId, id: DomainId) -> ApiResult<AcceptedDomain> {
+    let snap = store(a)?.cluster().await?;
+    Ok(snap
+        .domains
+        .into_iter()
+        .find(|d| d.id == id && d.tenant == org)
+        .ok_or(Error::NotFound)?)
+}
+
+/// Политика принятого домена и действующая политика (наложение организация → домен). Нет домена — 404.
+#[utoipa::path(get, path = "/api/v1/orgs/{org}/transport/domains/{id}/policy", tag = "transport",
+    params(("org" = String, Path, description = "Организация (UUID)"),
+        ("id" = String, Path, description = "Домен (UUID)")),
+    responses((status = 200, body = Policies), (status = 404, body = Problem), (status = 503, body = Problem)))]
+async fn get_domain_policy(
+    State(a): State<Arc<Admin>>,
+    Path((org, id)): Path<(TenantId, DomainId)>,
+) -> ApiResult<Json<Policies>> {
+    own_domain(&a, org, id).await?;
+    Ok(Json(
+        policies(&a, org, PolicyTarget::Domain(id), Some(id), None).await?,
+    ))
+}
+
+/// Задаёт политику принятого домена целиком. Нет домена — 404.
+#[utoipa::path(put, path = "/api/v1/orgs/{org}/transport/domains/{id}/policy", tag = "transport",
+    params(("org" = String, Path, description = "Организация (UUID)"),
+        ("id" = String, Path, description = "Домен (UUID)")),
+    request_body = PolicyBody,
+    responses((status = 200, body = PolicyBody), (status = 400, body = Problem), (status = 404, body = Problem),
+        (status = 503, body = Problem)))]
+async fn put_domain_policy(
+    State(a): State<Arc<Admin>>,
+    Path((org, id)): Path<(TenantId, DomainId)>,
+    Json(body): Json<PolicyBody>,
+) -> ApiResult<Json<PolicyBody>> {
+    own_domain(&a, org, id).await?;
+    a.d.policies
+        .set_policy(org, PolicyTarget::Domain(id), &body.clone().into())
+        .await?;
+    Ok(Json(body))
 }
 
 /// Доверенные источники организации и версия снимка кластера.
@@ -589,6 +642,79 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND);
         let (_, _, b) = env.call("GET", &base, Some("org"), None).await;
         assert_eq!(b, json!({"version": v3, "domains": []}));
+    }
+
+    /// Политика домена — на принятом домене (решение 94): уровень «домен» в цепочке организация → домен → ящик;
+    /// домен другой организации или удалённый — 404; прежнего ресурса `/orgs/{org}/domains` нет.
+    #[tokio::test]
+    async fn domain_policy() {
+        let env = Env::new();
+        let base = format!("{}/domains", org());
+        let body = json!({"version": 0, "name": "example.org"});
+        let (s, _, b) = env.call("POST", &base, Some("org"), Some(body)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let v1 = version(&b);
+        let id = b["domain"]["id"].as_str().expect("id").to_owned();
+        let policy = format!("{base}/{id}/policy");
+
+        let (s, _, b) = env.call("GET", &policy, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["policy"]["max_recipients"], Value::Null);
+        let limit = json!({"max_recipients": 50});
+        let (s, _, b) = env.call("PUT", &policy, Some("org"), Some(limit)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["max_recipients"], 50);
+        let org_policy = format!("/api/v1/orgs/{}/policy", TenantId::DEFAULT);
+        let up = json!({"max_recipients": 10, "send_per_hour": 100});
+        let (s, _, _) = env.call("PUT", &org_policy, Some("org"), Some(up)).await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, _, b) = env.call("GET", &policy, Some("org"), None).await;
+        assert_eq!(b["policy"]["max_recipients"], 50);
+        assert_eq!(b["policy"]["send_per_hour"], Value::Null);
+        assert_eq!(b["effective"]["max_recipients"], 50);
+        assert_eq!(b["effective"]["send_per_hour"], 100);
+        let bad = json!({"trash_retention": "14 days"});
+        let (s, _, _) = env.call("PUT", &policy, Some("org"), Some(bad)).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Оператор — только чтение; другая организация — 403; чужой домен под своей организацией — 404.
+        let (s, _, _) = env.call("GET", &policy, Some("operator"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let empty = || Some(json!({}));
+        let (s, _, _) = env.call("PUT", &policy, Some("operator"), empty()).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, _) = env.call("GET", &policy, Some("other"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let foreign = format!(
+            "/api/v1/orgs/{}/transport/domains/{id}/policy",
+            env.other_tenant
+        );
+        let (s, _, _) = env.call("GET", &foreign, Some("other"), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        let item = format!("{base}/{id}?version={v1}");
+        let (s, _, _) = env.call("DELETE", &item, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _, _) = env.call("GET", &policy, Some("org"), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _, _) = env.call("PUT", &policy, Some("org"), empty()).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let missing = format!("{base}/{}/policy", tp_contracts::DomainId::new());
+        let (s, _, _) = env.call("GET", &missing, Some("org"), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        // Прежние маршруты доменов организации удалены (ADM-33).
+        let old = format!("/api/v1/orgs/{}/domains", TenantId::DEFAULT);
+        for (method, path, body) in [
+            ("GET", old.clone(), None),
+            ("POST", old.clone(), Some(json!({"name": "a.example"}))),
+            ("GET", format!("{old}/{id}"), None),
+            ("DELETE", format!("{old}/{id}"), None),
+            ("PUT", format!("{old}/{id}/policy"), empty()),
+        ] {
+            let (s, _, _) = env.call(method, &path, Some("org"), body).await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{method} {path}");
+        }
     }
 
     /// Домены и источники другой организации не видны и не меняются.

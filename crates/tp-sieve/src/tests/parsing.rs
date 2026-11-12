@@ -112,7 +112,10 @@ if address :detail "to" "" { fileinto "inbox.empty-detail"; stop; }
 if address :user :matches "to" "*-request" { discard; }
 "#;
     for text in [flags, sub] {
-        assert!(crate::check(text).is_ok(), "{text}");
+        assert!(
+            crate::compile(text.as_bytes(), &crate::Limits::default()).is_ok(),
+            "{text}"
+        );
     }
     let script = parsed(flags);
     assert_eq!(
