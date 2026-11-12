@@ -31,7 +31,6 @@ pub mod sieve;
 mod testenv;
 pub mod transport;
 
-pub use accounts::{Domain, DomainStore};
 pub use audit::{AuditEntry, AuditPage, AuditRecord, AuditSink};
 pub use console::ConsoleConfig;
 pub use export::{

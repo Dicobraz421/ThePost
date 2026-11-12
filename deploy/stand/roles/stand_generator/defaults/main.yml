@@ -11,7 +11,8 @@ stand_smb_hostname: "{{ hostvars[stand_smb_host].thepost_hostname | default('mai
 stand_domain: "{{ hostvars[stand_smb_host].thepost_domain | default('stand.test') }}"
 
 # Учётные записи стенда: <stand_user_prefix><n>@<домен>, n = 1 … stand_users (Д.3: SMB — 1 000 ящиков), и служебные:
-# зонды (stand_probe_accounts) и ящик 10 000 писем (stand_big_mailbox) — имена до @.
+# зонды (stand_probe_accounts), ящик 10 000 писем (stand_big_mailbox) и цель перебора (stand_bruteforce_account) —
+# имена до @.
 stand_users: 1000
 stand_user_prefix: user
 stand_probe_accounts: [probe1, probe2, probe3]
@@ -58,11 +59,13 @@ stand_model:
   searches_per_day: 10
   flag_changes_per_day: 200
 
-# Сценарии (Д.6, DEP-14): множитель к номинальной нагрузке и длительность (секунды).
-#   stress — ступени stand_stress_factors по stand_stress_step с до первого нарушения Д.7;
-#   x3     — ×3, 30 мин: без рестартов узла, отказы только 4xx, принятые письма не потеряны;
-#   faults — номинальная нагрузка; kill -9 узла на 1/3 и перезапуск PostgreSQL на 2/3 длительности;
-#   long   — 72 ч, срез RSS и p95 каждые stand_long_window с.
+# Сценарии (Д.6, DEP-14, DEP-25): множитель к номинальной нагрузке и длительность (секунды).
+#   stress     — ступени stand_stress_factors по stand_stress_step с до первого нарушения Д.7;
+#   x3         — ×3, 30 мин: без рестартов узла, отказы только 4xx, принятые письма не потеряны;
+#   faults     — номинальная нагрузка; kill -9 узла на 1/3 и перезапуск PostgreSQL на 2/3 длительности;
+#   long       — 72 ч, срез RSS и p95 каждые stand_long_window с;
+#   bruteforce — номинальная нагрузка с генератора и перебор паролей со второго адреса (stand_bruteforce_source).
+# Профиль порогов узла на прогон — stand_profile (speed или thresholds, deploy/stand/thresholds.yml).
 stand_scenarios:
   base: { factor: 1, duration: 7200 }
   peak: { factor: 2, duration: 3600 }
@@ -70,6 +73,7 @@ stand_scenarios:
   x3: { factor: 3, duration: 1800 }
   faults: { factor: 1, duration: 1800 }
   long: { factor: 1, duration: 259200 }
+  bruteforce: { factor: 1, duration: 600 }
 # Короткий прогон для проверки стенда: -e stand_duration=300.
 stand_duration: ""
 stand_factor: ""
@@ -87,6 +91,13 @@ stand_sample_interval: 5
 stand_smb_samples_dir: /var/lib/thepost-stand-samples
 # Сверка после нагрузки: ожидание хвоста очереди до появления всех принятых писем, с.
 stand_tail_max: 300
+
+# Сценарий bruteforce (решение 56): второй адрес генератора (не адрес нагрузки; настроен на интерфейсе генератора,
+# например ip addr add) — с него неверные пароли IMAP учётной записи stand_bruteforce_account (заводится вместе
+# с остальными) и несуществующих имён; пороги — auth.abuse узла (ip_failures, account_failures; по умолчанию 10 и
+# 20). Блокировки живут auth.abuse.block_for (15 мин): повтор сценария — не раньше.
+stand_bruteforce_source: ""
+stand_bruteforce_account: brute
 
 # Корпус: число писем-образцов (плюс общие части для дублей MIME).
 stand_corpus_messages: 200

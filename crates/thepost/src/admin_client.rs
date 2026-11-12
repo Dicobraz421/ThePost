@@ -1464,12 +1464,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use serde_json::{Value, json};
     use tp_admin::{AdminConfig, AdminRole, Deps, InitRequest, RoleBinding};
     use tp_contracts::auth::Principal;
     use tp_contracts::ext::DecisionHooks;
-    use tp_contracts::{DomainId, Result};
     use tp_testkit::{
         Clock, FakeAuthenticator, MemAppPasswords, MemAuditLog, MemBlobIndex, MemBlobStore,
         MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemModeration,
@@ -1768,24 +1766,6 @@ mod tests {
         assert_eq!(next_link(&HeaderMap::new()), None);
     }
 
-    /// Домены организации (не транспорт): в тестах не используются.
-    struct NoDomains;
-
-    #[async_trait]
-    impl tp_admin::DomainStore for NoDomains {
-        async fn list(&self, _: TenantId) -> Result<Vec<tp_admin::Domain>> {
-            Ok(Vec::new())
-        }
-
-        async fn create(&self, _: TenantId, _: &str) -> Result<tp_admin::Domain> {
-            Err(tp_contracts::Error::UNAVAILABLE)
-        }
-
-        async fn delete(&self, _: TenantId, _: DomainId) -> Result<()> {
-            Err(tp_contracts::Error::UNAVAILABLE)
-        }
-    }
-
     /// Admin API tp-admin на хранилищах testkit на loopback: локальный вход подключён, `oidc` — токен OIDC
     /// администратора инсталляции; страница списков — 2 записи (переход по `Link` в каждом списке длиннее).
     async fn admin_api() -> (Arc<tp_admin::Admin>, Url) {
@@ -1833,7 +1813,6 @@ mod tests {
             quota: Arc::new(quota),
             policies: Arc::new(policies.clone()),
             resolver: Arc::new(policies),
-            domains: Arc::new(NoDomains),
             trash: Arc::new(trash),
             store: Arc::new(store),
             app_passwords,

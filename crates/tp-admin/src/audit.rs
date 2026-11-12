@@ -236,8 +236,8 @@ mod tests {
         let env = Env::new();
         let org = format!("/api/v1/orgs/{}", tp_contracts::TenantId::DEFAULT);
         // Два изменения в журнал: отказ оператору и создание домена администратором.
-        let domains = format!("{org}/domains");
-        let body = Some(json!({"name": "example.org"}));
+        let domains = format!("{org}/transport/domains");
+        let body = Some(json!({"version": 0, "name": "example.org"}));
         let (s, _, _) = env
             .call("POST", &domains, Some("operator"), body.clone())
             .await;
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(entries.len(), 2, "{b}");
         assert_eq!(entries[0]["status"], 403);
         assert_eq!(entries[0]["roles"], json!(["operator"]));
-        assert_eq!(entries[1]["route"], "/api/v1/orgs/{org}/domains");
+        assert_eq!(entries[1]["route"], "/api/v1/orgs/{org}/transport/domains");
         assert!(entries[0]["seq"].as_u64() < entries[1]["seq"].as_u64());
         for path in [&org, &domains] {
             let (s, _, _) = env.call("GET", path, Some("auditor"), None).await;
