@@ -10,8 +10,6 @@ manual: no
 
 Хвост волны admin-12 (CLI — ветка `x/admin-sieve-cli`), PR #440; команды автоответа — хвост волны app-25, PR #442.
 
-Требует подтверждения владельца: команды автоответа `thepost admin vacation` — отдельной волной после admin-12 (вариант Б агента), в полосе admin после CI-07? (PR #442, решение 1)
-
 ## Сделать
 - `thepost admin sieve delete <учётная запись> <имя>` — `DELETE …/sieve/scripts/{name}`.
 - Автоответ: `thepost admin vacation get|set` — `GET`/`PUT …/accounts/{account}/vacation` (`set --off` выключает).
