@@ -604,7 +604,7 @@
 | [FIX-05](FIX-05.md) | узел не стартует со вторым шардом, пока GC BLOB не учитывает все шарды | app | A | app-49 | done | — |
 | [FIX-06](FIX-06.md) | `tp-mailstore`: паника разбора метаданных письма (фаззер, цель `meta`) | mailstore | A | mailstore-13 | done | — |
 | [FIX-07](FIX-07.md) | `tp-mailstore`: паника разбиения письма на части (фаззер, цель `split`) | mailstore | A | mailstore-13 | done | — |
-| [FIX-08](FIX-08.md) | `tp-smtp`: паника разбора ответа Milter (фаззер, цель `milter`) | smtp | A | smtp-22 | done | — |
+| [FIX-08](FIX-08.md) | `tp-smtp`: паника разбора ответа Milter (фаззер, цель `milter`) | smtp | A | smtp-22 | ready | — |
 | [ADM-37](ADM-37.md) | CLI `account list --after` | admin | A | admin-25 | ready | APP-22 |
 | [ADM-38](ADM-38.md) | CLI: политики, группы, корзина, аудит, журнал доставки, транспорт | admin | A | admin-25 | ready | APP-22 |
 | [ADM-39](ADM-39.md) | CLI: `thepost admin login --oidc` | admin | A | admin-25 | ready | APP-42 |
