@@ -33,9 +33,10 @@
 //!   локального получателя (smtp-in, submission, [`Delivery::submit`]) после правил потока и до `ingest`: папки и
 //!   флаги, отброс, перенаправление, автоответ; перенаправленное письмо и внутренний автоответ — через правила
 //!   получателя с проверкой петли ([`Delivery::relay`], SMTP-34);
-//! - приём iMIP ([`Delivery::with_itip`], [`crate::itip`], SMTP-33): письмо smtp-in с частью `text/calendar;
-//!   method=…` после доставки в ящик передаётся `ItipDelivery` получателя; письмо остаётся в ящике, отказ и сбой
-//!   iTIP — только запись в журнал.
+//! - приглашения iTIP в письмах ([`Delivery::with_itip`], [`crate::itip`]): письмо с частью `text/calendar;
+//!   method=…` после доставки в ящик передаётся `ItipDelivery` получателя — smtp-in как iMIP (SMTP-33),
+//!   submission и [`Delivery::submit`] как внутреннее планирование (решение 78, SMTP-36); письмо остаётся в ящике,
+//!   отказ и сбой iTIP — только запись в журнал.
 //! - личные списки отправителей ящика ([`Delivery::with_sender_lists`], `SenderLists`, SMTP-25) — при каждой
 //!   доставке в ящик (smtp-in, submission, [`Delivery::submit`], пересылки и перенаправления): письмо
 //!   заблокированного отправителя — в «Спам», надёжного — во «Входящие» поверх карантина фильтра Milter; сверяется
@@ -71,7 +72,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
-use tp_contracts::auth::{DirChange, DirCursor, Directory, Principal};
+use tp_contracts::auth::{Authorizer, DirChange, DirCursor, Directory, Principal};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::ext::{CopyTo, Decision, DecisionHooks, SubmissionInfo};
 use tp_contracts::groups::DistributionGroup;
@@ -215,6 +216,8 @@ pub struct Delivery {
     flow: Option<FlowDeps>,
     rules: Option<Arc<dyn DeliveryRules>>,
     itip: Option<Arc<dyn ItipDelivery>>,
+    /// Права отправки от чужого адреса (Send As, Send on Behalf) для приглашений из почтового клиента (SMTP-36).
+    authz: Option<Arc<dyn Authorizer>>,
     senders: Option<Arc<dyn SenderLists>>,
     /// Политики организации (SMTP-40): профиль Milter, лимиты сеанса submission ([`Handler::policy`]).
     policies: Option<Arc<dyn PolicyResolver>>,
@@ -320,6 +323,7 @@ impl Delivery {
             flow: None,
             rules: None,
             itip: None,
+            authz: None,
             senders: None,
             policies: None,
             vacation_rate: VacationRate::new(cfg.delivery.vacation_rate),
@@ -368,35 +372,69 @@ impl Delivery {
         self
     }
 
-    /// Приём iMIP (RFC 6047, SMTP-33): письмо smtp-in с частью `text/calendar; method=…` после доставки в ящик
-    /// передаётся `itip` для каждой учётной записи получателя. Отправитель — адрес `From` письма, прошедшего DMARC,
-    /// совпадающий с `ORGANIZER` (сообщения организатора) или `ATTENDEE` (ответы участника), иначе сообщение не
-    /// применяется. Письмо в любом случае остаётся в ящике; отказ и сбой iTIP — запись в журнал.
+    /// Приглашения iTIP в письмах: письмо с частью `text/calendar; method=…` после доставки в ящик передаётся `itip`
+    /// для каждой учётной записи получателя, если `From` письма совпадает с `ORGANIZER` (сообщения организатора) или
+    /// `ATTENDEE` (ответы участника) и ему можно доверять:
+    /// - smtp-in (iMIP, RFC 6047, SMTP-33) — письмо прошло DMARC, источник `ItipSource::Imip`;
+    /// - submission и [`Delivery::submit`] (решение 78, SMTP-36) — `From` принадлежит учётной записи отправителя
+    ///   (вошедшей в сеанс submission; у [`Delivery::submit`] — по отправителю конверта): её адрес, псевдоним
+    ///   (`Account::addresses`) или право Send As / Send on Behalf ([`Delivery::with_authz`]); источник
+    ///   `ItipSource::Internal`. Иначе — только письмо.
+    ///
+    /// Письмо в любом случае остаётся в ящике; отказ и сбой iTIP — запись в журнал.
     pub fn with_itip(mut self, itip: Arc<dyn ItipDelivery>) -> Self {
         self.itip = Some(itip);
         self
     }
 
+    /// Права отправки от чужого адреса (`Authorizer::send_right`) для приглашений из почтового клиента
+    /// ([`Delivery::with_itip`], SMTP-36). Без них внутренним приглашением считается только письмо со своим адресом
+    /// или псевдонимом в `From`.
+    pub fn with_authz(mut self, authz: Arc<dyn Authorizer>) -> Self {
+        self.authz = Some(authz);
+        self
+    }
+
     /// Передаёт сообщение iTIP письма `raw` учётным записям `targets` (получатель конверта и учётная запись), кроме
-    /// получателей из `failed`. `dmarc_pass` — письмо прошло DMARC.
-    async fn imip(
+    /// получателей из `failed`; доверие к `From` — по `origin`.
+    async fn apply_itip(
         &self,
         id: &str,
         raw: &[u8],
-        dmarc_pass: bool,
+        origin: ItipOrigin<'_>,
         targets: &[(String, AccountId)],
         failed: &[dsn::Recipient],
     ) {
         let Some(delivery) = &self.itip else {
             return;
         };
-        let msg = match itip::extract(raw, dmarc_pass) {
+        let msg = match itip::extract(raw) {
             None => return,
             Some(Err(reason)) => {
                 tracing::info!(%id, reason, "smtp: сообщение iTIP не применено");
                 return;
             }
             Some(Ok(m)) => m,
+        };
+        let source = match origin {
+            ItipOrigin::Imip { dmarc_pass: true } => ItipSource::Imip,
+            ItipOrigin::Imip { dmarc_pass: false } => {
+                tracing::info!(%id, reason = "отправитель не прошёл DMARC", "smtp: сообщение iTIP не применено");
+                return;
+            }
+            ItipOrigin::Internal { account, principal } => {
+                match self.owns_from(account, principal, &msg.from).await {
+                    Ok(true) => ItipSource::Internal,
+                    Ok(false) => {
+                        tracing::info!(%id, %account, "smtp: From приглашения не принадлежит отправителю, осталось письмом");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(%id, %account, error = %e, "smtp: сбой проверки отправителя приглашения");
+                        return;
+                    }
+                }
+            }
         };
         let mut seen = HashSet::new();
         for (rcpt, account) in targets {
@@ -418,7 +456,7 @@ impl Delivery {
                 from: msg.from.clone(),
                 method: msg.method,
                 ics: msg.ics.clone(),
-                source: ItipSource::Imip,
+                source,
             };
             match delivery.deliver(&message).await {
                 Ok(ItipOutcome::Applied) => {
@@ -432,6 +470,42 @@ impl Delivery {
                 }
             }
         }
+    }
+
+    /// Адрес `from` принадлежит учётной записи `account` организации узла (решение 78): её адрес или псевдоним
+    /// (`Account::addresses`), иначе право отправки от него ([`Delivery::with_authz`]). Субъект проверки прав —
+    /// `principal` сеанса submission; без него (отправка вне сессии SMTP) — учётная запись без групп.
+    async fn owns_from(
+        &self,
+        account: AccountId,
+        principal: Option<&Principal>,
+        from: &str,
+    ) -> Result<bool> {
+        let tenant = self.deps.tenant;
+        let Some(acc) = self.deps.accounts.get(tenant, account).await? else {
+            return Ok(false);
+        };
+        if acc.addresses().iter().any(|a| a.eq_ignore_ascii_case(from)) {
+            return Ok(true);
+        }
+        let Some(authz) = &self.authz else {
+            return Ok(false);
+        };
+        let own;
+        let principal = match principal {
+            Some(p) => p,
+            None => {
+                own = Principal {
+                    tenant,
+                    account,
+                    login: acc.login,
+                    groups: BTreeSet::new(),
+                    scopes: None,
+                };
+                &own
+            }
+        };
+        Ok(authz.send_right(principal, from).await?.is_some())
     }
 
     /// Пересылка наружу: SRS-переписывание отправителя и ARC-подпись ([`crate::forward`], SMTP-23); приём
@@ -1499,16 +1573,20 @@ impl Delivery {
             .await?;
         let local = local_rcpts(&prepared.deliveries);
         let spam = junk_rcpts(&prepared.deliveries, &prepared.junk);
-        // iMIP — только проверенной входящей почте вне «Спама»: адресу `From` без DMARC доверять нельзя.
-        let imip: Vec<(String, AccountId)> = match &check {
-            Some(_) if self.itip.is_some() => prepared
-                .deliveries
-                .iter()
-                .filter(|(r, d)| !r.is_empty() && !prepared.junk.contains(&d.account))
-                .map(|(r, d)| (r.clone(), d.account))
-                .collect(),
-            _ => Vec::new(),
-        };
+        // iTIP — входящей почте с проверками отправителя (iMIP) и письму вошедшего пользователя (решение 78), вне
+        // «Спама»: адресу `From` без DMARC или без связи с отправителем доверять нельзя.
+        let origin = match (&check, sender) {
+            (Some(c), _) => Some(ItipOrigin::Imip {
+                dmarc_pass: c.dmarc_pass,
+            }),
+            (None, Some(account)) => Some(ItipOrigin::Internal {
+                account,
+                principal: env.principal.as_ref(),
+            }),
+            (None, None) => None,
+        }
+        .filter(|_| self.itip.is_some());
+        let itip_to = itip_targets(origin.is_some(), &prepared.deliveries, &prepared.junk);
         if !prepared.deliveries.is_empty() {
             let ingested = self
                 .ingest_all(
@@ -1522,9 +1600,9 @@ impl Delivery {
                 .await?;
             push_unique(&mut forward, ingested.forward);
         }
-        if !imip.is_empty() {
-            let dmarc_pass = check.as_ref().is_some_and(|c| c.dmarc_pass);
-            self.imip(&env.id, &full, dmarc_pass, &imip, &failed).await;
+        if let Some(origin) = origin.filter(|_| !itip_to.is_empty()) {
+            self.apply_itip(&env.id, &full, origin, &itip_to, &failed)
+                .await;
         }
         let external = self
             .forward(
@@ -1765,6 +1843,12 @@ impl Delivery {
             .await?;
         let local_list = local_rcpts(&prepared.deliveries);
         let spam = junk_rcpts(&prepared.deliveries, &prepared.junk);
+        // Приглашение из почтового клиента (решение 78) — от учётной записи отправителя конверта.
+        let itip_to = itip_targets(
+            sender.is_some() && self.itip.is_some(),
+            &prepared.deliveries,
+            &prepared.junk,
+        );
         if !prepared.deliveries.is_empty() {
             let local: Vec<String> = prepared.deliveries.iter().map(|(r, _)| r.clone()).collect();
             match self
@@ -1793,6 +1877,13 @@ impl Delivery {
                 }
                 Err(e) => return Err(e),
             }
+        }
+        if let Some(account) = sender.filter(|_| !itip_to.is_empty()) {
+            let origin = ItipOrigin::Internal {
+                account,
+                principal: None,
+            };
+            self.apply_itip(id, &full, origin, &itip_to, &failed).await;
         }
         let forward = self
             .forward(
@@ -2668,6 +2759,36 @@ pub(crate) async fn read_blob(blobs: &dyn BlobStore, key: &tp_contracts::BlobKey
     use futures::TryStreamExt;
     let chunks: Vec<Bytes> = blobs.get(key, None).await?.try_collect().await?;
     Ok(chunks.concat().into())
+}
+
+/// Откуда письмо с iTIP и чем подтверждается его `From` ([`Delivery::with_itip`]).
+#[derive(Debug, Clone, Copy)]
+enum ItipOrigin<'a> {
+    /// smtp-in (iMIP, SMTP-33): письмо прошло DMARC.
+    Imip { dmarc_pass: bool },
+    /// Почтовый клиент (submission, [`Delivery::submit`]; решение 78): учётная запись отправителя и субъект сеанса
+    /// submission.
+    Internal {
+        account: AccountId,
+        principal: Option<&'a Principal>,
+    },
+}
+
+/// Получатели сообщения iTIP: доставки с адресом получателя (не копии модулей) вне «Спама»; при `enabled` = ложь —
+/// никого.
+fn itip_targets(
+    enabled: bool,
+    deliveries: &[(String, MailDelivery)],
+    junk: &HashSet<AccountId>,
+) -> Vec<(String, AccountId)> {
+    if !enabled {
+        return Vec::new();
+    }
+    deliveries
+        .iter()
+        .filter(|(r, d)| !r.is_empty() && !junk.contains(&d.account))
+        .map(|(r, d)| (r.clone(), d.account))
+        .collect()
 }
 
 /// Учётная запись отправителя транзакции: аутентифицированный пользователь организации; smtp-in — внешний.

@@ -96,7 +96,7 @@ async fn forged_sender_is_ignored() {
         )
         .await;
     assert_eq!(r.code, 250);
-    // Submission не проверяется DMARC: iTIP не применяется.
+    // Submission без входа: ни DMARC, ни учётной записи отправителя — iTIP не применяется.
     let mut e = fx::envelope("192.0.2.10:1000");
     e.mode = Mode::Submission;
     assert_eq!(d.data(&e, Bytes::from(spoofed)).await.code, 250);
