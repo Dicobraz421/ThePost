@@ -391,6 +391,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             now: tp_blob::system_now(),
         }),
         audit_export: Some(audit_export),
+        card_reindex: Some(meta.clone()),
     };
     let mut setup = RoleSetup {
         cfg: &cfg,
