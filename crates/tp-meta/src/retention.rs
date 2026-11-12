@@ -127,6 +127,7 @@ struct PolicyRow {
     trash_retention_us: Option<i64>,
     retention_us: Option<i64>,
     send_per_hour: Option<i64>,
+    rcpts_per_hour: Option<i64>,
     max_recipients: Option<i64>,
     dkim_selector: Option<String>,
     milter_profile: Option<String>,
@@ -150,6 +151,7 @@ impl PolicyRow {
             trash_retention: self.trash_retention_us.map(from_micros).transpose()?,
             retention: self.retention_us.map(from_micros).transpose()?,
             send_per_hour: self.send_per_hour.map(to_u32).transpose()?,
+            rcpts_per_hour: self.rcpts_per_hour.map(to_u32).transpose()?,
             max_recipients: self.max_recipients.map(to_u32).transpose()?,
             dkim_selector: self.dkim_selector,
             milter_profile: self.milter_profile,
@@ -168,8 +170,8 @@ impl PolicyRow {
 }
 
 const POLICY_COLUMNS: &str = "level, quota_bytes, trash_retention_us, retention_us, send_per_hour, \
-                              max_recipients, dkim_selector, milter_profile, trash_purge, \
-                              trash_purge_user_can_choose";
+                              rcpts_per_hour, max_recipients, dkim_selector, milter_profile, \
+                              trash_purge, trash_purge_user_can_choose";
 
 /// Действующая политика в открытой транзакции организации: заданные уровни по порядку цепочки.
 async fn resolve_in(
@@ -239,13 +241,13 @@ impl PgMeta {
         } else {
             sqlx::query(
                 "INSERT INTO policies (tenant_id, level, object_id, quota_bytes, trash_retention_us, retention_us,
-                                       send_per_hour, max_recipients, dkim_selector, milter_profile,
+                                       send_per_hour, rcpts_per_hour, max_recipients, dkim_selector, milter_profile,
                                        trash_purge, trash_purge_user_can_choose)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  ON CONFLICT (tenant_id, level, object_id) DO UPDATE SET
                      quota_bytes = EXCLUDED.quota_bytes, trash_retention_us = EXCLUDED.trash_retention_us,
                      retention_us = EXCLUDED.retention_us, send_per_hour = EXCLUDED.send_per_hour,
-                     max_recipients = EXCLUDED.max_recipients, dkim_selector = EXCLUDED.dkim_selector,
+                     rcpts_per_hour = EXCLUDED.rcpts_per_hour, max_recipients = EXCLUDED.max_recipients, dkim_selector = EXCLUDED.dkim_selector,
                      milter_profile = EXCLUDED.milter_profile, trash_purge = EXCLUDED.trash_purge,
                      trash_purge_user_can_choose = EXCLUDED.trash_purge_user_can_choose, updated_at = now()",
             )
@@ -256,6 +258,7 @@ impl PgMeta {
             .bind(policy.trash_retention.map(micros).transpose()?)
             .bind(policy.retention.map(micros).transpose()?)
             .bind(policy.send_per_hour.map(i64::from))
+            .bind(policy.rcpts_per_hour.map(i64::from))
             .bind(policy.max_recipients.map(i64::from))
             .bind(&policy.dkim_selector)
             .bind(&policy.milter_profile)
@@ -970,6 +973,7 @@ mod tests {
             trash_retention_us: None,
             retention_us: None,
             send_per_hour: None,
+            rcpts_per_hour: None,
             max_recipients: None,
             dkim_selector: None,
             milter_profile: None,
