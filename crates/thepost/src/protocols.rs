@@ -362,7 +362,7 @@ impl RoleService for ImapRole {
             let server = server.clone();
             loops.spawn(async move { server.serve(listener).await });
         }
-        let server = tp_imap::Pop3Server::new(session());
+        let server = tp_imap::Pop3Server::new(session()).with_accounts(self.ext.accounts.clone());
         for listener in pop3 {
             let server = server.clone();
             loops.spawn(async move { server.serve(listener).await });
@@ -724,16 +724,44 @@ mod tests {
         MemEventBus, MemMailboxAudit, MemMetadata, MemQuota, MemTrash, SystemClock,
     };
 
-    /// Роль imap на хранилищах testkit с расширениями, как собирает их узел (`Services::imap_extensions`).
-    fn imap_role(bound: Bound) -> ImapRole {
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let index = MemBlobIndex::new(clock.clone());
-        let meta = MemMetadata::new(clock.clone()).with_blob_index(index.clone());
-        let bus = MemEventBus::default();
+    /// Хранилища testkit роли imap, общие с тестом: учётные записи, шина, вход.
+    struct Stand {
+        clock: Arc<dyn Clock>,
+        index: MemBlobIndex,
+        meta: MemMetadata,
+        bus: MemEventBus,
+        auth: FakeAuthenticator,
+    }
+
+    impl Stand {
+        fn new() -> Self {
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let index = MemBlobIndex::new(clock.clone());
+            let meta = MemMetadata::new(clock.clone()).with_blob_index(index.clone());
+            Self {
+                clock,
+                index,
+                meta,
+                bus: MemEventBus::default(),
+                auth: FakeAuthenticator::default(),
+            }
+        }
+    }
+
+    /// Роль imap на хранилищах `stand` с расширениями, как собирает их узел (`Services::imap_extensions`).
+    fn imap_role(stand: &Stand, bound: Bound) -> ImapRole {
+        let Stand {
+            clock,
+            index,
+            meta,
+            bus,
+            auth,
+        } = stand;
+        let (meta, bus) = (meta.clone(), bus.clone());
         let trash = MemTrash::new(&meta);
         let store = tp_mailstore::Store::new(tp_mailstore::Deps {
-            blobs: Arc::new(MemBlobStore::new(clock)),
-            index: Arc::new(index),
+            blobs: Arc::new(MemBlobStore::new(clock.clone())),
+            index: Arc::new(index.clone()),
             messages: Arc::new(meta.clone()),
             changes: Arc::new(meta.clone()),
             trash: Arc::new(trash.clone()),
@@ -741,7 +769,7 @@ mod tests {
             bus: Arc::new(bus.clone()),
             hooks: DecisionHooks::default(),
         });
-        let auth = Arc::new(FakeAuthenticator::default());
+        let auth = Arc::new(auth.clone());
         let deps = tp_imap::Deps {
             sasl: Arc::new(FakeSasl::new(auth.clone())),
             auth,
@@ -786,7 +814,7 @@ mod tests {
             ..Default::default()
         };
         let bound = Bound::default();
-        let role = imap_role(bound.clone());
+        let role = imap_role(&Stand::new(), bound.clone());
         let shutdown = CancellationToken::new();
         let ready = ReadyHandle::default();
         let ctx = RoleCtx {
@@ -822,6 +850,107 @@ mod tests {
         shutdown.cancel();
         task.await.expect("join").expect("run");
         assert!(!ready.is_ready());
+    }
+
+    /// APP-64: сигнал `AccountDisabled` потерян (обрыв потока шины), вход запрещён в хранилище — после
+    /// переподписки POP3 сверяет сеансы с `Extensions::accounts` и закрывает сеанс учётной записи.
+    #[tokio::test]
+    async fn pop3_session_closed_after_reconcile_with_account_store() {
+        use base64::Engine as _;
+        use tokio::io::AsyncWriteExt;
+        use tp_contracts::auth::Principal;
+        use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
+        use tp_contracts::{DomainId, TenantId};
+
+        const LOGIN: &str = "pop3@example.org";
+        let stand = Stand::new();
+        let upsert = |enabled| AccountUpsert {
+            domain: DomainId::new(),
+            login: LOGIN.into(),
+            display_name: "POP3".into(),
+            external_id: None,
+            enabled,
+            aliases: Vec::new(),
+            kind: AccountKind::User,
+        };
+        let tenant = TenantId::DEFAULT;
+        let account = stand
+            .meta
+            .upsert(tenant, upsert(true))
+            .await
+            .expect("account");
+        let principal = Principal {
+            tenant,
+            account: account.id,
+            login: LOGIN.into(),
+            groups: Default::default(),
+            scopes: None,
+        };
+        stand.auth.add_token("pop3-token", principal);
+
+        let mut cfg = tp_imap::ImapConfig {
+            pop3: tp_imap::config::Pop3Config {
+                enabled: true,
+                listeners: vec![EndpointConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)))],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.timeouts.resubscribe = Duration::from_millis(10);
+        let bound = Bound::default();
+        let role = imap_role(&stand, bound.clone());
+        let shutdown = CancellationToken::new();
+        let ready = ReadyHandle::default();
+        let ctx = RoleCtx {
+            config: fixed_config(cfg),
+            shutdown: shutdown.clone(),
+            drain_deadline: Duration::from_secs(1),
+            ready: ready.clone(),
+            load: fixed_load(LoadLevel::Normal),
+        };
+        let task = tokio::spawn(async move { role.run(ctx).await });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.is_ready() {
+            assert!(Instant::now() < deadline, "роль imap не готова");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let pop3 = bound.get(POP3);
+        assert_eq!(pop3.len(), 1, "{pop3:?}");
+        let stream = tokio::net::TcpStream::connect(pop3[0])
+            .await
+            .expect("connect");
+        let mut c = BufReader::new(stream);
+        async fn line(c: &mut BufReader<tokio::net::TcpStream>) -> String {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), c.read_line(&mut line))
+                .await
+                .expect("no response in time")
+                .expect("read");
+            line
+        }
+        assert!(line(&mut c).await.starts_with("+OK"));
+        // OAUTHBEARER не передаёт пароль и доступен без TLS.
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("n,a={LOGIN},\x01auth=Bearer pop3-token\x01\x01"));
+        c.get_mut()
+            .write_all(format!("AUTH OAUTHBEARER {creds}\r\n").as_bytes())
+            .await
+            .expect("write");
+        assert_eq!(line(&mut c).await, "+OK Logged in, 0 messages\r\n");
+
+        // Вход запрещён, сигнал не опубликован: поток шины оборвался — после переподписки сверка с хранилищем.
+        stand
+            .meta
+            .upsert(tenant, upsert(false))
+            .await
+            .expect("disable");
+        stand.bus.disconnect();
+        assert_eq!(line(&mut c).await, "-ERR [SYS/PERM] Account disabled\r\n");
+        assert_eq!(line(&mut c).await, "", "соединение закрыто");
+
+        shutdown.cancel();
+        task.await.expect("join").expect("run");
     }
 
     #[test]
