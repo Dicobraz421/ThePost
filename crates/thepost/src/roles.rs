@@ -62,6 +62,35 @@ impl std::fmt::Debug for OrphanProbe {
     }
 }
 
+/// Число шардов в справочнике `shards`; `None` — справочника нет (схема ещё не создана).
+pub async fn shard_count(pool: &sqlx::PgPool) -> Result<Option<i64>> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('shards') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .map_err(tp_meta::schema::db_err)?;
+    if !exists {
+        return Ok(None);
+    }
+    sqlx::query_scalar("SELECT count(*) FROM shards")
+        .fetch_one(pool)
+        .await
+        .map(Some)
+        .map_err(tp_meta::schema::db_err)
+}
+
+/// Защита от потери данных до шардированного GC BLOB (FIX-05): GC не читает справочник шардов и удалит объект,
+/// на который ссылается только другой шард. Больше одного шарда — причина отказа роли maintenance (`serve`) и
+/// `FAIL` в `doctor`; `None` — шард один. Проверку снимает FIX-04 вместе с шардированным GC.
+pub fn unsharded_gc(shards: i64) -> Option<String> {
+    (shards > 1).then(|| {
+        format!(
+            "шардов в справочнике: {shards}, а сборка мусора BLOB учитывает только ссылки этой базы и \
+             удалит объекты других шардов: второй шард требует FIX-04 (шардированный GC); роль maintenance не \
+             запускается"
+        )
+    })
+}
+
 /// Зависимости роли maintenance.
 pub struct Maintenance {
     /// Учёт объектов BLOB.
