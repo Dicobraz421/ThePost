@@ -1,14 +1,21 @@
-# Свои PEM с управляющей машины (сертификат заказчика). Замена файлов — повторный прогон; thepost перечитывает их
-# без перезапуска (tls.reload_interval).
+# Свои PEM с управляющей машины (сертификат заказчика): цепочка — в путь секции tls, ключ — новой версией секрета
+# thepost/tls#key в OpenBao (решение 100), на ВМ не копируется. Замена файлов — повторный прогон; thepost перечитывает
+# цепочку и секрет без перезапуска.
 ---
 - name: Install certificate of client protocols (files)
   ansible.builtin.copy:
-    src: "{{ item.src }}"
-    dest: "/etc/thepost/tls/{{ item.dest }}"
+    src: "{{ thepost_tls_cert_src }}"
+    dest: /etc/thepost/tls/fullchain.pem
     owner: root
     group: thepost
-    mode: "{{ item.mode }}"
-  loop:
-    - { src: "{{ thepost_tls_cert_src }}", dest: fullchain.pem, mode: "0644" }
-    - { src: "{{ thepost_tls_key_src }}", dest: privkey.pem, mode: "0640" }
-  no_log: true
+    mode: "0644"
+
+- name: Store key of client protocols in OpenBao (files)
+  ansible.builtin.include_role:
+    name: openbao
+    tasks_from: kv
+  vars:
+    openbao_kv_from: "{{ thepost_openbao_from }}"
+    openbao_kv_path: tls
+    openbao_kv_field: key
+    openbao_kv_value: "{{ lookup('ansible.builtin.file', thepost_tls_key_src) ~ '\n' }}"

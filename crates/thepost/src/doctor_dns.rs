@@ -735,7 +735,7 @@ mod tests {
         dns
     }
 
-    const SMTP: &str = "smtp:\n  hostname: mx.example.org\n  dkim:\n    domains:\n      example.org:\n        selector: s1\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n";
+    const SMTP: &str = "smtp:\n  hostname: mx.example.org\n  dkim:\n    domains:\n      example.org:\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n";
 
     async fn run(cfg: &Config, dns: &MockDns) -> Report {
         run_store(cfg, dns, None).await
@@ -777,7 +777,7 @@ mod tests {
         // Эталон `--profile smb`: домен и узел в зоне .test — проверки DNS пропущены, а не провалены.
         let cfg = config_for(
             "example.test",
-            "smtp:\n  hostname: mail.example.test\n  dkim:\n    domains:\n      example.test:\n        selector: s1\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n",
+            "smtp:\n  hostname: mail.example.test\n  dkim:\n    domains:\n      example.test:\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n",
         );
         let failing = MockDns {
             fail: Some("SERVFAIL".into()),

@@ -38,7 +38,7 @@ use crate::acme::AcmeConfig;
 use crate::load::{LOAD, LoadConfig};
 use crate::pressure::{PRESSURE, PressureConfig};
 use crate::privileges::{CONFINE, PRIVILEGES, PrivilegesConfig};
-use crate::ratelimit::RateLimitConfig;
+use crate::ratelimit::{RATELIMIT, RateLimitConfig};
 use crate::reload::ReloadConfig;
 use crate::roles::RuntimeConfig;
 use crate::secrets::SecretsConfig;
@@ -176,7 +176,7 @@ impl SectionRegistry {
         r.sections.insert("reload", def::<ReloadConfig>());
         r.sections.insert("runtime", def::<RuntimeConfig>());
         r.sections.insert("tls", def::<TlsConfig>());
-        r.sections.insert("ratelimit", def::<RateLimitConfig>());
+        r.sections.insert(RATELIMIT, def::<RateLimitConfig>());
         r.sections.insert("acme", def::<AcmeConfig>());
         r.sections.insert("secrets", def::<SecretsConfig>());
         r.sections

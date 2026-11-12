@@ -113,7 +113,12 @@ fn parse(raw: &[u8], max: usize) -> Headline {
         })
         .min()
         .unwrap_or(raw.len());
-    let env = tp_mailstore::meta::message_meta(&raw[..end]).envelope;
+    envelope_headline(&tp_mailstore::meta::message_meta(&raw[..end]).envelope, max)
+}
+
+/// Тема и отправитель из разобранного конверта письма; значения — до `max` символов. Тот же вид, что у
+/// [`headline`]: и для письма из хранилища, и для скрытого письма корзины (`TrashStore::hidden_message`).
+pub(crate) fn envelope_headline(env: &tp_contracts::meta::Envelope, max: usize) -> Headline {
     let from: Vec<String> = env
         .from
         .iter()

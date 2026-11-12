@@ -1,4 +1,5 @@
 # Сертификат от внутреннего CA (роль thepost_pki): стенд и тест; клиентам — CA {{ thepost_pki_dir }}/ca.pem.
+# Ключ — только в OpenBao (секрет thepost/tls#key, решение 100), на диск не пишется.
 ---
 - name: Issue certificate of client protocols (internal CA)
   ansible.builtin.include_role:
@@ -8,17 +9,14 @@
     thepost_pki_issue_name: client
     thepost_pki_issue_dir: "{{ thepost_pki_dir }}"
     thepost_pki_issue_names: "{{ thepost_tls_names | map('regex_replace', '^', 'DNS:') | list }}"
-    thepost_pki_issue_key_group: root
+    thepost_pki_issue_key_secret: tls
+    thepost_pki_issue_openbao_from: "{{ thepost_openbao_from }}"
 
 - name: Install certificate of client protocols
   ansible.builtin.copy:
-    src: "{{ thepost_pki_dir }}/{{ item.src }}"
-    dest: "/etc/thepost/tls/{{ item.dest }}"
+    src: "{{ thepost_pki_dir }}/client.pem"
+    dest: /etc/thepost/tls/fullchain.pem
     remote_src: true
     owner: root
     group: thepost
-    mode: "{{ item.mode }}"
-  loop:
-    - { src: client.pem, dest: fullchain.pem, mode: "0644" }
-    - { src: client.key, dest: privkey.pem, mode: "0640" }
-  no_log: true
+    mode: "0644"

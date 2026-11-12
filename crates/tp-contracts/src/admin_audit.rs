@@ -2,8 +2,12 @@
 //!
 //! Каждое изменение администратора (запрос, изменяющий данные, включая отказ в доступе) и доступ к содержимому
 //! писем — запись [`AdminAuditRecord`]. Журнал — только добавление: записи не меняются и не удаляются. Тело запроса
-//! и секреты не записываются. Запись делает Admin API (`tp-admin`), экспорт в SIEM (syslog, OTLP) — тоже он, поверх
-//! записи в журнал. Реализация — `tp-meta` (таблица `audit_log`, META-22, META-70), in-memory — `tp-testkit`.
+//! и секреты не записываются. Запись делает Admin API (`tp-admin`) — только в журнал.
+//!
+//! Выгрузка в SIEM (syslog, OTLP; решение владельца 12.11, APP-59) читает журнал ([`AuditLog::export_page`]) от
+//! отметки доставки приёмника ([`AuditLog::export_mark`]) и сдвигает её после доставки
+//! ([`AuditLog::advance_export_mark`]): недоступный приёмник догоняет пропущенное, записи не теряются. Реализация —
+//! `tp-meta` (таблицы `audit_log`, `audit_export`; META-22, META-70, APP-59), in-memory — `tp-testkit`.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -100,6 +104,31 @@ pub trait AuditLog: Send + Sync + 'static {
     /// `at` в интервале [`since`, `until`), `seq` больше `after`, не более `limit`. Неверный запрос
     /// ([`AdminAuditQuery::validate`]) — [`Error::Invalid`].
     async fn search(&self, tenant: TenantId, query: &AdminAuditQuery) -> Result<AdminAuditPage>;
+
+    /// Выгрузка в SIEM: записи всех организаций и уровня инсталляции с номером больше `after` по возрастанию
+    /// `seq`, не более `limit` (≥ 1, иначе [`Error::Invalid`]). Видимые записи — непрерывный префикс порядка
+    /// добавления: запись с меньшим номером не появляется после записи с бо́льшим, поэтому отметка «доставлено до
+    /// N» ничего не пропускает.
+    async fn export_page(&self, after: u64, limit: usize) -> Result<Vec<AdminAuditEntry>>;
+
+    /// Отметка доставки приёмника выгрузки `sink` (`syslog`, `otlp`): номер последней доставленной записи; 0 —
+    /// ничего не доставлено.
+    async fn export_mark(&self, sink: &str) -> Result<u64>;
+
+    /// Сдвигает отметку `sink` с `from` на `to` (`to` > `from`, иначе [`Error::Invalid`]), если она всё ещё
+    /// `from`; `false` — отметку уже сдвинул другой выгружающий узел, ничего не изменено.
+    async fn advance_export_mark(&self, sink: &str, from: u64, to: u64) -> Result<bool>;
+}
+
+/// Проверка аргументов [`AuditLog::advance_export_mark`] для реализаций.
+pub fn check_export_mark(sink: &str, from: u64, to: u64) -> Result<()> {
+    if sink.is_empty() {
+        return Err(Error::invalid("audit export: sink is empty"));
+    }
+    if to <= from {
+        return Err(Error::invalid("audit export: mark must move forward"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -133,6 +162,17 @@ mod tests {
             ..q
         };
         assert!(matches!(reversed.validate(), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn export_mark_moves_forward() {
+        assert_eq!(check_export_mark("syslog", 0, 1), Ok(()));
+        for (sink, from, to) in [("", 0, 1), ("syslog", 3, 3), ("syslog", 3, 2)] {
+            assert!(matches!(
+                check_export_mark(sink, from, to),
+                Err(Error::Invalid(_))
+            ));
+        }
     }
 
     #[test]

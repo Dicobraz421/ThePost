@@ -27,7 +27,7 @@ use tp_contracts::meta::{
     AccountScope, AccountStore, Flags, MailboxStore, MessageQuery, MessageStore, NewMessage,
     SpecialUse,
 };
-use tp_contracts::meta::{Policy, PolicyTarget};
+use tp_contracts::meta::{Policy, PolicyStore, PolicyTarget};
 use tp_contracts::queue::{DsnParams, OutMessage, OutRcpt, QueueStore};
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, GroupId, HeldId, QueueId, TenantId};
 use tp_meta::failover::{FailoverConfig, connect_failover};

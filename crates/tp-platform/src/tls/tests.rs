@@ -302,7 +302,7 @@ fn key_ref() -> SecretRef {
 }
 
 /// Сертификат сервера, который слушатель с неявным TLS на `certs` отдаёт клиенту.
-async fn listener_cert(certs: &Arc<TlsCerts>) -> CertificateDer<'static> {
+pub(crate) async fn listener_cert(certs: &Arc<TlsCerts>) -> CertificateDer<'static> {
     use crate::listen::{EndpointConfig, Listener};
     let mut endpoint = EndpointConfig::new("127.0.0.1:0".parse().expect("addr"));
     endpoint.implicit_tls = true;

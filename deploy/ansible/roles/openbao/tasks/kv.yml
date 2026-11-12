@@ -1,0 +1,38 @@
+# Поле секрета KV thepost (ключ TLS слушателей узла, решение 100): чтение и, если задан openbao_kv_value и значение
+# другое, запись новой версии (значение — через stdin, не аргументом). Команды bao выполняет узел OpenBao
+# openbao_kv_from (его openbao_cli_env с токеном администратора — после configure.yml):
+#   include_role: { name: openbao, tasks_from: kv }
+#   с openbao_kv_from, openbao_kv_path (путь в KV thepost), openbao_kv_field и (для записи) openbao_kv_value.
+# Результат — openbao_kv_read (rc 0 — поле есть, stdout — значение) и openbao_kv_written.
+---
+- name: Read secret thepost/{{ openbao_kv_path }}
+  ansible.builtin.command:
+    argv: [bao, kv, get, -mount=thepost, "-field={{ openbao_kv_field }}", "{{ openbao_kv_path }}"]
+  environment: "{{ hostvars[openbao_kv_from].openbao_cli_env }}"
+  delegate_to: "{{ openbao_kv_from }}"
+  register: openbao_kv_read
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+
+# put — пути ещё нет; patch — другие поля пути (если есть) сохраняются.
+- name: Write secret thepost/{{ openbao_kv_path }}
+  ansible.builtin.command:
+    argv:
+      - bao
+      - kv
+      - "{{ 'patch' if openbao_kv_read.rc == 0 else 'put' }}"
+      - -mount=thepost
+      - "{{ openbao_kv_path }}"
+      - "{{ openbao_kv_field }}=-"
+    stdin: "{{ openbao_kv_value }}"
+    stdin_add_newline: false
+  environment: "{{ hostvars[openbao_kv_from].openbao_cli_env }}"
+  delegate_to: "{{ openbao_kv_from }}"
+  register: openbao_kv_written
+  when: >-
+    openbao_kv_value is defined
+    and (openbao_kv_read.rc != 0 or (openbao_kv_read.stdout | trim) != (openbao_kv_value | trim))
+  changed_when: true
+  no_log: true

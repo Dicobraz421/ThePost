@@ -7,7 +7,8 @@
 1. `docker compose -f deploy/compose/dev.yml --profile smb up -d --build` — `tls-init`, `openbao-init-tls`,
    `postgres-role-tls` завершаются с кодом 0, `thepost` работает (`docker compose … ps`).
 2. `docker compose -f deploy/compose/dev.yml --profile smb logs thepost` — нет `слушатели роли не заданы`;
-   нет ошибок чтения `/etc/thepost/tls/fullchain.pem`, `privkey.pem` и `/etc/ssl/certs`.
+   нет ошибок чтения `/etc/thepost/tls/fullchain.pem`, секрета `thepost/tls#key` (ключ TLS — только в OpenBao) и
+   `/etc/ssl/certs`.
 3. `docker compose -f deploy/compose/dev.yml --profile smb run --rm --no-deps thepost doctor` — `tls.certificate`,
    `tls.names` (`mail.example.test`), `database.*`, `blob.*` — `OK`. Известные `FAIL` на 2026-11-10: `dns.mx`
    (у `example.test` нет MX — ожидаемо для тестового домена) и `database.node_role` (нет роли `thepost_app` — META-17).
@@ -37,4 +38,5 @@
 
 ## Повторный запуск
 1. `docker compose … --profile smb down` и снова `up -d` — сертификаты не перевыпускаются (`tls: сертификаты уже есть`),
-   `privkey.pem` — владелец 65532, `0600`; узел поднимается так же.
+   `openbao-init-tls` ключ TLS не перезаписывает (нет строки `записан ключ TLS`), в томе `tls` нет `privkey.pem`;
+   узел поднимается так же.
