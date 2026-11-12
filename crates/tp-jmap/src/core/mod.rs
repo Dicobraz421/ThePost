@@ -22,6 +22,7 @@ use tp_contracts::meta::{
 };
 use tp_contracts::queue::Outbound;
 use tp_contracts::retention::TrashStore;
+use tp_contracts::schedule::FreeBusy;
 use tp_contracts::search::SearchIndex;
 use tp_contracts::sieve::SieveStore;
 use tp_contracts::transport::MailFlow;
@@ -59,11 +60,26 @@ pub const SIEVE: &str = "urn:ietf:params:jmap:sieve";
 pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
 /// Capability календарей (draft-ietf-jmap-calendars); доступна при подключённом [`Jmap::with_dav`].
 pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
+/// Capability участников организации (RFC 9670); доступна при подключённом [`Jmap::with_dav`].
+pub const PRINCIPALS: &str = "urn:ietf:params:jmap:principals";
+/// Capability владельца учётной записи (RFC 9670 §1.5.2); объявляется вместе с [`PRINCIPALS`].
+pub const PRINCIPALS_OWNER: &str = "urn:ietf:params:jmap:principals:owner";
+/// Capability занятости участников (draft-ietf-jmap-calendars); доступна при подключённом
+/// [`Jmap::with_freebusy`].
+pub const AVAILABILITY: &str = "urn:ietf:params:jmap:principals:availability";
 
 /// Встроенные capability.
 const BUILTIN: [&str; 5] = [CORE, MAIL, SUBMISSION, WEBSOCKET, SETTINGS];
 /// Встроенные capability, доступные при подключённом хранилище (URI заняты всегда).
-const OPTIONAL: [&str; 4] = [VACATION, SIEVE, CONTACTS, CALENDARS];
+const OPTIONAL: [&str; 7] = [
+    VACATION,
+    SIEVE,
+    CONTACTS,
+    CALENDARS,
+    PRINCIPALS,
+    PRINCIPALS_OWNER,
+    AVAILABILITY,
+];
 
 /// Зависимости сервера JMAP: реализации контрактов, выбранные приложением.
 #[derive(Clone)]
@@ -136,6 +152,8 @@ pub struct Jmap {
     pub(crate) sieve: Option<Arc<dyn SieveStore>>,
     /// Календари и контакты; `None` — capability `contacts` и `calendars` не объявляются.
     pub(crate) dav: Option<Arc<dyn DavStore>>,
+    /// Занятость учётных записей; `None` — capability `principals:availability` не объявляется.
+    pub(crate) freebusy: Option<Arc<dyn FreeBusy>>,
     stop: watch::Sender<bool>,
 }
 
@@ -250,6 +268,7 @@ impl Jmap {
             profile_signer: None,
             sieve: None,
             dav: None,
+            freebusy: None,
             stop: watch::channel(false).0,
         })
     }
@@ -295,6 +314,15 @@ impl Jmap {
         self.sieve.as_ref().ok_or(MethodError::new("unknownMethod"))
     }
 
+    /// Подключает занятость учётных записей (CONTRACTS.md#Schedule): capability
+    /// `urn:ietf:params:jmap:principals:availability` (JMAP-30; вместе с [`Jmap::with_dav`]). `None` — capability
+    /// не объявляется.
+    #[must_use]
+    pub fn with_freebusy(mut self, freebusy: Option<Arc<dyn FreeBusy>>) -> Self {
+        self.freebusy = freebusy;
+        self
+    }
+
     /// Хранилище DAV для метода; не подключено — `unknownMethod`.
     pub(crate) fn dav_store(&self) -> MethodResult<&Arc<dyn DavStore>> {
         self.dav.as_ref().ok_or(MethodError::new("unknownMethod"))
@@ -304,7 +332,8 @@ impl Jmap {
     fn optional_enabled(&self, uri: &str) -> bool {
         match uri {
             VACATION | SIEVE => self.sieve.is_some(),
-            CONTACTS | CALENDARS => self.dav.is_some(),
+            CONTACTS | CALENDARS | PRINCIPALS | PRINCIPALS_OWNER => self.dav.is_some(),
+            AVAILABILITY => self.dav.is_some() && self.freebusy.is_some(),
             _ => false,
         }
     }
@@ -403,6 +432,25 @@ impl Jmap {
                 crate::calendars::account_capability(&self.cfg.calendars),
             );
             primary.insert(CALENDARS.into(), json!(account));
+            caps.insert(PRINCIPALS.into(), json!({}));
+            account_caps.insert(
+                PRINCIPALS.into(),
+                crate::principal::account_capability(&account),
+            );
+            primary.insert(PRINCIPALS.into(), json!(account));
+            caps.insert(PRINCIPALS_OWNER.into(), json!({}));
+            account_caps.insert(
+                PRINCIPALS_OWNER.into(),
+                crate::principal::owner_capability(&account),
+            );
+            if self.freebusy.is_some() {
+                caps.insert(AVAILABILITY.into(), json!({}));
+                account_caps.insert(
+                    AVAILABILITY.into(),
+                    crate::principal::availability_capability(self),
+                );
+                primary.insert(AVAILABILITY.into(), json!(account));
+            }
         }
         for cap in &self.d.capabilities {
             caps.insert(cap.uri().into(), cap.session_object());
