@@ -10,6 +10,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Веб-консоль (console/dist) вшивается в бинарный файл; без фичи — страница «консоль не собрана».
+console = ["dep:rust-embed"]
+
 [dependencies]
 tp-contracts.workspace = true
 tp-mailstore.workspace = true
@@ -25,6 +29,7 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
+rust-embed = { workspace = true, optional = true }
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
