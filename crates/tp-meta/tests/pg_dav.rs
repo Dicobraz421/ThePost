@@ -538,7 +538,7 @@ END:VCARD
     // Записанная после миграции карточка не пересчитывается, тело без строк — без строк.
     assert_eq!(meta.reindex_cards(fn_index).await.expect("reindex"), 1);
     assert_eq!(found("петров").await, ["old.vcf"]);
-    assert_eq!(found("иванов").await, ["new.vcf", "old.vcf"]);
+    assert_eq!(found("иван").await, ["new.vcf", "old.vcf"]);
     assert_eq!(
         meta.state(scope, CollectionKind::AddressBook)
             .await
