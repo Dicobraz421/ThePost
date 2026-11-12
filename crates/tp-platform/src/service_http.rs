@@ -348,7 +348,7 @@ mod tests {
 
     use super::*;
     use crate::telemetry::BusSample;
-    use crate::tls::tests::{CERT_A, KEY_A, TempDir, connector, write_pair};
+    use crate::tls::tests::{CERT_A, KEY_A, Pair, TempDir, connector};
 
     fn local() -> ServiceHttpConfig {
         ServiceHttpConfig {
@@ -428,11 +428,8 @@ mod tests {
     #[tokio::test]
     async fn https_endpoints_with_bus_metrics() {
         let dir = TempDir::new("service-https");
-        let certs = Arc::new(
-            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
-                .await
-                .expect("certs"),
-        );
+        let pair = Pair::new(&dir.0, CERT_A, KEY_A);
+        let certs = Arc::new(pair.load().await);
         let health = Health::default();
         let metrics = Metrics::default();
         let hits = Counter::<u64>::default();

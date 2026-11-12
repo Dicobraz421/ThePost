@@ -23,7 +23,7 @@
   'blob': {'url': 'file:///var/lib/thepost/blob'},
   'tls': {
     'cert_file': tls_dir ~ '/fullchain.pem',
-    'key_file': tls_dir ~ '/privkey.pem',
+    'key': {'secret': 'thepost/tls#key'},
   },
   'http': {
     'jmap': {'listen': thepost_listen_address ~ ':443'},

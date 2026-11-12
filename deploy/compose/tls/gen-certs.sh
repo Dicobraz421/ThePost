@@ -40,13 +40,12 @@ chmod 0644 ca.pem server.pem
 chmod 0600 server.key ca.key
 if [ "$(id -u)" = 0 ]; then chown 999:999 server.key; fi
 
-# Сертификат и ключ thepost под путями секции tls (fullchain.pem, privkey.pem): ключ — владельцу nonroot 65532
-# (образ distroless), server.key остаётся у 999. Копируются при каждом запуске — вслед за перевыпуском.
+# Цепочка thepost под путём секции tls (fullchain.pem) — при каждом запуске, вслед за перевыпуском. Ключ thepost —
+# только в OpenBao (секрет thepost/tls#key, его пишет openbao/init.sh из server.key; решение 100): файла ключа для
+# узла нет, прежний privkey.pem удаляется.
 cp server.pem fullchain.pem
-cp server.key privkey.pem
 chmod 0644 fullchain.pem
-chmod 0600 privkey.pem
-if [ "$(id -u)" = 0 ]; then chown 65532:65532 privkey.pem; fi
+rm -f privkey.pem
 
 # Копия CA для клиентов на хосте (sslrootcert, --cacert).
 if [ -n "$OUT" ]; then cp ca.pem "$OUT/ca.pem" && chmod 0644 "$OUT/ca.pem"; fi
