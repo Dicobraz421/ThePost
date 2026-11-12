@@ -29,6 +29,9 @@ use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 use crate::sieve::ScriptError;
 
+/// Издатель токенов OIDC тестов (`Deps::oidc_issuer`).
+pub const ISSUER: &str = "https://idp.example.org/realms/mail";
+
 /// Журнал аудита в памяти — [`MemAuditLog`] tp-testkit; [`MemAudit::records`] — записи для проверок.
 #[derive(Debug, Clone, Default)]
 pub struct MemAudit(pub MemAuditLog);
@@ -127,6 +130,7 @@ impl Stores {
             senders: Arc::new(self.senders.clone()),
             mailbox_audit: Arc::new(self.mailbox_audit.clone()),
             sync: Arc::new(self.sync_gate.clone()),
+            oidc_issuer: Some(ISSUER.to_owned()),
         }
     }
 }

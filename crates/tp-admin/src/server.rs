@@ -51,7 +51,7 @@ use crate::audit::AUDIT_ROUTE;
 use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
-use crate::init::{InitConfig, Local};
+use crate::init::{InitConfig, Local, OidcClient};
 
 /// Начало префикса маршрутов модуля.
 pub const MODULE_PREFIX: &str = "/api/v1/modules/";
@@ -183,6 +183,8 @@ pub struct AdminConfig {
     pub init: InitConfig,
     /// Веб-консоль администратора ([`crate::console`]); по умолчанию раздаётся.
     pub console: ConsoleConfig,
+    /// Клиент консоли у поставщика OIDC `auth.oidc` (`GET /api/v1/session`); по умолчанию не настроен.
+    pub oidc: Option<OidcClient>,
 }
 
 impl Default for AdminConfig {
@@ -201,6 +203,7 @@ impl Default for AdminConfig {
             audit: AuditExportConfig::default(),
             init: InitConfig::default(),
             console: ConsoleConfig::default(),
+            oidc: None,
         }
     }
 }
@@ -234,6 +237,9 @@ impl AdminConfig {
         self.audit.check()?;
         self.init.check()?;
         self.console.check()?;
+        if let Some(o) = &self.oidc {
+            o.check()?;
+        }
         if self.subject_max_chars == 0 || self.header_scan_bytes == 0 || self.content_page_size == 0
         {
             return Err(Error::invalid(
@@ -335,6 +341,9 @@ pub struct Deps {
     pub mailbox_audit: Arc<dyn MailboxAudit>,
     /// Остановка синхронизации каталога сверх порога удаления.
     pub sync: Arc<dyn SyncGate>,
+    /// Издатель токенов OIDC, которые проверяет [`Deps::auth`] (`auth.oidc.issuer`); `None` — OIDC не настроен.
+    /// Отдаётся консоли в `GET /api/v1/session` вместе с клиентом `admin.oidc`.
+    pub oidc_issuer: Option<String>,
 }
 
 impl fmt::Debug for Deps {
@@ -380,6 +389,11 @@ impl Admin {
     /// повтор префикса — `Conflict`.
     pub fn new(d: Deps, cfg: AdminConfig) -> Result<Self> {
         cfg.check()?;
+        if cfg.oidc.is_some() && d.oidc_issuer.is_none() {
+            return Err(Error::invalid(
+                "admin.oidc: вход в консоль через OIDC без auth.oidc — поставщик не настроен",
+            ));
+        }
         let mut seen = BTreeSet::new();
         for m in &d.modules {
             let p = m.prefix();
@@ -444,8 +458,8 @@ impl Admin {
                 .route(&format!("{prefix}/{{*rest}}"), any(handler));
         }
         let api = api.route_layer(middleware::from_fn_with_state(self.clone(), guard));
-        let api = crate::console::routes(api, &self.cfg.console, crate::console::embedded());
-        crate::init::routes(api)
+        let api = crate::cors::layer(crate::init::routes(api), &self.cfg.console.cors_origins);
+        crate::console::routes(api, &self.cfg.console, crate::console::embedded())
             .route("/api/openapi.json", get(openapi))
             .layer(DefaultBodyLimit::max(self.cfg.max_body_size))
             .with_state(self)
@@ -914,6 +928,23 @@ mod tests {
         assert_eq!(s, StatusCode::FORBIDDEN);
         let (s, _, _) = env.call("GET", "/api/v1/whoami", Some("wide"), None).await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    /// Каждая операция схемы — с `operationId`, без повторов (по нему консоль и CLI называют операции).
+    #[test]
+    fn operation_ids_unique() {
+        let spec = serde_json::to_value(openapi_spec()).expect("spec");
+        let mut seen = std::collections::BTreeMap::new();
+        let mut dups = Vec::new();
+        for (path, item) in spec["paths"].as_object().expect("paths") {
+            for (method, op) in item.as_object().expect("item") {
+                let id = op["operationId"].as_str().expect("operationId").to_owned();
+                if let Some(prev) = seen.insert(id.clone(), format!("{method} {path}")) {
+                    dups.push(format!("{id}: {prev} и {method} {path}"));
+                }
+            }
+        }
+        assert!(dups.is_empty(), "{dups:#?}");
     }
 
     #[tokio::test]
