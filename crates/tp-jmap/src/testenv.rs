@@ -22,9 +22,10 @@ use tp_contracts::sieve::SieveStore;
 use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_testkit::{
-    Clock, FakeAuthenticator, FakeSearch, MemBlobIndex, MemBlobStore, MemDav, MemDeliveryLog,
-    MemEventBus, MemItipSender, MemMetadata, MemOutbound, MemPolicies, MemQuota, MemSieve,
-    MemSubmissions, MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
+    Clock, FakeAuthenticator, FakeSearch, MemAddressBook, MemBlobIndex, MemBlobStore, MemDav,
+    MemDeliveryLog, MemEventBus, MemItipSender, MemMetadata, MemOutbound, MemPolicies, MemQuota,
+    MemSenderLists, MemSieve, MemSubmissions, MemTrash, RecordingDecisionHook, SearchDoc,
+    SystemClock,
 };
 
 use crate::{Deps, Jmap, JmapConfig};
@@ -132,6 +133,8 @@ pub struct Env {
     pub outbound: Arc<MemOutbound>,
     pub submissions: MemSubmissions,
     pub delivery_log: MemDeliveryLog,
+    pub sender_lists: MemSenderLists,
+    pub org: MemAddressBook,
     pub bus: MemEventBus,
     /// Корзина (`purge`); настройка `trash.purge` — из `policies`.
     pub trash: MemTrash,
@@ -242,6 +245,8 @@ impl Env {
         let outbound = Arc::new(MemOutbound::default());
         let submissions = MemSubmissions::new();
         let delivery_log = MemDeliveryLog::new();
+        let sender_lists = MemSenderLists::new();
+        let org = MemAddressBook::new();
         let unpacking = Unpacking {
             inner: blobs,
             index: index.clone(),
@@ -291,7 +296,15 @@ impl Env {
         .with_freebusy(
             stores.then(|| Arc::new(dav.clone()) as Arc<dyn tp_contracts::schedule::FreeBusy>),
         )
-        .with_schedule(schedule.then_some(schedule_deps));
+        .with_schedule(schedule.then_some(schedule_deps))
+        .with_sender_lists(
+            stores.then(|| {
+                Arc::new(sender_lists.clone()) as Arc<dyn tp_contracts::senders::SenderLists>
+            }),
+        )
+        .with_org(
+            stores.then(|| Arc::new(org.clone()) as Arc<dyn tp_contracts::addressbook::OrgStore>),
+        );
         Self {
             meta,
             search,
@@ -303,6 +316,8 @@ impl Env {
             outbound,
             submissions,
             delivery_log,
+            sender_lists,
+            org,
             bus,
             trash,
             policies,

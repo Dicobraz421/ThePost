@@ -28,6 +28,10 @@
 //!   (`tp_dav::itip`, [`Jmap::with_schedule`]), ParticipantIdentity/get, CalendarEventNotification/get, changes, set
 //!   по входящим планирования;
 //! - `sieve` — SieveScript/get, set, query, validate (RFC 9661) поверх `SieveStore` и проверки `tp_sieve`;
+//! - `sender_lists` — SenderList/get, set: личные списки надёжных и заблокированных отправителей, capability
+//!   `urn:thepost:senderlists`, [`Jmap::with_sender_lists`];
+//! - `orgchart` — OrgUnit/get: дерево подразделений с членами по старшинству, capability `urn:thepost:orgchart`,
+//!   [`Jmap::with_org`];
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
 //! Протокол — JSON поверх HTTP: типы запросов и ответов — `serde_json`, HTTP — `axum`.
@@ -46,9 +50,11 @@ mod email_set;
 #[doc(hidden)]
 pub mod fuzz;
 mod mailbox;
+mod orgchart;
 mod principal;
 mod push;
 mod scheduling;
+mod sender_lists;
 mod settings;
 mod sieve;
 pub mod submission;
@@ -63,8 +69,8 @@ pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
 
 use crate::core::error::MethodResult;
 use crate::core::{
-    AVAILABILITY, CALENDARS, CONTACTS, CORE, Ctx, MAIL, PRINCIPALS, SETTINGS, SIEVE, SUBMISSION,
-    VACATION,
+    AVAILABILITY, CALENDARS, CONTACTS, CORE, Ctx, MAIL, ORG_CHART, PRINCIPALS, SENDER_LISTS,
+    SETTINGS, SIEVE, SUBMISSION, VACATION,
 };
 
 /// Встроенные методы и их capability.
@@ -95,6 +101,9 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("EmailSubmission/queryChanges", SUBMISSION),
     ("UserSettings/get", SETTINGS),
     ("UserSettings/set", SETTINGS),
+    ("SenderList/get", SENDER_LISTS),
+    ("SenderList/set", SENDER_LISTS),
+    ("OrgUnit/get", ORG_CHART),
     ("VacationResponse/get", VACATION),
     ("VacationResponse/set", VACATION),
     ("SieveScript/get", SIEVE),
@@ -164,6 +173,9 @@ pub(crate) async fn call_builtin(
         "EmailSubmission/queryChanges" => submission::submission_query_changes(ctx, args).await,
         "UserSettings/get" => settings::get(ctx, args).await,
         "UserSettings/set" => settings::set(ctx, args).await,
+        "SenderList/get" => sender_lists::get(ctx, args).await,
+        "SenderList/set" => sender_lists::set(ctx, args).await,
+        "OrgUnit/get" => orgchart::get(ctx, args).await,
         "VacationResponse/get" => vacation::get(ctx, args).await,
         "VacationResponse/set" => vacation::set(ctx, args).await,
         "SieveScript/get" => sieve::get(ctx, args).await,
