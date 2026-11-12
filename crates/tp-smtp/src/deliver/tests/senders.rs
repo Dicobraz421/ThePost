@@ -87,6 +87,7 @@ async fn safe_sender_overrides_filter_verdict() {
     d.deps.milter = Some(Arc::new(Milters::new(
         MilterConfig {
             filters: vec![filter.filter("rspamd")],
+            ..MilterConfig::default()
         },
         "mx.example.org",
     )));

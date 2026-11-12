@@ -1,10 +1,13 @@
 //! Milter-клиент (SRS 4.1): антиспам и антивирус по протоколу Milter v6 (Rspamd, clamav-milter и др.).
 //!
-//! [`Milters`] — фильтры секции `smtp.milter` двух профилей (SMTP-27): приём (smtp-in) и исходящая почта
+//! [`Milters`] — фильтры секции `smtp.milter` двух направлений (SMTP-27): приём (smtp-in) и исходящая почта
 //! (submission и отправка вне сессии SMTP — JMAP EmailSubmission; в частности, внешние системы DLP). Письмо
-//! проходит фильтры своего профиля по порядку после приёма (`DATA`/`BDAT`, вызов отправки), до доставки и
-//! постановки в очередь. У письма JMAP соединения клиента нет: фильтру передаются имя узла и семейство адреса
-//! «неизвестно» (`SMFIA_UNKNOWN`). Каждому фильтру — отдельное соединение: согласование
+//! проходит фильтры своего направления по порядку после приёма (`DATA`/`BDAT`, вызов отправки), до доставки и
+//! постановки в очередь. Набор фильтров письма сужает профиль `smtp.milter.profiles`, выбранный политикой
+//! организации (`Policy::milter_profile`, SMTP-40); профиль не задан — все фильтры направления, профиля нет в
+//! конфигурации — тоже все (предупреждение в журнал: фильтрация не пропускается). У письма JMAP соединения
+//! клиента нет: фильтру передаются имя узла и семейство адреса «неизвестно» (`SMFIA_UNKNOWN`). Каждому фильтру —
+//! отдельное соединение: согласование
 //! (`O`), макросы (`D`), `C`, `H`, `M`, `R`, `T`, заголовки (`L`), `N`, тело (`B`), `E`, `Q`; шаги, от
 //! которых фильтр отказался при согласовании (`SMFIP_NO*`, `SMFIP_NR_*`), не отправляются или идут без ответа.
 //!
@@ -14,7 +17,7 @@
 //! - `discard` — письмо принято (`250`) и никому не доставляется;
 //! - добавление, вставка и изменение заголовков (`h`, `i`, `m`) — применяются к письму, следующий фильтр
 //!   видит изменённое письмо;
-//! - `quarantine` — профиль приёма доставляет письмо в «Спам», профиль исходящей почты отклоняет (`550 5.7.1`):
+//! - `quarantine` — направление приёма доставляет письмо в «Спам», направление исходящей почты отклоняет (`550 5.7.1`):
 //!   исходящее письмо в карантине наружу не уходит.
 //!
 //! Отказ фильтра на шаге до конца тела (`MAIL`, `RCPT`, заголовки) отклоняет всё письмо: проверка идёт после
@@ -24,7 +27,7 @@
 //! Таймауты — `connect_timeout`, `command_timeout` (ответ на команду), `end_timeout` (ответ на конец тела;
 //! `progress` фильтра продлевает ожидание). Недоступность фильтра (соединение, таймаут, нарушение протокола) —
 //! по `on_failure` фильтра: `accept` — письмо идёт дальше с заголовком `X-ThePost-Milter: <имя>; unavailable`,
-//! `tempfail` — `451 4.7.1`. Не задано — по профилю: приём — `accept`, исходящая почта — `tempfail`.
+//! `tempfail` — `451 4.7.1`. Не задано — по направлению: приём — `accept`, исходящая почта — `tempfail`.
 //!
 //! Готовый крейт клиента (`miltr-client`, MIT) не подошёл: не разбирает ответ `accept` (`SMFIR_ACCEPT`),
 //! не умеет отправлять макросы и по описанию автора — тестовый клиент; поэтому здесь минимальная реализация
@@ -39,7 +42,7 @@ use tokio::net::TcpStream;
 
 use std::net::SocketAddr;
 
-use crate::config::{MilterConfig, MilterFilter, MilterOnFailure, MilterProfile};
+use crate::config::{MilterConfig, MilterDirection, MilterFilter, MilterOnFailure};
 use crate::server::{Envelope, Mode, Reply, reply};
 
 pub mod proto;
@@ -74,8 +77,8 @@ pub struct Outcome {
 /// Письмо для проверки фильтрами.
 #[derive(Debug, Clone, Copy)]
 pub struct Mail<'a> {
-    /// Профиль: чьи фильтры проверяют письмо.
-    pub profile: MilterProfile,
+    /// Направление: чьи фильтры проверяют письмо.
+    pub direction: MilterDirection,
     /// Идентификатор транзакции (макрос `i`, журнал).
     pub id: &'a str,
     /// Клиент SMTP: адрес и имя из `EHLO`; `None` — письмо отправлено не по SMTP (JMAP).
@@ -89,12 +92,12 @@ pub struct Mail<'a> {
 }
 
 impl<'a> Mail<'a> {
-    /// Письмо транзакции SMTP: smtp-in — профиль приёма, submission — профиль исходящей почты.
+    /// Письмо транзакции SMTP: smtp-in — направление приёма, submission — направление исходящей почты.
     pub fn of(env: &'a Envelope) -> Self {
         Self {
-            profile: match env.mode {
-                Mode::Inbound => MilterProfile::Inbound,
-                Mode::Submission => MilterProfile::Outbound,
+            direction: match env.mode {
+                Mode::Inbound => MilterDirection::Inbound,
+                Mode::Submission => MilterDirection::Outbound,
             },
             id: &env.id,
             client: Some((env.conn.client, &env.helo)),
@@ -105,7 +108,7 @@ impl<'a> Mail<'a> {
     }
 }
 
-/// Фильтры Milter обоих профилей.
+/// Фильтры Milter обоих направлений.
 #[derive(Clone)]
 pub struct Milters {
     cfg: MilterConfig,
@@ -150,20 +153,47 @@ enum Filtered {
 impl Milters {
     /// Фильтры секции `smtp.milter`; `hostname` — макрос `j`.
     pub fn new(cfg: MilterConfig, hostname: impl Into<String>) -> Self {
+        for (profile, names) in &cfg.profiles {
+            for name in names {
+                if !cfg.filters.iter().any(|f| &f.name == name) {
+                    tracing::warn!(%profile, filter = %name, "milter: фильтра профиля нет в smtp.milter.filters");
+                }
+            }
+        }
         Self {
             cfg,
             hostname: hostname.into(),
         }
     }
 
-    /// В профиле `profile` есть фильтры.
-    pub fn applies(&self, profile: MilterProfile) -> bool {
-        self.cfg.filters.iter().any(|f| f.profile == profile)
+    /// У направления `direction` есть фильтры.
+    pub fn applies(&self, direction: MilterDirection) -> bool {
+        self.cfg.filters.iter().any(|f| f.direction == direction)
     }
 
-    /// Проверяет письмо `raw` фильтрами профиля `env.profile` по порядку.
-    pub async fn check(&self, env: &Mail<'_>, raw: Bytes) -> Outcome {
-        self.check_with(env, raw, |f| {
+    /// Фильтры направления `direction` профиля `profile` по порядку `filters`.
+    fn selected<'a>(
+        &'a self,
+        direction: MilterDirection,
+        profile: Option<&str>,
+    ) -> impl Iterator<Item = &'a MilterFilter> + 'a {
+        let names = profile.and_then(|p| {
+            let names = self.cfg.profiles.get(p);
+            if names.is_none() {
+                tracing::warn!(profile = %p, "milter: профиля политики нет в smtp.milter.profiles, все фильтры");
+            }
+            names
+        });
+        self.cfg
+            .filters
+            .iter()
+            .filter(move |f| f.direction == direction && names.is_none_or(|n| n.contains(&f.name)))
+    }
+
+    /// Проверяет письмо `raw` фильтрами направления `env.direction` из профиля `profile` (`None` — все) по
+    /// порядку.
+    pub async fn check(&self, env: &Mail<'_>, raw: Bytes, profile: Option<&str>) -> Outcome {
+        self.check_with(env, raw, profile, |f| {
             let address = f.address.clone();
             let timeout = f.connect_timeout;
             async move {
@@ -181,6 +211,7 @@ impl Milters {
         &self,
         env: &Mail<'_>,
         raw: Bytes,
+        profile: Option<&str>,
         connect: F,
     ) -> Outcome
     where
@@ -193,7 +224,7 @@ impl Milters {
             message: raw,
             quarantine: None,
         };
-        for f in self.cfg.filters.iter().filter(|f| f.profile == env.profile) {
+        for f in self.selected(env.direction, profile) {
             let mut mods = Vec::new();
             let res = match connect(f).await {
                 Ok(stream) => {
@@ -605,7 +636,19 @@ fn apply(raw: &[u8], mods: &[HeaderMod]) -> Bytes {
     let field = |name: &str, value: &str| {
         // Значение от фильтра: `\n` свёртки — в `\r\n`, без управляющих символов вне свёртки.
         let value = value.replace("\r\n", "\n").replace('\r', "");
-        let value = value.replace('\n', "\r\n");
+        // Строка после `\n` без пробела в начале стала бы новым заголовком — дополняется пробелом (FIX-08).
+        let value = value
+            .split('\n')
+            .enumerate()
+            .map(|(i, l)| {
+                if i > 0 && !l.starts_with([' ', '\t']) {
+                    format!(" {l}")
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
         let sep = if value.starts_with([' ', '\t']) {
             ""
         } else {
@@ -617,7 +660,14 @@ fn apply(raw: &[u8], mods: &[HeaderMod]) -> Bytes {
         f.split_once(':')
             .is_some_and(|(n, _)| n.trim_end().eq_ignore_ascii_case(name))
     };
-    for m in mods {
+    // Имя от фильтра — печатные ASCII без `:` (RFC 5322, 2.2), иначе изменение пропускается (FIX-08).
+    let valid = |m: &&HeaderMod| {
+        let (HeaderMod::Add(name, _)
+        | HeaderMod::Insert(_, name, _)
+        | HeaderMod::Change(_, name, _)) = m;
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+    };
+    for m in mods.iter().filter(valid) {
         match m {
             HeaderMod::Add(name, value) => fields.push(field(name, value)),
             HeaderMod::Insert(i, name, value) => {
@@ -652,5 +702,7 @@ fn apply(raw: &[u8], mods: &[HeaderMod]) -> Bytes {
     out.freeze()
 }
 
+#[cfg(test)]
+mod profile_tests;
 #[cfg(test)]
 pub(crate) mod tests;

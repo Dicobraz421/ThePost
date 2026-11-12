@@ -28,7 +28,8 @@ use crate::server::{Envelope, Handler, Mode, Reply, Session, SessionCtx, reply};
 
 /// Лимиты сессии в целях: малые, чтобы границы достигались быстро.
 const MAX_MESSAGE: usize = 64 * 1024;
-const MAX_RCPTS: usize = 8;
+/// Получателей в транзакции без AUTH — умолчание политики организации.
+const MAX_RCPTS: usize = tp_contracts::meta::Policy::DEFAULT_MAX_RECIPIENTS as usize;
 
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -77,7 +78,6 @@ fn ctx(mode: Mode) -> SessionCtx {
             hostname: "mx.example.org".into(),
             limits: Limits {
                 max_message_size: MAX_MESSAGE,
-                max_recipients: MAX_RCPTS,
                 ..Limits::default()
             },
             timeouts: Timeouts {
@@ -287,22 +287,25 @@ fn milter_outcome(data: &[u8]) -> Vec<Verdict> {
         let m = Milters::new(
             MilterConfig {
                 filters: vec![filter(on_failure)],
+                ..MilterConfig::default()
             },
             "mx.example.org",
         );
         let input = Bytes::copy_from_slice(data);
-        let out =
-            runtime().block_on(
-                m.check_with(&crate::milter::Mail::of(&env), raw.clone(), |_| {
-                    let input = input.clone();
-                    async move {
-                        Ok(tokio::io::join(
-                            std::io::Cursor::new(input),
-                            tokio::io::sink(),
-                        ))
-                    }
-                }),
-            );
+        let out = runtime().block_on(m.check_with(
+            &crate::milter::Mail::of(&env),
+            raw.clone(),
+            None,
+            |_| {
+                let input = input.clone();
+                async move {
+                    Ok(tokio::io::join(
+                        std::io::Cursor::new(input),
+                        tokio::io::sink(),
+                    ))
+                }
+            },
+        ));
         match &out.verdict {
             Verdict::Accept => {
                 assert!(

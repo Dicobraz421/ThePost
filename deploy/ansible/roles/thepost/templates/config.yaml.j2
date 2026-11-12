@@ -1,15 +1,15 @@
 {#- Эталон SMB: пресет all (deploy/config/all.yaml) + параметры узла; поверх — thepost_config_extra. -#}
 {%- set acme = thepost_tls_mode == 'acme' -%}
 {%- set tls_dir = '/var/lib/thepost/tls' if acme else '/etc/thepost/tls' -%}
-{#- Фильтр Milter описывается отдельно на каждый профиль: inbound — приём, outbound — почта пользователей. -#}
+{#- Фильтр Milter описывается отдельно на каждое направление: inbound — приём, outbound — почта пользователей. -#}
 {%- set milters = [('rspamd', thepost_rspamd_milter_address)]
       + ([('clamav', thepost_clamav_milter_address)] if thepost_clamav else []) -%}
-{%- set profiles = ['inbound'] + (['outbound'] if thepost_milter_submission else []) -%}
+{%- set directions = ['inbound'] + (['outbound'] if thepost_milter_submission else []) -%}
 {%- set filters = [] -%}
-{%- for profile in profiles -%}
+{%- for direction in directions -%}
 {%-   for name, address in milters -%}
-{%-     set _ = filters.append({'name': name if profile == 'inbound' else name ~ '-outbound',
-                                'address': address, 'profile': profile}) -%}
+{%-     set _ = filters.append({'name': name if direction == 'inbound' else name ~ '-outbound',
+                                'address': address, 'direction': direction}) -%}
 {%-   endfor -%}
 {%- endfor -%}
 {%- set base = {

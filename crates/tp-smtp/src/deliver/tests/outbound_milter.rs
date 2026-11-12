@@ -1,14 +1,14 @@
-//! Профиль Milter исходящей почты (SMTP-27) на заглушке фильтра: отказ и изменение письма при отправке —
+//! Направление Milter исходящей почты (SMTP-27) на заглушке фильтра: отказ и изменение письма при отправке —
 //! submission и отправка вне сессии SMTP (JMAP EmailSubmission).
 
 use super::*;
-use crate::config::{MilterConfig, MilterFilter, MilterOnFailure, MilterProfile};
+use crate::config::{MilterConfig, MilterDirection, MilterFilter, MilterOnFailure};
 use crate::milter::proto::{self, Packet};
 use crate::milter::tests as mt;
 
 fn outbound(mock: &mt::Mock, name: &str) -> MilterFilter {
     MilterFilter {
-        profile: MilterProfile::Outbound,
+        direction: MilterDirection::Outbound,
         ..mock.filter(name)
     }
 }
@@ -16,7 +16,10 @@ fn outbound(mock: &mt::Mock, name: &str) -> MilterFilter {
 fn with_filters(env: &Env, filters: Vec<MilterFilter>) -> Delivery {
     let mut d = env.delivery(true);
     d.deps.milter = Some(Arc::new(Milters::new(
-        MilterConfig { filters },
+        MilterConfig {
+            filters,
+            ..MilterConfig::default()
+        },
         "mx.example.org",
     )));
     d
@@ -96,7 +99,7 @@ async fn submit_message_changed_by_outbound_filter() {
 }
 
 #[tokio::test]
-async fn submission_session_uses_outbound_profile() {
+async fn submission_session_uses_outbound_direction() {
     let env = Env::new(DecisionHooks::default()).await;
     let dlp = mt::Mock::start(0, reject()).await;
     let d = with_filters(&env, vec![outbound(&dlp, "dlp")]);
@@ -105,7 +108,7 @@ async fn submission_session_uses_outbound_profile() {
     let r = d.data(&e, Bytes::from_static(MAIL)).await;
     assert_eq!((r.code, r.esc), (550, [5, 7, 1]));
     assert!(env.inbox("bob@example.org").await.is_empty());
-    // Приём извне профиль исходящей почты не проходит.
+    // Приём извне фильтры исходящей почты не проходит.
     let before = dlp.codes().await.len();
     let e = envelope(Mode::Inbound, &["bob@example.org"]);
     assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
@@ -121,10 +124,10 @@ async fn unavailable_outbound_filter_has_own_policy() {
         .expect("bind");
     let address = closed.local_addr().expect("addr").to_string();
     drop(closed);
-    let filter = |profile, on_failure| MilterFilter {
+    let filter = |direction, on_failure| MilterFilter {
         name: "ext".into(),
         address: address.clone(),
-        profile,
+        direction,
         on_failure,
         connect_timeout: std::time::Duration::from_secs(2),
         ..MilterFilter::default()
@@ -133,8 +136,8 @@ async fn unavailable_outbound_filter_has_own_policy() {
     let d = with_filters(
         &env,
         vec![
-            filter(MilterProfile::Inbound, Some(MilterOnFailure::Accept)),
-            filter(MilterProfile::Outbound, None),
+            filter(MilterDirection::Inbound, Some(MilterOnFailure::Accept)),
+            filter(MilterDirection::Outbound, None),
         ],
     );
     let e = envelope(Mode::Inbound, &["bob@example.org"]);

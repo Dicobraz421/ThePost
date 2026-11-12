@@ -32,16 +32,19 @@ impl Sched {
             now: Arc::new(move || c.now()),
         };
         let base = env.delivery(false);
-        let delivery = Arc::new(Delivery::new(
-            Deps {
-                outbound: Some(Arc::new(OutQueue::new(deps.clone()))),
-                ..base.deps.clone()
-            },
-            &SmtpConfig {
-                hostname: "mx.example.org".into(),
-                ..SmtpConfig::default()
-            },
-        ));
+        let delivery = Arc::new(
+            Delivery::new(
+                Deps {
+                    outbound: Some(Arc::new(OutQueue::new(deps.clone()))),
+                    ..base.deps.clone()
+                },
+                &SmtpConfig {
+                    hostname: "mx.example.org".into(),
+                    ..SmtpConfig::default()
+                },
+            )
+            .with_transport(env.routes()),
+        );
         let transport = Arc::new(Scripted::default());
         let worker = QueueWorker::new(deps, transport.clone(), "mx.example.org")
             .with_local(delivery.clone());

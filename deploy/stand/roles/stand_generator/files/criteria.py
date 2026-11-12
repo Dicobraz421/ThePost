@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Отчёт по критериям приёмки APP-D Д.7 для профиля SMB (DEP-13, DEP-14) из журналов прогона run-scenario.sh.
+"""Отчёт по критериям приёмки APP-D Д.7 для профиля SMB (DEP-13, DEP-14, DEP-25) из журналов прогона run-scenario.sh.
+
+Профиль порогов узла (params.txt: profile, решение 54): speed — рабочие пороги, критерии Д.7 как есть;
+thresholds — пороги Д.5, критерий прогона — «узел не падает, отказы только 4xx, принятые письма не потеряны»
+(строка «Пороги Д.5»), строки скорости — справочно.
 
   criteria.py <каталог прогона>                      — criteria.md и criteria.json; код выхода 1, если есть «не прошёл»;
   criteria.py <каталог> --window <t0> <t1> --check   — проверка ступени stress: задержки зондов и доля отказов в окне
                                                        (вывод — нарушения; код 1 — есть нарушение).
 
 Входы каталога: params.txt, events.txt, probes.jsonl (probes.py), probe-k6.jsonl и probe-idle-k6.jsonl (probe.js),
-smb-samples.csv (smb-sampler.py, узел SMB), ledger.txt (сверка принятых писем), журналы нагрузки
+smb-samples.csv (smb-sampler.py, узел SMB; метрики Д.7 узла APP-34 — пул СУБД, NOTIFY, слушатели, «сироты»),
+ledger.txt (сверка принятых писем), brute.json (сценарий bruteforce), журналы нагрузки
 (smtp-in.log, submission.log, k6-summary.json — в каталоге или в step-*/ для stress).
 """
 
@@ -18,6 +23,9 @@ import os
 import sys
 
 PASS, FAIL, NONE, NA = "прошёл", "не прошёл", "не измерялось", "не относится к SMB"
+PROFILES = {"speed": "рабочие пороги, критерии Д.7", "thresholds": "пороги Д.5, критерий — устойчивость"}
+INFO = "справочно"  # профиль thresholds: значение строки скорости, в итог прогона не входит
+NO_D7 = "в /metrics узла нет метрик Д.7 (tp_db_*, tp_blob_orphans_*: APP-34) — выпуск узла раньше"
 LOSS_GRACE = 60  # с после события отказа: задержки зондов в критерии строк 1–5 не входят (faults)
 
 
@@ -88,6 +96,8 @@ class Run:
         self.d = d
         self.params = kv(os.path.join(d, "params.txt"))
         self.scenario = self.params.get("scenario", "base")
+        self.profile = self.params.get("profile", "speed") or "speed"
+        self.bus_kind = self.params.get("bus_kind", "")
         self.users = int(self.params.get("users", "0") or 0)
         self.ev = events(os.path.join(d, "events.txt"))
         self.probes = jsonl(os.path.join(d, "probes.jsonl")) + jsonl(os.path.join(d, "probe-k6.jsonl"))
@@ -95,6 +105,20 @@ class Run:
         self.samples = samples(os.path.join(d, "smb-samples.csv"))
         self.ledger = kv(os.path.join(d, "ledger.txt"))
         self.loads = sorted({os.path.dirname(p) for p in glob.glob(os.path.join(d, "**", "load.txt"), recursive=True)})
+        self.brute = None
+        p = os.path.join(d, "brute.json")
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                self.brute = json.load(f)
+
+    def d7(self):
+        """Метрики Д.7 узла (APP-34) есть в срезах."""
+        return bool(self.node("pool_max"))
+
+    def delta(self, col, t0=None, t1=None):
+        """Прирост счётчика узла за окно (сбросы при перезапуске узла не вычитаются)."""
+        v = self.node(col, t0, t1)
+        return sum(max(0.0, b - a) for a, b in zip(v, v[1:])) if len(v) >= 2 else None
 
     def when(self, name):
         return [e for e in self.ev if e[1] == name]
@@ -326,11 +350,14 @@ def faults_row(run):
     return (name, crit, text, PASS if good else FAIL, note)
 
 
-def x3_row(run):
-    name, crit = "Поведение под нагрузкой ×3 к номинальной", "Узел не завершается аварийно; принятые письма не " \
-        "теряются; отказы — только 4xx"
-    if run.scenario != "x3":
-        return (name, crit, "—", NONE, "сценарий x3 (-e stand_scenario=x3)")
+STABLE = "Узел не завершается аварийно; принятые письма не теряются; отказы — только 4xx"
+
+
+def stability(run, name, crit):
+    """Строка «не падает, отказы только 4xx, принятые письма не потеряны» (x3, профиль thresholds).
+
+    В сценарии faults перезапуски узла — внесённый отказ: в критерий не входят.
+    """
     nr, pids = restarts(run)
     lc = run.load_counts()
     bad = {c: n for c, n in lc["codes"].items() if not c.startswith("4")}
@@ -340,8 +367,60 @@ def x3_row(run):
             f" {lc['codes'] or ''}; JMAP 5xx {h5}; потеряно {max(n_lost, 0) if n_lost is not None else '—'}")
     if nr is None or n_lost is None:
         return (name, crit, text, NONE, "нет срезов узла или сверки")
-    good = nr == 0 and pids <= 1 and not bad and h5 == 0 and n_lost <= 0
+    fault = run.scenario == "faults"
+    good = (fault or (nr == 0 and pids <= 1)) and not bad and h5 == 0 and n_lost <= 0
+    if fault:
+        note = "перезапуски — внесённые отказы сценария faults" + (f"; {note}" if note else "")
     return (name, crit, text, PASS if good else FAIL, note)
+
+
+def x3_row(run):
+    name = "Поведение под нагрузкой ×3 к номинальной"
+    if run.scenario != "x3":
+        return (name, STABLE, "—", NONE, "сценарий x3 (-e stand_scenario=x3)")
+    return stability(run, name, STABLE)
+
+
+def thresholds_row(run):
+    name = "Пороги Д.5: устойчивость (решение 54)"
+    if run.profile != "thresholds":
+        return (name, STABLE, "—", NONE, "профиль thresholds (-e stand_profile=thresholds)")
+    return stability(run, name, STABLE)
+
+
+def first_line(path, default):
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.strip():
+                    return line.strip()
+    return default
+
+
+def brute_row(run):
+    """Защита от перебора со второго адреса (Д.6, решение 56): итог probes.py brute."""
+    name = "Защита от перебора (сценарий bruteforce, второй адрес)"
+    b = run.brute or {}
+    crit = (f"Блокировка учётной записи после {b.get('account_failures', 'account_failures')} и адреса после "
+            f"{b.get('ip_failures', 'ip_failures')} неудач (auth.abuse); генератор не блокируется")
+    if run.scenario != "bruteforce":
+        return (name, crit, "—", NONE,
+                "сценарий bruteforce (-e stand_scenario=bruteforce -e stand_bruteforce_source=…)")
+    if not run.brute:
+        return (name, crit, "—", NONE, first_line(os.path.join(run.d, "brute.log"), "нет brute.json"))
+    if b.get("skipped"):
+        return (name, crit, "—", NONE, b["skipped"])
+    fails = {}
+    for x in b.get("attempts", []):
+        fails[x["phase"]] = fails.get(x["phase"], 0) + (x["result"] == "no")
+    text = "; ".join(f"{x['name']}: {x['result']} (ожидалось {x['expect']})" for x in b.get("checks", []))
+    note = (f"со второго адреса {b.get('source')}: отказов входа {b.get('target')} — {fails.get('account', 0)}, "
+            f"под несуществующими именами — {fails.get('address', 0)}")
+    wrong = [x for x in b.get("checks", []) if x["result"] in ("ok", "no") and not x["ok"]]
+    if b.get("inconclusive") and not wrong:
+        return (name, crit, text, NONE, "узел не ответил «ok» или «no» (UNAVAILABLE, обрыв — перегрузка): "
+                + ", ".join(b["inconclusive"]) + "; " + note)
+    return (name, crit, text, PASS if b.get("ok") else FAIL, note)
 
 
 def long_windows(run):
@@ -384,8 +463,41 @@ def long_row(run):
     return (name, crit, text, PASS if good else FAIL, note), ws
 
 
+def in_process_bus(run):
+    return run.bus_kind != "postgres"
+
+
+def bus_note(run):
+    return (f"SMB: шина сигналов в процессе (bus.kind: {run.bus_kind or 'по умолчанию'}) — NOTIFY и слушателей "
+            "LISTEN нет")
+
+
+def notify_row(run):
+    """Доля времени фиксаций с NOTIFY во времени всех фиксаций за прогон (META-53, APP-34)."""
+    name, crit = "Доля времени фиксации на primary, занятая NOTIFY", "≤ 5 %"
+    dn, dc = run.delta("notify_commit_sum"), run.delta("commit_sum")
+    if dn is not None and dc is not None:
+        if dc <= 0:
+            return (name, crit, "фиксаций за прогон: 0", NONE, "tp_db_commit_seconds не рос")
+        share = 100 * dn / dc
+        n = run.delta("notify_commit_count") or 0
+        return (name, crit, f"{share:.2f} % (фиксаций с NOTIFY {n:.0f}, время {dn:.1f} с из {dc:.1f} с)",
+                PASS if share <= 5 else FAIL, "прирост tp_db_notify_commit_seconds_sum / tp_db_commit_seconds_sum")
+    if not run.d7():
+        return (name, crit, "—", NONE, NO_D7)
+    if in_process_bus(run):
+        return (name, crit, "—", NA, bus_note(run))
+    return (name, crit, "—", NONE, "в /metrics узла нет tp_db_notify_commit_seconds и tp_db_commit_seconds")
+
+
 def listeners_row(run):
     name, crit = "Число соединений-слушателей сигналов (узлы × шарды) на целевом масштабе", "≤ 2 000"
+    m = run.node("listeners")
+    if m:
+        return (name, crit, f"tp_db_listeners: max {max(m):.0f}", PASS if max(m) <= 2000 else FAIL,
+                "SMB: 1 узел × 1 шард")
+    if run.d7() and in_process_bus(run):
+        return (name, crit, "—", NA, bus_note(run))
     v = run.node("pg_listen")
     if not v:
         return (name, crit, "—", NONE, "нет срезов узла (pg_stat_activity)")
@@ -394,6 +506,34 @@ def listeners_row(run):
                 "слушатель сигналов не виден в pg_stat_activity (последний запрос соединения — не LISTEN)")
     return (name, crit, f"LISTEN в pg_stat_activity: max {max(v):.0f}", PASS if max(v) <= 2000 else FAIL,
             "SMB: 1 узел × 1 шард")
+
+
+def orphans_row(run):
+    """«Сироты» после цикла GC (BLOB-16, APP-34): проходы поиска за прогон и остаток после последнего."""
+    name, crit = "«Сироты» после цикла GC", "0"
+    rem = run.node("orphans_remaining")
+    if not rem:
+        return (name, crit, "—", NONE, NO_D7 if not run.d7() else "в /metrics узла нет tp_blob_orphans_remaining")
+    passes = run.delta("orphans_passes") or 0
+    total = max(run.node("orphans_passes") or [0])
+    found, deleted = run.delta("orphans_found") or 0, run.delta("orphans_deleted") or 0
+    text = (f"проходов за прогон {passes:.0f} (всего {total:.0f}), найдено {found:.0f}, удалено {deleted:.0f}, "
+            f"осталось {rem[-1]:.0f}")
+    if total <= 0:
+        return (name, crit, text, NONE, "поиск «сирот» ни разу не прошёл (blob.orphans.interval; в профиле "
+                "thresholds — 2 мин)")
+    return (name, crit, text, PASS if rem[-1] == 0 else FAIL, "tp_blob_orphans_remaining в конце прогона")
+
+
+def pool_text(run, t0=None, t1=None):
+    """Пул СУБД узла (PLT-25, APP-34): занято / предел, ожидающие, среднее ожидание соединения."""
+    use, top = run.node("pool_in_use", t0, t1), run.node("pool_max", t0, t1)
+    if not use or not top:
+        return None
+    wait, n = run.delta("pool_wait_sum", t0, t1), run.delta("pool_wait_count", t0, t1)
+    waiting = run.node("pool_waiting", t0, t1)
+    mean = f", среднее ожидание {1000 * wait / n:.0f} мс (n={n:.0f})" if wait is not None and n else ""
+    return f"занято max {max(use):.0f} из {max(top):.0f}, ожидают max {max(waiting or [0]):.0f}{mean}"
 
 
 def stress_steps(run):
@@ -413,6 +553,7 @@ def stress_steps(run):
         total = run.node("mem_total_bytes", t0, t1)
         disk = run.node("disk_util_pct", t0, t1)
         pg = run.node("pg_conns", t0, t1)
+        use, top = run.node("pool_in_use", t0, t1), run.node("pool_max", t0, t1)
         out.append({
             "factor": f, "t0": t0, "t1": t1, "violations": viol,
             "smtp": pct(run.values("smtp", t0, t1)[0], 95), "jmap_query": pct(run.values("jmap_query", t0, t1)[0], 95),
@@ -421,6 +562,8 @@ def stress_steps(run):
             "rss": max(rss) if rss else None,
             "mem_used_pct": (100 * (1 - min(avail) / max(total))) if avail and total else None,
             "disk": sum(disk) / len(disk) if disk else None, "pg": max(pg) if pg else None,
+            "pool_use": max(use) if use else None, "pool_max": max(top) if top else None,
+            "pool": pool_text(run, t0, t1),
         })
     return out
 
@@ -434,8 +577,10 @@ def bottleneck(step, pool):
         cand.append((step["mem_used_pct"] / 90, f"память {step['mem_used_pct']:.0f} %"))
     if step["disk"] is not None:
         cand.append((step["disk"] / 80, f"диск {step['disk']:.0f} %"))
-    if step["pg"] is not None and pool:
-        cand.append((step["pg"] / pool, f"пул СУБД {step['pg']:.0f} из {pool}"))
+    if step.get("pool_use") is not None and step.get("pool_max"):
+        cand.append((step["pool_use"] / step["pool_max"], f"пул СУБД {step['pool']}"))
+    elif step["pg"] is not None and pool:
+        cand.append((step["pg"] / pool, f"пул СУБД {step['pg']:.0f} из {pool} (pg_stat_activity)"))
     if not cand:
         return "нет срезов узла"
     score, text = max(cand)
@@ -469,8 +614,7 @@ def report(run):
     users_note = (f"уменьшенный стенд: users={run.users}" if run.users < 1000 else "")
     rows = [
         lat[0], lat[1], lat[2], lat[3], lat[4],
-        ("Доля времени фиксации на primary, занятая NOTIFY", "≤ 5 %", "—", NONE,
-         "нужен учёт времени NOTIFY в транзакциях фиксации (pg_stat_statements или метрика узла)"),
+        notify_row(run),
         listeners_row(run),
         fts,
         ("Полнотекстовый поиск, общий ящик 1 млн писем, p95", "< 3 с", "—", NA, "общих ящиков 1 млн в SMB нет (Д.3)"),
@@ -480,12 +624,19 @@ def report(run):
         ("Переключение primary PostgreSQL", "RTO ≤ 30 с, RPO = 0", "—", NA,
          "один PostgreSQL без HA; перезапуск PostgreSQL — в сценарии faults"),
         faults_row(run),
-        ("«Сироты» после цикла GC", "0", "—", NONE, "нет метрики или команды подсчёта «сирот» на узле"),
+        orphans_row(run),
         ("Потерянные объекты после PITR (thepost verify)", "0", "—", NONE, "сценарий «Восстановление» стендом не выполняется"),
         long,
         idle_row(run),
         x3_row(run),
     ]
+    if run.profile == "thresholds":
+        # Решение 54: на порогах Д.5 скорость не судится — значения справочно; судятся строка «Пороги Д.5»,
+        # «сироты» (поиск раз в 2 мин — только на этих порогах) и ×3 (тот же критерий устойчивости).
+        judged = {orphans_row(run)[0], x3_row(run)[0]}
+        rows = [(r[0], r[1], r[2], INFO, "профиль thresholds: пороги Д.5, критерий скорости не применяется"
+                 + (f"; {r[4]}" if r[4] else "")) if r[3] in (PASS, FAIL) and r[0] not in judged else r for r in rows]
+    rows += [thresholds_row(run), brute_row(run)]
     measured = [r for r in rows if r[3] in (PASS, FAIL)]
     failed = [r for r in rows if r[3] == FAIL]
     mem = run.node("mem_total_bytes")
@@ -502,7 +653,8 @@ def report(run):
     lines = [
         f"# Критерии Д.7, профиль SMB — прогон {run.params.get('run', os.path.basename(run.d))}",
         "",
-        f"Сценарий `{run.scenario}`, множитель {run.params.get('factor')}, длительность "
+        f"Профиль `{run.profile}` ({PROFILES.get(run.profile, '')}), "
+        f"сценарий `{run.scenario}`, множитель {run.params.get('factor')}, длительность "
         f"{run.params.get('duration')}, пользователей {run.users}; задержки — {scope}.",
         "",
         "| # | Показатель | Порог | Значение | Итог | Комментарий |",
@@ -512,21 +664,22 @@ def report(run):
         lines.append(f"| {i} | {r[0]} | {r[1]} | {r[2]} | **{r[3]}** | {r[4]} |")
     lines += ["", "## Нагрузка и сверка писем", "",
               f"- SMTP нагрузки (25 и 587): принято {lc['ok']}, отказов {lc['fail']} {lc['codes'] or ''}",
-              f"- {ledger_note}"]
+              f"- {ledger_note}",
+              f"- Пул СУБД узла: {pool_text(run) or 'нет tp_db_pool_* в /metrics узла (APP-34)'}"]
     if steps:
         pool = run.params.get("db_pool")
         pool = int(pool) if pool and pool.isdigit() else None
         sat = None
         lines += ["", "## Стресс: ступени", "",
                   "| Множитель | SMTP p95 | JMAP query p95 | SELECT p95 | доставка p95 | CPU узла | CPU thepost | "
-                  "RSS | память | диск | соединений СУБД | нарушения |",
+                  "RSS | память | диск | пул (соединений) СУБД | нарушения |",
                   "|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for s in steps:
             lines.append(
                 f"| ×{s['factor']} | {fmt(s['smtp'])} | {fmt(s['jmap_query'])} | {fmt(s['select'])} | "
                 f"{fmt(s['delivery'])} | {num(s['cpu'], ' %')} | {num(s['proc_cpu'], ' %')} | "
                 f"{num(s['rss'], ' MB', 2**20)} | {num(s['mem_used_pct'], ' %')} | {num(s['disk'], ' %')} | "
-                f"{num(s['pg'], '')} | {'; '.join(s['violations']) or '—'} |")
+                f"{s['pool'] or num(s['pg'], '')} | {'; '.join(s['violations']) or '—'} |")
             if s["violations"] and sat is None:
                 sat = s
         ok = [s for s in steps if not s["violations"]]
@@ -550,6 +703,7 @@ def report(run):
     lines.append("")
     data = {
         "run": run.params.get("run"), "scenario": run.scenario, "users": run.users,
+        "profile": run.profile,
         "rows": [dict(zip(("name", "criterion", "value", "status", "note"), r)) for r in rows],
         "load": lc, "ledger": run.ledger, "lost": n_lost, "stress": steps, "long": ws,
         "failed": len(failed),

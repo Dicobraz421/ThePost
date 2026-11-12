@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Срезы узла SMB во время прогона стенда (DEP-13, DEP-14): раз в <период> с — строка smb-samples.csv до появления
-файла <каталог>/stop. Источники: /metrics служебного HTTP (tp_process_resident_memory_bytes, tp_connections),
+"""Срезы узла SMB во время прогона стенда (DEP-13, DEP-14, DEP-25): раз в <период> с — строка smb-samples.csv до
+появления файла <каталог>/stop. Источники: /metrics служебного HTTP (tp_process_resident_memory_bytes, tp_connections;
+метрики Д.7 узла — APP-34: пул СУБД tp_db_pool_*, фиксации с NOTIFY tp_db_notify_commit_seconds и все фиксации
+tp_db_commit_seconds, слушатели tp_db_listeners, «сироты» tp_blob_orphans_*; нет в выпуске — пустые столбцы),
 /proc (CPU узла и процесса, память, загрузка дисков), systemd (MainPID, NRestarts), PostgreSQL (соединения thepost,
 слушатели LISTEN; psql от postgres).
 
@@ -19,7 +21,23 @@ import urllib.request
 COLUMNS = [
     "t", "pid", "nrestarts", "rss_bytes", "proc_cpu_pct", "host_cpu_pct", "mem_avail_bytes", "mem_total_bytes",
     "disk_util_pct", "pg_conns", "pg_listen", "connections", "role_restarts",
+] + [
+    "pool_in_use", "pool_max", "pool_waiting", "pool_wait_sum", "pool_wait_count", "commit_sum", "commit_count",
+    "notify_commit_sum", "notify_commit_count", "notify_share", "listeners", "listener_connected", "orphans_passes",
+    "orphans_found", "orphans_deleted", "orphans_remaining",
 ]
+# Метрики Д.7 узла (APP-34): столбец → имя в /metrics (счётчики — с суффиксом _total и без; метки суммируются).
+D7 = {
+    "pool_in_use": "tp_db_pool_in_use", "pool_max": "tp_db_pool_max", "pool_waiting": "tp_db_pool_waiting",
+    "pool_wait_sum": "tp_db_pool_wait_seconds_sum", "pool_wait_count": "tp_db_pool_wait_seconds_count",
+    "commit_sum": "tp_db_commit_seconds_sum", "commit_count": "tp_db_commit_seconds_count",
+    "notify_commit_sum": "tp_db_notify_commit_seconds_sum", "notify_commit_count": "tp_db_notify_commit_seconds_count",
+    "notify_share": "tp_db_notify_commit_share", "listeners": "tp_db_listeners",
+    "listener_connected": "tp_db_listener_connected", "orphans_passes": "tp_blob_orphans_passes",
+    "orphans_found": "tp_blob_orphans_found", "orphans_deleted": "tp_blob_orphans_deleted",
+    "orphans_remaining": "tp_blob_orphans_remaining",
+}
+D7_BY_NAME = {v: k for k, v in D7.items()}
 DISK = re.compile(r"^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+n\d+)$")
 TICK = os.sysconf("SC_CLK_TCK")
 NCPU = os.cpu_count() or 1
@@ -71,8 +89,9 @@ def metrics(url, ctx):
         with urllib.request.urlopen(f"{url}/metrics", context=ctx, timeout=5) as r:
             text = r.read().decode("utf-8", "replace")
     except OSError:
-        return None, None, None
+        return None, None, None, {}
     rss = conns = restarts = None
+    d7 = {}
     for line in text.splitlines():
         if line.startswith("#"):
             continue
@@ -88,7 +107,10 @@ def metrics(url, ctx):
             conns = (conns or 0) + x
         elif base in ("tp_role_restarts", "tp_role_restarts_total"):
             restarts = (restarts or 0) + x
-    return rss, conns, restarts
+        col = D7_BY_NAME.get(base[:-6] if base.endswith("_total") else base)
+        if col:
+            d7[col] = d7.get(col, 0) + x
+    return rss, conns, restarts, d7
 
 
 def vmrss(pid):
@@ -127,7 +149,7 @@ def main():
             pticks = proc_cpu(pid) if pid != "0" else None
             disks = disk_ticks()
             avail, mem_total = meminfo()
-            rss, conns, restarts = metrics(url, ctx)
+            rss, conns, restarts, d7 = metrics(url, ctx)
             if rss is None and pid != "0":
                 rss = vmrss(pid)
             pgv = cmd("runuser", "-u", "postgres", "--", "psql", "-XAtc", pg).split("|")
@@ -138,6 +160,7 @@ def main():
                 "connections": conns if conns is not None else "", "role_restarts": restarts if restarts is not None else "",
                 "host_cpu_pct": "", "proc_cpu_pct": "", "disk_util_pct": "",
             }
+            row.update({c: d7.get(c, "") for c in D7})
             if prev is not None:
                 dt = t0 - prev["t"]
                 dtotal = total - prev["total"]
