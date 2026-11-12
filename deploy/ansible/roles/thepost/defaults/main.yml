@@ -1,10 +1,11 @@
 # Роль thepost: бинарный файл, пользователь, юнит systemd, config.yaml и сертификат клиентских протоколов
 # (эталон SMB, SRS 1.2, 5.6). Юнит и sysusers — deploy/systemd; пример конфигурации — deploy/config/all.yaml.
 ---
-# Основной домен и имя узла (SMTP banner/HELO, сертификат клиентских протоколов).
+# Основной домен и имя узла (SMTP banner/HELO, сертификат клиентских протоколов). Локальные домены SMTP — принятые
+# домены организации в БД (решение 96): `thepost admin init` заводит домен адреса администратора, другие —
+# `thepost admin domain add <домен>`.
 thepost_domain: example.ru
 thepost_hostname: "mail.{{ thepost_domain }}"
-thepost_local_domains: ["{{ thepost_domain }}"]
 
 # Бинарный файл: thepost_binary_url (+ thepost_binary_checksum "sha256:…") или файл на управляющей машине.
 thepost_binary_url: ""
