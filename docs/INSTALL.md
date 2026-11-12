@@ -273,6 +273,23 @@ SRS 3.5). Поэтому потерять можно только письма, 
 4. Запустите `restore.yml`, как выше: он сам поставит средства копирования, восстановит базу и письма и включит
    таймеры; дальше `smb.yml` — как обычно.
 
+### Новый сервер вместо потерянного
+
+Копия OpenBao (секреты узла, в том числе ключи DKIM) снимается вместе с копией базы — снимок Raft в то же
+хранилище копий. Заранее храните **вне сервера**: `/root/openbao-init.json`, `/etc/openbao/unseal.key` и пароль restic.
+
+1. Установите новый сервер: `ansible-playbook … deploy/ansible/smb.yml -e thepost_backup=false`. Если в настройках
+   задан DKIM, прогон остановится на `Wait for thepost readiness` — это ожидаемо: ключ DKIM вернётся из снимка.
+2. Верните копии по тем же путям и выполните `chown -R postgres:postgres /var/lib/pgbackrest`.
+3. В новом OpenBao заведите только хранилище пароля копий:
+   `bao secrets enable -path=thepost-backup -version=2 kv` и
+   `bao kv put -mount=thepost-backup restic password=…` (для S3 — и его ключи). Ключ шифрования pgBackRest вернётся из снимка.
+4. Восстановите: `ansible-playbook … deploy/ansible/restore.yml -e thepost_restore_confirm=true
+   -e thepost_restore_openbao=true -e thepost_restore_openbao_init_src=<openbao-init.json>
+   -e thepost_restore_openbao_static_key_src=<unseal.key>` (при распечатывании ключами Шамира —
+   `thepost_restore_openbao_unseal_keys`). Снимок OpenBao ставится до восстановления базы.
+5. Обычный прогон `smb.yml` — узел стартует, DKIM подписывает тем же ключом, `thepost verify` — без потерь.
+
 ## Проверка подписи
 
 Архивы, SBOM и образ подписаны [cosign](https://docs.sigstore.dev/) без ключей; рядом с каждым файлом лежит
