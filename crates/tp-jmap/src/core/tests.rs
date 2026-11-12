@@ -312,3 +312,33 @@ async fn auth_unavailable() {
     );
     assert_eq!(env.jmap.authenticate(&h, peer).await, Err(Error::Forbidden));
 }
+
+/// JMAP-37: запрос с Basic по HTTP — в проверку учётных данных пришёл адрес соединения (`ConnectInfo`, как у
+/// сервера `tp_platform::service_http`), и при неверном пароле тоже.
+#[tokio::test]
+async fn basic_passes_connection_address() {
+    let env = Env::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = env
+        .jmap
+        .clone()
+        .router()
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let get = |auth: &str| {
+        format!(
+            "GET /jmap/session HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {auth}\r\n\
+             Connection: close\r\n\r\n"
+        )
+    };
+    // base64("user@example.org:app-secret") и base64("user@example.org:wrong")
+    let (code, _, _) = http(addr, get("dXNlckBleGFtcGxlLm9yZzphcHAtc2VjcmV0")).await;
+    assert_eq!(code, 200);
+    let (code, _, _) = http(addr, get("dXNlckBleGFtcGxlLm9yZzp3cm9uZw==")).await;
+    assert_eq!(code, 401);
+    let local = Some(std::net::IpAddr::from([127, 0, 0, 1]));
+    assert_eq!(env.auth.peers(), [local, local]);
+}
