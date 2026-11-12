@@ -25,6 +25,7 @@ use tp_contracts::retention::TrashStore;
 use tp_contracts::schedule::FreeBusy;
 use tp_contracts::search::SearchIndex;
 use tp_contracts::sieve::SieveStore;
+use tp_contracts::submission::SubmissionStore;
 use tp_contracts::transport::MailFlow;
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Result, TenantId};
 
@@ -114,6 +115,8 @@ pub struct Deps {
     pub authz: Arc<dyn Authorizer>,
     /// Очередь исходящей почты; `None` — узел не отправляет (EmailSubmission — `forbiddenToSend`).
     pub outbound: Option<Arc<dyn Outbound>>,
+    /// Учёт отправок: объекты `EmailSubmission` (отложенная отправка, отмена, статусы получателей).
+    pub submissions: Arc<dyn SubmissionStore>,
     /// Точки принятия решений модулей (`on_submission`; `before_final_delete` при очистке корзины).
     pub hooks: DecisionHooks,
     /// Capability модулей (`Registry::jmap_capabilities`).
@@ -417,7 +420,10 @@ impl Jmap {
         );
         account_caps.insert(
             SUBMISSION.into(),
-            json!({ "maxDelayedSend": 0, "submissionExtensions": {} }),
+            json!({
+                "maxDelayedSend": c.submission.max_delayed_send.as_secs(),
+                "submissionExtensions": {},
+            }),
         );
         account_caps.insert(SETTINGS.into(), json!({}));
         let mut primary = Map::new();
@@ -655,12 +661,16 @@ fn slot<'a>(slots: &'a Slots, p: &Principal, max: u32) -> Option<Inflight<'a>> {
 
 /// Идентификатор цепочки письма (`threadId`): по ключу цепочки из метаданных; письмо без ключа — своя цепочка.
 pub(crate) fn thread_id(m: &Message) -> String {
-    let key = if m.meta.thread_key.is_empty() {
-        format!("id:{}", m.id)
+    if m.meta.thread_key.is_empty() {
+        lone_thread_id(m.id)
     } else {
-        m.meta.thread_key.clone()
-    };
-    format!("T{}", digest(key.as_bytes()))
+        format!("T{}", digest(m.meta.thread_key.as_bytes()))
+    }
+}
+
+/// Цепочка из одного письма `id`: письмо без ключа цепочки или уже удалённое.
+pub(crate) fn lone_thread_id(id: tp_contracts::MessageId) -> String {
+    format!("T{}", digest(format!("id:{id}").as_bytes()))
 }
 
 /// Первые 12 байт SHA-256 в hex.
