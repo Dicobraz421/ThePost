@@ -1,13 +1,14 @@
 //! `AUTH` (RFC 4954) роли submission поверх [`SaslServer`]: механизмы — `tp-auth`, здесь — команда,
 //! base64, отмена `*` и коды ответов.
 //!
-//! AUTH предлагается и принимается только по TLS (SRS 4.1, 6.2): без TLS — `538 5.7.11`. Попытки
-//! ограничиваются по адресу клиента ([`RateLimiter::check_ip`]); после `limits.max_auth_failures`
-//! неудач подряд адрес блокируется, соединение закрывается. Частота отправки — по учётной записи
+//! AUTH предлагается и принимается только по TLS (SRS 4.1, 6.2): без TLS — `538 5.7.11`. Защита от
+//! перебора — за проверкой учётных данных (`AbuseGuard` узла, как у IMAP): заблокированная попытка
+//! отклоняется как неверный пароль. Сеанс после `limits.max_auth_failures` неудач подряд закрывается
+//! (`421`), адрес клиента здесь не блокируется (решение 99). Частота отправки — по учётной записи
 //! ([`RateLimiter::check_account`]) на каждый `MAIL`. После входа сеанс получает политику организации учётной
 //! записи ([`super::Handler::policy`]: лимиты получателей письма и писем в час); недоступна — `454 4.7.0`.
-
-use std::time::Instant;
+//!
+//! [`RateLimiter::check_account`]: tp_platform::RateLimiter::check_account
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -17,7 +18,6 @@ use smtp_proto::{
 };
 use tp_contracts::Error;
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslFailure, SaslSession, SaslStep};
-use tp_platform::Verdict;
 
 use super::session::{Exit, Session, State, push, push_line};
 use super::{Mode, Reply, reply};
@@ -94,30 +94,6 @@ impl Session {
         if let Some(r) = refuse {
             self.fail(r, out);
             return None;
-        }
-        if let Some(limiter) = &self.ctx.limiter {
-            match limiter.check_ip(self.conn.client.ip()) {
-                Verdict::Allow => {}
-                Verdict::Limited { .. } => {
-                    push(
-                        out,
-                        &reply(
-                            454,
-                            [4, 7, 0],
-                            "Too many authentication attempts, try later",
-                        ),
-                    );
-                    return None;
-                }
-                Verdict::Blocked { .. } => {
-                    push(
-                        out,
-                        &reply(421, [4, 7, 0], "Too many authentication failures"),
-                    );
-                    self.exit = Some(Exit::Closed);
-                    return None;
-                }
-            }
         }
         let Some(mechanism) = from_bit(mechanism) else {
             self.fail(
@@ -247,7 +223,7 @@ impl Session {
         }
     }
 
-    /// Неуспешная аутентификация: `535`; после `limits.max_auth_failures` — блокировка адреса и закрытие.
+    /// Неуспешная аутентификация: `535`; после `limits.max_auth_failures` подряд — закрытие соединения.
     fn auth_failed(&mut self, f: SaslFailure, out: &mut Vec<u8>) {
         tracing::info!(client = %self.conn.client, failure = ?f, "smtp: AUTH отклонён");
         let r: Reply = match f {
@@ -262,9 +238,6 @@ impl Session {
         push(out, &r);
         self.auth_failures += 1;
         if self.auth_failures >= self.ctx.config.limits.max_auth_failures {
-            if let Some(limiter) = &self.ctx.limiter {
-                limiter.block_ip_at(self.conn.client.ip(), Instant::now());
-            }
             push(
                 out,
                 &reply(421, [4, 7, 0], "Too many authentication failures"),
