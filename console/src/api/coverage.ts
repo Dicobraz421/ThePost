@@ -46,4 +46,6 @@ export const covered: Record<string, string> = {
   "GET /api/v1/transport": "pages/transport.tsx",
   "PUT /api/v1/transport/sources/{name}": "pages/transport.tsx",
   "DELETE /api/v1/transport/sources/{name}": "pages/transport.tsx",
+  "GET /api/v1/orgs/{org}/delivery": "pages/delivery.tsx",
+  "GET /api/v1/orgs/{org}/audit": "pages/audit.tsx",
 };

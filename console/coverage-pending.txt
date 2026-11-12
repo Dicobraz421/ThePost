@@ -1,4 +1,2 @@
 # Операции Admin API без экрана консоли (UI-02): «МЕТОД путь», по одной в строке.
 # Экран готов — строку убрать и добавить операцию в src/api/coverage.ts.
-GET /api/v1/orgs/{org}/audit
-GET /api/v1/orgs/{org}/delivery

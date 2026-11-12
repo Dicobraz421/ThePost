@@ -13,6 +13,8 @@ import { Header } from "./components/header";
 import { i18nProvider } from "./i18n";
 import type { Schemas } from "./api/client";
 import { AccountCreate, AccountList, AccountShow } from "./pages/accounts";
+import { AuditPage } from "./pages/audit";
+import { DeliveryPage } from "./pages/delivery";
 import { DomainCreate, DomainList, DomainShow } from "./pages/domains";
 import { GroupCreate, GroupEdit, GroupList } from "./pages/groups";
 import { LoginPage } from "./pages/login";
@@ -71,6 +73,8 @@ export function App() {
             },
             { name: "moderation", list: "/moderation", meta: { label: "Модерация" } },
             { name: "transport", list: "/transport", meta: { label: "Транспорт" } },
+            { name: "delivery", list: "/delivery", meta: { label: "Журнал доставки" } },
+            { name: "audit", list: "/audit", meta: { label: "Журнал аудита" } },
           ]}
           // Без внешних обращений (SRS 5.2): телеметрия Refine выключена.
           options={{ disableTelemetry: true, syncWithLocation: true, warnWhenUnsavedChanges: true }}
@@ -105,6 +109,8 @@ export function App() {
               </Route>
               <Route path="/moderation" element={<ModerationPage />} />
               <Route path="/transport" element={<TransportPage />} />
+              <Route path="/delivery" element={<DeliveryPage />} />
+              <Route path="/audit" element={<AuditPage />} />
               <Route path="*" element={<ErrorComponent />} />
             </Route>
             <Route
