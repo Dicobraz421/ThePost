@@ -1,0 +1,19 @@
+BEGIN:VCARD
+VERSION:4.0
+UID:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000001
+FN:Анна Сергеевна Журавлёва
+N:Журавлёва;Анна;Сергеевна;;
+NICKNAME:Аня
+ORG:ООО «Ромашка»;Департамент продаж;Отде
+ л ключевых клиентов
+TITLE:Руководитель отдела
+EMAIL;TYPE=work:anna.zhuravleva@example.com
+TEL;VALUE=uri;TYPE="work,voice":tel:+7-495-555-01-01
+BDAY:19850412
+LANG;PREF=1:ru
+NOTE:Предпочитает переписку по почте.
+X-THEPOST-TEST:произвольное значение
+X-CUSTOM-FIELD;X-PARAM=значение:Поле клиента\, кото
+ рое сервер обязан сохранить
+REV:20261101T100000Z
+END:VCARD

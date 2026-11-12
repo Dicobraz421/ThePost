@@ -1,0 +1,14 @@
+BEGIN:VCARD
+VERSION:4.0
+UID:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000002
+KIND:org
+FN:ООО «Ромашка»
+ORG:ООО «Ромашка»
+ADR;TYPE=work:;;ул. Цветочная\, д. 3;Москва;;115000;Ро
+ ссия
+TEL;VALUE=uri;TYPE=work:tel:+7-495-555-01-02
+EMAIL;TYPE=work:info@romashka.example.com
+URL:https://romashka.example.com
+NOTE:Организация без свойства N.
+REV:20261101T100100Z
+END:VCARD

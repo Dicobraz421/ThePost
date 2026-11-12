@@ -1,0 +1,20 @@
+BEGIN:VCARD
+VERSION:4.0
+UID:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000007
+FN:Сергей Николаевич Воронцов
+N:Воронцов;Сергей;Николаевич;;
+ADR;TYPE=work;PREF=1;LABEL="ООО «Ромашка»\nул. Цветочн
+ ая, д. 3\nМосква":;;ул. Цветочная\, д. 3;Москва
+ ;;115000;Россия
+ADR;TYPE=home;PREF=2:;;Лесной пер.\, д. 12\, кв. 4;Тверь;
+ Тверская область;170000;Россия
+ADR;TYPE=postal:;а/я 77;;Москва;;101000;Россия
+TEL;VALUE=uri;TYPE="work,voice";PREF=1:tel:+7-495-555-01-07;ext=204
+TEL;VALUE=uri;TYPE=cell:tel:+7-900-555-01-08
+TEL;VALUE=uri;TYPE="work,fax":tel:+7-495-555-01-09
+TEL;TYPE=home:8 (4822) 55-50-10
+EMAIL;TYPE=work;PREF=1:s.vorontsov@example.com
+EMAIL;TYPE=home;PREF=2:vorontsov@example.net
+EMAIL:sergey.v@example.org
+REV:20261101T100600Z
+END:VCARD
