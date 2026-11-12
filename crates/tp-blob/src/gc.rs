@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(candidates, vec![key]);
         // Между выборкой кандидатов и `mark_deleting` пришло письмо с тем же вложением.
         assert_eq!(
-            e.index.acquire(T, &key.hash, 1).await.expect("вызов"),
+            e.index.acquire(T, None, &key.hash, 1).await.expect("вызов"),
             Acquire::Existing {
                 generation: key.generation
             }

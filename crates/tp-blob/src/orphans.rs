@@ -314,7 +314,8 @@ mod tests {
     /// Запись, оборванная после загрузки до `commit_new`.
     async fn interrupted(e: &Env, body: &'static [u8]) -> BlobKey {
         let hash: BlobHash = BlobHasher::digest(body);
-        let Acquire::Absent { generation } = e.index.acquire(T, &hash, 1).await.expect("вызов")
+        let Acquire::Absent { generation } =
+            e.index.acquire(T, None, &hash, 1).await.expect("вызов")
         else {
             panic!("объект уже есть");
         };

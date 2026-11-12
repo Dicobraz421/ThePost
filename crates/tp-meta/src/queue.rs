@@ -8,9 +8,10 @@
 //! Сроки попыток и лизы сравниваются с `now` вызывающего: часы СУБД не участвуют (кроме `queued_at`).
 //! Очередь общая для организаций: `enqueue` — транзакция организации письма, остальное — системные транзакции.
 //!
-//! Шарды (META-31): очередь письма — на шарде отправителя, рядом с «Отправленными»: вызывающий, знающий
-//! шард отправителя, ставит письмо через хранилища шарда ([`PgMeta::on_shard`]); `enqueue` хранилищ со
-//! справочником — в основную БД (шард отправителя письму неизвестен). `claim` обходит шарды по очереди:
+//! Шарды (META-31, CTR-49): очередь письма — на шарде отправителя, рядом с «Отправленными»: `enqueue` хранилищ
+//! со справочником ставит письмо на шард учётной записи `owner` (решение 46); без `owner` или для учётной
+//! записи, которой нет в справочнике, — в основную БД. Вызывающий, знающий шард, может ставить и через
+//! хранилища шарда ([`PgMeta::on_shard`]). `claim` обходит шарды по очереди:
 //! каждый проход начинается со следующего шарда и добирает `limit` с остальных; операции захвата идут
 //! на шард записи.
 
@@ -20,11 +21,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqlx::{FromRow, PgConnection};
 use time::OffsetDateTime;
+use tp_contracts::meta::AccountScope;
 use tp_contracts::queue::{
     Claimed, DsnNotify, DsnParams, DsnRet, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt,
     RcptStatus,
 };
-use tp_contracts::{BlobHash, BlobKey, Error, Gen, QueueId, Result, TenantId};
+use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, QueueId, Result, TenantId};
 use uuid::Uuid;
 
 use crate::PgMeta;
@@ -228,7 +230,23 @@ async fn settle(tx: &mut PgConnection, id: QueueId) -> Result<bool> {
 
 #[async_trait]
 impl QueueStore for PgMeta {
-    async fn enqueue(&self, msg: OutMessage) -> Result<QueueId> {
+    async fn enqueue(&self, owner: Option<AccountId>, msg: OutMessage) -> Result<QueueId> {
+        if let Some(account) = owner {
+            let scope = AccountScope {
+                tenant: msg.tenant,
+                account,
+            };
+            let shard = match self.shard_of(scope).await {
+                Ok(shard) => shard,
+                // Существование учётной записи контракт не проверяет: неизвестная — в основную БД.
+                Err(Error::NotFound) => ShardId::MAIN,
+                Err(e) => return Err(e),
+            };
+            if shard != ShardId::MAIN {
+                let view = self.on_shard(shard).await?;
+                return QueueStore::enqueue(&view, None, msg).await;
+            }
+        }
         self.once(async move {
         if msg.rcpts.is_empty() {
             return Err(Error::invalid("письмо в очередь без получателей"));

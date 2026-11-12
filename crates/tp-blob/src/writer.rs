@@ -297,7 +297,7 @@ impl BlobWriter {
             hash,
             generation,
         };
-        let mut generation = match self.index.acquire(tenant, &hash, refs).await? {
+        let mut generation = match self.index.acquire(tenant, None, &hash, refs).await? {
             Acquire::Existing { generation } => {
                 add(&self.counters.dedup, 1);
                 return Ok(key(generation));
@@ -660,8 +660,14 @@ mod tests {
 
     #[async_trait]
     impl BlobIndex for Bumping {
-        async fn acquire(&self, t: TenantId, h: &BlobHash, refs: u32) -> Result<Acquire> {
-            self.inner.acquire(t, h, refs).await
+        async fn acquire(
+            &self,
+            t: TenantId,
+            o: Option<tp_contracts::AccountId>,
+            h: &BlobHash,
+            refs: u32,
+        ) -> Result<Acquire> {
+            self.inner.acquire(t, o, h, refs).await
         }
         async fn commit_new(
             &self,

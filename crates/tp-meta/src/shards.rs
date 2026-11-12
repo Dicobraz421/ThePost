@@ -219,8 +219,8 @@ impl ShardDirectory {
         c.replicas.remove(&shard);
     }
 
-    /// Сбрасывает кэш по сигналам системной подписки шины `bus`: `ConfigReloaded` (справочник — часть
-    /// конфигурации инсталляции) и `Resync` (сигналы могли потеряться). Задача завершается вместе с потоком
+    /// Сбрасывает кэш по сигналам системной подписки шины `bus`: `ShardsChanged` (изменён справочник, CTR-49),
+    /// `ConfigReloaded` (справочник — часть конфигурации инсталляции) и `Resync` (сигналы могли потеряться). Задача завершается вместе с потоком
     /// подписки (остановка шины).
     pub async fn follow(
         self: Arc<Self>,
@@ -229,7 +229,10 @@ impl ShardDirectory {
         let mut stream = bus.subscribe_system().await?;
         Ok(tokio::spawn(async move {
             while let Some(event) = stream.next().await {
-                if matches!(event.kind, EventKind::ConfigReloaded | EventKind::Resync) {
+                if matches!(
+                    event.kind,
+                    EventKind::ShardsChanged | EventKind::ConfigReloaded | EventKind::Resync
+                ) {
                     tracing::debug!("справочник шардов: сброс кэша по сигналу");
                     self.invalidate();
                 }

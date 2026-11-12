@@ -245,7 +245,7 @@ impl Jmap {
     pub(crate) async fn put_object(&self, tenant: TenantId, data: Bytes) -> Result<BlobKey> {
         let d = &self.d;
         let hash = BlobHash(Sha256::digest(&data).into());
-        let generation = match d.blob_index.acquire(tenant, &hash, 1).await? {
+        let generation = match d.blob_index.acquire(tenant, None, &hash, 1).await? {
             Acquire::Existing { generation } => generation,
             Acquire::Absent { generation } => {
                 let mut generation = generation;
