@@ -752,6 +752,9 @@ impl StartupSection {
 /// ```yaml
 /// maintenance:
 ///   purge_interval: 1h
+///   verify:
+///     at: "03:00"
+///     interval: 24h
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -761,25 +764,122 @@ pub struct MaintenanceSection {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub purge_interval: Duration,
+    /// Проверка целостности BLOB по расписанию (`thepost verify` без `--fix`, APP-44).
+    pub verify: VerifySchedule,
 }
 
 impl Default for MaintenanceSection {
     fn default() -> Self {
         Self {
             purge_interval: Duration::from_secs(3600),
+            verify: VerifySchedule::default(),
         }
     }
 }
 
 impl MaintenanceSection {
-    /// Период положителен.
+    /// Периоды положительны, расписание проверки целостности согласовано.
     pub fn check(&self) -> Result<()> {
         if self.purge_interval.is_zero() {
             return Err(Error::invalid(
                 "maintenance: purge_interval must be positive",
             ));
         }
+        self.verify.check()
+    }
+}
+
+/// `maintenance.verify`: расписание проверки целостности BLOB в роли maintenance (APP-44). Проход — сверка
+/// `thepost verify` без `--fix`: ничего не удаляет и не помечает, итог — в журнал узла и `/metrics`
+/// (`tp_blob_verify_*`); исправление — только вручную (`thepost verify --fix`). В кластере проход выполняет один
+/// узел — держатель лизы `lease_name`. Требует перезапуска.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerifySchedule {
+    /// Выполнять проверку по расписанию (`true`).
+    pub enabled: bool,
+    /// Время прохода, UTC, `ЧЧ:ММ` (`03:00`); при `interval` не в целых сутках — сдвиг сетки проходов от
+    /// полуночи UTC 1970-01-01.
+    #[serde(deserialize_with = "time_of_day::deserialize")]
+    #[schemars(with = "String")]
+    pub at: Duration,
+    /// Период проходов (`24h` — раз в сутки в `at`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub interval: Duration,
+    /// Имя лизы лидера (`blob-verify`).
+    pub lease_name: String,
+    /// Срок лизы (`2m`): продлевается, пока идёт проход; после прохода держится до истечения, чтобы узел с
+    /// отстающими часами не повторил проход, — срок должен покрывать расхождение часов узлов.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub lease_ttl: Duration,
+}
+
+impl Default for VerifySchedule {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            at: Duration::from_secs(3 * 3600),
+            interval: Duration::from_secs(24 * 3600),
+            lease_name: "blob-verify".to_owned(),
+            lease_ttl: Duration::from_secs(120),
+        }
+    }
+}
+
+impl VerifySchedule {
+    /// Период и срок лизы положительны, имя лизы задано.
+    pub fn check(&self) -> Result<()> {
+        if self.interval.is_zero() {
+            return Err(Error::invalid(
+                "maintenance: verify.interval must be positive",
+            ));
+        }
+        if self.lease_ttl.is_zero() {
+            return Err(Error::invalid(
+                "maintenance: verify.lease_ttl must be positive",
+            ));
+        }
+        if self.lease_name.is_empty() {
+            return Err(Error::invalid("maintenance: verify.lease_name is empty"));
+        }
         Ok(())
+    }
+
+    /// Сколько ждать от момента `now` (от начала эпохи Unix, UTC) до следующего прохода: ближайший момент
+    /// сетки `at + k·interval` строго после `now`.
+    pub fn until_next(&self, now: Duration) -> Duration {
+        let interval = self.interval.as_nanos().max(1);
+        let phase = self.at.as_nanos() % interval;
+        let since = (now.as_nanos() + interval - phase) % interval;
+        let wait = interval - since;
+        Duration::new(
+            u64::try_from(wait / 1_000_000_000).unwrap_or(u64::MAX),
+            u32::try_from(wait % 1_000_000_000).unwrap_or(0),
+        )
+    }
+}
+
+/// Время суток `ЧЧ:ММ` (UTC) как смещение от полуночи.
+mod time_of_day {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Duration, D::Error> {
+        use serde::de::Error as _;
+        let raw = String::deserialize(d)?;
+        let parsed = raw.split_once(':').and_then(|(h, m)| {
+            let two_digits = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit());
+            if !two_digits(h) || !two_digits(m) {
+                return None;
+            }
+            let (h, m) = (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?);
+            (h < 24 && m < 60).then(|| Duration::from_secs(h * 3600 + m * 60))
+        });
+        parsed
+            .ok_or_else(|| D::Error::custom(format!("время суток {raw:?}: ожидается ЧЧ:ММ (UTC)")))
     }
 }
 
@@ -1131,6 +1231,54 @@ blob:
             "{MINIMAL_DEV}maintenance:\n  purge_interval: 0s\n"
         )));
         assert!(e.contains("purge_interval"), "{e}");
+    }
+
+    /// APP-44: расписание проверки целостности — раз в сутки в 03:00 UTC по умолчанию; время и период из
+    /// config.yaml; неверное время и нулевой период — ошибки.
+    #[test]
+    fn maintenance_verify_schedule() {
+        let config = |yaml: &str| parse(&format!("{MINIMAL_DEV}maintenance:\n  verify:\n{yaml}"));
+        let section = |yaml: &str| {
+            config(yaml)
+                .expect("config")
+                .section::<MaintenanceSection>(MAINTENANCE)
+                .expect("section")
+                .verify
+                .clone()
+        };
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        let v = parse(MINIMAL_DEV)
+            .expect("config")
+            .section::<MaintenanceSection>(MAINTENANCE)
+            .expect("section")
+            .verify
+            .clone();
+        assert_eq!(v, VerifySchedule::default());
+        assert!(v.enabled);
+        assert_eq!((v.at, v.interval), (hours(3), hours(24)));
+        // Сутки: до 03:00 — в тот же день, в 03:00 и позже — на следующий.
+        let day = 20_000 * hours(24);
+        assert_eq!(v.until_next(day + hours(1)), hours(2));
+        assert_eq!(v.until_next(day + hours(3)), hours(24));
+        assert_eq!(v.until_next(day + hours(23)), hours(4));
+
+        let v = section("    at: \"23:30\"\n    interval: 12h\n    enabled: false\n");
+        assert!(!v.enabled);
+        assert_eq!(v.at, Duration::from_secs(23 * 3600 + 30 * 60));
+        assert_eq!(
+            v.until_next(day + hours(11)),
+            Duration::from_secs(30 * 60),
+            "период 12h: проходы в 11:30 и 23:30"
+        );
+
+        for bad in ["24:00", "3:00", "03:60", "ночью"] {
+            let e = err(config(&format!("    at: \"{bad}\"\n")));
+            assert!(e.contains("ЧЧ:ММ"), "{bad}: {e}");
+        }
+        let e = err(config("    interval: 0s\n"));
+        assert!(e.contains("verify.interval"), "{e}");
+        let e = err(config("    lease_ttl: 0s\n"));
+        assert!(e.contains("verify.lease_ttl"), "{e}");
     }
 
     /// APP-08: шина — в процессе (по умолчанию) или PostgreSQL LISTEN/NOTIFY; Valkey — ошибка строгой проверки.
