@@ -427,6 +427,7 @@
 | [DEP-18](DEP-18.md) | thepost_pki — перевыпуск внутреннего сертификата до конца срока | deploy | A | deploy-15 | todo | — |
 | [APP-25](APP-25.md) | thepost doctor — срок внутренних сертификатов | app | A | app-24 | ready | — |
 | [SYS-12](SYS-12.md) | Landlock — резолвер systemd-resolved (Ubuntu 24.04) | sys | A | sys-07 | ready | — |
+| [DEP-24](DEP-24.md) | эталон на Debian 13 и Ubuntu 26.04 | deploy | A | deploy-16 | todo | DEP-17 |
 | [DEP-19](DEP-19.md) | эталон Ansible на Astra Linux SE 1.8 | deploy | A | deploy-16 | todo | DEP-15,DEP-17 |
 | [DEP-20](DEP-20.md) | эталон Ansible на РЕД ОС 8 | deploy | A | deploy-16 | todo | DEP-15,DEP-17 |
 | [APP-30](APP-30.md) | cluster.listen — адрес приёма межузловых вызовов отдельно от объявляемого | app | A | app-29 | todo | APP-18 |
@@ -435,6 +436,8 @@
 | [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | ready | CTR-31,SMTP-22 |
 | [META-44](META-44.md) | очередь модерации без группы в PostgreSQL | meta | B | meta-28 | todo | CTR-43 |
 | [SMTP-30](SMTP-30.md) | исход Moderate правил потока — в очередь модерации | smtp | A | smtp-11 | todo | CTR-43,SMTP-22 |
+| [CTR-49](CTR-49.md) | учётная запись в очереди и учёте BLOB, сигнал ShardsChanged | contracts | B | contracts-36 | todo | CTR-35 |
+| [CTR-50](CTR-50.md) | подключение отключённого ящика — опция «оставить» / «удалить» содержимое | contracts | B | contracts-36 | todo | CTR-35 |
 | [DEPS-06](DEPS-06.md) | HTTP/2 для межузловых вызовов — фичи axum и reqwest | deps | B | deps-06 | todo | CLU-14 |
 | [CLU-15](CLU-15.md) | Rpc — h2 в ALPN | cluster | A | cluster-10 | todo | DEPS-06 |
 | [DEP-22](DEP-22.md) | сертификаты узлов с URI thepost:node:<id> | deploy | A | deploy-20 | todo | CLU-14 |

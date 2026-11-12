@@ -7,6 +7,7 @@
 # и сравнение sha256 бинарника (выпуск не блокирует, расхождение — красный job).
 # CI-05 (решение 2026-11-01): архивы и образ проверяются на интерпретаторы и сценарии (.github/interp_check.py)
 # до публикации; нарушение — красный build (беты нет) или image (бета без образа).
+# CI-06: build и repro собирают console/dist (.github/actions/console) до cross build; образ — пока без консоли.
 name: Beta
 
 on:
@@ -78,7 +79,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - run: cross build --release --locked -p thepost --target ${{ matrix.target }}
+      - id: console
+        uses: ./.github/actions/console
+      - run: cross build --release --locked -p thepost --target ${{ matrix.target }} ${{ steps.console.outputs.cargo-args }}
       - name: Smoke (x86_64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: target/${{ matrix.target }}/release/thepost --version || target/${{ matrix.target }}/release/thepost
@@ -175,7 +178,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - run: cross build --release --locked -p thepost --target ${{ matrix.target }}
+      - id: console
+        uses: ./.github/actions/console
+      - run: cross build --release --locked -p thepost --target ${{ matrix.target }} ${{ steps.console.outputs.cargo-args }}
       - uses: actions/download-artifact@v4
         with:
           name: ${{ env.PKG }}

@@ -2,3 +2,5 @@
 **/*.rs.bk
 .env
 junit.xml
+/console/dist
+/console/node_modules

@@ -12,7 +12,7 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 141/177 | 210/259 | в работе, 81 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 141/178 | 210/262 | в работе, 80 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
 | Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 0/39 | 0/80 | не начат | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/0 | 0/0 | карточки — после Ф1 | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
@@ -46,7 +46,7 @@
    - `app-07` (APP-11, CLI `thepost admin`), `jmap-14` (JMAP-14, автонастройка клиентов), `auth-06` (AUTH-11).
    - `smtp-06` (SMTP-20…23: доверенные источники, принятые домены, точки правил, SRS/ARC) → `app-05` (APP-09).
    - `app-04` (APP-08, взаимодействие без опроса), `platform-11` (PLT-21), `ci-03`, `ci-04`, `deps-01`;
-     `deps-02` (DEPS-02), `deps-03` → `jmap-15` (JMAP-22, подпись профиля) → `platform-13` (PLT-23) → `app-22` (APP-23), `admin-07` (ADM-12), `app-19` (APP-20), `app-20` (APP-21, CLI на типах tp-admin), `contracts-32` (CTR-44, список учётных записей) → `meta-29` (META-45, побайтный порядок), `docs-01` (DOC-01, PREREQUISITES), `app-23` (APP-24) и `deploy-14` (DEP-16) — база UTF-8, `deploy-15` (UTC, chrony, перевыпуск PKI), `app-24`, `sys-07`, `deploy-16` (Astra Linux SE, РЕД ОС), `app-29` (APP-30, `cluster.listen`), `deploy-19` (DEP-23, копия OpenBao), `admin-08` (ADM-13) → `app-21` (APP-22), `platform-12` (PLT-22, mTLS источников).
+     `deps-02` (DEPS-02), `deps-03` → `jmap-15` (JMAP-22, подпись профиля) → `platform-13` (PLT-23) → `app-22` (APP-23), `admin-07` (ADM-12), `app-19` (APP-20), `app-20` (APP-21, CLI на типах tp-admin), `contracts-32` (CTR-44, список учётных записей) → `meta-29` (META-45, побайтный порядок), `docs-01` (DOC-01, PREREQUISITES), `app-23` (APP-24) и `deploy-14` (DEP-16) — база UTF-8, `deploy-15` (UTC, chrony, перевыпуск PKI), `app-24`, `sys-07`, `deploy-16` (Debian 13, Ubuntu 26.04, Astra Linux SE, РЕД ОС), `app-29` (APP-30, `cluster.listen`), `deploy-19` (DEP-23, копия OpenBao), `admin-08` (ADM-13) → `app-21` (APP-22), `platform-12` (PLT-22, mTLS источников).
    - Выход этапа: `deploy-12` (DEP-12…14 — учётные записи и наполнение стенда, отчёт по Д.7, стресс, отказы, 72 ч) и
      `deploy-13` (DEP-15 — резервное копирование SMB: pgBackRest и копия каталога писем, восстановление с `thepost verify`).
    - Приёмка этапа: критерии выхода Ф1 ниже (нагрузка Д.6 для SMB) — отчёт `criteria.md` DEP-13 без «не прошёл».
@@ -364,13 +364,14 @@
 | deploy-15 | DEP-17, DEP-18 | A | deploy-14 | 4 |
 | app-24 | APP-25 | A | — | 2 |
 | sys-07 | SYS-12 | A | — | 2 |
-| deploy-16 | DEP-19, DEP-20 | A | deploy-13, deploy-15 | 4 |
+| deploy-16 | DEP-24, DEP-19, DEP-20 | A | deploy-13, deploy-15 | 4 |
 | app-29 | APP-30 | A | app-17 | 2 |
 | deploy-19 | DEP-23 | A | deploy-13 | 4 |
 | ✅ platform-12 | PLT-22 | A | smtp-06 | 2 |
 | contracts-31 (ветка `x/contracts-31`) | CTR-43 | B | contracts-19, smtp-06 | 1 |
 | meta-28 (ветка `x/meta-28`) | META-44 | B | contracts-31 | 3 |
 | smtp-11 | SMTP-30 | A | contracts-31, meta-28 | 4 |
+| contracts-36 (ветка `x/contracts-36`) | CTR-49, CTR-50 | B | contracts-23 | 1 |
 | deps-06 (ветка `x/deps-06`) | DEPS-06 | B | cluster-09 | 1 |
 | cluster-10 | CLU-15 | A | deps-06 | 4 |
 | deploy-20 | DEP-22 | A | cluster-09 | 4 |
