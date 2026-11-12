@@ -352,8 +352,8 @@ impl Services {
 
     /// Доставка и обработчик транзакций SMTP (smtp-in, submission): проверки SPF/DKIM/DMARC/ARC, Milter, очередь,
     /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC), политики
-    /// организации (профиль Milter, лимиты сеанса submission — `PgMeta`, SMTP-40) и правила потока почты модуля
-    /// (если включён).
+    /// организации (профиль Milter, лимиты сеанса submission — `PgMeta`, SMTP-40), лимиты отправки в час — общие с
+    /// submission и для отправки из JMAP (SMTP-43) — и правила потока почты модуля (если включён).
     pub fn delivery(&self, smtp: &SmtpConfig) -> Result<Arc<Delivery>> {
         // Приглашения и ответы извне (iMIP, SMTP-33) после доставки в ящик применяются к календарю получателя.
         let delivery = self.base_delivery(smtp)?.with_itip(self.itip.clone());
@@ -397,7 +397,8 @@ impl Services {
             .with_transport(self.routes.clone())
             .with_forwarding(Arc::new(forwarding))
             .with_rules(self.rules.clone())
-            .with_policies(Arc::new(self.meta.clone())))
+            .with_policies(Arc::new(self.meta.clone()))
+            .with_send_limits(self.send_limits.clone()))
     }
 
     /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
