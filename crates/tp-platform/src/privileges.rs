@@ -247,7 +247,10 @@ pub fn role_paths(cfg: &Config, config_file: &Path) -> RolePaths {
         }
     } else {
         paths.config.push(tls.cert_file.clone());
-        paths.config.push(tls.key_file.clone());
+        // Ключ из хранилища секретов (`tls.key`) на диске не лежит.
+        if tls.key.is_none() {
+            paths.config.push(tls.key_file.clone());
+        }
     }
     if let Ok(secrets) = cfg.section::<SecretsConfig>("secrets")
         && secrets.url.is_some()

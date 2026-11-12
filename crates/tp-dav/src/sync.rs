@@ -5,7 +5,7 @@
 //! Изменений больше `limit` (`nresults` клиента, не больше `dav.max_response_items`) — `507` с
 //! `number-of-matches-within-limits` для коллекции и токен продолжения. Неизвестный, чужой или устаревший токен
 //! (надгробия очищены: `Conflict` хранилища) — 403 `valid-sync-token`; `sync-level` кроме `1` — 403
-//! `sync-traversal-supported`. Другие отчёты — 403 `supported-report` (calendar-query, multiget — DAV-06, DAV-07).
+//! `sync-traversal-supported`. Отчёты CalDAV — [`crate::query`]; остальные — 403 `supported-report`.
 
 use std::collections::HashMap;
 
@@ -17,8 +17,9 @@ use tp_contracts::{Error, ModSeq, Result};
 
 use crate::path::{self, Target};
 use crate::props::{self, Res, SYNC_PREFIX, Want};
+use crate::query::{self, unsupported};
 use crate::server::{Cx, multistatus, precondition, status};
-use crate::xml::{DAV, Element, Multistatus, PropName};
+use crate::xml::{CALDAV, DAV, Element, Multistatus, PropName};
 
 /// Разобранный запрос `sync-collection`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +88,9 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, body: Body) -> Result<R
         Ok(None) => return Ok(status(StatusCode::BAD_REQUEST)),
         Err(code) => return Ok(status(code)),
     };
+    if el.ns == CALDAV {
+        return query::report(cx, target, &el).await;
+    }
     let req = match SyncRequest::parse(&el) {
         Ok(r) => r,
         Err(SyncError::Report) => return Ok(unsupported()),
@@ -153,10 +157,6 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, body: Body) -> Result<R
     }
     ms.sync_token(&props::sync_token(ch.new_state));
     Ok(multistatus(ms))
-}
-
-fn unsupported() -> Response {
-    precondition(StatusCode::FORBIDDEN, "<d:supported-report/>")
 }
 
 fn invalid_token() -> Response {

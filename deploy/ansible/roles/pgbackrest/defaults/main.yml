@@ -48,6 +48,20 @@ thepost_backup_restic_opts: >-
 thepost_backup_rsync_dest: /var/backups/thepost/blob-mirror
 thepost_backup_rsync_delete: false
 
+# Снимок Raft OpenBao (DEP-23, решение 39; все секреты The Post: DKIM, AppRole, пароли СУБД, ключи копий) — после
+# каждой копии СУБД (thepost-backup-openbao.service) в то же хранилище копий: репозиторий restic (тег thepost-openbao)
+# или каталог rsync. Вход — AppRole с политикой только на снимок; role_id и secret_id выдаёт OpenBao, на ВМ — только
+# зашифрованная учётная запись systemd. Снимок зашифрован ключом OpenBao: без ключа распечатывания (и ключей
+# восстановления, root-токена — openbao-init.json) его не прочитать, их администратор хранит вне сервера.
+thepost_backup_openbao: true
+# Своё расписание снимка (OnCalendar); пусто — только после копий СУБД.
+thepost_backup_openbao_schedule: ""
+thepost_backup_openbao_approle: thepost-backup-snapshot
+# rsync: каталог снимков (локальный или [user@]host:каталог), рядом с зеркалом каталога писем.
+thepost_backup_openbao_rsync_dest: "{{ thepost_backup_rsync_dest | dirname }}/openbao"
+# Снимки хранятся не меньше глубины PITR + неделя (последний — всегда); rsync по SSH — без удаления.
+thepost_backup_openbao_keep_days: "{{ thepost_backup_retention_days | int + 8 }}"
+
 # Секреты: KV v2 OpenBao, отдельный от thepost (узлу не доступен, политика thepost — только thepost/*).
 thepost_backup_openbao_mount: thepost-backup
 # Зашифрованные учётные данные systemd (systemd-creds encrypt): auto — TPM2 + ключ ВМ, если есть TPM, иначе ключ ВМ.
@@ -80,6 +94,19 @@ thepost_restore_blob: true
 thepost_restore_blob_snapshot: ""
 # После сверки удалить «сирот» (объекты новее T): thepost verify --fix.
 thepost_restore_verify_fix: true
+# OpenBao из снимка (restore.yml -e thepost_restore_openbao=true; новая ВМ или откат секретов) — до СУБД.
+thepost_restore_openbao: false
+# Снимок: restic — ID (thepost-restic snapshots --tag thepost-openbao), rsync — имя каталога openbao-<время>;
+# latest — последний.
+thepost_restore_openbao_snapshot: latest
+# Хранимое вне сервера (на управляющей машине): openbao-init.json прежнего сервера (root-токен, ключи
+# восстановления; кладётся на ВМ вместо нового) и/или токен администратора прежнего OpenBao.
+thepost_restore_openbao_init_src: ""
+thepost_restore_openbao_admin_token: ""
+# Ключ распечатывания прежнего сервера: seal static — файл ключа ({{ openbao_static_key_file }} прежней ВМ) на
+# управляющей машине; shamir — список ключей; pkcs11 и KMS — тот же ключ доступен новой ВМ, параметров нет.
+thepost_restore_openbao_static_key_src: ""
+thepost_restore_openbao_unseal_keys: []
 # Сразу после восстановления — новая полная копия (новая линия времени PostgreSQL).
 thepost_restore_full_backup: true
 
@@ -88,4 +115,7 @@ thepost_backup_timers: >-
   {{ [{'name': 'thepost-backup-full', 'unit': 'thepost-backup@full.service', 'schedule': thepost_backup_full_schedule},
       {'name': 'thepost-backup-diff', 'unit': 'thepost-backup@diff.service', 'schedule': thepost_backup_diff_schedule}]
      + ([{'name': 'thepost-backup-blob', 'unit': 'thepost-backup-blob.service', 'schedule': thepost_backup_blob_schedule}]
-        if thepost_backup_blob_schedule | length > 0 else []) }}
+        if thepost_backup_blob_schedule | length > 0 else [])
+     + ([{'name': 'thepost-backup-openbao', 'unit': 'thepost-backup-openbao.service',
+          'schedule': thepost_backup_openbao_schedule}]
+        if thepost_backup_openbao and thepost_backup_openbao_schedule | length > 0 else []) }}

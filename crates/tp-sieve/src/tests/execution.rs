@@ -9,7 +9,7 @@ use crate::{Action, Context, Limits, Outcome, check, run};
 const ENV_FROM: &str = "alice@example.com";
 const ENV_TO: &str = "bob+lists@example.org";
 
-fn exec_raw(script: &str, message: &[u8], limits: &Limits) -> Outcome {
+pub(super) fn exec_raw(script: &str, message: &[u8], limits: &Limits) -> Outcome {
     let program = match check(script) {
         Ok(p) => p,
         Err(d) => panic!("{script}: {d:?}"),
@@ -25,7 +25,7 @@ fn exec_raw(script: &str, message: &[u8], limits: &Limits) -> Outcome {
 }
 
 /// Кратко: действия через запятую и `implicit-keep` в конце; ошибка — `error`.
-fn summary(o: &Outcome) -> String {
+pub(super) fn summary(o: &Outcome) -> String {
     let mut v: Vec<String> = o
         .actions
         .iter()
@@ -51,12 +51,12 @@ fn summary(o: &Outcome) -> String {
     v.join(", ")
 }
 
-fn on_mail(script: &str, mail: &str) -> String {
+pub(super) fn on_mail(script: &str, mail: &str) -> String {
     let raw = corpus_mail(mail).expect(mail).raw;
     summary(&exec_raw(script, &raw, &Limits::default()))
 }
 
-fn on_text(script: &str, message: &str) -> String {
+pub(super) fn on_text(script: &str, message: &str) -> String {
     summary(&exec_raw(script, message.as_bytes(), &Limits::default()))
 }
 
@@ -285,7 +285,7 @@ fn control_and_actions() {
         ),
         (
             "require \"body\"; keep; if body :contains \"fox\" { discard; }",
-            "error, implicit-keep",
+            "keep, discard",
         ),
     ];
     for (script, expected) in cases {

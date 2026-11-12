@@ -1,0 +1,38 @@
+---
+source: crates/tp-dav/src/tests/query.rs
+expression: r.show()
+---
+207 Multi-Status
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/work/weekly.ics</d:href>
+<d:propstat>
+<d:prop>
+<d:getetag>"3"</d:getetag>
+<c:calendar-data>BEGIN:VCALENDAR&#13;
+VERSION:2.0&#13;
+PRODID:-//test//RU&#13;
+BEGIN:VEVENT&#13;
+UID:weekly&#13;
+DTSTAMP:20260101T000000Z&#13;
+SUMMARY:Перенос&#13;
+DTSTART:20260121T150000Z&#13;
+DTEND:20260121T160000Z&#13;
+RECURRENCE-ID:20260120T090000Z&#13;
+END:VEVENT&#13;
+BEGIN:VEVENT&#13;
+UID:weekly&#13;
+DTSTAMP:20260101T000000Z&#13;
+SUMMARY:Статус&#13;
+DTSTART:20260127T090000Z&#13;
+DTEND:20260127T100000Z&#13;
+RECURRENCE-ID:20260127T090000Z&#13;
+END:VEVENT&#13;
+END:VCALENDAR&#13;
+</c:calendar-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+</d:multistatus>
