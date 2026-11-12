@@ -330,9 +330,9 @@ impl Delivery {
         }
     }
 
-    /// Лимиты отправки в час (SMTP-43) для [`Delivery::submit`] (JMAP): писем — `Policy::send_per_hour`,
-    /// адресатов — `Policy::rcpts_per_hour` учётной записи отправителя; те же счётчики, что у сеансов submission
-    /// (`SessionCtx::send_limits`). Без них отправка вне сессии не ограничена.
+    /// Лимиты отправки в час (SMTP-43) для [`Delivery::submit`] и отложенной отправки (JMAP): писем —
+    /// `Policy::send_per_hour`, адресатов — `Policy::rcpts_per_hour` учётной записи отправителя; те же счётчики, что
+    /// у сеансов submission (`SessionCtx::send_limits`). Без них отправка вне сессии не ограничена.
     pub fn with_send_limits(mut self, limits: Arc<SendLimits>) -> Self {
         self.send_limits = Some(limits);
         self
@@ -1876,50 +1876,9 @@ impl Delivery {
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<Submitted> {
-        let limited = match &self.send_limits {
-            Some(l) if tenant == self.deps.tenant => self
-                .sender_by_address(mail_from)
-                .await?
-                .map(|account| (l, account)),
-            _ => None,
-        };
-        let Some((l, account)) = limited else {
-            return self.submit_unlimited(tenant, mail_from, rcpts, raw).await;
-        };
-        let policy = self.account_policy(tenant, account).await?;
-        let key = account.to_string();
-        let now = Instant::now();
-        let exceeded = if !l.allow_message_at(policy.send_per_hour_or_default(), &key, now) {
-            Some(limits::MESSAGES_EXCEEDED)
-        } else if !l.allow_rcpts_at(policy.rcpts_per_hour_or_default(), &key, rcpts.len(), now) {
-            Some(limits::RCPTS_EXCEEDED)
-        } else {
-            None
-        };
-        if let Some(text) = exceeded {
-            let line = format!("451 4.7.1 {text}");
-            let step = Step::new(Ek::Reject, Dd::Defer, rcpts.to_vec()).reason(line.clone());
-            self.track(mail_from, tracking::message_id(&raw).as_deref(), vec![step])
-                .await;
-            tracing::info!(
-                rcpts = rcpts.len(),
-                "smtp: отправка вне сессии отклонена лимитом в час"
-            );
+        if let Some(line) = self.over_send_limit(tenant, mail_from, rcpts, &raw).await? {
             return Ok(Submitted::all(rcpts, SubmitStatus::Failed(line)));
         }
-        let sent = self.submit_unlimited(tenant, mail_from, rcpts, raw).await?;
-        l.record_at(self.max_tracked, &key, rcpts.len(), Instant::now());
-        Ok(sent)
-    }
-
-    /// [`Delivery::submit`] без лимитов отправки.
-    async fn submit_unlimited(
-        &self,
-        tenant: TenantId,
-        mail_from: &str,
-        rcpts: &[String],
-        raw: Bytes,
-    ) -> Result<Submitted> {
         let id = crate::server::next_id();
         let requested = rcpts;
         let Flowed {
@@ -1957,6 +1916,49 @@ impl Delivery {
             })
             .collect();
         Ok(Submitted { rcpts: statuses })
+    }
+
+    /// Лимиты отправки в час вне сессии SMTP ([`Delivery::with_send_limits`], SMTP-43) — для [`Delivery::submit`] и
+    /// [`Delivery::schedule`]: отправитель `mail_from` — учётная запись организации узла, письмо — `send_per_hour`
+    /// писем и `rcpts_per_hour` адресатов её политики за скользящий час. Допущенное письмо учитывается сразу (до
+    /// отправки или постановки). Превышен предел — ответ `451 4.7.1` и событие отказа в журнале доставки. Без
+    /// лимитов, для другой организации и внешнего отправителя — без ограничения.
+    async fn over_send_limit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: &Bytes,
+    ) -> Result<Option<String>> {
+        let Some(l) = &self.send_limits else {
+            return Ok(None);
+        };
+        if tenant != self.deps.tenant {
+            return Ok(None);
+        }
+        let Some(account) = self.sender_by_address(mail_from).await? else {
+            return Ok(None);
+        };
+        let policy = self.account_policy(tenant, account).await?;
+        let key = account.to_string();
+        let now = Instant::now();
+        let exceeded = if !l.allow_message_at(policy.send_per_hour_or_default(), &key, now) {
+            limits::MESSAGES_EXCEEDED
+        } else if !l.allow_rcpts_at(policy.rcpts_per_hour_or_default(), &key, rcpts.len(), now) {
+            limits::RCPTS_EXCEEDED
+        } else {
+            l.record_at(self.max_tracked, &key, rcpts.len(), now);
+            return Ok(None);
+        };
+        let line = format!("451 4.7.1 {exceeded}");
+        let step = Step::new(Ek::Reject, Dd::Defer, rcpts.to_vec()).reason(line.clone());
+        self.track(mail_from, tracking::message_id(raw).as_deref(), vec![step])
+            .await;
+        tracing::info!(
+            rcpts = rcpts.len(),
+            "smtp: отправка вне сессии отклонена лимитом в час"
+        );
+        Ok(Some(line))
     }
 
     /// Правила Sieve получателей письма `raw` (SMTP-31): доставка с адресом получателя заменяется доставками в папки
