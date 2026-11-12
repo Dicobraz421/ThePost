@@ -31,10 +31,11 @@ maintenance:
   purge_interval: 1h
   admin_token_retention: 30d
   verify: { at: "03:00", interval: 24h }
-meta:
-  dav: { tombstone_ttl: 90d }          # старше — клиенту полная синхронизация
-  sieve: { vacation_log_ttl: 90d }
-  delivery: { retention: 30d }
+# Сроки очистки — секция meta (по умолчанию):
+#   meta:
+#     dav: { tombstone_ttl: 90d }        # надгробия DAV; старше — клиенту полная синхронизация
+#     sieve: { vacation_log_ttl: 90d }   # журнал автоответов
+#     delivery: { retention: 30d }       # журнал доставки
 
 # Календари и контакты (роль dav): лимиты CalDAV и CardDAV; полный перечень — thepost config schema.
 dav:
