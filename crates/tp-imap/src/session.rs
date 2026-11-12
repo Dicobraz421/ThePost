@@ -63,8 +63,8 @@ pub trait Transport: Send + Sized + 'static {
     /// Канал защищён TLS.
     fn tls(&self) -> bool;
 
-    /// Адрес клиента соединения (из заголовка PROXY или адрес TCP-собеседника) — для защиты от перебора
-    /// (`SaslContext::peer`, CTR-57).
+    /// Адрес клиента соединения (из заголовка PROXY или адрес TCP-собеседника): защита от перебора
+    /// (`SaslContext::peer`, CTR-57) и журнал аудита ящиков (IMAP-15).
     fn peer(&self) -> IpAddr;
 
     /// Можно предложить STARTTLS.
@@ -72,9 +72,6 @@ pub trait Transport: Send + Sized + 'static {
 
     /// Рукопожатие TLS после ответа на `STARTTLS`.
     fn starttls(self) -> impl Future<Output = Result<Self>> + Send;
-
-    /// Адрес клиента для журнала аудита.
-    fn client(&self) -> Option<IpAddr>;
 }
 
 impl Transport for Conn {
@@ -98,10 +95,6 @@ impl Transport for Conn {
 
     fn starttls(self) -> impl Future<Output = Result<Self>> + Send {
         Conn::starttls(self)
-    }
-
-    fn client(&self) -> Option<IpAddr> {
-        Some(self.info.client.ip())
     }
 }
 
@@ -244,7 +237,7 @@ impl<T: Transport> Session<T> {
     /// Сессия соединения.
     pub fn new(ctx: Arc<SessionCtx>, conn: T) -> Self {
         let reader = reader(&ctx.config);
-        let audit = Audit::new(ctx.deps.audit.clone(), "imap", conn.client());
+        let audit = Audit::new(ctx.deps.audit.clone(), "imap", Some(conn.peer()));
         Self {
             ctx,
             peer: conn.peer(),
