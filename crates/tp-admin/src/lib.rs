@@ -11,11 +11,13 @@
 //! - [`app_passwords`] — пароли приложений: выпуск (значение один раз), список, отзыв;
 //! - [`transport`] — настройки транспорта: принятые домены, доверенные источники, политики доменов назначения;
 //! - [`sieve`] — правила Sieve и автоответ учётной записи, скрипт организации: проверка текста до записи;
+//! - [`console`] — веб-консоль: вшитая статика `console/dist` (фича `console`), маршруты SPA, заголовки безопасности;
 //! - [`init`] — первый администратор без OIDC (`thepost admin init`): локальный сокет, одноразовый токен, сессия.
 
 pub mod accounts;
 pub mod app_passwords;
 pub mod audit;
+pub mod console;
 pub mod delivery;
 pub mod export;
 pub mod groups;
@@ -29,6 +31,7 @@ pub mod transport;
 
 pub use accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
 pub use audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink, LogAudit};
+pub use console::ConsoleConfig;
 pub use export::{
     AuditExportConfig, Fanout, OtlpAudit, OtlpAuditConfig, SyslogAudit, SyslogConfig,
 };
