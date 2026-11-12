@@ -1,9 +1,16 @@
 # Let's Encrypt через certbot (ACME HTTP-01, --standalone): порт 80 узла открыт из интернета, имена
 # thepost_tls_names указывают на узел (DNS A/AAAA). Продление — certbot.timer пакета; deploy-hook копирует файлы,
 # thepost перечитывает их без перезапуска (tls.reload_interval). Смена списка имён — certbot certonly --expand вручную.
+# AlmaLinux: certbot — из EPEL; РЕД ОС — пакет дистрибутива; RHEL — EPEL подключает администратор.
 ---
+- name: Enable EPEL for certbot
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+  when: ansible_pkg_mgr != 'apt' and ansible_distribution not in ['RedHat', 'RED']
+
 - name: Install certbot
-  ansible.builtin.apt:
+  ansible.builtin.package:
     name: certbot
     state: present
 
@@ -38,6 +45,14 @@
          + (['--server', thepost_acme_directory_url] if thepost_acme_directory_url | length > 0 else [])
          + (thepost_tls_names | map('regex_replace', '^', '--domain=') | list) }}
     creates: /etc/letsencrypt/live/thepost/fullchain.pem
+
+# Пакет Debian включает certbot.timer сам; РЕД ОС, AlmaLinux — certbot-renew.timer выключен.
+- name: Enable certbot renewal timer
+  ansible.builtin.systemd_service:
+    name: certbot-renew.timer
+    state: started
+    enabled: true
+  when: ansible_pkg_mgr != 'apt'
 
 - name: Install certificate of client protocols (certbot)
   ansible.builtin.copy:

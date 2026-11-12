@@ -62,7 +62,11 @@ thepost_backup_pg_data_dir: >-
 thepost_backup_pg_conf_dir: >-
   {{ postgresql_conf_dir | default('/etc/postgresql/' ~ thepost_backup_pg_version ~ '/' ~ thepost_backup_pg_cluster) }}
 thepost_backup_pg_port: "{{ postgresql_port | default(5432) }}"
-thepost_backup_pg_unit: "postgresql@{{ thepost_backup_pg_version }}-{{ thepost_backup_pg_cluster }}.service"
+thepost_backup_pg_unit: >-
+  {{ postgresql_unit | default('postgresql@' ~ thepost_backup_pg_version ~ '-' ~ thepost_backup_pg_cluster ~ '.service') }}
+thepost_backup_pg_home: "{{ postgresql_home | default('/var/lib/postgresql') }}"
+# EPEL для restic (AlmaLinux и другие сборки RHEL; на самом RHEL и РЕД ОС не ставится).
+thepost_backup_epel: "{{ ansible_pkg_mgr != 'apt' and ansible_distribution not in ['RedHat', 'RED'] }}"
 # Первая полная копия сразу после установки (без неё PITR недоступен до первого таймера).
 thepost_backup_initial: true
 # Запускать таймеры копий (restore.yml — false до конца восстановления).

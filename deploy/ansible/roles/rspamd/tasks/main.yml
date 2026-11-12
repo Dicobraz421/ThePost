@@ -1,25 +1,52 @@
-# Установка Rspamd для The Post (Debian, Ubuntu). Повторный прогон ничего не меняет.
+# Установка Rspamd для The Post (Debian, Ubuntu, Astra Linux SE; РЕД ОС, AlmaLinux, RHEL). Повторный прогон ничего
+# не меняет.
 ---
 - name: Check OS family
   ansible.builtin.assert:
-    that: ansible_os_family == 'Debian'
-    fail_msg: "Роль rspamd эталона SMB поддерживает Debian и Ubuntu"
+    that: ansible_pkg_mgr in ['apt', 'dnf', 'dnf5']
+    fail_msg: >-
+      Роль rspamd эталона SMB поддерживает Debian, Ubuntu, Astra Linux SE (apt) и РЕД ОС, AlmaLinux, RHEL (dnf)
 
-- name: Add Rspamd repository
+- name: Install python3-debian for deb822_repository
+  ansible.builtin.apt:
+    name: python3-debian
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: not rspamd_rhel | bool and rspamd_official_repo | bool
+
+- name: Add Rspamd repository (apt)
   ansible.builtin.deb822_repository:
     name: rspamd
     uris: "{{ rspamd_repo_uri }}"
-    suites: "{{ ansible_distribution_release }}"
+    suites: "{{ rspamd_repo_suite }}"
     components: [main]
     signed_by: "{{ rspamd_repo_key_url }}"
-  when: rspamd_official_repo
+  when: not rspamd_rhel | bool and rspamd_official_repo | bool
   register: rspamd_repo
 
-- name: Install Rspamd
+- name: Install Rspamd (apt)
   ansible.builtin.apt:
     name: rspamd
     state: present
     update_cache: "{{ rspamd_repo is changed }}"
+  when: not rspamd_rhel | bool
+
+- name: Add Rspamd repository (dnf)
+  ansible.builtin.yum_repository:
+    name: rspamd
+    description: Rspamd stable repository
+    baseurl: "{{ rspamd_rpm_repo_uri }}/centos-{{ ansible_distribution_major_version }}/{{ ansible_architecture }}"
+    gpgcheck: true
+    repo_gpgcheck: true
+    gpgkey: "{{ rspamd_rpm_repo_key_url }}"
+  when: rspamd_rhel | bool and rspamd_official_repo | bool
+
+- name: Install Rspamd (dnf)
+  ansible.builtin.dnf:
+    name: rspamd
+    state: present
+  when: rspamd_rhel | bool
 
 - name: Write worker overrides
   ansible.builtin.template:

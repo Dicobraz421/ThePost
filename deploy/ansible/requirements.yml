@@ -7,6 +7,11 @@ collections:
   # 3.13 — postgresql_alter_system; параметры подключения — login_port, login_db (в 4.x/5.x без псевдонимов port, db).
   - name: community.postgresql
     version: ">=3.13.0"
+  # Семейство RHEL (РЕД ОС, AlmaLinux): firewalld — роль thepost, контексты SELinux — роль pgbackrest.
+  - name: ansible.posix
+    version: ">=1.5.0"
+  - name: community.general
+    version: ">=8.0.0"
   # Стенд (deploy/stand): образ imaptest на генераторе.
   - name: containers.podman
     version: ">=1.10.0"

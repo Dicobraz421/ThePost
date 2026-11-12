@@ -5,6 +5,6 @@
 set -eu
 unit="thepost-pgbackrest-$$"
 exec systemd-run --quiet --wait --pipe --collect --service-type=exec --unit="$unit" \
-  --uid=postgres --gid=postgres -p WorkingDirectory=/var/lib/postgresql \
+  --uid=postgres --gid=postgres -p WorkingDirectory={{ thepost_backup_pg_home }} \
   -p LoadCredentialEncrypted=pgbackrest.conf:{{ thepost_backup_creds_dir }}/pgbackrest.cred \
   /usr/bin/pgbackrest --config-include-path="/run/credentials/$unit.service" --stanza={{ thepost_backup_stanza }} "$@"

@@ -26,10 +26,27 @@
       ({{ thepost_backup_retention_days }} сут. + неделя между полными копиями): восстановленные письма потеряют тела
   when: thepost_blob_gc_window is defined and thepost_blob_gc_window is match('^[0-9]+d$')
 
-- name: Install backup tools
-  ansible.builtin.apt:
-    name: "{{ ['pgbackrest', thepost_backup_blob_tool] + (['openssh-client'] if thepost_backup_blob_tool == 'rsync' else []) }}"
+# РЕД ОС, AlmaLinux, RHEL: pgBackRest — PGDG (pgdg-common, роль postgresql) или пакет РЕД ОС; restic — EPEL
+# (AlmaLinux; на RHEL EPEL подключает администратор) или пакет РЕД ОС.
+- name: Enable EPEL
+  ansible.builtin.dnf:
+    name: epel-release
     state: present
+  when: thepost_backup_epel | bool
+
+# dbus — для systemd-run обёрток thepost-pgbackrest и thepost-restic (в минимальной установке Debian 13 его нет).
+- name: Install backup tools
+  ansible.builtin.package:
+    name: >-
+      {{ ['pgbackrest', thepost_backup_blob_tool, 'dbus']
+         + ([('openssh-client' if ansible_pkg_mgr == 'apt' else 'openssh-clients')]
+            if thepost_backup_blob_tool == 'rsync' else []) }}
+    state: present
+
+- name: Start D-Bus
+  ansible.builtin.systemd_service:
+    name: dbus.socket
+    state: started
 
 - name: Secrets and systemd credentials
   ansible.builtin.import_tasks: secrets.yml
@@ -50,6 +67,10 @@
           if thepost_backup_blob_tool == 'rsync' and ':' not in thepost_backup_rsync_dest else []) }}
   loop_control:
     label: "{{ item.path }}"
+
+- name: SELinux contexts of pgBackRest
+  ansible.builtin.include_tasks: selinux.yml
+  when: ansible_selinux.status | default('disabled') == 'enabled'
 
 - name: Create local restic repository directory
   ansible.builtin.file:
