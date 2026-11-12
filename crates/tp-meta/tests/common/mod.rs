@@ -141,6 +141,17 @@ impl SecretStore for MemSecrets {
             .map(Secret::new)
             .ok_or(tp_contracts::Error::NotFound)
     }
+
+    async fn put(&self, r: &SecretRef, value: &Secret) -> tp_contracts::Result<()> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(tp_contracts::Error::UNAVAILABLE);
+        }
+        self.values
+            .lock()
+            .expect("lock")
+            .insert(r.clone(), value.expose().to_owned());
+        Ok(())
+    }
 }
 
 /// Общее хранилище секретов тестов процесса.

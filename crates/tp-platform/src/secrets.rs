@@ -7,7 +7,7 @@
 //! (`GET /v1/<mount>/<путь>`, поле из `data`) — с арендой, если хранилище её выдало. Все поля одного динамического
 //! пути берутся из одной аренды (логин и пароль — из одной выдачи), пока аренда действует.
 //!
-//! Запись — [`SecretWriter`] (ключ TLS, выпущенный встроенным ACME, PLT-29): поле KV v2 сливается с остальными
+//! Запись — [`SecretStore::put`] (ключ TLS, выпущенный встроенным ACME, PLT-29): поле KV v2 сливается с остальными
 //! полями пути и пишется новой версией (`POST /v1/<mount>/data/<путь>` с `options.cas` — версия, с которой
 //! начато слияние; правка в хранилище между чтением и записью — отказ, а не потеря чужих полей).
 //!
@@ -825,36 +825,6 @@ impl VaultStore {
     }
 }
 
-/// Хранилище секретов с записью: узел кладёт выпущенные им секреты (ключ TLS от ACME). Права узла на запись —
-/// только своих путей (политика хранилища).
-#[async_trait]
-pub trait SecretWriter: SecretStore {
-    /// Записывает поле секрета новой версией; остальные поля пути сохраняются. Запрещено политикой — `Forbidden`;
-    /// хранилище недоступно — `Unavailable`; путь не KV v2 или изменён параллельно (отказ `cas`) — `Invalid`.
-    async fn put(&self, secret: &SecretRef, value: &Secret) -> Result<()>;
-}
-
-#[async_trait]
-impl SecretWriter for VaultStore {
-    async fn put(&self, secret: &SecretRef, value: &Secret) -> Result<()> {
-        let path = secret.path();
-        let result = match path.split_once('/') {
-            Some((mount, _)) if self.inner.dynamic_mounts.iter().any(|m| m == mount) => {
-                return Err(Error::invalid(format!(
-                    "secret {secret}: writes go to KV v2, {mount} is in dynamic_mounts"
-                )));
-            }
-            Some((mount, rest)) => self.write_kv(mount, rest, secret.field(), value).await,
-            None => {
-                return Err(Error::invalid(format!(
-                    "secret {secret}: no path inside the mount"
-                )));
-            }
-        };
-        result.map_err(|e| self.fail(secret, e))
-    }
-}
-
 #[async_trait]
 impl SecretStore for VaultStore {
     async fn get(&self, secret: &SecretRef) -> Result<Secret> {
@@ -870,6 +840,24 @@ impl SecretStore for VaultStore {
                 Some(rest) => self.read_kv(mount, rest, secret.field()).await,
                 // KV v2 без пути внутри точки монтирования — такого секрета нет.
                 None => Err(VaultError::NotFound),
+            }
+        };
+        result.map_err(|e| self.fail(secret, e))
+    }
+
+    async fn put(&self, secret: &SecretRef, value: &Secret) -> Result<()> {
+        let path = secret.path();
+        let result = match path.split_once('/') {
+            Some((mount, _)) if self.inner.dynamic_mounts.iter().any(|m| m == mount) => {
+                return Err(Error::invalid(format!(
+                    "secret {secret}: writes go to KV v2, {mount} is in dynamic_mounts"
+                )));
+            }
+            Some((mount, rest)) => self.write_kv(mount, rest, secret.field(), value).await,
+            None => {
+                return Err(Error::invalid(format!(
+                    "secret {secret}: no path inside the mount"
+                )));
             }
         };
         result.map_err(|e| self.fail(secret, e))

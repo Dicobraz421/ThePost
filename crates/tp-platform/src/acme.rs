@@ -3,7 +3,7 @@
 //! без перезапуска.
 //!
 //! Ключ TLS — только в хранилище секретов (решение 100, PLT-29): выпущенный ключ пишется новой версией секрета
-//! `tls.key` ([`SecretWriter`]), затем цепочка — в `tls.cert_file`. Ошибка записи ключа — `ERROR` в журнал,
+//! `tls.key` ([`SecretStore::put`]), затем цепочка — в `tls.cert_file`. Ошибка записи ключа — `ERROR` в журнал,
 //! прежняя пара остаётся; ошибка записи цепочки — прежний ключ возвращается в секрет. Без `tls.key` ACME не
 //! работает (`Invalid`). Узлу нужна запись только своего пути ключа TLS (политика хранилища — DEP-44).
 //!
@@ -33,9 +33,8 @@ use serde::Deserialize;
 use tp_contracts::Error;
 use tp_contracts::config::duration;
 use tp_contracts::role::CancellationToken;
-use tp_contracts::secrets::{Secret, SecretRef};
+use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 
-use crate::secrets::SecretWriter;
 use crate::tls::{TlsCerts, TlsConfig};
 
 /// Секция `acme`.
@@ -181,7 +180,7 @@ pub struct Acme {
     tls: TlsConfig,
     challenges: Http01Challenges,
     certs: Option<Arc<TlsCerts>>,
-    keys: Arc<dyn SecretWriter>,
+    keys: Arc<dyn SecretStore>,
     http: Option<Arc<dyn HttpClient>>,
 }
 
@@ -202,7 +201,7 @@ impl Acme {
         tls: TlsConfig,
         challenges: Http01Challenges,
         certs: Option<Arc<TlsCerts>>,
-        keys: Arc<dyn SecretWriter>,
+        keys: Arc<dyn SecretStore>,
     ) -> Self {
         // Встроенный HTTP-клиент instant-acme берёт процессный провайдер rustls.
         crate::tls::install_crypto_provider();
@@ -620,17 +619,13 @@ mod tests {
         async fn get(&self, secret: &SecretRef) -> tp_contracts::Result<Secret> {
             self.mem.get(secret).await
         }
-    }
 
-    #[async_trait::async_trait]
-    impl SecretWriter for Keys {
         async fn put(&self, secret: &SecretRef, value: &Secret) -> tp_contracts::Result<()> {
             if self.fail_put.load(Ordering::SeqCst) {
                 return Err(Error::Forbidden);
             }
             self.puts.fetch_add(1, Ordering::SeqCst);
-            self.mem.set(secret, value.expose());
-            Ok(())
+            self.mem.put(secret, value).await
         }
     }
 

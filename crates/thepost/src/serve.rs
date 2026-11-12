@@ -235,7 +235,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         aux.clone(),
     )
     .await?;
-    let acme = acme::prepare(&cfg, &sockets, aux.clone()).await?;
+    let acme = acme::prepare(&cfg, store.clone(), &sockets, aux.clone()).await?;
     // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
     let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
         // Ключ по ссылке `tls.key` читается из хранилища секретов узла и перечитывается по новой версии (APP-35).

@@ -640,6 +640,14 @@ mod tests {
         async fn get(&self, _: &crate::secrets::SecretRef) -> Result<crate::secrets::Secret> {
             Err(Error::NotFound)
         }
+
+        async fn put(
+            &self,
+            _: &crate::secrets::SecretRef,
+            _: &crate::secrets::Secret,
+        ) -> Result<()> {
+            Err(Error::Forbidden)
+        }
     }
 
     #[test]
