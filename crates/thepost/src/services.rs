@@ -1336,6 +1336,7 @@ mod tests {
                     display_name: login.into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await
@@ -1394,7 +1395,7 @@ mod tests {
                 .expect("submit");
             assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued, "{sent:?}");
         }
-        let held = GroupStore::held(&meta, t, Some(group.id), 10)
+        let held = GroupStore::held(&meta, t, Some(group.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 2, "{held:?}");
@@ -1460,7 +1461,7 @@ mod tests {
         drop(tx);
         assert_eq!(queued, 1, "DSN отказа не в очереди");
         assert!(
-            GroupStore::held(&meta, t, Some(group.id), 10)
+            GroupStore::held(&meta, t, Some(group.id), None, 10)
                 .await
                 .expect("held")
                 .is_empty()

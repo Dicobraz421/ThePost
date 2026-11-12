@@ -1594,6 +1594,7 @@ async fn meeting_scheduling() {
                     display_name: name.to_owned(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await
