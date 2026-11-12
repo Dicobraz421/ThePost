@@ -1,5 +1,6 @@
 //! META-46…48: календари и контакты на PostgreSQL — общий набор `tp_testkit::suite::dav`, сигналы, RLS, миграция
-//! на базе прежней схемы, шард ящика, очистка надгробий и устаревшие токены синхронизации.
+//! на базе прежней схемы, шард ящика, очистка надгробий и устаревшие токены синхронизации; книга GAL организации
+//! (META-63).
 
 mod common;
 
@@ -10,8 +11,8 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Executor, PgPool};
 use time::OffsetDateTime;
 use tp_contracts::dav::{
-    Collection, CollectionKind, Component, DavStore, DeleteOutcome, ObjectIndex, Precondition,
-    PutOutcome,
+    Collection, CollectionKind, Component, DavStore, DeleteOutcome, GAL_COLLECTION_NAME, GalCard,
+    ObjectIndex, Precondition, PutOutcome,
 };
 use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::{AccountId, DomainId, Error, ModSeq, TenantId};
@@ -93,6 +94,160 @@ async fn passes_contract_suite() {
         },
     };
     suite::dav(&meta, &fx).await;
+}
+
+/// META-63: книга GAL организации (CTR-60) — общий набор.
+#[tokio::test]
+async fn gal_suite() {
+    let Some(pool) = common::pool().await else {
+        return;
+    };
+    let meta = PgMeta::new(pool.clone(), config());
+    let tenant = common::tenant(&pool).await;
+    let (domain, name) = common::domain(&pool, tenant).await;
+    let owner = account_in(&meta, tenant, (domain, &name)).await;
+    let peer = account_in(&meta, tenant, (domain, &name)).await;
+    let fx = DavFixture {
+        owner,
+        peer,
+        foreign: AccountScope {
+            tenant: common::tenant(&pool).await,
+            account: owner.account,
+        },
+    };
+    suite::dav::gal(&meta, &fx).await;
+}
+
+/// META-63: сигнал `GalChanged` после записи книги GAL с изменениями — общий набор.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gal_signals_after_commit() {
+    let Some(pool) = common::pool().await else {
+        return;
+    };
+    let bus = Arc::new(MemEventBus::default());
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default()).with_bus(bus.clone());
+    let tenant = common::tenant(&pool).await;
+    suite::dav::gal_signals(&meta, bus.as_ref(), tenant).await;
+}
+
+/// META-63: UID переходит между карточками одного набора (к соседней, от исчезнувшей) — одна транзакция без
+/// конфликта уникальности; у карточек прежние идентификаторы.
+#[tokio::test]
+async fn gal_uid_moves_between_cards() {
+    let Some(pool) = common::pool().await else {
+        return;
+    };
+    let meta = PgMeta::new(pool.clone(), config());
+    let tenant = common::tenant(&pool).await;
+    let scope = AccountScope {
+        tenant,
+        account: AccountId::new(),
+    };
+    let gal = |name: &str, uid: &str| GalCard {
+        name: name.into(),
+        body: format!("BEGIN:VCARD\r\nUID:{uid}\r\nEND:VCARD\r\n"),
+        index: card(uid),
+    };
+    meta.sync_gal(
+        tenant,
+        "Организация",
+        vec![gal("a.vcf", "x"), gal("b.vcf", "y"), gal("c.vcf", "z")],
+    )
+    .await
+    .expect("sync_gal");
+    let book = meta
+        .collection_by_name(scope, CollectionKind::AddressBook, GAL_COLLECTION_NAME)
+        .await
+        .expect("by name")
+        .expect("книга GAL");
+    let before = meta.list_objects(scope, book.id).await.expect("list");
+    meta.sync_gal(
+        tenant,
+        "Организация",
+        vec![gal("a.vcf", "y"), gal("b.vcf", "z")],
+    )
+    .await
+    .expect("sync_gal");
+    let after = meta.list_objects(scope, book.id).await.expect("list");
+    assert_eq!(
+        after
+            .iter()
+            .map(|r| (r.name.as_str(), r.id))
+            .collect::<Vec<_>>(),
+        [("a.vcf", before[0].id), ("b.vcf", before[1].id)]
+    );
+    for (name, uid) in [("a.vcf", "y"), ("b.vcf", "z")] {
+        let got = meta
+            .object_by_uid(scope, book.id, uid)
+            .await
+            .expect("by uid")
+            .expect("карточка");
+        assert_eq!(got.name, name);
+    }
+}
+
+/// META-63: книга GAL — в основной БД; учётная запись второго шарда видит и читает её, запись — `Forbidden`.
+#[tokio::test]
+async fn gal_lives_in_main_db() {
+    let Some(t) = common::two_shards().await else {
+        return;
+    };
+    let tenant = t.tenant().await;
+    let tenant_id = tenant.0;
+    let scope = t.account_on(tenant, t.shard).await;
+    let a = GalCard {
+        name: "a.vcf".into(),
+        body: "BEGIN:VCARD\r\nUID:a\r\nEND:VCARD\r\n".into(),
+        index: card("a"),
+    };
+    let m = t
+        .meta
+        .sync_gal(tenant_id, "Организация", vec![a.clone()])
+        .await
+        .expect("sync_gal");
+    let list = t
+        .meta
+        .list_collections(scope, CollectionKind::AddressBook)
+        .await
+        .expect("list");
+    assert_eq!(list.len(), 1);
+    let book = &list[0];
+    assert!(book.is_gal());
+    assert_eq!(book.state, m);
+    let got = t
+        .meta
+        .get_object(scope, book.id, "a.vcf")
+        .await
+        .expect("get")
+        .expect("a");
+    assert_eq!((&got.body, &got.index), (&a.body, &a.index));
+    assert_eq!(
+        t.meta
+            .objects_by_id(scope, &[got.id])
+            .await
+            .expect("by id")
+            .len(),
+        1
+    );
+    assert_eq!(
+        t.meta
+            .delete_object(scope, book.id, "a.vcf", Precondition::Any)
+            .await,
+        Err(Error::Forbidden)
+    );
+    let count = async |pool: &DbPool| -> i64 {
+        let mut tx = schema::begin_system(pool).await.expect("begin");
+        let n = sqlx::query_scalar("SELECT count(*) FROM dav_objects WHERE collection_id = $1")
+            .bind(book.id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count");
+        tx.rollback().await.expect("rollback");
+        n
+    };
+    assert_eq!(count(t.main.meta.pool()).await, 1);
+    assert_eq!(count(&t.shard_pool).await, 0);
+    t.drop_db().await;
 }
 
 /// CTR-54, CTR-56: коллекция по умолчанию и свойства, перенос объекта, поиск контактов — общий набор.
