@@ -308,7 +308,7 @@ CTR-35: `DirAccount::org: DirOrg { department (external_id подразделе�
 Порог массового удаления: `exceeds_removal_threshold(removed, total, percent)`, `MASS_REMOVAL_PERCENT` = 5; `SyncGate` — остановка
 синхронизации до подтверждения: `hold_sync(tenant, removed, total, at) -> MassRemoval { removed, total, detected_at, approved }` (подтверждение
 сохраняется, если `removed` не выросло), `pending_sync`, `approve_sync` (нет — `NotFound`; Admin API), `clear_sync` (синхронизация после
-отключения). In-memory — `MemSyncGate`; набор `suite::sync_gate`.
+отключения). PostgreSQL — `PgMeta` (`sync_holds`), in-memory — `MemSyncGate`; набор `suite::sync_gate`.
 CTR-58 (решение 79): `DirAccount::hidden_from_gal: bool` (`#[serde(default)]`, как у групп и почтовых контактов) — запись не попадает
 в адресную книгу (GAL), вход и приём почты не меняются. Заполняет каталог (LDAP — AUTH-16), учитывает построение GAL (DAV-27).
 
@@ -984,3 +984,7 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   организации (`SharingPolicy`, `SharingPolicyStore`). Вид учётной записи — поле `Account::kind` и `AccountUpsert::kind`
   (`meta::AccountKind`), хранится с учётной записью (`tp-meta` — миграция 0031 `accounts.kind`, `tp-testkit`); несовместимо: новые
   обязательные поля `Account` и `AccountUpsert`. Реализации новых хранилищ в памяти и наборы — отдельной волной `tp-testkit`.
+- 2026-11-12 — x/admin-parity (правило владельца 12.11 «старое рядом с новым не оставлять»): у `AccountStore::restore_account`,
+  `disabled_accounts`, `attach_account` нет тел по умолчанию (были `Internal`) — реализации `PgMeta`, `MemMetadata`. `SyncGate` на
+  PostgreSQL — `PgMeta` (миграция 0032 `sync_holds`), набор `suite::sync_gate`. `tp_admin::Deps` — хранилища CTR-35 обязательны
+  (`contacts`, `org`, `dynamic`, `senders`, `mailbox_audit`, `sync`) вместо `Admin::with_parity`.

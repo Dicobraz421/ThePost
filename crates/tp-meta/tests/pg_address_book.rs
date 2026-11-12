@@ -1,5 +1,6 @@
-//! META-33: списки отправителей, контакты, оргструктура, динамические группы, состояние учётной записи и отмена
-//! отправки на PostgreSQL — общие наборы `tp_testkit::suite`; состояние ящика — и на втором шарде.
+//! META-33: списки отправителей, контакты, оргструктура, динамические группы, состояние учётной записи, остановка
+//! синхронизации каталога и отмена отправки на PostgreSQL — общие наборы `tp_testkit::suite`; состояние ящика — и на
+//! втором шарде.
 
 mod common;
 
@@ -20,6 +21,15 @@ async fn sender_lists_suite() {
         account: AccountId::new(),
     };
     suite::sender_lists(&meta, scope(tenant), scope(tenant)).await;
+}
+
+#[tokio::test]
+async fn sync_gate_suite() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let tenant = common::tenant(meta.pool()).await;
+    suite::sync_gate(&meta, tenant).await;
 }
 
 #[tokio::test]
