@@ -5,19 +5,24 @@
 //!   модераторы (непусто — группа модерируемая), скрытие из GAL. У групп каталога (`external_id`, AUTH-07)
 //!   имя, адрес и участники — из каталога: через API меняются только ограничения, модераторы и скрытие
 //!   (если они не сопоставлены в секции каталога, иначе синхронизация их перезапишет); удалить группу каталога
-//!   нельзя;
+//!   нельзя. В ответе — словарь `names`: имя входа каждой упомянутой учётной записи и имя каждой упомянутой
+//!   группы (участники, перечисленные отправители, модераторы); имена читаются страницами списка учётных записей
+//!   и одним списком групп, а не запросом на участника;
 //! - очередь модерации (`/api/v1/orgs/{org}/moderation`): письма по времени постановки, одобрение — доставка
 //!   участникам, отклонение — уведомление отправителя с причиной. Письмо забирается из очереди
 //!   (`GroupStore::take_held`) и передаётся [`Moderation`] (контракт, CTR-31; реализация — `tp-smtp`: раскрытие группы,
-//!   приём в ящики, DSN, журнал доставки); ошибка решения возвращает его в очередь.
+//!   приём в ящики, DSN, журнал доставки); ошибка решения возвращает его в очередь. Тема письма (`subject`) —
+//!   только по `include=subject` и только администратору, с записью в аудит (`crate::content`); источник —
+//!   объект `HeldMessage::blob` ([`Admin::with_held_blobs`], без него — `null`).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{MatchedPath, Path, Query, State};
+use axum::http::{StatusCode, Uri};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 pub use tp_contracts::groups::Moderation;
@@ -28,7 +33,42 @@ use tp_contracts::groups::{
 use tp_contracts::{AccountId, Error, GroupId, HeldId, Result, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::server::{Admin, ApiResult, Problem};
+use crate::content::{self, Access};
+use crate::server::{Admin, ApiResult, Caller, Problem};
+
+/// Участник группы: учётная запись или вложенная группа.
+// Схема OpenAPI контракта `tp_contracts::groups::GroupMember` (в `serde` — тот же вид); значений этого типа нет.
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+#[schema(as = GroupMember)]
+pub enum GroupMemberSchema {
+    /// Учётная запись организации (UUID).
+    Account(String),
+    /// Вложенная группа (UUID).
+    Group(String),
+}
+
+/// Кто может писать в группу: `"anyone"` — все, `"internal"` — учётные записи организации,
+/// `{"only": {"accounts": [...], "groups": [...]}}` — перечисленные учётные записи и участники групп.
+// Схема OpenAPI контракта `tp_contracts::groups::SenderRestriction`; значений этого типа нет.
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+#[schema(as = SenderRestriction)]
+pub enum SenderRestrictionSchema {
+    /// Без ограничений, в том числе внешние отправители.
+    Anyone,
+    /// Только учётные записи организации.
+    Internal,
+    /// Только перечисленные.
+    Only {
+        /// Учётные записи (UUID).
+        accounts: Vec<String>,
+        /// Группы (UUID).
+        groups: Vec<String>,
+    },
+}
 
 /// Группа рассылки.
 #[derive(Debug, Serialize, ToSchema)]
@@ -42,21 +82,126 @@ pub struct GroupInfo {
     /// Идентификатор в каталоге; `null` — группа создана через Admin API.
     pub external_id: Option<String>,
     /// Участники: `{"account": UUID}` или `{"group": UUID}`.
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<GroupMemberSchema>)]
     pub members: Vec<GroupMember>,
     /// Кто может писать: `"anyone"`, `"internal"`, `{"only": {"accounts": [...], "groups": [...]}}`.
-    #[schema(value_type = Object)]
+    #[schema(value_type = SenderRestrictionSchema)]
     pub senders: SenderRestriction,
     /// Модераторы; непусто — письма не от модераторов ждут одобрения.
     #[schema(value_type = Vec<String>)]
     pub moderators: Vec<AccountId>,
     /// Скрыта из адресной книги.
     pub hidden_from_gal: bool,
+    /// Имена по идентификатору (UUID) для `members`, `senders` и `moderators`: учётная запись — имя входа,
+    /// группа — её имя. Идентификатора нет в словаре — учётной записи или группы уже нет.
+    pub names: BTreeMap<String, String>,
 }
 
-impl From<DistributionGroup> for GroupInfo {
-    fn from(g: DistributionGroup) -> Self {
+/// Идентификаторы, на которые ссылается группа: учётные записи и группы.
+fn refs(g: &DistributionGroup) -> (BTreeSet<AccountId>, BTreeSet<GroupId>) {
+    let mut accounts: BTreeSet<AccountId> = g.moderators.iter().copied().collect();
+    let mut groups = BTreeSet::new();
+    for m in &g.members {
+        match m {
+            GroupMember::Account(x) => accounts.insert(*x),
+            GroupMember::Group(x) => groups.insert(*x),
+        };
+    }
+    if let SenderRestriction::Only {
+        accounts: sa,
+        groups: sg,
+    } = &g.senders
+    {
+        accounts.extend(sa);
+        groups.extend(sg);
+    }
+    (accounts, groups)
+}
+
+/// Имена учётных записей и групп организации, на которые ссылаются группы ответа.
+#[derive(Debug, Default)]
+struct Names {
+    accounts: BTreeMap<AccountId, String>,
+    groups: BTreeMap<GroupId, String>,
+}
+
+impl Names {
+    /// Имена для групп `shown`. Имена групп — из `all` (список групп организации) или одним `GroupStore::list`;
+    /// имена входа — страницами `AccountStore::list` до последней нужной записи, без запроса на участника.
+    async fn load(
+        a: &Admin,
+        org: TenantId,
+        shown: &[DistributionGroup],
+        all: Option<&[DistributionGroup]>,
+    ) -> Result<Self> {
+        let mut want_accounts = BTreeSet::new();
+        let mut want_groups = BTreeSet::new();
+        for g in shown {
+            let (accounts, groups) = refs(g);
+            want_accounts.extend(accounts);
+            want_groups.extend(groups);
+        }
+        let mut names = Self::default();
+        if !want_groups.is_empty() {
+            let listed;
+            let all = match all {
+                Some(all) => all,
+                None => {
+                    listed = a.d.groups.list(org).await?;
+                    &listed
+                }
+            };
+            for g in all.iter().filter(|g| want_groups.contains(&g.id)) {
+                names.groups.insert(g.id, g.name.clone());
+            }
+        }
+        let limit = a.cfg.max_page_size;
+        let mut after: Option<String> = None;
+        while !want_accounts.is_empty() {
+            let page = a.d.accounts.list(org, "", after.as_deref(), limit).await?;
+            let next = page.last().map(|acc| acc.login.to_lowercase());
+            if next.is_none() || next == after {
+                break;
+            }
+            after = next;
+            for acc in page {
+                if want_accounts.remove(&acc.id) {
+                    names.accounts.insert(acc.id, acc.login);
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// Группа с именами тех, на кого она ссылается.
+    fn info(&self, g: DistributionGroup) -> GroupInfo {
+        let (accounts, groups) = refs(&g);
+        let accounts = accounts
+            .iter()
+            .filter_map(|id| Some((id.to_string(), self.accounts.get(id)?.clone())));
+        let groups = groups
+            .iter()
+            .filter_map(|id| Some((id.to_string(), self.groups.get(id)?.clone())));
+        GroupInfo {
+            names: accounts.chain(groups).collect(),
+            ..GroupInfo::bare(g)
+        }
+    }
+
+    /// Одна группа с именами.
+    async fn one(a: &Admin, g: DistributionGroup) -> Result<GroupInfo> {
+        let shown = [g];
+        let names = Self::load(a, shown[0].tenant, &shown, None).await?;
+        let [g] = shown;
+        Ok(names.info(g))
+    }
+}
+
+impl GroupInfo {
+    /// Группа без словаря имён.
+    fn bare(g: DistributionGroup) -> Self {
         Self {
+            names: BTreeMap::new(),
             id: g.id.to_string(),
             name: g.name,
             address: g.address,
@@ -80,11 +225,11 @@ pub struct NewGroup {
     pub address: Option<String>,
     /// Участники.
     #[serde(default)]
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<GroupMemberSchema>)]
     pub members: Vec<GroupMember>,
     /// Ограничение отправителей (по умолчанию — без ограничений).
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = SenderRestrictionSchema)]
     pub senders: SenderRestriction,
     /// Модераторы.
     #[serde(default)]
@@ -113,10 +258,10 @@ pub struct GroupPatch {
     #[schema(value_type = Option<String>)]
     pub address: Option<Option<String>>,
     /// Участники (не для групп каталога).
-    #[schema(value_type = Option<Vec<Object>>)]
+    #[schema(value_type = Option<Vec<GroupMemberSchema>>)]
     pub members: Option<Vec<GroupMember>>,
     /// Ограничение отправителей.
-    #[schema(value_type = Option<Object>)]
+    #[schema(value_type = Option<SenderRestrictionSchema>)]
     pub senders: Option<SenderRestriction>,
     /// Модераторы.
     #[schema(value_type = Option<Vec<String>>)]
@@ -152,6 +297,11 @@ pub struct HeldInfo {
     #[serde(with = "time::serde::rfc3339")]
     #[schema(value_type = String, format = DateTime)]
     pub held_at: OffsetDateTime,
+    /// Тема письма (заголовок `Subject`, декодированный, обрезанный). Поле есть только с `include=subject`;
+    /// `null` — заголовка нет или письмо недоступно.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub subject: Option<Option<String>>,
 }
 
 impl From<HeldMessage> for HeldInfo {
@@ -179,6 +329,7 @@ impl From<HeldMessage> for HeldInfo {
             message_id: h.message_id,
             size: h.size,
             held_at: h.held_at,
+            subject: None,
         }
     }
 }
@@ -192,6 +343,9 @@ pub struct HeldQuery {
     pub group: Option<GroupId>,
     /// Размер (по умолчанию и наибольший — из конфигурации).
     pub limit: Option<usize>,
+    /// `subject` — отдать тему писем (`subject`). Только администратору; запрос пишется в журнал аудита как доступ
+    /// к содержимому; размер — не больше `admin.content_page_size`.
+    pub include: Option<String>,
 }
 
 /// Отклонение письма.
@@ -236,7 +390,15 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         approve,
         reject
     ),
-    components(schemas(GroupInfo, NewGroup, GroupPatch, HeldInfo, Rejection))
+    components(schemas(
+        GroupInfo,
+        GroupMemberSchema,
+        SenderRestrictionSchema,
+        NewGroup,
+        GroupPatch,
+        HeldInfo,
+        Rejection
+    ))
 )]
 pub(crate) struct Doc;
 
@@ -288,7 +450,8 @@ async fn list_groups(
     Path(org): Path<TenantId>,
 ) -> ApiResult<Json<Vec<GroupInfo>>> {
     let list = a.d.groups.list(org).await?;
-    Ok(Json(list.into_iter().map(Into::into).collect()))
+    let names = Names::load(&a, org, &list, Some(&list)).await?;
+    Ok(Json(list.into_iter().map(|g| names.info(g)).collect()))
 }
 
 /// Создаёт группу (не из каталога).
@@ -315,7 +478,7 @@ async fn create_group(
     g.validate()?;
     check_refs(&a, &g).await?;
     a.d.groups.put(g.clone()).await?;
-    Ok((StatusCode::CREATED, Json(g.into())))
+    Ok((StatusCode::CREATED, Json(Names::one(&a, g).await?)))
 }
 
 /// Группа.
@@ -326,7 +489,8 @@ async fn get_group(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, GroupId)>,
 ) -> ApiResult<Json<GroupInfo>> {
-    Ok(Json(group(&a, org, id).await?.into()))
+    let g = group(&a, org, id).await?;
+    Ok(Json(Names::one(&a, g).await?))
 }
 
 /// Изменяет группу: ограничения, модераторы, скрытие; имя, адрес и участники — только у групп не из каталога.
@@ -368,7 +532,7 @@ async fn patch_group(
     g.validate()?;
     check_refs(&a, &g).await?;
     a.d.groups.put(g.clone()).await?;
-    Ok(Json(g.into()))
+    Ok(Json(Names::one(&a, g).await?))
 }
 
 /// Удаляет группу (не из каталога); письма её очереди модерации отклоняются с уведомлением.
@@ -398,14 +562,45 @@ async fn delete_group(
 /// Очередь модерации организации или группы.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/moderation", tag = "groups",
     params(("org" = String, Path, description = "Организация (UUID)"), HeldQuery),
-    responses((status = 200, body = Vec<HeldInfo>), (status = 403, body = Problem)))]
+    responses((status = 200, body = Vec<HeldInfo>), (status = 400, body = Problem), (status = 403, body = Problem)))]
 async fn list_held(
     State(a): State<Arc<Admin>>,
+    Extension(caller): Extension<Caller>,
+    route: MatchedPath,
+    uri: Uri,
     Path(org): Path<TenantId>,
     Query(q): Query<HeldQuery>,
 ) -> ApiResult<Json<Vec<HeldInfo>>> {
-    let held = a.d.groups.held(org, q.group, a.cfg.page(q.limit)).await?;
-    Ok(Json(held.into_iter().map(Into::into).collect()))
+    let subjects = content::requested(q.include.as_deref())?;
+    let access = Access {
+        caller: &caller,
+        org,
+        route: route.as_str(),
+        path: uri.path(),
+    };
+    if subjects {
+        access.check(&a).await?;
+    }
+    let limit = a.cfg.content_page(q.limit, subjects);
+    let held = a.d.groups.held(org, q.group, limit).await?;
+    if !subjects {
+        return Ok(Json(held.into_iter().map(Into::into).collect()));
+    }
+    access.record(&a, 200, held.len()).await?;
+    let mut out = Vec::with_capacity(held.len());
+    for h in held {
+        let subject = match &a.held_blobs {
+            Some(blobs) => {
+                let raw = blobs.get(&h.blob, Some(content::head_range(&a.cfg))).await;
+                content::headline(&a.cfg, raw).await.subject
+            }
+            None => None,
+        };
+        let mut info = HeldInfo::from(h);
+        info.subject = Some(subject);
+        out.push(info);
+    }
+    Ok(Json(out))
 }
 
 /// Возвращает письмо в очередь после неудачного решения.
@@ -492,11 +687,13 @@ mod tests {
     use serde_json::{Value, json};
     use time::OffsetDateTime;
     use tp_contracts::groups::{
-        DistributionGroup, GroupStore, HeldMessage, HoldSource, Moderator, SenderRestriction,
+        DistributionGroup, GroupMember, GroupStore, HeldMessage, HoldSource, Moderator,
+        SenderRestriction,
     };
     use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, GroupId, HeldId, TenantId};
 
-    use crate::testenv::{Decision, Env};
+    use crate::server::AdminConfig;
+    use crate::testenv::{Decision, Env, config};
 
     fn base() -> String {
         format!("/api/v1/orgs/{}", TenantId::DEFAULT)
@@ -760,6 +957,242 @@ mod tests {
         );
         let (_, _, list) = env.call("GET", &queue, Some("org"), None).await;
         assert!(list.as_array().expect("list").is_empty());
+    }
+
+    /// Приёмка ADM-20: имена участников, отправителей и модераторов — в том же ответе, страницами списка.
+    #[tokio::test]
+    async fn names_in_one_response() {
+        let cfg = AdminConfig {
+            page_size: 10,
+            max_page_size: 64,
+            ..config()
+        };
+        let env = Env::with(cfg, Vec::new());
+        let mut ids = Vec::new();
+        for i in 0..200 {
+            let login = format!("User{i:03}@example.org");
+            ids.push((env.account(&login).await.account, login));
+        }
+        let outsider = env.account("zed@example.org").await.account;
+        let groups = format!("{}/groups", base());
+        let (_, _, inner) = env
+            .call(
+                "POST",
+                &groups,
+                Some("org"),
+                Some(json!({"name": "Внутренняя"})),
+            )
+            .await;
+        let inner_id = inner["id"].as_str().expect("id").to_owned();
+        let mut members: Vec<Value> = ids.iter().map(|(id, _)| json!({ "account": id })).collect();
+        members.push(json!({ "group": inner_id }));
+        let body = json!({
+            "name": "Все", "members": members, "moderators": [ids[0].0],
+            "senders": {"only": {"accounts": [outsider], "groups": [inner_id]}}
+        });
+        let (s, _, g) = env.call("POST", &groups, Some("org"), Some(body)).await;
+        assert_eq!(s, StatusCode::CREATED, "{g}");
+        let id = g["id"].as_str().expect("id").to_owned();
+        let check = |g: &Value| {
+            let names = g["names"].as_object().expect("names");
+            assert_eq!(names.len(), 202, "200 участников, отправитель, группа");
+            for (id, login) in &ids {
+                assert_eq!(names[&id.to_string()], json!(login));
+            }
+            assert_eq!(names[&outsider.to_string()], "zed@example.org");
+            assert_eq!(names[&inner_id], "Внутренняя");
+            assert_eq!(g["members"].as_array().expect("members").len(), 201);
+            assert_eq!(
+                g["members"][0],
+                json!({ "account": ids[0].0 }),
+                "вид участника прежний"
+            );
+        };
+        check(&g);
+        let one = format!("{groups}/{id}");
+        let (s, _, g) = env.call("GET", &one, Some("operator"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        check(&g);
+        let (_, _, list) = env.call("GET", &groups, Some("org"), None).await;
+        let list = list.as_array().expect("list");
+        check(list.iter().find(|g| g["id"] == id.as_str()).expect("group"));
+        let inner = list
+            .iter()
+            .find(|g| g["id"] == inner_id.as_str())
+            .expect("inner");
+        assert_eq!(inner["names"], json!({}));
+
+        // Изменение: ответ — с именами нового состава; удалённой группы в словаре нет.
+        let patch =
+            json!({"members": [{"account": outsider}], "senders": "internal", "moderators": []});
+        let (s, _, g) = env.call("PATCH", &one, Some("org"), Some(patch)).await;
+        assert_eq!(s, StatusCode::OK, "{g}");
+        assert_eq!(
+            g["names"],
+            json!({ outsider.to_string(): "zed@example.org" })
+        );
+        let dir = DistributionGroup {
+            id: GroupId::new(),
+            tenant: TenantId::DEFAULT,
+            name: "devs".into(),
+            address: None,
+            external_id: Some("guid-1".into()),
+            members: vec![
+                GroupMember::Group(GroupId::new()),
+                GroupMember::Account(AccountId::new()),
+            ],
+            senders: SenderRestriction::Anyone,
+            moderators: vec![],
+            hidden_from_gal: false,
+        };
+        env.groups.put(dir.clone()).await.expect("put");
+        let (s, _, g) = env
+            .call("GET", &format!("{groups}/{}", dir.id), Some("org"), None)
+            .await;
+        assert_eq!((s, &g["names"]), (StatusCode::OK, &json!({})));
+    }
+
+    /// Приёмка ADM-20: `members` и `senders` в схеме — не произвольный объект, и схема совпадает с контрактом.
+    #[tokio::test]
+    async fn precise_schemas() {
+        let env = Env::new();
+        let (_, _, spec) = env.call("GET", "/api/openapi.json", None, None).await;
+        let schemas = &spec["components"]["schemas"];
+        let member = "#/components/schemas/GroupMember";
+        let senders = "#/components/schemas/SenderRestriction";
+        for (name, required) in [
+            ("GroupInfo", true),
+            ("NewGroup", false),
+            ("GroupPatch", false),
+        ] {
+            let props = &schemas[name]["properties"];
+            let text = props.to_string();
+            assert!(
+                text.contains(member) && text.contains(senders),
+                "{name}: {text}"
+            );
+            if required {
+                assert_eq!(props["members"]["items"]["$ref"], member);
+                assert_eq!(props["senders"]["$ref"], senders);
+                assert_eq!(
+                    props["names"]["additionalProperties"]["type"], "string",
+                    "{props}"
+                );
+            }
+        }
+        let variants = schemas["GroupMember"]["oneOf"].as_array().expect("oneOf");
+        let keys: Vec<_> = variants
+            .iter()
+            .map(|v| {
+                assert_eq!(v["type"], "object");
+                let key = v["required"][0].as_str().expect("required");
+                assert_eq!(v["properties"][key]["type"], "string");
+                key
+            })
+            .collect();
+        assert_eq!(keys, ["account", "group"]);
+        let variants = schemas["SenderRestriction"]["oneOf"]
+            .as_array()
+            .expect("oneOf");
+        let text = schemas["SenderRestriction"].to_string();
+        assert!(
+            text.contains("\"anyone\"") && text.contains("\"internal\""),
+            "{text}"
+        );
+        let only = variants
+            .iter()
+            .find(|v| v["properties"]["only"].is_object())
+            .expect("only");
+        let fields = &only["properties"]["only"];
+        assert_eq!(fields["required"], json!(["accounts", "groups"]));
+        assert_eq!(fields["properties"]["accounts"]["items"]["type"], "string");
+
+        // Вид контракта в `serde` — тот же, что описывает схема.
+        let (a, g) = (AccountId::new(), GroupId::new());
+        assert_eq!(
+            json!([GroupMember::Account(a), GroupMember::Group(g)]),
+            json!([{ "account": a }, { "group": g }])
+        );
+        assert_eq!(
+            json!([SenderRestriction::Anyone, SenderRestriction::Internal]),
+            json!(["anyone", "internal"])
+        );
+        let only = SenderRestriction::Only {
+            accounts: vec![a],
+            groups: vec![g],
+        };
+        assert_eq!(
+            json!(only),
+            json!({"only": {"accounts": [a], "groups": [g]}})
+        );
+    }
+
+    /// Приёмка ADM-19: тема письма очереди — только по `include=subject`, администратору, с записью в аудит.
+    #[tokio::test]
+    async fn held_subjects_on_request() {
+        use tp_contracts::blob::BlobStore;
+
+        let env = Env::new();
+        let (_, _, g) = env
+            .call(
+                "POST",
+                &format!("{}/groups", base()),
+                Some("org"),
+                Some(json!({"name": "Staff", "address": "staff@example.org"})),
+            )
+            .await;
+        let gid: GroupId = g["id"].as_str().expect("id").parse().expect("uuid");
+        let h1 = held(gid, "a@ext");
+        let h2 = HeldMessage {
+            blob: BlobKey {
+                hash: BlobHash([2; 32]),
+                ..h1.blob
+            },
+            ..held(gid, "b@ext")
+        };
+        let raw = "From: A <a@ext>\r\nSubject: =?UTF-8?B?0J/RgNC40LLQtdGC?=\r\n\r\nтело\r\n";
+        env.held_blobs.put(&h1.blob, raw.into()).await.expect("put");
+        for h in [&h1, &h2] {
+            env.groups
+                .hold(TenantId::DEFAULT, h.clone())
+                .await
+                .expect("hold");
+        }
+        let content = |env: &Env| -> Vec<_> {
+            let log = env.audit.records();
+            log.into_iter()
+                .filter(|r| r.content_messages.is_some())
+                .collect()
+        };
+        let queue = format!("{}/moderation", base());
+        let (s, _, list) = env.call("GET", &queue, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(!list[0].as_object().expect("item").contains_key("subject"));
+        assert!(content(&env).is_empty());
+
+        let with = format!("{queue}?include=subject");
+        let (s, _, list) = env.call("GET", &with, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK, "{list}");
+        assert_eq!(list[0]["subject"], "Привет");
+        assert_eq!(list[0]["sender"], "a@ext");
+        assert_eq!(list[1]["subject"], Value::Null, "объекта письма нет");
+        let log = content(&env);
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            (
+                log[0].route.as_str(),
+                log[0].status,
+                log[0].content_messages
+            ),
+            ("/api/v1/orgs/{org}/moderation", 200, Some(2))
+        );
+
+        let (s, _, _) = env.call("GET", &with, Some("operator"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(content(&env).last().expect("audit").status, 403);
+        let bad = format!("{queue}?include=all");
+        let (s, _, _) = env.call("GET", &bad, Some("org"), None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
     /// CTR-43: письмо правила потока в очереди — источник и правило видны, одобрение — доставка получателям.

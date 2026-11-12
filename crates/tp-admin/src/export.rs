@@ -508,6 +508,7 @@ mod tests {
             route: route.into(),
             path: "/api/v1/orgs/x/domains".into(),
             status: 201,
+            content_messages: None,
         }
     }
 

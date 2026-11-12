@@ -249,6 +249,8 @@ pub struct Env {
     pub transport: MemTransport,
     pub tokens: MemLocalAdminTokens,
     pub sieve: MemSieve,
+    /// Объекты писем очереди модерации (`Admin::with_held_blobs`).
+    pub held_blobs: MemBlobStore,
     pub admin: Arc<Admin>,
     pub router: Router,
     pub other_tenant: TenantId,
@@ -372,7 +374,12 @@ impl Env {
             admin
         };
         let sieve = MemSieve::new();
-        let admin = Arc::new(admin.with_sieve(Arc::new(sieve.clone()), check_script));
+        let held_blobs = MemBlobStore::new(Arc::new(SystemClock));
+        let admin = Arc::new(
+            admin
+                .with_sieve(Arc::new(sieve.clone()), check_script)
+                .with_held_blobs(Arc::new(held_blobs.clone())),
+        );
         let app_passwords = stores.app_passwords();
         let Stores {
             meta,
@@ -400,6 +407,7 @@ impl Env {
             transport,
             tokens,
             sieve,
+            held_blobs,
             router: admin.clone().router(),
             admin,
             other_tenant,

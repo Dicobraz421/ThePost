@@ -6,6 +6,8 @@
 //!   имени входа, фильтр по префиксу; продолжение — заголовок `Link` с `rel="next"`, RFC 8288), чтение с
 //!   использованием квоты и только локальные атрибуты — политика ящика (квота, срок корзины, лимиты отправки);
 //!   без каталога (SMB, решение #193) — создание локальной учётной записи в принятом домене организации (пароль — пароль приложения);
+//!   изменение (`PATCH`): отображаемое имя и блокировка входа (`enabled`) — только у локальных записей, у записей
+//!   каталога оба поля ведёт каталог (409);
 //! - правило `trash.purge` (`mode`, `user_can_choose`) — поле политики уровня; выбор пользователя и действующее
 //!   значение ящика — [`crate::retention`];
 //! - политика уровня задаётся целиком (`PUT`), поле `null` — не задано на уровне; действующая политика
@@ -32,7 +34,7 @@ use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::retention::TrashPurgeRuleBody;
-use crate::server::{Admin, ApiResult, Problem};
+use crate::server::{Admin, ApiResult, Problem, Refused};
 
 /// Уровень цепочки политик, задаваемый через Admin API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -237,6 +239,18 @@ pub struct NewAccount {
     pub display_name: Option<String>,
 }
 
+/// Изменение учётной записи: заданные поля заменяются, отсутствующие — без изменений; хотя бы одно поле обязательно.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountPatch {
+    /// Отображаемое имя (непустое, одна строка); у записи каталога — 409.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Вход разрешён; `false` — учётная запись заблокирована. У записи каталога — 409.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
 /// Поиск по имени входа или страница списка учётных записей.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
@@ -275,7 +289,10 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
             "/api/v1/orgs/{org}/accounts",
             get(list_accounts).post(create_account),
         )
-        .route("/api/v1/orgs/{org}/accounts/{account}", get(get_account))
+        .route(
+            "/api/v1/orgs/{org}/accounts/{account}",
+            get(get_account).patch(patch_account),
+        )
         .route(
             "/api/v1/orgs/{org}/accounts/{account}/policy",
             put(put_account_policy),
@@ -296,6 +313,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         list_accounts,
         create_account,
         get_account,
+        patch_account,
         put_account_policy
     ),
     components(schemas(
@@ -307,7 +325,8 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         NewDomain,
         QuotaInfo,
         AccountInfo,
-        NewAccount
+        NewAccount,
+        AccountPatch
     ))
 )]
 pub(crate) struct Doc;
@@ -662,6 +681,60 @@ async fn get_account(
     Path((org, id)): Path<(TenantId, AccountId)>,
 ) -> ApiResult<Json<AccountInfo>> {
     let acc = account(&a, org, id).await?;
+    Ok(Json(account_info(&a, acc).await?))
+}
+
+/// Изменяет локальную учётную запись: отображаемое имя и блокировка входа (`enabled: false` — вход запрещён).
+/// Пустое тело (`{}`) — 422. У записи каталога (`external_id` задан) оба поля ведёт каталог: синхронизация
+/// перезаписывает и имя, и признак блокировки, поэтому изменение — 409 с пояснением.
+#[utoipa::path(patch, path = "/api/v1/orgs/{org}/accounts/{account}", tag = "accounts",
+    params(("org" = String, Path, description = "Организация (UUID)"), ("account" = String, Path, description = "Учётная запись (UUID)")),
+    request_body = AccountPatch,
+    responses((status = 200, body = AccountInfo), (status = 400, body = Problem), (status = 404, body = Problem),
+        (status = 409, body = Problem), (status = 422, body = Problem)))]
+async fn patch_account(
+    State(a): State<Arc<Admin>>,
+    Path((org, id)): Path<(TenantId, AccountId)>,
+    Json(p): Json<AccountPatch>,
+) -> std::result::Result<Json<AccountInfo>, Refused> {
+    if p.display_name.is_none() && p.enabled.is_none() {
+        return Err(Refused::Problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "нужно хотя бы одно поле: display_name, enabled".to_owned(),
+        ));
+    }
+    let acc = account(&a, org, id).await?;
+    if acc.external_id.is_some() {
+        let detail = if p.display_name.is_some() {
+            "отображаемое имя записи каталога ведёт каталог: измените его в каталоге"
+        } else {
+            "признак блокировки записи каталога перезаписывает синхронизация каталога: \
+             заблокируйте учётную запись в каталоге"
+        };
+        return Err(Refused::Problem(StatusCode::CONFLICT, detail.to_owned()));
+    }
+    let display_name = match p.display_name.as_deref().map(str::trim) {
+        Some(n) if n.is_empty() || n.chars().any(char::is_control) => {
+            return Err(
+                Error::invalid("display_name — непустая строка без управляющих символов").into(),
+            );
+        }
+        Some(n) => n.to_owned(),
+        None => acc.display_name,
+    };
+    let acc =
+        a.d.accounts
+            .upsert(
+                org,
+                AccountUpsert {
+                    domain: acc.domain,
+                    login: acc.login,
+                    display_name,
+                    external_id: None,
+                    enabled: p.enabled.unwrap_or(acc.enabled),
+                },
+            )
+            .await?;
     Ok(Json(account_info(&a, acc).await?))
 }
 
@@ -1109,6 +1182,103 @@ mod tests {
         assert_eq!(s, StatusCode::FORBIDDEN);
         let (s, _, _) = env.call("GET", &other, Some("root"), None).await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    /// Приёмка ADM-18: блокировка и имя локальной записи, запись каталога — 409, нет записи — 404.
+    #[tokio::test]
+    async fn patch_account() {
+        use tp_contracts::meta::{AccountStore, AccountUpsert};
+
+        let env = Env::new();
+        let scope = env.account("user@example.org").await;
+        let one = format!("{}/accounts/{}", org(), scope.account);
+        let (s, _, b) = env
+            .call("PATCH", &one, Some("org"), Some(json!({"enabled": false})))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["enabled"], false);
+        assert_eq!(b["login"], "user@example.org");
+        let (_, _, b) = env.call("GET", &one, Some("org"), None).await;
+        assert_eq!(b["enabled"], false);
+        let last = env.audit.records().pop().expect("audit");
+        assert_eq!(
+            (last.method.as_str(), last.route.as_str(), last.status),
+            ("PATCH", "/api/v1/orgs/{org}/accounts/{account}", 200)
+        );
+        assert_eq!(last.path, one);
+
+        // Имя меняется отдельно, блокировка сохраняется; разблокировка.
+        let body = json!({"display_name": " Анна Петрова "});
+        let (s, _, b) = env.call("PATCH", &one, Some("org"), Some(body)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            (&b["display_name"], &b["enabled"]),
+            (&json!("Анна Петрова"), &json!(false))
+        );
+        let body = json!({"enabled": true, "display_name": "Анна"});
+        let (_, _, b) = env.call("PATCH", &one, Some("org"), Some(body)).await;
+        assert_eq!(
+            (&b["display_name"], &b["enabled"]),
+            (&json!("Анна"), &json!(true))
+        );
+        assert_eq!(b["id"], scope.account.to_string(), "запись та же");
+
+        // Пустое тело и неизвестное поле — 422; пустое имя — 400.
+        for bad in [json!({}), json!({"login": "x@example.org"})] {
+            let (s, _, _) = env.call("PATCH", &one, Some("org"), Some(bad)).await;
+            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        for bad in [
+            json!({"display_name": "  "}),
+            json!({"display_name": "a\nb"}),
+        ] {
+            let (s, _, _) = env.call("PATCH", &one, Some("org"), Some(bad)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+        }
+
+        // Запись каталога: имя и блокировку ведёт каталог.
+        let dir = env
+            .meta
+            .upsert(
+                TenantId::DEFAULT,
+                AccountUpsert {
+                    domain: tp_contracts::DomainId::new(),
+                    login: "dir@example.org".into(),
+                    display_name: "Из каталога".into(),
+                    external_id: Some("guid-1".into()),
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("upsert");
+        let dir_url = format!("{}/accounts/{}", org(), dir.id);
+        for body in [
+            json!({"display_name": "Другое"}),
+            json!({"enabled": false}),
+            json!({"display_name": "Другое", "enabled": false}),
+        ] {
+            let (s, _, b) = env.call("PATCH", &dir_url, Some("org"), Some(body)).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{b}");
+            assert!(b["detail"].as_str().expect("detail").contains("каталог"));
+        }
+        let (_, _, b) = env.call("GET", &dir_url, Some("org"), None).await;
+        assert_eq!(
+            (&b["display_name"], &b["enabled"]),
+            (&json!("Из каталога"), &json!(true))
+        );
+
+        // Нет записи — 404; оператор и чужая организация — 403.
+        let missing = format!("{}/accounts/{}", org(), tp_contracts::AccountId::new());
+        let block = || Some(json!({"enabled": false}));
+        let (s, _, _) = env.call("PATCH", &missing, Some("org"), block()).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        for token in ["operator", "user", "other"] {
+            let (s, _, _) = env.call("PATCH", &one, Some(token), block()).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{token}");
+        }
+        let (_, _, spec) = env.call("GET", "/api/openapi.json", None, None).await;
+        let op = &spec["paths"]["/api/v1/orgs/{org}/accounts/{account}"]["patch"];
+        assert_eq!(op["operationId"], "patch_account");
     }
 
     #[test]
