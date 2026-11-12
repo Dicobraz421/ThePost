@@ -20,6 +20,7 @@ async fn upsert_creates_system_folders_and_matches() {
         display_name: "Иван".into(),
         external_id: Some("guid-1".into()),
         enabled: true,
+        aliases: Vec::new(),
     };
     let acc = meta.upsert(tenant, data.clone()).await.expect("upsert");
     assert_eq!(acc.tenant, tenant);

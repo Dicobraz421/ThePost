@@ -214,6 +214,7 @@ pub async fn account(meta: &PgMeta) -> tp_contracts::meta::AccountScope {
                 display_name: "User".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
             },
         )
         .await
@@ -376,6 +377,7 @@ impl TwoShards {
                     display_name: "User".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await

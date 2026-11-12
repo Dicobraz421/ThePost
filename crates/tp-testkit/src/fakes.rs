@@ -14,7 +14,7 @@
 //! let p = principal(TenantId::DEFAULT, "user@example.com");
 //! auth.add_password("user@example.com", "secret", p.clone());
 //! let sasl = FakeSasl::new(Arc::new(auth));
-//! let ctx = SaslContext { service: "smtp", tls: true };
+//! let ctx = SaslContext { service: "smtp", tls: true, peer: Some([192, 0, 2, 7].into()) };
 //! let mut s = sasl.start(Mechanism::Plain, &ctx).expect("start");
 //! let step = s.step(Some(b"\0user@example.com\0secret")).await.expect("step");
 //! assert_eq!(step, SaslStep::Done(p));
@@ -22,6 +22,7 @@
 //! ```
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -73,10 +74,13 @@ struct AuthState {
     tokens: HashMap<String, Principal>,
     kerberos: HashMap<String, Principal>,
     failure: Option<Error>,
+    /// Адреса клиентов всех вызовов `verify` по порядку.
+    peers: Vec<Option<IpAddr>>,
 }
 
 /// [`Authenticator`] по заданным паролям, токенам и принципалам Kerberos. Неизвестные или неверные
 /// данные — `Forbidden`; [`FakeAuthenticator::set_failure`] — ошибка каждого вызова (`Unavailable`).
+/// Адрес клиента каждого вызова запоминается ([`FakeAuthenticator::peers`], CTR-57).
 #[derive(Debug, Clone, Default)]
 pub struct FakeAuthenticator(Arc<Mutex<AuthState>>);
 
@@ -108,6 +112,11 @@ impl FakeAuthenticator {
             .retain(|_, p| !p.login.eq_ignore_ascii_case(login));
     }
 
+    /// Адреса клиентов всех вызовов `verify` по порядку (в том числе неуспешных).
+    pub fn peers(&self) -> Vec<Option<IpAddr>> {
+        lock(&self.0).peers.clone()
+    }
+
     /// Каждый `verify` возвращает `err` (недоступность каталога); `None` — снять.
     pub fn set_failure(&self, err: Option<Error>) {
         lock(&self.0).failure = err;
@@ -116,8 +125,9 @@ impl FakeAuthenticator {
 
 #[async_trait]
 impl Authenticator for FakeAuthenticator {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
-        let st = lock(&self.0);
+    async fn verify(&self, credentials: Credentials, peer: Option<IpAddr>) -> Result<Principal> {
+        let mut st = lock(&self.0);
+        st.peers.push(peer);
         if let Some(e) = &st.failure {
             return Err(e.clone());
         }
@@ -401,6 +411,7 @@ impl SaslServer for FakeSasl {
         Ok(Box::new(FakeSaslSession {
             auth: self.auth.clone(),
             mechanism,
+            peer: ctx.peer,
             state: SessionState::Initial,
         }))
     }
@@ -418,6 +429,8 @@ enum SessionState {
 struct FakeSaslSession {
     auth: Arc<dyn Authenticator>,
     mechanism: Mechanism,
+    /// Адрес клиента соединения.
+    peer: Option<IpAddr>,
     state: SessionState,
 }
 
@@ -426,7 +439,7 @@ const OAUTH_ERROR: &[u8] = br#"{"status":"invalid_token"}"#;
 
 impl FakeSaslSession {
     async fn verify(&mut self, creds: Credentials, authzid: Option<&str>) -> Result<SaslStep> {
-        match self.auth.verify(creds).await {
+        match self.auth.verify(creds, self.peer).await {
             Ok(p) => {
                 self.state = SessionState::Finished;
                 if authzid.is_some_and(|a| !a.eq_ignore_ascii_case(&p.login)) {
@@ -1499,10 +1512,27 @@ mod tests {
     use tp_contracts::search::{IndexSegment, RebuildReason};
     use tp_contracts::{BlobHash, Gen};
 
+    const PEER: Option<IpAddr> = Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7)));
+
     const TLS: SaslContext = SaslContext {
         service: "imap",
         tls: true,
+        peer: PEER,
     };
+
+    /// CTR-57: адрес клиента из `SaslContext` доходит до `Authenticator::verify`; без адреса — `None`.
+    #[tokio::test]
+    async fn sasl_passes_peer_to_verify() {
+        let (auth, p) = auth();
+        let sasl = FakeSasl::new(Arc::new(auth.clone()));
+        let unknown = SaslContext { peer: None, ..TLS };
+        for ctx in [TLS, unknown] {
+            let mut s = sasl.start(Mechanism::Plain, &ctx).expect("start");
+            let step = s.step(Some(b"\0user@example.com\0secret")).await;
+            assert_eq!(step, Ok(SaslStep::Done(p.clone())));
+        }
+        assert_eq!(auth.peers(), [PEER, None]);
+    }
 
     fn auth() -> (FakeAuthenticator, Principal) {
         let auth = FakeAuthenticator::default();
@@ -1520,15 +1550,15 @@ mod tests {
             secret: secret.into(),
         };
         assert_eq!(
-            auth.verify(pass("user@example.com", "secret")).await,
+            auth.verify(pass("user@example.com", "secret"), PEER).await,
             Ok(p.clone())
         );
         assert_eq!(
-            auth.verify(pass("user@example.com", "x")).await,
+            auth.verify(pass("user@example.com", "x"), PEER).await,
             Err(Error::Forbidden)
         );
         assert_eq!(
-            auth.verify(Credentials::Bearer("tok".into())).await,
+            auth.verify(Credentials::Bearer("tok".into()), PEER).await,
             Ok(p.clone())
         );
         auth.add_kerberos("user@EXAMPLE.COM", p.clone());
@@ -1536,18 +1566,21 @@ mod tests {
             principal: "user@EXAMPLE.COM".into(),
             authzid: authzid.map(str::to_owned),
         };
-        assert_eq!(auth.verify(krb(None)).await, Ok(p.clone()));
-        assert_eq!(auth.verify(krb(Some("other"))).await, Err(Error::Forbidden));
+        assert_eq!(auth.verify(krb(None), PEER).await, Ok(p.clone()));
+        assert_eq!(
+            auth.verify(krb(Some("other")), PEER).await,
+            Err(Error::Forbidden)
+        );
         auth.set_failure(Some(Error::UNAVAILABLE));
-        assert_eq!(auth.verify(krb(None)).await, Err(Error::UNAVAILABLE));
+        assert_eq!(auth.verify(krb(None), PEER).await, Err(Error::UNAVAILABLE));
         auth.set_failure(None);
         auth.disable("user@example.com");
         assert_eq!(
-            auth.verify(Credentials::Bearer("tok".into())).await,
+            auth.verify(Credentials::Bearer("tok".into()), PEER).await,
             Err(Error::Forbidden)
         );
         assert_eq!(
-            auth.verify(pass("user@example.com", "secret")).await,
+            auth.verify(pass("user@example.com", "secret"), PEER).await,
             Err(Error::Forbidden)
         );
     }

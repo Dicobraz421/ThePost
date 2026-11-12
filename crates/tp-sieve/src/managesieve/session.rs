@@ -1,6 +1,7 @@
 //! Сеанс ManageSieve: чтение команд, приветствие, `STARTTLS`, вход SASL (SIEVE-08); команды скриптов — [`super::scripts`].
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use base64::Engine;
@@ -43,6 +44,8 @@ enum Reject {
 pub struct Session<T: Transport> {
     pub(super) ctx: Arc<SessionCtx>,
     conn: Option<T>,
+    /// Адрес клиента соединения.
+    peer: IpAddr,
     buf: Vec<u8>,
     pub(super) out: Vec<u8>,
     /// Вошедшая учётная запись.
@@ -63,6 +66,7 @@ impl<T: Transport> Session<T> {
     pub fn new(ctx: Arc<SessionCtx>, conn: T) -> Self {
         Self {
             ctx,
+            peer: conn.peer(),
             conn: Some(conn),
             buf: Vec::new(),
             out: Vec::new(),
@@ -393,6 +397,7 @@ impl<T: Transport> Session<T> {
         let ctx = SaslContext {
             service: SERVICE,
             tls: true,
+            peer: Some(self.peer),
         };
         let Some(mech) = std::str::from_utf8(mech)
             .ok()

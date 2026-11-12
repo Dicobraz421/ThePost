@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use sqlx::postgres::PgArguments;
 use sqlx::query::QueryAs;
 use sqlx::{FromRow, PgConnection, Postgres};
-use tp_contracts::meta::{Account, AccountScope, AccountStore, AccountUpsert, QuotaUsage};
+use tp_contracts::meta::{
+    Account, AccountScope, AccountStore, AccountUpsert, QuotaUsage, account_aliases,
+};
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use uuid::Uuid;
 
@@ -15,7 +17,7 @@ use crate::shards::{ReadIntent, ShardId};
 
 /// `AccountStore::list` без верхней границы префикса (пустой префикс или одни `U+10FFFF`): `$1` — организация,
 /// `$2` — префикс, `$3` — курсор (строго больше), `$4` — лимит. Открыт для проверки плана (`EXPLAIN`) в тестах.
-pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases
     FROM accounts
     WHERE tenant_id = $1 AND lower(login) COLLATE "C" >= $2 AND starts_with(lower(login), $2)
       AND lower(login) COLLATE "C" > $3
@@ -23,7 +25,7 @@ pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, di
 
 /// Как [`LIST_SQL`], префикс — диапазоном `>= $2 AND < $5` (`$5` — `prefix_next`), не `starts_with` и не `LIKE`
 /// (`%` и `_` в префиксе — обычные знаки).
-pub const LIST_PREFIX_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+pub const LIST_PREFIX_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases
     FROM accounts
     WHERE tenant_id = $1 AND lower(login) COLLATE "C" >= $2 AND lower(login) COLLATE "C" < $5
       AND lower(login) COLLATE "C" > $3
@@ -56,6 +58,7 @@ struct AccountRow {
     display_name: String,
     external_id: Option<String>,
     enabled: bool,
+    aliases: Vec<String>,
 }
 
 /// Строка `upsert`: учётная запись и её шард.
@@ -66,7 +69,7 @@ struct UpsertRow {
     shard_id: i32,
 }
 
-/// Общие параметры `upsert` (`$3`–`$7`).
+/// Общие параметры `upsert` (`$3`–`$8`).
 fn bind_upsert<'q>(
     q: QueryAs<'q, Postgres, UpsertRow, PgArguments>,
     data: &'q AccountUpsert,
@@ -76,6 +79,10 @@ fn bind_upsert<'q>(
         .bind(&data.display_name)
         .bind(&data.external_id)
         .bind(data.enabled)
+        .bind(account_aliases(
+            &data.login,
+            data.aliases.iter().map(String::as_str),
+        ))
 }
 
 impl From<AccountRow> for Account {
@@ -88,6 +95,7 @@ impl From<AccountRow> for Account {
             display_name: r.display_name,
             external_id: r.external_id,
             enabled: r.enabled,
+            aliases: r.aliases,
         }
     }
 }
@@ -146,9 +154,9 @@ impl PgMeta {
             Some(id) => bind_upsert(
                 sqlx::query_as(
                     "UPDATE accounts SET domain_id = $3, login = $4, display_name = $5, external_id = $6,
-                                         enabled = $7, updated_at = now()
+                                         enabled = $7, aliases = $8, updated_at = now()
                      WHERE tenant_id = $1 AND account_id = $2
-                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled,
+                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases,
                                shard_id",
                 )
                 .bind(tenant.as_uuid())
@@ -158,9 +166,9 @@ impl PgMeta {
             None => bind_upsert(
                 sqlx::query_as(
                     "INSERT INTO accounts (tenant_id, account_id, domain_id, login, display_name, external_id,
-                                           enabled, shard_id)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled,
+                                           enabled, aliases, shard_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases,
                                shard_id",
                 )
                 .bind(tenant.as_uuid())
@@ -211,7 +219,7 @@ impl AccountStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
-                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases
              FROM accounts WHERE tenant_id = $1 AND account_id = $2",
             )
             .bind(tenant.as_uuid())
@@ -229,7 +237,7 @@ impl AccountStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
-                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases
              FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2)",
             )
             .bind(tenant.as_uuid())
@@ -247,7 +255,7 @@ impl AccountStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
-                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases
              FROM accounts WHERE tenant_id = $1 AND external_id = $2",
             )
             .bind(tenant.as_uuid())

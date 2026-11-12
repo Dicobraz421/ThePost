@@ -582,6 +582,7 @@ async fn mvp_mail_flow() {
                 display_name: "Alice".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
             },
         )
         .await
@@ -899,6 +900,7 @@ async fn mvp_mail_flow() {
                 display_name: "Bob".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
             },
         )
         .await

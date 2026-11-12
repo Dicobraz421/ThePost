@@ -13,7 +13,6 @@
 //! явного списка `service_http.internal_networks`, иначе ошибка проверки конфигурации.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +24,7 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
@@ -221,19 +221,24 @@ pub async fn serve(
     serve_on(tls, router, shutdown).await
 }
 
+/// Обслуживает `router` на `listener`; запрос несёт адрес клиента соединения (`ConnectInfo<SocketAddr>`).
 async fn serve_on<L>(
     listener: L,
     router: Router,
     shutdown: CancellationToken,
 ) -> tp_contracts::Result<()>
 where
-    L: axum::serve::Listener,
-    L::Addr: fmt::Debug,
+    L: axum::serve::Listener<Addr = SocketAddr>,
 {
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await
-        .map_err(|e| Error::Internal(format!("service http: {e}")))
+    // Адрес клиента соединения — в расширении запроса `ConnectInfo<SocketAddr>`: обработчики передают его в
+    // проверку учётных данных (CTR-57, защита от перебора).
+    axum::serve(
+        listener.tap_io(|_| {}),
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.cancelled().await })
+    .await
+    .map_err(|e| Error::Internal(format!("service http: {e}")))
 }
 
 /// Результат рукопожатия: поток TLS и адрес клиента; `None` — рукопожатие не удалось.
@@ -447,10 +452,19 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let shutdown = CancellationToken::new();
         let trigger = shutdown.clone();
-        let router = router(health.clone(), metrics);
+        // Обработчик видит адрес клиента соединения (CTR-57).
+        let router = router(health.clone(), metrics).route(
+            "/peer",
+            get(
+                |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>| async move {
+                    peer.ip().to_string()
+                },
+            ),
+        );
         let server = tokio::spawn(async move {
             serve(listener, router, &cfg, Profile::Prod, Some(certs), shutdown).await
         });
+        assert_eq!(get_tls(addr, "/peer").await, (200, addr.ip().to_string()));
 
         assert_eq!(
             get_tls(addr, "/healthz/live").await,

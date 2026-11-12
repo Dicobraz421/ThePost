@@ -15,6 +15,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
+use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -60,6 +61,10 @@ pub trait Transport: Send + Sized + 'static {
     /// Канал защищён TLS.
     fn tls(&self) -> bool;
 
+    /// Адрес клиента соединения (из заголовка PROXY или адрес TCP-собеседника) — для защиты от перебора
+    /// (`SaslContext::peer`, CTR-57).
+    fn peer(&self) -> IpAddr;
+
     /// Можно предложить STARTTLS.
     fn can_starttls(&self) -> bool;
 
@@ -76,6 +81,10 @@ impl Transport for Conn {
 
     fn tls(&self) -> bool {
         self.info.tls
+    }
+
+    fn peer(&self) -> IpAddr {
+        self.info.client.ip()
     }
 
     fn can_starttls(&self) -> bool {
@@ -151,6 +160,8 @@ pub(crate) struct Selected {
 pub struct Session<T: Transport> {
     pub(crate) ctx: Arc<SessionCtx>,
     pub(crate) conn: Option<T>,
+    /// Адрес клиента соединения.
+    pub(crate) peer: IpAddr,
     pub(crate) reader: Reader,
     pub(crate) out: Vec<u8>,
     pub(crate) principal: Option<Principal>,
@@ -222,6 +233,7 @@ impl<T: Transport> Session<T> {
         let reader = reader(&ctx.config);
         Self {
             ctx,
+            peer: conn.peer(),
             conn: Some(conn),
             reader,
             out: Vec::new(),
@@ -847,7 +859,7 @@ impl<T: Transport> Session<T> {
             return;
         };
         let creds = Credentials::Password { login, secret };
-        match self.ctx.deps.auth.verify(creds).await {
+        match self.ctx.deps.auth.verify(creds, Some(self.peer)).await {
             Ok(p) => self.logged_in(tag, p),
             Err(Error::Forbidden) => self.auth_failed(tag, SaslFailure::Authentication),
             Err(e) => self.auth_unavailable(tag, &e),
@@ -884,6 +896,7 @@ impl<T: Transport> Session<T> {
         let ctx = SaslContext {
             service: "imap",
             tls,
+            peer: Some(self.peer),
         };
         let mut sasl = match self.ctx.deps.sasl.start(mech, &ctx) {
             Ok(s) => s,

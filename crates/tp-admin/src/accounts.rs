@@ -636,6 +636,7 @@ async fn create_account(
                     display_name,
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await?;
@@ -732,6 +733,7 @@ async fn patch_account(
                     display_name,
                     external_id: None,
                     enabled: p.enabled.unwrap_or(acc.enabled),
+                    aliases: acc.aliases,
                 },
             )
             .await?;
@@ -1435,6 +1437,7 @@ mod tests {
                     display_name: "Из каталога".into(),
                     external_id: Some("guid-1".into()),
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await

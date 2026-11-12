@@ -22,6 +22,7 @@ async fn accounts(meta: &PgMeta, tenant: TenantId) -> [AccountId; 4] {
                     display_name: format!("User {i}"),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await

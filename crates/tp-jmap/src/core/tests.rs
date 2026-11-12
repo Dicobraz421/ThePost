@@ -299,10 +299,16 @@ async fn auth_unavailable() {
         axum::http::header::AUTHORIZATION,
         "Bearer token-1".parse().expect("header"),
     );
-    assert_eq!(env.jmap.authenticate(&h).await, Err(Error::UNAVAILABLE));
+    // Адрес клиента соединения доходит до проверки учётных данных (CTR-57).
+    let peer = Some(std::net::IpAddr::from([192, 0, 2, 7]));
+    assert_eq!(
+        env.jmap.authenticate(&h, peer).await,
+        Err(Error::UNAVAILABLE)
+    );
+    assert_eq!(env.auth.peers().last(), Some(&peer));
     h.insert(
         axum::http::header::AUTHORIZATION,
         "Digest x".parse().expect("header"),
     );
-    assert_eq!(env.jmap.authenticate(&h).await, Err(Error::Forbidden));
+    assert_eq!(env.jmap.authenticate(&h, peer).await, Err(Error::Forbidden));
 }

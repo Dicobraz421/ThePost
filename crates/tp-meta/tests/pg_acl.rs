@@ -21,6 +21,7 @@ async fn passes_contract_suite() {
                 display_name: "Peer".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
             },
         )
         .await

@@ -269,29 +269,17 @@ pub trait GroupStore: Send + Sync + 'static {
     /// (CTR-43, без группы); [`HeldMessage::validate`] — `Error::Invalid`; занятый `id` — `Error::Conflict`.
     async fn hold(&self, tenant: TenantId, message: HeldMessage) -> Result<()>;
 
-    /// Очередь модерации организации (письма групп и правил) или одной группы по (`held_at`, `id`), не более `limit`.
-    async fn held(
-        &self,
-        tenant: TenantId,
-        group: Option<GroupId>,
-        limit: usize,
-    ) -> Result<Vec<HeldMessage>>;
-
-    /// Страница очереди модерации строго после курсора `after` (CTR-55): тот же отбор и порядок (`held_at`, `id`), что
-    /// у [`GroupStore::held`]; `after = None` — с начала (как `held`). Курсор следующей страницы —
+    /// Страница очереди модерации организации (письма групп и правил) или одной группы по (`held_at`, `id`) строго
+    /// после курсора `after` (CTR-55; `None` — с начала), не более `limit`. Курсор следующей страницы —
     /// [`HeldCursor::of`] последнего письма страницы; страница короче `limit` — последняя. Письма, поставленные или
     /// забранные между страницами, не дают ни пропусков, ни повторов остальных. Правило — [`held_page`].
-    /// По умолчанию — `Error::Internal` (реализации — `tp-meta`, `tp-testkit`).
-    async fn held_after(
+    async fn held(
         &self,
         tenant: TenantId,
         group: Option<GroupId>,
         after: Option<HeldCursor>,
         limit: usize,
-    ) -> Result<Vec<HeldMessage>> {
-        let _ = (tenant, group, after, limit);
-        Err(Error::internal("GroupStore::held_after не реализован"))
-    }
+    ) -> Result<Vec<HeldMessage>>;
 
     /// Забирает письмо из очереди для решения модератора (доставить или отклонить — вызывающий).
     /// Нет письма (в том числе уже решено другим модератором) — `Error::NotFound`.
@@ -322,7 +310,7 @@ impl HeldCursor {
     }
 }
 
-/// Страница очереди для [`GroupStore::held_after`]: письма `queue` (в любом порядке) строго после `after` по
+/// Страница очереди для [`GroupStore::held`]: письма `queue` (в любом порядке) строго после `after` по
 /// (`held_at`, `id`), не более `limit`. Для реализаций в памяти и проверки реализаций хранилища.
 pub fn held_page(
     queue: impl IntoIterator<Item = HeldMessage>,
@@ -634,6 +622,7 @@ mod tests {
             &self,
             _: TenantId,
             _: Option<GroupId>,
+            _: Option<HeldCursor>,
             _: usize,
         ) -> Result<Vec<HeldMessage>> {
             Ok(Vec::new())

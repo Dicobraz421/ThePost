@@ -1,6 +1,7 @@
 //! Сеанс ManageSieve через `tokio::io::duplex` (SIEVE-08): приветствие, `STARTTLS`, вход, лимиты.
 
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,9 @@ use crate::SieveConfig;
 use crate::managesieve::{Deps, Session, SessionCtx, Transport};
 
 /// Соединение теста: «TLS» — признак, рукопожатия нет.
+/// Адрес клиента соединений стенда.
+const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7));
+
 struct TestConn {
     io: DuplexStream,
     tls: bool,
@@ -36,6 +40,10 @@ impl Transport for TestConn {
 
     fn tls(&self) -> bool {
         self.tls
+    }
+
+    fn peer(&self) -> IpAddr {
+        PEER
     }
 
     fn can_starttls(&self) -> bool {
