@@ -64,6 +64,7 @@ fn dir_account(id: &str, login: &str, emails: &[&str]) -> DirAccount {
         enabled: true,
         attributes: BTreeMap::new(),
         org: Default::default(),
+        hidden_from_gal: false,
     }
 }
 
@@ -1463,6 +1464,7 @@ async fn outbound_suite() {
 
 mod local_domains;
 mod org_policy;
+mod rcpt_rate;
 mod rules;
 mod scheduled;
 mod senders;

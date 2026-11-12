@@ -35,7 +35,9 @@ use tp_contracts::auth::{
 use tp_contracts::bus::EventBus;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::ext::{Decision, DecisionHook, DeliveryInfo, FinalDelete, SubmissionInfo};
-use tp_contracts::meta::{AccountScope, AccountStore, MessageStore, PolicyResolver, QuotaUsage};
+use tp_contracts::meta::{
+    AccountScope, AccountStore, Message, MessageStore, PolicyResolver, QuotaUsage,
+};
 use tp_contracts::queue::{
     Claimed, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt, RcptStatus,
 };
@@ -1252,6 +1254,10 @@ impl TrashStore for MemTrash {
         Ok(self.page(scope, true, offset, limit))
     }
 
+    async fn hidden_message(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
+        Ok(self.meta.hidden_message(scope, id))
+    }
+
     async fn restore(&self, scope: AccountScope, object: TrashObject) -> Result<Restored> {
         let id = trashed_message(object)?;
         let Some(row) = self
@@ -1680,6 +1686,7 @@ mod tests {
             enabled: true,
             attributes: Default::default(),
             org: Default::default(),
+            hidden_from_gal: false,
         }
     }
 
@@ -1750,8 +1757,10 @@ mod tests {
             .expect("none");
         assert!(none.changes.is_empty() && none.next == p3.next);
 
+        // Признаки учётной записи (вход, скрытие из GAL — CTR-58) доходят до потребителя без изменений.
         let mut a = dir_account("a");
         a.enabled = false;
+        a.hidden_from_gal = true;
         dir.upsert_account(t, a.clone());
         dir.remove_account(t, "c");
         let inc = dir

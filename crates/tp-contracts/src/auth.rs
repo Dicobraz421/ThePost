@@ -64,6 +64,10 @@ pub struct DirAccount {
     /// Оргатрибуты (CTR-35): подразделение, должность, руководитель, старшинство.
     #[serde(default)]
     pub org: DirOrg,
+    /// Скрыта из адресной книги (CTR-58, решение 79): нет в GAL, вход и приём почты — как обычно
+    /// (как [`DistributionGroup::hidden_from_gal`](crate::groups::DistributionGroup::hidden_from_gal) у групп).
+    #[serde(default)]
+    pub hidden_from_gal: bool,
 }
 
 /// Оргатрибуты учётной записи в каталоге (CTR-35); ссылки — `external_id` записей каталога.
@@ -519,6 +523,23 @@ mod tests {
             serde_json::from_str::<Rights>(&s).expect("parse"),
             Rights::ALL
         );
+    }
+
+    /// CTR-58: запись без признака скрытия (прежний формат) — видна в адресной книге.
+    #[test]
+    fn dir_account_hidden_default() {
+        let old = r#"{"external_id":"a","login":"a@x","display_name":"A","emails":["a@x"],"enabled":true,"attributes":{}}"#;
+        let a: DirAccount = serde_json::from_str(old).expect("parse");
+        assert!(!a.hidden_from_gal);
+        assert_eq!(a.org, DirOrg::default());
+        let hidden = DirAccount {
+            hidden_from_gal: true,
+            ..a
+        };
+        let back: DirAccount =
+            serde_json::from_str(&serde_json::to_string(&hidden).expect("serialize"))
+                .expect("parse");
+        assert_eq!(back, hidden);
     }
 
     #[test]

@@ -11,6 +11,13 @@
 //! полями пути и пишется новой версией (`POST /v1/<mount>/data/<путь>` с `options.cas` — версия, с которой
 //! начато слияние; правка в хранилище между чтением и записью — отказ, а не потеря чужих полей).
 //!
+//! Внутренние сертификаты (PLT-26, решение 64) — движок PKI OpenBao: путь `<mount>/issue/<роль>` из `secrets.pki`
+//! читается выпуском (`POST /v1/<mount>/issue/<роль>` с именами и сроком из секции). Все поля — из одного выпуска:
+//! `certificate`, `private_key`, `issuing_ca`, `ca_chain`, `serial_number` и `bundle` — ключ, сертификат и цепочка УЦ
+//! одним PEM (п. 19 синка 12.11, решение 80: цепочка — в том же секрете, что ключ, замена пары одним шагом; ссылка
+//! для `tls.key`). Выпуск действует до двух третей срока сертификата, затем следующее чтение выпускает новый; отказ
+//! выпуска при действующем сертификате — прежний выпуск (предупреждение в журнале), после срока — ошибка.
+//!
 //! Вход узла — ровно один способ: Kubernetes (токен сервисного аккаунта), сертификат TLS узла (mTLS), AppRole
 //! (`secret_id` из файла, например учётные данные systemd) или готовый токен из файла (Vault Agent, dev).
 //! Токен узла продлевается, когда прошло две трети срока; отказ продления или ответ 403 — новый вход.
@@ -26,15 +33,22 @@
 //!     approle:
 //!       role_id_file: /etc/thepost/openbao/role_id
 //!       secret_id_file: /run/credentials/thepost.service/openbao-secret-id
+//!   pki:
+//!     pki/issue/thepost-node:
+//!       common_name: mx1.example.ru
+//!       uri_sans: ["thepost:node:mx1"]
+//!       ttl: 72h
 //! database:
 //!   password: { secret: "thepost/db#password" }
+//! tls:
+//!   key: { secret: "pki/issue/thepost-node#bundle" }
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -64,6 +78,8 @@ pub struct SecretsConfig {
     pub auth: SecretsAuthConfig,
     /// Точки монтирования, которые читаются без KV v2 (`GET /v1/<путь>`): движки с арендами и KV v1.
     pub dynamic_mounts: Vec<String>,
+    /// Выпуск внутренних сертификатов движком PKI: путь `<mount>/issue/<роль>` → имена и срок сертификата.
+    pub pki: BTreeMap<String, PkiIssueConfig>,
     /// Время на один запрос к хранилищу (`10s`).
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -82,9 +98,40 @@ impl Default for SecretsConfig {
             tls: SecretsTlsConfig::default(),
             auth: SecretsAuthConfig::default(),
             dynamic_mounts: vec!["database".to_owned()],
+            pki: BTreeMap::new(),
             request_timeout: Duration::from_secs(10),
             max_response_bytes: 1024 * 1024,
             doctor: SecretsDoctorConfig::default(),
+        }
+    }
+}
+
+/// Выпуск сертификата движком PKI (`secrets.pki.<mount>/issue/<роль>`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct PkiIssueConfig {
+    /// Имя субъекта (CN) сертификата, например имя хоста узла.
+    pub common_name: String,
+    /// Дополнительные имена DNS (SAN).
+    pub alt_names: Vec<String>,
+    /// Адреса IP (SAN).
+    pub ip_sans: Vec<String>,
+    /// URI (SAN), например идентичность узла `thepost:node:<id>` (решение 103).
+    pub uri_sans: Vec<String>,
+    /// Срок сертификата (`72h`); не больше `max_ttl` роли PKI.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub ttl: Duration,
+}
+
+impl Default for PkiIssueConfig {
+    fn default() -> Self {
+        Self {
+            common_name: String::new(),
+            alt_names: Vec::new(),
+            ip_sans: Vec::new(),
+            uri_sans: Vec::new(),
+            ttl: Duration::from_secs(72 * 3600),
         }
     }
 }
@@ -299,6 +346,25 @@ impl SecretsConfig {
                 "dynamic_mounts: expected mount names like database",
             ));
         }
+        for (path, issue) in &self.pki {
+            let shape = path.split('/').collect::<Vec<_>>();
+            let valid = matches!(shape.as_slice(), [mount, "issue", role] if segment(mount) && segment(role));
+            if !valid
+                || self
+                    .dynamic_mounts
+                    .iter()
+                    .any(|m| Some(m.as_str()) == shape.first().copied())
+            {
+                return Err(Error::invalid(format!(
+                    "pki.{path}: expected <mount>/issue/<role> outside dynamic_mounts"
+                )));
+            }
+            if issue.common_name.is_empty() || issue.ttl.as_secs() == 0 {
+                return Err(Error::invalid(format!(
+                    "pki.{path}: common_name and a ttl of at least 1s are required"
+                )));
+            }
+        }
         if self
             .namespace
             .as_deref()
@@ -436,6 +502,15 @@ struct Issued {
     expires: Instant,
 }
 
+/// Текущий выпуск сертификата PKI: все поля — из одного выпуска.
+struct IssuedCert {
+    fields: BTreeMap<String, Secret>,
+    /// Две трети срока: следующее чтение выпускает новый сертификат.
+    renew_at: Instant,
+    /// Конец срока сертификата.
+    expires: Instant,
+}
+
 struct Inner {
     http: Client,
     /// Адрес хранилища (`https://host:port/`).
@@ -444,8 +519,10 @@ struct Inner {
     namespace: Option<String>,
     auth: Auth,
     dynamic_mounts: Vec<String>,
+    pki: BTreeMap<String, PkiIssueConfig>,
     token: Mutex<Option<NodeToken>>,
     issued: Mutex<HashMap<String, Issued>>,
+    certs: Mutex<HashMap<String, IssuedCert>>,
 }
 
 /// Клиент OpenBao/Vault — встроенная реализация [`SecretStore`]. Клоны разделяют токен узла.
@@ -503,8 +580,10 @@ impl VaultStore {
                 namespace: cfg.namespace.clone(),
                 auth,
                 dynamic_mounts: cfg.dynamic_mounts.clone(),
+                pki: cfg.pki.clone(),
                 token: Mutex::new(None),
                 issued: Mutex::new(HashMap::new()),
+                certs: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -796,6 +875,107 @@ impl VaultStore {
             .ok_or(VaultError::NotFound)
     }
 
+    /// Поле сертификата PKI `path`: текущий выпуск до двух третей срока, затем новый; отказ выпуска при
+    /// действующем сертификате — прежний выпуск.
+    async fn read_pki(
+        &self,
+        path: &str,
+        issue: &PkiIssueConfig,
+        field: &str,
+    ) -> std::result::Result<Secret, VaultError> {
+        let mut certs = self.inner.certs.lock().await;
+        let now = Instant::now();
+        let fresh = certs.get(path).filter(|c| c.renew_at > now).is_some();
+        if !fresh {
+            match self.issue_cert(path, issue).await {
+                Ok(cert) => {
+                    tracing::info!(pki = %path, "internal certificate issued");
+                    certs.insert(path.to_owned(), cert);
+                }
+                Err(e) if certs.get(path).is_some_and(|c| c.expires > now) => {
+                    tracing::warn!(pki = %path, error = %e, "internal certificate not reissued, keeping the current one");
+                }
+                Err(e) => {
+                    certs.remove(path);
+                    return Err(e);
+                }
+            }
+        }
+        certs
+            .get(path)
+            .and_then(|c| c.fields.get(field))
+            .cloned()
+            .ok_or(VaultError::NotFound)
+    }
+
+    /// Выпуск сертификата: `POST /v1/<mount>/issue/<роль>`.
+    async fn issue_cert(
+        &self,
+        path: &str,
+        issue: &PkiIssueConfig,
+    ) -> std::result::Result<IssuedCert, VaultError> {
+        let body = json!({
+            "common_name": issue.common_name,
+            "alt_names": issue.alt_names.join(","),
+            "ip_sans": issue.ip_sans.join(","),
+            "uri_sans": issue.uri_sans.join(","),
+            "ttl": format!("{}s", issue.ttl.as_secs()),
+        });
+        let v = self
+            .call("POST", &format!("/v1/{path}"), Some(&body))
+            .await?;
+        let data = v.get("data").ok_or(VaultError::Response("no data"))?;
+        let pem = |name: &str| {
+            data.get(name)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let (Some(certificate), Some(private_key)) = (pem("certificate"), pem("private_key"))
+        else {
+            return Err(VaultError::Response("no certificate or private_key"));
+        };
+        let issuing_ca = pem("issuing_ca").unwrap_or_default();
+        let chain = data
+            .get("ca_chain")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| issuing_ca.clone());
+        let expiration = data
+            .get("expiration")
+            .and_then(Value::as_u64)
+            .ok_or(VaultError::Response("no expiration"))?;
+        let unix_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let lifetime = Duration::from_secs(expiration).saturating_sub(unix_now);
+        if lifetime.is_zero() {
+            return Err(VaultError::Response("certificate is already expired"));
+        }
+        let bundle = format!("{private_key}\n{certificate}\n{chain}\n");
+        let mut fields = BTreeMap::new();
+        fields.insert("bundle".to_owned(), Secret::new(bundle));
+        fields.insert("ca_chain".to_owned(), Secret::new(chain));
+        fields.insert("issuing_ca".to_owned(), Secret::new(issuing_ca));
+        if let Some(serial) = pem("serial_number") {
+            fields.insert("serial_number".to_owned(), Secret::new(serial));
+        }
+        fields.insert("certificate".to_owned(), Secret::new(certificate));
+        fields.insert("private_key".to_owned(), Secret::new(private_key));
+        let now = Instant::now();
+        Ok(IssuedCert {
+            fields,
+            renew_at: now + lifetime * 2 / 3,
+            expires: now + lifetime,
+        })
+    }
+
     /// Обновляет или снимает запомненную аренду после продления.
     async fn note_lease(&self, id: &str, renewed: Option<&SecretLease>) {
         let mut issued = self.inner.issued.lock().await;
@@ -833,7 +1013,9 @@ impl SecretStore for VaultStore {
             Some((mount, rest)) => (mount, Some(rest)),
             None => (path, None),
         };
-        let result = if self.inner.dynamic_mounts.iter().any(|m| m == mount) {
+        let result = if let Some(issue) = self.inner.pki.get(path) {
+            self.read_pki(path, issue, secret.field()).await
+        } else if self.inner.dynamic_mounts.iter().any(|m| m == mount) {
             self.read_dynamic(path, secret.field()).await
         } else {
             match rest {
@@ -847,6 +1029,11 @@ impl SecretStore for VaultStore {
 
     async fn put(&self, secret: &SecretRef, value: &Secret) -> Result<()> {
         let path = secret.path();
+        if self.inner.pki.contains_key(path) {
+            return Err(Error::invalid(format!(
+                "secret {secret}: {path} issues certificates (secrets.pki), it is not written"
+            )));
+        }
         let result = match path.split_once('/') {
             Some((mount, _)) if self.inner.dynamic_mounts.iter().any(|m| m == mount) => {
                 return Err(Error::invalid(format!(

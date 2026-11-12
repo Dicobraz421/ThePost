@@ -21,7 +21,11 @@ struct Sched {
 
 impl Sched {
     async fn new() -> Self {
-        let env = Env::new(DecisionHooks::default()).await;
+        Self::build(Env::new(DecisionHooks::default()).await, |d| d)
+    }
+
+    /// Окружение `env`; доставка — с дополнительными зависимостями `with`.
+    fn build(env: Env, with: impl FnOnce(Delivery) -> Delivery) -> Self {
         let clock = ManualClock::default();
         let queue = MemQueue::new(clock.shared());
         let c = clock.clone();
@@ -32,7 +36,7 @@ impl Sched {
             now: Arc::new(move || c.now()),
         };
         let base = env.delivery(false);
-        let delivery = Arc::new(
+        let delivery = Arc::new(with(
             Delivery::new(
                 Deps {
                     outbound: Some(Arc::new(OutQueue::new(deps.clone()))),
@@ -44,7 +48,7 @@ impl Sched {
                 },
             )
             .with_transport(env.routes()),
-        );
+        ));
         let transport = Arc::new(Scripted::default());
         let worker = QueueWorker::new(deps, transport.clone(), "mx.example.org")
             .with_local(delivery.clone());
@@ -186,4 +190,68 @@ async fn outbound_schedule_suite() {
     let list = rcpts(&["x@example.net", "bob@example.org"]);
     tp_testkit::suite::outbound_schedule(s.delivery.as_ref(), TenantId::DEFAULT, &list, at).await;
     assert!(s.queue.blobs().is_empty());
+}
+
+/// Лимит писем в час (SMTP-43) — и для отложенной отправки: письмо учитывается при постановке; при
+/// `send_per_hour = 1` второе отложенное письмо alice не ставится (`Error::Unavailable`), отказ `451 4.7.1` — в
+/// журнале доставки, в срок выпускается только первое.
+#[tokio::test]
+async fn scheduled_over_hourly_limit_is_refused() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let policies = super::org_policy::alice_policy(
+        &env,
+        tp_contracts::meta::Policy {
+            send_per_hour: Some(1),
+            ..tp_contracts::meta::Policy::default()
+        },
+    )
+    .await;
+    let log = tp_testkit::MemDeliveryLog::new();
+    let tracking = crate::tracking::Tracking::new(
+        Arc::new(log.clone()),
+        tp_contracts::membership::NodeId::new("node-1").expect("node"),
+    );
+    let s = Sched::build(env, |d| {
+        d.with_policies(Arc::new(policies))
+            .with_tracking(tracking)
+            .with_send_limits(Arc::new(crate::SendLimits::new()))
+    });
+    let at = s.clock.now() + Duration::from_secs(600);
+    let list = rcpts(&["x@example.net"]);
+    let schedule = || {
+        s.delivery.schedule(
+            TenantId::DEFAULT,
+            super::org_policy::ALICE,
+            &list,
+            Bytes::from_static(MAIL),
+            at,
+        )
+    };
+    schedule().await.expect("first");
+    assert!(
+        matches!(schedule().await, Err(Error::Unavailable { .. })),
+        "второе письмо сверх лимита"
+    );
+    let rejected: Vec<_> = log
+        .events()
+        .into_iter()
+        .filter(|e| e.kind == tp_contracts::delivery::DeliveryEventKind::Reject)
+        .collect();
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert!(
+        rejected[0]
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("451 4.7.1 ")),
+        "{rejected:?}"
+    );
+    s.clock.advance(Duration::from_secs(600));
+    assert_eq!(
+        s.worker
+            .run_once(&QueueConfig::default())
+            .await
+            .expect("run"),
+        1
+    );
+    assert_eq!(s.transport.calls.lock().expect("lock").len(), 1);
 }
