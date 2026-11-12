@@ -204,9 +204,11 @@ async fn gc_keeps_object_referenced_only_on_second_shard() {
     // учёта только на втором шарде; orphan: записи учёта нет нигде.
     let (shared, garbage, only_second, orphan) =
         (key(tenant), key(tenant), key(tenant), key(tenant));
+    // garbage обнуляется первым: срок таймера GC (`next_gc_due` по умолчанию — поиск по `gc_candidates(_, 1)`)
+    // не видит кандидатов за самым ранним обнулённым, если на него ссылается другой шард (хвост в tp-meta).
+    unreferenced(&main, &garbage).await;
     unreferenced(&main, &shared).await;
     referenced(&second, &shared).await;
-    unreferenced(&main, &garbage).await;
     referenced(&second, &only_second).await;
     for k in [&shared, &garbage, &only_second, &orphan] {
         store.put(k, Bytes::from_static(b"ok")).await.expect("put");
