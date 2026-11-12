@@ -48,7 +48,7 @@
     src: "{{ hostvars[stand_smb_host].thepost_pki_dir | default('/etc/thepost/pki') }}/ca.pem"
   delegate_to: "{{ stand_smb_host }}"
   register: stand_ca
-  when: hostvars[stand_smb_host].thepost_tls_mode | default('certbot') == 'internal'
+  when: hostvars[stand_smb_host].thepost_tls_mode | default('acme') == 'internal'
 
 - name: Install CA of SMB node
   ansible.builtin.copy:

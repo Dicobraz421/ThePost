@@ -40,6 +40,7 @@ pub mod shards;
 pub mod sieve;
 pub mod signals;
 pub mod submissions;
+mod sync_gate;
 pub mod transport;
 
 use std::future::Future;

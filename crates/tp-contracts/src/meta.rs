@@ -289,21 +289,11 @@ pub trait AccountStore: Send + Sync + 'static {
     }
 
     /// Восстанавливает отключённый ящик ([`AccountState::Active`]; действующий — без изменений). Нет учётной записи —
-    /// `Error::NotFound`. По умолчанию — `Error::Internal`.
-    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
-        let _ = (tenant, id);
-        Err(Error::internal(
-            "AccountStore::restore_account не реализован",
-        ))
-    }
+    /// `Error::NotFound`.
+    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()>;
 
-    /// Отключённые ящики организации по (`until`, `id`) — список Admin API. По умолчанию — `Error::Internal`.
-    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
-        let _ = tenant;
-        Err(Error::internal(
-            "AccountStore::disabled_accounts не реализован",
-        ))
-    }
+    /// Отключённые ящики организации по (`until`, `id`) — список Admin API.
+    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>>;
 
     /// Отключённые ящики всех организаций со сроком хранения не позже `now`, по (`until`, `id`), не более `limit` —
     /// окончательное удаление (роль maintenance). По умолчанию — `Error::Internal`.
@@ -325,19 +315,14 @@ pub trait AccountStore: Send + Sync + 'static {
     /// операции (ссылки на объекты BLOB организации не меняются), долгую операцию над большим ящиком Admin API ведёт
     /// фоновой задачей (ADM-10). Без режима (`None`) ящик `to` должен быть пуст, иначе — `Error::Invalid` с подсказкой
     /// выбрать режим. `disabled` действует — `Error::Invalid`; `to` отключена — `Error::Conflict`; нет любой из
-    /// записей — `Error::NotFound`. По умолчанию — `Error::Internal`.
+    /// записей — `Error::NotFound`.
     async fn attach_account(
         &self,
         tenant: TenantId,
         disabled: AccountId,
         to: AccountId,
         existing: Option<ExistingContent>,
-    ) -> Result<Account> {
-        let _ = (tenant, disabled, to, existing);
-        Err(Error::internal(
-            "AccountStore::attach_account не реализован",
-        ))
-    }
+    ) -> Result<Account>;
 
     /// Окончательно удаляет отключённый ящик (учётную запись и папки) после удаления писем вызывающим (`MailStore`,
     /// освобождение ссылок BLOB). Действующий — `Error::Invalid`; остались письма — `Error::Conflict`; нет —

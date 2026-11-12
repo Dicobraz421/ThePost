@@ -7,8 +7,9 @@ use std::sync::Arc;
 use tp_contracts::acl::AclStore;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::meta::{
-    Account, AccountKind, AccountScope, AccountStore, AccountUpsert, Flag, Flags, MailboxStore,
-    MessageQuery, MessageStore, NewMailbox, QuotaUsage, SpecialUse,
+    Account, AccountKind, AccountScope, AccountStore, AccountUpsert, DisabledAccount,
+    ExistingContent, Flag, Flags, MailboxStore, MessageQuery, MessageStore, NewMailbox, QuotaUsage,
+    SpecialUse,
 };
 use tp_contracts::{AccountId, DomainId, MailboxId, Result, TenantId};
 use tp_testkit::{MemAcl, MemMetadata};
@@ -122,6 +123,43 @@ impl AccountStore for Limited {
             q.limit_bytes = self.1;
             Ok(q)
         })
+    }
+
+    fn restore_account<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        id: AccountId,
+    ) -> Fut<'async_trait, ()>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.restore_account(tenant, id)
+    }
+
+    fn disabled_accounts<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+    ) -> Fut<'async_trait, Vec<DisabledAccount>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.disabled_accounts(tenant)
+    }
+
+    fn attach_account<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        disabled: AccountId,
+        to: AccountId,
+        existing: Option<ExistingContent>,
+    ) -> Fut<'async_trait, Account>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.attach_account(tenant, disabled, to, existing)
     }
 }
 
