@@ -1,10 +1,11 @@
-//! Тесты tp-sieve: разбор (SIEVE-01), проверка (SIEVE-02), выполнение (SIEVE-03), действия (SIEVE-04), тесты расширений (SIEVE-05).
+//! Тесты tp-sieve: разбор (SIEVE-01), проверка (SIEVE-02), выполнение (SIEVE-03), действия (SIEVE-04), тесты расширений (SIEVE-05), автоответ (SIEVE-06).
 
 mod actions;
 mod checking;
 mod execution;
 mod extensions;
 mod parsing;
+mod vacation;
 
 use crate::{Diagnostic, Limits};
 

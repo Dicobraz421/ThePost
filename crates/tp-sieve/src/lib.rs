@@ -9,9 +9,11 @@
 
 pub mod ast;
 mod compile;
+mod config;
 mod lexer;
 mod outcome;
 mod run;
+mod vacation;
 
 use std::fmt;
 
@@ -19,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 pub use ast::{Arg, Command, Script, Test, parse};
 pub use compile::{EXTENSIONS, Program, check, compile};
+pub use config::VacationConfig;
 pub use run::{Action, Context, Outcome, VacationAction, run};
 
 /// Лимиты разбора и выполнения (секция `sieve` — SIEVE-07; здесь значения по умолчанию).
