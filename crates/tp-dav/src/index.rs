@@ -57,11 +57,7 @@ pub fn index(
 pub fn card(body: &str) -> Result<ObjectIndex, IndexError> {
     let v = VCard::parse(body).map_err(|_| IndexError::Card)?;
     let uid = v.uid().ok_or(IndexError::Uid)?.to_owned();
-    checked(ObjectIndex {
-        component: Component::Card,
-        uid,
-        span: None,
-    })
+    checked(ObjectIndex::new(Component::Card, uid, None))
 }
 
 /// Индекс iCalendar: один вид компонента и один UID на ресурс.
@@ -98,11 +94,7 @@ pub fn of_calendar(ical: &ICalendar, opts: &IndexOptions) -> Result<ObjectIndex,
     }
     let component = component.ok_or(IndexError::Calendar)?;
     let uid = uid.ok_or(IndexError::Uid)?.to_owned();
-    checked(ObjectIndex {
-        component,
-        uid,
-        span: span(ical, opts),
-    })
+    checked(ObjectIndex::new(component, uid, span(ical, opts)))
 }
 
 fn checked(idx: ObjectIndex) -> Result<ObjectIndex, IndexError> {

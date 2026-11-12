@@ -338,11 +338,7 @@ pub(crate) mod tests {
 
     async fn put_card(env: &Env, book: &str, uid: &str) {
         let body = format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:{uid}\r\nFN:X\r\nEND:VCARD\r\n");
-        let index = ObjectIndex {
-            component: tp_contracts::dav::Component::Card,
-            uid: uid.into(),
-            span: None,
-        };
+        let index = ObjectIndex::new(tp_contracts::dav::Component::Card, uid, None);
         env.dav
             .put_object(
                 env.scope,

@@ -42,6 +42,7 @@ use crate::shards::ShardId;
 ///     max_object_size: 1048576
 ///     max_objects: 20000
 ///     max_collections: 100
+///     busy_horizon: 400d
 ///     tombstone_ttl: 90d
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -53,6 +54,10 @@ pub struct DavConfig {
     pub max_objects: usize,
     /// Коллекций учётной записи (всех видов).
     pub max_collections: usize,
+    /// Горизонт индекса занятости от момента записи объекта ([`DavLimits::busy_horizon`]).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub busy_horizon: Duration,
     /// Срок хранения надгробий удалённых объектов и коллекций: токен синхронизации старше очищенных — полная
     /// синхронизация клиента.
     #[serde(with = "duration")]
@@ -67,6 +72,7 @@ impl DavConfig {
             max_object_size: self.max_object_size,
             max_objects: self.max_objects,
             max_collections: self.max_collections,
+            busy_horizon: self.busy_horizon,
         }
     }
 
@@ -76,6 +82,7 @@ impl DavConfig {
             max_object_size: limits.max_object_size,
             max_objects: limits.max_objects,
             max_collections: limits.max_collections,
+            busy_horizon: limits.busy_horizon,
             ..Self::default()
         }
     }
@@ -89,6 +96,7 @@ impl Default for DavConfig {
             max_object_size: l.max_object_size,
             max_objects: l.max_objects,
             max_collections: l.max_collections,
+            busy_horizon: l.busy_horizon,
             tombstone_ttl: Duration::from_secs(90 * 24 * 3600),
         }
     }
@@ -156,6 +164,8 @@ impl CollectionRow {
             order: to_u32(self.sort_order)?,
             timezone: self.timezone,
             components,
+            // Прозрачность календаря хранит META-51.
+            transparent: false,
             state: modseq(self.modseq)?,
         })
     }
@@ -185,14 +195,15 @@ impl ObjectRow {
             name: self.name,
             etag: self.etag,
             body: self.body,
-            index: ObjectIndex {
-                component: self.component.parse()?,
-                uid: self.uid,
-                span: self.span_start.map(|start| Span {
+            // Индекс занятости и `Schedule-Tag` хранит META-51.
+            index: ObjectIndex::new(
+                self.component.parse()?,
+                self.uid,
+                self.span_start.map(|start| Span {
                     start,
                     end: self.span_end,
                 }),
-            },
+            ),
         })
     }
 }
@@ -1259,7 +1270,7 @@ mod tests {
     #[test]
     fn config_from_yaml() {
         let c: DavConfig = serde_yaml_ng::from_str(
-            "max_object_size: 4096\nmax_objects: 4\nmax_collections: 3\ntombstone_ttl: 7d\n",
+            "max_object_size: 4096\nmax_objects: 4\nmax_collections: 3\nbusy_horizon: 30d\ntombstone_ttl: 7d\n",
         )
         .expect("yaml");
         assert_eq!(
@@ -1267,7 +1278,8 @@ mod tests {
             DavLimits {
                 max_object_size: 4096,
                 max_objects: 4,
-                max_collections: 3
+                max_collections: 3,
+                busy_horizon: Duration::from_secs(30 * 24 * 3600),
             }
         );
         assert_eq!(c.tombstone_ttl, Duration::from_secs(7 * 24 * 3600));

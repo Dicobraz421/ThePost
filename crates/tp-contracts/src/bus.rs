@@ -16,7 +16,7 @@ use crate::ids::{AccountId, MailboxId, ModSeq, TenantId};
 use crate::meta::AccountScope;
 
 /// Вид сигнала. Виды учётной записи (`account = Some`): `MailboxChanged`, `MailboxListChanged`, `DavChanged`,
-/// `SieveChanged`; остальные —
+/// `ScheduleInboxChanged`, `SieveChanged`; остальные —
 /// системные (`account = None`, приходят в [`EventBus::subscribe_system`]). `Resync` вставляет в поток только шина.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
@@ -36,6 +36,12 @@ pub enum EventKind {
         kind: CollectionKind,
         /// Коллекция.
         collection: CollectionId,
+        /// `ModSeq` изменения.
+        modseq: ModSeq,
+    },
+    /// Изменились входящие планирования учётной записи (`DavStore::inbox_put`, `inbox_delete`; JMAP push
+    /// `CalendarEventNotification`). Сигнал — [`crate::schedule::schedule_inbox_changed`].
+    ScheduleInboxChanged {
         /// `ModSeq` изменения.
         modseq: ModSeq,
     },
@@ -92,6 +98,7 @@ impl EventKind {
             EventKind::MailboxChanged { .. }
                 | EventKind::MailboxListChanged
                 | EventKind::DavChanged { .. }
+                | EventKind::ScheduleInboxChanged { .. }
                 | EventKind::SieveChanged
                 | EventKind::Resync
         )
@@ -157,6 +164,7 @@ mod tests {
             }
             .is_system()
         );
+        assert!(!EventKind::ScheduleInboxChanged { modseq: ModSeq(3) }.is_system());
         assert!(!EventKind::SieveChanged.is_system());
         assert!(!EventKind::Resync.is_system());
         for kind in [
