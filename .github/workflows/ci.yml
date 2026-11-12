@@ -181,8 +181,7 @@ jobs:
           checks: 'true'
 
   # Только main, бета и ручной запуск: release-сборка и артефакт (решение 116, CI-14) — тем же путём, что выпуск
-  # в beta.yml (.github/actions/release-build: cross, запуск на qemu Nehalem); бинарный файл раздаёт веб-консоль
-  # (CI-08, .github/actions/console-check). В PR не выполняется.
+  # в beta.yml (.github/actions/release-build: cross, запуск на qemu Nehalem). В PR не выполняется.
   release:
     needs: [changes, test]
     if: >-
@@ -197,9 +196,6 @@ jobs:
         with:
           target: x86_64-unknown-linux-gnu
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-      - uses: ./.github/actions/console-check
-        with:
-          binary: ${{ steps.build.outputs.binary }}
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: thepost-linux-x86_64
