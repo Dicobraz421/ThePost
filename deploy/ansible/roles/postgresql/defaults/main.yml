@@ -1,16 +1,44 @@
 # Роль postgresql: одиночный PostgreSQL профиля SMB (SRS 1.2) — пакеты PGDG, только TLS по сети, раздельные
 # учётные записи (SRS 2.7, 3.1; META-23, DEP-08; как compose/postgres/app-role.sh): владелец схемы, узел, только чтение.
 ---
-# PostgreSQL 16+ (SRS); пакеты — репозиторий PGDG (apt.postgresql.org): в Debian 12 только 15.
+# PostgreSQL 16+ (SRS). Семейство ОС — по менеджеру пакетов: apt — Debian, Ubuntu, Astra Linux SE; dnf — РЕД ОС,
+# AlmaLinux, RHEL (решения 2026-11-11 №28, 51, 52).
 postgresql_version: 16
-postgresql_pgdg_repo: true
+postgresql_rhel: "{{ ansible_pkg_mgr != 'apt' }}"
+# Пакеты PGDG (в Debian 12 и Astra Linux SE 1.8 только 15): apt.postgresql.org или download.postgresql.org (yum,
+# AlmaLinux, RHEL). РЕД ОС — пакеты postgresqlNN дистрибутива (PGDG для РЕД ОС нет).
+postgresql_pgdg_repo: "{{ ansible_distribution != 'RED' }}"
 postgresql_pgdg_uri: http://apt.postgresql.org/pub/repos/apt
+# Набор apt — кодовое имя выпуска; у Astra Linux SE 1.8 своё имя, набор — bookworm (база Debian 12).
+postgresql_pgdg_suite: >-
+  {{ 'bookworm' if ansible_distribution is match('Astra') else ansible_distribution_release }}-pgdg
 postgresql_pgdg_key_url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+# Astra Linux SE закрепляет свои репозитории (Pin-Priority 900, astra.pin.pref) — свои postgresql-common и libpq5
+# (15) не дают поставить PGDG 16; true — пакеты PGDG получают приоритет 901 (thepost-pgdg.pref).
+postgresql_pgdg_pin: "{{ ansible_distribution is match('Astra') }}"
+postgresql_pgdg_yum_uri: https://download.postgresql.org/pub/repos/yum
+postgresql_pgdg_yum_key_url: https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL
 postgresql_cluster: main
-postgresql_conf_dir: "/etc/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}"
-postgresql_data_dir: "/var/lib/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}"
-postgresql_bin_dir: "/usr/lib/postgresql/{{ postgresql_version }}/bin"
-postgresql_service: postgresql
+# Раскладка пакетов: Debian — /etc/postgresql/<версия>/<кластер>, юнит postgresql@<версия>-<кластер>; семейство RHEL
+# (PGDG и РЕД ОС) — настройки в каталоге данных /var/lib/pgsql/<версия>/data, юнит postgresql-<версия>.
+postgresql_data_dir: >-
+  {{ '/var/lib/pgsql/' ~ postgresql_version ~ '/data' if postgresql_rhel | bool
+     else '/var/lib/postgresql/' ~ postgresql_version ~ '/' ~ postgresql_cluster }}
+postgresql_conf_dir: >-
+  {{ postgresql_data_dir if postgresql_rhel | bool
+     else '/etc/postgresql/' ~ postgresql_version ~ '/' ~ postgresql_cluster }}
+postgresql_bin_dir: >-
+  {{ '/usr/pgsql-' ~ postgresql_version ~ '/bin' if postgresql_rhel | bool
+     else '/usr/lib/postgresql/' ~ postgresql_version ~ '/bin' }}
+postgresql_home: "{{ '/var/lib/pgsql' if postgresql_rhel | bool else '/var/lib/postgresql' }}"
+# Создание кластера семейства RHEL: PGDG — <bin>/postgresql-<версия>-setup, РЕД ОС — /usr/bin/postgresql-<версия>-setup.
+postgresql_setup_cmd: >-
+  {{ ('/usr/bin' if ansible_distribution == 'RED' else postgresql_bin_dir) ~ '/postgresql-' ~ postgresql_version ~ '-setup' }}
+# Юнит кластера (drop-in роли pgbackrest) и служба для запуска и перезапуска.
+postgresql_unit: >-
+  {{ 'postgresql-' ~ postgresql_version if postgresql_rhel | bool
+     else 'postgresql@' ~ postgresql_version ~ '-' ~ postgresql_cluster }}.service
+postgresql_service: "{{ 'postgresql-' ~ postgresql_version if postgresql_rhel | bool else 'postgresql' }}"
 
 # Только локальные подключения: thepost на той же ВМ.
 postgresql_listen_addresses: localhost

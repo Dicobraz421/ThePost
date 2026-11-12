@@ -135,8 +135,13 @@ curl --cacert $CA -si https://localhost/.well-known/jmap | head -1              
 через 587 с AUTH, получение через IMAP или JMAP — шаги в `docs/manual-tests/CMP-01.md` (после CMP-04, CMP-05).
 
 ## Эталон SMB одной командой (Ansible)
-Чистая ВМ Debian 12 или Ubuntu 24.04 → PostgreSQL 16 (PGDG), OpenBao, Rspamd (clamav-milter — `thepost_clamav: true`)
-и `thepost` (все роли) под systemd (SRS 1.2, 5.6):
+Чистая ВМ → PostgreSQL 16 (PGDG), OpenBao, Rspamd (clamav-milter — `thepost_clamav: true`) и `thepost` (все роли) под
+systemd (SRS 1.2, 5.6). ОС (решения 2026-11-11 №28, 51, 52; семейство — по менеджеру пакетов):
+- apt — Debian 13 (основа) и 12, Ubuntu 26.04 и 24.04, Astra Linux SE 1.8 (наборы PGDG и Rspamd — `bookworm`);
+- dnf — AlmaLinux 10 и 9 (совместимость с RHEL 9 и 10): PGDG yum, Rspamd `rspamd.com/rpm-stable`, restic и certbot —
+  EPEL (на самом RHEL EPEL подключает администратор); РЕД ОС 8 — PostgreSQL, Rspamd, pgBackRest и restic из
+  репозиториев дистрибутива, ClamAV в них нет. Включённый firewalld — роль `thepost` открывает порты клиентских
+  протоколов (certbot — и 80); SELinux — контексты каталогов pgBackRest (роль `pgbackrest`, `tasks/selinux.yml`).
 ```bash
 cargo build --release                                   # или thepost_binary_url + thepost_binary_checksum
 ansible-galaxy collection install -r deploy/ansible/requirements.yml

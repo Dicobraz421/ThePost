@@ -1,0 +1,27 @@
+# SELinux (РЕД ОС, AlmaLinux, RHEL в режиме enforcing): archive_command pgBackRest выполняется в домене postgresql_t —
+# каталоги хранилища, спула и журнала pgBackRest получают типы данных и журнала PostgreSQL.
+---
+- name: Install SELinux management tools
+  ansible.builtin.dnf:
+    name: [policycoreutils-python-utils, python3-policycoreutils]
+    state: present
+
+- name: Set SELinux file contexts of pgBackRest
+  community.general.sefcontext:
+    target: "{{ item.path }}(/.*)?"
+    setype: "{{ item.type }}"
+    state: present
+  loop: >-
+    {{ ([{'path': thepost_backup_repo_path, 'type': 'postgresql_db_t'}] if thepost_backup_repo == 'posix' else [])
+       + [{'path': '/var/spool/pgbackrest', 'type': 'postgresql_db_t'},
+          {'path': '/var/log/pgbackrest', 'type': 'postgresql_log_t'}] }}
+  loop_control:
+    label: "{{ item.path }}"
+  register: thepost_backup_sefcontext
+
+- name: Apply SELinux file contexts of pgBackRest
+  ansible.builtin.command: restorecon -iR {{ item.item.path | quote }}
+  loop: "{{ thepost_backup_sefcontext.results | selectattr('changed') | list }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  changed_when: true
