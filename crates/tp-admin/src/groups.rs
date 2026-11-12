@@ -9,15 +9,17 @@
 //! - очередь модерации (`/api/v1/orgs/{org}/moderation`): письма по времени постановки, одобрение — доставка
 //!   участникам, отклонение — уведомление отправителя с причиной. Письмо забирается из очереди
 //!   (`GroupStore::take_held`) и передаётся [`Moderation`] (контракт, CTR-31; реализация — `tp-smtp`: раскрытие группы,
-//!   приём в ящики, DSN, журнал доставки); ошибка решения возвращает его в очередь.
+//!   приём в ящики, DSN, журнал доставки); ошибка решения возвращает его в очередь. Тема письма (`subject`) —
+//!   только по `include=subject` и только администратору, с записью в аудит (`crate::content`); источник —
+//!   объект `HeldMessage::blob` ([`Admin::with_held_blobs`], без него — `null`).
 
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{MatchedPath, Path, Query, State};
+use axum::http::{StatusCode, Uri};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 pub use tp_contracts::groups::Moderation;
@@ -28,7 +30,8 @@ use tp_contracts::groups::{
 use tp_contracts::{AccountId, Error, GroupId, HeldId, Result, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::server::{Admin, ApiResult, Problem};
+use crate::content::{self, Access};
+use crate::server::{Admin, ApiResult, Caller, Problem};
 
 /// Группа рассылки.
 #[derive(Debug, Serialize, ToSchema)]
@@ -152,6 +155,11 @@ pub struct HeldInfo {
     #[serde(with = "time::serde::rfc3339")]
     #[schema(value_type = String, format = DateTime)]
     pub held_at: OffsetDateTime,
+    /// Тема письма (заголовок `Subject`, декодированный, обрезанный). Поле есть только с `include=subject`;
+    /// `null` — заголовка нет или письмо недоступно.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub subject: Option<Option<String>>,
 }
 
 impl From<HeldMessage> for HeldInfo {
@@ -179,6 +187,7 @@ impl From<HeldMessage> for HeldInfo {
             message_id: h.message_id,
             size: h.size,
             held_at: h.held_at,
+            subject: None,
         }
     }
 }
@@ -192,6 +201,9 @@ pub struct HeldQuery {
     pub group: Option<GroupId>,
     /// Размер (по умолчанию и наибольший — из конфигурации).
     pub limit: Option<usize>,
+    /// `subject` — отдать тему писем (`subject`). Только администратору; запрос пишется в журнал аудита как доступ
+    /// к содержимому; размер — не больше `admin.content_page_size`.
+    pub include: Option<String>,
 }
 
 /// Отклонение письма.
@@ -398,14 +410,45 @@ async fn delete_group(
 /// Очередь модерации организации или группы.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/moderation", tag = "groups",
     params(("org" = String, Path, description = "Организация (UUID)"), HeldQuery),
-    responses((status = 200, body = Vec<HeldInfo>), (status = 403, body = Problem)))]
+    responses((status = 200, body = Vec<HeldInfo>), (status = 400, body = Problem), (status = 403, body = Problem)))]
 async fn list_held(
     State(a): State<Arc<Admin>>,
+    Extension(caller): Extension<Caller>,
+    route: MatchedPath,
+    uri: Uri,
     Path(org): Path<TenantId>,
     Query(q): Query<HeldQuery>,
 ) -> ApiResult<Json<Vec<HeldInfo>>> {
-    let held = a.d.groups.held(org, q.group, a.cfg.page(q.limit)).await?;
-    Ok(Json(held.into_iter().map(Into::into).collect()))
+    let subjects = content::requested(q.include.as_deref())?;
+    let access = Access {
+        caller: &caller,
+        org,
+        route: route.as_str(),
+        path: uri.path(),
+    };
+    if subjects {
+        access.check(&a).await?;
+    }
+    let limit = a.cfg.content_page(q.limit, subjects);
+    let held = a.d.groups.held(org, q.group, limit).await?;
+    if !subjects {
+        return Ok(Json(held.into_iter().map(Into::into).collect()));
+    }
+    access.record(&a, 200, held.len()).await?;
+    let mut out = Vec::with_capacity(held.len());
+    for h in held {
+        let subject = match &a.held_blobs {
+            Some(blobs) => {
+                let raw = blobs.get(&h.blob, Some(content::head_range(&a.cfg))).await;
+                content::headline(&a.cfg, raw).await.subject
+            }
+            None => None,
+        };
+        let mut info = HeldInfo::from(h);
+        info.subject = Some(subject);
+        out.push(info);
+    }
+    Ok(Json(out))
 }
 
 /// Возвращает письмо в очередь после неудачного решения.
@@ -760,6 +803,74 @@ mod tests {
         );
         let (_, _, list) = env.call("GET", &queue, Some("org"), None).await;
         assert!(list.as_array().expect("list").is_empty());
+    }
+
+    /// Приёмка ADM-19: тема письма очереди — только по `include=subject`, администратору, с записью в аудит.
+    #[tokio::test]
+    async fn held_subjects_on_request() {
+        use tp_contracts::blob::BlobStore;
+
+        let env = Env::new();
+        let (_, _, g) = env
+            .call(
+                "POST",
+                &format!("{}/groups", base()),
+                Some("org"),
+                Some(json!({"name": "Staff", "address": "staff@example.org"})),
+            )
+            .await;
+        let gid: GroupId = g["id"].as_str().expect("id").parse().expect("uuid");
+        let h1 = held(gid, "a@ext");
+        let h2 = HeldMessage {
+            blob: BlobKey {
+                hash: BlobHash([2; 32]),
+                ..h1.blob
+            },
+            ..held(gid, "b@ext")
+        };
+        let raw = "From: A <a@ext>\r\nSubject: =?UTF-8?B?0J/RgNC40LLQtdGC?=\r\n\r\nтело\r\n";
+        env.held_blobs.put(&h1.blob, raw.into()).await.expect("put");
+        for h in [&h1, &h2] {
+            env.groups
+                .hold(TenantId::DEFAULT, h.clone())
+                .await
+                .expect("hold");
+        }
+        let content = |env: &Env| -> Vec<_> {
+            let log = env.audit.records();
+            log.into_iter()
+                .filter(|r| r.content_messages.is_some())
+                .collect()
+        };
+        let queue = format!("{}/moderation", base());
+        let (s, _, list) = env.call("GET", &queue, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(!list[0].as_object().expect("item").contains_key("subject"));
+        assert!(content(&env).is_empty());
+
+        let with = format!("{queue}?include=subject");
+        let (s, _, list) = env.call("GET", &with, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK, "{list}");
+        assert_eq!(list[0]["subject"], "Привет");
+        assert_eq!(list[0]["sender"], "a@ext");
+        assert_eq!(list[1]["subject"], Value::Null, "объекта письма нет");
+        let log = content(&env);
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            (
+                log[0].route.as_str(),
+                log[0].status,
+                log[0].content_messages
+            ),
+            ("/api/v1/orgs/{org}/moderation", 200, Some(2))
+        );
+
+        let (s, _, _) = env.call("GET", &with, Some("operator"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(content(&env).last().expect("audit").status, 403);
+        let bad = format!("{queue}?include=all");
+        let (s, _, _) = env.call("GET", &bad, Some("org"), None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
     /// CTR-43: письмо правила потока в очереди — источник и правило видны, одобрение — доставка получателям.

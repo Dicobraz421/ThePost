@@ -390,6 +390,7 @@ impl Admin {
             route: INIT_ROUTE.into(),
             path: path.into(),
             status,
+            content_messages: None,
         };
         if let Err(e) = self.d.audit.record(&record).await {
             tracing::error!(error = %e, route = INIT_ROUTE, "admin: запись аудита не сохранена");
@@ -607,6 +608,7 @@ async fn exchange(State(a): State<Arc<Admin>>, headers: HeaderMap) -> Response {
         route: SESSION_ROUTE.into(),
         path: SESSION_ROUTE.into(),
         status,
+        content_messages: None,
     };
     if let Err(e) = a.d.audit.record(&record).await {
         tracing::error!(error = %e, route = SESSION_ROUTE, "admin: запись аудита не сохранена");
