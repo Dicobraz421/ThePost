@@ -879,6 +879,7 @@ impl LdapDirectory {
             enabled,
             attributes,
             org: Default::default(),
+            hidden_from_gal: false,
         })
     }
 
