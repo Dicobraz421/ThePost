@@ -3,6 +3,10 @@
 //!
 //! Время передаётся явно (`*_at`), поэтому тесты не зависят от часов; обёртки без суффикса берут `Instant::now()`.
 //! Состояние — в памяти узла; число отслеживаемых ключей ограничено `max_entries`.
+//!
+//! Доверенные подсети (`trusted`, PLT-32) — без лимитов адреса и подсети; защита от перебора паролей
+//! (`auth.abuse`, `tp_auth::AbuseGuard`) от них не зависит и действует для всех. Секция применяется без перезапуска
+//! ([`RateLimiter::follow`]).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -12,9 +16,15 @@ use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tokio::sync::watch;
 use tp_contracts::config::duration;
+use tp_contracts::role::CancellationToken;
 
+use crate::config::Config;
 use crate::listen::Cidr;
+
+/// Имя секции.
+pub const RATELIMIT: &str = "ratelimit";
 
 /// Секция `ratelimit`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -38,6 +48,11 @@ pub struct RateLimitConfig {
     pub block_duration: Duration,
     /// Предел числа отслеживаемых ключей; при превышении удаляются восполненные корзины и истёкшие блокировки.
     pub max_entries: usize,
+    /// Доверенные адреса и подсети (`10.0.0.0/8`, `2001:db8::5`): сканеры, МФУ, мониторинг, генератор нагрузки
+    /// с одного адреса. С них лимиты адреса и подсети не действуют (и блокировка по ним не ставится); лимит учётной
+    /// записи и защита от перебора паролей (`auth.abuse`) — действуют. Пусто — доверенных нет.
+    #[schemars(with = "Vec<String>")]
+    pub trusted: Vec<Cidr>,
 }
 
 impl Default for RateLimitConfig {
@@ -63,6 +78,7 @@ impl Default for RateLimitConfig {
             ipv6_prefix: 64,
             block_duration: Duration::from_secs(900),
             max_entries: 100_000,
+            trusted: Vec::new(),
         }
     }
 }
@@ -189,15 +205,37 @@ impl RateLimiter {
         *self.cfg.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(cfg);
     }
 
+    /// Применяет секцию `ratelimit` каждой новой версии конфигурации (`Reloader::subscribe`) до `shutdown`.
+    pub async fn follow(
+        self: Arc<Self>,
+        mut rx: watch::Receiver<Arc<Config>>,
+        shutdown: CancellationToken,
+    ) {
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                changed = rx.changed() => if changed.is_err() { return },
+            }
+            let section = rx.borrow_and_update().section::<RateLimitConfig>(RATELIMIT);
+            match section {
+                Ok(cfg) => self.apply((*cfg).clone()),
+                Err(e) => tracing::warn!(error = %e, "секция ratelimit не применена"),
+            }
+        }
+    }
+
     /// Новое соединение или попытка с адреса `ip` (лимиты адреса и подсети).
     pub fn check_ip(&self, ip: IpAddr) -> Verdict {
         self.check_ip_at(ip, Instant::now())
     }
 
-    /// [`Self::check_ip`] на момент `now`.
+    /// [`Self::check_ip`] на момент `now`. Доверенный адрес (`trusted`) — всегда `Allow`, без учёта.
     pub fn check_ip_at(&self, ip: IpAddr, now: Instant) -> Verdict {
         let cfg = self.config();
         let ip = ip.to_canonical();
+        if cfg.trusted.iter().any(|net| net.contains(ip)) {
+            return Verdict::Allow;
+        }
         let (subnet_cfg, prefix) = match ip {
             IpAddr::V4(_) => (cfg.subnet_v4, cfg.ipv4_prefix),
             IpAddr::V6(_) => (cfg.subnet_v6, cfg.ipv6_prefix),
@@ -577,6 +615,120 @@ mod tests {
         }
     }
 
+    fn trusted(cfg: RateLimitConfig, nets: &[&str]) -> RateLimitConfig {
+        RateLimitConfig {
+            trusted: nets.iter().map(|n| n.parse().expect("cidr")).collect(),
+            ..cfg
+        }
+    }
+
+    /// PLT-32: с доверенного адреса 100 соединений подряд проходят, недоверенный сосед по той же /24 упирается
+    /// в лимит адреса; доверенные соединения не учитываются (и не расходуют лимит подсети).
+    #[test]
+    fn trusted_sources_are_not_limited() {
+        let rl = RateLimiter::new(trusted(cfg(), &["192.0.2.10", "2001:db8:5::/48"]));
+        let clock = Clock(Instant::now());
+        for _ in 0..100 {
+            assert_eq!(
+                rl.check_ip_at(ip("192.0.2.10"), clock.at(0.0)),
+                Verdict::Allow
+            );
+            assert!(
+                rl.check_ip_at(ip("::ffff:192.0.2.10"), clock.at(0.0))
+                    .is_allowed()
+            );
+            assert!(
+                rl.check_ip_at(ip("2001:db8:5:1::7"), clock.at(0.0))
+                    .is_allowed()
+            );
+        }
+        assert!(rl.is_empty(), "trusted sources are not tracked");
+        for other in [ip("192.0.2.11"), ip("2001:db8:6::1")] {
+            for _ in 0..3 {
+                assert!(rl.check_ip_at(other, clock.at(0.0)).is_allowed());
+            }
+            assert!(
+                matches!(
+                    rl.check_ip_at(other, clock.at(0.0)),
+                    Verdict::Blocked { .. }
+                ),
+                "{other} is not trusted"
+            );
+        }
+        // Лимит учётной записи от доверенных подсетей не зависит.
+        for _ in 0..2 {
+            assert!(
+                rl.check_account_at("ann@example.org", clock.at(0.0))
+                    .is_allowed()
+            );
+        }
+        assert!(
+            !rl.check_account_at("ann@example.org", clock.at(0.0))
+                .is_allowed()
+        );
+    }
+
+    /// Список доверенных меняется без перезапуска: добавленный адрес пропускается (даже заблокированный),
+    /// удалённый — снова ограничивается.
+    #[test]
+    fn trusted_list_follows_apply() {
+        let rl = RateLimiter::new(cfg());
+        let clock = Clock(Instant::now());
+        let a = ip("198.51.100.7");
+        for _ in 0..3 {
+            assert!(rl.check_ip_at(a, clock.at(0.0)).is_allowed());
+        }
+        assert!(!rl.check_ip_at(a, clock.at(0.0)).is_allowed());
+        rl.apply(trusted(cfg(), &["198.51.100.0/24"]));
+        for _ in 0..100 {
+            assert!(rl.check_ip_at(a, clock.at(1.0)).is_allowed());
+        }
+        rl.apply(cfg());
+        assert!(matches!(
+            rl.check_ip_at(a, clock.at(1.0)),
+            Verdict::Blocked { .. }
+        ));
+    }
+
+    /// `follow`: новая версия конфигурации из рассылки перечитывания применяет `ratelimit.trusted`.
+    #[tokio::test]
+    async fn follow_applies_reloaded_section() {
+        let registry = crate::config::SectionRegistry::new();
+        let parse = |trusted: &str| {
+            let src = format!(
+                "database: {{ url: pg }}\nblob: {{ url: file:///b }}\ndomain: d\n\
+                 ratelimit: {{ ip: {{ burst: 1, per_minute: 1 }}, block_duration: 0s, trusted: [{trusted}] }}\n"
+            );
+            Arc::new(registry.parse(&src, Vec::new()).expect("parse"))
+        };
+        let initial = parse("");
+        let rl = Arc::new(RateLimiter::new(
+            (*initial
+                .section::<RateLimitConfig>(RATELIMIT)
+                .expect("section"))
+            .clone(),
+        ));
+        let (tx, rx) = watch::channel(initial);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(rl.clone().follow(rx, shutdown.clone()));
+        let a = ip("203.0.113.5");
+        assert!(rl.check_ip(a).is_allowed());
+        assert!(!rl.check_ip(a).is_allowed());
+        tx.send_replace(parse("203.0.113.0/24"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !rl.check_ip(a).is_allowed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("trusted applied");
+        for _ in 0..100 {
+            assert!(rl.check_ip(a).is_allowed());
+        }
+        shutdown.cancel();
+        task.await.expect("follow");
+    }
+
     #[test]
     fn table_is_bounded_and_purged() {
         let rl = RateLimiter::new(RateLimitConfig {
@@ -617,5 +769,11 @@ mod tests {
         assert!(serde_yaml_ng::from_str::<RateLimitConfig>("ip: { rate: 1 }").is_err());
         assert!(serde_yaml_ng::from_str::<RateLimitConfig>("block_duration: 900").is_err());
         assert!(serde_yaml_ng::from_str::<RateLimitConfig>("block_secs: 900").is_err());
+        let cfg: RateLimitConfig =
+            serde_yaml_ng::from_str("trusted: [10.0.0.0/8, 2001:db8::5]\n").expect("trusted");
+        assert_eq!(cfg.trusted.len(), 2);
+        assert!(cfg.trusted[0].contains(ip("10.1.2.3")));
+        assert!(RateLimitConfig::default().trusted.is_empty());
+        assert!(serde_yaml_ng::from_str::<RateLimitConfig>("trusted: [10.0.0.0/33]").is_err());
     }
 }

@@ -110,7 +110,12 @@ fn config(dir: &Path, db_url: &str, domain: &str) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/all.yaml"),
     )
     .expect("deploy/config/all.yaml");
-    let base = without_sections(&all, &["domain", "database", "blob", "secrets", "http"]);
+    let base = without_sections(
+        &all,
+        &[
+            "domain", "database", "blob", "secrets", "http", "tls", "smtp", "imap",
+        ],
+    );
     assert!(base.contains("roles: [all]"), "{base}");
     let path = |p: PathBuf| p.display().to_string().replace('\\', "/");
     format!(

@@ -23,6 +23,7 @@ pub mod failover;
 pub mod groups;
 pub mod index_manifest;
 pub mod lease;
+pub mod mailbox_audit;
 pub mod mailboxes;
 pub mod membership;
 pub mod messages;
@@ -35,6 +36,7 @@ pub mod schema;
 pub mod shards;
 pub mod sieve;
 pub mod signals;
+pub mod submissions;
 pub mod transport;
 
 use std::future::Future;
@@ -56,12 +58,14 @@ use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
 use crate::failover::Failover;
+use crate::mailbox_audit::MailboxAuditConfig;
 use crate::pool::{DbPool, TxFuture};
 use crate::replica::Replica;
 use crate::retention::RetentionConfig;
 use crate::shards::{ReadIntent, ShardId, ShardResolver};
 use crate::sieve::SieveConfig;
 use crate::signals::SignalsConfig;
+use crate::submissions::SubmissionsConfig;
 
 /// Секция конфигурации контура метаданных `meta` (SRS 5.5); пул соединений — отдельная секция
 /// `database` ([`pool::PoolConfig`]). Все поля необязательны; неизвестное поле — ошибка разбора.
@@ -114,6 +118,10 @@ pub struct MetaConfig {
     pub dav: DavConfig,
     /// Скрипты Sieve и автоответ: лимиты ([`sieve`]).
     pub sieve: SieveConfig,
+    /// Отправки JMAP: срок хранения ([`submissions`]).
+    pub submissions: SubmissionsConfig,
+    /// Аудит доступа к ящику: срок хранения ([`mailbox_audit`]).
+    pub mailbox_audit: MailboxAuditConfig,
 }
 
 impl MetaConfig {
@@ -135,6 +143,8 @@ impl Default for MetaConfig {
             abuse: AbuseBlocksConfig::default(),
             dav: DavConfig::default(),
             sieve: SieveConfig::default(),
+            submissions: SubmissionsConfig::default(),
+            mailbox_audit: MailboxAuditConfig::default(),
         }
     }
 }
@@ -230,7 +240,8 @@ pub(crate) struct BoxDb {
 ///   письма по его id (`MessageStore::insert`, `insert_batch`; ключ — запись `created` журнала изменений),
 ///   журнал доставки (`DeliveryLog::record*`; ключ — номера `seq`, выданные до транзакции), очередь
 ///   модерации (`GroupStore::hold`; ключ — `HeldId` вызывающего), позиция подписчика (`EventLog::commit`;
-///   ключ — позиция не меньше заданной);
+///   ключ — позиция не меньше заданной), очередь отправки (`QueueStore::enqueue`; ключ — `QueueId`, выданный
+///   до транзакции, META-62), пароль приложения (`AppPasswordStore::insert`; ключ — идентификатор и хеш);
 /// - **идемпотентные по сути** — список у [`PgMeta::rewrite`].
 ///
 /// Остальные записи выполняются один раз: временный отказ (`Unavailable` с `retry_after`) отдаётся
@@ -328,7 +339,7 @@ impl PgMeta {
     ///
     /// Не повторяются: CAS по версии (`transport`, `put_manifest`) и номеру захвата (лизы, очередь) —
     /// повтор применённой записи отвечает `Conflict`; счётчики ссылок BLOB, UID и `ModSeq` писем,
-    /// выдача идентификаторов внутри операции (`enqueue`, `create`, `copy`), удаление с возвратом
+    /// выдача идентификаторов внутри операции (`create`, `copy`), удаление с возвратом
     /// удалённого (`take_held`, `GroupStore::remove`) — повтор вернул бы другое.
     pub(crate) async fn rewrite<T, F, Fut>(&self, op: F) -> Result<T>
     where
