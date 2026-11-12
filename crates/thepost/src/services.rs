@@ -28,16 +28,14 @@ use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::bus::EventBus;
 use tp_contracts::events::EventSink;
 use tp_contracts::ext::{DecisionHooks, Registry};
-use tp_contracts::ids::{DomainId, MessageId};
+use tp_contracts::ids::MessageId;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::membership::NodeId;
-use tp_contracts::meta::{
-    AccountScope, AccountStore, MailboxStore, MessageQuery, MessageStore, Policy,
-};
+use tp_contracts::meta::{AccountScope, AccountStore, MailboxStore, MessageQuery, MessageStore};
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
-use tp_contracts::transport::{AcceptedDomain, DomainKind, MailFlow};
+use tp_contracts::transport::MailFlow;
 use tp_contracts::{Error, Result, TenantId};
 use tp_meta::PgMeta;
 use tp_platform::{Config, Metrics, RateLimitConfig, RateLimiter, TlsCerts};
@@ -586,18 +584,17 @@ impl Services {
     ) -> Result<tp_admin::Admin> {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
-            audit: Arc::new(tp_admin::LogAudit),
-            // TODO(ADM-05): чтение журнала аудита — нет реализации `AuditLog` поверх `audit_log` (META-22).
-            audit_log: None,
+            audit_log: Arc::new(self.meta.clone()),
+            // Экспорт в SIEM (`admin.audit`) узел не запускает: без приёмников.
+            audit: Arc::new(tp_admin::Fanout::default()),
             delivery: Arc::new(self.meta.clone()),
             groups: Arc::new(self.meta.clone()),
             moderation: Arc::new(self.base_delivery(smtp)?),
             modules: ext.admin_routes().to_vec(),
             accounts: Arc::new(self.meta.clone()),
             quota: Arc::new(self.meta.clone()),
-            policies: Arc::new(PgPolicies(self.meta.clone())),
+            policies: Arc::new(self.meta.clone()),
             resolver: Arc::new(self.meta.clone()),
-            domains: Arc::new(PgDomains(self.meta.clone())),
             trash: Arc::new(self.meta.clone()),
             store: self.store.clone(),
             app_passwords: self.app_passwords.clone(),
@@ -733,120 +730,6 @@ impl Authenticator for Guarded {
             }
             Err(e) => Err(e),
         }
-    }
-}
-
-/// Политики уровней Admin API поверх `PgMeta` (до контракта CTR-25).
-struct PgPolicies(PgMeta);
-
-fn policy_target(t: tp_admin::PolicyTarget) -> tp_meta::retention::PolicyTarget {
-    match t {
-        tp_admin::PolicyTarget::Tenant => tp_meta::retention::PolicyTarget::Tenant,
-        tp_admin::PolicyTarget::Domain(d) => tp_meta::retention::PolicyTarget::Domain(d),
-        tp_admin::PolicyTarget::Account(a) => tp_meta::retention::PolicyTarget::Account(a),
-    }
-}
-
-#[async_trait]
-impl tp_admin::PolicyStore for PgPolicies {
-    async fn policy(&self, tenant: TenantId, target: tp_admin::PolicyTarget) -> Result<Policy> {
-        self.0.policy(tenant, policy_target(target)).await
-    }
-
-    async fn set_policy(
-        &self,
-        tenant: TenantId,
-        target: tp_admin::PolicyTarget,
-        policy: &Policy,
-    ) -> Result<()> {
-        self.0
-            .set_policy(tenant, policy_target(target), policy)
-            .await
-    }
-}
-
-/// Домены Admin API поверх принятых доменов `TransportStore` (`PgMeta`, таблица `domains`; до контракта CTR-25):
-/// список — принятые домены организации, создание — полномочный домен, удаление — только без учётных записей.
-/// Версия снимка кластера устарела между чтением и записью — запись повторяется по свежему снимку.
-struct PgDomains(PgMeta);
-
-/// Попыток записи при гонке версий снимка кластера.
-const DOMAIN_ATTEMPTS: usize = 5;
-
-#[async_trait]
-impl tp_admin::DomainStore for PgDomains {
-    async fn list(&self, tenant: TenantId) -> Result<Vec<tp_admin::Domain>> {
-        let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
-        Ok(cluster
-            .domains
-            .into_iter()
-            .filter(|d| d.tenant == tenant)
-            .map(|d| tp_admin::Domain {
-                id: d.id,
-                name: d.name,
-            })
-            .collect())
-    }
-
-    async fn create(&self, tenant: TenantId, name: &str) -> Result<tp_admin::Domain> {
-        let domain = AcceptedDomain {
-            id: DomainId::new(),
-            tenant,
-            name: name.to_owned(),
-            kind: DomainKind::Authoritative,
-        };
-        for _ in 0..DOMAIN_ATTEMPTS {
-            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
-            // Имя занято (в любой организации) — `Conflict`; иначе `Conflict` записи — устаревшая версия.
-            if cluster.domain(name).is_some() {
-                return Err(Error::Conflict);
-            }
-            match tp_contracts::transport::TransportStore::put_domain(
-                &self.0,
-                cluster.version,
-                &domain,
-            )
-            .await
-            {
-                Ok(_) => {
-                    return Ok(tp_admin::Domain {
-                        id: domain.id,
-                        name: domain.name,
-                    });
-                }
-                Err(Error::Conflict) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(Error::Conflict)
-    }
-
-    async fn delete(&self, tenant: TenantId, id: DomainId) -> Result<()> {
-        for _ in 0..DOMAIN_ATTEMPTS {
-            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
-            if !cluster
-                .domains
-                .iter()
-                .any(|d| d.id == id && d.tenant == tenant)
-            {
-                return Err(Error::NotFound);
-            }
-            match tp_contracts::transport::TransportStore::delete_domain(
-                &self.0,
-                cluster.version,
-                id,
-            )
-            .await
-            {
-                Ok(_) => return Ok(()),
-                // Устаревшая версия снимка — повтор по свежему.
-                Err(Error::Conflict) => continue,
-                // Внешний ключ `accounts` → `domains`: у домена есть учётные записи.
-                Err(Error::Invalid(_)) => return Err(Error::Conflict),
-                Err(e) => return Err(e),
-            }
-        }
-        Err(Error::Conflict)
     }
 }
 
@@ -1092,6 +975,7 @@ mod tests {
     async fn delivery_rewrites_addresses_from_transport_store() {
         use std::time::Duration;
 
+        use tp_contracts::ids::DomainId;
         use tp_contracts::role::CancellationToken;
         use tp_contracts::transport::{
             AcceptedDomain, AddressPattern, DomainKind, RewriteRule, TransportStore,

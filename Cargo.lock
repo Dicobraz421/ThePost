@@ -4932,6 +4932,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "tower-http",
  "tp-auth",
  "tp-contracts",
  "tp-mailstore",

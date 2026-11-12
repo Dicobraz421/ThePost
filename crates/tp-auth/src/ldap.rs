@@ -1,7 +1,8 @@
 //! Каталог организации в LDAP / Active Directory (SRS 5.1; CONTRACTS.md#Directory).
 //!
 //! Клиент — `ldap3`; канал — LDAPS (`ldaps://`) или StartTLS, открытый `ldap://` — только профиль dev с
-//! `tls.allow_plaintext`. Пароль служебной учётной записи — ссылкой на секрет ([`SecretRef`]).
+//! `tls.allow_plaintext`. Пароль служебной учётной записи и ключ клиентского сертификата (`tls.key`, PEM) — ссылками
+//! на секрет ([`SecretRef`]).
 //!
 //! Синхронизация инкрементальная ([`SyncMode`]): по `modifyTimestamp` (OpenLDAP, FreeIPA, 389-ds) или по
 //! `uSNChanged` (Active Directory, Samba AD). Курсор — непрозрачная строка: позиция последней выданной записи
@@ -60,7 +61,7 @@ use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result, TenantId};
 
-use crate::{GroupSource, check_channel, plaintext_warning};
+use crate::{GroupSource, check_channel, client_key, plaintext_warning};
 
 mod sync;
 
@@ -476,9 +477,9 @@ impl Source for Ldap3 {
     }
 }
 
-/// Конфигурация rustls для LDAPS: CA из `tls.ca_file` или системные корни, сертификат клиента для mTLS.
-/// Блокирующий I/O.
-fn client_tls(tls: &InternalTls) -> Result<ClientConfig> {
+/// Конфигурация rustls для LDAPS: CA из `tls.ca_file` или системные корни; для mTLS — сертификат
+/// `tls.cert_file` и его ключ `key` (PEM из хранилища секретов, [`client_key`]). Блокирующий I/O.
+fn client_tls(tls: &InternalTls, key: Option<&Secret>) -> Result<ClientConfig> {
     let provider = rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
@@ -502,15 +503,18 @@ fn client_tls(tls: &InternalTls) -> Result<ClientConfig> {
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Invalid(format!("LDAP: tls: {e}")))?
         .with_root_certificates(roots);
-    match (&tls.cert_file, &tls.key_file) {
+    match (&tls.cert_file, key) {
         (Some(cert), Some(key)) => {
-            let key = PrivateKeyDer::from_pem_file(key)
-                .map_err(|e| Error::Invalid(format!("LDAP: tls.key_file: {e}")))?;
+            let key = PrivateKeyDer::from_pem_slice(key.expose().as_bytes())
+                .map_err(|e| Error::Invalid(format!("LDAP: tls.key: {e}")))?;
             builder
                 .with_client_auth_cert(read_certs(cert)?, key)
                 .map_err(|e| Error::Invalid(format!("LDAP: tls.cert_file: {e}")))
         }
-        _ => Ok(builder.with_no_client_auth()),
+        (None, None) => Ok(builder.with_no_client_auth()),
+        _ => Err(Error::Invalid(
+            "LDAP: tls.cert_file and tls.key must be set together".into(),
+        )),
     }
 }
 
@@ -612,8 +616,8 @@ pub(crate) struct RawGroup {
 }
 
 impl LdapDirectory {
-    /// Каталог организации `tenant`: проверяет секцию, читает пароль служебной учётной записи из `secrets`,
-    /// готовит TLS. Соединения открываются на операцию.
+    /// Каталог организации `tenant`: проверяет секцию, читает из `secrets` пароль служебной учётной записи
+    /// и ключ клиентского сертификата (`tls.key`), готовит TLS. Соединения открываются на операцию.
     pub async fn connect(
         tenant: TenantId,
         cfg: LdapConfig,
@@ -631,8 +635,9 @@ impl LdapDirectory {
         let tls = if plaintext {
             None
         } else {
+            let key = client_key("LDAP", &cfg.tls, secrets).await?;
             let t = cfg.tls.clone();
-            let c = tokio::task::spawn_blocking(move || client_tls(&t))
+            let c = tokio::task::spawn_blocking(move || client_tls(&t, key.as_ref()))
                 .await
                 .map_err(|e| Error::Internal(format!("LDAP: tls: {e}")))??;
             Some(Arc::new(c))

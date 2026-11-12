@@ -22,6 +22,18 @@ SRS 3.8. Все операции хранилищ выполняются в ко
 параметр сеанса `app.tenant_id` через `SET LOCAL` в начале каждой транзакции. Политики (квоты, срок корзины, лимиты отправки,
 ключи DKIM, профиль Milter, правило `trash.purge`) — `PolicyResolver::resolve(tenant, domain, account, mailbox?) -> Policy` по цепочке организация → домен → ящик (→ папка).
 
+### Policy
+`meta::Policy` — поля уровня, `None` — не задано (`overlay` накладывает более специфичный уровень). Потребители и умолчания (CTR-67,
+решение 97): `quota_bytes`, `trash_retention` — `tp-meta` (умолчание — секция `meta.retention`); `retention` — модуль «Соответствие
+требованиям» (удаление по сроку через `DecisionHook::before_final_delete`), ядро не применяет, не задано — без срока; `send_per_hour`
+(умолчание `Policy::DEFAULT_SEND_PER_HOUR` = 1000), `max_recipients` (`DEFAULT_MAX_RECIPIENTS` = 100) — лимиты submission в SMTP
+(`*_or_default()`); `dkim_selector` — селектор подписи домена в SMTP (не задано — подпись всеми ключами домена); `milter_profile` — набор
+фильтров `smtp.milter` (не задано — все фильтры); `trash_purge` — правило корзины (#Trash). Настроек этих полей SMTP в config.yaml нет.
+`PolicyTarget::{Tenant, Domain, Account, Mailbox}` — уровень цепочки, один тип на всю систему (CTR-25). `PolicyStore`:
+`policy(tenant, target) -> Policy` (уровень без наложения, не задан — `Policy::default()`), `set_policy(tenant, target, &Policy)` (уровень
+целиком, `Policy::default()` удаляет уровень); существование объекта уровня проверяет вызывающий, запись сразу видна `PolicyResolver`.
+In-memory — `MemPolicies` (`PolicyStore` + `PolicyResolver`); набор `suite::policy_store`. PostgreSQL — META-70, Admin API — ADM-34.
+
 ## BlobStore
 SRS 3.2. Объекты неизменяемы, запись идемпотентна.
 - `put(&BlobKey, Bytes) -> Result<()>`; `put_stream(&BlobKey, ByteStream, size_hint) -> Result<()>`
@@ -329,6 +341,15 @@ SendAs, SendOnBehalf, ChangeRights, ChangeRules, ChangeForwarding}, object: Audi
 until, limit, after })` -> `AuditPage` (как `DeliveryLog::search`), `purge_audit(before)` (maintenance, можно сутками). In-memory —
 `MemMailboxAudit` (`entries`, `fail_next`); набор `suite::mailbox_audit`. Запись — IMAP-15, JMAP-18; PostgreSQL (только добавление) — META-33;
 выгрузка в SIEM и выборка — ADM-10.
+
+## AdminAuditLog
+SRS 5.2, 6.8, решение 98 (CTR-25; код — `admin_audit.rs`). Журнал аудита Admin API, только добавление. `AdminAuditRecord { at, tenant?
+(`None` — уровень инсталляции), actor_tenant, actor, actor_login, roles: Vec<String> (роли Admin API), method, route, path, status,
+content_messages? }` — без тела запроса и секретов. `AuditLog`: `append(&record) -> seq` (номер ≥ 1, растёт в порядке добавления);
+`search(tenant, &AdminAuditQuery { since?, until?, limit ≥ 1, after? }) -> AdminAuditPage { entries: Vec<AdminAuditEntry { seq, record }>,
+next? }` — только записи организации (без уровня инсталляции), по возрастанию `seq`, `at` в [`since`, `until`), `next` — у полной страницы;
+`AdminAuditQuery::validate` (неверный — `Invalid`). In-memory — `MemAuditLog` (`entries`); набор `suite::admin_audit_log`. PostgreSQL
+(таблица `audit_log`, META-22) — META-70; запись и `GET …/audit` — Admin API (ADM-34), экспорт в SIEM — там же.
 
 ## Auth
 SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>` (неверные данные — `Forbidden`);
@@ -828,3 +849,11 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-52 (волна contracts-37): `InternalTls.key: Option<SecretRef>` — ключ внутренних каналов из хранилища секретов
   (взамен `key_file`, оба сразу — `Invalid`), `InternalTls::key_source()` и `KeySource::{File, Secret}`. Новое поле секции: код,
   собирающий `InternalTls` перечислением всех полей, дополняется `key: None` (в репозитории таких мест нет).
+- 2026-11-12 — CTR-25, CTR-67, CTR-70 (волна contracts-46, аудит 12.11, решения 93, 97, 98, 104, 105): `meta::{PolicyTarget, PolicyStore}`
+  — уровень цепочки политик и запись уровня (один `PolicyTarget` на систему; `tp_testkit::PolicyLevel` удалён, `MemPolicies` реализует
+  `PolicyStore`, синхронные `MemPolicies::policy`/`set_policy` удалены); `admin_audit::{AuditLog, AdminAuditRecord, AdminAuditEntry,
+  AdminAuditQuery, AdminAuditPage}` — журнал аудита Admin API, `MemAuditLog`, наборы `suite::{policy_store, admin_audit_log}`.
+  `Policy`: потребители полей и умолчания уровня организации полей SMTP (`DEFAULT_SEND_PER_HOUR`, `DEFAULT_MAX_RECIPIENTS`,
+  `send_per_hour_or_default`, `max_recipients_or_default`), исполнитель `retention` — модуль «Соответствие требованиям».
+  `TenantTransport.rewrites` — обязательное поле (без `serde(default)`). Временные трейты `tp-admin` (`PolicyStore`, `PolicyTarget`,
+  `AuditLog`) и `PolicyTarget` `tp-meta` заменяются в META-70 и ADM-34.

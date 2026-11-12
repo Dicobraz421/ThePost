@@ -165,6 +165,13 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     if meta_cfg.migrate_on_start {
         tp_meta::schema::migrate(&migrations).await?;
     }
+    // FIX-05: со вторым шардом GC BLOB удалит чужие объекты — роль maintenance не стартует до FIX-04.
+    if cfg.roles().contains(Role::Maintenance)
+        && let Some(reason) =
+            crate::roles::unsharded_gc(crate::roles::shard_count(&pool).await?.unwrap_or(1))
+    {
+        return Err(Error::invalid(reason));
+    }
     let events_cfg = meta_cfg.events.clone();
     let blob_cfg = cfg.section::<BlobSection>(BLOB)?;
     // Шина сигналов — до хранилищ: после фиксации они публикуют `LogAppended` (будит читателей журнала событий),
@@ -351,6 +358,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         purge: Some(Purge {
             meta: meta.clone(),
             interval: maintenance_cfg.purge_interval,
+            admin_token_retention: maintenance_cfg.admin_token_retention,
         }),
         verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {
             verifier: Arc::new(crate::verify::verifier(
@@ -686,7 +694,7 @@ async fn start_rpc(
         return Ok(None);
     }
     let ctx = |e| infra::context("cluster.rpc", e);
-    let tls = NodeTls::load_with_secrets(&cluster.rpc.tls, store.as_ref())
+    let tls = NodeTls::load(&cluster.rpc.tls, store.as_ref())
         .await
         .map_err(ctx)?;
     let rpc = NodeRpc::new(node.clone(), &cluster.rpc, tls, members).map_err(ctx)?;
@@ -726,10 +734,10 @@ async fn start_rpc(
     Ok(Some(rpc))
 }
 
-/// Отпечаток источников сертификатов межузлового канала: содержимое файлов УЦ, сертификата и ключа и значение
-/// секрета ключа (`rpc.tls.key`). Недоступный источник — тоже состояние: его появление меняет отпечаток.
-/// Значения в отпечаток не восстановимы и никуда не выводятся.
-async fn rpc_tls_fingerprint(tls: &InternalTls, store: &dyn SecretStore) -> u64 {
+/// Отпечаток файлов сертификатов межузлового канала: содержимое файлов УЦ, сертификата и ключа. Недоступный файл —
+/// тоже состояние: его появление меняет отпечаток. Секрет ключа (`rpc.tls.key`) опрашивает сам `tp-cluster`
+/// (`rpc.key_poll_interval`). Значения в отпечаток не восстановимы и никуда не выводятся.
+async fn rpc_tls_fingerprint(tls: &InternalTls) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for file in [&tls.ca_file, &tls.cert_file, &tls.key_file] {
@@ -738,21 +746,12 @@ async fn rpc_tls_fingerprint(tls: &InternalTls, store: &dyn SecretStore) -> u64 
             None => None::<Vec<u8>>.hash(&mut hasher),
         }
     }
-    match &tls.key {
-        Some(secret) => store
-            .get(secret)
-            .await
-            .ok()
-            .map(|s| s.expose().to_owned())
-            .hash(&mut hasher),
-        None => None::<String>.hash(&mut hasher),
-    }
     hasher.finish()
 }
 
 /// Перечитывание сертификатов межузлового канала без перезапуска (APP-36, хвост CLU-16): раз в `period`
-/// сверяется отпечаток файлов и секрета ключа ([`rpc_tls_fingerprint`]); при изменении —
-/// `NodeRpc::follow_tls_with_secrets` читает новую пару (ошибка — `warn`, действует прежняя). До `shutdown`.
+/// сверяется отпечаток файлов ([`rpc_tls_fingerprint`]); при изменении — `NodeRpc::follow_tls` читает новую пару
+/// (ошибка — `warn`, действует прежняя). Смену секрета ключа `NodeRpc::follow_tls` отслеживает сам. До `shutdown`.
 async fn follow_rpc_tls(
     rpc: NodeRpc,
     tls: InternalTls,
@@ -760,23 +759,22 @@ async fn follow_rpc_tls(
     period: Duration,
     shutdown: CancellationToken,
 ) {
-    let seen = rpc_tls_fingerprint(&tls, store.as_ref()).await;
-    let state = (seen, tls.clone(), store.clone(), shutdown);
-    let changes =
-        futures::stream::unfold(state, move |(mut seen, tls, store, shutdown)| async move {
-            loop {
-                tokio::select! {
-                    () = shutdown.cancelled() => return None,
-                    () = tokio::time::sleep(period) => {}
-                }
-                let now = rpc_tls_fingerprint(&tls, store.as_ref()).await;
-                if now != seen {
-                    seen = now;
-                    return Some(((), (seen, tls, store, shutdown)));
-                }
+    let seen = rpc_tls_fingerprint(&tls).await;
+    let state = (seen, tls.clone(), shutdown);
+    let changes = futures::stream::unfold(state, move |(mut seen, tls, shutdown)| async move {
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return None,
+                () = tokio::time::sleep(period) => {}
             }
-        });
-    rpc.follow_tls_with_secrets(&tls, store, changes).await;
+            let now = rpc_tls_fingerprint(&tls).await;
+            if now != seen {
+                seen = now;
+                return Some(((), (seen, tls, shutdown)));
+            }
+        }
+    });
+    rpc.follow_tls(&tls, store, changes).await;
 }
 
 /// Продление записи узла с периодом `period` до остановки.
@@ -1006,7 +1004,10 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().expect("tempdir");
-        let (url, password) = split_password(&dev_url(&url));
+        // Своя база: шард, добавленный параллельным тестом в общую, остановил бы роль maintenance (FIX-05).
+        let admin_url = dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&admin_url).await;
+        let (url, password) = split_password(&url_db);
         let secrets = Arc::new(MemSecretStore::default());
         // Без пароля в адресе (trust) пароль серверу не нужен, но ссылка всё равно разрешается.
         let db: SecretRef = "thepost/db#password".parse().expect("ref");
@@ -1087,6 +1088,7 @@ mod tests {
         let report = running.wait().await.expect("wait");
         assert!(report.failed.is_empty(), "{report:?}");
         assert!(report.cancelled.is_empty(), "{report:?}");
+        crate::testutil::drop_database(&admin_url, &db_name).await;
     }
 
     /// TLS-соединение со слушателем, доверяя только сертификату `cert` (PEM): `true` — сервер предъявил его.
@@ -1237,30 +1239,23 @@ mod tests {
         }
     }
 
-    /// APP-36: отпечаток источников сертификатов межузлового канала меняется при смене секрета ключа и файла и
-    /// не меняется без изменений; недоступный секрет — отдельное состояние.
+    /// APP-36: отпечаток файлов сертификатов межузлового канала меняется при смене файла и не меняется без
+    /// изменений; недоступный файл — отдельное состояние.
     #[tokio::test]
-    async fn rpc_tls_fingerprint_follows_files_and_secret() {
+    async fn rpc_tls_fingerprint_follows_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cert = dir.path().join("node.pem");
-        std::fs::write(&cert, "cert-1").expect("cert");
-        let key: SecretRef = "thepost/node#key".parse().expect("ref");
-        let store = MemSecretStore::default();
         let tls = InternalTls {
             cert_file: Some(cert.clone()),
-            key: Some(key.clone()),
             ..InternalTls::default()
         };
-        let missing = rpc_tls_fingerprint(&tls, &store).await;
-        store.set(&key, "key-1".to_owned());
-        let first = rpc_tls_fingerprint(&tls, &store).await;
+        let missing = rpc_tls_fingerprint(&tls).await;
+        std::fs::write(&cert, "cert-1").expect("cert");
+        let first = rpc_tls_fingerprint(&tls).await;
         assert_ne!(missing, first);
-        assert_eq!(first, rpc_tls_fingerprint(&tls, &store).await);
-        store.set(&key, "key-2".to_owned());
-        let rotated = rpc_tls_fingerprint(&tls, &store).await;
-        assert_ne!(first, rotated);
+        assert_eq!(first, rpc_tls_fingerprint(&tls).await);
         std::fs::write(&cert, "cert-2").expect("cert");
-        assert_ne!(rotated, rpc_tls_fingerprint(&tls, &store).await);
+        assert_ne!(first, rpc_tls_fingerprint(&tls).await);
     }
 
     /// APP-18: два узла в процессе над одной базой — `cluster.addr` объявлен в составе и слушается, вызов идёт по

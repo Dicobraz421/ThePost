@@ -30,21 +30,21 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
+use tp_contracts::admin_audit::{AdminAuditRecord, AuditLog};
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::blob::BlobStore;
 use tp_contracts::delivery::DeliveryLog;
 use tp_contracts::ext::{AdminRequest, AdminRoutes};
 use tp_contracts::groups::GroupStore;
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountStore, PolicyResolver};
+use tp_contracts::meta::{AccountStore, PolicyResolver, PolicyStore};
 use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::transport::TransportStore;
 use tp_contracts::{Error, Result, TenantId};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
-use crate::accounts::{DomainStore, PolicyStore};
-use crate::audit::{AUDIT_ROUTE, AuditLog, AuditRecord, AuditSink};
+use crate::audit::{AUDIT_ROUTE, AuditSink};
 use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
@@ -81,6 +81,16 @@ pub enum AdminRole {
 }
 
 impl AdminRole {
+    /// Имя роли в журнале аудита и API (`installation_admin`, `organization_admin`, `operator`, `auditor`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdminRole::InstallationAdmin => "installation_admin",
+            AdminRole::OrganizationAdmin => "organization_admin",
+            AdminRole::Operator => "operator",
+            AdminRole::Auditor => "auditor",
+        }
+    }
+
     /// Роль допускает запрос `method` к шаблону маршрута `route` в организации `tenant` (`None` — вне
     /// организаций: `whoami`, модули) от субъекта организации `own`.
     pub fn permits(
@@ -267,6 +277,11 @@ pub struct Caller {
 }
 
 impl Caller {
+    /// Роли для записи журнала аудита ([`AdminRole::as_str`]).
+    pub fn audit_roles(&self) -> Vec<String> {
+        self.roles.iter().map(|r| r.as_str().to_owned()).collect()
+    }
+
     /// Одна из ролей допускает запрос ([`AdminRole::permits`]); ролей нет — нет.
     pub fn permits(&self, tenant: Option<TenantId>, method: &Method, route: &str) -> bool {
         self.roles
@@ -280,10 +295,10 @@ impl Caller {
 pub struct Deps {
     /// Проверка Bearer-токенов (OIDC).
     pub auth: Arc<dyn Authenticator>,
-    /// Журнал аудита: запись (хранилище и экспорт — [`crate::export::Fanout`]).
+    /// Журнал аудита: запись и чтение (CTR-25).
+    pub audit_log: Arc<dyn AuditLog>,
+    /// Экспорт журнала аудита в SIEM ([`crate::export::Fanout`]; без экспорта — пустой).
     pub audit: Arc<dyn AuditSink>,
-    /// Журнал аудита: чтение; `None` — не подключено (маршрут отвечает 503).
-    pub audit_log: Option<Arc<dyn AuditLog>>,
     /// Журнал доставки: поиск.
     pub delivery: Arc<dyn DeliveryLog>,
     /// Группы рассылки и очередь модерации.
@@ -300,8 +315,6 @@ pub struct Deps {
     pub policies: Arc<dyn PolicyStore>,
     /// Действующие политики.
     pub resolver: Arc<dyn PolicyResolver>,
-    /// Домены.
-    pub domains: Arc<dyn DomainStore>,
     /// Корзина: список элементов.
     pub trash: Arc<dyn TrashStore>,
     /// Почтовое хранилище: восстановление из корзины с уведомлением клиентов.
@@ -503,20 +516,20 @@ async fn guard(
         ApiError(Error::Forbidden).into_response()
     };
     if method != Method::GET && method != Method::HEAD {
-        let record = AuditRecord {
+        let record = AdminAuditRecord {
             at: OffsetDateTime::now_utc(),
             tenant,
             actor_tenant: caller.principal.tenant,
             actor: caller.principal.account,
             actor_login: caller.principal.login.clone(),
-            roles: caller.roles.iter().copied().collect(),
+            roles: caller.audit_roles(),
             method: method.to_string(),
             route,
             path,
             status: resp.status().as_u16(),
             content_messages: None,
         };
-        if let Err(e) = a.d.audit.record(&record).await {
+        if let Err(e) = crate::audit::record(&a.d, &record).await {
             tracing::error!(error = %e, route = %record.route, "admin: запись аудита не сохранена");
         }
     }
@@ -811,7 +824,7 @@ mod tests {
         assert!(log[0].roles.is_empty());
         assert_eq!(log[0].actor_login, "user@example.org");
         assert_eq!(log[1].status, 200);
-        assert_eq!(log[1].roles, vec![AdminRole::OrganizationAdmin]);
+        assert_eq!(log[1].roles, vec![AdminRole::OrganizationAdmin.as_str()]);
         assert_eq!(log[1].route, "/api/v1/modules/echo/{*rest}");
         assert_eq!(log[1].path, "/api/v1/modules/echo/jobs/1");
         assert_eq!(log[1].actor_tenant, TenantId::DEFAULT);

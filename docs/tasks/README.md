@@ -454,6 +454,7 @@
 | [META-53](META-53.md) | метрика доли NOTIFY во времени фиксации primary | meta | A | meta-34 | ready | — |
 | [BLOB-16](BLOB-16.md) | метрика «сирот» после цикла GC | blob | A | blob-09 | todo | — |
 | [PLT-25](PLT-25.md) | метрики пула СУБД и слушателя сигналов | platform | A | platform-15 | ready | — |
+| [PLT-32](PLT-32.md) | ratelimit.trusted — доверенные подсети без ограничения частоты | platform | A | platform-21 | ready | — |
 | [APP-31](APP-31.md) | старт узла при медленном OpenBao | app | A | app-30 | ready | — |
 | [DEP-25](DEP-25.md) | стенд Д.6 — два прогона, квота 150 MB, генератор доверенный, сценарий перебора | deploy | A | deploy-21 | ready | DEP-14 |
 | [DOC-01](DOC-01.md) | docs/PREREQUISITES.md — требования и тонкости настройки окружения | docs | A | docs-01 | done | — |
@@ -466,6 +467,8 @@
 | [DEP-24](DEP-24.md) | эталон на Debian 13 и Ubuntu 26.04 | deploy | A | deploy-16 | ready | DEP-17 |
 | [DEP-19](DEP-19.md) | эталон Ansible на Astra Linux SE 1.8 | deploy | A | deploy-16 | ready | DEP-15,DEP-17 |
 | [DEP-20](DEP-20.md) | эталон Ansible на РЕД ОС 8 и семействе RHEL (AlmaLinux 9 и 10) | deploy | A | deploy-16 | ready | DEP-15,DEP-17 |
+| [DEP-40](DEP-40.md) | эталон на ВМ Astra Linux SE 1.8 | deploy | A | deploy-30 | todo | DEP-19 |
+| [DEP-41](DEP-41.md) | restore.yml на семействе RHEL — обёртки полным путём | deploy | A | deploy-30 | todo | DEP-23 |
 | [APP-30](APP-30.md) | cluster.listen — адрес приёма межузловых вызовов отдельно от объявляемого | app | A | app-29 | done | APP-18 |
 | [DEP-23](DEP-23.md) | резервная копия OpenBao — снимок Raft | deploy | A | deploy-19 | done | DEP-15 |
 | [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | done | SMTP-20 |

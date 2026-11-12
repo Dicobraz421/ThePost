@@ -31,8 +31,7 @@ pub mod sieve;
 mod testenv;
 pub mod transport;
 
-pub use accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
-pub use audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink, LogAudit};
+pub use audit::{AuditEntry, AuditPage, AuditRecord, AuditSink};
 pub use console::ConsoleConfig;
 pub use export::{
     AuditExportConfig, Fanout, OtlpAudit, OtlpAuditConfig, SyslogAudit, SyslogConfig,

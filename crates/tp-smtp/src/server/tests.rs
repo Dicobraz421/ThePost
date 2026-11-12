@@ -12,11 +12,12 @@ use tp_platform::ConnInfo;
 use super::*;
 use crate::config::SmtpConfig;
 
-/// Обработчик, запоминающий письма; получатели из `reject` отклоняются.
+/// Обработчик, запоминающий письма; получатели из `reject` отклоняются; политика субъекта AUTH — `policy`.
 #[derive(Default)]
 pub(crate) struct Recorder {
     pub(crate) mails: Mutex<Vec<(Envelope, Bytes)>>,
     pub(crate) reject: Mutex<Vec<String>>,
+    pub(crate) policy: Mutex<tp_contracts::meta::Policy>,
 }
 
 impl Recorder {
@@ -38,6 +39,13 @@ impl Handler for Recorder {
     async fn data(&self, env: &Envelope, raw: Bytes) -> Reply {
         self.mails.lock().expect("lock").push((env.clone(), raw));
         reply(250, [2, 0, 0], "Queued")
+    }
+
+    async fn policy(
+        &self,
+        _principal: &tp_contracts::auth::Principal,
+    ) -> tp_contracts::Result<tp_contracts::meta::Policy> {
+        Ok(self.policy.lock().expect("lock").clone())
     }
 }
 
@@ -331,16 +339,18 @@ async fn size_limits() {
     assert!(env.rec.mails().is_empty());
 }
 
+/// Без AUTH — умолчание политики организации (`Policy::DEFAULT_MAX_RECIPIENTS`) получателей транзакции.
 #[tokio::test]
 async fn too_many_recipients() {
-    let cfg = config(|c| c.limits.max_recipients = 2);
-    let mut env = start(Mode::Inbound, cfg).await;
+    let mut env = inbound().await;
     let c = &mut env.client;
     assert_eq!(c.cmd("EHLO client.example.net").await, 250);
     assert_eq!(c.cmd("MAIL FROM:<a@example.net>").await, 250);
-    assert_eq!(c.cmd("RCPT TO:<b1@example.org>").await, 250);
-    assert_eq!(c.cmd("RCPT TO:<b2@example.org>").await, 250);
-    assert_eq!(c.cmd("RCPT TO:<b3@example.org>").await, 452);
+    let max = tp_contracts::meta::Policy::DEFAULT_MAX_RECIPIENTS;
+    for i in 0..max {
+        assert_eq!(c.cmd(&format!("RCPT TO:<b{i}@example.org>")).await, 250);
+    }
+    assert_eq!(c.cmd("RCPT TO:<over@example.org>").await, 452);
 }
 
 #[tokio::test]
