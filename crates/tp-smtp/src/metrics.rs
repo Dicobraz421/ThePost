@@ -5,7 +5,7 @@
 //! - `tp_smtp_messages_total{role,result}` — письма после данных: `accepted` (2xx) или `rejected`;
 //! - `tp_smtp_screen_violations_total{reason,action}` — экран соединений: `pregreet`, `pipelining`, `rate`;
 //!   `rejected`, `logged` (режим журнала), `cached` (отказ по кэшу);
-//! - `tp_smtp_send_limited_total{kind}` — отказы по лимиту отправки (`messages`);
+//! - `tp_smtp_send_limited_total{kind}` — отказы по лимиту отправки (`messages`, `recipients`);
 //! - `tp_smtp_queue_claimed_total`, `tp_smtp_queue_inflight` — захваченные и обрабатываемые записи очереди;
 //! - `tp_smtp_queue_recipients_total{result}` — итоги попыток по получателям: `delivered`, `deferred`, `failed`;
 //! - `tp_smtp_queue_delivery_seconds` — время от постановки в очередь до доставки.

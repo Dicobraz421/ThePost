@@ -2,21 +2,31 @@
 //!
 //! - Identity — адрес учётной записи (имя входа) с отображаемым именем из `AccountStore`; адреса и подписи
 //!   ведёт каталог, поэтому `Identity/set` отвечает `forbidden`.
-//! - `EmailSubmission/set` ставит письмо в очередь исходящей почты ([`Outbound`](tp_contracts::queue::Outbound)) сразу (`undoStatus` = `final`,
-//!   `maxDelayedSend` = 0). Адрес `From` проверяет [`Authorizer::send_right`](tp_contracts::auth::Authorizer::send_right)
+//! - `EmailSubmission/set`, создание: письмо отправляется сразу ([`Outbound::submit`](tp_contracts::queue::Outbound::submit),
+//!   `undoStatus` = `final`) или, при `sendAt` в будущем (не дальше `maxDelayedSend` — `jmap.submission.max_delayed_send`,
+//!   иначе `invalidProperties`), ставится в очередь со сроком выпуска ([`Outbound::schedule`](tp_contracts::queue::Outbound::schedule),
+//!   `undoStatus` = `pending`). Адрес `From` проверяет [`Authorizer::send_right`](tp_contracts::auth::Authorizer::send_right)
 //!   (свои адреса, Send As, Send on Behalf — с заголовком `Sender`). До очереди — `DecisionHooks::on_submission`
-//!   (`Deny` — `forbiddenToSend`; дополнения: заголовки в начало письма, копии в папки и внешним адресам).
+//!   (`Deny` — `forbiddenToSend`; дополнения: заголовки в начало письма, копии в папки и внешним адресам; у отложенного
+//!   письма копии внешним адресам выпускаются тем же сроком, копии в папки кладутся при постановке).
 //!   Ещё раньше — правила потока почты ([`Jmap::with_mail_flow`](crate::Jmap::with_mail_flow), CTR-24): `Reject` —
 //!   `forbiddenToSend` с текстом правила, `Drop` — письмо принято и не отправлено (получатели `queued`), изменённые конверт
-//!   и тело — дальше вместо исходных.
-//!   Заголовок `Bcc` из отправляемого письма удаляется. В ответе `created` — `deliveryStatus` по каждому
-//!   получателю из [`Outbound::submit`](tp_contracts::queue::Outbound::submit) (доставлено локально — `yes`, в очереди — `queued`, отказ — `no` с ответом
-//!   SMTP). Объекты EmailSubmission после ответа не хранятся: `EmailSubmission/get` их не находит (статусы есть
-//!   только в ответе `set`), отменить отправку нельзя (`cannotUnsend`).
-//! - `EmailSubmission/query` и `queryChanges` проверяют фильтр и сортировку (RFC 8621 §7.3) и возвращают пустой
-//!   список; `queryState` — состояние учётной записи (меняется после отправки с переносом письма).
+//!   и тело — дальше вместо исходных. Заголовок `Bcc` из отправляемого письма удаляется.
+//! - Каждая отправка записывается в [`SubmissionStore`](tp_contracts::submission::SubmissionStore): `EmailSubmission/get`,
+//!   `changes`, `query`, `queryChanges` читают записи, `state` и `queryState` — состояние хранилища. `deliveryStatus` —
+//!   статусы получателей записи (доставлено — `yes`, в очереди или отложено — `queued`, отказ — `no` с ответом SMTP);
+//!   у ждущей срока и отменённой отправки — `null`.
+//! - Статус доставки (JMAP-16): перед чтением отправки учётной записи сверяются с журналом доставки ([`sync_delivery`]) —
+//!   по записи очереди отправки ([`DeliveryLog::by_queue`](tp_contracts::delivery::DeliveryLog::by_queue)): доставка в
+//!   ящик и приём внешним сервером — `yes` (как и письмо, принятое и отброшенное правилом: отправителю об этом не
+//!   сообщается), отказ — `no` с причиной из журнала, временный отказ, карантин и модерация — `queued`. Новые статусы записываются в хранилище, поэтому меняют `state` и видны в `EmailSubmission/changes` и push.
+//!   У письма, отправленного сразу, записи очереди нет ([`Submitted`] её не сообщает): его статусы — ответ
+//!   [`Outbound::submit`](tp_contracts::queue::Outbound::submit).
+//! - `EmailSubmission/set`, изменение — только отмена отложенной отправки (`undoStatus: canceled`): письмо снимается
+//!   с очереди ([`Outbound::cancel_scheduled`](tp_contracts::queue::Outbound::cancel_scheduled)), запись отменяется;
+//!   отправленное или уже выпущенное письмо — `cannotUnsend`. Удаление убирает запись, на письмо и очередь не влияет.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use axum::body::Bytes;
@@ -25,53 +35,28 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tp_contracts::MessageId;
+use tp_contracts::audit::{AuditAction, AuditObject};
 use tp_contracts::auth::SendRight;
+use tp_contracts::delivery::{DeliveryDecision, DeliveryEvent, DeliveryEventKind};
 use tp_contracts::ext::{CopyTo, Decision, SubmissionInfo};
 use tp_contracts::mailstore::IngestRequest;
-use tp_contracts::meta::Changes;
+use tp_contracts::meta::{AccountScope, Changes};
 use tp_contracts::queue::{SubmitStatus, Submitted};
+use tp_contracts::submission::{EmailSubmission, SubmissionFilter, UndoStatus};
 use tp_contracts::transport::{BlobRef, FlowDirection, FlowEnvelope, FlowInput, FlowVerdict};
+use tp_contracts::{Error, MessageId, ModSeq};
 
-use crate::core::error::{MethodError, MethodResult, set_error};
+use crate::core::error::{MethodError, MethodResult, changes_error, set_error};
 use crate::core::request::{
-    Comparator, GetArgs, QueryChangesArgs, QueryWindow, apply_window, object, parse_args,
-    parse_state, query_changes_response, select, state_string,
+    ChangesArgs, Comparator, GetArgs, QueryChangesArgs, QueryWindow, SetOutcome, apply_window,
+    object, or_null, parse_args, query_changes_response, select,
 };
-use crate::core::{Ctx, digest};
+use crate::core::{Ctx, Jmap, digest, lone_thread_id, thread_id};
 use crate::email_get::{collect, utc_date};
-
-/// `deliveryStatus` EmailSubmission (RFC 8621 §7): получатель → `smtpReply`, `delivered`, `displayed`.
-fn delivery_status(s: &Submitted) -> Value {
-    let mut m = Map::new();
-    for (rcpt, st) in &s.rcpts {
-        let (reply, delivered) = match st {
-            SubmitStatus::Delivered => ("250 2.0.0 Delivered".to_owned(), "yes"),
-            SubmitStatus::Queued => ("250 2.0.0 Queued".to_owned(), "queued"),
-            SubmitStatus::Failed(r) if r.trim().is_empty() => {
-                ("550 5.0.0 Not delivered".to_owned(), "no")
-            }
-            SubmitStatus::Failed(r) => (r.clone(), "no"),
-        };
-        m.insert(
-            rcpt.clone(),
-            json!({"smtpReply": reply, "delivered": delivered, "displayed": "unknown"}),
-        );
-    }
-    Value::Object(m)
-}
-
-fn or_null(m: Map<String, Value>) -> Value {
-    if m.is_empty() {
-        Value::Null
-    } else {
-        Value::Object(m)
-    }
-}
 
 // ---------- Identity ----------
 
-fn identity_id(login: &str) -> String {
+pub(crate) fn identity_id(login: &str) -> String {
     format!("I{}", digest(login.to_lowercase().as_bytes()))
 }
 
@@ -192,7 +177,178 @@ pub(crate) async fn identity_set(
 
 // ---------- EmailSubmission ----------
 
-/// `EmailSubmission/get`: отправки после ответа `EmailSubmission/set` не хранятся.
+fn undo_name(u: UndoStatus) -> &'static str {
+    match u {
+        UndoStatus::Pending => "pending",
+        UndoStatus::Final => "final",
+        UndoStatus::Canceled => "canceled",
+    }
+}
+
+/// `deliveryStatus` EmailSubmission (RFC 8621 §7): получатель → `smtpReply`, `delivered`, `displayed`; статусов
+/// нет (отправка ждёт срока или отменена) — `null`.
+fn delivery_status(rcpts: &[(String, SubmitStatus)]) -> Value {
+    if rcpts.is_empty() {
+        return Value::Null;
+    }
+    let mut m = Map::new();
+    for (rcpt, st) in rcpts {
+        let (reply, delivered) = match st {
+            SubmitStatus::Delivered => ("250 2.0.0 Delivered".to_owned(), "yes"),
+            SubmitStatus::Queued => ("250 2.0.0 Queued".to_owned(), "queued"),
+            SubmitStatus::Failed(r) if r.trim().is_empty() => {
+                ("550 5.0.0 Not delivered".to_owned(), "no")
+            }
+            SubmitStatus::Failed(r) => (r.clone(), "no"),
+        };
+        m.insert(
+            rcpt.clone(),
+            json!({"smtpReply": reply, "delivered": delivered, "displayed": "unknown"}),
+        );
+    }
+    Value::Object(m)
+}
+
+/// Статус получателя по событию журнала доставки; событие не о доставке получателю (приём, уведомление DSN) — `None`.
+fn tracked(e: &DeliveryEvent) -> Option<SubmitStatus> {
+    if matches!(e.kind, DeliveryEventKind::Receive | DeliveryEventKind::Dsn) {
+        return None;
+    }
+    Some(match e.decision {
+        // Доставлено в ящик или принято внешним сервером: дальше письмо ведёт он.
+        DeliveryDecision::Accept | DeliveryDecision::Discard => SubmitStatus::Delivered,
+        DeliveryDecision::Reject => SubmitStatus::Failed(e.reason.clone().unwrap_or_default()),
+        DeliveryDecision::Defer | DeliveryDecision::Quarantine | DeliveryDecision::Hold => {
+            SubmitStatus::Queued
+        }
+    })
+}
+
+/// Статусы получателей отправки по событиям её записи очереди (по возрастанию времени): действует последнее
+/// событие о получателе; о ком событий нет — в очереди.
+fn track(rcpts: &[String], events: &[DeliveryEvent]) -> Vec<(String, SubmitStatus)> {
+    let mut out: Vec<(String, SubmitStatus)> = rcpts
+        .iter()
+        .map(|r| (r.clone(), SubmitStatus::Queued))
+        .collect();
+    for e in events {
+        let Some(status) = tracked(e) else { continue };
+        for (rcpt, st) in &mut out {
+            if e.recipients.iter().any(|x| x.eq_ignore_ascii_case(rcpt)) {
+                *st = status.clone();
+            }
+        }
+    }
+    out
+}
+
+/// Сверка отправок учётной записи с журналом доставки (JMAP-16): у отправок с записью очереди, срок которых
+/// наступил, статусы получателей берутся из [`DeliveryLog::by_queue`](tp_contracts::delivery::DeliveryLog::by_queue)
+/// и записываются [`SubmissionStore::finalize`](tp_contracts::submission::SubmissionStore::finalize) — отправка
+/// становится `final`, изменение статусов меняет состояние и попадает в `EmailSubmission/changes`. Отправки, у которых
+/// все получатели в конечном статусе, и отменённые не перечитываются.
+pub(crate) async fn sync_delivery(jmap: &Jmap, scope: AccountScope) -> tp_contracts::Result<()> {
+    let now = OffsetDateTime::now_utc();
+    let limit = jmap.cfg.submission.max_delivery_events;
+    for s in jmap.d.submissions.list(scope).await? {
+        let Some(queue) = s.queue else { continue };
+        let due = match s.undo_status {
+            UndoStatus::Canceled => continue,
+            UndoStatus::Pending if s.send_at > now => continue,
+            UndoStatus::Pending => true,
+            UndoStatus::Final => false,
+        };
+        let settled =
+            !s.delivery.is_empty() && s.delivery.iter().all(|(_, st)| *st != SubmitStatus::Queued);
+        if !due && settled {
+            continue;
+        }
+        let events = jmap
+            .d
+            .delivery_log
+            .by_queue(scope.tenant, queue, limit)
+            .await?;
+        let delivery = track(&s.rcpt_to, &events);
+        if !due && delivery == s.delivery {
+            continue;
+        }
+        match jmap
+            .d
+            .submissions
+            .finalize(scope, &s.id, delivery, Some(queue))
+            .await
+        {
+            // Отменена или удалена между чтением и записью — сверять нечего.
+            Ok(_) | Err(Error::Conflict | Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Состояние отправок учётной записи после сверки с журналом доставки ([`sync_delivery`]) — `state` и `queryState`
+/// EmailSubmission, состояние типа в push.
+pub(crate) async fn synced_state(jmap: &Jmap, scope: AccountScope) -> tp_contracts::Result<String> {
+    sync_delivery(jmap, scope).await?;
+    Ok(jmap.d.submissions.state(scope).await?.to_string())
+}
+
+/// Состояние отправок учётной записи (`state`, `queryState`) — [`synced_state`].
+async fn submission_state(ctx: &Ctx<'_>) -> MethodResult<String> {
+    Ok(synced_state(ctx.jmap, ctx.scope).await?)
+}
+
+/// Состояние отправок из строки клиента; чужая строка — `cannotCalculateChanges`.
+fn parse_submission_state(s: &str) -> MethodResult<u64> {
+    s.parse()
+        .map_err(|_| MethodError::new("cannotCalculateChanges"))
+}
+
+/// Цепочки писем учётной записи: письмо → `threadId`.
+async fn threads(ctx: &Ctx<'_>) -> MethodResult<HashMap<MessageId, String>> {
+    Ok(ctx
+        .jmap
+        .messages_in(ctx.scope, None)
+        .await?
+        .iter()
+        .map(|m| (m.id, thread_id(m)))
+        .collect())
+}
+
+/// `threadId` письма отправки; письмо удалено — его собственная цепочка.
+async fn thread_of(ctx: &Ctx<'_>, email: MessageId) -> MethodResult<String> {
+    Ok(match ctx.jmap.d.messages.get(ctx.scope, email).await? {
+        Some(m) => thread_id(&m),
+        None => lone_thread_id(email),
+    })
+}
+
+/// Объект EmailSubmission (RFC 8621 §7). Параметры SMTP конверта и DSN/MDN не ведутся: `parameters` — `null`,
+/// `dsnBlobIds` и `mdnBlobIds` пусты.
+fn submission_object(s: &EmailSubmission, thread: &str) -> Map<String, Value> {
+    let rcpt_to: Vec<Value> = s
+        .rcpt_to
+        .iter()
+        .map(|r| json!({"email": r, "parameters": null}))
+        .collect();
+    object(json!({
+        "id": s.id,
+        "identityId": s.identity,
+        "emailId": s.email.to_string(),
+        "threadId": thread,
+        "envelope": {
+            "mailFrom": {"email": s.mail_from, "parameters": null},
+            "rcptTo": rcpt_to,
+        },
+        "sendAt": utc_date(s.send_at),
+        "undoStatus": undo_name(s.undo_status),
+        "deliveryStatus": delivery_status(&s.delivery),
+        "dsnBlobIds": [],
+        "mdnBlobIds": [],
+    }))
+}
+
+/// `EmailSubmission/get`.
 pub(crate) async fn submission_get(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
@@ -200,51 +356,171 @@ pub(crate) async fn submission_get(
     let a: GetArgs = parse_args(args)?;
     ctx.check_account(&a.account_id)?;
     ctx.check_get_limit(a.ids.as_ref())?;
-    let state = state_string(ctx.state().await?);
+    let store = &ctx.jmap.d.submissions;
+    let state = submission_state(ctx).await?;
+    let (mut found, mut not_found) = (Vec::new(), Vec::new());
+    match &a.ids {
+        None => found = store.list(ctx.scope).await?,
+        Some(ids) => {
+            for id in ids {
+                match store.get(ctx.scope, ctx.resolve_id(id)).await? {
+                    Some(s) => found.push(s),
+                    None => not_found.push(id.clone()),
+                }
+            }
+        }
+    }
+    let mut list = Vec::with_capacity(found.len());
+    for s in &found {
+        let thread = thread_of(ctx, s.email).await?;
+        let obj = submission_object(s, &thread);
+        list.push(Value::Object(select(obj, a.properties.as_deref())));
+    }
     Ok(object(json!({
         "accountId": a.account_id,
         "state": state,
-        "list": [],
-        "notFound": a.ids.unwrap_or_default(),
+        "list": list,
+        "notFound": not_found,
+    })))
+}
+
+/// `EmailSubmission/changes` (RFC 8621 §7.2) по журналу [`SubmissionStore::submission_changes`](tp_contracts::submission::SubmissionStore::submission_changes).
+pub(crate) async fn submission_changes(
+    ctx: &mut Ctx<'_>,
+    args: Map<String, Value>,
+) -> MethodResult<Map<String, Value>> {
+    let a: ChangesArgs = parse_args(args)?;
+    ctx.check_account(&a.account_id)?;
+    let since = parse_submission_state(&a.since_state)?;
+    let limit = a.limit(ctx.jmap.cfg.max_changes)?;
+    sync_delivery(ctx.jmap, ctx.scope).await?;
+    let c = ctx
+        .jmap
+        .d
+        .submissions
+        .submission_changes(ctx.scope, since, limit)
+        .await
+        .map_err(changes_error)?;
+    Ok(object(json!({
+        "accountId": a.account_id,
+        "oldState": a.since_state,
+        "newState": c.new_state.to_string(),
+        "hasMoreChanges": c.has_more,
+        "created": c.created,
+        "updated": c.updated,
+        "destroyed": c.destroyed,
     })))
 }
 
 /// Свойства сортировки `EmailSubmission/query` (RFC 8621 §7.3).
 const SUBMISSION_SORT: &[&str] = &["emailId", "threadId", "sentAt"];
 
-/// Проверяет фильтр `EmailSubmission/query` (RFC 8621 §7.3): операторы `AND`/`OR`/`NOT` и условия
-/// `identityIds`, `emailIds`, `threadIds`, `undoStatus`, `before`, `after` (по `sendAt`).
-fn check_submission_filter(v: &Value) -> MethodResult<()> {
+/// Фильтр `EmailSubmission/query` (RFC 8621 §7.3): операторы и условия [`SubmissionFilter`].
+enum Filter {
+    And(Vec<Filter>),
+    Or(Vec<Filter>),
+    Not(Vec<Filter>),
+    Cond(SubmissionFilter),
+}
+
+impl Filter {
+    fn matches(&self, s: &EmailSubmission) -> bool {
+        match self {
+            Filter::And(f) => f.iter().all(|f| f.matches(s)),
+            Filter::Or(f) => f.iter().any(|f| f.matches(s)),
+            Filter::Not(f) => !f.iter().any(|f| f.matches(s)),
+            Filter::Cond(c) => c.matches(s),
+        }
+    }
+}
+
+/// Упоминает ли фильтр цепочки (`threadIds`).
+fn mentions_threads(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => m.contains_key("threadIds") || m.values().any(mentions_threads),
+        Value::Array(a) => a.iter().any(mentions_threads),
+        _ => false,
+    }
+}
+
+/// Разбирает фильтр: операторы `AND`/`OR`/`NOT` и условия `identityIds`, `emailIds`, `threadIds`, `undoStatus`,
+/// `before`, `after` (по `sendAt`). `threadIds` переводится в письма цепочек по `threads`.
+fn parse_filter(v: &Value, threads: &HashMap<MessageId, String>) -> MethodResult<Filter> {
     let unsupported = |why: &str| MethodError::with("unsupportedFilter", why);
     let Value::Object(m) = v else {
         return Err(unsupported("filter must be an object"));
     };
     if let Some(op) = m.get("operator") {
-        if !matches!(op.as_str(), Some("AND" | "OR" | "NOT")) {
-            return Err(unsupported("operator"));
-        }
         let conds = m
             .get("conditions")
             .and_then(Value::as_array)
-            .ok_or_else(|| unsupported("conditions"))?;
-        return conds.iter().try_for_each(check_submission_filter);
-    }
-    for (k, v) in m {
-        let ok = match k.as_str() {
-            "identityIds" | "emailIds" | "threadIds" => v
-                .as_array()
-                .is_some_and(|ids| ids.iter().all(Value::is_string)),
-            "undoStatus" => matches!(v.as_str(), Some("pending" | "final" | "canceled")),
-            "before" | "after" => v
-                .as_str()
-                .is_some_and(|s| OffsetDateTime::parse(s, &Rfc3339).is_ok()),
-            _ => return Err(unsupported(k)),
+            .ok_or_else(|| unsupported("conditions"))?
+            .iter()
+            .map(|c| parse_filter(c, threads))
+            .collect::<MethodResult<Vec<_>>>()?;
+        return match op.as_str() {
+            Some("AND") => Ok(Filter::And(conds)),
+            Some("OR") => Ok(Filter::Or(conds)),
+            Some("NOT") => Ok(Filter::Not(conds)),
+            _ => Err(unsupported("operator")),
         };
-        if !ok {
-            return Err(MethodError::invalid(format!("filter: bad {k}")));
+    }
+    let mut f = SubmissionFilter::default();
+    let mut by_thread: Option<Vec<MessageId>> = None;
+    for (k, v) in m {
+        let bad = || MethodError::invalid(format!("filter: bad {k}"));
+        let strings = || -> MethodResult<Vec<&str>> {
+            v.as_array()
+                .and_then(|ids| ids.iter().map(Value::as_str).collect())
+                .ok_or_else(bad)
+        };
+        let date = || {
+            v.as_str()
+                .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+                .ok_or_else(bad)
+        };
+        match k.as_str() {
+            "identityIds" => {
+                f.identity_ids = Some(strings()?.into_iter().map(str::to_owned).collect());
+            }
+            "emailIds" => {
+                let ids = strings()?;
+                f.email_ids = Some(
+                    ids.into_iter()
+                        .filter_map(|i| MessageId::from_str(i).ok())
+                        .collect(),
+                );
+            }
+            "threadIds" => {
+                let ids = strings()?;
+                by_thread = Some(
+                    threads
+                        .iter()
+                        .filter(|(_, t)| ids.contains(&t.as_str()))
+                        .map(|(m, _)| *m)
+                        .collect(),
+                );
+            }
+            "undoStatus" => {
+                f.undo_status = Some(match v.as_str() {
+                    Some("pending") => UndoStatus::Pending,
+                    Some("final") => UndoStatus::Final,
+                    Some("canceled") => UndoStatus::Canceled,
+                    _ => return Err(bad()),
+                });
+            }
+            "before" => f.before = Some(date()?),
+            "after" => f.after = Some(date()?),
+            _ => return Err(unsupported(k)),
         }
     }
-    Ok(())
+    if let Some(of_threads) = by_thread {
+        f.email_ids = Some(match f.email_ids.take() {
+            Some(ids) => ids.into_iter().filter(|i| of_threads.contains(i)).collect(),
+            None => of_threads,
+        });
+    }
+    Ok(Filter::Cond(f))
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,29 +533,59 @@ struct SubmissionQueryArgs {
     window: QueryWindow,
 }
 
-/// Результаты `EmailSubmission/query`: отправки не хранятся, поэтому после проверки фильтра и сортировки
-/// список пуст при любом состоянии.
-fn submission_ids(a: &SubmissionQueryArgs) -> MethodResult<Vec<String>> {
-    if let Some(f) = &a.filter {
-        check_submission_filter(f)?;
-    }
-    for c in a.sort.iter().flatten() {
+/// Результаты `EmailSubmission/query`: отправки учётной записи по фильтру и сортировке; без сортировки и при
+/// равенстве — по `sendAt`, затем по `id`.
+async fn submission_ids(ctx: &Ctx<'_>, a: &SubmissionQueryArgs) -> MethodResult<Vec<String>> {
+    let sort = a.sort.as_deref().unwrap_or_default();
+    for c in sort {
         if !SUBMISSION_SORT.contains(&c.property.as_str()) {
             return Err(MethodError::with("unsupportedSort", c.property.clone()));
         }
     }
-    Ok(Vec::new())
+    let by_thread = sort.iter().any(|c| c.property == "threadId");
+    let threads = if by_thread || a.filter.as_ref().is_some_and(mentions_threads) {
+        threads(ctx).await?
+    } else {
+        HashMap::new()
+    };
+    let filter = match &a.filter {
+        Some(f) => Some(parse_filter(f, &threads)?),
+        None => None,
+    };
+    let mut list = ctx.jmap.d.submissions.list(ctx.scope).await?;
+    list.retain(|s| filter.as_ref().is_none_or(|f| f.matches(s)));
+    let thread = |s: &EmailSubmission| {
+        threads
+            .get(&s.email)
+            .cloned()
+            .unwrap_or_else(|| lone_thread_id(s.email))
+    };
+    list.sort_by(|x, y| {
+        for c in sort {
+            let ord = match c.property.as_str() {
+                "emailId" => x.email.to_string().cmp(&y.email.to_string()),
+                "threadId" => thread(x).cmp(&thread(y)),
+                _ => x.send_at.cmp(&y.send_at),
+            };
+            let ord = if c.is_ascending { ord } else { ord.reverse() };
+            if ord.is_ne() {
+                return ord;
+            }
+        }
+        (x.send_at, &x.id).cmp(&(y.send_at, &y.id))
+    });
+    Ok(list.into_iter().map(|s| s.id).collect())
 }
 
-/// `EmailSubmission/query` (RFC 8621 §7.3): `queryState` — состояние учётной записи.
+/// `EmailSubmission/query` (RFC 8621 §7.3): `queryState` — состояние отправок.
 pub(crate) async fn submission_query(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: SubmissionQueryArgs = parse_args(args)?;
     ctx.check_account(&a.account_id)?;
-    let ids = submission_ids(&a)?;
-    let state = state_string(ctx.state().await?);
+    let state = submission_state(ctx).await?;
+    let ids = submission_ids(ctx, &a).await?;
     let mut out = object(json!({
         "accountId": a.account_id,
         "queryState": state,
@@ -289,8 +595,9 @@ pub(crate) async fn submission_query(
     Ok(out)
 }
 
-/// `EmailSubmission/queryChanges` (RFC 8620 §5.6): результаты пусты в любом состоянии, изменений нет.
-/// Чужая строка состояния или состояние новее текущего — `cannotCalculateChanges`.
+/// `EmailSubmission/queryChanges` (RFC 8620 §5.6) по журналу изменений отправок: изменённые и удалённые — в
+/// `removed`, изменённые и созданные, входящие в результаты, — в `added`. Чужое или устаревшее состояние —
+/// `cannotCalculateChanges`.
 pub(crate) async fn submission_query_changes(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
@@ -300,21 +607,25 @@ pub(crate) async fn submission_query_changes(
     let mut q = args;
     q.retain(|k, _| matches!(k.as_str(), "accountId" | "filter" | "sort"));
     let a: SubmissionQueryArgs = parse_args(q)?;
-    let ids = submission_ids(&a)?;
-    let since = parse_state(&qc.since_query_state)?;
+    let since = parse_submission_state(&qc.since_query_state)?;
     let limit = qc.limit(ctx.jmap.cfg.max_changes)?;
-    let now = ctx.state().await?;
-    if since > now {
-        return Err(MethodError::new("cannotCalculateChanges"));
-    }
-    let none = Changes {
-        created: Vec::new(),
-        updated: Vec::new(),
-        destroyed: Vec::new(),
-        new_state: now,
-        has_more: false,
+    sync_delivery(ctx.jmap, ctx.scope).await?;
+    let c = ctx
+        .jmap
+        .d
+        .submissions
+        .submission_changes(ctx.scope, since, limit)
+        .await
+        .map_err(changes_error)?;
+    let ids = submission_ids(ctx, &a).await?;
+    let changes = Changes {
+        created: c.created,
+        updated: c.updated,
+        destroyed: c.destroyed,
+        new_state: ModSeq(c.new_state),
+        has_more: c.has_more,
     };
-    query_changes_response(&qc, &ids, &none, limit)
+    query_changes_response(&qc, &ids, &changes, limit)
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,6 +665,9 @@ struct Create {
     envelope: Option<Envelope>,
     #[serde(default)]
     undo_status: Option<String>,
+    /// Срок отложенной отправки (UTCDate); нет или уже наступил — отправить сейчас.
+    #[serde(default)]
+    send_at: Option<String>,
 }
 
 /// Синтаксически допустимый адрес конверта: `local@domain` без пробелов и угловых скобок.
@@ -421,28 +735,6 @@ fn prepend_headers(raw: Vec<u8>, headers: &[(String, String)]) -> Vec<u8> {
     }
     out.extend_from_slice(&raw);
     out
-}
-
-/// Внешние адреса пересылки (`Ingested::forward`, копии `CopyTo::Address`) — в очередь исходящей почты.
-pub(crate) async fn forward(
-    ctx: &Ctx<'_>,
-    mail_from: &str,
-    raw: &[u8],
-    to: &[String],
-) -> MethodResult<()> {
-    if to.is_empty() {
-        return Ok(());
-    }
-    let Some(out) = &ctx.jmap.d.outbound else {
-        tracing::warn!(
-            count = to.len(),
-            "jmap: копии внешним адресам не отправлены — узел без очереди"
-        );
-        return Ok(());
-    };
-    out.enqueue(ctx.scope.tenant, mail_from, to, Bytes::copy_from_slice(raw))
-        .await?;
-    Ok(())
 }
 
 /// Итог правил потока для отправки.
@@ -541,11 +833,44 @@ async fn mail_flow(
     }
 }
 
-/// Одна отправка: `Ok(Ok((id, письмо, статусы)))` — отправлено, `Ok(Err(SetError))` — отказ по объекту.
+/// Срок отложенной отправки из `sendAt`: `None` — отправить сейчас (свойства нет или момент уже наступил);
+/// дальше `maxDelayedSend` или не дата — `invalidProperties`.
+fn delayed_until(
+    send_at: Option<&str>,
+    now: OffsetDateTime,
+    max_delay: std::time::Duration,
+) -> std::result::Result<Option<OffsetDateTime>, Value> {
+    let Some(s) = send_at else {
+        return Ok(None);
+    };
+    let Ok(at) = OffsetDateTime::parse(s, &Rfc3339) else {
+        return Err(set_error(
+            "invalidProperties",
+            Some("sendAt must be a date"),
+            &["sendAt"],
+        ));
+    };
+    if at <= now {
+        return Ok(None);
+    }
+    let max = time::Duration::try_from(max_delay).unwrap_or(time::Duration::MAX);
+    if at - now > max {
+        return Err(set_error(
+            "invalidProperties",
+            Some("sendAt is later than maxDelayedSend allows"),
+            &["sendAt"],
+        ));
+    }
+    Ok(Some(at))
+}
+
+/// Одна отправка: `Ok(Ok(запись))` — отправлена или поставлена в очередь со сроком, `Ok(Err(SetError))` — отказ
+/// по объекту. Запись в [`SubmissionStore`](tp_contracts::submission::SubmissionStore): отправленная сразу —
+/// `Final` со статусами получателей, отложенная — `Pending` с записью очереди.
 async fn submit_one(
     ctx: &Ctx<'_>,
     obj: Value,
-) -> MethodResult<std::result::Result<(String, MessageId, Submitted), Value>> {
+) -> MethodResult<std::result::Result<EmailSubmission, Value>> {
     let c: Create = match serde_json::from_value(obj) {
         Ok(c) => c,
         Err(e) => {
@@ -556,10 +881,25 @@ async fn submit_one(
             )));
         }
     };
-    if c.undo_status.as_deref().is_some_and(|u| u != "final") {
+    let now = OffsetDateTime::now_utc();
+    let max_delay = ctx.jmap.cfg.submission.max_delayed_send;
+    let release_at = match delayed_until(c.send_at.as_deref(), now, max_delay) {
+        Ok(at) => at,
+        Err(e) => return Ok(Err(e)),
+    };
+    // `undoStatus` задаёт сервер: клиент может только повторить его значение.
+    let undo = if release_at.is_some() {
+        UndoStatus::Pending
+    } else {
+        UndoStatus::Final
+    };
+    if c.undo_status
+        .as_deref()
+        .is_some_and(|u| u != undo_name(undo))
+    {
         return Ok(Err(set_error(
             "invalidProperties",
-            Some("delayed send is not supported"),
+            Some("undoStatus is set by the server"),
             &["undoStatus"],
         )));
     }
@@ -572,7 +912,8 @@ async fn submit_one(
         )));
     };
     let p = ctx.principal;
-    if ctx.resolve_id(&c.identity_id) != identity_id(&p.login) {
+    let identity = identity_id(&p.login);
+    if ctx.resolve_id(&c.identity_id) != identity {
         return Ok(Err(set_error("invalidProperties", None, &["identityId"])));
     }
     let msg = match MessageId::from_str(ctx.resolve_id(&c.email_id)) {
@@ -588,7 +929,8 @@ async fn submit_one(
     };
     let mut raw = collect(d.store.fetch_raw(ctx.scope, msg.id, None).await?).await?;
 
-    // Адреса из заголовков.
+    // Адреса из заголовков; Message-ID — пояснение записи аудита.
+    let message_id;
     let (from, sender, header_rcpts) = {
         let Some(parsed) = MessageParser::default().parse_headers(&raw) else {
             return Ok(Err(set_error("invalidEmail", None, &[])));
@@ -610,6 +952,7 @@ async fn submit_one(
         {
             rcpts.extend(list.iter().filter_map(|a| a.address()).map(str::to_owned));
         }
+        message_id = parsed.message_id().and_then(crate::audit::detail);
         (from, sender, rcpts)
     };
     let Some(from) = from else {
@@ -690,6 +1033,17 @@ async fn submit_one(
         return Ok(Err(e));
     }
 
+    let mut record = EmailSubmission {
+        id: format!("S{}", MessageId::new()),
+        identity,
+        email: msg.id,
+        mail_from: mail_from.clone(),
+        rcpt_to: rcpts.clone(),
+        send_at: now,
+        undo_status: UndoStatus::Final,
+        delivery: Vec::new(),
+        queue: None,
+    };
     raw = prepend_headers(strip_header(&raw, "Bcc"), &add);
     let (mail_from, rcpts) = match mail_flow(ctx, mail_from, rcpts, raw).await? {
         Flowed::Send {
@@ -701,8 +1055,11 @@ async fn submit_one(
             (mail_from, rcpts)
         }
         Flowed::Drop(rcpts) => {
-            let statuses = Submitted::all(&rcpts, SubmitStatus::Queued);
-            return Ok(Ok((format!("S{}", MessageId::new()), msg.id, statuses)));
+            // Принято без отправки: запись окончательная, срока выпуска нет.
+            record.delivery = Submitted::all(&rcpts, SubmitStatus::Queued).rcpts;
+            d.submissions.insert(ctx.scope, record.clone()).await?;
+            audit_send(ctx, &from, right, msg.id, message_id).await?;
+            return Ok(Ok(record));
         }
         Flowed::Refuse(e) => return Ok(Err(e)),
     };
@@ -728,9 +1085,6 @@ async fn submit_one(
             copies = a.copies;
         }
     }
-    let statuses = outbound
-        .submit(p.tenant, &mail_from, &rcpts, Bytes::copy_from_slice(&raw))
-        .await?;
     let mut external = Vec::new();
     let mut boxes = Vec::new();
     for c in copies {
@@ -739,24 +1093,164 @@ async fn submit_one(
             CopyTo::Mailbox(delivery) => boxes.push(delivery),
         }
     }
-    forward(ctx, &mail_from, &raw, &external).await?;
+    let body = Bytes::from(raw);
+    match release_at {
+        None => {
+            record.delivery = outbound
+                .submit(p.tenant, &mail_from, &rcpts, body.clone())
+                .await?
+                .rcpts;
+            if !external.is_empty() {
+                outbound
+                    .enqueue(p.tenant, &mail_from, &external, body.clone())
+                    .await?;
+            }
+        }
+        Some(at) => {
+            // Копии внешним адресам выпускаются тем же сроком, что и письмо.
+            let queue = outbound
+                .schedule(p.tenant, &mail_from, &rcpts, body.clone(), at)
+                .await?;
+            if !external.is_empty() {
+                outbound
+                    .schedule(p.tenant, &mail_from, &external, body.clone(), at)
+                    .await?;
+            }
+            record.send_at = at;
+            record.undo_status = UndoStatus::Pending;
+            record.queue = Some(queue);
+        }
+    }
     if !boxes.is_empty() {
-        let data = Bytes::from(raw);
         d.store
             .ingest(IngestRequest {
                 tenant: p.tenant,
                 mail_from: mail_from.clone(),
-                raw: Box::pin(futures::stream::once(async move { Ok(data) })),
+                raw: Box::pin(futures::stream::once(async move { Ok(body) })),
                 deliveries: boxes,
-                received_at: OffsetDateTime::now_utc(),
+                received_at: now,
             })
             .await?;
     }
-    Ok(Ok((format!("S{}", MessageId::new()), msg.id, statuses)))
+    if let Err(e) = d.submissions.insert(ctx.scope, record.clone()).await {
+        // Письмо уже в очереди: отложенное снимается, отправленное сразу остаётся без записи.
+        if let Some(queue) = record.queue
+            && let Err(undo) = outbound.cancel_scheduled(p.tenant, queue).await
+        {
+            tracing::error!(error = %undo, "jmap: отложенное письмо без записи отправки не снято с очереди");
+        }
+        tracing::error!(error = %e, "jmap: запись отправки не сохранена");
+        return Err(e.into());
+    }
+    audit_send(ctx, &from, right, msg.id, message_id).await?;
+    Ok(Ok(record))
 }
 
-/// `EmailSubmission/set`: создание — постановка в очередь; затем неявный `Email/set`
-/// (`onSuccessUpdateEmail`, `onSuccessDestroyEmail`) — ответ после ответа метода.
+/// Аудит ящика (JMAP-18): отправка от адреса другой учётной записи — действие представителя в её ящике (`SendAs`,
+/// `SendOnBehalf`); от своего адреса или адреса без ящика (группа) — отправка владельца в своём ящике (`Send`).
+/// Пояснение — Message-ID письма.
+async fn audit_send(
+    ctx: &Ctx<'_>,
+    from: &str,
+    right: SendRight,
+    email: MessageId,
+    message_id: Option<String>,
+) -> MethodResult<()> {
+    let p = ctx.principal;
+    let other = match ctx.jmap.d.accounts.by_login(p.tenant, from).await? {
+        Some(a) if a.id != p.account => Some(a.id),
+        _ => None,
+    };
+    match other {
+        Some(mailbox_owner) => {
+            let action = match right {
+                SendRight::SendAs => AuditAction::SendAs,
+                SendRight::SendOnBehalf => AuditAction::SendOnBehalf,
+            };
+            let object = AuditObject {
+                detail: message_id,
+                ..AuditObject::default()
+            };
+            crate::audit::delegate(ctx, mailbox_owner, action, object).await;
+        }
+        None => {
+            let object = AuditObject {
+                mailbox: None,
+                message: Some(email),
+                detail: message_id,
+            };
+            crate::audit::owner(ctx, AuditAction::Send, object).await;
+        }
+    }
+    Ok(())
+}
+
+/// Отмена отложенной отправки (`undoStatus: canceled`): письмо снимается с очереди
+/// ([`Outbound::cancel_scheduled`](tp_contracts::queue::Outbound::cancel_scheduled)), затем отменяется запись.
+/// Уже отменённая — успех; отправленная или выпущенная из очереди — `cannotUnsend`. `Ok(Ok(запись))` — отменена.
+async fn cancel_one(
+    ctx: &Ctx<'_>,
+    id: &str,
+    patch: &Value,
+) -> MethodResult<std::result::Result<EmailSubmission, Value>> {
+    let Value::Object(p) = patch else {
+        return Ok(Err(set_error("invalidPatch", None, &[])));
+    };
+    let bad: Vec<&str> = p
+        .iter()
+        .filter(|(k, v)| !(*k == "undoStatus" && v.as_str() == Some("canceled")))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !bad.is_empty() || p.is_empty() {
+        return Ok(Err(set_error(
+            "invalidProperties",
+            Some("only undoStatus can be changed, to canceled"),
+            &bad,
+        )));
+    }
+    let d = &ctx.jmap.d;
+    let Some(s) = d.submissions.get(ctx.scope, id).await? else {
+        return Ok(Err(set_error("notFound", None, &[])));
+    };
+    let cannot = || set_error("cannotUnsend", None, &[]);
+    match s.undo_status {
+        UndoStatus::Canceled => return Ok(Ok(s)),
+        UndoStatus::Final => return Ok(Err(cannot())),
+        UndoStatus::Pending => {}
+    }
+    if let Some(queue) = s.queue {
+        let Some(outbound) = &d.outbound else {
+            return Ok(Err(cannot()));
+        };
+        match outbound.cancel_scheduled(ctx.scope.tenant, queue).await {
+            Ok(()) => {}
+            // Письмо уже выпущено (или доставлено и запись очереди удалена): отправка окончательная.
+            Err(Error::Conflict | Error::NotFound) => {
+                match d
+                    .submissions
+                    .finalize(ctx.scope, id, Vec::new(), s.queue)
+                    .await
+                {
+                    Ok(_) | Err(Error::Conflict | Error::NotFound) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                return Ok(Err(cannot()));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    match d.submissions.cancel(ctx.scope, id).await {
+        Ok(s) => Ok(Ok(s)),
+        Err(Error::Conflict) => Ok(Err(cannot())),
+        Err(Error::NotFound) => Ok(Err(set_error("notFound", None, &[]))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `EmailSubmission/set`: создание — отправка сразу или постановка в очередь со сроком `sendAt`; изменение —
+/// отмена отложенной отправки; удаление — удаление записи (на письмо и очередь не влияет). Затем неявный
+/// `Email/set` (`onSuccessUpdateEmail`, `onSuccessDestroyEmail`) по письмам успешно созданных, изменённых и
+/// удалённых отправок — ответ после ответа метода.
 pub(crate) async fn submission_set(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
@@ -769,44 +1263,66 @@ pub(crate) async fn submission_set(
     if n > ctx.jmap.cfg.max_objects_in_set as usize {
         return Err(MethodError::new("requestTooLarge"));
     }
-    let old = state_string(ctx.state().await?);
+    let old = submission_state(ctx).await?;
     if a.if_in_state.as_ref().is_some_and(|s| *s != old) {
         return Err(MethodError::new("stateMismatch"));
     }
-    let (mut created, mut not_created) = (Map::new(), Map::new());
+    let mut out = SetOutcome::default();
     // Успешные отправки: (creation id, id отправки, письмо).
-    let mut sent: Vec<(String, String, MessageId)> = Vec::new();
+    let mut done: Vec<(Option<String>, String, MessageId)> = Vec::new();
     for (cid, obj) in a.create.unwrap_or_default() {
         match submit_one(ctx, obj).await? {
-            Ok((id, email, statuses)) => {
-                created.insert(
-                    cid.clone(),
-                    json!({
-                        "id": id,
-                        "undoStatus": "final",
-                        "sendAt": utc_date(OffsetDateTime::now_utc()),
-                        "deliveryStatus": delivery_status(&statuses),
-                    }),
-                );
-                ctx.created.insert(cid.clone(), id.clone());
-                sent.push((cid, id, email));
+            Ok(s) => {
+                let thread = thread_of(ctx, s.email).await?;
+                let mut created = submission_object(&s, &thread);
+                created.retain(|k, _| !matches!(k.as_str(), "identityId" | "emailId"));
+                out.created.insert(cid.clone(), Value::Object(created));
+                ctx.created.insert(cid.clone(), s.id.clone());
+                done.push((Some(cid), s.id, s.email));
             }
             Err(e) => {
-                not_created.insert(cid, e);
+                out.not_created.insert(cid, e);
             }
         }
     }
-    let mut not_updated = Map::new();
-    for (id, _) in a.update.unwrap_or_default() {
-        not_updated.insert(id, set_error("cannotUnsend", None, &[]));
+    for (key, patch) in a.update.unwrap_or_default() {
+        let id = ctx.resolve_id(&key).to_owned();
+        match cancel_one(ctx, &id, &patch).await? {
+            Ok(s) => {
+                out.updated.insert(key, Value::Null);
+                done.push((None, s.id, s.email));
+            }
+            Err(e) => {
+                out.not_updated.insert(key, e);
+            }
+        }
     }
-    let mut not_destroyed = Map::new();
-    for id in a.destroy.unwrap_or_default() {
-        not_destroyed.insert(id, set_error("notFound", None, &[]));
+    for key in a.destroy.unwrap_or_default() {
+        let id = ctx.resolve_id(&key).to_owned();
+        let store = &ctx.jmap.d.submissions;
+        let email = store.get(ctx.scope, &id).await?.map(|s| s.email);
+        let deleted = match email {
+            Some(email) => match store.delete(ctx.scope, &id).await {
+                Ok(_) => Some(email),
+                Err(Error::NotFound) => None,
+                Err(e) => return Err(e.into()),
+            },
+            None => None,
+        };
+        match deleted {
+            Some(email) => {
+                done.push((None, id, email));
+                out.destroyed.push(key);
+            }
+            None => {
+                out.not_destroyed
+                    .insert(key, set_error("notFound", None, &[]));
+            }
+        }
     }
     let email_of = |key: &str| {
-        sent.iter()
-            .find(|(cid, id, _)| key.strip_prefix('#') == Some(cid.as_str()) || key == id)
+        done.iter()
+            .find(|(cid, id, _)| key.strip_prefix('#') == cid.as_deref() || key == id)
             .map(|(_, _, e)| e.to_string())
     };
     let mut update = Map::new();
@@ -821,18 +1337,8 @@ pub(crate) async fn submission_set(
         .iter()
         .filter_map(|k| email_of(k))
         .collect();
-    let new = state_string(ctx.state().await?);
-    let out = object(json!({
-        "accountId": a.account_id,
-        "oldState": old,
-        "newState": new,
-        "created": or_null(created),
-        "updated": null,
-        "destroyed": null,
-        "notCreated": or_null(not_created),
-        "notUpdated": or_null(not_updated),
-        "notDestroyed": or_null(not_destroyed),
-    }));
+    let new = submission_state(ctx).await?;
+    let out = out.response(&a.account_id, &old, &new);
     if !update.is_empty() || !destroy.is_empty() {
         let args = object(json!({
             "accountId": a.account_id,
@@ -852,6 +1358,7 @@ mod tests {
     use async_trait::async_trait;
     use tp_contracts::meta::SpecialUse;
     use tp_contracts::queue::Outbound;
+    use tp_contracts::submission::SubmissionStore;
     use tp_contracts::{Result, TenantId};
 
     use crate::JmapConfig;
@@ -1271,6 +1778,496 @@ mod tests {
         assert_eq!(r[1][1]["type"], "cannotCalculateChanges");
         assert_eq!(r[2][1]["type"], "cannotCalculateChanges");
         assert_eq!(r[3][1]["type"], "invalidArguments");
+    }
+
+    /// Создаёт черновик и отправку с `sendAt`; возвращает ответ `EmailSubmission/set`.
+    async fn send_at(env: &Env, at: OffsetDateTime) -> Value {
+        let acc = env.account();
+        let r = calls(
+            env,
+            &env.jmap,
+            json!([
+                ["Email/set", {"accountId": acc, "create": {"d": draft(env, "user@example.org")}}, "0"],
+                ["EmailSubmission/set", {"accountId": acc, "create": {"s": {
+                    "identityId": identity_id("user@example.org"),
+                    "emailId": "#d",
+                    "sendAt": utc_date(at),
+                }}}, "1"]
+            ]),
+        )
+        .await;
+        assert_eq!(r[1][0], "EmailSubmission/set", "{:?}", r[1]);
+        r[1][1].clone()
+    }
+
+    /// Сессия объявляет `maxDelayedSend` из конфигурации.
+    #[tokio::test]
+    async fn max_delayed_send_in_session() {
+        let mut cfg = JmapConfig::default();
+        cfg.submission.max_delayed_send = std::time::Duration::from_secs(3600);
+        let env = Env::with(cfg, Vec::new()).await;
+        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let caps = &s["accounts"][env.account()]["accountCapabilities"];
+        assert_eq!(
+            caps["urn:ietf:params:jmap:submission"]["maxDelayedSend"],
+            3600
+        );
+    }
+
+    /// Отправка со сроком: письмо в очереди со сроком выпуска, запись `pending` без статусов; видна в `get`,
+    /// `query` и `changes`.
+    #[tokio::test]
+    async fn delayed_send_is_scheduled() {
+        let env = Env::new().await;
+        let acc = env.account();
+        let at = (OffsetDateTime::now_utc() + time::Duration::hours(2))
+            .replace_nanosecond(0)
+            .expect("time");
+        let state0 = env.submissions.state(env.scope).await.expect("state");
+        let set = send_at(&env, at).await;
+        let created = &set["created"]["s"];
+        assert_eq!(created["undoStatus"], "pending", "{set}");
+        assert_eq!(created["sendAt"], utc_date(at));
+        assert_eq!(created["deliveryStatus"], Value::Null);
+        assert_eq!(set["oldState"], state0.to_string());
+        assert_ne!(set["newState"], set["oldState"]);
+        let id = created["id"].as_str().expect("id");
+
+        assert!(env.outbound.queued().is_empty(), "сразу не отправлено");
+        let scheduled = env.outbound.scheduled();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].release_at, at);
+        assert_eq!(
+            scheduled[0].message.rcpts,
+            vec!["rcpt@external.test", "hidden@external.test"]
+        );
+        let stored = env
+            .submissions
+            .get(env.scope, id)
+            .await
+            .expect("get")
+            .expect("stored");
+        assert_eq!(stored.queue, Some(scheduled[0].queue));
+        assert_eq!(stored.undo_status, UndoStatus::Pending);
+
+        let r = calls(
+            &env,
+            &env.jmap,
+            json!([
+                ["EmailSubmission/get", {"accountId": acc, "ids": [id, "S-нет"]}, "g"],
+                ["EmailSubmission/query", {"accountId": acc, "filter": {"undoStatus": "pending"}}, "q"],
+                ["EmailSubmission/query", {"accountId": acc, "filter": {"undoStatus": "final"}}, "qf"],
+                ["EmailSubmission/changes", {"accountId": acc, "sinceState": set["oldState"]}, "c"],
+                ["EmailSubmission/changes", {"accountId": acc, "sinceState": "чужое"}, "cx"],
+            ]),
+        )
+        .await;
+        let got = &r[0][1]["list"][0];
+        assert_eq!(got["id"], id, "{:?}", r[0]);
+        assert_eq!(got["undoStatus"], "pending");
+        assert_eq!(got["sendAt"], utc_date(at));
+        assert_eq!(got["identityId"], identity_id("user@example.org"));
+        assert_eq!(got["envelope"]["mailFrom"]["email"], "user@example.org");
+        assert_eq!(got["envelope"]["rcptTo"][0]["email"], "rcpt@external.test");
+        assert!(got["threadId"].is_string() && got["emailId"].is_string());
+        assert_eq!(r[0][1]["notFound"], json!(["S-нет"]));
+        assert_eq!(r[0][1]["state"], set["newState"]);
+        assert_eq!(r[1][1]["ids"], json!([id]));
+        assert_eq!(r[1][1]["queryState"], set["newState"]);
+        assert_eq!(r[2][1]["ids"], json!([]));
+        assert_eq!(r[3][1]["created"], json!([id]), "{:?}", r[3]);
+        assert_eq!(r[3][1]["newState"], set["newState"]);
+        assert_eq!(r[4][1]["type"], "cannotCalculateChanges");
+    }
+
+    /// Отмена до срока: письмо снято с очереди, запись `canceled`, неявный `Email/set` возвращает письмо в
+    /// черновики; повтор отмены — успех; удаление убирает запись.
+    #[tokio::test]
+    async fn delayed_send_is_canceled() {
+        let env = Env::new().await;
+        let acc = env.account();
+        let set = send_at(&env, OffsetDateTime::now_utc() + time::Duration::minutes(5)).await;
+        let id = set["created"]["s"]["id"].as_str().expect("id").to_owned();
+        let cancel = json!({"accountId": acc,
+            "update": {&id: {"undoStatus": "canceled"}},
+            "onSuccessUpdateEmail": {&id: {"keywords/$flagged": true}}});
+        let r = calls(
+            &env,
+            &env.jmap,
+            json!([
+                ["EmailSubmission/set", cancel, "u"],
+                ["EmailSubmission/get", {"accountId": acc, "ids": [id]}, "g"],
+                ["EmailSubmission/queryChanges", {"accountId": acc, "sinceQueryState": set["newState"],
+                    "filter": {"undoStatus": "canceled"}}, "qc"],
+                ["EmailSubmission/set", {"accountId": acc, "update": {&id: {"undoStatus": "canceled"}}}, "u2"],
+                ["EmailSubmission/set", {"accountId": acc, "update": {
+                    &id: {"undoStatus": "final"}, "S-нет": {"undoStatus": "canceled"}}}, "u3"],
+                ["EmailSubmission/set", {"accountId": acc, "destroy": [id, "S-нет"]}, "d"],
+                ["EmailSubmission/get", {"accountId": acc, "ids": [id]}, "g2"],
+            ]),
+        )
+        .await;
+        assert_eq!(r[0][1]["updated"], json!({&id: null}), "{:?}", r[0]);
+        assert_eq!(r[1][0], "Email/set", "неявный Email/set: {:?}", r[1]);
+        assert!(r[1][1]["updated"].is_object(), "{:?}", r[1]);
+        assert_eq!(r[2][1]["list"][0]["undoStatus"], "canceled");
+        assert_eq!(r[2][1]["list"][0]["deliveryStatus"], Value::Null);
+        assert_eq!(r[3][1]["removed"], json!([id]), "{:?}", r[3]);
+        assert_eq!(r[3][1]["added"], json!([{"id": id, "index": 0}]));
+        assert_eq!(r[4][1]["updated"], json!({&id: null}), "повтор отмены");
+        assert_eq!(r[5][1]["notUpdated"][&id]["type"], "invalidProperties");
+        assert_eq!(r[5][1]["notUpdated"]["S-нет"]["type"], "notFound");
+        assert_eq!(r[6][1]["destroyed"], json!([id]));
+        assert_eq!(r[6][1]["notDestroyed"]["S-нет"]["type"], "notFound");
+        assert_eq!(r[7][1]["notFound"], json!([id]));
+        assert!(
+            env.outbound.scheduled().is_empty(),
+            "письмо снято с очереди"
+        );
+        assert!(env.outbound.queued().is_empty());
+    }
+
+    /// Отменить нельзя: письмо отправлено сразу или уже выпущено из очереди — `cannotUnsend`, выпущенная
+    /// отправка становится `final`.
+    #[tokio::test]
+    async fn cannot_unsend() {
+        let env = Env::new().await;
+        let acc = env.account();
+        let now = send_at(&env, OffsetDateTime::now_utc() - time::Duration::hours(1)).await;
+        assert_eq!(now["created"]["s"]["undoStatus"], "final", "{now}");
+        assert_eq!(env.outbound.queued().len(), 1, "срок в прошлом — сразу");
+        let sent = now["created"]["s"]["id"].as_str().expect("id");
+        let later = send_at(&env, OffsetDateTime::now_utc() + time::Duration::hours(1)).await;
+        let released = later["created"]["s"]["id"].as_str().expect("id");
+        assert!(env.outbound.release(env.outbound.scheduled()[0].queue));
+        let r = calls(
+            &env,
+            &env.jmap,
+            json!([
+                ["EmailSubmission/set", {"accountId": acc, "update": {
+                    sent: {"undoStatus": "canceled"}, released: {"undoStatus": "canceled"}}}, "u"],
+                ["EmailSubmission/get", {"accountId": acc, "ids": [released], "properties": ["undoStatus"]}, "g"],
+            ]),
+        )
+        .await;
+        assert_eq!(
+            r[0][1]["notUpdated"][sent]["type"], "cannotUnsend",
+            "{:?}",
+            r[0]
+        );
+        assert_eq!(r[0][1]["notUpdated"][released]["type"], "cannotUnsend");
+        assert_eq!(r[1][1]["list"][0]["undoStatus"], "final");
+    }
+
+    /// Срок дальше `maxDelayedSend`, не дата, чужой `undoStatus` — `invalidProperties`; при `maxDelayedSend` = 0
+    /// отложенная отправка запрещена. Ничего не отправлено и не записано.
+    #[tokio::test]
+    async fn delayed_send_limits() {
+        let mut cfg = JmapConfig::default();
+        cfg.submission.max_delayed_send = std::time::Duration::from_secs(3600);
+        let env = Env::with(cfg, Vec::new()).await;
+        let acc = env.account();
+        let far = send_at(&env, OffsetDateTime::now_utc() + time::Duration::hours(2)).await;
+        assert_eq!(far["notCreated"]["s"]["type"], "invalidProperties", "{far}");
+        assert_eq!(far["notCreated"]["s"]["properties"], json!(["sendAt"]));
+        let identity = identity_id("user@example.org");
+        let soon = utc_date(OffsetDateTime::now_utc() + time::Duration::minutes(10));
+        let r = calls(
+            &env,
+            &env.jmap,
+            json!([
+                ["Email/set", {"accountId": acc, "create": {"d": draft(&env, "user@example.org")}}, "0"],
+                ["EmailSubmission/set", {"accountId": acc, "create": {
+                    "a": {"identityId": identity, "emailId": "#d", "sendAt": "завтра"},
+                    "b": {"identityId": identity, "emailId": "#d", "sendAt": soon, "undoStatus": "final"},
+                    "c": {"identityId": identity, "emailId": "#d", "undoStatus": "pending"},
+                }}, "1"]
+            ]),
+        )
+        .await;
+        for cid in ["a", "b", "c"] {
+            assert_eq!(
+                r[1][1]["notCreated"][cid]["type"], "invalidProperties",
+                "{cid}: {:?}",
+                r[1]
+            );
+        }
+        assert!(env.outbound.scheduled().is_empty() && env.outbound.queued().is_empty());
+        assert!(
+            env.submissions
+                .list(env.scope)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+
+        let mut cfg = JmapConfig::default();
+        cfg.submission.max_delayed_send = std::time::Duration::ZERO;
+        let env = Env::with(cfg, Vec::new()).await;
+        let off = send_at(&env, OffsetDateTime::now_utc() + time::Duration::minutes(1)).await;
+        assert_eq!(off["notCreated"]["s"]["type"], "invalidProperties", "{off}");
+    }
+
+    /// Отправленное сразу письмо записано: `final` со статусами получателей; сортировка и фильтры `query`.
+    #[tokio::test]
+    async fn sent_submissions_are_stored() {
+        let env = Env::new().await;
+        let acc = env.account();
+        let first = send_at(&env, OffsetDateTime::now_utc() + time::Duration::hours(3)).await;
+        let second = send_at(&env, OffsetDateTime::now_utc() - time::Duration::seconds(1)).await;
+        let (a, b) = (
+            first["created"]["s"]["id"].as_str().expect("id"),
+            second["created"]["s"]["id"].as_str().expect("id"),
+        );
+        let r = calls(
+            &env,
+            &env.jmap,
+            json!([
+                ["EmailSubmission/get", {"accountId": acc, "ids": null}, "g"],
+                ["EmailSubmission/query", {"accountId": acc, "sort": [{"property": "sentAt", "isAscending": false}]}, "q"],
+                ["EmailSubmission/query", {"accountId": acc, "filter": {"operator": "NOT",
+                    "conditions": [{"undoStatus": "pending"}]}}, "qn"],
+                ["EmailSubmission/get", {"accountId": acc, "#ids": {
+                    "resultOf": "qn", "name": "EmailSubmission/query", "path": "/ids"}}, "g2"],
+            ]),
+        )
+        .await;
+        assert_eq!(
+            r[0][1]["list"].as_array().map(Vec::len),
+            Some(2),
+            "{:?}",
+            r[0]
+        );
+        assert_eq!(r[1][1]["ids"], json!([a, b]));
+        assert_eq!(r[2][1]["ids"], json!([b]));
+        let sent = &r[3][1]["list"][0];
+        assert_eq!(sent["undoStatus"], "final");
+        assert_eq!(
+            sent["deliveryStatus"]["rcpt@external.test"]["delivered"], "queued",
+            "{sent}"
+        );
+        let thread = sent["threadId"].as_str().expect("thread");
+        let by_thread = calls(
+            &env,
+            &env.jmap,
+            json!([["EmailSubmission/query", {"accountId": acc, "filter": {"threadIds": [thread]},
+                "sort": [{"property": "threadId"}]}, "t"]]),
+        )
+        .await;
+        assert_eq!(by_thread[0][1]["ids"], json!([b]), "{:?}", by_thread[0]);
+    }
+
+    /// Событие журнала доставки записи очереди `queue`.
+    fn event(
+        env: &Env,
+        queue: tp_contracts::QueueId,
+        kind: DeliveryEventKind,
+        decision: DeliveryDecision,
+        rcpt: &str,
+        reason: Option<&str>,
+    ) -> DeliveryEvent {
+        DeliveryEvent {
+            tenant: env.scope.tenant,
+            at: OffsetDateTime::now_utc(),
+            node: tp_contracts::membership::NodeId::try_from("node-1".to_owned()).expect("node"),
+            kind,
+            sender: "user@example.org".into(),
+            recipients: vec![rcpt.to_owned()],
+            message_id: None,
+            queue_id: Some(queue),
+            decision,
+            reason: reason.map(str::to_owned),
+        }
+    }
+
+    /// Статус доставки из журнала: наступившая отложенная отправка становится `final`, статусы получателей — по
+    /// событиям её записи очереди; каждое изменение меняет состояние и видно в `changes`; после конечных статусов
+    /// состояние не меняется.
+    #[tokio::test]
+    async fn delivery_status_from_log() {
+        use tp_contracts::delivery::DeliveryLog;
+        let env = Env::new().await;
+        let acc = env.account();
+        let queue = tp_contracts::QueueId::new();
+        let rcpts = [
+            "local@example.org",
+            "slow@external.test",
+            "Far@external.test",
+        ];
+        let state0 = env
+            .submissions
+            .insert(
+                env.scope,
+                EmailSubmission {
+                    id: "S1".into(),
+                    identity: identity_id("user@example.org"),
+                    email: MessageId::new(),
+                    mail_from: "user@example.org".into(),
+                    rcpt_to: rcpts.iter().map(|r| (*r).to_owned()).collect(),
+                    send_at: OffsetDateTime::now_utc() - time::Duration::minutes(1),
+                    undo_status: UndoStatus::Pending,
+                    delivery: Vec::new(),
+                    queue: Some(queue),
+                },
+            )
+            .await
+            .expect("insert");
+        let get = || async {
+            let r = calls(
+                &env,
+                &env.jmap,
+                json!([["EmailSubmission/get", {"accountId": acc, "ids": ["S1"]}, "g"]]),
+            )
+            .await;
+            r[0][1].clone()
+        };
+        let delivered =
+            |g: &Value, rcpt: &str| g["list"][0]["deliveryStatus"][rcpt]["delivered"].clone();
+
+        // Срок наступил, событий ещё нет: окончательная, все получатели в очереди.
+        let g1 = get().await;
+        assert_eq!(g1["list"][0]["undoStatus"], "final", "{g1}");
+        assert!(rcpts.iter().all(|r| delivered(&g1, r) == "queued"), "{g1}");
+        assert_ne!(g1["state"], state0.to_string());
+        let cancel = calls(
+            &env,
+            &env.jmap,
+            json!([["EmailSubmission/set", {"accountId": acc, "update": {"S1": {"undoStatus": "canceled"}}}, "u"]]),
+        )
+        .await;
+        assert_eq!(cancel[0][1]["notUpdated"]["S1"]["type"], "cannotUnsend");
+
+        // Доставка в ящик и временный отказ; приём письма и уведомление DSN статус не меняют.
+        for e in [
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Receive,
+                DeliveryDecision::Accept,
+                rcpts[1],
+                None,
+            ),
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Deliver,
+                DeliveryDecision::Accept,
+                rcpts[0],
+                None,
+            ),
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Relay,
+                DeliveryDecision::Defer,
+                rcpts[1],
+                Some("451 4.7.1 Try later"),
+            ),
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Dsn,
+                DeliveryDecision::Reject,
+                rcpts[0],
+                None,
+            ),
+        ] {
+            env.delivery_log.record(e).await.expect("record");
+        }
+        let g2 = get().await;
+        assert_eq!(delivered(&g2, rcpts[0]), "yes", "{g2}");
+        assert_eq!(delivered(&g2, rcpts[1]), "queued");
+        assert_eq!(delivered(&g2, rcpts[2]), "queued");
+        assert_ne!(g2["state"], g1["state"]);
+        let c = calls(
+            &env,
+            &env.jmap,
+            json!([["EmailSubmission/changes", {"accountId": acc, "sinceState": g1["state"]}, "c"]]),
+        )
+        .await;
+        assert_eq!(c[0][1]["updated"], json!(["S1"]), "{:?}", c[0]);
+
+        // Отказ с ответом сервера и приём внешним сервером (адрес — без учёта регистра).
+        for e in [
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Relay,
+                DeliveryDecision::Reject,
+                rcpts[1],
+                Some("550 5.1.1 No such user"),
+            ),
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Relay,
+                DeliveryDecision::Accept,
+                "far@external.test",
+                Some("250 2.0.0 OK"),
+            ),
+        ] {
+            env.delivery_log.record(e).await.expect("record");
+        }
+        // Изменение видно и без чтения объекта: `changes` сверяет сам.
+        let c = calls(
+            &env,
+            &env.jmap,
+            json!([["EmailSubmission/changes", {"accountId": acc, "sinceState": g2["state"]}, "c"]]),
+        )
+        .await;
+        assert_eq!(c[0][1]["updated"], json!(["S1"]), "{:?}", c[0]);
+        let g3 = get().await;
+        let status = &g3["list"][0]["deliveryStatus"];
+        assert_eq!(status[rcpts[1]]["delivered"], "no", "{g3}");
+        assert_eq!(status[rcpts[1]]["smtpReply"], "550 5.1.1 No such user");
+        assert_eq!(status[rcpts[2]]["delivered"], "yes");
+        assert_eq!(g3["state"], c[0][1]["newState"]);
+
+        // Все получатели в конечном статусе: журнал больше не читается, состояние не меняется.
+        env.delivery_log
+            .record(event(
+                &env,
+                queue,
+                DeliveryEventKind::Relay,
+                DeliveryDecision::Defer,
+                rcpts[0],
+                None,
+            ))
+            .await
+            .expect("record");
+        let g4 = get().await;
+        assert_eq!(g4["state"], g3["state"]);
+        assert_eq!(delivered(&g4, rcpts[0]), "yes");
+    }
+
+    /// Ждущая срока и отменённая отправки с журналом не сверяются; состояние отправок — в push вместе с папками.
+    #[tokio::test]
+    async fn pending_is_not_tracked_and_push_state() {
+        use tp_contracts::bus::EventKind;
+        use tp_contracts::delivery::DeliveryLog;
+        let env = Env::new().await;
+        let set = send_at(&env, OffsetDateTime::now_utc() + time::Duration::hours(1)).await;
+        let queue = env.outbound.scheduled()[0].queue;
+        env.delivery_log
+            .record(event(
+                &env,
+                queue,
+                DeliveryEventKind::Deliver,
+                DeliveryDecision::Accept,
+                "rcpt@external.test",
+                None,
+            ))
+            .await
+            .expect("record");
+        let state = synced_state(&env.jmap, env.scope).await.expect("state");
+        assert_eq!(set["newState"], state, "отправка ждёт срока — не сверяется");
+        let stored = env.submissions.list(env.scope).await.expect("list");
+        assert_eq!(stored[0].undo_status, UndoStatus::Pending);
+        let kind = EventKind::MailboxChanged {
+            mailbox: env.mailbox(SpecialUse::Sent),
+            modseq: ModSeq(1),
+        };
+        assert!(crate::push::changed_types(&kind).contains(&"EmailSubmission"));
     }
 
     #[test]
