@@ -6,7 +6,11 @@
                     index (письмо с уникальным словом на 25 → находится Email/query text), avail (вход IMAP и сессия
                     JMAP раз в период — переподключение при отказах);
   probes.py idle  — N простаивающих соединений IMAP IDLE на --hold с (память на соединение, отметки — в --events);
-  probes.py count — писем в ящиках всех учётных записей (IMAP STATUS; без Sent, Drafts, Trash) в JSON.
+  probes.py count — писем в ящиках всех учётных записей (IMAP STATUS; без Sent, Drafts, Trash) в JSON (--exclude —
+                    кроме этих: цель перебора может быть заблокирована);
+  probes.py brute — перебор паролей IMAP со второго адреса (--source, решение 56): неверные пароли учётной записи
+                    --target и несуществующие имена; проверки — вход верным паролем со второго адреса и с адреса
+                    генератора (итог — --out-json).
 
 Замеры — строки JSON в --out: {"t": unix, "probe": имя, "ms": задержка, "ok": bool, "accepted": писем принято}.
 Учётные записи — --accounts (login:пароль): нагрузка — <prefix><n>@<домен>, зонды — probe1 … probe3, ящик big.
@@ -378,16 +382,100 @@ def count(a):
         finally:
             close(m)
 
+    skip = set(a.exclude)
     with ThreadPoolExecutor(10) as ex:
-        per = dict(ex.map(one, list(c.accounts)))
+        per = dict(ex.map(one, [x for x in c.accounts if x not in skip]))
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump({"t": time.time(), "total": sum(per.values()), "per": per}, f, sort_keys=True)
     print(sum(per.values()))
 
 
+class SourceIMAP(imaplib.IMAP4_SSL):
+    """IMAP4_SSL с адресом источника (второй адрес генератора)."""
+
+    def __init__(self, host, port, source, **kw):
+        self.source = source
+        super().__init__(host, port, **kw)
+
+    def _create_socket(self, timeout):
+        src = (self.source, 0) if self.source else None
+        sock = socket.create_connection((self.host, self.port), timeout, source_address=src)
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
+def try_login(c, login, pw, source=""):
+    """Вход IMAP: ("ok" | "no" | "conn", текст ответа, мс)."""
+    t0 = time.monotonic()
+    try:
+        m = SourceIMAP(c.a.host, 993, source, ssl_context=c.ssl, timeout=30)
+    except (OSError, imaplib.IMAP4.error) as e:
+        return "conn", str(e)[:200], (time.monotonic() - t0) * 1000
+    try:
+        m.login(login, pw)
+        return "ok", "OK", (time.monotonic() - t0) * 1000
+    except imaplib.IMAP4.error as e:
+        return "no", str(e)[:200], (time.monotonic() - t0) * 1000
+    except OSError as e:
+        return "conn", str(e)[:200], (time.monotonic() - t0) * 1000
+    finally:
+        close(m)
+
+
+def brute(a):
+    """Перебор со второго адреса (Д.6, решение 56): учётная запись, затем адрес.
+
+    1. Исходное состояние: --target входит верным паролем со второго адреса (иначе блокировки прошлого прогона ещё
+       действуют — оценка невозможна).
+    2. Учётная запись: --account-failures + 1 неверных паролей --target со второго адреса → верный пароль --target не
+       пускают ни со второго адреса, ни с адреса генератора (блокировка учётной записи); учётная запись нагрузки
+       --check с адреса генератора входит (генератор не заблокирован).
+    3. Адрес: --ip-failures + 1 неверных входов под несуществующими именами со второго адреса → верный пароль --check
+       со второго адреса не пускают (блокировка адреса), с адреса генератора — пускают.
+    """
+    c = Ctx(a)
+    target, tpw = c.acct(a.target)
+    check, cpw = c.acct(a.check)
+    res = {"source": a.source, "target": target, "check": check, "ip_failures": a.ip_failures,
+           "account_failures": a.account_failures, "attempts": [], "checks": []}
+
+    def attempt(phase, login, pw):
+        out, text, ms = try_login(c, login, pw, a.source)
+        res["attempts"].append({"t": round(time.time(), 3), "phase": phase, "login": login, "result": out,
+                                "text": text, "ms": round(ms, 1)})
+        return out
+
+    def verify(name, login, pw, source, expect):
+        out, text, ms = try_login(c, login, pw, source)
+        res["checks"].append({"t": round(time.time(), 3), "name": name, "login": login, "source": source or "генератор",
+                              "expect": expect, "result": out, "text": text, "ms": round(ms, 1),
+                              "ok": out == expect})
+
+    out, text, _ = try_login(c, target, tpw, a.source)
+    res["baseline"] = {"result": out, "text": text}
+    if out != "ok":
+        res["skipped"] = (f"исходный вход {target} со второго адреса — {out} ({text}): блокировка прошлого прогона "
+                          "(auth.abuse.block_for) или адрес не настроен на генераторе")
+    else:
+        for _ in range(a.account_failures + 1):
+            attempt("account", target, "wrong-" + secrets.token_hex(6))
+        verify("учётная запись: верный пароль со второго адреса", target, tpw, a.source, "no")
+        verify("учётная запись: верный пароль с адреса генератора", target, tpw, "", "no")
+        verify("генератор после блокировки учётной записи", check, cpw, "", "ok")
+        for _ in range(a.ip_failures + 1):
+            attempt("address", f"nobody-{secrets.token_hex(4)}@{a.domain}", "wrong-" + secrets.token_hex(6))
+        verify("адрес: верный пароль другой учётной записи со второго адреса", check, cpw, a.source, "no")
+        verify("генератор после блокировки адреса", check, cpw, "", "ok")
+    res["ok"] = "skipped" not in res and all(x["ok"] for x in res["checks"])
+    with open(a.out_json, "w", encoding="utf-8") as f:
+        json.dump(res, f, ensure_ascii=False, indent=1)
+    for x in res["checks"]:
+        print(f"{x['name']}: {x['result']} (ожидалось {x['expect']})")
+    print(res.get("skipped", f"итог: {'прошёл' if res['ok'] else 'не прошёл'}"))
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["run", "idle", "count"])
+    p.add_argument("mode", choices=["run", "idle", "count", "brute"])
     p.add_argument("--accounts", required=True)
     p.add_argument("--host", required=True)
     p.add_argument("--domain", required=True)
@@ -402,8 +490,14 @@ def main():
     p.add_argument("--events", default="")
     p.add_argument("-n", type=int, default=100)
     p.add_argument("--hold", type=int, default=60)
+    p.add_argument("--exclude", action="append", default=[])
+    p.add_argument("--source", default="")
+    p.add_argument("--target", default="brute")
+    p.add_argument("--check", default="")
+    p.add_argument("--ip-failures", type=int, default=10)
+    p.add_argument("--account-failures", type=int, default=20)
     a = p.parse_args()
-    {"run": run, "idle": idle, "count": count}[a.mode](a)
+    {"run": run, "idle": idle, "count": count, "brute": brute}[a.mode](a)
 
 
 if __name__ == "__main__":
