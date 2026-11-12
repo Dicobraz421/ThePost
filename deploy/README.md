@@ -106,7 +106,8 @@ cargo nextest run -p <крейты> --no-tests=pass
 
 ## Эталон SMB в контейнерах (профиль smb)
 `thepost` (`roles: [all]`, локальный BLOB, шина в процессе) + PostgreSQL (TLS, `sslmode=verify-full`, CA из тома `tls`)
-+ OpenBao (TLS, Raft, автоматическое распечатывание) + Rspamd; конфигурация — `compose/thepost-smb.yaml`.
++ OpenBao (TLS, Raft, автоматическое распечатывание) + Rspamd; конфигурация — пресет `config/all.yaml` и значения
+установки в переменных `THEPOST_*` (`compose/dev.yml`, служба `thepost`; см. «Одна конфигурация SMB»).
 `thepost` подключается к PostgreSQL ролью `thepost` (член `thepost_app`, не владелец схемы), миграции — от владельца
 схемы `thepost_owner` (`database.owner`); пароли берёт из OpenBao (`thepost/db`, `thepost/db-owner`), в OpenBao входит
 по AppRole (том `openbao-approle` → `/etc/thepost/openbao`). Контейнер — nonroot 65532, `cap_drop: [ALL]`,
@@ -134,6 +135,27 @@ curl --cacert $CA -si https://localhost/.well-known/jmap | head -1              
 Письмо между двумя пользователями: учётные записи `a@example.test`, `b@example.test` (способ — issue #193), отправка
 через 587 с AUTH, получение через IMAP или JMAP — шаги в `docs/manual-tests/CMP-01.md` (после CMP-04, CMP-05).
 
+## Одна конфигурация SMB (решение 105)
+Конфигурация эталона SMB — только пресет `deploy/config/all.yaml`: роли, хранилище, сертификат, слушатели, секреты.
+Compose и Ansible его не копируют, а подставляют значения своей установки — секции у них одинаковые:
+
+| Параметр | Пресет | Compose (`THEPOST_*`) | Ansible (инвентарь) |
+|---|---|---|---|
+| `domain` | `example.ru` | `example.test` | `thepost_domain` |
+| `database.url` | `localhost`, CA `/etc/thepost/pki` | `postgres-tls`, CA тома `tls` | `thepost_db_url` (+ `thepost_db_urls`) |
+| `database.owner.user` | `thepost_owner` | — | `thepost_db_owner_role` |
+| `smtp.hostname` | `mail.example.ru` | `mail.example.test` | `thepost_hostname` |
+| `smtp.milter` | — | — | `thepost_rspamd_milter_address`, `thepost_clamav` |
+| `http.admin.listen` | `127.0.0.1:8443` | — | `thepost_admin_listen` |
+| `secrets.url`, `secrets.tls.ca_file` | `localhost:8200`, `/etc/thepost/pki` | `openbao-tls:8200`, том `tls` | `thepost_secrets_url`, `thepost_internal_ca_file` |
+| `secrets.auth.approle` | `role_id` — `/etc/thepost/openbao`, `secret_id` — учётные данные systemd | `secret_id` — том `openbao-approle` | `thepost_secrets_role_id_file` |
+| `tls`, `acme` | `/etc/thepost/tls` | том `tls` | `thepost_tls_mode` |
+| `blob.gc.window` | по умолчанию | — | `thepost_blob_gc_window` |
+
+Остальное (слушатели 25, 465, 587, 143, 993, 443, роли, BLOB) — из пресета без изменений; новый параметр эталона
+добавляется в пресет, а не в compose или шаблон роли. Проверка пресета — `thepost config check --config
+deploy/config/all.yaml`.
+
 ## Эталон SMB одной командой (Ansible)
 Чистая ВМ → PostgreSQL 16 (PGDG), OpenBao, Rspamd (clamav-milter — `thepost_clamav: true`) и `thepost` (все роли) под
 systemd (SRS 1.2, 5.6). ОС (решения 2026-11-11 №28, 51, 52; семейство — по менеджеру пакетов):
@@ -152,7 +174,8 @@ ansible-playbook -i inventory.yml deploy/ansible/smb.yml
 loopback) → OpenBao (`https://localhost:8200`, пароли `thepost/db`, `thepost/db-owner`, `thepost/db-readonly`, AppRole)
 → PostgreSQL (`hostssl` только для учётных записей The Post, без SUPERUSER и BYPASSRLS; `postgres` запускается
 юнитом напрямую, без `pg_ctlcluster` на Perl) → Rspamd (Milter `127.0.0.1:11332`) → clamav-milter (`127.0.0.1:7357`) →
-`thepost` (sysusers, юнит и сокеты, `config.yaml` из шаблона с проверкой `thepost config check`, ожидание
+`thepost` (sysusers, юнит и сокеты, `config.yaml` — пресет `deploy/config/all.yaml` со значениями инвентаря, с
+проверкой `thepost config check`, ожидание
 `/healthz/ready`). Порты ниже 1024 — только сокеты systemd (`thepost-*.socket`, решение 102), у процесса нет
 capabilities.
 Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
@@ -208,7 +231,7 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 ```bash
 sudo install -m 0755 target/release/thepost /usr/local/bin/thepost
 sudo install -m 0644 deploy/systemd/thepost.sysusers.conf /usr/lib/sysusers.d/thepost.conf && sudo systemd-sysusers
-sudo install -D -m 0640 -o root -g thepost deploy/config/all.yaml /etc/thepost/config.yaml   # задать domain, database.url
+sudo install -D -m 0640 -o root -g thepost deploy/config/all.yaml /etc/thepost/config.yaml   # domain, smtp.hostname, адреса
 sudo install -m 0644 deploy/systemd/thepost.service deploy/systemd/thepost-*.socket /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/thepost.service /etc/systemd/system/thepost-*.socket
 # Порты ниже 1024 — только сокеты systemd (у процесса нет capabilities, решение 102):

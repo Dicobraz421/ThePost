@@ -1,5 +1,6 @@
 # Роль thepost: бинарный файл, пользователь, юнит systemd, config.yaml и сертификат клиентских протоколов
-# (эталон SMB, SRS 1.2, 5.6). Юнит и sysusers — deploy/systemd; пример конфигурации — deploy/config/all.yaml.
+# (эталон SMB, SRS 1.2, 5.6). Юнит и sysusers — deploy/systemd; config.yaml — пресет deploy/config/all.yaml
+# (единственная конфигурация SMB, решение 105) со значениями ниже.
 ---
 # Основной домен и имя узла (SMTP banner/HELO, сертификат клиентских протоколов). Локальные домены SMTP — принятые
 # домены организации в БД (решение 96): `thepost admin init` заводит домен адреса администратора, другие —
@@ -40,11 +41,9 @@ thepost_db_failover: {}
 thepost_secrets_url: "{{ openbao_api_addr | default('https://localhost:8200') }}"
 thepost_secrets_role_id_file: "{{ openbao_thepost_role_id_file | default('/etc/thepost/openbao/role_id') }}"
 
-# Слушатели клиентских протоколов (адрес без порта). С активацией сокетов — 0.0.0.0 или [::]: сокеты systemd
-# слушают все адреса (ListenStream=<порт>); другой адрес — и в drop-in юнитов thepost-*.socket.
-thepost_listen_address: "0.0.0.0"
 # Порты ниже 1024 (25, 465, 587, 143, 993, 443) слушает только systemd (юниты thepost-*.socket, решение 102) — у
-# процесса нет capabilities (SRS 2.7, DEP-08).
+# процесса нет capabilities (SRS 2.7, DEP-08). Слушатели — из пресета (0.0.0.0:<порт>); другой адрес — drop-in юнита
+# сокета (ListenStream=) и тот же адрес в thepost_config_extra.
 thepost_sockets: [smtp, submissions, submission, imap, imaps, https]
 # Admin API — только внутренний адрес (SRS 6.8): loopback, частные сети.
 thepost_admin_listen: "127.0.0.1:8443"
