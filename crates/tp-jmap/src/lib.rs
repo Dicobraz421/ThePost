@@ -13,6 +13,7 @@
 //! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`
 //!   (подпись профиля ключом TLS — [`ProfileSigner`], [`Jmap::with_profile_signer`]);
 //! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
+//! - `contacts` — AddressBook/get, changes, set (RFC 9610) поверх `DavStore`, [`Jmap::with_dav`];
 //! - `sieve` — SieveScript/get, set, query, validate (RFC 9661) поверх `SieveStore` и проверки `tp_sieve`;
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
@@ -20,6 +21,7 @@
 
 mod autoconfig;
 mod blob;
+mod contacts;
 pub mod core;
 mod email_get;
 mod email_query;
@@ -41,7 +43,7 @@ pub use crate::autoconfig::sign::{ProfileSigner, SignatureAlgorithm, SigningKey}
 pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
 
 use crate::core::error::MethodResult;
-use crate::core::{CORE, Ctx, MAIL, SETTINGS, SIEVE, SUBMISSION, VACATION};
+use crate::core::{CONTACTS, CORE, Ctx, MAIL, SETTINGS, SIEVE, SUBMISSION, VACATION};
 
 /// Встроенные методы и их capability.
 pub(crate) const METHODS: &[(&str, &str)] = &[
@@ -76,6 +78,9 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("SieveScript/set", SIEVE),
     ("SieveScript/query", SIEVE),
     ("SieveScript/validate", SIEVE),
+    ("AddressBook/get", CONTACTS),
+    ("AddressBook/changes", CONTACTS),
+    ("AddressBook/set", CONTACTS),
 ];
 
 /// Варианты сортировки `Email/query` (сессия, `emailQuerySortOptions`).
@@ -119,6 +124,9 @@ pub(crate) async fn call_builtin(
         "SieveScript/set" => sieve::set(ctx, args).await,
         "SieveScript/query" => sieve::query(ctx, args).await,
         "SieveScript/validate" => sieve::validate(ctx, args).await,
+        "AddressBook/get" => contacts::get(ctx, args).await,
+        "AddressBook/changes" => contacts::changes(ctx, args).await,
+        "AddressBook/set" => contacts::set(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
 }

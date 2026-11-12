@@ -57,7 +57,7 @@ const EVERY_TYPE: &[&str] = &[
 ];
 
 /// Типы данных, которые меняет уведомление шины.
-fn changed_types(kind: &EventKind) -> &'static [&'static str] {
+pub(crate) fn changed_types(kind: &EventKind) -> &'static [&'static str] {
     match kind {
         EventKind::MailboxChanged { .. } => &["Email", "Thread", "Mailbox"],
         EventKind::MailboxListChanged => &["Mailbox"],

@@ -301,6 +301,7 @@ impl Jmap {
     fn optional_enabled(&self, uri: &str) -> bool {
         match uri {
             VACATION | SIEVE => self.sieve.is_some(),
+            CONTACTS => self.dav.is_some(),
             _ => false,
         }
     }
@@ -388,6 +389,11 @@ impl Jmap {
                 crate::sieve::account_capability(sieve.limits()),
             );
             primary.insert(SIEVE.into(), json!(account));
+        }
+        if self.dav.is_some() {
+            caps.insert(CONTACTS.into(), json!({}));
+            account_caps.insert(CONTACTS.into(), crate::contacts::account_capability());
+            primary.insert(CONTACTS.into(), json!(account));
         }
         for cap in &self.d.capabilities {
             caps.insert(cap.uri().into(), cap.session_object());
