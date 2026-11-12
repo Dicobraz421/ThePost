@@ -1,0 +1,46 @@
+---
+source: crates/tp-dav/src/tests/card_versions.rs
+expression: r.show()
+---
+207 Multi-Status
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/contacts/group.vcf</d:href>
+<d:propstat>
+<d:prop>
+<d:getetag>"2"</d:getetag>
+<card:address-data>BEGIN:VCARD&#13;
+VERSION:3.0&#13;
+X-ADDRESSBOOKSERVER-KIND:group&#13;
+FN;CHARSET=UTF-8:Проект&#13;
+X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:c-ivan&#13;
+X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:c-maria&#13;
+UID:g-proj&#13;
+N;CHARSET=UTF-8:Проект;;;;&#13;
+END:VCARD&#13;
+</card:address-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/contacts/sales.vcf</d:href>
+<d:propstat>
+<d:prop>
+<d:getetag>"3"</d:getetag>
+<card:address-data>BEGIN:VCARD&#13;
+VERSION:3.0&#13;
+N:Отдел продаж;;;;&#13;
+FN:Отдел продаж&#13;
+X-ADDRESSBOOKSERVER-KIND:group&#13;
+X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:c-ivan&#13;
+X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:c-maria&#13;
+UID:g-sales&#13;
+END:VCARD&#13;
+</card:address-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+</d:multistatus>

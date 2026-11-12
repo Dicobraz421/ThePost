@@ -1,0 +1,89 @@
+# Веб-консоль (CI-06, SRS 5.2): сборка console/dist для вшивания в бинарный файл (DEPS-05, фича `console` tp-admin).
+# Одна версия Node и один порядок шагов на PR (ci.yml, job console), выпуск (ci.yml, release) и бету (beta.yml).
+# Без console/package-lock.json шаги пропускаются, `cargo-args` пустой — сборка без консоли.
+# checks: 'true' — перед сборкой проверка типов, линтер, vitest, npm audit по боевым зависимостям
+# и лицензии боевых зависимостей по списку [licenses] allow из deny.toml (licensee, SPDX-выражения).
+name: console
+description: Сборка console/dist (и проверки на PR)
+
+inputs:
+  checks:
+    description: Проверки перед сборкой (PR)
+    default: 'false'
+  node-version:
+    description: Версия Node (LTS)
+    default: '26'
+
+outputs:
+  cargo-args:
+    description: Аргументы cargo build для консоли (`--features tp-admin/console` или пусто)
+    value: ${{ steps.args.outputs.args }}
+
+runs:
+  using: composite
+  steps:
+    - id: has
+      shell: bash
+      run: |
+        if [ -f console/package-lock.json ]; then
+          echo yes=true >> "$GITHUB_OUTPUT"
+        else
+          echo "console/package-lock.json нет — консоль не собирается"
+          echo yes=false >> "$GITHUB_OUTPUT"
+        fi
+    - if: steps.has.outputs.yes == 'true'
+      uses: actions/setup-node@v7.1.0
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: console/package-lock.json
+    - if: steps.has.outputs.yes == 'true'
+      shell: bash
+      working-directory: console
+      run: npm ci --no-fund --no-audit
+    - if: steps.has.outputs.yes == 'true' && inputs.checks == 'true'
+      name: Типы, линтер, vitest
+      shell: bash
+      working-directory: console
+      run: |
+        npm run typecheck
+        npm run lint
+        npm test
+    - if: steps.has.outputs.yes == 'true' && inputs.checks == 'true'
+      name: npm audit (боевые зависимости)
+      shell: bash
+      working-directory: console
+      run: npm audit --omit=dev
+    - if: steps.has.outputs.yes == 'true' && inputs.checks == 'true'
+      name: Лицензии по deny.toml
+      shell: bash
+      working-directory: console
+      run: |
+        # Конфиг licensee — только из deny.toml (не в репозитории); CLI licensee 12 флаг --licenses не читает.
+        python3 - <<'EOF'
+        import json, tomllib
+        allow = tomllib.load(open("../deny.toml", "rb"))["licenses"]["allow"]
+        json.dump({"licenses": {"spdx": allow}, "corrections": True}, open(".licensee.json", "w"))
+        print("разрешены:", ", ".join(allow))
+        EOF
+        npx --yes licensee@12.0.2 --production --errors-only
+        rm .licensee.json
+    - if: steps.has.outputs.yes == 'true'
+      shell: bash
+      working-directory: console
+      run: |
+        npm run build
+        test -f dist/index.html || { echo "::error::npm run build не создал console/dist/index.html"; exit 1; }
+    - id: args
+      shell: bash
+      run: |
+        args=
+        if [ "${{ steps.has.outputs.yes }}" = true ]; then
+          if grep -qE '^console[[:space:]]*=' crates/tp-admin/Cargo.toml; then
+            args="--features tp-admin/console"
+          else
+            echo "::notice::console/dist собран, но фичи console у tp-admin нет (DEPS-05) — бинарный файл без консоли"
+          fi
+        fi
+        echo "cargo: ${args:-без консоли}"
+        echo "args=$args" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,48 @@
+{
+  "name": "thepost-console",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "UNLICENSED",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "gen:api": "node scripts/gen-api.mjs"
+  },
+  "dependencies": {
+    "@refinedev/antd": "^6.0.3",
+    "@refinedev/core": "^5.0.12",
+    "@refinedev/react-router": "^2.0.4",
+    "@tanstack/react-query": "^5.107.1",
+    "antd": "^5.29.3",
+    "dayjs": "^1.11.23",
+    "oidc-client-ts": "^3.5.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router": "^7.18.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "eslint": "^10.14.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.14.0",
+    "jsdom": "^31.0.0",
+    "openapi-typescript": "^7.13.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.2",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  },
+  "overrides": {
+    "path-to-regexp": "^\n8.4.2"
+  }
+}

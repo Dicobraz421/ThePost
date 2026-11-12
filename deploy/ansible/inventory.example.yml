@@ -27,3 +27,7 @@ all:
         # thepost_backup_s3_bucket: thepost-backup
         # thepost_backup_repo_path: /pgbackrest
         # thepost_backup_restic_repo: s3:https://s3.example.ru/thepost-backup/blob
+        # Снимок OpenBao (DEP-23) — после каждой копии базы, в то же хранилище (restic; вход — AppRole из OpenBao,
+        # токена здесь нет). Восстановить на новой ВМ — restore.yml -e thepost_restore_openbao=true: нужны
+        # openbao-init.json и /etc/openbao/unseal.key прежнего сервера — храните их вне сервера.
+        thepost_backup_openbao: true

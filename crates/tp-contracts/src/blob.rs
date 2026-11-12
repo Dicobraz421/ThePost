@@ -62,7 +62,7 @@
 //!     data: Bytes,
 //!     refs: u32,
 //! ) -> Result<BlobKey> {
-//!     let mut generation = match index.acquire(tenant, &hash, refs).await? {
+//!     let mut generation = match index.acquire(tenant, None, &hash, refs).await? {
 //!         Acquire::Existing { generation } => return Ok(BlobKey { tenant, hash, generation }),
 //!         Acquire::Absent { generation } => generation,
 //!     };
@@ -104,7 +104,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
-use crate::ids::{BlobHash, BlobKey, Gen, TenantId};
+use crate::ids::{AccountId, BlobHash, BlobKey, Gen, TenantId};
 use crate::meta::AccountScope;
 
 /// Поток байтов объекта.
@@ -256,7 +256,18 @@ pub enum Commit {
 #[async_trait]
 pub trait BlobIndex: Send + Sync + 'static {
     /// Шаг 2 записи: добавить `refs` ссылок к записи `live` или выдать поколение для загрузки.
-    async fn acquire(&self, tenant: TenantId, hash: &BlobHash, refs: u32) -> Result<Acquire>;
+    ///
+    /// `owner` — учётная запись организации `tenant`, для ящика (или отправки) которой берутся ссылки (CTR-49,
+    /// решение 46): хранилище с шардами выбирает по ней шард учёта; `None` — владельца нет или ссылки на ящики
+    /// нескольких учётных записей (доставка нескольким получателям, загрузка без учётной записи) — шард по выбору
+    /// хранилища. Хранилище без шардов `owner` не использует; существование учётной записи не проверяется.
+    async fn acquire(
+        &self,
+        tenant: TenantId,
+        owner: Option<AccountId>,
+        hash: &BlobHash,
+        refs: u32,
+    ) -> Result<Acquire>;
 
     /// Шаг 3 записи: после загрузки объекта `hash/generation` размером `size` создать запись `live`
     /// с `refs` ссылками. Объект не сжат — то же, что [`BlobIndex::commit_new_with`] с [`Compression::None`].
@@ -419,7 +430,13 @@ mod tests {
 
     #[async_trait]
     impl BlobIndex for Plain {
-        async fn acquire(&self, _: TenantId, _: &BlobHash, _: u32) -> Result<Acquire> {
+        async fn acquire(
+            &self,
+            _: TenantId,
+            _: Option<AccountId>,
+            _: &BlobHash,
+            _: u32,
+        ) -> Result<Acquire> {
             Ok(Acquire::Absent { generation: Gen(1) })
         }
         async fn commit_new(
@@ -484,7 +501,13 @@ mod tests {
 
     #[async_trait]
     impl BlobIndex for Zeros {
-        async fn acquire(&self, _: TenantId, _: &BlobHash, _: u32) -> Result<Acquire> {
+        async fn acquire(
+            &self,
+            _: TenantId,
+            _: Option<AccountId>,
+            _: &BlobHash,
+            _: u32,
+        ) -> Result<Acquire> {
             Err(Error::NotFound)
         }
         async fn commit_new(

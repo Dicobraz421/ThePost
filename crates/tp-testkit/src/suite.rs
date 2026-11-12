@@ -54,8 +54,8 @@ use tp_contracts::groups::{
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountState, AccountStore, AccountUpsert, MailboxStore, MessageQuery,
-    MessageStore, NewMailbox, NewMessage, PolicyResolver, SpecialUse,
+    Account, AccountScope, AccountState, AccountStore, AccountUpsert, ExistingContent,
+    MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, PolicyResolver, SpecialUse,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -288,12 +288,16 @@ pub async fn membership_info(m: &dyn Membership, ttl: Duration, wait: &dyn Wait)
     assert!(ours().await.is_empty(), "запись a истекла");
 }
 
-// ---------- Календари и контакты, Sieve (CTR-45, CTR-46) ----------
+// ---------- Календари и контакты, планирование встреч, Sieve (CTR-45…47) ----------
 
 pub mod dav;
+pub mod freebusy;
+pub mod itip;
 pub mod sieve;
 
 pub use dav::dav;
+pub use freebusy::freebusy;
+pub use itip::itip;
 pub use sieve::sieve;
 
 // ---------- EventBus: сигналы ----------
@@ -307,8 +311,8 @@ async fn next_signal(stream: &mut EventStream) -> Option<Event> {
         .expect("сигнал не пришёл")
 }
 
-/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37, CTR-39): `LogAppended`, `MembersChanged`, `Blocked`,
-/// `Unblocked`, `TrashChanged` приходят
+/// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37, CTR-39, CTR-49): `LogAppended`, `MembersChanged`,
+/// `ShardsChanged`, `Blocked`, `Unblocked`, `TrashChanged` приходят
 /// в `subscribe_system()` и не приходят подписке учётной записи; `publish(Resync)` — `Invalid`.
 /// «Не пришло» проверяется тем, что первым пришёл сигнал, опубликованный позже.
 pub async fn signals(bus: &dyn EventBus) {
@@ -331,6 +335,7 @@ pub async fn signals(bus: &dyn EventBus) {
             },
         ),
         system(TenantId::DEFAULT, EventKind::MembersChanged),
+        system(TenantId::DEFAULT, EventKind::ShardsChanged),
         system(
             scope.tenant,
             EventKind::Blocked {
@@ -1627,11 +1632,14 @@ pub async fn submission_store(
 /// чужие записи учёта не мешают.
 pub async fn blob_compression(index: &dyn BlobIndex, tenant: TenantId) {
     let fresh = fresh_hash;
-    let absent =
-        async |hash: &BlobHash| match index.acquire(tenant, hash, 1).await.expect("acquire") {
-            Acquire::Absent { generation } => generation,
-            other => panic!("ожидался Absent: {other:?}"),
-        };
+    let absent = async |hash: &BlobHash| match index
+        .acquire(tenant, None, hash, 1)
+        .await
+        .expect("acquire")
+    {
+        Acquire::Absent { generation } => generation,
+        other => panic!("ожидался Absent: {other:?}"),
+    };
     let done = |c: Commit| match c {
         Commit::Done { generation } => generation,
         other => panic!("ожидался Done: {other:?}"),
@@ -1657,7 +1665,7 @@ pub async fn blob_compression(index: &dyn BlobIndex, tenant: TenantId) {
         Ok(Some(Compression::Zstd))
     );
     assert!(matches!(
-        index.acquire(tenant, &zstd, 1).await,
+        index.acquire(tenant, None, &zstd, 1).await,
         Ok(Acquire::Existing { generation }) if generation == g
     ));
     assert_eq!(
@@ -1711,7 +1719,11 @@ pub async fn blob_gc_due(index: &dyn BlobIndex, tenant: TenantId) {
     const W: Duration = Duration::from_secs(3600);
     let w = time::Duration::HOUR;
     let hash = fresh_hash();
-    let generation = match index.acquire(tenant, &hash, 1).await.expect("acquire") {
+    let generation = match index
+        .acquire(tenant, None, &hash, 1)
+        .await
+        .expect("acquire")
+    {
         Acquire::Absent { generation } => generation,
         other => panic!("ожидался Absent: {other:?}"),
     };
@@ -3120,19 +3132,22 @@ pub async fn queue_postpone(queue: &dyn QueueStore, tenant: TenantId) {
     let sec = time::Duration::seconds;
     let lease = Duration::from_secs(30);
     let id = queue
-        .enqueue(OutMessage {
-            tenant,
-            blob: BlobKey {
+        .enqueue(
+            None,
+            OutMessage {
                 tenant,
-                hash: fresh_hash(),
-                generation: Gen::INITIAL,
+                blob: BlobKey {
+                    tenant,
+                    hash: fresh_hash(),
+                    generation: Gen::INITIAL,
+                },
+                size: 100,
+                from: "a@example.org".into(),
+                dsn: DsnParams::default(),
+                rcpts: vec![OutRcpt::new("b@example.net"), OutRcpt::new("c@example.net")],
+                next_attempt: t0,
             },
-            size: 100,
-            from: "a@example.org".into(),
-            dsn: DsnParams::default(),
-            rcpts: vec![OutRcpt::new("b@example.net"), OutRcpt::new("c@example.net")],
-            next_attempt: t0,
-        })
+        )
         .await
         .expect("enqueue");
     let claim_own = async |now: OffsetDateTime| {
@@ -3969,9 +3984,10 @@ pub struct AccountStateFixture {
     pub domain_name: String,
 }
 
-/// Набор проверок состояния ящика `AccountStore` (CTR-35): отключение со сроком (`upsert` его не снимает), списки
-/// отключённых и истёкших, восстановление, подключение к другой учётной записи (письма сохраняются, запись `to`
-/// удаляется), окончательное удаление отключённого без писем.
+/// Набор проверок состояния ящика `AccountStore` (CTR-35, CTR-50): отключение со сроком (`upsert` его не снимает),
+/// списки отключённых и истёкших, восстановление, подключение к другой учётной записи (письма сохраняются, запись `to`
+/// удаляется; письма ящика `to` — по режиму `ExistingContent`, без режима — `Invalid`), окончательное удаление
+/// отключённого без писем.
 pub async fn account_state(
     accounts: &dyn AccountStore,
     mailboxes: &dyn MailboxStore,
@@ -4059,7 +4075,7 @@ pub async fn account_state(
     let kept = put_message(messages, scope(a.id), inbox, 10).await;
     let to = accounts.upsert(t, upsert("successor")).await.expect("to");
     assert!(matches!(
-        accounts.attach_account(t, a.id, to.id).await,
+        accounts.attach_account(t, a.id, to.id, None).await,
         Err(Error::Invalid(_))
     ));
     accounts
@@ -4067,7 +4083,7 @@ pub async fn account_state(
         .await
         .expect("disable a");
     let attached = accounts
-        .attach_account(t, a.id, to.id)
+        .attach_account(t, a.id, to.id, None)
         .await
         .expect("attach");
     assert_eq!(
@@ -4093,22 +4109,133 @@ pub async fn account_state(
             .is_some()
     );
 
-    // В ящике `to` есть письма — Conflict; нет записи — NotFound.
+    // В ящике `to` есть письма: без режима — Invalid (подсказка); `to` отключена — Conflict; нет записи — NotFound.
     let b = accounts.upsert(t, upsert("other")).await.expect("b");
     let busy = accounts.upsert(t, upsert("busy")).await.expect("busy");
     let busy_inbox = role_folder(mailboxes, scope(busy.id), SpecialUse::Inbox).await;
-    put_message(messages, scope(busy.id), busy_inbox, 10).await;
+    let busy_msg = put_message(messages, scope(busy.id), busy_inbox, 10).await;
     accounts
         .disable_account(t, b.id, until)
         .await
         .expect("disable b");
+    assert!(matches!(
+        accounts.attach_account(t, b.id, busy.id, None).await,
+        Err(Error::Invalid(_))
+    ));
+    let gone = accounts.upsert(t, upsert("gone")).await.expect("gone");
+    accounts
+        .disable_account(t, gone.id, until)
+        .await
+        .expect("disable gone");
     assert_eq!(
-        accounts.attach_account(t, b.id, busy.id).await,
+        accounts
+            .attach_account(t, b.id, gone.id, Some(ExistingContent::Keep))
+            .await,
         Err(Error::Conflict)
     );
     assert_eq!(
-        accounts.attach_account(t, b.id, AccountId::new()).await,
+        accounts
+            .attach_account(t, b.id, AccountId::new(), Some(ExistingContent::Keep))
+            .await,
         Err(Error::NotFound)
+    );
+
+    // «Оставить»: письма системной папки — в папку с той же ролью, папка с занятым именем — с суффиксом.
+    let folder = |parent| NewMailbox {
+        parent,
+        name: "Projects".to_owned(),
+        role: None,
+    };
+    let own = mailboxes
+        .create(scope(b.id), folder(None))
+        .await
+        .expect("own folder");
+    let theirs = mailboxes
+        .create(scope(busy.id), folder(None))
+        .await
+        .expect("their folder");
+    let nested = mailboxes
+        .create(scope(busy.id), folder(Some(theirs.id)))
+        .await
+        .expect("nested folder");
+    let project_msg = put_message(messages, scope(busy.id), nested.id, 20).await;
+    let attached = accounts
+        .attach_account(t, b.id, busy.id, Some(ExistingContent::Keep))
+        .await
+        .expect("attach keep");
+    assert_eq!(
+        (attached.id, attached.login.as_str()),
+        (b.id, busy.login.as_str())
+    );
+    assert_eq!(accounts.get(t, busy.id).await.expect("busy gone"), None);
+    let b_inbox = role_folder(mailboxes, scope(b.id), SpecialUse::Inbox).await;
+    let moved = messages
+        .get(scope(b.id), busy_msg)
+        .await
+        .expect("get")
+        .expect("inbox message kept");
+    assert_eq!(moved.mailbox, b_inbox);
+    let listed = mailboxes.list(scope(b.id)).await.expect("list b");
+    let renamed = listed
+        .iter()
+        .find(|m| m.parent.is_none() && m.name == "Projects 1")
+        .expect("moved folder with suffix");
+    assert!(
+        listed
+            .iter()
+            .any(|m| m.id == own.id && m.name == "Projects")
+    );
+    let moved_nested = listed
+        .iter()
+        .find(|m| m.parent == Some(renamed.id) && m.name == "Projects")
+        .expect("nested folder moved");
+    let moved = messages
+        .get(scope(b.id), project_msg)
+        .await
+        .expect("get")
+        .expect("folder message kept");
+    assert_eq!(moved.mailbox, moved_nested.id);
+    assert_eq!(
+        mailboxes
+            .status(scope(b.id), moved_nested.id)
+            .await
+            .expect("status")
+            .messages,
+        1
+    );
+    assert_eq!(accounts.quota(t, b.id).await.expect("quota").messages, 2);
+
+    // «Удалить»: письма ящика `to` — в корзину подключаемого ящика, папки не переносятся.
+    let c = accounts.upsert(t, upsert("third")).await.expect("c");
+    let d = accounts.upsert(t, upsert("fourth")).await.expect("d");
+    let d_inbox = role_folder(mailboxes, scope(d.id), SpecialUse::Inbox).await;
+    let d_msg = put_message(messages, scope(d.id), d_inbox, 10).await;
+    mailboxes
+        .create(scope(d.id), folder(None))
+        .await
+        .expect("d folder");
+    accounts
+        .disable_account(t, c.id, until)
+        .await
+        .expect("disable c");
+    accounts
+        .attach_account(t, c.id, d.id, Some(ExistingContent::Delete))
+        .await
+        .expect("attach delete");
+    let c_trash = role_folder(mailboxes, scope(c.id), SpecialUse::Trash).await;
+    let trashed = messages
+        .get(scope(c.id), d_msg)
+        .await
+        .expect("get")
+        .expect("message in trash");
+    assert_eq!(trashed.mailbox, c_trash);
+    assert!(
+        !mailboxes
+            .list(scope(c.id))
+            .await
+            .expect("list c")
+            .iter()
+            .any(|m| m.name == "Projects")
     );
 
     // Окончательное удаление: только отключённый и без писем.
@@ -4124,10 +4251,13 @@ pub async fn account_state(
         accounts.remove_disabled(t, a.id).await,
         Err(Error::Conflict)
     );
-    accounts.remove_disabled(t, b.id).await.expect("remove b");
-    assert_eq!(accounts.get(t, b.id).await.expect("b gone"), None);
+    accounts
+        .remove_disabled(t, gone.id)
+        .await
+        .expect("remove gone");
+    assert_eq!(accounts.get(t, gone.id).await.expect("gone removed"), None);
     assert_eq!(
-        accounts.remove_disabled(t, b.id).await,
+        accounts.remove_disabled(t, gone.id).await,
         Err(Error::NotFound)
     );
 }
@@ -4163,7 +4293,7 @@ pub async fn queue_release(queue: &dyn QueueStore, tenant: TenantId) {
     let delayed = message(t0 + sec(3600));
     let blob = delayed.blob;
     assert_eq!(delayed.release_at(), t0 + sec(3600));
-    let id = queue.enqueue(delayed).await.expect("enqueue delayed");
+    let id = queue.enqueue(None, delayed).await.expect("enqueue delayed");
     assert!(claim_own(id, t0).await.is_none(), "not released yet");
     assert_eq!(
         queue.cancel_queued(TenantId::new(), id).await,
@@ -4173,7 +4303,10 @@ pub async fn queue_release(queue: &dyn QueueStore, tenant: TenantId) {
     assert_eq!(queue.cancel_queued(tenant, id).await, Err(Error::NotFound));
     assert!(claim_own(id, t0 + sec(7200)).await.is_none(), "canceled");
 
-    let id = queue.enqueue(message(t0 + sec(60))).await.expect("enqueue");
+    let id = queue
+        .enqueue(None, message(t0 + sec(60)))
+        .await
+        .expect("enqueue");
     let c = claim_own(id, t0 + sec(60)).await.expect("released");
     assert!(c.queued_at >= t0 + sec(60), "queued_at from release");
     assert_eq!(queue.cancel_queued(tenant, id).await, Err(Error::Conflict));

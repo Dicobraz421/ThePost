@@ -3,13 +3,20 @@
 //! [`crate::Delivery::with_rules`] подключает точку правил [`tp_contracts::sieve::DeliveryRules`] (`tp-sieve`): для
 //! каждого локального получателя — после правил потока и до `MailStore::ingest` — правила выбирают папки и флаги
 //! (`keep`, `fileinto`, `:create`, `:flags`; несколько папок — несколько доставок одного `ingest`), отбрасывают
-//! письмо (`discard`), перенаправляют его (`redirect`: локальные адреса — в ящики, как пересылки модулей; внешние —
-//! в очередь с SRS и ARC, [`crate::forward`]) и решают автоответ. Сбой правил — доставка во «Входящие» и запись в
-//! журналы. Решение правил (папки, перенаправление, отброс, ошибки) пишется в журнал доставки без содержимого письма.
-//! Получатели перенаправления писем правилам не передаются (защита от петель).
+//! письмо (`discard`), перенаправляют его (`redirect`: внешние адреса — в очередь с SRS и ARC, [`crate::forward`])
+//! и решают автоответ. Сбой правил — доставка во «Входящие» и запись в журналы. Решение правил (папки,
+//! перенаправление, отброс, ошибки) пишется в журнал доставки без содержимого письма.
+//!
+//! Письмо, перенаправленное правилом локальному адресу, и внутренний автоответ доставляются как любое письмо —
+//! через правила получателя (решение 61, SMTP-34). Петля: каждое перенаправление добавляет письму служебный
+//! заголовок [`CHAIN_HEADER`] с меткой ящика, правила которого его перенаправили ([`chain_token`]); заголовки
+//! письма — цепочка обработанных ящиков, их число — счётчик. Ящик, уже бывший в цепочке, счётчик больше
+//! `delivery.redirect_hops` и больше `delivery.redirect_total` перенаправлений одного письма — правила не
+//! применяются, письмо остаётся во «Входящих», запись в журнал доставки. Заголовок уходит и наружу: петля через
+//! внешний сервер обрывается так же.
 //!
 //! Автоответ ([`build_reply`], RFC 3834) — конверт `MAIL FROM:<>`, `Auto-Submitted: auto-replied`, `In-Reply-To`,
-//! `References`: внешнему адресату — в очередь исходящей почты, локальному — сразу во «Входящие» (без правил).
+//! `References`: внешнему адресату — в очередь исходящей почты, локальному — через его правила.
 //! Ответ не отправляется ([`suppressed`]) на уведомления (пустой отправитель), автоматические письма
 //! (`Auto-Submitted` не `no`), письма списков рассылки (`List-*`, `Precedence: bulk|list|junk`), письма роботов
 //! (`MAILER-DAEMON`, `owner-*`, `*-request`, `noreply` …), при `X-Auto-Response-Suppress: All|OOF`, на письма в
@@ -20,11 +27,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address;
 use mail_builder::headers::date::Date;
 use mail_builder::headers::raw::Raw;
 use mail_builder::mime::MimePart;
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tp_contracts::meta::{AccountScope, Mailbox, MailboxStore, NewMailbox, SpecialUse};
 use tp_contracts::sieve::{AutoReply, ReplyBody};
@@ -35,12 +44,72 @@ use crate::tracking::Step;
 /// Итог правил всех получателей письма, кроме доставок в ящики.
 #[derive(Debug, Default)]
 pub(crate) struct Sieved {
-    /// Адреса перенаправления (`redirect`) без повторов.
-    pub redirect: Vec<String>,
+    /// Перенаправления (`redirect`): письмо с дополненной цепочкой и адреса.
+    pub redirect: Vec<Hop>,
     /// Автоответы: учётная запись получателя и ответ.
     pub replies: Vec<(AccountScope, AutoReply)>,
     /// События журнала доставки: решения правил.
     pub steps: Vec<Step>,
+}
+
+/// Перенаправление правилами одного ящика: письмо с его меткой в цепочке и адреса назначения.
+#[derive(Debug)]
+pub(crate) struct Hop {
+    /// Письмо с заголовком [`CHAIN_HEADER`] перенаправившего ящика.
+    pub raw: Bytes,
+    /// Адреса назначения.
+    pub to: Vec<String>,
+}
+
+/// Служебный заголовок цепочки перенаправлений: по одному на перенаправление, значение — метка ящика
+/// ([`chain_token`]); число заголовков — счётчик перенаправлений.
+pub const CHAIN_HEADER: &str = "X-ThePost-Redirected";
+
+/// Метка ящика в цепочке перенаправлений: начало SHA-256 идентификатора учётной записи (сам идентификатор и адрес
+/// наружу не раскрываются).
+pub(crate) fn chain_token(account: AccountId) -> String {
+    Sha256::digest(account.to_string().as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Цепочка перенаправлений письма `raw`: метки ящиков из заголовков [`CHAIN_HEADER`].
+pub(crate) fn chain(raw: &[u8]) -> Vec<String> {
+    let Some(msg) = mail_parser::MessageParser::new().parse_headers(raw) else {
+        return Vec::new();
+    };
+    msg.headers()
+        .iter()
+        .filter(|h| h.name.as_str().eq_ignore_ascii_case(CHAIN_HEADER))
+        .filter_map(|h| raw.get(h.offset_start as usize..h.offset_end as usize))
+        .map(|v| String::from_utf8_lossy(v).trim().to_ascii_lowercase())
+        .collect()
+}
+
+/// Письмо `raw` с меткой `token` перенаправившего ящика в цепочке.
+pub(crate) fn stamp(raw: &[u8], token: &str) -> Bytes {
+    let mut m = Vec::with_capacity(CHAIN_HEADER.len() + token.len() + 4 + raw.len());
+    m.extend_from_slice(format!("{CHAIN_HEADER}: {token}\r\n").as_bytes());
+    m.extend_from_slice(raw);
+    Bytes::from(m)
+}
+
+/// Добавляет автоответы `more` к `replies`; второй ответ той же учётной записи тому же адресату (письмо пришло ей
+/// и напрямую, и перенаправлением) не добавляется.
+pub(crate) fn merge_replies(
+    replies: &mut Vec<(AccountScope, AutoReply)>,
+    more: Vec<(AccountScope, AutoReply)>,
+) {
+    for (scope, reply) in more {
+        if !replies
+            .iter()
+            .any(|(s, r)| s.account == scope.account && r.to.eq_ignore_ascii_case(&reply.to))
+        {
+            replies.push((scope, reply));
+        }
+    }
 }
 
 /// Окно ограничения частоты автоответов.
@@ -415,6 +484,20 @@ mod tests {
             ..r
         };
         assert!(suppressed("bob@example.org", plain, &own).is_some());
+    }
+
+    #[test]
+    fn redirect_chain() {
+        let (a, b) = (AccountId::new(), AccountId::new());
+        let plain =
+            b"From: sender@example.net\r\nSubject: hi\r\n\r\nX-ThePost-Redirected: body\r\n";
+        assert!(chain(plain).is_empty());
+        let once = stamp(plain, &chain_token(a));
+        let twice = stamp(&once, &chain_token(b));
+        assert_eq!(chain(&twice), [chain_token(b), chain_token(a)]);
+        assert_eq!(chain_token(a).len(), 16);
+        assert_ne!(chain_token(a), chain_token(b));
+        assert!(twice.ends_with(plain));
     }
 
     #[test]

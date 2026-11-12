@@ -1,0 +1,51 @@
+---
+source: crates/tp-dav/src/tests/multiget.rs
+expression: r.show()
+---
+207 Multi-Status
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/tasks/buy.ics</d:href>
+<d:propstat>
+<d:prop>
+<d:getetag>"3"</d:getetag>
+<c:calendar-data>BEGIN:VCALENDAR&#13;
+VERSION:2.0&#13;
+PRODID:-//test//RU&#13;
+BEGIN:VTODO&#13;
+UID:buy&#13;
+DTSTAMP:20260101T000000Z&#13;
+SUMMARY:buy&#13;
+DUE;VALUE=DATE:20260115&#13;
+PRIORITY:1&#13;
+END:VTODO&#13;
+END:VCALENDAR&#13;
+</c:calendar-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/tasks/call.ics</d:href>
+<d:propstat>
+<d:prop>
+<d:getetag>"4"</d:getetag>
+<c:calendar-data>BEGIN:VCALENDAR&#13;
+VERSION:2.0&#13;
+PRODID:-//test//RU&#13;
+BEGIN:VTODO&#13;
+UID:call&#13;
+DTSTAMP:20260101T000000Z&#13;
+SUMMARY:call&#13;
+STATUS:COMPLETED&#13;
+COMPLETED:20260104T100000Z&#13;
+PERCENT-COMPLETE:100&#13;
+END:VTODO&#13;
+END:VCALENDAR&#13;
+</c:calendar-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+</d:multistatus>

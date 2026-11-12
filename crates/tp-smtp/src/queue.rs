@@ -82,7 +82,7 @@ pub(crate) async fn store_blob(
     data: Bytes,
 ) -> Result<BlobKey> {
     let hash = tp_mailstore::split::hash(&data);
-    let mut generation = match index.acquire(tenant, &hash, 1).await? {
+    let mut generation = match index.acquire(tenant, None, &hash, 1).await? {
         Acquire::Existing { generation } => {
             return Ok(BlobKey {
                 tenant,
@@ -155,7 +155,7 @@ impl QueueDeps {
             rcpts,
             next_attempt: (self.now)(),
         };
-        if let Err(e) = self.store.enqueue(msg).await {
+        if let Err(e) = self.store.enqueue(None, msg).await {
             self.release(&blob).await;
             return Err(e);
         }

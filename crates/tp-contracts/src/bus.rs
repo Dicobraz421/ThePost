@@ -16,7 +16,7 @@ use crate::ids::{AccountId, MailboxId, ModSeq, TenantId};
 use crate::meta::AccountScope;
 
 /// Вид сигнала. Виды учётной записи (`account = Some`): `MailboxChanged`, `MailboxListChanged`, `DavChanged`,
-/// `SieveChanged`; остальные —
+/// `ScheduleInboxChanged`, `SieveChanged`; остальные —
 /// системные (`account = None`, приходят в [`EventBus::subscribe_system`]). `Resync` вставляет в поток только шина.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
@@ -36,6 +36,12 @@ pub enum EventKind {
         kind: CollectionKind,
         /// Коллекция.
         collection: CollectionId,
+        /// `ModSeq` изменения.
+        modseq: ModSeq,
+    },
+    /// Изменились входящие планирования учётной записи (`DavStore::inbox_put`, `inbox_delete`; JMAP push
+    /// `CalendarEventNotification`). Сигнал — [`crate::schedule::schedule_inbox_changed`].
+    ScheduleInboxChanged {
         /// `ModSeq` изменения.
         modseq: ModSeq,
     },
@@ -78,6 +84,11 @@ pub enum EventKind {
         /// Учётная запись.
         account: AccountId,
     },
+    /// Изменился справочник шардов метаданных: добавлен или выведен шард, изменились его адрес или реплика,
+    /// учётная запись перенесена на другой шард (CTR-49, решение 47; `tenant` — `TenantId::DEFAULT`). Публикует тот,
+    /// кто меняет справочник (модуль «Шардирование», администрирование), после фиксации; узлы сбрасывают кэш
+    /// справочника (учётная запись → шард, список шардов, пулы).
+    ShardsChanged,
     /// Сигналы подписки потеряны (переполнение буфера подписчика, переподключение слушателя): сверка с хранилищем.
     /// Шина вставляет его в поток подписки с `tenant`/`account` этой подписки (системная — `TenantId::DEFAULT`,
     /// `None`); `publish` с этим видом — `Invalid`.
@@ -92,6 +103,7 @@ impl EventKind {
             EventKind::MailboxChanged { .. }
                 | EventKind::MailboxListChanged
                 | EventKind::DavChanged { .. }
+                | EventKind::ScheduleInboxChanged { .. }
                 | EventKind::SieveChanged
                 | EventKind::Resync
         )
@@ -157,6 +169,7 @@ mod tests {
             }
             .is_system()
         );
+        assert!(!EventKind::ScheduleInboxChanged { modseq: ModSeq(3) }.is_system());
         assert!(!EventKind::SieveChanged.is_system());
         assert!(!EventKind::Resync.is_system());
         for kind in [
@@ -179,6 +192,7 @@ mod tests {
             EventKind::TrashChanged {
                 account: AccountId::new(),
             },
+            EventKind::ShardsChanged,
         ] {
             assert!(kind.is_system(), "{kind:?}");
         }

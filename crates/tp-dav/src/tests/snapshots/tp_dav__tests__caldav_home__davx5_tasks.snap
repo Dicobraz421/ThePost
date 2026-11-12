@@ -1,0 +1,63 @@
+---
+source: crates/tp-dav/src/tests/caldav_home.rs
+expression: r.show()
+---
+207 Multi-Status
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/tasks/</d:href>
+<d:propstat>
+<d:prop>
+<d:resourcetype>
+<d:collection/>
+<c:calendar/>
+</d:resourcetype>
+<d:displayname>Задачи</d:displayname>
+<d:current-user-privilege-set>
+<d:privilege>
+<d:all/>
+</d:privilege>
+<d:privilege>
+<d:read/>
+</d:privilege>
+<d:privilege>
+<d:write/>
+</d:privilege>
+<d:privilege>
+<d:write-properties/>
+</d:privilege>
+<d:privilege>
+<d:write-content/>
+</d:privilege>
+<d:privilege>
+<d:bind/>
+</d:privilege>
+<d:privilege>
+<d:unbind/>
+</d:privilege>
+<d:privilege>
+<d:read-current-user-privilege-set/>
+</d:privilege>
+</d:current-user-privilege-set>
+<c:supported-calendar-component-set>
+<c:comp name="VTODO"/>
+</c:supported-calendar-component-set>
+<c:supported-calendar-data>
+<c:calendar-data content-type="text/calendar" version="2.0"/>
+</c:supported-calendar-data>
+<c:max-resource-size>1048576</c:max-resource-size>
+<ical:calendar-order>1</ical:calendar-order>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+<d:propstat>
+<d:prop>
+<c:calendar-description/>
+<ical:calendar-color/>
+<c:calendar-timezone-id/>
+</d:prop>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:propstat>
+</d:response>
+</d:multistatus>

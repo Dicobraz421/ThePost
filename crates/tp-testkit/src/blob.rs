@@ -17,7 +17,7 @@ use tp_contracts::blob::{
     Acquire, BlobIndex, BlobStore, ByteStream, Commit, Compression, ObjectEntry, ObjectStream,
 };
 use tp_contracts::meta::AccountScope;
-use tp_contracts::{BlobHash, BlobKey, Error, Gen, Result, TenantId};
+use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, Result, TenantId};
 
 use crate::infra::{Clock, SystemClock, lock};
 
@@ -413,7 +413,15 @@ fn refs_arg(refs: u32) -> Result<u32> {
 
 #[async_trait]
 impl BlobIndex for MemBlobIndex {
-    async fn acquire(&self, tenant: TenantId, hash: &BlobHash, refs: u32) -> Result<Acquire> {
+    async fn acquire(
+        &self,
+        tenant: TenantId,
+        owner: Option<AccountId>,
+        hash: &BlobHash,
+        refs: u32,
+    ) -> Result<Acquire> {
+        // Учёт в памяти без шардов: владелец не используется (CTR-49).
+        let _ = owner;
         let refs = refs_arg(refs)?;
         let mut rows = lock(&self.rows);
         Ok(match rows.get_mut(&(tenant, *hash)) {
@@ -660,7 +668,7 @@ mod tests {
         let t = TenantId::DEFAULT;
         let h = hash(1);
         assert_eq!(
-            idx.acquire(t, &h, 3).await.expect("ok"),
+            idx.acquire(t, None, &h, 3).await.expect("ok"),
             Acquire::Absent {
                 generation: Gen::INITIAL
             }
@@ -674,7 +682,7 @@ mod tests {
             }
         );
         assert_eq!(
-            idx.acquire(t, &h, 2).await.expect("ok"),
+            idx.acquire(t, None, &h, 2).await.expect("ok"),
             Acquire::Existing {
                 generation: Gen::INITIAL
             }
@@ -699,10 +707,10 @@ mod tests {
             Err(Error::Conflict)
         );
         assert_eq!(idx.release(t, &h, Gen(7), 1).await, Err(Error::NotFound));
-        assert!(idx.acquire(t, &h, 0).await.is_err());
+        assert!(idx.acquire(t, None, &h, 0).await.is_err());
 
         // Новая ссылка снимает обнуление: GC не трогает объект.
-        idx.acquire(t, &h, 1).await.expect("ok");
+        idx.acquire(t, None, &h, 1).await.expect("ok");
         clock.advance(W * 2);
         assert!(
             idx.gc_candidates(clock.now() - W, 10)
@@ -773,7 +781,7 @@ mod tests {
         );
         assert!(idx.finalize_delete(&first[0]).await.expect("finalize"));
         assert_eq!(idx.next_gc_due(W).await, Ok(Some(zero + 2 * W)));
-        idx.acquire(t, &h, 1).await.expect("ok");
+        idx.acquire(t, None, &h, 1).await.expect("ok");
         assert_eq!(idx.next_gc_due(W).await, Ok(None));
     }
 
@@ -783,7 +791,7 @@ mod tests {
         let t = TenantId::DEFAULT;
         let h = hash(2);
         let k0 = key(2, Gen::INITIAL);
-        idx.acquire(t, &h, 1).await.expect("ok");
+        idx.acquire(t, None, &h, 1).await.expect("ok");
         idx.commit_new(t, &h, Gen::INITIAL, 5, 1).await.expect("ok");
         idx.release(t, &h, Gen::INITIAL, 1).await.expect("ok");
 
@@ -796,7 +804,8 @@ mod tests {
         assert!(idx.exists(&k0).await.expect("ok"));
 
         // Запись deleting: новое письмо загружает следующее поколение.
-        let Acquire::Absent { generation: g1 } = idx.acquire(t, &h, 2).await.expect("ok") else {
+        let Acquire::Absent { generation: g1 } = idx.acquire(t, None, &h, 2).await.expect("ok")
+        else {
             panic!("ожидалось Absent");
         };
         assert_eq!(g1, Gen(1));
@@ -840,7 +849,7 @@ mod tests {
             Commit::Bumped { generation: Gen(1) }
         );
         assert_eq!(
-            idx.acquire(t, &h, 1).await.expect("ok"),
+            idx.acquire(t, None, &h, 1).await.expect("ok"),
             Acquire::Absent { generation: Gen(1) }
         );
         idx.prune_tombstones(clock.now() + W);
@@ -962,7 +971,7 @@ mod tests {
         let h = hash(8);
         let data = Bytes::from_static(b"attachment");
 
-        let Acquire::Absent { generation } = idx.acquire(t, &h, 2).await.expect("ok") else {
+        let Acquire::Absent { generation } = idx.acquire(t, None, &h, 2).await.expect("ok") else {
             panic!("ожидалось Absent");
         };
         let k = BlobKey {

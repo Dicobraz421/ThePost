@@ -450,7 +450,7 @@ impl MailboxStore for PgMeta {
             if created {
                 rows = select_all(&mut tx, scope).await?;
             }
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             if created {
                 self.signal_log([scope.account]).await;
             }
@@ -463,7 +463,7 @@ impl MailboxStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
             let mb = fetch(&mut tx, scope, id, false).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(mb)
         })
         .await
@@ -483,7 +483,7 @@ impl MailboxStore for PgMeta {
             changelog::log(&mut tx, scope, ms, &[Change::mailbox(mb.id, Op::Created)]).await?;
             let ev = changelog::event(scope, Some(mb.id), CoreEventKind::MailboxCreated);
             changelog::append_events(&mut tx, self.cfg.event_partitions, &[ev]).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             self.signal_log([scope.account]).await;
             Ok(mb)
         })
@@ -546,7 +546,7 @@ impl MailboxStore for PgMeta {
         .await
         .map_err(db_err)?;
         changelog::log(&mut tx, scope, ms, &[Change::mailbox(id, Op::Updated)]).await?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(())
 }).await
     }
@@ -646,7 +646,7 @@ impl MailboxStore for PgMeta {
                 .map(|b| changelog::event(scope, Some(*b), CoreEventKind::MailboxDeleted)),
         );
         changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         self.signal_log([scope.account]).await;
         Ok(())
 }).await
@@ -673,7 +673,7 @@ impl MailboxStore for PgMeta {
                 return Err(Error::NotFound);
             }
             changelog::log(&mut tx, scope, ms, &[Change::mailbox(id, Op::Updated)]).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(())
         })
         .await
@@ -699,7 +699,7 @@ impl MailboxStore for PgMeta {
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             let (uid_validity, uid_next, highest, messages, unseen, size) =
                 row.ok_or(Error::NotFound)?;
             Ok(MailboxStatus {

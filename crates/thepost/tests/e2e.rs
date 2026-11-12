@@ -473,6 +473,9 @@ async fn mvp_mail_flow() {
     let path = dir.path().join("config.yaml");
     std::fs::write(&path, config(dir.path(), &db_url, &domain)).expect("config");
     let shutdown = CancellationToken::new();
+    // Роль admin узла забирает ожидающий сокет `admin init`, чей бы он ни был: запуск — не одновременно с тестами
+    // Admin API.
+    let bound = ADMIN_SOCKET.lock().await;
     let running = start(ServeOptions {
         config: path,
         secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
@@ -482,6 +485,7 @@ async fn mvp_mail_flow() {
     })
     .await
     .expect("start");
+    drop(bound);
     let until = deadline();
     while !running.health.is_ready() {
         retry(until, "узел готов").await;
@@ -877,8 +881,8 @@ const FLOW_MODULES: &[Builtin] = &[Builtin {
     make: || Arc::new(FlowModule),
 }];
 
-/// Конфигурация [`config`] со слушателем Admin API, локальным сокетом `admin init` и модулем `flowcount`.
-fn transport_config(dir: &Path, db_url: &str, domain: &str, socket: &Path) -> String {
+/// Конфигурация [`config`] со слушателем Admin API и локальным сокетом `admin init`.
+fn admin_config(dir: &Path, db_url: &str, domain: &str, socket: &Path) -> String {
     let jmap = "http:\n  jmap: { listen: \"127.0.0.1:0\", allow_plaintext: true }\n";
     let base = config(dir, db_url, domain);
     assert!(base.contains(jmap), "{base}");
@@ -887,10 +891,22 @@ fn transport_config(dir: &Path, db_url: &str, domain: &str, socket: &Path) -> St
         &format!("{jmap}  admin: {{ listen: \"127.0.0.1:0\", allow_plaintext: true }}\n"),
     );
     format!(
-        "{base}admin:\n  init:\n    socket: \"{socket}\"\nmodules:\n  flowcount:\n    enabled: true\n",
+        "{base}admin:\n  init:\n    socket: \"{socket}\"\n",
         socket = socket.display().to_string().replace('\\', "/"),
     )
 }
+
+/// [`admin_config`] с модулем `flowcount`.
+fn transport_config(dir: &Path, db_url: &str, domain: &str, socket: &Path) -> String {
+    format!(
+        "{}modules:\n  flowcount:\n    enabled: true\n",
+        admin_config(dir, db_url, domain, socket)
+    )
+}
+
+/// Сокет `admin init` роль admin забирает из общего для процесса места (`local_admin::bind` → `local_admin::serve`
+/// при запуске узла): запуски узлов в тестах — по очереди, иначе сокет достаётся чужому узлу.
+static ADMIN_SOCKET: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// `thepost admin init` по локальному сокету узла: ответ узла (`status`, `token`, …).
 async fn admin_init(socket: &Path, email: &str) -> Value {
@@ -942,6 +958,7 @@ async fn transport_settings_without_restart() {
         .expect("registry")
         .load(&path)
         .expect("load config");
+    let bound = ADMIN_SOCKET.lock().await;
     thepost::local_admin::bind(&cfg).expect("admin init socket");
     let shutdown = CancellationToken::new();
     let running = start(ServeOptions {
@@ -963,6 +980,7 @@ async fn transport_settings_without_restart() {
     // Первый администратор: учётная запись, принятый домен и одноразовый токен Admin API.
     let login = format!("admin@{domain}");
     let granted = admin_init(&socket, &login).await;
+    drop(bound);
     assert_eq!(granted["status"], "granted", "{granted}");
     let token = granted["token"].as_str().expect("token").to_owned();
 
@@ -1020,5 +1038,241 @@ async fn transport_settings_without_restart() {
     shutdown.cancel();
     let report = running.wait().await.expect("wait");
     assert!(report.failed.is_empty(), "{report:?}");
+    drop_database(&url, &db_name).await;
+}
+
+// ---------- APP-26: правила Sieve и автоответ ----------
+
+/// Получатели очереди исходящей почты с адресом `address`.
+async fn queued(pool: &sqlx::PgPool, address: &str) -> i64 {
+    let mut tx = tp_meta::schema::begin(pool, TenantId::DEFAULT)
+        .await
+        .expect("begin");
+    sqlx::query_scalar("SELECT count(*) FROM queue_rcpts WHERE address = $1")
+        .bind(address)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("queue")
+}
+
+/// Скрипт и автоответ через Admin API → письмо по SMTP → папка по `fileinto` и автоответ в очереди (один на
+/// отправителя за период); автоответ виден в JMAP `VacationResponse/get` (Postman).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sieve_rules_and_vacation() {
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = Arc::new(MemSecretStore::default());
+    let db: SecretRef = "thepost/db#password".parse().expect("ref");
+    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+
+    let domain = "example.ru".to_owned();
+    let socket = dir.path().join("admin.sock");
+    let path = dir.path().join("config.yaml");
+    // Без роли smtp-out: автоответ остаётся в очереди, его никто не забирает.
+    let text = admin_config(dir.path(), &db_url, &domain, &socket).replace(
+        "roles: [all]",
+        "roles: [smtp-in, submission, imap, jmap, admin, search, indexer, maintenance]",
+    );
+    assert!(!text.contains("roles: [all]"), "{text}");
+    std::fs::write(&path, text).expect("config");
+    let cfg = thepost::sections::registry()
+        .expect("registry")
+        .load(&path)
+        .expect("load config");
+    let bound = ADMIN_SOCKET.lock().await;
+    thepost::local_admin::bind(&cfg).expect("admin init socket");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+    let smtp = addr(&running, "smtp-in");
+    let admin = addr(&running, "admin");
+
+    // Администратор — он же получатель: учётная запись и принятый домен заведены `admin init`.
+    let login = format!("admin@{domain}");
+    let granted = admin_init(&socket, &login).await;
+    drop(bound);
+    assert_eq!(granted["status"], "granted", "{granted}");
+    let token = granted["token"].as_str().expect("token").to_owned();
+    let (code, body) = http(
+        admin,
+        "POST",
+        "/api/v1/session",
+        &format!("Bearer {token}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+    let session: Value = serde_json::from_slice(&body).expect("session");
+    let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
+
+    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let tenant = TenantId::DEFAULT;
+    let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
+    let account: sqlx::types::Uuid =
+        sqlx::query_scalar("SELECT account_id FROM accounts WHERE login = $1")
+            .bind(&login)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("account");
+    drop(tx);
+    let base = format!("/api/v1/orgs/{tenant}/accounts/{account}");
+
+    // Admin API: неверный скрипт — 422 с позицией; верный — записан и включён.
+    let script = format!("{base}/sieve/scripts/main");
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &script,
+        &bearer,
+        Some(&json!({ "text": "if header :contains \"subject\" {" })),
+    )
+    .await;
+    assert_eq!(code, 422, "{}", String::from_utf8_lossy(&body));
+    let problem: Value = serde_json::from_slice(&body).expect("problem");
+    assert!(problem["errors"][0]["line"].is_u64(), "{problem}");
+    let rule = "require [\"fileinto\", \"mailbox\"];\n\
+                if header :contains \"subject\" \"report\" { fileinto :create \"Reports\"; }\n";
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &script,
+        &bearer,
+        Some(&json!({ "text": rule })),
+    )
+    .await;
+    assert!(
+        matches!(code, 200 | 201 | 204),
+        "{code} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (code, body) = http(admin, "POST", &format!("{script}/activate"), &bearer, None).await;
+    assert!(
+        matches!(code, 200 | 204),
+        "{code} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Admin API: автоответ за пользователя.
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &format!("{base}/vacation"),
+        &bearer,
+        Some(
+            &json!({ "enabled": true, "subject": "Out of office", "text_body": "Back on Monday." }),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(code, 200 | 204),
+        "{code} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // JMAP (Postman): тот же автоответ в `VacationResponse/get`.
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let scope = AccountScope {
+        tenant,
+        account: tp_contracts::ids::AccountId::from_uuid(account),
+    };
+    let apps =
+        tp_auth::AppPasswords::new(Arc::new(meta.clone()), tp_auth::PasswordConfig::default())
+            .expect("app passwords");
+    let (_, secret) = apps.issue(scope, "e2e").await.expect("issue");
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{login}:{}", secret.expose()))
+    );
+    let jmap = addr(&running, "jmap");
+    let jmap_call = |method: &'static str, args: Value| {
+        let basic = basic.clone();
+        async move {
+            let req = json!({
+                "using": [
+                    "urn:ietf:params:jmap:core",
+                    "urn:ietf:params:jmap:mail",
+                    "urn:ietf:params:jmap:vacationresponse",
+                ],
+                "methodCalls": [[method, args, "c0"]],
+            });
+            let (code, body) = http(jmap, "POST", "/jmap/api", &basic, Some(&req)).await;
+            assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+            let resp: Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(resp["methodResponses"][0][0], method, "{resp}");
+            resp["methodResponses"][0][1].clone()
+        }
+    };
+    let account_id = account.to_string();
+    let r = jmap_call("VacationResponse/get", json!({ "accountId": account_id })).await;
+    assert_eq!(r["list"][0]["isEnabled"], true, "{r}");
+    assert_eq!(r["list"][0]["textBody"], "Back on Monday.", "{r}");
+
+    // Письмо внешнего отправителя: в папку по правилу, автоответ — в очередь.
+    let sender = "bob@sender.test";
+    let send = |n: u32, subject: &'static str| {
+        let message = format!(
+            "From: Bob <{sender}>\nTo: <{login}>\nSubject: {subject}\n\
+             Message-ID: <app26-{n}-{}@sender.test>\n\nSee attached.\n",
+            std::process::id()
+        );
+        let login = login.clone();
+        async move { smtp_send(smtp, sender, &login, &message).await }
+    };
+    send(1, "Weekly report").await;
+    let until = deadline();
+    let reports = loop {
+        let r = jmap_call("Mailbox/get", json!({ "accountId": account_id })).await;
+        let found = r["list"]
+            .as_array()
+            .and_then(|l| l.iter().find(|m| m["name"] == "Reports"))
+            .cloned();
+        match found {
+            Some(m) if m["totalEmails"] == 1 => break m,
+            _ => retry(until, "письмо в папке Reports (fileinto)").await,
+        }
+    };
+    assert_eq!(reports["totalEmails"], 1, "{reports}");
+    let until = deadline();
+    while queued(&pool, sender).await != 1 {
+        retry(until, "автоответ в очереди").await;
+    }
+
+    // Второе письмо того же отправителя: мимо правила — во «Входящие», повторного автоответа нет.
+    send(2, "Lunch").await;
+    let until = deadline();
+    loop {
+        let r = jmap_call("Mailbox/get", json!({ "accountId": account_id })).await;
+        let inbox = r["list"]
+            .as_array()
+            .and_then(|l| l.iter().find(|m| m["role"] == "inbox"))
+            .cloned();
+        if inbox.is_some_and(|m| m["totalEmails"] == 1) {
+            break;
+        }
+        retry(until, "второе письмо во «Входящих»").await;
+    }
+    assert_eq!(queued(&pool, sender).await, 1);
+
+    shutdown.cancel();
+    let report = running.wait().await.expect("wait");
+    assert!(report.failed.is_empty(), "{report:?}");
+    pool.close().await;
     drop_database(&url, &db_name).await;
 }

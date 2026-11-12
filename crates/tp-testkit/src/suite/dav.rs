@@ -18,6 +18,7 @@ pub const LIMITS: DavLimits = DavLimits {
     max_object_size: 4096,
     max_objects: 4,
     max_collections: 3,
+    busy_horizon: std::time::Duration::from_secs(30 * 24 * 3600),
 };
 
 /// Учётные записи набора: `owner`, `peer` — без коллекций, одной организации; `foreign` — та же учётная запись `owner`
@@ -65,14 +66,14 @@ fn at(h: i64) -> OffsetDateTime {
 }
 
 fn event(uid: &str, span: Option<(i64, Option<i64>)>) -> ObjectIndex {
-    ObjectIndex {
-        component: Component::Event,
-        uid: uid.into(),
-        span: span.map(|(s, e)| Span {
+    ObjectIndex::new(
+        Component::Event,
+        uid,
+        span.map(|(s, e)| Span {
             start: at(s),
             end: e.map(at),
         }),
-    }
+    )
 }
 
 fn body(uid: &str) -> String {
@@ -918,11 +919,7 @@ pub async fn signals(store: &dyn DavStore, bus: &dyn EventBus, scope: AccountSco
         .await
         .expect("create");
     expect(book.id, m).await;
-    let card = ObjectIndex {
-        component: Component::Card,
-        uid: "uid-1".into(),
-        span: None,
-    };
+    let card = ObjectIndex::new(Component::Card, "uid-1", None);
     let p = stored(
         store
             .put_object(

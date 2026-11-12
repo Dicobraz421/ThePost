@@ -17,9 +17,9 @@ use time::OffsetDateTime;
 use tp_contracts::events::{CoreEvent, CoreEventKind};
 use tp_contracts::meta::{
     Account, AccountScope, AccountState, AccountStore, AccountUpsert, ChangeLog, Changes,
-    DisabledAccount, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Mailbox, MailboxStatus,
-    MailboxStore, Message, MessageChange, MessageQuery, MessageStore, NewMailbox, NewMessage,
-    QuotaUsage, SpecialUse,
+    DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Mailbox,
+    MailboxStatus, MailboxStore, Message, MessageChange, MessageQuery, MessageStore, NewMailbox,
+    NewMessage, QuotaUsage, SpecialUse,
 };
 use tp_contracts::retention::{PurgeOutcome, Restored};
 use tp_contracts::{
@@ -429,6 +429,144 @@ impl AccountData {
         }
         self.touch(ms, boxes);
         Ok(out)
+    }
+}
+
+impl AccountData {
+    /// Имя `base` у родителя `parent`, а если оно занято (без учёта регистра ASCII), — с наименьшим свободным
+    /// суффиксом: «base 1», «base 2»… (как у системных папок).
+    fn free_name(&self, parent: Option<MailboxId>, base: &str) -> String {
+        let taken = |n: &str| {
+            self.mailboxes
+                .values()
+                .any(|m| m.mailbox.parent == parent && m.mailbox.name.eq_ignore_ascii_case(n))
+        };
+        if !taken(base) {
+            return base.to_owned();
+        }
+        (1u32..)
+            .map(|i| format!("{base} {i}"))
+            .find(|n| !taken(n))
+            .unwrap_or_else(|| base.to_owned())
+    }
+
+    /// Переносит письма ящика `src` в этот ящик при подключении (CTR-50, [`ExistingContent`]) одним номером
+    /// изменения: папки `src` с ролью — в папки с той же ролью; `Keep` — остальные папки с иерархией (занятое имя —
+    /// с суффиксом [`AccountData::free_name`]), письма — в соответствующие папки; `Delete` — письма в корзину со
+    /// сроком `mark` (исходная папка — с той же ролью, иначе «Входящие»). Письма корзины `src` — в корзину со своими
+    /// сроками, скрытые — скрытыми. `MessageId` сохраняются, UID — новые; ссылки BLOB не меняются.
+    fn absorb(
+        &mut self,
+        src: &AccountData,
+        mode: ExistingContent,
+        mark: (OffsetDateTime, OffsetDateTime),
+        now: i64,
+        fx: &mut Effects,
+    ) -> Result<()> {
+        self.ensure_system(now, fx);
+        let inbox = self.by_role(SpecialUse::Inbox)?;
+        let trash = self.by_role(SpecialUse::Trash)?;
+        let ms = self.bump();
+        // Папки `src` → папки этого ящика; родители раньше вложенных.
+        let mut map: HashMap<MailboxId, MailboxId> = HashMap::new();
+        let mut rest: Vec<&MailboxRow> = src.mailboxes.values().collect();
+        rest.sort_by(|a, b| a.mailbox.name.cmp(&b.mailbox.name));
+        while !rest.is_empty() {
+            let before = rest.len();
+            let mut later = Vec::new();
+            for row in rest {
+                let f = &row.mailbox;
+                let parent = match f.parent.map(|p| (p, map.get(&p).copied())) {
+                    None => None,
+                    Some((_, Some(p))) => Some(p),
+                    Some((p, None)) if src.mailboxes.contains_key(&p) => {
+                        later.push(row);
+                        continue;
+                    }
+                    Some((_, None)) => None,
+                };
+                let same_role = f.role.and_then(|r| self.by_role(r).ok());
+                let to = match (same_role, mode) {
+                    (Some(id), _) => id,
+                    (None, ExistingContent::Delete) => inbox,
+                    (None, ExistingContent::Keep) => {
+                        let data = NewMailbox {
+                            parent,
+                            name: self.free_name(parent, &f.name),
+                            role: f.role,
+                        };
+                        let id = self.create_mailbox(&data, now, ms).id;
+                        if let Some(r) = self.mailboxes.get_mut(&id) {
+                            r.mailbox.subscribed = f.subscribed;
+                        }
+                        self.mbx_log.push((ms, id, Op::Created));
+                        fx.events.push((Some(id), CoreEventKind::MailboxCreated));
+                        id
+                    }
+                };
+                map.insert(f.id, to);
+            }
+            if later.len() == before {
+                return Err(Error::internal("attach: цикл в иерархии папок"));
+            }
+            rest = later;
+        }
+        let origin = |m: MailboxId| map.get(&m).copied().unwrap_or(inbox);
+        let mut rows: Vec<&MessageRow> = src.messages.values().collect();
+        rows.sort_by_key(|r| (r.message.mailbox, r.message.uid));
+        let mut touched = vec![trash];
+        for row in rows {
+            let mut row = row.clone();
+            let trashed = match (row.trashed, mode) {
+                (Some(t), _) => Some(Trashed {
+                    from: origin(t.from),
+                    ..t
+                }),
+                (None, ExistingContent::Keep) => None,
+                (None, ExistingContent::Delete) => {
+                    // В корзину — без `\Deleted` (CTR-33).
+                    row.message.flags.remove(&Flag::Deleted);
+                    Some(Trashed {
+                        from: origin(row.message.mailbox),
+                        deleted_at: mark.0,
+                        expires_at: mark.1,
+                    })
+                }
+            };
+            let to = match trashed {
+                Some(_) => trash,
+                None => origin(row.message.mailbox),
+            };
+            let uid = self.alloc_uid(to)?;
+            let id = row.message.id;
+            row.trashed = trashed;
+            row.message.mailbox = to;
+            row.message.uid = uid;
+            row.message.modseq = ms;
+            self.msg_log.push(MsgLog {
+                modseq: ms,
+                id,
+                op: Op::Created,
+                mailbox: to,
+                uid,
+                from: None,
+            });
+            self.messages.insert(id, row);
+            fx.events
+                .push((Some(to), CoreEventKind::Delivered { message: id }));
+            touched.push(to);
+        }
+        for row in src.hidden.values() {
+            let mut row = row.clone();
+            row.trashed = row.trashed.map(|t| Trashed {
+                from: origin(t.from),
+                ..t
+            });
+            row.message.mailbox = trash;
+            self.hidden.insert(row.message.id, row);
+        }
+        self.touch(ms, touched);
+        Ok(())
     }
 }
 
@@ -1026,7 +1164,10 @@ impl AccountStore for MemMetadata {
         tenant: TenantId,
         disabled: AccountId,
         to: AccountId,
+        existing: Option<ExistingContent>,
     ) -> Result<Account> {
+        let mark = self.trash_mark();
+        let now = self.now_unix();
         let mut st = lock(&self.state);
         let from = st
             .accounts
@@ -1036,25 +1177,47 @@ impl AccountStore for MemMetadata {
         if from.state == AccountState::Active || disabled == to {
             return Err(Error::invalid("attach: mailbox is not disabled"));
         }
-        if target.state != AccountState::Active
-            || !target.messages.is_empty()
-            || !target.hidden.is_empty()
-        {
+        if target.state != AccountState::Active {
             return Err(Error::Conflict);
         }
-        let identity = target.account.clone();
-        st.accounts.remove(&(tenant, to));
-        let acc = st
+        let busy = !target.messages.is_empty() || !target.hidden.is_empty();
+        if busy && existing.is_none() {
+            return Err(Error::invalid(
+                "attach: в ящике учётной записи есть письма — выберите режим: keep (перенести в подключаемый \
+                 ящик) или delete (в корзину подключаемого ящика)",
+            ));
+        }
+        let src = st
             .accounts
-            .get_mut(&(tenant, disabled))
+            .remove(&(tenant, to))
             .ok_or_else(|| Error::internal("учётная запись пропала"))?;
+        let Some(acc) = st.accounts.get_mut(&(tenant, disabled)) else {
+            st.accounts.insert((tenant, to), src);
+            return Err(Error::internal("учётная запись пропала"));
+        };
+        let mut fx = Effects::default();
+        if let (true, Some(mode)) = (busy, existing)
+            && let Err(e) = acc.absorb(&src, mode, mark, now, &mut fx)
+        {
+            st.accounts.insert((tenant, to), src);
+            return Err(e);
+        }
+        let identity = src.account;
         acc.account.domain = identity.domain;
         acc.account.login = identity.login;
         acc.account.display_name = identity.display_name;
         acc.account.external_id = identity.external_id;
         acc.account.enabled = identity.enabled;
         acc.state = AccountState::Active;
-        Ok(acc.account.clone())
+        let account = acc.account.clone();
+        self.apply(
+            AccountScope {
+                tenant,
+                account: disabled,
+            },
+            fx,
+        );
+        Ok(account)
     }
 
     async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {

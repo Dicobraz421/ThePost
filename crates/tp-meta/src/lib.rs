@@ -11,7 +11,9 @@ pub mod admin_tokens;
 pub mod app_passwords;
 pub mod blob_index;
 pub mod changelog;
+pub mod commits;
 pub mod credentials;
+pub mod dav;
 pub mod delivery;
 pub mod doctor;
 pub mod events;
@@ -29,6 +31,7 @@ pub mod replica;
 pub mod retention;
 pub mod schema;
 pub mod shards;
+pub mod sieve;
 pub mod signals;
 pub mod transport;
 
@@ -46,6 +49,7 @@ use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Error, Result, TenantId};
 
 use crate::abuse::AbuseBlocksConfig;
+use crate::dav::DavConfig;
 use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
@@ -54,6 +58,7 @@ use crate::pool::TxFuture;
 use crate::replica::Replica;
 use crate::retention::RetentionConfig;
 use crate::shards::{ReadIntent, ShardId, ShardResolver};
+use crate::sieve::SieveConfig;
 use crate::signals::SignalsConfig;
 
 /// Секция конфигурации контура метаданных `meta` (SRS 5.5); пул соединений — отдельная секция
@@ -73,6 +78,10 @@ use crate::signals::SignalsConfig;
 ///     retention: 30d
 ///   signals:
 ///     channel: tp_signals
+///   dav:
+///     tombstone_ttl: 90d
+///   sieve:
+///     max_scripts: 16
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -99,6 +108,10 @@ pub struct MetaConfig {
     pub signals: SignalsConfig,
     /// Блокировки источников и учётных записей ([`abuse`]).
     pub abuse: AbuseBlocksConfig,
+    /// Календари и контакты: лимиты и срок надгробий ([`dav`]).
+    pub dav: DavConfig,
+    /// Скрипты Sieve и автоответ: лимиты ([`sieve`]).
+    pub sieve: SieveConfig,
 }
 
 impl MetaConfig {
@@ -118,6 +131,8 @@ impl Default for MetaConfig {
             delivery: DeliveryLogConfig::default(),
             signals: SignalsConfig::default(),
             abuse: AbuseBlocksConfig::default(),
+            dav: DavConfig::default(),
+            sieve: SieveConfig::default(),
         }
     }
 }

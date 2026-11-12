@@ -44,6 +44,7 @@ use utoipa::{Modify, OpenApi, ToSchema};
 
 use crate::accounts::{DomainStore, PolicyStore};
 use crate::audit::{AUDIT_ROUTE, AuditLog, AuditRecord, AuditSink};
+use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
 use crate::init::{InitConfig, Local};
@@ -136,6 +137,7 @@ pub struct RoleBinding {
 /// init: { token_ttl: 10m, session_ttl: 8h, socket: /var/lib/thepost/admin.sock }
 /// audit:
 ///   syslog: { address: "siem.example.org:6514" }
+/// console: { enabled: true, connect_src: ["https://idp.example.org"] }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -158,6 +160,8 @@ pub struct AdminConfig {
     pub audit: AuditExportConfig,
     /// Первый администратор без OIDC (`thepost admin init`, [`crate::init`]).
     pub init: InitConfig,
+    /// Веб-консоль администратора ([`crate::console`]); по умолчанию раздаётся.
+    pub console: ConsoleConfig,
 }
 
 impl Default for AdminConfig {
@@ -172,6 +176,7 @@ impl Default for AdminConfig {
             allow_external: false,
             audit: AuditExportConfig::default(),
             init: InitConfig::default(),
+            console: ConsoleConfig::default(),
         }
     }
 }
@@ -204,6 +209,7 @@ impl AdminConfig {
         }
         self.audit.check()?;
         self.init.check()?;
+        self.console.check()?;
         if self.page_size == 0 || self.page_size > self.max_page_size {
             return Err(Error::invalid("admin: page_size — от 1 до max_page_size"));
         }
@@ -297,6 +303,8 @@ pub struct Admin {
     pub(crate) transport: Option<Arc<dyn TransportStore>>,
     /// Локальный вход (`admin init`, сессии); `None` — не подключено (обмен отвечает 503).
     pub(crate) local: Option<Arc<Local>>,
+    /// Правила Sieve и автоответ; `None` — не подключено (маршруты отвечают 503).
+    pub(crate) sieve: Option<crate::sieve::Sieve>,
 }
 
 impl fmt::Debug for Admin {
@@ -306,6 +314,7 @@ impl fmt::Debug for Admin {
             .field("cfg", &self.cfg)
             .field("transport", &self.transport.is_some())
             .field("local", &self.local.is_some())
+            .field("sieve", &self.sieve.is_some())
             .finish()
     }
 }
@@ -333,6 +342,7 @@ impl Admin {
             cfg,
             transport: None,
             local: None,
+            sieve: None,
         })
     }
 
@@ -352,6 +362,7 @@ impl Admin {
         api = crate::delivery::routes(api);
         api = crate::groups::routes(api);
         api = crate::transport::routes(api);
+        api = crate::sieve::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -366,6 +377,7 @@ impl Admin {
                 .route(&format!("{prefix}/{{*rest}}"), any(handler));
         }
         let api = api.route_layer(middleware::from_fn_with_state(self.clone(), guard));
+        let api = crate::console::routes(api, &self.cfg.console, crate::console::embedded());
         crate::init::routes(api)
             .route("/api/openapi.json", get(openapi))
             .layer(DefaultBodyLimit::max(self.cfg.max_body_size))
@@ -662,6 +674,7 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     api.merge(crate::delivery::Doc::openapi());
     api.merge(crate::groups::Doc::openapi());
     api.merge(crate::transport::Doc::openapi());
+    api.merge(crate::sieve::Doc::openapi());
     api.merge(crate::init::Doc::openapi());
     api
 }

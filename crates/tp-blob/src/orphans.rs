@@ -9,6 +9,11 @@
 //! `put_raw`), пропускаются. Работа низкого приоритета: проверки и удаления ограничены по скорости,
 //! один узел — держатель лизы. Проходы — по расписанию из конфигурации ([`OrphanConfig::interval`];
 //! SRS 2.8, закрытый список таймеров, п. 4).
+//!
+//! Метрики (критерий Д.7 «"Сироты" после цикла GC — 0», решение 57): найдено, удалено и осталось после
+//! прохода — [`OrphanMetrics`], описания для `/metrics` — [`OrphanMetrics::STATS`]. «Осталось» — найденные
+//! «сироты», удаление которых не подтверждено: после удаления объект проверяется `head`; при обрыве прохода
+//! неудалённая «сирота» остаётся в счёте.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -86,30 +91,78 @@ pub struct OrphanPass {
     pub listed: u64,
     /// Проверено ключей BLOB.
     pub checked: u64,
+    /// Найдено «сирот».
+    pub found: u64,
     /// Удалено «сирот».
     pub deleted: u64,
+    /// Найденных «сирот», которых после прохода нет оснований считать удалёнными: удаление не выполнено
+    /// (проход оборван) или объект после удаления остался в хранилище.
+    pub remaining: u64,
     /// Проход прекращён: лиза потеряна.
     pub lease_lost: bool,
 }
 
-/// Снимок метрик поиска «сирот» (накопительные счётчики).
+/// Снимок метрик поиска «сирот»: накопительные счётчики и `remaining` — значение последнего прохода.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OrphanMetrics {
     /// Завершённых проходов.
     pub passes: u64,
     /// Проверено ключей.
     pub checked: u64,
+    /// Найдено «сирот».
+    pub found: u64,
     /// Удалено «сирот».
     pub deleted: u64,
+    /// «Сирот» осталось после последнего прохода ([`OrphanPass::remaining`]; критерий Д.7 — 0).
+    /// Полный проход записывает своё значение, оборванный (ошибка, потеря лизы) — только ненулевое:
+    /// ноль по части листинга ничего не доказывает. До первого полного прохода — 0 при `passes = 0`.
+    pub remaining: u64,
     /// Ошибок.
     pub errors: u64,
+}
+
+/// Описание показателя для `/metrics`: имя, пояснение, значение из снимка, счётчик (иначе — текущее значение).
+pub type OrphanStat = (&'static str, &'static str, fn(&OrphanMetrics) -> u64, bool);
+
+impl OrphanMetrics {
+    /// Показатели «сирот» для отчёта по Д.7: `tp_blob_orphans_{passes,found,deleted}_total`,
+    /// `tp_blob_orphans_remaining`. Регистрирует приложение — снимок [`OrphanSweeper::metrics`]
+    /// читается на каждый запрос `/metrics`.
+    pub const STATS: [OrphanStat; 4] = [
+        (
+            "tp_blob_orphans_passes",
+            "Завершённые проходы поиска «сирот» BLOB",
+            |m| m.passes,
+            true,
+        ),
+        (
+            "tp_blob_orphans_found",
+            "Найдено «сирот» BLOB",
+            |m| m.found,
+            true,
+        ),
+        (
+            "tp_blob_orphans_deleted",
+            "Удалено «сирот» BLOB",
+            |m| m.deleted,
+            true,
+        ),
+        (
+            "tp_blob_orphans_remaining",
+            "«Сирот» BLOB осталось после последнего прохода",
+            |m| m.remaining,
+            false,
+        ),
+    ];
 }
 
 #[derive(Debug, Default)]
 struct Counters {
     passes: AtomicU64,
     checked: AtomicU64,
+    found: AtomicU64,
     deleted: AtomicU64,
+    remaining: AtomicU64,
     errors: AtomicU64,
 }
 
@@ -170,7 +223,9 @@ impl OrphanSweeper {
         OrphanMetrics {
             passes: get(&c.passes),
             checked: get(&c.checked),
+            found: get(&c.found),
             deleted: get(&c.deleted),
+            remaining: get(&c.remaining),
             errors: get(&c.errors),
         }
     }
@@ -199,31 +254,44 @@ impl OrphanSweeper {
     }
 
     async fn pass(&self, mut leader: Option<&mut Leader<'_>>) -> Result<OrphanPass> {
-        let res = self.pass_inner(&mut leader).await;
-        match &res {
-            Ok(p) => {
+        let mut p = OrphanPass::default();
+        let res = self.pass_inner(&mut leader, &mut p).await;
+        // Полный проход — его значение; оборванный — только известный остаток.
+        if p.remaining > 0 || (res.is_ok() && !p.lease_lost) {
+            self.counters
+                .remaining
+                .store(p.remaining, Ordering::Relaxed);
+        }
+        match res {
+            Ok(()) => {
                 inc(&self.counters.passes);
                 tracing::info!(
                     listed = p.listed,
                     checked = p.checked,
+                    found = p.found,
                     deleted = p.deleted,
+                    remaining = p.remaining,
                     "проход поиска «сирот» BLOB"
                 );
+                Ok(p)
             }
             Err(e) => {
                 inc(&self.counters.errors);
-                tracing::warn!(error = %e, "поиск «сирот» BLOB прерван");
+                tracing::warn!(error = %e, remaining = p.remaining, "поиск «сирот» BLOB прерван");
+                Err(e)
             }
         }
-        res
     }
 
-    async fn pass_inner(&self, leader: &mut Option<&mut Leader<'_>>) -> Result<OrphanPass> {
+    async fn pass_inner(
+        &self,
+        leader: &mut Option<&mut Leader<'_>>,
+        pass: &mut OrphanPass,
+    ) -> Result<()> {
         let older_than = before((self.now)(), self.cfg.grace);
         let mut checks = Pacer::new(self.cfg.max_checks_per_sec);
         let mut deletes = Pacer::new(self.cfg.max_deletes_per_sec);
         let renew_every = self.cfg.renew_every.max(1);
-        let mut pass = OrphanPass::default();
         let mut list = self.store.list(&self.cfg.prefix, older_than);
         while let Some(entry) = list.next().await {
             let entry = entry?;
@@ -237,18 +305,27 @@ impl OrphanSweeper {
             pass.checked += 1;
             inc(&self.counters.checked);
             if let Some(key) = orphan_key(self.index.as_ref(), &entry).await? {
+                pass.found += 1;
+                pass.remaining += 1;
+                inc(&self.counters.found);
                 deletes.wait().await;
                 self.store.delete(&key).await?;
                 pass.deleted += 1;
                 inc(&self.counters.deleted);
-                tracing::debug!(%key, "«сирота» BLOB удалена");
+                // Удаление подтверждается: объект, оставшийся после `delete`, — «сирота» после прохода.
+                if self.store.head(&key).await?.is_none() {
+                    pass.remaining -= 1;
+                    tracing::debug!(%key, "«сирота» BLOB удалена");
+                } else {
+                    tracing::warn!(%key, "«сирота» BLOB осталась после удаления");
+                }
             }
-            if pass.checked % renew_every == 0 && !keep(leader).await? {
+            if pass.checked.is_multiple_of(renew_every) && !keep(leader).await? {
                 pass.lease_lost = true;
                 break;
             }
         }
-        Ok(pass)
+        Ok(())
     }
 }
 
@@ -314,7 +391,8 @@ mod tests {
     /// Запись, оборванная после загрузки до `commit_new`.
     async fn interrupted(e: &Env, body: &'static [u8]) -> BlobKey {
         let hash: BlobHash = BlobHasher::digest(body);
-        let Acquire::Absent { generation } = e.index.acquire(T, &hash, 1).await.expect("вызов")
+        let Acquire::Absent { generation } =
+            e.index.acquire(T, None, &hash, 1).await.expect("вызов")
         else {
             panic!("объект уже есть");
         };
@@ -351,6 +429,69 @@ mod tests {
         assert!(e.store.contains(&live));
         assert!(e.store.bytes("idx/t/a/seg").is_some());
         assert_eq!(e.sweeper.metrics().deleted, 1);
+    }
+
+    /// Приёмка BLOB-16 (Д.7): после прохода с оборванной загрузкой «сирот» 0, метрика это показывает.
+    #[tokio::test]
+    async fn metrics_show_no_orphans_after_pass() {
+        let e = env();
+        let orphan = interrupted(&e, b"lost").await;
+        e.writer
+            .write(T, Bytes::from_static(b"live"), 1)
+            .await
+            .expect("вызов");
+        e.clock.advance(Duration::from_secs(GRACE + 1));
+
+        let pass = e.sweeper.run_once().await.expect("вызов");
+        assert_eq!((pass.found, pass.deleted, pass.remaining), (1, 1, 0));
+        assert!(!e.store.contains(&orphan));
+        let m = e.sweeper.metrics();
+        assert_eq!((m.passes, m.found, m.deleted, m.remaining), (1, 1, 1, 0));
+
+        // Повторный проход «сирот» не находит: счётчики не растут, остаток — 0.
+        let pass = e.sweeper.run_once().await.expect("вызов");
+        assert_eq!((pass.found, pass.remaining), (0, 0));
+        let m = e.sweeper.metrics();
+        assert_eq!((m.passes, m.found, m.deleted, m.remaining), (2, 1, 1, 0));
+
+        // Показатели для `/metrics` читают тот же снимок.
+        let stats: Vec<_> = OrphanMetrics::STATS
+            .iter()
+            .map(|(name, _, pick, counter)| (*name, pick(&m), *counter))
+            .collect();
+        assert_eq!(
+            stats,
+            [
+                ("tp_blob_orphans_passes", 2, true),
+                ("tp_blob_orphans_found", 1, true),
+                ("tp_blob_orphans_deleted", 1, true),
+                ("tp_blob_orphans_remaining", 0, false),
+            ]
+        );
+    }
+
+    /// Сбой удаления: «сирота» остаётся в метрике до прохода, который её удалит.
+    #[tokio::test]
+    async fn failed_delete_counts_as_remaining() {
+        let e = env();
+        let orphan = interrupted(&e, b"stuck").await;
+        e.clock.advance(Duration::from_secs(GRACE + 1));
+
+        e.store.fail_next(BlobOp::Delete, Error::UNAVAILABLE);
+        assert_eq!(e.sweeper.run_once().await, Err(Error::UNAVAILABLE));
+        assert!(e.store.contains(&orphan));
+        let m = e.sweeper.metrics();
+        assert_eq!((m.found, m.deleted, m.remaining, m.errors), (1, 0, 1, 1));
+
+        // Оборванный проход без известного остатка значение не сбрасывает.
+        e.store.fail_next(BlobOp::List, Error::UNAVAILABLE);
+        assert_eq!(e.sweeper.run_once().await, Err(Error::UNAVAILABLE));
+        assert_eq!(e.sweeper.metrics().remaining, 1);
+
+        let pass = e.sweeper.run_once().await.expect("вызов");
+        assert_eq!((pass.found, pass.deleted, pass.remaining), (1, 1, 0));
+        let m = e.sweeper.metrics();
+        assert_eq!((m.found, m.deleted, m.remaining), (2, 1, 0));
     }
 
     #[tokio::test]

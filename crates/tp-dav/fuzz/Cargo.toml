@@ -1,0 +1,27 @@
+# Цель fuzz разбора DAV (DAV-02), в каталоге crates/tp-dav:
+#   cargo +nightly fuzz run xml fuzz/corpus/xml -- -max_total_time=600
+# Цель: xml — XML-тело запроса (PROPFIND, PROPPATCH, sync-collection): лимиты глубины и числа элементов,
+# DTD и неизвестные сущности отклоняются, разбор запросов из дерева без паники.
+# Проверки — tp_dav::fuzz; новые входы — в fuzz/corpus/<цель> (не в git).
+# Отдельный workspace: в сборку и Cargo.lock основного workspace не входит.
+[package]
+name = "tp-dav-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tp-dav = { path = ".." }
+
+[[bin]]
+name = "xml"
+path = "fuzz_targets/xml.rs"
+test = false
+doc = false
+bench = false

@@ -1041,6 +1041,8 @@ async fn submission_copy_to_local_address() {
     assert!(env.inbox("carol@example.org").await.is_empty());
 }
 
+mod imip;
+
 mod groups {
     //! SMTP-16: квота до `DATA`, ограничения отправителей и модерация групп рассылки.
 

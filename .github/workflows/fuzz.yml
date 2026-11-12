@@ -30,7 +30,7 @@ jobs:
     outputs:
       matrix: ${{ steps.t.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - id: t
         name: Цели cargo-fuzz
         shell: bash
@@ -68,14 +68,14 @@ jobs:
       TARGET: ${{ matrix.target }}
       SECONDS_PER_TARGET: ${{ inputs.seconds || '600' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.90.3
         with:
           tool: cargo-fuzz
       # rust-cache не нужен: nightly обновляется ежедневно, кэш сборки к следующей ночи устаревает.
       - name: Корпус из кэша
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.name }}-${{ matrix.target }}-${{ github.run_id }}
@@ -94,13 +94,13 @@ jobs:
             -max_total_time="$SECONDS_PER_TARGET" -timeout=30 -print_final_stats=1 2>&1 | tee "$RUNNER_TEMP/fuzz.log"
       - name: Корпус в кэш
         if: always() && steps.build.outcome == 'success'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6.1.0
         with:
           path: ${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.name }}-${{ matrix.target }}-${{ github.run_id }}
       - name: Артефакт падения
         if: failure() && steps.run.outcome == 'failure'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: fuzz-${{ matrix.name }}-${{ matrix.target }}
           path: |
