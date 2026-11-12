@@ -1,0 +1,113 @@
+---
+source: crates/tp-dav/src/tests/caldav_home.rs
+expression: r.show()
+---
+207 Multi-Status
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/</d:href>
+<d:propstat>
+<d:prop>
+<d:resourcetype>
+<d:collection/>
+</d:resourcetype>
+<d:owner>
+<d:href>/dav/principals/ivan@example.org/</d:href>
+</d:owner>
+<d:supported-report-set/>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+<d:propstat>
+<d:prop>
+<d:displayname/>
+<d:sync-token/>
+<cs:getctag/>
+<c:calendar-description/>
+<c:calendar-timezone/>
+<c:supported-calendar-component-set/>
+<c:schedule-calendar-transp/>
+<ical:calendar-color/>
+<ical:calendar-order/>
+</d:prop>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:propstat>
+</d:response>
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/calendar/</d:href>
+<d:propstat>
+<d:prop>
+<d:displayname>Календарь</d:displayname>
+<d:resourcetype>
+<d:collection/>
+<c:calendar/>
+</d:resourcetype>
+<d:owner>
+<d:href>/dav/principals/ivan@example.org/</d:href>
+</d:owner>
+<d:sync-token>urn:thepost:sync:1</d:sync-token>
+<d:supported-report-set>
+<d:supported-report>
+<d:report>
+<d:sync-collection/>
+</d:report>
+</d:supported-report>
+</d:supported-report-set>
+<cs:getctag>1</cs:getctag>
+<c:supported-calendar-component-set>
+<c:comp name="VEVENT"/>
+</c:supported-calendar-component-set>
+<ical:calendar-order>0</ical:calendar-order>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+<d:propstat>
+<d:prop>
+<c:calendar-description/>
+<c:calendar-timezone/>
+<c:schedule-calendar-transp/>
+<ical:calendar-color/>
+</d:prop>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:propstat>
+</d:response>
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/tasks/</d:href>
+<d:propstat>
+<d:prop>
+<d:displayname>Задачи</d:displayname>
+<d:resourcetype>
+<d:collection/>
+<c:calendar/>
+</d:resourcetype>
+<d:owner>
+<d:href>/dav/principals/ivan@example.org/</d:href>
+</d:owner>
+<d:sync-token>urn:thepost:sync:2</d:sync-token>
+<d:supported-report-set>
+<d:supported-report>
+<d:report>
+<d:sync-collection/>
+</d:report>
+</d:supported-report>
+</d:supported-report-set>
+<cs:getctag>2</cs:getctag>
+<c:supported-calendar-component-set>
+<c:comp name="VTODO"/>
+</c:supported-calendar-component-set>
+<ical:calendar-order>1</ical:calendar-order>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+<d:propstat>
+<d:prop>
+<c:calendar-description/>
+<c:calendar-timezone/>
+<c:schedule-calendar-transp/>
+<ical:calendar-color/>
+</d:prop>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:propstat>
+</d:response>
+</d:multistatus>

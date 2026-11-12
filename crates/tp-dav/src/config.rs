@@ -39,6 +39,10 @@ pub struct DavConfig {
     pub expand_horizon: Duration,
     /// Наибольшее число развёрнутых вхождений одного объекта; достигнуто — интервал без конца.
     pub max_instances: usize,
+    /// Отображаемое имя календаря по умолчанию (создаётся при первом обращении к дому календарей).
+    pub default_calendar_name: String,
+    /// Отображаемое имя списка задач по умолчанию (VTODO; создаётся вместе с календарём по умолчанию).
+    pub default_tasks_name: String,
 }
 
 impl Default for DavConfig {
@@ -51,6 +55,8 @@ impl Default for DavConfig {
             max_object_size: 1024 * 1024,
             expand_horizon: Duration::from_secs(730 * 24 * 3600),
             max_instances: 10_000,
+            default_calendar_name: "Календарь".to_owned(),
+            default_tasks_name: "Задачи".to_owned(),
         }
     }
 }

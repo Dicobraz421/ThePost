@@ -250,7 +250,7 @@ pub(crate) async fn mkcol(
         return Ok(not_allowed());
     };
     let kind = *kind;
-    if calendar && kind != CollectionKind::Calendar {
+    if (calendar && kind != CollectionKind::Calendar) || crate::path::reserved(kind, name) {
         return Ok(status(StatusCode::FORBIDDEN));
     }
     let el = match cx.xml(body).await {

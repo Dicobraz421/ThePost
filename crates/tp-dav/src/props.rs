@@ -6,19 +6,31 @@
 //! (`current-user-privilege-set`, `sync-token`, `supported-report-set` и др.) — только по имени. Список дочерних
 //! ресурсов (`Depth: 1`) ограничен `dav.max_response_items`: остаток — `507` с `number-of-matches-within-limits`.
 //!
+//! Дом календарей: при первом `PROPFIND`, если календарей нет, создаются календарь (`calendar`, VEVENT) и список
+//! задач (`tasks`, VTODO) с именами из `dav.default_calendar_name`, `dav.default_tasks_name`. Принципал публикует
+//! `schedule-inbox-URL` и `schedule-outbox-URL` (`inbox/`, `outbox/` дома календарей — заготовки для DAV-13:
+//! отвечают только на `PROPFIND`, имена зарезервированы).
+//!
 //! `PROPPATCH` — у коллекции: `displayname`, описание (`calendar-description`, `addressbook-description`), цвет и
-//! порядок календаря (`calendar-color`, `calendar-order`, Apple). Изменения атомарны: ошибка одного свойства — оно
+//! порядок календаря (`calendar-color`, `calendar-order`, Apple), часовой пояс календаря (`calendar-timezone` —
+//! VTIMEZONE, RFC 4791 §5.2.2; `calendar-timezone-id` — IANA, RFC 7809 §5.2; хранится идентификатор IANA). Изменения атомарны: ошибка одного свойства — оно
 //! со своим статусом (403 — защищённое или неизвестное, 409 — недопустимое значение), остальные — 424, ничего не
 //! записано. Произвольные («мёртвые») свойства не хранятся.
 
 use std::collections::BTreeSet;
+use std::str::FromStr;
 
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
+use calcard::common::timezone::Tz;
+use calcard::icalendar::{
+    ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarProperty,
+};
+use time::OffsetDateTime;
 use tp_contracts::ModSeq;
-use tp_contracts::Result;
-use tp_contracts::dav::{Collection, CollectionKind};
+use tp_contracts::dav::{Collection, CollectionKind, Component};
+use tp_contracts::{Error, Result};
 
 use crate::path::{self, Target};
 use crate::server::{Cx, multistatus, precondition, status};
@@ -63,6 +75,8 @@ pub(crate) enum Res<'a> {
     Principals,
     Principal,
     Home(CollectionKind),
+    /// Ресурс планирования дома календарей: входящие (`true`) или исходящие.
+    Schedule(bool),
     Collection(&'a Collection),
     Object {
         coll: &'a Collection,
@@ -80,10 +94,17 @@ impl Res<'_> {
             Res::Principals => path::PRINCIPALS.to_owned(),
             Res::Principal => path::principal(login),
             Res::Home(k) => path::home(*k, login),
+            Res::Schedule(inbox) => schedule_href(login, *inbox),
             Res::Collection(c) => path::collection(c.kind, login, &c.name),
             Res::Object { coll, name, .. } => path::object(coll.kind, login, &coll.name, name),
         }
     }
+}
+
+/// Ссылка на ресурс планирования: входящие (`true`) или исходящие.
+fn schedule_href(login: &str, inbox: bool) -> String {
+    let name = if inbox { path::INBOX } else { path::OUTBOX };
+    path::collection(CollectionKind::Calendar, login, name)
 }
 
 /// Запрошенные свойства.
@@ -166,6 +187,8 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
             CollectionKind::Calendar => "<d:collection/><c:calendar/>",
             CollectionKind::AddressBook => "<d:collection/><card:addressbook/>",
         },
+        Res::Schedule(true) => "<d:collection/><c:schedule-inbox/>",
+        Res::Schedule(false) => "<d:collection/><c:schedule-outbox/>",
         Res::Object { .. } => "",
     };
     let mut v = vec![p(DAV, "resourcetype", rt.to_owned())];
@@ -189,8 +212,18 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
             }
             addrs.push_str(&href(&me));
             v.push(p(CALDAV, "calendar-user-address-set", addrs));
+            v.push(p(
+                CALDAV,
+                "schedule-inbox-URL",
+                href(&schedule_href(login, true)),
+            ));
+            v.push(p(
+                CALDAV,
+                "schedule-outbox-URL",
+                href(&schedule_href(login, false)),
+            ));
         }
-        Res::Home(_) => v.push(p(DAV, "owner", href(&me))),
+        Res::Home(_) | Res::Schedule(_) => v.push(p(DAV, "owner", href(&me))),
         Res::Collection(c) => collection_props(cx, c, &me, &mut v),
         Res::Object {
             coll, etag, body, ..
@@ -252,6 +285,12 @@ fn collection_props(cx: &Cx<'_>, c: &Collection, me: &str, v: &mut Vec<(PropName
                 "<c:calendar-data content-type=\"text/calendar\" version=\"2.0\"/>".to_owned(),
             ));
             v.push(p(CALDAV, "max-resource-size", max));
+            if let Some(tz) = &c.timezone {
+                v.push(p(CALDAV, "calendar-timezone-id", text(tz).into_owned()));
+                if let Some(ical) = vtimezone(tz) {
+                    v.push(p(CALDAV, "calendar-timezone", text(&ical).into_owned()));
+                }
+            }
         }
         CollectionKind::AddressBook => {
             if let Some(d) = &c.description {
@@ -269,6 +308,35 @@ fn collection_props(cx: &Cx<'_>, c: &Collection, me: &str, v: &mut Vec<(PropName
             v.push(p(CARDDAV, "max-resource-size", max));
         }
     }
+}
+
+/// Идентификатор изготовителя в создаваемых данных iCalendar.
+pub(crate) const PRODID: &str = "-//The Post//DAV//RU";
+
+/// Пустой VCALENDAR (`VERSION`, `PRODID`).
+pub(crate) fn vcalendar() -> ICalendar {
+    let mut root = ICalendarComponent::new(ICalendarComponentType::VCalendar);
+    root.add_property(ICalendarProperty::Version, "2.0");
+    root.add_property(ICalendarProperty::Prodid, PRODID);
+    ICalendar {
+        components: vec![root],
+    }
+}
+
+/// Значение `calendar-timezone` (RFC 4791 §5.2.2): VCALENDAR с VTIMEZONE пояса `tzid` (IANA), правила — на год
+/// вперёд от текущего момента. Неизвестный пояс — `None`.
+fn vtimezone(tzid: &str) -> Option<String> {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let mut ical = vcalendar();
+    ical.add_timezone(tzid, now, now + 366 * 86_400)?;
+    Some(ical.to_string())
+}
+
+/// Часовой пояс (IANA) из значения `calendar-timezone` (VCALENDAR с VTIMEZONE).
+fn timezone_of(ical: &str) -> Option<String> {
+    let ical = ICalendar::parse(ical).ok()?;
+    let (_, tz) = ical.timezones().find_map(ICalendarComponent::timezone)?;
+    tz.name().map(std::borrow::Cow::into_owned)
 }
 
 /// Группы `propstat` ресурса для запроса `want`.
@@ -365,6 +433,9 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         }
         Target::Principal(_) => emit(cx, &mut ms, &Res::Principal, &want),
         Target::Home(kind, _) => {
+            if *kind == CollectionKind::Calendar {
+                ensure_defaults(cx).await?;
+            }
             emit(cx, &mut ms, &Res::Home(*kind), &want);
             if depth1 {
                 let list = cx.store().list_collections(cx.scope, *kind).await?;
@@ -378,6 +449,10 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         }
         Target::Collection(kind, _, name) => {
             let Some(c) = cx.store().collection_by_name(cx.scope, *kind, name).await? else {
+                if path::reserved(*kind, name) {
+                    emit(cx, &mut ms, &Res::Schedule(name == path::INBOX), &want);
+                    return Ok(multistatus(ms));
+                }
                 return Ok(status(StatusCode::NOT_FOUND));
             };
             emit(cx, &mut ms, &Res::Collection(&c), &want);
@@ -402,6 +477,34 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         }
     }
     Ok(multistatus(ms))
+}
+
+/// Календарь и список задач по умолчанию — если у учётной записи нет ни одного календаря. Имена ресурсов
+/// постоянные ([`path::DEFAULT_CALENDAR`], [`path::DEFAULT_TASKS`]): одновременные обращения не создают дубликатов
+/// (`Conflict` хранилища — уже создано).
+pub(crate) async fn ensure_defaults(cx: &Cx<'_>) -> Result<()> {
+    let kind = CollectionKind::Calendar;
+    if !cx.store().list_collections(cx.scope, kind).await?.is_empty() {
+        return Ok(());
+    }
+    let cfg = &cx.dav.cfg;
+    let defaults = [
+        (path::DEFAULT_CALENDAR, &cfg.default_calendar_name, Component::Event),
+        (path::DEFAULT_TASKS, &cfg.default_tasks_name, Component::Todo),
+    ];
+    for (order, (name, display, component)) in (0u32..).zip(defaults) {
+        let c = Collection {
+            display_name: display.clone(),
+            order,
+            components: BTreeSet::from([component]),
+            ..Collection::new(kind, name)
+        };
+        match cx.store().create_collection(cx.scope, c).await {
+            Ok(_) | Err(Error::Conflict) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Объекты коллекции (`Depth: 1`), не больше `dav.max_response_items`.
@@ -482,6 +585,18 @@ pub(crate) fn apply(c: &mut Collection, name: &PropName, value: Option<&Element>
             None => c.order = 0,
             Some(Ok(n)) => c.order = n,
             Some(Err(_)) => return StatusCode::CONFLICT,
+        },
+        (CALDAV, "calendar-timezone") if calendar => match v.filter(|s| !s.is_empty()) {
+            None => c.timezone = None,
+            // Пояс, которого нет в базе IANA (своё определение клиента), не хранится: календарь остаётся в UTC.
+            Some(ical) => c.timezone = timezone_of(&ical),
+        },
+        (CALDAV, "calendar-timezone-id") if calendar => match v.filter(|s| !s.is_empty()) {
+            None => c.timezone = None,
+            Some(id) => match Tz::from_str(&id).ok().and_then(|tz| tz.name()) {
+                Some(tz) => c.timezone = Some(tz.into_owned()),
+                None => return StatusCode::CONFLICT,
+            },
         },
         _ => return StatusCode::FORBIDDEN,
     }

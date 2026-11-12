@@ -133,6 +133,23 @@ fn area(kind: CollectionKind) -> &'static str {
     }
 }
 
+/// Имя ресурса входящих приглашений в доме календарей (`schedule-inbox-URL`, RFC 6638; заготовка для DAV-13).
+pub(crate) const INBOX: &str = "inbox";
+
+/// Имя ресурса исходящих приглашений в доме календарей (`schedule-outbox-URL`).
+pub(crate) const OUTBOX: &str = "outbox";
+
+/// Имя зарезервировано под ресурсы планирования дома календарей.
+pub(crate) fn reserved(kind: CollectionKind, name: &str) -> bool {
+    kind == CollectionKind::Calendar && (name == INBOX || name == OUTBOX)
+}
+
+/// Имя календаря по умолчанию (сегмент URL).
+pub(crate) const DEFAULT_CALENDAR: &str = "calendar";
+
+/// Имя списка задач по умолчанию (сегмент URL).
+pub(crate) const DEFAULT_TASKS: &str = "tasks";
+
 /// `/dav/principals/`.
 pub(crate) const PRINCIPALS: &str = "/dav/principals/";
 
