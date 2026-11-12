@@ -22,9 +22,9 @@
 | ОС | glibc | Шаг 1 | Шаг 2 | doctor | Письмо |
 |---|---|---|---|---|---|
 | Debian 13 (trixie) | 2.41 | `ok=137 changed=88 failed=0` | `changed=0` | `OK` 26, `WARN` 3, `FAIL` 0 | `alice → bob`: 587 принято, в INBOX по IMAP |
-| Ubuntu 26.04.1 LTS (resolute) ¹ | 2.43 | `ok=135 changed=86 failed=0` | `changed=1` — `chrony : Start chrony` (только в контейнере, см. ниже) | `OK` 26, `WARN` 3, `FAIL` 0 | то же |
+| Ubuntu 26.04.1 LTS (resolute) | 2.43 | `ok=137 changed=87 failed=0` | `changed=1` — `chrony : Start chrony` (только в контейнере, см. ниже) | `OK` 26, `WARN` 3, `FAIL` 0 | то же |
 
-¹ Ubuntu — прогон до правок по РЕД ОС, AlmaLinux, Astra и до слияния с `main` (DEP-23); Debian 13 — на итоговом коде.
+Код — ветка `w/deploy-16` после слияния с `main` (снимок OpenBao, DEP-23).
 
 `WARN` — ожидаемые для стенда: `secrets.seal static` (ключ распечатывания в файле), `privileges.seccomp log` (нет
 секции `confine`), `dns.dkim` (DKIM не настроен); DNS-проверки домена `example.test` — `SKIP`.
