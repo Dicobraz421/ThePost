@@ -13,8 +13,8 @@ manual: no
 
 ## Сделать
 - Роль `thepost`: переключатель `thepost_wait_ready` (по умолчанию `true`); `false` — плейбук не ждёт `/healthz/ready`
-  и завершается успешно с предупреждением (сценарий «новый сервер перед `restore.yml`»). Умолчание владельца из синка
-  12.11 — вариант «б»; инструкция INSTALL — DOC-02.
+  и завершается успешно с предупреждением (сценарий «новый сервер перед `restore.yml`»). Подтверждено владельцем —
+  решение 79; инструкция INSTALL — DOC-02.
 - `deploy/README.md`, раздел «Резервное копирование и восстановление»: снимок Raft OpenBao (`thepost_backup_openbao`,
   `thepost-backup-openbao.service`, AppRole `thepost-backup-snapshot`), восстановление `-e thepost_restore_openbao=true`
   с ключом распечатывания, `chown` каталога копий на новой ВМ.
