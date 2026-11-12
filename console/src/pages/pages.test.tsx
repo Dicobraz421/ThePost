@@ -13,6 +13,7 @@ const empty = {
   max_recipients: null,
   milter_profile: null,
   quota_bytes: null,
+  rcpts_per_hour: null,
   retention: null,
   send_per_hour: null,
   trash_purge: null,

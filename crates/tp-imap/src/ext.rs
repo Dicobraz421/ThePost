@@ -22,6 +22,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use tp_contracts::acl::{ANYONE, AclStore, validate_identifier};
+use tp_contracts::audit::AuditAction;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights};
 use tp_contracts::meta::{AccountScope, AccountStore, Flag, Flags};
 use tp_contracts::{Error, MailboxId, Result};
@@ -535,6 +536,9 @@ impl<T: Transport> Session<T> {
                     _ => rights,
                 };
                 acl.set_acl(scope, mailbox, &identifier, new).await?;
+                let detail = format!("{identifier} {new}");
+                self.audit_done(scope, AuditAction::ChangeRights, mailbox, &[], Some(detail))
+                    .await;
                 self.ok(tag, None, "SETACL completed");
             }
             AclCommand::Delete { identifier, .. } => {
@@ -552,6 +556,9 @@ impl<T: Transport> Session<T> {
                 }
                 acl.set_acl(scope, mailbox, &identifier, Rights::NONE)
                     .await?;
+                let detail = format!("{identifier} deleted");
+                self.audit_done(scope, AuditAction::ChangeRights, mailbox, &[], Some(detail))
+                    .await;
                 self.ok(tag, None, "DELETEACL completed");
             }
             AclCommand::MyRights { .. } => {}

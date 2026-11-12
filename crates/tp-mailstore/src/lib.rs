@@ -34,6 +34,8 @@ pub mod disabled;
 mod fetch;
 #[doc(hidden)]
 pub mod fuzz;
+#[cfg(test)]
+mod fuzz_regress;
 mod ingest;
 pub mod meta;
 mod ops;

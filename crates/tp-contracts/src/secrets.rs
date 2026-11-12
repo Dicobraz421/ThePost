@@ -290,6 +290,12 @@ pub trait SecretStore: Send + Sync + 'static {
     /// хранилище недоступно или запечатано — `Unavailable`.
     async fn get(&self, secret: &SecretRef) -> Result<Secret>;
 
+    /// Записывает поле секрета новой версией; остальные поля пути сохраняются (узел кладёт выпущенные им секреты,
+    /// например ключ TLS от ACME; права узла на запись — только своих путей, политика хранилища).
+    /// Запрещено политикой — `Forbidden`; хранилище недоступно — `Unavailable`;
+    /// хранилище не настроено или путь не для записи (динамический секрет, нет пути внутри точки монтирования) или изменён параллельно — `Invalid`.
+    async fn put(&self, secret: &SecretRef, value: &Secret) -> Result<()>;
+
     /// Продлевает аренду; возвращает новый срок. Неизвестная, истёкшая или непродлеваемая аренда — `NotFound`
     /// (секрет нужно прочитать заново). По умолчанию аренд нет — `NotFound`.
     async fn renew(&self, lease: &SecretLease) -> Result<SecretLease> {
@@ -415,6 +421,10 @@ mod tests {
                 "thepost/admin#token" => Err(Error::Forbidden),
                 _ => Err(Error::NotFound),
             }
+        }
+
+        async fn put(&self, _: &SecretRef, _: &Secret) -> Result<()> {
+            Err(Error::Forbidden)
         }
     }
 

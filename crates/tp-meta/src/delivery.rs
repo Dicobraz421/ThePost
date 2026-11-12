@@ -1,11 +1,11 @@
 //! Журнал доставки на PostgreSQL (META-22; CONTRACTS.md#DeliveryLog; SRS 5.2).
 //!
 //! Таблица `delivery_log` секционирована по суткам UTC; секции нужных суток создаются перед записью
-//! (`tp_delivery_partitions`), устаревшие удаляются целиком ([`DeliveryLog::purge`], срок —
+//! (`tp_log_partitions`), устаревшие удаляются целиком ([`DeliveryLog::purge`], срок —
 //! [`DeliveryLogConfig::retention`]). Таблица только на добавление: UPDATE и DELETE отклоняет триггер, роль
 //! приложения имеет только SELECT и INSERT. Момент хранится с точностью до микросекунды.
 //!
-//! Позиция страницы — `<момент в микросекундах>.<номер записи>` последней записи страницы.
+//! Позиция страницы — [`position`] последней записи страницы.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -103,13 +103,15 @@ fn micros(at: OffsetDateTime) -> i128 {
     at.unix_timestamp_nanos().div_euclid(1000)
 }
 
-fn cursor(at: OffsetDateTime, seq: i64) -> DeliveryCursor {
-    DeliveryCursor(format!("{}.{seq}", micros(at)))
+/// Позиция страницы журнала по суткам (доставки, аудита ящика): `<момент в микросекундах>.<номер записи>`.
+pub(crate) fn position(at: OffsetDateTime, seq: i64) -> String {
+    format!("{}.{seq}", micros(at))
 }
 
-fn parse_cursor(c: &DeliveryCursor) -> Result<(OffsetDateTime, i64)> {
-    let bad = || Error::invalid("неверная позиция журнала доставки");
-    let (at, seq) = c.0.split_once('.').ok_or_else(bad)?;
+/// Разбор [`position`]; неверная позиция — `Error::Invalid`.
+pub(crate) fn parse_position(c: &str) -> Result<(OffsetDateTime, i64)> {
+    let bad = || Error::invalid("неверная позиция журнала");
+    let (at, seq) = c.split_once('.').ok_or_else(bad)?;
     let at: i128 = at.parse().map_err(|_| bad())?;
     let seq: i64 = seq.parse().map_err(|_| bad())?;
     let at = at
@@ -117,6 +119,55 @@ fn parse_cursor(c: &DeliveryCursor) -> Result<(OffsetDateTime, i64)> {
         .and_then(|n| OffsetDateTime::from_unix_timestamp_nanos(n).ok())
         .ok_or_else(bad)?;
     Ok((at, seq))
+}
+
+fn cursor(at: OffsetDateTime, seq: i64) -> DeliveryCursor {
+    DeliveryCursor(position(at, seq))
+}
+
+fn parse_cursor(c: &DeliveryCursor) -> Result<(OffsetDateTime, i64)> {
+    parse_position(&c.0)
+}
+
+/// Секции суток `days` журнала `parent` (`tp_log_partitions`).
+pub(crate) async fn day_partitions(
+    tx: &mut sqlx::PgConnection,
+    parent: &str,
+    days: &[Date],
+) -> Result<()> {
+    sqlx::query("SELECT tp_log_partitions($1, $2::date[])")
+        .bind(parent)
+        .bind(days)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// Удаляет секции журнала `parent`, сутки которых целиком раньше `before` (`tp_log_purge`, по всем организациям).
+pub(crate) async fn purge_days(
+    meta: &PgMeta,
+    parent: &'static str,
+    before: OffsetDateTime,
+) -> Result<()> {
+    meta.rewrite(|| async move {
+        let dropped: i32 = with_system(&meta.pool, move |tx| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT tp_log_purge($1, $2)")
+                    .bind(parent)
+                    .bind(before)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)
+            })
+        })
+        .await?;
+        if dropped > 0 {
+            tracing::info!(log = parent, sections = dropped, %before, "журнал: удалены секции");
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[derive(FromRow)]
@@ -240,11 +291,7 @@ impl PgMeta {
                 let batch = Arc::clone(&batch);
                 Box::pin(async move {
                     let (batch, seq) = &*batch;
-                    sqlx::query("SELECT tp_delivery_partitions($1::date[])")
-                        .bind(&batch.days)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db_err)?;
+                    day_partitions(tx, "delivery_log", &batch.days).await?;
                     sqlx::query(
                         "INSERT INTO delivery_log (tenant_id, at, seq, node, kind, sender, sender_key, recipients,
                                                    rcpt_keys, message_id, queue_id, decision, reason)
@@ -370,21 +417,37 @@ impl DeliveryLog for PgMeta {
     }
 
     async fn purge(&self, before: OffsetDateTime) -> Result<()> {
-        self.rewrite(|| async move {
-            let dropped: i32 = with_system(&self.pool, move |tx| {
+        purge_days(self, "delivery_log", before).await
+    }
+
+    async fn by_queue(
+        &self,
+        tenant: TenantId,
+        queue: QueueId,
+        limit: usize,
+    ) -> Result<Vec<DeliveryEvent>> {
+        if limit == 0 {
+            return Err(Error::invalid("delivery by_queue limit must be positive"));
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.idempotent(|| async move {
+            let rows: Vec<EventRow> = with_tenant(&self.pool, tenant, move |tx| {
                 Box::pin(async move {
-                    sqlx::query_scalar("SELECT tp_delivery_purge($1)")
-                        .bind(before)
-                        .fetch_one(&mut *tx)
-                        .await
-                        .map_err(db_err)
+                    sqlx::query_as(
+                        "SELECT at, seq, node, kind, sender, recipients, message_id, queue_id, decision, reason
+                         FROM delivery_log WHERE tenant_id = $1 AND queue_id = $2
+                         ORDER BY at, seq LIMIT $3",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(queue.as_uuid())
+                    .bind(limit)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(db_err)
                 })
             })
             .await?;
-            if dropped > 0 {
-                tracing::info!(sections = dropped, %before, "журнал доставки: удалены секции");
-            }
-            Ok(())
+            rows.into_iter().map(|r| r.into_event(tenant)).collect()
         })
         .await
     }

@@ -1,5 +1,7 @@
 target/
-corpus/
+# Корпус — в кэше CI; в git — только входы `crash-*`, на которых разбор падал (тесты src/fuzz_regress.rs).
+corpus/*/*
+!corpus/*/crash-*
 artifacts/
 coverage/
 Cargo.lock

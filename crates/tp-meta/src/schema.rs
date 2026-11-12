@@ -115,9 +115,19 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0025_busy_recurring.sql"),
     ),
     (
+        26,
+        "rcpts per hour",
+        include_str!("../migrations/0026_rcpts_per_hour.sql"),
+    ),
+    (
         27,
+        "submissions mailbox audit",
+        include_str!("../migrations/0027_submissions_mailbox_audit.sql"),
+    ),
+    (
+        30,
         "address book",
-        include_str!("../migrations/0027_address_book.sql"),
+        include_str!("../migrations/0030_address_book.sql"),
     ),
 ];
 
@@ -258,4 +268,65 @@ pub(crate) fn to_u64(v: i64) -> Result<u64> {
 /// `u64` → `bigint`.
 pub(crate) fn to_i64(v: u64) -> Result<i64> {
     i64::try_from(v).map_err(|_| Error::invalid(format!("значение вне bigint: {v}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MIGRATIONS;
+
+    /// Версии в списке идут подряд с 1; каждому номеру соответствует ровно один файл
+    /// `migrations/NNNN_*.sql` с тем же содержимым; лишних файлов в каталоге нет.
+    #[test]
+    fn migration_numbers_are_sequential_and_match_files() {
+        for (i, (version, _, _)) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(
+                *version,
+                i64::try_from(i).expect("индекс") + 1,
+                "версии миграций должны идти подряд с 1 (позиция {i})"
+            );
+        }
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut files: Vec<(i64, String)> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("каталог migrations") {
+            let name = entry
+                .expect("запись каталога")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            let (num, rest) = name.split_once('_').unwrap_or((&name, ""));
+            let num: i64 = num
+                .parse()
+                .unwrap_or_else(|_| panic!("имя файла миграции без номера: {name}"));
+            assert!(
+                num.to_string().len() <= 4 && name.len() > 5 && rest.ends_with(".sql"),
+                "имя файла миграции не вида NNNN_*.sql: {name}"
+            );
+            files.push((num, name));
+        }
+        files.sort();
+
+        for pair in files.windows(2) {
+            assert_ne!(
+                pair[0].0, pair[1].0,
+                "два файла с одним номером миграции: {} и {}",
+                pair[0].1, pair[1].1
+            );
+        }
+        let nums: Vec<i64> = files.iter().map(|(n, _)| *n).collect();
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|(v, _, _)| *v).collect();
+        assert_eq!(
+            nums, versions,
+            "файлы в migrations/ и список MIGRATIONS расходятся"
+        );
+
+        for ((version, _, sql), (_, name)) in MIGRATIONS.iter().zip(&files) {
+            assert!(
+                name.starts_with(&format!("{version:04}_")),
+                "номер в имени {name} не совпадает с версией {version}"
+            );
+            let on_disk = std::fs::read_to_string(dir.join(name)).expect("файл миграции");
+            assert_eq!(&on_disk, sql, "файл {name} не тот, что подключён в списке");
+        }
+    }
 }
