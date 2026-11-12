@@ -7,9 +7,9 @@
 //!
 //! Подсекции `blob.local` и `blob.s3` — секции крейта `tp-blob` как есть (BLOB-11): приложение подставляет только каталог, бакет и префикс из `blob.url`.
 //!
-//! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `sieve`, `imap`, `jmap`, `search`, `mailstore`; `admin` — секция
+//! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `sieve`, `imap`, `jmap`, `dav`, `search`, `mailstore`; `admin` — секция
 //! `tp-admin` без `listen` (адрес Admin API — один ключ `http.admin.listen`, APP-16); приложение добавляет `auth`
-//! (каталог, OIDC, пароли приложений, Kerberos) и `http` (слушатели jmap и admin).
+//! (каталог, OIDC, пароли приложений, Kerberos) и `http` (слушатели jmap, dav и admin).
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
@@ -21,6 +21,7 @@ use serde::{Deserialize, Deserializer};
 use tp_blob::{GcConfig, LocalConfig, OrphanConfig, S3Config};
 use tp_cluster::{LocalBusConfig, RpcConfig};
 use tp_contracts::config::duration;
+use tp_contracts::role::{Role, RoleSet};
 use tp_contracts::tls::{InternalChannel, Profile};
 use tp_contracts::{Error, Result};
 use tp_meta::MetaConfig;
@@ -47,6 +48,8 @@ pub const SMTP: &str = "smtp";
 pub const IMAP: &str = "imap";
 /// Имя секции JMAP (`tp-jmap`).
 pub const JMAP: &str = "jmap";
+/// Имя секции календарей и контактов CalDAV/CardDAV (`tp-dav`).
+pub const DAV: &str = "dav";
 /// Имя секции правил Sieve и автоответа (`tp-sieve`).
 pub const SIEVE: &str = "sieve";
 /// Имя секции поиска (`tp-search`).
@@ -59,7 +62,7 @@ pub const MAILSTORE: &str = "mailstore";
 pub const MAINTENANCE: &str = "maintenance";
 /// Имя секции входа: каталог, OIDC, пароли приложений, Kerberos.
 pub const AUTH: &str = "auth";
-/// Имя секции слушателей HTTP ролей jmap и admin.
+/// Имя секции слушателей HTTP ролей jmap, dav и admin.
 pub const HTTP: &str = "http";
 
 /// Реестр секций: платформа, `tp-meta`, приложение и встроенные модули; проверки каналов.
@@ -83,6 +86,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     r.add_section::<tp_sieve::SieveConfig>(SIEVE)?;
     r.add_section::<tp_imap::ImapConfig>(IMAP)?;
     r.add_section::<tp_jmap::JmapConfig>(JMAP)?;
+    r.add_section::<tp_dav::DavConfig>(DAV)?;
     r.add_section::<tp_search::SearchConfig>(SEARCH)?;
     r.add_section::<AdminSection>(ADMIN)?;
     r.add_section::<tp_mailstore::Config>(MAILSTORE)?;
@@ -470,8 +474,9 @@ impl AuthSection {
 
 // ---------- http ----------
 
-/// Секция `http`: слушатели HTTP ролей jmap и admin (TLS — секция `tls`; открытый HTTP — только `profile: dev`
+/// Секция `http`: слушатели HTTP ролей jmap, dav и admin (TLS — секция `tls`; открытый HTTP — только `profile: dev`
 /// с `allow_plaintext`). Слушатель не задан — роль готова, но соединений не принимает. Требует перезапуска.
+/// Календари и контакты (роль dav, `/dav/*`) без `dav` отдаёт слушатель `jmap` — один порт 443 с JMAP.
 /// `acme` — открытый HTTP для проверок ACME HTTP-01 (только при `acme.enabled`, APP-14).
 ///
 /// ```yaml
@@ -485,6 +490,9 @@ impl AuthSection {
 pub struct HttpSection {
     /// JMAP (`/.well-known/jmap`, `/jmap/*`).
     pub jmap: Option<HttpListener>,
+    /// CalDAV и CardDAV (`/dav/*`, `/.well-known/caldav`, `/.well-known/carddav`) на отдельном адресе; не задан —
+    /// на слушателе `jmap`.
+    pub dav: Option<HttpListener>,
     /// Admin API (`/api/*`); адрес — только внутренний (loopback, частные сети).
     pub admin: Option<HttpListener>,
     /// Проверки ACME HTTP-01 (`/.well-known/acme-challenge/*`, остальное — 404) при `acme.enabled`.
@@ -556,14 +564,39 @@ impl HttpListener {
 }
 
 impl HttpSection {
-    /// Проверка: открытый HTTP — только в dev, ненулевые таймауты, Admin API — только на внутреннем адресе.
+    /// Проверка: открытый HTTP — только в dev, ненулевые таймауты, Admin API — только на внутреннем адресе,
+    /// `dav` — не тот же адрес, что `jmap` (общий порт — без `http.dav`).
     pub fn check(&self, profile: Profile) -> Result<()> {
-        for (name, l, public) in [("jmap", &self.jmap, true), ("admin", &self.admin, false)] {
+        for (name, l, public) in [
+            ("jmap", &self.jmap, true),
+            ("dav", &self.dav, true),
+            ("admin", &self.admin, false),
+        ] {
             if let Some(l) = l {
                 l.server(public).check(profile).map_err(|e| sub(name, e))?;
             }
         }
+        if let (Some(jmap), Some(dav)) = (&self.jmap, &self.dav)
+            && jmap.listen == dav.listen
+            && jmap.listen.port() != 0
+        {
+            return Err(Error::Invalid(format!(
+                "dav: listen {} совпадает с http.jmap.listen: для общего порта уберите http.dav — календари и \
+                 контакты отдаёт слушатель jmap",
+                dav.listen
+            )));
+        }
         Ok(())
+    }
+
+    /// Слушатель календарей и контактов узла с ролями `roles`: `http.dav`; не задан — `http.jmap`. Второе
+    /// значение — `true`, если это слушатель роли jmap того же узла (маршруты DAV добавляются к JMAP, своего
+    /// сокета у роли dav нет).
+    pub fn dav_listener(&self, roles: &RoleSet) -> (Option<&HttpListener>, bool) {
+        match &self.dav {
+            Some(dav) => (Some(dav), false),
+            None => (self.jmap.as_ref(), roles.contains(Role::Jmap)),
+        }
     }
 }
 
@@ -1134,6 +1167,7 @@ blob:
             "\"sieve\"",
             "\"imap\"",
             "\"jmap\"",
+            "\"dav\"",
             "\"search\"",
             "\"admin\"",
             "\"auth\"",
