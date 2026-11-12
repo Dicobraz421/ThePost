@@ -54,6 +54,42 @@ pgBackRest из PGDG, restic 0.14 из Debian.
 «сироты»; записи учёта проверяются все (строка «verify ловит потерю»). Тела писем после `T` остаются до суток и
 удаляются поиском «сирот».
 
+## Прогон S3 2026-11-12
+
+Стенд: school-99, SeaweedFS 3.80 в контейнере (S3 по HTTPS на 443, свой CA, бакет `thepost-backup`), прежняя ВМ —
+контейнер Debian 12 с systemd, новая — Debian 13 (одно имя в инвентаре `mail.example.test`), Ansible 2.17 в отдельном
+контейнере (`community.docker.docker_api`), `thepost_tls_mode: internal`, узел — выпуск `beta-20261112` (x86_64),
+DKIM (`thepost/dkim#example.test`, RSA 2048). Хранилище копий:
+
+```yaml
+thepost_backup_repo: s3
+thepost_backup_s3_endpoint: https://s3.dep22.test
+thepost_backup_s3_bucket: thepost-backup
+thepost_backup_s3_uri_style: path
+thepost_backup_s3_ca_file: /etc/ssl/dep22/s3-ca.pem      # CA стенда, положен на ВМ заранее
+thepost_backup_repo_path: /pgbackrest
+thepost_backup_restic_repo: s3:https://s3.dep22.test/thepost-backup/blob
+```
+
+Особенности стенда — как в прогоне 2026-11-11 (`mount --make-rshared /`, `cluster.node_id`), chrony — drop-in с `-x`
+(часы общего хоста не трогать). Правок роли `pgbackrest` для S3 не понадобилось.
+
+| # | Итог |
+|---|---|
+| 1 | первый прогон — `failed=1` на `Wait for thepost readiness` (`secret thepost/dkim#example.test: not found`): ключ DKIM и ключи S3 (`thepost-backup/s3`) положены в OpenBao после него, как в INSTALL; второй прогон — `failed=0`, stanza в S3, репозиторий restic `s3:https://…/blob`, полная копия 20261112-124515F (3,7 МБ), снимок OpenBao |
+| 2 | `changed=0` |
+| 3 | три таймера; `status: ok`, `cipher: aes-256-cbc`, `repo1-type=s3`, `repo1-storage-verify-tls=y` со своим CA; снимка `thepost-blob` до первого письма нет — каталог писем пуст (`ConditionDirectoryNotEmpty`) |
+| 4 | `window: 15d` |
+| 5 | `.cred` 0600 root (`pgbackrest`, `restic-password`, `restic-aws`, `openbao-snapshot`); в `/etc/pgbackrest/pgbackrest.conf` — только `repo1-cipher-type`, ключей S3 и шифрования нет |
+| 6 | `admin init`; письма 1–3 — `MESSAGES 3` |
+| 7 | diff 20261112-124515F_20261112-125014D; `thepost-backup-blob`, `thepost-backup-openbao` — `success` |
+| 8 | `T = 2026-11-12 12:50:33+00`; письмо 6; WAL `…0A` в архиве S3 (`failed_count 0`); снимок BLOB `c82d9e2f` |
+| 9 | каталог данных PostgreSQL и каталог писем удалены |
+| 10 | `failed=0`; «Снимок каталога писем: c82d9e2f»; `thepost verify: объектов 0, записей 10, потерянных 0`; новая полная копия 20261112-125629F |
+| 11 | `MESSAGES 5`: письма 1–5 с телами, письма 6 нет |
+| 12 | без `thepost_restore_confirm` — отказ на проверке параметров, `thepost` и PostgreSQL — `active` |
+| 13 | письмо 7 → diff → прежняя ВМ остановлена. Новая ВМ (Debian 13): `smb.yml -e thepost_backup=false -e thepost_wait_ready=false` — `failed=0`, предупреждение `Warn that thepost is not ready` (DEP-27); в новый OpenBao — пароль restic и ключи S3; `restore.yml` без ключа распечатывания — отказ, службы `active`; с `thepost_restore_openbao_static_key_src` — `failed=0`: «Снимок OpenBao: 07457b71», база и письма из S3, `verify` — 12 записей, потерянных 0; `MESSAGES 6` (1–5, 7) с телами; отпечаток `thepost/dkim` тот же (`9f44fadf…`); новая полная копия 20261112-132155F и снимки в S3. Обычный `smb.yml` после — `failed=0`, `changed=2` (`config.yaml`: окно W с копированием). |
+
 ## Замечания
 
 - Роль `postgresql` (`tasks/accounts.yml`) передаёт `community.postgresql.postgresql_user` параметр `update_password`,

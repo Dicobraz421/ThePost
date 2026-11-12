@@ -225,7 +225,8 @@
 - name: Warn that thepost is not ready
   ansible.builtin.debug:
     msg: >-
-      ВНИМАНИЕ: thepost не готов (/healthz/ready — {{ thepost_ready_once.status | default('нет ответа') }}),
+      ВНИМАНИЕ: thepost не готов (/healthz/ready — {{ 'нет ответа' if thepost_ready_once.status | default(-1) | int < 0
+        else thepost_ready_once.status }}),
       ожидание выключено (thepost_wait_ready: false). На новом сервере это ожидаемо до restore.yml с
       thepost_restore_openbao=true; причина — journalctl -u thepost.
   when: not thepost_wait_ready | bool and thepost_ready_once.status | default(0) != 200
