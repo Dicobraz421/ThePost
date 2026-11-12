@@ -454,6 +454,7 @@
 | [META-53](META-53.md) | метрика доли NOTIFY во времени фиксации primary | meta | A | meta-34 | ready | — |
 | [BLOB-16](BLOB-16.md) | метрика «сирот» после цикла GC | blob | A | blob-09 | todo | — |
 | [PLT-25](PLT-25.md) | метрики пула СУБД и слушателя сигналов | platform | A | platform-15 | ready | — |
+| [PLT-32](PLT-32.md) | ratelimit.trusted — доверенные подсети без ограничения частоты | platform | A | platform-21 | ready | — |
 | [APP-31](APP-31.md) | старт узла при медленном OpenBao | app | A | app-30 | ready | — |
 | [DEP-25](DEP-25.md) | стенд Д.6 — два прогона, квота 150 MB, генератор доверенный, сценарий перебора | deploy | A | deploy-21 | ready | DEP-14 |
 | [DOC-01](DOC-01.md) | docs/PREREQUISITES.md — требования и тонкости настройки окружения | docs | A | docs-01 | done | — |

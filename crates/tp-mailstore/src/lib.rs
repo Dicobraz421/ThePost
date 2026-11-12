@@ -6,7 +6,8 @@
 //! Объекты пишет [`BlobWriter`] (сжатие zstd по правилам BLOB-13, хэш и дедупликация — по исходному
 //! содержимому), читает [`Decompressing`] (распаковка по признаку учёта) — MS-15.
 //! Изменяющие операции после фиксации публикуют `MailboxChanged` в [`EventBus`]; ошибка публикации
-//! не отменяет операцию (шина at-most-once, клиенты сверяются по `ModSeq`). Корзина и истечение её срока — [`trash`].
+//! не отменяет операцию (шина at-most-once, клиенты сверяются по `ModSeq`). Корзина и истечение её срока — [`trash`];
+//! хранение отключённых ящиков — [`disabled`].
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -29,6 +30,7 @@ use tp_contracts::meta::{
 use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::{MailboxId, MessageId, ModSeq, Result};
 
+pub mod disabled;
 mod fetch;
 #[doc(hidden)]
 pub mod fuzz;
@@ -41,6 +43,7 @@ pub mod quota;
 pub mod split;
 pub mod trash;
 
+pub use disabled::{DisabledConfig, DisabledMailboxes, DisabledPass};
 pub use quota::QuotaWarnConfig;
 pub use split::MimeLimits;
 pub use trash::{TrashConfig, TrashPass};
@@ -52,6 +55,12 @@ pub use trash::{TrashConfig, TrashPass};
 ///   max_wait: 1h
 ///   retry: 5m
 ///   batch: 500
+///   defer: 1d
+/// disabled:
+///   max_wait: 1h
+///   retry: 5m
+///   batch: 100
+///   page: 500
 ///   defer: 1d
 /// quota:
 ///   thresholds: [80, 95]
@@ -66,6 +75,8 @@ pub use trash::{TrashConfig, TrashPass};
 pub struct Config {
     /// Истечение срока корзины.
     pub trash: TrashConfig,
+    /// Хранение отключённых ящиков.
+    pub disabled: DisabledConfig,
     /// Предупреждения о заполнении квоты.
     pub quota: QuotaWarnConfig,
     /// Пределы разбора MIME.
@@ -355,6 +366,40 @@ pub(crate) mod testenv {
                 store,
             }
         }
+    }
+
+    /// Таймер на часах testkit: запоминает взведённые сроки.
+    pub struct TestTimer {
+        pub clock: tp_testkit::ManualClock,
+        pub armed: Arc<std::sync::Mutex<Vec<OffsetDateTime>>>,
+    }
+
+    impl crate::trash::Timer for TestTimer {
+        fn now(&self) -> OffsetDateTime {
+            Clock::now(&self.clock)
+        }
+
+        fn sleep_until(&self, at: OffsetDateTime) -> impl Future<Output = ()> + Send {
+            self.armed.lock().expect("lock").push(at);
+            let clock = self.clock.clone();
+            async move {
+                while Clock::now(&clock) < at {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Ждёт выполнения условия (не дольше 5 с).
+    pub async fn until(what: &str, mut cond: impl AsyncFnMut() -> bool) {
+        let wait = async {
+            while !cond().await {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap_or_else(|_| panic!("не дождались: {what}"));
     }
 
     /// Исходное содержимое объекта (с распаковкой).

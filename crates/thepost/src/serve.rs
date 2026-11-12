@@ -163,6 +163,13 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     if meta_cfg.migrate_on_start {
         tp_meta::schema::migrate(&migrations).await?;
     }
+    // FIX-05: со вторым шардом GC BLOB удалит чужие объекты — роль maintenance не стартует до FIX-04.
+    if cfg.roles().contains(Role::Maintenance)
+        && let Some(reason) =
+            crate::roles::unsharded_gc(crate::roles::shard_count(&pool).await?.unwrap_or(1))
+    {
+        return Err(Error::invalid(reason));
+    }
     let events_cfg = meta_cfg.events.clone();
     let blob_cfg = cfg.section::<BlobSection>(BLOB)?;
     // Шина сигналов — до хранилищ: после фиксации они публикуют `LogAppended` (будит читателей журнала событий),
@@ -352,6 +359,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         purge: Some(Purge {
             meta: meta.clone(),
             interval: maintenance_cfg.purge_interval,
+            admin_token_retention: maintenance_cfg.admin_token_retention,
         }),
         verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {
             verifier: Arc::new(crate::verify::verifier(
@@ -1007,7 +1015,10 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().expect("tempdir");
-        let (url, password) = split_password(&dev_url(&url));
+        // Своя база: шард, добавленный параллельным тестом в общую, остановил бы роль maintenance (FIX-05).
+        let admin_url = dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&admin_url).await;
+        let (url, password) = split_password(&url_db);
         let secrets = Arc::new(MemSecretStore::default());
         // Без пароля в адресе (trust) пароль серверу не нужен, но ссылка всё равно разрешается.
         let db: SecretRef = "thepost/db#password".parse().expect("ref");
@@ -1088,6 +1099,7 @@ mod tests {
         let report = running.wait().await.expect("wait");
         assert!(report.failed.is_empty(), "{report:?}");
         assert!(report.cancelled.is_empty(), "{report:?}");
+        crate::testutil::drop_database(&admin_url, &db_name).await;
     }
 
     /// TLS-соединение со слушателем, доверяя только сертификату `cert` (PEM): `true` — сервер предъявил его.

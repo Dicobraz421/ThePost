@@ -7,12 +7,11 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tp_contracts::meta::{
     AccountScope, AccountStore, MailboxStore, MessageStore, NewMailbox, NewMessage, Policy,
-    PolicyResolver, SpecialUse,
+    PolicyResolver, PolicyTarget, SpecialUse,
 };
 use tp_contracts::retention::{Quota, Restored, TrashObject, TrashStore};
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, MailboxId};
 use tp_meta::PgMeta;
-use tp_meta::retention::PolicyTarget;
 
 const DAY: Duration = Duration::from_secs(24 * 3600);
 

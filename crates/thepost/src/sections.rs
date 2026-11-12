@@ -751,11 +751,13 @@ impl StartupSection {
 // ---------- maintenance ----------
 
 /// Секция `maintenance`: задания роли maintenance, у которых нет своей секции крейта (APP-32, решение 2026-11-11
-/// п. 65). Сроки хранения — в `meta` (`meta.dav.tombstone_ttl`, `meta.sieve.vacation_log_ttl`).
+/// п. 65). Сроки хранения — в `meta` (`meta.dav.tombstone_ttl`, `meta.sieve.vacation_log_ttl`,
+/// `meta.delivery.retention`); срок токенов `admin init` — здесь (APP-39).
 ///
 /// ```yaml
 /// maintenance:
 ///   purge_interval: 1h
+///   admin_token_retention: 30d
 ///   verify:
 ///     at: "03:00"
 ///     interval: 24h
@@ -763,11 +765,18 @@ impl StartupSection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct MaintenanceSection {
-    /// Период очистки по сроку надгробий DAV и журнала автоответов (`1h`); первый проход — при запуске роли.
+    /// Период очистки по сроку надгробий DAV, журнала автоответов, журнала доставки и токенов `admin init`
+    /// (`1h`); первый проход — при запуске роли.
     /// Требует перезапуска.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub purge_interval: Duration,
+    /// Сколько хранить одноразовые токены `thepost admin init` после истечения их срока (`30d`): погашенные,
+    /// отозванные и истёкшие токены остаются для аудита, затем удаляются очисткой по сроку; `0s` — сразу по
+    /// истечении.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub admin_token_retention: Duration,
     /// Проверка целостности BLOB по расписанию (`thepost verify` без `--fix`, APP-44).
     pub verify: VerifySchedule,
 }
@@ -776,6 +785,7 @@ impl Default for MaintenanceSection {
     fn default() -> Self {
         Self {
             purge_interval: Duration::from_secs(3600),
+            admin_token_retention: Duration::from_secs(30 * 24 * 3600),
             verify: VerifySchedule::default(),
         }
     }
@@ -1301,6 +1311,16 @@ blob:
             .section::<MaintenanceSection>(MAINTENANCE)
             .expect("section");
         assert_eq!(m.purge_interval, Duration::from_secs(600));
+        // APP-39: срок хранения токенов admin init — 30 суток по умолчанию, из config.yaml.
+        assert_eq!(m.admin_token_retention, Duration::from_secs(30 * 24 * 3600));
+        let c = parse(&format!(
+            "{MINIMAL_DEV}maintenance:\n  admin_token_retention: 7d\n"
+        ))
+        .expect("config");
+        let m = c
+            .section::<MaintenanceSection>(MAINTENANCE)
+            .expect("section");
+        assert_eq!(m.admin_token_retention, Duration::from_secs(7 * 24 * 3600));
         let e = err(parse(&format!(
             "{MINIMAL_DEV}maintenance:\n  purge_interval: 0s\n"
         )));

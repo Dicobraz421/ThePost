@@ -2,7 +2,8 @@
 //!
 //! Порции изменений групп ([`LdapDirectory`], курсор — как у [`Directory`](tp_contracts::auth::Directory))
 //! переводятся в [`DistributionGroup`]: DN участников, модераторов и разрешённых отправителей разрешаются
-//! в учётные записи (по имени входа в [`AccountStore`]) и группы (по `external_id` в [`GroupStore`]).
+//! в учётные записи (по идентификатору каталога в [`AccountStore`], имя входа — только для учётных записей без
+//! него) и группы (по `external_id` в [`GroupStore`]).
 //! Вложенная группа, ещё не выданная каталогом (порядок не гарантирован), создаётся заготовкой без
 //! участников и заполняется своей записью. Учётная запись, которой ещё нет в метаданных, пропускается:
 //! её подхватит следующее изменение группы или полная синхронизация.
@@ -310,7 +311,11 @@ impl GroupSync {
         Ok(self.put(stub).await?.then_some(Target::Group(id)))
     }
 
+    /// Учётная запись по DN: по идентификатору каталога ([`AccountStore::by_external_id`]) — переименование
+    /// входа не теряет членство; по имени входа — только учётная запись без `external_id` (заведена до
+    /// синхронизации каталога), чтобы не сопоставить чужую запись каталога с тем же именем.
     async fn account_target(&self, dn: &str) -> Result<Option<Target>> {
+        let tenant = self.dir.tenant;
         let m = &self.dir.cfg.accounts;
         let rows = self
             .dir
@@ -319,17 +324,26 @@ impl GroupSync {
                 base: dn.to_owned(),
                 base_only: true,
                 filter: m.filter.clone(),
-                attrs: vec![m.login.clone()],
+                attrs: vec![m.id.clone(), m.login.clone()],
                 show_deleted: false,
             })
             .await?;
-        let Some(login) = rows.first().and_then(|e| first(e, &m.login)) else {
+        let Some(e) = rows.first() else {
+            return Ok(None);
+        };
+        if let Some(x) = external_id(e, &m.id)
+            && let Some(a) = self.accounts.by_external_id(tenant, &x).await?
+        {
+            return Ok(Some(Target::Account(a.id)));
+        }
+        let Some(login) = first(e, &m.login) else {
             return Ok(None);
         };
         Ok(self
             .accounts
-            .by_login(self.dir.tenant, &login)
+            .by_login(tenant, &login)
             .await?
+            .filter(|a| a.external_id.is_none())
             .map(|a| Target::Account(a.id)))
     }
 }
