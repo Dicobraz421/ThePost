@@ -46,11 +46,22 @@ pub struct Deps {
     pub auth: Arc<dyn Authenticator>,
     /// Календари и контакты.
     pub store: Arc<dyn DavStore>,
-    /// Каталог организации — источник глобальной адресной книги; `None` — книги нет.
-    pub directory: Option<Arc<dyn Directory>>,
+}
+
+/// Источники глобальной адресной книги ([`router_with_gal`]).
+#[derive(Clone)]
+pub struct GalDeps {
+    /// Каталог организации: учётные записи и группы.
+    pub directory: Arc<dyn Directory>,
     /// Группы рассылки: скрытые из адресной книги (`hidden_from_gal`) в неё не попадают; `None` — видны все
     /// группы каталога.
     pub groups: Option<Arc<dyn GroupStore>>,
+}
+
+impl fmt::Debug for GalDeps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GalDeps").finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for Deps {
@@ -66,6 +77,8 @@ impl fmt::Debug for Deps {
 pub(crate) struct Dav {
     pub d: Deps,
     pub cfg: DavConfig,
+    /// Источники глобальной адресной книги; `None` — книги нет.
+    pub gal_deps: Option<GalDeps>,
     /// Построенные глобальные адресные книги.
     pub gal: gal::Cache,
 }
@@ -86,9 +99,20 @@ impl Dav {
 
 /// Маршруты DAV под `/dav/`; TLS, PROXY и слушатель — у вызывающего (`tp-platform`).
 pub fn router(d: Deps, cfg: DavConfig) -> Router {
+    build(d, None, cfg)
+}
+
+/// Маршруты DAV с глобальной адресной книгой «Организация» из каталога `gal` (только чтение, в доме адресных
+/// книг каждого пользователя).
+pub fn router_with_gal(d: Deps, gal: GalDeps, cfg: DavConfig) -> Router {
+    build(d, Some(gal), cfg)
+}
+
+fn build(d: Deps, gal_deps: Option<GalDeps>, cfg: DavConfig) -> Router {
     let dav = Arc::new(Dav {
         d,
         cfg,
+        gal_deps,
         gal: gal::Cache::default(),
     });
     Router::new()

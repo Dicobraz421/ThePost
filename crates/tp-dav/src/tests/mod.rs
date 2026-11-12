@@ -13,7 +13,7 @@ use tp_contracts::dav::{Collection, CollectionKind, DavStore};
 use tp_contracts::meta::AccountScope;
 use tp_testkit::{FakeAuthenticator, FakeDirectory, MemDav, MemGroups, principal};
 
-use crate::{DavConfig, Deps, router};
+use crate::{DavConfig, Deps, GalDeps, router_with_gal};
 
 mod auth;
 mod caldav_home;
@@ -67,11 +67,13 @@ impl Env {
         let store = MemDav::new();
         let dir = FakeDirectory::default();
         let groups = MemGroups::new();
-        let app = router(
+        let app = router_with_gal(
             Deps {
                 auth: Arc::new(auth.clone()),
                 store: Arc::new(store.clone()),
-                directory: Some(Arc::new(dir.clone())),
+            },
+            GalDeps {
+                directory: Arc::new(dir.clone()),
                 groups: Some(Arc::new(groups.clone())),
             },
             cfg,

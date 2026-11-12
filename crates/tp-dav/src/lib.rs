@@ -6,7 +6,7 @@
 //! `calendar-multiget`, `free-busy-query`, RFC 4791 §7.8–7.10), отчёты CardDAV (`addressbook-query`,
 //! `addressbook-multiget`, RFC 6352 §8.6–8.7). Хранилище — [`tp_contracts::dav::DavStore`].
 //!
-//! Глобальная адресная книга «Организация» только для чтения из каталога ([`Deps::directory`]) — в доме адресных книг
+//! Глобальная адресная книга «Организация» только для чтения из каталога ([`router_with_gal`]) — в доме адресных книг
 //! каждого пользователя.
 //!
 //! - [`config`] — секция `dav` ([`DavConfig`]);
@@ -32,4 +32,4 @@ mod tests;
 
 pub use config::DavConfig;
 pub use path::PREFIX;
-pub use server::{ALLOW, DAV_HEADER, Deps, router};
+pub use server::{ALLOW, DAV_HEADER, Deps, GalDeps, router, router_with_gal};

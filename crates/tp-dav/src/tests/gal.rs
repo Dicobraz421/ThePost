@@ -301,8 +301,6 @@ async fn no_directory_no_gal() {
         Deps {
             auth: Arc::new(env.auth.clone()),
             store: Arc::new(MemDav::new()),
-            directory: None,
-            groups: None,
         },
         DavConfig::default(),
     );

@@ -1,6 +1,6 @@
 //! Глобальная адресная книга (GAL, SRS 4.4): книга «Организация» только для чтения в доме адресных книг каждого
 //! пользователя — `/dav/addressbooks/<логин>/gal/` (имя — `dav.gal_name`). Есть, если приложение передало каталог
-//! ([`crate::Deps::directory`]).
+//! ([`crate::router_with_gal`]).
 //!
 //! Состав — снимок каталога (`Directory`): учётные записи с разрешённым входом и адресом и группы с адресом
 //! рассылки; группа, скрытая из GAL (`hidden_from_gal` в `GroupStore`, поиск по идентификатору каталога), не
@@ -65,7 +65,7 @@ pub(crate) fn is(c: &Collection) -> bool {
 
 /// Запрос к глобальной адресной книге или её карточке (каталог подключён).
 pub(crate) fn is_target(cx: &Cx<'_>, target: &Target) -> bool {
-    cx.dav.d.directory.is_some()
+    cx.dav.gal_deps.is_some()
         && matches!(
             target,
             Target::Collection(CollectionKind::AddressBook, _, name)
@@ -100,9 +100,10 @@ pub(crate) async fn find(
 /// Снимок организации вошедшего: из памяти, если он не старше `dav.gal_cache`, иначе из каталога. Каталог не
 /// подключён — `None`.
 pub(crate) async fn load(cx: &Cx<'_>) -> Result<Option<Arc<Gal>>> {
-    let Some(dir) = cx.dav.d.directory.as_deref() else {
+    let Some(deps) = cx.dav.gal_deps.as_ref() else {
         return Ok(None);
     };
+    let dir = deps.directory.as_ref();
     let tenant = cx.scope.tenant;
     let cfg = &cx.dav.cfg;
     let cached = cx
@@ -132,7 +133,7 @@ pub(crate) async fn load(cx: &Cx<'_>) -> Result<Option<Arc<Gal>>> {
             .await?;
         groups.apply(page);
     }
-    let hidden: HashSet<String> = match cx.dav.d.groups.as_deref() {
+    let hidden: HashSet<String> = match deps.groups.as_deref() {
         Some(store) => store
             .list(tenant)
             .await?
