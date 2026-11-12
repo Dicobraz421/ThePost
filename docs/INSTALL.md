@@ -79,6 +79,9 @@ PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamA
    | `files` | свои файлы PEM: `thepost_tls_cert_src`, `thepost_tls_key_src` |
    | `internal` | внутренний центр сертификации — только для стенда |
 
+   Закрытый ключ сертификата хранится только в OpenBao (секрет `thepost/tls`), на диске сервера его нет: плейбук
+   кладёт его туда сам, при `acme` — сам узел. Сменить свой сертификат (`files`) — заменить файлы и повторить прогон.
+
 3. Запустите:
 
    ```bash
@@ -96,7 +99,8 @@ PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamA
 
 Если PostgreSQL и OpenBao уже есть или нужна своя схема — установка бинарного файла, юнита systemd и `config.yaml`
 по шагам описана в [`deploy/README.md`](../deploy/README.md#установка-под-systemd-smb-enterprise-вм). Секреты (пароли
-СУБД, ключи) в `config.yaml` не пишутся — только ссылки на OpenBao.
+СУБД, ключи, в том числе ключ TLS — `tls.key: { secret: "thepost/tls#key" }`) в `config.yaml` не пишутся — только
+ссылки на OpenBao.
 
 ## Первый администратор
 
@@ -316,7 +320,9 @@ SRS 3.5). Поэтому потерять можно только письма, 
    -e thepost_restore_openbao=true -e thepost_restore_openbao_init_src=<openbao-init.json>
    -e thepost_restore_openbao_static_key_src=<unseal.key>` (при распечатывании ключами Шамира —
    `thepost_restore_openbao_unseal_keys`). Снимок OpenBao ставится до восстановления базы.
-5. Обычный прогон `smb.yml` — узел стартует, DKIM подписывает тем же ключом, `thepost verify` — без потерь.
+5. Обычный прогон `smb.yml` — узел стартует, DKIM подписывает тем же ключом, `thepost verify` — без потерь; ключ TLS
+   из снимка прогон сводит с сертификатом сервера (`internal` — новый сертификат к ключу, `files` и `certbot` — свой
+   ключ новой версией секрета).
 
 ## Проверка подписи
 
