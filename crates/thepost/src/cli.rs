@@ -1,4 +1,4 @@
-//! Командная строка `thepost` (APP-01..03; `thepost admin` — APP-19, APP-11).
+//! Командная строка `thepost` (APP-01..03; `thepost admin` — APP-19, APP-11; `thepost admin openapi` — APP-37).
 //!
 //! Путь к config.yaml — `--config`, иначе переменная `THEPOST_CONFIG`, иначе `/etc/thepost/config.yaml`.
 
@@ -9,7 +9,7 @@ use tp_contracts::Error;
 use tp_contracts::role::CancellationToken;
 use tp_platform::config::ENV_CONFIG_PATH;
 
-use crate::{admin_client, doctor, local_admin, secrets, sections, serve, verify};
+use crate::{admin_client, doctor, local_admin, openapi, secrets, sections, serve, verify};
 
 /// Путь к config.yaml по умолчанию.
 pub const DEFAULT_CONFIG: &str = "/etc/thepost/config.yaml";
@@ -87,6 +87,12 @@ pub enum AdminAction {
         /// Путь сокета узла (по умолчанию — admin.init.socket).
         #[arg(long)]
         socket: Option<PathBuf>,
+    },
+    /// Схема Admin API (OpenAPI, JSON) без запуска узла: config.yaml, сеть и токен не нужны.
+    Openapi {
+        /// Файл для схемы (по умолчанию — stdout).
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
     },
     /// Команды Admin API: `thepost admin <ресурс> <действие>`.
     #[command(flatten)]
@@ -208,6 +214,10 @@ pub async fn run(cli: Cli) -> i32 {
             };
             local_admin::command(&path, args).await
         }
+        Command::Admin {
+            action: AdminAction::Openapi { output },
+            ..
+        } => openapi::command(output.as_deref()).await,
         Command::Admin {
             api,
             action: AdminAction::Api(action),
