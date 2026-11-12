@@ -12,6 +12,7 @@ pub mod app_passwords;
 pub mod blob_index;
 pub mod changelog;
 pub mod credentials;
+pub mod dav;
 pub mod delivery;
 pub mod doctor;
 pub mod events;
@@ -46,6 +47,7 @@ use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Error, Result, TenantId};
 
 use crate::abuse::AbuseBlocksConfig;
+use crate::dav::DavConfig;
 use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
@@ -73,6 +75,8 @@ use crate::signals::SignalsConfig;
 ///     retention: 30d
 ///   signals:
 ///     channel: tp_signals
+///   dav:
+///     tombstone_ttl: 90d
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -99,6 +103,8 @@ pub struct MetaConfig {
     pub signals: SignalsConfig,
     /// Блокировки источников и учётных записей ([`abuse`]).
     pub abuse: AbuseBlocksConfig,
+    /// Календари и контакты: лимиты и срок надгробий ([`dav`]).
+    pub dav: DavConfig,
 }
 
 impl MetaConfig {
@@ -118,6 +124,7 @@ impl Default for MetaConfig {
             delivery: DeliveryLogConfig::default(),
             signals: SignalsConfig::default(),
             abuse: AbuseBlocksConfig::default(),
+            dav: DavConfig::default(),
         }
     }
 }
