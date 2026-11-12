@@ -3,6 +3,8 @@
 //!
 //! Метрики критериев Д.7 (APP-34): пул соединений узла и слушатель LISTEN (`tp_platform::DbMetrics`), время
 //! фиксаций с NOTIFY и число слушателей ([`register_db`]), «сироты» BLOB ([`register_orphans`]).
+//!
+//! Проверка целостности BLOB по расписанию (APP-44): [`register_verify`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -13,11 +15,12 @@ use tp_blob::OrphanMetrics;
 use tp_contracts::acquire::AcquireObserver;
 use tp_meta::commits::{HISTOGRAM_BUCKETS, Histogram};
 use tp_meta::failover::{Failover, FailoverMetrics};
+use tp_meta::pool::DbPool;
 use tp_meta::signals::{PgSignalBus, SignalMetrics};
 use tp_platform::{DbMetrics, ListenerSample, Metrics, PoolSample};
 use tp_search::{CacheStats, IndexCache, Indexer, IndexerStats};
 
-use crate::roles::OrphanProbe;
+use crate::roles::{OrphanProbe, VerifyMetrics, VerifyProbe};
 
 /// Описание показателя: имя, пояснение, значение `V` из снимка `S`, счётчик (иначе — текущее значение).
 type StatDef<S, V = u64> = (&'static str, &'static str, fn(&S) -> V, bool);
@@ -222,6 +225,42 @@ pub fn register_failover(metrics: &Metrics, failover: Failover) {
 
 /// Имя пула узла в метке `pool`.
 pub const POOL_PRIMARY: &str = "primary";
+/// Имя пула миграций (`database.owner` / `database.direct_url`) в метке `pool`.
+pub const POOL_MIGRATIONS: &str = "migrations";
+/// Имя пула слушателя сигналов (`bus.kind: postgres`) в метке `pool`.
+pub const POOL_LISTENER: &str = "listener";
+
+/// Пул, о котором сообщает наблюдатель [`pool_observer`]: назначается, когда пул создан (наблюдатель нужен при
+/// создании пула, снимок занятости — от готового пула). До назначения снимок нулевой.
+#[derive(Debug, Clone, Default)]
+pub struct PoolSlot(Arc<std::sync::OnceLock<DbPool>>);
+
+impl PoolSlot {
+    /// Назначает пул `pool`; повторное назначение не меняет первый пул.
+    pub fn set(&self, pool: &DbPool) {
+        let _ = self.0.set(pool.clone());
+    }
+
+    fn sample(&self) -> PoolSample {
+        self.0.get().map_or_else(PoolSample::default, |p| {
+            let s = p.snapshot();
+            PoolSample {
+                size: s.size,
+                idle: s.idle,
+                max: s.max,
+            }
+        })
+    }
+}
+
+/// Наблюдатель ожидания соединения пула `name` для метрик Д.7 (APP-34, META-55): `tp_db_pool_{in_use,idle,max}`,
+/// `tp_db_pool_waiting`, `tp_db_pool_wait_seconds`, `tp_db_pool_acquire_errors_total` с меткой `pool="<name>"`.
+/// Наблюдатель передаётся функции создания пула `tp-meta`, созданный пул — в [`PoolSlot::set`].
+pub fn pool_observer(db: &DbMetrics, name: &str) -> (Arc<dyn AcquireObserver>, PoolSlot) {
+    let slot = PoolSlot::default();
+    let source = slot.clone();
+    (db.pool_observer(name, move || source.sample()), slot)
+}
 /// Имя слушателя сигналов узла в метке `listener`.
 pub const LISTENER_SIGNALS: &str = "signals";
 
@@ -253,28 +292,15 @@ impl<F: Fn() -> Histogram + Send + Sync> EncodeMetric for Durations<F> {
     }
 }
 
-/// Регистрирует метрики СУБД узла для критериев Д.7 (APP-34) в наборе `db` (`DbMetrics::register`):
-/// - пул узла `failover` — `tp_db_pool_{in_use,idle,max}{pool="primary"}`; возвращается наблюдатель ожидания
-///   соединения (`tp_db_pool_waiting`, `tp_db_pool_wait_seconds`, `tp_db_pool_acquire_errors_total`) для передачи
-///   хранилищу метаданных (META-55);
+/// Регистрирует метрики СУБД узла для критериев Д.7 (APP-34) в наборе `db` (`DbMetrics::register`); пулы —
+/// [`pool_observer`]:
 /// - шина LISTEN/NOTIFY `signals` (`bus.kind: postgres`) — слушатель `tp_db_listener_*{listener="signals"}`,
 ///   `tp_db_notify_commit_seconds` (время фиксаций с NOTIFY), `tp_db_commit_seconds` (время всех фиксаций),
 ///   `tp_db_listeners` (соединений-слушателей узла), `tp_db_notify_commit_share` (доля NOTIFY во времени фиксаций,
 ///   критерий — не больше 0,05; 0 — фиксаций ещё не было).
-pub fn register_db(
-    metrics: &Metrics,
-    db: &DbMetrics,
-    failover: &Failover,
-    signals: Option<PgSignalBus>,
-) -> Arc<dyn AcquireObserver> {
-    let pool = failover.pool().clone();
-    let observer = db.pool_observer(POOL_PRIMARY, move || PoolSample {
-        size: pool.size(),
-        idle: u32::try_from(pool.num_idle()).unwrap_or(u32::MAX),
-        max: pool.options().get_max_connections(),
-    });
+pub fn register_db(metrics: &Metrics, db: &DbMetrics, signals: Option<PgSignalBus>) {
     let Some(bus) = signals else {
-        return observer;
+        return;
     };
     let listener = bus.clone();
     db.listener(LISTENER_SIGNALS, move || {
@@ -314,7 +340,6 @@ pub fn register_db(
         false,
     )];
     register(metrics, &source, PgSignalBus::metrics, share);
-    observer
 }
 
 /// Регистрирует метрики поиска «сирот» BLOB роли maintenance (BLOB-16, Д.7):
@@ -327,6 +352,65 @@ pub fn register_orphans(metrics: &Metrics) -> OrphanProbe {
         &Arc::new(probe.clone()),
         OrphanProbe::metrics,
         OrphanMetrics::STATS,
+    );
+    probe
+}
+
+/// Регистрирует показатели проверки целостности BLOB по расписанию роли maintenance (APP-44):
+/// `tp_blob_verify_{passes,failed}_total`, расхождения последнего прохода `tp_blob_verify_{damaged,orphans,errors}`,
+/// `tp_blob_verify_duration_seconds`, `tp_blob_verify_finished_timestamp_seconds`. Возвращает держатель для
+/// `ScheduledVerify::probe`: до первого прохода значения нулевые.
+pub fn register_verify(metrics: &Metrics) -> VerifyProbe {
+    let probe = VerifyProbe::default();
+    let defs: [StatDef<VerifyMetrics>; 7] = [
+        (
+            "tp_blob_verify_passes",
+            "Завершённые проходы проверки целостности BLOB",
+            |m| m.passes,
+            true,
+        ),
+        (
+            "tp_blob_verify_failed",
+            "Проходы проверки целостности BLOB, прерванные ошибкой или потерей лизы",
+            |m| m.failed,
+            true,
+        ),
+        (
+            "tp_blob_verify_damaged",
+            "Повреждённые записи учёта BLOB в последнем проходе (объекта нет или размер не совпадает)",
+            |m| m.damaged,
+            false,
+        ),
+        (
+            "tp_blob_verify_orphans",
+            "Объекты BLOB без записи учёта в последнем проходе",
+            |m| m.orphans,
+            false,
+        ),
+        (
+            "tp_blob_verify_errors",
+            "Объекты и записи BLOB, которые в последнем проходе проверить не удалось",
+            |m| m.errors,
+            false,
+        ),
+        (
+            "tp_blob_verify_duration_seconds",
+            "Время последнего прохода проверки целостности BLOB, секунд",
+            |m| m.duration_secs,
+            false,
+        ),
+        (
+            "tp_blob_verify_finished_timestamp_seconds",
+            "Момент завершения последнего прохода проверки целостности BLOB (0 — проходов не было)",
+            |m| m.finished_at,
+            false,
+        ),
+    ];
+    register(
+        metrics,
+        &Arc::new(probe.clone()),
+        VerifyProbe::metrics,
+        defs,
     );
     probe
 }

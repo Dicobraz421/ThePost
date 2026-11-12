@@ -270,23 +270,55 @@ async fn dkim(smtp: &SmtpConfig, dns: &dyn Dns, t: Duration, report: &mut Report
         );
         return;
     }
+    // Письмо подписывается всеми ключами домена или селектором политики организации (SMTP-40): опубликованы
+    // должны быть все ключи.
     for (domain, d) in &smtp.dkim.domains {
         let id = format!("dns.dkim.{domain}");
-        let name = format!("{}._domainkey.{domain}", d.selector);
-        if skip_reserved(&id, &name, report) {
+        let names: Vec<String> = d
+            .keys
+            .keys()
+            .map(|s| format!("{s}._domainkey.{domain}"))
+            .collect();
+        let Some(first) = names.first() else {
+            report.push(
+                &id,
+                Status::Warn,
+                "",
+                "у домена нет ключей DKIM (smtp.dkim.domains.*.keys): письма не подписываются",
+            );
+            continue;
+        };
+        if skip_reserved(&id, first, report) {
             continue;
         }
-        match query(t, dns.txt(&name)).await {
-            Err(e) => report.push(&id, Status::Fail, name, format!("TXT не получены: {e}")),
-            Ok(list) if list.iter().any(|r| r.contains("p=")) => {
-                report.push(&id, Status::Ok, name, "открытый ключ опубликован")
+        let mut missing = Vec::new();
+        let mut failed = None;
+        for name in &names {
+            match query(t, dns.txt(name)).await {
+                Err(e) => {
+                    failed = Some((name.clone(), e));
+                    break;
+                }
+                Ok(list) if list.iter().any(|r| r.contains("p=")) => {}
+                Ok(_) => missing.push(name.clone()),
             }
-            Ok(_) => report.push(
+        }
+        if let Some((name, e)) = failed {
+            report.push(&id, Status::Fail, name, format!("TXT не получены: {e}"));
+        } else if !missing.is_empty() {
+            report.push(
                 &id,
                 Status::Fail,
-                name,
+                missing.join(", "),
                 "открытый ключ селектора не опубликован: подписанные письма не пройдут проверку DKIM",
-            ),
+            );
+        } else {
+            report.push(
+                &id,
+                Status::Ok,
+                names.join(", "),
+                "открытые ключи опубликованы",
+            );
         }
     }
 }
@@ -784,6 +816,18 @@ mod tests {
         ] {
             assert_eq!(reserved_zone(name), zone, "{name}");
         }
+    }
+
+    /// Проверяются все ключи домена: неопубликованный второй селектор — провал с его именем.
+    #[tokio::test]
+    async fn every_dkim_key_checked() {
+        let cfg = config(&format!(
+            "{SMTP}          s2: {{ algorithm: ed25519-sha256, key: {{ secret: \"thepost/dkim#s2\" }} }}\n"
+        ));
+        let r = run(&cfg, &healthy()).await;
+        let dkim = r.get("dns.dkim.example.org").expect("dkim");
+        assert_eq!(dkim.status, Status::Fail, "{dkim:?}");
+        assert_eq!(dkim.value, "s2._domainkey.example.org", "{dkim:?}");
     }
 
     #[tokio::test]

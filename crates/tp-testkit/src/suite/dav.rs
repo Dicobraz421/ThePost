@@ -19,7 +19,7 @@ pub const LIMITS: DavLimits = DavLimits {
     max_object_size: 4096,
     max_objects: 4,
     max_collections: 3,
-    busy_horizon: std::time::Duration::from_secs(30 * 24 * 3600),
+    max_busy_instances: 1000,
 };
 
 /// Учётные записи набора: `owner`, `peer` — без коллекций, одной организации; `foreign` — та же учётная запись `owner`

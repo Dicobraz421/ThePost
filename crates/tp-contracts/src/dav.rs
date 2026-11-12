@@ -23,7 +23,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -399,12 +398,17 @@ pub struct ObjectIndex {
     pub uid: String,
     /// Интервал; `None` — без дат (контакт, задача без `DTSTART`/`DUE`): кандидат любого запроса time-range.
     pub span: Option<Span>,
-    /// Индекс занятости (CTR-47): вхождения с развёрнутыми повторами и исключениями от начала объекта до момента записи
-    /// плюс [`DavLimits::busy_horizon`], не больше [`crate::schedule::MAX_BUSY_PERIODS`]. Вычисляет `tp-dav` (DAV-16):
-    /// `TRANSP:TRANSPARENT`, `STATUS:CANCELLED`, задачи и контакты — пусто, `STATUS:TENTATIVE` —
-    /// [`crate::schedule::BusyKind::Tentative`].
+    /// Индекс занятости (CTR-47) неповторяющегося объекта: его периоды, не больше
+    /// [`crate::schedule::MAX_BUSY_PERIODS`]. Вычисляет `tp-dav` (DAV-16): `TRANSP:TRANSPARENT`, `STATUS:CANCELLED`,
+    /// задачи и контакты — пусто, `STATUS:TENTATIVE` — [`crate::schedule::BusyKind::Tentative`]. У повторяющегося
+    /// объекта ([`ObjectIndex::recurring`]) — пусто.
     #[serde(default)]
     pub busy: Vec<BusyPeriod>,
+    /// Повторяющееся событие (META-54, решение 59): в теле есть `RRULE` или `RDATE`. Его занятость в индекс не
+    /// пишется: хранилище разворачивает повторы и исключения из тела при запросе
+    /// ([`crate::schedule::FreeBusy::query`]). Задаёт вызывающий; только у [`Component::Event`].
+    #[serde(default)]
+    pub recurring: bool,
     /// `Schedule-Tag` объекта планирования (RFC 6638 §3.2) без кавычек ([`valid_etag`]); `None` — объект без
     /// планирования. Задаёт вызывающий: новый при изменении организатором, прежний — при изменении участником только
     /// своего `PARTSTAT`. `If-Schedule-Tag-Match` проверяет вызывающий по прочитанному объекту и пишет с
@@ -425,19 +429,25 @@ impl ObjectIndex {
             uid: uid.into(),
             span,
             busy: Vec::new(),
+            recurring: false,
             schedule_tag: None,
             search: CardSearch::default(),
         }
     }
 
-    /// Проверяет UID, интервал (конец не раньше начала), занятость ([`validate_busy`]), `Schedule-Tag`
-    /// ([`valid_etag`]) и поисковые строки ([`CardSearch::validate`]; непустые — только у [`Component::Card`]);
-    /// иначе — `Error::Invalid`.
+    /// Проверяет UID, интервал (конец не раньше начала), занятость ([`validate_busy`]; у повторяющегося объекта —
+    /// пусто, повторяющийся — только событие), `Schedule-Tag` ([`valid_etag`]) и поисковые строки
+    /// ([`CardSearch::validate`]; непустые — только у [`Component::Card`]); иначе — `Error::Invalid`.
     pub fn validate(&self) -> Result<()> {
         if self.uid.is_empty() || !plain(&self.uid, MAX_UID_LEN) {
             return Err(Error::invalid("недопустимый UID объекта"));
         }
         validate_busy(&self.busy)?;
+        if self.recurring && (self.component != Component::Event || !self.busy.is_empty()) {
+            return Err(Error::invalid(
+                "повторяющийся объект — событие без индекса занятости",
+            ));
+        }
         if self.schedule_tag.as_deref().is_some_and(|t| !valid_etag(t)) {
             return Err(Error::invalid("недопустимый Schedule-Tag объекта"));
         }
@@ -595,19 +605,20 @@ pub struct DavLimits {
     pub max_objects: usize,
     /// Коллекций учётной записи (всех видов).
     pub max_collections: usize,
-    /// Горизонт индекса занятости ([`ObjectIndex::busy`]) от момента записи объекта (CTR-47). Хранилище его не
-    /// проверяет; `tp-dav` разворачивает повторы до него.
-    pub busy_horizon: Duration,
+    /// Наибольшее число вхождений одного повторяющегося объекта, разворачиваемых при запросе занятости
+    /// ([`crate::schedule::FreeBusy::query`], META-54), считая от начала повторов; вхождения сверх него в занятость
+    /// не попадают.
+    pub max_busy_instances: usize,
 }
 
 impl Default for DavLimits {
-    /// 1 МиБ на объект, 20 000 объектов в коллекции, 100 коллекций, горизонт занятости 400 дней.
+    /// 1 МиБ на объект, 20 000 объектов в коллекции, 100 коллекций, 20 000 вхождений повторяющегося объекта.
     fn default() -> Self {
         Self {
             max_object_size: 1024 * 1024,
             max_objects: 20_000,
             max_collections: 100,
-            busy_horizon: Duration::from_secs(400 * 24 * 3600),
+            max_busy_instances: 20_000,
         }
     }
 }

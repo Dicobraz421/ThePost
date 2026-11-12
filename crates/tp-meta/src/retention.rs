@@ -6,8 +6,8 @@
 //! (`tp_trash_retention_us`: папка → учётная запись → домен → организация), иначе
 //! [`RetentionConfig::trash_retention`]. Изменение политики действует на элементы, удалённые после него.
 //!
-//! Политики — таблица `policies`, одна строка на уровень цепочки ([`PolicyTarget`]); [`PolicyResolver`]
-//! накладывает уровни по порядку ([`Policy::overlay`]).
+//! Политики — таблица `policies`, одна строка на уровень цепочки ([`PolicyTarget`] контракта); уровень читает
+//! и задаёт [`PolicyStore`] (CTR-25, META-70), [`PolicyResolver`] накладывает уровни по порядку ([`Policy::overlay`]).
 //!
 //! «Очистить корзину» (`trash.purge`, решение 2026-11-01-trash-purge): правило администратора — колонки
 //! `trash_purge*` в `policies`, выбор пользователя — `accounts.trash_purge`. Скрытое письмо — строка корзины
@@ -26,7 +26,8 @@ use tp_contracts::config::duration;
 use tp_contracts::events::CoreEventKind;
 use tp_contracts::ext::{Decision, DecisionHooks, FinalDelete};
 use tp_contracts::meta::{
-    AccountScope, Inserted, MessageStore, Policy, PolicyResolver, QuotaUsage, SpecialUse,
+    AccountScope, Inserted, MessageStore, Policy, PolicyResolver, PolicyStore, QuotaUsage,
+    SpecialUse,
 };
 use tp_contracts::retention::{
     PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule,
@@ -71,36 +72,26 @@ impl Default for RetentionConfig {
     }
 }
 
-/// Уровень цепочки политик.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PolicyTarget {
-    /// Организация.
-    Tenant,
-    /// Домен.
-    Domain(DomainId),
-    /// Учётная запись (ящик).
-    Account(AccountId),
-    /// Папка.
-    Mailbox(MailboxId),
+/// Уровень цепочки политик — тип контракта (CTR-25).
+pub use tp_contracts::meta::PolicyTarget;
+
+/// Колонка `policies.level` уровня.
+fn level(target: PolicyTarget) -> &'static str {
+    match target {
+        PolicyTarget::Tenant => "tenant",
+        PolicyTarget::Domain(_) => "domain",
+        PolicyTarget::Account(_) => "account",
+        PolicyTarget::Mailbox(_) => "mailbox",
+    }
 }
 
-impl PolicyTarget {
-    fn level(self) -> &'static str {
-        match self {
-            PolicyTarget::Tenant => "tenant",
-            PolicyTarget::Domain(_) => "domain",
-            PolicyTarget::Account(_) => "account",
-            PolicyTarget::Mailbox(_) => "mailbox",
-        }
-    }
-
-    fn object(self, tenant: TenantId) -> Uuid {
-        match self {
-            PolicyTarget::Tenant => *tenant.as_uuid(),
-            PolicyTarget::Domain(id) => *id.as_uuid(),
-            PolicyTarget::Account(id) => *id.as_uuid(),
-            PolicyTarget::Mailbox(id) => *id.as_uuid(),
-        }
+/// Колонка `policies.object_id` уровня: у организации — она сама.
+fn object(target: PolicyTarget, tenant: TenantId) -> Uuid {
+    match target {
+        PolicyTarget::Tenant => *tenant.as_uuid(),
+        PolicyTarget::Domain(id) => *id.as_uuid(),
+        PolicyTarget::Account(id) => *id.as_uuid(),
+        PolicyTarget::Mailbox(id) => *id.as_uuid(),
     }
 }
 
@@ -136,6 +127,7 @@ struct PolicyRow {
     trash_retention_us: Option<i64>,
     retention_us: Option<i64>,
     send_per_hour: Option<i64>,
+    rcpts_per_hour: Option<i64>,
     max_recipients: Option<i64>,
     dkim_selector: Option<String>,
     milter_profile: Option<String>,
@@ -159,6 +151,7 @@ impl PolicyRow {
             trash_retention: self.trash_retention_us.map(from_micros).transpose()?,
             retention: self.retention_us.map(from_micros).transpose()?,
             send_per_hour: self.send_per_hour.map(to_u32).transpose()?,
+            rcpts_per_hour: self.rcpts_per_hour.map(to_u32).transpose()?,
             max_recipients: self.max_recipients.map(to_u32).transpose()?,
             dkim_selector: self.dkim_selector,
             milter_profile: self.milter_profile,
@@ -177,8 +170,8 @@ impl PolicyRow {
 }
 
 const POLICY_COLUMNS: &str = "level, quota_bytes, trash_retention_us, retention_us, send_per_hour, \
-                              max_recipients, dkim_selector, milter_profile, trash_purge, \
-                              trash_purge_user_can_choose";
+                              rcpts_per_hour, max_recipients, dkim_selector, milter_profile, \
+                              trash_purge, trash_purge_user_can_choose";
 
 /// Действующая политика в открытой транзакции организации: заданные уровни по порядку цепочки.
 async fn resolve_in(
@@ -216,8 +209,8 @@ impl PgMeta {
             "SELECT {POLICY_COLUMNS} FROM policies WHERE tenant_id = $1 AND level = $2 AND object_id = $3"
         )))
         .bind(tenant.as_uuid())
-        .bind(target.level())
-        .bind(target.object(tenant))
+        .bind(level(target))
+        .bind(object(target, tenant))
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -240,31 +233,32 @@ impl PgMeta {
                 "DELETE FROM policies WHERE tenant_id = $1 AND level = $2 AND object_id = $3",
             )
             .bind(tenant.as_uuid())
-            .bind(target.level())
-            .bind(target.object(tenant))
+            .bind(level(target))
+            .bind(object(target, tenant))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         } else {
             sqlx::query(
                 "INSERT INTO policies (tenant_id, level, object_id, quota_bytes, trash_retention_us, retention_us,
-                                       send_per_hour, max_recipients, dkim_selector, milter_profile,
+                                       send_per_hour, rcpts_per_hour, max_recipients, dkim_selector, milter_profile,
                                        trash_purge, trash_purge_user_can_choose)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  ON CONFLICT (tenant_id, level, object_id) DO UPDATE SET
                      quota_bytes = EXCLUDED.quota_bytes, trash_retention_us = EXCLUDED.trash_retention_us,
                      retention_us = EXCLUDED.retention_us, send_per_hour = EXCLUDED.send_per_hour,
-                     max_recipients = EXCLUDED.max_recipients, dkim_selector = EXCLUDED.dkim_selector,
+                     rcpts_per_hour = EXCLUDED.rcpts_per_hour, max_recipients = EXCLUDED.max_recipients, dkim_selector = EXCLUDED.dkim_selector,
                      milter_profile = EXCLUDED.milter_profile, trash_purge = EXCLUDED.trash_purge,
                      trash_purge_user_can_choose = EXCLUDED.trash_purge_user_can_choose, updated_at = now()",
             )
             .bind(tenant.as_uuid())
-            .bind(target.level())
-            .bind(target.object(tenant))
+            .bind(level(target))
+            .bind(object(target, tenant))
             .bind(policy.quota_bytes.map(to_i64).transpose()?)
             .bind(policy.trash_retention.map(micros).transpose()?)
             .bind(policy.retention.map(micros).transpose()?)
             .bind(policy.send_per_hour.map(i64::from))
+            .bind(policy.rcpts_per_hour.map(i64::from))
             .bind(policy.max_recipients.map(i64::from))
             .bind(&policy.dkim_selector)
             .bind(&policy.milter_profile)
@@ -277,6 +271,23 @@ impl PgMeta {
         crate::commits::commit(tx).await?;
         Ok(())
 }).await
+    }
+}
+
+/// Уровни цепочки для Admin API (CTR-25) — [`PgMeta::policy`] и [`PgMeta::set_policy`].
+#[async_trait]
+impl PolicyStore for PgMeta {
+    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
+        PgMeta::policy(self, tenant, target).await
+    }
+
+    async fn set_policy(
+        &self,
+        tenant: TenantId,
+        target: PolicyTarget,
+        policy: &Policy,
+    ) -> Result<()> {
+        PgMeta::set_policy(self, tenant, target, policy).await
     }
 }
 
@@ -912,7 +923,10 @@ impl PgMeta {
 }
 
 /// Размер и число писем ящика на шарде `pool`, включая корзину, без скрытых.
-pub(crate) async fn box_usage(pool: &sqlx::PgPool, scope: AccountScope) -> Result<(u64, u64)> {
+pub(crate) async fn box_usage(
+    pool: &crate::pool::DbPool,
+    scope: AccountScope,
+) -> Result<(u64, u64)> {
     let mut tx = begin(pool, scope.tenant).await?;
     let (used, messages): (i64, i64) = sqlx::query_as(
         "SELECT coalesce(sum(size), 0)::bigint, count(*) FROM messages
@@ -959,6 +973,7 @@ mod tests {
             trash_retention_us: None,
             retention_us: None,
             send_per_hour: None,
+            rcpts_per_hour: None,
             max_recipients: None,
             dkim_selector: None,
             milter_profile: None,
@@ -970,7 +985,7 @@ mod tests {
             .map(|l| row(l).rank())
             .collect();
         assert_eq!(ranks, [0, 1, 2, 3]);
-        assert_eq!(PolicyTarget::Tenant.object(t), *t.as_uuid());
+        assert_eq!(object(PolicyTarget::Tenant, t), *t.as_uuid());
     }
 
     #[test]

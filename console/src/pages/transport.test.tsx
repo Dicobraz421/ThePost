@@ -49,6 +49,34 @@ test("принятые домены: список, добавление с ве�
   await waitFor(() => expect(sent(calls, "DELETE", `${T}/domains/d2?version=7`)).toHaveLength(1));
 });
 
+test("политика домена: окно у строки принятого домена — GET и PUT transport/domains/{id}/policy", async () => {
+  const empty = {
+    dkim_selector: null,
+    max_recipients: null,
+    milter_profile: null,
+    quota_bytes: null,
+    rcpts_per_hour: null,
+    retention: null,
+    send_per_hour: null,
+    trash_purge: null,
+    trash_retention: null,
+  };
+  const calls = open("/transport", {
+    ...routes,
+    [`GET ${T}/domains/d1/policy`]: { body: { policy: { ...empty, dkim_selector: "s1" }, effective: { ...empty, dkim_selector: "s1" } } },
+    [`PUT ${T}/domains/d1/policy`]: (c) => ({ body: c.body }),
+  });
+  expect(await screen.findByText("old.example.org")).toBeTruthy();
+  fireEvent.click(screen.getAllByRole("button", { name: "Политика" })[0]);
+  expect(await screen.findByText("Политика домена example.org")).toBeTruthy();
+  const selector = () => screen.getByLabelText("Селектор ключа DKIM.") as HTMLInputElement;
+  await waitFor(() => expect(selector().value).toBe("s1"));
+  fireEvent.change(selector(), { target: { value: "s2" } });
+  fireEvent.click(screen.getByRole("button", { name: "Сохранить политику" }));
+  await waitFor(() => expect(sent(calls, "PUT", `${T}/domains/d1/policy`)[0]?.body).toEqual({ ...empty, dkim_selector: "s2" }));
+  expect(await screen.findByText("Политика домена сохранена")).toBeTruthy();
+});
+
 test("источники и маршруты: изменение источника — PUT по имени, новый маршрут — PUT по шаблону", async () => {
   const calls = open("/transport", {
     ...routes,

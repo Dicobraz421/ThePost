@@ -1,5 +1,5 @@
 import { Create, List, Show, ShowButton, useForm } from "@refinedev/antd";
-import { useCreate, useCustomMutation, useDelete, useInfiniteList, useList, useShow } from "@refinedev/core";
+import { useCreate, useCustom, useCustomMutation, useDelete, useInfiniteList, useList, useShow } from "@refinedev/core";
 import { Alert, Button, Descriptions, Divider, Form, Input, Modal, Popconfirm, Space, Table, Tag, Typography } from "antd";
 import { useState } from "react";
 import { Link } from "react-router";
@@ -161,14 +161,14 @@ function AppPasswords({ account }: { account: string }) {
 export function AccountShow() {
   const { result: account, query } = useShow<Account>();
   const { mutate, mutation } = useCustomMutation<Schemas["PolicyBody"]>();
-  // Узел отдаёт идентификатор основного домена: имя — из списка доменов организации; список недоступен —
-  // показывается идентификатор, без уведомления об ошибке.
-  const { result: domains } = useList<Schemas["DomainInfo"]>({
-    resource: "domains",
-    pagination: { mode: "off" },
+  // Узел отдаёт идентификатор основного домена: имя — из принятых доменов организации (транспорт, единственный
+  // ресурс доменов); список недоступен — показывается идентификатор, без уведомления об ошибке.
+  const { result: accepted } = useCustom<{ version: number; domains: { id: string; name: string }[] }>({
+    url: "/api/v1/orgs/{org}/transport/domains",
+    method: "get",
     errorNotification: false,
   });
-  const domain = domains.data.find((d) => d.id === account?.domain)?.name ?? account?.domain;
+  const domain = accepted.data?.domains?.find((d) => d.id === account?.domain)?.name ?? account?.domain;
   return (
     <Show title={account?.login ?? "Учётная запись"} isLoading={query.isLoading}>
       <Descriptions column={1}>

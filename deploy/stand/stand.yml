@@ -1,10 +1,12 @@
-# Стенд SMB и нагрузка (APP-D Д.2–Д.7) одной командой: узел SMB (эталон deploy/ansible/smb.yml) с порогами стенда
-# (Д.5, thresholds.yml), генератор нагрузки (imaptest, smtp-source, swaks, k6), учётные записи через thepost admin,
-# наполнение ящиков (Д.3), сценарий (Д.6) с зондами и отчёт по критериям Д.7 (criteria.md) в
-# deploy/stand/reports/<прогон>-<сценарий>/.
+# Стенд SMB и нагрузка (APP-D Д.2–Д.7) одной командой: узел SMB (эталон deploy/ansible/smb.yml) с общими
+# параметрами стенда (thresholds.yml: квота ящика, доверенный генератор), генератор нагрузки (imaptest, smtp-source,
+# swaks, k6), учётные записи через thepost admin, наполнение ящиков (Д.3), сценарий (Д.6) в профиле порогов
+# (speed — рабочие, thresholds — Д.5) с зондами и отчёт по критериям Д.7 (criteria.md) в
+# deploy/stand/reports/<прогон>-<профиль>-<сценарий>/.
 #   ansible-galaxy collection install -r deploy/ansible/requirements.yml
-#   ansible-playbook -i <инвентарь> deploy/stand/stand.yml [-e stand_scenario=<base|peak|stress|x3|faults|long>]
-#                    [-e stand_duration=300]
+#   ansible-playbook -i <инвентарь> deploy/stand/stand.yml
+#                    [-e stand_scenario=<base|peak|stress|x3|faults|long|bruteforce>]
+#                    [-e stand_profile=<speed|thresholds>] [-e stand_duration=300]
 # Теги: install — установка, provision — учётные записи, fill — наполнение, run — прогон. Например, только учётные
 # записи и наполнение — --tags provision,fill; только прогон — --tags run. Пример инвентаря —
 # deploy/stand/inventory.example.yml, параметры — roles/stand_generator/defaults/main.yml.
@@ -14,14 +16,15 @@
   gather_facts: false
   tags: [always]
   tasks:
-    - name: Load stand thresholds (D.5)
+    - name: Load stand profiles (D.5, D.6)
       ansible.builtin.include_vars:
         file: thresholds.yml
 
-    - name: Apply stand thresholds and relay of outgoing mail to smtp-sink
+    # Профиль порогов (stand_profiles) накладывает прогон (run.yml) — здесь только общее для обоих профилей.
+    - name: Apply common stand parameters and relay of outgoing mail to smtp-sink
       ansible.builtin.set_fact:
         thepost_config_extra: >-
-          {{ stand_thresholds
+          {{ stand_common
              | combine({'smtp': {'queue': {'relay': stand_relay}}}, recursive=true)
              | combine(stand_config_extra | default({}), recursive=true, list_merge='replace') }}
       vars:
@@ -33,6 +36,21 @@
 - name: SMB node
   ansible.builtin.import_playbook: ../ansible/smb.yml
   tags: [install]
+
+# Основа профилей стенда: конфигурация установки; прогон накладывает на неё stand_profiles[stand_profile].
+- name: Save base configuration of SMB node for stand profiles
+  hosts: smb
+  become: true
+  tags: [install]
+  tasks:
+    - name: Save base configuration
+      ansible.builtin.copy:
+        src: /etc/thepost/config.yaml
+        dest: /etc/thepost/config.stand-base.yaml
+        remote_src: true
+        owner: root
+        group: thepost
+        mode: "0640"
 
 - name: Load generator
   hosts: generator

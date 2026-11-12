@@ -1,5 +1,5 @@
 //! Набор проверок [`FreeBusy`] (CTR-47) поверх индекса занятости [`DavStore`]: in-memory `MemDav` и `PgMeta`
-//! (META-51) проходят одни и те же проверки.
+//! (META-51) проходят одни и те же проверки. Повторяющиеся события (META-54, решение 59) — набор [`recurring`].
 
 use time::{Duration, OffsetDateTime};
 use tp_contracts::dav::{
@@ -221,6 +221,209 @@ pub async fn freebusy(dav: &dyn DavStore, fb: &dyn FreeBusy, fx: &DavFixture) {
         Ok(vec![(
             owner.account,
             vec![busy(10, 12, BusyKind::Unavailable)]
+        )])
+    );
+}
+
+fn ts(unix: i64) -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(unix).expect("метка времени")
+}
+
+/// Тело события с повторами: `lines` — свойства `VEVENT` после `UID`.
+fn recurring_body(uid: &str, lines: &str) -> String {
+    format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//thepost//suite//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+         DTSTAMP:20260101T000000Z\r\n{lines}END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+}
+
+async fn put_recurring(
+    store: &dyn DavStore,
+    scope: AccountScope,
+    coll: CollectionId,
+    name: &str,
+    body: String,
+    start: OffsetDateTime,
+) {
+    let index = ObjectIndex {
+        recurring: true,
+        ..ObjectIndex::new(Component::Event, name, Some(Span { start, end: None }))
+    };
+    store
+        .put_object(scope, coll, name, body, index, Precondition::Any)
+        .await
+        .expect("put_object");
+}
+
+/// Набор проверок занятости повторяющихся событий (META-54, решение 59): повторы разворачиваются при запросе, без
+/// горизонта — еженедельная встреча без конца видна через 3 года, исключённая дата (`EXDATE`) не занята; время без
+/// пояса — в поясе календаря; вхождения сверх `DavLimits::max_busy_instances` не видны; повторяющийся объект с
+/// индексом занятости — `Invalid`; перезапись неповторяющимся возвращает занятость по индексу. `dav` и `fb` — одно
+/// хранилище; учётные записи `fx` — без данных; лимиты — `suite::dav::LIMITS`.
+pub async fn recurring(dav: &dyn DavStore, fb: &dyn FreeBusy, fx: &DavFixture) {
+    let owner = fx.owner;
+    let tenant = owner.tenant;
+    let work = calendar(
+        dav,
+        owner,
+        Collection::new(CollectionKind::Calendar, "work"),
+    )
+    .await;
+    let tokyo = calendar(
+        dav,
+        owner,
+        Collection {
+            timezone: Some("Asia/Tokyo".into()),
+            ..Collection::new(CollectionKind::Calendar, "tokyo")
+        },
+    )
+    .await;
+    // Понедельник 5 января 2026, 10:00–11:00 UTC, каждую неделю без конца; 12 февраля 2029 исключено.
+    let first = ts(1_767_607_200);
+    put_recurring(
+        dav,
+        owner,
+        work,
+        "weekly",
+        recurring_body(
+            "weekly",
+            "DTSTART:20260105T100000Z\r\nDTEND:20260105T110000Z\r\nRRULE:FREQ=WEEKLY\r\n\
+             EXDATE:20290212T100000Z\r\n",
+        ),
+        first,
+    )
+    .await;
+    let hour = |unix: i64| BusyPeriod {
+        start: ts(unix),
+        end: ts(unix + 3600),
+        kind: BusyKind::Busy,
+    };
+    // 1–20 февраля 2029: понедельники 5 и 19; 12-е исключено.
+    let feb_2029 = Period {
+        start: ts(1_864_598_400),
+        end: ts(1_866_240_000),
+    };
+    assert_eq!(
+        fb.query(tenant, &[owner.account], feb_2029).await,
+        Ok(vec![(
+            owner.account,
+            vec![hour(1_864_980_000), hour(1_866_189_600)]
+        )]),
+        "встреча без конца видна через 3 года, исключённая дата не занята"
+    );
+    // Вхождения сверх лимита (1000 недель от начала) не разворачиваются: 2050 год пуст.
+    assert_eq!(
+        fb.query(
+            tenant,
+            &[owner.account],
+            Period {
+                start: ts(2_524_608_000),
+                end: ts(2_524_608_000 + 30 * 86_400),
+            }
+        )
+        .await,
+        Ok(vec![(owner.account, vec![])])
+    );
+    // Время без пояса — в поясе календаря: 10:00 в Токио — 01:00 UTC.
+    put_recurring(
+        dav,
+        owner,
+        tokyo,
+        "floating",
+        recurring_body(
+            "floating",
+            "DTSTART:20260105T100000\r\nDTEND:20260105T110000\r\nRRULE:FREQ=DAILY;COUNT=2\r\n",
+        ),
+        ts(1_767_574_800),
+    )
+    .await;
+    assert_eq!(
+        fb.query(
+            tenant,
+            &[owner.account],
+            Period {
+                start: ts(1_767_574_800 - 3600),
+                end: ts(1_767_574_800 + 7200),
+            }
+        )
+        .await,
+        Ok(vec![(owner.account, vec![hour(1_767_574_800)])])
+    );
+    // Повторяющийся объект с индексом занятости не принимается.
+    let both = ObjectIndex {
+        recurring: true,
+        busy: vec![hour(1_767_607_200)],
+        ..ObjectIndex::new(
+            Component::Event,
+            "both",
+            Some(Span {
+                start: first,
+                end: None,
+            }),
+        )
+    };
+    assert!(matches!(
+        dav.put_object(
+            owner,
+            work,
+            "both",
+            recurring_body("both", "DTSTART:20260105T100000Z\r\nRRULE:FREQ=DAILY\r\n"),
+            both,
+            Precondition::Any,
+        )
+        .await,
+        Err(Error::Invalid(_))
+    ));
+    // Перезапись неповторяющимся: занятость — по индексу, повторов нет; и обратно.
+    let single = ObjectIndex {
+        busy: vec![hour(1_864_980_000)],
+        ..ObjectIndex::new(
+            Component::Event,
+            "weekly",
+            Some(Span {
+                start: ts(1_864_980_000),
+                end: Some(ts(1_864_980_000 + 3600)),
+            }),
+        )
+    };
+    dav.put_object(
+        owner,
+        work,
+        "weekly",
+        recurring_body(
+            "weekly",
+            "DTSTART:20290205T100000Z\r\nDTEND:20290205T110000Z\r\n",
+        ),
+        single,
+        Precondition::Any,
+    )
+    .await
+    .expect("put single");
+    assert_eq!(
+        fb.query(tenant, &[owner.account], feb_2029).await,
+        Ok(vec![(owner.account, vec![hour(1_864_980_000)])])
+    );
+    put_recurring(
+        dav,
+        owner,
+        work,
+        "weekly",
+        recurring_body(
+            "weekly",
+            "DTSTART:20260105T100000Z\r\nDTEND:20260105T110000Z\r\nRRULE:FREQ=WEEKLY\r\n",
+        ),
+        first,
+    )
+    .await;
+    assert_eq!(
+        fb.query(tenant, &[owner.account], feb_2029).await,
+        Ok(vec![(
+            owner.account,
+            vec![
+                hour(1_864_980_000),
+                hour(1_864_980_000 + 7 * 86_400),
+                hour(1_866_189_600)
+            ]
         )])
     );
 }

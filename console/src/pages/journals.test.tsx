@@ -73,7 +73,7 @@ test("журнал аудита: записи, отбор по админист�
         : {
             body: {
               entries: [
-                record(1, "alice@example.org", "POST", "/api/v1/orgs/{org}/domains", 201),
+                record(1, "alice@example.org", "POST", "/api/v1/orgs/{org}/transport/domains", 201),
                 record(2, "bob@example.org", "DELETE", "/api/v1/orgs/{org}/groups/{group}", 403),
               ],
               next: 2,

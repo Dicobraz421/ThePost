@@ -11,7 +11,9 @@
 //! Токен полной синхронизации — состояние вида или коллекции — не ниже своей границы.
 //!
 //! Планирование (CTR-47): индекс занятости объекта — строки `dav_busy`, заменяются при записи объекта и удаляются
-//! вместе с ним; [`FreeBusy::query`] читает их одним запросом на шард по учётным записям и интервалу. Входящие
+//! вместе с ним; [`FreeBusy::query`] читает их одним запросом на шард по учётным записям и интервалу. У
+//! повторяющихся событий (`dav_objects.recurring`; META-54, решение 59) строк индекса нет: тем же запросом читаются
+//! их тела, повторы разворачивает calcard вне транзакции ([`crate::busy`]). Входящие
 //! планирования — `dav_inbox`: номера изменений из того же счётчика, но состояние календарей они не меняют
 //! (`mailbox_state.dav_inbox_state`).
 
@@ -21,7 +23,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgConnection, PgPool};
+use sqlx::{FromRow, PgConnection};
 use time::OffsetDateTime;
 use tp_contracts::config::duration;
 use tp_contracts::dav::{
@@ -52,7 +54,7 @@ use crate::shards::ShardId;
 ///     max_object_size: 1048576
 ///     max_objects: 20000
 ///     max_collections: 100
-///     busy_horizon: 400d
+///     max_busy_instances: 20000
 ///     tombstone_ttl: 90d
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -64,10 +66,9 @@ pub struct DavConfig {
     pub max_objects: usize,
     /// Коллекций учётной записи (всех видов).
     pub max_collections: usize,
-    /// Горизонт индекса занятости от момента записи объекта ([`DavLimits::busy_horizon`]).
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub busy_horizon: Duration,
+    /// Вхождений одного повторяющегося события, разворачиваемых при запросе занятости, считая от начала повторов
+    /// ([`DavLimits::max_busy_instances`]).
+    pub max_busy_instances: usize,
     /// Срок хранения надгробий удалённых объектов и коллекций: токен синхронизации старше очищенных — полная
     /// синхронизация клиента.
     #[serde(with = "duration")]
@@ -82,7 +83,7 @@ impl DavConfig {
             max_object_size: self.max_object_size,
             max_objects: self.max_objects,
             max_collections: self.max_collections,
-            busy_horizon: self.busy_horizon,
+            max_busy_instances: self.max_busy_instances,
         }
     }
 
@@ -92,7 +93,7 @@ impl DavConfig {
             max_object_size: limits.max_object_size,
             max_objects: limits.max_objects,
             max_collections: limits.max_collections,
-            busy_horizon: limits.busy_horizon,
+            max_busy_instances: limits.max_busy_instances,
             ..Self::default()
         }
     }
@@ -106,7 +107,7 @@ impl Default for DavConfig {
             max_object_size: l.max_object_size,
             max_objects: l.max_objects,
             max_collections: l.max_collections,
-            busy_horizon: l.busy_horizon,
+            max_busy_instances: l.max_busy_instances,
             tombstone_ttl: Duration::from_secs(90 * 24 * 3600),
         }
     }
@@ -210,7 +211,7 @@ impl CollectionRow {
 }
 
 const OBJECT_COLUMNS: &str = "object_id, collection_id, name, etag, body, component, uid, span_start, span_end, \
-                              schedule_tag, search, busy_starts, busy_ends, busy_kinds";
+                              schedule_tag, search, recurring, busy_starts, busy_ends, busy_kinds";
 
 /// Источник выборки объектов с индексом занятости (массивы по порядку периодов); условия — по столбцам `dav_objects`.
 const OBJECT_FROM: &str = "dav_objects LEFT JOIN LATERAL (
@@ -235,6 +236,7 @@ struct ObjectRow {
     span_end: Option<OffsetDateTime>,
     schedule_tag: Option<String>,
     search: Vec<String>,
+    recurring: bool,
     busy_starts: Option<Vec<OffsetDateTime>>,
     busy_ends: Option<Vec<OffsetDateTime>>,
     busy_kinds: Option<Vec<String>>,
@@ -264,6 +266,7 @@ impl ObjectRow {
             body: self.body,
             index: ObjectIndex {
                 busy,
+                recurring: self.recurring,
                 schedule_tag: self.schedule_tag,
                 search: CardSearch {
                     strings: self.search,
@@ -483,6 +486,14 @@ struct BusyRow {
     kind: String,
 }
 
+/// Повторяющееся событие — кандидат запроса занятости: тело и часовой пояс календаря.
+#[derive(Debug, FromRow)]
+struct RecurringRow {
+    account_id: Uuid,
+    body: String,
+    timezone: Option<String>,
+}
+
 /// Граница очищенных надгробий: вида учётной записи или коллекции.
 #[derive(Debug, Clone, Copy)]
 enum Floor {
@@ -674,7 +685,11 @@ impl PgMeta {
 }
 
 /// Очистка надгробий учётной записи `scope` старше `before` с подъёмом границ вида и коллекций.
-async fn purge_account(pool: &PgPool, scope: AccountScope, before: OffsetDateTime) -> Result<u64> {
+async fn purge_account(
+    pool: &crate::pool::DbPool,
+    scope: AccountScope,
+    before: OffsetDateTime,
+) -> Result<u64> {
     let mut tx = begin(pool, scope.tenant).await?;
     lock_modseq(&mut tx, scope).await?;
     let n: i64 = sqlx::query_scalar(
@@ -1219,7 +1234,7 @@ impl DavStore for PgMeta {
                         sqlx::query(
                             "UPDATE dav_objects SET uid = $4, etag = $5, component = $6, span_start = $7,
                                                     span_end = $8, body = $9, modseq = $10, schedule_tag = $11,
-                                                    search = $12
+                                                    search = $12, recurring = $13
                              WHERE tenant_id = $1 AND account_id = $2 AND object_id = $3",
                         )
                         .bind(scope.tenant.as_uuid())
@@ -1234,6 +1249,7 @@ impl DavStore for PgMeta {
                         .bind(arg(ms)?)
                         .bind(&index.schedule_tag)
                         .bind(&index.search.strings)
+                        .bind(index.recurring)
                         .execute(&mut *tx)
                         .await
                         .map_err(db_err)?;
@@ -1245,8 +1261,8 @@ impl DavStore for PgMeta {
                             "INSERT INTO dav_objects (tenant_id, account_id, object_id, collection_id, name, uid,
                                                       etag, component, span_start, span_end, body,
                                                       created_modseq, placed_modseq, modseq, schedule_tag,
-                                                      search)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12, $13, $14)",
+                                                      search, recurring)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12, $13, $14, $15)",
                         )
                         .bind(scope.tenant.as_uuid())
                         .bind(scope.account.as_uuid())
@@ -1262,6 +1278,7 @@ impl DavStore for PgMeta {
                         .bind(arg(ms)?)
                         .bind(&index.schedule_tag)
                         .bind(&index.search.strings)
+                        .bind(index.recurring)
                         .execute(&mut *tx)
                         .await
                         .map_err(db_err)?;
@@ -1880,9 +1897,10 @@ impl FreeBusy for PgMeta {
             }
         }
         let mut found: HashMap<Uuid, Vec<BusyPeriod>> = HashMap::new();
+        let mut recurring: Vec<RecurringRow> = Vec::new();
         for (shard, ids) in by_shard {
             let ids = &ids;
-            let rows: Vec<BusyRow> = self
+            let (rows, bodies): (Vec<BusyRow>, Vec<RecurringRow>) = self
                 .idempotent(|| async move {
                     let mut tx = begin(&self.read_pool(shard).await?, tenant).await?;
                     let rows = sqlx::query_as(
@@ -1899,10 +1917,27 @@ impl FreeBusy for PgMeta {
                     .fetch_all(&mut *tx)
                     .await
                     .map_err(db_err)?;
+                    // Повторяющиеся события — кандидаты по интервалу объекта (span_end NULL — без конца).
+                    let bodies = sqlx::query_as(
+                        "SELECT o.account_id, o.body, c.timezone
+                         FROM dav_objects o JOIN dav_collections c USING (tenant_id, account_id, collection_id)
+                         WHERE o.tenant_id = $1 AND o.account_id = ANY($2) AND o.recurring
+                           AND (o.span_start IS NULL OR o.span_start < $4)
+                           AND (o.span_end IS NULL OR o.span_end > $3)
+                           AND c.kind = 'calendar' AND NOT c.transparent",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(ids)
+                    .bind(range.start)
+                    .bind(range.end)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
                     crate::commits::commit(tx).await?;
-                    Ok(rows)
+                    Ok((rows, bodies))
                 })
                 .await?;
+            recurring.extend(bodies);
             for r in rows {
                 let p = BusyPeriod {
                     start: r.busy_start,
@@ -1911,6 +1946,31 @@ impl FreeBusy for PgMeta {
                 };
                 if let Some(p) = p.clip(&range) {
                     found.entry(r.account_id).or_default().push(p);
+                }
+            }
+        }
+        if !recurring.is_empty() {
+            // Разворот повторов — вычисления вне транзакции и вне потоков async.
+            let limit = self.cfg.dav.max_busy_instances;
+            let expanded = tokio::task::spawn_blocking(move || {
+                recurring
+                    .into_iter()
+                    .map(|r| {
+                        let periods =
+                            crate::busy::expand(&r.body, r.timezone.as_deref(), &range, limit);
+                        (r.account_id, periods)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|e| Error::internal(format!("разворот повторов: {e}")))?;
+            for (account, periods) in expanded {
+                match periods {
+                    Some(p) => found.entry(account).or_default().extend(p),
+                    None => tracing::warn!(
+                        tenant = %tenant,
+                        "тело повторяющегося события не разбирается — в занятости не учтено"
+                    ),
                 }
             }
         }
@@ -1931,7 +1991,7 @@ mod tests {
     #[test]
     fn config_from_yaml() {
         let c: DavConfig = serde_yaml_ng::from_str(
-            "max_object_size: 4096\nmax_objects: 4\nmax_collections: 3\nbusy_horizon: 30d\ntombstone_ttl: 7d\n",
+            "max_object_size: 4096\nmax_objects: 4\nmax_collections: 3\nmax_busy_instances: 500\ntombstone_ttl: 7d\n",
         )
         .expect("yaml");
         assert_eq!(
@@ -1940,7 +2000,7 @@ mod tests {
                 max_object_size: 4096,
                 max_objects: 4,
                 max_collections: 3,
-                busy_horizon: Duration::from_secs(30 * 24 * 3600),
+                max_busy_instances: 500,
             }
         );
         assert_eq!(c.tombstone_ttl, Duration::from_secs(7 * 24 * 3600));

@@ -1610,262 +1610,6 @@
         }
       }
     },
-    "/api/v1/orgs/{org}/domains": {
-      "get": {
-        "tags": [
-          "domains"
-        ],
-        "summary": "Домены организации.",
-        "operationId": "list_domains",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "Организация (UUID)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/DomainInfo"
-                  }
-                }
-              }
-            }
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      },
-      "post": {
-        "tags": [
-          "domains"
-        ],
-        "summary": "Создаёт домен.",
-        "operationId": "create_domain",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "Организация (UUID)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/NewDomain"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DomainInfo"
-                }
-              }
-            }
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/orgs/{org}/domains/{domain}": {
-      "get": {
-        "tags": [
-          "domains"
-        ],
-        "summary": "Домен и его политика.",
-        "operationId": "get_domain",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "Организация (UUID)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "domain",
-            "in": "path",
-            "description": "Домен (UUID)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DomainDetails"
-                }
-              }
-            }
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "tags": [
-          "domains"
-        ],
-        "summary": "Удаляет домен без учётных записей.",
-        "operationId": "delete_domain",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "Организация (UUID)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "domain",
-            "in": "path",
-            "description": "Домен (UUID)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {},
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/orgs/{org}/domains/{domain}/policy": {
-      "put": {
-        "tags": [
-          "domains"
-        ],
-        "summary": "Задаёт политику домена целиком.",
-        "operationId": "put_domain_policy",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "Организация (UUID)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "domain",
-            "in": "path",
-            "description": "Домен (UUID)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PolicyBody"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PolicyBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/orgs/{org}/groups": {
       "get": {
         "tags": [
@@ -2789,6 +2533,139 @@
           },
           "409": {
             "description": "устаревшая версия",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/transport/domains/{id}/policy": {
+      "get": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Политика принятого домена и действующая политика (наложение организация → домен). Нет домена — 404.",
+        "operationId": "get_domain_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Домен (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Policies"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Задаёт политику принятого домена целиком. Нет домена — 404.",
+        "operationId": "put_domain_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Домен (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
             "content": {
               "application/json": {
                 "schema": {
@@ -3864,37 +3741,6 @@
         },
         "additionalProperties": false
       },
-      "DomainDetails": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/DomainInfo",
-            "description": "Домен."
-          },
-          {
-            "$ref": "#/components/schemas/Policies",
-            "description": "Политики."
-          }
-        ],
-        "description": "Домен с политиками."
-      },
-      "DomainInfo": {
-        "type": "object",
-        "description": "Домен.",
-        "required": [
-          "id",
-          "name"
-        ],
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Идентификатор."
-          },
-          "name": {
-            "type": "string",
-            "description": "Имя."
-          }
-        }
-      },
       "DomainList": {
         "type": "object",
         "description": "Принятые домены организации.",
@@ -4184,20 +4030,6 @@
         },
         "additionalProperties": false
       },
-      "NewDomain": {
-        "type": "object",
-        "description": "Новый домен.",
-        "required": [
-          "name"
-        ],
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Имя (A-label; приводится к нижнему регистру)."
-          }
-        },
-        "additionalProperties": false
-      },
       "NewGroup": {
         "type": "object",
         "description": "Новая группа.",
@@ -4319,6 +4151,15 @@
             ],
             "format": "int64",
             "description": "Квота ящика, байт.",
+            "minimum": 0
+          },
+          "rcpts_per_hour": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Лимит отправки, адресатов в час (сумма получателей писем за скользящий час).",
             "minimum": 0
           },
           "retention": {

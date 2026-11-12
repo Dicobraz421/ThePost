@@ -1,5 +1,6 @@
 //! META-51: планирование встреч на PostgreSQL — наборы `tp_testkit::suite::freebusy` и `suite::itip`, сигналы
 //! входящих, RLS новых таблиц, миграция 0024 на базе прежней схемы, занятость учётных записей разных шардов.
+//! META-54: набор `suite::freebusy_recurring` (разворот повторов при запросе) и миграция 0025.
 
 mod common;
 
@@ -130,6 +131,15 @@ async fn passes_freebusy_suite() {
         return;
     };
     suite::freebusy(&meta, &meta, &fx).await;
+}
+
+/// META-54: еженедельная встреча без конца видна через 3 года, исключённая дата не занята.
+#[tokio::test]
+async fn passes_freebusy_recurring_suite() {
+    let Some((meta, fx)) = fixture().await else {
+        return;
+    };
+    suite::freebusy_recurring(&meta, &meta, &fx).await;
 }
 
 #[tokio::test]
@@ -304,6 +314,7 @@ async fn migration_on_existing_db() {
         .run(&pool)
         .await
         .expect("migrate until");
+    let pool = common::db(pool);
     let tenant = common::tenant(&pool).await;
     let (domain, _) = common::domain(&pool, tenant).await;
     let scope = AccountScope {
@@ -403,6 +414,189 @@ async fn migration_on_existing_db() {
         .expect("drop database");
 }
 
+/// Миграция 0025 на базе схемы META-51: у события с `RRULE` периоды, записанные в индекс до горизонта, убираются,
+/// событие помечается повторяющимся и разворачивается при запросе; неповторяющееся остаётся в индексе.
+#[tokio::test]
+async fn migration_moves_recurring_out_of_index() {
+    let Some(url) = common::pg_url() else { return };
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let name = format!("tp_meta_{}", uuid::Uuid::now_v7().simple());
+    admin
+        .execute(AssertSqlSafe(format!("CREATE DATABASE {name}")))
+        .await
+        .expect("create database");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(
+            PgConnectOptions::from_str(&url)
+                .expect("url")
+                .database(&name),
+        )
+        .await
+        .expect("connect db");
+    schema::migrator_until(24)
+        .run(&pool)
+        .await
+        .expect("migrate until");
+    let pool = common::db(pool);
+    let tenant = common::tenant(&pool).await;
+    let (domain, _) = common::domain(&pool, tenant).await;
+    let scope = AccountScope {
+        tenant,
+        account: AccountId::new(),
+    };
+    let cal = Collection::new(CollectionKind::Calendar, "work");
+    let ts = |unix: i64| OffsetDateTime::from_unix_timestamp(unix).expect("метка времени");
+    // Понедельник 5 января 2026, 10:00 UTC, каждую неделю без конца; разовая встреча — 6 января.
+    let first = 1_767_607_200;
+    let weekly = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:weekly\r\n\
+                  DTSTAMP:20260101T000000Z\r\nDTSTART:20260105T100000Z\r\nDTEND:20260105T110000Z\r\n\
+                  rrule:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    // «RRULE» в тексте описания — не правило повторения.
+    let single = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:single\r\n\
+                  DTSTAMP:20260101T000000Z\r\nDTSTART:20260106T100000Z\r\nDTEND:20260106T110000Z\r\n\
+                  DESCRIPTION:no RRULE:here\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let (weekly_id, single_id) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let mut tx = schema::begin(&pool, tenant).await.expect("begin");
+    sqlx::query(
+        "INSERT INTO accounts (tenant_id, account_id, domain_id, login) VALUES ($1, $2, $3, 'old')",
+    )
+    .bind(tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(domain.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO dav_collections (tenant_id, account_id, collection_id, kind, name, display_name, components,
+                                      created_modseq, props_modseq, modseq, object_count)
+         VALUES ($1, $2, $3, 'calendar', 'work', 'work', ARRAY['VEVENT'], 1, 1, 3, 2)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(cal.id.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .expect("collection");
+    for (id, uid, body, start, end, ms) in [
+        (weekly_id, "weekly", weekly, first, None, 2_i64),
+        (
+            single_id,
+            "single",
+            single,
+            first + 86_400,
+            Some(first + 90_000),
+            3,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO dav_objects (tenant_id, account_id, object_id, collection_id, name, uid, etag, component,
+                                      span_start, span_end, body, created_modseq, modseq)
+             VALUES ($1, $2, $3, $4, $5 || '.ics', $5, '1', 'VEVENT', $6, $7, $8, $9, $9)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(id)
+        .bind(cal.id.as_uuid())
+        .bind(uid)
+        .bind(ts(start))
+        .bind(end.map(ts))
+        .bind(body)
+        .bind(ms)
+        .execute(&mut *tx)
+        .await
+        .expect("object");
+    }
+    // Индекс META-51: у еженедельной — вхождения до горизонта (здесь два), у разовой — её период.
+    for (id, ord, start) in [
+        (weekly_id, 0, first),
+        (weekly_id, 1, first + 7 * 86_400),
+        (single_id, 0, first + 86_400),
+    ] {
+        sqlx::query(
+            "INSERT INTO dav_busy (tenant_id, account_id, object_id, ord, collection_id, busy_start, busy_end, kind)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'busy')",
+        )
+        .bind(tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(id)
+        .bind(ord)
+        .bind(cal.id.as_uuid())
+        .bind(ts(start))
+        .bind(ts(start + 3600))
+        .execute(&mut *tx)
+        .await
+        .expect("busy");
+    }
+    sqlx::query(
+        "UPDATE mailbox_state SET modseq = 3, dav_calendar_state = 3 WHERE account_id = $1",
+    )
+    .bind(scope.account.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .expect("state");
+    tx.commit().await.expect("commit");
+
+    schema::migrate(&pool).await.expect("migrate");
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let w = meta
+        .get_object(scope, cal.id, "weekly.ics")
+        .await
+        .expect("get")
+        .expect("weekly");
+    assert!(w.index.recurring && w.index.busy.is_empty());
+    let s = meta
+        .get_object(scope, cal.id, "single.ics")
+        .await
+        .expect("get")
+        .expect("single");
+    assert!(!s.index.recurring);
+    assert_eq!(s.index.busy.len(), 1);
+    let hour = |unix: i64| BusyPeriod {
+        start: ts(unix),
+        end: ts(unix + 3600),
+        kind: BusyKind::Busy,
+    };
+    // Первая неделя: еженедельная — разворотом, разовая — из индекса; без двойного счёта.
+    assert_eq!(
+        meta.query(
+            tenant,
+            &[scope.account],
+            Period {
+                start: ts(first - 3600),
+                end: ts(first + 2 * 86_400),
+            }
+        )
+        .await,
+        Ok(vec![(
+            scope.account,
+            vec![hour(first), hour(first + 86_400)]
+        )])
+    );
+    // Через 3 года (за прежним горизонтом в 400 дней): понедельник 5 февраля 2029.
+    assert_eq!(
+        meta.query(
+            tenant,
+            &[scope.account],
+            Period {
+                start: ts(1_864_598_400),
+                end: ts(1_864_598_400 + 7 * 86_400),
+            }
+        )
+        .await,
+        Ok(vec![(scope.account, vec![hour(1_864_980_000)])])
+    );
+    pool.close().await;
+    admin
+        .execute(AssertSqlSafe(format!("DROP DATABASE {name} WITH (FORCE)")))
+        .await
+        .expect("drop database");
+}
+
 /// Занятость и входящие учётной записи второго шарда — в БД этого шарда; запрос занятости собирает учётные
 /// записи обоих шардов.
 #[tokio::test]
@@ -428,7 +622,7 @@ async fn schedule_lives_on_account_shard() {
         .await
         .expect("inbox_put");
     for table in ["dav_busy", "dav_inbox"] {
-        let count = async |pool: &sqlx::PgPool| -> i64 {
+        let count = async |pool: &tp_meta::pool::DbPool| -> i64 {
             let mut tx = schema::begin_system(pool).await.expect("begin");
             let n = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT count(*) FROM {table} WHERE account_id = $1"
