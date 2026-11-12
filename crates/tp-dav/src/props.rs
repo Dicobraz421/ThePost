@@ -11,6 +11,10 @@
 //! `schedule-inbox-URL` и `schedule-outbox-URL` (`inbox/`, `outbox/` дома календарей — заготовки для DAV-13:
 //! отвечают только на `PROPFIND`, имена зарезервированы).
 //!
+//! Дом адресных книг (`addressbook-home-set` принципала): при первом `PROPFIND`, если адресных книг нет, создаётся
+//! книга `contacts` с именем из `dav.default_addressbook_name`. Свойства книги: `supported-address-data` (vCard 3.0
+//! и 4.0), `max-resource-size`, `addressbook-description`.
+//!
 //! `PROPPATCH` — у коллекции: `displayname`, описание (`calendar-description`, `addressbook-description`), цвет и
 //! порядок календаря (`calendar-color`, `calendar-order`, Apple), часовой пояс календаря (`calendar-timezone` —
 //! VTIMEZONE, RFC 4791 §5.2.2; `calendar-timezone-id` — IANA, RFC 7809 §5.2; хранится идентификатор IANA). Изменения атомарны: ошибка одного свойства — оно
@@ -451,9 +455,7 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         }
         Target::Principal(_) => emit(cx, &mut ms, &Res::Principal, &want),
         Target::Home(kind, _) => {
-            if *kind == CollectionKind::Calendar {
-                ensure_defaults(cx).await?;
-            }
+            ensure_defaults(cx, *kind).await?;
             emit(cx, &mut ms, &Res::Home(*kind), &want);
             if depth1 {
                 let list = cx.store().list_collections(cx.scope, *kind).await?;
@@ -497,11 +499,11 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
     Ok(multistatus(ms))
 }
 
-/// Календарь и список задач по умолчанию — если у учётной записи нет ни одного календаря. Имена ресурсов
-/// постоянные ([`path::DEFAULT_CALENDAR`], [`path::DEFAULT_TASKS`]): одновременные обращения не создают дубликатов
+/// Коллекции по умолчанию дома вида `kind` — если у учётной записи нет ни одной коллекции этого вида: календарь
+/// и список задач либо адресная книга. Имена ресурсов постоянные ([`path::DEFAULT_CALENDAR`],
+/// [`path::DEFAULT_TASKS`], [`path::DEFAULT_ADDRESSBOOK`]): одновременные обращения не создают дубликатов
 /// (`Conflict` хранилища — уже создано).
-pub(crate) async fn ensure_defaults(cx: &Cx<'_>) -> Result<()> {
-    let kind = CollectionKind::Calendar;
+pub(crate) async fn ensure_defaults(cx: &Cx<'_>, kind: CollectionKind) -> Result<()> {
     if !cx
         .store()
         .list_collections(cx.scope, kind)
@@ -511,24 +513,31 @@ pub(crate) async fn ensure_defaults(cx: &Cx<'_>) -> Result<()> {
         return Ok(());
     }
     let cfg = &cx.dav.cfg;
-    let defaults = [
-        (
-            path::DEFAULT_CALENDAR,
-            &cfg.default_calendar_name,
-            Component::Event,
-        ),
-        (
-            path::DEFAULT_TASKS,
-            &cfg.default_tasks_name,
-            Component::Todo,
-        ),
-    ];
+    let defaults: &[(&str, &String, Component)] = match kind {
+        CollectionKind::Calendar => &[
+            (
+                path::DEFAULT_CALENDAR,
+                &cfg.default_calendar_name,
+                Component::Event,
+            ),
+            (
+                path::DEFAULT_TASKS,
+                &cfg.default_tasks_name,
+                Component::Todo,
+            ),
+        ],
+        CollectionKind::AddressBook => &[(
+            path::DEFAULT_ADDRESSBOOK,
+            &cfg.default_addressbook_name,
+            Component::Card,
+        )],
+    };
     for (order, (name, display, component)) in (0u32..).zip(defaults) {
         let c = Collection {
-            display_name: display.clone(),
+            display_name: (*display).clone(),
             order,
-            components: BTreeSet::from([component]),
-            ..Collection::new(kind, name)
+            components: BTreeSet::from([*component]),
+            ..Collection::new(kind, *name)
         };
         match cx.store().create_collection(cx.scope, c).await {
             Ok(_) | Err(Error::Conflict) => {}

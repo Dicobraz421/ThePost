@@ -50,6 +50,8 @@ pub struct DavConfig {
     pub default_calendar_name: String,
     /// Отображаемое имя списка задач по умолчанию (VTODO; создаётся вместе с календарём по умолчанию).
     pub default_tasks_name: String,
+    /// Отображаемое имя адресной книги по умолчанию (создаётся при первом обращении к дому адресных книг).
+    pub default_addressbook_name: String,
 }
 
 impl Default for DavConfig {
@@ -67,6 +69,7 @@ impl Default for DavConfig {
             max_multiget_hrefs: 1_000,
             default_calendar_name: "Календарь".to_owned(),
             default_tasks_name: "Задачи".to_owned(),
+            default_addressbook_name: "Контакты".to_owned(),
         }
     }
 }

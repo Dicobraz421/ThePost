@@ -150,6 +150,9 @@ pub(crate) const DEFAULT_CALENDAR: &str = "calendar";
 /// Имя списка задач по умолчанию (сегмент URL).
 pub(crate) const DEFAULT_TASKS: &str = "tasks";
 
+/// Имя адресной книги по умолчанию (сегмент URL).
+pub(crate) const DEFAULT_ADDRESSBOOK: &str = "contacts";
+
 /// `/dav/principals/`.
 pub(crate) const PRINCIPALS: &str = "/dav/principals/";
 

@@ -1,0 +1,65 @@
+---
+source: crates/tp-dav/src/tests/carddav_home.rs
+expression: r.show()
+---
+207 Multi-Status
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/contacts/</d:href>
+<d:propstat>
+<d:prop>
+<d:resourcetype>
+<d:collection/>
+<card:addressbook/>
+</d:resourcetype>
+<d:displayname>Контакты</d:displayname>
+<card:addressbook-description>Личные контакты</card:addressbook-description>
+<card:supported-address-data>
+<card:address-data-type content-type="text/vcard" version="3.0"/>
+<card:address-data-type content-type="text/vcard" version="4.0"/>
+</card:supported-address-data>
+<card:max-resource-size>1048576</card:max-resource-size>
+<d:current-user-privilege-set>
+<d:privilege>
+<d:all/>
+</d:privilege>
+<d:privilege>
+<d:read/>
+</d:privilege>
+<d:privilege>
+<d:write/>
+</d:privilege>
+<d:privilege>
+<d:write-properties/>
+</d:privilege>
+<d:privilege>
+<d:write-content/>
+</d:privilege>
+<d:privilege>
+<d:bind/>
+</d:privilege>
+<d:privilege>
+<d:unbind/>
+</d:privilege>
+<d:privilege>
+<d:read-current-user-privilege-set/>
+</d:privilege>
+</d:current-user-privilege-set>
+<d:owner>
+<d:href>/dav/principals/ivan@example.org/</d:href>
+</d:owner>
+<d:supported-report-set>
+<d:supported-report>
+<d:report>
+<d:sync-collection/>
+</d:report>
+</d:supported-report>
+</d:supported-report-set>
+<cs:getctag>2</cs:getctag>
+<d:sync-token>urn:thepost:sync:2</d:sync-token>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+</d:multistatus>
