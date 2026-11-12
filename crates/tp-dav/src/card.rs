@@ -24,7 +24,9 @@
 //!
 //! Проверка карточки при `PUT` ([`check_put`], RFC 6352 §6.3.2.1): `valid-address-data` (не разбирается, нет `UID`),
 //! `supported-address-data` (версия не 3.0 и не 4.0), `max-resource-size` — встроенное фото больше
-//! `dav.max_photo_size` (публикуется как `max-image-size`).
+//! `dav.max_photo_size` (публикуется как `max-image-size`). Тело не в UTF-8 (выгрузки старых телефонов и Outlook:
+//! `CHARSET` без `ENCODING`) перед проверкой перекодируется по `CHARSET` ([`put_text`], [`crate::charset`]) и
+//! хранится записью calcard — ответ без `ETag`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -364,6 +366,18 @@ pub(crate) fn in_version(body: &str, to: VCardVersion) -> Cow<'_, str> {
         }
         _ => Cow::Borrowed(body),
     }
+}
+
+/// Текст тела `PUT` в адресную книгу и признак «тело изменено сервером». В UTF-8 — как есть; 8-битное (`CHARSET`
+/// без `ENCODING`) — перекод [`crate::charset::vcard_utf8`] и запись calcard в той же версии: без устаревшего
+/// `CHARSET` у значений, уже записанных в UTF-8. Не перекодируется или не разбирается — `None`.
+pub(crate) fn put_text(raw: &[u8]) -> Option<(String, bool)> {
+    if let Ok(text) = std::str::from_utf8(raw) {
+        return Some((text.to_owned(), false));
+    }
+    let text = crate::charset::vcard_utf8(raw)?;
+    let card = VCard::parse(&text).ok()?;
+    Some((card.to_string(), true))
 }
 
 /// Проверка тела `PUT` в адресную книгу: индекс или нарушенное предусловие (см. описание модуля).
