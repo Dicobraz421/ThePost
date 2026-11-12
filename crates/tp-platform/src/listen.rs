@@ -7,6 +7,8 @@
 //! Слушатель с `client_ca_file` запрашивает в рукопожатии (неявный TLS и STARTTLS) необязательный сертификат
 //! клиента и проверяет его по этим CA (PLT-22): проверенная цепочка — `peer_certificates()` потока
 //! [`Stream::Tls`] (по ней SMTP распознаёт доверенный источник, SMTP-20).
+//! Списки отзыва `client_crl_files` (PLT-28): отозванный сертификат клиента — отказ рукопожатия; файлы CA и
+//! списков перечитываются без перезапуска вместе с сертификатами сервера ([`TlsCerts::run`]).
 
 use std::fmt;
 use std::io;
@@ -56,9 +58,15 @@ pub struct EndpointConfig {
     pub backlog: u32,
     /// PEM-файл доверенных CA сертификатов клиента (mTLS): слушатель запрашивает необязательный сертификат
     /// клиента; от этих CA — принимается и доступен протоколу, от чужого — отказ рукопожатия, без сертификата —
-    /// соединение принимается. Не задан — сертификат клиента не запрашивается. Требует перезапуска.
+    /// соединение принимается. Не задан — сертификат клиента не запрашивается. Путь требует перезапуска;
+    /// содержимое файла перечитывается без перезапуска вместе с сертификатами сервера.
     #[serde(default)]
     pub client_ca_file: Option<PathBuf>,
+    /// Файлы списков отзыва (CRL, PEM или DER) сертификатов клиента; требуют `client_ca_file`. Отозванный
+    /// сертификат — отказ рукопожатия, как сертификату чужого CA; сертификат CA без списка принимается. Состав
+    /// путей требует перезапуска; содержимое файлов перечитывается без перезапуска вместе с сертификатами сервера.
+    #[serde(default)]
+    pub client_crl_files: Vec<PathBuf>,
 }
 
 fn default_handshake_timeout() -> Duration {
@@ -80,6 +88,7 @@ impl EndpointConfig {
             handshake_timeout: default_handshake_timeout(),
             backlog: default_backlog(),
             client_ca_file: None,
+            client_crl_files: Vec::new(),
         }
     }
 
@@ -252,7 +261,8 @@ impl Listener {
         Self::from_tcp(tcp, cfg, tls)
     }
 
-    /// Слушатель на готовом сокете (передача сокета systemd, тесты). Файл `client_ca_file` читается здесь.
+    /// Слушатель на готовом сокете (передача сокета systemd, тесты). Файлы `client_ca_file` и `client_crl_files`
+    /// читаются здесь и далее перечитываются `tls` ([`TlsCerts::run`]).
     pub fn from_tcp(
         tcp: TcpListener,
         cfg: &EndpointConfig,
@@ -264,18 +274,26 @@ impl Listener {
                 cfg.listen
             )));
         }
-        let client_auth = match &cfg.client_ca_file {
-            None => None,
-            Some(_) if tls.is_none() => {
+        let client_auth = match (&cfg.client_ca_file, &tls) {
+            (None, _) if !cfg.client_crl_files.is_empty() => {
+                return Err(Error::Invalid(format!(
+                    "listen {}: client_crl_files requires client_ca_file",
+                    cfg.listen
+                )));
+            }
+            (None, _) => None,
+            (Some(_), None) => {
                 return Err(Error::Invalid(format!(
                     "listen {}: client_ca_file requires tls certificates",
                     cfg.listen
                 )));
             }
-            Some(path) => Some(
-                ClientAuth::load(path)
-                    .map_err(|e| Error::Invalid(format!("listen {}: {e}", cfg.listen)))?,
-            ),
+            (Some(path), Some(certs)) => {
+                let auth = ClientAuth::load(path, &cfg.client_crl_files)
+                    .map_err(|e| Error::Invalid(format!("listen {}: {e}", cfg.listen)))?;
+                certs.watch_client(&auth);
+                Some(auth)
+            }
         };
         Ok(Self {
             tcp,
@@ -528,9 +546,13 @@ mod tests {
     use tokio_rustls::TlsConnector;
 
     use super::*;
+    use tp_contracts::role::CancellationToken;
+
+    use crate::fswatch::tests::MemFsEvents;
     use crate::tls::tests::{
-        CA_CLIENT, CERT_A, CERT_B, CERT_GW, KEY_A, KEY_B, KEY_GW, TempDir, connector, der,
-        write_pair,
+        CA_CLIENT, CA_CRL, CERT_A, CERT_B, CERT_CRL_OK, CERT_CRL_REVOKED, CERT_GW, CRL_EMPTY,
+        CRL_REVOKED, CRL_REVOKED_DER, KEY_A, KEY_B, KEY_CRL_OK, KEY_CRL_REVOKED, KEY_GW, TempDir,
+        connector, der, write_pair,
     };
 
     /// Самоподписанный сертификат клиента `thepost-node`: не выписан CA клиентов слушателя.
@@ -859,6 +881,116 @@ mod tests {
         assert!(chain.is_err());
     }
 
+    /// Сертификат клиента признан слушателем (цепочка у протокола); отказ рукопожатия — `false`.
+    async fn accepted(l: &Arc<Listener>, at: SocketAddr, cert: &str, key: &str) -> bool {
+        let (chain, _) = mtls_handshake(l, at, mtls_client(Some((cert, key)))).await;
+        match chain {
+            Ok(chain) => {
+                assert_eq!(chain.expect("client chain")[0], der(cert));
+                true
+            }
+            Err(e) => {
+                assert!(e.to_string().contains("tls handshake"), "{e}");
+                false
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_client_cert_is_rejected_and_crl_is_reread_without_restart() {
+        let dir = TempDir::new("crl");
+        let certs = Arc::new(
+            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
+                .await
+                .expect("certs"),
+        );
+        // Два CA в файле, список отзыва — только у одного.
+        let ca = dir.0.join("client-ca.pem");
+        std::fs::write(&ca, format!("{CA_CLIENT}{CA_CRL}")).expect("ca");
+        // Списки — в своём каталоге: наблюдение за ним ставится по файлам слушателя.
+        let crl_dir = dir.0.join("crl");
+        std::fs::create_dir_all(&crl_dir).expect("crl dir");
+        let crl = crl_dir.join("clients.crl");
+        std::fs::write(&crl, CRL_EMPTY).expect("crl");
+        let mut cfg = mtls_endpoint(true, &ca);
+        cfg.client_crl_files = vec![crl.clone()];
+        let (l, at) = listener(cfg.clone(), Some(certs.clone())).await;
+        let l = Arc::new(l);
+
+        // Список без отозванных: оба сертификата признаются.
+        assert!(accepted(&l, at, CERT_CRL_OK, KEY_CRL_OK).await);
+        assert!(accepted(&l, at, CERT_CRL_REVOKED, KEY_CRL_REVOKED).await);
+
+        // Файл списка заменён: перечитывание по событию ОС, без перезапуска и без нового слушателя.
+        let events = Arc::new(MemFsEvents::default());
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(certs.clone().run_with(events.clone(), shutdown.clone()));
+        std::fs::write(&crl, CRL_REVOKED).expect("crl");
+        let mut rejected = false;
+        for _ in 0..200 {
+            events.fire(&crl_dir);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !accepted(&l, at, CERT_CRL_REVOKED, KEY_CRL_REVOKED).await {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "revoked client certificate is still accepted");
+        shutdown.cancel();
+        run.await.expect("run");
+        // Неотозванный сертификат того же CA, сертификат CA без списка и клиент без сертификата — принимаются.
+        assert!(accepted(&l, at, CERT_CRL_OK, KEY_CRL_OK).await);
+        assert!(accepted(&l, at, CERT_GW, KEY_GW).await);
+        let (chain, _) = mtls_handshake(&l, at, mtls_client(None)).await;
+        assert!(chain.expect("anonymous").unwrap_or_default().is_empty());
+
+        // Испорченный список: ошибка перечитывания, действует прежний.
+        std::fs::write(
+            &crl,
+            "-----BEGIN X509 CRL-----\nAAAA\n-----END X509 CRL-----\n",
+        )
+        .expect("crl");
+        let err = certs.reload().await.expect_err("broken crl");
+        assert!(err.to_string().contains("client-ca.pem"), "{err}");
+        assert!(!accepted(&l, at, CERT_CRL_REVOKED, KEY_CRL_REVOKED).await);
+        std::fs::write(&crl, "").expect("crl");
+        let err = certs.reload().await.expect_err("empty crl");
+        assert!(err.to_string().contains("clients.crl"), "{err}");
+        assert!(!accepted(&l, at, CERT_CRL_REVOKED, KEY_CRL_REVOKED).await);
+
+        // Отзыв снят (список без отозванных): перечитывание по запросу; новые сертификаты сервера список не теряют.
+        std::fs::write(&crl, CRL_EMPTY).expect("crl");
+        assert!(certs.reload_if_changed().await.expect("reload"));
+        assert!(accepted(&l, at, CERT_CRL_REVOKED, KEY_CRL_REVOKED).await);
+        assert!(!certs.reload_if_changed().await.expect("unchanged"));
+
+        // Список в DER; STARTTLS.
+        std::fs::write(&crl, CRL_REVOKED_DER).expect("crl");
+        cfg.implicit_tls = false;
+        let (l, at) = listener(cfg.clone(), Some(certs.clone())).await;
+        let l = Arc::new(l);
+        assert!(!accepted(&l, at, CERT_CRL_REVOKED, KEY_CRL_REVOKED).await);
+        assert!(accepted(&l, at, CERT_CRL_OK, KEY_CRL_OK).await);
+        write_pair(&dir.0, CERT_B, KEY_B);
+        certs.reload().await.expect("reload");
+        assert!(!accepted(&l, at, CERT_CRL_REVOKED, KEY_CRL_REVOKED).await);
+
+        // Ошибки настройки — при открытии слушателя.
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        cfg.client_ca_file = None;
+        let err = Listener::from_tcp(tcp, &cfg, Some(certs.clone())).expect_err("crl without ca");
+        assert!(
+            err.to_string()
+                .contains("client_crl_files requires client_ca_file"),
+            "{err}"
+        );
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        cfg.client_ca_file = Some(ca);
+        cfg.client_crl_files = vec![dir.0.join("absent.crl")];
+        let err = Listener::from_tcp(tcp, &cfg, Some(certs)).expect_err("absent crl");
+        assert!(err.to_string().contains("absent.crl"), "{err}");
+    }
+
     #[tokio::test]
     async fn without_client_ca_client_cert_is_not_requested() {
         let dir = TempDir::new("no-mtls");
@@ -931,6 +1063,7 @@ mod tests {
         assert_eq!(cfg.trusted_proxies[0].to_string(), "10.0.0.0/8");
         assert_eq!(cfg.handshake_timeout, Duration::from_secs(10));
         assert_eq!(cfg.client_ca_file, None);
+        assert!(cfg.client_crl_files.is_empty());
         let mtls: EndpointConfig = serde_yaml_ng::from_str(
             "listen: \"0.0.0.0:25\"\nclient_ca_file: /etc/thepost/tls/clients-ca.pem\n",
         )
