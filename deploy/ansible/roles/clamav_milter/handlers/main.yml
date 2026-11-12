@@ -1,4 +1,9 @@
 ---
+- name: Restart clamd
+  ansible.builtin.systemd_service:
+    name: "{{ clamav_clamd_service }}"
+    state: restarted
+
 - name: Restart clamav-milter
   ansible.builtin.systemd_service:
     name: clamav-milter

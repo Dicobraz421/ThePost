@@ -2,5 +2,13 @@
 # thepost doctor (time.clock_skew) требуют верных часов. Пакет дистрибутива; повторный прогон ничего не меняет.
 ---
 # Серверы NTP (имена или адреса), например ["ntp1.corp.example", "10.0.0.1"]. Пусто — пул из конфигурации пакета
-# (Debian — 2.debian.pool.ntp.org, Ubuntu — ntp.ubuntu.com); задано — только эти серверы, пул отключается.
+# (Debian — 2.debian.pool.ntp.org, Ubuntu — ntp.ubuntu.com, РЕД ОС и AlmaLinux — свой пул); задано — только эти
+# серверы, пул отключается.
 thepost_ntp_servers: []
+
+# Пути и служба пакета: Debian, Ubuntu, Astra Linux — /etc/chrony, chrony.service; РЕД ОС, AlmaLinux, RHEL —
+# /etc/chrony.conf, chronyd.service (каталог sources.d подключает роль строкой sourcedir).
+chrony_redhat: "{{ ansible_pkg_mgr != 'apt' }}"
+chrony_conf_file: "{{ '/etc/chrony.conf' if chrony_redhat | bool else '/etc/chrony/chrony.conf' }}"
+chrony_sources_dir: /etc/chrony/sources.d
+chrony_service: "{{ 'chronyd' if chrony_redhat | bool else 'chrony' }}"
