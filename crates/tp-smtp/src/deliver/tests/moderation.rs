@@ -152,7 +152,7 @@ async fn rejected_message_bounces_to_sender() {
     assert_eq!(from, "");
     assert_eq!(rcpts, &vec!["sender@example.net".to_owned()]);
     let dsn = String::from_utf8_lossy(raw);
-    assert!(dsn.contains("report-type=delivery-status"), "{dsn}");
+    assert!(dsn.contains("multipart/report"), "{dsn}");
     assert!(
         dsn.contains("Final-Recipient: rfc822; news@example.org"),
         "{dsn}"
