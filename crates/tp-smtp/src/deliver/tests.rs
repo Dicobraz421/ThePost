@@ -64,6 +64,7 @@ fn dir_account(id: &str, login: &str, emails: &[&str]) -> DirAccount {
         enabled: true,
         attributes: BTreeMap::new(),
         org: Default::default(),
+        hidden_from_gal: false,
     }
 }
 

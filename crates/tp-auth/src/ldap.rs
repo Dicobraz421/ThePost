@@ -1006,6 +1006,7 @@ impl LdapDirectory {
                     .and_then(|a| first(e, a))
                     .and_then(|v| v.trim().parse().ok()),
             },
+            hidden_from_gal: false,
         })
     }
 
