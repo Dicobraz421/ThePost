@@ -23,6 +23,7 @@ cms.workspace = true
 futures.workspace = true
 mail-builder.workspace = true
 mail-parser = { workspace = true, features = ["full_encoding"] }
+mail-parser-1 = { workspace = true, features = ["full_encoding"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

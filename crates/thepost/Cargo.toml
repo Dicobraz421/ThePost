@@ -39,6 +39,7 @@ clap.workspace = true
 futures.workspace = true
 mail-auth.workspace = true
 mail-parser.workspace = true
+mail-parser-1.workspace = true
 prometheus-client.workspace = true
 reqwest.workspace = true
 serde.workspace = true

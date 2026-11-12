@@ -19,6 +19,7 @@ base64.workspace = true
 futures.workspace = true
 mail-builder.workspace = true
 mail-parser.workspace = true
+mail-parser-1.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting", "parsing"] }

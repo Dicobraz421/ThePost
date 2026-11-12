@@ -21,6 +21,7 @@ futures.workspace = true
 mail-auth = { workspace = true, features = ["arc"] }
 mail-builder.workspace = true
 mail-parser.workspace = true
+mail-parser-1.workspace = true
 mail-send.workspace = true
 prometheus-client.workspace = true
 reqwest.workspace = true

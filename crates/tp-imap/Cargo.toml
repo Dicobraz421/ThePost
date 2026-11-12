@@ -22,6 +22,7 @@ flate2.workspace = true
 futures.workspace = true
 imap-codec.workspace = true
 mail-parser.workspace = true
+mail-parser-1.workspace = true
 nom.workspace = true
 serde.workspace = true
 thiserror.workspace = true

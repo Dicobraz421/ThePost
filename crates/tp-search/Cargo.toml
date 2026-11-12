@@ -17,6 +17,7 @@ async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 mail-parser.workspace = true
+mail-parser-1.workspace = true
 moka.workspace = true
 schemars.workspace = true
 calamine.workspace = true

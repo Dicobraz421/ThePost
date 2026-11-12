@@ -67,8 +67,11 @@ libgssapi = "0.11.0"
 lopdf = { version = "0.46.0", default-features = false }
 mail-auth = "0.14.1"
 mail-builder = "1.0.0"
-# 0.11 в коде крейтов; 1.0 (через mail-auth 0.14 и mail-send 0.7) меняет API разбора — отдельная карточка (DEPS-02).
+# 0.11 в коде крейтов и в calcard 0.3; 1.0 (она же у mail-auth 0.14 и mail-send 0.7) меняет API разбора.
+# Переход по полосам (DEPS-09): крейт переводит код с `mail_parser` на `mail_parser_1`; когда все перейдут —
+# полоса deps убирает 0.11 из манифестов крейтов.
 mail-parser = "0.11.9"
+mail-parser-1 = { package = "mail-parser", version = "1.0.1" }
 mail-send = "0.7.0"
 moka = { version = "0.12.16", features = ["future"] }
 nix = { version = "0.31.3", features = ["signal", "process", "resource", "socket"] }
