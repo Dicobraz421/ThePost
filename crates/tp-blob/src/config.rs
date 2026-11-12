@@ -42,15 +42,13 @@ mod tests {
         );
 
         let gc: GcConfig =
-            parse("window: 14d\nbatch: 10\nmax_wait: 10m\nprecision: 5s\nlease_ttl: 90s\n")
-                .expect("gc");
+            parse("window: 14d\nbatch: 10\nmax_wait: 10m\nlease_ttl: 90s\n").expect("gc");
         assert_eq!(
             gc,
             GcConfig {
                 window: Duration::from_secs(14 * 24 * 3600),
                 batch: 10,
                 max_wait: Duration::from_secs(600),
-                precision: Duration::from_secs(5),
                 lease_ttl: Duration::from_secs(90),
                 ..GcConfig::default()
             }
