@@ -42,7 +42,7 @@ runs:
       env:
         TARGET: ${{ inputs.target }}
         ARGS: ${{ steps.console.outputs.cargo-args }}
-        RUSTFLAGS: -C target-cpu=x86-64-v3
+        RUSTFLAGS: ''
       run: cross build --release --locked -p thepost --target "$TARGET" $ARGS
     # qemu-user и гостевая система — из Debian 12 (glibc под базовый x86-64), в контейнере: на раннере ubuntu-26.04
     # загрузчик и libc собраны под x86-64-v3 и под Nehalem падают сами, ещё до бинаря (qemu -L не спасает).
@@ -53,7 +53,6 @@ runs:
         BIN: target/${{ inputs.target }}/release/thepost
         GUEST: debian:12-slim
       run: |
-        gcc -Q --help=target | grep -E "^ +-march=" || true  # ВРЕМЕННО: уровень gcc раннера
         docker run --rm -v "$PWD/$BIN:/thepost:ro" "$GUEST" sh -c 'apt-get update -qq &&
           apt-get install -y -qq --no-install-recommends qemu-user >/dev/null &&
           qemu-x86_64 -cpu Nehalem /thepost --version'
