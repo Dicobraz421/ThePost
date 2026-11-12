@@ -48,7 +48,7 @@ use crate::modules;
 use crate::protocols::{
     Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, LogPause, SmtpRole, Sockets,
 };
-use crate::roles::{Maintenance, PendingRole};
+use crate::roles::{Maintenance, PendingRole, Purge};
 use crate::secrets;
 use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection, HttpSection};
 use crate::services::{Base, Services};
@@ -334,6 +334,12 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         gc: blob_cfg.gc.clone(),
         orphans: blob_cfg.orphans.clone(),
         trash: Some(services.mail.clone()),
+        purge: Some(Purge {
+            meta: meta.clone(),
+            interval: cfg
+                .section::<sections::MaintenanceSection>(sections::MAINTENANCE)?
+                .purge_interval,
+        }),
     };
     let mut setup = RoleSetup {
         cfg: &cfg,

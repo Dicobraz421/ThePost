@@ -55,6 +55,8 @@ pub const SEARCH: &str = "search";
 pub const ADMIN: &str = "admin";
 /// Имя секции почтового хранилища (`tp-mailstore`).
 pub const MAILSTORE: &str = "mailstore";
+/// Имя секции роли maintenance.
+pub const MAINTENANCE: &str = "maintenance";
 /// Имя секции входа: каталог, OIDC, пароли приложений, Kerberos.
 pub const AUTH: &str = "auth";
 /// Имя секции слушателей HTTP ролей jmap и admin.
@@ -76,6 +78,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     r.add_section::<DoctorSection>(DOCTOR)?;
     r.add_section::<VerifySection>(VERIFY)?;
     r.add_section::<StartupSection>(STARTUP)?;
+    r.add_section::<MaintenanceSection>(MAINTENANCE)?;
     r.add_section::<tp_smtp::SmtpConfig>(SMTP)?;
     r.add_section::<tp_sieve::SieveConfig>(SIEVE)?;
     r.add_section::<tp_imap::ImapConfig>(IMAP)?;
@@ -90,6 +93,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     })?;
     r.add_check::<BlobSection>(BLOB, BlobSection::check)?;
     r.add_check::<StartupSection>(STARTUP, |c, _| c.check())?;
+    r.add_check::<MaintenanceSection>(MAINTENANCE, |c, _| c.check())?;
     r.add_check::<ClusterSection>(CLUSTER, |c, _| c.check())?;
     r.add_check::<AdminSection>(ADMIN, |c, _| c.0.check())?;
     r.add_check::<AuthSection>(AUTH, AuthSection::check)?;
@@ -693,6 +697,45 @@ impl StartupSection {
     }
 }
 
+// ---------- maintenance ----------
+
+/// Секция `maintenance`: задания роли maintenance, у которых нет своей секции крейта (APP-32, решение 2026-11-11
+/// п. 65). Сроки хранения — в `meta` (`meta.dav.tombstone_ttl`, `meta.sieve.vacation_log_ttl`).
+///
+/// ```yaml
+/// maintenance:
+///   purge_interval: 1h
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintenanceSection {
+    /// Период очистки по сроку надгробий DAV и журнала автоответов (`1h`); первый проход — при запуске роли.
+    /// Требует перезапуска.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub purge_interval: Duration,
+}
+
+impl Default for MaintenanceSection {
+    fn default() -> Self {
+        Self {
+            purge_interval: Duration::from_secs(3600),
+        }
+    }
+}
+
+impl MaintenanceSection {
+    /// Период положителен.
+    pub fn check(&self) -> Result<()> {
+        if self.purge_interval.is_zero() {
+            return Err(Error::invalid(
+                "maintenance: purge_interval must be positive",
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ---------- doctor ----------
 
 /// Секция `doctor`: пороги проверок окружения `thepost doctor` (проверки СУБД — `meta.doctor`).
@@ -1006,6 +1049,28 @@ blob:
             "{MINIMAL_DEV}cluster:\n  events_poll_interval: 1s\n"
         )));
         assert!(e.contains("events_poll_interval"), "{e}");
+    }
+
+    /// APP-32: период очистки роли maintenance — `1h` по умолчанию, из config.yaml, нулевой — ошибка.
+    #[test]
+    fn maintenance_purge_interval() {
+        let c = parse(MINIMAL_DEV).expect("config");
+        let m = c
+            .section::<MaintenanceSection>(MAINTENANCE)
+            .expect("section");
+        assert_eq!(m.purge_interval, Duration::from_secs(3600));
+        let c = parse(&format!(
+            "{MINIMAL_DEV}maintenance:\n  purge_interval: 10m\n"
+        ))
+        .expect("config");
+        let m = c
+            .section::<MaintenanceSection>(MAINTENANCE)
+            .expect("section");
+        assert_eq!(m.purge_interval, Duration::from_secs(600));
+        let e = err(parse(&format!(
+            "{MINIMAL_DEV}maintenance:\n  purge_interval: 0s\n"
+        )));
+        assert!(e.contains("purge_interval"), "{e}");
     }
 
     /// APP-08: шина — в процессе (по умолчанию) или PostgreSQL LISTEN/NOTIFY; Valkey — ошибка строгой проверки.
