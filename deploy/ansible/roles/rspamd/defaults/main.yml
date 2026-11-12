@@ -13,6 +13,8 @@ rspamd_repo_key_url: https://rspamd.com/apt-stable/gpg.key
 # AlmaLinux, RHEL: сборки rspamd.com для CentOS той же версии.
 rspamd_rpm_repo_uri: https://rspamd.com/rpm-stable
 rspamd_rpm_repo_key_url: https://rspamd.com/rpm/rspamd.asc
+# EPEL для зависимостей сборок rspamd.com (AlmaLinux; на самом RHEL EPEL подключает администратор).
+rspamd_epel: "{{ rspamd_rhel | bool and rspamd_official_repo | bool and ansible_distribution != 'RedHat' }}"
 rspamd_service: rspamd
 
 # Все рабочие процессы — только loopback: thepost на той же ВМ.

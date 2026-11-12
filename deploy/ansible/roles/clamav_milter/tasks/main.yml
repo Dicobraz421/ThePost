@@ -1,4 +1,4 @@
-# Установка clamd, freshclam и clamav-milter (Debian, Ubuntu, Astra Linux SE; AlmaLinux, RHEL — EPEL). Повторный
+# Установка clamd, freshclam и clamav-milter (Debian, Ubuntu; AlmaLinux, RHEL — EPEL). Повторный
 # прогон ничего не меняет.
 ---
 - name: Check OS family
@@ -6,9 +6,10 @@
     that:
       - ansible_pkg_mgr in ['apt', 'dnf', 'dnf5']
       - ansible_distribution != 'RED'
+      - ansible_distribution is not match('Astra')
     fail_msg: >-
-      Роль clamav_milter поддерживает Debian, Ubuntu, Astra Linux SE, AlmaLinux и RHEL (EPEL); в репозиториях РЕД ОС 8
-      ClamAV нет — thepost_clamav: false или свой фильтр Milter (smtp.milter)
+      Роль clamav_milter поддерживает Debian, Ubuntu, AlmaLinux и RHEL (EPEL); в репозиториях РЕД ОС 8 и Astra Linux SE
+      1.8 ClamAV нет — thepost_clamav: false или свой фильтр Milter (smtp.milter)
 
 - name: Enable EPEL
   ansible.builtin.dnf:

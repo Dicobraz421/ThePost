@@ -3,6 +3,12 @@
 # thepost перечитывает их без перезапуска (tls.reload_interval). Смена списка имён — certbot certonly --expand вручную.
 # AlmaLinux: certbot — из EPEL; РЕД ОС — пакет дистрибутива; RHEL — EPEL подключает администратор.
 ---
+- name: Check certbot availability
+  ansible.builtin.assert:
+    that: ansible_distribution is not match('Astra')
+    fail_msg: >-
+      В репозиториях Astra Linux SE 1.8 нет certbot: thepost_tls_mode: acme (встроенный клиент ACME thepost) или files
+
 - name: Enable EPEL for certbot
   ansible.builtin.dnf:
     name: epel-release

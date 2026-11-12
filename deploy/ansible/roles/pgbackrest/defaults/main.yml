@@ -32,7 +32,8 @@ thepost_backup_cipher: true
 
 # Копия каталога BLOB (тела писем): restic (снимки, шифрование, дедупликация; каталог или S3) или rsync (зеркало
 # в каталог или по SSH). Запускается после каждой копии СУБД и по своему расписанию.
-thepost_backup_blob_tool: restic
+# Astra Linux SE 1.8 — rsync: restic в репозиториях Astra нет.
+thepost_backup_blob_tool: "{{ 'rsync' if ansible_distribution is match('Astra') else 'restic' }}"
 thepost_backup_blob_dir: /var/lib/thepost/blob
 # Частота копии BLOB (OnCalendar; RPO тел писем); пусто — только после копий СУБД.
 thepost_backup_blob_schedule: hourly

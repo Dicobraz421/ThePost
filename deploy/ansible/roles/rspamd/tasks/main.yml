@@ -32,6 +32,13 @@
     update_cache: "{{ rspamd_repo is changed }}"
   when: not rspamd_rhel | bool
 
+# Сборки rspamd.com для CentOS зависят от EPEL (libsodium, jemalloc, hyperscan).
+- name: Enable EPEL
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+  when: rspamd_epel | bool
+
 - name: Add Rspamd repository (dnf)
   ansible.builtin.yum_repository:
     name: rspamd

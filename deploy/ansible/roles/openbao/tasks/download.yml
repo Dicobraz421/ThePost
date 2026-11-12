@@ -1,0 +1,38 @@
+# Пакет OpenBao через uri с ca_path (openbao_download_ca_path) и сверка SHA-256: сумма — из openbao_package_checksum
+# ("sha256:<сумма>" или "sha256:<адрес checksums.txt>").
+---
+- name: Read OpenBao checksums
+  ansible.builtin.uri:
+    url: "{{ openbao_package_checksum | regex_replace('^sha256:', '') }}"
+    ca_path: "{{ openbao_download_ca_path }}"
+    return_content: true
+  register: openbao_checksums
+  when: openbao_package_checksum is match('sha256:https?://')
+
+- name: Set OpenBao package checksum
+  ansible.builtin.set_fact:
+    openbao_package_sha256: >-
+      {{ (openbao_checksums.content | regex_search('(?m)^([0-9a-f]{64})\s+' ~ (openbao_package_url | basename | regex_escape) ~ '$', '\1') | first)
+         if openbao_checksums.content is defined else openbao_package_checksum | regex_replace('^sha256:', '') }}
+
+- name: Download OpenBao package
+  ansible.builtin.uri:
+    url: "{{ openbao_package_url }}"
+    ca_path: "{{ openbao_download_ca_path }}"
+    dest: "/var/cache/openbao_{{ openbao_version }}.{{ openbao_package_ext }}"
+    creates: "/var/cache/openbao_{{ openbao_version }}.{{ openbao_package_ext }}"
+    mode: "0644"
+
+- name: Read OpenBao package checksum
+  ansible.builtin.stat:
+    path: "/var/cache/openbao_{{ openbao_version }}.{{ openbao_package_ext }}"
+    checksum_algorithm: sha256
+  register: openbao_package_stat
+
+- name: Check OpenBao package checksum
+  ansible.builtin.assert:
+    that: openbao_package_stat.stat.checksum == openbao_package_sha256
+    fail_msg: >-
+      Сумма SHA-256 пакета OpenBao не совпала с {{ openbao_package_checksum }}: удалите
+      /var/cache/openbao_{{ openbao_version }}.{{ openbao_package_ext }} и повторите прогон
+    quiet: true

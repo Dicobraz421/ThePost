@@ -13,6 +13,9 @@ postgresql_pgdg_uri: http://apt.postgresql.org/pub/repos/apt
 postgresql_pgdg_suite: >-
   {{ 'bookworm' if ansible_distribution is match('Astra') else ansible_distribution_release }}-pgdg
 postgresql_pgdg_key_url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+# Astra Linux SE закрепляет свои репозитории (Pin-Priority 900, astra.pin.pref) — свои postgresql-common и libpq5
+# (15) не дают поставить PGDG 16; true — пакеты PGDG получают приоритет 901 (thepost-pgdg.pref).
+postgresql_pgdg_pin: "{{ ansible_distribution is match('Astra') }}"
 postgresql_pgdg_yum_uri: https://download.postgresql.org/pub/repos/yum
 postgresql_pgdg_yum_key_url: https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL
 postgresql_cluster: main

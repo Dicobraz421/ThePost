@@ -119,33 +119,34 @@
 - name: Apply PostgreSQL restart
   ansible.builtin.meta: flush_handlers
 
+# Обёртки — полным путём: secure_path sudo в семействе RHEL без /usr/local/sbin.
 # info: status.code 0 — stanza в порядке, 1 — нет stanza, 2 — нет копий (pgBackRest, команда info).
 - name: Read pgBackRest stanza state
-  ansible.builtin.command: thepost-pgbackrest --output=json info
+  ansible.builtin.command: /usr/local/sbin/thepost-pgbackrest --output=json info
   register: thepost_backup_info
   changed_when: false
   failed_when: false
 
 - name: Create pgBackRest stanza
-  ansible.builtin.command: thepost-pgbackrest stanza-create
+  ansible.builtin.command: /usr/local/sbin/thepost-pgbackrest stanza-create
   when: thepost_backup_info.rc != 0 or (thepost_backup_info.stdout | from_json)[0].status.code == 1
   changed_when: true
   register: thepost_backup_stanza_created
 
 - name: Check WAL archiving
-  ansible.builtin.command: thepost-pgbackrest check
+  ansible.builtin.command: /usr/local/sbin/thepost-pgbackrest check
   when: thepost_backup_stanza_created is changed  # noqa: no-handler
   changed_when: false
 
 - name: Check restic repository
-  ansible.builtin.command: thepost-restic cat config
+  ansible.builtin.command: /usr/local/sbin/thepost-restic cat config
   register: thepost_backup_restic_config
   changed_when: false
   failed_when: false
   when: thepost_backup_blob_tool == 'restic'
 
 - name: Initialize restic repository
-  ansible.builtin.command: thepost-restic init
+  ansible.builtin.command: /usr/local/sbin/thepost-restic init
   when: thepost_backup_blob_tool == 'restic' and thepost_backup_restic_config.rc != 0
   changed_when: true
 

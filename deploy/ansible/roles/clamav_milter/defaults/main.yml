@@ -8,8 +8,8 @@ clamav_milter_on_infected: Reject
 clamav_db_wait_retries: 60
 clamav_db_wait_delay: 10
 
-# Пакеты и пути: Debian, Ubuntu, Astra Linux SE — пакеты дистрибутива; AlmaLinux — EPEL (на RHEL EPEL подключает
-# администратор); в РЕД ОС 8 ClamAV нет.
+# Пакеты и пути: Debian, Ubuntu — пакеты дистрибутива; AlmaLinux — EPEL (на RHEL EPEL подключает администратор);
+# в РЕД ОС 8 и Astra Linux SE 1.8 ClamAV нет.
 clamav_rhel: "{{ ansible_pkg_mgr != 'apt' }}"
 clamav_packages: >-
   {{ ['clamav', 'clamd', 'clamav-update', 'clamav-milter'] if clamav_rhel | bool

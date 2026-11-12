@@ -37,6 +37,20 @@
   when: not postgresql_rhel | bool and postgresql_pgdg_repo | bool
   register: postgresql_repo
 
+- name: Prefer PGDG packages over pinned distribution repositories (apt)
+  ansible.builtin.copy:
+    dest: /etc/apt/preferences.d/thepost-pgdg.pref
+    content: |
+      # Ansible: роль postgresql — PostgreSQL 16 из PGDG поверх закреплённых репозиториев дистрибутива (Astra Linux SE).
+      Package: *
+      Pin: release o=apt.postgresql.org
+      Pin-Priority: 901
+    owner: root
+    group: root
+    mode: "0644"
+  when: not postgresql_rhel | bool and postgresql_pgdg_repo | bool and postgresql_pgdg_pin | bool
+  register: postgresql_pin
+
 - name: Install PostgreSQL (apt)
   ansible.builtin.apt:
     name:
@@ -44,7 +58,7 @@
       - python3-psycopg2
       - acl  # become_user postgres
     state: present
-    update_cache: "{{ postgresql_repo is changed }}"
+    update_cache: "{{ postgresql_repo is changed or postgresql_pin is changed }}"
   when: not postgresql_rhel | bool
 
 # PGDG для AlmaLinux и RHEL: пакеты версии и общий (pgBackRest — роль pgbackrest). Каталог — по ansible_architecture:
