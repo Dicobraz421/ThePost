@@ -1,7 +1,9 @@
 //! Milter-клиент (SRS 4.1): антиспам и антивирус по протоколу Milter v6 (Rspamd, clamav-milter и др.).
 //!
 //! [`Milters`] — цепочка фильтров секции `smtp.milter`; письмо проходит фильтры по порядку после приёма
-//! (`DATA`/`BDAT`), до доставки и постановки в очередь. Каждому фильтру — отдельное соединение: согласование
+//! (`DATA`/`BDAT`), до доставки и постановки в очередь. Набор фильтров письма — профиль `smtp.milter.profiles`,
+//! выбранный политикой организации (`Policy::milter_profile`, SMTP-40); профиль не задан — все фильтры режима,
+//! профиля нет в конфигурации — тоже все (предупреждение в журнал: фильтрация не пропускается). Каждому фильтру — отдельное соединение: согласование
 //! (`O`), макросы (`D`), `C`, `H`, `M`, `R`, `T`, заголовки (`L`), `N`, тело (`B`), `E`, `Q`; шаги, от
 //! которых фильтр отказался при согласовании (`SMFIP_NO*`, `SMFIP_NR_*`), не отправляются или идут без ответа.
 //!
@@ -111,6 +113,13 @@ enum Filtered {
 impl Milters {
     /// Цепочка из секции `smtp.milter`; `hostname` — макрос `j`.
     pub fn new(cfg: MilterConfig, hostname: impl Into<String>) -> Self {
+        for (profile, names) in &cfg.profiles {
+            for name in names {
+                if !cfg.filters.iter().any(|f| &f.name == name) {
+                    tracing::warn!(%profile, filter = %name, "milter: фильтра профиля нет в smtp.milter.filters");
+                }
+            }
+        }
         Self {
             cfg,
             hostname: hostname.into(),
@@ -122,9 +131,29 @@ impl Milters {
         self.cfg.filters.iter().any(|f| f.applies(mode))
     }
 
-    /// Проверяет письмо `raw` транзакции `env` фильтрами её режима по порядку.
-    pub async fn check(&self, env: &Envelope, raw: Bytes) -> Outcome {
-        self.check_with(env, raw, |f| {
+    /// Фильтры режима `mode` профиля `profile` по порядку `filters`.
+    fn selected<'a>(
+        &'a self,
+        mode: Mode,
+        profile: Option<&str>,
+    ) -> impl Iterator<Item = &'a MilterFilter> + 'a {
+        let names = profile.and_then(|p| {
+            let names = self.cfg.profiles.get(p);
+            if names.is_none() {
+                tracing::warn!(profile = %p, "milter: профиля политики нет в smtp.milter.profiles, все фильтры");
+            }
+            names
+        });
+        self.cfg
+            .filters
+            .iter()
+            .filter(move |f| f.applies(mode) && names.is_none_or(|n| n.contains(&f.name)))
+    }
+
+    /// Проверяет письмо `raw` транзакции `env` фильтрами её режима из профиля `profile` (`None` — все) по
+    /// порядку.
+    pub async fn check(&self, env: &Envelope, raw: Bytes, profile: Option<&str>) -> Outcome {
+        self.check_with(env, raw, profile, |f| {
             let address = f.address.clone();
             let timeout = f.connect_timeout;
             async move {
@@ -142,6 +171,7 @@ impl Milters {
         &self,
         env: &Envelope,
         raw: Bytes,
+        profile: Option<&str>,
         connect: F,
     ) -> Outcome
     where
@@ -154,7 +184,7 @@ impl Milters {
             message: raw,
             quarantine: None,
         };
-        for f in self.cfg.filters.iter().filter(|f| f.applies(env.mode)) {
+        for f in self.selected(env.mode, profile) {
             let mut mods = Vec::new();
             let res = match connect(f).await {
                 Ok(stream) => {
@@ -636,4 +666,6 @@ impl MilterFilter {
 }
 
 #[cfg(test)]
-mod tests;
+mod profile_tests;
+#[cfg(test)]
+pub(crate) mod tests;

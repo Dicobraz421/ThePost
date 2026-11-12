@@ -5,7 +5,8 @@
 //! перебора — за проверкой учётных данных (`AbuseGuard` узла, как у IMAP): заблокированная попытка
 //! отклоняется как неверный пароль. Сеанс после `limits.max_auth_failures` неудач подряд закрывается
 //! (`421`), адрес клиента здесь не блокируется (решение 99). Частота отправки — по учётной записи
-//! ([`RateLimiter::check_account`]) на каждый `MAIL`.
+//! ([`RateLimiter::check_account`]) на каждый `MAIL`. После входа сеанс получает политику организации учётной
+//! записи ([`super::Handler::policy`]: лимиты получателей письма и писем в час); недоступна — `454 4.7.0`.
 //!
 //! [`RateLimiter::check_account`]: tp_platform::RateLimiter::check_account
 
@@ -182,8 +183,20 @@ impl Session {
                 Some(State::Auth(ex))
             }
             Ok(SaslStep::Done(p)) => {
+                let policy = match self.ctx.handler.policy(&p).await {
+                    Ok(policy) => policy,
+                    Err(e) => {
+                        tracing::warn!(error = %e, login = %p.login, "smtp: политика учётной записи недоступна");
+                        push(
+                            out,
+                            &reply(454, [4, 7, 0], "Temporary authentication failure"),
+                        );
+                        return None;
+                    }
+                };
                 tracing::info!(client = %self.conn.client, login = %p.login, "smtp: AUTH");
                 self.principal = Some(p);
+                self.policy = policy;
                 self.auth_failures = 0;
                 push(out, &reply(235, [2, 7, 0], "Authentication successful"));
                 None
