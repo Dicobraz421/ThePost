@@ -94,6 +94,10 @@ enum AcmeError {
     State(#[from] serde_yaml_ng::Error),
     #[error("acme.domains is empty")]
     NoDomains,
+    #[error(
+        "acme writes the issued key to tls.key_file; tls.key from the secret store cannot be used with acme"
+    )]
+    SecretKey,
     #[error("acme: storage task failed")]
     Join,
 }
@@ -106,7 +110,7 @@ impl From<AcmeError> for Error {
                 tracing::warn!(error = %e, "acme request failed");
                 Error::UNAVAILABLE
             }
-            AcmeError::NoDomains => Error::Invalid(e.to_string()),
+            AcmeError::NoDomains | AcmeError::SecretKey => Error::Invalid(e.to_string()),
             _ => Error::Internal(e.to_string()),
         }
     }
@@ -226,6 +230,9 @@ impl Acme {
         if self.cfg.domains.is_empty() {
             return Err(AcmeError::NoDomains.into());
         }
+        if self.tls.key.is_some() {
+            return Err(AcmeError::SecretKey.into());
+        }
         let cert_file = self.tls.cert_file.clone();
         let domains_file = self.domains_file();
         let (not_after, issued_for) = tokio::task::spawn_blocking(move || {
@@ -279,6 +286,9 @@ impl Acme {
     async fn try_issue(&self) -> Result<(), AcmeError> {
         if self.cfg.domains.is_empty() {
             return Err(AcmeError::NoDomains);
+        }
+        if self.tls.key.is_some() {
+            return Err(AcmeError::SecretKey);
         }
         let account = self.account().await?;
         let identifiers: Vec<Identifier> = self
