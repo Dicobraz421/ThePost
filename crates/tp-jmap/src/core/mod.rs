@@ -14,6 +14,7 @@ use tp_contracts::auth::{Authenticator, Authorizer, Principal};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::bus::EventBus;
 use tp_contracts::dav::DavStore;
+use tp_contracts::delivery::DeliveryLog;
 use tp_contracts::ext::{DecisionHooks, JmapCapability};
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{
@@ -117,6 +118,8 @@ pub struct Deps {
     pub outbound: Option<Arc<dyn Outbound>>,
     /// Учёт отправок: объекты `EmailSubmission` (отложенная отправка, отмена, статусы получателей).
     pub submissions: Arc<dyn SubmissionStore>,
+    /// Журнал доставки: статусы получателей отправок (`EmailSubmission.deliveryStatus`).
+    pub delivery_log: Arc<dyn DeliveryLog>,
     /// Точки принятия решений модулей (`on_submission`; `before_final_delete` при очистке корзины).
     pub hooks: DecisionHooks,
     /// Capability модулей (`Registry::jmap_capabilities`).

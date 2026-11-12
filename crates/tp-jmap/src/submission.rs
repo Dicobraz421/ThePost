@@ -14,8 +14,14 @@
 //!   и тело — дальше вместо исходных. Заголовок `Bcc` из отправляемого письма удаляется.
 //! - Каждая отправка записывается в [`SubmissionStore`](tp_contracts::submission::SubmissionStore): `EmailSubmission/get`,
 //!   `changes`, `query`, `queryChanges` читают записи, `state` и `queryState` — состояние хранилища. `deliveryStatus` —
-//!   статусы получателей записи (доставлено локально — `yes`, в очереди — `queued`, отказ — `no` с ответом SMTP); у
-//!   ждущей срока и отменённой отправки — `null`.
+//!   статусы получателей записи (доставлено — `yes`, в очереди или отложено — `queued`, отказ — `no` с ответом SMTP);
+//!   у ждущей срока и отменённой отправки — `null`.
+//! - Статус доставки (JMAP-16): перед чтением отправки учётной записи сверяются с журналом доставки ([`sync_delivery`]) —
+//!   по записи очереди отправки ([`DeliveryLog::by_queue`](tp_contracts::delivery::DeliveryLog::by_queue)): доставка в
+//!   ящик и приём внешним сервером — `yes` (как и письмо, принятое и отброшенное правилом: отправителю об этом не
+//!   сообщается), отказ — `no` с причиной из журнала, временный отказ, карантин и модерация — `queued`. Новые статусы записываются в хранилище, поэтому меняют `state` и видны в `EmailSubmission/changes` и push.
+//!   У письма, отправленного сразу, записи очереди нет ([`Submitted`] её не сообщает): его статусы — ответ
+//!   [`Outbound::submit`](tp_contracts::queue::Outbound::submit).
 //! - `EmailSubmission/set`, изменение — только отмена отложенной отправки (`undoStatus: canceled`): письмо снимается
 //!   с очереди ([`Outbound::cancel_scheduled`](tp_contracts::queue::Outbound::cancel_scheduled)), запись отменяется;
 //!   отправленное или уже выпущенное письмо — `cannotUnsend`. Удаление убирает запись, на письмо и очередь не влияет.
@@ -30,9 +36,10 @@ use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tp_contracts::auth::SendRight;
+use tp_contracts::delivery::{DeliveryDecision, DeliveryEvent, DeliveryEventKind};
 use tp_contracts::ext::{CopyTo, Decision, SubmissionInfo};
 use tp_contracts::mailstore::IngestRequest;
-use tp_contracts::meta::Changes;
+use tp_contracts::meta::{AccountScope, Changes};
 use tp_contracts::queue::{SubmitStatus, Submitted};
 use tp_contracts::submission::{EmailSubmission, SubmissionFilter, UndoStatus};
 use tp_contracts::transport::{BlobRef, FlowDirection, FlowEnvelope, FlowInput, FlowVerdict};
@@ -43,7 +50,7 @@ use crate::core::request::{
     ChangesArgs, Comparator, GetArgs, QueryChangesArgs, QueryWindow, SetOutcome, apply_window,
     object, or_null, parse_args, query_changes_response, select,
 };
-use crate::core::{Ctx, digest, lone_thread_id, thread_id};
+use crate::core::{Ctx, Jmap, digest, lone_thread_id, thread_id};
 use crate::email_get::{collect, utc_date};
 
 // ---------- Identity ----------
@@ -201,9 +208,93 @@ fn delivery_status(rcpts: &[(String, SubmitStatus)]) -> Value {
     Value::Object(m)
 }
 
-/// Состояние отправок учётной записи (`state`, `queryState`): состояние [`SubmissionStore`](tp_contracts::submission::SubmissionStore).
+/// Статус получателя по событию журнала доставки; событие не о доставке получателю (приём, уведомление DSN) — `None`.
+fn tracked(e: &DeliveryEvent) -> Option<SubmitStatus> {
+    if matches!(e.kind, DeliveryEventKind::Receive | DeliveryEventKind::Dsn) {
+        return None;
+    }
+    Some(match e.decision {
+        // Доставлено в ящик или принято внешним сервером: дальше письмо ведёт он.
+        DeliveryDecision::Accept | DeliveryDecision::Discard => SubmitStatus::Delivered,
+        DeliveryDecision::Reject => SubmitStatus::Failed(e.reason.clone().unwrap_or_default()),
+        DeliveryDecision::Defer | DeliveryDecision::Quarantine | DeliveryDecision::Hold => {
+            SubmitStatus::Queued
+        }
+    })
+}
+
+/// Статусы получателей отправки по событиям её записи очереди (по возрастанию времени): действует последнее
+/// событие о получателе; о ком событий нет — в очереди.
+fn track(rcpts: &[String], events: &[DeliveryEvent]) -> Vec<(String, SubmitStatus)> {
+    let mut out: Vec<(String, SubmitStatus)> = rcpts
+        .iter()
+        .map(|r| (r.clone(), SubmitStatus::Queued))
+        .collect();
+    for e in events {
+        let Some(status) = tracked(e) else { continue };
+        for (rcpt, st) in &mut out {
+            if e.recipients.iter().any(|x| x.eq_ignore_ascii_case(rcpt)) {
+                *st = status.clone();
+            }
+        }
+    }
+    out
+}
+
+/// Сверка отправок учётной записи с журналом доставки (JMAP-16): у отправок с записью очереди, срок которых
+/// наступил, статусы получателей берутся из [`DeliveryLog::by_queue`](tp_contracts::delivery::DeliveryLog::by_queue)
+/// и записываются [`SubmissionStore::finalize`](tp_contracts::submission::SubmissionStore::finalize) — отправка
+/// становится `final`, изменение статусов меняет состояние и попадает в `EmailSubmission/changes`. Отправки, у которых
+/// все получатели в конечном статусе, и отменённые не перечитываются.
+pub(crate) async fn sync_delivery(jmap: &Jmap, scope: AccountScope) -> tp_contracts::Result<()> {
+    let now = OffsetDateTime::now_utc();
+    let limit = jmap.cfg.submission.max_delivery_events;
+    for s in jmap.d.submissions.list(scope).await? {
+        let Some(queue) = s.queue else { continue };
+        let due = match s.undo_status {
+            UndoStatus::Canceled => continue,
+            UndoStatus::Pending if s.send_at > now => continue,
+            UndoStatus::Pending => true,
+            UndoStatus::Final => false,
+        };
+        let settled =
+            !s.delivery.is_empty() && s.delivery.iter().all(|(_, st)| *st != SubmitStatus::Queued);
+        if !due && settled {
+            continue;
+        }
+        let events = jmap
+            .d
+            .delivery_log
+            .by_queue(scope.tenant, queue, limit)
+            .await?;
+        let delivery = track(&s.rcpt_to, &events);
+        if !due && delivery == s.delivery {
+            continue;
+        }
+        match jmap
+            .d
+            .submissions
+            .finalize(scope, &s.id, delivery, Some(queue))
+            .await
+        {
+            // Отменена или удалена между чтением и записью — сверять нечего.
+            Ok(_) | Err(Error::Conflict | Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Состояние отправок учётной записи после сверки с журналом доставки ([`sync_delivery`]) — `state` и `queryState`
+/// EmailSubmission, состояние типа в push.
+pub(crate) async fn synced_state(jmap: &Jmap, scope: AccountScope) -> tp_contracts::Result<String> {
+    sync_delivery(jmap, scope).await?;
+    Ok(jmap.d.submissions.state(scope).await?.to_string())
+}
+
+/// Состояние отправок учётной записи (`state`, `queryState`) — [`synced_state`].
 async fn submission_state(ctx: &Ctx<'_>) -> MethodResult<String> {
-    Ok(ctx.jmap.d.submissions.state(ctx.scope).await?.to_string())
+    Ok(synced_state(ctx.jmap, ctx.scope).await?)
 }
 
 /// Состояние отправок из строки клиента; чужая строка — `cannotCalculateChanges`.
@@ -301,6 +392,7 @@ pub(crate) async fn submission_changes(
     ctx.check_account(&a.account_id)?;
     let since = parse_submission_state(&a.since_state)?;
     let limit = a.limit(ctx.jmap.cfg.max_changes)?;
+    sync_delivery(ctx.jmap, ctx.scope).await?;
     let c = ctx
         .jmap
         .d
@@ -516,6 +608,7 @@ pub(crate) async fn submission_query_changes(
     let a: SubmissionQueryArgs = parse_args(q)?;
     let since = parse_submission_state(&qc.since_query_state)?;
     let limit = qc.limit(ctx.jmap.cfg.max_changes)?;
+    sync_delivery(ctx.jmap, ctx.scope).await?;
     let c = ctx
         .jmap
         .d
@@ -1918,6 +2011,219 @@ mod tests {
         )
         .await;
         assert_eq!(by_thread[0][1]["ids"], json!([b]), "{:?}", by_thread[0]);
+    }
+
+    /// Событие журнала доставки записи очереди `queue`.
+    fn event(
+        env: &Env,
+        queue: tp_contracts::QueueId,
+        kind: DeliveryEventKind,
+        decision: DeliveryDecision,
+        rcpt: &str,
+        reason: Option<&str>,
+    ) -> DeliveryEvent {
+        DeliveryEvent {
+            tenant: env.scope.tenant,
+            at: OffsetDateTime::now_utc(),
+            node: tp_contracts::membership::NodeId::try_from("node-1".to_owned()).expect("node"),
+            kind,
+            sender: "user@example.org".into(),
+            recipients: vec![rcpt.to_owned()],
+            message_id: None,
+            queue_id: Some(queue),
+            decision,
+            reason: reason.map(str::to_owned),
+        }
+    }
+
+    /// Статус доставки из журнала: наступившая отложенная отправка становится `final`, статусы получателей — по
+    /// событиям её записи очереди; каждое изменение меняет состояние и видно в `changes`; после конечных статусов
+    /// состояние не меняется.
+    #[tokio::test]
+    async fn delivery_status_from_log() {
+        use tp_contracts::delivery::DeliveryLog;
+        let env = Env::new().await;
+        let acc = env.account();
+        let queue = tp_contracts::QueueId::new();
+        let rcpts = [
+            "local@example.org",
+            "slow@external.test",
+            "Far@external.test",
+        ];
+        let state0 = env
+            .submissions
+            .insert(
+                env.scope,
+                EmailSubmission {
+                    id: "S1".into(),
+                    identity: identity_id("user@example.org"),
+                    email: MessageId::new(),
+                    mail_from: "user@example.org".into(),
+                    rcpt_to: rcpts.iter().map(|r| (*r).to_owned()).collect(),
+                    send_at: OffsetDateTime::now_utc() - time::Duration::minutes(1),
+                    undo_status: UndoStatus::Pending,
+                    delivery: Vec::new(),
+                    queue: Some(queue),
+                },
+            )
+            .await
+            .expect("insert");
+        let get = || async {
+            let r = calls(
+                &env,
+                &env.jmap,
+                json!([["EmailSubmission/get", {"accountId": acc, "ids": ["S1"]}, "g"]]),
+            )
+            .await;
+            r[0][1].clone()
+        };
+        let delivered =
+            |g: &Value, rcpt: &str| g["list"][0]["deliveryStatus"][rcpt]["delivered"].clone();
+
+        // Срок наступил, событий ещё нет: окончательная, все получатели в очереди.
+        let g1 = get().await;
+        assert_eq!(g1["list"][0]["undoStatus"], "final", "{g1}");
+        assert!(rcpts.iter().all(|r| delivered(&g1, r) == "queued"), "{g1}");
+        assert_ne!(g1["state"], state0.to_string());
+        let cancel = calls(
+            &env,
+            &env.jmap,
+            json!([["EmailSubmission/set", {"accountId": acc, "update": {"S1": {"undoStatus": "canceled"}}}, "u"]]),
+        )
+        .await;
+        assert_eq!(cancel[0][1]["notUpdated"]["S1"]["type"], "cannotUnsend");
+
+        // Доставка в ящик и временный отказ; приём письма и уведомление DSN статус не меняют.
+        for e in [
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Receive,
+                DeliveryDecision::Accept,
+                rcpts[1],
+                None,
+            ),
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Deliver,
+                DeliveryDecision::Accept,
+                rcpts[0],
+                None,
+            ),
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Relay,
+                DeliveryDecision::Defer,
+                rcpts[1],
+                Some("451 4.7.1 Try later"),
+            ),
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Dsn,
+                DeliveryDecision::Reject,
+                rcpts[0],
+                None,
+            ),
+        ] {
+            env.delivery_log.record(e).await.expect("record");
+        }
+        let g2 = get().await;
+        assert_eq!(delivered(&g2, rcpts[0]), "yes", "{g2}");
+        assert_eq!(delivered(&g2, rcpts[1]), "queued");
+        assert_eq!(delivered(&g2, rcpts[2]), "queued");
+        assert_ne!(g2["state"], g1["state"]);
+        let c = calls(
+            &env,
+            &env.jmap,
+            json!([["EmailSubmission/changes", {"accountId": acc, "sinceState": g1["state"]}, "c"]]),
+        )
+        .await;
+        assert_eq!(c[0][1]["updated"], json!(["S1"]), "{:?}", c[0]);
+
+        // Отказ с ответом сервера и приём внешним сервером (адрес — без учёта регистра).
+        for e in [
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Relay,
+                DeliveryDecision::Reject,
+                rcpts[1],
+                Some("550 5.1.1 No such user"),
+            ),
+            event(
+                &env,
+                queue,
+                DeliveryEventKind::Relay,
+                DeliveryDecision::Accept,
+                "far@external.test",
+                Some("250 2.0.0 OK"),
+            ),
+        ] {
+            env.delivery_log.record(e).await.expect("record");
+        }
+        // Изменение видно и без чтения объекта: `changes` сверяет сам.
+        let c = calls(
+            &env,
+            &env.jmap,
+            json!([["EmailSubmission/changes", {"accountId": acc, "sinceState": g2["state"]}, "c"]]),
+        )
+        .await;
+        assert_eq!(c[0][1]["updated"], json!(["S1"]), "{:?}", c[0]);
+        let g3 = get().await;
+        let status = &g3["list"][0]["deliveryStatus"];
+        assert_eq!(status[rcpts[1]]["delivered"], "no", "{g3}");
+        assert_eq!(status[rcpts[1]]["smtpReply"], "550 5.1.1 No such user");
+        assert_eq!(status[rcpts[2]]["delivered"], "yes");
+        assert_eq!(g3["state"], c[0][1]["newState"]);
+
+        // Все получатели в конечном статусе: журнал больше не читается, состояние не меняется.
+        env.delivery_log
+            .record(event(
+                &env,
+                queue,
+                DeliveryEventKind::Relay,
+                DeliveryDecision::Defer,
+                rcpts[0],
+                None,
+            ))
+            .await
+            .expect("record");
+        let g4 = get().await;
+        assert_eq!(g4["state"], g3["state"]);
+        assert_eq!(delivered(&g4, rcpts[0]), "yes");
+    }
+
+    /// Ждущая срока и отменённая отправки с журналом не сверяются; состояние отправок — в push вместе с папками.
+    #[tokio::test]
+    async fn pending_is_not_tracked_and_push_state() {
+        use tp_contracts::bus::EventKind;
+        use tp_contracts::delivery::DeliveryLog;
+        let env = Env::new().await;
+        let set = send_at(&env, OffsetDateTime::now_utc() + time::Duration::hours(1)).await;
+        let queue = env.outbound.scheduled()[0].queue;
+        env.delivery_log
+            .record(event(
+                &env,
+                queue,
+                DeliveryEventKind::Deliver,
+                DeliveryDecision::Accept,
+                "rcpt@external.test",
+                None,
+            ))
+            .await
+            .expect("record");
+        let state = synced_state(&env.jmap, env.scope).await.expect("state");
+        assert_eq!(set["newState"], state, "отправка ждёт срока — не сверяется");
+        let stored = env.submissions.list(env.scope).await.expect("list");
+        assert_eq!(stored[0].undo_status, UndoStatus::Pending);
+        let kind = EventKind::MailboxChanged {
+            mailbox: env.mailbox(SpecialUse::Sent),
+            modseq: ModSeq(1),
+        };
+        assert!(crate::push::changed_types(&kind).contains(&"EmailSubmission"));
     }
 
     #[test]

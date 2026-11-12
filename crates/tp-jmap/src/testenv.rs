@@ -22,9 +22,9 @@ use tp_contracts::sieve::SieveStore;
 use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_testkit::{
-    Clock, FakeAuthenticator, FakeSearch, MemBlobIndex, MemBlobStore, MemDav, MemEventBus,
-    MemItipSender, MemMetadata, MemOutbound, MemPolicies, MemQuota, MemSieve, MemSubmissions,
-    MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
+    Clock, FakeAuthenticator, FakeSearch, MemBlobIndex, MemBlobStore, MemDav, MemDeliveryLog,
+    MemEventBus, MemItipSender, MemMetadata, MemOutbound, MemPolicies, MemQuota, MemSieve,
+    MemSubmissions, MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
 use crate::{Deps, Jmap, JmapConfig};
@@ -131,6 +131,7 @@ pub struct Env {
     pub authz: Arc<TestAuthz>,
     pub outbound: Arc<MemOutbound>,
     pub submissions: MemSubmissions,
+    pub delivery_log: MemDeliveryLog,
     pub bus: MemEventBus,
     /// Корзина (`purge`); настройка `trash.purge` — из `policies`.
     pub trash: MemTrash,
@@ -240,6 +241,7 @@ impl Env {
         let authz = Arc::new(TestAuthz::default());
         let outbound = Arc::new(MemOutbound::default());
         let submissions = MemSubmissions::new();
+        let delivery_log = MemDeliveryLog::new();
         let unpacking = Unpacking {
             inner: blobs,
             index: index.clone(),
@@ -276,6 +278,7 @@ impl Env {
                 authz: authz.clone(),
                 outbound: Some(outbound.clone()),
                 submissions: Arc::new(submissions.clone()),
+                delivery_log: Arc::new(delivery_log.clone()),
                 hooks,
                 capabilities: caps,
             },
@@ -299,6 +302,7 @@ impl Env {
             authz,
             outbound,
             submissions,
+            delivery_log,
             bus,
             trash,
             policies,

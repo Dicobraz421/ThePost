@@ -37,7 +37,10 @@ use crate::core::{Jmap, Problem};
 
 /// Типы учётной записи, чьё состояние — состояние учётной записи (`Identity` и `UserSettings` ведут своё).
 #[cfg(test)]
-const ALL_TYPES: &[&str] = &["Email", "Thread", "Mailbox", "EmailSubmission"];
+const ALL_TYPES: &[&str] = &["Email", "Thread", "Mailbox"];
+
+/// Отправки (JMAP-15, JMAP-16): состояние `SubmissionStore` после сверки с журналом доставки.
+const SUBMISSION_TYPES: &[&str] = &["EmailSubmission"];
 
 /// Типы со своим состоянием (JMAP-23…29): Sieve и автоответ — состояние `SieveStore`, контакты и календари —
 /// состояния адресных книг и календарей `DavStore`. В `StateChange` попадают только при подключённом хранилище.
@@ -65,7 +68,9 @@ const EVERY_TYPE: &[&str] = &[
 /// Типы данных, которые меняет уведомление шины.
 pub(crate) fn changed_types(kind: &EventKind) -> &'static [&'static str] {
     match kind {
-        EventKind::MailboxChanged { .. } => &["Email", "Thread", "Mailbox"],
+        // Своего сигнала у отправок на шине нет: их состояние сообщается вместе с изменением папок — отправка и
+        // отмена переносят письмо, доставка меняет папки.
+        EventKind::MailboxChanged { .. } => &["Email", "Thread", "Mailbox", "EmailSubmission"],
         EventKind::MailboxListChanged => &["Mailbox"],
         EventKind::SieveChanged => SIEVE_TYPES,
         EventKind::DavChanged {
@@ -86,6 +91,7 @@ pub(crate) fn changed_types(kind: &EventKind) -> &'static [&'static str] {
 /// Состояния типов учётной записи для push.
 struct States {
     mail: String,
+    submissions: String,
     sieve: Option<String>,
     contacts: Option<String>,
     calendars: Option<String>,
@@ -95,6 +101,7 @@ struct States {
 impl States {
     async fn load(jmap: &Jmap, scope: AccountScope) -> tp_contracts::Result<Self> {
         let mail = state_string(jmap.state(scope).await?);
+        let submissions = crate::submission::synced_state(jmap, scope).await?;
         let sieve = match &jmap.sieve {
             Some(s) => Some(s.state(scope).await?.to_string()),
             None => None,
@@ -114,6 +121,7 @@ impl States {
         let notifications = crate::scheduling::notification_state(jmap, scope).await;
         Ok(Self {
             mail,
+            submissions,
             sieve,
             contacts,
             calendars,
@@ -123,7 +131,9 @@ impl States {
 
     /// Состояние типа; тип неподключённого хранилища — `None`.
     fn of(&self, ty: &str) -> Option<&str> {
-        if SIEVE_TYPES.contains(&ty) {
+        if SUBMISSION_TYPES.contains(&ty) {
+            Some(&self.submissions)
+        } else if SIEVE_TYPES.contains(&ty) {
             self.sieve.as_deref()
         } else if CONTACT_TYPES.contains(&ty) {
             self.contacts.as_deref()
@@ -138,7 +148,7 @@ impl States {
 
     /// `pushState`: состояние почты, при подключённых хранилищах — с их состояниями.
     fn push_state(&self) -> String {
-        let mut s = self.mail.clone();
+        let mut s = format!("{}-e{}", self.mail, self.submissions);
         for (tag, extra) in [
             ("s", &self.sieve),
             ("c", &self.contacts),
