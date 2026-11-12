@@ -20,4 +20,12 @@ export const covered: Record<string, string> = {
   "GET /api/v1/orgs/{org}/accounts/{account}/app-passwords": "pages/accounts.tsx",
   "POST /api/v1/orgs/{org}/accounts/{account}/app-passwords": "pages/accounts.tsx",
   "DELETE /api/v1/orgs/{org}/accounts/{account}/app-passwords/{id}": "pages/accounts.tsx",
+  "GET /api/v1/orgs/{org}/groups": "pages/groups.tsx",
+  "POST /api/v1/orgs/{org}/groups": "pages/groups.tsx",
+  "GET /api/v1/orgs/{org}/groups/{group}": "pages/groups.tsx",
+  "PATCH /api/v1/orgs/{org}/groups/{group}": "pages/groups.tsx",
+  "DELETE /api/v1/orgs/{org}/groups/{group}": "pages/groups.tsx",
+  "GET /api/v1/orgs/{org}/moderation": "components/moderation-queue.tsx",
+  "POST /api/v1/orgs/{org}/moderation/{held}/approve": "components/moderation-queue.tsx",
+  "POST /api/v1/orgs/{org}/moderation/{held}/reject": "components/moderation-queue.tsx",
 };

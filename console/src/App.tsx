@@ -13,7 +13,9 @@ import { Header } from "./components/header";
 import { i18nProvider } from "./i18n";
 import { AccountCreate, AccountList, AccountShow } from "./pages/accounts";
 import { DomainCreate, DomainList, DomainShow } from "./pages/domains";
+import { GroupCreate, GroupEdit, GroupList } from "./pages/groups";
 import { LoginPage } from "./pages/login";
+import { ModerationPage } from "./pages/moderation";
 import { OrganizationPage } from "./pages/organization";
 import { authProvider } from "./providers/auth";
 import { dataProvider } from "./providers/data";
@@ -48,6 +50,14 @@ export function App() {
               show: "/accounts/:id",
               meta: { label: "Учётные записи" },
             },
+            {
+              name: "groups",
+              list: "/groups",
+              create: "/groups/create",
+              edit: "/groups/:id",
+              meta: { label: "Группы рассылки" },
+            },
+            { name: "moderation", list: "/moderation", meta: { label: "Модерация" } },
           ]}
           // Без внешних обращений (SRS 5.2): телеметрия Refine выключена.
           options={{ disableTelemetry: true, syncWithLocation: true, warnWhenUnsavedChanges: true }}
@@ -74,6 +84,12 @@ export function App() {
                 <Route path="create" element={<AccountCreate />} />
                 <Route path=":id" element={<AccountShow />} />
               </Route>
+              <Route path="/groups">
+                <Route index element={<GroupList />} />
+                <Route path="create" element={<GroupCreate />} />
+                <Route path=":id" element={<GroupEdit />} />
+              </Route>
+              <Route path="/moderation" element={<ModerationPage />} />
               <Route path="*" element={<ErrorComponent />} />
             </Route>
             <Route

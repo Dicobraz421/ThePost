@@ -7,14 +7,6 @@ POST /api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore
 POST /api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore
 GET /api/v1/orgs/{org}/audit
 GET /api/v1/orgs/{org}/delivery
-GET /api/v1/orgs/{org}/groups
-POST /api/v1/orgs/{org}/groups
-DELETE /api/v1/orgs/{org}/groups/{group}
-GET /api/v1/orgs/{org}/groups/{group}
-PATCH /api/v1/orgs/{org}/groups/{group}
-GET /api/v1/orgs/{org}/moderation
-POST /api/v1/orgs/{org}/moderation/{held}/approve
-POST /api/v1/orgs/{org}/moderation/{held}/reject
 GET /api/v1/orgs/{org}/transport/domains
 POST /api/v1/orgs/{org}/transport/domains
 DELETE /api/v1/orgs/{org}/transport/domains/{id}
