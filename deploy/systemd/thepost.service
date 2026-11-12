@@ -12,14 +12,20 @@ Description=The Post mail server
 Documentation=https://github.com/Dicobraz421/ThePost
 Wants=network-online.target
 After=network-online.target postgresql.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
 User=thepost
 Group=thepost
 ExecStart=/usr/local/bin/thepost serve --config /etc/thepost/config.yaml
+# Перезапуск после сбоя — с растущей паузой: 10 с → 5 мин за 6 шагов (RestartSteps/RestartMaxDelaySec —
+# systemd 254+, старше — постоянные 10 с), без предела числа попыток (StartLimitIntervalSec=0 в [Unit]).
+# Медленное хранилище секретов узел пережидает сам — startup.secrets_timeout (APP-31), перезапуск для этого не нужен.
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
+RestartSteps=6
+RestartMaxDelaySec=5min
 TimeoutStopSec=60s
 LimitNOFILE=1048576
 
