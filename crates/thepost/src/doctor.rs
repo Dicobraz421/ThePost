@@ -17,11 +17,11 @@ use futures::TryStreamExt;
 use serde::Serialize;
 use tp_cluster::NodeTls;
 use tp_contracts::blob::BlobStore;
-use tp_contracts::secrets::SecretStore;
+use tp_contracts::secrets::{Secret, SecretStore};
 use tp_contracts::{Error, Result};
 use tp_meta::MetaConfig;
 use tp_meta::pool::DbPool;
-use tp_platform::{Config, TlsCerts, TlsConfig};
+use tp_platform::Config;
 
 use crate::doctor_dns::{self, Dns};
 use crate::infra;
@@ -867,19 +867,21 @@ pub async fn internal_keys(
     let db = cfg.section::<tp_meta::pool::PoolConfig>(tp_meta::pool::PoolConfig::SECTION);
     match db.as_ref().map(|db| (&db.tls, db.tls.cert_file.clone())) {
         Ok((tls, Some(cert_file))) => {
-            // Пара «сертификат и ключ» проверяется готовой загрузкой сертификатов платформы.
-            let pair = TlsConfig {
-                cert_file,
-                key_file: tls.key_file.clone().unwrap_or_default(),
-                key: tls.key.clone(),
-                ..TlsConfig::default()
-            };
+            // Пара «сертификат и ключ» — та же проверка, что у ключа слушателей (`tp_platform::tls::check_pair`).
             let load = |store: Option<Arc<dyn SecretStore>>| async move {
-                match store {
-                    Some(store) => TlsCerts::load_with_secrets(&pair, store).await,
-                    None => TlsCerts::load(&pair).await,
-                }
-                .map(drop)
+                let key = match (&tls.key, &tls.key_file, store) {
+                    (Some(secret), _, Some(store)) => store.get(secret).await?,
+                    (None, Some(file), _) => tokio::fs::read_to_string(file)
+                        .await
+                        .map(Secret::new)
+                        .map_err(|e| Error::Invalid(format!("{}: {e}", file.display())))?,
+                    _ => {
+                        return Err(Error::Invalid(
+                            "ключ клиентского сертификата не задан".into(),
+                        ));
+                    }
+                };
+                tp_platform::tls::check_pair(&cert_file, &key).await
             };
             internal_key(id, tls, store, load, report).await;
         }
@@ -1240,7 +1242,7 @@ mod tests {
             .parse(
                 &format!(
                     "domain: example.org\nprofile: dev\ndatabase:\n  url: \"postgres://thepost@db:5432/thepost?sslmode=verify-full{db_ca}\"\n\
-                     blob:\n  url: file:///tmp/b\ntls:\n  cert_file: \"{node}\"\n  key_file: \"{node}\"\n{secrets}",
+                     blob:\n  url: file:///tmp/b\ntls:\n  cert_file: \"{node}\"\n{secrets}",
                     node = slash(node),
                 ),
                 Vec::new(),

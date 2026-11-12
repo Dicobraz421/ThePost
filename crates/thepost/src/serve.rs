@@ -237,8 +237,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let acme = acme::prepare(&cfg, store.clone(), &sockets, aux.clone()).await?;
     // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
     let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
-        // Ключ по ссылке `tls.key` читается из хранилища секретов узла и перечитывается по новой версии (APP-35).
-        let certs = Arc::new(TlsCerts::load_with_secrets(&tls, store.clone()).await.map_err(|e| {
+        // Ключ — только секрет `tls.key` в хранилище секретов узла, перечитывается по новой версии (APP-35, PLT-31).
+        let certs = Arc::new(TlsCerts::load(&tls, store.clone()).await.map_err(|e| {
             infra::context(
                 "tls",
                 match e {
@@ -1113,7 +1113,7 @@ mod tests {
             .is_ok()
     }
 
-    /// APP-35: ключ TLS по ссылке `tls.key` из хранилища секретов узла (файла `key_file` нет) — слушатель с
+    /// APP-35: ключ TLS по ссылке `tls.key` из хранилища секретов узла (файла ключа нет) — слушатель с
     /// неявным TLS стартует; новая версия секрета с новой цепочкой подхватывается без перезапуска.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tls_key_from_secret_store_and_rotation() {

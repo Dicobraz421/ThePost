@@ -111,7 +111,7 @@ mod tests {
     use tp_platform::TlsConfig;
     use tp_testkit::{
         Clock, FakeAuthenticator, FakeSearch, MemAcl, MemBlobIndex, MemBlobStore, MemEventBus,
-        MemMetadata, MemPolicies, MemQuota, MemTrash, SystemClock,
+        MemMetadata, MemPolicies, MemQuota, MemSecretStore, MemTrash, SystemClock,
     };
     use x509_parser::asn1_rs::{Any, FromDer};
 
@@ -139,9 +139,10 @@ mod tests {
         0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02,
     ];
 
-    fn write_pair(cfg: &TlsConfig, (cert, key): (&str, &str)) {
+    /// Цепочка — в файл секции, ключ — новой версией секрета `tls.key` в `store`.
+    fn write_pair(cfg: &TlsConfig, store: &MemSecretStore, (cert, key): (&str, &str)) {
         std::fs::write(&cfg.cert_file, cert).expect("write cert");
-        std::fs::write(&cfg.key_file, key).expect("write key");
+        store.set(&cfg.key, key);
     }
 
     fn der(pem: &str) -> Vec<u8> {
@@ -310,11 +311,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = TlsConfig {
             cert_file: dir.path().join("cert.pem"),
-            key_file: dir.path().join("key.pem"),
             ..TlsConfig::default()
         };
-        write_pair(&cfg, P256);
-        let certs = Arc::new(TlsCerts::load(&cfg).await.expect("load"));
+        let store = Arc::new(MemSecretStore::default());
+        write_pair(&cfg, &store, P256);
+        let certs = Arc::new(TlsCerts::load(&cfg, store.clone()).await.expect("load"));
         let addr = serve(jmap(Some(certs.clone())).await).await;
 
         let pairs = [
@@ -324,7 +325,7 @@ mod tests {
         ];
         let mut previous: Option<Vec<u8>> = None;
         for (pair, scheme) in pairs {
-            write_pair(&cfg, pair);
+            write_pair(&cfg, &store, pair);
             certs.reload().await.expect("reload");
             let signed = parse_signed(&profile(addr).await);
             assert_eq!(
@@ -350,7 +351,7 @@ mod tests {
             assert!(plist.contains("<string>user@example.org</string>"));
         }
 
-        write_pair(&cfg, ED25519);
+        write_pair(&cfg, &store, ED25519);
         certs.reload().await.expect("reload ed25519");
         assert!(
             profile(addr).await.starts_with(b"<?xml"),

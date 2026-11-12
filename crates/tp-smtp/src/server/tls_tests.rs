@@ -31,10 +31,15 @@ pub(crate) fn testdata(name: &str) -> PathBuf {
 pub(crate) async fn certs() -> Arc<TlsCerts> {
     let cfg = TlsConfig {
         cert_file: testdata("cert.pem"),
-        key_file: testdata("key.pem"),
         ..TlsConfig::default()
     };
-    Arc::new(TlsCerts::load(&cfg).await.expect("certs"))
+    // Ключ — только секрет `tls.key` в хранилище секретов (PLT-31).
+    let store = Arc::new(tp_testkit::MemSecretStore::default());
+    store.set(
+        &cfg.key,
+        std::fs::read_to_string(testdata("key.pem")).expect("key"),
+    );
+    Arc::new(TlsCerts::load(&cfg, store).await.expect("certs"))
 }
 
 pub(crate) fn connector() -> TlsConnector {

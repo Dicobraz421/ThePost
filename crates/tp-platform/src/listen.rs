@@ -551,8 +551,8 @@ mod tests {
     use crate::fswatch::tests::MemFsEvents;
     use crate::tls::tests::{
         CA_CLIENT, CA_CRL, CERT_A, CERT_B, CERT_CRL_OK, CERT_CRL_REVOKED, CERT_GW, CRL_EMPTY,
-        CRL_REVOKED, CRL_REVOKED_DER, KEY_A, KEY_B, KEY_CRL_OK, KEY_CRL_REVOKED, KEY_GW, TempDir,
-        connector, der, write_pair,
+        CRL_REVOKED, CRL_REVOKED_DER, KEY_A, KEY_B, KEY_CRL_OK, KEY_CRL_REVOKED, KEY_GW, Pair,
+        TempDir, connector, der,
     };
 
     /// Самоподписанный сертификат клиента `thepost-node`: не выписан CA клиентов слушателя.
@@ -672,11 +672,8 @@ mod tests {
     #[tokio::test]
     async fn starttls_upgrade_with_self_signed_cert() {
         let dir = TempDir::new("starttls");
-        let certs = Arc::new(
-            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
-                .await
-                .expect("certs"),
-        );
+        let pair = Pair::new(&dir.0, CERT_A, KEY_A);
+        let certs = Arc::new(pair.load().await);
         let (l, at) = listener(EndpointConfig::new(addr("127.0.0.1:0")), Some(certs)).await;
         let server = tokio::spawn(async move {
             let conn = l
@@ -744,11 +741,8 @@ mod tests {
         assert!(Listener::from_tcp(tcp, &cfg, None).is_err());
 
         let dir = TempDir::new("implicit");
-        let certs = Arc::new(
-            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
-                .await
-                .expect("certs"),
-        );
+        let pair = Pair::new(&dir.0, CERT_A, KEY_A);
+        let certs = Arc::new(pair.load().await);
         let (l, at) = listener(cfg, Some(certs)).await;
         let server = tokio::spawn(serve_one(l));
         let c = TcpStream::connect(at).await.expect("connect");
@@ -838,11 +832,8 @@ mod tests {
     #[tokio::test]
     async fn optional_client_cert_is_verified_by_listener_ca() {
         let dir = TempDir::new("mtls");
-        let certs = Arc::new(
-            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
-                .await
-                .expect("certs"),
-        );
+        let pair = Pair::new(&dir.0, CERT_A, KEY_A);
+        let certs = Arc::new(pair.load().await);
         let ca = dir.0.join("client-ca.pem");
         std::fs::write(&ca, CA_CLIENT).expect("ca");
         for implicit in [true, false] {
@@ -872,7 +863,7 @@ mod tests {
         let l = Arc::new(l);
         let (chain, _) = mtls_handshake(&l, at, mtls_client(Some((CERT_GW, KEY_GW)))).await;
         assert!(chain.is_ok());
-        write_pair(&dir.0, CERT_B, KEY_B);
+        pair.write(CERT_B, KEY_B);
         certs.reload().await.expect("reload");
         let (chain, server) = mtls_handshake(&l, at, mtls_client(Some((CERT_GW, KEY_GW)))).await;
         assert_eq!(server, Some(der(CERT_B)));
@@ -899,11 +890,8 @@ mod tests {
     #[tokio::test]
     async fn revoked_client_cert_is_rejected_and_crl_is_reread_without_restart() {
         let dir = TempDir::new("crl");
-        let certs = Arc::new(
-            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
-                .await
-                .expect("certs"),
-        );
+        let pair = Pair::new(&dir.0, CERT_A, KEY_A);
+        let certs = Arc::new(pair.load().await);
         // Два CA в файле, список отзыва — только у одного.
         let ca = dir.0.join("client-ca.pem");
         std::fs::write(&ca, format!("{CA_CLIENT}{CA_CRL}")).expect("ca");
@@ -971,7 +959,7 @@ mod tests {
         let l = Arc::new(l);
         assert!(!accepted(&l, at, CERT_CRL_REVOKED, KEY_CRL_REVOKED).await);
         assert!(accepted(&l, at, CERT_CRL_OK, KEY_CRL_OK).await);
-        write_pair(&dir.0, CERT_B, KEY_B);
+        pair.write(CERT_B, KEY_B);
         certs.reload().await.expect("reload");
         assert!(!accepted(&l, at, CERT_CRL_REVOKED, KEY_CRL_REVOKED).await);
 
@@ -994,11 +982,8 @@ mod tests {
     #[tokio::test]
     async fn without_client_ca_client_cert_is_not_requested() {
         let dir = TempDir::new("no-mtls");
-        let certs = Arc::new(
-            TlsCerts::load(&write_pair(&dir.0, CERT_A, KEY_A))
-                .await
-                .expect("certs"),
-        );
+        let pair = Pair::new(&dir.0, CERT_A, KEY_A);
+        let certs = Arc::new(pair.load().await);
         let mut cfg = EndpointConfig::new(addr("127.0.0.1:0"));
         cfg.implicit_tls = true;
         let (l, at) = listener(cfg, Some(certs.clone())).await;
