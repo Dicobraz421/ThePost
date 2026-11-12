@@ -289,6 +289,13 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         services.dkim.clone(),
         aux.clone(),
     ));
+    // Лимиты частоты и доверенные подсети `ratelimit` без перезапуска (PLT-32).
+    tokio::spawn(
+        services
+            .limiter
+            .clone()
+            .follow(reloader.subscribe(), aux.clone()),
+    );
 
     // Уровень нагрузки узла по ресурсам cgroups (PLT-15): роли читают его из `RoleCtx::load`. Снимки ресурсов —
     // по триггерам PSI (секция `pressure`, PLT-17), без них — с интервалом секции `resources`.
