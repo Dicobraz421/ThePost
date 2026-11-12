@@ -311,6 +311,7 @@ pub(crate) fn emit(cx: &Cx<'_>, ms: &mut Multistatus, g: &Gal, o: &DavObject, wa
         name: &o.name,
         etag: &o.etag,
         body: want.needs_body().then_some(o.body.as_str()),
+        tag: None,
     };
     props::emit(cx, ms, &res, want);
 }

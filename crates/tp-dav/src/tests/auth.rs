@@ -137,7 +137,7 @@ async fn options_without_auth() {
     assert_eq!(r.header("dav"), Some(DAV_HEADER));
     assert_eq!(
         DAV_HEADER,
-        "1, 3, access-control, calendar-access, addressbook, extended-mkcol"
+        "1, 3, access-control, calendar-access, calendar-auto-schedule, addressbook, extended-mkcol"
     );
     assert_eq!(r.header("allow"), Some(ALLOW));
     assert!(ALLOW.contains("MKCALENDAR") && ALLOW.contains("REPORT"));
