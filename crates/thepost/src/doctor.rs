@@ -460,7 +460,7 @@ async fn database(
 }
 
 /// Справочник шардов (FIX-05): больше одного шарда — `FAIL`, пока GC BLOB не шардирован (FIX-04).
-async fn shards(pool: &PgPool, timeout: Duration, report: &mut Report) {
+async fn shards(pool: &DbPool, timeout: Duration, report: &mut Report) {
     let id = "database.shards";
     match tokio::time::timeout(timeout, crate::roles::shard_count(pool)).await {
         Ok(Ok(None)) => report.push(
