@@ -43,6 +43,7 @@ use tp_smtp::{Mode, SmtpConfig, SmtpOutService};
 use tp_sys::{NodeResources, ResourceSnapshot, ResourcesConfig};
 
 use crate::acme;
+use crate::audit_export::AuditExport;
 use crate::infra;
 use crate::log_reader::LogSignals;
 use crate::modules;
@@ -237,8 +238,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let acme = acme::prepare(&cfg, store.clone(), &sockets, aux.clone()).await?;
     // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
     let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
-        // Ключ по ссылке `tls.key` читается из хранилища секретов узла и перечитывается по новой версии (APP-35).
-        let certs = Arc::new(TlsCerts::load_with_secrets(&tls, store.clone()).await.map_err(|e| {
+        // Ключ — только секрет `tls.key` в хранилище секретов узла, перечитывается по новой версии (APP-35, PLT-31).
+        let certs = Arc::new(TlsCerts::load(&tls, store.clone()).await.map_err(|e| {
             infra::context(
                 "tls",
                 match e {
@@ -289,6 +290,13 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         services.dkim.clone(),
         aux.clone(),
     ));
+    // Лимиты частоты и доверенные подсети `ratelimit` без перезапуска (PLT-32).
+    tokio::spawn(
+        services
+            .limiter
+            .clone()
+            .follow(reloader.subscribe(), aux.clone()),
+    );
 
     // Уровень нагрузки узла по ресурсам cgroups (PLT-15): роли читают его из `RoleCtx::load`. Снимки ресурсов —
     // по триггерам PSI (секция `pressure`, PLT-17), без них — с интервалом секции `resources`.
@@ -338,6 +346,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         .page_size;
     // Показатели есть и при выключенной проверке: нулевые.
     let verify_probe = crate::metrics::register_verify(&metrics);
+    // Выгрузка журнала аудита из базы в SIEM (`admin.audit`, APP-59): роль maintenance, одна на кластер (лиза).
+    let audit_export = Arc::new(AuditExport::new(
+        Arc::new(meta.clone()),
+        leases.clone(),
+        holder.clone(),
+        store.clone(),
+        reloader.subscribe(),
+    ));
     let maintenance = Maintenance {
         index: Arc::new(meta.clone()),
         store: blob.clone(),
@@ -374,6 +390,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             probe: verify_probe,
             now: tp_blob::system_now(),
         }),
+        audit_export: Some(audit_export),
     };
     let mut setup = RoleSetup {
         cfg: &cfg,
@@ -1113,7 +1130,7 @@ mod tests {
             .is_ok()
     }
 
-    /// APP-35: ключ TLS по ссылке `tls.key` из хранилища секретов узла (файла `key_file` нет) — слушатель с
+    /// APP-35: ключ TLS по ссылке `tls.key` из хранилища секретов узла (файла ключа нет) — слушатель с
     /// неявным TLS стартует; новая версия секрета с новой цепочкой подхватывается без перезапуска.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tls_key_from_secret_store_and_rotation() {

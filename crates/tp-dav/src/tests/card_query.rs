@@ -2,8 +2,13 @@
 //! карточек: кириллица, несколько адресов и телефонов.
 
 use axum::http::StatusCode;
+use calcard::vcard::VCard;
+use tp_contracts::dav::{CollectionKind, DavStore, TimeRange};
 
 use super::{BOOKS, Env};
+use crate::DavConfig;
+use crate::card::Filter;
+use crate::xml::CARDDAV;
 
 const IVAN: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c-ivan\r\nFN:Иван Петров\r\nN:Петров;Иван;Сергеевич;;\r\n\
     EMAIL;TYPE=INTERNET,WORK:ivan.petrov@example.org\r\nEMAIL;TYPE=INTERNET,HOME:vanya@mail.example\r\n\
@@ -264,4 +269,89 @@ async fn multiget_limit() {
         .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert!(r.body.contains("number-of-matches-within-limits"));
+}
+
+/// DAV-24: `PUT` карточки заполняет поисковые строки индекса (CTR-54): полное имя, части имени, адреса e-mail.
+#[tokio::test]
+async fn put_fills_search_index() {
+    let env = env().await;
+    let book = env
+        .collection(CollectionKind::AddressBook, "contacts")
+        .await
+        .expect("книга");
+    let o = env
+        .store
+        .get_object(env.scope, book.id, "ivan.vcf")
+        .await
+        .expect("хранилище")
+        .expect("карточка");
+    let strings = &o.index.search.strings;
+    for s in [
+        "иван петров",
+        "петров",
+        "иван",
+        "сергеевич",
+        "ivan.petrov@example.org",
+        "vanya@mail.example",
+    ] {
+        assert!(strings.iter().any(|x| x == s), "{s}: {strings:?}");
+    }
+    assert!(
+        !strings
+            .iter()
+            .any(|x| x.contains("495") || x.contains("ромашка")),
+        "телефоны и организация — не в индексе: {strings:?}"
+    );
+}
+
+/// DAV-24: `addressbook-query` по части имени и по адресу — кандидаты из индекса (`find_cards`), ответ тот же, что
+/// у полного перебора карточек книги.
+#[tokio::test]
+async fn query_by_index_same_as_full_scan() {
+    let env = env().await;
+    let book = env
+        .collection(CollectionKind::AddressBook, "contacts")
+        .await
+        .expect("книга");
+    let all = env
+        .store
+        .in_range(env.scope, book.id, TimeRange::default())
+        .await
+        .expect("карточки");
+    let filters = [
+        r#"<card:filter><card:prop-filter name="FN"><card:text-match>ИВАН</card:text-match></card:prop-filter></card:filter>"#,
+        r#"<card:filter><card:prop-filter name="N"><card:text-match match-type="equals">петров</card:text-match></card:prop-filter></card:filter>"#,
+        r#"<card:filter><card:prop-filter name="fn"><card:text-match collation="i;octet" match-type="starts-with">Мар</card:text-match></card:prop-filter></card:filter>"#,
+        r#"<card:filter><card:prop-filter name="EMAIL"><card:text-match>EXAMPLE.ORG</card:text-match></card:prop-filter></card:filter>"#,
+        r#"<card:filter><card:prop-filter name="EMAIL"><card:text-match collation="i;ascii-casemap" match-type="ends-with">@PARTNER.example</card:text-match></card:prop-filter></card:filter>"#,
+        r#"<card:filter><card:prop-filter name="NICKNAME"><card:text-match>маш</card:text-match></card:prop-filter></card:filter>"#,
+        r#"<card:filter test="allof"><card:prop-filter name="TEL"/><card:prop-filter name="EMAIL"><card:text-match>example</card:text-match></card:prop-filter></card:filter>"#,
+        r#"<card:filter><card:prop-filter name="EMAIL" test="allof"><card:text-match>ivan</card:text-match><card:text-match match-type="ends-with">.org</card:text-match></card:prop-filter></card:filter>"#,
+    ];
+    for inner in filters {
+        let root = crate::xml::parse(query(inner).as_bytes(), DavConfig::default().xml_limits())
+            .expect("XML");
+        let filter = Filter::parse(root.child(CARDDAV, "filter").expect("filter")).expect("фильтр");
+        assert!(filter.needle().is_some(), "кандидаты по индексу: {inner}");
+        let mut want: Vec<String> = all
+            .iter()
+            .filter(|o| VCard::parse(&o.body).is_ok_and(|c| filter.matches(&c)))
+            .map(|o| o.name.clone())
+            .collect();
+        want.sort();
+        assert!(!want.is_empty(), "{inner}");
+        assert_eq!(found(&env, inner).await, want, "{inner}");
+    }
+    // Без условия, которое сужает выборку, — полный перебор.
+    for inner in [
+        r#"<card:filter><card:prop-filter name="FN"><card:text-match negate-condition="yes">иван</card:text-match></card:prop-filter></card:filter>"#,
+        r#"<card:filter><card:prop-filter name="TEL"><card:text-match>495</card:text-match></card:prop-filter></card:filter>"#,
+        r#"<card:filter><card:prop-filter name="FN"><card:text-match>иван</card:text-match></card:prop-filter><card:prop-filter name="TEL"/></card:filter>"#,
+        r#"<card:filter><card:prop-filter name="N"><card:text-match>Петров;Иван</card:text-match></card:prop-filter></card:filter>"#,
+    ] {
+        let root = crate::xml::parse(query(inner).as_bytes(), DavConfig::default().xml_limits())
+            .expect("XML");
+        let filter = Filter::parse(root.child(CARDDAV, "filter").expect("filter")).expect("фильтр");
+        assert_eq!(filter.needle(), None, "{inner}");
+    }
 }

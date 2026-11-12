@@ -31,6 +31,42 @@ blob:
 
 roles: [mailbox]
 
+# Календари и контакты (роль dav: /dav/, /.well-known/caldav, /.well-known/carddav) — на слушателе jmap, один порт
+# 443 с JMAP за балансировщиком; отдельный адрес — http.dav.
+#   http:
+#     dav: { listen: "0.0.0.0:9443" }
+
+# IMAP — 143 со STARTTLS и 993 с неявным TLS, ManageSieve — 4190 со STARTTLS (как в шаблоне Ansible config.yaml.j2);
+# за L4-балансировщиком — на все адреса узла. Без слушателей протокол выключен.
+imap:
+  listeners:
+    - listen: "0.0.0.0:143"
+    - listen: "0.0.0.0:993"
+      implicit_tls: true
+sieve:
+  managesieve:
+    listen:
+      - listen: "0.0.0.0:4190"
+
+# Роль maintenance (входит в пресет): раз в purge_interval — очистка по сроку надгробий DAV, журнала автоответов,
+# журнала доставки и токенов `thepost admin init`; сроки хранения — в meta. Проверка целостности BLOB — verify:
+# в кластере проход выполняет один узел — держатель лизы verify.lease_name.
+maintenance:
+  purge_interval: 1h
+  admin_token_retention: 30d
+  verify: { at: "03:00", interval: 24h }
+# Сроки очистки — секция meta (по умолчанию):
+#   meta:
+#     dav: { tombstone_ttl: 90d }        # надгробия DAV; старше — клиенту полная синхронизация
+#     sieve: { vacation_log_ttl: 90d }   # журнал автоответов
+#     delivery: { retention: 30d }       # журнал доставки
+
+# Календари и контакты (роль dav): лимиты CalDAV и CardDAV; полный перечень — thepost config schema.
+dav:
+  max_request_size: 1048576
+  max_object_size: 1048576
+  expand_horizon: 730d
+
 # Секреты — только из хранилища (OpenBao или Vault), канал — TLS; поля секции — по PLT-12.
 secrets:
   url: https://openbao.example.ru:8200

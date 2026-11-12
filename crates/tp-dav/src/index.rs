@@ -12,15 +12,17 @@
 //! `STATUS:TENTATIVE` — отдельным видом. Событие с `RRULE` или `RDATE` — [`ObjectIndex::recurring`], без индекса
 //! занятости: его повторы хранилище разворачивает при запросе (META-54, решение 59).
 
+use std::borrow::Cow;
+
 use calcard::common::timezone::Tz;
 use calcard::icalendar::dates::CalendarExpand;
 use calcard::icalendar::{
     ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarProperty, ICalendarStatus,
     ICalendarTransparency, ICalendarValue,
 };
-use calcard::vcard::VCard;
+use calcard::vcard::{VCard, VCardEntry, VCardProperty, VCardValue};
 use time::OffsetDateTime;
-use tp_contracts::dav::{CollectionKind, Component, ObjectIndex, Span};
+use tp_contracts::dav::{CardSearch, CollectionKind, Component, ObjectIndex, Span};
 use tp_contracts::schedule::{BusyKind, BusyPeriod, MAX_BUSY_PERIODS, merge_busy};
 
 /// Параметры развёртки повторов.
@@ -61,11 +63,44 @@ pub fn index(
     }
 }
 
-/// Индекс vCard: UID обязателен (RFC 6352 §5.1).
+/// Индекс vCard: UID обязателен (RFC 6352 §5.1); поисковые строки (CTR-54) — полное имя (`FN`), части имени (`N`),
+/// псевдонимы (`NICKNAME`) и адреса (`EMAIL`).
 pub fn card(body: &str) -> Result<ObjectIndex, IndexError> {
     let v = VCard::parse(body).map_err(|_| IndexError::Card)?;
     let uid = v.uid().ok_or(IndexError::Uid)?.to_owned();
-    checked(ObjectIndex::new(Component::Card, uid, None))
+    let searched = [
+        VCardProperty::Fn,
+        VCardProperty::N,
+        VCardProperty::Nickname,
+        VCardProperty::Email,
+    ];
+    let strings = v
+        .entries
+        .iter()
+        .filter(|e| searched.contains(&e.name))
+        .flat_map(entry_parts);
+    checked(ObjectIndex {
+        search: CardSearch::new(strings),
+        ..ObjectIndex::new(Component::Card, uid, None)
+    })
+}
+
+/// Значения свойства vCard как текст — каждая часть составного значения (`N`, `ADR`) отдельно. Те же значения
+/// сравнивает `text-match` отчёта `addressbook-query` (и все части через `;`), поэтому подходящая фильтру карточка
+/// всегда — кандидат поиска по индексу.
+pub(crate) fn entry_parts(e: &VCardEntry) -> Vec<Cow<'_, str>> {
+    let mut parts: Vec<Cow<'_, str>> = Vec::new();
+    for v in &e.values {
+        match v {
+            VCardValue::Component(items) => {
+                parts.extend(items.iter().map(|s| Cow::Borrowed(s.as_str())));
+            }
+            VCardValue::Integer(i) => parts.push(Cow::Owned(i.to_string())),
+            VCardValue::Float(f) => parts.push(Cow::Owned(f.to_string())),
+            other => parts.extend(other.as_text().map(Cow::Borrowed)),
+        }
+    }
+    parts
 }
 
 /// Индекс iCalendar: один вид компонента и один UID на ресурс.
@@ -315,6 +350,10 @@ mod tests {
         let vcard = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c-1\r\nFN:Иван Петров\r\nN:Петров;Иван;;;\r\nEND:VCARD\r\n";
         let idx = index(vcard, CollectionKind::AddressBook, &opts()).expect("card");
         assert_eq!((idx.component, idx.uid.as_str()), (Component::Card, "c-1"));
+        assert_eq!(idx.search.strings, ["иван петров", "петров", "иван"]);
+        let mail = vcard.replace("END:VCARD", "EMAIL;TYPE=work:Ivan@Example.com\r\nEND:VCARD");
+        let idx = card(&mail).expect("card");
+        assert!(idx.search.matches("ivan@ex") && idx.search.matches("ПЕТР"));
     }
 
     #[test]

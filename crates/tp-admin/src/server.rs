@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::rejection::RawPathParamsRejection;
-use axum::extract::{DefaultBodyLimit, MatchedPath, RawPathParams, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, RawPathParams, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -47,7 +47,7 @@ use tp_contracts::{Error, Result, TenantId};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
-use crate::audit::{AUDIT_ROUTE, AuditSink};
+use crate::audit::AUDIT_ROUTE;
 use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
@@ -176,7 +176,8 @@ pub struct AdminConfig {
     pub listen: SocketAddr,
     /// Разрешить внешний адрес слушателя (не loopback, не частный, `0.0.0.0`/`::`); по умолчанию — нет (SRS 6.8).
     pub allow_external: bool,
-    /// Экспорт журнала аудита во внешнюю SIEM (syslog, OTLP); по умолчанию выключен.
+    /// Выгрузка журнала аудита из базы во внешнюю SIEM (syslog, OTLP; выполняет роль maintenance узла); по
+    /// умолчанию выключена.
     pub audit: AuditExportConfig,
     /// Первый администратор без OIDC (`thepost admin init`, [`crate::init`]).
     pub init: InitConfig,
@@ -298,10 +299,8 @@ impl Caller {
 pub struct Deps {
     /// Проверка Bearer-токенов (OIDC).
     pub auth: Arc<dyn Authenticator>,
-    /// Журнал аудита: запись и чтение (CTR-25).
+    /// Журнал аудита: запись и чтение (CTR-25); выгрузку в SIEM из него делает [`crate::export`].
     pub audit_log: Arc<dyn AuditLog>,
-    /// Экспорт журнала аудита в SIEM ([`crate::export::Fanout`]; без экспорта — пустой).
-    pub audit: Arc<dyn AuditSink>,
     /// Журнал доставки: поиск.
     pub delivery: Arc<dyn DeliveryLog>,
     /// Группы рассылки и очередь модерации.
@@ -324,6 +323,18 @@ pub struct Deps {
     pub store: Arc<dyn MailStore>,
     /// Пароли приложений: выпуск, список, отзыв.
     pub app_passwords: tp_auth::AppPasswords,
+    /// Почтовые контакты адресной книги (CTR-35, [`crate::directory`]).
+    pub contacts: Arc<dyn ContactStore>,
+    /// Оргструктура: подразделения и оргатрибуты.
+    pub org: Arc<dyn OrgStore>,
+    /// Фильтры динамических групп.
+    pub dynamic: Arc<dyn DynamicGroupStore>,
+    /// Списки отправителей ящиков ([`crate::mailboxes`]).
+    pub senders: Arc<dyn SenderLists>,
+    /// Журнал и политика аудита ящиков.
+    pub mailbox_audit: Arc<dyn MailboxAudit>,
+    /// Остановка синхронизации каталога сверх порога удаления.
+    pub sync: Arc<dyn SyncGate>,
 }
 
 impl fmt::Debug for Deps {
@@ -334,30 +345,6 @@ impl fmt::Debug for Deps {
                 &self.modules.iter().map(|m| m.prefix()).collect::<Vec<_>>(),
             )
             .finish_non_exhaustive()
-    }
-}
-
-/// Хранилища соответствия Exchange (CTR-35): адресная книга, списки отправителей, аудит ящиков, остановка
-/// синхронизации каталога ([`crate::directory`], [`crate::mailboxes`]).
-#[derive(Clone)]
-pub struct ParityStores {
-    /// Почтовые контакты.
-    pub contacts: Arc<dyn ContactStore>,
-    /// Оргструктура: подразделения и оргатрибуты.
-    pub org: Arc<dyn OrgStore>,
-    /// Фильтры динамических групп.
-    pub dynamic: Arc<dyn DynamicGroupStore>,
-    /// Списки отправителей ящиков.
-    pub senders: Arc<dyn SenderLists>,
-    /// Журнал и политика аудита ящиков.
-    pub mailbox_audit: Arc<dyn MailboxAudit>,
-    /// Остановка синхронизации каталога сверх порога удаления.
-    pub sync: Arc<dyn SyncGate>,
-}
-
-impl fmt::Debug for ParityStores {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ParityStores").finish_non_exhaustive()
     }
 }
 
@@ -373,8 +360,6 @@ pub struct Admin {
     pub(crate) sieve: Option<crate::sieve::Sieve>,
     /// Объекты писем очереди модерации; `None` — не подключено (тема письма очереди — `null`).
     pub(crate) held_blobs: Option<Arc<dyn BlobStore>>,
-    /// Хранилища CTR-35; `None` — не подключено (маршруты адресной книги, списков, аудита ящиков — 503).
-    pub(crate) parity: Option<ParityStores>,
 }
 
 impl fmt::Debug for Admin {
@@ -386,7 +371,6 @@ impl fmt::Debug for Admin {
             .field("local", &self.local.is_some())
             .field("sieve", &self.sieve.is_some())
             .field("held_blobs", &self.held_blobs.is_some())
-            .field("parity", &self.parity.is_some())
             .finish()
     }
 }
@@ -416,7 +400,6 @@ impl Admin {
             local: None,
             sieve: None,
             held_blobs: None,
-            parity: None,
         })
     }
 
@@ -431,12 +414,6 @@ impl Admin {
     /// сжимает объекты, сюда передаётся читатель с распаковкой. Без него тема — `null`.
     pub fn with_held_blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
         self.held_blobs = Some(blobs);
-        self
-    }
-
-    /// Подключает хранилища соответствия Exchange ([`ParityStores`]).
-    pub fn with_parity(mut self, stores: ParityStores) -> Self {
-        self.parity = Some(stores);
         self
     }
 
@@ -476,17 +453,22 @@ impl Admin {
 
     /// Субъект по заголовку `Authorization: Bearer` (токен OIDC); нет заголовка, другая схема, неверный токен —
     /// `Forbidden`.
-    pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal> {
+    pub async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<IpAddr>,
+    ) -> Result<Principal> {
         let token = bearer(headers)?;
         self.d
             .auth
-            .verify(Credentials::Bearer(token.to_owned()))
+            .verify(Credentials::Bearer(token.to_owned()), peer)
             .await
     }
 
     /// Администратор запроса: сессия Admin API ([`crate::init`]) или токен OIDC с ролями по конфигурации.
     /// Локальный токен `admin init` здесь не принимается — только обмен на сессию (`POST /api/v1/session`).
-    pub async fn identify(&self, headers: &HeaderMap) -> Result<Caller> {
+    /// `peer` — адрес клиента соединения (CTR-57; `None` — запрос без соединения клиента).
+    pub async fn identify(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> Result<Caller> {
         let token = bearer(headers)?;
         if let Some(c) = self.session_caller(token, OffsetDateTime::now_utc()) {
             return c;
@@ -494,7 +476,7 @@ impl Admin {
         if tp_contracts::admin_token::is_local_admin_token(token) {
             return Err(Error::Forbidden);
         }
-        Ok(self.caller(self.authenticate(headers).await?))
+        Ok(self.caller(self.authenticate(headers, peer).await?))
     }
 
     /// Роли субъекта по назначениям конфигурации.
@@ -528,7 +510,12 @@ async fn guard(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let caller = match a.identify(req.headers()).await {
+    // Адрес клиента соединения ставит сервер HTTP (`tp_platform::service_http`); без соединения — неизвестен.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    let caller = match a.identify(req.headers(), peer).await {
         Ok(c) => c,
         Err(e) => return auth_error(&e),
     };

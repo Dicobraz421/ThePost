@@ -8,6 +8,10 @@
 //! и все части через `;` (`N`, `ADR`). Фильтр без условий и запрос без `filter` — все карточки. Неверный фильтр —
 //! 400, неизвестное сравнение — 403 `supported-collation`.
 //!
+//! Кандидаты книги пользователя — по поисковым строкам контакта (CTR-54, `DavStore::find_cards`), если фильтр
+//! требует `text-match` по `FN`, `N`, `NICKNAME` или `EMAIL` (`allof` — любой такой `prop-filter`, `anyof` —
+//! единственный); точная проверка — та же. Остальные фильтры — перебором всех карточек книги.
+//!
 //! `limit` (`nresults`, не больше `dav.max_response_items`): остаток — `507` с `number-of-matches-within-limits`
 //! для адресной книги (§8.6.2). `address-data` с `prop` — карточка только с названными свойствами (`VERSION` — всегда).
 //!
@@ -44,6 +48,9 @@ use crate::server::{Cx, multistatus, precondition, status};
 use crate::xml::{CARDDAV, DAV, Element, Multistatus};
 
 type Parsed<T> = std::result::Result<T, FilterError>;
+
+/// Свойства, значения которых — поисковые строки контакта ([`index::card`]).
+const INDEXED: [&str; 4] = ["FN", "N", "NICKNAME", "EMAIL"];
 
 /// `param-filter`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +163,22 @@ impl PropFilter {
         }
     }
 
+    /// Искомое индекса ([`TextMatch::index_needle`]) для свойства из поисковых строк контакта (`FN`, `N`,
+    /// `NICKNAME`, `EMAIL` — [`index::card`]): условие, без которого свойство фильтру не подходит.
+    fn needle(&self) -> Option<String> {
+        let indexed = INDEXED.iter().any(|n| self.name.eq_ignore_ascii_case(n));
+        if !indexed || self.not_defined {
+            return None;
+        }
+        if self.all {
+            return self.texts.iter().find_map(TextMatch::index_needle);
+        }
+        match (self.texts.as_slice(), self.params.is_empty()) {
+            ([t], true) => t.index_needle(),
+            _ => None,
+        }
+    }
+
     fn matches(&self, card: &VCard) -> bool {
         let mut entries = card
             .entries
@@ -182,6 +205,18 @@ impl Filter {
         })
     }
 
+    /// Искомое индекса для фильтра: условие `prop-filter`, без которого карточка фильтру не подходит
+    /// (`allof` — любое из них, `anyof` — единственного); `None` — кандидаты — все карточки книги.
+    pub(crate) fn needle(&self) -> Option<String> {
+        if self.all {
+            return self.props.iter().find_map(PropFilter::needle);
+        }
+        match self.props.as_slice() {
+            [p] => p.needle(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn matches(&self, card: &VCard) -> bool {
         if self.props.is_empty() {
             return true;
@@ -196,17 +231,7 @@ impl Filter {
 
 /// Значения свойства для сравнения: каждая часть и, если частей несколько, все через `;`.
 fn entry_texts(e: &VCardEntry) -> Vec<Cow<'_, str>> {
-    let mut parts: Vec<Cow<'_, str>> = Vec::new();
-    for v in &e.values {
-        match v {
-            VCardValue::Component(items) => {
-                parts.extend(items.iter().map(|s| Cow::Borrowed(s.as_str())));
-            }
-            VCardValue::Integer(i) => parts.push(Cow::Owned(i.to_string())),
-            VCardValue::Float(f) => parts.push(Cow::Owned(f.to_string())),
-            other => parts.extend(other.as_text().map(Cow::Borrowed)),
-        }
-    }
+    let mut parts = index::entry_parts(e);
     if parts.len() > 1 {
         parts.push(Cow::Owned(parts.join(";")));
     }
@@ -454,7 +479,10 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
     let kind = CollectionKind::AddressBook;
     if let Some(g) = gal::find(cx, kind, name).await? {
         return match root.name.as_str() {
-            "addressbook-query" => Ok(query(cx, &g.coll, &g.cards, root)),
+            "addressbook-query" => Ok(match filter_of(root) {
+                Ok(filter) => query(cx, &g.coll, &g.cards, &filter, root),
+                Err(e) => filter_error(e),
+            }),
             "addressbook-multiget" => multiget(cx, &g.coll, Some(&g.cards), root).await,
             _ => Ok(unsupported()),
         };
@@ -464,14 +492,46 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
     };
     match root.name.as_str() {
         "addressbook-query" => {
-            let objects = cx
-                .store()
-                .in_range(cx.scope, c.id, TimeRange::default())
-                .await?;
-            Ok(query(cx, &c, &objects, root))
+            let filter = match filter_of(root) {
+                Ok(f) => f,
+                Err(e) => return Ok(filter_error(e)),
+            };
+            let objects = match filter.needle() {
+                // Кандидаты по поисковым строкам (CTR-54); в книге не больше `max_objects` карточек.
+                Some(needle) => {
+                    let limit = cx.store().limits().max_objects;
+                    cx.store()
+                        .find_cards(cx.scope, c.id, &needle, limit)
+                        .await?
+                }
+                None => {
+                    cx.store()
+                        .in_range(cx.scope, c.id, TimeRange::default())
+                        .await?
+                }
+            };
+            Ok(query(cx, &c, &objects, &filter, root))
         }
         "addressbook-multiget" => multiget(cx, &c, None, root).await,
         _ => Ok(unsupported()),
+    }
+}
+
+/// Фильтр `addressbook-query`; нет `filter` — все карточки.
+fn filter_of(root: &Element) -> Parsed<Filter> {
+    root.child(CARDDAV, "filter")
+        .map_or_else(|| Ok(Filter::default()), Filter::parse)
+}
+
+/// Ответ на неверный фильтр: неизвестное сравнение — 403 `supported-collation`, неподдерживаемое — 403
+/// `supported-filter`, остальное — 400.
+fn filter_error(e: FilterError) -> Response {
+    match e {
+        FilterError::Collation => {
+            precondition(StatusCode::FORBIDDEN, "<card:supported-collation/>")
+        }
+        FilterError::Unsupported => precondition(StatusCode::FORBIDDEN, "<card:supported-filter/>"),
+        FilterError::Invalid => status(StatusCode::BAD_REQUEST),
     }
 }
 
@@ -493,19 +553,14 @@ fn emit(
     props::emit(cx, ms, &res, want);
 }
 
-/// `addressbook-query` по карточкам `objects` книги `c`.
-fn query(cx: &Cx<'_>, c: &Collection, objects: &[DavObject], root: &Element) -> Response {
-    let filter = match root.child(CARDDAV, "filter").map(Filter::parse) {
-        None => Filter::default(),
-        Some(Ok(f)) => f,
-        Some(Err(FilterError::Collation)) => {
-            return precondition(StatusCode::FORBIDDEN, "<card:supported-collation/>");
-        }
-        Some(Err(FilterError::Unsupported)) => {
-            return precondition(StatusCode::FORBIDDEN, "<card:supported-filter/>");
-        }
-        Some(Err(FilterError::Invalid)) => return status(StatusCode::BAD_REQUEST),
-    };
+/// `addressbook-query` с фильтром `filter` по карточкам-кандидатам `objects` книги `c`.
+fn query(
+    cx: &Cx<'_>,
+    c: &Collection,
+    objects: &[DavObject],
+    filter: &Filter,
+    root: &Element,
+) -> Response {
     let nresults = root
         .child(CARDDAV, "limit")
         .and_then(|l| l.child(CARDDAV, "nresults"))

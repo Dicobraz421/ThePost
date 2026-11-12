@@ -2,9 +2,10 @@
 //!
 //! Проверки: MX основного домена (и указывает ли он на `smtp.hostname`), SPF, DKIM по селекторам
 //! `smtp.dkim.domains`, DMARC, MTA-STS, PTR исходящих адресов (`smtp.queue.source_ip` или адреса
-//! `smtp.hostname`), срок и имена сертификата `tls`, закрытый ключ `tls` (файл `key_file` или секрет `tls.key`
+//! `smtp.hostname`), срок и имена сертификата `tls`, закрытый ключ `tls` (секрет `tls.key` в хранилище секретов
 //! подходит к цепочке), слушатели с PROXY protocol v2 за балансировщиком.
 //! Имена зон RFC 6761 (`.test`, `.example`, `.invalid`, `.localhost`) — проверки DNS пропускаются (SKIP, CMP-09).
+//! При роли dav — SRV `_caldavs._tcp` и `_carddavs._tcp` с TXT `path=` (RFC 6764) основного домена и доменов DKIM.
 //! DNS — через [`Dns`]: в работе — системный резолвер (`mail-auth`), в тестах — подстановка.
 
 use std::net::IpAddr;
@@ -19,13 +20,28 @@ use tp_platform::{AcmeConfig, Config, TlsCerts, TlsConfig};
 use tp_smtp::SmtpConfig;
 
 use crate::doctor::{Report, Status, message};
-use crate::sections::{DoctorSection, IMAP, SMTP};
+use crate::sections::{self, DoctorSection, IMAP, SMTP};
+
+/// Запись SRV (RFC 2782); узел — без точки в конце, пустой — «.» (служба недоступна).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SrvRecord {
+    /// Приоритет.
+    pub priority: u16,
+    /// Вес.
+    pub weight: u16,
+    /// Порт.
+    pub port: u16,
+    /// Узел.
+    pub target: String,
+}
 
 /// Запросы DNS проверок. Нет записей (NXDOMAIN, пустой ответ) — пустой список; сбой — `Err`.
 #[async_trait]
 pub trait Dns: Send + Sync {
     /// MX: (предпочтение, узел) в порядке предпочтения.
     async fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>, String>;
+    /// SRV имени в порядке приоритета.
+    async fn srv(&self, name: &str) -> Result<Vec<SrvRecord>, String>;
     /// Текст записей TXT имени.
     async fn txt(&self, name: &str) -> Result<Vec<String>, String>;
     /// Адреса узла (A, затем AAAA).
@@ -76,6 +92,32 @@ impl Dns for SystemDns {
             out
         });
         absent(r)
+    }
+
+    async fn srv(&self, name: &str) -> Result<Vec<SrvRecord>, String> {
+        // mail-auth SRV не оборачивает: запрос — его резолвером hickory.
+        use mail_auth::hickory_resolver::proto::rr::RData;
+        match self.0.resolver().srv_lookup(name).await {
+            Ok(lookup) => {
+                let mut out: Vec<SrvRecord> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::SRV(s) => Some(SrvRecord {
+                            priority: s.priority,
+                            weight: s.weight,
+                            port: s.port,
+                            target: s.target.to_string().trim_end_matches('.').to_owned(),
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                out.sort();
+                Ok(out)
+            }
+            Err(e) if e.is_no_records_found() => Ok(Vec::new()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     async fn txt(&self, name: &str) -> Result<Vec<String>, String> {
@@ -189,6 +231,7 @@ pub async fn check(
     dmarc(&domain, dns, t, report).await;
     mta_sts(&domain, dns, t, report).await;
     ptr(&smtp, dns, t, report).await;
+    dav_srv(cfg, &domain, &smtp, dns, t, report).await;
     certificate(cfg, &smtp, store, doctor, SystemTime::now(), report).await;
     proxy(cfg, &smtp, report);
 }
@@ -427,6 +470,135 @@ async fn ptr(smtp: &SmtpConfig, dns: &dyn Dns, t: Duration, report: &mut Report)
     }
 }
 
+/// Службы RFC 6764 §3 (только TLS): по SRV и TXT `path=` клиенты (iOS, macOS, DAVx5, Thunderbird) находят
+/// сервер календарей и контактов по адресу почты.
+const DAV_SERVICES: [(&str, &str); 2] = [("caldavs", "календарей"), ("carddavs", "контактов")];
+
+/// Домены проверок DAV: основной и домены подписи DKIM (`smtp.dkim.domains`), без повторов.
+fn dav_domains(domain: &str, smtp: &SmtpConfig) -> Vec<String> {
+    let mut out = vec![domain.to_owned()];
+    for d in smtp.dkim.domains.keys() {
+        let d = d.trim_end_matches('.').to_ascii_lowercase();
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Путь из записей TXT `path=` (RFC 6764 §4).
+fn txt_path(records: &[String]) -> Option<&str> {
+    records.iter().find_map(|r| {
+        r.split_whitespace()
+            .find_map(|t| t.strip_prefix("path="))
+            .map(|p| p.trim_matches('"'))
+    })
+}
+
+/// SRV `_caldavs._tcp` / `_carddavs._tcp` и TXT `path=` каждого домена при роли dav. Записи нет — `WARN` с готовыми
+/// строками зоны: узел — `jmap.autoconfig.host` или `smtp.hostname`, порт — слушателя DAV (`http.dav`, иначе
+/// `http.jmap`; не задан — 443), путь — `/dav/`.
+async fn dav_srv(
+    cfg: &Config,
+    domain: &str,
+    smtp: &SmtpConfig,
+    dns: &dyn Dns,
+    t: Duration,
+    report: &mut Report,
+) {
+    let roles = cfg.roles();
+    if !roles.contains(tp_contracts::role::Role::Dav) {
+        return;
+    }
+    let http = cfg
+        .section::<sections::HttpSection>(sections::HTTP)
+        .map(|h| (*h).clone())
+        .unwrap_or_default();
+    let port = http.dav_listener(roles).0.map_or(443, |l| l.listen.port());
+    let auto_host = cfg
+        .section::<tp_jmap::JmapConfig>(sections::JMAP)
+        .ok()
+        .and_then(|j| j.autoconfig.host.clone());
+    let host = auto_host
+        .unwrap_or_else(|| smtp.hostname.clone())
+        .trim_end_matches('.')
+        .to_owned();
+    let path = tp_dav::PREFIX;
+    for d in dav_domains(domain, smtp) {
+        for (service, what) in DAV_SERVICES {
+            let id = format!("dns.{service}.{d}");
+            let name = format!("_{service}._tcp.{d}");
+            if skip_reserved(&id, &name, report) {
+                continue;
+            }
+            let srv_line = format!("{name}. SRV 0 1 {port} {host}.");
+            let txt_line = format!("{name}. TXT \"path={path}\"");
+            let records = match query(t, dns.srv(&name)).await {
+                Ok(records) => records,
+                Err(e) => {
+                    report.push(&id, Status::Fail, name, format!("SRV не получены: {e}"));
+                    continue;
+                }
+            };
+            if records.is_empty() {
+                report.push(
+                    &id,
+                    Status::Warn,
+                    name,
+                    format!(
+                        "нет записи SRV: клиенты не найдут сервер {what} по адресу почты (RFC 6764); добавьте в DNS: {srv_line} и {txt_line}"
+                    ),
+                );
+                continue;
+            }
+            if records.iter().all(|r| r.target.is_empty()) {
+                report.push(
+                    &id,
+                    Status::Warn,
+                    name,
+                    format!(
+                        "SRV с узлом «.»: служба {what} объявлена недоступной (RFC 2782); замените на: {srv_line}"
+                    ),
+                );
+                continue;
+            }
+            let value = records
+                .iter()
+                .map(|r| format!("{} {} {} {}", r.priority, r.weight, r.port, r.target))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let well_known = service.trim_end_matches('s');
+            match query(t, dns.txt(&name)).await {
+                Err(e) => report.push(&id, Status::Fail, name, format!("TXT не получены: {e}")),
+                Ok(list) => match txt_path(&list) {
+                    Some(p) if p.trim_end_matches('/') == path.trim_end_matches('/') => report.push(
+                        &id,
+                        Status::Ok,
+                        value,
+                        format!("SRV и TXT path={p} опубликованы"),
+                    ),
+                    Some(p) => report.push(
+                        &id,
+                        Status::Warn,
+                        name,
+                        format!(
+                            "TXT path={p}, а служба {what} на узле — по {path}: исправьте запись на {txt_line}"
+                        ),
+                    ),
+                    None => report.push(
+                        &id,
+                        Status::Warn,
+                        name,
+                        format!(
+                            "нет TXT path=: клиенты будут искать /.well-known/{well_known} (RFC 6764 §5); добавьте в DNS: {txt_line}"
+                        ),
+                    ),
+                },
+            }
+        }
+    }
+}
+
 /// Срок и имена первого сертификата PEM-цепочки.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertInfo {
@@ -557,31 +729,22 @@ async fn certificate(
     }
 }
 
-/// Закрытый ключ секции `tls` подходит к цепочке `cert_file` — та же загрузка, что при запуске узла. При `tls.key`
-/// ключ читается из хранилища секретов, файл `key_file` не проверяется; иначе — файл `key_file`. В отчёте — путь
-/// или ссылка на секрет, значение ключа не выводится.
+/// Закрытый ключ секции `tls` (секрет `tls.key` в хранилище секретов, PLT-31) подходит к цепочке `cert_file` — та
+/// же загрузка, что при запуске узла; без хранилища проверка пропускается. В отчёте — ссылка на секрет, значение
+/// ключа не выводится.
 async fn key(tls: &TlsConfig, store: Option<&Arc<dyn SecretStore>>, report: &mut Report) {
     let id = "tls.key";
-    let (value, loaded) = match (&tls.key, store) {
-        (Some(secret), None) => {
-            report.push(
-                id,
-                Status::Skipped,
-                format!("секрет {secret}"),
-                "хранилище секретов не настроено",
-            );
-            return;
-        }
-        (Some(secret), Some(store)) => (
-            format!("секрет {secret}"),
-            TlsCerts::load_with_secrets(tls, store.clone()).await,
-        ),
-        (None, _) => (
-            tls.key_file.display().to_string(),
-            TlsCerts::load(tls).await,
-        ),
+    let value = format!("секрет {}", tls.key);
+    let Some(store) = store else {
+        report.push(
+            id,
+            Status::Skipped,
+            value,
+            "хранилище секретов не настроено",
+        );
+        return;
     };
-    match loaded {
+    match TlsCerts::load(tls, store.clone()).await {
         Ok(_) => report.push(id, Status::Ok, value, "ключ подходит к сертификату"),
         Err(e) => report.push(id, Status::Fail, value, message(&e)),
     }
@@ -664,6 +827,7 @@ pub async fn check_with(
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MockDns {
     pub mx: std::collections::HashMap<String, Vec<(u16, String)>>,
+    pub srv: std::collections::HashMap<String, Vec<SrvRecord>>,
     pub txt: std::collections::HashMap<String, Vec<String>>,
     pub ip: std::collections::HashMap<String, Vec<IpAddr>>,
     pub ptr: std::collections::HashMap<IpAddr, Vec<String>>,
@@ -676,6 +840,11 @@ impl Dns for MockDns {
     async fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>, String> {
         self.fail.clone().map_or(Ok(()), Err)?;
         Ok(self.mx.get(domain).cloned().unwrap_or_default())
+    }
+
+    async fn srv(&self, name: &str) -> Result<Vec<SrvRecord>, String> {
+        self.fail.clone().map_or(Ok(()), Err)?;
+        Ok(self.srv.get(name).cloned().unwrap_or_default())
     }
 
     async fn txt(&self, name: &str) -> Result<Vec<String>, String> {
@@ -744,7 +913,7 @@ mod tests {
         dns
     }
 
-    const SMTP: &str = "smtp:\n  hostname: mx.example.org\n  dkim:\n    domains:\n      example.org:\n        selector: s1\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n";
+    const SMTP: &str = "smtp:\n  hostname: mx.example.org\n  dkim:\n    domains:\n      example.org:\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n";
 
     async fn run(cfg: &Config, dns: &MockDns) -> Report {
         run_store(cfg, dns, None).await
@@ -786,7 +955,7 @@ mod tests {
         // Эталон `--profile smb`: домен и узел в зоне .test — проверки DNS пропущены, а не провалены.
         let cfg = config_for(
             "example.test",
-            "smtp:\n  hostname: mail.example.test\n  dkim:\n    domains:\n      example.test:\n        selector: s1\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n",
+            "smtp:\n  hostname: mail.example.test\n  dkim:\n    domains:\n      example.test:\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n",
         );
         let failing = MockDns {
             fail: Some("SERVFAIL".into()),
@@ -871,6 +1040,64 @@ mod tests {
         assert!(mx.message.contains("SERVFAIL"), "{mx:?}");
     }
 
+    /// APP-60: роль dav — SRV `_caldavs._tcp`, `_carddavs._tcp` и TXT `path=` домена; записи нет — `WARN` с готовой
+    /// строкой зоны (порт — слушателя DAV), есть — `OK`.
+    #[tokio::test]
+    async fn dav_srv_hints() {
+        let cfg = config(&format!(
+            "{SMTP}http:\n  jmap: {{ listen: 127.0.0.1:443 }}\n  dav: {{ listen: 127.0.0.1:8443 }}\n"
+        ));
+        let r = run(&cfg, &healthy()).await;
+        for service in ["caldavs", "carddavs"] {
+            let c = r.get(&format!("dns.{service}.example.org")).expect(service);
+            assert_eq!(c.status, Status::Warn, "{c:?}");
+            let name = format!("_{service}._tcp.example.org.");
+            assert!(
+                c.message
+                    .contains(&format!("{name} SRV 0 1 8443 mx.example.org.")),
+                "{c:?}"
+            );
+            assert!(
+                c.message.contains(&format!("{name} TXT \"path=/dav/\"")),
+                "{c:?}"
+            );
+        }
+
+        let mut dns = healthy();
+        for service in ["caldavs", "carddavs"] {
+            let name = format!("_{service}._tcp.example.org");
+            dns.srv.insert(
+                name.clone(),
+                vec![SrvRecord {
+                    priority: 0,
+                    weight: 1,
+                    port: 8443,
+                    target: "mx.example.org".into(),
+                }],
+            );
+            dns.txt.insert(name, vec!["path=/dav/".into()]);
+        }
+        let r = run(&cfg, &dns).await;
+        for id in ["dns.caldavs.example.org", "dns.carddavs.example.org"] {
+            assert_eq!(status(&r, id), Some(Status::Ok), "{id}: {r:?}");
+        }
+
+        // SRV есть, TXT нет — предупреждение со строкой TXT.
+        dns.txt.remove("_carddavs._tcp.example.org");
+        let r = run(&cfg, &dns).await;
+        let c = r.get("dns.carddavs.example.org").expect("carddavs");
+        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert!(
+            c.message
+                .contains("_carddavs._tcp.example.org. TXT \"path=/dav/\""),
+            "{c:?}"
+        );
+
+        // Роль dav выключена — проверок нет.
+        let r = run(&config(&format!("{SMTP}roles: [jmap]\n")), &healthy()).await;
+        assert!(r.get("dns.caldavs.example.org").is_none(), "{r:?}");
+    }
+
     #[tokio::test]
     async fn certificate_expiry_and_names() {
         let info = cert_info(CERT).expect("cert");
@@ -896,8 +1123,7 @@ mod tests {
         let path = dir.path().join("cert.pem");
         std::fs::write(&path, CERT).expect("write");
         let cfg = config(&format!(
-            "smtp:\n  hostname: mx.example.org\ntls:\n  cert_file: \"{}\"\n  key_file: \"{}\"\n",
-            path.display().to_string().replace('\\', "/"),
+            "smtp:\n  hostname: mx.example.org\ntls:\n  cert_file: \"{}\"\n",
             path.display().to_string().replace('\\', "/"),
         ));
         let r = run(&cfg, &healthy()).await;
@@ -909,37 +1135,20 @@ mod tests {
         assert_eq!(status(&r, "tls.certificate"), Some(Status::Warn));
     }
 
-    /// APP-35: ключ в файле — пара проверяется; `tls.key` — файл `key_file` не читается, секрет читается из
-    /// хранилища и сверяется с цепочкой; значение ключа в отчёт не попадает.
+    /// APP-35, PLT-31: ключ `tls.key` — только секрет: читается из хранилища и сверяется с цепочкой (ссылка по
+    /// умолчанию — `thepost/tls#key`); значение ключа в отчёт не попадает.
     #[tokio::test]
-    async fn tls_key_from_file_or_secret() {
+    async fn tls_key_from_secret() {
         const KEY: &str = include_str!("testdata/key.pem");
         const OTHER: &str = include_str!("testdata/key-rsa.pem");
         let dir = tempfile::tempdir().expect("tempdir");
         let cert = dir.path().join("cert.pem");
-        let key_file = dir.path().join("key.pem");
         std::fs::write(&cert, CERT).expect("cert");
-        std::fs::write(&key_file, KEY).expect("key");
         let path = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
         let dns = healthy();
 
-        let files = config(&format!(
-            "tls:\n  cert_file: \"{}\"\n  key_file: \"{}\"\n",
-            path(&cert),
-            path(&key_file)
-        ));
-        let r = run(&files, &dns).await;
-        assert_eq!(status(&r, "tls.key"), Some(Status::Ok), "{r:?}");
-        std::fs::write(&key_file, OTHER).expect("key");
-        let r = run(&files, &dns).await;
-        assert_eq!(status(&r, "tls.key"), Some(Status::Fail), "{r:?}");
-
-        // Файла key_file нет (значение по умолчанию): при tls.key о нём не сообщается.
         let secret: tp_contracts::secrets::SecretRef = "thepost/tls#key".parse().expect("ref");
-        let by_secret = config(&format!(
-            "tls:\n  cert_file: \"{}\"\n  key: {{ secret: \"{secret}\" }}\n",
-            path(&cert)
-        ));
+        let by_secret = config(&format!("tls:\n  cert_file: \"{}\"\n", path(&cert)));
         let mem = Arc::new(tp_testkit::MemSecretStore::default());
         let store: Arc<dyn SecretStore> = mem.clone();
         let r = run_store(&by_secret, &dns, None).await;

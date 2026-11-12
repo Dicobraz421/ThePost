@@ -1,8 +1,8 @@
 # DEP-19: эталон на Astra Linux SE 1.8 — ручная проверка
 
 Нужно: ВМ Astra Linux SE 1.8 (ядро Astra с PARSEC), управляющая машина с Ansible ≥ 2.15 и коллекциями
-`deploy/ansible/requirements.yml`, выпуск `thepost`. В инвентаре: `thepost_tls_mode: acme` или `files` (certbot в
-репозиториях Astra нет), `thepost_clamav: false` (ClamAV нет).
+`deploy/ansible/requirements.yml`, выпуск `thepost`. В инвентаре: `thepost_tls_mode: acme` или `files`,
+`thepost_clamav: false` (ClamAV нет).
 
 | # | Шаг | Ожидание |
 |---|---|---|
@@ -28,7 +28,7 @@ leakage». Плейбук целиком (службы, doctor, письмо) н
 | rspamd | `rspamd.com` `bookworm`, 4.2.3 |
 | openbao 2.7.2 (`.deb` выпуска) | ставится |
 | restic | нет — копия каталога писем на Astra по умолчанию rsync (`thepost_backup_blob_tool`) |
-| clamav-daemon, clamav-milter, certbot | нет — роль `clamav_milter` и режим `certbot` останавливаются с подсказкой |
+| clamav-daemon, clamav-milter | нет — роль `clamav_milter` останавливается с подсказкой |
 
 Ansible определяет Astra как `ansible_distribution: Astra Linux`, семейство — не Debian: роли выбирают ветку по
 `ansible_pkg_mgr` (`apt`), наборы PGDG и Rspamd — `bookworm` (кодовое имя выпуска Astra — `1.8_x86-64`).
@@ -41,4 +41,4 @@ Ansible определяет Astra как `ansible_distribution: Astra Linux`, �
   ВМ.
 - **ЗПС** (замкнутая программная среда): бинарные файлы вне репозиториев Astra (`thepost`, OpenBao, PGDG, rspamd.com)
   без подписи Astra не запустятся — эталон рассчитан на выключенную ЗПС.
-- **ClamAV и certbot** — нет в репозиториях; **restic** — нет, копия BLOB — rsync (без шифрования, зеркало).
+- **ClamAV** — нет в репозиториях; **restic** — нет, копия BLOB — rsync (без шифрования, зеркало).

@@ -108,6 +108,32 @@ fn section_from_yaml_and_checks() {
         "длительность без единицы"
     );
     assert!(serde_yaml_ng::from_str::<SecretsConfig>("auth: { ldap: {} }").is_err());
+
+    let pki: SecretsConfig = serde_yaml_ng::from_str(&format!(
+        "url: https://bao\n{token}pki:\n  pki/issue/node:\n    common_name: mx1.example.ru\n    uri_sans: [\"thepost:node:mx1\"]\n"
+    ))
+    .expect("pki");
+    assert!(pki.check(Profile::Prod).is_ok());
+    let node = &pki.pki["pki/issue/node"];
+    assert_eq!(node.ttl, Duration::from_secs(72 * 3600));
+    assert_eq!(node.uri_sans, ["thepost:node:mx1"]);
+    for bad in [
+        "pki/node: { common_name: a }",
+        "pki/issue/node/x: { common_name: a }",
+        "database/issue/node: { common_name: a }",
+        "pki/issue/..: { common_name: a }",
+        "pki/issue/node: {}",
+        "pki/issue/node: { common_name: a, ttl: 0s }",
+    ] {
+        assert!(
+            err(
+                &format!("url: https://bao\n{token}pki: {{ {bad} }}\n"),
+                Profile::Prod
+            )
+            .contains("pki."),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
@@ -165,6 +191,10 @@ struct MockState {
     logins: u32,
     renewals: u32,
     cert_logins: u32,
+    /// Очередь выпусков PKI: сертификат, ключ и срок (с) до конца.
+    pki: Vec<(&'static str, &'static str, u64)>,
+    /// Тела запросов выпуска PKI.
+    pki_requests: Vec<Value>,
 }
 
 impl MockState {
@@ -292,6 +322,29 @@ impl MockState {
                     );
                 }
                 (404, json!({ "errors": [] }))
+            }
+            ("POST", "/v1/pki/issue/node") => {
+                self.pki_requests.push(body.clone());
+                if self.pki.is_empty() {
+                    return (500, json!({ "errors": ["internal error"] }));
+                }
+                let (cert, key, ttl) = self.pki.remove(0);
+                let unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_secs();
+                (
+                    200,
+                    json!({ "data": {
+                        "certificate": cert,
+                        "private_key": key,
+                        "private_key_type": "ec",
+                        "issuing_ca": CERT_CLIENT,
+                        "ca_chain": [],
+                        "serial_number": format!("00:{:02x}", self.pki_requests.len()),
+                        "expiration": unix + ttl,
+                    } }),
+                )
             }
             ("POST", p) if p.starts_with("/v1/") && p.contains("/data/") => {
                 let rest = &p[4..];
@@ -666,6 +719,97 @@ async fn dynamic_fields_share_one_lease() {
         ..lease
     };
     assert_eq!(store.renew(&fixed).await, Err(Error::NotFound));
+}
+
+fn pki_config(mock: &Mock, dir: &TempDir) -> SecretsConfig {
+    let mut cfg = mock.config(dir, approle(dir, "secret-1"));
+    cfg.pki.insert(
+        "pki/issue/node".into(),
+        PkiIssueConfig {
+            common_name: "localhost".into(),
+            alt_names: vec!["mx1.example.ru".into()],
+            uri_sans: vec!["thepost:node:mx1".into()],
+            ttl: Duration::from_secs(6),
+            ..PkiIssueConfig::default()
+        },
+    );
+    cfg
+}
+
+/// Приёмка PLT-26: внутренний сертификат PKI продлевается до конца срока без перезапуска слушателя; отказ
+/// выпуска при действующем сертификате оставляет прежний.
+#[tokio::test]
+async fn pki_certificate_is_renewed_before_expiry_without_restart() {
+    use crate::tls::tests::{CERT_B, KEY_B, listener_cert};
+    use crate::tls::{TlsCerts, TlsConfig};
+
+    let mock = Mock::start().await;
+    mock.with(|st| st.pki.push((CERT_A, KEY_A, 6)));
+    let dir = TempDir::new("vault-pki");
+    let store: Arc<dyn SecretStore> = Arc::new(
+        VaultStore::new(&pki_config(&mock, &dir), Profile::Prod)
+            .await
+            .expect("store"),
+    );
+    let tls = TlsConfig {
+        cert_file: dir.0.join("absent-chain.pem"),
+        key: r("pki/issue/node#bundle"),
+        ..TlsConfig::default()
+    };
+    let certs = Arc::new(TlsCerts::load(&tls, store.clone()).await.expect("load"));
+    assert_eq!(listener_cert(&certs).await, der(CERT_A));
+    let request = mock.with(|st| st.pki_requests[0].clone());
+    assert_eq!(
+        request,
+        json!({
+            "common_name": "localhost",
+            "alt_names": "mx1.example.ru",
+            "ip_sans": "",
+            "uri_sans": "thepost:node:mx1",
+            "ttl": "6s",
+        })
+    );
+    // Поля — из одного выпуска; повторное чтение до двух третей срока не выпускает новый.
+    let cert = store
+        .get(&r("pki/issue/node#certificate"))
+        .await
+        .expect("cert");
+    assert_eq!(cert.expose(), CERT_A);
+    let ca = store.get(&r("pki/issue/node#ca_chain")).await.expect("ca");
+    assert_eq!(ca.expose(), CERT_CLIENT, "без ca_chain — issuing_ca");
+    assert!(!certs.reload_if_changed().await.expect("fresh"));
+    assert_eq!(mock.with(|st| st.pki_requests.len()), 1);
+    let put = store
+        .put(&r("pki/issue/node#bundle"), &Secret::new("x"))
+        .await;
+    assert!(matches!(put, Err(Error::Invalid(_))), "{put:?}");
+
+    // Две трети срока (4 с из 5–6 с) прошли: отказ выпуска — действует прежний сертификат.
+    tokio::time::sleep(Duration::from_millis(4100)).await;
+    assert!(!certs.reload_if_changed().await.expect("kept"));
+    assert_eq!(mock.with(|st| st.pki_requests.len()), 2);
+    assert_eq!(listener_cert(&certs).await, der(CERT_A));
+
+    // Выпуск удался до конца срока — новая пара у слушателя без перезапуска.
+    mock.with(|st| st.pki.push((CERT_B, KEY_B, 6)));
+    assert!(certs.reload_if_changed().await.expect("renewed"));
+    assert_eq!(listener_cert(&certs).await, der(CERT_B));
+    certs.certified_key().keys_match().expect("pair b");
+}
+
+#[tokio::test]
+async fn pki_expired_or_failed_issue_is_an_error() {
+    let mock = Mock::start().await;
+    mock.with(|st| st.pki.push((CERT_A, KEY_A, 0)));
+    let dir = TempDir::new("vault-pki-expired");
+    let store = VaultStore::new(&pki_config(&mock, &dir), Profile::Prod)
+        .await
+        .expect("store");
+    let expired = store.get(&r("pki/issue/node#bundle")).await;
+    assert!(expired.is_err(), "сертификат с истёкшим сроком");
+    let failed = store.get(&r("pki/issue/node#bundle")).await;
+    assert!(failed.is_err(), "выпуска нет и прежнего нет");
+    assert_eq!(mock.with(|st| st.pki_requests.len()), 2);
 }
 
 #[tokio::test]

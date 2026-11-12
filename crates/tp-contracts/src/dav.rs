@@ -50,6 +50,18 @@ pub const MAX_PROPERTY_LEN: usize = 255;
 /// Наибольшая длина UID объекта, байт.
 pub const MAX_UID_LEN: usize = 1024;
 
+/// Наибольшее число поисковых строк контакта ([`CardSearch`], CTR-54).
+pub const MAX_CARD_SEARCH_STRINGS: usize = 64;
+
+/// Наибольшая длина поисковой строки контакта ([`CardSearch`]), байт.
+pub const MAX_CARD_SEARCH_LEN: usize = 255;
+
+/// Наибольший размер оповещений по умолчанию одного вида ([`Collection::alerts_with_time`], CTR-56), байт.
+pub const MAX_DEFAULT_ALERTS_LEN: usize = 8192;
+
+/// Имя (сегмент URL) коллекции по умолчанию, пока она не назначена ([`default_of`]).
+pub const DEFAULT_COLLECTION_NAME: &str = "default";
+
 /// Вид коллекции.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,13 +173,39 @@ pub struct Collection {
     /// в [`crate::schedule::FreeBusy::query`]. У адресной книги не используется.
     #[serde(default)]
     pub transparent: bool,
+    /// Коллекция по умолчанию своего вида (CTR-56; JMAP `isDefault`, CalDAV `schedule-default-calendar-URL`): не больше
+    /// одной на вид у учётной записи — запись коллекции с признаком ([`DavStore::create_collection`],
+    /// [`DavStore::update_collection`]) снимает его с прежней той же операцией. Ни у одной — действует [`default_of`].
+    #[serde(default)]
+    pub is_default: bool,
+    /// Пользователь подписан на коллекцию (JMAP `isSubscribed`): клиенты показывают и синхронизируют её.
+    #[serde(default = "yes")]
+    pub subscribed: bool,
+    /// Коллекция показывается в клиенте (JMAP `isVisible`).
+    #[serde(default = "yes")]
+    pub visible: bool,
+    /// Оповещения по умолчанию для событий со временем (JMAP `defaultAlertsWithTime`; CalDAV
+    /// `default-alarm-vevent-datetime`): текст JSON-объекта `Id[Alert]` JSCalendar, не длиннее
+    /// [`MAX_DEFAULT_ALERTS_LEN`] байт; `None` — нет. Хранилище содержимое не разбирает; в `VALARM` и обратно
+    /// переводит вызывающий (`tp-dav`, calcard). Только у календаря.
+    #[serde(default)]
+    pub alerts_with_time: Option<String>,
+    /// То же для событий на весь день (JMAP `defaultAlertsWithoutTime`; CalDAV `default-alarm-vevent-date`).
+    #[serde(default)]
+    pub alerts_without_time: Option<String>,
     /// Наибольший `ModSeq` изменений коллекции: свойств и объектов (CTag). Задаёт хранилище; при записи не учитывается.
     pub state: ModSeq,
 }
 
+/// Значение по умолчанию при разборе: подписана и видима (как [`Collection::new`]).
+fn yes() -> bool {
+    true
+}
+
 impl Collection {
     /// Новая коллекция вида `kind` с именем `name`: отображаемое имя — `name`, компоненты по умолчанию —
-    /// `VEVENT`, `VTODO` (календарь) или `VCARD` (адресная книга), остальные свойства пусты.
+    /// `VEVENT`, `VTODO` (календарь) или `VCARD` (адресная книга); не по умолчанию, подписана и видима; остальные
+    /// свойства пусты.
     pub fn new(kind: CollectionKind, name: impl Into<String>) -> Self {
         let name = name.into();
         let components = match kind {
@@ -185,14 +223,20 @@ impl Collection {
             timezone: None,
             components,
             transparent: false,
+            is_default: false,
+            subscribed: true,
+            visible: true,
+            alerts_with_time: None,
+            alerts_without_time: None,
             state: ModSeq::ZERO,
         }
     }
 
     /// Проверяет поля: имя — [`valid_name`]; отображаемое имя — до [`MAX_DISPLAY_NAME_LEN`] символов, описание — до
     /// [`MAX_DESCRIPTION_LEN`] байт, цвет и часовой пояс — до [`MAX_PROPERTY_LEN`] байт, все без управляющих символов
-    /// (в описании допустимы перевод строки и табуляция); компоненты — непустые и подходят виду ([`Component::fits`]).
-    /// Иначе — `Error::Invalid`.
+    /// (в описании допустимы перевод строки и табуляция); компоненты — непустые и подходят виду ([`Component::fits`]);
+    /// оповещения по умолчанию — только у календаря, каждое — текст JSON-объекта не длиннее
+    /// [`MAX_DEFAULT_ALERTS_LEN`] байт. Иначе — `Error::Invalid`.
     pub fn validate(&self) -> Result<()> {
         if !valid_name(&self.name) {
             return Err(Error::invalid(format!(
@@ -222,7 +266,108 @@ impl Collection {
         if self.components.is_empty() || !self.components.iter().all(|c| c.fits(self.kind)) {
             return Err(Error::invalid("недопустимые компоненты коллекции"));
         }
+        for alerts in [&self.alerts_with_time, &self.alerts_without_time]
+            .into_iter()
+            .flatten()
+        {
+            if self.kind != CollectionKind::Calendar {
+                return Err(Error::invalid(
+                    "оповещения по умолчанию — только у календаря",
+                ));
+            }
+            if alerts.len() > MAX_DEFAULT_ALERTS_LEN {
+                return Err(Error::invalid(
+                    "оповещения по умолчанию больше допустимого размера",
+                ));
+            }
+            if !serde_json::from_str::<serde_json::Value>(alerts).is_ok_and(|v| v.is_object()) {
+                return Err(Error::invalid("оповещения по умолчанию — не объект JSON"));
+            }
+        }
         Ok(())
+    }
+}
+
+/// Коллекция по умолчанию среди `collections` — коллекций одного вида в любом порядке (CTR-56): назначенная
+/// ([`Collection::is_default`]); не назначена — с именем [`DEFAULT_COLLECTION_NAME`], иначе первая по порядку
+/// [`DavStore::list_collections`] (`order`, затем имя).
+pub fn default_of(collections: &[Collection]) -> Option<&Collection> {
+    collections
+        .iter()
+        .find(|c| c.is_default)
+        .or_else(|| {
+            collections
+                .iter()
+                .find(|c| c.name == DEFAULT_COLLECTION_NAME)
+        })
+        .or_else(|| {
+            collections
+                .iter()
+                .min_by(|a, b| (a.order, a.name.as_bytes()).cmp(&(b.order, b.name.as_bytes())))
+        })
+}
+
+/// Поисковые строки контакта (CTR-54): полное имя, части имени, адреса e-mail — в нижнем регистре. Вычисляет
+/// вызывающий из тела (`tp_dav::index::card`), хранилище хранит их с объектом ([`ObjectIndex::search`]) и ищет по
+/// вхождению подстроки ([`DavStore::find_cards`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CardSearch {
+    /// Строки: нижний регистр, непустые, без управляющих символов и повторов, не длиннее [`MAX_CARD_SEARCH_LEN`]
+    /// байт, не больше [`MAX_CARD_SEARCH_STRINGS`].
+    pub strings: Vec<String>,
+}
+
+impl CardSearch {
+    /// Собирает индекс из значений контакта: пробелы по краям убираются, нижний регистр, управляющие символы
+    /// заменяются пробелом, строка обрезается до [`MAX_CARD_SEARCH_LEN`] байт по границе символа; пустые и повторы
+    /// пропускаются, лишние сверх [`MAX_CARD_SEARCH_STRINGS`] отбрасываются.
+    pub fn new<S: AsRef<str>>(values: impl IntoIterator<Item = S>) -> Self {
+        let mut strings: Vec<String> = Vec::new();
+        for value in values {
+            let mut s: String = value
+                .as_ref()
+                .trim()
+                .to_lowercase()
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let mut end = s.len().min(MAX_CARD_SEARCH_LEN);
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            if !s.is_empty() && !strings.contains(&s) {
+                strings.push(s);
+            }
+            if strings.len() == MAX_CARD_SEARCH_STRINGS {
+                break;
+            }
+        }
+        Self { strings }
+    }
+
+    /// Проверяет правила поля [`CardSearch::strings`]; иначе — `Error::Invalid`.
+    pub fn validate(&self) -> Result<()> {
+        let ok = self.strings.len() <= MAX_CARD_SEARCH_STRINGS
+            && self.strings.iter().enumerate().all(|(i, s)| {
+                !s.is_empty()
+                    && plain(s, MAX_CARD_SEARCH_LEN)
+                    && *s == s.to_lowercase()
+                    && !self.strings[..i].contains(s)
+            });
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::invalid("недопустимые поисковые строки контакта"))
+        }
+    }
+
+    /// Контакт — кандидат поиска `needle`: какая-либо строка содержит `needle` в нижнем регистре; пустой `needle`
+    /// подходит любому контакту. Точную проверку фильтра (поле, слова) делает вызывающий по телу.
+    pub fn matches(&self, needle: &str) -> bool {
+        let needle = needle.trim().to_lowercase();
+        needle.is_empty() || self.strings.iter().any(|s| s.contains(&needle))
     }
 }
 
@@ -270,10 +415,14 @@ pub struct ObjectIndex {
     /// [`Precondition::IfMatch`] его ETag.
     #[serde(default)]
     pub schedule_tag: Option<String>,
+    /// Поисковые строки контакта (CTR-54) для [`DavStore::find_cards`]; у объектов календаря — пусто. Заменяются
+    /// при каждой записи объекта.
+    #[serde(default)]
+    pub search: CardSearch,
 }
 
 impl ObjectIndex {
-    /// Индекс без занятости и `Schedule-Tag`.
+    /// Индекс без занятости, `Schedule-Tag` и поисковых строк.
     pub fn new(component: Component, uid: impl Into<String>, span: Option<Span>) -> Self {
         Self {
             component,
@@ -282,11 +431,13 @@ impl ObjectIndex {
             busy: Vec::new(),
             recurring: false,
             schedule_tag: None,
+            search: CardSearch::default(),
         }
     }
 
     /// Проверяет UID, интервал (конец не раньше начала), занятость ([`validate_busy`]; у повторяющегося объекта —
-    /// пусто, повторяющийся — только событие) и `Schedule-Tag` ([`valid_etag`]); иначе — `Error::Invalid`.
+    /// пусто, повторяющийся — только событие), `Schedule-Tag` ([`valid_etag`]) и поисковые строки
+    /// ([`CardSearch::validate`]; непустые — только у [`Component::Card`]); иначе — `Error::Invalid`.
     pub fn validate(&self) -> Result<()> {
         if self.uid.is_empty() || !plain(&self.uid, MAX_UID_LEN) {
             return Err(Error::invalid("недопустимый UID объекта"));
@@ -299,6 +450,12 @@ impl ObjectIndex {
         }
         if self.schedule_tag.as_deref().is_some_and(|t| !valid_etag(t)) {
             return Err(Error::invalid("недопустимый Schedule-Tag объекта"));
+        }
+        self.search.validate()?;
+        if self.component != Component::Card && !self.search.strings.is_empty() {
+            return Err(Error::invalid(
+                "поисковые строки — только у контакта (VCARD)",
+            ));
         }
         if let Some(Span {
             start,
@@ -411,6 +568,33 @@ pub enum DeleteOutcome {
     PreconditionFailed,
 }
 
+/// Объект перенесён в другую коллекцию ([`DavStore::move_object`], CTR-54).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Moved {
+    /// Идентификатор объекта — прежний.
+    pub id: DavObjectId,
+    /// Новый ETag.
+    pub etag: String,
+    /// `ModSeq` надгробия в исходной коллекции.
+    pub removed: ModSeq,
+    /// `ModSeq` создания в целевой коллекции (больше `removed`).
+    pub modseq: ModSeq,
+}
+
+/// Результат [`DavStore::move_object`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MoveOutcome {
+    /// Перенесён.
+    Moved(Moved),
+    /// Не выполнено условие для исходного ресурса или имя занято в целевой коллекции (HTTP 412); ничего не изменено.
+    PreconditionFailed,
+    /// В целевой коллекции уже есть объект с этим UID под именем `name`; ничего не изменено.
+    UidConflict {
+        /// Имя ресурса целевой коллекции с этим UID.
+        name: String,
+    },
+}
+
 /// Лимиты хранилища — из конфигурации реализации (`meta`); `tp-dav` публикует их (`max-resource-size`), JMAP —
 /// в capabilities. Превышение — `Error::QuotaExceeded`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,7 +675,8 @@ pub trait DavStore: Send + Sync + 'static {
     ) -> Result<Option<Collection>>;
 
     /// Создаёт коллекцию; недопустимые поля ([`Collection::validate`]) — `Invalid`, занятый `id` или имя вида —
-    /// `Conflict`, коллекций уже [`DavLimits::max_collections`] — `QuotaExceeded`. Возвращает `ModSeq` изменения.
+    /// `Conflict`, коллекций уже [`DavLimits::max_collections`] — `QuotaExceeded`. [`Collection::is_default`] — как у
+    /// [`DavStore::update_collection`]. Возвращает `ModSeq` изменения.
     async fn create_collection(
         &self,
         scope: AccountScope,
@@ -499,8 +684,13 @@ pub trait DavStore: Send + Sync + 'static {
     ) -> Result<ModSeq>;
 
     /// Заменяет свойства коллекции `collection.id` (отображаемое имя, описание, цвет, порядок, часовой пояс,
-    /// компоненты); нет — `NotFound`, другие `kind` или `name` — `Invalid`. Объекты не проверяются заново.
-    /// Возвращает `ModSeq` изменения.
+    /// компоненты, признак по умолчанию, подписка, видимость, оповещения по умолчанию); нет — `NotFound`, другие
+    /// `kind` или `name`, недопустимые поля ([`Collection::validate`]) — `Invalid`. Объекты не проверяются заново.
+    /// [`Collection::is_default`]` = true` снимает признак с прежней коллекции по умолчанию того же вида в той же
+    /// транзакции (признак — не больше чем у одной): у прежней — своё изменение свойств (новый `ModSeq`,
+    /// [`Collection::state`], [`DavStore::collection_changes`], сигнал [`dav_changed`]) раньше изменения
+    /// `collection.id`; `false` у текущей — коллекция по умолчанию не назначена (действует [`default_of`]), как и после
+    /// удаления назначенной. Возвращает `ModSeq` изменения `collection.id`.
     async fn update_collection(
         &self,
         scope: AccountScope,
@@ -584,6 +774,39 @@ pub trait DavStore: Send + Sync + 'static {
         name: &str,
         pre: Precondition,
     ) -> Result<DeleteOutcome>;
+
+    /// Переносит ресурс `name` коллекции `from` в коллекцию `to` той же учётной записи одной транзакцией (CTR-54,
+    /// решение 80; JMAP `ContactCard/set` и `CalendarEvent/set` со сменой коллекции, WebDAV `MOVE`). Имя ресурса,
+    /// [`DavObject::id`], тело и индекс (с поисковыми строками) сохраняются; ETag и `ModSeq` — новые: в `from`
+    /// остаётся надгробие ([`Moved::removed`], видно в [`DavStore::changes`]), в `to` — создание ([`Moved::modseq`]);
+    /// в [`DavStore::account_changes`] объект — в `updated` (идентификатор не менялся). Сигнал [`dav_changed`] — по
+    /// обеим коллекциям. Проверки по порядку: нет любой из коллекций или ресурса при [`Precondition::Any`] —
+    /// `NotFound`; `from == to`, коллекции разного вида или компонент объекта не из [`Collection::components`]
+    /// целевой — `Invalid`; условие `pre` к исходному ресурсу ([`Precondition::IfMatch`] с другим ETag или без
+    /// ресурса; [`Precondition::IfNoneMatch`] — как `Any`) и свободное имя `name` в `to` — иначе
+    /// [`MoveOutcome::PreconditionFailed`]; UID у ресурса `to` — [`MoveOutcome::UidConflict`]; в `to` уже
+    /// [`DavLimits::max_objects`] — `QuotaExceeded`.
+    async fn move_object(
+        &self,
+        scope: AccountScope,
+        from: CollectionId,
+        name: &str,
+        to: CollectionId,
+        pre: Precondition,
+    ) -> Result<MoveOutcome>;
+
+    /// Кандидаты поиска контактов (CTR-54; `addressbook-query` с `text-match`, JMAP `ContactCard/query`): объекты
+    /// коллекции, у которых какая-либо поисковая строка ([`ObjectIndex::search`]) содержит `needle`
+    /// ([`CardSearch::matches`]; пустой `needle` — все), по имени, не более `limit`; ровно `limit` в ответе — выборка
+    /// могла быть обрезана. Точную проверку фильтра делает вызывающий по телу (как после [`DavStore::in_range`]).
+    /// Нет коллекции — `NotFound`.
+    async fn find_cards(
+        &self,
+        scope: AccountScope,
+        collection: CollectionId,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<DavObject>>;
 
     // ---------- Изменения ----------
 
@@ -683,6 +906,112 @@ mod tests {
         for bad in ["", "a\"b", "a b", "a\\b", &"e".repeat(65)] {
             assert!(!valid_etag(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn card_search() {
+        let search = CardSearch::new([
+            " Анна Петрова ",
+            "Петрова",
+            "Ann.Petrova@Example.COM",
+            "петрова",
+            "",
+            "a\tb",
+        ]);
+        assert_eq!(
+            search.strings,
+            ["анна петрова", "петрова", "ann.petrova@example.com", "a b"]
+        );
+        assert_eq!(search.validate(), Ok(()));
+        // По части имени и по адресу, без учёта регистра; пустой запрос — любой контакт.
+        assert!(search.matches("ПЕТР"));
+        assert!(search.matches("petrova@ex"));
+        assert!(search.matches(" "));
+        assert!(!search.matches("иван"));
+        assert!(CardSearch::default().matches(""));
+        assert!(!CardSearch::default().matches("a"));
+
+        // Пределы числа и длины; обрезка — по границе символа.
+        let many = CardSearch::new((0..200).map(|i| format!("s{i}")));
+        assert_eq!(many.strings.len(), MAX_CARD_SEARCH_STRINGS);
+        let long = CardSearch::new(["я".repeat(MAX_CARD_SEARCH_LEN)]);
+        assert_eq!(long.strings[0].len(), MAX_CARD_SEARCH_LEN - 1);
+        assert_eq!(long.validate(), Ok(()));
+
+        for bad in [
+            vec!["Верхний".to_owned()],
+            vec![String::new()],
+            vec!["a".to_owned(), "a".to_owned()],
+            vec!["x".repeat(MAX_CARD_SEARCH_LEN + 1)],
+            vec!["a\nb".to_owned()],
+            (0..=MAX_CARD_SEARCH_STRINGS)
+                .map(|i| i.to_string())
+                .collect(),
+        ] {
+            let search = CardSearch { strings: bad };
+            assert!(search.validate().is_err(), "{search:?}");
+        }
+        assert_eq!(
+            serde_json::to_value(CardSearch::new(["a", "b"])).ok(),
+            Some(serde_json::json!(["a", "b"]))
+        );
+    }
+
+    #[test]
+    fn collection_prefs() {
+        // Новая коллекция: не по умолчанию, подписана и видима, без оповещений.
+        let book = Collection::new(CollectionKind::AddressBook, "book");
+        assert!(book.subscribed && book.visible && !book.is_default);
+        assert_eq!(book.validate(), Ok(()));
+
+        let alerts = Collection {
+            alerts_with_time: Some(
+                r#"{"a1":{"@type":"Alert","trigger":{"@type":"OffsetTrigger","offset":"-PT15M"}}}"#
+                    .into(),
+            ),
+            alerts_without_time: Some("{}".into()),
+            ..Collection::new(CollectionKind::Calendar, "work")
+        };
+        assert_eq!(alerts.validate(), Ok(()));
+        let text = serde_json::to_string(&alerts).unwrap_or_default();
+        assert_eq!(
+            serde_json::from_str::<Collection>(&text).ok(),
+            Some(alerts.clone())
+        );
+        // Оповещения — только у календаря, объект JSON в пределах размера.
+        let in_book = Collection {
+            alerts_with_time: alerts.alerts_with_time.clone(),
+            ..book
+        };
+        assert!(in_book.validate().is_err());
+        for bad in [
+            "[]",
+            "не json",
+            &format!("{{\"a\":\"{}\"}}", "x".repeat(MAX_DEFAULT_ALERTS_LEN)),
+        ] {
+            let c = Collection {
+                alerts_without_time: Some(bad.to_owned()),
+                ..alerts.clone()
+            };
+            assert!(c.validate().is_err(), "{bad:.20}");
+        }
+    }
+
+    #[test]
+    fn default_rule() {
+        let named = |name: &str, order| Collection {
+            order,
+            ..Collection::new(CollectionKind::Calendar, name)
+        };
+        assert_eq!(default_of(&[]), None);
+        // Без сегмента `default` — первая по порядку, затем по имени.
+        let list = [named("work", 2), named("b", 1), named("a", 1)];
+        assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("a"));
+        let mut list = [named("a", 0), named(DEFAULT_COLLECTION_NAME, 9)];
+        assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("default"));
+        // Назначенная — раньше прежнего правила.
+        list[0].is_default = true;
+        assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("a"));
     }
 
     #[test]

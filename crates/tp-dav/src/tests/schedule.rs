@@ -12,7 +12,7 @@ use mail_parser::MimeHeaders;
 use time::OffsetDateTime;
 use tp_contracts::auth::Principal;
 use tp_contracts::dav::{CollectionKind, DavObject, DavStore};
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::queue::Outbound;
 use tp_contracts::schedule::{
     ItipDelivery, ItipMessage, ItipMethod, ItipOutcome, ItipOutgoing, ItipSender, ItipSource,
@@ -36,6 +36,8 @@ struct Sched {
     inbox: ItipInbox,
     tenant: TenantId,
     accounts: Vec<(String, AccountScope)>,
+    /// Учётные записи (псевдонимы — DAV-23).
+    meta: MemMetadata,
 }
 
 impl Sched {
@@ -58,6 +60,8 @@ impl Sched {
                         display_name: login.to_owned(),
                         external_id: None,
                         enabled: true,
+                        aliases: Vec::new(),
+                        kind: AccountKind::User,
                     },
                 )
                 .await
@@ -88,7 +92,7 @@ impl Sched {
             },
             None,
             Some(ScheduleDeps {
-                accounts: Arc::new(meta),
+                accounts: Arc::new(meta.clone()),
                 delivery: Arc::new(inbox.clone()),
                 sender: Some(Arc::new(sender.clone())),
                 freebusy: Arc::new(store.clone()),
@@ -102,6 +106,7 @@ impl Sched {
             inbox,
             tenant,
             accounts,
+            meta,
         }
     }
 
@@ -1007,4 +1012,164 @@ async fn freebusy_two_users() {
     }
     let inbox = format!("{}inbox/", home(IVAN));
     assert_eq!(env.send(IVAN, "POST", &inbox, &[], "x").await.status, 405);
+}
+
+// ---------- DAV-23: адреса учётной записи ----------
+
+/// Псевдоним вошедшего — второй `mailto:` в `calendar-user-address-set` (основной первым, затем ссылка на
+/// принципала) и свой адрес организатора при разборе участников.
+#[tokio::test]
+async fn principal_addresses_with_alias() {
+    let env = Sched::new().await;
+    let alias = "i.ivanov@example.org";
+    env.meta
+        .upsert(
+            env.tenant,
+            AccountUpsert {
+                domain: DomainId::new(),
+                login: IVAN.to_owned(),
+                display_name: IVAN.to_owned(),
+                external_id: None,
+                enabled: true,
+                aliases: vec!["I.Ivanov@Example.org".to_owned()],
+                kind: AccountKind::User,
+            },
+        )
+        .await
+        .expect("псевдоним");
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><c:calendar-user-address-set/></d:prop>
+</d:propfind>"#;
+    let r = env
+        .send(
+            IVAN,
+            "PROPFIND",
+            &format!("/dav/principals/{IVAN}/"),
+            &[("depth", "0")],
+            body,
+        )
+        .await;
+    insta::assert_snapshot!(r.show(), @r#"
+    207 Multi-Status
+    <?xml version="1.0" encoding="utf-8"?>
+    <d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+    <d:response>
+    <d:href>/dav/principals/ivan@example.org/</d:href>
+    <d:propstat>
+    <d:prop>
+    <c:calendar-user-address-set>
+    <d:href>mailto:ivan@example.org</d:href>
+    <d:href>mailto:i.ivanov@example.org</d:href>
+    <d:href>/dav/principals/ivan@example.org/</d:href>
+    </c:calendar-user-address-set>
+    </d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+    </d:response>
+    </d:multistatus>
+    "#);
+    // Учётная запись без псевдонимов — только адрес входа.
+    let r = env
+        .send(
+            PETR,
+            "PROPFIND",
+            &format!("/dav/principals/{PETR}/"),
+            &[("depth", "0")],
+            body,
+        )
+        .await;
+    assert!(
+        r.body.contains(&format!(
+            "<c:calendar-user-address-set><d:href>mailto:{PETR}</d:href><d:href>/dav/principals/{PETR}/</d:href></c:calendar-user-address-set>"
+        )),
+        "{}",
+        r.body
+    );
+
+    // Запрос занятости от псевдонима — организатор свой.
+    let outbox = format!("{}outbox/", home(IVAN));
+    let request = freebusy_request(&[PETR]).replace(
+        &format!("ORGANIZER:mailto:{IVAN}"),
+        &format!("ORGANIZER:mailto:{alias}"),
+    );
+    let r = env.send(IVAN, "POST", &outbox, &[], &request).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+// ---------- DAV-25: календарь по умолчанию ----------
+
+/// Календарь и книга, созданные при первом обращении, — по умолчанию (`is_default`); `schedule-default-calendar-URL`
+/// — по признаку коллекции, назначенному и не через CalDAV (JMAP).
+#[tokio::test]
+async fn default_calendar_by_flag() {
+    let env = Sched::new().await;
+    let scope = env.scope(IVAN);
+    env.send(IVAN, "PROPFIND", &home(IVAN), &[("depth", "0")], "")
+        .await;
+    env.send(
+        IVAN,
+        "PROPFIND",
+        &format!("/dav/addressbooks/{IVAN}/"),
+        &[("depth", "0")],
+        "",
+    )
+    .await;
+    let get = |kind: CollectionKind, name: &'static str| {
+        let store = env.store.clone();
+        async move {
+            store
+                .collection_by_name(scope, kind, name)
+                .await
+                .expect("хранилище")
+                .expect("коллекция")
+        }
+    };
+    assert!(get(CollectionKind::Calendar, "calendar").await.is_default);
+    assert!(!get(CollectionKind::Calendar, "tasks").await.is_default);
+    assert!(
+        get(CollectionKind::AddressBook, "contacts")
+            .await
+            .is_default
+    );
+
+    let inbox = format!("{}inbox/", home(IVAN));
+    let body = r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+        <d:prop><c:schedule-default-calendar-URL/></d:prop></d:propfind>"#;
+    let default_url = |r: &Resp| {
+        r.body
+            .split("<c:schedule-default-calendar-URL><d:href>")
+            .nth(1)
+            .and_then(|s| s.split("</d:href>").next())
+            .map(str::to_owned)
+    };
+    let r = env
+        .send(IVAN, "PROPFIND", &inbox, &[("depth", "0")], body)
+        .await;
+    assert_eq!(
+        default_url(&r).as_deref(),
+        Some("/dav/calendars/ivan@example.org/calendar/"),
+        "{}",
+        r.body
+    );
+    // Другой календарь назначен по умолчанию (как JMAP `isDefault`): признак у прежнего снимает хранилище.
+    let work = tp_contracts::dav::Collection {
+        is_default: true,
+        components: BTreeSet::from([tp_contracts::dav::Component::Event]),
+        ..tp_contracts::dav::Collection::new(CollectionKind::Calendar, "work")
+    };
+    env.store
+        .create_collection(scope, work)
+        .await
+        .expect("назначен");
+    assert!(!get(CollectionKind::Calendar, "calendar").await.is_default);
+    let r = env
+        .send(IVAN, "PROPFIND", &inbox, &[("depth", "0")], body)
+        .await;
+    assert_eq!(
+        default_url(&r).as_deref(),
+        Some("/dav/calendars/ivan@example.org/work/"),
+        "{}",
+        r.body
+    );
 }

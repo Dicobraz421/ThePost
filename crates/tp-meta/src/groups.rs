@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use sqlx::{FromRow, PgConnection};
 use time::OffsetDateTime;
 use tp_contracts::groups::{
-    DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
+    DistributionGroup, GroupMember, GroupStore, HeldCursor, HeldMessage, SenderRestriction,
 };
 use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, GroupId, HeldId, Result, TenantId};
 use uuid::Uuid;
@@ -499,6 +499,7 @@ impl GroupStore for PgMeta {
         &self,
         tenant: TenantId,
         group: Option<GroupId>,
+        after: Option<HeldCursor>,
         limit: usize,
     ) -> Result<Vec<HeldMessage>> {
         self.idempotent(|| async move {
@@ -508,11 +509,14 @@ impl GroupStore for PgMeta {
                     sqlx::query_as(sqlx::AssertSqlSafe(format!(
                         "SELECT {HELD_COLUMNS} FROM group_held
                      WHERE tenant_id = $1 AND ($2::uuid IS NULL OR group_id = $2)
+                       AND ($4::timestamptz IS NULL OR (held_at, held_id) > ($4, $5::uuid))
                      ORDER BY held_at, held_id LIMIT $3"
                     )))
                     .bind(tenant.as_uuid())
                     .bind(group.map(|g| *g.as_uuid()))
                     .bind(limit)
+                    .bind(after.map(|c| c.held_at))
+                    .bind(after.map(|c| *c.id.as_uuid()))
                     .fetch_all(&mut *tx)
                     .await
                     .map_err(db_err)

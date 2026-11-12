@@ -25,7 +25,7 @@ use calcard::icalendar::{
 use time::OffsetDateTime;
 use tp_contracts::dav::{
     Collection, CollectionKind, Component, DavObject, DavStore, ObjectIndex, Precondition,
-    PutOutcome, valid_name,
+    PutOutcome, default_of, valid_name,
 };
 use tp_contracts::meta::AccountScope;
 use tp_contracts::schedule::{InboxMessage, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome};
@@ -34,7 +34,7 @@ use tp_contracts::{Error, Result};
 use crate::config::DavConfig;
 use crate::index::{self, IndexError};
 use crate::itip::{self, Itip};
-use crate::{path, props};
+use crate::props;
 
 /// Приём iTIP в календари учётных записей.
 #[derive(Clone)]
@@ -67,8 +67,9 @@ pub(crate) fn object_index(
     Ok(idx)
 }
 
-/// Календарь по умолчанию для приглашений (`schedule-default-calendar-URL`): `calendar`, иначе первый календарь с
-/// VEVENT; у учётной записи без календарей создаются календари по умолчанию.
+/// Календарь по умолчанию для приглашений (`schedule-default-calendar-URL`) — правило контракта
+/// [`tp_contracts::dav::default_of`] среди календарей с VEVENT (назначенный `Collection::is_default`, CTR-56); у
+/// учётной записи без календарей создаются календари по умолчанию.
 pub(crate) async fn default_calendar(
     store: &dyn DavStore,
     scope: AccountScope,
@@ -78,13 +79,11 @@ pub(crate) async fn default_calendar(
     let list = store
         .list_collections(scope, CollectionKind::Calendar)
         .await?;
-    let events = |c: &&Collection| c.components.contains(&Component::Event);
-    Ok(list
-        .iter()
-        .filter(events)
-        .find(|c| c.name == path::DEFAULT_CALENDAR)
-        .or_else(|| list.iter().find(events))
-        .cloned())
+    let events: Vec<Collection> = list
+        .into_iter()
+        .filter(|c| c.components.contains(&Component::Event))
+        .collect();
+    Ok(default_of(&events).cloned())
 }
 
 /// Объект с UID `uid` в календарях учётной записи.

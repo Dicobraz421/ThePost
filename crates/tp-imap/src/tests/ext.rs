@@ -7,8 +7,9 @@ use std::sync::Arc;
 use tp_contracts::acl::AclStore;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountStore, AccountUpsert, Flag, Flags, MailboxStore, MessageQuery,
-    MessageStore, NewMailbox, QuotaUsage, SpecialUse,
+    Account, AccountKind, AccountScope, AccountStore, AccountUpsert, DisabledAccount,
+    ExistingContent, Flag, Flags, MailboxStore, MessageQuery, MessageStore, NewMailbox, QuotaUsage,
+    SpecialUse,
 };
 use tp_contracts::{AccountId, DomainId, MailboxId, Result, TenantId};
 use tp_testkit::{MemAcl, MemMetadata};
@@ -123,6 +124,43 @@ impl AccountStore for Limited {
             Ok(q)
         })
     }
+
+    fn restore_account<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        id: AccountId,
+    ) -> Fut<'async_trait, ()>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.restore_account(tenant, id)
+    }
+
+    fn disabled_accounts<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+    ) -> Fut<'async_trait, Vec<DisabledAccount>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.disabled_accounts(tenant)
+    }
+
+    fn attach_account<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        disabled: AccountId,
+        to: AccountId,
+        existing: Option<ExistingContent>,
+    ) -> Fut<'async_trait, Account>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.attach_account(tenant, disabled, to, existing)
+    }
 }
 
 struct Ext {
@@ -171,6 +209,8 @@ impl Ext {
                     display_name: "Bob".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await
@@ -586,7 +626,7 @@ async fn shared_access_audited() {
         assert_eq!(entry.actor_account, Some(bob.account));
         assert_eq!(entry.actor_kind, AuditActorKind::Delegate);
         assert_eq!(entry.object.mailbox, Some(projects));
-        assert_eq!(entry.client.as_deref(), Some("imap 192.0.2.1"));
+        assert_eq!(entry.client.as_deref(), Some("imap 192.0.2.7"));
     }
     assert!(e[1].object.message.is_some());
     assert_eq!(e[1].object.message, e[2].object.message);

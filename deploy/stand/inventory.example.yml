@@ -6,6 +6,14 @@
 # Узел внешних интеграций (Rspamd + clamav-milter, FreeIPA) — в профиле SMB Rspamd и clamav-milter на узле SMB
 # (эталон); учётные записи — stand_provision (по умолчанию admin: thepost admin на узле SMB, пароль приложения
 # у каждой свой; roles/stand_generator/defaults/main.yml).
+# Календари, контакты и правила (DEP-21): CalDAV и CardDAV — на порту 443 с JMAP (/dav/, /.well-known/caldav и
+# carddav), ManageSieve — 4190 (STARTTLS). Генератор обращается по имени узла (/etc/hosts); клиентам (Thunderbird, iOS,
+# DAVx5, sieve-connect) — записи DNS зоны стенда (RFC 6764, RFC 5804):
+#   _caldavs._tcp.stand.test.   SRV 0 1 443  mail.stand.test.
+#   _caldavs._tcp.stand.test.   TXT "path=/dav/"
+#   _carddavs._tcp.stand.test.  SRV 0 1 443  mail.stand.test.
+#   _carddavs._tcp.stand.test.  TXT "path=/dav/"
+#   _sieve._tcp.stand.test.     SRV 0 1 4190 mail.stand.test.
 ---
 all:
   children:

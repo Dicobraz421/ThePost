@@ -37,7 +37,7 @@ use tp_contracts::admin_token::{
 };
 use tp_contracts::auth::Principal;
 use tp_contracts::config::duration;
-use tp_contracts::meta::{Account, AccountScope, AccountUpsert};
+use tp_contracts::meta::{Account, AccountKind, AccountScope, AccountUpsert};
 use tp_contracts::transport::{AcceptedDomain, DomainKind};
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
@@ -323,6 +323,8 @@ impl Admin {
                         display_name,
                         external_id: None,
                         enabled: true,
+                        aliases: Vec::new(),
+                        kind: AccountKind::User,
                     },
                 )
                 .await?
@@ -465,6 +467,8 @@ fn enabled(a: Account) -> AccountUpsert {
         display_name: a.display_name,
         external_id: a.external_id,
         enabled: true,
+        aliases: a.aliases,
+        kind: a.kind,
     }
 }
 
@@ -836,6 +840,7 @@ mod tests {
                 login: "boss@example.test".into(),
                 secret: again.password.clone(),
             },
+            None,
         )
         .await
         .expect("login");

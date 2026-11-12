@@ -1473,6 +1473,7 @@ mod tests {
         MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemModeration,
         MemPolicies, MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
     };
+    use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
     use super::*;
 
@@ -1804,7 +1805,6 @@ mod tests {
         let deps = Deps {
             auth: Arc::new(auth),
             audit_log: Arc::new(MemAuditLog::new()),
-            audit: Arc::new(tp_admin::Fanout::default()),
             delivery: Arc::new(MemDeliveryLog::new()),
             groups: Arc::new(MemGroups::new()),
             moderation: Arc::new(MemModeration::default()),
@@ -1816,6 +1816,12 @@ mod tests {
             trash: Arc::new(trash),
             store: Arc::new(store),
             app_passwords,
+            contacts: Arc::new(MemAddressBook::new()),
+            org: Arc::new(MemAddressBook::new()),
+            dynamic: Arc::new(MemAddressBook::new()),
+            senders: Arc::new(MemSenderLists::new()),
+            mailbox_audit: Arc::new(MemMailboxAudit::new()),
+            sync: Arc::new(MemSyncGate::new()),
         };
         let cfg = AdminConfig {
             roles: vec![RoleBinding {

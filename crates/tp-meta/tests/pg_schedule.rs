@@ -13,7 +13,7 @@ use time::{Duration, OffsetDateTime};
 use tp_contracts::dav::{
     Collection, CollectionKind, Component, DavStore, ObjectIndex, Precondition, PutOutcome, Span,
 };
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::schedule::{BusyKind, BusyPeriod, FreeBusy, InboxMessage, ItipMethod, Period};
 use tp_contracts::{AccountId, DomainId, Error, ModSeq, TenantId};
 use tp_meta::dav::DavConfig;
@@ -40,6 +40,8 @@ async fn account_in(meta: &PgMeta, tenant: TenantId, domain: (DomainId, &str)) -
                 display_name: "User".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await

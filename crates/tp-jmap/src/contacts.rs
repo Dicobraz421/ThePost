@@ -11,7 +11,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tp_contracts::Error;
-use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore};
+use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore, default_of};
 use tp_contracts::meta::AccountScope;
 
 use crate::core::Ctx;
@@ -24,20 +24,16 @@ use crate::core::request::{
 pub(crate) const KIND: CollectionKind = CollectionKind::AddressBook;
 
 /// Сегмент URL книги по умолчанию.
-const DEFAULT_NAME: &str = "default";
+const DEFAULT_NAME: &str = tp_contracts::dav::DEFAULT_COLLECTION_NAME;
 
 /// Значение capability учётной записи: карточка — в одной книге (объект CardDAV).
 pub(crate) fn account_capability() -> Value {
     json!({ "maxAddressBooksPerCard": 1, "mayCreateAddressBook": true })
 }
 
-/// Книга по умолчанию среди `books` (в порядке хранилища).
+/// Книга по умолчанию среди `books` — правило контракта [`default_of`]: назначенная, иначе прежнее правило.
 pub(crate) fn default_book(books: &[Collection]) -> Option<CollectionId> {
-    books
-        .iter()
-        .find(|b| b.name == DEFAULT_NAME)
-        .or(books.first())
-        .map(|b| b.id)
+    default_of(books).map(|b| b.id)
 }
 
 /// Текущее состояние контактов.
@@ -56,7 +52,7 @@ fn book_object(b: &Collection, default: Option<CollectionId>) -> Map<String, Val
         "description": b.description,
         "sortOrder": b.order,
         "isDefault": default == Some(b.id),
-        "isSubscribed": true,
+        "isSubscribed": b.subscribed,
         "shareWith": null,
         "myRights": rights(),
     }))

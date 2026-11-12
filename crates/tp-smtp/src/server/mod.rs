@@ -136,10 +136,16 @@ pub trait Handler: Send + Sync + 'static {
     async fn data(&self, env: &Envelope, raw: Bytes) -> Reply;
 
     /// Политика организации субъекта `principal` для сеанса submission (SMTP-40): `max_recipients`,
-    /// `send_per_hour`. По умолчанию — без заданных уровней (умолчания полей `Policy`).
+    /// `send_per_hour`, `rcpts_per_hour`. По умолчанию — без заданных уровней (умолчания полей `Policy`).
     async fn policy(&self, principal: &Principal) -> tp_contracts::Result<Policy> {
         let _ = principal;
         Ok(Policy::default())
+    }
+
+    /// Письмо транзакции `env` не принято лимитом отправки сеанса с ответом `reply` (адресатов в час, SMTP-43) —
+    /// для журнала доставки. По умолчанию — ничего.
+    async fn limited(&self, env: &Envelope, reply: &Reply) {
+        let _ = (env, reply);
     }
 }
 

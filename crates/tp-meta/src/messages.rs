@@ -130,9 +130,14 @@ fn part_order(a: &str, b: &str) -> Ordering {
 
 macro_rules! select_messages {
     ($tail:literal) => {
+        select_messages!("hidden_at IS NULL", $tail)
+    };
+    ($visibility:literal, $tail:literal) => {
         concat!(
             "SELECT message_id, mailbox_id, uid, modseq, size, received_at, flags, skeleton_hash, skeleton_gen, meta
-             FROM messages WHERE tenant_id = $1 AND account_id = $2 AND hidden_at IS NULL ",
+             FROM messages WHERE tenant_id = $1 AND account_id = $2 AND ",
+            $visibility,
+            " ",
             $tail
         )
     };
@@ -209,6 +214,31 @@ async fn existing(
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)
+}
+
+/// Скрытое письмо корзины (`TrashStore::hidden_message`): строка с `hidden_at`, части — как у `get`.
+pub(crate) async fn hidden_message(
+    meta: &PgMeta,
+    scope: AccountScope,
+    id: MessageId,
+) -> Result<Option<Message>> {
+    meta.idempotent(|| async move {
+        let mut tx = begin(&meta.box_pool(scope).await?, scope.tenant).await?;
+        let rows: Vec<MessageRow> = sqlx::query_as(select_messages!(
+            "hidden_at IS NOT NULL",
+            "AND message_id = $3"
+        ))
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let msg = assemble(&mut tx, scope, rows).await?.pop();
+        crate::commits::commit(tx).await?;
+        Ok(msg)
+    })
+    .await
 }
 
 /// Ссылки писем `ids` на объекты BLOB изменяются на `delta` (каждое письмо — по ссылке на каждый объект).
@@ -838,7 +868,17 @@ impl MessageStore for PgMeta {
     async fn to_trash(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
         self.once(async move {
             let db = self.box_db(scope).await?;
-            let trash_for = self.trash_retention(&db, scope).await?;
+            let trash_for = self
+                .trash_retention(&db, scope, || async {
+                    let mut tx = begin(&db.pool, scope.tenant).await?;
+                    let found = existing(&mut tx, scope, &uuids(ids), false).await?;
+                    crate::commits::commit(tx).await?;
+                    let mut folders: Vec<Uuid> = found.into_iter().map(|(_, mb)| mb).collect();
+                    folders.sort_unstable();
+                    folders.dedup();
+                    Ok(folders)
+                })
+                .await?;
             let mut tx = begin(&db.pool, scope.tenant).await?;
             let current = changelog::lock_modseq(&mut tx, scope).await?;
             let trash = by_role(&mut tx, scope, SpecialUse::Trash)
@@ -856,7 +896,7 @@ impl MessageStore for PgMeta {
                 return Ok(current);
             }
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
-            let events: Vec<_> = relocate(&mut tx, scope, ms, &src, trash, Some(trash_for))
+            let events: Vec<_> = relocate(&mut tx, scope, ms, &src, trash, Some(&trash_for))
                 .await?
                 .into_iter()
                 .map(|m| {

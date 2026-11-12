@@ -17,7 +17,7 @@
 //! Скрытое письмо не видно пользователю: его нет в `MessageStore` (`get`, `list`, операции над письмами — как над
 //! отсутствующим), в счётчиках папки, в квоте (`Quota`, `AccountStore::quota`); `ChangeLog` показывает его удалённым
 //! из корзины, событие ядра — `Trashed` (индексатор поиска по текущему состоянию удаляет документ). Видит и восстанавливает
-//! его администратор: [`TrashStore::list_hidden`], [`TrashStore::restore`]. Срок корзины для скрытых истекает как обычно
+//! его администратор: [`TrashStore::list_hidden`], [`TrashStore::hidden_message`] (заголовки), [`TrashStore::restore`]. Срок корзины для скрытых истекает как обычно
 //! (`expired` → `before_final_delete` → `expunge_final`).
 //!
 //! Таймер истечения в кластере (CTR-37): после `MailStore::delete_to_trash` и [`TrashStore::purge`] реализация
@@ -32,7 +32,7 @@ use crate::bus::{Event, EventKind};
 use crate::error::{Error, Result};
 use crate::ext::DecisionHooks;
 use crate::ids::{MailboxId, MessageId, ModSeq};
-use crate::meta::{AccountScope, Inserted, QuotaUsage};
+use crate::meta::{AccountScope, Inserted, Message, QuotaUsage};
 
 /// Объект в корзине. Ф1 — письма; события и контакты добавятся с календарями.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -157,6 +157,12 @@ pub trait TrashStore: Send + Sync + 'static {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<TrashItem>>;
+
+    /// Скрытое письмо `id` учётной записи ([`TrashStore::purge`] с `hide`) — метаданные как у `MessageStore::get`
+    /// (тема, отправитель, дата — в `Message::meta.envelope`), без снятия скрытия: письмо остаётся невидимым
+    /// пользователю (Admin API: заголовки «восстанавливаемого элемента»; аудит обращения — у вызывающего).
+    /// Письма нет или оно не скрыто — `None`.
+    async fn hidden_message(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>>;
 
     /// Восстанавливает элемент, видимый или скрытый (для письма — как `MessageStore::restore`: в исходную папку,
     /// её нет — во «Входящие»; прежний `MessageId`, новый UID). Элемента нет — `Error::NotFound`.

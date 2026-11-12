@@ -699,8 +699,14 @@ impl<T: Transport> Session<T> {
         };
         let scope = self.scope().ok_or(Error::Forbidden)?;
         let id = node.mailbox.id;
+        let has_messages = self.ctx.deps.mailboxes.status(scope, id).await?.messages > 0;
         match self.ctx.deps.mailboxes.delete(scope, id, false).await {
             Ok(()) => {
+                if has_messages {
+                    // Аудит ящика: письма папки удалены вместе с ней (в корзину), запись — о папке.
+                    self.audit_done(scope, AuditAction::Delete, id, &[], None)
+                        .await;
+                }
                 if self.selected.as_ref().is_some_and(|s| s.mailbox == id) {
                     self.selected = None;
                     self.untagged(StatusKind::Ok, Some(Code::Closed), "Mailbox deleted");

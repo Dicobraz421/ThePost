@@ -18,6 +18,7 @@
 //!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -282,17 +283,19 @@ impl Services {
             extractor,
         });
 
-        // Очередь исходящей почты: письмо и уведомления подписываются DKIM при постановке.
+        // Очередь исходящей почты: письмо и уведомления подписываются DKIM при постановке; селектор подписи —
+        // политика организации принятого домена `From` (SMTP-40).
         let smtp = cfg.section::<SmtpConfig>(SMTP)?;
-        let dkim = Arc::new(tp_smtp::dkim_sign::DkimSign::new(
-            secrets.clone(),
-            smtp.dkim.clone(),
-        ));
+        let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
+        let dkim = Arc::new(
+            tp_smtp::dkim_sign::DkimSign::new(secrets.clone(), smtp.dkim.clone())
+                .with_policies(Arc::new(meta.clone()), routes.clone()),
+        );
         let queue = Arc::new(Queue::new(queue_deps(&meta, &blob)).with_dkim(dkim.clone()));
         let smtp_metrics = Arc::new(SmtpMetrics::new());
         smtp_metrics.register(metrics);
         let limiter = Arc::new(RateLimiter::new(
-            (*cfg.section::<RateLimitConfig>("ratelimit")?).clone(),
+            (*cfg.section::<RateLimitConfig>(tp_platform::ratelimit::RATELIMIT)?).clone(),
         ));
 
         // Секции, читаемые ролями при запуске, проверяются здесь: ошибка — до запуска ролей.
@@ -304,7 +307,6 @@ impl Services {
             (*cfg.section::<tp_dav::DavConfig>(DAV)?).clone(),
         ));
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
-        let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
         let sieve = (*cfg.section::<tp_sieve::SieveConfig>(SIEVE)?).clone();
         let sieve_limits = sieve.limits();
@@ -350,8 +352,9 @@ impl Services {
     }
 
     /// Доставка и обработчик транзакций SMTP (smtp-in, submission): проверки SPF/DKIM/DMARC/ARC, Milter, очередь,
-    /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC) и правила потока
-    /// почты модуля (если включён).
+    /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC), политики
+    /// организации (профиль Milter, лимиты сеанса submission — `PgMeta`, SMTP-40), лимиты отправки в час — общие с
+    /// submission и для отправки из JMAP (SMTP-43) — и правила потока почты модуля (если включён).
     pub fn delivery(&self, smtp: &SmtpConfig) -> Result<Arc<Delivery>> {
         // Приглашения и ответы извне (iMIP, SMTP-33) после доставки в ящик применяются к календарю получателя.
         let delivery = self.base_delivery(smtp)?.with_itip(self.itip.clone());
@@ -394,7 +397,9 @@ impl Services {
             .with_tracking(self.tracking.clone())
             .with_transport(self.routes.clone())
             .with_forwarding(Arc::new(forwarding))
-            .with_rules(self.rules.clone()))
+            .with_rules(self.rules.clone())
+            .with_policies(Arc::new(self.meta.clone()))
+            .with_send_limits(self.send_limits.clone()))
     }
 
     /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
@@ -467,6 +472,7 @@ impl Services {
             bus: self.bus.clone(),
             trash: Arc::new(self.meta.clone()),
             hooks: self.hooks.clone(),
+            audit: Arc::new(self.meta.clone()),
         }
     }
 
@@ -524,6 +530,9 @@ impl Services {
             accounts: Arc::new(self.meta.clone()),
             authz: self.authz.clone(),
             outbound: Some(outbound.clone()),
+            submissions: Arc::new(self.meta.clone()),
+            delivery_log: Arc::new(self.meta.clone()),
+            audit: Arc::new(self.meta.clone()),
             hooks: self.hooks.clone(),
             capabilities: ext.jmap_capabilities().to_vec(),
             trash: Arc::new(self.meta.clone()),
@@ -576,6 +585,7 @@ impl Services {
 
     /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`
     /// (`impl Moderation for Delivery`, FIX-01) без правил потока почты: письмо прошло их при приёме.
+    /// Журнал аудита — только в базу; в SIEM его выгружает роль maintenance ([`crate::audit_export`]).
     pub fn admin(
         &self,
         ext: &Registry,
@@ -585,8 +595,6 @@ impl Services {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
             audit_log: Arc::new(self.meta.clone()),
-            // Экспорт в SIEM (`admin.audit`) узел не запускает: без приёмников.
-            audit: Arc::new(tp_admin::Fanout::default()),
             delivery: Arc::new(self.meta.clone()),
             groups: Arc::new(self.meta.clone()),
             moderation: Arc::new(self.base_delivery(smtp)?),
@@ -598,6 +606,13 @@ impl Services {
             trash: Arc::new(self.meta.clone()),
             store: self.store.clone(),
             app_passwords: self.app_passwords.clone(),
+            // Соответствие Exchange (ADM-10): адресная книга, списки отправителей, аудит ящиков, остановка синхронизации.
+            contacts: Arc::new(self.meta.clone()),
+            org: Arc::new(self.meta.clone()),
+            dynamic: Arc::new(self.meta.clone()),
+            senders: Arc::new(self.meta.clone()),
+            mailbox_audit: Arc::new(self.meta.clone()),
+            sync: Arc::new(self.meta.clone()),
         };
         let limits = self.sieve_limits;
         let check = move |text: &str| match tp_sieve::compile(text.as_bytes(), &limits) {
@@ -670,24 +685,47 @@ pub fn system_resolver() -> Result<mail_auth::MessageAuthenticator> {
 }
 
 /// Проверка учётных данных под защитой от перебора: `AbuseGuard::check` до проверки, `failure` после отказа
-/// (`Forbidden`), `success` после входа. Попытка — учётная запись по имени входа (пароль); адреса клиента контракт
-/// `Authenticator` не передаёт — счётчики адреса и подсети ждут его в протоколах. Заблокированная попытка —
+/// (`Forbidden`), `success` после входа. Попытка — адрес клиента соединения (`peer`, CTR-57: счётчики адреса и
+/// подсети) и учётная запись по имени входа (пароль). Заблокированная попытка —
 /// `Forbidden` (протокол отвечает как на неверный пароль, учётные данные не проверяются).
 ///
 /// Хранилище блокировок недоступно — решение по `auth.abuse.fail_closed` принимает `AbuseGuard` (AUTH-11,
 /// решение владельца #253): `false` (по умолчанию) — вход проверяется по блокировкам, известным узлу; `true` —
 /// ошибка `AbuseGuard::check` возвращается вызывающему (`Unavailable`: протокол отвечает временным отказом).
-struct Guarded {
+pub struct Guarded {
     inner: Arc<dyn Authenticator>,
     guard: tp_auth::AbuseGuard,
     accounts: Arc<dyn AccountStore>,
     tenant: TenantId,
 }
 
+impl std::fmt::Debug for Guarded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guarded")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Guarded {
-    /// Попытка входа по предъявленным данным: для пароля — учётная запись по имени входа (нет или ошибка
-    /// каталога — без учётной записи); токен и Kerberos — субъект известен только после проверки.
-    async fn attempt(&self, credentials: &Credentials) -> tp_auth::Attempt {
+    /// Проверка `inner` под защитой `guard`; учётная запись попытки — по имени входа из `accounts` в `tenant`.
+    pub fn new(
+        inner: Arc<dyn Authenticator>,
+        guard: tp_auth::AbuseGuard,
+        accounts: Arc<dyn AccountStore>,
+        tenant: TenantId,
+    ) -> Self {
+        Self {
+            inner,
+            guard,
+            accounts,
+            tenant,
+        }
+    }
+
+    /// Попытка входа с адреса `peer` по предъявленным данным: для пароля — учётная запись по имени входа (нет или
+    /// ошибка каталога — без учётной записи); токен и Kerberos — субъект известен только после проверки.
+    async fn attempt(&self, credentials: &Credentials, peer: Option<IpAddr>) -> tp_auth::Attempt {
         let account = match credentials {
             Credentials::Password { login, .. } => {
                 match self.accounts.by_login(self.tenant, login).await {
@@ -700,20 +738,20 @@ impl Guarded {
             }
             _ => None,
         };
-        tp_auth::Attempt { ip: None, account }
+        tp_auth::Attempt { ip: peer, account }
     }
 }
 
 #[async_trait]
 impl Authenticator for Guarded {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
-        let attempt = self.attempt(&credentials).await;
+    async fn verify(&self, credentials: Credentials, peer: Option<IpAddr>) -> Result<Principal> {
+        let attempt = self.attempt(&credentials, peer).await;
         match self.guard.check(self.tenant, &attempt).await {
             Ok(Some(_)) => return Err(Error::Forbidden),
             Ok(None) => {}
             Err(e) => return Err(e),
         }
-        match self.inner.verify(credentials).await {
+        match self.inner.verify(credentials, peer).await {
             Ok(p) => {
                 let ok = tp_auth::Attempt {
                     ip: attempt.ip,
@@ -925,19 +963,90 @@ mod tests {
     async fn guarded_blocks_account_after_failures() {
         let g = guarded(MemAbuseBlocks::default(), 3, false).await;
         for _ in 0..2 {
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+            assert_eq!(
+                g.verify(password("wrong"), None).await,
+                Err(Error::Forbidden)
+            );
         }
-        g.verify(password("right")).await.expect("login");
+        g.verify(password("right"), None).await.expect("login");
         for _ in 0..2 {
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+            assert_eq!(
+                g.verify(password("wrong"), None).await,
+                Err(Error::Forbidden)
+            );
         }
-        g.verify(password("right"))
+        g.verify(password("right"), None)
             .await
             .expect("login after reset");
         for _ in 0..3 {
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+            assert_eq!(
+                g.verify(password("wrong"), None).await,
+                Err(Error::Forbidden)
+            );
         }
-        assert_eq!(g.verify(password("right")).await, Err(Error::Forbidden));
+        assert_eq!(
+            g.verify(password("right"), None).await,
+            Err(Error::Forbidden)
+        );
+    }
+
+    /// CTR-57: неудачи считаются и по адресу клиента — порог блокирует адрес (и верный пароль с него), вход с
+    /// другого адреса проверяется.
+    #[tokio::test]
+    async fn guarded_blocks_address_after_failures() {
+        let mut g = guarded(MemAbuseBlocks::default(), 1000, false).await;
+        let cfg = tp_auth::AbuseConfig {
+            ip_failures: 2,
+            account_failures: 1000,
+            ..tp_auth::AbuseConfig::default()
+        };
+        g.guard = tp_auth::AbuseGuard::new(cfg, Arc::new(MemAbuseBlocks::default()));
+        let peer = Some(IpAddr::from([192, 0, 2, 7]));
+        let other = Some(IpAddr::from([198, 51, 100, 9]));
+        for _ in 0..2 {
+            assert_eq!(
+                g.verify(password("wrong"), peer).await,
+                Err(Error::Forbidden)
+            );
+        }
+        assert_eq!(
+            g.verify(password("right"), peer).await,
+            Err(Error::Forbidden)
+        );
+        g.verify(password("right"), other)
+            .await
+            .expect("login from another address");
+    }
+
+    /// APP-40 (SRS 6.3): неудачи с разными несуществующими именами входа (учётной записи нет) засчитываются адресу —
+    /// порог блокирует адрес, в том числе для существующей учётной записи с верным паролем; вход с другого адреса
+    /// работает.
+    #[tokio::test]
+    async fn guarded_blocks_address_after_unknown_logins() {
+        let mut g = guarded(MemAbuseBlocks::default(), 1000, false).await;
+        let cfg = tp_auth::AbuseConfig {
+            ip_failures: 3,
+            account_failures: 1000,
+            ..tp_auth::AbuseConfig::default()
+        };
+        g.guard = tp_auth::AbuseGuard::new(cfg, Arc::new(MemAbuseBlocks::default()));
+        let peer = Some(IpAddr::from([192, 0, 2, 7]));
+        let other = Some(IpAddr::from([198, 51, 100, 9]));
+        for i in 0..3 {
+            let unknown = Credentials::Password {
+                login: format!("nobody{i}@example.org"),
+                secret: "guess".into(),
+            };
+            assert_eq!(g.verify(unknown, peer).await, Err(Error::Forbidden));
+        }
+        assert_eq!(
+            g.verify(password("right"), peer).await,
+            Err(Error::Forbidden),
+            "адрес заблокирован"
+        );
+        g.verify(password("right"), other)
+            .await
+            .expect("login from another address");
     }
 
     /// Хранилище блокировок недоступно, `auth.abuse.fail_closed: false` — вход проверяется (решение владельца #253,
@@ -947,8 +1056,11 @@ mod tests {
         let blocks = MemAbuseBlocks::default();
         blocks.fail_next(Error::UNAVAILABLE);
         let g = guarded(blocks, 3, false).await;
-        g.verify(password("right")).await.expect("login");
-        assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+        g.verify(password("right"), None).await.expect("login");
+        assert_eq!(
+            g.verify(password("wrong"), None).await,
+            Err(Error::Forbidden)
+        );
     }
 
     /// Хранилище блокировок недоступно, `auth.abuse.fail_closed: true` — вход запрещён (временная ошибка, учётные
@@ -958,12 +1070,12 @@ mod tests {
         let blocks = MemAbuseBlocks::default();
         blocks.fail_next(Error::UNAVAILABLE);
         let g = guarded(blocks, 3, true).await;
-        let refused = g.verify(password("right")).await;
+        let refused = g.verify(password("right"), None).await;
         assert!(
             matches!(refused, Err(Error::Unavailable { .. })),
             "{refused:?}"
         );
-        g.verify(password("right"))
+        g.verify(password("right"), None)
             .await
             .expect("login after store recovered");
     }
@@ -1220,6 +1332,8 @@ mod tests {
                     display_name: login.into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: tp_contracts::meta::AccountKind::User,
                 },
             )
             .await
@@ -1278,7 +1392,7 @@ mod tests {
                 .expect("submit");
             assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued, "{sent:?}");
         }
-        let held = GroupStore::held(&meta, t, Some(group.id), 10)
+        let held = GroupStore::held(&meta, t, Some(group.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 2, "{held:?}");
@@ -1344,7 +1458,7 @@ mod tests {
         drop(tx);
         assert_eq!(queued, 1, "DSN отказа не в очереди");
         assert!(
-            GroupStore::held(&meta, t, Some(group.id), 10)
+            GroupStore::held(&meta, t, Some(group.id), None, 10)
                 .await
                 .expect("held")
                 .is_empty()

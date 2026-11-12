@@ -242,6 +242,8 @@
          | list }}
     thepost_db_failover: { retry_initial: 100ms, retry_max: 2s, retry_for: 30s, probe_timeout: 3s }
     thepost_secrets_url: "{{ small_openbao_url }}"
+    # Ключ TLS (секрет thepost/tls) записывается через узел инициализации OpenBao.
+    thepost_openbao_from: "{{ small_bao_init }}"
     thepost_config_extra_small:
       roles: [mailbox]
       blob:

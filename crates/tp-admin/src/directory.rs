@@ -9,7 +9,7 @@
 //!   каталога и подразделениям; у группы со статическими участниками фильтр не задаётся (409). Состав вычисляется при
 //!   раскрытии — `GET …/filter/members`.
 //!
-//! Хранилища — [`ParityStores`] ([`Admin::with_parity`]; не подключены — 503).
+//! Хранилища — поля [`Deps`] `contacts`, `org`, `dynamic`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use tp_contracts::addressbook::{DynamicGroup, MailContact, MemberFilter, OrgMemb
 use tp_contracts::{ContactId, Error, GroupId, OrgUnitId, Result, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::server::{Admin, ApiResult, ParityStores, Problem};
+use crate::server::{Admin, ApiResult, Deps, Problem};
 
 /// Почтовый контакт.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -233,11 +233,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
 )]
 pub(crate) struct Doc;
 
-pub(crate) fn stores(a: &Admin) -> ApiResult<&ParityStores> {
-    Ok(a.parity.as_ref().ok_or(Error::UNAVAILABLE)?)
-}
-
-async fn contact(s: &ParityStores, org: TenantId, id: ContactId) -> Result<MailContact> {
+async fn contact(s: &Deps, org: TenantId, id: ContactId) -> Result<MailContact> {
     s.contacts.contact(org, id).await?.ok_or(Error::NotFound)
 }
 
@@ -254,12 +250,12 @@ async fn check_groups(a: &Admin, org: TenantId, groups: &[GroupId]) -> Result<()
 /// Почтовые контакты организации.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/contacts", tag = "addressbook",
     params(("org" = String, Path, description = "Организация (UUID)")),
-    responses((status = 200, body = Vec<ContactInfo>), (status = 503, body = Problem)))]
+    responses((status = 200, body = Vec<ContactInfo>)))]
 async fn list_contacts(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
 ) -> ApiResult<Json<Vec<ContactInfo>>> {
-    let list = stores(&a)?.contacts.contacts(org).await?;
+    let list = a.d.contacts.contacts(org).await?;
     Ok(Json(list.into_iter().map(ContactInfo::from).collect()))
 }
 
@@ -268,13 +264,13 @@ async fn list_contacts(
     params(("org" = String, Path, description = "Организация (UUID)")),
     request_body = ContactBody,
     responses((status = 201, body = ContactInfo), (status = 400, body = Problem),
-        (status = 409, description = "адрес занят", body = Problem), (status = 503, body = Problem)))]
+        (status = 409, description = "адрес занят", body = Problem)))]
 async fn create_contact(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
     Json(body): Json<ContactBody>,
 ) -> ApiResult<(StatusCode, Json<ContactInfo>)> {
-    let s = stores(&a)?;
+    let s = &a.d;
     let c = build_contact(&a, org, ContactId::new(), None, body).await?;
     s.contacts.put_contact(c.clone()).await?;
     Ok((StatusCode::CREATED, Json(c.into())))
@@ -309,12 +305,12 @@ async fn build_contact(
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/contacts/{contact}", tag = "addressbook",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("contact" = String, Path, description = "Контакт (UUID)")),
-    responses((status = 200, body = ContactInfo), (status = 404, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 200, body = ContactInfo), (status = 404, body = Problem)))]
 async fn get_contact(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, ContactId)>,
 ) -> ApiResult<Json<ContactInfo>> {
-    Ok(Json(contact(stores(&a)?, org, id).await?.into()))
+    Ok(Json(contact(&a.d, org, id).await?.into()))
 }
 
 /// Заменяет локальный контакт целиком; контакт каталога — 409.
@@ -323,14 +319,13 @@ async fn get_contact(
         ("contact" = String, Path, description = "Контакт (UUID)")),
     request_body = ContactBody,
     responses((status = 200, body = ContactInfo), (status = 400, body = Problem), (status = 404, body = Problem),
-        (status = 409, description = "контакт каталога или адрес занят", body = Problem),
-        (status = 503, body = Problem)))]
+        (status = 409, description = "контакт каталога или адрес занят", body = Problem)))]
 async fn put_contact(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, ContactId)>,
     Json(body): Json<ContactBody>,
 ) -> ApiResult<Json<ContactInfo>> {
-    let s = stores(&a)?;
+    let s = &a.d;
     if contact(s, org, id).await?.external_id.is_some() {
         return Err(Error::Conflict.into());
     }
@@ -344,12 +339,12 @@ async fn put_contact(
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("contact" = String, Path, description = "Контакт (UUID)")),
     responses((status = 204), (status = 404, body = Problem),
-        (status = 409, description = "контакт каталога", body = Problem), (status = 503, body = Problem)))]
+        (status = 409, description = "контакт каталога", body = Problem)))]
 async fn delete_contact(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, ContactId)>,
 ) -> ApiResult<StatusCode> {
-    let s = stores(&a)?;
+    let s = &a.d;
     if contact(s, org, id).await?.external_id.is_some() {
         return Err(Error::Conflict.into());
     }
@@ -360,12 +355,12 @@ async fn delete_contact(
 /// Подразделения организации (дерево — по `parent`).
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/units", tag = "addressbook",
     params(("org" = String, Path, description = "Организация (UUID)")),
-    responses((status = 200, body = Vec<UnitInfo>), (status = 503, body = Problem)))]
+    responses((status = 200, body = Vec<UnitInfo>)))]
 async fn list_units(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
 ) -> ApiResult<Json<Vec<UnitInfo>>> {
-    let list = stores(&a)?.org.org_units(org).await?;
+    let list = a.d.org.org_units(org).await?;
     Ok(Json(list.into_iter().map(UnitInfo::from).collect()))
 }
 
@@ -373,7 +368,7 @@ async fn list_units(
 #[utoipa::path(post, path = "/api/v1/orgs/{org}/units", tag = "addressbook",
     params(("org" = String, Path, description = "Организация (UUID)")),
     request_body = UnitBody,
-    responses((status = 201, body = UnitInfo), (status = 400, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 201, body = UnitInfo), (status = 400, body = Problem)))]
 async fn create_unit(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
@@ -386,11 +381,11 @@ async fn create_unit(
         parent: body.parent,
         external_id: None,
     };
-    stores(&a)?.org.put_org_unit(unit.clone()).await?;
+    a.d.org.put_org_unit(unit.clone()).await?;
     Ok((StatusCode::CREATED, Json(unit.into())))
 }
 
-async fn unit(s: &ParityStores, org: TenantId, id: OrgUnitId) -> Result<OrgUnit> {
+async fn unit(s: &Deps, org: TenantId, id: OrgUnitId) -> Result<OrgUnit> {
     s.org
         .org_units(org)
         .await?
@@ -406,13 +401,13 @@ async fn unit(s: &ParityStores, org: TenantId, id: OrgUnitId) -> Result<OrgUnit>
     request_body = UnitBody,
     responses((status = 200, body = UnitInfo), (status = 400, description = "цикл, неизвестное вышестоящее",
         body = Problem), (status = 404, body = Problem),
-        (status = 409, description = "подразделение каталога", body = Problem), (status = 503, body = Problem)))]
+        (status = 409, description = "подразделение каталога", body = Problem)))]
 async fn put_unit(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, OrgUnitId)>,
     Json(body): Json<UnitBody>,
 ) -> ApiResult<Json<UnitInfo>> {
-    let s = stores(&a)?;
+    let s = &a.d;
     if unit(s, org, id).await?.external_id.is_some() {
         return Err(Error::Conflict.into());
     }
@@ -432,13 +427,12 @@ async fn put_unit(
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("unit" = String, Path, description = "Подразделение (UUID)")),
     responses((status = 204), (status = 404, body = Problem),
-        (status = 409, description = "есть вложенные или подразделение каталога", body = Problem),
-        (status = 503, body = Problem)))]
+        (status = 409, description = "есть вложенные или подразделение каталога", body = Problem)))]
 async fn delete_unit(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, OrgUnitId)>,
 ) -> ApiResult<StatusCode> {
-    let s = stores(&a)?;
+    let s = &a.d;
     if unit(s, org, id).await?.external_id.is_some() {
         return Err(Error::Conflict.into());
     }
@@ -450,17 +444,13 @@ async fn delete_unit(
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/units/{unit}/members", tag = "addressbook",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("unit" = String, Path, description = "Подразделение (UUID)"), MembersQuery),
-    responses((status = 200, body = Vec<UnitMember>), (status = 404, body = Problem),
-        (status = 503, body = Problem)))]
+    responses((status = 200, body = Vec<UnitMember>), (status = 404, body = Problem)))]
 async fn unit_members(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, OrgUnitId)>,
     Query(q): Query<MembersQuery>,
 ) -> ApiResult<Json<Vec<UnitMember>>> {
-    let list = stores(&a)?
-        .org
-        .org_members(org, Some(id), q.subtree)
-        .await?;
+    let list = a.d.org.org_members(org, Some(id), q.subtree).await?;
     Ok(Json(list.into_iter().map(UnitMember::from).collect()))
 }
 
@@ -468,16 +458,16 @@ async fn unit_members(
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/groups/{group}/filter", tag = "groups",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("group" = String, Path, description = "Группа (UUID)")),
-    responses((status = 200, body = FilterBody), (status = 404, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 200, body = FilterBody), (status = 404, body = Problem)))]
 async fn get_filter(
     State(a): State<Arc<Admin>>,
     Path((org, group)): Path<(TenantId, GroupId)>,
 ) -> ApiResult<Json<FilterBody>> {
-    let g = stores(&a)?
-        .dynamic
-        .dynamic(org, group)
-        .await?
-        .ok_or(Error::NotFound)?;
+    let g =
+        a.d.dynamic
+            .dynamic(org, group)
+            .await?
+            .ok_or(Error::NotFound)?;
     Ok(Json(FilterBody {
         filter: g.filter,
         contacts: g.contacts,
@@ -490,14 +480,13 @@ async fn get_filter(
         ("group" = String, Path, description = "Группа (UUID)")),
     request_body = FilterBody,
     responses((status = 200, body = FilterBody), (status = 400, body = Problem), (status = 404, body = Problem),
-        (status = 409, description = "у группы есть статические участники", body = Problem),
-        (status = 503, body = Problem)))]
+        (status = 409, description = "у группы есть статические участники", body = Problem)))]
 async fn put_filter(
     State(a): State<Arc<Admin>>,
     Path((org, group)): Path<(TenantId, GroupId)>,
     Json(body): Json<FilterBody>,
 ) -> ApiResult<Json<FilterBody>> {
-    let s = stores(&a)?;
+    let s = &a.d;
     let g = a.d.groups.get(org, group).await?.ok_or(Error::NotFound)?;
     if !g.members.is_empty() {
         return Err(Error::Conflict.into());
@@ -518,12 +507,12 @@ async fn put_filter(
 #[utoipa::path(delete, path = "/api/v1/orgs/{org}/groups/{group}/filter", tag = "groups",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("group" = String, Path, description = "Группа (UUID)")),
-    responses((status = 204), (status = 404, body = Problem), (status = 503, body = Problem)))]
+    responses((status = 204), (status = 404, body = Problem)))]
 async fn delete_filter(
     State(a): State<Arc<Admin>>,
     Path((org, group)): Path<(TenantId, GroupId)>,
 ) -> ApiResult<StatusCode> {
-    stores(&a)?.dynamic.remove_dynamic(org, group).await?;
+    a.d.dynamic.remove_dynamic(org, group).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -531,13 +520,12 @@ async fn delete_filter(
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/groups/{group}/filter/members", tag = "groups",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("group" = String, Path, description = "Группа (UUID)")),
-    responses((status = 200, body = DynamicMembers), (status = 404, body = Problem),
-        (status = 503, body = Problem)))]
+    responses((status = 200, body = DynamicMembers), (status = 404, body = Problem)))]
 async fn filter_members(
     State(a): State<Arc<Admin>>,
     Path((org, group)): Path<(TenantId, GroupId)>,
 ) -> ApiResult<Json<DynamicMembers>> {
-    let m = stores(&a)?.dynamic.expand_dynamic(org, group).await?;
+    let m = a.d.dynamic.expand_dynamic(org, group).await?;
     Ok(Json(DynamicMembers {
         accounts: m.accounts.iter().map(ToString::to_string).collect(),
         contacts: m.contacts.iter().map(ToString::to_string).collect(),
@@ -774,14 +762,5 @@ mod tests {
             )
             .await;
         assert_eq!(s, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn unavailable_without_stores() {
-        let env = Env::without_parity();
-        let (s, _, _) = env
-            .call("GET", &format!("{ORG}/contacts"), Some("org"), None)
-            .await;
-        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

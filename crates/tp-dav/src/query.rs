@@ -194,6 +194,20 @@ impl TextMatch {
         }
     }
 
+    /// Искомое для поиска контактов по индексу (CTR-54, `DavStore::find_cards`): подстрока, которую содержит
+    /// поисковая строка ([`tp_contracts::dav::CardSearch`]: значение в нижнем регистре без пробелов по краям) каждого
+    /// значения, совпавшего с условием, — при любом сравнении и виде совпадения. `None` — индекс не сужает
+    /// кандидатов: условие с `negate-condition`, пустое искомое, искомое с `;` (совпадение с частями через `;`) или
+    /// с управляющими символами (в индексе они заменены пробелом).
+    pub(crate) fn index_needle(&self) -> Option<String> {
+        let needle = self.needle.trim().to_lowercase();
+        let usable = !self.negate
+            && !needle.is_empty()
+            && !needle.contains(';')
+            && !needle.chars().any(char::is_control);
+        usable.then_some(needle)
+    }
+
     /// Хотя бы одно значение совпадает с искомым (с учётом `negate-condition`).
     pub(crate) fn matches<'a>(&self, values: impl IntoIterator<Item = &'a str>) -> bool {
         let needle = self.needle.as_str();

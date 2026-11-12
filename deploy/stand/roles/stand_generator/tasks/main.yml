@@ -48,7 +48,7 @@
     src: "{{ hostvars[stand_smb_host].thepost_pki_dir | default('/etc/thepost/pki') }}/ca.pem"
   delegate_to: "{{ stand_smb_host }}"
   register: stand_ca
-  when: hostvars[stand_smb_host].thepost_tls_mode | default('certbot') == 'internal'
+  when: hostvars[stand_smb_host].thepost_tls_mode | default('acme') == 'internal'
 
 - name: Install CA of SMB node
   ansible.builtin.copy:
@@ -106,7 +106,7 @@
     owner: root
     group: root
     mode: "0755"
-  loop: [make-corpus.py, jmap.js, probe.js, run-scenario.sh, fill.py, probes.py, criteria.py]
+  loop: [make-corpus.py, jmap.js, dav.js, probe.js, run-scenario.sh, fill.py, fill-dav.py, probes.py, criteria.py]
 
 - name: Build message corpus (D.3)
   ansible.builtin.command:

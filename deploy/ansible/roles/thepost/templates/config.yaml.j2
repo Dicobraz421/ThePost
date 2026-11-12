@@ -1,6 +1,7 @@
-{#- Эталон SMB: пресет all (deploy/config/all.yaml) + параметры узла; поверх — thepost_config_extra. -#}
+{#- Эталон SMB: пресет all (deploy/config/all.yaml, единственная конфигурация SMB — решение 105) + значения
+    инвентаря; поверх — thepost_config_extra. Здесь только подстановка, разделов конфигурации шаблон не задаёт. -#}
+{%- set preset = lookup('ansible.builtin.file', role_path ~ '/../../../config/all.yaml') | from_yaml -%}
 {%- set acme = thepost_tls_mode == 'acme' -%}
-{%- set tls_dir = '/var/lib/thepost/tls' if acme else '/etc/thepost/tls' -%}
 {#- Фильтр Milter описывается отдельно на каждое направление: inbound — приём, outbound — почта пользователей. -#}
 {%- set milters = [('rspamd', thepost_rspamd_milter_address)]
       + ([('clamav', thepost_clamav_milter_address)] if thepost_clamav else []) -%}
@@ -12,62 +13,45 @@
                                 'address': address, 'direction': direction}) -%}
 {%-   endfor -%}
 {%- endfor -%}
-{%- set base = {
+{%- set node = {
   'domain': thepost_domain,
-  'roles': ['all'],
-  'database': {
-    'url': thepost_db_url,
-    'password': {'secret': 'thepost/db#password'},
-    'owner': {'user': thepost_db_owner_role, 'password': {'secret': 'thepost/db-owner#password'}},
-  },
-  'blob': {'url': 'file:///var/lib/thepost/blob'},
-  'tls': {
-    'cert_file': tls_dir ~ '/fullchain.pem',
-    'key_file': tls_dir ~ '/privkey.pem',
-  },
-  'http': {
-    'jmap': {'listen': thepost_listen_address ~ ':443'},
-    'admin': {'listen': thepost_admin_listen},
-  },
-  'imap': {'listeners': [
-    {'listen': thepost_listen_address ~ ':143'},
-    {'listen': thepost_listen_address ~ ':993', 'implicit_tls': true},
-  ]},
-  'smtp': {
-    'hostname': thepost_hostname,
-    'inbound': [{'listen': thepost_listen_address ~ ':25'}],
-    'submission': [
-      {'listen': thepost_listen_address ~ ':587'},
-      {'listen': thepost_listen_address ~ ':465', 'implicit_tls': true},
-    ],
-    'milter': {'filters': filters},
-  },
+  'database': {'url': thepost_db_url, 'owner': {'user': thepost_db_owner_role}},
+  'http': {'admin': {'listen': thepost_admin_listen}},
+  'smtp': {'hostname': thepost_hostname, 'milter': {'filters': filters}},
+  'maintenance': thepost_maintenance,
   'secrets': {
     'url': thepost_secrets_url,
     'tls': {'ca_file': thepost_internal_ca_file},
-    'auth': {'approle': {
-      'role_id_file': thepost_secrets_role_id_file,
-      'secret_id_file': '/run/credentials/thepost.service/openbao-secret-id',
-    }},
+    'auth': {'approle': {'role_id_file': thepost_secrets_role_id_file}},
   },
 } -%}
+{%- if thepost_dav_listen | length > 0 -%}
+{%-   set node = node | combine({'http': {'dav': {'listen': thepost_dav_listen}}}, recursive=true) -%}
+{%- endif -%}
+{%- if thepost_dav | length > 0 -%}
+{%-   set node = node | combine({'dav': thepost_dav}, recursive=true) -%}
+{%- endif -%}
 {%- if thepost_db_urls | length > 0 -%}
-{%-   set base = base | combine({'database': {'urls': thepost_db_urls}}, recursive=true) -%}
+{%-   set node = node | combine({'database': {'urls': thepost_db_urls}}, recursive=true) -%}
 {%- endif -%}
 {%- if thepost_blob_gc_window | length > 0 -%}
-{%-   set base = base | combine({'blob': {'gc': {'window': thepost_blob_gc_window}}}, recursive=true) -%}
+{%-   set node = node | combine({'blob': {'gc': {'window': thepost_blob_gc_window}}}, recursive=true) -%}
 {%- endif -%}
 {%- if thepost_db_failover | length > 0 -%}
-{%-   set base = base | combine({'database': {'failover': thepost_db_failover}}, recursive=true) -%}
+{%-   set node = node | combine({'database': {'failover': thepost_db_failover}}, recursive=true) -%}
 {%- endif -%}
+{#- ACME: цепочка — в /var/lib/thepost/tls (StateDirectory юнита); ключ (tls.key пресета) пишет сам узел (PLT-29). -#}
 {%- if acme -%}
 {%-   set acme_section = {'enabled': true, 'domains': thepost_tls_names, 'contact': ['mailto:' ~ thepost_acme_email],
                           'state_dir': '/var/lib/thepost/acme'} -%}
 {%-   if thepost_acme_directory_url | length > 0 -%}
 {%-     set acme_section = acme_section | combine({'directory_url': thepost_acme_directory_url}) -%}
 {%-   endif -%}
-{%-   set base = base | combine({'acme': acme_section}) -%}
+{%-   set node = node | combine({'acme': acme_section,
+                                'tls': {'cert_file': '/var/lib/thepost/tls/fullchain.pem'}}, recursive=true) -%}
 {%- endif -%}
 # {{ ansible_managed }}
-# The Post, профиль SMB (deploy/ansible/smb.yml): секретов здесь нет — только ссылки на OpenBao.
-{{ base | combine(thepost_config_extra, recursive=true, list_merge='replace') | to_nice_yaml(indent=2, width=120) }}
+# The Post, профиль SMB (deploy/ansible/smb.yml): пресет deploy/config/all.yaml + значения инвентаря.
+# Секретов здесь нет — только ссылки на OpenBao.
+{{ preset | combine(node, recursive=true, list_merge='replace')
+          | combine(thepost_config_extra, recursive=true, list_merge='replace') | to_nice_yaml(indent=2, width=120) }}

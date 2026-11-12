@@ -41,7 +41,9 @@ use crate::{deliver, imip};
 /// Зависимости планирования встреч ([`crate::router_with`]).
 #[derive(Clone)]
 pub struct ScheduleDeps {
-    /// Учётные записи: адрес участника — имя входа учётной записи организации.
+    /// Учётные записи: адрес участника — имя входа учётной записи организации; адреса вошедшего
+    /// (`calendar-user-address-set`, свои при разборе участников) — все адреса его учётной записи
+    /// (`Account::addresses`: основной и псевдонимы).
     pub accounts: Arc<dyn AccountStore>,
     /// Приём iTIP учётными записями организации ([`crate::ItipInbox`]).
     pub delivery: Arc<dyn ItipDelivery>,
@@ -195,7 +197,14 @@ pub(crate) async fn after_change(
     new: Option<&ICalendar>,
 ) -> Option<ICalendar> {
     let deps = cx.dav.schedule.as_ref()?;
-    let plan = itip::plan(old, new, &cx.addresses(), OffsetDateTime::now_utc());
+    let addresses = match cx.addresses().await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "iTIP: адреса учётной записи недоступны, рассылки нет");
+            return None;
+        }
+    };
+    let plan = itip::plan(old, new, &addresses, OffsetDateTime::now_utc());
     let from = match &plan.role {
         itip::Role::Organizer(a) | itip::Role::Attendee(a) => a.clone(),
         itip::Role::None => return None,
@@ -452,10 +461,11 @@ async fn post(cx: &Cx<'_>, body: Body) -> Result<Response> {
     if range.validate().is_err() {
         return bad(MESSAGE);
     }
+    let addresses = cx.addresses().await?;
     let organizer = req
         .property(&ICalendarProperty::Organizer)
         .and_then(itip::entry_address);
-    if !organizer.is_some_and(|o| cx.addresses().contains(&o)) {
+    if !organizer.is_some_and(|o| addresses.contains(&o)) {
         return bad("<c:valid-organizer/>");
     }
     let attendees: Vec<(&ICalendarEntry, String)> = req

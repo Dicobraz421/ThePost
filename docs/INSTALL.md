@@ -9,8 +9,8 @@
   или 24.04, Astra Linux SE 1.8, РЕД ОС 8, AlmaLinux 10 или 9 (совместимость с RHEL 9 и 10), от 4 vCPU и 8 ГБ памяти
   (целевой размер для 1 000 пользователей), диск — под письма.
 - **Имя сервера** (например, `mail.example.ru`) и **почтовый домен** (`example.ru`), доступ к их DNS.
-- **Открытые порты**: 25 (приём почты), 465 и 587 (отправка), 993 и 143 (IMAP), 443 (JMAP, автонастройка),
-  80 (только для выпуска сертификата Let's Encrypt).
+- **Открытые порты**: 25 (приём почты), 465 и 587 (отправка), 993 и 143 (IMAP), 4190 (ManageSieve — правила
+  фильтрации), 443 (JMAP, автонастройка), 80 (только для выпуска сертификата Let's Encrypt).
 - Все требования к окружению и тонкости настройки (кодировка базы UTF-8 и др.) — [PREREQUISITES.md](PREREQUISITES.md).
 
 Все внутренние компоненты ставятся вместе с сервером: PostgreSQL (метаданные), OpenBao (секреты), Rspamd (антиспам).
@@ -74,10 +74,12 @@ PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamA
 
    | `thepost_tls_mode` | Сертификат |
    |---|---|
-   | `certbot` (по умолчанию) | Let's Encrypt; порт 80 открыт, DNS имени сервера указывает на ВМ |
-   | `acme` | Let's Encrypt встроенным клиентом The Post |
+   | `acme` (по умолчанию) | Let's Encrypt встроенным клиентом The Post; порт 80 открыт, DNS имени сервера указывает на ВМ; ключ — в OpenBao |
    | `files` | свои файлы PEM: `thepost_tls_cert_src`, `thepost_tls_key_src` |
    | `internal` | внутренний центр сертификации — только для стенда |
+
+   Закрытый ключ сертификата хранится только в OpenBao (секрет `thepost/tls`), на диске сервера его нет: плейбук
+   кладёт его туда сам, при `acme` — сам узел. Сменить свой сертификат (`files`) — заменить файлы и повторить прогон.
 
 3. Запустите:
 
@@ -96,7 +98,8 @@ PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamA
 
 Если PostgreSQL и OpenBao уже есть или нужна своя схема — установка бинарного файла, юнита systemd и `config.yaml`
 по шагам описана в [`deploy/README.md`](../deploy/README.md#установка-под-systemd-smb-enterprise-вм). Секреты (пароли
-СУБД, ключи) в `config.yaml` не пишутся — только ссылки на OpenBao.
+СУБД, ключи, в том числе ключ TLS — `tls.key: { secret: "thepost/tls#key" }`) в `config.yaml` не пишутся — только
+ссылки на OpenBao.
 
 ## Первый администратор
 
@@ -153,10 +156,12 @@ $DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@e
 | | | 143 | STARTTLS |
 | Исходящая почта (SMTP) | `mail.example.ru` | 465 | SSL/TLS |
 | | | 587 | STARTTLS |
+| Правила фильтрации (ManageSieve) | `mail.example.ru` | 4190 | STARTTLS |
 | JMAP | `https://mail.example.ru/.well-known/jmap` | 443 | HTTPS |
 
 Имя входа — адрес целиком (`ivanov@example.ru`), пароль — пароль приложения. Подходит любой клиент IMAP и SMTP
-(например, Thunderbird), по JMAP — [Postman](https://github.com/Dicobraz421/Postman). В тестовом варианте с `example.test` клиент попросит принять
+(например, Thunderbird), правила фильтрации — клиент ManageSieve (дополнение Thunderbird Sieve, `sieve-connect`),
+по JMAP — [Postman](https://github.com/Dicobraz421/Postman). В тестовом варианте с `example.test` клиент попросит принять
 сертификат: его выпустил тестовый центр (`deploy/compose/tls/ca.pem`).
 
 ## DNS домена
@@ -171,14 +176,13 @@ $DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@e
 | `TXT _dmarc` | `v=DMARC1; p=quarantine; rua=mailto:postmaster@example.ru` |
 | `TXT <селектор>._domainkey` (DKIM) | открытый ключ подписи, см. ниже |
 
-**Подпись DKIM.** Закрытый ключ хранится в OpenBao, в `config.yaml` — только ссылка на него:
+**Подпись DKIM.** Закрытый ключ хранится в OpenBao, в `config.yaml` — только ссылка на него. Каким селектором подписывать, задаёт политика организации или домена (Admin API, поле `dkim_selector`); без неё письмо подписывается всеми ключами домена:
 
 ```yaml
 smtp:
   dkim:
     domains:
       example.ru:
-        selector: s2026
         keys:
           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim#example.ru" } }
 ```
@@ -316,7 +320,9 @@ SRS 3.5). Поэтому потерять можно только письма, 
    -e thepost_restore_openbao=true -e thepost_restore_openbao_init_src=<openbao-init.json>
    -e thepost_restore_openbao_static_key_src=<unseal.key>` (при распечатывании ключами Шамира —
    `thepost_restore_openbao_unseal_keys`). Снимок OpenBao ставится до восстановления базы.
-5. Обычный прогон `smb.yml` — узел стартует, DKIM подписывает тем же ключом, `thepost verify` — без потерь.
+5. Обычный прогон `smb.yml` — узел стартует, DKIM подписывает тем же ключом, `thepost verify` — без потерь; ключ TLS
+   из снимка прогон сводит с сертификатом сервера (`internal` — новый сертификат к ключу, `files` — свой
+   ключ новой версией секрета, `acme` — узел выпускает новый сам).
 
 ## Проверка подписи
 

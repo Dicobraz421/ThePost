@@ -23,6 +23,7 @@ fn account(id: &str, name: &str, emails: &[&str], enabled: bool) -> DirAccount {
         enabled,
         attributes: BTreeMap::new(),
         org: DirOrg::default(),
+        hidden_from_gal: false,
     }
 }
 

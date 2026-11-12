@@ -1,0 +1,58 @@
+# Release-сборка thepost (решение 116, CI-14) — единственный путь: артефакт CI (ci.yml, release), выпуск и repro
+# (beta.yml). cross (образ glibc) под базовый x86-64 без AVX2; затем запуск x86_64 на эмуляции старого процессора
+# (qemu-user, Nehalem = x86-64-v2, без AVX): инструкции новее базового уровня — SIGILL, сборка падает.
+# Нативная сборка на ubuntu-latest (ubuntu-26.04: система собрана под x86-64-v3) дала C-код aws-lc-sys и ring
+# под x86-64-v3, бинарь падал на стенде без AVX2; образ cross собирает под базовый x86-64.
+# RUSTFLAGS сборки пустые в любом workflow (в ci.yml — `-D warnings`): бинарь CI совпадает с бинарём беты.
+name: release-build
+description: cross build --release thepost и запуск на старом процессоре
+
+inputs:
+  target:
+    description: Цель rustc (x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu)
+    required: true
+  cache:
+    description: rust-cache ('false' — сборка с нуля, repro)
+    default: 'true'
+  save-cache:
+    description: Сохранять rust-cache
+    default: 'true'
+
+outputs:
+  binary:
+    description: Путь к бинарю
+    value: target/${{ inputs.target }}/release/thepost
+
+runs:
+  using: composite
+  steps:
+    # Ключ cross-*: прежние кэши (release — нативная сборка под x86-64-v3) не подхватываются.
+    - if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@v2.9.3
+      with:
+        shared-key: cross-${{ inputs.target }}
+        save-if: ${{ inputs.save-cache }}
+    - uses: taiki-e/install-action@v2.90.3
+      with:
+        tool: cross
+    - id: console
+      uses: ./.github/actions/console
+    - name: cross build
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        ARGS: ${{ steps.console.outputs.cargo-args }}
+        RUSTFLAGS: ''
+      run: cross build --release --locked -p thepost --target "$TARGET" $ARGS
+    # qemu-user и гостевая система — из Debian 12 (glibc под базовый x86-64), в контейнере: на раннере ubuntu-26.04
+    # загрузчик и libc собраны под x86-64-v3 и под Nehalem падают сами, ещё до бинаря (qemu -L не спасает).
+    - name: Запуск на старом процессоре (qemu Nehalem, без AVX)
+      if: inputs.target == 'x86_64-unknown-linux-gnu'
+      shell: bash
+      env:
+        BIN: target/${{ inputs.target }}/release/thepost
+        GUEST: debian:12-slim
+      run: |
+        docker run --rm -v "$PWD/$BIN:/thepost:ro" "$GUEST" sh -c 'apt-get update -qq &&
+          apt-get install -y -qq --no-install-recommends qemu-user >/dev/null &&
+          qemu-x86_64 -cpu Nehalem /thepost --version'
