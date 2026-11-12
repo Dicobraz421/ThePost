@@ -7,7 +7,8 @@
 //!   письма iMIP (RFC 6047, SMTP-33), `tp-dav` и `tp-jmap` при планировании внутри организации (DAV-13, JMAP-31).
 //! - [`ItipSender`] — iTIP внешним участникам письмом iMIP через `queue::Outbound` (очередь и DKIM).
 //! - Входящие планирования (`schedule-inbox`, RFC 6638 §2.2) — методы `inbox_*` [`crate::dav::DavStore`].
-//! - [`FreeBusy`] — занятость по индексу [`crate::dav::ObjectIndex::busy`]; на нём строятся VFREEBUSY (RFC 6638 §5),
+//! - [`FreeBusy`] — занятость: индекс [`crate::dav::ObjectIndex::busy`] неповторяющихся объектов и разворот повторов
+//!   при запросе (META-54, решение 59); на нём строятся VFREEBUSY (RFC 6638 §5),
 //!   JMAP `Principal/getAvailability` и `Availability/get` (`urn:thepost:availability`).
 
 use std::fmt;
@@ -399,17 +400,21 @@ pub fn validate_busy(periods: &[BusyPeriod]) -> Result<()> {
     Ok(())
 }
 
-/// Занятость учётных записей по индексу [`crate::dav::ObjectIndex::busy`] календарей, кроме прозрачных
-/// ([`crate::dav::Collection::transparent`]). Реализации — хранилища (`MemDav`, `PgMeta` — META-51); индекс вычисляет
-/// `tp-dav` (DAV-16): `TRANSP:TRANSPARENT` и `STATUS:CANCELLED` не занимают. Права на чтение занятости и политику
+/// Занятость учётных записей по календарям, кроме прозрачных ([`crate::dav::Collection::transparent`]).
+/// Неповторяющиеся объекты — по индексу [`crate::dav::ObjectIndex::busy`] (вычисляет `tp-dav`, DAV-16).
+/// Повторяющиеся ([`crate::dav::ObjectIndex::recurring`]; META-54, решение 59) хранилище разворачивает из тела при
+/// запросе библиотекой calcard: `RRULE`, `RDATE`, `EXDATE`, переопределённые вхождения (`RECURRENCE-ID`), часовые
+/// пояса; время без пояса — в поясе календаря ([`crate::dav::Collection::timezone`], иначе UTC); `TRANSP:TRANSPARENT`
+/// и `STATUS:CANCELLED` не занимают, `STATUS:TENTATIVE` — [`BusyKind::Tentative`]; горизонта нет, от начала повторов
+/// разворачивается не больше [`crate::dav::DavLimits::max_busy_instances`] вхождений объекта; тело, которое не
+/// разбирается, занятости не даёт. Реализации — хранилища (`MemDav`, `PgMeta` — META-51, META-54). Права на чтение занятости и политику
 /// организации проверяет вызывающий (CTR-48).
 #[async_trait]
 pub trait FreeBusy: Send + Sync + 'static {
     /// Занятость учётных записей `accounts` организации `tenant` в интервале `range`: по записи на каждую учётную
     /// запись в порядке `accounts` (повторы — один раз), периоды пересекающиеся с `range`, обрезанные по нему и
     /// нормализованные ([`merge_busy`]). Учётная запись без календарей, чужой организации или несуществующая — пустой
-    /// список (существование проверяет вызывающий). Недопустимый `range` — `Invalid`. Периоды за горизонтом индекса
-    /// ([`crate::dav::DavLimits::busy_horizon`]) могут отсутствовать.
+    /// список (существование проверяет вызывающий). Недопустимый `range` — `Invalid`.
     async fn query(
         &self,
         tenant: TenantId,

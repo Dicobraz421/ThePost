@@ -297,6 +297,7 @@ pub mod sieve;
 
 pub use dav::dav;
 pub use freebusy::freebusy;
+pub use freebusy::recurring as freebusy_recurring;
 pub use itip::itip;
 pub use sieve::sieve;
 
