@@ -579,6 +579,7 @@ impl Services {
 
     /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`
     /// (`impl Moderation for Delivery`, FIX-01) без правил потока почты: письмо прошло их при приёме.
+    /// Журнал аудита — только в базу; в SIEM его выгружает роль maintenance ([`crate::audit_export`]).
     pub fn admin(
         &self,
         ext: &Registry,
@@ -588,8 +589,6 @@ impl Services {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
             audit_log: Arc::new(self.meta.clone()),
-            // Экспорт в SIEM (`admin.audit`) узел не запускает: без приёмников.
-            audit: Arc::new(tp_admin::Fanout::default()),
             delivery: Arc::new(self.meta.clone()),
             groups: Arc::new(self.meta.clone()),
             moderation: Arc::new(self.base_delivery(smtp)?),

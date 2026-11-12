@@ -43,6 +43,7 @@ use tp_smtp::{Mode, SmtpConfig, SmtpOutService};
 use tp_sys::{NodeResources, ResourceSnapshot, ResourcesConfig};
 
 use crate::acme;
+use crate::audit_export::AuditExport;
 use crate::infra;
 use crate::log_reader::LogSignals;
 use crate::modules;
@@ -345,6 +346,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         .page_size;
     // Показатели есть и при выключенной проверке: нулевые.
     let verify_probe = crate::metrics::register_verify(&metrics);
+    // Выгрузка журнала аудита из базы в SIEM (`admin.audit`, APP-59): роль maintenance, одна на кластер (лиза).
+    let audit_export = Arc::new(AuditExport::new(
+        Arc::new(meta.clone()),
+        leases.clone(),
+        holder.clone(),
+        store.clone(),
+        reloader.subscribe(),
+    ));
     let maintenance = Maintenance {
         index: Arc::new(meta.clone()),
         store: blob.clone(),
@@ -381,6 +390,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             probe: verify_probe,
             now: tp_blob::system_now(),
         }),
+        audit_export: Some(audit_export),
     };
     let mut setup = RoleSetup {
         cfg: &cfg,

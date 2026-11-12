@@ -124,6 +124,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "submissions mailbox audit",
         include_str!("../migrations/0027_submissions_mailbox_audit.sql"),
     ),
+    (
+        28,
+        "audit export",
+        include_str!("../migrations/0028_audit_export.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
