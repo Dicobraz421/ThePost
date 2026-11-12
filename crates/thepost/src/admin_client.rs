@@ -1822,6 +1822,7 @@ mod tests {
             senders: Arc::new(MemSenderLists::new()),
             mailbox_audit: Arc::new(MemMailboxAudit::new()),
             sync: Arc::new(MemSyncGate::new()),
+            oidc_issuer: None,
         };
         let cfg = AdminConfig {
             roles: vec![RoleBinding {

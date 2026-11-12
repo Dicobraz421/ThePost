@@ -44,6 +44,8 @@ pub use export::{
     export_pass,
 };
 pub use groups::Moderation;
-pub use init::{InitConfig, InitGranted, InitReply, InitRequest, OidcLogin, SessionInfo};
+pub use init::{
+    InitConfig, InitGranted, InitReply, InitRequest, OidcClient, OidcLogin, SessionInfo,
+};
 pub use server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 pub use sieve::{ScriptCheck, ScriptError};

@@ -15,9 +15,10 @@
 //!   проверкой, в том же ответе — значение сессии (`tps_…`, срок `admin.init.session_ttl`); дальше — только сессия
 //!   или OIDC Bearer. Роль сессии — администратор инсталляции. Сессии — в памяти узла: после перезапуска —
 //!   повторный `admin init --force` или вход через OIDC.
-//! - `GET /api/v1/session` — без входа: способы входа консоли — поставщик OIDC из `admin.oidc` ([`OidcLogin`];
-//!   не настроен — `{"oidc": null}`, вход только токеном `admin init`). Секретов в ответе нет: клиент консоли —
-//!   публичный (код авторизации с PKCE).
+//! - `GET /api/v1/session` — без входа: способы входа консоли — поставщик OIDC ([`OidcLogin`]: издатель — тот, чьи
+//!   токены проверяет узел, `auth.oidc.issuer` ([`crate::Deps::oidc_issuer`]); клиент консоли — `admin.oidc`,
+//!   [`OidcClient`]). Не настроен — `{"oidc": null}`, вход только токеном `admin init`. Секретов в ответе нет: клиент
+//!   консоли — публичный (код авторизации с PKCE).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -574,37 +575,26 @@ pub struct AdminSession {
     pub roles: Vec<AdminRole>,
 }
 
-/// Секция `admin.oidc`: вход в веб-консоль через поставщика OIDC (код авторизации с PKCE, публичный клиент).
-/// Издатель — тот же, что проверяет токены Admin API (`auth.oidc.issuer`).
+/// Секция `admin.oidc`: клиент веб-консоли у поставщика OIDC (код авторизации с PKCE, публичный клиент). Поставщик —
+/// `auth.oidc`: его издателя узел передаёт в [`crate::Deps::oidc_issuer`]; без `auth.oidc` секция — ошибка запуска.
 ///
 /// ```yaml
-/// oidc: { issuer: "https://idp.example.org/realms/mail", client_id: thepost-console, scope: "openid profile" }
+/// oidc: { client_id: thepost-console, scope: "openid profile" }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct OidcLogin {
-    /// Издатель (`iss`), `https://…`.
-    pub issuer: String,
+pub struct OidcClient {
     /// Идентификатор публичного клиента консоли у поставщика.
     pub client_id: String,
     /// Запрашиваемые области через пробел; нет — `openid`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub scope: Option<String>,
 }
 
-impl OidcLogin {
-    /// Проверяет значения: издатель — `https://узел…` без пробелов, клиент и области — непустая строка без
-    /// управляющих знаков.
+impl OidcClient {
+    /// Проверяет значения: клиент и области — непустая строка без управляющих знаков.
     pub fn check(&self) -> Result<()> {
         let plain = |s: &str| !s.trim().is_empty() && !s.chars().any(char::is_control);
-        let host = self.issuer.strip_prefix("https://").unwrap_or_default();
-        if host.is_empty() || host.starts_with('/') || self.issuer.chars().any(char::is_whitespace)
-        {
-            return Err(Error::invalid(format!(
-                "admin.oidc: issuer {:?} — ожидается https://узел[/путь]",
-                self.issuer
-            )));
-        }
         if !plain(&self.client_id) || !self.scope.as_deref().is_none_or(plain) {
             return Err(Error::invalid(
                 "admin.oidc: client_id и scope — непустые строки без управляющих знаков",
@@ -614,8 +604,20 @@ impl OidcLogin {
     }
 }
 
+/// Вход в консоль через поставщика OIDC: издатель из `auth.oidc`, клиент из `admin.oidc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct OidcLogin {
+    /// Издатель (`iss`) — тот, чьи токены проверяет Admin API (`auth.oidc.issuer`).
+    pub issuer: String,
+    /// Идентификатор публичного клиента консоли у поставщика.
+    pub client_id: String,
+    /// Запрашиваемые области через пробел; нет — `openid`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
 /// Способы входа консоли.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct SessionInfo {
     /// Поставщик OIDC; `null` — не настроен (вход только токеном `admin init`).
     pub oidc: Option<OidcLogin>,
@@ -634,13 +636,21 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
 )]
 pub(crate) struct Doc;
 
-/// Способы входа консоли: поставщик OIDC (`admin.oidc`). Без входа.
+/// Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`). Без входа.
 #[utoipa::path(get, path = "/api/v1/session", tag = "admin", security(()),
     responses((status = 200, body = SessionInfo)))]
 async fn session_info(State(a): State<Arc<Admin>>) -> Json<SessionInfo> {
-    Json(SessionInfo {
-        oidc: a.cfg.oidc.clone(),
-    })
+    let oidc = a
+        .cfg
+        .oidc
+        .as_ref()
+        .zip(a.d.oidc_issuer.as_ref())
+        .map(|(c, issuer)| OidcLogin {
+            issuer: issuer.clone(),
+            client_id: c.client_id.clone(),
+            scope: c.scope.clone(),
+        });
+    Json(SessionInfo { oidc })
 }
 
 /// Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится
@@ -743,7 +753,8 @@ mod tests {
         }
     }
 
-    /// Приёмка ADM-25: способы входа — без заголовка `Authorization`; с настройкой OIDC и без.
+    /// Приёмка ADM-25: способы входа — без заголовка `Authorization`; с настройкой OIDC и без. Издатель — из
+    /// `auth.oidc` (`Deps::oidc_issuer`), клиент — из `admin.oidc`.
     #[tokio::test]
     async fn session_info_without_login() {
         let env = Env::new();
@@ -751,8 +762,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(b, json!({"oidc": null}));
 
-        let oidc = OidcLogin {
-            issuer: "https://idp.example.org/realms/mail".into(),
+        let oidc = OidcClient {
             client_id: "thepost-console".into(),
             scope: None,
         };
@@ -767,36 +777,57 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
             b,
-            json!({"oidc": {"issuer": "https://idp.example.org/realms/mail", "client_id": "thepost-console"}})
+            json!({"oidc": {"issuer": crate::testenv::ISSUER, "client_id": "thepost-console"}})
         );
         let spec = serde_json::to_value(crate::server::openapi_spec()).expect("spec");
         assert_eq!(spec["paths"][SESSION_ROUTE]["get"]["security"], json!([{}]));
     }
 
     #[test]
-    fn oidc_login_check() {
-        let ok = OidcLogin {
-            issuer: "https://idp.example.org".into(),
+    fn oidc_client_check() {
+        let ok = OidcClient {
             client_id: "c".into(),
             scope: Some("openid profile".into()),
         };
         assert!(ok.check().is_ok());
         for bad in [
-            OidcLogin {
-                issuer: "http://idp.example.org".into(),
-                ..ok.clone()
-            },
-            OidcLogin {
+            OidcClient {
                 client_id: " ".into(),
                 ..ok.clone()
             },
-            OidcLogin {
+            OidcClient {
                 scope: Some(String::new()),
                 ..ok.clone()
             },
         ] {
             assert!(bad.check().is_err(), "{bad:?}");
         }
+        // Издатель задаётся в `auth.oidc`, не здесь.
+        let e = serde_json::from_value::<OidcClient>(
+            json!({"issuer": "https://idp.example.org", "client_id": "c"}),
+        );
+        assert!(e.is_err());
+    }
+
+    /// `admin.oidc` без `auth.oidc` (издателя нет) — ошибка конфигурации при запуске.
+    #[test]
+    fn oidc_client_requires_issuer() {
+        let cfg = crate::server::AdminConfig {
+            oidc: Some(OidcClient {
+                client_id: "thepost-console".into(),
+                scope: None,
+            }),
+            ..crate::testenv::config()
+        };
+        let d = crate::server::Deps {
+            oidc_issuer: None,
+            ..crate::testenv::deps()
+        };
+        let e = Admin::new(d, cfg).map(|_| ()).expect_err("no issuer");
+        assert!(
+            matches!(&e, Error::Invalid(m) if m.contains("auth.oidc")),
+            "{e:?}"
+        );
     }
 
     /// Приёмка ADM-11: init заводит домен, учётную запись с паролем и токен; токен обменивается на сессию один раз.
