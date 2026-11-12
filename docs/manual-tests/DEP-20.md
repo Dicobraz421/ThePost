@@ -14,15 +14,16 @@
 
 ## Прогон 2026-11-12
 
-Стенд и способ — как в [DEP-24](DEP-24.md) (контейнеры с systemd, Ansible 2.20, `beta-20261111.3`). Образы:
+Стенд и способ — как в [DEP-24](DEP-24.md) (контейнеры с systemd, Ansible 2.20, `beta-20261111.3`); код — ветка
+`w/deploy-16` после слияния с `main` (снимок OpenBao, DEP-23). Образы:
 `almalinux:9`, `quay.io/almalinuxorg/almalinux:10` (вариант x86-64-v2: процессор стенда без x86-64-v3, образ
 `almalinux:10` не запускается — «CPU does not support x86-64-v3»), `registry.red-soft.ru/ubi8/ubi` (РЕД ОС 8.0.3; со
 стенда реестр и репозитории РЕД ОС отвечают только в сети с MTU 1300 — образ перенесён через `docker save`).
 
 | ОС | glibc | Шаг 1 | Шаг 2 | doctor | Письмо | firewalld |
 |---|---|---|---|---|---|---|
-| AlmaLinux 9.8 | 2.34 | `ok=140 changed=92 failed=0` | `changed=0` | `OK` 26, `WARN` 3, `FAIL` 0 | `alice → bob`: 587 принято, в INBOX по IMAP | порты открыты (шаг 5) |
-| РЕД ОС 8.0.3 | 2.36 | `ok=140 changed=88 failed=0` | `changed=0` (третий прогон, после правки сравнения учётных данных) | `OK` 26, `WARN` 3, `FAIL` 0 | то же | не проверялся |
+| AlmaLinux 9.8 | 2.34 | `ok=141 changed=92 failed=0` | `changed=0` | `OK` 26, `WARN` 3, `FAIL` 0 | `alice → bob`: 587 принято, в INBOX по IMAP | порты открыты (шаг 5; прогон до слияния с `main`, firewalld поставлен в контейнер заранее) |
+| РЕД ОС 8.0.3 | 2.36 | `ok=142 changed=89 failed=0` | `changed=0` | `OK` 26, `WARN` 3, `FAIL` 0 | то же | не проверялся |
 | AlmaLinux 10 (x86-64-v2) | — | до `postgresql : Initialize PostgreSQL cluster`: chrony, thepost_pki, OpenBao — `ok`; `initdb` PGDG — «CPU ISA level is lower than required» | — | — | — | — |
 
 `WARN` — как в DEP-24 (`secrets.seal static`, `privileges.seccomp log`, `dns.dkim`).
