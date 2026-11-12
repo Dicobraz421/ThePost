@@ -2,7 +2,7 @@ import "@refinedev/antd/dist/reset.css";
 import "dayjs/locale/ru";
 
 import { ErrorComponent, ThemedLayout, ThemedTitle, useNotificationProvider } from "@refinedev/antd";
-import { Authenticated, Refine } from "@refinedev/core";
+import { Authenticated, Refine, usePermissions } from "@refinedev/core";
 import routerProvider, { CatchAllNavigate, DocumentTitleHandler, NavigateToResource } from "@refinedev/react-router";
 import { App as AntdApp, ConfigProvider } from "antd";
 import ruRU from "antd/locale/ru_RU";
@@ -11,6 +11,7 @@ import { Outlet, Route, Routes } from "react-router";
 
 import { Header } from "./components/header";
 import { i18nProvider } from "./i18n";
+import type { Schemas } from "./api/client";
 import { AccountCreate, AccountList, AccountShow } from "./pages/accounts";
 import { DomainCreate, DomainList, DomainShow } from "./pages/domains";
 import { GroupCreate, GroupEdit, GroupList } from "./pages/groups";
@@ -18,12 +19,21 @@ import { LoginPage } from "./pages/login";
 import { ModerationPage } from "./pages/moderation";
 import { OrganizationPage } from "./pages/organization";
 import { AccountTrash } from "./pages/trash";
+import { TransportPage } from "./pages/transport";
+import { accessControlProvider, allowed } from "./providers/access";
 import { authProvider } from "./providers/auth";
 import { dataProvider } from "./providers/data";
 
 dayjs.locale("ru");
 
 const Title = (props: { collapsed: boolean }) => <ThemedTitle {...props} text="The Post" />;
+
+/** Первый раздел по роли: аудитору доступен только журнал аудита. */
+function Home() {
+  const { data: roles, isLoading } = usePermissions<Schemas["AdminRole"][]>({});
+  if (isLoading) return null;
+  return <NavigateToResource resource={allowed(roles ?? ["installation_admin"], "organization", "list") ? "organization" : "audit"} />;
+}
 
 export function App() {
   return (
@@ -33,6 +43,7 @@ export function App() {
           routerProvider={routerProvider}
           dataProvider={dataProvider}
           authProvider={authProvider}
+          accessControlProvider={accessControlProvider}
           i18nProvider={i18nProvider}
           notificationProvider={useNotificationProvider}
           resources={[
@@ -59,6 +70,7 @@ export function App() {
               meta: { label: "Группы рассылки" },
             },
             { name: "moderation", list: "/moderation", meta: { label: "Модерация" } },
+            { name: "transport", list: "/transport", meta: { label: "Транспорт" } },
           ]}
           // Без внешних обращений (SRS 5.2): телеметрия Refine выключена.
           options={{ disableTelemetry: true, syncWithLocation: true, warnWhenUnsavedChanges: true }}
@@ -73,7 +85,7 @@ export function App() {
                 </Authenticated>
               }
             >
-              <Route index element={<NavigateToResource resource="organization" />} />
+              <Route index element={<Home />} />
               <Route path="/organization" element={<OrganizationPage />} />
               <Route path="/domains">
                 <Route index element={<DomainList />} />
@@ -92,13 +104,14 @@ export function App() {
                 <Route path=":id" element={<GroupEdit />} />
               </Route>
               <Route path="/moderation" element={<ModerationPage />} />
+              <Route path="/transport" element={<TransportPage />} />
               <Route path="*" element={<ErrorComponent />} />
             </Route>
             <Route
               path="/login"
               element={
                 <Authenticated key="login" fallback={<LoginPage />}>
-                  <NavigateToResource resource="organization" />
+                  <Home />
                 </Authenticated>
               }
             />

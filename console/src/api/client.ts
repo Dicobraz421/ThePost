@@ -21,7 +21,21 @@ export function loadSession(): Session | null {
   }
 }
 
+let me: { token?: string; data: Promise<Schemas["WhoAmI"]> } | undefined;
+
+/** Кто вошёл и его роли: один запрос `whoami` на сессию (меню и кнопки спрашивают роли многократно). */
+export function whoami() {
+  const token = loadSession()?.token;
+  if (!me || me.token !== token) {
+    const data = request<Schemas["WhoAmI"]>(`${API}/whoami`).then((r) => r.data);
+    data.catch(() => (me = undefined));
+    me = { token, data };
+  }
+  return me.data;
+}
+
 export function saveSession(s: Session | null) {
+  me = undefined;
   if (s) sessionStorage.setItem(SESSION_KEY, JSON.stringify(s));
   else sessionStorage.removeItem(SESSION_KEY);
 }
@@ -63,7 +77,8 @@ export async function request<T>(path: string, o: RequestOptions = {}): Promise<
   }
   if (!resp.ok) {
     const p = (data ?? {}) as Partial<Schemas["Problem"]>;
-    const error: HttpError = { message: p.detail ?? p.title ?? resp.statusText, statusCode: resp.status };
+    // `problem` — тело ответа целиком: расширения RFC 9457 (ошибки текста скрипта Sieve — `errors`).
+    const error: HttpError = { message: p.detail ?? p.title ?? resp.statusText, statusCode: resp.status, problem: data };
     throw error;
   }
   // Продолжение списка: `Link: <…&after=…>; rel="next"` (RFC 8288).

@@ -97,7 +97,7 @@ test("чтение, создание, замена, удаление и прои
 test("ошибка API (RFC 9457) — HttpError для уведомления", async () => {
   await signIn();
   stubApi({ [`POST /api/v1/orgs/${ORG}/domains`]: { status: 409, body: { status: 409, title: "Conflict", detail: "домен уже есть" } } });
-  await expect(dataProvider.create({ resource: "domains", variables: { name: "example.org" } })).rejects.toEqual({
+  await expect(dataProvider.create({ resource: "domains", variables: { name: "example.org" } })).rejects.toMatchObject({
     message: "домен уже есть",
     statusCode: 409,
   });

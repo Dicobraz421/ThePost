@@ -52,6 +52,8 @@ const ru: Record<string, string> = {
   "groups.titles.create": "Новая группа",
   "groups.titles.edit": "Группа",
   "moderation.moderation": "Модерация",
+  "transport.transport": "Транспорт",
+  "documentTitle.transport.list": "Транспорт — The Post",
   "documentTitle.groups.list": "Группы рассылки — The Post",
   "documentTitle.groups.create": "Новая группа — The Post",
   "documentTitle.groups.edit": "Группа — The Post",

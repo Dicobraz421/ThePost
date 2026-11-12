@@ -1,7 +1,7 @@
 // Вход в консоль (SRS 5.2): одноразовый токен `thepost admin init` (META-43) или OIDC с PKCE.
 import type { AuthProvider } from "@refinedev/core";
 
-import { API, getOrg, loadSession, request, saveSession, type Schemas, setOrg } from "../api/client";
+import { API, getOrg, loadSession, request, saveSession, type Schemas, setOrg, whoami } from "../api/client";
 
 /**
  * Ответ `GET /api/v1/session`: поставщик OIDC, если настроен. Операции в схеме узла пока нет —
@@ -45,7 +45,7 @@ async function login(p: LoginParams) {
   const user = await manager.signinRedirectCallback();
   await manager.removeUser();
   saveSession({ token: user.access_token, expires_at: new Date((user.expires_at ?? 0) * 1000).toISOString() });
-  if (!getOrg()) setOrg((await request<Schemas["WhoAmI"]>(`${API}/whoami`)).data.tenant);
+  if (!getOrg()) setOrg((await whoami()).tenant);
 }
 
 export const authProvider: AuthProvider = {
@@ -65,6 +65,6 @@ export const authProvider: AuthProvider = {
   // Истёкшая сессия не загружается: консоль возвращает на экран входа.
   check: async () => (loadSession() ? { authenticated: true } : { authenticated: false, logout: true, redirectTo: "/login" }),
   onError: async (e: { statusCode?: number }) => (e?.statusCode === 401 ? { logout: true, redirectTo: "/login" } : {}),
-  getIdentity: async () => (await request<Schemas["WhoAmI"]>(`${API}/whoami`)).data,
-  getPermissions: async () => (await request<Schemas["WhoAmI"]>(`${API}/whoami`)).data.roles,
+  getIdentity: whoami,
+  getPermissions: async () => (await whoami()).roles,
 };
