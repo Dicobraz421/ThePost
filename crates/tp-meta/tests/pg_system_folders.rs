@@ -4,7 +4,7 @@
 mod common;
 
 use tp_contracts::meta::{
-    AccountScope, AccountStore, AccountUpsert, ChangeLog, MailboxStore, SpecialUse,
+    AccountKind, AccountScope, AccountStore, AccountUpsert, ChangeLog, MailboxStore, SpecialUse,
 };
 use tp_contracts::{AccountId, DomainId, TenantId};
 use tp_meta::{PgMeta, schema};
@@ -138,6 +138,8 @@ async fn raw_account_with_inbox_filled_on_login() {
                 display_name: "Old".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -180,6 +182,8 @@ async fn raw_account_with_inbox_filled_on_login() {
             display_name: "Old".into(),
             external_id: None,
             enabled: true,
+            aliases: Vec::new(),
+            kind: AccountKind::User,
         },
     )
     .await

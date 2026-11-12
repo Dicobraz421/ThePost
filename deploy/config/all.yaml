@@ -21,21 +21,30 @@ blob:
 
 roles: [all]
 
-# Сертификат клиентских протоколов (SMTP, IMAP, JMAP); перечитывается без перезапуска (tls.reload_interval).
+# Сертификат клиентских протоколов (SMTP, IMAP, ManageSieve, JMAP): цепочка — файл, ключ — только в OpenBao (секрет
+# thepost/tls#key, решение 100; на диске его нет). Пару узел перечитывает без перезапуска (tls.reload_interval).
 tls:
   cert_file: /etc/thepost/tls/fullchain.pem
-  key_file: /etc/thepost/tls/privkey.pem
+  key: { secret: "thepost/tls#key" }
 
 # Слушатели — на все адреса: порты ниже 1024 под systemd слушают юниты thepost-*.socket (ListenStream=<порт>),
-# узел берёт сокет по порту (решение 102). Admin API — только внутренний адрес (SRS 6.8).
+# узел берёт сокет по порту (решение 102). Admin API — только внутренний адрес (SRS 6.8). Календари и контакты
+# (роль dav: /dav/, /.well-known/caldav, /.well-known/carddav) — на слушателе jmap, один порт 443 с JMAP; отдельный
+# адрес — http.dav.
 http:
   jmap: { listen: "0.0.0.0:443" }
   admin: { listen: "127.0.0.1:8443" }
+  # dav: { listen: "0.0.0.0:9443" }
 imap:
   listeners:
     - listen: "0.0.0.0:143"
     - listen: "0.0.0.0:993"
       implicit_tls: true
+# ManageSieve (RFC 5804): STARTTLS на 4190, сертификат — секция tls.
+sieve:
+  managesieve:
+    listen:
+      - listen: "0.0.0.0:4190"
 smtp:
   hostname: mail.example.ru
   inbound:
@@ -44,6 +53,24 @@ smtp:
     - listen: "0.0.0.0:587"
     - listen: "0.0.0.0:465"
       implicit_tls: true
+
+# Роль maintenance (входит в пресет): раз в purge_interval — очистка по сроку надгробий DAV, журнала автоответов,
+# журнала доставки и токенов `thepost admin init`; сроки хранения — в meta. Проверка целостности BLOB — verify.
+maintenance:
+  purge_interval: 1h
+  admin_token_retention: 30d
+  verify: { at: "03:00", interval: 24h }
+# Сроки очистки — секция meta (по умолчанию):
+#   meta:
+#     dav: { tombstone_ttl: 90d }        # надгробия DAV; старше — клиенту полная синхронизация
+#     sieve: { vacation_log_ttl: 90d }   # журнал автоответов
+#     delivery: { retention: 30d }       # журнал доставки
+
+# Календари и контакты (роль dav): лимиты CalDAV и CardDAV; полный перечень — thepost config schema.
+dav:
+  max_request_size: 1048576
+  max_object_size: 1048576
+  expand_horizon: 730d
 
 # Секреты — только из хранилища (OpenBao или Vault), канал — TLS. Вход AppRole: secret_id — учётные данные
 # systemd (LoadCredential в thepost.service). Поля секции — по PLT-12.

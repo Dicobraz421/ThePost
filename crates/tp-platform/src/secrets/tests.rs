@@ -753,15 +753,10 @@ async fn pki_certificate_is_renewed_before_expiry_without_restart() {
     );
     let tls = TlsConfig {
         cert_file: dir.0.join("absent-chain.pem"),
-        key_file: dir.0.join("absent-key.pem"),
-        key: Some(r("pki/issue/node#bundle")),
+        key: r("pki/issue/node#bundle"),
         ..TlsConfig::default()
     };
-    let certs = Arc::new(
-        TlsCerts::load_with_secrets(&tls, store.clone())
-            .await
-            .expect("load"),
-    );
+    let certs = Arc::new(TlsCerts::load(&tls, store.clone()).await.expect("load"));
     assert_eq!(listener_cert(&certs).await, der(CERT_A));
     let request = mock.with(|st| st.pki_requests[0].clone());
     assert_eq!(

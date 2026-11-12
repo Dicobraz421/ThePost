@@ -67,8 +67,8 @@ pub(crate) fn object_index(
     Ok(idx)
 }
 
-/// Календарь по умолчанию для приглашений (`schedule-default-calendar-URL`): `calendar`, иначе первый календарь с
-/// VEVENT; у учётной записи без календарей создаются календари по умолчанию.
+/// Календарь по умолчанию для приглашений (`schedule-default-calendar-URL`): назначенный
+/// (`Collection::is_default`, CTR-56), иначе `calendar`, иначе первый календарь с VEVENT; у учётной записи без календарей создаются календари по умолчанию.
 pub(crate) async fn default_calendar(
     store: &dyn DavStore,
     scope: AccountScope,
@@ -82,7 +82,12 @@ pub(crate) async fn default_calendar(
     Ok(list
         .iter()
         .filter(events)
-        .find(|c| c.name == path::DEFAULT_CALENDAR)
+        .find(|c| c.is_default)
+        .or_else(|| {
+            list.iter()
+                .filter(events)
+                .find(|c| c.name == path::DEFAULT_CALENDAR)
+        })
         .or_else(|| list.iter().find(events))
         .cloned())
 }

@@ -14,22 +14,23 @@ thepost_binary_checksum: ""
 thepost_binary_src: "{{ playbook_dir }}/../../target/release/thepost"
 thepost_binary_path: /usr/local/bin/thepost
 
-# Сертификат клиентских протоколов (SMTP, IMAP, JMAP, служебный HTTP; решение 101):
+# Сертификат клиентских протоколов (SMTP, IMAP, ManageSieve, JMAP, служебный HTTP; решение 101). Ключ — только в
+# OpenBao: секрет thepost/tls#key (tls.key пресета, решение 100), на диске ВМ его нет; цепочка — файл секции tls.
+# thepost перечитывает пару без перезапуска.
 #   acme     — встроенный клиент ACME thepost (по умолчанию для публичного имени; секция acme, SRS 6.2, HTTP-01 на
-#              порту 80 — сокет thepost-http.socket, firewalld открывает 80): сертификат — /var/lib/thepost/tls,
-#              закрытый ключ — в OpenBao (thepost_acme_key_secret, PLT-29); продление — сам thepost без перезапуска;
+#              порту 80 — сокет thepost-http.socket, firewalld открывает 80): ключ записывает сам узел (PLT-29),
+#              цепочка — в /var/lib/thepost/tls; продление — сам thepost;
 #   internal — внутренний CA роли thepost_pki (стенд, тест; клиентам нужен {{ thepost_pki_dir }}/ca.pem);
-#   files    — свои PEM с управляющей машины: thepost_tls_cert_src (цепочка), thepost_tls_key_src.
+#   files    — свои PEM с управляющей машины: thepost_tls_cert_src (цепочка), thepost_tls_key_src (ключ — в OpenBao).
 thepost_tls_mode: acme
 thepost_tls_names: ["{{ thepost_hostname }}"]
 thepost_tls_cert_src: ""
 thepost_tls_key_src: ""
 # ACME: контакт учётной записи и каталог (пусто — Let's Encrypt; staging —
-# https://acme-staging-v02.api.letsencrypt.org/directory). Ключ сертификата — секрет OpenBao (tls.key; запись —
+# https://acme-staging-v02.api.letsencrypt.org/directory). Ключ сертификата — секрет tls.key пресета (запись —
 # политика узла deploy/openbao/thepost-policy.hcl).
 thepost_acme_email: ""
 thepost_acme_directory_url: ""
-thepost_acme_key_secret: "thepost/tls#key"
 
 # Внутренние каналы — только TLS с проверкой имени (решение 2026-10-30): CA — роль thepost_pki.
 thepost_internal_ca_file: "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/ca.pem"
@@ -42,13 +43,26 @@ thepost_db_urls: []
 thepost_db_failover: {}
 thepost_secrets_url: "{{ openbao_api_addr | default('https://localhost:8200') }}"
 thepost_secrets_role_id_file: "{{ openbao_thepost_role_id_file | default('/etc/thepost/openbao/role_id') }}"
+thepost_secrets_secret_id_file: >-
+  {{ openbao_thepost_secret_id_file | default('/etc/thepost/credentials/openbao-secret-id') }}
+# Узел OpenBao с токеном администратора (роль openbao, openbao_cli_env), через который роль записывает ключ TLS в
+# секрет thepost/tls: эталон SMB — эта ВМ; малый Enterprise — узел инициализации кластера OpenBao.
+thepost_openbao_from: "{{ inventory_hostname }}"
 
-# Порты ниже 1024 (25, 465, 587, 143, 993, 443) слушает только systemd (юниты thepost-*.socket, решение 102) — у
-# процесса нет capabilities (SRS 2.7, DEP-08). Слушатели — из пресета (0.0.0.0:<порт>); другой адрес — drop-in юнита
-# сокета (ListenStream=) и тот же адрес в thepost_config_extra.
-thepost_sockets: [smtp, submissions, submission, imap, imaps, https]
+# Порты клиентских протоколов (25, 465, 587, 143, 993, 443 и ManageSieve 4190) слушает только systemd (юниты
+# thepost-*.socket, решение 102) — у процесса нет capabilities (SRS 2.7, DEP-08), перезапуск не закрывает сокеты.
+# Слушатели — из пресета (0.0.0.0:<порт>); другой адрес — drop-in юнита сокета (ListenStream=) и тот же адрес в
+# thepost_config_extra.
+thepost_sockets: [smtp, submissions, submission, imap, imaps, https, managesieve]
 # Admin API — только внутренний адрес (SRS 6.8): loopback, частные сети.
 thepost_admin_listen: "127.0.0.1:8443"
+# Календари и контакты (роль dav: /dav/, /.well-known/caldav и carddav): пусто — на слушателе jmap, один порт 443
+# с JMAP; адрес:порт — отдельный слушатель http.dav (порт — и в thepost_firewall_ports). Лимиты — секция dav.
+thepost_dav_listen: ""
+thepost_dav: {}
+# Роль maintenance (секция maintenance): период очистки по сроку и срок токенов admin init; сроки хранения
+# надгробий DAV и журналов — thepost_config_extra.meta (dav.tombstone_ttl, sieve.vacation_log_ttl, delivery.retention).
+thepost_maintenance: { purge_interval: 1h, admin_token_retention: 30d }
 # Владелец схемы для миграций (database.owner; роль postgresql, секрет thepost/db-owner в OpenBao): узел входит
 # ролью thepost (thepost_app), схему меняет только при запуске миграций (meta.migrate_on_start).
 thepost_db_owner_role: "{{ postgresql_owner_role | default('thepost_owner') }}"
@@ -58,8 +72,9 @@ thepost_db_owner_role: "{{ postgresql_owner_role | default('thepost_owner') }}"
 thepost_local_units: >-
   {{ [(postgresql_service | default('postgresql')) ~ '.service', 'openbao.service', 'rspamd.service']
      + (['clamav-milter.service'] if thepost_clamav | bool else []) }}
-# Порты клиентских протоколов в firewalld (если он включён): SMTP, submissions, submission, IMAP, IMAPS, HTTPS.
-thepost_firewall_ports: [25, 465, 587, 143, 993, 443]
+# Порты клиентских протоколов в firewalld (если он включён): SMTP, submissions, submission, IMAP, IMAPS, HTTPS,
+# ManageSieve.
+thepost_firewall_ports: [25, 465, 587, 143, 993, 443, 4190]
 
 # Фильтры Milter: Rspamd (роль rspamd) и, при thepost_clamav, clamav-milter (роль clamav_milter).
 thepost_rspamd_milter_address: "{{ rspamd_milter_address | default('127.0.0.1:11332') }}"

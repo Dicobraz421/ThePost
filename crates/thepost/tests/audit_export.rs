@@ -18,7 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use thepost::doctor::{self, Status};
-use thepost::doctor_dns::Dns;
+use thepost::doctor_dns::{Dns, SrvRecord};
 use thepost::serve::{ServeOptions, start};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -41,6 +41,9 @@ struct NoDns;
 #[async_trait]
 impl Dns for NoDns {
     async fn mx(&self, _: &str) -> Result<Vec<(u16, String)>, String> {
+        Ok(Vec::new())
+    }
+    async fn srv(&self, _: &str) -> Result<Vec<SrvRecord>, String> {
         Ok(Vec::new())
     }
     async fn txt(&self, _: &str) -> Result<Vec<String>, String> {

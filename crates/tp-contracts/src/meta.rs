@@ -42,6 +42,17 @@ pub struct AccountScope {
 
 // ---------- Учётные записи ----------
 
+/// Вид учётной записи (CTR-48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKind {
+    /// Пользователь (или общий ящик).
+    User,
+    /// Ресурс: переговорная, оборудование (iCalendar `CUTYPE=ROOM`, `RESOURCE`). Приглашения обрабатываются по
+    /// правилам бронирования ([`crate::sharing::BookingPolicy`], [`crate::sharing::ResourceStore`]).
+    Resource,
+}
+
 /// Учётная запись.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
@@ -59,6 +70,20 @@ pub struct Account {
     pub external_id: Option<String>,
     /// Вход разрешён.
     pub enabled: bool,
+    /// Псевдонимы (CTR-53): адреса каталога (`crate::auth::DirAlias`), доставляемые этой учётной записи, кроме
+    /// основного, — в нижнем регистре, без повторов и catch-all `@domain`, в порядке каталога. Задаёт
+    /// [`AccountUpsert::aliases`]; все адреса учётной записи — [`Account::addresses`].
+    pub aliases: Vec<String>,
+    /// Вид (CTR-48): пользователь или ресурс. Задаёт [`AccountUpsert::kind`].
+    pub kind: AccountKind,
+}
+
+impl Account {
+    /// Адреса, на которые учётной записи доставляется почта (CTR-53; `calendar-user-address-set` CalDAV, участник
+    /// приглашения): основной (имя входа) первым, затем [`Account::aliases`] — правило [`account_addresses`].
+    pub fn addresses(&self) -> Vec<String> {
+        account_addresses(&self.login, self.aliases.iter().map(String::as_str))
+    }
 }
 
 /// Данные для создания или обновления учётной записи (синхронизация с каталогом).
@@ -75,6 +100,12 @@ pub struct AccountUpsert {
     pub external_id: Option<String>,
     /// Вход разрешён.
     pub enabled: bool,
+    /// Псевдонимы каталога с целью — этой учётной записью (CTR-53), в любом регистре; заменяют прежние. Хранилище
+    /// приводит их правилом [`account_addresses`] (нижний регистр, без повторов, основного адреса и catch-all) —
+    /// [`Account::aliases`].
+    pub aliases: Vec<String>,
+    /// Вид учётной записи (CTR-48); при обновлении заменяет прежний.
+    pub kind: AccountKind,
 }
 
 /// Состояние ящика учётной записи (CTR-35, решение 2026-11-04-exchange-parity «Удалённые ящики»).
@@ -127,6 +158,38 @@ pub struct QuotaUsage {
     pub messages: u64,
     /// Лимит из [`PolicyResolver`]; `None` — без ограничения.
     pub limit_bytes: Option<u64>,
+}
+
+/// Адреса учётной записи для [`Account::addresses`] (CTR-53): основной `primary` первым, затем `aliases` в
+/// порядке перечисления; нижний регистр, без повторов. Пропускаются catch-all (`@domain`, пустая локальная часть —
+/// `crate::auth::DirAlias`), пустые строки и строки без `@`.
+pub fn account_addresses<'a>(
+    primary: &'a str,
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for address in std::iter::once(primary).chain(aliases) {
+        let address = address.trim().to_lowercase();
+        let personal = address
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+        if personal && !out.contains(&address) {
+            out.push(address);
+        }
+    }
+    out
+}
+
+/// Псевдонимы учётной записи для хранения ([`Account::aliases`]): `aliases` по правилу [`account_addresses`] без
+/// основного адреса `primary`.
+pub fn account_aliases<'a>(
+    primary: &'a str,
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let primary = primary.trim().to_lowercase();
+    let mut out = account_addresses("", aliases);
+    out.retain(|a| *a != primary);
+    out
 }
 
 /// Учётные записи организации.
@@ -841,6 +904,38 @@ mod tests {
         fn _c(_: Arc<dyn ChangeLog>) {}
         fn _p(_: Arc<dyn PolicyResolver>) {}
         fn _ps(_: Arc<dyn PolicyStore>) {}
+    }
+
+    #[test]
+    fn addresses_rule() {
+        // Основной первым, псевдонимы — в нижнем регистре, без повторов и без catch-all.
+        assert_eq!(
+            account_addresses(
+                "Ann@Example.com",
+                [
+                    "sales@example.com",
+                    "@example.com",
+                    "ANN@example.com",
+                    "Info@Example.COM",
+                    "sales@example.com",
+                    "",
+                    "no-at",
+                ],
+            ),
+            ["ann@example.com", "sales@example.com", "info@example.com"]
+        );
+        assert_eq!(
+            account_aliases(
+                "Ann@Example.com",
+                ["ANN@example.com", "@example.com", "S@Example.com"]
+            ),
+            ["s@example.com"]
+        );
+        // Имя входа — не адрес: остаются только псевдонимы.
+        assert_eq!(
+            account_addresses("ann", ["a@example.com"]),
+            ["a@example.com"]
+        );
     }
 
     #[test]

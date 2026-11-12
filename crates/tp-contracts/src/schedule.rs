@@ -125,7 +125,9 @@ impl FromStr for ItipMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ItipSource {
-    /// Планирование внутри организации (`tp-dav`, `tp-jmap`): отправитель — адрес учётной записи организации.
+    /// Планирование внутри организации: отправитель — адрес учётной записи организации. Источники — `tp-dav`, `tp-jmap`
+    /// и приглашение из почтового клиента (submission, JMAP `EmailSubmission`; решение 78, SMTP-36), если `From` письма
+    /// принадлежит вошедшей учётной записи (свой адрес, псевдоним, право Send As); иначе письмо остаётся письмом.
     Internal,
     /// Письмо iMIP (RFC 6047, `tp-smtp`): отправитель — адрес `From`, прошедший DMARC.
     Imip,

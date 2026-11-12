@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tp_contracts::acl::AclStore;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountStore, AccountUpsert, Flag, Flags, MailboxStore, MessageQuery,
-    MessageStore, NewMailbox, QuotaUsage, SpecialUse,
+    Account, AccountKind, AccountScope, AccountStore, AccountUpsert, Flag, Flags, MailboxStore,
+    MessageQuery, MessageStore, NewMailbox, QuotaUsage, SpecialUse,
 };
 use tp_contracts::{AccountId, DomainId, MailboxId, Result, TenantId};
 use tp_testkit::{MemAcl, MemMetadata};
@@ -171,6 +171,8 @@ impl Ext {
                     display_name: "Bob".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await
@@ -586,7 +588,7 @@ async fn shared_access_audited() {
         assert_eq!(entry.actor_account, Some(bob.account));
         assert_eq!(entry.actor_kind, AuditActorKind::Delegate);
         assert_eq!(entry.object.mailbox, Some(projects));
-        assert_eq!(entry.client.as_deref(), Some("imap 192.0.2.1"));
+        assert_eq!(entry.client.as_deref(), Some("imap 192.0.2.7"));
     }
     assert!(e[1].object.message.is_some());
     assert_eq!(e[1].object.message, e[2].object.message);

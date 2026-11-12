@@ -71,8 +71,14 @@ async fn bruteforce_from_trusted_source_is_still_blocked() {
     let g = guarded(3).await;
     for _ in 0..3 {
         assert!(limiter.check_ip(trusted).is_allowed());
-        assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+        assert_eq!(
+            g.verify(password("wrong"), Some(trusted)).await,
+            Err(Error::Forbidden)
+        );
     }
     assert!(limiter.check_ip(trusted).is_allowed());
-    assert_eq!(g.verify(password("right")).await, Err(Error::Forbidden));
+    assert_eq!(
+        g.verify(password("right"), Some(trusted)).await,
+        Err(Error::Forbidden)
+    );
 }

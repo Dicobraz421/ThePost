@@ -1,13 +1,12 @@
 # Политика узла thepost — общая для compose, Helm и Ansible:
-# чтение секретов KV v2 `thepost`, продление своего токена и аренд; запись — только ключ TLS встроенного ACME.
+# чтение секретов KV v2 `thepost`, запись — только ключа TLS слушателей; продление своего токена и аренд.
 path "thepost/data/*" {
   capabilities = ["read"]
 }
 
-# Ключ сертификата встроенного клиента ACME (tls.key: { secret: "thepost/tls#key" }, PLT-29): узел пишет новый ключ
-# при выпуске и продлении (решение 101).
+# Ключ TLS слушателей (`tls.key`, решение 100): встроенный ACME записывает выпущенный ключ новой версией (PLT-29).
 path "thepost/data/tls" {
-  capabilities = ["create", "update", "read"]
+  capabilities = ["read", "create", "update"]
 }
 
 # Пароль учётной записи PostgreSQL «только чтение» (thepost_readonly) — администратору и отчётам, не узлу (DEP-08).

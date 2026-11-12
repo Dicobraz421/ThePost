@@ -68,6 +68,7 @@ fn person(n: usize) -> DirAccount {
         enabled: true,
         attributes: BTreeMap::new(),
         org: DirOrg::default(),
+        hidden_from_gal: false,
     }
 }
 

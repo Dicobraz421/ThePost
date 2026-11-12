@@ -18,12 +18,19 @@
   'database': {'url': thepost_db_url, 'owner': {'user': thepost_db_owner_role}},
   'http': {'admin': {'listen': thepost_admin_listen}},
   'smtp': {'hostname': thepost_hostname, 'milter': {'filters': filters}},
+  'maintenance': thepost_maintenance,
   'secrets': {
     'url': thepost_secrets_url,
     'tls': {'ca_file': thepost_internal_ca_file},
     'auth': {'approle': {'role_id_file': thepost_secrets_role_id_file}},
   },
 } -%}
+{%- if thepost_dav_listen | length > 0 -%}
+{%-   set node = node | combine({'http': {'dav': {'listen': thepost_dav_listen}}}, recursive=true) -%}
+{%- endif -%}
+{%- if thepost_dav | length > 0 -%}
+{%-   set node = node | combine({'dav': thepost_dav}, recursive=true) -%}
+{%- endif -%}
 {%- if thepost_db_urls | length > 0 -%}
 {%-   set node = node | combine({'database': {'urls': thepost_db_urls}}, recursive=true) -%}
 {%- endif -%}
@@ -33,7 +40,7 @@
 {%- if thepost_db_failover | length > 0 -%}
 {%-   set node = node | combine({'database': {'failover': thepost_db_failover}}, recursive=true) -%}
 {%- endif -%}
-{#- ACME: сертификат — в /var/lib/thepost/tls (StateDirectory юнита), ключ — в OpenBao (tls.key, PLT-29). -#}
+{#- ACME: цепочка — в /var/lib/thepost/tls (StateDirectory юнита); ключ (tls.key пресета) пишет сам узел (PLT-29). -#}
 {%- if acme -%}
 {%-   set acme_section = {'enabled': true, 'domains': thepost_tls_names, 'contact': ['mailto:' ~ thepost_acme_email],
                           'state_dir': '/var/lib/thepost/acme'} -%}
@@ -41,8 +48,7 @@
 {%-     set acme_section = acme_section | combine({'directory_url': thepost_acme_directory_url}) -%}
 {%-   endif -%}
 {%-   set node = node | combine({'acme': acme_section,
-                                'tls': {'cert_file': '/var/lib/thepost/tls/fullchain.pem',
-                                        'key': {'secret': thepost_acme_key_secret}}}, recursive=true) -%}
+                                'tls': {'cert_file': '/var/lib/thepost/tls/fullchain.pem'}}, recursive=true) -%}
 {%- endif -%}
 # {{ ansible_managed }}
 # The Post, профиль SMB (deploy/ansible/smb.yml): пресет deploy/config/all.yaml + значения инвентаря.

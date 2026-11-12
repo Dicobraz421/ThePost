@@ -1067,6 +1067,8 @@ mod group_sync {
             display_name: login.to_owned(),
             external_id: external_id.map(str::to_owned),
             enabled: true,
+            aliases: Vec::new(),
+            kind: tp_contracts::meta::AccountKind::User,
         };
         let alice = meta
             .upsert(T, upsert("alice@example.org", Some(ALICE_ID)))

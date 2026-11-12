@@ -25,7 +25,7 @@ use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_contracts::config::duration;
-use tp_contracts::meta::{Account, AccountUpsert, Policy, PolicyTarget};
+use tp_contracts::meta::{Account, AccountKind, AccountUpsert, Policy, PolicyTarget};
 use tp_contracts::retention::TrashPurgeRule;
 use tp_contracts::transport::normalize_domain;
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
@@ -437,6 +437,8 @@ async fn create_account(
                     display_name,
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await?;
@@ -533,6 +535,8 @@ async fn patch_account(
                     display_name,
                     external_id: None,
                     enabled: p.enabled.unwrap_or(acc.enabled),
+                    aliases: acc.aliases,
+                    kind: acc.kind,
                 },
             )
             .await?;
@@ -1174,6 +1178,8 @@ mod tests {
                     display_name: "Из каталога".into(),
                     external_id: Some("guid-1".into()),
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: tp_contracts::meta::AccountKind::User,
                 },
             )
             .await
