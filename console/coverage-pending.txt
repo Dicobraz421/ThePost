@@ -1,12 +1,5 @@
 # Операции Admin API без экрана консоли (UI-02): «МЕТОД путь», по одной в строке.
 # Экран готов — строку убрать и добавить операцию в src/api/coverage.ts.
-GET /api/v1/orgs/{org}/accounts
-POST /api/v1/orgs/{org}/accounts
-GET /api/v1/orgs/{org}/accounts/{account}
-GET /api/v1/orgs/{org}/accounts/{account}/app-passwords
-POST /api/v1/orgs/{org}/accounts/{account}/app-passwords
-DELETE /api/v1/orgs/{org}/accounts/{account}/app-passwords/{id}
-PUT /api/v1/orgs/{org}/accounts/{account}/policy
 GET /api/v1/orgs/{org}/accounts/{account}/trash
 GET /api/v1/orgs/{org}/accounts/{account}/trash-purge
 GET /api/v1/orgs/{org}/accounts/{account}/trash/hidden

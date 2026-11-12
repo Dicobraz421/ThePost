@@ -11,6 +11,7 @@ import { Outlet, Route, Routes } from "react-router";
 
 import { Header } from "./components/header";
 import { i18nProvider } from "./i18n";
+import { AccountCreate, AccountList, AccountShow } from "./pages/accounts";
 import { DomainCreate, DomainList, DomainShow } from "./pages/domains";
 import { LoginPage } from "./pages/login";
 import { OrganizationPage } from "./pages/organization";
@@ -40,6 +41,13 @@ export function App() {
               show: "/domains/:id",
               meta: { label: "Домены" },
             },
+            {
+              name: "accounts",
+              list: "/accounts",
+              create: "/accounts/create",
+              show: "/accounts/:id",
+              meta: { label: "Учётные записи" },
+            },
           ]}
           // Без внешних обращений (SRS 5.2): телеметрия Refine выключена.
           options={{ disableTelemetry: true, syncWithLocation: true, warnWhenUnsavedChanges: true }}
@@ -60,6 +68,11 @@ export function App() {
                 <Route index element={<DomainList />} />
                 <Route path="create" element={<DomainCreate />} />
                 <Route path=":id" element={<DomainShow />} />
+              </Route>
+              <Route path="/accounts">
+                <Route index element={<AccountList />} />
+                <Route path="create" element={<AccountCreate />} />
+                <Route path=":id" element={<AccountShow />} />
               </Route>
               <Route path="*" element={<ErrorComponent />} />
             </Route>

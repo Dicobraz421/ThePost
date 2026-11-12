@@ -13,4 +13,11 @@ export const covered: Record<string, string> = {
   "GET /api/v1/orgs/{org}/domains/{domain}": "pages/domains.tsx",
   "DELETE /api/v1/orgs/{org}/domains/{domain}": "pages/domains.tsx",
   "PUT /api/v1/orgs/{org}/domains/{domain}/policy": "pages/domains.tsx",
+  "GET /api/v1/orgs/{org}/accounts": "pages/accounts.tsx",
+  "POST /api/v1/orgs/{org}/accounts": "pages/accounts.tsx",
+  "GET /api/v1/orgs/{org}/accounts/{account}": "pages/accounts.tsx",
+  "PUT /api/v1/orgs/{org}/accounts/{account}/policy": "pages/accounts.tsx",
+  "GET /api/v1/orgs/{org}/accounts/{account}/app-passwords": "pages/accounts.tsx",
+  "POST /api/v1/orgs/{org}/accounts/{account}/app-passwords": "pages/accounts.tsx",
+  "DELETE /api/v1/orgs/{org}/accounts/{account}/app-passwords/{id}": "pages/accounts.tsx",
 };
