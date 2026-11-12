@@ -23,6 +23,9 @@
 //!   одну организацию);
 //! - доверенные источники ([`crate::sources`], SMTP-20): приложение — внешние получатели только при `external`,
 //!   без проверок SPF/DKIM/DMARC; шлюз без данных об исходном клиенте — результаты проверок шлюза;
+//! - фильтры Milter ([`crate::milter`]) двух профилей: приём — smtp-in; исходящая почта — submission и
+//!   [`Delivery::submit`] (JMAP EmailSubmission, SMTP-27), до правил потока: отказ фильтра — отказ отправки,
+//!   изменённые заголовки — дальше по ним;
 //! - правила потока почты ([`Delivery::with_mail_flow`], `MailFlow`, SMTP-22) — один раз на письмо: smtp-in после
 //!   Milter, submission и [`Delivery::submit`] — до точек принятия решений и очереди; `Reject` — `550 5.7.1`,
 //!   `Drop` — `250` без доставки, изменённые конверт и тело — дальше по ним, `matched` — в журнал доставки;
@@ -85,12 +88,13 @@ use tp_contracts::{AccountId, Error, MailboxId, QueueId, Result, TenantId};
 
 use crate::address::Addressing;
 use crate::authcheck::AuthCheck;
+use crate::config::MilterProfile;
 use crate::config::{DeliveryConfig, QuotaReject, SmtpConfig};
 use crate::dsn::{self, DsnSink};
 use crate::forward::Forwarding;
 use crate::groups::{Groups, Hold};
 use crate::itip;
-use crate::milter::{Milters, Verdict};
+use crate::milter::{self, Milters, Verdict};
 use crate::routes::Routes;
 use crate::server::{Envelope, Handler, Mode, Reply, is_positive, reply};
 use crate::sieve::{self, Hop, Sieved, VacationRate};
@@ -1281,8 +1285,14 @@ impl Delivery {
         full.extend_from_slice(headers.as_bytes());
         full.extend_from_slice(&raw);
         let mut full = Bytes::from(full);
-        if let Some(m) = self.deps.milter.as_ref().filter(|m| m.applies(env.mode)) {
-            let out = m.check(env, full).await;
+        let mail = milter::Mail::of(env);
+        if let Some(m) = self
+            .deps
+            .milter
+            .as_ref()
+            .filter(|m| m.applies(mail.profile))
+        {
+            let out = m.check(&mail, full).await;
             match out.verdict {
                 Verdict::Accept => {}
                 Verdict::Refuse(r) => return Ok(Some(r)),
@@ -1564,15 +1574,58 @@ impl Delivery {
         true
     }
 
-    /// Обработка письма отправки вне сессии SMTP до доставки и очереди: правила потока (один раз на письмо) и
-    /// переписывание отправителя. `Done` — судьба письма решена правилом (отказ, удаление).
+    /// Обработка письма отправки вне сессии SMTP до доставки и очереди: фильтры Milter профиля исходящей почты
+    /// (SMTP-27), правила потока (один раз на письмо) и переписывание отправителя. `Done` — судьба письма решена
+    /// фильтром или правилом (отказ, удаление).
     async fn pre_submit(
         &self,
+        id: &str,
         tenant: TenantId,
         mail_from: &str,
         rcpts: &[String],
         mut raw: Bytes,
     ) -> Result<Pre> {
+        let outbound = MilterProfile::Outbound;
+        if let Some(m) = self.deps.milter.as_ref().filter(|m| m.applies(outbound)) {
+            let mail = milter::Mail {
+                profile: outbound,
+                id,
+                client: None,
+                login: None,
+                mail_from,
+                rcpts,
+            };
+            let out = m.check(&mail, raw).await;
+            let refused = match out.verdict {
+                Verdict::Accept => out.quarantine.map(|reason| {
+                    tracing::info!(%id, %reason, "smtp: письмо в карантине фильтра");
+                    reply(550, [5, 7, 1], "Message held by content filter")
+                }),
+                Verdict::Refuse(r) => Some(r),
+                Verdict::Discard => {
+                    let step = Step::new(Ek::Receive, Dd::Discard, rcpts.to_vec());
+                    self.track(
+                        mail_from,
+                        tracking::message_id(&out.message).as_deref(),
+                        vec![step],
+                    )
+                    .await;
+                    return Ok(Pre::Done(SubmitStatus::Delivered));
+                }
+            };
+            if let Some(r) = refused {
+                let step = Step::new(Ek::Reject, tracking::decision(&r), rcpts.to_vec())
+                    .reason(tracking::reason(&r));
+                self.track(
+                    mail_from,
+                    tracking::message_id(&out.message).as_deref(),
+                    vec![step],
+                )
+                .await;
+                return Ok(Pre::Done(SubmitStatus::Failed(tracking::reason(&r))));
+            }
+            raw = out.message;
+        }
         let mut flowed_rcpts = None;
         let input = FlowInput {
             tenant,
@@ -1791,7 +1844,7 @@ impl Delivery {
             mail_from,
             rcpts,
             raw,
-        } = match self.pre_submit(tenant, mail_from, rcpts, raw).await? {
+        } = match self.pre_submit(&id, tenant, mail_from, rcpts, raw).await? {
             Pre::Done(status) => return Ok(Submitted::all(requested, status)),
             Pre::Go(m) => m,
         };

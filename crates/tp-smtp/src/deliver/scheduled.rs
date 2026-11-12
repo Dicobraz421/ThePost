@@ -1,6 +1,6 @@
 //! Отложенная отправка и её отмена (SRS 4.1, решение 2026-11-04-exchange-parity; SMTP-24).
 //!
-//! [`Delivery::schedule`] — правила потока почты (один раз на письмо, до постановки в очередь) и постановка
+//! [`Delivery::schedule`] — фильтры Milter исходящей почты и правила потока (один раз на письмо, до постановки в очередь) и постановка
 //! письма всем получателям, включая локальных, со сроком выпуска. До срока запись можно отменить
 //! ([`Delivery::cancel_scheduled`]): она удаляется, тело освобождается. В срок запись берёт обработчик очереди
 //! ([`crate::queue::QueueWorker`]): локальные получатели доставляются в ящики через [`LocalRelease`] — группы
@@ -16,9 +16,9 @@ use super::{Delivery, Flowed, Pre, Resolved};
 use crate::queue::{LocalRelease, RcptResult};
 
 impl Delivery {
-    /// Ставит письмо в очередь со сроком выпуска `release_at` (`Outbound::schedule`). Письмо, отклонённое правилом
-    /// потока, — `Error::Forbidden`, временный отказ правила и узел без очереди — `Error::Unavailable`. Письмо,
-    /// удалённое правилом потока, в очередь не ставится: возвращается идентификатор без записи (отмена такой
+    /// Ставит письмо в очередь со сроком выпуска `release_at` (`Outbound::schedule`). Письмо, отклонённое фильтром
+    /// Milter или правилом потока, — `Error::Forbidden`, временный отказ и узел без очереди — `Error::Unavailable`.
+    /// Письмо, удалённое фильтром или правилом потока, в очередь не ставится: возвращается идентификатор без записи (отмена такой
     /// отправки — `NotFound`, как у уже доставленной).
     pub(super) async fn schedule(
         &self,
@@ -35,13 +35,16 @@ impl Delivery {
             mail_from,
             rcpts,
             raw,
-        } = match self.pre_submit(tenant, mail_from, rcpts, raw).await? {
+        } = match self
+            .pre_submit(&crate::server::next_id(), tenant, mail_from, rcpts, raw)
+            .await?
+        {
             Pre::Done(SubmitStatus::Failed(reply)) if reply.starts_with('4') => {
                 return Err(Error::UNAVAILABLE);
             }
             Pre::Done(SubmitStatus::Failed(_)) => return Err(Error::Forbidden),
             Pre::Done(SubmitStatus::Delivered | SubmitStatus::Queued) => {
-                tracing::info!("smtp: отложенное письмо удалено правилом потока");
+                tracing::info!("smtp: отложенное письмо удалено фильтром или правилом потока");
                 return Ok(QueueId::new());
             }
             Pre::Go(m) => m,

@@ -19,8 +19,12 @@
 //!     filters:
 //!       - name: rspamd
 //!         address: "127.0.0.1:11332"
-//!         submission: true
+//!         profile: inbound
 //!         on_failure: accept
+//!       - name: dlp
+//!         address: "dlp.example.org:8890"
+//!         profile: outbound
+//!         on_failure: tempfail
 //!   queue:
 //!     retry: [5m, 15m, 30m, 1h, 2h, 4h, 8h]
 //!     expire: 5d
@@ -468,7 +472,9 @@ impl Default for AuthCheckConfig {
     }
 }
 
-/// Фильтры Milter (SRS 4.1): цепочка в порядке перечисления.
+/// Фильтры Milter (SRS 4.1). Два профиля: приём (smtp-in) и исходящая почта (submission, JMAP
+/// EmailSubmission); профиль — цепочка его фильтров в порядке перечисления. Фильтр принадлежит одному профилю;
+/// фильтр для обоих описывается дважды — со своей политикой при недоступности в каждом.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct MilterConfig {
@@ -484,10 +490,8 @@ pub struct MilterFilter {
     pub name: String,
     /// Адрес `хост:порт` (TCP).
     pub address: String,
-    /// Проверять входящую почту (smtp-in).
-    pub inbound: bool,
-    /// Проверять почту пользователей (submission).
-    pub submission: bool,
+    /// Профиль, в который входит фильтр.
+    pub profile: MilterProfile,
     /// Ожидание соединения с фильтром.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -500,8 +504,30 @@ pub struct MilterFilter {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub end_timeout: Duration,
-    /// Что делать, если фильтр недоступен.
-    pub on_failure: MilterOnFailure,
+    /// Что делать, если фильтр недоступен. Не задано — по профилю: приём — `accept` (почта не останавливается
+    /// из-за антиспама), исходящая — `tempfail` (письмо не уходит мимо проверки, например DLP).
+    pub on_failure: Option<MilterOnFailure>,
+}
+
+impl MilterFilter {
+    /// Политика при недоступности фильтра: заданная или по профилю.
+    pub fn failure_policy(&self) -> MilterOnFailure {
+        self.on_failure.unwrap_or(match self.profile {
+            MilterProfile::Inbound => MilterOnFailure::Accept,
+            MilterProfile::Outbound => MilterOnFailure::Tempfail,
+        })
+    }
+}
+
+/// Профиль Milter (SRS 4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MilterProfile {
+    /// Приём почты (smtp-in): антиспам, антивирус.
+    #[default]
+    Inbound,
+    /// Исходящая почта пользователей: submission и JMAP EmailSubmission (в частности, внешние системы DLP).
+    Outbound,
 }
 
 impl Default for MilterFilter {
@@ -509,22 +535,20 @@ impl Default for MilterFilter {
         Self {
             name: "milter".into(),
             address: "127.0.0.1:11332".into(),
-            inbound: true,
-            submission: false,
+            profile: MilterProfile::default(),
             connect_timeout: Duration::from_secs(5),
             command_timeout: Duration::from_secs(10),
             end_timeout: Duration::from_secs(60),
-            on_failure: MilterOnFailure::default(),
+            on_failure: None,
         }
     }
 }
 
 /// Политика при недоступности фильтра.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MilterOnFailure {
     /// Принять с пометкой: заголовок `X-ThePost-Milter: <имя>; unavailable`.
-    #[default]
     Accept,
     /// Временный отказ (`451 4.7.1`), отправитель повторит.
     Tempfail,
@@ -800,6 +824,37 @@ mod tests {
         let mut r = SectionRegistry::new();
         r.add_section::<SmtpConfig>("smtp").expect("smtp");
         r
+    }
+
+    #[test]
+    fn milter_profiles() {
+        let parse = |filter: &str| {
+            registry().parse(
+                &format!("{BASE}smtp:\n  milter:\n    filters:\n      - {filter}\n"),
+                Vec::new(),
+            )
+        };
+        let cfg = parse("{ name: dlp, address: \"dlp:8890\", profile: outbound }").expect("parse");
+        let smtp = cfg.section::<SmtpConfig>("smtp").expect("smtp");
+        let f = &smtp.milter.filters[0];
+        assert_eq!(f.profile, MilterProfile::Outbound);
+        // Политика при недоступности не задана — по профилю.
+        assert_eq!(f.failure_policy(), MilterOnFailure::Tempfail);
+        assert_eq!(
+            MilterFilter::default().failure_policy(),
+            MilterOnFailure::Accept
+        );
+        let cfg = parse("{ name: dlp, profile: outbound, on_failure: accept }").expect("parse");
+        let smtp = cfg.section::<SmtpConfig>("smtp").expect("smtp");
+        assert_eq!(
+            smtp.milter.filters[0].failure_policy(),
+            MilterOnFailure::Accept
+        );
+        // Прежние признаки фильтра `inbound`/`submission` — неизвестные поля (строгий разбор — ошибка).
+        let old = format!(
+            "{BASE}smtp:\n  milter:\n    filters:\n      - {{ name: rspamd, submission: true }}\n"
+        );
+        assert!(registry().parse_strict(&old, Vec::new()).is_err());
     }
 
     #[test]

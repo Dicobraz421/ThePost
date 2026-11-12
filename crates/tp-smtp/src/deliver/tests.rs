@@ -1057,6 +1057,7 @@ async fn submission_copy_to_local_address() {
 mod addressbook;
 mod imip;
 mod moderation;
+mod outbound_milter;
 
 mod groups {
     //! SMTP-16: квота до `DATA`, ограничения отправителей и модерация групп рассылки.
