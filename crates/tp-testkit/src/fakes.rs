@@ -36,7 +36,9 @@ use tp_contracts::auth::{
 use tp_contracts::bus::EventBus;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::ext::{Decision, DecisionHook, DeliveryInfo, FinalDelete, SubmissionInfo};
-use tp_contracts::meta::{AccountScope, AccountStore, MessageStore, PolicyResolver, QuotaUsage};
+use tp_contracts::meta::{
+    AccountScope, AccountStore, Message, MessageStore, PolicyResolver, QuotaUsage,
+};
 use tp_contracts::queue::{
     Claimed, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt, RcptStatus,
 };
@@ -1263,6 +1265,10 @@ impl TrashStore for MemTrash {
         limit: usize,
     ) -> Result<Vec<TrashItem>> {
         Ok(self.page(scope, true, offset, limit))
+    }
+
+    async fn hidden_message(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
+        Ok(self.meta.hidden_message(scope, id))
     }
 
     async fn restore(&self, scope: AccountScope, object: TrashObject) -> Result<Restored> {

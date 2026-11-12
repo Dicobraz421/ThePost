@@ -811,6 +811,15 @@ impl MemMetadata {
         })
     }
 
+    /// Скрытое письмо корзины `id` учётной записи `scope` (`TrashStore::hidden_message`); нет — `None`.
+    pub(crate) fn hidden_message(&self, scope: AccountScope, id: MessageId) -> Option<Message> {
+        let st = lock(&self.state);
+        st.accounts
+            .get(&(scope.tenant, scope.account))
+            .and_then(|acc| acc.hidden.get(&id))
+            .map(|row| row.message.clone())
+    }
+
     /// Восстанавливает скрытое письмо в исходную папку (её нет — во «Входящие») с тем же `MessageId`
     /// и новым UID; скрытого письма нет — `NotFound`.
     pub(crate) fn restore_hidden(&self, scope: AccountScope, id: MessageId) -> Result<Restored> {

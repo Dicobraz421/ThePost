@@ -653,6 +653,14 @@ mod tests {
             self.inner.list_hidden(scope, offset, limit).await
         }
 
+        async fn hidden_message(
+            &self,
+            scope: AccountScope,
+            id: MessageId,
+        ) -> Result<Option<tp_contracts::meta::Message>> {
+            self.inner.hidden_message(scope, id).await
+        }
+
         async fn restore(
             &self,
             scope: AccountScope,

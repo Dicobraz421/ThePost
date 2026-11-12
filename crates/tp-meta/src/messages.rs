@@ -130,9 +130,14 @@ fn part_order(a: &str, b: &str) -> Ordering {
 
 macro_rules! select_messages {
     ($tail:literal) => {
+        select_messages!("hidden_at IS NULL", $tail)
+    };
+    ($visibility:literal, $tail:literal) => {
         concat!(
             "SELECT message_id, mailbox_id, uid, modseq, size, received_at, flags, skeleton_hash, skeleton_gen, meta
-             FROM messages WHERE tenant_id = $1 AND account_id = $2 AND hidden_at IS NULL ",
+             FROM messages WHERE tenant_id = $1 AND account_id = $2 AND ",
+            $visibility,
+            " ",
             $tail
         )
     };
@@ -209,6 +214,31 @@ async fn existing(
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)
+}
+
+/// Скрытое письмо корзины (`TrashStore::hidden_message`): строка с `hidden_at`, части — как у `get`.
+pub(crate) async fn hidden_message(
+    meta: &PgMeta,
+    scope: AccountScope,
+    id: MessageId,
+) -> Result<Option<Message>> {
+    meta.idempotent(|| async move {
+        let mut tx = begin(&meta.box_pool(scope).await?, scope.tenant).await?;
+        let rows: Vec<MessageRow> = sqlx::query_as(select_messages!(
+            "hidden_at IS NOT NULL",
+            "AND message_id = $3"
+        ))
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let msg = assemble(&mut tx, scope, rows).await?.pop();
+        crate::commits::commit(tx).await?;
+        Ok(msg)
+    })
+    .await
 }
 
 /// Ссылки писем `ids` на объекты BLOB изменяются на `delta` (каждое письмо — по ссылке на каждый объект).

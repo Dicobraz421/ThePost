@@ -33,6 +33,7 @@
     {'listen': thepost_listen_address ~ ':143'},
     {'listen': thepost_listen_address ~ ':993', 'implicit_tls': true},
   ]},
+  'sieve': {'managesieve': {'listen': [{'listen': thepost_listen_address ~ ':4190'}]}},
   'smtp': {
     'hostname': thepost_hostname,
     'inbound': [{'listen': thepost_listen_address ~ ':25'}],

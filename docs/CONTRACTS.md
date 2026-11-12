@@ -571,7 +571,9 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 `before_final_delete` вне транзакции: `Allow` — стереть (как `expunge_final`), `Deny` (Legal Hold) или ошибка хука — скрыть;
 прочие письма — пропуск. Скрытое письмо не видно пользователю: нет в `MessageStore::get`/`list` и операциях над письмами,
 в счётчиках папки, в квоте (`Quota`, `AccountStore::quota`); `ChangeLog` — удалено из корзины, событие ядра — `Trashed`.
-Администратор: `list_hidden(scope, offset, limit)`, `restore` (видимые и скрытые; исходная папка или «Входящие», прежний `MessageId`;
+Администратор: `list_hidden(scope, offset, limit)`, `hidden_message(scope, id) -> Option<Message>` (скрытое письмо — метаданные как у
+`MessageStore::get`, тема/отправитель/дата — в `meta.envelope`; скрытие не снимается; нет или не скрыто — `None`; аудит — у вызывающего),
+`restore` (видимые и скрытые; исходная папка или «Входящие», прежний `MessageId`;
 протоколы и Admin API — через `MailStore::restore`, с уведомлением клиентов);
 `list` — только видимые. Срок корзины для скрытых — как для остальных (`expired` → хук → `expunge_final`).
 Настройка: `Policy::trash_purge: Option<TrashPurgeRule { mode, user_can_choose }>` (администратор, уровни цепочки; не задано —
@@ -916,6 +918,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-58 (волна contracts-40, решение 79): `DirAccount::hidden_from_gal` (`#[serde(default)]`) — учётная запись скрыта
   из адресной книги без запрета входа. Код, собирающий `DirAccount` перечислением всех полей, дополняется `hidden_from_gal` (в репозитории —
   `tp-auth` и тесты `tp-testkit`, `tp-dav`, `tp-smtp`: `false`); чтение признака из LDAP — AUTH-16, фильтр GAL — DAV-27.
+- 2026-11-12 — MS-19 (волна mailstore-12, класс B): `TrashStore::hidden_message(scope, id) -> Option<Message>` — метаданные скрытого
+  письма для администратора без снятия скрытия (без реализации по умолчанию; `MemTrash`, `PgMeta`); набор `suite::trash_purge` проверяет
+  его. Потребитель — Admin API: тема и отправитель скрытых писем на странице `trash/hidden` (из `Message::meta.envelope`, без чтения BLOB).
 - 2026-11-12 — CTR-53 (волна contracts-38): `Account::aliases`, `AccountUpsert::aliases` и `Account::addresses()` — адреса учётной
   записи (основной и псевдонимы каталога без catch-all); правила — `meta::account_addresses`, `meta::account_aliases`. Несовместимо:
   новые обязательные поля `Account` и `AccountUpsert`. `tp-meta` — миграция 0030 (`accounts.aliases`).
