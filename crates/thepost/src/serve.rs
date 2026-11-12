@@ -43,6 +43,7 @@ use tp_smtp::{Mode, SmtpConfig, SmtpOutService};
 use tp_sys::{NodeResources, ResourceSnapshot, ResourcesConfig};
 
 use crate::acme;
+use crate::audit_export::AuditExport;
 use crate::infra;
 use crate::log_reader::LogSignals;
 use crate::modules;
@@ -290,6 +291,20 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         services.dkim.clone(),
         aux.clone(),
     ));
+    // Экспорт журнала аудита в SIEM (`admin.audit`, APP-59) — у роли admin; новая секция — без перезапуска.
+    let audit = if cfg.roles().contains(Role::Admin) {
+        let audit = AuditExport::start(&cfg, store.as_ref())
+            .await
+            .map_err(|e| infra::context("admin.audit", e))?;
+        tokio::spawn(
+            audit
+                .clone()
+                .watch(reloader.subscribe(), store.clone(), aux.clone()),
+        );
+        Some(audit)
+    } else {
+        None
+    };
 
     // Уровень нагрузки узла по ресурсам cgroups (PLT-15): роли читают его из `RoleCtx::load`. Снимки ресурсов —
     // по триггерам PSI (секция `pressure`, PLT-17), без них — с интервалом секции `resources`.
@@ -387,6 +402,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         events,
         signals,
         maintenance: Some(maintenance),
+        audit,
     };
     for role in Role::ALL.iter().copied() {
         if !cfg.roles().contains(role) {
@@ -492,6 +508,8 @@ struct RoleSetup<'a> {
     events: EventConsumer,
     signals: LogSignals,
     maintenance: Option<Maintenance>,
+    /// Экспорт журнала аудита роли admin (`admin.audit`).
+    audit: Option<Arc<AuditExport>>,
 }
 
 impl RoleSetup<'_> {
@@ -571,8 +589,12 @@ impl RoleSetup<'_> {
                     .section::<sections::AdminSection>(sections::ADMIN)?
                     .0
                     .clone();
+                let audit: Arc<dyn tp_admin::AuditSink> = match &self.audit {
+                    Some(audit) => audit.clone(),
+                    None => Arc::new(tp_admin::Fanout::default()),
+                };
                 let admin = Arc::new(crate::local_admin::attach(
-                    self.services.admin(self.ext, cfg, &*smtp()?)?,
+                    self.services.admin(self.ext, cfg, &*smtp()?, audit)?,
                     self.services,
                 ));
                 crate::local_admin::serve(admin.clone());

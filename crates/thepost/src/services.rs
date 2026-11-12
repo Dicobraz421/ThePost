@@ -576,17 +576,18 @@ impl Services {
 
     /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`
     /// (`impl Moderation for Delivery`, FIX-01) без правил потока почты: письмо прошло их при приёме.
+    /// `audit` — экспорт журнала аудита в SIEM (секция `admin.audit`, [`crate::audit_export`]).
     pub fn admin(
         &self,
         ext: &Registry,
         cfg: tp_admin::AdminConfig,
         smtp: &SmtpConfig,
+        audit: Arc<dyn tp_admin::AuditSink>,
     ) -> Result<tp_admin::Admin> {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
             audit_log: Arc::new(self.meta.clone()),
-            // Экспорт в SIEM (`admin.audit`) узел не запускает: без приёмников.
-            audit: Arc::new(tp_admin::Fanout::default()),
+            audit,
             delivery: Arc::new(self.meta.clone()),
             groups: Arc::new(self.meta.clone()),
             moderation: Arc::new(self.base_delivery(smtp)?),
@@ -1173,7 +1174,14 @@ mod tests {
         // Admin API узла с локальным входом (как роль admin в `serve`): администратор `admin init` — модератор.
         let admin_cfg = cfg.section::<AdminSection>(ADMIN).expect("admin").0.clone();
         let admin = Arc::new(crate::local_admin::attach(
-            services.admin(&ext, admin_cfg, &smtp).expect("admin"),
+            services
+                .admin(
+                    &ext,
+                    admin_cfg,
+                    &smtp,
+                    Arc::new(tp_admin::Fanout::default()),
+                )
+                .expect("admin"),
             &services,
         ));
         let granted = admin
