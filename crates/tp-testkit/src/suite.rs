@@ -2471,7 +2471,7 @@ pub async fn moderation(m: &dyn Moderation, fx: &ModerationFixture) {
 // ---------- Trash: trash.purge ----------
 
 /// Запись правила администратора `trash.purge` уровня организации для [`trash_purge`]
-/// (запись политик уровней — вне контрактов до CTR-25: in-memory — `MemPolicies`, PostgreSQL — `PgMeta::set_policy`).
+/// (запись политик уровней — контракт `PolicyStore`: in-memory — `MemPolicies`, PostgreSQL — `PgMeta`).
 /// Остальные поля политики уровня сохраняются.
 #[async_trait]
 pub trait TrashPurgeAdmin: Send + Sync {
