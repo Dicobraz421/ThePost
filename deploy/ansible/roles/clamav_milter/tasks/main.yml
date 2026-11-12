@@ -1,14 +1,44 @@
-# Установка clamd, freshclam и clamav-milter (Debian, Ubuntu). Повторный прогон ничего не меняет.
+# Установка clamd, freshclam и clamav-milter (Debian, Ubuntu; AlmaLinux, RHEL — EPEL). Повторный
+# прогон ничего не меняет.
 ---
 - name: Check OS family
   ansible.builtin.assert:
-    that: ansible_os_family == 'Debian'
-    fail_msg: "Роль clamav_milter эталона SMB поддерживает Debian и Ubuntu"
+    that:
+      - ansible_pkg_mgr in ['apt', 'dnf', 'dnf5']
+      - ansible_distribution != 'RED'
+      - ansible_distribution is not match('Astra')
+    fail_msg: >-
+      Роль clamav_milter поддерживает Debian, Ubuntu, AlmaLinux и RHEL (EPEL); в репозиториях РЕД ОС 8 и Astra Linux SE
+      1.8 ClamAV нет — thepost_clamav: false или свой фильтр Milter (smtp.milter)
+
+- name: Enable EPEL
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+  when: clamav_epel | bool
 
 - name: Install ClamAV
-  ansible.builtin.apt:
-    name: [clamav-daemon, clamav-freshclam, clamav-milter]
+  ansible.builtin.package:
+    name: "{{ clamav_packages }}"
     state: present
+
+# Пакеты EPEL: в образцах настроек строка Example (служба не запускается), сокет clamd выключен.
+- name: Enable ClamAV configuration (EPEL)
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    regexp: '^Example\s*$'
+    state: absent
+  loop: [/etc/freshclam.conf, "{{ clamav_clamd_conf }}", "{{ clamav_milter_conf }}"]
+  when: clamav_rhel | bool
+  notify: [Restart clamd, Restart clamav-milter]
+
+- name: Configure clamd socket (EPEL)
+  ansible.builtin.lineinfile:
+    path: "{{ clamav_clamd_conf }}"
+    regexp: '^#?LocalSocket\s'
+    line: "LocalSocket {{ clamav_clamd_socket }}"
+  when: clamav_rhel | bool
+  notify: Restart clamd
 
 - name: Start freshclam
   ansible.builtin.systemd_service:
@@ -27,12 +57,12 @@
 
 - name: Configure clamav-milter
   ansible.builtin.lineinfile:
-    path: /etc/clamav/clamav-milter.conf
+    path: "{{ clamav_milter_conf }}"
     regexp: "^#?{{ item.key }} "
     line: "{{ item.key }} {{ item.value }}"
   loop:
     - { key: MilterSocket, value: "inet:{{ clamav_milter_address.split(':') | last }}@{{ clamav_milter_address.split(':') | first }}" }
-    - { key: ClamdSocket, value: "unix:/var/run/clamav/clamd.ctl" }
+    - { key: ClamdSocket, value: "unix:{{ clamav_clamd_socket }}" }
     - { key: OnInfected, value: "{{ clamav_milter_on_infected }}" }
     - { key: AddHeader, value: Replace }
   notify: Restart clamav-milter
@@ -42,4 +72,4 @@
     name: "{{ item }}"
     state: started
     enabled: true
-  loop: [clamav-daemon, clamav-milter]
+  loop: ["{{ clamav_clamd_service }}", clamav-milter]

@@ -54,6 +54,14 @@ thepost_admin_listen: "127.0.0.1:8443"
 # ролью thepost (thepost_app), схему меняет только при запуске миграций (meta.migrate_on_start).
 thepost_db_owner_role: "{{ postgresql_owner_role | default('thepost_owner') }}"
 
+# Службы этой ВМ (эталон SMB), с которыми запускается thepost (drop-in smb.conf): юнит PostgreSQL — по роли postgresql
+# (Debian — postgresql.service, семейство RHEL — postgresql-<версия>.service).
+thepost_local_units: >-
+  {{ [(postgresql_service | default('postgresql')) ~ '.service', 'openbao.service', 'rspamd.service']
+     + (['clamav-milter.service'] if thepost_clamav | bool else []) }}
+# Порты клиентских протоколов в firewalld (если он включён): SMTP, submissions, submission, IMAP, IMAPS, HTTPS.
+thepost_firewall_ports: [25, 465, 587, 143, 993, 443]
+
 # Фильтры Milter: Rspamd (роль rspamd) и, при thepost_clamav, clamav-milter (роль clamav_milter).
 thepost_rspamd_milter_address: "{{ rspamd_milter_address | default('127.0.0.1:11332') }}"
 thepost_clamav: false

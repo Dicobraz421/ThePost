@@ -1,10 +1,20 @@
 # Роль rspamd: антиспам профиля SMB (SRS 1.2) — пакет проекта Rspamd, проверка через Milter (worker proxy).
 # thepost подключается к rspamd_milter_address (секция smtp.milter, фильтр rspamd).
 ---
-# true — репозиторий rspamd.com (рекомендация проекта Rspamd); false — пакет дистрибутива.
-rspamd_official_repo: true
+# Семейство ОС — по менеджеру пакетов: apt — Debian, Ubuntu, Astra Linux SE; dnf — РЕД ОС, AlmaLinux, RHEL.
+rspamd_rhel: "{{ ansible_pkg_mgr != 'apt' }}"
+# true — репозиторий rspamd.com (рекомендация проекта Rspamd); false — пакет дистрибутива. РЕД ОС — пакет
+# дистрибутива (у rspamd.com сборок для РЕД ОС нет).
+rspamd_official_repo: "{{ ansible_distribution != 'RED' }}"
 rspamd_repo_uri: https://rspamd.com/apt-stable/
+# Набор apt — кодовое имя выпуска; Astra Linux SE 1.8 — bookworm (база Debian 12).
+rspamd_repo_suite: "{{ 'bookworm' if ansible_distribution is match('Astra') else ansible_distribution_release }}"
 rspamd_repo_key_url: https://rspamd.com/apt-stable/gpg.key
+# AlmaLinux, RHEL: сборки rspamd.com для CentOS той же версии.
+rspamd_rpm_repo_uri: https://rspamd.com/rpm-stable
+rspamd_rpm_repo_key_url: https://rspamd.com/rpm/rspamd.asc
+# EPEL для зависимостей сборок rspamd.com (AlmaLinux; на самом RHEL EPEL подключает администратор).
+rspamd_epel: "{{ rspamd_rhel | bool and rspamd_official_repo | bool and ansible_distribution != 'RedHat' }}"
 rspamd_service: rspamd
 
 # Все рабочие процессы — только loopback: thepost на той же ВМ.

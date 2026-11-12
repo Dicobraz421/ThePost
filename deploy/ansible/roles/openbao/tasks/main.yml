@@ -14,6 +14,13 @@
     checksum: "{{ openbao_package_checksum }}"
     dest: "/var/cache/openbao_{{ openbao_version }}.{{ openbao_package_ext }}"
     mode: "0644"
+  when: openbao_download_ca_path | length == 0
+
+# РЕД ОС 8: Python 3.11 дистрибутива с OpenSSL 3.5 не принимает корневые сертификаты в DER, которыми get_url проверяет
+# TLS («ASN1: NOT_ENOUGH_DATA»), — загрузка через uri с файлом корневых сертификатов и сверка суммы SHA-256.
+- name: Download OpenBao package (ca_path)
+  ansible.builtin.include_tasks: download.yml
+  when: openbao_download_ca_path | length > 0
 
 - name: Install OpenBao package (deb)
   ansible.builtin.apt:
