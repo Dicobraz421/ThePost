@@ -125,6 +125,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         .map_err(|_| Error::internal("чтение конфигурации прервано"))??;
     let cfg = reloader.current();
     let store = secrets::store(&cfg, opts.secrets).await?;
+    // Медленное хранилище секретов (OpenBao стартует или запечатан) — ждём, а не падаем в перезапуск (APP-31).
+    secrets::wait_ready(&cfg, store.as_ref()).await?;
     // Секреты конфигурации — при запуске и каждом перечитывании; аренды продлеваются (PLT-12).
     let reloader = reloader.with_secret_store(store.clone()).await?;
     let cfg = reloader.current();

@@ -2,7 +2,7 @@
 //!
 //! Приложение регистрирует секции полос (`database`, `meta`) и свои: `blob` — хранилище BLOB (локальный каталог
 //! или S3), `bus` — шина уведомлений (в процессе), `cluster` — имя узла и опросы, `doctor` — пороги
-//! проверок окружения. Проверки открытых каналов подключаются через [`SectionRegistry::add_check`]: `thepost config
+//! проверок окружения, `startup` — ожидание хранилища секретов при запуске. Проверки открытых каналов подключаются через [`SectionRegistry::add_check`]: `thepost config
 //! check` (строгий режим) и запуск (мягкий режим) отвергают адрес без TLS вне профиля dev.
 //!
 //! Подсекции `blob.local` и `blob.s3` — секции крейта `tp-blob` как есть (BLOB-11): приложение подставляет только каталог, бакет и префикс из `blob.url`.
@@ -37,6 +37,8 @@ pub const BUS: &str = "bus";
 pub const CLUSTER: &str = "cluster";
 /// Имя секции порогов `thepost doctor`.
 pub const DOCTOR: &str = "doctor";
+/// Имя секции запуска узла.
+pub const STARTUP: &str = "startup";
 /// Имя секции `thepost verify`.
 pub const VERIFY: &str = "verify";
 /// Имя секции SMTP (`tp-smtp`).
@@ -71,6 +73,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     r.add_section::<ClusterSection>(CLUSTER)?;
     r.add_section::<DoctorSection>(DOCTOR)?;
     r.add_section::<VerifySection>(VERIFY)?;
+    r.add_section::<StartupSection>(STARTUP)?;
     r.add_section::<tp_smtp::SmtpConfig>(SMTP)?;
     r.add_section::<tp_imap::ImapConfig>(IMAP)?;
     r.add_section::<tp_jmap::JmapConfig>(JMAP)?;
@@ -83,6 +86,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
         pool_config(c, profile).check().map(drop)
     })?;
     r.add_check::<BlobSection>(BLOB, BlobSection::check)?;
+    r.add_check::<StartupSection>(STARTUP, |c, _| c.check())?;
     r.add_check::<ClusterSection>(CLUSTER, |c, _| c.check())?;
     r.add_check::<AdminSection>(ADMIN, |c, _| c.0.check())?;
     r.add_check::<AuthSection>(AUTH, AuthSection::check)?;
@@ -641,6 +645,51 @@ impl Default for VerifySection {
     }
 }
 
+// ---------- startup ----------
+
+/// Секция `startup`: ожидание внешних служб при запуске узла (APP-31, решение 2026-11-11 п. 58).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct StartupSection {
+    /// Сколько узел ждёт хранилище секретов (OpenBao) при запуске, повторяя вход и чтение секретов (`120s`);
+    /// `0s` — без повторов: первая неудача завершает запуск.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub secrets_timeout: Duration,
+    /// Пауза перед первым повтором (`1s`); дальше удваивается.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub secrets_retry_initial: Duration,
+    /// Наибольшая пауза между повторами (`15s`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub secrets_retry_max: Duration,
+}
+
+impl Default for StartupSection {
+    fn default() -> Self {
+        Self {
+            secrets_timeout: Duration::from_secs(120),
+            secrets_retry_initial: Duration::from_secs(1),
+            secrets_retry_max: Duration::from_secs(15),
+        }
+    }
+}
+
+impl StartupSection {
+    /// Паузы положительны, наибольшая — не меньше первой.
+    pub fn check(&self) -> Result<()> {
+        if self.secrets_retry_initial.is_zero()
+            || self.secrets_retry_max < self.secrets_retry_initial
+        {
+            return Err(Error::invalid(
+                "startup: secrets_retry_initial must be positive and not exceed secrets_retry_max",
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ---------- doctor ----------
 
 /// Секция `doctor`: пороги проверок окружения `thepost doctor` (проверки СУБД — `meta.doctor`).
@@ -1011,6 +1060,7 @@ blob:
             "\"meta\"",
             "\"doctor\"",
             "\"verify\"",
+            "\"startup\"",
             "\"secrets\"",
             "\"smtp\"",
             "\"imap\"",
