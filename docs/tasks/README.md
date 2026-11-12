@@ -288,6 +288,20 @@
 | [CLU-18](CLU-18.md) | идентичность узла — только URI `thepost:node:<id>` | cluster | A | cluster-13 | todo | DEP-22 |
 | [CTR-71](CTR-71.md) | ключ подписчика шарда — всегда `<имя>@<шард>` | contracts | B | contracts-47 | ready | — |
 | [DEP-47](DEP-47.md) | Helm: порты из конфигурации узла | deploy | A | deploy-34 | ready | — |
+| [FIX-04](FIX-04.md) | GC BLOB по всем шардам в узле | app | A | app-52 | ready | BLOB-15 |
+| [META-73](META-73.md) | GC: кандидаты после отбора занятых, ближайший срок одним запросом | meta | A | meta-47 | ready | BLOB-15 |
+| [KIT-11](KIT-11.md) | `MemShardedBlobIndex` и общий набор GC по шардам | testkit | A | testkit-08 | ready | BLOB-15 |
+| [DEPS-13](DEPS-13.md) | `nix` с признаком `fs` для `tp-sys` | deps | B | deps-13 | ready | SYS-13 |
+| [SYS-14](SYS-14.md) | `fs_usage` на `nix::sys::statvfs` | sys | A | sys-09 | todo | DEPS-13 |
+| [CTR-73](CTR-73.md) | очередь: ближайший срок попытки и сигнал пополнения | contracts | B | contracts-50 | ready | — |
+| [CTR-74](CTR-74.md) | `Outbound`: учётная запись отправителя при постановке | contracts | B | contracts-50 | ready | — |
+| [CTR-76](CTR-76.md) | политика архива: возраст, квота, выборка «пора в архив» | contracts | B | contracts-50 | ready | — |
+| [CTR-77](CTR-77.md) | сигнал «ящик отключён или срок изменён» | contracts | B | contracts-50 | ready | — |
+| [CTR-78](CTR-78.md) | атомарная отметка «ящик удаляется» | contracts | B | contracts-50 | ready | — |
+| [META-72](META-72.md) | очередь: `next_due` и сигнал в PostgreSQL | meta | A | meta-48 | todo | CTR-73,CTR-74 |
+| [META-75](META-75.md) | архив и отключённые ящики в PostgreSQL | meta | A | meta-48 | todo | CTR-76,CTR-77,CTR-78 |
+| [SMTP-42](SMTP-42.md) | smtp-out без опроса: сигнал очереди и таймер ближайшего срока | smtp | A | smtp-23 | todo | META-72 |
+| [MS-20](MS-20.md) | отключённые ящики: воркер на сигнале | mailstore | A | mailstore-14 | todo | CTR-77 |
 
 ## Ф1 · Синк 12.11, часть 2 — этап 3: сессии Admin API в PostgreSQL, роли PKI OpenBao (решения 71, 77)
 
@@ -583,6 +597,23 @@
 | [DOC-04](DOC-04.md) | INSTALL и PREREQUISITES: ACME, ключи в OpenBao, сокеты systemd | docs | A | docs-04 | todo | DEP-44,DEP-45,DEP-46 |
 | [AUTH-18](AUTH-18.md) | LDAP: удалить псевдоним `DisabledRule` | auth | A | auth-13 | done | — |
 
+## Ф1 · Хвосты облачных волн 12.11, п. 62–91 — этап 2 (FIX — срочно)
+
+| Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
+|---|---|---|---|---|---|---|
+| [FIX-05](FIX-05.md) | узел не стартует со вторым шардом, пока GC BLOB не учитывает все шарды | app | A | app-49 | done | — |
+| [FIX-06](FIX-06.md) | `tp-mailstore`: паника разбора метаданных письма (фаззер, цель `meta`) | mailstore | A | mailstore-13 | done | — |
+| [FIX-07](FIX-07.md) | `tp-mailstore`: паника разбиения письма на части (фаззер, цель `split`) | mailstore | A | mailstore-13 | done | — |
+| [FIX-08](FIX-08.md) | `tp-smtp`: паника разбора ответа Milter (фаззер, цель `milter`) | smtp | A | smtp-22 | ready | — |
+| [ADM-37](ADM-37.md) | CLI `account list --after` | admin | A | admin-25 | ready | APP-22 |
+| [ADM-38](ADM-38.md) | CLI: политики, группы, корзина, аудит, журнал доставки, транспорт | admin | A | admin-25 | ready | APP-22 |
+| [ADM-39](ADM-39.md) | CLI: `thepost admin login --oidc` | admin | A | admin-25 | ready | APP-42 |
+| [BLOB-17](BLOB-17.md) | `verify`: раздельные счётчики «пропал» и «неверный размер» | blob | A | blob-10 | ready | BLOB-14 |
+| [DEP-49](DEP-49.md) | эталонные конфигурации: `maintenance.*` и `cli.oidc.*` | deploy | A | deploy-35 | ready | APP-44,APP-39 |
+| [DOC-05](DOC-05.md) | справочник администратора: `maintenance.*` и `cli.oidc.*` | docs | A | docs-05 | todo | DEP-49 |
+| [APP-56](APP-56.md) | узел: OIDC с ключом из хранилища секретов | app | A | app-50 | ready | AUTH-17 |
+| [CTR-72](CTR-72.md) | `AccountStore::by_external_id` — обязательный метод | contracts | B | contracts-48 | ready | — |
+
 ## Ф2. Совместная работа (≈5 мес.)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
@@ -764,6 +795,7 @@
 | [SMTP-37](SMTP-37.md) | журнал доставки: запись о приёме iTIP | smtp | A | smtp-18 | todo | CTR-66,SMTP-33 |
 | [APP-53](APP-53.md) | узел: планирование в JMAP и очистка входящих | app | A | app-46 | todo | JMAP-31,DAV-32 |
 | [SMTP-38](SMTP-38.md) | iMIP: отправитель «от имени» (`SENT-BY`) | smtp | A | smtp-19 | ready | SMTP-33,CTR-48 |
+| [APP-58](APP-58.md) | узел: вход GSSAPI | app | A | app-51 | ready | DEPS-12 |
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 
