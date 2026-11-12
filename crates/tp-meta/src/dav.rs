@@ -54,7 +54,8 @@ use crate::pool::with_system;
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
 use crate::shards::ShardId;
 
-/// Секция `meta.dav`: лимиты хранилища ([`DavLimits`]) и срок надгробий.
+/// Секция `meta.dav`: лимиты хранилища ([`DavLimits`]), срок надгробий и пересчёт поисковых строк контактов
+/// ([`PgMeta::reindex_cards`]).
 ///
 /// ```yaml
 /// meta:
@@ -64,6 +65,8 @@ use crate::shards::ShardId;
 ///     max_collections: 100
 ///     max_busy_instances: 20000
 ///     tombstone_ttl: 90d
+///     card_reindex_batch: 100
+///     card_reindex_pause: 100ms
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -82,6 +85,12 @@ pub struct DavConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub tombstone_ttl: Duration,
+    /// Карточек в пачке пересчёта поисковых строк ([`PgMeta::reindex_cards`]).
+    pub card_reindex_batch: usize,
+    /// Пауза между пачками пересчёта: узел обслуживает клиентов во время пересчёта.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub card_reindex_pause: Duration,
 }
 
 impl DavConfig {
@@ -108,7 +117,7 @@ impl DavConfig {
 }
 
 impl Default for DavConfig {
-    /// Лимиты [`DavLimits::default`], надгробия — 90 суток.
+    /// Лимиты [`DavLimits::default`], надгробия — 90 суток, пересчёт — по 100 карточек с паузой 100 мс.
     fn default() -> Self {
         let l = DavLimits::default();
         Self {
@@ -117,6 +126,8 @@ impl Default for DavConfig {
             max_collections: l.max_collections,
             max_busy_instances: l.max_busy_instances,
             tombstone_ttl: Duration::from_secs(90 * 24 * 3600),
+            card_reindex_batch: 100,
+            card_reindex_pause: Duration::from_millis(100),
         }
     }
 }
@@ -413,7 +424,7 @@ async fn store_object(
             sqlx::query(
                 "UPDATE dav_objects SET uid = $4, etag = $5, component = $6, span_start = $7,
                                         span_end = $8, body = $9, modseq = $10, schedule_tag = $11,
-                                        search = $12, recurring = $13
+                                        search = $12, search_pending = false, recurring = $13
                  WHERE tenant_id = $1 AND account_id = $2 AND object_id = $3",
             )
             .bind(scope.tenant.as_uuid())
