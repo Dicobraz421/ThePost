@@ -269,17 +269,61 @@ pub trait GroupStore: Send + Sync + 'static {
     /// (CTR-43, без группы); [`HeldMessage::validate`] — `Error::Invalid`; занятый `id` — `Error::Conflict`.
     async fn hold(&self, tenant: TenantId, message: HeldMessage) -> Result<()>;
 
-    /// Очередь модерации организации (письма групп и правил) или одной группы по (`held_at`, `id`), не более `limit`.
+    /// Страница очереди модерации организации (письма групп и правил) или одной группы по (`held_at`, `id`) строго
+    /// после курсора `after` (CTR-55; `None` — с начала), не более `limit`. Курсор следующей страницы —
+    /// [`HeldCursor::of`] последнего письма страницы; страница короче `limit` — последняя. Письма, поставленные или
+    /// забранные между страницами, не дают ни пропусков, ни повторов остальных. Правило — [`held_page`].
     async fn held(
         &self,
         tenant: TenantId,
         group: Option<GroupId>,
+        after: Option<HeldCursor>,
         limit: usize,
     ) -> Result<Vec<HeldMessage>>;
 
     /// Забирает письмо из очереди для решения модератора (доставить или отклонить — вызывающий).
     /// Нет письма (в том числе уже решено другим модератором) — `Error::NotFound`.
     async fn take_held(&self, tenant: TenantId, id: HeldId) -> Result<HeldMessage>;
+}
+
+/// Курсор очереди модерации (CTR-55): место последнего письма предыдущей страницы в порядке (`held_at`, `id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct HeldCursor {
+    /// Время постановки последнего письма страницы.
+    pub held_at: OffsetDateTime,
+    /// Его идентификатор — различает письма с одинаковым `held_at`.
+    pub id: HeldId,
+}
+
+impl HeldCursor {
+    /// Курсор письма `message`.
+    pub fn of(message: &HeldMessage) -> Self {
+        Self {
+            held_at: message.held_at,
+            id: message.id,
+        }
+    }
+
+    /// Письмо стоит в очереди строго после курсора.
+    pub fn precedes(&self, message: &HeldMessage) -> bool {
+        *self < Self::of(message)
+    }
+}
+
+/// Страница очереди для [`GroupStore::held`]: письма `queue` (в любом порядке) строго после `after` по
+/// (`held_at`, `id`), не более `limit`. Для реализаций в памяти и проверки реализаций хранилища.
+pub fn held_page(
+    queue: impl IntoIterator<Item = HeldMessage>,
+    after: Option<HeldCursor>,
+    limit: usize,
+) -> Vec<HeldMessage> {
+    let mut page: Vec<HeldMessage> = queue
+        .into_iter()
+        .filter(|m| after.is_none_or(|c| c.precedes(m)))
+        .collect();
+    page.sort_by_key(HeldCursor::of);
+    page.truncate(limit);
+    page
 }
 
 /// Наибольшая длина причины отказа модератора, символов.
@@ -347,6 +391,36 @@ mod tests {
     fn object_safe() {
         fn _store(_: std::sync::Arc<dyn GroupStore>) {}
         fn _moderation(_: std::sync::Arc<dyn Moderation>) {}
+    }
+
+    #[test]
+    fn held_pages() {
+        // Пять писем, у трёх одинаковое время: страницы по два — без пропусков и повторов.
+        let at = |s: i64| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(s);
+        let queue: Vec<HeldMessage> = [3, 1, 1, 2, 1]
+            .into_iter()
+            .map(|s| HeldMessage {
+                held_at: at(s),
+                ..held(None, HoldSource::FlowRule { rule: "r".into() })
+            })
+            .collect();
+        let mut expected = queue.clone();
+        expected.sort_by_key(HeldCursor::of);
+        let (mut read, mut after, mut pages) = (Vec::new(), None, 0);
+        loop {
+            let page = held_page(queue.clone(), after, 2);
+            pages += 1;
+            after = page.last().map(HeldCursor::of).or(after);
+            let last = page.len() < 2;
+            read.extend(page);
+            if last {
+                break;
+            }
+        }
+        assert_eq!(read, expected);
+        assert_eq!(pages, 3);
+        assert_eq!(held_page(queue.clone(), None, 2), expected[..2]);
+        assert_eq!(held_page(queue, after, 2), []);
     }
 
     fn held(group: Option<GroupId>, source: HoldSource) -> HeldMessage {
@@ -548,6 +622,7 @@ mod tests {
             &self,
             _: TenantId,
             _: Option<GroupId>,
+            _: Option<HeldCursor>,
             _: usize,
         ) -> Result<Vec<HeldMessage>> {
             Ok(Vec::new())

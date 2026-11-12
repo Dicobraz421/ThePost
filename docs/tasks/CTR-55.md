@@ -10,6 +10,9 @@ manual: no
 
 Хвост волны console-02, PR #439.
 
+Решение владельца 2026-11-12 (PR #500): один путь — курсор `after` у `GroupStore::held`; отдельного `held_after` нет. `tp-meta`,
+`tp-testkit` и вызовы — в том же PR.
+
 ## Сделать
 - `GroupStore::held_after(tenant, group, after, limit)`: страница очереди модерации по (`held_at`, `id`) строго после
   курсора `after` (пара `held_at` и `HeldId` последнего письма предыдущей страницы; `None` — с начала). `held` остаётся

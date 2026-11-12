@@ -36,6 +36,18 @@ roles: [mailbox]
 #   http:
 #     dav: { listen: "0.0.0.0:9443" }
 
+# IMAP — 143 со STARTTLS и 993 с неявным TLS, ManageSieve — 4190 со STARTTLS (как в шаблоне Ansible config.yaml.j2);
+# за L4-балансировщиком — на все адреса узла. Без слушателей протокол выключен.
+imap:
+  listeners:
+    - listen: "0.0.0.0:143"
+    - listen: "0.0.0.0:993"
+      implicit_tls: true
+sieve:
+  managesieve:
+    listen:
+      - listen: "0.0.0.0:4190"
+
 # Роль maintenance (входит в пресет): раз в purge_interval — очистка по сроку надгробий DAV, журнала автоответов,
 # журнала доставки и токенов `thepost admin init`; сроки хранения — в meta. Проверка целостности BLOB — verify:
 # в кластере проход выполняет один узел — держатель лизы verify.lease_name.

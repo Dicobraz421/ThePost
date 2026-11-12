@@ -12,7 +12,7 @@ use mail_parser::MimeHeaders;
 use time::OffsetDateTime;
 use tp_contracts::auth::Principal;
 use tp_contracts::dav::{CollectionKind, DavObject, DavStore};
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::queue::Outbound;
 use tp_contracts::schedule::{
     ItipDelivery, ItipMessage, ItipMethod, ItipOutcome, ItipOutgoing, ItipSender, ItipSource,
@@ -58,6 +58,8 @@ impl Sched {
                         display_name: login.to_owned(),
                         external_id: None,
                         enabled: true,
+                        aliases: Vec::new(),
+                        kind: AccountKind::User,
                     },
                 )
                 .await

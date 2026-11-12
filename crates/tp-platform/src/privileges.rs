@@ -238,19 +238,14 @@ pub fn role_paths(cfg: &Config, config_file: &Path) -> RolePaths {
         .section::<AcmeConfig>("acme")
         .map(|a| (*a).clone())
         .unwrap_or_default();
+    // Ключ TLS — в хранилище секретов (`tls.key`, решение 100), на диске только цепочка.
     if acme.enabled {
         paths.state.push(acme.state_dir.clone());
-        for file in [&tls.cert_file, &tls.key_file] {
-            if let Some(dir) = file.parent() {
-                push_unique(&mut paths.state, dir.to_owned());
-            }
+        if let Some(dir) = tls.cert_file.parent() {
+            push_unique(&mut paths.state, dir.to_owned());
         }
     } else {
         paths.config.push(tls.cert_file.clone());
-        // Ключ из хранилища секретов (`tls.key`) на диске не лежит.
-        if tls.key.is_none() {
-            paths.config.push(tls.key_file.clone());
-        }
     }
     if let Ok(secrets) = cfg.section::<SecretsConfig>("secrets")
         && secrets.url.is_some()
@@ -742,7 +737,7 @@ mod tests {
     #[test]
     fn role_paths_from_platform_sections() {
         let cfg = config(
-            "tls: { cert_file: /etc/tp/tls/crt.pem, key_file: /etc/tp/tls/key.pem }\n\
+            "tls: { cert_file: /etc/tp/tls/crt.pem }\n\
              secrets:\n  url: https://vault:8200\n  auth: { approle: { role_id: r, secret_id_file: /run/cred/sid } }\n",
         );
         let p = role_paths(&cfg, Path::new("/etc/thepost/config.yaml"));
@@ -751,8 +746,7 @@ mod tests {
             [
                 "/etc/thepost/config.yaml",
                 "/etc/thepost",
-                "/etc/tp/tls/crt.pem",
-                "/etc/tp/tls/key.pem"
+                "/etc/tp/tls/crt.pem"
             ]
             .map(PathBuf::from)
         );
@@ -760,7 +754,7 @@ mod tests {
         assert!(p.state.is_empty() && p.blob.is_empty() && p.cache.is_empty());
 
         let acme = config(
-            "tls: { cert_file: /var/lib/tp/tls/crt.pem, key_file: /var/lib/tp/tls/key.pem }\n\
+            "tls: { cert_file: /var/lib/tp/tls/crt.pem }\n\
              acme: { enabled: true, domains: [mail.example.org], state_dir: /var/lib/tp/acme }\n",
         );
         let p = role_paths(&acme, Path::new("config.yaml"));

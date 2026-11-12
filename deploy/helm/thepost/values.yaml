@@ -4,19 +4,23 @@
 # секрет с цепочкой TLS клиентских протоколов (values.tls.secretName: tls.crt; ca.crt — CA внутренних каналов) и ключ TLS
 # в OpenBao (секрет thepost/tls#key — bootstrap.sh с TLS_KEY; в под монтируются только tls.crt и ca.crt).
 
-# Образ узла — ghcr.io (выпуски beta.yml, linux/amd64; теги beta-<дата> и beta), подписан cosign без ключей:
+# Образ узла — ghcr.io (выпуски beta.yml, linux/amd64; теги <версия> = appVersion чарта, beta-<дата> и beta),
+# подписан cosign без ключей:
 #   cosign verify ghcr.io/dicobraz421/thepost:<тег> \
 #     --certificate-identity 'https://github.com/Dicobraz421/ThePost/.github/workflows/beta.yml@refs/heads/main' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 # Закрепить проверенный образ — tag с digest из описания выпуска: "beta-20261112@sha256:…". Свой реестр (зеркало,
 # закрытый контур) — repository: <реестр>/thepost (тот же digest после копирования, например crane copy или skopeo
-# copy с подписью: cosign copy); реестр с входом — imagePullSecrets.
+# copy с подписью: cosign copy).
 image:
   repository: ghcr.io/dicobraz421/thepost
-  # Пусто — appVersion чарта (тег выпуска с версией); до первого такого выпуска — tag: beta-<дата> из выпуска.
+  # Пусто — appVersion чарта: установка закреплена за выпуском (решение 111).
   tag: ""
   pullPolicy: IfNotPresent
-# Секреты docker-registry для входа в реестр образа (имена в пространстве имён релиза), например [{ name: ghcr }].
+# Обязательно (решение 110: образ в ghcr.io закрытый) — секреты docker-registry для входа в реестр образа, в
+# пространстве имён релиза; без них helm template/install падает с подсказкой. Токен GitHub — read:packages:
+#   kubectl -n thepost create secret docker-registry ghcr --docker-server=ghcr.io #     --docker-username=<логин GitHub> --docker-password=<токен>
+#   helm install … --set 'imagePullSecrets[0].name=ghcr'
 imagePullSecrets: []
 
 replicaCount: 1

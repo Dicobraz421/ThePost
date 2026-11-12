@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -130,14 +131,16 @@ impl Gssapi {
         Gssapi { acceptors }
     }
 
-    /// Сеанс обмена для службы `service`; принципал проверяет `authn` ([`Credentials::Gssapi`]).
+    /// Сеанс обмена для службы `service` с клиентом `peer`; принципал проверяет `authn` ([`Credentials::Gssapi`]).
     pub(crate) fn session(
         &self,
         service: &str,
+        peer: Option<IpAddr>,
         authn: Arc<dyn Authenticator>,
     ) -> Result<Box<dyn SaslSession>> {
         Ok(Box::new(Exchange {
             authn,
+            peer,
             state: State::Accept(self.acceptors.acceptor(service)?),
         }))
     }
@@ -160,7 +163,7 @@ impl KerberosAuthenticator {
 
 #[async_trait]
 impl Authenticator for KerberosAuthenticator {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
+    async fn verify(&self, credentials: Credentials, _peer: Option<IpAddr>) -> Result<Principal> {
         let Credentials::Gssapi { principal, .. } = credentials else {
             return Err(Error::Forbidden);
         };
@@ -184,6 +187,8 @@ enum State {
 /// Один обмен GSSAPI.
 struct Exchange {
     authn: Arc<dyn Authenticator>,
+    /// Адрес клиента соединения (`SaslContext::peer`).
+    peer: Option<IpAddr>,
     state: State,
 }
 
@@ -213,7 +218,7 @@ impl Exchange {
             principal,
             authzid: authzid.clone(),
         };
-        match self.authn.verify(credentials).await {
+        match self.authn.verify(credentials, self.peer).await {
             Ok(p) if authzid.is_none_or(|z| z.eq_ignore_ascii_case(&p.login)) => {
                 Ok(SaslStep::Done(p))
             }
@@ -450,12 +455,14 @@ mod tests {
     const IMAP: SaslContext = SaslContext {
         service: "imap",
         tls: false,
+        peer: crate::testutil::PEER,
     };
 
     /// ManageSieve (RFC 5804, раздел 2.1: имя службы SASL — `sieve`).
     const SIEVE: SaslContext = SaslContext {
         service: "sieve",
         tls: false,
+        peer: crate::testutil::PEER,
     };
 
     /// Полный обмен RFC 4752: токены контекста, пустой ответ, слои, выбор клиента с authzid.

@@ -31,7 +31,7 @@ use tp_contracts::bus::{EventKind, EventStream};
 use tp_contracts::dav::CollectionKind;
 use tp_contracts::meta::AccountScope;
 
-use crate::core::http::auth_error;
+use crate::core::http::{Peer, auth_error};
 use crate::core::request::state_string;
 use crate::core::{Jmap, Problem};
 
@@ -301,9 +301,10 @@ fn source_stream(src: Source) -> impl Stream<Item = Result<SseEvent, Infallible>
 pub(crate) async fn eventsource(
     State(j): State<Arc<Jmap>>,
     Query(q): Query<EventSourceQuery>,
+    peer: Peer,
     headers: HeaderMap,
 ) -> Response {
-    let p = match j.authenticate(&headers).await {
+    let p = match j.authenticate(&headers, peer.0).await {
         Ok(p) => p,
         Err(e) => return auth_error(&e),
     };
@@ -355,10 +356,11 @@ fn scope_of(p: &Principal) -> AccountScope {
 /// `GET /jmap/ws` (RFC 8887): переход на WebSocket с подпротоколом `jmap`.
 pub(crate) async fn websocket(
     State(j): State<Arc<Jmap>>,
+    peer: Peer,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let p = match j.authenticate(&headers).await {
+    let p = match j.authenticate(&headers, peer.0).await {
         Ok(p) => p,
         Err(e) => return auth_error(&e),
     };

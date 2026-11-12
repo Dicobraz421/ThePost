@@ -134,6 +134,16 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "address book",
         include_str!("../migrations/0029_address_book.sql"),
     ),
+    (
+        30,
+        "contracts 38",
+        include_str!("../migrations/0030_contracts_38.sql"),
+    ),
+    (
+        31,
+        "account kind",
+        include_str!("../migrations/0031_account_kind.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

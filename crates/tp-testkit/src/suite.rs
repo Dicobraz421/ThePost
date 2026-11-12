@@ -51,15 +51,15 @@ use tp_contracts::delivery::{
 use tp_contracts::events::{Partition, PartitionAssigner, ShardEventLogs, ShardPartition};
 use tp_contracts::ext::{Decision, DecisionHook, DecisionHooks, FinalDelete};
 use tp_contracts::groups::{
-    DistributionGroup, GroupMember, GroupStore, HeldMessage, HoldSource, Moderation, Moderator,
-    SenderRestriction,
+    DistributionGroup, GroupMember, GroupStore, HeldCursor, HeldMessage, HoldSource, Moderation,
+    Moderator, SenderRestriction, held_page,
 };
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountState, AccountStore, AccountUpsert, Envelope, ExistingContent,
-    MailboxStore, MessageMeta, MessageQuery, MessageStore, NewMailbox, NewMessage, Policy,
-    PolicyResolver, PolicyStore, PolicyTarget, SpecialUse, account_disabled,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, Envelope,
+    ExistingContent, MailboxStore, MessageMeta, MessageQuery, MessageStore, NewMailbox, NewMessage,
+    Policy, PolicyResolver, PolicyStore, PolicyTarget, SpecialUse, account_disabled,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -2139,13 +2139,49 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
         Err(Error::NotFound)
     );
     assert_eq!(
-        store.held(t, Some(closed.id), 10).await,
+        store.held(t, Some(closed.id), None, 10).await,
         Ok(vec![h1.clone(), h2.clone()])
     );
     assert_eq!(
-        store.held(t, Some(closed.id), 1).await,
+        store.held(t, Some(closed.id), None, 1).await,
         Ok(vec![h1.clone()])
     );
+    // Страницы по курсору (CTR-55): 5 писем, у трёх одинаковое время, по 2 — без пропусков и повторов.
+    let extra = [held(2, closed.id), held(2, closed.id), held(5, closed.id)];
+    for h in &extra {
+        store.hold(t, h.clone()).await.expect("hold");
+    }
+    let expected = held_page(
+        [h1.clone(), h2.clone()].into_iter().chain(extra.clone()),
+        None,
+        usize::MAX,
+    );
+    let (mut read, mut after, mut pages) = (Vec::new(), None, 0);
+    loop {
+        let page = store
+            .held(t, Some(closed.id), after, 2)
+            .await
+            .expect("held");
+        pages += 1;
+        after = page.last().map(HeldCursor::of).or(after);
+        let last = page.len() < 2;
+        read.extend(page);
+        if last {
+            break;
+        }
+    }
+    assert_eq!(read, expected);
+    assert_eq!(pages, 3);
+    assert_eq!(store.held(t, Some(closed.id), after, 2).await, Ok(vec![]));
+    assert_eq!(
+        store
+            .held(t, None, Some(HeldCursor::of(&expected[3])), 10)
+            .await,
+        Ok(vec![h3.clone(), expected[4].clone()])
+    );
+    for h in &extra {
+        store.take_held(t, h.id).await.expect("take");
+    }
     assert_eq!(store.take_held(t, h1.id).await, Ok(h1.clone()));
     assert_eq!(store.take_held(t, h1.id).await, Err(Error::NotFound));
 
@@ -2154,7 +2190,7 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
     assert_eq!(store.get(f, all.id).await, Ok(None));
     assert_eq!(store.by_address(f, &upper).await, Ok(None));
     assert_eq!(store.expand(f, all.id).await, Err(Error::NotFound));
-    assert_eq!(store.held(f, None, 10).await, Ok(Vec::new()));
+    assert_eq!(store.held(f, None, None, 10).await, Ok(Vec::new()));
     assert_eq!(store.take_held(f, h2.id).await, Err(Error::NotFound));
     assert_eq!(store.remove(f, closed.id).await, Ok(Vec::new()));
     assert_eq!(store.get(t, closed.id).await, Ok(Some(closed.clone())));
@@ -2165,7 +2201,7 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
     assert_eq!(store.get(t, closed.id).await, Ok(None));
     store.remove(t, inner.id).await.expect("remove");
     assert_eq!(store.expand(t, all.id).await, Ok(sorted(vec![a, b])));
-    assert_eq!(store.held(t, Some(all.id), 10).await, Ok(vec![h3]));
+    assert_eq!(store.held(t, Some(all.id), None, 10).await, Ok(vec![h3]));
 }
 
 // ---------- AccountStore: external_id ----------
@@ -2200,6 +2236,8 @@ pub async fn account_external_id(
         display_name: "Анна".into(),
         external_id: Some(ext.clone()),
         enabled: true,
+        aliases: Vec::new(),
+        kind: AccountKind::User,
     };
     assert_eq!(
         accounts
@@ -2219,6 +2257,63 @@ pub async fn account_external_id(
             .expect("by ext"),
         Some(a.clone())
     );
+    // Псевдонимы (CTR-53): два псевдонима и catch-all домена — три адреса, основной первым; чтение — с записью.
+    let aliased = accounts
+        .upsert(
+            fx.tenant,
+            AccountUpsert {
+                aliases: vec![
+                    login("Sales"),
+                    format!("@{}", fx.domain_name),
+                    login("ANNA"),
+                    login("info"),
+                    login("sales"),
+                ],
+                ..upsert(login("anna"))
+            },
+        )
+        .await
+        .expect("upsert");
+    assert_eq!(
+        aliased.addresses(),
+        [login("anna"), login("sales"), login("info")].map(|a| a.to_lowercase())
+    );
+    assert_eq!(
+        accounts.get(fx.tenant, a.id).await,
+        Ok(Some(aliased.clone()))
+    );
+    assert_eq!(
+        accounts.by_external_id(fx.tenant, &ext).await,
+        Ok(Some(aliased))
+    );
+    // Запись заменяет псевдонимы.
+    assert_eq!(
+        accounts.upsert(fx.tenant, upsert(login("anna"))).await,
+        Ok(a.clone())
+    );
+    // Вид учётной записи (CTR-48) хранится с ней и заменяется записью.
+    assert_eq!(a.kind, AccountKind::User);
+    let room = accounts
+        .upsert(
+            fx.tenant,
+            AccountUpsert {
+                kind: AccountKind::Resource,
+                ..upsert(login("anna"))
+            },
+        )
+        .await
+        .expect("upsert");
+    assert_eq!(room.kind, AccountKind::Resource);
+    assert_eq!(accounts.get(fx.tenant, a.id).await, Ok(Some(room.clone())));
+    assert_eq!(
+        accounts.by_login(fx.tenant, &room.login).await,
+        Ok(Some(room))
+    );
+    assert_eq!(
+        accounts.upsert(fx.tenant, upsert(login("anna"))).await,
+        Ok(a.clone())
+    );
+
     assert_eq!(
         accounts
             .by_external_id(fx.tenant, &ext.to_uppercase())
@@ -2322,6 +2417,8 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                     display_name: n.into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await
@@ -2337,6 +2434,8 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                 display_name: "aaron".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -2432,6 +2531,8 @@ pub async fn account_by_ids(accounts: &dyn AccountStore, fx: &AccountListFixture
         display_name: n.into(),
         external_id: None,
         enabled: true,
+        aliases: Vec::new(),
+        kind: AccountKind::User,
     };
     let mut made = Vec::new();
     for n in ["ids-a", "ids-b"] {
@@ -4104,6 +4205,8 @@ pub async fn account_state(
         display_name: n.to_owned(),
         external_id: Some(format!("{n}-{run}")),
         enabled: true,
+        aliases: Vec::new(),
+        kind: AccountKind::User,
     };
     let scope = |account| AccountScope { tenant: t, account };
     let until = OffsetDateTime::now_utc()
@@ -4723,7 +4826,7 @@ pub async fn rule_moderation(
         Err(Error::Invalid(_))
     ));
     let queue: Vec<_> = groups
-        .held(t, None, 10_000)
+        .held(t, None, None, 10_000)
         .await
         .expect("queue")
         .into_iter()
@@ -4731,7 +4834,7 @@ pub async fn rule_moderation(
         .collect();
     assert_eq!(queue, [approve.clone(), decline.clone()]);
     let in_group = groups
-        .held(t, Some(GroupId::new()), 10_000)
+        .held(t, Some(GroupId::new()), None, 10_000)
         .await
         .expect("group queue");
     assert!(in_group.iter().all(|h| h.id != approve.id));
