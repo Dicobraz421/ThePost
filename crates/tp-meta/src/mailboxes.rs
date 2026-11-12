@@ -4,8 +4,6 @@
 //! поэтому пересозданная папка с тем же именем получает новое значение. UIDNEXT и наибольший `ModSeq`
 //! папки хранятся в её строке.
 
-use std::time::Duration;
-
 use async_trait::async_trait;
 use sqlx::{FromRow, PgConnection};
 use tp_contracts::events::CoreEventKind;
@@ -17,7 +15,7 @@ use uuid::Uuid;
 
 use crate::PgMeta;
 use crate::changelog::{self, Change, Op};
-use crate::retention::micros;
+use crate::retention::{TrashFor, micros};
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
 use crate::shards::ShardId;
 
@@ -331,9 +329,33 @@ pub(crate) struct Relocated {
     pub uid: Uid,
 }
 
+/// Папка `id` и все вложенные с ролями, предки раньше потомков.
+async fn subtree(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    id: MailboxId,
+) -> Result<Vec<(Uuid, Option<String>)>> {
+    sqlx::query_as(
+        "WITH RECURSIVE sub(id, role, depth) AS (
+             SELECT mailbox_id, role, 0 FROM mailboxes
+             WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3
+             UNION ALL
+             SELECT m.mailbox_id, m.role, sub.depth + 1 FROM mailboxes m JOIN sub ON m.parent_id = sub.id
+             WHERE m.tenant_id = $1 AND m.account_id = $2)
+         SELECT id, role FROM sub ORDER BY depth, id",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(id.as_uuid())
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)
+}
+
 /// Переносит письма `ids` (в этом порядке) в папку `to` с сохранением идентификаторов и новыми UID;
 /// `trash` — перенос в корзину: запомнить исходную папку для восстановления и срок окончательного удаления
-/// (политика папки по цепочке, иначе `trash` — срок по умолчанию конфигурации; CTR-07) и снять `\Deleted` (CTR-33:
+/// (срок исходной папки из `trash.folders`, иначе политика папки по цепочке в этой БД, иначе `trash.default`;
+/// [`TrashFor`], CTR-07) и снять `\Deleted` (CTR-33:
 /// иначе первый же EXPUNGE в корзине стёр бы или скрыл письмо, удалённое из другой папки).
 /// Записывает изменения `Moved` и изменения папок.
 /// Отсутствующие письма пропускаются (в UID папки остаётся пропуск).
@@ -343,13 +365,22 @@ pub(crate) async fn relocate(
     modseq: ModSeq,
     ids: &[Uuid],
     to: MailboxId,
-    trash: Option<Duration>,
+    trash: Option<&TrashFor>,
 ) -> Result<Vec<Relocated>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let first = alloc_uids(tx, scope, to, ids.len(), modseq).await?;
     let ms = to_i64(modseq.0)?;
+    let folders: Vec<(Uuid, i64)> = trash
+        .map(|t| {
+            t.folders
+                .iter()
+                .map(|(id, d)| Ok((*id, micros(*d)?)))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     // Подзапрос `old` видит строки до UPDATE: прежние папка и UID.
     let rows: Vec<(Uuid, Uuid, i64, i64)> = sqlx::query_as(
         "WITH src AS (SELECT id, ord FROM unnest($3::uuid[]) WITH ORDINALITY AS s(id, ord)),
@@ -360,6 +391,8 @@ pub(crate) async fn relocate(
                                trashed_from = CASE WHEN $7 THEN old.mailbox_id END,
                                trashed_at = CASE WHEN $7 THEN now() END, hidden_at = NULL,
                                trash_expires_at = CASE WHEN $7 THEN now() + coalesce(
+                                   (SELECT f.us FROM unnest($10::uuid[], $11::int8[]) AS f(id, us)
+                                    WHERE f.id = old.mailbox_id),
                                    tp_trash_retention_us(m.tenant_id, m.account_id, old.mailbox_id), $8
                                ) * interval '1 microsecond' END
          FROM src, old
@@ -373,8 +406,10 @@ pub(crate) async fn relocate(
     .bind(i64::from(first.0))
     .bind(ms)
     .bind(trash.is_some())
-    .bind(trash.map(micros).transpose()?.unwrap_or(0))
+    .bind(trash.map(|t| micros(t.default)).transpose()?.unwrap_or(0))
     .bind(r"\Deleted")
+    .bind(folders.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+    .bind(folders.iter().map(|(_, us)| *us).collect::<Vec<_>>())
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -554,26 +589,19 @@ impl MailboxStore for PgMeta {
     async fn delete(&self, scope: AccountScope, id: MailboxId, cascade: bool) -> Result<()> {
         self.once(async move {
         let db = self.box_db(scope).await?;
-        let trash_for = self.trash_retention(&db, scope).await?;
+        let trash_for = self
+            .trash_retention(&db, scope, || async {
+                let mut tx = begin(&db.pool, scope.tenant).await?;
+                let boxes = subtree(&mut tx, scope, id).await?;
+                crate::commits::commit(tx).await?;
+                Ok(boxes.into_iter().map(|(b, _)| b).collect())
+            })
+            .await?;
         let mut tx = begin(&db.pool, scope.tenant).await?;
         // Строка состояния ящика заблокирована: иерархия папок не меняется до конца транзакции.
         let ms = changelog::bump_modseq(&mut tx, scope).await?;
         // Папка и все вложенные, предки раньше потомков.
-        let subtree: Vec<(Uuid, Option<String>)> = sqlx::query_as(
-            "WITH RECURSIVE sub(id, role, depth) AS (
-                 SELECT mailbox_id, role, 0 FROM mailboxes
-                 WHERE tenant_id = $1 AND account_id = $2 AND mailbox_id = $3
-                 UNION ALL
-                 SELECT m.mailbox_id, m.role, sub.depth + 1 FROM mailboxes m JOIN sub ON m.parent_id = sub.id
-                 WHERE m.tenant_id = $1 AND m.account_id = $2)
-             SELECT id, role FROM sub ORDER BY depth, id",
-        )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(id.as_uuid())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
+        let subtree = subtree(&mut tx, scope, id).await?;
         if subtree.is_empty() {
             return Err(Error::NotFound);
         }
@@ -608,7 +636,7 @@ impl MailboxStore for PgMeta {
                 ms,
                 &ids,
                 trash,
-                Some(trash_for),
+                Some(&trash_for),
             )
             .await?
             {

@@ -121,8 +121,13 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
     ),
     (
         27,
+        "submissions mailbox audit",
+        include_str!("../migrations/0027_submissions_mailbox_audit.sql"),
+    ),
+    (
+        28,
         "audit export",
-        include_str!("../migrations/0027_audit_export.sql"),
+        include_str!("../migrations/0028_audit_export.sql"),
     ),
 ];
 
