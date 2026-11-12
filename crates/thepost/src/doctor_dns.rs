@@ -2,20 +2,23 @@
 //!
 //! Проверки: MX основного домена (и указывает ли он на `smtp.hostname`), SPF, DKIM по селекторам
 //! `smtp.dkim.domains`, DMARC, MTA-STS, PTR исходящих адресов (`smtp.queue.source_ip` или адреса
-//! `smtp.hostname`), срок и имена сертификата `tls`, слушатели с PROXY protocol v2 за балансировщиком.
+//! `smtp.hostname`), срок и имена сертификата `tls`, закрытый ключ `tls` (файл `key_file` или секрет `tls.key`
+//! подходит к цепочке), слушатели с PROXY protocol v2 за балансировщиком.
 //! Имена зон RFC 6761 (`.test`, `.example`, `.invalid`, `.localhost`) — проверки DNS пропускаются (SKIP, CMP-09).
 //! DNS — через [`Dns`]: в работе — системный резолвер (`mail-auth`), в тестах — подстановка.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use mail_auth::{MessageAuthenticator, NoCache};
+use tp_contracts::secrets::SecretStore;
 use tp_platform::listen::EndpointConfig;
-use tp_platform::{AcmeConfig, Config, TlsConfig};
+use tp_platform::{AcmeConfig, Config, TlsCerts, TlsConfig};
 use tp_smtp::SmtpConfig;
 
-use crate::doctor::{Report, Status};
+use crate::doctor::{Report, Status, message};
 use crate::sections::{DoctorSection, IMAP, SMTP};
 
 /// Запросы DNS проверок. Нет записей (NXDOMAIN, пустой ответ) — пустой список; сбой — `Err`.
@@ -165,8 +168,15 @@ fn skip_reserved(id: &str, name: &str, report: &mut Report) -> bool {
     true
 }
 
-/// Все проверки DNS, сертификатов и PROXY v2.
-pub async fn check(cfg: &Config, dns: &dyn Dns, doctor: &DoctorSection, report: &mut Report) {
+/// Все проверки DNS, сертификатов и PROXY v2; `store` — хранилище секретов узла (ключ `tls.key`), `None` — не
+/// настроено.
+pub async fn check(
+    cfg: &Config,
+    dns: &dyn Dns,
+    store: Option<&Arc<dyn SecretStore>>,
+    doctor: &DoctorSection,
+    report: &mut Report,
+) {
     let smtp = cfg
         .section::<SmtpConfig>(SMTP)
         .map(|s| (*s).clone())
@@ -179,7 +189,7 @@ pub async fn check(cfg: &Config, dns: &dyn Dns, doctor: &DoctorSection, report: 
     dmarc(&domain, dns, t, report).await;
     mta_sts(&domain, dns, t, report).await;
     ptr(&smtp, dns, t, report).await;
-    certificate(cfg, &smtp, doctor, SystemTime::now(), report).await;
+    certificate(cfg, &smtp, store, doctor, SystemTime::now(), report).await;
     proxy(cfg, &smtp, report);
 }
 
@@ -441,6 +451,7 @@ fn covers(names: &[String], host: &str) -> bool {
 async fn certificate(
     cfg: &Config,
     smtp: &SmtpConfig,
+    store: Option<&Arc<dyn SecretStore>>,
     doctor: &DoctorSection,
     now: SystemTime,
     report: &mut Report,
@@ -493,6 +504,7 @@ async fn certificate(
         _ => format!("действителен ещё {days} сут."),
     };
     report.push(id, status, path.clone(), msg);
+    key(&tls, store, report).await;
     let host = smtp.hostname.trim_end_matches('.');
     if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
         if covers(&info.names, host) {
@@ -510,6 +522,36 @@ async fn certificate(
                 format!("сертификат не покрывает smtp.hostname ({host}): клиенты не проверят TLS"),
             );
         }
+    }
+}
+
+/// Закрытый ключ секции `tls` подходит к цепочке `cert_file` — та же загрузка, что при запуске узла. При `tls.key`
+/// ключ читается из хранилища секретов, файл `key_file` не проверяется; иначе — файл `key_file`. В отчёте — путь
+/// или ссылка на секрет, значение ключа не выводится.
+async fn key(tls: &TlsConfig, store: Option<&Arc<dyn SecretStore>>, report: &mut Report) {
+    let id = "tls.key";
+    let (value, loaded) = match (&tls.key, store) {
+        (Some(secret), None) => {
+            report.push(
+                id,
+                Status::Skipped,
+                format!("секрет {secret}"),
+                "хранилище секретов не настроено",
+            );
+            return;
+        }
+        (Some(secret), Some(store)) => (
+            format!("секрет {secret}"),
+            TlsCerts::load_with_secrets(tls, store.clone()).await,
+        ),
+        (None, _) => (
+            tls.key_file.display().to_string(),
+            TlsCerts::load(tls).await,
+        ),
+    };
+    match loaded {
+        Ok(_) => report.push(id, Status::Ok, value, "ключ подходит к сертификату"),
+        Err(e) => report.push(id, Status::Fail, value, message(&e)),
     }
 }
 
@@ -572,14 +614,15 @@ fn proxy(cfg: &Config, smtp: &SmtpConfig, report: &mut Report) {
 pub async fn check_with(
     cfg: &Config,
     dns: Option<&dyn Dns>,
+    store: Option<&Arc<dyn SecretStore>>,
     doctor: &DoctorSection,
     report: &mut Report,
 ) {
     if let Some(dns) = dns {
-        return check(cfg, dns, doctor, report).await;
+        return check(cfg, dns, store, doctor, report).await;
     }
     match SystemDns::new() {
-        Ok(dns) => check(cfg, &dns, doctor, report).await,
+        Ok(dns) => check(cfg, &dns, store, doctor, report).await,
         Err(e) => report.push("dns.resolver", Status::Fail, "", e.to_string()),
     }
 }
@@ -672,8 +715,16 @@ mod tests {
     const SMTP: &str = "smtp:\n  hostname: mx.example.org\n  dkim:\n    domains:\n      example.org:\n        selector: s1\n        keys:\n          s1: { algorithm: rsa-sha256, key: { secret: \"thepost/dkim#s1\" } }\n";
 
     async fn run(cfg: &Config, dns: &MockDns) -> Report {
+        run_store(cfg, dns, None).await
+    }
+
+    async fn run_store(
+        cfg: &Config,
+        dns: &MockDns,
+        store: Option<&Arc<dyn SecretStore>>,
+    ) -> Report {
         let mut report = Report::default();
-        check(cfg, dns, &DoctorSection::default(), &mut report).await;
+        check(cfg, dns, store, &DoctorSection::default(), &mut report).await;
         report
     }
 
@@ -812,6 +863,56 @@ mod tests {
         let cfg = config("tls:\n  cert_file: /nonexistent/cert.pem\n");
         let r = run(&cfg, &healthy()).await;
         assert_eq!(status(&r, "tls.certificate"), Some(Status::Warn));
+    }
+
+    /// APP-35: ключ в файле — пара проверяется; `tls.key` — файл `key_file` не читается, секрет читается из
+    /// хранилища и сверяется с цепочкой; значение ключа в отчёт не попадает.
+    #[tokio::test]
+    async fn tls_key_from_file_or_secret() {
+        const KEY: &str = include_str!("testdata/key.pem");
+        const OTHER: &str = include_str!("testdata/key-rsa.pem");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("cert.pem");
+        let key_file = dir.path().join("key.pem");
+        std::fs::write(&cert, CERT).expect("cert");
+        std::fs::write(&key_file, KEY).expect("key");
+        let path = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+        let dns = healthy();
+
+        let files = config(&format!(
+            "tls:\n  cert_file: \"{}\"\n  key_file: \"{}\"\n",
+            path(&cert),
+            path(&key_file)
+        ));
+        let r = run(&files, &dns).await;
+        assert_eq!(status(&r, "tls.key"), Some(Status::Ok), "{r:?}");
+        std::fs::write(&key_file, OTHER).expect("key");
+        let r = run(&files, &dns).await;
+        assert_eq!(status(&r, "tls.key"), Some(Status::Fail), "{r:?}");
+
+        // Файла key_file нет (значение по умолчанию): при tls.key о нём не сообщается.
+        let secret: tp_contracts::secrets::SecretRef = "thepost/tls#key".parse().expect("ref");
+        let by_secret = config(&format!(
+            "tls:\n  cert_file: \"{}\"\n  key: {{ secret: \"{secret}\" }}\n",
+            path(&cert)
+        ));
+        let mem = Arc::new(tp_testkit::MemSecretStore::default());
+        let store: Arc<dyn SecretStore> = mem.clone();
+        let r = run_store(&by_secret, &dns, None).await;
+        assert_eq!(status(&r, "tls.key"), Some(Status::Skipped), "{r:?}");
+        let r = run_store(&by_secret, &dns, Some(&store)).await;
+        assert_eq!(status(&r, "tls.key"), Some(Status::Fail), "{r:?}");
+        mem.set(&secret, OTHER);
+        let r = run_store(&by_secret, &dns, Some(&store)).await;
+        assert_eq!(status(&r, "tls.key"), Some(Status::Fail), "{r:?}");
+        mem.set(&secret, KEY);
+        let r = run_store(&by_secret, &dns, Some(&store)).await;
+        let check = r.get("tls.key").expect("tls.key");
+        assert_eq!(check.status, Status::Ok, "{r:?}");
+        assert_eq!(check.value, "секрет thepost/tls#key");
+        let text = format!("{r:?}");
+        assert!(!text.contains("privkey.pem"), "{text}");
+        assert!(!text.contains("PRIVATE KEY"), "{text}");
     }
 
     #[tokio::test]

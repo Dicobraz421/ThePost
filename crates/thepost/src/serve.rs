@@ -224,7 +224,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let acme = acme::prepare(&cfg, &sockets, aux.clone()).await?;
     // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
     let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
-        let certs = Arc::new(TlsCerts::load(&tls).await.map_err(|e| {
+        // Ключ по ссылке `tls.key` читается из хранилища секретов узла и перечитывается по новой версии (APP-35).
+        let certs = Arc::new(TlsCerts::load_with_secrets(&tls, store.clone()).await.map_err(|e| {
             infra::context(
                 "tls",
                 match e {
@@ -954,6 +955,105 @@ mod tests {
         let report = running.wait().await.expect("wait");
         assert!(report.failed.is_empty(), "{report:?}");
         assert!(report.cancelled.is_empty(), "{report:?}");
+    }
+
+    /// TLS-соединение со слушателем, доверяя только сертификату `cert` (PEM): `true` — сервер предъявил его.
+    async fn presents(addr: SocketAddr, cert: &[u8]) -> bool {
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(cert).expect("pem"))
+            .expect("root");
+        let cfg = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let name = ServerName::try_from("localhost").expect("name");
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(name, tcp)
+            .await
+            .is_ok()
+    }
+
+    /// APP-35: ключ TLS по ссылке `tls.key` из хранилища секретов узла (файла `key_file` нет) — слушатель с
+    /// неявным TLS стартует; новая версия секрета с новой цепочкой подхватывается без перезапуска.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_key_from_secret_store_and_rotation() {
+        const CERT: &[u8] = include_bytes!("testdata/cert.pem");
+        const KEY: &str = include_str!("testdata/key.pem");
+        // Вторая пара на то же имя (`localhost`) — из тестовых данных tp-platform.
+        let other = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tp-platform/src/testdata");
+        let cert2 = std::fs::read(other.join("cert-b.pem")).expect("cert-b");
+        let key2 = std::fs::read_to_string(other.join("key-b.pem")).expect("key-b");
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, password) = split_password(&dev_url(&url));
+        let secrets = Arc::new(MemSecretStore::default());
+        let db: SecretRef = "thepost/db#password".parse().expect("ref");
+        let key: SecretRef = "thepost/tls#key".parse().expect("ref");
+        secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&cert, CERT).expect("cert");
+        let path = write_config(
+            dir.path(),
+            &format!(
+                "domain: example.org\nprofile: dev\nroles: [imap]\n\
+                 service_http:\n  listen: 127.0.0.1:0\n  allow_plaintext: true\n\
+                 database:\n  url: \"{url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
+                 meta:\n  events:\n    node_ttl: 3s\n\
+                 cluster:\n  node_id: app-tls-{pid}\n\
+                 runtime:\n  drain_deadline: 5s\n\
+                 tls:\n  cert_file: \"{cert}\"\n  key: {{ secret: \"{key}\" }}\n  key_poll_interval: 100ms\n\
+                 imap:\n  listeners:\n    - {{ listen: \"127.0.0.1:0\", implicit_tls: true }}\n\
+                 blob:\n  url: file://{blob}\n",
+                pid = std::process::id(),
+                cert = cert.display(),
+                blob = dir.path().join("blob").display(),
+            ),
+        );
+        // Ключа в хранилище нет — узел не стартует и называет секрет.
+        let (o, _) = opts(path.clone(), Some(secrets.clone()));
+        let e = start(o).await.expect_err("no tls key").to_string();
+        assert!(e.contains("thepost/tls#key"), "{e}");
+        secrets.set(&key, KEY);
+        let (o, shutdown) = opts(path, Some(secrets.clone()));
+        let running = start(o).await.expect("start");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !running.health.is_ready() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "узел не готов: {:?}",
+                running.health.roles_status()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let imap = running.listeners.get(Role::Imap.as_str())[0];
+        assert!(presents(imap, CERT).await);
+        assert!(!presents(imap, &cert2).await);
+
+        // Новая пара: цепочка в файле, ключ — новой версией секрета; опрос секрета (`key_poll_interval`)
+        // перечитывает пару, прежняя действует до успешной загрузки.
+        std::fs::write(&cert, &cert2).expect("cert");
+        secrets.set(&key, key2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !presents(imap, &cert2).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "новая версия ключа не подхвачена"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        shutdown.cancel();
+        let report = running.wait().await.expect("wait");
+        assert!(report.failed.is_empty(), "{report:?}");
     }
 
     /// Сертификаты узлов внутреннего УЦ из `tp-cluster` (CN `a`, `b`; SAN `127.0.0.1`).

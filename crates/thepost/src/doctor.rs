@@ -175,7 +175,7 @@ impl Report {
 }
 
 /// Сообщение ошибки без префикса варианта.
-fn message(e: &Error) -> String {
+pub(crate) fn message(e: &Error) -> String {
     match e {
         Error::Invalid(m) | Error::Internal(m) => m.clone(),
         other => other.to_string(),
@@ -289,7 +289,7 @@ pub async fn check(
             "хранилище секретов не настроено",
         ),
     }
-    doctor_dns::check_with(cfg, dns, &doctor, report).await;
+    doctor_dns::check_with(cfg, dns, store.as_ref(), &doctor, report).await;
     internal_pki(cfg, SystemTime::now(), report).await;
 }
 
