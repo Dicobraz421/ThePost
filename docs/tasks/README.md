@@ -268,6 +268,24 @@
 | [APP-11](APP-11.md) | CLI thepost admin | app | A | app-07 | done | ADM-01 |
 | [DEP-10](DEP-10.md) | HPA, VPA и эталон «малый Enterprise» | deploy | A | deploy-07 | done | DEP-09 |
 
+## Ф1 · Хвосты PR 10–12.11 — этап 3: шарды, реплики, Rpc, edge, «малый Enterprise»
+
+| Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
+|---|---|---|---|---|---|---|
+| [SYS-13](SYS-13.md) | свободное место файловой системы (`statvfs`) | sys | A | sys-08 | ready | — |
+| [APP-45](APP-45.md) | межузловой канал: перечитывание сертификатов по событиям | app | A | app-40 | todo | CLU-14 |
+| [APP-46](APP-46.md) | службы ролей узла в Rpc | app | A | app-40 | todo | APP-18 |
+| [APP-47](APP-47.md) | шарды и реплики СУБД в узле | app | A | app-40 | todo | META-30,META-31,META-32,META-41 |
+| [APP-48](APP-48.md) | нагрузка узла: свободное место дисков кэша | app | A | app-40 | todo | SYS-13,APP-10 |
+| [META-61](META-61.md) | срок корзины уровня папки на шарде, отличном от основного | meta | A | meta-38 | ready | META-30 |
+| [META-62](META-62.md) | повтор `enqueue` и пароля приложения при переключении СУБД | meta | A | meta-38 | ready | META-40 |
+| [DEP-30](DEP-30.md) | эталоны: прямые адреса и реплики СУБД | deploy | A | deploy-24 | ready | META-41,META-32 |
+| [DEP-31](DEP-31.md) | прогон pg-ha и «малого Enterprise» после правки community.postgresql | deploy | A | deploy-24 | ready | DEP-17,DEP-18 |
+| [DEP-32](DEP-32.md) | «малый Enterprise» на 5 ВМ и отказ одной ВМ | deploy | A | deploy-24 | ready | DEP-10,DEP-31 |
+| [DEP-33](DEP-33.md) | OpenBao в Kubernetes без `bootstrap.sh` | deploy | A | deploy-24 | ready | DEP-10 |
+| [DEP-34](DEP-34.md) | пресет edge по SRS 2.6: без BLOB и очереди | deploy | A | deploy-24 | ready | SYS-12 |
+| [DEPS-09](DEPS-09.md) | mail-parser 1.0 в коде крейтов | deps | B | deps-09 | ready | — |
+
 ## Ф1 · Решение 2026-11-04: соответствие функциям Exchange — этап 3, кроме `jmap-14` (этап 2)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
@@ -465,6 +483,30 @@
 | [APP-34](APP-34.md) | метрики Д.7 в `/metrics` узла — пул СУБД, слушатель, NOTIFY, «сироты» | app | A | app-33 | todo | PLT-25,PLT-27,META-53,META-55,BLOB-16 |
 | [APP-36](APP-36.md) | `InternalTls.key` в узле — межузловой канал и СУБД | app | A | app-34 | todo | CTR-52,CLU-16,META-56,APP-35 |
 
+## Ф1 · Хвосты PR 10–12.11 — этапы 1 и 2: защита от перебора по адресу, очистка журналов, CLI, эталон SMB
+
+| Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
+|---|---|---|---|---|---|---|
+| [CTR-57](CTR-57.md) | адрес клиента в проверке учётных данных | contracts | B | contracts-39 | ready | — |
+| [AUTH-14](AUTH-14.md) | SASL передаёт адрес клиента в проверку учётных данных | auth | A | auth-09 | todo | CTR-57 |
+| [SMTP-35](SMTP-35.md) | адрес клиента в AUTH SMTP | smtp | A | smtp-15 | todo | CTR-57 |
+| [IMAP-19](IMAP-19.md) | адрес клиента во входе IMAP и POP3 | imap | A | imap-10 | todo | CTR-57 |
+| [IMAP-20](IMAP-20.md) | тест: EXPUNGE в корзине не трогает письмо, перенесённое из INBOX с `\Deleted` | imap | A | imap-10 | todo | — |
+| [JMAP-37](JMAP-37.md) | адрес клиента во входе JMAP по HTTP | jmap | A | jmap-21 | todo | CTR-57 |
+| [APP-39](APP-39.md) | maintenance: срок журнала доставки и токенов `admin init` | app | A | app-37 | ready | META-22,META-43 |
+| [APP-40](APP-40.md) | защита от перебора по адресу и подсети в узле | app | A | app-38 | todo | CTR-57 |
+| [ADM-23](ADM-23.md) | тест: `AccountQuery` из строки запроса | admin | A | admin-16 | ready | ADM-13 |
+| [APP-41](APP-41.md) | CLI `thepost admin account list --after` | app | A | app-39 | ready | APP-22 |
+| [APP-42](APP-42.md) | CLI `thepost admin`: вход через OIDC device flow | app | A | app-39 | ready | APP-11 |
+| [APP-43](APP-43.md) | CLI `thepost admin`: остальные операции Admin API | app | A | app-39 | ready | APP-22 |
+| [APP-44](APP-44.md) | maintenance: проверка целостности `verify` по расписанию | app | A | app-39 | ready | BLOB-14 |
+| [AUTH-15](AUTH-15.md) | синхронизация групп LDAP: участники по `external_id` | auth | A | auth-10 | ready | CTR-32 |
+| [DEP-27](DEP-27.md) | роль thepost: не ждать готовности узла; копия OpenBao в deploy/README | deploy | A | deploy-23 | ready | DEP-23 |
+| [DEP-28](DEP-28.md) | Helm: образ узла из ghcr.io | deploy | A | deploy-23 | ready | CI-03 |
+| [DEP-29](DEP-29.md) | ручная проверка: резервные копии SMB в S3 | deploy | A | deploy-23 | ready | DEP-15 |
+| [DOC-02](DOC-02.md) | INSTALL: новый сервер без ожидания готовности узла | docs | A | docs-02 | todo | DEP-27 |
+| [PLT-28](PLT-28.md) | списки отзыва (CRL) для сертификатов клиентов | platform | A | platform-18 | ready | PLT-22 |
+
 ## Ф2. Совместная работа (≈5 мес.)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
@@ -525,7 +567,7 @@
 | [UI-09](UI-09.md) | правила и автоответ пользователя; покрытие Admin API | console | A | console-03 | todo | UI-04,UI-05,UI-06,UI-07,UI-08,ADM-14 |
 | [ADM-15](ADM-15.md) | раздача веб-консоли ролью admin | admin | A | admin-10 | todo | DEPS-05,UI-01 |
 | [CTR-47](CTR-47.md) | планирование встреч — iTIP и занятость | contracts | B | contracts-34 | done | CTR-45 |
-| [META-54](META-54.md) | занятость повторяющихся событий — разворот при запросе | meta | B | meta-35 | ready | CTR-47 |
+| [META-54](META-54.md) | занятость повторяющихся событий — разворот при запросе | meta | B | meta-35 | todo | CTR-47,META-51 |
 | [SMTP-34](SMTP-34.md) | пересылка правилами и автоответ — через правила получателя с проверкой петли | smtp | A | smtp-14 | ready | SMTP-31 |
 | [ADM-17](ADM-17.md) | Sieve-скрипты пользователя в Admin API и CLI | admin | A | admin-12 | ready | — |
 | [APP-32](APP-32.md) | очистка надгробий DAV и журнала автоответов в роли maintenance | app | A | app-31 | ready | META-48,META-50 |
@@ -582,6 +624,13 @@
 | [JMAP-36](JMAP-36.md) | Calendar и AddressBook — `isDefault`, `isSubscribed`, `isVisible`, оповещения по умолчанию | jmap | A | jmap-20 | todo | CTR-56,JMAP-27,JMAP-25 |
 | [ADM-21](ADM-21.md) | очередь модерации — страницы по курсору | admin | A | admin-15 | todo | CTR-55,META-59 |
 | [APP-38](APP-38.md) | подключения хвостов Ф2 в узле — адреса для CalDAV, темы писем, пределы Sieve в JMAP | app | A | app-36 | todo | DAV-23,META-57,ADM-19,JMAP-35,APP-29,APP-27 |
+| [CTR-58](CTR-58.md) | признак «скрыта из GAL» у учётной записи каталога | contracts | B | contracts-40 | ready | — |
+| [AUTH-16](AUTH-16.md) | LDAP: атрибут «скрыта из GAL» у учётной записи | auth | A | auth-11 | todo | CTR-58 |
+| [DAV-26](DAV-26.md) | адрес клиента во входе CalDAV и CardDAV | dav | A | dav-08 | todo | CTR-57 |
+| [DAV-27](DAV-27.md) | GAL: скрытые учётные записи не попадают в книгу «Организация» | dav | A | dav-08 | todo | CTR-58,DAV-12 |
+| [DAV-28](DAV-28.md) | GAL: ETag карточки — хэш её содержимого | dav | A | dav-08 | todo | DAV-12 |
+| [SIEVE-12](SIEVE-12.md) | адрес клиента во входе ManageSieve | sieve | A | sieve-05 | todo | CTR-57 |
+| [JMAP-38](JMAP-38.md) | JMAP Principal: тип `resource` для переговорных и оборудования | jmap | A | jmap-22 | todo | JMAP-30,CTR-48 |
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 

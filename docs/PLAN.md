@@ -12,8 +12,8 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 160/193 | 234/279 | в работе, 84 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
-| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 14/59 | 35/113 | в работе, 31 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 160/211 | 234/311 | в работе, 75 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 14/64 | 35/120 | в работе, 29 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/1 | 0/1 | не начат | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
 
@@ -41,6 +41,8 @@
    - `admin-06` (ADM-11) → `app-18` (APP-19, `thepost admin init`) → `meta-27` (META-43, токены в PostgreSQL) — первый администратор без OIDC (#193).
    - `meta-26` (META-42) и `testkit-05` (KIT-08) — системные папки по роли.
    - `app-06` (APP-10) — корзина, сжатие и нагрузка в узле; `app-16` (APP-17) — журнал доставки, группы, обучение антиспама, защита от перебора.
+   - Хвосты PR 10–12.11: защита от перебора по адресу и подсети (SRS 6.3) — `contracts-39` (CTR-57) → `auth-09`, `smtp-15`,
+     `imap-10`, `jmap-21` → `app-38`; срок журнала доставки и токенов `admin init` — `app-37`.
    - Приёмка этапа: `docs/manual-tests/CMP-01.md` целиком на бете (стенд DEP-04), клиенты Thunderbird и Postman.
 2. **Этап 2 — «пилот SMB»**: удобство и надёжность эксплуатации.
    - `app-07` (APP-11, CLI `thepost admin`), `jmap-14` (JMAP-14, автонастройка клиентов), `auth-06` (AUTH-11).
@@ -53,28 +55,37 @@
    - Хвосты облачных волн 12.11: `app-32` (APP-35, `tls.key` в узле), `imap-09` (IMAP-18, нестабильный тест), `deploy-22` (DEP-26, юнит systemd);
      метрики Д.7 в `/metrics` узла — `contracts-37` (CTR-51, CTR-52) → `platform-17`, `meta-36` → `app-33` (APP-34) — до прогона Д.7 на `deploy-21`;
      ключ TLS межузлового канала и СУБД из OpenBao — `contracts-37` → `meta-36`, `cluster-11` → `app-34` (APP-36).
+   - Хвосты PR 10–12.11: `admin-16` (ADM-23), `app-39` (CLI `--after`, OIDC device flow, остальные операции; `verify` по
+     расписанию), `auth-10` (группы LDAP по `external_id`), `deploy-23` (не ждать готовности узла, Helm из ghcr.io, копии в S3)
+     → `docs-02`, `platform-18` (CRL).
+   - Ручная проверка подписанного профиля `.mobileconfig` на iPhone и Mac — `docs/manual-tests/JMAP-22.md` на бете (JMAP-22, APP-23).
    - Приёмка этапа: критерии выхода Ф1 ниже (нагрузка Д.6 для SMB) — отчёт `criteria.md` DEP-13 без «не прошёл».
 3. **Этап 3 — после пилота и шагов 4.1–4.3** («рюшечки» и Enterprise; решение 33): соответствие Exchange (`contracts-23` и зависящие: архив,
    отключённые ящики, динамические группы, личные списки, отложенная отправка, аудит доступа), внешние встречи
    (`contracts-24`, `meta-16`, `jmap-09`), модерация правилами потока (`contracts-31`, `meta-28`, `smtp-11`), шарды (`meta-13`, `meta-14`, `blob-08`), Enterprise и HA (`deploy-07`,
    `meta-25`, `cluster-09`, `app-17`), сборка Exchange (`app-08`), `contracts-30`.
+   - Хвосты PR 10–12.11: шарды, реплики, Rpc и сертификаты межузлового канала в узле — `sys-08` → `app-40`; `meta-38`;
+     `deploy-24` (прямые адреса и реплики СУБД, прогоны pg-ha и «малого Enterprise», отказ ВМ, OpenBao без `bootstrap.sh`,
+     пресет edge); `deps-09` (mail-parser 1.0, решение 17).
 
 4. **Этап 4 — Ф2 «совместная работа»** (раздел «Ф2. Совместная работа» ниже). Шаги 4.1–4.3 — раньше этапа 3
    (решение 33): волны на свободные полосы, когда в этапах 1–2 нет готовых; внутри этапа — по порядку пунктов.
    - 4.1 Календари, контакты, автоответ: `contracts-33` (CTR-45, CTR-46) → `deps-04`; `dav-01` → `dav-02` (CalDAV) → `dav-03`
      (CardDAV, GAL); `meta-30`, `meta-31`; `sieve-01` → `sieve-02`; `smtp-12`; `jmap-16` (VacationResponse, JMAP Sieve, Contacts);
      `admin-09` → `app-28` (DAV в узле), `app-25` (Sieve и автоответ в узле) → `deploy-17`.
-     Хвосты: `contracts-38` (CTR-53…56) → `meta-37`, `dav-07`, `testkit-06` → `jmap-20`; `deps-08` → `sieve-04`.
+     Хвосты: `contracts-38` (CTR-53…56) → `meta-37`, `dav-07`, `testkit-06` → `jmap-20`; `deps-08` → `sieve-04`;
+     хвосты PR 10–12.11 — `contracts-40` (CTR-58, скрытие из GAL) → `auth-11`, `dav-08`.
      Приёмка: `docs/manual-tests/DAV-08.md`, `DAV-11.md`, `APP-29.md`, `APP-26.md` — Thunderbird, iOS и macOS, DAVx5, Postman.
    - 4.2 Управление правилами, JMAP Calendars, консоль: `sieve-03` (ManageSieve), `jmap-17` → `app-26`; `ci-05` (полоса `console`)
      → `console-01` → `console-02` → `console-03`, `deps-05` → `admin-10` (раздача консоли).
      Хвосты: `auth-08` → `app-26`; `app-35` (выгрузка схемы API); `admin-13`; `ci-06` → `admin-14` (CLI); `deps-07` → `ci-07`
-     (консоль в образе); `contracts-38`, `meta-37` → `admin-15`.
+     (консоль в образе); `contracts-38`, `meta-37` → `admin-15`; `sieve-05` (адрес клиента в ManageSieve).
    - 4.3 Встречи: `contracts-34` (CTR-47) → `meta-32`, `dav-04` (RFC 6638, iMIP, занятость), `smtp-13`, `jmap-18` → `app-27`;
-     хвосты — `app-36` (APP-38, подключения в узле) после `dav-07`, `jmap-20`, `admin-13`, `app-26`.
+     хвосты — `app-36` (APP-38, подключения в узле) после `dav-07`, `jmap-20`, `admin-13`, `app-26`;
+     `meta-35` (META-54, разворот повторов) — после `meta-32` (META-51), решение 59.
    - Приёмка этапа: `deploy-18` (CMP-10) — критерий Ф2 на бете.
    - 4.4 «Рюшечки» Ф2 (после приёмки): `contracts-35` (общий доступ, представители, ресурсы) → `meta-33`, `auth-07`, `dav-05`,
-     `jmap-19`, `admin-11` → `console-04`; `dav-06` (публикация ICS, FBURL, оргструктура в GAL) — после `contracts-23`, `contracts-24`,
+     `jmap-19`, `admin-11` → `console-04`, `jmap-22` (тип `resource` в Principal); `dav-06` (публикация ICS, FBURL, оргструктура в GAL) — после `contracts-23`, `contracts-24`,
      `meta-16`, `auth-05` этапа 3.
 
 ## Ф0. Основа (≈3 мес.)
@@ -224,6 +235,18 @@
 | blob-08 | BLOB-15 | A | blob-07, meta-13 | 4 |
 | ✅ app-07 | APP-11 | A | admin-01 | 2 |
 | ✅ deploy-07 | DEP-10 | A | deploy-06 | 4 |
+
+### Хвосты PR 10–12.11 — этап 3: шарды, реплики, Rpc, edge, «малый Enterprise»
+
+Источник — «Что не сделано» и отчёты PR #263, #291, #350, #369, #389, #390, #393, #398, #400, #401, #403, #406, #412.
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| sys-08 | SYS-13 | A | — | 2 |
+| app-40 | APP-45, APP-46, APP-47, APP-48 | A | cluster-09, app-17, meta-13, meta-14, meta-25, sys-08 | 2 |
+| meta-38 | META-61, META-62 | A | meta-13, meta-24 | 3 |
+| deploy-24 | DEP-30, DEP-31, DEP-32, DEP-33, DEP-34 | A | deploy-07, deploy-15, sys-07, meta-25 | 4 |
+| deps-09 (ветка `x/deps-09`) | DEPS-09 | B | deps-02 | 1 |
 
 ### Решение 2026-11-04: соответствие функциям Exchange — этап 3, кроме `jmap-14` (этап 2)
 
@@ -408,6 +431,27 @@
 | app-33 | APP-34 | A | platform-17, meta-36, blob-09 | 2 |
 | app-34 | APP-36 | A | meta-36, cluster-11, app-32 | 2 |
 
+### Хвосты PR 10–12.11 — этапы 1 и 2: защита от перебора по адресу, очистка журналов, CLI, эталон SMB
+
+Источник — «Что не сделано» и отчёты PR #212, #281, #286, #287, #293, #295, #353, #366, #375, #378, #395, #421; этап —
+как у исходной волны (`app-37`, `app-38` и волны адреса клиента — этап 1, остальные — этап 2).
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| contracts-39 (ветка `x/contracts-39`) | CTR-57 | B | — | 1 |
+| auth-09 | AUTH-14 | A | contracts-39 | 1 |
+| smtp-15 | SMTP-35 | A | contracts-39 | 4 |
+| imap-10 | IMAP-19, IMAP-20 | A | contracts-39 | 2 |
+| jmap-21 | JMAP-37 | A | contracts-39 | 3 |
+| app-37 | APP-39 | A | meta-27, app-16 | 2 |
+| app-38 | APP-40 | A | contracts-39, auth-09 | 2 |
+| admin-16 | ADM-23 | A | admin-08 | 3 |
+| app-39 | APP-41, APP-42, APP-43, APP-44 | A | app-21, blob-07 | 2 |
+| auth-10 | AUTH-15 | A | contracts-20 | 1 |
+| deploy-23 | DEP-27, DEP-28, DEP-29 | A | deploy-19, deploy-13, ci-03 | 4 |
+| docs-02 | DOC-02 | A | deploy-23 | 1 |
+| platform-18 | PLT-28 | A | platform-12 | 2 |
+
 
 Первая учётная запись SMB без OIDC (#193) и отложенная отправка с отменой (#195) — решены 2026-11-10, карточки выше.
 
@@ -447,7 +491,7 @@
 | console-03 | UI-07, UI-08, UI-09 | A | console-02, admin-09 | 1 |
 | admin-10 | ADM-15 | A | deps-05, console-01 | 3 |
 | ✅ contracts-34 (ветка `x/contracts-34`) | CTR-47 | B | contracts-33 | 1 |
-| meta-35 (ветка `x/meta-35`) | META-54 | B | contracts-34, meta-30 | 3 |
+| meta-35 (ветка `x/meta-35`) | META-54 | B | contracts-34, meta-30, meta-32 | 3 |
 | smtp-14 | SMTP-34 | A | smtp-12 | 1 |
 | admin-12 | ADM-17 | A | sieve-01 | 3 |
 | app-31 | APP-32 | A | meta-30, meta-31 | 2 |
@@ -481,12 +525,18 @@
 | jmap-20 | JMAP-34, JMAP-35, JMAP-36 | A | contracts-38, testkit-06, jmap-17, app-25 | 3 |
 | admin-15 | ADM-21 | A | contracts-38, meta-37, admin-14 | 3 |
 | app-36 | APP-38 | A | dav-07, meta-37, admin-13, jmap-20, app-28, app-26 | 2 |
+| contracts-40 (ветка `x/contracts-40`) | CTR-58 | B | — | 1 |
+| auth-11 | AUTH-16 | A | contracts-40 | 1 |
+| dav-08 | DAV-26, DAV-27, DAV-28 | A | contracts-39, contracts-40, dav-03 | 4 |
+| sieve-05 | SIEVE-12 | A | contracts-39, sieve-03 | 2 |
+| jmap-22 | JMAP-38 | A | jmap-18, contracts-35 | 3 |
 
 Выход Ф2: `docs/manual-tests/CMP-10.md` на бете без «не прошёл» — календари, контакты, правила и автоответы проверены клиентами
 (Thunderbird, iOS и macOS, DAVx5, Evolution, Postman); консоль покрывает Admin API (`console/coverage-pending.txt` пуст, UI-09).
 
 Строки от `auth-08` до `app-36` — хвосты облачных волн 2026-11-12 (PR #426, #427, #428, #429, #431, #439–#442, #444); карточки с
-пометкой «Требует подтверждения владельца» — перед запуском — ответ владельца.
+пометкой «Требует подтверждения владельца» — перед запуском — ответ владельца. Строки от `contracts-40` до `jmap-22` — хвосты
+PR 10–12.11 (#293, #443, #449).
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 
