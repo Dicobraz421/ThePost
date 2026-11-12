@@ -28,7 +28,10 @@
 //! - правила Sieve получателей ([`Delivery::with_rules`], [`crate::sieve`], SMTP-31, SMTP-32) — для каждого
 //!   локального получателя (smtp-in, submission, [`Delivery::submit`]) после правил потока и до `ingest`: папки и
 //!   флаги, отброс, перенаправление, автоответ; перенаправленное письмо и внутренний автоответ — через правила
-//!   получателя с проверкой петли ([`Delivery::relay`], SMTP-34).
+//!   получателя с проверкой петли ([`Delivery::relay`], SMTP-34);
+//! - приём iMIP ([`Delivery::with_itip`], [`crate::itip`], SMTP-33): письмо smtp-in с частью `text/calendar;
+//!   method=…` после доставки в ящик передаётся `ItipDelivery` получателя; письмо остаётся в ящике, отказ и сбой
+//!   iTIP — только запись в журнал.
 //!
 //! Отправка вне сессии SMTP (JMAP `EmailSubmission/set`) — [`Delivery::submit`] и `impl Outbound for Delivery`
 //! (CMP-04, контракт `tp_contracts::queue::Outbound`, CTR-28): локальные получатели доставляются сразу тем же
@@ -61,6 +64,7 @@ use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested,
 use tp_contracts::meta::{Account, AccountScope, AccountStore, Mailbox, MailboxStore, SpecialUse};
 use tp_contracts::queue::{DsnRet, Outbound, SubmitStatus, Submitted};
 use tp_contracts::retention::Quota;
+use tp_contracts::schedule::{ItipDelivery, ItipMessage, ItipOutcome, ItipSource};
 use tp_contracts::sieve::{AutoReply, DeliveryRules, MailboxRef, RulesInput, RulesOutcome};
 use tp_contracts::transport::{
     AcceptedDomain, BlobRef, DomainKind, EnvelopeSide, FlowDirection, FlowEnvelope, FlowInput,
@@ -74,6 +78,7 @@ use crate::config::{DeliveryConfig, QuotaReject, SmtpConfig};
 use crate::dsn::{self, DsnSink};
 use crate::forward::Forwarding;
 use crate::groups::{Groups, Hold};
+use crate::itip;
 use crate::milter::{Milters, Verdict};
 use crate::routes::Routes;
 use crate::server::{Envelope, Handler, Mode, Reply, is_positive, reply};
@@ -189,6 +194,7 @@ pub struct Delivery {
     forwarding: Option<Arc<Forwarding>>,
     flow: Option<FlowDeps>,
     rules: Option<Arc<dyn DeliveryRules>>,
+    itip: Option<Arc<dyn ItipDelivery>>,
     vacation_rate: VacationRate,
     /// `delivery.redirect_hops`.
     redirect_hops: u32,
@@ -236,6 +242,7 @@ impl Delivery {
             forwarding: None,
             flow: None,
             rules: None,
+            itip: None,
             vacation_rate: VacationRate::new(cfg.delivery.vacation_rate),
             redirect_hops: cfg.delivery.redirect_hops,
             redirect_total: cfg.delivery.redirect_total,
@@ -248,6 +255,72 @@ impl Delivery {
     pub fn with_rules(mut self, rules: Arc<dyn DeliveryRules>) -> Self {
         self.rules = Some(rules);
         self
+    }
+
+    /// Приём iMIP (RFC 6047, SMTP-33): письмо smtp-in с частью `text/calendar; method=…` после доставки в ящик
+    /// передаётся `itip` для каждой учётной записи получателя. Отправитель — адрес `From` письма, прошедшего DMARC,
+    /// совпадающий с `ORGANIZER` (сообщения организатора) или `ATTENDEE` (ответы участника), иначе сообщение не
+    /// применяется. Письмо в любом случае остаётся в ящике; отказ и сбой iTIP — запись в журнал.
+    pub fn with_itip(mut self, itip: Arc<dyn ItipDelivery>) -> Self {
+        self.itip = Some(itip);
+        self
+    }
+
+    /// Передаёт сообщение iTIP письма `raw` учётным записям `targets` (получатель конверта и учётная запись), кроме
+    /// получателей из `failed`. `dmarc_pass` — письмо прошло DMARC.
+    async fn imip(
+        &self,
+        id: &str,
+        raw: &[u8],
+        dmarc_pass: bool,
+        targets: &[(String, AccountId)],
+        failed: &[dsn::Recipient],
+    ) {
+        let Some(delivery) = &self.itip else {
+            return;
+        };
+        let msg = match itip::extract(raw, dmarc_pass) {
+            None => return,
+            Some(Err(reason)) => {
+                tracing::info!(%id, reason, "smtp: сообщение iTIP не применено");
+                return;
+            }
+            Some(Ok(m)) => m,
+        };
+        let mut seen = HashSet::new();
+        for (rcpt, account) in targets {
+            if failed.iter().any(|f| f.address.eq_ignore_ascii_case(rcpt)) || !seen.insert(*account)
+            {
+                continue;
+            }
+            let to = self
+                .addressing
+                .split(rcpt)
+                .map_or_else(|| rcpt.clone(), |(base, _)| base)
+                .to_lowercase();
+            let message = ItipMessage {
+                recipient: AccountScope {
+                    tenant: self.deps.tenant,
+                    account: *account,
+                },
+                to,
+                from: msg.from.clone(),
+                method: msg.method,
+                ics: msg.ics.clone(),
+                source: ItipSource::Imip,
+            };
+            match delivery.deliver(&message).await {
+                Ok(ItipOutcome::Applied) => {
+                    tracing::debug!(%id, %account, method = %msg.method, "smtp: сообщение iTIP применено");
+                }
+                Ok(ItipOutcome::Ignored(reason)) => {
+                    tracing::info!(%id, %account, %reason, "smtp: сообщение iTIP не применено");
+                }
+                Err(e) => {
+                    tracing::warn!(%id, %account, error = %e, "smtp: сбой приёма iTIP");
+                }
+            }
+        }
     }
 
     /// Пересылка наружу: SRS-переписывание отправителя и ARC-подпись ([`crate::forward`], SMTP-23); приём
@@ -1262,6 +1335,16 @@ impl Delivery {
             )
             .await?;
         let local = local_rcpts(&prepared.deliveries);
+        // iMIP — только проверенной входящей почте вне «Спама»: адресу `From` без DMARC доверять нельзя.
+        let imip: Vec<(String, AccountId)> = match &check {
+            Some(_) if !junk && self.itip.is_some() => prepared
+                .deliveries
+                .iter()
+                .filter(|(r, _)| !r.is_empty())
+                .map(|(r, d)| (r.clone(), d.account))
+                .collect(),
+            _ => Vec::new(),
+        };
         if !prepared.deliveries.is_empty() {
             let ingested = self
                 .ingest_all(
@@ -1274,6 +1357,10 @@ impl Delivery {
                 )
                 .await?;
             push_unique(&mut forward, ingested.forward);
+        }
+        if !imip.is_empty() {
+            let dmarc_pass = check.as_ref().is_some_and(|c| c.dmarc_pass);
+            self.imip(&env.id, &full, dmarc_pass, &imip, &failed).await;
         }
         let external = self
             .forward(
