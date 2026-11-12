@@ -1,7 +1,8 @@
 # Узел The Post в Kubernetes:
 #   helm install thepost deploy/helm/thepost -n thepost --create-namespace -f <свои значения>
 # До установки — OpenBao (deploy/helm/openbao, bootstrap.sh: Kubernetes auth для сервисного аккаунта thepost),
-# секрет TLS клиентских протоколов (values.tls.secretName: tls.crt, tls.key; ca.crt — CA внутренних каналов).
+# секрет с цепочкой TLS клиентских протоколов (values.tls.secretName: tls.crt; ca.crt — CA внутренних каналов) и ключ TLS
+# в OpenBao (секрет thepost/tls#key — bootstrap.sh с TLS_KEY; в под монтируются только tls.crt и ca.crt).
 
 # Образ узла — ghcr.io (выпуски beta.yml, linux/amd64; теги beta-<дата> и beta), подписан cosign без ключей:
 #   cosign verify ghcr.io/dicobraz421/thepost:<тег> \
@@ -198,7 +199,8 @@ config:
     url: s3://thepost-blob
   tls:
     cert_file: /etc/thepost/tls/tls.crt
-    key_file: /etc/thepost/tls/tls.key
+    # Ключ — только из OpenBao (решение 100); новая версия секрета подхватывается без перезапуска.
+    key: { secret: "thepost/tls#key" }
   service_http:
     listen: "0.0.0.0:8081"
     internal_networks: ["0.0.0.0/32"]
