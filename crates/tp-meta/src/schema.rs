@@ -120,9 +120,9 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0026_rcpts_per_hour.sql"),
     ),
     (
-        29,
+        27,
         "audit export",
-        include_str!("../migrations/0029_audit_export.sql"),
+        include_str!("../migrations/0027_audit_export.sql"),
     ),
 ];
 
