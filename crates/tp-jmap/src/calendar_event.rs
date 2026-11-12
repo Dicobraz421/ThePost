@@ -14,8 +14,8 @@
 //! Отличия от черновика (см. также `crate::calendars`):
 //! - событие — в одном календаре (`maxCalendarsPerEvent` = 1): перенос сменой `calendarIds` не поддерживается
 //!   (контракт не переносит объект с сохранением `id`);
-//! - `isDraft` — всегда `false`; `isOrigin`, `mayInviteSelf` и прочие свойства планирования, отправка приглашений
-//!   (`sendSchedulingMessages`) — JMAP-31;
+//! - `isDraft` — всегда `false`; `isOrigin` — только по запросу в `properties`; `mayInviteSelf` и прочие права
+//!   участников не поддерживаются; отправка приглашений (`sendSchedulingMessages`) — `crate::scheduling`;
 //! - `useDefaultAlerts` хранится в событии, но оповещений календаря по умолчанию нет (`crate::calendars`);
 //! - `utcStart`/`utcEnd` при записи, `recurrenceOverridesBefore`/`After`, `reduceParticipants` не поддерживаются;
 //! - `/copy` — между учётными записями, а доступна только своя: чужая — `fromAccountNotFound`;
@@ -34,7 +34,7 @@ use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use tp_contracts::Error;
 use tp_contracts::dav::{
     CollectionId, Component, DavObject, DavObjectId, DavStore, DeleteOutcome, ObjectIndex,
-    Precondition, PutOutcome,
+    Precondition, Put, PutOutcome,
 };
 use tp_contracts::meta::AccountScope;
 use tp_dav::index::IndexOptions;
@@ -49,6 +49,7 @@ use crate::core::request::{
     parse_state, select,
 };
 use crate::email_get::utc_date;
+use crate::scheduling::{self, Written};
 
 /// Свойства JMAP объекта `CalendarEvent`, которых нет в JSCalendar.
 const JMAP_PROPS: [&str; 7] = [
@@ -83,7 +84,7 @@ fn guarded<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
 }
 
 /// `Group` JSCalendar ресурса без первого события и само событие. Неразбираемое тело — `None`.
-fn split(body: &str) -> Option<(Map<String, Value>, Map<String, Value>)> {
+pub(crate) fn split(body: &str) -> Option<(Map<String, Value>, Map<String, Value>)> {
     let v = guarded(|| {
         let js = ICalendar::parse(body)
             .ok()?
@@ -125,6 +126,7 @@ fn to_ical(
     mut group: Map<String, Value>,
     mut event: Map<String, Value>,
     opts: &IndexOptions,
+    busy_horizon: std::time::Duration,
 ) -> Result<(String, ObjectIndex), Value> {
     for p in JMAP_PROPS {
         event.remove(p);
@@ -143,8 +145,8 @@ fn to_ical(
             .into_icalendar()
     })
     .ok_or_else(|| invalid("JSCalendar cannot be converted to iCalendar", &[]))?;
-    let index =
-        tp_dav::index::of_calendar(&ical, opts).map_err(|e| invalid(&e.to_string(), &["uid"]))?;
+    let index = scheduling::object_index(&ical, opts, busy_horizon, OffsetDateTime::now_utc())
+        .map_err(|e| invalid(&e.to_string(), &["uid"]))?;
     if index.span.is_none() {
         let why = "invalid start, duration or recurrence";
         return Err(invalid(why, &["start", "duration", "recurrenceRule"]));
@@ -421,6 +423,7 @@ async fn get_one(
     zones: &mut Zones,
     id: &str,
     with_utc: bool,
+    with_origin: bool,
 ) -> MethodResult<Option<Map<String, Value>>> {
     let store = ctx.jmap.dav_store()?;
     let Some((oid, rid)) = split_id(id) else {
@@ -429,7 +432,11 @@ async fn get_one(
     let Some(obj) = find(store.as_ref(), ctx.scope, oid).await? else {
         return Ok(None);
     };
-    let event = event_json(&obj);
+    let mut event = event_json(&obj);
+    if with_origin {
+        let origin = scheduling::is_origin(&obj.body, &scheduling::addresses(ctx));
+        event.insert("isOrigin".into(), json!(origin));
+    }
     if rid.is_none() && !with_utc {
         return Ok(Some(event));
     }
@@ -500,6 +507,7 @@ pub(crate) async fn get(
     let st = state(store.as_ref(), ctx.scope).await?;
     let props = a.properties.as_deref();
     let with_utc = props.is_some_and(|p| p.iter().any(|x| x == "utcStart" || x == "utcEnd"));
+    let with_origin = props.is_some_and(|p| p.iter().any(|x| x == "isOrigin"));
     let (mut list, mut not_found) = (Vec::new(), Vec::new());
     let ids: Vec<String> = match &a.ids {
         Some(ids) => ids.iter().map(|i| ctx.resolve_id(i).to_owned()).collect(),
@@ -515,7 +523,7 @@ pub(crate) async fn get(
             continue;
         }
         seen.push(id);
-        match get_one(ctx, &mut zones, id, with_utc).await? {
+        match get_one(ctx, &mut zones, id, with_utc, with_origin).await? {
             Some(m) => list.push(select(m, props)),
             None => not_found.push(id.clone()),
         }
@@ -551,9 +559,9 @@ pub(crate) async fn changes(
 // ---------- Изменение ----------
 
 /// Итог записи как ошибка `/set`; `Ok` — записано.
-fn put_error(r: tp_contracts::Result<PutOutcome>) -> MethodResult<Result<DavObjectId, Value>> {
+fn put_error(r: tp_contracts::Result<PutOutcome>) -> MethodResult<Result<Put, Value>> {
     Ok(match r {
-        Ok(PutOutcome::Stored(p)) => Ok(p.id),
+        Ok(PutOutcome::Stored(p)) => Ok(p),
         Ok(PutOutcome::UidConflict { .. }) => Err(invalid(
             "uid is used by another event of the calendar",
             &["uid"],
@@ -590,7 +598,7 @@ fn unsupported_props(event: &Map<String, Value>) -> Option<Value> {
     (!bad.is_empty()).then(|| set_error("invalidProperties", None, &bad))
 }
 
-async fn create_one(ctx: &Ctx<'_>, v: &Value) -> MethodResult<Result<Value, Value>> {
+async fn create_one(ctx: &Ctx<'_>, v: &Value, send: bool) -> MethodResult<Result<Value, Value>> {
     let store = ctx.jmap.dav_store()?;
     let Value::Object(src) = v else {
         return Ok(Err(set_error("invalidProperties", None, &[])));
@@ -620,7 +628,12 @@ async fn create_one(ctx: &Ctx<'_>, v: &Value) -> MethodResult<Result<Value, Valu
     event.insert("updated".into(), now.clone());
     let server_set = json!({ "uid": event["uid"], "created": event["created"], "updated": now });
     let group = object(json!({ "@type": "Group", "prodId": "-//The Post//JMAP//RU" }));
-    let (body, index) = match to_ical(group, event, &index_options(ctx)) {
+    let (body, index) = match to_ical(
+        group,
+        event,
+        &index_options(ctx),
+        store.limits().busy_horizon,
+    ) {
         Ok(x) => x,
         Err(e) => return Ok(Err(e)),
     };
@@ -630,14 +643,28 @@ async fn create_one(ctx: &Ctx<'_>, v: &Value) -> MethodResult<Result<Value, Valu
             ctx.scope,
             cal,
             &name,
-            body,
-            index,
+            body.clone(),
+            index.clone(),
             Precondition::IfNoneMatch,
         )
         .await;
-    Ok(put_error(put)?.map(|id| {
+    let put = match put_error(put)? {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(e)),
+    };
+    if send {
+        let written = Written {
+            collection: cal,
+            name: &name,
+            body: &body,
+            index,
+            etag: put.etag,
+        };
+        scheduling::announce(ctx, None, Some(written)).await;
+    }
+    Ok(Ok({
         let mut created = server_set;
-        created["id"] = json!(id.to_string());
+        created["id"] = json!(put.id.to_string());
         created["isDraft"] = json!(false);
         for key in ["uid", "created"] {
             if src.contains_key(key) {
@@ -697,6 +724,7 @@ async fn update_one(
     ctx: &Ctx<'_>,
     id: &str,
     patch: Option<&Value>,
+    send: bool,
 ) -> MethodResult<Result<Value, Value>> {
     let store = ctx.jmap.dav_store()?;
     let not_found = || Ok(Err(set_error("notFound", None, &[])));
@@ -753,20 +781,44 @@ async fn update_one(
     }
     let now = utc_date(OffsetDateTime::now_utc());
     event.insert("updated".into(), now.clone());
-    let (body, index) = match to_ical(group, event, &index_options(ctx)) {
+    let (body, index) = match to_ical(
+        group,
+        event,
+        &index_options(ctx),
+        store.limits().busy_horizon,
+    ) {
         Ok(x) => x,
         Err(e) => return Ok(Err(e)),
     };
     let pre = Precondition::IfMatch(obj.etag.clone());
     let put = store
-        .put_object(ctx.scope, obj.collection, &obj.name, body, index, pre)
+        .put_object(
+            ctx.scope,
+            obj.collection,
+            &obj.name,
+            body.clone(),
+            index.clone(),
+            pre,
+        )
         .await;
-    Ok(put_error(put)?.map(|_| {
-        if patch.is_some_and(|p| p.contains_key("updated")) {
-            json!({ "updated": now })
-        } else {
-            Value::Null
-        }
+    let put = match put_error(put)? {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(e)),
+    };
+    if send {
+        let written = Written {
+            collection: obj.collection,
+            name: &obj.name,
+            body: &body,
+            index,
+            etag: put.etag,
+        };
+        scheduling::announce(ctx, Some(&obj.body), Some(written)).await;
+    }
+    Ok(Ok(if patch.is_some_and(|p| p.contains_key("updated")) {
+        json!({ "updated": now })
+    } else {
+        Value::Null
     }))
 }
 
@@ -788,7 +840,8 @@ pub(crate) async fn set(
         rest.insert("sendSchedulingMessages".into(), v);
     }
     let extra: SetExtra = parse_args(rest)?;
-    if extra.send_scheduling_messages {
+    let send = extra.send_scheduling_messages;
+    if send && ctx.jmap.schedule.is_none() {
         return Err(MethodError::invalid(
             "sendSchedulingMessages is not supported",
         ));
@@ -803,7 +856,7 @@ pub(crate) async fn set(
     }
     let mut out = SetOutcome::default();
     for (cid, v) in a.create.unwrap_or_default() {
-        match create_one(ctx, &v).await? {
+        match create_one(ctx, &v, send).await? {
             Ok(created) => {
                 if let Some(id) = created["id"].as_str() {
                     ctx.created.insert(cid.clone(), id.to_owned());
@@ -817,7 +870,7 @@ pub(crate) async fn set(
     }
     for (id, patch) in a.update.unwrap_or_default() {
         let rid = ctx.resolve_id(&id).to_owned();
-        match update_one(ctx, &rid, Some(&patch)).await? {
+        match update_one(ctx, &rid, Some(&patch), send).await? {
             Ok(v) => out.updated.insert(id, v),
             Err(e) => out.not_updated.insert(id, e),
         };
@@ -831,7 +884,7 @@ pub(crate) async fn set(
         };
         if inst.is_some() {
             // Удаление вхождения — исключение в событии.
-            match update_one(ctx, &rid, None).await? {
+            match update_one(ctx, &rid, None, send).await? {
                 Ok(_) => out.destroyed.push(id),
                 Err(e) => {
                     out.not_destroyed.insert(id, e);
@@ -847,7 +900,12 @@ pub(crate) async fn set(
             .delete_object(ctx.scope, obj.collection, &obj.name, Precondition::Any)
             .await
         {
-            Ok(DeleteOutcome::Deleted(_)) => out.destroyed.push(id),
+            Ok(DeleteOutcome::Deleted(_)) => {
+                if send {
+                    scheduling::announce(ctx, Some(&obj.body), None).await;
+                }
+                out.destroyed.push(id);
+            }
             Ok(DeleteOutcome::PreconditionFailed) | Err(Error::NotFound) => {
                 out.not_destroyed.insert(id, not_found);
             }
@@ -1508,13 +1566,14 @@ pub(crate) mod tests {
         )
         .await;
         assert!(r["notUpdated"].is_null(), "{r}");
-        let r = call(
-            &env,
-            "CalendarEvent/set",
-            json!({"accountId": acc, "sendSchedulingMessages": true}),
-        )
-        .await;
+        // Планирование не подключено — рассылка недоступна; подключено — пустой запрос проходит.
+        let plain = Env::unscheduled().await;
+        let args = json!({"accountId": plain.account(), "sendSchedulingMessages": true});
+        let r = call(&plain, "CalendarEvent/set", args).await;
         assert_eq!(r["type"], "invalidArguments", "{r}");
+        let args = json!({"accountId": acc, "sendSchedulingMessages": true});
+        let r = call(&env, "CalendarEvent/set", args).await;
+        assert!(r["newState"].is_string(), "{r}");
         let r = call(
             &env,
             "CalendarEvent/get",

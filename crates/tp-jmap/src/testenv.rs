@@ -23,8 +23,8 @@ use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_testkit::{
     Clock, FakeAuthenticator, FakeSearch, MemBlobIndex, MemBlobStore, MemDav, MemEventBus,
-    MemMetadata, MemOutbound, MemPolicies, MemQuota, MemSieve, MemTrash, RecordingDecisionHook,
-    SearchDoc, SystemClock,
+    MemItipSender, MemMetadata, MemOutbound, MemPolicies, MemQuota, MemSieve, MemTrash,
+    RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
 use crate::{Deps, Jmap, JmapConfig};
@@ -142,6 +142,8 @@ pub struct Env {
     pub sieve: MemSieve,
     /// Календари и контакты (`Jmap::with_dav`), сигналы — в `bus`.
     pub dav: MemDav,
+    /// Письма iMIP внешним участникам (`Jmap::with_schedule`).
+    pub imip: MemItipSender,
     pub jmap: Arc<Jmap>,
 }
 
@@ -156,7 +158,35 @@ impl Env {
 
     /// Окружение без хранилищ Sieve и DAV (capability `vacationresponse`, `sieve`, `contacts` не объявлены).
     pub async fn bare() -> Self {
-        Self::build(JmapConfig::default(), Vec::new(), None, false).await
+        Self::build(JmapConfig::default(), Vec::new(), None, false, false).await
+    }
+
+    /// Окружение с хранилищами, но без планирования встреч (`Jmap::with_schedule` не вызван).
+    pub async fn unscheduled() -> Self {
+        Self::build(JmapConfig::default(), Vec::new(), None, true, false).await
+    }
+
+    /// Учётная запись `login` организации: вошедший для [`Env::request_as`].
+    pub async fn user(&self, login: &str) -> Principal {
+        let scope = self.meta.account(login).await.expect("account");
+        Principal {
+            tenant: scope.tenant,
+            account: scope.account,
+            login: login.into(),
+            groups: BTreeSet::new(),
+            scopes: None,
+        }
+    }
+
+    /// Один вызов от имени `who`: аргументы ответа.
+    pub async fn call_as(&self, who: &Principal, method: &str, args: Value) -> Value {
+        let cals = "urn:ietf:params:jmap:calendars";
+        let req = json!({ "using": [USING[0], cals], "methodCalls": [[method, args, "c0"]] });
+        let resp = match self.jmap.api(who, req.to_string().as_bytes()).await {
+            Ok(r) => serde_json::to_value(r).expect("serialize"),
+            Err(p) => p.to_json(),
+        };
+        resp["methodResponses"][0][1].clone()
     }
 
     /// Окружение с подписью профиля `.mobileconfig`.
@@ -165,7 +195,7 @@ impl Env {
         caps: Vec<Arc<dyn JmapCapability>>,
         signer: Option<Arc<dyn crate::ProfileSigner>>,
     ) -> Self {
-        Self::build(cfg, caps, signer, true).await
+        Self::build(cfg, caps, signer, true, true).await
     }
 
     async fn build(
@@ -173,6 +203,7 @@ impl Env {
         caps: Vec<Arc<dyn JmapCapability>>,
         signer: Option<Arc<dyn crate::ProfileSigner>>,
         stores: bool,
+        schedule: bool,
     ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let blobs = MemBlobStore::new(clock.clone());
@@ -214,6 +245,18 @@ impl Env {
         };
         let sieve = MemSieve::new().with_bus(Arc::new(bus.clone()));
         let dav = MemDav::new().with_bus(Arc::new(bus.clone()));
+        let imip = MemItipSender::new();
+        // Применённые сообщения остаются во входящих: по ним строятся `CalendarEventNotification`.
+        let dav_cfg = tp_dav::DavConfig {
+            schedule_keep_processed: true,
+            ..tp_dav::DavConfig::default()
+        };
+        let schedule_deps = tp_dav::ScheduleDeps {
+            accounts: Arc::new(meta.clone()),
+            delivery: Arc::new(tp_dav::ItipInbox::new(Arc::new(dav.clone()), dav_cfg)),
+            sender: Some(Arc::new(imip.clone())),
+            freebusy: Arc::new(dav.clone()),
+        };
         let jmap = Jmap::new(
             Deps {
                 auth: Arc::new(auth.clone()),
@@ -241,7 +284,8 @@ impl Env {
         .with_dav(stores.then(|| Arc::new(dav.clone()) as Arc<dyn DavStore>))
         .with_freebusy(
             stores.then(|| Arc::new(dav.clone()) as Arc<dyn tp_contracts::schedule::FreeBusy>),
-        );
+        )
+        .with_schedule(schedule.then_some(schedule_deps));
         Self {
             meta,
             search,
@@ -258,6 +302,7 @@ impl Env {
             blobs: unpacking,
             sieve,
             dav,
+            imip,
             jmap: Arc::new(jmap),
         }
     }
