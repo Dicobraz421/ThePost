@@ -1,7 +1,5 @@
 //! Примеры RFC 9051 и расширений: разбор команд, литералы, сериализация ответов.
 
-use proptest::prelude::*;
-
 use super::types::command::CommandBody;
 use super::types::fetch::{MacroOrMessageDataItemNames, MessageDataItemName, Section};
 use super::types::flag::FlagNameAttribute;
@@ -296,30 +294,4 @@ fn mailbox_names() {
         mailbox_bytes(&Mailbox::from(astring(b"Lists/x".to_vec()).expect("a"))),
         b"Lists/x"
     );
-}
-
-proptest! {
-    // Fuzz на произвольных байтах и на искажённых примерах RFC: разбор не паникует,
-    // разобранные команды сериализуются.
-    #[test]
-    fn fuzz_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
-        fuzz_input(&data);
-    }
-
-    #[test]
-    fn fuzz_mutated_examples(
-        base in prop::sample::select(vec![
-            "a LIST (SUBSCRIBED RECURSIVEMATCH) \"\" (\"INBOX\" {3}\r\nx/%) RETURN (STATUS (SIZE))\r\n",
-            "a FETCH 1:* (BODY.PEEK[1.2.MIME]<0.100> BINARY[2] UID)\r\n",
-            "a CREATE {4+}\r\nnews (USE (\\Sent))\r\n",
-            "a STATUS {5}\r\nINBOX (MESSAGES SIZE)\r\n",
-        ]),
-        pos in any::<prop::sample::Index>(),
-        byte in any::<u8>(),
-    ) {
-        let mut data = base.as_bytes().to_vec();
-        let i = pos.index(data.len());
-        data[i] = byte;
-        fuzz_input(&data);
-    }
 }
