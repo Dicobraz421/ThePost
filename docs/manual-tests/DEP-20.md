@@ -9,7 +9,7 @@
 | 2 | Повторить шаг 1 | `changed=0` |
 | 3 | `thepost doctor` в окружении службы ([DEP-08](DEP-08.md), шаг 3) | нет `FAIL` |
 | 4 | Письмо `alice → bob` через 587 (STARTTLS, AUTH), получение по IMAP 993 | письмо в INBOX `bob` |
-| 5 | firewalld включён: `firewall-cmd --list-ports` | `25/tcp 143/tcp 443/tcp 465/tcp 587/tcp 993/tcp` (certbot — и `80/tcp`) |
+| 5 | firewalld включён: `firewall-cmd --list-ports` | `25/tcp 143/tcp 443/tcp 465/tcp 587/tcp 993/tcp` (`thepost_tls_mode: acme` — и `80/tcp`) |
 | 6 | SELinux `enforcing`: `ls -Zd /var/lib/pgbackrest /var/log/pgbackrest`; `ausearch -m avc -ts today` | `postgresql_db_t`, `postgresql_log_t`; отказов AVC для `postgres`, `thepost`, `bao`, `rspamd` нет; `systemctl start thepost-backup@diff` — `success` |
 
 ## Прогон 2026-11-12
@@ -37,7 +37,7 @@
 - РЕД ОС: Python 3.11 дистрибутива с OpenSSL 3.5 не принимает корневые сертификаты в DER («ASN1: NOT_ENOUGH_DATA»),
   которыми `get_url` проверяет TLS, — пакет OpenBao загружается через `uri` с `ca_path` и сверкой SHA-256
   (`openbao/tasks/download.yml`);
-- AlmaLinux: сборки `rspamd.com` зависят от EPEL (libsodium, jemalloc, hyperscan), restic и certbot — тоже EPEL;
+- AlmaLinux: сборки `rspamd.com` зависят от EPEL (libsodium, jemalloc, hyperscan), restic — тоже EPEL;
 - `sudo` семейства RHEL (`secure_path`) не видит `/usr/local/sbin` — обёртки pgBackRest и restic вызываются полным
   путём;
 - в минимальной установке нет `cmp` (diffutils) — сравнение учётных данных systemd средствами bash (без него каждый
@@ -50,7 +50,7 @@
   `postgresql_t`); thepost, OpenBao и Rspamd без своей политики работают как `unconfined_service_t`. Шаг 6 — на ВМ.
 - **AlmaLinux 10 и RHEL 10 целиком** — нужен процессор x86-64-v3 (сборки PGDG и `rspamd.com` для EL10 — под него);
   остальное совпадает с AlmaLinux 9.
-- **firewalld на РЕД ОС**, **certbot** (EPEL / РЕД ОС, таймер `certbot-renew.timer`), **clamav-milter** (EPEL на
+- **firewalld на РЕД ОС**, **clamav-milter** (EPEL на
   AlmaLinux; в РЕД ОС 8 ClamAV нет — роль останавливается с подсказкой), **RHEL** (заявлен совместимым по AlmaLinux,
   решение 52; EPEL подключает администратор).
 - `restore.yml` на семействе RHEL: задачи восстановления вызывают `thepost-pgbackrest` без полного пути — правка

@@ -186,29 +186,32 @@ impl From<TrashPurgeSetting> for TrashPurgeInfo {
 
 /// Маршруты корзины.
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route("/api/v1/orgs/{org}/accounts/{account}/trash", get(list))
-        .route(
-            "/api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore",
-            post(restore),
-        )
-        .route(
-            "/api/v1/orgs/{org}/accounts/{account}/trash/hidden",
-            get(list_hidden),
-        )
-        .route(
-            "/api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore",
-            post(restore_hidden),
-        )
-        .route(
-            "/api/v1/orgs/{org}/accounts/{account}/trash-purge",
-            get(trash_purge),
-        )
+    r.route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash",
+        get(list_trash),
+    )
+    .route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore",
+        post(restore),
+    )
+    .route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash/hidden",
+        get(list_hidden),
+    )
+    .route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore",
+        post(restore_hidden),
+    )
+    .route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash-purge",
+        get(trash_purge),
+    )
 }
 
 /// Спецификация OpenAPI маршрутов модуля.
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(list, restore, list_hidden, restore_hidden, trash_purge),
+    paths(list_trash, restore, list_hidden, restore_hidden, trash_purge),
     components(schemas(
         TrashEntry,
         TrashPage,
@@ -245,7 +248,7 @@ impl From<TrashItem> for TrashEntry {
         ("account" = String, Path, description = "Учётная запись (UUID)"), PageQuery),
     responses((status = 200, body = TrashPage), (status = 400, body = Problem), (status = 403, body = Problem),
         (status = 404, body = Problem)))]
-async fn list(
+async fn list_trash(
     State(a): State<Arc<Admin>>,
     Extension(caller): Extension<Caller>,
     route: MatchedPath,

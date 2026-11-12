@@ -98,19 +98,22 @@ pub struct DeliveryResults {
 
 /// Маршруты журнала доставки.
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route("/api/v1/orgs/{org}/delivery", get(search))
+    r.route("/api/v1/orgs/{org}/delivery", get(search_delivery))
 }
 
 /// Спецификация OpenAPI маршрутов модуля.
 #[derive(Debug, OpenApi)]
-#[openapi(paths(search), components(schemas(DeliveryEntry, DeliveryResults)))]
+#[openapi(
+    paths(search_delivery),
+    components(schemas(DeliveryEntry, DeliveryResults))
+)]
 pub(crate) struct Doc;
 
 /// Поиск в журнале доставки организации.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/delivery", tag = "delivery",
     params(("org" = String, Path, description = "Организация (UUID)"), DeliveryParams),
     responses((status = 200, body = DeliveryResults), (status = 400, body = Problem), (status = 403, body = Problem)))]
-async fn search(
+async fn search_delivery(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
     Query(q): Query<DeliveryParams>,

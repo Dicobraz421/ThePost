@@ -251,7 +251,8 @@ SRS 5.2, решение 2026-11-01-borrowings-security (CTR-21; код — `deli
 и поиск, содержимое писем не хранится. `DeliveryEvent { tenant, at, node: NodeId, kind, sender, recipients, message_id: Option<_>
 (без угловых скобок), queue_id: Option<QueueId>, decision, reason: Option<String> }`; `DeliveryEventKind { Receive, Reject, Deliver,
 Relay, Dsn, Itip }` (`Itip`, CTR-66 — приём iTIP из письма iMIP: `decision` `Accept` — применено, `Discard` — пропущено, `reason` —
-`METHOD` или `METHOD: причина`, `delivery::itip_record(method, &ItipOutcome)`; пишет `tp-smtp`, SMTP-37; `tp-meta` — миграция 0032), `DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, Hold }` (строки в нижнем регистре).
+`METHOD` или `METHOD: причина`, `delivery::itip_record(method, &ItipOutcome)`; пишет `tp-smtp`, SMTP-37; `tp-meta` — миграция 0033),
+`DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, Hold }` (строки в нижнем регистре).
 `DeliveryLog`: `record(event)`, `record_batch(Vec<_>)` (по умолчанию — по одной), `search(tenant, &DeliveryQuery) -> DeliveryPage
 { events, next: Option<DeliveryCursor> }`, `purge(before)` — по всем организациям (maintenance), можно целыми сутками-секциями.
 `by_queue(tenant, QueueId, limit)` (CTR-35) — события записи очереди по `at` (равные — в порядке записи), `limit ≥ 1`: статус доставки
@@ -321,7 +322,7 @@ CTR-35: `DirAccount::org: DirOrg { department (external_id подразделе�
 Порог массового удаления: `exceeds_removal_threshold(removed, total, percent)`, `MASS_REMOVAL_PERCENT` = 5; `SyncGate` — остановка
 синхронизации до подтверждения: `hold_sync(tenant, removed, total, at) -> MassRemoval { removed, total, detected_at, approved }` (подтверждение
 сохраняется, если `removed` не выросло), `pending_sync`, `approve_sync` (нет — `NotFound`; Admin API), `clear_sync` (синхронизация после
-отключения). In-memory — `MemSyncGate`; набор `suite::sync_gate`.
+отключения). PostgreSQL — `PgMeta` (`sync_holds`), in-memory — `MemSyncGate`; набор `suite::sync_gate`.
 CTR-58 (решение 79): `DirAccount::hidden_from_gal: bool` (`#[serde(default)]`, как у групп и почтовых контактов) — запись не попадает
 в адресную книгу (GAL), вход и приём почты не меняются. Заполняет каталог (LDAP — AUTH-16), учитывает построение GAL (DAV-27).
 
@@ -1007,12 +1008,16 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   набор `suite::account_by_ids`; `EventKind::AccountDisabled { account }` — системный сигнал запрета входа и `meta::account_disabled`,
   набор `suite::signals`. По сравнению с карточками: повторы в `by_ids` схлопываются; сигнал — и при `disable_account` (вход запрещён
   и там). Публикация в `tp-meta` — META-67, подписчики — IMAP-22, JMAP-41.
+- 2026-11-12 — x/admin-parity (правило владельца 12.11 «старое рядом с новым не оставлять»): у `AccountStore::restore_account`,
+  `disabled_accounts`, `attach_account` нет тел по умолчанию (были `Internal`) — реализации `PgMeta`, `MemMetadata`. `SyncGate` на
+  PostgreSQL — `PgMeta` (миграция 0032 `sync_holds`), набор `suite::sync_gate`. `tp_admin::Deps` — хранилища CTR-35 обязательны
+  (`contacts`, `org`, `dynamic`, `senders`, `mailbox_audit`, `sync`) вместо `Admin::with_parity`.
 - 2026-11-13 — CTR-62, CTR-65, CTR-66 и обязательный `by_ids` (волна contracts-45). `AccountStore::by_address(tenant, address) ->
   Option<AddressTarget::{Account, Group}>` — основной адрес и псевдоним — учётная запись, адрес группы — группа; `MemMetadata::with_groups`,
   набор `suite::account_by_address`; `PgMeta` до META-68 — без псевдонимов. `AccountStore::by_ids` — без реализации по умолчанию
   (`MemMetadata`, обёртка `Limited` в тестах `tp-imap`; `PgMeta` — META-66). `DavStore::inbox_state`, `inbox_changes` (надгробия
   входящих), `InboxItem::received_at`; набор `suite::itip::inbox_log`; `PgMeta` — META-69 (до неё `inbox_changes` — `Internal`).
-  `DeliveryEventKind::Itip` и `delivery::itip_record`; `tp-meta` — миграция 0032 (`delivery_log.kind`). Несовместимо: новые
+  `DeliveryEventKind::Itip` и `delivery::itip_record`; `tp-meta` — миграция 0033 (`delivery_log.kind`). Несовместимо: новые
   обязательные методы `AccountStore`, `DavStore`, поле `InboxItem::received_at`, вариант `DeliveryEventKind`. По сравнению с карточками:
   методы без реализаций по умолчанию (правило владельца); итог iTIP — в `decision` и `reason`, а не полями варианта (событие — строка в
   хранилище и Admin API).

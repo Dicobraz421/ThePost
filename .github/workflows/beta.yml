@@ -7,7 +7,9 @@
 # и сравнение sha256 бинарника (выпуск не блокирует, расхождение — красный job).
 # CI-05 (решение 2026-11-01): архивы и образ проверяются на интерпретаторы и сценарии (.github/interp_check.py)
 # до публикации; нарушение — красный build (беты нет) или image (бета без образа).
-# CI-06: build и repro собирают console/dist (.github/actions/console) до cross build; образ — пока без консоли.
+# CI-06: build и repro собирают console/dist (.github/actions/console) до cross build (фича `console` крейта thepost).
+# CI-08: образ — с консолью (deploy/docker/Dockerfile, CONSOLE=1 по умолчанию, DEP-35); build (x86_64) и image
+# проверяют, что thepost отвечает на GET /console/ страницей консоли (.github/actions/console-check).
 # CI-14 (решение 116): сборка build и repro — .github/actions/release-build (её же берёт артефакт ci.yml): cross под
 # базовый x86-64 без AVX2, бинарь x86_64 запускается на qemu Nehalem — падение валит сборку.
 # CI-13 (решение 111): образ ещё и с тегом версии выпуска — appVersion из deploy/helm/thepost/Chart.yaml (источник
@@ -84,9 +86,15 @@ jobs:
       PKG: thepost-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/release-build
+      - id: build
+        uses: ./.github/actions/release-build
         with:
           target: ${{ matrix.target }}
+      # Консоль вшивается одинаково для обеих целей; aarch64 на раннере x86_64 не запускается.
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: ./.github/actions/console-check
+        with:
+          binary: ${{ steps.build.outputs.binary }}
       - name: Архив
         shell: bash
         run: |
@@ -140,6 +148,9 @@ jobs:
         run: |
           id=$(docker create thepost:check)
           docker export "$id" | python3 .github/interp_check.py -
+      - uses: ./.github/actions/console-check
+        with:
+          image: thepost:check
       - id: push
         uses: docker/build-push-action@v7.4.0
         with:

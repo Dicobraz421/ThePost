@@ -1,5 +1,6 @@
 # Роль thepost: бинарный файл, пользователь, юнит systemd, config.yaml и сертификат клиентских протоколов
-# (эталон SMB, SRS 1.2, 5.6). Юнит и sysusers — deploy/systemd; пример конфигурации — deploy/config/all.yaml.
+# (эталон SMB, SRS 1.2, 5.6). Юнит и sysusers — deploy/systemd; config.yaml — пресет deploy/config/all.yaml
+# (единственная конфигурация SMB, решение 105) со значениями ниже.
 ---
 # Основной домен и имя узла (SMTP banner/HELO, сертификат клиентских протоколов). Локальные домены SMTP — принятые
 # домены организации в БД (решение 96): `thepost admin init` заводит домен адреса администратора, другие —
@@ -13,21 +14,21 @@ thepost_binary_checksum: ""
 thepost_binary_src: "{{ playbook_dir }}/../../target/release/thepost"
 thepost_binary_path: /usr/local/bin/thepost
 
-# Сертификат клиентских протоколов (SMTP, IMAP, ManageSieve, JMAP, служебный HTTP). Ключ — только в OpenBao: секрет
-# thepost/tls#key (tls.key, решение 100), на диске ВМ его нет; цепочка — файл секции tls. thepost перечитывает пару
-# без перезапуска.
-#   certbot  — Let's Encrypt (ACME HTTP-01, certbot --standalone на порту 80; продление — certbot.timer, deploy-hook
-#              записывает ключ в OpenBao и копирует цепочку);
-#   acme     — встроенный клиент ACME thepost (секция acme, SRS 6.2): ключ записывает сам узел, цепочка — в
-#              /var/lib/thepost/tls;
+# Сертификат клиентских протоколов (SMTP, IMAP, ManageSieve, JMAP, служебный HTTP; решение 101). Ключ — только в
+# OpenBao: секрет thepost/tls#key (tls.key пресета, решение 100), на диске ВМ его нет; цепочка — файл секции tls.
+# thepost перечитывает пару без перезапуска.
+#   acme     — встроенный клиент ACME thepost (по умолчанию для публичного имени; секция acme, SRS 6.2, HTTP-01 на
+#              порту 80 — сокет thepost-http.socket, firewalld открывает 80): ключ записывает сам узел (PLT-29),
+#              цепочка — в /var/lib/thepost/tls; продление — сам thepost;
 #   internal — внутренний CA роли thepost_pki (стенд, тест; клиентам нужен {{ thepost_pki_dir }}/ca.pem);
 #   files    — свои PEM с управляющей машины: thepost_tls_cert_src (цепочка), thepost_tls_key_src (ключ — в OpenBao).
-thepost_tls_mode: certbot
+thepost_tls_mode: acme
 thepost_tls_names: ["{{ thepost_hostname }}"]
 thepost_tls_cert_src: ""
 thepost_tls_key_src: ""
-# ACME (certbot и acme): контакт учётной записи и каталог (пусто — Let's Encrypt; staging —
-# https://acme-staging-v02.api.letsencrypt.org/directory).
+# ACME: контакт учётной записи и каталог (пусто — Let's Encrypt; staging —
+# https://acme-staging-v02.api.letsencrypt.org/directory). Ключ сертификата — секрет tls.key пресета (запись —
+# политика узла deploy/openbao/thepost-policy.hcl).
 thepost_acme_email: ""
 thepost_acme_directory_url: ""
 
@@ -48,14 +49,10 @@ thepost_secrets_secret_id_file: >-
 # секрет thepost/tls: эталон SMB — эта ВМ; малый Enterprise — узел инициализации кластера OpenBao.
 thepost_openbao_from: "{{ inventory_hostname }}"
 
-# Слушатели клиентских протоколов (адрес без порта). С активацией сокетов — 0.0.0.0 или [::]: сокеты systemd
-# слушают все адреса (ListenStream=<порт>); другой адрес — и в drop-in юнитов thepost-*.socket.
-thepost_listen_address: "0.0.0.0"
-# Порты клиентских протоколов (25, 465, 587, 143, 993, 443 и ManageSieve 4190) слушает systemd (юниты
-# thepost-*.socket): у процесса нет capabilities для портов ниже 1024 (SRS 2.7, DEP-08), перезапуск не закрывает
-# сокеты. false — процессу выдаётся CAP_NET_BIND_SERVICE (drop-in bind-capability.conf), юниты сокетов выключены. По умолчанию false: приём сокетов systemd в thepost ещё не подключён (TODO(PLT-16)
-# в crates/thepost/src/protocols.rs) — с true узел не займёт порты, уже занятые systemd.
-thepost_socket_activation: false
+# Порты клиентских протоколов (25, 465, 587, 143, 993, 443 и ManageSieve 4190) слушает только systemd (юниты
+# thepost-*.socket, решение 102) — у процесса нет capabilities (SRS 2.7, DEP-08), перезапуск не закрывает сокеты.
+# Слушатели — из пресета (0.0.0.0:<порт>); другой адрес — drop-in юнита сокета (ListenStream=) и тот же адрес в
+# thepost_config_extra.
 thepost_sockets: [smtp, submissions, submission, imap, imaps, https, managesieve]
 # Admin API — только внутренний адрес (SRS 6.8): loopback, частные сети.
 thepost_admin_listen: "127.0.0.1:8443"
