@@ -597,7 +597,7 @@ impl MessageStore for PgMeta {
                 .await
                 .map_err(db_err)?;
             let msg = assemble(&mut tx, scope, rows).await?.pop();
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(msg)
         })
         .await
@@ -648,7 +648,7 @@ impl MessageStore for PgMeta {
             return Err(Error::NotFound);
         }
         let out = assemble(&mut tx, scope, rows).await?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(out)
 }).await
     }
@@ -695,7 +695,7 @@ impl MessageStore for PgMeta {
                 }
             }
             if changed.is_empty() {
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 return Ok(update);
             }
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
@@ -741,7 +741,7 @@ impl MessageStore for PgMeta {
                 })
                 .collect();
             changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             self.signal_log([scope.account]).await;
             update.modseq = ms;
             update.changed = ids.into_iter().map(MessageId::from_uuid).collect();
@@ -776,7 +776,7 @@ impl MessageStore for PgMeta {
                 })
                 .collect();
             changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             self.signal_log([scope.account]).await;
             Ok(inserted)
         })
@@ -828,7 +828,7 @@ impl MessageStore for PgMeta {
                 ));
             }
             changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             self.signal_log([scope.account]).await;
             Ok(inserted)
         })
@@ -852,7 +852,7 @@ impl MessageStore for PgMeta {
                 .map(|(id, _)| id)
                 .collect();
             if src.is_empty() {
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 return Ok(current);
             }
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
@@ -865,7 +865,7 @@ impl MessageStore for PgMeta {
                 })
                 .collect();
             changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             self.signal_log([scope.account]).await;
             Ok(ms)
         })
@@ -935,7 +935,7 @@ impl MessageStore for PgMeta {
                 }
             }
             changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             self.signal_log([scope.account]).await;
             src.iter()
                 .map(|id| {
@@ -964,7 +964,7 @@ impl MessageStore for PgMeta {
                 .map(|(id, _)| id)
                 .collect();
             if src.is_empty() {
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 return Ok(current);
             }
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
@@ -1010,7 +1010,7 @@ impl MessageStore for PgMeta {
             );
             changelog::log(&mut tx, scope, ms, &changes).await?;
             changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             self.signal_log([scope.account]).await;
             Ok(ms)
         })

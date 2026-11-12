@@ -107,7 +107,7 @@ async fn mark_shard(view: &PgMeta, key: &BlobKey, older_than: OffsetDateTime) ->
         // Другое поколение — другой объект; надгробие удалённого — помечать нечего.
         Some(_) => Check::Marked(None, false),
     };
-    tx.commit().await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
     Ok(check)
 }
 
@@ -132,7 +132,7 @@ async fn unmark_shard(view: &PgMeta, key: &BlobKey, marked: Marked) -> Result<()
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
     Ok(())
 }
 
@@ -195,7 +195,7 @@ async fn referenced(view: &PgMeta, keys: &[BlobKey]) -> Result<Vec<BlobKey>> {
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
     rows.into_iter().map(|(t, h, g)| key_of(t, h, g)).collect()
 }
 
@@ -289,7 +289,7 @@ impl PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             rows.into_iter()
                 .map(|(tenant, hash, g, size, damaged, compression)| {
                     Ok(LiveBlob {
@@ -329,7 +329,7 @@ impl PgMeta {
             .map_err(db_err)?
             .rows_affected()
                 == 1;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(marked)
         })
         .await
@@ -364,7 +364,7 @@ impl BlobIndex for PgMeta {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(match (live, any) {
             (Some(g), _) => Acquire::Existing {
                 generation: gen_of(g)?,
@@ -440,7 +440,7 @@ impl BlobIndex for PgMeta {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         let g = gen_of(g)?;
         Ok(if state == "live" {
             Commit::Done { generation: g }
@@ -479,7 +479,7 @@ impl BlobIndex for PgMeta {
             .fetch_one(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             match (released, present) {
                 (true, _) => Ok(()),
                 (false, true) => Err(Error::Conflict),
@@ -538,7 +538,7 @@ impl BlobIndex for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         rows.into_iter()
             .map(|(tenant, hash, g)| key_of(tenant, hash, g))
             .collect()
@@ -565,7 +565,7 @@ impl BlobIndex for PgMeta {
             .map_err(db_err)?
             .rows_affected()
                 == 1;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(marked)
         })
         .await
@@ -593,7 +593,7 @@ impl BlobIndex for PgMeta {
             .map_err(db_err)?
             .rows_affected()
                 == 1;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(done)
         })
         .await
@@ -620,7 +620,7 @@ impl BlobIndex for PgMeta {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(found)
 }).await
     }

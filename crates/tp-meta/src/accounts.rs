@@ -183,18 +183,18 @@ impl PgMeta {
         let created = if shard == ShardId::MAIN {
             let created =
                 mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             created
         } else {
             // Ящик на другом шарде: каталог фиксируется первым, состояние ящика и папки — на шарде
             // (повтор upsert дополняет недостающее).
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             let pool = self.shard_pool(shard, ReadIntent::Primary).await?;
             let mut tx = begin(&pool, tenant).await?;
             mailboxes::ensure_state(&mut tx, scope).await?;
             let created =
                 mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             created
         };
         if created > 0 {
@@ -219,7 +219,7 @@ impl AccountStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(row.map(Account::from))
         })
         .await
@@ -237,7 +237,7 @@ impl AccountStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(row.map(Account::from))
         })
         .await
@@ -255,7 +255,7 @@ impl AccountStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(row.map(Account::from))
         })
         .await
@@ -290,7 +290,7 @@ impl AccountStore for PgMeta {
                 q = q.bind(next);
             }
             let rows: Vec<AccountRow> = q.fetch_all(&mut *tx).await.map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(rows.into_iter().map(Account::from).collect())
         })
         .await
@@ -335,7 +335,7 @@ impl AccountStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             let (used, messages) = row.ok_or(Error::NotFound)?;
             Ok(QuotaUsage {
                 used_bytes: to_u64(used)?,

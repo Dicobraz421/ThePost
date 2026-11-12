@@ -85,7 +85,7 @@ impl IndexManifestStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             row.map_or(Ok(IndexManifest::default()), IndexManifest::try_from)
         })
         .await
@@ -135,7 +135,7 @@ impl IndexManifestStore for PgMeta {
         }
         .map_err(db_err)?;
         let version = version.ok_or(Error::Conflict)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         to_u64(version)
 }).await
     }
@@ -161,7 +161,7 @@ impl IndexManifestStore for PgMeta {
             .fetch_one(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             to_u64(version)
         })
         .await
@@ -185,7 +185,7 @@ impl IndexManifestStore for PgMeta {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(db_err)?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 rows.extend(part);
             }
             // NULLS LAST: запрошенные перестройки раньше индексов старой схемы.

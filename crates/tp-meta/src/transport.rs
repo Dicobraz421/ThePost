@@ -206,7 +206,7 @@ impl PgMeta {
     /// Конец изменения уровня кластера: новая версия, фиксация, сигнал.
     async fn cluster_commit(&self, mut tx: Transaction<'static, Postgres>) -> Result<u64> {
         let version = bump_cluster(&mut tx).await?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         self.signal(transport_changed(None)).await;
         Ok(version)
     }
@@ -230,7 +230,7 @@ impl PgMeta {
         expected: u64,
     ) -> Result<u64> {
         let version = bump_tenant(&mut tx, tenant, expected).await?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         self.signal(transport_changed(Some(tenant))).await;
         Ok(version)
     }
@@ -267,7 +267,7 @@ impl TransportStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(ClusterTransport {
             version: to_u64(version)?,
             domains: domains
@@ -305,7 +305,7 @@ impl TransportStore for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(TenantTransport {
                 version: to_u64(version.unwrap_or(0))?,
                 routes: routes

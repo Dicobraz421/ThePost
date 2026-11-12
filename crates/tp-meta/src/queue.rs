@@ -60,7 +60,7 @@ async fn queue_view<'v>(
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         if found {
             remember(meta, id, *shard);
             return Ok(view);
@@ -294,7 +294,7 @@ impl QueueStore for PgMeta {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(id)
 }).await
     }
@@ -365,7 +365,7 @@ impl QueueStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         let mut rcpts: HashMap<Uuid, Vec<QueuedRcpt>> = HashMap::with_capacity(ids.len());
         for r in rows {
             rcpts.entry(r.queue_id).or_default().push(QueuedRcpt {
@@ -406,7 +406,7 @@ impl QueueStore for PgMeta {
             .await
             .map_err(db_err)?
             .rows_affected();
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             if n == 1 { Ok(()) } else { Err(Error::Conflict) }
         })
         .await
@@ -442,7 +442,7 @@ impl QueueStore for PgMeta {
                 return Err(Error::NotFound);
             }
             settle(&mut tx, claim.id).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(())
         })
         .await
@@ -472,7 +472,7 @@ impl QueueStore for PgMeta {
                 return Err(Error::NotFound);
             }
             settle(&mut tx, claim.id).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(())
         })
         .await
@@ -510,7 +510,7 @@ impl QueueStore for PgMeta {
                 return Err(Error::NotFound);
             }
             let pending = settle(&mut tx, claim.id).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(!pending)
         })
         .await
