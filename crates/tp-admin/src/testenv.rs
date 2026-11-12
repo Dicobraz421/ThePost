@@ -19,13 +19,14 @@ use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, Polic
 use tp_contracts::{AccountId, DomainId, Error, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
-    MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies, MemQuota, MemTransport,
-    MemTrash, PolicyLevel, SystemClock,
+    MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies, MemQuota, MemSieve,
+    MemTransport, MemTrash, PolicyLevel, SystemClock,
 };
 
 use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
 use crate::audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink};
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
+use crate::sieve::ScriptError;
 
 /// Журнал аудита в памяти.
 #[derive(Debug, Clone, Default)]
@@ -247,9 +248,25 @@ pub struct Env {
     pub app_passwords: tp_auth::AppPasswords,
     pub transport: MemTransport,
     pub tokens: MemLocalAdminTokens,
+    pub sieve: MemSieve,
     pub admin: Arc<Admin>,
     pub router: Router,
     pub other_tenant: TenantId,
+}
+
+/// Проверка скрипта тестов (вместо `tp_sieve::check`): каждое `oops` — ошибка с позицией.
+pub fn check_script(text: &str) -> Vec<ScriptError> {
+    let mut errors = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        for (at, _) in line.match_indices("oops") {
+            errors.push(ScriptError {
+                line: i as u32 + 1,
+                column: line[..at].chars().count() as u32 + 1,
+                message: "неизвестная команда".into(),
+            });
+        }
+    }
+    errors
 }
 
 /// Субъект с группами.
@@ -354,7 +371,8 @@ impl Env {
         } else {
             admin
         };
-        let admin = Arc::new(admin);
+        let sieve = MemSieve::new();
+        let admin = Arc::new(admin.with_sieve(Arc::new(sieve.clone()), check_script));
         let app_passwords = stores.app_passwords();
         let Stores {
             meta,
@@ -381,6 +399,7 @@ impl Env {
             app_passwords,
             transport,
             tokens,
+            sieve,
             router: admin.clone().router(),
             admin,
             other_tenant,
