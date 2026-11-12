@@ -98,6 +98,9 @@ pub struct Bus {
     pub bus: Arc<dyn EventBus>,
     /// Снимок метрик.
     pub sample: BusSampler,
+    /// Шина LISTEN/NOTIFY (`bus.kind: postgres`) — источник метрик слушателя и фиксаций с NOTIFY
+    /// (`crate::metrics::register_db`, APP-34); у шины в процессе — `None`.
+    pub signals: Option<PgSignalBus>,
 }
 
 impl std::fmt::Debug for Bus {
@@ -124,6 +127,7 @@ pub async fn open_bus(
             Ok(Bus {
                 bus: Arc::new(bus),
                 sample: Arc::new(move || bus_sample(counters.snapshot())),
+                signals: None,
             })
         }
         BusKind::Postgres => {
@@ -141,8 +145,9 @@ pub async fn open_bus(
                 .map_err(|e| context("meta.signals", e))?;
             let probe = bus.clone();
             Ok(Bus {
-                bus: Arc::new(bus),
+                bus: Arc::new(bus.clone()),
                 sample: Arc::new(move || pg_bus_sample(probe.connected(), &probe.metrics())),
+                signals: Some(bus),
             })
         }
     }

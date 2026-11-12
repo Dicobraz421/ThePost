@@ -3,11 +3,11 @@
 //! журнала событий (по сигналам, [`crate::log_reader`]), очистка по сроку надгробий DAV и журнала автоответов
 //! ([`Purge`], решение 2026-11-11 п. 65); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tp_blob::{GcConfig, GcWorker, OrphanConfig, OrphanSweeper, system_now};
+use tp_blob::{GcConfig, GcWorker, OrphanConfig, OrphanMetrics, OrphanSweeper, system_now};
 use tp_contracts::Result;
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::events::EventSink;
@@ -37,6 +37,26 @@ impl RoleService for PendingRole {
     }
 }
 
+/// Воркер поиска «сирот» роли maintenance для `/metrics` (APP-34): создаётся при первом запуске роли и
+/// переживает её перезапуски — счётчики не обнуляются. До запуска роли снимок нулевой. Клон — тот же воркер.
+#[derive(Clone, Default)]
+pub struct OrphanProbe(Arc<OnceLock<Arc<OrphanSweeper>>>);
+
+impl OrphanProbe {
+    /// Снимок метрик воркера ([`OrphanSweeper::metrics`]).
+    pub fn metrics(&self) -> OrphanMetrics {
+        self.0.get().map(|s| s.metrics()).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for OrphanProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrphanProbe")
+            .field("started", &self.0.get().is_some())
+            .finish()
+    }
+}
+
 /// Зависимости роли maintenance.
 pub struct Maintenance {
     /// Учёт объектов BLOB.
@@ -57,6 +77,8 @@ pub struct Maintenance {
     pub gc: GcConfig,
     /// Поиск «сирот» (`blob.orphans`).
     pub orphans: OrphanConfig,
+    /// Воркер поиска «сирот»: его метрики читает `/metrics` (`crate::metrics::register_orphans`).
+    pub orphan_probe: OrphanProbe,
     /// Почтовое хранилище для истечения срока корзины (`TrashStore::expired` → `before_final_delete` →
     /// `expunge_final`, секция `mailstore.trash`); `None` — истечение не выполняется (тесты).
     pub trash: Option<tp_mailstore::Store>,
@@ -160,12 +182,18 @@ impl RoleService for Maintenance {
             self.gc.clone(),
             system_now(),
         );
-        let orphans = OrphanSweeper::new(
-            self.index.clone(),
-            self.store.clone(),
-            self.orphans.clone(),
-            system_now(),
-        );
+        let orphans = self
+            .orphan_probe
+            .0
+            .get_or_init(|| {
+                Arc::new(OrphanSweeper::new(
+                    self.index.clone(),
+                    self.store.clone(),
+                    self.orphans.clone(),
+                    system_now(),
+                ))
+            })
+            .clone();
         let (leases, holder, token) = (
             self.leases.clone(),
             self.holder.clone(),
@@ -342,6 +370,7 @@ mod tests {
             },
             gc: GcConfig::default(),
             orphans: OrphanConfig::default(),
+            orphan_probe: OrphanProbe::default(),
             trash: None,
             purge: None,
         };
@@ -503,6 +532,7 @@ mod tests {
             },
             gc: GcConfig::default(),
             orphans: OrphanConfig::default(),
+            orphan_probe: OrphanProbe::default(),
             trash: None,
             purge: Some(purge),
         };
