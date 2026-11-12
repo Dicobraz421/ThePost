@@ -35,7 +35,7 @@ use crate::hashing::Rendezvous;
 /// tls:
 ///   ca_file: /etc/thepost/cluster-ca.pem
 ///   cert_file: /etc/thepost/node.pem     # CN — идентификатор узла
-///   key_file: /etc/thepost/node-key.pem
+///   key: { secret: "thepost/tls/node#key" }   # ключ из хранилища секретов (PEM); либо key_file: <путь>
 /// permissions:
 ///   jmap: [search/query]
 ///   admin: [admin/*]
@@ -67,7 +67,10 @@ pub struct RpcConfig {
     /// Наибольший размер запроса (ключ и тело), байт.
     pub max_body_bytes: usize,
     /// TLS внутреннего канала: УЦ узлов (`ca_file`), сертификат узла (`cert_file`, CN — идентификатор узла) и
-    /// ключ (`key_file`) — обязательны при запуске транспорта; открытый канал и `server_name` не допускаются.
+    /// ключ — обязательны при запуске транспорта; открытый канал и `server_name` не допускаются. Ключ — ссылка
+    /// на секрет `key: { secret: "<путь>#<поле>" }` (значение — PEM, на диск не пишется) либо файл `key_file`;
+    /// оба сразу — ошибка. Файлы и секрет перечитываются по событиям перечитывания сертификатов; ключ, не
+    /// подходящий к сертификату, — действует прежняя пара.
     pub tls: InternalTls,
 }
 

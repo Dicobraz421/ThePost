@@ -7,6 +7,8 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use tp_contracts::secrets::SecretRef;
+use tp_testkit::MemSecretStore;
 use tp_testkit::membership::MemMembership;
 use tp_testkit::suite::{RpcFixture, rpc as rpc_suite};
 
@@ -618,6 +620,189 @@ async fn reloads_certificates_without_restart() {
         d.call(&echo, "k", Bytes::new(), LONG).await,
         Err(RpcError::Unavailable)
     );
+    assert_eq!(
+        c.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|c|k|"))
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Каталог с `ca.pem` и `<имя>.pem`; ключ узла в файл не пишется.
+fn cert_dir(tag: &str, name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tp-cluster-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(dir.join("ca.pem"), CA).expect("ca");
+    std::fs::write(dir.join(format!("{name}.pem")), pem(name).0).expect("cert");
+    dir
+}
+
+fn key_ref(name: &str) -> SecretRef {
+    format!("thepost/tls/node-{name}#key").parse().expect("ref")
+}
+
+/// Секция `rpc.tls` узла `name` с ключом по ссылке на секрет.
+fn secret_tls(dir: &std::path::Path, name: &str) -> InternalTls {
+    InternalTls {
+        ca_file: Some(dir.join("ca.pem")),
+        cert_file: Some(dir.join(format!("{name}.pem"))),
+        key: Some(key_ref(name)),
+        ..InternalTls::default()
+    }
+}
+
+fn key_text(name: &str) -> &'static str {
+    std::str::from_utf8(pem(name).1).expect("pem")
+}
+
+/// CLU-16: два узла с ключом из хранилища секретов устанавливают mTLS-соединение.
+#[tokio::test]
+async fn key_from_secret_store() {
+    let dir = cert_dir("secret", "a");
+    std::fs::write(dir.join("b.pem"), pem("b").0).expect("cert");
+    let store = MemSecretStore::default();
+    store.set(&key_ref("a"), key_text("a"));
+    store.set(&key_ref("b"), key_text("b"));
+    let a_tls = NodeTls::load_with_secrets(&secret_tls(&dir, "a"), &store)
+        .await
+        .expect("a");
+    let b_tls = NodeTls::load_with_secrets(&secret_tls(&dir, "b"), &store)
+        .await
+        .expect("b");
+    assert_eq!(a_tls.identity(), &named("a"));
+
+    let mut cluster = Cluster::new();
+    let cfg = config("permissions:\n  jmap: [search/*]\n", 4);
+    let a = cluster.start("a", a_tls, &[Role::Jmap], &cfg).await;
+    let b = cluster.start("b", b_tls, &[Role::Search], &cfg).await;
+    let echo = svc(Role::Search, "echo");
+    b.serve(echo.clone(), Arc::new(Echo("b"))).expect("echo");
+    assert_eq!(
+        a.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|a|k|"))
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// CLU-16: `key` и `key_file` вместе, `key` без хранилища, нет секрета, не PEM, чужой ключ — `Invalid` без
+/// значения секрета в тексте; недоступное хранилище — повторяемая ошибка.
+#[tokio::test]
+async fn key_secret_errors() {
+    let dir = cert_dir("secret-err", "a");
+    let cfg = secret_tls(&dir, "a");
+    let store = MemSecretStore::default();
+    store.set(&key_ref("a"), key_text("a"));
+
+    let both = InternalTls {
+        key_file: Some(dir.join("a-key.pem")),
+        ..cfg.clone()
+    };
+    let e = NodeTls::load_with_secrets(&both, &store)
+        .await
+        .expect_err("both");
+    assert!(
+        matches!(&e, Error::Invalid(m) if m.contains("mutually exclusive")),
+        "{e:?}"
+    );
+    assert!(matches!(NodeTls::load(&both).await, Err(Error::Invalid(_))));
+
+    let e = NodeTls::load(&cfg).await.expect_err("no store");
+    assert!(
+        matches!(&e, Error::Invalid(m) if m.contains("secret store")),
+        "{e:?}"
+    );
+    let none = InternalTls {
+        key: None,
+        ..cfg.clone()
+    };
+    let e = NodeTls::load_with_secrets(&none, &store)
+        .await
+        .expect_err("no key");
+    assert!(
+        matches!(&e, Error::Invalid(m) if m.contains("key_file") && m.contains("rpc.tls.key ")),
+        "{e:?}"
+    );
+
+    let empty = MemSecretStore::default();
+    let e = NodeTls::load_with_secrets(&cfg, &empty)
+        .await
+        .expect_err("missing secret");
+    assert!(
+        matches!(&e, Error::Invalid(m) if m.contains("thepost/tls/node-a")),
+        "{e:?}"
+    );
+
+    store.set(&key_ref("a"), "garbage-value");
+    let e = NodeTls::load_with_secrets(&cfg, &store)
+        .await
+        .expect_err("garbage");
+    assert!(
+        matches!(&e, Error::Invalid(m) if !m.contains("garbage-value")),
+        "{e:?}"
+    );
+    // Ключ другого узла не подходит к сертификату.
+    store.set(&key_ref("a"), key_text("b"));
+    let e = NodeTls::load_with_secrets(&cfg, &store)
+        .await
+        .expect_err("foreign key");
+    assert!(matches!(e, Error::Invalid(_)), "{e:?}");
+
+    store.set(&key_ref("a"), key_text("a"));
+    store.seal();
+    let e = NodeTls::load_with_secrets(&cfg, &store)
+        .await
+        .expect_err("sealed");
+    assert!(e.is_retryable(), "{e:?}");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// CLU-16: ключ из хранилища перечитывается по тем же событиям, что и файлы; не подходящий к сертификату ключ
+/// и недоступное хранилище оставляют прежнюю пару.
+#[tokio::test]
+async fn reloads_key_from_secret_store() {
+    let mut cluster = Cluster::new();
+    let cfg = config("permissions:\n  jmap: [search/*]\n", 4);
+    let a = cluster.start("a", tls("a"), &[Role::Jmap], &cfg).await;
+    let b = cluster.start("b", tls("b"), &[Role::Search], &cfg).await;
+    let echo = svc(Role::Search, "echo");
+    b.serve(echo.clone(), Arc::new(Echo("b"))).expect("echo");
+
+    // Смена УЦ: новая пара b — сертификат в файле, ключ в хранилище.
+    let dir = cert_dir("secret-reload", "b");
+    let bundle = [CA, CA2].concat();
+    let (b2, b2_key) = pem("node-b2");
+    std::fs::write(dir.join("ca.pem"), &bundle).expect("ca");
+    std::fs::write(dir.join("b.pem"), b2).expect("cert");
+    let section = secret_tls(&dir, "b");
+    let store = Arc::new(MemSecretStore::default());
+    let once = || futures::stream::iter([()]);
+
+    // Прежний ключ с новым сертификатом, затем недоступное хранилище: действует прежняя пара.
+    store.set(&key_ref("b"), key_text("b"));
+    b.follow_tls_with_secrets(&section, store.clone(), once())
+        .await;
+    store.set(&key_ref("b"), std::str::from_utf8(b2_key).expect("pem"));
+    store.seal();
+    b.follow_tls_with_secrets(&section, store.clone(), once())
+        .await;
+    // Без хранилища ключ по ссылке не читается.
+    b.follow_tls(&section, once()).await;
+    assert_eq!(
+        a.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|a|k|"))
+    );
+
+    store.unseal();
+    b.follow_tls_with_secrets(&section, store.clone(), once())
+        .await;
+    // Сертификат b теперь от второго УЦ: узел с прежним УЦ его не принимает, с обоими — принимает.
+    let c = cluster.start("c", tls("c"), &[Role::Jmap], &cfg).await;
+    assert_eq!(
+        c.call(&echo, "k", Bytes::new(), LONG).await,
+        Err(RpcError::Unavailable)
+    );
+    let (c_cert, c_key) = pem("c");
+    c.reload_tls(NodeTls::from_pem(&bundle, c_cert, c_key).expect("c tls"))
+        .expect("reload c");
     assert_eq!(
         c.call(&echo, "k", Bytes::new(), LONG).await,
         Ok(Bytes::from("b|c|k|"))
