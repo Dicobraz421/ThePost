@@ -2,18 +2,20 @@
 //! пользователя — `/dav/addressbooks/<логин>/gal/` (имя — `dav.gal_name`). Есть, если приложение передало каталог
 //! ([`crate::router_with_gal`]).
 //!
-//! Состав — снимок каталога (`Directory`): учётные записи с разрешённым входом и адресом и группы с адресом
-//! рассылки; группа, скрытая из GAL (`hidden_from_gal` в `GroupStore`, поиск по идентификатору каталога), не
-//! показывается. Карточки строятся на лету (calcard, vCard 3.0; по запросу — 4.0, [`crate::card`]): `UID` —
+//! Состав — снимок каталога (`Directory`): учётные записи с разрешённым входом и адресом, кроме скрытых из GAL
+//! (`DirAccount::hidden_from_gal`, CTR-58), и группы с адресом рассылки; группа, скрытая из GAL (`hidden_from_gal`
+//! в `GroupStore`, поиск по идентификатору каталога), не показывается. Карточки строятся на лету (calcard, vCard 3.0; по запросу — 4.0, [`crate::card`]): `UID` —
 //! идентификатор в каталоге, `FN`, `EMAIL` (первый — основной), телефоны из атрибутов `telephoneNumber` и `mobile`;
 //! группа — `KIND:group` (`X-ADDRESSBOOKSERVER-KIND` в 3.0). Оргструктура (подразделение, должность, руководитель) —
 //! DAV-22.
 //!
-//! ETag карточки — хеш её тела: меняется только у изменённой карточки, клиент после смены токена книги сверяет
-//! список ETag и скачивает лишь изменённые. Версия снимка — хеш состава и содержимого всех карточек: `getctag` и
-//! токен синхронизации книги. `sync-collection`: пустой токен — все карточки, токен текущего снимка — без изменений,
-//! токен прежнего снимка — 403 `valid-sync-token` (клиент повторяет полную синхронизацию и так узнаёт и об
-//! удалённых). Снимок хранится в памяти процесса `dav.gal_cache` (каталог не опрашивается на каждый запрос). Запись
+//! ETag карточки — хеш её тела (DAV-28): меняется только у изменённой карточки. Версия снимка — хеш состава и
+//! содержимого всех карточек: `getctag` и токен синхронизации книги. `sync-collection`: пустой токен — все
+//! карточки, токен текущего снимка — без изменений, токен одного из `dav.gal_sync_history` прежних снимков — только
+//! изменённые и новые карточки и удалённые (404) по сравнению ETag; токен старше — 403 `valid-sync-token` (клиент
+//! повторяет полную синхронизацию). Снимок хранится в памяти процесса `dav.gal_cache` (каталог не опрашивается на
+//! каждый запрос); история снимков — ETag карточек по имени, тоже в памяти процесса (после перезапуска — полная
+//! синхронизация). Запись
 //! (`PUT`, `DELETE`, `PROPPATCH`, `MKCOL`) — 403 `DAV:need-privileges`.
 //!
 //! Книга отчуждаема: основной путь к адресной книге организации — свой клиент (JMAP), CardDAV-книга — для сторонних
@@ -50,14 +52,27 @@ use crate::xml::{self, Multistatus};
 pub(crate) struct Gal {
     /// Книга: `state` — версия снимка.
     pub coll: Collection,
-    /// Карточки по имени ресурса.
+    /// Карточки по возрастанию имени ресурса.
     pub cards: Vec<DavObject>,
+    /// Прежние снимки, новые первыми (не больше `dav.gal_sync_history`): версия и ETag карточек по имени.
+    pub previous: Vec<(ModSeq, BTreeMap<String, String>)>,
 }
 
 impl Gal {
     /// Карточка по имени ресурса.
     pub(crate) fn card(&self, name: &str) -> Option<&DavObject> {
-        self.cards.iter().find(|o| o.name == name)
+        self.cards
+            .binary_search_by(|o| o.name.as_str().cmp(name))
+            .ok()
+            .map(|i| &self.cards[i])
+    }
+
+    /// ETag карточек по имени.
+    fn etags(&self) -> BTreeMap<String, String> {
+        self.cards
+            .iter()
+            .map(|o| (o.name.clone(), o.etag.clone()))
+            .collect()
     }
 }
 
@@ -120,10 +135,11 @@ pub(crate) async fn load(cx: &Cx<'_>) -> Result<Option<Arc<Gal>>> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&tenant)
-        .filter(|(at, _)| at.elapsed() < cfg.gal_cache)
-        .map(|(_, g)| Arc::clone(g));
-    if let Some(g) = cached {
-        return Ok(Some(g));
+        .map(|(at, g)| (*at, Arc::clone(g)));
+    if let Some((at, g)) = &cached
+        && at.elapsed() < cfg.gal_cache
+    {
+        return Ok(Some(Arc::clone(g)));
     }
     let limit = cfg.gal_page_size.max(1);
     let mut accounts = Dump::new(|a: &DirAccount| a.external_id.clone());
@@ -162,7 +178,19 @@ pub(crate) async fn load(cx: &Cx<'_>) -> Result<Option<Arc<Gal>>> {
                 .filter_map(group_card),
         )
         .collect();
-    let gal = Arc::new(build(&cfg.gal_name, cards));
+    let mut gal = build(&cfg.gal_name, cards);
+    let gal = match cached.map(|(_, g)| g) {
+        // Каталог не изменился — прежний снимок с его историей.
+        Some(prev) if prev.coll.state == gal.coll.state => prev,
+        Some(prev) => {
+            gal.previous = std::iter::once((prev.coll.state, prev.etags()))
+                .chain(prev.previous.iter().cloned())
+                .take(cfg.gal_sync_history)
+                .collect();
+            Arc::new(gal)
+        }
+        None => Arc::new(gal),
+    };
     cx.dav
         .gal
         .0
@@ -218,9 +246,9 @@ fn write(uid: &str, entries: Vec<VCardEntry>) -> Option<Card> {
     Some((uid.to_owned(), body))
 }
 
-/// Карточка учётной записи; вход запрещён или нет адреса — `None`.
+/// Карточка учётной записи; вход запрещён, запись скрыта из адресной книги или нет адреса — `None`.
 fn account_card(a: &DirAccount) -> Option<Card> {
-    if !a.enabled || a.emails.is_empty() {
+    if !a.enabled || a.hidden_from_gal || a.emails.is_empty() {
         return None;
     }
     let name = if a.display_name.trim().is_empty() {
@@ -310,7 +338,11 @@ fn build(display_name: &str, cards: Vec<Card>) -> Gal {
             index: ObjectIndex::new(Component::Card, uid, None),
         })
         .collect();
-    Gal { coll, cards }
+    Gal {
+        coll,
+        cards,
+        previous: Vec::new(),
+    }
 }
 
 /// `response` карточки книги.
@@ -327,14 +359,25 @@ pub(crate) fn emit(cx: &Cx<'_>, ms: &mut Multistatus, g: &Gal, o: &DavObject, wa
 
 /// `sync-collection` книги (см. описание модуля).
 pub(crate) fn sync(cx: &Cx<'_>, g: &Gal, req: SyncRequest) -> Response {
-    if req.since != ModSeq::ZERO && req.since != g.coll.state {
-        return invalid_token();
-    }
+    let want = Want::Props(req.props);
     let mut ms = Multistatus::new();
     if req.since == ModSeq::ZERO {
-        let want = Want::Props(req.props);
         for o in &g.cards {
             emit(cx, &mut ms, g, o, &want);
+        }
+    } else if req.since != g.coll.state {
+        let Some((_, old)) = g.previous.iter().find(|(v, _)| *v == req.since) else {
+            return invalid_token();
+        };
+        for o in g.cards.iter().filter(|o| old.get(&o.name) != Some(&o.etag)) {
+            emit(cx, &mut ms, g, o, &want);
+        }
+        for name in old.keys().filter(|n| g.card(n).is_none()) {
+            ms.status(
+                &path::object(CollectionKind::AddressBook, cx.login(), path::GAL, name),
+                StatusCode::NOT_FOUND,
+                None,
+            );
         }
     }
     ms.sync_token(&props::sync_token(g.coll.state));

@@ -1,4 +1,4 @@
-//! DAV-01: вход Basic и Bearer, 401, чужой принципал — 403, корень и принципал, OPTIONS.
+//! DAV-01: вход Basic и Bearer, 401, чужой принципал — 403, корень и принципал, OPTIONS; DAV-26: адрес клиента.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -161,4 +161,26 @@ async fn unavailable_unknown_and_methods() {
     let r = env.send("LOCK", "/dav/", &[], "").await;
     assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(r.header("allow"), Some(ALLOW));
+}
+
+/// DAV-26: вход Basic и Bearer — в проверку учётных данных пришёл адрес соединения (`ConnectInfo`, как его ставит
+/// сервер `tp_platform::service_http`), и при неверном пароле тоже; без соединения — адрес неизвестен.
+#[tokio::test]
+async fn verify_gets_connection_address() {
+    let env = Env::new();
+    let peer = std::net::SocketAddr::from(([192, 0, 2, 7], 50_000));
+    for (a, code) in [
+        (basic(LOGIN, "secret"), StatusCode::MULTI_STATUS),
+        (basic(LOGIN, "wrong"), StatusCode::UNAUTHORIZED),
+        ("Bearer token-1".to_owned(), StatusCode::MULTI_STATUS),
+    ] {
+        let mut req = propfind("/dav/", Some(a.as_str()));
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        assert_eq!(env.raw(req).await.status, code, "{a}");
+    }
+    let own = basic(LOGIN, "secret");
+    env.raw(propfind("/dav/", Some(own.as_str()))).await;
+    let ip = Some(peer.ip());
+    assert_eq!(env.auth.peers(), [ip, ip, ip, None]);
 }
