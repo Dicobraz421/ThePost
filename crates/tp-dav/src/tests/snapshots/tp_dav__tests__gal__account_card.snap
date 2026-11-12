@@ -1,0 +1,14 @@
+---
+source: crates/tp-dav/src/tests/gal.rs
+expression: "r.body.replace(\"\\r\\n\", \"\\n\")"
+---
+BEGIN:VCARD
+VERSION:3.0
+UID:u-ivan
+FN;CHARSET=UTF-8:Иван Петров
+EMAIL;TYPE=WORK,pref:ivan@example.org
+EMAIL;TYPE=WORK:i.petrov@example.org
+TEL;TYPE=WORK:+7 495 123-45-67
+TEL;TYPE=CELL:+7 916 000-11-22
+N;CHARSET=UTF-8:Иван Петров;;;;
+END:VCARD

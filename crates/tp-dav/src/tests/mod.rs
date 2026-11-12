@@ -11,7 +11,7 @@ use tower::ServiceExt;
 use tp_contracts::TenantId;
 use tp_contracts::dav::{Collection, CollectionKind, DavStore};
 use tp_contracts::meta::AccountScope;
-use tp_testkit::{FakeAuthenticator, MemDav, principal};
+use tp_testkit::{FakeAuthenticator, FakeDirectory, MemDav, MemGroups, principal};
 
 use crate::{DavConfig, Deps, router};
 
@@ -20,6 +20,7 @@ mod caldav_home;
 mod card_query;
 mod card_versions;
 mod carddav_home;
+mod gal;
 mod multiget;
 mod preconditions;
 mod propfind;
@@ -41,6 +42,10 @@ pub(crate) struct Env {
     pub store: MemDav,
     pub auth: FakeAuthenticator,
     pub scope: AccountScope,
+    /// Каталог организации (глобальная адресная книга).
+    pub dir: FakeDirectory,
+    /// Группы рассылки (скрытие из адресной книги).
+    pub groups: MemGroups,
 }
 
 impl Env {
@@ -60,10 +65,14 @@ impl Env {
             principal(tenant, "petr@example.org"),
         );
         let store = MemDav::new();
+        let dir = FakeDirectory::default();
+        let groups = MemGroups::new();
         let app = router(
             Deps {
                 auth: Arc::new(auth.clone()),
                 store: Arc::new(store.clone()),
+                directory: Some(Arc::new(dir.clone())),
+                groups: Some(Arc::new(groups.clone())),
             },
             cfg,
         );
@@ -71,6 +80,8 @@ impl Env {
             app,
             store,
             auth,
+            dir,
+            groups,
             scope: AccountScope {
                 tenant,
                 account: me.account,

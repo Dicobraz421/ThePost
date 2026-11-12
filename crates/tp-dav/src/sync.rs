@@ -16,10 +16,11 @@ use axum::response::Response;
 use tp_contracts::dav::DavObject;
 use tp_contracts::{Error, ModSeq, Result};
 
+use crate::card;
+use crate::gal;
 use crate::path::{self, Target};
 use crate::props::{self, Res, SYNC_PREFIX, Want};
 use crate::query::{self, unsupported};
-use crate::card;
 use crate::server::{Cx, multistatus, precondition, status};
 use crate::xml::{CALDAV, CARDDAV, DAV, Element, Multistatus, PropName};
 
@@ -111,6 +112,9 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, body: Body) -> Result<R
     let Target::Collection(kind, _, name) = target else {
         return Ok(unsupported());
     };
+    if let Some(g) = gal::find(cx, *kind, name).await? {
+        return Ok(gal::sync(cx, &g, req));
+    }
     let Some(c) = cx.store().collection_by_name(cx.scope, *kind, name).await? else {
         return Ok(status(StatusCode::NOT_FOUND));
     };
@@ -164,6 +168,6 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, body: Body) -> Result<R
     Ok(multistatus(ms))
 }
 
-fn invalid_token() -> Response {
+pub(crate) fn invalid_token() -> Response {
     precondition(StatusCode::FORBIDDEN, "<d:valid-sync-token/>")
 }

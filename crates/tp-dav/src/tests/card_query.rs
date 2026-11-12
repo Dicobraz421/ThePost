@@ -17,8 +17,7 @@ const MARIA: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c-maria\r\nFN:Мария 
 const JOHN: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c-john\r\nFN:John Smith\r\nN:Smith;John;;;\r\n\
     EMAIL;TYPE=INTERNET:john@partner.example\r\nEND:VCARD\r\n";
 
-const NOMAIL: &str =
-    "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c-nomail\r\nFN:Склад\r\nN:Склад;;;;\r\nTEL;TYPE=WORK:+7 495 765-43-21\r\nEND:VCARD\r\n";
+const NOMAIL: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c-nomail\r\nFN:Склад\r\nN:Склад;;;;\r\nTEL;TYPE=WORK:+7 495 765-43-21\r\nEND:VCARD\r\n";
 
 /// Книга `contacts` с четырьмя карточками.
 async fn env() -> Env {
@@ -71,7 +70,10 @@ async fn text_match_types() {
     let env = env().await;
     let cases: [(&str, &[&str]); 9] = [
         // Без условий — все.
-        ("<card:filter/>", &["ivan.vcf", "john.vcf", "maria.vcf", "nomail.vcf"]),
+        (
+            "<card:filter/>",
+            &["ivan.vcf", "john.vcf", "maria.vcf", "nomail.vcf"],
+        ),
         // Подстрока без учёта регистра, кириллица (сравнение по умолчанию — i;unicode-casemap).
         (
             r#"<card:filter><card:prop-filter name="FN"><card:text-match>ИВАН</card:text-match></card:prop-filter></card:filter>"#,
@@ -178,11 +180,7 @@ async fn limit_and_errors() {
     assert!(r.body.contains("number-of-matches-within-limits"));
 
     let bad = [
-        (
-            r#"<card:filter test="some"/>"#,
-            StatusCode::BAD_REQUEST,
-            "",
-        ),
+        (r#"<card:filter test="some"/>"#, StatusCode::BAD_REQUEST, ""),
         (
             r#"<card:filter><card:prop-filter/></card:filter>"#,
             StatusCode::BAD_REQUEST,

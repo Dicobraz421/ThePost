@@ -6,6 +6,9 @@
 //! `calendar-multiget`, `free-busy-query`, RFC 4791 §7.8–7.10), отчёты CardDAV (`addressbook-query`,
 //! `addressbook-multiget`, RFC 6352 §8.6–8.7). Хранилище — [`tp_contracts::dav::DavStore`].
 //!
+//! Глобальная адресная книга «Организация» только для чтения из каталога ([`Deps::directory`]) — в доме адресных книг
+//! каждого пользователя.
+//!
 //! - [`config`] — секция `dav` ([`DavConfig`]);
 //! - [`index`] — индекс объекта (UID, компонент, интервал с повторами) из тела, им пользуется и `tp-jmap`;
 //! - [`xml`] — разбор XML-тел с лимитами и запись `multistatus`;
@@ -14,6 +17,7 @@
 mod card;
 pub mod config;
 pub mod fuzz;
+mod gal;
 pub mod index;
 mod path;
 mod props;

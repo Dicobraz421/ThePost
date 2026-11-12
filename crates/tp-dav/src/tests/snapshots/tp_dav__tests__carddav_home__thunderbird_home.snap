@@ -89,4 +89,26 @@ expression: r.show()
 <d:status>HTTP/1.1 200 OK</d:status>
 </d:propstat>
 </d:response>
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/gal/</d:href>
+<d:propstat>
+<d:prop>
+<d:resourcetype>
+<d:collection/>
+<card:addressbook/>
+</d:resourcetype>
+<d:displayname>Организация</d:displayname>
+<d:current-user-privilege-set>
+<d:privilege>
+<d:read/>
+</d:privilege>
+<d:privilege>
+<d:read-current-user-privilege-set/>
+</d:privilege>
+</d:current-user-privilege-set>
+<cs:getctag>7565435706391538070</cs:getctag>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
 </d:multistatus>

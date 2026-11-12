@@ -34,6 +34,7 @@ use calcard::vcard::{
 use tp_contracts::Result;
 use tp_contracts::dav::{Collection, CollectionKind, DavObject, ObjectIndex, TimeRange};
 
+use crate::gal;
 use crate::index;
 
 use crate::path::{self, Target};
@@ -289,8 +290,7 @@ fn adapt(card: &VCard, to: VCardVersion) -> VCard {
             }
         } else {
             for p in &mut e.params {
-                if p.name == VCardParameterName::Pref
-                    && p.value == VCardParameterValue::Integer(1)
+                if p.name == VCardParameterName::Pref && p.value == VCardParameterValue::Integer(1)
                 {
                     *p = VCardParameter::typ("pref".to_owned());
                 }
@@ -452,6 +452,13 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
         return Ok(unsupported());
     };
     let kind = CollectionKind::AddressBook;
+    if let Some(g) = gal::find(cx, kind, name).await? {
+        return match root.name.as_str() {
+            "addressbook-query" => Ok(query(cx, &g.coll, &g.cards, root)),
+            "addressbook-multiget" => multiget(cx, &g.coll, Some(&g.cards), root).await,
+            _ => Ok(unsupported()),
+        };
+    }
     let Some(c) = cx.store().collection_by_name(cx.scope, kind, name).await? else {
         return Ok(status(StatusCode::NOT_FOUND));
     };
@@ -463,7 +470,7 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
                 .await?;
             Ok(query(cx, &c, &objects, root))
         }
-        "addressbook-multiget" => multiget(cx, &c, root).await,
+        "addressbook-multiget" => multiget(cx, &c, None, root).await,
         _ => Ok(unsupported()),
     }
 }
@@ -536,8 +543,14 @@ fn query(cx: &Cx<'_>, c: &Collection, objects: &[DavObject], root: &Element) -> 
     multistatus(ms)
 }
 
-/// `addressbook-multiget`: карточки по ссылкам в порядке запроса; отсутствующие и чужие — 404 в ответе.
-async fn multiget(cx: &Cx<'_>, c: &Collection, root: &Element) -> Result<Response> {
+/// `addressbook-multiget`: карточки по ссылкам в порядке запроса; отсутствующие и чужие — 404 в ответе. Карточки —
+/// из `all` (глобальная адресная книга) или из хранилища.
+async fn multiget(
+    cx: &Cx<'_>,
+    c: &Collection,
+    all: Option<&[DavObject]>,
+    root: &Element,
+) -> Result<Response> {
     let hrefs: Vec<&str> = root
         .children
         .iter()
@@ -562,12 +575,16 @@ async fn multiget(cx: &Cx<'_>, c: &Collection, root: &Element) -> Result<Respons
     let mut names: Vec<String> = resolved.iter().filter_map(|(_, n)| n.clone()).collect();
     names.sort_unstable();
     names.dedup();
-    let objects = if names.is_empty() {
-        Vec::new()
-    } else {
-        cx.store().multiget(cx.scope, c.id, &names).await?
+    let stored = match all {
+        Some(_) => Vec::new(),
+        None if names.is_empty() => Vec::new(),
+        None => cx.store().multiget(cx.scope, c.id, &names).await?,
     };
-    let by_name: HashMap<&str, &DavObject> = objects.iter().map(|o| (o.name.as_str(), o)).collect();
+    let by_name: HashMap<&str, &DavObject> = all
+        .unwrap_or(&stored)
+        .iter()
+        .map(|o| (o.name.as_str(), o))
+        .collect();
     let mut ms = Multistatus::new();
     for (href, name) in &resolved {
         let Some(o) = name.as_deref().and_then(|n| by_name.get(n)) else {

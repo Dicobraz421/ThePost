@@ -121,13 +121,19 @@ fn conversion_details() {
     assert!(!v3.contains("PREF=1"), "{v3}");
 
     let group = convert(&parse(V4_GROUP), VCardVersion::V3_0).expect("3.0");
-    assert!(group.contains("X-ADDRESSBOOKSERVER-KIND:group\r\n"), "{group}");
+    assert!(
+        group.contains("X-ADDRESSBOOKSERVER-KIND:group\r\n"),
+        "{group}"
+    );
     assert!(
         group.contains("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:c-ivan\r\n"),
         "{group}"
     );
     // vCard 3.0 требует N.
-    assert!(group.contains("\r\nN;CHARSET=UTF-8:Проект;;;;\r\n"), "{group}");
+    assert!(
+        group.contains("\r\nN;CHARSET=UTF-8:Проект;;;;\r\n"),
+        "{group}"
+    );
 }
 
 async fn env_with(cards: &[(&str, &str)]) -> Env {
@@ -168,12 +174,18 @@ async fn get_by_accept() {
     assert_eq!(get("apple.vcf", "").await, APPLE);
     assert_eq!(get("v4.vcf", "text/vcard").await, V4);
     assert_eq!(get("v4.vcf", "text/vcard; version=4.0").await, V4);
-    assert_eq!(get("apple.vcf", "text/vcard;version=3.0, */*;q=0.1").await, APPLE);
+    assert_eq!(
+        get("apple.vcf", "text/vcard;version=3.0, */*;q=0.1").await,
+        APPLE
+    );
     // Неподдерживаемая версия — как хранится.
     assert_eq!(get("v4.vcf", "text/vcard; version=2.1").await, V4);
     let v3 = get("v4.vcf", "text/x-vcard, text/vcard; version=3.0").await;
     assert!(v3.starts_with("BEGIN:VCARD\r\nVERSION:3.0\r\n"), "{v3}");
-    assert!(v3.contains("PHOTO;ENCODING=b;TYPE=PNG:iVBORw0KGgo="), "{v3}");
+    assert!(
+        v3.contains("PHOTO;ENCODING=b;TYPE=PNG:iVBORw0KGgo="),
+        "{v3}"
+    );
     let v4 = get("apple.vcf", "text/vcard; version=\"4.0\"").await;
     assert!(v4.starts_with("BEGIN:VCARD\r\nVERSION:4.0\r\n"), "{v4}");
     assert!(v4.contains("UID:c-ivan"), "{v4}");
@@ -197,12 +209,23 @@ async fn address_data_version() {
     };
     let r = report(r#"content-type="text/vcard" version="3.0""#, "").await;
     insta::assert_snapshot!("multiget_v3", r.show());
-    let r = report(r#"version="4.0""#, r#"<card:prop name="KIND"/><card:prop name="MEMBER"/>"#).await;
+    let r = report(
+        r#"version="4.0""#,
+        r#"<card:prop name="KIND"/><card:prop name="MEMBER"/>"#,
+    )
+    .await;
     insta::assert_snapshot!("multiget_v4_props", r.show());
-    for attrs in [r#"version="2.1""#, r#"content-type="application/vcard+json""#] {
+    for attrs in [
+        r#"version="2.1""#,
+        r#"content-type="application/vcard+json""#,
+    ] {
         let r = report(attrs, "").await;
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{attrs}");
-        assert!(r.body.contains("<card:supported-address-data/>"), "{}", r.body);
+        assert!(
+            r.body.contains("<card:supported-address-data/>"),
+            "{}",
+            r.body
+        );
     }
     // addressbook-query — так же.
     let q = r#"<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -246,16 +269,14 @@ async fn put_preconditions() {
     };
     let rejected = [
         ("не vCard".to_owned(), "<card:valid-address-data/>"),
-        (
-            super::event("e-1", "Событие"),
-            "<card:valid-address-data/>",
-        ),
+        (super::event("e-1", "Событие"), "<card:valid-address-data/>"),
         (
             "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Без UID\r\nEND:VCARD\r\n".to_owned(),
             "<card:valid-address-data/>",
         ),
         (
-            "BEGIN:VCARD\r\nVERSION:2.1\r\nUID:old\r\nFN:Old\r\nN:Old;;;;\r\nEND:VCARD\r\n".to_owned(),
+            "BEGIN:VCARD\r\nVERSION:2.1\r\nUID:old\r\nFN:Old\r\nN:Old;;;;\r\nEND:VCARD\r\n"
+                .to_owned(),
             "<card:supported-address-data/>",
         ),
         (
@@ -265,7 +286,10 @@ async fn put_preconditions() {
         (photo(65, false), "<card:max-resource-size/>"),
         (photo(65, true), "<card:max-resource-size/>"),
         (
-            format!("BEGIN:VCARD\r\nVERSION:3.0\r\nUID:big\r\nFN:Big\r\nNOTE:{}\r\nEND:VCARD\r\n", "x".repeat(5000)),
+            format!(
+                "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:big\r\nFN:Big\r\nNOTE:{}\r\nEND:VCARD\r\n",
+                "x".repeat(5000)
+            ),
             "<card:max-resource-size/>",
         ),
     ];
@@ -288,7 +312,10 @@ async fn put_preconditions() {
         assert_eq!(r.status, StatusCode::CREATED, "{name}: {}", r.body);
     }
     // no-uid-conflict: тот же UID в другом ресурсе книги.
-    assert_eq!(put("a.vcf", vcard("c-1", "Иван")).await.status, StatusCode::CREATED);
+    assert_eq!(
+        put("a.vcf", vcard("c-1", "Иван")).await.status,
+        StatusCode::CREATED
+    );
     let r = put("b.vcf", vcard("c-1", "Иван")).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert!(
@@ -300,6 +327,16 @@ async fn put_preconditions() {
     );
     // max-image-size опубликован.
     let r = env.propfind(&format!("{BOOKS}contacts/"), "0", r#"<d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><d:prop><card:max-image-size/><card:max-resource-size/></d:prop></d:propfind>"#).await;
-    assert!(r.body.contains("<card:max-image-size>64</card:max-image-size>"), "{}", r.body);
-    assert!(r.body.contains("<card:max-resource-size>4096</card:max-resource-size>"), "{}", r.body);
+    assert!(
+        r.body
+            .contains("<card:max-image-size>64</card:max-image-size>"),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body
+            .contains("<card:max-resource-size>4096</card:max-resource-size>"),
+        "{}",
+        r.body
+    );
 }

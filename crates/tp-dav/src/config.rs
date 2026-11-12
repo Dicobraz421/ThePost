@@ -53,6 +53,14 @@ pub struct DavConfig {
     /// Размер встроенного в карточку фото (`PHOTO`, после декодирования base64), байт; больше — `PUT` отклоняется
     /// (`max-resource-size`). Публикуется как `max-image-size`.
     pub max_photo_size: usize,
+    /// Отображаемое имя глобальной адресной книги (каталог организации, только для чтения).
+    pub gal_name: String,
+    /// Записей каталога в одной порции при построении глобальной адресной книги.
+    pub gal_page_size: usize,
+    /// Срок хранения построенной глобальной адресной книги в памяти; `0s` — строить на каждый запрос.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub gal_cache: Duration,
     /// Отображаемое имя адресной книги по умолчанию (создаётся при первом обращении к дому адресных книг).
     pub default_addressbook_name: String,
 }
@@ -73,6 +81,9 @@ impl Default for DavConfig {
             default_calendar_name: "Календарь".to_owned(),
             default_tasks_name: "Задачи".to_owned(),
             max_photo_size: 512 * 1024,
+            gal_name: "Организация".to_owned(),
+            gal_page_size: 1_000,
+            gal_cache: Duration::from_secs(60),
             default_addressbook_name: "Контакты".to_owned(),
         }
     }

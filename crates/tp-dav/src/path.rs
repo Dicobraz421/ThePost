@@ -8,6 +8,7 @@
 //! /dav/calendars/<логин>/<коллекция>/           календарь
 //! /dav/calendars/<логин>/<коллекция>/<объект>   событие, задача
 //! /dav/addressbooks/<логин>/…                   то же для адресных книг
+//! /dav/addressbooks/<логин>/gal/                глобальная адресная книга (только чтение)
 //! ```
 //!
 //! Сегменты декодируются из процентной записи (UTF-8); пустые сегменты пропускаются, коллекции — со `/` и без.
@@ -139,9 +140,15 @@ pub(crate) const INBOX: &str = "inbox";
 /// Имя ресурса исходящих приглашений в доме календарей (`schedule-outbox-URL`).
 pub(crate) const OUTBOX: &str = "outbox";
 
-/// Имя зарезервировано под ресурсы планирования дома календарей.
+/// Имя глобальной адресной книги в доме адресных книг (сегмент URL).
+pub(crate) const GAL: &str = "gal";
+
+/// Имя зарезервировано: ресурсы планирования дома календарей, глобальная адресная книга дома адресных книг.
 pub(crate) fn reserved(kind: CollectionKind, name: &str) -> bool {
-    kind == CollectionKind::Calendar && (name == INBOX || name == OUTBOX)
+    match kind {
+        CollectionKind::Calendar => name == INBOX || name == OUTBOX,
+        CollectionKind::AddressBook => name == GAL,
+    }
 }
 
 /// Имя календаря по умолчанию (сегмент URL).
