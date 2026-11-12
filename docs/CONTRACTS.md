@@ -349,8 +349,12 @@ SRS 5.2, 6.8, решение 98 (CTR-25; код — `admin_audit.rs`). Журн�
 content_messages? }` — без тела запроса и секретов. `AuditLog`: `append(&record) -> seq` (номер ≥ 1, растёт в порядке добавления);
 `search(tenant, &AdminAuditQuery { since?, until?, limit ≥ 1, after? }) -> AdminAuditPage { entries: Vec<AdminAuditEntry { seq, record }>,
 next? }` — только записи организации (без уровня инсталляции), по возрастанию `seq`, `at` в [`since`, `until`), `next` — у полной страницы;
-`AdminAuditQuery::validate` (неверный — `Invalid`). In-memory — `MemAuditLog` (`entries`); набор `suite::admin_audit_log`. PostgreSQL
-(таблица `audit_log`, META-22) — META-70; запись и `GET …/audit` — Admin API (ADM-34), экспорт в SIEM — там же.
+`AdminAuditQuery::validate` (неверный — `Invalid`). Выгрузка в SIEM (решение владельца 12.11: база + выгрузка из неё, APP-59):
+`export_page(after, limit ≥ 1) -> Vec<AdminAuditEntry>` — все записи (и уровень инсталляции) с `seq > after` по возрастанию; видимые записи —
+непрерывный префикс порядка добавления (меньший номер не появляется после бо́льшего); `export_mark(sink) -> seq` (0 — ничего не доставлено),
+`advance_export_mark(sink, from, to) -> bool` — сдвиг, только если отметка всё ещё `from` (`to > from`, иначе `Invalid`; `check_export_mark`).
+In-memory — `MemAuditLog` (`entries`); набор `suite::admin_audit_log`. PostgreSQL (таблицы `audit_log`, META-22, и `audit_export`, APP-59) —
+META-70; запись и `GET …/audit` — Admin API (ADM-34); выгрузка — роль maintenance узла под лизой (APP-59).
 
 ## Auth
 SRS 5.1. `Authenticator`: `verify(Credentials) -> Result<Principal>` (неверные данные — `Forbidden`);

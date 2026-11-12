@@ -68,3 +68,11 @@ cn: postmaster
 mail: postmaster@example.org
 mail: abuse@example.org
 aliasedObjectName: uid=alice,ou=people,dc=example,dc=org
+
+dn: cn=vendor,ou=contacts,dc=example,dc=org
+objectClass: contact
+cn: Vendor Support
+mail: smtp:support@vendor.example
+title: Supplier
+entryUUID: 00000000-0000-0000-0000-0000000000c0
+modifyTimestamp: 20261001000000Z

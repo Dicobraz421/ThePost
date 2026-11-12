@@ -2,6 +2,7 @@
 
 pub mod acme;
 pub mod admin_client;
+pub mod audit_export;
 pub mod cli;
 pub mod doctor;
 pub mod doctor_dns;
