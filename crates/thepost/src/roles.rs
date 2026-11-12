@@ -65,39 +65,10 @@ impl std::fmt::Debug for OrphanProbe {
     }
 }
 
-/// Число шардов в справочнике `shards`; `None` — справочника нет (схема ещё не создана).
-pub async fn shard_count(pool: &tp_meta::pool::DbPool) -> Result<Option<i64>> {
-    let mut conn = pool.acquire().await?;
-    let exists: bool = sqlx::query_scalar("SELECT to_regclass('shards') IS NOT NULL")
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(tp_meta::schema::db_err)?;
-    if !exists {
-        return Ok(None);
-    }
-    sqlx::query_scalar("SELECT count(*) FROM shards")
-        .fetch_one(&mut *conn)
-        .await
-        .map(Some)
-        .map_err(tp_meta::schema::db_err)
-}
-
-/// Защита от потери данных до шардированного GC BLOB (FIX-05): GC не читает справочник шардов и удалит объект,
-/// на который ссылается только другой шард. Больше одного шарда — причина отказа роли maintenance (`serve`) и
-/// `FAIL` в `doctor`; `None` — шард один. Проверку снимает FIX-04 вместе с шардированным GC.
-pub fn unsharded_gc(shards: i64) -> Option<String> {
-    (shards > 1).then(|| {
-        format!(
-            "шардов в справочнике: {shards}, а сборка мусора BLOB учитывает только ссылки этой базы и \
-             удалит объекты других шардов: второй шард требует FIX-04 (шардированный GC); роль maintenance не \
-             запускается"
-        )
-    })
-}
-
 /// Зависимости роли maintenance.
 pub struct Maintenance {
-    /// Учёт объектов BLOB.
+    /// Учёт объектов BLOB по всем шардам справочника (`PgMeta::with_shards`, FIX-04): GC и поиск «сирот» не
+    /// удаляют объект, на который ссылается любой шард.
     pub index: Arc<dyn BlobIndex>,
     /// Хранилище BLOB.
     pub store: Arc<dyn BlobStore>,

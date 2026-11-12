@@ -12,7 +12,8 @@ use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
 use tp_meta::MetaConfig;
 use tp_meta::failover::{self, Failover};
-use tp_meta::pool::{self, DbPool, NoAcquireObserver, PoolConfig};
+use tp_meta::pool::{self, AcquireObserver, DbPool, NoAcquireObserver, PoolConfig};
+use tp_meta::shards::ShardDirectory;
 use tp_meta::signals::{PgSignalBus, SignalMetrics};
 use tp_platform::{BusSample, Config, DbMetrics};
 
@@ -26,6 +27,23 @@ pub fn pool_config(cfg: &Config) -> Result<PoolConfig> {
         &*cfg.section::<PoolConfig>(PoolConfig::SECTION)?,
         cfg.profile(),
     ))
+}
+
+/// Справочник шардов основной БД `catalog` (FIX-04): учёт BLOB над ним (`PgMeta::with_shards`) ведёт GC, поиск
+/// «сирот» и сверку по ссылкам всех шардов — объект, на который ссылается только другой шард, не удаляется.
+/// Пулы шардов — с параметрами секции `database` (адрес и пароль — из строки справочника), без учёта ожидания
+/// соединения.
+pub fn shard_directory(
+    cfg: &Config,
+    catalog: DbPool,
+    store: Arc<dyn SecretStore>,
+) -> Result<Arc<ShardDirectory>> {
+    Ok(Arc::new(ShardDirectory::new(
+        catalog,
+        pool_config(cfg)?,
+        store,
+        |_, _| -> Arc<dyn AcquireObserver> { Arc::new(NoAcquireObserver) },
+    )))
 }
 
 /// Пул PostgreSQL для коротких команд (`doctor`, `verify`): пароль или динамические учётные данные — из

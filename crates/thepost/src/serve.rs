@@ -166,13 +166,6 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     if meta_cfg.migrate_on_start {
         tp_meta::schema::migrate(&migrations).await?;
     }
-    // FIX-05: со вторым шардом GC BLOB удалит чужие объекты — роль maintenance не стартует до FIX-04.
-    if cfg.roles().contains(Role::Maintenance)
-        && let Some(reason) =
-            crate::roles::unsharded_gc(crate::roles::shard_count(&pool).await?.unwrap_or(1))
-    {
-        return Err(Error::invalid(reason));
-    }
     let events_cfg = meta_cfg.events.clone();
     let blob_cfg = cfg.section::<BlobSection>(BLOB)?;
     // Шина сигналов — до хранилищ: после фиксации они публикуют `LogAppended` (будит читателей журнала событий),
@@ -186,6 +179,12 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
 
     let ext = modules::activate_of(&cfg, &migrations, opts.modules).await?;
     let store = ext.secret_store().unwrap_or(store);
+    // Учёт BLOB роли maintenance — по всем шардам справочника (FIX-04): GC, «сироты» и сверка не удалят объект, на
+    // который ссылается только другой шард. Кэш справочника сбрасывают `ShardsChanged`, `ConfigReloaded`, `Resync`;
+    // задача завершается с остановкой шины.
+    let shards = infra::shard_directory(&cfg, meta.pool().clone(), store.clone())?;
+    shards.clone().follow(bus.clone()).await?;
+    let blob_index = meta.clone().with_shards(shards);
 
     // Членство: запись узла до чтения состава, иначе узлу не достанется ни одного раздела.
     let node = infra::node_id(&cfg)?;
@@ -355,7 +354,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         reloader.subscribe(),
     ));
     let maintenance = Maintenance {
-        index: Arc::new(meta.clone()),
+        index: Arc::new(blob_index.clone()),
         store: blob.clone(),
         leases,
         holder,
@@ -378,9 +377,9 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         }),
         verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {
             verifier: Arc::new(crate::verify::verifier(
-                Arc::new(meta.clone()),
+                Arc::new(blob_index.clone()),
                 Arc::new(crate::verify::PgInventory::new(
-                    meta.clone(),
+                    blob_index.clone(),
                     verify_page_size,
                 )),
                 blob.clone(),
