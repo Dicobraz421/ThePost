@@ -170,8 +170,8 @@ impl PolicyRow {
 }
 
 const POLICY_COLUMNS: &str = "level, quota_bytes, trash_retention_us, retention_us, send_per_hour, \
-                              max_recipients, dkim_selector, milter_profile, trash_purge, \
-                              trash_purge_user_can_choose";
+                              rcpts_per_hour, max_recipients, dkim_selector, milter_profile, \
+                              trash_purge, trash_purge_user_can_choose";
 
 /// Действующая политика в открытой транзакции организации: заданные уровни по порядку цепочки.
 async fn resolve_in(
