@@ -361,6 +361,37 @@ mod tests {
         );
     }
 
+    /// FIX-08: неверное изменение заголовка — нарушение протокола, решение по `on_failure`.
+    #[test]
+    fn milter_bad_header_change_follows_on_failure() {
+        use crate::milter::proto::{
+            P_NOBODY, P_NOCONNECT, P_NODATA, P_NOEOH, P_NOHDRS, P_NOHELO, P_NOMAIL, P_NORCPT,
+            R_ACCEPT, R_ADDHEADER,
+        };
+        let steps =
+            P_NOCONNECT | P_NOHELO | P_NOMAIL | P_NORCPT | P_NODATA | P_NOHDRS | P_NOEOH | P_NOBODY;
+        let mut neg = vec![0, 0, 0, 13, b'O', 0, 0, 0, 6, 0, 0, 0, 0x01];
+        neg.extend_from_slice(&steps.to_be_bytes());
+        let with = |header: &[u8]| {
+            let mut s = neg.clone();
+            let len = u32::try_from(header.len() + 1).expect("len");
+            s.extend_from_slice(&len.to_be_bytes());
+            s.push(R_ADDHEADER);
+            s.extend_from_slice(header);
+            s.extend_from_slice(&[0, 0, 0, 1, R_ACCEPT]);
+            milter_outcome(&s)
+        };
+        assert_eq!(with(b"X-Spam\0yes\0"), [Verdict::Accept, Verdict::Accept]);
+        for bad in [&b"X Spam\0yes\0"[..], b"X-Spam\0", b"X-Spam\0yes\0more\0"] {
+            let out = with(bad);
+            assert_eq!(out[0], Verdict::Accept, "{bad:?}");
+            assert!(
+                matches!(&out[1], Verdict::Refuse(r) if r.code == 451),
+                "{bad:?}: {out:?}"
+            );
+        }
+    }
+
     #[test]
     fn proxy_header_and_garbage() {
         // PROXY v2, PROXY TCP4 203.0.113.7:4242 → 198.51.100.1:25, затем команды.
