@@ -571,6 +571,19 @@ etag }>`, `multiget(names)`, `objects_by_id(ids)` (JMAP), `in_range(collection, 
 Precondition::{Any, IfMatch(etag), IfNoneMatch}) -> PutOutcome::{Stored(Put { id, etag, modseq, created }), PreconditionFailed,
 UidConflict { name }}` (UID уникален в коллекции; компонент не из `components` — `Invalid`; перезапись сохраняет `id`),
 `delete_object(collection, name, Precondition) -> DeleteOutcome::{Deleted(ModSeq), PreconditionFailed}` (нет ресурса при `Any` — `NotFound`).
+Свойства коллекции сверх `Collection` (CTR-56, решение 82): `CollectionPrefs { is_default, subscribed, visible, alerts_with_time,
+alerts_without_time }` (`#[serde(default)]`; по умолчанию — не по умолчанию, подписана, видима, без оповещений). `is_default` — коллекция
+по умолчанию вида (JMAP `isDefault`, `schedule-default-calendar-URL`), не больше одной на вид; `subscribed`, `visible` — JMAP
+`isSubscribed`, `isVisible`; оповещения по умолчанию для событий со временем и на весь день (JMAP `defaultAlertsWithTime`,
+`defaultAlertsWithoutTime`; CalDAV `default-alarm-vevent-datetime`, `default-alarm-vevent-date`) — текст JSON-объекта `Id[Alert]`
+JSCalendar до `MAX_DEFAULT_ALERTS_LEN` = 8192 байт, только у календаря (`validate(kind)` → `Invalid`); хранилище его не разбирает,
+в `VALARM` переводит `tp-dav`. `collection_prefs(scope, id)` (нет коллекции — `NotFound`; по умолчанию — `CollectionPrefs::default()`),
+`list_collection_prefs(scope, kind) -> Vec<(CollectionId, CollectionPrefs)>` в порядке `list_collections`, `set_collection_prefs(scope, id,
+prefs) -> ModSeq` — замена; `is_default = true` снимает признак с прежней той же транзакцией, `false` у текущей — не назначена; это
+изменение свойств коллекции (`state`, `collection_changes`, `DavChanged` — у `id` и у прежней по умолчанию); по умолчанию — `Internal`.
+`default_collection(scope, kind)` — назначенная, иначе прежнее правило `dav::default_of(&[Collection])`: сегмент `default`
+(`DEFAULT_COLLECTION_NAME`), иначе первая по (`order`, имя). Свойства — отдельная структура, а не поля `Collection`: код, собирающий
+`Collection` перечислением полей, не меняется. Потребители: META-60, DAV-25, JMAP-36; in-memory и тесты набора — `tp-testkit`.
 Перенос (CTR-54, решение 80): `move_object(scope, from, name, to, Precondition) -> MoveOutcome::{Moved(Moved { id, etag, removed, modseq }),
 PreconditionFailed, UidConflict { name }}` — одной транзакцией; имя, `id`, тело, индекс и поисковые строки сохраняются, ETag и `ModSeq` —
 новые: в `from` — надгробие (`removed`, видно в `changes`), в `to` — создание (`modseq`), в `account_changes` объект — в `updated`;
@@ -849,3 +862,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   сохранением `id` (по умолчанию — `Internal`); поиск контактов — `CardSearch`, `NewCard`, `DavStore::put_card` (по умолчанию —
   `put_object`), `DavStore::find_cards` (по умолчанию — все объекты). По сравнению с карточкой: поисковые строки — не поле
   `ObjectIndex`, а параметр `put_card` (существующий код не меняется).
+- 2026-11-12 — CTR-56 (волна contracts-38): `CollectionPrefs` — коллекция по умолчанию, подписка и видимость, оповещения по умолчанию;
+  `DavStore::{collection_prefs, list_collection_prefs, set_collection_prefs, default_collection}`, правило без назначенной —
+  `dav::default_of`. По сравнению с карточкой: свойства — отдельная структура, а не поля `Collection` (существующий код не меняется).

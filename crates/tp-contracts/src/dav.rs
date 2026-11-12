@@ -57,6 +57,12 @@ pub const MAX_CARD_SEARCH_STRINGS: usize = 64;
 /// Наибольшая длина поисковой строки контакта ([`CardSearch`]), байт.
 pub const MAX_CARD_SEARCH_LEN: usize = 255;
 
+/// Наибольший размер оповещений по умолчанию одного вида ([`CollectionPrefs`], CTR-56), байт.
+pub const MAX_DEFAULT_ALERTS_LEN: usize = 8192;
+
+/// Имя (сегмент URL) коллекции по умолчанию, пока она не назначена ([`default_of`]).
+pub const DEFAULT_COLLECTION_NAME: &str = "default";
+
 /// Вид коллекции.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +237,82 @@ impl Collection {
         }
         Ok(())
     }
+}
+
+/// Свойства коллекции сверх [`Collection`] (CTR-56): коллекция по умолчанию, подписка и видимость, оповещения по
+/// умолчанию. Хранятся с коллекцией, читаются и пишутся отдельными методами [`DavStore`]; отсутствующие поля при
+/// разборе — значения [`CollectionPrefs::default`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CollectionPrefs {
+    /// Коллекция по умолчанию своего вида (JMAP `isDefault`; CalDAV `schedule-default-calendar-URL`): не больше одной
+    /// на вид у учётной записи — назначение новой снимает признак с прежней той же операцией
+    /// ([`DavStore::set_collection_prefs`]).
+    pub is_default: bool,
+    /// Пользователь подписан на коллекцию (JMAP `isSubscribed`): клиенты показывают и синхронизируют её.
+    pub subscribed: bool,
+    /// Коллекция показывается в клиенте (JMAP `isVisible`).
+    pub visible: bool,
+    /// Оповещения по умолчанию для событий со временем (JMAP `defaultAlertsWithTime`; CalDAV
+    /// `default-alarm-vevent-datetime`): текст JSON-объекта `Id[Alert]` JSCalendar, не длиннее
+    /// [`MAX_DEFAULT_ALERTS_LEN`] байт; `None` — нет. Хранилище содержимое не разбирает; в `VALARM` и обратно
+    /// переводит вызывающий (`tp-dav`, calcard). Только у календаря.
+    pub alerts_with_time: Option<String>,
+    /// То же для событий на весь день (JMAP `defaultAlertsWithoutTime`; CalDAV `default-alarm-vevent-date`).
+    pub alerts_without_time: Option<String>,
+}
+
+impl Default for CollectionPrefs {
+    /// Не по умолчанию, подписана, видима, без оповещений — как коллекции, созданные до CTR-56.
+    fn default() -> Self {
+        Self {
+            is_default: false,
+            subscribed: true,
+            visible: true,
+            alerts_with_time: None,
+            alerts_without_time: None,
+        }
+    }
+}
+
+impl CollectionPrefs {
+    /// Проверяет оповещения коллекции вида `kind`: только у календаря, каждое — текст JSON-объекта не длиннее
+    /// [`MAX_DEFAULT_ALERTS_LEN`] байт. Иначе — `Error::Invalid`.
+    pub fn validate(&self, kind: CollectionKind) -> Result<()> {
+        for alerts in [&self.alerts_with_time, &self.alerts_without_time]
+            .into_iter()
+            .flatten()
+        {
+            if kind != CollectionKind::Calendar {
+                return Err(Error::invalid(
+                    "оповещения по умолчанию — только у календаря",
+                ));
+            }
+            if alerts.len() > MAX_DEFAULT_ALERTS_LEN {
+                return Err(Error::invalid(
+                    "оповещения по умолчанию больше допустимого размера",
+                ));
+            }
+            if !serde_json::from_str::<serde_json::Value>(alerts).is_ok_and(|v| v.is_object()) {
+                return Err(Error::invalid("оповещения по умолчанию — не объект JSON"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Коллекция по умолчанию, когда она не назначена ([`CollectionPrefs::is_default`]), — прежнее правило: с именем
+/// [`DEFAULT_COLLECTION_NAME`], иначе первая по порядку [`DavStore::list_collections`] (`order`, затем имя).
+/// `collections` — коллекции одного вида в любом порядке.
+pub fn default_of(collections: &[Collection]) -> Option<&Collection> {
+    collections
+        .iter()
+        .find(|c| c.name == DEFAULT_COLLECTION_NAME)
+        .or_else(|| {
+            collections
+                .iter()
+                .min_by(|a, b| (a.order, a.name.as_bytes()).cmp(&(b.order, b.name.as_bytes())))
+        })
 }
 
 /// Поисковые строки контакта (CTR-54): полное имя, части имени, адреса e-mail — в нижнем регистре. Вычисляет
@@ -609,6 +691,72 @@ pub trait DavStore: Send + Sync + 'static {
     /// последней; страницы `/changes` не делят одно изменение). Нет — `NotFound`. Возвращает `ModSeq` коллекции.
     async fn delete_collection(&self, scope: AccountScope, id: CollectionId) -> Result<ModSeq>;
 
+    /// Свойства коллекции сверх [`Collection`] (CTR-56). Нет коллекции — `NotFound`. По умолчанию — через
+    /// [`DavStore::get_collection`], всегда [`CollectionPrefs::default`] (хранилище без этих свойств).
+    async fn collection_prefs(
+        &self,
+        scope: AccountScope,
+        id: CollectionId,
+    ) -> Result<CollectionPrefs> {
+        match self.get_collection(scope, id).await? {
+            Some(_) => Ok(CollectionPrefs::default()),
+            None => Err(Error::NotFound),
+        }
+    }
+
+    /// Свойства всех коллекций вида `kind` в порядке [`DavStore::list_collections`] — одним запросом (список
+    /// календарей JMAP, `PROPFIND` дома коллекций). По умолчанию — [`CollectionPrefs::default`] для каждой.
+    async fn list_collection_prefs(
+        &self,
+        scope: AccountScope,
+        kind: CollectionKind,
+    ) -> Result<Vec<(CollectionId, CollectionPrefs)>> {
+        Ok(self
+            .list_collections(scope, kind)
+            .await?
+            .into_iter()
+            .map(|c| (c.id, CollectionPrefs::default()))
+            .collect())
+    }
+
+    /// Заменяет свойства [`CollectionPrefs`] коллекции `id`. Нет коллекции — `NotFound`;
+    /// [`CollectionPrefs::validate`] — `Invalid`. `is_default = true` снимает признак с прежней коллекции по умолчанию
+    /// того же вида в той же транзакции (признак — ровно у одной); `false` у текущей — коллекция по умолчанию не
+    /// назначена (действует [`default_of`]). Это изменение свойств коллекции: новый `ModSeq`,
+    /// [`Collection::state`], [`DavStore::collection_changes`] и сигнал [`dav_changed`] — у `id` и, раньше неё, у
+    /// прежней коллекции по умолчанию, если признак с неё снят. Возвращает `ModSeq` изменения `id`. Новая коллекция
+    /// ([`DavStore::create_collection`]) получает [`CollectionPrefs::default`]; удаление коллекции по умолчанию
+    /// оставляет вид без назначенной. По умолчанию — `Error::Internal` (реализации — `tp-meta`, `tp-testkit`).
+    async fn set_collection_prefs(
+        &self,
+        scope: AccountScope,
+        id: CollectionId,
+        prefs: CollectionPrefs,
+    ) -> Result<ModSeq> {
+        let _ = (scope, id, prefs);
+        Err(Error::internal(
+            "DavStore::set_collection_prefs не реализован",
+        ))
+    }
+
+    /// Коллекция по умолчанию вида `kind`: назначенная ([`CollectionPrefs::is_default`]), иначе по прежнему правилу
+    /// [`default_of`]; `None` — у учётной записи нет коллекций вида. По умолчанию — через
+    /// [`DavStore::list_collections`] и [`DavStore::list_collection_prefs`].
+    async fn default_collection(
+        &self,
+        scope: AccountScope,
+        kind: CollectionKind,
+    ) -> Result<Option<Collection>> {
+        let collections = self.list_collections(scope, kind).await?;
+        let prefs = self.list_collection_prefs(scope, kind).await?;
+        let assigned = prefs.iter().find(|(_, p)| p.is_default).map(|(id, _)| *id);
+        Ok(collections
+            .iter()
+            .find(|c| Some(c.id) == assigned)
+            .or_else(|| default_of(&collections))
+            .cloned())
+    }
+
     // ---------- Объекты ----------
 
     /// Объект коллекции по имени ресурса. Нет коллекции — `NotFound`.
@@ -901,6 +1049,61 @@ mod tests {
             serde_json::to_value(CardSearch::new(["a", "b"])).ok(),
             Some(serde_json::json!(["a", "b"]))
         );
+    }
+
+    #[test]
+    fn collection_prefs() {
+        // Отсутствующие поля — значения по умолчанию: подписана и видима.
+        let parsed = serde_json::from_str::<CollectionPrefs>("{}").ok();
+        assert_eq!(parsed, Some(CollectionPrefs::default()));
+        let prefs = CollectionPrefs::default();
+        assert!(prefs.subscribed && prefs.visible && !prefs.is_default);
+        assert_eq!(prefs.validate(CollectionKind::AddressBook), Ok(()));
+
+        let alerts = CollectionPrefs {
+            alerts_with_time: Some(
+                r#"{"a1":{"@type":"Alert","trigger":{"@type":"OffsetTrigger","offset":"-PT15M"}}}"#
+                    .into(),
+            ),
+            alerts_without_time: Some("{}".into()),
+            ..CollectionPrefs::default()
+        };
+        assert_eq!(alerts.validate(CollectionKind::Calendar), Ok(()));
+        let text = serde_json::to_string(&alerts).unwrap_or_default();
+        assert_eq!(
+            serde_json::from_str::<CollectionPrefs>(&text).ok(),
+            Some(alerts.clone())
+        );
+        // Оповещения — только у календаря, объект JSON в пределах размера.
+        assert!(alerts.validate(CollectionKind::AddressBook).is_err());
+        for bad in [
+            "[]",
+            "не json",
+            &format!("{{\"a\":\"{}\"}}", "x".repeat(MAX_DEFAULT_ALERTS_LEN)),
+        ] {
+            let prefs = CollectionPrefs {
+                alerts_without_time: Some(bad.to_owned()),
+                ..CollectionPrefs::default()
+            };
+            assert!(
+                prefs.validate(CollectionKind::Calendar).is_err(),
+                "{bad:.20}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_rule() {
+        let named = |name: &str, order| Collection {
+            order,
+            ..Collection::new(CollectionKind::Calendar, name)
+        };
+        assert_eq!(default_of(&[]), None);
+        // Без сегмента `default` — первая по порядку, затем по имени.
+        let list = [named("work", 2), named("b", 1), named("a", 1)];
+        assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("a"));
+        let list = [named("a", 0), named(DEFAULT_COLLECTION_NAME, 9)];
+        assert_eq!(default_of(&list).map(|c| c.name.as_str()), Some("default"));
     }
 
     #[test]
