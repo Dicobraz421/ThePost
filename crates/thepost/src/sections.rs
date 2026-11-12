@@ -60,6 +60,8 @@ pub const ADMIN: &str = "admin";
 pub const MAILSTORE: &str = "mailstore";
 /// Имя секции роли maintenance.
 pub const MAINTENANCE: &str = "maintenance";
+/// Имя секции командной строки `thepost admin`.
+pub const CLI: &str = "cli";
 /// Имя секции входа: каталог, OIDC, пароли приложений, Kerberos.
 pub const AUTH: &str = "auth";
 /// Имя секции слушателей HTTP ролей jmap, dav и admin.
@@ -82,6 +84,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     r.add_section::<VerifySection>(VERIFY)?;
     r.add_section::<StartupSection>(STARTUP)?;
     r.add_section::<MaintenanceSection>(MAINTENANCE)?;
+    r.add_section::<CliSection>(CLI)?;
     r.add_section::<tp_smtp::SmtpConfig>(SMTP)?;
     r.add_section::<tp_sieve::SieveConfig>(SIEVE)?;
     r.add_section::<tp_imap::ImapConfig>(IMAP)?;
@@ -98,6 +101,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     r.add_check::<BlobSection>(BLOB, BlobSection::check)?;
     r.add_check::<StartupSection>(STARTUP, |c, _| c.check())?;
     r.add_check::<MaintenanceSection>(MAINTENANCE, |c, _| c.check())?;
+    r.add_check::<CliSection>(CLI, |c, _| c.oidc.check())?;
     r.add_check::<ClusterSection>(CLUSTER, |c, _| c.check())?;
     r.add_check::<AdminSection>(ADMIN, |c, _| c.0.check())?;
     r.add_check::<AuthSection>(AUTH, AuthSection::check)?;
@@ -883,6 +887,76 @@ mod time_of_day {
     }
 }
 
+// ---------- cli ----------
+
+/// Секция `cli`: командная строка `thepost admin` (APP-42).
+///
+/// ```yaml
+/// cli:
+///   oidc:
+///     client_id: thepost-cli
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CliSection {
+    /// Вход администратора через поставщика `auth.oidc` с устройства без браузера (RFC 8628).
+    pub oidc: CliOidc,
+}
+
+/// `cli.oidc`: клиент OAuth командной строки у поставщика `auth.oidc` и опрос токена при входе с устройства.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CliOidc {
+    /// Идентификатор открытого клиента (public client) с разрешённым Device Authorization Grant; не задан —
+    /// вход с устройства недоступен. Токен клиента должен содержать получателя из `auth.oidc.audience`.
+    pub client_id: Option<String>,
+    /// Запрашиваемые области доступа через пробел (`openid`).
+    pub scope: String,
+    /// Пауза между опросами токена, если поставщик не задал `interval` (`5s`, RFC 8628).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub poll_interval: Duration,
+    /// Прибавка к паузе на ответ `slow_down` (`5s`, RFC 8628).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub slow_down_step: Duration,
+    /// Наибольшее время ожидания подтверждения (`15m`), даже если код поставщика действует дольше.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub max_wait: Duration,
+}
+
+impl Default for CliOidc {
+    fn default() -> Self {
+        Self {
+            client_id: None,
+            scope: "openid".to_owned(),
+            poll_interval: Duration::from_secs(5),
+            slow_down_step: Duration::from_secs(5),
+            max_wait: Duration::from_secs(15 * 60),
+        }
+    }
+}
+
+impl CliOidc {
+    /// Клиент и области доступа не пусты, паузы и время ожидания положительны.
+    pub fn check(&self) -> Result<()> {
+        if self.client_id.as_deref().is_some_and(str::is_empty) {
+            return Err(Error::invalid("cli: oidc.client_id is empty"));
+        }
+        if self.scope.trim().is_empty() {
+            return Err(Error::invalid("cli: oidc.scope is empty"));
+        }
+        if self.poll_interval.is_zero() || self.slow_down_step.is_zero() || self.max_wait.is_zero()
+        {
+            return Err(Error::invalid(
+                "cli: oidc.poll_interval, slow_down_step and max_wait must be positive",
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ---------- doctor ----------
 
 /// Секция `doctor`: пороги проверок окружения `thepost doctor` (проверки СУБД — `meta.doctor`).
@@ -1279,6 +1353,27 @@ blob:
         assert!(e.contains("verify.interval"), "{e}");
         let e = err(config("    lease_ttl: 0s\n"));
         assert!(e.contains("verify.lease_ttl"), "{e}");
+    }
+
+    /// APP-42: секция `cli` — клиент входа с устройства не задан по умолчанию; паузы из config.yaml; пустой
+    /// клиент и нулевая пауза — ошибки.
+    #[test]
+    fn cli_oidc_section() {
+        let config = |yaml: &str| parse(&format!("{MINIMAL_DEV}cli:\n  oidc:\n{yaml}"));
+        let c = parse(MINIMAL_DEV).expect("config");
+        let cli = c.section::<CliSection>(CLI).expect("section");
+        assert_eq!(cli.oidc, CliOidc::default());
+        assert_eq!(cli.oidc.client_id, None);
+        let c = config("    client_id: thepost-cli\n    scope: openid email\n    max_wait: 5m\n")
+            .expect("config");
+        let cli = c.section::<CliSection>(CLI).expect("section");
+        assert_eq!(cli.oidc.client_id.as_deref(), Some("thepost-cli"));
+        assert_eq!(cli.oidc.scope, "openid email");
+        assert_eq!(cli.oidc.max_wait, Duration::from_secs(300));
+        let e = err(config("    client_id: \"\"\n"));
+        assert!(e.contains("client_id"), "{e}");
+        let e = err(config("    poll_interval: 0s\n"));
+        assert!(e.contains("poll_interval"), "{e}");
     }
 
     /// APP-08: шина — в процессе (по умолчанию) или PostgreSQL LISTEN/NOTIFY; Valkey — ошибка строгой проверки.
