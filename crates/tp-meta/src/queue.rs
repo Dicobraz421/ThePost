@@ -30,7 +30,7 @@ use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, QueueId, Result, Te
 use uuid::Uuid;
 
 use crate::PgMeta;
-use crate::schema::{begin, begin_system, db_err, to_i64, to_u32, to_u64};
+use crate::schema::{begin_system, db_err, to_i64, to_u32, to_u64};
 use crate::shards::ShardId;
 
 /// Хранилища шарда записи очереди `id` среди `views`: по захвату этого экземпляра или поиском по шардам;
@@ -247,7 +247,6 @@ impl QueueStore for PgMeta {
                 return QueueStore::enqueue(&view, None, msg).await;
             }
         }
-        self.once(async move {
         if msg.rcpts.is_empty() {
             return Err(Error::invalid("письмо в очередь без получателей"));
         }
@@ -258,45 +257,35 @@ impl QueueStore for PgMeta {
         if msg.blob.tenant != msg.tenant {
             return Err(Error::invalid("объект письма другой организации"));
         }
+        // Ключ записи (META-62) — идентификатор, выданный до транзакции: после обрыва во время COMMIT
+        // письмо поставлено, если есть строка очереди с ним.
         let id = QueueId::new();
-        let mut tx = begin(&self.pool, msg.tenant).await?;
-        sqlx::query(
-            "INSERT INTO queue (tenant_id, queue_id, blob_hash, blob_gen, size, mail_from, envid, ret,
-                                queued_at, next_attempt)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9)",
+        let tenant = msg.tenant;
+        let msg = std::sync::Arc::new(msg);
+        self.keyed(
+            tenant,
+            |tx| {
+                let msg = msg.clone();
+                Box::pin(async move {
+                    insert_queued(tx, id, &msg).await?;
+                    Ok(id)
+                })
+            },
+            move |tx| {
+                Box::pin(async move {
+                    let found: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM queue WHERE tenant_id = $1 AND queue_id = $2)",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(id.as_uuid())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    Ok(found.then_some(id))
+                })
+            },
         )
-        .bind(msg.tenant.as_uuid())
-        .bind(id.as_uuid())
-        .bind(msg.blob.hash.as_bytes().as_slice())
-        .bind(i64::from(msg.blob.generation.0))
-        .bind(to_i64(msg.size)?)
-        .bind(&msg.from)
-        .bind(&msg.dsn.envid)
-        .bind(msg.dsn.ret.map(ret_str))
-        .bind(msg.next_attempt)
-        .execute(&mut *tx)
         .await
-        .map_err(db_err)?;
-        let addresses: Vec<&str> = msg.rcpts.iter().map(|r| r.address.as_str()).collect();
-        let notify: Vec<Option<i16>> = msg.rcpts.iter().map(|r| notify_bits(r.notify)).collect();
-        let orcpt: Vec<Option<&str>> = msg.rcpts.iter().map(|r| r.orcpt.as_deref()).collect();
-        sqlx::query(
-            "INSERT INTO queue_rcpts (tenant_id, queue_id, ord, address, notify, orcpt, next_attempt)
-             SELECT $1, $2, r.ord, r.address, r.notify, r.orcpt, $6
-             FROM unnest($3::text[], $4::int2[], $5::text[]) WITH ORDINALITY AS r(address, notify, orcpt, ord)",
-        )
-        .bind(msg.tenant.as_uuid())
-        .bind(id.as_uuid())
-        .bind(&addresses)
-        .bind(&notify)
-        .bind(&orcpt)
-        .bind(msg.next_attempt)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        crate::commits::commit(tx).await?;
-        Ok(id)
-}).await
     }
 
     async fn claim(
@@ -515,6 +504,45 @@ impl QueueStore for PgMeta {
         })
         .await
     }
+}
+
+/// Строки письма `msg` в очереди под идентификатором `id` (`queue`, `queue_rcpts`).
+async fn insert_queued(tx: &mut PgConnection, id: QueueId, msg: &OutMessage) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO queue (tenant_id, queue_id, blob_hash, blob_gen, size, mail_from, envid, ret,
+                            queued_at, next_attempt)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9)",
+    )
+    .bind(msg.tenant.as_uuid())
+    .bind(id.as_uuid())
+    .bind(msg.blob.hash.as_bytes().as_slice())
+    .bind(i64::from(msg.blob.generation.0))
+    .bind(to_i64(msg.size)?)
+    .bind(&msg.from)
+    .bind(&msg.dsn.envid)
+    .bind(msg.dsn.ret.map(ret_str))
+    .bind(msg.next_attempt)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let addresses: Vec<&str> = msg.rcpts.iter().map(|r| r.address.as_str()).collect();
+    let notify: Vec<Option<i16>> = msg.rcpts.iter().map(|r| notify_bits(r.notify)).collect();
+    let orcpt: Vec<Option<&str>> = msg.rcpts.iter().map(|r| r.orcpt.as_deref()).collect();
+    sqlx::query(
+        "INSERT INTO queue_rcpts (tenant_id, queue_id, ord, address, notify, orcpt, next_attempt)
+         SELECT $1, $2, r.ord, r.address, r.notify, r.orcpt, $6
+         FROM unnest($3::text[], $4::int2[], $5::text[]) WITH ORDINALITY AS r(address, notify, orcpt, ord)",
+    )
+    .bind(msg.tenant.as_uuid())
+    .bind(id.as_uuid())
+    .bind(&addresses)
+    .bind(&notify)
+    .bind(&orcpt)
+    .bind(msg.next_attempt)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
 }
 
 #[cfg(test)]
