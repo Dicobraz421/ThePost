@@ -24,9 +24,9 @@
 //! [`SecretStore`] при создании пула и при смене учётных данных ([`PoolConfig::client_key`]) и передаётся
 //! драйверу из памяти, на диск не пишется.
 //!
-//! Ожидание соединения пула сообщается наблюдателю [`AcquireObserver`] ([`observe`], CTR-51, META-55): транзакции
-//! [`with_tenant`], [`with_system`] и их варианты с повтором ([`crate::failover`]) получают соединение через него.
-//! Снимок занятости пула для `/metrics` — [`snapshot`].
+//! Пул `tp-meta` — [`DbPool`]: пул sqlx с обязательным наблюдателем ожидания соединения [`AcquireObserver`]
+//! (CTR-51, META-55), заданным при создании. Все функции получения соединения принимают [`DbPool`]; «сырой» пул
+//! sqlx наружу не отдаётся. Снимок занятости пула для `/metrics` — [`DbPool::snapshot`].
 //!
 //! Реплика для фоновых чтений ([`PoolConfig::read_replica`], `ReadIntent::Stale`, META-32) — [`connect_replica`],
 //! [`crate::replica`].
@@ -35,7 +35,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
-use tp_contracts::acquire::AcquireObserver;
+pub use tp_contracts::acquire::{AcquireObserver, NoAcquireObserver};
 use tp_contracts::config::duration;
 use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalChannel, InternalTls, KeySource, Profile, Transport};
@@ -482,35 +482,137 @@ async fn credentials_options(
     }
 }
 
-/// Пул по конфигурации; пароль — из хранилища секретов. Первое соединение открывается сразу
-/// (ошибка адреса, секрета или доступа — при старте).
+/// Пул соединений PostgreSQL с обязательным наблюдателем ожидания соединения (CTR-51, META-55).
+///
+/// Единственный вид пула `tp-meta` вне крейта: все функции получения соединения ([`with_tenant`],
+/// [`with_system`], [`crate::schema::begin`], [`crate::failover::Failover`], хранилища) принимают его и ждут
+/// соединение через наблюдателя — получить соединение в обход наблюдателя нельзя, «сырой» пул sqlx наружу не
+/// отдаётся. Наблюдатель задаётся при создании ([`DbPool::new`], функции `connect*`); пулу без учёта ожидания
+/// (тесты, одиночные команды) наблюдатель-пустышку [`NoAcquireObserver`] передают явно.
+///
+/// Клон — тот же пул и тот же наблюдатель.
+#[derive(Clone)]
+pub struct DbPool {
+    pool: PgPool,
+    observer: Arc<dyn AcquireObserver>,
+}
+
+impl fmt::Debug for DbPool {
+    // Параметры соединения sqlx печатают пароль и ключ — в журнал не попадают.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DbPool")
+            .field("snapshot", &self.snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DbPool {
+    /// Пул `pool` с наблюдателем ожидания соединения `observer`. Пул без учёта ожидания —
+    /// `Arc::new(NoAcquireObserver)`.
+    pub fn new(pool: PgPool, observer: Arc<dyn AcquireObserver>) -> Self {
+        Self { pool, observer }
+    }
+
+    /// Транзакция на соединении пула; ожидание соединения — через наблюдателя: отказ и тайм-аут пула —
+    /// исход «отказ», отменённая задача — «брошено».
+    pub async fn begin(&self) -> Result<Transaction<'static, Postgres>> {
+        self.observer
+            .observe(self.pool.begin())
+            .await
+            .map_err(db_err)
+    }
+
+    /// Соединение пула для одиночного запроса вне транзакции; ожидание — через наблюдателя.
+    pub async fn acquire(&self) -> Result<PoolConnection<Postgres>> {
+        self.acquire_sqlx().await.map_err(db_err)
+    }
+
+    /// Как [`Self::acquire`], с ошибкой sqlx: различение тайм-аута пула ([`crate::failover`]), причина отказа в
+    /// отчёте диагностики (`thepost doctor`).
+    pub async fn acquire_sqlx(&self) -> sqlx::Result<PoolConnection<Postgres>> {
+        self.observer.observe(self.pool.acquire()).await
+    }
+
+    /// Соединение-слушатель LISTEN из пула ([`crate::signals`]); ожидание соединения — через наблюдателя.
+    pub(crate) async fn listener(&self) -> Result<sqlx::postgres::PgListener> {
+        self.observer
+            .observe(sqlx::postgres::PgListener::connect_with(&self.pool))
+            .await
+            .map_err(db_err)
+    }
+
+    /// Снимок занятости пула для `/metrics`: без обращения к СУБД.
+    pub fn snapshot(&self) -> PoolSnapshot {
+        PoolSnapshot {
+            size: self.pool.size(),
+            idle: u32::try_from(self.pool.num_idle()).unwrap_or(u32::MAX),
+            max: self.pool.options().get_max_connections(),
+        }
+    }
+
+    /// Закрывает пул: новые соединения не выдаются, выданные закрываются при возврате.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    /// Пул закрыт.
+    pub fn is_closed(&self) -> bool {
+        self.pool.is_closed()
+    }
+
+    /// `self` и `other` — один пул (клоны): параметры пула лежат в его общем состоянии.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        std::ptr::eq(self.pool.options(), other.pool.options())
+    }
+
+    /// Пул sqlx — только для смены параметров соединения внутри крейта (ротация, переключение primary).
+    pub(crate) fn raw(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+/// Пул по конфигурации; пароль — из хранилища секретов, ожидание соединения — наблюдателю `observer`.
+/// Первое соединение открывается сразу (ошибка адреса, секрета или доступа — при старте).
 ///
 /// Динамические учётные данные берутся один раз, без продления аренды — для коротких команд (`doctor`,
 /// `verify`); долгоживущему узлу — [`connect_rotating`].
-pub async fn connect(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Result<PgPool> {
+pub async fn connect(
+    cfg: &PoolConfig,
+    secrets: &dyn SecretStore,
+    observer: Arc<dyn AcquireObserver>,
+) -> Result<DbPool> {
     let opts = credentials_options(cfg, &cfg.url, cfg.pgbouncer, secrets).await?;
-    cfg.pool_options().connect_with(opts).await.map_err(db_err)
+    let pool = DbPool::new(cfg.pool_options().connect_lazy_with(opts), observer);
+    if let Err(e) = pool.acquire().await {
+        pool.close().await;
+        return Err(e);
+    }
+    Ok(pool)
 }
 
 /// Пул узла: как [`connect`], а с [`PoolConfig::dynamic_credentials`] — с задачей ротации учётных данных
 /// ([`crate::credentials`]): аренда продлевается, при отказе — новые учётные данные для новых соединений без
-/// остановки ролей. Задача завершается с закрытием пула ([`PgPool::close`]).
+/// остановки ролей. Задача завершается с закрытием пула ([`DbPool::close`]).
 ///
 /// С [`PoolConfig::urls`] — к первому доступному для записи адресу (выбор при запуске); повтор операций при
 /// переключении СУБД — пул [`crate::failover::connect_failover`].
-pub async fn connect_rotating(cfg: &PoolConfig, secrets: Arc<dyn SecretStore>) -> Result<PgPool> {
+pub async fn connect_rotating(
+    cfg: &PoolConfig,
+    secrets: Arc<dyn SecretStore>,
+    observer: Arc<dyn AcquireObserver>,
+) -> Result<DbPool> {
     if !cfg.urls.is_empty() {
-        return crate::failover::connect_failover(cfg, secrets)
+        return crate::failover::connect_failover(cfg, secrets, observer)
             .await
             .map(|f| f.pool().clone());
     }
     if cfg.dynamic_credentials.is_none() {
-        return connect(cfg, secrets.as_ref()).await;
+        return connect(cfg, secrets.as_ref(), observer).await;
     }
-    let pool = rotating_pool(cfg, secrets).await?;
+    let pool = DbPool::new(rotating_pool(cfg, secrets).await?, observer);
     if let Err(e) = pool.acquire().await {
         pool.close().await;
-        return Err(db_err(e));
+        return Err(e);
     }
     Ok(pool)
 }
@@ -574,25 +676,30 @@ async fn rotating_pool_with(
 }
 
 /// Пул к адресу `url` с паролем `password`, ключом клиентского сертификата `key` ([`PoolConfig::client_key`];
-/// `tls.key` без ключа — `Invalid`) и параметрами `cfg`, соединения — по требованию (роли загружаются лениво,
-/// SRS 2.7; пулы шардов).
+/// `tls.key` без ключа — `Invalid`), параметрами `cfg` и наблюдателем `observer`; соединения — по требованию
+/// (роли загружаются лениво, SRS 2.7; пулы шардов).
 pub fn connect_lazy(
     cfg: &PoolConfig,
     url: &str,
     password: Option<&Secret>,
     key: Option<&Secret>,
-) -> Result<PgPool> {
+    observer: Arc<dyn AcquireObserver>,
+) -> Result<DbPool> {
     let opts = cfg.open_options(url, cfg.pgbouncer, password, key)?;
-    Ok(cfg.pool_options().connect_lazy_with(opts))
+    Ok(DbPool::new(
+        cfg.pool_options().connect_lazy_with(opts),
+        observer,
+    ))
 }
 
 /// Пул к реплике основной БД [`PoolConfig::read_replica`] (соединения — по требованию) с учётными данными
-/// `password`; `None` — реплика не задана. Динамические учётные данные для реплики не поддерживаются —
-/// `Invalid`.
+/// узла и наблюдателем `observer`; `None` — реплика не задана. Динамические учётные данные для реплики не
+/// поддерживаются — `Invalid`.
 pub async fn connect_replica(
     cfg: &PoolConfig,
     secrets: &dyn SecretStore,
-) -> Result<Option<PgPool>> {
+    observer: Arc<dyn AcquireObserver>,
+) -> Result<Option<DbPool>> {
     let Some(url) = &cfg.read_replica else {
         return Ok(None);
     };
@@ -603,16 +710,21 @@ pub async fn connect_replica(
     }
     let password = cfg.password(secrets).await?;
     let key = cfg.client_key(secrets).await?;
-    connect_lazy(cfg, url, password.as_ref(), key.as_ref()).map(Some)
+    connect_lazy(cfg, url, password.as_ref(), key.as_ref(), observer).map(Some)
 }
 
-/// Пул из одного соединения в обход PgBouncer для миграций ([`crate::schema::migrate`], модули): с
-/// [`PoolConfig::owner`] — от владельца схемы с его паролем, иначе — с учётными данными узла.
+/// Пул из одного соединения в обход PgBouncer для миграций ([`crate::schema::migrate`], модули) с
+/// наблюдателем `observer`: с [`PoolConfig::owner`] — от владельца схемы с его паролем, иначе — с учётными
+/// данными узла.
 ///
 /// Адресов несколько (`direct_url` + `direct_urls`, иначе `url` + `urls`) — соединение с первым доступным для
 /// записи (поиск primary, как у пула узла; проверка адреса — не дольше `failover.probe_timeout`); ни один
 /// не доступен для записи — `Unavailable`.
-pub async fn connect_direct(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Result<PgPool> {
+pub async fn connect_direct(
+    cfg: &PoolConfig,
+    secrets: &dyn SecretStore,
+    observer: Arc<dyn AcquireObserver>,
+) -> Result<DbPool> {
     let (addresses, pgbouncer) = cfg.migration_addresses();
     let url = addresses[0].as_str();
     let opts = match &cfg.owner {
@@ -633,12 +745,26 @@ pub async fn connect_direct(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Resu
     } else {
         writable_address(cfg, &opts, &addresses, pgbouncer).await?
     };
-    PgPoolOptions::new()
+    single_pool(cfg.acquire_timeout, opts, observer).await
+}
+
+/// Пул из одного соединения с параметрами `opts` (миграции основной БД и шардов); соединение открывается
+/// сразу — через наблюдателя `observer`.
+pub(crate) async fn single_pool(
+    acquire_timeout: Duration,
+    opts: PgConnectOptions,
+    observer: Arc<dyn AcquireObserver>,
+) -> Result<DbPool> {
+    let pool = PgPoolOptions::new()
         .max_connections(1)
-        .acquire_timeout(cfg.acquire_timeout)
-        .connect_with(opts)
-        .await
-        .map_err(db_err)
+        .acquire_timeout(acquire_timeout)
+        .connect_lazy_with(opts);
+    let pool = DbPool::new(pool, observer);
+    if let Err(e) = pool.acquire().await {
+        pool.close().await;
+        return Err(e);
+    }
+    Ok(pool)
 }
 
 /// Параметры `opts` (учётные данные — из них), перенесённые на первый из `addresses`, доступный для записи.
@@ -667,7 +793,7 @@ async fn writable_address(
     Err(Error::UNAVAILABLE)
 }
 
-/// Снимок занятости пула соединений для `/metrics` ([`snapshot`]).
+/// Снимок занятости пула соединений для `/metrics` ([`DbPool::snapshot`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoolSnapshot {
     /// Открыто соединений (занятые и свободные).
@@ -685,61 +811,6 @@ impl PoolSnapshot {
     }
 }
 
-/// Снимок занятости пула `pool`: без обращения к СУБД.
-pub fn snapshot(pool: &PgPool) -> PoolSnapshot {
-    PoolSnapshot {
-        size: pool.size(),
-        idle: u32::try_from(pool.num_idle()).unwrap_or(u32::MAX),
-        max: pool.options().get_max_connections(),
-    }
-}
-
-/// Наблюдатели пулов: пул и его наблюдатель. Запись держит пул, пока он не закрыт, — адрес его параметров
-/// (признак «тот же пул») не достаётся другому пулу. Записей — по числу пулов узла (основная БД, шарды).
-static OBSERVED: RwLock<Vec<(PgPool, Arc<dyn AcquireObserver>)>> = RwLock::new(Vec::new());
-
-/// `a` и `b` — один пул (клоны): параметры пула лежат в его общем состоянии.
-pub(crate) fn same_pool(a: &PgPool, b: &PgPool) -> bool {
-    std::ptr::eq(a.options(), b.options())
-}
-
-/// Назначает пулу `pool` (и всем его клонам) наблюдателя ожидания соединения (CTR-51): транзакции
-/// [`with_tenant`], [`with_system`], [`crate::schema::begin`] и повторы [`crate::failover::Failover`] на этом
-/// пуле сообщают ему о каждом ожидании; отказ и тайм-аут пула — исход «отказ», отменённая задача — «брошено».
-/// Без назначения наблюдателя нет (ожидание не учитывается). Повторное назначение заменяет прежнее;
-/// записи закрытых пулов удаляются.
-pub fn observe(pool: &PgPool, observer: Arc<dyn AcquireObserver>) {
-    let mut list = OBSERVED.write().unwrap_or_else(PoisonError::into_inner);
-    list.retain(|(p, _)| !p.is_closed() && !same_pool(p, pool));
-    list.push((pool.clone(), observer));
-}
-
-/// Наблюдатель пула `pool`; `None` — не назначен.
-fn observer(pool: &PgPool) -> Option<Arc<dyn AcquireObserver>> {
-    let list = OBSERVED.read().unwrap_or_else(PoisonError::into_inner);
-    list.iter()
-        .find(|(p, _)| same_pool(p, pool))
-        .map(|(_, o)| o.clone())
-}
-
-/// Транзакция на соединении пула `pool`; ожидание соединения — через наблюдателя пула ([`observe`]).
-pub(crate) async fn begin_tx(pool: &PgPool) -> Result<Transaction<'static, Postgres>> {
-    match observer(pool) {
-        Some(o) => o.observe(pool.begin()).await,
-        None => pool.begin().await,
-    }
-    .map_err(db_err)
-}
-
-/// Соединение пула `pool` для одиночного запроса; ожидание — через наблюдателя пула ([`observe`]).
-pub(crate) async fn acquire(pool: &PgPool) -> Result<PoolConnection<Postgres>> {
-    match observer(pool) {
-        Some(o) => o.observe(pool.acquire()).await,
-        None => pool.acquire().await,
-    }
-    .map_err(db_err)
-}
-
 /// Будущее тела транзакции, заимствующее соединение.
 pub type TxFuture<'c, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>;
 
@@ -747,7 +818,7 @@ pub type TxFuture<'c, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>;
 /// ошибка — откат. Внутри — только СУБД: к BLOB и сети в открытой транзакции не обращаться.
 ///
 /// ```no_run
-/// # async fn demo(pool: &sqlx::PgPool, tenant: tp_contracts::TenantId) -> tp_contracts::Result<()> {
+/// # async fn demo(pool: &tp_meta::pool::DbPool, tenant: tp_contracts::TenantId) -> tp_contracts::Result<()> {
 /// let n: i64 = tp_meta::pool::with_tenant(pool, tenant, |tx| {
 ///     Box::pin(async move {
 ///         sqlx::query_scalar("SELECT count(*) FROM accounts")
@@ -759,7 +830,7 @@ pub type TxFuture<'c, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>;
 /// .await?;
 /// # Ok(()) }
 /// ```
-pub async fn with_tenant<T, F>(pool: &PgPool, tenant: TenantId, f: F) -> Result<T>
+pub async fn with_tenant<T, F>(pool: &DbPool, tenant: TenantId, f: F) -> Result<T>
 where
     F: for<'c> FnOnce(&'c mut PgConnection) -> TxFuture<'c, T>,
 {
@@ -770,7 +841,7 @@ where
 }
 
 /// Как [`with_tenant`], но по всем организациям (`SET LOCAL app.all_tenants`): GC, журнал событий.
-pub async fn with_system<T, F>(pool: &PgPool, f: F) -> Result<T>
+pub async fn with_system<T, F>(pool: &DbPool, f: F) -> Result<T>
 where
     F: for<'c> FnOnce(&'c mut PgConnection) -> TxFuture<'c, T>,
 {
@@ -993,8 +1064,9 @@ dynamic_credentials:
             .await
             .expect("credentials");
         assert!(inline_key(&opts, KEY_PEM));
-        let lazy = connect_lazy(&c, url, None, key.as_ref()).expect("lazy");
-        assert!(inline_key(&lazy.connect_options(), KEY_PEM));
+        let lazy =
+            connect_lazy(&c, url, None, key.as_ref(), Arc::new(NoAcquireObserver)).expect("lazy");
+        assert!(inline_key(&lazy.raw().connect_options(), KEY_PEM));
 
         // Новая версия секрета — при следующем чтении (новое подключение).
         let next = KEY_PEM.replace("IAAA", "IBBB");
@@ -1028,7 +1100,7 @@ dynamic_credentials:
         // `key` без хранилища — ошибка конфигурации, а не соединение без клиентского сертификата.
         for r in [
             c.open_options(url, false, None, None).map(drop),
-            connect_lazy(&c, url, None, None).map(drop),
+            connect_lazy(&c, url, None, None, Arc::new(NoAcquireObserver)).map(drop),
         ] {
             assert!(
                 matches!(&r, Err(Error::Invalid(m)) if m.contains("database.tls.key")),
@@ -1071,6 +1143,22 @@ dynamic_credentials:
         ));
     }
 
+    /// Ключ не подходит к сертификату — понятная ошибка конфигурации, а не «СУБД недоступна» (META-56). Текст —
+    /// как у rustls 0.23 (`Error::InconsistentKeys(KeyMismatch)`).
+    #[test]
+    fn tls_key_mismatch_is_invalid() {
+        let tls = |text: &str| sqlx::Error::Tls(Box::new(std::io::Error::other(text.to_owned())));
+        let e = db_err(tls("keys may not be consistent: KeyMismatch"));
+        assert!(
+            matches!(&e, Error::Invalid(m) if m.contains("не подходит к сертификату")),
+            "{e}"
+        );
+        assert!(matches!(
+            db_err(tls("received fatal alert: HandshakeFailure")),
+            Error::Unavailable { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn acquire_observer_and_snapshot() {
         use tp_contracts::acquire::AcquireCounter;
@@ -1082,46 +1170,34 @@ dynamic_credentials:
             acquire_timeout: Duration::from_millis(300),
             ..dev(url)
         };
-        let pool = connect_lazy(&c, url, None, None).expect("lazy");
+        let counter = Arc::new(AcquireCounter::default());
+        let pool = connect_lazy(&c, url, None, None, counter.clone()).expect("lazy");
         assert_eq!(
-            snapshot(&pool),
+            pool.snapshot(),
             PoolSnapshot {
                 size: 0,
                 idle: 0,
                 max: 3
             }
         );
-        // Без наблюдателя — как раньше.
-        assert!(matches!(
-            begin_tx(&pool).await,
-            Err(Error::Unavailable { .. })
-        ));
-
-        let counter = Arc::new(AcquireCounter::default());
-        observe(&pool.clone(), counter.clone());
-        let other = connect_lazy(&c, url, None, None).expect("lazy");
-        assert!(same_pool(&pool, &pool.clone()) && !same_pool(&pool, &other));
-        assert!(observer(&other).is_none());
+        let other_counter = Arc::new(AcquireCounter::default());
+        let other = connect_lazy(&c, url, None, None, other_counter.clone()).expect("lazy");
+        assert!(pool.same(&pool.clone()) && !pool.same(&other));
 
         assert!(crate::schema::begin_system(&pool).await.is_err());
-        assert!(acquire(&pool).await.is_err());
+        assert!(pool.acquire().await.is_err());
+        assert!(pool.clone().begin().await.is_err());
         let failed = with_tenant(&pool, TenantId::DEFAULT, |_| Box::pin(async { Ok(()) })).await;
         assert!(matches!(failed, Err(Error::Unavailable { .. })));
         assert_eq!(
             (counter.waiting(), counter.acquired(), counter.failed()),
-            (0, 0, 3)
+            (0, 0, 4)
         );
-        // Чужой пул наблюдателю не сообщает; повторное назначение заменяет наблюдателя.
-        assert!(begin_tx(&other).await.is_err());
-        assert_eq!(counter.failed(), 3);
-        let second = Arc::new(AcquireCounter::default());
-        observe(&pool, second.clone());
-        assert!(begin_tx(&pool).await.is_err());
-        assert_eq!((counter.failed(), second.failed()), (3, 1));
-        // Запись закрытого пула удаляется при следующем назначении.
+        // Чужой пул — своему наблюдателю.
+        assert!(other.begin().await.is_err());
+        assert_eq!((counter.failed(), other_counter.failed()), (4, 1));
         pool.close().await;
-        observe(&other, counter.clone());
-        assert!(observer(&pool).is_none());
         other.close().await;
+        assert!(pool.is_closed());
     }
 }

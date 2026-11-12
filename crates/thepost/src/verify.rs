@@ -300,7 +300,7 @@ mod tests {
             eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
             return;
         };
-        let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+        let pool = crate::testutil::db_pool(&url).await;
         tp_meta::schema::migrate(&pool).await.expect("migrate");
         let tenant = TenantId::new();
         tp_meta::pool::with_tenant(&pool, tenant, |tx| {

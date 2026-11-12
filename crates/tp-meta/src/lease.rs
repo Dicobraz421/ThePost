@@ -69,7 +69,7 @@ impl LeaseStore for PgMeta {
             .bind(name)
             .bind(holder)
             .bind(ttl_arg(ttl)?)
-            .fetch_optional(&mut *crate::pool::acquire(&self.pool).await?)
+            .fetch_optional(&mut *self.pool.acquire().await?)
             .await
             .map_err(db_err)?;
             row.map(Lease::try_from).transpose()
@@ -89,7 +89,7 @@ impl LeaseStore for PgMeta {
             .bind(&lease.holder)
             .bind(to_i64(lease.fencing)?)
             .bind(ttl_arg(ttl)?)
-            .fetch_optional(&mut *crate::pool::acquire(&self.pool).await?)
+            .fetch_optional(&mut *self.pool.acquire().await?)
             .await
             .map_err(db_err)?;
             row.map(Lease::try_from).transpose()
@@ -106,7 +106,7 @@ impl LeaseStore for PgMeta {
             .bind(&lease.name)
             .bind(&lease.holder)
             .bind(to_i64(lease.fencing)?)
-            .execute(&mut *crate::pool::acquire(&self.pool).await?)
+            .execute(&mut *self.pool.acquire().await?)
             .await
             .map_err(db_err)?;
             Ok(())

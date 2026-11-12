@@ -154,12 +154,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         "запуск узла"
     );
 
-    let db = infra::connect_node_db(&cfg, store.clone()).await?;
-    crate::metrics::register_failover(&metrics, db.clone());
+    // Метрики Д.7 (APP-34): пулы узла (ожидание соединения — наблюдатель пула, META-55), слушатель LISTEN, время
+    // фиксаций с NOTIFY.
     let db_metrics = DbMetrics::register(&metrics, &*cfg.section::<TelemetryConfig>("telemetry")?);
+    let db = infra::connect_node_db(&cfg, store.clone(), &db_metrics).await?;
+    crate::metrics::register_failover(&metrics, db.clone());
     let pool = db.pool().clone();
     let meta_cfg = (*cfg.section::<MetaConfig>(MetaConfig::SECTION)?).clone();
-    let migrations = infra::migration_pool(&cfg, store.as_ref(), &pool).await?;
+    let migrations = infra::migration_pool(&cfg, store.as_ref(), &pool, &db_metrics).await?;
     if meta_cfg.migrate_on_start {
         tp_meta::schema::migrate(&migrations).await?;
     }
@@ -167,13 +169,10 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let blob_cfg = cfg.section::<BlobSection>(BLOB)?;
     // Шина сигналов — до хранилищ: после фиксации они публикуют `LogAppended` (будит читателей журнала событий),
     // `MembersChanged`, `TransportChanged` и др. (APP-08, SRS 2.8).
-    let bus = infra::open_bus(&cfg, Some(&db), store.clone()).await?;
+    let bus = infra::open_bus(&cfg, Some(&db), store.clone(), &db_metrics).await?;
     let sample = bus.sample.clone();
     metrics.register_bus(move || sample());
-    // Метрики Д.7 (APP-34): пул узла, слушатель LISTEN, время фиксаций с NOTIFY.
-    // TODO(META-55): наблюдателя ожидания соединения передать пулу `tp-meta`, когда он начнёт его принимать, —
-    // до тех пор `tp_db_pool_waiting`, `tp_db_pool_wait_seconds` и `tp_db_pool_acquire_errors_total` нулевые.
-    let _pool_observer = crate::metrics::register_db(&metrics, &db_metrics, &db, bus.signals);
+    crate::metrics::register_db(&metrics, &db_metrics, bus.signals);
     let bus = bus.bus;
     let meta = PgMeta::new(pool, meta_cfg).with_bus(bus.clone());
 

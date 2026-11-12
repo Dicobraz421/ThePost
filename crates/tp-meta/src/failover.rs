@@ -38,14 +38,14 @@ use std::time::{Duration, Instant};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::{Connection, PgConnection};
 use tp_contracts::config::duration;
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result, TenantId};
 
 use crate::credentials::Rotated;
-use crate::pool::{self, PoolConfig, TxFuture};
-use crate::schema::{begin, begin_system, db_err};
+use crate::pool::{self, AcquireObserver, DbPool, PoolConfig, TxFuture};
+use crate::schema::{begin, begin_system};
 
 /// Подсекция `database.failover`: повтор операций и поиск primary при переключении СУБД (SRS 3.1, 5.5).
 /// Параметры требуют перезапуска.
@@ -191,7 +191,7 @@ pub struct Failover(Arc<Inner>);
 
 #[derive(Debug)]
 struct Inner {
-    pool: PgPool,
+    pool: DbPool,
     cfg: FailoverConfig,
     targets: Vec<Target>,
     reset: Rotated,
@@ -248,7 +248,7 @@ enum Scope {
 }
 
 impl Scope {
-    async fn begin(self, pool: &PgPool) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    async fn begin(self, pool: &DbPool) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
         match self {
             Scope::Tenant(t) => begin(pool, t).await,
             Scope::System => begin_system(pool).await,
@@ -260,7 +260,7 @@ impl Failover {
     /// Пул `pool` с адресами `targets` (первый — `url`); соединения, открытые до смены адреса, `pool`
     /// закрывает по отметке `reset`.
     pub(crate) fn new(
-        pool: PgPool,
+        pool: DbPool,
         targets: Vec<Target>,
         reset: Rotated,
         cfg: FailoverConfig,
@@ -283,19 +283,13 @@ impl Failover {
     }
 
     /// Пул узла (новые соединения — к текущему primary).
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &DbPool {
         &self.0.pool
     }
 
-    /// Назначает пулу наблюдателя ожидания соединения (CTR-51, [`pool::observe`]): транзакции и повторы на
-    /// пуле сообщают ему о каждом ожидании; служебные проверки primary не учитываются.
-    pub fn observe(&self, observer: Arc<dyn tp_contracts::acquire::AcquireObserver>) {
-        pool::observe(&self.0.pool, observer);
-    }
-
-    /// Снимок занятости пула для `/metrics` ([`pool::snapshot`]).
+    /// Снимок занятости пула для `/metrics` ([`DbPool::snapshot`]).
     pub fn snapshot(&self) -> pool::PoolSnapshot {
-        pool::snapshot(&self.0.pool)
+        self.0.pool.snapshot()
     }
 
     /// Номер переключения primary: новое значение — пул перенаправлен к другому адресу (слушатель сигналов
@@ -328,7 +322,7 @@ impl Failover {
         loop {
             if let Some(i) = inner.search().await {
                 inner.switch_to(i, false);
-                return inner.pool.acquire().await.map(drop).map_err(db_err);
+                return inner.pool.acquire().await.map(drop);
             }
             if started.elapsed().saturating_add(pause) > inner.cfg.retry_for {
                 tracing::warn!(
@@ -347,7 +341,7 @@ impl Failover {
     /// (при переключении — поиск и сброс пула) и повтор с нарастающей паузой до `retry_for`.
     pub async fn retry<T, F, Fut>(&self, mut op: F) -> Result<T>
     where
-        F: FnMut(PgPool) -> Fut,
+        F: FnMut(DbPool) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         let mut r = self.0.retrier();
@@ -472,7 +466,7 @@ impl Failover {
 type NoKey<T> = for<'c> fn(&'c mut PgConnection) -> TxFuture<'c, Option<T>>;
 
 /// Тело `f` в транзакции области `scope` без повтора.
-async fn run<T, F>(pool: &PgPool, scope: Scope, f: &F) -> Result<T>
+async fn run<T, F>(pool: &DbPool, scope: Scope, f: &F) -> Result<T>
 where
     F: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, T>,
 {
@@ -546,7 +540,7 @@ impl Inner {
     fn switch_to(&self, i: usize, count: bool) {
         let target = &self.targets[i].opts;
         self.reset
-            .replace(&self.pool, |cur| retarget(cur.clone(), target));
+            .replace(self.pool.raw(), |cur| retarget(cur.clone(), target));
         self.counters.primary.store(i, Ordering::Relaxed);
         let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.switched.send_replace(epoch);
@@ -570,7 +564,7 @@ impl Inner {
     /// Адрес доступен для записи (`Some(true)`), только для чтения (`Some(false)`), недоступен (`None`):
     /// отдельное соединение с учётными данными пула.
     async fn probe(&self, t: &Target) -> Option<bool> {
-        let opts = retarget((*self.pool.connect_options()).clone(), &t.opts);
+        let opts = retarget((*self.pool.raw().connect_options()).clone(), &t.opts);
         let check = async {
             let mut conn = PgConnection::connect_with(&opts).await?;
             let writable = writable(&mut conn).await;
@@ -590,7 +584,7 @@ impl Inner {
     /// Проверка соединения пула (обрывы отсекает проверка соединения при выдаче).
     async fn health(&self) -> Health {
         let timeout = self.cfg.probe_timeout;
-        let mut conn = match tokio::time::timeout(timeout, self.pool.acquire()).await {
+        let mut conn = match tokio::time::timeout(timeout, self.pool.acquire_sqlx()).await {
             Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => return Health::Busy,
             Ok(Err(_)) => return Health::Broken,
             Ok(Ok(c)) => c,
@@ -617,11 +611,18 @@ pub(crate) async fn writable(conn: &mut PgConnection) -> std::result::Result<boo
 /// Пул узла с поиском primary по `url` + `urls` и повтором при переключении (SRS 3.1); с
 /// [`PoolConfig::dynamic_credentials`] — с ротацией учётных данных ([`pool::connect_rotating`]).
 /// Primary выбирается при запуске (не найден за `failover.retry_for` — `Unavailable`).
-pub async fn connect_failover(cfg: &PoolConfig, secrets: Arc<dyn SecretStore>) -> Result<Failover> {
+pub async fn connect_failover(
+    cfg: &PoolConfig,
+    secrets: Arc<dyn SecretStore>,
+    observer: Arc<dyn AcquireObserver>,
+) -> Result<Failover> {
     cfg.check()?;
     let targets = cfg.targets()?;
     let reset = Rotated::default();
-    let pool = pool::node_pool(cfg, secrets, reset.clone()).await?;
+    let pool = DbPool::new(
+        pool::node_pool(cfg, secrets, reset.clone()).await?,
+        observer,
+    );
     let failover = Failover::new(pool, targets, reset, cfg.failover.clone());
     if let Err(e) = failover.start().await {
         failover.pool().close().await;

@@ -27,19 +27,18 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use tp_contracts::bus::{EventBus, EventKind};
 use tp_contracts::meta::AccountScope;
 use tp_contracts::secrets::{SecretRef, SecretStore};
 use tp_contracts::{AccountId, Error, Result, TenantId};
 
 use crate::pool::{
-    PoolConfig, PoolSnapshot, connect_lazy, fetch_secret, observe, same_pool, snapshot,
+    AcquireObserver, DbPool, PoolConfig, PoolSnapshot, connect_lazy, fetch_secret, single_pool,
     url_has_password,
 };
 use crate::replica::Replica;
 use crate::schema::{begin, db_err};
-use tp_contracts::acquire::AcquireObserver;
 
 /// Номер шарда — тип контракта (CTR-34): [`ShardId::MAIN`] — основная БД.
 pub use tp_contracts::ShardId;
@@ -140,7 +139,7 @@ pub trait ShardResolver: Send + Sync + 'static {
 
     /// Пул шарда для операции с назначением `intent` (записи — всегда `Primary`); `NotFound` — шарда нет
     /// в справочнике.
-    async fn pool(&self, shard: ShardId, intent: ReadIntent) -> Result<PgPool>;
+    async fn pool(&self, shard: ShardId, intent: ReadIntent) -> Result<DbPool>;
 
     /// Шард для новой учётной записи организации.
     async fn place(&self, tenant: TenantId) -> Result<ShardId>;
@@ -159,7 +158,7 @@ pub trait ShardResolver: Send + Sync + 'static {
     }
 
     /// Пул шарда учётной записи.
-    async fn pool_for(&self, scope: AccountScope, intent: ReadIntent) -> Result<PgPool> {
+    async fn pool_for(&self, scope: AccountScope, intent: ReadIntent) -> Result<DbPool> {
         let shard = self.shard_of(scope).await?;
         self.pool(shard, intent).await
     }
@@ -173,7 +172,7 @@ struct Cache {
     /// Шарды справочника; `None` — не прочитаны.
     shards: Option<Vec<ShardId>>,
     accounts: HashMap<(TenantId, AccountId), ShardId>,
-    pools: HashMap<ShardId, PgPool>,
+    pools: HashMap<ShardId, DbPool>,
     replicas: HashMap<ShardId, Option<Arc<Replica>>>,
     /// Поколение кэша: результат запроса, начатого до сброса, не кэшируется.
     epoch: u64,
@@ -181,15 +180,44 @@ struct Cache {
 
 /// Справочник шардов в основной БД; пулы шардов создаются по требованию и кэшируются.
 pub struct ShardDirectory {
-    catalog: PgPool,
+    catalog: DbPool,
     cfg: PoolConfig,
     secrets: Arc<dyn SecretStore>,
     cache: Mutex<Cache>,
-    observers: Option<ShardObservers>,
+    observers: ShardObservers,
 }
 
-/// Наблюдатель ожидания соединения для пула шарда ([`ShardDirectory::with_acquire_observers`]).
-pub type ShardObservers = Arc<dyn Fn(ShardId) -> Arc<dyn AcquireObserver> + Send + Sync>;
+/// Назначение пула шарда — для наблюдателя ожидания соединения ([`ShardObservers`]) и меток метрик.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShardPool {
+    /// Пул primary шарда (хранилища ящиков).
+    Primary,
+    /// Пул реплики шарда для фоновых чтений (`ReadIntent::Stale`).
+    Replica,
+    /// Соединение миграций схемы шарда ([`ShardDirectory::migrate`]).
+    Migrations,
+    /// Пул публикатора сигналов шарда ([`crate::signals::ShardedSignalBus`]).
+    Publisher,
+    /// Соединение слушателя сигналов шарда ([`crate::signals::ShardedSignalBus`]).
+    Listener,
+}
+
+impl ShardPool {
+    /// Имя для метки метрик: `primary`, `replica`, `migrations`, `publisher`, `listener`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Replica => "replica",
+            Self::Migrations => "migrations",
+            Self::Publisher => "publisher",
+            Self::Listener => "listener",
+        }
+    }
+}
+
+/// Наблюдатель ожидания соединения для пула шарда по номеру шарда и назначению пула
+/// ([`ShardDirectory::new`]).
+pub type ShardObservers = Arc<dyn Fn(ShardId, ShardPool) -> Arc<dyn AcquireObserver> + Send + Sync>;
 
 impl fmt::Debug for ShardDirectory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -200,36 +228,40 @@ impl fmt::Debug for ShardDirectory {
 impl ShardDirectory {
     /// Справочник над пулом основной БД; пулы других шардов — с параметрами `cfg` (адрес — `dsn` шарда,
     /// пароль — секрет `credentials` из `secrets`; `cfg.url` и `cfg.password` не используются).
-    pub fn new(catalog: PgPool, cfg: PoolConfig, secrets: Arc<dyn SecretStore>) -> Self {
+    ///
+    /// Наблюдатели ожидания соединения (CTR-51) — от `observers`: вызывается при создании каждого пула шарда с
+    /// адресом — primary, реплики, миграций, публикатора и слушателя сигналов ([`ShardPool`]; в том числе заново
+    /// после [`forget`](Self::forget) и сброса кэша). Пул основной БД (шард без адреса) — `catalog` со своим
+    /// наблюдателем.
+    pub fn new(
+        catalog: DbPool,
+        cfg: PoolConfig,
+        secrets: Arc<dyn SecretStore>,
+        observers: impl Fn(ShardId, ShardPool) -> Arc<dyn AcquireObserver> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             catalog,
             cfg,
             secrets,
             cache: Mutex::new(Cache::default()),
-            observers: None,
+            observers: Arc::new(observers),
         }
     }
 
-    /// Наблюдатели ожидания соединения пулов шардов (CTR-51, [`crate::pool::observe`]): `observers` вызывается
-    /// при создании пула primary шарда с адресом (в том числе заново после [`forget`](Self::forget) и сброса
-    /// кэша). Пул основной БД (шард без адреса) наблюдает узел; пулы реплик не наблюдаются.
-    pub fn with_acquire_observers(
-        mut self,
-        observers: impl Fn(ShardId) -> Arc<dyn AcquireObserver> + Send + Sync + 'static,
-    ) -> Self {
-        self.observers = Some(Arc::new(observers));
-        self
+    /// Наблюдатель ожидания соединения для пула `kind` шарда `shard`.
+    pub(crate) fn observer(&self, shard: ShardId, kind: ShardPool) -> Arc<dyn AcquireObserver> {
+        (self.observers)(shard, kind)
     }
 
     /// Снимки занятости созданных пулов primary шардов с адресом, по номеру шарда (для `/metrics`); пул основной
-    /// БД — [`crate::pool::snapshot`] от пула узла. Без обращения к СУБД.
+    /// БД — [`DbPool::snapshot`] от пула узла. Без обращения к СУБД.
     pub fn snapshots(&self) -> Vec<(ShardId, PoolSnapshot)> {
         let c = self.cached();
         let mut out: Vec<_> = c
             .pools
             .iter()
-            .filter(|(_, p)| !same_pool(p, &self.catalog))
-            .map(|(id, p)| (*id, snapshot(p)))
+            .filter(|(_, p)| !p.same(&self.catalog))
+            .map(|(id, p)| (*id, p.snapshot()))
             .collect();
         out.sort_by_key(|(id, _)| *id);
         out
@@ -240,8 +272,8 @@ impl ShardDirectory {
         let c = self.cached();
         c.pools
             .get(&shard)
-            .filter(|p| !same_pool(p, &self.catalog))
-            .map(snapshot)
+            .filter(|p| !p.same(&self.catalog))
+            .map(DbPool::snapshot)
     }
 
     /// Все шарды по номеру; строка с паролем в адресе или неверной ссылкой на секрет — `Invalid`.
@@ -249,7 +281,7 @@ impl ShardDirectory {
         let rows: Vec<ShardRow> = sqlx::query_as(
             "SELECT shard_id, name, dsn, credentials, accepts_new, site, read_replica FROM shards ORDER BY shard_id",
         )
-        .fetch_all(&mut *crate::pool::acquire(&self.catalog).await?)
+        .fetch_all(&mut *self.catalog.acquire().await?)
         .await
         .map_err(db_err)?;
         rows.into_iter().map(Shard::try_from).collect()
@@ -344,12 +376,12 @@ impl ShardDirectory {
                         .open_options(dsn, false, password.as_ref(), key.as_ref())?
                 }
             };
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(self.cfg.acquire_timeout)
-                .connect_with(opts)
-                .await
-                .map_err(db_err)?;
+            let pool = single_pool(
+                self.cfg.acquire_timeout,
+                opts,
+                self.observer(shard.id, ShardPool::Migrations),
+            )
+            .await?;
             let applied = crate::schema::migrate(&pool).await;
             pool.close().await;
             applied?;
@@ -369,7 +401,7 @@ impl ShardDirectory {
             "SELECT shard_id, name, dsn, credentials, accepts_new, site, read_replica FROM shards WHERE shard_id = $1",
         )
         .bind(shard.0)
-        .fetch_optional(&mut *crate::pool::acquire(&self.catalog).await?)
+        .fetch_optional(&mut *self.catalog.acquire().await?)
         .await
         .map_err(db_err)?;
         Ok(ShardRecord {
@@ -377,13 +409,14 @@ impl ShardDirectory {
         })
     }
 
-    /// Пул к адресу `dsn` шарда `shard` с паролем из секрета `credentials`.
+    /// Пул `kind` к адресу `dsn` шарда `shard` с паролем из секрета `credentials`.
     async fn connect(
         &self,
         shard: ShardId,
+        kind: ShardPool,
         dsn: &str,
         credentials: Option<&SecretRef>,
-    ) -> Result<PgPool> {
+    ) -> Result<DbPool> {
         // Секрет читается вне транзакций БД.
         let password = match credentials {
             Some(r) => {
@@ -392,26 +425,25 @@ impl ShardDirectory {
             None => None,
         };
         let key = self.cfg.client_key(self.secrets.as_ref()).await?;
-        connect_lazy(&self.cfg, dsn, password.as_ref(), key.as_ref())
+        connect_lazy(
+            &self.cfg,
+            dsn,
+            password.as_ref(),
+            key.as_ref(),
+            self.observer(shard, kind),
+        )
     }
 
     /// Кэширует пул, если кэш не сброшен с поколения `epoch`; параллельный запрос мог создать пул раньше —
     /// остаётся первый.
-    fn keep(&self, key: ShardId, epoch: u64, pool: PgPool) -> PgPool {
+    fn keep(&self, key: ShardId, epoch: u64, pool: DbPool) -> DbPool {
         let mut c = self.cached();
         if c.epoch != epoch {
             return pool;
         }
         match c.pools.entry(key) {
             Entry::Occupied(e) => e.get().clone(),
-            Entry::Vacant(e) => {
-                if let Some(observers) = &self.observers
-                    && !same_pool(&pool, &self.catalog)
-                {
-                    observe(&pool, observers(key));
-                }
-                e.insert(pool).clone()
-            }
+            Entry::Vacant(e) => e.insert(pool).clone(),
         }
     }
 }
@@ -455,7 +487,7 @@ impl ShardResolver for ShardDirectory {
 
     /// Пул шарда. Секрет недоступен, отозван или запрещён политикой — `Unavailable` (причина — в журнале).
     /// `Stale` — реплика шарда при допустимом отставании, иначе primary.
-    async fn pool(&self, shard: ShardId, intent: ReadIntent) -> Result<PgPool> {
+    async fn pool(&self, shard: ShardId, intent: ReadIntent) -> Result<DbPool> {
         if intent == ReadIntent::Stale
             && let Some(replica) = self.replica(shard).await?
             && replica.usable().await
@@ -474,8 +506,13 @@ impl ShardResolver for ShardDirectory {
         let pool = match &rec.shard.dsn {
             None => self.catalog.clone(),
             Some(dsn) => {
-                self.connect(shard, dsn, rec.shard.credentials.as_ref())
-                    .await?
+                self.connect(
+                    shard,
+                    ShardPool::Primary,
+                    dsn,
+                    rec.shard.credentials.as_ref(),
+                )
+                .await?
             }
         };
         Ok(self.keep(key, epoch, pool))
@@ -486,7 +523,7 @@ impl ShardResolver for ShardDirectory {
         let shard: Option<i32> = sqlx::query_scalar(
             "SELECT shard_id FROM shards WHERE accepts_new ORDER BY shard_id LIMIT 1",
         )
-        .fetch_optional(&mut *crate::pool::acquire(&self.catalog).await?)
+        .fetch_optional(&mut *self.catalog.acquire().await?)
         .await
         .map_err(db_err)?;
         shard
@@ -504,7 +541,7 @@ impl ShardResolver for ShardDirectory {
         };
         let mut ids: Vec<ShardId> =
             sqlx::query_scalar::<_, i32>("SELECT shard_id FROM shards ORDER BY shard_id")
-                .fetch_all(&mut *crate::pool::acquire(&self.catalog).await?)
+                .fetch_all(&mut *self.catalog.acquire().await?)
                 .await
                 .map_err(db_err)?
                 .into_iter()
@@ -534,7 +571,12 @@ impl ShardResolver for ShardDirectory {
             None => None,
             Some(url) => {
                 let pool = self
-                    .connect(shard, url, rec.shard.credentials.as_ref())
+                    .connect(
+                        shard,
+                        ShardPool::Replica,
+                        url,
+                        rec.shard.credentials.as_ref(),
+                    )
                     .await?;
                 Some(Arc::new(Replica::new(pool, self.cfg.replica_max_lag)))
             }

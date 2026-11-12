@@ -7,15 +7,15 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sqlx::{Executor, PgPool};
+use sqlx::Executor;
 use tp_contracts::secrets::SecretRef;
 use tp_meta::credentials::DynamicCredentials;
-use tp_meta::pool::{self, PoolConfig};
+use tp_meta::pool::{self, DbPool, NoAcquireObserver, PoolConfig};
 use tp_testkit::MemSecretStore;
 
-async fn current_user(pool: &PgPool) -> String {
+async fn current_user(pool: &DbPool) -> String {
     sqlx::query_scalar("SELECT current_user::text")
-        .fetch_one(pool)
+        .fetch_one(&mut *common::conn(pool).await)
         .await
         .expect("current_user")
 }
@@ -31,7 +31,8 @@ async fn new_connections_use_rotated_credentials_running_queries_survive() {
         .map(|i| (format!("tp_dyn_{tag}_{i}"), format!("pw-{tag}-{i}")))
         .collect();
     for (role, password) in &roles {
-        admin
+        common::conn(&admin)
+            .await
             .execute(sqlx::AssertSqlSafe(format!(
                 "CREATE ROLE {role} LOGIN PASSWORD '{password}'"
             )))
@@ -61,7 +62,7 @@ async fn new_connections_use_rotated_credentials_running_queries_survive() {
         max_connections: 4,
         ..common::dev_pool_config(&base)
     };
-    let pool = pool::connect_rotating(&cfg, Arc::new(store.clone()))
+    let pool = pool::connect_rotating(&cfg, Arc::new(store.clone()), Arc::new(NoAcquireObserver))
         .await
         .expect("пул");
     assert_eq!(current_user(&pool).await, roles[0].0);
@@ -75,7 +76,9 @@ async fn new_connections_use_rotated_credentials_running_queries_survive() {
     assert_eq!(before, roles[0].0);
     issue(&roles[1]);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while pool.connect_options().get_username() != roles[1].0 {
+    // Параметры соединения пул наружу не отдаёт: ротация видна по роли нового соединения (соединения,
+    // открытые до неё, закрываются при выдаче).
+    while current_user(&pool).await != roles[1].0 {
         assert!(Instant::now() < deadline, "ротация не произошла");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -94,13 +97,15 @@ async fn new_connections_use_rotated_credentials_running_queries_survive() {
     pool.close().await;
 
     for (role, _) in &roles {
-        admin
+        common::conn(&admin)
+            .await
             .execute(sqlx::AssertSqlSafe(format!(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{role}'"
             )))
             .await
             .expect("terminate");
-        admin
+        common::conn(&admin)
+            .await
             .execute(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}")))
             .await
             .expect("drop role");

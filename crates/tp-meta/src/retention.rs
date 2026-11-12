@@ -912,7 +912,10 @@ impl PgMeta {
 }
 
 /// Размер и число писем ящика на шарде `pool`, включая корзину, без скрытых.
-pub(crate) async fn box_usage(pool: &sqlx::PgPool, scope: AccountScope) -> Result<(u64, u64)> {
+pub(crate) async fn box_usage(
+    pool: &crate::pool::DbPool,
+    scope: AccountScope,
+) -> Result<(u64, u64)> {
     let mut tx = begin(pool, scope.tenant).await?;
     let (used, messages): (i64, i64) = sqlx::query_as(
         "SELECT coalesce(sum(size), 0)::bigint, count(*) FROM messages
