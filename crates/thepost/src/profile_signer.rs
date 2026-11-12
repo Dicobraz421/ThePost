@@ -110,8 +110,9 @@ mod tests {
     use tp_contracts::ext::DecisionHooks;
     use tp_platform::TlsConfig;
     use tp_testkit::{
-        Clock, FakeAuthenticator, FakeSearch, MemAcl, MemBlobIndex, MemBlobStore, MemEventBus,
-        MemMetadata, MemPolicies, MemQuota, MemSecretStore, MemTrash, SystemClock,
+        Clock, FakeAuthenticator, FakeSearch, MemAcl, MemBlobIndex, MemBlobStore, MemDeliveryLog,
+        MemEventBus, MemMailboxAudit, MemMetadata, MemPolicies, MemQuota, MemSecretStore,
+        MemSubmissions, MemTrash, SystemClock,
     };
     use x509_parser::asn1_rs::{Any, FromDer};
 
@@ -198,6 +199,9 @@ mod tests {
             accounts: accounts.clone(),
             authz: Arc::new(tp_auth::AclAuthorizer::new(acl, accounts)),
             outbound: None,
+            submissions: Arc::new(MemSubmissions::new()),
+            delivery_log: Arc::new(MemDeliveryLog::new()),
+            audit: Arc::new(MemMailboxAudit::new()),
             hooks: DecisionHooks::default(),
             capabilities: Vec::new(),
         };

@@ -7,9 +7,12 @@
 //!   SearchSnippet/get (RFC 8621 §5);
 //! - `email_set` — Email/set (черновики, keywords, mailboxIds, удаление в корзину), Email/import, Email/copy (§4.6–4.8);
 //! - `blob` — загрузка и скачивание blob, Blob/copy (RFC 8620 §6);
-//! - [`submission`] — Identity/get, set и EmailSubmission/get, set, query, queryChanges → очередь [`Outbound`](tp_contracts::queue::Outbound) (RFC 8621 §6–7);
+//! - [`submission`] — Identity/get, set и EmailSubmission/get, changes, query, queryChanges, set: отправка сразу и
+//!   отложенная (`sendAt`, отмена) через [`Outbound`](tp_contracts::queue::Outbound), записи — `SubmissionStore` (RFC 8621 §6–7);
 //! - `push` — EventSource и WebSocket (RFC 8620 §7, RFC 8887) по шине уведомлений;
 //! - `fuzz` — проверки разбора для целей cargo-fuzz `crates/tp-jmap/fuzz` (JMAP-09; не API);
+//! - `audit` — запись действий с ящиком в `MailboxAudit` (JMAP-18): отправка от чужого адреса, по политике — удаление,
+//!   перенос, отправка и изменение правил владельцем;
 //! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`
 //!   (подпись профиля ключом TLS — [`ProfileSigner`], [`Jmap::with_profile_signer`]);
 //! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
@@ -27,10 +30,15 @@
 //!   (`tp_dav::itip`, [`Jmap::with_schedule`]), ParticipantIdentity/get, CalendarEventNotification/get, changes, set
 //!   по входящим планирования;
 //! - `sieve` — SieveScript/get, set, query, validate (RFC 9661) поверх `SieveStore` и проверки `tp_sieve`;
+//! - `sender_lists` — SenderList/get, set: личные списки надёжных и заблокированных отправителей, capability
+//!   `urn:thepost:senderlists`, [`Jmap::with_sender_lists`];
+//! - `orgchart` — OrgUnit/get: дерево подразделений с членами по старшинству, capability `urn:thepost:orgchart`,
+//!   [`Jmap::with_org`];
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
 //! Протокол — JSON поверх HTTP: типы запросов и ответов — `serde_json`, HTTP — `axum`.
 
+mod audit;
 mod autoconfig;
 mod blob;
 mod calendar_event;
@@ -45,9 +53,11 @@ mod email_set;
 #[doc(hidden)]
 pub mod fuzz;
 mod mailbox;
+mod orgchart;
 mod principal;
 mod push;
 mod scheduling;
+mod sender_lists;
 mod settings;
 mod sieve;
 pub mod submission;
@@ -62,8 +72,8 @@ pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
 
 use crate::core::error::MethodResult;
 use crate::core::{
-    AVAILABILITY, CALENDARS, CONTACTS, CORE, Ctx, MAIL, PRINCIPALS, SETTINGS, SIEVE, SUBMISSION,
-    VACATION,
+    AVAILABILITY, CALENDARS, CONTACTS, CORE, Ctx, MAIL, ORG_CHART, PRINCIPALS, SENDER_LISTS,
+    SETTINGS, SIEVE, SUBMISSION, VACATION,
 };
 
 /// Встроенные методы и их capability.
@@ -88,11 +98,15 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("Identity/get", SUBMISSION),
     ("Identity/set", SUBMISSION),
     ("EmailSubmission/get", SUBMISSION),
+    ("EmailSubmission/changes", SUBMISSION),
     ("EmailSubmission/set", SUBMISSION),
     ("EmailSubmission/query", SUBMISSION),
     ("EmailSubmission/queryChanges", SUBMISSION),
     ("UserSettings/get", SETTINGS),
     ("UserSettings/set", SETTINGS),
+    ("SenderList/get", SENDER_LISTS),
+    ("SenderList/set", SENDER_LISTS),
+    ("OrgUnit/get", ORG_CHART),
     ("VacationResponse/get", VACATION),
     ("VacationResponse/set", VACATION),
     ("SieveScript/get", SIEVE),
@@ -156,11 +170,15 @@ pub(crate) async fn call_builtin(
         "Identity/get" => submission::identity_get(ctx, args).await,
         "Identity/set" => submission::identity_set(ctx, args).await,
         "EmailSubmission/get" => submission::submission_get(ctx, args).await,
+        "EmailSubmission/changes" => submission::submission_changes(ctx, args).await,
         "EmailSubmission/set" => submission::submission_set(ctx, args).await,
         "EmailSubmission/query" => submission::submission_query(ctx, args).await,
         "EmailSubmission/queryChanges" => submission::submission_query_changes(ctx, args).await,
         "UserSettings/get" => settings::get(ctx, args).await,
         "UserSettings/set" => settings::set(ctx, args).await,
+        "SenderList/get" => sender_lists::get(ctx, args).await,
+        "SenderList/set" => sender_lists::set(ctx, args).await,
+        "OrgUnit/get" => orgchart::get(ctx, args).await,
         "VacationResponse/get" => vacation::get(ctx, args).await,
         "VacationResponse/set" => vacation::set(ctx, args).await,
         "SieveScript/get" => sieve::get(ctx, args).await,
