@@ -9,6 +9,9 @@
 //! по локальному сокету и сессия), действует на следующую сессию SMTP; правила потока почты тестового модуля
 //! (`Registry::mail_flow`) вызываются один раз на письмо.
 //!
+//! Планирование встреч (APP-28): приглашение из CalDAV и JMAP — участнику организации в календарь, внешнему —
+//! письмом iMIP в очередь исходящей почты.
+//!
 //! Без `TEST_DATABASE_URL` тесты пропускаются.
 
 use std::path::{Path, PathBuf};
@@ -1449,6 +1452,268 @@ async fn sieve_rules_and_vacation() {
     let report = running.wait().await.expect("wait");
     assert!(report.failed.is_empty(), "{report:?}");
     pool.close().await;
+    drop_database(&url, &db_name).await;
+}
+
+// ---------- APP-28: планирование встреч ----------
+
+/// Запрос DAV с телом iCalendar и дополнительными заголовками `headers` (строки с `\r\n`): ответ целиком.
+async fn dav_send(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    authorization: &str,
+    headers: &str,
+    ics: &str,
+) -> String {
+    let mut s = TcpStream::connect(addr).await.expect("dav connect");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\n\
+         Content-Type: text/calendar; charset=utf-8\r\n{headers}\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{ics}",
+        ics.len()
+    );
+    s.write_all(req.as_bytes()).await.expect("dav write");
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await.expect("dav read");
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// Адреса ответа `PROPFIND`.
+fn dav_hrefs(listing: &str) -> Vec<String> {
+    listing
+        .split("<d:href>")
+        .skip(1)
+        .filter_map(|r| r.split("</d:href>").next().map(str::to_owned))
+        .collect()
+}
+
+/// Календари дома `home` (без самого дома, входящих и исходящих планирования).
+async fn dav_calendars(web: std::net::SocketAddr, home: &str, basic: &str) -> Vec<String> {
+    let listed = dav(web, "PROPFIND", home, basic, "1").await;
+    assert!(listed.starts_with("HTTP/1.1 207"), "{listed}");
+    dav_hrefs(&listed)
+        .into_iter()
+        .filter(|h| h != home && !h.ends_with("/inbox/") && !h.ends_with("/outbox/"))
+        .collect()
+}
+
+/// Объект календаря с `UID:{uid}` в доме `home`: текст iCalendar.
+async fn dav_event(
+    web: std::net::SocketAddr,
+    home: &str,
+    basic: &str,
+    uid: &str,
+) -> Option<String> {
+    for calendar in dav_calendars(web, home, basic).await {
+        let objects = dav(web, "PROPFIND", &calendar, basic, "1").await;
+        for href in dav_hrefs(&objects)
+            .into_iter()
+            .filter(|h| h.ends_with(".ics"))
+        {
+            let ics = dav(web, "GET", &href, basic, "0").await;
+            if ics.contains(&format!("UID:{uid}")) {
+                return Some(ics);
+            }
+        }
+    }
+    None
+}
+
+/// Планирование встреч в узле (APP-28): организатор создаёт встречу в CalDAV (`PUT`) и в JMAP
+/// (`sendSchedulingMessages`) — участник организации получает событие в свой календарь, внешнему участнику письмо
+/// iMIP ставится в очередь исходящей почты; `POST` в исходящие планирования разрешён.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn meeting_scheduling() {
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = Arc::new(MemSecretStore::default());
+    let db: SecretRef = "thepost/db#password".parse().expect("ref");
+    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+
+    let domain = "example.ru".to_owned();
+    let path = dir.path().join("config.yaml");
+    // Без роли smtp-out: письма iMIP остаются в очереди, их никто не забирает. Без роли admin — сокет
+    // `admin init` не нужен.
+    let text = config(dir.path(), &db_url, &domain).replace(
+        "roles: [all]",
+        "roles: [smtp-in, imap, jmap, dav, search, indexer, maintenance]",
+    );
+    assert!(!text.contains("roles: [all]"), "{text}");
+    std::fs::write(&path, text).expect("config");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+
+    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let tenant = TenantId::DEFAULT;
+    let domain_id = DomainId::new();
+    let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
+    sqlx::query("INSERT INTO domains (tenant_id, domain_id, name) VALUES ($1, $2, $3)")
+        .bind(tenant.as_uuid())
+        .bind(domain_id.as_uuid())
+        .bind(&domain)
+        .execute(&mut *tx)
+        .await
+        .expect("domain");
+    tx.commit().await.expect("commit");
+    let apps =
+        tp_auth::AppPasswords::new(Arc::new(meta.clone()), tp_auth::PasswordConfig::default())
+            .expect("app passwords");
+    let mut users = Vec::new();
+    for name in ["alice", "bob"] {
+        let login = format!("{name}@{domain}");
+        let account = meta
+            .upsert(
+                tenant,
+                AccountUpsert {
+                    domain: domain_id,
+                    login: login.clone(),
+                    display_name: name.to_owned(),
+                    external_id: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("account");
+        let scope = AccountScope {
+            tenant,
+            account: account.id,
+        };
+        let (_, secret) = apps.issue(scope, "e2e").await.expect("issue");
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("{login}:{}", secret.expose()));
+        users.push((login, account.id.to_string(), auth));
+    }
+    let (alice, alice_id, alice_auth) = users[0].clone();
+    let (bob, _, bob_auth) = users[1].clone();
+    let web = addr(&running, "jmap");
+    let alice_basic = format!("Basic {alice_auth}");
+    let bob_basic = format!("Basic {bob_auth}");
+    let alice_home = format!("/dav/calendars/{alice}/");
+    let bob_home = format!("/dav/calendars/{bob}/");
+    let external = "carol@external.test";
+    let external_jmap = "dave@external.test";
+
+    // 1. CalDAV: организатор кладёт встречу в свой календарь — сервер рассылает приглашения сам.
+    let calendars = dav_calendars(web, &alice_home, &alice_basic).await;
+    let calendar = calendars
+        .first()
+        .unwrap_or_else(|| panic!("нет календаря по умолчанию: {calendars:?}"));
+    let ics = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//thepost//e2e//EN\r\nBEGIN:VEVENT\r\n\
+         UID:app-28-dav\r\nDTSTAMP:20261112T100000Z\r\nDTSTART:20270111T070000Z\r\n\
+         DTEND:20270111T080000Z\r\nSEQUENCE:0\r\nSUMMARY:Planning DAV\r\n\
+         ORGANIZER:mailto:{alice}\r\n\
+         ATTENDEE;PARTSTAT=ACCEPTED:mailto:{alice}\r\n\
+         ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{bob}\r\n\
+         ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{external}\r\n\
+         END:VEVENT\r\nEND:VCALENDAR\r\n"
+    );
+    let put = dav_send(
+        web,
+        "PUT",
+        &format!("{calendar}app-28-dav.ics"),
+        &alice_basic,
+        "If-None-Match: *\r\n",
+        &ics,
+    )
+    .await;
+    assert!(put.starts_with("HTTP/1.1 201"), "{put}");
+    // Участник организации: событие в его календаре, ответа ещё нет.
+    let invited = dav_event(web, &bob_home, &bob_basic, "app-28-dav")
+        .await
+        .expect("приглашение в календаре участника");
+    assert!(invited.contains("SUMMARY:Planning DAV"), "{invited}");
+    assert!(invited.contains("NEEDS-ACTION"), "{invited}");
+    // Внешний участник: письмо iMIP в очереди исходящей почты; участнику организации письмо не ставится.
+    assert_eq!(queued(&pool, external).await, 1);
+    assert_eq!(queued(&pool, &bob).await, 0);
+    // Итог рассылки записан в объект организатора (`SCHEDULE-STATUS`).
+    let mine = dav_event(web, &alice_home, &alice_basic, "app-28-dav")
+        .await
+        .expect("событие организатора");
+    assert!(mine.contains("SCHEDULE-STATUS"), "{mine}");
+
+    // 2. Занятость (`POST` VFREEBUSY в исходящие планирования; без планирования — 403): у организатора занято
+    // время встречи, о внешнем адресе сведений нет (`3.7`).
+    let request = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//thepost//e2e//EN\r\nMETHOD:REQUEST\r\n\
+         BEGIN:VFREEBUSY\r\nUID:app-28-fb\r\nDTSTAMP:20261112T100000Z\r\n\
+         DTSTART:20270111T000000Z\r\nDTEND:20270112T000000Z\r\nORGANIZER:mailto:{bob}\r\n\
+         ATTENDEE:mailto:{alice}\r\nATTENDEE:mailto:{external}\r\n\
+         END:VFREEBUSY\r\nEND:VCALENDAR\r\n"
+    );
+    let busy = dav_send(
+        web,
+        "POST",
+        &format!("{bob_home}outbox/"),
+        &bob_basic,
+        "",
+        &request,
+    )
+    .await;
+    assert!(busy.starts_with("HTTP/1.1 200"), "{busy}");
+    assert!(busy.contains("schedule-response"), "{busy}");
+    assert!(busy.contains("20270111T070000Z/20270111T080000Z"), "{busy}");
+    assert!(busy.contains("3.7"), "{busy}");
+
+    // 3. JMAP: `sendSchedulingMessages` — те же получатели тем же путём.
+    let jmap = Jmap {
+        addr: web,
+        auth: alice_auth,
+        account: alice_id,
+    };
+    let set = jmap
+        .call(
+            "CalendarEvent/set",
+            json!({ "accountId": jmap.account, "sendSchedulingMessages": true, "create": { "e": {
+                "uid": "app-28-jmap", "title": "Planning JMAP",
+                "start": "2027-01-12T10:00:00", "timeZone": "Europe/Moscow", "duration": "PT1H",
+                "organizerCalendarAddress": format!("mailto:{alice}"),
+                "participants": {
+                    "o": { "@type": "Participant", "name": "Alice",
+                           "calendarAddress": format!("mailto:{alice}"), "roles": { "owner": true } },
+                    "b": { "@type": "Participant", "name": "Bob",
+                           "calendarAddress": format!("mailto:{bob}"), "roles": { "attendee": true },
+                           "participationStatus": "needs-action", "expectReply": true },
+                    "x": { "@type": "Participant", "name": "Dave",
+                           "calendarAddress": format!("mailto:{external_jmap}"),
+                           "roles": { "attendee": true },
+                           "participationStatus": "needs-action", "expectReply": true },
+                },
+            } } }),
+        )
+        .await;
+    assert!(set["created"]["e"]["id"].is_string(), "{set}");
+    let invited = dav_event(web, &bob_home, &bob_basic, "app-28-jmap")
+        .await
+        .expect("приглашение из JMAP в календаре участника");
+    assert!(invited.contains("SUMMARY:Planning JMAP"), "{invited}");
+    assert_eq!(queued(&pool, external_jmap).await, 1);
+    assert_eq!(queued(&pool, &bob).await, 0);
+    pool.close().await;
+    shutdown.cancel();
+    let report = running.wait().await.expect("report");
+    assert!(report.failed.is_empty(), "{report:?}");
     drop_database(&url, &db_name).await;
 }
 
