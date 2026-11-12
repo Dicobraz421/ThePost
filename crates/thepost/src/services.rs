@@ -119,6 +119,8 @@ pub struct Services {
     pub rules: Arc<tp_sieve::Rules>,
     /// Лимиты проверки текста скрипта в Admin API — секция `sieve` (те же, что при доставке).
     pub sieve_limits: tp_sieve::Limits,
+    /// Секция `sieve` на момент запуска: слушатели и лимиты сеансов ManageSieve (APP-27).
+    pub sieve: Arc<tp_sieve::SieveConfig>,
 }
 
 impl std::fmt::Debug for Services {
@@ -297,6 +299,7 @@ impl Services {
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
         let sieve = (*cfg.section::<tp_sieve::SieveConfig>(SIEVE)?).clone();
         let sieve_limits = sieve.limits();
+        let sieve_section = Arc::new(sieve.clone());
         let rules = Arc::new(
             tp_sieve::Rules::new(Arc::new(meta.clone()), Arc::new(meta.clone()), sieve)
                 .with_node(smtp.hostname.clone()),
@@ -332,6 +335,7 @@ impl Services {
             mail_flow: ext.mail_flow(),
             rules,
             sieve_limits,
+            sieve: sieve_section,
         })
     }
 
@@ -442,6 +446,22 @@ impl Services {
         }
     }
 
+    /// ManageSieve в роли imap (APP-27): вход — SASL узла (служба `sieve` задаётся сеансом `tp-sieve`; проверка —
+    /// через защиту от перебора [`Guarded`], как у IMAP), скрипты — `PgMeta`.
+    pub fn managesieve(
+        &self,
+        profile: tp_contracts::tls::Profile,
+    ) -> crate::protocols::ManageSieveSetup {
+        crate::protocols::ManageSieveSetup {
+            deps: tp_sieve::managesieve::Deps {
+                sasl: self.sasl.clone(),
+                store: Arc::new(self.meta.clone()),
+            },
+            config: self.sieve.clone(),
+            profile,
+        }
+    }
+
     /// Зависимости расширений IMAP: QUOTA (учётные записи), ACL и общие папки (ACL папок, единый слой
     /// авторизации). Без них `tp-imap` эти возможности не объявляет.
     pub fn imap_extensions(&self) -> tp_imap::Extensions {
@@ -490,7 +510,10 @@ impl Services {
             .with_mail_flow(self.mail_flow.clone())
             .with_profile_signer(crate::profile_signer::profile_signer(certs))
             // VacationResponse и SieveScript (JMAP-23, JMAP-24): автоответ из Postman.
-            .with_sieve(Some(Arc::new(self.meta.clone()))))
+            .with_sieve(Some(Arc::new(self.meta.clone())))
+            // Контакты и календари (JMAP-25…29) — то же хранилище, что у CalDAV и CardDAV; занятость — JMAP-30.
+            .with_dav(Some(Arc::new(self.meta.clone())))
+            .with_freebusy(Some(Arc::new(self.meta.clone()))))
     }
 
     /// Маршруты календарей и контактов (CalDAV, CardDAV; APP-29): хранилище — `PgMeta`, вход — тот же, что у
