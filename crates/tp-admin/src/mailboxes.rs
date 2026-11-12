@@ -281,7 +281,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
     )
     .route("/api/v1/orgs/{org}/sync-hold", get(get_sync_hold))
     .route("/api/v1/orgs/{org}/sync-hold/approve", post(approve_sync))
-    .route(MAILBOX_AUDIT_ROUTE, get(search_audit))
+    .route(MAILBOX_AUDIT_ROUTE, get(search_mailbox_audit))
     .route(
         "/api/v1/orgs/{org}/mailbox-audit/policy",
         put(put_org_audit_policy).delete(delete_org_audit_policy),
@@ -305,7 +305,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         attach_disabled,
         get_sync_hold,
         approve_sync,
-        search_audit,
+        search_mailbox_audit,
         put_org_audit_policy,
         delete_org_audit_policy,
         get_audit_policy,
@@ -447,7 +447,7 @@ async fn approve_sync(
     params(("org" = String, Path, description = "Организация (UUID)"), MailboxAuditQuery),
     responses((status = 200, body = MailboxAuditPage), (status = 400, body = Problem),
         (status = 503, body = Problem)))]
-async fn search_audit(
+async fn search_mailbox_audit(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
     Query(q): Query<MailboxAuditQuery>,

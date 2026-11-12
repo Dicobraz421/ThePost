@@ -929,6 +929,23 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
     }
 
+    /// Каждая операция схемы — с `operationId`, без повторов (по нему консоль и CLI называют операции).
+    #[test]
+    fn operation_ids_unique() {
+        let spec = serde_json::to_value(openapi_spec()).expect("spec");
+        let mut seen = std::collections::BTreeMap::new();
+        let mut dups = Vec::new();
+        for (path, item) in spec["paths"].as_object().expect("paths") {
+            for (method, op) in item.as_object().expect("item") {
+                let id = op["operationId"].as_str().expect("operationId").to_owned();
+                if let Some(prev) = seen.insert(id.clone(), format!("{method} {path}")) {
+                    dups.push(format!("{id}: {prev} и {method} {path}"));
+                }
+            }
+        }
+        assert!(dups.is_empty(), "{dups:#?}");
+    }
+
     #[tokio::test]
     async fn openapi_without_login() {
         let env = Env::new();
