@@ -35,6 +35,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tp_contracts::audit::{AuditAction, AuditObject};
 use tp_contracts::auth::SendRight;
 use tp_contracts::delivery::{DeliveryDecision, DeliveryEvent, DeliveryEventKind};
 use tp_contracts::ext::{CopyTo, Decision, SubmissionInfo};
@@ -55,7 +56,7 @@ use crate::email_get::{collect, utc_date};
 
 // ---------- Identity ----------
 
-fn identity_id(login: &str) -> String {
+pub(crate) fn identity_id(login: &str) -> String {
     format!("I{}", digest(login.to_lowercase().as_bytes()))
 }
 
@@ -928,7 +929,8 @@ async fn submit_one(
     };
     let mut raw = collect(d.store.fetch_raw(ctx.scope, msg.id, None).await?).await?;
 
-    // Адреса из заголовков.
+    // Адреса из заголовков; Message-ID — пояснение записи аудита.
+    let message_id;
     let (from, sender, header_rcpts) = {
         let Some(parsed) = MessageParser::default().parse_headers(&raw) else {
             return Ok(Err(set_error("invalidEmail", None, &[])));
@@ -950,6 +952,7 @@ async fn submit_one(
         {
             rcpts.extend(list.iter().filter_map(|a| a.address()).map(str::to_owned));
         }
+        message_id = parsed.message_id().and_then(crate::audit::detail);
         (from, sender, rcpts)
     };
     let Some(from) = from else {
@@ -1055,6 +1058,7 @@ async fn submit_one(
             // Принято без отправки: запись окончательная, срока выпуска нет.
             record.delivery = Submitted::all(&rcpts, SubmitStatus::Queued).rcpts;
             d.submissions.insert(ctx.scope, record.clone()).await?;
+            audit_send(ctx, &from, right, msg.id, message_id).await?;
             return Ok(Ok(record));
         }
         Flowed::Refuse(e) => return Ok(Err(e)),
@@ -1138,7 +1142,47 @@ async fn submit_one(
         tracing::error!(error = %e, "jmap: запись отправки не сохранена");
         return Err(e.into());
     }
+    audit_send(ctx, &from, right, msg.id, message_id).await?;
     Ok(Ok(record))
+}
+
+/// Аудит ящика (JMAP-18): отправка от адреса другой учётной записи — действие представителя в её ящике (`SendAs`,
+/// `SendOnBehalf`); от своего адреса или адреса без ящика (группа) — отправка владельца в своём ящике (`Send`).
+/// Пояснение — Message-ID письма.
+async fn audit_send(
+    ctx: &Ctx<'_>,
+    from: &str,
+    right: SendRight,
+    email: MessageId,
+    message_id: Option<String>,
+) -> MethodResult<()> {
+    let p = ctx.principal;
+    let other = match ctx.jmap.d.accounts.by_login(p.tenant, from).await? {
+        Some(a) if a.id != p.account => Some(a.id),
+        _ => None,
+    };
+    match other {
+        Some(mailbox_owner) => {
+            let action = match right {
+                SendRight::SendAs => AuditAction::SendAs,
+                SendRight::SendOnBehalf => AuditAction::SendOnBehalf,
+            };
+            let object = AuditObject {
+                detail: message_id,
+                ..AuditObject::default()
+            };
+            crate::audit::delegate(ctx, mailbox_owner, action, object).await;
+        }
+        None => {
+            let object = AuditObject {
+                mailbox: None,
+                message: Some(email),
+                detail: message_id,
+            };
+            crate::audit::owner(ctx, AuditAction::Send, object).await;
+        }
+    }
+    Ok(())
 }
 
 /// Отмена отложенной отправки (`undoStatus: canceled`): письмо снимается с очереди

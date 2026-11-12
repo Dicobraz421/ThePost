@@ -23,9 +23,9 @@ use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_testkit::{
     Clock, FakeAuthenticator, FakeSearch, MemAddressBook, MemBlobIndex, MemBlobStore, MemDav,
-    MemDeliveryLog, MemEventBus, MemItipSender, MemMetadata, MemOutbound, MemPolicies, MemQuota,
-    MemSenderLists, MemSieve, MemSubmissions, MemTrash, RecordingDecisionHook, SearchDoc,
-    SystemClock,
+    MemDeliveryLog, MemEventBus, MemItipSender, MemMailboxAudit, MemMetadata, MemOutbound,
+    MemPolicies, MemQuota, MemSenderLists, MemSieve, MemSubmissions, MemTrash,
+    RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
 use crate::{Deps, Jmap, JmapConfig};
@@ -133,6 +133,7 @@ pub struct Env {
     pub outbound: Arc<MemOutbound>,
     pub submissions: MemSubmissions,
     pub delivery_log: MemDeliveryLog,
+    pub audit: MemMailboxAudit,
     pub sender_lists: MemSenderLists,
     pub org: MemAddressBook,
     pub bus: MemEventBus,
@@ -245,6 +246,7 @@ impl Env {
         let outbound = Arc::new(MemOutbound::default());
         let submissions = MemSubmissions::new();
         let delivery_log = MemDeliveryLog::new();
+        let audit = MemMailboxAudit::new();
         let sender_lists = MemSenderLists::new();
         let org = MemAddressBook::new();
         let unpacking = Unpacking {
@@ -284,6 +286,7 @@ impl Env {
                 outbound: Some(outbound.clone()),
                 submissions: Arc::new(submissions.clone()),
                 delivery_log: Arc::new(delivery_log.clone()),
+                audit: Arc::new(audit.clone()),
                 hooks,
                 capabilities: caps,
             },
@@ -316,6 +319,7 @@ impl Env {
             outbound,
             submissions,
             delivery_log,
+            audit,
             sender_lists,
             org,
             bus,

@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tp_contracts::addressbook::OrgStore;
+use tp_contracts::audit::MailboxAudit;
 use tp_contracts::auth::{Authenticator, Authorizer, Principal};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::bus::EventBus;
@@ -130,6 +131,8 @@ pub struct Deps {
     pub submissions: Arc<dyn SubmissionStore>,
     /// Журнал доставки: статусы получателей отправок (`EmailSubmission.deliveryStatus`).
     pub delivery_log: Arc<dyn DeliveryLog>,
+    /// Аудит доступа к ящику: действия не владельца и, по политике, владельца (SRS 5.2).
+    pub audit: Arc<dyn MailboxAudit>,
     /// Точки принятия решений модулей (`on_submission`; `before_final_delete` при очистке корзины).
     pub hooks: DecisionHooks,
     /// Capability модулей (`Registry::jmap_capabilities`).

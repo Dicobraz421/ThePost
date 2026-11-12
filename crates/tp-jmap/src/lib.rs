@@ -11,6 +11,8 @@
 //!   отложенная (`sendAt`, отмена) через [`Outbound`](tp_contracts::queue::Outbound), записи — `SubmissionStore` (RFC 8621 §6–7);
 //! - `push` — EventSource и WebSocket (RFC 8620 §7, RFC 8887) по шине уведомлений;
 //! - `fuzz` — проверки разбора для целей cargo-fuzz `crates/tp-jmap/fuzz` (JMAP-09; не API);
+//! - `audit` — запись действий с ящиком в `MailboxAudit` (JMAP-18): отправка от чужого адреса, по политике — удаление,
+//!   перенос, отправка и изменение правил владельцем;
 //! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`
 //!   (подпись профиля ключом TLS — [`ProfileSigner`], [`Jmap::with_profile_signer`]);
 //! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
@@ -36,6 +38,7 @@
 //!
 //! Протокол — JSON поверх HTTP: типы запросов и ответов — `serde_json`, HTTP — `axum`.
 
+mod audit;
 mod autoconfig;
 mod blob;
 mod calendar_event;
