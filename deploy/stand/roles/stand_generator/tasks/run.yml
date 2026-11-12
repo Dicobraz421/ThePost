@@ -69,6 +69,16 @@
       retries: 60
       delay: 5
 
+# Сценарий, зонды и отчёт — версии из этого клона и без --tags install.
+- name: Install scenario scripts
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ stand_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: [jmap.js, probe.js, run-scenario.sh, probes.py, criteria.py]
+
 - name: Write stand parameters
   ansible.builtin.template:
     src: stand.env.j2
