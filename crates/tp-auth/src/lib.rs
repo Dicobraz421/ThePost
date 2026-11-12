@@ -229,7 +229,7 @@ pub(crate) mod testutil {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use tp_contracts::meta::{AccountStore, AccountUpsert};
+    use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
     use tp_contracts::{AccountId, DomainId, Result, TenantId};
     use tp_testkit::{MemMetadata, SystemClock};
 
@@ -263,6 +263,7 @@ pub(crate) mod testutil {
                         external_id: None,
                         enabled: *enabled,
                         aliases: Vec::new(),
+                        kind: AccountKind::User,
                     },
                 )
                 .await

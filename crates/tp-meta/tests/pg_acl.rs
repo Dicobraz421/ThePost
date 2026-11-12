@@ -2,7 +2,7 @@
 
 mod common;
 
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_testkit::suite::{AclFixture, acl_store};
 
 #[tokio::test]
@@ -22,6 +22,7 @@ async fn passes_contract_suite() {
                 external_id: None,
                 enabled: true,
                 aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await

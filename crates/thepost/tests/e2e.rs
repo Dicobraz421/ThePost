@@ -32,7 +32,9 @@ use tp_contracts::delivery::{DeliveryEventKind, DeliveryLog, DeliveryQuery};
 use tp_contracts::ext::{DecisionHooks, Migration, Module, ModuleCtx, Registry};
 use tp_contracts::ids::DomainId;
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, MessageStore, Policy};
+use tp_contracts::meta::{
+    AccountKind, AccountScope, AccountStore, AccountUpsert, MessageStore, Policy,
+};
 use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::secrets::{SecretRef, SecretStore};
@@ -583,6 +585,7 @@ async fn mvp_mail_flow() {
                 external_id: None,
                 enabled: true,
                 aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -901,6 +904,7 @@ async fn mvp_mail_flow() {
                 external_id: None,
                 enabled: true,
                 aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await

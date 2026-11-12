@@ -365,7 +365,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn purge_removes_expired_dav_tombstones_and_vacation_log() {
         use tp_contracts::dav::{Collection, CollectionKind, DavStore};
-        use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+        use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
         use tp_contracts::sieve::VacationLog;
         use tp_contracts::{DomainId, TenantId};
 
@@ -409,6 +409,7 @@ mod tests {
                     external_id: None,
                     enabled: true,
                     aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await

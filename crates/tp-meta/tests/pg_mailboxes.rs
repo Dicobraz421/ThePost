@@ -2,7 +2,9 @@
 
 mod common;
 
-use tp_contracts::meta::{AccountStore, AccountUpsert, MailboxStore, NewMailbox, SpecialUse};
+use tp_contracts::meta::{
+    AccountKind, AccountStore, AccountUpsert, MailboxStore, NewMailbox, SpecialUse,
+};
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Uid};
 
 #[tokio::test]
@@ -21,6 +23,7 @@ async fn upsert_creates_system_folders_and_matches() {
         external_id: Some("guid-1".into()),
         enabled: true,
         aliases: Vec::new(),
+        kind: AccountKind::User,
     };
     let acc = meta.upsert(tenant, data.clone()).await.expect("upsert");
     assert_eq!(acc.tenant, tenant);

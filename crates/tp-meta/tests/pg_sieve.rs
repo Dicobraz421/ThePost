@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::{AssertSqlSafe, PgPool};
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::sieve::{SieveStore, Vacation, VacationLog};
 use tp_contracts::{DomainId, Error, TenantId};
 use tp_meta::sieve::SieveConfig;
@@ -35,6 +35,7 @@ async fn account_in(meta: &PgMeta, tenant: TenantId, domain: (DomainId, &str)) -
                 external_id: None,
                 enabled: true,
                 aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await

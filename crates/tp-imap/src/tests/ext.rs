@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tp_contracts::acl::AclStore;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountStore, AccountUpsert, Flag, Flags, MailboxStore, MessageQuery,
-    MessageStore, NewMailbox, QuotaUsage, SpecialUse,
+    Account, AccountKind, AccountScope, AccountStore, AccountUpsert, Flag, Flags, MailboxStore,
+    MessageQuery, MessageStore, NewMailbox, QuotaUsage, SpecialUse,
 };
 use tp_contracts::{AccountId, DomainId, MailboxId, Result, TenantId};
 use tp_testkit::{MemAcl, MemMetadata};
@@ -172,6 +172,7 @@ impl Ext {
                     external_id: None,
                     enabled: true,
                     aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await

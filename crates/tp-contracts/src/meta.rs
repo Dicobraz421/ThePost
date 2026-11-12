@@ -42,6 +42,17 @@ pub struct AccountScope {
 
 // ---------- Учётные записи ----------
 
+/// Вид учётной записи (CTR-48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKind {
+    /// Пользователь (или общий ящик).
+    User,
+    /// Ресурс: переговорная, оборудование (iCalendar `CUTYPE=ROOM`, `RESOURCE`). Приглашения обрабатываются по
+    /// правилам бронирования ([`crate::sharing::BookingPolicy`], [`crate::sharing::ResourceStore`]).
+    Resource,
+}
+
 /// Учётная запись.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
@@ -63,6 +74,8 @@ pub struct Account {
     /// основного, — в нижнем регистре, без повторов и catch-all `@domain`, в порядке каталога. Задаёт
     /// [`AccountUpsert::aliases`]; все адреса учётной записи — [`Account::addresses`].
     pub aliases: Vec<String>,
+    /// Вид (CTR-48): пользователь или ресурс. Задаёт [`AccountUpsert::kind`].
+    pub kind: AccountKind,
 }
 
 impl Account {
@@ -91,6 +104,8 @@ pub struct AccountUpsert {
     /// приводит их правилом [`account_addresses`] (нижний регистр, без повторов, основного адреса и catch-all) —
     /// [`Account::aliases`].
     pub aliases: Vec<String>,
+    /// Вид учётной записи (CTR-48); при обновлении заменяет прежний.
+    pub kind: AccountKind,
 }
 
 /// Состояние ящика учётной записи (CTR-35, решение 2026-11-04-exchange-parity «Удалённые ящики»).

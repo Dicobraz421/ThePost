@@ -5,7 +5,7 @@ mod common;
 
 use sqlx::PgPool;
 use tp_contracts::meta::{
-    AccountScope, AccountStore, AccountUpsert, ChangeLog, MailboxStore, SpecialUse,
+    AccountKind, AccountScope, AccountStore, AccountUpsert, ChangeLog, MailboxStore, SpecialUse,
 };
 use tp_contracts::{AccountId, DomainId, TenantId};
 use tp_meta::{PgMeta, schema};
@@ -140,6 +140,7 @@ async fn raw_account_with_inbox_filled_on_login() {
                 external_id: None,
                 enabled: true,
                 aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -183,6 +184,7 @@ async fn raw_account_with_inbox_filled_on_login() {
             external_id: None,
             enabled: true,
             aliases: Vec::new(),
+            kind: AccountKind::User,
         },
     )
     .await

@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tp_contracts::auth::Principal;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, MailStore};
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse};
+use tp_contracts::meta::{
+    AccountKind, AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse,
+};
 use tp_contracts::{DomainId, Error, MailboxId, Result, TenantId};
 use tp_mailstore::Store;
 use tp_testkit::SearchDoc;
@@ -118,6 +120,7 @@ impl Env {
                     external_id: None,
                     enabled: true,
                     aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await

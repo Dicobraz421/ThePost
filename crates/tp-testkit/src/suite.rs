@@ -54,7 +54,7 @@ use tp_contracts::groups::{
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountState, AccountStore, AccountUpsert, ExistingContent,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, ExistingContent,
     MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, PolicyResolver, SpecialUse,
 };
 use tp_contracts::queue::{
@@ -2231,6 +2231,7 @@ pub async fn account_external_id(
         external_id: Some(ext.clone()),
         enabled: true,
         aliases: Vec::new(),
+        kind: AccountKind::User,
     };
     assert_eq!(
         accounts
@@ -2280,6 +2281,28 @@ pub async fn account_external_id(
         Ok(Some(aliased))
     );
     // Запись заменяет псевдонимы.
+    assert_eq!(
+        accounts.upsert(fx.tenant, upsert(login("anna"))).await,
+        Ok(a.clone())
+    );
+    // Вид учётной записи (CTR-48) хранится с ней и заменяется записью.
+    assert_eq!(a.kind, AccountKind::User);
+    let room = accounts
+        .upsert(
+            fx.tenant,
+            AccountUpsert {
+                kind: AccountKind::Resource,
+                ..upsert(login("anna"))
+            },
+        )
+        .await
+        .expect("upsert");
+    assert_eq!(room.kind, AccountKind::Resource);
+    assert_eq!(accounts.get(fx.tenant, a.id).await, Ok(Some(room.clone())));
+    assert_eq!(
+        accounts.by_login(fx.tenant, &room.login).await,
+        Ok(Some(room))
+    );
     assert_eq!(
         accounts.upsert(fx.tenant, upsert(login("anna"))).await,
         Ok(a.clone())
@@ -2389,6 +2412,7 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                     external_id: None,
                     enabled: true,
                     aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await
@@ -2405,6 +2429,7 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                 external_id: None,
                 enabled: true,
                 aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -4077,6 +4102,7 @@ pub async fn account_state(
         external_id: Some(format!("{n}-{run}")),
         enabled: true,
         aliases: Vec::new(),
+        kind: AccountKind::User,
     };
     let scope = |account| AccountScope { tenant: t, account };
     let until = OffsetDateTime::now_utc()

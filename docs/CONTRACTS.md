@@ -81,6 +81,8 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   правило хранения — `meta::account_aliases(primary, aliases)`). Адреса, на которые учётной записи доставляется почта, —
   `Account::addresses()`: основной (имя входа) первым, затем псевдонимы, правило — `meta::account_addresses(primary, aliases)`.
   Отдельного метода хранилища нет. Потребитель — DAV-23 (`calendar-user-address-set`).
+  Вид учётной записи (CTR-48) — поле `Account::kind: AccountKind::{User, Resource}` (ресурс — переговорная, оборудование), задаётся
+  `AccountUpsert::kind` и заменяется при обновлении; правила бронирования ресурса — раздел Sharing.
   Состояние ящика (CTR-35, «Удалённые ящики» решения 2026-11-04-exchange-parity): `AccountState::{Active, Disabled { until }}` —
   отключённый ящик (учётная запись исчезла из каталога): вход и приём почты запрещены независимо от `enabled`, нет в GAL, хранится до
   `until` (по умолчанию 30 дней — политика синхронизации). `account_state` (по умолчанию — через `get`, всегда `Active`),
@@ -669,8 +671,10 @@ SRS 4.4, 4.5; APP-I «Политики общего доступа к кален
 владельца (CalDAV `calendar-proxy-read`/`-write`) и планирование от его имени (`SENT-BY`); `Delegate::rights()` — `READ` или `WRITE`
 плюс `schedule`. `DelegateStore`: `delegates(owner)`, `set_delegate(owner, Delegate)` (сам себе — `Invalid`), `remove_delegate(owner,
 delegate)`, `delegations(delegate) -> Vec<Delegation { owner, level, schedule_on_behalf }>` (`calendar-proxy-*-for`).
-Ресурсы (переговорные): `AccountKind::{User, Resource}`; `ResourceStore`: `account_kind(scope)`, `booking_policy(scope) ->
-Option<BookingPolicy>`, `set_booking_policy(scope, Option<_>)` (учётная запись — ресурс, пока заданы правила), `resources(tenant)`.
+Ресурсы (переговорные) — учётные записи вида `meta::AccountKind::Resource`: вид — поле `Account::kind`, задаётся `AccountUpsert::kind`
+(раздел Metadata), отдельного метода нет. `ResourceStore` — правила бронирования: `booking_policy(scope) -> Option<BookingPolicy>`
+(`None` — не заданы или не ресурс), `set_booking_policy(scope, Option<_>)` (учётная запись не ресурс — `Invalid`; вид правила не
+меняют), `resources(tenant)` — учётные записи вида `Resource`.
 `BookingPolicy { auto_accept, allow_conflicts, max_duration: Option<_>, horizon: Option<_>, bookers: Bookers::{Internal, Only { accounts,
 groups }}, working_hours: Option<WorkingHours { timezone (IANA), days: BTreeSet<DayOfWeek>, from, to }> }` (`#[serde(default)]`,
 длительности — humantime; по умолчанию — автоматическое принятие без пересечений, до 24 ч, на 180 дней вперёд, круглосуточно, все учётные
@@ -910,5 +914,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `tp_platform::service_http` передаёт обработчикам адрес соединения (`ConnectInfo<SocketAddr>`).
 - 2026-11-12 — CTR-48 (волна contracts-35): раздел Sharing, модуль `sharing` — `CollectionRights`, `CollectionAcl` (права на коллекции,
   `shared_with`), представители (`Delegate`, `DelegateStore`), ресурсы (`AccountKind`, `BookingPolicy::decide`, `ResourceStore`), политика
-  организации (`SharingPolicy`, `SharingPolicyStore`). По сравнению с карточкой: вид учётной записи — метод `ResourceStore::account_kind`,
-  а не поле `Account` (существующий код не меняется); реализации в памяти и наборы — отдельной волной `tp-testkit`.
+  организации (`SharingPolicy`, `SharingPolicyStore`). Вид учётной записи — поле `Account::kind` и `AccountUpsert::kind`
+  (`meta::AccountKind`), хранится с учётной записью (`tp-meta` — миграция 0026 `accounts.kind`, `tp-testkit`); несовместимо: новые
+  обязательные поля `Account` и `AccountUpsert`. Реализации новых хранилищ в памяти и наборы — отдельной волной `tp-testkit`.

@@ -5,8 +5,9 @@
 //!   без записей — это правило слоя авторизации, хранилище его не хранит.
 //! - [`DelegateStore`] — представители учётной записи (CalDAV `calendar-proxy-read`, `calendar-proxy-write`; Outlook
 //!   «делегаты»): доступ ко всем календарям владельца и планирование от его имени.
-//! - [`ResourceStore`] — ресурсы (переговорные): вид учётной записи [`AccountKind`] и правила бронирования
-//!   [`BookingPolicy`]; решение по приглашению — [`BookingPolicy::decide`].
+//! - [`ResourceStore`] — правила бронирования [`BookingPolicy`] ресурсов (переговорных) — учётных записей вида
+//!   [`AccountKind::Resource`] ([`Account::kind`](crate::meta::Account::kind)); решение по приглашению —
+//!   [`BookingPolicy::decide`].
 //! - [`SharingPolicy`] — политика организации на общий доступ (APP-I «Политики общего доступа к календарям»).
 //!
 //! Права проверяет единый слой авторизации (`tp-auth`), хранилища только хранят записи; реализации — `tp-meta`,
@@ -25,6 +26,8 @@ use crate::config::duration;
 use crate::dav::CollectionId;
 use crate::error::{Error, Result};
 use crate::ids::{AccountId, GroupId, TenantId};
+#[cfg(doc)]
+use crate::meta::AccountKind;
 use crate::meta::AccountScope;
 use crate::schedule::{BusyPeriod, Period};
 
@@ -290,18 +293,6 @@ pub trait DelegateStore: Send + Sync + 'static {
 
 // ---------- Ресурсы ----------
 
-/// Вид учётной записи.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccountKind {
-    /// Пользователь (или общий ящик).
-    #[default]
-    User,
-    /// Ресурс: переговорная, оборудование (iCalendar `CUTYPE=ROOM`, `RESOURCE`). Приглашения обрабатываются по
-    /// [`BookingPolicy`].
-    Resource,
-}
-
 /// Кому разрешено бронировать ресурс.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
@@ -557,24 +548,26 @@ impl BookingPolicy {
     }
 }
 
-/// Ресурсы организации: вид учётной записи и правила бронирования. Учётная запись — ресурс, пока у неё заданы правила.
+/// Правила бронирования ресурсов организации. Ресурс — учётная запись вида [`AccountKind::Resource`]: вид —
+/// свойство самой учётной записи ([`Account::kind`](crate::meta::Account::kind), задаётся
+/// [`AccountUpsert::kind`](crate::meta::AccountUpsert::kind)), здесь не хранится и не меняется.
 #[async_trait]
 pub trait ResourceStore: Send + Sync + 'static {
-    /// Вид учётной записи. Нет учётной записи — `Error::NotFound`.
-    async fn account_kind(&self, scope: AccountScope) -> Result<AccountKind>;
-
-    /// Правила бронирования; `None` — не ресурс. Нет учётной записи — `Error::NotFound`.
+    /// Правила бронирования ресурса; `None` — не заданы (приглашения ресурсу не обрабатываются автоматически) или
+    /// учётная запись — не ресурс. Нет учётной записи — `Error::NotFound`.
     async fn booking_policy(&self, scope: AccountScope) -> Result<Option<BookingPolicy>>;
 
-    /// Задаёт правила (учётная запись становится ресурсом) или снимает их (`None` — снова пользователь; принятые
-    /// бронирования остаются). [`BookingPolicy::validate`] — `Error::Invalid`; нет учётной записи — `Error::NotFound`.
+    /// Задаёт правила бронирования ресурса или снимает их (`None`; принятые бронирования остаются).
+    /// [`BookingPolicy::validate`] и учётная запись не вида [`AccountKind::Resource`] — `Error::Invalid`; нет
+    /// учётной записи — `Error::NotFound`. Смена вида учётной записи на пользователя снимает правила.
     async fn set_booking_policy(
         &self,
         scope: AccountScope,
         policy: Option<BookingPolicy>,
     ) -> Result<()>;
 
-    /// Ресурсы организации по идентификатору — список выбора переговорной, GAL.
+    /// Учётные записи вида [`AccountKind::Resource`] организации по идентификатору — список выбора переговорной,
+    /// GAL.
     async fn resources(&self, tenant: TenantId) -> Result<Vec<AccountId>>;
 }
 
@@ -965,7 +958,6 @@ mod tests {
         for policy in bad {
             assert!(policy.validate().is_err(), "{policy:?}");
         }
-        assert_eq!(AccountKind::default(), AccountKind::User);
     }
 
     #[test]

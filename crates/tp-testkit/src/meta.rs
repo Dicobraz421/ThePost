@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tp_contracts::events::{CoreEvent, CoreEventKind};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountState, AccountStore, AccountUpsert, ChangeLog, Changes,
-    DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Mailbox,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, ChangeLog,
+    Changes, DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Mailbox,
     MailboxStatus, MailboxStore, Message, MessageChange, MessageQuery, MessageStore, NewMailbox,
     NewMessage, QuotaUsage, SpecialUse, account_aliases,
 };
@@ -633,6 +633,7 @@ impl MemMetadata {
                     external_id: None,
                     enabled: true,
                     aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await?;
@@ -1031,6 +1032,7 @@ impl AccountStore for MemMetadata {
             let a = &mut acc.account;
             a.domain = data.domain;
             a.aliases = account_aliases(&data.login, data.aliases.iter().map(String::as_str));
+            a.kind = data.kind;
             a.login = data.login;
             a.display_name = data.display_name;
             a.external_id = data.external_id.or(a.external_id.take());
@@ -1053,6 +1055,7 @@ impl AccountStore for MemMetadata {
             tenant,
             domain: data.domain,
             aliases: account_aliases(&data.login, data.aliases.iter().map(String::as_str)),
+            kind: data.kind,
             login: data.login,
             display_name: data.display_name,
             external_id: data.external_id,
@@ -2575,6 +2578,7 @@ mod tests {
             external_id: ext.map(Into::into),
             enabled: true,
             aliases: Vec::new(),
+            kind: AccountKind::User,
         };
         let t = TenantId::DEFAULT;
         let x = meta

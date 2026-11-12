@@ -13,7 +13,7 @@ use tp_contracts::dav::{
     Collection, CollectionKind, Component, DavStore, DeleteOutcome, ObjectIndex, Precondition,
     PutOutcome,
 };
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::{AccountId, DomainId, Error, ModSeq, TenantId};
 use tp_meta::dav::DavConfig;
 use tp_meta::{MetaConfig, PgMeta, schema};
@@ -40,6 +40,7 @@ async fn account_in(meta: &PgMeta, tenant: TenantId, domain: (DomainId, &str)) -
                 external_id: None,
                 enabled: true,
                 aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await

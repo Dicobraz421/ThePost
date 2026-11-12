@@ -687,6 +687,7 @@ async fn insert_batch_all_or_nothing() {
                 external_id: None,
                 enabled: true,
                 aliases: Vec::new(),
+                kind: tp_contracts::meta::AccountKind::User,
             },
         )
         .await

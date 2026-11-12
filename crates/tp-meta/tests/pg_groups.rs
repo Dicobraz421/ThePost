@@ -4,7 +4,7 @@
 mod common;
 
 use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
-use tp_contracts::meta::{AccountStore, AccountUpsert};
+use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
 use tp_contracts::{AccountId, Error, GroupId, TenantId};
 use tp_meta::PgMeta;
 use tp_testkit::suite::{ExternalIdFixture, GroupFixture, account_external_id, group_store};
@@ -23,6 +23,7 @@ async fn accounts(meta: &PgMeta, tenant: TenantId) -> [AccountId; 4] {
                     external_id: None,
                     enabled: true,
                     aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await
