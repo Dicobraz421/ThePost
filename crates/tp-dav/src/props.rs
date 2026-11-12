@@ -259,9 +259,11 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
             "<d:supported-report><d:report><c:calendar-multiget/></d:report></d:supported-report>",
             "<d:supported-report><d:report><c:free-busy-query/></d:report></d:supported-report>"
         ),
-        Res::Collection(_) => {
-            "<d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report>"
-        }
+        Res::Collection(_) => concat!(
+            "<d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report>",
+            "<d:supported-report><d:report><card:addressbook-query/></d:report></d:supported-report>",
+            "<d:supported-report><d:report><card:addressbook-multiget/></d:report></d:supported-report>"
+        ),
         _ => "",
     };
     v.push(p(DAV, "supported-report-set", reports.to_owned()));

@@ -44,7 +44,7 @@ pub struct DavConfig {
     /// Наибольший год дат объекта календаря; позже — `PUT` отклоняется (`max-date-time`, §5.2.7). Повтор без
     /// конца допустим.
     pub max_date_year: i32,
-    /// Ссылок `href` в одном запросе `calendar-multiget`; больше — 403 `number-of-matches-within-limits`.
+    /// Ссылок `href` в одном запросе `calendar-multiget` и `addressbook-multiget`; больше — 403 `number-of-matches-within-limits`.
     pub max_multiget_hrefs: usize,
     /// Отображаемое имя календаря по умолчанию (создаётся при первом обращении к дому календарей).
     pub default_calendar_name: String,

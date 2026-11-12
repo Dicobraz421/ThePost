@@ -55,6 +55,16 @@ expression: r.show()
 <d:sync-collection/>
 </d:report>
 </d:supported-report>
+<d:supported-report>
+<d:report>
+<card:addressbook-query/>
+</d:report>
+</d:supported-report>
+<d:supported-report>
+<d:report>
+<card:addressbook-multiget/>
+</d:report>
+</d:supported-report>
 </d:supported-report-set>
 <cs:getctag>2</cs:getctag>
 <d:sync-token>urn:thepost:sync:2</d:sync-token>
