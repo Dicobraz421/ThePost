@@ -728,7 +728,8 @@
 | [CTR-64](CTR-64.md) | сигнал `AccountDisabled` — вход учётной записи запрещён | contracts | B | contracts-44 | ready | — |
 | [META-66](META-66.md) | `by_ids` в PostgreSQL | meta | A | meta-42 | todo | CTR-63 |
 | [META-67](META-67.md) | публикация `AccountDisabled` при блокировке | meta | A | meta-42 | todo | CTR-64 |
-| [MS-19](MS-19.md) | заголовки скрытого письма корзины | mailstore | A | mailstore-12 | ready | — |
+| [CTR-80](CTR-80.md) | заголовки скрытого письма корзины для администратора | contracts | B | contracts-52 | ready | CTR-35 |
+| [MS-19](MS-19.md) | заголовки скрытого письма корзины | mailstore | A | mailstore-12 | todo | CTR-80 |
 | [ADM-32](ADM-32.md) | темы скрытых писем и имена участников групп одним запросом | admin | A | admin-21 | todo | CTR-63,MS-19,ADM-19,ADM-20 |
 | [IMAP-22](IMAP-22.md) | заблокированная учётная запись — закрытие сеансов IMAP и POP3 | imap | A | imap-12 | todo | CTR-64 |
 | [JMAP-41](JMAP-41.md) | заблокированная учётная запись — закрытие push JMAP | jmap | A | jmap-24 | todo | CTR-64 |
