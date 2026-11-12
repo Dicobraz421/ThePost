@@ -446,10 +446,9 @@ impl Failover {
                     continue;
                 }
             };
-            match tx.commit().await {
+            match crate::commits::commit(tx).await {
                 Ok(()) => return Ok(out),
                 Err(e) => {
-                    let e = db_err(e);
                     ambiguous = e.is_retryable();
                     r.after(e, seen).await?;
                 }

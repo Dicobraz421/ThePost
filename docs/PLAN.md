@@ -12,8 +12,8 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 141/184 | 210/268 | в работе, 78 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
-| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 0/43 | 0/84 | не начат | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 160/184 | 234/268 | в работе, 87 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 14/43 | 35/84 | в работе, 42 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 0/0 | 0/0 | карточки — после Ф1 | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
 
@@ -212,17 +212,17 @@
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
 | ✅ contracts-22 (ветка `x/contracts-22`) | CTR-34 | B | contracts-12 | 1 |
-| meta-13 | META-30, META-31 | A | meta-12, meta-10, contracts-22 | 3 |
-| meta-14 | META-32 | A | meta-13 | 3 |
+| ✅ meta-13 | META-30, META-31 | A | meta-12, meta-10, contracts-22 | 3 |
+| ✅ meta-14 | META-32 | A | meta-13 | 3 |
 | blob-08 | BLOB-15 | A | blob-07, meta-13 | 4 |
 | ✅ app-07 | APP-11 | A | admin-01 | 2 |
-| deploy-07 | DEP-10 | A | deploy-06 | 4 |
+| ✅ deploy-07 | DEP-10 | A | deploy-06 | 4 |
 
 ### Решение 2026-11-04: соответствие функциям Exchange — этап 3, кроме `jmap-14` (этап 2)
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-23 (ветка `x/contracts-23`) | CTR-35 | B | contracts-22 | 1 |
+| ✅ contracts-23 (ветка `x/contracts-23`) | CTR-35 | B | contracts-22 | 1 |
 | meta-15 | META-33 | A | meta-13, contracts-23 | 3 |
 | auth-05 | AUTH-10 | A | auth-03, contracts-23 | 1 |
 | mailstore-10 | MS-16, MS-17 | A | mailstore-08, contracts-23 | 1 |
@@ -321,9 +321,9 @@
 | ✅ sys-06 | SYS-11 | A | sys-05 | 2 |
 | ✅ platform-11 | PLT-21 | A | sys-06, cluster-08 | 2 |
 | ✅ app-16 | APP-17 | A | smtp-05, auth-04, app-15 | 2 |
-| app-17 | APP-18 | A | smtp-10, cluster-07, app-16 | 2 |
-| meta-25 | META-41 | A | meta-21 | 3 |
-| cluster-09 | CLU-14 | A | cluster-07 | 4 |
+| ✅ app-17 | APP-18 | A | smtp-10, cluster-07, app-16 | 2 |
+| ✅ meta-25 | META-41 | A | meta-21 | 3 |
+| ✅ cluster-09 | CLU-14 | A | cluster-07 | 4 |
 | ✅ meta-20 | META-27 (тест) | A | meta-10 | 3 |
 
 ### Ответы владельца 2026-11-10 (#193, #195, #205, #253, #272)
@@ -334,7 +334,7 @@
 | ✅ admin-06 | ADM-11 | A | contracts-29 | 3 |
 | ✅ app-18 | APP-19 | A | admin-06 | 2 |
 | ✅ meta-27 (ветка `x/admin-tokens-pg`) | META-43 | B | admin-06, app-18 | 3 |
-| contracts-30 (ветка `x/contracts-30`) | CTR-42 | B | contracts-29 | 1 |
+| ✅ contracts-30 (ветка `x/contracts-30`) | CTR-42 | B | contracts-29 | 1 |
 | ✅ meta-26 | META-42 | A | meta-17 | 3 |
 | ✅ testkit-05 | KIT-08 | A | testkit-04 | 1 |
 | ✅ auth-06 | AUTH-11 | A | auth-04 | 1 |
@@ -357,8 +357,8 @@
 | ✅ app-21 | APP-22 | A | admin-08, app-20 | 2 |
 | ✅ platform-13 | PLT-23 | A | platform-12 | 2 |
 | ✅ app-22 | APP-23 | A | platform-13, jmap-15 | 2 |
-| deploy-12 | DEP-12, DEP-13, DEP-14 | A | deploy-02, app-20 | 4 |
-| deploy-13 | DEP-15 | A | deploy-02 | 4 |
+| ✅ deploy-12 | DEP-12, DEP-13, DEP-14 | A | deploy-02, app-20 | 4 |
+| ✅ deploy-13 | DEP-15 | A | deploy-02 | 4 |
 | meta-34 | META-53 | A | meta-14 | 3 |
 | blob-09 | BLOB-16 | A | blob-08 | 4 |
 | platform-15 | PLT-25 | A | platform-13 | 2 |
@@ -366,22 +366,22 @@
 | deploy-21 | DEP-25 | A | deploy-12 | 4 |
 | ✅ docs-01 | DOC-01 | A | — | 1 |
 | ✅ app-23 | APP-24 | A | — | 2 |
-| deploy-14 | DEP-16 | A | — | 4 |
-| deploy-15 | DEP-17, DEP-18 | A | deploy-14 | 4 |
-| app-24 | APP-25 | A | — | 2 |
-| sys-07 | SYS-12 | A | — | 2 |
+| ✅ deploy-14 | DEP-16 | A | — | 4 |
+| ✅ deploy-15 | DEP-17, DEP-18 | A | deploy-14 | 4 |
+| ✅ app-24 | APP-25 | A | — | 2 |
+| ✅ sys-07 | SYS-12 | A | — | 2 |
 | deploy-16 | DEP-24, DEP-19, DEP-20 | A | deploy-13, deploy-15 | 4 |
-| app-29 | APP-30 | A | app-17 | 2 |
-| deploy-19 | DEP-23 | A | deploy-13 | 4 |
+| ✅ app-29 | APP-30 | A | app-17 | 2 |
+| ✅ deploy-19 | DEP-23 | A | deploy-13 | 4 |
 | ✅ platform-12 | PLT-22 | A | smtp-06 | 2 |
-| contracts-31 (ветка `x/contracts-31`) | CTR-43 | B | contracts-19, smtp-06 | 1 |
+| ✅ contracts-31 (ветка `x/contracts-31`) | CTR-43 | B | contracts-19, smtp-06 | 1 |
 | meta-28 (ветка `x/meta-28`) | META-44 | B | contracts-31 | 3 |
 | smtp-11 | SMTP-30 | A | contracts-31, meta-28 | 4 |
-| contracts-36 (ветка `x/contracts-36`) | CTR-49, CTR-50 | B | contracts-23 | 1 |
+| ✅ contracts-36 (ветка `x/contracts-36`) | CTR-49, CTR-50 | B | contracts-23 | 1 |
 | deps-06 (ветка `x/deps-06`) | DEPS-06 | B | cluster-09 | 1 |
 | cluster-10 | CLU-15 | A | deps-06 | 4 |
 | deploy-20 | DEP-22 | A | cluster-09 | 4 |
-| platform-14 | PLT-24 | A | platform-13 | 2 |
+| ✅ platform-14 | PLT-24 | A | platform-13 | 2 |
 | platform-16 | PLT-26 | A | platform-14 | 2 |
 
 
@@ -398,31 +398,31 @@
 
 | Волна | Карточки | Класс | Ждёт | Поток |
 |---|---|---|---|---|
-| contracts-33 (ветка `x/contracts-33`) | CTR-45, CTR-46 | B | — | 1 |
-| deps-04 (ветка `x/deps-04`) | DEPS-04 | B | contracts-33 | 1 |
-| meta-30 | META-46, META-47, META-48 | A/B | contracts-33 | 3 |
-| meta-31 | META-49, META-50 | A/B | contracts-33 | 3 |
-| dav-01 | DAV-01, DAV-02, DAV-03, DAV-04 | A | deps-04 | 4 |
-| dav-02 | DAV-05, DAV-06, DAV-07, DAV-08 | A | dav-01 | 4 |
+| ✅ contracts-33 (ветка `x/contracts-33`) | CTR-45, CTR-46 | B | — | 1 |
+| ✅ deps-04 (ветка `x/deps-04`) | DEPS-04 | B | contracts-33 | 1 |
+| ✅ meta-30 | META-46, META-47, META-48 | A/B | contracts-33 | 3 |
+| ✅ meta-31 | META-49, META-50 | A/B | contracts-33 | 3 |
+| ✅ dav-01 | DAV-01, DAV-02, DAV-03, DAV-04 | A | deps-04 | 4 |
+| ✅ dav-02 | DAV-05, DAV-06, DAV-07, DAV-08 | A | dav-01 | 4 |
 | dav-03 | DAV-09, DAV-10, DAV-11, DAV-12 | A | dav-01 | 4 |
-| sieve-01 | SIEVE-01, SIEVE-02, SIEVE-03 | A | deps-04 | 2 |
-| sieve-02 | SIEVE-04, SIEVE-05, SIEVE-06, SIEVE-07 | A | sieve-01 | 2 |
-| smtp-12 | SMTP-31, SMTP-32 | A | contracts-33 | 1 |
-| jmap-16 | JMAP-23, JMAP-24, JMAP-25, JMAP-26 | A | deps-04, sieve-01, dav-01 | 3 |
-| admin-09 | ADM-14 | A | sieve-01 | 3 |
+| ✅ sieve-01 | SIEVE-01, SIEVE-02, SIEVE-03 | A | deps-04 | 2 |
+| ✅ sieve-02 | SIEVE-04, SIEVE-05, SIEVE-06, SIEVE-07 | A | sieve-01 | 2 |
+| ✅ smtp-12 | SMTP-31, SMTP-32 | A | contracts-33 | 1 |
+| ✅ jmap-16 | JMAP-23, JMAP-24, JMAP-25, JMAP-26 | A | deps-04, sieve-01, dav-01 | 3 |
+| ✅ admin-09 | ADM-14 | A | sieve-01 | 3 |
 | app-28 | APP-29 | A | dav-02, dav-03, meta-30 | 2 |
 | app-25 | APP-26 | A | sieve-02, smtp-12, meta-31, jmap-16, admin-09 | 2 |
 | deploy-17 | DEP-21 | A | app-28 | 4 |
 | sieve-03 | SIEVE-08, SIEVE-09 | A | sieve-02 | 2 |
 | jmap-17 | JMAP-27, JMAP-28, JMAP-29 | A | jmap-16, dav-01 | 3 |
 | app-26 | APP-27 | A | sieve-03, jmap-17, app-28, app-25 | 2 |
-| ci-05 (ветка `x/ci-05`) | CI-06 | B | — | 1 |
+| ✅ ci-05 (ветка `x/ci-05`) | CI-06 | B | — | 1 |
 | deps-05 (ветка `x/deps-05`) | DEPS-05 | B | ci-05 | 1 |
-| console-01 | UI-01, UI-02, UI-03 | A | ci-05 | 1 |
+| ✅ console-01 | UI-01, UI-02, UI-03 | A | ci-05 | 1 |
 | console-02 | UI-04, UI-05, UI-06 | A | console-01 | 1 |
 | console-03 | UI-07, UI-08, UI-09 | A | console-02, admin-09 | 1 |
 | admin-10 | ADM-15 | A | deps-05, console-01 | 3 |
-| contracts-34 (ветка `x/contracts-34`) | CTR-47 | B | contracts-33 | 1 |
+| ✅ contracts-34 (ветка `x/contracts-34`) | CTR-47 | B | contracts-33 | 1 |
 | meta-35 (ветка `x/meta-35`) | META-54 | B | contracts-34, meta-30 | 3 |
 | smtp-14 | SMTP-34 | A | smtp-12 | 1 |
 | admin-12 | ADM-17 | A | sieve-01 | 3 |

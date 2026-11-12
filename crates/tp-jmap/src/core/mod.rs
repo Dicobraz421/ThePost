@@ -57,11 +57,13 @@ pub const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
 pub const SIEVE: &str = "urn:ietf:params:jmap:sieve";
 /// Capability контактов (RFC 9610); доступна при подключённом [`Jmap::with_dav`].
 pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
+/// Capability календарей (draft-ietf-jmap-calendars); доступна при подключённом [`Jmap::with_dav`].
+pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
 
 /// Встроенные capability.
 const BUILTIN: [&str; 5] = [CORE, MAIL, SUBMISSION, WEBSOCKET, SETTINGS];
 /// Встроенные capability, доступные при подключённом хранилище (URI заняты всегда).
-const OPTIONAL: [&str; 3] = [VACATION, SIEVE, CONTACTS];
+const OPTIONAL: [&str; 4] = [VACATION, SIEVE, CONTACTS, CALENDARS];
 
 /// Зависимости сервера JMAP: реализации контрактов, выбранные приложением.
 #[derive(Clone)]
@@ -132,7 +134,7 @@ pub struct Jmap {
     pub(crate) profile_signer: Option<Arc<dyn ProfileSigner>>,
     /// Скрипты Sieve и автоответ; `None` — capability `vacationresponse` и `sieve` не объявляются.
     pub(crate) sieve: Option<Arc<dyn SieveStore>>,
-    /// Календари и контакты; `None` — capability `contacts` не объявляется.
+    /// Календари и контакты; `None` — capability `contacts` и `calendars` не объявляются.
     pub(crate) dav: Option<Arc<dyn DavStore>>,
     stop: watch::Sender<bool>,
 }
@@ -280,7 +282,8 @@ impl Jmap {
     }
 
     /// Подключает хранилище календарей и контактов (CONTRACTS.md#Dav): capability
-    /// `urn:ietf:params:jmap:contacts` (JMAP-25, JMAP-26). `None` — capability не объявляется.
+    /// `urn:ietf:params:jmap:contacts` (JMAP-25, JMAP-26) и `urn:ietf:params:jmap:calendars` (JMAP-27…29).
+    /// `None` — capability не объявляются.
     #[must_use]
     pub fn with_dav(mut self, dav: Option<Arc<dyn DavStore>>) -> Self {
         self.dav = dav;
@@ -301,7 +304,7 @@ impl Jmap {
     fn optional_enabled(&self, uri: &str) -> bool {
         match uri {
             VACATION | SIEVE => self.sieve.is_some(),
-            CONTACTS => self.dav.is_some(),
+            CONTACTS | CALENDARS => self.dav.is_some(),
             _ => false,
         }
     }
@@ -394,6 +397,12 @@ impl Jmap {
             caps.insert(CONTACTS.into(), json!({}));
             account_caps.insert(CONTACTS.into(), crate::contacts::account_capability());
             primary.insert(CONTACTS.into(), json!(account));
+            caps.insert(CALENDARS.into(), json!({}));
+            account_caps.insert(
+                CALENDARS.into(),
+                crate::calendars::account_capability(&self.cfg.calendars),
+            );
+            primary.insert(CALENDARS.into(), json!(account));
         }
         for cap in &self.d.capabilities {
             caps.insert(cap.uri().into(), cap.session_object());

@@ -483,7 +483,7 @@ async fn purge_account(pool: &PgPool, scope: AccountScope, before: OffsetDateTim
     .fetch_one(&mut *tx)
     .await
     .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
     to_u64(n)
 }
 
@@ -511,7 +511,7 @@ impl DavStore for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             rows.into_iter()
                 .map(CollectionRow::into_collection)
                 .collect()
@@ -527,7 +527,7 @@ impl DavStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
             let c = fetch_collection(&mut tx, scope, id).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(c)
         })
         .await
@@ -552,7 +552,7 @@ impl DavStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             row.map(CollectionRow::into_collection).transpose()
         })
         .await
@@ -621,7 +621,7 @@ impl DavStore for PgMeta {
                 .await
                 .map_err(db_err)?;
                 advance(&mut tx, scope, collection.kind, ms).await?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 Ok(ms)
             })
             .await?;
@@ -666,7 +666,7 @@ impl DavStore for PgMeta {
                 .await
                 .map_err(db_err)?;
                 advance(&mut tx, scope, collection.kind, ms).await?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 Ok(ms)
             })
             .await?;
@@ -722,7 +722,7 @@ impl DavStore for PgMeta {
                 .await
                 .map_err(db_err)?;
                 advance(&mut tx, scope, c.kind, ms).await?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 Ok((c.kind, ms))
             })
             .await?;
@@ -741,7 +741,7 @@ impl DavStore for PgMeta {
             require_collection(&mut tx, scope, collection).await?;
             let mut out =
                 select_objects(&mut tx, scope, collection, "name = $4", |q| q.bind(name)).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(out.pop())
         })
         .await
@@ -758,7 +758,7 @@ impl DavStore for PgMeta {
             require_collection(&mut tx, scope, collection).await?;
             let mut out =
                 select_objects(&mut tx, scope, collection, "uid = $4", |q| q.bind(uid)).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(out.pop())
         })
         .await
@@ -783,7 +783,7 @@ impl DavStore for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(rows
                 .into_iter()
                 .map(|(id, name, etag)| ObjectRef {
@@ -809,7 +809,7 @@ impl DavStore for PgMeta {
                 q.bind(names)
             })
             .await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             let by_name: HashMap<&str, &DavObject> =
                 found.iter().map(|o| (o.name.as_str(), o)).collect();
             Ok(names
@@ -843,7 +843,7 @@ impl DavStore for PgMeta {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(db_err)?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 let found: HashMap<Uuid, DavObject> = rows
                     .into_iter()
                     .map(|r| Ok((r.object_id, r.into_object()?)))
@@ -874,7 +874,7 @@ impl DavStore for PgMeta {
                 |q| q.bind(range.start).bind(range.end),
             )
             .await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(out)
         })
         .await
@@ -1029,7 +1029,7 @@ impl DavStore for PgMeta {
                 .await
                 .map_err(db_err)?;
                 advance(&mut tx, scope, c.kind, ms).await?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 Ok((
                     c.kind,
                     PutOutcome::Stored(Put {
@@ -1117,7 +1117,7 @@ impl DavStore for PgMeta {
                 .await
                 .map_err(db_err)?;
                 advance(&mut tx, scope, c.kind, ms).await?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 Ok((c.kind, DeleteOutcome::Deleted(ms)))
             })
             .await?;
@@ -1163,7 +1163,7 @@ impl DavStore for PgMeta {
                 .map_err(db_err)?;
             }
             check_since(&mut tx, scope, since, Floor::Collection(collection)).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             page(rows, since, limit, c.state)
         })
         .await
@@ -1200,7 +1200,7 @@ impl DavStore for PgMeta {
             }
             let complete = kind_state(&mut tx, scope, kind).await?;
             check_since(&mut tx, scope, since, Floor::Kind(kind)).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             let rows = rows
                 .into_iter()
                 .map(|(id, m, c, d)| (CollectionId::from_uuid(id), m, c, d))
@@ -1242,7 +1242,7 @@ impl DavStore for PgMeta {
             }
             let complete = kind_state(&mut tx, scope, kind).await?;
             check_since(&mut tx, scope, since, Floor::Kind(kind)).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             let rows = rows
                 .into_iter()
                 .map(|(id, m, c, d)| (DavObjectId::from_uuid(id), m, c, d))
@@ -1256,7 +1256,7 @@ impl DavStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
             let s = kind_state(&mut tx, scope, kind).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(s)
         })
         .await

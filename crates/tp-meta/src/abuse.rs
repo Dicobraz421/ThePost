@@ -161,7 +161,7 @@ impl AbuseBlocks for PgMeta {
         if done.is_none() {
             return Err(Error::invalid("срок блокировки в прошлом"));
         }
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         self.signal(Event {
             tenant,
             account: None,
@@ -192,7 +192,7 @@ impl AbuseBlocks for PgMeta {
             .fetch_one(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(until)
         })
         .await
@@ -209,7 +209,7 @@ impl AbuseBlocks for PgMeta {
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(())
         })
         .await?;
@@ -235,7 +235,7 @@ impl AbuseBlocks for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             rows.into_iter()
                 .map(|r| {
                     Ok(AbuseBlock {

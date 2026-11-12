@@ -39,10 +39,11 @@ use crate::core::{Jmap, Problem};
 #[cfg(test)]
 const ALL_TYPES: &[&str] = &["Email", "Thread", "Mailbox", "EmailSubmission"];
 
-/// Типы со своим состоянием (JMAP-23…26): Sieve и автоответ — состояние `SieveStore`, контакты — состояние
-/// адресных книг `DavStore`. В `StateChange` попадают только при подключённом хранилище.
+/// Типы со своим состоянием (JMAP-23…29): Sieve и автоответ — состояние `SieveStore`, контакты и календари —
+/// состояния адресных книг и календарей `DavStore`. В `StateChange` попадают только при подключённом хранилище.
 const SIEVE_TYPES: &[&str] = &["VacationResponse", "SieveScript"];
 const CONTACT_TYPES: &[&str] = &["AddressBook", "ContactCard"];
+const CALENDAR_TYPES: &[&str] = &["Calendar", "CalendarEvent"];
 
 /// Все типы: почтовые и типы со своим состоянием.
 const EVERY_TYPE: &[&str] = &[
@@ -54,6 +55,8 @@ const EVERY_TYPE: &[&str] = &[
     "SieveScript",
     "AddressBook",
     "ContactCard",
+    "Calendar",
+    "CalendarEvent",
 ];
 
 /// Типы данных, которые меняет уведомление шины.
@@ -66,6 +69,10 @@ pub(crate) fn changed_types(kind: &EventKind) -> &'static [&'static str] {
             kind: CollectionKind::AddressBook,
             ..
         } => CONTACT_TYPES,
+        EventKind::DavChanged {
+            kind: CollectionKind::Calendar,
+            ..
+        } => CALENDAR_TYPES,
         // Сигналы потеряны — что изменилось, неизвестно: клиент перечитывает все типы.
         EventKind::Resync => EVERY_TYPE,
         _ => &[],
@@ -77,6 +84,7 @@ struct States {
     mail: String,
     sieve: Option<String>,
     contacts: Option<String>,
+    calendars: Option<String>,
 }
 
 impl States {
@@ -92,10 +100,17 @@ impl States {
             )),
             None => None,
         };
+        let calendars = match &jmap.dav {
+            Some(d) => Some(state_string(
+                d.state(scope, CollectionKind::Calendar).await?,
+            )),
+            None => None,
+        };
         Ok(Self {
             mail,
             sieve,
             contacts,
+            calendars,
         })
     }
 
@@ -105,6 +120,8 @@ impl States {
             self.sieve.as_deref()
         } else if CONTACT_TYPES.contains(&ty) {
             self.contacts.as_deref()
+        } else if CALENDAR_TYPES.contains(&ty) {
+            self.calendars.as_deref()
         } else {
             Some(&self.mail)
         }
@@ -113,7 +130,11 @@ impl States {
     /// `pushState`: состояние почты, при подключённых хранилищах — с их состояниями.
     fn push_state(&self) -> String {
         let mut s = self.mail.clone();
-        for (tag, extra) in [("s", &self.sieve), ("c", &self.contacts)] {
+        for (tag, extra) in [
+            ("s", &self.sieve),
+            ("c", &self.contacts),
+            ("k", &self.calendars),
+        ] {
             if let Some(e) = extra {
                 s.push_str(&format!("-{tag}{e}"));
             }

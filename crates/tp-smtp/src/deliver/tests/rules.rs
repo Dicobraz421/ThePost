@@ -229,8 +229,10 @@ async fn redirect_external_via_srs_and_local() {
     assert!(env.inbox("alice@example.org").await.is_empty());
     assert_eq!(env.inbox("bob@example.org").await.len(), 1);
     assert_eq!(env.inbox("carol@example.org").await.len(), 1);
-    // Получатель перенаправления правилам не передаётся.
-    assert_eq!(rules.calls().len(), 2);
+    // Получатель перенаправления — тоже через правила (SMTP-34).
+    assert_eq!(rules.calls().len(), 3);
+    // Наружу — с цепочкой перенаправлений: петля через внешний сервер обрывается так же.
+    assert!(queued[0].2.starts_with(b"X-ThePost-Redirected: "));
     assert!(
         reasons(&log, "alice@example.org")
             .iter()
@@ -238,28 +240,110 @@ async fn redirect_external_via_srs_and_local() {
     );
 }
 
+fn redirect(to: &str, keep: bool) -> RulesOutcome {
+    RulesOutcome {
+        redirect: vec![to.into()],
+        ..if keep {
+            RulesOutcome::implicit_keep()
+        } else {
+            RulesOutcome::default()
+        }
+    }
+}
+
+// ---------- SMTP-34: перенаправленное письмо — через правила получателя, петля обрывается ----------
+
 #[tokio::test]
-async fn redirect_loop_delivers_once() {
-    let (env, rules, _log, d) = setup(false, cfg()).await;
-    // alice → bob, bob → alice: каждая учётная запись получает письмо не больше одного раза.
-    rules.set(
-        "alice@example.org",
-        RulesOutcome {
-            redirect: vec!["bob@example.org".into()],
-            ..RulesOutcome::implicit_keep()
-        },
+async fn redirect_loop_breaks_in_inbox() {
+    let (env, rules, log, d) = setup(false, cfg()).await;
+    // alice → bob → alice без копий: письмо не теряется и не ходит по кругу.
+    rules.set("alice@example.org", redirect("bob@example.org", false));
+    rules.set("bob@example.org", redirect("alice@example.org", false));
+    let e = envelope(Mode::Inbound, &["alice@example.org"]);
+    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+
+    // Правила: alice, затем bob; вернувшееся к alice письмо правилами не обрабатывается.
+    let calls = rules.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].scope, env.scope("bob@example.org").await);
+    let alice = env.inbox("alice@example.org").await;
+    assert_eq!(alice.len(), 1);
+    assert_eq!(alice[0].matches("X-ThePost-Redirected: ").count(), 2);
+    assert!(env.inbox("bob@example.org").await.is_empty());
+    assert!(
+        reasons(&log, "alice@example.org").iter().any(|r| r
+            == "sieve: rules skipped, mailbox already in redirect chain; default folder"),
+        "{:?}",
+        reasons(&log, "alice@example.org")
     );
+}
+
+#[tokio::test]
+async fn redirected_mail_is_sorted_by_recipient_rules() {
+    let (env, rules, log, d) = setup(false, cfg()).await;
+    rules.set("alice@example.org", redirect("bob@example.org", true));
     rules.set(
         "bob@example.org",
-        RulesOutcome {
-            redirect: vec!["alice@example.org".into()],
-            ..RulesOutcome::implicit_keep()
-        },
+        keeps(vec![keep(named("From Alice", true), &[Flag::Flagged])]),
     );
-    let e = envelope(Mode::Inbound, &["alice@example.org", "bob@example.org"]);
+    let e = envelope(Mode::Inbound, &["alice@example.org"]);
     assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+
     assert_eq!(env.inbox("alice@example.org").await.len(), 1);
-    assert_eq!(env.inbox("bob@example.org").await.len(), 1);
+    assert!(env.inbox("bob@example.org").await.is_empty());
+    let sorted = folder(&env, "bob@example.org", "From Alice").await;
+    assert_eq!(sorted.len(), 1);
+    assert!(sorted[0].flags.contains(&Flag::Flagged));
+    // Правила bob видят письмо с цепочкой и исходным отправителем конверта.
+    let calls = rules.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].mail_from, "sender@example.net");
+    assert!(
+        reasons(&log, "bob@example.org")
+            .iter()
+            .any(|r| r == "sieve: fileinto From Alice")
+    );
+}
+
+#[tokio::test]
+async fn redirect_hop_limit() {
+    let mut c = cfg();
+    c.delivery.redirect_hops = 1;
+    let (env, rules, log, d) = setup(false, c).await;
+    // alice → bob → carol → dave при пределе 1: правила carol уже не применяются.
+    rules.set("alice@example.org", redirect("bob@example.org", false));
+    rules.set("bob@example.org", redirect("carol@example.org", false));
+    rules.set("carol@example.org", redirect("bob@example.org", false));
+    let e = envelope(Mode::Inbound, &["alice@example.org"]);
+    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    assert_eq!(rules.calls().len(), 2);
+    assert_eq!(env.inbox("carol@example.org").await.len(), 1);
+    assert!(env.inbox("alice@example.org").await.is_empty());
+    assert!(
+        reasons(&log, "carol@example.org")
+            .iter()
+            .any(|r| r == "sieve: rules skipped, redirect hop limit; default folder")
+    );
+}
+
+#[tokio::test]
+async fn redirect_total_limit() {
+    let mut c = cfg();
+    c.delivery.redirect_total = 1;
+    let (env, rules, log, d) = setup(false, c).await;
+    rules.set("alice@example.org", redirect("bob@example.org", false));
+    rules.set("bob@example.org", redirect("carol@example.org", false));
+    rules.set("carol@example.org", RulesOutcome::default());
+    let e = envelope(Mode::Inbound, &["alice@example.org"]);
+    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    // Второе перенаправление — сверх предела: carol получает письмо без правил (её правило — `discard`).
+    assert_eq!(rules.calls().len(), 2);
+    assert_eq!(env.inbox("carol@example.org").await.len(), 1);
+    assert!(
+        reasons(&log, "carol@example.org")
+            .iter()
+            .any(|r| r == "sieve: rules skipped, redirect limit per message; default folder")
+    );
 }
 
 #[tokio::test]
@@ -416,12 +500,49 @@ async fn auto_reply_to_internal_sender_goes_to_mailbox() {
     );
     assert!(alice[0].contains("In-Reply-To: <orig-1@example.net>\r\n"));
     assert!(env.queue.0.lock().expect("lock").is_empty());
-    // Автоответ доставлен без правил получателя.
-    assert_eq!(rules.calls().len(), 1);
+    // Автоответ доставлен через правила получателя (SMTP-34), с пустым отправителем конверта.
+    let calls = rules.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].scope, env.scope("alice@example.org").await);
+    assert_eq!(calls[1].mail_from, "");
     assert!(
         reasons(&log, "alice@example.org")
             .iter()
             .any(|r| r == "auto-reply delivered")
+    );
+}
+
+#[tokio::test]
+async fn auto_reply_redirected_back_stays_in_inbox() {
+    let (env, rules, log, d) = setup(false, cfg()).await;
+    // bob отвечает автоответом, alice перенаправляет всё bob: ответ возвращается к bob и остаётся во «Входящих».
+    rules.set(
+        "bob@example.org",
+        vacation("alice@example.org", "bob@example.org"),
+    );
+    rules.set("alice@example.org", redirect("bob@example.org", false));
+    d.submit(
+        TenantId::DEFAULT,
+        "alice@example.org",
+        &rcpts(&["bob@example.org"]),
+        Bytes::from_static(ORIGINAL),
+    )
+    .await
+    .expect("submit");
+    // Правила: bob (письмо), alice (автоответ); к вернувшемуся автоответу правила bob не применяются.
+    assert_eq!(rules.calls().len(), 2);
+    let bob = env.inbox("bob@example.org").await;
+    assert_eq!(bob.len(), 2, "{bob:?}");
+    assert_eq!(
+        bob.iter()
+            .filter(|m| m.contains("Auto-Submitted: auto-replied\r\n"))
+            .count(),
+        1
+    );
+    assert!(env.inbox("alice@example.org").await.is_empty());
+    assert!(
+        reasons(&log, "bob@example.org").iter().any(|r| r
+            == "sieve: rules skipped, mailbox already in redirect chain; default folder")
     );
 }
 

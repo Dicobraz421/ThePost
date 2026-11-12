@@ -11,6 +11,7 @@ pub mod admin_tokens;
 pub mod app_passwords;
 pub mod blob_index;
 pub mod changelog;
+pub mod commits;
 pub mod credentials;
 pub mod dav;
 pub mod delivery;

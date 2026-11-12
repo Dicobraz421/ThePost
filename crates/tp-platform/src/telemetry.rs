@@ -30,6 +30,9 @@ pub struct TelemetryConfig {
     pub log_format: LogFormat,
     /// OTLP-экспорт трейсов (OpenTelemetry); не задан — выключен. Требует перезапуска.
     pub otlp: Option<OtlpConfig>,
+    /// Границы гистограммы времени ожидания соединения из пула СУБД (`tp_db_pool_wait_seconds`), мс, по
+    /// возрастанию (PLT-25). Требует перезапуска.
+    pub db_wait_buckets_ms: Vec<u64>,
 }
 
 impl Default for TelemetryConfig {
@@ -38,6 +41,7 @@ impl Default for TelemetryConfig {
             log_level: "info".to_owned(),
             log_format: LogFormat::Json,
             otlp: None,
+            db_wait_buckets_ms: vec![1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000],
         }
     }
 }
@@ -123,6 +127,14 @@ impl Metrics {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .register_collector(Box::new(BusCollector(Box::new(snapshot))));
+    }
+
+    /// Регистрирует сборщик: метрики, значения которых снимаются на каждый `/metrics`.
+    pub(crate) fn register_collector(&self, collector: Box<dyn Collector>) {
+        self.0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register_collector(collector);
     }
 
     /// Текстовый формат OpenMetrics/Prometheus.

@@ -4,7 +4,8 @@
 //! [`parse`] (лексер и грамматика RFC 5228 §8, SIEVE-01) → [`check`] / [`compile`] (require, аргументы, расширения —
 //! программа [`Program`], SIEVE-02) → [`run`] (выполнение над письмом, SIEVE-03) → слияние действий в
 //! `RulesOutcome` (SIEVE-04). Точка правил доставки — [`Rules`] (SIEVE-07): скрипт организации, автоответ
-//! (SIEVE-06), активный скрипт пользователя; секция конфигурации — [`SieveConfig`]. [`fuzz`] — проверки для целей
+//! (SIEVE-06), активный скрипт пользователя; секция конфигурации — [`SieveConfig`]. [`managesieve`] — сервер
+//! ManageSieve (RFC 5804; SIEVE-08, SIEVE-09): вход SASL и команды скриптов поверх `SieveStore`. [`fuzz`] — проверки для целей
 //! cargo-fuzz `crates/tp-sieve/fuzz` (не API).
 //!
 //! Все лимиты ([`Limits`]) дают ошибку разбора или выполнения, а не панику: скрипты пишут пользователи.
@@ -14,6 +15,7 @@ mod compile;
 mod config;
 pub mod fuzz;
 mod lexer;
+pub mod managesieve;
 mod outcome;
 mod rules;
 mod run;
@@ -26,6 +28,7 @@ use serde::{Deserialize, Serialize};
 pub use ast::{Arg, Command, Script, Test, parse};
 pub use compile::{EXTENSIONS, Program, check, compile};
 pub use config::{CacheConfig, ManageSieveConfig, SieveConfig, VacationConfig};
+pub use managesieve::ManageSieve;
 pub use rules::Rules;
 pub use run::{Action, Context, Outcome, VacationAction, run};
 
