@@ -52,7 +52,7 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq --no-install-recommends qemu-user >/dev/null
         qemu-x86_64 -cpu Nehalem "$BIN" --version && exit 0
-        # ВРЕМЕННО (разбор CI-14): где падает и на каком уровне проходит.
+        set +e  # ВРЕМЕННО (разбор CI-14): где падает и на каком уровне проходит.
         sudo apt-get install -y -qq --no-install-recommends binutils >/dev/null || true
         for cpu in Nehalem,+aes Westmere Westmere,-aes SandyBridge Haswell max; do
           echo "== $cpu"; qemu-x86_64 -cpu "$cpu" "$BIN" --version; echo "rc=$?"
