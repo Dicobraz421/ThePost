@@ -571,6 +571,21 @@ etag }>`, `multiget(names)`, `objects_by_id(ids)` (JMAP), `in_range(collection, 
 Precondition::{Any, IfMatch(etag), IfNoneMatch}) -> PutOutcome::{Stored(Put { id, etag, modseq, created }), PreconditionFailed,
 UidConflict { name }}` (UID уникален в коллекции; компонент не из `components` — `Invalid`; перезапись сохраняет `id`),
 `delete_object(collection, name, Precondition) -> DeleteOutcome::{Deleted(ModSeq), PreconditionFailed}` (нет ресурса при `Any` — `NotFound`).
+Перенос (CTR-54, решение 80): `move_object(scope, from, name, to, Precondition) -> MoveOutcome::{Moved(Moved { id, etag, removed, modseq }),
+PreconditionFailed, UidConflict { name }}` — одной транзакцией; имя, `id`, тело, индекс и поисковые строки сохраняются, ETag и `ModSeq` —
+новые: в `from` — надгробие (`removed`, видно в `changes`), в `to` — создание (`modseq`), в `account_changes` объект — в `updated`;
+сигнал `DavChanged` — по обеим коллекциям. `from == to`, разный вид коллекций или компонент не из `components` целевой — `Invalid`;
+условие — к исходному ресурсу (`IfNoneMatch` — как `Any`); имя занято в целевой — `PreconditionFailed`, UID — `UidConflict`;
+`max_objects` целевой — `QuotaExceeded`; по умолчанию — `Internal`.
+Поиск контактов (CTR-54): `CardSearch { strings }` — поисковые строки контакта (полное имя, части имени, адреса e-mail; нижний регистр,
+без повторов и управляющих символов, до `MAX_CARD_SEARCH_STRINGS` = 64 строк по `MAX_CARD_SEARCH_LEN` = 255 байт; `new(values)` приводит
+и обрезает, `validate()`, `matches(needle)`), вычисляет вызывающий (`tp_dav::index::card`). `put_card(scope, collection, name,
+NewCard { body, index, search }, Precondition) -> PutOutcome` — `put_object` со строками (не `VCARD` или недопустимые строки — `Invalid`;
+по умолчанию — проверка и `put_object`, строки не хранятся); запись через `put_object` оставляет объект без строк.
+`find_cards(scope, collection, needle, limit) -> Vec<DavObject>` — кандидаты, у которых строка содержит `needle` (пустой — все), по имени,
+не более `limit`; точную проверку фильтра делает вызывающий (как после `in_range`); по умолчанию — все объекты коллекции (`list_objects` и
+`multiget`), `needle` и `limit` не применяются. Поисковые строки — параметр записи, а не поле `ObjectIndex`: код, собирающий `ObjectIndex`
+перечислением полей, не меняется. Потребители: META-58, DAV-24, JMAP-34; in-memory и тесты набора — `tp-testkit`.
 Изменения: `ModSeq` — из счётчика учётной записи (как у писем), у каждого изменения свой; `Collection::state` — наибольший `ModSeq`
 коллекции (CTag). `changes(collection, since, limit) -> Changes<String>` (имена, RFC 6578; повторно созданное имя — не в `destroyed`),
 `collection_changes(kind, since, limit) -> Changes<CollectionId>` (JMAP `Calendar/changes`, `AddressBook/changes`),
@@ -830,3 +845,7 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   без catch-all; по умолчанию — только основной через `get`), правило — `meta::account_addresses`.
 - 2026-11-12 — CTR-55 (волна contracts-38): `GroupStore::held_after(tenant, group, after, limit)` и `HeldCursor { held_at, id }` —
   продолжение очереди модерации по курсору (по умолчанию — `Internal`); правило страницы — `groups::held_page`.
+- 2026-11-12 — CTR-54 (волна contracts-38): `DavStore::move_object` и `MoveOutcome`/`Moved` — перенос объекта между коллекциями с
+  сохранением `id` (по умолчанию — `Internal`); поиск контактов — `CardSearch`, `NewCard`, `DavStore::put_card` (по умолчанию —
+  `put_object`), `DavStore::find_cards` (по умолчанию — все объекты). По сравнению с карточкой: поисковые строки — не поле
+  `ObjectIndex`, а параметр `put_card` (существующий код не меняется).

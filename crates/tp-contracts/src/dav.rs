@@ -51,6 +51,12 @@ pub const MAX_PROPERTY_LEN: usize = 255;
 /// Наибольшая длина UID объекта, байт.
 pub const MAX_UID_LEN: usize = 1024;
 
+/// Наибольшее число поисковых строк контакта ([`CardSearch`], CTR-54).
+pub const MAX_CARD_SEARCH_STRINGS: usize = 64;
+
+/// Наибольшая длина поисковой строки контакта ([`CardSearch`]), байт.
+pub const MAX_CARD_SEARCH_LEN: usize = 255;
+
 /// Вид коллекции.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -224,6 +230,70 @@ impl Collection {
             return Err(Error::invalid("недопустимые компоненты коллекции"));
         }
         Ok(())
+    }
+}
+
+/// Поисковые строки контакта (CTR-54): полное имя, части имени, адреса e-mail — в нижнем регистре. Вычисляет
+/// вызывающий из тела (`tp_dav::index::card`), хранилище хранит их с объектом ([`DavStore::put_card`]) и ищет по
+/// вхождению подстроки ([`DavStore::find_cards`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CardSearch {
+    /// Строки: нижний регистр, непустые, без управляющих символов и повторов, не длиннее [`MAX_CARD_SEARCH_LEN`]
+    /// байт, не больше [`MAX_CARD_SEARCH_STRINGS`].
+    pub strings: Vec<String>,
+}
+
+impl CardSearch {
+    /// Собирает индекс из значений контакта: пробелы по краям убираются, нижний регистр, управляющие символы
+    /// заменяются пробелом, строка обрезается до [`MAX_CARD_SEARCH_LEN`] байт по границе символа; пустые и повторы
+    /// пропускаются, лишние сверх [`MAX_CARD_SEARCH_STRINGS`] отбрасываются.
+    pub fn new<S: AsRef<str>>(values: impl IntoIterator<Item = S>) -> Self {
+        let mut strings: Vec<String> = Vec::new();
+        for value in values {
+            let mut s: String = value
+                .as_ref()
+                .trim()
+                .to_lowercase()
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let mut end = s.len().min(MAX_CARD_SEARCH_LEN);
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            if !s.is_empty() && !strings.contains(&s) {
+                strings.push(s);
+            }
+            if strings.len() == MAX_CARD_SEARCH_STRINGS {
+                break;
+            }
+        }
+        Self { strings }
+    }
+
+    /// Проверяет правила поля [`CardSearch::strings`]; иначе — `Error::Invalid`.
+    pub fn validate(&self) -> Result<()> {
+        let ok = self.strings.len() <= MAX_CARD_SEARCH_STRINGS
+            && self.strings.iter().enumerate().all(|(i, s)| {
+                !s.is_empty()
+                    && plain(s, MAX_CARD_SEARCH_LEN)
+                    && *s == s.to_lowercase()
+                    && !self.strings[..i].contains(s)
+            });
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::invalid("недопустимые поисковые строки контакта"))
+        }
+    }
+
+    /// Контакт — кандидат поиска `needle`: какая-либо строка содержит `needle` в нижнем регистре; пустой `needle`
+    /// подходит любому контакту. Точную проверку фильтра (поле, слова) делает вызывающий по телу.
+    pub fn matches(&self, needle: &str) -> bool {
+        let needle = needle.trim().to_lowercase();
+        needle.is_empty() || self.strings.iter().any(|s| s.contains(&needle))
     }
 }
 
@@ -401,6 +471,45 @@ pub enum DeleteOutcome {
     PreconditionFailed,
 }
 
+/// Записываемый контакт с поисковыми строками ([`DavStore::put_card`], CTR-54).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewCard {
+    /// Тело vCard.
+    pub body: String,
+    /// Индекс объекта; компонент — [`Component::Card`].
+    pub index: ObjectIndex,
+    /// Поисковые строки.
+    #[serde(default)]
+    pub search: CardSearch,
+}
+
+/// Объект перенесён в другую коллекцию ([`DavStore::move_object`], CTR-54).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Moved {
+    /// Идентификатор объекта — прежний.
+    pub id: DavObjectId,
+    /// Новый ETag.
+    pub etag: String,
+    /// `ModSeq` надгробия в исходной коллекции.
+    pub removed: ModSeq,
+    /// `ModSeq` создания в целевой коллекции (больше `removed`).
+    pub modseq: ModSeq,
+}
+
+/// Результат [`DavStore::move_object`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MoveOutcome {
+    /// Перенесён.
+    Moved(Moved),
+    /// Не выполнено условие для исходного ресурса или имя занято в целевой коллекции (HTTP 412); ничего не изменено.
+    PreconditionFailed,
+    /// В целевой коллекции уже есть объект с этим UID под именем `name`; ничего не изменено.
+    UidConflict {
+        /// Имя ресурса целевой коллекции с этим UID.
+        name: String,
+    },
+}
+
 /// Лимиты хранилища — из конфигурации реализации (`meta`); `tp-dav` публикует их (`max-resource-size`), JMAP —
 /// в capabilities. Превышение — `Error::QuotaExceeded`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +683,77 @@ pub trait DavStore: Send + Sync + 'static {
         pre: Precondition,
     ) -> Result<DeleteOutcome>;
 
+    /// Переносит ресурс `name` коллекции `from` в коллекцию `to` той же учётной записи одной транзакцией (CTR-54,
+    /// решение 80; JMAP `ContactCard/set` и `CalendarEvent/set` со сменой коллекции, WebDAV `MOVE`). Имя ресурса,
+    /// [`DavObject::id`], тело, индекс и поисковые строки ([`CardSearch`]) сохраняются; ETag и `ModSeq` — новые: в `from`
+    /// остаётся надгробие ([`Moved::removed`], видно в [`DavStore::changes`]), в `to` — создание ([`Moved::modseq`]);
+    /// в [`DavStore::account_changes`] объект — в `updated` (идентификатор не менялся). Сигнал [`dav_changed`] — по
+    /// обеим коллекциям. Проверки по порядку: нет любой из коллекций или ресурса при [`Precondition::Any`] —
+    /// `NotFound`; `from == to`, коллекции разного вида или компонент объекта не из [`Collection::components`]
+    /// целевой — `Invalid`; условие `pre` к исходному ресурсу ([`Precondition::IfMatch`] с другим ETag или без
+    /// ресурса; [`Precondition::IfNoneMatch`] — как `Any`) и свободное имя `name` в `to` — иначе
+    /// [`MoveOutcome::PreconditionFailed`]; UID у ресурса `to` — [`MoveOutcome::UidConflict`]; в `to` уже
+    /// [`DavLimits::max_objects`] — `QuotaExceeded`. По умолчанию — `Error::Internal` (реализации — `tp-meta`,
+    /// `tp-testkit`).
+    async fn move_object(
+        &self,
+        scope: AccountScope,
+        from: CollectionId,
+        name: &str,
+        to: CollectionId,
+        pre: Precondition,
+    ) -> Result<MoveOutcome> {
+        let _ = (scope, from, name, to, pre);
+        Err(Error::internal("DavStore::move_object не реализован"))
+    }
+
+    /// [`DavStore::put_object`] для контакта с поисковыми строками [`NewCard::search`] (CTR-54): те же проверки и исходы, плюс
+    /// [`CardSearch::validate`] и компонент [`Component::Card`] — иначе `Invalid`. Строки заменяются при каждой
+    /// записи; запись через `put_object` оставляет объект без поисковых строк. По умолчанию — проверка и
+    /// `put_object`, строки не хранятся (хранилище без поискового индекса: [`DavStore::find_cards`] по умолчанию
+    /// возвращает все объекты).
+    async fn put_card(
+        &self,
+        scope: AccountScope,
+        collection: CollectionId,
+        name: &str,
+        card: NewCard,
+        pre: Precondition,
+    ) -> Result<PutOutcome> {
+        card.search.validate()?;
+        if card.index.component != Component::Card {
+            return Err(Error::invalid(
+                "поисковые строки — только у контакта (VCARD)",
+            ));
+        }
+        self.put_object(scope, collection, name, card.body, card.index, pre)
+            .await
+    }
+
+    /// Кандидаты поиска контактов (CTR-54; `addressbook-query` с `text-match`, JMAP `ContactCard/query`): объекты
+    /// коллекции, у которых какая-либо поисковая строка содержит `needle` ([`CardSearch::matches`]; пустой `needle` —
+    /// все), по имени, не более `limit`; ровно `limit` в ответе — выборка могла быть обрезана. Точную проверку
+    /// фильтра делает вызывающий по телу (как после [`DavStore::in_range`]). Объект без поисковых строк (записан
+    /// `put_object`) находится только пустым `needle`. Нет коллекции — `NotFound`. По умолчанию — хранилище без
+    /// поискового индекса: все объекты коллекции ([`DavStore::list_objects`] и [`DavStore::multiget`]), `needle` и
+    /// `limit` не применяются, чтобы не потерять совпадения.
+    async fn find_cards(
+        &self,
+        scope: AccountScope,
+        collection: CollectionId,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<DavObject>> {
+        let _ = (needle, limit);
+        let names: Vec<String> = self
+            .list_objects(scope, collection)
+            .await?
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        self.multiget(scope, collection, &names).await
+    }
+
     // ---------- Изменения ----------
 
     /// Изменения ресурсов коллекции после `since` — имена (RFC 6578 `sync-collection`), не более `limit`, по `ModSeq`.
@@ -672,6 +852,55 @@ mod tests {
         for bad in ["", "a\"b", "a b", "a\\b", &"e".repeat(65)] {
             assert!(!valid_etag(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn card_search() {
+        let search = CardSearch::new([
+            " Анна Петрова ",
+            "Петрова",
+            "Ann.Petrova@Example.COM",
+            "петрова",
+            "",
+            "a\tb",
+        ]);
+        assert_eq!(
+            search.strings,
+            ["анна петрова", "петрова", "ann.petrova@example.com", "a b"]
+        );
+        assert_eq!(search.validate(), Ok(()));
+        // По части имени и по адресу, без учёта регистра; пустой запрос — любой контакт.
+        assert!(search.matches("ПЕТР"));
+        assert!(search.matches("petrova@ex"));
+        assert!(search.matches(" "));
+        assert!(!search.matches("иван"));
+        assert!(CardSearch::default().matches(""));
+        assert!(!CardSearch::default().matches("a"));
+
+        // Пределы числа и длины; обрезка — по границе символа.
+        let many = CardSearch::new((0..200).map(|i| format!("s{i}")));
+        assert_eq!(many.strings.len(), MAX_CARD_SEARCH_STRINGS);
+        let long = CardSearch::new(["я".repeat(MAX_CARD_SEARCH_LEN)]);
+        assert_eq!(long.strings[0].len(), MAX_CARD_SEARCH_LEN - 1);
+        assert_eq!(long.validate(), Ok(()));
+
+        for bad in [
+            vec!["Верхний".to_owned()],
+            vec![String::new()],
+            vec!["a".to_owned(), "a".to_owned()],
+            vec!["x".repeat(MAX_CARD_SEARCH_LEN + 1)],
+            vec!["a\nb".to_owned()],
+            (0..=MAX_CARD_SEARCH_STRINGS)
+                .map(|i| i.to_string())
+                .collect(),
+        ] {
+            let search = CardSearch { strings: bad };
+            assert!(search.validate().is_err(), "{search:?}");
+        }
+        assert_eq!(
+            serde_json::to_value(CardSearch::new(["a", "b"])).ok(),
+            Some(serde_json::json!(["a", "b"]))
+        );
     }
 
     #[test]
