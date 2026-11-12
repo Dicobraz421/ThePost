@@ -26,8 +26,8 @@ use tp_contracts::config::duration;
 use tp_contracts::events::CoreEventKind;
 use tp_contracts::ext::{Decision, DecisionHooks, FinalDelete};
 use tp_contracts::meta::{
-    AccountScope, Inserted, MessageStore, Policy, PolicyResolver, PolicyStore, QuotaUsage,
-    SpecialUse,
+    AccountScope, Inserted, MessageStore, Policy, PolicyResolver, PolicyStore, PolicyTarget,
+    QuotaUsage, SpecialUse,
 };
 use tp_contracts::retention::{
     PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashPurgeRule,
@@ -71,9 +71,6 @@ impl Default for RetentionConfig {
         }
     }
 }
-
-/// Уровень цепочки политик — тип контракта (CTR-25).
-pub use tp_contracts::meta::PolicyTarget;
 
 /// Колонка `policies.level` уровня.
 fn level(target: PolicyTarget) -> &'static str {
@@ -200,9 +197,11 @@ async fn resolve_in(
     )
 }
 
-impl PgMeta {
+/// Уровни цепочки для Admin API (CTR-25, META-70): единственный путь чтения и записи уровня (META-76).
+#[async_trait]
+impl PolicyStore for PgMeta {
     /// Политика одного уровня цепочки (без наложения); не задана — все поля `None`.
-    pub async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
+    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
         self.idempotent(|| async move {
         let mut tx = begin(&self.pool, tenant).await?;
         let row: Option<PolicyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -220,7 +219,7 @@ impl PgMeta {
     }
 
     /// Задаёт политику уровня целиком (Admin API); политика без заданных полей удаляет уровень.
-    pub async fn set_policy(
+    async fn set_policy(
         &self,
         tenant: TenantId,
         target: PolicyTarget,
@@ -271,23 +270,6 @@ impl PgMeta {
         crate::commits::commit(tx).await?;
         Ok(())
 }).await
-    }
-}
-
-/// Уровни цепочки для Admin API (CTR-25) — [`PgMeta::policy`] и [`PgMeta::set_policy`].
-#[async_trait]
-impl PolicyStore for PgMeta {
-    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
-        PgMeta::policy(self, tenant, target).await
-    }
-
-    async fn set_policy(
-        &self,
-        tenant: TenantId,
-        target: PolicyTarget,
-        policy: &Policy,
-    ) -> Result<()> {
-        PgMeta::set_policy(self, tenant, target, policy).await
     }
 }
 

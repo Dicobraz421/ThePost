@@ -8,17 +8,17 @@ use time::OffsetDateTime;
 use tp_contracts::bus::EventKind;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::meta::{
-    AccountScope, ChangeLog, MailboxStore, MessageStore, NewMessage, Policy, SpecialUse,
+    AccountScope, ChangeLog, MailboxStore, MessageStore, NewMessage, Policy, PolicyStore,
+    PolicyTarget, SpecialUse,
 };
 use tp_contracts::retention::{
     Quota, TrashObject, TrashPurge, TrashPurgeRule, TrashStore, trash_changed,
 };
 use tp_contracts::{BlobHash, BlobKey, Gen, MailboxId, TenantId};
-use tp_meta::retention::PolicyTarget;
 use tp_meta::{MetaConfig, PgMeta};
 use tp_testkit::suite::{TrashPurgeAdmin, TrashPurgeFixture, trash_purge};
 
-/// Правило организации — через `PgMeta::set_policy`, прочие поля уровня сохраняются.
+/// Правило организации — через `PolicyStore::set_policy`, прочие поля уровня сохраняются.
 struct Admin<'a>(&'a PgMeta);
 
 #[async_trait]
