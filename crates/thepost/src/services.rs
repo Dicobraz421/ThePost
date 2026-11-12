@@ -18,6 +18,7 @@
 //!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -677,8 +678,8 @@ pub fn system_resolver() -> Result<mail_auth::MessageAuthenticator> {
 }
 
 /// Проверка учётных данных под защитой от перебора: `AbuseGuard::check` до проверки, `failure` после отказа
-/// (`Forbidden`), `success` после входа. Попытка — учётная запись по имени входа (пароль); адреса клиента контракт
-/// `Authenticator` не передаёт — счётчики адреса и подсети ждут его в протоколах. Заблокированная попытка —
+/// (`Forbidden`), `success` после входа. Попытка — адрес клиента соединения (`peer`, CTR-57: счётчики адреса и
+/// подсети) и учётная запись по имени входа (пароль). Заблокированная попытка —
 /// `Forbidden` (протокол отвечает как на неверный пароль, учётные данные не проверяются).
 ///
 /// Хранилище блокировок недоступно — решение по `auth.abuse.fail_closed` принимает `AbuseGuard` (AUTH-11,
@@ -715,9 +716,9 @@ impl Guarded {
         }
     }
 
-    /// Попытка входа по предъявленным данным: для пароля — учётная запись по имени входа (нет или ошибка
-    /// каталога — без учётной записи); токен и Kerberos — субъект известен только после проверки.
-    async fn attempt(&self, credentials: &Credentials) -> tp_auth::Attempt {
+    /// Попытка входа с адреса `peer` по предъявленным данным: для пароля — учётная запись по имени входа (нет или
+    /// ошибка каталога — без учётной записи); токен и Kerberos — субъект известен только после проверки.
+    async fn attempt(&self, credentials: &Credentials, peer: Option<IpAddr>) -> tp_auth::Attempt {
         let account = match credentials {
             Credentials::Password { login, .. } => {
                 match self.accounts.by_login(self.tenant, login).await {
@@ -730,20 +731,20 @@ impl Guarded {
             }
             _ => None,
         };
-        tp_auth::Attempt { ip: None, account }
+        tp_auth::Attempt { ip: peer, account }
     }
 }
 
 #[async_trait]
 impl Authenticator for Guarded {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
-        let attempt = self.attempt(&credentials).await;
+    async fn verify(&self, credentials: Credentials, peer: Option<IpAddr>) -> Result<Principal> {
+        let attempt = self.attempt(&credentials, peer).await;
         match self.guard.check(self.tenant, &attempt).await {
             Ok(Some(_)) => return Err(Error::Forbidden),
             Ok(None) => {}
             Err(e) => return Err(e),
         }
-        match self.inner.verify(credentials).await {
+        match self.inner.verify(credentials, peer).await {
             Ok(p) => {
                 let ok = tp_auth::Attempt {
                     ip: attempt.ip,
@@ -955,19 +956,90 @@ mod tests {
     async fn guarded_blocks_account_after_failures() {
         let g = guarded(MemAbuseBlocks::default(), 3, false).await;
         for _ in 0..2 {
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+            assert_eq!(
+                g.verify(password("wrong"), None).await,
+                Err(Error::Forbidden)
+            );
         }
-        g.verify(password("right")).await.expect("login");
+        g.verify(password("right"), None).await.expect("login");
         for _ in 0..2 {
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+            assert_eq!(
+                g.verify(password("wrong"), None).await,
+                Err(Error::Forbidden)
+            );
         }
-        g.verify(password("right"))
+        g.verify(password("right"), None)
             .await
             .expect("login after reset");
         for _ in 0..3 {
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+            assert_eq!(
+                g.verify(password("wrong"), None).await,
+                Err(Error::Forbidden)
+            );
         }
-        assert_eq!(g.verify(password("right")).await, Err(Error::Forbidden));
+        assert_eq!(
+            g.verify(password("right"), None).await,
+            Err(Error::Forbidden)
+        );
+    }
+
+    /// CTR-57: неудачи считаются и по адресу клиента — порог блокирует адрес (и верный пароль с него), вход с
+    /// другого адреса проверяется.
+    #[tokio::test]
+    async fn guarded_blocks_address_after_failures() {
+        let mut g = guarded(MemAbuseBlocks::default(), 1000, false).await;
+        let cfg = tp_auth::AbuseConfig {
+            ip_failures: 2,
+            account_failures: 1000,
+            ..tp_auth::AbuseConfig::default()
+        };
+        g.guard = tp_auth::AbuseGuard::new(cfg, Arc::new(MemAbuseBlocks::default()));
+        let peer = Some(IpAddr::from([192, 0, 2, 7]));
+        let other = Some(IpAddr::from([198, 51, 100, 9]));
+        for _ in 0..2 {
+            assert_eq!(
+                g.verify(password("wrong"), peer).await,
+                Err(Error::Forbidden)
+            );
+        }
+        assert_eq!(
+            g.verify(password("right"), peer).await,
+            Err(Error::Forbidden)
+        );
+        g.verify(password("right"), other)
+            .await
+            .expect("login from another address");
+    }
+
+    /// APP-40 (SRS 6.3): неудачи с разными несуществующими именами входа (учётной записи нет) засчитываются адресу —
+    /// порог блокирует адрес, в том числе для существующей учётной записи с верным паролем; вход с другого адреса
+    /// работает.
+    #[tokio::test]
+    async fn guarded_blocks_address_after_unknown_logins() {
+        let mut g = guarded(MemAbuseBlocks::default(), 1000, false).await;
+        let cfg = tp_auth::AbuseConfig {
+            ip_failures: 3,
+            account_failures: 1000,
+            ..tp_auth::AbuseConfig::default()
+        };
+        g.guard = tp_auth::AbuseGuard::new(cfg, Arc::new(MemAbuseBlocks::default()));
+        let peer = Some(IpAddr::from([192, 0, 2, 7]));
+        let other = Some(IpAddr::from([198, 51, 100, 9]));
+        for i in 0..3 {
+            let unknown = Credentials::Password {
+                login: format!("nobody{i}@example.org"),
+                secret: "guess".into(),
+            };
+            assert_eq!(g.verify(unknown, peer).await, Err(Error::Forbidden));
+        }
+        assert_eq!(
+            g.verify(password("right"), peer).await,
+            Err(Error::Forbidden),
+            "адрес заблокирован"
+        );
+        g.verify(password("right"), other)
+            .await
+            .expect("login from another address");
     }
 
     /// Хранилище блокировок недоступно, `auth.abuse.fail_closed: false` — вход проверяется (решение владельца #253,
@@ -977,8 +1049,11 @@ mod tests {
         let blocks = MemAbuseBlocks::default();
         blocks.fail_next(Error::UNAVAILABLE);
         let g = guarded(blocks, 3, false).await;
-        g.verify(password("right")).await.expect("login");
-        assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+        g.verify(password("right"), None).await.expect("login");
+        assert_eq!(
+            g.verify(password("wrong"), None).await,
+            Err(Error::Forbidden)
+        );
     }
 
     /// Хранилище блокировок недоступно, `auth.abuse.fail_closed: true` — вход запрещён (временная ошибка, учётные
@@ -988,12 +1063,12 @@ mod tests {
         let blocks = MemAbuseBlocks::default();
         blocks.fail_next(Error::UNAVAILABLE);
         let g = guarded(blocks, 3, true).await;
-        let refused = g.verify(password("right")).await;
+        let refused = g.verify(password("right"), None).await;
         assert!(
             matches!(refused, Err(Error::Unavailable { .. })),
             "{refused:?}"
         );
-        g.verify(password("right"))
+        g.verify(password("right"), None)
             .await
             .expect("login after store recovered");
     }
@@ -1250,6 +1325,8 @@ mod tests {
                     display_name: login.into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: tp_contracts::meta::AccountKind::User,
                 },
             )
             .await
@@ -1308,7 +1385,7 @@ mod tests {
                 .expect("submit");
             assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued, "{sent:?}");
         }
-        let held = GroupStore::held(&meta, t, Some(group.id), 10)
+        let held = GroupStore::held(&meta, t, Some(group.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 2, "{held:?}");
@@ -1374,7 +1451,7 @@ mod tests {
         drop(tx);
         assert_eq!(queued, 1, "DSN отказа не в очереди");
         assert!(
-            GroupStore::held(&meta, t, Some(group.id), 10)
+            GroupStore::held(&meta, t, Some(group.id), None, 10)
                 .await
                 .expect("held")
                 .is_empty()

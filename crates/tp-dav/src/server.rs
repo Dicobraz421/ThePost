@@ -9,11 +9,12 @@
 //! по умолчанию `caldav: /dav/`, `carddav: /dav/`); здесь эти пути не обслуживаются.
 
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -154,14 +155,27 @@ impl Cx<'_> {
         &self.principal.login
     }
 
-    /// Адреса календарного пользователя вошедшего ([`crate::itip::address`]): имя входа, если оно — адрес.
-    pub(crate) fn addresses(&self) -> Vec<String> {
+    /// Адреса календарного пользователя вошедшего ([`crate::itip::address`]; `calendar-user-address-set`, свои
+    /// при разборе участников): с планированием — все адреса учётной записи (`Account::addresses`, основной первым,
+    /// затем псевдонимы), без него или без учётной записи — имя входа, если оно — адрес.
+    pub(crate) async fn addresses(&self) -> tp_contracts::Result<Vec<String>> {
+        if let Some(s) = &self.dav.schedule
+            && let Some(account) = s
+                .accounts
+                .get(self.scope.tenant, self.scope.account)
+                .await?
+        {
+            let all = account.addresses();
+            if !all.is_empty() {
+                return Ok(all);
+            }
+        }
         let login = crate::itip::address(&self.principal.login);
-        if login.contains('@') {
+        Ok(if login.contains('@') {
             vec![login]
         } else {
             Vec::new()
-        }
+        })
     }
 
     /// Заголовок как строка без пробелов по краям.
@@ -200,7 +214,12 @@ async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {
     if parts.method == Method::OPTIONS {
         return options();
     }
-    let principal = match authenticate(dav.d.auth.as_ref(), &parts.headers).await {
+    // Адрес клиента соединения ставит сервер HTTP (`tp_platform::service_http`); без соединения — неизвестен.
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    let principal = match authenticate(dav.d.auth.as_ref(), &parts.headers, peer).await {
         Ok(p) => p,
         Err(e) => return auth_error(&e),
     };
@@ -251,10 +270,11 @@ async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {
     result.unwrap_or_else(|e| store_error(&e))
 }
 
-/// Субъект по заголовку `Authorization`; нет заголовка или неверные данные — `Forbidden`.
+/// Субъект по заголовку `Authorization` запроса клиента `peer`; нет заголовка или неверные данные — `Forbidden`.
 async fn authenticate(
     auth: &dyn Authenticator,
     headers: &HeaderMap,
+    peer: Option<IpAddr>,
 ) -> tp_contracts::Result<Principal> {
     let value = headers
         .get(header::AUTHORIZATION)
@@ -275,7 +295,7 @@ async fn authenticate(
     } else {
         return Err(Error::Forbidden);
     };
-    auth.verify(creds).await
+    auth.verify(creds, peer).await
 }
 
 fn auth_error(e: &Error) -> Response {

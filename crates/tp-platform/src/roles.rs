@@ -35,6 +35,12 @@ use crate::pressure::{ResourceSource, ResourceWatch};
 use crate::service_http::Health;
 use crate::telemetry::Metrics;
 
+/// Роль `role` узла с ролями `roles` работает с метаданными (PostgreSQL) и хранилищем писем (BLOB): все роли,
+/// кроме smtp-in в режиме edge — узел DMZ без доступа к хранилищам данных (решение 2026-10-30, SRS 2.6).
+pub fn uses_data_layer(roles: &RoleSet, role: Role) -> bool {
+    !(roles.edge && role == Role::SmtpIn)
+}
+
 /// Секция `runtime`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]

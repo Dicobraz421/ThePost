@@ -23,7 +23,7 @@
   'blob': {'url': 'file:///var/lib/thepost/blob'},
   'tls': {
     'cert_file': tls_dir ~ '/fullchain.pem',
-    'key_file': tls_dir ~ '/privkey.pem',
+    'key': {'secret': 'thepost/tls#key'},
   },
   'http': {
     'jmap': {'listen': thepost_listen_address ~ ':443'},
@@ -33,6 +33,7 @@
     {'listen': thepost_listen_address ~ ':143'},
     {'listen': thepost_listen_address ~ ':993', 'implicit_tls': true},
   ]},
+  'sieve': {'managesieve': {'listen': [{'listen': thepost_listen_address ~ ':4190'}]}},
   'smtp': {
     'hostname': thepost_hostname,
     'inbound': [{'listen': thepost_listen_address ~ ':25'}],

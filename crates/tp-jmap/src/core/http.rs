@@ -4,11 +4,14 @@
 //! Загрузка и скачивание blob — `crate::blob`, push (EventSource, WebSocket) — `crate::push`;
 //! автонастройка клиентов (`/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`) — `crate::autoconfig`.
 
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, FromRequestParts, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -19,6 +22,24 @@ use tp_contracts::Error;
 use tp_contracts::auth::{Credentials, Principal};
 
 use super::{Jmap, Problem};
+
+/// Адрес клиента HTTP-соединения: расширение запроса `ConnectInfo<SocketAddr>`, которое ставит сервер HTTP
+/// (`tp_platform::service_http`); `None` — запрос без соединения клиента (маршрутизатор вызван напрямую).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Peer(pub(crate) Option<IpAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for Peer {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Infallible> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.ip()),
+        ))
+    }
+}
 
 impl Jmap {
     /// Маршруты JMAP; TLS, PROXY и слушатель — у вызывающего (`tp-platform`).
@@ -48,8 +69,13 @@ impl Jmap {
             .with_state(self)
     }
 
-    /// Субъект по заголовку `Authorization`; нет заголовка или неверные данные — `Forbidden`.
-    pub async fn authenticate(&self, headers: &HeaderMap) -> tp_contracts::Result<Principal> {
+    /// Субъект по заголовку `Authorization` запроса клиента `peer` (адрес соединения — для защиты от перебора,
+    /// CTR-57; `None` — запрос без соединения клиента); нет заголовка или неверные данные — `Forbidden`.
+    pub async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<IpAddr>,
+    ) -> tp_contracts::Result<Principal> {
         let value = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -69,7 +95,7 @@ impl Jmap {
         } else {
             return Err(Error::Forbidden);
         };
-        self.d.auth.verify(creds).await
+        self.d.auth.verify(creds, peer).await
     }
 
     pub(crate) fn base_url(&self, headers: &HeaderMap) -> String {
@@ -117,8 +143,8 @@ pub(crate) fn auth_error(e: &Error) -> Response {
     resp
 }
 
-async fn session(State(j): State<Arc<Jmap>>, headers: HeaderMap) -> Response {
-    let p = match j.authenticate(&headers).await {
+async fn session(State(j): State<Arc<Jmap>>, peer: Peer, headers: HeaderMap) -> Response {
+    let p = match j.authenticate(&headers, peer.0).await {
         Ok(p) => p,
         Err(e) => return auth_error(&e),
     };
@@ -131,8 +157,8 @@ async fn session(State(j): State<Arc<Jmap>>, headers: HeaderMap) -> Response {
     resp
 }
 
-async fn api(State(j): State<Arc<Jmap>>, headers: HeaderMap, body: Body) -> Response {
-    let p = match j.authenticate(&headers).await {
+async fn api(State(j): State<Arc<Jmap>>, peer: Peer, headers: HeaderMap, body: Body) -> Response {
+    let p = match j.authenticate(&headers, peer.0).await {
         Ok(p) => p,
         Err(e) => return auth_error(&e),
     };

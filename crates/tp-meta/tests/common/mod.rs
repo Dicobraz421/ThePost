@@ -235,7 +235,7 @@ pub async fn domain(pool: &DbPool, tenant: TenantId) -> (DomainId, String) {
 
 /// Новая учётная запись в новой организации.
 pub async fn account(meta: &PgMeta) -> tp_contracts::meta::AccountScope {
-    use tp_contracts::meta::{AccountStore, AccountUpsert};
+    use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
     let tenant = tenant(meta.pool()).await;
     let (domain, name) = domain(meta.pool(), tenant).await;
     let acc = meta
@@ -247,6 +247,8 @@ pub async fn account(meta: &PgMeta) -> tp_contracts::meta::AccountScope {
                 display_name: "User".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -409,6 +411,8 @@ impl TwoShards {
                     display_name: "User".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: tp_contracts::meta::AccountKind::User,
                 },
             )
             .await

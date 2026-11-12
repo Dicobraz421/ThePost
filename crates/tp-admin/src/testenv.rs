@@ -15,7 +15,9 @@ use tp_contracts::auth::Principal;
 use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse};
+use tp_contracts::meta::{
+    AccountKind, AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse,
+};
 use tp_contracts::{AccountId, DomainId, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemAuditLog, MemBlobIndex, MemBlobStore,
@@ -347,6 +349,8 @@ impl Env {
                     display_name: login.to_owned(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await

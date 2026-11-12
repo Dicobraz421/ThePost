@@ -11,6 +11,9 @@
 //! Остановка узла ([`SessionCtx::shutdown`]): сессия, ожидающая команду, отвечает `* BYE` и закрывается;
 //! [`Server::serve`] перестаёт принимать соединения и ждёт сессии не дольше
 //! [`Timeouts::drain`](crate::config::Timeouts).
+//!
+//! Вход учётной записи запрещён (сигнал `AccountDisabled`, IMAP-22): сессия после входа отвечает
+//! `* BYE Account disabled` — сразу, если ждёт команду или в `IDLE`, иначе по завершении текущей команды.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -37,6 +40,7 @@ use tp_platform::{Conn, Listener};
 use crate::audit::Audit;
 use crate::compress::Deflate;
 use crate::config::ImapConfig;
+use crate::disable::{Registration, Sessions};
 use crate::ext::Extensions;
 use crate::proto::types::auth::AuthMechanism;
 use crate::proto::types::command::{CommandBody, FetchModifier, SelectParameter};
@@ -63,14 +67,15 @@ pub trait Transport: Send + Sized + 'static {
     /// Канал защищён TLS.
     fn tls(&self) -> bool;
 
+    /// Адрес клиента соединения (из заголовка PROXY или адрес TCP-собеседника): защита от перебора
+    /// (`SaslContext::peer`, CTR-57) и журнал аудита ящиков (IMAP-15).
+    fn peer(&self) -> IpAddr;
+
     /// Можно предложить STARTTLS.
     fn can_starttls(&self) -> bool;
 
     /// Рукопожатие TLS после ответа на `STARTTLS`.
     fn starttls(self) -> impl Future<Output = Result<Self>> + Send;
-
-    /// Адрес клиента для журнала аудита.
-    fn client(&self) -> Option<IpAddr>;
 }
 
 impl Transport for Conn {
@@ -84,16 +89,16 @@ impl Transport for Conn {
         self.info.tls
     }
 
+    fn peer(&self) -> IpAddr {
+        self.info.client.ip()
+    }
+
     fn can_starttls(&self) -> bool {
         Conn::can_starttls(self)
     }
 
     fn starttls(self) -> impl Future<Output = Result<Self>> + Send {
         Conn::starttls(self)
-    }
-
-    fn client(&self) -> Option<IpAddr> {
-        Some(self.info.client.ip())
     }
 }
 
@@ -163,6 +168,8 @@ pub(crate) struct Selected {
 pub struct Session<T: Transport> {
     pub(crate) ctx: Arc<SessionCtx>,
     pub(crate) conn: Option<T>,
+    /// Адрес клиента соединения.
+    pub(crate) peer: IpAddr,
     pub(crate) reader: Reader,
     pub(crate) out: Vec<u8>,
     pub(crate) principal: Option<Principal>,
@@ -180,6 +187,9 @@ pub struct Session<T: Transport> {
     pub(crate) audit: Audit,
     /// Сжатие потока (`COMPRESS DEFLATE`).
     pub(crate) deflate: Option<Deflate>,
+    /// Открытые сессии сервера: регистрация после входа (закрытие по `AccountDisabled`).
+    sessions: Option<Sessions>,
+    registration: Option<Registration>,
     errors: u32,
     auth_failures: u32,
     /// Сессия завершается после отправки накопленных ответов.
@@ -234,9 +244,10 @@ impl<T: Transport> Session<T> {
     /// Сессия соединения.
     pub fn new(ctx: Arc<SessionCtx>, conn: T) -> Self {
         let reader = reader(&ctx.config);
-        let audit = Audit::new(ctx.deps.audit.clone(), "imap", conn.client());
+        let audit = Audit::new(ctx.deps.audit.clone(), "imap", Some(conn.peer()));
         Self {
             ctx,
+            peer: conn.peer(),
             conn: Some(conn),
             reader,
             out: Vec::new(),
@@ -248,6 +259,8 @@ impl<T: Transport> Session<T> {
             ext: Extensions::default(),
             audit,
             deflate: None,
+            sessions: None,
+            registration: None,
             errors: 0,
             auth_failures: 0,
             close: false,
@@ -258,6 +271,25 @@ impl<T: Transport> Session<T> {
     pub fn with_extensions(mut self, ext: Extensions) -> Self {
         self.ext = ext;
         self
+    }
+
+    /// Регистрирует сессию после входа в открытых сессиях сервера: `AccountDisabled` её закрывает.
+    pub(crate) fn with_sessions(mut self, sessions: Sessions) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// Отменяется, когда вход учётной записи запрещён; без регистрации — никогда.
+    pub(crate) fn disabled(&self) -> CancellationToken {
+        self.registration
+            .as_ref()
+            .map_or_else(CancellationToken::new, |r| r.token().clone())
+    }
+
+    /// Вход учётной записи запрещён: `BYE`, сессия закрывается.
+    pub(crate) fn account_disabled(&mut self) {
+        self.bye(None, "Account disabled");
+        self.close = true;
     }
 
     /// Ведёт сессию до `LOGOUT`, закрытия клиентом, таймаута или остановки узла.
@@ -316,6 +348,11 @@ impl<T: Transport> Session<T> {
     /// остановка узла — `BYE` уже отправлен).
     pub(crate) async fn read_input(&mut self, expect: Expect) -> Result<Option<Input>> {
         let mut buf = vec![0u8; 16 * 1024];
+        let disabled = self.disabled();
+        if disabled.is_cancelled() {
+            self.account_disabled();
+            return self.end().await;
+        }
         loop {
             while let Some(input) = self.reader.next(expect) {
                 match input {
@@ -340,27 +377,32 @@ impl<T: Transport> Session<T> {
             let io = conn.io();
             let read = tokio::select! {
                 biased;
-                _ = shutdown.cancelled() => None,
-                r = tokio::time::timeout(timeout, io.read(&mut buf)) => Some(r),
+                _ = shutdown.cancelled() => Err(Stop::Shutdown),
+                _ = disabled.cancelled() => Err(Stop::Disabled),
+                r = tokio::time::timeout(timeout, io.read(&mut buf)) => Ok(r),
             };
             match read {
-                None => {
+                Err(Stop::Shutdown) => {
                     self.bye(Some(proto::code("UNAVAILABLE")), "Server shutting down");
                     return self.end().await;
                 }
-                Some(Err(_)) => {
+                Err(Stop::Disabled) => {
+                    self.account_disabled();
+                    return self.end().await;
+                }
+                Ok(Err(_)) => {
                     self.bye(None, "Autologout: idle for too long");
                     return self.end().await;
                 }
-                Some(Ok(Ok(0))) => return Ok(None),
-                Some(Ok(Ok(n))) => {
+                Ok(Ok(Ok(0))) => return Ok(None),
+                Ok(Ok(Ok(n))) => {
                     if let Err(e) = self.received(&buf[..n]) {
                         tracing::debug!(error = %e, "imap: сжатый поток повреждён");
                         self.close = true;
                         return Ok(None);
                     }
                 }
-                Some(Ok(Err(e))) => return Err(io_error(e)),
+                Ok(Ok(Err(e))) => return Err(io_error(e)),
             }
         }
     }
@@ -863,7 +905,7 @@ impl<T: Transport> Session<T> {
             return;
         };
         let creds = Credentials::Password { login, secret };
-        match self.ctx.deps.auth.verify(creds).await {
+        match self.ctx.deps.auth.verify(creds, Some(self.peer)).await {
             Ok(p) => self.logged_in(tag, p),
             Err(Error::Forbidden) => self.auth_failed(tag, SaslFailure::Authentication),
             Err(e) => self.auth_unavailable(tag, &e),
@@ -900,6 +942,7 @@ impl<T: Transport> Session<T> {
         let ctx = SaslContext {
             service: "imap",
             tls,
+            peer: Some(self.peer),
         };
         let mut sasl = match self.ctx.deps.sasl.start(mech, &ctx) {
             Ok(s) => s,
@@ -952,6 +995,12 @@ impl<T: Transport> Session<T> {
 
     fn logged_in(&mut self, tag: &Tag<'static>, principal: Principal) {
         tracing::debug!(account = %principal.account, "imap: вход выполнен");
+        self.registration = self.sessions.as_ref().map(|s| {
+            s.register(AccountScope {
+                tenant: principal.tenant,
+                account: principal.account,
+            })
+        });
         self.principal = Some(principal);
         let caps = self.capabilities();
         self.ok(tag, Some(Code::Capability(caps)), "Logged in");
@@ -1040,6 +1089,12 @@ impl<T: Transport> Session<T> {
     }
 }
 
+/// Почему прервано ожидание ввода.
+enum Stop {
+    Shutdown,
+    Disabled,
+}
+
 pub(crate) fn io_error(e: std::io::Error) -> Error {
     tracing::debug!(error = %e, "imap: ошибка ввода-вывода");
     Error::UNAVAILABLE
@@ -1050,6 +1105,7 @@ pub(crate) fn io_error(e: std::io::Error) -> Error {
 pub struct Server {
     ctx: Arc<SessionCtx>,
     ext: Extensions,
+    sessions: Sessions,
 }
 
 impl fmt::Debug for Server {
@@ -1066,6 +1122,7 @@ impl Server {
         Self {
             ctx: Arc::new(ctx),
             ext: Extensions::default(),
+            sessions: Sessions::default(),
         }
     }
 
@@ -1076,10 +1133,17 @@ impl Server {
     }
 
     /// Принимает соединения до остановки узла, затем ждёт сессии не дольше `timeouts.drain`
-    /// (сессии получают `BYE`) и прерывает оставшиеся.
+    /// (сессии получают `BYE`) и прерывает оставшиеся. Сигнал `AccountDisabled` закрывает сессии учётной записи;
+    /// по `Resync` они сверяются с `Extensions::accounts`.
     pub async fn serve(&self, listener: Listener) -> Result<()> {
         let mut sessions = JoinSet::new();
         let shutdown = self.ctx.shutdown.clone();
+        self.sessions.start(
+            self.ctx.deps.bus.clone(),
+            self.ext.accounts.clone(),
+            self.ctx.config.timeouts.resubscribe,
+            shutdown.clone(),
+        );
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -1095,6 +1159,7 @@ impl Server {
                     let full = sessions.len() >= self.ctx.config.limits.max_connections;
                     let ctx = self.ctx.clone();
                     let ext = self.ext.clone();
+                    let open = self.sessions.clone();
                     let task = async move {
                         let peer = incoming.peer();
                         let conn = match incoming.establish().await {
@@ -1109,7 +1174,9 @@ impl Server {
                             return;
                         }
                         let client = conn.info.client;
-                        let session = Session::new(ctx, conn).with_extensions(ext);
+                        let session = Session::new(ctx, conn)
+                            .with_extensions(ext)
+                            .with_sessions(open);
                         if let Err(e) = session.run().await {
                             tracing::debug!(%client, error = %e, "imap: сессия прервана");
                         }

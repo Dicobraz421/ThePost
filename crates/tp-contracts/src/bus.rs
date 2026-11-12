@@ -89,6 +89,14 @@ pub enum EventKind {
     /// кто меняет справочник (модуль «Шардирование», администрирование), после фиксации; узлы сбрасывают кэш
     /// справочника (учётная запись → шард, список шардов, пулы).
     ShardsChanged,
+    /// Вход учётной записи `account` организации `tenant` запрещён (CTR-64): после фиксации `enabled = false` или
+    /// отключения ящика. Подписчики — протоколы с долгими сеансами (IMAP IDLE, JMAP push и EventSource) закрывают
+    /// сеансы учётной записи; по `Resync` и при запуске сверяются с хранилищем. Сигнал —
+    /// [`crate::meta::account_disabled`].
+    AccountDisabled {
+        /// Учётная запись.
+        account: AccountId,
+    },
     /// Сигналы подписки потеряны (переполнение буфера подписчика, переподключение слушателя): сверка с хранилищем.
     /// Шина вставляет его в поток подписки с `tenant`/`account` этой подписки (системная — `TenantId::DEFAULT`,
     /// `None`); `publish` с этим видом — `Invalid`.
@@ -193,6 +201,9 @@ mod tests {
                 account: AccountId::new(),
             },
             EventKind::ShardsChanged,
+            EventKind::AccountDisabled {
+                account: AccountId::new(),
+            },
         ] {
             assert!(kind.is_system(), "{kind:?}");
         }
