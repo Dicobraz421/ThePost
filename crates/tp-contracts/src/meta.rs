@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::bus::{Event, EventKind};
 use crate::error::{Error, Result};
 use crate::ids::{
     AccountId, BlobKey, DomainId, MailboxId, MessageId, ModSeq, TenantId, Uid, UidValidity,
@@ -192,11 +193,40 @@ pub fn account_aliases<'a>(
     out
 }
 
+/// Сигнал «вход учётной записи запрещён» (системный, `account = None`, [`EventKind::AccountDisabled`]; CTR-64).
+/// Публикует реализация [`AccountStore`] после фиксации `enabled = false` (`upsert` разрешённой ранее записи) и
+/// [`AccountStore::disable_account`]; протоколы с долгими сеансами (IMAP, JMAP) закрывают сеансы учётной записи.
+pub fn account_disabled(scope: AccountScope) -> Event {
+    Event {
+        tenant: scope.tenant,
+        account: None,
+        kind: EventKind::AccountDisabled {
+            account: scope.account,
+        },
+    }
+}
+
 /// Учётные записи организации.
 #[async_trait]
 pub trait AccountStore: Send + Sync + 'static {
     /// Учётная запись по идентификатору.
     async fn get(&self, tenant: TenantId, id: AccountId) -> Result<Option<Account>>;
+
+    /// Учётные записи по списку идентификаторов (CTR-63; имена участников группы, Admin API): в порядке `ids`,
+    /// не найденные (и чужой организации) пропускаются, повтор идентификатора — одна запись (первое вхождение).
+    /// По умолчанию — [`AccountStore::get`] по одному; реализация одним запросом — `tp-meta` (META-66).
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if seen.insert(id)
+                && let Some(a) = self.get(tenant, id).await?
+            {
+                out.push(a);
+            }
+        }
+        Ok(out)
+    }
 
     /// Учётная запись по имени входа (без учёта регистра).
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>>;
