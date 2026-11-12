@@ -1096,3 +1096,80 @@ async fn principal_addresses_with_alias() {
     let r = env.send(IVAN, "POST", &outbox, &[], &request).await;
     assert_eq!(r.status, 200, "{}", r.body);
 }
+
+// ---------- DAV-25: календарь по умолчанию ----------
+
+/// Календарь и книга, созданные при первом обращении, — по умолчанию (`is_default`); `schedule-default-calendar-URL`
+/// — по признаку коллекции, назначенному и не через CalDAV (JMAP).
+#[tokio::test]
+async fn default_calendar_by_flag() {
+    let env = Sched::new().await;
+    let scope = env.scope(IVAN);
+    env.send(IVAN, "PROPFIND", &home(IVAN), &[("depth", "0")], "")
+        .await;
+    env.send(
+        IVAN,
+        "PROPFIND",
+        &format!("/dav/addressbooks/{IVAN}/"),
+        &[("depth", "0")],
+        "",
+    )
+    .await;
+    let get = |kind: CollectionKind, name: &'static str| {
+        let store = env.store.clone();
+        async move {
+            store
+                .collection_by_name(scope, kind, name)
+                .await
+                .expect("хранилище")
+                .expect("коллекция")
+        }
+    };
+    assert!(get(CollectionKind::Calendar, "calendar").await.is_default);
+    assert!(!get(CollectionKind::Calendar, "tasks").await.is_default);
+    assert!(
+        get(CollectionKind::AddressBook, "contacts")
+            .await
+            .is_default
+    );
+
+    let inbox = format!("{}inbox/", home(IVAN));
+    let body = r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+        <d:prop><c:schedule-default-calendar-URL/></d:prop></d:propfind>"#;
+    let default_url = |r: &Resp| {
+        r.body
+            .split("<c:schedule-default-calendar-URL><d:href>")
+            .nth(1)
+            .and_then(|s| s.split("</d:href>").next())
+            .map(str::to_owned)
+    };
+    let r = env
+        .send(IVAN, "PROPFIND", &inbox, &[("depth", "0")], body)
+        .await;
+    assert_eq!(
+        default_url(&r).as_deref(),
+        Some("/dav/calendars/ivan@example.org/calendar/"),
+        "{}",
+        r.body
+    );
+    // Другой календарь назначен по умолчанию (как JMAP `isDefault`): признак у прежнего снимает хранилище.
+    let work = tp_contracts::dav::Collection {
+        is_default: true,
+        components: BTreeSet::from([tp_contracts::dav::Component::Event]),
+        ..tp_contracts::dav::Collection::new(CollectionKind::Calendar, "work")
+    };
+    env.store
+        .create_collection(scope, work)
+        .await
+        .expect("назначен");
+    assert!(!get(CollectionKind::Calendar, "calendar").await.is_default);
+    let r = env
+        .send(IVAN, "PROPFIND", &inbox, &[("depth", "0")], body)
+        .await;
+    assert_eq!(
+        default_url(&r).as_deref(),
+        Some("/dav/calendars/ivan@example.org/work/"),
+        "{}",
+        r.body
+    );
+}
