@@ -1003,6 +1003,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (`contacts`, `org`, `dynamic`, `senders`, `mailbox_audit`, `sync`) вместо `Admin::with_parity`.
 - 2026-11-12 — CTR-81 (волна contracts-53, решение 114): `AuditAction::Search` — поиск по тексту писем в чужом ящике; строка запроса —
   в `AuditObject::detail`, без найденных писем; в `AuditAction::OWNER` не входит (`AuditPolicy::records` для владельца — только действия
-  из `OWNER`). Несовместимо: новый вариант `AuditAction`; исчерпывающих `match` по нему в коде нет. `tp-meta` — миграция 0034
+  из `OWNER`). Несовместимо: новый вариант `AuditAction`; исчерпывающих `match` по нему в коде нет. `tp-meta` — миграция 0035
   (`mailbox_audit_action_check`), `tp-admin` — описание параметра `action`; набор `suite::mailbox_audit` — запись `Search`. Запись
   протоколами — IMAP-23, JMAP-43.
