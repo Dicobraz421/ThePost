@@ -1,16 +1,20 @@
-# DEP-38: restore.yml на семействе RHEL — обёртки полным путём
+# DEP-38: ManageSieve в поставке: секция и порт 4190
 
 lane: deploy
-deps: [DEP-23]
+deps: [APP-27]
 class: A
-files: [deploy/ansible/restore.yml]
-read: [docs/decisions/2026-11-11-stage2-followups.md]
+files: [deploy/*]
+read: [docs/tasks/APP-27.md, docs/tasks/SIEVE-08.md]
 checks: [none]
 manual: no
 
+Хвост реестра облачных волн, п. 54: app-26, PR #491. после установки из поставки ManageSieve выключен: в `deploy/` нет секции
+`sieve.managesieve.listen` и порта 4190.
+
 ## Сделать
-- На RHEL-семействе `sudo` не видит `/usr/local/sbin`: в `restore.yml` вызывать служебные обёртки полным путём, как
-  уже сделано в ролях (отчёт deploy-16, #476).
+- `deploy/config/*.yaml` (smb, all, mailbox, access): `sieve.managesieve.listen` на 4190 (STARTTLS); роль `thepost` и
+  межсетевой экран — порт 4190; сокет systemd `thepost-managesieve.socket`; Helm — порт сервиса; `deploy/README.md`.
 
 ## Приёмка
-- `restore.yml` на AlmaLinux 9 в контейнере доходит до восстановления без «command not found».
+- `thepost config check`, `--syntax-check`, `helm template` без ошибок; на стенде `sieve-connect` к 4190 входит паролем
+  приложения.

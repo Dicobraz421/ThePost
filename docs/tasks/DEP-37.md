@@ -1,18 +1,19 @@
-# DEP-37: эталон на ВМ Astra Linux SE 1.8
+# DEP-37: примеры секций `maintenance` и `dav` в `deploy/config`
 
 lane: deploy
-deps: [DEP-19]
+deps: [APP-32, APP-29]
 class: A
-files: [deploy/ansible/*, docs/manual-tests/DEP-37.md]
-read: [docs/decisions/2026-11-11-stage2-followups.md, docs/manual-tests/DEP-19.md, docs/PREREQUISITES.md]
+files: [deploy/config/*, deploy/ansible/roles/thepost/*, deploy/helm/thepost/*]
+read: [docs/tasks/APP-29.md, docs/tasks/APP-32.md]
 checks: [none]
-manual: yes
+manual: no
+
+Хвост реестра облачных волн, п. 37: app-31, PR #455. и п. 43 (app-28, PR #484): в `deploy/config/*.yaml` нет секции `maintenance` и ключей
+`dav`, `http.dav`.
 
 ## Сделать
-- На ВМ Astra Linux SE 1.8 с её ядром: `smb.yml` — `failed=0`, повтор — `changed=0`, `thepost doctor` без `FAIL`,
-  письмо между двумя пользователями; режимы МРД и МКЦ (PARSEC) — работа служб и песочницы Landlock/seccomp; ЗПС —
-  что нужно подписать заказчику (`thepost`, OpenBao, PGDG) — по итогам строкой в `docs/PREREQUISITES.md` (решение 89).
-- В контейнере не проверить: systemd без модуля PARSEC не запускается (отчёт deploy-16, #476).
+- `deploy/config/*.yaml`: пример `maintenance` (сроки очистки) и `dav` (`http.dav` или общий порт с JMAP, путь `/dav/`);
+  шаблон config.yaml роли `thepost` и значения Helm — те же ключи с умолчаниями.
 
 ## Приёмка
-- `docs/manual-tests/DEP-37.md` с итогом по каждому режиму.
+- `thepost config check` для каждого файла `deploy/config/*.yaml` без ошибок; `helm template` без ошибок.

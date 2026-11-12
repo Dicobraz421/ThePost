@@ -9,6 +9,9 @@
 //! ([`GroupStore::expand`], защита от циклов — в хранилище) в учётные записи организации.
 //!
 //! Группы каталога без записи в [`GroupStore`] раскрываются по снимку каталога, как до SMTP-16.
+//!
+//! Решение модератора (`tp_contracts::groups::Moderation`, FIX-01) — `impl Moderation for Delivery`
+//! ([`crate::deliver`]): объект письма читается отсюда, ссылку на него снимает успешное решение.
 
 use std::fmt;
 use std::sync::Arc;
@@ -17,7 +20,7 @@ use bytes::Bytes;
 use time::OffsetDateTime;
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::groups::{DistributionGroup, GroupStore, HeldMessage};
-use tp_contracts::{AccountId, HeldId, Result, TenantId};
+use tp_contracts::{AccountId, BlobKey, GroupId, HeldId, Result, TenantId};
 
 use crate::queue::{release_blob, store_blob};
 
@@ -67,6 +70,25 @@ impl Groups {
         address: &str,
     ) -> Result<Option<DistributionGroup>> {
         self.store.by_address(tenant, address).await
+    }
+
+    /// Группа по идентификатору.
+    pub(crate) async fn get(
+        &self,
+        tenant: TenantId,
+        id: GroupId,
+    ) -> Result<Option<DistributionGroup>> {
+        self.store.get(tenant, id).await
+    }
+
+    /// Письмо очереди модерации целиком (как принято).
+    pub(crate) async fn read(&self, key: &BlobKey) -> Result<Bytes> {
+        crate::deliver::read_blob(self.blobs.as_ref(), key).await
+    }
+
+    /// Снимает ссылку письма очереди модерации на объект (после решения модератора).
+    pub(crate) async fn release(&self, key: &BlobKey) {
+        release_blob(self.index.as_ref(), key).await;
     }
 
     /// Учётные записи группы с раскрытием вложенных.

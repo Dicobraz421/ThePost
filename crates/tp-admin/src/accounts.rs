@@ -761,7 +761,7 @@ mod tests {
     use serde_json::{Value, json};
     use tp_contracts::TenantId;
 
-    use super::{domain_name, encode_query};
+    use super::{AccountQuery, domain_name, encode_query};
     use crate::server::AdminConfig;
     use crate::testenv::{Env, config};
 
@@ -1123,6 +1123,194 @@ mod tests {
             .call("GET", &format!("{base}?limit=x"), Some("org"), None)
             .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    /// Строка запроса из `AccountQuery` тем же обходом, что у клиента: поля JSON — пары «имя=значение»,
+    /// `null` пропускается, значения — в `%XX`.
+    fn query_string(q: &AccountQuery) -> String {
+        let Value::Object(fields) = serde_json::to_value(q).expect("json") else {
+            panic!("AccountQuery — не объект");
+        };
+        fields
+            .into_iter()
+            .filter_map(|(k, v)| match v {
+                Value::Null => None,
+                Value::String(s) => Some(format!("{k}={}", encode_query(&s))),
+                other => Some(format!("{k}={other}")),
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    /// Разбор строки запроса тем же извлекателем, что у обработчика списка.
+    fn parse_query(query: &str) -> Option<AccountQuery> {
+        let uri: axum::http::Uri = format!("/accounts?{query}").parse().expect("uri");
+        axum::extract::Query::<AccountQuery>::try_from_uri(&uri)
+            .ok()
+            .map(|q| q.0)
+    }
+
+    /// ADM-23: `AccountQuery` обходит строку запроса без потерь — кириллица, `+`, `&`, `=`, пробел, `%`.
+    #[test]
+    fn account_query_from_query_string() {
+        let search = AccountQuery {
+            login: Some("Юля+тест@пример.рф".into()),
+            ..AccountQuery::default()
+        };
+        let list = AccountQuery {
+            login: None,
+            prefix: Some("ю+ a&b=c%".into()),
+            after: Some("юля+тест@пример.рф".into()),
+            limit: Some(25),
+        };
+        for q in [search.clone(), list, AccountQuery::default()] {
+            let s = query_string(&q);
+            assert!(s.is_ascii(), "{s}");
+            assert_eq!(parse_query(&s), Some(q), "{s}");
+        }
+        assert_eq!(
+            query_string(&search),
+            "login=%D0%AE%D0%BB%D1%8F%2B%D1%82%D0%B5%D1%81%D1%82@%D0%BF%D1%80%D0%B8%D0%BC%D0%B5%D1%80.%D1%80%D1%84"
+        );
+
+        // Параметры по одному и вместе; пустая строка — все поля пусты.
+        assert_eq!(
+            parse_query("prefix=a&after=a%40b.test&limit=3"),
+            Some(AccountQuery {
+                login: None,
+                prefix: Some("a".into()),
+                after: Some("a@b.test".into()),
+                limit: Some(3),
+            })
+        );
+        assert_eq!(parse_query(""), Some(AccountQuery::default()));
+        // Незакодированный `+` в строке запроса — пробел (application/x-www-form-urlencoded): плюс — только `%2B`.
+        assert_eq!(
+            parse_query("login=a+b@x.test").and_then(|q| q.login),
+            Some("a b@x.test".to_owned())
+        );
+        // Неизвестный и повторный параметр, не число и отрицательное число в `limit` — отказ.
+        for bad in [
+            "page=2",
+            "limit=x",
+            "limit=-1",
+            "limit=1&limit=2",
+            "prefix=a&offset=1",
+        ] {
+            assert_eq!(parse_query(bad), None, "{bad}");
+        }
+    }
+
+    /// ADM-23: строка запроса через роутер — поиск и список с кириллицей и `+`, отказы — 400.
+    #[tokio::test]
+    async fn account_query_over_router() {
+        let env = Env::new();
+        for l in [
+            "Юля+тест@пример.рф",
+            "юра@пример.рф",
+            "юля@пример.рф",
+            "a+b@example.org",
+            "a b@example.org",
+        ] {
+            env.account(l).await;
+        }
+        let base = format!("{}/accounts", org());
+        let get = async |q: &AccountQuery| {
+            let path = format!("{base}?{}", query_string(q));
+            env.call("GET", &path, Some("org"), None).await
+        };
+
+        // Поиск: кириллица и `+` доходят до хранилища без потерь (`+` не превращается в пробел). Регистр кириллицы
+        // здесь тот же: хранилище в памяти сравнивает имена без учёта регистра только для ASCII.
+        let (s, _, b) = get(&AccountQuery {
+            login: Some("Юля+тест@пример.рф".into()),
+            ..AccountQuery::default()
+        })
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(logins(&b), ["Юля+тест@пример.рф"]);
+        let (_, _, b) = get(&AccountQuery {
+            login: Some("a+b@example.org".into()),
+            ..AccountQuery::default()
+        })
+        .await;
+        assert_eq!(logins(&b), ["a+b@example.org"]);
+        // Незакодированный `+` — пробел: находится запись с пробелом, а не с плюсом.
+        let raw = format!("{base}?login=a+b@example.org");
+        let (_, _, b) = env.call("GET", &raw, Some("org"), None).await;
+        assert_eq!(logins(&b), ["a b@example.org"]);
+
+        // Список: prefix, limit и after вместе; ссылка продолжения читается тем же разбором.
+        let (s, h, b) = get(&AccountQuery {
+            prefix: Some("Ю".into()),
+            limit: Some(1),
+            ..AccountQuery::default()
+        })
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(logins(&b), ["Юля+тест@пример.рф"]);
+        let link = next(&h).expect("next");
+        assert!(link.is_ascii(), "{link}");
+        let (_, query) = link.split_once('?').expect("query");
+        assert_eq!(
+            parse_query(query),
+            Some(AccountQuery {
+                login: None,
+                prefix: Some("ю".into()),
+                after: Some("юля+тест@пример.рф".into()),
+                limit: Some(1),
+            })
+        );
+        let (_, h, b) = env.call("GET", &link, Some("org"), None).await;
+        assert_eq!(logins(&b), ["юля@пример.рф"]);
+        let (_, h, b) = env
+            .call("GET", &next(&h).expect("next"), Some("org"), None)
+            .await;
+        assert_eq!(logins(&b), ["юра@пример.рф"]);
+        assert!(next(&h).is_none(), "страница последняя");
+        let (_, h, b) = get(&AccountQuery {
+            prefix: Some("юля+".into()),
+            after: Some("юля+".into()),
+            limit: Some(5),
+            ..AccountQuery::default()
+        })
+        .await;
+        assert_eq!(logins(&b), ["Юля+тест@пример.рф"]);
+        assert!(next(&h).is_none());
+
+        // `login` с любым параметром списка — 400 с пояснением (RFC 9457).
+        for rest in [
+            AccountQuery {
+                prefix: Some("ю".into()),
+                ..AccountQuery::default()
+            },
+            AccountQuery {
+                after: Some("юля@пример.рф".into()),
+                ..AccountQuery::default()
+            },
+            AccountQuery {
+                limit: Some(1),
+                ..AccountQuery::default()
+            },
+        ] {
+            let q = AccountQuery {
+                login: Some("юля@пример.рф".into()),
+                ..rest
+            };
+            let (s, _, b) = get(&q).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{q:?}");
+            assert_eq!(b["status"], 400, "{b}");
+            assert!(
+                b["detail"].as_str().is_some_and(|d| d.contains("login")),
+                "{b}"
+            );
+        }
+        // Неизвестный параметр и не число в `limit` — 400.
+        for bad in ["page=2", "limit=x", "login=a&offset=1"] {
+            let path = format!("{base}?{bad}");
+            let (s, _, _) = env.call("GET", &path, Some("org"), None).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+        }
     }
 
     /// Размер страницы: по умолчанию — `page_size`, больший `max_page_size` урезается, 0 — одна запись.

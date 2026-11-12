@@ -173,6 +173,6 @@
 86. **CLI администратора для Sieve** — удаление скрипта, автоответ, скрипт организации отдельной волной после admin-12 (ADM-22).
 87. **`crates/thepost/src/admin_client.rs` — в полосе admin** (правка `lanes.toml`, CI-07).
 88. **Нестабильный фазз-тест IMAP** — исправить расхождение разбора и записи FETCH, случай закрепить тестом (IMAP-18).
-89. **Проверка на ВМ** — только Astra Linux SE 1.8 (ядро с PARSEC, МРД/МКЦ, ЗПС, Landlock и seccomp); SELinux enforcing и AlmaLinux 10 — позже (DEP-37).
+89. **Проверка на ВМ** — только Astra Linux SE 1.8 (ядро с PARSEC, МРД/МКЦ, ЗПС, Landlock и seccomp); SELinux enforcing и AlmaLinux 10 — позже (DEP-40).
 90. **Копия каталога писем на Astra** — rsync без шифрования; требования к защите хранилища копий — отдельным разделом в `docs/PREREQUISITES.md`.
 91. **Антивирус на Astra и РЕД ОС** — без ClamAV, свой антивирус по Milter; как подключить — в `docs/PREREQUISITES.md`.

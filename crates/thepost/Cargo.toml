@@ -10,6 +10,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Веб-консоль вшивается в бинарный файл: `cargo build -p thepost --features console`. По умолчанию выключена.
+console = ["tp-admin/console"]
+
 [dependencies]
 tp-contracts.workspace = true
 tp-platform.workspace = true

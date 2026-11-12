@@ -12,6 +12,10 @@
 //! (`Routes::watch` запускает `serve`). Правила потока почты — модуль (`Registry::mail_flow`): один раз на письмо в
 //! доставке smtp-in и submission и в JMAP `EmailSubmission/set` (доставка JMAP их не применяет повторно).
 //!
+//! Планирование встреч (APP-28, SRS 4.4) — одни зависимости на узел ([`Services::schedule`]): приём iTIP в календари
+//! (`tp_dav::ItipInbox`) — у CalDAV, JMAP и доставки smtp-in (iMIP извне, `Delivery::with_itip`); приглашения
+//! внешним участникам — письмом (`tp_dav::ImipSender`) через ту же доставку, что у JMAP; занятость — `PgMeta`.
+//!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
 use std::sync::Arc;
@@ -33,7 +37,7 @@ use tp_contracts::meta::{
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
-use tp_contracts::transport::MailFlow;
+use tp_contracts::transport::{AcceptedDomain, DomainKind, MailFlow};
 use tp_contracts::{Error, Result, TenantId};
 use tp_meta::PgMeta;
 use tp_platform::{Config, Metrics, RateLimitConfig, RateLimiter, TlsCerts};
@@ -52,7 +56,7 @@ use tp_smtp::{
 
 use crate::infra;
 use crate::sections::{
-    ADMIN, AUTH, AdminSection, AuthSection, JMAP, MAILSTORE, SEARCH, SIEVE, SMTP,
+    ADMIN, AUTH, AdminSection, AuthSection, DAV, JMAP, MAILSTORE, SEARCH, SIEVE, SMTP,
 };
 
 /// Общие сервисы ролей узла.
@@ -121,6 +125,8 @@ pub struct Services {
     pub sieve_limits: tp_sieve::Limits,
     /// Секция `sieve` на момент запуска: слушатели и лимиты сеансов ManageSieve (APP-27).
     pub sieve: Arc<tp_sieve::SieveConfig>,
+    /// Приём iTIP в календари учётных записей (APP-28): общий для CalDAV, JMAP и доставки smtp-in.
+    pub itip: Arc<tp_dav::ItipInbox>,
 }
 
 impl std::fmt::Debug for Services {
@@ -294,6 +300,11 @@ impl Services {
         // Секции, читаемые ролями при запуске, проверяются здесь: ошибка — до запуска ролей.
         cfg.section::<tp_jmap::JmapConfig>(JMAP)?;
         cfg.section::<AdminSection>(ADMIN)?;
+        // Приём iTIP — с настройками секции `dav` (календарь по умолчанию, входящие планирования, лимиты).
+        let itip = Arc::new(tp_dav::ItipInbox::new(
+            Arc::new(meta.clone()),
+            (*cfg.section::<tp_dav::DavConfig>(DAV)?).clone(),
+        ));
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
         let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
@@ -336,6 +347,7 @@ impl Services {
             rules,
             sieve_limits,
             sieve: sieve_section,
+            itip,
         })
     }
 
@@ -343,7 +355,8 @@ impl Services {
     /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC) и правила потока
     /// почты модуля (если включён).
     pub fn delivery(&self, smtp: &SmtpConfig) -> Result<Arc<Delivery>> {
-        let delivery = self.base_delivery(smtp)?;
+        // Приглашения и ответы извне (iMIP, SMTP-33) после доставки в ящик применяются к календарю получателя.
+        let delivery = self.base_delivery(smtp)?.with_itip(self.itip.clone());
         Ok(Arc::new(match &self.mail_flow {
             Some(flow) => delivery.with_mail_flow(
                 flow.clone(),
@@ -384,6 +397,19 @@ impl Services {
             .with_transport(self.routes.clone())
             .with_forwarding(Arc::new(forwarding))
             .with_rules(self.rules.clone()))
+    }
+
+    /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
+    /// записям организации сообщения iTIP кладутся прямо в календарь ([`Services::itip`]), остальным адресам —
+    /// письмом iMIP через `outbound` (локальные получатели — в ящики, внешние — в очередь с подписью DKIM);
+    /// занятость — из `PgMeta`.
+    fn schedule(&self, outbound: Arc<dyn Outbound>) -> tp_dav::ScheduleDeps {
+        tp_dav::ScheduleDeps {
+            accounts: Arc::new(self.meta.clone()),
+            delivery: self.itip.clone(),
+            sender: Some(Arc::new(tp_dav::ImipSender::new(outbound))),
+            freebusy: Arc::new(self.meta.clone()),
+        }
     }
 
     /// Доверенные источники приёма smtp-in и submission (шлюз, приложения) из снимков узла.
@@ -499,7 +525,7 @@ impl Services {
             bus: self.bus.clone(),
             accounts: Arc::new(self.meta.clone()),
             authz: self.authz.clone(),
-            outbound: Some(outbound),
+            outbound: Some(outbound.clone()),
             hooks: self.hooks.clone(),
             capabilities: ext.jmap_capabilities().to_vec(),
             trash: Arc::new(self.meta.clone()),
@@ -513,7 +539,9 @@ impl Services {
             .with_sieve(Some(Arc::new(self.meta.clone())))
             // Контакты и календари (JMAP-25…29) — то же хранилище, что у CalDAV и CardDAV; занятость — JMAP-30.
             .with_dav(Some(Arc::new(self.meta.clone())))
-            .with_freebusy(Some(Arc::new(self.meta.clone()))))
+            .with_freebusy(Some(Arc::new(self.meta.clone())))
+            // Приглашения из JMAP (`sendSchedulingMessages`, JMAP-31) — теми же зависимостями, что у CalDAV.
+            .with_schedule(Some(self.schedule(outbound))))
     }
 
     /// Маршруты календарей и контактов (CalDAV, CardDAV; APP-29): хранилище — `PgMeta`, вход — тот же, что у
@@ -521,33 +549,41 @@ impl Services {
     /// «Организация» (группы, скрытые из адресной книги, в неё не попадают); без каталога её нет (SRS 4.4).
     /// `well_known` — добавить перенаправления `/.well-known/caldav` и `/.well-known/carddav` на `/dav/`
     /// (RFC 6764 §5): для слушателя без JMAP, который отдаёт их сам по `jmap.autoconfig`.
-    pub fn dav(&self, cfg: tp_dav::DavConfig, well_known: bool) -> axum::Router {
+    /// Планирование встреч (APP-28): приглашения, ответы и отмены рассылает сервер ([`Services::schedule`]);
+    /// письма iMIP уходят через доставку SMTP с настройками `smtp`.
+    pub fn dav(
+        &self,
+        cfg: tp_dav::DavConfig,
+        smtp: &SmtpConfig,
+        well_known: bool,
+    ) -> Result<axum::Router> {
         let deps = tp_dav::Deps {
             auth: self.authn.clone(),
             store: Arc::new(self.meta.clone()),
         };
-        let router = match &self.directory {
-            Some(directory) => tp_dav::router_with_gal(
-                deps,
-                tp_dav::GalDeps {
-                    directory: directory.clone(),
-                    groups: Some(Arc::new(self.meta.clone())),
-                },
-                cfg,
-            ),
-            None => tp_dav::router(deps, cfg),
-        };
+        let gal = self.directory.as_ref().map(|directory| tp_dav::GalDeps {
+            directory: directory.clone(),
+            groups: Some(Arc::new(self.meta.clone())),
+        });
+        let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
+        let router = tp_dav::router_with(deps, gal, Some(self.schedule(outbound)), cfg);
         if !well_known {
-            return router;
+            return Ok(router);
         }
         let context = || async { axum::response::Redirect::permanent(tp_dav::PREFIX) };
-        router
+        Ok(router
             .route("/.well-known/caldav", axum::routing::any(context))
-            .route("/.well-known/carddav", axum::routing::any(context))
+            .route("/.well-known/carddav", axum::routing::any(context)))
     }
 
-    /// Admin API.
-    pub fn admin(&self, ext: &Registry, cfg: tp_admin::AdminConfig) -> Result<tp_admin::Admin> {
+    /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`
+    /// (`impl Moderation for Delivery`, FIX-01) без правил потока почты: письмо прошло их при приёме.
+    pub fn admin(
+        &self,
+        ext: &Registry,
+        cfg: tp_admin::AdminConfig,
+        smtp: &SmtpConfig,
+    ) -> Result<tp_admin::Admin> {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
             audit: Arc::new(tp_admin::LogAudit),
@@ -555,13 +591,13 @@ impl Services {
             audit_log: None,
             delivery: Arc::new(self.meta.clone()),
             groups: Arc::new(self.meta.clone()),
-            moderation: Arc::new(NoModeration),
+            moderation: Arc::new(self.base_delivery(smtp)?),
             modules: ext.admin_routes().to_vec(),
             accounts: Arc::new(self.meta.clone()),
             quota: Arc::new(self.meta.clone()),
             policies: Arc::new(PgPolicies(self.meta.clone())),
             resolver: Arc::new(self.meta.clone()),
-            domains: Arc::new(NoDomains),
+            domains: Arc::new(PgDomains(self.meta.clone())),
             trash: Arc::new(self.meta.clone()),
             store: self.store.clone(),
             app_passwords: self.app_passwords.clone(),
@@ -729,49 +765,88 @@ impl tp_admin::PolicyStore for PgPolicies {
     }
 }
 
-/// Решения модерации групп: доставки одобренного письма участникам и DSN отказа в сборке ещё нет.
-struct NoModeration;
+/// Домены Admin API поверх принятых доменов `TransportStore` (`PgMeta`, таблица `domains`; до контракта CTR-25):
+/// список — принятые домены организации, создание — полномочный домен, удаление — только без учётных записей.
+/// Версия снимка кластера устарела между чтением и записью — запись повторяется по свежему снимку.
+struct PgDomains(PgMeta);
 
-const NO_MODERATION: &str = "модерация групп рассылки: доставка решений ещё не подключена";
-
-#[async_trait]
-impl tp_admin::groups::Moderation for NoModeration {
-    async fn deliver(
-        &self,
-        _tenant: TenantId,
-        _group: Option<&tp_contracts::groups::DistributionGroup>,
-        _message: &tp_contracts::groups::HeldMessage,
-    ) -> Result<()> {
-        Err(Error::Internal(NO_MODERATION.to_owned()))
-    }
-
-    async fn reject(
-        &self,
-        _tenant: TenantId,
-        _message: &tp_contracts::groups::HeldMessage,
-        _reason: &str,
-    ) -> Result<()> {
-        Err(Error::Internal(NO_MODERATION.to_owned()))
-    }
-}
-
-/// Домены Admin API: хранения доменов организации в контрактах ещё нет (CTR-25) — операции недоступны.
-struct NoDomains;
-
-const NO_DOMAINS: &str = "домены организации: хранилище ещё не подключено (CTR-25)";
+/// Попыток записи при гонке версий снимка кластера.
+const DOMAIN_ATTEMPTS: usize = 5;
 
 #[async_trait]
-impl tp_admin::DomainStore for NoDomains {
-    async fn list(&self, _tenant: TenantId) -> Result<Vec<tp_admin::Domain>> {
-        Err(Error::Internal(NO_DOMAINS.to_owned()))
+impl tp_admin::DomainStore for PgDomains {
+    async fn list(&self, tenant: TenantId) -> Result<Vec<tp_admin::Domain>> {
+        let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
+        Ok(cluster
+            .domains
+            .into_iter()
+            .filter(|d| d.tenant == tenant)
+            .map(|d| tp_admin::Domain {
+                id: d.id,
+                name: d.name,
+            })
+            .collect())
     }
 
-    async fn create(&self, _tenant: TenantId, _name: &str) -> Result<tp_admin::Domain> {
-        Err(Error::Internal(NO_DOMAINS.to_owned()))
+    async fn create(&self, tenant: TenantId, name: &str) -> Result<tp_admin::Domain> {
+        let domain = AcceptedDomain {
+            id: DomainId::new(),
+            tenant,
+            name: name.to_owned(),
+            kind: DomainKind::Authoritative,
+        };
+        for _ in 0..DOMAIN_ATTEMPTS {
+            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
+            // Имя занято (в любой организации) — `Conflict`; иначе `Conflict` записи — устаревшая версия.
+            if cluster.domain(name).is_some() {
+                return Err(Error::Conflict);
+            }
+            match tp_contracts::transport::TransportStore::put_domain(
+                &self.0,
+                cluster.version,
+                &domain,
+            )
+            .await
+            {
+                Ok(_) => {
+                    return Ok(tp_admin::Domain {
+                        id: domain.id,
+                        name: domain.name,
+                    });
+                }
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
     }
 
-    async fn delete(&self, _tenant: TenantId, _id: DomainId) -> Result<()> {
-        Err(Error::Internal(NO_DOMAINS.to_owned()))
+    async fn delete(&self, tenant: TenantId, id: DomainId) -> Result<()> {
+        for _ in 0..DOMAIN_ATTEMPTS {
+            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
+            if !cluster
+                .domains
+                .iter()
+                .any(|d| d.id == id && d.tenant == tenant)
+            {
+                return Err(Error::NotFound);
+            }
+            match tp_contracts::transport::TransportStore::delete_domain(
+                &self.0,
+                cluster.version,
+                id,
+            )
+            .await
+            {
+                Ok(_) => return Ok(()),
+                // Устаревшая версия снимка — повтор по свежему.
+                Err(Error::Conflict) => continue,
+                // Внешний ключ `accounts` → `domains`: у домена есть учётные записи.
+                Err(Error::Invalid(_)) => return Err(Error::Conflict),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
     }
 }
 
@@ -1155,6 +1230,245 @@ mod tests {
 
         stop.cancel();
         drop((services, delivery, meta));
+        crate::testutil::drop_database(&url, &db_name).await;
+    }
+
+    /// FIX-02: письмо внешнего отправителя в модерируемую группу узла (`PgMeta`) → Admin API узла (`Services::admin`,
+    /// сессия `admin init`): `approve` — 204 (было 500 «доставка решений ещё не подключена»), письмо у каждого
+    /// участника, повтор — 404; `reject` — 204, DSN отправителю в очереди исходящей почты.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moderation_decisions_through_admin_api() {
+        use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
+        use tp_contracts::meta::{AccountUpsert, SpecialUse};
+        use tp_contracts::queue::SubmitStatus;
+        use tp_contracts::transport::TransportStore;
+        use tp_contracts::{GroupId, HeldId};
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
+        let meta = PgMeta::new(pool.clone(), tp_meta::MetaConfig::default()).with_bus(bus.clone());
+        let cfg = crate::sections::registry_of(crate::modules::BUILTIN)
+            .expect("registry")
+            .parse(
+                "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
+                 database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\n\
+                 blob:\n  url: file:///var/lib/thepost/blob\n",
+                Vec::new(),
+            )
+            .expect("config");
+        let ext = Registry::default();
+        let metrics = tp_platform::Metrics::default();
+        let services = Services::build(Base {
+            cfg: &cfg,
+            meta: meta.clone(),
+            blob: Arc::new(tp_testkit::MemBlobStore::default()),
+            bus: bus.clone(),
+            secrets: Arc::new(tp_testkit::MemSecretStore::default()),
+            ext: &ext,
+            metrics: &metrics,
+            node: NodeId::new("fix-02").expect("node"),
+        })
+        .await
+        .expect("services");
+        let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
+        let t = TenantId::DEFAULT;
+        let stop = tp_contracts::role::CancellationToken::new();
+        tokio::spawn(services.routes.clone().watch(
+            bus.clone(),
+            stop.clone(),
+            std::time::Duration::from_millis(50),
+        ));
+
+        // Admin API узла с локальным входом (как роль admin в `serve`): администратор `admin init` — модератор.
+        let admin_cfg = cfg.section::<AdminSection>(ADMIN).expect("admin").0.clone();
+        let admin = Arc::new(crate::local_admin::attach(
+            services.admin(&ext, admin_cfg, &smtp).expect("admin"),
+            &services,
+        ));
+        let granted = admin
+            .init(&tp_admin::InitRequest {
+                email: "admin@example.org".into(),
+                display_name: None,
+                force: false,
+            })
+            .await
+            .expect("admin init");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let router = admin.clone().router();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let http = reqwest::Client::new();
+        let r = http
+            .post(format!("{base}/api/v1/session"))
+            .bearer_auth(&granted.token)
+            .send()
+            .await
+            .expect("session");
+        assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+        let session: serde_json::Value =
+            serde_json::from_slice(&r.bytes().await.expect("body")).expect("json");
+        let session = session["session"].as_str().expect("session").to_owned();
+
+        // Группа news@ — alice и bob, модератор — администратор.
+        let domain = TransportStore::cluster(&meta)
+            .await
+            .expect("cluster")
+            .domain("example.org")
+            .expect("domain")
+            .id;
+        let mut scopes = Vec::new();
+        for login in ["alice@example.org", "bob@example.org"] {
+            let acc = AccountStore::upsert(
+                &meta,
+                t,
+                AccountUpsert {
+                    domain,
+                    login: login.into(),
+                    display_name: login.into(),
+                    external_id: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("account");
+            scopes.push(AccountScope {
+                tenant: t,
+                account: acc.id,
+            });
+        }
+        let group = DistributionGroup {
+            id: GroupId::new(),
+            tenant: t,
+            name: "News".into(),
+            address: Some("news@example.org".into()),
+            external_id: None,
+            members: scopes
+                .iter()
+                .map(|s| GroupMember::Account(s.account))
+                .collect(),
+            senders: SenderRestriction::Anyone,
+            moderators: vec![granted.account],
+            hidden_from_gal: false,
+        };
+        GroupStore::put(&meta, group.clone()).await.expect("group");
+
+        // Два письма внешнего отправителя ждут модератора (домен `admin init` — в снимке транспорта узла).
+        let delivery = services.delivery(&smtp).expect("delivery");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let r = delivery
+                .resolve("alice@example.org")
+                .await
+                .expect("resolve");
+            if matches!(r, tp_smtp::deliver::Resolved::Local(_)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "домен не принят: {r:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for tag in ["fix02-approve", "fix02-reject"] {
+            let raw = format!(
+                "From: ext@remote.example\r\nTo: news@example.org\r\nSubject: {tag}\r\n\
+                 Message-ID: <{tag}@remote.example>\r\n\r\nbody\r\n"
+            );
+            let sent = delivery
+                .submit(
+                    t,
+                    "ext@remote.example",
+                    &["news@example.org".to_owned()],
+                    bytes::Bytes::from(raw),
+                )
+                .await
+                .expect("submit");
+            assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued, "{sent:?}");
+        }
+        let held = GroupStore::held(&meta, t, Some(group.id), 10)
+            .await
+            .expect("held");
+        assert_eq!(held.len(), 2, "{held:?}");
+        let id_of = |tag: &str| {
+            let mid = format!("{tag}@remote.example");
+            held.iter()
+                .find(|h| h.message_id.as_deref() == Some(mid.as_str()))
+                .expect("held message")
+                .id
+        };
+        let (approve, reject) = (id_of("fix02-approve"), id_of("fix02-reject"));
+        let decide = |id: HeldId, what: &str, body: &'static str| {
+            http.post(format!("{base}/api/v1/orgs/{t}/moderation/{id}/{what}"))
+                .bearer_auth(&session)
+                .body(body)
+                .send()
+        };
+        let inbox_count = |scope: AccountScope| {
+            let meta = meta.clone();
+            async move {
+                let inbox = MailboxStore::list(&meta, scope)
+                    .await
+                    .expect("mailboxes")
+                    .into_iter()
+                    .find(|m| m.role == Some(SpecialUse::Inbox))
+                    .expect("inbox")
+                    .id;
+                MessageStore::list(&meta, scope, inbox, MessageQuery::All, 10)
+                    .await
+                    .expect("messages")
+                    .len()
+            }
+        };
+
+        // Одобрение: доставка участникам; повтор по тому же письму — 404.
+        let r = decide(approve, "approve", "").await.expect("approve");
+        let status = r.status();
+        let body = r.text().await.unwrap_or_default();
+        assert_eq!(status, reqwest::StatusCode::NO_CONTENT, "approve: {body}");
+        for scope in &scopes {
+            assert_eq!(inbox_count(*scope).await, 1, "{scope:?}");
+        }
+        let r = decide(approve, "approve", "").await.expect("approve again");
+        assert_eq!(r.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // Отказ: DSN внешнему отправителю — в очереди исходящей почты, участникам ничего.
+        let r = decide(reject, "reject", r#"{"reason":"off-topic"}"#)
+            .await
+            .expect("reject");
+        let status = r.status();
+        let body = r.text().await.unwrap_or_default();
+        assert_eq!(status, reqwest::StatusCode::NO_CONTENT, "reject: {body}");
+        for scope in &scopes {
+            assert_eq!(inbox_count(*scope).await, 1, "{scope:?}");
+        }
+        let mut tx = tp_meta::schema::begin(&pool, t).await.expect("begin");
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM queue_rcpts WHERE address = 'ext@remote.example'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("queue");
+        drop(tx);
+        assert_eq!(queued, 1, "DSN отказа не в очереди");
+        assert!(
+            GroupStore::held(&meta, t, Some(group.id), 10)
+                .await
+                .expect("held")
+                .is_empty()
+        );
+
+        server.abort();
+        stop.cancel();
+        drop((services, delivery, admin, meta, pool));
         crate::testutil::drop_database(&url, &db_name).await;
     }
 }

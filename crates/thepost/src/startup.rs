@@ -14,7 +14,9 @@ use tp_platform::Config;
 use tp_platform::privileges;
 use tp_sys::{ConfineConfig, ConfineReport, Confinement, RolePaths, SeccompMode};
 
-use crate::sections::{self, AUTH, AuthSection, BLOB, BlobLocation, BlobSection, SEARCH};
+use crate::sections::{
+    self, AUTH, AuthSection, BLOB, BlobLocation, BlobSection, CLUSTER, ClusterSection, SEARCH,
+};
 
 /// Учётная запись процесса и ограничения ролей для `thepost serve` по config.yaml `path`.
 pub fn prepare_serve(path: &Path) -> Result<ConfineReport> {
@@ -103,6 +105,10 @@ pub fn role_paths(cfg: &Config, config_file: &Path) -> RolePaths {
     if let Ok(db) = cfg.section::<PoolConfig>(PoolConfig::SECTION) {
         tls_files(&db.tls, &mut paths.config);
     }
+    // Межузловой канал (`cluster.rpc.tls`): файлы читаются при запуске и перечитываются под Landlock.
+    if let Ok(cluster) = cfg.section::<ClusterSection>(CLUSTER) {
+        tls_files(&cluster.rpc.tls, &mut paths.config);
+    }
     if let Ok(auth) = cfg.section::<AuthSection>(AUTH) {
         if let Some(ldap) = &auth.ldap {
             tls_files(&ldap.tls, &mut paths.config);
@@ -114,8 +120,15 @@ pub fn role_paths(cfg: &Config, config_file: &Path) -> RolePaths {
     paths
 }
 
+/// Файлы секции TLS внутреннего канала. Ключ по ссылке на секрет (`key`, CTR-52) читается из хранилища секретов:
+/// файла ключа на диске нет и в пути доступа роли он не входит (APP-36).
 fn tls_files(tls: &InternalTls, out: &mut Vec<PathBuf>) {
-    for file in [&tls.ca_file, &tls.cert_file, &tls.key_file]
+    let key_file = if tls.key.is_some() {
+        &None
+    } else {
+        &tls.key_file
+    };
+    for file in [&tls.ca_file, &tls.cert_file, key_file]
         .into_iter()
         .flatten()
     {
@@ -231,6 +244,58 @@ mod tests {
             paths
                 .config
                 .contains(&PathBuf::from("/etc/thepost/config.yaml"))
+        );
+    }
+
+    /// APP-36: файлы межузлового канала и СУБД входят в пути роли; при ключе из хранилища секретов (`key`)
+    /// файла ключа среди них нет.
+    #[test]
+    fn channel_key_from_secret_store_has_no_file_path() {
+        let parse = |db_key: &str, rpc_key: &str| {
+            let cfg = sections::registry()
+                .expect("registry")
+                .parse(
+                    &format!(
+                        "domain: example.org\nprofile: dev\n\
+                         database:\n  url: postgres://x@y/z\n  tls:\n    ca_file: /etc/thepost/pg-ca.pem\n    \
+                         cert_file: /etc/thepost/pg.pem\n    {db_key}\n\
+                         blob:\n  url: file:///var/lib/thepost/blob\n\
+                         cluster:\n  rpc:\n    tls:\n      ca_file: /etc/thepost/ca.pem\n      \
+                         cert_file: /etc/thepost/node.pem\n      {rpc_key}\n"
+                    ),
+                    Vec::new(),
+                )
+                .expect("config");
+            role_paths(&cfg, Path::new("/etc/thepost/config.yaml")).config
+        };
+        let files = parse(
+            "key_file: /etc/thepost/pg-key.pem",
+            "key_file: /etc/thepost/node-key.pem",
+        );
+        for file in [
+            "pg-ca.pem",
+            "pg.pem",
+            "pg-key.pem",
+            "ca.pem",
+            "node.pem",
+            "node-key.pem",
+        ] {
+            assert!(
+                files.contains(&Path::new("/etc/thepost").join(file)),
+                "{file}: {files:?}"
+            );
+        }
+        let files = parse(
+            "key: { secret: \"thepost/db#key\" }",
+            "key: { secret: \"thepost/node#key\" }",
+        );
+        assert!(files.contains(&PathBuf::from("/etc/thepost/node.pem")));
+        assert!(files.contains(&PathBuf::from("/etc/thepost/pg.pem")));
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.ends_with("pg-key.pem") || f.ends_with("node-key.pem")),
+            "{files:?}"
         );
     }
 }
