@@ -1,13 +1,17 @@
 //! Сервисы ролей ядра (SRS 2.1): maintenance — GC и «сироты» BLOB под лизой лидера, истечение срока корзины
 //! (`tp-mailstore`: таймер на ближайший срок → точка принятия решений → окончательное удаление), подписчики
 //! журнала событий (по сигналам, [`crate::log_reader`]), очистка по сроку надгробий DAV и журнала автоответов
-//! ([`Purge`], решение 2026-11-11 п. 65); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
+//! ([`Purge`], решение 2026-11-11 п. 65), проверка целостности BLOB по расписанию под лизой лидера
+//! ([`ScheduledVerify`], APP-44); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tp_blob::{GcConfig, GcWorker, OrphanConfig, OrphanMetrics, OrphanSweeper, system_now};
+use tp_blob::{
+    GcConfig, GcWorker, Now, OrphanConfig, OrphanMetrics, OrphanSweeper, Verifier, VerifyReport,
+    system_now,
+};
 use tp_contracts::Result;
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::events::EventSink;
@@ -17,6 +21,7 @@ use tp_meta::PgMeta;
 use tp_meta::events::EventConsumer;
 
 use crate::log_reader::{LogReader, LogSignals};
+use crate::sections::VerifySchedule;
 
 /// Роль ядра, реализация которой ещё не вошла в сборку (протоколы — этап Ф1): объявляет готовность
 /// и ждёт остановки, чтобы узел с пресетом `all` доходил до ready.
@@ -84,6 +89,197 @@ pub struct Maintenance {
     pub trash: Option<tp_mailstore::Store>,
     /// Очистка по сроку надгробий DAV и журнала автоответов; `None` — не выполняется (тесты без PostgreSQL).
     pub purge: Option<Purge>,
+    /// Проверка целостности BLOB по расписанию; `None` — выключена (`maintenance.verify.enabled: false`).
+    pub verify: Option<ScheduledVerify>,
+}
+
+/// Показатели проверки целостности BLOB по расписанию для `/metrics` (`crate::metrics::register_verify`).
+/// Расхождения — итог последнего завершённого прохода: после исправления (`thepost verify --fix`) следующий
+/// проход их обнуляет.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VerifyMetrics {
+    /// Завершённые проходы.
+    pub passes: u64,
+    /// Проходы, прерванные ошибкой (листинг хранилища, СУБД) или потерей лизы.
+    pub failed: u64,
+    /// Повреждённые записи учёта в последнем проходе: объекта нет или его размер не совпадает с учётом.
+    pub damaged: u64,
+    /// «Сироты» в последнем проходе: объекты хранилища без записи учёта.
+    pub orphans: u64,
+    /// Объекты и записи, которые в последнем проходе проверить не удалось.
+    pub errors: u64,
+    /// Время последнего прохода, секунд.
+    pub duration_secs: u64,
+    /// Момент завершения последнего прохода, секунд от начала эпохи Unix; 0 — проходов не было.
+    pub finished_at: u64,
+}
+
+/// Держатель показателей проверки целостности: пишет воркер роли, читает `/metrics`. Клон — те же показатели;
+/// перезапуск роли их не обнуляет.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyProbe(Arc<Mutex<VerifyMetrics>>);
+
+impl VerifyProbe {
+    /// Снимок показателей.
+    pub fn metrics(&self) -> VerifyMetrics {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn update(&self, f: impl FnOnce(&mut VerifyMetrics)) {
+        f(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner));
+    }
+}
+
+/// Итог попытки прохода [`ScheduledVerify::pass`].
+#[derive(Debug)]
+pub enum VerifyPass {
+    /// Проход завершён: отчёт сверки.
+    Done(VerifyReport),
+    /// Лиза у другого узла: проход выполняет он.
+    NotLeader,
+    /// Проход не завершён: ошибка сверки или лизы, потеря лизы.
+    Failed,
+}
+
+/// Проверка целостности BLOB по расписанию в роли maintenance (APP-44): сверка `thepost verify` без `--fix` под
+/// лизой лидера. Ничего не исправляет: расхождения — `ERROR` в журнал узла и показатели, исправление — вручную.
+#[derive(Clone)]
+pub struct ScheduledVerify {
+    /// Сверка хранилища и учёта (та же, что у `thepost verify`).
+    pub verifier: Arc<Verifier>,
+    /// Расписание и лиза (`maintenance.verify`).
+    pub schedule: VerifySchedule,
+    /// Показатели для `/metrics`.
+    pub probe: VerifyProbe,
+    /// Часы расписания (UTC).
+    pub now: Now,
+}
+
+impl std::fmt::Debug for ScheduledVerify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScheduledVerify")
+            .field("schedule", &self.schedule)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScheduledVerify {
+    /// Проходы по расписанию до остановки; остановка прерывает и идущий проход (сверка только читает).
+    pub async fn run(
+        self,
+        leases: Arc<dyn LeaseStore>,
+        holder: String,
+        shutdown: CancellationToken,
+    ) {
+        loop {
+            let nanos = u64::try_from((self.now)().unix_timestamp_nanos()).unwrap_or_default();
+            let since_epoch = Duration::from_nanos(nanos);
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(self.schedule.until_next(since_epoch)) => {}
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                _ = self.pass(&*leases, &holder) => {}
+            }
+        }
+    }
+
+    /// Один проход под лизой: лиза продлевается, пока идёт сверка, и после прохода не отдаётся — истекает сама
+    /// (`lease_ttl`), чтобы узел с отстающими часами не повторил проход. Потеря лизы прерывает проход.
+    pub async fn pass(&self, leases: &dyn LeaseStore, holder: &str) -> VerifyPass {
+        let (name, ttl) = (&self.schedule.lease_name, self.schedule.lease_ttl);
+        let mut lease = match leases.try_acquire(name, holder, ttl).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                tracing::debug!(lease = %name, "проверка целостности BLOB: проход выполняет другой узел");
+                return VerifyPass::NotLeader;
+            }
+            Err(e) => {
+                tracing::warn!(lease = %name, error = %e, "проверка целостности BLOB: лиза не получена, проход пропущен");
+                self.probe.update(|m| m.failed += 1);
+                return VerifyPass::Failed;
+            }
+        };
+        let started = tokio::time::Instant::now();
+        let mut renew =
+            tokio::time::interval_at(started + ttl / 3, (ttl / 3).max(Duration::from_millis(1)));
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let sweep = self.verifier.run(false);
+        tokio::pin!(sweep);
+        let result = loop {
+            tokio::select! {
+                result = &mut sweep => break result,
+                _ = renew.tick() => match leases.renew(&lease, ttl).await {
+                    Ok(Some(renewed)) => lease = renewed,
+                    Ok(None) => {
+                        tracing::warn!(lease = %name, "проверка целостности BLOB: лиза потеряна, проход прерван");
+                        self.probe.update(|m| m.failed += 1);
+                        return VerifyPass::Failed;
+                    }
+                    // Сверка только читает: сбой продления не повод её бросать — повтор на следующем такте.
+                    Err(e) => tracing::warn!(lease = %name, error = %e, "проверка целостности BLOB: лиза не продлена"),
+                },
+            }
+        };
+        let report = match result {
+            Ok(report) => report,
+            Err(e) => {
+                tracing::error!(error = %e, "проверка целостности BLOB: проход прерван ошибкой");
+                self.probe.update(|m| m.failed += 1);
+                return VerifyPass::Failed;
+            }
+        };
+        let duration_secs = started.elapsed().as_secs();
+        self.probe.update(|m| {
+            m.passes += 1;
+            m.damaged = report.damaged;
+            m.orphans = report.orphans;
+            m.errors = report.errors;
+            m.duration_secs = duration_secs;
+            m.finished_at = u64::try_from(report.finished_at).unwrap_or_default();
+        });
+        for d in &report.damaged_blobs {
+            tracing::error!(
+                path = %d.path,
+                damage = ?d.damage,
+                expected_size = d.expected_size,
+                actual_size = ?d.actual_size,
+                "проверка целостности BLOB: запись учёта повреждена"
+            );
+        }
+        for path in &report.orphan_paths {
+            tracing::error!(path = %path, "проверка целостности BLOB: объект без записи учёта («сирота»)");
+        }
+        let (objects, records, damaged, orphans, errors, truncated) = (
+            report.objects_listed,
+            report.records_checked,
+            report.damaged,
+            report.orphans,
+            report.errors,
+            report.truncated,
+        );
+        if damaged + orphans + errors == 0 {
+            tracing::info!(
+                objects,
+                records,
+                duration_secs,
+                "проверка целостности BLOB: расхождений нет"
+            );
+        } else {
+            tracing::error!(
+                objects,
+                records,
+                damaged,
+                orphans,
+                errors,
+                truncated,
+                duration_secs,
+                "проверка целостности BLOB: найдены расхождения; исправление — вручную: thepost verify --fix"
+            );
+        }
+        VerifyPass::Done(report)
+    }
 }
 
 /// Очистка по сроку в роли maintenance (APP-32): надгробия DAV старше `meta.dav.tombstone_ttl` и записи журнала
@@ -222,7 +418,20 @@ impl RoleService for Maintenance {
             .purge
             .clone()
             .map(|purge| tokio::spawn(purge.run(ctx.shutdown.clone())));
+        let verify = self.verify.clone().map(|verify| {
+            tokio::spawn(verify.run(
+                self.leases.clone(),
+                self.holder.clone(),
+                ctx.shutdown.clone(),
+            ))
+        });
         ctx.ready.set(true);
+        let verify = async move {
+            match verify {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
         let trash = async move {
             match trash {
                 Some(task) => task.await,
@@ -235,11 +444,12 @@ impl RoleService for Maintenance {
                 None => Ok(()),
             }
         };
-        let (gc, orphans, trash, purge, ()) = tokio::join!(
+        let (gc, orphans, trash, purge, verify, ()) = tokio::join!(
             gc,
             orphans,
             trash,
             purge,
+            verify,
             consume(
                 self.events.clone(),
                 self.sinks.clone(),
@@ -252,6 +462,7 @@ impl RoleService for Maintenance {
             ("blob-orphans", orphans),
             ("trash-expiry", trash),
             ("purge", purge),
+            ("blob-verify", verify),
         ] {
             if let Err(e) = done {
                 return Err(tp_contracts::Error::Internal(format!("{what}: {e}")));
@@ -373,6 +584,7 @@ mod tests {
             orphan_probe: OrphanProbe::default(),
             trash: None,
             purge: None,
+            verify: None,
         };
         let (ctx, shutdown, ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -387,6 +599,147 @@ mod tests {
         assert!(ready.is_ready());
         shutdown.cancel();
         task.await.expect("join").expect("run");
+    }
+
+    /// APP-44: проход по расписанию находит повреждённую запись учёта BLOB (объект пропал из хранилища) и
+    /// «сироту», показатели `/metrics` растут; ничего не исправляется; узел без лизы проход не выполняет.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduled_verify_finds_damaged_blob() {
+        use bytes::Bytes;
+        use tp_blob::{BlobWriter, VerifyConfig, WriterConfig};
+        use tp_contracts::{BlobKey, Gen};
+        use tp_testkit::ManualClock;
+
+        const GRACE: u64 = 3600;
+        let clock = ManualClock::default();
+        let index = MemBlobIndex::new(clock.shared());
+        let store = MemBlobStore::new(clock.shared());
+        let writer = BlobWriter::new(
+            Arc::new(index.clone()),
+            Arc::new(store.clone()),
+            WriterConfig::default(),
+        );
+        let inventory = Arc::new(crate::testutil::MemInventory::new(index.clone()));
+        let mut keys = Vec::new();
+        for body in [&b"ok"[..], b"lost"] {
+            let key = writer
+                .write(TenantId::DEFAULT, Bytes::from_static(body), 1)
+                .await
+                .expect("write");
+            keys.push(key);
+        }
+        inventory
+            .keys
+            .lock()
+            .expect("lock")
+            .extend(keys.iter().copied());
+        let (ok, lost) = (keys[0], keys[1]);
+        store.delete(&lost).await.expect("delete");
+        let orphan = BlobKey {
+            generation: Gen(7),
+            ..ok
+        };
+        store
+            .put(&orphan, Bytes::from_static(b"ok"))
+            .await
+            .expect("put");
+        clock.advance(Duration::from_secs(GRACE + 1));
+
+        let metrics = tp_platform::Metrics::default();
+        let probe = crate::metrics::register_verify(&metrics);
+        let c = clock.clone();
+        let verify = ScheduledVerify {
+            verifier: Arc::new(Verifier::new(
+                Arc::new(index.clone()),
+                inventory.clone(),
+                Arc::new(store.clone()),
+                VerifyConfig {
+                    grace_secs: GRACE,
+                    ..VerifyConfig::default()
+                },
+                Arc::new(move || c.now()),
+            )),
+            // Сетка проходов — каждые 200 мс.
+            schedule: VerifySchedule {
+                at: Duration::ZERO,
+                interval: Duration::from_millis(200),
+                ..VerifySchedule::default()
+            },
+            probe: probe.clone(),
+            now: system_now(),
+        };
+        let text = metrics.encode().expect("encode");
+        assert!(text.contains("tp_blob_verify_passes_total 0"), "{text}");
+        assert!(text.contains("tp_blob_verify_damaged 0"), "{text}");
+
+        // Лиза у другого узла: прохода нет.
+        let leases = MemLease::default();
+        let lease_name = verify.schedule.lease_name.clone();
+        let other = leases
+            .try_acquire(&lease_name, "node-b/1", Duration::from_secs(60))
+            .await
+            .expect("acquire")
+            .expect("free");
+        assert!(matches!(
+            verify.pass(&leases, "node-a/1").await,
+            VerifyPass::NotLeader
+        ));
+        assert_eq!(probe.metrics(), VerifyMetrics::default());
+        leases.release(&other).await.expect("release");
+
+        // GC и поиск «сирот» роли — на своём пустом хранилище: «сироту» этого теста они бы удалили.
+        let role = Maintenance {
+            index: Arc::new(MemBlobIndex::default()),
+            store: Arc::new(MemBlobStore::default()),
+            leases: Arc::new(leases.clone()),
+            holder: "node-a/1".into(),
+            events: EventConsumer::new(
+                Arc::new(MemEventLog::new(1)) as Arc<dyn EventLog>,
+                Arc::new(leases.clone()),
+                "node-a/1",
+                tp_meta::events::EventsConfig::default(),
+            ),
+            sinks: Vec::new(),
+            signals: LogSignals {
+                bus: Arc::new(tp_cluster::LocalBus::new(
+                    &tp_cluster::LocalBusConfig::default(),
+                )),
+                members: None,
+                lease_ttl: Duration::from_secs(30),
+                resubscribe: Duration::from_secs(1),
+            },
+            gc: GcConfig::default(),
+            orphans: OrphanConfig::default(),
+            orphan_probe: OrphanProbe::default(),
+            trash: None,
+            purge: None,
+            verify: Some(verify),
+        };
+        let (ctx, shutdown, _ready) = ctx();
+        let task = tokio::spawn(async move { role.run(ctx).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // Второй проход — по расписанию снова, тем же держателем лизы.
+        while probe.metrics().passes < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "проход по расписанию не выполнен"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        shutdown.cancel();
+        task.await.expect("join").expect("run");
+
+        let m = probe.metrics();
+        assert_eq!((m.damaged, m.orphans, m.errors, m.failed), (1, 1, 0, 0));
+        assert!(m.finished_at > 0);
+        let text = metrics.encode().expect("encode");
+        assert!(text.contains("tp_blob_verify_damaged 1"), "{text}");
+        assert!(text.contains("tp_blob_verify_orphans 1"), "{text}");
+        assert!(!text.contains("tp_blob_verify_passes_total 0"), "{text}");
+        assert_eq!(leases.holder(&lease_name).as_deref(), Some("node-a/1"));
+        // Без --fix: «сирота» на месте, запись не помечена.
+        assert!(store.contains(&orphan));
+        assert!(inventory.damaged.lock().expect("lock").is_empty());
     }
 
     /// APP-32: проход очистки удаляет надгробия DAV и записи журнала автоответов старше срока из `meta`, свежие
@@ -534,6 +887,7 @@ mod tests {
             orphan_probe: OrphanProbe::default(),
             trash: None,
             purge: Some(purge),
+            verify: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });

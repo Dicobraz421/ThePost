@@ -49,7 +49,7 @@ use crate::modules;
 use crate::protocols::{
     Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, LogPause, SmtpRole, Sockets,
 };
-use crate::roles::{Maintenance, PendingRole, Purge};
+use crate::roles::{Maintenance, PendingRole, Purge, ScheduledVerify};
 use crate::secrets;
 use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection, HttpSection};
 use crate::services::{Base, Services};
@@ -325,6 +325,12 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         events_cfg.clone(),
     )
     .with_assigner(assigner, node.clone());
+    let maintenance_cfg = cfg.section::<sections::MaintenanceSection>(sections::MAINTENANCE)?;
+    let verify_page_size = cfg
+        .section::<sections::VerifySection>(sections::VERIFY)?
+        .page_size;
+    // Показатели есть и при выключенной проверке: нулевые.
+    let verify_probe = crate::metrics::register_verify(&metrics);
     let maintenance = Maintenance {
         index: Arc::new(meta.clone()),
         store: blob.clone(),
@@ -344,9 +350,21 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         trash: Some(services.mail.clone()),
         purge: Some(Purge {
             meta: meta.clone(),
-            interval: cfg
-                .section::<sections::MaintenanceSection>(sections::MAINTENANCE)?
-                .purge_interval,
+            interval: maintenance_cfg.purge_interval,
+        }),
+        verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {
+            verifier: Arc::new(crate::verify::verifier(
+                Arc::new(meta.clone()),
+                Arc::new(crate::verify::PgInventory::new(
+                    meta.clone(),
+                    verify_page_size,
+                )),
+                blob.clone(),
+                tp_blob::VerifyConfig::default(),
+            )),
+            schedule: maintenance_cfg.verify.clone(),
+            probe: verify_probe,
+            now: tp_blob::system_now(),
         }),
     };
     let mut setup = RoleSetup {

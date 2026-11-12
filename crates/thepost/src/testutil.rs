@@ -103,3 +103,50 @@ pub async fn db_pool(url: &str) -> tp_meta::pool::DbPool {
     let pool = sqlx::PgPool::connect(url).await.expect("pool");
     tp_meta::pool::DbPool::new(pool, std::sync::Arc::new(tp_meta::pool::NoAcquireObserver))
 }
+
+/// Перечисление записей учёта BLOB поверх `MemBlobIndex` по записанным ключам (`keys`); помеченные
+/// повреждёнными — в `damaged`.
+pub struct MemInventory {
+    index: tp_testkit::MemBlobIndex,
+    pub keys: std::sync::Mutex<Vec<tp_contracts::BlobKey>>,
+    pub damaged: std::sync::Mutex<std::collections::BTreeSet<tp_contracts::BlobKey>>,
+}
+
+impl MemInventory {
+    pub fn new(index: tp_testkit::MemBlobIndex) -> Self {
+        Self {
+            index,
+            keys: std::sync::Mutex::default(),
+            damaged: std::sync::Mutex::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl tp_blob::BlobInventory for MemInventory {
+    fn live(
+        &self,
+    ) -> futures::stream::BoxStream<'static, tp_contracts::Result<tp_blob::IndexedBlob>> {
+        use futures::StreamExt;
+        let rows: Vec<_> = self
+            .keys
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|k| {
+                let r = self.index.row(k.tenant, &k.hash)?;
+                (r.state == tp_testkit::blob::BlobState::Live && r.generation == k.generation)
+                    .then_some(Ok(tp_blob::IndexedBlob {
+                        key: *k,
+                        size: r.size,
+                    }))
+            })
+            .collect();
+        futures::stream::iter(rows).boxed()
+    }
+
+    async fn mark_damaged(&self, key: &tp_contracts::BlobKey) -> tp_contracts::Result<()> {
+        self.damaged.lock().expect("lock").insert(*key);
+        Ok(())
+    }
+}
