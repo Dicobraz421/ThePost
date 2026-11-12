@@ -72,6 +72,9 @@ pub trait Transport: Send + Sized + 'static {
 
     /// Рукопожатие TLS после ответа на `STARTTLS`.
     fn starttls(self) -> impl Future<Output = Result<Self>> + Send;
+
+    /// Адрес клиента для журнала аудита.
+    fn client(&self) -> Option<IpAddr>;
 }
 
 impl Transport for Conn {
@@ -95,6 +98,10 @@ impl Transport for Conn {
 
     fn starttls(self) -> impl Future<Output = Result<Self>> + Send {
         Conn::starttls(self)
+    }
+
+    fn client(&self) -> Option<IpAddr> {
+        Some(self.info.client.ip())
     }
 }
 
@@ -121,6 +128,8 @@ pub struct Deps {
     pub trash: Arc<dyn TrashStore>,
     /// Точки принятия решений модулей: Legal Hold перед стиранием при `trash.purge = erase`.
     pub hooks: DecisionHooks,
+    /// Журнал аудита доступа к ящику (IMAP-15): что сохранять, решает политика ящика.
+    pub audit: Arc<dyn MailboxAudit>,
 }
 
 impl fmt::Debug for Deps {
@@ -235,6 +244,7 @@ impl<T: Transport> Session<T> {
     /// Сессия соединения.
     pub fn new(ctx: Arc<SessionCtx>, conn: T) -> Self {
         let reader = reader(&ctx.config);
+        let audit = Audit::new(ctx.deps.audit.clone(), "imap", conn.client());
         Self {
             ctx,
             peer: conn.peer(),
@@ -247,7 +257,7 @@ impl<T: Transport> Session<T> {
             condstore: false,
             qresync: false,
             ext: Extensions::default(),
-            audit: Audit::default(),
+            audit,
             deflate: None,
             errors: 0,
             auth_failures: 0,
@@ -258,12 +268,6 @@ impl<T: Transport> Session<T> {
     /// Подключает зависимости расширений (QUOTA, ACL, общие папки).
     pub fn with_extensions(mut self, ext: Extensions) -> Self {
         self.ext = ext;
-        self
-    }
-
-    /// Подключает журнал аудита доступа к ящику; `client` — адрес клиента для записей.
-    pub fn with_audit(mut self, log: Arc<dyn MailboxAudit>, client: Option<IpAddr>) -> Self {
-        self.audit = Audit::new(log, "imap", client);
         self
     }
 
@@ -1058,14 +1062,12 @@ pub(crate) fn io_error(e: std::io::Error) -> Error {
 pub struct Server {
     ctx: Arc<SessionCtx>,
     ext: Extensions,
-    audit: Option<Arc<dyn MailboxAudit>>,
 }
 
 impl fmt::Debug for Server {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
             .field("ext", &self.ext)
-            .field("audit", &self.audit.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1076,19 +1078,12 @@ impl Server {
         Self {
             ctx: Arc::new(ctx),
             ext: Extensions::default(),
-            audit: None,
         }
     }
 
     /// Подключает зависимости расширений (QUOTA, ACL, общие папки) для новых сессий.
     pub fn with_extensions(mut self, ext: Extensions) -> Self {
         self.ext = ext;
-        self
-    }
-
-    /// Подключает журнал аудита доступа к ящику для новых сессий.
-    pub fn with_audit(mut self, log: Arc<dyn MailboxAudit>) -> Self {
-        self.audit = Some(log);
         self
     }
 
@@ -1112,7 +1107,6 @@ impl Server {
                     let full = sessions.len() >= self.ctx.config.limits.max_connections;
                     let ctx = self.ctx.clone();
                     let ext = self.ext.clone();
-                    let audit = self.audit.clone();
                     let task = async move {
                         let peer = incoming.peer();
                         let conn = match incoming.establish().await {
@@ -1127,10 +1121,7 @@ impl Server {
                             return;
                         }
                         let client = conn.info.client;
-                        let mut session = Session::new(ctx, conn).with_extensions(ext);
-                        if let Some(log) = audit {
-                            session = session.with_audit(log, Some(client.ip()));
-                        }
+                        let session = Session::new(ctx, conn).with_extensions(ext);
                         if let Err(e) = session.run().await {
                             tracing::debug!(%client, error = %e, "imap: сессия прервана");
                         }

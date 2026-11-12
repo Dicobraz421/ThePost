@@ -10,10 +10,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
+use tp_contracts::addressbook::OrgStore;
+use tp_contracts::audit::MailboxAudit;
 use tp_contracts::auth::{Authenticator, Authorizer, Principal};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::bus::EventBus;
 use tp_contracts::dav::DavStore;
+use tp_contracts::delivery::DeliveryLog;
 use tp_contracts::ext::{DecisionHooks, JmapCapability};
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{
@@ -24,7 +27,9 @@ use tp_contracts::queue::Outbound;
 use tp_contracts::retention::TrashStore;
 use tp_contracts::schedule::FreeBusy;
 use tp_contracts::search::SearchIndex;
+use tp_contracts::senders::SenderLists;
 use tp_contracts::sieve::SieveStore;
+use tp_contracts::submission::SubmissionStore;
 use tp_contracts::transport::MailFlow;
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Result, TenantId};
 
@@ -68,10 +73,18 @@ pub const PRINCIPALS_OWNER: &str = "urn:ietf:params:jmap:principals:owner";
 /// [`Jmap::with_freebusy`].
 pub const AVAILABILITY: &str = "urn:ietf:params:jmap:principals:availability";
 
+/// Capability личных списков отправителей The Post (`SenderList`); доступна при подключённом
+/// [`Jmap::with_sender_lists`].
+pub const SENDER_LISTS: &str = "urn:thepost:senderlists";
+/// Capability оргструктуры The Post (`OrgUnit`); доступна при подключённом [`Jmap::with_org`].
+pub const ORG_CHART: &str = "urn:thepost:orgchart";
+
 /// Встроенные capability.
 const BUILTIN: [&str; 5] = [CORE, MAIL, SUBMISSION, WEBSOCKET, SETTINGS];
 /// Встроенные capability, доступные при подключённом хранилище (URI заняты всегда).
-const OPTIONAL: [&str; 7] = [
+const OPTIONAL: [&str; 9] = [
+    SENDER_LISTS,
+    ORG_CHART,
     VACATION,
     SIEVE,
     CONTACTS,
@@ -114,6 +127,12 @@ pub struct Deps {
     pub authz: Arc<dyn Authorizer>,
     /// Очередь исходящей почты; `None` — узел не отправляет (EmailSubmission — `forbiddenToSend`).
     pub outbound: Option<Arc<dyn Outbound>>,
+    /// Учёт отправок: объекты `EmailSubmission` (отложенная отправка, отмена, статусы получателей).
+    pub submissions: Arc<dyn SubmissionStore>,
+    /// Журнал доставки: статусы получателей отправок (`EmailSubmission.deliveryStatus`).
+    pub delivery_log: Arc<dyn DeliveryLog>,
+    /// Аудит доступа к ящику: действия не владельца и, по политике, владельца (SRS 5.2).
+    pub audit: Arc<dyn MailboxAudit>,
     /// Точки принятия решений модулей (`on_submission`; `before_final_delete` при очистке корзины).
     pub hooks: DecisionHooks,
     /// Capability модулей (`Registry::jmap_capabilities`).
@@ -156,6 +175,10 @@ pub struct Jmap {
     pub(crate) freebusy: Option<Arc<dyn FreeBusy>>,
     /// Планирование встреч (JMAP-31); `None` — `sendSchedulingMessages` недоступен.
     pub(crate) schedule: Option<tp_dav::ScheduleDeps>,
+    /// Личные списки отправителей; `None` — capability `urn:thepost:senderlists` не объявляется.
+    pub(crate) sender_lists: Option<Arc<dyn SenderLists>>,
+    /// Оргструктура; `None` — capability `urn:thepost:orgchart` не объявляется.
+    pub(crate) org: Option<Arc<dyn OrgStore>>,
     stop: watch::Sender<bool>,
 }
 
@@ -168,6 +191,8 @@ impl fmt::Debug for Jmap {
             .field("profile_signer", &self.profile_signer.is_some())
             .field("sieve", &self.sieve.is_some())
             .field("dav", &self.dav.is_some())
+            .field("sender_lists", &self.sender_lists.is_some())
+            .field("org", &self.org.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -272,6 +297,8 @@ impl Jmap {
             dav: None,
             freebusy: None,
             schedule: None,
+            sender_lists: None,
+            org: None,
             stop: watch::channel(false).0,
         })
     }
@@ -336,6 +363,35 @@ impl Jmap {
         self
     }
 
+    /// Подключает личные списки надёжных и заблокированных отправителей (CONTRACTS.md#SenderLists, JMAP-17):
+    /// capability `urn:thepost:senderlists`, методы `SenderList/get` и `SenderList/set`. `None` — capability не
+    /// объявляется, её методы — `unknownMethod`.
+    #[must_use]
+    pub fn with_sender_lists(mut self, lists: Option<Arc<dyn SenderLists>>) -> Self {
+        self.sender_lists = lists;
+        self
+    }
+
+    /// Подключает оргструктуру организации (CONTRACTS.md#AddressBook, JMAP-17): capability `urn:thepost:orgchart`,
+    /// метод `OrgUnit/get`. `None` — capability не объявляется, её метод — `unknownMethod`.
+    #[must_use]
+    pub fn with_org(mut self, org: Option<Arc<dyn OrgStore>>) -> Self {
+        self.org = org;
+        self
+    }
+
+    /// Списки отправителей для метода; не подключены — `unknownMethod`.
+    pub(crate) fn sender_lists_store(&self) -> MethodResult<&Arc<dyn SenderLists>> {
+        self.sender_lists
+            .as_ref()
+            .ok_or(MethodError::new("unknownMethod"))
+    }
+
+    /// Оргструктура для метода; не подключена — `unknownMethod`.
+    pub(crate) fn org_store(&self) -> MethodResult<&Arc<dyn OrgStore>> {
+        self.org.as_ref().ok_or(MethodError::new("unknownMethod"))
+    }
+
     /// Хранилище DAV для метода; не подключено — `unknownMethod`.
     pub(crate) fn dav_store(&self) -> MethodResult<&Arc<dyn DavStore>> {
         self.dav.as_ref().ok_or(MethodError::new("unknownMethod"))
@@ -344,6 +400,8 @@ impl Jmap {
     /// Подключена ли встроенная capability, зависящая от хранилища.
     fn optional_enabled(&self, uri: &str) -> bool {
         match uri {
+            SENDER_LISTS => self.sender_lists.is_some(),
+            ORG_CHART => self.org.is_some(),
             VACATION | SIEVE => self.sieve.is_some(),
             CONTACTS | CALENDARS | PRINCIPALS | PRINCIPALS_OWNER => self.dav.is_some(),
             AVAILABILITY => self.dav.is_some() && self.freebusy.is_some(),
@@ -417,13 +475,29 @@ impl Jmap {
         );
         account_caps.insert(
             SUBMISSION.into(),
-            json!({ "maxDelayedSend": 0, "submissionExtensions": {} }),
+            json!({
+                "maxDelayedSend": c.submission.max_delayed_send.as_secs(),
+                "submissionExtensions": {},
+            }),
         );
         account_caps.insert(SETTINGS.into(), json!({}));
         let mut primary = Map::new();
         primary.insert(MAIL.into(), json!(account));
         primary.insert(SUBMISSION.into(), json!(account));
         primary.insert(SETTINGS.into(), json!(account));
+        if self.sender_lists.is_some() {
+            caps.insert(SENDER_LISTS.into(), json!({}));
+            account_caps.insert(
+                SENDER_LISTS.into(),
+                crate::sender_lists::account_capability(),
+            );
+            primary.insert(SENDER_LISTS.into(), json!(account));
+        }
+        if self.org.is_some() {
+            caps.insert(ORG_CHART.into(), json!({}));
+            account_caps.insert(ORG_CHART.into(), json!({}));
+            primary.insert(ORG_CHART.into(), json!(account));
+        }
         if let Some(sieve) = &self.sieve {
             caps.insert(VACATION.into(), json!({}));
             account_caps.insert(VACATION.into(), json!({}));
@@ -655,12 +729,16 @@ fn slot<'a>(slots: &'a Slots, p: &Principal, max: u32) -> Option<Inflight<'a>> {
 
 /// Идентификатор цепочки письма (`threadId`): по ключу цепочки из метаданных; письмо без ключа — своя цепочка.
 pub(crate) fn thread_id(m: &Message) -> String {
-    let key = if m.meta.thread_key.is_empty() {
-        format!("id:{}", m.id)
+    if m.meta.thread_key.is_empty() {
+        lone_thread_id(m.id)
     } else {
-        m.meta.thread_key.clone()
-    };
-    format!("T{}", digest(key.as_bytes()))
+        format!("T{}", digest(m.meta.thread_key.as_bytes()))
+    }
+}
+
+/// Цепочка из одного письма `id`: письмо без ключа цепочки или уже удалённое.
+pub(crate) fn lone_thread_id(id: tp_contracts::MessageId) -> String {
+    format!("T{}", digest(format!("id:{id}").as_bytes()))
 }
 
 /// Первые 12 байт SHA-256 в hex.

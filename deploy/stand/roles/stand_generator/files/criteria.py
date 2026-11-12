@@ -11,8 +11,9 @@ thresholds — пороги Д.5, критерий прогона — «узел
 
 Входы каталога: params.txt, events.txt, probes.jsonl (probes.py), probe-k6.jsonl и probe-idle-k6.jsonl (probe.js),
 smb-samples.csv (smb-sampler.py, узел SMB; метрики Д.7 узла APP-34 — пул СУБД, NOTIFY, слушатели, «сироты»),
-ledger.txt (сверка принятых писем), brute.json (сценарий bruteforce), журналы нагрузки
-(smtp-in.log, submission.log, k6-summary.json — в каталоге или в step-*/ для stress).
+ledger.txt (сверка принятых писем), brute.json (сценарий bruteforce), services.json (службы CalDAV, CardDAV,
+ManageSieve — DEP-21), журналы нагрузки (smtp-in.log, submission.log, k6-summary.json, dav-summary.json — в каталоге
+или в step-*/ для stress).
 """
 
 import csv
@@ -180,11 +181,34 @@ class Run:
     def k6_5xx(self):
         n = 0
         for d in self.loads:
-            p = os.path.join(d, "k6-summary.json")
-            if os.path.exists(p):
-                with open(p, encoding="utf-8") as f:
-                    n += int(json.load(f).get("metrics", {}).get("http_5xx", {}).get("count", 0))
+            for name in ("k6-summary.json", "dav-summary.json"):
+                p = os.path.join(d, name)
+                if os.path.exists(p):
+                    with open(p, encoding="utf-8") as f:
+                        n += int(json.load(f).get("metrics", {}).get("http_5xx", {}).get("count", 0))
         return n
+
+    def dav_load(self):
+        """Запросы нагрузки dav.js по именам (тег name): число, p95 (мс, последней нагрузки — для stress последней
+        ступени), отказов — из dav-summary.json (подметрики http_req_duration и dav_fail)."""
+        out = {}
+        for d in self.loads:
+            p = os.path.join(d, "dav-summary.json")
+            if not os.path.exists(p):
+                continue
+            with open(p, encoding="utf-8") as f:
+                m = json.load(f).get("metrics", {})
+            for key, v in m.items():
+                metric, _, tag = key.partition("{name:")
+                if not tag:
+                    continue
+                x = out.setdefault(tag[:-1], {"n": 0, "bad": 0})
+                if metric == "http_req_duration":
+                    x["n"] += int(v.get("count", 0))
+                    x["p95"] = v.get("p(95)")
+                elif metric == "dav_fail":
+                    x["bad"] += int(v.get("count", 0))
+        return out
 
 
 def latency_rows(run, t0=None, t1=None, skip_faults=False):
@@ -597,6 +621,31 @@ def check(run, t0, t1):
     return viol
 
 
+def services_row(run):
+    """Службы календарей, контактов и правил до нагрузки (DEP-21, probes.py services)."""
+    name, crit = "Службы CalDAV, CardDAV, ManageSieve", "/.well-known → /dav/, 207, CAPABILITY и вход на 4190"
+    p = os.path.join(run.d, "services.json")
+    if not os.path.exists(p):
+        return name, crit, "—", NONE, first_line(os.path.join(run.d, "services.log"), "проверка не запускалась")
+    with open(p, encoding="utf-8") as f:
+        res = json.load(f)
+    bad = [x["name"] + f" ({x['got']})" for x in res.get("checks", []) if not x.get("ok")]
+    value = f"проверок {len(res.get('checks', []))}, отказов {len(bad)}"
+    return name, crit, value, PASS if res.get("ok") else FAIL, "; ".join(bad)
+
+
+def dav_lines(run):
+    """Раздел отчёта: зонды caldav, carddav, managesieve и нагрузка dav.js (справочно: в Д.7 порогов нет)."""
+    lines = ["", "## Календари, контакты, ManageSieve (справочно)", "",
+             "| Замер | n | p95 | отказов |", "|---|---|---|---|"]
+    for probe in ("caldav", "carddav", "managesieve"):
+        ok, bad = run.values(probe)
+        lines.append(f"| зонд {probe} | {len(ok)} | {fmt(pct(ok, 95))} | {bad} |")
+    for name, v in sorted(run.dav_load().items()):
+        lines.append(f"| нагрузка: {name} | {v.get('n', '—')} | {fmt(v.get('p95'))} | {v.get('bad', 0)} |")
+    return lines
+
+
 def report(run):
     skip = run.scenario == "faults"
     t0 = t1 = None
@@ -636,7 +685,7 @@ def report(run):
         judged = {orphans_row(run)[0], x3_row(run)[0]}
         rows = [(r[0], r[1], r[2], INFO, "профиль thresholds: пороги Д.5, критерий скорости не применяется"
                  + (f"; {r[4]}" if r[4] else "")) if r[3] in (PASS, FAIL) and r[0] not in judged else r for r in rows]
-    rows += [thresholds_row(run), brute_row(run)]
+    rows += [thresholds_row(run), brute_row(run), services_row(run)]
     measured = [r for r in rows if r[3] in (PASS, FAIL)]
     failed = [r for r in rows if r[3] == FAIL]
     mem = run.node("mem_total_bytes")
@@ -666,6 +715,7 @@ def report(run):
               f"- SMTP нагрузки (25 и 587): принято {lc['ok']}, отказов {lc['fail']} {lc['codes'] or ''}",
               f"- {ledger_note}",
               f"- Пул СУБД узла: {pool_text(run) or 'нет tp_db_pool_* в /metrics узла (APP-34)'}"]
+    lines += dav_lines(run)
     if steps:
         pool = run.params.get("db_pool")
         pool = int(pool) if pool and pool.isdigit() else None

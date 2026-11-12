@@ -1,13 +1,32 @@
 # syntax=docker/dockerfile:1.7
 # OCI-образ The Post: один бинарный файл, профиль — по config.yaml (SRS 1.2).
 # Сборка из корня репозитория: docker build -f deploy/docker/Dockerfile -t thepost .
+# Веб-консоль (SRS 5.2) вшита по умолчанию; без консоли и без Node — `--build-arg CONSOLE=0`.
 
 ARG RUST_VERSION=1.98
+# Node — как в CI (.github/actions/console, node-version).
+ARG NODE_VERSION=26
+ARG CONSOLE=1
+
+# Сборка console/dist (DEPS-07). BuildKit собирает только стадию console-${CONSOLE}: при CONSOLE=0 Node не нужен.
+FROM node:${NODE_VERSION}-bookworm-slim AS console-1
+WORKDIR /console
+COPY console/package.json console/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-fund --no-audit
+COPY console/ ./
+RUN npm run build && test -f dist/index.html && mv dist /dist
+
+FROM rust:${RUST_VERSION}-bookworm AS console-0
+RUN mkdir /dist
+
+FROM console-${CONSOLE} AS console
 
 FROM rust:${RUST_VERSION}-bookworm AS build
+ARG CONSOLE
 ENV CARGO_TERM_COLOR=never
 WORKDIR /src
 COPY . .
+COPY --from=console /dist console/dist
 # Тулчейн образа вместо channel из rust-toolchain.toml: сборка воспроизводима и без загрузки rustup.
 # Имя — полное, из `rustup default` (1.97.1-x86_64-…): короткое `1.97` rustup не сопоставляет с установленным
 # 1.97.1 и идёт качать канал.
@@ -15,6 +34,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
     RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)" cargo build --release --locked -p thepost \
+      $([ "$CONSOLE" = 1 ] && echo --features console) \
  && install -D -m 0755 target/release/thepost /out/bin/thepost \
  && install -d -m 0750 /out/state /out/etc \
  && install -d -m 0700 /out/state/blob

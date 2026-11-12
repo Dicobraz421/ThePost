@@ -106,7 +106,7 @@
     owner: root
     group: root
     mode: "0755"
-  loop: [make-corpus.py, jmap.js, probe.js, run-scenario.sh, fill.py, probes.py, criteria.py]
+  loop: [make-corpus.py, jmap.js, dav.js, probe.js, run-scenario.sh, fill.py, fill-dav.py, probes.py, criteria.py]
 
 - name: Build message corpus (D.3)
   ansible.builtin.command:
