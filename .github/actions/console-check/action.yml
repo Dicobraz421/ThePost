@@ -45,8 +45,8 @@ runs:
           sleep 1
         done
 
-        # Каталог BLOB и сокет `admin init`: у бинарного файла — во временном каталоге, у образа — его
-        # /var/lib/thepost (создан в образе, владелец nonroot).
+        # Каталоги на запись (BLOB; индекс поиска `search.index.dir` запуск создаёт при любых ролях) и сокет
+        # `admin init`: у бинарного файла — во временном каталоге, у образа — его /var/lib/thepost (владелец nonroot).
         blob=/var/lib/thepost/blob
         if [ -n "$BIN" ]; then blob="$dir/blob"; fi
         cat > "$dir/config.yaml" <<EOF
@@ -63,7 +63,8 @@ runs:
           url: file://$blob
         EOF
         if [ -n "$BIN" ]; then
-          printf 'admin:\n  init: { socket: "%s" }\n' "$dir/admin.sock" >> "$dir/config.yaml"
+          printf 'admin:\n  init: { socket: "%s" }\nsearch:\n  index: { dir: "%s" }\n' \
+            "$dir/admin.sock" "$dir/search" >> "$dir/config.yaml"
         fi
         cat "$dir/config.yaml"
 
