@@ -27,6 +27,7 @@ thiserror.workspace = true
 time = { workspace = true, features = ["formatting", "parsing"] }
 tokio.workspace = true
 tokio-rustls.workspace = true
+tower-http.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 rust-embed = { workspace = true, optional = true }

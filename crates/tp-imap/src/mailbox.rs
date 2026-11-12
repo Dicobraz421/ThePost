@@ -11,6 +11,7 @@
 
 use std::num::NonZeroU64;
 
+use tp_contracts::audit::AuditAction;
 use tp_contracts::auth::Rights;
 use tp_contracts::meta::{AccountScope, Flag, Mailbox, MessageQuery, NewMailbox, SpecialUse};
 use tp_contracts::{Error, MailboxId, Result};
@@ -548,6 +549,7 @@ impl<T: Transport> Session<T> {
                 mailbox,
             });
         }
+        self.audit(scope, AuditAction::Login, id, &[], None).await?;
         self.selected = Some(Selected {
             owner: scope,
             mailbox: id,

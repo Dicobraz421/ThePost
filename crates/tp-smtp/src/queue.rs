@@ -14,6 +14,10 @@
 //!   `next_hop` (промежуточный узел, SMTP-21).
 //!   Устаревший захват (`Conflict`: лиза истекла, запись взял другой узел) — запись пропускается.
 //!   Уведомления отправителю (DSN: отказ, задержка, успех) — [`crate::dsn`].
+//! - Отложенная отправка (SMTP-24): [`Outbound::schedule`] ставит запись со сроком выпуска — `claim` не отдаёт её
+//!   раньше срока; [`Outbound::cancel_scheduled`] до первого захвата удаляет запись и снимает ссылку на тело.
+//!   Локальные получатели выпущенной записи доставляются в ящики через [`LocalRelease`]
+//!   ([`QueueWorker::with_local`]), а не по SMTP.
 //! - [`SmtpOutService`] — роль smtp-out: опрос очереди до остановки.
 //!
 //! Время попыток — из [`Now`] (тесты — управляемые часы), очередь сама времени не берёт.
@@ -31,7 +35,7 @@ use tp_contracts::queue::{
     Claimed, DsnNotify, DsnRet, OutMessage, OutRcpt, Outbound, QueueStore, QueuedRcpt, RcptStatus,
 };
 use tp_contracts::role::{RoleCtx, RoleService};
-use tp_contracts::{BlobKey, Error, Result, TenantId};
+use tp_contracts::{BlobKey, Error, QueueId, Result, TenantId};
 
 use crate::config::{QueueConfig, SmtpConfig};
 use crate::dkim_sign::DkimSign;
@@ -136,14 +140,16 @@ impl QueueDeps {
         release_blob(self.index.as_ref(), key).await;
     }
 
-    /// Ставит письмо `raw` в очередь получателям `rcpts`; первая попытка — сразу.
+    /// Ставит письмо `raw` в очередь получателям `rcpts` со сроком выпуска `release_at` (первая попытка — не
+    /// раньше него) и возвращает запись очереди.
     pub async fn put(
         &self,
         tenant: TenantId,
         from: &str,
         rcpts: Vec<OutRcpt>,
         raw: Bytes,
-    ) -> Result<()> {
+        release_at: OffsetDateTime,
+    ) -> Result<QueueId> {
         let size = raw.len() as u64;
         let blob = self.store_blob(tenant, raw).await?;
         let msg = OutMessage {
@@ -153,13 +159,15 @@ impl QueueDeps {
             from: from.to_owned(),
             dsn: Default::default(),
             rcpts,
-            next_attempt: (self.now)(),
+            next_attempt: release_at,
         };
-        if let Err(e) = self.store.enqueue(None, msg).await {
-            self.release(&blob).await;
-            return Err(e);
+        match self.store.enqueue(None, msg).await {
+            Ok(id) => Ok(id),
+            Err(e) => {
+                self.release(&blob).await;
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     async fn read(&self, key: &BlobKey) -> Result<Bytes> {
@@ -209,7 +217,11 @@ impl Queue {
 impl DsnSink for Queue {
     async fn send_dsn(&self, tenant: TenantId, to: &str, raw: Bytes) -> Result<()> {
         let raw = self.signed(raw).await?;
-        self.deps.put(tenant, "", vec![OutRcpt::new(to)], raw).await
+        let now = (self.deps.now)();
+        self.deps
+            .put(tenant, "", vec![OutRcpt::new(to)], raw, now)
+            .await
+            .map(drop)
     }
 }
 
@@ -222,6 +234,21 @@ impl Outbound for Queue {
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<()> {
+        let now = (self.deps.now)();
+        self.schedule(tenant, mail_from, rcpts, raw, now)
+            .await
+            .map(drop)
+    }
+
+    /// Отложенная отправка (SMTP-24): запись со сроком выпуска `release_at` — [`QueueWorker`] не захватит её раньше.
+    async fn schedule(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+        release_at: OffsetDateTime,
+    ) -> Result<QueueId> {
         // Один адрес — один получатель записи (повтор адреса — `Invalid` очереди).
         let mut seen = std::collections::HashSet::new();
         let rcpts = rcpts
@@ -230,8 +257,34 @@ impl Outbound for Queue {
             .map(OutRcpt::new)
             .collect();
         let raw = self.signed(raw).await?;
-        self.deps.put(tenant, mail_from, rcpts, raw).await
+        self.deps
+            .put(tenant, mail_from, rcpts, raw, release_at)
+            .await
     }
+
+    /// Отмена до выпуска (SMTP-24): запись удаляется, ссылка на тело снимается — объект освобождается.
+    async fn cancel_scheduled(&self, tenant: TenantId, queue: QueueId) -> Result<()> {
+        let blob = self.deps.store.cancel_queued(tenant, queue).await?;
+        self.deps.release(&blob).await;
+        Ok(())
+    }
+}
+
+/// Локальная доставка получателей записи очереди (SMTP-24): письмо с отложенной отправкой ставится в очередь
+/// целиком, и при выпуске локальные получатели доставляются в ящики, а не по SMTP. Реализация —
+/// [`crate::Delivery`].
+#[async_trait]
+pub trait LocalRelease: Send + Sync + 'static {
+    /// Доставляет письмо `raw` от `from` тем из `rcpts`, кто обслуживается локально (учётные записи, псевдонимы,
+    /// группы организации узла). Итог — по каждому получателю в порядке `rcpts`: `None` — получатель не
+    /// локальный, его доставляет [`Transport`]. Ошибка — попытка всем получателям откладывается.
+    async fn release(
+        &self,
+        tenant: TenantId,
+        from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<Vec<Option<RcptResult>>>;
 }
 
 /// Итог попытки доставки одному получателю.
@@ -292,6 +345,8 @@ pub struct QueueWorker {
     bus: Option<Arc<dyn EventBus>>,
     /// Журнал доставки.
     tracking: Option<Tracking>,
+    /// Локальная доставка получателей при выпуске записи.
+    local: Option<Arc<dyn LocalRelease>>,
 }
 
 impl fmt::Debug for QueueWorker {
@@ -319,7 +374,15 @@ impl QueueWorker {
             routes: None,
             bus: None,
             tracking: None,
+            local: None,
         }
+    }
+
+    /// Локальная доставка при выпуске записи (SMTP-24): получатели, которых обслуживает `local`, доставляются в
+    /// ящики, остальные — по SMTP. Нужна узлу, принимающему отложенную отправку ([`Outbound::schedule`]).
+    pub fn with_local(mut self, local: Arc<dyn LocalRelease>) -> Self {
+        self.local = Some(local);
+        self
     }
 
     /// Журнал доставки (SMTP-17): передача наружу по каждому получателю и уведомления отправителю.
@@ -393,9 +456,37 @@ impl QueueWorker {
                 return self.finish(cfg, &c, &[], outcome).await;
             }
         };
+        // Локальные получатели (отложенная отправка, SMTP-24) — в ящики; остальные — по SMTP.
+        let mut released: Vec<Option<RcptResult>> = vec![None; c.rcpts.len()];
+        if let Some(local) = &self.local {
+            let addresses: Vec<String> = c.rcpts.iter().map(|r| r.rcpt.address.clone()).collect();
+            match local
+                .release(c.tenant, &c.from, &addresses, message.clone())
+                .await
+            {
+                Ok(results) if results.len() == addresses.len() => released = results,
+                Ok(_) => {
+                    return Err(Error::internal(
+                        "local release: result count differs from recipients",
+                    ));
+                }
+                Err(e) => {
+                    let reason = format!("local delivery unavailable: {e}");
+                    let outcome = c
+                        .rcpts
+                        .iter()
+                        .map(|r| (r, RcptResult::Temporary(reason.clone())))
+                        .collect();
+                    return self.finish(cfg, &c, &message, outcome).await;
+                }
+            }
+        }
         // Получатели по доменам: одно соединение на домен.
         let mut domains: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (i, r) in c.rcpts.iter().enumerate() {
+            if released[i].is_some() {
+                continue;
+            }
             let domain = r
                 .rcpt
                 .address
@@ -411,11 +502,18 @@ impl QueueWorker {
             Some(routes) => match (routes.tenant(c.tenant).await, routes.cluster().await) {
                 (Ok(t), Ok(cl)) => (Some(t), Some(cl)),
                 (Err(e), _) | (_, Err(e)) => {
+                    // Итоги локальной доставки сохраняются: повтор — только остальным получателям.
                     let reason = format!("transport settings unavailable: {e}");
                     let outcome = c
                         .rcpts
                         .iter()
-                        .map(|r| (r, RcptResult::Temporary(reason.clone())))
+                        .zip(released)
+                        .map(|(r, res)| {
+                            (
+                                r,
+                                res.unwrap_or_else(|| RcptResult::Temporary(reason.clone())),
+                            )
+                        })
                         .collect();
                     return self.finish(cfg, &c, &message, outcome).await;
                 }
@@ -497,7 +595,12 @@ impl QueueWorker {
                 .renew(&c.claim, (self.deps.now)() + cfg.lease)
                 .await?;
         }
-        let mut outcome = Vec::new();
+        let mut outcome: Vec<(&QueuedRcpt, RcptResult)> = c
+            .rcpts
+            .iter()
+            .zip(released)
+            .filter_map(|(r, res)| Some((r, res?)))
+            .collect();
         for (idx, results) in domains.values().zip(results) {
             for (i, res) in idx.iter().zip(results) {
                 outcome.push((&c.rcpts[*i], res));

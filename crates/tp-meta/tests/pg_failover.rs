@@ -15,6 +15,7 @@ use sqlx::{AssertSqlSafe, Executor, PgPool};
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tp_contracts::app_password::AppPassword;
 use tp_contracts::delivery::{
     DeliveryDecision, DeliveryEvent, DeliveryEventKind, DeliveryLog, DeliveryQuery,
 };
@@ -26,8 +27,11 @@ use tp_contracts::meta::{
     AccountScope, AccountStore, Flags, MailboxStore, MessageQuery, MessageStore, NewMessage,
     SpecialUse,
 };
-use tp_contracts::{BlobHash, BlobKey, Error, Gen, GroupId, HeldId, TenantId};
+use tp_contracts::meta::{Policy, PolicyTarget};
+use tp_contracts::queue::{DsnParams, OutMessage, OutRcpt, QueueStore};
+use tp_contracts::{BlobHash, BlobKey, Error, Gen, GroupId, HeldId, QueueId, TenantId};
 use tp_meta::failover::{FailoverConfig, connect_failover};
+use tp_meta::pool::NoAcquireObserver;
 use tp_meta::schema::db_err;
 use tp_meta::{MetaConfig, PgMeta};
 use uuid::Uuid;
@@ -106,7 +110,7 @@ async fn read_only_primary_switches_without_losing_writes() {
         retry_for: Duration::from_secs(20),
         probe_timeout: Duration::from_secs(2),
     };
-    let fo = connect_failover(&cfg, common::secrets())
+    let fo = connect_failover(&cfg, common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("connect_failover");
     assert_eq!(fo.metrics().primary, 0, "primary — первый адрес");
@@ -250,12 +254,13 @@ fn via(url: &str, addr: std::net::SocketAddr) -> String {
     format!("{scheme}://{}{addr}{tail}", user.unwrap_or_default())
 }
 
-async fn migrated(url: &str, db: &str) -> PgPool {
+async fn migrated(url: &str, db: &str) -> tp_meta::pool::DbPool {
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&url_for(url, db))
         .await
         .expect("connect");
+    let pool = common::db(pool);
     tp_meta::schema::migrate(&pool).await.expect("миграции");
     pool
 }
@@ -302,7 +307,7 @@ async fn meta_read_retried_on_new_primary() {
         retry_for: Duration::from_secs(30),
         probe_timeout: Duration::from_secs(2),
     };
-    let fo = connect_failover(&cfg, common::secrets())
+    let fo = connect_failover(&cfg, common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("connect_failover");
     let meta = PgMeta::from_failover(&fo, MetaConfig::default());
@@ -517,7 +522,7 @@ async fn keyed_write_not_doubled_after_commit_cut() {
         retry_for: Duration::from_secs(30),
         probe_timeout: Duration::from_secs(5),
     };
-    let fo = connect_failover(&cfg, common::secrets())
+    let fo = connect_failover(&cfg, common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("connect_failover");
     let meta = PgMeta::from_failover(&fo, MetaConfig::default());
@@ -637,10 +642,188 @@ async fn keyed_write_not_doubled_after_commit_cut() {
         EventPos(7)
     );
 
+    // Очередь отправки (META-62).
+    cut.arm("INSERT INTO queue_rcpts");
+    let queued = meta
+        .enqueue(None, out_message(scope))
+        .await
+        .expect("постановка в очередь переживает обрыв после COMMIT");
+    assert_eq!(cut.cuts(), 6, "COMMIT постановки оборван");
+    assert_eq!(
+        queue_rows(&direct, tenant).await,
+        vec![queued],
+        "запись очереди — одна"
+    );
+
+    // Пароль приложения (META-62).
+    let password = app_password();
+    cut.arm("INSERT INTO app_passwords");
+    tp_contracts::app_password::AppPasswordStore::insert(&meta, scope, password.clone())
+        .await
+        .expect("пароль приложения переживает обрыв после COMMIT");
+    assert_eq!(cut.cuts(), 7, "COMMIT пароля оборван");
+    assert_eq!(password_ids(&direct, scope).await, vec![password.id]);
+
     let m = fo.metrics();
-    assert!(m.retries >= 5, "{m:?}");
+    assert!(m.retries >= 7, "{m:?}");
     assert_eq!((m.switches, m.gave_up), (0, 0), "{m:?}");
     fo.pool().close().await;
+}
+
+/// META-62: сеанс записи оборван на сервере (`pg_terminate_backend`) до COMMIT — запись повторена и
+/// выполнена ровно один раз: постановка в очередь, пароль приложения, запись, идемпотентная по сути
+/// (`set_policy`). Запись задерживается блокировкой таблицы в другом сеансе, пока её сеанс не оборван.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_retried_after_backend_terminated() {
+    let Some(direct) = common::meta().await else {
+        return;
+    };
+    let url = common::pg_url().expect("url");
+    let scope = common::account(&direct).await;
+    let tenant = scope.tenant;
+    let mut cfg = common::dev_pool_config(&url);
+    cfg.acquire_timeout = Duration::from_secs(5);
+    cfg.failover = FailoverConfig {
+        retry_initial: Duration::from_millis(50),
+        retry_max: Duration::from_millis(500),
+        retry_for: Duration::from_secs(30),
+        probe_timeout: Duration::from_secs(5),
+    };
+    let fo = connect_failover(&cfg, common::secrets(), Arc::new(NoAcquireObserver))
+        .await
+        .expect("connect_failover");
+    let meta = PgMeta::from_failover(&fo, MetaConfig::default());
+
+    let queued = terminated_during(&direct, "queue", "INSERT INTO queue", {
+        let meta = meta.clone();
+        async move { meta.enqueue(None, out_message(scope)).await }
+    })
+    .await
+    .expect("постановка в очередь переживает обрыв сеанса");
+    assert_eq!(
+        queue_rows(&direct, tenant).await,
+        vec![queued],
+        "запись очереди — одна"
+    );
+
+    let password = app_password();
+    terminated_during(&direct, "app_passwords", "INSERT INTO app_passwords", {
+        let (meta, password) = (meta.clone(), password.clone());
+        async move { tp_contracts::app_password::AppPasswordStore::insert(&meta, scope, password).await }
+    })
+    .await
+    .expect("пароль приложения переживает обрыв сеанса");
+    assert_eq!(password_ids(&direct, scope).await, vec![password.id]);
+
+    let policy = Policy {
+        quota_bytes: Some(4096),
+        ..Policy::default()
+    };
+    terminated_during(&direct, "policies", "INSERT INTO policies", {
+        let (meta, policy) = (meta.clone(), policy.clone());
+        async move {
+            meta.set_policy(tenant, PolicyTarget::Account(scope.account), &policy)
+                .await
+        }
+    })
+    .await
+    .expect("политика переживает обрыв сеанса");
+    assert_eq!(
+        direct
+            .policy(tenant, PolicyTarget::Account(scope.account))
+            .await
+            .expect("политика"),
+        policy
+    );
+
+    let m = fo.metrics();
+    assert!(m.retries >= 3, "{m:?}");
+    fo.pool().close().await;
+}
+
+/// Выполняет `op`, пока таблица `table` заблокирована в отдельном сеансе; сеанс `op`, ждущий блокировку
+/// на запросе `query`, обрывается `pg_terminate_backend`, затем блокировка снимается.
+async fn terminated_during<T: Send + 'static>(
+    direct: &PgMeta,
+    table: &str,
+    query: &str,
+    op: impl std::future::Future<Output = tp_contracts::Result<T>> + Send + 'static,
+) -> tp_contracts::Result<T> {
+    let mut lock = common::conn(direct.pool()).await;
+    lock.execute(AssertSqlSafe(format!(
+        "BEGIN; LOCK TABLE {table} IN EXCLUSIVE MODE"
+    )))
+    .await
+    .expect("блокировка");
+    let task = tokio::spawn(op);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut conn = common::conn(direct.pool()).await;
+    loop {
+        let killed: Vec<bool> = sqlx::query_scalar(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+             WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE $1",
+        )
+        .bind(format!("{query}%"))
+        .fetch_all(&mut *conn)
+        .await
+        .expect("pg_terminate_backend");
+        if killed.iter().any(|k| *k) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "запись не дошла до блокировки"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    lock.execute("ROLLBACK").await.expect("снять блокировку");
+    task.await.expect("задача")
+}
+
+fn out_message(scope: AccountScope) -> OutMessage {
+    OutMessage {
+        tenant: scope.tenant,
+        blob: blob_key(scope),
+        size: 10,
+        from: "a@example.org".into(),
+        dsn: DsnParams::default(),
+        rcpts: vec![OutRcpt::new("b@example.org")],
+        next_attempt: OffsetDateTime::now_utc(),
+    }
+}
+
+fn app_password() -> AppPassword {
+    AppPassword {
+        id: Uuid::now_v7().simple().to_string(),
+        label: "Телефон".into(),
+        hash: format!("$argon2id$v=19$m=19456,t=2,p=1${}", Uuid::now_v7().simple()),
+        created_at: OffsetDateTime::now_utc(),
+        revoked_at: None,
+    }
+}
+
+/// Записи очереди организации.
+async fn queue_rows(direct: &PgMeta, tenant: TenantId) -> Vec<QueueId> {
+    let mut tx = tp_meta::schema::begin(direct.pool(), tenant)
+        .await
+        .expect("begin");
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT queue_id FROM queue WHERE tenant_id = $1")
+        .bind(tenant.as_uuid())
+        .fetch_all(&mut *tx)
+        .await
+        .expect("очередь");
+    tx.commit().await.expect("commit");
+    ids.into_iter().map(QueueId::from_uuid).collect()
+}
+
+/// Идентификаторы паролей приложения учётной записи.
+async fn password_ids(direct: &PgMeta, scope: AccountScope) -> Vec<String> {
+    tp_contracts::app_password::AppPasswordStore::list(direct, scope)
+        .await
+        .expect("пароли")
+        .into_iter()
+        .map(|p| p.id)
+        .collect()
 }
 
 fn blob_key(scope: AccountScope) -> BlobKey {

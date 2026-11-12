@@ -52,6 +52,9 @@ pub struct PolicyBody {
     /// Лимит отправки, писем в час.
     #[serde(default)]
     pub send_per_hour: Option<u32>,
+    /// Лимит отправки, адресатов в час (сумма получателей писем за скользящий час).
+    #[serde(default)]
+    pub rcpts_per_hour: Option<u32>,
     /// Лимит получателей одного письма.
     #[serde(default)]
     pub max_recipients: Option<u32>,
@@ -73,6 +76,7 @@ impl From<Policy> for PolicyBody {
             trash_retention: p.trash_retention,
             retention: p.retention,
             send_per_hour: p.send_per_hour,
+            rcpts_per_hour: p.rcpts_per_hour,
             max_recipients: p.max_recipients,
             dkim_selector: p.dkim_selector,
             milter_profile: p.milter_profile,
@@ -88,6 +92,7 @@ impl From<PolicyBody> for Policy {
             trash_retention: p.trash_retention,
             retention: p.retention,
             send_per_hour: p.send_per_hour,
+            rcpts_per_hour: p.rcpts_per_hour,
             max_recipients: p.max_recipients,
             dkim_selector: p.dkim_selector,
             milter_profile: p.milter_profile,
@@ -438,7 +443,7 @@ async fn create_account(
     Ok((StatusCode::CREATED, Json(account_info(&a, acc).await?)))
 }
 
-async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo> {
+pub(crate) async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo> {
     let scope = tp_contracts::meta::AccountScope {
         tenant: acc.tenant,
         account: acc.id,
@@ -704,7 +709,7 @@ mod tests {
             .await;
         assert_eq!(list, json!([]));
 
-        let opolicy = json!({"quota_bytes": 100, "send_per_hour": 7});
+        let opolicy = json!({"quota_bytes": 100, "send_per_hour": 7, "rcpts_per_hour": 900});
         env.call(
             "PUT",
             &format!("{}/policy", org()),
@@ -726,6 +731,7 @@ mod tests {
         assert_eq!(b["policy"]["quota_bytes"], 2048);
         assert_eq!(b["effective"]["quota_bytes"], 2048);
         assert_eq!(b["effective"]["send_per_hour"], 7);
+        assert_eq!(b["effective"]["rcpts_per_hour"], 900);
 
         let missing = format!("{}/accounts/{}", org(), tp_contracts::AccountId::new());
         let (s, _, _) = env.call("GET", &missing, Some("org"), None).await;

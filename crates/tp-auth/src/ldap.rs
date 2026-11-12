@@ -54,13 +54,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tp_contracts::auth::{
-    DirAccount, DirAlias, DirChange, DirCursor, DirDomain, DirGroup, DirPage, Directory,
+    DirAccount, DirAlias, DirChange, DirContact, DirCursor, DirDomain, DirGroup, DirOrg, DirPage,
+    DirUnit, Directory,
 };
 use tp_contracts::config::duration;
 use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result, TenantId};
 
+use crate::dirsync::RemovalPolicy;
 use crate::{GroupSource, check_channel, client_key, plaintext_warning};
 
 mod sync;
@@ -139,6 +141,78 @@ pub struct AccountMap {
     pub gal: BTreeMap<String, String>,
     /// Фильтр удалённых записей (режим USN; у надгробий AD остаются `objectClass` и идентификатор).
     pub deleted_filter: String,
+    /// Оргатрибуты: должность, руководитель, старшинство (подразделение — ветка каталога, [`UnitMap`]).
+    pub org: OrgMap,
+}
+
+/// Атрибуты оргструктуры учётной записи; не заданный атрибут — не синхронизируется.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct OrgMap {
+    /// Должность (`title`).
+    pub title: Option<String>,
+    /// DN руководителя (`manager`).
+    pub manager: Option<String>,
+    /// Старшинство — целое число, больше — выше в списке подразделения (атрибут — настройка организации).
+    pub seniority: Option<String>,
+}
+
+/// Подразделения — ветки каталога (`organizationalUnit`): подразделение учётной записи — ближайшая ветка над её DN,
+/// вышестоящее подразделение — ближайшая ветка над веткой.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct UnitMap {
+    /// База поиска; не задана — `base_dn`.
+    pub base: Option<String>,
+    /// Фильтр веток-подразделений.
+    pub filter: String,
+    /// Постоянный идентификатор.
+    pub id: String,
+    /// Название.
+    pub name: String,
+}
+
+impl Default for UnitMap {
+    fn default() -> Self {
+        UnitMap {
+            base: None,
+            filter: "(objectClass=organizationalUnit)".into(),
+            id: "entryUUID".into(),
+            name: "ou".into(),
+        }
+    }
+}
+
+/// Почтовые контакты — внешние адресаты каталога: класс объектов (`filter`) и ветка (`base`) — настройка.
+/// Атрибуты GAL — по сопоставлению учётных записей ([`AccountMap::gal`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContactMap {
+    /// База поиска; не задана — `base_dn`.
+    pub base: Option<String>,
+    /// Фильтр контактов.
+    pub filter: String,
+    /// Постоянный идентификатор.
+    pub id: String,
+    /// Отображаемое имя; нет значения — адрес.
+    pub display_name: String,
+    /// Внешний адрес (префикс `smtp:` снимается).
+    pub email: String,
+    /// Фильтр удалённых контактов (режим USN).
+    pub deleted_filter: String,
+}
+
+impl Default for ContactMap {
+    fn default() -> Self {
+        ContactMap {
+            base: None,
+            filter: "(&(objectClass=contact)(mail=*))".into(),
+            id: "entryUUID".into(),
+            display_name: "cn".into(),
+            email: "mail".into(),
+            deleted_filter: "(objectClass=contact)".into(),
+        }
+    }
 }
 
 impl Default for AccountMap {
@@ -153,6 +227,7 @@ impl Default for AccountMap {
             disabled: None,
             gal: BTreeMap::new(),
             deleted_filter: "(objectClass=user)".into(),
+            org: OrgMap::default(),
         }
     }
 }
@@ -269,6 +344,12 @@ pub struct LdapConfig {
     pub aliases: Option<AliasMap>,
     /// Почтовые домены организации.
     pub domains: Vec<DomainEntry>,
+    /// Почтовые контакты; не задано — в каталоге их нет.
+    pub contacts: Option<ContactMap>,
+    /// Подразделения; не задано — учётные записи без подразделения.
+    pub units: Option<UnitMap>,
+    /// Исчезновение учётных записей: срок хранения ящика, порог массового удаления.
+    pub removal: RemovalPolicy,
 }
 
 impl Default for LdapConfig {
@@ -289,6 +370,9 @@ impl Default for LdapConfig {
             groups: GroupMap::default(),
             aliases: None,
             domains: Vec::new(),
+            contacts: None,
+            units: None,
+            removal: RemovalPolicy::default(),
         }
     }
 }
@@ -307,6 +391,11 @@ impl LdapConfig {
         if self.bind_dn.is_empty() != self.bind_password.is_none() {
             return Err(Error::invalid(
                 "LDAP: bind_dn and bind_password must be set together",
+            ));
+        }
+        if self.removal.threshold_percent > 100 {
+            return Err(Error::invalid(
+                "LDAP: removal.threshold_percent must be 0..=100",
             ));
         }
         if self.page_size == 0 || i32::try_from(self.page_size).is_err() {
@@ -843,7 +932,37 @@ impl LdapDirectory {
         })
     }
 
-    fn account(&self, e: &SearchEntry, external_id: String) -> Option<DirAccount> {
+    /// Ветки-подразделения: DN в нижнем регистре → (идентификатор, название); не заданы — пусто.
+    async fn unit_index(&self) -> Result<HashMap<String, (String, String)>> {
+        let Some(m) = &self.cfg.units else {
+            return Ok(HashMap::new());
+        };
+        let rows = self
+            .source
+            .search(&Query {
+                base: self.base(&m.base).to_owned(),
+                base_only: false,
+                filter: m.filter.clone(),
+                attrs: vec![m.id.clone(), m.name.clone()],
+                show_deleted: false,
+            })
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|e| {
+                let id = external_id(e, &m.id)?;
+                let name = first(e, &m.name)?;
+                Some((e.dn.to_ascii_lowercase(), (id, name)))
+            })
+            .collect())
+    }
+
+    fn account(
+        &self,
+        e: &SearchEntry,
+        external_id: String,
+        units: &HashMap<String, (String, String)>,
+    ) -> Option<DirAccount> {
         let m = &self.cfg.accounts;
         let Some(login) = first(e, &m.login) else {
             tracing::warn!(dn = %e.dn, "LDAP account without login attribute, skipped");
@@ -878,7 +997,18 @@ impl LdapDirectory {
             emails,
             enabled,
             attributes,
-            org: Default::default(),
+            org: DirOrg {
+                department: enclosing(&e.dn, units).map(|(id, _)| id.clone()),
+                title: m.org.title.as_ref().and_then(|a| first(e, a)),
+                // DN; `accounts_since` заменяет идентификатором.
+                manager: m.org.manager.as_ref().and_then(|a| first(e, a)),
+                seniority: m
+                    .org
+                    .seniority
+                    .as_ref()
+                    .and_then(|a| first(e, a))
+                    .and_then(|v| v.trim().parse().ok()),
+            },
         })
     }
 
@@ -888,6 +1018,9 @@ impl LdapDirectory {
         a.extend(m.emails.iter().cloned());
         a.extend(m.disabled.iter().map(|d| d.attribute.clone()));
         a.extend(m.gal.values().cloned());
+        a.extend(m.org.title.iter().cloned());
+        a.extend(m.org.manager.iter().cloned());
+        a.extend(m.org.seniority.iter().cloned());
         a
     }
 
@@ -1020,8 +1153,30 @@ impl Directory for LdapDirectory {
             id_attr: &m.id,
             attrs: self.account_attrs(),
         };
-        self.page(cursor, limit, spec, |e, id| self.account(e, id))
-            .await
+        let units = self.unit_index().await?;
+        let mut page = self
+            .page(cursor, limit, spec, |e, id| self.account(e, id, &units))
+            .await?;
+        let mut cache = HashMap::new();
+        let dns: Vec<String> = page
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                DirChange::Upsert(a) => a.org.manager.clone(),
+                DirChange::Removed { .. } => None,
+            })
+            .collect();
+        self.ids_of(dns, &mut cache).await?;
+        for c in &mut page.changes {
+            if let DirChange::Upsert(a) = c {
+                a.org.manager = a
+                    .org
+                    .manager
+                    .take()
+                    .and_then(|dn| cache.get(&dn.to_ascii_lowercase()).cloned().flatten());
+            }
+        }
+        Ok(page)
     }
 
     async fn groups_since(
@@ -1123,6 +1278,66 @@ impl Directory for LdapDirectory {
         self.own(tenant)?;
         Ok(self.cfg.accounts.gal.keys().cloned().collect())
     }
+
+    async fn contacts_since(
+        &self,
+        tenant: TenantId,
+        cursor: Option<&DirCursor>,
+        limit: usize,
+    ) -> Result<DirPage<DirContact>> {
+        self.own(tenant)?;
+        let Some(m) = &self.cfg.contacts else {
+            return Ok(DirPage {
+                changes: Vec::new(),
+                next: cursor.cloned().unwrap_or_else(|| DirCursor(String::new())),
+                has_more: false,
+            });
+        };
+        let gal = &self.cfg.accounts.gal;
+        let mut attrs = vec![m.display_name.clone(), m.email.clone()];
+        attrs.extend(gal.values().cloned());
+        let spec = Spec {
+            base: self.base(&m.base),
+            filter: &m.filter,
+            deleted_filter: &m.deleted_filter,
+            id_attr: &m.id,
+            attrs,
+        };
+        self.page(cursor, limit, spec, |e, id| {
+            let email = values(e, &m.email)
+                .map(|v| match v.split_once(':') {
+                    Some((p, a)) if p.eq_ignore_ascii_case("smtp") => a,
+                    _ => v,
+                })
+                .find(|a| a.contains('@'))?
+                .to_owned();
+            Some(DirContact {
+                external_id: id,
+                display_name: first(e, &m.display_name).unwrap_or_else(|| email.clone()),
+                email,
+                attributes: gal
+                    .iter()
+                    .filter_map(|(name, attr)| first(e, attr).map(|v| (name.clone(), v)))
+                    .collect(),
+            })
+        })
+        .await
+    }
+
+    async fn units(&self, tenant: TenantId) -> Result<Vec<DirUnit>> {
+        self.own(tenant)?;
+        let index = self.unit_index().await?;
+        let mut out: Vec<DirUnit> = index
+            .iter()
+            .map(|(dn, (id, name))| DirUnit {
+                external_id: id.clone(),
+                name: name.clone(),
+                parent: enclosing(dn, &index).map(|(p, _)| p.clone()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -1217,6 +1432,31 @@ fn guid(b: &[u8]) -> Option<String> {
         b[14],
         b[15]
     ))
+}
+
+/// DN без первого RDN (запятая, экранированная `\\`, — часть значения); корень — `None`.
+fn parent_dn(dn: &str) -> Option<&str> {
+    let mut escaped = false;
+    for (i, c) in dn.char_indices() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            ',' if !escaped => return Some(dn[i + 1..].trim_start()),
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
+/// Ближайшая ветка из `units` (DN в нижнем регистре) строго над `dn`.
+fn enclosing<'a, V>(dn: &str, units: &'a HashMap<String, V>) -> Option<&'a V> {
+    let mut cur = parent_dn(dn);
+    while let Some(d) = cur {
+        if let Some(v) = units.get(&d.to_ascii_lowercase()) {
+            return Some(v);
+        }
+        cur = parent_dn(d);
+    }
+    None
 }
 
 fn flagged(e: &SearchEntry, rule: &FlagRule) -> bool {

@@ -207,6 +207,19 @@ impl Env {
         }
     }
 
+    /// Число писем в папке «Спам» учётной записи.
+    async fn junk(&self, login: &str) -> usize {
+        let scope = self.scope(login).await;
+        let junk = self
+            .meta
+            .mailbox_by_role(scope, SpecialUse::Junk)
+            .expect("junk");
+        MessageStore::list(&self.meta, scope, junk, MessageQuery::All, 100)
+            .await
+            .expect("list")
+            .len()
+    }
+
     /// Письма во «Входящих» учётной записи (исходный текст).
     async fn inbox(&self, login: &str) -> Vec<String> {
         let scope = self.scope(login).await;
@@ -1060,8 +1073,10 @@ async fn submission_copy_to_local_address() {
     assert!(env.inbox("carol@example.org").await.is_empty());
 }
 
+mod addressbook;
 mod imip;
 mod moderation;
+mod outbound_milter;
 
 mod groups {
     //! SMTP-16: квота до `DATA`, ограничения отправителей и модерация групп рассылки.
@@ -1448,5 +1463,8 @@ async fn outbound_suite() {
 
 mod local_domains;
 mod org_policy;
+mod rcpt_rate;
 mod rules;
+mod scheduled;
+mod senders;
 mod wave;

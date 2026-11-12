@@ -247,7 +247,8 @@ fn identity_from_certificate() {
 
 #[tokio::test]
 async fn load_requires_files() {
-    let e = NodeTls::load(&InternalTls::default())
+    let store = MemSecretStore::default();
+    let e = NodeTls::load(&InternalTls::default(), &store)
         .await
         .expect_err("no files");
     assert!(
@@ -261,7 +262,7 @@ async fn load_requires_files() {
         ..InternalTls::default()
     };
     assert!(matches!(
-        NodeTls::load(&missing).await,
+        NodeTls::load(&missing, &store).await,
         Err(Error::Invalid(_))
     ));
 }
@@ -592,7 +593,9 @@ async fn reloads_certificates_without_restart() {
         key_file: Some(dir.join("b-key.pem")),
         ..InternalTls::default()
     };
-    b.follow_tls(&files, futures::stream::iter([()])).await;
+    let no_secrets: Arc<dyn SecretStore> = Arc::new(MemSecretStore::default());
+    b.follow_tls(&files, no_secrets.clone(), futures::stream::iter([()]))
+        .await;
 
     // Новый узел знает только прежний УЦ: сервер b не принят.
     let c = cluster.start("c", tls("c"), &[Role::Jmap], &cfg).await;
@@ -614,7 +617,8 @@ async fn reloads_certificates_without_restart() {
         key_file: Some(dir.join("missing-key.pem")),
         ..files
     };
-    b.follow_tls(&broken, futures::stream::iter([()])).await;
+    b.follow_tls(&broken, no_secrets, futures::stream::iter([()]))
+        .await;
     let d = cluster.start("d", tls("d"), &[Role::Jmap], &cfg).await;
     assert_eq!(
         d.call(&echo, "k", Bytes::new(), LONG).await,
@@ -662,10 +666,10 @@ async fn key_from_secret_store() {
     let store = MemSecretStore::default();
     store.set(&key_ref("a"), key_text("a"));
     store.set(&key_ref("b"), key_text("b"));
-    let a_tls = NodeTls::load_with_secrets(&secret_tls(&dir, "a"), &store)
+    let a_tls = NodeTls::load(&secret_tls(&dir, "a"), &store)
         .await
         .expect("a");
-    let b_tls = NodeTls::load_with_secrets(&secret_tls(&dir, "b"), &store)
+    let b_tls = NodeTls::load(&secret_tls(&dir, "b"), &store)
         .await
         .expect("b");
     assert_eq!(a_tls.identity(), &named("a"));
@@ -683,7 +687,7 @@ async fn key_from_secret_store() {
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
-/// CLU-16: `key` и `key_file` вместе, `key` без хранилища, нет секрета, не PEM, чужой ключ — `Invalid` без
+/// CLU-16: `key` и `key_file` вместе, нет секрета, не PEM, чужой ключ — `Invalid` без
 /// значения секрета в тексте; недоступное хранилище — повторяемая ошибка.
 #[tokio::test]
 async fn key_secret_errors() {
@@ -696,34 +700,23 @@ async fn key_secret_errors() {
         key_file: Some(dir.join("a-key.pem")),
         ..cfg.clone()
     };
-    let e = NodeTls::load_with_secrets(&both, &store)
-        .await
-        .expect_err("both");
+    let e = NodeTls::load(&both, &store).await.expect_err("both");
     assert!(
         matches!(&e, Error::Invalid(m) if m.contains("mutually exclusive")),
-        "{e:?}"
-    );
-    assert!(matches!(NodeTls::load(&both).await, Err(Error::Invalid(_))));
-
-    let e = NodeTls::load(&cfg).await.expect_err("no store");
-    assert!(
-        matches!(&e, Error::Invalid(m) if m.contains("secret store")),
         "{e:?}"
     );
     let none = InternalTls {
         key: None,
         ..cfg.clone()
     };
-    let e = NodeTls::load_with_secrets(&none, &store)
-        .await
-        .expect_err("no key");
+    let e = NodeTls::load(&none, &store).await.expect_err("no key");
     assert!(
         matches!(&e, Error::Invalid(m) if m.contains("key_file") && m.contains("rpc.tls.key ")),
         "{e:?}"
     );
 
     let empty = MemSecretStore::default();
-    let e = NodeTls::load_with_secrets(&cfg, &empty)
+    let e = NodeTls::load(&cfg, &empty)
         .await
         .expect_err("missing secret");
     assert!(
@@ -732,25 +725,19 @@ async fn key_secret_errors() {
     );
 
     store.set(&key_ref("a"), "garbage-value");
-    let e = NodeTls::load_with_secrets(&cfg, &store)
-        .await
-        .expect_err("garbage");
+    let e = NodeTls::load(&cfg, &store).await.expect_err("garbage");
     assert!(
         matches!(&e, Error::Invalid(m) if !m.contains("garbage-value")),
         "{e:?}"
     );
     // Ключ другого узла не подходит к сертификату.
     store.set(&key_ref("a"), key_text("b"));
-    let e = NodeTls::load_with_secrets(&cfg, &store)
-        .await
-        .expect_err("foreign key");
+    let e = NodeTls::load(&cfg, &store).await.expect_err("foreign key");
     assert!(matches!(e, Error::Invalid(_)), "{e:?}");
 
     store.set(&key_ref("a"), key_text("a"));
     store.seal();
-    let e = NodeTls::load_with_secrets(&cfg, &store)
-        .await
-        .expect_err("sealed");
+    let e = NodeTls::load(&cfg, &store).await.expect_err("sealed");
     assert!(e.is_retryable(), "{e:?}");
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
@@ -778,22 +765,17 @@ async fn reloads_key_from_secret_store() {
 
     // Прежний ключ с новым сертификатом, затем недоступное хранилище: действует прежняя пара.
     store.set(&key_ref("b"), key_text("b"));
-    b.follow_tls_with_secrets(&section, store.clone(), once())
-        .await;
+    b.follow_tls(&section, store.clone(), once()).await;
     store.set(&key_ref("b"), std::str::from_utf8(b2_key).expect("pem"));
     store.seal();
-    b.follow_tls_with_secrets(&section, store.clone(), once())
-        .await;
-    // Без хранилища ключ по ссылке не читается.
-    b.follow_tls(&section, once()).await;
+    b.follow_tls(&section, store.clone(), once()).await;
     assert_eq!(
         a.call(&echo, "k", Bytes::new(), LONG).await,
         Ok(Bytes::from("b|a|k|"))
     );
 
     store.unseal();
-    b.follow_tls_with_secrets(&section, store.clone(), once())
-        .await;
+    b.follow_tls(&section, store.clone(), once()).await;
     // Сертификат b теперь от второго УЦ: узел с прежним УЦ его не принимает, с обоими — принимает.
     let c = cluster.start("c", tls("c"), &[Role::Jmap], &cfg).await;
     assert_eq!(
@@ -807,5 +789,118 @@ async fn reloads_key_from_secret_store() {
         c.call(&echo, "k", Bytes::new(), LONG).await,
         Ok(Bytes::from("b|c|k|"))
     );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// CLU-17: новая версия секрета ключа подхватывается опросом за период, без событий и без перезапуска;
+/// недоступное хранилище и неизменная версия пару не трогают.
+#[tokio::test]
+async fn polls_key_secret_version() {
+    let mut cluster = Cluster::new();
+    let cfg = config("permissions:\n  jmap: [search/*]\n", 4);
+    let mut b_cfg = cfg.clone();
+    b_cfg.key_poll_interval = Duration::from_millis(20);
+    let a = cluster.start("a", tls("a"), &[Role::Jmap], &cfg).await;
+    let b = cluster.start("b", tls("b"), &[Role::Search], &b_cfg).await;
+    let echo = svc(Role::Search, "echo");
+    b.serve(echo.clone(), Arc::new(Echo("b"))).expect("echo");
+
+    // Сертификат b в файле уже от второго УЦ, в хранилище — прежний ключ: пока версия не сменилась, b работает
+    // на прежней паре.
+    let dir = cert_dir("secret-poll", "b");
+    let bundle = [CA, CA2].concat();
+    let (b2, b2_key) = pem("node-b2");
+    std::fs::write(dir.join("ca.pem"), &bundle).expect("ca");
+    std::fs::write(dir.join("b.pem"), b2).expect("cert");
+    let section = secret_tls(&dir, "b");
+    let store = Arc::new(MemSecretStore::default());
+    store.set(&key_ref("b"), key_text("b"));
+    let follower = b.clone();
+    let follow = tokio::spawn({
+        let store: Arc<dyn SecretStore> = store.clone();
+        async move {
+            follower
+                .follow_tls(&section, store, futures::stream::pending())
+                .await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        a.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|a|k|"))
+    );
+    store.seal();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        a.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|a|k|"))
+    );
+
+    // Новая версия секрета — новая пара за период опроса.
+    store.unseal();
+    store.set(&key_ref("b"), std::str::from_utf8(b2_key).expect("pem"));
+    let (c_cert, c_key) = pem("c");
+    let c = cluster
+        .start(
+            "c",
+            NodeTls::from_pem(&bundle, c_cert, c_key).expect("c tls"),
+            &[Role::Jmap],
+            &cfg,
+        )
+        .await;
+    let fresh = cluster.start("d", tls("d"), &[Role::Jmap], &cfg).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // Новый клиент d (без соединений из пула) с прежним УЦ: сервер b с новой парой он не принимает.
+        fresh.reload_tls(tls("d")).expect("reload d");
+        if fresh.call(&echo, "k", Bytes::new(), LONG).await == Err(RpcError::Unavailable) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "new key version not picked up");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        c.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|c|k|"))
+    );
+    follow.abort();
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// CLU-17: опрос выключен (`0s`) — новая версия секрета без события не применяется.
+#[tokio::test]
+async fn key_poll_disabled() {
+    let mut cluster = Cluster::new();
+    let mut cfg = config("permissions:\n  jmap: [search/*]\n", 4);
+    cfg.key_poll_interval = Duration::ZERO;
+    let b = cluster.start("b", tls("b"), &[Role::Search], &cfg).await;
+    let echo = svc(Role::Search, "echo");
+    b.serve(echo.clone(), Arc::new(Echo("b"))).expect("echo");
+    let dir = cert_dir("secret-nopoll", "b");
+    let (b2, b2_key) = pem("node-b2");
+    std::fs::write(dir.join("ca.pem"), [CA, CA2].concat()).expect("ca");
+    std::fs::write(dir.join("b.pem"), b2).expect("cert");
+    let section = secret_tls(&dir, "b");
+    let store = Arc::new(MemSecretStore::default());
+    store.set(&key_ref("b"), key_text("b"));
+    let follower = b.clone();
+    let follow = tokio::spawn({
+        let store: Arc<dyn SecretStore> = store.clone();
+        async move {
+            follower
+                .follow_tls(&section, store, futures::stream::pending())
+                .await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Подходящая новая пара в хранилище и файле, но без опроса и событий b остаётся на прежней.
+    store.set(&key_ref("b"), std::str::from_utf8(b2_key).expect("pem"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let a = cluster.start("a", tls("a"), &[Role::Jmap], &cfg).await;
+    assert_eq!(
+        a.call(&echo, "k", Bytes::new(), LONG).await,
+        Ok(Bytes::from("b|a|k|"))
+    );
+    follow.abort();
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }

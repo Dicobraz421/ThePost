@@ -1,7 +1,7 @@
 # CTR-68: `InternalTls`: ключ только из хранилища секретов
 
 lane: contracts
-deps: [CTR-52]
+deps: [CTR-52, AUTH-17]
 class: B
 files: [crates/tp-contracts/src/*, crates/tp-testkit/src/*, docs/CONTRACTS.md]
 read: [docs/decisions/2026-11-11-stage2-followups.md, docs/tasks/CTR-52.md]

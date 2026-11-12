@@ -23,7 +23,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgConnection, PgPool};
+use sqlx::{FromRow, PgConnection};
 use time::OffsetDateTime;
 use tp_contracts::config::duration;
 use tp_contracts::dav::{
@@ -623,7 +623,11 @@ impl PgMeta {
 }
 
 /// Очистка надгробий учётной записи `scope` старше `before` с подъёмом границ вида и коллекций.
-async fn purge_account(pool: &PgPool, scope: AccountScope, before: OffsetDateTime) -> Result<u64> {
+async fn purge_account(
+    pool: &crate::pool::DbPool,
+    scope: AccountScope,
+    before: OffsetDateTime,
+) -> Result<u64> {
     let mut tx = begin(pool, scope.tenant).await?;
     lock_modseq(&mut tx, scope).await?;
     let n: i64 = sqlx::query_scalar(

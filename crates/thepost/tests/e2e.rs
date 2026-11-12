@@ -110,7 +110,12 @@ fn config(dir: &Path, db_url: &str, domain: &str) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/all.yaml"),
     )
     .expect("deploy/config/all.yaml");
-    let base = without_sections(&all, &["domain", "database", "blob", "secrets", "http"]);
+    let base = without_sections(
+        &all,
+        &[
+            "domain", "database", "blob", "secrets", "http", "tls", "smtp", "imap",
+        ],
+    );
     assert!(base.contains("roles: [all]"), "{base}");
     let path = |p: PathBuf| p.display().to_string().replace('\\', "/");
     format!(
@@ -586,7 +591,7 @@ async fn mvp_mail_flow() {
     }
 
     // Учётная запись и пароль приложения — в той же БД (миграции выполнил узел).
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
     let domain_id = accept_domain(&meta, tenant, &domain).await;
@@ -1276,7 +1281,13 @@ async fn transport_settings_without_restart() {
 // ---------- APP-26: правила Sieve и автоответ ----------
 
 /// Получатели очереди исходящей почты с адресом `address`.
-async fn queued(pool: &sqlx::PgPool, address: &str) -> i64 {
+/// Пул `tp-meta` к базе `url` без учёта ожидания соединения (наблюдатель-пустышка): метрик в тесте нет.
+async fn db_pool(url: &str) -> tp_meta::pool::DbPool {
+    let pool = sqlx::PgPool::connect(url).await.expect("pool");
+    tp_meta::pool::DbPool::new(pool, Arc::new(tp_meta::pool::NoAcquireObserver))
+}
+
+async fn queued(pool: &tp_meta::pool::DbPool, address: &str) -> i64 {
     let mut tx = tp_meta::schema::begin(pool, TenantId::DEFAULT)
         .await
         .expect("begin");
@@ -1354,7 +1365,7 @@ async fn sieve_rules_and_vacation() {
     let session: Value = serde_json::from_slice(&body).expect("session");
     let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
 
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let tenant = TenantId::DEFAULT;
     let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
     let account: sqlx::types::Uuid =
@@ -1616,7 +1627,7 @@ async fn meeting_scheduling() {
         retry(until, "узел готов").await;
     }
 
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
     let domain_id = accept_domain(&meta, tenant, &domain).await;
@@ -1833,6 +1844,16 @@ async fn d7_metrics() {
         "tp_blob_orphans_remaining",
     ] {
         assert!(text.contains(name), "{name}: {text}");
+    }
+    // Ожидание соединения пулов учтено наблюдателем пула (META-55): узел уже получал соединения.
+    for pool in ["primary", "listener"] {
+        let series = format!("tp_db_pool_wait_seconds_count{{pool=\"{pool}\"}} ");
+        let waits: f64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix(series.as_str()))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{series}: {text}"));
+        assert!(waits >= 1.0, "{series}: {text}");
     }
 
     shutdown.cancel();

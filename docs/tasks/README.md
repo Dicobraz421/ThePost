@@ -549,11 +549,14 @@
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | ready | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | todo | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | todo | — |
-| [CTR-68](CTR-68.md) | `InternalTls`: ключ только из хранилища секретов | contracts | B | contracts-46 | todo | CTR-52 |
+| [CTR-68](CTR-68.md) | `InternalTls`: ключ только из хранилища секретов | contracts | B | contracts-46 | todo | CTR-52,AUTH-17 |
 | [CTR-70](CTR-70.md) | `TenantTransport.rewrites` без `serde(default)` | contracts | B | contracts-46 | todo | — |
 | [META-70](META-70.md) | `PolicyStore` и `AuditLog` в PostgreSQL | meta | A | meta-44 | todo | CTR-25 |
 | [ADM-34](ADM-34.md) | Admin API на контрактах CTR-25: политики и журнал аудита из БД | admin | B | admin-23 | todo | CTR-25,META-70 |
 | [ADM-36](ADM-36.md) | Admin API: проверка полей политики для SMTP | admin | A | admin-23 | todo | CTR-67 |
+| [APP-59](APP-59.md) | узел запускает экспорт журнала аудита в syslog/OTLP | app | A | app-53 | todo | ADM-34 |
+| [META-76](META-76.md) | убрать старые PgMeta::policy/set_policy и реэкспорт PolicyTarget | meta | A | meta-49 | todo | META-70 |
+| [META-77](META-77.md) | проверка номеров миграций — подряд, без повторов, совпадают с именами файлов | meta | A | meta-50 | ready | — |
 | [ADM-35](ADM-35.md) | CLI: проверка скрипта Sieve без `tp_sieve::check` | admin | A | admin-24 | todo | JMAP-35 |
 | [SIEVE-13](SIEVE-13.md) | одна проверка скрипта: удалить `tp_sieve::check` | sieve | A | sieve-06 | todo | SIEVE-11,JMAP-35,ADM-35 |
 | [DEP-43](DEP-43.md) | эталоны: лимиты, селектор DKIM и Milter — политикой организации | deploy | A | deploy-32 | todo | CTR-67 |
@@ -725,7 +728,8 @@
 | [CTR-64](CTR-64.md) | сигнал `AccountDisabled` — вход учётной записи запрещён | contracts | B | contracts-44 | ready | — |
 | [META-66](META-66.md) | `by_ids` в PostgreSQL | meta | A | meta-42 | todo | CTR-63 |
 | [META-67](META-67.md) | публикация `AccountDisabled` при блокировке | meta | A | meta-42 | todo | CTR-64 |
-| [MS-19](MS-19.md) | заголовки скрытого письма корзины | mailstore | A | mailstore-12 | ready | — |
+| [CTR-80](CTR-80.md) | заголовки скрытого письма корзины для администратора | contracts | B | contracts-52 | ready | CTR-35 |
+| [MS-19](MS-19.md) | заголовки скрытого письма корзины | mailstore | A | mailstore-12 | todo | CTR-80 |
 | [ADM-32](ADM-32.md) | темы скрытых писем и имена участников групп одним запросом | admin | A | admin-21 | todo | CTR-63,MS-19,ADM-19,ADM-20 |
 | [IMAP-22](IMAP-22.md) | заблокированная учётная запись — закрытие сеансов IMAP и POP3 | imap | A | imap-12 | todo | CTR-64 |
 | [JMAP-41](JMAP-41.md) | заблокированная учётная запись — закрытие push JMAP | jmap | A | jmap-24 | todo | CTR-64 |

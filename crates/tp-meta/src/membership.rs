@@ -117,7 +117,7 @@ impl PgMeta {
                 r#"SELECT node_id, roles, addr, site, joined_at, expires_at FROM nodes
                ORDER BY node_id COLLATE "C""#,
             )
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.pool.acquire().await?)
             .await
             .map_err(db_err)?;
             rows.into_iter()
@@ -169,7 +169,7 @@ impl PgMeta {
         .bind(up.addr)
         .bind(up.site)
         .bind(ttl_arg(ttl)?)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *self.pool.acquire().await?)
         .await
         .map_err(db_err)?;
         if changed {
@@ -209,7 +209,7 @@ impl Membership for PgMeta {
                 "DELETE FROM nodes WHERE node_id = $1 RETURNING expires_at > now()",
             )
             .bind(node.as_str())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.pool.acquire().await?)
             .await
             .map_err(db_err)?;
             if was_live == Some(true) {
@@ -227,7 +227,7 @@ impl Membership for PgMeta {
                 r#"SELECT node_id, roles, addr, site FROM nodes WHERE expires_at > now()
                ORDER BY node_id COLLATE "C""#,
             )
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.pool.acquire().await?)
             .await
             .map_err(db_err)?;
             rows.into_iter().map(InfoRow::into_info).collect()
@@ -240,7 +240,7 @@ impl Membership for PgMeta {
             let names: Vec<String> = sqlx::query_scalar(
             r#"SELECT node_id FROM nodes WHERE expires_at > now() ORDER BY node_id COLLATE "C""#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *self.pool.acquire().await?)
         .await
         .map_err(db_err)?;
             names.into_iter().map(node_id).collect()

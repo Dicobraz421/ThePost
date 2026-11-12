@@ -4153,6 +4153,15 @@
             "description": "Квота ящика, байт.",
             "minimum": 0
           },
+          "rcpts_per_hour": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Лимит отправки, адресатов в час (сумма получателей писем за скользящий час).",
+            "minimum": 0
+          },
           "retention": {
             "type": [
               "string",
