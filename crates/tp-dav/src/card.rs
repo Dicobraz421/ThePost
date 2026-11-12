@@ -481,7 +481,7 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
         return match root.name.as_str() {
             "addressbook-query" => Ok(match filter_of(root) {
                 Ok(filter) => query(cx, &g.coll, &g.cards, &filter, root),
-                Err(resp) => resp,
+                Err(e) => filter_error(e),
             }),
             "addressbook-multiget" => multiget(cx, &g.coll, Some(&g.cards), root).await,
             _ => Ok(unsupported()),
@@ -494,7 +494,7 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
         "addressbook-query" => {
             let filter = match filter_of(root) {
                 Ok(f) => f,
-                Err(resp) => return Ok(resp),
+                Err(e) => return Ok(filter_error(e)),
             };
             let objects = match filter.needle() {
                 // Кандидаты по поисковым строкам (CTR-54); в книге не больше `max_objects` карточек.
@@ -517,20 +517,21 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
     }
 }
 
-/// Фильтр `addressbook-query`; нет `filter` — все карточки. Неверный — ответ с ошибкой.
-fn filter_of(root: &Element) -> std::result::Result<Filter, Response> {
-    match root.child(CARDDAV, "filter").map(Filter::parse) {
-        None => Ok(Filter::default()),
-        Some(Ok(f)) => Ok(f),
-        Some(Err(FilterError::Collation)) => Err(precondition(
-            StatusCode::FORBIDDEN,
-            "<card:supported-collation/>",
-        )),
-        Some(Err(FilterError::Unsupported)) => Err(precondition(
-            StatusCode::FORBIDDEN,
-            "<card:supported-filter/>",
-        )),
-        Some(Err(FilterError::Invalid)) => Err(status(StatusCode::BAD_REQUEST)),
+/// Фильтр `addressbook-query`; нет `filter` — все карточки.
+fn filter_of(root: &Element) -> Parsed<Filter> {
+    root.child(CARDDAV, "filter")
+        .map_or_else(|| Ok(Filter::default()), Filter::parse)
+}
+
+/// Ответ на неверный фильтр: неизвестное сравнение — 403 `supported-collation`, неподдерживаемое — 403
+/// `supported-filter`, остальное — 400.
+fn filter_error(e: FilterError) -> Response {
+    match e {
+        FilterError::Collation => {
+            precondition(StatusCode::FORBIDDEN, "<card:supported-collation/>")
+        }
+        FilterError::Unsupported => precondition(StatusCode::FORBIDDEN, "<card:supported-filter/>"),
+        FilterError::Invalid => status(StatusCode::BAD_REQUEST),
     }
 }
 
