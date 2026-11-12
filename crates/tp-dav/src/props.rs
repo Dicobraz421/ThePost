@@ -11,6 +11,11 @@
 //! `schedule-inbox-URL` и `schedule-outbox-URL` (`inbox/`, `outbox/` дома календарей — заготовки для DAV-13:
 //! отвечают только на `PROPFIND`, имена зарезервированы).
 //!
+//! Дом адресных книг (`addressbook-home-set` принципала): при первом `PROPFIND`, если адресных книг нет, создаётся
+//! книга `contacts` с именем из `dav.default_addressbook_name`. Свойства книги: `supported-address-data` (vCard 3.0
+//! и 4.0), `max-resource-size`, `max-image-size` (Apple; `dav.max_photo_size`), `addressbook-description`.
+//! Глобальная адресная книга ([`crate::gal`]) — последней в списке дома, права — только чтение.
+//!
 //! `PROPPATCH` — у коллекции: `displayname`, описание (`calendar-description`, `addressbook-description`), цвет и
 //! порядок календаря (`calendar-color`, `calendar-order`, Apple), часовой пояс календаря (`calendar-timezone` —
 //! VTIMEZONE, RFC 4791 §5.2.2; `calendar-timezone-id` — IANA, RFC 7809 §5.2; хранится идентификатор IANA). Изменения атомарны: ошибка одного свойства — оно
@@ -32,6 +37,7 @@ use tp_contracts::ModSeq;
 use tp_contracts::dav::{Collection, CollectionKind, Component};
 use tp_contracts::{Error, Result};
 
+use crate::gal;
 use crate::path::{self, Target};
 use crate::server::{Cx, multistatus, precondition, status};
 use crate::xml::{
@@ -245,6 +251,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
     v.push(p(DAV, "principal-collection-set", href(path::PRINCIPALS)));
     let privs = match res {
         Res::Root | Res::Principals | Res::Principal => PRIV_READ,
+        Res::Collection(c) | Res::Object { coll: c, .. } if gal::is(c) => PRIV_READ,
         _ => PRIV_OWNER,
     };
     v.push(p(DAV, "current-user-privilege-set", privs.to_owned()));
@@ -255,9 +262,11 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
             "<d:supported-report><d:report><c:calendar-multiget/></d:report></d:supported-report>",
             "<d:supported-report><d:report><c:free-busy-query/></d:report></d:supported-report>"
         ),
-        Res::Collection(_) => {
-            "<d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report>"
-        }
+        Res::Collection(_) => concat!(
+            "<d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report>",
+            "<d:supported-report><d:report><card:addressbook-query/></d:report></d:supported-report>",
+            "<d:supported-report><d:report><card:addressbook-multiget/></d:report></d:supported-report>"
+        ),
         _ => "",
     };
     v.push(p(DAV, "supported-report-set", reports.to_owned()));
@@ -324,6 +333,11 @@ fn collection_props(cx: &Cx<'_>, c: &Collection, me: &str, v: &mut Vec<(PropName
                 .to_owned(),
             ));
             v.push(p(CARDDAV, "max-resource-size", max));
+            v.push(p(
+                CARDDAV,
+                "max-image-size",
+                cx.dav.cfg.max_photo_size.to_string(),
+            ));
         }
     }
 }
@@ -451,9 +465,7 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         }
         Target::Principal(_) => emit(cx, &mut ms, &Res::Principal, &want),
         Target::Home(kind, _) => {
-            if *kind == CollectionKind::Calendar {
-                ensure_defaults(cx).await?;
-            }
+            ensure_defaults(cx, *kind).await?;
             emit(cx, &mut ms, &Res::Home(*kind), &want);
             if depth1 {
                 let list = cx.store().list_collections(cx.scope, *kind).await?;
@@ -463,11 +475,30 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
                 if list.len() > max {
                     truncated(&mut ms, &target.href(cx.login()));
                 }
+                // Каталог недоступен — дом показывается без глобальной адресной книги.
+                if *kind == CollectionKind::AddressBook {
+                    match gal::load(cx).await {
+                        Ok(Some(g)) => emit(cx, &mut ms, &Res::Collection(&g.coll), &want),
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "DAV: глобальная адресная книга недоступна");
+                        }
+                    }
+                }
             }
         }
         Target::Collection(kind, _, name) => {
+            if let Some(g) = gal::find(cx, *kind, name).await? {
+                emit(cx, &mut ms, &Res::Collection(&g.coll), &want);
+                if depth1 {
+                    for o in &g.cards {
+                        gal::emit(cx, &mut ms, &g, o, &want);
+                    }
+                }
+                return Ok(multistatus(ms));
+            }
             let Some(c) = cx.store().collection_by_name(cx.scope, *kind, name).await? else {
-                if path::reserved(*kind, name) {
+                if *kind == CollectionKind::Calendar && path::reserved(*kind, name) {
                     emit(cx, &mut ms, &Res::Schedule(name == path::INBOX), &want);
                     return Ok(multistatus(ms));
                 }
@@ -479,6 +510,13 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
             }
         }
         Target::Object(kind, _, coll, name) => {
+            if let Some(g) = gal::find(cx, *kind, coll).await? {
+                let Some(o) = g.card(name) else {
+                    return Ok(status(StatusCode::NOT_FOUND));
+                };
+                gal::emit(cx, &mut ms, &g, o, &want);
+                return Ok(multistatus(ms));
+            }
             let Some(c) = cx.store().collection_by_name(cx.scope, *kind, coll).await? else {
                 return Ok(status(StatusCode::NOT_FOUND));
             };
@@ -497,11 +535,11 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
     Ok(multistatus(ms))
 }
 
-/// Календарь и список задач по умолчанию — если у учётной записи нет ни одного календаря. Имена ресурсов
-/// постоянные ([`path::DEFAULT_CALENDAR`], [`path::DEFAULT_TASKS`]): одновременные обращения не создают дубликатов
+/// Коллекции по умолчанию дома вида `kind` — если у учётной записи нет ни одной коллекции этого вида: календарь
+/// и список задач либо адресная книга. Имена ресурсов постоянные ([`path::DEFAULT_CALENDAR`],
+/// [`path::DEFAULT_TASKS`], [`path::DEFAULT_ADDRESSBOOK`]): одновременные обращения не создают дубликатов
 /// (`Conflict` хранилища — уже создано).
-pub(crate) async fn ensure_defaults(cx: &Cx<'_>) -> Result<()> {
-    let kind = CollectionKind::Calendar;
+pub(crate) async fn ensure_defaults(cx: &Cx<'_>, kind: CollectionKind) -> Result<()> {
     if !cx
         .store()
         .list_collections(cx.scope, kind)
@@ -511,24 +549,31 @@ pub(crate) async fn ensure_defaults(cx: &Cx<'_>) -> Result<()> {
         return Ok(());
     }
     let cfg = &cx.dav.cfg;
-    let defaults = [
-        (
-            path::DEFAULT_CALENDAR,
-            &cfg.default_calendar_name,
-            Component::Event,
-        ),
-        (
-            path::DEFAULT_TASKS,
-            &cfg.default_tasks_name,
-            Component::Todo,
-        ),
-    ];
+    let defaults: &[(&str, &String, Component)] = match kind {
+        CollectionKind::Calendar => &[
+            (
+                path::DEFAULT_CALENDAR,
+                &cfg.default_calendar_name,
+                Component::Event,
+            ),
+            (
+                path::DEFAULT_TASKS,
+                &cfg.default_tasks_name,
+                Component::Todo,
+            ),
+        ],
+        CollectionKind::AddressBook => &[(
+            path::DEFAULT_ADDRESSBOOK,
+            &cfg.default_addressbook_name,
+            Component::Card,
+        )],
+    };
     for (order, (name, display, component)) in (0u32..).zip(defaults) {
         let c = Collection {
-            display_name: display.clone(),
+            display_name: (*display).clone(),
             order,
-            components: BTreeSet::from([component]),
-            ..Collection::new(kind, name)
+            components: BTreeSet::from([*component]),
+            ..Collection::new(kind, *name)
         };
         match cx.store().create_collection(cx.scope, c).await {
             Ok(_) | Err(Error::Conflict) => {}

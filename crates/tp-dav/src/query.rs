@@ -121,19 +121,52 @@ enum Collation {
     Unicode,
 }
 
-/// `text-match`: подстрока.
+/// Вид совпадения `text-match` (`match-type`, RFC 6352 §10.5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchType {
+    Equals,
+    Contains,
+    StartsWith,
+    EndsWith,
+}
+
+/// `text-match`: CalDAV — подстрока, CardDAV — по `match-type`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextMatch {
     /// Искомое, приведённое по сравнению.
     needle: String,
     collation: Collation,
+    kind: MatchType,
     negate: bool,
 }
 
 impl TextMatch {
+    /// `text-match` CalDAV (RFC 4791 §9.7.5): сравнение по умолчанию — `i;ascii-casemap`, подстрока.
     fn parse(el: &Element) -> std::result::Result<TextMatch, FilterError> {
+        Self::with(el, Collation::Ascii, MatchType::Contains)
+    }
+
+    /// `text-match` CardDAV (RFC 6352 §10.5.4): сравнение по умолчанию — `i;unicode-casemap`, вид — `match-type`
+    /// (`equals`, `contains` — по умолчанию, `starts-with`, `ends-with`).
+    pub(crate) fn parse_card(el: &Element) -> std::result::Result<TextMatch, FilterError> {
+        let kind = match el.attr("match-type") {
+            None | Some("contains") => MatchType::Contains,
+            Some("equals") => MatchType::Equals,
+            Some("starts-with") => MatchType::StartsWith,
+            Some("ends-with") => MatchType::EndsWith,
+            Some(_) => return Err(FilterError::Invalid),
+        };
+        Self::with(el, Collation::Unicode, kind)
+    }
+
+    fn with(
+        el: &Element,
+        default: Collation,
+        kind: MatchType,
+    ) -> std::result::Result<TextMatch, FilterError> {
         let collation = match el.attr("collation") {
-            None | Some("i;ascii-casemap") => Collation::Ascii,
+            None => default,
+            Some("i;ascii-casemap") => Collation::Ascii,
             Some("i;unicode-casemap") => Collation::Unicode,
             Some("i;octet") => Collation::Octet,
             Some(_) => return Err(FilterError::Collation),
@@ -146,6 +179,7 @@ impl TextMatch {
         let mut m = TextMatch {
             needle: String::new(),
             collation,
+            kind,
             negate,
         };
         m.needle = m.fold(&el.text).into_owned();
@@ -160,11 +194,18 @@ impl TextMatch {
         }
     }
 
-    /// Хотя бы одно значение содержит искомое (с учётом `negate-condition`).
-    fn matches<'a>(&self, values: impl IntoIterator<Item = &'a str>) -> bool {
-        let found = values
-            .into_iter()
-            .any(|v| self.fold(v).contains(self.needle.as_str()));
+    /// Хотя бы одно значение совпадает с искомым (с учётом `negate-condition`).
+    pub(crate) fn matches<'a>(&self, values: impl IntoIterator<Item = &'a str>) -> bool {
+        let needle = self.needle.as_str();
+        let found = values.into_iter().any(|v| {
+            let v = self.fold(v);
+            match self.kind {
+                MatchType::Equals => v == needle,
+                MatchType::Contains => v.contains(needle),
+                MatchType::StartsWith => v.starts_with(needle),
+                MatchType::EndsWith => v.ends_with(needle),
+            }
+        });
         found != self.negate
     }
 }
@@ -756,7 +797,7 @@ fn request_tz(root: &Element, c: &Collection) -> Tz {
 }
 
 /// Запрошенные свойства отчёта: `prop`, `allprop` или `propname`; без них — только ссылки.
-fn want_of(root: &Element) -> Want {
+pub(crate) fn want_of(root: &Element) -> Want {
     if let Some(p) = root.child(DAV, "prop") {
         Want::Props(props::keys(p))
     } else if root.child(DAV, "allprop").is_some() {
@@ -879,8 +920,8 @@ async fn calendar_query(cx: &Cx<'_>, c: &Collection, root: &Element) -> Result<R
     Ok(multistatus(ms))
 }
 
-/// Имя объекта календаря `c` по ссылке `href` (путь или полный URL); чужая или неверная ссылка — `None`.
-fn object_name(cx: &Cx<'_>, c: &Collection, href: &str) -> Option<String> {
+/// Имя объекта коллекции `c` по ссылке `href` (путь или полный URL); чужая или неверная ссылка — `None`.
+pub(crate) fn object_name(cx: &Cx<'_>, c: &Collection, href: &str) -> Option<String> {
     let path = match href.split_once("://") {
         Some((_, rest)) => &rest[rest.find('/')?..],
         None => href,

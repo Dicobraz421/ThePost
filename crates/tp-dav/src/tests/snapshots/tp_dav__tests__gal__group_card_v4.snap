@@ -1,0 +1,12 @@
+---
+source: crates/tp-dav/src/tests/gal.rs
+expression: "r.body.replace(\"\\r\\n\", \"\\n\")"
+---
+BEGIN:VCARD
+VERSION:4.0
+UID:g-sales
+KIND:GROUP
+FN:Продажи
+EMAIL;TYPE=WORK:sales@example.org
+N:Продажи;;;;
+END:VCARD

@@ -1,0 +1,52 @@
+---
+source: crates/tp-dav/src/tests/card_query.rs
+expression: r.show()
+---
+207 Multi-Status
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/contacts/john.vcf</d:href>
+<d:propstat>
+<d:prop>
+<d:getcontenttype>text/vcard; charset=utf-8</d:getcontenttype>
+<card:address-data>BEGIN:VCARD&#13;
+VERSION:3.0&#13;
+UID:c-john&#13;
+FN:John Smith&#13;
+N:Smith;John;;;&#13;
+EMAIL;TYPE=INTERNET:john@partner.example&#13;
+END:VCARD&#13;
+</card:address-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/contacts/maria.vcf</d:href>
+<d:propstat>
+<d:prop>
+<d:getcontenttype>text/vcard; charset=utf-8</d:getcontenttype>
+<card:address-data>BEGIN:VCARD&#13;
+VERSION:4.0&#13;
+UID:c-maria&#13;
+FN:Мария Иванова&#13;
+N:Иванова;Мария;;;&#13;
+EMAIL;TYPE=work:maria@example.org&#13;
+TEL;TYPE=cell;VALUE=uri:tel:+7-903-555-66-77&#13;
+NICKNAME:Маша&#13;
+END:VCARD&#13;
+</card:address-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/contacts/none.vcf</d:href>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:response>
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/other/ivan.vcf</d:href>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:response>
+</d:multistatus>

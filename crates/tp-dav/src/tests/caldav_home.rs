@@ -120,14 +120,6 @@ async fn defaults_created_once() {
     assert_eq!(r.status, StatusCode::NO_CONTENT);
     env.propfind(CALS, "1", "").await;
     assert_eq!(list().await.len(), 1);
-    // Адресные книги по умолчанию не создаются.
-    env.propfind(super::BOOKS, "1", "").await;
-    let books = env
-        .store
-        .list_collections(env.scope, CollectionKind::AddressBook)
-        .await
-        .expect("книги");
-    assert!(books.is_empty());
 }
 
 #[tokio::test]
