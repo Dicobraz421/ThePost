@@ -337,6 +337,7 @@ pub(crate) async fn handle(
             Err(Error::NotFound) => Ok(status(StatusCode::NOT_FOUND)),
             Err(e) => Err(e),
         },
+        ("POST", false, None) => post(cx, body).await,
         ("REPORT", _, None) => Ok(crate::query::unsupported()),
         ("GET" | "HEAD" | "DELETE", false, Some(_)) => Ok(status(StatusCode::NOT_FOUND)),
         ("PUT" | "DELETE" | "PROPPATCH" | "MKCOL" | "MKCALENDAR", ..) => {
@@ -346,3 +347,161 @@ pub(crate) async fn handle(
     }
 }
 
+fn timestamp(c: &ICalendarComponent, p: &ICalendarProperty) -> Option<OffsetDateTime> {
+    let t = c
+        .property(p)?
+        .values
+        .first()?
+        .as_partial_date_time()?
+        .to_timestamp()?;
+    OffsetDateTime::from_unix_timestamp(t).ok()
+}
+
+/// Ответ VFREEBUSY (`METHOD:REPLY`) с периодами `busy` участника `attendee` запроса `req`.
+fn freebusy_reply(
+    req: &ICalendarComponent,
+    attendee: &ICalendarEntry,
+    range: Period,
+    busy: &[BusyPeriod],
+) -> String {
+    let mut root = ICalendarComponent::new(ICalendarComponentType::VCalendar);
+    root.add_property(ICalendarProperty::Version, "2.0");
+    root.add_property(ICalendarProperty::Prodid, props::PRODID);
+    root.add_property(ICalendarProperty::Method, ICalendarMethod::Reply);
+    root.component_ids.push(1);
+    let utc = |t: OffsetDateTime| PartialDateTime::from_utc_timestamp(t.unix_timestamp());
+    let mut fb = ICalendarComponent::new(ICalendarComponentType::VFreebusy);
+    fb.entries.extend(
+        req.entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.name,
+                    ICalendarProperty::Uid | ICalendarProperty::Organizer
+                )
+            })
+            .cloned(),
+    );
+    fb.add_dtstamp(PartialDateTime::now());
+    fb.add_property(ICalendarProperty::Dtstart, utc(range.start));
+    fb.add_property(ICalendarProperty::Dtend, utc(range.end));
+    fb.entries.push(attendee.clone());
+    for (kind, fbtype) in [
+        (BusyKind::Busy, ICalendarFreeBusyType::Busy),
+        (BusyKind::Tentative, ICalendarFreeBusyType::BusyTentative),
+        (
+            BusyKind::Unavailable,
+            ICalendarFreeBusyType::BusyUnavailable,
+        ),
+    ] {
+        let values: Vec<ICalendarValue> = busy
+            .iter()
+            .filter(|p| p.kind == kind)
+            .map(|p| {
+                ICalendarValue::Period(ICalendarPeriod::Range {
+                    start: utc(p.start),
+                    end: utc(p.end),
+                })
+            })
+            .collect();
+        if !values.is_empty() {
+            fb.entries.push(
+                ICalendarEntry::new(ICalendarProperty::Freebusy)
+                    .with_param(ICalendarParameter::fbtype(fbtype))
+                    .with_values(values),
+            );
+        }
+    }
+    ICalendar {
+        components: vec![root, fb],
+    }
+    .to_string()
+}
+
+/// `POST` в исходящие: запрос занятости (RFC 6638 §5).
+async fn post(cx: &Cx<'_>, body: Body) -> Result<Response> {
+    const MESSAGE: &str = "<c:valid-scheduling-message/>";
+    let bad = |inner: &str| Ok(precondition(StatusCode::FORBIDDEN, inner));
+    let Some(deps) = &cx.dav.schedule else {
+        return Ok(status(StatusCode::FORBIDDEN));
+    };
+    let Ok(bytes) = read(body, cx.dav.cfg.max_request_size).await else {
+        return Ok(status(StatusCode::PAYLOAD_TOO_LARGE));
+    };
+    let Some(ical) = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|t| ICalendar::parse(t).ok())
+    else {
+        return bad("<c:valid-calendar-data/>");
+    };
+    let Some(req) = ical
+        .components
+        .iter()
+        .find(|c| c.component_type == ICalendarComponentType::VFreebusy)
+        .filter(|_| itip::method(&ical) == Some(ItipMethod::Request))
+    else {
+        return bad(MESSAGE);
+    };
+    let (Some(start), Some(end)) = (
+        timestamp(req, &ICalendarProperty::Dtstart),
+        timestamp(req, &ICalendarProperty::Dtend),
+    ) else {
+        return bad(MESSAGE);
+    };
+    let range = Period { start, end };
+    if range.validate().is_err() {
+        return bad(MESSAGE);
+    }
+    let organizer = req
+        .property(&ICalendarProperty::Organizer)
+        .and_then(itip::entry_address);
+    if !organizer.is_some_and(|o| cx.addresses().contains(&o)) {
+        return bad("<c:valid-organizer/>");
+    }
+    let attendees: Vec<(&ICalendarEntry, String)> = req
+        .properties(&ICalendarProperty::Attendee)
+        .filter_map(|e| Some((e, itip::entry_address(e)?)))
+        .collect();
+    if attendees.is_empty() {
+        return bad(MESSAGE);
+    }
+    if attendees.len() > cx.dav.cfg.max_freebusy_attendees {
+        return bad("<c:max-attendees-per-instance/>");
+    }
+    let mut accounts: Vec<Option<AccountId>> = Vec::with_capacity(attendees.len());
+    for (_, addr) in &attendees {
+        accounts.push(deps.account(cx.scope, addr).await?.flatten());
+    }
+    let ids: Vec<AccountId> = accounts.iter().flatten().copied().collect();
+    let busy = if ids.is_empty() {
+        Vec::new()
+    } else {
+        deps.freebusy.query(cx.scope.tenant, &ids, range).await?
+    };
+    let mut out = format!("{HEADER}<c:schedule-response{XMLNS}>");
+    for ((entry, addr), account) in attendees.iter().zip(&accounts) {
+        let _ = write!(
+            out,
+            "<c:response><c:recipient>{}</c:recipient>",
+            xml::href(&format!("mailto:{addr}"))
+        );
+        match account {
+            Some(id) => {
+                let periods = busy
+                    .iter()
+                    .find(|(a, _)| a == id)
+                    .map_or(&[][..], |(_, p)| p.as_slice());
+                let data = freebusy_reply(req, entry, range, periods);
+                let _ = write!(
+                    out,
+                    "<c:request-status>2.0;Success</c:request-status><c:calendar-data>{}</c:calendar-data>",
+                    xml::text(&data)
+                );
+            }
+            None => out.push_str("<c:request-status>3.7;Invalid calendar user</c:request-status>"),
+        }
+        out.push_str("</c:response>");
+    }
+    out.push_str("</c:schedule-response>");
+    Ok(xml_response(StatusCode::OK, out))
+}

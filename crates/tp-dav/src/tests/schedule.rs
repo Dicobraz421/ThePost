@@ -910,3 +910,85 @@ async fn keep_processed_and_instance_cancel() {
     assert_eq!(o.index.busy.len(), 2);
 }
 
+// ---------- DAV-16: занятость ----------
+
+/// Запрос занятости, как его отправляет Календарь macOS («Доступность»).
+fn freebusy_request(attendees: &[&str]) -> String {
+    let list: String = attendees
+        .iter()
+        .map(|a| format!("ATTENDEE:mailto:{a}\r\n"))
+        .collect();
+    format!(
+        "BEGIN:VCALENDAR\r\nCALSCALE:GREGORIAN\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n\
+         PRODID:-//Apple Inc.//macOS 15.1//EN\r\nBEGIN:VFREEBUSY\r\nUID:4FD3AD92-6CC1\r\n\
+         DTEND:20260108T000000Z\r\n{list}DTSTART:20260105T000000Z\r\n\
+         X-CALENDARSERVER-MASK-UID:m-1\r\nDTSTAMP:20260104T120000Z\r\n\
+         ORGANIZER:mailto:{IVAN}\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n"
+    )
+}
+
+#[tokio::test]
+async fn freebusy_two_users() {
+    let env = Sched::new().await;
+    // Пётр: ежедневная встреча с пропуском 6-го и переносом 7-го (под вопросом), прозрачное и отменённое события.
+    let series = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//RU\r\nBEGIN:VEVENT\r\nUID:f-1\r\n\
+        DTSTAMP:20260101T000000Z\r\nDTSTART:20260105T100000Z\r\nDTEND:20260105T110000Z\r\n\
+        RRULE:FREQ=DAILY;COUNT=4\r\nEXDATE:20260106T100000Z\r\nSUMMARY:Стендап\r\nEND:VEVENT\r\n\
+        BEGIN:VEVENT\r\nUID:f-1\r\nRECURRENCE-ID:20260107T100000Z\r\nDTSTAMP:20260101T000000Z\r\n\
+        DTSTART:20260107T150000Z\r\nDTEND:20260107T160000Z\r\nSTATUS:TENTATIVE\r\nSUMMARY:Стендап\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(env.put(PETR, "f1.ics", &[], series).await.status, 201);
+    for (name, uid, extra) in [
+        ("f2.ics", "f-2", "TRANSP:TRANSPARENT\r\n"),
+        ("f3.ics", "f-3", "STATUS:CANCELLED\r\n"),
+    ] {
+        let body = super::event(uid, "Не занимает").replace("SUMMARY", &format!("{extra}SUMMARY"));
+        assert_eq!(env.put(PETR, name, &[], &body).await.status, 201);
+    }
+    // Ольга: одна встреча в интервале и одна вне его.
+    for (name, uid, day) in [("o1.ics", "o-1", "20260106"), ("o2.ics", "o-2", "20260201")] {
+        let body = super::event(uid, "Встреча").replace("20260105", day);
+        assert_eq!(env.put(OLGA, name, &[], &body).await.status, 201);
+    }
+    let outbox = format!("{}outbox/", home(IVAN));
+    let r = env
+        .send(
+            IVAN,
+            "POST",
+            &outbox,
+            &[("content-type", "text/calendar; charset=utf-8")],
+            &freebusy_request(&[PETR, OLGA, ANNA]),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let shown: String = r
+        .show()
+        .replace("&#13;", "")
+        .lines()
+        .filter(|l| !l.starts_with("DTSTAMP:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!("freebusy_macos", shown);
+
+    // Недопустимые запросы.
+    let not_mine = freebusy_request(&[PETR]).replace(
+        &format!("ORGANIZER:mailto:{IVAN}"),
+        "ORGANIZER:mailto:x@y.z",
+    );
+    let reversed = freebusy_request(&[PETR]).replace("DTEND:20260108", "DTEND:20260101");
+    for (body, want) in [
+        (not_mine.as_str(), "valid-organizer"),
+        (reversed.as_str(), "valid-scheduling-message"),
+        (
+            meeting("m", IVAN, T10, 0, "").as_str(),
+            "valid-scheduling-message",
+        ),
+        ("мусор", "valid-calendar-data"),
+    ] {
+        let r = env.send(IVAN, "POST", &outbox, &[], body).await;
+        assert_eq!(r.status, 403, "{want}");
+        assert!(r.body.contains(want), "{want}: {}", r.body);
+    }
+    let inbox = format!("{}inbox/", home(IVAN));
+    assert_eq!(env.send(IVAN, "POST", &inbox, &[], "x").await.status, 405);
+}

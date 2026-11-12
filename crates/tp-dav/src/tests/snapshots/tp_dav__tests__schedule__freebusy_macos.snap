@@ -1,0 +1,55 @@
+---
+source: crates/tp-dav/src/tests/schedule.rs
+expression: shown
+---
+200 OK
+<?xml version="1.0" encoding="utf-8"?>
+<c:schedule-response xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<c:response>
+<c:recipient>
+<d:href>mailto:petr@example.org</d:href>
+</c:recipient>
+<c:request-status>2.0;Success</c:request-status>
+<c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//The Post//DAV//RU
+METHOD:REPLY
+BEGIN:VFREEBUSY
+UID:4FD3AD92-6CC1
+ORGANIZER:mailto:ivan@example.org
+DTSTART:20260105T000000Z
+DTEND:20260108T000000Z
+ATTENDEE:mailto:petr@example.org
+FREEBUSY;FBTYPE=BUSY:20260105T100000Z/20260105T110000Z
+FREEBUSY;FBTYPE=BUSY-TENTATIVE:20260107T150000Z/20260107T160000Z
+END:VFREEBUSY
+END:VCALENDAR
+</c:calendar-data>
+</c:response>
+<c:response>
+<c:recipient>
+<d:href>mailto:olga@example.org</d:href>
+</c:recipient>
+<c:request-status>2.0;Success</c:request-status>
+<c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//The Post//DAV//RU
+METHOD:REPLY
+BEGIN:VFREEBUSY
+UID:4FD3AD92-6CC1
+ORGANIZER:mailto:ivan@example.org
+DTSTART:20260105T000000Z
+DTEND:20260108T000000Z
+ATTENDEE:mailto:olga@example.org
+FREEBUSY;FBTYPE=BUSY:20260106T100000Z/20260106T110000Z
+END:VFREEBUSY
+END:VCALENDAR
+</c:calendar-data>
+</c:response>
+<c:response>
+<c:recipient>
+<d:href>mailto:anna@example.net</d:href>
+</c:recipient>
+<c:request-status>3.7;Invalid calendar user</c:request-status>
+</c:response>
+</c:schedule-response>
