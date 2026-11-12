@@ -3413,7 +3413,9 @@ pub async fn outbound_submit(ob: &dyn Outbound, tenant: TenantId, rcpts: &[Strin
 // ---------- Соответствие Exchange (CTR-35) ----------
 
 /// Набор проверок [`MailboxAudit`] (CTR-35): политика по умолчанию (не владелец — да, владелец — нет, чтение
-/// владельцем — никогда), политика ящика и организации, поиск со страницами и условиями, изоляция организаций.
+/// владельцем — никогда), политика ящика и организации, поиск со страницами и условиями, изоляция организаций;
+/// поиск по тексту (CTR-81): запись не владельца со строкой запроса сохраняется и читается, поиск владельцем не
+/// записывается и в политику не входит.
 /// Моменты — текущие (журнал может быть секционирован по суткам); `purge` набор не проверяет. Политика организации
 /// `tenant` в конце сбрасывается.
 pub async fn mailbox_audit(audit: &dyn MailboxAudit, tenant: TenantId, foreign_tenant: TenantId) {
@@ -3584,6 +3586,44 @@ pub async fn mailbox_audit(audit: &dyn MailboxAudit, tenant: TenantId, foreign_t
         audit.search_audit(tenant, &garbage).await,
         Err(Error::Invalid(_))
     ));
+
+    // Поиск по тексту (CTR-81): строка запроса — в `detail`; поиск владельцем не записывается даже при «записывать всё».
+    let mut search = entry(K::Delegate, AuditAction::Search, 7);
+    search.object = AuditObject {
+        mailbox: Some(MailboxId::new()),
+        message: None,
+        detail: Some("BODY \"отчёт за квартал\"".into()),
+    };
+    assert!(rec(search.clone()).await);
+    let searches = audit
+        .search_audit(
+            tenant,
+            &AuditQuery {
+                account: Some(owner.account),
+                action: Some(AuditAction::Search),
+                ..AuditQuery::all(10)
+            },
+        )
+        .await
+        .expect("by search");
+    assert_eq!(searches.entries, [search]);
+    let searching = AuditPolicy {
+        non_owner: true,
+        owner: [AuditAction::Search].into_iter().collect(),
+    };
+    assert!(matches!(
+        audit.set_audit_policy(tenant, None, Some(searching)).await,
+        Err(Error::Invalid(_))
+    ));
+    audit
+        .set_audit_policy(tenant, None, Some(AuditPolicy::all()))
+        .await
+        .expect("tenant policy all");
+    assert!(!rec(entry(K::Owner, AuditAction::Search, 8)).await);
+    audit
+        .set_audit_policy(tenant, None, None)
+        .await
+        .expect("reset tenant again");
 }
 
 /// Набор проверок [`SenderLists`] (CTR-35): пустые списки нового ящика, замена с приведением записей, состояние,

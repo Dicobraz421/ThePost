@@ -345,10 +345,12 @@ JMAP `urn:thepost:senderlists` — JMAP-17, Admin API — ADM-10, PostgreSQL —
 
 ## MailboxAudit
 SRS 5.2, решение 2026-11-04-exchange-parity (CTR-35; код — `audit.rs`). `AuditEntry { scope (ящик), at, actor (вход или субъект OIDC),
-actor_account: Option<AccountId>, actor_kind: AuditActorKind::{Owner, Delegate, Admin}, action: AuditAction::{Login, Read, Move, Delete, Send,
-SendAs, SendOnBehalf, ChangeRights, ChangeRules, ChangeForwarding}, object: AuditObject { mailbox?, message?, detail? }, client? }`,
-`validate()` (у владельца `actor_account` — ящик). `AuditPolicy { non_owner (по умолчанию true), owner: BTreeSet<AuditAction> (по умолчанию
-пусто; только `AuditAction::OWNER`) }`, `records(kind, action)` — чтение владельцем не записывается никогда. `MailboxAudit`:
+actor_account: Option<AccountId>, actor_kind: AuditActorKind::{Owner, Delegate, Admin}, action: AuditAction::{Login, Read, Search, Move,
+Delete, Send, SendAs, SendOnBehalf, ChangeRights, ChangeRules, ChangeForwarding}, object: AuditObject { mailbox?, message?, detail? }, client? }`,
+`validate()` (у владельца `actor_account` — ящик). `Search` (решение 114, CTR-81) — поиск по тексту писем (IMAP `SEARCH`/`UID SEARCH` с
+`BODY`/`TEXT`, JMAP `Email/query` с `text`/`body`): строка запроса — в `detail`, папка — в `mailbox`, найденные письма не записываются.
+`AuditPolicy { non_owner (по умолчанию true), owner: BTreeSet<AuditAction> (по умолчанию пусто; только `AuditAction::OWNER`) }`,
+`records(kind, action)` — вход, чтение и поиск владельцем не записываются никогда. `MailboxAudit`:
 `record_audit(entry) -> bool` — протоколы вызывают для каждого действия, политику применяет хранилище; `audit_policy(scope)` (ящик → организация
 → по умолчанию), `set_audit_policy(tenant, account?, policy?)`, `search_audit(tenant, &AuditQuery { account, actor, actor_kind, action, since,
 until, limit, after })` -> `AuditPage` (как `DeliveryLog::search`), `purge_audit(before)` (maintenance, можно сутками). In-memory —
@@ -984,3 +986,8 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   организации (`SharingPolicy`, `SharingPolicyStore`). Вид учётной записи — поле `Account::kind` и `AccountUpsert::kind`
   (`meta::AccountKind`), хранится с учётной записью (`tp-meta` — миграция 0031 `accounts.kind`, `tp-testkit`); несовместимо: новые
   обязательные поля `Account` и `AccountUpsert`. Реализации новых хранилищ в памяти и наборы — отдельной волной `tp-testkit`.
+- 2026-11-12 — CTR-81 (волна contracts-53, решение 114): `AuditAction::Search` — поиск по тексту писем в чужом ящике; строка запроса —
+  в `AuditObject::detail`, без найденных писем; в `AuditAction::OWNER` не входит (`AuditPolicy::records` для владельца — только действия
+  из `OWNER`). Несовместимо: новый вариант `AuditAction`; исчерпывающих `match` по нему в коде нет. `tp-meta` — миграция 0032
+  (`mailbox_audit_action_check`), `tp-admin` — описание параметра `action`; набор `suite::mailbox_audit` — запись `Search`. Запись
+  протоколами — IMAP-23, JMAP-43.

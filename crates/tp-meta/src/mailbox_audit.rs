@@ -337,6 +337,10 @@ mod tests {
             enum_of::<AuditAction>("change_forwarding".into()),
             Ok(AuditAction::ChangeForwarding)
         );
+        assert_eq!(
+            enum_of::<AuditAction>("search".into()),
+            Ok(AuditAction::Search)
+        );
     }
 
     #[test]

@@ -144,6 +144,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "account kind",
         include_str!("../migrations/0031_account_kind.sql"),
     ),
+    (
+        32,
+        "audit search",
+        include_str!("../migrations/0032_audit_search.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
