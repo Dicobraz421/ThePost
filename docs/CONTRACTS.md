@@ -76,10 +76,11 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; по умолчанию — `Internal`),
   `list(tenant, prefix, after, limit)` (CTR-44, список Admin API: по возрастанию `lower(login)` в порядке сравнения строк хранилища,
   префикс и курсор `after` — в нижнем регистре, строго больше; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
-  `addresses(tenant, id) -> Vec<String>` (CTR-53) — адреса, на которые учётной записи доставляется почта: основной (имя входа) первым,
-  затем псевдонимы каталога (`DirAlias` с целью — этой учётной записью) без catch-all `@domain`; нижний регистр, без повторов — правило
-  `meta::account_addresses(primary, aliases)`; нет учётной записи — `NotFound`; по умолчанию — только основной адрес через `get`.
-  Потребители: META-57 (PostgreSQL), DAV-23 (`calendar-user-address-set`); in-memory с псевдонимами и тест набора — `tp-testkit`.
+  Псевдонимы (CTR-53) — поле `Account::aliases` (нижний регистр, без повторов, основного адреса и catch-all `@domain`; хранится с
+  учётной записью, задаётся `AccountUpsert::aliases` — псевдонимы каталога `DirAlias` с целью — этой учётной записью, заменяют прежние;
+  правило хранения — `meta::account_aliases(primary, aliases)`). Адреса, на которые учётной записи доставляется почта, —
+  `Account::addresses()`: основной (имя входа) первым, затем псевдонимы, правило — `meta::account_addresses(primary, aliases)`.
+  Отдельного метода хранилища нет. Потребитель — DAV-23 (`calendar-user-address-set`).
   Состояние ящика (CTR-35, «Удалённые ящики» решения 2026-11-04-exchange-parity): `AccountState::{Active, Disabled { until }}` —
   отключённый ящик (учётная запись исчезла из каталога): вход и приём почты запрещены независимо от `enabled`, нет в GAL, хранится до
   `until` (по умолчанию 30 дней — политика синхронизации). `account_state` (по умолчанию — через `get`, всегда `Active`),
@@ -245,10 +246,10 @@ Vec<AccountId> (непусто — модерируемая), hidden_from_gal }`
 `expand` (`None` — внешний). Ограничения и модерация — для группы-адресата, не для вложенных. Очередь модерации:
 `HeldMessage { id: HeldId, group, sender, sender_account, message_id, blob, size, held_at }` (ссылка на объект — у вызывающего);
 `hold` (нет группы — `NotFound`, занятый id — `Conflict`), `held(tenant, Option<GroupId>, limit)` по (`held_at`, `id`),
-`take_held(tenant, id)` — забрать для решения (повторно — `NotFound`). Продолжение очереди (CTR-55):
-`held_after(tenant, Option<GroupId>, after: Option<HeldCursor { held_at, id }>, limit)` — страница строго после курсора в том же порядке
-(`None` — с начала; курсор — `HeldCursor::of` последнего письма страницы; по умолчанию — `Internal`), правило — `groups::held_page`;
-`held` остаётся первой страницей (META-59, ADM-21). Синхронизация из каталога — `tp-auth` (AUTH-07), проверки
+`take_held(tenant, id)` — забрать для решения (повторно — `NotFound`). Страницы очереди (CTR-55):
+`held(tenant, Option<GroupId>, after: Option<HeldCursor { held_at, id }>, limit)` — страница строго после курсора в порядке
+(`held_at`, `id`) (`None` — с начала; курсор — `HeldCursor::of` последнего письма страницы; страница короче `limit` — последняя),
+правило — `groups::held_page`; другого метода чтения очереди нет (потребитель курсора — ADM-21). Синхронизация из каталога — `tp-auth` (AUTH-07), проверки
 при приёме — `tp-smtp` (SMTP-16), Admin API — ADM-07; реализация — `tp-meta` (META-21), in-memory — `MemGroups`; набор — `suite::group_store`.
 Решения модератора (CTR-31): `Moderation` (вместо временного трейта `tp-admin`) — `deliver(tenant, &group, &HeldMessage)` доставляет
 одобренное письмо участникам группы (раскрытие `expand`, приём в ящики, журнал доставки; другая группа или организация — `Invalid`,
@@ -571,34 +572,31 @@ etag }>`, `multiget(names)`, `objects_by_id(ids)` (JMAP), `in_range(collection, 
 Precondition::{Any, IfMatch(etag), IfNoneMatch}) -> PutOutcome::{Stored(Put { id, etag, modseq, created }), PreconditionFailed,
 UidConflict { name }}` (UID уникален в коллекции; компонент не из `components` — `Invalid`; перезапись сохраняет `id`),
 `delete_object(collection, name, Precondition) -> DeleteOutcome::{Deleted(ModSeq), PreconditionFailed}` (нет ресурса при `Any` — `NotFound`).
-Свойства коллекции сверх `Collection` (CTR-56, решение 82): `CollectionPrefs { is_default, subscribed, visible, alerts_with_time,
-alerts_without_time }` (`#[serde(default)]`; по умолчанию — не по умолчанию, подписана, видима, без оповещений). `is_default` — коллекция
-по умолчанию вида (JMAP `isDefault`, `schedule-default-calendar-URL`), не больше одной на вид; `subscribed`, `visible` — JMAP
+Свойства коллекции (CTR-56, решение 82) — поля `Collection` (`#[serde(default)]`): `is_default`, `subscribed`, `visible`,
+`alerts_with_time`, `alerts_without_time`; `Collection::new` — не по умолчанию, подписана, видима, без оповещений. `is_default` —
+коллекция по умолчанию вида (JMAP `isDefault`, `schedule-default-calendar-URL`), не больше одной на вид; `subscribed`, `visible` — JMAP
 `isSubscribed`, `isVisible`; оповещения по умолчанию для событий со временем и на весь день (JMAP `defaultAlertsWithTime`,
 `defaultAlertsWithoutTime`; CalDAV `default-alarm-vevent-datetime`, `default-alarm-vevent-date`) — текст JSON-объекта `Id[Alert]`
-JSCalendar до `MAX_DEFAULT_ALERTS_LEN` = 8192 байт, только у календаря (`validate(kind)` → `Invalid`); хранилище его не разбирает,
-в `VALARM` переводит `tp-dav`. `collection_prefs(scope, id)` (нет коллекции — `NotFound`; по умолчанию — `CollectionPrefs::default()`),
-`list_collection_prefs(scope, kind) -> Vec<(CollectionId, CollectionPrefs)>` в порядке `list_collections`, `set_collection_prefs(scope, id,
-prefs) -> ModSeq` — замена; `is_default = true` снимает признак с прежней той же транзакцией, `false` у текущей — не назначена; это
-изменение свойств коллекции (`state`, `collection_changes`, `DavChanged` — у `id` и у прежней по умолчанию); по умолчанию — `Internal`.
-`default_collection(scope, kind)` — назначенная, иначе прежнее правило `dav::default_of(&[Collection])`: сегмент `default`
-(`DEFAULT_COLLECTION_NAME`), иначе первая по (`order`, имя). Свойства — отдельная структура, а не поля `Collection`: код, собирающий
-`Collection` перечислением полей, не меняется. Потребители: META-60, DAV-25, JMAP-36; in-memory и тесты набора — `tp-testkit`.
+JSCalendar до `MAX_DEFAULT_ALERTS_LEN` = 8192 байт, только у календаря (`Collection::validate` → `Invalid`); хранилище его не
+разбирает, в `VALARM` переводит `tp-dav`. Читаются с коллекцией (`get_collection`, `list_collections`), меняются обычной записью —
+`create_collection`, `update_collection`; отдельных методов нет. Запись с `is_default = true` снимает признак с прежней коллекции по
+умолчанию того же вида той же транзакцией: у прежней — своё изменение свойств (`ModSeq`, `state`, `collection_changes`, `DavChanged`)
+раньше изменения записываемой; `false` у текущей — не назначена. Коллекция по умолчанию среди списка — `dav::default_of(&[Collection])`:
+назначенная, иначе сегмент `default` (`DEFAULT_COLLECTION_NAME`), иначе первая по (`order`, имя). Потребители записи свойств — DAV-25,
+JMAP-36.
 Перенос (CTR-54, решение 80): `move_object(scope, from, name, to, Precondition) -> MoveOutcome::{Moved(Moved { id, etag, removed, modseq }),
 PreconditionFailed, UidConflict { name }}` — одной транзакцией; имя, `id`, тело, индекс и поисковые строки сохраняются, ETag и `ModSeq` —
 новые: в `from` — надгробие (`removed`, видно в `changes`), в `to` — создание (`modseq`), в `account_changes` объект — в `updated`;
 сигнал `DavChanged` — по обеим коллекциям. `from == to`, разный вид коллекций или компонент не из `components` целевой — `Invalid`;
 условие — к исходному ресурсу (`IfNoneMatch` — как `Any`); имя занято в целевой — `PreconditionFailed`, UID — `UidConflict`;
-`max_objects` целевой — `QuotaExceeded`; по умолчанию — `Internal`.
-Поиск контактов (CTR-54): `CardSearch { strings }` — поисковые строки контакта (полное имя, части имени, адреса e-mail; нижний регистр,
-без повторов и управляющих символов, до `MAX_CARD_SEARCH_STRINGS` = 64 строк по `MAX_CARD_SEARCH_LEN` = 255 байт; `new(values)` приводит
-и обрезает, `validate()`, `matches(needle)`), вычисляет вызывающий (`tp_dav::index::card`). `put_card(scope, collection, name,
-NewCard { body, index, search }, Precondition) -> PutOutcome` — `put_object` со строками (не `VCARD` или недопустимые строки — `Invalid`;
-по умолчанию — проверка и `put_object`, строки не хранятся); запись через `put_object` оставляет объект без строк.
-`find_cards(scope, collection, needle, limit) -> Vec<DavObject>` — кандидаты, у которых строка содержит `needle` (пустой — все), по имени,
-не более `limit`; точную проверку фильтра делает вызывающий (как после `in_range`); по умолчанию — все объекты коллекции (`list_objects` и
-`multiget`), `needle` и `limit` не применяются. Поисковые строки — параметр записи, а не поле `ObjectIndex`: код, собирающий `ObjectIndex`
-перечислением полей, не меняется. Потребители: META-58, DAV-24, JMAP-34; in-memory и тесты набора — `tp-testkit`.
+`max_objects` целевой — `QuotaExceeded`.
+Поиск контактов (CTR-54): `ObjectIndex::search: CardSearch { strings }` (`#[serde(default)]`) — поисковые строки контакта (полное
+имя, части имени, адреса e-mail; нижний регистр, без повторов и управляющих символов, до `MAX_CARD_SEARCH_STRINGS` = 64 строк по
+`MAX_CARD_SEARCH_LEN` = 255 байт; `CardSearch::new(values)` приводит и обрезает, `validate()`, `matches(needle)`), вычисляет вызывающий
+(`tp_dav::index::card`); непустые — только у `VCARD` (`ObjectIndex::validate` → `Invalid`). Пишутся единственным методом записи
+`put_object` и заменяются при каждой записи, читаются с объектом. `find_cards(scope, collection, needle, limit) -> Vec<DavObject>` —
+кандидаты, у которых строка содержит `needle` (пустой — все), по имени, не более `limit`; точную проверку фильтра делает вызывающий
+(как после `in_range`). Потребители `find_cards` — DAV-24, JMAP-34.
 Изменения: `ModSeq` — из счётчика учётной записи (как у писем), у каждого изменения свой; `Collection::state` — наибольший `ModSeq`
 коллекции (CTag). `changes(collection, since, limit) -> Changes<String>` (имена, RFC 6578; повторно созданное имя — не в `destroyed`),
 `collection_changes(kind, since, limit) -> Changes<CollectionId>` (JMAP `Calendar/changes`, `AddressBook/changes`),
@@ -854,14 +852,14 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-52 (волна contracts-37): `InternalTls.key: Option<SecretRef>` — ключ внутренних каналов из хранилища секретов
   (взамен `key_file`, оба сразу — `Invalid`), `InternalTls::key_source()` и `KeySource::{File, Secret}`. Новое поле секции: код,
   собирающий `InternalTls` перечислением всех полей, дополняется `key: None` (в репозитории таких мест нет).
-- 2026-11-12 — CTR-53 (волна contracts-38): `AccountStore::addresses(tenant, id)` — адреса учётной записи (основной и псевдонимы каталога
-  без catch-all; по умолчанию — только основной через `get`), правило — `meta::account_addresses`.
-- 2026-11-12 — CTR-55 (волна contracts-38): `GroupStore::held_after(tenant, group, after, limit)` и `HeldCursor { held_at, id }` —
-  продолжение очереди модерации по курсору (по умолчанию — `Internal`); правило страницы — `groups::held_page`.
+- 2026-11-12 — CTR-53 (волна contracts-38): `Account::aliases`, `AccountUpsert::aliases` и `Account::addresses()` — адреса учётной
+  записи (основной и псевдонимы каталога без catch-all); правила — `meta::account_addresses`, `meta::account_aliases`. Несовместимо:
+  новые обязательные поля `Account` и `AccountUpsert`. `tp-meta` — миграция 0025 (`accounts.aliases`).
+- 2026-11-12 — CTR-55 (волна contracts-38): `GroupStore::held(tenant, group, after, limit)` — очередь модерации страницами по курсору
+  `HeldCursor { held_at, id }`; правило страницы — `groups::held_page`. Несовместимо: новый параметр `after` у `held`.
 - 2026-11-12 — CTR-54 (волна contracts-38): `DavStore::move_object` и `MoveOutcome`/`Moved` — перенос объекта между коллекциями с
-  сохранением `id` (по умолчанию — `Internal`); поиск контактов — `CardSearch`, `NewCard`, `DavStore::put_card` (по умолчанию —
-  `put_object`), `DavStore::find_cards` (по умолчанию — все объекты). По сравнению с карточкой: поисковые строки — не поле
-  `ObjectIndex`, а параметр `put_card` (существующий код не меняется).
-- 2026-11-12 — CTR-56 (волна contracts-38): `CollectionPrefs` — коллекция по умолчанию, подписка и видимость, оповещения по умолчанию;
-  `DavStore::{collection_prefs, list_collection_prefs, set_collection_prefs, default_collection}`, правило без назначенной —
-  `dav::default_of`. По сравнению с карточкой: свойства — отдельная структура, а не поля `Collection` (существующий код не меняется).
+  сохранением `id`; поиск контактов — `ObjectIndex::search: CardSearch` (пишется `put_object`) и `DavStore::find_cards`. Несовместимо:
+  оба метода обязательны для реализаций, новое поле `ObjectIndex`. `tp-meta` — миграция 0025 (`dav_objects.search`, `placed_modseq`).
+- 2026-11-12 — CTR-56 (волна contracts-38): поля `Collection` — `is_default`, `subscribed`, `visible`, `alerts_with_time`,
+  `alerts_without_time`; признак по умолчанию переносится записью коллекции (`create_collection`, `update_collection`), правило
+  выбора — `dav::default_of`. Несовместимо: новые поля `Collection`. `tp-meta` — миграция 0025 (столбцы `dav_collections`).

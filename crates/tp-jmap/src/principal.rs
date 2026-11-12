@@ -404,6 +404,7 @@ mod tests {
             display_name: name.into(),
             external_id: cur.external_id,
             enabled,
+            aliases: cur.aliases,
         };
         env.meta.upsert(scope.tenant, data).await.expect("upsert");
         scope

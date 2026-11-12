@@ -1235,7 +1235,7 @@ mod groups {
         assert_eq!(env.inbox("bob@example.org").await.len(), 1);
         let held = env
             .groups
-            .held(TenantId::DEFAULT, Some(g.id), 10)
+            .held(TenantId::DEFAULT, Some(g.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 1);
@@ -1265,7 +1265,7 @@ mod groups {
         assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued);
         let held = env
             .groups
-            .held(TenantId::DEFAULT, Some(g.id), 10)
+            .held(TenantId::DEFAULT, Some(g.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 2);

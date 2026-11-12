@@ -59,6 +59,18 @@ pub struct Account {
     pub external_id: Option<String>,
     /// Вход разрешён.
     pub enabled: bool,
+    /// Псевдонимы (CTR-53): адреса каталога (`crate::auth::DirAlias`), доставляемые этой учётной записи, кроме
+    /// основного, — в нижнем регистре, без повторов и catch-all `@domain`, в порядке каталога. Задаёт
+    /// [`AccountUpsert::aliases`]; все адреса учётной записи — [`Account::addresses`].
+    pub aliases: Vec<String>,
+}
+
+impl Account {
+    /// Адреса, на которые учётной записи доставляется почта (CTR-53; `calendar-user-address-set` CalDAV, участник
+    /// приглашения): основной (имя входа) первым, затем [`Account::aliases`] — правило [`account_addresses`].
+    pub fn addresses(&self) -> Vec<String> {
+        account_addresses(&self.login, self.aliases.iter().map(String::as_str))
+    }
 }
 
 /// Данные для создания или обновления учётной записи (синхронизация с каталогом).
@@ -75,6 +87,10 @@ pub struct AccountUpsert {
     pub external_id: Option<String>,
     /// Вход разрешён.
     pub enabled: bool,
+    /// Псевдонимы каталога с целью — этой учётной записью (CTR-53), в любом регистре; заменяют прежние. Хранилище
+    /// приводит их правилом [`account_addresses`] (нижний регистр, без повторов, основного адреса и catch-all) —
+    /// [`Account::aliases`].
+    pub aliases: Vec<String>,
 }
 
 /// Состояние ящика учётной записи (CTR-35, решение 2026-11-04-exchange-parity «Удалённые ящики»).
@@ -129,7 +145,7 @@ pub struct QuotaUsage {
     pub limit_bytes: Option<u64>,
 }
 
-/// Адреса учётной записи для [`AccountStore::addresses`] (CTR-53): основной `primary` первым, затем `aliases` в
+/// Адреса учётной записи для [`Account::addresses`] (CTR-53): основной `primary` первым, затем `aliases` в
 /// порядке перечисления; нижний регистр, без повторов. Пропускаются catch-all (`@domain`, пустая локальная часть —
 /// `crate::auth::DirAlias`), пустые строки и строки без `@`.
 pub fn account_addresses<'a>(
@@ -146,6 +162,18 @@ pub fn account_addresses<'a>(
             out.push(address);
         }
     }
+    out
+}
+
+/// Псевдонимы учётной записи для хранения ([`Account::aliases`]): `aliases` по правилу [`account_addresses`] без
+/// основного адреса `primary`.
+pub fn account_aliases<'a>(
+    primary: &'a str,
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let primary = primary.trim().to_lowercase();
+    let mut out = account_addresses("", aliases);
+    out.retain(|a| *a != primary);
     out
 }
 
@@ -184,18 +212,6 @@ pub trait AccountStore: Send + Sync + 'static {
         Err(Error::Internal(
             "AccountStore::list не реализован".to_owned(),
         ))
-    }
-
-    /// Адреса, на которые учётной записи доставляется почта (CTR-53; `calendar-user-address-set` CalDAV, участник
-    /// приглашения): основной (имя входа) первым, затем псевдонимы каталога (`crate::auth::DirAlias` с целью — этой
-    /// учётной записью) без catch-all `@domain`; нижний регистр, без повторов — правило [`account_addresses`].
-    /// Нет учётной записи — `Error::NotFound`. По умолчанию — только основной адрес через [`AccountStore::get`]
-    /// (хранилище без псевдонимов).
-    async fn addresses(&self, tenant: TenantId, id: AccountId) -> Result<Vec<String>> {
-        match self.get(tenant, id).await? {
-            Some(account) => Ok(account_addresses(&account.login, [])),
-            None => Err(Error::NotFound),
-        }
     }
 
     /// Создаёт или обновляет учётную запись (из LDAP); при создании — системные папки.
@@ -824,6 +840,13 @@ mod tests {
                 ],
             ),
             ["ann@example.com", "sales@example.com", "info@example.com"]
+        );
+        assert_eq!(
+            account_aliases(
+                "Ann@Example.com",
+                ["ANN@example.com", "@example.com", "S@Example.com"]
+            ),
+            ["s@example.com"]
         );
         // Имя входа — не адрес: остаются только псевдонимы.
         assert_eq!(

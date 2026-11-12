@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use tp_contracts::bus::EventBus;
 use tp_contracts::dav::{
     Collection, CollectionId, CollectionKind, DavLimits, DavObject, DavObjectId, DavStore,
-    DeleteOutcome, ObjectIndex, ObjectRef, Precondition, Put, PutOutcome, TimeRange, dav_changed,
-    valid_name,
+    DeleteOutcome, MoveOutcome, Moved, ObjectIndex, ObjectRef, Precondition, Put, PutOutcome,
+    TimeRange, dav_changed, valid_name,
 };
 use tp_contracts::meta::{AccountScope, Changes};
 use tp_contracts::schedule::{
@@ -31,7 +31,10 @@ struct Obj {
     etag: String,
     body: String,
     index: ObjectIndex,
+    /// Создание объекта (для изменений учётной записи: перенос идентификатор не меняет).
     created: ModSeq,
+    /// Появление в нынешней коллекции (создание или перенос).
+    placed: ModSeq,
     modseq: ModSeq,
 }
 
@@ -74,6 +77,26 @@ impl Account {
 
     fn coll(&self, id: CollectionId) -> Result<&Coll> {
         self.collections.get(&id).ok_or(Error::NotFound)
+    }
+
+    /// Снимает признак коллекции по умолчанию с коллекции вида `kind`, кроме `keep`: её изменение свойств со своим
+    /// `ModSeq`.
+    fn clear_default(
+        &mut self,
+        kind: CollectionKind,
+        keep: CollectionId,
+    ) -> Option<(CollectionId, ModSeq)> {
+        let prev = self
+            .collections
+            .values()
+            .find(|c| c.meta.kind == kind && c.meta.is_default && c.meta.id != keep)
+            .map(|c| c.meta.id)?;
+        let modseq = self.bump();
+        let c = self.collections.get_mut(&prev)?;
+        c.meta.is_default = false;
+        c.meta.state = modseq;
+        c.props = modseq;
+        Some((prev, modseq))
     }
 
     fn check_since(&self, since: ModSeq) -> Result<()> {
@@ -285,7 +308,7 @@ impl DavStore for MemDav {
     ) -> Result<ModSeq> {
         collection.validate()?;
         let (kind, id) = (collection.kind, collection.id);
-        let modseq = {
+        let (cleared, modseq) = {
             let mut st = lock(&self.state);
             let acc = st.entry(scope).or_default();
             let taken = acc.collections.contains_key(&id)
@@ -300,6 +323,10 @@ impl DavStore for MemDav {
             if acc.collections.len() >= self.limits.max_collections {
                 return Err(Error::QuotaExceeded);
             }
+            let cleared = collection
+                .is_default
+                .then(|| acc.clear_default(kind, id))
+                .flatten();
             let modseq = acc.bump();
             collection.state = modseq;
             acc.collections.insert(
@@ -311,8 +338,11 @@ impl DavStore for MemDav {
                     objects: BTreeMap::new(),
                 },
             );
-            modseq
+            (cleared, modseq)
         };
+        if let Some((prev, m)) = cleared {
+            self.signal(scope, kind, prev, m).await;
+        }
         self.signal(scope, kind, id, modseq).await;
         Ok(modseq)
     }
@@ -324,13 +354,17 @@ impl DavStore for MemDav {
     ) -> Result<ModSeq> {
         collection.validate()?;
         let (kind, id) = (collection.kind, collection.id);
-        let modseq = {
+        let (cleared, modseq) = {
             let mut st = lock(&self.state);
             let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
             let cur = acc.coll(id)?;
             if cur.meta.kind != kind || cur.meta.name != collection.name {
                 return Err(Error::invalid("вид и имя коллекции не меняются"));
             }
+            let cleared = collection
+                .is_default
+                .then(|| acc.clear_default(kind, id))
+                .flatten();
             let modseq = acc.bump();
             let c = acc.collections.get_mut(&id).ok_or(Error::NotFound)?;
             c.meta = Collection {
@@ -338,8 +372,11 @@ impl DavStore for MemDav {
                 ..collection
             };
             c.props = modseq;
-            modseq
+            (cleared, modseq)
         };
+        if let Some((prev, m)) = cleared {
+            self.signal(scope, kind, prev, m).await;
+        }
         self.signal(scope, kind, id, modseq).await;
         Ok(modseq)
     }
@@ -511,9 +548,9 @@ impl DavStore for MemDav {
                 return Err(Error::QuotaExceeded);
             }
             let kind = c.meta.kind;
-            let prev = cur.map(|o| (o.id, o.created));
+            let prev = cur.map(|o| (o.id, o.created, o.placed));
             let modseq = acc.bump();
-            let (id, created) = prev.unwrap_or((DavObjectId::new(), modseq));
+            let (id, created, placed) = prev.unwrap_or((DavObjectId::new(), modseq, modseq));
             let etag = modseq.to_string();
             let c = acc
                 .collections
@@ -527,6 +564,7 @@ impl DavStore for MemDav {
                     body,
                     index,
                     created,
+                    placed,
                     modseq,
                 },
             );
@@ -587,6 +625,100 @@ impl DavStore for MemDav {
         Ok(DeleteOutcome::Deleted(modseq))
     }
 
+    async fn move_object(
+        &self,
+        scope: AccountScope,
+        from: CollectionId,
+        name: &str,
+        to: CollectionId,
+        pre: Precondition,
+    ) -> Result<MoveOutcome> {
+        let (kind, moved) = {
+            let mut st = lock(&self.state);
+            let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
+            let (src, dst) = (acc.coll(from)?, acc.coll(to)?);
+            let cur = src.objects.get(name);
+            if cur.is_none() && !matches!(pre, Precondition::IfMatch(_)) {
+                return Err(Error::NotFound);
+            }
+            if from == to || src.meta.kind != dst.meta.kind {
+                return Err(Error::invalid(
+                    "перенос — между разными коллекциями одного вида",
+                ));
+            }
+            if let Some(o) = cur
+                && !dst.meta.components.contains(&o.index.component)
+            {
+                return Err(Error::invalid(format!(
+                    "компонент {} не поддерживается коллекцией",
+                    o.index.component
+                )));
+            }
+            let Some(o) = cur.filter(|o| match &pre {
+                Precondition::IfMatch(etag) => o.etag == *etag,
+                Precondition::Any | Precondition::IfNoneMatch => true,
+            }) else {
+                return Ok(MoveOutcome::PreconditionFailed);
+            };
+            if dst.objects.contains_key(name) {
+                return Ok(MoveOutcome::PreconditionFailed);
+            }
+            if let Some((other, _)) = dst.objects.iter().find(|(_, d)| d.index.uid == o.index.uid) {
+                return Ok(MoveOutcome::UidConflict {
+                    name: other.clone(),
+                });
+            }
+            if dst.objects.len() >= self.limits.max_objects {
+                return Err(Error::QuotaExceeded);
+            }
+            let kind = src.meta.kind;
+            let (removed, modseq) = (acc.bump(), acc.bump());
+            let src = acc.collections.get_mut(&from).ok_or(Error::NotFound)?;
+            let mut o = src.objects.remove(name).ok_or(Error::NotFound)?;
+            src.meta.state = removed;
+            acc.objects.push(Tomb {
+                collection: from,
+                kind,
+                id: o.id,
+                name: name.to_owned(),
+                modseq: removed,
+            });
+            o.etag = modseq.to_string();
+            o.placed = modseq;
+            o.modseq = modseq;
+            let moved = Moved {
+                id: o.id,
+                etag: o.etag.clone(),
+                removed,
+                modseq,
+            };
+            let dst = acc.collections.get_mut(&to).ok_or(Error::NotFound)?;
+            dst.objects.insert(name.to_owned(), o);
+            dst.meta.state = modseq;
+            (kind, moved)
+        };
+        self.signal(scope, kind, from, moved.removed).await;
+        self.signal(scope, kind, to, moved.modseq).await;
+        Ok(MoveOutcome::Moved(moved))
+    }
+
+    async fn find_cards(
+        &self,
+        scope: AccountScope,
+        collection: CollectionId,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<DavObject>> {
+        let st = lock(&self.state);
+        let c = st.get(&scope).ok_or(Error::NotFound)?.coll(collection)?;
+        Ok(c.objects
+            .iter()
+            .filter(|(_, o)| o.index.search.matches(needle))
+            .take(limit)
+            .map(|(n, o)| object(collection, n, o))
+            .collect())
+    }
+
     async fn changes(
         &self,
         scope: AccountScope,
@@ -602,7 +734,7 @@ impl DavStore for MemDav {
             .objects
             .iter()
             .filter(|(_, o)| o.modseq > since)
-            .map(|(n, o)| (o.modseq, live(o.created, since, n.clone())))
+            .map(|(n, o)| (o.modseq, live(o.placed, since, n.clone())))
             .collect();
         if since != ModSeq::ZERO {
             // Последнее надгробие имени, которого сейчас нет.
@@ -671,10 +803,16 @@ impl DavStore for MemDav {
             .map(|o| (o.modseq, live(o.created, since, o.id)))
             .collect();
         if since != ModSeq::ZERO {
+            // Надгробие перенесённого объекта — не удаление: объект жив в другой коллекции.
+            let alive: std::collections::HashSet<DavObjectId> = acc
+                .collections
+                .values()
+                .flat_map(|c| c.objects.values().map(|o| o.id))
+                .collect();
             all.extend(
                 acc.objects
                     .iter()
-                    .filter(|t| t.kind == kind && t.modseq > since)
+                    .filter(|t| t.kind == kind && t.modseq > since && !alive.contains(&t.id))
                     .map(|t| (t.modseq, Change::Destroyed(t.id))),
             );
         }
@@ -823,6 +961,13 @@ mod tests {
     async fn suite_dav() {
         let store = MemDav::new().with_limits(suite::dav::LIMITS);
         suite::dav(&store, &suite::dav::DavFixture::new()).await;
+    }
+
+    #[tokio::test]
+    async fn suite_dav_organize() {
+        let store = MemDav::new().with_limits(suite::dav::LIMITS);
+        suite::dav::organize(&store, scope()).await;
+        suite::dav::organize(&MemDav::new(), scope()).await;
     }
 
     #[tokio::test]

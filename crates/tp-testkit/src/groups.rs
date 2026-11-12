@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tp_contracts::groups::{
-    DistributionGroup, GroupMember, GroupStore, HeldMessage, Moderation, check_delivery,
-    validate_reject_reason,
+    DistributionGroup, GroupMember, GroupStore, HeldCursor, HeldMessage, Moderation,
+    check_delivery, held_page, validate_reject_reason,
 };
 use tp_contracts::{AccountId, Error, GroupId, HeldId, Result, TenantId};
 
@@ -161,18 +161,18 @@ impl GroupStore for MemGroups {
         &self,
         tenant: TenantId,
         group: Option<GroupId>,
+        after: Option<HeldCursor>,
         limit: usize,
     ) -> Result<Vec<HeldMessage>> {
         let st = lock(&self.state);
-        let mut found = sorted(
+        Ok(held_page(
             st.held
                 .iter()
                 .filter(|((t, _), h)| *t == tenant && group.is_none_or(|g| h.group == Some(g)))
-                .map(|(_, h)| h.clone())
-                .collect(),
-        );
-        found.truncate(limit);
-        Ok(found)
+                .map(|(_, h)| h.clone()),
+            after,
+            limit,
+        ))
     }
 
     async fn take_held(&self, tenant: TenantId, id: HeldId) -> Result<HeldMessage> {

@@ -323,6 +323,7 @@ impl Admin {
                         display_name,
                         external_id: None,
                         enabled: true,
+                        aliases: Vec::new(),
                     },
                 )
                 .await?
@@ -465,6 +466,7 @@ fn enabled(a: Account) -> AccountUpsert {
         display_name: a.display_name,
         external_id: a.external_id,
         enabled: true,
+        aliases: a.aliases,
     }
 }
 

@@ -257,6 +257,7 @@ pub(crate) mod testutil {
                         display_name: (*login).to_owned(),
                         external_id: None,
                         enabled: *enabled,
+                        aliases: Vec::new(),
                     },
                 )
                 .await

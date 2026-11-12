@@ -171,6 +171,7 @@ impl Ext {
                     display_name: "Bob".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
                 },
             )
             .await
