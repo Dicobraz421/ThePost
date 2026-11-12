@@ -96,6 +96,12 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0020_mailbox_shards.sql"),
     ),
     (21, "dav", include_str!("../migrations/0021_dav.sql")),
+    (22, "sieve", include_str!("../migrations/0022_sieve.sql")),
+    (
+        23,
+        "vacation log",
+        include_str!("../migrations/0023_vacation_log.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

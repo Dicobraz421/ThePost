@@ -30,6 +30,7 @@ pub mod replica;
 pub mod retention;
 pub mod schema;
 pub mod shards;
+pub mod sieve;
 pub mod signals;
 pub mod transport;
 
@@ -56,6 +57,7 @@ use crate::pool::TxFuture;
 use crate::replica::Replica;
 use crate::retention::RetentionConfig;
 use crate::shards::{ReadIntent, ShardId, ShardResolver};
+use crate::sieve::SieveConfig;
 use crate::signals::SignalsConfig;
 
 /// Секция конфигурации контура метаданных `meta` (SRS 5.5); пул соединений — отдельная секция
@@ -77,6 +79,8 @@ use crate::signals::SignalsConfig;
 ///     channel: tp_signals
 ///   dav:
 ///     tombstone_ttl: 90d
+///   sieve:
+///     max_scripts: 16
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -105,6 +109,8 @@ pub struct MetaConfig {
     pub abuse: AbuseBlocksConfig,
     /// Календари и контакты: лимиты и срок надгробий ([`dav`]).
     pub dav: DavConfig,
+    /// Скрипты Sieve и автоответ: лимиты ([`sieve`]).
+    pub sieve: SieveConfig,
 }
 
 impl MetaConfig {
@@ -125,6 +131,7 @@ impl Default for MetaConfig {
             signals: SignalsConfig::default(),
             abuse: AbuseBlocksConfig::default(),
             dav: DavConfig::default(),
+            sieve: SieveConfig::default(),
         }
     }
 }
