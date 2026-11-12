@@ -17,6 +17,7 @@ import { GroupCreate, GroupEdit, GroupList } from "./pages/groups";
 import { LoginPage } from "./pages/login";
 import { ModerationPage } from "./pages/moderation";
 import { OrganizationPage } from "./pages/organization";
+import { AccountTrash } from "./pages/trash";
 import { authProvider } from "./providers/auth";
 import { dataProvider } from "./providers/data";
 
@@ -83,6 +84,7 @@ export function App() {
                 <Route index element={<AccountList />} />
                 <Route path="create" element={<AccountCreate />} />
                 <Route path=":id" element={<AccountShow />} />
+                <Route path=":id/trash" element={<AccountTrash />} />
               </Route>
               <Route path="/groups">
                 <Route index element={<GroupList />} />

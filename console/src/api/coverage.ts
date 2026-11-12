@@ -28,4 +28,9 @@ export const covered: Record<string, string> = {
   "GET /api/v1/orgs/{org}/moderation": "components/moderation-queue.tsx",
   "POST /api/v1/orgs/{org}/moderation/{held}/approve": "components/moderation-queue.tsx",
   "POST /api/v1/orgs/{org}/moderation/{held}/reject": "components/moderation-queue.tsx",
+  "GET /api/v1/orgs/{org}/accounts/{account}/trash": "pages/trash.tsx",
+  "GET /api/v1/orgs/{org}/accounts/{account}/trash-purge": "pages/trash.tsx",
+  "GET /api/v1/orgs/{org}/accounts/{account}/trash/hidden": "pages/trash.tsx",
+  "POST /api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore": "pages/trash.tsx",
+  "POST /api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore": "pages/trash.tsx",
 };

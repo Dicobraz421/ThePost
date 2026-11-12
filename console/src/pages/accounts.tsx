@@ -2,6 +2,7 @@ import { Create, List, Show, ShowButton, useForm } from "@refinedev/antd";
 import { useCreate, useCustomMutation, useDelete, useInfiniteList, useList, useShow } from "@refinedev/core";
 import { Alert, Button, Descriptions, Divider, Form, Input, Modal, Popconfirm, Table, Tag, Typography } from "antd";
 import { useState } from "react";
+import { Link } from "react-router";
 
 import type { Schemas } from "../api/client";
 import { bytes, when } from "../components/format";
@@ -173,6 +174,7 @@ export function AccountShow() {
         <Descriptions.Item label="Занято">{account && `${quota(account)}, писем: ${account.quota.messages}`}</Descriptions.Item>
         <Descriptions.Item label="Идентификатор">{account?.id}</Descriptions.Item>
       </Descriptions>
+      {account && <Link to={`/accounts/${encodeURIComponent(account.id)}/trash`}>Корзина и скрытые письма</Link>}
       <Divider orientation="left">Политика ящика</Divider>
       <PolicyForm
         policies={account}
