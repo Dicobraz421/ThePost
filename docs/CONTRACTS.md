@@ -112,7 +112,13 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   `Invalid`, остались письма — `Conflict`). Методы, кроме `account_state`, по умолчанию — `Internal`. In-memory — `MemMetadata`; набор
   `suite::account_state`. PostgreSQL — META-33.
   CTR-63: `by_ids(tenant, &[AccountId]) -> Vec<Account>` — в порядке запроса, не найденные и чужой организации пропускаются, повтор —
-  одна запись (первое вхождение); по умолчанию — `get` по одному, одним запросом — META-66; набор `suite::account_by_ids`.
+  одна запись (первое вхождение); обязателен (без реализации по умолчанию; PostgreSQL одним запросом — META-66); набор
+  `suite::account_by_ids`.
+  CTR-62: `by_address(tenant, address) -> Option<AddressTarget>` — получатель адреса организации (участник приглашения):
+  `AddressTarget::Account(Account)` — основной адрес или псевдоним (`Account::addresses`), иначе `AddressTarget::Group(DistributionGroup)`
+  — адрес группы рассылки (`GroupStore::by_address`); без учёта регистра и пробелов по краям; вход и состояние ящика не учитываются.
+  Обязателен; `MemMetadata` видит группы через `with_groups(MemGroups)`; `PgMeta` до META-68 — основной адрес и адрес группы без
+  псевдонимов. Набор `suite::account_by_address`; потребители — DAV-30.
   CTR-64: после фиксации `enabled = false` (`upsert` разрешённой ранее записи) и `disable_account` реализация публикует
   `account_disabled(scope)` — системный сигнал `AccountDisabled { account }` (раздел EventBus; `tp-meta` — META-67).
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).

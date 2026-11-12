@@ -57,9 +57,9 @@ use tp_contracts::groups::{
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, Envelope,
-    ExistingContent, MailboxStore, MessageMeta, MessageQuery, MessageStore, NewMailbox, NewMessage,
-    Policy, PolicyResolver, PolicyStore, PolicyTarget, SpecialUse, account_disabled,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
+    Envelope, ExistingContent, MailboxStore, MessageMeta, MessageQuery, MessageStore, NewMailbox,
+    NewMessage, Policy, PolicyResolver, PolicyStore, PolicyTarget, SpecialUse, account_disabled,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -2564,6 +2564,82 @@ pub async fn account_by_ids(accounts: &dyn AccountStore, fx: &AccountListFixture
         "чужая организация — нет, повтор — один раз"
     );
     assert_eq!(by_ids(Vec::new()).await, Vec::new());
+}
+
+/// Набор проверок `AccountStore::by_address` (CTR-62): основной адрес и псевдоним — учётная запись, адрес группы
+/// рассылки — группа (без учёта регистра и пробелов по краям), неизвестный адрес и адрес другой организации — `None`.
+/// `groups` — группы, которые видит `accounts`. Организации из [`AccountListFixture`] могут быть непустыми: адреса
+/// уникальны для прогона.
+pub async fn account_by_address(
+    accounts: &dyn AccountStore,
+    groups: &dyn GroupStore,
+    fx: &AccountListFixture,
+) {
+    let run = AccountId::new();
+    let addr = |n: &str| format!("{n}-{run}@{}", fx.domain_name);
+    let account = accounts
+        .upsert(
+            fx.tenant,
+            AccountUpsert {
+                domain: fx.domain,
+                login: addr("addr-owner"),
+                display_name: "Владелец".into(),
+                external_id: None,
+                enabled: true,
+                aliases: vec![addr("Addr-Sales")],
+                kind: AccountKind::User,
+            },
+        )
+        .await
+        .expect("upsert");
+    let group = DistributionGroup {
+        id: GroupId::new(),
+        tenant: fx.tenant,
+        name: "Отдел".into(),
+        address: Some(addr("addr-team")),
+        external_id: None,
+        members: vec![GroupMember::Account(account.id)],
+        senders: SenderRestriction::default(),
+        moderators: Vec::new(),
+        hidden_from_gal: false,
+    };
+    groups.put(group.clone()).await.expect("put group");
+    let by_address = |tenant: TenantId, address: String| async move {
+        accounts
+            .by_address(tenant, &address)
+            .await
+            .expect("by_address")
+    };
+
+    let own = Some(AddressTarget::Account(account.clone()));
+    assert_eq!(by_address(fx.tenant, addr("addr-owner")).await, own);
+    assert_eq!(
+        by_address(fx.tenant, addr("ADDR-OWNER").to_uppercase()).await,
+        own,
+        "основной адрес — без учёта регистра"
+    );
+    assert_eq!(
+        by_address(
+            fx.tenant,
+            format!(" {} ", addr("addr-sales").to_uppercase())
+        )
+        .await,
+        own,
+        "псевдоним — учётная запись"
+    );
+    assert_eq!(
+        by_address(fx.tenant, addr("Addr-Team")).await,
+        Some(AddressTarget::Group(group)),
+        "адрес группы — группа"
+    );
+    assert_eq!(by_address(fx.tenant, addr("addr-nobody")).await, None);
+    for a in ["addr-owner", "addr-sales", "addr-team"] {
+        assert_eq!(
+            by_address(fx.foreign_tenant, addr(a)).await,
+            None,
+            "другая организация"
+        );
+    }
 }
 
 // ---------- Moderation ----------

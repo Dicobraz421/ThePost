@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tp_contracts::acl::AclStore;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::meta::{
-    Account, AccountKind, AccountScope, AccountStore, AccountUpsert, Flag, Flags, MailboxStore,
-    MessageQuery, MessageStore, NewMailbox, QuotaUsage, SpecialUse,
+    Account, AccountKind, AccountScope, AccountStore, AccountUpsert, AddressTarget, Flag, Flags,
+    MailboxStore, MessageQuery, MessageStore, NewMailbox, QuotaUsage, SpecialUse,
 };
 use tp_contracts::{AccountId, DomainId, MailboxId, Result, TenantId};
 use tp_testkit::{MemAcl, MemMetadata};
@@ -94,6 +94,19 @@ impl AccountStore for Limited {
         Self: 'async_trait,
     {
         self.0.by_ids(tenant, ids)
+    }
+
+    fn by_address<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        address: &'life1 str,
+    ) -> Fut<'async_trait, Option<AddressTarget>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.by_address(tenant, address)
     }
 
     fn by_login<'life0, 'life1, 'async_trait>(

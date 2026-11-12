@@ -16,10 +16,10 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tp_contracts::events::{CoreEvent, CoreEventKind};
 use tp_contracts::meta::{
-    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, ChangeLog,
-    Changes, DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Mailbox,
-    MailboxStatus, MailboxStore, Message, MessageChange, MessageQuery, MessageStore, NewMailbox,
-    NewMessage, QuotaUsage, SpecialUse, account_aliases,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
+    ChangeLog, Changes, DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate,
+    Inserted, Mailbox, MailboxStatus, MailboxStore, Message, MessageChange, MessageQuery,
+    MessageStore, NewMailbox, NewMessage, QuotaUsage, SpecialUse, account_aliases,
 };
 use tp_contracts::retention::{PurgeOutcome, Restored};
 use tp_contracts::{
@@ -28,7 +28,9 @@ use tp_contracts::{
 };
 
 use crate::blob::MemBlobIndex;
+use crate::groups::MemGroups;
 use crate::infra::{Clock, MemEventLog, SystemClock, lock};
+use tp_contracts::groups::GroupStore;
 
 /// Срок хранения в корзине по умолчанию (как в конфигурации хранилища).
 pub const DEFAULT_TRASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -583,6 +585,8 @@ pub struct MemMetadata {
     clock: Arc<dyn Clock>,
     events: MemEventLog,
     blobs: Option<MemBlobIndex>,
+    /// Группы рассылки для [`AccountStore::by_address`] (CTR-62); `None` — только учётные записи.
+    groups: Option<MemGroups>,
     trash_retention: Duration,
 }
 
@@ -594,6 +598,7 @@ impl MemMetadata {
             clock,
             events: MemEventLog::default(),
             blobs: None,
+            groups: None,
             trash_retention: DEFAULT_TRASH_RETENTION,
         }
     }
@@ -607,6 +612,12 @@ impl MemMetadata {
     /// Учёт ссылок на объекты (`copy` добавляет, `expunge_final` снимает) — в `blobs`.
     pub fn with_blob_index(mut self, blobs: MemBlobIndex) -> Self {
         self.blobs = Some(blobs);
+        self
+    }
+
+    /// Группы рассылки `groups` для [`AccountStore::by_address`] (CTR-62): адрес группы — [`AddressTarget::Group`].
+    pub fn with_groups(mut self, groups: MemGroups) -> Self {
+        self.groups = Some(groups);
         self
     }
 
@@ -965,6 +976,24 @@ impl AccountStore for MemMetadata {
             .filter_map(|id| st.accounts.get(&(tenant, *id)))
             .map(|a| a.account.clone())
             .collect())
+    }
+
+    async fn by_address(&self, tenant: TenantId, address: &str) -> Result<Option<AddressTarget>> {
+        let address = address.trim().to_lowercase();
+        let account = lock(&self.state)
+            .accounts
+            .values()
+            .find(|a| a.account.tenant == tenant && a.account.addresses().contains(&address))
+            .map(|a| a.account.clone());
+        if let Some(account) = account {
+            return Ok(Some(AddressTarget::Account(account)));
+        }
+        let Some(groups) = &self.groups else {
+            return Ok(None);
+        };
+        Ok(GroupStore::by_address(groups, tenant, &address)
+            .await?
+            .map(AddressTarget::Group))
     }
 
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
@@ -1963,6 +1992,21 @@ mod tests {
             foreign_domain: DomainId::new(),
         };
         crate::suite::account_by_ids(&MemMetadata::default(), &fx).await;
+    }
+
+    /// CTR-62: общий набор `AccountStore::by_address`.
+    #[tokio::test]
+    async fn account_by_address_suite() {
+        let fx = crate::suite::AccountListFixture {
+            tenant: TenantId::DEFAULT,
+            domain: DomainId::new(),
+            domain_name: "example.org".into(),
+            foreign_tenant: TenantId::new(),
+            foreign_domain: DomainId::new(),
+        };
+        let groups = MemGroups::new();
+        let meta = MemMetadata::default().with_groups(groups.clone());
+        crate::suite::account_by_address(&meta, &groups, &fx).await;
     }
 
     /// CTR-35: общий набор состояния ящика.
