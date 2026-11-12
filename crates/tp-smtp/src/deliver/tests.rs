@@ -1426,5 +1426,6 @@ async fn outbound_suite() {
     tp_testkit::suite::outbound_submit(&d, TenantId::DEFAULT, &list).await;
 }
 
+mod local_domains;
 mod rules;
 mod wave;
