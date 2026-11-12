@@ -115,9 +115,6 @@ impl FlagRule {
     }
 }
 
-/// Признак отключённой учётной записи (прежнее имя [`FlagRule`]).
-pub type DisabledRule = FlagRule;
-
 /// Сопоставление учётных записей.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -1009,6 +1006,7 @@ impl LdapDirectory {
                     .and_then(|a| first(e, a))
                     .and_then(|v| v.trim().parse().ok()),
             },
+            hidden_from_gal: false,
         })
     }
 

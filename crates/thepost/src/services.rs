@@ -282,12 +282,14 @@ impl Services {
             extractor,
         });
 
-        // Очередь исходящей почты: письмо и уведомления подписываются DKIM при постановке.
+        // Очередь исходящей почты: письмо и уведомления подписываются DKIM при постановке; селектор подписи —
+        // политика организации принятого домена `From` (SMTP-40).
         let smtp = cfg.section::<SmtpConfig>(SMTP)?;
-        let dkim = Arc::new(tp_smtp::dkim_sign::DkimSign::new(
-            secrets.clone(),
-            smtp.dkim.clone(),
-        ));
+        let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
+        let dkim = Arc::new(
+            tp_smtp::dkim_sign::DkimSign::new(secrets.clone(), smtp.dkim.clone())
+                .with_policies(Arc::new(meta.clone()), routes.clone()),
+        );
         let queue = Arc::new(Queue::new(queue_deps(&meta, &blob)).with_dkim(dkim.clone()));
         let smtp_metrics = Arc::new(SmtpMetrics::new());
         smtp_metrics.register(metrics);
@@ -304,7 +306,6 @@ impl Services {
             (*cfg.section::<tp_dav::DavConfig>(DAV)?).clone(),
         ));
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
-        let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
         let sieve = (*cfg.section::<tp_sieve::SieveConfig>(SIEVE)?).clone();
         let sieve_limits = sieve.limits();
@@ -350,8 +351,9 @@ impl Services {
     }
 
     /// Доставка и обработчик транзакций SMTP (smtp-in, submission): проверки SPF/DKIM/DMARC/ARC, Milter, очередь,
-    /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC) и правила потока
-    /// почты модуля (если включён).
+    /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC), политики
+    /// организации (профиль Milter, лимиты сеанса submission — `PgMeta`, SMTP-40), лимиты отправки в час — общие с
+    /// submission и для отправки из JMAP (SMTP-43) — и правила потока почты модуля (если включён).
     pub fn delivery(&self, smtp: &SmtpConfig) -> Result<Arc<Delivery>> {
         // Приглашения и ответы извне (iMIP, SMTP-33) после доставки в ящик применяются к календарю получателя.
         let delivery = self.base_delivery(smtp)?.with_itip(self.itip.clone());
@@ -394,7 +396,9 @@ impl Services {
             .with_tracking(self.tracking.clone())
             .with_transport(self.routes.clone())
             .with_forwarding(Arc::new(forwarding))
-            .with_rules(self.rules.clone()))
+            .with_rules(self.rules.clone())
+            .with_policies(Arc::new(self.meta.clone()))
+            .with_send_limits(self.send_limits.clone()))
     }
 
     /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
@@ -467,6 +471,7 @@ impl Services {
             bus: self.bus.clone(),
             trash: Arc::new(self.meta.clone()),
             hooks: self.hooks.clone(),
+            audit: Arc::new(self.meta.clone()),
         }
     }
 

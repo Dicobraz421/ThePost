@@ -1,12 +1,10 @@
 //! POP3 (IMAP-12): сеанс RFC 1939 — USER/PASS, AUTH (RFC 5034), STAT, LIST, UIDL, RETR, TOP, DELE, RSET, QUIT.
 
-use std::sync::Arc;
-
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use tp_contracts::meta::{MessageQuery, MessageStore, SpecialUse};
 
-use super::{CLIENT_IP, Client, Env, LOGIN, PASSWORD, TestConn};
+use super::{Client, Env, LOGIN, PASSWORD, TestConn};
 use crate::config::Pop3Config;
 use crate::pop3::Pop3Session;
 
@@ -15,8 +13,7 @@ const TWO: &[u8] = b"From: a@example.org\r\nSubject: two\r\n\r\nHello\r\n";
 
 async fn pop(env: &Env, tls: bool) -> Client {
     let (server, client) = tokio::io::duplex(1 << 20);
-    let session = Pop3Session::new(env.ctx(), TestConn { io: server, tls })
-        .with_audit(Arc::new(env.audit.clone()), Some(CLIENT_IP));
+    let session = Pop3Session::new(env.ctx(), TestConn { io: server, tls });
     let task = tokio::spawn(session.run());
     let mut c = Client {
         io: tokio::io::BufReader::new(client),

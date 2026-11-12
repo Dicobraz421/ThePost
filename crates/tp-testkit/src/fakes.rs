@@ -1686,6 +1686,7 @@ mod tests {
             enabled: true,
             attributes: Default::default(),
             org: Default::default(),
+            hidden_from_gal: false,
         }
     }
 
@@ -1756,8 +1757,10 @@ mod tests {
             .expect("none");
         assert!(none.changes.is_empty() && none.next == p3.next);
 
+        // Признаки учётной записи (вход, скрытие из GAL — CTR-58) доходят до потребителя без изменений.
         let mut a = dir_account("a");
         a.enabled = false;
+        a.hidden_from_gal = true;
         dir.upsert_account(t, a.clone());
         dir.remove_account(t, "c");
         let inc = dir

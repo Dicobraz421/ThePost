@@ -5,8 +5,10 @@
 //! реализация не обращается.
 
 pub mod abuse;
+mod account_state;
 pub mod accounts;
 pub mod acl;
+mod address_book;
 pub mod admin_tokens;
 pub mod app_passwords;
 pub mod audit_log;
@@ -329,10 +331,12 @@ impl PgMeta {
     /// - upsert по значению: `AbuseBlocks::block` (срок — `greatest`, действующая блокировка не
     ///   сокращается), `AccountStore::upsert` (поиск по имени входа, системные папки — `ensure_system`),
     ///   `AclStore::set_acl`, `set_send_delegation`, `GroupStore::put` (группа заменяется целиком),
-    ///   `Membership::heartbeat` (`upsert_node`), `set_policy`, `set_user_trash_purge`;
+    ///   `Membership::heartbeat` (`upsert_node`), `set_policy`, `set_user_trash_purge`, `ContactStore::put_contact`,
+    ///   `OrgStore::put_org_unit`, `set_org`, `DynamicGroupStore::put_dynamic` (замена целиком);
     /// - `set_*` по значению: `MailboxStore::set_subscribed` (повтор лишь добавляет запись `updated` в
     ///   журнал изменений), `AppPasswords::revoke` (`COALESCE` — время первого отзыва),
-    ///   `mark_blob_damaged` (`coalesce` — время первой пометки);
+    ///   `mark_blob_damaged` (`coalesce` — время первой пометки), `disable_account`, `restore_account` (срок
+    ///   хранения по значению);
     /// - удаление по ключу без возврата удалённого: `AbuseBlocks::unblock`, `Membership::leave`,
     ///   `DeliveryLog::purge` (секции суток), `purge_events` (число удалённых при повторе — только
     ///   оставшиеся).
@@ -340,7 +344,10 @@ impl PgMeta {
     /// Не повторяются: CAS по версии (`transport`, `put_manifest`) и номеру захвата (лизы, очередь) —
     /// повтор применённой записи отвечает `Conflict`; счётчики ссылок BLOB, UID и `ModSeq` писем,
     /// выдача идентификаторов внутри операции (`create`, `copy`), удаление с возвратом
-    /// удалённого (`take_held`, `GroupStore::remove`) — повтор вернул бы другое.
+    /// удалённого и удаление с ответом `NotFound` об отсутствии (`take_held`, `GroupStore::remove`,
+    /// `remove_contact`, `remove_org_unit`, `remove_dynamic`, `cancel_queued`), состояние списков отправителей
+    /// (`put_sender_list`), подключение и удаление отключённого ящика (`attach_account`, `remove_disabled`) —
+    /// повтор вернул бы другое.
     pub(crate) async fn rewrite<T, F, Fut>(&self, op: F) -> Result<T>
     where
         F: FnMut() -> Fut,

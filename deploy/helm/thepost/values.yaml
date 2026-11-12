@@ -201,9 +201,25 @@ config:
   service_http:
     listen: "0.0.0.0:8081"
     internal_networks: ["0.0.0.0/32"]
+  # Календари и контакты (роль dav: /dav/, /.well-known/caldav и carddav) — на слушателе jmap, один порт с JMAP;
+  # отдельный адрес — http.dav (и порт в ports, Service).
   http:
     jmap: { listen: "0.0.0.0:4443" }
     admin: { listen: "127.0.0.1:8443" }
+  # Роль maintenance: очистка по сроку (надгробия DAV, журналы автоответов и доставки, токены admin init);
+  # сроки хранения — meta. Проверку BLOB в кластере выполняет один под — держатель лизы verify.lease_name.
+  maintenance:
+    purge_interval: 1h
+    admin_token_retention: 30d
+    verify: { at: "03:00", interval: 24h }
+  meta:
+    dav: { tombstone_ttl: 90d }
+    sieve: { vacation_log_ttl: 90d }
+    delivery: { retention: 30d }
+  # Лимиты CalDAV и CardDAV; полный перечень — thepost config schema.
+  dav:
+    max_request_size: 1048576
+    max_object_size: 1048576
   imap:
     listeners:
       - listen: "0.0.0.0:1143"

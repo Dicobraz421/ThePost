@@ -129,6 +129,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "audit export",
         include_str!("../migrations/0028_audit_export.sql"),
     ),
+    (
+        29,
+        "address book",
+        include_str!("../migrations/0029_address_book.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

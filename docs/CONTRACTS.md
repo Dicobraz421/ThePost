@@ -299,6 +299,8 @@ CTR-35: `DirAccount::org: DirOrg { department (external_id подразделе�
 синхронизации до подтверждения: `hold_sync(tenant, removed, total, at) -> MassRemoval { removed, total, detected_at, approved }` (подтверждение
 сохраняется, если `removed` не выросло), `pending_sync`, `approve_sync` (нет — `NotFound`; Admin API), `clear_sync` (синхронизация после
 отключения). In-memory — `MemSyncGate`; набор `suite::sync_gate`.
+CTR-58 (решение 79): `DirAccount::hidden_from_gal: bool` (`#[serde(default)]`, как у групп и почтовых контактов) — запись не попадает
+в адресную книгу (GAL), вход и приём почты не меняются. Заполняет каталог (LDAP — AUTH-16), учитывает построение GAL (DAV-27).
 
 ## AddressBook
 SRS 4.5, 5.1, решение 2026-11-04-exchange-parity (CTR-35; код — `addressbook.rs`). Ids — `ContactId`, `OrgUnitId`. Состояние учётной записи
@@ -872,6 +874,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   по цепочке организация → домен → ящик, `Policy::DEFAULT_RCPTS_PER_HOUR` = 2000, `rcpts_per_hour_or_default()`; потребитель — SMTP
   (SMTP-43). Хранение — столбец `policies.rcpts_per_hour` (миграция 0026), Admin API — поле `rcpts_per_hour` политики уровня. Код,
   собирающий `Policy` перечислением всех полей, дополняется `rcpts_per_hour`.
+- 2026-11-12 — CTR-58 (волна contracts-40, решение 79): `DirAccount::hidden_from_gal` (`#[serde(default)]`) — учётная запись скрыта
+  из адресной книги без запрета входа. Код, собирающий `DirAccount` перечислением всех полей, дополняется `hidden_from_gal` (в репозитории —
+  `tp-auth` и тесты `tp-testkit`, `tp-dav`, `tp-smtp`: `false`); чтение признака из LDAP — AUTH-16, фильтр GAL — DAV-27.
 - 2026-11-12 — MS-19 (волна mailstore-12, класс B): `TrashStore::hidden_message(scope, id) -> Option<Message>` — метаданные скрытого
   письма для администратора без снятия скрытия (без реализации по умолчанию; `MemTrash`, `PgMeta`); набор `suite::trash_purge` проверяет
-  его. Потребитель — `tp_mailstore::Store::hidden_headers` (тема, отправитель, дата из `Message::meta.envelope`, без чтения BLOB).
+  его. Потребитель — Admin API: тема и отправитель скрытых писем на странице `trash/hidden` (из `Message::meta.envelope`, без чтения BLOB).

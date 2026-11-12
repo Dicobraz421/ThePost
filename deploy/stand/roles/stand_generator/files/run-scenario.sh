@@ -1,9 +1,10 @@
 #!/bin/bash
 # Сценарий нагрузки стенда SMB по модели APP-D Д.3 (сценарии — Д.6, критерии — Д.7): входящая почта (smtp-source → 25),
 # исходящая (swaks → 587 с AUTH; доля внутренним адресатам, остальные — внешние через smtp-sink генератора),
-# IMAP (imaptest: подключённые клиенты, чтение, флаги, поиск), JMAP (k6: push, поиск, флаги); на всё время нагрузки —
-# зонды Д.7 (probes.py, probe.js), до нагрузки — замер памяти простаивающих соединений, после — сверка принятых писем
-# и отчёт criteria.py (criteria.md, criteria.json).
+# IMAP (imaptest: подключённые клиенты, чтение, флаги, поиск), JMAP (k6: push, поиск, флаги), календари и контакты
+# (k6 dav.js: CalDAV, приглашения, CardDAV); на всё время нагрузки — зонды Д.7 (probes.py, probe.js), до нагрузки —
+# проверка служб CalDAV, CardDAV и ManageSieve (services.json) и замер памяти простаивающих соединений, после — сверка
+# принятых писем и отчёт criteria.py (criteria.md, criteria.json).
 # Запуск: run-scenario.sh <base|peak|stress|x3|faults|long|bruteforce> [длительность, с] [множитель].
 #   stress     — ступени STRESS_FACTORS по STRESS_STEP с до первого нарушения Д.7 (criteria.py --check);
 #   faults     — отказы вносит stand.yml (kill -9 узла, перезапуск PostgreSQL) и пишет их в events.txt;
@@ -108,7 +109,9 @@ load() {
   vus=$(push_vus "$f")
   echo "start=$(date +%s) factor=$f duration=${dur}s inbound_per_sec=$(rate "$INBOUND_PER_DAY" "$f")" \
     "outbound_per_sec=$(rate "$OUTBOUND_PER_DAY" "$f") search_per_min=$(per_min "$SEARCHES_PER_DAY" "$f")" \
-    "flags_per_min=$(per_min "$FLAG_CHANGES_PER_DAY" "$f") imap_clients=$clients push_connections=$vus" >"$dir/load.txt"
+    "flags_per_min=$(per_min "$FLAG_CHANGES_PER_DAY" "$f") imap_clients=$clients push_connections=$vus" \
+    "calendar_per_min=$(per_min "$CALENDAR_OPS_PER_DAY" "$f") contacts_per_min=$(per_min "$CONTACT_OPS_PER_DAY" "$f")" \
+    >"$dir/load.txt"
   : >"$dir/smtp-in.log"
   : >"$dir/submission.log"
   limit=$((dur + 600))
@@ -133,6 +136,12 @@ load() {
     WORDS_FILE=$CORPUS/words.txt timeout "$limit" k6 run --quiet --summary-export "$dir/k6-summary.json" \
     "$STAND_DIR/jmap.js" >"$dir/k6.log" 2>&1 &
   jobs[k6]=$!
+  # Календарные операции без приглашений (Д.3: 15 в сутки, из них 3 приглашения) и приглашения — отдельно.
+  SMB_HOST=$SMB_HOST DOMAIN=$DOMAIN USERS=$USERS USER_PREFIX=$USER_PREFIX ACCOUNTS=$ACCOUNTS DURATION=$dur \
+    CALENDAR_PER_MIN=$(per_min "$((CALENDAR_OPS_PER_DAY - INVITATIONS_PER_DAY))" "$f") \
+    INVITES_PER_MIN=$(per_min "$INVITATIONS_PER_DAY" "$f") CONTACTS_PER_MIN=$(per_min "$CONTACT_OPS_PER_DAY" "$f") \
+    timeout "$limit" k6 run --quiet --summary-export "$dir/dav-summary.json" "$STAND_DIR/dav.js" >"$dir/dav.log" 2>&1 &
+  jobs[dav]=$!
   : >"$dir/exit-codes.txt"
   for name in "${!jobs[@]}"; do
     code=0
@@ -144,7 +153,7 @@ load() {
 }
 
 PROBE_ARGS=(--accounts "$ACCOUNTS" --host "$SMB_HOST" --domain "$DOMAIN" --prefix "$USER_PREFIX" --users "$USERS"
-  --big "$BIG_MAILBOX" --ca "$CA_FILE")
+  --big "$BIG_MAILBOX" --ca "$CA_FILE" --sieve-port "$MANAGESIEVE_PORT")
 K6_ENV=(SMB_HOST="$SMB_HOST" DOMAIN="$DOMAIN" USERS="$USERS" USER_PREFIX="$USER_PREFIX" ACCOUNTS="$ACCOUNTS"
   WORDS_FILE="$CORPUS/words.txt" BIG="$BIG_MAILBOX" INTERVAL="$PROBE_INTERVAL")
 count_mail() { python3 "$STAND_DIR/probes.py" count "${PROBE_ARGS[@]}" --exclude "$BRUTE_ACCOUNT" --out-json "$1"; }
@@ -165,6 +174,11 @@ if ! curl -sS --max-time 30 --user "$(user 1):${PASS[$(user 1)]}" "imaps://$SMB_
   exit 3
 fi
 : >"$OUT/events.txt"
+
+# Службы календарей, контактов и правил (DEP-21): /.well-known → /dav/, дома 207, ManageSieve — CAPABILITY и вход.
+# Отказ — строка отчёта «не прошёл», прогон продолжается.
+python3 "$STAND_DIR/probes.py" services "${PROBE_ARGS[@]}" --out-json "$OUT/services.json" >"$OUT/services.log" 2>&1 ||
+  echo "services: код $?" >>"$OUT/services.log"
 
 # Память простаивающих соединений (Д.7): N IMAP IDLE, затем N JMAP push; RSS узла — срезы smb-sampler.py.
 if [ "$IDLE_CONNECTIONS" -gt 0 ]; then

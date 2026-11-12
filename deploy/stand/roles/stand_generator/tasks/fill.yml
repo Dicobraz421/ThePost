@@ -1,4 +1,4 @@
-# Наполнение ящиков до прогона (DEP-12, Д.3): fill.py на генераторе; выполненный объём — {{ stand_dir }}/fill-state.json,
+# Наполнение до прогона (DEP-12, Д.3; DEP-21): ящики — fill.py, календари и адресные книги — fill-dav.py на генераторе;
 # повтор досылает только недостающее. Полный объём SMB (1 000 × 1 500) — часы: ожидание до 48 ч.
 ---
 - name: Fill mailboxes (D.3)
@@ -29,3 +29,31 @@
 - name: Show fill result
   ansible.builtin.debug:
     msg: "{{ stand_fill.stdout_lines }}"
+
+# Календари и адресные книги (DEP-21): fill-dav.py, выполненное — {{ stand_dir }}/fill-dav-state.json.
+- name: Fill calendars and address books
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ stand_dir }}/fill-dav.py"
+      - --accounts={{ stand_etc_dir }}/accounts
+      - --host={{ stand_smb_hostname }}
+      - --ca={{ (stand_etc_dir ~ '/ca.pem') if hostvars[stand_smb_host].thepost_tls_mode | default('certbot') == 'internal' else '' }}
+      - --users={{ stand_users }}
+      - --prefix={{ stand_user_prefix }}
+      - --domain={{ stand_domain }}
+      - --events={{ stand_fill_events }}
+      - --recurring={{ stand_fill_recurring }}
+      - --contacts={{ stand_fill_contacts }}
+      - --parallel={{ stand_fill_parallel }}
+      - --rate={{ stand_fill_rate }}
+      - --state={{ stand_dir }}/fill-dav-state.json
+      - --verify={{ stand_fill_verify }}
+  register: stand_fill_dav
+  changed_when: "'planned=0 ' not in stand_fill_dav.stdout"
+  async: 172800
+  poll: 30
+
+- name: Show calendar and address book fill result
+  ansible.builtin.debug:
+    msg: "{{ stand_fill_dav.stdout_lines }}"
