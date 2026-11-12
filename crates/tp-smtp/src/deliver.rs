@@ -32,6 +32,9 @@
 //! - приём iMIP ([`Delivery::with_itip`], [`crate::itip`], SMTP-33): письмо smtp-in с частью `text/calendar;
 //!   method=…` после доставки в ящик передаётся `ItipDelivery` получателя; письмо остаётся в ящике, отказ и сбой
 //!   iTIP — только запись в журнал.
+//! - решения модератора (`tp_contracts::groups::Moderation`, CTR-31, CTR-43; FIX-01, `moderation`): одобренное письмо
+//!   очереди модерации — участникам группы или исходным получателям правила потока без повторной модерации, отказ —
+//!   уведомление отправителю (RFC 3464) с причиной модератора.
 //!
 //! Отправка вне сессии SMTP (JMAP `EmailSubmission/set`) — [`Delivery::submit`] и `impl Outbound for Delivery`
 //! (CMP-04, контракт `tp_contracts::queue::Outbound`, CTR-28): локальные получатели доставляются сразу тем же
@@ -2319,7 +2322,7 @@ fn placeholder_blob(tenant: TenantId) -> BlobRef {
 }
 
 /// Объект BLOB целиком.
-async fn read_blob(blobs: &dyn BlobStore, key: &tp_contracts::BlobKey) -> Result<Bytes> {
+pub(crate) async fn read_blob(blobs: &dyn BlobStore, key: &tp_contracts::BlobKey) -> Result<Bytes> {
     use futures::TryStreamExt;
     let chunks: Vec<Bytes> = blobs.get(key, None).await?.try_collect().await?;
     Ok(chunks.concat().into())
@@ -2347,6 +2350,8 @@ fn clean(s: &str) -> String {
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+mod moderation;
 
 #[cfg(test)]
 mod tests;

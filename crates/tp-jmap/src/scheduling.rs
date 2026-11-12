@@ -48,17 +48,13 @@ pub(crate) fn addresses(ctx: &Ctx<'_>) -> Vec<String> {
     }
 }
 
-/// Индекс объекта календаря для записи в момент `now`: интервал, занятость до горизонта хранилища
-/// (`DavLimits::busy_horizon`), `Schedule-Tag` — как при записи CalDAV.
+/// Индекс объекта календаря для записи: интервал, занятость (у повторяющегося события — признак
+/// `ObjectIndex::recurring`, META-54), `Schedule-Tag` — как при записи CalDAV.
 pub(crate) fn object_index(
     ical: &ICalendar,
     opts: &IndexOptions,
-    busy_horizon: std::time::Duration,
-    now: OffsetDateTime,
 ) -> Result<ObjectIndex, tp_dav::index::IndexError> {
     let mut idx = tp_dav::index::of_calendar(ical, opts)?;
-    let horizon = time::Duration::try_from(busy_horizon).unwrap_or(time::Duration::MAX);
-    tp_dav::index::clip_busy(&mut idx, now.checked_add(horizon).unwrap_or(now));
     idx.schedule_tag = itip::schedule_tag(ical);
     Ok(idx)
 }
@@ -392,7 +388,6 @@ pub(crate) async fn notification_state(
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
-    use time::OffsetDateTime;
     use tp_contracts::auth::Principal;
     use tp_contracts::dav::{CollectionKind, DavObject, DavStore};
     use tp_contracts::meta::AccountScope;
@@ -666,13 +661,8 @@ mod tests {
         assert_eq!(plain.index.schedule_tag, None);
         let weekly = stored(&env, env.scope, "meet-1").await.expect("встреча");
         assert!(weekly.index.schedule_tag.is_some());
-        let horizon = time::Duration::try_from(env.dav.limits().busy_horizon).expect("horizon");
-        let until = OffsetDateTime::now_utc() + horizon;
-        assert!(!weekly.index.busy.is_empty());
-        assert!(
-            weekly.index.busy.iter().all(|p| p.start < until),
-            "занятость за горизонтом"
-        );
+        // Повторы в индекс занятости не пишутся: их разворачивает хранилище при запросе (META-54).
+        assert!(weekly.index.recurring && weekly.index.busy.is_empty());
     }
 
     #[tokio::test]

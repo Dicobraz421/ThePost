@@ -18,7 +18,8 @@
 | Требование | Проверка | При нарушении | Источник |
 |---|---|---|---|
 | Linux x86_64 или AArch64 | `uname -m` | бинарного файла под другую платформу нет | [README](../README.md#установка) |
-| Эталон Ansible — Debian 12 или Ubuntu 24.04 (семейство Debian) | `cat /etc/os-release` | плейбук `smb.yml` останавливается на проверке платформы | [`smb.yml`](../deploy/ansible/smb.yml), [INSTALL](INSTALL.md#рабочий-сервер-ansible) |
+| glibc 2.18 и новее (выпуск собирается `cross` в образе с glibc 2.23; по версиям символов `beta-20261111.3` x86_64 и AArch64 — не выше `GLIBC_2.18`) | `ldd --version` | бинарный файл не запустится: `version 'GLIBC_2.xx' not found` | [`beta.yml`](../.github/workflows/beta.yml), [решение 51](decisions/2026-11-11-stage2-followups.md) |
+| Эталон Ansible: apt — Debian 13 (основа) и 12, Ubuntu 26.04 и 24.04, Astra Linux SE 1.8; dnf — РЕД ОС 8, AlmaLinux 10 и 9 (совместимость с RHEL 9 и 10, сам RHEL не проверяется) | `cat /etc/os-release` | плейбук `smb.yml` останавливается на проверке платформы (менеджер пакетов не apt и не dnf) | [`smb.yml`](../deploy/ansible/smb.yml), [INSTALL](INSTALL.md#рабочий-сервер-ansible), решения 28, 51, 52, [DEP-24](manual-tests/DEP-24.md), [DEP-19](manual-tests/DEP-19.md), [DEP-20](manual-tests/DEP-20.md) |
 | systemd с `systemd-sysusers` и `LoadCredential=` (юнит, sysusers, учётные данные) | `systemd-analyze verify /etc/systemd/system/thepost.service` | юнит не загрузится; без `LoadCredential=` узел не получит `secret_id` OpenBao | [`thepost.service`](../deploy/systemd/thepost.service) |
 | Ядро с seccomp | `privileges.seccomp`: `OK enforce` | `FAIL`: запуск с `confine.seccomp` не выполнится | [`privileges.rs`](../crates/tp-platform/src/privileges.rs) |
 | Секция `confine` в `config.yaml` задана явно (`seccomp: enforce`) | `privileges.seccomp` | `WARN log`: без секции вызовы вне профиля только пишутся в журнал, не блокируются | [`doctor.rs`](../crates/thepost/src/doctor.rs) |
@@ -218,8 +219,23 @@ PostgreSQL) продукт отдельно не копирует ([S5 п. 5.3](
 
 ## Известные тонкости
 
-- **Debian 12: PostgreSQL 16 только из PGDG** — в дистрибутиве 15; роль ставит пакеты `apt.postgresql.org`
+- **PostgreSQL 16 — из PGDG** (Debian 12 и Astra Linux SE 1.8 — 15, Debian 13 — 17, Ubuntu 26.04 — 18): роль ставит
+  пакеты `apt.postgresql.org` или `download.postgresql.org` (AlmaLinux); РЕД ОС 8 — `postgresql16-server` дистрибутива
   ([роль `postgresql`](../deploy/ansible/roles/postgresql/defaults/main.yml)).
+- **Astra Linux SE 1.8**: репозитории Astra закреплены (приоритет 900) — роль даёт PGDG приоритет 901
+  (`/etc/apt/preferences.d/thepost-pgdg.pref`); restic, certbot и ClamAV в репозиториях нет — копия каталога писем
+  rsync, сертификат — `thepost_tls_mode: acme` или `files`, `thepost_clamav: false`. ЗПС (замкнутая программная
+  среда) не запустит неподписанные `thepost`, OpenBao и PGDG — эталон рассчитан на выключенную ЗПС; работа с PARSEC
+  (МРД, МКЦ) и Landlock — проверить на ВМ ([DEP-19](manual-tests/DEP-19.md)).
+- **РЕД ОС 8**: Rspamd, pgBackRest и restic — из репозиториев дистрибутива, ClamAV нет; Python 3.11 дистрибутива не
+  проверяет TLS в `get_url` Ansible («ASN1: NOT_ENOUGH_DATA») — пакет OpenBao роль загружает через `uri`; для
+  `thepost_binary_url` — то же ограничение, ставьте бинарный файл с управляющей машины (`thepost_binary_src`)
+  ([DEP-20](manual-tests/DEP-20.md)).
+- **AlmaLinux и RHEL**: Rspamd (`rspamd.com`), restic и certbot требуют EPEL — на AlmaLinux роль ставит
+  `epel-release`, на RHEL EPEL подключает администратор. AlmaLinux 10 и RHEL 10 — процессор x86-64-v3 (сборки PGDG и
+  `rspamd.com` для EL10). Включённый firewalld — роль `thepost` открывает порты клиентских протоколов; SELinux — роль
+  `pgbackrest` выставляет типы каталогам pgBackRest; работа под `enforcing` — проверить на ВМ
+  ([DEP-20](manual-tests/DEP-20.md)).
 - **`postgres` и `pg_autoctl` запускаются юнитом напрямую**, без `pg_ctlcluster` на Perl (SRS 7.1, без
   интерпретаторов в работе) ([deploy/README](../deploy/README.md#эталон-smb-одной-командой-ansible)).
 - **Сокеты systemd пока не принимаются** (TODO(PLT-16)): `thepost_socket_activation: true` — узел не займёт порты;
@@ -239,8 +255,9 @@ PostgreSQL) продукт отдельно не копирует ([S5 п. 5.3](
 
 Решены (`docs/decisions/2026-11-11-stage2-followups.md`): синхронизация времени — chrony в эталоне (п. 25, DEP-17);
 часовой пояс PostgreSQL — UTC в эталоне (п. 24, DEP-17); кодировка базы — UTF8 и `C.UTF-8` (п. 23, DEP-16, APP-24);
-Ubuntu 24.04 и Landlock — `/run/systemd/resolve` в `confine.system_read` (п. 26, SYS-12); ОС — основа Debian 12,
-первыми Astra Linux SE 1.8 и РЕД ОС 8, Ubuntu 24.04 как есть (п. 28, DEP-19, DEP-20); clamav-milter — 2 GB (п. 30);
+Ubuntu 24.04 и Landlock — `/run/systemd/resolve` в `confine.system_read` (п. 26, SYS-12); ОС — основа Debian 13,
+Debian 12, Ubuntu 26.04 и 24.04, Astra Linux SE 1.8, РЕД ОС 8, AlmaLinux 10 и 9 (п. 28, 51, 52; DEP-19, DEP-20,
+DEP-24); clamav-milter — 2 GB (п. 30);
 срок внутренних сертификатов — проверка в `doctor` и перевыпуск плейбуком (п. 27, APP-25, DEP-18).
 
 1. **Rspamd**: минимальная версия — не определена (Compose — 3.11.1, Ansible — текущий пакет `rspamd.com`).

@@ -10,6 +10,7 @@ pub mod acl;
 pub mod admin_tokens;
 pub mod app_passwords;
 pub mod blob_index;
+mod busy;
 pub mod changelog;
 pub mod commits;
 pub mod credentials;

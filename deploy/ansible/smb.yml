@@ -1,5 +1,7 @@
 # Эталонная установка SMB одной командой (SRS 1.2, 5.6): PostgreSQL, OpenBao, Rspamd (clamav-milter — по желанию)
-# и thepost (все роли) на одной ВМ Debian 12 / Ubuntu 24.04; резервное копирование — thepost_backup (по умолчанию да).
+# и thepost (все роли) на одной ВМ; резервное копирование — thepost_backup (по умолчанию да). ОС (решения 2026-11-11
+# №28, 51, 52): Debian 13 и 12, Ubuntu 26.04 и 24.04, Astra Linux SE 1.8 (apt); РЕД ОС 8, AlmaLinux 10 и 9 (dnf;
+# совместимость с RHEL 9 и 10).
 #   ansible-galaxy collection install -r deploy/ansible/requirements.yml
 #   ansible-playbook -i <инвентарь> deploy/ansible/smb.yml
 # Пример инвентаря — deploy/ansible/inventory.example.yml (группа smb); переменные — defaults ролей.
@@ -20,8 +22,10 @@
   pre_tasks:
     - name: Check platform
       ansible.builtin.assert:
-        that: ansible_os_family == 'Debian'
-        fail_msg: "Эталон SMB — Debian 12 или Ubuntu 24.04"
+        that: ansible_pkg_mgr in ['apt', 'dnf', 'dnf5']
+        fail_msg: >-
+          Эталон SMB — Debian 13 и 12, Ubuntu 26.04 и 24.04, Astra Linux SE 1.8, РЕД ОС 8, AlmaLinux 10 и 9
+          (менеджер пакетов {{ ansible_pkg_mgr }} не поддерживается)
   roles:
     - chrony
     - thepost_pki

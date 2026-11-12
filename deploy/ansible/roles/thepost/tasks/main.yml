@@ -79,8 +79,8 @@
       # Ansible: deploy/ansible/roles/thepost — не править вручную.
       # Эталон SMB: PostgreSQL, OpenBao и фильтры Milter — на этой же ВМ.
       [Unit]
-      Wants=postgresql.service openbao.service rspamd.service{{ ' clamav-milter.service' if thepost_clamav else '' }}
-      After=postgresql.service openbao.service rspamd.service{{ ' clamav-milter.service' if thepost_clamav else '' }}
+      Wants={{ thepost_local_units | join(' ') }}
+      After={{ thepost_local_units | join(' ') }}
     owner: root
     group: root
     mode: "0644"
@@ -104,6 +104,31 @@
   when: thepost_socket_activation
   notify: Restart thepost
 
+# Растущая пауза перезапуска (RestartSteps, RestartMaxDelaySec) — systemd 254+; на старых — постоянные 30 с
+# (решение 85).
+- name: Check systemd version
+  ansible.builtin.command: systemctl --version
+  register: thepost_systemd_version
+  changed_when: false
+  check_mode: false
+
+- name: Constant restart delay on systemd < 254
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../systemd/thepost.service.d/restart-legacy.conf"
+    dest: /etc/systemd/system/thepost.service.d/restart-legacy.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: thepost_systemd_version.stdout_lines[0].split()[1] | int < 254
+  notify: Restart thepost
+
+- name: Growing restart delay on systemd 254+
+  ansible.builtin.file:
+    path: /etc/systemd/system/thepost.service.d/restart-legacy.conf
+    state: absent
+  when: thepost_systemd_version.stdout_lines[0].split()[1] | int >= 254
+  notify: Restart thepost
+
 - name: Create configuration directories
   ansible.builtin.file:
     path: "{{ item }}"
@@ -114,6 +139,22 @@
   loop:
     - /etc/thepost
     - /etc/thepost/tls
+
+# firewalld (РЕД ОС, AlmaLinux, RHEL; включён — открыть порты клиентских протоколов, certbot — и 80).
+- name: Check firewalld
+  ansible.builtin.command: systemctl is-active firewalld
+  register: thepost_firewalld
+  changed_when: false
+  failed_when: false
+
+- name: Open client ports in firewalld
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ thepost_firewall_ports + ([80] if thepost_tls_mode == 'certbot' else []) }}"
+  when: thepost_firewalld.stdout == 'active'
 
 - name: Certificate of client protocols
   ansible.builtin.include_tasks: "tls-{{ thepost_tls_mode }}.yml"

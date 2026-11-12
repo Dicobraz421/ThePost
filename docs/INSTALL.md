@@ -5,7 +5,8 @@
 
 ## Что понадобится
 
-- **Linux** x86_64 или AArch64. Для рабочего сервера — Debian 12 или Ubuntu 24.04, от 4 vCPU и 8 ГБ памяти
+- **Linux** x86_64 или AArch64 с glibc 2.18 и новее. Для рабочего сервера — Debian 13 (основа) или 12, Ubuntu 26.04
+  или 24.04, Astra Linux SE 1.8, РЕД ОС 8, AlmaLinux 10 или 9 (совместимость с RHEL 9 и 10), от 4 vCPU и 8 ГБ памяти
   (целевой размер для 1 000 пользователей), диск — под письма.
 - **Имя сервера** (например, `mail.example.ru`) и **почтовый домен** (`example.ru`), доступ к их DNS.
 - **Открытые порты**: 25 (приём почты), 465 и 587 (отправка), 993 и 143 (IMAP), 443 (JMAP, автонастройка),
@@ -41,7 +42,8 @@ docker compose -f deploy/compose/dev.yml --profile smb run --rm --no-deps thepos
 
 ## Рабочий сервер: Ansible
 
-Чистая ВМ Debian 12 или Ubuntu 24.04 → PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamAV) и `thepost`
+Чистая ВМ (Debian 13 или 12, Ubuntu 26.04 или 24.04, Astra Linux SE 1.8, РЕД ОС 8, AlmaLinux 10 или 9) →
+PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamAV) и `thepost`
 под systemd, одной командой с управляющей машины. Повторный запуск ничего не ломает — им же применяются изменения.
 
 1. Скачайте выпуск и распакуйте бинарный файл:

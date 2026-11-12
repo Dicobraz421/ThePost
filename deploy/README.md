@@ -135,8 +135,13 @@ curl --cacert $CA -si https://localhost/.well-known/jmap | head -1              
 через 587 с AUTH, получение через IMAP или JMAP — шаги в `docs/manual-tests/CMP-01.md` (после CMP-04, CMP-05).
 
 ## Эталон SMB одной командой (Ansible)
-Чистая ВМ Debian 12 или Ubuntu 24.04 → PostgreSQL 16 (PGDG), OpenBao, Rspamd (clamav-milter — `thepost_clamav: true`)
-и `thepost` (все роли) под systemd (SRS 1.2, 5.6):
+Чистая ВМ → PostgreSQL 16 (PGDG), OpenBao, Rspamd (clamav-milter — `thepost_clamav: true`) и `thepost` (все роли) под
+systemd (SRS 1.2, 5.6). ОС (решения 2026-11-11 №28, 51, 52; семейство — по менеджеру пакетов):
+- apt — Debian 13 (основа) и 12, Ubuntu 26.04 и 24.04, Astra Linux SE 1.8 (наборы PGDG и Rspamd — `bookworm`);
+- dnf — AlmaLinux 10 и 9 (совместимость с RHEL 9 и 10): PGDG yum, Rspamd `rspamd.com/rpm-stable`, restic и certbot —
+  EPEL (на самом RHEL EPEL подключает администратор); РЕД ОС 8 — PostgreSQL, Rspamd, pgBackRest и restic из
+  репозиториев дистрибутива, ClamAV в них нет. Включённый firewalld — роль `thepost` открывает порты клиентских
+  протоколов (certbot — и 80); SELinux — контексты каталогов pgBackRest (роль `pgbackrest`, `tasks/selinux.yml`).
 ```bash
 cargo build --release                                   # или thepost_binary_url + thepost_binary_checksum
 ansible-galaxy collection install -r deploy/ansible/requirements.yml
@@ -195,6 +200,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submis
 # …или без активации сокетов — CAP_NET_BIND_SERVICE (сокеты не включать):
 #   sudo install -D -m 0644 deploy/systemd/thepost.service.d/bind-capability.conf \
 #     /etc/systemd/system/thepost.service.d/bind-capability.conf && sudo systemctl daemon-reload
+# systemd < 254 (`systemctl --version`; Debian 12, AlmaLinux 9, РЕД ОС 8) — постоянная пауза перезапуска 30 с:
+#   sudo install -D -m 0644 deploy/systemd/thepost.service.d/restart-legacy.conf \
+#     /etc/systemd/system/thepost.service.d/restart-legacy.conf && sudo systemctl daemon-reload
 sudo systemctl enable --now thepost
 systemd-analyze security thepost.service   # не хуже 2.0 (с сокетами — 1.2, с bind-capability.conf — 1.6)
 ```
@@ -206,6 +214,10 @@ Hardening юнита: пустой `CapabilityBoundingSet=`, `NoNewPrivileges`, 
 `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`,
 `SystemCallFilter=@system-service` без привилегированных вызовов (свои профили seccomp и Landlock процесс
 накладывает сам — секция `confine`).
+Перезапуск после сбоя (решение 85): без предела числа попыток (`StartLimitIntervalSec=0`), пауза растёт с 10 с до
+5 мин (`RestartSteps=6`, `RestartMaxDelaySec=5min`, systemd 254+; на старых — постоянные 30 с, `restart-legacy.conf`).
+После длинной серии сбоев узел вернётся не позже чем через 5 минут после устранения причины; сразу —
+`systemctl restart thepost`.
 
 Данные — `/var/lib/thepost` (создаёт systemd). BLOB-каталог вне него — `systemctl edit thepost`:
 `[Service]` + `ReadWritePaths=/srv/thepost-blob`. Проверка окружения — `thepost doctor` (SRS 5.5); привилегии
