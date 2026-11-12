@@ -4,9 +4,12 @@
 # IMAP (imaptest: подключённые клиенты, чтение, флаги, поиск), JMAP (k6: push, поиск, флаги); на всё время нагрузки —
 # зонды Д.7 (probes.py, probe.js), до нагрузки — замер памяти простаивающих соединений, после — сверка принятых писем
 # и отчёт criteria.py (criteria.md, criteria.json).
-# Запуск: run-scenario.sh <base|peak|stress|x3|faults|long> [длительность, с] [множитель].
-#   stress — ступени STRESS_FACTORS по STRESS_STEP с до первого нарушения Д.7 (criteria.py --check);
-#   faults — отказы вносит stand.yml (kill -9 узла, перезапуск PostgreSQL) и пишет их в events.txt.
+# Запуск: run-scenario.sh <base|peak|stress|x3|faults|long|bruteforce> [длительность, с] [множитель].
+#   stress     — ступени STRESS_FACTORS по STRESS_STEP с до первого нарушения Д.7 (criteria.py --check);
+#   faults     — отказы вносит stand.yml (kill -9 узла, перезапуск PostgreSQL) и пишет их в events.txt;
+#   bruteforce — нагрузка с адреса генератора и перебор паролей со второго адреса BRUTE_SOURCE (probes.py brute).
+# Профиль порогов узла (STAND_PROFILE: speed или thresholds) накладывает stand.yml до запуска; по нему судит
+# criteria.py.
 # Подключённые клиенты (imaptest, push) — тоже × множитель.
 # Параметры — /etc/thepost-stand/stand.env, пароли — $ACCOUNTS (login:пароль). Отчёт — $STAND_DIR/reports/<RUN_ID>-…/.
 # WAIT_SMB=1 (stand.yml): после нагрузки — load.done и ожидание smb.done (срезы узла smb-samples.csv в каталоге).
@@ -22,7 +25,7 @@ var="SCENARIO_${SCENARIO^^}"
 read -r FACTOR DURATION <<<"${!var}"
 DURATION=${2:-$DURATION}
 FACTOR=${3:-$FACTOR}
-RUN=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}-$SCENARIO
+RUN=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$STAND_PROFILE}-$SCENARIO
 OUT=$STAND_DIR/reports/$RUN
 CORPUS=$STAND_DIR/corpus
 mkdir -p "$OUT"
@@ -144,7 +147,7 @@ PROBE_ARGS=(--accounts "$ACCOUNTS" --host "$SMB_HOST" --domain "$DOMAIN" --prefi
   --big "$BIG_MAILBOX" --ca "$CA_FILE")
 K6_ENV=(SMB_HOST="$SMB_HOST" DOMAIN="$DOMAIN" USERS="$USERS" USER_PREFIX="$USER_PREFIX" ACCOUNTS="$ACCOUNTS"
   WORDS_FILE="$CORPUS/words.txt" BIG="$BIG_MAILBOX" INTERVAL="$PROBE_INTERVAL")
-count_mail() { python3 "$STAND_DIR/probes.py" count "${PROBE_ARGS[@]}" --out-json "$1"; }
+count_mail() { python3 "$STAND_DIR/probes.py" count "${PROBE_ARGS[@]}" --exclude "$BRUTE_ACCOUNT" --out-json "$1"; }
 sink() { find "$STAND_DIR/sink" -type f | wc -l; }
 
 cat >"$OUT/params.txt" <<EOF
@@ -152,6 +155,8 @@ run=$RUN scenario=$SCENARIO factor=$FACTOR duration=${DURATION}s users=$USERS ho
 imap_clients=$(imap_clients "$FACTOR") push_connections=$(push_vus "$FACTOR") corpus_messages=${#MSGS[@]}
 probe_interval=$PROBE_INTERVAL idle_connections=$IDLE_CONNECTIONS idle_hold=$IDLE_HOLD long_window=$LONG_WINDOW
 stress_factors=${STRESS_FACTORS// /,} stress_step=$STRESS_STEP db_pool=$DB_POOL
+profile=$STAND_PROFILE bus_kind=${BUS_KIND:-} brute_source=${BRUTE_SOURCE:-} abuse_ip_failures=$ABUSE_IP_FAILURES
+abuse_account_failures=$ABUSE_ACCOUNT_FAILURES
 EOF
 
 # Учётные записи заведены: вход IMAP первой из них.
@@ -204,7 +209,25 @@ if [ "$SCENARIO" = stress ]; then
     fi
   done
 else
+  BRUTE=
+  if [ "$SCENARIO" = bruteforce ]; then
+    if [ -n "$BRUTE_SOURCE" ]; then
+      # Перебор — через 10 с после начала нагрузки, параллельно с ней.
+      (
+        sleep 10
+        event brute_start
+        python3 "$STAND_DIR/probes.py" brute "${PROBE_ARGS[@]}" --source "$BRUTE_SOURCE" --target "$BRUTE_ACCOUNT" \
+          --check "$(user 1)" --ip-failures "$ABUSE_IP_FAILURES" --account-failures "$ABUSE_ACCOUNT_FAILURES" \
+          --out-json "$OUT/brute.json" >"$OUT/brute.log" 2>&1 || echo "probes.py brute: код $?" >>"$OUT/brute.log"
+        event brute_end
+      ) &
+      BRUTE=$!
+    else
+      echo "второй адрес не задан: -e stand_bruteforce_source=<адрес генератора>" >"$OUT/brute.log"
+    fi
+  fi
   load "$FACTOR" "$DURATION" "$OUT"
+  if [ -n "$BRUTE" ]; then wait "$BRUTE" || true; fi
 fi
 event load_end
 
