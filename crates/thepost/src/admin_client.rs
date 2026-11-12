@@ -27,7 +27,6 @@ use tp_admin::accounts::{AccountInfo, AccountQuery, NewAccount};
 use tp_admin::app_passwords::{AppPasswordInfo, IssuedAppPassword, NewAppPassword};
 use tp_admin::init::AdminSession;
 use tp_admin::server::{Problem, WhoAmI};
-use tp_admin::sieve::{Script, ScriptBody, ScriptProblem, ScriptText};
 use tp_admin::transport::{DomainBody, DomainList, DomainWritten, VersionQuery, Written};
 use tp_contracts::admin_token::is_local_admin_token;
 use tp_contracts::transport::{AcceptedDomain, DomainKind};
@@ -110,12 +109,6 @@ pub enum ApiAction {
         #[command(subcommand)]
         action: DomainAction,
     },
-    /// Правила Sieve учётной записи: просмотр, правка, включение и отключение за пользователя.
-    Sieve {
-        /// Действие.
-        #[command(subcommand)]
-        action: SieveAction,
-    },
 }
 
 /// Действия с учётными записями.
@@ -193,45 +186,6 @@ pub enum DomainAction {
     },
 }
 
-/// Действия с правилами Sieve учётной записи (решение 62, ADM-17); каждое изменение — в журнале аудита Admin API.
-#[derive(Debug, Clone, Subcommand)]
-pub enum SieveAction {
-    /// Скрипты учётной записи: имя, размер, какой активен.
-    List {
-        /// Учётная запись: идентификатор (UUID) или имя входа.
-        account: String,
-    },
-    /// Текст скрипта (в stdout — как записан).
-    Get {
-        /// Учётная запись: идентификатор (UUID) или имя входа.
-        account: String,
-        /// Имя скрипта (из `sieve list`).
-        name: String,
-    },
-    /// Создание или замена текста скрипта: текст проверяется, активность сохраняется.
-    Put {
-        /// Учётная запись: идентификатор (UUID) или имя входа.
-        account: String,
-        /// Имя скрипта.
-        name: String,
-        /// Файл с текстом скрипта (UTF-8); `-` — stdin.
-        #[arg(long, value_name = "ПУТЬ")]
-        file: PathBuf,
-    },
-    /// Включение скрипта: он выполняется при доставке, прежний активный отключается.
-    Activate {
-        /// Учётная запись: идентификатор (UUID) или имя входа.
-        account: String,
-        /// Имя скрипта (из `sieve list`).
-        name: String,
-    },
-    /// Отключение правил: активного скрипта нет, тексты остаются.
-    Deactivate {
-        /// Учётная запись: идентификатор (UUID) или имя входа.
-        account: String,
-    },
-}
-
 /// Операция Admin API: метод и шаблон пути, как в спецификации OpenAPI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Op {
@@ -296,31 +250,6 @@ pub const DOMAIN_REMOVE: Op = Op {
     method: "DELETE",
     path: "/api/v1/orgs/{org}/transport/domains/{id}",
 };
-/// Скрипты Sieve учётной записи.
-pub const SIEVE_LIST: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts",
-};
-/// Скрипт с текстом.
-pub const SIEVE_GET: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}",
-};
-/// Создание или замена текста скрипта.
-pub const SIEVE_PUT: Op = Op {
-    method: "PUT",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}",
-};
-/// Включение скрипта.
-pub const SIEVE_ACTIVATE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}/activate",
-};
-/// Отключение правил учётной записи.
-pub const SIEVE_DEACTIVATE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/deactivate",
-};
 
 /// Все операции клиента (сверка со спецификацией OpenAPI — тест).
 pub const OPERATIONS: &[Op] = &[
@@ -335,11 +264,6 @@ pub const OPERATIONS: &[Op] = &[
     DOMAIN_LIST,
     DOMAIN_ADD,
     DOMAIN_REMOVE,
-    SIEVE_LIST,
-    SIEVE_GET,
-    SIEVE_PUT,
-    SIEVE_ACTIVATE,
-    SIEVE_DEACTIVATE,
 ];
 
 /// Результат команды: текст для stdout или сообщение об ошибке.
@@ -549,14 +473,6 @@ fn problem(op: Op, status: StatusCode, body: &[u8]) -> String {
     let mut msg = format!("{} {}: {} {title}", op.method, op.path, status.as_u16());
     if let Some(detail) = p.as_ref().and_then(|p| p.detail.as_deref()) {
         msg.push_str(&format!(": {detail}"));
-    }
-    if let Ok(script) = serde_json::from_slice::<ScriptProblem>(body) {
-        for e in &script.errors {
-            msg.push_str(&format!(
-                "\n  строка {}, столбец {}: {}",
-                e.line, e.column, e.message
-            ));
-        }
     }
     if status == StatusCode::UNAUTHORIZED {
         msg.push_str(if op == SESSION {
@@ -850,90 +766,7 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                 }
             }
         }
-        ApiAction::Sieve { action } => {
-            let org = org(client, args).await?;
-            match action {
-                SieveAction::List { account } => {
-                    let id = account_id(client, &org, &account).await?;
-                    let list: Vec<Script> = client
-                        .call(SIEVE_LIST, &[org.as_str(), id.as_str()], &[], NO_BODY)
-                        .await?;
-                    let rows: Vec<Vec<String>> = list
-                        .iter()
-                        .map(|s| {
-                            let active = if s.active { "да" } else { "нет" };
-                            vec![s.name.clone(), s.size.to_string(), active.to_owned()]
-                        })
-                        .collect();
-                    out(args, &list, table(&["ИМЯ", "РАЗМЕР", "АКТИВЕН"], &rows))
-                }
-                SieveAction::Get { account, name } => {
-                    let id = account_id(client, &org, &account).await?;
-                    let script: ScriptBody = client
-                        .call(
-                            SIEVE_GET,
-                            &[org.as_str(), id.as_str(), name.as_str()],
-                            &[],
-                            NO_BODY,
-                        )
-                        .await?;
-                    let text = script.text.clone();
-                    out(args, &script, text)
-                }
-                SieveAction::Put {
-                    account,
-                    name,
-                    file,
-                } => {
-                    let body = ScriptText {
-                        text: script_text(file).await?,
-                    };
-                    let id = account_id(client, &org, &account).await?;
-                    client
-                        .call_empty(
-                            SIEVE_PUT,
-                            &[org.as_str(), id.as_str(), name.as_str()],
-                            &[],
-                            Some(&body),
-                        )
-                        .await?;
-                    out(args, &(), format!("Скрипт {name} записан.\n"))
-                }
-                SieveAction::Activate { account, name } => {
-                    let id = account_id(client, &org, &account).await?;
-                    client
-                        .call_empty(
-                            SIEVE_ACTIVATE,
-                            &[org.as_str(), id.as_str(), name.as_str()],
-                            &[],
-                            NO_BODY,
-                        )
-                        .await?;
-                    out(args, &(), format!("Скрипт {name} включён.\n"))
-                }
-                SieveAction::Deactivate { account } => {
-                    let id = account_id(client, &org, &account).await?;
-                    client
-                        .call_empty(SIEVE_DEACTIVATE, &[org.as_str(), id.as_str()], &[], NO_BODY)
-                        .await?;
-                    out(args, &(), "Правила отключены.\n".to_owned())
-                }
-            }
-        }
     }
-}
-
-/// Текст скрипта из файла `file` (`-` — stdin); чтение — вне потоков async.
-async fn script_text(file: PathBuf) -> CliResult<String> {
-    tokio::task::spawn_blocking(move || {
-        if file.as_os_str() == "-" {
-            std::io::read_to_string(std::io::stdin()).map_err(|e| format!("stdin: {e}"))
-        } else {
-            std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))
-        }
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 const ACCOUNT_COLUMNS: &[&str] = &["ИДЕНТИФИКАТОР", "ИМЯ ВХОДА", "ИМЯ", "ВХОД"];
@@ -1168,7 +1001,7 @@ mod tests {
     use tp_testkit::{
         Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
         MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemModeration, MemPolicies,
-        MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
+        MemQuota, MemTransport, MemTrash, SystemClock,
     };
 
     use super::*;
@@ -1255,13 +1088,6 @@ mod tests {
                 "id1",
             ],
             &["thepost", "admin", "domain", "list"],
-            &["thepost", "admin", "sieve", "list", "a@b.test"],
-            &["thepost", "admin", "sieve", "get", "a@b.test", "main"],
-            &[
-                "thepost", "admin", "sieve", "put", "a@b.test", "main", "--file", "-",
-            ],
-            &["thepost", "admin", "sieve", "activate", "a@b.test", "main"],
-            &["thepost", "admin", "sieve", "deactivate", "a@b.test"],
             &["thepost", "admin", "account", "list", "--login", "a@b.test"],
             &["thepost", "admin", "account", "list"],
             &[
@@ -1279,8 +1105,6 @@ mod tests {
                 "thepost", "admin", "account", "list", "--login", "a@b.test", "--limit", "1",
             ],
             &["thepost", "admin", "account", "list", "--limit", "0"],
-            &["thepost", "admin", "sieve", "put", "a@b.test", "main"],
-            &["thepost", "admin", "sieve", "activate", "a@b.test"],
         ] {
             assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
         }
@@ -1525,7 +1349,6 @@ mod tests {
             tp_admin::Admin::new(deps, cfg)
                 .expect("admin")
                 .with_transport(Arc::new(MemTransport::new()))
-                .with_sieve(Arc::new(MemSieve::new()), check_script)
                 .with_local_tokens(Arc::new(MemLocalAdminTokens::new())),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1536,20 +1359,6 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, router).await });
         let url = Url::parse(&format!("http://{addr}")).expect("url");
         (admin, url)
-    }
-
-    /// Проверка скрипта, как у узла: разбор tp-sieve.
-    fn check_script(text: &str) -> Vec<tp_admin::ScriptError> {
-        tp_sieve::check(text)
-            .err()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|d| tp_admin::ScriptError {
-                line: d.line,
-                column: d.column,
-                message: d.message,
-            })
-            .collect()
     }
 
     fn client(url: &Url, token: &str) -> Client {
@@ -1852,88 +1661,5 @@ mod tests {
         .await
         .expect("domains");
         assert!(!domains.contains("third.test"), "{domains}");
-    }
-
-    /// ADM-17 (решение 62): администратор из CLI записывает пользователю правило пересылки, включает, отключает;
-    /// неверный текст — отказ с позицией ошибки, в хранилище не попадает.
-    #[tokio::test]
-    async fn sieve_commands_against_admin_api() {
-        let (_admin, url) = admin_api().await;
-        let c = client(&url, "oidc");
-        let sieve = |action| ApiAction::Sieve { action };
-        let account = || "a@rules.test".to_owned();
-        let name = || "пересылка".to_owned();
-        for action in [
-            ApiAction::Domain {
-                action: DomainAction::Add {
-                    name: "rules.test".into(),
-                    relay: None,
-                },
-            },
-            ApiAction::Account {
-                action: AccountAction::Create {
-                    login: account(),
-                    name: None,
-                },
-            },
-        ] {
-            exec(&c, false, action).await.expect("подготовка");
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("rule.sieve");
-        let text = "redirect \"outside@example.net\";\n";
-        std::fs::write(&file, text).expect("write");
-        let put = |file: &Path| {
-            sieve(SieveAction::Put {
-                account: account(),
-                name: name(),
-                file: file.to_owned(),
-            })
-        };
-        let done = exec(&c, false, put(&file)).await.expect("put");
-        assert_eq!(done, "Скрипт пересылка записан.\n");
-        let on = sieve(SieveAction::Activate {
-            account: account(),
-            name: name(),
-        });
-        exec(&c, false, on).await.expect("activate");
-
-        let list = || sieve(SieveAction::List { account: account() });
-        let listed = exec(&c, false, list()).await.expect("list");
-        let row = listed.lines().nth(1).expect("строка");
-        assert!(row.contains("пересылка") && row.ends_with("да"), "{listed}");
-        let get = || {
-            sieve(SieveAction::Get {
-                account: account(),
-                name: name(),
-            })
-        };
-        assert_eq!(exec(&c, false, get()).await.as_deref(), Ok(text));
-
-        // Неверный текст: 422 с позицией, прежний текст на месте.
-        let bad = dir.path().join("bad.sieve");
-        std::fs::write(&bad, "keep;\nнеизвестно;\n").expect("write");
-        let err = exec(&c, false, put(&bad)).await.expect_err("422");
-        assert!(err.contains("422") && err.contains("строка 2"), "{err}");
-        let missing = dir.path().join("нет.sieve");
-        let err = exec(&c, false, put(&missing)).await.expect_err("нет файла");
-        assert!(err.contains("нет.sieve"), "{err}");
-        assert_eq!(exec(&c, false, get()).await.as_deref(), Ok(text));
-
-        // Отключение: скрипт остаётся, активного нет.
-        let off = sieve(SieveAction::Deactivate { account: account() });
-        let done = exec(&c, false, off).await.expect("deactivate");
-        assert_eq!(done, "Правила отключены.\n");
-        let json = exec(&c, true, list()).await.expect("list");
-        let v: Value = serde_json::from_str(&json).expect("json");
-        assert_eq!(v[0]["name"], "пересылка");
-        assert_eq!(v[0]["active"], false);
-        let on = sieve(SieveAction::Activate {
-            account: account(),
-            name: "другой".into(),
-        });
-        let err = exec(&c, false, on).await.expect_err("404");
-        assert!(err.contains("404"), "{err}");
     }
 }
