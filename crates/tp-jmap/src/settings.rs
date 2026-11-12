@@ -185,8 +185,8 @@ pub(crate) async fn set(
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tp_contracts::meta::PolicyTarget;
     use tp_contracts::retention::{TrashPurge, TrashPurgeRule};
-    use tp_testkit::PolicyLevel;
 
     use crate::testenv::Env;
 
@@ -211,7 +211,7 @@ mod tests {
             user_can_choose: allow,
         };
         env.policies
-            .set_trash_purge_rule(env.scope.tenant, PolicyLevel::Tenant, Some(rule));
+            .set_trash_purge_rule(env.scope.tenant, PolicyTarget::Tenant, Some(rule));
     }
 
     #[tokio::test]
