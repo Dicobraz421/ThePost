@@ -261,40 +261,40 @@
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
 | [CTR-34](CTR-34.md) | раздел журнала событий по шардам | contracts | B | contracts-22 | done | CTR-23 |
-| [META-30](META-30.md) | хранилища ящика через справочник шардов | meta | A | meta-13 | ready | META-29,META-27 |
-| [META-31](META-31.md) | журнал событий, очередь и учёт BLOB по шардам | meta | A | meta-13 | ready | META-30,CTR-34 |
-| [META-32](META-32.md) | чтение с реплик для фоновых задач | meta | A | meta-14 | todo | META-30 |
-| [BLOB-15](BLOB-15.md) | сборка мусора по учёту ссылок всех шардов | blob | A | blob-08 | todo | META-31,BLOB-14 |
+| [META-30](META-30.md) | хранилища ящика через справочник шардов | meta | A | meta-13 | done | META-29,META-27 |
+| [META-31](META-31.md) | журнал событий, очередь и учёт BLOB по шардам | meta | A | meta-13 | done | META-30,CTR-34 |
+| [META-32](META-32.md) | чтение с реплик для фоновых задач | meta | A | meta-14 | done | META-30 |
+| [BLOB-15](BLOB-15.md) | сборка мусора по учёту ссылок всех шардов | blob | A | blob-08 | ready | META-31,BLOB-14 |
 | [APP-11](APP-11.md) | CLI thepost admin | app | A | app-07 | done | ADM-01 |
-| [DEP-10](DEP-10.md) | HPA, VPA и эталон «малый Enterprise» | deploy | A | deploy-07 | ready | DEP-09 |
+| [DEP-10](DEP-10.md) | HPA, VPA и эталон «малый Enterprise» | deploy | A | deploy-07 | done | DEP-09 |
 
 ## Ф1 · Решение 2026-11-04: соответствие функциям Exchange — этап 3, кроме `jmap-14` (этап 2)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-35](CTR-35.md) | контракты: соответствие Exchange | contracts | B | contracts-23 | ready | CTR-34 |
-| [META-33](META-33.md) | хранение: списки, контакты, оргструктура, аудит, отключённые ящики | meta | A | meta-15 | todo | CTR-35,META-30 |
-| [AUTH-10](AUTH-10.md) | синхронизация каталога: контакты, оргструктура, отключение ящиков | auth | A | auth-05 | todo | CTR-35,AUTH-07 |
-| [MS-16](MS-16.md) | архив ящика | mailstore | A | mailstore-10 | todo | CTR-35,MS-14 |
-| [MS-17](MS-17.md) | хранение отключённых ящиков | mailstore | A | mailstore-10 | todo | CTR-35,MS-16 |
-| [SMTP-24](SMTP-24.md) | отложенная отправка и отмена | smtp | A | smtp-07 | todo | CTR-35,SMTP-14 |
-| [SMTP-25](SMTP-25.md) | личные списки отправителей при доставке | smtp | A | smtp-07 | todo | CTR-35,SMTP-16 |
-| [SMTP-26](SMTP-26.md) | раскрытие динамических групп и контактов | smtp | A | smtp-07 | todo | CTR-35,SMTP-16 |
-| [SMTP-27](SMTP-27.md) | профиль Milter для исходящей почты | smtp | A | smtp-07 | todo | SMTP-05 |
-| [JMAP-15](JMAP-15.md) | отложенная отправка в EmailSubmission | jmap | A | jmap-08 | todo | CTR-35,JMAP-07 |
-| [JMAP-16](JMAP-16.md) | статус доставки EmailSubmission | jmap | A | jmap-08 | todo | CTR-35,JMAP-07 |
-| [JMAP-17](JMAP-17.md) | расширения: списки отправителей и оргструктура | jmap | A | jmap-08 | todo | CTR-35,JMAP-01 |
-| [JMAP-18](JMAP-18.md) | аудит доступа к ящику в JMAP | jmap | A | jmap-08 | todo | CTR-35,JMAP-05 |
+| [CTR-35](CTR-35.md) | контракты: соответствие Exchange | contracts | B | contracts-23 | done | CTR-34 |
+| [META-33](META-33.md) | хранение: списки, контакты, оргструктура, аудит, отключённые ящики | meta | A | meta-15 | ready | CTR-35,META-30 |
+| [AUTH-10](AUTH-10.md) | синхронизация каталога: контакты, оргструктура, отключение ящиков | auth | A | auth-05 | ready | CTR-35,AUTH-07 |
+| [MS-16](MS-16.md) | архив ящика | mailstore | A | mailstore-10 | ready | CTR-35,MS-14 |
+| [MS-17](MS-17.md) | хранение отключённых ящиков | mailstore | A | mailstore-10 | ready | CTR-35,MS-16 |
+| [SMTP-24](SMTP-24.md) | отложенная отправка и отмена | smtp | A | smtp-07 | ready | CTR-35,SMTP-14 |
+| [SMTP-25](SMTP-25.md) | личные списки отправителей при доставке | smtp | A | smtp-07 | ready | CTR-35,SMTP-16 |
+| [SMTP-26](SMTP-26.md) | раскрытие динамических групп и контактов | smtp | A | smtp-07 | ready | CTR-35,SMTP-16 |
+| [SMTP-27](SMTP-27.md) | профиль Milter для исходящей почты | smtp | A | smtp-07 | ready | SMTP-05 |
+| [JMAP-15](JMAP-15.md) | отложенная отправка в EmailSubmission | jmap | A | jmap-08 | ready | CTR-35,JMAP-07 |
+| [JMAP-16](JMAP-16.md) | статус доставки EmailSubmission | jmap | A | jmap-08 | ready | CTR-35,JMAP-07 |
+| [JMAP-17](JMAP-17.md) | расширения: списки отправителей и оргструктура | jmap | A | jmap-08 | ready | CTR-35,JMAP-01 |
+| [JMAP-18](JMAP-18.md) | аудит доступа к ящику в JMAP | jmap | A | jmap-08 | ready | CTR-35,JMAP-05 |
 | [JMAP-14](JMAP-14.md) | автонастройка клиентов | jmap | A | jmap-14 | done | JMAP-01 |
-| [IMAP-15](IMAP-15.md) | аудит доступа к ящику в IMAP | imap | A | imap-06 | todo | CTR-35,IMAP-07 |
-| [ADM-10](ADM-10.md) | Admin API: контакты, группы, оргструктура, отключённые ящики, аудит | admin | A | admin-05 | todo | CTR-35,ADM-07 |
+| [IMAP-15](IMAP-15.md) | аудит доступа к ящику в IMAP | imap | A | imap-06 | ready | CTR-35,IMAP-07 |
+| [ADM-10](ADM-10.md) | Admin API: контакты, группы, оргструктура, отключённые ящики, аудит | admin | A | admin-05 | ready | CTR-35,ADM-07 |
 | [APP-12](APP-12.md) | сборка: соответствие Exchange и doctor автонастройки | app | A | app-08 | todo | META-33,AUTH-10,MS-17,SMTP-27,JMAP-18,IMAP-15,ADM-10 |
 
 ## Ф1 · Решение 2026-11-04: внешние встречи — API занятости и публикации — этап 3
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-36](CTR-36.md) | точка расширения источников занятости, публикации календарей | contracts | B | contracts-24 | todo | CTR-35 |
+| [CTR-36](CTR-36.md) | точка расширения источников занятости, публикации календарей | contracts | B | contracts-24 | ready | CTR-35 |
 | [META-34](META-34.md) | хранение публикаций календарей и шаблонов партнёров | meta | A | meta-16 | todo | CTR-36,META-33 |
 | [JMAP-19](JMAP-19.md) | расширение Availability/get | jmap | A | jmap-09 | todo | CTR-36,JMAP-14 |
 | [JMAP-20](JMAP-20.md) | расширение публикации календарей | jmap | A | jmap-09 | todo | CTR-36,JMAP-14 |
@@ -380,9 +380,9 @@
 | [SYS-11](SYS-11.md) | проба Landlock без `/sys/kernel/security` | sys | A | sys-06 | done | SYS-07 |
 | [PLT-21](PLT-21.md) | doctor — проба Landlock; подпись метрики отставания шины | platform | A | platform-11 | done | SYS-11,CLU-13 |
 | [APP-17](APP-17.md) | подключение журнала доставки, групп, обучения антиспама и защиты от перебора | app | A | app-16 | done | SMTP-16,SMTP-17,SMTP-18,AUTH-08,APP-16 |
-| [APP-18](APP-18.md) | подключение транспорта организации и Rpc узла | app | A | app-17 | ready | SMTP-29,CLU-12,APP-15 |
-| [META-41](META-41.md) | слушатель сигналов и миграции при списке адресов СУБД | meta | A | meta-25 | ready | META-38 |
-| [CLU-14](CLU-14.md) | Rpc — идентичность узла по SAN, HTTP/2 | cluster | A | cluster-09 | ready | CLU-12 |
+| [APP-18](APP-18.md) | подключение транспорта организации и Rpc узла | app | A | app-17 | done | SMTP-29,CLU-12,APP-15 |
+| [META-41](META-41.md) | слушатель сигналов и миграции при списке адресов СУБД | meta | A | meta-25 | done | META-38 |
+| [CLU-14](CLU-14.md) | Rpc — идентичность узла по SAN, HTTP/2 | cluster | A | cluster-09 | done | CLU-12 |
 | [META-27](META-27.md) | состав кластера с ролями и блокировки | meta | A | meta-20 | done | CTR-23,META-16 |
 
 ## Ф1 · Ответы владельца 2026-11-10 (#193, #195, #205, #253, #272)
@@ -393,7 +393,7 @@
 | [ADM-11](ADM-11.md) | `thepost admin init` — первый администратор | admin | A | admin-06 | done | CTR-41 |
 | [APP-19](APP-19.md) | команда `thepost admin init` и локальный сокет | app | A | app-18 | done | ADM-11 |
 | [META-43](META-43.md) | локальные токены Admin API в PostgreSQL, подключение `admin init` | meta | B | meta-27 | done | CTR-41,ADM-11,APP-19 |
-| [CTR-42](CTR-42.md) | хранилище отправок JMAP (отложенная отправка и отмена) | contracts | B | contracts-30 | ready | CTR-28 |
+| [CTR-42](CTR-42.md) | хранилище отправок JMAP (отложенная отправка и отмена) | contracts | B | contracts-30 | done | CTR-28 |
 | [META-42](META-42.md) | системные папки — только по роли, суффикс при совпадении имени | meta | A | meta-26 | done | CMP-05 |
 | [KIT-08](KIT-08.md) | фейк ящика — системные папки только по роли | testkit | A | testkit-05 | done | KIT-07 |
 | [AUTH-11](AUTH-11.md) | `auth.abuse.fail_closed` | auth | A | auth-06 | done | AUTH-08 |
@@ -416,114 +416,114 @@
 | [APP-22](APP-22.md) | CLI thepost admin без копий структур | app | A | app-21 | done | ADM-13,APP-21 |
 | [PLT-23](PLT-23.md) | текущая цепочка и ключ TLS для подписи | platform | A | platform-13 | done | PLT-22 |
 | [APP-23](APP-23.md) | подпись профиля .mobileconfig в узле | app | A | app-22 | done | PLT-23,JMAP-22 |
-| [DEP-12](DEP-12.md) | стенд SMB — учётные записи через thepost admin и наполнение по Д.3 | deploy | A | deploy-12 | ready | DEP-04,APP-21 |
-| [DEP-13](DEP-13.md) | стенд SMB — замеры и отчёт по критериям Д.7 | deploy | A | deploy-12 | ready | DEP-12 |
-| [DEP-14](DEP-14.md) | стенд SMB — стресс, ×3, отказы и длительный прогон | deploy | A | deploy-12 | ready | DEP-13 |
-| [DEP-15](DEP-15.md) | резервное копирование SMB — pgBackRest и копия каталога писем | deploy | A | deploy-13 | ready | DEP-05 |
-| [META-53](META-53.md) | метрика доли NOTIFY во времени фиксации primary | meta | A | meta-34 | todo | — |
+| [DEP-12](DEP-12.md) | стенд SMB — учётные записи через thepost admin и наполнение по Д.3 | deploy | A | deploy-12 | done | DEP-04,APP-21 |
+| [DEP-13](DEP-13.md) | стенд SMB — замеры и отчёт по критериям Д.7 | deploy | A | deploy-12 | done | DEP-12 |
+| [DEP-14](DEP-14.md) | стенд SMB — стресс, ×3, отказы и длительный прогон | deploy | A | deploy-12 | done | DEP-13 |
+| [DEP-15](DEP-15.md) | резервное копирование SMB — pgBackRest и копия каталога писем | deploy | A | deploy-13 | done | DEP-05 |
+| [META-53](META-53.md) | метрика доли NOTIFY во времени фиксации primary | meta | A | meta-34 | ready | — |
 | [BLOB-16](BLOB-16.md) | метрика «сирот» после цикла GC | blob | A | blob-09 | todo | — |
 | [PLT-25](PLT-25.md) | метрики пула СУБД и слушателя сигналов | platform | A | platform-15 | ready | — |
-| [APP-31](APP-31.md) | старт узла при медленном OpenBao | app | A | app-30 | todo | — |
-| [DEP-25](DEP-25.md) | стенд Д.6 — два прогона, квота 150 MB, генератор доверенный, сценарий перебора | deploy | A | deploy-21 | todo | DEP-14 |
+| [APP-31](APP-31.md) | старт узла при медленном OpenBao | app | A | app-30 | ready | — |
+| [DEP-25](DEP-25.md) | стенд Д.6 — два прогона, квота 150 MB, генератор доверенный, сценарий перебора | deploy | A | deploy-21 | ready | DEP-14 |
 | [DOC-01](DOC-01.md) | docs/PREREQUISITES.md — требования и тонкости настройки окружения | docs | A | docs-01 | done | — |
 | [APP-24](APP-24.md) | thepost doctor — кодировка и LC_CTYPE базы | app | A | app-23 | done | — |
-| [DEP-16](DEP-16.md) | эталоны задают кодировку UTF8 и LC_CTYPE UTF-8 базы | deploy | A | deploy-14 | ready | — |
-| [DEP-17](DEP-17.md) | эталон — UTC в PostgreSQL, chrony, текст ошибки «база не в UTF-8» | deploy | A | deploy-15 | todo | DEP-16 |
-| [DEP-18](DEP-18.md) | thepost_pki — перевыпуск внутреннего сертификата до конца срока | deploy | A | deploy-15 | todo | — |
-| [APP-25](APP-25.md) | thepost doctor — срок внутренних сертификатов | app | A | app-24 | ready | — |
-| [SYS-12](SYS-12.md) | Landlock — резолвер systemd-resolved (Ubuntu 24.04) | sys | A | sys-07 | ready | — |
-| [DEP-24](DEP-24.md) | эталон на Debian 13 и Ubuntu 26.04 | deploy | A | deploy-16 | todo | DEP-17 |
-| [DEP-19](DEP-19.md) | эталон Ansible на Astra Linux SE 1.8 | deploy | A | deploy-16 | todo | DEP-15,DEP-17 |
-| [DEP-20](DEP-20.md) | эталон Ansible на РЕД ОС 8 и семействе RHEL (AlmaLinux 9 и 10) | deploy | A | deploy-16 | todo | DEP-15,DEP-17 |
-| [APP-30](APP-30.md) | cluster.listen — адрес приёма межузловых вызовов отдельно от объявляемого | app | A | app-29 | todo | APP-18 |
-| [DEP-23](DEP-23.md) | резервная копия OpenBao — снимок Raft | deploy | A | deploy-19 | todo | DEP-15 |
+| [DEP-16](DEP-16.md) | эталоны задают кодировку UTF8 и LC_CTYPE UTF-8 базы | deploy | A | deploy-14 | done | — |
+| [DEP-17](DEP-17.md) | эталон — UTC в PostgreSQL, chrony, текст ошибки «база не в UTF-8» | deploy | A | deploy-15 | done | DEP-16 |
+| [DEP-18](DEP-18.md) | thepost_pki — перевыпуск внутреннего сертификата до конца срока | deploy | A | deploy-15 | done | — |
+| [APP-25](APP-25.md) | thepost doctor — срок внутренних сертификатов | app | A | app-24 | done | — |
+| [SYS-12](SYS-12.md) | Landlock — резолвер systemd-resolved (Ubuntu 24.04) | sys | A | sys-07 | done | — |
+| [DEP-24](DEP-24.md) | эталон на Debian 13 и Ubuntu 26.04 | deploy | A | deploy-16 | ready | DEP-17 |
+| [DEP-19](DEP-19.md) | эталон Ansible на Astra Linux SE 1.8 | deploy | A | deploy-16 | ready | DEP-15,DEP-17 |
+| [DEP-20](DEP-20.md) | эталон Ansible на РЕД ОС 8 и семействе RHEL (AlmaLinux 9 и 10) | deploy | A | deploy-16 | ready | DEP-15,DEP-17 |
+| [APP-30](APP-30.md) | cluster.listen — адрес приёма межузловых вызовов отдельно от объявляемого | app | A | app-29 | done | APP-18 |
+| [DEP-23](DEP-23.md) | резервная копия OpenBao — снимок Raft | deploy | A | deploy-19 | done | DEP-15 |
 | [PLT-22](PLT-22.md) | необязательный сертификат клиента на слушателях SMTP | platform | A | platform-12 | done | SMTP-20 |
-| [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | ready | CTR-31,SMTP-22 |
-| [META-44](META-44.md) | очередь модерации без группы в PostgreSQL | meta | B | meta-28 | todo | CTR-43 |
+| [CTR-43](CTR-43.md) | очередь модерации — и для правил потока почты | contracts | B | contracts-31 | done | CTR-31,SMTP-22 |
+| [META-44](META-44.md) | очередь модерации без группы в PostgreSQL | meta | B | meta-28 | ready | CTR-43 |
 | [SMTP-30](SMTP-30.md) | исход Moderate правил потока — в очередь модерации | smtp | A | smtp-11 | todo | CTR-43,SMTP-22 |
-| [CTR-49](CTR-49.md) | учётная запись в очереди и учёте BLOB, сигнал ShardsChanged | contracts | B | contracts-36 | todo | CTR-35 |
-| [CTR-50](CTR-50.md) | подключение отключённого ящика — опция «оставить» / «удалить» содержимое | contracts | B | contracts-36 | todo | CTR-35 |
-| [DEPS-06](DEPS-06.md) | HTTP/2 для межузловых вызовов — фичи axum и reqwest | deps | B | deps-06 | todo | CLU-14 |
+| [CTR-49](CTR-49.md) | учётная запись в очереди и учёте BLOB, сигнал ShardsChanged | contracts | B | contracts-36 | done | CTR-35 |
+| [CTR-50](CTR-50.md) | подключение отключённого ящика — опция «оставить» / «удалить» содержимое | contracts | B | contracts-36 | done | CTR-35 |
+| [DEPS-06](DEPS-06.md) | HTTP/2 для межузловых вызовов — фичи axum и reqwest | deps | B | deps-06 | ready | CLU-14 |
 | [CLU-15](CLU-15.md) | Rpc — h2 в ALPN | cluster | A | cluster-10 | todo | DEPS-06 |
-| [DEP-22](DEP-22.md) | сертификаты узлов с URI thepost:node:<id> | deploy | A | deploy-20 | todo | CLU-14 |
-| [PLT-24](PLT-24.md) | ключи TLS из OpenBao | platform | A | platform-14 | ready | PLT-23 |
-| [PLT-26](PLT-26.md) | внутренние сертификаты движком PKI OpenBao | platform | A | platform-16 | todo | PLT-24 |
+| [DEP-22](DEP-22.md) | сертификаты узлов с URI thepost:node:<id> | deploy | A | deploy-20 | ready | CLU-14 |
+| [PLT-24](PLT-24.md) | ключи TLS из OpenBao | platform | A | platform-14 | done | PLT-23 |
+| [PLT-26](PLT-26.md) | внутренние сертификаты движком PKI OpenBao | platform | A | platform-16 | ready | PLT-24 |
 
 ## Ф2. Совместная работа (≈5 мес.)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
-| [CTR-45](CTR-45.md) | календари и контакты — коллекции, объекты, журнал изменений | contracts | B | contracts-33 | ready | CTR-03,CTR-04 |
-| [CTR-46](CTR-46.md) | Sieve — скрипты, автоответ, точка правил доставки | contracts | B | contracts-33 | ready | CTR-05,CTR-10 |
-| [DEPS-04](DEPS-04.md) | зависимости крейтов Ф2 — tp-dav, tp-sieve, tp-jmap | deps | B | deps-04 | todo | CTR-45,CTR-46 |
-| [META-46](META-46.md) | схема календарей и контактов | meta | B | meta-30 | todo | CTR-45 |
-| [META-47](META-47.md) | DavStore на PostgreSQL | meta | A | meta-30 | todo | META-46 |
-| [META-48](META-48.md) | журнал изменений DAV — токены синхронизации и надгробия | meta | A | meta-30 | todo | META-47 |
-| [META-49](META-49.md) | хранение скриптов Sieve и автоответа | meta | B | meta-31 | todo | CTR-46 |
-| [META-50](META-50.md) | журнал автоответов | meta | A | meta-31 | todo | META-49 |
-| [DAV-01](DAV-01.md) | HTTP-каркас DAV и вход | dav | A | dav-01 | todo | DEPS-04,CTR-45 |
-| [DAV-02](DAV-02.md) | PROPFIND, PROPPATCH, OPTIONS и XML multistatus | dav | A | dav-01 | todo | DAV-01 |
-| [DAV-03](DAV-03.md) | ресурсы — GET, PUT, DELETE, ETag, MKCOL и MKCALENDAR | dav | A | dav-01 | todo | DAV-02 |
-| [DAV-04](DAV-04.md) | синхронизация — sync-collection и getctag | dav | A | dav-01 | todo | DAV-03 |
-| [DAV-05](DAV-05.md) | CalDAV — дом календарей и свойства | dav | A | dav-02 | todo | DAV-04 |
-| [DAV-06](DAV-06.md) | CalDAV — calendar-query и free-busy-query | dav | A | dav-02 | todo | DAV-05 |
-| [DAV-07](DAV-07.md) | CalDAV — calendar-multiget и задачи VTODO | dav | A | dav-02 | todo | DAV-05 |
-| [DAV-08](DAV-08.md) | CalDAV — проверка объектов и ручная проверка клиентами | dav | A | dav-02 | todo | DAV-06,DAV-07 |
-| [DAV-09](DAV-09.md) | CardDAV — дом адресных книг и свойства | dav | A | dav-03 | todo | DAV-04 |
-| [DAV-10](DAV-10.md) | CardDAV — addressbook-query и addressbook-multiget | dav | A | dav-03 | todo | DAV-09 |
-| [DAV-11](DAV-11.md) | CardDAV — версии vCard и проверка карточек | dav | A | dav-03 | todo | DAV-10 |
-| [DAV-12](DAV-12.md) | глобальная адресная книга (GAL) только для чтения | dav | A | dav-03 | todo | DAV-09 |
-| [SIEVE-01](SIEVE-01.md) | разбор скриптов Sieve — лексер и грамматика | sieve | A | sieve-01 | todo | DEPS-04 |
-| [SIEVE-02](SIEVE-02.md) | проверка скрипта — require, аргументы, сообщения об ошибках | sieve | A | sieve-01 | todo | SIEVE-01 |
-| [SIEVE-03](SIEVE-03.md) | интерпретатор — управление, тесты ядра, сравнения | sieve | A | sieve-01 | todo | SIEVE-02 |
-| [SIEVE-04](SIEVE-04.md) | действия — fileinto, copy, imap4flags, redirect, mailbox | sieve | A | sieve-02 | todo | SIEVE-03 |
-| [SIEVE-05](SIEVE-05.md) | тесты envelope, body, relational, subaddress | sieve | A | sieve-02 | todo | SIEVE-03 |
-| [SIEVE-06](SIEVE-06.md) | автоответ vacation | sieve | A | sieve-02 | todo | SIEVE-03 |
-| [SIEVE-07](SIEVE-07.md) | правила доставки — реализация DeliveryRules и фаззинг | sieve | A | sieve-02 | todo | SIEVE-04,SIEVE-05,SIEVE-06 |
-| [SMTP-31](SMTP-31.md) | правила Sieve при локальной доставке | smtp | A | smtp-12 | todo | CTR-46,SMTP-28 |
-| [SMTP-32](SMTP-32.md) | отправка автоответа | smtp | A | smtp-12 | todo | SMTP-31 |
-| [JMAP-23](JMAP-23.md) | VacationResponse — автоответ из JMAP | jmap | A | jmap-16 | todo | CTR-46,JMAP-02 |
-| [JMAP-24](JMAP-24.md) | JMAP Sieve — SieveScript (RFC 9661) | jmap | A | jmap-16 | todo | CTR-46,SIEVE-02,JMAP-02 |
-| [JMAP-25](JMAP-25.md) | JMAP Contacts — AddressBook (RFC 9610) | jmap | A | jmap-16 | todo | CTR-45,JMAP-02 |
-| [JMAP-26](JMAP-26.md) | JMAP Contacts — ContactCard | jmap | A | jmap-16 | todo | JMAP-25,DAV-03 |
-| [ADM-14](ADM-14.md) | Admin API — правила Sieve и автоответ | admin | A | admin-09 | todo | CTR-46,SIEVE-02 |
+| [CTR-45](CTR-45.md) | календари и контакты — коллекции, объекты, журнал изменений | contracts | B | contracts-33 | done | CTR-03,CTR-04 |
+| [CTR-46](CTR-46.md) | Sieve — скрипты, автоответ, точка правил доставки | contracts | B | contracts-33 | done | CTR-05,CTR-10 |
+| [DEPS-04](DEPS-04.md) | зависимости крейтов Ф2 — tp-dav, tp-sieve, tp-jmap | deps | B | deps-04 | done | CTR-45,CTR-46 |
+| [META-46](META-46.md) | схема календарей и контактов | meta | B | meta-30 | done | CTR-45 |
+| [META-47](META-47.md) | DavStore на PostgreSQL | meta | A | meta-30 | done | META-46 |
+| [META-48](META-48.md) | журнал изменений DAV — токены синхронизации и надгробия | meta | A | meta-30 | done | META-47 |
+| [META-49](META-49.md) | хранение скриптов Sieve и автоответа | meta | B | meta-31 | done | CTR-46 |
+| [META-50](META-50.md) | журнал автоответов | meta | A | meta-31 | done | META-49 |
+| [DAV-01](DAV-01.md) | HTTP-каркас DAV и вход | dav | A | dav-01 | done | DEPS-04,CTR-45 |
+| [DAV-02](DAV-02.md) | PROPFIND, PROPPATCH, OPTIONS и XML multistatus | dav | A | dav-01 | done | DAV-01 |
+| [DAV-03](DAV-03.md) | ресурсы — GET, PUT, DELETE, ETag, MKCOL и MKCALENDAR | dav | A | dav-01 | done | DAV-02 |
+| [DAV-04](DAV-04.md) | синхронизация — sync-collection и getctag | dav | A | dav-01 | done | DAV-03 |
+| [DAV-05](DAV-05.md) | CalDAV — дом календарей и свойства | dav | A | dav-02 | done | DAV-04 |
+| [DAV-06](DAV-06.md) | CalDAV — calendar-query и free-busy-query | dav | A | dav-02 | done | DAV-05 |
+| [DAV-07](DAV-07.md) | CalDAV — calendar-multiget и задачи VTODO | dav | A | dav-02 | done | DAV-05 |
+| [DAV-08](DAV-08.md) | CalDAV — проверка объектов и ручная проверка клиентами | dav | A | dav-02 | done | DAV-06,DAV-07 |
+| [DAV-09](DAV-09.md) | CardDAV — дом адресных книг и свойства | dav | A | dav-03 | ready | DAV-04 |
+| [DAV-10](DAV-10.md) | CardDAV — addressbook-query и addressbook-multiget | dav | A | dav-03 | ready | DAV-09 |
+| [DAV-11](DAV-11.md) | CardDAV — версии vCard и проверка карточек | dav | A | dav-03 | ready | DAV-10 |
+| [DAV-12](DAV-12.md) | глобальная адресная книга (GAL) только для чтения | dav | A | dav-03 | ready | DAV-09 |
+| [SIEVE-01](SIEVE-01.md) | разбор скриптов Sieve — лексер и грамматика | sieve | A | sieve-01 | done | DEPS-04 |
+| [SIEVE-02](SIEVE-02.md) | проверка скрипта — require, аргументы, сообщения об ошибках | sieve | A | sieve-01 | done | SIEVE-01 |
+| [SIEVE-03](SIEVE-03.md) | интерпретатор — управление, тесты ядра, сравнения | sieve | A | sieve-01 | done | SIEVE-02 |
+| [SIEVE-04](SIEVE-04.md) | действия — fileinto, copy, imap4flags, redirect, mailbox | sieve | A | sieve-02 | done | SIEVE-03 |
+| [SIEVE-05](SIEVE-05.md) | тесты envelope, body, relational, subaddress | sieve | A | sieve-02 | done | SIEVE-03 |
+| [SIEVE-06](SIEVE-06.md) | автоответ vacation | sieve | A | sieve-02 | done | SIEVE-03 |
+| [SIEVE-07](SIEVE-07.md) | правила доставки — реализация DeliveryRules и фаззинг | sieve | A | sieve-02 | done | SIEVE-04,SIEVE-05,SIEVE-06 |
+| [SMTP-31](SMTP-31.md) | правила Sieve при локальной доставке | smtp | A | smtp-12 | done | CTR-46,SMTP-28 |
+| [SMTP-32](SMTP-32.md) | отправка автоответа | smtp | A | smtp-12 | done | SMTP-31 |
+| [JMAP-23](JMAP-23.md) | VacationResponse — автоответ из JMAP | jmap | A | jmap-16 | done | CTR-46,JMAP-02 |
+| [JMAP-24](JMAP-24.md) | JMAP Sieve — SieveScript (RFC 9661) | jmap | A | jmap-16 | done | CTR-46,SIEVE-02,JMAP-02 |
+| [JMAP-25](JMAP-25.md) | JMAP Contacts — AddressBook (RFC 9610) | jmap | A | jmap-16 | done | CTR-45,JMAP-02 |
+| [JMAP-26](JMAP-26.md) | JMAP Contacts — ContactCard | jmap | A | jmap-16 | done | JMAP-25,DAV-03 |
+| [ADM-14](ADM-14.md) | Admin API — правила Sieve и автоответ | admin | A | admin-09 | done | CTR-46,SIEVE-02 |
 | [APP-29](APP-29.md) | календари и контакты в узле — роль dav | app | A | app-28 | todo | DAV-08,DAV-11,DAV-12,META-48 |
-| [APP-26](APP-26.md) | правила Sieve и автоответ в узле — доставка, Admin API, JMAP VacationResponse | app | A | app-25 | todo | SIEVE-07,SMTP-32,META-50,ADM-14,JMAP-23 |
+| [APP-26](APP-26.md) | правила Sieve и автоответ в узле — доставка, Admin API, JMAP VacationResponse | app | A | app-25 | ready | SIEVE-07,SMTP-32,META-50,ADM-14,JMAP-23 |
 | [DEP-21](DEP-21.md) | стенд — CalDAV, CardDAV, ManageSieve | deploy | A | deploy-17 | todo | APP-29 |
-| [SIEVE-08](SIEVE-08.md) | ManageSieve — протокол и вход | sieve | A | sieve-03 | todo | SIEVE-02 |
-| [SIEVE-09](SIEVE-09.md) | ManageSieve — команды скриптов | sieve | A | sieve-03 | todo | SIEVE-08 |
-| [JMAP-27](JMAP-27.md) | JMAP Calendars — Calendar | jmap | A | jmap-17 | todo | CTR-45,DAV-03,JMAP-25 |
-| [JMAP-28](JMAP-28.md) | JMAP Calendars — CalendarEvent | jmap | A | jmap-17 | todo | JMAP-27 |
-| [JMAP-29](JMAP-29.md) | JMAP Calendars — CalendarEvent/query и развёртывание повторов | jmap | A | jmap-17 | todo | JMAP-28 |
+| [SIEVE-08](SIEVE-08.md) | ManageSieve — протокол и вход | sieve | A | sieve-03 | ready | SIEVE-02 |
+| [SIEVE-09](SIEVE-09.md) | ManageSieve — команды скриптов | sieve | A | sieve-03 | ready | SIEVE-08 |
+| [JMAP-27](JMAP-27.md) | JMAP Calendars — Calendar | jmap | A | jmap-17 | ready | CTR-45,DAV-03,JMAP-25 |
+| [JMAP-28](JMAP-28.md) | JMAP Calendars — CalendarEvent | jmap | A | jmap-17 | ready | JMAP-27 |
+| [JMAP-29](JMAP-29.md) | JMAP Calendars — CalendarEvent/query и развёртывание повторов | jmap | A | jmap-17 | ready | JMAP-28 |
 | [APP-27](APP-27.md) | ManageSieve и JMAP календари, контакты, Sieve в узле | app | A | app-26 | todo | SIEVE-09,JMAP-29,APP-29,APP-26 |
-| [CI-06](CI-06.md) | полоса console и сборка веб-консоли в CI | ci | B | ci-05 | ready | — |
-| [DEPS-05](DEPS-05.md) | rust-embed — веб-консоль внутри бинарного файла | deps | B | deps-05 | todo | CI-06 |
-| [UI-01](UI-01.md) | каркас веб-консоли на Refine | console | A | console-01 | todo | CI-06 |
-| [UI-02](UI-02.md) | вход, провайдер данных, типы из OpenAPI, покрытие API | console | A | console-01 | todo | UI-01 |
-| [UI-03](UI-03.md) | организации, домены и политики | console | A | console-01 | todo | UI-02 |
-| [UI-04](UI-04.md) | учётные записи и пароли приложений | console | A | console-02 | todo | UI-03 |
-| [UI-05](UI-05.md) | группы рассылки и модерация | console | A | console-02 | todo | UI-03 |
-| [UI-06](UI-06.md) | корзина учётной записи | console | A | console-02 | todo | UI-04 |
+| [CI-06](CI-06.md) | полоса console и сборка веб-консоли в CI | ci | B | ci-05 | done | — |
+| [DEPS-05](DEPS-05.md) | rust-embed — веб-консоль внутри бинарного файла | deps | B | deps-05 | ready | CI-06 |
+| [UI-01](UI-01.md) | каркас веб-консоли на Refine | console | A | console-01 | done | CI-06 |
+| [UI-02](UI-02.md) | вход, провайдер данных, типы из OpenAPI, покрытие API | console | A | console-01 | done | UI-01 |
+| [UI-03](UI-03.md) | организации, домены и политики | console | A | console-01 | done | UI-02 |
+| [UI-04](UI-04.md) | учётные записи и пароли приложений | console | A | console-02 | ready | UI-03 |
+| [UI-05](UI-05.md) | группы рассылки и модерация | console | A | console-02 | ready | UI-03 |
+| [UI-06](UI-06.md) | корзина учётной записи | console | A | console-02 | ready | UI-04 |
 | [UI-07](UI-07.md) | транспорт — принятые домены, источники, маршруты | console | A | console-03 | todo | UI-03 |
 | [UI-08](UI-08.md) | журнал доставки и журнал аудита | console | A | console-03 | todo | UI-03 |
 | [UI-09](UI-09.md) | правила и автоответ пользователя; покрытие Admin API | console | A | console-03 | todo | UI-04,UI-05,UI-06,UI-07,UI-08,ADM-14 |
 | [ADM-15](ADM-15.md) | раздача веб-консоли ролью admin | admin | A | admin-10 | todo | DEPS-05,UI-01 |
-| [CTR-47](CTR-47.md) | планирование встреч — iTIP и занятость | contracts | B | contracts-34 | todo | CTR-45 |
-| [META-54](META-54.md) | занятость повторяющихся событий — разворот при запросе | meta | B | meta-35 | todo | CTR-47 |
-| [SMTP-34](SMTP-34.md) | пересылка правилами и автоответ — через правила получателя с проверкой петли | smtp | A | smtp-14 | todo | SMTP-31 |
-| [ADM-17](ADM-17.md) | Sieve-скрипты пользователя в Admin API и CLI | admin | A | admin-12 | todo | — |
-| [APP-32](APP-32.md) | очистка надгробий DAV и журнала автоответов в роли maintenance | app | A | app-31 | todo | META-48,META-50 |
-| [META-51](META-51.md) | входящие планирования и индекс занятости | meta | B | meta-32 | todo | CTR-47,META-47 |
-| [DAV-13](DAV-13.md) | планирование внутри организации — RFC 6638 | dav | A | dav-04 | todo | DAV-08,CTR-47 |
-| [DAV-14](DAV-14.md) | iMIP наружу — приглашения внешним участникам | dav | A | dav-04 | todo | DAV-13 |
-| [DAV-15](DAV-15.md) | приём iTIP — обработка приглашений и ответов | dav | A | dav-04 | todo | DAV-13 |
-| [DAV-16](DAV-16.md) | занятость — VFREEBUSY и реализация FreeBusy | dav | A | dav-04 | todo | DAV-13 |
-| [SMTP-33](SMTP-33.md) | приём iMIP — приглашения и ответы извне | smtp | A | smtp-13 | todo | CTR-47,SMTP-31 |
+| [CTR-47](CTR-47.md) | планирование встреч — iTIP и занятость | contracts | B | contracts-34 | done | CTR-45 |
+| [META-54](META-54.md) | занятость повторяющихся событий — разворот при запросе | meta | B | meta-35 | ready | CTR-47 |
+| [SMTP-34](SMTP-34.md) | пересылка правилами и автоответ — через правила получателя с проверкой петли | smtp | A | smtp-14 | ready | SMTP-31 |
+| [ADM-17](ADM-17.md) | Sieve-скрипты пользователя в Admin API и CLI | admin | A | admin-12 | ready | — |
+| [APP-32](APP-32.md) | очистка надгробий DAV и журнала автоответов в роли maintenance | app | A | app-31 | ready | META-48,META-50 |
+| [META-51](META-51.md) | входящие планирования и индекс занятости | meta | B | meta-32 | ready | CTR-47,META-47 |
+| [DAV-13](DAV-13.md) | планирование внутри организации — RFC 6638 | dav | A | dav-04 | ready | DAV-08,CTR-47 |
+| [DAV-14](DAV-14.md) | iMIP наружу — приглашения внешним участникам | dav | A | dav-04 | ready | DAV-13 |
+| [DAV-15](DAV-15.md) | приём iTIP — обработка приглашений и ответов | dav | A | dav-04 | ready | DAV-13 |
+| [DAV-16](DAV-16.md) | занятость — VFREEBUSY и реализация FreeBusy | dav | A | dav-04 | ready | DAV-13 |
+| [SMTP-33](SMTP-33.md) | приём iMIP — приглашения и ответы извне | smtp | A | smtp-13 | ready | CTR-47,SMTP-31 |
 | [JMAP-30](JMAP-30.md) | JMAP — Principal и занятость | jmap | A | jmap-18 | todo | JMAP-29,CTR-47 |
 | [JMAP-31](JMAP-31.md) | JMAP — приглашения на встречи | jmap | A | jmap-18 | todo | JMAP-30,DAV-13 |
 | [APP-28](APP-28.md) | планирование встреч в узле | app | A | app-27 | todo | DAV-16,SMTP-33,META-51,JMAP-31,APP-27 |
 | [CMP-10](CMP-10.md) | приёмка Ф2 — календари, контакты, правила, консоль | deploy | A | deploy-18 | todo | APP-28,UI-09,DEP-21 |
-| [CTR-48](CTR-48.md) | общий доступ к календарям и контактам, представители, ресурсы | contracts | B | contracts-35 | todo | CTR-45,CTR-47 |
+| [CTR-48](CTR-48.md) | общий доступ к календарям и контактам, представители, ресурсы | contracts | B | contracts-35 | ready | CTR-45,CTR-47 |
 | [META-52](META-52.md) | права на коллекции, представители, правила ресурсов | meta | B | meta-33 | todo | CTR-48 |
 | [AUTH-12](AUTH-12.md) | Authorizer — права на календари и адресные книги | auth | A | auth-07 | todo | CTR-48,AUTH-07 |
 | [DAV-17](DAV-17.md) | общий доступ к календарям и адресным книгам | dav | A | dav-05 | todo | DAV-16,CTR-48,AUTH-12 |
