@@ -13,6 +13,8 @@
 //! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`
 //!   (подпись профиля ключом TLS — [`ProfileSigner`], [`Jmap::with_profile_signer`]);
 //! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
+//! - `contact_card` — ContactCard/get, changes, query, queryChanges, set, copy: vCard в `DavStore`, JSContact —
+//!   calcard, индекс — `tp_dav::index`;
 //! - `contacts` — AddressBook/get, changes, set (RFC 9610) поверх `DavStore`, [`Jmap::with_dav`];
 //! - `sieve` — SieveScript/get, set, query, validate (RFC 9661) поверх `SieveStore` и проверки `tp_sieve`;
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
@@ -21,6 +23,7 @@
 
 mod autoconfig;
 mod blob;
+mod contact_card;
 mod contacts;
 pub mod core;
 mod email_get;
@@ -81,6 +84,12 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("AddressBook/get", CONTACTS),
     ("AddressBook/changes", CONTACTS),
     ("AddressBook/set", CONTACTS),
+    ("ContactCard/get", CONTACTS),
+    ("ContactCard/changes", CONTACTS),
+    ("ContactCard/query", CONTACTS),
+    ("ContactCard/queryChanges", CONTACTS),
+    ("ContactCard/set", CONTACTS),
+    ("ContactCard/copy", CONTACTS),
 ];
 
 /// Варианты сортировки `Email/query` (сессия, `emailQuerySortOptions`).
@@ -127,6 +136,12 @@ pub(crate) async fn call_builtin(
         "AddressBook/get" => contacts::get(ctx, args).await,
         "AddressBook/changes" => contacts::changes(ctx, args).await,
         "AddressBook/set" => contacts::set(ctx, args).await,
+        "ContactCard/get" => contact_card::get(ctx, args).await,
+        "ContactCard/changes" => contact_card::changes(ctx, args).await,
+        "ContactCard/query" => contact_card::query(ctx, args).await,
+        "ContactCard/queryChanges" => contact_card::query_changes(ctx, args).await,
+        "ContactCard/set" => contact_card::set(ctx, args).await,
+        "ContactCard/copy" => contact_card::copy(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
 }

@@ -433,17 +433,26 @@ pub(crate) async fn query(
                 .is_none_or(|n| s.name.to_lowercase().contains(n))
         })
         .collect();
-    all.sort_by(|x, y| x.name.cmp(&y.name));
-    for c in a.sort.iter().flatten().rev() {
-        match c.property.as_str() {
-            "name" => all.sort_by(|x, y| x.name.to_lowercase().cmp(&y.name.to_lowercase())),
-            "isActive" => all.sort_by_key(|s| s.active),
-            _ => return Err(MethodError::new("unsupportedSort")),
-        }
-        if !c.is_ascending {
-            all.reverse();
-        }
+    let sort = a.sort.as_deref().unwrap_or_default();
+    if sort
+        .iter()
+        .any(|c| !matches!(c.property.as_str(), "name" | "isActive"))
+    {
+        return Err(MethodError::new("unsupportedSort"));
     }
+    all.sort_by(|x, y| {
+        sort.iter()
+            .map(|c| {
+                let o = if c.property == "name" {
+                    x.name.to_lowercase().cmp(&y.name.to_lowercase())
+                } else {
+                    x.active.cmp(&y.active)
+                };
+                if c.is_ascending { o } else { o.reverse() }
+            })
+            .find(|o| o.is_ne())
+            .unwrap_or_else(|| x.name.cmp(&y.name))
+    });
     let ids: Vec<String> = all.iter().map(|s| script_id(&s.name)).collect();
     let mut out = object(json!({
         "accountId": a.account_id,

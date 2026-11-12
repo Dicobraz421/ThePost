@@ -305,7 +305,7 @@ pub(crate) async fn set(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::{Value, json};
     use tp_contracts::dav::{CollectionKind, DavStore, ObjectIndex, Precondition};
 
