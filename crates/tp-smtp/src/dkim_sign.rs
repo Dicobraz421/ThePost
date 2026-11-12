@@ -1,14 +1,15 @@
 //! DKIM-подпись исходящей почты (RFC 6376, RFC 8463) на `mail-auth`: RSA-SHA256 и Ed25519-SHA256.
 //!
-//! Подписываются письма, домен `From` которых есть в `smtp.dkim.domains`; ключ — активный селектор домена
-//! (`selector`), закрытый ключ (PEM: PKCS#8 или PKCS#1 для RSA, PKCS#8 для Ed25519) — из хранилища секретов
-//! по ссылке `key` (решение 2026-10-30: секреты — только во внешнем хранилище). Разобранные ключи кэшируются
-//! на `key_refresh`.
+//! Подписываются письма, домен `From` которых есть в `smtp.dkim.domains`. Селектор подписи — политика
+//! организации домена (`Policy::dkim_selector`, уровень принятого домена; SMTP-40, решение 97,
+//! [`DkimSign::with_policies`]); не задан — письмо подписывается всеми ключами домена (по подписи на ключ).
+//! Закрытый ключ (PEM: PKCS#8 или PKCS#1 для RSA, PKCS#8 для Ed25519) — из хранилища секретов по ссылке `key`
+//! (решение 2026-10-30: секреты — только во внешнем хранилище). Разобранные ключи кэшируются на `key_refresh`.
 //!
-//! Ротация селекторов: новый ключ публикуется в DNS (`<селектор>._domainkey.<домен>`) и добавляется в `keys`,
-//! затем `selector` переключается на него (без перезапуска, [`DkimSign::update`]); старый селектор остаётся
-//! в DNS, пока письма с его подписью могут проверяться. Подпись ставит [`crate::queue::Queue`] при постановке
-//! в очередь — до первой попытки, один раз на письмо.
+//! Ротация селекторов: новый ключ публикуется в DNS (`<селектор>._domainkey.<домен>`) и добавляется в `keys`
+//! (без перезапуска, [`DkimSign::update`]), затем политика домена переключается на него; старый селектор
+//! остаётся в DNS, пока письма с его подписью могут проверяться, и удаляется из `keys`. Подпись ставит
+//! [`crate::queue::Queue`] при постановке в очередь — до первой попытки, один раз на письмо.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -22,10 +23,12 @@ use mail_auth::signer::Ready;
 use mail_parser::MessageParser;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use tp_contracts::meta::PolicyResolver;
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
 
 use crate::config::{DkimAlgorithm, DkimConfig};
+use crate::routes::Routes;
 
 type Signer = DkimSigner<SigningKeyPair, Ready>;
 
@@ -37,6 +40,8 @@ pub struct DkimSign {
     secrets: Arc<dyn SecretStore>,
     cfg: RwLock<Arc<DkimConfig>>,
     cache: Mutex<KeyCache>,
+    /// Политики организаций и принятые домены: селектор подписи домена.
+    policies: Option<(Arc<dyn PolicyResolver>, Arc<Routes>)>,
 }
 
 impl fmt::Debug for DkimSign {
@@ -54,7 +59,29 @@ impl DkimSign {
             secrets,
             cfg: RwLock::new(Arc::new(cfg)),
             cache: Mutex::new(HashMap::new()),
+            policies: None,
         }
+    }
+
+    /// Селектор подписи — политика организации принятого домена `From` (`Policy::dkim_selector`): организация и
+    /// домен — из снимка принятых доменов `routes`. Без политик и для домена вне принятых — все ключи домена.
+    pub fn with_policies(mut self, policies: Arc<dyn PolicyResolver>, routes: Arc<Routes>) -> Self {
+        self.policies = Some((policies, routes));
+        self
+    }
+
+    /// Селектор подписи домена `domain` из политики организации; `None` — не задан.
+    async fn policy_selector(&self, domain: &str) -> Result<Option<String>> {
+        let Some((policies, routes)) = &self.policies else {
+            return Ok(None);
+        };
+        let Some(accepted) = routes.cluster().await?.domain(domain).cloned() else {
+            return Ok(None);
+        };
+        Ok(policies
+            .resolve(accepted.tenant, Some(accepted.id), None, None)
+            .await?
+            .dkim_selector)
     }
 
     /// Новая версия секции (hot reload): ключи сменённых селекторов перечитываются.
@@ -66,20 +93,30 @@ impl DkimSign {
         lock(&self.cache).clear();
     }
 
-    /// Заголовок `DKIM-Signature` (с `\r\n`) для письма `raw`; домен `From` без ключа — `None`.
+    /// Заголовки `DKIM-Signature` (каждый с `\r\n`) для письма `raw`: селектором политики домена или всеми
+    /// ключами домена; домен `From` без ключей — `None`. Селектор политики без ключа в `smtp.dkim` — `Invalid`
+    /// (письмо не уходит без подписи).
     pub async fn sign(&self, raw: &[u8]) -> Result<Option<String>> {
         let Some(domain) = from_domain(raw) else {
             return Ok(None);
         };
         let cfg = read(&self.cfg).clone();
-        let Some(d) = cfg.domains.get(&domain) else {
+        let Some(d) = cfg.domains.get(&domain).filter(|d| !d.keys.is_empty()) else {
             return Ok(None);
         };
-        let signer = self.signer(&cfg, &domain, &d.selector).await?;
-        let sig = signer
-            .sign(raw)
-            .map_err(|e| Error::Internal(format!("dkim sign {domain}: {e}")))?;
-        Ok(Some(sig.to_header()))
+        let selectors = match self.policy_selector(&domain).await? {
+            Some(s) => vec![s],
+            None => d.keys.keys().cloned().collect(),
+        };
+        let mut headers = String::new();
+        for selector in &selectors {
+            let signer = self.signer(&cfg, &domain, selector).await?;
+            let sig = signer
+                .sign(raw)
+                .map_err(|e| Error::Internal(format!("dkim sign {domain}: {e}")))?;
+            headers.push_str(&sig.to_header());
+        }
+        Ok(Some(headers))
     }
 
     async fn signer(&self, cfg: &DkimConfig, domain: &str, selector: &str) -> Result<Arc<Signer>> {
@@ -150,5 +187,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[cfg(test)]
+mod policy_tests;
 #[cfg(test)]
 mod tests;

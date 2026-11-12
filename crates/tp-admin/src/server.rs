@@ -43,7 +43,7 @@ use tp_contracts::{Error, Result, TenantId};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
-use crate::accounts::{DomainStore, PolicyStore};
+use crate::accounts::PolicyStore;
 use crate::audit::{AUDIT_ROUTE, AuditLog, AuditRecord, AuditSink};
 use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
@@ -300,8 +300,6 @@ pub struct Deps {
     pub policies: Arc<dyn PolicyStore>,
     /// Действующие политики.
     pub resolver: Arc<dyn PolicyResolver>,
-    /// Домены.
-    pub domains: Arc<dyn DomainStore>,
     /// Корзина: список элементов.
     pub trash: Arc<dyn TrashStore>,
     /// Почтовое хранилище: восстановление из корзины с уведомлением клиентов.

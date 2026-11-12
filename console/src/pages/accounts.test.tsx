@@ -83,13 +83,17 @@ test("учётная запись: политика ящика — PUT accounts/
       body: account("a1", "alice@example.org", { policy: { ...empty, quota_bytes: 100 }, effective: { ...empty, quota_bytes: 100 } }),
     },
     [`GET ${BASE}/accounts/a1/app-passwords`]: { body: [] },
-    [`GET ${BASE}/domains`]: { body: [{ id: "d1", name: "example.org" }] },
+    [`GET ${BASE}/transport/domains`]: {
+      body: { version: 4, domains: [{ id: "d1", tenant: "t", name: "example.org", kind: "authoritative" }] },
+    },
     [`PUT ${BASE}/accounts/a1/policy`]: (c) => ({ body: c.body }),
   });
   await waitFor(() => expect((screen.getByLabelText("Квота ящика, байт.") as HTMLInputElement).value).toBe("100"));
   expect(screen.getByText("Вход разрешён")).toBeTruthy();
-  // Основной домен — по имени, а не идентификатором.
+  // Основной домен — по имени из принятых доменов транспорта, а не идентификатором.
   expect(await screen.findByText("example.org")).toBeTruthy();
+  expect(sent(calls, "GET", `${BASE}/transport/domains`).length).toBeGreaterThan(0);
+  expect(calls.some((c) => c.path.startsWith(`${BASE}/domains`))).toBe(false);
   fireEvent.change(screen.getByLabelText("Квота ящика, байт."), { target: { value: "200" } });
   fireEvent.click(screen.getByRole("button", { name: "Сохранить политику" }));
   await waitFor(() => expect(sent(calls, "PUT", `${BASE}/accounts/a1/policy`)[0]?.body).toEqual({ ...empty, quota_bytes: 200 }));

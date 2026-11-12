@@ -16,14 +16,14 @@ use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, Policy, SpecialUse};
-use tp_contracts::{AccountId, DomainId, Error, MessageId, Result, TenantId};
+use tp_contracts::{AccountId, DomainId, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
     MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies, MemQuota, MemSieve,
-    MemTransport, MemTrash, PolicyLevel, SystemClock,
+    MemTransport, MemTrash, SystemClock,
 };
 
-use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
+use crate::accounts::{PolicyStore, PolicyTarget};
 use crate::audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink};
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 use crate::sieve::ScriptError;
@@ -88,7 +88,7 @@ pub use tp_testkit::{MemModeration, ModerationDecision as Decision};
 #[async_trait]
 impl PolicyStore for MemPolicies {
     async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
-        Ok(MemPolicies::policy(self, tenant, level(target)))
+        tp_contracts::meta::PolicyStore::policy(self, tenant, level(target)).await
     }
 
     async fn set_policy(
@@ -97,56 +97,16 @@ impl PolicyStore for MemPolicies {
         target: PolicyTarget,
         policy: &Policy,
     ) -> Result<()> {
-        MemPolicies::set_policy(self, tenant, level(target), policy.clone());
-        Ok(())
+        tp_contracts::meta::PolicyStore::set_policy(self, tenant, level(target), policy).await
     }
 }
 
-fn level(target: PolicyTarget) -> PolicyLevel {
+fn level(target: PolicyTarget) -> tp_contracts::meta::PolicyTarget {
+    use tp_contracts::meta::PolicyTarget as Level;
     match target {
-        PolicyTarget::Tenant => PolicyLevel::Tenant,
-        PolicyTarget::Domain(d) => PolicyLevel::Domain(d),
-        PolicyTarget::Account(a) => PolicyLevel::Account(a),
-    }
-}
-
-/// Домены в памяти (без проверки учётных записей домена при удалении).
-#[derive(Debug, Clone, Default)]
-pub struct MemDomains(Arc<Mutex<Vec<(TenantId, Domain)>>>);
-
-#[async_trait]
-impl DomainStore for MemDomains {
-    async fn list(&self, tenant: TenantId) -> Result<Vec<Domain>> {
-        let mut v: Vec<Domain> = lock(&self.0)
-            .iter()
-            .filter(|(t, _)| *t == tenant)
-            .map(|(_, d)| d.clone())
-            .collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(v)
-    }
-
-    async fn create(&self, tenant: TenantId, name: &str) -> Result<Domain> {
-        let mut m = lock(&self.0);
-        if m.iter().any(|(_, d)| d.name == name) {
-            return Err(Error::Conflict);
-        }
-        let d = Domain {
-            id: DomainId::new(),
-            name: name.to_owned(),
-        };
-        m.push((tenant, d.clone()));
-        Ok(d)
-    }
-
-    async fn delete(&self, tenant: TenantId, id: DomainId) -> Result<()> {
-        let mut m = lock(&self.0);
-        let before = m.len();
-        m.retain(|(t, d)| !(*t == tenant && d.id == id));
-        if m.len() == before {
-            return Err(Error::NotFound);
-        }
-        Ok(())
+        PolicyTarget::Tenant => Level::Tenant,
+        PolicyTarget::Domain(d) => Level::Domain(d),
+        PolicyTarget::Account(a) => Level::Account(a),
     }
 }
 
@@ -218,7 +178,6 @@ impl Stores {
             quota: Arc::new(self.quota.clone()),
             policies: Arc::new(self.policies.clone()),
             resolver: Arc::new(self.policies.clone()),
-            domains: Arc::new(MemDomains::default()),
             trash: Arc::new(self.trash.clone()),
             store: Arc::new(self.store.clone()),
             app_passwords: self.app_passwords(),

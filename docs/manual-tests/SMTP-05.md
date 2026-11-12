@@ -6,14 +6,12 @@ Linux или WSL2 с Docker. Rspamd принимает Milter на воркер�
 
 ## Подготовка
 1. `docker run -d --name tp-rspamd -p 11332:11332 rspamd/rspamd:3.11.1` → контейнер запущен.
-2. config.yaml узла (роль smtp-in и submission, локальный домен `example.org`):
+2. config.yaml узла (роль smtp-in и submission):
    ```yaml
    smtp:
      hostname: mx.example.org
      inbound:
        - listen: "127.0.0.1:2525"
-     delivery:
-       local_domains: [example.org]
      milter:
        filters:
          - name: rspamd
@@ -21,7 +19,8 @@ Linux или WSL2 с Docker. Rspamd принимает Milter на воркер�
            submission: true
            on_failure: accept
    ```
-3. `thepost serve` с этой конфигурацией; учётная запись `bob@example.org` существует.
+3. `thepost serve` с этой конфигурацией; `example.org` — принятый домен организации
+   (`thepost admin domain add example.org`), учётная запись `bob@example.org` существует.
 
 ## Сценарии
 1. Обычное письмо: `swaks --server 127.0.0.1:2525 --to bob@example.org --from a@example.net` → `250 2.0.0 OK`;
