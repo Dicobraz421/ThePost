@@ -4,7 +4,7 @@
 //!
 //! Заголовки декодируются (RFC 2047), адреса разбираются по RFC 5322 — `mail-parser`. Ошибка выполнения (в том числе
 //! превышение [`Limits::max_steps`] и [`Limits::max_actions`]) отменяет действия скрипта: остаётся implicit keep.
-//! Слияние действий в `RulesOutcome` — SIEVE-04.
+//! Слияние действий в `RulesOutcome` — [`crate::outcome`] (SIEVE-04).
 
 use std::cmp::Ordering;
 
@@ -89,6 +89,8 @@ pub struct Outcome {
     pub flags: Vec<String>,
     /// Ошибка выполнения (без содержимого письма).
     pub error: Option<String>,
+    /// Выполнение закончилось командой `stop`.
+    pub stopped: bool,
 }
 
 /// Выполняет программу над письмом.
@@ -104,7 +106,8 @@ pub fn run(program: &Program, ctx: &Context<'_>, limits: &Limits) -> Outcome {
         vacation: false,
     };
     match ex.block(&program.commands) {
-        Ok(_) => Outcome {
+        Ok(flow) => Outcome {
+            stopped: matches!(flow, Flow::Stop),
             implicit_keep: !ex.cancel_keep,
             actions: ex.actions,
             flags: ex.flags,
@@ -118,13 +121,13 @@ pub fn run(program: &Program, ctx: &Context<'_>, limits: &Limits) -> Outcome {
     }
 }
 
-struct Hdr {
-    name: String,
+pub(crate) struct Hdr {
+    pub(crate) name: String,
     /// Значение после RFC 2047, без ведущих и хвостовых пробелов.
-    value: String,
+    pub(crate) value: String,
     /// Границы сырого значения в письме.
-    start: usize,
-    end: usize,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 struct Fail(String);
@@ -227,6 +230,19 @@ impl Exec<'_> {
                 "больше {} действий за выполнение",
                 self.limits.max_actions
             )));
+        }
+        if matches!(action, Action::Redirect { .. }) {
+            let n = self
+                .actions
+                .iter()
+                .filter(|a| matches!(a, Action::Redirect { .. }))
+                .count();
+            if n >= self.limits.max_redirects {
+                return Err(Fail(format!(
+                    "больше {} перенаправлений за выполнение",
+                    self.limits.max_redirects
+                )));
+            }
         }
         self.actions.push(action);
         self.cancel_keep |= cancels_keep;
@@ -528,7 +544,7 @@ fn glob(p: &[Glob], s: &[char], cmp: Comparator, steps: &mut u64, max: u64) -> O
 // ---------- Письмо ----------
 
 /// Заголовки верхнего уровня: имя, значение после RFC 2047 и границы сырого значения.
-fn parse_headers(raw: &[u8]) -> Vec<Hdr> {
+pub(crate) fn parse_headers(raw: &[u8]) -> Vec<Hdr> {
     // Непустая карта заголовков включает разбор «по умолчанию» для всех остальных — как текст с RFC 2047.
     let parser = MessageParser::new()
         .header_text(HeaderName::Subject)
@@ -556,7 +572,7 @@ fn header_text(v: &HeaderValue<'_>) -> String {
 }
 
 /// Адреса из сырого значения заголовка (RFC 5322, группы раскрываются); имена и комментарии отбрасываются.
-fn parse_addresses(raw: &[u8]) -> Vec<String> {
+pub(crate) fn parse_addresses(raw: &[u8]) -> Vec<String> {
     let mut buf = Vec::with_capacity(raw.len() + 9);
     buf.extend_from_slice(b"From:");
     buf.extend_from_slice(raw);
@@ -577,7 +593,7 @@ fn parse_addresses(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn strip_angle(s: &str) -> &str {
+pub(crate) fn strip_angle(s: &str) -> &str {
     let s = s.trim();
     s.strip_prefix('<')
         .and_then(|x| x.strip_suffix('>'))
@@ -586,7 +602,7 @@ fn strip_angle(s: &str) -> &str {
 
 /// Часть адреса (RFC 5228 §2.7.4, RFC 5233): локальная часть — до последней `@`, `:user`/`:detail` — по первому `+`;
 /// `:detail` без `+` — нет значения.
-fn address_part(addr: &str, part: Part) -> Option<String> {
+pub(crate) fn address_part(addr: &str, part: Part) -> Option<String> {
     let (local, domain) = addr.rsplit_once('@').unwrap_or((addr, ""));
     let v = match part {
         Part::All => addr,

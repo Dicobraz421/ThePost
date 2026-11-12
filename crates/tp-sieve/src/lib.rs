@@ -2,13 +2,15 @@
 //!
 //! Своя реализация: sieve-rs распространяется под AGPL-3.0 (SRS 4.3, 7.1). Путь скрипта:
 //! [`parse`] (лексер и грамматика RFC 5228 §8, SIEVE-01) → [`check`] / [`compile`] (require, аргументы, расширения —
-//! программа [`Program`], SIEVE-02) → [`run`] (выполнение над письмом, SIEVE-03).
+//! программа [`Program`], SIEVE-02) → [`run`] (выполнение над письмом, SIEVE-03) → слияние действий в
+//! `RulesOutcome` (SIEVE-04).
 //!
 //! Все лимиты ([`Limits`]) дают ошибку разбора или выполнения, а не панику: скрипты пишут пользователи.
 
 pub mod ast;
 mod compile;
 mod lexer;
+mod outcome;
 mod run;
 
 use std::fmt;
@@ -34,6 +36,10 @@ pub struct Limits {
     pub max_actions: usize,
     /// Шагов выполнения (команды, тесты, сравнения строк).
     pub max_steps: u64,
+    /// Перенаправлений (`redirect`) за одно выполнение; больше — ошибка выполнения.
+    pub max_redirects: usize,
+    /// Объём текста письма, который читает тест `body`, байт (остальное не проверяется).
+    pub max_body_scan: usize,
 }
 
 impl Default for Limits {
@@ -45,6 +51,8 @@ impl Default for Limits {
             max_commands: 4096,
             max_actions: 256,
             max_steps: 10_000_000,
+            max_redirects: 4,
+            max_body_scan: 1024 * 1024,
         }
     }
 }
