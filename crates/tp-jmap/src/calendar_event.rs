@@ -389,9 +389,8 @@ impl Zones {
         scope: AccountScope,
         cal: CollectionId,
     ) -> MethodResult<Option<&Collection>> {
-        if !self.known.contains_key(&cal) {
-            let c = store.get_collection(scope, cal).await?;
-            self.known.insert(cal, c);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.known.entry(cal) {
+            e.insert(store.get_collection(scope, cal).await?);
         }
         Ok(self.known.get(&cal).and_then(Option::as_ref))
     }

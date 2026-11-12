@@ -263,7 +263,7 @@ fn matches(filter: &Value, card: &Map<String, Value>) -> MethodResult<bool> {
         let ok = match key.as_str() {
             "inAddressBook" => {
                 let id = val.as_str().ok_or_else(unsupported)?;
-                card["addressBookIds"].get(id).is_some()
+                card.get("addressBookIds").and_then(|b| b.get(id)).is_some()
             }
             "hasMember" => {
                 let uid = val.as_str().ok_or_else(unsupported)?;
@@ -840,6 +840,24 @@ pub(crate) mod tests {
         let base = book_path(&env, &book).await;
         let corpus = corpus().await;
         for (name, body) in &corpus {
+            if body.contains("\r\nVERSION:2.1\r\n") {
+                // CardDAV принимает vCard 3.0 и 4.0 (`supported-address-data`); выгрузку 2.1 кладёт импорт —
+                // прямо в хранилище.
+                let index = tp_dav::index::card(body).expect("index");
+                let put = env
+                    .dav
+                    .put_object(
+                        env.scope,
+                        book.parse().expect("id"),
+                        name,
+                        body.clone(),
+                        index,
+                        tp_contracts::dav::Precondition::Any,
+                    )
+                    .await;
+                assert!(put.is_ok(), "{name}: {put:?}");
+                continue;
+            }
             let (status, resp) = dav_request(addr, "PUT", &format!("{base}{name}"), body).await;
             assert_eq!(status, 201, "{name}: {resp}");
         }
