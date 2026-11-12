@@ -291,6 +291,18 @@ fn collection_props(cx: &Cx<'_>, c: &Collection, me: &str, v: &mut Vec<(PropName
                 "<c:calendar-data content-type=\"text/calendar\" version=\"2.0\"/>".to_owned(),
             ));
             v.push(p(CALDAV, "max-resource-size", max));
+            let (min, max) = cx.dav.cfg.date_bounds();
+            for (name, bound) in [("min-date-time", min), ("max-date-time", max)] {
+                if let Some(t) = bound {
+                    let value = format!(
+                        "{:04}{:02}{:02}T000000Z",
+                        t.year(),
+                        u8::from(t.month()),
+                        t.day()
+                    );
+                    v.push(p(CALDAV, name, value));
+                }
+            }
             if let Some(tz) = &c.timezone {
                 v.push(p(CALDAV, "calendar-timezone-id", text(tz).into_owned()));
                 if let Some(ical) = vtimezone(tz) {
@@ -490,13 +502,26 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
 /// (`Conflict` хранилища — уже создано).
 pub(crate) async fn ensure_defaults(cx: &Cx<'_>) -> Result<()> {
     let kind = CollectionKind::Calendar;
-    if !cx.store().list_collections(cx.scope, kind).await?.is_empty() {
+    if !cx
+        .store()
+        .list_collections(cx.scope, kind)
+        .await?
+        .is_empty()
+    {
         return Ok(());
     }
     let cfg = &cx.dav.cfg;
     let defaults = [
-        (path::DEFAULT_CALENDAR, &cfg.default_calendar_name, Component::Event),
-        (path::DEFAULT_TASKS, &cfg.default_tasks_name, Component::Todo),
+        (
+            path::DEFAULT_CALENDAR,
+            &cfg.default_calendar_name,
+            Component::Event,
+        ),
+        (
+            path::DEFAULT_TASKS,
+            &cfg.default_tasks_name,
+            Component::Todo,
+        ),
     ];
     for (order, (name, display, component)) in (0u32..).zip(defaults) {
         let c = Collection {

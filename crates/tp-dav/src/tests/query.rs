@@ -7,9 +7,7 @@ use super::{CALS, Env, Resp};
 
 /// VCALENDAR с одним или несколькими компонентами.
 pub(crate) fn ical(components: &str) -> String {
-    format!(
-        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//RU\r\n{components}END:VCALENDAR\r\n"
-    )
+    format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//RU\r\n{components}END:VCALENDAR\r\n")
 }
 
 /// VEVENT с UID и свойствами `props` (строки с `\r\n`).
@@ -45,7 +43,8 @@ async fn put(env: &Env, coll: &str, name: &str, body: &str) {
 async fn dataset() -> Env {
     let env = Env::new();
     env.calendar("work").await;
-    env.put_event("work", "single.ics", "ev-1", "Планёрка").await;
+    env.put_event("work", "single.ics", "ev-1", "Планёрка")
+        .await;
     put(&env, "work", "weekly.ics", &weekly()).await;
     put(
         &env,
@@ -143,9 +142,11 @@ async fn time_range_recurrence() {
         assert_eq!(in_range(&env, start, end).await, want, "{start}–{end}");
     }
     // Открытые границы.
-    let open = r#"<C:comp-filter name="VEVENT"><C:time-range start="20260127T000000Z"/></C:comp-filter>"#;
+    let open =
+        r#"<C:comp-filter name="VEVENT"><C:time-range start="20260127T000000Z"/></C:comp-filter>"#;
     assert_eq!(names(&query(&env, "work", open, "").await), ["weekly.ics"]);
-    let open = r#"<C:comp-filter name="VEVENT"><C:time-range end="20260105T110000Z"/></C:comp-filter>"#;
+    let open =
+        r#"<C:comp-filter name="VEVENT"><C:time-range end="20260105T110000Z"/></C:comp-filter>"#;
     assert_eq!(names(&query(&env, "work", open, "").await), ["single.ics"]);
 }
 
@@ -293,10 +294,7 @@ async fn expand_and_limit_recurrence_set() {
     let env = dataset().await;
     let filter = range("VEVENT", "20260101T000000Z", "20260201T000000Z");
     let data = r#"<C:calendar-data><C:expand start="20260107T000000Z" end="20260201T000000Z"/></C:calendar-data>"#;
-    let body = query_body(
-        &prop("UID", "<C:text-match>weekly</C:text-match>"),
-        data,
-    );
+    let body = query_body(&prop("UID", "<C:text-match>weekly</C:text-match>"), data);
     let r = env
         .send("REPORT", &format!("{CALS}work/"), &[("depth", "1")], &body)
         .await;
@@ -308,10 +306,7 @@ async fn expand_and_limit_recurrence_set() {
     let r = env
         .send("REPORT", &format!("{CALS}work/"), &[("depth", "1")], &body)
         .await;
-    for part in [
-        "DTSTART;VALUE=DATE:20260110",
-        "DTEND;VALUE=DATE:20260111",
-    ] {
+    for part in ["DTSTART;VALUE=DATE:20260110", "DTEND;VALUE=DATE:20260111"] {
         assert!(r.body.contains(part), "{part}: {}", r.body);
     }
     assert!(!r.body.contains("RECURRENCE-ID"), "{}", r.body);
@@ -410,7 +405,10 @@ async fn free_busy() {
     let env = dataset().await;
     for (name, props) in [
         // Пересекается с «Планёркой» (10:00–11:00): периоды сливаются.
-        ("overlap", "DTSTART:20260105T103000Z\r\nDTEND:20260105T120000Z\r\n"),
+        (
+            "overlap",
+            "DTSTART:20260105T103000Z\r\nDTEND:20260105T120000Z\r\n",
+        ),
         (
             "tentative",
             "DTSTART:20260105T140000Z\r\nDTEND:20260105T150000Z\r\nSTATUS:TENTATIVE\r\n",
@@ -424,9 +422,18 @@ async fn free_busy() {
             "DTSTART:20260105T180000Z\r\nDTEND:20260105T190000Z\r\nSTATUS:CANCELLED\r\n",
         ),
         // Выходит за конец интервала: обрезается.
-        ("late", "DTSTART:20260106T080000Z\r\nDTEND:20260106T093000Z\r\n"),
+        (
+            "late",
+            "DTSTART:20260106T080000Z\r\nDTEND:20260106T093000Z\r\n",
+        ),
     ] {
-        put(&env, "work", &format!("{name}.ics"), &ical(&vevent(name, props))).await;
+        put(
+            &env,
+            "work",
+            &format!("{name}.ics"),
+            &ical(&vevent(name, props)),
+        )
+        .await;
     }
     let body = r#"<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
       <C:time-range start="20260105T000000Z" end="20260106T091500Z"/></C:free-busy-query>"#;
@@ -460,8 +467,6 @@ async fn free_busy() {
     );
     let bad = r#"<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
       <C:time-range start="20260105T000000Z"/></C:free-busy-query>"#;
-    let r = env
-        .send("REPORT", &format!("{CALS}work/"), &[], bad)
-        .await;
+    let r = env.send("REPORT", &format!("{CALS}work/"), &[], bad).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 }

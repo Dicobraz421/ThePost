@@ -4,8 +4,10 @@
 //! `PUT` — объект коллекции: тело не больше `max-resource-size` (меньшее из `dav.max_object_size` и лимита
 //! хранилища), индекс — [`crate::index`]; условия `If-Match` (в том числе `*` и список) и `If-None-Match: *` —
 //! 412 при несовпадении. Ответ — 201 (создан) или 204 (перезаписан) с `ETag`: тело хранится без изменений
-//! (RFC 4791 §5.3.4). Предусловия: `valid-calendar-data` / `valid-address-data`, `supported-calendar-component`,
-//! `no-uid-conflict` (с `href` ресурса с тем же UID), `max-resource-size`; нет коллекции — 409.
+//! (RFC 4791 §5.3.4). Предусловия (403 с `<d:error>`): `valid-calendar-data` / `valid-address-data` (тело не
+//! разбирается calcard), `valid-calendar-object-resource` (один UID и один вид компонента, без `METHOD`),
+//! `supported-calendar-component`, `no-uid-conflict` (с `href` ресурса с тем же UID), `max-resource-size`,
+//! `min-date-time` / `max-date-time` (`dav.min_date_year`, `dav.max_date_year`); нет коллекции — 409.
 //!
 //! `MKCALENDAR` и `MKCOL` — коллекция с именем из последнего сегмента URL: в доме календарей — календарь, в доме
 //! адресных книг — адресная книга (`resourcetype` другого вида — 403 `valid-resourcetype`). Начальные свойства —
@@ -18,12 +20,14 @@ use std::collections::BTreeSet;
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
+use calcard::icalendar::{ICalendar, ICalendarProperty};
 use tp_contracts::dav::{
-    Collection, CollectionId, CollectionKind, Component, DeleteOutcome, Precondition, PutOutcome,
+    Collection, CollectionId, CollectionKind, Component, DeleteOutcome, ObjectIndex, Precondition,
+    PutOutcome,
 };
 use tp_contracts::{Error, Result};
 
-use crate::index;
+use crate::index::{self, IndexError};
 use crate::path::Target;
 use crate::props::{self, content_type};
 use crate::server::{Cx, not_allowed, precondition, read, status, xml_response};
@@ -78,6 +82,54 @@ fn valid_data(kind: CollectionKind) -> &'static str {
         CollectionKind::Calendar => "<c:valid-calendar-data/>",
         CollectionKind::AddressBook => "<card:valid-address-data/>",
     }
+}
+
+/// Индекс тела объекта или нарушенное предусловие (RFC 4791 §5.3.2.1, RFC 6352 §6.3.2.1): тело не разбирается
+/// или в нём нет компонента — `valid-calendar-data` / `valid-address-data`; `METHOD`, нет UID, разные UID или виды
+/// компонентов — `valid-calendar-object-resource`.
+fn checked_index(
+    cx: &Cx<'_>,
+    kind: CollectionKind,
+    text: &str,
+) -> std::result::Result<ObjectIndex, &'static str> {
+    const RESOURCE: &str = "<c:valid-calendar-object-resource/>";
+    let result = match kind {
+        CollectionKind::AddressBook => index::card(text).map_err(|e| (e, valid_data(kind))),
+        CollectionKind::Calendar => match ICalendar::parse(text) {
+            Err(_) => Err((IndexError::Calendar, valid_data(kind))),
+            Ok(ical) => {
+                let method = ical
+                    .components
+                    .first()
+                    .is_some_and(|c| c.has_property(&ICalendarProperty::Method));
+                match index::of_calendar(&ical, &cx.dav.index_options()) {
+                    Err(IndexError::Calendar) => Err((IndexError::Calendar, valid_data(kind))),
+                    Err(e) => Err((e, RESOURCE)),
+                    Ok(_) if method => Err((IndexError::Mixed, RESOURCE)),
+                    Ok(idx) => Ok(idx),
+                }
+            }
+        },
+    };
+    result.map_err(|(e, inner)| {
+        tracing::debug!(error = %e, precondition = inner, "DAV PUT: тело не принято");
+        inner
+    })
+}
+
+/// Даты объекта вне `dav.min_date_year` … `dav.max_date_year`: нарушенное предусловие. Проверяется интервал
+/// индекса: начало первого вхождения и конец последнего, если он известен (объект без дат, повтор без конца и
+/// вхождения за горизонтом развёртки `dav.expand_horizon` конца не имеют и по нему не отклоняются).
+fn date_violation(cx: &Cx<'_>, idx: &ObjectIndex) -> Option<&'static str> {
+    let span = idx.span?;
+    let (min, max) = cx.dav.cfg.date_bounds();
+    if min.is_some_and(|m| span.start < m) {
+        return Some("<c:min-date-time/>");
+    }
+    if max.is_some_and(|m| span.start >= m || span.end.is_some_and(|e| e > m)) {
+        return Some("<c:max-date-time/>");
+    }
+    None
 }
 
 /// Условие записи и удаления по `If-Match` и `If-None-Match`; `None` — условие уже не выполнено (412).
@@ -135,18 +187,18 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
     let Ok(text) = String::from_utf8(bytes.to_vec()) else {
         return Ok(precondition(StatusCode::FORBIDDEN, valid_data(kind)));
     };
-    let idx = match index::index(&text, kind, &cx.dav.index_options()) {
+    let idx = match checked_index(cx, kind, &text) {
         Ok(idx) => idx,
-        Err(e) => {
-            tracing::debug!(error = %e, "DAV PUT: тело не принято");
-            return Ok(precondition(StatusCode::FORBIDDEN, valid_data(kind)));
-        }
+        Err(inner) => return Ok(precondition(StatusCode::FORBIDDEN, inner)),
     };
     if !c.components.contains(&idx.component) {
         return Ok(precondition(
             StatusCode::FORBIDDEN,
             "<c:supported-calendar-component/>",
         ));
+    }
+    if let Some(inner) = date_violation(cx, &idx) {
+        return Ok(precondition(StatusCode::FORBIDDEN, inner));
     }
     let Some(pre) = condition(cx, c.id, name).await? else {
         return Ok(status(StatusCode::PRECONDITION_FAILED));

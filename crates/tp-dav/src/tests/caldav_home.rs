@@ -116,9 +116,7 @@ async fn defaults_created_once() {
         ]
     );
     // Пока есть хоть один календарь, удалённый не создаётся заново.
-    let r = env
-        .send("DELETE", &format!("{CALS}tasks/"), &[], "")
-        .await;
+    let r = env.send("DELETE", &format!("{CALS}tasks/"), &[], "").await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
     env.propfind(CALS, "1", "").await;
     assert_eq!(list().await.len(), 1);

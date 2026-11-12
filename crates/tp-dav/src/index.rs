@@ -67,6 +67,11 @@ pub fn card(body: &str) -> Result<ObjectIndex, IndexError> {
 /// Индекс iCalendar: один вид компонента и один UID на ресурс.
 pub fn calendar(body: &str, opts: &IndexOptions) -> Result<ObjectIndex, IndexError> {
     let ical = ICalendar::parse(body).map_err(|_| IndexError::Calendar)?;
+    of_calendar(&ical, opts)
+}
+
+/// Индекс разобранного iCalendar (см. [`calendar`]).
+pub fn of_calendar(ical: &ICalendar, opts: &IndexOptions) -> Result<ObjectIndex, IndexError> {
     if ical.components.first().map(|c| &c.component_type)
         != Some(&ICalendarComponentType::VCalendar)
     {
@@ -96,7 +101,7 @@ pub fn calendar(body: &str, opts: &IndexOptions) -> Result<ObjectIndex, IndexErr
     checked(ObjectIndex {
         component,
         uid,
-        span: span(&ical, opts),
+        span: span(ical, opts),
     })
 }
 

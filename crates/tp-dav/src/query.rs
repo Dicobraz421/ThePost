@@ -31,8 +31,8 @@ use calcard::common::PartialDateTime;
 use calcard::common::timezone::Tz;
 use calcard::icalendar::{
     ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarEntry, ICalendarFreeBusyType,
-    ICalendarParameter, ICalendarPeriod, ICalendarProperty, ICalendarStatus,
-    ICalendarTransparency, ICalendarValue, ICalendarValueType,
+    ICalendarParameter, ICalendarPeriod, ICalendarProperty, ICalendarStatus, ICalendarTransparency,
+    ICalendarValue, ICalendarValueType,
 };
 use time::{Date, Month, OffsetDateTime};
 use tp_contracts::Result;
@@ -301,7 +301,11 @@ impl CompFilter {
         }
         match self.comps.as_slice() {
             [] => Some(None),
-            [c] if !c.not_defined && c.range.is_none() && c.props.is_empty() && c.comps.is_empty() => {
+            [c] if !c.not_defined
+                && c.range.is_none()
+                && c.props.is_empty()
+                && c.comps.is_empty() =>
+            {
                 Component::from_str(&c.name)
                     .ok()
                     .filter(|x| x.fits(CollectionKind::Calendar))
@@ -510,11 +514,7 @@ fn param_matches(e: &ICalendarEntry, f: &ParamFilter) -> bool {
     if f.not_defined {
         return params.peek().is_none();
     }
-    params.any(|p| {
-        f.text
-            .as_ref()
-            .is_none_or(|t| t.matches(p.value.as_text()))
-    })
+    params.any(|p| f.text.as_ref().is_none_or(|t| t.matches(p.value.as_text())))
 }
 
 /// Текстовые значения свойства; у свойства без текстовых значений (дата, длительность, число) — его запись

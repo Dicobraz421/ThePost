@@ -33,7 +33,8 @@ async fn multiget_mixed() {
     env.calendar("other").await;
     env.put_event("work", "a.ics", "a", "Первая").await;
     env.put_event("work", "b%20c.ics", "b", "Вторая").await;
-    env.put_event("other", "x.ics", "x", "Чужой календарь").await;
+    env.put_event("other", "x.ics", "x", "Чужой календарь")
+        .await;
     let hrefs = [
         "/dav/calendars/ivan@example.org/work/b%20c.ics",
         "/dav/calendars/ivan@example.org/work/missing.ics",
@@ -69,7 +70,12 @@ async fn multiget_limit_and_expand() {
          DTEND:20260105T103000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\nSUMMARY:Зарядка\r\nEND:VEVENT\r\n",
     );
     let path = format!("{CALS}work/daily.ics");
-    assert!(env.send("PUT", &path, &[], &daily).await.status.is_success());
+    assert!(
+        env.send("PUT", &path, &[], &daily)
+            .await
+            .status
+            .is_success()
+    );
     let three = [path.as_str(), path.as_str(), path.as_str()];
     let r = report(&env, "work", &multiget_body("<D:getetag/>", &three)).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
@@ -96,8 +102,14 @@ async fn tasks() -> Env {
     let env = Env::new();
     env.propfind(CALS, "0", "").await;
     for (uid, props) in [
-        ("start-due", "DTSTART:20260110T090000Z\r\nDUE:20260112T180000Z\r\n"),
-        ("start-duration", "DTSTART:20260110T090000Z\r\nDURATION:PT2H\r\n"),
+        (
+            "start-due",
+            "DTSTART:20260110T090000Z\r\nDUE:20260112T180000Z\r\n",
+        ),
+        (
+            "start-duration",
+            "DTSTART:20260110T090000Z\r\nDURATION:PT2H\r\n",
+        ),
         ("start", "DTSTART:20260110T090000Z\r\n"),
         ("due", "DUE:20260115T120000Z\r\n"),
         (
@@ -143,9 +155,18 @@ async fn tasks_collection_accepts_only_vtodo() {
         r.body
     );
     let r = env
-        .send("PUT", &format!("{CALS}calendar/t.ics"), &[], &vtodo("t", ""))
+        .send(
+            "PUT",
+            &format!("{CALS}calendar/t.ics"),
+            &[],
+            &vtodo("t", ""),
+        )
         .await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN, "задача в календаре событий");
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "задача в календаре событий"
+    );
     let c = env
         .collection(CollectionKind::Calendar, "tasks")
         .await
@@ -174,7 +195,12 @@ async fn vtodo_time_range() {
         (
             "20260110T100000Z",
             "20260110T110000Z",
-            vec!["created.ics", "no-dates.ics", "start-due.ics", "start-duration.ics"],
+            vec![
+                "created.ics",
+                "no-dates.ics",
+                "start-due.ics",
+                "start-duration.ics",
+            ],
         ),
         // DTSTART без срока — только момент начала; DTSTART+DURATION — до 11:00.
         (
@@ -230,10 +256,18 @@ async fn thunderbird_tasks_sync_snapshot() {
     env.propfind(CALS, "0", "").await;
     for (uid, props) in [
         ("buy", "DUE;VALUE=DATE:20260115\r\nPRIORITY:1\r\n"),
-        ("call", "STATUS:COMPLETED\r\nCOMPLETED:20260104T100000Z\r\nPERCENT-COMPLETE:100\r\n"),
+        (
+            "call",
+            "STATUS:COMPLETED\r\nCOMPLETED:20260104T100000Z\r\nPERCENT-COMPLETE:100\r\n",
+        ),
     ] {
         let r = env
-            .send("PUT", &format!("{CALS}tasks/{uid}.ics"), &[], &vtodo(uid, props))
+            .send(
+                "PUT",
+                &format!("{CALS}tasks/{uid}.ics"),
+                &[],
+                &vtodo(uid, props),
+            )
             .await;
         assert_eq!(r.status, StatusCode::CREATED);
     }
