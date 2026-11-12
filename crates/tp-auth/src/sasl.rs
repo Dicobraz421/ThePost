@@ -569,6 +569,49 @@ mod tests {
         ));
     }
 
+    /// ManageSieve (RFC 5804) входит со службой `sieve`: имя службы не сверяется со списком, а токен без
+    /// областей (или с областями других служб) вход не отсекает — области проверяет протокол.
+    #[tokio::test]
+    async fn sieve_service() {
+        let sieve = SaslContext {
+            service: "sieve",
+            tls: true,
+        };
+        let s = server();
+        assert_eq!(s.mechanisms(sieve.tls), DEFAULT.to_vec());
+        let mut p = s.start(Mechanism::Plain, &sieve).expect("plain");
+        assert_eq!(
+            done(
+                p.step(Some(b"\0tim\0tanstaaftanstaaf"))
+                    .await
+                    .expect("step")
+            ),
+            "tim"
+        );
+        let mut p = s.start(Mechanism::Plain, &sieve).expect("plain");
+        assert_eq!(
+            p.step(Some(b"\0tim\0wrong")).await,
+            Ok(SaslStep::Fail(SaslFailure::Authentication))
+        );
+        let msg = format!(
+            "n,a=user@example.com,\x01host=server.example.com\x01port=4190\x01auth=Bearer {TOKEN}\x01\x01"
+        );
+        let mut o = s
+            .start(Mechanism::OauthBearer, &sieve)
+            .expect("oauthbearer");
+        let SaslStep::Done(who) = o.step(Some(msg.as_bytes())).await.expect("ok") else {
+            panic!("not done")
+        };
+        assert_eq!(who.login, "user@example.com");
+        assert_eq!(who.scopes, Some(BTreeSet::new()), "области — как в токене");
+        // Без TLS открытые механизмы службе `sieve` не предлагаются.
+        let plain = SaslContext {
+            service: "sieve",
+            tls: false,
+        };
+        assert!(s.start(Mechanism::Plain, &plain).is_err());
+    }
+
     /// Пример Google (developers.google.com/gmail/imap/xoauth2-protocol).
     #[tokio::test]
     async fn xoauth2() {
