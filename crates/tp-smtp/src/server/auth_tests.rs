@@ -56,11 +56,11 @@ struct Blocking {
 
 #[async_trait]
 impl Authenticator for Blocking {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
+    async fn verify(&self, credentials: Credentials, peer: Option<IpAddr>) -> Result<Principal> {
         if self.blocked.load(Ordering::SeqCst) {
             return Err(Error::Forbidden);
         }
-        self.inner.verify(credentials).await
+        self.inner.verify(credentials, peer).await
     }
 }
 

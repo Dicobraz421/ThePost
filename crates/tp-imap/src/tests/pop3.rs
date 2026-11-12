@@ -297,5 +297,5 @@ async fn quit_delete_audited_by_policy() {
     assert_eq!(e.len(), 1, "{e:?}");
     assert_eq!(e[0].action, AuditAction::Delete);
     assert_eq!(e[0].object.mailbox, Some(env.mailbox(SpecialUse::Inbox)));
-    assert_eq!(e[0].client.as_deref(), Some("pop3 192.0.2.1"));
+    assert_eq!(e[0].client.as_deref(), Some("pop3 192.0.2.7"));
 }

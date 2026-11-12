@@ -38,7 +38,8 @@ use tp_contracts::ext::{DecisionHooks, Migration, Module, ModuleCtx, Registry};
 use tp_contracts::ids::DomainId;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{
-    AccountScope, AccountStore, AccountUpsert, MessageStore, Policy, PolicyStore, PolicyTarget,
+    AccountKind, AccountScope, AccountStore, AccountUpsert, MessageStore, Policy, PolicyStore,
+    PolicyTarget,
 };
 use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
@@ -621,6 +622,8 @@ async fn mvp_mail_flow() {
                 display_name: "Alice".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -938,6 +941,8 @@ async fn mvp_mail_flow() {
                 display_name: "Bob".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -1656,6 +1661,8 @@ async fn meeting_scheduling() {
                     display_name: name.to_owned(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: tp_contracts::meta::AccountKind::User,
                 },
             )
             .await

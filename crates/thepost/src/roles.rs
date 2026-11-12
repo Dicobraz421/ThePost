@@ -845,7 +845,7 @@ mod tests {
             DeliveryDecision, DeliveryEvent, DeliveryEventKind, DeliveryLog, DeliveryQuery,
         };
         use tp_contracts::membership::NodeId;
-        use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+        use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
         use tp_contracts::sieve::VacationLog;
         use tp_contracts::{DomainId, TenantId};
 
@@ -888,6 +888,8 @@ mod tests {
                     display_name: "User".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await

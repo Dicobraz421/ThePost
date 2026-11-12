@@ -686,6 +686,8 @@ async fn insert_batch_all_or_nothing() {
                 display_name: "B".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: tp_contracts::meta::AccountKind::User,
             },
         )
         .await

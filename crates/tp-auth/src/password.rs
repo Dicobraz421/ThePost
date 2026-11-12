@@ -6,6 +6,7 @@
 //! протокол спрашивает ограничитель до [`PasswordAuthenticator`] и сообщает ему о неудаче.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -247,7 +248,7 @@ impl PasswordAuthenticator {
 
 #[async_trait]
 impl Authenticator for PasswordAuthenticator {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
+    async fn verify(&self, credentials: Credentials, _peer: Option<IpAddr>) -> Result<Principal> {
         let Credentials::Password { login, secret } = credentials else {
             return Err(Error::Forbidden);
         };
@@ -324,7 +325,7 @@ mod tests {
                 ("bob@example.org", "builder"),
             ]))));
         let p = auth
-            .verify(pw("Alice@Example.org", "wonderland"))
+            .verify(pw("Alice@Example.org", "wonderland"), crate::testutil::PEER)
             .await
             .expect("ok");
         assert_eq!(p.account, ids[0]);
@@ -338,7 +339,10 @@ mod tests {
             pw("bob@example.org", "builder"),
             Credentials::Bearer("token".into()),
         ] {
-            assert_eq!(auth.verify(bad).await, Err(Error::Forbidden));
+            assert_eq!(
+                auth.verify(bad, crate::testutil::PEER).await,
+                Err(Error::Forbidden)
+            );
         }
     }
 
@@ -370,18 +374,27 @@ mod tests {
         );
 
         assert!(
-            auth.verify(pw("alice@example.org", secret.expose()))
-                .await
-                .is_ok()
+            auth.verify(
+                pw("alice@example.org", secret.expose()),
+                crate::testutil::PEER
+            )
+            .await
+            .is_ok()
         );
         assert!(
-            auth.verify(pw("alice@example.org", other.expose()))
-                .await
-                .is_ok()
+            auth.verify(
+                pw("alice@example.org", other.expose()),
+                crate::testutil::PEER
+            )
+            .await
+            .is_ok()
         );
         assert_eq!(
-            auth.verify(pw("alice@example.org", "abcdefghijklmnop"))
-                .await,
+            auth.verify(
+                pw("alice@example.org", "abcdefghijklmnop"),
+                crate::testutil::PEER
+            )
+            .await,
             Err(Error::Forbidden)
         );
 
@@ -389,16 +402,23 @@ mod tests {
         apps.revoke(t, &phone.id).await.expect("revoke");
         apps.revoke(t, &phone.id).await.expect("revoke again");
         assert_eq!(
-            auth.verify(pw("alice@example.org", secret.expose())).await,
+            auth.verify(
+                pw("alice@example.org", secret.expose()),
+                crate::testutil::PEER
+            )
+            .await,
             Err(Error::Forbidden)
         );
         assert!(
-            auth.verify(pw("alice@example.org", other.expose()))
-                .await
-                .is_ok()
+            auth.verify(
+                pw("alice@example.org", other.expose()),
+                crate::testutil::PEER
+            )
+            .await
+            .is_ok()
         );
         assert!(
-            auth.verify(pw("alice@example.org", "wonderland"))
+            auth.verify(pw("alice@example.org", "wonderland"), crate::testutil::PEER)
                 .await
                 .is_ok()
         );

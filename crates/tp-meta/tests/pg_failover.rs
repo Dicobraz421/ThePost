@@ -622,7 +622,7 @@ async fn keyed_write_not_doubled_after_commit_cut() {
         .expect("очередь модерации переживает обрыв после COMMIT");
     assert_eq!(cut.cuts(), 4, "COMMIT очереди модерации оборван");
     let list = direct
-        .held(tenant, Some(group.id), 10)
+        .held(tenant, Some(group.id), None, 10)
         .await
         .expect("очередь");
     assert_eq!(list.iter().map(|h| h.id).collect::<Vec<_>>(), vec![held.id]);

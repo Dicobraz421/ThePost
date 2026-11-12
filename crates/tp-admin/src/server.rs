@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::rejection::RawPathParamsRejection;
-use axum::extract::{DefaultBodyLimit, MatchedPath, RawPathParams, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, RawPathParams, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -475,17 +475,22 @@ impl Admin {
 
     /// Субъект по заголовку `Authorization: Bearer` (токен OIDC); нет заголовка, другая схема, неверный токен —
     /// `Forbidden`.
-    pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal> {
+    pub async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<IpAddr>,
+    ) -> Result<Principal> {
         let token = bearer(headers)?;
         self.d
             .auth
-            .verify(Credentials::Bearer(token.to_owned()))
+            .verify(Credentials::Bearer(token.to_owned()), peer)
             .await
     }
 
     /// Администратор запроса: сессия Admin API ([`crate::init`]) или токен OIDC с ролями по конфигурации.
     /// Локальный токен `admin init` здесь не принимается — только обмен на сессию (`POST /api/v1/session`).
-    pub async fn identify(&self, headers: &HeaderMap) -> Result<Caller> {
+    /// `peer` — адрес клиента соединения (CTR-57; `None` — запрос без соединения клиента).
+    pub async fn identify(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> Result<Caller> {
         let token = bearer(headers)?;
         if let Some(c) = self.session_caller(token, OffsetDateTime::now_utc()) {
             return c;
@@ -493,7 +498,7 @@ impl Admin {
         if tp_contracts::admin_token::is_local_admin_token(token) {
             return Err(Error::Forbidden);
         }
-        Ok(self.caller(self.authenticate(headers).await?))
+        Ok(self.caller(self.authenticate(headers, peer).await?))
     }
 
     /// Роли субъекта по назначениям конфигурации.
@@ -527,7 +532,12 @@ async fn guard(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let caller = match a.identify(req.headers()).await {
+    // Адрес клиента соединения ставит сервер HTTP (`tp_platform::service_http`); без соединения — неизвестен.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    let caller = match a.identify(req.headers(), peer).await {
         Ok(c) => c,
         Err(e) => return auth_error(&e),
     };

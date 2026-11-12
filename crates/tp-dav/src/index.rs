@@ -18,9 +18,9 @@ use calcard::icalendar::{
     ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarProperty, ICalendarStatus,
     ICalendarTransparency, ICalendarValue,
 };
-use calcard::vcard::VCard;
+use calcard::vcard::{VCard, VCardProperty, VCardValue};
 use time::OffsetDateTime;
-use tp_contracts::dav::{CollectionKind, Component, ObjectIndex, Span};
+use tp_contracts::dav::{CardSearch, CollectionKind, Component, ObjectIndex, Span};
 use tp_contracts::schedule::{BusyKind, BusyPeriod, MAX_BUSY_PERIODS, merge_busy};
 
 /// Параметры развёртки повторов.
@@ -61,11 +61,31 @@ pub fn index(
     }
 }
 
-/// Индекс vCard: UID обязателен (RFC 6352 §5.1).
+/// Индекс vCard: UID обязателен (RFC 6352 §5.1); поисковые строки (CTR-54) — полное имя (`FN`), части имени (`N`),
+/// псевдонимы (`NICKNAME`) и адреса (`EMAIL`).
 pub fn card(body: &str) -> Result<ObjectIndex, IndexError> {
     let v = VCard::parse(body).map_err(|_| IndexError::Card)?;
     let uid = v.uid().ok_or(IndexError::Uid)?.to_owned();
-    checked(ObjectIndex::new(Component::Card, uid, None))
+    let searched = [
+        VCardProperty::Fn,
+        VCardProperty::N,
+        VCardProperty::Nickname,
+        VCardProperty::Email,
+    ];
+    let strings = v
+        .entries
+        .iter()
+        .filter(|e| searched.contains(&e.name))
+        .flat_map(|e| &e.values)
+        .flat_map(|value| match value {
+            VCardValue::Text(text) => std::slice::from_ref(text),
+            VCardValue::Component(parts) => parts.as_slice(),
+            _ => &[],
+        });
+    checked(ObjectIndex {
+        search: CardSearch::new(strings),
+        ..ObjectIndex::new(Component::Card, uid, None)
+    })
 }
 
 /// Индекс iCalendar: один вид компонента и один UID на ресурс.
@@ -315,6 +335,10 @@ mod tests {
         let vcard = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c-1\r\nFN:Иван Петров\r\nN:Петров;Иван;;;\r\nEND:VCARD\r\n";
         let idx = index(vcard, CollectionKind::AddressBook, &opts()).expect("card");
         assert_eq!((idx.component, idx.uid.as_str()), (Component::Card, "c-1"));
+        assert_eq!(idx.search.strings, ["иван петров", "петров", "иван"]);
+        let mail = vcard.replace("END:VCARD", "EMAIL;TYPE=work:Ivan@Example.com\r\nEND:VCARD");
+        let idx = card(&mail).expect("card");
+        assert!(idx.search.matches("ivan@ex") && idx.search.matches("ПЕТР"));
     }
 
     #[test]

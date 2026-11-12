@@ -54,7 +54,7 @@ impl Env {
         assert_eq!(d.data(&e, Bytes::from(raw)).await.code, 250);
         let held = self
             .groups
-            .held(T, Some(group.id), 100)
+            .held(T, Some(group.id), None, 100)
             .await
             .expect("held")
             .into_iter()
@@ -118,7 +118,7 @@ async fn approved_message_delivered_to_each_member_once() {
     assert!(env.queued().is_empty(), "{:?}", env.queued());
     assert!(
         env.groups
-            .held(T, Some(g.id), 100)
+            .held(T, Some(g.id), None, 100)
             .await
             .expect("held")
             .is_empty()

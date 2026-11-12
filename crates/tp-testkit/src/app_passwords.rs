@@ -87,6 +87,8 @@ mod tests {
                     display_name: "Foreign".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: tp_contracts::meta::AccountKind::User,
                 },
             )
             .await

@@ -5,8 +5,9 @@ use std::collections::BTreeSet;
 use time::{Duration, OffsetDateTime};
 use tp_contracts::bus::{EventBus, EventKind};
 use tp_contracts::dav::{
-    Collection, CollectionId, CollectionKind, Component, DavLimits, DavStore, DeleteOutcome,
-    ObjectIndex, Precondition, Put, PutOutcome, Span, TimeRange,
+    CardSearch, Collection, CollectionId, CollectionKind, Component, DavLimits, DavStore,
+    DeleteOutcome, MoveOutcome, ObjectIndex, Precondition, Put, PutOutcome, Span, TimeRange,
+    default_of,
 };
 use tp_contracts::meta::AccountScope;
 use tp_contracts::{AccountId, Error, ModSeq, TenantId};
@@ -947,4 +948,349 @@ pub async fn signals(store: &dyn DavStore, bus: &dyn EventBus, scope: AccountSco
         .await
         .expect("delete");
     expect(book.id, m).await;
+}
+
+/// Набор проверок [`DavStore`] (CTR-54, CTR-56): коллекция по умолчанию (признак не больше чем у одной на вид),
+/// подписка, видимость и оповещения по умолчанию; перенос объекта между коллекциями (идентификатор сохраняется,
+/// изменения обеих коллекций, конфликт UID, занятое имя); поиск контактов по поисковым строкам индекса.
+/// `s` — учётная запись без коллекций; хватает лимитов [`LIMITS`].
+pub async fn organize(store: &dyn DavStore, s: AccountScope) {
+    let cal = CollectionKind::Calendar;
+    let list = async || store.list_collections(s, cal).await.expect("list");
+    let get = async |id: CollectionId| {
+        store
+            .get_collection(s, id)
+            .await
+            .expect("get")
+            .expect("коллекция")
+    };
+
+    // ---------- Коллекция по умолчанию и свойства (CTR-56) ----------
+    let work = Collection::new(cal, "work");
+    let home = Collection {
+        order: 1,
+        ..Collection::new(cal, "home")
+    };
+    for c in [&work, &home] {
+        store.create_collection(s, c.clone()).await.expect("create");
+    }
+    // Не назначена — прежнее правило: первая по порядку.
+    let all = list().await;
+    assert!(
+        all.iter()
+            .all(|c| !c.is_default && c.subscribed && c.visible)
+    );
+    assert_eq!(default_of(&all).map(|c| c.id), Some(work.id));
+
+    let alerts =
+        r#"{"a1":{"@type":"Alert","trigger":{"@type":"OffsetTrigger","offset":"-PT15M"}}}"#;
+    let home_set = Collection {
+        is_default: true,
+        subscribed: false,
+        visible: false,
+        alerts_with_time: Some(alerts.into()),
+        alerts_without_time: Some("{}".into()),
+        ..home.clone()
+    };
+    let m_home = store
+        .update_collection(s, home_set.clone())
+        .await
+        .expect("update");
+    // Оповещения, подписка и видимость сохраняются и читаются.
+    assert_eq!(
+        get(home.id).await,
+        Collection {
+            state: m_home,
+            ..home_set.clone()
+        }
+    );
+    assert_eq!(default_of(&list().await).map(|c| c.id), Some(home.id));
+
+    // Смена коллекции по умолчанию: признак ровно у одной; у прежней — своё изменение свойств раньше новой.
+    let before = store.state(s, cal).await.expect("state");
+    let m_work = store
+        .update_collection(
+            s,
+            Collection {
+                is_default: true,
+                ..work.clone()
+            },
+        )
+        .await
+        .expect("update");
+    let all = list().await;
+    assert_eq!(
+        all.iter()
+            .filter(|c| c.is_default)
+            .map(|c| c.id)
+            .collect::<Vec<_>>(),
+        [work.id]
+    );
+    let was = get(home.id).await;
+    assert!(before < was.state && was.state < m_work, "{was:?}");
+    assert_eq!(
+        was,
+        Collection {
+            is_default: false,
+            state: was.state,
+            ..home_set.clone()
+        }
+    );
+    let ch = store
+        .collection_changes(s, cal, before, 10)
+        .await
+        .expect("changes");
+    assert_eq!(ch.updated, [home.id, work.id]);
+    assert_eq!(ch.new_state, m_work);
+
+    // Признак — по видам независимо; создание с признаком; оповещения — только у календаря.
+    let bad = Collection {
+        alerts_with_time: Some(alerts.into()),
+        ..Collection::new(CollectionKind::AddressBook, "bad")
+    };
+    assert!(matches!(
+        store.create_collection(s, bad).await,
+        Err(Error::Invalid(_))
+    ));
+    let book = Collection {
+        is_default: true,
+        ..Collection::new(CollectionKind::AddressBook, "book")
+    };
+    store
+        .create_collection(s, book.clone())
+        .await
+        .expect("create");
+    assert!(get(book.id).await.is_default);
+    assert!(get(work.id).await.is_default);
+    // Снятие признака: коллекция по умолчанию не назначена.
+    store
+        .update_collection(s, work.clone())
+        .await
+        .expect("update");
+    assert!(list().await.iter().all(|c| !c.is_default));
+
+    // ---------- Перенос (CTR-54) ----------
+    let e1 = stored(
+        put(
+            store,
+            s,
+            work.id,
+            "e1.ics",
+            event("u1", Some((1, Some(2)))),
+            Precondition::Any,
+        )
+        .await,
+    );
+    for (coll, name, uid) in [
+        (work.id, "e2.ics", "u2"),
+        (home.id, "x.ics", "u1"),
+        (home.id, "e2.ics", "u9"),
+    ] {
+        stored(put(store, s, coll, name, event(uid, None), Precondition::Any).await);
+    }
+    let mv = async |from: CollectionId, name: &'static str, to: CollectionId, pre: Precondition| {
+        store.move_object(s, from, name, to, pre).await
+    };
+    assert_eq!(
+        mv(work.id, "e1.ics", home.id, Precondition::Any).await,
+        Ok(MoveOutcome::UidConflict {
+            name: "x.ics".into()
+        })
+    );
+    assert_eq!(
+        mv(work.id, "e2.ics", home.id, Precondition::Any).await,
+        Ok(MoveOutcome::PreconditionFailed)
+    );
+    assert_eq!(
+        mv(
+            work.id,
+            "e1.ics",
+            home.id,
+            Precondition::IfMatch("other".into())
+        )
+        .await,
+        Ok(MoveOutcome::PreconditionFailed)
+    );
+    assert_eq!(
+        mv(work.id, "none.ics", home.id, Precondition::Any).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        mv(work.id, "e1.ics", CollectionId::new(), Precondition::Any).await,
+        Err(Error::NotFound)
+    );
+    for to in [work.id, book.id] {
+        assert!(matches!(
+            mv(work.id, "e1.ics", to, Precondition::Any).await,
+            Err(Error::Invalid(_))
+        ));
+    }
+    store
+        .delete_object(s, home.id, "x.ics", Precondition::Any)
+        .await
+        .expect("delete");
+    let since = store.state(s, cal).await.expect("state");
+    let source = store
+        .get_object(s, work.id, "e1.ics")
+        .await
+        .expect("get")
+        .expect("объект");
+    let MoveOutcome::Moved(moved) = mv(
+        work.id,
+        "e1.ics",
+        home.id,
+        Precondition::IfMatch(e1.etag.clone()),
+    )
+    .await
+    .expect("move") else {
+        panic!("не перенесён");
+    };
+    // Идентификатор, тело и индекс сохраняются; ETag и ModSeq — новые.
+    assert_eq!(moved.id, e1.id);
+    assert_ne!(moved.etag, e1.etag);
+    assert!(since < moved.removed && moved.removed < moved.modseq);
+    let target = store
+        .get_object(s, home.id, "e1.ics")
+        .await
+        .expect("get")
+        .expect("объект");
+    assert_eq!(
+        target,
+        tp_contracts::dav::DavObject {
+            collection: home.id,
+            etag: moved.etag.clone(),
+            ..source
+        }
+    );
+    assert_eq!(store.get_object(s, work.id, "e1.ics").await, Ok(None));
+    assert_eq!(get(work.id).await.state, moved.removed);
+    assert_eq!(get(home.id).await.state, moved.modseq);
+    // Виден в изменениях обеих коллекций; в изменениях учётной записи — обновление, не удаление.
+    let ch = store.changes(s, work.id, since, 10).await.expect("changes");
+    assert_eq!(
+        (ch.created.len(), ch.updated.len(), ch.destroyed),
+        (0, 0, vec!["e1.ics".to_owned()])
+    );
+    let ch = store.changes(s, home.id, since, 10).await.expect("changes");
+    assert_eq!(
+        (ch.created, ch.updated.len(), ch.destroyed.len()),
+        (vec!["e1.ics".to_owned()], 0, 0)
+    );
+    let ch = store
+        .account_changes(s, cal, since, 10)
+        .await
+        .expect("changes");
+    assert_eq!(
+        (ch.created.len(), ch.updated, ch.destroyed.len()),
+        (0, vec![e1.id], 0)
+    );
+    assert_eq!(ch.new_state, moved.modseq);
+    // Лимит объектов целевой коллекции.
+    let max = store.limits().max_objects;
+    if max <= 8 {
+        for i in 2..max {
+            let (name, uid) = (format!("f{i}.ics"), format!("f{i}"));
+            stored(
+                put(
+                    store,
+                    s,
+                    home.id,
+                    &name,
+                    event(&uid, None),
+                    Precondition::Any,
+                )
+                .await,
+            );
+        }
+        assert_eq!(
+            mv(work.id, "e2.ics", home.id, Precondition::Any).await,
+            Ok(MoveOutcome::PreconditionFailed)
+        );
+        stored(
+            put(
+                store,
+                s,
+                work.id,
+                "e3.ics",
+                event("u3", None),
+                Precondition::Any,
+            )
+            .await,
+        );
+        assert_eq!(
+            mv(work.id, "e3.ics", home.id, Precondition::Any).await,
+            Err(Error::QuotaExceeded)
+        );
+    }
+
+    // ---------- Поиск контактов (CTR-54) ----------
+    let card = |uid: &str, search: &[&str]| ObjectIndex {
+        search: CardSearch::new(search),
+        ..ObjectIndex::new(Component::Card, uid, None)
+    };
+    let put_card = async |name: &str, index: ObjectIndex| {
+        stored(
+            store
+                .put_object(
+                    s,
+                    book.id,
+                    name,
+                    "BEGIN:VCARD\r\nEND:VCARD\r\n".into(),
+                    index,
+                    Precondition::Any,
+                )
+                .await
+                .expect("put"),
+        )
+    };
+    put_card(
+        "a.vcf",
+        card("c1", &["Анна Петрова", "Петрова", "ann@example.com"]),
+    )
+    .await;
+    put_card("b.vcf", card("c2", &["Борис 100%_x", "boris@example.com"])).await;
+    put_card("c.vcf", card("c3", &[])).await;
+    let find = async |needle: &str, limit: usize| {
+        let found = store
+            .find_cards(s, book.id, needle, limit)
+            .await
+            .expect("find");
+        found.into_iter().map(|o| o.name).collect::<Vec<_>>()
+    };
+    // По части имени и по адресу, без учёта регистра; пустой запрос — все; по имени ресурса, не более limit.
+    assert_eq!(find("ПЕТР", 10).await, ["a.vcf"]);
+    assert_eq!(find("example.com", 10).await, ["a.vcf", "b.vcf"]);
+    assert_eq!(find("example.com", 1).await, ["a.vcf"]);
+    assert_eq!(find("", 10).await, ["a.vcf", "b.vcf", "c.vcf"]);
+    assert_eq!(find("100%_", 10).await, ["b.vcf"]);
+    assert_eq!(find("%", 10).await, ["b.vcf"]);
+    assert!(find("иван", 10).await.is_empty());
+    assert_eq!(
+        store.find_cards(s, CollectionId::new(), "a", 10).await,
+        Err(Error::NotFound)
+    );
+    // Строки читаются с объектом и заменяются при записи.
+    let read = store
+        .get_object(s, book.id, "a.vcf")
+        .await
+        .expect("get")
+        .expect("объект");
+    assert_eq!(
+        read.index.search.strings,
+        ["анна петрова", "петрова", "ann@example.com"]
+    );
+    put_card("a.vcf", card("c1", &["Анна Иванова"])).await;
+    assert!(find("петр", 10).await.is_empty());
+    assert_eq!(find("иван", 10).await, ["a.vcf"]);
+    // Поисковые строки — только у контакта.
+    let bad = ObjectIndex {
+        search: CardSearch::new(["x"]),
+        ..event("u7", None)
+    };
+    assert!(matches!(
+        store
+            .put_object(s, work.id, "bad.ics", body("u7"), bad, Precondition::Any)
+            .await,
+        Err(Error::Invalid(_))
+    ));
 }

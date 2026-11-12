@@ -379,6 +379,9 @@ impl DirectorySync {
             display_name: a.display_name.clone(),
             external_id: Some(a.external_id.clone()),
             enabled: a.enabled,
+            // Адреса каталога: основной и повторы отбрасывает правило `meta::account_aliases` (CTR-53).
+            aliases: a.emails.clone(),
+            kind: tp_contracts::meta::AccountKind::User,
         };
         let account = match self.stores.accounts.upsert(t, upsert).await {
             Ok(acc) => acc,

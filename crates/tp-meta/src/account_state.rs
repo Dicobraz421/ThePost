@@ -53,8 +53,7 @@ struct StateRow {
     disabled_until: Option<OffsetDateTime>,
 }
 
-const STATE_COLUMNS: &str =
-    "account_id, tenant_id, domain_id, login, display_name, external_id, enabled, disabled_until";
+const STATE_COLUMNS: &str = "account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, disabled_until";
 
 fn state(until: Option<OffsetDateTime>) -> AccountState {
     match until {
@@ -410,9 +409,9 @@ async fn swap_catalog(
     let ident = t.account;
     let row: AccountRow = sqlx::query_as(
         "UPDATE accounts SET domain_id = $3, login = $4, display_name = $5, external_id = $6, enabled = $7,
-                             disabled_until = NULL, updated_at = now()
+                             aliases = $8, kind = $9, disabled_until = NULL, updated_at = now()
          WHERE tenant_id = $1 AND account_id = $2
-         RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled",
+         RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind",
     )
     .bind(tu)
     .bind(du)
@@ -421,10 +420,12 @@ async fn swap_catalog(
     .bind(&ident.display_name)
     .bind(&ident.external_id)
     .bind(ident.enabled)
+    .bind(&ident.aliases)
+    .bind(&ident.kind)
     .fetch_one(&mut *tx)
     .await
     .map_err(db_err)?;
-    Ok(Account::from(row))
+    Account::try_from(row)
 }
 
 impl PgMeta {
@@ -490,15 +491,16 @@ impl PgMeta {
             .await
             .map_err(db_err)?;
             crate::commits::commit(tx).await?;
-            Ok(rows
-                .into_iter()
+            rows.into_iter()
                 .filter_map(|r| {
-                    r.disabled_until.map(|until| DisabledAccount {
-                        account: Account::from(r.account),
-                        until,
+                    r.disabled_until.map(|until| {
+                        Ok(DisabledAccount {
+                            account: Account::try_from(r.account)?,
+                            until,
+                        })
                     })
                 })
-                .collect())
+                .collect()
         })
         .await
     }

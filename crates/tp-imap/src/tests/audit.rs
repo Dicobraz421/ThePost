@@ -38,7 +38,7 @@ async fn owner_read_not_recorded_delete_by_policy() {
     assert_eq!(e[0].scope, env.scope());
     assert_eq!(e[0].object.mailbox, Some(inbox));
     assert_eq!(e[0].object.message, Some(second));
-    assert_eq!(e[0].client.as_deref(), Some("imap 192.0.2.1"));
+    assert_eq!(e[0].client.as_deref(), Some("imap 192.0.2.7"));
 }
 
 #[tokio::test]
