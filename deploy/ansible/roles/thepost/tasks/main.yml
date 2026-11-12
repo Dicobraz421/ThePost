@@ -159,6 +159,16 @@
 - name: Certificate of client protocols
   ansible.builtin.include_tasks: "tls-{{ thepost_tls_mode }}.yml"
 
+# Ключ TLS — только в секрете thepost/tls (решение 100): файлы ключа прежних установок удаляются.
+- name: Remove key files of client protocols
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/thepost/tls/privkey.pem
+    - /var/lib/thepost/tls/privkey.pem
+    - "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/client.key"
+
 - name: Write config.yaml
   ansible.builtin.template:
     src: config.yaml.j2

@@ -13,12 +13,14 @@ thepost_binary_checksum: ""
 thepost_binary_src: "{{ playbook_dir }}/../../target/release/thepost"
 thepost_binary_path: /usr/local/bin/thepost
 
-# Сертификат клиентских протоколов (SMTP, IMAP, JMAP, служебный HTTP):
+# Сертификат клиентских протоколов (SMTP, IMAP, JMAP, служебный HTTP). Ключ — только в OpenBao: секрет thepost/tls#key
+# (tls.key, решение 100), на диске ВМ его нет; цепочка — файл секции tls. thepost перечитывает пару без перезапуска.
 #   certbot  — Let's Encrypt (ACME HTTP-01, certbot --standalone на порту 80; продление — certbot.timer, deploy-hook
-#              копирует файлы, thepost перечитывает их без перезапуска — tls.reload_interval);
-#   acme     — встроенный клиент ACME thepost (секция acme, SRS 6.2; файлы — в /var/lib/thepost/tls);
+#              записывает ключ в OpenBao и копирует цепочку);
+#   acme     — встроенный клиент ACME thepost (секция acme, SRS 6.2): ключ записывает сам узел, цепочка — в
+#              /var/lib/thepost/tls;
 #   internal — внутренний CA роли thepost_pki (стенд, тест; клиентам нужен {{ thepost_pki_dir }}/ca.pem);
-#   files    — свои PEM с управляющей машины: thepost_tls_cert_src (цепочка), thepost_tls_key_src.
+#   files    — свои PEM с управляющей машины: thepost_tls_cert_src (цепочка), thepost_tls_key_src (ключ — в OpenBao).
 thepost_tls_mode: certbot
 thepost_tls_names: ["{{ thepost_hostname }}"]
 thepost_tls_cert_src: ""
@@ -39,6 +41,11 @@ thepost_db_urls: []
 thepost_db_failover: {}
 thepost_secrets_url: "{{ openbao_api_addr | default('https://localhost:8200') }}"
 thepost_secrets_role_id_file: "{{ openbao_thepost_role_id_file | default('/etc/thepost/openbao/role_id') }}"
+thepost_secrets_secret_id_file: >-
+  {{ openbao_thepost_secret_id_file | default('/etc/thepost/credentials/openbao-secret-id') }}
+# Узел OpenBao с токеном администратора (роль openbao, openbao_cli_env), через который роль записывает ключ TLS в
+# секрет thepost/tls: эталон SMB — эта ВМ; малый Enterprise — узел инициализации кластера OpenBao.
+thepost_openbao_from: "{{ inventory_hostname }}"
 
 # Слушатели клиентских протоколов (адрес без порта). С активацией сокетов — 0.0.0.0 или [::]: сокеты systemd
 # слушают все адреса (ListenStream=<порт>); другой адрес — и в drop-in юнитов thepost-*.socket.

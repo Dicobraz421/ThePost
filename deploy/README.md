@@ -55,6 +55,7 @@ AppRole `thepost` (`role_id`, `secret_id` — том `openbao-approle`, влад
 | `thepost/db-owner` | `username`, `password` | владелец схемы `thepost_owner` (миграции, `database.owner`) |
 | `thepost/db-readonly` | `username`, `password` | только чтение `thepost_readonly`; узлу недоступен (политика `thepost`) |
 | `thepost/s3` | `access_key_id`, `secret_access_key` | ключи SeaweedFS (`compose/seaweedfs-s3.json`) |
+| `thepost/tls` | `key` | ключ TLS слушателей узла (`tls.key`) — `server.key` тома `tls`; после перевыпуска — новая версия |
 
 `postgres-role-tls` создаёт в PostgreSQL учётные записи (раздел «PostgreSQL: учётные записи» ниже); новые пароли
 берёт из `openbao-init-tls` через том `pg-bootstrap` и удаляет файлы. Роль `postgres` — администратор стенда и тестов, приложению не выдаётся.
@@ -121,8 +122,9 @@ docker compose -f deploy/compose/dev.yml --profile smb run --rm thepost doctor  
 
 Слушатели эталона: SMTP 25 (STARTTLS), submission 587 (STARTTLS) и 465 (неявный TLS), IMAP 143 (STARTTLS) и 993,
 JMAP — HTTPS 443 (`http.jmap`); порт 80 публикуется, но не слушается. Домен — `example.test`
-(принятый домен организации в БД: его заводит `thepost admin init`). Сертификат — `fullchain.pem`/`privkey.pem` тома `tls` от `tls-init`
-(SAN: `localhost`, `thepost`, `mail.example.test`), CA для клиентов — `deploy/compose/tls/ca.pem`.
+(принятый домен организации в БД: его заводит `thepost admin init`). Сертификат — `fullchain.pem` тома `tls` от `tls-init`
+(SAN: `localhost`, `thepost`, `mail.example.test`), ключ — только секрет `thepost/tls#key` в OpenBao (`tls.key`,
+решение 100; записывает `openbao-init-tls`), CA для клиентов — `deploy/compose/tls/ca.pem`.
 Проверка эталона (полная — `docs/manual-tests/CMP-01.md`):
 ```bash
 CA=deploy/compose/tls/ca.pem
@@ -158,7 +160,12 @@ loopback) → OpenBao (`https://localhost:8200`, пароли `thepost/db`, `the
 Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 Сертификат клиентских протоколов — `thepost_tls_mode`: `certbot` (Let's Encrypt HTTP-01, по умолчанию; порт 80
 открыт, DNS указывает на ВМ), `acme` (встроенный клиент thepost, секция `acme`), `internal` (внутренний CA — стенд),
-`files` (свои PEM). Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
+`files` (свои PEM). Ключ TLS — только в OpenBao (решение 100): секрет `thepost/tls#key`, в `config.yaml` —
+`tls.key: { secret: "thepost/tls#key" }`, на диске ВМ файла ключа нет (прежние `privkey.pem` роль удаляет); цепочка —
+файл `tls.cert_file`. Ключ записывает роль (`internal` — выпускает его в памяти, `files` — с управляющей машины,
+`certbot` — после выпуска и в deploy-hook продления через AppRole узла), при `acme` — сам узел (политика `thepost`
+разрешает ему запись только этого пути). Новая версия секрета узел подхватывает без перезапуска.
+Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
 Повторный прогон ничего не меняет. Ключи восстановления и root-токен OpenBao — `/root/openbao-init.json` (см. ниже).
 
 ### Резервное копирование и восстановление (роль `pgbackrest`, DEP-15)
@@ -194,7 +201,9 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 ставится до восстановления СУБД. Новая ВМ: первый `smb.yml -e thepost_backup=false -e thepost_wait_ready=false`
 (узел ждёт секретов из снимка — плейбук не ждёт `/healthz/ready`, завершается с предупреждением); копии — по тем же
 путям, на перенесённом каталоге копий — `chown -R postgres:postgres /var/lib/pgbackrest` (uid `postgres` на новой ВМ
-может быть другим); в новом OpenBao — только `thepost-backup/restic#password` (и `s3`).
+может быть другим); в новом OpenBao — только `thepost-backup/restic#password` (и `s3`). Ключ TLS `thepost/tls` в
+снимке — прежний: после `restore.yml` — повторный `smb.yml` (`internal` перевыпускает сертификат к ключу из снимка,
+`files` и `certbot` записывают свой ключ новой версией).
 
 Восстановление — `deploy/ansible/restore.yml` (`roles/pgbackrest/tasks/restore.yml`): роль `openbao` (токен
 администратора, пароли СУБД) → остановка таймеров и `thepost` → `pgbackrest restore --delta --type=time
@@ -239,7 +248,8 @@ Hardening юнита: пустой `CapabilityBoundingSet=`, `NoNewPrivileges`, 
 `[Service]` + `ReadWritePaths=/srv/thepost-blob`. Проверка окружения — `thepost doctor` (SRS 5.5); привилегии
 службы (`privileges.*`) — только в её окружении: `docs/manual-tests/DEP-08.md`.
 
-Секретов в `config.yaml` нет — только ссылки на OpenBao (секция `secrets`, `database.password`). Вход узла — AppRole:
+Секретов в `config.yaml` нет — только ссылки на OpenBao (секция `secrets`, `database.password`, ключ TLS `tls.key` —
+секрет `thepost/tls#key`: `bao kv put -mount=thepost tls key=@privkey.pem`, файл ключа на ВМ не нужен). Вход узла — AppRole:
 `role_id` — `/etc/thepost/openbao/role_id`, `secret_id` — `/etc/thepost/credentials/openbao-secret-id` (0600 root),
 процессу его передаёт systemd (`LoadCredential=` в `thepost.service`). Оба файла создаёт роль Ansible `openbao`.
 С TPM `secret_id` можно зашифровать: `systemd-creds encrypt --with-key=tpm2 --name=openbao-secret-id …`
@@ -329,8 +339,8 @@ Helm `cnpg.db_durability`; по умолчанию `required` на ВМ и в K8
 
 ## OpenBao (хранилище секретов)
 Эталонная поставка включает OpenBao (MPL-2.0; подходит и существующий HashiCorp Vault заказчика): хранилище Raft,
-канал — только TLS, KV v2 `thepost`, политика `thepost` (`openbao/thepost-policy.hcl`: только чтение `thepost/*`
-и продление своего токена). Распечатывание после перезапуска — автоматическое (решение владельца 2026-10-30):
+канал — только TLS, KV v2 `thepost`, политика `thepost` (`openbao/thepost-policy.hcl`: чтение `thepost/*`, запись —
+только ключа TLS `thepost/tls` для встроенного ACME, продление своего токена). Распечатывание после перезапуска — автоматическое (решение владельца 2026-10-30):
 
 | Способ | Когда | Настройка |
 |---|---|---|
@@ -357,7 +367,7 @@ ansible-playbook -i <инвентарь> deploy/ansible/openbao.yml \
 helm repo add openbao https://openbao.github.io/openbao-helm
 helm install openbao openbao/openbao --version 0.30.6 -n openbao --create-namespace -f deploy/helm/openbao/values.yaml
 kubectl -n openbao exec -it openbao-0 -- bao operator init   # ключи восстановления и root-токен — администратору
-BAO_TOKEN=<root-токен> sh deploy/helm/openbao/bootstrap.sh openbao thepost
+BAO_TOKEN=<root-токен> TLS_KEY=tls.key sh deploy/helm/openbao/bootstrap.sh openbao thepost   # ключ — thepost/tls#key
 ```
 До установки — секреты `openbao-tls` (сертификат, ключ, CA) и, без KMS/HSM, `openbao-unseal` (`helm/openbao/values.yaml`).
 Узел `thepost` входит через Kubernetes auth: сервисный аккаунт `thepost` в пространстве `thepost`, роль `thepost`.
@@ -370,4 +380,5 @@ helm install thepost deploy/helm/thepost -n thepost --create-namespace -f <св�
 seccomp `RuntimeDefault` (свой профиль узла — `containerSecurityContext.seccompProfile` типа `Localhost`) и профили ролей
 процесса (секция `confine`). Слушатели — на портах выше 1024, стандартные порты (25, 465, 587, 143, 993, 443) — у Service.
 Admin API — `127.0.0.1:8443` в поде (`kubectl port-forward`), служебный HTTP — адрес пода для проб kubelet.
-До установки — секрет `thepost-tls` (`tls.crt`, `tls.key`, `ca.crt`) и OpenBao (`bootstrap.sh` выше).
+До установки — секрет `thepost-tls` (`tls.crt`, `ca.crt`; в под монтируются только они) и OpenBao (`bootstrap.sh` выше,
+ключ TLS — `TLS_KEY`: секрет `thepost/tls#key`, в values — `config.tls.key`; смена ключа — повторный `bootstrap.sh`).
