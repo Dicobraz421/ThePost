@@ -162,9 +162,7 @@ async fn pop3_session_closed_without_update() {
     assert_eq!(c.rest().await, "");
     c.task.await.expect("join").expect("session");
     // Без QUIT помеченное письмо не удалено.
-    let left = env
-        .meta
-        .list(env.scope(), inbox, MessageQuery::All, 10)
+    let left = MessageStore::list(&env.meta, env.scope(), inbox, MessageQuery::All, 10)
         .await
         .expect("list");
     assert_eq!(left.len(), 1);
