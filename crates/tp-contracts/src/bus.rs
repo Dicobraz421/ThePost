@@ -97,6 +97,15 @@ pub enum EventKind {
         /// Учётная запись.
         account: AccountId,
     },
+    /// Изменилась книга GAL организации `tenant` (CTR-60): [`crate::dav::DavStore::sync_gal`] записал карточки или
+    /// отображаемое имя. Подписчики — JMAP push и кэши `tp-dav` всех учётных записей организации; сверка — по
+    /// [`crate::dav::Collection::state`] книги. Сигнал — [`crate::dav::gal_changed`].
+    GalChanged {
+        /// Книга GAL.
+        collection: CollectionId,
+        /// `ModSeq` книги после записи.
+        modseq: ModSeq,
+    },
     /// Сигналы подписки потеряны (переполнение буфера подписчика, переподключение слушателя): сверка с хранилищем.
     /// Шина вставляет его в поток подписки с `tenant`/`account` этой подписки (системная — `TenantId::DEFAULT`,
     /// `None`); `publish` с этим видом — `Invalid`.
@@ -203,6 +212,10 @@ mod tests {
             EventKind::ShardsChanged,
             EventKind::AccountDisabled {
                 account: AccountId::new(),
+            },
+            EventKind::GalChanged {
+                collection: CollectionId::new(),
+                modseq: ModSeq(4),
             },
         ] {
             assert!(kind.is_system(), "{kind:?}");

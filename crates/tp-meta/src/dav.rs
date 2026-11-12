@@ -28,8 +28,8 @@ use time::OffsetDateTime;
 use tp_contracts::config::duration;
 use tp_contracts::dav::{
     CardSearch, Collection, CollectionId, CollectionKind, Component, DavLimits, DavObject,
-    DavObjectId, DavStore, DeleteOutcome, MoveOutcome, Moved, ObjectIndex, ObjectRef, Precondition,
-    Put, PutOutcome, Span, TimeRange, dav_changed, valid_name,
+    DavObjectId, DavStore, DeleteOutcome, GalCard, MoveOutcome, Moved, ObjectIndex, ObjectRef,
+    Precondition, Put, PutOutcome, Span, TimeRange, dav_changed, valid_name,
 };
 use tp_contracts::meta::{AccountScope, Changes};
 use tp_contracts::schedule::{
@@ -1860,6 +1860,27 @@ impl DavStore for PgMeta {
             .await?;
         self.signal(schedule_inbox_changed(scope, ms)).await;
         Ok(ms)
+    }
+
+    // Книга GAL в PostgreSQL — META-63; до неё — только чтобы собирался workspace (CTR-60).
+    async fn sync_gal(
+        &self,
+        tenant: TenantId,
+        display_name: &str,
+        cards: Vec<GalCard>,
+    ) -> Result<ModSeq> {
+        let _ = (tenant, display_name, cards);
+        Err(Error::internal("книга GAL в PostgreSQL — META-63"))
+    }
+
+    async fn gal_changes(
+        &self,
+        tenant: TenantId,
+        since: ModSeq,
+        limit: usize,
+    ) -> Result<Changes<DavObjectId>> {
+        let _ = (tenant, since, limit);
+        Err(Error::internal("книга GAL в PostgreSQL — META-63"))
     }
 }
 
