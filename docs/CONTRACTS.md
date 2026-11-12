@@ -656,6 +656,39 @@ iMIP (RFC 6047), занятость. iCalendar контракты не разб�
 - Наборы: `suite::itip` (входящие, `Schedule-Tag`, занятость в индексе, `transparent`; лимиты `suite::dav::LIMITS`, `DavFixture`),
   `suite::itip::signals`, `suite::freebusy(dav, fb, fixture)`.
 
+## Sharing
+SRS 4.4, 4.5; APP-I «Политики общего доступа к календарям»; CTR-48. Код — `sharing.rs`. Права проверяет единый слой авторизации
+(`tp-auth`), хранилища только хранят записи; владелец имеет все права на свои коллекции без записей.
+`CollectionRights { free_busy, read, write, schedule, admin }` (`#[serde(default)]`; `NONE`, `FREE_BUSY`, `READ`, `WRITE`, `SCHEDULE`, `ALL`):
+старшее включает младшие (`effective()`: `admin` — все, `write` — `read`, `read` — `free_busy`; `schedule` — отдельное), `contains`,
+`intersect`, `|`. `CollectionAcl` — права на коллекции (`dav::Collection`) по субъектам, как у `AclStore` (имя входа, группа, `anyone`;
+без отрицательных прав): `collection_acl(owner: AccountScope, collection) -> Vec<CollectionAclEntry { identifier, rights }>` (нет
+коллекции — `NotFound`), `set_collection_acl(owner, collection, identifier, rights)` — замена целиком, пустые права удаляют запись,
+`collection_rights(owner, collection, identifiers) -> CollectionRights` — объединение записей субъекта (`sharing::collection_rights`),
+`shared_with(scope, identifiers) -> Vec<SharedCollection { owner, collection, rights }>` — чужие коллекции для дома коллекций получателя,
+по (`owner`, `collection`). Удаление коллекции или учётной записи удаляет записи.
+Представители: `Delegate { delegate: AccountId, level: DelegateLevel::{Read, Write}, schedule_on_behalf }` — доступ ко всем календарям
+владельца (CalDAV `calendar-proxy-read`/`-write`) и планирование от его имени (`SENT-BY`); `Delegate::rights()` — `READ` или `WRITE`
+плюс `schedule`. `DelegateStore`: `delegates(owner)`, `set_delegate(owner, Delegate)` (сам себе — `Invalid`), `remove_delegate(owner,
+delegate)`, `delegations(delegate) -> Vec<Delegation { owner, level, schedule_on_behalf }>` (`calendar-proxy-*-for`).
+Ресурсы (переговорные): `AccountKind::{User, Resource}`; `ResourceStore`: `account_kind(scope)`, `booking_policy(scope) ->
+Option<BookingPolicy>`, `set_booking_policy(scope, Option<_>)` (учётная запись — ресурс, пока заданы правила), `resources(tenant)`.
+`BookingPolicy { auto_accept, allow_conflicts, max_duration: Option<_>, horizon: Option<_>, bookers: Bookers::{Internal, Only { accounts,
+groups }}, working_hours: Option<WorkingHours { timezone (IANA), days: BTreeSet<DayOfWeek>, from, to }> }` (`#[serde(default)]`,
+длительности — humantime; по умолчанию — автоматическое принятие без пересечений, до 24 ч, на 180 дней вперёд, круглосуточно, все учётные
+записи организации; `validate()` → `Invalid`). `BookingPolicy::decide(&BookingRequest { organizer: Option<AccountId>, organizer_groups,
+periods: Vec<BookingPeriod { period, local_start }>, unbounded }, busy: &[BusyPeriod], now) -> BookingDecision::{Accept,
+Decline(DeclineReason), Tentative}` — чистая функция; проверки по порядку: организатор (внешний — никогда; `NotAllowed`), вхождения
+(`Invalid`), длительность (`TooLong`), горизонт (`TooFar`; повторы без конца при заданном горизонте), рабочее время
+(`OutsideWorkingHours`; местное время вхождения вычисляет вызывающий), пересечения (`Conflict`); прошло всё — `Accept` при `auto_accept`,
+иначе `Tentative`. Повторы разворачивает и занятость (`FreeBusy`) читает вызывающий (`tp-dav`, обработка iTIP).
+Политика организации: `SharingPolicy { scope: SharingScope::{Nobody, Groups { groups }, Organization}, max_outside: CollectionRights }`
+(по умолчанию — `Organization`, `max_outside = READ`): `ceiling(anyone, in_group)` — наибольшие права субъекту (вне групп и субъекту
+`anyone` — не больше `max_outside`), `check(rights, anyone, in_group)` — при выдаче (`Forbidden`; отзыв допустим всегда), `limit(rights, …)`
+— при вычислении действующих прав (ужесточение политики действует на выданные записи). `SharingPolicyStore`: `sharing_policy(tenant)`,
+`set_sharing_policy(tenant, policy)`. Реализации — `tp-meta`, in-memory и наборы — `tp-testkit`; проверка прав — `tp-auth`; CalDAV, CardDAV,
+JMAP (`shareWith`, `myRights`) — `tp-dav`, `tp-jmap`; Admin API — `tp-admin`.
+
 ## Sieve
 SRS 4.3; CTR-46. Код — `sieve.rs`. Интерпретатор — свой крейт `tp-sieve` (sieve-rs под AGPL-3.0); ManageSieve — в роли `imap` (как POP3),
 секция `sieve` крейта `tp-sieve`; `Role` не меняется. `SieveStore` (по `AccountScope`; текст проверяет вызывающий): `limits() ->
@@ -876,3 +909,7 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-57 (волна contracts-39): адрес клиента в проверке учётных данных — `Authenticator::verify_from(credentials, peer)`
   (по умолчанию — `verify`) и `SaslServer::start_from(mechanism, ctx, peer)` (по умолчанию — `start`). По сравнению с карточкой: адрес —
   параметр `start_from`, а не поле `SaslContext` (существующий код не меняется).
+- 2026-11-12 — CTR-48 (волна contracts-35): раздел Sharing, модуль `sharing` — `CollectionRights`, `CollectionAcl` (права на коллекции,
+  `shared_with`), представители (`Delegate`, `DelegateStore`), ресурсы (`AccountKind`, `BookingPolicy::decide`, `ResourceStore`), политика
+  организации (`SharingPolicy`, `SharingPolicyStore`). По сравнению с карточкой: вид учётной записи — метод `ResourceStore::account_kind`,
+  а не поле `Account` (существующий код не меняется); реализации в памяти и наборы — отдельной волной `tp-testkit`.
