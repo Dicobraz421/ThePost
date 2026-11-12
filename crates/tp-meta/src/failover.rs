@@ -597,7 +597,7 @@ impl Inner {
 }
 
 /// Сеанс доступен для записи (`target_session_attrs=read-write`).
-async fn writable(conn: &mut PgConnection) -> std::result::Result<bool, sqlx::Error> {
+pub(crate) async fn writable(conn: &mut PgConnection) -> std::result::Result<bool, sqlx::Error> {
     let ro: String = sqlx::query_scalar("SHOW transaction_read_only")
         .fetch_one(conn)
         .await?;

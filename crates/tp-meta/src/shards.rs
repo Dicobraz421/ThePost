@@ -12,6 +12,9 @@
 //! Кэш [`ShardDirectory`] (список шардов, учётная запись → шард, пулы) сбрасывает сигнал изменения
 //! справочника ([`ShardDirectory::follow`]); пулы создаются заново лениво — при первом запросе к шарду.
 //!
+//! Реплика шарда для фоновых чтений (`ReadIntent::Stale`, META-32) — столбец `read_replica` (без пароля,
+//! учётные данные — как у шарда); отставание проверяет [`crate::replica`].
+//!
 //! Справочник хранит адрес шарда без пароля и ссылку на секрет с паролем (`credentials`, CTR-15,
 //! решение 2026-10-30): пароль читается из [`SecretStore`] при создании пула шарда. Адрес с паролем
 //! отклоняет ограничение таблицы и проверка при чтении справочника.
@@ -30,6 +33,7 @@ use tp_contracts::secrets::{SecretRef, SecretStore};
 use tp_contracts::{AccountId, Error, Result, TenantId};
 
 use crate::pool::{PoolConfig, connect_lazy, fetch_secret, url_has_password};
+use crate::replica::Replica;
 use crate::schema::{begin, db_err};
 
 /// Номер шарда — тип контракта (CTR-34): [`ShardId::MAIN`] — основная БД.
@@ -61,6 +65,8 @@ pub struct Shard {
     pub accepts_new: bool,
     /// Площадка (ЦОД) шарда; `None` — не задана.
     pub site: Option<String>,
+    /// Адрес реплики шарда для фоновых чтений без пароля; `None` — фоновые чтения на primary.
+    pub read_replica: Option<String>,
 }
 
 impl fmt::Debug for Shard {
@@ -73,6 +79,7 @@ impl fmt::Debug for Shard {
             .field("credentials", &self.credentials)
             .field("accepts_new", &self.accepts_new)
             .field("site", &self.site)
+            .field("read_replica", &self.read_replica.is_some())
             .finish()
     }
 }
@@ -85,6 +92,7 @@ struct ShardRow {
     credentials: Option<String>,
     accepts_new: bool,
     site: Option<String>,
+    read_replica: Option<String>,
 }
 
 impl TryFrom<ShardRow> for Shard {
@@ -93,7 +101,9 @@ impl TryFrom<ShardRow> for Shard {
     /// Проверка при чтении: адрес без пароля, ссылка на секрет разбирается.
     fn try_from(r: ShardRow) -> Result<Self> {
         let id = r.shard_id;
-        if r.dsn.as_deref().is_some_and(url_has_password) {
+        if r.dsn.as_deref().is_some_and(url_has_password)
+            || r.read_replica.as_deref().is_some_and(url_has_password)
+        {
             tracing::error!(shard = id, "справочник шардов: пароль в адресе шарда");
             return Err(Error::invalid(format!(
                 "шард {id}: пароль в адресе запрещён; пароль — ссылка на секрет в столбце credentials"
@@ -112,6 +122,7 @@ impl TryFrom<ShardRow> for Shard {
             credentials,
             accepts_new: r.accepts_new,
             site: r.site,
+            read_replica: r.read_replica,
         })
     }
 }
@@ -136,6 +147,12 @@ pub trait ShardResolver: Send + Sync + 'static {
     /// Сброс кэша по сигналу изменения справочника (шарды, адреса, размещение учётных записей).
     fn invalidate(&self) {}
 
+    /// Реплика шарда для фоновых чтений; `None` — нет (чтения на primary).
+    async fn replica(&self, shard: ShardId) -> Result<Option<Arc<Replica>>> {
+        let _ = shard;
+        Ok(None)
+    }
+
     /// Пул шарда учётной записи.
     async fn pool_for(&self, scope: AccountScope, intent: ReadIntent) -> Result<PgPool> {
         let shard = self.shard_of(scope).await?;
@@ -151,7 +168,8 @@ struct Cache {
     /// Шарды справочника; `None` — не прочитаны.
     shards: Option<Vec<ShardId>>,
     accounts: HashMap<(TenantId, AccountId), ShardId>,
-    pools: HashMap<(ShardId, ReadIntent), PgPool>,
+    pools: HashMap<ShardId, PgPool>,
+    replicas: HashMap<ShardId, Option<Arc<Replica>>>,
     /// Поколение кэша: результат запроса, начатого до сброса, не кэшируется.
     epoch: u64,
 }
@@ -185,7 +203,7 @@ impl ShardDirectory {
     /// Все шарды по номеру; строка с паролем в адресе или неверной ссылкой на секрет — `Invalid`.
     pub async fn list(&self) -> Result<Vec<Shard>> {
         let rows: Vec<ShardRow> = sqlx::query_as(
-            "SELECT shard_id, name, dsn, credentials, accepts_new, site FROM shards ORDER BY shard_id",
+            "SELECT shard_id, name, dsn, credentials, accepts_new, site, read_replica FROM shards ORDER BY shard_id",
         )
         .fetch_all(&self.catalog)
         .await
@@ -196,7 +214,9 @@ impl ShardDirectory {
     /// Забывает пулы шарда (смена адреса или секрета): следующий запрос перечитает справочник и секрет
     /// и создаст пул заново. Соединения прежнего пула закрываются, когда его отпустят все держатели.
     pub fn forget(&self, shard: ShardId) {
-        self.cached().pools.retain(|(s, _), _| *s != shard);
+        let mut c = self.cached();
+        c.pools.remove(&shard);
+        c.replicas.remove(&shard);
     }
 
     /// Сбрасывает кэш по сигналам системной подписки шины `bus`: `ConfigReloaded` (справочник — часть
@@ -234,6 +254,8 @@ impl ShardDirectory {
             password: rec.shard.credentials,
             dynamic_credentials: None,
             direct_url: None,
+            direct_urls: Vec::new(),
+            read_replica: None,
             owner: None,
             pgbouncer: false,
             ..self.cfg.clone()
@@ -294,7 +316,7 @@ impl ShardDirectory {
     /// Строка справочника шарда; `NotFound` — шарда нет.
     async fn row(&self, shard: ShardId) -> Result<ShardRecord> {
         let row: Option<ShardRow> = sqlx::query_as(
-            "SELECT shard_id, name, dsn, credentials, accepts_new, site FROM shards WHERE shard_id = $1",
+            "SELECT shard_id, name, dsn, credentials, accepts_new, site, read_replica FROM shards WHERE shard_id = $1",
         )
         .bind(shard.0)
         .fetch_optional(&self.catalog)
@@ -324,7 +346,7 @@ impl ShardDirectory {
 
     /// Кэширует пул, если кэш не сброшен с поколения `epoch`; параллельный запрос мог создать пул раньше —
     /// остаётся первый.
-    fn keep(&self, key: (ShardId, ReadIntent), epoch: u64, pool: PgPool) -> PgPool {
+    fn keep(&self, key: ShardId, epoch: u64, pool: PgPool) -> PgPool {
         let mut c = self.cached();
         if c.epoch != epoch {
             return pool;
@@ -371,9 +393,15 @@ impl ShardResolver for ShardDirectory {
     }
 
     /// Пул шарда. Секрет недоступен, отозван или запрещён политикой — `Unavailable` (причина — в журнале).
+    /// `Stale` — реплика шарда при допустимом отставании, иначе primary.
     async fn pool(&self, shard: ShardId, intent: ReadIntent) -> Result<PgPool> {
-        let _ = intent;
-        let key = (shard, ReadIntent::Primary);
+        if intent == ReadIntent::Stale
+            && let Some(replica) = self.replica(shard).await?
+            && replica.usable().await
+        {
+            return Ok(replica.pool().clone());
+        }
+        let key = shard;
         let epoch = {
             let c = self.cached();
             if let Some(p) = c.pools.get(&key) {
@@ -432,6 +460,31 @@ impl ShardResolver for ShardDirectory {
         Ok(ids)
     }
 
+    async fn replica(&self, shard: ShardId) -> Result<Option<Arc<Replica>>> {
+        let epoch = {
+            let c = self.cached();
+            if let Some(r) = c.replicas.get(&shard) {
+                return Ok(r.clone());
+            }
+            c.epoch
+        };
+        let rec = self.row(shard).await?;
+        let replica = match &rec.shard.read_replica {
+            None => None,
+            Some(url) => {
+                let pool = self
+                    .connect(shard, url, rec.shard.credentials.as_ref())
+                    .await?;
+                Some(Arc::new(Replica::new(pool, self.cfg.replica_max_lag)))
+            }
+        };
+        let mut c = self.cached();
+        if c.epoch != epoch {
+            return Ok(replica);
+        }
+        Ok(c.replicas.entry(shard).or_insert(replica).clone())
+    }
+
     fn invalidate(&self) {
         let mut c = self.cached();
         let epoch = c.epoch.wrapping_add(1);
@@ -454,6 +507,7 @@ mod tests {
             credentials: credentials.map(Into::into),
             accepts_new: false,
             site: None,
+            read_replica: None,
         }
     }
 

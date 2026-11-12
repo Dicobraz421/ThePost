@@ -1,6 +1,8 @@
 # Серверный сертификат от внутреннего CA: <dir>/<name>.pem (сертификат, затем CA — цепочка) и <name>.key.
 # Переменные: thepost_pki_issue_name, thepost_pki_issue_dir, thepost_pki_issue_names (SAN: "DNS:…", "IP:…"),
-# thepost_pki_issue_key_group (группа ключа, режим 0640).
+# thepost_pki_issue_key_group (группа ключа, режим 0640). До конца срока меньше thepost_pki_renew_before — перевыпуск
+# тем же CA и ключом; службы подхватывают его копированием файлов (notify в ролях openbao, postgresql; thepost
+# перечитывает сертификат клиентских протоколов сам).
 ---
 - name: Create key {{ thepost_pki_issue_name }}
   community.crypto.openssl_privatekey:
@@ -24,6 +26,19 @@
     extended_key_usage: [serverAuth]
     mode: "0644"
 
+- name: Check certificate {{ thepost_pki_issue_name }}
+  ansible.builtin.stat:
+    path: "{{ thepost_pki_dir }}/{{ thepost_pki_issue_name }}.crt"
+  register: thepost_pki_issue_stat
+
+- name: Read certificate expiry {{ thepost_pki_issue_name }}
+  community.crypto.x509_certificate_info:
+    path: "{{ thepost_pki_dir }}/{{ thepost_pki_issue_name }}.crt"
+    valid_at:
+      renew: "{{ thepost_pki_renew_before }}"
+  register: thepost_pki_issue_info
+  when: thepost_pki_issue_stat.stat.exists
+
 - name: Create certificate {{ thepost_pki_issue_name }}
   community.crypto.x509_certificate:
     path: "{{ thepost_pki_dir }}/{{ thepost_pki_issue_name }}.crt"
@@ -32,6 +47,7 @@
     ownca_path: "{{ thepost_pki_dir }}/ca.pem"
     ownca_privatekey_path: "{{ thepost_pki_dir }}/ca.key"
     ownca_not_after: "{{ thepost_pki_cert_not_after }}"
+    force: "{{ thepost_pki_issue_stat.stat.exists and not thepost_pki_issue_info.valid_at.renew }}"
     mode: "0644"
 
 - name: Read certificate and CA {{ thepost_pki_issue_name }}

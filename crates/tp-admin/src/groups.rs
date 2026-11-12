@@ -22,7 +22,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 pub use tp_contracts::groups::Moderation;
 use tp_contracts::groups::{
-    DistributionGroup, GroupMember, HeldMessage, SenderRestriction, validate_reject_reason,
+    DistributionGroup, GroupMember, HeldMessage, HoldSource, Moderator, SenderRestriction,
+    validate_reject_reason,
 };
 use tp_contracts::{AccountId, Error, GroupId, HeldId, Result, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -129,8 +130,16 @@ pub struct GroupPatch {
 pub struct HeldInfo {
     /// Идентификатор.
     pub id: String,
-    /// Группа-адресат.
-    pub group: String,
+    /// Группа-адресат; `null` — письмо задержано правилом потока (CTR-43).
+    pub group: Option<String>,
+    /// Источник задержки: `group` — модерируемая группа, `flow_rule` — правило потока почты.
+    pub source: String,
+    /// Имя правила потока (для `flow_rule`).
+    pub rule: Option<String>,
+    /// Модераторы письма: `account:<UUID>` или `group:<UUID>`; пусто — модераторы группы.
+    pub moderators: Vec<String>,
+    /// Исходные получатели (для письма правила — кому доставляется одобренное письмо).
+    pub recipients: Vec<String>,
     /// Отправитель конверта.
     pub sender: String,
     /// Учётная запись отправителя; `null` — внешний.
@@ -147,9 +156,24 @@ pub struct HeldInfo {
 
 impl From<HeldMessage> for HeldInfo {
     fn from(h: HeldMessage) -> Self {
+        let (source, rule) = match h.source {
+            HoldSource::Group => ("group", None),
+            HoldSource::FlowRule { rule } => ("flow_rule", Some(rule)),
+        };
         Self {
             id: h.id.to_string(),
-            group: h.group.to_string(),
+            group: h.group.map(|g| g.to_string()),
+            source: source.to_owned(),
+            rule,
+            moderators: h
+                .moderators
+                .iter()
+                .map(|m| match m {
+                    Moderator::Account(a) => format!("account:{a}"),
+                    Moderator::Group(g) => format!("group:{g}"),
+                })
+                .collect(),
+            recipients: h.recipients,
             sender: h.sender,
             sender_account: h.sender_account.map(|a| a.to_string()),
             message_id: h.message_id,
@@ -401,7 +425,15 @@ async fn approve(
     Path((org, id)): Path<(TenantId, HeldId)>,
 ) -> ApiResult<StatusCode> {
     let h = a.d.groups.take_held(org, id).await?;
-    let g = match a.d.groups.get(org, h.group).await {
+    let Some(gid) = h.group else {
+        // Письмо правила потока (CTR-43): доставка исходным получателям.
+        if let Err(e) = a.d.moderation.deliver(org, None, &h).await {
+            put_back(&a, org, h).await;
+            return Err(e.into());
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let g = match a.d.groups.get(org, gid).await {
         Ok(Some(g)) => g,
         Ok(None) => {
             // Группа удалена между постановкой и решением: доставлять некому.
@@ -420,7 +452,7 @@ async fn approve(
             return Err(e.into());
         }
     };
-    if let Err(e) = a.d.moderation.deliver(org, &g, &h).await {
+    if let Err(e) = a.d.moderation.deliver(org, Some(&g), &h).await {
         put_back(&a, org, h).await;
         return Err(e.into());
     }
@@ -459,8 +491,10 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::{Value, json};
     use time::OffsetDateTime;
-    use tp_contracts::groups::{DistributionGroup, GroupStore, HeldMessage, SenderRestriction};
-    use tp_contracts::{BlobHash, BlobKey, Error, Gen, GroupId, HeldId, TenantId};
+    use tp_contracts::groups::{
+        DistributionGroup, GroupStore, HeldMessage, HoldSource, Moderator, SenderRestriction,
+    };
+    use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, GroupId, HeldId, TenantId};
 
     use crate::testenv::{Decision, Env};
 
@@ -471,7 +505,10 @@ mod tests {
     fn held(group: GroupId, sender: &str) -> HeldMessage {
         HeldMessage {
             id: HeldId::new(),
-            group,
+            group: Some(group),
+            source: HoldSource::Group,
+            moderators: Vec::new(),
+            recipients: Vec::new(),
             sender: sender.into(),
             sender_account: None,
             message_id: Some("m1@ext".into()),
@@ -716,12 +753,50 @@ mod tests {
         assert_eq!(
             env.moderation.decisions(),
             [
-                Decision::Deliver(h1.id, gid),
+                Decision::Deliver(h1.id, Some(gid)),
                 Decision::Reject(h2.id, "off-topic".into()),
                 Decision::Reject(h3.id, super::DEFAULT_REASON.into()),
             ]
         );
         let (_, _, list) = env.call("GET", &queue, Some("org"), None).await;
         assert!(list.as_array().expect("list").is_empty());
+    }
+
+    /// CTR-43: письмо правила потока в очереди — источник и правило видны, одобрение — доставка получателям.
+    #[tokio::test]
+    async fn flow_rule_held() {
+        let env = Env::new();
+        let moderator = AccountId::new();
+        let h = HeldMessage {
+            group: None,
+            source: HoldSource::FlowRule {
+                rule: "Внешние вложения".into(),
+            },
+            moderators: vec![Moderator::Account(moderator)],
+            recipients: vec!["boss@example.org".into()],
+            ..held(GroupId::new(), "x@ext.example")
+        };
+        env.groups
+            .hold(TenantId::DEFAULT, h.clone())
+            .await
+            .expect("hold");
+        let queue = format!("{}/moderation", base());
+        let (s, _, list) = env.call("GET", &queue, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let item = &list[0];
+        assert_eq!(
+            (&item["group"], &item["source"], &item["rule"]),
+            (
+                &json!(null),
+                &json!("flow_rule"),
+                &json!("Внешние вложения")
+            )
+        );
+        assert_eq!(item["moderators"], json!([format!("account:{moderator}")]));
+        assert_eq!(item["recipients"], json!(["boss@example.org"]));
+        let url = format!("{queue}/{}/approve", h.id);
+        let (s, _, _) = env.call("POST", &url, Some("org"), None).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        assert_eq!(env.moderation.decisions(), [Decision::Deliver(h.id, None)]);
     }
 }

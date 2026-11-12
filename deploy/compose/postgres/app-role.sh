@@ -53,7 +53,7 @@ WHERE NOT pg_has_role(:'readonly', 'thepost_reader', 'MEMBER') \gexec
 -- Языковая настройка (решение 2026-11-11 №23): UTF8 с LC_CTYPE UTF-8, иначе lower() не переводит кириллицу в именах
 -- входа. Существующая БД с другой настройкой не пересоздаётся — ошибка.
 SELECT format('DO $e$ BEGIN RAISE EXCEPTION %L; END $e$', format('БД %s: кодировка %s, LC_CTYPE %s — нужны UTF8 и '
-  'LC_CTYPE UTF-8 (C.UTF-8 или <язык>.UTF-8); БД не пересоздаётся: перенесите данные в новую — docs/PREREQUISITES.md',
+  'LC_CTYPE UTF-8 (C.UTF-8 или <язык>.UTF-8). Пересоздайте базу в UTF-8 (только чистые установки) — docs/PREREQUISITES.md',
   datname, pg_encoding_to_char(encoding), datctype))
 FROM pg_database WHERE datname = :'db'
   AND NOT (pg_encoding_to_char(encoding) = 'UTF8' AND lower(datctype::text) ~ '[.]utf-?8$') \gexec
