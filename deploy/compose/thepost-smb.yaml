@@ -37,8 +37,6 @@ smtp:
     - listen: "0.0.0.0:587"
     - listen: "0.0.0.0:465"
       implicit_tls: true
-  delivery:
-    local_domains: [example.test]
 
 # Хранилище секретов (OpenBao, только TLS); вход AppRole — role_id и secret_id выдаёт openbao-init-tls.
 # Поля секции — по PLT-12.

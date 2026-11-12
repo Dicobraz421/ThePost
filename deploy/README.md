@@ -121,7 +121,7 @@ docker compose -f deploy/compose/dev.yml --profile smb run --rm thepost doctor  
 
 Слушатели эталона: SMTP 25 (STARTTLS), submission 587 (STARTTLS) и 465 (неявный TLS), IMAP 143 (STARTTLS) и 993,
 JMAP — HTTPS 443 (`http.jmap`); порт 80 публикуется, но не слушается. Домен — `example.test`
-(`smtp.delivery.local_domains`). Сертификат — `fullchain.pem`/`privkey.pem` тома `tls` от `tls-init`
+(принятый домен организации в БД: его заводит `thepost admin init`). Сертификат — `fullchain.pem`/`privkey.pem` тома `tls` от `tls-init`
 (SAN: `localhost`, `thepost`, `mail.example.test`), CA для клиентов — `deploy/compose/tls/ca.pem`.
 Проверка эталона (полная — `docs/manual-tests/CMP-01.md`):
 ```bash
