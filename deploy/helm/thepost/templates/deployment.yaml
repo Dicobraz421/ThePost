@@ -21,10 +21,8 @@ spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       # Токен сервисного аккаунта — вход в OpenBao (secrets.auth.kubernetes.jwt_file).
       automountServiceAccountToken: true
-      {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- include "thepost.imagePullSecrets" . | nindent 8 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:

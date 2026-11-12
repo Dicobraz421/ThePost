@@ -14,6 +14,20 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- end -}}
 
+{{/* Секреты входа в реестр образа обязательны (решение 110: образ в ghcr.io закрытый). */}}
+{{- define "thepost.imagePullSecrets" -}}
+{{- $s := .Values.imagePullSecrets -}}
+{{- if not $s -}}
+{{- fail "imagePullSecrets не задан: образ в ghcr.io закрытый. Создайте секрет: kubectl -n <пространство> create secret docker-registry ghcr --docker-server=ghcr.io --docker-username=<логин GitHub> --docker-password=<токен read:packages>, затем --set 'imagePullSecrets[0].name=ghcr'" -}}
+{{- end -}}
+{{- range $s -}}
+{{- if not (and (kindIs "map" .) .name) -}}
+{{- fail "imagePullSecrets: каждый элемент — { name: <секрет docker-registry> }" -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml $s -}}
+{{- end -}}
+
 {{/* Кластер CloudNativePG (cnpg.enabled): Cluster, служба primary <имя>-rw, CA сервера. */}}
 {{- define "thepost.dbCluster" -}}
 {{- printf "%s-db" (include "thepost.fullname" .) | trunc 50 | trimSuffix "-" -}}
