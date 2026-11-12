@@ -211,3 +211,22 @@
   until: thepost_ready.status == 200
   retries: "{{ thepost_ready_retries }}"
   delay: "{{ thepost_ready_delay }}"
+  when: thepost_wait_ready | bool
+
+# thepost_wait_ready: false — одна проверка без ожидания (новый сервер до restore.yml: узел ждёт секретов из снимка).
+- name: Check thepost readiness once
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ thepost_service_http_port }}/healthz/ready"
+    validate_certs: false
+  register: thepost_ready_once
+  failed_when: false
+  when: not thepost_wait_ready | bool
+
+- name: Warn that thepost is not ready
+  ansible.builtin.debug:
+    msg: >-
+      ВНИМАНИЕ: thepost не готов (/healthz/ready — {{ 'нет ответа' if thepost_ready_once.status | default(-1) | int < 0
+        else thepost_ready_once.status }}),
+      ожидание выключено (thepost_wait_ready: false). На новом сервере это ожидаемо до restore.yml с
+      thepost_restore_openbao=true; причина — journalctl -u thepost.
+  when: not thepost_wait_ready | bool and thepost_ready_once.status | default(0) != 200

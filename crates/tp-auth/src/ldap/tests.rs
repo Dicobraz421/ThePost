@@ -623,7 +623,7 @@ async fn live_ldap() {
         } else {
             let t = tls.clone();
             Some(Arc::new(
-                tokio::task::spawn_blocking(move || client_tls(&t))
+                tokio::task::spawn_blocking(move || client_tls(&t, None))
                     .await
                     .expect("join")
                     .expect("tls"),
@@ -1006,5 +1006,111 @@ mod group_sync {
         let empty = sync.run(None).await.expect("empty");
         assert_eq!(empty.removed, 0);
         assert_eq!(groups.list(T).await.expect("list").len(), 2);
+    }
+}
+
+/// Ключ клиентского сертификата LDAPS — из хранилища секретов (`tls.key`, решение 100).
+mod client_key_tls {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use rustls::SignatureScheme;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
+    use tp_contracts::Error;
+    use tp_contracts::secrets::SecretRef;
+    use tp_contracts::tls::InternalTls;
+    use tp_testkit::{MemSecretStore, SystemClock};
+
+    use super::super::client_tls;
+    use crate::client_key;
+
+    fn testdata(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/testdata")
+            .join(name)
+    }
+
+    fn tls(key: &SecretRef) -> InternalTls {
+        InternalTls {
+            cert_file: Some(testdata("client.crt")),
+            key: Some(key.clone()),
+            ..InternalTls::default()
+        }
+    }
+
+    fn store(key: &SecretRef, name: &str) -> MemSecretStore {
+        let s = MemSecretStore::new(Arc::new(SystemClock));
+        s.set(
+            key,
+            std::fs::read_to_string(testdata(name)).expect("testdata"),
+        );
+        s
+    }
+
+    #[tokio::test]
+    async fn key_from_secret_store_is_file_identity() {
+        let r = SecretRef::new("thepost/ldap", "tls_key").expect("ref");
+        let tls = tls(&r);
+        let key = client_key("LDAP", &tls, &store(&r, "client.key"))
+            .await
+            .expect("key")
+            .expect("some");
+        let cfg = client_tls(&tls, Some(&key)).expect("tls");
+        let got = cfg
+            .client_auth_cert_resolver
+            .resolve(&[], &[SignatureScheme::ECDSA_NISTP256_SHA256])
+            .expect("client cert");
+
+        let cert = std::fs::read(testdata("client.crt")).expect("cert");
+        let want_chain = rustls::pki_types::CertificateDer::pem_slice_iter(&cert)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("pem");
+        assert_eq!(got.cert, want_chain);
+        let file_key = PrivateKeyDer::from_pem_file(testdata("client.key")).expect("key file");
+        let want_key = rustls::crypto::aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(file_key)
+            .expect("load");
+        assert_eq!(got.key.public_key(), want_key.public_key());
+        assert!(got.keys_match().is_ok());
+    }
+
+    #[tokio::test]
+    async fn key_errors() {
+        let r = SecretRef::new("thepost/ldap", "tls_key").expect("ref");
+        // Нет секрета в хранилище — понятная ошибка с путём.
+        let empty = MemSecretStore::new(Arc::new(SystemClock));
+        match client_key("LDAP", &tls(&r), &empty).await {
+            Err(Error::Invalid(m)) => assert!(m.contains("thepost/ldap#tls_key"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // Ключ от другого сертификата.
+        let wrong = client_key("LDAP", &tls(&r), &store(&r, "other.key"))
+            .await
+            .expect("key");
+        assert!(matches!(
+            client_tls(&tls(&r), wrong.as_ref()),
+            Err(Error::Invalid(_))
+        ));
+        // Сертификат без ключа.
+        assert!(matches!(client_tls(&tls(&r), None), Err(Error::Invalid(_))));
+        // `key_file` не поддерживается.
+        let file = InternalTls {
+            cert_file: Some(testdata("client.crt")),
+            key_file: Some(testdata("client.key")),
+            ..InternalTls::default()
+        };
+        assert!(matches!(
+            client_key("LDAP", &file, &empty).await,
+            Err(Error::Invalid(_))
+        ));
+        // Без mTLS — ключ не читается.
+        assert_eq!(
+            client_key("LDAP", &InternalTls::default(), &empty)
+                .await
+                .map(|k| k.is_none()),
+            Ok(true)
+        );
     }
 }
