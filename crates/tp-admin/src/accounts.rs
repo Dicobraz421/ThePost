@@ -1,5 +1,7 @@
 //! Организация, домены, учётные записи и квоты (SRS 5.2, 3.8).
 //!
+//! - организации (`/api/v1/orgs`): доступные вошедшему администратору по областям его ролей; без модуля
+//!   «Мультитенантность» — одна организация по умолчанию (решение 10);
 //! - организация (`/api/v1/orgs/{org}`): чтение и политика уровня организации;
 //! - домены организации — принятые домены транспорта и политика домена ([`crate::transport`], CTR-24);
 //! - учётные записи приходят из каталога (LDAP): здесь — поиск по имени входа, постраничный список (по возрастанию
@@ -20,9 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::routing::{get, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_contracts::config::duration;
 use tp_contracts::meta::{Account, AccountKind, AccountUpsert, Policy, PolicyTarget};
@@ -32,7 +34,7 @@ use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::retention::TrashPurgeRuleBody;
-use crate::server::{Admin, ApiResult, Problem, Refused};
+use crate::server::{Admin, ApiResult, Caller, Problem, Refused};
 
 /// Политика уровня; `null` — не задано на уровне.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -198,7 +200,8 @@ pub struct AccountQuery {
 
 /// Маршруты организации и учётных записей.
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route("/api/v1/orgs/{org}", get(get_org))
+    r.route("/api/v1/orgs", get(list_orgs))
+        .route("/api/v1/orgs/{org}", get(get_org))
         .route("/api/v1/orgs/{org}/policy", put(put_org_policy))
         .route(
             "/api/v1/orgs/{org}/accounts",
@@ -218,6 +221,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
 #[derive(Debug, OpenApi)]
 #[openapi(
     paths(
+        list_orgs,
         get_org,
         put_org_policy,
         list_accounts,
@@ -278,6 +282,31 @@ pub(crate) fn split_login(login: &str) -> Result<(String, String)> {
     }
 }
 
+/// Организации, доступные вошедшему администратору: по областям его ролей среди организаций инсталляции (без модуля
+/// «Мультитенантность» — только организация по умолчанию).
+#[utoipa::path(get, path = "/api/v1/orgs", tag = "organizations",
+    responses((status = 200, body = Vec<Organization>), (status = 403, body = Problem)))]
+async fn list_orgs(
+    State(a): State<Arc<Admin>>,
+    Extension(c): Extension<Caller>,
+) -> ApiResult<Json<Vec<Organization>>> {
+    let mut out = Vec::new();
+    for org in [TenantId::DEFAULT] {
+        if c.permits(Some(org), &Method::GET, "/api/v1/orgs/{org}") {
+            out.push(organization(&a, org).await?);
+        }
+    }
+    Ok(Json(out))
+}
+
+async fn organization(a: &Admin, org: TenantId) -> Result<Organization> {
+    Ok(Organization {
+        id: org.to_string(),
+        default: org == TenantId::DEFAULT,
+        policies: policies(a, org, PolicyTarget::Tenant, None, None).await?,
+    })
+}
+
 /// Организация и её политика.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}", tag = "organizations",
     params(("org" = String, Path, description = "Организация (UUID)")),
@@ -286,11 +315,7 @@ async fn get_org(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
 ) -> ApiResult<Json<Organization>> {
-    Ok(Json(Organization {
-        id: org.to_string(),
-        default: org == TenantId::DEFAULT,
-        policies: policies(&a, org, PolicyTarget::Tenant, None, None).await?,
-    }))
+    Ok(Json(organization(&a, org).await?))
 }
 
 /// Задаёт политику организации целиком.
@@ -572,6 +597,27 @@ mod tests {
 
     fn org() -> String {
         format!("/api/v1/orgs/{}", TenantId::DEFAULT)
+    }
+
+    /// Приёмка ADM-26: администратор инсталляции и организации видят организацию по умолчанию, без прав — 403.
+    #[tokio::test]
+    async fn list_orgs() {
+        let env = Env::new();
+        for token in ["root", "org", "operator"] {
+            let (s, _, b) = env.call("GET", "/api/v1/orgs", Some(token), None).await;
+            assert_eq!(s, StatusCode::OK, "{token}");
+            assert_eq!(b.as_array().map(Vec::len), Some(1), "{token}: {b}");
+            assert_eq!(b[0]["id"], TenantId::DEFAULT.to_string());
+            assert_eq!(b[0]["default"], true);
+        }
+        let (_, _, b) = env.call("GET", "/api/v1/orgs", Some("other"), None).await;
+        assert_eq!(b, json!([]), "администратор другой организации");
+        for token in ["user", "auditor"] {
+            let (s, _, _) = env.call("GET", "/api/v1/orgs", Some(token), None).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{token}");
+        }
+        let (s, _, _) = env.call("GET", "/api/v1/orgs", None, None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

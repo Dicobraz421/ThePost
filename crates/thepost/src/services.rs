@@ -83,6 +83,8 @@ pub struct Services {
     pub authz: Arc<dyn Authorizer>,
     /// Каталог LDAP; `None` — учётные записи только из PostgreSQL.
     pub directory: Option<Arc<dyn Directory>>,
+    /// Издатель токенов OIDC (`auth.oidc.issuer`); `None` — вход Bearer OIDC не настроен.
+    pub oidc_issuer: Option<String>,
     /// Пароли приложений.
     pub app_passwords: tp_auth::AppPasswords,
     /// Полнотекстовый поиск (роль search в процессе).
@@ -328,6 +330,7 @@ impl Services {
             sasl,
             authz,
             directory,
+            oidc_issuer: auth.oidc.as_ref().map(|o| o.issuer.clone()),
             app_passwords,
             search,
             indexes,
@@ -613,6 +616,9 @@ impl Services {
             senders: Arc::new(self.meta.clone()),
             mailbox_audit: Arc::new(self.meta.clone()),
             sync: Arc::new(self.meta.clone()),
+            // Издатель для входа консоли (`GET /api/v1/session`) — тот, чьи токены проверяет узел; `admin.oidc` без
+            // `auth.oidc` — ошибка `Admin::new`.
+            oidc_issuer: self.oidc_issuer.clone(),
         };
         let limits = self.sieve_limits;
         let check = move |text: &str| match tp_sieve::compile(text.as_bytes(), &limits) {
@@ -1284,6 +1290,22 @@ mod tests {
 
         // Admin API узла с локальным входом (как роль admin в `serve`): администратор `admin init` — модератор.
         let admin_cfg = cfg.section::<AdminSection>(ADMIN).expect("admin").0.clone();
+        // Вход консоли через OIDC (`admin.oidc`) без поставщика `auth.oidc` — ошибка запуска Admin API.
+        let console_oidc = tp_admin::AdminConfig {
+            oidc: Some(tp_admin::OidcClient {
+                client_id: "thepost-console".into(),
+                scope: None,
+            }),
+            ..admin_cfg.clone()
+        };
+        let e = services
+            .admin(&ext, console_oidc, &smtp)
+            .map(|_| ())
+            .expect_err("admin.oidc без auth.oidc");
+        assert!(
+            matches!(&e, tp_contracts::Error::Invalid(m) if m.contains("auth.oidc")),
+            "{e:?}"
+        );
         let admin = Arc::new(crate::local_admin::attach(
             services.admin(&ext, admin_cfg, &smtp).expect("admin"),
             &services,
