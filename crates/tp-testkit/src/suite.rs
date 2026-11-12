@@ -4680,7 +4680,7 @@ pub struct PolicyFixture {
 
 /// CTR-25, CTR-67: [`PolicyStore`] — уровни читаются без наложения и задаются целиком, пустая политика удаляет
 /// уровень, организации разделены; запись сразу видна [`PolicyResolver`], разрешение по цепочке покрывает все поля,
-/// включая поля SMTP (`send_per_hour`, `max_recipients`, `dkim_selector`, `milter_profile`) и `retention`.
+/// включая поля SMTP (`send_per_hour`, `rcpts_per_hour`, `max_recipients`, `dkim_selector`, `milter_profile`) и `retention`.
 pub async fn policy_store(
     store: &dyn PolicyStore,
     resolver: &dyn PolicyResolver,
@@ -4716,12 +4716,14 @@ pub async fn policy_store(
         trash_retention: Some(DAY * 30),
         retention: Some(DAY * 365),
         send_per_hour: Some(100),
+        rcpts_per_hour: Some(3000),
         max_recipients: Some(50),
         dkim_selector: Some("t2026".into()),
         milter_profile: Some("tenant".into()),
         trash_purge: Some(rule),
     };
     let domain = Policy {
+        rcpts_per_hour: Some(1500),
         max_recipients: Some(20),
         dkim_selector: Some("d2026".into()),
         ..Policy::default()
@@ -4755,6 +4757,7 @@ pub async fn policy_store(
             trash_retention: Some(DAY * 30),
             retention: Some(DAY * 365),
             send_per_hour: Some(5),
+            rcpts_per_hour: Some(1500),
             max_recipients: Some(20),
             dkim_selector: Some("d2026".into()),
             milter_profile: Some("account".into()),
@@ -4762,6 +4765,7 @@ pub async fn policy_store(
         }
     );
     assert_eq!(effective.send_per_hour_or_default(), 5);
+    assert_eq!(effective.rcpts_per_hour_or_default(), 1500);
     assert_eq!(effective.max_recipients_or_default(), 20);
     assert_eq!(
         resolve(Some(fx.mailbox)).await.expect("resolve").retention,
@@ -4802,6 +4806,11 @@ pub async fn policy_store(
     assert_eq!(store.policy(t, T::Domain(fx.domain)).await, Ok(domain));
     let effective = resolve(None).await.expect("resolve");
     assert_eq!(effective.max_recipients, Some(50));
+    assert_eq!(
+        effective.rcpts_per_hour,
+        Some(3000),
+        "адресатов в час — из организации"
+    );
     assert_eq!(effective.dkim_selector.as_deref(), Some("d2027"));
 
     // Пустая политика удаляет уровень; без уровней — умолчания уровня организации.
@@ -4821,6 +4830,10 @@ pub async fn policy_store(
     assert_eq!(
         effective.send_per_hour_or_default(),
         Policy::DEFAULT_SEND_PER_HOUR
+    );
+    assert_eq!(
+        effective.rcpts_per_hour_or_default(),
+        Policy::DEFAULT_RCPTS_PER_HOUR
     );
     assert_eq!(
         effective.max_recipients_or_default(),

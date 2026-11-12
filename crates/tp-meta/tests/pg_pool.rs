@@ -3,11 +3,13 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use tp_contracts::secrets::SecretRef;
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, TenantId};
 use tp_meta::doctor::{self, DoctorConfig, Status};
-use tp_meta::pool::{self, PoolConfig};
+use tp_meta::pool::{self, NoAcquireObserver, PoolConfig};
 use tp_meta::schema::db_err;
 
 fn cfg(url: String, pgbouncer: bool) -> PoolConfig {
@@ -75,9 +77,11 @@ async fn password_from_secret_store() {
         ..common::dev_pool_config(&url)
     };
     assert!(!pool::url_has_password(&c.url), "адрес без пароля");
-    let pool = pool::connect(&c, &*store).await.expect("connect");
+    let pool = pool::connect(&c, &*store, Arc::new(NoAcquireObserver))
+        .await
+        .expect("connect");
     let one: i32 = sqlx::query_scalar("SELECT 1")
-        .fetch_one(&pool)
+        .fetch_one(&mut *common::conn(&pool).await)
         .await
         .expect("select");
     assert_eq!(one, 1);
@@ -85,11 +89,15 @@ async fn password_from_secret_store() {
     // Отозванный секрет — понятная ошибка Unavailable, без значения.
     store.revoke(&secret);
     assert_eq!(
-        pool::connect(&c, &*store).await.err(),
+        pool::connect(&c, &*store, Arc::new(NoAcquireObserver))
+            .await
+            .err(),
         Some(Error::UNAVAILABLE)
     );
     assert_eq!(
-        pool::connect_direct(&c, &*store).await.err(),
+        pool::connect_direct(&c, &*store, Arc::new(NoAcquireObserver))
+            .await
+            .err(),
         Some(Error::UNAVAILABLE)
     );
 }
@@ -104,10 +112,21 @@ async fn pool_modes_and_with_tenant() {
     for pgbouncer in [false, true] {
         let c = cfg(url.clone(), pgbouncer);
         let secrets = common::secrets();
-        let pool = pool::connect(&c, &*secrets).await.expect("connect");
+        let pool = pool::connect(&c, &*secrets, Arc::new(NoAcquireObserver))
+            .await
+            .expect("connect");
         let password = c.password(&*secrets).await.expect("password");
-        let lazy = pool::connect_lazy(&c, &c.url, password.as_ref()).expect("lazy");
-        let direct = pool::connect_direct(&c, &*secrets).await.expect("direct");
+        let lazy = pool::connect_lazy(
+            &c,
+            &c.url,
+            password.as_ref(),
+            None,
+            Arc::new(NoAcquireObserver),
+        )
+        .expect("lazy");
+        let direct = pool::connect_direct(&c, &*secrets, Arc::new(NoAcquireObserver))
+            .await
+            .expect("direct");
         for p in [&pool, &lazy, &direct] {
             let seen: String = pool::with_tenant(p, tenant, |tx| {
                 Box::pin(async move {
@@ -125,16 +144,20 @@ async fn pool_modes_and_with_tenant() {
         // SET LOCAL не переживает транзакцию: следующая видит пустой контекст.
         let after: Option<String> =
             sqlx::query_scalar("SELECT nullif(current_setting('app.tenant_id', true), '')")
-                .fetch_one(&pool)
+                .fetch_one(&mut *common::conn(&pool).await)
                 .await
                 .expect("after");
         assert_eq!(after, None);
     }
 
     // Ошибка тела — откат.
-    let pool = pool::connect(&cfg(url.clone(), false), &*common::secrets())
-        .await
-        .expect("connect");
+    let pool = pool::connect(
+        &cfg(url.clone(), false),
+        &*common::secrets(),
+        Arc::new(NoAcquireObserver),
+    )
+    .await
+    .expect("connect");
     let other = TenantId::new();
     let res: tp_contracts::Result<()> = pool::with_tenant(&pool, other, |tx| {
         Box::pin(async move {
@@ -225,16 +248,16 @@ async fn sslmode_disable_only_in_dev() {
         ..dev.clone()
     };
     assert!(matches!(
-        pool::connect(&prod, &*common::secrets()).await,
+        pool::connect(&prod, &*common::secrets(), Arc::new(NoAcquireObserver)).await,
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        pool::connect_lazy(&prod, &dev.url, None),
+        pool::connect_lazy(&prod, &dev.url, None, None, Arc::new(NoAcquireObserver)),
         Err(Error::Invalid(_))
     ));
 
     // doctor сообщает режим канала.
-    let pool = pool::connect(&dev, &*common::secrets())
+    let pool = pool::connect(&dev, &*common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("connect");
     let report = doctor::check(&pool, &DoctorConfig::default())
@@ -243,4 +266,101 @@ async fn sslmode_disable_only_in_dev() {
     let tls = report.get("tls").expect("tls");
     assert!(tls.value.starts_with("sslmode=disable"), "{tls:?}");
     assert_eq!(tls.status, Status::Warn);
+}
+
+/// META-55: пул из одного соединения, вторая транзакция ждёт — наблюдатель получает ожидание и его время;
+/// отменённое ожидание не оставляет «ожидает».
+#[tokio::test]
+async fn acquire_observer_sees_wait() {
+    use std::time::Duration;
+    use tp_contracts::acquire::AcquireCounter;
+
+    let Some(url) = common::pg_url() else {
+        return;
+    };
+    let c = PoolConfig {
+        max_connections: 1,
+        acquire_timeout: Duration::from_secs(30),
+        ..cfg(url, false)
+    };
+    // Ленивый пул: наблюдатель задан при создании и не видит пробного соединения `pool::connect`.
+    let password = c.password(&*common::secrets()).await.expect("password");
+    let counter = Arc::new(AcquireCounter::default());
+    let pool =
+        pool::connect_lazy(&c, &c.url, password.as_ref(), None, counter.clone()).expect("lazy");
+    assert_eq!(pool.snapshot().max, 1);
+
+    let waiting = |n: u64| {
+        let counter = counter.clone();
+        async move {
+            for _ in 0..500 {
+                if counter.waiting() == n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("ожидающих не {n}: {}", counter.waiting());
+        }
+    };
+    let second = |pool: pool::DbPool| {
+        tokio::spawn(async move {
+            pool::with_system(&pool, |tx| {
+                Box::pin(async move {
+                    sqlx::query_scalar::<_, i32>("SELECT 1")
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(db_err)
+                })
+            })
+            .await
+        })
+    };
+
+    // Первая транзакция держит единственное соединение.
+    let held = tp_meta::schema::begin(&pool, TenantId::DEFAULT)
+        .await
+        .expect("begin");
+    assert_eq!((counter.waiting(), counter.acquired()), (0, 1));
+    let snap = pool.snapshot();
+    assert_eq!((snap.size, snap.idle, snap.in_use()), (1, 0, 1));
+
+    // Вторая ждёт: наблюдатель видит ожидание, после освобождения — его время.
+    let task = second(pool.clone());
+    waiting(1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let before = counter.waited();
+    drop(held);
+    assert_eq!(task.await.expect("join"), Ok(1));
+    assert_eq!(
+        (counter.waiting(), counter.acquired(), counter.failed()),
+        (0, 2, 0)
+    );
+    assert!(counter.waited() - before >= Duration::from_millis(50));
+
+    // Отменённое ожидание не оставляет «ожидает» и не считается отказом.
+    let held = tp_meta::schema::begin_system(&pool).await.expect("begin");
+    let task = second(pool.clone());
+    waiting(1).await;
+    task.abort();
+    assert!(task.await.expect_err("отменена").is_cancelled());
+    waiting(0).await;
+    assert_eq!(
+        (counter.acquired(), counter.failed(), counter.cancelled()),
+        (3, 0, 1)
+    );
+    drop(held);
+
+    // Тайм-аут пула — исход «отказ».
+    let short = PoolConfig {
+        acquire_timeout: Duration::from_millis(200),
+        ..c
+    };
+    let timed = Arc::new(AcquireCounter::default());
+    let pool = pool::connect_lazy(&short, &short.url, password.as_ref(), None, timed.clone())
+        .expect("lazy");
+    let held = tp_meta::schema::begin_system(&pool).await.expect("begin");
+    let r = pool::with_system(&pool, |_| Box::pin(async { Ok(()) })).await;
+    assert!(matches!(r, Err(Error::Unavailable { .. })), "{r:?}");
+    assert_eq!((timed.waiting(), timed.failed()), (0, 1));
+    drop(held);
 }

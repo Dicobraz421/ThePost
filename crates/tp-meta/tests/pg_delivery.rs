@@ -39,12 +39,12 @@ fn event(tenant: TenantId, at: OffsetDateTime, tag: &str) -> DeliveryEvent {
     }
 }
 
-async fn sections(pool: &sqlx::PgPool) -> Vec<String> {
+async fn sections(pool: &tp_meta::pool::DbPool) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
          WHERE i.inhparent = 'delivery_log'::regclass ORDER BY 1",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *common::conn(pool).await)
     .await
     .expect("sections")
 }

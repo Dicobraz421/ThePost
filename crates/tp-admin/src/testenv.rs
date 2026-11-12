@@ -22,8 +22,9 @@ use tp_testkit::{
     MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies,
     MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
 };
+use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
-use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
+use crate::server::{Admin, AdminConfig, AdminRole, Deps, ParityStores, RoleBinding};
 use crate::sieve::ScriptError;
 
 /// Журнал аудита в памяти — [`MemAuditLog`] tp-testkit; [`MemAudit::records`] — записи для проверок.
@@ -138,6 +139,10 @@ pub struct Env {
     pub sieve: MemSieve,
     /// Объекты писем очереди модерации (`Admin::with_held_blobs`).
     pub held_blobs: MemBlobStore,
+    /// Адресная книга: контакты, оргструктура, динамические группы (`Admin::with_parity`).
+    pub addressbook: MemAddressBook,
+    pub mailbox_audit: MemMailboxAudit,
+    pub sync_gate: MemSyncGate,
     pub admin: Arc<Admin>,
     pub router: Router,
     pub other_tenant: TenantId,
@@ -208,16 +213,21 @@ impl Env {
 
     /// Без настроек транспорта (маршруты транспорта — 503).
     pub fn without_transport() -> Self {
-        Self::build(config(), Vec::new(), false, true)
+        Self::build(config(), Vec::new(), false, true, true)
     }
 
     /// Без локального входа (`admin init` и обмен — 503).
     pub fn without_local() -> Self {
-        Self::build(config(), Vec::new(), true, false)
+        Self::build(config(), Vec::new(), true, false, true)
+    }
+
+    /// Без хранилищ CTR-35 (адресная книга, списки, аудит ящиков — 503).
+    pub fn without_parity() -> Self {
+        Self::build(config(), Vec::new(), true, true, false)
     }
 
     pub fn with(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>) -> Self {
-        Self::build(cfg, modules, true, true)
+        Self::build(cfg, modules, true, true, true)
     }
 
     fn build(
@@ -225,6 +235,7 @@ impl Env {
         modules: Vec<Arc<dyn AdminRoutes>>,
         with_transport: bool,
         with_local: bool,
+        with_parity: bool,
     ) -> Self {
         let auth = FakeAuthenticator::default();
         let other_tenant = TenantId::new();
@@ -256,6 +267,22 @@ impl Env {
         let tokens = MemLocalAdminTokens::new();
         let admin = if with_local {
             admin.with_local_tokens(Arc::new(tokens.clone()))
+        } else {
+            admin
+        };
+        let addressbook = MemAddressBook::new();
+        let senders = MemSenderLists::new();
+        let mailbox_audit = MemMailboxAudit::new();
+        let sync_gate = MemSyncGate::new();
+        let admin = if with_parity {
+            admin.with_parity(ParityStores {
+                contacts: Arc::new(addressbook.clone()),
+                org: Arc::new(addressbook.clone()),
+                dynamic: Arc::new(addressbook.clone()),
+                senders: Arc::new(senders.clone()),
+                mailbox_audit: Arc::new(mailbox_audit.clone()),
+                sync: Arc::new(sync_gate.clone()),
+            })
         } else {
             admin
         };
@@ -294,6 +321,9 @@ impl Env {
             tokens,
             sieve,
             held_blobs,
+            addressbook,
+            mailbox_audit,
+            sync_gate,
             router: admin.clone().router(),
             admin,
             other_tenant,

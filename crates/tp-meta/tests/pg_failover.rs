@@ -28,6 +28,7 @@ use tp_contracts::meta::{
 };
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, GroupId, HeldId, TenantId};
 use tp_meta::failover::{FailoverConfig, connect_failover};
+use tp_meta::pool::NoAcquireObserver;
 use tp_meta::schema::db_err;
 use tp_meta::{MetaConfig, PgMeta};
 use uuid::Uuid;
@@ -106,7 +107,7 @@ async fn read_only_primary_switches_without_losing_writes() {
         retry_for: Duration::from_secs(20),
         probe_timeout: Duration::from_secs(2),
     };
-    let fo = connect_failover(&cfg, common::secrets())
+    let fo = connect_failover(&cfg, common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("connect_failover");
     assert_eq!(fo.metrics().primary, 0, "primary — первый адрес");
@@ -250,12 +251,13 @@ fn via(url: &str, addr: std::net::SocketAddr) -> String {
     format!("{scheme}://{}{addr}{tail}", user.unwrap_or_default())
 }
 
-async fn migrated(url: &str, db: &str) -> PgPool {
+async fn migrated(url: &str, db: &str) -> tp_meta::pool::DbPool {
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&url_for(url, db))
         .await
         .expect("connect");
+    let pool = common::db(pool);
     tp_meta::schema::migrate(&pool).await.expect("миграции");
     pool
 }
@@ -302,7 +304,7 @@ async fn meta_read_retried_on_new_primary() {
         retry_for: Duration::from_secs(30),
         probe_timeout: Duration::from_secs(2),
     };
-    let fo = connect_failover(&cfg, common::secrets())
+    let fo = connect_failover(&cfg, common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("connect_failover");
     let meta = PgMeta::from_failover(&fo, MetaConfig::default());
@@ -517,7 +519,7 @@ async fn keyed_write_not_doubled_after_commit_cut() {
         retry_for: Duration::from_secs(30),
         probe_timeout: Duration::from_secs(5),
     };
-    let fo = connect_failover(&cfg, common::secrets())
+    let fo = connect_failover(&cfg, common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("connect_failover");
     let meta = PgMeta::from_failover(&fo, MetaConfig::default());

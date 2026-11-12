@@ -11,6 +11,8 @@
 //! - `content` — тема и отправитель писем корзины и очереди модерации по `include=subject` с записью в аудит;
 //! - [`app_passwords`] — пароли приложений: выпуск (значение один раз), список, отзыв;
 //! - [`transport`] — настройки транспорта: принятые домены, доверенные источники, политики доменов назначения;
+//! - [`directory`] — адресная книга: почтовые контакты, дерево подразделений, фильтры динамических групп;
+//! - [`mailboxes`] — списки отправителей ящика, отключённые ящики, остановка синхронизации, аудит доступа к ящикам;
 //! - [`sieve`] — правила Sieve и автоответ учётной записи, скрипт организации: проверка текста до записи;
 //! - [`console`] — веб-консоль: вшитая статика `console/dist` (фича `console`), маршруты SPA, заголовки безопасности;
 //! - [`init`] — первый администратор без OIDC (`thepost admin init`): локальный сокет, одноразовый токен, сессия.
@@ -21,9 +23,11 @@ pub mod audit;
 pub mod console;
 mod content;
 pub mod delivery;
+pub mod directory;
 pub mod export;
 pub mod groups;
 pub mod init;
+pub mod mailboxes;
 pub mod retention;
 pub mod server;
 pub mod sieve;
@@ -39,5 +43,5 @@ pub use export::{
 };
 pub use groups::Moderation;
 pub use init::{InitConfig, InitGranted, InitReply, InitRequest};
-pub use server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
+pub use server::{Admin, AdminConfig, AdminRole, Deps, ParityStores, RoleBinding};
 pub use sieve::{ScriptCheck, ScriptError};

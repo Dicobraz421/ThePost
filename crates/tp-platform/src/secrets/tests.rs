@@ -146,6 +146,10 @@ fn url_forms() {
 struct MockState {
     /// `<mount>/<путь>` → поля KV v2.
     kv: HashMap<String, Map<String, Value>>,
+    /// `<mount>/<путь>` → текущая версия KV v2 (нет — 1 для заданных тестом).
+    kv_versions: HashMap<String, u64>,
+    /// Записи KV v2 (`POST …/data/…`).
+    kv_writes: u32,
     /// Путь динамического секрета → поля, срок аренды (с), продлеваемость.
     dynamic: HashMap<String, (Map<String, Value>, u64, bool)>,
     leases: HashMap<String, (Instant, u64)>,
@@ -267,7 +271,15 @@ impl MockState {
                 if let Some((mount, sub)) = rest.split_once("/data/")
                     && let Some(fields) = self.kv.get(&format!("{mount}/{sub}"))
                 {
-                    return (200, json!({ "data": { "data": fields, "metadata": {} } }));
+                    let version = self
+                        .kv_versions
+                        .get(&format!("{mount}/{sub}"))
+                        .copied()
+                        .unwrap_or(1);
+                    return (
+                        200,
+                        json!({ "data": { "data": fields, "metadata": { "version": version } } }),
+                    );
                 }
                 if let Some((fields, ttl, renewable)) = self.dynamic.get(rest).cloned() {
                     self.issued += 1;
@@ -280,6 +292,35 @@ impl MockState {
                     );
                 }
                 (404, json!({ "errors": [] }))
+            }
+            ("POST", p) if p.starts_with("/v1/") && p.contains("/data/") => {
+                let rest = &p[4..];
+                if self.forbidden.iter().any(|f| rest.starts_with(f.as_str())) {
+                    return denied;
+                }
+                let Some((mount, sub)) = rest.split_once("/data/") else {
+                    return (404, json!({ "errors": [] }));
+                };
+                let key = format!("{mount}/{sub}");
+                let current = self
+                    .kv
+                    .contains_key(&key)
+                    .then(|| self.kv_versions.get(&key).copied().unwrap_or(1));
+                let cas = body["options"]["cas"].as_u64();
+                if cas.is_some() && cas != Some(current.unwrap_or(0)) {
+                    return (
+                        400,
+                        json!({ "errors": ["check-and-set parameter did not match the current version"] }),
+                    );
+                }
+                let Some(fields) = body["data"].as_object() else {
+                    return (400, json!({ "errors": ["no data provided"] }));
+                };
+                let version = current.unwrap_or(0) + 1;
+                self.kv.insert(key.clone(), fields.clone());
+                self.kv_versions.insert(key, version);
+                self.kv_writes += 1;
+                (200, json!({ "data": { "version": version } }))
             }
             _ => (405, json!({ "errors": ["unsupported"] })),
         }
@@ -513,6 +554,68 @@ async fn approle_store_passes_contract_suite() {
         shown.contains("approle") && !shown.contains("secret-1"),
         "{shown}"
     );
+}
+
+#[tokio::test]
+async fn put_writes_new_kv_version_and_keeps_other_fields() {
+    let mock = Mock::start().await;
+    mock.with(|st| {
+        st.kv.insert(
+            "thepost/tls".into(),
+            fields(&[("key", "old"), ("note", "keep")]),
+        );
+        st.kv_versions.insert("thepost/tls".into(), 3);
+        st.forbidden.push("thepost/data/admin".into());
+    });
+    let dir = TempDir::new("vault-put");
+    let mut cfg = mock.config(&dir, approle(&dir, "secret-1"));
+    cfg.dynamic_mounts = vec!["database".into()];
+    let store = VaultStore::new(&cfg, Profile::Prod).await.expect("store");
+
+    store
+        .put(&r("thepost/tls#key"), &Secret::new("new"))
+        .await
+        .expect("put");
+    assert_eq!(
+        store
+            .get(&r("thepost/tls#key"))
+            .await
+            .expect("get")
+            .expose(),
+        "new"
+    );
+    let (fields_now, version) =
+        mock.with(|st| (st.kv["thepost/tls"].clone(), st.kv_versions["thepost/tls"]));
+    assert_eq!(
+        fields_now["note"], "keep",
+        "остальные поля пути сохраняются"
+    );
+    assert_eq!(version, 4, "новая версия KV v2");
+
+    // Пути ещё нет — первая версия.
+    store
+        .put(&r("thepost/fresh#key"), &Secret::new("k"))
+        .await
+        .expect("put new path");
+    assert_eq!(mock.with(|st| st.kv_versions["thepost/fresh"]), 1);
+
+    assert_eq!(
+        store
+            .put(&r("thepost/admin#token"), &Secret::new("x"))
+            .await,
+        Err(Error::Forbidden)
+    );
+    assert!(matches!(
+        store
+            .put(&r("database/creds/x#password"), &Secret::new("x"))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        store.put(&r("thepost#key"), &Secret::new("x")).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(mock.with(|st| st.kv_writes), 2);
 }
 
 #[tokio::test]

@@ -542,3 +542,59 @@ async fn shared_append_copy_move_by_insert_right() {
     let flags = messages(&x, x.env.scope(), projects).await;
     assert_eq!(flags.iter().filter(|f| f.contains(&Flag::Seen)).count(), 1);
 }
+
+#[tokio::test]
+async fn shared_access_audited() {
+    use tp_contracts::audit::{AuditAction, AuditActorKind};
+    let x = Ext::new(None).await;
+    let projects = x.projects().await;
+    share(&x, projects, "lrstea").await;
+    let (mut b, bob) = x.bob_with_scope().await;
+    let shared = format!("\"Other Users/{LOGIN}/Projects\"");
+    assert!(
+        b.cmd(&format!("S1 SELECT {shared}"))
+            .await
+            .contains("S1 OK")
+    );
+    // Метаданные — не чтение содержимого.
+    assert!(b.cmd("F1 FETCH 1 (FLAGS UID)").await.contains("F1 OK"));
+    assert!(b.cmd("F2 FETCH 1 BODY[TEXT]").await.contains("Hello"));
+    assert!(
+        b.cmd("T1 STORE 1 +FLAGS.SILENT (\\Deleted)")
+            .await
+            .contains("T1 OK")
+    );
+    assert!(b.cmd("E1 EXPUNGE").await.contains("E1 OK"));
+    let r = b
+        .cmd(&format!("A1 SETACL {shared} carol@example.org lr"))
+        .await;
+    assert!(r.contains("A1 OK"), "{r}");
+    let e = x.env.audit.entries();
+    let actions: Vec<AuditAction> = e.iter().map(|e| e.action).collect();
+    assert_eq!(
+        actions,
+        [
+            AuditAction::Login,
+            AuditAction::Read,
+            AuditAction::Delete,
+            AuditAction::ChangeRights
+        ]
+    );
+    for entry in &e {
+        assert_eq!(entry.scope, x.env.scope());
+        assert_eq!(entry.actor, BOB);
+        assert_eq!(entry.actor_account, Some(bob.account));
+        assert_eq!(entry.actor_kind, AuditActorKind::Delegate);
+        assert_eq!(entry.object.mailbox, Some(projects));
+        assert_eq!(entry.client.as_deref(), Some("imap 192.0.2.1"));
+    }
+    assert!(e[1].object.message.is_some());
+    assert_eq!(e[1].object.message, e[2].object.message);
+    assert_eq!(e[3].object.detail.as_deref(), Some("carol@example.org lr"));
+    // Чтение владельцем своей папки не записывается.
+    x.env.deliver(projects, PLAIN, Default::default()).await;
+    let mut o = x.login(LOGIN, PASSWORD).await;
+    assert!(o.cmd("S2 SELECT Projects").await.contains("S2 OK"));
+    assert!(o.cmd("F3 FETCH 1:* BODY[]").await.contains("F3 OK"));
+    assert_eq!(x.env.audit.entries().len(), 4);
+}

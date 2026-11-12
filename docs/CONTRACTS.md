@@ -26,7 +26,8 @@ SRS 3.8. Все операции хранилищ выполняются в ко
 `meta::Policy` — поля уровня, `None` — не задано (`overlay` накладывает более специфичный уровень). Потребители и умолчания (CTR-67,
 решение 97): `quota_bytes`, `trash_retention` — `tp-meta` (умолчание — секция `meta.retention`); `retention` — модуль «Соответствие
 требованиям» (удаление по сроку через `DecisionHook::before_final_delete`), ядро не применяет, не задано — без срока; `send_per_hour`
-(умолчание `Policy::DEFAULT_SEND_PER_HOUR` = 1000), `max_recipients` (`DEFAULT_MAX_RECIPIENTS` = 100) — лимиты submission в SMTP
+(умолчание `Policy::DEFAULT_SEND_PER_HOUR` = 1000), `rcpts_per_hour` (адресатов за скользящий час, как RecipientRateLimit в Exchange;
+`DEFAULT_RCPTS_PER_HOUR` = 2000, решение 113), `max_recipients` (`DEFAULT_MAX_RECIPIENTS` = 100) — лимиты submission в SMTP
 (`*_or_default()`); `dkim_selector` — селектор подписи домена в SMTP (не задано — подпись всеми ключами домена); `milter_profile` — набор
 фильтров `smtp.milter` (не задано — все фильтры); `trash_purge` — правило корзины (#Trash). Настроек этих полей SMTP в config.yaml нет.
 `PolicyTarget::{Tenant, Domain, Account, Mailbox}` — уровень цепочки, один тип на всю систему (CTR-25). `PolicyStore`:
@@ -428,7 +429,9 @@ Hot reload: новая копия рассылается через `watch`; п�
 поле — `[A-Za-z0-9_.-]+`. Скаляр на месте ссылки — ошибка «secret in plaintext» без значения в тексте. `Secret` — значение,
 `***` в `Debug`/`Display`, обнуляется при удалении, доступ — `expose()`; `lease() -> Option<&SecretLease { id, ttl, renewable }>`,
 `lease_ttl()`. `SecretStore`: `get(&SecretRef) -> Result<Secret>` (`NotFound` — нет пути или поля, `Forbidden` — политика,
-`Unavailable` — недоступно или запечатано), `renew(&SecretLease) -> Result<SecretLease>` (неизвестная/истёкшая — `NotFound`, перечитать;
+`Unavailable` — недоступно или запечатано), `put(&SecretRef, &Secret) -> Result<()>` — новая версия поля, прочие поля
+пути сохраняются (`Forbidden` — политика, `Unavailable` — недоступно, `Invalid` — не настроено, путь не для записи или
+изменён параллельно; реализации по умолчанию нет), `renew(&SecretLease) -> Result<SecretLease>` (неизвестная/истёкшая — `NotFound`, перечитать;
 по умолчанию — `NotFound`). Встроенный клиент — `tp-platform` (PLT-12), замена — `Registry::set_secret_store`, in-memory — `tp-testkit`.
 Код — `secrets.rs`.
 
@@ -861,3 +864,7 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `send_per_hour_or_default`, `max_recipients_or_default`), исполнитель `retention` — модуль «Соответствие требованиям».
   `TenantTransport.rewrites` — обязательное поле (без `serde(default)`). Временные трейты `tp-admin` (`PolicyStore`, `PolicyTarget`,
   `AuditLog`) и `PolicyTarget` `tp-meta` заменяются в META-70 и ADM-34.
+- 2026-11-12 — CTR-79 (волна contracts-51, решение 113): `Policy::rcpts_per_hour` — лимит отправки «адресатов в час» на учётную запись
+  по цепочке организация → домен → ящик, `Policy::DEFAULT_RCPTS_PER_HOUR` = 2000, `rcpts_per_hour_or_default()`; потребитель — SMTP
+  (SMTP-43). Хранение — столбец `policies.rcpts_per_hour` (миграция 0026), Admin API — поле `rcpts_per_hour` политики уровня. Код,
+  собирающий `Policy` перечислением всех полей, дополняется `rcpts_per_hour`.
