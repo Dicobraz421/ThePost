@@ -104,6 +104,31 @@
   when: thepost_socket_activation
   notify: Restart thepost
 
+# Растущая пауза перезапуска (RestartSteps, RestartMaxDelaySec) — systemd 254+; на старых — постоянные 30 с
+# (решение 85).
+- name: Check systemd version
+  ansible.builtin.command: systemctl --version
+  register: thepost_systemd_version
+  changed_when: false
+  check_mode: false
+
+- name: Constant restart delay on systemd < 254
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../systemd/thepost.service.d/restart-legacy.conf"
+    dest: /etc/systemd/system/thepost.service.d/restart-legacy.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: thepost_systemd_version.stdout_lines[0].split()[1] | int < 254
+  notify: Restart thepost
+
+- name: Growing restart delay on systemd 254+
+  ansible.builtin.file:
+    path: /etc/systemd/system/thepost.service.d/restart-legacy.conf
+    state: absent
+  when: thepost_systemd_version.stdout_lines[0].split()[1] | int >= 254
+  notify: Restart thepost
+
 - name: Create configuration directories
   ansible.builtin.file:
     path: "{{ item }}"
