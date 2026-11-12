@@ -1,6 +1,11 @@
 //! Встроенный клиент ACME для профиля SMB (SRS 6.2): выпуск сертификата по HTTP-01 (ответ на проверку отдаёт
-//! служебный HTTP — [`challenge_router`]), хранение цепочки и ключа на диске в файлах секции `tls`,
-//! продление за `renew_before` до истечения, перечитывание [`TlsCerts`] без перезапуска.
+//! служебный HTTP — [`challenge_router`]), продление за `renew_before` до истечения, перечитывание [`TlsCerts`]
+//! без перезапуска.
+//!
+//! Ключ TLS — только в хранилище секретов (решение 100, PLT-29): выпущенный ключ пишется новой версией секрета
+//! `tls.key` ([`SecretWriter`]), затем цепочка — в `tls.cert_file`. Ошибка записи ключа — `ERROR` в журнал,
+//! прежняя пара остаётся; ошибка записи цепочки — прежний ключ возвращается в секрет. Без `tls.key` ACME не
+//! работает (`Invalid`). Узлу нужна запись только своего пути ключа TLS (политика хранилища — DEP-44).
 //!
 //! Учётная запись ACME сохраняется в `state_dir/account.yaml`, список доменов последнего выпуска — в
 //! `state_dir/domains` (смена доменов вызывает перевыпуск). Срок действия читается из сертификата на диске.
@@ -28,7 +33,9 @@ use serde::Deserialize;
 use tp_contracts::Error;
 use tp_contracts::config::duration;
 use tp_contracts::role::CancellationToken;
+use tp_contracts::secrets::{Secret, SecretRef};
 
+use crate::secrets::SecretWriter;
 use crate::tls::{TlsCerts, TlsConfig};
 
 /// Секция `acme`.
@@ -94,10 +101,10 @@ enum AcmeError {
     State(#[from] serde_yaml_ng::Error),
     #[error("acme.domains is empty")]
     NoDomains,
-    #[error(
-        "acme writes the issued key to tls.key_file; tls.key from the secret store cannot be used with acme"
-    )]
-    SecretKey,
+    #[error("acme stores the issued key in the secret store: tls.key: {{ secret }} is required")]
+    NoSecretKey,
+    #[error("tls.key: secret {secret}: {source}")]
+    KeyStore { secret: SecretRef, source: Error },
     #[error("acme: storage task failed")]
     Join,
 }
@@ -110,7 +117,8 @@ impl From<AcmeError> for Error {
                 tracing::warn!(error = %e, "acme request failed");
                 Error::UNAVAILABLE
             }
-            AcmeError::NoDomains | AcmeError::SecretKey => Error::Invalid(e.to_string()),
+            AcmeError::NoDomains | AcmeError::NoSecretKey => Error::Invalid(e.to_string()),
+            AcmeError::KeyStore { source, .. } => source,
             _ => Error::Internal(e.to_string()),
         }
     }
@@ -173,6 +181,7 @@ pub struct Acme {
     tls: TlsConfig,
     challenges: Http01Challenges,
     certs: Option<Arc<TlsCerts>>,
+    keys: Arc<dyn SecretWriter>,
     http: Option<Arc<dyn HttpClient>>,
 }
 
@@ -186,12 +195,14 @@ impl fmt::Debug for Acme {
 }
 
 impl Acme {
-    /// Клиент по секции `acme`; сертификат и ключ пишутся в файлы секции `tls`, затем перечитывается `certs`.
+    /// Клиент по секции `acme`: ключ пишется в секрет `tls.key` хранилища `keys` (то же, из которого его читает
+    /// `certs`), цепочка — в `tls.cert_file`, затем перечитывается `certs`.
     pub fn new(
         cfg: AcmeConfig,
         tls: TlsConfig,
         challenges: Http01Challenges,
         certs: Option<Arc<TlsCerts>>,
+        keys: Arc<dyn SecretWriter>,
     ) -> Self {
         // Встроенный HTTP-клиент instant-acme берёт процессный провайдер rustls.
         crate::tls::install_crypto_provider();
@@ -200,6 +211,7 @@ impl Acme {
             tls,
             challenges,
             certs,
+            keys,
             http: None,
         }
     }
@@ -230,8 +242,8 @@ impl Acme {
         if self.cfg.domains.is_empty() {
             return Err(AcmeError::NoDomains.into());
         }
-        if self.tls.key.is_some() {
-            return Err(AcmeError::SecretKey.into());
+        if self.tls.key.is_none() {
+            return Err(AcmeError::NoSecretKey.into());
         }
         let cert_file = self.tls.cert_file.clone();
         let domains_file = self.domains_file();
@@ -253,7 +265,8 @@ impl Acme {
         Ok(now + self.cfg.renew_before >= not_after)
     }
 
-    /// Выпускает сертификат безусловно: заказ, проверки HTTP-01, финализация, запись файлов, перечитывание TLS.
+    /// Выпускает сертификат безусловно: заказ, проверки HTTP-01, финализация, запись ключа в секрет и цепочки в
+    /// файл, перечитывание TLS.
     pub async fn issue(&self) -> tp_contracts::Result<()> {
         Ok(self.try_issue().await?)
     }
@@ -287,9 +300,9 @@ impl Acme {
         if self.cfg.domains.is_empty() {
             return Err(AcmeError::NoDomains);
         }
-        if self.tls.key.is_some() {
-            return Err(AcmeError::SecretKey);
-        }
+        let Some(key_ref) = self.tls.key.clone() else {
+            return Err(AcmeError::NoSecretKey);
+        };
         let account = self.account().await?;
         let identifiers: Vec<Identifier> = self
             .cfg
@@ -337,23 +350,49 @@ impl Acme {
         }
         let (key_pem, chain_pem) = result?;
         check_pair(&chain_pem, &key_pem)?;
+        let key = Secret::new(key_pem);
 
-        let tls = self.tls.clone();
-        let domains_file = self.domains_file();
-        let domains = self.domains_text();
-        tokio::task::spawn_blocking(move || {
-            write_private(&tls.key_file, key_pem.as_bytes())?;
-            write_atomic(&tls.cert_file, chain_pem.as_bytes(), false)?;
-            write_atomic(&domains_file, domains.as_bytes(), false)
+        // Прежний ключ — для возврата, если цепочку записать не удастся (пары ещё нет — возвращать нечего).
+        let previous = match self.keys.get(&key_ref).await {
+            Ok(old) => Some(old),
+            Err(Error::NotFound) => None,
+            Err(source) => return Err(key_not_stored(key_ref, source)),
+        };
+        if let Err(source) = self.keys.put(&key_ref, &key).await {
+            return Err(key_not_stored(key_ref, source));
+        }
+        let cert_file = self.tls.cert_file.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            write_atomic(&cert_file, chain_pem.as_bytes(), false)
         })
         .await
-        .map_err(|_| AcmeError::Join)??;
+        .map_err(|_| AcmeError::Join)
+        .and_then(|r| r);
+        if let Err(e) = written {
+            tracing::error!(error = %e, "acme: certificate chain not written");
+            if let Some(old) = previous
+                && let Err(source) = self.keys.put(&key_ref, &old).await
+            {
+                tracing::error!(
+                    secret = %key_ref,
+                    error = %source,
+                    "acme: previous tls key not restored, key and certificate differ"
+                );
+            }
+            return Err(e);
+        }
         if let Some(certs) = &self.certs {
             certs
                 .reload()
                 .await
                 .map_err(|e| AcmeError::Protocol(format!("issued certificate rejected: {e}")))?;
         }
+        // Список доменов — после пары: его потеря вызывает лишь повторный выпуск.
+        let domains_file = self.domains_file();
+        let domains = self.domains_text();
+        tokio::task::spawn_blocking(move || write_atomic(&domains_file, domains.as_bytes(), false))
+            .await
+            .map_err(|_| AcmeError::Join)??;
         Ok(())
     }
 
@@ -438,7 +477,13 @@ fn check_pair(chain_pem: &str, key_pem: &str) -> Result<(), AcmeError> {
     Ok(())
 }
 
-/// Закрытые данные (ключ, учётная запись): права 0600.
+/// Ключ не записан в секрет: `ERROR` в журнал, прежняя пара остаётся.
+fn key_not_stored(secret: SecretRef, source: Error) -> AcmeError {
+    tracing::error!(secret = %secret, error = %source, "acme: tls key not stored, previous pair kept");
+    AcmeError::KeyStore { secret, source }
+}
+
+/// Закрытые данные (учётная запись): права 0600.
 fn write_private(path: &Path, data: &[u8]) -> Result<(), AcmeError> {
     write_atomic(path, data, true)
 }
@@ -549,15 +594,59 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
     use axum::body::Bytes;
     use axum::body::HttpBody as _;
     use axum::http::{Method, Request};
 
+    use tp_contracts::secrets::SecretStore;
+    use tp_testkit::MemSecretStore;
+
     use super::*;
     use crate::tls::tests::{CERT_A, CERT_B, KEY_A, TempDir, der};
+
+    /// Хранилище ключа TLS в памяти с записью: число записей, отказ записи по флагу.
+    #[derive(Default)]
+    struct Keys {
+        mem: MemSecretStore,
+        puts: AtomicUsize,
+        fail_put: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl SecretStore for Keys {
+        async fn get(&self, secret: &SecretRef) -> tp_contracts::Result<Secret> {
+            self.mem.get(secret).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SecretWriter for Keys {
+        async fn put(&self, secret: &SecretRef, value: &Secret) -> tp_contracts::Result<()> {
+            if self.fail_put.load(Ordering::SeqCst) {
+                return Err(Error::Forbidden);
+            }
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            self.mem.set(secret, value.expose());
+            Ok(())
+        }
+    }
+
+    impl Keys {
+        async fn key(&self) -> Option<String> {
+            self.mem
+                .get(&key_ref())
+                .await
+                .ok()
+                .map(|s| s.expose().to_owned())
+        }
+    }
+
+    fn key_ref() -> SecretRef {
+        SecretRef::new("thepost/tls", "key").expect("ref")
+    }
 
     const BASE: &str = "https://acme.test";
     const TOKEN: &str = "tok-ABC_123";
@@ -807,7 +896,7 @@ mod tests {
         out
     }
 
-    fn setup(dir: &Path, fixed_chain: Option<&str>) -> (Acme, Arc<MockAcme>, TlsConfig) {
+    fn setup(dir: &Path, fixed_chain: Option<&str>) -> (Acme, Arc<MockAcme>, TlsConfig, Arc<Keys>) {
         let challenges = Http01Challenges::default();
         let mock = Arc::new(MockAcme {
             challenges: challenges.clone(),
@@ -817,7 +906,8 @@ mod tests {
         });
         let tls = TlsConfig {
             cert_file: dir.join("tls/fullchain.pem"),
-            key_file: dir.join("tls/privkey.pem"),
+            key_file: dir.join("tls/absent-key.pem"),
+            key: Some(key_ref()),
             ..TlsConfig::default()
         };
         let cfg = AcmeConfig {
@@ -828,14 +918,16 @@ mod tests {
             state_dir: dir.join("acme"),
             ..AcmeConfig::default()
         };
-        let acme = Acme::new(cfg, tls.clone(), challenges, None).with_http(mock.clone());
-        (acme, mock, tls)
+        let keys = Arc::new(Keys::default());
+        let acme =
+            Acme::new(cfg, tls.clone(), challenges, None, keys.clone()).with_http(mock.clone());
+        (acme, mock, tls, keys)
     }
 
     #[tokio::test]
     async fn issues_and_renews_with_mock_directory() {
         let dir = TempDir::new("acme-issue");
-        let (acme, mock, tls) = setup(&dir.0, None);
+        let (acme, mock, tls, keys) = setup(&dir.0, None);
         let now = SystemTime::now();
         assert!(
             acme.needs_renewal_at(now).await.expect("check"),
@@ -844,9 +936,10 @@ mod tests {
         assert!(acme.renew_if_needed_at(now).await.expect("issue"));
 
         let chain = std::fs::read_to_string(&tls.cert_file).expect("chain");
-        let key = std::fs::read_to_string(&tls.key_file).expect("key");
+        let key = keys.key().await.expect("key in secret store");
         assert!(key.contains("PRIVATE KEY"));
         check_pair(&chain, &key).expect("key matches certificate");
+        assert!(!tls.key_file.exists(), "key is not written to disk");
         assert!(dir.0.join("acme/account.yaml").exists());
         assert_eq!(
             std::fs::read_to_string(dir.0.join("acme/domains")).expect("domains"),
@@ -860,7 +953,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&tls.key_file)
+            let mode = std::fs::metadata(dir.0.join("acme/account.yaml"))
                 .expect("meta")
                 .permissions()
                 .mode();
@@ -884,16 +977,45 @@ mod tests {
         );
         let st = mock.state.lock().expect("state");
         assert_eq!((st.accounts, st.orders), (1, 2));
+        assert_eq!(
+            keys.puts.load(Ordering::SeqCst),
+            2,
+            "new secret version per issue"
+        );
+        let renewed = keys.key().await.expect("key");
+        assert_ne!(renewed, key, "renewal stores a new key");
+        let chain = std::fs::read_to_string(&tls.cert_file).expect("chain");
+        check_pair(&chain, &renewed).expect("renewed pair matches");
+    }
+
+    #[tokio::test]
+    async fn acme_requires_key_in_secret_store() {
+        let dir = TempDir::new("acme-no-secret");
+        let (acme, mock, tls, _keys) = setup(&dir.0, None);
+        let acme = Acme {
+            tls: TlsConfig { key: None, ..tls },
+            ..acme
+        };
+        assert!(matches!(
+            acme.needs_renewal_at(SystemTime::now()).await,
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(acme.issue().await, Err(Error::Invalid(_))));
+        assert_eq!(mock.state.lock().expect("state").orders, 0);
     }
 
     #[tokio::test]
     async fn issued_certificate_is_reloaded_into_tls() {
         let dir = TempDir::new("acme-reload");
-        let (acme, _mock, tls) = setup(&dir.0, None);
+        let (acme, _mock, tls, keys) = setup(&dir.0, None);
         std::fs::create_dir_all(dir.0.join("tls")).expect("dir");
         std::fs::write(&tls.cert_file, CERT_A).expect("cert");
-        std::fs::write(&tls.key_file, KEY_A).expect("key");
-        let certs = Arc::new(TlsCerts::load(&tls).await.expect("certs"));
+        keys.mem.set(&key_ref(), KEY_A);
+        let certs = Arc::new(
+            TlsCerts::load_with_secrets(&tls, keys.clone())
+                .await
+                .expect("certs"),
+        );
         let before = certs.server_config();
         let acme = Acme {
             certs: Some(certs.clone()),
@@ -907,6 +1029,9 @@ mod tests {
         );
         let chain = std::fs::read_to_string(&tls.cert_file).expect("chain");
         assert_ne!(der(&chain), der(CERT_A));
+        let key = keys.key().await.expect("key");
+        assert_ne!(key, KEY_A, "new key version in the secret");
+        check_pair(&chain, &key).expect("listener pair matches");
 
         let acme = Acme {
             cfg: AcmeConfig {
@@ -923,16 +1048,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failures_leave_files_untouched() {
+    async fn failures_leave_pair_untouched() {
         let dir = TempDir::new("acme-fail");
         // Цепочка не соответствует выпущенному ключу.
-        let (acme, mock, tls) = setup(&dir.0, Some(CERT_B));
+        let (acme, mock, tls, keys) = setup(&dir.0, Some(CERT_B));
         assert!(acme.issue().await.expect_err("mismatch").is_retryable());
-        assert!(!tls.cert_file.exists() && !tls.key_file.exists());
+        assert!(!tls.cert_file.exists());
+        assert_eq!(keys.key().await, None);
         assert!(mock.state.lock().expect("state").chain.is_some());
 
         // Ответ на проверку не опубликован: сервер ACME отклоняет проверку, до финализации не доходит.
-        let (acme, mock, tls) = setup(&dir.0, None);
+        let (acme, mock, tls, _keys) = setup(&dir.0, None);
         let acme = Acme {
             challenges: Http01Challenges::default(),
             ..acme
@@ -949,6 +1075,58 @@ mod tests {
             ..acme
         };
         assert!(matches!(acme.issue().await, Err(Error::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn key_store_failure_keeps_previous_pair() {
+        let dir = TempDir::new("acme-store-fail");
+        let (acme, _mock, tls, keys) = setup(&dir.0, None);
+        std::fs::create_dir_all(dir.0.join("tls")).expect("dir");
+        std::fs::write(&tls.cert_file, CERT_A).expect("cert");
+        keys.mem.set(&key_ref(), KEY_A);
+        let certs = Arc::new(
+            TlsCerts::load_with_secrets(&tls, keys.clone())
+                .await
+                .expect("certs"),
+        );
+        let before = certs.server_config();
+        let acme = Acme {
+            certs: Some(certs.clone()),
+            ..acme
+        };
+
+        // Запись ключа запрещена: ни секрет, ни цепочка не меняются, TLS не перечитан.
+        keys.fail_put.store(true, Ordering::SeqCst);
+        assert_eq!(acme.issue().await, Err(Error::Forbidden));
+        assert_eq!(keys.key().await.as_deref(), Some(KEY_A));
+        assert_eq!(
+            der(&std::fs::read_to_string(&tls.cert_file).expect("chain")),
+            der(CERT_A)
+        );
+        assert!(Arc::ptr_eq(&before, &certs.server_config()));
+
+        // Цепочку записать нельзя (на месте файла — каталог): прежний ключ возвращён в секрет.
+        keys.fail_put.store(false, Ordering::SeqCst);
+        let blocked = Acme {
+            tls: TlsConfig {
+                cert_file: dir.0.join("blocked"),
+                ..acme.tls.clone()
+            },
+            ..acme
+        };
+        std::fs::create_dir_all(dir.0.join("blocked/inner")).expect("dir");
+        blocked.issue().await.expect_err("chain not written");
+        assert_eq!(
+            keys.key().await.as_deref(),
+            Some(KEY_A),
+            "previous key restored"
+        );
+        assert_eq!(
+            keys.puts.load(Ordering::SeqCst),
+            2,
+            "new key, then previous"
+        );
+        assert!(Arc::ptr_eq(&before, &certs.server_config()));
     }
 
     #[tokio::test]
@@ -999,10 +1177,16 @@ mod tests {
         };
         let tls = TlsConfig {
             cert_file: dir.0.join("tls/fullchain.pem"),
-            key_file: dir.0.join("tls/privkey.pem"),
+            key: Some(key_ref()),
             ..TlsConfig::default()
         };
-        let acme = Acme::new(cfg, tls.clone(), Http01Challenges::default(), None);
+        let acme = Acme::new(
+            cfg,
+            tls.clone(),
+            Http01Challenges::default(),
+            None,
+            Arc::new(Keys::default()),
+        );
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
         acme.issue().await.expect_err("directory unreachable");
         assert!(!tls.cert_file.exists());

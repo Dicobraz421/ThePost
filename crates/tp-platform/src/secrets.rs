@@ -7,6 +7,10 @@
 //! (`GET /v1/<mount>/<путь>`, поле из `data`) — с арендой, если хранилище её выдало. Все поля одного динамического
 //! пути берутся из одной аренды (логин и пароль — из одной выдачи), пока аренда действует.
 //!
+//! Запись — [`SecretWriter`] (ключ TLS, выпущенный встроенным ACME, PLT-29): поле KV v2 сливается с остальными
+//! полями пути и пишется новой версией (`POST /v1/<mount>/data/<путь>` с `options.cas` — версия, с которой
+//! начато слияние; правка в хранилище между чтением и записью — отказ, а не потеря чужих полей).
+//!
 //! Вход узла — ровно один способ: Kubernetes (токен сервисного аккаунта), сертификат TLS узла (mTLS), AppRole
 //! (`secret_id` из файла, например учётные данные systemd) или готовый токен из файла (Vault Agent, dev).
 //! Токен узла продлевается, когда прошло две трети срока; отказ продления или ответ 403 — новый вход.
@@ -705,6 +709,41 @@ impl VaultStore {
         field_value(v.get("data").and_then(|d| d.get("data")), field).map(Secret::new)
     }
 
+    /// Запись поля KV v2 новой версией: поля пути читаются, поле заменяется, запись — с `cas` прочитанной версии
+    /// (пути ещё нет — без `cas`).
+    async fn write_kv(
+        &self,
+        mount: &str,
+        rest: &str,
+        field: &str,
+        value: &Secret,
+    ) -> std::result::Result<(), VaultError> {
+        let path = format!("/v1/{mount}/data/{rest}");
+        let (mut fields, version) = match self.call("GET", &path, None).await {
+            Ok(v) => {
+                let data = v.get("data");
+                let fields = data
+                    .and_then(|d| d.get("data"))
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let version = data
+                    .and_then(|d| d.get("metadata"))
+                    .and_then(|m| m.get("version"))
+                    .and_then(Value::as_u64);
+                (fields, version)
+            }
+            Err(e) if e.status() == Some(404) => (serde_json::Map::new(), None),
+            Err(e) => return Err(e),
+        };
+        fields.insert(field.to_owned(), Value::String(value.expose().to_owned()));
+        let body = match version {
+            Some(cas) => json!({ "options": { "cas": cas }, "data": fields }),
+            None => json!({ "data": fields }),
+        };
+        self.call("POST", &path, Some(&body)).await.map(drop)
+    }
+
     /// Чтение как есть (движки с арендами, KV v1); поля одного пути — из одной действующей аренды.
     async fn read_dynamic(
         &self,
@@ -783,6 +822,36 @@ impl VaultStore {
             _ => tracing::warn!(secret = %what, error = %e, "secret store request failed"),
         }
         e.into()
+    }
+}
+
+/// Хранилище секретов с записью: узел кладёт выпущенные им секреты (ключ TLS от ACME). Права узла на запись —
+/// только своих путей (политика хранилища).
+#[async_trait]
+pub trait SecretWriter: SecretStore {
+    /// Записывает поле секрета новой версией; остальные поля пути сохраняются. Запрещено политикой — `Forbidden`;
+    /// хранилище недоступно — `Unavailable`; путь не KV v2 или изменён параллельно (отказ `cas`) — `Invalid`.
+    async fn put(&self, secret: &SecretRef, value: &Secret) -> Result<()>;
+}
+
+#[async_trait]
+impl SecretWriter for VaultStore {
+    async fn put(&self, secret: &SecretRef, value: &Secret) -> Result<()> {
+        let path = secret.path();
+        let result = match path.split_once('/') {
+            Some((mount, _)) if self.inner.dynamic_mounts.iter().any(|m| m == mount) => {
+                return Err(Error::invalid(format!(
+                    "secret {secret}: writes go to KV v2, {mount} is in dynamic_mounts"
+                )));
+            }
+            Some((mount, rest)) => self.write_kv(mount, rest, secret.field(), value).await,
+            None => {
+                return Err(Error::invalid(format!(
+                    "secret {secret}: no path inside the mount"
+                )));
+            }
+        };
+        result.map_err(|e| self.fail(secret, e))
     }
 }
 

@@ -30,7 +30,7 @@ pub use reload::{ReloadConfig, ReloadTrigger, Reloader, section_watch};
 pub use roles::{RoleLimits, RoleSpec, Roles, RolesReport, RuntimeConfig};
 /// rustls слушателей: типы ключа [`TlsCerts::certified_key`] (схемы подписи) для крейтов без своей зависимости.
 pub use rustls;
-pub use secrets::{SecretsConfig, VaultStore};
+pub use secrets::{SecretWriter, SecretsConfig, VaultStore};
 pub use service_http::{Health, ServiceHttpConfig};
 pub use telemetry::{BusSample, Metrics, Telemetry, TelemetryConfig};
 pub use tls::{TlsCerts, TlsConfig};
