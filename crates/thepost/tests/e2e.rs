@@ -37,7 +37,10 @@ use tp_contracts::delivery::{DeliveryEventKind, DeliveryLog, DeliveryQuery};
 use tp_contracts::ext::{DecisionHooks, Migration, Module, ModuleCtx, Registry};
 use tp_contracts::ids::DomainId;
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, MessageStore, Policy};
+use tp_contracts::meta::{
+    AccountKind, AccountScope, AccountStore, AccountUpsert, MessageStore, Policy, PolicyStore,
+    PolicyTarget,
+};
 use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::secrets::{SecretRef, SecretStore};
@@ -54,6 +57,20 @@ fn testdata(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/testdata")
         .join(name)
+}
+
+/// Хранилище секретов узла теста: пароль СУБД (`thepost/db#password`) и ключ TLS — только секрет `tls.key`
+/// (PLT-31; ссылка по умолчанию `thepost/tls#key`, ключ тестового сертификата).
+fn node_secrets(password: Option<String>) -> Arc<MemSecretStore> {
+    let secrets = Arc::new(MemSecretStore::default());
+    let db: SecretRef = "thepost/db#password".parse().expect("ref");
+    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let key: SecretRef = "thepost/tls#key".parse().expect("ref");
+    secrets.set(
+        &key,
+        std::fs::read_to_string(testdata("key.pem")).expect("key.pem"),
+    );
+    secrets
 }
 
 /// Адрес без `sslmode` — открытый канал (профиль dev).
@@ -84,22 +101,31 @@ fn split_password(url: &str) -> (String, Option<String>) {
     }
 }
 
-/// config.yaml без секций верхнего уровня `names` (их задаёт тест).
-fn without_sections(text: &str, names: &[&str]) -> String {
+/// Пресет `preset` с секциями теста `own`: секции верхнего уровня, которые задаёт тест, и секции `drop` вырезаются
+/// из пресета целиком, поэтому новая секция пресета не даёт повторяющегося ключа. Комментарии с первой колонки
+/// остаются.
+fn with_sections(preset: &str, own: &str, drop: &[&str]) -> String {
+    let top = |line: &str| !line.starts_with([' ', '\t', '#']) && !line.trim().is_empty();
+    let names: Vec<&str> = own
+        .lines()
+        .filter(|l| top(l))
+        .filter_map(|l| l.split_once(':').map(|(name, _)| name))
+        .chain(drop.iter().copied())
+        .collect();
     let mut out = String::new();
     let mut skip = false;
-    for line in text.lines() {
-        let top = !line.starts_with([' ', '\t']) && !line.trim().is_empty();
-        if top {
+    for line in preset.lines() {
+        if top(line) {
             skip = names
                 .iter()
                 .any(|n| line.strip_prefix(n).is_some_and(|r| r.starts_with(':')));
         }
-        if !skip {
+        if !skip || line.starts_with('#') {
             out.push_str(line);
             out.push('\n');
         }
     }
+    out.push_str(own);
     out
 }
 
@@ -110,12 +136,9 @@ fn config(dir: &Path, db_url: &str, domain: &str) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/all.yaml"),
     )
     .expect("deploy/config/all.yaml");
-    let base = without_sections(&all, &["domain", "database", "blob", "secrets", "http"]);
-    assert!(base.contains("roles: [all]"), "{base}");
     let path = |p: PathBuf| p.display().to_string().replace('\\', "/");
-    format!(
-        "{base}\
-domain: {domain}
+    let own = format!(
+        "domain: {domain}
 profile: dev
 database:
   url: \"{db_url}\"
@@ -128,7 +151,6 @@ service_http:
   allow_plaintext: true
 tls:
   cert_file: \"{cert}\"
-  key_file: \"{key}\"
 meta:
   events:
     node_ttl: 3s
@@ -157,10 +179,12 @@ search:
 ",
         blob = path(dir.join("blob")),
         cert = path(testdata("cert.pem")),
-        key = path(testdata("key.pem")),
         index = path(dir.join("index")),
         pid = std::process::id(),
-    )
+    );
+    let text = with_sections(&all, &own, &["secrets"]);
+    assert!(text.contains("roles: [all]"), "{text}");
+    text
 }
 
 /// Срок ожидания шага: `WAIT` от текущего момента.
@@ -558,9 +582,7 @@ async fn mvp_mail_flow() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     // Домен профиля SMB из поставки (`deploy/config/all.yaml`).
     let domain = "example.ru".to_owned();
@@ -586,7 +608,7 @@ async fn mvp_mail_flow() {
     }
 
     // Учётная запись и пароль приложения — в той же БД (миграции выполнил узел).
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
     let domain_id = accept_domain(&meta, tenant, &domain).await;
@@ -600,6 +622,8 @@ async fn mvp_mail_flow() {
                 display_name: "Alice".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -870,7 +894,7 @@ async fn mvp_mail_flow() {
     };
     meta.set_policy(
         tenant,
-        tp_meta::retention::PolicyTarget::Tenant,
+        PolicyTarget::Tenant,
         &Policy {
             trash_purge: Some(erase),
             ..Policy::default()
@@ -917,6 +941,8 @@ async fn mvp_mail_flow() {
                 display_name: "Bob".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -988,7 +1014,7 @@ async fn mvp_mail_flow() {
     // удалённое в корзину, окончательно удаляет воркер истечения узла.
     meta.set_policy(
         tenant,
-        tp_meta::retention::PolicyTarget::Tenant,
+        PolicyTarget::Tenant,
         &Policy {
             trash_purge: Some(erase),
             trash_retention: Some(Duration::from_secs(2)),
@@ -1134,9 +1160,7 @@ async fn transport_settings_without_restart() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let domain = "example.ru".to_owned();
     let socket = dir.path().join("admin.sock");
@@ -1211,6 +1235,45 @@ async fn transport_settings_without_restart() {
     .await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
+    // ADM-34: политика организации — через контракт `PolicyStore` в PostgreSQL; изменения — в журнале аудита
+    // (`audit_log`), `GET …/audit` отдаёт их.
+    let org = format!("/api/v1/orgs/{}", TenantId::DEFAULT);
+    let policy = json!({ "max_recipients": 7 });
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &format!("{org}/policy"),
+        &bearer,
+        Some(&policy),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = http(admin, "GET", &org, &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let read: Value = serde_json::from_slice(&body).expect("org");
+    assert_eq!(read["policy"]["max_recipients"], 7, "{read}");
+    let (code, body) = http(admin, "GET", &format!("{org}/audit"), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let audit: Value = serde_json::from_slice(&body).expect("audit");
+    let changes: Vec<(&str, &str, u64)> = audit["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|e| {
+            Some((
+                e["method"].as_str()?,
+                e["route"].as_str()?,
+                e["status"].as_u64()?,
+            ))
+        })
+        .collect();
+    for change in [
+        ("PUT", "/api/v1/orgs/{org}/transport/sources/{name}", 200),
+        ("PUT", "/api/v1/orgs/{org}/policy", 200),
+    ] {
+        assert!(changes.contains(&change), "{change:?}: {audit}");
+    }
+
     // Следующая сессия без перезапуска (сигнал `TransportChanged`): отправитель вне списка источника — отказ.
     let until = deadline();
     while mail_from_code(smtp, "robot@other.test").await != 550 {
@@ -1237,7 +1300,13 @@ async fn transport_settings_without_restart() {
 // ---------- APP-26: правила Sieve и автоответ ----------
 
 /// Получатели очереди исходящей почты с адресом `address`.
-async fn queued(pool: &sqlx::PgPool, address: &str) -> i64 {
+/// Пул `tp-meta` к базе `url` без учёта ожидания соединения (наблюдатель-пустышка): метрик в тесте нет.
+async fn db_pool(url: &str) -> tp_meta::pool::DbPool {
+    let pool = sqlx::PgPool::connect(url).await.expect("pool");
+    tp_meta::pool::DbPool::new(pool, Arc::new(tp_meta::pool::NoAcquireObserver))
+}
+
+async fn queued(pool: &tp_meta::pool::DbPool, address: &str) -> i64 {
     let mut tx = tp_meta::schema::begin(pool, TenantId::DEFAULT)
         .await
         .expect("begin");
@@ -1260,9 +1329,7 @@ async fn sieve_rules_and_vacation() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let domain = "example.ru".to_owned();
     let socket = dir.path().join("admin.sock");
@@ -1315,7 +1382,7 @@ async fn sieve_rules_and_vacation() {
     let session: Value = serde_json::from_slice(&body).expect("session");
     let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
 
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let tenant = TenantId::DEFAULT;
     let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
     let account: sqlx::types::Uuid =
@@ -1548,9 +1615,7 @@ async fn meeting_scheduling() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let domain = "example.ru".to_owned();
     let path = dir.path().join("config.yaml");
@@ -1577,7 +1642,7 @@ async fn meeting_scheduling() {
         retry(until, "узел готов").await;
     }
 
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+    let pool = db_pool(&url_db).await;
     let meta = PgMeta::new(pool.clone(), MetaConfig::default());
     let tenant = TenantId::DEFAULT;
     let domain_id = accept_domain(&meta, tenant, &domain).await;
@@ -1596,6 +1661,8 @@ async fn meeting_scheduling() {
                     display_name: name.to_owned(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: tp_contracts::meta::AccountKind::User,
                 },
             )
             .await
@@ -1737,9 +1804,7 @@ async fn d7_metrics() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let path = dir.path().join("config.yaml");
     let text = config(dir.path(), &db_url, "example.ru")
@@ -1795,6 +1860,16 @@ async fn d7_metrics() {
     ] {
         assert!(text.contains(name), "{name}: {text}");
     }
+    // Ожидание соединения пулов учтено наблюдателем пула (META-55): узел уже получал соединения.
+    for pool in ["primary", "listener"] {
+        let series = format!("tp_db_pool_wait_seconds_count{{pool=\"{pool}\"}} ");
+        let waits: f64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix(series.as_str()))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{series}: {text}"));
+        assert!(waits >= 1.0, "{series}: {text}");
+    }
 
     shutdown.cancel();
     let report = running.wait().await.expect("report");
@@ -1802,8 +1877,9 @@ async fn d7_metrics() {
     drop_database(&url, &db_name).await;
 }
 
-/// FIX-03: домены организации в Admin API узла — принятые домены `TransportStore` (`PgMeta`). Список — 200 с
-/// доменом `admin init`; создание и удаление нового домена; удаление домена с учётной записью — 409.
+/// ADM-33: домены организации в Admin API узла — один ресурс `transport/domains` (`TransportStore` `PgMeta`). Список — 200
+/// с доменом `admin init`; создание, политика домена и удаление нового домена; удаление домена с учётной записью — отказ;
+/// прежнего ресурса `/orgs/{org}/domains` нет (404).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_domains() {
     let Some(url) = tp_testkit::pg_url() else {
@@ -1814,9 +1890,7 @@ async fn admin_domains() {
     let (db_name, url_db) = create_database(&url).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (db_url, password) = split_password(&url_db);
-    let secrets = Arc::new(MemSecretStore::default());
-    let db: SecretRef = "thepost/db#password".parse().expect("ref");
-    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+    let secrets = node_secrets(password);
 
     let domain = "example.ru".to_owned();
     let socket = dir.path().join("admin.sock");
@@ -1861,11 +1935,11 @@ async fn admin_domains() {
     assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
     let session: Value = serde_json::from_slice(&body).expect("session");
     let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
-    let base = format!("/api/v1/orgs/{}/domains", TenantId::DEFAULT);
+    let base = format!("/api/v1/orgs/{}/transport/domains", TenantId::DEFAULT);
     let list = || domain_list(admin, &base, &bearer);
 
     // Список: принятый домен `admin init`.
-    let domains = list().await;
+    let (version, domains) = list().await;
     let own = domains
         .iter()
         .find(|d| d["name"] == domain)
@@ -1874,43 +1948,69 @@ async fn admin_domains() {
         .expect("id")
         .to_owned();
 
-    // Создание: имя приводится к канонической форме; повтор — 409.
+    // Создание: имя приводится к канонической форме (`normalize_domain`); повтор — 409.
     let (code, body) = http(
         admin,
         "POST",
         &base,
         &bearer,
-        Some(&json!({ "name": "Corp.Example" })),
+        Some(&json!({ "version": version, "name": "Corp.Example" })),
     )
     .await;
     assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
     let created: Value = serde_json::from_slice(&body).expect("created");
-    assert_eq!(created["name"], "corp.example", "{created}");
-    let id = created["id"].as_str().expect("id").to_owned();
-    assert!(list().await.iter().any(|d| d["id"] == id));
+    assert_eq!(created["domain"]["name"], "corp.example", "{created}");
+    assert_eq!(created["domain"]["kind"], "authoritative", "{created}");
+    let id = created["domain"]["id"].as_str().expect("id").to_owned();
+    let (version, domains) = list().await;
+    assert!(domains.iter().any(|d| d["id"] == id));
     let (code, body) = http(
         admin,
         "POST",
         &base,
         &bearer,
-        Some(&json!({ "name": "corp.example" })),
+        Some(&json!({ "version": version, "name": "corp.example" })),
     )
     .await;
     assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
-    let (code, body) = http(admin, "GET", &format!("{base}/{id}"), &bearer, None).await;
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
-    // Удаление домена без учётных записей — 204, повтор — 404.
-    let (code, body) = http(admin, "DELETE", &format!("{base}/{id}"), &bearer, None).await;
-    assert_eq!(code, 204, "{}", String::from_utf8_lossy(&body));
-    assert!(!list().await.iter().any(|d| d["id"] == id));
-    let (code, body) = http(admin, "DELETE", &format!("{base}/{id}"), &bearer, None).await;
+    // Политика домена — на принятом домене: запись и чтение уровня «домен».
+    let policy = format!("{base}/{id}/policy");
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &policy,
+        &bearer,
+        Some(&json!({ "max_recipients": 50 })),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = http(admin, "GET", &policy, &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let read: Value = serde_json::from_slice(&body).expect("policy");
+    assert_eq!(read["policy"]["max_recipients"], 50, "{read}");
+    assert_eq!(read["effective"]["max_recipients"], 50, "{read}");
+
+    // Прежний ресурс доменов организации удалён.
+    let old = format!("/api/v1/orgs/{}/domains", TenantId::DEFAULT);
+    let (code, _) = http(admin, "GET", &old, &bearer, None).await;
+    assert_eq!(code, 404);
+    let (code, _) = http(admin, "GET", &format!("{old}/{id}"), &bearer, None).await;
+    assert_eq!(code, 404);
+
+    // Удаление домена без учётных записей — 200, повтор — 404.
+    let item = |version: u64, id: &str| format!("{base}/{id}?version={version}");
+    let (code, body) = http(admin, "DELETE", &item(version, &id), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let (version, domains) = list().await;
+    assert!(!domains.iter().any(|d| d["id"] == id));
+    let (code, body) = http(admin, "DELETE", &item(version, &id), &bearer, None).await;
     assert_eq!(code, 404, "{}", String::from_utf8_lossy(&body));
 
-    // Домен с учётной записью администратора не удаляется — 409, домен на месте.
-    let (code, body) = http(admin, "DELETE", &format!("{base}/{own}"), &bearer, None).await;
-    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
-    assert!(list().await.iter().any(|d| d["id"] == own));
+    // Домен с учётной записью администратора не удаляется (внешний ключ — 400), домен на месте.
+    let (code, body) = http(admin, "DELETE", &item(version, &own), &bearer, None).await;
+    assert_eq!(code, 400, "{}", String::from_utf8_lossy(&body));
+    assert!(list().await.1.iter().any(|d| d["id"] == own));
 
     shutdown.cancel();
     let report = running.wait().await.expect("wait");
@@ -1918,10 +2018,11 @@ async fn admin_domains() {
     drop_database(&url, &db_name).await;
 }
 
-/// `GET /api/v1/orgs/{org}/domains`: 200 и список доменов.
-async fn domain_list(addr: std::net::SocketAddr, path: &str, bearer: &str) -> Vec<Value> {
+/// `GET /api/v1/orgs/{org}/transport/domains`: 200, версия снимка кластера и принятые домены организации.
+async fn domain_list(addr: std::net::SocketAddr, path: &str, bearer: &str) -> (u64, Vec<Value>) {
     let (code, body) = http(addr, "GET", path, bearer, None).await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     let list: Value = serde_json::from_slice(&body).expect("domains");
-    list.as_array().expect("array").clone()
+    let version = list["version"].as_u64().expect("version");
+    (version, list["domains"].as_array().expect("array").clone())
 }

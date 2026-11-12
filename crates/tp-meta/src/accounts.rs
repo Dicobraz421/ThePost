@@ -1,10 +1,16 @@
 //! Учётные записи на PostgreSQL (CONTRACTS.md#Metadata).
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use sqlx::postgres::PgArguments;
 use sqlx::query::QueryAs;
 use sqlx::{FromRow, PgConnection, Postgres};
-use tp_contracts::meta::{Account, AccountScope, AccountStore, AccountUpsert, QuotaUsage};
+use time::OffsetDateTime;
+use tp_contracts::meta::{
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, DisabledAccount,
+    ExistingContent, QuotaUsage, account_aliases, account_disabled,
+};
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use uuid::Uuid;
 
@@ -15,7 +21,7 @@ use crate::shards::{ReadIntent, ShardId};
 
 /// `AccountStore::list` без верхней границы префикса (пустой префикс или одни `U+10FFFF`): `$1` — организация,
 /// `$2` — префикс, `$3` — курсор (строго больше), `$4` — лимит. Открыт для проверки плана (`EXPLAIN`) в тестах.
-pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind
     FROM accounts
     WHERE tenant_id = $1 AND lower(login) COLLATE "C" >= $2 AND starts_with(lower(login), $2)
       AND lower(login) COLLATE "C" > $3
@@ -23,7 +29,7 @@ pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, di
 
 /// Как [`LIST_SQL`], префикс — диапазоном `>= $2 AND < $5` (`$5` — `prefix_next`), не `starts_with` и не `LIKE`
 /// (`%` и `_` в префиксе — обычные знаки).
-pub const LIST_PREFIX_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+pub const LIST_PREFIX_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind
     FROM accounts
     WHERE tenant_id = $1 AND lower(login) COLLATE "C" >= $2 AND lower(login) COLLATE "C" < $5
       AND lower(login) COLLATE "C" > $3
@@ -48,14 +54,16 @@ fn prefix_next(prefix: &str) -> Option<String> {
 }
 
 #[derive(FromRow)]
-struct AccountRow {
-    account_id: Uuid,
-    tenant_id: Uuid,
-    domain_id: Uuid,
-    login: String,
-    display_name: String,
-    external_id: Option<String>,
-    enabled: bool,
+pub(crate) struct AccountRow {
+    pub(crate) account_id: Uuid,
+    pub(crate) tenant_id: Uuid,
+    pub(crate) domain_id: Uuid,
+    pub(crate) login: String,
+    pub(crate) display_name: String,
+    pub(crate) external_id: Option<String>,
+    pub(crate) enabled: bool,
+    pub(crate) aliases: Vec<String>,
+    pub(crate) kind: String,
 }
 
 /// Строка `upsert`: учётная запись и её шард.
@@ -66,7 +74,7 @@ struct UpsertRow {
     shard_id: i32,
 }
 
-/// Общие параметры `upsert` (`$3`–`$7`).
+/// Общие параметры `upsert` (`$3`–`$9`).
 fn bind_upsert<'q>(
     q: QueryAs<'q, Postgres, UpsertRow, PgArguments>,
     data: &'q AccountUpsert,
@@ -76,11 +84,34 @@ fn bind_upsert<'q>(
         .bind(&data.display_name)
         .bind(&data.external_id)
         .bind(data.enabled)
+        .bind(account_aliases(
+            &data.login,
+            data.aliases.iter().map(String::as_str),
+        ))
+        .bind(kind_str(data.kind))
 }
 
-impl From<AccountRow> for Account {
-    fn from(r: AccountRow) -> Self {
-        Account {
+fn kind_str(kind: AccountKind) -> &'static str {
+    match kind {
+        AccountKind::User => "user",
+        AccountKind::Resource => "resource",
+    }
+}
+
+impl TryFrom<AccountRow> for Account {
+    type Error = Error;
+
+    fn try_from(r: AccountRow) -> Result<Self> {
+        let kind = match r.kind.as_str() {
+            "user" => AccountKind::User,
+            "resource" => AccountKind::Resource,
+            other => {
+                return Err(Error::internal(format!(
+                    "вид учётной записи в БД: {other:?}"
+                )));
+            }
+        };
+        Ok(Account {
             id: AccountId::from_uuid(r.account_id),
             tenant: TenantId::from_uuid(r.tenant_id),
             domain: DomainId::from_uuid(r.domain_id),
@@ -88,20 +119,22 @@ impl From<AccountRow> for Account {
             display_name: r.display_name,
             external_id: r.external_id,
             enabled: r.enabled,
-        }
+            aliases: r.aliases,
+            kind,
+        })
     }
 }
 
-/// Сопоставление при синхронизации: по `external_id`, иначе по имени входа.
-/// Запись с тем же именем, но другим `external_id` — `Error::Conflict`.
+/// Сопоставление при синхронизации: по `external_id`, иначе по имени входа; найденная запись — с прежним
+/// `enabled` (строка заблокирована до фиксации). Запись с тем же именем, но другим `external_id` — `Error::Conflict`.
 async fn find_for_upsert(
     tx: &mut PgConnection,
     tenant: TenantId,
     data: &AccountUpsert,
-) -> Result<Option<Uuid>> {
+) -> Result<Option<(Uuid, bool)>> {
     if let Some(ext) = &data.external_id {
-        let id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT account_id FROM accounts WHERE tenant_id = $1 AND external_id = $2 FOR UPDATE",
+        let id: Option<(Uuid, bool)> = sqlx::query_as(
+            "SELECT account_id, enabled FROM accounts WHERE tenant_id = $1 AND external_id = $2 FOR UPDATE",
         )
         .bind(tenant.as_uuid())
         .bind(ext)
@@ -112,8 +145,8 @@ async fn find_for_upsert(
             return Ok(id);
         }
     }
-    let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
-        "SELECT account_id, external_id FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2) FOR UPDATE",
+    let row: Option<(Uuid, bool, Option<String>)> = sqlx::query_as(
+        "SELECT account_id, enabled, external_id FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2) FOR UPDATE",
     )
     .bind(tenant.as_uuid())
     .bind(&data.login)
@@ -121,15 +154,17 @@ async fn find_for_upsert(
     .await
     .map_err(db_err)?;
     match row {
-        Some((_, Some(other))) if data.external_id.as_ref().is_some_and(|ext| *ext != other) => {
+        Some((_, _, Some(other))) if data.external_id.as_ref().is_some_and(|ext| *ext != other) => {
             Err(Error::Conflict)
         }
-        Some((id, _)) => Ok(Some(id)),
+        Some((id, enabled, _)) => Ok(Some((id, enabled))),
         None => Ok(None),
     }
 }
 
 impl PgMeta {
+    /// Сигнал `AccountDisabled` (CTR-64) — после фиксации перехода `enabled` разрешённой записи в `false`;
+    /// новая запись и повторное сохранение запрещённой — без сигнала.
     async fn upsert_once(&self, tenant: TenantId, data: &AccountUpsert) -> Result<Account> {
         self.rewrite(|| async move {
         if data.login.is_empty() {
@@ -141,14 +176,16 @@ impl PgMeta {
             None => ShardId::MAIN,
         };
         let mut tx = begin(&self.pool, tenant).await?;
+        let found = find_for_upsert(&mut tx, tenant, data).await?;
+        let disabled = found.is_some_and(|(_, was)| was) && !data.enabled;
         // Шард прежней учётной записи не меняется (перенос — модуль «Шардирование»).
-        let account: UpsertRow = match find_for_upsert(&mut tx, tenant, data).await? {
-            Some(id) => bind_upsert(
+        let account: UpsertRow = match found {
+            Some((id, _)) => bind_upsert(
                 sqlx::query_as(
                     "UPDATE accounts SET domain_id = $3, login = $4, display_name = $5, external_id = $6,
-                                         enabled = $7, updated_at = now()
+                                         enabled = $7, aliases = $8, kind = $9, updated_at = now()
                      WHERE tenant_id = $1 AND account_id = $2
-                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled,
+                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind,
                                shard_id",
                 )
                 .bind(tenant.as_uuid())
@@ -158,9 +195,9 @@ impl PgMeta {
             None => bind_upsert(
                 sqlx::query_as(
                     "INSERT INTO accounts (tenant_id, account_id, domain_id, login, display_name, external_id,
-                                           enabled, shard_id)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled,
+                                           enabled, aliases, kind, shard_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind,
                                shard_id",
                 )
                 .bind(tenant.as_uuid())
@@ -173,7 +210,7 @@ impl PgMeta {
         .await
         .map_err(db_err)?;
         let shard = ShardId(account.shard_id);
-        let account = Account::from(account.account);
+        let account = Account::try_from(account.account)?;
 
         // Новая учётная запись — системные папки; прежняя без части папок — дополняется при входе.
         let scope = AccountScope {
@@ -184,11 +221,18 @@ impl PgMeta {
             let created =
                 mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
             crate::commits::commit(tx).await?;
+            if disabled {
+                self.signal(account_disabled(scope)).await;
+            }
             created
         } else {
             // Ящик на другом шарде: каталог фиксируется первым, состояние ящика и папки — на шарде
-            // (повтор upsert дополняет недостающее).
+            // (повтор upsert дополняет недостающее). Сигнал — сразу после фиксации каталога: повтор после
+            // отказа шарда видит запрещённую запись и сигнал не повторит.
             crate::commits::commit(tx).await?;
+            if disabled {
+                self.signal(account_disabled(scope)).await;
+            }
             let pool = self.shard_pool(shard, ReadIntent::Primary).await?;
             let mut tx = begin(&pool, tenant).await?;
             mailboxes::ensure_state(&mut tx, scope).await?;
@@ -211,7 +255,7 @@ impl AccountStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
-                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind
              FROM accounts WHERE tenant_id = $1 AND account_id = $2",
             )
             .bind(tenant.as_uuid())
@@ -220,16 +264,49 @@ impl AccountStore for PgMeta {
             .await
             .map_err(db_err)?;
             crate::commits::commit(tx).await?;
-            Ok(row.map(Account::from))
+            row.map(Account::try_from).transpose()
         })
         .await
+    }
+
+    /// Одним запросом (`account_id = ANY($2)`, по первичному ключу); порядок запроса и пропуск повторов — после
+    /// чтения. Чужая организация не видна (условие `tenant_id` и RLS).
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<Uuid> = ids.iter().map(|id| *id.as_uuid()).collect();
+        let keys = &keys;
+        let rows: Vec<AccountRow> = self
+            .idempotent(|| async move {
+                let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
+                let rows: Vec<AccountRow> = sqlx::query_as(
+                    "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind
+                 FROM accounts WHERE tenant_id = $1 AND account_id = ANY($2)",
+                )
+                .bind(tenant.as_uuid())
+                .bind(keys)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                crate::commits::commit(tx).await?;
+                Ok(rows)
+            })
+            .await?;
+        let mut found: HashMap<Uuid, AccountRow> =
+            rows.into_iter().map(|r| (r.account_id, r)).collect();
+        // `remove` — повтор идентификатора уже не найдёт запись (первое вхождение).
+        keys.iter()
+            .filter_map(|k| found.remove(k))
+            .map(Account::try_from)
+            .collect()
     }
 
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
-                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind
              FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2)",
             )
             .bind(tenant.as_uuid())
@@ -238,7 +315,7 @@ impl AccountStore for PgMeta {
             .await
             .map_err(db_err)?;
             crate::commits::commit(tx).await?;
-            Ok(row.map(Account::from))
+            row.map(Account::try_from).transpose()
         })
         .await
     }
@@ -247,7 +324,7 @@ impl AccountStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
-                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind
              FROM accounts WHERE tenant_id = $1 AND external_id = $2",
             )
             .bind(tenant.as_uuid())
@@ -256,7 +333,7 @@ impl AccountStore for PgMeta {
             .await
             .map_err(db_err)?;
             crate::commits::commit(tx).await?;
-            Ok(row.map(Account::from))
+            row.map(Account::try_from).transpose()
         })
         .await
     }
@@ -291,7 +368,7 @@ impl AccountStore for PgMeta {
             }
             let rows: Vec<AccountRow> = q.fetch_all(&mut *tx).await.map_err(db_err)?;
             crate::commits::commit(tx).await?;
-            Ok(rows.into_iter().map(Account::from).collect())
+            rows.into_iter().map(Account::try_from).collect()
         })
         .await
     }
@@ -344,6 +421,57 @@ impl AccountStore for PgMeta {
             })
         })
         .await
+    }
+
+    /// Состояние и срок хранения — [`crate::account_state`].
+    async fn account_state(&self, tenant: TenantId, id: AccountId) -> Result<AccountState> {
+        self.account_state_of(tenant, id).await
+    }
+
+    /// После фиксации — сигнал `AccountDisabled` (CTR-64): вход в отключённый ящик запрещён.
+    async fn disable_account(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        until: OffsetDateTime,
+    ) -> Result<()> {
+        self.set_disabled(tenant, id, Some(until)).await?;
+        self.signal(account_disabled(AccountScope {
+            tenant,
+            account: id,
+        }))
+        .await;
+        Ok(())
+    }
+
+    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        self.set_disabled(tenant, id, None).await
+    }
+
+    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
+        self.disabled_of(tenant).await
+    }
+
+    async fn expired_accounts(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<AccountScope>> {
+        self.expired(now, limit).await
+    }
+
+    async fn attach_account(
+        &self,
+        tenant: TenantId,
+        disabled: AccountId,
+        to: AccountId,
+        existing: Option<ExistingContent>,
+    ) -> Result<Account> {
+        self.attach(tenant, disabled, to, existing).await
+    }
+
+    async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        self.remove_disabled_box(tenant, id).await
     }
 }
 

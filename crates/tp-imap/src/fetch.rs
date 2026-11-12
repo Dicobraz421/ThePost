@@ -19,6 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures::StreamExt;
 use mail_parser::{MessageParser, MimeHeaders, PartType};
+use tp_contracts::audit::AuditAction;
 use tp_contracts::auth::Rights;
 use tp_contracts::blob::ByteStream;
 use tp_contracts::meta::{Address, BodyPart, Envelope, Flag, FlagOp, Message, MessageQuery};
@@ -106,6 +107,19 @@ fn sets_seen(item: &MessageDataItemName<'_>) -> bool {
 // ---------- Строки ----------
 
 /// Строка IMAP из байтов: литерал (NUL заменяется пробелом — в `BODY` он недопустим).
+/// Элемент выдаёт содержимое письма (аудит чтения): тело, разделы, заголовки.
+fn reads_content(item: &MessageDataItemName<'_>) -> bool {
+    matches!(
+        item,
+        MessageDataItemName::Rfc822
+            | MessageDataItemName::Rfc822Header
+            | MessageDataItemName::Rfc822Text
+            | MessageDataItemName::BodyExt { .. }
+            | MessageDataItemName::Binary { .. }
+            | MessageDataItemName::BinarySize { .. }
+    )
+}
+
 fn nstring_bytes(mut data: Vec<u8>) -> NString<'static> {
     if data.is_empty() {
         return NString::try_from("").unwrap_or(NString(None));
@@ -792,6 +806,7 @@ impl<T: Transport> Session<T> {
         let mark_seen = !selected.read_only
             && items.iter().any(sets_seen)
             && self.selected_rights().await?.contains(Rights::SEEN);
+        let reads = items.iter().any(reads_content);
         let batch = self.ctx.config.limits.fetch_batch.max(1);
         for chunk in indexes.chunks(batch) {
             let ids: Vec<MessageId> = chunk.iter().map(|&i| selected.messages[i].1).collect();
@@ -811,6 +826,11 @@ impl<T: Transport> Session<T> {
                 .filter(|m| changed_since.is_none_or(|n| m.modseq.0 > n))
                 .map(|m| (m.id, m))
                 .collect();
+            if reads {
+                let read: Vec<MessageId> = by_id.keys().copied().collect();
+                self.audit(scope, AuditAction::Read, selected.mailbox, &read, None)
+                    .await?;
+            }
             if mark_seen {
                 let unseen: Vec<MessageId> = by_id
                     .values()

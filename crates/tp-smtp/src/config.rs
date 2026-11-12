@@ -11,7 +11,6 @@
 //!       implicit_tls: true
 //!   limits:
 //!     max_message_size: 52428800
-//!     max_recipients: 100
 //!   timeouts:
 //!     command: 5m
 //!     data: 10m
@@ -19,8 +18,14 @@
 //!     filters:
 //!       - name: rspamd
 //!         address: "127.0.0.1:11332"
-//!         submission: true
+//!         direction: inbound
 //!         on_failure: accept
+//!       - name: dlp
+//!         address: "dlp.example.org:8890"
+//!         direction: outbound
+//!         on_failure: tempfail
+//!     profiles:
+//!       antispam: [rspamd]
 //!   queue:
 //!     retry: [5m, 15m, 30m, 1h, 2h, 4h, 8h]
 //!     expire: 5d
@@ -30,7 +35,6 @@
 //!   dkim:
 //!     domains:
 //!       example.org:
-//!         selector: s2026
 //!         keys:
 //!           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim/example.org#s2026" } }
 //!           e2026: { algorithm: ed25519-sha256, key: { secret: "thepost/dkim/example.org#e2026" } }
@@ -58,6 +62,10 @@
 //!
 //! Слушатели (`inbound`, `submission`) применяются при запуске роли; лимиты и таймауты — к новым сессиям
 //! без перезапуска.
+//!
+//! Лимиты отправки и получателей письма, селектор DKIM и профиль Milter — политика организации
+//! (`tp_contracts::meta::Policy`, цепочка «организация → домен → учётная запись»; SMTP-40, решение 97), здесь их
+//! нет: секция задаёт ключи DKIM и адреса фильтров.
 
 use std::time::Duration;
 
@@ -349,8 +357,6 @@ pub enum ScreenMode {
 pub struct Limits {
     /// Наибольший размер письма, байт (объявляется в `SIZE`).
     pub max_message_size: usize,
-    /// Получателей в одной транзакции.
-    pub max_recipients: usize,
     /// Ошибочных команд за сессию; затем соединение закрывается (`421`).
     pub max_errors: u32,
     /// Одновременных соединений на слушатель; сверх лимита — `421` и закрытие.
@@ -358,11 +364,7 @@ pub struct Limits {
     /// Неудачных `AUTH` подряд; затем соединение закрывается (`421`). Блокировки адреса и учётной записи —
     /// защита от перебора `auth.abuse`.
     pub max_auth_failures: u32,
-    /// Писем в час на учётную запись (submission, скользящее окно); `0` — без лимита.
-    pub messages_per_hour: u32,
-    /// Получателей в час на учётную запись (сумма по письмам); `0` — без лимита.
-    pub recipients_per_hour: u32,
-    /// Предел учётных записей со счётчиками лимитов отправки на узле.
+    /// Предел учётных записей со счётчиками лимита отправки на узле (лимит — `Policy::send_per_hour`).
     pub max_tracked_accounts: usize,
 }
 
@@ -370,12 +372,9 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_message_size: 50 * 1024 * 1024,
-            max_recipients: 100,
             max_errors: 10,
             max_connections: 1000,
             max_auth_failures: 3,
-            messages_per_hour: 1000,
-            recipients_per_hour: 5000,
             max_tracked_accounts: 100_000,
         }
     }
@@ -408,9 +407,8 @@ impl Default for Timeouts {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeliveryConfig {
-    /// Локальные домены сверх доменов каталога (установка без LDAP, переходный период).
-    pub local_domains: Vec<String>,
-    /// Время жизни снимка каталога (домены, псевдонимы, группы) для разрешения получателей.
+    /// Время жизни снимка каталога (адреса, псевдонимы, группы) для разрешения получателей. Локальные домены —
+    /// принятые домены организации в БД (Admin API, `thepost admin domain add`).
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub directory_refresh: Duration,
@@ -431,7 +429,6 @@ pub struct DeliveryConfig {
 impl Default for DeliveryConfig {
     fn default() -> Self {
         Self {
-            local_domains: Vec::new(),
             directory_refresh: Duration::from_secs(5 * 60),
             quota_reject: QuotaReject::default(),
             vacation_rate: 60,
@@ -468,12 +465,18 @@ impl Default for AuthCheckConfig {
     }
 }
 
-/// Фильтры Milter (SRS 4.1): цепочка в порядке перечисления.
+/// Фильтры Milter (SRS 4.1). Два направления: приём (smtp-in) и исходящая почта (submission, JMAP
+/// EmailSubmission); письмо проходит фильтры своего направления в порядке перечисления. Фильтр принадлежит
+/// одному направлению; фильтр для обоих описывается дважды — со своей политикой при недоступности в каждом.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct MilterConfig {
     /// Фильтры; пусто — письма не фильтруются.
     pub filters: Vec<MilterFilter>,
+    /// Профили: имя → фильтры (`name`), вызываются в порядке `filters` (каждый — для своего направления).
+    /// Профиль выбирает политика организации (`Policy::milter_profile`); не задан — все фильтры. Имя неизвестного фильтра в профиле пропускается
+    /// (предупреждение в журнал).
+    pub profiles: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Фильтр Milter.
@@ -484,10 +487,8 @@ pub struct MilterFilter {
     pub name: String,
     /// Адрес `хост:порт` (TCP).
     pub address: String,
-    /// Проверять входящую почту (smtp-in).
-    pub inbound: bool,
-    /// Проверять почту пользователей (submission).
-    pub submission: bool,
+    /// Направление почты, которую проверяет фильтр.
+    pub direction: MilterDirection,
     /// Ожидание соединения с фильтром.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -500,8 +501,30 @@ pub struct MilterFilter {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub end_timeout: Duration,
-    /// Что делать, если фильтр недоступен.
-    pub on_failure: MilterOnFailure,
+    /// Что делать, если фильтр недоступен. Не задано — по направлению: приём — `accept` (почта не останавливается
+    /// из-за антиспама), исходящая — `tempfail` (письмо не уходит мимо проверки, например DLP).
+    pub on_failure: Option<MilterOnFailure>,
+}
+
+impl MilterFilter {
+    /// Политика при недоступности фильтра: заданная или по направлению.
+    pub fn failure_policy(&self) -> MilterOnFailure {
+        self.on_failure.unwrap_or(match self.direction {
+            MilterDirection::Inbound => MilterOnFailure::Accept,
+            MilterDirection::Outbound => MilterOnFailure::Tempfail,
+        })
+    }
+}
+
+/// Направление фильтра Milter (SRS 4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MilterDirection {
+    /// Приём почты (smtp-in): антиспам, антивирус.
+    #[default]
+    Inbound,
+    /// Исходящая почта пользователей: submission и JMAP EmailSubmission (в частности, внешние системы DLP).
+    Outbound,
 }
 
 impl Default for MilterFilter {
@@ -509,22 +532,20 @@ impl Default for MilterFilter {
         Self {
             name: "milter".into(),
             address: "127.0.0.1:11332".into(),
-            inbound: true,
-            submission: false,
+            direction: MilterDirection::default(),
             connect_timeout: Duration::from_secs(5),
             command_timeout: Duration::from_secs(10),
             end_timeout: Duration::from_secs(60),
-            on_failure: MilterOnFailure::default(),
+            on_failure: None,
         }
     }
 }
 
 /// Политика при недоступности фильтра.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MilterOnFailure {
     /// Принять с пометкой: заголовок `X-ThePost-Milter: <имя>; unavailable`.
-    #[default]
     Accept,
     /// Временный отказ (`451 4.7.1`), отправитель повторит.
     Tempfail,
@@ -761,9 +782,8 @@ impl Default for DkimConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DkimDomain {
-    /// Активный селектор: им подписываются письма (ротация — переключение на новый).
-    pub selector: String,
-    /// Ключи по селекторам (старые остаются для истории ротации).
+    /// Ключи по селекторам. Селектор подписи — политика организации (`Policy::dkim_selector`); не задан —
+    /// письмо подписывается всеми ключами домена (ключ после ротации удаляется из списка).
     pub keys: std::collections::BTreeMap<String, DkimKeyConfig>,
 }
 
@@ -800,6 +820,38 @@ mod tests {
         let mut r = SectionRegistry::new();
         r.add_section::<SmtpConfig>("smtp").expect("smtp");
         r
+    }
+
+    #[test]
+    fn milter_directions() {
+        let parse = |filter: &str| {
+            registry().parse(
+                &format!("{BASE}smtp:\n  milter:\n    filters:\n      - {filter}\n"),
+                Vec::new(),
+            )
+        };
+        let cfg =
+            parse("{ name: dlp, address: \"dlp:8890\", direction: outbound }").expect("parse");
+        let smtp = cfg.section::<SmtpConfig>("smtp").expect("smtp");
+        let f = &smtp.milter.filters[0];
+        assert_eq!(f.direction, MilterDirection::Outbound);
+        // Политика при недоступности не задана — по направлению.
+        assert_eq!(f.failure_policy(), MilterOnFailure::Tempfail);
+        assert_eq!(
+            MilterFilter::default().failure_policy(),
+            MilterOnFailure::Accept
+        );
+        let cfg = parse("{ name: dlp, direction: outbound, on_failure: accept }").expect("parse");
+        let smtp = cfg.section::<SmtpConfig>("smtp").expect("smtp");
+        assert_eq!(
+            smtp.milter.filters[0].failure_policy(),
+            MilterOnFailure::Accept
+        );
+        // Прежние признаки фильтра `inbound`/`submission` — неизвестные поля (строгий разбор — ошибка).
+        let old = format!(
+            "{BASE}smtp:\n  milter:\n    filters:\n      - {{ name: rspamd, submission: true }}\n"
+        );
+        assert!(registry().parse_strict(&old, Vec::new()).is_err());
     }
 
     #[test]

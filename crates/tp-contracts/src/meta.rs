@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::bus::{Event, EventKind};
 use crate::error::{Error, Result};
 use crate::ids::{
     AccountId, BlobKey, DomainId, MailboxId, MessageId, ModSeq, TenantId, Uid, UidValidity,
@@ -41,6 +42,17 @@ pub struct AccountScope {
 }
 
 // ---------- Учётные записи ----------
+
+/// Вид учётной записи (CTR-48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKind {
+    /// Пользователь (или общий ящик).
+    User,
+    /// Ресурс: переговорная, оборудование (iCalendar `CUTYPE=ROOM`, `RESOURCE`). Приглашения обрабатываются по
+    /// правилам бронирования ([`crate::sharing::BookingPolicy`], [`crate::sharing::ResourceStore`]).
+    Resource,
+}
 
 /// Учётная запись.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +71,20 @@ pub struct Account {
     pub external_id: Option<String>,
     /// Вход разрешён.
     pub enabled: bool,
+    /// Псевдонимы (CTR-53): адреса каталога (`crate::auth::DirAlias`), доставляемые этой учётной записи, кроме
+    /// основного, — в нижнем регистре, без повторов и catch-all `@domain`, в порядке каталога. Задаёт
+    /// [`AccountUpsert::aliases`]; все адреса учётной записи — [`Account::addresses`].
+    pub aliases: Vec<String>,
+    /// Вид (CTR-48): пользователь или ресурс. Задаёт [`AccountUpsert::kind`].
+    pub kind: AccountKind,
+}
+
+impl Account {
+    /// Адреса, на которые учётной записи доставляется почта (CTR-53; `calendar-user-address-set` CalDAV, участник
+    /// приглашения): основной (имя входа) первым, затем [`Account::aliases`] — правило [`account_addresses`].
+    pub fn addresses(&self) -> Vec<String> {
+        account_addresses(&self.login, self.aliases.iter().map(String::as_str))
+    }
 }
 
 /// Данные для создания или обновления учётной записи (синхронизация с каталогом).
@@ -75,6 +101,12 @@ pub struct AccountUpsert {
     pub external_id: Option<String>,
     /// Вход разрешён.
     pub enabled: bool,
+    /// Псевдонимы каталога с целью — этой учётной записью (CTR-53), в любом регистре; заменяют прежние. Хранилище
+    /// приводит их правилом [`account_addresses`] (нижний регистр, без повторов, основного адреса и catch-all) —
+    /// [`Account::aliases`].
+    pub aliases: Vec<String>,
+    /// Вид учётной записи (CTR-48); при обновлении заменяет прежний.
+    pub kind: AccountKind,
 }
 
 /// Состояние ящика учётной записи (CTR-35, решение 2026-11-04-exchange-parity «Удалённые ящики»).
@@ -129,11 +161,72 @@ pub struct QuotaUsage {
     pub limit_bytes: Option<u64>,
 }
 
+/// Адреса учётной записи для [`Account::addresses`] (CTR-53): основной `primary` первым, затем `aliases` в
+/// порядке перечисления; нижний регистр, без повторов. Пропускаются catch-all (`@domain`, пустая локальная часть —
+/// `crate::auth::DirAlias`), пустые строки и строки без `@`.
+pub fn account_addresses<'a>(
+    primary: &'a str,
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for address in std::iter::once(primary).chain(aliases) {
+        let address = address.trim().to_lowercase();
+        let personal = address
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+        if personal && !out.contains(&address) {
+            out.push(address);
+        }
+    }
+    out
+}
+
+/// Псевдонимы учётной записи для хранения ([`Account::aliases`]): `aliases` по правилу [`account_addresses`] без
+/// основного адреса `primary`.
+pub fn account_aliases<'a>(
+    primary: &'a str,
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let primary = primary.trim().to_lowercase();
+    let mut out = account_addresses("", aliases);
+    out.retain(|a| *a != primary);
+    out
+}
+
+/// Сигнал «вход учётной записи запрещён» (системный, `account = None`, [`EventKind::AccountDisabled`]; CTR-64).
+/// Публикует реализация [`AccountStore`] после фиксации `enabled = false` (`upsert` разрешённой ранее записи) и
+/// [`AccountStore::disable_account`]; протоколы с долгими сеансами (IMAP, JMAP) закрывают сеансы учётной записи.
+pub fn account_disabled(scope: AccountScope) -> Event {
+    Event {
+        tenant: scope.tenant,
+        account: None,
+        kind: EventKind::AccountDisabled {
+            account: scope.account,
+        },
+    }
+}
+
 /// Учётные записи организации.
 #[async_trait]
 pub trait AccountStore: Send + Sync + 'static {
     /// Учётная запись по идентификатору.
     async fn get(&self, tenant: TenantId, id: AccountId) -> Result<Option<Account>>;
+
+    /// Учётные записи по списку идентификаторов (CTR-63; имена участников группы, Admin API): в порядке `ids`,
+    /// не найденные (и чужой организации) пропускаются, повтор идентификатора — одна запись (первое вхождение).
+    /// По умолчанию — [`AccountStore::get`] по одному; реализация одним запросом — `tp-meta` (META-66).
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if seen.insert(id)
+                && let Some(a) = self.get(tenant, id).await?
+            {
+                out.push(a);
+            }
+        }
+        Ok(out)
+    }
 
     /// Учётная запись по имени входа (без учёта регистра).
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>>;
@@ -196,21 +289,11 @@ pub trait AccountStore: Send + Sync + 'static {
     }
 
     /// Восстанавливает отключённый ящик ([`AccountState::Active`]; действующий — без изменений). Нет учётной записи —
-    /// `Error::NotFound`. По умолчанию — `Error::Internal`.
-    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
-        let _ = (tenant, id);
-        Err(Error::internal(
-            "AccountStore::restore_account не реализован",
-        ))
-    }
+    /// `Error::NotFound`.
+    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()>;
 
-    /// Отключённые ящики организации по (`until`, `id`) — список Admin API. По умолчанию — `Error::Internal`.
-    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
-        let _ = tenant;
-        Err(Error::internal(
-            "AccountStore::disabled_accounts не реализован",
-        ))
-    }
+    /// Отключённые ящики организации по (`until`, `id`) — список Admin API.
+    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>>;
 
     /// Отключённые ящики всех организаций со сроком хранения не позже `now`, по (`until`, `id`), не более `limit` —
     /// окончательное удаление (роль maintenance). По умолчанию — `Error::Internal`.
@@ -232,19 +315,14 @@ pub trait AccountStore: Send + Sync + 'static {
     /// операции (ссылки на объекты BLOB организации не меняются), долгую операцию над большим ящиком Admin API ведёт
     /// фоновой задачей (ADM-10). Без режима (`None`) ящик `to` должен быть пуст, иначе — `Error::Invalid` с подсказкой
     /// выбрать режим. `disabled` действует — `Error::Invalid`; `to` отключена — `Error::Conflict`; нет любой из
-    /// записей — `Error::NotFound`. По умолчанию — `Error::Internal`.
+    /// записей — `Error::NotFound`.
     async fn attach_account(
         &self,
         tenant: TenantId,
         disabled: AccountId,
         to: AccountId,
         existing: Option<ExistingContent>,
-    ) -> Result<Account> {
-        let _ = (tenant, disabled, to, existing);
-        Err(Error::internal(
-            "AccountStore::attach_account не реализован",
-        ))
-    }
+    ) -> Result<Account>;
 
     /// Окончательно удаляет отключённый ящик (учётную запись и папки) после удаления писем вызывающим (`MailStore`,
     /// освобождение ссылок BLOB). Действующий — `Error::Invalid`; остались письма — `Error::Conflict`; нет —
@@ -692,23 +770,36 @@ pub trait ChangeLog: Send + Sync + 'static {
 
 // ---------- Политики ----------
 
-/// Политики, действующие для объекта (SRS 3.8). `None` — не задано ни на одном уровне цепочки:
-/// действует значение по умолчанию из конфигурации крейта-потребителя.
+/// Политики, действующие для объекта (SRS 3.8). `None` — не задано ни на одном уровне цепочки: действует
+/// умолчание, указанное у поля. У полей SMTP умолчание уровня организации — константы `DEFAULT_*` и методы
+/// `*_or_default`, настроек этих полей в config.yaml нет (решение 97). У каждого поля указан потребитель.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Policy {
-    /// Квота ящика, байт.
+    /// Квота ящика, байт. Потребитель — `tp-meta` (`QuotaUsage::limit_bytes`); не задано — значение секции
+    /// `meta.retention` (без него — без ограничения).
     pub quota_bytes: Option<u64>,
-    /// Срок хранения в корзине.
+    /// Срок хранения в корзине. Потребитель — `tp-meta` (срок письма в корзине); не задано — значение секции
+    /// `meta.retention`.
     pub trash_retention: Option<Duration>,
-    /// Срок хранения писем (политика хранения; разрешается до папки).
+    /// Срок хранения писем (политика хранения; разрешается до папки). Исполнитель — модуль «Соответствие
+    /// требованиям» (удаление по сроку через `DecisionHook::before_final_delete`, CONTRACTS.md#Trash); ядро поле
+    /// не применяет. Не задано — письма хранятся без срока.
     pub retention: Option<Duration>,
-    /// Лимит отправки, писем в час.
+    /// Лимит отправки (submission), писем в час на учётную запись. Потребитель — SMTP (SMTP-40); не задано —
+    /// [`Policy::DEFAULT_SEND_PER_HOUR`].
     pub send_per_hour: Option<u32>,
-    /// Лимит получателей одного письма.
+    /// Лимит отправки, адресатов в час на учётную запись (скользящий час, сумма получателей всех писем; как
+    /// RecipientRateLimit в Exchange — решение 113). Потребитель — SMTP (SMTP-43); не задано —
+    /// [`Policy::DEFAULT_RCPTS_PER_HOUR`].
+    pub rcpts_per_hour: Option<u32>,
+    /// Лимит получателей одного письма (`RCPT TO` сеанса submission). Потребитель — SMTP (SMTP-40); не задано —
+    /// [`Policy::DEFAULT_MAX_RECIPIENTS`].
     pub max_recipients: Option<u32>,
-    /// Селектор ключа DKIM домена.
+    /// Селектор ключа DKIM домена отправителя (ключи — ссылки на секреты в `smtp.dkim`). Потребитель — SMTP
+    /// (SMTP-40); не задано — письмо подписывается всеми ключами домена.
     pub dkim_selector: Option<String>,
-    /// Профиль Milter.
+    /// Профиль Milter — набор фильтров из `smtp.milter` (адреса фильтров — в config.yaml). Потребитель — SMTP
+    /// (SMTP-40); не задано — все фильтры конфигурации, как без профилей.
     pub milter_profile: Option<String>,
     /// Правило администратора `trash.purge` (решение 2026-11-01-trash-purge); вычисление с выбором пользователя —
     /// [`PolicyResolver::trash_purge`].
@@ -716,6 +807,28 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Умолчание уровня организации для [`Policy::send_per_hour`], писем в час.
+    pub const DEFAULT_SEND_PER_HOUR: u32 = 1000;
+    /// Умолчание уровня организации для [`Policy::rcpts_per_hour`], адресатов в час (решение 113).
+    pub const DEFAULT_RCPTS_PER_HOUR: u32 = 2000;
+    /// Умолчание уровня организации для [`Policy::max_recipients`].
+    pub const DEFAULT_MAX_RECIPIENTS: u32 = 100;
+
+    /// Действующий лимит отправки, писем в час: заданный в цепочке или [`Policy::DEFAULT_SEND_PER_HOUR`].
+    pub fn send_per_hour_or_default(&self) -> u32 {
+        self.send_per_hour.unwrap_or(Self::DEFAULT_SEND_PER_HOUR)
+    }
+
+    /// Действующий лимит отправки, адресатов в час: заданный в цепочке или [`Policy::DEFAULT_RCPTS_PER_HOUR`].
+    pub fn rcpts_per_hour_or_default(&self) -> u32 {
+        self.rcpts_per_hour.unwrap_or(Self::DEFAULT_RCPTS_PER_HOUR)
+    }
+
+    /// Действующий лимит получателей письма: заданный в цепочке или [`Policy::DEFAULT_MAX_RECIPIENTS`].
+    pub fn max_recipients_or_default(&self) -> u32 {
+        self.max_recipients.unwrap_or(Self::DEFAULT_MAX_RECIPIENTS)
+    }
+
     /// Накладывает более специфичный уровень: заданные в `over` поля заменяют поля `self`.
     pub fn overlay(self, over: Policy) -> Policy {
         Policy {
@@ -723,12 +836,44 @@ impl Policy {
             trash_retention: over.trash_retention.or(self.trash_retention),
             retention: over.retention.or(self.retention),
             send_per_hour: over.send_per_hour.or(self.send_per_hour),
+            rcpts_per_hour: over.rcpts_per_hour.or(self.rcpts_per_hour),
             max_recipients: over.max_recipients.or(self.max_recipients),
             dkim_selector: over.dkim_selector.or(self.dkim_selector),
             milter_profile: over.milter_profile.or(self.milter_profile),
             trash_purge: over.trash_purge.or(self.trash_purge),
         }
     }
+}
+
+/// Уровень цепочки политик «организация → домен → ящик → папка» (CTR-25) — один тип на всю систему: хранилище
+/// политик ([`PolicyStore`]), Admin API, in-memory `tp-testkit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicyTarget {
+    /// Организация.
+    Tenant,
+    /// Домен.
+    Domain(DomainId),
+    /// Учётная запись (ящик).
+    Account(AccountId),
+    /// Папка.
+    Mailbox(MailboxId),
+}
+
+/// Политики уровней цепочки (CTR-25): чтение и запись одного уровня без наложения — для Admin API. Наложение
+/// цепочки — [`PolicyResolver`], запись видна ему сразу. Существование объекта уровня (домена, учётной записи,
+/// папки) не проверяется: это делает вызывающий.
+#[async_trait]
+pub trait PolicyStore: Send + Sync + 'static {
+    /// Политика одного уровня без наложения; не задана — `Policy::default()` (все поля `None`).
+    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy>;
+
+    /// Задаёт политику уровня целиком; `Policy::default()` удаляет уровень.
+    async fn set_policy(
+        &self,
+        tenant: TenantId,
+        target: PolicyTarget,
+        policy: &Policy,
+    ) -> Result<()>;
 }
 
 /// Разрешение политик по цепочке «организация → домен → ящик (→ папка)»: каждый следующий уровень
@@ -773,6 +918,39 @@ mod tests {
         fn _s(_: Arc<dyn MessageStore>) {}
         fn _c(_: Arc<dyn ChangeLog>) {}
         fn _p(_: Arc<dyn PolicyResolver>) {}
+        fn _ps(_: Arc<dyn PolicyStore>) {}
+    }
+
+    #[test]
+    fn addresses_rule() {
+        // Основной первым, псевдонимы — в нижнем регистре, без повторов и без catch-all.
+        assert_eq!(
+            account_addresses(
+                "Ann@Example.com",
+                [
+                    "sales@example.com",
+                    "@example.com",
+                    "ANN@example.com",
+                    "Info@Example.COM",
+                    "sales@example.com",
+                    "",
+                    "no-at",
+                ],
+            ),
+            ["ann@example.com", "sales@example.com", "info@example.com"]
+        );
+        assert_eq!(
+            account_aliases(
+                "Ann@Example.com",
+                ["ANN@example.com", "@example.com", "S@Example.com"]
+            ),
+            ["s@example.com"]
+        );
+        // Имя входа — не адрес: остаются только псевдонимы.
+        assert_eq!(
+            account_addresses("ann", ["a@example.com"]),
+            ["a@example.com"]
+        );
     }
 
     #[test]
@@ -836,6 +1014,7 @@ mod tests {
         };
         let domain = Policy {
             quota_bytes: Some(20),
+            rcpts_per_hour: Some(300),
             dkim_selector: Some("s1".into()),
             ..Policy::default()
         };
@@ -849,6 +1028,18 @@ mod tests {
         assert_eq!(p.dkim_selector.as_deref(), Some("s1"));
         assert_eq!(p.milter_profile, None);
         assert_eq!(p.trash_purge, None);
+        // Умолчания уровня организации полей SMTP (CTR-67).
+        assert_eq!(p.send_per_hour_or_default(), 5);
+        assert_eq!(p.rcpts_per_hour_or_default(), 300);
+        assert_eq!(
+            p.max_recipients_or_default(),
+            Policy::DEFAULT_MAX_RECIPIENTS
+        );
+        assert_eq!(
+            Policy::default().send_per_hour_or_default(),
+            Policy::DEFAULT_SEND_PER_HOUR
+        );
+        assert_eq!(Policy::default().rcpts_per_hour_or_default(), 2000);
         let rule = TrashPurgeRule {
             mode: TrashPurge::Erase,
             user_can_choose: true,

@@ -15,6 +15,7 @@ mod session;
 
 use std::fmt;
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -44,6 +45,10 @@ pub trait Transport: Send + Sized + 'static {
     /// Канал защищён TLS.
     fn tls(&self) -> bool;
 
+    /// Адрес клиента соединения (из заголовка PROXY или адрес TCP-собеседника) — для защиты от перебора
+    /// (`SaslContext::peer`, CTR-57).
+    fn peer(&self) -> IpAddr;
+
     /// Можно предложить `STARTTLS`.
     fn can_starttls(&self) -> bool;
 
@@ -60,6 +65,10 @@ impl Transport for Conn {
 
     fn tls(&self) -> bool {
         self.info.tls
+    }
+
+    fn peer(&self) -> IpAddr {
+        self.info.client.ip()
     }
 
     fn can_starttls(&self) -> bool {

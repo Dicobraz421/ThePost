@@ -10,6 +10,7 @@ use tp_contracts::auth::{DirAccount, DirAlias, DirDomain, DirGroup};
 use tp_contracts::ext::{Augment, CopyTo, Decision, DecisionHooks};
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountScope, MessageQuery, MessageStore, SpecialUse};
+use tp_contracts::transport::TransportStore;
 use tp_contracts::{Result, TenantId};
 use tp_testkit::{
     BlobOp, Clock, FakeDirectory, MemBlobIndex, MemBlobStore, MemEventBus, MemGroups, MemMetadata,
@@ -49,6 +50,8 @@ struct Env {
     quota: MemQuota,
     store: Arc<dyn MailStore>,
     dir: FakeDirectory,
+    /// Настройки транспорта: `example.org` — принятый домен организации.
+    transport: MemTransport,
     queue: Arc<Queue>,
 }
 
@@ -61,6 +64,7 @@ fn dir_account(id: &str, login: &str, emails: &[&str]) -> DirAccount {
         enabled: true,
         attributes: BTreeMap::new(),
         org: Default::default(),
+        hidden_from_gal: false,
     }
 }
 
@@ -131,6 +135,19 @@ impl Env {
                 target: "a".into(),
             }],
         );
+        let transport = MemTransport::new();
+        transport
+            .put_domain(
+                0,
+                &AcceptedDomain {
+                    id: tp_contracts::DomainId::new(),
+                    tenant: t,
+                    name: "example.org".into(),
+                    kind: DomainKind::Authoritative,
+                },
+            )
+            .await
+            .expect("accepted domain");
         Self {
             meta,
             blobs,
@@ -139,8 +156,14 @@ impl Env {
             quota,
             store: Arc::new(store),
             dir,
+            transport,
             queue: Arc::new(Queue::default()),
         }
+    }
+
+    /// Снимки настроек транспорта окружения.
+    fn routes(&self) -> Arc<Routes> {
+        Arc::new(Routes::new(Arc::new(self.transport.clone())))
     }
 
     fn delivery(&self, outbound: bool) -> Delivery {
@@ -169,6 +192,7 @@ impl Env {
             },
             &cfg,
         )
+        .with_transport(self.routes())
     }
 
     async fn scope(&self, login: &str) -> AccountScope {
@@ -182,6 +206,19 @@ impl Env {
             tenant: acc.tenant,
             account: acc.id,
         }
+    }
+
+    /// Число писем в папке «Спам» учётной записи.
+    async fn junk(&self, login: &str) -> usize {
+        let scope = self.scope(login).await;
+        let junk = self
+            .meta
+            .mailbox_by_role(scope, SpecialUse::Junk)
+            .expect("junk");
+        MessageStore::list(&self.meta, scope, junk, MessageQuery::All, 100)
+            .await
+            .expect("list")
+            .len()
     }
 
     /// Письма во «Входящих» учётной записи (исходный текст).
@@ -281,7 +318,6 @@ fn rewrite_rule(from: &str, to: &str) -> tp_contracts::transport::RewriteRule {
 
 #[tokio::test]
 async fn subaddress_catch_all_and_rewrite() {
-    use tp_contracts::transport::TransportStore;
     let env = Env::new(DecisionHooks::default()).await;
     env.dir.set_aliases(
         TenantId::DEFAULT,
@@ -291,7 +327,7 @@ async fn subaddress_catch_all_and_rewrite() {
         }],
     );
     // Таблица переписывания — в настройках транспорта организации (SMTP-29).
-    let transport = MemTransport::new();
+    let transport = env.transport.clone();
     let mut v = 0;
     for (from, to) in [
         ("@old.example.org", "@example.org"),
@@ -302,15 +338,13 @@ async fn subaddress_catch_all_and_rewrite() {
             .await
             .expect("rewrite");
     }
-    let d = env
-        .delivery_with(
-            true,
-            SmtpConfig {
-                hostname: "mx.example.org".into(),
-                ..SmtpConfig::default()
-            },
-        )
-        .with_transport(Arc::new(Routes::new(Arc::new(transport))));
+    let d = env.delivery_with(
+        true,
+        SmtpConfig {
+            hostname: "mx.example.org".into(),
+            ..SmtpConfig::default()
+        },
+    );
     let logins = |r: Resolved| match r {
         Resolved::Local(a) => a.into_iter().map(|a| a.login).collect::<Vec<_>>(),
         other => panic!("not local: {other:?}"),
@@ -376,10 +410,9 @@ async fn rewrite_table_reloads_on_transport_signal() {
     use std::time::Duration;
     use tp_contracts::bus::EventBus;
     use tp_contracts::role::CancellationToken;
-    use tp_contracts::transport::TransportStore;
     let env = Env::new(DecisionHooks::default()).await;
     let bus: Arc<dyn EventBus> = Arc::new(MemEventBus::default());
-    let transport = MemTransport::new().with_bus(bus.clone());
+    let transport = env.transport.clone().with_bus(bus.clone());
     // Снимок недоступен и прежнего нет — ошибка (временный отказ), а не доставка без переписывания.
     transport.fail_next(Error::Unavailable { retry_after: None });
     let routes = Arc::new(Routes::new(Arc::new(transport.clone())));
@@ -1041,8 +1074,11 @@ async fn submission_copy_to_local_address() {
     assert!(env.inbox("carol@example.org").await.is_empty());
 }
 
+mod addressbook;
 mod imip;
+mod invite;
 mod moderation;
+mod outbound_milter;
 
 mod groups {
     //! SMTP-16: квота до `DATA`, ограничения отправителей и модерация групп рассылки.
@@ -1235,7 +1271,7 @@ mod groups {
         assert_eq!(env.inbox("bob@example.org").await.len(), 1);
         let held = env
             .groups
-            .held(TenantId::DEFAULT, Some(g.id), 10)
+            .held(TenantId::DEFAULT, Some(g.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 1);
@@ -1265,7 +1301,7 @@ mod groups {
         assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued);
         let held = env
             .groups
-            .held(TenantId::DEFAULT, Some(g.id), 10)
+            .held(TenantId::DEFAULT, Some(g.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 2);
@@ -1335,6 +1371,7 @@ mod tracking {
                 ..SmtpConfig::default()
             },
         )
+        .with_transport(env.routes())
         .with_tracking(tracking.clone());
         // Отказ на RCPT.
         let inbound = envelope(Mode::Inbound, &[]);
@@ -1426,5 +1463,10 @@ async fn outbound_suite() {
     tp_testkit::suite::outbound_submit(&d, TenantId::DEFAULT, &list).await;
 }
 
+mod local_domains;
+mod org_policy;
+mod rcpt_rate;
 mod rules;
+mod scheduled;
+mod senders;
 mod wave;

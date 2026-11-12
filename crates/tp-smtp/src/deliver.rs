@@ -2,10 +2,12 @@
 //! группы каталога), заголовки `Return-Path` и `Received`, [`MailStore::ingest`] одним вызовом на письмо.
 //!
 //! [`Delivery`] — обработчик сессий ([`Handler`]) обеих ролей:
-//! - получатель в локальном домене — учётные записи, на которые он разрешается; неизвестный — `550 5.1.1`;
+//! - локальный домен — только принятый домен организации узла ([`Delivery::with_transport`], `ClusterTransport`,
+//!   решение 96); получатель в нём — учётные записи, на которые он разрешается; неизвестный — `550 5.1.1`;
 //!   переполненный ящик — `452 4.2.2` или `552 5.2.2` (`delivery.quota_reject`) до `DATA`;
 //! - группа рассылки ([`Delivery::with_groups`], [`crate::groups`]): отправитель вне круга — `550 5.7.1` на `RCPT`,
-//!   письмо модерируемой группы — в очередь модерации, иначе группа раскрывается;
+//!   письмо модерируемой группы — в очередь модерации, иначе группа раскрывается: учётные записи — в ящики,
+//!   почтовые контакты — внешним адресатам; динамическая группа — по фильтру на момент доставки (SMTP-26);
 //! - внешний получатель: smtp-in — `550 5.7.1` (не открытый релей), submission — в очередь исходящей почты
 //!   ([`Outbound`], [`crate::queue::Queue`]); узел без очереди (`Deps::outbound` = `None`) — `451 4.3.2`;
 //! - submission: до доставки и очереди — `DecisionHooks::on_submission` (`Deny` — `550 5.7.1`; дополнения:
@@ -16,12 +18,14 @@
 //!   локальные — сразу в ящики тем же `ingest` (SMTP-28), внешние — в очередь [`Outbound`] с отправителем SRS и
 //!   ARC-подписью ([`Delivery::with_forwarding`], [`crate::forward`]); уведомление на адрес SRS — обратно
 //!   исходному отправителю (подделанный или просроченный адрес — `550 5.1.1`);
-//! - принятые домены кластера ([`Delivery::with_transport`], `ClusterTransport`, SMTP-21): полномочный —
-//!   неизвестный адрес `550 5.1.1`; внутренняя ретрансляция — неизвестный адрес принимается и ставится в очередь
+//! - виды принятых доменов (SMTP-21): полномочный — неизвестный адрес `550 5.1.1`; внутренняя ретрансляция — неизвестный адрес принимается и ставится в очередь
 //!   (smtp-out доставляет его на `next_hop` домена); домен другой организации — `451 4.3.0` (узел обслуживает
 //!   одну организацию);
 //! - доверенные источники ([`crate::sources`], SMTP-20): приложение — внешние получатели только при `external`,
 //!   без проверок SPF/DKIM/DMARC; шлюз без данных об исходном клиенте — результаты проверок шлюза;
+//! - фильтры Milter ([`crate::milter`]) двух направлений: приём — smtp-in; исходящая почта — submission и
+//!   [`Delivery::submit`] (JMAP EmailSubmission, SMTP-27), до правил потока: отказ фильтра — отказ отправки,
+//!   изменённые заголовки — дальше по ним;
 //! - правила потока почты ([`Delivery::with_mail_flow`], `MailFlow`, SMTP-22) — один раз на письмо: smtp-in после
 //!   Milter, submission и [`Delivery::submit`] — до точек принятия решений и очереди; `Reject` — `550 5.7.1`,
 //!   `Drop` — `250` без доставки, изменённые конверт и тело — дальше по ним, `matched` — в журнал доставки;
@@ -29,9 +33,15 @@
 //!   локального получателя (smtp-in, submission, [`Delivery::submit`]) после правил потока и до `ingest`: папки и
 //!   флаги, отброс, перенаправление, автоответ; перенаправленное письмо и внутренний автоответ — через правила
 //!   получателя с проверкой петли ([`Delivery::relay`], SMTP-34);
-//! - приём iMIP ([`Delivery::with_itip`], [`crate::itip`], SMTP-33): письмо smtp-in с частью `text/calendar;
-//!   method=…` после доставки в ящик передаётся `ItipDelivery` получателя; письмо остаётся в ящике, отказ и сбой
-//!   iTIP — только запись в журнал.
+//! - приглашения iTIP в письмах ([`Delivery::with_itip`], [`crate::itip`]): письмо с частью `text/calendar;
+//!   method=…` после доставки в ящик передаётся `ItipDelivery` получателя — smtp-in как iMIP (SMTP-33),
+//!   submission и [`Delivery::submit`] как внутреннее планирование (решение 78, SMTP-36); письмо остаётся в ящике,
+//!   отказ и сбой iTIP — только запись в журнал.
+//! - личные списки отправителей ящика ([`Delivery::with_sender_lists`], `SenderLists`, SMTP-25) — при каждой
+//!   доставке в ящик (smtp-in, submission, [`Delivery::submit`], пересылки и перенаправления): письмо
+//!   заблокированного отправителя — в «Спам», надёжного — во «Входящие» поверх карантина фильтра Milter; сверяется
+//!   `From` письма, затем отправитель конверта. Письмо с проваленным DMARC остаётся в «Спаме» и от «надёжного»:
+//!   его адрес мог быть подделан;
 //! - решения модератора (`tp_contracts::groups::Moderation`, CTR-31, CTR-43; FIX-01, `moderation`): одобренное письмо
 //!   очереди модерации — участникам группы или исходным получателям правила потока без повторной модерации, отказ —
 //!   уведомление отправителю (RFC 3464) с причиной модератора.
@@ -39,6 +49,9 @@
 //! Отправка вне сессии SMTP (JMAP `EmailSubmission/set`) — [`Delivery::submit`] и `impl Outbound for Delivery`
 //! (CMP-04, контракт `tp_contracts::queue::Outbound`, CTR-28): локальные получатели доставляются сразу тем же
 //! `ingest`, внешние — в очередь (без очереди — `SubmitStatus::Failed` с `451 4.3.0`, SMTP-28); статус по получателю.
+//! Отложенная отправка и её отмена (`Outbound::schedule`, `cancel_scheduled`; SMTP-24) — `scheduled`.
+//! Лимиты писем и адресатов в час учётной записи отправителя — общие с submission ([`Delivery::with_send_limits`],
+//! [`crate::limits`], SMTP-43).
 //!
 //! Адресация ([`crate::address`]): получатели переписываются до разрешения, отправитель — после проверок, по
 //! таблице организации из снимка настроек транспорта ([`Delivery::with_transport`], `TenantTransport::rewrites`);
@@ -59,30 +72,35 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
-use tp_contracts::auth::{DirChange, DirCursor, Directory};
+use tp_contracts::auth::{Authorizer, DirChange, DirCursor, Directory, Principal};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::ext::{CopyTo, Decision, DecisionHooks, SubmissionInfo};
 use tp_contracts::groups::DistributionGroup;
 use tp_contracts::mailstore::{Delivery as MailDelivery, IngestRequest, Ingested, MailStore};
-use tp_contracts::meta::{Account, AccountScope, AccountStore, Mailbox, MailboxStore, SpecialUse};
+use tp_contracts::meta::{
+    Account, AccountScope, AccountStore, Mailbox, MailboxStore, Policy, PolicyResolver, SpecialUse,
+};
 use tp_contracts::queue::{DsnRet, Outbound, SubmitStatus, Submitted};
 use tp_contracts::retention::Quota;
 use tp_contracts::schedule::{ItipDelivery, ItipMessage, ItipOutcome, ItipSource};
+use tp_contracts::senders::{SenderLists, SenderVerdict};
 use tp_contracts::sieve::{AutoReply, DeliveryRules, MailboxRef, RulesInput, RulesOutcome};
 use tp_contracts::transport::{
     AcceptedDomain, BlobRef, DomainKind, EnvelopeSide, FlowDirection, FlowEnvelope, FlowInput,
     FlowOutcome, FlowVerdict, MailFlow,
 };
-use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
+use tp_contracts::{AccountId, Error, MailboxId, QueueId, Result, TenantId};
 
 use crate::address::Addressing;
 use crate::authcheck::AuthCheck;
+use crate::config::MilterDirection;
 use crate::config::{DeliveryConfig, QuotaReject, SmtpConfig};
 use crate::dsn::{self, DsnSink};
 use crate::forward::Forwarding;
 use crate::groups::{Groups, Hold};
 use crate::itip;
-use crate::milter::{Milters, Verdict};
+use crate::limits::{self, SendLimits};
+use crate::milter::{self, Milters, Verdict};
 use crate::routes::Routes;
 use crate::server::{Envelope, Handler, Mode, Reply, is_positive, reply};
 use crate::sieve::{self, Hop, Sieved, VacationRate};
@@ -102,8 +120,7 @@ pub struct Deps {
     pub accounts: Arc<dyn AccountStore>,
     /// Папки: «Входящие» и «Спам» получателя.
     pub mailboxes: Arc<dyn MailboxStore>,
-    /// Каталог: домены, псевдонимы, адреса учётных записей, группы. `None` — только `delivery.local_domains`
-    /// и имена входа.
+    /// Каталог: псевдонимы, адреса учётных записей, группы. `None` — только имена входа.
     pub directory: Option<Arc<dyn Directory>>,
     /// Квоты: переполненный ящик отклоняется на `RCPT`.
     pub quota: Option<Arc<dyn Quota>>,
@@ -140,10 +157,9 @@ pub enum Resolved {
     Unknown,
 }
 
-/// Снимок каталога: локальные домены и адрес → имена входа.
+/// Снимок каталога: адрес → имена входа.
 #[derive(Debug, Default)]
 struct Snapshot {
-    domains: HashSet<String>,
     addresses: HashMap<String, BTreeSet<String>>,
 }
 
@@ -159,6 +175,8 @@ struct Target {
     delivered_to: Option<String>,
     /// Адрес — группа рассылки [`Groups`] (ограничения отправителей, модерация).
     group: Option<DistributionGroup>,
+    /// Адреса почтовых контактов в составе группы (SMTP-26): внешняя доставка.
+    contacts: Vec<String>,
     /// Неизвестный адрес домена внутренней ретрансляции: в очередь (на `next_hop` домена).
     relay: bool,
     /// Принятый домен другой организации.
@@ -198,11 +216,20 @@ pub struct Delivery {
     flow: Option<FlowDeps>,
     rules: Option<Arc<dyn DeliveryRules>>,
     itip: Option<Arc<dyn ItipDelivery>>,
+    /// Права отправки от чужого адреса (Send As, Send on Behalf) для приглашений из почтового клиента (SMTP-36).
+    authz: Option<Arc<dyn Authorizer>>,
+    senders: Option<Arc<dyn SenderLists>>,
+    /// Политики организации (SMTP-40): профиль Milter, лимиты сеанса submission ([`Handler::policy`]).
+    policies: Option<Arc<dyn PolicyResolver>>,
     vacation_rate: VacationRate,
     /// `delivery.redirect_hops`.
     redirect_hops: u32,
     /// `delivery.redirect_total`.
     redirect_total: u32,
+    /// Лимиты отправки учётной записи в час для [`Delivery::submit`] (SMTP-43), общие с сеансами submission.
+    send_limits: Option<Arc<SendLimits>>,
+    /// `smtp.limits.max_tracked_accounts`.
+    max_tracked: usize,
 }
 
 impl fmt::Debug for Delivery {
@@ -214,9 +241,59 @@ impl fmt::Debug for Delivery {
     }
 }
 
+/// Письмо отправки вне сессии SMTP после правил потока.
+struct Flowed {
+    mail_from: String,
+    rcpts: Vec<String>,
+    raw: Bytes,
+}
+
+/// Итог [`Delivery::pre_submit`].
+enum Pre {
+    /// Судьба письма решена: статус всем получателям.
+    Done(SubmitStatus),
+    /// Дальше — доставка и очередь.
+    Go(Flowed),
+}
+
+/// Что известно о письме для выбора папки получателя: вердикт проверок и фильтров и отправитель — для личных
+/// списков отправителей ящика (SMTP-25).
+struct Filing {
+    /// Письмо — спам: DMARC не пройден (`quarantine`, `reject`) или карантин фильтра Milter.
+    junk: bool,
+    /// Подлинность отправителя не подтверждена (DMARC не пройден): «надёжный» отправитель спам не отменяет —
+    /// адрес мог быть подделан.
+    forged: bool,
+    /// Адреса отправителя для списков: `From` письма, затем отправитель конверта.
+    senders: Vec<String>,
+}
+
+impl Filing {
+    fn new(junk: bool, forged: bool, mail_from: &str, raw: &[u8]) -> Self {
+        let mut senders = Vec::new();
+        if let Some(from) = mail_parser::MessageParser::default()
+            .parse_headers(raw)
+            .as_ref()
+            .and_then(|m| m.from()?.first()?.address())
+        {
+            senders.push(from.to_owned());
+        }
+        if !mail_from.is_empty() && !senders.iter().any(|s| s.eq_ignore_ascii_case(mail_from)) {
+            senders.push(mail_from.to_owned());
+        }
+        Self {
+            junk,
+            forged,
+            senders,
+        }
+    }
+}
+
 /// Письмо, подготовленное к доставке.
 struct Prepared {
     deliveries: Vec<(String, MailDelivery)>,
+    /// Учётные записи, которым письмо доставляется как спам (папка «Спам»).
+    junk: HashSet<AccountId>,
     /// Внешние адреса (после переписывания).
     external: Vec<String>,
     /// Адреса для очереди без пересылки: неизвестные адреса доменов внутренней ретрансляции, исходные
@@ -246,10 +323,45 @@ impl Delivery {
             flow: None,
             rules: None,
             itip: None,
+            authz: None,
+            senders: None,
+            policies: None,
             vacation_rate: VacationRate::new(cfg.delivery.vacation_rate),
             redirect_hops: cfg.delivery.redirect_hops,
             redirect_total: cfg.delivery.redirect_total,
+            send_limits: None,
+            max_tracked: cfg.limits.max_tracked_accounts,
         }
+    }
+
+    /// Лимиты отправки в час (SMTP-43) для [`Delivery::submit`] и отложенной отправки (JMAP): писем —
+    /// `Policy::send_per_hour`, адресатов — `Policy::rcpts_per_hour` учётной записи отправителя; те же счётчики, что
+    /// у сеансов submission (`SessionCtx::send_limits`). Без них отправка вне сессии не ограничена.
+    pub fn with_send_limits(mut self, limits: Arc<SendLimits>) -> Self {
+        self.send_limits = Some(limits);
+        self
+    }
+
+    /// Личные списки надёжных и заблокированных отправителей ящиков (SMTP-25): при доставке в ящик письмо
+    /// заблокированного отправителя — в «Спам», надёжного — во «Входящие» поверх вердикта фильтров.
+    pub fn with_sender_lists(mut self, senders: Arc<dyn SenderLists>) -> Self {
+        self.senders = Some(senders);
+        self
+    }
+
+    /// Письмо — спам для ящика `scope`: вердикт письма с поправкой на списки отправителей ящика. Сверяется `From`
+    /// письма, затем отправитель конверта — решает первое совпадение. «Надёжный» не отменяет спам письма с
+    /// неподтверждённым отправителем ([`Filing::forged`]).
+    async fn junk_for(&self, scope: AccountScope, filing: &Filing) -> Result<bool> {
+        let Some(lists) = self.senders.as_ref().filter(|_| !filing.senders.is_empty()) else {
+            return Ok(filing.junk);
+        };
+        let list = lists.sender_list(scope).await?;
+        Ok(match filing.senders.iter().find_map(|a| list.verdict(a)) {
+            Some(SenderVerdict::Blocked) => true,
+            Some(SenderVerdict::Safe) if !filing.forged => false,
+            Some(SenderVerdict::Safe) | None => filing.junk,
+        })
     }
 
     /// Правила Sieve получателей ([`crate::sieve`], SMTP-31): для каждого локального получателя после правил потока
@@ -260,35 +372,69 @@ impl Delivery {
         self
     }
 
-    /// Приём iMIP (RFC 6047, SMTP-33): письмо smtp-in с частью `text/calendar; method=…` после доставки в ящик
-    /// передаётся `itip` для каждой учётной записи получателя. Отправитель — адрес `From` письма, прошедшего DMARC,
-    /// совпадающий с `ORGANIZER` (сообщения организатора) или `ATTENDEE` (ответы участника), иначе сообщение не
-    /// применяется. Письмо в любом случае остаётся в ящике; отказ и сбой iTIP — запись в журнал.
+    /// Приглашения iTIP в письмах: письмо с частью `text/calendar; method=…` после доставки в ящик передаётся `itip`
+    /// для каждой учётной записи получателя, если `From` письма совпадает с `ORGANIZER` (сообщения организатора) или
+    /// `ATTENDEE` (ответы участника) и ему можно доверять:
+    /// - smtp-in (iMIP, RFC 6047, SMTP-33) — письмо прошло DMARC, источник `ItipSource::Imip`;
+    /// - submission и [`Delivery::submit`] (решение 78, SMTP-36) — `From` принадлежит учётной записи отправителя
+    ///   (вошедшей в сеанс submission; у [`Delivery::submit`] — по отправителю конверта): её адрес, псевдоним
+    ///   (`Account::addresses`) или право Send As / Send on Behalf ([`Delivery::with_authz`]); источник
+    ///   `ItipSource::Internal`. Иначе — только письмо.
+    ///
+    /// Письмо в любом случае остаётся в ящике; отказ и сбой iTIP — запись в журнал.
     pub fn with_itip(mut self, itip: Arc<dyn ItipDelivery>) -> Self {
         self.itip = Some(itip);
         self
     }
 
+    /// Права отправки от чужого адреса (`Authorizer::send_right`) для приглашений из почтового клиента
+    /// ([`Delivery::with_itip`], SMTP-36). Без них внутренним приглашением считается только письмо со своим адресом
+    /// или псевдонимом в `From`.
+    pub fn with_authz(mut self, authz: Arc<dyn Authorizer>) -> Self {
+        self.authz = Some(authz);
+        self
+    }
+
     /// Передаёт сообщение iTIP письма `raw` учётным записям `targets` (получатель конверта и учётная запись), кроме
-    /// получателей из `failed`. `dmarc_pass` — письмо прошло DMARC.
-    async fn imip(
+    /// получателей из `failed`; доверие к `From` — по `origin`.
+    async fn apply_itip(
         &self,
         id: &str,
         raw: &[u8],
-        dmarc_pass: bool,
+        origin: ItipOrigin<'_>,
         targets: &[(String, AccountId)],
         failed: &[dsn::Recipient],
     ) {
         let Some(delivery) = &self.itip else {
             return;
         };
-        let msg = match itip::extract(raw, dmarc_pass) {
+        let msg = match itip::extract(raw) {
             None => return,
             Some(Err(reason)) => {
                 tracing::info!(%id, reason, "smtp: сообщение iTIP не применено");
                 return;
             }
             Some(Ok(m)) => m,
+        };
+        let source = match origin {
+            ItipOrigin::Imip { dmarc_pass: true } => ItipSource::Imip,
+            ItipOrigin::Imip { dmarc_pass: false } => {
+                tracing::info!(%id, reason = "отправитель не прошёл DMARC", "smtp: сообщение iTIP не применено");
+                return;
+            }
+            ItipOrigin::Internal { account, principal } => {
+                match self.owns_from(account, principal, &msg.from).await {
+                    Ok(true) => ItipSource::Internal,
+                    Ok(false) => {
+                        tracing::info!(%id, %account, "smtp: From приглашения не принадлежит отправителю, осталось письмом");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(%id, %account, error = %e, "smtp: сбой проверки отправителя приглашения");
+                        return;
+                    }
+                }
+            }
         };
         let mut seen = HashSet::new();
         for (rcpt, account) in targets {
@@ -310,7 +456,7 @@ impl Delivery {
                 from: msg.from.clone(),
                 method: msg.method,
                 ics: msg.ics.clone(),
-                source: ItipSource::Imip,
+                source,
             };
             match delivery.deliver(&message).await {
                 Ok(ItipOutcome::Applied) => {
@@ -324,6 +470,42 @@ impl Delivery {
                 }
             }
         }
+    }
+
+    /// Адрес `from` принадлежит учётной записи `account` организации узла (решение 78): её адрес или псевдоним
+    /// (`Account::addresses`), иначе право отправки от него ([`Delivery::with_authz`]). Субъект проверки прав —
+    /// `principal` сеанса submission; без него (отправка вне сессии SMTP) — учётная запись без групп.
+    async fn owns_from(
+        &self,
+        account: AccountId,
+        principal: Option<&Principal>,
+        from: &str,
+    ) -> Result<bool> {
+        let tenant = self.deps.tenant;
+        let Some(acc) = self.deps.accounts.get(tenant, account).await? else {
+            return Ok(false);
+        };
+        if acc.addresses().iter().any(|a| a.eq_ignore_ascii_case(from)) {
+            return Ok(true);
+        }
+        let Some(authz) = &self.authz else {
+            return Ok(false);
+        };
+        let own;
+        let principal = match principal {
+            Some(p) => p,
+            None => {
+                own = Principal {
+                    tenant,
+                    account,
+                    login: acc.login,
+                    groups: BTreeSet::new(),
+                    scopes: None,
+                };
+                &own
+            }
+        };
+        Ok(authz.send_right(principal, from).await?.is_some())
     }
 
     /// Пересылка наружу: SRS-переписывание отправителя и ARC-подпись ([`crate::forward`], SMTP-23); приём
@@ -353,12 +535,9 @@ impl Delivery {
         }
     }
 
-    /// Домен — локальный (каталог, `delivery.local_domains`, принятые домены организации).
+    /// Домен — локальный: принятый домен организации узла.
     async fn local_domain(&self, domain: &str) -> Result<bool> {
         let domain = domain.to_lowercase();
-        if self.snapshot().await?.domains.contains(&domain) {
-            return Ok(true);
-        }
         Ok(self
             .accepted(&domain)
             .await?
@@ -412,13 +591,48 @@ impl Delivery {
         }
     }
 
-    /// Таблица переписывания адресов конверта организации (SMTP-29): `TenantTransport::rewrites` из снимков
-    /// `routes`. Снимок перечитывается после сигнала `TransportChanged` — [`Routes::watch`] запускает владелец
-    /// снимков (один на узел, общий со smtp-out). Без снимков адреса не переписываются; снимок недоступен —
-    /// временная ошибка (правило может направлять получателя в другой ящик).
+    /// Снимки настроек транспорта `routes`: принятые домены (`ClusterTransport`) — единственный источник
+    /// локальных доменов, таблица переписывания адресов конверта организации (SMTP-29,
+    /// `TenantTransport::rewrites`). Снимок перечитывается после сигнала `TransportChanged` — [`Routes::watch`]
+    /// запускает владелец снимков (один на узел, общий со smtp-out). Без снимков локальных доменов нет и адреса
+    /// не переписываются; снимок недоступен — временная ошибка.
     pub fn with_transport(mut self, routes: Arc<Routes>) -> Self {
         self.transport = Some(routes);
         self
+    }
+
+    /// Политики организации (SMTP-40, решение 97): профиль Milter письма (`Policy::milter_profile`; submission —
+    /// цепочка учётной записи отправителя, smtp-in — уровень организации) и лимиты сеанса submission
+    /// ([`Handler::policy`]: `max_recipients`, `send_per_hour`, `rcpts_per_hour`). Без политик — умолчания
+    /// полей `Policy`.
+    pub fn with_policies(mut self, policies: Arc<dyn PolicyResolver>) -> Self {
+        self.policies = Some(policies);
+        self
+    }
+
+    /// Политика учётной записи `account`: цепочка «организация → основной домен → учётная запись»; учётной
+    /// записи нет — уровень организации.
+    async fn account_policy(&self, tenant: TenantId, account: AccountId) -> Result<Policy> {
+        let Some(policies) = &self.policies else {
+            return Ok(Policy::default());
+        };
+        match self.deps.accounts.get(tenant, account).await? {
+            Some(a) => {
+                policies
+                    .resolve(tenant, Some(a.domain), Some(a.id), None)
+                    .await
+            }
+            None => policies.resolve(tenant, None, None, None).await,
+        }
+    }
+
+    /// Политика письма транзакции `env`: субъект AUTH — его учётная запись, иначе — организация узла.
+    async fn message_policy(&self, env: &Envelope) -> Result<Policy> {
+        match (&env.principal, &self.policies) {
+            (_, None) => Ok(Policy::default()),
+            (Some(p), Some(_)) => self.account_policy(p.tenant, p.account).await,
+            (None, Some(policies)) => policies.resolve(self.deps.tenant, None, None, None).await,
+        }
     }
 
     /// Адрес конверта `address` организации `tenant` после переписывания для стороны `side`; `None` — правила нет.
@@ -457,35 +671,30 @@ impl Delivery {
             resolved,
             delivered_to,
             group: None,
+            contacts: Vec::new(),
             relay: false,
             foreign: false,
         };
         let Some((_, domain)) = lower.rsplit_once('@') else {
             return Ok(target(Resolved::Unknown, None));
         };
-        let snap = self.snapshot().await?;
-        let accepted = self.accepted(domain).await?;
-        if accepted
-            .as_ref()
-            .is_some_and(|d| d.tenant != self.deps.tenant)
-        {
+        let Some(accepted) = self.accepted(domain).await? else {
+            return Ok(target(Resolved::External, None));
+        };
+        if accepted.tenant != self.deps.tenant {
             return Ok(Target {
                 foreign: true,
                 ..target(Resolved::External, None)
             });
         }
-        let relay = matches!(
-            accepted.as_ref().map(|d| &d.kind),
-            Some(DomainKind::InternalRelay { .. })
-        );
-        if !snap.domains.contains(domain) && accepted.is_none() {
-            return Ok(target(Resolved::External, None));
-        }
+        let relay = matches!(accepted.kind, DomainKind::InternalRelay { .. });
+        let snap = self.snapshot().await?;
         if let Some(groups) = &self.groups
             && let Some(group) = groups.by_address(self.deps.tenant, &lower).await?
         {
+            let members = groups.members(self.deps.tenant, &group).await?;
             let mut accounts = Vec::new();
-            for id in groups.members(self.deps.tenant, &group).await? {
+            for id in members.accounts {
                 if let Some(acc) = self.deps.accounts.get(self.deps.tenant, id).await?
                     && acc.enabled
                 {
@@ -494,6 +703,7 @@ impl Delivery {
             }
             return Ok(Target {
                 group: Some(group),
+                contacts: members.contacts,
                 ..target(Resolved::Local(accounts), None)
             });
         }
@@ -555,25 +765,10 @@ impl Delivery {
     }
 
     async fn load_snapshot(&self) -> Result<Snapshot> {
-        let mut snap = Snapshot {
-            domains: self
-                .cfg
-                .local_domains
-                .iter()
-                .map(|d| d.to_lowercase())
-                .collect(),
-            addresses: HashMap::new(),
-        };
         let Some(dir) = &self.deps.directory else {
-            return Ok(snap);
+            return Ok(Snapshot::default());
         };
         let tenant = self.deps.tenant;
-        snap.domains.extend(
-            dir.domains(tenant)
-                .await?
-                .into_iter()
-                .map(|d| d.name.to_lowercase()),
-        );
         // external_id → (имя входа, адреса); группы: external_id → (адрес, члены).
         let mut accounts = HashMap::new();
         let mut cursor: Option<DirCursor> = None;
@@ -658,8 +853,7 @@ impl Delivery {
                 .or_default()
                 .extend(expand(&alias.target));
         }
-        snap.addresses = addresses;
-        Ok(snap)
+        Ok(Snapshot { addresses })
     }
 
     /// Папка доставки: «Спам» (`junk`) или «Входящие».
@@ -681,11 +875,12 @@ impl Delivery {
         &self,
         id: &str,
         rcpts: &[String],
-        junk: bool,
+        filing: &Filing,
         origin: Origin,
     ) -> Result<Prepared> {
         let mut out = Prepared {
             deliveries: Vec::new(),
+            junk: HashSet::new(),
             external: Vec::new(),
             relayed: Vec::new(),
             queued: Vec::new(),
@@ -729,30 +924,19 @@ impl Delivery {
                     continue;
                 }
             }
+            // Контакты в составе группы — внешним адресатам (очередь; письмо извне — пересылкой).
+            push_unique(&mut out.external, target.contacts);
             match target.resolved {
                 Resolved::Local(accounts) => {
                     for acc in accounts {
-                        if out.deliveries.iter().any(|(_, d)| d.account == acc.id) {
-                            continue;
-                        }
-                        let scope = AccountScope {
-                            tenant: acc.tenant,
-                            account: acc.id,
-                        };
-                        let mailbox = self.mailbox(scope, junk).await?;
-                        out.deliveries.push((
-                            rcpt.clone(),
-                            MailDelivery {
-                                account: acc.id,
-                                mailbox,
-                                extra_headers: target
-                                    .delivered_to
-                                    .iter()
-                                    .map(|a| ("Delivered-To".to_owned(), clean(a)))
-                                    .collect(),
-                                flags: Default::default(),
-                            },
-                        ));
+                        self.push_delivery(
+                            &mut out,
+                            rcpt,
+                            &acc,
+                            target.delivered_to.as_deref(),
+                            filing,
+                        )
+                        .await?;
                     }
                 }
                 Resolved::External => {
@@ -777,6 +961,43 @@ impl Delivery {
             }
         }
         Ok(out)
+    }
+
+    /// Добавляет доставку письма получателя `rcpt` в ящик учётной записи `acc` (одна на учётную запись): папка —
+    /// «Входящие» или «Спам» по [`Delivery::junk_for`]; `delivered_to` — полный адрес с подадресом.
+    async fn push_delivery(
+        &self,
+        out: &mut Prepared,
+        rcpt: &str,
+        acc: &Account,
+        delivered_to: Option<&str>,
+        filing: &Filing,
+    ) -> Result<()> {
+        if out.deliveries.iter().any(|(_, d)| d.account == acc.id) {
+            return Ok(());
+        }
+        let scope = AccountScope {
+            tenant: acc.tenant,
+            account: acc.id,
+        };
+        let junk = self.junk_for(scope, filing).await?;
+        if junk {
+            out.junk.insert(acc.id);
+        }
+        let mailbox = self.mailbox(scope, junk).await?;
+        out.deliveries.push((
+            rcpt.to_owned(),
+            MailDelivery {
+                account: acc.id,
+                mailbox,
+                extra_headers: delivered_to
+                    .iter()
+                    .map(|a| ("Delivered-To".to_owned(), clean(a)))
+                    .collect(),
+                flags: Default::default(),
+            },
+        ));
+        Ok(())
     }
 
     /// Может ли `sender` писать в группу (без [`Groups`] групп-адресатов нет — да).
@@ -976,12 +1197,12 @@ impl Delivery {
         id: &str,
         prepared: &mut Prepared,
         addresses: &[String],
-        junk: bool,
+        filing: &Filing,
     ) -> Result<()> {
         if addresses.is_empty() {
             return Ok(());
         }
-        let mut copies = self.prepare(id, addresses, junk, Origin::Module).await?;
+        let mut copies = self.prepare(id, addresses, filing, Origin::Module).await?;
         copies.external.append(&mut copies.relayed);
         for (_, d) in copies.deliveries {
             if !prepared
@@ -989,6 +1210,9 @@ impl Delivery {
                 .iter()
                 .any(|(_, x)| x.account == d.account)
             {
+                if copies.junk.contains(&d.account) {
+                    prepared.junk.insert(d.account);
+                }
                 prepared.deliveries.push((String::new(), d));
             }
         }
@@ -1007,13 +1231,13 @@ impl Delivery {
         mail_from: &str,
         raw: &Bytes,
         mut forward: Vec<String>,
-        junk: bool,
+        filing: &Filing,
         received_at: OffsetDateTime,
         mut delivered: HashSet<AccountId>,
     ) -> Result<Vec<String>> {
         let mut external = Vec::new();
         while !forward.is_empty() {
-            let p = self.prepare(id, &forward, junk, Origin::Module).await?;
+            let p = self.prepare(id, &forward, filing, Origin::Module).await?;
             push_unique(&mut external, p.external);
             push_unique(&mut external, p.relayed);
             let deliveries: Vec<_> = p
@@ -1153,7 +1377,8 @@ impl Delivery {
             });
         let env = rewritten.as_ref().unwrap_or(env);
         // DMARC не пройден при политике quarantine/reject — в «Спам».
-        let mut junk = check.as_ref().is_some_and(|c| c.junk);
+        let forged = check.as_ref().is_some_and(|c| c.junk);
+        let mut junk = forged;
         let mut headers = self.trace_headers(env, received_at);
         if let Some(c) = &check {
             // Authentication-Results и Received-SPF — выше Received этого узла (RFC 8601, 7208).
@@ -1163,8 +1388,15 @@ impl Delivery {
         full.extend_from_slice(headers.as_bytes());
         full.extend_from_slice(&raw);
         let mut full = Bytes::from(full);
-        if let Some(m) = self.deps.milter.as_ref().filter(|m| m.applies(env.mode)) {
-            let out = m.check(env, full).await;
+        let mail = milter::Mail::of(env);
+        if let Some(m) = self
+            .deps
+            .milter
+            .as_ref()
+            .filter(|m| m.applies(mail.direction))
+        {
+            let profile = self.message_policy(env).await?.milter_profile;
+            let out = m.check(&mail, full, profile.as_deref()).await;
             match out.verdict {
                 Verdict::Accept => {}
                 Verdict::Refuse(r) => return Ok(Some(r)),
@@ -1287,8 +1519,10 @@ impl Delivery {
             trail.decision = Some(Dd::Quarantine);
         }
         let sender = sender_account(env, self.deps.tenant);
+        let filing = Filing::new(junk, forged, &env.mail_from, &full);
+        let filing = &filing;
         let mut prepared = self
-            .prepare(&env.id, &env.rcpts, junk, Origin::Sender(sender))
+            .prepare(&env.id, &env.rcpts, filing, Origin::Sender(sender))
             .await?;
         // Очередь модерации — до доставки: её сбой — временный отказ без частичной доставки.
         self.hold_all(&prepared.held, &env.mail_from, sender, &full, received_at)
@@ -1308,7 +1542,7 @@ impl Delivery {
                 CopyTo::Address(a) => copy_to.push(a),
             }
         }
-        self.add_copies(&env.id, &mut prepared, &copy_to, junk)
+        self.add_copies(&env.id, &mut prepared, &copy_to, filing)
             .await?;
         // Внешние получатели smtp-in от обычного клиента — только перенаправления правил потока: пересылка.
         let redirect = env.mode == Mode::Inbound && !app;
@@ -1333,21 +1567,26 @@ impl Delivery {
                 &env.mail_from,
                 &full,
                 &mut prepared.deliveries,
-                junk,
+                &prepared.junk,
                 false,
             )
             .await?;
         let local = local_rcpts(&prepared.deliveries);
-        // iMIP — только проверенной входящей почте вне «Спама»: адресу `From` без DMARC доверять нельзя.
-        let imip: Vec<(String, AccountId)> = match &check {
-            Some(_) if !junk && self.itip.is_some() => prepared
-                .deliveries
-                .iter()
-                .filter(|(r, _)| !r.is_empty())
-                .map(|(r, d)| (r.clone(), d.account))
-                .collect(),
-            _ => Vec::new(),
-        };
+        let spam = junk_rcpts(&prepared.deliveries, &prepared.junk);
+        // iTIP — входящей почте с проверками отправителя (iMIP) и письму вошедшего пользователя (решение 78), вне
+        // «Спама»: адресу `From` без DMARC или без связи с отправителем доверять нельзя.
+        let origin = match (&check, sender) {
+            (Some(c), _) => Some(ItipOrigin::Imip {
+                dmarc_pass: c.dmarc_pass,
+            }),
+            (None, Some(account)) => Some(ItipOrigin::Internal {
+                account,
+                principal: env.principal.as_ref(),
+            }),
+            (None, None) => None,
+        }
+        .filter(|_| self.itip.is_some());
+        let itip_to = itip_targets(origin.is_some(), &prepared.deliveries, &prepared.junk);
         if !prepared.deliveries.is_empty() {
             let ingested = self
                 .ingest_all(
@@ -1361,9 +1600,9 @@ impl Delivery {
                 .await?;
             push_unique(&mut forward, ingested.forward);
         }
-        if !imip.is_empty() {
-            let dmarc_pass = check.as_ref().is_some_and(|c| c.dmarc_pass);
-            self.imip(&env.id, &full, dmarc_pass, &imip, &failed).await;
+        if let Some(origin) = origin.filter(|_| !itip_to.is_empty()) {
+            self.apply_itip(&env.id, &full, origin, &itip_to, &failed)
+                .await;
         }
         let external = self
             .forward(
@@ -1371,7 +1610,7 @@ impl Delivery {
                 &env.mail_from,
                 &full,
                 forward,
-                junk,
+                filing,
                 received_at,
                 delivered,
             )
@@ -1382,7 +1621,7 @@ impl Delivery {
                 &env.id,
                 &env.mail_from,
                 hops,
-                junk,
+                filing,
                 received_at,
                 Some(env.conn.client.ip()),
             )
@@ -1399,7 +1638,7 @@ impl Delivery {
             Some(env.conn.client.ip()),
         )
         .await?;
-        outcome_steps(&mut trail.steps, &prepared.held, &local, &failed, junk);
+        outcome_steps(&mut trail.steps, &prepared.held, &local, &failed, &spam);
         trail.steps.extend(sieve_steps);
         self.send_replies(&env.id, &env.mail_from, &full, replies, &mut trail.steps)
             .await;
@@ -1443,27 +1682,62 @@ impl Delivery {
         true
     }
 
-    /// Отправка от имени пользователя вне сессии SMTP (JMAP `EmailSubmission/set`, CMP-04): получатели в
-    /// локальных доменах (`delivery.local_domains` и каталог: домены, адреса, псевдонимы, группы)
-    /// доставляются сразу через [`MailStore::ingest`] — как входящая почта, без очереди, MX, MTA-STS и DANE;
-    /// внешние — в очередь исходящей почты ([`Deps::outbound`]) письмом `raw` без изменений. Пересылки модулей
-    /// на локальные адреса — сразу в ящики, на внешние — в очередь.
-    ///
-    /// Неизвестный локальный адрес и переполненный ящик — статус [`SubmitStatus::Failed`] и уведомление о
-    /// недоставке отправителю (как для входящей почты). Узел без очереди: внешние получатели —
-    /// `SubmitStatus::Failed` с временной ошибкой [`NO_OUTBOUND`] без уведомления (статус получает отправитель),
-    /// локальные доставляются. Ошибка хранилища, каталога или очереди — `Err`.
-    /// Другая организация (`tenant` ≠ `Deps::tenant`) — все получатели в очередь, как до CMP-04 (без очереди —
-    /// все `Failed`).
-    pub async fn submit(
+    /// Обработка письма отправки вне сессии SMTP до доставки и очереди: фильтры Milter исходящей почты
+    /// (SMTP-27) из профиля политики организации (SMTP-40), правила потока (один раз на письмо) и переписывание
+    /// отправителя. `Done` — судьба письма решена фильтром или правилом (отказ, удаление).
+    async fn pre_submit(
         &self,
+        id: &str,
         tenant: TenantId,
         mail_from: &str,
         rcpts: &[String],
         mut raw: Bytes,
-    ) -> Result<Submitted> {
-        let id = crate::server::next_id();
-        let requested = rcpts;
+    ) -> Result<Pre> {
+        let outbound = MilterDirection::Outbound;
+        if let Some(m) = self.deps.milter.as_ref().filter(|m| m.applies(outbound)) {
+            let profile = match &self.policies {
+                Some(p) => p.resolve(tenant, None, None, None).await?.milter_profile,
+                None => None,
+            };
+            let mail = milter::Mail {
+                direction: outbound,
+                id,
+                client: None,
+                login: None,
+                mail_from,
+                rcpts,
+            };
+            let out = m.check(&mail, raw, profile.as_deref()).await;
+            let refused = match out.verdict {
+                Verdict::Accept => out.quarantine.map(|reason| {
+                    tracing::info!(%id, %reason, "smtp: письмо в карантине фильтра");
+                    reply(550, [5, 7, 1], "Message held by content filter")
+                }),
+                Verdict::Refuse(r) => Some(r),
+                Verdict::Discard => {
+                    let step = Step::new(Ek::Receive, Dd::Discard, rcpts.to_vec());
+                    self.track(
+                        mail_from,
+                        tracking::message_id(&out.message).as_deref(),
+                        vec![step],
+                    )
+                    .await;
+                    return Ok(Pre::Done(SubmitStatus::Delivered));
+                }
+            };
+            if let Some(r) = refused {
+                let step = Step::new(Ek::Reject, tracking::decision(&r), rcpts.to_vec())
+                    .reason(tracking::reason(&r));
+                self.track(
+                    mail_from,
+                    tracking::message_id(&out.message).as_deref(),
+                    vec![step],
+                )
+                .await;
+                return Ok(Pre::Done(SubmitStatus::Failed(tracking::reason(&r))));
+            }
+            raw = out.message;
+        }
         let mut flowed_rcpts = None;
         let input = FlowInput {
             tenant,
@@ -1495,7 +1769,7 @@ impl Delivery {
                     .await;
             }
             if let Some(status) = status {
-                return Ok(Submitted::all(rcpts, status));
+                return Ok(Pre::Done(status));
             }
             if let Some(body) = body {
                 raw = body;
@@ -1509,29 +1783,36 @@ impl Delivery {
             .rewrite(tenant, mail_from, EnvelopeSide::Sender)
             .await?;
         let mail_from = rewritten.as_deref().unwrap_or(mail_from);
-        if tenant != self.deps.tenant {
-            let status = match &self.deps.outbound {
-                Some(q) => {
-                    q.enqueue(tenant, mail_from, rcpts, raw).await?;
-                    SubmitStatus::Queued
-                }
-                None => {
-                    no_outbound(&id, rcpts.len());
-                    SubmitStatus::Failed(NO_OUTBOUND.into())
-                }
-            };
-            return Ok(Submitted::all(requested, status));
-        }
+        Ok(Pre::Go(Flowed {
+            mail_from: mail_from.to_owned(),
+            rcpts: rcpts.to_vec(),
+            raw,
+        }))
+    }
+
+    /// Доставка письма отправки после [`Delivery::pre_submit`]: локальным получателям — в ящики (группы, правила
+    /// Sieve, пересылки), внешним — в очередь. Статус — по каждому адресу `rcpts`. `bounce` — уведомить отправителя
+    /// о недоставленных; выпуск отложенной отправки ([`LocalRelease`]) уведомляет сам, по итогам записи очереди.
+    async fn dispatch(
+        &self,
+        id: &str,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+        bounce: bool,
+    ) -> Result<Vec<(String, SubmitStatus)>> {
         let sender = self.sender_by_address(mail_from).await?;
+        let filing = Filing::new(false, false, mail_from, &raw);
+        let filing = &filing;
         let mut prepared = self
-            .prepare(&id, rcpts, false, Origin::Sender(sender))
+            .prepare(id, rcpts, filing, Origin::Sender(sender))
             .await?;
         let received_at = OffsetDateTime::now_utc();
         self.hold_all(&prepared.held, mail_from, sender, &raw, received_at)
             .await?;
         let queue = self.deps.outbound.is_some();
         if !queue && !prepared.external.is_empty() {
-            no_outbound(&id, prepared.external.len());
+            no_outbound(id, prepared.external.len());
         }
         let mut failed = prepared.failed;
         // Письмо локальным получателям — с заголовками трассировки; правила и пересылки — по нему.
@@ -1539,7 +1820,7 @@ impl Delivery {
             raw.clone()
         } else {
             let mut full = self
-                .submit_headers(&id, mail_from, rcpts, received_at)
+                .submit_headers(id, mail_from, rcpts, received_at)
                 .into_bytes();
             full.extend_from_slice(&raw);
             Bytes::from(full)
@@ -1552,20 +1833,27 @@ impl Delivery {
             steps: mut sieve_steps,
         } = self
             .apply_rules(
-                &id,
+                id,
                 mail_from,
                 &full,
                 &mut prepared.deliveries,
-                false,
+                &prepared.junk,
                 false,
             )
             .await?;
         let local_list = local_rcpts(&prepared.deliveries);
+        let spam = junk_rcpts(&prepared.deliveries, &prepared.junk);
+        // Приглашение из почтового клиента (решение 78) — от учётной записи отправителя конверта.
+        let itip_to = itip_targets(
+            sender.is_some() && self.itip.is_some(),
+            &prepared.deliveries,
+            &prepared.junk,
+        );
         if !prepared.deliveries.is_empty() {
             let local: Vec<String> = prepared.deliveries.iter().map(|(r, _)| r.clone()).collect();
             match self
                 .ingest_all(
-                    &id,
+                    id,
                     mail_from,
                     full.clone(),
                     prepared.deliveries,
@@ -1590,19 +1878,26 @@ impl Delivery {
                 Err(e) => return Err(e),
             }
         }
+        if let Some(account) = sender.filter(|_| !itip_to.is_empty()) {
+            let origin = ItipOrigin::Internal {
+                account,
+                principal: None,
+            };
+            self.apply_itip(id, &full, origin, &itip_to, &failed).await;
+        }
         let forward = self
             .forward(
-                &id,
+                id,
                 mail_from,
                 &full,
                 forward,
-                false,
+                filing,
                 received_at,
                 delivered,
             )
             .await?;
         let relayed = self
-            .relay(&id, mail_from, hops, false, received_at, None)
+            .relay(id, mail_from, hops, filing, received_at, None)
             .await?;
         sieve::merge_replies(&mut replies, relayed.replies);
         sieve_steps.extend(relayed.steps);
@@ -1631,23 +1926,75 @@ impl Delivery {
         if queue {
             push_unique(&mut out, prepared.relayed);
         }
-        self.queue_out(&id, mail_from, out, raw.clone()).await?;
-        self.queue_forward(&id, mail_from, forward, raw.clone(), None)
+        self.queue_out(id, mail_from, out, raw.clone()).await?;
+        self.queue_forward(id, mail_from, forward, raw.clone(), None)
             .await?;
         let mut steps = vec![Step::new(Ek::Receive, Dd::Accept, rcpts.to_vec())];
-        outcome_steps(&mut steps, &prepared.held, &local_list, &failed, false);
+        outcome_steps(&mut steps, &prepared.held, &local_list, &failed, &spam);
         steps.extend(sieve_steps);
-        self.send_replies(&id, mail_from, &full, replies, &mut steps)
+        self.send_replies(id, mail_from, &full, replies, &mut steps)
             .await;
-        if !failed.is_empty() && !mail_from.is_empty() {
-            let sent = self
-                .bounce(&id, mail_from, &failed, &raw, received_at)
-                .await;
+        if bounce && !failed.is_empty() && !mail_from.is_empty() {
+            let sent = self.bounce(id, mail_from, &failed, &raw, received_at).await;
             steps.push(dsn_step(mail_from, sent));
         }
         self.track(mail_from, tracking::message_id(&raw).as_deref(), steps)
             .await;
         tracing::info!(%id, count = rcpts.len(), "smtp: отправка вне сессии обработана");
+        Ok(statuses)
+    }
+
+    /// Отправка от имени пользователя вне сессии SMTP (JMAP `EmailSubmission/set`, CMP-04): получатели в
+    /// принятых доменах организации (адреса, псевдонимы и группы каталога)
+    /// доставляются сразу через [`MailStore::ingest`] — как входящая почта, без очереди, MX, MTA-STS и DANE;
+    /// внешние — в очередь исходящей почты ([`Deps::outbound`]) письмом `raw` без изменений. Пересылки модулей
+    /// на локальные адреса — сразу в ящики, на внешние — в очередь.
+    ///
+    /// Неизвестный локальный адрес и переполненный ящик — статус [`SubmitStatus::Failed`] и уведомление о
+    /// недоставке отправителю (как для входящей почты). Узел без очереди: внешние получатели —
+    /// `SubmitStatus::Failed` с временной ошибкой [`NO_OUTBOUND`] без уведомления (статус получает отправитель),
+    /// локальные доставляются. Ошибка хранилища, каталога или очереди — `Err`.
+    /// Другая организация (`tenant` ≠ `Deps::tenant`) — все получатели в очередь, как до CMP-04 (без очереди —
+    /// все `Failed`).
+    ///
+    /// Лимиты отправки ([`Delivery::with_send_limits`], SMTP-43): письмо учётной записи, превысившее за скользящий
+    /// час `send_per_hour` писем или `rcpts_per_hour` адресатов, не отправляется — все получатели `Failed` с
+    /// `451 4.7.1`, событие отказа — в журнал доставки.
+    pub async fn submit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<Submitted> {
+        if let Some(line) = self.over_send_limit(tenant, mail_from, rcpts, &raw).await? {
+            return Ok(Submitted::all(rcpts, SubmitStatus::Failed(line)));
+        }
+        let id = crate::server::next_id();
+        let requested = rcpts;
+        let Flowed {
+            mail_from,
+            rcpts,
+            raw,
+        } = match self.pre_submit(&id, tenant, mail_from, rcpts, raw).await? {
+            Pre::Done(status) => return Ok(Submitted::all(requested, status)),
+            Pre::Go(m) => m,
+        };
+        let (mail_from, rcpts) = (mail_from.as_str(), rcpts.as_slice());
+        if tenant != self.deps.tenant {
+            let status = match &self.deps.outbound {
+                Some(q) => {
+                    q.enqueue(tenant, mail_from, rcpts, raw).await?;
+                    SubmitStatus::Queued
+                }
+                None => {
+                    no_outbound(&id, rcpts.len());
+                    SubmitStatus::Failed(NO_OUTBOUND.into())
+                }
+            };
+            return Ok(Submitted::all(requested, status));
+        }
+        let statuses = self.dispatch(&id, mail_from, rcpts, raw, true).await?;
         // Статус — по получателям запроса: адрес, убранный правилом потока, считается обработанным.
         let statuses = requested
             .iter()
@@ -1660,6 +2007,49 @@ impl Delivery {
             })
             .collect();
         Ok(Submitted { rcpts: statuses })
+    }
+
+    /// Лимиты отправки в час вне сессии SMTP ([`Delivery::with_send_limits`], SMTP-43) — для [`Delivery::submit`] и
+    /// [`Delivery::schedule`]: отправитель `mail_from` — учётная запись организации узла, письмо — `send_per_hour`
+    /// писем и `rcpts_per_hour` адресатов её политики за скользящий час. Допущенное письмо учитывается сразу (до
+    /// отправки или постановки). Превышен предел — ответ `451 4.7.1` и событие отказа в журнале доставки. Без
+    /// лимитов, для другой организации и внешнего отправителя — без ограничения.
+    async fn over_send_limit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: &Bytes,
+    ) -> Result<Option<String>> {
+        let Some(l) = &self.send_limits else {
+            return Ok(None);
+        };
+        if tenant != self.deps.tenant {
+            return Ok(None);
+        }
+        let Some(account) = self.sender_by_address(mail_from).await? else {
+            return Ok(None);
+        };
+        let policy = self.account_policy(tenant, account).await?;
+        let key = account.to_string();
+        let now = Instant::now();
+        let exceeded = if !l.allow_message_at(policy.send_per_hour_or_default(), &key, now) {
+            limits::MESSAGES_EXCEEDED
+        } else if !l.allow_rcpts_at(policy.rcpts_per_hour_or_default(), &key, rcpts.len(), now) {
+            limits::RCPTS_EXCEEDED
+        } else {
+            l.record_at(self.max_tracked, &key, rcpts.len(), now);
+            return Ok(None);
+        };
+        let line = format!("451 4.7.1 {exceeded}");
+        let step = Step::new(Ek::Reject, Dd::Defer, rcpts.to_vec()).reason(line.clone());
+        self.track(mail_from, tracking::message_id(raw).as_deref(), vec![step])
+            .await;
+        tracing::info!(
+            rcpts = rcpts.len(),
+            "smtp: отправка вне сессии отклонена лимитом в час"
+        );
+        Ok(Some(line))
     }
 
     /// Правила Sieve получателей письма `raw` (SMTP-31): доставка с адресом получателя заменяется доставками в папки
@@ -1676,7 +2066,7 @@ impl Delivery {
         mail_from: &str,
         raw: &Bytes,
         deliveries: &mut Vec<(String, MailDelivery)>,
-        junk: bool,
+        junk: &HashSet<AccountId>,
         over: bool,
     ) -> Result<Sieved> {
         let mut out = Sieved::default();
@@ -1768,7 +2158,9 @@ impl Delivery {
                 });
             }
             match outcome.vacation {
-                Some(_) if junk => notes.push("auto-reply skipped: junk".into()),
+                Some(_) if junk.contains(&d.account) => {
+                    notes.push("auto-reply skipped: junk".into())
+                }
                 Some(reply) => out.replies.push((scope, reply)),
                 None => {}
             }
@@ -1801,7 +2193,7 @@ impl Delivery {
         id: &str,
         mail_from: &str,
         hops: Vec<Hop>,
-        junk: bool,
+        filing: &Filing,
         received_at: OffsetDateTime,
         ip: Option<std::net::IpAddr>,
     ) -> Result<Sieved> {
@@ -1811,12 +2203,12 @@ impl Delivery {
         while let Some(hop) = hops.pop_front() {
             let over = done >= self.redirect_total;
             done = done.saturating_add(1);
-            let mut p = self.prepare(id, &hop.to, junk, Origin::Module).await?;
+            let mut p = self.prepare(id, &hop.to, filing, Origin::Module).await?;
             let mut external = std::mem::take(&mut p.external);
             push_unique(&mut external, std::mem::take(&mut p.relayed));
             let delivered = accounts_of(&p.deliveries);
             let sieved = self
-                .apply_rules(id, mail_from, &hop.raw, &mut p.deliveries, junk, over)
+                .apply_rules(id, mail_from, &hop.raw, &mut p.deliveries, &p.junk, over)
                 .await?;
             if !p.deliveries.is_empty() {
                 let mut ignored = Vec::new();
@@ -1838,7 +2230,7 @@ impl Delivery {
                                 mail_from,
                                 &hop.raw,
                                 ingested.forward,
-                                junk,
+                                filing,
                                 received_at,
                                 delivered,
                             )
@@ -1957,8 +2349,9 @@ impl Delivery {
                     raw: sieve::stamp(&raw, &sieve::chain_token(from)),
                     to: vec![to.to_owned()],
                 };
+                let filing = Filing::new(false, false, "", &hop.raw);
                 let sieved = self
-                    .relay(id, "", vec![hop], false, OffsetDateTime::now_utc(), None)
+                    .relay(id, "", vec![hop], &filing, OffsetDateTime::now_utc(), None)
                     .await?;
                 Ok(("delivered", sieved.steps))
             }
@@ -2022,6 +2415,21 @@ impl Outbound for Delivery {
         raw: Bytes,
     ) -> Result<Submitted> {
         Delivery::submit(self, tenant, mail_from, rcpts, raw).await
+    }
+
+    async fn schedule(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+        release_at: OffsetDateTime,
+    ) -> Result<QueueId> {
+        Delivery::schedule(self, tenant, mail_from, rcpts, raw, release_at).await
+    }
+
+    async fn cancel_scheduled(&self, tenant: TenantId, queue: QueueId) -> Result<()> {
+        Delivery::cancel_scheduled(self, tenant, queue).await
     }
 }
 
@@ -2101,6 +2509,17 @@ impl DsnSink for Delivery {
 
 #[async_trait]
 impl Handler for Delivery {
+    async fn policy(&self, principal: &Principal) -> Result<Policy> {
+        self.account_policy(principal.tenant, principal.account)
+            .await
+    }
+
+    async fn limited(&self, env: &Envelope, reply: &Reply) {
+        let step = Step::new(Ek::Reject, tracking::decision(reply), env.rcpts.clone())
+            .reason(tracking::reason(reply));
+        self.track(&env.mail_from, None, vec![step]).await;
+    }
+
     async fn rcpt(&self, env: &Envelope, rcpt: &str) -> Reply {
         let r = self.check_rcpt(env, rcpt).await;
         if !is_positive(&r) {
@@ -2252,6 +2671,20 @@ fn local_rcpts(deliveries: &[(String, MailDelivery)]) -> Vec<String> {
     out
 }
 
+/// Получатели, письмо которым доставляется в «Спам» (учётные записи `junk`).
+fn junk_rcpts(deliveries: &[(String, MailDelivery)], junk: &HashSet<AccountId>) -> Vec<String> {
+    let mut out = Vec::new();
+    push_unique(
+        &mut out,
+        deliveries
+            .iter()
+            .filter(|(r, d)| !r.is_empty() && junk.contains(&d.account))
+            .map(|(r, _)| r.clone())
+            .collect(),
+    );
+    out
+}
+
 /// События журнала доставки после приёма: модерация, доставка в ящики (`local` без `failed`), отказы
 /// получателям.
 fn outcome_steps(
@@ -2259,7 +2692,7 @@ fn outcome_steps(
     held: &[(String, DistributionGroup)],
     local: &[String],
     failed: &[dsn::Recipient],
-    junk: bool,
+    junk: &[String],
 ) {
     for (rcpt, _) in held {
         steps.push(
@@ -2271,13 +2704,13 @@ fn outcome_steps(
         .filter(|r| !failed.iter().any(|f| f.address.eq_ignore_ascii_case(r)))
         .cloned()
         .collect();
-    if !delivered.is_empty() {
-        let step = Step::new(Ek::Deliver, Dd::Accept, delivered);
-        steps.push(if junk {
-            step.reason("junk folder")
-        } else {
-            step
-        });
+    let (spam, inbox): (Vec<String>, Vec<String>) =
+        delivered.into_iter().partition(|r| junk.contains(r));
+    if !inbox.is_empty() {
+        steps.push(Step::new(Ek::Deliver, Dd::Accept, inbox));
+    }
+    if !spam.is_empty() {
+        steps.push(Step::new(Ek::Deliver, Dd::Accept, spam).reason("junk folder"));
     }
     for f in failed {
         steps.push(
@@ -2328,6 +2761,36 @@ pub(crate) async fn read_blob(blobs: &dyn BlobStore, key: &tp_contracts::BlobKey
     Ok(chunks.concat().into())
 }
 
+/// Откуда письмо с iTIP и чем подтверждается его `From` ([`Delivery::with_itip`]).
+#[derive(Debug, Clone, Copy)]
+enum ItipOrigin<'a> {
+    /// smtp-in (iMIP, SMTP-33): письмо прошло DMARC.
+    Imip { dmarc_pass: bool },
+    /// Почтовый клиент (submission, [`Delivery::submit`]; решение 78): учётная запись отправителя и субъект сеанса
+    /// submission.
+    Internal {
+        account: AccountId,
+        principal: Option<&'a Principal>,
+    },
+}
+
+/// Получатели сообщения iTIP: доставки с адресом получателя (не копии модулей) вне «Спама»; при `enabled` = ложь —
+/// никого.
+fn itip_targets(
+    enabled: bool,
+    deliveries: &[(String, MailDelivery)],
+    junk: &HashSet<AccountId>,
+) -> Vec<(String, AccountId)> {
+    if !enabled {
+        return Vec::new();
+    }
+    deliveries
+        .iter()
+        .filter(|(r, d)| !r.is_empty() && !junk.contains(&d.account))
+        .map(|(r, d)| (r.clone(), d.account))
+        .collect()
+}
+
 /// Учётная запись отправителя транзакции: аутентифицированный пользователь организации; smtp-in — внешний.
 fn sender_account(env: &Envelope, tenant: TenantId) -> Option<AccountId> {
     env.principal
@@ -2352,6 +2815,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 mod moderation;
+mod scheduled;
 
 #[cfg(test)]
 mod tests;

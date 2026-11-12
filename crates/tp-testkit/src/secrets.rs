@@ -1,7 +1,7 @@
 //! In-memory хранилище секретов (CONTRACTS.md#Secrets; решение 2026-10-30).
 //!
 //! [`MemSecretStore`] заменяет OpenBao/Vault в тестах полос: секреты задаёт тест ([`MemSecretStore::set`],
-//! [`MemSecretStore::set_dynamic`]), аренды динамических секретов истекают по [`Clock`] и отзываются
+//! [`MemSecretStore::set_dynamic`]) или код через `put`, аренды динамических секретов истекают по [`Clock`] и отзываются
 //! ([`MemSecretStore::revoke`]), политика запрещает пути ([`MemSecretStore::forbid`]), недоступность —
 //! [`MemSecretStore::seal`] и [`MemSecretStore::fail_next`].
 
@@ -45,11 +45,25 @@ struct State {
     sealed: bool,
     faults: VecDeque<Error>,
     gets: u64,
+    puts: u64,
     renews: u64,
 }
 
 impl State {
     /// Ошибка недоступности: запечатано или очередная инъецированная ошибка.
+    /// Путь не запрещён политикой ([`MemSecretStore::forbid`]).
+    fn allowed(&self, secret: &SecretRef) -> Result<()> {
+        let path = secret.path();
+        let denied = self.forbidden.iter().any(|p| {
+            path.strip_prefix(p.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        });
+        if denied {
+            return Err(Error::Forbidden);
+        }
+        Ok(())
+    }
+
     fn fault(&mut self) -> Result<()> {
         if self.sealed {
             return Err(Error::UNAVAILABLE);
@@ -90,7 +104,7 @@ impl MemSecretStore {
 
     /// Задаёт статическое поле секрета (замена значения — ротация: следующее `get` вернёт новое).
     pub fn set(&self, secret: &SecretRef, value: impl Into<String>) {
-        self.put(secret, Value::Static(value.into()));
+        self.insert(secret, Value::Static(value.into()));
     }
 
     /// Задаёт динамическое поле: каждое `get` выдаёт новую аренду на `ttl` (как database secrets engine).
@@ -101,7 +115,7 @@ impl MemSecretStore {
         ttl: Duration,
         renewable: bool,
     ) {
-        self.put(
+        self.insert(
             secret,
             Value::Dynamic {
                 value: value.into(),
@@ -111,7 +125,7 @@ impl MemSecretStore {
         );
     }
 
-    fn put(&self, secret: &SecretRef, value: Value) {
+    fn insert(&self, secret: &SecretRef, value: Value) {
         lock(&self.state)
             .secrets
             .entry(secret.path().to_owned())
@@ -130,7 +144,7 @@ impl MemSecretStore {
         }
     }
 
-    /// Запрещает политикой путь `path` и всё под ним (`<path>/…`): `get` — `Forbidden`.
+    /// Запрещает политикой путь `path` и всё под ним (`<path>/…`): `get` и `put` — `Forbidden`.
     pub fn forbid(&self, path: &str) {
         lock(&self.state).forbidden.insert(path.to_owned());
     }
@@ -165,7 +179,7 @@ impl MemSecretStore {
         lock(&self.state).sealed = false;
     }
 
-    /// Следующая операция (`get` или `renew`) вернёт `err` (очередь, по одной ошибке на операцию).
+    /// Следующая операция (`get`, `put` или `renew`) вернёт `err` (очередь, по одной ошибке на операцию).
     pub fn fail_next(&self, err: Error) {
         lock(&self.state).faults.push_back(err);
     }
@@ -188,6 +202,11 @@ impl MemSecretStore {
         lock(&self.state).gets
     }
 
+    /// Число вызовов `put` (включая неудачные).
+    pub fn puts(&self) -> u64 {
+        lock(&self.state).puts
+    }
+
     /// Число вызовов `renew` (включая неудачные).
     pub fn renews(&self) -> u64 {
         lock(&self.state).renews
@@ -207,14 +226,8 @@ impl SecretStore for MemSecretStore {
         let mut st = lock(&self.state);
         st.gets += 1;
         st.fault()?;
+        st.allowed(secret)?;
         let path = secret.path();
-        let denied = st.forbidden.iter().any(|p| {
-            path.strip_prefix(p.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-        });
-        if denied {
-            return Err(Error::Forbidden);
-        }
         let value = st
             .secrets
             .get(path)
@@ -241,6 +254,25 @@ impl SecretStore for MemSecretStore {
                 Ok(Secret::new(value).with_lease(SecretLease { id, ttl, renewable }))
             }
         }
+    }
+
+    /// Статическое поле (как KV v2); поле, заданное динамическим, — `Invalid`.
+    async fn put(&self, secret: &SecretRef, value: &Secret) -> Result<()> {
+        let mut st = lock(&self.state);
+        st.puts += 1;
+        st.fault()?;
+        st.allowed(secret)?;
+        let fields = st.secrets.entry(secret.path().to_owned()).or_default();
+        if matches!(fields.get(secret.field()), Some(Value::Dynamic { .. })) {
+            return Err(Error::invalid(format!(
+                "secret {secret}: dynamic secret, writes go to KV v2"
+            )));
+        }
+        fields.insert(
+            secret.field().to_owned(),
+            Value::Static(value.expose().to_owned()),
+        );
+        Ok(())
     }
 
     async fn renew(&self, lease: &SecretLease) -> Result<SecretLease> {
@@ -378,6 +410,61 @@ mod tests {
         store.clear_faults();
         assert!(store.get(&db).await.is_ok());
         assert_eq!((store.gets(), store.renews()), (5, 3));
+    }
+
+    #[tokio::test]
+    async fn put_then_get_keeps_other_fields() {
+        let store = MemSecretStore::default();
+        let key = r("thepost/tls#key");
+        store.set(&r("thepost/tls#chain"), "chain");
+        store.put(&key, &Secret::new("k1")).await.expect("put");
+        assert_eq!(store.get(&key).await.expect("get").expose(), "k1");
+        store.put(&key, &Secret::new("k2")).await.expect("rotate");
+        assert_eq!(store.get(&key).await.expect("get").expose(), "k2");
+        assert_eq!(
+            store
+                .get(&r("thepost/tls#chain"))
+                .await
+                .expect("chain")
+                .expose(),
+            "chain"
+        );
+        store
+            .put(&r("thepost/fresh#key"), &Secret::new("new"))
+            .await
+            .expect("new path");
+        assert_eq!(
+            store
+                .get(&r("thepost/fresh#key"))
+                .await
+                .expect("get")
+                .expose(),
+            "new"
+        );
+
+        store.forbid("thepost/admin");
+        assert_eq!(
+            store
+                .put(&r("thepost/admin#token"), &Secret::new("x"))
+                .await,
+            Err(Error::Forbidden)
+        );
+        let dynamic = r("database/creds/thepost#password");
+        store.set_dynamic(&dynamic, "dyn", TTL, true);
+        assert!(matches!(
+            store.put(&dynamic, &Secret::new("x")).await,
+            Err(Error::Invalid(_))
+        ));
+        store.seal();
+        assert!(matches!(
+            store.put(&key, &Secret::new("k3")).await,
+            Err(Error::Unavailable { .. })
+        ));
+        store.unseal();
+        store.fail_next(Error::UNAVAILABLE);
+        assert!(store.put(&key, &Secret::new("k3")).await.is_err());
+        assert_eq!(store.get(&key).await.expect("get").expose(), "k2");
+        assert_eq!(store.puts(), 7);
     }
 
     #[tokio::test]

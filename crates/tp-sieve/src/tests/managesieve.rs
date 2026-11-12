@@ -1,12 +1,15 @@
 //! Сеанс ManageSieve через `tokio::io::duplex` (SIEVE-08): приветствие, `STARTTLS`, вход, лимиты.
 
 use std::collections::BTreeSet;
+use std::net::{IpAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tp_contracts::auth::Principal;
@@ -14,13 +17,17 @@ use tp_contracts::meta::AccountScope;
 use tp_contracts::sieve::SieveLimits;
 use tp_contracts::tls::Profile;
 use tp_contracts::{AccountId, Result, TenantId};
+use tp_platform::listen::{EndpointConfig, Listener};
 use tp_testkit::fakes::{FakeAuthenticator, FakeSasl};
 use tp_testkit::sieve::MemSieve;
 
 use crate::SieveConfig;
-use crate::managesieve::{Deps, Session, SessionCtx, Transport};
+use crate::managesieve::{Deps, Session, SessionCtx, Transport, serve};
 
 /// Соединение теста: «TLS» — признак, рукопожатия нет.
+/// Адрес клиента соединений стенда.
+const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7));
+
 struct TestConn {
     io: DuplexStream,
     tls: bool,
@@ -38,6 +45,10 @@ impl Transport for TestConn {
         self.tls
     }
 
+    fn peer(&self) -> IpAddr {
+        PEER
+    }
+
     fn can_starttls(&self) -> bool {
         self.certs && !self.tls
     }
@@ -53,6 +64,8 @@ pub(super) struct Stand {
     buf: Vec<u8>,
     pub(super) store: Arc<MemSieve>,
     pub(super) scope: AccountScope,
+    /// Проверка учётных данных: адреса клиентов вызовов (CTR-57).
+    pub(super) auth: FakeAuthenticator,
     pub(super) shutdown: CancellationToken,
     session: JoinHandle<()>,
 }
@@ -87,6 +100,27 @@ impl Setup {
     }
 
     pub(super) fn start(self) -> Stand {
+        let (tls, certs) = (self.tls, self.certs);
+        let parts = self.parts();
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let conn = TestConn {
+            io: server,
+            tls,
+            certs,
+        };
+        Stand {
+            io: client,
+            buf: Vec::new(),
+            store: parts.store,
+            scope: parts.scope,
+            auth: parts.auth,
+            shutdown: parts.ctx.shutdown.clone(),
+            session: tokio::spawn(Session::new(parts.ctx, conn).run()),
+        }
+    }
+
+    /// Контекст сеансов стенда: хранилище и учётная запись `user` / `secret` (токен `token`).
+    fn parts(self) -> Parts {
         let scope = AccountScope {
             tenant: TenantId::DEFAULT,
             account: AccountId::new(),
@@ -102,31 +136,30 @@ impl Setup {
         auth.add_password("user", "secret", principal.clone());
         auth.add_token("token", principal);
         let store = Arc::new(MemSieve::new().with_limits(self.limits));
-        let shutdown = CancellationToken::new();
         let ctx = Arc::new(SessionCtx {
             config: Arc::new(self.config),
             deps: Deps {
-                sasl: Arc::new(FakeSasl::new(Arc::new(auth))),
+                sasl: Arc::new(FakeSasl::new(Arc::new(auth.clone()))),
                 store: store.clone(),
             },
             profile: self.profile,
-            shutdown: shutdown.clone(),
+            shutdown: CancellationToken::new(),
         });
-        let (client, server) = tokio::io::duplex(1 << 20);
-        let conn = TestConn {
-            io: server,
-            tls: self.tls,
-            certs: self.certs,
-        };
-        Stand {
-            io: client,
-            buf: Vec::new(),
+        Parts {
+            ctx,
             store,
             scope,
-            shutdown,
-            session: tokio::spawn(Session::new(ctx, conn).run()),
+            auth,
         }
     }
+}
+
+/// Части стенда: контекст сеансов и то, что тесты проверяют.
+struct Parts {
+    ctx: Arc<SessionCtx>,
+    store: Arc<MemSieve>,
+    scope: AccountScope,
+    auth: FakeAuthenticator,
 }
 
 impl Stand {
@@ -452,4 +485,87 @@ async fn idle_timeout_and_shutdown() {
     s.shutdown.cancel();
     assert_eq!(s.response().await, "BYE \"Server is shutting down\"\r\n");
     s.closed().await;
+}
+
+/// SIEVE-12: `AUTHENTICATE PLAIN` — в проверку учётных данных приходит адрес клиента сессии, и при неудаче.
+#[tokio::test]
+async fn authenticate_passes_client_address() {
+    let mut s = Setup::tls().start();
+    s.response().await;
+    let bad = format!("AUTHENTICATE \"PLAIN\" \"{}\"", plain("wrong"));
+    assert_eq!(s.cmd(&bad).await, "NO \"Authentication failed\"\r\n");
+    s.login().await;
+    assert_eq!(s.auth.peers(), [Some(PEER); 2]);
+}
+
+/// Заголовок PROXY protocol v2 балансировщика (команда PROXY, TCP поверх IPv4): клиент `client` → `local`.
+fn proxy_v2(client: SocketAddrV4, local: SocketAddrV4) -> Vec<u8> {
+    // Сигнатура v2, затем версия 2 и команда PROXY, TCP поверх IPv4, длина адресов 12 байт.
+    let mut h = vec![
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, 0x21, 0x11, 0, 12,
+    ];
+    h.extend_from_slice(&client.ip().octets());
+    h.extend_from_slice(&local.ip().octets());
+    h.extend_from_slice(&client.port().to_be_bytes());
+    h.extend_from_slice(&local.port().to_be_bytes());
+    h
+}
+
+/// Строки ответа сервера до завершающей `OK` / `NO` / `BYE` включительно.
+async fn tcp_response(r: &mut BufReader<OwnedReadHalf>) -> String {
+    let mut out = String::new();
+    loop {
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), r.read_line(&mut line))
+            .await
+            .expect("ответ сервера")
+            .expect("чтение");
+        assert!(n > 0, "соединение закрыто: {out:?}");
+        out.push_str(&line);
+        if ["OK", "NO", "BYE"].iter().any(|p| line.starts_with(p)) {
+            return out;
+        }
+    }
+}
+
+/// SIEVE-12: за балансировщиком с PROXY protocol в проверку учётных данных приходит адрес клиента из заголовка,
+/// а не адрес балансировщика (соединение слушателя платформы, [`serve`]).
+#[tokio::test]
+async fn authenticate_behind_proxy_passes_client_address() {
+    let parts = Setup {
+        profile: Profile::Dev,
+        ..Setup::default()
+    }
+    .parts();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = tcp.local_addr().expect("addr");
+    let mut ep = EndpointConfig::new(addr);
+    ep.proxy_protocol = true;
+    let listener = Listener::from_tcp(tcp, &ep, None).expect("listener");
+    let server = tokio::spawn(serve(parts.ctx.clone(), listener, Duration::ZERO));
+
+    let client: SocketAddrV4 = "203.0.113.7:4242".parse().expect("addr");
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let (r, mut w) = tcp.into_split();
+    let mut r = BufReader::new(r);
+    w.write_all(&proxy_v2(client, "127.0.0.1:4190".parse().expect("addr")))
+        .await
+        .expect("proxy header");
+    assert!(
+        tcp_response(&mut r)
+            .await
+            .ends_with("OK \"ManageSieve ready\"\r\n")
+    );
+    w.write_all(format!("AUTHENTICATE \"PLAIN\" \"{}\"\r\n", plain("secret")).as_bytes())
+        .await
+        .expect("запись");
+    assert_eq!(tcp_response(&mut r).await, "OK \"Authenticated\"\r\n");
+    assert_eq!(
+        parts.auth.peers(),
+        [Some(IpAddr::V4(*client.ip()))],
+        "адрес клиента из заголовка PROXY, не балансировщика"
+    );
+
+    parts.ctx.shutdown.cancel();
+    server.await.expect("serve");
 }

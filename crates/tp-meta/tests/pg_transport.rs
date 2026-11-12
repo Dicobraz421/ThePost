@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tp_contracts::bus::{Event, EventKind};
-use tp_contracts::meta::{AccountStore, AccountUpsert};
+use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
 use tp_contracts::transport::{
     AcceptedDomain, AddressPattern, ClusterTransport, DestinationPolicy, DomainKind, RewriteRule,
     SourceKind, SourceMatch, TenantTransport, TlsRequirement, TransportStore, TrustedSource,
@@ -102,7 +102,7 @@ impl TransportStore for WithTenants {
 
 /// Транзакция организации от имени роли приложения `thepost_app` (суперпользователь тестов обходит RLS).
 async fn app_tx(
-    pool: &sqlx::PgPool,
+    pool: &tp_meta::pool::DbPool,
     tenant: TenantId,
 ) -> sqlx::Transaction<'static, sqlx::Postgres> {
     let mut tx = schema::begin(pool, tenant).await.expect("begin");
@@ -190,6 +190,8 @@ async fn conformance_and_cluster_signals() {
             display_name: "User".into(),
             external_id: None,
             enabled: true,
+            aliases: Vec::new(),
+            kind: AccountKind::User,
         },
     )
     .await

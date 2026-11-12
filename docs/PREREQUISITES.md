@@ -48,11 +48,12 @@
 | 25 | приём почты (STARTTLS) | `openssl s_client -connect <сервер>:25 -starttls smtp` | внешняя почта не приходит | [INSTALL](INSTALL.md#что-понадобится) |
 | 465, 587 | отправка с входом (TLS, STARTTLS) | `openssl s_client -connect <сервер>:465` | клиенты не отправляют | [INSTALL](INSTALL.md#настройка-клиентов) |
 | 993, 143 | IMAP (TLS, STARTTLS) | `openssl s_client -connect <сервер>:993` | клиенты не читают почту | [INSTALL](INSTALL.md#настройка-клиентов) |
+| 4190 | ManageSieve — правила фильтрации (STARTTLS) | `openssl s_client -connect <сервер>:4190 -starttls sieve` | клиенты не меняют правила фильтрации | [INSTALL](INSTALL.md#настройка-клиентов) |
 | 443 | JMAP, автонастройка | `curl -si https://<сервер>/.well-known/jmap` → `401` | JMAP-клиенты не подключаются | [deploy/README](../deploy/README.md#эталон-smb-в-контейнерах-профиль-smb) |
-| 80 | только выпуск сертификата Let's Encrypt (`certbot`, HTTP-01) | `curl -I http://<сервер>/` во время выпуска | сертификат не выпускается | [INSTALL](INSTALL.md#рабочий-сервер-ansible) |
+| 80 | только выпуск и продление сертификата Let's Encrypt (встроенный ACME, HTTP-01; `thepost_tls_mode: acme`) | `curl -I http://<сервер>/` во время выпуска | сертификат не выпускается | [INSTALL](INSTALL.md#рабочий-сервер-ansible) |
 
-Порты ниже 1024 узел слушает с `CAP_NET_BIND_SERVICE` (`bind-capability.conf`, по умолчанию) или сокетами systemd —
-второй вариант пока не работает (TODO(PLT-16)). Проверка: `privileges.capabilities` — `OK`; лишние capabilities — `WARN`.
+Порты ниже 1024 слушает только systemd (юниты `thepost-*.socket`, решение 102) и передаёт узлу готовые сокеты — у
+процесса нет ни одной capability. Проверка: `privileges.capabilities` — `OK`; любые capabilities — `WARN`.
 
 Исходящие:
 
@@ -106,7 +107,7 @@ PTR задаёт владелец адреса (провайдер, хостин
 |---|---|---|---|
 | Сертификат клиентских протоколов (секция `tls`) читается и действителен | `tls.certificate` | истёк — `FAIL`; < 21 сут. (`doctor.cert_warn_before`) — `WARN`; файла нет — `WARN` (при `acme` — `SKIP` до выпуска) | [`doctor_dns.rs`](../crates/thepost/src/doctor_dns.rs) |
 | Сертификат покрывает `smtp.hostname` | `tls.names` | `WARN`: клиенты не проверят TLS | там же |
-| Способ выпуска — `thepost_tls_mode`: `certbot` (порт 80, DNS на ВМ), `acme`, `files`, `internal` (только стенд) | прогон плейбука | плейбук отклоняет неверный режим или пустой `thepost_acme_email` | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
+| Способ выпуска — `thepost_tls_mode`: `acme` (по умолчанию; порт 80, DNS на ВМ), `files`, `internal` (только стенд) | прогон плейбука | плейбук отклоняет неверный режим или пустой `thepost_acme_email` | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
 | Клиенты — TLS 1.3; TLS 1.2 только настройкой `tls.min_version: "1.2"` | `openssl s_client -tls1_2 -connect <сервер>:993` | старые клиенты без TLS 1.3 не подключатся | [S6 п. 6.2](spec/S6.md), [`tls.rs`](../crates/tp-platform/src/tls.rs) |
 | Внутренние каналы (PostgreSQL, S3, OpenBao, служебный HTTP) — только TLS с проверкой имени | `database.tls`, `secrets.config` | открытый канал — только профиль `dev` (`allow_plaintext`) с `WARN` | [S6 п. 6.2](spec/S6.md), [решение 2026-10-30](decisions/2026-10-30-owner-answers.md) |
 | Эталон SMB: внутренний CA `thepost_pki` (CA — 10 лет, сертификат служб — 825 сут.). Прогон плейбука перевыпускает сертификат тем же CA, если до конца срока < 90 сут. (`thepost_pki_renew_before`); CA сам не перевыпускается: истёк — плейбук останавливается с инструкцией (удалить `/etc/thepost/pki`, повторить прогон, раздать новый `ca.pem` клиентам вне ВМ) | `openssl x509 -enddate -noout -in /etc/thepost/pki/internal.pem` | по истечении — внутренние каналы не установятся (проверка в `doctor` — APP-25) | [роль `thepost_pki`](../deploy/ansible/roles/thepost_pki/defaults/main.yml), [решение 27](decisions/2026-11-11-stage2-followups.md) |
@@ -174,7 +175,7 @@ PTR задаёт владелец адреса (провайдер, хостин
 |---|---|---|---|
 | Rspamd с Milter на `127.0.0.1:11332` (worker proxy); эталон — пакет `rspamd.com` (Ansible), образ `rspamd/rspamd:3.11.1` (Compose) | `ss -ltn \| grep 11332`, `systemctl is-active rspamd` | по умолчанию (`on_failure: accept`) письмо принимается без проверки с заголовком `X-ThePost-Milter: <имя>; unavailable`; `tempfail` — `451 4.7.1` | [роль `rspamd`](../deploy/ansible/roles/rspamd/defaults/main.yml), [`tp-smtp/src/config.rs`](../crates/tp-smtp/src/config.rs) |
 | По желанию — clamav-milter на `127.0.0.1:7357` (`thepost_clamav: true`), заражённое — `Reject`; RAM — +2 GB (S8) | `systemctl is-active clamav-milter` | без баз freshclam clamd не запускается: роль ждёт до 10 мин | [роль `clamav_milter`](../deploy/ansible/roles/clamav_milter/defaults/main.yml), [S8](spec/S8.md) |
-| Почту пользователей (submission) проверять — `thepost_milter_submission: true` | `config.yaml`: `smtp.milter.filters[].submission` | по умолчанию проверяется только входящая | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
+| Почту пользователей (submission и отправка JMAP) проверять — `thepost_milter_submission: true` | `config.yaml`: второй элемент `smtp.milter.filters[]` того же адреса с `direction: outbound` | по умолчанию проверяется только входящая; при недоступности фильтра исходящей почты — `451` (`on_failure: tempfail`) | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
 
 `doctor` доступность фильтров Milter не проверяет.
 
@@ -192,11 +193,11 @@ PTR задаёт владелец адреса (провайдер, хостин
 | Требование | Проверка | При нарушении | Источник |
 |---|---|---|---|
 | Отдельная учётная запись `thepost` (sysusers), не root | `privileges.user` | root — `FAIL`: сервер не стартует (кроме `privileges.allow_root`, тогда `WARN`) | [`privileges.rs`](../crates/tp-platform/src/privileges.rs) |
-| Capabilities — нет, кроме `cap_net_bind_service` | `privileges.capabilities` | лишние — `WARN` | там же |
+| Capabilities — нет (порты ниже 1024 — сокеты systemd) | `privileges.capabilities` | лишние — `WARN` | там же |
 | `NoNewPrivileges=yes` (K8s — `allowPrivilegeEscalation: false`) | `privileges.no_new_privs` | `WARN` | там же |
 | `/etc/thepost` — владелец root; `config.yaml` — `0640 root:thepost`, секретов в нём нет — только ссылки `{ secret: … }` | `stat -c '%a %U:%G' /etc/thepost/config.yaml`; `config.load` | значение секрета в открытом виде — ошибка проверки конфигурации и запуска | [`thepost.service`](../deploy/systemd/thepost.service), [S5 п. 5.5](spec/S5.md) |
 | `secret_id` — `/etc/thepost/credentials/openbao-secret-id`, `0600 root`, процессу — через `LoadCredential=`; `role_id` — `/etc/thepost/openbao/role_id` | `stat`; `secrets.login` | `FAIL` входа в OpenBao | [deploy/README](../deploy/README.md#установка-под-systemd-smb-enterprise-вм) |
-| Hardening юнита не ослаблен | `systemd-analyze security thepost.service` — не хуже 2.0 (с `bind-capability.conf` — 1.6) | — | там же |
+| Hardening юнита не ослаблен | `systemd-analyze security thepost.service` — не хуже 2.0 (ожидается 1.2) | — | там же |
 
 `privileges.*` зависят от окружения процесса: `sudo -u thepost thepost doctor` не видит ограничений юнита. Точная
 проверка — `systemd-run` с параметрами службы ([DEP-08](manual-tests/DEP-08.md) шаг 3).
@@ -217,13 +218,53 @@ PTR задаёт владелец адреса (провайдер, хостин
 Учётные записи (источник — каталог), конфигурацию (система управления конфигурацией) и очередь SMTP (вместе с
 PostgreSQL) продукт отдельно не копирует ([S5 п. 5.3](spec/S5.md)).
 
+## Astra Linux SE и РЕД ОС: копии и антивирус
+
+Решения владельца 90–91. В репозиториях этих ОС нет части готовых средств, которыми эталон пользуется на Debian,
+Ubuntu и AlmaLinux. Эталон ставит только пакеты из репозиториев самой ОС, поэтому на Astra он работает и с включённой ЗПС
+для служебных средств (сам `thepost`, OpenBao и PGDG подписывает заказчик — см. «Известные тонкости»).
+
+| Что | Debian, Ubuntu, AlmaLinux | Astra Linux SE 1.8 | РЕД ОС 8 |
+|---|---|---|---|
+| Копия каталога писем | restic: снимки, шифрование | **rsync**: зеркало, **без шифрования** | restic (есть в репозитории) |
+| Антивирус | ClamAV по Milter (`thepost_clamav: true`) | **нет ClamAV** — свой антивирус по Milter | **нет ClamAV** — свой антивирус по Milter |
+
+**Копия писем на Astra (rsync).** Зеркало каталога `/var/lib/thepost/blob` пишется как есть, без шифрования
+(`thepost_backup_blob_tool: rsync` ставится сам). Поэтому защищать нужно само хранилище копий:
+
+1. Отдельный диск или сервер копий — не тот диск, где лежат письма.
+2. Диск копий зашифрован средствами ОС (LUKS / `cryptsetup`, на Astra — штатно), ключ — вне сервера писем.
+3. Доступ к каталогу копий — только у root и учётной записи копирования; по сети — только по SSH.
+4. Проверка: `ls -ld <каталог копий>` — права `drwx------`; `lsblk -f` — у диска копий `crypto_LUKS`.
+
+База (pgBackRest) и снимок OpenBao шифруются на всех ОС одинаково — ключ в OpenBao.
+
+**Антивирус на Astra и РЕД ОС.** Сервер проверяет письма любым антивирусом с интерфейсом Milter (Касперский и
+Dr.Web для почтовых серверов его поддерживают). Эталон ставит `thepost_clamav: false`; свой антивирус подключите так:
+
+1. Установите и настройте антивирус по его инструкции, включите в нём Milter (например, на `127.0.0.1:7358`).
+2. В инвентаре Ansible добавьте фильтр рядом с Rspamd (список фильтров заменяется целиком — Rspamd укажите тоже):
+
+   ```yaml
+   thepost_config_extra:
+     smtp:
+       milter:
+         filters:
+           - { name: rspamd, address: "{{ thepost_rspamd_milter_address }}", direction: inbound }
+           - { name: antivirus, address: "127.0.0.1:7358", direction: inbound }
+   ```
+3. Повторите `ansible-playbook … smb.yml`.
+4. Проверка: `sudo -u thepost thepost doctor` — фильтр `antivirus` доступен; тестовое письмо с EICAR отклоняется.
+
+Без антивируса почта работает, вложения проверяет только Rspamd (без сигнатур вирусов).
+
 ## Известные тонкости
 
 - **PostgreSQL 16 — из PGDG** (Debian 12 и Astra Linux SE 1.8 — 15, Debian 13 — 17, Ubuntu 26.04 — 18): роль ставит
   пакеты `apt.postgresql.org` или `download.postgresql.org` (AlmaLinux); РЕД ОС 8 — `postgresql16-server` дистрибутива
   ([роль `postgresql`](../deploy/ansible/roles/postgresql/defaults/main.yml)).
 - **Astra Linux SE 1.8**: репозитории Astra закреплены (приоритет 900) — роль даёт PGDG приоритет 901
-  (`/etc/apt/preferences.d/thepost-pgdg.pref`); restic, certbot и ClamAV в репозиториях нет — копия каталога писем
+  (`/etc/apt/preferences.d/thepost-pgdg.pref`); restic и ClamAV в репозиториях нет — копия каталога писем
   rsync, сертификат — `thepost_tls_mode: acme` или `files`, `thepost_clamav: false`. ЗПС (замкнутая программная
   среда) не запустит неподписанные `thepost`, OpenBao и PGDG — эталон рассчитан на выключенную ЗПС; работа с PARSEC
   (МРД, МКЦ) и Landlock — проверить на ВМ ([DEP-19](manual-tests/DEP-19.md)).
@@ -231,15 +272,13 @@ PostgreSQL) продукт отдельно не копирует ([S5 п. 5.3](
   проверяет TLS в `get_url` Ansible («ASN1: NOT_ENOUGH_DATA») — пакет OpenBao роль загружает через `uri`; для
   `thepost_binary_url` — то же ограничение, ставьте бинарный файл с управляющей машины (`thepost_binary_src`)
   ([DEP-20](manual-tests/DEP-20.md)).
-- **AlmaLinux и RHEL**: Rspamd (`rspamd.com`), restic и certbot требуют EPEL — на AlmaLinux роль ставит
+- **AlmaLinux и RHEL**: Rspamd (`rspamd.com`) и restic требуют EPEL — на AlmaLinux роль ставит
   `epel-release`, на RHEL EPEL подключает администратор. AlmaLinux 10 и RHEL 10 — процессор x86-64-v3 (сборки PGDG и
   `rspamd.com` для EL10). Включённый firewalld — роль `thepost` открывает порты клиентских протоколов; SELinux — роль
   `pgbackrest` выставляет типы каталогам pgBackRest; работа под `enforcing` — проверить на ВМ
   ([DEP-20](manual-tests/DEP-20.md)).
 - **`postgres` и `pg_autoctl` запускаются юнитом напрямую**, без `pg_ctlcluster` на Perl (SRS 7.1, без
   интерпретаторов в работе) ([deploy/README](../deploy/README.md#эталон-smb-одной-командой-ansible)).
-- **Сокеты systemd пока не принимаются** (TODO(PLT-16)): `thepost_socket_activation: true` — узел не займёт порты;
-  рабочий вариант — `CAP_NET_BIND_SERVICE` ([deploy/README](../deploy/README.md#установка-под-systemd-smb-enterprise-вм)).
 - **Landlock и символьные ссылки**: Landlock проверяет цель ссылки — каталог цели должен быть в `confine.system_read`
   (Debian/Ubuntu: `/etc/ssl/certs/*.pem` → `/usr/share/ca-certificates` — уже в списке по умолчанию)
   ([`confine/mod.rs`](../crates/tp-sys/src/confine/mod.rs)).

@@ -4,7 +4,7 @@
 {% for n in range(1, stand_users | int + 1) %}
 {{ stand_user_prefix }}{{ n }}@{{ stand_domain }}:{{ stand_user_password }}
 {% endfor %}
-{% for name in stand_probe_accounts + [stand_big_mailbox] %}
+{% for name in stand_probe_accounts + [stand_big_mailbox, stand_bruteforce_account] %}
 {{ name }}@{{ stand_domain }}:{{ stand_user_password }}
 {% endfor %}
 {% endif %}

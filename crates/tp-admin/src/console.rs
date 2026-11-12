@@ -50,6 +50,9 @@ pub struct ConsoleConfig {
     pub asset_max_age: Duration,
     /// Дополнительные источники `connect-src` (поставщик OIDC, например `https://idp.example.org`); по умолчанию — нет.
     pub connect_src: Vec<String>,
+    /// Источники консоли на отдельном веб-сервере (`https://узел[:порт]`, архив `console/dist`): им Admin API
+    /// отвечает с заголовками CORS ([`crate::cors`]); по умолчанию — нет, заголовков CORS нет.
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for ConsoleConfig {
@@ -58,23 +61,29 @@ impl Default for ConsoleConfig {
             enabled: true,
             asset_max_age: Duration::from_secs(365 * 24 * 3600),
             connect_src: Vec::new(),
+            cors_origins: Vec::new(),
         }
     }
 }
 
 impl ConsoleConfig {
-    /// Проверяет значения: источник `connect_src` — `https://узел[:порт]` без пути и служебных знаков.
+    /// Проверяет значения: источники `connect_src` и `cors_origins` — `https://узел[:порт]` без пути и служебных знаков.
     pub fn check(&self) -> Result<()> {
-        for src in &self.connect_src {
-            let host = src.strip_prefix("https://").unwrap_or_default();
-            let ok = !host.is_empty()
-                && host
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
-            if !ok {
-                return Err(Error::invalid(format!(
-                    "admin.console: connect_src {src:?} — ожидается https://узел[:порт]"
-                )));
+        for (field, list) in [
+            ("connect_src", &self.connect_src),
+            ("cors_origins", &self.cors_origins),
+        ] {
+            for src in list {
+                let host = src.strip_prefix("https://").unwrap_or_default();
+                let ok = !host.is_empty()
+                    && host.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')
+                    });
+                if !ok {
+                    return Err(Error::invalid(format!(
+                        "admin.console: {field} {src:?} — ожидается https://узел[:порт]"
+                    )));
+                }
             }
         }
         Ok(())
@@ -327,8 +336,8 @@ mod tests {
         assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
         assert!(b.starts_with(b"<!doctype html>"));
 
-        // Маршрут с точкой в последнем сегменте (карточка домена) — тоже страница, а не 404.
-        let (s, h, b) = call(&cfg, dist, "/console/domains/example.org").await;
+        // Маршрут с точкой в последнем сегменте (карточка учётной записи) — тоже страница, а не 404.
+        let (s, h, b) = call(&cfg, dist, "/console/accounts/user@example.org").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
         assert!(b.starts_with(b"<!doctype html>"));

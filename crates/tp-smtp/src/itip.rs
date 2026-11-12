@@ -1,15 +1,17 @@
-//! Приём iMIP (RFC 6047, SRS 4.4, SMTP-33): письмо с частью `text/calendar; method=…` локальному получателю после
-//! доставки передаётся приёму iTIP учётной записи (`ItipDelivery`, [`crate::deliver::Delivery::with_itip`]).
+//! Приглашения iTIP в письмах (RFC 6047, SRS 4.4): письмо с частью `text/calendar; method=…` локальному получателю
+//! после доставки передаётся приёму iTIP учётной записи (`ItipDelivery`, [`crate::deliver::Delivery::with_itip`]) —
+//! извне (iMIP, SMTP-33) и из почтового клиента (submission, JMAP; решение 78, SMTP-36).
 //!
-//! Здесь — только то, что нужно до вызова: часть письма, метод и проверка отправителя. Отправитель — адрес `From`
-//! письма, прошедшего DMARC; от организатора (`REQUEST`, `CANCEL`, …) он должен совпадать с `ORGANIZER`, от
-//! участника (`REPLY`, `COUNTER`, `REFRESH`) — с одним из `ATTENDEE`. iCalendar целиком не разбирается (это делает
-//! реализация `ItipDelivery` на calcard): из объекта читаются только строки `METHOD`, `ORGANIZER` и `ATTENDEE`.
+//! Здесь — только то, что нужно до вызова: часть письма, метод и сверка `From` с участниками. От организатора
+//! (`REQUEST`, `CANCEL`, …) `From` должен совпадать с `ORGANIZER`, от участника (`REPLY`, `COUNTER`, `REFRESH`) — с
+//! одним из `ATTENDEE`. Доверие к самому `From` (DMARC у iMIP, принадлежность вошедшей учётной записи у письма из
+//! клиента) проверяет вызывающий. iCalendar целиком не разбирается (это делает реализация `ItipDelivery` на
+//! calcard): из объекта читаются только строки `METHOD`, `ORGANIZER` и `ATTENDEE`.
 
 use mail_parser::{MessageParser, MimeHeaders};
 use tp_contracts::schedule::ItipMethod;
 
-/// Сообщение iTIP из письма с проверенным отправителем.
+/// Сообщение iTIP из письма, `From` которого совпал с организатором или участником.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Imip {
     /// Адрес `From` (строчными), совпавший с `ORGANIZER` или `ATTENDEE`.
@@ -20,9 +22,8 @@ pub(crate) struct Imip {
 }
 
 /// Сообщение iTIP письма `raw`. `None` — письмо без iTIP (нет части `text/calendar` с параметром `method`);
-/// `Err` — причина, по которой сообщение не применяется (для журнала, без содержимого). `dmarc_pass` — письмо
-/// прошло DMARC.
-pub(crate) fn extract(raw: &[u8], dmarc_pass: bool) -> Option<Result<Imip, &'static str>> {
+/// `Err` — причина, по которой сообщение не применяется (для журнала, без содержимого).
+pub(crate) fn extract(raw: &[u8]) -> Option<Result<Imip, &'static str>> {
     let msg = MessageParser::new().parse(raw)?;
     let (param, ics) = msg.parts.iter().find_map(|p| {
         let ct = p.content_type()?;
@@ -38,10 +39,7 @@ pub(crate) fn extract(raw: &[u8], dmarc_pass: bool) -> Option<Result<Imip, &'sta
     })?;
     Some((|| {
         let method: ItipMethod = param.parse().map_err(|_| "неизвестный метод iTIP")?;
-        if !dmarc_pass {
-            return Err("отправитель не прошёл DMARC");
-        }
-        // Ровно один адрес `From`: DMARC проверяет домен `From`, а не выбор из нескольких адресов.
+        // Ровно один адрес `From`: DMARC и права отправки проверяют один адрес, а не выбор из нескольких.
         let from = msg
             .from()
             .map(|a| a.iter().filter_map(|x| x.address.as_deref()).collect())
@@ -135,7 +133,7 @@ mod tests {
 
     #[test]
     fn request_from_organizer() {
-        let m = extract(mail("REQUEST", REQUEST).as_bytes(), true)
+        let m = extract(mail("REQUEST", REQUEST).as_bytes())
             .expect("itip")
             .expect("ok");
         assert_eq!(m.from, "org@example.com");
@@ -148,11 +146,11 @@ mod tests {
         let reply = REQUEST.replace("METHOD:REQUEST", "METHOD:REPLY");
         // Отправитель — организатор, а не участник.
         assert_eq!(
-            extract(mail("REPLY", &reply).as_bytes(), true),
+            extract(mail("REPLY", &reply).as_bytes()),
             Some(Err("отправитель письма — не участник"))
         );
         let reply = reply.replace("bob@example.org", "ORG@example.com");
-        let m = extract(mail("reply", &reply).as_bytes(), true)
+        let m = extract(mail("reply", &reply).as_bytes())
             .expect("itip")
             .expect("ok");
         assert_eq!(m.method, ItipMethod::Reply);
@@ -161,21 +159,20 @@ mod tests {
     #[test]
     fn ignored() {
         let other = REQUEST.replace("org@exam\r\n ple.com", "other@example.com");
-        for (method, ics, dmarc) in [
-            ("REQUEST", REQUEST, false),
-            ("REQUEST", other.as_str(), true),
-            ("CANCEL", REQUEST, true),
-            ("BOGUS", REQUEST, true),
+        for (method, ics) in [
+            ("REQUEST", other.as_str()),
+            ("CANCEL", REQUEST),
+            ("BOGUS", REQUEST),
         ] {
-            let got = extract(mail(method, ics).as_bytes(), dmarc).expect("itip");
-            assert!(got.is_err(), "{method} {dmarc}: {got:?}");
+            let got = extract(mail(method, ics).as_bytes()).expect("itip");
+            assert!(got.is_err(), "{method}: {got:?}");
         }
         // Адрес в SENT-BY и в имени — не организатор.
         let sent_by = REQUEST
             .replace("org@exam\r\n ple.com", "boss@example.net")
             .replace("x@example.net", "org@example.com");
         assert!(matches!(
-            extract(mail("REQUEST", &sent_by).as_bytes(), true),
+            extract(mail("REQUEST", &sent_by).as_bytes()),
             Some(Err(_))
         ));
     }
@@ -183,14 +180,11 @@ mod tests {
     #[test]
     fn not_itip() {
         assert_eq!(
-            extract(
-                b"From: a@example.com\r\nSubject: s\r\n\r\nMETHOD:REQUEST\r\n",
-                true
-            ),
+            extract(b"From: a@example.com\r\nSubject: s\r\n\r\nMETHOD:REQUEST\r\n"),
             None
         );
         // `text/calendar` без параметра `method` — вложение-календарь, не iMIP (RFC 6047 §2.4).
         let plain = mail("REQUEST", REQUEST).replace(" method=REQUEST;", "");
-        assert_eq!(extract(plain.as_bytes(), true), None);
+        assert_eq!(extract(plain.as_bytes()), None);
     }
 }

@@ -15,6 +15,10 @@
 //!   проверкой, в том же ответе — значение сессии (`tps_…`, срок `admin.init.session_ttl`); дальше — только сессия
 //!   или OIDC Bearer. Роль сессии — администратор инсталляции. Сессии — в памяти узла: после перезапуска —
 //!   повторный `admin init --force` или вход через OIDC.
+//! - `GET /api/v1/session` — без входа: способы входа консоли — поставщик OIDC ([`OidcLogin`]: издатель — тот, чьи
+//!   токены проверяет узел, `auth.oidc.issuer` ([`crate::Deps::oidc_issuer`]); клиент консоли — `admin.oidc`,
+//!   [`OidcClient`]). Не настроен — `{"oidc": null}`, вход только токеном `admin init`. Секретов в ответе нет: клиент
+//!   консоли — публичный (код авторизации с PKCE).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -25,23 +29,23 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::get;
 use axum::{Json, Router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tp_contracts::admin_audit::AdminAuditRecord;
 use tp_contracts::admin_token::{
     LOCAL_ADMIN_TOKEN_PREFIX, LocalAdminToken, LocalAdminTokens, is_local_admin_token,
 };
 use tp_contracts::auth::Principal;
 use tp_contracts::config::duration;
-use tp_contracts::meta::{Account, AccountScope, AccountUpsert};
+use tp_contracts::meta::{Account, AccountKind, AccountScope, AccountUpsert};
 use tp_contracts::transport::{AcceptedDomain, DomainKind};
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::audit::AuditRecord;
 use crate::server::{Admin, AdminRole, ApiError, Caller, Problem};
 
 /// Маршрут обмена локального токена на сессию.
@@ -323,6 +327,8 @@ impl Admin {
                         display_name,
                         external_id: None,
                         enabled: true,
+                        aliases: Vec::new(),
+                        kind: AccountKind::User,
                     },
                 )
                 .await?
@@ -379,7 +385,7 @@ impl Admin {
 
     async fn audit_local(&self, actor: AccountId, login: &str, path: &str, status: u16) {
         let tenant = TenantId::DEFAULT;
-        let record = AuditRecord {
+        let record = AdminAuditRecord {
             at: OffsetDateTime::now_utc(),
             tenant: Some(tenant),
             actor_tenant: tenant,
@@ -392,7 +398,7 @@ impl Admin {
             status,
             content_messages: None,
         };
-        if let Err(e) = self.d.audit.record(&record).await {
+        if let Err(e) = crate::audit::record(&self.d, &record).await {
             tracing::error!(error = %e, route = INIT_ROUTE, "admin: запись аудита не сохранена");
         }
     }
@@ -465,6 +471,8 @@ fn enabled(a: Account) -> AccountUpsert {
         display_name: a.display_name,
         external_id: a.external_id,
         enabled: true,
+        aliases: a.aliases,
+        kind: a.kind,
     }
 }
 
@@ -567,15 +575,83 @@ pub struct AdminSession {
     pub roles: Vec<AdminRole>,
 }
 
-/// Маршрут обмена (вне слоя доступа: вход — сам локальный токен).
-pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route(SESSION_ROUTE, post(exchange))
+/// Секция `admin.oidc`: клиент веб-консоли у поставщика OIDC (код авторизации с PKCE, публичный клиент). Поставщик —
+/// `auth.oidc`: его издателя узел передаёт в [`crate::Deps::oidc_issuer`]; без `auth.oidc` секция — ошибка запуска.
+///
+/// ```yaml
+/// oidc: { client_id: thepost-console, scope: "openid profile" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OidcClient {
+    /// Идентификатор публичного клиента консоли у поставщика.
+    pub client_id: String,
+    /// Запрашиваемые области через пробел; нет — `openid`.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
-/// Спецификация OpenAPI маршрута обмена.
+impl OidcClient {
+    /// Проверяет значения: клиент и области — непустая строка без управляющих знаков.
+    pub fn check(&self) -> Result<()> {
+        let plain = |s: &str| !s.trim().is_empty() && !s.chars().any(char::is_control);
+        if !plain(&self.client_id) || !self.scope.as_deref().is_none_or(plain) {
+            return Err(Error::invalid(
+                "admin.oidc: client_id и scope — непустые строки без управляющих знаков",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Вход в консоль через поставщика OIDC: издатель из `auth.oidc`, клиент из `admin.oidc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct OidcLogin {
+    /// Издатель (`iss`) — тот, чьи токены проверяет Admin API (`auth.oidc.issuer`).
+    pub issuer: String,
+    /// Идентификатор публичного клиента консоли у поставщика.
+    pub client_id: String,
+    /// Запрашиваемые области через пробел; нет — `openid`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+/// Способы входа консоли.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct SessionInfo {
+    /// Поставщик OIDC; `null` — не настроен (вход только токеном `admin init`).
+    pub oidc: Option<OidcLogin>,
+}
+
+/// Маршрут сессии (вне слоя доступа: способы входа — без входа, обмен — вход самим локальным токеном).
+pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
+    r.route(SESSION_ROUTE, get(session_info).post(exchange))
+}
+
+/// Спецификация OpenAPI маршрута сессии.
 #[derive(Debug, OpenApi)]
-#[openapi(paths(exchange), components(schemas(AdminSession)))]
+#[openapi(
+    paths(session_info, exchange),
+    components(schemas(AdminSession, SessionInfo, OidcLogin))
+)]
 pub(crate) struct Doc;
+
+/// Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`). Без входа.
+#[utoipa::path(get, path = "/api/v1/session", tag = "admin", security(()),
+    responses((status = 200, body = SessionInfo)))]
+async fn session_info(State(a): State<Arc<Admin>>) -> Json<SessionInfo> {
+    let oidc = a
+        .cfg
+        .oidc
+        .as_ref()
+        .zip(a.d.oidc_issuer.as_ref())
+        .map(|(c, issuer)| OidcLogin {
+            issuer: issuer.clone(),
+            client_id: c.client_id.clone(),
+            scope: c.scope.clone(),
+        });
+    Json(SessionInfo { oidc })
+}
 
 /// Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится
 /// первой проверкой; повтор, срок, отзыв — 401.
@@ -591,13 +667,13 @@ async fn exchange(State(a): State<Arc<Admin>>, headers: HeaderMap) -> Response {
         Ok(s) => (
             s.account.parse().unwrap_or_else(|_| nobody()),
             s.login.clone(),
-            s.roles.clone(),
+            s.roles.iter().map(|r| r.as_str().to_owned()).collect(),
             201,
         ),
         Err(e) if e.is_retryable() => (nobody(), String::new(), Vec::new(), 503),
         Err(_) => (nobody(), String::new(), Vec::new(), 401),
     };
-    let record = AuditRecord {
+    let record = AdminAuditRecord {
         at: now,
         tenant: Some(TenantId::DEFAULT),
         actor_tenant: TenantId::DEFAULT,
@@ -610,7 +686,7 @@ async fn exchange(State(a): State<Arc<Admin>>, headers: HeaderMap) -> Response {
         status,
         content_messages: None,
     };
-    if let Err(e) = a.d.audit.record(&record).await {
+    if let Err(e) = crate::audit::record(&a.d, &record).await {
         tracing::error!(error = %e, route = SESSION_ROUTE, "admin: запись аудита не сохранена");
     }
     match r {
@@ -675,6 +751,83 @@ mod tests {
             display_name: None,
             force,
         }
+    }
+
+    /// Приёмка ADM-25: способы входа — без заголовка `Authorization`; с настройкой OIDC и без. Издатель — из
+    /// `auth.oidc` (`Deps::oidc_issuer`), клиент — из `admin.oidc`.
+    #[tokio::test]
+    async fn session_info_without_login() {
+        let env = Env::new();
+        let (s, _, b) = env.call("GET", SESSION_ROUTE, None, None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b, json!({"oidc": null}));
+
+        let oidc = OidcClient {
+            client_id: "thepost-console".into(),
+            scope: None,
+        };
+        let env = Env::with(
+            crate::server::AdminConfig {
+                oidc: Some(oidc),
+                ..crate::testenv::config()
+            },
+            Vec::new(),
+        );
+        let (s, _, b) = env.call("GET", SESSION_ROUTE, None, None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            b,
+            json!({"oidc": {"issuer": crate::testenv::ISSUER, "client_id": "thepost-console"}})
+        );
+        let spec = serde_json::to_value(crate::server::openapi_spec()).expect("spec");
+        assert_eq!(spec["paths"][SESSION_ROUTE]["get"]["security"], json!([{}]));
+    }
+
+    #[test]
+    fn oidc_client_check() {
+        let ok = OidcClient {
+            client_id: "c".into(),
+            scope: Some("openid profile".into()),
+        };
+        assert!(ok.check().is_ok());
+        for bad in [
+            OidcClient {
+                client_id: " ".into(),
+                ..ok.clone()
+            },
+            OidcClient {
+                scope: Some(String::new()),
+                ..ok.clone()
+            },
+        ] {
+            assert!(bad.check().is_err(), "{bad:?}");
+        }
+        // Издатель задаётся в `auth.oidc`, не здесь.
+        let e = serde_json::from_value::<OidcClient>(
+            json!({"issuer": "https://idp.example.org", "client_id": "c"}),
+        );
+        assert!(e.is_err());
+    }
+
+    /// `admin.oidc` без `auth.oidc` (издателя нет) — ошибка конфигурации при запуске.
+    #[test]
+    fn oidc_client_requires_issuer() {
+        let cfg = crate::server::AdminConfig {
+            oidc: Some(OidcClient {
+                client_id: "thepost-console".into(),
+                scope: None,
+            }),
+            ..crate::testenv::config()
+        };
+        let d = crate::server::Deps {
+            oidc_issuer: None,
+            ..crate::testenv::deps()
+        };
+        let e = Admin::new(d, cfg).map(|_| ()).expect_err("no issuer");
+        assert!(
+            matches!(&e, Error::Invalid(m) if m.contains("auth.oidc")),
+            "{e:?}"
+        );
     }
 
     /// Приёмка ADM-11: init заводит домен, учётную запись с паролем и токен; токен обменивается на сессию один раз.
@@ -836,6 +989,7 @@ mod tests {
                 login: "boss@example.test".into(),
                 secret: again.password.clone(),
             },
+            None,
         )
         .await
         .expect("login");

@@ -4,9 +4,17 @@
   probes.py run   — до появления файла --stop: smtp (MAIL … DATA → 250 на 25), delivery (587 → EXISTS в IMAP IDLE),
                     signal (STORE флага → FETCH в IDLE другого соединения), select (SELECT INBOX ящика big),
                     index (письмо с уникальным словом на 25 → находится Email/query text), avail (вход IMAP и сессия
-                    JMAP раз в период — переподключение при отказах);
+                    JMAP раз в период — переподключение при отказах), caldav и carddav (PROPFIND дома календарей
+                    и адресных книг), managesieve (вход на 4190 и LISTSCRIPTS);
+  probes.py services — службы календарей, контактов и правил (DEP-21) до прогона: /.well-known/caldav и carddav
+                    ведут на /dav/, дома отвечают 207, ManageSieve на 4190 — CAPABILITY, STARTTLS, вход и LISTSCRIPTS
+                    (итог — --out-json, код 1 — есть отказ);
   probes.py idle  — N простаивающих соединений IMAP IDLE на --hold с (память на соединение, отметки — в --events);
-  probes.py count — писем в ящиках всех учётных записей (IMAP STATUS; без Sent, Drafts, Trash) в JSON.
+  probes.py count — писем в ящиках всех учётных записей (IMAP STATUS; без Sent, Drafts, Trash) в JSON (--exclude —
+                    кроме этих: цель перебора может быть заблокирована);
+  probes.py brute — перебор паролей IMAP со второго адреса (--source, решение 56): неверные пароли учётной записи
+                    --target и несуществующие имена; проверки — вход верным паролем со второго адреса и с адреса
+                    генератора (итог — --out-json).
 
 Замеры — строки JSON в --out: {"t": unix, "probe": имя, "ms": задержка, "ok": bool, "accepted": писем принято}.
 Учётные записи — --accounts (login:пароль): нагрузка — <prefix><n>@<домен>, зонды — probe1 … probe3, ящик big.
@@ -14,6 +22,7 @@
 
 import argparse
 import base64
+import http.client
 import imaplib
 import json
 import random
@@ -27,6 +36,7 @@ import string
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
@@ -109,7 +119,110 @@ class Ctx:
             return json.load(r)["methodResponses"]
 
 
+    def dav(self, name, method, path, body=None, depth="0"):
+        """Запрос DAV от учётной записи name: (код, заголовки, тело)."""
+        login, pw = self.acct(name)
+        return dav_request(self.a.host, self.ssl, login, pw, method, path, body, depth)
+
+    def sieve(self, name):
+        """Сеанс ManageSieve (RFC 5804) учётной записи name: вход и LISTSCRIPTS; итог — число скриптов."""
+        login, pw = self.acct(name)
+        s = ManageSieve(self.a.host, self.a.sieve_port, self.ssl)
+        try:
+            s.login(login, pw)
+            return len(s.listscripts())
+        finally:
+            s.logout()
+
+
 JMAP_ACCOUNTS = {}
+PROPFIND = (b'<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/>'
+            b"<d:sync-token/></d:prop></d:propfind>")
+
+
+def dav_request(host, ctx, login, pw, method, path, body=None, depth="0"):
+    conn = http.client.HTTPSConnection(host, 443, context=ctx, timeout=30)
+    try:
+        h = {"Authorization": "Basic " + base64.b64encode(f"{login}:{pw}".encode()).decode()}
+        if body is not None:
+            h["Content-Type"] = "application/xml; charset=utf-8"
+        if method in ("PROPFIND", "REPORT"):
+            h["Depth"] = depth
+        conn.request(method, path, body=body, headers=h)
+        r = conn.getresponse()
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
+    finally:
+        conn.close()
+
+
+def home(kind, login):
+    """Дом календарей (calendars) или адресных книг (addressbooks) учётной записи."""
+    return f"/dav/{kind}/{urllib.parse.quote(login, safe='@')}/"
+
+
+class ManageSieve:
+    """Клиент ManageSieve (RFC 5804) на stdlib: приветствие, STARTTLS, AUTHENTICATE PLAIN, LISTSCRIPTS."""
+
+    def __init__(self, host, port, ctx, timeout=30):
+        self.host, self.ctx = host, ctx
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.f = self.sock.makefile("rb")
+        self.caps = self._caps()
+
+    def _line(self):
+        line = self.f.readline()
+        if not line:
+            raise ConnectionError("ManageSieve: соединение закрыто")
+        return line.rstrip(b"\r\n")
+
+    def _response(self):
+        """Строки до ответа OK / NO / BYE; литералы {n} и {n+} читаются целиком."""
+        lines = []
+        while True:
+            line = self._line()
+            m = re.search(rb"\{(\d+)\+?\}$", line)
+            if m:
+                line += self.f.read(int(m.group(1))) + self._line()
+            head = line.split(b" ", 1)[0].upper()
+            if head in (b"OK", b"NO", b"BYE"):
+                if head != b"OK":
+                    raise RuntimeError(f"ManageSieve: {line.decode(errors='replace')[:200]}")
+                return lines
+            lines.append(line)
+
+    def _caps(self, lines=None):
+        caps = {}
+        for line in self._response() if lines is None else lines:
+            parts = re.findall(rb'"((?:[^"\\]|\\.)*)"', line)
+            if parts:
+                caps[parts[0].decode().upper()] = parts[1].decode() if len(parts) > 1 else ""
+        return caps
+
+    def cmd(self, text):
+        self.sock.sendall(text.encode() + b"\r\n")
+        return self._response()
+
+    def starttls(self):
+        self.cmd("STARTTLS")
+        self.sock = self.ctx.wrap_socket(self.sock, server_hostname=self.host)
+        self.f = self.sock.makefile("rb")
+        self.caps = self._caps()
+
+    def login(self, login, pw):
+        if "STARTTLS" in self.caps:
+            self.starttls()
+        token = base64.b64encode(f"\0{login}\0{pw}".encode()).decode()
+        self.cmd(f'AUTHENTICATE "PLAIN" "{token}"')
+
+    def listscripts(self):
+        return self.cmd("LISTSCRIPTS")
+
+    def logout(self):
+        try:
+            self.cmd("LOGOUT")
+        except (OSError, RuntimeError):
+            pass
+        self.sock.close()
 
 
 def close(conn):
@@ -286,6 +399,18 @@ def run(a):
             r.read()
         c.log("avail_jmap", (time.monotonic() - t0) * 1000)
 
+    def collection(kind):
+        def body(_):
+            t0 = time.monotonic()
+            code, _, _ = c.dav("probe1", "PROPFIND", home(kind, probe1), PROPFIND, depth="1")
+            c.log(kind, (time.monotonic() - t0) * 1000, ok=code == 207, code=code)
+        return body
+
+    def managesieve(_):
+        t0 = time.monotonic()
+        c.sieve("probe1")
+        c.log("managesieve", (time.monotonic() - t0) * 1000)
+
     probes = [
         ("smtp", p, smtp),
         ("delivery", 5 * p, delivery),
@@ -294,6 +419,9 @@ def run(a):
         ("index", 5 * p, index),
         ("avail_imap", 1, avail_imap),
         ("avail_jmap", 1, avail_jmap),
+        ("caldav", 5 * p, collection("calendars")),
+        ("carddav", 5 * p, collection("addressbooks")),
+        ("managesieve", 5 * p, managesieve),
     ]
     c.log("probes_start", big=big_login)
     threads = [threading.Thread(target=forever, args=(c, n, per, b), daemon=True) for n, per, b in probes]
@@ -308,6 +436,58 @@ def run(a):
     for t in threads:
         t.join(timeout=240)
     c.log("probes_end")
+
+
+def services(a):
+    """Службы DAV и ManageSieve (DEP-21) учётной записью probe1: итог — проверки в --out-json, код 1 — есть отказ."""
+    c = Ctx(a)
+    login, pw = c.acct("probe1")
+    checks = []
+
+    def check(name, good, fn):
+        t0 = time.monotonic()
+        try:
+            got = fn()
+            ok = good(got)
+        except Exception as e:  # noqa: BLE001 — отказ проверки — итог «не прошёл»
+            got, ok = f"{type(e).__name__}: {e}"[:200], False
+        checks.append({"name": name, "ok": bool(ok), "got": str(got), "ms": round((time.monotonic() - t0) * 1000, 1)})
+
+    def well_known(kind):
+        code, h, _ = dav_request(a.host, c.ssl, login, pw, "GET", f"/.well-known/{kind}")
+        return code, urllib.parse.urlsplit(h.get("location", "")).path
+
+    def redirect(got):
+        return 300 <= got[0] < 400 and got[1].startswith("/dav/")
+
+    def propfind(kind):
+        return c.dav("probe1", "PROPFIND", home(kind, login), PROPFIND, depth="1")[0]
+
+    def capability():
+        s = ManageSieve(a.host, a.sieve_port, c.ssl)
+        try:
+            if "STARTTLS" in s.caps:
+                s.starttls()
+            caps = s._caps(s.cmd("CAPABILITY"))
+            return sorted(k for k in caps if k in ("IMPLEMENTATION", "SASL", "SIEVE", "VERSION"))
+        finally:
+            s.logout()
+
+    check("/.well-known/caldav → /dav/", redirect, lambda: well_known("caldav"))
+    check("/.well-known/carddav → /dav/", redirect, lambda: well_known("carddav"))
+    check("PROPFIND дома календарей — 207", lambda got: got == 207, lambda: propfind("calendars"))
+    check("PROPFIND дома адресных книг — 207", lambda got: got == 207, lambda: propfind("addressbooks"))
+    check(f"ManageSieve {a.sieve_port}: CAPABILITY после STARTTLS", lambda got: {"IMPLEMENTATION", "SIEVE"} <= set(got),
+          capability)
+    check(f"ManageSieve {a.sieve_port}: вход паролем приложения, LISTSCRIPTS", lambda got: isinstance(got, int),
+          lambda: c.sieve("probe1"))
+    ok = all(x["ok"] for x in checks)
+    if a.out_json:
+        with open(a.out_json, "w", encoding="utf-8") as f:
+            json.dump({"ok": ok, "checks": checks}, f, ensure_ascii=False, indent=1)
+    for x in checks:
+        print(f"{x['name']}: {'ok' if x['ok'] else 'отказ'} ({x['got']}, {x['ms']} мс)")
+    return 0 if ok else 1
 
 
 def idle(a):
@@ -378,16 +558,126 @@ def count(a):
         finally:
             close(m)
 
+    skip = set(a.exclude)
     with ThreadPoolExecutor(10) as ex:
-        per = dict(ex.map(one, list(c.accounts)))
+        per = dict(ex.map(one, [x for x in c.accounts if x not in skip]))
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump({"t": time.time(), "total": sum(per.values()), "per": per}, f, sort_keys=True)
     print(sum(per.values()))
 
 
+class SourceIMAP(imaplib.IMAP4_SSL):
+    """IMAP4_SSL с адресом источника (второй адрес генератора)."""
+
+    def __init__(self, host, port, source, **kw):
+        self.source = source
+        super().__init__(host, port, **kw)
+
+    def _create_socket(self, timeout):
+        src = (self.source, 0) if self.source else None
+        sock = socket.create_connection((self.host, self.port), timeout, source_address=src)
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
+def try_login(c, login, pw, source=""):
+    """Вход IMAP: ("ok" | "no" | "unavail" | "conn", текст ответа, мс).
+
+    no — отказ входа (неверный пароль или блокировка: узел отвечает на них одинаково); unavail — временный отказ
+    ([UNAVAILABLE]: перегрузка узла, не блокировка); conn — обрыв или тайм-аут соединения.
+    """
+    t0 = time.monotonic()
+    try:
+        m = SourceIMAP(c.a.host, 993, source, ssl_context=c.ssl, timeout=30)
+    except (OSError, imaplib.IMAP4.error) as e:
+        return "conn", str(e)[:200], (time.monotonic() - t0) * 1000
+    try:
+        m.login(login, pw)
+        return "ok", "OK", (time.monotonic() - t0) * 1000
+    except imaplib.IMAP4.error as e:
+        text = str(e)[:200]
+        return ("unavail" if "UNAVAILABLE" in text else "no"), text, (time.monotonic() - t0) * 1000
+    except OSError as e:
+        return "conn", str(e)[:200], (time.monotonic() - t0) * 1000
+    finally:
+        close(m)
+
+
+def brute(a):
+    """Перебор со второго адреса (Д.6, решение 56): учётная запись, затем адрес.
+
+    Временные отказы узла (unavail, conn — перегрузка стенда) не считаются: неудачная попытка повторяется, пока
+    отказов входа («no») не наберётся сколько нужно, проверка — пока не будет ответа «ok» или «no» (до --retries раз).
+
+    1. Исходное состояние: --target входит верным паролем со второго адреса (иначе блокировки прошлого прогона ещё
+       действуют — оценка невозможна).
+    2. Учётная запись: --account-failures + 1 неверных паролей --target со второго адреса → верный пароль --target не
+       пускают ни со второго адреса, ни с адреса генератора (блокировка учётной записи); учётная запись нагрузки
+       --check с адреса генератора входит (генератор не заблокирован).
+    3. Адрес: --ip-failures + 1 неверных входов под несуществующими именами со второго адреса → верный пароль --check
+       со второго адреса не пускают (блокировка адреса), с адреса генератора — пускают.
+    """
+    c = Ctx(a)
+    target, tpw = c.acct(a.target)
+    check, cpw = c.acct(a.check)
+    res = {"source": a.source, "target": target, "check": check, "ip_failures": a.ip_failures,
+           "account_failures": a.account_failures, "attempts": [], "checks": []}
+
+    def attempts(phase, n, login):
+        """n отказов входа («no») неверным паролем со второго адреса; временные отказы — повтор."""
+        got = 0
+        for _ in range(n * a.retries):
+            if got >= n:
+                break
+            name = login() if callable(login) else login
+            out, text, ms = try_login(c, name, "wrong-" + secrets.token_hex(6), a.source)
+            res["attempts"].append({"t": round(time.time(), 3), "phase": phase, "login": name, "result": out,
+                                    "text": text, "ms": round(ms, 1)})
+            got += out == "no"
+            if out != "no":
+                time.sleep(2)
+
+    def definite(login, pw, source):
+        """Вход до ответа «ok» или «no» (временные отказы — повтор, до --retries раз)."""
+        tries = 0
+        for tries in range(1, a.retries + 1):
+            out, text, ms = try_login(c, login, pw, source)
+            if out in ("ok", "no"):
+                break
+            time.sleep(5)
+        return out, text, ms, tries
+
+    def verify(name, login, pw, source, expect):
+        out, text, ms, tries = definite(login, pw, source)
+        res["checks"].append({"t": round(time.time(), 3), "name": name, "login": login, "source": source or "генератор",
+                              "expect": expect, "result": out, "text": text, "ms": round(ms, 1), "tries": tries,
+                              "ok": out == expect})
+
+    out, text, _, _ = definite(target, tpw, a.source)
+    res["baseline"] = {"result": out, "text": text}
+    if out != "ok":
+        res["skipped"] = (f"исходный вход {target} со второго адреса — {out} ({text}): блокировка прошлого прогона "
+                          "(auth.abuse.block_for) или адрес не настроен на генераторе")
+    else:
+        attempts("account", a.account_failures + 1, target)
+        verify("учётная запись: верный пароль со второго адреса", target, tpw, a.source, "no")
+        verify("учётная запись: верный пароль с адреса генератора", target, tpw, "", "no")
+        verify("генератор после блокировки учётной записи", check, cpw, "", "ok")
+        attempts("address", a.ip_failures + 1, lambda: f"nobody-{secrets.token_hex(4)}@{a.domain}")
+        verify("адрес: верный пароль другой учётной записи со второго адреса", check, cpw, a.source, "no")
+        verify("генератор после блокировки адреса", check, cpw, "", "ok")
+    res["ok"] = "skipped" not in res and all(x["ok"] for x in res["checks"])
+    # Нет ответа «ok» или «no» — узел перегружен: проверка не состоялась (не «не прошёл»).
+    res["inconclusive"] = [x["name"] for x in res["checks"] if x["result"] not in ("ok", "no")]
+    with open(a.out_json, "w", encoding="utf-8") as f:
+        json.dump(res, f, ensure_ascii=False, indent=1)
+    for x in res["checks"]:
+        print(f"{x['name']}: {x['result']} (ожидалось {x['expect']})")
+    print(res.get("skipped", f"итог: {'прошёл' if res['ok'] else 'не прошёл'}"))
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["run", "idle", "count"])
+    p.add_argument("mode", choices=["run", "idle", "count", "brute", "services"])
     p.add_argument("--accounts", required=True)
     p.add_argument("--host", required=True)
     p.add_argument("--domain", required=True)
@@ -402,8 +692,16 @@ def main():
     p.add_argument("--events", default="")
     p.add_argument("-n", type=int, default=100)
     p.add_argument("--hold", type=int, default=60)
+    p.add_argument("--exclude", action="append", default=[])
+    p.add_argument("--source", default="")
+    p.add_argument("--target", default="brute")
+    p.add_argument("--check", default="")
+    p.add_argument("--ip-failures", type=int, default=10)
+    p.add_argument("--account-failures", type=int, default=20)
+    p.add_argument("--retries", type=int, default=5)
+    p.add_argument("--sieve-port", type=int, default=4190)
     a = p.parse_args()
-    {"run": run, "idle": idle, "count": count}[a.mode](a)
+    return {"run": run, "idle": idle, "count": count, "brute": brute, "services": services}[a.mode](a)
 
 
 if __name__ == "__main__":

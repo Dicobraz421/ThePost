@@ -5,32 +5,33 @@
 //! доступ к содержимому писем (`include=subject` списков корзины и очереди модерации): запись с числом писем
 //! (`content_messages`), без тем.
 //!
-//! Куда пишется — [`AuditSink`]. Встроенная реализация [`LogAudit`] пишет запись в общий журнал событий
-//! узла (`tracing`, цель `audit`). Хранилище только на добавление в PostgreSQL (META-22) подключается реализацией
-//! этого трейта, экспорт в SIEM — [`crate::export`] (syslog RFC 5424 поверх TLS, OTLP), вместе —
-//! [`crate::export::Fanout`].
+//! Журнал — контракт [`AuditLog`](tp_contracts::admin_audit::AuditLog) (CTR-25; в узле — таблица `audit_log`, META-70): запись
+//! пишется только в него. В SIEM (syslog RFC 5424 поверх TLS, OTLP) записи выгружает из журнала [`crate::export`]
+//! от отметки доставки (решение владельца 12.11: база + выгрузка из неё, APP-59).
 //!
-//! Чтение — `GET /api/v1/orgs/{org}/audit` ([`AuditLog`]): администраторы и аудитор организации, оператор — нет.
-//! Контракта чтения журнала аудита пока нет: [`AuditLog`] — временный трейт полосы до CTR-25.
+//! Чтение — `GET /api/v1/orgs/{org}/audit` (`AuditLog::search`): администраторы и аудитор организации, оператор —
+//! нет. В ответе и в экспорте запись — [`AuditRecord`] (момент — RFC 3339).
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tp_contracts::{AccountId, Error, Result, TenantId};
+use tp_contracts::admin_audit::{
+    AdminAuditEntry, AdminAuditPage, AdminAuditQuery, AdminAuditRecord,
+};
+use tp_contracts::{AccountId, Result, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::server::{Admin, AdminRole, ApiResult, Problem};
+use crate::server::{Admin, ApiResult, Deps, Problem};
 
 /// Шаблон маршрута чтения журнала аудита (единственный маршрут роли «аудитор»).
 pub const AUDIT_ROUTE: &str = "/api/v1/orgs/{org}/audit";
 
-/// Запись журнала аудита.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// Запись журнала аудита в ответе API и в экспорте в SIEM ([`AdminAuditRecord`] контракта).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AuditRecord {
     /// Момент (UTC).
     #[serde(with = "time::serde::rfc3339")]
@@ -47,11 +48,12 @@ pub struct AuditRecord {
     pub actor: AccountId,
     /// Имя входа администратора.
     pub actor_login: String,
-    /// Роли администратора на момент операции; пусто — ролей нет (отказ).
-    pub roles: Vec<AdminRole>,
+    /// Роли администратора на момент операции (`installation_admin`, `organization_admin`, `operator`,
+    /// `auditor`); пусто — ролей нет (отказ).
+    pub roles: Vec<String>,
     /// Метод HTTP.
     pub method: String,
-    /// Шаблон маршрута (`/api/v1/orgs/{org}/domains`); неизвестный маршрут — путь.
+    /// Шаблон маршрута (`/api/v1/orgs/{org}/transport/domains`); неизвестный маршрут — путь.
     pub route: String,
     /// Путь запроса.
     pub path: String,
@@ -59,31 +61,29 @@ pub struct AuditRecord {
     pub status: u16,
     /// Доступ к содержимому писем (`include=subject`, [`crate::retention`], [`crate::groups`]): число писем, тема и
     /// отправитель которых запрошены; `None` — запрос содержимое не отдаёт. Самих тем в записи нет.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub content_messages: Option<u64>,
 }
 
-/// Приёмник журнала аудита: только добавление.
-#[async_trait]
-pub trait AuditSink: Send + Sync + 'static {
-    /// Добавляет запись.
-    async fn record(&self, record: &AuditRecord) -> Result<()>;
+impl From<&AdminAuditRecord> for AuditRecord {
+    fn from(r: &AdminAuditRecord) -> Self {
+        Self {
+            at: r.at,
+            tenant: r.tenant,
+            actor_tenant: r.actor_tenant,
+            actor: r.actor,
+            actor_login: r.actor_login.clone(),
+            roles: r.roles.clone(),
+            method: r.method.clone(),
+            route: r.route.clone(),
+            path: r.path.clone(),
+            status: r.status,
+            content_messages: r.content_messages,
+        }
+    }
 }
 
-/// Запрос к журналу аудита организации.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditQuery {
-    /// Начало интервала, включительно.
-    pub since: Option<OffsetDateTime>,
-    /// Конец интервала, не включительно.
-    pub until: Option<OffsetDateTime>,
-    /// Не более записей, ≥ 1.
-    pub limit: usize,
-    /// Продолжение после записи с этим номером.
-    pub after: Option<u64>,
-}
-
-/// Запись журнала с порядковым номером.
+/// Запись журнала с номером в ответе API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AuditEntry {
     /// Номер записи (возрастает в порядке добавления).
@@ -93,7 +93,7 @@ pub struct AuditEntry {
     pub record: AuditRecord,
 }
 
-/// Страница журнала аудита.
+/// Страница журнала аудита в ответе API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AuditPage {
     /// Записи по возрастанию `seq`.
@@ -102,39 +102,26 @@ pub struct AuditPage {
     pub next: Option<u64>,
 }
 
-/// Чтение журнала аудита (временный трейт полосы до контракта CTR-25).
-#[async_trait]
-pub trait AuditLog: Send + Sync + 'static {
-    /// Записи организации `tenant` (без уровня инсталляции) по возрастанию `seq`: в интервале
-    /// [`since`, `until`), после `after`, не более `limit`; `next` — номер последней, если страница полная.
-    async fn search(&self, tenant: TenantId, query: &AuditQuery) -> Result<AuditPage>;
+impl From<AdminAuditPage> for AuditPage {
+    fn from(p: AdminAuditPage) -> Self {
+        Self {
+            entries: p
+                .entries
+                .iter()
+                .map(|e: &AdminAuditEntry| AuditEntry {
+                    seq: e.seq,
+                    record: AuditRecord::from(&e.record),
+                })
+                .collect(),
+            next: p.next,
+        }
+    }
 }
 
-/// Журнал аудита в журнале событий узла (`tracing`, цель `audit`, уровень `info`).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LogAudit;
-
-#[async_trait]
-impl AuditSink for LogAudit {
-    async fn record(&self, r: &AuditRecord) -> Result<()> {
-        let tenant = r.tenant.map(|t| t.to_string());
-        tracing::info!(
-            target: "audit",
-            at = %r.at,
-            tenant = tenant.as_deref(),
-            actor_tenant = %r.actor_tenant,
-            actor = %r.actor,
-            actor_login = %r.actor_login,
-            roles = ?r.roles,
-            method = %r.method,
-            route = %r.route,
-            path = %r.path,
-            status = r.status,
-            content_messages = r.content_messages,
-            "admin api"
-        );
-        Ok(())
-    }
+/// Записывает `record` в журнал ([`Deps::audit_log`]); не записано — ошибка.
+pub(crate) async fn record(d: &Deps, record: &AdminAuditRecord) -> Result<()> {
+    d.audit_log.append(record).await?;
+    Ok(())
 }
 
 /// Параметры чтения журнала аудита.
@@ -157,40 +144,34 @@ pub struct AuditParams {
 
 /// Маршруты журнала аудита.
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route(AUDIT_ROUTE, get(search))
+    r.route(AUDIT_ROUTE, get(search_audit))
 }
 
 /// Спецификация OpenAPI маршрутов модуля.
 #[derive(Debug, OpenApi)]
-#[openapi(paths(search), components(schemas(AuditRecord, AuditEntry, AuditPage)))]
+#[openapi(
+    paths(search_audit),
+    components(schemas(AuditRecord, AuditEntry, AuditPage))
+)]
 pub(crate) struct Doc;
 
 /// Журнал аудита организации.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/audit", tag = "audit",
     params(("org" = String, Path, description = "Организация (UUID)"), AuditParams),
-    responses((status = 200, body = AuditPage), (status = 400, body = Problem), (status = 403, body = Problem),
-        (status = 503, body = Problem)))]
-async fn search(
+    responses((status = 200, body = AuditPage), (status = 400, body = Problem), (status = 403, body = Problem)))]
+async fn search_audit(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
     Query(q): Query<AuditParams>,
 ) -> ApiResult<Json<AuditPage>> {
-    if let (Some(s), Some(u)) = (q.since, q.until)
-        && s >= u
-    {
-        return Err(Error::invalid("audit: since must be before until").into());
-    }
-    let log =
-        a.d.audit_log
-            .as_ref()
-            .ok_or(Error::Unavailable { retry_after: None })?;
-    let query = AuditQuery {
+    let query = AdminAuditQuery {
         since: q.since,
         until: q.until,
         limit: a.cfg.page(q.limit),
         after: q.after,
     };
-    Ok(Json(log.search(org, &query).await?))
+    query.validate()?;
+    Ok(Json(a.d.audit_log.search(org, &query).await?.into()))
 }
 
 #[cfg(test)]
@@ -204,14 +185,50 @@ mod tests {
         format!("/api/v1/orgs/{}/audit", tp_contracts::TenantId::DEFAULT)
     }
 
+    /// Приёмка ADM-34: политика организации пишется через Admin API в контракт `PolicyStore`, изменение видно в
+    /// `GET …/audit` (журнал — контракт `AuditLog`).
+    #[tokio::test]
+    async fn policy_change_is_stored_and_audited() {
+        use tp_contracts::TenantId;
+        use tp_contracts::meta::{PolicyStore, PolicyTarget};
+
+        let env = Env::new();
+        let path = format!("/api/v1/orgs/{}/policy", TenantId::DEFAULT);
+        let (s, _, b) = env
+            .call(
+                "PUT",
+                &path,
+                Some("org"),
+                Some(json!({"max_recipients": 7})),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let stored = env
+            .policies
+            .policy(TenantId::DEFAULT, PolicyTarget::Tenant)
+            .await
+            .expect("policy");
+        assert_eq!(stored.max_recipients, Some(7));
+
+        let (s, _, b) = env.call("GET", &audit(), Some("auditor"), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let last = b["entries"].as_array().expect("entries").last().cloned();
+        let last = last.expect("entry");
+        assert_eq!(last["route"], "/api/v1/orgs/{org}/policy", "{b}");
+        assert_eq!(last["method"], "PUT");
+        assert_eq!(last["status"], 200);
+        assert_eq!(last["roles"], json!(["organization_admin"]));
+        assert!(last["at"].as_str().is_some_and(|t| t.ends_with('Z')), "{b}");
+    }
+
     /// Приёмка ADM-06: аудитор читает только журнал аудита, оператор — всё, кроме него, и только чтение.
     #[tokio::test]
     async fn auditor_and_operator_rights() {
         let env = Env::new();
         let org = format!("/api/v1/orgs/{}", tp_contracts::TenantId::DEFAULT);
         // Два изменения в журнал: отказ оператору и создание домена администратором.
-        let domains = format!("{org}/domains");
-        let body = Some(json!({"name": "example.org"}));
+        let domains = format!("{org}/transport/domains");
+        let body = Some(json!({"version": 0, "name": "example.org"}));
         let (s, _, _) = env
             .call("POST", &domains, Some("operator"), body.clone())
             .await;
@@ -234,7 +251,7 @@ mod tests {
         assert_eq!(entries.len(), 2, "{b}");
         assert_eq!(entries[0]["status"], 403);
         assert_eq!(entries[0]["roles"], json!(["operator"]));
-        assert_eq!(entries[1]["route"], "/api/v1/orgs/{org}/domains");
+        assert_eq!(entries[1]["route"], "/api/v1/orgs/{org}/transport/domains");
         assert!(entries[0]["seq"].as_u64() < entries[1]["seq"].as_u64());
         for path in [&org, &domains] {
             let (s, _, _) = env.call("GET", path, Some("auditor"), None).await;

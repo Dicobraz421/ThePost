@@ -222,7 +222,7 @@ fn openldap_cfg() -> LdapConfig {
     LdapConfig {
         base_dn: "dc=example,dc=org".into(),
         accounts: AccountMap {
-            disabled: Some(DisabledRule {
+            disabled: Some(FlagRule {
                 attribute: "nsAccountLock".into(),
                 value: Some("true".into()),
                 flag: None,
@@ -464,7 +464,7 @@ fn ad_cfg() -> LdapConfig {
             login: "userPrincipalName".into(),
             display_name: "displayName".into(),
             emails: vec!["mail".into(), "proxyAddresses".into()],
-            disabled: Some(DisabledRule {
+            disabled: Some(FlagRule {
                 attribute: "userAccountControl".into(),
                 value: None,
                 flag: Some(2),
@@ -538,6 +538,36 @@ async fn active_directory_usn() {
             .map(|_| ()),
         Err(Error::Conflict)
     );
+}
+
+#[tokio::test]
+async fn account_hidden_from_gal() {
+    let alice = "03020100-0504-0706-0809-0a0b0c0d0e0f";
+    let hidden = |dir: LdapDirectory| async move {
+        let page = dir.accounts_since(T, None, 10).await.expect("ad");
+        upserts(&page)
+            .into_iter()
+            .map(|a| (a.external_id, a.hidden_from_gal))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let fake = Fake::new(include_str!("ad.ldif"));
+    fake.set(
+        "CN=Alice,OU=Staff,DC=corp,DC=example",
+        "msExchHideFromAddressLists",
+        "TRUE",
+    );
+    // По умолчанию — msExchHideFromAddressLists: скрыта только alice.
+    let got = hidden(LdapDirectory::with_source(T, ad_cfg(), fake.clone())).await;
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(|(id, h)| *h == (id == alice)), "{got:?}");
+    // Признак не задан — все записи в GAL.
+    let mut cfg = ad_cfg();
+    cfg.accounts.hidden = None;
+    let got = hidden(LdapDirectory::with_source(T, cfg, fake.clone())).await;
+    assert!(got.values().all(|h| !h), "{got:?}");
+    // Записи без атрибута (OpenLDAP) — в GAL.
+    let (dir, _) = openldap();
+    assert!(hidden(dir).await.values().all(|h| !h));
 }
 
 #[test]
@@ -623,7 +653,7 @@ async fn live_ldap() {
         } else {
             let t = tls.clone();
             Some(Arc::new(
-                tokio::task::spawn_blocking(move || client_tls(&t))
+                tokio::task::spawn_blocking(move || client_tls(&t, None))
                     .await
                     .expect("join")
                     .expect("tls"),
@@ -734,6 +764,98 @@ async fn live_ldap() {
     result.expect("live LDAP");
 }
 
+// ---------- Контакты, подразделения, оргатрибуты (AUTH-10) ----------
+
+#[tokio::test]
+async fn contacts_units_and_org() {
+    const PEOPLE: &str = "00000000-0000-0000-0000-0000000000f0";
+    let fake = Fake::new(include_str!("openldap.ldif"));
+    fake.set(
+        "uid=alice,ou=people,dc=example,dc=org",
+        "manager",
+        "UID=carol,ou=people,dc=example,dc=org",
+    );
+    fake.set("uid=alice,ou=people,dc=example,dc=org", "seniority", " 7 ");
+    let mut cfg = openldap_cfg();
+    cfg.contacts = Some(ContactMap {
+        base: Some("ou=contacts,dc=example,dc=org".into()),
+        ..ContactMap::default()
+    });
+    cfg.units = Some(UnitMap::default());
+    cfg.accounts.org = OrgMap {
+        title: Some("title".into()),
+        manager: Some("manager".into()),
+        seniority: Some("seniority".into()),
+    };
+    let dir = LdapDirectory::with_source(T, cfg, fake.clone());
+
+    assert_eq!(
+        dir.units(T).await.expect("units"),
+        [DirUnit {
+            external_id: PEOPLE.into(),
+            name: "people".into(),
+            parent: None,
+        }]
+    );
+    let accounts = upserts(&dir.accounts_since(T, None, 100).await.expect("accounts"));
+    let alice = accounts
+        .iter()
+        .find(|a| a.login == "alice@example.org")
+        .expect("alice");
+    assert_eq!(
+        alice.org,
+        DirOrg {
+            department: Some(PEOPLE.into()),
+            title: Some("Engineer".into()),
+            manager: Some("00000000-0000-0000-0000-0000000000c1".into()),
+            seniority: Some(7),
+        }
+    );
+    let carol = accounts
+        .iter()
+        .find(|a| a.login == "carol@example.org")
+        .expect("carol");
+    assert_eq!(carol.org.manager, None);
+    assert_eq!(carol.org.department.as_deref(), Some(PEOPLE));
+
+    let contacts = dir.contacts_since(T, None, 100).await.expect("contacts");
+    assert_eq!(
+        upserts(&contacts),
+        [DirContact {
+            external_id: "00000000-0000-0000-0000-0000000000c0".into(),
+            display_name: "Vendor Support".into(),
+            email: "support@vendor.example".into(),
+            attributes: BTreeMap::from([("title".into(), "Supplier".into())]),
+        }]
+    );
+    let idle = dir
+        .contacts_since(T, Some(&contacts.next), 100)
+        .await
+        .expect("idle");
+    assert!(idle.changes.is_empty());
+
+    // Контакты не сопоставлены — каталог без контактов.
+    let plain = LdapDirectory::with_source(T, openldap_cfg(), fake);
+    assert!(
+        plain
+            .contacts_since(T, None, 10)
+            .await
+            .expect("none")
+            .changes
+            .is_empty()
+    );
+    assert!(plain.units(T).await.expect("none").is_empty());
+}
+
+#[test]
+fn parent_dn_escaped_comma() {
+    assert_eq!(
+        parent_dn(r"cn=Smith\, John,ou=people,dc=x"),
+        Some("ou=people,dc=x")
+    );
+    assert_eq!(parent_dn("dc=x"), None);
+}
+
 // ---------- Группы рассылки из каталога (AUTH-07) ----------
 
 mod group_sync {
@@ -741,7 +863,7 @@ mod group_sync {
         DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
     };
     use tp_contracts::{AccountId, BlobHash, BlobKey, Gen, HeldId};
-    use tp_testkit::{Clock, MemGroups, SystemClock};
+    use tp_testkit::{Clock, MemAddressBook, MemGroups, SystemClock};
 
     use super::*;
 
@@ -777,6 +899,7 @@ mod group_sync {
         sync: GroupSync,
         fake: Arc<Fake>,
         groups: MemGroups,
+        book: MemAddressBook,
         alice: AccountId,
         carol: AccountId,
     }
@@ -790,10 +913,17 @@ mod group_sync {
         ])
         .await;
         let groups = MemGroups::new();
+        let book = MemAddressBook::new();
         Env {
-            sync: GroupSync::new(dir, Arc::new(meta), Arc::new(groups.clone())),
+            sync: GroupSync::new(
+                dir,
+                Arc::new(meta),
+                Arc::new(groups.clone()),
+                Arc::new(book.clone()),
+            ),
             fake,
             groups,
+            book,
             alice: ids[0],
             carol: ids[1],
         }
@@ -820,6 +950,7 @@ mod group_sync {
             groups,
             alice,
             carol,
+            ..
         } = env(openldap_cfg()).await;
         let full = sync.run(None).await.expect("full");
         assert_eq!((full.upserted, full.removed, full.skipped), (2, 0, 0));
@@ -894,6 +1025,141 @@ mod group_sync {
         );
     }
 
+    /// AUTH-10: почтовый контакт-участник группы — по `external_id` в адресной книге; выбыл — группа снимается.
+    #[tokio::test]
+    async fn contact_member() {
+        use tp_contracts::ContactId;
+        use tp_contracts::addressbook::{ContactStore, MailContact};
+
+        const VENDOR_DN: &str = "cn=vendor,ou=contacts,dc=example,dc=org";
+        let cfg = LdapConfig {
+            contacts: Some(ContactMap {
+                base: Some("ou=contacts,dc=example,dc=org".into()),
+                ..ContactMap::default()
+            }),
+            ..openldap_cfg()
+        };
+        let Env {
+            sync,
+            fake,
+            groups,
+            book,
+            ..
+        } = env(cfg).await;
+        let vendor = MailContact {
+            id: ContactId::new(),
+            tenant: T,
+            display_name: "Vendor".into(),
+            email: "support@vendor.example".into(),
+            external_id: Some("00000000-0000-0000-0000-0000000000c0".into()),
+            attributes: BTreeMap::new(),
+            groups: Vec::new(),
+            hidden_from_gal: false,
+        };
+        book.put_contact(vendor.clone()).await.expect("contact");
+        fake.set_all(DEVS_DN, "member", &[ALICE_DN, VENDOR_DN]);
+        let full = sync.run(None).await.expect("full");
+        let devs = group(&groups, DEVS).await;
+        let got = |book: MemAddressBook| async move {
+            book.contact(T, vendor.id)
+                .await
+                .expect("contact")
+                .expect("some")
+                .groups
+        };
+        assert_eq!(got(book.clone()).await, [devs.id]);
+        assert_eq!(
+            book.group_contacts(T, devs.id).await.expect("expand").len(),
+            1
+        );
+
+        fake.set_all(DEVS_DN, "member", &[ALICE_DN]);
+        fake.set(DEVS_DN, "modifyTimestamp", "20261005000000Z");
+        sync.run(Some(&full.cursor)).await.expect("incremental");
+        assert!(got(book.clone()).await.is_empty());
+    }
+
+    /// Приёмка CTR-32: участник-учётная запись — по идентификатору каталога; переименование входа не теряет
+    /// членство. Имя входа — только для учётной записи без `external_id`.
+    #[tokio::test]
+    async fn login_rename_keeps_membership() {
+        use tp_contracts::meta::{AccountStore, AccountUpsert};
+        use tp_testkit::MemMetadata;
+
+        const ALICE_ID: &str = "00000000-0000-0000-0000-0000000000a1";
+        let fake = Fake::new(include_str!("openldap.ldif"));
+        let dir = LdapDirectory::with_source(T, openldap_cfg(), fake.clone());
+        let meta = MemMetadata::new(Arc::new(SystemClock));
+        let domain = tp_contracts::DomainId::new();
+        let upsert = |login: &str, external_id: Option<&str>| AccountUpsert {
+            domain,
+            login: login.to_owned(),
+            display_name: login.to_owned(),
+            external_id: external_id.map(str::to_owned),
+            enabled: true,
+            aliases: Vec::new(),
+            kind: tp_contracts::meta::AccountKind::User,
+        };
+        let alice = meta
+            .upsert(T, upsert("alice@example.org", Some(ALICE_ID)))
+            .await
+            .expect("alice")
+            .id;
+        // carol заведена до синхронизации каталога (без `external_id`) — сопоставляется по имени входа.
+        let carol = meta
+            .upsert(T, upsert("carol@example.org", None))
+            .await
+            .expect("carol")
+            .id;
+        let groups = MemGroups::new();
+        let sync = GroupSync::new(
+            dir,
+            Arc::new(meta.clone()),
+            Arc::new(groups.clone()),
+            Arc::new(MemAddressBook::new()),
+        );
+        let full = sync.run(None).await.expect("full");
+        assert_eq!(
+            group(&groups, DEVS).await.members,
+            sorted(vec![
+                GroupMember::Account(alice),
+                GroupMember::Account(carol)
+            ])
+        );
+
+        // Вход alice переименован в каталоге и в метаданных (синхронизация учётных записей — по `external_id`).
+        fake.set_all(ALICE_DN, "mail", &["liddell@example.org"]);
+        meta.upsert(T, upsert("liddell@example.org", Some(ALICE_ID)))
+            .await
+            .expect("rename");
+        fake.set(DEVS_DN, "modifyTimestamp", "20261005000000Z");
+        let inc = sync.run(Some(&full.cursor)).await.expect("incremental");
+        assert_eq!(inc.upserted, 1);
+        assert_eq!(
+            group(&groups, DEVS).await.members,
+            sorted(vec![
+                GroupMember::Account(alice),
+                GroupMember::Account(carol)
+            ])
+        );
+
+        // Запись каталога с тем же именем входа, но другим идентификатором — другой человек: учётная запись
+        // alice (со своим `external_id`) по имени входа не сопоставляется.
+        let devs = group(&groups, DEVS).await;
+        fake.set_all(
+            ALICE_DN,
+            "entryUUID",
+            &["00000000-0000-0000-0000-0000000000ff"],
+        );
+        fake.set(DEVS_DN, "modifyTimestamp", "20261006000000Z");
+        sync.run(Some(&inc.cursor)).await.expect("incremental");
+        assert_eq!(
+            group(&groups, DEVS).await.members,
+            [GroupMember::Account(carol)]
+        );
+        assert_eq!(group(&groups, DEVS).await.id, devs.id);
+    }
+
     #[tokio::test]
     async fn restrictions_moderators_and_hiding_from_directory() {
         let flag = |attribute: &str| {
@@ -920,6 +1186,7 @@ mod group_sync {
             groups,
             alice,
             carol,
+            ..
         } = env(cfg.clone()).await;
         fake.set(STAFF_DN, "tpHidden", "true");
         fake.set(STAFF_DN, "tpModerator", CAROL_DN);
@@ -1006,5 +1273,111 @@ mod group_sync {
         let empty = sync.run(None).await.expect("empty");
         assert_eq!(empty.removed, 0);
         assert_eq!(groups.list(T).await.expect("list").len(), 2);
+    }
+}
+
+/// Ключ клиентского сертификата LDAPS — из хранилища секретов (`tls.key`, решение 100).
+mod client_key_tls {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use rustls::SignatureScheme;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
+    use tp_contracts::Error;
+    use tp_contracts::secrets::SecretRef;
+    use tp_contracts::tls::InternalTls;
+    use tp_testkit::{MemSecretStore, SystemClock};
+
+    use super::super::client_tls;
+    use crate::client_key;
+
+    fn testdata(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/testdata")
+            .join(name)
+    }
+
+    fn tls(key: &SecretRef) -> InternalTls {
+        InternalTls {
+            cert_file: Some(testdata("client.crt")),
+            key: Some(key.clone()),
+            ..InternalTls::default()
+        }
+    }
+
+    fn store(key: &SecretRef, name: &str) -> MemSecretStore {
+        let s = MemSecretStore::new(Arc::new(SystemClock));
+        s.set(
+            key,
+            std::fs::read_to_string(testdata(name)).expect("testdata"),
+        );
+        s
+    }
+
+    #[tokio::test]
+    async fn key_from_secret_store_is_file_identity() {
+        let r = SecretRef::new("thepost/ldap", "tls_key").expect("ref");
+        let tls = tls(&r);
+        let key = client_key("LDAP", &tls, &store(&r, "client.key"))
+            .await
+            .expect("key")
+            .expect("some");
+        let cfg = client_tls(&tls, Some(&key)).expect("tls");
+        let got = cfg
+            .client_auth_cert_resolver
+            .resolve(&[], &[SignatureScheme::ECDSA_NISTP256_SHA256])
+            .expect("client cert");
+
+        let cert = std::fs::read(testdata("client.crt")).expect("cert");
+        let want_chain = rustls::pki_types::CertificateDer::pem_slice_iter(&cert)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("pem");
+        assert_eq!(got.cert, want_chain);
+        let file_key = PrivateKeyDer::from_pem_file(testdata("client.key")).expect("key file");
+        let want_key = rustls::crypto::aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(file_key)
+            .expect("load");
+        assert_eq!(got.key.public_key(), want_key.public_key());
+        assert!(got.keys_match().is_ok());
+    }
+
+    #[tokio::test]
+    async fn key_errors() {
+        let r = SecretRef::new("thepost/ldap", "tls_key").expect("ref");
+        // Нет секрета в хранилище — понятная ошибка с путём.
+        let empty = MemSecretStore::new(Arc::new(SystemClock));
+        match client_key("LDAP", &tls(&r), &empty).await {
+            Err(Error::Invalid(m)) => assert!(m.contains("thepost/ldap#tls_key"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // Ключ от другого сертификата.
+        let wrong = client_key("LDAP", &tls(&r), &store(&r, "other.key"))
+            .await
+            .expect("key");
+        assert!(matches!(
+            client_tls(&tls(&r), wrong.as_ref()),
+            Err(Error::Invalid(_))
+        ));
+        // Сертификат без ключа.
+        assert!(matches!(client_tls(&tls(&r), None), Err(Error::Invalid(_))));
+        // `key_file` не поддерживается.
+        let file = InternalTls {
+            cert_file: Some(testdata("client.crt")),
+            key_file: Some(testdata("client.key")),
+            ..InternalTls::default()
+        };
+        assert!(matches!(
+            client_key("LDAP", &file, &empty).await,
+            Err(Error::Invalid(_))
+        ));
+        // Без mTLS — ключ не читается.
+        assert_eq!(
+            client_key("LDAP", &InternalTls::default(), &empty)
+                .await
+                .map(|k| k.is_none()),
+            Ok(true)
+        );
     }
 }

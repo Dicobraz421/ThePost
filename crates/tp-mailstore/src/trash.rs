@@ -101,7 +101,7 @@ pub(crate) trait Timer: Send + Sync {
 }
 
 /// Системные часы и таймер tokio.
-struct SystemTimer;
+pub(crate) struct SystemTimer;
 
 impl Timer for SystemTimer {
     fn now(&self) -> OffsetDateTime {
@@ -123,10 +123,10 @@ async fn next_event(events: &mut Option<EventStream>) -> Option<tp_contracts::bu
 }
 
 /// Момент позже любого срока: `TrashStore::expired` на него — элементы по возрастанию срока.
-const FAR: OffsetDateTime = PrimitiveDateTime::MAX.assume_utc();
+pub(crate) const FAR: OffsetDateTime = PrimitiveDateTime::MAX.assume_utc();
 
 /// `at + d`; вне диапазона — `FAR`.
-fn after(at: OffsetDateTime, d: Duration) -> OffsetDateTime {
+pub(crate) fn after(at: OffsetDateTime, d: Duration) -> OffsetDateTime {
     time::Duration::try_from(d)
         .ok()
         .and_then(|d| at.checked_add(d))
@@ -367,7 +367,7 @@ mod tests {
     use tp_contracts::{MailboxId, TenantId};
 
     use super::*;
-    use crate::testenv::{Env, stream};
+    use crate::testenv::{Env, TestTimer, stream, until};
 
     struct Fixture {
         env: Env,
@@ -653,6 +653,14 @@ mod tests {
             self.inner.list_hidden(scope, offset, limit).await
         }
 
+        async fn hidden_message(
+            &self,
+            scope: AccountScope,
+            id: MessageId,
+        ) -> Result<Option<tp_contracts::meta::Message>> {
+            self.inner.hidden_message(scope, id).await
+        }
+
         async fn restore(
             &self,
             scope: AccountScope,
@@ -685,39 +693,6 @@ mod tests {
         ) -> Result<()> {
             self.inner.defer(scope, object, until).await
         }
-    }
-
-    /// Таймер на часах testkit: запоминает взведённые сроки.
-    struct TestTimer {
-        clock: tp_testkit::ManualClock,
-        armed: Arc<Mutex<Vec<OffsetDateTime>>>,
-    }
-
-    impl Timer for TestTimer {
-        fn now(&self) -> OffsetDateTime {
-            tp_testkit::Clock::now(&self.clock)
-        }
-
-        fn sleep_until(&self, at: OffsetDateTime) -> impl Future<Output = ()> + Send {
-            self.armed.lock().expect("lock").push(at);
-            let clock = self.clock.clone();
-            async move {
-                while tp_testkit::Clock::now(&clock) < at {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            }
-        }
-    }
-
-    async fn until(what: &str, mut cond: impl AsyncFnMut() -> bool) {
-        let wait = async {
-            while !cond().await {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(5), wait)
-            .await
-            .unwrap_or_else(|_| panic!("не дождались: {what}"));
     }
 
     /// Взведённые сроки без подряд идущих повторов (сверка по лишнему сигналу срок не меняет).

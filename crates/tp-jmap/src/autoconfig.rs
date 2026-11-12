@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::core::Jmap;
 use crate::core::config::{MailEndpoint, Security};
+use crate::core::http::Peer;
 use crate::core::http::auth_error;
 
 /// Тип содержимого профиля Apple.
@@ -119,8 +120,12 @@ pub(crate) async fn thunderbird(
 }
 
 /// Профиль `.mobileconfig` вошедшего пользователя.
-pub(crate) async fn mobileconfig(State(j): State<Arc<Jmap>>, headers: HeaderMap) -> Response {
-    let p = match j.authenticate(&headers).await {
+pub(crate) async fn mobileconfig(
+    State(j): State<Arc<Jmap>>,
+    peer: Peer,
+    headers: HeaderMap,
+) -> Response {
+    let p = match j.authenticate(&headers, peer.0).await {
         Ok(p) => p,
         Err(e) => return auth_error(&e),
     };

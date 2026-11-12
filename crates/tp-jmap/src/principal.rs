@@ -6,8 +6,8 @@
 //! `/queryChanges` нет; `canCalculateChanges` — `false`).
 //!
 //! Отличия от RFC 9670 и черновика:
-//! - `type` — всегда `individual`: вид учётной записи (ресурс, переговорная) контракт пока не хранит
-//!   (`AccountKind::Resource` — CTR-48); фильтр `type` с другим значением ничего не находит;
+//! - `type` — `individual` или `resource` по виду учётной записи (`Account::kind`, CTR-48); фильтр `type` с другим
+//!   значением ничего не находит;
 //! - `description`, `timeZone`, `accounts` — `null`;
 //! - занятость видна всем участникам организации (права «только занятость» и политика — CTR-48);
 //!   `showDetails` не поддерживается: `event` периода — `null`;
@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tp_contracts::ids::{AccountId, TenantId};
-use tp_contracts::meta::{Account, AccountState, AccountStore};
+use tp_contracts::meta::{Account, AccountKind, AccountState, AccountStore};
 use tp_contracts::schedule::{BusyKind, BusyPeriod, Period};
 
 use crate::core::error::{MethodError, MethodResult};
@@ -84,7 +84,7 @@ async fn all(jmap: &Jmap, tenant: TenantId) -> MethodResult<Vec<Account>> {
 }
 
 /// Участник по `id`; нет, отключён или чужой организации — `None`.
-async fn find(jmap: &Jmap, tenant: TenantId, id: &str) -> MethodResult<Option<Account>> {
+pub(crate) async fn find(jmap: &Jmap, tenant: TenantId, id: &str) -> MethodResult<Option<Account>> {
     let Ok(id) = AccountId::from_str(id) else {
         return Ok(None);
     };
@@ -93,6 +93,14 @@ async fn find(jmap: &Jmap, tenant: TenantId, id: &str) -> MethodResult<Option<Ac
         return Ok(None);
     };
     Ok(visible(store, &a).await?.then_some(a))
+}
+
+/// `Principal.type` (RFC 9670) по виду учётной записи.
+fn principal_type(kind: AccountKind) -> &'static str {
+    match kind {
+        AccountKind::User => "individual",
+        AccountKind::Resource => "resource",
+    }
 }
 
 fn principal_json(ctx: &Ctx<'_>, a: &Account) -> Map<String, Value> {
@@ -112,7 +120,7 @@ fn principal_json(ctx: &Ctx<'_>, a: &Account) -> Map<String, Value> {
     }
     object(json!({
         "id": id,
-        "type": "individual",
+        "type": principal_type(a.kind),
         "name": a.display_name,
         "description": null,
         "email": a.login,
@@ -204,7 +212,7 @@ fn matches(filter: &Value, own: AccountId, a: &Account) -> MethodResult<bool> {
                 let t = text()?;
                 name.contains(&t) || email.contains(&t)
             }
-            "type" => val.as_str().ok_or_else(unsupported)? == "individual",
+            "type" => val.as_str().ok_or_else(unsupported)? == principal_type(a.kind),
             "timeZone" => {
                 val.as_str().ok_or_else(unsupported)?;
                 false
@@ -404,6 +412,8 @@ mod tests {
             display_name: name.into(),
             external_id: cur.external_id,
             enabled,
+            aliases: cur.aliases,
+            kind: cur.kind,
         };
         env.meta.upsert(scope.tenant, data).await.expect("upsert");
         scope

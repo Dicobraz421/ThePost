@@ -15,6 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,10 +28,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::config::duration;
+use tp_contracts::secrets::{Secret, SecretStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result};
 
-use crate::{Accounts, check_channel, plaintext_warning};
+use crate::{Accounts, check_channel, client_key, plaintext_warning};
 
 /// Секция поставщика OpenID Connect (`auth.oidc`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -64,7 +66,8 @@ pub struct OidcConfig {
     pub http_timeout: Duration,
     /// Наибольший размер ответа поставщика, байт.
     pub max_response: usize,
-    /// TLS: CA поставщика (`ca_file`; не задан — системные корни), сертификат клиента; `allow_plaintext` — dev.
+    /// TLS: CA поставщика (`ca_file`; не задан — системные корни), сертификат клиента (`cert_file` и ключ `key` —
+    /// ссылка на секрет, PEM); `allow_plaintext` — dev.
     pub tls: InternalTls,
 }
 
@@ -147,6 +150,9 @@ pub struct OidcAuthenticator {
     algs: Vec<Algorithm>,
     plaintext: bool,
     http: reqwest::Client,
+    /// Задан `tls.key`, но ключ ещё не прочитан ([`OidcAuthenticator::with_secrets`]): запросы к поставщику —
+    /// ошибка, а не канал без сертификата клиента.
+    key_pending: bool,
     keys: moka::future::Cache<(), Arc<Keys>>,
     accounts: Accounts,
 }
@@ -163,38 +169,36 @@ impl fmt::Debug for OidcAuthenticator {
 
 impl OidcAuthenticator {
     /// Проверка токенов поставщика `cfg` для учётных записей `accounts`. Ключи читаются при первой проверке.
+    /// С `tls.key` (mTLS) ключ клиентского сертификата читает [`with_secrets`](Self::with_secrets); до этого
+    /// запросы к поставщику — [`Error::Invalid`].
     pub async fn new(cfg: OidcConfig, profile: Profile, accounts: Accounts) -> Result<Self> {
         let plaintext = cfg.check(profile)?;
         if plaintext {
             tracing::warn!("{}", plaintext_warning("OIDC"));
         }
-        let tls = cfg.tls.clone();
-        let (roots, identity) = tokio::task::spawn_blocking(move || read_tls(&tls))
-            .await
-            .map_err(|e| Error::Internal(format!("OIDC: tls: {e}")))??;
-        let mut http = reqwest::Client::builder()
-            .timeout(cfg.http_timeout)
-            .https_only(!plaintext);
-        for cert in roots {
-            http = http.add_root_certificate(cert);
-        }
-        if let Some(id) = identity {
-            http = http.identity(id);
-        }
-        let http = http
-            .build()
-            .map_err(|e| Error::Internal(format!("OIDC: http client: {e}")))?;
+        let http = http_client(&cfg, plaintext, None).await?;
         Ok(OidcAuthenticator {
             algs: cfg.algs()?,
             keys: moka::future::Cache::builder()
                 .max_capacity(1)
                 .time_to_live(cfg.jwks_ttl)
                 .build(),
+            key_pending: cfg.tls.key.is_some(),
             cfg: Arc::new(cfg),
             plaintext,
             http,
             accounts,
         })
+    }
+
+    /// Читает из `secrets` ключ клиентского сертификата (`tls.key`) и включает mTLS к поставщику; без
+    /// `tls.key` ничего не меняет.
+    pub async fn with_secrets(mut self, secrets: &dyn SecretStore) -> Result<Self> {
+        if let Some(key) = client_key("OIDC", &self.cfg.tls, secrets).await? {
+            self.http = http_client(&self.cfg, self.plaintext, Some(key)).await?;
+            self.key_pending = false;
+        }
+        Ok(self)
     }
 
     /// Адрес документа discovery поставщика (`openid-configuration` в ответе-ошибке OAUTHBEARER).
@@ -206,6 +210,12 @@ impl OidcAuthenticator {
     }
 
     async fn get<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
+        if self.key_pending {
+            return Err(Error::Invalid(
+                "OIDC: tls.key is set, but the secret store is not connected (OidcAuthenticator::with_secrets)"
+                    .into(),
+            ));
+        }
         let fail = |what: &str| {
             tracing::warn!(url, "OIDC provider: {what}");
             Error::Unavailable { retry_after: None }
@@ -312,8 +322,35 @@ impl OidcAuthenticator {
     }
 }
 
-/// Корни (`ca_file`) и сертификат клиента для `reqwest`. Блокирующий I/O.
-fn read_tls(tls: &InternalTls) -> Result<(Vec<reqwest::Certificate>, Option<reqwest::Identity>)> {
+/// Клиент HTTP к поставщику: таймаут, только `https` (кроме открытого канала dev), корни из `ca_file`,
+/// сертификат клиента `cert_file` с ключом `key` (PEM).
+async fn http_client(
+    cfg: &OidcConfig,
+    plaintext: bool,
+    key: Option<Secret>,
+) -> Result<reqwest::Client> {
+    let tls = cfg.tls.clone();
+    let (roots, identity) = tokio::task::spawn_blocking(move || read_tls(&tls, key.as_ref()))
+        .await
+        .map_err(|e| Error::Internal(format!("OIDC: tls: {e}")))??;
+    let mut http = reqwest::Client::builder()
+        .timeout(cfg.http_timeout)
+        .https_only(!plaintext);
+    for cert in roots {
+        http = http.add_root_certificate(cert);
+    }
+    if let Some(id) = identity {
+        http = http.identity(id);
+    }
+    http.build()
+        .map_err(|e| Error::Internal(format!("OIDC: http client: {e}")))
+}
+
+/// Корни (`ca_file`) и сертификат клиента (`cert_file` и ключ `key`) для `reqwest`. Блокирующий I/O.
+fn read_tls(
+    tls: &InternalTls,
+    key: Option<&Secret>,
+) -> Result<(Vec<reqwest::Certificate>, Option<reqwest::Identity>)> {
     let read = |p: &std::path::Path| {
         std::fs::read(p).map_err(|e| Error::Invalid(format!("OIDC: {}: {e}", p.display())))
     };
@@ -322,17 +359,22 @@ fn read_tls(tls: &InternalTls) -> Result<(Vec<reqwest::Certificate>, Option<reqw
             .map_err(|e| Error::Invalid(format!("OIDC: tls.ca_file: {e}")))?,
         None => Vec::new(),
     };
-    let identity = match (&tls.cert_file, &tls.key_file) {
+    let identity = match (&tls.cert_file, key) {
         (Some(c), Some(k)) => {
             let mut pem = read(c)?;
             pem.push(b'\n');
-            pem.extend(read(k)?);
+            pem.extend_from_slice(k.expose().as_bytes());
             let id = reqwest::Identity::from_pem(&pem)
-                .map_err(|e| Error::Invalid(format!("OIDC: tls.cert_file: {e}")));
+                .map_err(|e| Error::Invalid(format!("OIDC: tls.cert_file, tls.key: {e}")));
             pem.fill(0);
             Some(id?)
         }
-        _ => None,
+        (_, None) => None,
+        (None, Some(_)) => {
+            return Err(Error::Invalid(
+                "OIDC: tls.cert_file and tls.key must be set together".into(),
+            ));
+        }
     };
     Ok((roots, identity))
 }
@@ -357,7 +399,7 @@ fn scopes(claims: &serde_json::Map<String, Value>) -> BTreeSet<String> {
 
 #[async_trait]
 impl Authenticator for OidcAuthenticator {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
+    async fn verify(&self, credentials: Credentials, _peer: Option<IpAddr>) -> Result<Principal> {
         let Credentials::Bearer(token) = credentials else {
             return Err(Error::Forbidden);
         };
@@ -521,7 +563,7 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         let (auth, alice) = setup(p.cfg()).await;
         let t = token(Some("k1"), K1, claims(&p, json!({})));
         let pr = auth
-            .verify(Credentials::Bearer(t.clone()))
+            .verify(Credentials::Bearer(t.clone()), crate::testutil::PEER)
             .await
             .expect("ok");
         assert_eq!(pr.account, alice);
@@ -533,12 +575,17 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         );
         assert!(pr.has_scope("mail") && !pr.has_scope("admin"));
         // Набор ключей — из кэша.
-        auth.verify(Credentials::Bearer(t)).await.expect("again");
+        auth.verify(Credentials::Bearer(t), crate::testutil::PEER)
+            .await
+            .expect("again");
         assert_eq!(p.hits("/.well-known/openid-configuration"), 1);
         assert_eq!(p.hits("/jwks"), 1);
         // Без kid — единственный ключ набора; scp массивом.
         let t = token(None, K1, claims(&p, json!({ "scp": ["imap"] })));
-        let pr = auth.verify(Credentials::Bearer(t)).await.expect("no kid");
+        let pr = auth
+            .verify(Credentials::Bearer(t), crate::testutil::PEER)
+            .await
+            .expect("no kid");
         assert!(pr.has_scope("imap"));
         assert_eq!(
             auth.discovery_url(),
@@ -586,7 +633,8 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         ];
         for t in bad {
             assert_eq!(
-                auth.verify(Credentials::Bearer(t)).await,
+                auth.verify(Credentials::Bearer(t), crate::testutil::PEER)
+                    .await,
                 Err(Error::Forbidden)
             );
         }
@@ -594,7 +642,10 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
             login: "alice@example.org".into(),
             secret: "x".into(),
         };
-        assert_eq!(auth.verify(pw).await, Err(Error::Forbidden));
+        assert_eq!(
+            auth.verify(pw, crate::testutil::PEER).await,
+            Err(Error::Forbidden)
+        );
     }
 
     #[tokio::test]
@@ -605,38 +656,79 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
             ..p.cfg()
         })
         .await;
-        auth.verify(Credentials::Bearer(token(
-            Some("k1"),
-            K1,
-            claims(&p, json!({})),
-        )))
+        auth.verify(
+            Credentials::Bearer(token(Some("k1"), K1, claims(&p, json!({})))),
+            crate::testutil::PEER,
+        )
         .await
         .expect("k1");
         *p.jwks.lock().expect("lock") = jwks(&[("k2", K2)]);
-        auth.verify(Credentials::Bearer(token(
-            Some("k2"),
-            K2,
-            claims(&p, json!({})),
-        )))
+        auth.verify(
+            Credentials::Bearer(token(Some("k2"), K2, claims(&p, json!({})))),
+            crate::testutil::PEER,
+        )
         .await
         .expect("k2 after refresh");
         assert_eq!(p.hits("/jwks"), 2);
 
         // Частое перечитывание ограничено: неизвестный kid в пределах jwks_refresh_min — отказ без запроса.
         let (slow, _) = setup(p.cfg()).await;
-        slow.verify(Credentials::Bearer(token(
-            Some("k2"),
-            K2,
-            claims(&p, json!({})),
-        )))
+        slow.verify(
+            Credentials::Bearer(token(Some("k2"), K2, claims(&p, json!({})))),
+            crate::testutil::PEER,
+        )
         .await
         .expect("k2");
         let unknown = token(Some("k3"), K1, claims(&p, json!({})));
         assert_eq!(
-            slow.verify(Credentials::Bearer(unknown)).await,
+            slow.verify(Credentials::Bearer(unknown), crate::testutil::PEER)
+                .await,
             Err(Error::Forbidden)
         );
         assert_eq!(p.hits("/jwks"), 3);
+    }
+
+    #[tokio::test]
+    async fn client_key_from_secret_store() {
+        use tp_contracts::secrets::SecretRef;
+        use tp_testkit::{MemSecretStore, SystemClock};
+
+        let p = Provider::start(&[("k1", K1)]).await;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testdata");
+        let r = SecretRef::new("thepost/oidc", "tls_key").expect("ref");
+        let mut cfg = p.cfg();
+        cfg.tls.cert_file = Some(dir.join("client.crt"));
+        cfg.tls.key = Some(r.clone());
+        let t = || token(Some("k1"), K1, claims(&p, json!({})));
+
+        // Хранилище не подключено — понятная ошибка, к поставщику без сертификата не идём.
+        let (auth, _) = setup(cfg.clone()).await;
+        assert!(matches!(
+            auth.verify(Credentials::Bearer(t()), crate::testutil::PEER).await,
+            Err(Error::Invalid(m)) if m.contains("secret store")
+        ));
+        assert_eq!(p.hits("/jwks"), 0);
+
+        // Секрета нет в хранилище.
+        let store = MemSecretStore::new(Arc::new(SystemClock));
+        assert!(matches!(
+            auth.clone().with_secrets(&store).await,
+            Err(Error::Invalid(m)) if m.contains("thepost/oidc#tls_key")
+        ));
+
+        // Ключ из хранилища — тот же PEM, что в файле.
+        store.set(
+            &r,
+            std::fs::read_to_string(dir.join("client.key")).expect("key"),
+        );
+        let (auth, alice) = setup(cfg).await;
+        let auth = auth.with_secrets(&store).await.expect("with_secrets");
+        assert_eq!(
+            auth.verify(Credentials::Bearer(t()), crate::testutil::PEER)
+                .await
+                .map(|p| p.account),
+            Ok(alice)
+        );
     }
 
     #[tokio::test]
@@ -650,7 +742,8 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         .await;
         let t = token(Some("k1"), K1, claims(&p, json!({})));
         assert!(matches!(
-            auth.verify(Credentials::Bearer(t)).await,
+            auth.verify(Credentials::Bearer(t), crate::testutil::PEER)
+                .await,
             Err(Error::Internal(_))
         ));
         // Поставщик недоступен.
@@ -661,7 +754,8 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         .await;
         let t = token(Some("k1"), K1, claims(&p, json!({})));
         assert!(matches!(
-            auth.verify(Credentials::Bearer(t)).await,
+            auth.verify(Credentials::Bearer(t), crate::testutil::PEER)
+                .await,
             Err(Error::Unavailable { .. })
         ));
     }

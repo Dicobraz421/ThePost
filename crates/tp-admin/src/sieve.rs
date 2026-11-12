@@ -187,7 +187,7 @@ const ORG_SCRIPT: &str = "/api/v1/orgs/{org}/sieve";
 
 /// Маршруты правил Sieve и автоответа.
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route(SCRIPTS, get(list))
+    r.route(SCRIPTS, get(list_scripts))
         .route(SCRIPT, get(read).put(put).delete(remove))
         .route(ACTIVATE, post(activate))
         .route(DEACTIVATE, post(deactivate))
@@ -204,7 +204,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
 #[derive(Debug, OpenApi)]
 #[openapi(
     paths(
-        list,
+        list_scripts,
         read,
         put,
         remove,
@@ -272,7 +272,7 @@ fn verify(s: &Sieve, text: &str) -> ApiResult<Option<Response>> {
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("account" = String, Path, description = "Учётная запись (UUID)")),
     responses((status = 200, body = Vec<Script>), (status = 404, body = Problem), (status = 503, body = Problem)))]
-async fn list(
+async fn list_scripts(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, AccountId)>,
 ) -> ApiResult<Json<Vec<Script>>> {

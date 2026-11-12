@@ -1,7 +1,7 @@
 # PLT-12: клиент OpenBao/Vault и секреты в конфигурации — ручная проверка
 
 Нужны: Docker с compose, клон репозитория. Профиль `smb` из `deploy/compose/dev.yml` (OpenBao по TLS, вход AppRole,
-`compose/thepost-smb.yaml`). Шаги с `thepost serve`/`thepost doctor` — после подключения `VaultStore`, `doctor` и
+пресет `deploy/config/all.yaml` и переменные `THEPOST_*` службы `thepost`). Шаги с `thepost serve`/`thepost doctor` — после подключения `VaultStore`, `doctor` и
 `Reloader::with_secret_store` в приложении (полоса app); до этого проверяются автотесты и шаг «Автотест с OpenBao».
 
 ## Автотест с OpenBao

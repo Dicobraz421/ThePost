@@ -1,12 +1,27 @@
 # Узел The Post в Kubernetes:
 #   helm install thepost deploy/helm/thepost -n thepost --create-namespace -f <свои значения>
 # До установки — OpenBao (deploy/helm/openbao, bootstrap.sh: Kubernetes auth для сервисного аккаунта thepost),
-# секрет TLS клиентских протоколов (values.tls.secretName: tls.crt, tls.key; ca.crt — CA внутренних каналов).
+# секрет с цепочкой TLS клиентских протоколов (values.tls.secretName: tls.crt; ca.crt — CA внутренних каналов) и ключ TLS
+# в OpenBao (секрет thepost/tls#key — bootstrap.sh с TLS_KEY; в под монтируются только tls.crt и ca.crt).
 
+# Образ узла — ghcr.io (выпуски beta.yml, linux/amd64; теги <версия> = appVersion чарта, beta-<дата> и beta),
+# подписан cosign без ключей:
+#   cosign verify ghcr.io/dicobraz421/thepost:<тег> \
+#     --certificate-identity 'https://github.com/Dicobraz421/ThePost/.github/workflows/beta.yml@refs/heads/main' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+# Закрепить проверенный образ — tag с digest из описания выпуска: "beta-20261112@sha256:…". Свой реестр (зеркало,
+# закрытый контур) — repository: <реестр>/thepost (тот же digest после копирования, например crane copy или skopeo
+# copy с подписью: cosign copy).
 image:
-  repository: thepost
-  tag: ""          # пусто — appVersion чарта
+  repository: ghcr.io/dicobraz421/thepost
+  # Пусто — appVersion чарта: установка закреплена за выпуском (решение 111).
+  tag: ""
   pullPolicy: IfNotPresent
+# Обязательно (решение 110: образ в ghcr.io закрытый) — секреты docker-registry для входа в реестр образа, в
+# пространстве имён релиза; без них helm template/install падает с подсказкой. Токен GitHub — read:packages:
+#   kubectl -n thepost create secret docker-registry ghcr --docker-server=ghcr.io #     --docker-username=<логин GitHub> --docker-password=<токен>
+#   helm install … --set 'imagePullSecrets[0].name=ghcr'
+imagePullSecrets: []
 
 replicaCount: 1
 
@@ -46,6 +61,7 @@ ports:
   submission: { container: 5587, service: 587 }
   imap: { container: 1143, service: 143 }
   imaps: { container: 1993, service: 993 }
+  managesieve: { container: 4190, service: 4190 }
   https: { container: 4443, service: 443 }
 
 service:
@@ -187,18 +203,39 @@ config:
     url: s3://thepost-blob
   tls:
     cert_file: /etc/thepost/tls/tls.crt
-    key_file: /etc/thepost/tls/tls.key
+    # Ключ — только из OpenBao (решение 100); новая версия секрета подхватывается без перезапуска.
+    key: { secret: "thepost/tls#key" }
   service_http:
     listen: "0.0.0.0:8081"
     internal_networks: ["0.0.0.0/32"]
+  # Календари и контакты (роль dav: /dav/, /.well-known/caldav и carddav) — на слушателе jmap, один порт с JMAP;
+  # отдельный адрес — http.dav (и порт в ports, Service).
   http:
     jmap: { listen: "0.0.0.0:4443" }
     admin: { listen: "127.0.0.1:8443" }
+  # Роль maintenance: очистка по сроку (надгробия DAV, журналы автоответов и доставки, токены admin init);
+  # сроки хранения — meta. Проверку BLOB в кластере выполняет один под — держатель лизы verify.lease_name.
+  maintenance:
+    purge_interval: 1h
+    admin_token_retention: 30d
+    verify: { at: "03:00", interval: 24h }
+  meta:
+    dav: { tombstone_ttl: 90d }
+    sieve: { vacation_log_ttl: 90d }
+    delivery: { retention: 30d }
+  # Лимиты CalDAV и CardDAV; полный перечень — thepost config schema.
+  dav:
+    max_request_size: 1048576
+    max_object_size: 1048576
   imap:
     listeners:
       - listen: "0.0.0.0:1143"
       - listen: "0.0.0.0:1993"
         implicit_tls: true
+  sieve:
+    managesieve:
+      listen:
+        - listen: "0.0.0.0:4190"
   smtp:
     hostname: mail.example.ru
     inbound:

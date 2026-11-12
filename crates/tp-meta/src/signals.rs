@@ -43,7 +43,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgListener;
 use time::OffsetDateTime;
 use tokio::sync::{Notify, watch};
 use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
@@ -54,9 +53,9 @@ use tp_contracts::{AccountId, Error, Result, TenantId};
 
 use crate::commits::{Histogram, Recorder, commit_metrics, observe_commit};
 use crate::failover::{Failover, connect_failover};
-use crate::pool::PoolConfig;
+use crate::pool::{AcquireObserver, PoolConfig};
 use crate::schema::db_err;
-use crate::shards::{ShardDirectory, ShardId, ShardResolver};
+use crate::shards::{ShardDirectory, ShardId, ShardPool, ShardResolver};
 
 /// Подсекция `meta.signals` (SRS 5.5). Параметры требуют перезапуска.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -817,8 +816,18 @@ impl ShardedSignalBus {
                 continue;
             }
             let cfg = self.dir.shard_pool_config(shard).await?;
-            let publish = connect_failover(&cfg, Arc::clone(&self.secrets)).await?;
-            let listen = connect_listener(&cfg, Arc::clone(&self.secrets)).await?;
+            let publish = connect_failover(
+                &cfg,
+                Arc::clone(&self.secrets),
+                self.dir.observer(shard, ShardPool::Publisher),
+            )
+            .await?;
+            let listen = connect_listener(
+                &cfg,
+                Arc::clone(&self.secrets),
+                self.dir.observer(shard, ShardPool::Listener),
+            )
+            .await?;
             let bus = PgSignalBus::start(publish, listen, self.cfg.clone())?;
             lock(&self.buses).entry(shard).or_insert(bus);
             added += 1;
@@ -927,10 +936,11 @@ async fn run_publisher(shared: Arc<Shared>, publish: Failover, mut stop: watch::
                     let channel = channel.clone();
                     let messages = messages.clone();
                     async move {
+                        let mut conn = pool.acquire().await?;
                         sqlx::query("SELECT pg_notify($1, m) FROM unnest($2::text[]) AS m")
                             .bind(channel)
                             .bind(messages)
-                            .execute(&pool)
+                            .execute(&mut *conn)
                             .await
                             .map(drop)
                             .map_err(db_err)
@@ -975,7 +985,7 @@ async fn run_listener(
         let connect = listen.retry(|pool| {
             let channel = channel.clone();
             async move {
-                let mut l = PgListener::connect_with(&pool).await.map_err(db_err)?;
+                let mut l = pool.listener().await?;
                 l.eager_reconnect(false);
                 l.ignore_pool_close_event(true);
                 l.listen(&channel).await.map_err(db_err)?;
@@ -1035,8 +1045,13 @@ async fn run_listener(
 
 /// Пул прямого соединения слушателя сигналов с учётными данными узла: мимо PgBouncer (с [`PoolConfig::pgbouncer`]
 /// — поиск primary по прямым адресам [`PoolConfig::direct_url`] + [`PoolConfig::direct_urls`], хотя бы один
-/// обязателен), без PgBouncer — поиск primary по `url` + `urls`.
-pub async fn connect_listener(cfg: &PoolConfig, secrets: Arc<dyn SecretStore>) -> Result<Failover> {
+/// обязателен), без PgBouncer — поиск primary по `url` + `urls`. Ожидание соединения слушателя и проверки
+/// primary — наблюдателю `observer`.
+pub async fn connect_listener(
+    cfg: &PoolConfig,
+    secrets: Arc<dyn SecretStore>,
+    observer: Arc<dyn AcquireObserver>,
+) -> Result<Failover> {
     let mut c = cfg.clone();
     if cfg.pgbouncer {
         let Some(mut direct) = cfg.direct_addresses() else {
@@ -1053,7 +1068,7 @@ pub async fn connect_listener(cfg: &PoolConfig, secrets: Arc<dyn SecretStore>) -
     c.max_connections = 2;
     c.min_connections = 0;
     c.application_name = format!("{} listener", cfg.application_name);
-    connect_failover(&c, secrets).await
+    connect_failover(&c, secrets, observer).await
 }
 
 #[cfg(test)]

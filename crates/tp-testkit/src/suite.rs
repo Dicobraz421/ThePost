@@ -33,6 +33,9 @@ use tp_contracts::addressbook::{
     ContactStore, DynamicGroup, DynamicGroupStore, MailContact, MemberFilter, Members,
     OrgAttributes, OrgMember, OrgStore, OrgUnit, unit_path,
 };
+use tp_contracts::admin_audit::{
+    AdminAuditEntry, AdminAuditPage, AdminAuditQuery, AdminAuditRecord, AuditLog,
+};
 use tp_contracts::admin_token::{LocalAdminToken, LocalAdminTokens};
 use tp_contracts::app_password::{AppPassword, AppPasswordStore};
 use tp_contracts::audit::{
@@ -48,14 +51,15 @@ use tp_contracts::delivery::{
 use tp_contracts::events::{Partition, PartitionAssigner, ShardEventLogs, ShardPartition};
 use tp_contracts::ext::{Decision, DecisionHook, DecisionHooks, FinalDelete};
 use tp_contracts::groups::{
-    DistributionGroup, GroupMember, GroupStore, HeldMessage, HoldSource, Moderation, Moderator,
-    SenderRestriction,
+    DistributionGroup, GroupMember, GroupStore, HeldCursor, HeldMessage, HoldSource, Moderation,
+    Moderator, SenderRestriction, held_page,
 };
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountState, AccountStore, AccountUpsert, ExistingContent,
-    MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, PolicyResolver, SpecialUse,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, Envelope,
+    ExistingContent, MailboxStore, MessageMeta, MessageQuery, MessageStore, NewMailbox, NewMessage,
+    Policy, PolicyResolver, PolicyStore, PolicyTarget, SpecialUse, account_disabled,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -313,7 +317,7 @@ async fn next_signal(stream: &mut EventStream) -> Option<Event> {
 }
 
 /// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37, CTR-39, CTR-49): `LogAppended`, `MembersChanged`,
-/// `ShardsChanged`, `Blocked`, `Unblocked`, `TrashChanged` приходят
+/// `ShardsChanged`, `Blocked`, `Unblocked`, `TrashChanged`, `AccountDisabled` (CTR-64) приходят
 /// в `subscribe_system()` и не приходят подписке учётной записи; `publish(Resync)` — `Invalid`.
 /// «Не пришло» проверяется тем, что первым пришёл сигнал, опубликованный позже.
 pub async fn signals(bus: &dyn EventBus) {
@@ -356,6 +360,7 @@ pub async fn signals(bus: &dyn EventBus) {
             },
         ),
         trash_changed(scope),
+        account_disabled(scope),
     ];
     for e in &published {
         assert!(e.kind.is_system());
@@ -2134,13 +2139,49 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
         Err(Error::NotFound)
     );
     assert_eq!(
-        store.held(t, Some(closed.id), 10).await,
+        store.held(t, Some(closed.id), None, 10).await,
         Ok(vec![h1.clone(), h2.clone()])
     );
     assert_eq!(
-        store.held(t, Some(closed.id), 1).await,
+        store.held(t, Some(closed.id), None, 1).await,
         Ok(vec![h1.clone()])
     );
+    // Страницы по курсору (CTR-55): 5 писем, у трёх одинаковое время, по 2 — без пропусков и повторов.
+    let extra = [held(2, closed.id), held(2, closed.id), held(5, closed.id)];
+    for h in &extra {
+        store.hold(t, h.clone()).await.expect("hold");
+    }
+    let expected = held_page(
+        [h1.clone(), h2.clone()].into_iter().chain(extra.clone()),
+        None,
+        usize::MAX,
+    );
+    let (mut read, mut after, mut pages) = (Vec::new(), None, 0);
+    loop {
+        let page = store
+            .held(t, Some(closed.id), after, 2)
+            .await
+            .expect("held");
+        pages += 1;
+        after = page.last().map(HeldCursor::of).or(after);
+        let last = page.len() < 2;
+        read.extend(page);
+        if last {
+            break;
+        }
+    }
+    assert_eq!(read, expected);
+    assert_eq!(pages, 3);
+    assert_eq!(store.held(t, Some(closed.id), after, 2).await, Ok(vec![]));
+    assert_eq!(
+        store
+            .held(t, None, Some(HeldCursor::of(&expected[3])), 10)
+            .await,
+        Ok(vec![h3.clone(), expected[4].clone()])
+    );
+    for h in &extra {
+        store.take_held(t, h.id).await.expect("take");
+    }
     assert_eq!(store.take_held(t, h1.id).await, Ok(h1.clone()));
     assert_eq!(store.take_held(t, h1.id).await, Err(Error::NotFound));
 
@@ -2149,7 +2190,7 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
     assert_eq!(store.get(f, all.id).await, Ok(None));
     assert_eq!(store.by_address(f, &upper).await, Ok(None));
     assert_eq!(store.expand(f, all.id).await, Err(Error::NotFound));
-    assert_eq!(store.held(f, None, 10).await, Ok(Vec::new()));
+    assert_eq!(store.held(f, None, None, 10).await, Ok(Vec::new()));
     assert_eq!(store.take_held(f, h2.id).await, Err(Error::NotFound));
     assert_eq!(store.remove(f, closed.id).await, Ok(Vec::new()));
     assert_eq!(store.get(t, closed.id).await, Ok(Some(closed.clone())));
@@ -2160,7 +2201,7 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
     assert_eq!(store.get(t, closed.id).await, Ok(None));
     store.remove(t, inner.id).await.expect("remove");
     assert_eq!(store.expand(t, all.id).await, Ok(sorted(vec![a, b])));
-    assert_eq!(store.held(t, Some(all.id), 10).await, Ok(vec![h3]));
+    assert_eq!(store.held(t, Some(all.id), None, 10).await, Ok(vec![h3]));
 }
 
 // ---------- AccountStore: external_id ----------
@@ -2195,6 +2236,8 @@ pub async fn account_external_id(
         display_name: "Анна".into(),
         external_id: Some(ext.clone()),
         enabled: true,
+        aliases: Vec::new(),
+        kind: AccountKind::User,
     };
     assert_eq!(
         accounts
@@ -2214,6 +2257,63 @@ pub async fn account_external_id(
             .expect("by ext"),
         Some(a.clone())
     );
+    // Псевдонимы (CTR-53): два псевдонима и catch-all домена — три адреса, основной первым; чтение — с записью.
+    let aliased = accounts
+        .upsert(
+            fx.tenant,
+            AccountUpsert {
+                aliases: vec![
+                    login("Sales"),
+                    format!("@{}", fx.domain_name),
+                    login("ANNA"),
+                    login("info"),
+                    login("sales"),
+                ],
+                ..upsert(login("anna"))
+            },
+        )
+        .await
+        .expect("upsert");
+    assert_eq!(
+        aliased.addresses(),
+        [login("anna"), login("sales"), login("info")].map(|a| a.to_lowercase())
+    );
+    assert_eq!(
+        accounts.get(fx.tenant, a.id).await,
+        Ok(Some(aliased.clone()))
+    );
+    assert_eq!(
+        accounts.by_external_id(fx.tenant, &ext).await,
+        Ok(Some(aliased))
+    );
+    // Запись заменяет псевдонимы.
+    assert_eq!(
+        accounts.upsert(fx.tenant, upsert(login("anna"))).await,
+        Ok(a.clone())
+    );
+    // Вид учётной записи (CTR-48) хранится с ней и заменяется записью.
+    assert_eq!(a.kind, AccountKind::User);
+    let room = accounts
+        .upsert(
+            fx.tenant,
+            AccountUpsert {
+                kind: AccountKind::Resource,
+                ..upsert(login("anna"))
+            },
+        )
+        .await
+        .expect("upsert");
+    assert_eq!(room.kind, AccountKind::Resource);
+    assert_eq!(accounts.get(fx.tenant, a.id).await, Ok(Some(room.clone())));
+    assert_eq!(
+        accounts.by_login(fx.tenant, &room.login).await,
+        Ok(Some(room))
+    );
+    assert_eq!(
+        accounts.upsert(fx.tenant, upsert(login("anna"))).await,
+        Ok(a.clone())
+    );
+
     assert_eq!(
         accounts
             .by_external_id(fx.tenant, &ext.to_uppercase())
@@ -2317,6 +2417,8 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                     display_name: n.into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await
@@ -2332,6 +2434,8 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                 display_name: "aaron".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -2414,6 +2518,54 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
     assert_eq!(list(fx.foreign_tenant, "", None, 10).await, vec![foreign]);
 }
 
+// ---------- AccountStore: by_ids ----------
+
+/// Набор проверок `AccountStore::by_ids` (CTR-63): порядок — как в запросе, несуществующие и чужой организации
+/// пропускаются, повтор идентификатора — одна запись, пустой список — пусто. Организации из [`AccountListFixture`]
+/// могут быть непустыми: имена входа уникальны для прогона.
+pub async fn account_by_ids(accounts: &dyn AccountStore, fx: &AccountListFixture) {
+    let run = AccountId::new();
+    let upsert = |domain: DomainId, n: &str| AccountUpsert {
+        domain,
+        login: format!("{n}-{run}@{}", fx.domain_name),
+        display_name: n.into(),
+        external_id: None,
+        enabled: true,
+        aliases: Vec::new(),
+        kind: AccountKind::User,
+    };
+    let mut made = Vec::new();
+    for n in ["ids-a", "ids-b"] {
+        made.push(
+            accounts
+                .upsert(fx.tenant, upsert(fx.domain, n))
+                .await
+                .expect("upsert"),
+        );
+    }
+    let foreign = accounts
+        .upsert(fx.foreign_tenant, upsert(fx.foreign_domain, "ids-f"))
+        .await
+        .expect("upsert foreign");
+    let (a, b) = (&made[0], &made[1]);
+    let by_ids = |ids: Vec<AccountId>| async move {
+        accounts.by_ids(fx.tenant, &ids).await.expect("by_ids")
+    };
+
+    // Три идентификатора, один несуществующий — две записи в порядке запроса.
+    assert_eq!(
+        by_ids(vec![b.id, AccountId::new(), a.id]).await,
+        vec![b.clone(), a.clone()]
+    );
+    assert_eq!(by_ids(vec![a.id, b.id]).await, vec![a.clone(), b.clone()]);
+    assert_eq!(
+        by_ids(vec![a.id, foreign.id, a.id]).await,
+        vec![a.clone()],
+        "чужая организация — нет, повтор — один раз"
+    );
+    assert_eq!(by_ids(Vec::new()).await, Vec::new());
+}
+
 // ---------- Moderation ----------
 
 /// Данные набора [`moderation`]: модерируемая группа организации `tenant` и письма её очереди, уже забранные
@@ -2467,7 +2619,7 @@ pub async fn moderation(m: &dyn Moderation, fx: &ModerationFixture) {
 // ---------- Trash: trash.purge ----------
 
 /// Запись правила администратора `trash.purge` уровня организации для [`trash_purge`]
-/// (запись политик уровней — вне контрактов до CTR-25: in-memory — `MemPolicies`, PostgreSQL — `PgMeta::set_policy`).
+/// (запись политик уровней — контракт `PolicyStore`: in-memory — `MemPolicies`, PostgreSQL — `PgMeta`).
 /// Остальные поля политики уровня сохраняются.
 #[async_trait]
 pub trait TrashPurgeAdmin: Send + Sync {
@@ -2535,7 +2687,13 @@ async fn put_message(
         size,
         received_at: purge_received_at(),
         flags: Default::default(),
-        meta: Default::default(),
+        meta: MessageMeta {
+            envelope: Envelope {
+                subject: Some(format!("размер {size}")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     };
     messages
         .insert(scope, mailbox, msg)
@@ -2562,7 +2720,7 @@ fn sorted_ids(mut ids: Vec<MessageId>) -> Vec<MessageId> {
     ids
 }
 
-/// Набор проверок «очистить корзину» (`TrashStore::purge`, `list_hidden`, `restore`) и настройки `trash.purge`
+/// Набор проверок «очистить корзину» (`TrashStore::purge`, `list_hidden`, `hidden_message`, `restore`) и настройки `trash.purge`
 /// (`PolicyResolver::trash_purge`, `set_user_trash_purge`): `hide` скрывает письмо (нет в `MessageStore`, в счётчиках
 /// корзины, в квоте), администратор его восстанавливает; `erase` стирает; Legal Hold и ошибка точки принятия решений
 /// не дают стереть; пользователь не меняет значение без `user_can_choose`, значение администратора приоритетнее.
@@ -2599,6 +2757,7 @@ pub async fn trash_purge(
     let b = put_message(messages, s, inbox, 200).await;
     let c = put_message(messages, s, inbox, 50).await;
     messages.to_trash(s, &[a, b]).await.expect("to trash");
+    let shown = messages.get(s, a).await.expect("get").expect("trashed");
     let out = trash
         .purge(s, &[a, c, MessageId::new(), a], &none)
         .await
@@ -2623,6 +2782,44 @@ pub async fn trash_purge(
     let hidden = trash.list_hidden(s, 0, 100).await.expect("hidden");
     assert_eq!(trash_ids(hidden.clone()), [a]);
     assert_eq!((hidden[0].origin, hidden[0].size), (inbox, 100));
+    // Администратор читает метаданные скрытого письма, скрытие не снимается.
+    let seen = trash
+        .hidden_message(s, a)
+        .await
+        .expect("hidden message")
+        .expect("hidden");
+    assert_eq!(
+        (
+            seen.id,
+            seen.skeleton,
+            seen.size,
+            seen.received_at,
+            &seen.meta
+        ),
+        (a, shown.skeleton, 100, shown.received_at, &shown.meta)
+    );
+    assert_eq!(seen.meta.envelope.subject.as_deref(), Some("размер 100"));
+    assert_eq!(messages.get(s, a).await, Ok(None), "остаётся скрытым");
+    assert_eq!(
+        trash_ids(trash.list_hidden(s, 0, 100).await.expect("hidden")),
+        [a]
+    );
+    for other in [b, c, MessageId::new()] {
+        assert_eq!(
+            trash.hidden_message(s, other).await,
+            Ok(None),
+            "видимое в корзине, вне корзины и отсутствующее — не скрытые"
+        );
+    }
+    let stranger = AccountScope {
+        tenant: s.tenant,
+        account: AccountId::new(),
+    };
+    assert_eq!(
+        trash.hidden_message(stranger, a).await,
+        Ok(None),
+        "чужая учётная запись"
+    );
     let used = quota.usage(s).await.expect("usage");
     assert_eq!(
         (used.used_bytes, used.messages),
@@ -2648,6 +2845,11 @@ pub async fn trash_purge(
         panic!("message expected");
     };
     assert_eq!((mailbox, inserted.id), (inbox, a));
+    assert_eq!(
+        trash.hidden_message(s, a).await,
+        Ok(None),
+        "восстановленное не скрыто"
+    );
     assert_eq!(
         messages.get(s, a).await.expect("get").map(|m| m.mailbox),
         Some(inbox)
@@ -4003,6 +4205,8 @@ pub async fn account_state(
         display_name: n.to_owned(),
         external_id: Some(format!("{n}-{run}")),
         enabled: true,
+        aliases: Vec::new(),
+        kind: AccountKind::User,
     };
     let scope = |account| AccountScope { tenant: t, account };
     let until = OffsetDateTime::now_utc()
@@ -4622,7 +4826,7 @@ pub async fn rule_moderation(
         Err(Error::Invalid(_))
     ));
     let queue: Vec<_> = groups
-        .held(t, None, 10_000)
+        .held(t, None, None, 10_000)
         .await
         .expect("queue")
         .into_iter()
@@ -4630,7 +4834,7 @@ pub async fn rule_moderation(
         .collect();
     assert_eq!(queue, [approve.clone(), decline.clone()]);
     let in_group = groups
-        .held(t, Some(GroupId::new()), 10_000)
+        .held(t, Some(GroupId::new()), None, 10_000)
         .await
         .expect("group queue");
     assert!(in_group.iter().all(|h| h.id != approve.id));
@@ -4657,4 +4861,328 @@ pub async fn rule_moderation(
     m.reject(t, &taken, "not allowed").await.expect("reject");
     assert_eq!(groups.take_held(t, approve.id).await, Err(Error::NotFound));
     (approve.id, decline.id)
+}
+
+/// Объекты набора [`policy_store`]: организация с доменом, учётной записью и папкой и другая организация.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyFixture {
+    /// Организация.
+    pub tenant: TenantId,
+    /// Другая организация (её уровни не видны).
+    pub foreign_tenant: TenantId,
+    /// Домен организации.
+    pub domain: DomainId,
+    /// Учётная запись домена.
+    pub account: AccountId,
+    /// Папка учётной записи.
+    pub mailbox: MailboxId,
+}
+
+/// CTR-25, CTR-67: [`PolicyStore`] — уровни читаются без наложения и задаются целиком, пустая политика удаляет
+/// уровень, организации разделены; запись сразу видна [`PolicyResolver`], разрешение по цепочке покрывает все поля,
+/// включая поля SMTP (`send_per_hour`, `rcpts_per_hour`, `max_recipients`, `dkim_selector`, `milter_profile`) и `retention`.
+pub async fn policy_store(
+    store: &dyn PolicyStore,
+    resolver: &dyn PolicyResolver,
+    fx: &PolicyFixture,
+) {
+    use PolicyTarget as T;
+    const DAY: Duration = Duration::from_secs(24 * 3600);
+    let t = fx.tenant;
+    let levels = [
+        T::Tenant,
+        T::Domain(fx.domain),
+        T::Account(fx.account),
+        T::Mailbox(fx.mailbox),
+    ];
+    for level in levels {
+        assert_eq!(
+            store.policy(t, level).await,
+            Ok(Policy::default()),
+            "{level:?}"
+        );
+    }
+    let resolve = |mailbox: Option<MailboxId>| {
+        resolver.resolve(t, Some(fx.domain), Some(fx.account), mailbox)
+    };
+    assert_eq!(resolve(Some(fx.mailbox)).await, Ok(Policy::default()));
+
+    let rule = TrashPurgeRule {
+        mode: TrashPurge::Erase,
+        user_can_choose: true,
+    };
+    let tenant = Policy {
+        quota_bytes: Some(10_000),
+        trash_retention: Some(DAY * 30),
+        retention: Some(DAY * 365),
+        send_per_hour: Some(100),
+        rcpts_per_hour: Some(3000),
+        max_recipients: Some(50),
+        dkim_selector: Some("t2026".into()),
+        milter_profile: Some("tenant".into()),
+        trash_purge: Some(rule),
+    };
+    let domain = Policy {
+        rcpts_per_hour: Some(1500),
+        max_recipients: Some(20),
+        dkim_selector: Some("d2026".into()),
+        ..Policy::default()
+    };
+    let account = Policy {
+        send_per_hour: Some(5),
+        milter_profile: Some("account".into()),
+        ..Policy::default()
+    };
+    let mailbox = Policy {
+        retention: Some(DAY * 7),
+        ..Policy::default()
+    };
+    let set = [&tenant, &domain, &account, &mailbox];
+    for (level, p) in levels.into_iter().zip(set) {
+        store.set_policy(t, level, p).await.expect("set_policy");
+    }
+    for (level, p) in levels.into_iter().zip(set) {
+        assert_eq!(
+            store.policy(t, level).await.as_ref(),
+            Ok(p),
+            "{level:?} без наложения"
+        );
+    }
+
+    let effective = resolve(None).await.expect("resolve");
+    assert_eq!(
+        effective,
+        Policy {
+            quota_bytes: Some(10_000),
+            trash_retention: Some(DAY * 30),
+            retention: Some(DAY * 365),
+            send_per_hour: Some(5),
+            rcpts_per_hour: Some(1500),
+            max_recipients: Some(20),
+            dkim_selector: Some("d2026".into()),
+            milter_profile: Some("account".into()),
+            trash_purge: Some(rule),
+        }
+    );
+    assert_eq!(effective.send_per_hour_or_default(), 5);
+    assert_eq!(effective.rcpts_per_hour_or_default(), 1500);
+    assert_eq!(effective.max_recipients_or_default(), 20);
+    assert_eq!(
+        resolve(Some(fx.mailbox)).await.expect("resolve").retention,
+        Some(DAY * 7),
+        "папка уточняет срок хранения"
+    );
+    assert_eq!(
+        resolver.resolve(t, None, None, None).await,
+        Ok(tenant.clone()),
+        "только организация"
+    );
+
+    // Другая организация не видит уровней.
+    let f = fx.foreign_tenant;
+    for level in [T::Tenant, T::Domain(fx.domain), T::Account(fx.account)] {
+        assert_eq!(
+            store.policy(f, level).await,
+            Ok(Policy::default()),
+            "{level:?}"
+        );
+    }
+    assert_eq!(
+        resolver
+            .resolve(f, Some(fx.domain), Some(fx.account), None)
+            .await,
+        Ok(Policy::default())
+    );
+
+    // Уровень задаётся целиком: незаданные поля домена — из организации.
+    let domain = Policy {
+        dkim_selector: Some("d2027".into()),
+        ..Policy::default()
+    };
+    store
+        .set_policy(t, T::Domain(fx.domain), &domain)
+        .await
+        .expect("replace");
+    assert_eq!(store.policy(t, T::Domain(fx.domain)).await, Ok(domain));
+    let effective = resolve(None).await.expect("resolve");
+    assert_eq!(effective.max_recipients, Some(50));
+    assert_eq!(
+        effective.rcpts_per_hour,
+        Some(3000),
+        "адресатов в час — из организации"
+    );
+    assert_eq!(effective.dkim_selector.as_deref(), Some("d2027"));
+
+    // Пустая политика удаляет уровень; без уровней — умолчания уровня организации.
+    for level in levels {
+        store
+            .set_policy(t, level, &Policy::default())
+            .await
+            .expect("clear");
+        assert_eq!(
+            store.policy(t, level).await,
+            Ok(Policy::default()),
+            "{level:?}"
+        );
+    }
+    let effective = resolve(Some(fx.mailbox)).await.expect("resolve");
+    assert_eq!(effective, Policy::default());
+    assert_eq!(
+        effective.send_per_hour_or_default(),
+        Policy::DEFAULT_SEND_PER_HOUR
+    );
+    assert_eq!(
+        effective.rcpts_per_hour_or_default(),
+        Policy::DEFAULT_RCPTS_PER_HOUR
+    );
+    assert_eq!(
+        effective.max_recipients_or_default(),
+        Policy::DEFAULT_MAX_RECIPIENTS
+    );
+}
+
+/// CTR-25: [`AuditLog`] — номера растут в порядке добавления; чтение — только записи организации (без уровня
+/// инсталляции и чужих), по возрастанию номера, интервал [`since`, `until`), курсор `after`, `next` у полной
+/// страницы; неверный запрос — `Invalid`. `tenant` и `foreign_tenant` — организации без записей в журнале.
+pub async fn admin_audit_log(log: &dyn AuditLog, tenant: TenantId, foreign_tenant: TenantId) {
+    let t0 = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("time");
+    let at = |s: i64| t0 + time::Duration::seconds(s);
+    let record = |tenant: Option<TenantId>, s: i64| {
+        let org = tenant.unwrap_or(foreign_tenant);
+        AdminAuditRecord {
+            at: at(s),
+            tenant,
+            actor_tenant: org,
+            actor: AccountId::new(),
+            actor_login: format!("admin{s}"),
+            roles: vec!["organization_admin".into()],
+            method: "PUT".into(),
+            route: "/api/v1/orgs/{org}/policy".into(),
+            path: format!("/api/v1/orgs/{org}/policy"),
+            status: if s % 2 == 0 { 200 } else { 403 },
+            content_messages: (s == 3).then_some(2),
+        }
+    };
+    let records = [
+        record(Some(tenant), 0),
+        record(Some(foreign_tenant), 1),
+        record(None, 2),
+        record(Some(tenant), 3),
+        record(Some(tenant), 4),
+    ];
+    let mut seqs = Vec::new();
+    for r in &records {
+        seqs.push(log.append(r).await.expect("append"));
+    }
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+    let entry = |i: usize| AdminAuditEntry {
+        seq: seqs[i],
+        record: records[i].clone(),
+    };
+    let query = |limit: usize| AdminAuditQuery {
+        since: None,
+        until: None,
+        limit,
+        after: None,
+    };
+    let page = |entries: Vec<AdminAuditEntry>, next: Option<u64>| AdminAuditPage { entries, next };
+
+    assert_eq!(
+        log.search(tenant, &query(10)).await,
+        Ok(page(vec![entry(0), entry(3), entry(4)], None))
+    );
+    assert_eq!(
+        log.search(foreign_tenant, &query(10)).await,
+        Ok(page(vec![entry(1)], None)),
+        "чужие записи и уровень инсталляции не видны"
+    );
+    // Страницы по курсору.
+    assert_eq!(
+        log.search(tenant, &query(2)).await,
+        Ok(page(vec![entry(0), entry(3)], Some(seqs[3])))
+    );
+    let rest = AdminAuditQuery {
+        after: Some(seqs[3]),
+        ..query(2)
+    };
+    assert_eq!(
+        log.search(tenant, &rest).await,
+        Ok(page(vec![entry(4)], None))
+    );
+    // Интервал [since, until).
+    let window = AdminAuditQuery {
+        since: Some(at(3)),
+        until: Some(at(4)),
+        ..query(10)
+    };
+    assert_eq!(
+        log.search(tenant, &window).await,
+        Ok(page(vec![entry(3)], None))
+    );
+    let since = AdminAuditQuery {
+        since: Some(at(1)),
+        ..query(10)
+    };
+    assert_eq!(
+        log.search(tenant, &since).await,
+        Ok(page(vec![entry(3), entry(4)], None))
+    );
+    // Неверный запрос.
+    assert!(matches!(
+        log.search(tenant, &query(0)).await,
+        Err(Error::Invalid(_))
+    ));
+    let reversed = AdminAuditQuery {
+        since: Some(at(4)),
+        until: Some(at(3)),
+        ..query(10)
+    };
+    assert!(matches!(
+        log.search(tenant, &reversed).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // APP-59: выгрузка — все записи (и уровень инсталляции) по возрастанию номера после `after`; в общей базе
+    // между ними могут быть записи других тестов.
+    let all = log
+        .export_page(seqs[0] - 1, 10_000)
+        .await
+        .expect("export page");
+    let ours: Vec<AdminAuditEntry> = all
+        .iter()
+        .filter(|e| seqs.contains(&e.seq))
+        .cloned()
+        .collect();
+    assert_eq!(ours, (0..records.len()).map(entry).collect::<Vec<_>>());
+    assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+    let first = log.export_page(seqs[0] - 1, 1).await.expect("export page");
+    assert_eq!(first, vec![entry(0)]);
+    assert!(matches!(
+        log.export_page(0, 0).await,
+        Err(Error::Invalid(_))
+    ));
+    // Отметка доставки: 0 — ничего; сдвиг только с текущей; назад и на месте — `Invalid`.
+    let sink = format!("suite-{}", AccountId::new());
+    assert_eq!(log.export_mark(&sink).await, Ok(0));
+    assert_eq!(log.advance_export_mark(&sink, 0, seqs[1]).await, Ok(true));
+    assert_eq!(log.export_mark(&sink).await, Ok(seqs[1]));
+    assert_eq!(
+        log.advance_export_mark(&sink, 0, seqs[2]).await,
+        Ok(false),
+        "отметку уже сдвинули"
+    );
+    assert_eq!(
+        log.advance_export_mark(&sink, seqs[1], seqs[4]).await,
+        Ok(true)
+    );
+    assert_eq!(log.export_mark(&sink).await, Ok(seqs[4]));
+    for (from, to) in [(seqs[4], seqs[4]), (seqs[4], seqs[3])] {
+        assert!(matches!(
+            log.advance_export_mark(&sink, from, to).await,
+            Err(Error::Invalid(_))
+        ));
+    }
+    assert_eq!(log.export_mark(&format!("{sink}-other")).await, Ok(0));
 }

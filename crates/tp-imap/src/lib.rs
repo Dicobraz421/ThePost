@@ -12,11 +12,15 @@
 //! - `idle` — IDLE и уведомления о выбранной папке (`EXISTS`, `EXPUNGE`, `FETCH FLAGS`).
 //! - `ext` — NAMESPACE (общие папки), QUOTA, ACL ([`Extensions`]).
 //! - `compress` — `COMPRESS=DEFLATE`.
+//! - `disable` — заблокированная учётная запись: сигнал `AccountDisabled` закрывает сессии IMAP и POP3.
+//! - `audit` — аудит доступа к ящику (`MailboxAudit`): [`Server::with_audit`], [`Pop3Server::with_audit`].
 //! - [`pop3`] — POP3 (RFC 1939) со STLS и SASL; выключен по умолчанию.
 //! - [`config`] — секция `imap` config.yaml.
 
+mod audit;
 mod compress;
 pub mod config;
+mod disable;
 mod ext;
 mod fetch;
 #[doc(hidden)]

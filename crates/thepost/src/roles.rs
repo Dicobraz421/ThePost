@@ -1,6 +1,7 @@
 //! Сервисы ролей ядра (SRS 2.1): maintenance — GC и «сироты» BLOB под лизой лидера, истечение срока корзины
 //! (`tp-mailstore`: таймер на ближайший срок → точка принятия решений → окончательное удаление), подписчики
-//! журнала событий (по сигналам, [`crate::log_reader`]), очистка по сроку надгробий DAV и журнала автоответов
+//! журнала событий (по сигналам, [`crate::log_reader`]), очистка по сроку надгробий DAV, журнала автоответов,
+//! журнала доставки и токенов `admin init`
 //! ([`Purge`], решение 2026-11-11 п. 65), проверка целостности BLOB по расписанию под лизой лидера
 //! ([`ScheduledVerify`], APP-44); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
 
@@ -13,6 +14,7 @@ use tp_blob::{
     system_now,
 };
 use tp_contracts::Result;
+use tp_contracts::admin_token::LocalAdminTokens;
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::events::EventSink;
 use tp_contracts::lease::LeaseStore;
@@ -62,6 +64,36 @@ impl std::fmt::Debug for OrphanProbe {
     }
 }
 
+/// Число шардов в справочнике `shards`; `None` — справочника нет (схема ещё не создана).
+pub async fn shard_count(pool: &tp_meta::pool::DbPool) -> Result<Option<i64>> {
+    let mut conn = pool.acquire().await?;
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('shards') IS NOT NULL")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(tp_meta::schema::db_err)?;
+    if !exists {
+        return Ok(None);
+    }
+    sqlx::query_scalar("SELECT count(*) FROM shards")
+        .fetch_one(&mut *conn)
+        .await
+        .map(Some)
+        .map_err(tp_meta::schema::db_err)
+}
+
+/// Защита от потери данных до шардированного GC BLOB (FIX-05): GC не читает справочник шардов и удалит объект,
+/// на который ссылается только другой шард. Больше одного шарда — причина отказа роли maintenance (`serve`) и
+/// `FAIL` в `doctor`; `None` — шард один. Проверку снимает FIX-04 вместе с шардированным GC.
+pub fn unsharded_gc(shards: i64) -> Option<String> {
+    (shards > 1).then(|| {
+        format!(
+            "шардов в справочнике: {shards}, а сборка мусора BLOB учитывает только ссылки этой базы и \
+             удалит объекты других шардов: второй шард требует FIX-04 (шардированный GC); роль maintenance не \
+             запускается"
+        )
+    })
+}
+
 /// Зависимости роли maintenance.
 pub struct Maintenance {
     /// Учёт объектов BLOB.
@@ -91,6 +123,8 @@ pub struct Maintenance {
     pub purge: Option<Purge>,
     /// Проверка целостности BLOB по расписанию; `None` — выключена (`maintenance.verify.enabled: false`).
     pub verify: Option<ScheduledVerify>,
+    /// Выгрузка журнала аудита в SIEM (`admin.audit`, APP-59); `None` — не выполняется (тесты без PostgreSQL).
+    pub audit_export: Option<Arc<crate::audit_export::AuditExport>>,
 }
 
 /// Показатели проверки целостности BLOB по расписанию для `/metrics` (`crate::metrics::register_verify`).
@@ -282,15 +316,21 @@ impl ScheduledVerify {
     }
 }
 
-/// Очистка по сроку в роли maintenance (APP-32): надгробия DAV старше `meta.dav.tombstone_ttl` и записи журнала
-/// автоответов старше `meta.sieve.vacation_log_ttl` — сроки знает [`PgMeta`]. Удаление по сроку идемпотентно,
-/// повтор удаляет только оставшееся: как и истечение корзины, работает на каждом узле с ролью без лизы.
+/// Очистка по сроку в роли maintenance (APP-32, APP-39): надгробия DAV старше `meta.dav.tombstone_ttl`, записи
+/// журнала автоответов старше `meta.sieve.vacation_log_ttl`, журнал доставки старше `meta.delivery.retention`,
+/// завершённые и отменённые отправки JMAP старше `meta.submissions.retention`, аудит ящиков старше
+/// `meta.mailbox_audit.retention` — сроки знает [`PgMeta`]; токены `admin init`, истёкшие раньше `maintenance.admin_token_retention` назад.
+/// Удаление по сроку идемпотентно, повтор удаляет только оставшееся: как и истечение корзины, работает на каждом
+/// узле с ролью без лизы.
 #[derive(Clone)]
 pub struct Purge {
-    /// Метаданные: шаги `purge_dav_tombstones` и `purge_vacation_log`.
+    /// Метаданные: шаги `purge_dav_tombstones`, `purge_vacation_log`, `purge_expired_delivery`,
+    /// `expire_old_submissions`, `purge_expired_mailbox_audit` и `LocalAdminTokens::prune`.
     pub meta: PgMeta,
     /// Период (`maintenance.purge_interval`); первый проход — при запуске роли.
     pub interval: Duration,
+    /// Срок хранения токенов `admin init` после истечения (`maintenance.admin_token_retention`).
+    pub admin_token_retention: Duration,
 }
 
 /// Итог одного прохода [`Purge::step`]: число удалённых записей каждого шага.
@@ -300,36 +340,74 @@ pub struct Purged {
     pub dav_tombstones: Result<u64>,
     /// Записи журнала автоответов.
     pub vacation_log: Result<u64>,
+    /// Журнал доставки: удаляется секциями по суткам, числа записей нет.
+    pub delivery_log: Result<()>,
+    /// Отправки JMAP (`SubmissionStore::expire_submissions`).
+    pub submissions: Result<u64>,
+    /// Аудит ящиков: удаляется секциями по суткам, числа записей нет.
+    pub mailbox_audit: Result<()>,
+    /// Токены `admin init`.
+    pub admin_tokens: Result<u64>,
 }
 
 impl std::fmt::Debug for Purge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Purge")
             .field("interval", &self.interval)
+            .field("admin_token_retention", &self.admin_token_retention)
             .finish_non_exhaustive()
     }
 }
 
 impl Purge {
-    /// Один проход: оба шага независимы — ошибка одного не отменяет другой и ждёт следующего прохода.
+    /// Один проход: шаги независимы — ошибка одного не отменяет остальные и ждёт следующего прохода.
     pub async fn step(&self) -> Purged {
         let done = Purged {
             dav_tombstones: self.meta.purge_dav_tombstones().await,
             vacation_log: self.meta.purge_vacation_log().await,
+            delivery_log: self.meta.purge_expired_delivery().await,
+            submissions: self.meta.expire_old_submissions().await,
+            mailbox_audit: self.meta.purge_expired_mailbox_audit().await,
+            admin_tokens: self.prune_admin_tokens().await,
+        };
+        let failed = |step: &str, e: &tp_contracts::Error| {
+            tracing::warn!(step, error = %e, "очистка по сроку не выполнена: повтор в следующий проход");
         };
         for (step, result) in [
             ("purge_dav_tombstones", &done.dav_tombstones),
             ("purge_vacation_log", &done.vacation_log),
+            ("expire_old_submissions", &done.submissions),
+            ("prune_admin_tokens", &done.admin_tokens),
         ] {
             match result {
                 Ok(0) => tracing::debug!(step, "очистка по сроку: удалять нечего"),
                 Ok(deleted) => tracing::info!(step, deleted, "очистка по сроку"),
-                Err(e) => {
-                    tracing::warn!(step, error = %e, "очистка по сроку не выполнена: повтор в следующий проход");
-                }
+                Err(e) => failed(step, e),
+            }
+        }
+        // Об удалённых секциях журналов пишет сам `tp-meta`.
+        for (step, result) in [
+            ("purge_expired_delivery", &done.delivery_log),
+            ("purge_expired_mailbox_audit", &done.mailbox_audit),
+        ] {
+            if let Err(e) = result {
+                failed(step, e);
             }
         }
         done
+    }
+
+    /// Удаляет токены `admin init`, истёкшие раньше чем [`Purge::admin_token_retention`] назад.
+    async fn prune_admin_tokens(&self) -> Result<u64> {
+        let now = (system_now())();
+        let before = match TryFrom::try_from(self.admin_token_retention) {
+            Ok(retention) => now.checked_sub(retention),
+            Err(_) => None,
+        }
+        .ok_or_else(|| {
+            tp_contracts::Error::invalid("maintenance.admin_token_retention вне диапазона")
+        })?;
+        LocalAdminTokens::prune(&self.meta, before).await
     }
 
     /// Проходы с периодом [`Purge::interval`] до остановки; остановка прерывает и идущий проход (незавершённая
@@ -425,7 +503,18 @@ impl RoleService for Maintenance {
                 ctx.shutdown.clone(),
             ))
         });
+        // Выгрузка журнала аудита: один узел кластера — держатель лизы (APP-59).
+        let audit_export = self.audit_export.clone().map(|export| {
+            let token = ctx.shutdown.clone();
+            tokio::spawn(async move { export.run(token).await })
+        });
         ctx.ready.set(true);
+        let audit_export = async move {
+            match audit_export {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
         let verify = async move {
             match verify {
                 Some(task) => task.await,
@@ -444,12 +533,13 @@ impl RoleService for Maintenance {
                 None => Ok(()),
             }
         };
-        let (gc, orphans, trash, purge, verify, ()) = tokio::join!(
+        let (gc, orphans, trash, purge, verify, audit_export, ()) = tokio::join!(
             gc,
             orphans,
             trash,
             purge,
             verify,
+            audit_export,
             consume(
                 self.events.clone(),
                 self.sinks.clone(),
@@ -463,6 +553,7 @@ impl RoleService for Maintenance {
             ("trash-expiry", trash),
             ("purge", purge),
             ("blob-verify", verify),
+            ("audit-export", audit_export),
         ] {
             if let Err(e) = done {
                 return Err(tp_contracts::Error::Internal(format!("{what}: {e}")));
@@ -585,6 +676,7 @@ mod tests {
             trash: None,
             purge: None,
             verify: None,
+            audit_export: None,
         };
         let (ctx, shutdown, ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -714,6 +806,7 @@ mod tests {
             trash: None,
             purge: None,
             verify: Some(verify),
+            audit_export: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -742,12 +835,17 @@ mod tests {
         assert!(inventory.damaged.lock().expect("lock").is_empty());
     }
 
-    /// APP-32: проход очистки удаляет надгробия DAV и записи журнала автоответов старше срока из `meta`, свежие
-    /// остаются; роль maintenance выполняет проход при запуске. Отдельная база: очистка — по всем организациям.
+    /// APP-32, APP-39: проход очистки удаляет надгробия DAV, записи журнала автоответов и журнала доставки старше
+    /// срока из `meta` и токены `admin init`, истёкшие раньше `admin_token_retention`; свежие остаются; роль maintenance выполняет проход при запуске. Отдельная база: очистка — по всем организациям.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn purge_removes_expired_dav_tombstones_and_vacation_log() {
+    async fn purge_removes_expired_records() {
+        use tp_contracts::admin_token::LocalAdminToken;
         use tp_contracts::dav::{Collection, CollectionKind, DavStore};
-        use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+        use tp_contracts::delivery::{
+            DeliveryDecision, DeliveryEvent, DeliveryEventKind, DeliveryLog, DeliveryQuery,
+        };
+        use tp_contracts::membership::NodeId;
+        use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
         use tp_contracts::sieve::VacationLog;
         use tp_contracts::{DomainId, TenantId};
 
@@ -757,7 +855,7 @@ mod tests {
         };
         let url = crate::testutil::dev_url(&url);
         let (db_name, url_db) = crate::testutil::create_database(&url).await;
-        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        let pool = crate::testutil::db_pool(&url_db).await;
         tp_meta::schema::migrate(&pool).await.expect("migrate");
         let ttl = Duration::from_secs(2);
         let mut cfg = tp_meta::MetaConfig::default();
@@ -790,6 +888,8 @@ mod tests {
                     display_name: "User".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await
@@ -837,13 +937,90 @@ mod tests {
         );
         assert_eq!(tombstones().await, 2);
 
+        // APP-39: журнал доставки (срок `meta.delivery.retention` — 30 сут) и токены `admin init`.
+        let now = (system_now())();
+        let delivery = |at, sender: &str| DeliveryEvent {
+            tenant,
+            at,
+            node: NodeId::new("node-a").expect("node"),
+            kind: DeliveryEventKind::Receive,
+            sender: sender.into(),
+            recipients: vec!["user@purge.test".into()],
+            message_id: None,
+            queue_id: None,
+            decision: DeliveryDecision::Accept,
+            reason: None,
+        };
+        DeliveryLog::record(&meta, delivery(now - 40 * day, "old@example.net"))
+            .await
+            .expect("record");
+        DeliveryLog::record(&meta, delivery(now, "fresh@example.net"))
+            .await
+            .expect("record");
+        let delivery_senders = || {
+            let meta = meta.clone();
+            async move {
+                DeliveryLog::search(&meta, tenant, &DeliveryQuery::all(10))
+                    .await
+                    .expect("search")
+                    .events
+                    .into_iter()
+                    .map(|e| e.sender)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(delivery_senders().await.len(), 2);
+        // Токены: истёк 31 сут назад (погашен), истёк вчера, действующий.
+        let token = |id: &str, hash: &str, expires_at| LocalAdminToken {
+            id: id.into(),
+            tenant,
+            account: account.id,
+            hash: hash.repeat(64),
+            created_at: now - 60 * day,
+            expires_at,
+            used_at: None,
+            revoked_at: None,
+        };
+        for t in [
+            token("old", "a", now - 31 * day),
+            token("recent", "b", now - day),
+            token("active", "c", now + day),
+        ] {
+            LocalAdminTokens::issue(&meta, t).await.expect("issue");
+        }
+        let token_ids = || {
+            let meta = meta.clone();
+            async move {
+                LocalAdminTokens::list(&meta, tenant)
+                    .await
+                    .expect("list")
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect::<std::collections::BTreeSet<_>>()
+            }
+        };
+        assert_eq!(token_ids().await.len(), 3);
+
         let purge = Purge {
             meta: meta.clone(),
             interval: Duration::from_secs(3600),
+            admin_token_retention: 30 * day,
         };
         let done = purge.step().await;
         assert_eq!(done.dav_tombstones.expect("dav"), 1);
         assert_eq!(done.vacation_log.expect("vacation"), 1);
+        done.delivery_log.expect("delivery");
+        assert_eq!(done.admin_tokens.expect("tokens"), 1);
+        assert_eq!(
+            delivery_senders().await,
+            ["fresh@example.net"],
+            "старая запись журнала доставки удалена, свежая на месте"
+        );
+        assert_eq!(
+            token_ids().await,
+            ["active", "recent"].map(String::from).into(),
+            "токен, истёкший раньше срока хранения, удалён; остальные на месте"
+        );
         assert_eq!(tombstones().await, 1, "свежее надгробие на месте");
         assert!(
             meta.seen(scope, "fresh@example.net", "", day)
@@ -888,6 +1065,7 @@ mod tests {
             trash: None,
             purge: Some(purge),
             verify: None,
+            audit_export: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });

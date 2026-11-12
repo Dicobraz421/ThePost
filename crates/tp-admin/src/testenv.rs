@@ -1,9 +1,8 @@
 //! Окружение тестов: Admin API поверх in-memory реализаций tp-testkit; запросы — `tower::ServiceExt::oneshot`.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header};
@@ -11,144 +10,40 @@ use bytes::Bytes;
 use serde_json::Value;
 use time::OffsetDateTime;
 use tower::ServiceExt;
+use tp_contracts::admin_audit::AdminAuditRecord;
 use tp_contracts::auth::Principal;
 use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, Policy, SpecialUse};
-use tp_contracts::{AccountId, DomainId, Error, MessageId, Result, TenantId};
-use tp_testkit::{
-    Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
-    MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies, MemQuota, MemSieve,
-    MemTransport, MemTrash, PolicyLevel, SystemClock,
+use tp_contracts::meta::{
+    AccountKind, AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse,
 };
+use tp_contracts::{AccountId, DomainId, MessageId, Result, TenantId};
+use tp_testkit::{
+    Clock, FakeAuthenticator, MemAppPasswords, MemAuditLog, MemBlobIndex, MemBlobStore,
+    MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies,
+    MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
+};
+use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
-use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
-use crate::audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink};
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 use crate::sieve::ScriptError;
 
-/// Журнал аудита в памяти.
+/// Издатель токенов OIDC тестов (`Deps::oidc_issuer`).
+pub const ISSUER: &str = "https://idp.example.org/realms/mail";
+
+/// Журнал аудита в памяти — [`MemAuditLog`] tp-testkit; [`MemAudit::records`] — записи для проверок.
 #[derive(Debug, Clone, Default)]
-pub struct MemAudit(Arc<Mutex<Vec<AuditRecord>>>);
+pub struct MemAudit(pub MemAuditLog);
 
 impl MemAudit {
-    pub fn records(&self) -> Vec<AuditRecord> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    pub fn records(&self) -> Vec<AdminAuditRecord> {
+        self.0.entries().into_iter().map(|e| e.record).collect()
     }
-}
-
-#[async_trait]
-impl AuditSink for MemAudit {
-    async fn record(&self, record: &AuditRecord) -> Result<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(record.clone());
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl AuditLog for MemAudit {
-    async fn search(&self, tenant: TenantId, q: &AuditQuery) -> Result<AuditPage> {
-        let entries: Vec<AuditEntry> = lock(&self.0)
-            .iter()
-            .enumerate()
-            .map(|(i, r)| AuditEntry {
-                seq: i as u64 + 1,
-                record: r.clone(),
-            })
-            .filter(|e| {
-                e.record.tenant == Some(tenant)
-                    && q.after.is_none_or(|a| e.seq > a)
-                    && q.since.is_none_or(|t| e.record.at >= t)
-                    && q.until.is_none_or(|t| e.record.at < t)
-            })
-            .take(q.limit)
-            .collect();
-        let next = (entries.len() == q.limit)
-            .then(|| entries.last().map(|e| e.seq))
-            .flatten();
-        Ok(AuditPage { entries, next })
-    }
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Решения модерации — [`MemModeration`] tp-testkit (CTR-31).
 pub use tp_testkit::{MemModeration, ModerationDecision as Decision};
-
-/// Политики уровней — [`MemPolicies`] tp-testkit (разрешение цепочки и выбор пользователя `trash.purge`).
-#[async_trait]
-impl PolicyStore for MemPolicies {
-    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
-        Ok(MemPolicies::policy(self, tenant, level(target)))
-    }
-
-    async fn set_policy(
-        &self,
-        tenant: TenantId,
-        target: PolicyTarget,
-        policy: &Policy,
-    ) -> Result<()> {
-        MemPolicies::set_policy(self, tenant, level(target), policy.clone());
-        Ok(())
-    }
-}
-
-fn level(target: PolicyTarget) -> PolicyLevel {
-    match target {
-        PolicyTarget::Tenant => PolicyLevel::Tenant,
-        PolicyTarget::Domain(d) => PolicyLevel::Domain(d),
-        PolicyTarget::Account(a) => PolicyLevel::Account(a),
-    }
-}
-
-/// Домены в памяти (без проверки учётных записей домена при удалении).
-#[derive(Debug, Clone, Default)]
-pub struct MemDomains(Arc<Mutex<Vec<(TenantId, Domain)>>>);
-
-#[async_trait]
-impl DomainStore for MemDomains {
-    async fn list(&self, tenant: TenantId) -> Result<Vec<Domain>> {
-        let mut v: Vec<Domain> = lock(&self.0)
-            .iter()
-            .filter(|(t, _)| *t == tenant)
-            .map(|(_, d)| d.clone())
-            .collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(v)
-    }
-
-    async fn create(&self, tenant: TenantId, name: &str) -> Result<Domain> {
-        let mut m = lock(&self.0);
-        if m.iter().any(|(_, d)| d.name == name) {
-            return Err(Error::Conflict);
-        }
-        let d = Domain {
-            id: DomainId::new(),
-            name: name.to_owned(),
-        };
-        m.push((tenant, d.clone()));
-        Ok(d)
-    }
-
-    async fn delete(&self, tenant: TenantId, id: DomainId) -> Result<()> {
-        let mut m = lock(&self.0);
-        let before = m.len();
-        m.retain(|(t, d)| !(*t == tenant && d.id == id));
-        if m.len() == before {
-            return Err(Error::NotFound);
-        }
-        Ok(())
-    }
-}
 
 /// Хранилища в памяти: метаданные, квоты, почтовое хранилище.
 pub struct Stores {
@@ -161,6 +56,11 @@ pub struct Stores {
     pub moderation: MemModeration,
     pub policies: MemPolicies,
     pub trash: MemTrash,
+    /// Адресная книга: контакты, оргструктура, динамические группы.
+    pub addressbook: MemAddressBook,
+    pub senders: MemSenderLists,
+    pub mailbox_audit: MemMailboxAudit,
+    pub sync_gate: MemSyncGate,
 }
 
 impl Stores {
@@ -192,6 +92,10 @@ impl Stores {
             moderation: MemModeration::default(),
             policies,
             trash,
+            addressbook: MemAddressBook::new(),
+            senders: MemSenderLists::new(),
+            mailbox_audit: MemMailboxAudit::new(),
+            sync_gate: MemSyncGate::new(),
         }
     }
 
@@ -208,8 +112,7 @@ impl Stores {
     pub fn deps(&self) -> Deps {
         Deps {
             auth: Arc::new(FakeAuthenticator::default()),
-            audit: Arc::new(MemAudit::default()),
-            audit_log: None,
+            audit_log: Arc::new(MemAuditLog::new()),
             delivery: Arc::new(self.delivery.clone()),
             groups: Arc::new(self.groups.clone()),
             moderation: Arc::new(self.moderation.clone()),
@@ -218,10 +121,16 @@ impl Stores {
             quota: Arc::new(self.quota.clone()),
             policies: Arc::new(self.policies.clone()),
             resolver: Arc::new(self.policies.clone()),
-            domains: Arc::new(MemDomains::default()),
             trash: Arc::new(self.trash.clone()),
             store: Arc::new(self.store.clone()),
             app_passwords: self.app_passwords(),
+            contacts: Arc::new(self.addressbook.clone()),
+            org: Arc::new(self.addressbook.clone()),
+            dynamic: Arc::new(self.addressbook.clone()),
+            senders: Arc::new(self.senders.clone()),
+            mailbox_audit: Arc::new(self.mailbox_audit.clone()),
+            sync: Arc::new(self.sync_gate.clone()),
+            oidc_issuer: Some(ISSUER.to_owned()),
         }
     }
 }
@@ -251,6 +160,10 @@ pub struct Env {
     pub sieve: MemSieve,
     /// Объекты писем очереди модерации (`Admin::with_held_blobs`).
     pub held_blobs: MemBlobStore,
+    /// Адресная книга: контакты, оргструктура, динамические группы.
+    pub addressbook: MemAddressBook,
+    pub mailbox_audit: MemMailboxAudit,
+    pub sync_gate: MemSyncGate,
     pub admin: Arc<Admin>,
     pub router: Router,
     pub other_tenant: TenantId,
@@ -353,8 +266,7 @@ impl Env {
         let admin = Admin::new(
             Deps {
                 auth: Arc::new(auth.clone()),
-                audit: Arc::new(audit.clone()),
-                audit_log: Some(Arc::new(audit.clone())),
+                audit_log: Arc::new(audit.0.clone()),
                 modules,
                 ..stores.deps()
             },
@@ -390,6 +302,9 @@ impl Env {
             moderation,
             policies,
             trash,
+            addressbook,
+            mailbox_audit,
+            sync_gate,
             ..
         } = stores;
         Self {
@@ -408,6 +323,9 @@ impl Env {
             tokens,
             sieve,
             held_blobs,
+            addressbook,
+            mailbox_audit,
+            sync_gate,
             router: admin.clone().router(),
             admin,
             other_tenant,
@@ -431,6 +349,8 @@ impl Env {
                     display_name: login.to_owned(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await

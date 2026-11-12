@@ -1,5 +1,6 @@
 //! Окружение тестов: хранилище и фейки testkit, сессия над потоком в памяти, клиент по строкам.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -9,20 +10,25 @@ use tokio_util::sync::CancellationToken;
 use tp_contracts::auth::Principal;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{Delivered, Delivery, IngestRequest, MailStore};
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse};
+use tp_contracts::meta::{
+    AccountKind, AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse,
+};
 use tp_contracts::{DomainId, Error, MailboxId, Result, TenantId};
 use tp_mailstore::Store;
 use tp_testkit::SearchDoc;
 use tp_testkit::{
     Clock, FakeAuthenticator, FakeSasl, FakeSearch, MemBlobIndex, MemBlobStore, MemEventBus,
-    MemMetadata, MemPolicies, MemQuota, MemTrash, RecordingDecisionHook, SystemClock,
+    MemMailboxAudit, MemMetadata, MemPolicies, MemQuota, MemTrash, RecordingDecisionHook,
+    SystemClock,
 };
 
 use crate::config::ImapConfig;
 use crate::ext::Extensions;
 use crate::session::{Deps, Session, SessionCtx, Transport};
 
+mod audit;
 mod compress;
+mod disable;
 mod ext;
 mod fetch;
 mod idle;
@@ -36,6 +42,8 @@ mod write;
 
 pub(crate) const LOGIN: &str = "user@example.org";
 pub(crate) const PASSWORD: &str = "secret";
+/// Адрес клиента соединений стенда.
+pub(crate) const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7));
 
 /// Поток в памяти вместо соединения; STARTTLS недоступен.
 pub(crate) struct TestConn {
@@ -52,6 +60,10 @@ impl Transport for TestConn {
 
     fn tls(&self) -> bool {
         self.tls
+    }
+
+    fn peer(&self) -> IpAddr {
+        PEER
     }
 
     fn can_starttls(&self) -> bool {
@@ -74,6 +86,8 @@ pub(crate) struct Env {
     pub policies: MemPolicies,
     /// Точка принятия решений хранилища и сессии (Legal Hold, доставка).
     pub hook: RecordingDecisionHook,
+    /// Журнал аудита ящиков: подключён к сессиям [`Env::ctx`] (клиент [`PEER`]).
+    pub audit: MemMailboxAudit,
     pub principal: Principal,
     pub config: ImapConfig,
     pub shutdown: CancellationToken,
@@ -109,6 +123,8 @@ impl Env {
                     display_name: "User".into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await
@@ -132,6 +148,7 @@ impl Env {
             trash,
             policies,
             hook,
+            audit: MemMailboxAudit::new(),
             principal,
             config: ImapConfig::default(),
             shutdown: CancellationToken::new(),
@@ -159,6 +176,7 @@ impl Env {
                 bus: Arc::new(self.bus.clone()),
                 trash: Arc::new(self.trash.clone()),
                 hooks: DecisionHooks::new(vec![Arc::new(self.hook.clone())]),
+                audit: Arc::new(self.audit.clone()),
             },
             shutdown: self.shutdown.clone(),
         })
@@ -171,13 +189,19 @@ impl Env {
 
     /// Клиент новой сессии с зависимостями расширений.
     pub async fn client_ext(&self, tls: bool, ext: Extensions) -> Client {
-        Self::client_ctx(self.ctx(), tls, ext).await
+        let (server, client) = tokio::io::duplex(1 << 20);
+        let session = Session::new(self.ctx(), TestConn { io: server, tls }).with_extensions(ext);
+        Self::spawn(session, client).await
     }
 
     /// Клиент новой сессии над заданным контекстом (например, с другой шиной).
     pub async fn client_ctx(ctx: Arc<SessionCtx>, tls: bool, ext: Extensions) -> Client {
         let (server, client) = tokio::io::duplex(1 << 20);
         let session = Session::new(ctx, TestConn { io: server, tls }).with_extensions(ext);
+        Self::spawn(session, client).await
+    }
+
+    async fn spawn(session: Session<TestConn>, client: DuplexStream) -> Client {
         let task = tokio::spawn(session.run());
         let mut c = Client {
             io: BufReader::new(client),

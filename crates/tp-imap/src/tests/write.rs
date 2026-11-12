@@ -5,10 +5,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use tp_contracts::bus::{EventBus, EventKind, EventStream};
 use tp_contracts::ext::Decision;
-use tp_contracts::meta::{MailboxStore, MessageQuery, MessageStore, SpecialUse};
+use tp_contracts::meta::{MailboxStore, MessageQuery, MessageStore, PolicyTarget, SpecialUse};
 use tp_contracts::retention::{TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::{MailboxId, ModSeq};
-use tp_testkit::{HookCall, PolicyLevel};
+use tp_testkit::HookCall;
 
 use super::{Client, Env};
 
@@ -239,6 +239,31 @@ async fn trash_expunge_hides_by_default() {
     assert!(r.contains("* 1 EXISTS"), "{r}");
 }
 
+/// IMAP-20 (CTR-33): перенос в корзину по `EXPUNGE` снимает `\Deleted` и сохраняет остальные флаги, поэтому
+/// `EXPUNGE` в корзине не трогает письмо, удалённое из INBOX.
+#[tokio::test]
+async fn trash_expunge_keeps_message_moved_from_inbox() {
+    let env = Env::new().await;
+    let inbox = env.mailbox(SpecialUse::Inbox);
+    env.deliver(inbox, PLAIN.as_bytes(), Default::default())
+        .await;
+    let mut c = env.logged_in().await;
+    assert!(c.cmd("S1 SELECT INBOX").await.contains("S1 OK"));
+    c.cmd("D1 STORE 1 +FLAGS.SILENT (\\Seen \\Deleted)").await;
+    assert_eq!(
+        c.cmd("D2 EXPUNGE").await,
+        "* 1 EXPUNGE\r\nD2 OK EXPUNGE completed\r\n"
+    );
+    assert_eq!(count(&env, SpecialUse::Trash).await, 1);
+    assert!(c.cmd("T1 SELECT Trash").await.contains("* 1 EXISTS"));
+    let r = c.cmd("T2 FETCH 1 FLAGS").await;
+    assert!(r.contains("\\Seen") && !r.contains("\\Deleted"), "{r}");
+    assert_eq!(c.cmd("T3 EXPUNGE").await, "T3 OK EXPUNGE completed\r\n");
+    assert_eq!(count(&env, SpecialUse::Trash).await, 1);
+    assert_eq!(hidden_count(&env).await, 0);
+    assert_eq!(final_deletes(&env), 0);
+}
+
 #[tokio::test]
 async fn trash_uid_expunge_erases_unless_legal_hold() {
     let (env, mut c) = trash_of_three().await;
@@ -247,7 +272,7 @@ async fn trash_uid_expunge_erases_unless_legal_hold() {
         user_can_choose: false,
     };
     env.policies
-        .set_trash_purge_rule(env.scope().tenant, PolicyLevel::Tenant, Some(rule));
+        .set_trash_purge_rule(env.scope().tenant, PolicyTarget::Tenant, Some(rule));
     c.cmd("E1 STORE 1:3 +FLAGS.SILENT (\\Deleted)").await;
     // `erase`: только указанные UID, перед стиранием — точка принятия решений.
     assert_eq!(

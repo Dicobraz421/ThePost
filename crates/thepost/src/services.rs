@@ -13,11 +13,13 @@
 //! доставке smtp-in и submission и в JMAP `EmailSubmission/set` (доставка JMAP их не применяет повторно).
 //!
 //! Планирование встреч (APP-28, SRS 4.4) — одни зависимости на узел ([`Services::schedule`]): приём iTIP в календари
-//! (`tp_dav::ItipInbox`) — у CalDAV, JMAP и доставки smtp-in (iMIP извне, `Delivery::with_itip`); приглашения
+//! (`tp_dav::ItipInbox`) — у CalDAV, JMAP и доставки узла (iMIP извне и письма-приглашения из почтового клиента,
+//! `Delivery::with_itip`, права отправки — `Delivery::with_authz`); приглашения
 //! внешним участникам — письмом (`tp_dav::ImipSender`) через ту же доставку, что у JMAP; занятость — `PgMeta`.
 //!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -28,16 +30,14 @@ use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::bus::EventBus;
 use tp_contracts::events::EventSink;
 use tp_contracts::ext::{DecisionHooks, Registry};
-use tp_contracts::ids::{DomainId, MessageId};
+use tp_contracts::ids::MessageId;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::membership::NodeId;
-use tp_contracts::meta::{
-    AccountScope, AccountStore, MailboxStore, MessageQuery, MessageStore, Policy,
-};
+use tp_contracts::meta::{AccountScope, AccountStore, MailboxStore, MessageQuery, MessageStore};
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
-use tp_contracts::transport::{AcceptedDomain, DomainKind, MailFlow};
+use tp_contracts::transport::MailFlow;
 use tp_contracts::{Error, Result, TenantId};
 use tp_meta::PgMeta;
 use tp_platform::{Config, Metrics, RateLimitConfig, RateLimiter, TlsCerts};
@@ -84,6 +84,8 @@ pub struct Services {
     pub authz: Arc<dyn Authorizer>,
     /// Каталог LDAP; `None` — учётные записи только из PostgreSQL.
     pub directory: Option<Arc<dyn Directory>>,
+    /// Издатель токенов OIDC (`auth.oidc.issuer`); `None` — вход Bearer OIDC не настроен.
+    pub oidc_issuer: Option<String>,
     /// Пароли приложений.
     pub app_passwords: tp_auth::AppPasswords,
     /// Полнотекстовый поиск (роль search в процессе).
@@ -125,7 +127,7 @@ pub struct Services {
     pub sieve_limits: tp_sieve::Limits,
     /// Секция `sieve` на момент запуска: слушатели и лимиты сеансов ManageSieve (APP-27).
     pub sieve: Arc<tp_sieve::SieveConfig>,
-    /// Приём iTIP в календари учётных записей (APP-28): общий для CalDAV, JMAP и доставки smtp-in.
+    /// Приём iTIP в календари учётных записей (APP-28): общий для CalDAV, JMAP и доставки узла.
     pub itip: Arc<tp_dav::ItipInbox>,
 }
 
@@ -284,17 +286,19 @@ impl Services {
             extractor,
         });
 
-        // Очередь исходящей почты: письмо и уведомления подписываются DKIM при постановке.
+        // Очередь исходящей почты: письмо и уведомления подписываются DKIM при постановке; селектор подписи —
+        // политика организации принятого домена `From` (SMTP-40).
         let smtp = cfg.section::<SmtpConfig>(SMTP)?;
-        let dkim = Arc::new(tp_smtp::dkim_sign::DkimSign::new(
-            secrets.clone(),
-            smtp.dkim.clone(),
-        ));
+        let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
+        let dkim = Arc::new(
+            tp_smtp::dkim_sign::DkimSign::new(secrets.clone(), smtp.dkim.clone())
+                .with_policies(Arc::new(meta.clone()), routes.clone()),
+        );
         let queue = Arc::new(Queue::new(queue_deps(&meta, &blob)).with_dkim(dkim.clone()));
         let smtp_metrics = Arc::new(SmtpMetrics::new());
         smtp_metrics.register(metrics);
         let limiter = Arc::new(RateLimiter::new(
-            (*cfg.section::<RateLimitConfig>("ratelimit")?).clone(),
+            (*cfg.section::<RateLimitConfig>(tp_platform::ratelimit::RATELIMIT)?).clone(),
         ));
 
         // Секции, читаемые ролями при запуске, проверяются здесь: ошибка — до запуска ролей.
@@ -306,7 +310,6 @@ impl Services {
             (*cfg.section::<tp_dav::DavConfig>(DAV)?).clone(),
         ));
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
-        let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
         let sieve = (*cfg.section::<tp_sieve::SieveConfig>(SIEVE)?).clone();
         let sieve_limits = sieve.limits();
@@ -328,6 +331,7 @@ impl Services {
             sasl,
             authz,
             directory,
+            oidc_issuer: auth.oidc.as_ref().map(|o| o.issuer.clone()),
             app_passwords,
             search,
             indexes,
@@ -352,11 +356,11 @@ impl Services {
     }
 
     /// Доставка и обработчик транзакций SMTP (smtp-in, submission): проверки SPF/DKIM/DMARC/ARC, Milter, очередь,
-    /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC) и правила потока
-    /// почты модуля (если включён).
+    /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC), политики
+    /// организации (профиль Milter, лимиты сеанса submission — `PgMeta`, SMTP-40), лимиты отправки в час — общие с
+    /// submission и для отправки из JMAP (SMTP-43) — и правила потока почты модуля (если включён).
     pub fn delivery(&self, smtp: &SmtpConfig) -> Result<Arc<Delivery>> {
-        // Приглашения и ответы извне (iMIP, SMTP-33) после доставки в ящик применяются к календарю получателя.
-        let delivery = self.base_delivery(smtp)?.with_itip(self.itip.clone());
+        let delivery = self.base_delivery(smtp)?;
         Ok(Arc::new(match &self.mail_flow {
             Some(flow) => delivery.with_mail_flow(
                 flow.clone(),
@@ -369,6 +373,9 @@ impl Services {
 
     /// Доставка без правил потока почты: JMAP применяет их сам до `DecisionHooks::on_submission`
     /// (`Jmap::with_mail_flow`), повторный вызов нарушил бы «один раз на письмо».
+    /// Приглашения и ответы в письмах после доставки в ящик применяются к календарю получателя (`Delivery::with_itip`):
+    /// извне — iMIP с DMARC (SMTP-33), из submission, JMAP и DAV — если `From` принадлежит отправителю: свой адрес,
+    /// псевдоним или право Send As / Send on Behalf из ACL узла (`Delivery::with_authz`, SMTP-36, APP-62).
     fn base_delivery(&self, smtp: &SmtpConfig) -> Result<Delivery> {
         let resolver = system_resolver()?;
         let milter = (!smtp.milter.filters.is_empty())
@@ -396,7 +403,11 @@ impl Services {
             .with_tracking(self.tracking.clone())
             .with_transport(self.routes.clone())
             .with_forwarding(Arc::new(forwarding))
-            .with_rules(self.rules.clone()))
+            .with_rules(self.rules.clone())
+            .with_policies(Arc::new(self.meta.clone()))
+            .with_send_limits(self.send_limits.clone())
+            .with_itip(self.itip.clone())
+            .with_authz(self.authz.clone()))
     }
 
     /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
@@ -469,6 +480,7 @@ impl Services {
             bus: self.bus.clone(),
             trash: Arc::new(self.meta.clone()),
             hooks: self.hooks.clone(),
+            audit: Arc::new(self.meta.clone()),
         }
     }
 
@@ -526,6 +538,9 @@ impl Services {
             accounts: Arc::new(self.meta.clone()),
             authz: self.authz.clone(),
             outbound: Some(outbound.clone()),
+            submissions: Arc::new(self.meta.clone()),
+            delivery_log: Arc::new(self.meta.clone()),
+            audit: Arc::new(self.meta.clone()),
             hooks: self.hooks.clone(),
             capabilities: ext.jmap_capabilities().to_vec(),
             trash: Arc::new(self.meta.clone()),
@@ -578,6 +593,7 @@ impl Services {
 
     /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`
     /// (`impl Moderation for Delivery`, FIX-01) без правил потока почты: письмо прошло их при приёме.
+    /// Журнал аудита — только в базу; в SIEM его выгружает роль maintenance ([`crate::audit_export`]).
     pub fn admin(
         &self,
         ext: &Registry,
@@ -586,21 +602,28 @@ impl Services {
     ) -> Result<tp_admin::Admin> {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
-            audit: Arc::new(tp_admin::LogAudit),
-            // TODO(ADM-05): чтение журнала аудита — нет реализации `AuditLog` поверх `audit_log` (META-22).
-            audit_log: None,
+            audit_log: Arc::new(self.meta.clone()),
             delivery: Arc::new(self.meta.clone()),
             groups: Arc::new(self.meta.clone()),
             moderation: Arc::new(self.base_delivery(smtp)?),
             modules: ext.admin_routes().to_vec(),
             accounts: Arc::new(self.meta.clone()),
             quota: Arc::new(self.meta.clone()),
-            policies: Arc::new(PgPolicies(self.meta.clone())),
+            policies: Arc::new(self.meta.clone()),
             resolver: Arc::new(self.meta.clone()),
-            domains: Arc::new(PgDomains(self.meta.clone())),
             trash: Arc::new(self.meta.clone()),
             store: self.store.clone(),
             app_passwords: self.app_passwords.clone(),
+            // Соответствие Exchange (ADM-10): адресная книга, списки отправителей, аудит ящиков, остановка синхронизации.
+            contacts: Arc::new(self.meta.clone()),
+            org: Arc::new(self.meta.clone()),
+            dynamic: Arc::new(self.meta.clone()),
+            senders: Arc::new(self.meta.clone()),
+            mailbox_audit: Arc::new(self.meta.clone()),
+            sync: Arc::new(self.meta.clone()),
+            // Издатель для входа консоли (`GET /api/v1/session`) — тот, чьи токены проверяет узел; `admin.oidc` без
+            // `auth.oidc` — ошибка `Admin::new`.
+            oidc_issuer: self.oidc_issuer.clone(),
         };
         let limits = self.sieve_limits;
         let check = move |text: &str| match tp_sieve::compile(text.as_bytes(), &limits) {
@@ -673,24 +696,47 @@ pub fn system_resolver() -> Result<mail_auth::MessageAuthenticator> {
 }
 
 /// Проверка учётных данных под защитой от перебора: `AbuseGuard::check` до проверки, `failure` после отказа
-/// (`Forbidden`), `success` после входа. Попытка — учётная запись по имени входа (пароль); адреса клиента контракт
-/// `Authenticator` не передаёт — счётчики адреса и подсети ждут его в протоколах. Заблокированная попытка —
+/// (`Forbidden`), `success` после входа. Попытка — адрес клиента соединения (`peer`, CTR-57: счётчики адреса и
+/// подсети) и учётная запись по имени входа (пароль). Заблокированная попытка —
 /// `Forbidden` (протокол отвечает как на неверный пароль, учётные данные не проверяются).
 ///
 /// Хранилище блокировок недоступно — решение по `auth.abuse.fail_closed` принимает `AbuseGuard` (AUTH-11,
 /// решение владельца #253): `false` (по умолчанию) — вход проверяется по блокировкам, известным узлу; `true` —
 /// ошибка `AbuseGuard::check` возвращается вызывающему (`Unavailable`: протокол отвечает временным отказом).
-struct Guarded {
+pub struct Guarded {
     inner: Arc<dyn Authenticator>,
     guard: tp_auth::AbuseGuard,
     accounts: Arc<dyn AccountStore>,
     tenant: TenantId,
 }
 
+impl std::fmt::Debug for Guarded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guarded")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Guarded {
-    /// Попытка входа по предъявленным данным: для пароля — учётная запись по имени входа (нет или ошибка
-    /// каталога — без учётной записи); токен и Kerberos — субъект известен только после проверки.
-    async fn attempt(&self, credentials: &Credentials) -> tp_auth::Attempt {
+    /// Проверка `inner` под защитой `guard`; учётная запись попытки — по имени входа из `accounts` в `tenant`.
+    pub fn new(
+        inner: Arc<dyn Authenticator>,
+        guard: tp_auth::AbuseGuard,
+        accounts: Arc<dyn AccountStore>,
+        tenant: TenantId,
+    ) -> Self {
+        Self {
+            inner,
+            guard,
+            accounts,
+            tenant,
+        }
+    }
+
+    /// Попытка входа с адреса `peer` по предъявленным данным: для пароля — учётная запись по имени входа (нет или
+    /// ошибка каталога — без учётной записи); токен и Kerberos — субъект известен только после проверки.
+    async fn attempt(&self, credentials: &Credentials, peer: Option<IpAddr>) -> tp_auth::Attempt {
         let account = match credentials {
             Credentials::Password { login, .. } => {
                 match self.accounts.by_login(self.tenant, login).await {
@@ -703,20 +749,20 @@ impl Guarded {
             }
             _ => None,
         };
-        tp_auth::Attempt { ip: None, account }
+        tp_auth::Attempt { ip: peer, account }
     }
 }
 
 #[async_trait]
 impl Authenticator for Guarded {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
-        let attempt = self.attempt(&credentials).await;
+    async fn verify(&self, credentials: Credentials, peer: Option<IpAddr>) -> Result<Principal> {
+        let attempt = self.attempt(&credentials, peer).await;
         match self.guard.check(self.tenant, &attempt).await {
             Ok(Some(_)) => return Err(Error::Forbidden),
             Ok(None) => {}
             Err(e) => return Err(e),
         }
-        match self.inner.verify(credentials).await {
+        match self.inner.verify(credentials, peer).await {
             Ok(p) => {
                 let ok = tp_auth::Attempt {
                     ip: attempt.ip,
@@ -733,120 +779,6 @@ impl Authenticator for Guarded {
             }
             Err(e) => Err(e),
         }
-    }
-}
-
-/// Политики уровней Admin API поверх `PgMeta` (до контракта CTR-25).
-struct PgPolicies(PgMeta);
-
-fn policy_target(t: tp_admin::PolicyTarget) -> tp_meta::retention::PolicyTarget {
-    match t {
-        tp_admin::PolicyTarget::Tenant => tp_meta::retention::PolicyTarget::Tenant,
-        tp_admin::PolicyTarget::Domain(d) => tp_meta::retention::PolicyTarget::Domain(d),
-        tp_admin::PolicyTarget::Account(a) => tp_meta::retention::PolicyTarget::Account(a),
-    }
-}
-
-#[async_trait]
-impl tp_admin::PolicyStore for PgPolicies {
-    async fn policy(&self, tenant: TenantId, target: tp_admin::PolicyTarget) -> Result<Policy> {
-        self.0.policy(tenant, policy_target(target)).await
-    }
-
-    async fn set_policy(
-        &self,
-        tenant: TenantId,
-        target: tp_admin::PolicyTarget,
-        policy: &Policy,
-    ) -> Result<()> {
-        self.0
-            .set_policy(tenant, policy_target(target), policy)
-            .await
-    }
-}
-
-/// Домены Admin API поверх принятых доменов `TransportStore` (`PgMeta`, таблица `domains`; до контракта CTR-25):
-/// список — принятые домены организации, создание — полномочный домен, удаление — только без учётных записей.
-/// Версия снимка кластера устарела между чтением и записью — запись повторяется по свежему снимку.
-struct PgDomains(PgMeta);
-
-/// Попыток записи при гонке версий снимка кластера.
-const DOMAIN_ATTEMPTS: usize = 5;
-
-#[async_trait]
-impl tp_admin::DomainStore for PgDomains {
-    async fn list(&self, tenant: TenantId) -> Result<Vec<tp_admin::Domain>> {
-        let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
-        Ok(cluster
-            .domains
-            .into_iter()
-            .filter(|d| d.tenant == tenant)
-            .map(|d| tp_admin::Domain {
-                id: d.id,
-                name: d.name,
-            })
-            .collect())
-    }
-
-    async fn create(&self, tenant: TenantId, name: &str) -> Result<tp_admin::Domain> {
-        let domain = AcceptedDomain {
-            id: DomainId::new(),
-            tenant,
-            name: name.to_owned(),
-            kind: DomainKind::Authoritative,
-        };
-        for _ in 0..DOMAIN_ATTEMPTS {
-            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
-            // Имя занято (в любой организации) — `Conflict`; иначе `Conflict` записи — устаревшая версия.
-            if cluster.domain(name).is_some() {
-                return Err(Error::Conflict);
-            }
-            match tp_contracts::transport::TransportStore::put_domain(
-                &self.0,
-                cluster.version,
-                &domain,
-            )
-            .await
-            {
-                Ok(_) => {
-                    return Ok(tp_admin::Domain {
-                        id: domain.id,
-                        name: domain.name,
-                    });
-                }
-                Err(Error::Conflict) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(Error::Conflict)
-    }
-
-    async fn delete(&self, tenant: TenantId, id: DomainId) -> Result<()> {
-        for _ in 0..DOMAIN_ATTEMPTS {
-            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
-            if !cluster
-                .domains
-                .iter()
-                .any(|d| d.id == id && d.tenant == tenant)
-            {
-                return Err(Error::NotFound);
-            }
-            match tp_contracts::transport::TransportStore::delete_domain(
-                &self.0,
-                cluster.version,
-                id,
-            )
-            .await
-            {
-                Ok(_) => return Ok(()),
-                // Устаревшая версия снимка — повтор по свежему.
-                Err(Error::Conflict) => continue,
-                // Внешний ключ `accounts` → `domains`: у домена есть учётные записи.
-                Err(Error::Invalid(_)) => return Err(Error::Conflict),
-                Err(e) => return Err(e),
-            }
-        }
-        Err(Error::Conflict)
     }
 }
 
@@ -1042,19 +974,90 @@ mod tests {
     async fn guarded_blocks_account_after_failures() {
         let g = guarded(MemAbuseBlocks::default(), 3, false).await;
         for _ in 0..2 {
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+            assert_eq!(
+                g.verify(password("wrong"), None).await,
+                Err(Error::Forbidden)
+            );
         }
-        g.verify(password("right")).await.expect("login");
+        g.verify(password("right"), None).await.expect("login");
         for _ in 0..2 {
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+            assert_eq!(
+                g.verify(password("wrong"), None).await,
+                Err(Error::Forbidden)
+            );
         }
-        g.verify(password("right"))
+        g.verify(password("right"), None)
             .await
             .expect("login after reset");
         for _ in 0..3 {
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+            assert_eq!(
+                g.verify(password("wrong"), None).await,
+                Err(Error::Forbidden)
+            );
         }
-        assert_eq!(g.verify(password("right")).await, Err(Error::Forbidden));
+        assert_eq!(
+            g.verify(password("right"), None).await,
+            Err(Error::Forbidden)
+        );
+    }
+
+    /// CTR-57: неудачи считаются и по адресу клиента — порог блокирует адрес (и верный пароль с него), вход с
+    /// другого адреса проверяется.
+    #[tokio::test]
+    async fn guarded_blocks_address_after_failures() {
+        let mut g = guarded(MemAbuseBlocks::default(), 1000, false).await;
+        let cfg = tp_auth::AbuseConfig {
+            ip_failures: 2,
+            account_failures: 1000,
+            ..tp_auth::AbuseConfig::default()
+        };
+        g.guard = tp_auth::AbuseGuard::new(cfg, Arc::new(MemAbuseBlocks::default()));
+        let peer = Some(IpAddr::from([192, 0, 2, 7]));
+        let other = Some(IpAddr::from([198, 51, 100, 9]));
+        for _ in 0..2 {
+            assert_eq!(
+                g.verify(password("wrong"), peer).await,
+                Err(Error::Forbidden)
+            );
+        }
+        assert_eq!(
+            g.verify(password("right"), peer).await,
+            Err(Error::Forbidden)
+        );
+        g.verify(password("right"), other)
+            .await
+            .expect("login from another address");
+    }
+
+    /// APP-40 (SRS 6.3): неудачи с разными несуществующими именами входа (учётной записи нет) засчитываются адресу —
+    /// порог блокирует адрес, в том числе для существующей учётной записи с верным паролем; вход с другого адреса
+    /// работает.
+    #[tokio::test]
+    async fn guarded_blocks_address_after_unknown_logins() {
+        let mut g = guarded(MemAbuseBlocks::default(), 1000, false).await;
+        let cfg = tp_auth::AbuseConfig {
+            ip_failures: 3,
+            account_failures: 1000,
+            ..tp_auth::AbuseConfig::default()
+        };
+        g.guard = tp_auth::AbuseGuard::new(cfg, Arc::new(MemAbuseBlocks::default()));
+        let peer = Some(IpAddr::from([192, 0, 2, 7]));
+        let other = Some(IpAddr::from([198, 51, 100, 9]));
+        for i in 0..3 {
+            let unknown = Credentials::Password {
+                login: format!("nobody{i}@example.org"),
+                secret: "guess".into(),
+            };
+            assert_eq!(g.verify(unknown, peer).await, Err(Error::Forbidden));
+        }
+        assert_eq!(
+            g.verify(password("right"), peer).await,
+            Err(Error::Forbidden),
+            "адрес заблокирован"
+        );
+        g.verify(password("right"), other)
+            .await
+            .expect("login from another address");
     }
 
     /// Хранилище блокировок недоступно, `auth.abuse.fail_closed: false` — вход проверяется (решение владельца #253,
@@ -1064,8 +1067,11 @@ mod tests {
         let blocks = MemAbuseBlocks::default();
         blocks.fail_next(Error::UNAVAILABLE);
         let g = guarded(blocks, 3, false).await;
-        g.verify(password("right")).await.expect("login");
-        assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
+        g.verify(password("right"), None).await.expect("login");
+        assert_eq!(
+            g.verify(password("wrong"), None).await,
+            Err(Error::Forbidden)
+        );
     }
 
     /// Хранилище блокировок недоступно, `auth.abuse.fail_closed: true` — вход запрещён (временная ошибка, учётные
@@ -1075,12 +1081,12 @@ mod tests {
         let blocks = MemAbuseBlocks::default();
         blocks.fail_next(Error::UNAVAILABLE);
         let g = guarded(blocks, 3, true).await;
-        let refused = g.verify(password("right")).await;
+        let refused = g.verify(password("right"), None).await;
         assert!(
             matches!(refused, Err(Error::Unavailable { .. })),
             "{refused:?}"
         );
-        g.verify(password("right"))
+        g.verify(password("right"), None)
             .await
             .expect("login after store recovered");
     }
@@ -1092,6 +1098,7 @@ mod tests {
     async fn delivery_rewrites_addresses_from_transport_store() {
         use std::time::Duration;
 
+        use tp_contracts::ids::DomainId;
         use tp_contracts::role::CancellationToken;
         use tp_contracts::transport::{
             AcceptedDomain, AddressPattern, DomainKind, RewriteRule, TransportStore,
@@ -1104,7 +1111,7 @@ mod tests {
         };
         let url = crate::testutil::dev_url(&url);
         let (db_name, url_db) = crate::testutil::create_database(&url).await;
-        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        let pool = crate::testutil::db_pool(&url_db).await;
         tp_meta::schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
         let meta = PgMeta::new(pool, tp_meta::MetaConfig::default()).with_bus(bus.clone());
@@ -1233,6 +1240,205 @@ mod tests {
         crate::testutil::drop_database(&url, &db_name).await;
     }
 
+    /// APP-62: приглашение-письмо, отправленное через доставку JMAP и DAV (`Outbound` из `base_delivery`) от имени
+    /// boss учётной записью alice с правом Send on Behalf (ACL узла, `PgMeta`), — в календаре bob (`ItipInbox` узла);
+    /// от имени boss без права — только письмо.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn jmap_invite_on_behalf_reaches_calendar() {
+        use tp_contracts::acl::AclStore;
+        use tp_contracts::auth::SendRight;
+        use tp_contracts::dav::{CollectionKind, DavStore};
+        use tp_contracts::ids::DomainId;
+        use tp_contracts::meta::{AccountKind, AccountUpsert, SpecialUse};
+        use tp_contracts::queue::SubmitStatus;
+        use tp_contracts::role::CancellationToken;
+        use tp_contracts::transport::{AcceptedDomain, DomainKind, TransportStore};
+        use tp_smtp::deliver::Resolved;
+
+        const ALICE: &str = "alice@corp.example";
+        const BOSS: &str = "boss@corp.example";
+        const BOB: &str = "bob@corp.example";
+        const DAVE: &str = "dave@corp.example";
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = crate::testutil::db_pool(&url_db).await;
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
+        let meta = PgMeta::new(pool, tp_meta::MetaConfig::default()).with_bus(bus.clone());
+        let cfg = crate::sections::registry_of(crate::modules::BUILTIN)
+            .expect("registry")
+            .parse(
+                "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
+                 database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\n\
+                 blob:\n  url: file:///var/lib/thepost/blob\n",
+                Vec::new(),
+            )
+            .expect("config");
+        let ext = Registry::default();
+        let metrics = tp_platform::Metrics::default();
+        let services = Services::build(Base {
+            cfg: &cfg,
+            meta: meta.clone(),
+            blob: Arc::new(tp_testkit::MemBlobStore::default()),
+            bus: bus.clone(),
+            secrets: Arc::new(tp_testkit::MemSecretStore::default()),
+            ext: &ext,
+            metrics: &metrics,
+            node: NodeId::new("app-62").expect("node"),
+        })
+        .await
+        .expect("services");
+        let stop = CancellationToken::new();
+        tokio::spawn(services.routes.clone().watch(
+            bus.clone(),
+            stop.clone(),
+            std::time::Duration::from_millis(50),
+        ));
+        let t = TenantId::DEFAULT;
+
+        // Полномочный домен и учётные записи; boss доверил alice отправку от своего имени (Send on Behalf).
+        let version = TransportStore::cluster(&meta)
+            .await
+            .expect("cluster")
+            .version;
+        let domain = DomainId::new();
+        TransportStore::put_domain(
+            &meta,
+            version,
+            &AcceptedDomain {
+                id: domain,
+                tenant: t,
+                name: "corp.example".into(),
+                kind: DomainKind::Authoritative,
+            },
+        )
+        .await
+        .expect("domain");
+        let mut scope = std::collections::HashMap::new();
+        for login in [ALICE, BOSS, BOB, DAVE] {
+            let acc = AccountStore::upsert(
+                &meta,
+                t,
+                AccountUpsert {
+                    domain,
+                    login: login.into(),
+                    display_name: login.into(),
+                    external_id: None,
+                    enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
+                },
+            )
+            .await
+            .expect("account");
+            scope.insert(
+                login,
+                AccountScope {
+                    tenant: t,
+                    account: acc.id,
+                },
+            );
+        }
+        AclStore::set_send_delegation(&meta, scope[BOSS], ALICE, Some(SendRight::SendOnBehalf))
+            .await
+            .expect("delegate");
+
+        let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
+        // Та же доставка, что получают JMAP (`EmailSubmission/set`) и DAV (письма iMIP).
+        let outbound: Arc<dyn Outbound> =
+            Arc::new(services.base_delivery(&smtp).expect("delivery"));
+        let resolver = services.delivery(&smtp).expect("delivery");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let r = resolver.resolve(BOB).await.expect("resolve");
+            if matches!(r, Resolved::Local(_)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "домен не принят: {r:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Приглашение от имени boss (`From`), отправитель — `sender` (`Sender`, конверт — как у JMAP Send on Behalf).
+        let invite = |sender: &str, uid: &str| {
+            format!(
+                "From: <{BOSS}>\r\nSender: <{sender}>\r\nTo: {BOB}\r\nSubject: meeting\r\nMIME-Version: 1.0\r\n\
+                 Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\n\
+                 meeting\r\n--b\r\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\r\n\r\n\
+                 BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//app-62//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
+                 UID:{uid}\r\nDTSTAMP:20261112T100000Z\r\nDTSTART:20261120T100000Z\r\nDTEND:20261120T110000Z\r\n\
+                 SUMMARY:meeting\r\nORGANIZER:mailto:{BOSS}\r\nATTENDEE:mailto:{BOB}\r\nEND:VEVENT\r\n\
+                 END:VCALENDAR\r\n--b--\r\n"
+            )
+        };
+        for (sender, uid) in [(ALICE, "app62-on-behalf"), (DAVE, "app62-no-right")] {
+            let sent = outbound
+                .submit(
+                    t,
+                    sender,
+                    &[BOB.to_owned()],
+                    bytes::Bytes::from(invite(sender, uid)),
+                )
+                .await
+                .expect("submit");
+            assert_eq!(sent.rcpts, [(BOB.to_owned(), SubmitStatus::Delivered)]);
+        }
+
+        let bob = scope[BOB];
+        let in_calendar = |uid: &'static str| {
+            let meta = meta.clone();
+            async move {
+                for c in DavStore::list_collections(&meta, bob, CollectionKind::Calendar)
+                    .await
+                    .expect("calendars")
+                {
+                    if DavStore::object_by_uid(&meta, bob, c.id, uid)
+                        .await
+                        .expect("object")
+                        .is_some()
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+        };
+        assert!(
+            in_calendar("app62-on-behalf").await,
+            "приглашение с правом Send on Behalf не в календаре"
+        );
+        assert!(
+            !in_calendar("app62-no-right").await,
+            "приглашение без права — только письмо"
+        );
+        // Письма — во «Входящих» bob при любом исходе.
+        let inbox = MailboxStore::list(&meta, bob)
+            .await
+            .expect("mailboxes")
+            .into_iter()
+            .find(|m| m.role == Some(SpecialUse::Inbox))
+            .expect("inbox")
+            .id;
+        assert_eq!(
+            MessageStore::list(&meta, bob, inbox, MessageQuery::All, 10)
+                .await
+                .expect("messages")
+                .len(),
+            2
+        );
+
+        stop.cancel();
+        drop((services, outbound, resolver, meta));
+        crate::testutil::drop_database(&url, &db_name).await;
+    }
+
     /// FIX-02: письмо внешнего отправителя в модерируемую группу узла (`PgMeta`) → Admin API узла (`Services::admin`,
     /// сессия `admin init`): `approve` — 204 (было 500 «доставка решений ещё не подключена»), письмо у каждого
     /// участника, повтор — 404; `reject` — 204, DSN отправителю в очереди исходящей почты.
@@ -1250,7 +1456,7 @@ mod tests {
         };
         let url = crate::testutil::dev_url(&url);
         let (db_name, url_db) = crate::testutil::create_database(&url).await;
-        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        let pool = crate::testutil::db_pool(&url_db).await;
         tp_meta::schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
         let meta = PgMeta::new(pool.clone(), tp_meta::MetaConfig::default()).with_bus(bus.clone());
@@ -1288,6 +1494,22 @@ mod tests {
 
         // Admin API узла с локальным входом (как роль admin в `serve`): администратор `admin init` — модератор.
         let admin_cfg = cfg.section::<AdminSection>(ADMIN).expect("admin").0.clone();
+        // Вход консоли через OIDC (`admin.oidc`) без поставщика `auth.oidc` — ошибка запуска Admin API.
+        let console_oidc = tp_admin::AdminConfig {
+            oidc: Some(tp_admin::OidcClient {
+                client_id: "thepost-console".into(),
+                scope: None,
+            }),
+            ..admin_cfg.clone()
+        };
+        let e = services
+            .admin(&ext, console_oidc, &smtp)
+            .map(|_| ())
+            .expect_err("admin.oidc без auth.oidc");
+        assert!(
+            matches!(&e, tp_contracts::Error::Invalid(m) if m.contains("auth.oidc")),
+            "{e:?}"
+        );
         let admin = Arc::new(crate::local_admin::attach(
             services.admin(&ext, admin_cfg, &smtp).expect("admin"),
             &services,
@@ -1336,6 +1558,8 @@ mod tests {
                     display_name: login.into(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: tp_contracts::meta::AccountKind::User,
                 },
             )
             .await
@@ -1394,7 +1618,7 @@ mod tests {
                 .expect("submit");
             assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued, "{sent:?}");
         }
-        let held = GroupStore::held(&meta, t, Some(group.id), 10)
+        let held = GroupStore::held(&meta, t, Some(group.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 2, "{held:?}");
@@ -1460,7 +1684,7 @@ mod tests {
         drop(tx);
         assert_eq!(queued, 1, "DSN отказа не в очереди");
         assert!(
-            GroupStore::held(&meta, t, Some(group.id), 10)
+            GroupStore::held(&meta, t, Some(group.id), None, 10)
                 .await
                 .expect("held")
                 .is_empty()

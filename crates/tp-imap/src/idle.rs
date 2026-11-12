@@ -8,7 +8,8 @@
 //! В `IDLE` сессия подписана на шину (`EventBus`, уведомления учётной записи): `MailboxChanged` выбранной
 //! папки — `sync`. Шина at-most-once: при обрыве потока сессия переподписывается и сверяется с журналом; `Resync`
 //! (сигналы потеряны) своей учётной записи или системный — тоже `sync`.
-//! `IDLE` длится не дольше [`Timeouts::idle`](crate::config::Timeouts), затем `BYE`; остановка узла — `BYE`.
+//! `IDLE` длится не дольше [`Timeouts::idle`](crate::config::Timeouts), затем `BYE`; остановка узла и запрет входа
+//! учётной записи (`AccountDisabled`, IMAP-22) — `BYE`.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -29,6 +30,7 @@ use crate::store::modseq_item;
 /// Что разбудило сессию в `IDLE`.
 enum Wake {
     Shutdown,
+    Disabled,
     Timeout,
     Event(Option<Event>),
     Read(std::io::Result<usize>),
@@ -234,6 +236,7 @@ impl<T: Transport> Session<T> {
         let deadline = tokio::time::sleep(self.ctx.config.timeouts.idle);
         tokio::pin!(deadline);
         let shutdown = self.ctx.shutdown.clone();
+        let disabled = self.disabled();
         let mut buf = vec![0u8; 4096];
         loop {
             if let Some(input) = self.reader.next(Expect::IdleDone) {
@@ -251,6 +254,7 @@ impl<T: Transport> Session<T> {
             let wake = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => Wake::Shutdown,
+                _ = disabled.cancelled() => Wake::Disabled,
                 _ = &mut deadline => Wake::Timeout,
                 ev = async {
                     match events.as_mut() {
@@ -264,6 +268,10 @@ impl<T: Transport> Session<T> {
                 Wake::Shutdown => {
                     self.bye(Some(proto::code("UNAVAILABLE")), "Server shutting down");
                     self.close = true;
+                    return Ok(());
+                }
+                Wake::Disabled => {
+                    self.account_disabled();
                     return Ok(());
                 }
                 Wake::Timeout => {

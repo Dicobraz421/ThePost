@@ -1,0 +1,17 @@
+# The Post: сокет порта 80 (проверки ACME HTTP-01 встроенного клиента, http.acme, SRS 6.2) — его слушает systemd и
+# передаёт thepost.service (LISTEN_FDS, SRS 2.7). Нужен только с acme.enabled (thepost_tls_mode: acme); без ACME
+# не включать. Адрес в config.yaml — http.acme.listen (по умолчанию 0.0.0.0:80).
+
+[Unit]
+Description=The Post ACME HTTP-01 socket (port 80)
+Documentation=https://github.com/Dicobraz421/ThePost
+
+[Socket]
+ListenStream=80
+BindIPv6Only=both
+FileDescriptorName=http
+Service=thepost.service
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::rejection::RawPathParamsRejection;
-use axum::extract::{DefaultBodyLimit, MatchedPath, RawPathParams, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, RawPathParams, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -30,25 +30,28 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
-use tp_contracts::auth::{Authenticator, Credentials, Principal};
+use tp_contracts::addressbook::{ContactStore, DynamicGroupStore, OrgStore};
+use tp_contracts::admin_audit::{AdminAuditRecord, AuditLog};
+use tp_contracts::audit::MailboxAudit;
+use tp_contracts::auth::{Authenticator, Credentials, Principal, SyncGate};
 use tp_contracts::blob::BlobStore;
 use tp_contracts::delivery::DeliveryLog;
 use tp_contracts::ext::{AdminRequest, AdminRoutes};
 use tp_contracts::groups::GroupStore;
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountStore, PolicyResolver};
+use tp_contracts::meta::{AccountStore, PolicyResolver, PolicyStore};
 use tp_contracts::retention::{Quota, TrashStore};
+use tp_contracts::senders::SenderLists;
 use tp_contracts::transport::TransportStore;
 use tp_contracts::{Error, Result, TenantId};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
-use crate::accounts::{DomainStore, PolicyStore};
-use crate::audit::{AUDIT_ROUTE, AuditLog, AuditRecord, AuditSink};
+use crate::audit::AUDIT_ROUTE;
 use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
-use crate::init::{InitConfig, Local};
+use crate::init::{InitConfig, Local, OidcClient};
 
 /// Начало префикса маршрутов модуля.
 pub const MODULE_PREFIX: &str = "/api/v1/modules/";
@@ -81,6 +84,16 @@ pub enum AdminRole {
 }
 
 impl AdminRole {
+    /// Имя роли в журнале аудита и API (`installation_admin`, `organization_admin`, `operator`, `auditor`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdminRole::InstallationAdmin => "installation_admin",
+            AdminRole::OrganizationAdmin => "organization_admin",
+            AdminRole::Operator => "operator",
+            AdminRole::Auditor => "auditor",
+        }
+    }
+
     /// Роль допускает запрос `method` к шаблону маршрута `route` в организации `tenant` (`None` — вне
     /// организаций: `whoami`, модули) от субъекта организации `own`.
     pub fn permits(
@@ -92,7 +105,7 @@ impl AdminRole {
     ) -> bool {
         let read = *method == Method::GET || *method == Method::HEAD;
         let own_scope = tenant.is_none_or(|t| t == own);
-        let audit = route == AUDIT_ROUTE;
+        let audit = route == AUDIT_ROUTE || route == crate::mailboxes::MAILBOX_AUDIT_ROUTE;
         let cluster = route.starts_with(crate::transport::CLUSTER_PREFIX);
         match self {
             AdminRole::InstallationAdmin => true,
@@ -163,12 +176,15 @@ pub struct AdminConfig {
     pub listen: SocketAddr,
     /// Разрешить внешний адрес слушателя (не loopback, не частный, `0.0.0.0`/`::`); по умолчанию — нет (SRS 6.8).
     pub allow_external: bool,
-    /// Экспорт журнала аудита во внешнюю SIEM (syslog, OTLP); по умолчанию выключен.
+    /// Выгрузка журнала аудита из базы во внешнюю SIEM (syslog, OTLP; выполняет роль maintenance узла); по
+    /// умолчанию выключена.
     pub audit: AuditExportConfig,
     /// Первый администратор без OIDC (`thepost admin init`, [`crate::init`]).
     pub init: InitConfig,
     /// Веб-консоль администратора ([`crate::console`]); по умолчанию раздаётся.
     pub console: ConsoleConfig,
+    /// Клиент консоли у поставщика OIDC `auth.oidc` (`GET /api/v1/session`); по умолчанию не настроен.
+    pub oidc: Option<OidcClient>,
 }
 
 impl Default for AdminConfig {
@@ -187,6 +203,7 @@ impl Default for AdminConfig {
             audit: AuditExportConfig::default(),
             init: InitConfig::default(),
             console: ConsoleConfig::default(),
+            oidc: None,
         }
     }
 }
@@ -220,6 +237,9 @@ impl AdminConfig {
         self.audit.check()?;
         self.init.check()?;
         self.console.check()?;
+        if let Some(o) = &self.oidc {
+            o.check()?;
+        }
         if self.subject_max_chars == 0 || self.header_scan_bytes == 0 || self.content_page_size == 0
         {
             return Err(Error::invalid(
@@ -267,6 +287,11 @@ pub struct Caller {
 }
 
 impl Caller {
+    /// Роли для записи журнала аудита ([`AdminRole::as_str`]).
+    pub fn audit_roles(&self) -> Vec<String> {
+        self.roles.iter().map(|r| r.as_str().to_owned()).collect()
+    }
+
     /// Одна из ролей допускает запрос ([`AdminRole::permits`]); ролей нет — нет.
     pub fn permits(&self, tenant: Option<TenantId>, method: &Method, route: &str) -> bool {
         self.roles
@@ -280,10 +305,8 @@ impl Caller {
 pub struct Deps {
     /// Проверка Bearer-токенов (OIDC).
     pub auth: Arc<dyn Authenticator>,
-    /// Журнал аудита: запись (хранилище и экспорт — [`crate::export::Fanout`]).
-    pub audit: Arc<dyn AuditSink>,
-    /// Журнал аудита: чтение; `None` — не подключено (маршрут отвечает 503).
-    pub audit_log: Option<Arc<dyn AuditLog>>,
+    /// Журнал аудита: запись и чтение (CTR-25); выгрузку в SIEM из него делает [`crate::export`].
+    pub audit_log: Arc<dyn AuditLog>,
     /// Журнал доставки: поиск.
     pub delivery: Arc<dyn DeliveryLog>,
     /// Группы рассылки и очередь модерации.
@@ -300,14 +323,27 @@ pub struct Deps {
     pub policies: Arc<dyn PolicyStore>,
     /// Действующие политики.
     pub resolver: Arc<dyn PolicyResolver>,
-    /// Домены.
-    pub domains: Arc<dyn DomainStore>,
     /// Корзина: список элементов.
     pub trash: Arc<dyn TrashStore>,
     /// Почтовое хранилище: восстановление из корзины с уведомлением клиентов.
     pub store: Arc<dyn MailStore>,
     /// Пароли приложений: выпуск, список, отзыв.
     pub app_passwords: tp_auth::AppPasswords,
+    /// Почтовые контакты адресной книги (CTR-35, [`crate::directory`]).
+    pub contacts: Arc<dyn ContactStore>,
+    /// Оргструктура: подразделения и оргатрибуты.
+    pub org: Arc<dyn OrgStore>,
+    /// Фильтры динамических групп.
+    pub dynamic: Arc<dyn DynamicGroupStore>,
+    /// Списки отправителей ящиков ([`crate::mailboxes`]).
+    pub senders: Arc<dyn SenderLists>,
+    /// Журнал и политика аудита ящиков.
+    pub mailbox_audit: Arc<dyn MailboxAudit>,
+    /// Остановка синхронизации каталога сверх порога удаления.
+    pub sync: Arc<dyn SyncGate>,
+    /// Издатель токенов OIDC, которые проверяет [`Deps::auth`] (`auth.oidc.issuer`); `None` — OIDC не настроен.
+    /// Отдаётся консоли в `GET /api/v1/session` вместе с клиентом `admin.oidc`.
+    pub oidc_issuer: Option<String>,
 }
 
 impl fmt::Debug for Deps {
@@ -353,6 +389,11 @@ impl Admin {
     /// повтор префикса — `Conflict`.
     pub fn new(d: Deps, cfg: AdminConfig) -> Result<Self> {
         cfg.check()?;
+        if cfg.oidc.is_some() && d.oidc_issuer.is_none() {
+            return Err(Error::invalid(
+                "admin.oidc: вход в консоль через OIDC без auth.oidc — поставщик не настроен",
+            ));
+        }
         let mut seen = BTreeSet::new();
         for m in &d.modules {
             let p = m.prefix();
@@ -401,6 +442,8 @@ impl Admin {
         api = crate::groups::routes(api);
         api = crate::transport::routes(api);
         api = crate::sieve::routes(api);
+        api = crate::directory::routes(api);
+        api = crate::mailboxes::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -415,8 +458,8 @@ impl Admin {
                 .route(&format!("{prefix}/{{*rest}}"), any(handler));
         }
         let api = api.route_layer(middleware::from_fn_with_state(self.clone(), guard));
-        let api = crate::console::routes(api, &self.cfg.console, crate::console::embedded());
-        crate::init::routes(api)
+        let api = crate::cors::layer(crate::init::routes(api), &self.cfg.console.cors_origins);
+        crate::console::routes(api, &self.cfg.console, crate::console::embedded())
             .route("/api/openapi.json", get(openapi))
             .layer(DefaultBodyLimit::max(self.cfg.max_body_size))
             .with_state(self)
@@ -424,17 +467,22 @@ impl Admin {
 
     /// Субъект по заголовку `Authorization: Bearer` (токен OIDC); нет заголовка, другая схема, неверный токен —
     /// `Forbidden`.
-    pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal> {
+    pub async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<IpAddr>,
+    ) -> Result<Principal> {
         let token = bearer(headers)?;
         self.d
             .auth
-            .verify(Credentials::Bearer(token.to_owned()))
+            .verify(Credentials::Bearer(token.to_owned()), peer)
             .await
     }
 
     /// Администратор запроса: сессия Admin API ([`crate::init`]) или токен OIDC с ролями по конфигурации.
     /// Локальный токен `admin init` здесь не принимается — только обмен на сессию (`POST /api/v1/session`).
-    pub async fn identify(&self, headers: &HeaderMap) -> Result<Caller> {
+    /// `peer` — адрес клиента соединения (CTR-57; `None` — запрос без соединения клиента).
+    pub async fn identify(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> Result<Caller> {
         let token = bearer(headers)?;
         if let Some(c) = self.session_caller(token, OffsetDateTime::now_utc()) {
             return c;
@@ -442,7 +490,7 @@ impl Admin {
         if tp_contracts::admin_token::is_local_admin_token(token) {
             return Err(Error::Forbidden);
         }
-        Ok(self.caller(self.authenticate(headers).await?))
+        Ok(self.caller(self.authenticate(headers, peer).await?))
     }
 
     /// Роли субъекта по назначениям конфигурации.
@@ -476,7 +524,12 @@ async fn guard(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let caller = match a.identify(req.headers()).await {
+    // Адрес клиента соединения ставит сервер HTTP (`tp_platform::service_http`); без соединения — неизвестен.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    let caller = match a.identify(req.headers(), peer).await {
         Ok(c) => c,
         Err(e) => return auth_error(&e),
     };
@@ -503,20 +556,20 @@ async fn guard(
         ApiError(Error::Forbidden).into_response()
     };
     if method != Method::GET && method != Method::HEAD {
-        let record = AuditRecord {
+        let record = AdminAuditRecord {
             at: OffsetDateTime::now_utc(),
             tenant,
             actor_tenant: caller.principal.tenant,
             actor: caller.principal.account,
             actor_login: caller.principal.login.clone(),
-            roles: caller.roles.iter().copied().collect(),
+            roles: caller.audit_roles(),
             method: method.to_string(),
             route,
             path,
             status: resp.status().as_u16(),
             content_messages: None,
         };
-        if let Err(e) = a.d.audit.record(&record).await {
+        if let Err(e) = crate::audit::record(&a.d, &record).await {
             tracing::error!(error = %e, route = %record.route, "admin: запись аудита не сохранена");
         }
     }
@@ -739,6 +792,8 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     api.merge(crate::transport::Doc::openapi());
     api.merge(crate::sieve::Doc::openapi());
     api.merge(crate::init::Doc::openapi());
+    api.merge(crate::directory::Doc::openapi());
+    api.merge(crate::mailboxes::Doc::openapi());
     api
 }
 
@@ -811,7 +866,7 @@ mod tests {
         assert!(log[0].roles.is_empty());
         assert_eq!(log[0].actor_login, "user@example.org");
         assert_eq!(log[1].status, 200);
-        assert_eq!(log[1].roles, vec![AdminRole::OrganizationAdmin]);
+        assert_eq!(log[1].roles, vec![AdminRole::OrganizationAdmin.as_str()]);
         assert_eq!(log[1].route, "/api/v1/modules/echo/{*rest}");
         assert_eq!(log[1].path, "/api/v1/modules/echo/jobs/1");
         assert_eq!(log[1].actor_tenant, TenantId::DEFAULT);
@@ -873,6 +928,23 @@ mod tests {
         assert_eq!(s, StatusCode::FORBIDDEN);
         let (s, _, _) = env.call("GET", "/api/v1/whoami", Some("wide"), None).await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    /// Каждая операция схемы — с `operationId`, без повторов (по нему консоль и CLI называют операции).
+    #[test]
+    fn operation_ids_unique() {
+        let spec = serde_json::to_value(openapi_spec()).expect("spec");
+        let mut seen = std::collections::BTreeMap::new();
+        let mut dups = Vec::new();
+        for (path, item) in spec["paths"].as_object().expect("paths") {
+            for (method, op) in item.as_object().expect("item") {
+                let id = op["operationId"].as_str().expect("operationId").to_owned();
+                if let Some(prev) = seen.insert(id.clone(), format!("{method} {path}")) {
+                    dups.push(format!("{id}: {prev} и {method} {path}"));
+                }
+            }
+        }
+        assert!(dups.is_empty(), "{dups:#?}");
     }
 
     #[tokio::test]

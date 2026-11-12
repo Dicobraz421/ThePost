@@ -5,10 +5,13 @@
 //! реализация не обращается.
 
 pub mod abuse;
+mod account_state;
 pub mod accounts;
 pub mod acl;
+mod address_book;
 pub mod admin_tokens;
 pub mod app_passwords;
+pub mod audit_log;
 pub mod blob_index;
 mod busy;
 pub mod changelog;
@@ -22,6 +25,7 @@ pub mod failover;
 pub mod groups;
 pub mod index_manifest;
 pub mod lease;
+pub mod mailbox_audit;
 pub mod mailboxes;
 pub mod membership;
 pub mod messages;
@@ -34,6 +38,8 @@ pub mod schema;
 pub mod shards;
 pub mod sieve;
 pub mod signals;
+pub mod submissions;
+mod sync_gate;
 pub mod transport;
 
 use std::future::Future;
@@ -42,7 +48,7 @@ use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgConnection;
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::config::duration;
 use tp_contracts::events::partition_of;
@@ -55,12 +61,14 @@ use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
 use crate::failover::Failover;
-use crate::pool::TxFuture;
+use crate::mailbox_audit::MailboxAuditConfig;
+use crate::pool::{DbPool, TxFuture};
 use crate::replica::Replica;
 use crate::retention::RetentionConfig;
 use crate::shards::{ReadIntent, ShardId, ShardResolver};
 use crate::sieve::SieveConfig;
 use crate::signals::SignalsConfig;
+use crate::submissions::SubmissionsConfig;
 
 /// Секция конфигурации контура метаданных `meta` (SRS 5.5); пул соединений — отдельная секция
 /// `database` ([`pool::PoolConfig`]). Все поля необязательны; неизвестное поле — ошибка разбора.
@@ -113,6 +121,10 @@ pub struct MetaConfig {
     pub dav: DavConfig,
     /// Скрипты Sieve и автоответ: лимиты ([`sieve`]).
     pub sieve: SieveConfig,
+    /// Отправки JMAP: срок хранения ([`submissions`]).
+    pub submissions: SubmissionsConfig,
+    /// Аудит доступа к ящику: срок хранения ([`mailbox_audit`]).
+    pub mailbox_audit: MailboxAuditConfig,
 }
 
 impl MetaConfig {
@@ -134,6 +146,8 @@ impl Default for MetaConfig {
             abuse: AbuseBlocksConfig::default(),
             dav: DavConfig::default(),
             sieve: SieveConfig::default(),
+            submissions: SubmissionsConfig::default(),
+            mailbox_audit: MailboxAuditConfig::default(),
         }
     }
 }
@@ -200,7 +214,7 @@ pub(crate) struct BoxDb {
     /// Шард.
     pub(crate) shard: ShardId,
     /// Пул шарда (для [`ShardId::MAIN`] — пул основной БД, с повтором над [`Failover`]).
-    pub(crate) pool: PgPool,
+    pub(crate) pool: DbPool,
 }
 
 /// Хранилища метаданных на PostgreSQL.
@@ -219,7 +233,8 @@ pub(crate) struct BoxDb {
 ///
 /// С шиной ([`PgMeta::with_bus`]) после фиксации публикуются сигналы: `LogAppended` — после записи событий
 /// в журнал ядра, `MembersChanged` — при изменении состава кластера, `Blocked` — после блокировки,
-/// `Unblocked` — после снятия блокировки, `TransportChanged` — после изменения настроек транспорта ([`transport`]). Сигнал
+/// `Unblocked` — после снятия блокировки, `TransportChanged` — после изменения настроек транспорта ([`transport`]),
+/// `AccountDisabled` — после запрета входа учётной записи (`upsert` с `enabled = false`, `disable_account`). Сигнал
 /// at-most-once: ошибка публикации не отменяет зафиксированное изменение (только запись в журнал узла).
 ///
 /// Над [`Failover`] ([`PgMeta::from_failover`]) хранилища переживают переключение СУБД: при временном отказе
@@ -229,14 +244,15 @@ pub(crate) struct BoxDb {
 ///   письма по его id (`MessageStore::insert`, `insert_batch`; ключ — запись `created` журнала изменений),
 ///   журнал доставки (`DeliveryLog::record*`; ключ — номера `seq`, выданные до транзакции), очередь
 ///   модерации (`GroupStore::hold`; ключ — `HeldId` вызывающего), позиция подписчика (`EventLog::commit`;
-///   ключ — позиция не меньше заданной);
+///   ключ — позиция не меньше заданной), очередь отправки (`QueueStore::enqueue`; ключ — `QueueId`, выданный
+///   до транзакции, META-62), пароль приложения (`AppPasswordStore::insert`; ключ — идентификатор и хеш);
 /// - **идемпотентные по сути** — список у [`PgMeta::rewrite`].
 ///
 /// Остальные записи выполняются один раз: временный отказ (`Unavailable` с `retry_after`) отдаётся
 /// вызывающему, а следующая операция идёт к найденному primary.
 #[derive(Debug, Clone)]
 pub struct PgMeta {
-    pool: PgPool,
+    pool: DbPool,
     cfg: Arc<MetaConfig>,
     bus: Signals,
     failover: Option<Failover>,
@@ -248,7 +264,7 @@ pub struct PgMeta {
 
 impl PgMeta {
     /// Хранилища над готовым пулом; схема должна быть применена.
-    pub fn new(pool: PgPool, cfg: MetaConfig) -> Self {
+    pub fn new(pool: DbPool, cfg: MetaConfig) -> Self {
         Self {
             pool,
             cfg: Arc::new(cfg),
@@ -317,18 +333,23 @@ impl PgMeta {
     /// - upsert по значению: `AbuseBlocks::block` (срок — `greatest`, действующая блокировка не
     ///   сокращается), `AccountStore::upsert` (поиск по имени входа, системные папки — `ensure_system`),
     ///   `AclStore::set_acl`, `set_send_delegation`, `GroupStore::put` (группа заменяется целиком),
-    ///   `Membership::heartbeat` (`upsert_node`), `set_policy`, `set_user_trash_purge`;
+    ///   `Membership::heartbeat` (`upsert_node`), `set_policy`, `set_user_trash_purge`, `ContactStore::put_contact`,
+    ///   `OrgStore::put_org_unit`, `set_org`, `DynamicGroupStore::put_dynamic` (замена целиком);
     /// - `set_*` по значению: `MailboxStore::set_subscribed` (повтор лишь добавляет запись `updated` в
     ///   журнал изменений), `AppPasswords::revoke` (`COALESCE` — время первого отзыва),
-    ///   `mark_blob_damaged` (`coalesce` — время первой пометки);
+    ///   `mark_blob_damaged` (`coalesce` — время первой пометки), `disable_account`, `restore_account` (срок
+    ///   хранения по значению);
     /// - удаление по ключу без возврата удалённого: `AbuseBlocks::unblock`, `Membership::leave`,
     ///   `DeliveryLog::purge` (секции суток), `purge_events` (число удалённых при повторе — только
     ///   оставшиеся).
     ///
     /// Не повторяются: CAS по версии (`transport`, `put_manifest`) и номеру захвата (лизы, очередь) —
     /// повтор применённой записи отвечает `Conflict`; счётчики ссылок BLOB, UID и `ModSeq` писем,
-    /// выдача идентификаторов внутри операции (`enqueue`, `create`, `copy`), удаление с возвратом
-    /// удалённого (`take_held`, `GroupStore::remove`) — повтор вернул бы другое.
+    /// выдача идентификаторов внутри операции (`create`, `copy`), удаление с возвратом
+    /// удалённого и удаление с ответом `NotFound` об отсутствии (`take_held`, `GroupStore::remove`,
+    /// `remove_contact`, `remove_org_unit`, `remove_dynamic`, `cancel_queued`), состояние списков отправителей
+    /// (`put_sender_list`), подключение и удаление отключённого ящика (`attach_account`, `remove_disabled`) —
+    /// повтор вернул бы другое.
     pub(crate) async fn rewrite<T, F, Fut>(&self, op: F) -> Result<T>
     where
         F: FnMut() -> Fut,
@@ -398,7 +419,7 @@ impl PgMeta {
 
     /// Реплика основной БД для [`ReadIntent::Stale`] (`database.read_replica`, [`pool::connect_replica`]) с порогом
     /// отставания `max_lag` (`database.replica_max_lag`).
-    pub fn with_replica(mut self, pool: PgPool, max_lag: Duration) -> Self {
+    pub fn with_replica(mut self, pool: DbPool, max_lag: Duration) -> Self {
         self.replica = ReplicaOf(Some(Arc::new(Replica::new(pool, max_lag))));
         self
     }
@@ -427,7 +448,7 @@ impl PgMeta {
     }
 
     /// Пул чтения закрытого списка шарда `shard` (см. [`PgMeta::read_db`]).
-    pub(crate) async fn read_pool(&self, shard: ShardId) -> Result<PgPool> {
+    pub(crate) async fn read_pool(&self, shard: ShardId) -> Result<DbPool> {
         if self.stale_attempt()
             && let Some(replica) = self.replica_of(shard).await?
             && replica.usable().await
@@ -454,7 +475,7 @@ impl PgMeta {
     }
 
     /// Пул шарда `shard`: основная БД — пул этих хранилищ.
-    pub(crate) async fn shard_pool(&self, shard: ShardId, intent: ReadIntent) -> Result<PgPool> {
+    pub(crate) async fn shard_pool(&self, shard: ShardId, intent: ReadIntent) -> Result<DbPool> {
         match &self.shards.0 {
             Some(r) if shard != ShardId::MAIN => r.pool(shard, intent).await,
             _ => Ok(self.pool.clone()),
@@ -471,7 +492,7 @@ impl PgMeta {
     }
 
     /// Пул ящика учётной записи.
-    pub(crate) async fn box_pool(&self, scope: AccountScope) -> Result<PgPool> {
+    pub(crate) async fn box_pool(&self, scope: AccountScope) -> Result<DbPool> {
         Ok(self.box_db(scope).await?.pool)
     }
 
@@ -586,7 +607,7 @@ impl PgMeta {
     }
 
     /// Хранилища над пулом; при `migrate_on_start` — применение миграций ядра.
-    pub async fn open(pool: PgPool, cfg: MetaConfig) -> Result<Self> {
+    pub async fn open(pool: DbPool, cfg: MetaConfig) -> Result<Self> {
         if cfg.migrate_on_start {
             schema::migrate(&pool).await?;
         }
@@ -594,7 +615,7 @@ impl PgMeta {
     }
 
     /// Пул соединений.
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &DbPool {
         &self.pool
     }
 }

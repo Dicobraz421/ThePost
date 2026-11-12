@@ -2,7 +2,10 @@
 //!
 //! Порции изменений групп ([`LdapDirectory`], курсор — как у [`Directory`](tp_contracts::auth::Directory))
 //! переводятся в [`DistributionGroup`]: DN участников, модераторов и разрешённых отправителей разрешаются
-//! в учётные записи (по имени входа в [`AccountStore`]) и группы (по `external_id` в [`GroupStore`]).
+//! в учётные записи (по идентификатору каталога в [`AccountStore`], имя входа — только для учётных записей без
+//! него) и группы (по `external_id` в [`GroupStore`]).
+//! Почтовые контакты-участники (DN по сопоставлению [`ContactMap`](super::ContactMap)) — по `external_id` в
+//! [`ContactStore`]: группа добавляется в `MailContact::groups` (раскрытие группы — и им), выбывшим — снимается.
 //! Вложенная группа, ещё не выданная каталогом (порядок не гарантирован), создаётся заготовкой без
 //! участников и заполняется своей записью. Учётная запись, которой ещё нет в метаданных, пропускается:
 //! её подхватит следующее изменение группы или полная синхронизация.
@@ -16,12 +19,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tp_contracts::addressbook::ContactStore;
 use tp_contracts::auth::{DirChange, DirCursor};
 use tp_contracts::groups::{
     DistributionGroup, GroupMember, GroupStore, HeldMessage, SenderRestriction,
 };
 use tp_contracts::meta::AccountStore;
-use tp_contracts::{AccountId, Error, GroupId, Result};
+use tp_contracts::{AccountId, ContactId, Error, GroupId, Result};
 
 use super::{LdapDirectory, Query, RawGroup, external_id, first};
 
@@ -47,6 +51,7 @@ pub struct GroupSyncReport {
 enum Target {
     Account(AccountId),
     Group(GroupId),
+    Contact(ContactId),
 }
 
 /// Синхронизация групп рассылки организации каталога в [`GroupStore`].
@@ -55,6 +60,7 @@ pub struct GroupSync {
     dir: LdapDirectory,
     accounts: Arc<dyn AccountStore>,
     groups: Arc<dyn GroupStore>,
+    contacts: Arc<dyn ContactStore>,
 }
 
 impl std::fmt::Debug for GroupSync {
@@ -72,16 +78,19 @@ struct Run {
 }
 
 impl GroupSync {
-    /// Синхронизация каталога `dir` (организация — его) с учётными записями `accounts` и группами `groups`.
+    /// Синхронизация каталога `dir` (организация — его) с учётными записями `accounts`, группами `groups` и
+    /// почтовыми контактами `contacts`.
     pub fn new(
         dir: LdapDirectory,
         accounts: Arc<dyn AccountStore>,
         groups: Arc<dyn GroupStore>,
+        contacts: Arc<dyn ContactStore>,
     ) -> Self {
         GroupSync {
             dir,
             accounts,
             groups,
+            contacts,
         }
     }
 
@@ -122,8 +131,7 @@ impl GroupSync {
                     DirChange::Removed { external_id } => {
                         let tenant = self.dir.tenant;
                         if let Some(g) = self.groups.by_external_id(tenant, &external_id).await? {
-                            report.held.extend(self.groups.remove(tenant, g.id).await?);
-                            report.removed += 1;
+                            self.remove(g.id, &mut report).await?;
                         }
                     }
                 }
@@ -161,8 +169,38 @@ impl GroupSync {
                 continue;
             };
             if seen.binary_search(x).is_err() {
-                report.held.extend(self.groups.remove(tenant, g.id).await?);
-                report.removed += 1;
+                self.remove(g.id, report).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Удаляет группу и снимает её с почтовых контактов.
+    async fn remove(&self, id: GroupId, report: &mut GroupSyncReport) -> Result<()> {
+        self.set_contacts(id, &[]).await?;
+        report
+            .held
+            .extend(self.groups.remove(self.dir.tenant, id).await?);
+        report.removed += 1;
+        Ok(())
+    }
+
+    /// Состав группы `id` из почтовых контактов — ровно `contacts` (`MailContact::groups`).
+    async fn set_contacts(&self, id: GroupId, contacts: &[ContactId]) -> Result<()> {
+        let tenant = self.dir.tenant;
+        for mut c in self.contacts.group_contacts(tenant, id).await? {
+            if !contacts.contains(&c.id) {
+                c.groups.retain(|g| *g != id);
+                self.contacts.put_contact(c).await?;
+            }
+        }
+        for cid in contacts {
+            if let Some(mut c) = self.contacts.contact(tenant, *cid).await?
+                && !c.groups.contains(&id)
+            {
+                c.groups.push(id);
+                c.groups.sort_unstable();
+                self.contacts.put_contact(c).await?;
             }
         }
         Ok(())
@@ -174,15 +212,19 @@ impl GroupSync {
         let m = &self.dir.cfg.groups;
         // Сначала ссылки: ссылка группы на себя создаёт заготовку, её идентификатор нужен ниже.
         let mut members = Vec::with_capacity(raw.members.len());
+        let mut contacts = Vec::new();
         for dn in &raw.members {
             match self.target(dn, run).await? {
                 Some(Target::Account(a)) => members.push(GroupMember::Account(a)),
                 Some(Target::Group(g)) => members.push(GroupMember::Group(g)),
+                Some(Target::Contact(c)) => contacts.push(c),
                 None => {}
             }
         }
         members.sort_unstable();
         members.dedup();
+        contacts.sort_unstable();
+        contacts.dedup();
         let mut moderators = Vec::new();
         for dn in &raw.moderators {
             if let Some(Target::Account(a)) = self.target(dn, run).await? {
@@ -196,7 +238,7 @@ impl GroupSync {
             match self.target(dn, run).await? {
                 Some(Target::Account(a)) => accounts.push(a),
                 Some(Target::Group(g)) => groups.push(g),
-                None => {}
+                Some(Target::Contact(_)) | None => {}
             }
         }
         accounts.sort_unstable();
@@ -238,7 +280,12 @@ impl GroupSync {
                 .or_else(|| existing.as_ref().map(|g| g.hidden_from_gal))
                 .unwrap_or(false),
         };
-        self.put(group).await
+        let id = group.id;
+        if !self.put(group).await? {
+            return Ok(false);
+        }
+        self.set_contacts(id, &contacts).await?;
+        Ok(true)
     }
 
     /// Сохраняет группу; некорректная или с занятым адресом — пропуск с предупреждением.
@@ -262,13 +309,42 @@ impl GroupSync {
         }
         let t = match self.group_target(dn).await? {
             Some(t) => Some(t),
-            None => self.account_target(dn).await?,
+            None => match self.account_target(dn).await? {
+                Some(t) => Some(t),
+                None => self.contact_target(dn).await?,
+            },
         };
         if t.is_none() {
             tracing::debug!(%dn, "LDAP group reference not resolved");
         }
         run.targets.insert(key, t);
         Ok(t)
+    }
+
+    /// Почтовый контакт по DN (по `external_id` в [`ContactStore`]); контакты не сопоставлены — `None`.
+    async fn contact_target(&self, dn: &str) -> Result<Option<Target>> {
+        let Some(m) = &self.dir.cfg.contacts else {
+            return Ok(None);
+        };
+        let rows = self
+            .dir
+            .source
+            .search(&Query {
+                base: dn.to_owned(),
+                base_only: true,
+                filter: m.filter.clone(),
+                attrs: vec![m.id.clone()],
+                show_deleted: false,
+            })
+            .await?;
+        let Some(x) = rows.first().and_then(|e| external_id(e, &m.id)) else {
+            return Ok(None);
+        };
+        Ok(self
+            .contacts
+            .contact_by_external_id(self.dir.tenant, &x)
+            .await?
+            .map(|c| Target::Contact(c.id)))
     }
 
     async fn group_target(&self, dn: &str) -> Result<Option<Target>> {
@@ -310,7 +386,11 @@ impl GroupSync {
         Ok(self.put(stub).await?.then_some(Target::Group(id)))
     }
 
+    /// Учётная запись по DN: по идентификатору каталога ([`AccountStore::by_external_id`]) — переименование
+    /// входа не теряет членство; по имени входа — только учётная запись без `external_id` (заведена до
+    /// синхронизации каталога), чтобы не сопоставить чужую запись каталога с тем же именем.
     async fn account_target(&self, dn: &str) -> Result<Option<Target>> {
+        let tenant = self.dir.tenant;
         let m = &self.dir.cfg.accounts;
         let rows = self
             .dir
@@ -319,17 +399,26 @@ impl GroupSync {
                 base: dn.to_owned(),
                 base_only: true,
                 filter: m.filter.clone(),
-                attrs: vec![m.login.clone()],
+                attrs: vec![m.id.clone(), m.login.clone()],
                 show_deleted: false,
             })
             .await?;
-        let Some(login) = rows.first().and_then(|e| first(e, &m.login)) else {
+        let Some(e) = rows.first() else {
+            return Ok(None);
+        };
+        if let Some(x) = external_id(e, &m.id)
+            && let Some(a) = self.accounts.by_external_id(tenant, &x).await?
+        {
+            return Ok(Some(Target::Account(a.id)));
+        }
+        let Some(login) = first(e, &m.login) else {
             return Ok(None);
         };
         Ok(self
             .accounts
-            .by_login(self.dir.tenant, &login)
+            .by_login(tenant, &login)
             .await?
+            .filter(|a| a.external_id.is_none())
             .map(|a| Target::Account(a.id)))
     }
 }

@@ -1,0 +1,98 @@
+# Веб-консоль в поставке (CI-08, SRS 5.2): thepost отвечает на `GET /console/` страницей консоли, а не
+# «консоль не собрана» (503). Узел — роль admin (profile dev, открытый HTTP на loopback) против PostgreSQL 16
+# в контейнере; проверяются страница (200, `id="root"`) и первый скрипт `assets/` из неё (200).
+# Один из входов: `binary` — бинарный файл на раннере (x86_64), `image` — образ в локальном docker.
+name: console-check
+description: Бинарный файл или образ раздаёт веб-консоль
+
+inputs:
+  binary:
+    description: Путь к бинарному файлу thepost (x86_64)
+    default: ''
+  image:
+    description: Образ в локальном docker (CMD — serve --config /etc/thepost/config.yaml)
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: GET /console/ — страница консоли
+      shell: bash
+      env:
+        BIN: ${{ inputs.binary }}
+        IMAGE: ${{ inputs.image }}
+      run: |
+        set -euo pipefail
+        if { [ -n "$BIN" ] && [ -n "$IMAGE" ]; } || { [ -z "$BIN" ] && [ -z "$IMAGE" ]; }; then
+          echo "::error::console-check: нужен ровно один вход — binary или image"; exit 1
+        fi
+        dir="$RUNNER_TEMP/console-check"
+        rm -rf "$dir"; mkdir -p "$dir/blob"
+        pg=tp-console-pg; app=tp-console-app; pid=
+        cleanup() {
+          if [ -n "$pid" ]; then kill -KILL "$pid" 2>/dev/null || true; fi
+          docker rm -f "$app" "$pg" >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT
+        logs() {
+          if [ -n "$BIN" ]; then cat "$dir/log" || true; else docker logs "$app" 2>&1 || true; fi
+        }
+
+        docker run -d --name "$pg" -p 127.0.0.1:5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16 >/dev/null
+        # По TCP: во время initdb сервер слушает только сокет — готовность по pg_isready на сокете ложная.
+        for _ in $(seq 60); do
+          docker exec "$pg" psql -h 127.0.0.1 -U postgres -qtAc 'select 1' >/dev/null 2>&1 && break
+          sleep 1
+        done
+
+        # Каталоги на запись (BLOB; индекс поиска `search.index.dir` запуск создаёт при любых ролях) и сокет
+        # `admin init`: у бинарного файла — во временном каталоге, у образа — его /var/lib/thepost (владелец nonroot).
+        blob=/var/lib/thepost/blob
+        if [ -n "$BIN" ]; then blob="$dir/blob"; fi
+        cat > "$dir/config.yaml" <<EOF
+        domain: example.test
+        profile: dev
+        roles: [admin]
+        service_http: { listen: "127.0.0.1:0", allow_plaintext: true }
+        http:
+          admin: { listen: "127.0.0.1:18443", allow_plaintext: true }
+        database:
+          url: postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable
+          tls: { allow_plaintext: true }
+        blob:
+          url: file://$blob
+        EOF
+        if [ -n "$BIN" ]; then
+          printf 'admin:\n  init: { socket: "%s" }\nsearch:\n  index: { dir: "%s" }\n' \
+            "$dir/admin.sock" "$dir/search" >> "$dir/config.yaml"
+        fi
+        cat "$dir/config.yaml"
+
+        if [ -n "$BIN" ]; then
+          "$BIN" serve --config "$dir/config.yaml" > "$dir/log" 2>&1 &
+          pid=$!
+        else
+          docker run -d --name "$app" --network host \
+            -v "$dir/config.yaml:/etc/thepost/config.yaml:ro" "$IMAGE" >/dev/null
+        fi
+
+        base=http://127.0.0.1:18443
+        code=000
+        for _ in $(seq 90); do
+          code=$(curl -s -o "$dir/page" -w '%{http_code}' "$base/console/" || true)
+          [ "$code" != 000 ] && break
+          if [ -n "$BIN" ]; then
+            kill -0 "$pid" 2>/dev/null || { logs; echo "::error::thepost serve завершился до ответа"; exit 1; }
+          elif [ "$(docker inspect -f '{{.State.Running}}' "$app")" != true ]; then
+            logs; echo "::error::контейнер thepost завершился до ответа"; exit 1
+          fi
+          sleep 1
+        done
+        if [ "$code" != 200 ] || ! grep -q 'id="root"' "$dir/page" || grep -q 'Консоль не собрана' "$dir/page"; then
+          logs; echo "--- ответ $code:"; cat "$dir/page" || true
+          echo "::error::GET /console/ — $code, не страница консоли (консоль не вшита?)"; exit 1
+        fi
+        js=$(grep -o '/console/assets/[^"]*\.js' "$dir/page" | head -n1)
+        [ -n "$js" ] || { cat "$dir/page"; echo "::error::в странице консоли нет скрипта assets/"; exit 1; }
+        curl -fsS -o /dev/null "$base$js" || { logs; echo "::error::GET $js — не 200"; exit 1; }
+        echo "консоль раздаётся: /console/ — 200, $js — 200"

@@ -172,6 +172,8 @@ pub(crate) struct Rotation {
     pub(crate) secrets: Arc<dyn SecretStore>,
     pub(crate) pool: PgPool,
     pub(crate) rotated: Rotated,
+    /// Ключ клиентского сертификата из хранилища (`database.tls.key`), прочитанный последним.
+    pub(crate) key: Option<Secret>,
 }
 
 /// Исход продления аренд.
@@ -184,7 +186,7 @@ enum Renewal {
 
 impl Rotation {
     /// Продлевает аренды `cur` и ротирует учётные данные до закрытия пула.
-    pub(crate) async fn run(self, mut cur: Issued) {
+    pub(crate) async fn run(mut self, mut cur: Issued) {
         let close = self.pool.close_event();
         tokio::pin!(close);
         let Some(mut ttl) = cur.issued_ttl else {
@@ -211,7 +213,7 @@ impl Rotation {
             match issue(&self.dc, self.secrets.as_ref()).await {
                 // Хранилище вернуло прежнюю выдачу (действующую аренду): повтор позже.
                 Ok(next) if next.same_leases(&cur) => wait = self.dc.retry_interval,
-                Ok(next) => match self.switch(&next) {
+                Ok(next) => match self.switch(&next).await {
                     Ok(()) => {
                         cur = next;
                         match cur.issued_ttl {
@@ -263,10 +265,20 @@ impl Rotation {
     }
 
     /// Новые соединения пула — с учётными данными `next`.
-    fn switch(&self, next: &Issued) -> Result<()> {
-        let opts = self
-            .cfg
-            .connect_options(&self.cfg.url, self.cfg.pgbouncer)?;
+    /// Ключ клиентского сертификата (`database.tls.key`) перечитывается: новая версия секрета применяется
+    /// вместе с учётными данными; хранилище не отдало ключ — остаётся прежний.
+    async fn switch(&mut self, next: &Issued) -> Result<()> {
+        match self.cfg.client_key(self.secrets.as_ref()).await {
+            Ok(key) => self.key = key,
+            Err(e) => {
+                tracing::warn!(error = %e, "database.tls.key: ключ не перечитан — остаётся прежний");
+            }
+        }
+        let opts = self.cfg.with_key(
+            self.cfg
+                .connect_options(&self.cfg.url, self.cfg.pgbouncer)?,
+            self.key.as_ref(),
+        )?;
         // Адрес — текущего primary (после переключения он может отличаться от `url`).
         self.rotated
             .replace(&self.pool, |cur| retarget(next.apply(opts), cur));

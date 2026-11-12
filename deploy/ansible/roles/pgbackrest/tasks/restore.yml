@@ -23,7 +23,7 @@
       копий в OpenBao {{ thepost_backup_openbao_mount }}/, см. docs/INSTALL.md)
 
 - name: Show backups available
-  ansible.builtin.command: thepost-pgbackrest info
+  ansible.builtin.command: /usr/local/sbin/thepost-pgbackrest info
   register: thepost_restore_info
   changed_when: false
 
@@ -64,7 +64,7 @@
 - name: Restore PostgreSQL (PITR)
   ansible.builtin.command:
     argv: >-
-      {{ ['thepost-pgbackrest', 'restore', '--delta', '--log-level-console=info',
+      {{ ['/usr/local/sbin/thepost-pgbackrest', 'restore', '--delta', '--log-level-console=info',
           '--recovery-option=restore_command=pgbackrest --config-include-path=/run/credentials/'
           ~ thepost_backup_pg_unit ~ ' --stanza=' ~ thepost_backup_stanza ~ ' archive-get %f "%p"']
          + (['--type=time', '--target=' ~ thepost_restore_target, '--target-action=promote']
@@ -112,7 +112,7 @@
   ansible.builtin.shell:
     cmd: |
       set -euo pipefail
-      list=$(thepost-restic snapshots --compact --tag thepost-blob)
+      list=$(/usr/local/sbin/thepost-restic snapshots --compact --tag thepost-blob)
       t={{ thepost_restore_target | quote }}
       pick=
       if [ -n "$t" ]; then
@@ -136,7 +136,7 @@
 
 - name: Restore BLOB directory (restic)
   ansible.builtin.command:
-    argv: [thepost-restic, restore, "{{ snapshot }}", --tag, thepost-blob, --target, /]
+    argv: [/usr/local/sbin/thepost-restic, restore, "{{ snapshot }}", --tag, thepost-blob, --target, /]
   vars:
     snapshot: "{{ thepost_restore_blob_snapshot if thepost_restore_blob_snapshot | length > 0
       else thepost_restore_snapshot.stdout }}"

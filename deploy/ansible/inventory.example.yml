@@ -10,8 +10,8 @@ all:
       vars:
         thepost_domain: example.ru
         thepost_hostname: mail.example.ru
-        # Let's Encrypt (certbot): порт 80 открыт, DNS mail.example.ru → ВМ.
-        thepost_tls_mode: certbot
+        # Let's Encrypt — встроенный клиент ACME thepost (HTTP-01): порт 80 открыт, DNS mail.example.ru → ВМ.
+        thepost_tls_mode: acme
         thepost_acme_email: postmaster@example.ru
         # Антивирус (clamav-milter) — по желанию.
         thepost_clamav: false

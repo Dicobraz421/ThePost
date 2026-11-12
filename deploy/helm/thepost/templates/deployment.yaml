@@ -21,6 +21,8 @@ spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       # Токен сервисного аккаунта — вход в OpenBao (secrets.auth.kubernetes.jwt_file).
       automountServiceAccountToken: true
+      imagePullSecrets:
+        {{- include "thepost.imagePullSecrets" . | nindent 8 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -63,9 +65,13 @@ spec:
         - name: config
           configMap:
             name: {{ include "thepost.fullname" . }}-config
+        # Цепочка и CA; ключ TLS — в OpenBao, в под не попадает (решение 100).
         - name: tls
           secret:
             secretName: {{ .Values.tls.secretName }}
+            items:
+              - { key: tls.crt, path: tls.crt }
+              - { key: ca.crt, path: ca.crt }
         {{- if .Values.cnpg.enabled }}
         # Только сертификат CA (ключ CA в под не попадает).
         - name: db-ca

@@ -69,6 +69,12 @@
 6. Режим `preferred`: `helm upgrade … --set cnpg.db_durability=preferred` → `dataDurability: preferred`; те же реплики
    под fencing → `synchronous_standby_names` пуст, запись и приём писем продолжаются; `fencing off` → снова
    `ANY 1 (…)`. Вернуть `required`.
+7. Повтор записи за PgBouncer (META-62; Pooler `t-db-pooler-rw`, `pgbouncer: true`): под циклом отправки через 587
+   и выпуском паролей приложения на primary раз в секунду в течение минуты
+   `psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'thepost' AND state <> 'idle'"`
+   → `tp_db_failover_retries_total` растёт, клиентам — успех или временный отказ (4xx); `SELECT count(*),
+   count(DISTINCT queue_id) FROM queue` — числа равны; `SELECT password_id, count(*) FROM app_passwords GROUP BY 1
+   HAVING count(*) > 1` — пусто; число принятых 250 = число доставленных.
 
 ## SMB: PostgreSQL без pg_ctlcluster
 1. `ansible-playbook -i inventory.yml deploy/ansible/smb.yml` поверх существующей установки → PostgreSQL перезапущен

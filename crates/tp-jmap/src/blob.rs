@@ -26,7 +26,7 @@ use tp_contracts::meta::{AccountScope, BodyPart};
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, MessageId, Result, TenantId};
 
 use crate::core::error::{MethodError, MethodResult};
-use crate::core::http::{auth_error, json as json_response, problem};
+use crate::core::http::{Peer, auth_error, json as json_response, problem};
 use crate::core::request::{object, parse_args};
 use crate::core::{Ctx, Jmap, Problem};
 use crate::email_get::{is_multipart, leaf_path};
@@ -289,10 +289,11 @@ fn http_error(e: &Error) -> Response {
 pub(crate) async fn upload(
     State(j): State<Arc<Jmap>>,
     Path(account): Path<String>,
+    peer: Peer,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let p = match j.authenticate(&headers).await {
+    let p = match j.authenticate(&headers, peer.0).await {
         Ok(p) => p,
         Err(e) => return auth_error(&e),
     };
@@ -371,9 +372,10 @@ pub(crate) async fn download(
     State(j): State<Arc<Jmap>>,
     Path((account, blob, name)): Path<(String, String, String)>,
     Query(q): Query<DownloadQuery>,
+    peer: Peer,
     headers: HeaderMap,
 ) -> Response {
-    let p = match j.authenticate(&headers).await {
+    let p = match j.authenticate(&headers, peer.0).await {
         Ok(p) => p,
         Err(e) => return auth_error(&e),
     };

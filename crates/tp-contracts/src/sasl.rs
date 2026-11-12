@@ -56,7 +56,7 @@
 //! }
 //!
 //! // C: AUTH PLAIN AHVzZXIAc2VjcmV0  (base64 "\0user\0secret" декодирует протокол)
-//! let ctx = SaslContext { service: "smtp", tls: true };
+//! let ctx = SaslContext { service: "smtp", tls: true, peer: Some([192, 0, 2, 7].into()) };
 //! let mech: Mechanism = "plain".parse()?;
 //! assert_eq!(Server.mechanisms(false), Vec::<Mechanism>::new());
 //! let mut s = Server.start(mech, &ctx)?;
@@ -71,6 +71,7 @@
 //! ```
 
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -146,6 +147,10 @@ pub struct SaslContext {
     pub service: &'static str,
     /// Соединение защищено TLS.
     pub tls: bool,
+    /// Адрес клиента соединения (CTR-57; SRS 6.3): сеанс передаёт его в
+    /// [`Authenticator::verify`](crate::auth::Authenticator::verify) — счётчики защиты от перебора. `None` — только
+    /// когда адрес неизвестен (обмен без соединения клиента).
+    pub peer: Option<IpAddr>,
 }
 
 /// Неуспешная аутентификация; причина клиенту не уточняется сверх кода (SMTP 535 5.7.8, IMAP RFC 5530).
@@ -184,19 +189,92 @@ pub trait SaslServer: Send + Sync + 'static {
     /// Предлагаемые механизмы (`EHLO`, `CAPABILITY`); без TLS — без [`Mechanism::plaintext`].
     fn mechanisms(&self, tls: bool) -> Vec<Mechanism>;
 
-    /// Начинает обмен; механизм не из `mechanisms(ctx.tls)` — `Error::Invalid`.
+    /// Начинает обмен с клиентом `ctx.peer`; механизм не из `mechanisms(ctx.tls)` — `Error::Invalid`.
     fn start(&self, mechanism: Mechanism, ctx: &SaslContext) -> Result<Box<dyn SaslSession>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::auth::{Authenticator, Credentials};
+    use futures::executor::block_on;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn object_safe() {
         fn _sasl(_: Arc<dyn SaslServer>) {}
         fn _session(_: Box<dyn SaslSession>) {}
+    }
+
+    /// Проверка, запоминающая адреса клиента.
+    #[derive(Default)]
+    struct Recording {
+        peers: Mutex<Vec<Option<IpAddr>>>,
+    }
+
+    #[async_trait]
+    impl Authenticator for Recording {
+        async fn verify(&self, _: Credentials, peer: Option<IpAddr>) -> Result<Principal> {
+            if let Ok(mut peers) = self.peers.lock() {
+                peers.push(peer);
+            }
+            Err(Error::Forbidden)
+        }
+    }
+
+    struct Session {
+        auth: Arc<dyn Authenticator>,
+        peer: Option<IpAddr>,
+    }
+
+    #[async_trait]
+    impl SaslSession for Session {
+        async fn step(&mut self, _: Option<&[u8]>) -> Result<SaslStep> {
+            let credentials = Credentials::Bearer("t".into());
+            match self.auth.verify(credentials, self.peer).await {
+                Ok(p) => Ok(SaslStep::Done(p)),
+                Err(Error::Forbidden) => Ok(SaslStep::Fail(SaslFailure::Authentication)),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    struct Server(Arc<dyn Authenticator>);
+
+    impl SaslServer for Server {
+        fn mechanisms(&self, _: bool) -> Vec<Mechanism> {
+            vec![Mechanism::OauthBearer]
+        }
+
+        fn start(&self, _: Mechanism, ctx: &SaslContext) -> Result<Box<dyn SaslSession>> {
+            Ok(Box::new(Session {
+                auth: self.0.clone(),
+                peer: ctx.peer,
+            }))
+        }
+    }
+
+    #[test]
+    fn peer_reaches_verify() {
+        // Адрес соединения из `SaslContext` доходит до `verify`; `None` — адрес неизвестен.
+        let peer = Some(IpAddr::from([192, 0, 2, 7]));
+        let auth = Arc::new(Recording::default());
+        let server = Server(auth.clone());
+        for peer in [peer, None] {
+            let ctx = SaslContext {
+                service: "imap",
+                tls: true,
+                peer,
+            };
+            let step = server
+                .start(Mechanism::OauthBearer, &ctx)
+                .map(|mut s| block_on(s.step(None)));
+            assert_eq!(step, Ok(Ok(SaslStep::Fail(SaslFailure::Authentication))));
+        }
+        assert_eq!(
+            auth.peers.lock().map(|p| p.clone()).ok(),
+            Some(vec![peer, None])
+        );
     }
 
     #[test]

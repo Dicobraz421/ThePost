@@ -72,7 +72,7 @@ pub struct IssuedAppPassword {
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
     r.route(
         "/api/v1/orgs/{org}/accounts/{account}/app-passwords",
-        get(list).post(issue),
+        get(list_app_passwords).post(issue),
     )
     .route(
         "/api/v1/orgs/{org}/accounts/{account}/app-passwords/{id}",
@@ -83,7 +83,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
 /// Спецификация OpenAPI маршрутов модуля.
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(list, issue, revoke),
+    paths(list_app_passwords, issue, revoke),
     components(schemas(AppPasswordInfo, NewAppPassword, IssuedAppPassword))
 )]
 pub(crate) struct Doc;
@@ -101,7 +101,7 @@ async fn scope(a: &Admin, org: TenantId, id: AccountId) -> ApiResult<AccountScop
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("account" = String, Path, description = "Учётная запись (UUID)")),
     responses((status = 200, body = Vec<AppPasswordInfo>), (status = 404, body = Problem)))]
-async fn list(
+async fn list_app_passwords(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, AccountId)>,
 ) -> ApiResult<Json<Vec<AppPasswordInfo>>> {
@@ -190,7 +190,7 @@ mod tests {
         let secret = b["password"].as_str().expect("password").to_owned();
         let id = b["id"].as_str().expect("id").to_owned();
         let p = auth
-            .verify(login(&secret))
+            .verify(login(&secret), None)
             .await
             .expect("действующий пароль");
         assert_eq!(p.account, scope.account);
@@ -204,7 +204,10 @@ mod tests {
             .call("DELETE", &format!("{base}/{id}"), Some("org"), None)
             .await;
         assert_eq!(s, StatusCode::NO_CONTENT);
-        assert_eq!(auth.verify(login(&secret)).await, Err(Error::Forbidden));
+        assert_eq!(
+            auth.verify(login(&secret), None).await,
+            Err(Error::Forbidden)
+        );
         let (_, _, list) = env.call("GET", &base, Some("org"), None).await;
         assert!(list[0]["revoked_at"].is_string(), "{list}");
         let (s, _, _) = env

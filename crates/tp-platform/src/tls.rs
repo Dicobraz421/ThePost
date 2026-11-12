@@ -3,10 +3,13 @@
 //! SIGHUP, по новой версии секции и по запросу (например, после выпуска ACME). Опрос mtime — только если событий
 //! ОС нет (SRS 2.8).
 //!
-//! Закрытый ключ (PLT-24, решение 37) — из файла `key_file` или из хранилища секретов OpenBao/Vault по ссылке
-//! `key: { secret: "<путь>#<поле>" }` (PEM в поле секрета; на диск не пишется). Новая версия секрета подхватывается
-//! без перезапуска: секрет перечитывается с периодом `key_poll_interval`, по SIGHUP, по событию файла цепочки и по
-//! запросу; ключ, не подходящий к цепочке, отклоняется — действует прежняя пара, пока цепочка и ключ не совпадут.
+//! Закрытый ключ (PLT-24, PLT-31; решения 37, 100) — только из хранилища секретов OpenBao/Vault по ссылке
+//! `key: { secret: "<путь>#<поле>" }` (PEM в поле секрета; на диск не пишется; по умолчанию `thepost/tls#key`).
+//! Файла ключа нет: `key_file` в секции — ошибка разбора. Новая версия секрета подхватывается без перезапуска:
+//! секрет перечитывается с периодом `key_poll_interval`, по SIGHUP, по событию файла цепочки и по запросу; ключ, не
+//! подходящий к цепочке, отклоняется — действует прежняя пара, пока цепочка и ключ не совпадут.
+//! Сертификаты в PEM секрета ключа (внутренний сертификат PKI OpenBao, `…#bundle`, PLT-26) — цепочка, `cert_file`
+//! не читается: ключ и цепочка заменяются одним шагом, с продлением сертификата хранилищем без перезапуска.
 //!
 //! Клиентский доступ — TLS 1.3; TLS 1.2 включается настройкой `min_version: "1.2"` для устаревших клиентов.
 //! Ошибка перечитывания оставляет в силе прежние сертификаты.
@@ -56,10 +59,10 @@ use crate::reload::Hup;
 pub struct TlsConfig {
     /// PEM-файл с цепочкой сертификатов (сертификат узла первым).
     pub cert_file: PathBuf,
-    /// PEM-файл с закрытым ключом (PKCS#8, PKCS#1 или SEC1).
-    pub key_file: PathBuf,
-    /// Закрытый ключ из хранилища секретов вместо `key_file`: `{ secret: "<путь>#<поле>" }`, в поле — PEM.
-    pub key: Option<SecretRef>,
+    /// Закрытый ключ из хранилища секретов: `{ secret: "<путь>#<поле>" }`, в поле — PEM (PKCS#8, PKCS#1 или
+    /// SEC1); по умолчанию `thepost/tls#key`. Встроенный ACME пишет выпущенный ключ сюда же. Есть в PEM
+    /// сертификаты (сертификат узла первым) — они цепочка, `cert_file` не читается.
+    pub key: SecretRef,
     /// Минимальная версия TLS для клиентского доступа.
     pub min_version: TlsVersion,
     /// Период запасного опроса файлов (`1m`), только если события ОС (inotify) недоступны; `0s` — без опроса,
@@ -78,13 +81,17 @@ impl Default for TlsConfig {
     fn default() -> Self {
         Self {
             cert_file: PathBuf::from("/etc/thepost/tls/fullchain.pem"),
-            key_file: PathBuf::from("/etc/thepost/tls/privkey.pem"),
-            key: None,
+            key: default_key(),
             min_version: TlsVersion::Tls13,
             reload_interval: Duration::from_secs(60),
             key_poll_interval: Duration::from_secs(60),
         }
     }
+}
+
+/// Ссылка на ключ TLS по умолчанию: `thepost/tls#key`.
+fn default_key() -> SecretRef {
+    SecretRef::new("thepost/tls", "key").expect("valid default secret reference")
 }
 
 /// Версия TLS.
@@ -112,8 +119,10 @@ pub(crate) enum TlsError {
     NoKey(PathBuf),
     #[error("tls.key: secret {0}: no private key in PEM found")]
     NoKeyInSecret(SecretRef),
-    #[error("tls.key: secret {0}: the secret store is not connected")]
-    NoStore(SecretRef),
+    #[error("no private key in PEM found")]
+    NoKeyInPem,
+    #[error("tls.key: secret {0} not found in the secret store")]
+    NoSecret(SecretRef),
     #[error("{path}: client CA: {reason}")]
     ClientCa { path: PathBuf, reason: String },
     #[error("{path}: client CRL: {reason}")]
@@ -136,25 +145,22 @@ impl From<TlsError> for Error {
 /// Отметка версии файла: mtime и размер.
 type FileStamp = (Option<SystemTime>, u64);
 
-/// Отметка версии файлов: цепочка и ключ.
-type Stamp = [FileStamp; 2];
-
 /// Действующие сертификаты сервера. Разделяется слушателями через `Arc`; новые соединения
 /// получают текущую конфигурацию, установленные соединения не затрагиваются.
 pub struct TlsCerts {
     current: RwLock<Arc<Loaded>>,
     files: Mutex<Source>,
-    store: Option<Arc<dyn SecretStore>>,
+    store: Arc<dyn SecretStore>,
     /// Проверки сертификата клиента слушателей: их файлы CA и CRL перечитываются вместе с сертификатами.
     clients: Mutex<Vec<Weak<ClientFiles>>>,
 }
 
-/// Источник действующей пары: секция, отметка файлов и значение секрета ключа (сравнение версий).
+/// Источник действующей пары: секция, отметка файла цепочки и значение секрета ключа (сравнение версий).
 #[derive(Clone)]
 struct Source {
     cfg: TlsConfig,
-    stamp: Stamp,
-    key: Option<Secret>,
+    stamp: FileStamp,
+    key: Secret,
 }
 
 /// Конфигурации с проверкой сертификата клиента: слушатель, его действующий верификатор и конфигурация.
@@ -362,26 +368,10 @@ impl fmt::Debug for TlsCerts {
 }
 
 impl TlsCerts {
-    /// Загружает сертификаты по `cfg` (чтение файлов — в `spawn_blocking`). Ключ по ссылке на секрет (`key`)
-    /// требует хранилища — [`TlsCerts::load_with_secrets`], здесь — `Invalid`.
-    pub async fn load(cfg: &TlsConfig) -> tp_contracts::Result<Self> {
-        Self::load_from(cfg, None).await
-    }
-
-    /// Как [`TlsCerts::load`], с хранилищем секретов `store` для ключа по ссылке `key`; оно же используется при
-    /// перечитывании. Секция с ключом в файле хранилище не читает.
-    pub async fn load_with_secrets(
-        cfg: &TlsConfig,
-        store: Arc<dyn SecretStore>,
-    ) -> tp_contracts::Result<Self> {
-        Self::load_from(cfg, Some(store)).await
-    }
-
-    async fn load_from(
-        cfg: &TlsConfig,
-        store: Option<Arc<dyn SecretStore>>,
-    ) -> tp_contracts::Result<Self> {
-        let key = fetch_key(cfg, store.as_deref()).await?;
+    /// Загружает цепочку из файла `cert_file` (чтение — в `spawn_blocking`) и ключ по ссылке `key` из хранилища
+    /// секретов `store`; оно же читается при перечитывании.
+    pub async fn load(cfg: &TlsConfig, store: Arc<dyn SecretStore>) -> tp_contracts::Result<Self> {
+        let key = fetch_key(cfg, store.as_ref()).await?;
         let (loaded, source) = read_source(cfg.clone(), key).await?;
         Ok(Self {
             current: RwLock::new(Arc::new(loaded)),
@@ -488,8 +478,8 @@ impl TlsCerts {
         self.reload_with(cfg.clone()).await
     }
 
-    /// Перечитывает пару, если изменились mtime или размер файлов либо значение секрета ключа (новая версия), и
-    /// изменившиеся файлы CA и CRL слушателей. `true` — сертификаты, CA или списки отзыва заменены.
+    /// Перечитывает пару, если изменились mtime или размер файла цепочки либо значение секрета ключа (новая
+    /// версия), и изменившиеся файлы CA и CRL слушателей. `true` — сертификаты, CA или списки отзыва заменены.
     pub async fn reload_if_changed(&self) -> tp_contracts::Result<bool> {
         let pair = self.reload_pair_if_changed().await;
         let clients = self.reload_clients(false).await;
@@ -506,13 +496,8 @@ impl TlsCerts {
         let stamp = tokio::task::spawn_blocking(move || stamp(&probe))
             .await
             .map_err(|_| TlsError::Join)?;
-        let key = fetch_key(&old.cfg, self.store.as_deref()).await?;
-        let same_key = match (&key, &old.key) {
-            (Some(new), Some(old)) => new.expose() == old.expose(),
-            (None, None) => true,
-            _ => false,
-        };
-        if stamp == old.stamp && same_key {
+        let key = fetch_key(&old.cfg, self.store.as_ref()).await?;
+        if stamp == old.stamp && key.expose() == old.key.expose() {
             return Ok(false);
         }
         self.replace(old.cfg, key).await?;
@@ -533,9 +518,6 @@ impl TlsCerts {
         loop {
             let cfg = self.config();
             let mut files = vec![cfg.cert_file.clone()];
-            if cfg.key.is_none() {
-                files.push(cfg.key_file.clone());
-            }
             for client in self.clients() {
                 files.extend(client.paths().cloned());
             }
@@ -548,7 +530,7 @@ impl TlsCerts {
             // Файлы опрашиваются только без событий ОС, секрет ключа — всегда (событий о версии секрета нет).
             let nonzero = |d: Duration| (!d.is_zero()).then_some(d);
             let file_poll = nonzero(cfg.reload_interval).filter(|_| !fs.active());
-            let key_poll = cfg.key.as_ref().and(nonzero(cfg.key_poll_interval));
+            let key_poll = nonzero(cfg.key_poll_interval);
             // Без событий ОС и с выключенным опросом — ждать SIGHUP, запроса или новой секции (опрос могут включить).
             let poll = match [file_poll, key_poll].into_iter().flatten().min() {
                 Some(wait) => Some((wait, true)),
@@ -590,12 +572,12 @@ impl TlsCerts {
     }
 
     async fn reload_with(&self, cfg: TlsConfig) -> tp_contracts::Result<()> {
-        let key = fetch_key(&cfg, self.store.as_deref()).await?;
+        let key = fetch_key(&cfg, self.store.as_ref()).await?;
         self.replace(cfg, key).await
     }
 
-    /// Читает пару по `cfg` с ключом `key` (значение секрета; `None` — ключ в файле) и делает её действующей.
-    async fn replace(&self, cfg: TlsConfig, key: Option<Secret>) -> tp_contracts::Result<()> {
+    /// Читает пару по `cfg` с ключом `key` (значение секрета) и делает её действующей.
+    async fn replace(&self, cfg: TlsConfig, key: Secret) -> tp_contracts::Result<()> {
         let (loaded, source) = read_source(cfg, key).await?;
         *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(loaded);
         *self.files.lock().unwrap_or_else(PoisonError::into_inner) = source;
@@ -603,28 +585,33 @@ impl TlsCerts {
     }
 }
 
-/// Значение секрета ключа секции; `None` — ключ в файле. Обращение к хранилищу — до чтения файлов, вне
-/// `spawn_blocking`.
-async fn fetch_key(
-    cfg: &TlsConfig,
-    store: Option<&dyn SecretStore>,
-) -> tp_contracts::Result<Option<Secret>> {
-    let Some(secret) = &cfg.key else {
-        return Ok(None);
-    };
-    let store = store.ok_or_else(|| TlsError::NoStore(secret.clone()))?;
-    store.get(secret).await.map(Some)
+/// Значение секрета ключа секции; секрета нет — `Invalid` со ссылкой (ссылка по умолчанию в config.yaml не видна).
+/// Обращение к хранилищу — до чтения файлов, вне `spawn_blocking`.
+async fn fetch_key(cfg: &TlsConfig, store: &dyn SecretStore) -> tp_contracts::Result<Secret> {
+    match store.get(&cfg.key).await {
+        Err(Error::NotFound) => Err(TlsError::NoSecret(cfg.key.clone()).into()),
+        other => other,
+    }
 }
 
 /// Читает и проверяет пару секции в `spawn_blocking`.
-async fn read_source(
-    cfg: TlsConfig,
-    key: Option<Secret>,
-) -> tp_contracts::Result<(Loaded, Source)> {
+async fn read_source(cfg: TlsConfig, key: Secret) -> tp_contracts::Result<(Loaded, Source)> {
     let read = tokio::task::spawn_blocking(move || {
-        read_config(&cfg, key.as_ref()).map(|(loaded, stamp)| (loaded, Source { cfg, stamp, key }))
+        read_config(&cfg, &key).map(|(loaded, stamp)| (loaded, Source { cfg, stamp, key }))
     });
     Ok(read.await.map_err(|_| TlsError::Join)??)
+}
+
+/// Подходит ли закрытый ключ `key` (PEM) к цепочке из файла `cert_file` — та же проверка, что при загрузке пары
+/// слушателей; ошибка — `Invalid` без значения ключа. Для проверок `thepost doctor` ключей других каналов.
+pub async fn check_pair(cert_file: &Path, key: &Secret) -> tp_contracts::Result<()> {
+    let (cert_file, key) = (cert_file.to_owned(), key.clone());
+    let check = tokio::task::spawn_blocking(move || {
+        let chain = read_chain(&cert_file)?;
+        let key = parse_secret_pem(&key).1.ok_or(TlsError::NoKeyInPem)?;
+        build(chain, key, TlsVersion::Tls13, None).map(drop)
+    });
+    Ok(check.await.map_err(|_| TlsError::Join)??)
 }
 
 /// Конфигурация rustls сервера из цепочки и ключа. Провайдер криптографии — установленный в процессе,
@@ -674,20 +661,37 @@ fn build(
     Ok(builder.with_single_cert(chain, key)?)
 }
 
-/// Читает и проверяет файлы секции; `secret` — значение секрета ключа (`key`). Блокирующий I/O.
-fn read_config(cfg: &TlsConfig, secret: Option<&Secret>) -> Result<(Loaded, Stamp), TlsError> {
+/// Читает цепочку секции и проверяет её с ключом `secret` (значение секрета `key`). Блокирующий I/O.
+fn read_config(cfg: &TlsConfig, secret: &Secret) -> Result<(Loaded, FileStamp), TlsError> {
     // Отметка снимается до чтения: изменение во время чтения будет замечено следующим опросом.
     let stamp = stamp(cfg);
-    let chain = read_chain(&cfg.cert_file)?;
-    let key = match (&cfg.key, secret) {
-        (Some(r), Some(pem)) => rustls_pemfile::private_key(&mut pem.expose().as_bytes())
-            .ok()
-            .flatten()
-            .ok_or_else(|| TlsError::NoKeyInSecret(r.clone()))?,
-        (Some(r), None) => return Err(TlsError::NoStore(r.clone())),
-        (None, _) => read_key(&cfg.key_file)?,
+    let (chain, key) = parse_secret_pem(secret);
+    let key = key.ok_or_else(|| TlsError::NoKeyInSecret(cfg.key.clone()))?;
+    let chain = if chain.is_empty() {
+        read_chain(&cfg.cert_file)?
+    } else {
+        chain
     };
     Ok((Loaded::new(chain, key, cfg.min_version)?, stamp))
+}
+
+/// Сертификаты (в порядке PEM) и первый закрытый ключ из PEM секрета; не PEM — ни того, ни другого.
+fn parse_secret_pem(
+    pem: &Secret,
+) -> (Vec<CertificateDer<'static>>, Option<PrivateKeyDer<'static>>) {
+    let mut chain = Vec::new();
+    let mut key = None;
+    for item in rustls_pemfile::read_all(&mut pem.expose().as_bytes()) {
+        match item {
+            Ok(rustls_pemfile::Item::X509Certificate(c)) => chain.push(c),
+            Ok(rustls_pemfile::Item::Pkcs8Key(k)) if key.is_none() => key = Some(k.into()),
+            Ok(rustls_pemfile::Item::Pkcs1Key(k)) if key.is_none() => key = Some(k.into()),
+            Ok(rustls_pemfile::Item::Sec1Key(k)) if key.is_none() => key = Some(k.into()),
+            Ok(_) => {}
+            Err(_) => return (Vec::new(), None),
+        }
+    }
+    (chain, key)
 }
 
 /// Цепочка сертификатов из PEM-файла. Блокирующий I/O.
@@ -731,445 +735,10 @@ fn file_stamp(path: &Path) -> FileStamp {
     }
 }
 
-fn stamp(cfg: &TlsConfig) -> Stamp {
-    let one = file_stamp;
-    // Ключ из секрета: файл `key_file` не читается и на отметку не влияет.
-    let key = match cfg.key {
-        Some(_) => (None, 0),
-        None => one(&cfg.key_file),
-    };
-    [one(&cfg.cert_file), key]
+/// Отметка файла цепочки; версию ключа отличает значение секрета.
+fn stamp(cfg: &TlsConfig) -> FileStamp {
+    file_stamp(&cfg.cert_file)
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use rustls::pki_types::ServerName;
-    use rustls::{ClientConfig, RootCertStore};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio_rustls::TlsConnector;
-
-    use super::*;
-    use crate::fswatch::NoFsEvents;
-    use crate::fswatch::tests::MemFsEvents;
-
-    pub(crate) const CERT_A: &str = include_str!("testdata/cert-a.pem");
-    pub(crate) const KEY_A: &str = include_str!("testdata/key-a.pem");
-    pub(crate) const CERT_B: &str = include_str!("testdata/cert-b.pem");
-    pub(crate) const KEY_B: &str = include_str!("testdata/key-b.pem");
-    /// CA сертификатов клиента и выписанный им сертификат шлюза `gateway.example.test` (mTLS).
-    pub(crate) const CA_CLIENT: &str = include_str!("testdata/ca-client.pem");
-    pub(crate) const CERT_GW: &str = include_str!("testdata/cert-gw.pem");
-    pub(crate) const KEY_GW: &str = include_str!("testdata/key-gw.pem");
-    /// CA со списками отзыва (PLT-28): сертификаты клиентов `ok.example.test` и `revoked.example.test`, список
-    /// без отозванных (`CRL_EMPTY`) и с отозванным `revoked.example.test` (`CRL_REVOKED`, он же в DER).
-    pub(crate) const CA_CRL: &str = include_str!("testdata/ca-crl.pem");
-    pub(crate) const CERT_CRL_OK: &str = include_str!("testdata/cert-crl-ok.pem");
-    pub(crate) const KEY_CRL_OK: &str = include_str!("testdata/key-crl-ok.pem");
-    pub(crate) const CERT_CRL_REVOKED: &str = include_str!("testdata/cert-crl-revoked.pem");
-    pub(crate) const KEY_CRL_REVOKED: &str = include_str!("testdata/key-crl-revoked.pem");
-    pub(crate) const CRL_EMPTY: &str = include_str!("testdata/crl-empty.pem");
-    pub(crate) const CRL_REVOKED: &str = include_str!("testdata/crl-revoked.pem");
-    pub(crate) const CRL_REVOKED_DER: &[u8] = include_bytes!("testdata/crl-revoked.der");
-
-    /// Временный каталог теста; удаляется при drop.
-    pub(crate) struct TempDir(pub(crate) PathBuf);
-
-    impl TempDir {
-        pub(crate) fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "tp-platform-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    pub(crate) fn der(pem: &str) -> CertificateDer<'static> {
-        rustls_pemfile::certs(&mut pem.as_bytes())
-            .next()
-            .expect("cert")
-            .expect("pem")
-    }
-
-    /// Клиент, доверяющий самоподписанным `certs`, с версиями `versions`.
-    pub(crate) fn connector(
-        certs: &[&str],
-        versions: &[&'static rustls::SupportedProtocolVersion],
-    ) -> TlsConnector {
-        let mut roots = RootCertStore::empty();
-        for pem in certs {
-            roots.add(der(pem)).expect("root");
-        }
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let cfg = ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(versions)
-            .expect("versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        TlsConnector::from(Arc::new(cfg))
-    }
-
-    pub(crate) fn write_pair(dir: &Path, cert: &str, key: &str) -> TlsConfig {
-        let cfg = TlsConfig {
-            cert_file: dir.join("cert.pem"),
-            key_file: dir.join("key.pem"),
-            ..TlsConfig::default()
-        };
-        std::fs::write(&cfg.cert_file, cert).expect("write cert");
-        std::fs::write(&cfg.key_file, key).expect("write key");
-        cfg
-    }
-
-    /// Рукопожатие с сервером на `certs`: версия протокола и сертификат сервера.
-    async fn handshake(
-        certs: &TlsCerts,
-        client: TlsConnector,
-    ) -> std::io::Result<(rustls::ProtocolVersion, CertificateDer<'static>)> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let acceptor = certs.acceptor();
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.expect("accept");
-            let mut tls = acceptor.accept(tcp).await?;
-            let mut buf = [0u8; 4];
-            tls.read_exact(&mut buf).await?;
-            tls.write_all(b"pong").await?;
-            tls.shutdown().await
-        });
-        let tcp = TcpStream::connect(addr).await.expect("connect");
-        let name = ServerName::try_from("localhost").expect("name");
-        let mut tls = client.connect(name, tcp).await?;
-        tls.write_all(b"ping").await?;
-        let mut buf = [0u8; 4];
-        tls.read_exact(&mut buf).await?;
-        assert_eq!(&buf, b"pong");
-        let (_, conn) = tls.get_ref();
-        let version = conn.protocol_version().expect("version");
-        let cert = conn.peer_certificates().expect("peer certs")[0].clone();
-        let _ = server.await;
-        Ok((version, cert))
-    }
-
-    #[tokio::test]
-    async fn tls13_by_default_tls12_as_option() {
-        let dir = TempDir::new("tls-versions");
-        let cfg = write_pair(&dir.0, CERT_A, KEY_A);
-        let certs = TlsCerts::load(&cfg).await.expect("load");
-        let any = &[&rustls::version::TLS13, &rustls::version::TLS12];
-        let (version, cert) = handshake(&certs, connector(&[CERT_A], any))
-            .await
-            .expect("tls13");
-        assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
-        assert_eq!(cert, der(CERT_A));
-        let tls12_only = || connector(&[CERT_A], &[&rustls::version::TLS12]);
-        assert!(handshake(&certs, tls12_only()).await.is_err());
-
-        certs
-            .apply(&TlsConfig {
-                min_version: TlsVersion::Tls12,
-                ..cfg
-            })
-            .await
-            .expect("apply");
-        let (version, _) = handshake(&certs, tls12_only()).await.expect("tls12");
-        assert_eq!(version, rustls::ProtocolVersion::TLSv1_2);
-    }
-
-    #[tokio::test]
-    async fn files_are_reread_without_restart() {
-        let dir = TempDir::new("tls-reload");
-        let cfg = write_pair(&dir.0, CERT_A, KEY_A);
-        let certs = TlsCerts::load(&cfg).await.expect("load");
-        assert!(!certs.reload_if_changed().await.expect("same"));
-
-        // Повреждённый ключ: перечитывание отклонено, действуют прежние сертификаты.
-        std::fs::write(&cfg.key_file, "garbage").expect("write");
-        assert!(matches!(
-            certs.reload_if_changed().await,
-            Err(Error::Invalid(_))
-        ));
-        let both = || connector(&[CERT_A, CERT_B], &[&rustls::version::TLS13]);
-        assert_eq!(handshake(&certs, both()).await.expect("old").1, der(CERT_A));
-
-        write_pair(&dir.0, CERT_B, KEY_B);
-        assert!(certs.reload_if_changed().await.expect("changed"));
-        assert_eq!(handshake(&certs, both()).await.expect("new").1, der(CERT_B));
-    }
-
-    /// Подпись `msg` ключом `ck` проверяется открытым ключом его сертификата узла (ECDSA P-256 тестовых пар).
-    fn signed_by_chain(ck: &CertifiedKey, msg: &[u8]) -> bool {
-        use rustls::SignatureScheme;
-        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
-        let Some(signer) = ck.key.choose_scheme(&[scheme]) else {
-            return false;
-        };
-        let sig = signer.sign(msg).expect("sign");
-        // Открытый ключ P-256 — последние 65 байт SubjectPublicKeyInfo сертификата (несжатая точка).
-        let cert = rustls::server::ParsedCertificate::try_from(&ck.cert[0]).expect("parse cert");
-        let spki = cert.subject_public_key_info();
-        let point = &spki.as_ref()[spki.as_ref().len() - 65..];
-        let algs = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
-        let (_, verifiers) = algs
-            .mapping
-            .iter()
-            .find(|(s, _)| *s == scheme)
-            .expect("p-256 verifier");
-        verifiers[0].verify_signature(point, msg, &sig).is_ok()
-    }
-
-    #[tokio::test]
-    async fn certified_key_follows_reload() {
-        let dir = TempDir::new("tls-certified");
-        let cfg = write_pair(&dir.0, CERT_A, KEY_A);
-        let certs = TlsCerts::load(&cfg).await.expect("load");
-        let a = certs.certified_key();
-        assert_eq!(a.cert, vec![der(CERT_A)]);
-        a.keys_match().expect("key matches cert a");
-        assert!(signed_by_chain(&a, b"profile"));
-
-        // Ошибка перечитывания — прежняя пара.
-        std::fs::write(&cfg.key_file, "garbage").expect("write");
-        assert!(certs.reload_if_changed().await.is_err());
-        assert_eq!(certs.certified_key().cert, vec![der(CERT_A)]);
-
-        write_pair(&dir.0, CERT_B, KEY_B);
-        certs.reload().await.expect("reload");
-        let b = certs.certified_key();
-        assert_eq!(b.cert, vec![der(CERT_B)]);
-        b.keys_match().expect("key matches cert b");
-        assert!(signed_by_chain(&b, b"profile"));
-        // Старая пара не подходит к новой цепочке.
-        let mixed = CertifiedKey::new(b.cert.clone(), a.key.clone());
-        assert!(mixed.keys_match().is_err());
-        assert!(!signed_by_chain(&mixed, b"profile"));
-    }
-
-    /// Ждёт замены конфигурации rustls после `before`.
-    async fn replaced(certs: &TlsCerts, before: &Arc<ServerConfig>) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while Arc::ptr_eq(&certs.server_config(), before) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("certificates replaced in time");
-    }
-
-    #[tokio::test]
-    async fn file_event_reloads_without_waiting_for_poll() {
-        let dir = TempDir::new("tls-event");
-        let mut cfg = write_pair(&dir.0, CERT_A, KEY_A);
-        cfg.reload_interval = Duration::from_secs(3600);
-        let certs = Arc::new(TlsCerts::load(&cfg).await.expect("load"));
-        let events = Arc::new(MemFsEvents::default());
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(certs.clone().run_with(events.clone(), shutdown.clone()));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while events.watches() == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("watch installed");
-
-        let before = certs.server_config();
-        write_pair(&dir.0, CERT_B, KEY_B);
-        assert_eq!(events.fire(&dir.0), 1);
-        replaced(&certs, &before).await;
-        let both = connector(&[CERT_A, CERT_B], &[&rustls::version::TLS13]);
-        assert_eq!(handshake(&certs, both).await.expect("new").1, der(CERT_B));
-
-        shutdown.cancel();
-        task.await.expect("join");
-    }
-
-    #[tokio::test]
-    async fn poll_fallback_without_fs_events() {
-        let dir = TempDir::new("tls-poll");
-        let mut cfg = write_pair(&dir.0, CERT_A, KEY_A);
-        cfg.reload_interval = Duration::from_millis(20);
-        let certs = Arc::new(TlsCerts::load(&cfg).await.expect("load"));
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(
-            certs
-                .clone()
-                .run_with(Arc::new(NoFsEvents), shutdown.clone()),
-        );
-
-        let before = certs.server_config();
-        write_pair(&dir.0, CERT_B, KEY_B);
-        replaced(&certs, &before).await;
-
-        shutdown.cancel();
-        task.await.expect("join");
-    }
-
-    fn key_ref() -> SecretRef {
-        "thepost/tls#key".parse().expect("ref")
-    }
-
-    /// Секция с цепочкой в файле и ключом по ссылке на секрет; файла ключа нет.
-    fn secret_key_cfg(dir: &Path, cert: &str) -> TlsConfig {
-        let cfg = TlsConfig {
-            cert_file: dir.join("cert.pem"),
-            key_file: dir.join("absent-key.pem"),
-            key: Some(key_ref()),
-            ..TlsConfig::default()
-        };
-        std::fs::write(&cfg.cert_file, cert).expect("write cert");
-        cfg
-    }
-
-    /// Сертификат сервера, который слушатель с неявным TLS на `certs` отдаёт клиенту.
-    async fn listener_cert(certs: &Arc<TlsCerts>) -> CertificateDer<'static> {
-        use crate::listen::{EndpointConfig, Listener};
-        let mut endpoint = EndpointConfig::new("127.0.0.1:0".parse().expect("addr"));
-        endpoint.implicit_tls = true;
-        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let at = tcp.local_addr().expect("addr");
-        let l = Listener::from_tcp(tcp, &endpoint, Some(certs.clone())).expect("listener");
-        let server = tokio::spawn(async move {
-            let conn = l.accept().await.expect("accept").establish().await?;
-            assert!(conn.info.tls);
-            let mut stream = conn.stream;
-            stream.write_all(b"pong").await.expect("pong");
-            stream.shutdown().await.expect("shutdown");
-            tp_contracts::Result::Ok(())
-        });
-        let tcp = TcpStream::connect(at).await.expect("connect");
-        let name = ServerName::try_from("localhost").expect("name");
-        let mut tls = connector(&[CERT_A, CERT_B], &[&rustls::version::TLS13])
-            .connect(name, tcp)
-            .await
-            .expect("handshake");
-        let mut buf = [0u8; 4];
-        tls.read_exact(&mut buf).await.expect("pong");
-        let cert = tls.get_ref().1.peer_certificates().expect("peer certs")[0].clone();
-        server.await.expect("join").expect("establish");
-        cert
-    }
-
-    #[tokio::test]
-    async fn listener_starts_with_key_from_secret_store_and_follows_new_version() {
-        let dir = TempDir::new("tls-secret-key");
-        let cfg = secret_key_cfg(&dir.0, CERT_A);
-        let store = Arc::new(tp_testkit::MemSecretStore::default());
-        store.set(&key_ref(), KEY_A);
-        // Без хранилища ключ по ссылке не загрузить; файл ключа не читается.
-        let err = TlsCerts::load(&cfg).await.expect_err("no store");
-        assert!(
-            matches!(&err, Error::Invalid(m) if m.contains("thepost/tls#key")),
-            "{err}"
-        );
-        let certs = Arc::new(
-            TlsCerts::load_with_secrets(&cfg, store.clone())
-                .await
-                .expect("load"),
-        );
-        assert_eq!(listener_cert(&certs).await, der(CERT_A));
-        assert!(!certs.reload_if_changed().await.expect("same version"));
-
-        // Новая версия секрета раньше новой цепочки: ключ не подходит — действует прежняя пара.
-        store.set(&key_ref(), KEY_B);
-        assert!(matches!(
-            certs.reload_if_changed().await,
-            Err(Error::Invalid(_))
-        ));
-        assert_eq!(listener_cert(&certs).await, der(CERT_A));
-        std::fs::write(&cfg.cert_file, CERT_B).expect("write cert");
-        assert!(certs.reload_if_changed().await.expect("new version"));
-        assert_eq!(listener_cert(&certs).await, der(CERT_B));
-        certs.certified_key().keys_match().expect("pair b");
-
-        // Не PEM в секрете и недоступное хранилище — прежняя пара остаётся.
-        store.set(&key_ref(), "garbage");
-        let err = certs.reload_if_changed().await.expect_err("garbage");
-        assert!(
-            matches!(&err, Error::Invalid(m) if !m.contains("garbage")),
-            "{err}"
-        );
-        store.set(&key_ref(), KEY_B);
-        store.seal();
-        assert!(certs.reload().await.expect_err("sealed").is_retryable());
-        store.unseal();
-        assert_eq!(listener_cert(&certs).await, der(CERT_B));
-    }
-
-    #[tokio::test]
-    async fn secret_version_is_polled_even_with_fs_events() {
-        let dir = TempDir::new("tls-secret-poll");
-        let mut cfg = secret_key_cfg(&dir.0, CERT_A);
-        cfg.reload_interval = Duration::from_secs(3600);
-        cfg.key_poll_interval = Duration::from_millis(20);
-        let store = Arc::new(tp_testkit::MemSecretStore::default());
-        store.set(&key_ref(), KEY_A);
-        let certs = Arc::new(
-            TlsCerts::load_with_secrets(&cfg, store.clone())
-                .await
-                .expect("load"),
-        );
-        let events = Arc::new(MemFsEvents::default());
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(certs.clone().run_with(events.clone(), shutdown.clone()));
-
-        // Событий ОС о файлах нет: новую пару замечает только опрос секрета.
-        let before = certs.server_config();
-        std::fs::write(&cfg.cert_file, CERT_B).expect("write cert");
-        store.set(&key_ref(), KEY_B);
-        replaced(&certs, &before).await;
-        assert_eq!(certs.certified_key().cert, vec![der(CERT_B)]);
-
-        shutdown.cancel();
-        task.await.expect("join");
-    }
-
-    #[tokio::test]
-    async fn missing_or_mismatched_files_are_invalid() {
-        let dir = TempDir::new("tls-invalid");
-        let mut cfg = write_pair(&dir.0, CERT_A, KEY_B);
-        assert!(matches!(TlsCerts::load(&cfg).await, Err(Error::Invalid(_))));
-        cfg.cert_file = dir.0.join("absent.pem");
-        let err = TlsCerts::load(&cfg).await.expect_err("absent");
-        assert!(err.to_string().contains("absent.pem"), "{err}");
-        let empty = dir.0.join("empty.pem");
-        std::fs::write(&empty, "").expect("write");
-        cfg.cert_file = empty;
-        assert!(matches!(TlsCerts::load(&cfg).await, Err(Error::Invalid(_))));
-    }
-
-    #[test]
-    fn config_from_yaml() {
-        let cfg: TlsConfig =
-            serde_yaml_ng::from_str("min_version: \"1.2\"\ncert_file: /x/c.pem\n").expect("parse");
-        assert_eq!(cfg.min_version, TlsVersion::Tls12);
-        assert_eq!(cfg.cert_file, PathBuf::from("/x/c.pem"));
-        assert_eq!(cfg.key_file, TlsConfig::default().key_file);
-        assert!(serde_yaml_ng::from_str::<TlsConfig>("min_version: \"1.1\"").is_err());
-        assert_eq!(cfg.reload_interval, Duration::from_secs(60));
-        let off: TlsConfig = serde_yaml_ng::from_str("reload_interval: 0s").expect("0s");
-        assert!(off.reload_interval.is_zero());
-        assert!(serde_yaml_ng::from_str::<TlsConfig>("reload_interval: 60000").is_err());
-        assert!(serde_yaml_ng::from_str::<TlsConfig>("reload_interval_ms: 60000").is_err());
-        assert_eq!(cfg.key, None);
-        assert_eq!(cfg.key_poll_interval, Duration::from_secs(60));
-        let secret: TlsConfig = serde_yaml_ng::from_str(
-            "key: { secret: \"thepost/tls#key\" }\nkey_poll_interval: 5m\n",
-        )
-        .expect("secret key");
-        assert_eq!(secret.key, Some(key_ref()));
-        assert_eq!(secret.key_poll_interval, Duration::from_secs(300));
-        // Ключ открытым текстом в конфигурации — ошибка, значение в неё не попадает.
-        let err = serde_yaml_ng::from_str::<TlsConfig>("key: PRIVATE-KEY-TEXT").expect_err("plain");
-        assert!(!err.to_string().contains("PRIVATE-KEY-TEXT"), "{err}");
-    }
-}
+pub(crate) mod tests;

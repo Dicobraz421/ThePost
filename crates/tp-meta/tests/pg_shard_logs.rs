@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use sqlx::PgPool;
 use time::OffsetDateTime;
 use tp_contracts::blob::{Acquire, BlobIndex, Commit};
 use tp_contracts::bus::{Event, EventBus, EventKind};
@@ -18,6 +17,7 @@ use tp_contracts::{AccountId, BlobHash, BlobKey, Gen, ModSeq, ShardId, TenantId}
 use tp_meta::PgMeta;
 use tp_meta::events::{EventConsumer, EventsConfig};
 use tp_meta::failover::connect_failover;
+use tp_meta::pool::{DbPool, NoAcquireObserver};
 use tp_meta::signals::{PgSignalBus, ShardedSignalBus, SignalsConfig, connect_listener};
 
 fn hash() -> BlobHash {
@@ -196,7 +196,7 @@ async fn queue_jobs_of_both_shards_are_claimed() {
         assert!(done);
     }
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM queue")
-        .fetch_one(&t.shard_pool)
+        .fetch_one(&mut *common::conn(&t.shard_pool).await)
         .await
         .expect("count");
     assert_eq!(rows, 0);
@@ -235,7 +235,7 @@ async fn queue_enqueue_goes_to_owner_shard() {
         .enqueue(None, out(tenant, "n@x.test"))
         .await
         .expect("enqueue none");
-    let ids = |pool: PgPool| async move {
+    let ids = |pool: DbPool| async move {
         let mut tx = tp_meta::schema::begin(&pool, tenant).await.expect("begin");
         let mut ids: Vec<uuid::Uuid> =
             sqlx::query_scalar("SELECT queue_id FROM queue WHERE tenant_id = $1")
@@ -253,7 +253,7 @@ async fn queue_enqueue_goes_to_owner_shard() {
     t.drop_db().await;
 }
 
-async fn state(pool: &PgPool, key: &BlobKey) -> Option<(String, i64)> {
+async fn state(pool: &DbPool, key: &BlobKey) -> Option<(String, i64)> {
     let mut tx = tp_meta::schema::begin(pool, key.tenant)
         .await
         .expect("begin");
@@ -367,10 +367,10 @@ async fn signals_from_every_shard() {
     let cfg = common::dev_pool_config(&t.main_url());
     let secrets = common::secrets();
     let main = PgSignalBus::start(
-        connect_failover(&cfg, secrets.clone())
+        connect_failover(&cfg, secrets.clone(), Arc::new(NoAcquireObserver))
             .await
             .expect("publish"),
-        connect_listener(&cfg, secrets.clone())
+        connect_listener(&cfg, secrets.clone(), Arc::new(NoAcquireObserver))
             .await
             .expect("listen"),
         SignalsConfig::default(),
@@ -405,7 +405,7 @@ async fn signals_from_every_shard() {
 
     // Слушатель — на primary шарда: сообщение NOTIFY в БД шарда доходит до подписки (сверка всем).
     sqlx::query("SELECT pg_notify('tp_signals', '{\"t\":0,\"r\":true}')")
-        .execute(&t.shard_pool)
+        .execute(&mut *common::conn(&t.shard_pool).await)
         .await
         .expect("notify");
     let resync = tokio::time::timeout(Duration::from_secs(10), sub.next())

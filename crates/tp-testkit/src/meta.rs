@@ -16,10 +16,10 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tp_contracts::events::{CoreEvent, CoreEventKind};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountState, AccountStore, AccountUpsert, ChangeLog, Changes,
-    DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Mailbox,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, ChangeLog,
+    Changes, DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate, Inserted, Mailbox,
     MailboxStatus, MailboxStore, Message, MessageChange, MessageQuery, MessageStore, NewMailbox,
-    NewMessage, QuotaUsage, SpecialUse,
+    NewMessage, QuotaUsage, SpecialUse, account_aliases,
 };
 use tp_contracts::retention::{PurgeOutcome, Restored};
 use tp_contracts::{
@@ -632,6 +632,8 @@ impl MemMetadata {
                     display_name: login.to_owned(),
                     external_id: None,
                     enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
                 },
             )
             .await?;
@@ -808,6 +810,15 @@ impl MemMetadata {
                 modseq: ms,
             })
         })
+    }
+
+    /// Скрытое письмо корзины `id` учётной записи `scope` (`TrashStore::hidden_message`); нет — `None`.
+    pub(crate) fn hidden_message(&self, scope: AccountScope, id: MessageId) -> Option<Message> {
+        let st = lock(&self.state);
+        st.accounts
+            .get(&(scope.tenant, scope.account))
+            .and_then(|acc| acc.hidden.get(&id))
+            .map(|row| row.message.clone())
     }
 
     /// Восстанавливает скрытое письмо в исходную папку (её нет — во «Входящие») с тем же `MessageId`
@@ -1029,6 +1040,8 @@ impl AccountStore for MemMetadata {
                 .ok_or_else(|| Error::internal("учётная запись пропала"))?;
             let a = &mut acc.account;
             a.domain = data.domain;
+            a.aliases = account_aliases(&data.login, data.aliases.iter().map(String::as_str));
+            a.kind = data.kind;
             a.login = data.login;
             a.display_name = data.display_name;
             a.external_id = data.external_id.or(a.external_id.take());
@@ -1050,6 +1063,8 @@ impl AccountStore for MemMetadata {
             id: AccountId::new(),
             tenant,
             domain: data.domain,
+            aliases: account_aliases(&data.login, data.aliases.iter().map(String::as_str)),
+            kind: data.kind,
             login: data.login,
             display_name: data.display_name,
             external_id: data.external_id,
@@ -1926,6 +1941,19 @@ mod tests {
         crate::suite::account_list(&MemMetadata::default(), &fx).await;
     }
 
+    /// CTR-63: общий набор `AccountStore::by_ids` (реализация по умолчанию).
+    #[tokio::test]
+    async fn account_by_ids_suite() {
+        let fx = crate::suite::AccountListFixture {
+            tenant: TenantId::DEFAULT,
+            domain: DomainId::new(),
+            domain_name: "example.org".into(),
+            foreign_tenant: TenantId::new(),
+            foreign_domain: DomainId::new(),
+        };
+        crate::suite::account_by_ids(&MemMetadata::default(), &fx).await;
+    }
+
     /// CTR-35: общий набор состояния ящика.
     #[tokio::test]
     async fn account_state_suite() {
@@ -2571,6 +2599,8 @@ mod tests {
             display_name: "N".into(),
             external_id: ext.map(Into::into),
             enabled: true,
+            aliases: Vec::new(),
+            kind: AccountKind::User,
         };
         let t = TenantId::DEFAULT;
         let x = meta

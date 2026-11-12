@@ -16,8 +16,6 @@ manual: no
 ## Сделать
 - Секция `tls`: `key_file` удалить, только `key: { secret }`; ACME — ключ в хранилище (PLT-29); проверки `doctor` и
   пути Landlock — без файла ключа. Вход узла в OpenBao (`secrets.auth.cert.key_file`) — остаётся файлом.
-- `TlsCerts`: один `load(cfg, store)`; `load_with_secrets` удалить, потребителей (`serve.rs`, `doctor.rs`, `doctor_dns.rs`
-  и др.) править в этом же PR (хвост реестра, п. 70, PR #547).
 
 ## Приёмка
 - Тесты: `key_file` в YAML — ошибка разбора; слушатель стартует с ключом из хранилища в памяти.

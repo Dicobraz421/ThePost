@@ -111,6 +111,8 @@ tokio-rustls = "0.26.6"
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
 tokio-util = "0.7.20"
 tower = "0.5.3"
+# CORS в Admin API готовым слоем (решение 68; tp-admin). Ветка 0.6 — та же, что у reqwest: одна версия в дереве.
+tower-http = { version = "0.6.11", default-features = false, features = ["cors"] }
 tracing = "0.1.44"
 tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
@@ -124,6 +126,12 @@ zstd = { version = "0.14.3", default-features = false }
 
 [profile.dev]
 debug = "line-tables-only"
+
+# mail-parser в тестах — как в выпуске: его debug_assert!(false) на битом MIME роняет тест, а выпуск разбирает
+# такое письмо частично (FIX-06, FIX-07; фаззинг — так же, crates/*/fuzz/Cargo.toml).
+[profile.dev.package.mail-parser]
+debug-assertions = false
+overflow-checks = false
 
 [profile.release]
 lto = "thin"

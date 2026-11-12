@@ -10,6 +10,9 @@ manual: no
 
 Этап 4, «рюшечки» Ф2: без этого календари и контакты владельца работают.
 
+Решение владельца 2026-11-12 (PR #505): вид учётной записи — поле `Account::kind` (`AccountKind`, задаёт `AccountUpsert::kind`), а не
+метод `ResourceStore::account_kind`; `tp-meta` (миграция 0026), `tp-testkit` и места сборки `Account` — в том же PR.
+
 ## Сделать
 - `CollectionAcl`: записи прав на коллекцию (`read`, `write`, `free-busy`, `schedule`, `admin`) по субъектам, как у `AclStore`
   (имя входа, группа, `anyone`); `shared_with(scope) -> Vec<(owner, CollectionId, Rights)>` — для дома коллекций получателя.

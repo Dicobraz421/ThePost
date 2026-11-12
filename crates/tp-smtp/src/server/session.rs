@@ -23,6 +23,7 @@ use smtp_proto::{
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tp_contracts::auth::Principal;
+use tp_contracts::meta::Policy;
 use tp_contracts::transport::TrustedSource;
 use tp_platform::ConnInfo;
 
@@ -84,6 +85,9 @@ pub struct Session {
     pub(super) helo: Option<String>,
     pub(super) esmtp: bool,
     pub(super) principal: Option<Principal>,
+    /// Политика организации субъекта после AUTH ([`super::Handler::policy`]): лимиты получателей и отправки;
+    /// до AUTH — умолчания полей.
+    pub(super) policy: Policy,
     pub(super) tx: Option<Tx>,
     pub(super) errors: u32,
     pub(super) auth_failures: u32,
@@ -125,6 +129,7 @@ impl Session {
             helo: None,
             esmtp: false,
             principal: None,
+            policy: Policy::default(),
             tx: None,
             errors: 0,
             auth_failures: 0,
@@ -199,6 +204,7 @@ impl Session {
         self.helo = None;
         self.esmtp = false;
         self.principal = None;
+        self.policy = Policy::default();
         self.tx = None;
         self.exit = None;
     }
@@ -497,16 +503,16 @@ impl Session {
             return;
         }
         if let Some((l, account)) = self.send_account()
-            && !l.allow_message_at(&self.ctx.config.limits, account, Instant::now())
+            && !l.allow_message_at(
+                self.policy.send_per_hour_or_default(),
+                &account,
+                Instant::now(),
+            )
         {
             self.limited("messages");
             push(
                 out,
-                &reply(
-                    451,
-                    [4, 7, 1],
-                    "Hourly message limit exceeded, try again later",
-                ),
+                &reply(451, [4, 7, 1], crate::limits::MESSAGES_EXCEEDED),
             );
             return;
         }
@@ -534,26 +540,10 @@ impl Session {
         if tx.rcpts.iter().any(|r| r.eq_ignore_ascii_case(&address)) {
             return push(out, &reply(250, [2, 1, 5], "OK"));
         }
-        if tx.rcpts.len() >= self.ctx.config.limits.max_recipients {
+        // Submission после AUTH — политика учётной записи; иначе — умолчание `Policy` (100 получателей транзакции —
+        // минимум RFC 5321, 4.5.3.1.8).
+        if tx.rcpts.len() >= self.policy.max_recipients_or_default() as usize {
             return push(out, &reply(452, [4, 5, 3], "Too many recipients"));
-        }
-        if let Some((l, account)) = self.send_account()
-            && !l.allow_rcpts_at(
-                &self.ctx.config.limits,
-                account,
-                tx.rcpts.len() + 1,
-                Instant::now(),
-            )
-        {
-            self.limited("recipients");
-            return push(
-                out,
-                &reply(
-                    452,
-                    [4, 5, 3],
-                    "Hourly recipient limit exceeded, try again later",
-                ),
-            );
         }
         let env = self.envelope(tx);
         let r = self.ctx.handler.rcpt(&env, &address).await;
@@ -676,6 +666,21 @@ impl Session {
         };
         let env = self.envelope(&tx);
         self.xforward = None;
+        // Адресатов в час (SMTP-43): письмо, с которым сумма получателей за час превысила бы предел, не принимается.
+        if let Some((l, account)) = self.send_account()
+            && !l.allow_rcpts_at(
+                self.policy.rcpts_per_hour_or_default(),
+                &account,
+                env.rcpts.len(),
+                Instant::now(),
+            )
+        {
+            self.limited("recipients");
+            let r = reply(451, [4, 7, 1], crate::limits::RCPTS_EXCEEDED);
+            self.ctx.handler.limited(&env, &r).await;
+            tracing::info!(id = %env.id, rcpts = env.rcpts.len(), "smtp: превышен лимит адресатов в час");
+            return r;
+        }
         let r = self.ctx.handler.data(&env, Bytes::from(tx.body)).await;
         let accepted = is_positive(&r);
         if let Some(m) = &self.ctx.metrics {
@@ -683,8 +688,8 @@ impl Session {
         }
         if accepted && let Some((l, account)) = self.send_account() {
             l.record_at(
-                &self.ctx.config.limits,
-                account,
+                self.ctx.config.limits.max_tracked_accounts,
+                &account,
                 env.rcpts.len(),
                 Instant::now(),
             );
@@ -700,11 +705,11 @@ impl Session {
         r
     }
 
-    /// Лимиты отправки и учётная запись (submission после AUTH).
-    fn send_account(&self) -> Option<(&SendLimits, &str)> {
+    /// Лимиты отправки и ключ учётной записи в них (submission после AUTH; общий с JMAP — идентификатор).
+    fn send_account(&self) -> Option<(&SendLimits, String)> {
         let limits = self.ctx.send_limits.as_deref()?;
         let p = self.principal.as_ref()?;
-        Some((limits, p.login.as_str()))
+        Some((limits, p.account.to_string()))
     }
 
     fn limited(&self, kind: &'static str) {

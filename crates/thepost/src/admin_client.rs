@@ -1464,18 +1464,16 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use serde_json::{Value, json};
     use tp_admin::{AdminConfig, AdminRole, Deps, InitRequest, RoleBinding};
     use tp_contracts::auth::Principal;
     use tp_contracts::ext::DecisionHooks;
-    use tp_contracts::meta::Policy;
-    use tp_contracts::{DomainId, Result};
     use tp_testkit::{
-        Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
-        MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemModeration, MemPolicies,
-        MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
+        Clock, FakeAuthenticator, MemAppPasswords, MemAuditLog, MemBlobIndex, MemBlobStore,
+        MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemModeration,
+        MemPolicies, MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
     };
+    use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
     use super::*;
 
@@ -1769,43 +1767,6 @@ mod tests {
         assert_eq!(next_link(&HeaderMap::new()), None);
     }
 
-    /// Политики уровней: в тестах не задаются.
-    struct NoPolicies;
-
-    #[async_trait]
-    impl tp_admin::PolicyStore for NoPolicies {
-        async fn policy(&self, _: TenantId, _: tp_admin::PolicyTarget) -> Result<Policy> {
-            Ok(Policy::default())
-        }
-
-        async fn set_policy(
-            &self,
-            _: TenantId,
-            _: tp_admin::PolicyTarget,
-            _: &Policy,
-        ) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Домены организации (не транспорт): в тестах не используются.
-    struct NoDomains;
-
-    #[async_trait]
-    impl tp_admin::DomainStore for NoDomains {
-        async fn list(&self, _: TenantId) -> Result<Vec<tp_admin::Domain>> {
-            Ok(Vec::new())
-        }
-
-        async fn create(&self, _: TenantId, _: &str) -> Result<tp_admin::Domain> {
-            Err(tp_contracts::Error::UNAVAILABLE)
-        }
-
-        async fn delete(&self, _: TenantId, _: DomainId) -> Result<()> {
-            Err(tp_contracts::Error::UNAVAILABLE)
-        }
-    }
-
     /// Admin API tp-admin на хранилищах testkit на loopback: локальный вход подключён, `oidc` — токен OIDC
     /// администратора инсталляции; страница списков — 2 записи (переход по `Link` в каждом списке длиннее).
     async fn admin_api() -> (Arc<tp_admin::Admin>, Url) {
@@ -1843,20 +1804,25 @@ mod tests {
         );
         let deps = Deps {
             auth: Arc::new(auth),
-            audit: Arc::new(tp_admin::LogAudit),
-            audit_log: None,
+            audit_log: Arc::new(MemAuditLog::new()),
             delivery: Arc::new(MemDeliveryLog::new()),
             groups: Arc::new(MemGroups::new()),
             moderation: Arc::new(MemModeration::default()),
             modules: Vec::new(),
             accounts: Arc::new(meta.clone()),
             quota: Arc::new(quota),
-            policies: Arc::new(NoPolicies),
+            policies: Arc::new(policies.clone()),
             resolver: Arc::new(policies),
-            domains: Arc::new(NoDomains),
             trash: Arc::new(trash),
             store: Arc::new(store),
             app_passwords,
+            contacts: Arc::new(MemAddressBook::new()),
+            org: Arc::new(MemAddressBook::new()),
+            dynamic: Arc::new(MemAddressBook::new()),
+            senders: Arc::new(MemSenderLists::new()),
+            mailbox_audit: Arc::new(MemMailboxAudit::new()),
+            sync: Arc::new(MemSyncGate::new()),
+            oidc_issuer: None,
         };
         let cfg = AdminConfig {
             roles: vec![RoleBinding {

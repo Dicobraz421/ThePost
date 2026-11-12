@@ -31,10 +31,15 @@ pub(crate) fn testdata(name: &str) -> PathBuf {
 pub(crate) async fn certs() -> Arc<TlsCerts> {
     let cfg = TlsConfig {
         cert_file: testdata("cert.pem"),
-        key_file: testdata("key.pem"),
         ..TlsConfig::default()
     };
-    Arc::new(TlsCerts::load(&cfg).await.expect("certs"))
+    // Ключ — только секрет `tls.key` в хранилище секретов (PLT-31).
+    let store = Arc::new(tp_testkit::MemSecretStore::default());
+    store.set(
+        &cfg.key,
+        std::fs::read_to_string(testdata("key.pem")).expect("key"),
+    );
+    Arc::new(TlsCerts::load(&cfg, store).await.expect("certs"))
 }
 
 pub(crate) fn connector() -> TlsConnector {
@@ -85,10 +90,20 @@ impl Server {
         edit: impl FnOnce(&mut SmtpConfig),
         edit_deps: impl FnOnce(&mut ServerDeps),
     ) -> Self {
+        Self::with_endpoint(mode, |ep| ep.implicit_tls = implicit_tls, edit, edit_deps).await
+    }
+
+    /// Сервер со слушателем, настроенным `edit_ep` (неявный TLS, PROXY protocol).
+    pub(super) async fn with_endpoint(
+        mode: Mode,
+        edit_ep: impl FnOnce(&mut EndpointConfig),
+        edit: impl FnOnce(&mut SmtpConfig),
+        edit_deps: impl FnOnce(&mut ServerDeps),
+    ) -> Self {
         let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = tcp.local_addr().expect("addr");
         let mut ep = EndpointConfig::new(addr);
-        ep.implicit_tls = implicit_tls;
+        edit_ep(&mut ep);
         let tls = certs().await;
         let listener = Listener::from_tcp(tcp, &ep, Some(tls.clone())).expect("listener");
         let auth = FakeAuthenticator::default();
@@ -282,8 +297,9 @@ async fn sending_rate_limit() {
     srv.stop().await;
 }
 
+/// Лимит писем в час — политика субъекта AUTH (`Policy::send_per_hour`): второе письмо за час — `451`.
 #[tokio::test]
-async fn hourly_send_limits_and_metrics() {
+async fn hourly_send_limit_and_metrics() {
     let registry = tp_platform::Metrics::default();
     let metrics = Arc::new(crate::SmtpMetrics::new());
     metrics.register(&registry);
@@ -291,37 +307,23 @@ async fn hourly_send_limits_and_metrics() {
     let srv = Server::with_deps(
         Mode::Submission,
         true,
-        |c| {
-            c.limits.messages_per_hour = 1;
-            c.limits.recipients_per_hour = 2;
-        },
+        |_| {},
         |d| {
             d.send_limits = Some(Arc::new(crate::SendLimits::new()));
             d.metrics = Some(m);
         },
     )
     .await;
+    srv.rec.policy.lock().expect("lock").send_per_hour = Some(1);
     let mut c = Client::new(handshake(srv.connect().await).await);
     assert_eq!(c.code().await, 220);
     ehlo(&mut c).await;
     assert_eq!(c.cmd(&plain("secret")).await, 235);
-    // Третий получатель за час — отказ 452, письмо двоим принимается.
     assert_eq!(c.cmd("MAIL FROM:<alice@example.org>").await, 250);
     assert_eq!(c.cmd("RCPT TO:<bob@example.org>").await, 250);
-    assert_eq!(c.cmd("RCPT TO:<carol@example.org>").await, 250);
-    c.send("RCPT TO:<dave@example.org>\r\n").await;
-    let (code, text) = c.reply().await;
-    assert_eq!(
-        (code, text[0].as_str()),
-        (
-            452,
-            "4.5.3 Hourly recipient limit exceeded, try again later"
-        )
-    );
     assert_eq!(c.cmd("DATA").await, 354);
     c.send("Subject: hi\r\n\r\nhello\r\n.\r\n").await;
     assert_eq!(c.code().await, 250);
-    assert_eq!(srv.rec.mails()[0].0.rcpts.len(), 2);
     // Второе письмо за час — отказ 451.
     c.send("MAIL FROM:<alice@example.org>\r\n").await;
     let (code, text) = c.reply().await;
@@ -334,7 +336,6 @@ async fn hourly_send_limits_and_metrics() {
         "tp_smtp_sessions_total{role=\"submission\"} 1",
         "tp_smtp_sessions_active{role=\"submission\"} 1",
         "tp_smtp_messages_total{role=\"submission\",result=\"accepted\"} 1",
-        "tp_smtp_send_limited_total{kind=\"recipients\"} 1",
         "tp_smtp_send_limited_total{kind=\"messages\"} 1",
     ] {
         assert!(text.contains(line), "{line} in {text}");

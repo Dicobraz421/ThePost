@@ -9,8 +9,8 @@
   или 24.04, Astra Linux SE 1.8, РЕД ОС 8, AlmaLinux 10 или 9 (совместимость с RHEL 9 и 10), от 4 vCPU и 8 ГБ памяти
   (целевой размер для 1 000 пользователей), диск — под письма.
 - **Имя сервера** (например, `mail.example.ru`) и **почтовый домен** (`example.ru`), доступ к их DNS.
-- **Открытые порты**: 25 (приём почты), 465 и 587 (отправка), 993 и 143 (IMAP), 443 (JMAP, автонастройка),
-  80 (только для выпуска сертификата Let's Encrypt).
+- **Открытые порты**: 25 (приём почты), 465 и 587 (отправка), 993 и 143 (IMAP), 4190 (ManageSieve — правила
+  фильтрации), 443 (JMAP, автонастройка), 80 (только для выпуска сертификата Let's Encrypt).
 - Все требования к окружению и тонкости настройки (кодировка базы UTF-8 и др.) — [PREREQUISITES.md](PREREQUISITES.md).
 
 Все внутренние компоненты ставятся вместе с сервером: PostgreSQL (метаданные), OpenBao (секреты), Rspamd (антиспам).
@@ -25,8 +25,16 @@ git clone https://github.com/Dicobraz421/ThePost && cd ThePost
 docker compose -f deploy/compose/dev.yml --profile smb up -d --build
 ```
 
-Первая сборка образа идёт 20–30 минут (Rust собирается внутри Docker, на машине его ставить не нужно). Когда все
-контейнеры запущены, проверьте окружение:
+Первая сборка образа идёт 20–30 минут (Rust собирается внутри Docker, на машине его ставить не нужно). Без сборки —
+готовый образ выпуска из ghcr.io. Образ закрытый: сначала войдите в реестр токеном GitHub с правом `read:packages`
+(выдаёт владелец репозитория), `<версия>` — из выпуска (тег образа совпадает с `appVersion` чарта Helm):
+
+```bash
+docker login ghcr.io -u <логин GitHub>          # пароль — токен read:packages
+THEPOST_IMAGE=ghcr.io/dicobraz421/thepost:<версия> docker compose -f deploy/compose/dev.yml --profile smb up -d
+```
+
+Когда все контейнеры запущены, проверьте окружение:
 
 ```bash
 docker compose -f deploy/compose/dev.yml --profile smb run --rm --no-deps thepost doctor
@@ -66,10 +74,12 @@ PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamA
 
    | `thepost_tls_mode` | Сертификат |
    |---|---|
-   | `certbot` (по умолчанию) | Let's Encrypt; порт 80 открыт, DNS имени сервера указывает на ВМ |
-   | `acme` | Let's Encrypt встроенным клиентом The Post |
+   | `acme` (по умолчанию) | Let's Encrypt встроенным клиентом The Post; порт 80 открыт, DNS имени сервера указывает на ВМ; ключ — в OpenBao |
    | `files` | свои файлы PEM: `thepost_tls_cert_src`, `thepost_tls_key_src` |
    | `internal` | внутренний центр сертификации — только для стенда |
+
+   Закрытый ключ сертификата хранится только в OpenBao (секрет `thepost/tls`), на диске сервера его нет: плейбук
+   кладёт его туда сам, при `acme` — сам узел. Сменить свой сертификат (`files`) — заменить файлы и повторить прогон.
 
 3. Запустите:
 
@@ -88,7 +98,8 @@ PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamA
 
 Если PostgreSQL и OpenBao уже есть или нужна своя схема — установка бинарного файла, юнита systemd и `config.yaml`
 по шагам описана в [`deploy/README.md`](../deploy/README.md#установка-под-systemd-smb-enterprise-вм). Секреты (пароли
-СУБД, ключи) в `config.yaml` не пишутся — только ссылки на OpenBao.
+СУБД, ключи, в том числе ключ TLS — `tls.key: { secret: "thepost/tls#key" }`) в `config.yaml` не пишутся — только
+ссылки на OpenBao.
 
 ## Первый администратор
 
@@ -145,10 +156,12 @@ $DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@e
 | | | 143 | STARTTLS |
 | Исходящая почта (SMTP) | `mail.example.ru` | 465 | SSL/TLS |
 | | | 587 | STARTTLS |
+| Правила фильтрации (ManageSieve) | `mail.example.ru` | 4190 | STARTTLS |
 | JMAP | `https://mail.example.ru/.well-known/jmap` | 443 | HTTPS |
 
 Имя входа — адрес целиком (`ivanov@example.ru`), пароль — пароль приложения. Подходит любой клиент IMAP и SMTP
-(например, Thunderbird), по JMAP — [Postman](https://github.com/Dicobraz421/Postman). В тестовом варианте с `example.test` клиент попросит принять
+(например, Thunderbird), правила фильтрации — клиент ManageSieve (дополнение Thunderbird Sieve, `sieve-connect`),
+по JMAP — [Postman](https://github.com/Dicobraz421/Postman). В тестовом варианте с `example.test` клиент попросит принять
 сертификат: его выпустил тестовый центр (`deploy/compose/tls/ca.pem`).
 
 ## DNS домена
@@ -163,25 +176,40 @@ $DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@e
 | `TXT _dmarc` | `v=DMARC1; p=quarantine; rua=mailto:postmaster@example.ru` |
 | `TXT <селектор>._domainkey` (DKIM) | открытый ключ подписи, см. ниже |
 
-**Подпись DKIM.** Закрытый ключ хранится в OpenBao, в `config.yaml` — только ссылка на него:
+**Подпись DKIM.** Закрытый ключ хранится в OpenBao, в `config.yaml` — только ссылка на него. Каким селектором подписывать, задаёт политика организации или домена (Admin API, поле `dkim_selector`); без неё письмо подписывается всеми ключами домена:
 
 ```yaml
 smtp:
   dkim:
     domains:
       example.ru:
-        selector: s2026
         keys:
           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim#example.ru" } }
 ```
 
 `thepost doctor` проверяет MX, SPF, DKIM, DMARC, MTA-STS и PTR по публичному DNS и подсказывает, чего не хватает.
 
+## Kubernetes: Helm
+
+Чарт — `deploy/helm/thepost`, до него — OpenBao и секрет TLS (порядок — в
+[`deploy/README.md`](../deploy/README.md#kubernetes-helm)). Образ в ghcr.io закрытый: нужен секрет реестра с токеном
+GitHub (`read:packages`), без `imagePullSecrets` чарт не устанавливается и подсказывает, что сделать:
+
+```bash
+kubectl -n thepost create secret docker-registry ghcr --docker-server=ghcr.io   --docker-username=<логин GitHub> --docker-password=<токен read:packages>
+helm install thepost deploy/helm/thepost -n thepost --set 'imagePullSecrets[0].name=ghcr' -f <свои значения>
+```
+
+Тег образа по умолчанию — `appVersion` чарта: установка закреплена за выпуском. Другой тег — `--set image.tag=…`.
+
 ## Обновление
 
 - **Ansible** — скачайте новый выпуск и повторите `ansible-playbook … -e thepost_binary_src=…`: узел перезапустится,
   миграции базы применятся сами.
-- **Docker Compose** — `git pull` и `… --profile smb up -d --build`.
+- **Docker Compose** — `git pull` и `… --profile smb up -d --build` (с готовым образом — новая `<версия>` в
+  `THEPOST_IMAGE` и `… up -d`).
+- **Helm** — `git pull` и `helm upgrade thepost deploy/helm/thepost -n thepost --reuse-values`: тег образа — новый
+  `appVersion` чарта.
 
 Перед обновлением рабочего сервера сделайте внеочередную копию: `sudo systemctl start thepost-backup@full` (см. ниже).
 
@@ -280,8 +308,10 @@ SRS 3.5). Поэтому потерять можно только письма, 
 Копия OpenBao (секреты узла, в том числе ключи DKIM) снимается вместе с копией базы — снимок Raft в то же
 хранилище копий. Заранее храните **вне сервера**: `/root/openbao-init.json`, `/etc/openbao/unseal.key` и пароль restic.
 
-1. Установите новый сервер: `ansible-playbook … deploy/ansible/smb.yml -e thepost_backup=false`. Если в настройках
-   задан DKIM, прогон остановится на `Wait for thepost readiness` — это ожидаемо: ключ DKIM вернётся из снимка.
+1. Установите новый сервер без копирования и без ожидания готовности узла:
+   `ansible-playbook … deploy/ansible/smb.yml -e thepost_backup=false -e thepost_wait_ready=false`. Прогон завершится
+   успешно с предупреждением «thepost не готов»: узел ждёт секретов прежнего сервера (ключ DKIM и другие), они
+   вернутся из снимка OpenBao.
 2. Верните копии по тем же путям и выполните `chown -R postgres:postgres /var/lib/pgbackrest`.
 3. В новом OpenBao заведите только хранилище пароля копий:
    `bao secrets enable -path=thepost-backup -version=2 kv` и
@@ -290,7 +320,9 @@ SRS 3.5). Поэтому потерять можно только письма, 
    -e thepost_restore_openbao=true -e thepost_restore_openbao_init_src=<openbao-init.json>
    -e thepost_restore_openbao_static_key_src=<unseal.key>` (при распечатывании ключами Шамира —
    `thepost_restore_openbao_unseal_keys`). Снимок OpenBao ставится до восстановления базы.
-5. Обычный прогон `smb.yml` — узел стартует, DKIM подписывает тем же ключом, `thepost verify` — без потерь.
+5. Обычный прогон `smb.yml` — узел стартует, DKIM подписывает тем же ключом, `thepost verify` — без потерь; ключ TLS
+   из снимка прогон сводит с сертификатом сервера (`internal` — новый сертификат к ключу, `files` — свой
+   ключ новой версией секрета, `acme` — узел выпускает новый сам).
 
 ## Проверка подписи
 

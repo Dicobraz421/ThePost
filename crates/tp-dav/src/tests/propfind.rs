@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use axum::http::StatusCode;
-use tp_contracts::dav::{Collection, CollectionKind, Component};
+use tp_contracts::dav::{Collection, CollectionKind, Component, DavStore};
 
 use super::{CALS, Env};
 use crate::DavConfig;
@@ -475,4 +475,82 @@ async fn proppatch_is_atomic() {
         .send("PROPPATCH", &format!("{CALS}work/"), &[], "<x/>")
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+/// DAV-25: оповещения по умолчанию календаря — заданные по JMAP (поля коллекции, JSON `Id[Alert]`) видны в CalDAV
+/// компонентами VALARM, заданные `PROPPATCH` — в коллекции (JMAP); удаление и неразбираемое значение.
+#[tokio::test]
+async fn default_alarms() {
+    let env = Env::new();
+    let c = env.calendar("work").await;
+    let jmap = r#"{"a1":{"@type":"Alert","trigger":{"@type":"OffsetTrigger","offset":"-PT15M","relativeTo":"start"},"action":"display"}}"#;
+    env.store
+        .update_collection(
+            env.scope,
+            Collection {
+                alerts_with_time: Some(jmap.to_owned()),
+                ..c
+            },
+        )
+        .await
+        .expect("коллекция");
+    let path = format!("{CALS}work/");
+    let body = r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+        <d:prop><c:default-alarm-vevent-datetime/><c:default-alarm-vevent-date/></d:prop></d:propfind>"#;
+    let r = env.propfind(&path, "0", body).await;
+    assert_eq!(r.status, StatusCode::MULTI_STATUS);
+    let body_text = r.body.replace("&#13;", "");
+    let datetime = body_text
+        .split("<c:default-alarm-vevent-datetime>")
+        .nth(1)
+        .and_then(|s| s.split("</c:default-alarm-vevent-datetime>").next())
+        .unwrap_or_else(|| panic!("оповещения: {}", r.body));
+    for part in ["BEGIN:VALARM\n", "-PT15M", "ACTION:DISPLAY", "END:VALARM\n"] {
+        assert!(datetime.contains(part), "{part}: {datetime}");
+    }
+    assert!(
+        r.body.contains("<c:default-alarm-vevent-date/>"),
+        "не задано — пусто: {}",
+        r.body
+    );
+
+    // PROPPATCH (Календарь macOS присылает компоненты VALARM) — оповещение в коллекции, видно и при чтении.
+    const ALARM: &str = "BEGIN:VALARM\nACTION:AUDIO\nTRIGGER:-PT9H\nEND:VALARM";
+    let patch = format!(
+        r#"<d:propertyupdate xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:set><d:prop>
+        <c:default-alarm-vevent-date>{ALARM}</c:default-alarm-vevent-date></d:prop></d:set></d:propertyupdate>"#
+    );
+    let r = env.send("PROPPATCH", &path, &[], &patch).await;
+    assert!(r.body.contains("HTTP/1.1 200 OK"), "{}", r.body);
+    let stored = env
+        .collection(CollectionKind::Calendar, "work")
+        .await
+        .expect("календарь");
+    let json = stored.alerts_without_time.expect("оповещения без времени");
+    assert!(json.contains("-PT9H") && json.contains("Alert"), "{json}");
+    assert!(
+        stored.alerts_with_time.is_some(),
+        "другое свойство не изменилось"
+    );
+    let r = env.propfind(&path, "0", body).await;
+    assert!(
+        r.body.contains("TRIGGER") && r.body.contains("-PT9H"),
+        "{}",
+        r.body
+    );
+
+    // Неразбираемое значение — 409, ничего не записано; удаление — оповещений нет.
+    let bad = patch.replace(ALARM, "мусор");
+    let r = env.send("PROPPATCH", &path, &[], &bad).await;
+    assert!(r.body.contains("HTTP/1.1 409 Conflict"), "{}", r.body);
+    let remove = r#"<d:propertyupdate xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:remove><d:prop>
+        <c:default-alarm-vevent-datetime/></d:prop></d:remove></d:propertyupdate>"#;
+    let r = env.send("PROPPATCH", &path, &[], remove).await;
+    assert!(r.body.contains("HTTP/1.1 200 OK"), "{}", r.body);
+    let stored = env
+        .collection(CollectionKind::Calendar, "work")
+        .await
+        .expect("календарь");
+    assert_eq!(stored.alerts_with_time, None);
+    assert!(stored.alerts_without_time.is_some());
 }
