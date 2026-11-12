@@ -54,6 +54,7 @@ fn kind_str(k: DeliveryEventKind) -> &'static str {
         DeliveryEventKind::Deliver => "deliver",
         DeliveryEventKind::Relay => "relay",
         DeliveryEventKind::Dsn => "dsn",
+        DeliveryEventKind::Itip => "itip",
     }
 }
 
@@ -64,6 +65,7 @@ fn kind_of(s: &str) -> Result<DeliveryEventKind> {
         "deliver" => DeliveryEventKind::Deliver,
         "relay" => DeliveryEventKind::Relay,
         "dsn" => DeliveryEventKind::Dsn,
+        "itip" => DeliveryEventKind::Itip,
         other => {
             return Err(Error::internal(format!(
                 "событие журнала доставки: {other}"
@@ -483,6 +485,7 @@ mod tests {
             DeliveryEventKind::Deliver,
             DeliveryEventKind::Relay,
             DeliveryEventKind::Dsn,
+            DeliveryEventKind::Itip,
         ] {
             assert_eq!(kind_of(kind_str(k)), Ok(k));
             assert_eq!(serde_json::to_value(k).expect("ser"), kind_str(k));

@@ -53,7 +53,7 @@ pub struct DeliveryEntry {
     pub at: OffsetDateTime,
     /// Узел.
     pub node: String,
-    /// Событие: `receive`, `reject`, `deliver`, `relay`, `dsn`.
+    /// Событие: `receive`, `reject`, `deliver`, `relay`, `dsn`, `itip`.
     #[schema(value_type = String)]
     pub kind: DeliveryEventKind,
     /// Отправитель конверта; пустой — уведомление о недоставке.
