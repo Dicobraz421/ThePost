@@ -425,7 +425,9 @@ Hot reload: новая копия рассылается через `watch`; п�
 поле — `[A-Za-z0-9_.-]+`. Скаляр на месте ссылки — ошибка «secret in plaintext» без значения в тексте. `Secret` — значение,
 `***` в `Debug`/`Display`, обнуляется при удалении, доступ — `expose()`; `lease() -> Option<&SecretLease { id, ttl, renewable }>`,
 `lease_ttl()`. `SecretStore`: `get(&SecretRef) -> Result<Secret>` (`NotFound` — нет пути или поля, `Forbidden` — политика,
-`Unavailable` — недоступно или запечатано), `renew(&SecretLease) -> Result<SecretLease>` (неизвестная/истёкшая — `NotFound`, перечитать;
+`Unavailable` — недоступно или запечатано), `put(&SecretRef, &Secret) -> Result<()>` — новая версия поля, прочие поля
+пути сохраняются (`Forbidden` — политика, `Unavailable` — недоступно, `Invalid` — не настроено, путь не для записи или
+изменён параллельно; реализации по умолчанию нет), `renew(&SecretLease) -> Result<SecretLease>` (неизвестная/истёкшая — `NotFound`, перечитать;
 по умолчанию — `NotFound`). Встроенный клиент — `tp-platform` (PLT-12), замена — `Registry::set_secret_store`, in-memory — `tp-testkit`.
 Код — `secrets.rs`.
 

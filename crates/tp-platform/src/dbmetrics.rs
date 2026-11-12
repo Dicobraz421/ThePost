@@ -3,9 +3,10 @@
 //! Платформа не зависит от драйвера СУБД: владелец пула (`tp-meta`) передаёт снимок занятости замыканием
 //! (как [`Metrics::register_bus`]) и сообщает об ожидании соединения наблюдателю [`AcquireObserver`] (CTR-51),
 //! которым служит [`PoolMeter`] ([`DbMetrics::pool_observer`]) — так считаются ожидающие и время ожидания.
-//! Брошенное ожидание (отмена задачи) снимает «ожидает» без записи времени и отказа (PLT-27). Имена: `tp_db_pool_in_use`, `tp_db_pool_idle`, `tp_db_pool_max`,
-//! `tp_db_pool_waiting`, `tp_db_pool_wait_seconds` (гистограмма), `tp_db_pool_acquire_errors_total` — метка
-//! `pool`; `tp_db_listener_connected` (0/1), `tp_db_listener_subscribers`, `tp_db_listener_lag_seconds`,
+//! Брошенное ожидание (отмена задачи) снимает «ожидает» без записи времени и отказа (PLT-27) и считается в
+//! `tp_db_pool_acquire_cancelled_total` (PLT-30). Имена: `tp_db_pool_in_use`, `tp_db_pool_idle`, `tp_db_pool_max`,
+//! `tp_db_pool_waiting`, `tp_db_pool_wait_seconds` (гистограмма), `tp_db_pool_acquire_errors_total`,
+//! `tp_db_pool_acquire_cancelled_total` — метка `pool`; `tp_db_listener_connected` (0/1), `tp_db_listener_subscribers`, `tp_db_listener_lag_seconds`,
 //! `tp_db_listener_reconnects_total`, `tp_db_listener_received_total` — метка `listener`.
 
 use std::fmt;
@@ -78,6 +79,7 @@ pub struct DbMetrics {
     waiting: Family<Labels, Gauge>,
     wait: Family<Labels, Histogram, Buckets>,
     errors: Family<Labels, Counter>,
+    cancelled: Family<Labels, Counter>,
     sources: Arc<RwLock<Sources>>,
 }
 
@@ -99,6 +101,7 @@ impl DbMetrics {
             waiting: Family::default(),
             wait: Family::new_with_constructor(Buckets(buckets)),
             errors: Family::default(),
+            cancelled: Family::default(),
             sources: Arc::default(),
         };
         metrics.register(
@@ -115,6 +118,11 @@ impl DbMetrics {
             "tp_db_pool_acquire_errors",
             "Failed attempts to get a database connection (timeouts included)",
             this.errors.clone(),
+        );
+        metrics.register(
+            "tp_db_pool_acquire_cancelled",
+            "Abandoned waits for a database connection (the waiting task was cancelled)",
+            this.cancelled.clone(),
         );
         metrics.register_collector(Box::new(DbCollector(this.sources.clone())));
         this
@@ -136,6 +144,7 @@ impl DbMetrics {
             waiting: self.waiting.get_or_create(&labels).clone(),
             wait: self.wait.get_or_create(&labels).clone(),
             errors: self.errors.get_or_create(&labels).clone(),
+            cancelled: self.cancelled.get_or_create(&labels).clone(),
         }
     }
 
@@ -169,12 +178,14 @@ pub struct PoolMeter {
     waiting: Gauge,
     wait: Histogram,
     errors: Counter,
+    cancelled: Counter,
 }
 
 impl PoolMeter {
     /// Оборачивает получение соединения (`pool.acquire()`, `pool.begin()`): на время ожидания задача учтена в
     /// `tp_db_pool_waiting`, длительность — в `tp_db_pool_wait_seconds`, отказ — в `…_acquire_errors_total`.
-    /// Отмена ожидания (drop) счётчик ожидающих возвращает, время не записывается.
+    /// Отмена ожидания (drop) счётчик ожидающих возвращает, время не записывается, учитывается в
+    /// `…_acquire_cancelled_total`.
     pub async fn acquire<T, E>(&self, acquire: impl Future<Output = Result<T, E>>) -> Result<T, E> {
         let observer: &dyn AcquireObserver = self;
         observer.observe(acquire).await
@@ -199,7 +210,9 @@ impl AcquireObserver for PoolMeter {
                 self.wait.observe(waited.as_secs_f64());
                 self.errors.inc();
             }
-            AcquireEnd::Cancelled => {}
+            AcquireEnd::Cancelled => {
+                self.cancelled.inc();
+            }
         }
     }
 }
@@ -414,8 +427,8 @@ mod tests {
             ))
             .await;
         assert!(timed_out.is_err());
-        // Отмена ожидания: задача не остаётся в «ожидающих», время и отказ не записываются (PLT-27) —
-        // и через `PoolMeter::acquire`, и через трейт.
+        // Отмена ожидания: задача не остаётся в «ожидающих», время и отказ не записываются (PLT-27), отмена
+        // считается (PLT-30) — и через `PoolMeter::acquire`, и через трейт.
         let cancelled = tokio::time::timeout(
             Duration::from_millis(100),
             meter.acquire(slots.clone().acquire_owned()),
@@ -438,7 +451,15 @@ mod tests {
         assert!(sum >= 0.2, "{text}");
         assert_eq!(
             value(&text, "tp_db_pool_wait_seconds_count{pool=\"replica\"}"),
-            1.0
+            1.0,
+            "cancelled waits are not in the histogram"
+        );
+        assert_eq!(
+            value(
+                &text,
+                "tp_db_pool_acquire_cancelled_total{pool=\"replica\"}"
+            ),
+            2.0
         );
     }
 
