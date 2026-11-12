@@ -438,7 +438,7 @@ async fn create_account(
     Ok((StatusCode::CREATED, Json(account_info(&a, acc).await?)))
 }
 
-async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo> {
+pub(crate) async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo> {
     let scope = tp_contracts::meta::AccountScope {
         tenant: acc.tenant,
         account: acc.id,
