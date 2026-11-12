@@ -34,7 +34,7 @@ jobs:
       tag: ${{ steps.p.outputs.tag }}
       prev: ${{ steps.p.outputs.prev }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - id: p
@@ -72,11 +72,11 @@ jobs:
     env:
       PKG: thepost-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: beta-${{ matrix.target }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.90.3
         with:
           tool: cross
       - id: console
@@ -94,7 +94,7 @@ jobs:
           (cd dist && sha256sum "$PKG.tar.gz" > "$PKG.tar.gz.sha256")
       - name: Архив без интерпретаторов (CI-05)
         run: python3 .github/interp_check.py "dist/$PKG.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ env.PKG }}
           path: |
@@ -115,18 +115,18 @@ jobs:
     outputs:
       ref: ${{ steps.ref.outputs.ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - id: name
         shell: bash
         run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       # Сначала сборка в локальный docker и проверка (CI-05), публикация — повтор той же сборки из кэша buildx.
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -139,7 +139,7 @@ jobs:
           id=$(docker create thepost:check)
           docker export "$id" | python3 .github/interp_check.py -
       - id: push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -174,14 +174,14 @@ jobs:
     env:
       PKG: thepost-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: taiki-e/install-action@v2.90.3
         with:
           tool: cross
       - id: console
         uses: ./.github/actions/console
       - run: cross build --release --locked -p thepost --target ${{ matrix.target }} ${{ steps.console.outputs.cargo-args }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: ${{ env.PKG }}
           path: ${{ runner.temp }}/ref
@@ -212,8 +212,8 @@ jobs:
     env:
       TAG: ${{ needs.plan.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           # Только архивы беты: build-push-action кладёт в прогон ещё запись сборки (*.dockerbuild),
           # её загрузка падает и роняла выпуск (прогон 43046334824).
@@ -221,7 +221,7 @@ jobs:
           path: ${{ runner.temp }}/dist
           merge-multiple: true
       - name: SBOM (SPDX по Cargo.lock)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@v0.24.3
         with:
           path: .
           format: spdx-json
