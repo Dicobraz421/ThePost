@@ -162,6 +162,15 @@ jobs:
               echo "Прогон упал без входа в fuzz/artifacts — см. журнал."
             fi
             if [ -s "$RUNNER_TEMP/fuzz.log" ]; then
+              # Сообщение паники стоит выше трассы и в хвост не попадает (CI-09).
+              if grep -q -m1 'panicked at' "$RUNNER_TEMP/fuzz.log"; then
+                echo
+                echo "### Паника"
+                echo
+                echo '```'
+                grep -m1 -A3 'panicked at' "$RUNNER_TEMP/fuzz.log" | cut -c1-300
+                echo '```'
+              fi
               echo
               echo "### Журнал (хвост)"
               echo
