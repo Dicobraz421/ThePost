@@ -41,7 +41,7 @@ runs:
       env:
         TARGET: ${{ inputs.target }}
         ARGS: ${{ steps.console.outputs.cargo-args }}
-        RUSTFLAGS: -C target-cpu=x86-64-v3
+        RUSTFLAGS: ''
       run: cross build --release --locked -p thepost --target "$TARGET" $ARGS
     - name: Запуск на старом процессоре (qemu Nehalem, без AVX)
       if: inputs.target == 'x86_64-unknown-linux-gnu'
