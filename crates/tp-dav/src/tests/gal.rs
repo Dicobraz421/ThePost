@@ -1,5 +1,5 @@
-//! DAV-12: глобальная адресная книга «Организация» на in-memory каталоге: состав, скрытые из GAL, запрет записи,
-//! синхронизация по версии снимка каталога.
+//! DAV-12: глобальная адресная книга «Организация» на in-memory каталоге: состав, скрытые из GAL (группы и учётные
+//! записи — DAV-27), запрет записи, синхронизация по версии снимка каталога (изменения от прежнего снимка — DAV-28).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -332,4 +332,34 @@ async fn no_directory_no_gal() {
     // Имя зарезервировано и без каталога.
     let r = env.send("MKCOL", &gal(), &[], "").await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+/// DAV-27: учётная запись, скрытая из адресной книги (`hidden_from_gal`), не видна в `addressbook-query` и
+/// `sync-collection`; после снятия признака — появляется.
+#[tokio::test]
+async fn hidden_account() {
+    let env = env().await;
+    let t = env.scope.tenant;
+    let mut maria = account("u-maria", "Мария Иванова", &["maria@example.org"], true);
+    maria.hidden_from_gal = true;
+    env.dir.upsert_account(t, maria.clone());
+    let query = r#"<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+      <d:prop><d:getetag/></d:prop>
+      <card:filter><card:prop-filter name="FN"><card:text-match>Мария</card:text-match></card:prop-filter></card:filter>
+    </card:addressbook-query>"#;
+    let r = env.send("REPORT", &gal(), &[], query).await;
+    assert!(names(&r.body).is_empty(), "{}", r.body);
+    let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
+    assert_eq!(names(&r.body), ["g-sales.vcf", "u-ivan.vcf"]);
+    let r = env
+        .send("GET", &format!("{}u-maria.vcf", gal()), &[], "")
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+    maria.hidden_from_gal = false;
+    env.dir.upsert_account(t, maria);
+    let r = env.send("REPORT", &gal(), &[], query).await;
+    assert_eq!(names(&r.body), ["u-maria.vcf"], "{}", r.body);
+    let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
+    assert_eq!(names(&r.body), ["g-sales.vcf", "u-ivan.vcf", "u-maria.vcf"]);
 }

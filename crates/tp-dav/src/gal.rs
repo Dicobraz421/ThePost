@@ -2,9 +2,9 @@
 //! пользователя — `/dav/addressbooks/<логин>/gal/` (имя — `dav.gal_name`). Есть, если приложение передало каталог
 //! ([`crate::router_with_gal`]).
 //!
-//! Состав — снимок каталога (`Directory`): учётные записи с разрешённым входом и адресом и группы с адресом
-//! рассылки; группа, скрытая из GAL (`hidden_from_gal` в `GroupStore`, поиск по идентификатору каталога), не
-//! показывается. Карточки строятся на лету (calcard, vCard 3.0; по запросу — 4.0, [`crate::card`]): `UID` —
+//! Состав — снимок каталога (`Directory`): учётные записи с разрешённым входом и адресом, кроме скрытых из GAL
+//! (`DirAccount::hidden_from_gal`, CTR-58), и группы с адресом рассылки; группа, скрытая из GAL (`hidden_from_gal`
+//! в `GroupStore`, поиск по идентификатору каталога), не показывается. Карточки строятся на лету (calcard, vCard 3.0; по запросу — 4.0, [`crate::card`]): `UID` —
 //! идентификатор в каталоге, `FN`, `EMAIL` (первый — основной), телефоны из атрибутов `telephoneNumber` и `mobile`;
 //! группа — `KIND:group` (`X-ADDRESSBOOKSERVER-KIND` в 3.0). Оргструктура (подразделение, должность, руководитель) —
 //! DAV-22.
@@ -218,9 +218,9 @@ fn write(uid: &str, entries: Vec<VCardEntry>) -> Option<Card> {
     Some((uid.to_owned(), body))
 }
 
-/// Карточка учётной записи; вход запрещён или нет адреса — `None`.
+/// Карточка учётной записи; вход запрещён, запись скрыта из адресной книги или нет адреса — `None`.
 fn account_card(a: &DirAccount) -> Option<Card> {
-    if !a.enabled || a.emails.is_empty() {
+    if !a.enabled || a.hidden_from_gal || a.emails.is_empty() {
         return None;
     }
     let name = if a.display_name.trim().is_empty() {
