@@ -1,18 +1,23 @@
 //! Выполнение программы над письмом (SIEVE-03): `if`/`elsif`/`else`, `stop`, действия и implicit keep
 //! (RFC 5228 §2.10.2), тесты ядра, компараторы `i;octet`, `i;ascii-casemap`, `i;ascii-numeric` и типы сравнения
-//! `:is`, `:contains`, `:matches`, `:value`, `:count`.
+//! `:is`, `:contains`, `:matches`, `:value`, `:count`; тест `body` (RFC 5173, SIEVE-05).
 //!
 //! Заголовки декодируются (RFC 2047), адреса разбираются по RFC 5322 — `mail-parser`. Ошибка выполнения (в том числе
 //! превышение [`Limits::max_steps`] и [`Limits::max_actions`]) отменяет действия скрипта: остаётся implicit keep.
-//! Слияние действий в `RulesOutcome` — SIEVE-04.
+//! Слияние действий в `RulesOutcome` — [`crate::outcome`] (SIEVE-04).
 
 use std::cmp::Ordering;
 
-use mail_parser::{Address, HeaderName, HeaderValue, MessageParser};
+use mail_parser::decoders::html::html_to_text;
+use mail_parser::{
+    Address, HeaderName, HeaderValue, Message, MessageParser, MimeHeaders, PartType,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::Limits;
-use crate::compile::{Cmd, Comparator, FlagOp, Match, MatchKind, Part, Program, Rel, Test};
+use crate::compile::{
+    Cmd, Comparator, FlagOp, Match, MatchKind, Part, Program, Rel, Test, Transform,
+};
 
 /// Письмо и конверт на входе выполнения.
 #[derive(Debug, Clone, Copy, Default)]
@@ -89,6 +94,8 @@ pub struct Outcome {
     pub flags: Vec<String>,
     /// Ошибка выполнения (без содержимого письма).
     pub error: Option<String>,
+    /// Выполнение закончилось командой `stop`.
+    pub stopped: bool,
 }
 
 /// Выполняет программу над письмом.
@@ -102,9 +109,11 @@ pub fn run(program: &Program, ctx: &Context<'_>, limits: &Limits) -> Outcome {
         flags: Vec::new(),
         cancel_keep: false,
         vacation: false,
+        body: None,
     };
     match ex.block(&program.commands) {
-        Ok(_) => Outcome {
+        Ok(flow) => Outcome {
+            stopped: matches!(flow, Flow::Stop),
             implicit_keep: !ex.cancel_keep,
             actions: ex.actions,
             flags: ex.flags,
@@ -118,13 +127,13 @@ pub fn run(program: &Program, ctx: &Context<'_>, limits: &Limits) -> Outcome {
     }
 }
 
-struct Hdr {
-    name: String,
+pub(crate) struct Hdr {
+    pub(crate) name: String,
     /// Значение после RFC 2047, без ведущих и хвостовых пробелов.
-    value: String,
+    pub(crate) value: String,
     /// Границы сырого значения в письме.
-    start: usize,
-    end: usize,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 struct Fail(String);
@@ -143,6 +152,8 @@ struct Exec<'a> {
     flags: Vec<String>,
     cancel_keep: bool,
     vacation: bool,
+    /// Разобранное письмо для теста `body` (разбирается при первом тесте; `Some(None)` — не разобрано).
+    body: Option<Option<Message<'a>>>,
 }
 
 impl Exec<'_> {
@@ -228,6 +239,19 @@ impl Exec<'_> {
                 self.limits.max_actions
             )));
         }
+        if matches!(action, Action::Redirect { .. }) {
+            let n = self
+                .actions
+                .iter()
+                .filter(|a| matches!(a, Action::Redirect { .. }))
+                .count();
+            if n >= self.limits.max_redirects {
+                return Err(Fail(format!(
+                    "больше {} перенаправлений за выполнение",
+                    self.limits.max_redirects
+                )));
+            }
+        }
         self.actions.push(action);
         self.cancel_keep |= cancels_keep;
         Ok(())
@@ -310,8 +334,9 @@ impl Exec<'_> {
                     .collect();
                 self.matches(m, &values, keys)?
             }
-            Test::Body { .. } => {
-                return Err(Fail("тест body в этой версии не выполняется".into()));
+            Test::Body { m, transform, keys } => {
+                let values = self.body_values(transform)?;
+                self.matches(m, &values, keys)?
             }
             Test::HasFlag { m, keys } => {
                 let values = self.flags.clone();
@@ -323,6 +348,34 @@ impl Exec<'_> {
                 })
             }),
         })
+    }
+
+    /// Значения теста `body` (RFC 5173): `:raw` — тело как есть, `:text` — текст частей `text/*` (HTML — без
+    /// разметки), `:content` — декодированные части указанных типов. Всего не больше [`Limits::max_body_scan`] байт.
+    fn body_values(&mut self, transform: &Transform) -> Result<Vec<String>, Fail> {
+        let raw = self.ctx.message;
+        let mut scan = Scan {
+            left: self.limits.max_body_scan,
+            out: Vec::new(),
+        };
+        if let Transform::Raw = transform {
+            let body = raw.get(body_offset(raw)..).unwrap_or_default();
+            let body = body.get(..scan.left.min(body.len())).unwrap_or_default();
+            scan.push(&String::from_utf8_lossy(body));
+            return Ok(scan.out);
+        }
+        if self.body.is_none() {
+            self.step(1 + len_u64(raw.len()) / 1024)?;
+            self.body = Some(MessageParser::default().parse(raw));
+        }
+        if let Some(Some(msg)) = &self.body {
+            let types = match transform {
+                Transform::Content(types) => Some(types.as_slice()),
+                _ => None,
+            };
+            collect(msg, types, &mut scan);
+        }
+        Ok(scan.out)
     }
 
     fn header_values(&mut self, names: &[String]) -> Result<Vec<String>, Fail> {
@@ -527,8 +580,99 @@ fn glob(p: &[Glob], s: &[char], cmp: Comparator, steps: &mut u64, max: u64) -> O
 
 // ---------- Письмо ----------
 
+/// Накопитель значений `body` с остатком лимита.
+struct Scan {
+    left: usize,
+    out: Vec<String>,
+}
+
+impl Scan {
+    fn push(&mut self, s: &str) {
+        let mut end = s.len().min(self.left);
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.left -= end;
+        self.out.push(s.get(..end).unwrap_or_default().to_owned());
+    }
+}
+
+/// Начало тела: после первой пустой строки; её нет — тела нет.
+fn body_offset(raw: &[u8]) -> usize {
+    let mut i = 0;
+    while let Some(n) = raw
+        .get(i..)
+        .and_then(|r| r.iter().position(|&b| b == b'\n'))
+    {
+        let next = i + n + 1;
+        match raw.get(next..) {
+            Some([b'\n', ..]) => return next + 1,
+            Some([b'\r', b'\n', ..]) => return next + 2,
+            _ => i = next,
+        }
+    }
+    raw.len()
+}
+
+/// Подходит ли часть `ty/sub` под список `:content` (RFC 5173 §5.2): `""` — любая, `type` — любой подтип,
+/// `type/subtype` — точно.
+fn wanted(types: &[String], ty: &str, sub: &str) -> bool {
+    types.iter().any(|t| match t.split_once('/') {
+        None => t.is_empty() || t.eq_ignore_ascii_case(ty),
+        Some((a, b)) => {
+            !a.is_empty()
+                && !b.is_empty()
+                && a.eq_ignore_ascii_case(ty)
+                && b.eq_ignore_ascii_case(sub)
+        }
+    })
+}
+
+/// Собирает значения частей письма и вложенных писем: `types = None` — `:text`, иначе `:content`.
+fn collect(msg: &Message<'_>, types: Option<&[String]>, scan: &mut Scan) {
+    for part in &msg.parts {
+        if scan.left == 0 {
+            return;
+        }
+        let (ty, sub) = part.content_type().map_or(("text", "plain"), |c| {
+            (c.ctype(), c.subtype().unwrap_or(""))
+        });
+        let hit = match types {
+            None => ty.eq_ignore_ascii_case("text"),
+            Some(types) => wanted(types, ty, sub),
+        };
+        match &part.body {
+            PartType::Text(s) if hit => scan.push(s),
+            PartType::Html(s) if hit && types.is_none() => scan.push(&html_to_text(s)),
+            PartType::Html(s) if hit => scan.push(s),
+            PartType::Binary(b) | PartType::InlineBinary(b) if hit && types.is_some() => {
+                scan.push(&String::from_utf8_lossy(b));
+            }
+            PartType::Message(inner) => {
+                // Вложенное письмо: по `message/rfc822` — его заголовки, части — как у внешнего.
+                if hit && types.is_some() {
+                    // Границы заголовков — по корневой части: вложенное письмо без перекодирования делит
+                    // буфер с внешним.
+                    let head = inner
+                        .parts
+                        .first()
+                        .and_then(|p| {
+                            inner
+                                .raw_message
+                                .get(p.offset_header as usize..p.offset_body as usize)
+                        })
+                        .unwrap_or_default();
+                    scan.push(&String::from_utf8_lossy(head));
+                }
+                collect(inner, types, scan);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Заголовки верхнего уровня: имя, значение после RFC 2047 и границы сырого значения.
-fn parse_headers(raw: &[u8]) -> Vec<Hdr> {
+pub(crate) fn parse_headers(raw: &[u8]) -> Vec<Hdr> {
     // Непустая карта заголовков включает разбор «по умолчанию» для всех остальных — как текст с RFC 2047.
     let parser = MessageParser::new()
         .header_text(HeaderName::Subject)
@@ -556,7 +700,7 @@ fn header_text(v: &HeaderValue<'_>) -> String {
 }
 
 /// Адреса из сырого значения заголовка (RFC 5322, группы раскрываются); имена и комментарии отбрасываются.
-fn parse_addresses(raw: &[u8]) -> Vec<String> {
+pub(crate) fn parse_addresses(raw: &[u8]) -> Vec<String> {
     let mut buf = Vec::with_capacity(raw.len() + 9);
     buf.extend_from_slice(b"From:");
     buf.extend_from_slice(raw);
@@ -577,7 +721,7 @@ fn parse_addresses(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn strip_angle(s: &str) -> &str {
+pub(crate) fn strip_angle(s: &str) -> &str {
     let s = s.trim();
     s.strip_prefix('<')
         .and_then(|x| x.strip_suffix('>'))
@@ -586,7 +730,7 @@ fn strip_angle(s: &str) -> &str {
 
 /// Часть адреса (RFC 5228 §2.7.4, RFC 5233): локальная часть — до последней `@`, `:user`/`:detail` — по первому `+`;
 /// `:detail` без `+` — нет значения.
-fn address_part(addr: &str, part: Part) -> Option<String> {
+pub(crate) fn address_part(addr: &str, part: Part) -> Option<String> {
     let (local, domain) = addr.rsplit_once('@').unwrap_or((addr, ""));
     let v = match part {
         Part::All => addr,

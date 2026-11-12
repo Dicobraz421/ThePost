@@ -103,7 +103,6 @@ pub(crate) enum Test {
         names: Vec<String>,
         keys: Vec<String>,
     },
-    #[allow(dead_code, reason = "выполнение body — SIEVE-05")]
     Body {
         m: Match,
         transform: Transform,
@@ -158,7 +157,6 @@ pub(crate) enum Part {
     Detail,
 }
 
-#[allow(dead_code, reason = "выполнение body — SIEVE-05")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Transform {
     Raw,
