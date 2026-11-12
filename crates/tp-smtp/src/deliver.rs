@@ -27,7 +27,8 @@
 //!   `Drop` — `250` без доставки, изменённые конверт и тело — дальше по ним, `matched` — в журнал доставки;
 //! - правила Sieve получателей ([`Delivery::with_rules`], [`crate::sieve`], SMTP-31, SMTP-32) — для каждого
 //!   локального получателя (smtp-in, submission, [`Delivery::submit`]) после правил потока и до `ingest`: папки и
-//!   флаги, отброс, перенаправление (как пересылки модулей), автоответ.
+//!   флаги, отброс, перенаправление, автоответ; перенаправленное письмо и внутренний автоответ — через правила
+//!   получателя с проверкой петли ([`Delivery::relay`], SMTP-34).
 //!
 //! Отправка вне сессии SMTP (JMAP `EmailSubmission/set`) — [`Delivery::submit`] и `impl Outbound for Delivery`
 //! (CMP-04, контракт `tp_contracts::queue::Outbound`, CTR-28): локальные получатели доставляются сразу тем же
@@ -44,7 +45,7 @@
 //! (`quarantine`, `reject`) доставляется в «Спам». Затем письмо проверяют фильтры Milter ([`crate::milter`]):
 //! отказ фильтра — ответ на `DATA`, карантин — «Спам» (smtp-in) или отказ (submission).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -76,7 +77,7 @@ use crate::groups::{Groups, Hold};
 use crate::milter::{Milters, Verdict};
 use crate::routes::Routes;
 use crate::server::{Envelope, Handler, Mode, Reply, is_positive, reply};
-use crate::sieve::{self, Sieved, VacationRate};
+use crate::sieve::{self, Hop, Sieved, VacationRate};
 use crate::sources;
 use crate::srs::SrsError;
 use crate::tracking::{self, Mail, Step, Tracking, Trail};
@@ -189,6 +190,10 @@ pub struct Delivery {
     flow: Option<FlowDeps>,
     rules: Option<Arc<dyn DeliveryRules>>,
     vacation_rate: VacationRate,
+    /// `delivery.redirect_hops`.
+    redirect_hops: u32,
+    /// `delivery.redirect_total`.
+    redirect_total: u32,
 }
 
 impl fmt::Debug for Delivery {
@@ -232,6 +237,8 @@ impl Delivery {
             flow: None,
             rules: None,
             vacation_rate: VacationRate::new(cfg.delivery.vacation_rate),
+            redirect_hops: cfg.delivery.redirect_hops,
+            redirect_total: cfg.delivery.redirect_total,
         }
     }
 
@@ -1237,12 +1244,13 @@ impl Delivery {
             push_unique(&mut rcpts, prepared.external);
         }
         let mut failed = prepared.failed;
-        // Учётные записи получателей — до правил: перенаправление им же письмо не доставляет (петли).
+        // Учётные записи получателей — до правил: пересылка модулей им же письмо не доставляет (петли).
         let delivered = accounts_of(&prepared.deliveries);
+        let mut forward = Vec::new();
         let Sieved {
-            redirect: mut forward,
-            replies,
-            steps: sieve_steps,
+            redirect: hops,
+            mut replies,
+            steps: mut sieve_steps,
         } = self
             .apply_rules(
                 &env.id,
@@ -1250,6 +1258,7 @@ impl Delivery {
                 &full,
                 &mut prepared.deliveries,
                 junk,
+                false,
             )
             .await?;
         let local = local_rcpts(&prepared.deliveries);
@@ -1278,6 +1287,18 @@ impl Delivery {
             )
             .await?;
         push_unique(&mut forwarded, external);
+        let relayed = self
+            .relay(
+                &env.id,
+                &env.mail_from,
+                hops,
+                junk,
+                received_at,
+                Some(env.conn.client.ip()),
+            )
+            .await?;
+        sieve::merge_replies(&mut replies, relayed.replies);
+        sieve_steps.extend(relayed.steps);
         self.queue_out(&env.id, &env.mail_from, rcpts, full.clone())
             .await?;
         self.queue_forward(
@@ -1434,12 +1455,20 @@ impl Delivery {
             Bytes::from(full)
         };
         let delivered = accounts_of(&prepared.deliveries);
+        let mut forward = Vec::new();
         let Sieved {
-            redirect: mut forward,
-            replies,
-            steps: sieve_steps,
+            redirect: hops,
+            mut replies,
+            steps: mut sieve_steps,
         } = self
-            .apply_rules(&id, mail_from, &full, &mut prepared.deliveries, false)
+            .apply_rules(
+                &id,
+                mail_from,
+                &full,
+                &mut prepared.deliveries,
+                false,
+                false,
+            )
             .await?;
         let local_list = local_rcpts(&prepared.deliveries);
         if !prepared.deliveries.is_empty() {
@@ -1482,6 +1511,11 @@ impl Delivery {
                 delivered,
             )
             .await?;
+        let relayed = self
+            .relay(&id, mail_from, hops, false, received_at, None)
+            .await?;
+        sieve::merge_replies(&mut replies, relayed.replies);
+        sieve_steps.extend(relayed.steps);
         let statuses: Vec<(String, SubmitStatus)> = rcpts
             .iter()
             .map(|r| {
@@ -1542,6 +1576,10 @@ impl Delivery {
     /// правил (несколько папок — несколько доставок одного `ingest`; `discard` и `redirect` без копии — ни одной);
     /// копии модулей (без адреса) — без правил. Сбой правил — доставка в папку по умолчанию («Входящие», при
     /// `junk` — «Спам»). Возвращает перенаправления, автоответы (не для писем в «Спам») и события журнала.
+    ///
+    /// Петля перенаправлений (SMTP-34, [`crate::sieve`]): ящик уже есть в цепочке письма, цепочка длиннее
+    /// `delivery.redirect_hops` или исчерпан `delivery.redirect_total` (`over`) — правила ящика не применяются,
+    /// письмо — в папку по умолчанию, запись в журнал доставки.
     async fn apply_rules(
         &self,
         id: &str,
@@ -1549,14 +1587,35 @@ impl Delivery {
         raw: &Bytes,
         deliveries: &mut Vec<(String, MailDelivery)>,
         junk: bool,
+        over: bool,
     ) -> Result<Sieved> {
         let mut out = Sieved::default();
         let Some(rules) = &self.rules else {
             return Ok(out);
         };
+        let chain = sieve::chain(raw);
         let mut result = Vec::with_capacity(deliveries.len());
         for (rcpt, d) in std::mem::take(deliveries) {
             if rcpt.is_empty() {
+                result.push((rcpt, d));
+                continue;
+            }
+            let token = sieve::chain_token(d.account);
+            let looped = if chain.contains(&token) {
+                Some("mailbox already in redirect chain")
+            } else if chain.len() > self.redirect_hops as usize {
+                Some("redirect hop limit")
+            } else if over {
+                Some("redirect limit per message")
+            } else {
+                None
+            };
+            if let Some(why) = looped {
+                tracing::info!(%id, account = %d.account, reason = why, "smtp: петля перенаправлений, правила Sieve не применены");
+                out.steps.push(
+                    Step::new(Ek::Deliver, Dd::Accept, vec![rcpt.clone()])
+                        .reason(format!("sieve: rules skipped, {why}; default folder")),
+                );
                 result.push((rcpt, d));
                 continue;
             }
@@ -1613,7 +1672,10 @@ impl Delivery {
             let redirected = !outcome.redirect.is_empty();
             if redirected {
                 notes.push(format!("redirect {}", outcome.redirect.join(", ")));
-                push_unique(&mut out.redirect, outcome.redirect);
+                out.redirect.push(Hop {
+                    raw: sieve::stamp(raw, &token),
+                    to: outcome.redirect,
+                });
             }
             match outcome.vacation {
                 Some(_) if junk => notes.push("auto-reply skipped: junk".into()),
@@ -1637,6 +1699,74 @@ impl Delivery {
             result.extend(kept.into_iter().map(|k| (rcpt.clone(), k)));
         }
         *deliveries = result;
+        Ok(out)
+    }
+
+    /// Перенаправления правил и внутренние автоответы (SMTP-34, решение 61): письмо каждого перенаправления
+    /// доставляется как любое письмо — локальным адресатам через их правила (их перенаправления — так же, пока
+    /// цепочка не оборвётся: [`Delivery::apply_rules`]), внешним — в очередь с SRS и ARC. Неизвестный адрес и
+    /// переполненный ящик — только в журнал. Возвращает автоответы и события журнала доставки.
+    async fn relay(
+        &self,
+        id: &str,
+        mail_from: &str,
+        hops: Vec<Hop>,
+        junk: bool,
+        received_at: OffsetDateTime,
+        ip: Option<std::net::IpAddr>,
+    ) -> Result<Sieved> {
+        let mut out = Sieved::default();
+        let mut hops = VecDeque::from(hops);
+        let mut done = 0u32;
+        while let Some(hop) = hops.pop_front() {
+            let over = done >= self.redirect_total;
+            done = done.saturating_add(1);
+            let mut p = self.prepare(id, &hop.to, junk, Origin::Module).await?;
+            let mut external = std::mem::take(&mut p.external);
+            push_unique(&mut external, std::mem::take(&mut p.relayed));
+            let delivered = accounts_of(&p.deliveries);
+            let sieved = self
+                .apply_rules(id, mail_from, &hop.raw, &mut p.deliveries, junk, over)
+                .await?;
+            if !p.deliveries.is_empty() {
+                let mut ignored = Vec::new();
+                match self
+                    .ingest_all(
+                        id,
+                        mail_from,
+                        hop.raw.clone(),
+                        p.deliveries,
+                        received_at,
+                        &mut ignored,
+                    )
+                    .await
+                {
+                    Ok(ingested) => {
+                        let more = self
+                            .forward(
+                                id,
+                                mail_from,
+                                &hop.raw,
+                                ingested.forward,
+                                junk,
+                                received_at,
+                                delivered,
+                            )
+                            .await?;
+                        push_unique(&mut external, more);
+                    }
+                    Err(Error::QuotaExceeded) => {
+                        tracing::warn!(%id, "smtp: перенаправление не доставлено, ящики переполнены");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            self.queue_forward(id, mail_from, external, hop.raw, ip)
+                .await?;
+            hops.extend(sieved.redirect);
+            sieve::merge_replies(&mut out.replies, sieved.replies);
+            out.steps.extend(sieved.steps);
+        }
         Ok(out)
     }
 
@@ -1675,8 +1805,8 @@ impl Delivery {
 
     /// Автоответы правил на письмо `raw` от `mail_from` (SMTP-32): защита от петель RFC 3834
     /// ([`sieve::suppressed`]) и частота `delivery.vacation_rate`, затем письмо [`sieve::build_reply`] с конвертом
-    /// `<>`: внешнему адресату — в очередь, локальному — сразу во «Входящие». Сбой — только в журналы: исходное
-    /// письмо уже доставлено.
+    /// `<>`: внешнему адресату — в очередь, локальному — через его правила ([`Delivery::relay`]). Сбой — только в
+    /// журналы: исходное письмо уже доставлено.
     async fn send_replies(
         &self,
         id: &str,
@@ -1704,8 +1834,14 @@ impl Delivery {
                 &format!("{id}.{n}"),
                 OffsetDateTime::now_utc(),
             );
-            match self.deliver_reply(&reply.to, Bytes::from(msg)).await {
-                Ok(how) => steps.push(step(Dd::Accept, format!("auto-reply {how}"))),
+            match self
+                .deliver_reply(id, scope.account, &reply.to, Bytes::from(msg))
+                .await
+            {
+                Ok((how, more)) => {
+                    steps.push(step(Dd::Accept, format!("auto-reply {how}")));
+                    steps.extend(more);
+                }
                 Err(e) => {
                     tracing::warn!(%id, account = %scope.account, error = %e, "smtp: автоответ не отправлен");
                     steps.push(step(Dd::Defer, format!("auto-reply not sent: {e}")));
@@ -1714,17 +1850,35 @@ impl Delivery {
         }
     }
 
-    /// Письмо автоответа `raw` адресату `to` с конвертом `<>`: локальному — во «Входящие» (без правил), внешнему —
-    /// в очередь исходящей почты. Возвращает, куда отправлено.
-    async fn deliver_reply(&self, to: &str, raw: Bytes) -> Result<&'static str> {
-        let how = match self.resolve(to).await? {
-            Resolved::Local(_) => "delivered",
-            Resolved::External if self.deps.outbound.is_some() => "queued",
-            Resolved::External => return Err(Error::UNAVAILABLE),
-            Resolved::Unknown => return Err(Error::NotFound),
-        };
-        self.send_dsn(self.deps.tenant, to, raw).await?;
-        Ok(how)
+    /// Письмо автоответа `raw` учётной записи `from` адресату `to` с конвертом `<>`: локальному — как любое письмо,
+    /// через его правила (в цепочке перенаправлений — ящик отвечающего: вернуть ему ответ правилом можно, но его
+    /// правила к ответу не применяются; на автоответ не отвечают), внешнему — в очередь исходящей почты. Возвращает,
+    /// куда отправлено, и события журнала доставки правил получателя.
+    async fn deliver_reply(
+        &self,
+        id: &str,
+        from: AccountId,
+        to: &str,
+        raw: Bytes,
+    ) -> Result<(&'static str, Vec<Step>)> {
+        match self.resolve(to).await? {
+            Resolved::Local(_) => {
+                let hop = Hop {
+                    raw: sieve::stamp(&raw, &sieve::chain_token(from)),
+                    to: vec![to.to_owned()],
+                };
+                let sieved = self
+                    .relay(id, "", vec![hop], false, OffsetDateTime::now_utc(), None)
+                    .await?;
+                Ok(("delivered", sieved.steps))
+            }
+            Resolved::External if self.deps.outbound.is_some() => {
+                self.send_dsn(self.deps.tenant, to, raw).await?;
+                Ok(("queued", Vec::new()))
+            }
+            Resolved::External => Err(Error::UNAVAILABLE),
+            Resolved::Unknown => Err(Error::NotFound),
+        }
     }
 
     /// Заголовки трассировки письма, отправленного вне сессии SMTP ([`Delivery::submit`]).
