@@ -152,7 +152,7 @@ pub(crate) enum Comparator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Part {
     All,
-    LocalPart,
+    Local,
     Domain,
     User,
     Detail,
@@ -489,7 +489,7 @@ impl Compiler {
         for &(tag, pos, _) in &p.tags {
             let x = match tag {
                 "all" => Part::All,
-                "localpart" => Part::LocalPart,
+                "localpart" => Part::Local,
                 "domain" => Part::Domain,
                 "user" | "detail" => {
                     self.need("subaddress", pos);

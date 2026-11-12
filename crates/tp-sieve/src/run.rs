@@ -590,7 +590,7 @@ fn address_part(addr: &str, part: Part) -> Option<String> {
     let (local, domain) = addr.rsplit_once('@').unwrap_or((addr, ""));
     let v = match part {
         Part::All => addr,
-        Part::LocalPart => local,
+        Part::Local => local,
         Part::Domain => domain,
         Part::User => local.split_once('+').map_or(local, |(u, _)| u),
         Part::Detail => local.split_once('+')?.1,
