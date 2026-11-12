@@ -12,17 +12,17 @@ use super::*;
 use crate::config::{MilterConfig, MilterFilter, MilterOnFailure};
 use crate::server::tests::conn_info;
 
-type Script = Arc<dyn Fn(&Packet) -> Vec<Packet> + Send + Sync>;
+pub(crate) type Script = Arc<dyn Fn(&Packet) -> Vec<Packet> + Send + Sync>;
 
 /// Мок-фильтр: отвечает на согласование шагами `protocol`, на прочие команды — по сценарию `script`
 /// (на макросы и `Q` ответа нет). Принятые пакеты — в `seen`.
-struct Mock {
+pub(crate) struct Mock {
     address: String,
     seen: Arc<Mutex<Vec<Packet>>>,
 }
 
 impl Mock {
-    async fn start(protocol: u32, script: Script) -> Self {
+    pub(crate) async fn start(protocol: u32, script: Script) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("addr").to_string();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -60,7 +60,7 @@ impl Mock {
     }
 
     /// Коды принятых пакетов; сессия, начатая клиентом, — после её `Q` (клиент не ждёт ответа на `Q`).
-    async fn codes(&self) -> String {
+    pub(crate) async fn codes(&self) -> String {
         for _ in 0..100 {
             let codes = self.codes_now();
             if codes.is_empty() || codes.ends_with('Q') {
@@ -90,7 +90,7 @@ impl Mock {
             .collect()
     }
 
-    fn filter(&self, name: &str) -> MilterFilter {
+    pub(crate) fn filter(&self, name: &str) -> MilterFilter {
         MilterFilter {
             name: name.into(),
             address: self.address.clone(),
@@ -101,12 +101,12 @@ impl Mock {
     }
 }
 
-fn reply_of(code: u8) -> Packet {
+pub(crate) fn reply_of(code: u8) -> Packet {
     Packet::new(code, Bytes::new())
 }
 
 /// Сценарий: `continue` на всё, на конец тела — `eob`.
-fn on_eob(eob: Vec<Packet>) -> Script {
+pub(crate) fn on_eob(eob: Vec<Packet>) -> Script {
     Arc::new(move |p: &Packet| {
         if p.code == proto::C_BODYEOB {
             eob.clone()
@@ -116,7 +116,7 @@ fn on_eob(eob: Vec<Packet>) -> Script {
     })
 }
 
-fn header_mod(code: u8, index: Option<u32>, name: &str, value: &str) -> Packet {
+pub(crate) fn header_mod(code: u8, index: Option<u32>, name: &str, value: &str) -> Packet {
     let mut b = BytesMut::new();
     if let Some(i) = index {
         b.put_u32(i);

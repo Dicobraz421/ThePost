@@ -11,18 +11,18 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::collections::HashSet;
+
 use time::OffsetDateTime;
 use tp_contracts::groups::{
     DistributionGroup, HeldMessage, Moderation, check_delivery, validate_reject_reason,
 };
-use tp_contracts::mailstore::Delivery as MailDelivery;
-use tp_contracts::meta::AccountScope;
 use tp_contracts::queue::DsnRet;
 use tp_contracts::{Error, Result, TenantId};
 
 use super::{
-    Dd, Delivery, Ek, NO_OUTBOUND, Origin, Prepared, accounts_of, dsn_step, local_rcpts,
-    no_outbound, outcome_steps, push_unique,
+    Dd, Delivery, Ek, Filing, NO_OUTBOUND, Origin, Prepared, accounts_of, dsn_step, junk_rcpts,
+    local_rcpts, no_outbound, outcome_steps, push_unique,
 };
 use crate::dsn::{self, DsnSink};
 use crate::groups::Groups;
@@ -42,10 +42,16 @@ impl Delivery {
     }
 
     /// Доставки участникам группы `group` (включённые учётные записи, каждая — один раз) с адресом группы.
-    async fn members_of(&self, groups: &Groups, group: &DistributionGroup) -> Result<Prepared> {
+    async fn members_of(
+        &self,
+        groups: &Groups,
+        group: &DistributionGroup,
+        filing: &Filing,
+    ) -> Result<Prepared> {
         let rcpt = group.address.clone().unwrap_or_default();
         let mut out = Prepared {
             deliveries: Vec::new(),
+            junk: HashSet::new(),
             external: Vec::new(),
             relayed: Vec::new(),
             queued: Vec::new(),
@@ -53,26 +59,12 @@ impl Delivery {
             failed: Vec::new(),
         };
         for id in groups.members(self.deps.tenant, group).await? {
-            let Some(acc) = self.deps.accounts.get(self.deps.tenant, id).await? else {
-                continue;
-            };
-            if !acc.enabled || out.deliveries.iter().any(|(_, d)| d.account == acc.id) {
-                continue;
+            if let Some(acc) = self.deps.accounts.get(self.deps.tenant, id).await?
+                && acc.enabled
+            {
+                self.push_delivery(&mut out, &rcpt, &acc, None, filing)
+                    .await?;
             }
-            let scope = AccountScope {
-                tenant: acc.tenant,
-                account: acc.id,
-            };
-            let mailbox = self.mailbox(scope, false).await?;
-            out.deliveries.push((
-                rcpt.clone(),
-                MailDelivery {
-                    account: acc.id,
-                    mailbox,
-                    extra_headers: Vec::new(),
-                    flags: Default::default(),
-                },
-            ));
         }
         Ok(out)
     }
@@ -113,15 +105,17 @@ impl Moderation for Delivery {
         let id = format!("held-{}", message.id);
         let mail_from = message.sender.as_str();
         let received_at = OffsetDateTime::now_utc();
+        let filing = Filing::new(false, false, mail_from, &raw);
+        let filing = &filing;
         let (rcpts, mut prepared) = match group {
             Some(g) => (
                 g.address.iter().cloned().collect::<Vec<_>>(),
-                self.members_of(groups, g).await?,
+                self.members_of(groups, g, filing).await?,
             ),
             // Письмо правила потока: группы среди получателей раскрываются без модерации (`Origin::Module`).
             None => (
                 message.recipients.clone(),
-                self.prepare(&id, &message.recipients, false, Origin::Module)
+                self.prepare(&id, &message.recipients, filing, Origin::Module)
                     .await?,
             ),
         };
@@ -133,9 +127,17 @@ impl Moderation for Delivery {
             mut replies,
             steps: mut sieve_steps,
         } = self
-            .apply_rules(&id, mail_from, &raw, &mut prepared.deliveries, false, false)
+            .apply_rules(
+                &id,
+                mail_from,
+                &raw,
+                &mut prepared.deliveries,
+                &prepared.junk,
+                false,
+            )
             .await?;
         let local = local_rcpts(&prepared.deliveries);
+        let spam = junk_rcpts(&prepared.deliveries, &prepared.junk);
         if !prepared.deliveries.is_empty() {
             let targets: Vec<String> = prepared.deliveries.iter().map(|(r, _)| r.clone()).collect();
             match self
@@ -166,10 +168,18 @@ impl Moderation for Delivery {
             }
         }
         let forwarded = self
-            .forward(&id, mail_from, &raw, forward, false, received_at, delivered)
+            .forward(
+                &id,
+                mail_from,
+                &raw,
+                forward,
+                filing,
+                received_at,
+                delivered,
+            )
             .await?;
         let relayed = self
-            .relay(&id, mail_from, hops, false, received_at, None)
+            .relay(&id, mail_from, hops, filing, received_at, None)
             .await?;
         sieve::merge_replies(&mut replies, relayed.replies);
         sieve_steps.extend(relayed.steps);
@@ -188,7 +198,7 @@ impl Moderation for Delivery {
             .await?;
         let mut steps =
             vec![Step::new(Ek::Receive, Dd::Accept, rcpts).reason("approved by moderator")];
-        outcome_steps(&mut steps, &[], &local, &failed, false);
+        outcome_steps(&mut steps, &[], &local, &failed, &spam);
         steps.extend(sieve_steps);
         self.send_replies(&id, mail_from, &raw, replies, &mut steps)
             .await;

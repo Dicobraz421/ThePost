@@ -184,6 +184,19 @@ impl Env {
         }
     }
 
+    /// Число писем в папке «Спам» учётной записи.
+    async fn junk(&self, login: &str) -> usize {
+        let scope = self.scope(login).await;
+        let junk = self
+            .meta
+            .mailbox_by_role(scope, SpecialUse::Junk)
+            .expect("junk");
+        MessageStore::list(&self.meta, scope, junk, MessageQuery::All, 100)
+            .await
+            .expect("list")
+            .len()
+    }
+
     /// Письма во «Входящих» учётной записи (исходный текст).
     async fn inbox(&self, login: &str) -> Vec<String> {
         let scope = self.scope(login).await;
@@ -1428,4 +1441,5 @@ async fn outbound_suite() {
 
 mod rules;
 mod scheduled;
+mod senders;
 mod wave;
