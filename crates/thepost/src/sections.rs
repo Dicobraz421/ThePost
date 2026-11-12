@@ -7,7 +7,7 @@
 //!
 //! Подсекции `blob.local` и `blob.s3` — секции крейта `tp-blob` как есть (BLOB-11): приложение подставляет только каталог, бакет и префикс из `blob.url`.
 //!
-//! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `imap`, `jmap`, `search`, `mailstore`; `admin` — секция
+//! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `sieve`, `imap`, `jmap`, `search`, `mailstore`; `admin` — секция
 //! `tp-admin` без `listen` (адрес Admin API — один ключ `http.admin.listen`, APP-16); приложение добавляет `auth`
 //! (каталог, OIDC, пароли приложений, Kerberos) и `http` (слушатели jmap и admin).
 
@@ -47,6 +47,8 @@ pub const SMTP: &str = "smtp";
 pub const IMAP: &str = "imap";
 /// Имя секции JMAP (`tp-jmap`).
 pub const JMAP: &str = "jmap";
+/// Имя секции правил Sieve и автоответа (`tp-sieve`).
+pub const SIEVE: &str = "sieve";
 /// Имя секции поиска (`tp-search`).
 pub const SEARCH: &str = "search";
 /// Имя секции Admin API (`tp-admin`).
@@ -75,6 +77,7 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     r.add_section::<VerifySection>(VERIFY)?;
     r.add_section::<StartupSection>(STARTUP)?;
     r.add_section::<tp_smtp::SmtpConfig>(SMTP)?;
+    r.add_section::<tp_sieve::SieveConfig>(SIEVE)?;
     r.add_section::<tp_imap::ImapConfig>(IMAP)?;
     r.add_section::<tp_jmap::JmapConfig>(JMAP)?;
     r.add_section::<tp_search::SearchConfig>(SEARCH)?;
@@ -1063,6 +1066,7 @@ blob:
             "\"startup\"",
             "\"secrets\"",
             "\"smtp\"",
+            "\"sieve\"",
             "\"imap\"",
             "\"jmap\"",
             "\"search\"",

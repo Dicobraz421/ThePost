@@ -51,7 +51,9 @@ use tp_smtp::{
 };
 
 use crate::infra;
-use crate::sections::{ADMIN, AUTH, AdminSection, AuthSection, JMAP, MAILSTORE, SEARCH, SMTP};
+use crate::sections::{
+    ADMIN, AUTH, AdminSection, AuthSection, JMAP, MAILSTORE, SEARCH, SIEVE, SMTP,
+};
 
 /// Общие сервисы ролей узла.
 pub struct Services {
@@ -112,6 +114,11 @@ pub struct Services {
     pub routes: Arc<Routes>,
     /// Правила потока почты модуля (`Registry::mail_flow`); `None` — модуль не включён.
     pub mail_flow: Option<Arc<dyn MailFlow>>,
+    /// Правила Sieve и автоответ при доставке (APP-26): скрипты и журнал автоответов — `PgMeta`, кэш программ —
+    /// общий для smtp-in, submission и JMAP.
+    pub rules: Arc<tp_sieve::Rules>,
+    /// Лимиты проверки текста скрипта в Admin API — секция `sieve` (те же, что при доставке).
+    pub sieve_limits: tp_sieve::Limits,
 }
 
 impl std::fmt::Debug for Services {
@@ -287,6 +294,13 @@ impl Services {
         cfg.section::<AdminSection>(ADMIN)?;
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
         let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
+        // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
+        let sieve = (*cfg.section::<tp_sieve::SieveConfig>(SIEVE)?).clone();
+        let sieve_limits = sieve.limits();
+        let rules = Arc::new(
+            tp_sieve::Rules::new(Arc::new(meta.clone()), Arc::new(meta.clone()), sieve)
+                .with_node(smtp.hostname.clone()),
+        );
 
         Ok(Self {
             tenant,
@@ -316,6 +330,8 @@ impl Services {
             secrets,
             routes,
             mail_flow: ext.mail_flow(),
+            rules,
+            sieve_limits,
         })
     }
 
@@ -362,7 +378,8 @@ impl Services {
             .with_groups(groups)
             .with_tracking(self.tracking.clone())
             .with_transport(self.routes.clone())
-            .with_forwarding(Arc::new(forwarding)))
+            .with_forwarding(Arc::new(forwarding))
+            .with_rules(self.rules.clone()))
     }
 
     /// Доверенные источники приёма smtp-in и submission (шлюз, приложения) из снимков узла.
@@ -471,7 +488,9 @@ impl Services {
         Ok(tp_jmap::Jmap::new(deps, cfg)
             .map_err(|e| infra::context("jmap", e))?
             .with_mail_flow(self.mail_flow.clone())
-            .with_profile_signer(crate::profile_signer::profile_signer(certs)))
+            .with_profile_signer(crate::profile_signer::profile_signer(certs))
+            // VacationResponse и SieveScript (JMAP-23, JMAP-24): автоответ из Postman.
+            .with_sieve(Some(Arc::new(self.meta.clone()))))
     }
 
     /// Admin API.
@@ -494,7 +513,22 @@ impl Services {
             store: self.store.clone(),
             app_passwords: self.app_passwords.clone(),
         };
-        tp_admin::Admin::new(deps, cfg).map_err(|e| infra::context("admin", e))
+        let limits = self.sieve_limits;
+        let check = move |text: &str| match tp_sieve::compile(text.as_bytes(), &limits) {
+            Ok(_) => Vec::new(),
+            Err(diags) => diags
+                .into_iter()
+                .map(|d| tp_admin::ScriptError {
+                    line: d.line,
+                    column: d.column,
+                    message: d.message,
+                })
+                .collect(),
+        };
+        Ok(tp_admin::Admin::new(deps, cfg)
+            .map_err(|e| infra::context("admin", e))?
+            // Правила Sieve и автоответ за пользователя (ADM-14).
+            .with_sieve(Arc::new(self.meta.clone()), check))
     }
 
     /// Обучение антиспама (подписчик журнала событий `smtp-learn` роли maintenance): письмо, перенесённое в «Спам»
