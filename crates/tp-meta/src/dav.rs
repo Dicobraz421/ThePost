@@ -1,6 +1,7 @@
-//! Календари и контакты на PostgreSQL (CONTRACTS.md#Dav; META-46…48).
+//! Календари, контакты и планирование встреч на PostgreSQL (CONTRACTS.md#Dav, CONTRACTS.md#Schedule; META-46…48,
+//! META-51).
 //!
-//! Таблицы ящика `dav_collections`, `dav_objects`, `dav_tombstones` — на шарде учётной записи. Изменяющая операция
+//! Таблицы ящика `dav_collections`, `dav_objects`, `dav_tombstones`, `dav_busy`, `dav_inbox` — на шарде учётной записи. Изменяющая операция
 //! блокирует строку `mailbox_state` (счётчик `ModSeq`, общий с письмами) до фиксации: номера изменений видны по
 //! порядку, проверки лимитов и UID не гоняются с параллельной записью. ETag — `ModSeq` записи.
 //!
@@ -8,8 +9,13 @@
 //! очищенных — по виду (`mailbox_state.dav_*_floor`, для `collection_changes` и `account_changes`) и по коллекции
 //! (`dav_collections.tombstone_floor`, для `changes`): `since` ниже неё — `Conflict` (RFC 6578 `valid-sync-token`).
 //! Токен полной синхронизации — состояние вида или коллекции — не ниже своей границы.
+//!
+//! Планирование (CTR-47): индекс занятости объекта — строки `dav_busy`, заменяются при записи объекта и удаляются
+//! вместе с ним; [`FreeBusy::query`] читает их одним запросом на шард по учётным записям и интервалу. Входящие
+//! планирования — `dav_inbox`: номера изменений из того же счётчика, но состояние календарей они не меняют
+//! (`mailbox_state.dav_inbox_state`).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,6 +30,10 @@ use tp_contracts::dav::{
     TimeRange, dav_changed, valid_name,
 };
 use tp_contracts::meta::{AccountScope, Changes};
+use tp_contracts::schedule::{
+    BusyKind, BusyPeriod, FreeBusy, Inbox, InboxItem, InboxMessage, Period, merge_busy,
+    schedule_inbox_changed,
+};
 use tp_contracts::{AccountId, Error, ModSeq, Result, TenantId};
 use uuid::Uuid;
 
@@ -130,8 +140,25 @@ fn fetch_limit(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX).min(i64::MAX - 1) + 1
 }
 
+fn busy_kind_str(kind: BusyKind) -> &'static str {
+    match kind {
+        BusyKind::Busy => "busy",
+        BusyKind::Tentative => "tentative",
+        BusyKind::Unavailable => "unavailable",
+    }
+}
+
+fn parse_busy_kind(s: &str) -> Result<BusyKind> {
+    match s {
+        "busy" => Ok(BusyKind::Busy),
+        "tentative" => Ok(BusyKind::Tentative),
+        "unavailable" => Ok(BusyKind::Unavailable),
+        other => Err(Error::internal(format!("вид занятости в БД: {other:?}"))),
+    }
+}
+
 const COLLECTION_COLUMNS: &str = "collection_id, kind, name, display_name, description, color, sort_order, \
-                                  timezone, components, modseq";
+                                  timezone, components, transparent, modseq";
 
 #[derive(Debug, FromRow)]
 struct CollectionRow {
@@ -144,6 +171,7 @@ struct CollectionRow {
     sort_order: i64,
     timezone: Option<String>,
     components: Vec<String>,
+    transparent: bool,
     modseq: i64,
 }
 
@@ -164,15 +192,24 @@ impl CollectionRow {
             order: to_u32(self.sort_order)?,
             timezone: self.timezone,
             components,
-            // Прозрачность календаря хранит META-51.
-            transparent: false,
+            transparent: self.transparent,
             state: modseq(self.modseq)?,
         })
     }
 }
 
-const OBJECT_COLUMNS: &str =
-    "object_id, collection_id, name, etag, body, component, uid, span_start, span_end";
+const OBJECT_COLUMNS: &str = "object_id, collection_id, name, etag, body, component, uid, span_start, span_end, \
+                              schedule_tag, busy_starts, busy_ends, busy_kinds";
+
+/// Источник выборки объектов с индексом занятости (массивы по порядку периодов); условия — по столбцам `dav_objects`.
+const OBJECT_FROM: &str = "dav_objects LEFT JOIN LATERAL (
+             SELECT array_agg(b.busy_start ORDER BY b.ord) AS busy_starts,
+                    array_agg(b.busy_end ORDER BY b.ord) AS busy_ends,
+                    array_agg(b.kind ORDER BY b.ord) AS busy_kinds
+             FROM dav_busy b
+             WHERE b.tenant_id = dav_objects.tenant_id AND b.account_id = dav_objects.account_id
+               AND b.object_id = dav_objects.object_id
+         ) busy ON true";
 
 #[derive(Debug, FromRow)]
 struct ObjectRow {
@@ -185,25 +222,46 @@ struct ObjectRow {
     uid: String,
     span_start: Option<OffsetDateTime>,
     span_end: Option<OffsetDateTime>,
+    schedule_tag: Option<String>,
+    busy_starts: Option<Vec<OffsetDateTime>>,
+    busy_ends: Option<Vec<OffsetDateTime>>,
+    busy_kinds: Option<Vec<String>>,
 }
 
 impl ObjectRow {
     fn into_object(self) -> Result<DavObject> {
+        let busy = self
+            .busy_starts
+            .unwrap_or_default()
+            .into_iter()
+            .zip(self.busy_ends.unwrap_or_default())
+            .zip(self.busy_kinds.unwrap_or_default())
+            .map(|((start, end), kind)| {
+                Ok(BusyPeriod {
+                    start,
+                    end,
+                    kind: parse_busy_kind(&kind)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(DavObject {
             id: DavObjectId::from_uuid(self.object_id),
             collection: CollectionId::from_uuid(self.collection_id),
             name: self.name,
             etag: self.etag,
             body: self.body,
-            // Индекс занятости и `Schedule-Tag` хранит META-51.
-            index: ObjectIndex::new(
-                self.component.parse()?,
-                self.uid,
-                self.span_start.map(|start| Span {
-                    start,
-                    end: self.span_end,
-                }),
-            ),
+            index: ObjectIndex {
+                busy,
+                schedule_tag: self.schedule_tag,
+                ..ObjectIndex::new(
+                    self.component.parse()?,
+                    self.uid,
+                    self.span_start.map(|start| Span {
+                        start,
+                        end: self.span_end,
+                    }),
+                )
+            },
         })
     }
 }
@@ -254,7 +312,7 @@ async fn select_objects<'q>(
     >,
 ) -> Result<Vec<DavObject>> {
     let q = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {OBJECT_COLUMNS} FROM dav_objects
+        "SELECT {OBJECT_COLUMNS} FROM {OBJECT_FROM}
          WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3 AND ({filter})
          ORDER BY name COLLATE \"C\""
     )))
@@ -263,6 +321,104 @@ async fn select_objects<'q>(
     .bind(*collection.as_uuid());
     let rows: Vec<ObjectRow> = bind(q).fetch_all(&mut *tx).await.map_err(db_err)?;
     rows.into_iter().map(ObjectRow::into_object).collect()
+}
+
+/// Заменяет индекс занятости объекта `object` периодами `busy` (порядок сохраняется); `replace` — у объекта могли
+/// быть прежние периоды.
+async fn replace_busy(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    collection: CollectionId,
+    object: DavObjectId,
+    replace: bool,
+    busy: &[BusyPeriod],
+) -> Result<()> {
+    if replace {
+        sqlx::query(
+            "DELETE FROM dav_busy WHERE tenant_id = $1 AND account_id = $2 AND object_id = $3",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(object.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+    if busy.is_empty() {
+        return Ok(());
+    }
+    let starts: Vec<OffsetDateTime> = busy.iter().map(|p| p.start).collect();
+    let ends: Vec<OffsetDateTime> = busy.iter().map(|p| p.end).collect();
+    let kinds: Vec<&str> = busy.iter().map(|p| busy_kind_str(p.kind)).collect();
+    sqlx::query(
+        "INSERT INTO dav_busy (tenant_id, account_id, object_id, ord, collection_id, busy_start, busy_end, kind)
+         SELECT $1, $2, $3, (p.ord - 1)::integer, $4, p.busy_start, p.busy_end, p.kind
+         FROM unnest($5::timestamptz[], $6::timestamptz[], $7::text[])
+              WITH ORDINALITY AS p (busy_start, busy_end, kind, ord)",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(object.as_uuid())
+    .bind(collection.as_uuid())
+    .bind(&starts)
+    .bind(&ends)
+    .bind(&kinds)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Счётчик учётной записи и состояние входящих планирования становятся `to`; состояния календарей и адресных книг
+/// не меняются. Строка уже заблокирована [`lock_modseq`].
+async fn advance_inbox(tx: &mut PgConnection, scope: AccountScope, to: ModSeq) -> Result<()> {
+    sqlx::query(
+        "UPDATE mailbox_state SET modseq = $3, dav_inbox_state = $3 WHERE tenant_id = $1 AND account_id = $2",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(arg(to)?)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+#[derive(Debug, FromRow)]
+struct InboxRow {
+    item_id: Uuid,
+    name: String,
+    method: String,
+    uid: String,
+    sender: String,
+    body: String,
+    etag: String,
+    modseq: i64,
+}
+
+impl InboxRow {
+    fn into_item(self) -> Result<InboxItem> {
+        Ok(InboxItem {
+            id: DavObjectId::from_uuid(self.item_id),
+            name: self.name,
+            etag: self.etag,
+            modseq: modseq(self.modseq)?,
+            message: InboxMessage {
+                method: self.method.parse()?,
+                uid: self.uid,
+                from: self.sender,
+                body: self.body,
+            },
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct BusyRow {
+    account_id: Uuid,
+    busy_start: OffsetDateTime,
+    busy_end: OffsetDateTime,
+    kind: String,
 }
 
 /// Граница очищенных надгробий: вида учётной записи или коллекции.
@@ -602,8 +758,8 @@ impl DavStore for PgMeta {
                 sqlx::query(
                     "INSERT INTO dav_collections (tenant_id, account_id, collection_id, kind, name, display_name,
                                                   description, color, sort_order, timezone, components,
-                                                  created_modseq, props_modseq, modseq)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12)",
+                                                  created_modseq, props_modseq, modseq, transparent)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12, $13)",
                 )
                 .bind(scope.tenant.as_uuid())
                 .bind(scope.account.as_uuid())
@@ -617,6 +773,7 @@ impl DavStore for PgMeta {
                 .bind(&collection.timezone)
                 .bind(&components)
                 .bind(arg(ms)?)
+                .bind(collection.transparent)
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -649,7 +806,8 @@ impl DavStore for PgMeta {
                     collection.components.iter().map(|c| c.as_str()).collect();
                 sqlx::query(
                     "UPDATE dav_collections SET display_name = $4, description = $5, color = $6, sort_order = $7,
-                                                timezone = $8, components = $9, props_modseq = $10, modseq = $10
+                                                timezone = $8, components = $9, props_modseq = $10, modseq = $10,
+                                                transparent = $11
                      WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3",
                 )
                 .bind(scope.tenant.as_uuid())
@@ -662,6 +820,7 @@ impl DavStore for PgMeta {
                 .bind(&collection.timezone)
                 .bind(&components)
                 .bind(arg(ms)?)
+                .bind(collection.transparent)
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -834,7 +993,7 @@ impl DavStore for PgMeta {
             async move {
                 let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
                 let rows: Vec<ObjectRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                    "SELECT {OBJECT_COLUMNS} FROM dav_objects
+                    "SELECT {OBJECT_COLUMNS} FROM {OBJECT_FROM}
                      WHERE tenant_id = $1 AND account_id = $2 AND object_id = ANY($3)"
                 )))
                 .bind(scope.tenant.as_uuid())
@@ -972,7 +1131,7 @@ impl DavStore for PgMeta {
                     Some((id, _)) => {
                         sqlx::query(
                             "UPDATE dav_objects SET uid = $4, etag = $5, component = $6, span_start = $7,
-                                                    span_end = $8, body = $9, modseq = $10
+                                                    span_end = $8, body = $9, modseq = $10, schedule_tag = $11
                              WHERE tenant_id = $1 AND account_id = $2 AND object_id = $3",
                         )
                         .bind(scope.tenant.as_uuid())
@@ -985,6 +1144,7 @@ impl DavStore for PgMeta {
                         .bind(end)
                         .bind(body)
                         .bind(arg(ms)?)
+                        .bind(&index.schedule_tag)
                         .execute(&mut *tx)
                         .await
                         .map_err(db_err)?;
@@ -995,8 +1155,8 @@ impl DavStore for PgMeta {
                         sqlx::query(
                             "INSERT INTO dav_objects (tenant_id, account_id, object_id, collection_id, name, uid,
                                                       etag, component, span_start, span_end, body,
-                                                      created_modseq, modseq)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)",
+                                                      created_modseq, modseq, schedule_tag)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13)",
                         )
                         .bind(scope.tenant.as_uuid())
                         .bind(scope.account.as_uuid())
@@ -1010,12 +1170,15 @@ impl DavStore for PgMeta {
                         .bind(end)
                         .bind(body)
                         .bind(arg(ms)?)
+                        .bind(&index.schedule_tag)
                         .execute(&mut *tx)
                         .await
                         .map_err(db_err)?;
                         id
                     }
                 };
+                replace_busy(&mut tx, scope, collection, id, existing.is_some(), &index.busy)
+                    .await?;
                 sqlx::query(
                     "UPDATE dav_collections SET modseq = $4, object_count = object_count + $5
                      WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3",
@@ -1260,6 +1423,224 @@ impl DavStore for PgMeta {
             Ok(s)
         })
         .await
+    }
+
+    async fn inbox_put(
+        &self,
+        scope: AccountScope,
+        name: &str,
+        message: InboxMessage,
+    ) -> Result<Put> {
+        if !valid_name(name) {
+            return Err(Error::invalid(format!(
+                "недопустимое имя ресурса: {name:?}"
+            )));
+        }
+        message.validate()?;
+        let limits = self.limits();
+        if message.body.len() > limits.max_object_size {
+            return Err(Error::QuotaExceeded);
+        }
+        let message = &message;
+        let put = self
+            .once(async move {
+                let db = self.box_db(scope).await?;
+                let mut tx = begin(&db.pool, scope.tenant).await?;
+                if db.shard != ShardId::MAIN {
+                    // Учётная запись есть в каталоге (шард найден), состояния ящика на шарде может ещё не быть.
+                    ensure_state(&mut tx, scope).await?;
+                }
+                let cur = lock_modseq(&mut tx, scope).await?;
+                let (existing, count): (Option<Uuid>, i64) = sqlx::query_as(
+                    "SELECT (SELECT item_id FROM dav_inbox
+                             WHERE tenant_id = $1 AND account_id = $2 AND name = $3),
+                            (SELECT count(*) FROM dav_inbox WHERE tenant_id = $1 AND account_id = $2)",
+                )
+                .bind(scope.tenant.as_uuid())
+                .bind(scope.account.as_uuid())
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                if existing.is_none()
+                    && usize::try_from(count).unwrap_or(usize::MAX) >= limits.max_objects
+                {
+                    return Err(Error::QuotaExceeded);
+                }
+                let ms = cur.next();
+                let etag = ms.to_string();
+                let id = existing.map_or_else(DavObjectId::new, DavObjectId::from_uuid);
+                sqlx::query(
+                    "INSERT INTO dav_inbox AS i (tenant_id, account_id, item_id, name, method, uid, sender, body,
+                                                 etag, modseq)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     ON CONFLICT (tenant_id, account_id, item_id) DO UPDATE
+                     SET method = excluded.method, uid = excluded.uid, sender = excluded.sender,
+                         body = excluded.body, etag = excluded.etag, modseq = excluded.modseq",
+                )
+                .bind(scope.tenant.as_uuid())
+                .bind(scope.account.as_uuid())
+                .bind(id.as_uuid())
+                .bind(name)
+                .bind(message.method.as_str())
+                .bind(&message.uid)
+                .bind(&message.from)
+                .bind(&message.body)
+                .bind(&etag)
+                .bind(arg(ms)?)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                advance_inbox(&mut tx, scope, ms).await?;
+                crate::commits::commit(tx).await?;
+                Ok(Put {
+                    id,
+                    etag,
+                    modseq: ms,
+                    created: existing.is_none(),
+                })
+            })
+            .await?;
+        self.signal(schedule_inbox_changed(scope, put.modseq)).await;
+        Ok(put)
+    }
+
+    async fn inbox_list(&self, scope: AccountScope) -> Result<Inbox> {
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
+            let rows: Vec<InboxRow> = sqlx::query_as(
+                "SELECT item_id, name, method, uid, sender, body, etag, modseq FROM dav_inbox
+                 WHERE tenant_id = $1 AND account_id = $2 ORDER BY modseq",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let state: Option<i64> = sqlx::query_scalar(
+                "SELECT dav_inbox_state FROM mailbox_state WHERE tenant_id = $1 AND account_id = $2",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            crate::commits::commit(tx).await?;
+            Ok(Inbox {
+                items: rows
+                    .into_iter()
+                    .map(InboxRow::into_item)
+                    .collect::<Result<_>>()?,
+                state: modseq(state.unwrap_or(0))?,
+            })
+        })
+        .await
+    }
+
+    async fn inbox_delete(&self, scope: AccountScope, name: &str) -> Result<ModSeq> {
+        let ms = self
+            .once(async move {
+                let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
+                let cur = lock_modseq(&mut tx, scope).await?;
+                let n = sqlx::query(
+                    "DELETE FROM dav_inbox WHERE tenant_id = $1 AND account_id = $2 AND name = $3",
+                )
+                .bind(scope.tenant.as_uuid())
+                .bind(scope.account.as_uuid())
+                .bind(name)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+                if n == 0 {
+                    return Err(Error::NotFound);
+                }
+                let ms = cur.next();
+                advance_inbox(&mut tx, scope, ms).await?;
+                crate::commits::commit(tx).await?;
+                Ok(ms)
+            })
+            .await?;
+        self.signal(schedule_inbox_changed(scope, ms)).await;
+        Ok(ms)
+    }
+}
+
+#[async_trait]
+impl FreeBusy for PgMeta {
+    async fn query(
+        &self,
+        tenant: TenantId,
+        accounts: &[AccountId],
+        range: Period,
+    ) -> Result<Vec<(AccountId, Vec<BusyPeriod>)>> {
+        range.validate()?;
+        let mut order: Vec<AccountId> = Vec::with_capacity(accounts.len());
+        for a in accounts {
+            if !order.contains(a) {
+                order.push(*a);
+            }
+        }
+        if order.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Учётные записи по шардам: на шард — один запрос. Учётной записи нет в каталоге — занятости нет.
+        let mut by_shard: BTreeMap<ShardId, Vec<Uuid>> = BTreeMap::new();
+        for account in &order {
+            match self
+                .shard_of(AccountScope {
+                    tenant,
+                    account: *account,
+                })
+                .await
+            {
+                Ok(shard) => by_shard.entry(shard).or_default().push(*account.as_uuid()),
+                Err(Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut found: HashMap<Uuid, Vec<BusyPeriod>> = HashMap::new();
+        for (shard, ids) in by_shard {
+            let ids = &ids;
+            let rows: Vec<BusyRow> = self
+                .idempotent(|| async move {
+                    let mut tx = begin(&self.read_pool(shard).await?, tenant).await?;
+                    let rows = sqlx::query_as(
+                        "SELECT b.account_id, b.busy_start, b.busy_end, b.kind
+                         FROM dav_busy b JOIN dav_collections c USING (tenant_id, account_id, collection_id)
+                         WHERE b.tenant_id = $1 AND b.account_id = ANY($2)
+                           AND b.busy_end > $3 AND b.busy_start < $4
+                           AND c.kind = 'calendar' AND NOT c.transparent",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(ids)
+                    .bind(range.start)
+                    .bind(range.end)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    crate::commits::commit(tx).await?;
+                    Ok(rows)
+                })
+                .await?;
+            for r in rows {
+                let p = BusyPeriod {
+                    start: r.busy_start,
+                    end: r.busy_end,
+                    kind: parse_busy_kind(&r.kind)?,
+                };
+                if let Some(p) = p.clip(&range) {
+                    found.entry(r.account_id).or_default().push(p);
+                }
+            }
+        }
+        Ok(order
+            .into_iter()
+            .map(|a| {
+                let periods = found.remove(a.as_uuid()).unwrap_or_default();
+                (a, merge_busy(periods))
+            })
+            .collect())
     }
 }
 
