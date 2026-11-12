@@ -894,6 +894,80 @@ mod group_sync {
         );
     }
 
+    /// Приёмка CTR-32: участник-учётная запись — по идентификатору каталога; переименование входа не теряет
+    /// членство. Имя входа — только для учётной записи без `external_id`.
+    #[tokio::test]
+    async fn login_rename_keeps_membership() {
+        use tp_contracts::meta::{AccountStore, AccountUpsert};
+        use tp_testkit::MemMetadata;
+
+        const ALICE_ID: &str = "00000000-0000-0000-0000-0000000000a1";
+        let fake = Fake::new(include_str!("openldap.ldif"));
+        let dir = LdapDirectory::with_source(T, openldap_cfg(), fake.clone());
+        let meta = MemMetadata::new(Arc::new(SystemClock));
+        let domain = tp_contracts::DomainId::new();
+        let upsert = |login: &str, external_id: Option<&str>| AccountUpsert {
+            domain,
+            login: login.to_owned(),
+            display_name: login.to_owned(),
+            external_id: external_id.map(str::to_owned),
+            enabled: true,
+        };
+        let alice = meta
+            .upsert(T, upsert("alice@example.org", Some(ALICE_ID)))
+            .await
+            .expect("alice")
+            .id;
+        // carol заведена до синхронизации каталога (без `external_id`) — сопоставляется по имени входа.
+        let carol = meta
+            .upsert(T, upsert("carol@example.org", None))
+            .await
+            .expect("carol")
+            .id;
+        let groups = MemGroups::new();
+        let sync = GroupSync::new(dir, Arc::new(meta.clone()), Arc::new(groups.clone()));
+        let full = sync.run(None).await.expect("full");
+        assert_eq!(
+            group(&groups, DEVS).await.members,
+            sorted(vec![
+                GroupMember::Account(alice),
+                GroupMember::Account(carol)
+            ])
+        );
+
+        // Вход alice переименован в каталоге и в метаданных (синхронизация учётных записей — по `external_id`).
+        fake.set_all(ALICE_DN, "mail", &["liddell@example.org"]);
+        meta.upsert(T, upsert("liddell@example.org", Some(ALICE_ID)))
+            .await
+            .expect("rename");
+        fake.set(DEVS_DN, "modifyTimestamp", "20261005000000Z");
+        let inc = sync.run(Some(&full.cursor)).await.expect("incremental");
+        assert_eq!(inc.upserted, 1);
+        assert_eq!(
+            group(&groups, DEVS).await.members,
+            sorted(vec![
+                GroupMember::Account(alice),
+                GroupMember::Account(carol)
+            ])
+        );
+
+        // Запись каталога с тем же именем входа, но другим идентификатором — другой человек: учётная запись
+        // alice (со своим `external_id`) по имени входа не сопоставляется.
+        let devs = group(&groups, DEVS).await;
+        fake.set_all(
+            ALICE_DN,
+            "entryUUID",
+            &["00000000-0000-0000-0000-0000000000ff"],
+        );
+        fake.set(DEVS_DN, "modifyTimestamp", "20261006000000Z");
+        sync.run(Some(&inc.cursor)).await.expect("incremental");
+        assert_eq!(
+            group(&groups, DEVS).await.members,
+            [GroupMember::Account(carol)]
+        );
+        assert_eq!(group(&groups, DEVS).await.id, devs.id);
+    }
+
     #[tokio::test]
     async fn restrictions_moderators_and_hiding_from_directory() {
         let flag = |attribute: &str| {
