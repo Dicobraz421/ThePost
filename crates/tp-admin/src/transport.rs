@@ -19,6 +19,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tp_contracts::meta::PolicyTarget;
 use tp_contracts::transport::{
     AcceptedDomain, ClusterTransport, DestinationPolicy, DomainKind, SourceKind, SourceMatch,
     TlsRequirement, TransportStore, TrustedSource, normalize_domain,
@@ -26,7 +27,7 @@ use tp_contracts::transport::{
 use tp_contracts::{DomainId, Error, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::accounts::{Policies, PolicyBody, PolicyTarget, policies};
+use crate::accounts::{Policies, PolicyBody, policies};
 use crate::server::{Admin, ApiResult, Problem};
 
 /// Префикс маршрутов уровня кластера (только администратор инсталляции, [`crate::AdminRole::permits`]).
