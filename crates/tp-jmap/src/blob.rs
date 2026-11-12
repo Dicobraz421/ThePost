@@ -40,6 +40,8 @@ pub(crate) enum BlobRef {
     Part(MessageId, String),
     /// Загруженный файл.
     Upload(BlobKey),
+    /// Текст скрипта Sieve (`S<id скрипта>_<отпечаток текста>`, JMAP-24).
+    Script(String),
 }
 
 /// Учёт загрузок: какой учётной записи какой объект доступен и до какого момента.
@@ -92,6 +94,9 @@ pub(crate) fn parse_id(tenant: TenantId, id: &str) -> Option<BlobRef> {
             Some((m, path)) => BlobRef::Part(MessageId::from_str(m).ok()?, path.replace('_', ".")),
             None => BlobRef::Message(MessageId::from_str(rest).ok()?),
         });
+    }
+    if let Some(rest) = id.strip_prefix('S') {
+        return Some(BlobRef::Script(rest.to_owned()));
     }
     let (hash, generation) = id.strip_prefix('U')?.split_once('_')?;
     Some(BlobRef::Upload(BlobKey {
@@ -177,6 +182,10 @@ impl Jmap {
                 let data = Bytes::from(decode_transfer(bp, raw));
                 Ok(Some(stream::once(async move { Ok(data) }).boxed()))
             }
+            Some(BlobRef::Script(rest)) => Ok(self.script_blob(scope, &rest).await?.map(|text| {
+                let data = Bytes::from(text);
+                stream::once(async move { Ok(data) }).boxed()
+            })),
             Some(BlobRef::Upload(key)) if !self.uploaded.owns(scope, &key) => Ok(None),
             Some(BlobRef::Upload(key)) => match d.blob_index.compression(&key).await? {
                 None => Ok(None),
@@ -219,6 +228,7 @@ impl Jmap {
             Some(BlobRef::Upload(key)) => {
                 self.uploaded.owns(scope, &key) && d.blob_index.exists(&key).await?
             }
+            Some(BlobRef::Script(rest)) => self.script_blob(scope, &rest).await?.is_some(),
         })
     }
 
@@ -235,7 +245,7 @@ impl Jmap {
     pub(crate) async fn put_object(&self, tenant: TenantId, data: Bytes) -> Result<BlobKey> {
         let d = &self.d;
         let hash = BlobHash(Sha256::digest(&data).into());
-        let generation = match d.blob_index.acquire(tenant, &hash, 1).await? {
+        let generation = match d.blob_index.acquire(tenant, None, &hash, 1).await? {
             Acquire::Existing { generation } => generation,
             Acquire::Absent { generation } => {
                 let mut generation = generation;

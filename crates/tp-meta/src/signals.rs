@@ -18,7 +18,9 @@
 //! остановке шины, `drop` потока удаляет подписку.
 //!
 //! Метрики — [`PgSignalBus::metrics`]: задержка сигнала (от постановки в очередь до приёма слушателем, по
-//! часам узлов), размер пачек, время NOTIFY.
+//! часам узлов), размер пачек, время NOTIFY; для критериев Д.7 (META-53) — гистограммы времени фиксаций с NOTIFY
+//! и всех фиксаций процесса ([`crate::commits`]), их доля ([`SignalMetrics::notify_commit_share`]) и число
+//! соединений-слушателей узла ([`SignalMetrics::listeners`]; по кластеру — сумма по узлам).
 //!
 //! Шарды (META-31, решение 2026-11-01-scale-shards-geo-admin): сигнал шарда разделяет судьбу его данных —
 //! [`ShardedSignalBus`] держит шину [`PgSignalBus`] на primary каждого шарда справочника (слушатель и
@@ -50,6 +52,7 @@ use tp_contracts::meta::AccountScope;
 use tp_contracts::secrets::SecretStore;
 use tp_contracts::{AccountId, Error, Result, TenantId};
 
+use crate::commits::{Histogram, Recorder, commit_metrics, observe_commit};
 use crate::failover::{Failover, connect_failover};
 use crate::pool::PoolConfig;
 use crate::schema::db_err;
@@ -160,6 +163,49 @@ pub struct SignalMetrics {
     pub overflows: u64,
     /// Переподключений слушателя.
     pub reconnects: u64,
+    /// Время фиксаций с NOTIFY (отправок публикатора; команда с неявной фиксацией) — гистограмма.
+    pub notify_commit: Histogram,
+    /// Время всех фиксаций процесса на primary, включая NOTIFY ([`commit_metrics`]) — гистограмма.
+    pub commit: Histogram,
+    /// Соединений-слушателей узла сейчас (по одному на шину с подключённым слушателем).
+    pub listeners: u64,
+}
+
+impl SignalMetrics {
+    /// Доля времени фиксации, занятая NOTIFY (критерий Д.7 — не больше 0,05): сумма `notify_commit` к сумме
+    /// `commit`; `None` — фиксаций ещё не было.
+    pub fn notify_commit_share(&self) -> Option<f64> {
+        let total = self.commit.sum.as_secs_f64();
+        (total > 0.0).then(|| (self.notify_commit.sum.as_secs_f64() / total).min(1.0))
+    }
+
+    /// Сумма снимков шин (шарды): счётчики и суммы складываются, `*_max` — наибольшее, `*_last` — наибольшее
+    /// из последних; `commit` — общая для процесса, не складывается.
+    #[must_use]
+    pub fn merged(self, o: &Self) -> Self {
+        Self {
+            published: self.published + o.published,
+            coalesced: self.coalesced + o.coalesced,
+            dropped: self.dropped + o.dropped,
+            batches: self.batches + o.batches,
+            batched: self.batched + o.batched,
+            batch_max: self.batch_max.max(o.batch_max),
+            publish_errors: self.publish_errors + o.publish_errors,
+            notify_last: self.notify_last.max(o.notify_last),
+            notify_total: self.notify_total.saturating_add(o.notify_total),
+            notify_max: self.notify_max.max(o.notify_max),
+            received: self.received + o.received,
+            latency_last: self.latency_last.max(o.latency_last),
+            latency_total: self.latency_total.saturating_add(o.latency_total),
+            latency_max: self.latency_max.max(o.latency_max),
+            latency_count: self.latency_count + o.latency_count,
+            overflows: self.overflows + o.overflows,
+            reconnects: self.reconnects + o.reconnects,
+            notify_commit: self.notify_commit.merged(&o.notify_commit),
+            commit: o.commit,
+            listeners: self.listeners + o.listeners,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -181,6 +227,7 @@ struct Counters {
     latency_count: AtomicU64,
     overflows: AtomicU64,
     reconnects: AtomicU64,
+    notify_commit: Recorder,
 }
 
 fn micros(d: Duration) -> u64 {
@@ -499,6 +546,8 @@ impl Shared {
         c.notify_last_us.store(us, Ordering::Relaxed);
         add(&c.notify_total_us, us);
         c.notify_max_us.fetch_max(us, Ordering::Relaxed);
+        c.notify_commit.observe(took);
+        observe_commit(took);
     }
 
     /// Принятое сообщение NOTIFY: сверка (если отмечена) и раздача подписчикам.
@@ -695,6 +744,9 @@ impl PgSignalBus {
             latency_count: g(&c.latency_count),
             overflows: g(&c.overflows),
             reconnects: g(&c.reconnects),
+            notify_commit: c.notify_commit.snapshot(),
+            commit: commit_metrics(),
+            listeners: u64::from(self.connected()),
         }
     }
 }
@@ -777,6 +829,13 @@ impl ShardedSignalBus {
     /// Шарды с подключённой шиной по возрастанию.
     pub fn shards(&self) -> Vec<ShardId> {
         lock(&self.buses).keys().copied().collect()
+    }
+
+    /// Снимок метрик по шинам всех шардов ([`SignalMetrics::merged`]); `listeners` — соединений-слушателей узла.
+    pub fn metrics(&self) -> SignalMetrics {
+        self.all()
+            .iter()
+            .fold(SignalMetrics::default(), |m, b| m.merged(&b.metrics()))
     }
 
     /// Шина шарда; не подключённого — основной БД.

@@ -97,7 +97,7 @@ impl AclStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         rows.into_iter()
             .map(|(identifier, rights)| {
                 Ok(AclEntry {
@@ -150,7 +150,7 @@ impl AclStore for PgMeta {
             .await
             .map_err(db_err)?;
             }
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(())
         })
         .await
@@ -178,7 +178,7 @@ impl AclStore for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             effective(rows)
         })
         .await
@@ -212,7 +212,7 @@ impl AclStore for PgMeta {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(db_err)?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 rows.extend(part);
             }
             // Порядок шарда — по папке; ящики разных шардов не пересекаются.
@@ -258,7 +258,7 @@ impl AclStore for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             rows.into_iter()
                 .map(|(delegate, kind)| {
                     Ok(SendDelegation {
@@ -322,7 +322,7 @@ impl AclStore for PgMeta {
                 .map_err(db_err)?;
             }
         }
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(())
 }).await
     }
@@ -347,7 +347,7 @@ impl AclStore for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             let rights = kinds
                 .iter()
                 .map(|k| parse_kind(k))

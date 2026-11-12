@@ -221,7 +221,7 @@ impl PgMeta {
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         row.map_or(Ok(Policy::default()), PolicyRow::into_policy)
 }).await
     }
@@ -274,7 +274,7 @@ impl PgMeta {
             .await
             .map_err(db_err)?;
         }
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(())
 }).await
     }
@@ -301,7 +301,7 @@ impl PgMeta {
             .fetch_one(&mut *tx)
             .await
             .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         us.map(from_micros)
             .transpose()
             .map(|d| d.unwrap_or(default))
@@ -321,7 +321,7 @@ impl PolicyResolver for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.pool, tenant).await?;
             let p = resolve_in(&mut tx, tenant, domain, account, mailbox).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(p)
         })
         .await
@@ -341,7 +341,7 @@ impl PolicyResolver for PgMeta {
         .map_err(db_err)?;
             let (domain, user) = row.ok_or(Error::NotFound)?;
             let rule = account_rule(&mut tx, scope, domain).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(TrashPurgeSetting {
                 rule,
                 user: user.as_deref().map(parse_purge).transpose()?,
@@ -378,7 +378,7 @@ impl PolicyResolver for PgMeta {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(())
         })
         .await
@@ -477,7 +477,7 @@ async fn trash_page(
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
     rows.into_iter().map(TrashItem::try_from).collect()
 }).await
 }
@@ -524,7 +524,7 @@ impl PgMeta {
             };
             let (hide, erase) = (keep(hide), keep(erase));
             if hide.is_empty() && erase.is_empty() {
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 return Ok(PurgeOutcome {
                     hidden: Vec::new(),
                     erased: Vec::new(),
@@ -586,7 +586,7 @@ impl PgMeta {
             );
             changelog::log(&mut tx, scope, ms, &changes).await?;
             changelog::append_events(&mut tx, self.cfg.event_partitions, &events).await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             self.signal_log([scope.account]).await;
             // Что-то скрыто или стёрто: таймер истечения корзины пересчитывает ближайший срок.
             self.signal(trash_changed(scope)).await;
@@ -625,7 +625,7 @@ impl PgMeta {
         .await
         .map_err(db_err)?;
         let Some((target,)) = target else {
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             return Ok(None);
         };
         let trash = by_role(&mut tx, scope, SpecialUse::Trash)
@@ -668,7 +668,7 @@ impl PgMeta {
             },
         );
         changelog::append_events(&mut tx, self.cfg.event_partitions, &[ev]).await?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         self.signal_log([scope.account]).await;
         Ok(Some(Restored::Message {
             mailbox: to,
@@ -725,7 +725,7 @@ impl TrashStore for PgMeta {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         // Точки принятия решений — вне транзакции БД.
         let (mut hide, mut erase) = (Vec::new(), Vec::new());
         for r in rows {
@@ -773,7 +773,7 @@ impl TrashStore for PgMeta {
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(Restored::Message {
             mailbox: MailboxId::from_uuid(mailbox.ok_or(Error::NotFound)?),
             inserted,
@@ -797,7 +797,7 @@ impl TrashStore for PgMeta {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(db_err)?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 rows.extend(part);
             }
             rows.sort_by_key(|r| (r.trash_expires_at, r.tenant_id, r.account_id, r.message_id));
@@ -828,7 +828,7 @@ impl TrashStore for PgMeta {
         .await
         .map_err(db_err)?
         .rows_affected();
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         if n == 1 { Ok(()) } else { Err(Error::NotFound) }
 }).await
     }
@@ -869,7 +869,7 @@ impl Quota for PgMeta {
                 None,
             )
             .await?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(QuotaUsage {
                 used_bytes: to_u64(used)?,
                 messages: to_u64(messages)?,
@@ -901,7 +901,7 @@ impl PgMeta {
             None,
         )
         .await?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         let (used, messages) = box_usage(&db.pool, scope).await?;
         Ok(QuotaUsage {
             used_bytes: used,
@@ -923,7 +923,7 @@ pub(crate) async fn box_usage(pool: &sqlx::PgPool, scope: AccountScope) -> Resul
     .fetch_one(&mut *tx)
     .await
     .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
     Ok((to_u64(used)?, to_u64(messages)?))
 }
 

@@ -3,6 +3,7 @@
 
 pub mod acme;
 pub mod config;
+pub mod dbmetrics;
 pub mod fswatch;
 pub mod listen;
 pub mod load;
@@ -18,6 +19,7 @@ pub mod tls;
 
 pub use acme::{Acme, AcmeConfig, Http01Challenges};
 pub use config::{CheckMode, Config, Section, SectionRegistry};
+pub use dbmetrics::{DbMetrics, ListenerSample, PoolMeter, PoolSample, listener_application_name};
 pub use fswatch::{FsEvents, FsWatch, NoFsEvents, NotifyFsEvents};
 pub use listen::{Cidr, Conn, ConnInfo, EndpointConfig, Listener};
 pub use load::{LoadConfig, LoadInputs, NodeLoad, background_allowed};

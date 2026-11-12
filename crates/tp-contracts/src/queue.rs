@@ -11,7 +11,8 @@
 //! # Тело письма
 //!
 //! Вызывающий загружает письмо одним объектом и учитывает одну ссылку на него в `BlobIndex` до `enqueue`
-//! (ошибка `enqueue` — освободить ссылку). Когда все получатели в конечном статусе, [`QueueStore::complete`]
+//! (ошибка `enqueue` — освободить ссылку); учётная запись отправителя — одна и та же в `BlobIndex::acquire` и
+//! [`QueueStore::enqueue`] (CTR-49: шард). Когда все получатели в конечном статусе, [`QueueStore::complete`]
 //! возвращает `true`: запись удалена, вызывающий освобождает ссылку (`BlobIndex::release`) отдельной транзакцией.
 //!
 //! # Постановка письма
@@ -29,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
-use crate::ids::{BlobKey, QueueId, TenantId};
+use crate::ids::{AccountId, BlobKey, QueueId, TenantId};
 
 /// Что вернуть в уведомлении о недоставке (ESMTP `RET`, RFC 3461).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -179,7 +180,12 @@ pub struct Claimed {
 pub trait QueueStore: Send + Sync + 'static {
     /// Ставит письмо в очередь; все получатели ждут попытки с `next_attempt`.
     /// Пустой список или повтор адреса получателя — `Error::Invalid`.
-    async fn enqueue(&self, msg: OutMessage) -> Result<QueueId>;
+    ///
+    /// `owner` — учётная запись отправителя организации `msg.tenant` (CTR-49, решение 46): хранилище с шардами
+    /// ставит запись на шард её ящика, рядом с «Отправленными»; `None` — отправителя-учётной записи нет (DSN,
+    /// пересылка, письмо модуля) — шард по выбору хранилища. Хранилище без шардов `owner` не использует;
+    /// существование учётной записи не проверяется.
+    async fn enqueue(&self, owner: Option<AccountId>, msg: OutMessage) -> Result<QueueId>;
 
     /// Захватывает до `limit` записей, у которых есть получатели без конечного статуса со сроком попытки
     /// не позже `now` и нет действующей лизы; лиза — до `now + lease`, номер захвата увеличивается.

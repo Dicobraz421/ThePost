@@ -48,7 +48,7 @@ async fn generations_protocol() {
     };
 
     assert_eq!(
-        idx.acquire(tenant, &hash, 2).await.expect("acquire"),
+        idx.acquire(tenant, None, &hash, 2).await.expect("acquire"),
         Acquire::Absent {
             generation: Gen::INITIAL
         }
@@ -60,7 +60,7 @@ async fn generations_protocol() {
         Commit::Done { generation: Gen(0) }
     );
     assert_eq!(
-        idx.acquire(tenant, &hash, 1).await.expect("acquire"),
+        idx.acquire(tenant, None, &hash, 1).await.expect("acquire"),
         Acquire::Existing { generation: Gen(0) }
     );
     // Параллельная загрузка того же объекта: ссылки добавляются к существующей записи.
@@ -89,7 +89,7 @@ async fn generations_protocol() {
         Err(Error::NotFound)
     );
     assert!(matches!(
-        idx.acquire(tenant, &hash, 0).await,
+        idx.acquire(tenant, None, &hash, 0).await,
         Err(Error::Invalid(_))
     ));
 
@@ -111,7 +111,7 @@ async fn generations_protocol() {
 
     // Запись deleting: новая загрузка — следующим поколением.
     assert_eq!(
-        idx.acquire(tenant, &hash, 1).await.expect("acquire"),
+        idx.acquire(tenant, None, &hash, 1).await.expect("acquire"),
         Acquire::Absent { generation: Gen(1) }
     );
     assert_eq!(
@@ -187,7 +187,7 @@ async fn finalize_checks_generation_and_tombstone_expires() {
     tokio::time::sleep(ttl + Duration::from_millis(100)).await;
     idx.gc_candidates(future(), 100_000).await.expect("gc");
     assert_eq!(
-        idx.acquire(tenant, &hash, 1).await.expect("acquire"),
+        idx.acquire(tenant, None, &hash, 1).await.expect("acquire"),
         Acquire::Absent {
             generation: Gen::INITIAL
         }
@@ -245,7 +245,7 @@ async fn concurrent_acquire_release_gc_keeps_references() {
         let (idx, store) = (idx.clone(), store.clone());
         writers.push(tokio::spawn(async move {
             for _ in 0..ROUNDS {
-                let held = match idx.acquire(tenant, &hash, 1).await.expect("acquire") {
+                let held = match idx.acquire(tenant, None, &hash, 1).await.expect("acquire") {
                     Acquire::Existing { generation } => generation,
                     Acquire::Absent { mut generation } => loop {
                         store.lock().expect("lock").insert(generation.0);
@@ -301,7 +301,8 @@ async fn verify_pages_live_records_and_marks_damaged() {
     let mut keys = Vec::new();
     for i in 0..6u8 {
         let hash = random_hash();
-        let Acquire::Absent { generation } = idx.acquire(tenant, &hash, 1).await.expect("acquire")
+        let Acquire::Absent { generation } =
+            idx.acquire(tenant, None, &hash, 1).await.expect("acquire")
         else {
             panic!("новый хэш");
         };
@@ -470,7 +471,7 @@ async fn compression_migration_keeps_existing_rows() {
     assert_eq!(page[0].compression, Compression::None);
     // Существующая запись не меняет признак при новых ссылках; после надгробия — новая запись со сжатием.
     assert!(matches!(
-        idx.acquire(t, &live, 1).await,
+        idx.acquire(t, None, &live, 1).await,
         Ok(Acquire::Existing { generation: Gen(3) })
     ));
     assert_eq!(

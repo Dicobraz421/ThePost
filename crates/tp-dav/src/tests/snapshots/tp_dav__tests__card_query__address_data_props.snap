@@ -1,0 +1,38 @@
+---
+source: crates/tp-dav/src/tests/card_query.rs
+expression: r.show()
+---
+207 Multi-Status
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/contacts/ivan.vcf</d:href>
+<d:propstat>
+<d:prop>
+<card:address-data>BEGIN:VCARD&#13;
+VERSION:3.0&#13;
+UID:c-ivan&#13;
+FN;CHARSET=UTF-8:Иван Петров&#13;
+EMAIL;TYPE=INTERNET,WORK:ivan.petrov@example.org&#13;
+EMAIL;TYPE=INTERNET,HOME:vanya@mail.example&#13;
+END:VCARD&#13;
+</card:address-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+<d:response>
+<d:href>/dav/addressbooks/ivan@example.org/contacts/nomail.vcf</d:href>
+<d:propstat>
+<d:prop>
+<card:address-data>BEGIN:VCARD&#13;
+VERSION:3.0&#13;
+UID:c-nomail&#13;
+FN;CHARSET=UTF-8:Склад&#13;
+END:VCARD&#13;
+</card:address-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+</d:multistatus>

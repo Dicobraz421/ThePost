@@ -2,12 +2,12 @@
 //!
 //! Приложение регистрирует секции полос (`database`, `meta`) и свои: `blob` — хранилище BLOB (локальный каталог
 //! или S3), `bus` — шина уведомлений (в процессе), `cluster` — имя узла и опросы, `doctor` — пороги
-//! проверок окружения. Проверки открытых каналов подключаются через [`SectionRegistry::add_check`]: `thepost config
+//! проверок окружения, `startup` — ожидание хранилища секретов при запуске. Проверки открытых каналов подключаются через [`SectionRegistry::add_check`]: `thepost config
 //! check` (строгий режим) и запуск (мягкий режим) отвергают адрес без TLS вне профиля dev.
 //!
 //! Подсекции `blob.local` и `blob.s3` — секции крейта `tp-blob` как есть (BLOB-11): приложение подставляет только каталог, бакет и префикс из `blob.url`.
 //!
-//! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `imap`, `jmap`, `search`, `mailstore`; `admin` — секция
+//! Секции ролей (APP-04) — секции крейтов как есть: `smtp`, `sieve`, `imap`, `jmap`, `search`, `mailstore`; `admin` — секция
 //! `tp-admin` без `listen` (адрес Admin API — один ключ `http.admin.listen`, APP-16); приложение добавляет `auth`
 //! (каталог, OIDC, пароли приложений, Kerberos) и `http` (слушатели jmap и admin).
 
@@ -37,6 +37,8 @@ pub const BUS: &str = "bus";
 pub const CLUSTER: &str = "cluster";
 /// Имя секции порогов `thepost doctor`.
 pub const DOCTOR: &str = "doctor";
+/// Имя секции запуска узла.
+pub const STARTUP: &str = "startup";
 /// Имя секции `thepost verify`.
 pub const VERIFY: &str = "verify";
 /// Имя секции SMTP (`tp-smtp`).
@@ -45,12 +47,16 @@ pub const SMTP: &str = "smtp";
 pub const IMAP: &str = "imap";
 /// Имя секции JMAP (`tp-jmap`).
 pub const JMAP: &str = "jmap";
+/// Имя секции правил Sieve и автоответа (`tp-sieve`).
+pub const SIEVE: &str = "sieve";
 /// Имя секции поиска (`tp-search`).
 pub const SEARCH: &str = "search";
 /// Имя секции Admin API (`tp-admin`).
 pub const ADMIN: &str = "admin";
 /// Имя секции почтового хранилища (`tp-mailstore`).
 pub const MAILSTORE: &str = "mailstore";
+/// Имя секции роли maintenance.
+pub const MAINTENANCE: &str = "maintenance";
 /// Имя секции входа: каталог, OIDC, пароли приложений, Kerberos.
 pub const AUTH: &str = "auth";
 /// Имя секции слушателей HTTP ролей jmap и admin.
@@ -71,7 +77,10 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
     r.add_section::<ClusterSection>(CLUSTER)?;
     r.add_section::<DoctorSection>(DOCTOR)?;
     r.add_section::<VerifySection>(VERIFY)?;
+    r.add_section::<StartupSection>(STARTUP)?;
+    r.add_section::<MaintenanceSection>(MAINTENANCE)?;
     r.add_section::<tp_smtp::SmtpConfig>(SMTP)?;
+    r.add_section::<tp_sieve::SieveConfig>(SIEVE)?;
     r.add_section::<tp_imap::ImapConfig>(IMAP)?;
     r.add_section::<tp_jmap::JmapConfig>(JMAP)?;
     r.add_section::<tp_search::SearchConfig>(SEARCH)?;
@@ -83,6 +92,8 @@ pub fn registry_of(builtin: &[modules::Builtin]) -> Result<SectionRegistry> {
         pool_config(c, profile).check().map(drop)
     })?;
     r.add_check::<BlobSection>(BLOB, BlobSection::check)?;
+    r.add_check::<StartupSection>(STARTUP, |c, _| c.check())?;
+    r.add_check::<MaintenanceSection>(MAINTENANCE, |c, _| c.check())?;
     r.add_check::<ClusterSection>(CLUSTER, |c, _| c.check())?;
     r.add_check::<AdminSection>(ADMIN, |c, _| c.0.check())?;
     r.add_check::<AuthSection>(AUTH, AuthSection::check)?;
@@ -641,6 +652,90 @@ impl Default for VerifySection {
     }
 }
 
+// ---------- startup ----------
+
+/// Секция `startup`: ожидание внешних служб при запуске узла (APP-31, решение 2026-11-11 п. 58).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct StartupSection {
+    /// Сколько узел ждёт хранилище секретов (OpenBao) при запуске, повторяя вход и чтение секретов (`120s`);
+    /// `0s` — без повторов: первая неудача завершает запуск.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub secrets_timeout: Duration,
+    /// Пауза перед первым повтором (`1s`); дальше удваивается.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub secrets_retry_initial: Duration,
+    /// Наибольшая пауза между повторами (`15s`).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub secrets_retry_max: Duration,
+}
+
+impl Default for StartupSection {
+    fn default() -> Self {
+        Self {
+            secrets_timeout: Duration::from_secs(120),
+            secrets_retry_initial: Duration::from_secs(1),
+            secrets_retry_max: Duration::from_secs(15),
+        }
+    }
+}
+
+impl StartupSection {
+    /// Паузы положительны, наибольшая — не меньше первой.
+    pub fn check(&self) -> Result<()> {
+        if self.secrets_retry_initial.is_zero()
+            || self.secrets_retry_max < self.secrets_retry_initial
+        {
+            return Err(Error::invalid(
+                "startup: secrets_retry_initial must be positive and not exceed secrets_retry_max",
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ---------- maintenance ----------
+
+/// Секция `maintenance`: задания роли maintenance, у которых нет своей секции крейта (APP-32, решение 2026-11-11
+/// п. 65). Сроки хранения — в `meta` (`meta.dav.tombstone_ttl`, `meta.sieve.vacation_log_ttl`).
+///
+/// ```yaml
+/// maintenance:
+///   purge_interval: 1h
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintenanceSection {
+    /// Период очистки по сроку надгробий DAV и журнала автоответов (`1h`); первый проход — при запуске роли.
+    /// Требует перезапуска.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub purge_interval: Duration,
+}
+
+impl Default for MaintenanceSection {
+    fn default() -> Self {
+        Self {
+            purge_interval: Duration::from_secs(3600),
+        }
+    }
+}
+
+impl MaintenanceSection {
+    /// Период положителен.
+    pub fn check(&self) -> Result<()> {
+        if self.purge_interval.is_zero() {
+            return Err(Error::invalid(
+                "maintenance: purge_interval must be positive",
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ---------- doctor ----------
 
 /// Секция `doctor`: пороги проверок окружения `thepost doctor` (проверки СУБД — `meta.doctor`).
@@ -956,6 +1051,28 @@ blob:
         assert!(e.contains("events_poll_interval"), "{e}");
     }
 
+    /// APP-32: период очистки роли maintenance — `1h` по умолчанию, из config.yaml, нулевой — ошибка.
+    #[test]
+    fn maintenance_purge_interval() {
+        let c = parse(MINIMAL_DEV).expect("config");
+        let m = c
+            .section::<MaintenanceSection>(MAINTENANCE)
+            .expect("section");
+        assert_eq!(m.purge_interval, Duration::from_secs(3600));
+        let c = parse(&format!(
+            "{MINIMAL_DEV}maintenance:\n  purge_interval: 10m\n"
+        ))
+        .expect("config");
+        let m = c
+            .section::<MaintenanceSection>(MAINTENANCE)
+            .expect("section");
+        assert_eq!(m.purge_interval, Duration::from_secs(600));
+        let e = err(parse(&format!(
+            "{MINIMAL_DEV}maintenance:\n  purge_interval: 0s\n"
+        )));
+        assert!(e.contains("purge_interval"), "{e}");
+    }
+
     /// APP-08: шина — в процессе (по умолчанию) или PostgreSQL LISTEN/NOTIFY; Valkey — ошибка строгой проверки.
     #[test]
     fn bus_kinds() {
@@ -1011,8 +1128,10 @@ blob:
             "\"meta\"",
             "\"doctor\"",
             "\"verify\"",
+            "\"startup\"",
             "\"secrets\"",
             "\"smtp\"",
+            "\"sieve\"",
             "\"imap\"",
             "\"jmap\"",
             "\"search\"",

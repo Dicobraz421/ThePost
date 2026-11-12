@@ -13,9 +13,12 @@ workspace = true
 [dependencies]
 tp-contracts.workspace = true
 tp-mailstore.workspace = true
+tp-dav.workspace = true
+tp-sieve.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
+calcard.workspace = true
 cms.workspace = true
 futures.workspace = true
 mail-builder.workspace = true

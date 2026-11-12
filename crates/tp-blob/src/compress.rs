@@ -648,8 +648,14 @@ mod tests {
 
     #[async_trait]
     impl BlobIndex for Plain {
-        async fn acquire(&self, t: TenantId, h: &BlobHash, refs: u32) -> Result<Acquire> {
-            self.0.acquire(t, h, refs).await
+        async fn acquire(
+            &self,
+            t: TenantId,
+            o: Option<tp_contracts::AccountId>,
+            h: &BlobHash,
+            refs: u32,
+        ) -> Result<Acquire> {
+            self.0.acquire(t, o, h, refs).await
         }
         async fn commit_new(
             &self,

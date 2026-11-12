@@ -29,7 +29,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tp_blob::{BlobWriter, GcConfig, GcWorker, Now, OrphanConfig, OrphanSweeper, WriterConfig};
 use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, ByteStream, Commit, ObjectStream};
-use tp_contracts::{BlobHash, BlobKey, Gen, Result, TenantId};
+use tp_contracts::{AccountId, BlobHash, BlobKey, Gen, Result, TenantId};
 use tp_testkit::blob::{BlobState, MemBlobIndex, MemBlobStore};
 use tp_testkit::{Clock, ManualClock};
 
@@ -75,9 +75,15 @@ struct GatedIndex {
 
 #[async_trait]
 impl BlobIndex for GatedIndex {
-    async fn acquire(&self, t: TenantId, h: &BlobHash, refs: u32) -> Result<Acquire> {
+    async fn acquire(
+        &self,
+        t: TenantId,
+        o: Option<AccountId>,
+        h: &BlobHash,
+        refs: u32,
+    ) -> Result<Acquire> {
         self.gate.pass().await;
-        self.inner.acquire(t, h, refs).await
+        self.inner.acquire(t, o, h, refs).await
     }
     async fn commit_new(
         &self,

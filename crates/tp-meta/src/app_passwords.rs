@@ -47,7 +47,7 @@ impl AppPasswordStore for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(rows.into_iter().map(AppPassword::from).collect())
         })
         .await
@@ -82,7 +82,7 @@ impl AppPasswordStore for PgMeta {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(())
 }).await
     }
@@ -102,7 +102,7 @@ impl AppPasswordStore for PgMeta {
             .await
             .map_err(db_err)?
             .rows_affected();
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             if updated == 0 {
                 return Err(Error::NotFound);
             }

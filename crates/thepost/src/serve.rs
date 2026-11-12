@@ -48,7 +48,7 @@ use crate::modules;
 use crate::protocols::{
     Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, LogPause, SmtpRole, Sockets,
 };
-use crate::roles::{Maintenance, PendingRole};
+use crate::roles::{Maintenance, PendingRole, Purge};
 use crate::secrets;
 use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection, HttpSection};
 use crate::services::{Base, Services};
@@ -125,6 +125,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         .map_err(|_| Error::internal("чтение конфигурации прервано"))??;
     let cfg = reloader.current();
     let store = secrets::store(&cfg, opts.secrets).await?;
+    // Медленное хранилище секретов (OpenBao стартует или запечатан) — ждём, а не падаем в перезапуск (APP-31).
+    secrets::wait_ready(&cfg, store.as_ref()).await?;
     // Секреты конфигурации — при запуске и каждом перечитывании; аренды продлеваются (PLT-12).
     let reloader = reloader.with_secret_store(store.clone()).await?;
     let cfg = reloader.current();
@@ -332,6 +334,12 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         gc: blob_cfg.gc.clone(),
         orphans: blob_cfg.orphans.clone(),
         trash: Some(services.mail.clone()),
+        purge: Some(Purge {
+            meta: meta.clone(),
+            interval: cfg
+                .section::<sections::MaintenanceSection>(sections::MAINTENANCE)?
+                .purge_interval,
+        }),
     };
     let mut setup = RoleSetup {
         cfg: &cfg,

@@ -390,7 +390,7 @@ impl PgMeta {
             let last = rows.last().map_or(since_i, |r| r.modseq);
             (rows, ModSeq(to_u64(last)?), true)
         };
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(out)
 }).await
     }

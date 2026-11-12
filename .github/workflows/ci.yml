@@ -28,8 +28,9 @@ jobs:
     outputs:
       rust: ${{ steps.d.outputs.rust }}
       deps: ${{ steps.d.outputs.deps }}
+      console: ${{ steps.d.outputs.console }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - id: d
@@ -40,7 +41,11 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_REF: ${{ github.head_ref }}
         run: |
-          if [ -z "$BASE" ]; then echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ -z "$BASE" ]; then
+            echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"
+            if [ -f console/package-lock.json ]; then echo console=true; else echo console=false; fi >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # pull_request: HEAD — пробный мерж с main; base.sha в событии отстаёт, если main ушёл вперёд,
           # и в изменения попадают чужие файлы. Первый родитель мержа — тот main, с которым сливали.
           if [ "$EVENT" = pull_request ] && git rev-parse -q --verify HEAD^2 >/dev/null; then BASE=$(git rev-parse HEAD^1); fi
@@ -49,7 +54,8 @@ jobs:
           if [ "$EVENT" = pull_request ]; then
             python3 .github/lane_check.py lanes.toml changed.txt "$HEAD_REF"
           fi
-          if grep -qvE '^(docs/|[^/]*\.md$|.*/README\.md$)' changed.txt; then
+          # Веб-консоль (console/) Rust не трогает: её проверяет job console (CI-06).
+          if grep -qvE '^(docs/|console/|[^/]*\.md$|.*/README\.md$)' changed.txt; then
             echo rust=true >> "$GITHUB_OUTPUT"
           else
             echo rust=false >> "$GITHUB_OUTPUT"
@@ -59,13 +65,18 @@ jobs:
           else
             echo deps=false >> "$GITHUB_OUTPUT"
           fi
+          if grep -qE '^(console/|\.github/actions/console/)' changed.txt; then
+            echo console=true >> "$GITHUB_OUTPUT"
+          else
+            echo console=false >> "$GITHUB_OUTPUT"
+          fi
 
   fmt:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - run: cargo fmt --all --check
 
   clippy:
@@ -73,8 +84,8 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: clippy
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -97,12 +108,12 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.90.3
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --locked --profile ci --no-tests=pass
@@ -116,7 +127,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - run: python3 .github/interp_check.py --self-test
       - name: Базовый образ поставки
         shell: bash
@@ -145,8 +156,8 @@ jobs:
     if: needs.changes.outputs.deps == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: taiki-e/install-action@v2.90.3
         with:
           tool: cargo-deny,cargo-audit
       - run: cargo deny --locked check licenses bans sources
@@ -156,6 +167,19 @@ jobs:
       - name: cargo audit
         run: cargo audit --ignore RUSTSEC-2026-0459
 
+  # Веб-консоль (CI-06, SRS 5.2): Node LTS, npm ci по lock-файлу, типы, линтер, vitest, npm audit, лицензии
+  # по deny.toml, npm run build — шаги в .github/actions/console. Только при изменениях console/**.
+  console:
+    needs: changes
+    if: needs.changes.outputs.console == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/console
+        with:
+          checks: 'true'
+
   # Только main, бета и ручной запуск: release-сборка и артефакт.
   release:
     needs: [changes, test]
@@ -164,21 +188,23 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: release
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo build --release --locked -p thepost
+      - id: console
+        uses: ./.github/actions/console
+      - run: cargo build --release --locked -p thepost ${{ steps.console.outputs.cargo-args }}
       - run: target/release/thepost --version || target/release/thepost
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: thepost-linux-x86_64
           path: target/release/thepost
 
   # Единственный required check: зелёный, если всё нужное прошло или было пропущено.
   gate:
-    needs: [changes, fmt, clippy, test, interp, deny]
+    needs: [changes, fmt, clippy, test, interp, deny, console]
     if: always()
     runs-on: ubuntu-latest
     steps:

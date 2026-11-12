@@ -33,6 +33,8 @@ pub struct Outcome {
     pub headers: String,
     /// Доставить в «Спам»: DMARC не пройден при политике `quarantine` или `reject`.
     pub junk: bool,
+    /// DMARC пройден: адресу `From` можно доверять (приём iMIP, SMTP-33).
+    pub dmarc_pass: bool,
 }
 
 /// Кэш записей одного типа: значение до срока из ответа DNS; при переполнении вытесняются истёкшие,
@@ -203,6 +205,7 @@ impl AuthCheck {
             return Outcome {
                 headers: ar.to_header() + &received_spf,
                 junk: false,
+                dmarc_pass: false,
             };
         };
         let dkim = self.resolver.verify_dkim(self.params(&msg)).await;
@@ -222,6 +225,7 @@ impl AuthCheck {
         Outcome {
             headers: ar.to_header() + &received_spf,
             junk,
+            dmarc_pass: matches!(dmarc.result(), DmarcResult::Pass),
         }
     }
 }
@@ -253,13 +257,17 @@ impl AuthCheck {
             }
         };
         let lower = results.to_ascii_lowercase();
-        let junk = lower
-            .split([';', ' ', '\t', '\r', '\n'])
-            .any(|t| t == "dmarc=fail")
+        let has = |token: &str| {
+            lower
+                .split([';', ' ', '\t', '\r', '\n'])
+                .any(|t| t == token)
+        };
+        let junk = has("dmarc=fail")
             && (lower.contains("policy.dmarc=quarantine") || lower.contains("policy.dmarc=reject"));
         Some(Outcome {
             headers: String::new(),
             junk,
+            dmarc_pass: has("dmarc=pass"),
         })
     }
 
