@@ -1,10 +1,15 @@
 # {{ ansible_managed }}
 # Копия PostgreSQL pgBackRest (%i — full или diff; таймеры thepost-backup-full/diff.timer), затем копия каталога
-# BLOB (thepost-backup-blob.service, инвариант W — SRS 3.5). Журнал — journalctl -u 'thepost-backup@*'.
+# BLOB (thepost-backup-blob.service, инвариант W — SRS 3.5) и снимок OpenBao. Журнал — journalctl -u 'thepost-backup@*'.
 [Unit]
 Description=The Post: копия PostgreSQL (pgBackRest, %i)
 Wants=thepost-backup-blob.service
 Before=thepost-backup-blob.service
+{% if thepost_backup_openbao %}
+# Снимок OpenBao (DEP-23) — рядом с копией СУБД.
+Wants=thepost-backup-openbao.service
+Before=thepost-backup-openbao.service
+{% endif %}
 After={{ thepost_backup_pg_unit }} network-online.target
 Requires={{ thepost_backup_pg_unit }}
 

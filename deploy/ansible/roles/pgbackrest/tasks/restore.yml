@@ -38,7 +38,8 @@
     state: stopped
   loop: >-
     {{ thepost_backup_timers | map(attribute='name') | map('regex_replace', '$', '.timer') | list
-       + ['thepost-backup@full.service', 'thepost-backup@diff.service', 'thepost-backup-blob.service'] }}
+       + ['thepost-backup@full.service', 'thepost-backup@diff.service', 'thepost-backup-blob.service']
+       + (['thepost-backup-openbao.service'] if thepost_backup_openbao else []) }}
 
 - name: Stop thepost
   ansible.builtin.systemd_service:
