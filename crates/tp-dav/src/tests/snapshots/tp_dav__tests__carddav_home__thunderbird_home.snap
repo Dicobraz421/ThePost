@@ -106,7 +106,7 @@ expression: r.show()
 <d:read-current-user-privilege-set/>
 </d:privilege>
 </d:current-user-privilege-set>
-<cs:getctag>7565435706391538070</cs:getctag>
+<cs:getctag>6823048385053052706</cs:getctag>
 </d:prop>
 <d:status>HTTP/1.1 200 OK</d:status>
 </d:propstat>

@@ -234,14 +234,23 @@ async fn sync_by_snapshot_version() {
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     assert_eq!(names(&r.body).len(), 3);
     let first = token(&r.body);
-    let etag = |body: &str| {
-        body.split("<d:getetag>")
-            .nth(1)
-            .and_then(|s| s.split("</d:getetag>").next())
-            .expect("getetag")
-            .to_owned()
+    // ETag по имени карточки.
+    let etags = |body: &str| -> BTreeMap<String, String> {
+        body.split("<d:response>")
+            .skip(1)
+            .filter_map(|r| {
+                let name = names(r).pop()?;
+                let etag = r
+                    .split("<d:getetag>")
+                    .nth(1)?
+                    .split("</d:getetag>")
+                    .next()?;
+                Some((name, etag.to_owned()))
+            })
+            .collect()
     };
-    let etag1 = etag(&r.body);
+    let before = etags(&r.body);
+    assert_eq!(before.len(), 3);
 
     // Каталог не менялся: токен тот же, изменений нет.
     let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
@@ -249,7 +258,12 @@ async fn sync_by_snapshot_version() {
     assert!(names(&r.body).is_empty(), "{}", r.body);
     assert_eq!(token(&r.body), first);
 
-    // Изменение каталога меняет токен, getctag и ETag; прежний токен недействителен — полная синхронизация.
+    // Изменение каталога меняет токен и getctag; прежний токен недействителен — полная синхронизация. ETag
+    // меняется только у изменённой карточки.
+    env.dir.upsert_account(
+        t,
+        account("u-ivan", "Иван Петров", &["ivan.petrov@example.org"], true),
+    );
     env.dir.upsert_account(
         t,
         account("u-olga", "Ольга Смирнова", &["olga@example.org"], true),
@@ -262,7 +276,9 @@ async fn sync_by_snapshot_version() {
     assert_eq!(names(&r.body), ["g-sales.vcf", "u-ivan.vcf", "u-olga.vcf"]);
     let second = token(&r.body);
     assert_ne!(second, first);
-    assert_ne!(etag(&r.body), etag1);
+    let after = etags(&r.body);
+    assert_eq!(after["g-sales.vcf"], before["g-sales.vcf"]);
+    assert_ne!(after["u-ivan.vcf"], before["u-ivan.vcf"]);
 
     // Скрытие группы в хранилище групп — тоже новый снимок.
     let mut g = env
