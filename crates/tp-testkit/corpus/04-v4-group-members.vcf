@@ -1,0 +1,12 @@
+BEGIN:VCARD
+VERSION:4.0
+UID:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000004
+KIND:group
+FN:Отдел ключевых клиентов
+MEMBER:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000001
+MEMBER:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000007
+MEMBER:mailto:partner@example.net
+NOTE:Участники — карточки 01 и 07 корпуса и в
+ нешний адрес.
+REV:20261101T100300Z
+END:VCARD

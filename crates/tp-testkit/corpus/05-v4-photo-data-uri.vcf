@@ -1,0 +1,11 @@
+BEGIN:VCARD
+VERSION:4.0
+UID:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000005
+FN:Елена Викторовна Назарова
+N:Назарова;Елена;Викторовна;;
+EMAIL:e.nazarova@example.com
+PHOTO:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAA
+ AEUlEQVR42mPQqzXCihiGlgQAlgM3QYr963wAAAAASUVORK5CYII=
+LOGO;MEDIATYPE=image/png:https://static.example.com/logo/romashka.png
+REV:20261101T100400Z
+END:VCARD

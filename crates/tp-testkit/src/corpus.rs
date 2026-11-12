@@ -4,6 +4,9 @@
 //! Корпус — `crates/tp-testkit/corpus/*.eml`, байты как есть (`.gitattributes`: без нормализации):
 //! multipart/mixed/alternative/related/report/signed, вложения PDF/DOCX/XLSX, 8bit, КОИ-8, Windows-1251,
 //! UTF-8, ISO-2022-JP, вложенные message/rfc822, длинные строки; файлы `NN-broken-*` — битый MIME.
+//!
+//! Корпус vCard — `crates/tp-testkit/corpus/*.vcf` ([`vcards`], [`vcard`]): по одной карточке в файле,
+//! строки с CRLF, данные вымышленные; что проверяет каждый файл — [`VCARDS`].
 
 use std::fs;
 use std::path::PathBuf;
@@ -55,6 +58,103 @@ pub fn corpus_mail(name: &str) -> Result<CorpusMail> {
     corpus()?
         .into_iter()
         .find(|m| m.name.split_once('-').is_some_and(|(_, n)| n == name))
+        .ok_or(tp_contracts::Error::NotFound)
+}
+
+// ---------- vCard ----------
+
+/// Файлы корпуса vCard: имя без расширения и что файл проверяет.
+pub const VCARDS: &[(&str, &str)] = &[
+    (
+        "01-v4-cyrillic-x",
+        "vCard 4.0: кириллица в FN/N/ORG/NOTE, ORG из трёх уровней, X-свойства (в том числе с X-параметром)",
+    ),
+    (
+        "02-v4-org",
+        "vCard 4.0: организация (KIND:org) без свойства N",
+    ),
+    (
+        "03-v3-item-group",
+        "vCard 3.0: группы свойств item1./item2./item3. с подписями X-ABLabel, TYPE списком через запятую",
+    ),
+    (
+        "04-v4-group-members",
+        "vCard 4.0: группа контактов (KIND:group), MEMBER — urn:uuid карточек 01 и 07 и mailto:",
+    ),
+    (
+        "05-v4-photo-data-uri",
+        "vCard 4.0: фото в PHOTO как data:-URI (PNG, base64, перенос строк), LOGO — ссылкой с MEDIATYPE",
+    ),
+    (
+        "06-v3-photo-base64",
+        "vCard 3.0: фото в PHOTO;ENCODING=b;TYPE=PNG",
+    ),
+    (
+        "07-v4-multi-adr-tel",
+        "vCard 4.0: три адреса, четыре телефона и три почты с TYPE и PREF; LABEL у адреса, tel:-URI с ext",
+    ),
+    (
+        "08-v4-escaping-folding",
+        "vCard 4.0: экранирование `\\,` `\\;` `\\\\` `\\n` `\\N`, параметр в кавычках с `,;:` и `^n` (RFC 6868), \
+         перенос длинных строк по 75 октетов (кириллица, ASCII, внутри значения параметра)",
+    ),
+    (
+        "09-export-apple",
+        "выгрузка «Контактов» macOS (3.0): PRODID, type= строчными и повторами, item-группы, X-ABADR, \
+         X-ABDATE, X-ABLabel вида `_$!<…>!$_`, X-ABUID; без UID",
+    ),
+    (
+        "10-export-google",
+        "выгрузка Google Контактов (3.0): повтор TYPE, item-группы с X-ABLabel, CATEGORIES:myContacts; без UID",
+    ),
+    (
+        "11-export-outlook-v21",
+        "выгрузка Outlook (vCard 2.1): CHARSET=Windows-1251 и ENCODING=QUOTED-PRINTABLE с мягкими переносами, \
+         параметры без имени (TEL;WORK;VOICE), LABEL, X-MS-OL-*; без UID; файл — чистый ASCII",
+    ),
+    (
+        "12-export-thunderbird",
+        "выгрузка Thunderbird (4.0): EMAIL;PREF=1 первой строкой, VALUE=TEXT у TEL и TZ, VALUE=URL, UID без urn:uuid",
+    ),
+    (
+        "13-export-nextcloud",
+        "выгрузка Nextcloud / Sabre VObject (3.0): PRODID, TYPE в кавычках, X-SOCIALPROFILE, \
+         BDAY;VALUE=DATE, REV;VALUE=DATE-AND-OR-TIME",
+    ),
+];
+
+/// Карточка корпуса vCard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpusCard {
+    /// Имя файла без расширения (`02-v4-org`).
+    pub name: String,
+    /// Текст карточки как в файле (UTF-8, CRLF, строки перенесены).
+    pub text: String,
+    /// Что файл проверяет ([`VCARDS`]).
+    pub checks: &'static str,
+}
+
+/// Все карточки корпуса vCard по имени файла. Чтение синхронное: вызывать вне async-кода
+/// (или через `spawn_blocking`).
+pub fn vcards() -> Result<Vec<CorpusCard>> {
+    let dir = corpus_dir();
+    VCARDS
+        .iter()
+        .map(|&(name, checks)| {
+            Ok(CorpusCard {
+                name: name.to_owned(),
+                text: fs::read_to_string(dir.join(format!("{name}.vcf")))?,
+                checks,
+            })
+        })
+        .collect()
+}
+
+/// Карточка корпуса по имени файла без номера и расширения (`v4-org`).
+pub fn vcard(name: &str) -> Result<CorpusCard> {
+    vcards()?
+        .into_iter()
+        .find(|c| c.name.split_once('-').is_some_and(|(_, n)| n == name))
         .ok_or(tp_contracts::Error::NotFound)
 }
 
@@ -330,6 +430,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Логические строки карточки: переносы RFC 6350 (CRLF + пробел/табуляция) сняты.
+    fn unfold(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for line in text.split("\r\n").filter(|l| !l.is_empty()) {
+            match (line.strip_prefix([' ', '\t']), out.last_mut()) {
+                (Some(rest), Some(prev)) => prev.push_str(rest),
+                _ => out.push(line.to_owned()),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn vcards_table_matches_files() {
+        let mut files: Vec<String> = fs::read_dir(corpus_dir())
+            .expect("corpus dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().is_some_and(|e| e == "vcf"))
+            .map(|p| {
+                p.file_stem()
+                    .expect("stem")
+                    .to_str()
+                    .expect("utf-8")
+                    .to_owned()
+            })
+            .collect();
+        files.sort();
+        let table: Vec<&str> = VCARDS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(files, table, "каждый .vcf описан в VCARDS и наоборот");
+        assert!(VCARDS.iter().all(|(_, checks)| !checks.is_empty()));
+        assert_eq!(vcards().expect("vcards").len(), VCARDS.len());
+    }
+
+    #[test]
+    fn vcards_are_well_formed() {
+        for card in vcards().expect("vcards") {
+            let n = &card.name;
+            assert!(card.text.starts_with("BEGIN:VCARD\r\nVERSION:"), "{n}");
+            assert!(card.text.ends_with("\r\nEND:VCARD\r\n"), "{n}");
+            assert_eq!(
+                card.text.matches("BEGIN:VCARD").count(),
+                1,
+                "{n}: одна карточка в файле"
+            );
+            assert_eq!(
+                card.text.matches('\n').count(),
+                card.text.matches("\r\n").count(),
+                "{n}: только CRLF"
+            );
+            assert!(
+                card.text.split("\r\n").all(|l| l.len() <= 75),
+                "{n}: строка длиннее 75 октетов"
+            );
+            let lines = unfold(&card.text);
+            let has = |prop: &str| {
+                lines.iter().any(|l| {
+                    l.strip_prefix(prop)
+                        .is_some_and(|r| r.starts_with([':', ';']))
+                })
+            };
+            assert!(has("FN"), "{n}: нет FN");
+            // N обязателен до vCard 4.0.
+            assert!(has("N") || lines[1] == "VERSION:4.0", "{n}: нет N");
+        }
+    }
+
+    #[test]
+    fn vcards_content() {
+        let lines = |name: &str| unfold(&vcard(name).expect(name).text);
+        assert!(
+            lines("v4-cyrillic-x").contains(&"X-THEPOST-TEST:произвольное значение".to_owned())
+        );
+        assert!(lines("v4-org").contains(&"KIND:org".to_owned()));
+        assert!(
+            lines("v3-item-group")
+                .iter()
+                .any(|l| l.starts_with("item1.EMAIL"))
+        );
+        let group = lines("v4-group-members");
+        assert!(group.contains(&"KIND:group".to_owned()));
+        assert_eq!(group.iter().filter(|l| l.starts_with("MEMBER:")).count(), 3);
+        assert!(
+            lines("v4-photo-data-uri")
+                .iter()
+                .any(|l| l.starts_with("PHOTO:data:image/png;base64,iVBOR"))
+        );
+        assert!(
+            lines("v3-photo-base64")
+                .iter()
+                .any(|l| l.starts_with("PHOTO;ENCODING=b;TYPE=PNG:iVBOR"))
+        );
+        let multi = lines("v4-multi-adr-tel");
+        for (prop, count) in [("ADR", 3), ("TEL", 4), ("EMAIL", 3)] {
+            assert_eq!(
+                multi.iter().filter(|l| l.starts_with(prop)).count(),
+                count,
+                "{prop}"
+            );
+        }
+        let esc = lines("v4-escaping-folding");
+        let note = esc.iter().find(|l| l.starts_with("NOTE:")).expect("NOTE");
+        assert!(
+            note.len() > 300
+                && note.contains("\\n")
+                && note.contains("\\;")
+                && note.contains("\\\\")
+        );
+        assert!(
+            note.contains("перенести"),
+            "перенос не рвёт слова при склейке"
+        );
+        let outlook = vcard("export-outlook-v21").expect("outlook").text;
+        assert!(outlook.is_ascii() && outlook.contains("=\r\n"));
+        assert!(matches!(
+            vcard("no-such-card"),
+            Err(tp_contracts::Error::NotFound)
+        ));
     }
 
     #[test]

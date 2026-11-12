@@ -1,0 +1,25 @@
+BEGIN:VCARD
+VERSION:4.0
+UID:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000008
+FN:Иванов-Петров\, Константин (мл.)
+N:Иванов-Петров;Константин;Александрович
+ \, мл.;д-р\; проф.;к.т.н.,MBA
+ORG:ИП «Точка\; Запятая»;Отдел «A\\B»
+CATEGORIES:Клиенты,Поставщики\, подрядчики,VIP
+ADR;TYPE=work;LABEL="ул. Ленина, д. 1; офис 5: вход со 
+ двора^nэтаж 2":;;ул. Ленина\, д. 1\; офис 5;Сама
+ ра;;443000;Россия
+NOTE:Первая строка\nВторая строка с запятой
+ \, точкой с запятой\; и обратной косой чер
+ той \\ — всё это значение одного свойства
+ \, достаточно длинное\, чтобы его пришлос
+ ь перенести несколько раз: границы перен
+ оса не совпадают с границами слов\, а про
+ бел в начале продолжения в значение не в
+ ходит.\N\nПоследняя строка после пустой.
+URL:https://example.com/a/very/long/path/that/keeps/going/and/going/until/i
+ t/has/to/be/folded?query=one&other=two%2Cthree#fragment
+X-LONG-ASCII:aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffgg
+ gggggggghhhhhhhhhhiiiiiiiiiijjjjjjjjjjkkkkkkkkkk
+REV:20261101T100700Z
+END:VCARD

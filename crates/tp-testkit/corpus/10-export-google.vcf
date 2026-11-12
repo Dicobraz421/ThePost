@@ -1,0 +1,18 @@
+BEGIN:VCARD
+VERSION:3.0
+FN:Мария Климова
+N:Климова;Мария;;;
+EMAIL;TYPE=INTERNET;TYPE=WORK:m.klimova@example.com
+item1.EMAIL;TYPE=INTERNET:klimova.m@example.net
+item1.X-ABLabel:Личный
+TEL;TYPE=CELL:+7 900 555-01-31
+item2.TEL:+7 843 555-01-32
+item2.X-ABLabel:Приёмная
+ADR;TYPE=WORK:;;пр. Мира\, д. 5;Казань;Республика Т
+ атарстан;420000;RU
+ORG:ООО «Северный ветер»
+TITLE:Менеджер по работе с клиентами
+BDAY:19900721
+NOTE:Познакомились на выставке\nв 2024 году
+CATEGORIES:myContacts,Клиенты
+END:VCARD
