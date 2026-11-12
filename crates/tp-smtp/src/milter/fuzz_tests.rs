@@ -1,22 +1,13 @@
 //! FIX-08 (issue #469): вход фаззера цели `milter` и соседние места разбора ответов фильтра.
 //!
-//! Вход `crash-2fabe10d…` (84 байта): согласование со всеми шагами без команд, затем `replycode`
-//! `"555555555555\r"` — одиночный `\r` уходил в текст ответа SMTP (проверка цели паниковала).
+//! Вход `crash-2fabe10d…` (84 байта, в корпусе цели `fuzz/corpus/milter`): согласование со всеми шагами без
+//! команд, затем `replycode` `"555555555555\r"` — одиночный `\r` уходил в текст ответа SMTP (проверка цели
+//! паниковала).
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
-use super::{Packet, R_REPLYCODE, parse_replycode};
-use crate::milter::{HeaderMod, apply};
-
-/// Вход `crash-2fabe10d992a6b9ae3f5dad635076e5c9f085f78` из issue #469.
-const CRASH_469: [u8; 84] = [
-    0x00, 0x00, 0x00, 0x18, 0x4f, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0xb7,
-    0xff, 0xff, 0xff, 0xff, 0xdb, 0xff, 0xff, 0x00, 0xff, 0xff, 0x25, 0x18, 0x00, 0x00, 0x00, 0x2a,
-    0x79, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x35, 0x0d, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x34, 0xb0, 0xc9, 0xc8, 0x70, 0xe6, 0x49, 0x24, 0x36, 0x78, 0x00,
-    0x00, 0x37, 0x37, 0x37, 0x37, 0xa5, 0x00, 0x0a, 0x00, 0x00, 0x10, 0x00, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0x01, 0x13,
-];
+use super::{Packet, R_ADDHEADER, R_CHGHEADER, R_INSHEADER, R_REPLYCODE, parse_replycode};
+use crate::milter::{HeaderMod, apply, parse_header_mod};
 
 fn replycode(text: &[u8]) -> Option<(u16, [u8; 3], String)> {
     parse_replycode(&Packet::new(R_REPLYCODE, Bytes::copy_from_slice(text)))
@@ -24,7 +15,9 @@ fn replycode(text: &[u8]) -> Option<(u16, [u8; 3], String)> {
 
 #[test]
 fn crash_469_does_not_panic() {
-    crate::fuzz::milter(&CRASH_469);
+    crate::fuzz::milter(include_bytes!(
+        "../../fuzz/corpus/milter/crash-2fabe10d992a6b9ae3f5dad635076e5c9f085f78"
+    ));
 }
 
 #[test]
@@ -54,18 +47,83 @@ fn replycode_text_has_no_control_characters() {
 }
 
 #[test]
-fn header_mods_cannot_inject_fields() {
+fn replycode_enhanced_code_matches_class() {
+    // Класс расширенного кода не совпадает с кодом ответа или не цифры — код по умолчанию, токен — в тексте.
+    assert_eq!(
+        replycode(b"550 4.7.1 spam\0"),
+        Some((550, [5, 7, 1], "4.7.1 spam".into()))
+    );
+    assert_eq!(
+        replycode(b"451 +4.7.1 later\0"),
+        Some((451, [4, 7, 1], "+4.7.1 later".into()))
+    );
+    assert_eq!(
+        replycode(b"451 5.7.1\0"),
+        Some((451, [4, 7, 1], "5.7.1".into()))
+    );
+    assert_eq!(
+        replycode(b"554 5.7.0 no\0"),
+        Some((554, [5, 7, 0], "no".into()))
+    );
+}
+
+fn packet(code: u8, index: Option<u32>, data: &[u8]) -> Packet {
+    let mut b = BytesMut::new();
+    if let Some(i) = index {
+        b.put_u32(i);
+    }
+    b.put_slice(data);
+    Packet::new(code, b.freeze())
+}
+
+#[test]
+fn header_mod_bad_length_or_field_is_protocol_error() {
+    assert_eq!(
+        parse_header_mod(&packet(R_ADDHEADER, None, b"X-Spam\0yes\0")).ok(),
+        Some(HeaderMod::Add("X-Spam".into(), "yes".into()))
+    );
+    assert_eq!(
+        parse_header_mod(&packet(R_CHGHEADER, Some(2), b"Subject\0\0")).ok(),
+        Some(HeaderMod::Change(2, "Subject".into(), String::new()))
+    );
+    assert_eq!(
+        parse_header_mod(&packet(R_INSHEADER, Some(0), b"X-Top\0a\n\tb\0")).ok(),
+        Some(HeaderMod::Insert(0, "X-Top".into(), "a\n\tb".into()))
+    );
+    for (code, data) in [
+        // Индекс короче четырёх байт.
+        (R_INSHEADER, &b""[..]),
+        (R_CHGHEADER, b"\0\0\x01"),
+        // Не два поля.
+        (R_ADDHEADER, b""),
+        (R_ADDHEADER, b"X-Spam"),
+        (R_ADDHEADER, b"X-Spam\0yes\0extra\0"),
+        (R_CHGHEADER, b"\0\0\0\x01Subject"),
+        // Имя — не печатные ASCII без `:`.
+        (R_ADDHEADER, b"X-Bad\r\nEvil\x001\0"),
+        (R_ADDHEADER, b"X Bad\x001\0"),
+        (R_ADDHEADER, b"\x001\0"),
+        (R_INSHEADER, b"\0\0\0\0X:Bad\x001\0"),
+        (R_CHGHEADER, b"\0\0\0\x01Subject\n\0\0"),
+        (R_ADDHEADER, b"X-\xd0\xb0\x001\0"),
+    ] {
+        assert!(
+            parse_header_mod(&Packet::new(code, Bytes::copy_from_slice(data))).is_err(),
+            "{:?} {data:?}",
+            char::from(code)
+        );
+    }
+}
+
+#[test]
+fn header_values_cannot_inject_fields() {
     let raw = b"From: a@example.net\r\nSubject: x\r\n\r\nbody\r\n";
     let out = apply(
         raw,
-        &[
-            HeaderMod::Add("X-Bad\r\nEvil".into(), "1".into()),
-            HeaderMod::Add("X Bad".into(), "1".into()),
-            HeaderMod::Add(String::new(), "1".into()),
-            HeaderMod::Insert(0, "X:Bad".into(), "1".into()),
-            HeaderMod::Change(1, "Subject\n".into(), String::new()),
-            HeaderMod::Add("X-Fold".into(), "a\nEvil: b\n\tc\r\rd".into()),
-        ],
+        &[HeaderMod::Add(
+            "X-Fold".into(),
+            "a\nEvil: b\n\tc\r\rd".into(),
+        )],
     );
     assert_eq!(
         &out[..],

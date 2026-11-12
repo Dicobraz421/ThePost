@@ -202,11 +202,11 @@ pub fn parse_replycode(p: &Packet) -> Option<(u16, [u8; 3], String)> {
     }
     let rest = rest.trim_start_matches(['-', ' ']);
     let (esc, msg) = match rest.split_once(' ') {
-        Some((esc, msg)) => match parse_esc(esc) {
+        Some((esc, msg)) => match parse_esc(esc, code) {
             Some(e) => (e, msg),
             None => (default_esc(code), rest),
         },
-        None => match parse_esc(rest) {
+        None => match parse_esc(rest, code) {
             Some(e) => (e, ""),
             None => (default_esc(code), rest),
         },
@@ -219,10 +219,16 @@ pub fn parse_replycode(p: &Packet) -> Option<(u16, [u8; 3], String)> {
     Some((code, esc, msg))
 }
 
-fn parse_esc(s: &str) -> Option<[u8; 3]> {
-    let mut it = s.split('.').map(|p| p.parse::<u8>().ok());
+/// Расширенный код `класс.тема.деталь` (RFC 3463): только цифры, класс — первая цифра кода ответа (FIX-08:
+/// иначе `550 4.7.1` уходил клиенту с противоречивым кодом).
+fn parse_esc(s: &str, code: u16) -> Option<[u8; 3]> {
+    let mut it = s.split('.').map(|p| {
+        Some(p)
+            .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<u8>().ok())
+    });
     let esc = [it.next()??, it.next()??, it.next()??];
-    it.next().is_none().then_some(esc)
+    (it.next().is_none() && u16::from(esc[0]) == code / 100).then_some(esc)
 }
 
 fn default_esc(code: u16) -> [u8; 3] {
