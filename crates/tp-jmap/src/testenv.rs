@@ -14,14 +14,17 @@ use time::OffsetDateTime;
 use tp_contracts::Result;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::blob::{BlobIndex, BlobStore, ByteStream, Compression, ObjectStream};
+use tp_contracts::dav::DavStore;
 use tp_contracts::ext::{DecisionHooks, JmapCapability};
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, Flags, SpecialUse};
+use tp_contracts::sieve::SieveStore;
 use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_testkit::{
-    Clock, FakeAuthenticator, FakeSearch, MemBlobIndex, MemBlobStore, MemEventBus, MemMetadata,
-    MemOutbound, MemPolicies, MemQuota, MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
+    Clock, FakeAuthenticator, FakeSearch, MemBlobIndex, MemBlobStore, MemDav, MemEventBus,
+    MemMetadata, MemOutbound, MemPolicies, MemQuota, MemSieve, MemTrash, RecordingDecisionHook,
+    SearchDoc, SystemClock,
 };
 
 use crate::{Deps, Jmap, JmapConfig};
@@ -135,6 +138,10 @@ pub struct Env {
     pub hook: RecordingDecisionHook,
     /// Объекты BLOB сервера JMAP (`Deps::blobs`) и их учёт.
     pub blobs: Unpacking,
+    /// Скрипты Sieve и автоответ (`Jmap::with_sieve`), сигналы — в `bus`.
+    pub sieve: MemSieve,
+    /// Календари и контакты (`Jmap::with_dav`), сигналы — в `bus`.
+    pub dav: MemDav,
     pub jmap: Arc<Jmap>,
 }
 
@@ -147,11 +154,25 @@ impl Env {
         Self::with_signer(cfg, caps, None).await
     }
 
+    /// Окружение без хранилищ Sieve и DAV (capability `vacationresponse`, `sieve`, `contacts` не объявлены).
+    pub async fn bare() -> Self {
+        Self::build(JmapConfig::default(), Vec::new(), None, false).await
+    }
+
     /// Окружение с подписью профиля `.mobileconfig`.
     pub async fn with_signer(
         cfg: JmapConfig,
         caps: Vec<Arc<dyn JmapCapability>>,
         signer: Option<Arc<dyn crate::ProfileSigner>>,
+    ) -> Self {
+        Self::build(cfg, caps, signer, true).await
+    }
+
+    async fn build(
+        cfg: JmapConfig,
+        caps: Vec<Arc<dyn JmapCapability>>,
+        signer: Option<Arc<dyn crate::ProfileSigner>>,
+        stores: bool,
     ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let blobs = MemBlobStore::new(clock.clone());
@@ -191,6 +212,8 @@ impl Env {
             index: index.clone(),
             originals: Arc::default(),
         };
+        let sieve = MemSieve::new().with_bus(Arc::new(bus.clone()));
+        let dav = MemDav::new().with_bus(Arc::new(bus.clone()));
         let jmap = Jmap::new(
             Deps {
                 auth: Arc::new(auth.clone()),
@@ -213,7 +236,9 @@ impl Env {
             cfg,
         )
         .expect("jmap")
-        .with_profile_signer(signer);
+        .with_profile_signer(signer)
+        .with_sieve(stores.then(|| Arc::new(sieve.clone()) as Arc<dyn SieveStore>))
+        .with_dav(stores.then(|| Arc::new(dav.clone()) as Arc<dyn DavStore>));
         Self {
             meta,
             search,
@@ -228,6 +253,8 @@ impl Env {
             policies,
             hook,
             blobs: unpacking,
+            sieve,
+            dav,
             jmap: Arc::new(jmap),
         }
     }

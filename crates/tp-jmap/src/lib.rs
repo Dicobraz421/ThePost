@@ -12,6 +12,7 @@
 //! - `fuzz` — проверки разбора для целей cargo-fuzz `crates/tp-jmap/fuzz` (JMAP-09; не API);
 //! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`
 //!   (подпись профиля ключом TLS — [`ProfileSigner`], [`Jmap::with_profile_signer`]);
+//! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
 //! Протокол — JSON поверх HTTP: типы запросов и ответов — `serde_json`, HTTP — `axum`.
@@ -30,6 +31,7 @@ mod settings;
 pub mod submission;
 #[cfg(test)]
 mod testenv;
+mod vacation;
 
 use serde_json::{Map, Value};
 
@@ -37,7 +39,7 @@ pub use crate::autoconfig::sign::{ProfileSigner, SignatureAlgorithm, SigningKey}
 pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
 
 use crate::core::error::MethodResult;
-use crate::core::{CORE, Ctx, MAIL, SETTINGS, SUBMISSION};
+use crate::core::{CORE, Ctx, MAIL, SETTINGS, SUBMISSION, VACATION};
 
 /// Встроенные методы и их capability.
 pub(crate) const METHODS: &[(&str, &str)] = &[
@@ -66,6 +68,8 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("EmailSubmission/queryChanges", SUBMISSION),
     ("UserSettings/get", SETTINGS),
     ("UserSettings/set", SETTINGS),
+    ("VacationResponse/get", VACATION),
+    ("VacationResponse/set", VACATION),
 ];
 
 /// Варианты сортировки `Email/query` (сессия, `emailQuerySortOptions`).
@@ -103,6 +107,8 @@ pub(crate) async fn call_builtin(
         "EmailSubmission/queryChanges" => submission::submission_query_changes(ctx, args).await,
         "UserSettings/get" => settings::get(ctx, args).await,
         "UserSettings/set" => settings::set(ctx, args).await,
+        "VacationResponse/get" => vacation::get(ctx, args).await,
+        "VacationResponse/set" => vacation::set(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
 }
