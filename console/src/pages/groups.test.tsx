@@ -69,8 +69,11 @@ test("группы: список, признаки, удаление; групп
   expect(await screen.findByText("Staff")).toBeTruthy();
   expect(screen.getByText("модерация")).toBeTruthy();
   expect(screen.getByText("каталог")).toBeTruthy();
-  const remove = screen.getAllByRole("button", { name: /Удалить/ });
-  expect((remove[1] as HTMLButtonElement).disabled).toBe(true);
+  const remove = await waitFor(() => {
+    const found = screen.getAllByRole("button", { name: /Удалить/ }) as HTMLButtonElement[];
+    expect(found.map((b) => b.disabled)).toEqual([false, true]);
+    return found;
+  });
   fireEvent.click(remove[0]);
   expect(await screen.findByText(/Удалить группу Staff\?/)).toBeTruthy();
   const buttons = screen.getAllByRole("button", { name: /Удалить/ });
