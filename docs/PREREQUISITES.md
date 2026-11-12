@@ -174,7 +174,7 @@ PTR задаёт владелец адреса (провайдер, хостин
 |---|---|---|---|
 | Rspamd с Milter на `127.0.0.1:11332` (worker proxy); эталон — пакет `rspamd.com` (Ansible), образ `rspamd/rspamd:3.11.1` (Compose) | `ss -ltn \| grep 11332`, `systemctl is-active rspamd` | по умолчанию (`on_failure: accept`) письмо принимается без проверки с заголовком `X-ThePost-Milter: <имя>; unavailable`; `tempfail` — `451 4.7.1` | [роль `rspamd`](../deploy/ansible/roles/rspamd/defaults/main.yml), [`tp-smtp/src/config.rs`](../crates/tp-smtp/src/config.rs) |
 | По желанию — clamav-milter на `127.0.0.1:7357` (`thepost_clamav: true`), заражённое — `Reject`; RAM — +2 GB (S8) | `systemctl is-active clamav-milter` | без баз freshclam clamd не запускается: роль ждёт до 10 мин | [роль `clamav_milter`](../deploy/ansible/roles/clamav_milter/defaults/main.yml), [S8](spec/S8.md) |
-| Почту пользователей (submission) проверять — `thepost_milter_submission: true` | `config.yaml`: `smtp.milter.filters[].submission` | по умолчанию проверяется только входящая | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
+| Почту пользователей (submission и отправка JMAP) проверять — `thepost_milter_submission: true` | `config.yaml`: второй элемент `smtp.milter.filters[]` того же адреса с `profile: outbound` | по умолчанию проверяется только входящая; при недоступности фильтра исходящей почты — `451` (`on_failure: tempfail`) | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
 
 `doctor` доступность фильтров Milter не проверяет.
 
