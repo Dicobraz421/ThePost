@@ -956,6 +956,17 @@ impl AccountStore for MemMetadata {
             .map(|a| a.account.clone()))
     }
 
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
+        let st = lock(&self.state);
+        let mut seen = std::collections::HashSet::new();
+        Ok(ids
+            .iter()
+            .filter(|id| seen.insert(**id))
+            .filter_map(|id| st.accounts.get(&(tenant, *id)))
+            .map(|a| a.account.clone())
+            .collect())
+    }
+
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
         Ok(lock(&self.state)
             .accounts
@@ -1941,7 +1952,7 @@ mod tests {
         crate::suite::account_list(&MemMetadata::default(), &fx).await;
     }
 
-    /// CTR-63: общий набор `AccountStore::by_ids` (реализация по умолчанию).
+    /// CTR-63: общий набор `AccountStore::by_ids`.
     #[tokio::test]
     async fn account_by_ids_suite() {
         let fx = crate::suite::AccountListFixture {

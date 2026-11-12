@@ -83,6 +83,19 @@ impl AccountStore for Limited {
         AccountStore::get(&self.0, tenant, id)
     }
 
+    fn by_ids<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        ids: &'life1 [AccountId],
+    ) -> Fut<'async_trait, Vec<Account>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.by_ids(tenant, ids)
+    }
+
     fn by_login<'life0, 'life1, 'async_trait>(
         &'life0 self,
         tenant: TenantId,

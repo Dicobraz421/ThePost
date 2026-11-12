@@ -214,19 +214,8 @@ pub trait AccountStore: Send + Sync + 'static {
 
     /// Учётные записи по списку идентификаторов (CTR-63; имена участников группы, Admin API): в порядке `ids`,
     /// не найденные (и чужой организации) пропускаются, повтор идентификатора — одна запись (первое вхождение).
-    /// По умолчанию — [`AccountStore::get`] по одному; реализация одним запросом — `tp-meta` (META-66).
-    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
-        let mut seen = BTreeSet::new();
-        let mut out = Vec::with_capacity(ids.len());
-        for &id in ids {
-            if seen.insert(id)
-                && let Some(a) = self.get(tenant, id).await?
-            {
-                out.push(a);
-            }
-        }
-        Ok(out)
-    }
+    /// Реализации — `tp-meta` (одним запросом, META-66), `tp-testkit`.
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>>;
 
     /// Учётная запись по имени входа (без учёта регистра).
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>>;
