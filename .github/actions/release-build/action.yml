@@ -42,7 +42,7 @@ runs:
       env:
         TARGET: ${{ inputs.target }}
         ARGS: ${{ steps.console.outputs.cargo-args }}
-        RUSTFLAGS: -C target-cpu=x86-64-v3
+        RUSTFLAGS: ''
       run: cross build --release --locked -p thepost --target "$TARGET" $ARGS
     # Гостевая система для qemu — Debian 12 (glibc под базовый x86-64): glibc раннера ubuntu-26.04 собрана под
     # x86-64-v3 и под Nehalem падает сама, ещё до бинаря.
@@ -53,7 +53,6 @@ runs:
         BIN: target/${{ inputs.target }}/release/thepost
         GUEST: debian:12-slim
       run: |
-        gcc -Q --help=target | grep -E "^ +-march=" || true  # ВРЕМЕННО: уровень gcc раннера
         sudo apt-get update -qq
         sudo apt-get install -y -qq --no-install-recommends qemu-user >/dev/null
         root="$RUNNER_TEMP/guest"; mkdir -p "$root"
