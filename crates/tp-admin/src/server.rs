@@ -558,6 +558,30 @@ impl From<Error> for ApiError {
     }
 }
 
+/// Отказ обработчика с кодом и пояснением, которых нет у `tp_contracts::Error` (409 и 422 с `detail`).
+#[derive(Debug)]
+pub(crate) enum Refused {
+    /// Ошибка контракта.
+    Api(Error),
+    /// Код HTTP и пояснение.
+    Problem(StatusCode, String),
+}
+
+impl From<Error> for Refused {
+    fn from(e: Error) -> Self {
+        Self::Api(e)
+    }
+}
+
+impl IntoResponse for Refused {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Api(e) => ApiError(e).into_response(),
+            Self::Problem(status, detail) => problem(status, Some(detail)),
+        }
+    }
+}
+
 /// Ошибка (RFC 9457).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Problem {
