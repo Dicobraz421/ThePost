@@ -51,4 +51,20 @@ runs:
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq --no-install-recommends qemu-user >/dev/null
-        qemu-x86_64 -cpu Nehalem "$BIN" --version
+        qemu-x86_64 -cpu Nehalem "$BIN" --version && exit 0
+        # ВРЕМЕННО (разбор CI-14): где падает и на каком уровне проходит.
+        sudo apt-get install -y -qq --no-install-recommends binutils >/dev/null || true
+        for cpu in Nehalem,+aes Westmere Westmere,-aes SandyBridge Haswell max; do
+          echo "== $cpu"; qemu-x86_64 -cpu "$cpu" "$BIN" --version; echo "rc=$?"
+        done
+        qemu-x86_64 -cpu Nehalem -d in_asm,nochain -D /tmp/q.log "$BIN" --version || true
+        echo "== последние блоки"; tail -n 40 /tmp/q.log
+        pc=$(grep -oE '^0x[0-9a-f]+' /tmp/q.log | tail -n1)
+        echo "pc=$pc"; nm -n --defined-only "$BIN" 2>/dev/null | wc -l
+        curl -fsSL -o /tmp/b.tgz https://github.com/Dicobraz421/ThePost/releases/download/beta-20261112/thepost-beta-20261112-x86_64-unknown-linux-gnu.tar.gz
+        tar -C /tmp -xzf /tmp/b.tgz
+        echo "== бета под Nehalem"; qemu-x86_64 -cpu Nehalem /tmp/thepost-beta-20261112-x86_64-unknown-linux-gnu/thepost --version; echo "rc=$?"
+        echo "== бета под Nehalem,+aes"; qemu-x86_64 -cpu Nehalem,+aes /tmp/thepost-beta-20261112-x86_64-unknown-linux-gnu/thepost --version; echo "rc=$?"
+        qemu-x86_64 -cpu Nehalem -d in_asm,nochain -D /tmp/qb.log /tmp/thepost-beta-20261112-x86_64-unknown-linux-gnu/thepost --version || true
+        echo "== бета последние блоки"; tail -n 30 /tmp/qb.log
+        exit 1
