@@ -49,6 +49,8 @@
 //! (CMP-04, контракт `tp_contracts::queue::Outbound`, CTR-28): локальные получатели доставляются сразу тем же
 //! `ingest`, внешние — в очередь (без очереди — `SubmitStatus::Failed` с `451 4.3.0`, SMTP-28); статус по получателю.
 //! Отложенная отправка и её отмена (`Outbound::schedule`, `cancel_scheduled`; SMTP-24) — `scheduled`.
+//! Лимиты писем и адресатов в час учётной записи отправителя — общие с submission ([`Delivery::with_send_limits`],
+//! [`crate::limits`], SMTP-43).
 //!
 //! Адресация ([`crate::address`]): получатели переписываются до разрешения, отправитель — после проверок, по
 //! таблице организации из снимка настроек транспорта ([`Delivery::with_transport`], `TenantTransport::rewrites`);
@@ -96,6 +98,7 @@ use crate::dsn::{self, DsnSink};
 use crate::forward::Forwarding;
 use crate::groups::{Groups, Hold};
 use crate::itip;
+use crate::limits::{self, SendLimits};
 use crate::milter::{self, Milters, Verdict};
 use crate::routes::Routes;
 use crate::server::{Envelope, Handler, Mode, Reply, is_positive, reply};
@@ -220,6 +223,10 @@ pub struct Delivery {
     redirect_hops: u32,
     /// `delivery.redirect_total`.
     redirect_total: u32,
+    /// Лимиты отправки учётной записи в час для [`Delivery::submit`] (SMTP-43), общие с сеансами submission.
+    send_limits: Option<Arc<SendLimits>>,
+    /// `smtp.limits.max_tracked_accounts`.
+    max_tracked: usize,
 }
 
 impl fmt::Debug for Delivery {
@@ -318,7 +325,17 @@ impl Delivery {
             vacation_rate: VacationRate::new(cfg.delivery.vacation_rate),
             redirect_hops: cfg.delivery.redirect_hops,
             redirect_total: cfg.delivery.redirect_total,
+            send_limits: None,
+            max_tracked: cfg.limits.max_tracked_accounts,
         }
+    }
+
+    /// Лимиты отправки в час (SMTP-43) для [`Delivery::submit`] (JMAP): писем — `Policy::send_per_hour`,
+    /// адресатов — `Policy::rcpts_per_hour` учётной записи отправителя; те же счётчики, что у сеансов submission
+    /// (`SessionCtx::send_limits`). Без них отправка вне сессии не ограничена.
+    pub fn with_send_limits(mut self, limits: Arc<SendLimits>) -> Self {
+        self.send_limits = Some(limits);
+        self
     }
 
     /// Личные списки надёжных и заблокированных отправителей ящиков (SMTP-25): при доставке в ящик письмо
@@ -512,7 +529,8 @@ impl Delivery {
 
     /// Политики организации (SMTP-40, решение 97): профиль Milter письма (`Policy::milter_profile`; submission —
     /// цепочка учётной записи отправителя, smtp-in — уровень организации) и лимиты сеанса submission
-    /// ([`Handler::policy`]: `max_recipients`, `send_per_hour`). Без политик — умолчания полей `Policy`.
+    /// ([`Handler::policy`]: `max_recipients`, `send_per_hour`, `rcpts_per_hour`). Без политик — умолчания
+    /// полей `Policy`.
     pub fn with_policies(mut self, policies: Arc<dyn PolicyResolver>) -> Self {
         self.policies = Some(policies);
         self
@@ -1847,7 +1865,55 @@ impl Delivery {
     /// локальные доставляются. Ошибка хранилища, каталога или очереди — `Err`.
     /// Другая организация (`tenant` ≠ `Deps::tenant`) — все получатели в очередь, как до CMP-04 (без очереди —
     /// все `Failed`).
+    ///
+    /// Лимиты отправки ([`Delivery::with_send_limits`], SMTP-43): письмо учётной записи, превысившее за скользящий
+    /// час `send_per_hour` писем или `rcpts_per_hour` адресатов, не отправляется — все получатели `Failed` с
+    /// `451 4.7.1`, событие отказа — в журнал доставки.
     pub async fn submit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<Submitted> {
+        let limited = match &self.send_limits {
+            Some(l) if tenant == self.deps.tenant => self
+                .sender_by_address(mail_from)
+                .await?
+                .map(|account| (l, account)),
+            _ => None,
+        };
+        let Some((l, account)) = limited else {
+            return self.submit_unlimited(tenant, mail_from, rcpts, raw).await;
+        };
+        let policy = self.account_policy(tenant, account).await?;
+        let key = account.to_string();
+        let now = Instant::now();
+        let exceeded = if !l.allow_message_at(policy.send_per_hour_or_default(), &key, now) {
+            Some(limits::MESSAGES_EXCEEDED)
+        } else if !l.allow_rcpts_at(policy.rcpts_per_hour_or_default(), &key, rcpts.len(), now) {
+            Some(limits::RCPTS_EXCEEDED)
+        } else {
+            None
+        };
+        if let Some(text) = exceeded {
+            let line = format!("451 4.7.1 {text}");
+            let step = Step::new(Ek::Reject, Dd::Defer, rcpts.to_vec()).reason(line.clone());
+            self.track(mail_from, tracking::message_id(&raw).as_deref(), vec![step])
+                .await;
+            tracing::info!(
+                rcpts = rcpts.len(),
+                "smtp: отправка вне сессии отклонена лимитом в час"
+            );
+            return Ok(Submitted::all(rcpts, SubmitStatus::Failed(line)));
+        }
+        let sent = self.submit_unlimited(tenant, mail_from, rcpts, raw).await?;
+        l.record_at(self.max_tracked, &key, rcpts.len(), Instant::now());
+        Ok(sent)
+    }
+
+    /// [`Delivery::submit`] без лимитов отправки.
+    async fn submit_unlimited(
         &self,
         tenant: TenantId,
         mail_from: &str,
@@ -2353,6 +2419,12 @@ impl Handler for Delivery {
     async fn policy(&self, principal: &Principal) -> Result<Policy> {
         self.account_policy(principal.tenant, principal.account)
             .await
+    }
+
+    async fn limited(&self, env: &Envelope, reply: &Reply) {
+        let step = Step::new(Ek::Reject, tracking::decision(reply), env.rcpts.clone())
+            .reason(tracking::reason(reply));
+        self.track(&env.mail_from, None, vec![step]).await;
     }
 
     async fn rcpt(&self, env: &Envelope, rcpt: &str) -> Reply {
