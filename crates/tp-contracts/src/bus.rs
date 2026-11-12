@@ -9,12 +9,14 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::abuse::BlockSubject;
+use crate::dav::{CollectionId, CollectionKind};
 use crate::error::Result;
 use crate::events::Partition;
 use crate::ids::{AccountId, MailboxId, ModSeq, TenantId};
 use crate::meta::AccountScope;
 
-/// Вид сигнала. Виды учётной записи (`account = Some`): `MailboxChanged`, `MailboxListChanged`; остальные —
+/// Вид сигнала. Виды учётной записи (`account = Some`): `MailboxChanged`, `MailboxListChanged`, `DavChanged`,
+/// `SieveChanged`; остальные —
 /// системные (`account = None`, приходят в [`EventBus::subscribe_system`]). `Resync` вставляет в поток только шина.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
@@ -27,6 +29,19 @@ pub enum EventKind {
     },
     /// Изменился список папок учётной записи.
     MailboxListChanged,
+    /// Изменилась коллекция календарей или контактов учётной записи: свойства, объекты, удаление
+    /// ([`crate::dav::DavStore`]; JMAP push, кэши `tp-dav`). Сигнал — [`crate::dav::dav_changed`].
+    DavChanged {
+        /// Вид коллекции.
+        kind: CollectionKind,
+        /// Коллекция.
+        collection: CollectionId,
+        /// `ModSeq` изменения.
+        modseq: ModSeq,
+    },
+    /// Изменились скрипты Sieve или автоответ учётной записи ([`crate::sieve::SieveStore`]; кэш программ `tp-sieve`,
+    /// JMAP push). Сигнал — [`crate::sieve::sieve_changed`].
+    SieveChanged,
     /// В очереди исходящей почты появились записи (будит smtp-out).
     QueueReady,
     /// Конфигурация перечитана.
@@ -74,7 +89,11 @@ impl EventKind {
     pub fn is_system(&self) -> bool {
         !matches!(
             self,
-            EventKind::MailboxChanged { .. } | EventKind::MailboxListChanged | EventKind::Resync
+            EventKind::MailboxChanged { .. }
+                | EventKind::MailboxListChanged
+                | EventKind::DavChanged { .. }
+                | EventKind::SieveChanged
+                | EventKind::Resync
         )
     }
 }
@@ -130,6 +149,15 @@ mod tests {
             .is_system()
         );
         assert!(!EventKind::MailboxListChanged.is_system());
+        assert!(
+            !EventKind::DavChanged {
+                kind: CollectionKind::Calendar,
+                collection: CollectionId::new(),
+                modseq: ModSeq(2)
+            }
+            .is_system()
+        );
+        assert!(!EventKind::SieveChanged.is_system());
         assert!(!EventKind::Resync.is_system());
         for kind in [
             EventKind::QueueReady,

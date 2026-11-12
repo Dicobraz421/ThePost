@@ -25,6 +25,7 @@ pub mod messages;
 pub mod modules;
 pub mod pool;
 pub mod queue;
+pub mod replica;
 pub mod retention;
 pub mod schema;
 pub mod shards;
@@ -41,7 +42,8 @@ use sqlx::{PgConnection, PgPool};
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::config::duration;
 use tp_contracts::events::partition_of;
-use tp_contracts::{AccountId, Result, TenantId};
+use tp_contracts::meta::AccountScope;
+use tp_contracts::{AccountId, Error, Result, TenantId};
 
 use crate::abuse::AbuseBlocksConfig;
 use crate::delivery::DeliveryLogConfig;
@@ -49,7 +51,9 @@ use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
 use crate::failover::Failover;
 use crate::pool::TxFuture;
+use crate::replica::Replica;
 use crate::retention::RetentionConfig;
+use crate::shards::{ReadIntent, ShardId, ShardResolver};
 use crate::signals::SignalsConfig;
 
 /// Секция конфигурации контура метаданных `meta` (SRS 5.5); пул соединений — отдельная секция
@@ -118,6 +122,25 @@ impl Default for MetaConfig {
     }
 }
 
+tokio::task_local! {
+    /// Попытка чтения на реплике ([`PgMeta::with_intent`]): `true` — первая попытка `Stale`, повтор — primary.
+    static STALE_ATTEMPT: bool;
+}
+
+/// Реплика основной БД для фоновых чтений.
+#[derive(Clone, Default)]
+struct ReplicaOf(Option<Arc<Replica>>);
+
+impl std::fmt::Debug for ReplicaOf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Replica(set)"
+        } else {
+            "Replica(none)"
+        })
+    }
+}
+
 /// Шина, в которую хранилища публикуют сигналы после фиксации.
 #[derive(Clone, Default)]
 struct Signals(Option<Arc<dyn EventBus>>);
@@ -132,7 +155,51 @@ impl std::fmt::Debug for Signals {
     }
 }
 
+/// Справочник шардов хранилищ ящика; `None` — один шард (основная БД) без справочника.
+#[derive(Clone, Default)]
+struct Shards(Option<Arc<dyn ShardResolver>>);
+
+impl std::fmt::Debug for Shards {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Shards(directory)"
+        } else {
+            "Shards(local)"
+        })
+    }
+}
+
+/// Маршруты по шардам, общие для копий [`PgMeta`]: шард записи очереди, с какого шарда начинать `claim`.
+#[derive(Debug, Default)]
+pub(crate) struct Routing {
+    /// Шард записи очереди (захваты этого экземпляра); нет записи — поиск по шардам.
+    pub(crate) queue: std::sync::Mutex<std::collections::HashMap<tp_contracts::QueueId, ShardId>>,
+    /// Номер прохода `claim`: шард, с которого начинается обход.
+    pub(crate) claim_turn: std::sync::atomic::AtomicUsize,
+}
+
+/// Пул шарда ящика.
+#[derive(Debug, Clone)]
+pub(crate) struct BoxDb {
+    /// Шард.
+    pub(crate) shard: ShardId,
+    /// Пул шарда (для [`ShardId::MAIN`] — пул основной БД, с повтором над [`Failover`]).
+    pub(crate) pool: PgPool,
+}
+
 /// Хранилища метаданных на PostgreSQL.
+///
+/// Хранилища ящика (папки, письма, журнал изменений, ACL, корзина, манифест индекса) работают на шарде
+/// учётной записи через справочник ([`PgMeta::with_shards`], [`shards`]); каталог, политики, состав
+/// кластера, аренды, блокировки, транспорт — в основной БД. Без справочника — один шард (основная БД).
+/// Повтор при переключении СУБД ([`Failover`]) — для основной БД; операции на других шардах выполняются
+/// один раз, временный отказ отдаётся вызывающему.
+///
+/// Фоновые роли собирают хранилища с [`ReadIntent::Stale`] ([`PgMeta::with_intent`], META-32): чтения закрытого
+/// списка (папки, письма, журнал изменений, учётные записи, перечисление BLOB) идут на реплику шарда при
+/// допустимом отставании ([`replica`]), записи — всегда на primary; временный отказ чтения на реплике (в том
+/// числе конфликт с восстановлением `40001`) — повтор на primary. По умолчанию — [`ReadIntent::Primary`]:
+/// протокольные роли реплику не используют.
 ///
 /// С шиной ([`PgMeta::with_bus`]) после фиксации публикуются сигналы: `LogAppended` — после записи событий
 /// в журнал ядра, `MembersChanged` — при изменении состава кластера, `Blocked` — после блокировки,
@@ -157,6 +224,10 @@ pub struct PgMeta {
     cfg: Arc<MetaConfig>,
     bus: Signals,
     failover: Option<Failover>,
+    shards: Shards,
+    routing: Arc<Routing>,
+    intent: ReadIntent,
+    replica: ReplicaOf,
 }
 
 impl PgMeta {
@@ -167,6 +238,10 @@ impl PgMeta {
             cfg: Arc::new(cfg),
             bus: Signals::default(),
             failover: None,
+            shards: Shards::default(),
+            routing: Arc::default(),
+            intent: ReadIntent::Primary,
+            replica: ReplicaOf::default(),
         }
     }
 
@@ -189,14 +264,34 @@ impl PgMeta {
 
     /// **Идемпотентная** операция (чтение): над [`Failover`] временный отказ — повтор с нарастающей паузой
     /// ([`Failover::retry`]), иначе — один раз.
+    ///
+    /// С [`ReadIntent::Stale`] первая попытка — без повтора, чтения закрытого списка в ней идут на реплику
+    /// ([`PgMeta::read_db`]); временный отказ — операция заново на primary.
     pub(crate) async fn idempotent<T, F, Fut>(&self, mut op: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
+        if self.intent == ReadIntent::Stale {
+            match STALE_ATTEMPT.scope(true, op()).await {
+                Err(Error::Unavailable { .. }) => {
+                    tracing::debug!("чтение на реплике не удалось — повтор на primary");
+                }
+                r => return r,
+            }
+        }
+        self.retried(op).await
+    }
+
+    /// Повтор над [`Failover`] (иначе — один раз), всегда на primary.
+    async fn retried<T, F, Fut>(&self, mut op: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
         match &self.failover {
-            Some(fo) => fo.retry(|_| op()).await,
-            None => op().await,
+            Some(fo) => STALE_ATTEMPT.scope(false, fo.retry(|_| op())).await,
+            None => STALE_ATTEMPT.scope(false, op()).await,
         }
     }
 
@@ -223,7 +318,7 @@ impl PgMeta {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        self.idempotent(op).await
+        self.retried(op).await
     }
 
     /// Запись с ключом в транзакции организации `tenant`: над [`Failover`] — повтор с установлением исхода
@@ -264,6 +359,183 @@ impl PgMeta {
     pub fn with_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
         self.bus = Signals(Some(bus));
         self
+    }
+
+    /// Те же хранилища с хранилищами ящика на шардах справочника `resolver` (основная БД — шард
+    /// [`ShardId::MAIN`], её пул — пул этих хранилищ). Схема шардов — [`shards::ShardDirectory::migrate`].
+    pub fn with_shards(mut self, resolver: Arc<dyn ShardResolver>) -> Self {
+        self.shards = Shards(Some(resolver));
+        self
+    }
+
+    /// Те же хранилища с назначением чтений `intent`: [`ReadIntent::Stale`] — только для фоновых ролей
+    /// (экспорт, отчёты, eDiscovery, verify, «сироты» BLOB, первичная индексация).
+    pub fn with_intent(mut self, intent: ReadIntent) -> Self {
+        self.intent = intent;
+        self
+    }
+
+    /// Назначение чтений.
+    pub fn intent(&self) -> ReadIntent {
+        self.intent
+    }
+
+    /// Реплика основной БД для [`ReadIntent::Stale`] (`database.read_replica`, [`pool::connect_replica`]) с порогом
+    /// отставания `max_lag` (`database.replica_max_lag`).
+    pub fn with_replica(mut self, pool: PgPool, max_lag: Duration) -> Self {
+        self.replica = ReplicaOf(Some(Arc::new(Replica::new(pool, max_lag))));
+        self
+    }
+
+    /// Чтение идёт попыткой на реплике: хранилища `Stale` в первой попытке операции ([`PgMeta::idempotent`]).
+    pub(crate) fn stale_attempt(&self) -> bool {
+        self.intent == ReadIntent::Stale && STALE_ATTEMPT.try_with(|s| *s).unwrap_or(false)
+    }
+
+    /// Реплика шарда `shard`: основной БД — своя, другого шарда — из справочника.
+    async fn replica_of(&self, shard: ShardId) -> Result<Option<Arc<Replica>>> {
+        match &self.shards.0 {
+            Some(r) if shard != ShardId::MAIN => r.replica(shard).await,
+            _ => Ok(self.replica.0.clone()),
+        }
+    }
+
+    /// Шард и пул чтения закрытого списка ящика учётной записи: в попытке `Stale` — реплика шарда при
+    /// допустимом отставании, иначе primary.
+    pub(crate) async fn read_db(&self, scope: AccountScope) -> Result<BoxDb> {
+        let shard = self.shard_of(scope).await?;
+        Ok(BoxDb {
+            shard,
+            pool: self.read_pool(shard).await?,
+        })
+    }
+
+    /// Пул чтения закрытого списка шарда `shard` (см. [`PgMeta::read_db`]).
+    pub(crate) async fn read_pool(&self, shard: ShardId) -> Result<PgPool> {
+        if self.stale_attempt()
+            && let Some(replica) = self.replica_of(shard).await?
+            && replica.usable().await
+        {
+            return Ok(replica.pool().clone());
+        }
+        self.shard_pool(shard, ReadIntent::Primary).await
+    }
+
+    /// Справочник шардов; `None` — один шард без справочника.
+    pub fn shard_resolver(&self) -> Option<&Arc<dyn ShardResolver>> {
+        self.shards.0.as_ref()
+    }
+
+    /// Шард учётной записи: без справочника и при единственном шарде — [`ShardId::MAIN`] без запроса.
+    pub(crate) async fn shard_of(&self, scope: AccountScope) -> Result<ShardId> {
+        let Some(r) = &self.shards.0 else {
+            return Ok(ShardId::MAIN);
+        };
+        if r.shards().await?.len() <= 1 {
+            return Ok(ShardId::MAIN);
+        }
+        r.shard_of(scope).await
+    }
+
+    /// Пул шарда `shard`: основная БД — пул этих хранилищ.
+    pub(crate) async fn shard_pool(&self, shard: ShardId, intent: ReadIntent) -> Result<PgPool> {
+        match &self.shards.0 {
+            Some(r) if shard != ShardId::MAIN => r.pool(shard, intent).await,
+            _ => Ok(self.pool.clone()),
+        }
+    }
+
+    /// Шард и пул ящика учётной записи.
+    pub(crate) async fn box_db(&self, scope: AccountScope) -> Result<BoxDb> {
+        let shard = self.shard_of(scope).await?;
+        Ok(BoxDb {
+            shard,
+            pool: self.shard_pool(shard, ReadIntent::Primary).await?,
+        })
+    }
+
+    /// Пул ящика учётной записи.
+    pub(crate) async fn box_pool(&self, scope: AccountScope) -> Result<PgPool> {
+        Ok(self.box_db(scope).await?.pool)
+    }
+
+    /// Пулы всех шардов по возрастанию номера (системные выборки по всем ящикам).
+    pub(crate) async fn all_shards(&self) -> Result<Vec<BoxDb>> {
+        let ids = match &self.shards.0 {
+            Some(r) => r.shards().await?,
+            None => vec![ShardId::MAIN],
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for shard in ids {
+            out.push(BoxDb {
+                shard,
+                pool: self.shard_pool(shard, ReadIntent::Primary).await?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Хранилища одного шарда `shard` без справочника: журнал событий, очередь и учёт BLOB этого шарда
+    /// (вызывающий, знающий шард ящика, — например, учёт ссылок BLOB при доставке). Шард
+    /// [`ShardId::MAIN`] — эти же хранилища над основной БД (с повтором над [`Failover`]).
+    pub async fn on_shard(&self, shard: ShardId) -> Result<PgMeta> {
+        let pool = self.shard_pool(shard, ReadIntent::Primary).await?;
+        let replica = ReplicaOf(self.replica_of(shard).await?);
+        Ok(Self {
+            pool,
+            cfg: self.cfg.clone(),
+            bus: self.bus.clone(),
+            failover: if shard == ShardId::MAIN {
+                self.failover.clone()
+            } else {
+                None
+            },
+            shards: Shards::default(),
+            routing: Arc::default(),
+            intent: self.intent,
+            replica,
+        })
+    }
+
+    /// Хранилища каждого шарда по возрастанию номера; `None` — один шард (хранилища работают сами).
+    pub(crate) async fn shard_views(&self) -> Result<Option<Vec<(ShardId, PgMeta)>>> {
+        let Some(r) = &self.shards.0 else {
+            return Ok(None);
+        };
+        let ids = r.shards().await?;
+        if ids.len() <= 1 {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push((id, self.on_shard(id).await?));
+        }
+        Ok(Some(out))
+    }
+
+    /// Маршруты по шардам.
+    pub(crate) fn routing(&self) -> &Routing {
+        &self.routing
+    }
+
+    /// Запись с ключом в транзакции организации на шарде `db`: основная БД — [`keyed`](Self::keyed),
+    /// другой шард — один раз.
+    pub(crate) async fn keyed_at<T, F, C>(
+        &self,
+        db: &BoxDb,
+        tenant: TenantId,
+        f: F,
+        committed: C,
+    ) -> Result<T>
+    where
+        F: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, T>,
+        C: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, Option<T>>,
+    {
+        if db.shard == ShardId::MAIN {
+            self.keyed(tenant, f, committed).await
+        } else {
+            pool::with_tenant(&db.pool, tenant, f).await
+        }
     }
 
     /// Публикует сигнал после фиксации; ошибка — только в журнал узла (сигнал at-most-once).

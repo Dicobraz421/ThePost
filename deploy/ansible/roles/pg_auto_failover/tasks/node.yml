@@ -126,7 +126,7 @@
 - name: Check recovery mode
   community.postgresql.postgresql_query:
     query: SELECT pg_is_in_recovery() AS standby
-    port: "{{ pgaf_port }}"
+    login_port: "{{ pgaf_port }}"
   register: pgaf_recovery
   changed_when: false
   become: true
@@ -137,8 +137,7 @@
   community.postgresql.postgresql_user:
     name: "{{ item.name }}"
     password: "{{ item.password }}"
-    update_password: always
-    port: "{{ pgaf_port }}"
+    login_port: "{{ pgaf_port }}"
   loop:
     - { name: pgautofailover_replicator, password: "{{ pgaf_replicator_password }}" }
     - { name: pgautofailover_monitor, password: "{{ pgaf_monitor_password }}" }
@@ -152,14 +151,14 @@
 # Следующий узел формации — после того как этот дошёл до назначенного монитором состояния.
 - name: Wait for assigned state
   community.postgresql.postgresql_query:
-    db: "{{ pgaf_monitor_db }}"
+    login_db: "{{ pgaf_monitor_db }}"
     query: >-
       SELECT reportedstate::text AS reported, goalstate::text AS goal FROM pgautofailover.node
       WHERE formationid = %(formation)s AND nodename = %(name)s
     named_args:
       formation: "{{ pgaf_formation }}"
       name: "{{ pgaf_name }}"
-    port: "{{ pgaf_port }}"
+    login_port: "{{ pgaf_port }}"
   delegate_to: "{{ pgaf_monitor_host }}"
   register: pgaf_state
   until: >-

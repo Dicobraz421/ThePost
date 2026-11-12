@@ -1,0 +1,236 @@
+# Прогон сценария (DEP-04, DEP-13, DEP-14): срезы узла SMB (smb-sampler.py) на всё время, run-scenario.sh на
+# генераторе; для faults — kill -9 узла и перезапуск PostgreSQL на 1/3 и 2/3 длительности. После нагрузки срезы
+# узла кладутся в каталог прогона генератора, run-scenario.sh строит criteria.md; отчёт — в
+# deploy/stand/reports/<прогон>-<сценарий>/. Задача падает, если в criteria.md есть «не прошёл».
+---
+- name: Check scenario
+  ansible.builtin.assert:
+    that: stand_scenario in stand_scenarios
+    fail_msg: "Сценарий {{ stand_scenario }}: нет в stand_scenarios ({{ stand_scenarios | list | join(', ') }})"
+
+- name: Write stand parameters
+  ansible.builtin.template:
+    src: stand.env.j2
+    dest: "{{ stand_etc_dir }}/stand.env"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Fix run identifier
+  ansible.builtin.set_fact:
+    stand_run: "{{ lookup('ansible.builtin.pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+- name: Set run paths
+  ansible.builtin.set_fact:
+    stand_out: "{{ stand_dir }}/reports/{{ stand_run }}-{{ stand_scenario }}"
+    stand_smb_out: "{{ stand_smb_samples_dir }}/{{ stand_run }}-{{ stand_scenario }}"
+    stand_local_reports: "{{ playbook_dir }}/reports/{{ stand_run }}-{{ stand_scenario }}"
+    stand_run_duration: >-
+      {{ (stand_duration | string | length > 0) | ternary(stand_duration, stand_scenarios[stand_scenario].duration) | int }}
+    stand_service_http: "https://127.0.0.1:{{ hostvars[stand_smb_host].thepost_service_http_port | default(8081) }}"
+
+- name: Create local report directory
+  ansible.builtin.file:
+    path: "{{ stand_local_reports }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+
+- name: Install SMB sampler
+  ansible.builtin.copy:
+    src: smb-sampler.py
+    dest: /usr/local/sbin/thepost-stand-sampler
+    owner: root
+    group: root
+    mode: "0755"
+  delegate_to: "{{ stand_smb_host }}"
+
+- name: Read SMB clock before run
+  ansible.builtin.command: date -u +%s
+  delegate_to: "{{ stand_smb_host }}"
+  register: stand_smb_start
+  changed_when: false
+
+# Служебный HTTP узла SMB — только loopback; имя в сертификате — thepost_hostname, не 127.0.0.1.
+- name: Snapshot SMB metrics before run
+  ansible.builtin.uri:
+    url: "{{ stand_service_http }}/metrics"
+    validate_certs: false
+    return_content: true
+  delegate_to: "{{ stand_smb_host }}"
+  register: stand_metrics_before
+
+- name: Start SMB sampler
+  ansible.builtin.command:
+    argv:
+      - /usr/local/sbin/thepost-stand-sampler
+      - "{{ stand_smb_out }}"
+      - "{{ stand_sample_interval }}"
+      - "{{ stand_service_http }}"
+      - "280000"
+  delegate_to: "{{ stand_smb_host }}"
+  register: stand_sampler
+  changed_when: false
+  async: 280000
+  poll: 0
+
+# Пустые длительность и множитель — значения сценария (Д.6). Длинный сценарий — 72 ч: ожидание до 75 ч.
+- name: Start scenario on generator
+  ansible.builtin.command:
+    argv:
+      - "{{ stand_dir }}/run-scenario.sh"
+      - "{{ stand_scenario }}"
+      - "{{ stand_duration | default('') }}"
+      - "{{ stand_factor | default('') }}"
+  environment:
+    RUN_ID: "{{ stand_run }}"
+    WAIT_SMB: "1"
+  register: stand_job
+  changed_when: true
+  async: 270000
+  poll: 0
+
+- name: Inject faults (kill -9 of node, PostgreSQL restart)
+  when: stand_scenario == 'faults'
+  block:
+    - name: Wait for load start
+      ansible.builtin.wait_for:
+        path: "{{ stand_out }}/load.started"
+        timeout: 7200
+
+    - name: Wait 1/3 of scenario
+      ansible.builtin.pause:
+        seconds: "{{ (stand_run_duration | int / 3) | int }}"
+
+    - name: Kill node process (SIGKILL)
+      ansible.builtin.shell: date +%s.%N | cut -c1-14 && systemctl kill --signal=SIGKILL thepost
+      delegate_to: "{{ stand_smb_host }}"
+      register: stand_fault_kill
+      changed_when: true
+
+    - name: Record node kill
+      ansible.builtin.shell: echo "{{ stand_fault_kill.stdout_lines[0] }} kill-node" >>"{{ stand_out }}/events.txt"
+      changed_when: false
+
+    - name: Wait next 1/3 of scenario
+      ansible.builtin.pause:
+        seconds: "{{ (stand_run_duration | int / 3) | int }}"
+
+    - name: Restart PostgreSQL
+      ansible.builtin.shell: >-
+        date +%s.%N | cut -c1-14 &&
+        systemctl restart {{ hostvars[stand_smb_host].postgresql_service | default('postgresql') }}
+      delegate_to: "{{ stand_smb_host }}"
+      register: stand_fault_pg
+      changed_when: true
+
+    - name: Record PostgreSQL restart
+      ansible.builtin.shell: echo "{{ stand_fault_pg.stdout_lines[0] }} restart-postgresql" >>"{{ stand_out }}/events.txt"
+      changed_when: false
+
+- name: Wait for end of load
+  ansible.builtin.wait_for:
+    path: "{{ stand_out }}/load.done"
+    timeout: 270000
+    sleep: 10
+
+- name: Stop SMB sampler
+  ansible.builtin.file:
+    path: "{{ stand_smb_out }}/stop"
+    state: touch
+    mode: "0644"
+  delegate_to: "{{ stand_smb_host }}"
+
+- name: Wait for SMB sampler
+  ansible.builtin.async_status:
+    jid: "{{ stand_sampler.ansible_job_id }}"
+  delegate_to: "{{ stand_smb_host }}"
+  register: stand_sampler_status
+  until: stand_sampler_status.finished
+  retries: 30
+  delay: 5
+
+- name: Fetch SMB samples
+  ansible.builtin.fetch:
+    src: "{{ stand_smb_out }}/smb-samples.csv"
+    dest: "{{ stand_local_reports }}/"
+    flat: true
+  delegate_to: "{{ stand_smb_host }}"
+
+- name: Put SMB samples into generator report
+  ansible.builtin.copy:
+    src: "{{ stand_local_reports }}/smb-samples.csv"
+    dest: "{{ stand_out }}/smb-samples.csv"
+    mode: "0644"
+
+- name: Signal SMB samples ready
+  ansible.builtin.file:
+    path: "{{ stand_out }}/smb.done"
+    state: touch
+    mode: "0644"
+
+- name: Wait for report
+  ansible.builtin.async_status:
+    jid: "{{ stand_job.ansible_job_id }}"
+  register: stand_result
+  until: stand_result.finished
+  retries: 120
+  delay: 10
+  failed_when: false
+
+- name: Snapshot SMB metrics after run
+  ansible.builtin.uri:
+    url: "{{ stand_service_http }}/metrics"
+    validate_certs: false
+    return_content: true
+  delegate_to: "{{ stand_smb_host }}"
+  register: stand_metrics_after
+
+- name: Collect SMB journal warnings
+  ansible.builtin.command:
+    argv: [journalctl, -u, thepost, --since, "@{{ stand_smb_start.stdout }}", -p, warning, --no-pager]
+  delegate_to: "{{ stand_smb_host }}"
+  register: stand_journal
+  changed_when: false
+
+- name: Save SMB metrics and journal
+  ansible.builtin.copy:
+    content: "{{ item.content }}"
+    dest: "{{ stand_local_reports }}/{{ item.name }}"
+    mode: "0644"
+  loop:
+    - { name: smb-metrics-before.txt, content: "{{ stand_metrics_before.content }}" }
+    - { name: smb-metrics-after.txt, content: "{{ stand_metrics_after.content }}" }
+    - { name: smb-journal-warnings.txt, content: "{{ stand_journal.stdout }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  delegate_to: localhost
+  become: false
+
+- name: List generator report files
+  ansible.builtin.find:
+    paths: "{{ stand_out }}"
+    recurse: true
+  register: stand_files
+
+- name: Fetch generator report
+  ansible.builtin.fetch:
+    src: "{{ item.path }}"
+    dest: "{{ stand_local_reports }}/{{ item.path | relpath(stand_out) }}"
+    flat: true
+  loop: "{{ stand_files.files }}"
+  loop_control:
+    label: "{{ item.path | relpath(stand_out) }}"
+
+- name: Show summary
+  ansible.builtin.debug:
+    msg: "{{ (stand_result.stdout_lines | default([])) + (stand_result.stderr_lines | default([])) + ['Отчёт: ' ~ stand_local_reports] }}"
+
+- name: Check criteria D.7
+  ansible.builtin.assert:
+    that: stand_result.rc | default(1) == 0
+    fail_msg: >-
+      {{ 'Есть «не прошёл» — ' ~ stand_local_reports ~ '/criteria.md' if stand_result.rc | default(1) == 1
+         else 'Прогон не состоялся (код ' ~ (stand_result.rc | default('—')) ~ '), см. вывод выше' }}
+    success_msg: "Все измеренные критерии Д.7 прошли — {{ stand_local_reports }}/criteria.md"

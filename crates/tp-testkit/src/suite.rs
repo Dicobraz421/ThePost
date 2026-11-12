@@ -29,9 +29,17 @@ use futures::StreamExt;
 use time::OffsetDateTime;
 use tp_contracts::abuse::{AbuseBlock, AbuseBlocks, BlockSubject};
 use tp_contracts::acl::{ANYONE, AclEntry, AclStore, SendDelegation, SharedMailbox};
+use tp_contracts::addressbook::{
+    ContactStore, DynamicGroup, DynamicGroupStore, MailContact, MemberFilter, Members,
+    OrgAttributes, OrgMember, OrgStore, OrgUnit, unit_path,
+};
 use tp_contracts::admin_token::{LocalAdminToken, LocalAdminTokens};
 use tp_contracts::app_password::{AppPassword, AppPasswordStore};
-use tp_contracts::auth::{Rights, SendRight};
+use tp_contracts::audit::{
+    AuditAction, AuditActorKind, AuditCursor, AuditEntry, AuditObject, AuditPage, AuditPolicy,
+    AuditQuery, MailboxAudit,
+};
+use tp_contracts::auth::{MassRemoval, Rights, SendRight, SyncGate};
 use tp_contracts::blob::{Acquire, BlobIndex, Commit, Compression};
 use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
 use tp_contracts::delivery::{
@@ -40,13 +48,14 @@ use tp_contracts::delivery::{
 use tp_contracts::events::{Partition, PartitionAssigner, ShardEventLogs, ShardPartition};
 use tp_contracts::ext::{Decision, DecisionHook, DecisionHooks, FinalDelete};
 use tp_contracts::groups::{
-    DistributionGroup, GroupMember, GroupStore, HeldMessage, Moderation, SenderRestriction,
+    DistributionGroup, GroupMember, GroupStore, HeldMessage, HoldSource, Moderation, Moderator,
+    SenderRestriction,
 };
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountStore, AccountUpsert, MailboxStore, MessageQuery, MessageStore,
-    NewMailbox, NewMessage, PolicyResolver, SpecialUse,
+    Account, AccountScope, AccountState, AccountStore, AccountUpsert, MailboxStore, MessageQuery,
+    MessageStore, NewMailbox, NewMessage, PolicyResolver, SpecialUse,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -58,14 +67,15 @@ use tp_contracts::retention::{
 use tp_contracts::role::Role;
 use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
 use tp_contracts::secrets::{SecretLease, SecretRef, SecretStore};
-use tp_contracts::submission::{EmailSubmission, SubmissionStore, UndoStatus};
+use tp_contracts::senders::{SenderList, SenderLists, SenderVerdict};
+use tp_contracts::submission::{EmailSubmission, SubmissionFilter, SubmissionStore, UndoStatus};
 use tp_contracts::transport::{
     AcceptedDomain, AddressPattern, DestinationPolicy, DomainKind, EnvelopeSide, RewriteRule,
     SourceKind, SourceMatch, TenantTransport, TlsRequirement, TransportStore, TrustedSource,
 };
 use tp_contracts::{
-    AccountId, BlobHash, BlobKey, DomainId, Error, Gen, GroupId, HeldId, MailboxId, MessageId,
-    QueueId, ShardId, TenantId,
+    AccountId, BlobHash, BlobKey, ContactId, DomainId, Error, Gen, GroupId, HeldId, MailboxId,
+    MessageId, OrgUnitId, QueueId, ShardId, TenantId,
 };
 
 use crate::ManualClock;
@@ -277,6 +287,14 @@ pub async fn membership_info(m: &dyn Membership, ttl: Duration, wait: &dyn Wait)
     wait.wait(ttl + ttl / 4).await;
     assert!(ours().await.is_empty(), "запись a истекла");
 }
+
+// ---------- Календари и контакты, Sieve (CTR-45, CTR-46) ----------
+
+pub mod dav;
+pub mod sieve;
+
+pub use dav::dav;
+pub use sieve::sieve;
 
 // ---------- EventBus: сигналы ----------
 
@@ -2078,7 +2096,10 @@ pub async fn group_store(store: &dyn GroupStore, fx: &GroupFixture) {
     let base = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("time");
     let held = |s: i64, group: GroupId| HeldMessage {
         id: HeldId::new(),
-        group,
+        group: Some(group),
+        source: HoldSource::Group,
+        moderators: Vec::new(),
+        recipients: Vec::new(),
         sender: format!("d-{tag}@example.org"),
         sender_account: Some(d),
         message_id: Some(format!("{s}.{tag}@example.org")),
@@ -2404,11 +2425,12 @@ pub async fn moderation(m: &dyn Moderation, fx: &ModerationFixture) {
         ..fx.group.clone()
     };
     assert!(matches!(
-        m.deliver(fx.tenant, &other, &fx.approve).await,
+        m.deliver(fx.tenant, Some(&other), &fx.approve).await,
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        m.deliver(TenantId::new(), &fx.group, &fx.approve).await,
+        m.deliver(TenantId::new(), Some(&fx.group), &fx.approve)
+            .await,
         Err(Error::Invalid(_))
     ));
     for bad in ["", "a\nb"] {
@@ -2417,7 +2439,11 @@ pub async fn moderation(m: &dyn Moderation, fx: &ModerationFixture) {
             Err(Error::Invalid(_))
         ));
     }
-    m.deliver(fx.tenant, &fx.group, &fx.approve)
+    assert!(matches!(
+        m.deliver(fx.tenant, None, &fx.approve).await,
+        Err(Error::Invalid(_))
+    ));
+    m.deliver(fx.tenant, Some(&fx.group), &fx.approve)
         .await
         .expect("deliver");
     m.reject(fx.tenant, &fx.decline, "off-topic")
@@ -3213,4 +3239,1288 @@ pub async fn outbound_submit(ob: &dyn Outbound, tenant: TenantId, rcpts: &[Strin
     ob.enqueue(tenant, "suite@example.org", rcpts, raw)
         .await
         .expect("enqueue");
+}
+
+// ---------- Соответствие Exchange (CTR-35) ----------
+
+/// Набор проверок [`MailboxAudit`] (CTR-35): политика по умолчанию (не владелец — да, владелец — нет, чтение
+/// владельцем — никогда), политика ящика и организации, поиск со страницами и условиями, изоляция организаций.
+/// Моменты — текущие (журнал может быть секционирован по суткам); `purge` набор не проверяет. Политика организации
+/// `tenant` в конце сбрасывается.
+pub async fn mailbox_audit(audit: &dyn MailboxAudit, tenant: TenantId, foreign_tenant: TenantId) {
+    use AuditActorKind as K;
+    let owner = AccountScope {
+        tenant,
+        account: AccountId::new(),
+    };
+    let delegate = AccountId::new();
+    let now = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("time");
+    let entry = |kind: AuditActorKind, action: AuditAction, s: i64| AuditEntry {
+        scope: owner,
+        at: now - time::Duration::seconds(100 - s),
+        actor: match kind {
+            K::Owner => "owner@example.org".into(),
+            K::Delegate => "delegate@example.org".into(),
+            K::Admin => "admin-subject".into(),
+        },
+        actor_account: match kind {
+            K::Owner => Some(owner.account),
+            K::Delegate => Some(delegate),
+            K::Admin => None,
+        },
+        actor_kind: kind,
+        action,
+        object: AuditObject {
+            detail: Some(format!("step {s}")),
+            ..AuditObject::default()
+        },
+        client: Some("imap 192.0.2.1".into()),
+    };
+    assert_eq!(
+        audit.audit_policy(owner).await.expect("policy"),
+        AuditPolicy::default()
+    );
+    let rec = async |e: AuditEntry| audit.record_audit(e).await.expect("record");
+    assert!(rec(entry(K::Delegate, AuditAction::Read, 1)).await);
+    assert!(rec(entry(K::Admin, AuditAction::Login, 2)).await);
+    assert!(!rec(entry(K::Owner, AuditAction::Delete, 3)).await);
+    let mut foreign_owner = entry(K::Owner, AuditAction::Delete, 3);
+    foreign_owner.actor_account = Some(delegate);
+    assert!(matches!(
+        audit.record_audit(foreign_owner).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Политика ящика: удаление владельцем — да, перемещение — нет, чтение — никогда.
+    let only_delete = AuditPolicy {
+        non_owner: true,
+        owner: [AuditAction::Delete].into_iter().collect(),
+    };
+    audit
+        .set_audit_policy(tenant, Some(owner.account), Some(only_delete.clone()))
+        .await
+        .expect("mailbox policy");
+    assert!(rec(entry(K::Owner, AuditAction::Delete, 4)).await);
+    assert!(!rec(entry(K::Owner, AuditAction::Move, 5)).await);
+    assert!(!rec(entry(K::Owner, AuditAction::Read, 6)).await);
+    let reading = AuditPolicy {
+        non_owner: true,
+        owner: [AuditAction::Read].into_iter().collect(),
+    };
+    assert!(matches!(
+        audit.set_audit_policy(tenant, None, Some(reading)).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Политика организации — для ящиков без своей; сброс возвращает значение по умолчанию.
+    let other = AccountScope {
+        tenant,
+        account: AccountId::new(),
+    };
+    audit
+        .set_audit_policy(tenant, None, Some(AuditPolicy::all()))
+        .await
+        .expect("tenant policy");
+    assert_eq!(
+        audit.audit_policy(other).await.expect("other"),
+        AuditPolicy::all()
+    );
+    assert_eq!(audit.audit_policy(owner).await.expect("owner"), only_delete);
+    audit
+        .set_audit_policy(tenant, None, None)
+        .await
+        .expect("reset tenant");
+    assert_eq!(
+        audit.audit_policy(other).await.expect("other reset"),
+        AuditPolicy::default()
+    );
+    audit
+        .set_audit_policy(tenant, Some(owner.account), None)
+        .await
+        .expect("reset mailbox");
+    assert_eq!(
+        audit.audit_policy(owner).await.expect("owner reset"),
+        AuditPolicy::default()
+    );
+
+    // Поиск: записи ящика по времени, страницы, условия.
+    let q = AuditQuery {
+        account: Some(owner.account),
+        ..AuditQuery::all(2)
+    };
+    let steps = |p: &AuditPage| -> Vec<(AuditActorKind, AuditAction)> {
+        p.entries.iter().map(|e| (e.actor_kind, e.action)).collect()
+    };
+    let p1 = audit.search_audit(tenant, &q).await.expect("page 1");
+    assert_eq!(
+        steps(&p1),
+        [
+            (K::Delegate, AuditAction::Read),
+            (K::Admin, AuditAction::Login)
+        ]
+    );
+    assert_eq!(p1.entries[0], entry(K::Delegate, AuditAction::Read, 1));
+    let p2 = audit
+        .search_audit(
+            tenant,
+            &AuditQuery {
+                after: p1.next.clone(),
+                ..q.clone()
+            },
+        )
+        .await
+        .expect("page 2");
+    assert_eq!(steps(&p2), [(K::Owner, AuditAction::Delete)]);
+    assert_eq!(p2.next, None);
+    let owner_only = audit
+        .search_audit(
+            tenant,
+            &AuditQuery {
+                account: Some(owner.account),
+                actor_kind: Some(K::Owner),
+                ..AuditQuery::all(10)
+            },
+        )
+        .await
+        .expect("by kind");
+    assert_eq!(steps(&owner_only), [(K::Owner, AuditAction::Delete)]);
+    let by_actor = audit
+        .search_audit(
+            tenant,
+            &AuditQuery {
+                account: Some(owner.account),
+                actor: Some("DELEGATE@example.org".into()),
+                ..AuditQuery::all(10)
+            },
+        )
+        .await
+        .expect("by actor");
+    assert_eq!(steps(&by_actor), [(K::Delegate, AuditAction::Read)]);
+    let alien = audit
+        .search_audit(foreign_tenant, &q)
+        .await
+        .expect("foreign");
+    assert!(alien.entries.is_empty());
+    assert!(matches!(
+        audit.search_audit(tenant, &AuditQuery::all(0)).await,
+        Err(Error::Invalid(_))
+    ));
+    let garbage = AuditQuery {
+        after: Some(AuditCursor("garbage".into())),
+        ..q
+    };
+    assert!(matches!(
+        audit.search_audit(tenant, &garbage).await,
+        Err(Error::Invalid(_))
+    ));
+}
+
+/// Набор проверок [`SenderLists`] (CTR-35): пустые списки нового ящика, замена с приведением записей, состояние,
+/// вердикт (адрес приоритетнее домена, надёжный — заблокированного), некорректный список, изоляция ящиков.
+pub async fn sender_lists(lists: &dyn SenderLists, scope: AccountScope, other: AccountScope) {
+    assert_eq!(
+        lists.sender_list(scope).await.expect("empty"),
+        SenderList::default()
+    );
+    assert_eq!(lists.sender_list_state(scope).await.expect("state 0"), 0);
+    let s1 = lists
+        .put_sender_list(
+            scope,
+            SenderList {
+                safe: vec!["Boss@Partner.example".into(), "@trusted.example".into()],
+                blocked: vec!["partner.example".into(), "spam.example".into()],
+            },
+        )
+        .await
+        .expect("put");
+    assert!(s1 > 0);
+    assert_eq!(lists.sender_list_state(scope).await.expect("state"), s1);
+    assert_eq!(
+        lists.sender_list(scope).await.expect("get"),
+        SenderList {
+            safe: vec!["boss@partner.example".into(), "trusted.example".into()],
+            blocked: vec!["partner.example".into(), "spam.example".into()],
+        }
+    );
+    for (from, want) in [
+        ("boss@partner.example", Some(SenderVerdict::Safe)),
+        ("clerk@partner.example", Some(SenderVerdict::Blocked)),
+        ("anyone@TRUSTED.example", Some(SenderVerdict::Safe)),
+        ("x@sub.spam.example", None),
+        ("", None),
+    ] {
+        assert_eq!(
+            lists.sender_verdict(scope, from).await.expect("verdict"),
+            want,
+            "{from}"
+        );
+    }
+    let bad = SenderList {
+        safe: vec!["not an address".into()],
+        blocked: vec![],
+    };
+    assert!(matches!(
+        lists.put_sender_list(scope, bad).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(lists.sender_list_state(scope).await.expect("unchanged"), s1);
+    assert_eq!(
+        lists.sender_list(other).await.expect("other"),
+        SenderList::default()
+    );
+    assert_eq!(
+        lists
+            .sender_verdict(other, "x@spam.example")
+            .await
+            .expect("other verdict"),
+        None
+    );
+    let s2 = lists
+        .put_sender_list(scope, SenderList::default())
+        .await
+        .expect("clear");
+    assert!(s2 > s1);
+    assert_eq!(
+        lists
+            .sender_verdict(scope, "x@spam.example")
+            .await
+            .expect("cleared"),
+        None
+    );
+}
+
+fn mail_contact(tenant: TenantId, email: String, external_id: Option<String>) -> MailContact {
+    MailContact {
+        id: ContactId::new(),
+        tenant,
+        display_name: "Партнёр".into(),
+        email,
+        external_id,
+        attributes: Default::default(),
+        groups: Vec::new(),
+        hidden_from_gal: false,
+    }
+}
+
+fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
+    v.sort_unstable();
+    v
+}
+
+/// Набор проверок [`ContactStore`] (CTR-35): создание и замена, поиск по адресу (без учёта регистра) и по
+/// идентификатору каталога, занятый адрес или `external_id` — `Conflict`, состав групп, удаление, изоляция
+/// организаций. Адреса — с уникальной меткой.
+pub async fn contact_store(store: &dyn ContactStore, tenant: TenantId, foreign_tenant: TenantId) {
+    let tag = AccountId::new().to_string();
+    let addr = |who: &str| format!("{who}-{tag}@partner.example");
+    let ext = format!("ext-{tag}");
+    let (g1, g2) = (GroupId::new(), GroupId::new());
+    let mut c1 = mail_contact(tenant, addr("ann"), Some(ext.clone()));
+    c1.groups = vec![g2, g1, g2];
+    store.put_contact(c1.clone()).await.expect("put c1");
+    let got = store
+        .contact(tenant, c1.id)
+        .await
+        .expect("get")
+        .expect("c1");
+    assert_eq!(got.groups, sorted(vec![g1, g2]));
+    let found = store
+        .contact_by_address(tenant, &addr("ann").to_uppercase())
+        .await
+        .expect("by address");
+    assert_eq!(found.map(|c| c.id), Some(c1.id));
+    let found = store
+        .contact_by_external_id(tenant, &ext)
+        .await
+        .expect("by ext");
+    assert_eq!(found.map(|c| c.id), Some(c1.id));
+    let twin = mail_contact(tenant, addr("Ann"), None);
+    assert_eq!(store.put_contact(twin).await, Err(Error::Conflict));
+    let same_ext = mail_contact(tenant, addr("bob"), Some(ext.clone()));
+    assert_eq!(store.put_contact(same_ext).await, Err(Error::Conflict));
+    let bad = mail_contact(tenant, "no-at-sign".into(), None);
+    assert!(matches!(
+        store.put_contact(bad).await,
+        Err(Error::Invalid(_))
+    ));
+
+    let mut c2 = mail_contact(tenant, addr("bob"), None);
+    c2.groups = vec![g1];
+    store.put_contact(c2.clone()).await.expect("put c2");
+    let want = sorted(vec![c1.id, c2.id]);
+    let in_g1: Vec<_> = store
+        .group_contacts(tenant, g1)
+        .await
+        .expect("g1")
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(in_g1, want, "group contacts by id");
+    let listed: Vec<_> = store
+        .contacts(tenant)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|c| c.id)
+        .filter(|id| want.contains(id))
+        .collect();
+    assert_eq!(listed, want, "list by id");
+
+    // Замена: прежний адрес освобождается.
+    let moved = MailContact {
+        email: addr("ann-new"),
+        ..c1.clone()
+    };
+    store.put_contact(moved).await.expect("replace");
+    assert_eq!(
+        store
+            .contact_by_address(tenant, &addr("ann"))
+            .await
+            .expect("old"),
+        None
+    );
+    assert_eq!(
+        store.contact(foreign_tenant, c1.id).await.expect("foreign"),
+        None
+    );
+    assert_eq!(
+        store
+            .contact_by_address(foreign_tenant, &addr("ann-new"))
+            .await
+            .expect("foreign address"),
+        None
+    );
+    store.remove_contact(tenant, c1.id).await.expect("remove");
+    assert_eq!(
+        store.remove_contact(tenant, c1.id).await,
+        Err(Error::NotFound)
+    );
+    store
+        .remove_contact(tenant, c2.id)
+        .await
+        .expect("remove c2");
+    assert!(
+        store
+            .group_contacts(tenant, g1)
+            .await
+            .expect("g1 empty")
+            .is_empty()
+    );
+}
+
+fn org_unit(tenant: TenantId, name: &str, parent: Option<OrgUnitId>) -> OrgUnit {
+    OrgUnit {
+        id: OrgUnitId::new(),
+        tenant,
+        name: name.into(),
+        parent,
+        external_id: None,
+    }
+}
+
+/// Набор проверок [`OrgStore`] (CTR-35): дерево подразделений (неизвестный родитель и цикл — `Invalid`, занятый
+/// `external_id` — `Conflict`, удаление с вложенными — `Conflict`), оргатрибуты, члены подразделения по
+/// старшинству, сброс подразделения при удалении. `accounts` — не менее трёх существующих учётных записей
+/// организации без оргатрибутов; в конце оргатрибуты сбрасываются.
+pub async fn org_store(store: &dyn OrgStore, tenant: TenantId, accounts: &[AccountId]) {
+    let [a1, a2, a3] = [accounts[0], accounts[1], accounts[2]];
+    let tag = AccountId::new().to_string();
+    let root = OrgUnit {
+        external_id: Some(format!("ou-{tag}")),
+        ..org_unit(tenant, "Компания", None)
+    };
+    let it = org_unit(tenant, "ИТ", Some(root.id));
+    let dev = org_unit(tenant, "Разработка", Some(it.id));
+    for u in [&root, &it, &dev] {
+        store.put_org_unit(u.clone()).await.expect("put unit");
+    }
+    let orphan = org_unit(tenant, "Сирота", Some(OrgUnitId::new()));
+    assert!(matches!(
+        store.put_org_unit(orphan).await,
+        Err(Error::Invalid(_))
+    ));
+    let looped = OrgUnit {
+        parent: Some(dev.id),
+        ..root.clone()
+    };
+    assert!(matches!(
+        store.put_org_unit(looped).await,
+        Err(Error::Invalid(_))
+    ));
+    let twin = OrgUnit {
+        external_id: root.external_id.clone(),
+        ..org_unit(tenant, "Двойник", None)
+    };
+    assert_eq!(store.put_org_unit(twin).await, Err(Error::Conflict));
+    let renamed = OrgUnit {
+        name: "Информационные технологии".into(),
+        ..it.clone()
+    };
+    store.put_org_unit(renamed).await.expect("rename");
+    let units = store.org_units(tenant).await.expect("units");
+    let path: Vec<_> = unit_path(&units, dev.id)
+        .iter()
+        .map(|u| u.name.clone())
+        .collect();
+    assert_eq!(
+        path,
+        ["Компания", "Информационные технологии", "Разработка"]
+    );
+
+    let engineer = OrgAttributes {
+        department: Some(dev.id),
+        title: Some("Инженер".into()),
+        manager: Some(a2),
+        seniority: Some(10),
+        attributes: [("office".to_owned(), format!("Офис {tag}"))]
+            .into_iter()
+            .collect(),
+    };
+    store
+        .set_org(tenant, a1, engineer.clone())
+        .await
+        .expect("a1");
+    let head = OrgAttributes {
+        department: Some(it.id),
+        seniority: Some(20),
+        ..OrgAttributes::default()
+    };
+    store.set_org(tenant, a2, head).await.expect("a2");
+    let junior = OrgAttributes {
+        department: Some(dev.id),
+        ..OrgAttributes::default()
+    };
+    store.set_org(tenant, a3, junior).await.expect("a3");
+    assert_eq!(store.org(tenant, a1).await.expect("org a1"), engineer);
+    assert_eq!(
+        store.org(tenant, AccountId::new()).await.expect("none"),
+        OrgAttributes::default()
+    );
+    let unknown_unit = OrgAttributes {
+        department: Some(OrgUnitId::new()),
+        ..OrgAttributes::default()
+    };
+    assert!(matches!(
+        store.set_org(tenant, a1, unknown_unit).await,
+        Err(Error::Invalid(_))
+    ));
+    let own_manager = OrgAttributes {
+        manager: Some(a1),
+        ..OrgAttributes::default()
+    };
+    assert!(matches!(
+        store.set_org(tenant, a1, own_manager).await,
+        Err(Error::Invalid(_))
+    ));
+
+    let ids = |m: Vec<OrgMember>| m.into_iter().map(|m| m.account).collect::<Vec<_>>();
+    // a1 старше (10), a3 без старшинства; руководитель ИТ a2 — 20.
+    let dev_members = store
+        .org_members(tenant, Some(dev.id), false)
+        .await
+        .expect("dev");
+    assert_eq!(ids(dev_members), [a1, a3]);
+    let subtree = store
+        .org_members(tenant, Some(it.id), true)
+        .await
+        .expect("it subtree");
+    assert_eq!(ids(subtree), [a2, a1, a3]);
+    let it_only = store
+        .org_members(tenant, Some(it.id), false)
+        .await
+        .expect("it");
+    assert_eq!(ids(it_only), [a2]);
+    assert!(
+        store
+            .org_members(tenant, Some(root.id), false)
+            .await
+            .expect("root")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .org_members(tenant, Some(OrgUnitId::new()), true)
+            .await,
+        Err(Error::NotFound)
+    );
+
+    assert_eq!(
+        store.remove_org_unit(tenant, it.id).await,
+        Err(Error::Conflict)
+    );
+    store
+        .remove_org_unit(tenant, dev.id)
+        .await
+        .expect("remove dev");
+    assert_eq!(
+        store.remove_org_unit(tenant, dev.id).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        store.org(tenant, a1).await.expect("a1 after").department,
+        None
+    );
+    assert_eq!(
+        store.org(tenant, a3).await.expect("a3 after"),
+        OrgAttributes::default()
+    );
+    for id in [it.id, root.id] {
+        store.remove_org_unit(tenant, id).await.expect("cleanup");
+    }
+    for a in [a1, a2] {
+        store
+            .set_org(tenant, a, OrgAttributes::default())
+            .await
+            .expect("reset");
+    }
+}
+
+/// Окружение набора [`dynamic_groups`].
+#[derive(Debug, Clone)]
+pub struct DynamicFixture {
+    /// Организация.
+    pub tenant: TenantId,
+    /// Существующая группа рассылки организации без статических членов.
+    pub group: GroupId,
+    /// Не менее трёх существующих учётных записей организации без оргатрибутов.
+    pub accounts: Vec<AccountId>,
+}
+
+/// Набор проверок [`DynamicGroupStore`] (CTR-35): фильтр по атрибутам и подразделению, учётные записи и контакты
+/// в составе, некорректный фильтр — `Invalid`, снятие фильтра. Значения атрибутов — с уникальной меткой.
+pub async fn dynamic_groups(
+    contacts: &dyn ContactStore,
+    org: &dyn OrgStore,
+    dynamic: &dyn DynamicGroupStore,
+    fx: &DynamicFixture,
+) {
+    let t = fx.tenant;
+    let [a1, a2, a3] = [fx.accounts[0], fx.accounts[1], fx.accounts[2]];
+    let tag = AccountId::new().to_string();
+    let office = format!("Москва {tag}");
+    let unit = org_unit(t, "Отдел", None);
+    org.put_org_unit(unit.clone()).await.expect("unit");
+    let with_office = |department: Option<OrgUnitId>, title: &str| OrgAttributes {
+        department,
+        title: Some(title.into()),
+        attributes: [("office".to_owned(), office.clone())]
+            .into_iter()
+            .collect(),
+        ..OrgAttributes::default()
+    };
+    org.set_org(t, a1, with_office(Some(unit.id), "Инженер"))
+        .await
+        .expect("a1");
+    org.set_org(t, a2, with_office(None, "Бухгалтер"))
+        .await
+        .expect("a2");
+    let other_office = OrgAttributes {
+        title: Some("Инженер".into()),
+        ..OrgAttributes::default()
+    };
+    org.set_org(t, a3, other_office).await.expect("a3");
+    let mut partner = mail_contact(t, format!("p-{tag}@partner.example"), None);
+    partner.attributes = [("Office".to_owned(), office.to_uppercase())]
+        .into_iter()
+        .collect();
+    contacts
+        .put_contact(partner.clone())
+        .await
+        .expect("contact");
+
+    let by_office = MemberFilter::Equals {
+        attribute: "office".into(),
+        value: office.clone(),
+    };
+    let mut g = DynamicGroup {
+        group: fx.group,
+        tenant: t,
+        filter: by_office.clone(),
+        contacts: false,
+    };
+    dynamic.put_dynamic(g.clone()).await.expect("put");
+    assert_eq!(
+        dynamic.dynamic(t, fx.group).await.expect("get"),
+        Some(g.clone())
+    );
+    let listed = dynamic.dynamic_groups(t).await.expect("list");
+    assert!(listed.iter().any(|x| x.group == fx.group));
+    let both = sorted(vec![a1, a2]);
+    assert_eq!(
+        dynamic.expand_dynamic(t, fx.group).await.expect("expand"),
+        Members {
+            accounts: both.clone(),
+            contacts: Vec::new(),
+        }
+    );
+    g.contacts = true;
+    dynamic.put_dynamic(g.clone()).await.expect("with contacts");
+    assert_eq!(
+        dynamic
+            .expand_dynamic(t, fx.group)
+            .await
+            .expect("expand contacts"),
+        Members {
+            accounts: both,
+            contacts: vec![partner.id],
+        }
+    );
+    g.filter = MemberFilter::All(vec![
+        by_office,
+        MemberFilter::Unit {
+            unit: unit.id,
+            subtree: true,
+        },
+    ]);
+    dynamic.put_dynamic(g.clone()).await.expect("by unit");
+    assert_eq!(
+        dynamic
+            .expand_dynamic(t, fx.group)
+            .await
+            .expect("expand unit"),
+        Members {
+            accounts: vec![a1],
+            contacts: Vec::new(),
+        }
+    );
+    let bad = DynamicGroup {
+        filter: MemberFilter::Present {
+            attribute: "bad attribute".into(),
+        },
+        ..g
+    };
+    assert!(matches!(
+        dynamic.put_dynamic(bad).await,
+        Err(Error::Invalid(_))
+    ));
+
+    dynamic.remove_dynamic(t, fx.group).await.expect("remove");
+    assert_eq!(
+        dynamic.remove_dynamic(t, fx.group).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(dynamic.dynamic(t, fx.group).await.expect("gone"), None);
+    assert_eq!(
+        dynamic.expand_dynamic(t, fx.group).await,
+        Err(Error::NotFound)
+    );
+
+    contacts
+        .remove_contact(t, partner.id)
+        .await
+        .expect("cleanup contact");
+    for a in [a1, a2, a3] {
+        org.set_org(t, a, OrgAttributes::default())
+            .await
+            .expect("reset");
+    }
+    org.remove_org_unit(t, unit.id).await.expect("cleanup unit");
+}
+
+/// Набор проверок [`SyncGate`] (CTR-35): остановка, подтверждение (сохраняется, если удаляемых не больше), снятие.
+pub async fn sync_gate(gate: &dyn SyncGate, tenant: TenantId) {
+    let at = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("time");
+    gate.clear_sync(tenant).await.expect("clear");
+    assert_eq!(gate.pending_sync(tenant).await.expect("none"), None);
+    assert_eq!(gate.approve_sync(tenant).await, Err(Error::NotFound));
+    let h = gate.hold_sync(tenant, 10, 100, at).await.expect("hold");
+    assert_eq!(
+        h,
+        MassRemoval {
+            removed: 10,
+            total: 100,
+            detected_at: at,
+            approved: false,
+        }
+    );
+    assert!(gate.approve_sync(tenant).await.expect("approve").approved);
+    assert!(
+        gate.hold_sync(tenant, 8, 100, at)
+            .await
+            .expect("fewer")
+            .approved
+    );
+    assert!(
+        !gate
+            .hold_sync(tenant, 12, 100, at)
+            .await
+            .expect("more")
+            .approved
+    );
+    let pending = gate.pending_sync(tenant).await.expect("pending");
+    assert_eq!(pending.map(|h| h.removed), Some(12));
+    gate.clear_sync(tenant).await.expect("clear");
+    gate.clear_sync(tenant).await.expect("clear again");
+    assert_eq!(gate.pending_sync(tenant).await.expect("cleared"), None);
+}
+
+/// Окружение набора [`account_state`].
+#[derive(Debug, Clone)]
+pub struct AccountStateFixture {
+    /// Организация.
+    pub tenant: TenantId,
+    /// Домен организации.
+    pub domain: DomainId,
+    /// Имя домена.
+    pub domain_name: String,
+}
+
+/// Набор проверок состояния ящика `AccountStore` (CTR-35): отключение со сроком (`upsert` его не снимает), списки
+/// отключённых и истёкших, восстановление, подключение к другой учётной записи (письма сохраняются, запись `to`
+/// удаляется), окончательное удаление отключённого без писем.
+pub async fn account_state(
+    accounts: &dyn AccountStore,
+    mailboxes: &dyn MailboxStore,
+    messages: &dyn MessageStore,
+    fx: &AccountStateFixture,
+) {
+    let t = fx.tenant;
+    let run = AccountId::new();
+    let upsert = |n: &str| AccountUpsert {
+        domain: fx.domain,
+        login: format!("{n}-{run}@{}", fx.domain_name),
+        display_name: n.to_owned(),
+        external_id: Some(format!("{n}-{run}")),
+        enabled: true,
+    };
+    let scope = |account| AccountScope { tenant: t, account };
+    let until = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("time")
+        + time::Duration::days(30);
+    let sec = time::Duration::seconds;
+
+    let a = accounts.upsert(t, upsert("leaver")).await.expect("a");
+    assert_eq!(
+        accounts.account_state(t, a.id).await.expect("state"),
+        AccountState::Active
+    );
+    assert_eq!(
+        accounts.account_state(t, AccountId::new()).await,
+        Err(Error::NotFound)
+    );
+    accounts
+        .disable_account(t, a.id, until)
+        .await
+        .expect("disable");
+    let disabled = AccountState::Disabled { until };
+    assert_eq!(
+        accounts.account_state(t, a.id).await.expect("disabled"),
+        disabled
+    );
+    accounts
+        .upsert(t, upsert("leaver"))
+        .await
+        .expect("upsert again");
+    assert_eq!(
+        accounts
+            .account_state(t, a.id)
+            .await
+            .expect("still disabled"),
+        disabled
+    );
+    let listed = accounts.disabled_accounts(t).await.expect("disabled list");
+    assert!(
+        listed
+            .iter()
+            .any(|d| d.account.id == a.id && d.until == until)
+    );
+    let own = |v: Vec<AccountScope>| v.contains(&scope(a.id));
+    assert!(!own(accounts
+        .expired_accounts(until - sec(1), 10_000)
+        .await
+        .expect("not yet")));
+    assert!(own(accounts
+        .expired_accounts(until, 10_000)
+        .await
+        .expect("expired")));
+    accounts.restore_account(t, a.id).await.expect("restore");
+    accounts
+        .restore_account(t, a.id)
+        .await
+        .expect("restore again");
+    assert_eq!(
+        accounts.account_state(t, a.id).await.expect("active"),
+        AccountState::Active
+    );
+    let listed = accounts.disabled_accounts(t).await.expect("list");
+    assert!(!listed.iter().any(|d| d.account.id == a.id));
+    assert_eq!(
+        accounts.disable_account(t, AccountId::new(), until).await,
+        Err(Error::NotFound)
+    );
+
+    // Подключение: письма отключённого ящика — у учётной записи каталога `to`.
+    let inbox = role_folder(mailboxes, scope(a.id), SpecialUse::Inbox).await;
+    let kept = put_message(messages, scope(a.id), inbox, 10).await;
+    let to = accounts.upsert(t, upsert("successor")).await.expect("to");
+    assert!(matches!(
+        accounts.attach_account(t, a.id, to.id).await,
+        Err(Error::Invalid(_))
+    ));
+    accounts
+        .disable_account(t, a.id, until)
+        .await
+        .expect("disable a");
+    let attached = accounts
+        .attach_account(t, a.id, to.id)
+        .await
+        .expect("attach");
+    assert_eq!(
+        (
+            attached.id,
+            attached.login.as_str(),
+            attached.external_id.as_deref()
+        ),
+        (a.id, to.login.as_str(), to.external_id.as_deref())
+    );
+    assert_eq!(accounts.get(t, to.id).await.expect("to gone"), None);
+    assert_eq!(
+        accounts.account_state(t, a.id).await.expect("attached"),
+        AccountState::Active
+    );
+    let by_login = accounts.by_login(t, &to.login).await.expect("by login");
+    assert_eq!(by_login.map(|x| x.id), Some(a.id));
+    assert!(
+        messages
+            .get(scope(a.id), kept)
+            .await
+            .expect("message")
+            .is_some()
+    );
+
+    // В ящике `to` есть письма — Conflict; нет записи — NotFound.
+    let b = accounts.upsert(t, upsert("other")).await.expect("b");
+    let busy = accounts.upsert(t, upsert("busy")).await.expect("busy");
+    let busy_inbox = role_folder(mailboxes, scope(busy.id), SpecialUse::Inbox).await;
+    put_message(messages, scope(busy.id), busy_inbox, 10).await;
+    accounts
+        .disable_account(t, b.id, until)
+        .await
+        .expect("disable b");
+    assert_eq!(
+        accounts.attach_account(t, b.id, busy.id).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        accounts.attach_account(t, b.id, AccountId::new()).await,
+        Err(Error::NotFound)
+    );
+
+    // Окончательное удаление: только отключённый и без писем.
+    assert!(matches!(
+        accounts.remove_disabled(t, a.id).await,
+        Err(Error::Invalid(_))
+    ));
+    accounts
+        .disable_account(t, a.id, until)
+        .await
+        .expect("disable a again");
+    assert_eq!(
+        accounts.remove_disabled(t, a.id).await,
+        Err(Error::Conflict)
+    );
+    accounts.remove_disabled(t, b.id).await.expect("remove b");
+    assert_eq!(accounts.get(t, b.id).await.expect("b gone"), None);
+    assert_eq!(
+        accounts.remove_disabled(t, b.id).await,
+        Err(Error::NotFound)
+    );
+}
+
+/// Набор проверок срока выпуска и отмены `QueueStore` (CTR-35): запись не выдаётся до срока выпуска, до первого
+/// захвата отменяется (возвращается объект письма), после захвата — `Conflict`; `queued_at` не раньше срока выпуска.
+pub async fn queue_release(queue: &dyn QueueStore, tenant: TenantId) {
+    let t0 = OffsetDateTime::UNIX_EPOCH + time::Duration::days(500);
+    let sec = time::Duration::seconds;
+    let lease = Duration::from_secs(30);
+    let message = |release: OffsetDateTime| OutMessage {
+        tenant,
+        blob: BlobKey {
+            tenant,
+            hash: fresh_hash(),
+            generation: Gen::INITIAL,
+        },
+        size: 100,
+        from: "a@example.org".into(),
+        dsn: DsnParams::default(),
+        rcpts: vec![OutRcpt::new("b@example.net")],
+        next_attempt: release,
+    };
+    let claim_own = async |id: QueueId, now: OffsetDateTime| {
+        queue
+            .claim(now, 1000, lease)
+            .await
+            .expect("claim")
+            .into_iter()
+            .find(|c| c.claim.id == id)
+    };
+
+    let delayed = message(t0 + sec(3600));
+    let blob = delayed.blob;
+    assert_eq!(delayed.release_at(), t0 + sec(3600));
+    let id = queue.enqueue(delayed).await.expect("enqueue delayed");
+    assert!(claim_own(id, t0).await.is_none(), "not released yet");
+    assert_eq!(
+        queue.cancel_queued(TenantId::new(), id).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(queue.cancel_queued(tenant, id).await, Ok(blob));
+    assert_eq!(queue.cancel_queued(tenant, id).await, Err(Error::NotFound));
+    assert!(claim_own(id, t0 + sec(7200)).await.is_none(), "canceled");
+
+    let id = queue.enqueue(message(t0 + sec(60))).await.expect("enqueue");
+    let c = claim_own(id, t0 + sec(60)).await.expect("released");
+    assert!(c.queued_at >= t0 + sec(60), "queued_at from release");
+    assert_eq!(queue.cancel_queued(tenant, id).await, Err(Error::Conflict));
+    let done = RcptStatus::Delivered {
+        reply: "250 ok".into(),
+    };
+    assert_eq!(
+        queue.complete(&c.claim, "b@example.net", done).await,
+        Ok(true)
+    );
+    assert_eq!(queue.cancel_queued(tenant, id).await, Err(Error::NotFound));
+}
+
+/// Набор проверок `DeliveryLog::by_queue` (CTR-35): события записи очереди по времени, ограничение числа, изоляция
+/// организаций и записей. Моменты — текущие.
+pub async fn delivery_by_queue(log: &dyn DeliveryLog, fx: &DeliveryFixture) {
+    use DeliveryEventKind as K;
+    let q = QueueId::new();
+    let now = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("time");
+    let node = NodeId::new("suite-node").expect("node");
+    let event = |tenant: TenantId, s: i64, kind: DeliveryEventKind, queue: QueueId| DeliveryEvent {
+        tenant,
+        at: now - time::Duration::seconds(100 - s),
+        node: node.clone(),
+        kind,
+        sender: "a@example.org".into(),
+        recipients: vec!["b@example.net".into()],
+        message_id: Some(format!("{q}@example.org")),
+        queue_id: Some(queue),
+        decision: DeliveryDecision::Accept,
+        reason: Some(format!("step {s}")),
+    };
+    let relayed = event(fx.tenant, 2, K::Relay, q);
+    let received = event(fx.tenant, 1, K::Receive, q);
+    log.record_batch(vec![
+        relayed.clone(),
+        received.clone(),
+        event(fx.tenant, 3, K::Relay, QueueId::new()),
+        event(fx.foreign_tenant, 4, K::Dsn, q),
+    ])
+    .await
+    .expect("record");
+    assert_eq!(
+        log.by_queue(fx.tenant, q, 10).await.expect("by queue"),
+        [received.clone(), relayed]
+    );
+    assert_eq!(
+        log.by_queue(fx.tenant, q, 1).await.expect("limit"),
+        [received]
+    );
+    assert!(matches!(
+        log.by_queue(fx.tenant, q, 0).await,
+        Err(Error::Invalid(_))
+    ));
+    let foreign = log
+        .by_queue(fx.foreign_tenant, q, 10)
+        .await
+        .expect("foreign");
+    let kinds: Vec<_> = foreign.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, [K::Dsn]);
+}
+
+// ---------- Отложенная отправка JMAP (CTR-42) ----------
+
+/// Набор проверок выборки, изменений и срока хранения [`SubmissionStore`] (CTR-42): `query_submissions` по условиям
+/// RFC 8621 §7.3, `submission_changes` (созданные, изменённые, удалённые; созданные и удалённые после `since` не
+/// входят; `limit` и `has_more`; неизвестное состояние — `Conflict`), `expire_submissions` (только завершённые и
+/// отменённые старше срока). Моменты отправок — в 1971 году: срок хранения набора не задевает чужие записи.
+pub async fn submission_query(
+    store: &dyn SubmissionStore,
+    owner: AccountScope,
+    peer: AccountScope,
+) {
+    let t0 = OffsetDateTime::UNIX_EPOCH + time::Duration::days(400);
+    let day = time::Duration::days;
+    let sub =
+        |id: &str, identity: &str, send_at: OffsetDateTime, undo: UndoStatus| EmailSubmission {
+            id: id.into(),
+            identity: identity.into(),
+            email: MessageId::new(),
+            mail_from: "anna@example.org".into(),
+            rcpt_to: vec!["b@example.com".into()],
+            send_at,
+            undo_status: undo,
+            delivery: Vec::new(),
+            queue: Some(QueueId::new()),
+        };
+    let s0 = store.state(owner).await.expect("state");
+    let a = sub("a", "work", t0 + day(1), UndoStatus::Pending);
+    let b = sub("b", "work", t0, UndoStatus::Final);
+    let c = sub("c", "home", t0 + day(2), UndoStatus::Pending);
+    for s in [&a, &b, &c] {
+        store.insert(owner, s.clone()).await.expect("insert");
+    }
+    let ids = |v: Vec<EmailSubmission>| v.into_iter().map(|s| s.id).collect::<Vec<_>>();
+    let query =
+        async |f: SubmissionFilter| ids(store.query_submissions(owner, &f).await.expect("query"));
+    assert_eq!(query(SubmissionFilter::default()).await, ["b", "a", "c"]);
+    let pending = SubmissionFilter {
+        undo_status: Some(UndoStatus::Pending),
+        ..SubmissionFilter::default()
+    };
+    assert_eq!(query(pending).await, ["a", "c"]);
+    let home = SubmissionFilter {
+        identity_ids: Some(vec!["home".into()]),
+        ..SubmissionFilter::default()
+    };
+    assert_eq!(query(home).await, ["c"]);
+    let by_email = SubmissionFilter {
+        email_ids: Some(vec![b.email, c.email]),
+        ..SubmissionFilter::default()
+    };
+    assert_eq!(query(by_email).await, ["b", "c"]);
+    let window = SubmissionFilter {
+        after: Some(t0 + day(1)),
+        before: Some(t0 + day(2)),
+        ..SubmissionFilter::default()
+    };
+    assert_eq!(query(window).await, ["a"]);
+    let alien = store
+        .query_submissions(peer, &SubmissionFilter::default())
+        .await
+        .expect("peer");
+    assert!(
+        alien
+            .iter()
+            .all(|s| !["a", "b", "c"].contains(&s.id.as_str()))
+    );
+
+    // Изменения: созданные после s0.
+    let ch = store
+        .submission_changes(owner, s0, 100)
+        .await
+        .expect("changes");
+    assert_eq!(
+        (ch.created.as_slice(), ch.updated.len(), ch.destroyed.len()),
+        (["a", "b", "c"].map(String::from).as_slice(), 0, 0)
+    );
+    let s1 = store.state(owner).await.expect("s1");
+    assert_eq!((ch.new_state, ch.has_more), (s1, false));
+
+    // Отмена, фиксация, удаление; созданная и удалённая после s1 не входит.
+    store.cancel(owner, "a").await.expect("cancel");
+    store
+        .finalize(owner, "c", vec![], c.queue)
+        .await
+        .expect("finalize");
+    store.delete(owner, "b").await.expect("delete");
+    store
+        .insert(owner, sub("tmp", "work", t0, UndoStatus::Final))
+        .await
+        .expect("tmp");
+    store.delete(owner, "tmp").await.expect("delete tmp");
+    let ch = store
+        .submission_changes(owner, s1, 100)
+        .await
+        .expect("changes s1");
+    assert!(ch.created.is_empty());
+    assert_eq!(ch.updated, ["a", "c"]);
+    assert_eq!(ch.destroyed, ["b"]);
+    let s2 = store.state(owner).await.expect("s2");
+    assert_eq!(ch.new_state, s2);
+
+    // По одной: `has_more` до последней порции, итог — тот же.
+    let (mut since, mut all) = (s1, Vec::new());
+    loop {
+        let part = store
+            .submission_changes(owner, since, 1)
+            .await
+            .expect("part");
+        let n = part.created.len() + part.updated.len() + part.destroyed.len();
+        assert!(n <= 1, "limit 1: {part:?}");
+        all.extend(part.updated);
+        all.extend(part.destroyed);
+        since = part.new_state;
+        if !part.has_more {
+            break;
+        }
+    }
+    all.sort_unstable();
+    assert_eq!(all, ["a", "b", "c"]);
+    assert_eq!(since, s2);
+    assert_eq!(
+        store.submission_changes(owner, s2 + 1, 10).await,
+        Err(Error::Conflict)
+    );
+    assert!(matches!(
+        store.submission_changes(owner, s1, 0).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Срок хранения: отменённая `a` и завершённая `c` старше срока удаляются, ждущая и новая — нет.
+    let waiting = sub("w", "work", t0, UndoStatus::Pending);
+    store.insert(owner, waiting).await.expect("waiting");
+    let fresh = sub("fresh", "work", t0 + day(30), UndoStatus::Final);
+    store.insert(peer, fresh).await.expect("fresh");
+    let s3 = store.state(owner).await.expect("s3");
+    let removed = store
+        .expire_submissions(t0 + day(10), 10_000)
+        .await
+        .expect("expire");
+    assert!(removed >= 2, "removed {removed}");
+    assert_eq!(store.get(owner, "a").await.expect("a"), None);
+    assert_eq!(store.get(owner, "c").await.expect("c"), None);
+    assert!(store.get(owner, "w").await.expect("w").is_some());
+    assert!(store.get(peer, "fresh").await.expect("fresh").is_some());
+    let ch = store
+        .submission_changes(owner, s3, 100)
+        .await
+        .expect("after expire");
+    assert_eq!(ch.destroyed, ["a", "c"]);
+    store.cancel(owner, "w").await.expect("cleanup w");
+}
+
+/// Набор проверок отложенной отправки [`Outbound`] (CTR-42): `schedule` возвращает запись очереди, `cancel_scheduled`
+/// до выпуска удаляет её (повтор и чужая организация — `NotFound`). `release_at` — в будущем относительно часов
+/// реализации.
+pub async fn outbound_schedule(
+    ob: &dyn Outbound,
+    tenant: TenantId,
+    rcpts: &[String],
+    release_at: OffsetDateTime,
+) {
+    let raw = Bytes::from_static(b"Subject: later\r\n\r\nbody\r\n");
+    let id = ob
+        .schedule(tenant, "anna@example.org", rcpts, raw.clone(), release_at)
+        .await
+        .expect("schedule");
+    assert_eq!(
+        ob.cancel_scheduled(TenantId::new(), id).await,
+        Err(Error::NotFound)
+    );
+    ob.cancel_scheduled(tenant, id).await.expect("cancel");
+    assert_eq!(ob.cancel_scheduled(tenant, id).await, Err(Error::NotFound));
+    let other = ob
+        .schedule(tenant, "anna@example.org", rcpts, raw, release_at)
+        .await
+        .expect("schedule again");
+    assert_ne!(other, id);
+    ob.cancel_scheduled(tenant, other)
+        .await
+        .expect("cancel other");
+}
+
+// ---------- Модерация правилом потока (CTR-43) ----------
+
+/// Окружение набора [`rule_moderation`].
+#[derive(Debug, Clone)]
+pub struct RuleModerationFixture {
+    /// Организация.
+    pub tenant: TenantId,
+    /// Модератор правила (учётная запись организации).
+    pub moderator: AccountId,
+    /// Исходные получатели писем (адреса, которые реализация `Moderation` доставит).
+    pub recipients: Vec<String>,
+}
+
+/// Общий набор очереди модерации для правил потока (CTR-43): письмо без группы ставится в очередь (`GroupStore::hold`,
+/// источник и модераторы сохраняются), видно в очереди организации, одобрение — `Moderation::deliver` без группы
+/// (доставка исходным получателям), отказ — `Moderation::reject` (DSN отправителю); письмо правила с группой и без
+/// модераторов — `Invalid`. Возвращает (одобренное, отклонённое) — что доставлено и какое уведомление ушло, проверяет
+/// реализация.
+pub async fn rule_moderation(
+    groups: &dyn GroupStore,
+    m: &dyn Moderation,
+    fx: &RuleModerationFixture,
+) -> (HeldId, HeldId) {
+    let t = fx.tenant;
+    let tag = AccountId::new().to_string();
+    let at = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("time");
+    let held = |s: i64| HeldMessage {
+        id: HeldId::new(),
+        group: None,
+        source: HoldSource::FlowRule {
+            rule: format!("Правило {tag}"),
+        },
+        moderators: vec![Moderator::Account(fx.moderator)],
+        recipients: fx.recipients.clone(),
+        sender: format!("s-{tag}@example.net"),
+        sender_account: None,
+        message_id: Some(format!("{s}.{tag}@example.net")),
+        blob: BlobKey {
+            tenant: t,
+            hash: fresh_hash(),
+            generation: Gen::INITIAL,
+        },
+        size: 100,
+        held_at: at + time::Duration::seconds(s),
+    };
+    let (approve, decline) = (held(1), held(2));
+    for h in [&approve, &decline] {
+        groups.hold(t, h.clone()).await.expect("hold by rule");
+    }
+    let unmoderated = HeldMessage {
+        moderators: Vec::new(),
+        ..held(3)
+    };
+    assert!(matches!(
+        groups.hold(t, unmoderated).await,
+        Err(Error::Invalid(_))
+    ));
+    let grouped = HeldMessage {
+        group: Some(GroupId::new()),
+        ..held(4)
+    };
+    assert!(matches!(
+        groups.hold(t, grouped).await,
+        Err(Error::Invalid(_))
+    ));
+    let queue: Vec<_> = groups
+        .held(t, None, 10_000)
+        .await
+        .expect("queue")
+        .into_iter()
+        .filter(|h| h.message_id.as_deref().is_some_and(|m| m.contains(&tag)))
+        .collect();
+    assert_eq!(queue, [approve.clone(), decline.clone()]);
+    let in_group = groups
+        .held(t, Some(GroupId::new()), 10_000)
+        .await
+        .expect("group queue");
+    assert!(in_group.iter().all(|h| h.id != approve.id));
+
+    let taken = groups.take_held(t, approve.id).await.expect("take");
+    assert_eq!(taken, approve);
+    let some_group = DistributionGroup {
+        id: GroupId::new(),
+        tenant: t,
+        name: "Другая".into(),
+        address: None,
+        external_id: None,
+        members: Vec::new(),
+        senders: SenderRestriction::Anyone,
+        moderators: Vec::new(),
+        hidden_from_gal: false,
+    };
+    assert!(matches!(
+        m.deliver(t, Some(&some_group), &taken).await,
+        Err(Error::Invalid(_))
+    ));
+    m.deliver(t, None, &taken).await.expect("deliver by rule");
+    let taken = groups.take_held(t, decline.id).await.expect("take decline");
+    m.reject(t, &taken, "not allowed").await.expect("reject");
+    assert_eq!(groups.take_held(t, approve.id).await, Err(Error::NotFound));
+    (approve.id, decline.id)
 }

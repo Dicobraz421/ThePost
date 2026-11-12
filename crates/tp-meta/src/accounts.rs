@@ -1,7 +1,9 @@
 //! Учётные записи на PostgreSQL (CONTRACTS.md#Metadata).
 
 use async_trait::async_trait;
-use sqlx::{FromRow, PgConnection};
+use sqlx::postgres::PgArguments;
+use sqlx::query::QueryAs;
+use sqlx::{FromRow, PgConnection, Postgres};
 use tp_contracts::meta::{Account, AccountScope, AccountStore, AccountUpsert, QuotaUsage};
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use uuid::Uuid;
@@ -9,6 +11,7 @@ use uuid::Uuid;
 use crate::PgMeta;
 use crate::mailboxes;
 use crate::schema::{begin, db_err, to_u64};
+use crate::shards::{ReadIntent, ShardId};
 
 /// `AccountStore::list` без верхней границы префикса (пустой префикс или одни `U+10FFFF`): `$1` — организация,
 /// `$2` — префикс, `$3` — курсор (строго больше), `$4` — лимит. Открыт для проверки плана (`EXPLAIN`) в тестах.
@@ -53,6 +56,26 @@ struct AccountRow {
     display_name: String,
     external_id: Option<String>,
     enabled: bool,
+}
+
+/// Строка `upsert`: учётная запись и её шард.
+#[derive(FromRow)]
+struct UpsertRow {
+    #[sqlx(flatten)]
+    account: AccountRow,
+    shard_id: i32,
+}
+
+/// Общие параметры `upsert` (`$3`–`$7`).
+fn bind_upsert<'q>(
+    q: QueryAs<'q, Postgres, UpsertRow, PgArguments>,
+    data: &'q AccountUpsert,
+) -> QueryAs<'q, Postgres, UpsertRow, PgArguments> {
+    q.bind(data.domain.as_uuid())
+        .bind(&data.login)
+        .bind(&data.display_name)
+        .bind(&data.external_id)
+        .bind(data.enabled)
 }
 
 impl From<AccountRow> for Account {
@@ -112,41 +135,68 @@ impl PgMeta {
         if data.login.is_empty() {
             return Err(Error::invalid("пустое имя входа"));
         }
+        // Шард новой учётной записи — до транзакции каталога (справочник читает свой пул).
+        let place = match self.shard_resolver() {
+            Some(r) => r.place(tenant).await?,
+            None => ShardId::MAIN,
+        };
         let mut tx = begin(&self.pool, tenant).await?;
-        let account: AccountRow = match find_for_upsert(&mut tx, tenant, data).await? {
-            Some(id) => sqlx::query_as(
-                "UPDATE accounts SET domain_id = $3, login = $4, display_name = $5, external_id = $6,
-                                     enabled = $7, updated_at = now()
-                 WHERE tenant_id = $1 AND account_id = $2
-                 RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled",
+        // Шард прежней учётной записи не меняется (перенос — модуль «Шардирование»).
+        let account: UpsertRow = match find_for_upsert(&mut tx, tenant, data).await? {
+            Some(id) => bind_upsert(
+                sqlx::query_as(
+                    "UPDATE accounts SET domain_id = $3, login = $4, display_name = $5, external_id = $6,
+                                         enabled = $7, updated_at = now()
+                     WHERE tenant_id = $1 AND account_id = $2
+                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled,
+                               shard_id",
+                )
+                .bind(tenant.as_uuid())
+                .bind(id),
+                data,
+            ),
+            None => bind_upsert(
+                sqlx::query_as(
+                    "INSERT INTO accounts (tenant_id, account_id, domain_id, login, display_name, external_id,
+                                           enabled, shard_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled,
+                               shard_id",
+                )
+                .bind(tenant.as_uuid())
+                .bind(*AccountId::new().as_uuid()),
+                data,
             )
-            .bind(tenant.as_uuid())
-            .bind(id),
-            None => sqlx::query_as(
-                "INSERT INTO accounts (tenant_id, account_id, domain_id, login, display_name, external_id, enabled)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled",
-            )
-            .bind(tenant.as_uuid())
-            .bind(*AccountId::new().as_uuid()),
+            .bind(place.0),
         }
-        .bind(data.domain.as_uuid())
-        .bind(&data.login)
-        .bind(&data.display_name)
-        .bind(&data.external_id)
-        .bind(data.enabled)
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
-        let account = Account::from(account);
+        let shard = ShardId(account.shard_id);
+        let account = Account::from(account.account);
 
         // Новая учётная запись — системные папки; прежняя без части папок — дополняется при входе.
         let scope = AccountScope {
             tenant,
             account: account.id,
         };
-        let created = mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
-        tx.commit().await.map_err(db_err)?;
+        let created = if shard == ShardId::MAIN {
+            let created =
+                mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
+            tx.commit().await.map_err(db_err)?;
+            created
+        } else {
+            // Ящик на другом шарде: каталог фиксируется первым, состояние ящика и папки — на шарде
+            // (повтор upsert дополняет недостающее).
+            tx.commit().await.map_err(db_err)?;
+            let pool = self.shard_pool(shard, ReadIntent::Primary).await?;
+            let mut tx = begin(&pool, tenant).await?;
+            mailboxes::ensure_state(&mut tx, scope).await?;
+            let created =
+                mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
+            tx.commit().await.map_err(db_err)?;
+            created
+        };
         if created > 0 {
             self.signal_log([scope.account]).await;
         }
@@ -159,7 +209,7 @@ impl PgMeta {
 impl AccountStore for PgMeta {
     async fn get(&self, tenant: TenantId, id: AccountId) -> Result<Option<Account>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, tenant).await?;
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
                 "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
              FROM accounts WHERE tenant_id = $1 AND account_id = $2",
@@ -177,7 +227,7 @@ impl AccountStore for PgMeta {
 
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, tenant).await?;
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
                 "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
              FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2)",
@@ -195,7 +245,7 @@ impl AccountStore for PgMeta {
 
     async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, tenant).await?;
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
                 "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled
              FROM accounts WHERE tenant_id = $1 AND external_id = $2",
@@ -225,7 +275,7 @@ impl AccountStore for PgMeta {
         let next = prefix_next(prefix);
         let (next, after) = (next.as_deref(), after.unwrap_or(""));
         self.idempotent(|| async move {
-            let mut tx = begin(&self.pool, tenant).await?;
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let sql = if next.is_some() {
                 LIST_PREFIX_SQL
             } else {
@@ -257,6 +307,20 @@ impl AccountStore for PgMeta {
     /// Лимит (`limit_bytes`) разрешает `PolicyResolver`; здесь — только использование.
     async fn quota(&self, tenant: TenantId, id: AccountId) -> Result<QuotaUsage> {
         self.idempotent(|| async move {
+            let scope = AccountScope {
+                tenant,
+                account: id,
+            };
+            let db = self.box_db(scope).await?;
+            if db.shard != ShardId::MAIN {
+                // Учётная запись найдена в каталоге (её шард); письма — на шарде.
+                let (used_bytes, messages) = crate::retention::box_usage(&db.pool, scope).await?;
+                return Ok(QuotaUsage {
+                    used_bytes,
+                    messages,
+                    limit_bytes: None,
+                });
+            }
             let mut tx = begin(&self.pool, tenant).await?;
             let row: Option<(i64, i64)> = sqlx::query_as(
                 "SELECT coalesce(sum(m.size), 0)::bigint, count(m.message_id)

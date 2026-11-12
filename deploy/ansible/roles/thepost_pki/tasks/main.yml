@@ -46,6 +46,29 @@
     selfsigned_not_after: "{{ thepost_pki_ca_not_after }}"
     mode: "0644"
 
+# CA не перевыпускается сам: новый CA меняет доверие у всех клиентов. Истёк — остановка с инструкцией.
+- name: Read CA certificate
+  community.crypto.x509_certificate_info:
+    path: "{{ thepost_pki_dir }}/ca.pem"
+    valid_at:
+      renew: "{{ thepost_pki_renew_before }}"
+  register: thepost_pki_ca_info
+
+- name: Check CA expiry
+  ansible.builtin.assert:
+    that: not thepost_pki_ca_info.expired
+    fail_msg: >-
+      Срок внутреннего CA {{ thepost_pki_dir }}/ca.pem истёк ({{ thepost_pki_ca_info.not_after }}): каналы
+      PostgreSQL и OpenBao не проверяются. Новый CA — удалите {{ thepost_pki_dir }} и повторите прогон плейбука
+      (CA и сертификаты выпускаются заново, службы перезапускаются); клиентам вне этой ВМ раздайте новый ca.pem.
+
+- name: Warn about CA expiry
+  ansible.builtin.debug:
+    msg: >-
+      Внимание: срок внутреннего CA {{ thepost_pki_dir }}/ca.pem кончается {{ thepost_pki_ca_info.not_after }} —
+      до этого удалите {{ thepost_pki_dir }} и повторите прогон плейбука (новый CA); клиентам вне ВМ — новый ca.pem.
+  when: not thepost_pki_ca_info.valid_at.renew
+
 - name: Issue certificate of internal services
   ansible.builtin.include_tasks: issue.yml
   vars:

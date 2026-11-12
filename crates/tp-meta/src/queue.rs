@@ -7,6 +7,12 @@
 //!
 //! Сроки попыток и лизы сравниваются с `now` вызывающего: часы СУБД не участвуют (кроме `queued_at`).
 //! Очередь общая для организаций: `enqueue` — транзакция организации письма, остальное — системные транзакции.
+//!
+//! Шарды (META-31): очередь письма — на шарде отправителя, рядом с «Отправленными»: вызывающий, знающий
+//! шард отправителя, ставит письмо через хранилища шарда ([`PgMeta::on_shard`]); `enqueue` хранилищ со
+//! справочником — в основную БД (шард отправителя письму неизвестен). `claim` обходит шарды по очереди:
+//! каждый проход начинается со следующего шарда и добирает `limit` с остальных; операции захвата идут
+//! на шард записи.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -23,6 +29,64 @@ use uuid::Uuid;
 
 use crate::PgMeta;
 use crate::schema::{begin, begin_system, db_err, to_i64, to_u32, to_u64};
+use crate::shards::ShardId;
+
+/// Хранилища шарда записи очереди `id` среди `views`: по захвату этого экземпляра или поиском по шардам;
+/// записи нет нигде — основная БД (ответ — как без шардов).
+async fn queue_view<'v>(
+    meta: &PgMeta,
+    views: &'v [(ShardId, PgMeta)],
+    id: QueueId,
+) -> Result<&'v PgMeta> {
+    let known = meta
+        .routing()
+        .queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&id)
+        .copied();
+    if let Some(shard) = known
+        && let Some((_, v)) = views.iter().find(|(s, _)| *s == shard)
+    {
+        return Ok(v);
+    }
+    for (shard, view) in views {
+        let mut tx = begin_system(view.pool()).await?;
+        let found: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM queue WHERE queue_id = $1)")
+                .bind(id.as_uuid())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        if found {
+            remember(meta, id, *shard);
+            return Ok(view);
+        }
+    }
+    Ok(&views[0].1)
+}
+
+fn remember(meta: &PgMeta, id: QueueId, shard: ShardId) {
+    let mut homes = meta
+        .routing()
+        .queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Захваты завершаются `complete`; брошенные (лиза истекла) не копятся без предела.
+    if homes.len() >= 65_536 {
+        homes.clear();
+    }
+    homes.insert(id, shard);
+}
+
+fn forget(meta: &PgMeta, id: QueueId) {
+    meta.routing()
+        .queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&id);
+}
 
 fn ret_str(r: DsnRet) -> &'static str {
     match r {
@@ -223,6 +287,26 @@ impl QueueStore for PgMeta {
         limit: usize,
         lease: Duration,
     ) -> Result<Vec<Claimed>> {
+        if let Some(views) = self.shard_views().await? {
+            // Обход по очереди: проход начинается со следующего шарда.
+            let turn = self
+                .routing()
+                .claim_turn
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut out = Vec::new();
+            for k in 0..views.len() {
+                if out.len() >= limit {
+                    break;
+                }
+                let (shard, view) = &views[(turn + k) % views.len()];
+                let got = QueueStore::claim(view, now, limit - out.len(), lease).await?;
+                for c in &got {
+                    remember(self, c.claim.id, *shard);
+                }
+                out.extend(got);
+            }
+            return Ok(out);
+        }
         self.once(async move {
         if limit == 0 {
             return Ok(Vec::new());
@@ -288,6 +372,10 @@ impl QueueStore for PgMeta {
     }
 
     async fn renew(&self, claim: &QueueClaim, until: OffsetDateTime) -> Result<()> {
+        if let Some(views) = self.shard_views().await? {
+            let view = queue_view(self, &views, claim.id).await?;
+            return QueueStore::renew(view, claim, until).await;
+        }
         self.once(async move {
             let mut tx = begin_system(&self.pool).await?;
             let n = sqlx::query(
@@ -313,6 +401,10 @@ impl QueueStore for PgMeta {
         at: OffsetDateTime,
         reason: &str,
     ) -> Result<()> {
+        if let Some(views) = self.shard_views().await? {
+            let view = queue_view(self, &views, claim.id).await?;
+            return QueueStore::reschedule(view, claim, rcpt, at, reason).await;
+        }
         self.once(async move {
             let mut tx = begin_system(&self.pool).await?;
             lock_claim(&mut tx, claim).await?;
@@ -339,6 +431,10 @@ impl QueueStore for PgMeta {
     }
 
     async fn postpone(&self, claim: &QueueClaim, rcpt: &str, at: OffsetDateTime) -> Result<()> {
+        if let Some(views) = self.shard_views().await? {
+            let view = queue_view(self, &views, claim.id).await?;
+            return QueueStore::postpone(view, claim, rcpt, at).await;
+        }
         self.once(async move {
             let mut tx = begin_system(&self.pool).await?;
             lock_claim(&mut tx, claim).await?;
@@ -365,6 +461,14 @@ impl QueueStore for PgMeta {
     }
 
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
+        if let Some(views) = self.shard_views().await? {
+            let view = queue_view(self, &views, claim.id).await?;
+            let done = QueueStore::complete(view, claim, rcpt, status).await?;
+            if done {
+                forget(self, claim.id);
+            }
+            return Ok(done);
+        }
         self.once(async move {
             let (state, reply) = match &status {
                 RcptStatus::Delivered { reply } => ("delivered", reply),

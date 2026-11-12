@@ -29,8 +29,8 @@ use async_trait::async_trait;
 use mail_parser::{Address, MessageParser, MimeHeaders};
 use time::OffsetDateTime;
 use tp_contracts::auth::{
-    Authenticator, Credentials, DirAccount, DirAlias, DirChange, DirCursor, DirDomain, DirGroup,
-    DirPage, Directory, Principal,
+    Authenticator, Credentials, DirAccount, DirAlias, DirChange, DirContact, DirCursor, DirDomain,
+    DirGroup, DirPage, DirUnit, Directory, Principal,
 };
 use tp_contracts::bus::EventBus;
 use tp_contracts::ext::DecisionHooks;
@@ -216,6 +216,8 @@ impl<T: Clone> DirLog<T> {
 struct TenantDir {
     accounts: DirLog<DirAccount>,
     groups: DirLog<DirGroup>,
+    contacts: DirLog<DirContact>,
+    units: Vec<DirUnit>,
     aliases: Vec<DirAlias>,
     domains: Vec<DirDomain>,
     gal: Vec<String>,
@@ -255,6 +257,23 @@ impl FakeDirectory {
         self.with(tenant, |d| d.groups.set(external_id.to_owned(), None));
     }
 
+    /// Создаёт или изменяет почтовый контакт (по `external_id`).
+    pub fn upsert_contact(&self, tenant: TenantId, contact: DirContact) {
+        self.with(tenant, |d| {
+            d.contacts.set(contact.external_id.clone(), Some(contact));
+        });
+    }
+
+    /// Удаляет почтовый контакт.
+    pub fn remove_contact(&self, tenant: TenantId, external_id: &str) {
+        self.with(tenant, |d| d.contacts.set(external_id.to_owned(), None));
+    }
+
+    /// Подразделения (заменяет список).
+    pub fn set_units(&self, tenant: TenantId, units: Vec<DirUnit>) {
+        self.with(tenant, |d| d.units = units);
+    }
+
     /// Дополнительные адреса (заменяет список).
     pub fn set_aliases(&self, tenant: TenantId, aliases: Vec<DirAlias>) {
         self.with(tenant, |d| d.aliases = aliases);
@@ -275,6 +294,7 @@ impl FakeDirectory {
         self.with(tenant, |d| {
             d.accounts.compact();
             d.groups.compact();
+            d.contacts.compact();
         });
     }
 }
@@ -309,6 +329,19 @@ impl Directory for FakeDirectory {
 
     async fn gal_attributes(&self, tenant: TenantId) -> Result<Vec<String>> {
         Ok(self.with(tenant, |d| d.gal.clone()))
+    }
+
+    async fn contacts_since(
+        &self,
+        tenant: TenantId,
+        cursor: Option<&DirCursor>,
+        limit: usize,
+    ) -> Result<DirPage<DirContact>> {
+        self.with(tenant, |d| d.contacts.page(cursor, limit))
+    }
+
+    async fn units(&self, tenant: TenantId) -> Result<Vec<DirUnit>> {
+        Ok(self.with(tenant, |d| d.units.clone()))
     }
 }
 
@@ -905,7 +938,8 @@ impl QueueEntry {
     }
 }
 
-/// [`QueueStore`] в памяти. Время захвата передаёт вызывающий; `queued_at` — по часам [`Clock`].
+/// [`QueueStore`] в памяти. Время захвата передаёт вызывающий; `queued_at` — по часам [`Clock`], для отложенного
+/// письма — срок выпуска, если он позже. Отмена ([`QueueStore::cancel_queued`]) — до первого захвата.
 /// Когда все выданные захватом получатели завершены (`reschedule`/`postpone`/`complete`), лиза снимается.
 #[derive(Debug, Clone)]
 pub struct MemQueue {
@@ -990,7 +1024,7 @@ impl QueueStore for MemQueue {
             })
             .collect();
         let entry = QueueEntry {
-            queued_at: self.clock.now(),
+            queued_at: self.clock.now().max(msg.next_attempt),
             fencing: 0,
             lease_until: None,
             rcpts,
@@ -1086,6 +1120,20 @@ impl QueueStore for MemQueue {
             }
         })
         .map(|(_, finished)| finished)
+    }
+
+    async fn cancel_queued(&self, tenant: TenantId, id: QueueId) -> Result<BlobKey> {
+        let mut st = lock(&self.entries);
+        let e = st
+            .get(&id)
+            .filter(|e| e.msg.tenant == tenant)
+            .ok_or(Error::NotFound)?;
+        if e.fencing > 0 {
+            return Err(Error::Conflict);
+        }
+        let blob = e.msg.blob;
+        st.remove(&id);
+        Ok(blob)
     }
 }
 
@@ -1629,7 +1677,43 @@ mod tests {
             emails: vec![format!("{id}@example.com")],
             enabled: true,
             attributes: Default::default(),
+            org: Default::default(),
         }
+    }
+
+    /// CTR-35: контакты — инкрементально, подразделения — полным списком.
+    #[tokio::test]
+    async fn directory_contacts_and_units() {
+        use tp_contracts::auth::{DirContact, DirUnit};
+        let t = TenantId::DEFAULT;
+        let dir = FakeDirectory::default();
+        let contact = DirContact {
+            external_id: "c1".into(),
+            display_name: "Партнёр".into(),
+            email: "p@partner.example".into(),
+            attributes: Default::default(),
+        };
+        dir.upsert_contact(t, contact.clone());
+        let full = dir.contacts_since(t, None, 10).await.expect("full");
+        assert_eq!(full.changes, [DirChange::Upsert(contact)]);
+        dir.remove_contact(t, "c1");
+        let next = dir
+            .contacts_since(t, Some(&full.next), 10)
+            .await
+            .expect("next");
+        assert_eq!(
+            next.changes,
+            [DirChange::Removed {
+                external_id: "c1".into()
+            }]
+        );
+        let unit = DirUnit {
+            external_id: "ou".into(),
+            name: "ИТ".into(),
+            parent: None,
+        };
+        dir.set_units(t, vec![unit.clone()]);
+        assert_eq!(dir.units(t).await.expect("units"), [unit]);
     }
 
     #[tokio::test]
@@ -2020,6 +2104,13 @@ mod tests {
     async fn queue_passes_postpone_suite() {
         let clock = ManualClock::default();
         crate::suite::queue_postpone(&MemQueue::new(clock.shared()), TenantId::new()).await;
+    }
+
+    /// CTR-35: срок выпуска и отмена до захвата.
+    #[tokio::test]
+    async fn queue_passes_release_suite() {
+        let clock = ManualClock::default();
+        crate::suite::queue_release(&MemQueue::new(clock.shared()), TenantId::new()).await;
     }
 
     #[tokio::test]

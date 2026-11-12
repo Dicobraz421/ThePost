@@ -87,12 +87,28 @@ uuid_id!(
     QueueId
 );
 uuid_id!(
+    /// Коллекция календарей или контактов учётной записи (`dav::DavStore`, CTR-45).
+    CollectionId
+);
+uuid_id!(
+    /// Объект календаря или контакта в коллекции (`dav::DavStore`, CTR-45); JMAP id `CalendarEvent`, `ContactCard`.
+    DavObjectId
+);
+uuid_id!(
     /// Группа рассылки (`groups::GroupStore`).
     GroupId
 );
 uuid_id!(
     /// Письмо в очереди модерации группы рассылки (`groups::GroupStore::hold`).
     HeldId
+);
+uuid_id!(
+    /// Почтовый контакт — внешний адресат адресной книги (`addressbook::ContactStore`, CTR-35).
+    ContactId
+);
+uuid_id!(
+    /// Подразделение оргструктуры (`addressbook::OrgStore`, CTR-35).
+    OrgUnitId
 );
 
 impl TenantId {

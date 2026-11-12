@@ -97,8 +97,17 @@ pub struct OutMessage {
     pub dsn: DsnParams,
     /// Получатели; пустой список — `Error::Invalid`.
     pub rcpts: Vec<OutRcpt>,
-    /// Первая попытка доставки (обычно — момент постановки).
+    /// Срок выпуска (`release_at`, CTR-35): первая попытка доставки не раньше этого момента — обычно момент постановки,
+    /// для отложенной отправки (JMAP `sendAt`) — срок отправки; до первого захвата запись можно отменить
+    /// ([`QueueStore::cancel_queued`]).
     pub next_attempt: OffsetDateTime,
+}
+
+impl OutMessage {
+    /// Срок выпуска письма (CTR-35) — [`OutMessage::next_attempt`].
+    pub fn release_at(&self) -> OffsetDateTime {
+        self.next_attempt
+    }
 }
 
 /// Конечный статус получателя ([`QueueStore::complete`]).
@@ -144,7 +153,8 @@ pub struct Claimed {
     pub claim: QueueClaim,
     /// Лиза записи действует до этого момента.
     pub until: OffsetDateTime,
-    /// Момент постановки в очередь (срок доставки считает `tp-smtp`).
+    /// Момент постановки в очередь, а для отложенного письма — срок выпуска, если он позже (CTR-35): от него
+    /// `tp-smtp` считает срок доставки.
     pub queued_at: OffsetDateTime,
     /// Организация.
     pub tenant: TenantId,
@@ -205,6 +215,17 @@ pub trait QueueStore: Send + Sync + 'static {
     /// Конечный статус получателя. `true` — все получатели записи в конечном статусе: запись удалена,
     /// вызывающий освобождает ссылку на объект письма. Ошибки — как у `reschedule`.
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool>;
+
+    /// Отмена отправки до выпуска (CTR-35; JMAP `undoStatus: canceled`): удаляет запись организации `tenant`, которую
+    /// ещё не захватывали (нет попыток и лизы), и возвращает объект письма — вызывающий освобождает ссылку. Запись уже
+    /// захвачена или были попытки — `Error::Conflict` (JMAP `cannotUnsend`); нет записи (в том числе доставлена) —
+    /// `Error::NotFound`. Отмена и `claim` атомарны между собой. По умолчанию — `Error::Internal`.
+    async fn cancel_queued(&self, tenant: TenantId, id: QueueId) -> Result<BlobKey> {
+        let _ = (tenant, id);
+        Err(Error::internal(
+            "queue store does not support cancel_queued",
+        ))
+    }
 }
 
 /// Статус получателя при отправке ([`Outbound::submit`]); JMAP — `deliveryStatus` EmailSubmission (RFC 8621 §7).
@@ -250,6 +271,31 @@ pub trait Outbound: Send + Sync + 'static {
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<()>;
+
+    /// Отложенная отправка (CTR-42; JMAP `sendAt`): ставит письмо в очередь со сроком выпуска `release_at`
+    /// ([`OutMessage::next_attempt`]) для всех получателей — локальные доставляются при выпуске — и возвращает запись
+    /// очереди (`EmailSubmission::queue`). Ошибки — как у [`Outbound::enqueue`]. По умолчанию — `Error::Internal`.
+    async fn schedule(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+        release_at: OffsetDateTime,
+    ) -> Result<QueueId> {
+        let _ = (tenant, mail_from, rcpts, raw, release_at);
+        Err(Error::internal("outbound does not support schedule"))
+    }
+
+    /// Отмена отложенной отправки до выпуска (CTR-42; JMAP `undoStatus: canceled`): [`QueueStore::cancel_queued`] и
+    /// освобождение ссылки на тело. Уже выпущено — `Error::Conflict` (`cannotUnsend`); нет записи — `Error::NotFound`.
+    /// По умолчанию — `Error::Internal`.
+    async fn cancel_scheduled(&self, tenant: TenantId, queue: QueueId) -> Result<()> {
+        let _ = (tenant, queue);
+        Err(Error::internal(
+            "outbound does not support cancel_scheduled",
+        ))
+    }
 
     /// Отправляет письмо и возвращает статус по каждому получателю в порядке `rcpts`. По умолчанию —
     /// [`Outbound::enqueue`], все получатели [`SubmitStatus::Queued`].
@@ -308,7 +354,14 @@ mod tests {
                 ("a@example.org".to_owned(), SubmitStatus::Queued),
             ]
         );
-        assert_eq!(*ob.0.lock().expect("lock"), vec![rcpts]);
+        assert_eq!(*ob.0.lock().expect("lock"), vec![rcpts.clone()]);
+        let at = OffsetDateTime::UNIX_EPOCH;
+        let scheduled = ob
+            .schedule(TenantId::DEFAULT, "x@example.org", &rcpts, Bytes::new(), at)
+            .await;
+        assert!(matches!(scheduled, Err(Error::Internal(_))));
+        let canceled = ob.cancel_scheduled(TenantId::DEFAULT, QueueId::new()).await;
+        assert!(matches!(canceled, Err(Error::Internal(_))));
     }
 
     #[test]

@@ -652,7 +652,7 @@ impl tp_admin::groups::Moderation for NoModeration {
     async fn deliver(
         &self,
         _tenant: TenantId,
-        _group: &tp_contracts::groups::DistributionGroup,
+        _group: Option<&tp_contracts::groups::DistributionGroup>,
         _message: &tp_contracts::groups::HeldMessage,
     ) -> Result<()> {
         Err(Error::Internal(NO_MODERATION.to_owned()))

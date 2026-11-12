@@ -60,6 +60,7 @@ fn dir_account(id: &str, login: &str, emails: &[&str]) -> DirAccount {
         emails: emails.iter().map(|e| (*e).to_owned()).collect(),
         enabled: true,
         attributes: BTreeMap::new(),
+        org: Default::default(),
     }
 }
 
@@ -1422,4 +1423,5 @@ async fn outbound_suite() {
     tp_testkit::suite::outbound_submit(&d, TenantId::DEFAULT, &list).await;
 }
 
+mod rules;
 mod wave;
