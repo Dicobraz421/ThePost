@@ -106,7 +106,7 @@ async fn pool_modes_and_with_tenant() {
         let secrets = common::secrets();
         let pool = pool::connect(&c, &*secrets).await.expect("connect");
         let password = c.password(&*secrets).await.expect("password");
-        let lazy = pool::connect_lazy(&c, &c.url, password.as_ref()).expect("lazy");
+        let lazy = pool::connect_lazy(&c, &c.url, password.as_ref(), None).expect("lazy");
         let direct = pool::connect_direct(&c, &*secrets).await.expect("direct");
         for p in [&pool, &lazy, &direct] {
             let seen: String = pool::with_tenant(p, tenant, |tx| {
@@ -229,7 +229,7 @@ async fn sslmode_disable_only_in_dev() {
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        pool::connect_lazy(&prod, &dev.url, None),
+        pool::connect_lazy(&prod, &dev.url, None, None),
         Err(Error::Invalid(_))
     ));
 

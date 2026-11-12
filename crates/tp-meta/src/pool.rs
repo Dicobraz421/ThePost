@@ -20,6 +20,10 @@
 //! Адрес primary — `url` или список `url` + [`PoolConfig::urls`] (первый доступный для записи); поведение при
 //! переключении СУБД ([`PoolConfig::failover`]) — [`crate::failover`] (META-25).
 //!
+//! Ключ клиентского сертификата — файл `tls.key_file` или секрет `tls.key` (CTR-52, META-56): секрет читается из
+//! [`SecretStore`] при создании пула и при смене учётных данных ([`PoolConfig::client_key`]) и передаётся
+//! драйверу из памяти, на диск не пишется.
+//!
 //! Реплика для фоновых чтений ([`PoolConfig::read_replica`], `ReadIntent::Stale`, META-32) — [`connect_replica`],
 //! [`crate::replica`].
 
@@ -36,7 +40,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Connection, PgConnection, PgPool};
 use tp_contracts::config::duration;
 use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
-use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
+use tp_contracts::tls::{InternalChannel, InternalTls, KeySource, Profile, Transport};
 use tp_contracts::{Error, Result, TenantId};
 
 use crate::credentials::{self, DynamicCredentials, Rotated, Rotation};
@@ -187,7 +191,46 @@ impl PoolConfig {
         }
     }
 
-    /// Параметры соединения с `url` без пароля; `pgbouncer` отключает кэш подготовленных выражений.
+    /// Ключ клиентского сертификата из хранилища секретов (`database.tls.key`, PEM); `None` — ключ задан
+    /// файлом `tls.key_file` или не задан. Недоступный секрет — `Unavailable` (причина — в журнале); значение —
+    /// не закрытый ключ PEM — `Invalid`. Значение в тексты ошибок и журнал не попадает.
+    pub async fn client_key(&self, secrets: &dyn SecretStore) -> Result<Option<Secret>> {
+        let Some(KeySource::Secret(r)) = self.tls.key_source()? else {
+            return Ok(None);
+        };
+        let key = fetch_secret(secrets, r, "database.tls.key").await?;
+        if !is_private_key_pem(key.expose()) {
+            return Err(Error::invalid(
+                "database.tls.key: значение секрета — не закрытый ключ в формате PEM",
+            ));
+        }
+        Ok(Some(key))
+    }
+
+    /// Добавляет к параметрам `opts` ключ клиентского сертификата `key` из хранилища ([`Self::client_key`]).
+    /// Задан `tls.key`, а ключа нет (соединение собирается без хранилища секретов) — `Invalid`: без ключа
+    /// клиентский сертификат не был бы предъявлен.
+    pub(crate) fn with_key(
+        &self,
+        opts: PgConnectOptions,
+        key: Option<&Secret>,
+    ) -> Result<PgConnectOptions> {
+        if !matches!(self.tls.key_source()?, Some(KeySource::Secret(_)))
+            || matches!(opts.get_ssl_mode(), PgSslMode::Disable)
+        {
+            return Ok(opts);
+        }
+        match key {
+            Some(key) => Ok(opts.ssl_client_key_from_pem(key.expose())),
+            None => Err(Error::invalid(
+                "database.tls.key: ключ клиентского сертификата читается из хранилища секретов — \
+                 соединение без хранилища невозможно",
+            )),
+        }
+    }
+
+    /// Параметры соединения с `url` без пароля и без ключа из хранилища (`tls.key` — [`Self::client_key`]);
+    /// `pgbouncer` отключает кэш подготовленных выражений.
     pub fn connect_options(&self, url: &str, pgbouncer: bool) -> Result<PgConnectOptions> {
         self.options(url, pgbouncer).map(|(opts, _)| opts)
     }
@@ -297,8 +340,13 @@ impl PoolConfig {
             if let Some(ca) = &self.tls.ca_file {
                 opts = opts.ssl_root_cert(ca);
             }
-            if let (Some(cert), Some(key)) = (&self.tls.cert_file, &self.tls.key_file) {
-                opts = opts.ssl_client_cert(cert).ssl_client_key(key);
+            // Ключ из хранилища (`tls.key`) добавляет `with_key`: здесь хранилища нет.
+            match (&self.tls.cert_file, self.tls.key_source()?) {
+                (Some(cert), Some(KeySource::File(key))) => {
+                    opts = opts.ssl_client_cert(cert).ssl_client_key(key);
+                }
+                (Some(cert), Some(KeySource::Secret(_))) => opts = opts.ssl_client_cert(cert),
+                _ => {}
             }
         }
         let opts = if pgbouncer {
@@ -309,17 +357,20 @@ impl PoolConfig {
         Ok((opts, transport))
     }
 
-    /// Параметры нового пула с паролем из хранилища; открытый канал — предупреждение в лог.
+    /// Параметры нового пула с паролем и ключом клиентского сертификата из хранилища; открытый канал —
+    /// предупреждение в лог.
     pub(crate) fn open_options(
         &self,
         url: &str,
         pgbouncer: bool,
         password: Option<&Secret>,
+        key: Option<&Secret>,
     ) -> Result<PgConnectOptions> {
         let (opts, transport) = self.options(url, pgbouncer)?;
         if transport == Transport::Plaintext {
             tracing::warn!("{}", InternalChannel::Postgres.plaintext_warning());
         }
+        let opts = self.with_key(opts, key)?;
         Ok(match password {
             Some(p) => opts.password(p.expose()),
             None => opts,
@@ -375,6 +426,18 @@ pub fn url_has_password(url: &str) -> bool {
         })
 }
 
+/// Значение — закрытый ключ в PEM (`-----BEGIN [… ]PRIVATE KEY-----` с парной строкой `END`).
+fn is_private_key_pem(pem: &str) -> bool {
+    let Some(begin) = pem.find("-----BEGIN ") else {
+        return false;
+    };
+    let rest = &pem[begin + "-----BEGIN ".len()..];
+    let Some((label, body)) = rest.split_once("-----") else {
+        return false;
+    };
+    label.ends_with("PRIVATE KEY") && body.contains(&format!("-----END {label}-----"))
+}
+
 /// Значение секрета для подключения. Отказ хранилища (нет секрета, отозван, запрещён, недоступно) —
 /// `Unavailable`: пароль мог смениться, повтор после исправления поможет; ссылка (не значение) и причина — в журнал.
 pub(crate) async fn fetch_secret(
@@ -400,14 +463,15 @@ async fn credentials_options(
     secrets: &dyn SecretStore,
 ) -> Result<PgConnectOptions> {
     cfg.check_credentials()?;
+    let key = cfg.client_key(secrets).await?;
     match &cfg.dynamic_credentials {
         Some(dc) => {
             let issued = credentials::issue(dc, secrets).await?;
-            Ok(issued.apply(cfg.open_options(url, pgbouncer, None)?))
+            Ok(issued.apply(cfg.open_options(url, pgbouncer, None, key.as_ref())?))
         }
         None => {
             let password = cfg.password(secrets).await?;
-            cfg.open_options(url, pgbouncer, password.as_ref())
+            cfg.open_options(url, pgbouncer, password.as_ref(), key.as_ref())
         }
     }
 }
@@ -486,8 +550,9 @@ async fn rotating_pool_with(
     let Some(dc) = cfg.dynamic_credentials.clone() else {
         return Err(Error::invalid("database.dynamic_credentials не задан"));
     };
+    let key = cfg.client_key(secrets.as_ref()).await?;
     let issued = credentials::issue(&dc, secrets.as_ref()).await?;
-    let opts = issued.apply(cfg.open_options(&cfg.url, cfg.pgbouncer, None)?);
+    let opts = issued.apply(cfg.open_options(&cfg.url, cfg.pgbouncer, None, key.as_ref())?);
     // Соединение, открытое до смены учётных данных, закрывается при выдаче из пула (занятые — дорабатывают).
     let pool = hooked_pool(cfg, opts, rotated.clone());
     let rotation = Rotation {
@@ -496,15 +561,22 @@ async fn rotating_pool_with(
         secrets,
         pool: pool.clone(),
         rotated,
+        key,
     };
     tokio::spawn(rotation.run(issued));
     Ok(pool)
 }
 
-/// Пул к адресу `url` с паролем `password` и параметрами `cfg`, соединения — по требованию
-/// (роли загружаются лениво, SRS 2.7; пулы шардов).
-pub fn connect_lazy(cfg: &PoolConfig, url: &str, password: Option<&Secret>) -> Result<PgPool> {
-    let opts = cfg.open_options(url, cfg.pgbouncer, password)?;
+/// Пул к адресу `url` с паролем `password`, ключом клиентского сертификата `key` ([`PoolConfig::client_key`];
+/// `tls.key` без ключа — `Invalid`) и параметрами `cfg`, соединения — по требованию (роли загружаются лениво,
+/// SRS 2.7; пулы шардов).
+pub fn connect_lazy(
+    cfg: &PoolConfig,
+    url: &str,
+    password: Option<&Secret>,
+    key: Option<&Secret>,
+) -> Result<PgPool> {
+    let opts = cfg.open_options(url, cfg.pgbouncer, password, key)?;
     Ok(cfg.pool_options().connect_lazy_with(opts))
 }
 
@@ -524,7 +596,8 @@ pub async fn connect_replica(
         ));
     }
     let password = cfg.password(secrets).await?;
-    connect_lazy(cfg, url, password.as_ref()).map(Some)
+    let key = cfg.client_key(secrets).await?;
+    connect_lazy(cfg, url, password.as_ref(), key.as_ref()).map(Some)
 }
 
 /// Пул из одного соединения в обход PgBouncer для миграций ([`crate::schema::migrate`], модули): с
@@ -543,7 +616,8 @@ pub async fn connect_direct(cfg: &PoolConfig, secrets: &dyn SecretStore) -> Resu
                 Some(r) => Some(fetch_secret(secrets, r, "database.owner.password").await?),
                 None => None,
             };
-            cfg.open_options(url, pgbouncer, password.as_ref())?
+            let key = cfg.client_key(secrets).await?;
+            cfg.open_options(url, pgbouncer, password.as_ref(), key.as_ref())?
                 .username(&owner.user)
         }
         None => credentials_options(cfg, url, pgbouncer, secrets).await?,
@@ -793,5 +867,128 @@ dynamic_credentials:
             ..InternalTls::default()
         });
         assert!(named.check().is_err());
+    }
+
+    const KEY_PEM: &str =
+        "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAA\n-----END PRIVATE KEY-----\n";
+
+    fn key_ref() -> SecretRef {
+        "thepost/tls/db#key".parse().expect("ссылка")
+    }
+
+    fn mtls(url: &str) -> PoolConfig {
+        PoolConfig {
+            tls: InternalTls {
+                cert_file: Some("/etc/thepost/node.pem".into()),
+                key: Some(key_ref()),
+                ..InternalTls::default()
+            },
+            ..cfg(url)
+        }
+    }
+
+    /// Ключ в параметрах соединения — в памяти (`Inline`), не путём к файлу.
+    fn inline_key(opts: &PgConnectOptions, pem: &str) -> bool {
+        format!("{opts:?}").contains(&format!(
+            "ssl_client_key: Some(Inline({:?}))",
+            pem.as_bytes()
+        ))
+    }
+
+    #[tokio::test]
+    async fn tls_key_from_secret_store() {
+        let url = "postgres://db.internal/thepost";
+        let c = mtls(url);
+        assert_eq!(c.check(), Ok(Transport::Tls));
+        let store = tp_testkit::MemSecretStore::default();
+        store.set(&key_ref(), KEY_PEM);
+        let key = c.client_key(&store).await.expect("ключ");
+        assert_eq!(key.as_ref().map(Secret::expose), Some(KEY_PEM));
+        let opts = c
+            .open_options(url, false, None, key.as_ref())
+            .expect("параметры");
+        assert!(inline_key(&opts, KEY_PEM));
+        assert!(format!("{opts:?}").contains("node.pem"));
+        // Те же параметры собирает путь с хранилищем (пул узла, слушатель, миграции).
+        let opts = credentials_options(&c, url, false, &store)
+            .await
+            .expect("credentials");
+        assert!(inline_key(&opts, KEY_PEM));
+        let lazy = connect_lazy(&c, url, None, key.as_ref()).expect("lazy");
+        assert!(inline_key(&lazy.connect_options(), KEY_PEM));
+
+        // Новая версия секрета — при следующем чтении (новое подключение).
+        let next = KEY_PEM.replace("IAAA", "IBBB");
+        store.set(&key_ref(), next.clone());
+        let key = c.client_key(&store).await.expect("ключ");
+        assert_eq!(key.as_ref().map(Secret::expose), Some(next.as_str()));
+
+        // `key_file` — как раньше: путь, хранилище не читается.
+        let file = PoolConfig {
+            tls: InternalTls {
+                cert_file: Some("/etc/thepost/node.pem".into()),
+                key_file: Some("/etc/thepost/node.key".into()),
+                ..InternalTls::default()
+            },
+            ..cfg(url)
+        };
+        let gets = store.gets();
+        assert_eq!(
+            file.client_key(&store).await.map(|k| k.is_some()),
+            Ok(false)
+        );
+        assert_eq!(store.gets(), gets);
+        let opts = file.open_options(url, false, None, None).expect("файл");
+        assert!(format!("{opts:?}").contains("node.key"));
+    }
+
+    #[tokio::test]
+    async fn tls_key_errors() {
+        let url = "postgres://db.internal/thepost";
+        let c = mtls(url);
+        // `key` без хранилища — ошибка конфигурации, а не соединение без клиентского сертификата.
+        for r in [
+            c.open_options(url, false, None, None).map(drop),
+            connect_lazy(&c, url, None, None).map(drop),
+        ] {
+            assert!(
+                matches!(&r, Err(Error::Invalid(m)) if m.contains("database.tls.key")),
+                "{r:?}"
+            );
+        }
+        // Оба источника ключа — ошибка.
+        let mut both = c.clone();
+        both.tls.key_file = Some("/etc/thepost/node.key".into());
+        assert!(matches!(both.check(), Err(Error::Invalid(_))));
+
+        let store = tp_testkit::MemSecretStore::default();
+        // Секрета нет, хранилище запечатано — временный отказ.
+        assert!(matches!(
+            c.client_key(&store).await,
+            Err(Error::Unavailable { .. })
+        ));
+        store.set(&key_ref(), KEY_PEM);
+        store.seal();
+        assert!(matches!(
+            c.client_key(&store).await,
+            Err(Error::Unavailable { .. })
+        ));
+        store.unseal();
+        // Не ключ PEM (например, сертификат или пароль) — `Invalid` без значения в тексте.
+        for bad in [
+            "hunter2-not-a-key",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+            "-----BEGIN PRIVATE KEY-----\nAAAA\n",
+        ] {
+            store.set(&key_ref(), bad);
+            let e = c.client_key(&store).await.expect_err("не ключ");
+            assert!(
+                matches!(&e, Error::Invalid(m) if !m.contains("hunter2") && !m.contains("AAAA")),
+                "{e:?}"
+            );
+        }
+        assert!(is_private_key_pem(
+            "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----"
+        ));
     }
 }

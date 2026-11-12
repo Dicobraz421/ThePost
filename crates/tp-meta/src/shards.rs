@@ -269,6 +269,8 @@ impl ShardDirectory {
     /// [`crate::schema::migrate`]): с `database.owner` — от владельца схемы (имя роли и пароль владельца,
     /// адрес шарда), иначе — с учётными данными шарда. Данные каталога на шардах не пишутся.
     pub async fn migrate(&self) -> Result<()> {
+        // Секреты читаются вне транзакций БД; ключ клиентского сертификата — общий для шардов (`database.tls`).
+        let key = self.cfg.client_key(self.secrets.as_ref()).await?;
         for shard in self.list().await? {
             let Some(dsn) = &shard.dsn else {
                 continue;
@@ -283,7 +285,7 @@ impl ShardDirectory {
                         None => None,
                     };
                     self.cfg
-                        .open_options(dsn, false, password.as_ref())?
+                        .open_options(dsn, false, password.as_ref(), key.as_ref())?
                         .username(&owner.user)
                 }
                 None => {
@@ -294,7 +296,8 @@ impl ShardDirectory {
                         ),
                         None => None,
                     };
-                    self.cfg.open_options(dsn, false, password.as_ref())?
+                    self.cfg
+                        .open_options(dsn, false, password.as_ref(), key.as_ref())?
                 }
             };
             let pool = sqlx::postgres::PgPoolOptions::new()
@@ -344,7 +347,8 @@ impl ShardDirectory {
             }
             None => None,
         };
-        connect_lazy(&self.cfg, dsn, password.as_ref())
+        let key = self.cfg.client_key(self.secrets.as_ref()).await?;
+        connect_lazy(&self.cfg, dsn, password.as_ref(), key.as_ref())
     }
 
     /// Кэширует пул, если кэш не сброшен с поколения `epoch`; параллельный запрос мог создать пул раньше —
