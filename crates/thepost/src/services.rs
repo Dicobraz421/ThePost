@@ -1011,6 +1011,37 @@ mod tests {
             .expect("login from another address");
     }
 
+    /// APP-40 (SRS 6.3): неудачи с разными несуществующими именами входа (учётной записи нет) засчитываются адресу —
+    /// порог блокирует адрес, в том числе для существующей учётной записи с верным паролем; вход с другого адреса
+    /// работает.
+    #[tokio::test]
+    async fn guarded_blocks_address_after_unknown_logins() {
+        let mut g = guarded(MemAbuseBlocks::default(), 1000, false).await;
+        let cfg = tp_auth::AbuseConfig {
+            ip_failures: 3,
+            account_failures: 1000,
+            ..tp_auth::AbuseConfig::default()
+        };
+        g.guard = tp_auth::AbuseGuard::new(cfg, Arc::new(MemAbuseBlocks::default()));
+        let peer = Some(IpAddr::from([192, 0, 2, 7]));
+        let other = Some(IpAddr::from([198, 51, 100, 9]));
+        for i in 0..3 {
+            let unknown = Credentials::Password {
+                login: format!("nobody{i}@example.org"),
+                secret: "guess".into(),
+            };
+            assert_eq!(g.verify(unknown, peer).await, Err(Error::Forbidden));
+        }
+        assert_eq!(
+            g.verify(password("right"), peer).await,
+            Err(Error::Forbidden),
+            "адрес заблокирован"
+        );
+        g.verify(password("right"), other)
+            .await
+            .expect("login from another address");
+    }
+
     /// Хранилище блокировок недоступно, `auth.abuse.fail_closed: false` — вход проверяется (решение владельца #253,
     /// по умолчанию пускать).
     #[tokio::test]
