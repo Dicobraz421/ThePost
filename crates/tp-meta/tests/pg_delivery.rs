@@ -10,7 +10,7 @@ use tp_contracts::delivery::{
 use tp_contracts::membership::NodeId;
 use tp_contracts::{Error, TenantId};
 use tp_meta::schema::{self, db_err};
-use tp_testkit::suite::{DeliveryFixture, delivery_log};
+use tp_testkit::suite::{DeliveryFixture, delivery_by_queue, delivery_log};
 
 #[tokio::test]
 async fn passes_contract_suite() {
@@ -22,6 +22,7 @@ async fn passes_contract_suite() {
         foreign_tenant: common::tenant(meta.pool()).await,
     };
     delivery_log(&meta, &fx).await;
+    delivery_by_queue(&meta, &fx).await;
 }
 
 fn event(tenant: TenantId, at: OffsetDateTime, tag: &str) -> DeliveryEvent {

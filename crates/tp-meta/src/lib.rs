@@ -23,6 +23,7 @@ pub mod failover;
 pub mod groups;
 pub mod index_manifest;
 pub mod lease;
+pub mod mailbox_audit;
 pub mod mailboxes;
 pub mod membership;
 pub mod messages;
@@ -35,6 +36,7 @@ pub mod schema;
 pub mod shards;
 pub mod sieve;
 pub mod signals;
+pub mod submissions;
 pub mod transport;
 
 use std::future::Future;
@@ -56,12 +58,14 @@ use crate::delivery::DeliveryLogConfig;
 use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
 use crate::failover::Failover;
+use crate::mailbox_audit::MailboxAuditConfig;
 use crate::pool::TxFuture;
 use crate::replica::Replica;
 use crate::retention::RetentionConfig;
 use crate::shards::{ReadIntent, ShardId, ShardResolver};
 use crate::sieve::SieveConfig;
 use crate::signals::SignalsConfig;
+use crate::submissions::SubmissionsConfig;
 
 /// Секция конфигурации контура метаданных `meta` (SRS 5.5); пул соединений — отдельная секция
 /// `database` ([`pool::PoolConfig`]). Все поля необязательны; неизвестное поле — ошибка разбора.
@@ -114,6 +118,10 @@ pub struct MetaConfig {
     pub dav: DavConfig,
     /// Скрипты Sieve и автоответ: лимиты ([`sieve`]).
     pub sieve: SieveConfig,
+    /// Отправки JMAP: срок хранения ([`submissions`]).
+    pub submissions: SubmissionsConfig,
+    /// Аудит доступа к ящику: срок хранения ([`mailbox_audit`]).
+    pub mailbox_audit: MailboxAuditConfig,
 }
 
 impl MetaConfig {
@@ -135,6 +143,8 @@ impl Default for MetaConfig {
             abuse: AbuseBlocksConfig::default(),
             dav: DavConfig::default(),
             sieve: SieveConfig::default(),
+            submissions: SubmissionsConfig::default(),
+            mailbox_audit: MailboxAuditConfig::default(),
         }
     }
 }

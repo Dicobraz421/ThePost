@@ -112,6 +112,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "busy recurring",
         include_str!("../migrations/0025_busy_recurring.sql"),
     ),
+    (
+        26,
+        "submissions mailbox audit",
+        include_str!("../migrations/0026_submissions_mailbox_audit.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
