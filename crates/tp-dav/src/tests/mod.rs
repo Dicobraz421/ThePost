@@ -16,7 +16,11 @@ use tp_testkit::{FakeAuthenticator, MemDav, principal};
 use crate::{DavConfig, Deps, router};
 
 mod auth;
+mod caldav_home;
+mod multiget;
+mod preconditions;
 mod propfind;
+mod query;
 mod resource;
 mod sync;
 

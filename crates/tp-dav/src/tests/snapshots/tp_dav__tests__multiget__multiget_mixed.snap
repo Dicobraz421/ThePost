@@ -1,0 +1,66 @@
+---
+source: crates/tp-dav/src/tests/multiget.rs
+expression: r.show()
+---
+207 Multi-Status
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/work/b%20c.ics</d:href>
+<d:propstat>
+<d:prop>
+<d:getetag>"4"</d:getetag>
+<c:calendar-data>BEGIN:VCALENDAR&#13;
+VERSION:2.0&#13;
+PRODID:-//test//RU&#13;
+BEGIN:VEVENT&#13;
+UID:b&#13;
+DTSTAMP:20260101T000000Z&#13;
+DTSTART:20260105T100000Z&#13;
+DTEND:20260105T110000Z&#13;
+SUMMARY:Вторая&#13;
+END:VEVENT&#13;
+END:VCALENDAR&#13;
+</c:calendar-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/work/missing.ics</d:href>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:response>
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/work/a.ics</d:href>
+<d:propstat>
+<d:prop>
+<d:getetag>"3"</d:getetag>
+<c:calendar-data>BEGIN:VCALENDAR&#13;
+VERSION:2.0&#13;
+PRODID:-//test//RU&#13;
+BEGIN:VEVENT&#13;
+UID:a&#13;
+DTSTAMP:20260101T000000Z&#13;
+DTSTART:20260105T100000Z&#13;
+DTEND:20260105T110000Z&#13;
+SUMMARY:Первая&#13;
+END:VEVENT&#13;
+END:VCALENDAR&#13;
+</c:calendar-data>
+</d:prop>
+<d:status>HTTP/1.1 200 OK</d:status>
+</d:propstat>
+</d:response>
+<d:response>
+<d:href>/dav/calendars/ivan@example.org/other/x.ics</d:href>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:response>
+<d:response>
+<d:href>/dav/calendars/petr@example.org/work/a.ics</d:href>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:response>
+<d:response>
+<d:href>/somewhere/else.ics</d:href>
+<d:status>HTTP/1.1 404 Not Found</d:status>
+</d:response>
+</d:multistatus>
