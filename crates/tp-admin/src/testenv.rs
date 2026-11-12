@@ -26,8 +26,11 @@ use tp_testkit::{
 };
 use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
-use crate::server::{Admin, AdminConfig, AdminRole, Deps, ParityStores, RoleBinding};
+use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 use crate::sieve::ScriptError;
+
+/// Издатель токенов OIDC тестов (`Deps::oidc_issuer`).
+pub const ISSUER: &str = "https://idp.example.org/realms/mail";
 
 /// Журнал аудита в памяти — [`MemAuditLog`] tp-testkit; [`MemAudit::records`] — записи для проверок.
 #[derive(Debug, Clone, Default)]
@@ -53,6 +56,11 @@ pub struct Stores {
     pub moderation: MemModeration,
     pub policies: MemPolicies,
     pub trash: MemTrash,
+    /// Адресная книга: контакты, оргструктура, динамические группы.
+    pub addressbook: MemAddressBook,
+    pub senders: MemSenderLists,
+    pub mailbox_audit: MemMailboxAudit,
+    pub sync_gate: MemSyncGate,
 }
 
 impl Stores {
@@ -84,6 +92,10 @@ impl Stores {
             moderation: MemModeration::default(),
             policies,
             trash,
+            addressbook: MemAddressBook::new(),
+            senders: MemSenderLists::new(),
+            mailbox_audit: MemMailboxAudit::new(),
+            sync_gate: MemSyncGate::new(),
         }
     }
 
@@ -112,6 +124,13 @@ impl Stores {
             trash: Arc::new(self.trash.clone()),
             store: Arc::new(self.store.clone()),
             app_passwords: self.app_passwords(),
+            contacts: Arc::new(self.addressbook.clone()),
+            org: Arc::new(self.addressbook.clone()),
+            dynamic: Arc::new(self.addressbook.clone()),
+            senders: Arc::new(self.senders.clone()),
+            mailbox_audit: Arc::new(self.mailbox_audit.clone()),
+            sync: Arc::new(self.sync_gate.clone()),
+            oidc_issuer: Some(ISSUER.to_owned()),
         }
     }
 }
@@ -141,7 +160,7 @@ pub struct Env {
     pub sieve: MemSieve,
     /// Объекты писем очереди модерации (`Admin::with_held_blobs`).
     pub held_blobs: MemBlobStore,
-    /// Адресная книга: контакты, оргструктура, динамические группы (`Admin::with_parity`).
+    /// Адресная книга: контакты, оргструктура, динамические группы.
     pub addressbook: MemAddressBook,
     pub mailbox_audit: MemMailboxAudit,
     pub sync_gate: MemSyncGate,
@@ -215,21 +234,16 @@ impl Env {
 
     /// Без настроек транспорта (маршруты транспорта — 503).
     pub fn without_transport() -> Self {
-        Self::build(config(), Vec::new(), false, true, true)
+        Self::build(config(), Vec::new(), false, true)
     }
 
     /// Без локального входа (`admin init` и обмен — 503).
     pub fn without_local() -> Self {
-        Self::build(config(), Vec::new(), true, false, true)
-    }
-
-    /// Без хранилищ CTR-35 (адресная книга, списки, аудит ящиков — 503).
-    pub fn without_parity() -> Self {
-        Self::build(config(), Vec::new(), true, true, false)
+        Self::build(config(), Vec::new(), true, false)
     }
 
     pub fn with(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>) -> Self {
-        Self::build(cfg, modules, true, true, true)
+        Self::build(cfg, modules, true, true)
     }
 
     fn build(
@@ -237,7 +251,6 @@ impl Env {
         modules: Vec<Arc<dyn AdminRoutes>>,
         with_transport: bool,
         with_local: bool,
-        with_parity: bool,
     ) -> Self {
         let auth = FakeAuthenticator::default();
         let other_tenant = TenantId::new();
@@ -272,22 +285,6 @@ impl Env {
         } else {
             admin
         };
-        let addressbook = MemAddressBook::new();
-        let senders = MemSenderLists::new();
-        let mailbox_audit = MemMailboxAudit::new();
-        let sync_gate = MemSyncGate::new();
-        let admin = if with_parity {
-            admin.with_parity(ParityStores {
-                contacts: Arc::new(addressbook.clone()),
-                org: Arc::new(addressbook.clone()),
-                dynamic: Arc::new(addressbook.clone()),
-                senders: Arc::new(senders.clone()),
-                mailbox_audit: Arc::new(mailbox_audit.clone()),
-                sync: Arc::new(sync_gate.clone()),
-            })
-        } else {
-            admin
-        };
         let sieve = MemSieve::new();
         let held_blobs = MemBlobStore::new(Arc::new(SystemClock));
         let admin = Arc::new(
@@ -305,6 +302,9 @@ impl Env {
             moderation,
             policies,
             trash,
+            addressbook,
+            mailbox_audit,
+            sync_gate,
             ..
         } = stores;
         Self {

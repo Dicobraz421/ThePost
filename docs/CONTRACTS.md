@@ -315,7 +315,7 @@ CTR-35: `DirAccount::org: DirOrg { department (external_id подразделе�
 Порог массового удаления: `exceeds_removal_threshold(removed, total, percent)`, `MASS_REMOVAL_PERCENT` = 5; `SyncGate` — остановка
 синхронизации до подтверждения: `hold_sync(tenant, removed, total, at) -> MassRemoval { removed, total, detected_at, approved }` (подтверждение
 сохраняется, если `removed` не выросло), `pending_sync`, `approve_sync` (нет — `NotFound`; Admin API), `clear_sync` (синхронизация после
-отключения). In-memory — `MemSyncGate`; набор `suite::sync_gate`.
+отключения). PostgreSQL — `PgMeta` (`sync_holds`), in-memory — `MemSyncGate`; набор `suite::sync_gate`.
 CTR-58 (решение 79): `DirAccount::hidden_from_gal: bool` (`#[serde(default)]`, как у групп и почтовых контактов) — запись не попадает
 в адресную книгу (GAL), вход и приём почты не меняются. Заполняет каталог (LDAP — AUTH-16), учитывает построение GAL (DAV-27).
 
@@ -1011,6 +1011,10 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   набор `suite::account_by_ids`; `EventKind::AccountDisabled { account }` — системный сигнал запрета входа и `meta::account_disabled`,
   набор `suite::signals`. По сравнению с карточками: повторы в `by_ids` схлопываются; сигнал — и при `disable_account` (вход запрещён
   и там). Публикация в `tp-meta` — META-67, подписчики — IMAP-22, JMAP-41.
+- 2026-11-12 — x/admin-parity (правило владельца 12.11 «старое рядом с новым не оставлять»): у `AccountStore::restore_account`,
+  `disabled_accounts`, `attach_account` нет тел по умолчанию (были `Internal`) — реализации `PgMeta`, `MemMetadata`. `SyncGate` на
+  PostgreSQL — `PgMeta` (миграция 0032 `sync_holds`), набор `suite::sync_gate`. `tp_admin::Deps` — хранилища CTR-35 обязательны
+  (`contacts`, `org`, `dynamic`, `senders`, `mailbox_audit`, `sync`) вместо `Admin::with_parity`.
 - 2026-11-13 — CTR-60 (волна contracts-41, решение 72): книга GAL организации в `DavStore` — `sync_gal(tenant, display_name, cards)`
   (полный набор `GalCard` одной транзакцией; неизменная карточка сохраняет ETag и `ModSeq`, исчезнувшая — надгробие),
   `gal_changes(tenant, since, limit)`, `GAL_COLLECTION_NAME`, `Collection::is_gal`, `validate_gal`; книга видна каждой учётной записи

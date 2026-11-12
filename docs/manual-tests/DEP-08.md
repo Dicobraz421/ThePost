@@ -7,31 +7,24 @@
    (без установленного бинарного файла — только «/usr/local/bin/thepost is not executable»).
 2. Юнит отдельно (каталог `deploy/systemd/thepost.service.d` рядом systemd-analyze подхватывает как drop-in):
    `T=$(mktemp -d); cp deploy/systemd/thepost.service $T/; systemd-analyze security --offline=true $T/thepost.service | tail -1`
-   → `Overall exposure level … 1.2 OK` (не хуже 2.0). С drop-in без активации сокетов:
-   ```bash
-   R=$(mktemp -d); mkdir -p $R/etc/systemd/system/thepost.service.d
-   cp deploy/systemd/thepost.service $R/etc/systemd/system/
-   cp deploy/systemd/thepost.service.d/bind-capability.conf $R/etc/systemd/system/thepost.service.d/
-   systemd-analyze security --offline=true --root=$R thepost.service | tail -1
-   ```
-   → `1.6 OK`.
+   → `Overall exposure level … 1.2 OK` (не хуже 2.0).
 
 ## systemd: установка на ВМ (Ansible, эталон SMB)
-1. `ansible-playbook -i inventory.yml deploy/ansible/smb.yml` (по умолчанию `thepost_socket_activation: false`) →
-   прогон без ошибок, `/healthz/ready` — 200; повторный прогон — `changed=0`.
-2. `systemd-analyze security thepost.service | tail -1` → не хуже 2.0 (ожидается 1.6).
-   `systemctl show thepost -p CapabilityBoundingSet -p AmbientCapabilities` → только `cap_net_bind_service`.
-   `systemctl is-enabled thepost-smtp.socket` → `disabled`.
+1. `ansible-playbook -i inventory.yml deploy/ansible/smb.yml` → прогон без ошибок, `/healthz/ready` — 200; повторный
+   прогон — `changed=0`.
+2. `systemd-analyze security thepost.service | tail -1` → не хуже 2.0 (ожидается 1.2).
+   `systemctl show thepost -p CapabilityBoundingSet -p AmbientCapabilities` → пусто (ни одной capability, решение 102).
+   `systemctl is-active thepost-{smtp,submissions,submission,imap,imaps,https}.socket` → `active`;
+   `ss -ltnp 'sport < 1024'` → порты 25, 143, 443, 465, 587, 993 слушает `systemd` (pid 1) и передаёт `thepost`.
 3. Привилегии процесса службы — doctor в окружении службы (те же учётная запись, capabilities, NoNewPrivileges):
    ```bash
    sudo systemd-run --wait --pipe --quiet -p User=thepost -p Group=thepost -p NoNewPrivileges=yes \
-     -p CapabilityBoundingSet=CAP_NET_BIND_SERVICE -p AmbientCapabilities=CAP_NET_BIND_SERVICE \
+     -p CapabilityBoundingSet= -p AmbientCapabilities= \
      -p LoadCredential=openbao-secret-id:/etc/thepost/credentials/openbao-secret-id \
      /usr/local/bin/thepost doctor --config /etc/thepost/config.yaml | grep privileges
    ```
    → `privileges.user`, `privileges.capabilities`, `privileges.no_new_privs`, `privileges.seccomp`, `privileges.landlock` — `OK`
-   (на ядре без Landlock — `WARN unsupported`, это свойство ядра). С сокетами — те же `-p` без capabilities
-   (`-p CapabilityBoundingSet=`): `capabilities … eff=- bnd=-`.
+   (на ядре без Landlock — `WARN unsupported`, это свойство ядра); `capabilities … eff=- bnd=-`.
 4. `ss -ltnp | grep 8443` → `127.0.0.1:8443` (Admin API только на loopback); `curl -sk https://<адрес ВМ>:8443/` — отказ.
 5. PostgreSQL:
    ```bash
@@ -44,11 +37,8 @@
    схемы = thepost_owner`.
 6. Обновление установки до DEP-08 (таблицы принадлежат `thepost`): прогон плейбука → таблицы переданы `thepost_owner`,
    узел стартует, `database.node_role` — `OK`.
-7. Активация сокетов (после подключения приёма сокетов в узле, TODO(PLT-16)): `-e thepost_socket_activation=true` →
-   `systemctl is-active thepost-{smtp,submissions,submission,imap,imaps,https}.socket` — `active`, `bind-capability.conf`
-   удалён, `systemctl show thepost -p CapabilityBoundingSet` — пусто, `systemd-analyze security thepost.service` — 1.2;
-   `openssl s_client -connect <ВМ>:465` → `220`; `systemctl restart thepost` во время `nc <ВМ> 25` в цикле — соединения
-   не отклоняются (ждут в очереди сокета). Обратно `-e thepost_socket_activation=false` → сокеты остановлены, узел слушает сам.
+7. Сокеты systemd: `openssl s_client -connect <ВМ>:465` → `220`; `systemctl restart thepost` во время `nc <ВМ> 25` в
+   цикле — соединения не отклоняются (ждут в очереди сокета).
 
 ## Compose (профиль smb, образ уже собран — `--no-build`)
 1. `docker compose -f deploy/compose/dev.yml --profile smb up -d --no-build` → `postgres-role-tls`: «БД thepost — владелец

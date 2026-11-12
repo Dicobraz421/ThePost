@@ -504,10 +504,10 @@
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
 |---|---|---|---|---|---|---|
 | [CTR-57](CTR-57.md) | адрес клиента в проверке учётных данных | contracts | B | contracts-39 | done | — |
-| [AUTH-14](AUTH-14.md) | SASL передаёт адрес клиента в проверку учётных данных | auth | A | auth-09 | ready | CTR-57 |
+| [AUTH-14](AUTH-14.md) | SASL передаёт адрес клиента в проверку учётных данных | auth | A | auth-09 | done | CTR-57 |
 | [SMTP-35](SMTP-35.md) | адрес клиента в AUTH SMTP | smtp | A | smtp-15 | done | CTR-57 |
-| [IMAP-19](IMAP-19.md) | адрес клиента во входе IMAP и POP3 | imap | A | imap-10 | ready | CTR-57 |
-| [IMAP-20](IMAP-20.md) | тест: EXPUNGE в корзине не трогает письмо, перенесённое из INBOX с `\Deleted` | imap | A | imap-10 | ready | — |
+| [IMAP-19](IMAP-19.md) | адрес клиента во входе IMAP и POP3 | imap | A | imap-10 | done | CTR-57 |
+| [IMAP-20](IMAP-20.md) | тест: EXPUNGE в корзине не трогает письмо, перенесённое из INBOX с `\Deleted` | imap | A | imap-10 | done | — |
 | [JMAP-37](JMAP-37.md) | адрес клиента во входе JMAP по HTTP | jmap | A | jmap-21 | done | CTR-57 |
 | [APP-39](APP-39.md) | maintenance: срок журнала доставки и токенов `admin init` | app | A | app-37 | done | META-22,META-43 |
 | [APP-40](APP-40.md) | защита от перебора по адресу и подсети в узле | app | A | app-38 | done | CTR-57 |
@@ -552,7 +552,10 @@
 | [DEP-51](DEP-51.md) | эталоны deploy/config: edge.yaml и порты IMAP, ManageSieve | deploy | A | deploy-37 | done | DEP-37 |
 | [DEP-52](DEP-52.md) | стенд: доверенные подсети вместо выключенного ограничения частоты | deploy | A | deploy-38 | todo | PLT-32 |
 | [APP-60](APP-60.md) | thepost doctor: подсказки DNS для календарей и контактов | app | A | app-55 | done | DEP-21 |
-| [PLT-33](PLT-33.md) | обязательные параметры по ролям — edge без базы данных | platform | A | platform-22 | ready | — |
+| [PLT-33](PLT-33.md) | обязательные параметры по ролям — edge без базы данных | platform | A | platform-22 | done | — |
+| [APP-61](APP-61.md) | узел edge запускается без базы данных и хранилища писем | app | A | app-56 | ready | — |
+| [APP-62](APP-62.md) | приглашения из почтового клиента в узле — права отправителя и iTIP для JMAP и DAV | app | A | app-57 | todo | — |
+| [CTR-82](CTR-82.md) | вошедший пользователь в `Outbound::submit` — права отправителя через группы | contracts | B | contracts-54 | todo | — |
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | done | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | done | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | done | — |
@@ -702,7 +705,7 @@
 | [DAV-26](DAV-26.md) | адрес клиента во входе CalDAV и CardDAV | dav | A | dav-08 | ready | CTR-57 |
 | [DAV-27](DAV-27.md) | GAL: скрытые учётные записи не попадают в книгу «Организация» | dav | A | dav-08 | ready | CTR-58,DAV-12 |
 | [DAV-28](DAV-28.md) | GAL: ETag карточки — хэш её содержимого | dav | A | dav-08 | ready | DAV-12 |
-| [SIEVE-12](SIEVE-12.md) | адрес клиента во входе ManageSieve | sieve | A | sieve-05 | ready | CTR-57 |
+| [SIEVE-12](SIEVE-12.md) | адрес клиента во входе ManageSieve | sieve | A | sieve-05 | done | CTR-57 |
 | [JMAP-38](JMAP-38.md) | JMAP Principal: тип `resource` для переговорных и оборудования | jmap | A | jmap-22 | ready | JMAP-30,CTR-48 |
 | [CTR-60](CTR-60.md) | `DavStore` — глобальная адресная книга организации | contracts | B | contracts-41 | ready | CTR-45,CTR-58 |
 | [META-63](META-63.md) | книга GAL в PostgreSQL | meta | B | meta-39 | todo | CTR-60 |
@@ -725,27 +728,27 @@
 | [APP-51](APP-51.md) | узел: книга «Организация» без LDAP | app | A | app-45 | todo | META-65,APP-49 |
 | [APP-52](APP-52.md) | maintenance: метрики очистки по сроку | app | A | app-45 | todo | APP-32 |
 | [DEP-37](DEP-37.md) | примеры секций `maintenance` и `dav` в `deploy/config` | deploy | A | deploy-27 | done | APP-32,APP-29 |
-| [DEPS-11](DEPS-11.md) | `calcard` в dev-зависимостях `tp-testkit` | deps | B | deps-11 | ready | KIT-09 |
-| [KIT-10](KIT-10.md) | корпус vCard: проверка разбором и новые образцы | testkit | A | testkit-07 | todo | DEPS-11 |
+| [DEPS-11](DEPS-11.md) | `calcard` в dev-зависимостях `tp-testkit` | deps | B | deps-11 | done | KIT-09 |
+| [KIT-10](KIT-10.md) | корпус vCard: проверка разбором и новые образцы | testkit | A | testkit-07 | ready | DEPS-11 |
 | [DEP-38](DEP-38.md) | ManageSieve в поставке: секция и порт 4190 | deploy | A | deploy-28 | done | APP-27 |
-| [DEPS-12](DEPS-12.md) | фича `gssapi` в сборке узла | deps | B | deps-12 | ready | AUTH-13 |
-| [CI-12](CI-12.md) | libkrb5 в CI, выпуск и бета с GSSAPI | ci | B | ci-10 | todo | DEPS-12 |
-| [DEP-39](DEP-39.md) | образ и эталоны: libkrb5 для GSSAPI | deploy | A | deploy-29 | todo | DEPS-12 |
+| [DEPS-12](DEPS-12.md) | фича `gssapi` в сборке узла | deps | B | deps-12 | done | AUTH-13 |
+| [CI-12](CI-12.md) | libkrb5 в CI, выпуск и бета с GSSAPI | ci | B | ci-10 | ready | DEPS-12 |
+| [DEP-39](DEP-39.md) | образ и эталоны: libkrb5 для GSSAPI | deploy | A | deploy-29 | ready | DEPS-12 |
 | [DOC-03](DOC-03.md) | PREREQUISITES: Kerberos — принципалы служб и keytab | docs | A | docs-03 | todo | DEP-39 |
 | [ADM-30](ADM-30.md) | журнал аудита: фильтры `actor`, `method`, `route`; точные схемы транспорта | admin | A | admin-20 | todo | ADM-27 |
 | [ADM-31](ADM-31.md) | CLI: блокировка и изменение учётной записи | admin | A | admin-20 | todo | ADM-18,CI-07 |
-| [CTR-63](CTR-63.md) | `AccountStore::by_ids` — учётные записи по списку идентификаторов | contracts | B | contracts-44 | ready | — |
-| [CTR-64](CTR-64.md) | сигнал `AccountDisabled` — вход учётной записи запрещён | contracts | B | contracts-44 | ready | — |
-| [META-66](META-66.md) | `by_ids` в PostgreSQL | meta | A | meta-42 | todo | CTR-63 |
-| [META-67](META-67.md) | публикация `AccountDisabled` при блокировке | meta | A | meta-42 | todo | CTR-64 |
+| [CTR-63](CTR-63.md) | `AccountStore::by_ids` — учётные записи по списку идентификаторов | contracts | B | contracts-44 | done | — |
+| [CTR-64](CTR-64.md) | сигнал `AccountDisabled` — вход учётной записи запрещён | contracts | B | contracts-44 | done | — |
+| [META-66](META-66.md) | `by_ids` в PostgreSQL | meta | A | meta-42 | ready | CTR-63 |
+| [META-67](META-67.md) | публикация `AccountDisabled` при блокировке | meta | A | meta-42 | ready | CTR-64 |
 | [CTR-80](CTR-80.md) | заголовки скрытого письма корзины для администратора | contracts | B | contracts-52 | done | CTR-35 |
 | [MS-19](MS-19.md) | заголовки скрытого письма корзины | mailstore | A | mailstore-12 | done | CTR-80 |
 | [CTR-81](CTR-81.md) | действие «поиск» в журнале аудита ящика | contracts | B | contracts-53 | ready | CTR-35 |
 | [IMAP-23](IMAP-23.md) | поиск по тексту в чужом ящике — в журнал аудита | imap | A | imap-13 | todo | CTR-81 |
 | [JMAP-43](JMAP-43.md) | Email/query по тексту в чужом ящике — в журнал аудита | jmap | A | jmap-26 | todo | CTR-81 |
-| [ADM-32](ADM-32.md) | темы скрытых писем и имена участников групп одним запросом | admin | A | admin-21 | todo | CTR-63,MS-19,ADM-19,ADM-20 |
-| [IMAP-22](IMAP-22.md) | заблокированная учётная запись — закрытие сеансов IMAP и POP3 | imap | A | imap-12 | todo | CTR-64 |
-| [JMAP-41](JMAP-41.md) | заблокированная учётная запись — закрытие push JMAP | jmap | A | jmap-24 | todo | CTR-64 |
+| [ADM-32](ADM-32.md) | темы скрытых писем и имена участников групп одним запросом | admin | A | admin-21 | ready | CTR-63,MS-19,ADM-19,ADM-20 |
+| [IMAP-22](IMAP-22.md) | заблокированная учётная запись — закрытие сеансов IMAP и POP3 | imap | A | imap-12 | ready | CTR-64 |
+| [JMAP-41](JMAP-41.md) | заблокированная учётная запись — закрытие push JMAP | jmap | A | jmap-24 | ready | CTR-64 |
 | [UI-14](UI-14.md) | консоль: страница «нет доступа» | console | A | console-06 | todo | UI-09 |
 | [UI-15](UI-15.md) | консоль: блокировка учётной записи, темы писем, имена участников | console | A | console-06 | todo | UI-13,ADM-18,ADM-19,ADM-20 |
 | [CTR-62](CTR-62.md) | `AccountStore::by_address` с псевдонимами и адресами групп | contracts | B | contracts-45 | ready | CTR-53 |

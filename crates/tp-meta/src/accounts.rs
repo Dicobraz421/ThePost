@@ -1,5 +1,7 @@
 //! Учётные записи на PostgreSQL (CONTRACTS.md#Metadata).
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use sqlx::postgres::PgArguments;
 use sqlx::query::QueryAs;
@@ -7,7 +9,7 @@ use sqlx::{FromRow, PgConnection, Postgres};
 use time::OffsetDateTime;
 use tp_contracts::meta::{
     Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, DisabledAccount,
-    ExistingContent, QuotaUsage, account_aliases,
+    ExistingContent, QuotaUsage, account_aliases, account_disabled,
 };
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use uuid::Uuid;
@@ -123,16 +125,16 @@ impl TryFrom<AccountRow> for Account {
     }
 }
 
-/// Сопоставление при синхронизации: по `external_id`, иначе по имени входа.
-/// Запись с тем же именем, но другим `external_id` — `Error::Conflict`.
+/// Сопоставление при синхронизации: по `external_id`, иначе по имени входа; найденная запись — с прежним
+/// `enabled` (строка заблокирована до фиксации). Запись с тем же именем, но другим `external_id` — `Error::Conflict`.
 async fn find_for_upsert(
     tx: &mut PgConnection,
     tenant: TenantId,
     data: &AccountUpsert,
-) -> Result<Option<Uuid>> {
+) -> Result<Option<(Uuid, bool)>> {
     if let Some(ext) = &data.external_id {
-        let id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT account_id FROM accounts WHERE tenant_id = $1 AND external_id = $2 FOR UPDATE",
+        let id: Option<(Uuid, bool)> = sqlx::query_as(
+            "SELECT account_id, enabled FROM accounts WHERE tenant_id = $1 AND external_id = $2 FOR UPDATE",
         )
         .bind(tenant.as_uuid())
         .bind(ext)
@@ -143,8 +145,8 @@ async fn find_for_upsert(
             return Ok(id);
         }
     }
-    let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
-        "SELECT account_id, external_id FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2) FOR UPDATE",
+    let row: Option<(Uuid, bool, Option<String>)> = sqlx::query_as(
+        "SELECT account_id, enabled, external_id FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2) FOR UPDATE",
     )
     .bind(tenant.as_uuid())
     .bind(&data.login)
@@ -152,15 +154,17 @@ async fn find_for_upsert(
     .await
     .map_err(db_err)?;
     match row {
-        Some((_, Some(other))) if data.external_id.as_ref().is_some_and(|ext| *ext != other) => {
+        Some((_, _, Some(other))) if data.external_id.as_ref().is_some_and(|ext| *ext != other) => {
             Err(Error::Conflict)
         }
-        Some((id, _)) => Ok(Some(id)),
+        Some((id, enabled, _)) => Ok(Some((id, enabled))),
         None => Ok(None),
     }
 }
 
 impl PgMeta {
+    /// Сигнал `AccountDisabled` (CTR-64) — после фиксации перехода `enabled` разрешённой записи в `false`;
+    /// новая запись и повторное сохранение запрещённой — без сигнала.
     async fn upsert_once(&self, tenant: TenantId, data: &AccountUpsert) -> Result<Account> {
         self.rewrite(|| async move {
         if data.login.is_empty() {
@@ -172,9 +176,11 @@ impl PgMeta {
             None => ShardId::MAIN,
         };
         let mut tx = begin(&self.pool, tenant).await?;
+        let found = find_for_upsert(&mut tx, tenant, data).await?;
+        let disabled = found.is_some_and(|(_, was)| was) && !data.enabled;
         // Шард прежней учётной записи не меняется (перенос — модуль «Шардирование»).
-        let account: UpsertRow = match find_for_upsert(&mut tx, tenant, data).await? {
-            Some(id) => bind_upsert(
+        let account: UpsertRow = match found {
+            Some((id, _)) => bind_upsert(
                 sqlx::query_as(
                     "UPDATE accounts SET domain_id = $3, login = $4, display_name = $5, external_id = $6,
                                          enabled = $7, aliases = $8, kind = $9, updated_at = now()
@@ -215,11 +221,18 @@ impl PgMeta {
             let created =
                 mailboxes::ensure_system(&mut tx, scope, self.cfg.event_partitions).await?;
             crate::commits::commit(tx).await?;
+            if disabled {
+                self.signal(account_disabled(scope)).await;
+            }
             created
         } else {
             // Ящик на другом шарде: каталог фиксируется первым, состояние ящика и папки — на шарде
-            // (повтор upsert дополняет недостающее).
+            // (повтор upsert дополняет недостающее). Сигнал — сразу после фиксации каталога: повтор после
+            // отказа шарда видит запрещённую запись и сигнал не повторит.
             crate::commits::commit(tx).await?;
+            if disabled {
+                self.signal(account_disabled(scope)).await;
+            }
             let pool = self.shard_pool(shard, ReadIntent::Primary).await?;
             let mut tx = begin(&pool, tenant).await?;
             mailboxes::ensure_state(&mut tx, scope).await?;
@@ -254,6 +267,39 @@ impl AccountStore for PgMeta {
             row.map(Account::try_from).transpose()
         })
         .await
+    }
+
+    /// Одним запросом (`account_id = ANY($2)`, по первичному ключу); порядок запроса и пропуск повторов — после
+    /// чтения. Чужая организация не видна (условие `tenant_id` и RLS).
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<Uuid> = ids.iter().map(|id| *id.as_uuid()).collect();
+        let keys = &keys;
+        let rows: Vec<AccountRow> = self
+            .idempotent(|| async move {
+                let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
+                let rows: Vec<AccountRow> = sqlx::query_as(
+                    "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind
+                 FROM accounts WHERE tenant_id = $1 AND account_id = ANY($2)",
+                )
+                .bind(tenant.as_uuid())
+                .bind(keys)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                crate::commits::commit(tx).await?;
+                Ok(rows)
+            })
+            .await?;
+        let mut found: HashMap<Uuid, AccountRow> =
+            rows.into_iter().map(|r| (r.account_id, r)).collect();
+        // `remove` — повтор идентификатора уже не найдёт запись (первое вхождение).
+        keys.iter()
+            .filter_map(|k| found.remove(k))
+            .map(Account::try_from)
+            .collect()
     }
 
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
@@ -382,13 +428,20 @@ impl AccountStore for PgMeta {
         self.account_state_of(tenant, id).await
     }
 
+    /// После фиксации — сигнал `AccountDisabled` (CTR-64): вход в отключённый ящик запрещён.
     async fn disable_account(
         &self,
         tenant: TenantId,
         id: AccountId,
         until: OffsetDateTime,
     ) -> Result<()> {
-        self.set_disabled(tenant, id, Some(until)).await
+        self.set_disabled(tenant, id, Some(until)).await?;
+        self.signal(account_disabled(AccountScope {
+            tenant,
+            account: id,
+        }))
+        .await;
+        Ok(())
     }
 
     async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {

@@ -13,6 +13,7 @@
 //!     autologout: 30m
 //!     idle: 30m
 //!     drain: 30s
+//!     resubscribe: 1s
 //!   namespace:
 //!     other_users: Other Users
 //!   compress:
@@ -188,6 +189,10 @@ pub struct Timeouts {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub drain: Duration,
+    /// Пауза перед переподпиской на системные сигналы шины (`AccountDisabled`) после обрыва потока или ошибки.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub resubscribe: Duration,
 }
 
 impl Default for Timeouts {
@@ -197,6 +202,7 @@ impl Default for Timeouts {
             autologout: Duration::from_secs(30 * 60),
             idle: Duration::from_secs(30 * 60),
             drain: Duration::from_secs(30),
+            resubscribe: Duration::from_secs(1),
         }
     }
 }

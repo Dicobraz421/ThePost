@@ -1,4 +1,4 @@
-# Веб-консоль (CI-06, SRS 5.2): сборка console/dist для вшивания в бинарный файл (DEPS-05, фича `console` tp-admin).
+# Веб-консоль (CI-06, SRS 5.2): сборка console/dist для вшивания в бинарный файл (фича `console` крейта thepost, DEPS-07).
 # Одна версия Node и один порядок шагов на PR (ci.yml, job console), выпуск (ci.yml, release) и бету (beta.yml).
 # Без console/package-lock.json шаги пропускаются, `cargo-args` пустой — сборка без консоли.
 # checks: 'true' — перед сборкой проверка типов, линтер, vitest, npm audit по боевым зависимостям
@@ -16,7 +16,7 @@ inputs:
 
 outputs:
   cargo-args:
-    description: Аргументы cargo build для консоли (`--features tp-admin/console` или пусто)
+    description: Аргументы cargo build -p thepost для консоли (`--features console` или пусто)
     value: ${{ steps.args.outputs.args }}
 
 runs:
@@ -78,12 +78,6 @@ runs:
       shell: bash
       run: |
         args=
-        if [ "${{ steps.has.outputs.yes }}" = true ]; then
-          if grep -qE '^console[[:space:]]*=' crates/tp-admin/Cargo.toml; then
-            args="--features tp-admin/console"
-          else
-            echo "::notice::console/dist собран, но фичи console у tp-admin нет (DEPS-05) — бинарный файл без консоли"
-          fi
-        fi
+        if [ "${{ steps.has.outputs.yes }}" = true ]; then args="--features console"; fi
         echo "cargo: ${args:-без консоли}"
         echo "args=$args" >> "$GITHUB_OUTPUT"

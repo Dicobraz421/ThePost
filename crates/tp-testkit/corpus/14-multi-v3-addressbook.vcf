@@ -1,0 +1,33 @@
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//ThePost//Test Corpus//RU
+UID:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000141
+N:Смирнова;Ольга;Викторовна;;
+FN:Ольга Викторовна Смирнова
+ORG:АО «Северный ветер»;Отдел кадров
+EMAIL;TYPE=INTERNET,WORK:o.smirnova@example.com
+TEL;TYPE=CELL:+7 900 555-01-41
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//ThePost//Test Corpus//RU
+UID:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000142
+N:Kuznetsov;Boris;;;
+FN:Boris Kuznetsov
+EMAIL;TYPE=INTERNET,HOME:boris.k@example.net
+NOTE:Третья строка адресной книги проверяе
+ т перенос длинной строки внутри многока
+ рточного файла: слова не рвутся при скле
+ йке.
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//ThePost//Test Corpus//RU
+UID:urn:uuid:5f1c2c1e-0a51-4d6e-9c0b-000000000143
+N:;;;;
+FN:Сервисный центр «Пример»
+ORG:Сервисный центр «Пример»
+X-ABShowAs:COMPANY
+TEL;TYPE=WORK,VOICE:+7 495 555-01-43
+URL:https://service.example.org/
+END:VCARD
