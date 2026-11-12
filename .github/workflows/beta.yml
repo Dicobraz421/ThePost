@@ -8,6 +8,10 @@
 # CI-05 (решение 2026-11-01): архивы и образ проверяются на интерпретаторы и сценарии (.github/interp_check.py)
 # до публикации; нарушение — красный build (беты нет) или image (бета без образа).
 # CI-06: build и repro собирают console/dist (.github/actions/console) до cross build; образ — пока без консоли.
+# CI-14 (решение 116): сборка build и repro — .github/actions/release-build (её же берёт артефакт ci.yml): cross под
+# базовый x86-64 без AVX2, бинарь x86_64 запускается на qemu Nehalem — падение валит сборку.
+# CI-13 (решение 111): образ ещё и с тегом версии выпуска — appVersion из deploy/helm/thepost/Chart.yaml (источник
+# версии; чарт по умолчанию берёт тот же тег). Все теги — один digest: подпись cosign и SBOM образа — на все.
 name: Beta
 
 on:
@@ -33,6 +37,7 @@ jobs:
       build: ${{ steps.p.outputs.build }}
       tag: ${{ steps.p.outputs.tag }}
       prev: ${{ steps.p.outputs.prev }}
+      version: ${{ steps.p.outputs.version }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -56,7 +61,13 @@ jobs:
           while git rev-parse -q --verify "refs/tags/$tag" >/dev/null; do
             n=$((n + 1)); tag="beta-$(date -u +%Y%m%d).$n"
           done
-          echo "Бета $tag от $SHA (предыдущая: ${prev:-нет})"
+          version=$(sed -n 's/^appVersion:[[:space:]]*//p' deploy/helm/thepost/Chart.yaml | tr -d "\"'")
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::appVersion в deploy/helm/thepost/Chart.yaml не версия: '$version'"
+            exit 1
+          fi
+          echo "Бета $tag (версия $version) от $SHA (предыдущая: ${prev:-нет})"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo build=true >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
@@ -73,18 +84,9 @@ jobs:
       PKG: thepost-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: ./.github/actions/release-build
         with:
-          shared-key: beta-${{ matrix.target }}
-      - uses: taiki-e/install-action@v2.90.3
-        with:
-          tool: cross
-      - id: console
-        uses: ./.github/actions/console
-      - run: cross build --release --locked -p thepost --target ${{ matrix.target }} ${{ steps.console.outputs.cargo-args }}
-      - name: Smoke (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: target/${{ matrix.target }}/release/thepost --version || target/${{ matrix.target }}/release/thepost
+          target: ${{ matrix.target }}
       - name: Архив
         shell: bash
         run: |
@@ -145,13 +147,15 @@ jobs:
           file: deploy/docker/Dockerfile
           platforms: linux/amd64
           push: true
+          sbom: true
           tags: |
             ${{ steps.name.outputs.image }}:${{ needs.plan.outputs.tag }}
+            ${{ steps.name.outputs.image }}:${{ needs.plan.outputs.version }}
             ${{ steps.name.outputs.image }}:beta
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ needs.plan.outputs.tag }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
       - uses: sigstore/cosign-installer@v4.1.3
       - id: ref
         name: Подпись образа
@@ -175,12 +179,10 @@ jobs:
       PKG: thepost-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: taiki-e/install-action@v2.90.3
+      - uses: ./.github/actions/release-build
         with:
-          tool: cross
-      - id: console
-        uses: ./.github/actions/console
-      - run: cross build --release --locked -p thepost --target ${{ matrix.target }} ${{ steps.console.outputs.cargo-args }}
+          target: ${{ matrix.target }}
+          cache: 'false'
       - uses: actions/download-artifact@v8.0.2
         with:
           name: ${{ env.PKG }}
@@ -211,6 +213,7 @@ jobs:
       id-token: write
     env:
       TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/download-artifact@v8.0.2
@@ -271,7 +274,8 @@ jobs:
 
           ## OCI-образ
 
-          `@IMAGE@` (linux/amd64, теги `@TAG@` и `beta`):
+          `@IMAGE@` (linux/amd64, теги `@TAG@`, `@VERSION@` и `beta` — один digest, подпись и SBOM на все;
+          SBOM образа — аттестация buildx в ghcr.io). Образ закрытый: `docker login ghcr.io` или `imagePullSecrets`.
 
           ```sh
           cosign verify '@IMAGE@' \
@@ -280,7 +284,7 @@ jobs:
           ```
           EOF
           fi
-          sed -i -e "s|@TAG@|$TAG|g" -e "s|@IDENTITY@|$IDENTITY|g" -e "s|@IMAGE@|$IMAGE|g" notes.md
+          sed -i -e "s|@TAG@|$TAG|g" -e "s|@VERSION@|$VERSION|g" -e "s|@IDENTITY@|$IDENTITY|g" -e "s|@IMAGE@|$IMAGE|g" notes.md
           cat notes.md
           args=(--prerelease --target "$SHA" --title "$TAG" --notes-file notes.md --generate-notes)
           if [ -n "$PREV" ]; then args+=(--notes-start-tag "$PREV"); fi

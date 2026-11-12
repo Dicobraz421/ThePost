@@ -64,6 +64,7 @@ fn dir_account(id: &str, login: &str, emails: &[&str]) -> DirAccount {
         enabled: true,
         attributes: BTreeMap::new(),
         org: Default::default(),
+        hidden_from_gal: false,
     }
 }
 
@@ -205,6 +206,19 @@ impl Env {
             tenant: acc.tenant,
             account: acc.id,
         }
+    }
+
+    /// Число писем в папке «Спам» учётной записи.
+    async fn junk(&self, login: &str) -> usize {
+        let scope = self.scope(login).await;
+        let junk = self
+            .meta
+            .mailbox_by_role(scope, SpecialUse::Junk)
+            .expect("junk");
+        MessageStore::list(&self.meta, scope, junk, MessageQuery::All, 100)
+            .await
+            .expect("list")
+            .len()
     }
 
     /// Письма во «Входящих» учётной записи (исходный текст).
@@ -1060,8 +1074,10 @@ async fn submission_copy_to_local_address() {
     assert!(env.inbox("carol@example.org").await.is_empty());
 }
 
+mod addressbook;
 mod imip;
 mod moderation;
+mod outbound_milter;
 
 mod groups {
     //! SMTP-16: квота до `DATA`, ограничения отправителей и модерация групп рассылки.
@@ -1254,7 +1270,7 @@ mod groups {
         assert_eq!(env.inbox("bob@example.org").await.len(), 1);
         let held = env
             .groups
-            .held(TenantId::DEFAULT, Some(g.id), 10)
+            .held(TenantId::DEFAULT, Some(g.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 1);
@@ -1284,7 +1300,7 @@ mod groups {
         assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued);
         let held = env
             .groups
-            .held(TenantId::DEFAULT, Some(g.id), 10)
+            .held(TenantId::DEFAULT, Some(g.id), None, 10)
             .await
             .expect("held");
         assert_eq!(held.len(), 2);
@@ -1448,5 +1464,8 @@ async fn outbound_suite() {
 
 mod local_domains;
 mod org_policy;
+mod rcpt_rate;
 mod rules;
+mod scheduled;
+mod senders;
 mod wave;

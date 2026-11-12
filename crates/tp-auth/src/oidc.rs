@@ -15,6 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -398,7 +399,7 @@ fn scopes(claims: &serde_json::Map<String, Value>) -> BTreeSet<String> {
 
 #[async_trait]
 impl Authenticator for OidcAuthenticator {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
+    async fn verify(&self, credentials: Credentials, _peer: Option<IpAddr>) -> Result<Principal> {
         let Credentials::Bearer(token) = credentials else {
             return Err(Error::Forbidden);
         };
@@ -562,7 +563,7 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         let (auth, alice) = setup(p.cfg()).await;
         let t = token(Some("k1"), K1, claims(&p, json!({})));
         let pr = auth
-            .verify(Credentials::Bearer(t.clone()))
+            .verify(Credentials::Bearer(t.clone()), crate::testutil::PEER)
             .await
             .expect("ok");
         assert_eq!(pr.account, alice);
@@ -574,12 +575,17 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         );
         assert!(pr.has_scope("mail") && !pr.has_scope("admin"));
         // Набор ключей — из кэша.
-        auth.verify(Credentials::Bearer(t)).await.expect("again");
+        auth.verify(Credentials::Bearer(t), crate::testutil::PEER)
+            .await
+            .expect("again");
         assert_eq!(p.hits("/.well-known/openid-configuration"), 1);
         assert_eq!(p.hits("/jwks"), 1);
         // Без kid — единственный ключ набора; scp массивом.
         let t = token(None, K1, claims(&p, json!({ "scp": ["imap"] })));
-        let pr = auth.verify(Credentials::Bearer(t)).await.expect("no kid");
+        let pr = auth
+            .verify(Credentials::Bearer(t), crate::testutil::PEER)
+            .await
+            .expect("no kid");
         assert!(pr.has_scope("imap"));
         assert_eq!(
             auth.discovery_url(),
@@ -627,7 +633,8 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         ];
         for t in bad {
             assert_eq!(
-                auth.verify(Credentials::Bearer(t)).await,
+                auth.verify(Credentials::Bearer(t), crate::testutil::PEER)
+                    .await,
                 Err(Error::Forbidden)
             );
         }
@@ -635,7 +642,10 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
             login: "alice@example.org".into(),
             secret: "x".into(),
         };
-        assert_eq!(auth.verify(pw).await, Err(Error::Forbidden));
+        assert_eq!(
+            auth.verify(pw, crate::testutil::PEER).await,
+            Err(Error::Forbidden)
+        );
     }
 
     #[tokio::test]
@@ -646,35 +656,33 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
             ..p.cfg()
         })
         .await;
-        auth.verify(Credentials::Bearer(token(
-            Some("k1"),
-            K1,
-            claims(&p, json!({})),
-        )))
+        auth.verify(
+            Credentials::Bearer(token(Some("k1"), K1, claims(&p, json!({})))),
+            crate::testutil::PEER,
+        )
         .await
         .expect("k1");
         *p.jwks.lock().expect("lock") = jwks(&[("k2", K2)]);
-        auth.verify(Credentials::Bearer(token(
-            Some("k2"),
-            K2,
-            claims(&p, json!({})),
-        )))
+        auth.verify(
+            Credentials::Bearer(token(Some("k2"), K2, claims(&p, json!({})))),
+            crate::testutil::PEER,
+        )
         .await
         .expect("k2 after refresh");
         assert_eq!(p.hits("/jwks"), 2);
 
         // Частое перечитывание ограничено: неизвестный kid в пределах jwks_refresh_min — отказ без запроса.
         let (slow, _) = setup(p.cfg()).await;
-        slow.verify(Credentials::Bearer(token(
-            Some("k2"),
-            K2,
-            claims(&p, json!({})),
-        )))
+        slow.verify(
+            Credentials::Bearer(token(Some("k2"), K2, claims(&p, json!({})))),
+            crate::testutil::PEER,
+        )
         .await
         .expect("k2");
         let unknown = token(Some("k3"), K1, claims(&p, json!({})));
         assert_eq!(
-            slow.verify(Credentials::Bearer(unknown)).await,
+            slow.verify(Credentials::Bearer(unknown), crate::testutil::PEER)
+                .await,
             Err(Error::Forbidden)
         );
         assert_eq!(p.hits("/jwks"), 3);
@@ -696,7 +704,7 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         // Хранилище не подключено — понятная ошибка, к поставщику без сертификата не идём.
         let (auth, _) = setup(cfg.clone()).await;
         assert!(matches!(
-            auth.verify(Credentials::Bearer(t())).await,
+            auth.verify(Credentials::Bearer(t()), crate::testutil::PEER).await,
             Err(Error::Invalid(m)) if m.contains("secret store")
         ));
         assert_eq!(p.hits("/jwks"), 0);
@@ -716,7 +724,7 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         let (auth, alice) = setup(cfg).await;
         let auth = auth.with_secrets(&store).await.expect("with_secrets");
         assert_eq!(
-            auth.verify(Credentials::Bearer(t()))
+            auth.verify(Credentials::Bearer(t()), crate::testutil::PEER)
                 .await
                 .map(|p| p.account),
             Ok(alice)
@@ -734,7 +742,8 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         .await;
         let t = token(Some("k1"), K1, claims(&p, json!({})));
         assert!(matches!(
-            auth.verify(Credentials::Bearer(t)).await,
+            auth.verify(Credentials::Bearer(t), crate::testutil::PEER)
+                .await,
             Err(Error::Internal(_))
         ));
         // Поставщик недоступен.
@@ -745,7 +754,8 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         .await;
         let t = token(Some("k1"), K1, claims(&p, json!({})));
         assert!(matches!(
-            auth.verify(Credentials::Bearer(t)).await,
+            auth.verify(Credentials::Bearer(t), crate::testutil::PEER)
+                .await,
             Err(Error::Unavailable { .. })
         ));
     }

@@ -15,12 +15,14 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
+use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tp_contracts::audit::MailboxAudit;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::bus::EventBus;
 use tp_contracts::ext::DecisionHooks;
@@ -32,6 +34,7 @@ use tp_contracts::search::SearchIndex;
 use tp_contracts::{Error, MailboxId, MessageId, ModSeq, Result, Uid, UidValidity};
 use tp_platform::{Conn, Listener};
 
+use crate::audit::Audit;
 use crate::compress::Deflate;
 use crate::config::ImapConfig;
 use crate::ext::Extensions;
@@ -60,6 +63,10 @@ pub trait Transport: Send + Sized + 'static {
     /// Канал защищён TLS.
     fn tls(&self) -> bool;
 
+    /// Адрес клиента соединения (из заголовка PROXY или адрес TCP-собеседника): защита от перебора
+    /// (`SaslContext::peer`, CTR-57) и журнал аудита ящиков (IMAP-15).
+    fn peer(&self) -> IpAddr;
+
     /// Можно предложить STARTTLS.
     fn can_starttls(&self) -> bool;
 
@@ -76,6 +83,10 @@ impl Transport for Conn {
 
     fn tls(&self) -> bool {
         self.info.tls
+    }
+
+    fn peer(&self) -> IpAddr {
+        self.info.client.ip()
     }
 
     fn can_starttls(&self) -> bool {
@@ -110,6 +121,8 @@ pub struct Deps {
     pub trash: Arc<dyn TrashStore>,
     /// Точки принятия решений модулей: Legal Hold перед стиранием при `trash.purge = erase`.
     pub hooks: DecisionHooks,
+    /// Журнал аудита доступа к ящику (IMAP-15): что сохранять, решает политика ящика.
+    pub audit: Arc<dyn MailboxAudit>,
 }
 
 impl fmt::Debug for Deps {
@@ -151,6 +164,8 @@ pub(crate) struct Selected {
 pub struct Session<T: Transport> {
     pub(crate) ctx: Arc<SessionCtx>,
     pub(crate) conn: Option<T>,
+    /// Адрес клиента соединения.
+    pub(crate) peer: IpAddr,
     pub(crate) reader: Reader,
     pub(crate) out: Vec<u8>,
     pub(crate) principal: Option<Principal>,
@@ -164,6 +179,8 @@ pub struct Session<T: Transport> {
     pub(crate) qresync: bool,
     /// Необязательные зависимости расширений (QUOTA, ACL).
     pub(crate) ext: Extensions,
+    /// Аудит доступа к ящику.
+    pub(crate) audit: Audit,
     /// Сжатие потока (`COMPRESS DEFLATE`).
     pub(crate) deflate: Option<Deflate>,
     errors: u32,
@@ -220,8 +237,10 @@ impl<T: Transport> Session<T> {
     /// Сессия соединения.
     pub fn new(ctx: Arc<SessionCtx>, conn: T) -> Self {
         let reader = reader(&ctx.config);
+        let audit = Audit::new(ctx.deps.audit.clone(), "imap", Some(conn.peer()));
         Self {
             ctx,
+            peer: conn.peer(),
             conn: Some(conn),
             reader,
             out: Vec::new(),
@@ -231,6 +250,7 @@ impl<T: Transport> Session<T> {
             condstore: false,
             qresync: false,
             ext: Extensions::default(),
+            audit,
             deflate: None,
             errors: 0,
             auth_failures: 0,
@@ -847,7 +867,7 @@ impl<T: Transport> Session<T> {
             return;
         };
         let creds = Credentials::Password { login, secret };
-        match self.ctx.deps.auth.verify(creds).await {
+        match self.ctx.deps.auth.verify(creds, Some(self.peer)).await {
             Ok(p) => self.logged_in(tag, p),
             Err(Error::Forbidden) => self.auth_failed(tag, SaslFailure::Authentication),
             Err(e) => self.auth_unavailable(tag, &e),
@@ -884,6 +904,7 @@ impl<T: Transport> Session<T> {
         let ctx = SaslContext {
             service: "imap",
             tls,
+            peer: Some(self.peer),
         };
         let mut sasl = match self.ctx.deps.sasl.start(mech, &ctx) {
             Ok(s) => s,
@@ -1030,10 +1051,18 @@ pub(crate) fn io_error(e: std::io::Error) -> Error {
 }
 
 /// Сервер IMAP одного слушателя.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Server {
     ctx: Arc<SessionCtx>,
     ext: Extensions,
+}
+
+impl fmt::Debug for Server {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Server")
+            .field("ext", &self.ext)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Server {
@@ -1085,7 +1114,8 @@ impl Server {
                             return;
                         }
                         let client = conn.info.client;
-                        if let Err(e) = Session::new(ctx, conn).with_extensions(ext).run().await {
+                        let session = Session::new(ctx, conn).with_extensions(ext);
+                        if let Err(e) = session.run().await {
                             tracing::debug!(%client, error = %e, "imap: сессия прервана");
                         }
                     };

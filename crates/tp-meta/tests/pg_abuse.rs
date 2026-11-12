@@ -20,7 +20,7 @@ use tp_testkit::suite::{self, RealTime};
 
 async fn db_now(meta: &PgMeta) -> OffsetDateTime {
     sqlx::query_scalar("SELECT now()")
-        .fetch_one(meta.pool())
+        .fetch_one(&mut *common::conn(meta.pool()).await)
         .await
         .expect("now")
 }
@@ -96,7 +96,7 @@ async fn blocked_signal_and_isolation() {
     let (rls, forced): (bool, bool) = sqlx::query_as(
         "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'abuse_blocks'",
     )
-    .fetch_one(meta.pool())
+    .fetch_one(&mut *common::conn(meta.pool()).await)
     .await
     .expect("pg_class");
     assert!(rls && forced);
@@ -178,9 +178,11 @@ async fn migration_keeps_node_records() {
     .execute(&pool)
     .await
     .expect("old row");
-    schema::migrate(&pool).await.expect("migrate");
+    schema::migrate(&common::db(pool.clone()))
+        .await
+        .expect("migrate");
 
-    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let meta = PgMeta::new(common::db(pool.clone()), MetaConfig::default());
     let live = meta.live_info().await.expect("live_info");
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].id, NodeId::new("old-node").expect("id"));

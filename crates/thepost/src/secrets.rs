@@ -170,7 +170,7 @@ fn context(e: Error) -> Error {
     }
 }
 
-/// Хранилище не настроено: любое чтение — `Invalid` с пояснением.
+/// Хранилище не настроено: любое чтение и запись — `Invalid` с пояснением.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoSecretStore;
 
@@ -178,6 +178,13 @@ pub struct NoSecretStore;
 impl SecretStore for NoSecretStore {
     async fn get(&self, secret: &SecretRef) -> Result<Secret> {
         Err(Error::Invalid(not_configured(&[secret.to_string()])))
+    }
+
+    async fn put(&self, secret: &SecretRef, _: &Secret) -> Result<()> {
+        Err(Error::Invalid(format!(
+            "хранилище секретов не настроено (задайте секцию secrets: url и способ входа), \
+             запись секрета {secret} невозможна"
+        )))
     }
 }
 

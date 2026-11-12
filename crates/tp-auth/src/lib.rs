@@ -16,6 +16,7 @@
 //!   и принципал Kerberos в одном обмене проверяет [`CredentialsRouter`].
 
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,6 +28,7 @@ use tp_contracts::{Error, Result, TenantId};
 
 pub mod abuse;
 pub mod authz;
+pub mod dirsync;
 pub mod gssapi;
 pub mod ldap;
 pub mod oidc;
@@ -35,6 +37,7 @@ pub mod sasl;
 
 pub use abuse::{AbuseConfig, AbuseGuard, Attempt};
 pub use authz::AclAuthorizer;
+pub use dirsync::{AccountSyncReport, ContactSyncReport, DirStores, DirectorySync, RemovalPolicy};
 pub use gssapi::{Gssapi, GssapiConfig, KerberosAuthenticator};
 pub use ldap::{GroupSync, GroupSyncReport, LdapConfig, LdapDirectory};
 pub use oidc::{OidcAuthenticator, OidcConfig};
@@ -155,14 +158,14 @@ impl CredentialsRouter {
 
 #[async_trait]
 impl Authenticator for CredentialsRouter {
-    async fn verify(&self, credentials: Credentials) -> Result<Principal> {
+    async fn verify(&self, credentials: Credentials, peer: Option<IpAddr>) -> Result<Principal> {
         let target = match &credentials {
             Credentials::Password { .. } => &self.password,
             Credentials::Bearer(_) => &self.bearer,
             Credentials::Gssapi { .. } => &self.gssapi,
         };
         match target {
-            Some(a) => a.verify(credentials).await,
+            Some(a) => a.verify(credentials, peer).await,
             None => Err(Error::Forbidden),
         }
     }
@@ -234,11 +237,15 @@ pub(crate) mod testutil {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use tp_contracts::meta::{AccountStore, AccountUpsert};
+    use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
     use tp_contracts::{AccountId, DomainId, Result, TenantId};
     use tp_testkit::{MemMetadata, SystemClock};
 
     use crate::{Accounts, GroupSource};
+
+    /// Адрес клиента в тестах проверки учётных данных.
+    pub(crate) const PEER: Option<std::net::IpAddr> =
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7)));
 
     /// Учётные записи `(login, enabled)` в `MemMetadata` организации по умолчанию.
     pub(crate) async fn accounts(list: &[(&str, bool)]) -> (Accounts, Vec<AccountId>) {
@@ -263,6 +270,8 @@ pub(crate) mod testutil {
                         display_name: (*login).to_owned(),
                         external_id: None,
                         enabled: *enabled,
+                        aliases: Vec::new(),
+                        kind: AccountKind::User,
                     },
                 )
                 .await
@@ -373,18 +382,25 @@ mod tests {
 
         #[async_trait]
         impl Authenticator for Any {
-            async fn verify(&self, _: Credentials) -> Result<Principal> {
+            async fn verify(&self, _: Credentials, _: Option<IpAddr>) -> Result<Principal> {
                 let a = self.0.enabled("alice@example.org").await?;
                 self.0.principal(a, None).await
             }
         }
 
         let r = CredentialsRouter::default().bearer(Arc::new(Any(accounts)));
-        assert!(r.verify(Credentials::Bearer("t".into())).await.is_ok());
+        assert!(
+            r.verify(Credentials::Bearer("t".into()), crate::testutil::PEER)
+                .await
+                .is_ok()
+        );
         let pw = Credentials::Password {
             login: "alice@example.org".into(),
             secret: "x".into(),
         };
-        assert_eq!(r.verify(pw).await, Err(Error::Forbidden));
+        assert_eq!(
+            r.verify(pw, crate::testutil::PEER).await,
+            Err(Error::Forbidden)
+        );
     }
 }

@@ -1,6 +1,7 @@
-//! Сценарии сессии (IMAP-02): состояния, TLS, LOGIN, AUTHENTICATE, ENABLE, ID, LOGOUT, остановка с BYE.
+//! Сценарии сессии (IMAP-02): состояния, TLS, LOGIN, AUTHENTICATE, ENABLE, ID, LOGOUT, остановка с BYE;
+//! адрес клиента в проверке учётных данных, в том числе за балансировщиком с PROXY protocol (IMAP-19).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,10 +11,11 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tp_contracts::Error;
 use tp_platform::{EndpointConfig, Listener, TlsCerts, TlsConfig};
 
-use super::{Env, LOGIN, PASSWORD};
+use super::{Env, LOGIN, PASSWORD, PEER};
 use crate::session::{Server, SessionCtx};
 
 const CERT: &str = include_str!("../testdata/cert.pem");
@@ -120,6 +122,22 @@ async fn authenticate_plain() {
         .cmd(&format!("C4 AUTHENTICATE PLAIN {}", b64(b"garbage")))
         .await;
     assert!(r.starts_with("C4 BAD"), "{r}");
+}
+
+/// IMAP-19: `LOGIN` и `AUTHENTICATE` передают в проверку учётных данных адрес клиента сессии (и при неудаче).
+#[tokio::test]
+async fn login_passes_client_address() {
+    let env = Env::new().await;
+    let mut c = env.client(true).await;
+    let r = c.cmd(&format!("A1 LOGIN {LOGIN} wrong")).await;
+    assert!(r.starts_with("A1 NO [AUTHENTICATIONFAILED]"), "{r}");
+    let r = c.cmd(&format!("A2 LOGIN {LOGIN} {PASSWORD}")).await;
+    assert!(r.contains("A2 OK"), "{r}");
+    let creds = b64(format!("\0{LOGIN}\0{PASSWORD}").as_bytes());
+    let mut c = env.client(true).await;
+    let r = c.cmd(&format!("B1 AUTHENTICATE PLAIN {creds}")).await;
+    assert!(r.starts_with("B1 OK"), "{r}");
+    assert_eq!(env.auth.peers(), [Some(PEER); 3]);
 }
 
 #[tokio::test]
@@ -238,12 +256,13 @@ async fn certs() -> Arc<TlsCerts> {
     let dir = temp_dir();
     let cfg = TlsConfig {
         cert_file: dir.join("cert.pem"),
-        key_file: dir.join("key.pem"),
         ..TlsConfig::default()
     };
     std::fs::write(&cfg.cert_file, CERT).expect("cert");
-    std::fs::write(&cfg.key_file, KEY).expect("key");
-    let certs = TlsCerts::load(&cfg).await.expect("load");
+    // Ключ — только секрет `tls.key` в хранилище секретов (PLT-31).
+    let store = Arc::new(tp_testkit::MemSecretStore::default());
+    store.set(&cfg.key, KEY);
+    let certs = TlsCerts::load(&cfg, store).await.expect("load");
     let _ = std::fs::remove_dir_all(dir);
     Arc::new(certs)
 }
@@ -283,7 +302,49 @@ async fn server(
     )
 }
 
-async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> String {
+/// Адрес клиента за балансировщиком (из заголовка PROXY).
+pub(super) const PROXIED: SocketAddrV4 =
+    SocketAddrV4::new(std::net::Ipv4Addr::new(203, 0, 113, 7), 4242);
+
+/// Слушатель на 127.0.0.1 с неявным TLS, соединения — от балансировщика с заголовком PROXY protocol v2.
+pub(super) async fn proxied_listener() -> (SocketAddr, Listener) {
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let at = tcp.local_addr().expect("addr");
+    let mut cfg = EndpointConfig::new(at);
+    cfg.implicit_tls = true;
+    cfg.proxy_protocol = true;
+    let listener = Listener::from_tcp(tcp, &cfg, Some(certs().await)).expect("listener");
+    (at, listener)
+}
+
+/// Заголовок PROXY protocol v2 балансировщика (команда PROXY, TCP поверх IPv4): клиент `client` → `local`.
+fn proxy_v2(client: SocketAddrV4, local: SocketAddrV4) -> Vec<u8> {
+    // Сигнатура v2, затем версия 2 и команда PROXY, TCP поверх IPv4, длина адресов 12 байт.
+    let mut h = vec![
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, 0x21, 0x11, 0, 12,
+    ];
+    h.extend_from_slice(&client.ip().octets());
+    h.extend_from_slice(&local.ip().octets());
+    h.extend_from_slice(&client.port().to_be_bytes());
+    h.extend_from_slice(&local.port().to_be_bytes());
+    h
+}
+
+/// Соединение клиента [`PROXIED`] через балансировщик: заголовок PROXY v2, затем TLS-рукопожатие.
+pub(super) async fn connect_proxied(at: SocketAddr) -> BufReader<TlsStream<TcpStream>> {
+    let mut tcp = TcpStream::connect(at).await.expect("connect");
+    let local = SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 993);
+    tcp.write_all(&proxy_v2(PROXIED, local))
+        .await
+        .expect("proxy header");
+    let name = ServerName::try_from("localhost").expect("name");
+    let tls = connector().connect(name, tcp).await.expect("handshake");
+    BufReader::new(tls)
+}
+
+pub(super) async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> String {
     let mut s = String::new();
     r.read_line(&mut s).await.expect("read");
     s
@@ -354,5 +415,37 @@ async fn connection_limit() {
     );
     env.shutdown.cancel();
     assert!(read_line(&mut first).await.starts_with("* BYE"));
+    serve.await.expect("join").expect("serve");
+}
+
+/// IMAP-19: за балансировщиком с PROXY protocol в проверку учётных данных приходит адрес клиента из заголовка,
+/// а не адрес балансировщика.
+#[tokio::test]
+async fn login_behind_proxy_passes_client_address() {
+    let env = Env::new().await;
+    let (at, listener) = proxied_listener().await;
+    let server = Server::new(SessionCtx::clone(&env.ctx()));
+    let serve = tokio::spawn(async move { server.serve(listener).await });
+    let mut tls = connect_proxied(at).await;
+    assert!(read_line(&mut tls).await.starts_with("* OK"));
+    tls.get_mut()
+        .write_all(format!("A1 LOGIN {LOGIN} {PASSWORD}\r\n").as_bytes())
+        .await
+        .expect("write");
+    loop {
+        let line = read_line(&mut tls).await;
+        assert!(!line.is_empty(), "connection closed");
+        if line.starts_with("A1 ") {
+            assert!(line.starts_with("A1 OK"), "{line}");
+            break;
+        }
+    }
+    assert_eq!(
+        env.auth.peers(),
+        [Some(IpAddr::V4(*PROXIED.ip()))],
+        "адрес клиента из заголовка PROXY, не балансировщика"
+    );
+    env.shutdown.cancel();
+    assert!(read_line(&mut tls).await.starts_with("* BYE"));
     serve.await.expect("join").expect("serve");
 }

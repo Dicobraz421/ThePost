@@ -582,7 +582,7 @@ async fn list_held(
         access.check(&a).await?;
     }
     let limit = a.cfg.content_page(q.limit, subjects);
-    let held = a.d.groups.held(org, q.group, limit).await?;
+    let held = a.d.groups.held(org, q.group, None, limit).await?;
     if !subjects {
         return Ok(Json(held.into_iter().map(Into::into).collect()));
     }

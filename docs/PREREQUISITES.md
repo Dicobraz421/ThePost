@@ -48,6 +48,7 @@
 | 25 | приём почты (STARTTLS) | `openssl s_client -connect <сервер>:25 -starttls smtp` | внешняя почта не приходит | [INSTALL](INSTALL.md#что-понадобится) |
 | 465, 587 | отправка с входом (TLS, STARTTLS) | `openssl s_client -connect <сервер>:465` | клиенты не отправляют | [INSTALL](INSTALL.md#настройка-клиентов) |
 | 993, 143 | IMAP (TLS, STARTTLS) | `openssl s_client -connect <сервер>:993` | клиенты не читают почту | [INSTALL](INSTALL.md#настройка-клиентов) |
+| 4190 | ManageSieve — правила фильтрации (STARTTLS) | `openssl s_client -connect <сервер>:4190 -starttls sieve` | клиенты не меняют правила фильтрации | [INSTALL](INSTALL.md#настройка-клиентов) |
 | 443 | JMAP, автонастройка | `curl -si https://<сервер>/.well-known/jmap` → `401` | JMAP-клиенты не подключаются | [deploy/README](../deploy/README.md#эталон-smb-в-контейнерах-профиль-smb) |
 | 80 | только выпуск сертификата Let's Encrypt (`certbot`, HTTP-01) | `curl -I http://<сервер>/` во время выпуска | сертификат не выпускается | [INSTALL](INSTALL.md#рабочий-сервер-ansible) |
 
@@ -174,7 +175,7 @@ PTR задаёт владелец адреса (провайдер, хостин
 |---|---|---|---|
 | Rspamd с Milter на `127.0.0.1:11332` (worker proxy); эталон — пакет `rspamd.com` (Ansible), образ `rspamd/rspamd:3.11.1` (Compose) | `ss -ltn \| grep 11332`, `systemctl is-active rspamd` | по умолчанию (`on_failure: accept`) письмо принимается без проверки с заголовком `X-ThePost-Milter: <имя>; unavailable`; `tempfail` — `451 4.7.1` | [роль `rspamd`](../deploy/ansible/roles/rspamd/defaults/main.yml), [`tp-smtp/src/config.rs`](../crates/tp-smtp/src/config.rs) |
 | По желанию — clamav-milter на `127.0.0.1:7357` (`thepost_clamav: true`), заражённое — `Reject`; RAM — +2 GB (S8) | `systemctl is-active clamav-milter` | без баз freshclam clamd не запускается: роль ждёт до 10 мин | [роль `clamav_milter`](../deploy/ansible/roles/clamav_milter/defaults/main.yml), [S8](spec/S8.md) |
-| Почту пользователей (submission) проверять — `thepost_milter_submission: true` | `config.yaml`: `smtp.milter.filters[].submission` | по умолчанию проверяется только входящая | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
+| Почту пользователей (submission и отправка JMAP) проверять — `thepost_milter_submission: true` | `config.yaml`: второй элемент `smtp.milter.filters[]` того же адреса с `direction: outbound` | по умолчанию проверяется только входящая; при недоступности фильтра исходящей почты — `451` (`on_failure: tempfail`) | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
 
 `doctor` доступность фильтров Milter не проверяет.
 
@@ -249,8 +250,8 @@ Dr.Web для почтовых серверов его поддерживают)
      smtp:
        milter:
          filters:
-           - { name: rspamd, address: "{{ thepost_rspamd_milter_address }}", inbound: true, submission: false }
-           - { name: antivirus, address: "127.0.0.1:7358", inbound: true, submission: false }
+           - { name: rspamd, address: "{{ thepost_rspamd_milter_address }}", direction: inbound }
+           - { name: antivirus, address: "127.0.0.1:7358", direction: inbound }
    ```
 3. Повторите `ansible-playbook … smb.yml`.
 4. Проверка: `sudo -u thepost thepost doctor` — фильтр `antivirus` доступен; тестовое письмо с EICAR отклоняется.

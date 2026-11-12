@@ -1,12 +1,17 @@
 {#- Эталон SMB: пресет all (deploy/config/all.yaml) + параметры узла; поверх — thepost_config_extra. -#}
 {%- set acme = thepost_tls_mode == 'acme' -%}
 {%- set tls_dir = '/var/lib/thepost/tls' if acme else '/etc/thepost/tls' -%}
-{%- set filters = [{'name': 'rspamd', 'address': thepost_rspamd_milter_address,
-                    'inbound': true, 'submission': thepost_milter_submission}] -%}
-{%- if thepost_clamav -%}
-{%-   set filters = filters + [{'name': 'clamav', 'address': thepost_clamav_milter_address,
-                               'inbound': true, 'submission': thepost_milter_submission}] -%}
-{%- endif -%}
+{#- Фильтр Milter описывается отдельно на каждое направление: inbound — приём, outbound — почта пользователей. -#}
+{%- set milters = [('rspamd', thepost_rspamd_milter_address)]
+      + ([('clamav', thepost_clamav_milter_address)] if thepost_clamav else []) -%}
+{%- set directions = ['inbound'] + (['outbound'] if thepost_milter_submission else []) -%}
+{%- set filters = [] -%}
+{%- for direction in directions -%}
+{%-   for name, address in milters -%}
+{%-     set _ = filters.append({'name': name if direction == 'inbound' else name ~ '-outbound',
+                                'address': address, 'direction': direction}) -%}
+{%-   endfor -%}
+{%- endfor -%}
 {%- set base = {
   'domain': thepost_domain,
   'roles': ['all'],
@@ -18,7 +23,7 @@
   'blob': {'url': 'file:///var/lib/thepost/blob'},
   'tls': {
     'cert_file': tls_dir ~ '/fullchain.pem',
-    'key_file': tls_dir ~ '/privkey.pem',
+    'key': {'secret': 'thepost/tls#key'},
   },
   'http': {
     'jmap': {'listen': thepost_listen_address ~ ':443'},
@@ -28,6 +33,7 @@
     {'listen': thepost_listen_address ~ ':143'},
     {'listen': thepost_listen_address ~ ':993', 'implicit_tls': true},
   ]},
+  'sieve': {'managesieve': {'listen': [{'listen': thepost_listen_address ~ ':4190'}]}},
   'smtp': {
     'hostname': thepost_hostname,
     'inbound': [{'listen': thepost_listen_address ~ ':25'}],
@@ -37,6 +43,7 @@
     ],
     'milter': {'filters': filters},
   },
+  'maintenance': thepost_maintenance,
   'secrets': {
     'url': thepost_secrets_url,
     'tls': {'ca_file': thepost_internal_ca_file},
@@ -46,6 +53,12 @@
     }},
   },
 } -%}
+{%- if thepost_dav_listen | length > 0 -%}
+{%-   set base = base | combine({'http': {'dav': {'listen': thepost_dav_listen}}}, recursive=true) -%}
+{%- endif -%}
+{%- if thepost_dav | length > 0 -%}
+{%-   set base = base | combine({'dav': thepost_dav}) -%}
+{%- endif -%}
 {%- if thepost_db_urls | length > 0 -%}
 {%-   set base = base | combine({'database': {'urls': thepost_db_urls}}, recursive=true) -%}
 {%- endif -%}

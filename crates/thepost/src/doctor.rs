@@ -4,7 +4,8 @@
 //! пробного объекта), синхронизация часов узла и СУБД,
 //! минимальные привилегии процесса (PLT-16): учётная запись, capabilities, no_new_privs, seccomp, Landlock;
 //! DNS почтового домена (MX, SPF, DKIM, DMARC, MTA-STS, PTR), сертификаты и PROXY v2 — `doctor_dns` (APP-06);
-//! сроки внутренних сертификатов (CA СУБД и OpenBao, сертификат узла от них) — `pki.*` (APP-25).
+//! сроки внутренних сертификатов (CA СУБД и OpenBao, сертификат узла от них) — `pki.*` (APP-25); приёмники экспорта
+//! журнала аудита — `admin.audit.syslog`, `admin.audit.otlp` (APP-59).
 //!
 //! Вывод — таблица или JSON; код возврата ≠ 0, если хотя бы одна проверка не пройдена (`fail`).
 
@@ -15,13 +16,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use serde::Serialize;
-use sqlx::PgPool;
 use tp_cluster::NodeTls;
 use tp_contracts::blob::BlobStore;
-use tp_contracts::secrets::SecretStore;
+use tp_contracts::secrets::{Secret, SecretStore};
 use tp_contracts::{Error, Result};
 use tp_meta::MetaConfig;
-use tp_platform::{Config, TlsCerts, TlsConfig};
+use tp_meta::pool::DbPool;
+use tp_platform::Config;
 
 use crate::doctor_dns::{self, Dns};
 use crate::infra;
@@ -294,6 +295,93 @@ pub async fn check(
     internal_keys(cfg, store.as_ref(), report).await;
     internal_pki(cfg, SystemTime::now(), report).await;
     dav_well_known(cfg, report);
+    admin_audit(cfg, store.as_ref(), report).await;
+}
+
+/// Таймаут подключения к приёмнику OTLP (у syslog — свой, `admin.audit.syslog.connect_timeout`).
+const OTLP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP-подключение к `address` за `timeout`: `None` — подключились, иначе — причина.
+async fn tcp_reachable(address: &str, timeout: Duration) -> Option<String> {
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(address)).await {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => Some(format!(
+            "нет подключения к {address}: {e}; записи ждут в журнале до возврата приёмника"
+        )),
+        Err(_) => Some(format!(
+            "нет подключения к {address} за {}",
+            tp_contracts::config::duration::format(timeout)
+        )),
+    }
+}
+
+/// Выгрузка журнала аудита в SIEM (`admin.audit`, APP-59) узла с ролью maintenance (выгружает она).
+/// `admin.audit.syslog` — приёмник собирается, как при выгрузке (проверка, ключ клиента `tls.key` из хранилища
+/// секретов, TLS), затем подключение к `address` с рукопожатием TLS и проверкой сертификата приёмника за
+/// `connect_timeout`; `admin.audit.otlp` — TCP-подключение к узлу и порту `endpoint`. Нет подсекции — нет проверки.
+/// Пока приёмник недоступен, записи ждут в журнале и уходят после его возврата.
+pub async fn admin_audit(cfg: &Config, store: Option<&Arc<dyn SecretStore>>, report: &mut Report) {
+    if !cfg.roles().contains(tp_contracts::role::Role::Maintenance) {
+        return;
+    }
+    let Ok(admin) = cfg.section::<sections::AdminSection>(sections::ADMIN) else {
+        return;
+    };
+    let audit = &admin.0.audit;
+    if let Some(syslog) = &audit.syslog {
+        let id = "admin.audit.syslog";
+        let value = syslog.address.clone();
+        match store {
+            None => report.push(
+                id,
+                Status::Skipped,
+                value,
+                "хранилище секретов не настроено",
+            ),
+            Some(store) => {
+                match tp_admin::SyslogAudit::start(syslog.clone(), cfg.profile(), store.as_ref())
+                    .await
+                {
+                    Err(e) => report.push(id, Status::Fail, value, message(&e)),
+                    Ok(sink) => match sink.probe().await {
+                        Err(e) => report.push(
+                            id,
+                            Status::Fail,
+                            value,
+                            format!(
+                                "нет подключения к {}: {e}; записи ждут в журнале до возврата приёмника",
+                                syslog.address
+                            ),
+                        ),
+                        Ok(()) => report.push(
+                            id,
+                            Status::Ok,
+                            value,
+                            "приёмник syslog принимает соединения",
+                        ),
+                    },
+                }
+            }
+        }
+    }
+    if let Some(otlp) = &audit.otlp {
+        let id = "admin.audit.otlp";
+        let value = otlp.endpoint.clone();
+        let target = reqwest::Url::parse(&otlp.endpoint)
+            .map_err(|e| format!("endpoint: {e}"))
+            .and_then(|u| match (u.host_str(), u.port_or_known_default()) {
+                (Some(host), Some(port)) => Ok(format!("{host}:{port}")),
+                _ => Err("endpoint: нет узла или порта".to_owned()),
+            });
+        let why = match target {
+            Ok(target) => tcp_reachable(&target, OTLP_CONNECT_TIMEOUT).await,
+            Err(e) => Some(e),
+        };
+        match why {
+            Some(why) => report.push(id, Status::Fail, value, why),
+            None => report.push(id, Status::Ok, value, "приёмник OTLP принимает соединения"),
+        }
+    }
 }
 
 /// Путь адреса автонастройки `target` (`jmap.autoconfig.caldav`, `carddav`): путь на этом сервере или полный URL.
@@ -460,7 +548,7 @@ async fn database(
 }
 
 /// Справочник шардов (FIX-05): больше одного шарда — `FAIL`, пока GC BLOB не шардирован (FIX-04).
-async fn shards(pool: &PgPool, timeout: Duration, report: &mut Report) {
+async fn shards(pool: &DbPool, timeout: Duration, report: &mut Report) {
     let id = "database.shards";
     match tokio::time::timeout(timeout, crate::roles::shard_count(pool)).await {
         Ok(Ok(None)) => report.push(
@@ -490,13 +578,16 @@ async fn shards(pool: &PgPool, timeout: Duration, report: &mut Report) {
 
 /// Кодировка и `LC_CTYPE` базы узла (решение 2026-11-11 №23): `lower(login)` переводит кириллицу только в UTF8 с
 /// `LC_CTYPE` UTF-8.
-async fn locale(pool: &PgPool, timeout: Duration, report: &mut Report) {
+async fn locale(pool: &DbPool, timeout: Duration, report: &mut Report) {
     let id = "database.locale";
-    let query = sqlx::query_as::<_, (String, String)>(
-        "SELECT pg_encoding_to_char(encoding)::text, datctype::text FROM pg_database \
-         WHERE datname = current_database()",
-    )
-    .fetch_one(pool);
+    let query = async {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT pg_encoding_to_char(encoding)::text, datctype::text FROM pg_database \
+             WHERE datname = current_database()",
+        )
+        .fetch_one(&mut *pool.acquire_sqlx().await?)
+        .await
+    };
     let (encoding, ctype) = match tokio::time::timeout(timeout, query).await {
         Ok(Ok(row)) => row,
         Ok(Err(e)) => {
@@ -540,12 +631,15 @@ pub fn locale_status(encoding: &str, ctype: &str) -> (Status, &'static str) {
 }
 
 /// Расширения PostgreSQL базы узла, кроме встроенного `plpgsql` (по имени, по возрастанию).
-async fn extensions(pool: &PgPool, timeout: Duration, report: &mut Report) {
+async fn extensions(pool: &DbPool, timeout: Duration, report: &mut Report) {
     let id = "database.extensions";
-    let query = sqlx::query_scalar::<_, String>(
-        "SELECT extname::text FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY 1",
-    )
-    .fetch_all(pool);
+    let query = async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT extname::text FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY 1",
+        )
+        .fetch_all(&mut *pool.acquire_sqlx().await?)
+        .await
+    };
     let names = match tokio::time::timeout(timeout, query).await {
         Ok(Ok(names)) => names,
         Ok(Err(e)) => {
@@ -585,12 +679,14 @@ pub fn extensions_status(names: &[String]) -> (Status, &'static str) {
 }
 
 /// Расхождение часов узла и СУБД: момент СУБД сравнивается с серединой интервала запроса.
-async fn clock_skew(pool: &PgPool, timeout: Duration, doctor: &DoctorSection, report: &mut Report) {
+async fn clock_skew(pool: &DbPool, timeout: Duration, doctor: &DoctorSection, report: &mut Report) {
     let id = "time.clock_skew";
     let before = unix_seconds(SystemTime::now());
-    let query =
+    let query = async {
         sqlx::query_scalar::<_, f64>("SELECT extract(epoch FROM clock_timestamp())::float8")
-            .fetch_one(pool);
+            .fetch_one(&mut *pool.acquire_sqlx().await?)
+            .await
+    };
     let db = match tokio::time::timeout(timeout, query).await {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
@@ -859,19 +955,21 @@ pub async fn internal_keys(
     let db = cfg.section::<tp_meta::pool::PoolConfig>(tp_meta::pool::PoolConfig::SECTION);
     match db.as_ref().map(|db| (&db.tls, db.tls.cert_file.clone())) {
         Ok((tls, Some(cert_file))) => {
-            // Пара «сертификат и ключ» проверяется готовой загрузкой сертификатов платформы.
-            let pair = TlsConfig {
-                cert_file,
-                key_file: tls.key_file.clone().unwrap_or_default(),
-                key: tls.key.clone(),
-                ..TlsConfig::default()
-            };
+            // Пара «сертификат и ключ» — та же проверка, что у ключа слушателей (`tp_platform::tls::check_pair`).
             let load = |store: Option<Arc<dyn SecretStore>>| async move {
-                match store {
-                    Some(store) => TlsCerts::load_with_secrets(&pair, store).await,
-                    None => TlsCerts::load(&pair).await,
-                }
-                .map(drop)
+                let key = match (&tls.key, &tls.key_file, store) {
+                    (Some(secret), _, Some(store)) => store.get(secret).await?,
+                    (None, Some(file), _) => tokio::fs::read_to_string(file)
+                        .await
+                        .map(Secret::new)
+                        .map_err(|e| Error::Invalid(format!("{}: {e}", file.display())))?,
+                    _ => {
+                        return Err(Error::Invalid(
+                            "ключ клиентского сертификата не задан".into(),
+                        ));
+                    }
+                };
+                tp_platform::tls::check_pair(&cert_file, &key).await
             };
             internal_key(id, tls, store, load, report).await;
         }
@@ -1232,7 +1330,7 @@ mod tests {
             .parse(
                 &format!(
                     "domain: example.org\nprofile: dev\ndatabase:\n  url: \"postgres://thepost@db:5432/thepost?sslmode=verify-full{db_ca}\"\n\
-                     blob:\n  url: file:///tmp/b\ntls:\n  cert_file: \"{node}\"\n  key_file: \"{node}\"\n{secrets}",
+                     blob:\n  url: file:///tmp/b\ntls:\n  cert_file: \"{node}\"\n{secrets}",
                     node = slash(node),
                 ),
                 Vec::new(),

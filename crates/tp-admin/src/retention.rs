@@ -6,7 +6,7 @@
 //! Восстановление — `MailStore::restore`: письмо возвращается в исходную папку (нет — во «Входящие») с тем же
 //! идентификатором, клиенты получают уведомление. Тема и отправитель писем (`subject`, `from`) — только по
 //! `include=subject` и только администратору, с записью в аудит (`crate::content`); источник — `MailStore::fetch_raw`.
-//! Скрытые письма (`…/trash/hidden`) `fetch_raw` не отдаёт, поэтому у них тема и отправитель — `null`.
+//! У скрытых писем (`…/trash/hidden`) тема и отправитель — из метаданных письма (`TrashStore::hidden_message`, MS-19).
 //!
 //! «Очистить корзину» в клиенте — настройка `trash.purge` (решение 2026-11-01-trash-purge): правило администратора
 //! (`mode`, `user_can_choose`) — поле `trash_purge` политики уровня ([`crate::accounts`]), выбор пользователя
@@ -307,6 +307,17 @@ async fn page(
         let mut entry = TrashEntry::from(item);
         if subjects {
             let head = match message {
+                // Скрытое письмо хранилище не отдаёт: тема и отправитель — из метаданных, вычисленных при приёме
+                // (MS-19); BLOB не читается, скрытие не снимается.
+                Some(m) if hidden => {
+                    a.d.trash
+                        .hidden_message(scope, m)
+                        .await?
+                        .map(|msg| {
+                            content::envelope_headline(&msg.meta.envelope, a.cfg.subject_max_chars)
+                        })
+                        .unwrap_or_default()
+                }
                 Some(m) => {
                     let raw =
                         a.d.store
@@ -606,7 +617,7 @@ mod tests {
         assert!(["перво", "второ"].contains(&subject), "{subject}");
         assert_eq!(content(&env)[0].content_messages, Some(1));
 
-        // Скрытое письмо хранилище не отдаёт (`MailStore::fetch_raw` — `NotFound`): поля есть, значения — `null`.
+        // Скрытое письмо: тема и отправитель — из метаданных письма (MS-19), а не из хранилища.
         env.trash
             .purge(scope, &ids, &DecisionHooks::default())
             .await
@@ -615,9 +626,11 @@ mod tests {
         let (s, _, b) = env.call("GET", &hidden, Some("root"), None).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         let item = b["items"][0].as_object().expect("item");
-        assert_eq!(
-            (item.get("subject"), item.get("from")),
-            (Some(&Value::Null), Some(&Value::Null))
+        let subject = item["subject"].as_str().expect("subject");
+        assert!(["перво", "второ"].contains(&subject), "{subject}");
+        assert!(
+            item["from"].as_str().is_some_and(|f| !f.is_empty()),
+            "{item:?}"
         );
         assert_eq!(content(&env).len(), 2);
     }

@@ -10,6 +10,9 @@ manual: no
 
 Хвост волны dav-02, PR #427.
 
+Решение владельца 2026-11-12 (PR #500): один путь — псевдонимы хранятся с учётной записью (`Account::aliases`, `AccountUpsert::aliases`),
+адреса — `Account::addresses()`; метода `AccountStore::addresses` с реализацией по умолчанию нет. `tp-meta` и `tp-testkit` — в том же PR.
+
 ## Сделать
 - `AccountStore::addresses(tenant, id) -> Result<Vec<String>>`: адреса, на которые учётной записи доставляется почта, —
   основной первым, затем псевдонимы каталога (`DirAlias` с целью — этой учётной записью) без catch-all `@domain`;

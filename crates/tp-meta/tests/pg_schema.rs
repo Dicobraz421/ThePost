@@ -24,11 +24,13 @@ async fn migrations_apply_on_clean_db_and_are_idempotent() {
         .expect("create database");
 
     let opts = PgConnectOptions::from_str(&url).expect("url").database(&db);
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(opts)
-        .await
-        .expect("connect clean");
+    let pool = common::db(
+        PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(opts)
+            .await
+            .expect("connect clean"),
+    );
     schema::migrate(&pool).await.expect("first");
     schema::migrate(&pool).await.expect("second");
     // Параллельный старт нескольких узлов.
@@ -43,7 +45,7 @@ async fn migrations_apply_on_clean_db_and_are_idempotent() {
     }
 
     let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
-        .fetch_one(&pool)
+        .fetch_one(&mut *common::conn(&pool).await)
         .await
         .expect("count");
     assert_eq!(applied, schema::migrator().iter().count() as i64);
@@ -71,7 +73,9 @@ async fn rls_hides_other_tenants() {
         return;
     };
     // Суперпользователь обходит RLS: проверяем от имени обычной роли.
-    pool.execute(
+    common::conn(&pool)
+        .await
+        .execute(
         "DO $$ BEGIN CREATE ROLE tp_meta_rls NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
          GRANT USAGE ON SCHEMA public TO tp_meta_rls;
          GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO tp_meta_rls;",

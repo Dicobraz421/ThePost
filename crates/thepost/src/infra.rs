@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use sqlx::PgPool;
 use tp_blob::{LocalStore, S3Store};
 use tp_cluster::{BusMetrics, LocalBus};
 use tp_contracts::blob::BlobStore;
@@ -13,9 +12,9 @@ use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
 use tp_meta::MetaConfig;
 use tp_meta::failover::{self, Failover};
-use tp_meta::pool::{self, PoolConfig};
+use tp_meta::pool::{self, DbPool, NoAcquireObserver, PoolConfig};
 use tp_meta::signals::{PgSignalBus, SignalMetrics};
-use tp_platform::{BusSample, Config};
+use tp_platform::{BusSample, Config, DbMetrics};
 
 use crate::sections::{
     self, BLOB, BUS, BlobLocation, BlobSection, BusKind, BusSection, CLUSTER, ClusterSection,
@@ -30,10 +29,11 @@ pub fn pool_config(cfg: &Config) -> Result<PoolConfig> {
 }
 
 /// Пул PostgreSQL для коротких команд (`doctor`, `verify`): пароль или динамические учётные данные — из
-/// хранилища секретов, один раз.
-pub async fn connect_db(cfg: &Config, store: &dyn SecretStore) -> Result<PgPool> {
+/// хранилища секретов, один раз. Ожидание соединения не учитывается (наблюдатель-пустышка): у коротких команд
+/// нет `/metrics`.
+pub async fn connect_db(cfg: &Config, store: &dyn SecretStore) -> Result<DbPool> {
     let db = pool_config(cfg)?;
-    pool::connect(&db, store)
+    pool::connect(&db, store, Arc::new(NoAcquireObserver))
         .await
         .map_err(|e| context("database", e))
 }
@@ -41,21 +41,31 @@ pub async fn connect_db(cfg: &Config, store: &dyn SecretStore) -> Result<PgPool>
 /// Пул PostgreSQL узла (`serve`) с поиском primary по `database.url` + `database.urls` и повтором при
 /// переключении СУБД (META-25, `database.failover`); с `database.dynamic_credentials` аренда учётных данных
 /// продлевается, при отказе — новые учётные данные для новых соединений (META-18). Primary не найден за
-/// `database.failover.retry_for` — `Unavailable`. Метрики переключения — [`crate::metrics::register_failover`].
-pub async fn connect_node_db(cfg: &Config, store: Arc<dyn SecretStore>) -> Result<Failover> {
+/// `database.failover.retry_for` — `Unavailable`. Метрики переключения — [`crate::metrics::register_failover`];
+/// занятость пула и ожидание соединения — `tp_db_pool_*{pool="primary"}` набора `metrics` (APP-34, META-55).
+pub async fn connect_node_db(
+    cfg: &Config,
+    store: Arc<dyn SecretStore>,
+    metrics: &DbMetrics,
+) -> Result<Failover> {
     let db = pool_config(cfg)?;
-    failover::connect_failover(&db, store)
+    let (observer, slot) = crate::metrics::pool_observer(metrics, crate::metrics::POOL_PRIMARY);
+    let failover = failover::connect_failover(&db, store, observer)
         .await
-        .map_err(|e| context("database", e))
+        .map_err(|e| context("database", e))?;
+    slot.set(failover.pool());
+    Ok(failover)
 }
 
-/// Пул для миграций: от владельца схемы (`database.owner`, META-23) и/или в обход PgBouncer; иначе — основной пул.
+/// Пул для миграций: от владельца схемы (`database.owner`, META-23) и/или в обход PgBouncer — свой пул с метриками
+/// `tp_db_pool_*{pool="migrations"}` набора `metrics`; иначе — основной пул `main`.
 /// Узлы с ролью PostgreSQL `thepost_app` без `database.owner` схему не меняют: им — `meta.migrate_on_start: false`.
 pub async fn migration_pool(
     cfg: &Config,
     store: &dyn SecretStore,
-    main: &PgPool,
-) -> Result<PgPool> {
+    main: &DbPool,
+    metrics: &DbMetrics,
+) -> Result<DbPool> {
     let db = pool_config(cfg)?;
     if db.pgbouncer || db.direct_url.is_some() || db.owner.is_some() {
         let section = if db.owner.is_some() {
@@ -63,9 +73,13 @@ pub async fn migration_pool(
         } else {
             "database.direct_url"
         };
-        return pool::connect_direct(&db, store)
+        let (observer, slot) =
+            crate::metrics::pool_observer(metrics, crate::metrics::POOL_MIGRATIONS);
+        let pool = pool::connect_direct(&db, store, observer)
             .await
-            .map_err(|e| context(section, e));
+            .map_err(|e| context(section, e))?;
+        slot.set(&pool);
+        return Ok(pool);
     }
     Ok(main.clone())
 }
@@ -113,11 +127,13 @@ impl std::fmt::Debug for Bus {
 
 /// Шина по секции `bus`: `local` — в процессе; `postgres` — LISTEN/NOTIFY: публикатор на пуле узла `db`
 /// (обязателен), слушатель — прямое соединение с primary (`tp_meta::signals::connect_listener`), параметры —
-/// `meta.signals`. Вызывать внутри runtime tokio.
+/// `meta.signals`; занятость и ожидание соединения пула слушателя — `tp_db_pool_*{pool="listener"}` набора
+/// `metrics`. Вызывать внутри runtime tokio.
 pub async fn open_bus(
     cfg: &Config,
     db: Option<&Failover>,
     store: Arc<dyn SecretStore>,
+    metrics: &DbMetrics,
 ) -> Result<Bus> {
     let section = cfg.section::<BusSection>(BUS)?;
     match section.kind {
@@ -138,9 +154,12 @@ pub async fn open_bus(
                 .section::<MetaConfig>(MetaConfig::SECTION)?
                 .signals
                 .clone();
-            let listen = tp_meta::signals::connect_listener(&pool_config(cfg)?, store)
+            let (observer, slot) =
+                crate::metrics::pool_observer(metrics, crate::metrics::POOL_LISTENER);
+            let listen = tp_meta::signals::connect_listener(&pool_config(cfg)?, store, observer)
                 .await
                 .map_err(|e| context("bus", e))?;
+            slot.set(listen.pool());
             let bus = PgSignalBus::start(db.clone(), listen, signals)
                 .map_err(|e| context("meta.signals", e))?;
             let probe = bus.clone();
@@ -215,6 +234,11 @@ mod tests {
     use super::*;
     use crate::sections::registry;
 
+    /// Метрики СУБД узла над реестром `metrics` с параметрами по умолчанию.
+    fn db_metrics(metrics: &tp_platform::Metrics) -> DbMetrics {
+        DbMetrics::register(metrics, &tp_platform::TelemetryConfig::default())
+    }
+
     fn config(yaml: &str) -> Config {
         registry()
             .expect("registry")
@@ -237,9 +261,14 @@ mod tests {
             .await
             .expect("put");
         store.delete_raw("doctor/probe").await.expect("delete");
-        let bus = open_bus(&cfg, None, Arc::new(crate::secrets::NoSecretStore))
-            .await
-            .expect("bus");
+        let bus = open_bus(
+            &cfg,
+            None,
+            Arc::new(crate::secrets::NoSecretStore),
+            &db_metrics(&tp_platform::Metrics::default()),
+        )
+        .await
+        .expect("bus");
         assert!((bus.sample)().connected);
         // Шина PostgreSQL без пула узла (короткие команды) — ошибка конфигурации, а не паника.
         let pg = config(&format!(
@@ -247,9 +276,14 @@ mod tests {
              blob:\n  url: file://{}\nbus:\n  kind: postgres\n",
             dir.path().display().to_string().replace('\\', "/")
         ));
-        let e = open_bus(&pg, None, Arc::new(crate::secrets::NoSecretStore))
-            .await
-            .expect_err("без пула");
+        let e = open_bus(
+            &pg,
+            None,
+            Arc::new(crate::secrets::NoSecretStore),
+            &db_metrics(&tp_platform::Metrics::default()),
+        )
+        .await
+        .expect_err("без пула");
         assert!(e.to_string().contains("postgres"), "{e}");
         let s = pg_bus_sample(
             true,
@@ -276,7 +310,9 @@ mod tests {
         );
         let none: Arc<dyn SecretStore> = Arc::new(crate::secrets::NoSecretStore);
         let started = std::time::Instant::now();
-        let e = connect_node_db(&cfg, none).await.expect_err("no primary");
+        let e = connect_node_db(&cfg, none, &db_metrics(&tp_platform::Metrics::default()))
+            .await
+            .expect_err("no primary");
         assert!(matches!(e, Error::Unavailable { .. }), "{e}");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
@@ -300,17 +336,27 @@ mod tests {
              password: {{ secret: \"thepost/db#password\" }}\n  tls: {{ allow_plaintext: true }}\n\
              blob:\n  url: file:///tmp/b\n"
         ));
-        let db = connect_node_db(&cfg, Arc::new(mem)).await.expect("pool");
+        let metrics = tp_platform::Metrics::default();
+        let db = connect_node_db(&cfg, Arc::new(mem), &db_metrics(&metrics))
+            .await
+            .expect("pool");
         let one: i32 = sqlx::query_scalar("SELECT 1")
-            .fetch_one(db.pool())
+            .fetch_one(&mut *db.pool().acquire().await.expect("conn"))
             .await
             .expect("select");
         assert_eq!(one, 1);
         let m = db.metrics();
         assert_eq!((m.switches, m.primary, m.switching), (0, 0, false));
-        let metrics = tp_platform::Metrics::default();
         crate::metrics::register_failover(&metrics, db.clone());
         let text = metrics.encode().expect("encode");
+        // Ожидание соединения пула узла учтено наблюдателем (META-55): выбор primary и запрос.
+        let waits = text
+            .lines()
+            .find_map(|l| l.strip_prefix("tp_db_pool_wait_seconds_count{pool=\"primary\"} "))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("ожидание пула: {text}"));
+        assert!(waits >= 2.0, "{text}");
+        assert!(text.contains("tp_db_pool_max{pool=\"primary\"}"), "{text}");
         for line in [
             "tp_db_failover_switches_total 0",
             "tp_db_failover_switching 0",

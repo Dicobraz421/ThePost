@@ -190,7 +190,7 @@ mod tests {
         let secret = b["password"].as_str().expect("password").to_owned();
         let id = b["id"].as_str().expect("id").to_owned();
         let p = auth
-            .verify(login(&secret))
+            .verify(login(&secret), None)
             .await
             .expect("действующий пароль");
         assert_eq!(p.account, scope.account);
@@ -204,7 +204,10 @@ mod tests {
             .call("DELETE", &format!("{base}/{id}"), Some("org"), None)
             .await;
         assert_eq!(s, StatusCode::NO_CONTENT);
-        assert_eq!(auth.verify(login(&secret)).await, Err(Error::Forbidden));
+        assert_eq!(
+            auth.verify(login(&secret), None).await,
+            Err(Error::Forbidden)
+        );
         let (_, _, list) = env.call("GET", &base, Some("org"), None).await;
         assert!(list[0]["revoked_at"].is_string(), "{list}");
         let (s, _, _) = env

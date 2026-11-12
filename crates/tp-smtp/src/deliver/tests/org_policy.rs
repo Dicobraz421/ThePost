@@ -14,10 +14,10 @@ use crate::config::MilterConfig;
 use crate::milter::proto;
 use crate::milter::tests::{Mock, on_eob, reply_of};
 
-const ALICE: &str = "alice@example.org";
+pub(super) const ALICE: &str = "alice@example.org";
 
 /// Политика учётной записи alice (остальные уровни не заданы).
-async fn alice_policy(env: &Env, policy: Policy) -> MemPolicies {
+pub(super) async fn alice_policy(env: &Env, policy: Policy) -> MemPolicies {
     let policies = MemPolicies::new(&env.meta);
     let scope = env.scope(ALICE).await;
     policies
@@ -27,7 +27,7 @@ async fn alice_policy(env: &Env, policy: Policy) -> MemPolicies {
     policies
 }
 
-async fn principal(env: &Env) -> Principal {
+pub(super) async fn principal(env: &Env) -> Principal {
     let scope = env.scope(ALICE).await;
     Principal {
         tenant: scope.tenant,
@@ -39,7 +39,7 @@ async fn principal(env: &Env) -> Principal {
 }
 
 /// Сеанс submission по TLS с доставкой `d`; клиент уже вошёл как alice.
-async fn submission(
+pub(super) async fn submission(
     env: &Env,
     d: Delivery,
 ) -> (
@@ -133,7 +133,7 @@ async fn milter_profile_from_policy() {
         let mut profiles = std::collections::BTreeMap::new();
         profiles.insert("antispam".to_owned(), vec!["rspamd".to_owned()]);
         let submission = |mut f: crate::config::MilterFilter| {
-            f.submission = true;
+            f.direction = crate::config::MilterDirection::Outbound;
             f
         };
         let milters = Milters::new(
@@ -164,6 +164,53 @@ async fn milter_profile_from_policy() {
         assert!(!rspamd.codes().await.is_empty(), "{profile:?}");
         assert_eq!(!dlp.codes().await.is_empty(), dlp_called, "{profile:?}");
     }
+}
+
+/// Отправка вне сессии SMTP (JMAP): фильтры исходящей почты из профиля политики организации.
+#[tokio::test]
+async fn submit_milter_profile_from_tenant_policy() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let rspamd = Mock::start(0, on_eob(vec![reply_of(proto::R_ACCEPT)])).await;
+    let dlp = Mock::start(0, on_eob(vec![reply_of(proto::R_ACCEPT)])).await;
+    let outbound = |mut f: crate::config::MilterFilter| {
+        f.direction = crate::config::MilterDirection::Outbound;
+        f
+    };
+    let mut profiles = std::collections::BTreeMap::new();
+    profiles.insert("antispam".to_owned(), vec!["rspamd".to_owned()]);
+    let milters = Milters::new(
+        MilterConfig {
+            filters: vec![
+                outbound(rspamd.filter("rspamd")),
+                outbound(dlp.filter("dlp")),
+            ],
+            profiles,
+        },
+        "mx.example.org",
+    );
+    let policies = MemPolicies::new(&env.meta);
+    let policy = Policy {
+        milter_profile: Some("antispam".into()),
+        ..Policy::default()
+    };
+    policies
+        .set_policy(TenantId::DEFAULT, PolicyTarget::Tenant, &policy)
+        .await
+        .expect("policy");
+    let mut d = env.delivery(false).with_policies(Arc::new(policies));
+    d.deps.milter = Some(Arc::new(milters));
+    let sent = d
+        .submit(
+            TenantId::DEFAULT,
+            ALICE,
+            &["bob@example.org".to_owned()],
+            Bytes::from_static(MAIL),
+        )
+        .await
+        .expect("submit");
+    assert_eq!(sent.rcpts[0].1, SubmitStatus::Delivered);
+    assert!(!rspamd.codes().await.is_empty());
+    assert_eq!(dlp.codes().await, "");
 }
 
 /// Ключи лимитов и селектора DKIM, которые теперь задаёт политика, — ошибка `thepost config check`.

@@ -13,7 +13,7 @@ use time::{Duration, OffsetDateTime};
 use tp_contracts::dav::{
     Collection, CollectionKind, Component, DavStore, ObjectIndex, Precondition, PutOutcome, Span,
 };
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::schedule::{BusyKind, BusyPeriod, FreeBusy, InboxMessage, ItipMethod, Period};
 use tp_contracts::{AccountId, DomainId, Error, ModSeq, TenantId};
 use tp_meta::dav::DavConfig;
@@ -40,6 +40,8 @@ async fn account_in(meta: &PgMeta, tenant: TenantId, domain: (DomainId, &str)) -
                 display_name: "User".into(),
                 external_id: None,
                 enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
             },
         )
         .await
@@ -313,6 +315,7 @@ async fn migration_on_existing_db() {
         .run(&pool)
         .await
         .expect("migrate until");
+    let pool = common::db(pool);
     let tenant = common::tenant(&pool).await;
     let (domain, _) = common::domain(&pool, tenant).await;
     let scope = AccountScope {
@@ -440,6 +443,7 @@ async fn migration_moves_recurring_out_of_index() {
         .run(&pool)
         .await
         .expect("migrate until");
+    let pool = common::db(pool);
     let tenant = common::tenant(&pool).await;
     let (domain, _) = common::domain(&pool, tenant).await;
     let scope = AccountScope {
@@ -619,7 +623,7 @@ async fn schedule_lives_on_account_shard() {
         .await
         .expect("inbox_put");
     for table in ["dav_busy", "dav_inbox"] {
-        let count = async |pool: &sqlx::PgPool| -> i64 {
+        let count = async |pool: &tp_meta::pool::DbPool| -> i64 {
             let mut tx = schema::begin_system(pool).await.expect("begin");
             let n = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT count(*) FROM {table} WHERE account_id = $1"

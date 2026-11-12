@@ -153,6 +153,7 @@ pub(crate) async fn set(
         }
         match store.set_vacation(ctx.scope, v).await {
             Ok(_) => {
+                crate::sieve::rules_changed(ctx, "vacation").await;
                 out.updated.insert(id, Value::Null);
             }
             Err(Error::Invalid(m)) => {
