@@ -23,6 +23,9 @@
 //! - `contacts` — AddressBook/get, changes, set (RFC 9610) поверх `DavStore`, [`Jmap::with_dav`];
 //! - `principal` — Principal/get, query (RFC 9670) и Principal/getAvailability поверх `AccountStore` и `FreeBusy`,
 //!   [`Jmap::with_freebusy`];
+//! - `scheduling` — приглашения (JMAP-31): рассылка iTIP после `CalendarEvent/set` с `sendSchedulingMessages`
+//!   (`tp_dav::itip`, [`Jmap::with_schedule`]), ParticipantIdentity/get, CalendarEventNotification/get, changes, set
+//!   по входящим планирования;
 //! - `sieve` — SieveScript/get, set, query, validate (RFC 9661) поверх `SieveStore` и проверки `tp_sieve`;
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
@@ -44,6 +47,7 @@ pub mod fuzz;
 mod mailbox;
 mod principal;
 mod push;
+mod scheduling;
 mod settings;
 mod sieve;
 pub mod submission;
@@ -116,6 +120,10 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("CalendarEvent/queryChanges", CALENDARS),
     ("CalendarEvent/set", CALENDARS),
     ("CalendarEvent/copy", CALENDARS),
+    ("ParticipantIdentity/get", CALENDARS),
+    ("CalendarEventNotification/get", CALENDARS),
+    ("CalendarEventNotification/changes", CALENDARS),
+    ("CalendarEventNotification/set", CALENDARS),
 ];
 
 /// Варианты сортировки `Email/query` (сессия, `emailQuerySortOptions`).
@@ -180,6 +188,10 @@ pub(crate) async fn call_builtin(
         "CalendarEvent/queryChanges" => calendar_query::query_changes(ctx, args).await,
         "CalendarEvent/set" => calendar_event::set(ctx, args).await,
         "CalendarEvent/copy" => calendar_event::copy(ctx, args).await,
+        "ParticipantIdentity/get" => scheduling::identity_get(ctx, args).await,
+        "CalendarEventNotification/get" => scheduling::notification_get(ctx, args).await,
+        "CalendarEventNotification/changes" => scheduling::notification_changes(ctx, args).await,
+        "CalendarEventNotification/set" => scheduling::notification_set(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
 }
