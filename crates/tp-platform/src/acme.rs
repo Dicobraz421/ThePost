@@ -975,8 +975,10 @@ mod tests {
                 .await
                 .expect("renew")
         );
-        let st = mock.state.lock().expect("state");
-        assert_eq!((st.accounts, st.orders), (1, 2));
+        {
+            let st = mock.state.lock().expect("state");
+            assert_eq!((st.accounts, st.orders), (1, 2));
+        }
         assert_eq!(
             keys.puts.load(Ordering::SeqCst),
             2,
