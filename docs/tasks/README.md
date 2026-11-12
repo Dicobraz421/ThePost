@@ -556,6 +556,7 @@
 | [ADM-36](ADM-36.md) | Admin API: проверка полей политики для SMTP | admin | A | admin-23 | todo | CTR-67 |
 | [APP-59](APP-59.md) | узел запускает экспорт журнала аудита в syslog/OTLP | app | A | app-53 | todo | ADM-34 |
 | [META-76](META-76.md) | убрать старые PgMeta::policy/set_policy и реэкспорт PolicyTarget | meta | A | meta-49 | todo | META-70 |
+| [META-77](META-77.md) | проверка номеров миграций — подряд, без повторов, совпадают с именами файлов | meta | A | meta-50 | ready | — |
 | [ADM-35](ADM-35.md) | CLI: проверка скрипта Sieve без `tp_sieve::check` | admin | A | admin-24 | todo | JMAP-35 |
 | [SIEVE-13](SIEVE-13.md) | одна проверка скрипта: удалить `tp_sieve::check` | sieve | A | sieve-06 | todo | SIEVE-11,JMAP-35,ADM-35 |
 | [DEP-43](DEP-43.md) | эталоны: лимиты, селектор DKIM и Milter — политикой организации | deploy | A | deploy-32 | todo | CTR-67 |
