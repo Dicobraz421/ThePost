@@ -235,7 +235,7 @@ Relay, Dsn }`, `DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, H
 `DeliveryLog`: `record(event)`, `record_batch(Vec<_>)` (по умолчанию — по одной), `search(tenant, &DeliveryQuery) -> DeliveryPage
 { events, next: Option<DeliveryCursor> }`, `purge(before)` — по всем организациям (maintenance), можно целыми сутками-секциями.
 `by_queue(tenant, QueueId, limit)` (CTR-35) — события записи очереди по `at` (равные — в порядке записи), `limit ≥ 1`: статус доставки
-отправки JMAP (`EmailSubmission.deliveryStatus`, связь — `EmailSubmission::queue`); по умолчанию — `Internal`, набор `suite::delivery_by_queue`.
+отправки JMAP (`EmailSubmission.deliveryStatus`, связь — `EmailSubmission::queue`); обязателен, набор `suite::delivery_by_queue`.
 `DeliveryQuery { sender, recipient, message_id, since, until, limit, after }`: условия по «и», адреса — точно без учёта регистра ASCII,
 Message-ID — точно, интервал `[since, until)`; `validate()` (`limit ≥ 1`, непустой интервал) и `matches(&event)` — в контракте;
 порядок — по `at`, равные — в порядке записи; некорректный запрос или позиция — `Invalid`. Срок хранения (по умолчанию 30 суток) —
@@ -536,8 +536,8 @@ queue) -> state` (`Final` со статусами; отменённая — `Con
 after })` (RFC 8621 §7.3; `threadIds` вызывающий переводит в `email_ids`; по `send_at`, `id`; по умолчанию — `list` с фильтром),
 `submission_changes(scope, since, limit) -> SubmissionChanges { created, updated, destroyed, new_state, has_more }` (созданные и удалённые после
 `since` не входят; неизвестное или устаревшее состояние — `Conflict` = `cannotCalculateChanges`; `limit = 0` — `Invalid`), `expire_submissions(before,
-limit) -> usize` — срок хранения: `Final` и `Canceled` с `send_at < before` всех организаций (maintenance; срок — конфигурация); оба — по
-умолчанию `Internal`. Набор `suite::submission_query`. Далее: meta (таблица, RLS), smtp (выпуск по сроку, отмена), jmap (`maxDelayedSend`,
+limit) -> usize` — срок хранения: `Final` и `Canceled` с `send_at < before` всех организаций (maintenance; срок — конфигурация); оба
+обязательны. Набор `suite::submission_query`. Далее: meta (таблица, RLS), smtp (выпуск по сроку, отмена), jmap (`maxDelayedSend`,
 `EmailSubmission/get|set|query|queryChanges`).
 
 ## Trash, Retention, Quota (Ф1)
@@ -805,6 +805,8 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (очередь со сроком выпуска, отмена до выпуска), `SubmissionStore::{query_submissions, submission_changes, expire_submissions}`,
   `SubmissionFilter`, `SubmissionChanges`; описание потока в `submission.rs` (воркер `due` только фиксирует наступившие). In-memory —
   `MemOutbound` (`Scheduled`, `release`), `MemSubmissions` (журнал изменений); наборы `suite::{submission_query, outbound_schedule}`.
+- 2026-11-12 — x/jmap-08: `SubmissionStore::{submission_changes, expire_submissions}` и `DeliveryLog::by_queue` — обязательные (тела
+  по умолчанию с `Internal` удалены); реализации — `tp-meta` (PostgreSQL), `MemSubmissions`, `MemDeliveryLog`.
 - 2026-11-11 — CTR-43 (x/contracts-31, решение 2026-11-11-stage2-followups п. 9): очередь модерации и для правил потока почты —
   `HeldMessage::{group: Option<_>, source: HoldSource, moderators: Vec<Moderator>, recipients}`, `HeldMessage::validate`,
   `Moderation::deliver(.., Option<&DistributionGroup>, ..)` (без группы — исходным получателям), `check_delivery` для обоих случаев. In-memory —

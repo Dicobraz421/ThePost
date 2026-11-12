@@ -84,7 +84,7 @@ async fn all(jmap: &Jmap, tenant: TenantId) -> MethodResult<Vec<Account>> {
 }
 
 /// Участник по `id`; нет, отключён или чужой организации — `None`.
-async fn find(jmap: &Jmap, tenant: TenantId, id: &str) -> MethodResult<Option<Account>> {
+pub(crate) async fn find(jmap: &Jmap, tenant: TenantId, id: &str) -> MethodResult<Option<Account>> {
     let Ok(id) = AccountId::from_str(id) else {
         return Ok(None);
     };

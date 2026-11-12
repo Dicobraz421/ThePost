@@ -315,14 +315,15 @@ impl ScheduledVerify {
 }
 
 /// Очистка по сроку в роли maintenance (APP-32, APP-39): надгробия DAV старше `meta.dav.tombstone_ttl`, записи
-/// журнала автоответов старше `meta.sieve.vacation_log_ttl`, журнал доставки старше `meta.delivery.retention` —
-/// сроки знает [`PgMeta`]; токены `admin init`, истёкшие раньше `maintenance.admin_token_retention` назад.
+/// журнала автоответов старше `meta.sieve.vacation_log_ttl`, журнал доставки старше `meta.delivery.retention`,
+/// завершённые и отменённые отправки JMAP старше `meta.submissions.retention`, аудит ящиков старше
+/// `meta.mailbox_audit.retention` — сроки знает [`PgMeta`]; токены `admin init`, истёкшие раньше `maintenance.admin_token_retention` назад.
 /// Удаление по сроку идемпотентно, повтор удаляет только оставшееся: как и истечение корзины, работает на каждом
 /// узле с ролью без лизы.
 #[derive(Clone)]
 pub struct Purge {
-    /// Метаданные: шаги `purge_dav_tombstones`, `purge_vacation_log`, `purge_expired_delivery` и
-    /// `LocalAdminTokens::prune`.
+    /// Метаданные: шаги `purge_dav_tombstones`, `purge_vacation_log`, `purge_expired_delivery`,
+    /// `expire_old_submissions`, `purge_expired_mailbox_audit` и `LocalAdminTokens::prune`.
     pub meta: PgMeta,
     /// Период (`maintenance.purge_interval`); первый проход — при запуске роли.
     pub interval: Duration,
@@ -339,6 +340,10 @@ pub struct Purged {
     pub vacation_log: Result<u64>,
     /// Журнал доставки: удаляется секциями по суткам, числа записей нет.
     pub delivery_log: Result<()>,
+    /// Отправки JMAP (`SubmissionStore::expire_submissions`).
+    pub submissions: Result<u64>,
+    /// Аудит ящиков: удаляется секциями по суткам, числа записей нет.
+    pub mailbox_audit: Result<()>,
     /// Токены `admin init`.
     pub admin_tokens: Result<u64>,
 }
@@ -359,6 +364,8 @@ impl Purge {
             dav_tombstones: self.meta.purge_dav_tombstones().await,
             vacation_log: self.meta.purge_vacation_log().await,
             delivery_log: self.meta.purge_expired_delivery().await,
+            submissions: self.meta.expire_old_submissions().await,
+            mailbox_audit: self.meta.purge_expired_mailbox_audit().await,
             admin_tokens: self.prune_admin_tokens().await,
         };
         let failed = |step: &str, e: &tp_contracts::Error| {
@@ -367,6 +374,7 @@ impl Purge {
         for (step, result) in [
             ("purge_dav_tombstones", &done.dav_tombstones),
             ("purge_vacation_log", &done.vacation_log),
+            ("expire_old_submissions", &done.submissions),
             ("prune_admin_tokens", &done.admin_tokens),
         ] {
             match result {
@@ -375,9 +383,14 @@ impl Purge {
                 Err(e) => failed(step, e),
             }
         }
-        // Об удалённых секциях журнала доставки пишет сам `tp-meta`.
-        if let Err(e) = &done.delivery_log {
-            failed("purge_expired_delivery", e);
+        // Об удалённых секциях журналов пишет сам `tp-meta`.
+        for (step, result) in [
+            ("purge_expired_delivery", &done.delivery_log),
+            ("purge_expired_mailbox_audit", &done.mailbox_audit),
+        ] {
+            if let Err(e) = result {
+                failed(step, e);
+            }
         }
         done
     }
