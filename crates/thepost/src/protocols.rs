@@ -985,7 +985,16 @@ mod tests {
             .expect("disable");
         stand.bus.disconnect();
         assert_eq!(line(&mut c).await, "-ERR [SYS/PERM] Account disabled\r\n");
-        assert_eq!(line(&mut c).await, "", "соединение закрыто");
+        // Соединение закрыто: сервер может закрыть TLS без close_notify.
+        let mut rest = String::new();
+        let closed = tokio::time::timeout(Duration::from_secs(5), c.read_line(&mut rest))
+            .await
+            .expect("соединение не закрыто");
+        assert!(
+            matches!(&closed, Ok(0))
+                || matches!(&closed, Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{closed:?} {rest:?}"
+        );
 
         shutdown.cancel();
         task.await.expect("join").expect("run");
