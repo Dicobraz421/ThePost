@@ -755,23 +755,36 @@ pub trait ChangeLog: Send + Sync + 'static {
 
 // ---------- Политики ----------
 
-/// Политики, действующие для объекта (SRS 3.8). `None` — не задано ни на одном уровне цепочки:
-/// действует значение по умолчанию из конфигурации крейта-потребителя.
+/// Политики, действующие для объекта (SRS 3.8). `None` — не задано ни на одном уровне цепочки: действует
+/// умолчание, указанное у поля. У полей SMTP умолчание уровня организации — константы `DEFAULT_*` и методы
+/// `*_or_default`, настроек этих полей в config.yaml нет (решение 97). У каждого поля указан потребитель.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Policy {
-    /// Квота ящика, байт.
+    /// Квота ящика, байт. Потребитель — `tp-meta` (`QuotaUsage::limit_bytes`); не задано — значение секции
+    /// `meta.retention` (без него — без ограничения).
     pub quota_bytes: Option<u64>,
-    /// Срок хранения в корзине.
+    /// Срок хранения в корзине. Потребитель — `tp-meta` (срок письма в корзине); не задано — значение секции
+    /// `meta.retention`.
     pub trash_retention: Option<Duration>,
-    /// Срок хранения писем (политика хранения; разрешается до папки).
+    /// Срок хранения писем (политика хранения; разрешается до папки). Исполнитель — модуль «Соответствие
+    /// требованиям» (удаление по сроку через `DecisionHook::before_final_delete`, CONTRACTS.md#Trash); ядро поле
+    /// не применяет. Не задано — письма хранятся без срока.
     pub retention: Option<Duration>,
-    /// Лимит отправки, писем в час.
+    /// Лимит отправки (submission), писем в час на учётную запись. Потребитель — SMTP (SMTP-40); не задано —
+    /// [`Policy::DEFAULT_SEND_PER_HOUR`].
     pub send_per_hour: Option<u32>,
-    /// Лимит получателей одного письма.
+    /// Лимит отправки, адресатов в час на учётную запись (скользящий час, сумма получателей всех писем; как
+    /// RecipientRateLimit в Exchange — решение 113). Потребитель — SMTP (SMTP-43); не задано —
+    /// [`Policy::DEFAULT_RCPTS_PER_HOUR`].
+    pub rcpts_per_hour: Option<u32>,
+    /// Лимит получателей одного письма (`RCPT TO` сеанса submission). Потребитель — SMTP (SMTP-40); не задано —
+    /// [`Policy::DEFAULT_MAX_RECIPIENTS`].
     pub max_recipients: Option<u32>,
-    /// Селектор ключа DKIM домена.
+    /// Селектор ключа DKIM домена отправителя (ключи — ссылки на секреты в `smtp.dkim`). Потребитель — SMTP
+    /// (SMTP-40); не задано — письмо подписывается всеми ключами домена.
     pub dkim_selector: Option<String>,
-    /// Профиль Milter.
+    /// Профиль Milter — набор фильтров из `smtp.milter` (адреса фильтров — в config.yaml). Потребитель — SMTP
+    /// (SMTP-40); не задано — все фильтры конфигурации, как без профилей.
     pub milter_profile: Option<String>,
     /// Правило администратора `trash.purge` (решение 2026-11-01-trash-purge); вычисление с выбором пользователя —
     /// [`PolicyResolver::trash_purge`].
@@ -779,6 +792,28 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Умолчание уровня организации для [`Policy::send_per_hour`], писем в час.
+    pub const DEFAULT_SEND_PER_HOUR: u32 = 1000;
+    /// Умолчание уровня организации для [`Policy::rcpts_per_hour`], адресатов в час (решение 113).
+    pub const DEFAULT_RCPTS_PER_HOUR: u32 = 2000;
+    /// Умолчание уровня организации для [`Policy::max_recipients`].
+    pub const DEFAULT_MAX_RECIPIENTS: u32 = 100;
+
+    /// Действующий лимит отправки, писем в час: заданный в цепочке или [`Policy::DEFAULT_SEND_PER_HOUR`].
+    pub fn send_per_hour_or_default(&self) -> u32 {
+        self.send_per_hour.unwrap_or(Self::DEFAULT_SEND_PER_HOUR)
+    }
+
+    /// Действующий лимит отправки, адресатов в час: заданный в цепочке или [`Policy::DEFAULT_RCPTS_PER_HOUR`].
+    pub fn rcpts_per_hour_or_default(&self) -> u32 {
+        self.rcpts_per_hour.unwrap_or(Self::DEFAULT_RCPTS_PER_HOUR)
+    }
+
+    /// Действующий лимит получателей письма: заданный в цепочке или [`Policy::DEFAULT_MAX_RECIPIENTS`].
+    pub fn max_recipients_or_default(&self) -> u32 {
+        self.max_recipients.unwrap_or(Self::DEFAULT_MAX_RECIPIENTS)
+    }
+
     /// Накладывает более специфичный уровень: заданные в `over` поля заменяют поля `self`.
     pub fn overlay(self, over: Policy) -> Policy {
         Policy {
@@ -786,12 +821,44 @@ impl Policy {
             trash_retention: over.trash_retention.or(self.trash_retention),
             retention: over.retention.or(self.retention),
             send_per_hour: over.send_per_hour.or(self.send_per_hour),
+            rcpts_per_hour: over.rcpts_per_hour.or(self.rcpts_per_hour),
             max_recipients: over.max_recipients.or(self.max_recipients),
             dkim_selector: over.dkim_selector.or(self.dkim_selector),
             milter_profile: over.milter_profile.or(self.milter_profile),
             trash_purge: over.trash_purge.or(self.trash_purge),
         }
     }
+}
+
+/// Уровень цепочки политик «организация → домен → ящик → папка» (CTR-25) — один тип на всю систему: хранилище
+/// политик ([`PolicyStore`]), Admin API, in-memory `tp-testkit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicyTarget {
+    /// Организация.
+    Tenant,
+    /// Домен.
+    Domain(DomainId),
+    /// Учётная запись (ящик).
+    Account(AccountId),
+    /// Папка.
+    Mailbox(MailboxId),
+}
+
+/// Политики уровней цепочки (CTR-25): чтение и запись одного уровня без наложения — для Admin API. Наложение
+/// цепочки — [`PolicyResolver`], запись видна ему сразу. Существование объекта уровня (домена, учётной записи,
+/// папки) не проверяется: это делает вызывающий.
+#[async_trait]
+pub trait PolicyStore: Send + Sync + 'static {
+    /// Политика одного уровня без наложения; не задана — `Policy::default()` (все поля `None`).
+    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy>;
+
+    /// Задаёт политику уровня целиком; `Policy::default()` удаляет уровень.
+    async fn set_policy(
+        &self,
+        tenant: TenantId,
+        target: PolicyTarget,
+        policy: &Policy,
+    ) -> Result<()>;
 }
 
 /// Разрешение политик по цепочке «организация → домен → ящик (→ папка)»: каждый следующий уровень
@@ -836,6 +903,7 @@ mod tests {
         fn _s(_: Arc<dyn MessageStore>) {}
         fn _c(_: Arc<dyn ChangeLog>) {}
         fn _p(_: Arc<dyn PolicyResolver>) {}
+        fn _ps(_: Arc<dyn PolicyStore>) {}
     }
 
     #[test]
@@ -931,6 +999,7 @@ mod tests {
         };
         let domain = Policy {
             quota_bytes: Some(20),
+            rcpts_per_hour: Some(300),
             dkim_selector: Some("s1".into()),
             ..Policy::default()
         };
@@ -944,6 +1013,18 @@ mod tests {
         assert_eq!(p.dkim_selector.as_deref(), Some("s1"));
         assert_eq!(p.milter_profile, None);
         assert_eq!(p.trash_purge, None);
+        // Умолчания уровня организации полей SMTP (CTR-67).
+        assert_eq!(p.send_per_hour_or_default(), 5);
+        assert_eq!(p.rcpts_per_hour_or_default(), 300);
+        assert_eq!(
+            p.max_recipients_or_default(),
+            Policy::DEFAULT_MAX_RECIPIENTS
+        );
+        assert_eq!(
+            Policy::default().send_per_hour_or_default(),
+            Policy::DEFAULT_SEND_PER_HOUR
+        );
+        assert_eq!(Policy::default().rcpts_per_hour_or_default(), 2000);
         let rule = TrashPurgeRule {
             mode: TrashPurge::Erase,
             user_can_choose: true,

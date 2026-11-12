@@ -16,7 +16,6 @@ import type { Schemas } from "./api/client";
 import { AccountCreate, AccountList, AccountShow } from "./pages/accounts";
 import { AuditPage } from "./pages/audit";
 import { DeliveryPage } from "./pages/delivery";
-import { DomainCreate, DomainList, DomainShow } from "./pages/domains";
 import { GroupCreate, GroupEdit, GroupList } from "./pages/groups";
 import { LoginPage } from "./pages/login";
 import { ModerationPage } from "./pages/moderation";
@@ -53,13 +52,6 @@ export function App() {
           resources={[
             { name: "organization", list: "/organization", meta: { label: "Организация" } },
             {
-              name: "domains",
-              list: "/domains",
-              create: "/domains/create",
-              show: "/domains/:id",
-              meta: { label: "Домены" },
-            },
-            {
               name: "accounts",
               list: "/accounts",
               create: "/accounts/create",
@@ -94,11 +86,6 @@ export function App() {
             >
               <Route index element={<Home />} />
               <Route path="/organization" element={<OrganizationPage />} />
-              <Route path="/domains">
-                <Route index element={<DomainList />} />
-                <Route path="create" element={<DomainCreate />} />
-                <Route path=":id" element={<DomainShow />} />
-              </Route>
               <Route path="/accounts">
                 <Route index element={<AccountList />} />
                 <Route path="create" element={<AccountCreate />} />

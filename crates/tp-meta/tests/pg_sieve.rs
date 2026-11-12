@@ -6,10 +6,11 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::AssertSqlSafe;
 use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::sieve::{SieveStore, Vacation, VacationLog};
 use tp_contracts::{DomainId, Error, TenantId};
+use tp_meta::pool::DbPool;
 use tp_meta::sieve::SieveConfig;
 use tp_meta::{MetaConfig, PgMeta, schema};
 use tp_testkit::MemEventBus;
@@ -172,7 +173,7 @@ async fn scripts_live_on_account_shard() {
         .set_org_script(scope.tenant, Some("stop;".into()))
         .await
         .expect("org");
-    let count = async |pool: &PgPool, table: &str| -> i64 {
+    let count = async |pool: &DbPool, table: &str| -> i64 {
         let mut tx = schema::begin_system(pool).await.expect("begin");
         let n = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT count(*) FROM {table} WHERE tenant_id = $1"

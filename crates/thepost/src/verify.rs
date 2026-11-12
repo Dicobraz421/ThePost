@@ -154,53 +154,16 @@ pub async fn command(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-    use std::sync::Mutex;
     use std::time::Duration;
 
-    use async_trait::async_trait;
     use bytes::Bytes;
-    use futures::StreamExt;
-    use futures::stream::{self, BoxStream};
-    use tp_blob::{BlobWriter, IndexedBlob, WriterConfig};
+    use tp_blob::{BlobWriter, WriterConfig};
     use tp_contracts::{BlobKey, Gen, TenantId};
-    use tp_testkit::blob::BlobState;
     use tp_testkit::{Clock, ManualClock, MemBlobIndex, MemBlobStore};
 
+    use crate::testutil::MemInventory;
+
     const GRACE: u64 = 3600;
-
-    /// Перечисление записей поверх `MemBlobIndex` по записанным ключам.
-    struct Inventory {
-        index: MemBlobIndex,
-        keys: Mutex<Vec<BlobKey>>,
-        damaged: Mutex<BTreeSet<BlobKey>>,
-    }
-
-    #[async_trait]
-    impl BlobInventory for Inventory {
-        fn live(&self) -> BoxStream<'static, Result<IndexedBlob>> {
-            let rows: Vec<_> = self
-                .keys
-                .lock()
-                .expect("lock")
-                .iter()
-                .filter_map(|k| {
-                    let r = self.index.row(k.tenant, &k.hash)?;
-                    (r.state == BlobState::Live && r.generation == k.generation).then_some(Ok(
-                        IndexedBlob {
-                            key: *k,
-                            size: r.size,
-                        },
-                    ))
-                })
-                .collect();
-            stream::iter(rows).boxed()
-        }
-
-        async fn mark_damaged(&self, key: &BlobKey) -> Result<()> {
-            self.damaged.lock().expect("lock").insert(*key);
-            Ok(())
-        }
-    }
 
     #[tokio::test]
     async fn discrepancies_are_reported_and_fixed() {
@@ -212,11 +175,7 @@ mod tests {
             Arc::new(store.clone()),
             WriterConfig::default(),
         );
-        let inventory = Arc::new(Inventory {
-            index: index.clone(),
-            keys: Mutex::default(),
-            damaged: Mutex::default(),
-        });
+        let inventory = Arc::new(MemInventory::new(index.clone()));
         let mut keys = Vec::new();
         for body in [&b"ok"[..], b"missing", b"resized"] {
             let key = writer
@@ -300,7 +259,7 @@ mod tests {
             eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
             return;
         };
-        let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+        let pool = crate::testutil::db_pool(&url).await;
         tp_meta::schema::migrate(&pool).await.expect("migrate");
         let tenant = TenantId::new();
         tp_meta::pool::with_tenant(&pool, tenant, |tx| {

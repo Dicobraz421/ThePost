@@ -1,0 +1,1 @@
+if header :matches "subject" "*a*a*a*a*b" { stop; } keep; keep; keep;

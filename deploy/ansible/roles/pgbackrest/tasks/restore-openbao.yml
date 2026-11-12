@@ -50,9 +50,9 @@
       set -euo pipefail
       cd /root/openbao-restore
       s={{ thepost_restore_openbao_snapshot | quote }}
-      thepost-restic snapshots --compact --tag thepost-openbao "$s" | grep -E '^[0-9a-f]{8} ' | tail -n1
+      /usr/local/sbin/thepost-restic snapshots --compact --tag thepost-openbao "$s" | grep -E '^[0-9a-f]{8} ' | tail -n1
       for f in openbao.snap seal.json; do
-        thepost-restic dump --tag thepost-openbao "$s" "/run/thepost-backup-openbao/$f" >"$f"
+        /usr/local/sbin/thepost-restic dump --tag thepost-openbao "$s" "/run/thepost-backup-openbao/$f" >"$f"
       done
     executable: /bin/bash
   register: thepost_restore_openbao_fetch_restic

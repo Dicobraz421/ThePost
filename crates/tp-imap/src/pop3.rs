@@ -21,12 +21,14 @@ use base64::engine::general_purpose::STANDARD;
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinSet;
+use tp_contracts::audit::{AuditAction, MailboxAudit};
 use tp_contracts::auth::{Credentials, Principal};
 use tp_contracts::meta::{AccountScope, MessageQuery, SpecialUse};
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslStep};
-use tp_contracts::{Error, MessageId, Result};
+use tp_contracts::{Error, MailboxId, MessageId, Result};
 use tp_platform::{Conn, Listener};
 
+use crate::audit::Audit;
 use crate::session::{SessionCtx, Transport, io_error};
 
 /// Письмо ящика POP3.
@@ -69,6 +71,10 @@ impl Drop for MaildropLock {
 #[derive(Debug)]
 struct Maildrop {
     scope: AccountScope,
+    /// Вошедший субъект (аудит удаления).
+    principal: Principal,
+    /// «Входящие».
+    inbox: MailboxId,
     items: Vec<Item>,
     /// Блокировка ящика на время сессии.
     _lock: MaildropLock,
@@ -135,6 +141,7 @@ pub struct Pop3Session<T: Transport> {
     out: Vec<u8>,
     user: Option<String>,
     drop: Option<Maildrop>,
+    audit: Audit,
     errors: u32,
     auth_failures: u32,
     close: bool,
@@ -178,10 +185,17 @@ impl<T: Transport> Pop3Session<T> {
             out: Vec::new(),
             user: None,
             drop: None,
+            audit: Audit::default(),
             errors: 0,
             auth_failures: 0,
             close: false,
         }
+    }
+
+    /// Подключает журнал аудита доступа к ящику; `client` — адрес клиента для записей.
+    pub fn with_audit(mut self, log: Arc<dyn MailboxAudit>, client: Option<IpAddr>) -> Self {
+        self.audit = Audit::new(log, "pop3", client);
+        self
     }
 
     /// Ведёт сессию до `QUIT`, закрытия клиентом, таймаута или остановки узла.
@@ -552,6 +566,8 @@ impl<T: Transport> Pop3Session<T> {
         let n = items.len();
         self.drop = Some(Maildrop {
             scope,
+            principal: p,
+            inbox: inbox.id,
             items,
             _lock: lock,
         });
@@ -716,21 +732,51 @@ impl<T: Transport> Pop3Session<T> {
             self.reply(false, "[SYS/TEMP] Some messages were not deleted");
             return Ok(());
         }
+        if !ids.is_empty() {
+            self.audit
+                .record_done(
+                    &d.principal,
+                    d.scope,
+                    AuditAction::Delete,
+                    Some(d.inbox),
+                    &ids,
+                    None,
+                )
+                .await;
+        }
         self.reply(true, "Bye");
         Ok(())
     }
 }
 
 /// Сервер POP3 одного слушателя.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Pop3Server {
     ctx: Arc<SessionCtx>,
+    audit: Option<Arc<dyn MailboxAudit>>,
+}
+
+impl fmt::Debug for Pop3Server {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pop3Server")
+            .field("audit", &self.audit.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Pop3Server {
     /// Сервер с контекстом сессий (секция `imap.pop3`).
     pub fn new(ctx: SessionCtx) -> Self {
-        Self { ctx: Arc::new(ctx) }
+        Self {
+            ctx: Arc::new(ctx),
+            audit: None,
+        }
+    }
+
+    /// Подключает журнал аудита доступа к ящику для новых сессий.
+    pub fn with_audit(mut self, log: Arc<dyn MailboxAudit>) -> Self {
+        self.audit = Some(log);
+        self
     }
 
     /// Принимает соединения до остановки узла (POP3 выключен — сразу возвращает `Ok`), затем ждёт сессии
@@ -755,6 +801,7 @@ impl Pop3Server {
                     };
                     let full = sessions.len() >= self.ctx.config.pop3.max_connections;
                     let ctx = self.ctx.clone();
+                    let audit = self.audit.clone();
                     let task = async move {
                         let conn = match incoming.establish().await {
                             Ok(conn) => conn,
@@ -767,7 +814,12 @@ impl Pop3Server {
                             reject(conn).await;
                             return;
                         }
-                        if let Err(e) = Pop3Session::new(ctx, conn).run().await {
+                        let client = conn.info.client.ip();
+                        let mut session = Pop3Session::new(ctx, conn);
+                        if let Some(log) = audit {
+                            session = session.with_audit(log, Some(client));
+                        }
+                        if let Err(e) = session.run().await {
                             tracing::debug!(error = %e, "pop3: сессия прервана");
                         }
                     };

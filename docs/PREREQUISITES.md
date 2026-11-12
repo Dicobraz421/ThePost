@@ -174,7 +174,7 @@ PTR задаёт владелец адреса (провайдер, хостин
 |---|---|---|---|
 | Rspamd с Milter на `127.0.0.1:11332` (worker proxy); эталон — пакет `rspamd.com` (Ansible), образ `rspamd/rspamd:3.11.1` (Compose) | `ss -ltn \| grep 11332`, `systemctl is-active rspamd` | по умолчанию (`on_failure: accept`) письмо принимается без проверки с заголовком `X-ThePost-Milter: <имя>; unavailable`; `tempfail` — `451 4.7.1` | [роль `rspamd`](../deploy/ansible/roles/rspamd/defaults/main.yml), [`tp-smtp/src/config.rs`](../crates/tp-smtp/src/config.rs) |
 | По желанию — clamav-milter на `127.0.0.1:7357` (`thepost_clamav: true`), заражённое — `Reject`; RAM — +2 GB (S8) | `systemctl is-active clamav-milter` | без баз freshclam clamd не запускается: роль ждёт до 10 мин | [роль `clamav_milter`](../deploy/ansible/roles/clamav_milter/defaults/main.yml), [S8](spec/S8.md) |
-| Почту пользователей (submission) проверять — `thepost_milter_submission: true` | `config.yaml`: `smtp.milter.filters[].submission` | по умолчанию проверяется только входящая | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
+| Почту пользователей (submission и отправка JMAP) проверять — `thepost_milter_submission: true` | `config.yaml`: второй элемент `smtp.milter.filters[]` того же адреса с `direction: outbound` | по умолчанию проверяется только входящая; при недоступности фильтра исходящей почты — `451` (`on_failure: tempfail`) | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
 
 `doctor` доступность фильтров Milter не проверяет.
 
@@ -216,6 +216,46 @@ PTR задаёт владелец адреса (провайдер, хостин
 
 Учётные записи (источник — каталог), конфигурацию (система управления конфигурацией) и очередь SMTP (вместе с
 PostgreSQL) продукт отдельно не копирует ([S5 п. 5.3](spec/S5.md)).
+
+## Astra Linux SE и РЕД ОС: копии и антивирус
+
+Решения владельца 90–91. В репозиториях этих ОС нет части готовых средств, которыми эталон пользуется на Debian,
+Ubuntu и AlmaLinux. Эталон ставит только пакеты из репозиториев самой ОС, поэтому на Astra он работает и с включённой ЗПС
+для служебных средств (сам `thepost`, OpenBao и PGDG подписывает заказчик — см. «Известные тонкости»).
+
+| Что | Debian, Ubuntu, AlmaLinux | Astra Linux SE 1.8 | РЕД ОС 8 |
+|---|---|---|---|
+| Копия каталога писем | restic: снимки, шифрование | **rsync**: зеркало, **без шифрования** | restic (есть в репозитории) |
+| Антивирус | ClamAV по Milter (`thepost_clamav: true`) | **нет ClamAV** — свой антивирус по Milter | **нет ClamAV** — свой антивирус по Milter |
+
+**Копия писем на Astra (rsync).** Зеркало каталога `/var/lib/thepost/blob` пишется как есть, без шифрования
+(`thepost_backup_blob_tool: rsync` ставится сам). Поэтому защищать нужно само хранилище копий:
+
+1. Отдельный диск или сервер копий — не тот диск, где лежат письма.
+2. Диск копий зашифрован средствами ОС (LUKS / `cryptsetup`, на Astra — штатно), ключ — вне сервера писем.
+3. Доступ к каталогу копий — только у root и учётной записи копирования; по сети — только по SSH.
+4. Проверка: `ls -ld <каталог копий>` — права `drwx------`; `lsblk -f` — у диска копий `crypto_LUKS`.
+
+База (pgBackRest) и снимок OpenBao шифруются на всех ОС одинаково — ключ в OpenBao.
+
+**Антивирус на Astra и РЕД ОС.** Сервер проверяет письма любым антивирусом с интерфейсом Milter (Касперский и
+Dr.Web для почтовых серверов его поддерживают). Эталон ставит `thepost_clamav: false`; свой антивирус подключите так:
+
+1. Установите и настройте антивирус по его инструкции, включите в нём Milter (например, на `127.0.0.1:7358`).
+2. В инвентаре Ansible добавьте фильтр рядом с Rspamd (список фильтров заменяется целиком — Rspamd укажите тоже):
+
+   ```yaml
+   thepost_config_extra:
+     smtp:
+       milter:
+         filters:
+           - { name: rspamd, address: "{{ thepost_rspamd_milter_address }}", direction: inbound }
+           - { name: antivirus, address: "127.0.0.1:7358", direction: inbound }
+   ```
+3. Повторите `ansible-playbook … smb.yml`.
+4. Проверка: `sudo -u thepost thepost doctor` — фильтр `antivirus` доступен; тестовое письмо с EICAR отклоняется.
+
+Без антивируса почта работает, вложения проверяет только Rspamd (без сигнатур вирусов).
 
 ## Известные тонкости
 

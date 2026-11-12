@@ -2,10 +2,10 @@
 
 mod common;
 
-use sqlx::PgPool;
 use tp_contracts::ext::{Migration, Module, ModuleCtx, Registry};
 use tp_contracts::{Error, Result};
 use tp_meta::modules::{applied_version, drop_module, migrate_module};
+use tp_meta::pool::DbPool;
 use uuid::Uuid;
 
 struct TestModule {
@@ -55,21 +55,21 @@ fn name() -> String {
     format!("t{}", &Uuid::now_v7().simple().to_string()[..20])
 }
 
-async fn exists(pool: &PgPool, relation: String) -> bool {
+async fn exists(pool: &DbPool, relation: String) -> bool {
     sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind(relation)
-        .fetch_one(pool)
+        .fetch_one(&mut *common::conn(pool).await)
         .await
         .expect("to_regclass")
 }
 
 /// Состояние схемы ядра: миграции и таблицы `public`.
-async fn core_state(pool: &PgPool) -> (i64, i64) {
+async fn core_state(pool: &DbPool) -> (i64, i64) {
     sqlx::query_as(
         "SELECT (SELECT count(*) FROM _sqlx_migrations),
                 (SELECT count(*) FROM pg_tables WHERE schemaname = 'public')",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *common::conn(pool).await)
     .await
     .expect("core")
 }

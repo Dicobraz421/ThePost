@@ -31,6 +31,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tp_contracts::admin_audit::AdminAuditRecord;
 use tp_contracts::admin_token::{
     LOCAL_ADMIN_TOKEN_PREFIX, LocalAdminToken, LocalAdminTokens, is_local_admin_token,
 };
@@ -41,7 +42,6 @@ use tp_contracts::transport::{AcceptedDomain, DomainKind};
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::audit::AuditRecord;
 use crate::server::{Admin, AdminRole, ApiError, Caller, Problem};
 
 /// Маршрут обмена локального токена на сессию.
@@ -381,7 +381,7 @@ impl Admin {
 
     async fn audit_local(&self, actor: AccountId, login: &str, path: &str, status: u16) {
         let tenant = TenantId::DEFAULT;
-        let record = AuditRecord {
+        let record = AdminAuditRecord {
             at: OffsetDateTime::now_utc(),
             tenant: Some(tenant),
             actor_tenant: tenant,
@@ -394,7 +394,7 @@ impl Admin {
             status,
             content_messages: None,
         };
-        if let Err(e) = self.d.audit.record(&record).await {
+        if let Err(e) = crate::audit::record(&self.d, &record).await {
             tracing::error!(error = %e, route = INIT_ROUTE, "admin: запись аудита не сохранена");
         }
     }
@@ -595,13 +595,13 @@ async fn exchange(State(a): State<Arc<Admin>>, headers: HeaderMap) -> Response {
         Ok(s) => (
             s.account.parse().unwrap_or_else(|_| nobody()),
             s.login.clone(),
-            s.roles.clone(),
+            s.roles.iter().map(|r| r.as_str().to_owned()).collect(),
             201,
         ),
         Err(e) if e.is_retryable() => (nobody(), String::new(), Vec::new(), 503),
         Err(_) => (nobody(), String::new(), Vec::new(), 401),
     };
-    let record = AuditRecord {
+    let record = AdminAuditRecord {
         at: now,
         tenant: Some(TenantId::DEFAULT),
         actor_tenant: TenantId::DEFAULT,
@@ -614,7 +614,7 @@ async fn exchange(State(a): State<Arc<Admin>>, headers: HeaderMap) -> Response {
         status,
         content_messages: None,
     };
-    if let Err(e) = a.d.audit.record(&record).await {
+    if let Err(e) = crate::audit::record(&a.d, &record).await {
         tracing::error!(error = %e, route = SESSION_ROUTE, "admin: запись аудита не сохранена");
     }
     match r {

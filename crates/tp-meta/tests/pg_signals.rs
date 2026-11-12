@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use sqlx::PgPool;
 use tp_contracts::abuse::BlockSubject;
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::events::{Partition, partition_of};
@@ -17,6 +16,7 @@ use tp_contracts::membership::{Membership, NodeId, NodeInfo};
 use tp_contracts::meta::{AccountScope, MailboxStore, NewMailbox};
 use tp_contracts::{AccountId, Error, TenantId};
 use tp_meta::failover::{FailoverConfig, connect_failover};
+use tp_meta::pool::{DbPool, NoAcquireObserver};
 use tp_meta::signals::{PgSignalBus, SignalsConfig, Subscription, connect_listener};
 use tp_meta::{MetaConfig, PgMeta};
 use uuid::Uuid;
@@ -24,7 +24,7 @@ use uuid::Uuid;
 const WAIT: Duration = Duration::from_secs(10);
 
 /// Шина над тестовой БД с отдельным каналом (тесты не видят сигналов друг друга).
-async fn bus(cfg: SignalsConfig) -> Option<(PgSignalBus, String, PgPool)> {
+async fn bus(cfg: SignalsConfig) -> Option<(PgSignalBus, String, DbPool)> {
     let url = common::pg_url()?;
     let mut pool_cfg = common::dev_pool_config(&url);
     let app = format!("tp_sig_{}", Uuid::now_v7().simple());
@@ -35,11 +35,11 @@ async fn bus(cfg: SignalsConfig) -> Option<(PgSignalBus, String, PgPool)> {
         retry_for: Duration::from_secs(10),
         probe_timeout: Duration::from_secs(2),
     };
-    let publish = connect_failover(&pool_cfg, common::secrets())
+    let publish = connect_failover(&pool_cfg, common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("connect_failover");
     let admin = publish.pool().clone();
-    let listen = connect_listener(&pool_cfg, common::secrets())
+    let listen = connect_listener(&pool_cfg, common::secrets(), Arc::new(NoAcquireObserver))
         .await
         .expect("connect_listener");
     let cfg = SignalsConfig {
@@ -276,7 +276,7 @@ async fn reconnect_gives_resync() {
          WHERE application_name = $1 AND query LIKE 'LISTEN %'",
     )
     .bind(&listener_app)
-    .fetch_all(&admin)
+    .fetch_all(&mut *common::conn(&admin).await)
     .await
     .expect("terminate");
     assert_eq!(killed, vec![true], "одно соединение слушателя");
@@ -358,7 +358,7 @@ async fn listener_bypasses_pgbouncer() {
     let mut cfg = common::dev_pool_config(&url);
     cfg.pgbouncer = true;
     assert!(matches!(
-        connect_listener(&cfg, common::secrets()).await,
+        connect_listener(&cfg, common::secrets(), Arc::new(NoAcquireObserver)).await,
         Err(Error::Invalid(_))
     ));
 }

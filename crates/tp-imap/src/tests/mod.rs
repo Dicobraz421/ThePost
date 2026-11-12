@@ -18,13 +18,15 @@ use tp_mailstore::Store;
 use tp_testkit::SearchDoc;
 use tp_testkit::{
     Clock, FakeAuthenticator, FakeSasl, FakeSearch, MemBlobIndex, MemBlobStore, MemEventBus,
-    MemMetadata, MemPolicies, MemQuota, MemTrash, RecordingDecisionHook, SystemClock,
+    MemMailboxAudit, MemMetadata, MemPolicies, MemQuota, MemTrash, RecordingDecisionHook,
+    SystemClock,
 };
 
 use crate::config::ImapConfig;
 use crate::ext::Extensions;
 use crate::session::{Deps, Session, SessionCtx, Transport};
 
+mod audit;
 mod compress;
 mod ext;
 mod fetch;
@@ -39,6 +41,9 @@ mod write;
 
 pub(crate) const LOGIN: &str = "user@example.org";
 pub(crate) const PASSWORD: &str = "secret";
+/// Адрес клиента в записях аудита.
+pub(crate) const CLIENT_IP: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
 
 /// Адрес клиента соединений стенда.
 pub(crate) const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7));
@@ -84,6 +89,8 @@ pub(crate) struct Env {
     pub policies: MemPolicies,
     /// Точка принятия решений хранилища и сессии (Legal Hold, доставка).
     pub hook: RecordingDecisionHook,
+    /// Журнал аудита ящиков: подключён к сессиям [`Env::client_ext`] (клиент [`CLIENT_IP`]).
+    pub audit: MemMailboxAudit,
     pub principal: Principal,
     pub config: ImapConfig,
     pub shutdown: CancellationToken,
@@ -144,6 +151,7 @@ impl Env {
             trash,
             policies,
             hook,
+            audit: MemMailboxAudit::new(),
             principal,
             config: ImapConfig::default(),
             shutdown: CancellationToken::new(),
@@ -183,13 +191,21 @@ impl Env {
 
     /// Клиент новой сессии с зависимостями расширений.
     pub async fn client_ext(&self, tls: bool, ext: Extensions) -> Client {
-        Self::client_ctx(self.ctx(), tls, ext).await
+        let (server, client) = tokio::io::duplex(1 << 20);
+        let session = Session::new(self.ctx(), TestConn { io: server, tls })
+            .with_extensions(ext)
+            .with_audit(Arc::new(self.audit.clone()), Some(CLIENT_IP));
+        Self::spawn(session, client).await
     }
 
-    /// Клиент новой сессии над заданным контекстом (например, с другой шиной).
+    /// Клиент новой сессии над заданным контекстом (например, с другой шиной), без аудита.
     pub async fn client_ctx(ctx: Arc<SessionCtx>, tls: bool, ext: Extensions) -> Client {
         let (server, client) = tokio::io::duplex(1 << 20);
         let session = Session::new(ctx, TestConn { io: server, tls }).with_extensions(ext);
+        Self::spawn(session, client).await
+    }
+
+    async fn spawn(session: Session<TestConn>, client: DuplexStream) -> Client {
         let task = tokio::spawn(session.run());
         let mut c = Client {
             io: BufReader::new(client),

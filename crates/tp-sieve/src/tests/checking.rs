@@ -3,10 +3,10 @@
 
 use super::assert_error;
 use crate::compile::{Cmd, Comparator, MatchKind, Part, Rel, Test, decode_encoded};
-use crate::{EXTENSIONS, Program, check};
+use crate::{EXTENSIONS, Limits, Program, compile};
 
 fn ok(text: &str) -> Program {
-    match check(text) {
+    match compile(text.as_bytes(), &Limits::default()) {
         Ok(p) => p,
         Err(d) => panic!(
             "{text}\n{}",
@@ -379,7 +379,7 @@ elsif true { keep; }
 if size :over :under 2M { stop; }
 frobnicate;
 ";
-    let diags = check(text).expect_err("ошибки");
+    let diags = compile(text.as_bytes(), &Limits::default()).expect_err("ошибки");
     let text = diags
         .iter()
         .map(ToString::to_string)

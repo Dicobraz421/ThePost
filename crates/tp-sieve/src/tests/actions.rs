@@ -7,10 +7,10 @@ use tp_testkit::corpus::corpus_mail;
 
 use super::mailboxes;
 use crate::outcome::{mailbox_paths, merge};
-use crate::{Context, Limits, check, run};
+use crate::{Context, Limits, compile, run};
 
 fn outcome(script: &str, list: &[Mailbox], limits: &Limits) -> RulesOutcome {
-    let program = match check(script) {
+    let program = match compile(script.as_bytes(), &Limits::default()) {
         Ok(p) => p,
         Err(d) => panic!("{script}: {d:?}"),
     };

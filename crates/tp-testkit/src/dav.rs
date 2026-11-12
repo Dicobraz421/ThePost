@@ -922,9 +922,21 @@ impl FreeBusy for MemDav {
                     acc.collections
                         .values()
                         .filter(|c| c.meta.kind == CollectionKind::Calendar && !c.meta.transparent)
-                        .flat_map(|c| c.objects.values())
-                        .flat_map(|o| o.index.busy.iter())
-                        .filter_map(|p| p.clip(&range))
+                        .flat_map(|c| c.objects.values().map(move |o| (c, o)))
+                        .flat_map(|(c, o)| {
+                            if o.index.recurring {
+                                // Повторы разворачиваются при запросе (META-54).
+                                crate::busy::expand(
+                                    &o.body,
+                                    c.meta.timezone.as_deref(),
+                                    &range,
+                                    self.limits.max_busy_instances,
+                                )
+                                .unwrap_or_default()
+                            } else {
+                                o.index.busy.iter().filter_map(|p| p.clip(&range)).collect()
+                            }
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -994,6 +1006,12 @@ mod tests {
     async fn suite_freebusy() {
         let store = MemDav::new().with_limits(suite::dav::LIMITS);
         suite::freebusy(&store, &store, &suite::dav::DavFixture::new()).await;
+    }
+
+    #[tokio::test]
+    async fn suite_freebusy_recurring() {
+        let store = MemDav::new().with_limits(suite::dav::LIMITS);
+        suite::freebusy_recurring(&store, &store, &suite::dav::DavFixture::new()).await;
     }
 
     #[tokio::test]

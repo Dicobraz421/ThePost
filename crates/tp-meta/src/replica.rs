@@ -12,7 +12,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use sqlx::PgPool;
+use crate::pool::DbPool;
 
 /// Срок действия проверки отставания.
 pub const CHECK_EVERY: Duration = Duration::from_secs(1);
@@ -25,14 +25,14 @@ pub fn fresh_enough(lag: Option<Duration>, max: Duration) -> bool {
 /// Пул реплики с проверкой отставания.
 #[derive(Debug)]
 pub struct Replica {
-    pool: PgPool,
+    pool: DbPool,
     max_lag: Duration,
     checked: Mutex<Option<(Instant, bool)>>,
 }
 
 impl Replica {
     /// Реплика `pool` с порогом отставания `max_lag`.
-    pub fn new(pool: PgPool, max_lag: Duration) -> Self {
+    pub fn new(pool: DbPool, max_lag: Duration) -> Self {
         Self {
             pool,
             max_lag,
@@ -41,18 +41,19 @@ impl Replica {
     }
 
     /// Пул реплики.
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &DbPool {
         &self.pool
     }
 
     /// Отставание реплики; `None` — неизвестно (ничего не воспроизведено). Ошибка — реплика недоступна.
     pub async fn lag(&self) -> sqlx::Result<Option<Duration>> {
+        let mut conn = self.pool.acquire_sqlx().await?;
         let secs: Option<f64> = sqlx::query_scalar(
             "SELECT CASE WHEN pg_is_in_recovery()
                          THEN extract(epoch FROM now() - pg_last_xact_replay_timestamp())::float8
                          ELSE 0 END",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await?;
         Ok(secs.map(|s| Duration::from_secs_f64(s.max(0.0))))
     }

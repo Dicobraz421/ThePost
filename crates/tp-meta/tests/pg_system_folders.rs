@@ -3,7 +3,6 @@
 
 mod common;
 
-use sqlx::PgPool;
 use tp_contracts::meta::{
     AccountKind, AccountScope, AccountStore, AccountUpsert, ChangeLog, MailboxStore, SpecialUse,
 };
@@ -32,7 +31,7 @@ async fn roles(meta: &PgMeta, scope: AccountScope) -> Vec<SpecialUse> {
 
 /// Учётная запись, заведённая напрямую в базе (без папок), и, по выбору, папки `folders` (имя, роль).
 async fn raw_account(
-    pool: &PgPool,
+    pool: &tp_meta::pool::DbPool,
     tenant: TenantId,
     domain: DomainId,
     login: &str,

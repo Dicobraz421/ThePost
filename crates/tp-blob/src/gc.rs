@@ -1,22 +1,30 @@
-//! GC объектов BLOB (SRS 3.4, 3.5): записи без ссылок старше окна W удаляются из хранилища.
+//! GC объектов BLOB (SRS 3.4, 3.5, 3.6): записи без ссылок старше окна W удаляются из хранилища.
 //!
-//! Проход: [`BlobIndex::gc_candidates`] пакетами → [`BlobIndex::mark_deleting`] (условие `refcnt = 0`
-//! и окно W проверяются одной транзакцией) → [`BlobStore::delete`] → [`BlobIndex::finalize_delete`].
+//! Проход: [`BlobIndex::prune_uploads`] (истёкшие отметки загрузок) → [`BlobIndex::gc_candidates`] пакетами →
+//! [`BlobIndex::mark_deleting`] (условие `refcnt = 0` и окно W проверяются одной транзакцией) →
+//! [`BlobStore::delete`] → [`BlobIndex::finalize_delete`].
 //! Окно W не меньше глубины самой старой точки восстановления (инвариант W). Работает один узел —
 //! держатель лизы лидера; лиза продлевается между пакетами, потеря лизы прекращает проход.
 //! Сбой удаления оставляет запись `deleting` — следующий проход повторит её.
 //!
+//! Шарды (SRS 3.6, решение 2026-11-01-scale-shards-geo-admin): учёт ссылок ведётся на каждом шарде, объект
+//! удаляется, только когда на него не ссылается ни один шард справочника. Проверку выполняет учёт: операции GC
+//! контракта [`BlobIndex`] работают по всем шардам справочника (`tp-meta`: пометка `deleting` под блокировкой
+//! строки каждого шарда, надгробие шарду без строки). Воркеру передаётся учёт всех шардов, а не одного; отказ
+//! `mark_deleting` — запрет удаления (ссылки на этом или другом шарде, окно W шарда не истекло). Проход
+//! не полагается на свойства учёта одного шарда: пакет короче предела не означает конец кандидатов (учёт
+//! отбрасывает занятые другим шардом), а кандидат с запретом может вернуться в следующем пакете — он
+//! запоминается на проход и повторно не проверяется.
+//!
 //! Воркер ([`GcWorker::run`]) не делает периодических проходов (SRS 2.8, таймер 4): один таймер на ближайший
-//! срок окончания отсрочки — `zero_since + W` самой ранней записи без ссылок. Контракт учёта сроков
-//! не отдаёт, поэтому срок находится делением пополам по [`BlobIndex::gc_candidates`] с пределом 1
-//! (запрос по индексу `zero_since`) с точностью [`GcConfig::precision`]; таймер взводится на верхнюю
-//! границу — объект удаляется не раньше срока и не позже чем через `precision` после него.
+//! срок окончания отсрочки — [`BlobIndex::next_gc_due`] (`zero_since + W` самой ранней записи без ссылок).
 //! Ожидание не дольше `min(max_wait, window)`: по его истечении срок сверяется заново (без прохода).
 //! Ссылки, обнулённые после взвода, дают срок не раньше `now + W`, то есть не раньше взведённого таймера, —
 //! поэтому обнуление на любом узле без сигнала не опаздывает; сигнал [`GcWorker::wake`] после фиксации
 //! обнуления в этом процессе перевзводит таймер сразу. Просроченное после прохода или ошибки — повтор
 //! не раньше [`GcConfig::retry`] (таймер 2), лиза у другого узла — не раньше [`GcConfig::lease_ttl`] (таймер 1).
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,10 +34,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tokio::sync::Notify;
-use tp_contracts::Result;
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::config::duration;
 use tp_contracts::lease::{Lease, LeaseStore};
+use tp_contracts::{BlobKey, Result};
 
 use crate::worker::{
     Leader, LeasedPass, Now, Pacer, Schedule, Sleep, Tick, after, before, keep, release,
@@ -43,7 +51,6 @@ use crate::worker::{
 /// batch: 1000
 /// max_deletes_per_sec: 200
 /// max_wait: 1h
-/// precision: 1m
 /// retry: 5m
 /// lease_name: blob-gc
 /// lease_ttl: 2m
@@ -56,7 +63,7 @@ pub struct GcConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub window: Duration,
-    /// Размер пакета кандидатов.
+    /// Размер пакета кандидатов и истёкших отметок загрузок.
     pub batch: usize,
     /// Предел удалений в секунду; 0 — без ограничения.
     pub max_deletes_per_sec: u32,
@@ -64,11 +71,6 @@ pub struct GcConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub max_wait: Duration,
-    /// Точность поиска ближайшего срока: удаление не позже чем через столько после срока.
-    /// Меньше — точнее, но больше запросов к учёту на один взвод (log2(max_wait / precision)).
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub precision: Duration,
     /// Пауза перед повтором после ошибки или если кандидаты остались после прохода.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -88,7 +90,6 @@ impl Default for GcConfig {
             batch: 1000,
             max_deletes_per_sec: 200,
             max_wait: Duration::from_secs(3600),
-            precision: Duration::from_secs(60),
             retry: Duration::from_secs(300),
             lease_name: "blob-gc".to_owned(),
             lease_ttl: Duration::from_secs(120),
@@ -99,11 +100,13 @@ impl Default for GcConfig {
 /// Итог одного прохода.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcPass {
+    /// Удалено истёкших отметок загрузок.
+    pub uploads_pruned: u64,
     /// Получено кандидатов.
     pub candidates: u64,
     /// Удалено объектов (запись заменена надгробием или уже другого поколения).
     pub deleted: u64,
-    /// Кандидатов, которых удалять нельзя: ссылки вернулись или поколение сменилось.
+    /// Кандидатов, которых удалять нельзя: ссылки вернулись (на любом шарде) или поколение сменилось.
     pub skipped: u64,
     /// Удалённых объектов, чью запись `finalize_delete` не заменил: запись уже другого поколения.
     pub conflicts: u64,
@@ -116,6 +119,8 @@ pub struct GcPass {
 pub struct GcMetrics {
     /// Завершённых проходов.
     pub passes: u64,
+    /// Удалённых истёкших отметок загрузок.
+    pub uploads_pruned: u64,
     /// Кандидатов.
     pub candidates: u64,
     /// Удалённых объектов.
@@ -133,6 +138,7 @@ pub struct GcMetrics {
 #[derive(Debug, Default)]
 struct Counters {
     passes: AtomicU64,
+    uploads_pruned: AtomicU64,
     candidates: AtomicU64,
     deleted: AtomicU64,
     skipped: AtomicU64,
@@ -167,6 +173,8 @@ impl std::fmt::Debug for GcWorker {
 
 impl GcWorker {
     /// Воркер поверх учёта `index` и хранилища `store`; `now` — часы UTC ([`crate::system_now`]).
+    /// `index` — учёт всех шардов справочника (SRS 3.6): учёт одного шарда удалил бы объект,
+    /// на который ссылается другой.
     pub fn new(
         index: Arc<dyn BlobIndex>,
         store: Arc<dyn BlobStore>,
@@ -205,6 +213,7 @@ impl GcWorker {
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
         GcMetrics {
             passes: get(&c.passes),
+            uploads_pruned: get(&c.uploads_pruned),
             candidates: get(&c.candidates),
             deleted: get(&c.deleted),
             skipped: get(&c.skipped),
@@ -274,36 +283,18 @@ impl GcWorker {
     }
 
     /// Ближайший срок удаления, если он не позже `cap`; просроченные кандидаты — срок `now`.
-    /// Срок записи — `zero_since + W`: при `zero_since < t` проход в момент `t + W` её удаляет.
+    /// Срок записи по учёту — `zero_since + W`, но условие удаления строгое (`zero_since < now − W`):
+    /// проход должен быть позже срока, поэтому таймер — на микросекунду (разрешение времени учёта) после него.
     async fn next_due(
         &self,
         now: OffsetDateTime,
         cap: OffsetDateTime,
     ) -> Result<Option<OffsetDateTime>> {
-        let w = self.cfg.window;
-        let any = |t: OffsetDateTime| async move {
-            Ok::<_, tp_contracts::Error>(!self.index.gc_candidates(t, 1).await?.is_empty())
-        };
-        let mut lo = before(now, w);
-        if any(lo).await? {
-            return Ok(Some(now));
-        }
-        let mut hi = before(cap, w);
-        if hi <= lo || !any(hi).await? {
-            return Ok(None);
-        }
-        // Нет записей с `zero_since < lo`, есть с `zero_since < hi`.
-        let step = time::Duration::try_from(self.cfg.precision.max(Duration::from_millis(1)))
-            .unwrap_or(time::Duration::SECOND);
-        while hi - lo > step {
-            let mid = lo + (hi - lo) / 2;
-            if any(mid).await? {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        Ok(Some(after(hi, w)))
+        let due = self.index.next_gc_due(self.cfg.window).await?;
+        Ok(due
+            .map(|d| after(d, Duration::from_micros(1)))
+            .filter(|d| *d <= cap)
+            .map(|d| d.max(now)))
     }
 
     async fn pass(&self, mut leader: Option<&mut Leader<'_>>) -> Result<GcPass> {
@@ -315,6 +306,7 @@ impl GcWorker {
                     inc(&self.counters.lease_lost);
                 }
                 tracing::info!(
+                    uploads_pruned = p.uploads_pruned,
                     candidates = p.candidates,
                     deleted = p.deleted,
                     skipped = p.skipped,
@@ -331,18 +323,40 @@ impl GcWorker {
     }
 
     async fn pass_inner(&self, leader: &mut Option<&mut Leader<'_>>) -> Result<GcPass> {
+        let now = (self.now)();
         // Граница окна фиксируется на проход: кандидаты и `mark_deleting` проверяют одно условие.
-        let older_than = before((self.now)(), self.cfg.window);
+        let older_than = before(now, self.cfg.window);
         let batch = self.cfg.batch.max(1);
         let mut pacer = Pacer::new(self.cfg.max_deletes_per_sec);
         let mut pass = GcPass::default();
+        // Отметки загрузок, срок которых истёк (контракт: очищает GC в каждом проходе).
+        loop {
+            let pruned = self.index.prune_uploads(now, batch).await?;
+            pass.uploads_pruned += pruned as u64;
+            self.counters
+                .uploads_pruned
+                .fetch_add(pruned as u64, Ordering::Relaxed);
+            if pruned < batch {
+                break;
+            }
+            if !keep(leader).await? {
+                pass.lease_lost = true;
+                return Ok(pass);
+            }
+        }
+        // Кандидаты, удаление которых учёт запретил в этом проходе (ссылки на любом шарде).
+        let mut vetoed: HashSet<BlobKey> = HashSet::new();
         loop {
             let keys = self.index.gc_candidates(older_than, batch).await?;
-            pass.candidates += keys.len() as u64;
             let mut progress = false;
             for key in &keys {
+                if vetoed.contains(key) {
+                    continue;
+                }
+                pass.candidates += 1;
                 inc(&self.counters.candidates);
                 if !self.index.mark_deleting(key, older_than).await? {
+                    vetoed.insert(*key);
                     pass.skipped += 1;
                     inc(&self.counters.skipped);
                     progress = true;
@@ -360,9 +374,10 @@ impl GcWorker {
                 pass.deleted += 1;
                 inc(&self.counters.deleted);
             }
-            // Неполный пакет — кандидаты кончились. Пакет без продвижения (ни одна запись не заменена
-            // надгробием и не пропущена) — защита от зацикливания на одних и тех же кандидатах.
-            if keys.len() < batch || !progress {
+            // Конец — пустой пакет: неполный пакет концом не считается (учёт всех шардов отбрасывает кандидатов,
+            // занятых другим шардом, уже после выборки). Пакет без продвижения (только уже запрещённые
+            // кандидаты или незаменённые записи) — защита от зацикливания на одних и тех же кандидатах.
+            if !progress {
                 break;
             }
             if !keep(leader).await? {
@@ -385,9 +400,10 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use time::OffsetDateTime;
-    use tp_contracts::blob::Acquire;
-    use tp_contracts::{BlobKey, Error, Gen, TenantId};
-    use tp_testkit::blob::{BlobOp, BlobState, MemBlobIndex, MemBlobStore};
+    use tp_contracts::blob::{Acquire, Commit};
+    use tp_contracts::meta::AccountScope;
+    use tp_contracts::{AccountId, BlobHash, Error, Gen, TenantId};
+    use tp_testkit::blob::{BlobOp, BlobRow, BlobState, MemBlobIndex, MemBlobStore};
     use tp_testkit::{Clock, ManualClock, MemLease};
 
     use crate::writer::{BlobWriter, WriterConfig};
@@ -644,6 +660,301 @@ mod tests {
         assert_eq!(leases.holder("blob-gc"), None);
     }
 
+    #[tokio::test]
+    async fn expired_upload_marks_pruned() {
+        let e = env(GcConfig {
+            batch: 2,
+            ..GcConfig::default()
+        });
+        let scope = AccountScope {
+            tenant: T,
+            account: AccountId::new(),
+        };
+        let now = e.clock.now();
+        let mut keys = Vec::new();
+        for (body, ttl) in [("u1", 10), ("u2", 10), ("u3", 10), ("u4", 1000)] {
+            let key = put(&e, body, 1).await;
+            e.index
+                .mark_upload(scope, &key, now + secs(ttl))
+                .await
+                .expect("вызов");
+            keys.push(key);
+        }
+        e.clock.advance(Duration::from_secs(11));
+        // Истёкших больше пакета — удаляются все; действующая отметка остаётся.
+        let pass = e.gc.run_once().await.expect("вызов");
+        assert_eq!((pass.uploads_pruned, pass.candidates), (3, 0));
+        assert_eq!(e.gc.metrics().uploads_pruned, 3);
+        let now = e.clock.now();
+        assert!(
+            e.index
+                .upload_owned(scope, &keys[3], now)
+                .await
+                .expect("вызов")
+        );
+        assert_eq!(e.gc.run_once().await.expect("вызов").uploads_pruned, 0);
+    }
+
+    /// Учёт двух шардов в памяти по контракту [`BlobIndex`] для хранилища с шардами (как `tp-meta` со
+    /// справочником): запись и снятие ссылок — на первом шарде, операции GC — по всем шардам.
+    /// `filter` — `gc_candidates` отбрасывает кандидатов, занятых другим шардом (как `tp-meta`);
+    /// без него запрет виден только в `mark_deleting`.
+    #[derive(Debug)]
+    struct Shards {
+        shards: Vec<MemBlobIndex>,
+        filter: bool,
+    }
+
+    impl Shards {
+        /// Удалять нельзя: на каком-то шарде на объект есть ссылки или окно W ещё не истекло.
+        fn busy(&self, key: &BlobKey, older_than: OffsetDateTime) -> bool {
+            self.shards.iter().any(|s| {
+                s.row(key.tenant, &key.hash).is_some_and(|r| {
+                    r.generation == key.generation
+                        && r.state == BlobState::Live
+                        && (r.refcnt > 0 || r.zero_since.is_none_or(|z| z >= older_than))
+                })
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobIndex for Shards {
+        async fn acquire(
+            &self,
+            tenant: TenantId,
+            owner: Option<AccountId>,
+            hash: &BlobHash,
+            refs: u32,
+        ) -> Result<Acquire> {
+            self.shards[0].acquire(tenant, owner, hash, refs).await
+        }
+
+        async fn commit_new(
+            &self,
+            tenant: TenantId,
+            hash: &BlobHash,
+            generation: Gen,
+            size: u64,
+            refs: u32,
+        ) -> Result<Commit> {
+            self.shards[0]
+                .commit_new(tenant, hash, generation, size, refs)
+                .await
+        }
+
+        async fn release(
+            &self,
+            tenant: TenantId,
+            hash: &BlobHash,
+            generation: Gen,
+            refs: u32,
+        ) -> Result<()> {
+            self.shards[0].release(tenant, hash, generation, refs).await
+        }
+
+        async fn gc_candidates(
+            &self,
+            older_than: OffsetDateTime,
+            limit: usize,
+        ) -> Result<Vec<BlobKey>> {
+            let mut keys: Vec<BlobKey> = Vec::new();
+            for s in &self.shards {
+                for k in s.gc_candidates(older_than, limit).await? {
+                    if !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
+            }
+            if self.filter {
+                keys.retain(|k| !self.busy(k, older_than));
+            }
+            keys.truncate(limit);
+            Ok(keys)
+        }
+
+        async fn mark_deleting(&self, key: &BlobKey, older_than: OffsetDateTime) -> Result<bool> {
+            if self.busy(key, older_than) {
+                return Ok(false);
+            }
+            let mut marked = false;
+            for s in &self.shards {
+                marked |= s.mark_deleting(key, older_than).await?;
+            }
+            Ok(marked)
+        }
+
+        async fn finalize_delete(&self, key: &BlobKey) -> Result<bool> {
+            let mut done = false;
+            for s in &self.shards {
+                done |= s.finalize_delete(key).await?;
+            }
+            Ok(done)
+        }
+
+        async fn exists(&self, key: &BlobKey) -> Result<bool> {
+            for s in &self.shards {
+                if s.exists(key).await? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    /// Два шарда учёта над одним хранилищем: писатель — через первый шард, GC — по обоим.
+    struct TwoShards {
+        clock: ManualClock,
+        store: MemBlobStore,
+        index: [MemBlobIndex; 2],
+        writer: BlobWriter,
+        gc: GcWorker,
+    }
+
+    fn two_shards(filter: bool, batch: usize) -> TwoShards {
+        let clock = ManualClock::new(OffsetDateTime::UNIX_EPOCH + time::Duration::days(1000));
+        let store = MemBlobStore::new(clock.shared());
+        let index = [
+            MemBlobIndex::new(clock.shared()),
+            MemBlobIndex::new(clock.shared()),
+        ];
+        let writer = BlobWriter::new(
+            Arc::new(index[0].clone()),
+            Arc::new(store.clone()),
+            WriterConfig::default(),
+        );
+        let c = clock.clone();
+        let gc = GcWorker::new(
+            Arc::new(Shards {
+                shards: index.to_vec(),
+                filter,
+            }),
+            Arc::new(store.clone()),
+            GcConfig {
+                window: Duration::from_secs(W),
+                max_deletes_per_sec: 0,
+                batch,
+                ..GcConfig::default()
+            },
+            Arc::new(move || c.now()),
+        );
+        TwoShards {
+            clock,
+            store,
+            index,
+            writer,
+            gc,
+        }
+    }
+
+    impl TwoShards {
+        /// Объект с одной ссылкой на первом шарде.
+        async fn put(&self, body: &'static str) -> BlobKey {
+            self.writer
+                .write(T, Bytes::from_static(body.as_bytes()), 1)
+                .await
+                .expect("вызов")
+        }
+
+        /// Ссылка второго шарда на тот же объект (письмо с ним в ящике этого шарда).
+        async fn refer(&self, key: &BlobKey) {
+            let size = self.row(0, key).size;
+            assert_eq!(
+                self.index[1]
+                    .commit_new(T, &key.hash, key.generation, size, 1)
+                    .await
+                    .expect("вызов"),
+                Commit::Done {
+                    generation: key.generation
+                }
+            );
+        }
+
+        async fn release(&self, shard: usize, key: &BlobKey) {
+            self.index[shard]
+                .release(T, &key.hash, key.generation, 1)
+                .await
+                .expect("вызов");
+        }
+
+        fn row(&self, shard: usize, key: &BlobKey) -> BlobRow {
+            self.index[shard].row(T, &key.hash).expect("значение")
+        }
+
+        /// Объект, на который ссылались оба шарда; ссылка первого снята, окно W истекло.
+        async fn shared_released_on_first(&self) -> BlobKey {
+            let key = self.put("shared").await;
+            self.refer(&key).await;
+            self.release(0, &key).await;
+            self.clock.advance(Duration::from_secs(W + 1));
+            key
+        }
+    }
+
+    /// SRS 3.6: объект со ссылкой на одном шарде не удаляется, пока ссылку не снимут все шарды.
+    #[tokio::test]
+    async fn object_referenced_on_other_shard_stays() {
+        let e = two_shards(true, 1000);
+        let key = e.shared_released_on_first().await;
+
+        let pass = e.gc.run_once().await.expect("вызов");
+        assert_eq!(pass.deleted, 0);
+        assert!(e.store.contains(&key));
+        assert_eq!(e.row(0, &key).state, BlobState::Live);
+        assert_eq!(
+            (e.row(1, &key).state, e.row(1, &key).refcnt),
+            (BlobState::Live, 1)
+        );
+
+        // Ссылку снял и второй шард: удаление — после окна W от этого момента.
+        e.release(1, &key).await;
+        e.clock.advance(Duration::from_secs(W - 1));
+        assert_eq!(e.gc.run_once().await.expect("вызов").deleted, 0);
+        assert!(e.store.contains(&key));
+        e.clock.advance(Duration::from_secs(2));
+        assert_eq!(e.gc.run_once().await.expect("вызов").deleted, 1);
+        assert!(!e.store.contains(&key));
+        assert_eq!(e.row(0, &key).state, BlobState::Deleted);
+        assert_eq!(e.row(1, &key).state, BlobState::Deleted);
+    }
+
+    /// Учёт выдаёт кандидата, занятого другим шардом, в каждом пакете: запрет `mark_deleting` запоминается
+    /// на проход — объект цел, проход завершается.
+    #[tokio::test]
+    async fn vetoed_candidate_checked_once_per_pass() {
+        let e = two_shards(false, 1);
+        let key = e.shared_released_on_first().await;
+
+        let pass = e.gc.run_once().await.expect("вызов");
+        assert_eq!((pass.candidates, pass.skipped, pass.deleted), (1, 1, 0));
+        assert!(e.store.contains(&key));
+        assert_eq!(e.row(0, &key).state, BlobState::Live);
+        assert_eq!(e.row(1, &key).refcnt, 1);
+    }
+
+    /// Учёт отбрасывает занятого другим шардом кандидата уже после выборки — пакет короче предела;
+    /// остальные кандидаты удаляются в этом же проходе.
+    #[tokio::test]
+    async fn short_batch_is_not_the_end() {
+        let e = two_shards(true, 2);
+        let shared = e.put("shared").await;
+        e.refer(&shared).await;
+        e.release(0, &shared).await;
+        let mut free = Vec::new();
+        for body in ["x", "y", "z"] {
+            e.clock.advance(Duration::from_secs(1));
+            let key = e.put(body).await;
+            e.release(0, &key).await;
+            free.push(key);
+        }
+        e.clock.advance(Duration::from_secs(W + 1));
+
+        let pass = e.gc.run_once().await.expect("вызов");
+        assert_eq!((pass.candidates, pass.deleted, pass.skipped), (3, 3, 0));
+        assert!(free.iter().all(|k| !e.store.contains(k)));
+        assert!(e.store.contains(&shared));
+    }
+
     /// Таймер на часах testkit: запоминает взведённые сроки.
     fn test_sleep(
         clock: &ManualClock,
@@ -746,8 +1057,7 @@ mod tests {
         time::Duration::try_from(Duration::from_secs(n)).expect("длительность")
     }
 
-    /// Один таймер на ближайший срок: объект удаляется в срок (с точностью `precision`),
-    /// без периодических проходов.
+    /// Один таймер на ближайший срок: объект удаляется в срок, без периодических проходов.
     #[tokio::test]
     async fn timer_on_nearest_due() {
         let e = env(GcConfig::default());
@@ -758,12 +1068,11 @@ mod tests {
             e,
             GcConfig {
                 max_wait: Duration::from_secs(100 * W),
-                precision: Duration::from_secs(1),
                 ..GcConfig::default()
             },
         );
 
-        // Таймер — на срок первого: не раньше `zero_since + W`, не позже на `precision`.
+        // Таймер — на срок первого: сразу после `zero_since + W`.
         until("таймер на срок первого", || {
             r.last()
                 .is_some_and(|t| t > za + secs(W) && t <= za + secs(W + 1))

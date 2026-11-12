@@ -22,6 +22,19 @@ SRS 3.8. Все операции хранилищ выполняются в ко
 параметр сеанса `app.tenant_id` через `SET LOCAL` в начале каждой транзакции. Политики (квоты, срок корзины, лимиты отправки,
 ключи DKIM, профиль Milter, правило `trash.purge`) — `PolicyResolver::resolve(tenant, domain, account, mailbox?) -> Policy` по цепочке организация → домен → ящик (→ папка).
 
+### Policy
+`meta::Policy` — поля уровня, `None` — не задано (`overlay` накладывает более специфичный уровень). Потребители и умолчания (CTR-67,
+решение 97): `quota_bytes`, `trash_retention` — `tp-meta` (умолчание — секция `meta.retention`); `retention` — модуль «Соответствие
+требованиям» (удаление по сроку через `DecisionHook::before_final_delete`), ядро не применяет, не задано — без срока; `send_per_hour`
+(умолчание `Policy::DEFAULT_SEND_PER_HOUR` = 1000), `rcpts_per_hour` (адресатов за скользящий час, как RecipientRateLimit в Exchange;
+`DEFAULT_RCPTS_PER_HOUR` = 2000, решение 113), `max_recipients` (`DEFAULT_MAX_RECIPIENTS` = 100) — лимиты submission в SMTP
+(`*_or_default()`); `dkim_selector` — селектор подписи домена в SMTP (не задано — подпись всеми ключами домена); `milter_profile` — набор
+фильтров `smtp.milter` (не задано — все фильтры); `trash_purge` — правило корзины (#Trash). Настроек этих полей SMTP в config.yaml нет.
+`PolicyTarget::{Tenant, Domain, Account, Mailbox}` — уровень цепочки, один тип на всю систему (CTR-25). `PolicyStore`:
+`policy(tenant, target) -> Policy` (уровень без наложения, не задан — `Policy::default()`), `set_policy(tenant, target, &Policy)` (уровень
+целиком, `Policy::default()` удаляет уровень); существование объекта уровня проверяет вызывающий, запись сразу видна `PolicyResolver`.
+In-memory — `MemPolicies` (`PolicyStore` + `PolicyResolver`); набор `suite::policy_store`. PostgreSQL — META-70, Admin API — ADM-34.
+
 ## BlobStore
 SRS 3.2. Объекты неизменяемы, запись идемпотентна.
 - `put(&BlobKey, Bytes) -> Result<()>`; `put_stream(&BlobKey, ByteStream, size_hint) -> Result<()>`
@@ -340,6 +353,15 @@ until, limit, after })` -> `AuditPage` (как `DeliveryLog::search`), `purge_au
 `MemMailboxAudit` (`entries`, `fail_next`); набор `suite::mailbox_audit`. Запись — IMAP-15, JMAP-18; PostgreSQL (только добавление) — META-33;
 выгрузка в SIEM и выборка — ADM-10.
 
+## AdminAuditLog
+SRS 5.2, 6.8, решение 98 (CTR-25; код — `admin_audit.rs`). Журнал аудита Admin API, только добавление. `AdminAuditRecord { at, tenant?
+(`None` — уровень инсталляции), actor_tenant, actor, actor_login, roles: Vec<String> (роли Admin API), method, route, path, status,
+content_messages? }` — без тела запроса и секретов. `AuditLog`: `append(&record) -> seq` (номер ≥ 1, растёт в порядке добавления);
+`search(tenant, &AdminAuditQuery { since?, until?, limit ≥ 1, after? }) -> AdminAuditPage { entries: Vec<AdminAuditEntry { seq, record }>,
+next? }` — только записи организации (без уровня инсталляции), по возрастанию `seq`, `at` в [`since`, `until`), `next` — у полной страницы;
+`AdminAuditQuery::validate` (неверный — `Invalid`). In-memory — `MemAuditLog` (`entries`); набор `suite::admin_audit_log`. PostgreSQL
+(таблица `audit_log`, META-22) — META-70; запись и `GET …/audit` — Admin API (ADM-34), экспорт в SIEM — там же.
+
 ## Auth
 SRS 5.1. `Authenticator`: `verify(Credentials, peer: Option<IpAddr>) -> Result<Principal>` (неверные данные — `Forbidden`);
 `Credentials::{ Password { login, secret }, Bearer(token), Gssapi { principal, authzid } }`, секреты скрыты в `Debug`.
@@ -421,7 +443,9 @@ Hot reload: новая копия рассылается через `watch`; п�
 поле — `[A-Za-z0-9_.-]+`. Скаляр на месте ссылки — ошибка «secret in plaintext» без значения в тексте. `Secret` — значение,
 `***` в `Debug`/`Display`, обнуляется при удалении, доступ — `expose()`; `lease() -> Option<&SecretLease { id, ttl, renewable }>`,
 `lease_ttl()`. `SecretStore`: `get(&SecretRef) -> Result<Secret>` (`NotFound` — нет пути или поля, `Forbidden` — политика,
-`Unavailable` — недоступно или запечатано), `renew(&SecretLease) -> Result<SecretLease>` (неизвестная/истёкшая — `NotFound`, перечитать;
+`Unavailable` — недоступно или запечатано), `put(&SecretRef, &Secret) -> Result<()>` — новая версия поля, прочие поля
+пути сохраняются (`Forbidden` — политика, `Unavailable` — недоступно, `Invalid` — не настроено, путь не для записи или
+изменён параллельно; реализации по умолчанию нет), `renew(&SecretLease) -> Result<SecretLease>` (неизвестная/истёкшая — `NotFound`, перечитать;
 по умолчанию — `NotFound`). Встроенный клиент — `tp-platform` (PLT-12), замена — `Registry::set_secret_store`, in-memory — `tp-testkit`.
 Код — `secrets.rs`.
 
@@ -574,7 +598,7 @@ start, end: Option }>, busy: Vec<BusyPeriod>, schedule_tag: Option<String> } }` 
 `TimeRange { start?, end? }`, `ObjectIndex::may_overlap` — кандидат time-range: `start < range.end`, `end ≥ range.start` (точную проверку
 RFC 4791 §9.9 делает вызывающий).
 `DavStore` (по `AccountScope`, чужая учётная запись или организация — как отсутствующие): `limits() -> DavLimits { max_object_size,
-max_objects (в коллекции), max_collections (учётной записи), busy_horizon (CTR-47) }` (из конфигурации реализации; превышение — `QuotaExceeded`);
+max_objects (в коллекции), max_collections (учётной записи), max_busy_instances (META-54) }` (из конфигурации реализации; превышение — `QuotaExceeded`);
 коллекции — `list_collections(kind)` (по `order`, имени), `get_collection(id)`, `collection_by_name(kind, name)`, `create_collection`
 (занятые `id` или имя вида — `Conflict`), `update_collection` (свойства), `delete_collection` (сразу, без корзины; объекты и коллекция —
 в надгробия, каждый со своим `ModSeq`); объекты — `get_object(collection, name)`, `object_by_uid`, `list_objects -> Vec<ObjectRef { id, name,
@@ -645,9 +669,13 @@ iMIP (RFC 6047), занятость. iCalendar контракты не разб�
   организатором, прежний при изменении участником только `PARTSTAT`; `If-Schedule-Tag-Match` проверяет вызывающий по прочитанному объекту
   и пишет с `Precondition::IfMatch(etag)`.
 - Занятость: `ObjectIndex::busy: Vec<BusyPeriod { start, end, kind: BusyKind::{Busy, Tentative, Unavailable} }>` (`[start, end)`, UTC;
-  `FBTYPE`) — вхождения с повторами и исключениями до момента записи плюс `DavLimits::busy_horizon` (по умолчанию 400 дней), не больше
-  `MAX_BUSY_PERIODS` (4096), `validate_busy` → `Invalid`. Вычисляет `tp-dav` (DAV-16): `TRANSP:TRANSPARENT`, `STATUS:CANCELLED` — пусто,
-  `STATUS:TENTATIVE` — `Tentative`. `FreeBusy::query(tenant, accounts, Period { start, end }) -> Vec<(AccountId, Vec<BusyPeriod>)>` —
+  `FBTYPE`) — периоды неповторяющегося объекта, не больше `MAX_BUSY_PERIODS` (4096), `validate_busy` → `Invalid`. Вычисляет `tp-dav`
+  (DAV-16): `TRANSP:TRANSPARENT`, `STATUS:CANCELLED` — пусто, `STATUS:TENTATIVE` — `Tentative`. Повторяющееся событие (в теле `RRULE`
+  или `RDATE`) — `ObjectIndex::recurring = true` и пустой `busy` (иначе `Invalid`; только `Component::Event`): его занятость хранилище
+  разворачивает из тела при запросе библиотекой calcard (META-54, решение 59) — `RRULE`, `RDATE`, `EXDATE`, переопределённые вхождения,
+  часовые пояса; время без пояса — в поясе календаря (`Collection::timezone`, иначе UTC); `TRANSP:TRANSPARENT` и `STATUS:CANCELLED` не
+  занимают, `STATUS:TENTATIVE` — `Tentative`; горизонта нет, от начала повторов — не больше `DavLimits::max_busy_instances` вхождений
+  объекта (по умолчанию 20 000), остальные в занятость не попадают; тело, которое не разбирается, занятости не даёт. `FreeBusy::query(tenant, accounts, Period { start, end }) -> Vec<(AccountId, Vec<BusyPeriod>)>` —
   календари учётной записи кроме `transparent`; запись на каждую учётную запись в порядке `accounts` (повторы — один раз), периоды,
   пересекающиеся с интервалом, обрезаны по нему и нормализованы `merge_busy` (по `(start, end, kind)`, один вид склеен, разные — нет);
   нет данных, чужая организация, несуществующая — пусто (существование и права «только занятость», CTR-48, проверяет вызывающий);
@@ -880,6 +908,11 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   и сигнал входящих — для CTag и JMAP `CalendarEventNotification`; горизонт занятости — в `DavLimits`. Новые поля индекса и коллекции —
   `#[serde(default)]`. In-memory — `MemDav` (входящие, `FreeBusy`), `FakeItip`, `MemItipSender`; наборы `suite::itip`,
   `suite::itip::signals`, `suite::freebusy`. Реализация в `tp-meta` — META-51, в `tp-dav` — DAV-13, DAV-15, DAV-16.
+- 2026-11-12 — META-54 (x/meta-35), правка CTR-47 по решению 59: занятость повторяющихся событий разворачивается при запросе.
+  Добавлено `ObjectIndex::recurring` (`#[serde(default)]`; задаёт вызывающий — `tp-dav`, `tp-jmap`), `DavLimits::max_busy_instances`;
+  **удалено** `DavLimits::busy_horizon` и ключ конфигурации `meta.dav.busy_horizon` (секция `deny_unknown_fields`: ключ из конфигурации
+  убрать, вместо него — `meta.dav.max_busy_instances`). `ObjectIndex::busy` — только у неповторяющихся объектов. Разворот — в хранилищах
+  (`PgMeta`, `MemDav`) библиотекой calcard; набор `suite::freebusy_recurring`. Миграция `tp-meta` 0025.
 - 2026-11-12 — CTR-49 (x/contracts-36): `QueueStore::enqueue(owner: Option<AccountId>, msg)`, `BlobIndex::acquire(tenant, owner:
   Option<AccountId>, hash, refs)` — учётная запись отправителя или владельца для выбора шарда (решение 46); `EventKind::ShardsChanged` —
   системный сигнал изменения справочника шардов (решение 47). Вызовы в крейтах — `None` (учётная запись на этих путях неизвестна).
@@ -897,17 +930,29 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-52 (волна contracts-37): `InternalTls.key: Option<SecretRef>` — ключ внутренних каналов из хранилища секретов
   (взамен `key_file`, оба сразу — `Invalid`), `InternalTls::key_source()` и `KeySource::{File, Secret}`. Новое поле секции: код,
   собирающий `InternalTls` перечислением всех полей, дополняется `key: None` (в репозитории таких мест нет).
+- 2026-11-12 — CTR-25, CTR-67, CTR-70 (волна contracts-46, аудит 12.11, решения 93, 97, 98, 104, 105): `meta::{PolicyTarget, PolicyStore}`
+  — уровень цепочки политик и запись уровня (один `PolicyTarget` на систему; `tp_testkit::PolicyLevel` удалён, `MemPolicies` реализует
+  `PolicyStore`, синхронные `MemPolicies::policy`/`set_policy` удалены); `admin_audit::{AuditLog, AdminAuditRecord, AdminAuditEntry,
+  AdminAuditQuery, AdminAuditPage}` — журнал аудита Admin API, `MemAuditLog`, наборы `suite::{policy_store, admin_audit_log}`.
+  `Policy`: потребители полей и умолчания уровня организации полей SMTP (`DEFAULT_SEND_PER_HOUR`, `DEFAULT_MAX_RECIPIENTS`,
+  `send_per_hour_or_default`, `max_recipients_or_default`), исполнитель `retention` — модуль «Соответствие требованиям».
+  `TenantTransport.rewrites` — обязательное поле (без `serde(default)`). Временные трейты `tp-admin` (`PolicyStore`, `PolicyTarget`,
+  `AuditLog`) и `PolicyTarget` `tp-meta` заменяются в META-70 и ADM-34.
+- 2026-11-12 — CTR-79 (волна contracts-51, решение 113): `Policy::rcpts_per_hour` — лимит отправки «адресатов в час» на учётную запись
+  по цепочке организация → домен → ящик, `Policy::DEFAULT_RCPTS_PER_HOUR` = 2000, `rcpts_per_hour_or_default()`; потребитель — SMTP
+  (SMTP-43). Хранение — столбец `policies.rcpts_per_hour` (миграция 0026), Admin API — поле `rcpts_per_hour` политики уровня. Код,
+  собирающий `Policy` перечислением всех полей, дополняется `rcpts_per_hour`.
 - 2026-11-12 — CTR-53 (волна contracts-38): `Account::aliases`, `AccountUpsert::aliases` и `Account::addresses()` — адреса учётной
   записи (основной и псевдонимы каталога без catch-all); правила — `meta::account_addresses`, `meta::account_aliases`. Несовместимо:
-  новые обязательные поля `Account` и `AccountUpsert`. `tp-meta` — миграция 0025 (`accounts.aliases`).
+  новые обязательные поля `Account` и `AccountUpsert`. `tp-meta` — миграция 0028 (`accounts.aliases`).
 - 2026-11-12 — CTR-55 (волна contracts-38): `GroupStore::held(tenant, group, after, limit)` — очередь модерации страницами по курсору
   `HeldCursor { held_at, id }`; правило страницы — `groups::held_page`. Несовместимо: новый параметр `after` у `held`.
 - 2026-11-12 — CTR-54 (волна contracts-38): `DavStore::move_object` и `MoveOutcome`/`Moved` — перенос объекта между коллекциями с
   сохранением `id`; поиск контактов — `ObjectIndex::search: CardSearch` (пишется `put_object`) и `DavStore::find_cards`. Несовместимо:
-  оба метода обязательны для реализаций, новое поле `ObjectIndex`. `tp-meta` — миграция 0025 (`dav_objects.search`, `placed_modseq`).
+  оба метода обязательны для реализаций, новое поле `ObjectIndex`. `tp-meta` — миграция 0028 (`dav_objects.search`, `placed_modseq`).
 - 2026-11-12 — CTR-56 (волна contracts-38): поля `Collection` — `is_default`, `subscribed`, `visible`, `alerts_with_time`,
   `alerts_without_time`; признак по умолчанию переносится записью коллекции (`create_collection`, `update_collection`), правило
-  выбора — `dav::default_of`. Несовместимо: новые поля `Collection`. `tp-meta` — миграция 0025 (столбцы `dav_collections`).
+  выбора — `dav::default_of`. Несовместимо: новые поля `Collection`. `tp-meta` — миграция 0028 (столбцы `dav_collections`).
 - 2026-11-12 — CTR-57 (волна contracts-39): адрес клиента в проверке учётных данных — параметр `peer` у `Authenticator::verify` и поле
   `SaslContext::peer`. Несовместимо: новая сигнатура `verify`, новое поле `SaslContext`; все реализации и вызовы (`tp-auth`, `tp-imap`,
   `tp-smtp`, `tp-sieve`, `tp-jmap`, `tp-dav`, `tp-admin`, `tp-testkit`, `thepost`) переведены в том же PR; сервер HTTP
@@ -915,5 +960,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-48 (волна contracts-35): раздел Sharing, модуль `sharing` — `CollectionRights`, `CollectionAcl` (права на коллекции,
   `shared_with`), представители (`Delegate`, `DelegateStore`), ресурсы (`AccountKind`, `BookingPolicy::decide`, `ResourceStore`), политика
   организации (`SharingPolicy`, `SharingPolicyStore`). Вид учётной записи — поле `Account::kind` и `AccountUpsert::kind`
-  (`meta::AccountKind`), хранится с учётной записью (`tp-meta` — миграция 0026 `accounts.kind`, `tp-testkit`); несовместимо: новые
+  (`meta::AccountKind`), хранится с учётной записью (`tp-meta` — миграция 0029 `accounts.kind`, `tp-testkit`); несовместимо: новые
   обязательные поля `Account` и `AccountUpsert`. Реализации новых хранилищ в памяти и наборы — отдельной волной `tp-testkit`.

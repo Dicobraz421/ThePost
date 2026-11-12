@@ -4932,6 +4932,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "tower-http",
  "tp-auth",
  "tp-contracts",
  "tp-mailstore",
@@ -4960,6 +4961,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tp-contracts",
  "tp-testkit",
@@ -5145,6 +5147,7 @@ name = "tp-meta"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "calcard",
  "futures",
  "proptest",
  "schemars",
@@ -5299,6 +5302,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "calcard",
  "futures",
  "mail-parser 0.11.9",
  "proptest",

@@ -24,8 +24,8 @@ use calcard::icalendar::{
 };
 use time::OffsetDateTime;
 use tp_contracts::dav::{
-    Collection, CollectionKind, Component, DavLimits, DavObject, DavStore, ObjectIndex,
-    Precondition, PutOutcome, valid_name,
+    Collection, CollectionKind, Component, DavObject, DavStore, ObjectIndex, Precondition,
+    PutOutcome, valid_name,
 };
 use tp_contracts::meta::AccountScope;
 use tp_contracts::schedule::{InboxMessage, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome};
@@ -56,16 +56,13 @@ impl ItipInbox {
     }
 }
 
-/// Индекс объекта календаря для записи в момент `now`: интервал, занятость до горизонта хранилища, `Schedule-Tag`.
+/// Индекс объекта календаря для записи в момент `now`: интервал, занятость, `Schedule-Tag`.
 pub(crate) fn object_index(
     cfg: &DavConfig,
-    limits: &DavLimits,
     ical: &ICalendar,
     now: OffsetDateTime,
 ) -> std::result::Result<ObjectIndex, IndexError> {
     let mut idx = index::of_calendar(ical, &cfg.index_options(now))?;
-    let horizon = time::Duration::try_from(limits.busy_horizon).unwrap_or(time::Duration::MAX);
-    index::clip_busy(&mut idx, now.checked_add(horizon).unwrap_or(now));
     idx.schedule_tag = itip::schedule_tag(ical);
     Ok(idx)
 }
@@ -178,7 +175,7 @@ impl ItipInbox {
         if body.len() > self.cfg.max_object_size.min(limits.max_object_size) {
             return ignored("объект больше допустимого размера");
         }
-        let Ok(idx) = object_index(&self.cfg, &limits, ical, OffsetDateTime::now_utc()) else {
+        let Ok(idx) = object_index(&self.cfg, ical, OffsetDateTime::now_utc()) else {
             return ignored("недопустимый объект календаря");
         };
         let (coll, name, pre) = match existing {
