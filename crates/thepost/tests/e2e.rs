@@ -1198,6 +1198,45 @@ async fn transport_settings_without_restart() {
     .await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
+    // ADM-34: политика организации — через контракт `PolicyStore` в PostgreSQL; изменения — в журнале аудита
+    // (`audit_log`), `GET …/audit` отдаёт их.
+    let org = format!("/api/v1/orgs/{}", TenantId::DEFAULT);
+    let policy = json!({ "max_recipients": 7 });
+    let (code, body) = http(
+        admin,
+        "PUT",
+        &format!("{org}/policy"),
+        &bearer,
+        Some(&policy),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = http(admin, "GET", &org, &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let read: Value = serde_json::from_slice(&body).expect("org");
+    assert_eq!(read["policy"]["max_recipients"], 7, "{read}");
+    let (code, body) = http(admin, "GET", &format!("{org}/audit"), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let audit: Value = serde_json::from_slice(&body).expect("audit");
+    let changes: Vec<(&str, &str, u64)> = audit["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|e| {
+            Some((
+                e["method"].as_str()?,
+                e["route"].as_str()?,
+                e["status"].as_u64()?,
+            ))
+        })
+        .collect();
+    for change in [
+        ("PUT", "/api/v1/orgs/{org}/transport/sources/{name}", 200),
+        ("PUT", "/api/v1/orgs/{org}/policy", 200),
+    ] {
+        assert!(changes.contains(&change), "{change:?}: {audit}");
+    }
+
     // Следующая сессия без перезапуска (сигнал `TransportChanged`): отправитель вне списка источника — отказ.
     let until = deadline();
     while mail_from_code(smtp, "robot@other.test").await != 550 {

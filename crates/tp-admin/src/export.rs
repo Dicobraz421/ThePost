@@ -4,12 +4,12 @@
 //!   умолчанию 13 «log audit», severity 5 «notice») кадрами с подсчётом октетов (RFC 5425) поверх TLS (CA из
 //!   файла или системные корни, mTLS). Отправка — фоновой задачей через ограниченную очередь: запрос администратора
 //!   не ждёт SIEM; при недоступности приёмника задача переподключается, переполнение очереди — потеря записи
-//!   с ошибкой в журнале узла (основная копия — в хранилище журнала аудита).
+//!   с ошибкой в журнале узла (основная копия — в журнале аудита, `AuditLog`).
 //! - [`OtlpAudit`] — записи OTLP-логов (событие `thepost.admin.audit`, тело — запись JSON, атрибуты —
 //!   организация, администратор, метод, маршрут, код) через пакетный экспорт OTLP/HTTP.
 //!
-//! [`Fanout`] пишет запись во все приёмники (хранилище и экспорт); [`AuditExportConfig::start`] собирает
-//! экспорт по секции `admin.audit`.
+//! [`Fanout`] пишет запись во все приёмники экспорта; [`AuditExportConfig::start`] собирает их по секции
+//! `admin.audit`. Запись в JSON — [`AuditRecord`] (момент — RFC 3339).
 
 use std::fmt;
 use std::io;
@@ -32,6 +32,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
+use tp_contracts::admin_audit::AdminAuditRecord;
 use tp_contracts::config::duration;
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{Error, Result};
@@ -62,7 +63,7 @@ impl AuditExportConfig {
         Ok(())
     }
 
-    /// Запускает экспорт по секции: приёмники для [`Fanout`] вместе с хранилищем журнала.
+    /// Запускает экспорт по секции: приёмники для [`Fanout`].
     pub async fn start(&self, profile: Profile) -> Result<Vec<Arc<dyn AuditSink>>> {
         self.check()?;
         let mut out: Vec<Arc<dyn AuditSink>> = Vec::new();
@@ -92,7 +93,7 @@ impl fmt::Debug for Fanout {
 
 #[async_trait]
 impl AuditSink for Fanout {
-    async fn record(&self, record: &AuditRecord) -> Result<()> {
+    async fn record(&self, record: &AdminAuditRecord) -> Result<()> {
         let mut first = None;
         for s in &self.0 {
             if let Err(e) = s.record(record).await {
@@ -203,10 +204,15 @@ fn host_of(address: &str) -> Option<&str> {
 
 /// Сообщение RFC 5424 для записи: severity 5 (notice), MSGID `audit`, без структурированных данных,
 /// MSG — запись JSON в UTF-8 с BOM.
-pub fn rfc5424(r: &AuditRecord, facility: u8, hostname: Option<&str>, app_name: &str) -> String {
+pub fn rfc5424(
+    r: &AdminAuditRecord,
+    facility: u8,
+    hostname: Option<&str>,
+    app_name: &str,
+) -> String {
     let pri = u16::from(facility) * 8 + 5;
     let t = r.at.to_offset(UtcOffset::UTC);
-    let json = serde_json::to_string(r).unwrap_or_default();
+    let json = serde_json::to_string(&AuditRecord::from(r)).unwrap_or_default();
     format!(
         "<{pri}>1 {:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z {} {app_name} {} audit - \u{feff}{json}",
         t.year(),
@@ -274,7 +280,7 @@ impl SyslogAudit {
 
 #[async_trait]
 impl AuditSink for SyslogAudit {
-    async fn record(&self, r: &AuditRecord) -> Result<()> {
+    async fn record(&self, r: &AdminAuditRecord) -> Result<()> {
         let msg = rfc5424(
             r,
             self.cfg.facility,
@@ -459,8 +465,9 @@ impl OtlpAudit {
 
 #[async_trait]
 impl AuditSink for OtlpAudit {
-    async fn record(&self, r: &AuditRecord) -> Result<()> {
-        let json = serde_json::to_string(r).map_err(|e| Error::internal(e.to_string()))?;
+    async fn record(&self, r: &AdminAuditRecord) -> Result<()> {
+        let json = serde_json::to_string(&AuditRecord::from(r))
+            .map_err(|e| Error::internal(e.to_string()))?;
         let mut rec = self.logger.create_log_record();
         rec.set_event_name(OTLP_EVENT);
         rec.set_timestamp(SystemTime::from(r.at));
@@ -496,14 +503,14 @@ mod tests {
     use super::*;
     use crate::server::AdminRole;
 
-    fn record(route: &str) -> AuditRecord {
-        AuditRecord {
+    fn record(route: &str) -> AdminAuditRecord {
+        AdminAuditRecord {
             at: OffsetDateTime::parse("2026-11-01T10:20:30.123456789Z", &Rfc3339).expect("time"),
             tenant: Some(TenantId::DEFAULT),
             actor_tenant: TenantId::DEFAULT,
             actor: AccountId::new(),
             actor_login: "admin@example.org".into(),
-            roles: vec![AdminRole::OrganizationAdmin],
+            roles: vec![AdminRole::OrganizationAdmin.as_str().into()],
             method: "POST".into(),
             route: route.into(),
             path: "/api/v1/orgs/x/domains".into(),
@@ -713,7 +720,7 @@ mod tests {
         struct Count(Mutex<usize>, bool);
         #[async_trait]
         impl AuditSink for Count {
-            async fn record(&self, _: &AuditRecord) -> Result<()> {
+            async fn record(&self, _: &AdminAuditRecord) -> Result<()> {
                 *self.0.lock().expect("lock") += 1;
                 if self.1 {
                     Err(Error::UNAVAILABLE)

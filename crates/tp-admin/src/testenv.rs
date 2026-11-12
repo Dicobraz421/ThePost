@@ -11,69 +11,31 @@ use bytes::Bytes;
 use serde_json::Value;
 use time::OffsetDateTime;
 use tower::ServiceExt;
+use tp_contracts::admin_audit::AdminAuditRecord;
 use tp_contracts::auth::Principal;
 use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, Policy, SpecialUse};
+use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse};
 use tp_contracts::{AccountId, DomainId, Error, MessageId, Result, TenantId};
 use tp_testkit::{
-    Clock, FakeAuthenticator, MemAppPasswords, MemBlobIndex, MemBlobStore, MemDeliveryLog,
-    MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies, MemQuota, MemSieve,
-    MemTransport, MemTrash, SystemClock,
+    Clock, FakeAuthenticator, MemAppPasswords, MemAuditLog, MemBlobIndex, MemBlobStore,
+    MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies,
+    MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
 };
 
-use crate::accounts::{Domain, DomainStore, PolicyStore, PolicyTarget};
-use crate::audit::{AuditEntry, AuditLog, AuditPage, AuditQuery, AuditRecord, AuditSink};
+use crate::accounts::{Domain, DomainStore};
+use crate::export::Fanout;
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
 use crate::sieve::ScriptError;
 
-/// Журнал аудита в памяти.
+/// Журнал аудита в памяти — [`MemAuditLog`] tp-testkit; [`MemAudit::records`] — записи для проверок.
 #[derive(Debug, Clone, Default)]
-pub struct MemAudit(Arc<Mutex<Vec<AuditRecord>>>);
+pub struct MemAudit(pub MemAuditLog);
 
 impl MemAudit {
-    pub fn records(&self) -> Vec<AuditRecord> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-}
-
-#[async_trait]
-impl AuditSink for MemAudit {
-    async fn record(&self, record: &AuditRecord) -> Result<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(record.clone());
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl AuditLog for MemAudit {
-    async fn search(&self, tenant: TenantId, q: &AuditQuery) -> Result<AuditPage> {
-        let entries: Vec<AuditEntry> = lock(&self.0)
-            .iter()
-            .enumerate()
-            .map(|(i, r)| AuditEntry {
-                seq: i as u64 + 1,
-                record: r.clone(),
-            })
-            .filter(|e| {
-                e.record.tenant == Some(tenant)
-                    && q.after.is_none_or(|a| e.seq > a)
-                    && q.since.is_none_or(|t| e.record.at >= t)
-                    && q.until.is_none_or(|t| e.record.at < t)
-            })
-            .take(q.limit)
-            .collect();
-        let next = (entries.len() == q.limit)
-            .then(|| entries.last().map(|e| e.seq))
-            .flatten();
-        Ok(AuditPage { entries, next })
+    pub fn records(&self) -> Vec<AdminAuditRecord> {
+        self.0.entries().into_iter().map(|e| e.record).collect()
     }
 }
 
@@ -83,32 +45,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Решения модерации — [`MemModeration`] tp-testkit (CTR-31).
 pub use tp_testkit::{MemModeration, ModerationDecision as Decision};
-
-/// Политики уровней — [`MemPolicies`] tp-testkit (разрешение цепочки и выбор пользователя `trash.purge`).
-#[async_trait]
-impl PolicyStore for MemPolicies {
-    async fn policy(&self, tenant: TenantId, target: PolicyTarget) -> Result<Policy> {
-        tp_contracts::meta::PolicyStore::policy(self, tenant, level(target)).await
-    }
-
-    async fn set_policy(
-        &self,
-        tenant: TenantId,
-        target: PolicyTarget,
-        policy: &Policy,
-    ) -> Result<()> {
-        tp_contracts::meta::PolicyStore::set_policy(self, tenant, level(target), policy).await
-    }
-}
-
-fn level(target: PolicyTarget) -> tp_contracts::meta::PolicyTarget {
-    use tp_contracts::meta::PolicyTarget as Level;
-    match target {
-        PolicyTarget::Tenant => Level::Tenant,
-        PolicyTarget::Domain(d) => Level::Domain(d),
-        PolicyTarget::Account(a) => Level::Account(a),
-    }
-}
 
 /// Домены в памяти (без проверки учётных записей домена при удалении).
 #[derive(Debug, Clone, Default)]
@@ -208,8 +144,8 @@ impl Stores {
     pub fn deps(&self) -> Deps {
         Deps {
             auth: Arc::new(FakeAuthenticator::default()),
-            audit: Arc::new(MemAudit::default()),
-            audit_log: None,
+            audit_log: Arc::new(MemAuditLog::new()),
+            audit: Arc::new(Fanout::default()),
             delivery: Arc::new(self.delivery.clone()),
             groups: Arc::new(self.groups.clone()),
             moderation: Arc::new(self.moderation.clone()),
@@ -353,8 +289,7 @@ impl Env {
         let admin = Admin::new(
             Deps {
                 auth: Arc::new(auth.clone()),
-                audit: Arc::new(audit.clone()),
-                audit_log: Some(Arc::new(audit.clone())),
+                audit_log: Arc::new(audit.0.clone()),
                 modules,
                 ..stores.deps()
             },
