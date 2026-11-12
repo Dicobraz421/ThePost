@@ -1,0 +1,196 @@
+# Восстановление OpenBao из снимка Raft (DEP-23, решение 39): restore.yml -e thepost_restore_openbao=true — до
+# восстановления СУБД. Новая ВМ (smb.yml -e thepost_backup=false, пароль restic и ключи S3 — в новом OpenBao) или откат
+# секретов: снимок из хранилища копий заменяет данные OpenBao (снимок -force), OpenBao распечатывается ключом прежнего
+# сервера (администратор хранит его вне сервера), узлу и ролям — role_id, secret_id и пароли СУБД восстановленного.
+# Перед задачами — роль openbao (токен администратора текущего OpenBao).
+---
+- name: Check OpenBao restore parameters
+  ansible.builtin.assert:
+    that:
+      - thepost_restore_confirm | default(false) | bool
+      - openbao_cli_env is defined and openbao_cli_env.BAO_TOKEN is defined
+      - thepost_restore_openbao_init_src | length > 0 or thepost_restore_openbao_admin_token | length > 0
+      - openbao_seal != 'static' or thepost_restore_openbao_static_key_src | length > 0
+      - openbao_seal != 'shamir' or thepost_restore_openbao_unseal_keys | length > 0
+    fail_msg: >-
+      Восстановление OpenBao заменяет все его секреты снимком. Нужны: -e thepost_restore_confirm=true; хранимое вне
+      сервера — thepost_restore_openbao_init_src (openbao-init.json прежнего сервера на управляющей машине) или
+      thepost_restore_openbao_admin_token; seal static — thepost_restore_openbao_static_key_src (файл ключа
+      распечатывания прежнего сервера), shamir — thepost_restore_openbao_unseal_keys
+
+- name: Install snapshot tools
+  ansible.builtin.apt:
+    name: "{{ [thepost_backup_blob_tool] + (['openssh-client'] if thepost_backup_blob_tool == 'rsync' else []) }}"
+    state: present
+
+# Пароль restic и ключи S3 — из текущего OpenBao (новая ВМ: их положил администратор, см. docs/INSTALL.md).
+- name: Backup credentials for the snapshot
+  ansible.builtin.import_tasks: secrets.yml
+
+- name: Install restic wrapper
+  ansible.builtin.template:
+    src: thepost-restic.j2
+    dest: /usr/local/sbin/thepost-restic
+    owner: root
+    group: root
+    mode: "0755"
+  when: thepost_backup_blob_tool == 'restic'
+
+- name: Create snapshot restore directory
+  ansible.builtin.file:
+    path: /root/openbao-restore
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Fetch OpenBao snapshot (restic)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      cd /root/openbao-restore
+      s={{ thepost_restore_openbao_snapshot | quote }}
+      thepost-restic snapshots --compact --tag thepost-openbao "$s" | grep -E '^[0-9a-f]{8} ' | tail -n1
+      for f in openbao.snap seal.json; do
+        thepost-restic dump --tag thepost-openbao "$s" "/run/thepost-backup-openbao/$f" >"$f"
+      done
+    executable: /bin/bash
+  register: thepost_restore_openbao_fetch_restic
+  changed_when: true
+  when: thepost_backup_blob_tool == 'restic'
+
+- name: Fetch OpenBao snapshot (rsync)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      src={{ thepost_backup_openbao_rsync_dest | quote }}
+      s={{ thepost_restore_openbao_snapshot | quote }}
+      if [ "$s" = latest ]; then
+        s=$(rsync --list-only -e "ssh -o BatchMode=yes" "$src/" | awk '{print $NF}' | grep '^openbao-' | sort | tail -n1)
+      fi
+      [ -n "$s" ] || { echo "нет снимков OpenBao в $src" >&2; exit 1; }
+      echo "$s"
+      rsync -a -e "ssh -o BatchMode=yes" "$src/$s/" /root/openbao-restore/
+    executable: /bin/bash
+  register: thepost_restore_openbao_fetch_rsync
+  changed_when: true
+  when: thepost_backup_blob_tool == 'rsync'
+
+- name: Read snapshot seal description
+  ansible.builtin.slurp:
+    src: /root/openbao-restore/seal.json
+  register: thepost_restore_openbao_seal_raw
+
+- name: Check snapshot seal
+  ansible.builtin.assert:
+    that:
+      - snap.seal == openbao_seal
+      - openbao_seal != 'static' or snap.static_key_id == openbao_static_key_id
+    fail_msg: >-
+      Снимок {{ snap.created }} с {{ snap.host }}: seal {{ snap.seal }}, ключ {{ snap.static_key_id }}; здесь —
+      seal {{ openbao_seal }}, ключ {{ openbao_static_key_id }}. Задайте в инвентаре openbao_seal: {{ snap.seal }} и
+      openbao_static_key_id: {{ snap.static_key_id }}, прогоните smb.yml, затем restore.yml
+    success_msg: "Снимок OpenBao: {{ fetched.stdout_lines | first }}; {{ snap.created }}, {{ snap.host }}"
+  vars:
+    # Пропущенная задача тоже записывает register — у каждой выборки свой.
+    fetched: >-
+      {{ thepost_restore_openbao_fetch_restic if thepost_backup_blob_tool == 'restic'
+         else thepost_restore_openbao_fetch_rsync }}
+    snap: "{{ thepost_restore_openbao_seal_raw.content | b64decode | from_json }}"
+
+# Узел работает с секретами текущего OpenBao: после замены данных его вход недействителен.
+- name: Stop thepost before OpenBao restore
+  ansible.builtin.systemd_service:
+    name: thepost
+    state: stopped
+  failed_when: false
+
+# -force: снимок другого кластера (ключи шифрования — прежнего сервера); после установки OpenBao запечатан, пока не
+# получит ключ распечатывания прежнего сервера.
+- name: Restore OpenBao snapshot
+  ansible.builtin.command:
+    argv: [bao, operator, raft, snapshot, restore, -force, /root/openbao-restore/openbao.snap]
+  environment: "{{ openbao_cli_env }}"
+  changed_when: true
+  no_log: true
+
+- name: Stop OpenBao
+  ansible.builtin.systemd_service:
+    name: "{{ openbao_service }}"
+    state: stopped
+
+- name: Install unseal key of the previous server
+  ansible.builtin.copy:
+    src: "{{ thepost_restore_openbao_static_key_src }}"
+    dest: "{{ openbao_static_key_file }}"
+    owner: "{{ openbao_user }}"
+    group: "{{ openbao_user }}"
+    mode: "0400"
+  when: openbao_seal == 'static'
+  no_log: true
+
+- name: Start OpenBao
+  ansible.builtin.systemd_service:
+    name: "{{ openbao_service }}"
+    state: started
+
+- name: Wait for OpenBao API after restore
+  ansible.builtin.uri:
+    url: "{{ openbao_api_addr }}/v1/sys/health"
+    ca_path: "{{ openbao_config_dir }}/tls/ca.pem"
+    status_code: [200, 429, 501, 503]
+  register: thepost_restore_openbao_health
+  until: thepost_restore_openbao_health.status in ([200, 429, 503] if openbao_seal == 'shamir' else [200, 429])
+  retries: 30
+  delay: 2
+
+- name: Unseal OpenBao with keys of the previous server (shamir)
+  ansible.builtin.uri:
+    url: "{{ openbao_api_addr }}/v1/sys/unseal"
+    ca_path: "{{ openbao_config_dir }}/tls/ca.pem"
+    method: PUT
+    body_format: json
+    body: { key: "{{ item }}" }
+  loop: "{{ thepost_restore_openbao_unseal_keys }}"
+  when: openbao_seal == 'shamir' and thepost_restore_openbao_health.status == 503
+  no_log: true
+
+# Новый openbao-init.json относится к заменённым данным — на его место файл прежнего сервера (или ничего).
+- name: Install initialization result of the previous server
+  ansible.builtin.copy:
+    src: "{{ thepost_restore_openbao_init_src }}"
+    dest: "{{ openbao_init_file }}"
+    owner: root
+    group: root
+    mode: "0400"
+  when: thepost_restore_openbao_init_src | length > 0
+  no_log: true
+
+- name: Remove initialization result of the replaced data
+  ansible.builtin.file:
+    path: "{{ openbao_init_file }}"
+    state: absent
+  when: thepost_restore_openbao_init_src | length == 0
+
+# secret_id узла выдан заменённым OpenBao: configure.yml выдаст новый (role_id — восстановленный).
+- name: Remove AppRole secret_id of the replaced data
+  ansible.builtin.file:
+    path: "{{ openbao_thepost_secret_id_file }}"
+    state: absent
+
+- name: Use admin token of the restored OpenBao
+  ansible.builtin.set_fact:
+    openbao_admin_token: "{{ thepost_restore_openbao_admin_token }}"
+  no_log: true
+
+# KV, политика, AppRole thepost (role_id и новый secret_id), пароли СУБД — восстановленного OpenBao.
+- name: Configure restored OpenBao
+  ansible.builtin.include_role:
+    name: openbao
+    tasks_from: configure
+    public: true
+
+- name: Remove snapshot restore directory
+  ansible.builtin.file:
+    path: /root/openbao-restore
+    state: absent

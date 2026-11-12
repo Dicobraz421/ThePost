@@ -1,0 +1,29 @@
+# {{ ansible_managed }}
+# Снимок Raft OpenBao (DEP-23): после каждой копии PostgreSQL (thepost-backup@.service){{ ' и по таймеру thepost-backup-openbao.timer' if thepost_backup_openbao_schedule | length > 0 else '' }}.
+# Журнал — journalctl -u thepost-backup-openbao; восстановление — restore.yml -e thepost_restore_openbao=true.
+[Unit]
+Description=The Post: снимок OpenBao (Raft)
+After={{ openbao_service | default('openbao') }}.service network-online.target thepost-backup-blob.service
+
+[Service]
+Type=oneshot
+LoadCredentialEncrypted=openbao-snapshot.json:{{ thepost_backup_creds_dir }}/openbao-snapshot.cred
+{% if thepost_backup_blob_tool == 'restic' %}
+LoadCredentialEncrypted=restic.password:{{ thepost_backup_creds_dir }}/restic-password.cred
+{% if thepost_backup_restic_repo is match('s3:') %}
+LoadCredentialEncrypted=restic.aws:{{ thepost_backup_creds_dir }}/restic-aws.cred
+Environment=AWS_SHARED_CREDENTIALS_FILE=/run/credentials/%n/restic.aws
+{% endif %}
+Environment=RESTIC_REPOSITORY={{ thepost_backup_restic_repo }}
+Environment=RESTIC_PASSWORD_FILE=/run/credentials/%n/restic.password
+Environment=RESTIC_CACHE_DIR=/var/cache/restic
+{% endif %}
+RuntimeDirectory=thepost-backup-openbao
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/local/sbin/thepost-openbao-snapshot
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only

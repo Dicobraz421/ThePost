@@ -1,0 +1,33 @@
+#!/bin/bash
+# {{ ansible_managed }}
+# Снимок Raft OpenBao (DEP-23) в хранилище копий ({{ thepost_backup_blob_tool }}): вход AppRole
+# {{ thepost_backup_openbao_approle }} (политика — только снимок), снимок и описание распечатывания (seal.json) — в
+# каталог юнита, затем {{ 'в репозиторий restic (тег thepost-openbao)' if thepost_backup_blob_tool == 'restic' else 'в ' ~ thepost_backup_openbao_rsync_dest }}.
+# Запуск — systemctl start thepost-backup-openbao (после каждой копии СУБД — сам).
+set -euo pipefail
+: "${CREDENTIALS_DIRECTORY:?запуск — systemctl start thepost-backup-openbao}" "${RUNTIME_DIRECTORY:?}"
+export BAO_ADDR={{ openbao_cli_env.BAO_ADDR | quote }} BAO_CACERT={{ openbao_cli_env.BAO_CACERT | quote }}
+unset BAO_TOKEN
+BAO_TOKEN=$(bao write -field=token auth/approle/login - <"$CREDENTIALS_DIRECTORY/openbao-snapshot.json")
+export BAO_TOKEN
+trap 'bao token revoke -self >/dev/null 2>&1 || true' EXIT
+d=$RUNTIME_DIRECTORY
+bao operator raft snapshot save "$d/openbao.snap"
+# Чем распечатать снимок на новой ВМ: тип seal и идентификатор ключа static (сам ключ — у администратора).
+printf '{"seal":"%s","static_key_id":"%s","host":"%s","openbao":"%s","created":"%s"}\n' \
+  {{ openbao_seal | default('static') | quote }} {{ (openbao_static_key_id | default('')) | quote }} \
+  {{ inventory_hostname | quote }} "$(bao version | awk '{print $2}')" "$(date -u +%FT%TZ)" >"$d/seal.json"
+{% if thepost_backup_blob_tool == 'restic' %}
+# Репозиторий общий с копией каталога писем: forget/prune — под общей блокировкой.
+lock=/run/lock/thepost-restic.lock
+flock -w 3600 "$lock" restic {{ thepost_backup_restic_opts }} backup --quiet --tag thepost-openbao "$d"
+flock -w 3600 "$lock" restic {{ thepost_backup_restic_opts }} forget --quiet --tag thepost-openbao --keep-last 1 \
+  --keep-within {{ thepost_backup_openbao_keep_days | int }}d
+{% else %}
+dest={{ thepost_backup_openbao_rsync_dest | quote }}
+rsync -a --mkpath -e "ssh -o BatchMode=yes" "$d/" "$dest/openbao-$(date -u +%Y%m%dT%H%M%SZ)/"
+{% if ':' not in thepost_backup_openbao_rsync_dest %}
+# Только что записанный снимок моложе срока — последний не удаляется.
+find "$dest" -mindepth 1 -maxdepth 1 -name 'openbao-*' -mtime +{{ thepost_backup_openbao_keep_days | int }} -exec rm -rf {} +
+{% endif %}
+{% endif %}
