@@ -286,6 +286,16 @@
 | [DEP-34](DEP-34.md) | пресет edge по SRS 2.6: без BLOB и очереди | deploy | A | deploy-24 | ready | SYS-12 |
 | [DEPS-09](DEPS-09.md) | mail-parser 1.0 в коде крейтов | deps | B | deps-09 | ready | — |
 
+## Ф1 · Синк 12.11, часть 2 — этап 3: сессии Admin API в PostgreSQL, роли PKI OpenBao (решения 71, 77)
+
+| Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
+|---|---|---|---|---|---|---|
+| [CTR-61](CTR-61.md) | контракт хранилища сессий Admin API | contracts | B | contracts-43 | ready | CTR-41 |
+| [META-64](META-64.md) | сессии Admin API в PostgreSQL | meta | B | meta-40 | todo | CTR-61 |
+| [ADM-28](ADM-28.md) | сессии Admin API через хранилище | admin | A | admin-18 | todo | CTR-61 |
+| [APP-50](APP-50.md) | узел: сессии Admin API в PostgreSQL и их очистка | app | A | app-42 | todo | META-64,ADM-28 |
+| [DEP-36](DEP-36.md) | эталон: движок PKI OpenBao для внутренних сертификатов | deploy | A | deploy-26 | todo | PLT-26 |
+
 ## Ф1 · Решение 2026-11-04: соответствие функциям Exchange — этап 3, кроме `jmap-14` (этап 2)
 
 | Задача | Суть | Полоса | Класс | Волна | Статус | Зависит |
@@ -567,7 +577,7 @@
 | [UI-09](UI-09.md) | правила и автоответ пользователя; покрытие Admin API | console | A | console-03 | todo | UI-04,UI-05,UI-06,UI-07,UI-08,ADM-14 |
 | [ADM-15](ADM-15.md) | раздача веб-консоли ролью admin | admin | A | admin-10 | todo | DEPS-05,UI-01 |
 | [CTR-47](CTR-47.md) | планирование встреч — iTIP и занятость | contracts | B | contracts-34 | done | CTR-45 |
-| [META-54](META-54.md) | занятость повторяющихся событий — разворот при запросе | meta | B | meta-35 | todo | CTR-47,META-51 |
+| [META-54](META-54.md) | занятость повторяющихся событий — разворот при запросе | meta | B | meta-35 | todo | CTR-47,CTR-59,META-51 |
 | [SMTP-34](SMTP-34.md) | пересылка правилами и автоответ — через правила получателя с проверкой петли | smtp | A | smtp-14 | ready | SMTP-31 |
 | [ADM-17](ADM-17.md) | Sieve-скрипты пользователя в Admin API и CLI | admin | A | admin-12 | ready | — |
 | [APP-32](APP-32.md) | очистка надгробий DAV и журнала автоответов в роли maintenance | app | A | app-31 | ready | META-48,META-50 |
@@ -607,7 +617,7 @@
 | [CI-07](CI-07.md) | `admin_client.rs` — в полосу admin | ci | B | ci-06 | todo | ADM-17 |
 | [ADM-22](ADM-22.md) | CLI — удаление скрипта, автоответ и скрипт организации | admin | A | admin-14 | todo | ADM-17,CI-07 |
 | [DEPS-07](DEPS-07.md) | фича `console` в крейте `thepost` | deps | B | deps-07 | todo | DEPS-05 |
-| [CI-08](CI-08.md) | выпуск, бета и образ с консолью через фичу `thepost/console` | ci | B | ci-07 | todo | DEPS-07,ADM-15 |
+| [CI-08](CI-08.md) | выпуск, бета и образ с консолью через фичу `thepost/console` | ci | B | ci-07 | todo | DEPS-07,ADM-15,DEP-35 |
 | [CTR-53](CTR-53.md) | адреса учётной записи — основной и псевдонимы | contracts | B | contracts-38 | ready | — |
 | [CTR-54](CTR-54.md) | `DavStore` — перенос объекта между коллекциями и поиск контактов по индексу | contracts | B | contracts-38 | ready | CTR-45 |
 | [CTR-55](CTR-55.md) | очередь модерации — продолжение по курсору | contracts | B | contracts-38 | ready | CTR-43 |
@@ -631,6 +641,23 @@
 | [DAV-28](DAV-28.md) | GAL: ETag карточки — хэш её содержимого | dav | A | dav-08 | todo | DAV-12 |
 | [SIEVE-12](SIEVE-12.md) | адрес клиента во входе ManageSieve | sieve | A | sieve-05 | todo | CTR-57 |
 | [JMAP-38](JMAP-38.md) | JMAP Principal: тип `resource` для переговорных и оборудования | jmap | A | jmap-22 | todo | JMAP-30,CTR-48 |
+| [CTR-60](CTR-60.md) | `DavStore` — глобальная адресная книга организации | contracts | B | contracts-41 | todo | CTR-45,CTR-58 |
+| [META-63](META-63.md) | книга GAL в PostgreSQL | meta | B | meta-39 | todo | CTR-60 |
+| [DAV-29](DAV-29.md) | CardDAV: книга GAL из `DavStore` | dav | A | dav-09 | todo | CTR-60,DAV-27,DAV-28 |
+| [JMAP-39](JMAP-39.md) | JMAP Contacts: книга GAL | jmap | A | jmap-23 | todo | CTR-60,JMAP-34 |
+| [APP-49](APP-49.md) | узел: заполнение книги GAL | app | A | app-41 | todo | DAV-29,META-63,JMAP-39 |
+| [DEPS-10](DEPS-10.md) | `tower-http` (CORS) для `tp-admin` | deps | B | deps-10 | todo | DEPS-05 |
+| [ADM-24](ADM-24.md) | CORS в Admin API для консоли на отдельном веб-сервере | admin | A | admin-17 | todo | ADM-15,DEPS-10 |
+| [ADM-25](ADM-25.md) | `GET /api/v1/session` — настройки входа OIDC для консоли | admin | A | admin-17 | todo | ADM-15 |
+| [ADM-26](ADM-26.md) | `GET /api/v1/orgs` — список организаций | admin | A | admin-17 | todo | ADM-15 |
+| [ADM-27](ADM-27.md) | уникальные `operationId` в схеме Admin API | admin | A | admin-17 | todo | ADM-15 |
+| [UI-12](UI-12.md) | адрес Admin API в конфигурации консоли | console | A | console-05 | todo | UI-03,ADM-24 |
+| [UI-13](UI-13.md) | консоль: список организаций и типы по новой схеме | console | A | console-05 | todo | ADM-25,ADM-26,ADM-27 |
+| [CI-10](CI-10.md) | архив `console/dist` в выпуске и бете | ci | B | ci-09 | todo | CI-06 |
+| [CI-11](CI-11.md) | сверка схемы Admin API с копией консоли на PR | ci | B | ci-09 | todo | APP-37 |
+| [DEP-35](DEP-35.md) | Dockerfile: образ с веб-консолью | deploy | A | deploy-25 | todo | DEPS-07 |
+| [CTR-59](CTR-59.md) | занятость повторяющихся событий — правка контракта CTR-47 под разворот при запросе | contracts | B | contracts-42 | ready | CTR-47 |
+| [SMTP-36](SMTP-36.md) | приглашения из почтового клиента — в календарь коллеги | smtp | A | smtp-16 | todo | SMTP-33,CTR-53 |
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 

@@ -10,7 +10,7 @@ manual: no
 
 Хвост волны app-07 (APP-11), PR #353: OIDC device flow не сделан — токен OIDC принимается только из переменной окружения.
 
-Требует подтверждения владельца: нужен ли вход CLI через OIDC device flow (сейчас токен OIDC — из переменной окружения)? (PR #353, «Что не сделано»)
+Подтверждено владельцем — решение 79 (`docs/decisions/2026-11-11-stage2-followups.md`). Этап 2.
 
 ## Сделать
 - `thepost admin login --oidc`: RFC 8628 — `device_authorization_endpoint` из `.well-known/openid-configuration`

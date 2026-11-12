@@ -10,7 +10,7 @@ manual: no
 
 Хвост волны deps-05, PR #431.
 
-Требует подтверждения владельца: принять DEPS-05 (PR #431, класс B) и пробросить фичу `console` в `thepost` отдельной карточкой deps? (п. 33 синка 12.11)
+Подтверждено владельцем — решение 68 (`docs/decisions/2026-11-11-stage2-followups.md`).
 
 ## Сделать
 - `crates/thepost/Cargo.toml`: `[features] console = ["tp-admin/console"]` — бинарный файл с консолью собирается

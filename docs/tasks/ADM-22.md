@@ -16,7 +16,9 @@ manual: no
 - `thepost admin sieve delete <учётная запись> <имя>` — `DELETE …/sieve/scripts/{name}`.
 - Автоответ: `thepost admin vacation get|set` — `GET`/`PUT …/accounts/{account}/vacation` (`set --off` выключает).
 - Скрипт организации: `thepost admin sieve org get|put|delete` — `GET`/`PUT`/`DELETE /api/v1/orgs/{org}/sieve`;
-  `put --file <путь>` (`-` — stdin), ошибки текста (422) — с позициями, как у `sieve put`.
+  `put --file <путь>` (`-` — stdin), ошибки текста (422) — с позициями, как у `sieve put`; в справке `sieve org put` —
+  скрипты организации и пользователя выполняются подряд, запрещающее правило организации пишется `discard; stop;`
+  (решение 76).
 - Операции добавить в `OPERATIONS` (сверка с OpenAPI); `--json`, `--org` — как у остальных команд.
 
 ## Приёмка
