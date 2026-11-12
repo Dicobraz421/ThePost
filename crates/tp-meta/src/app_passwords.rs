@@ -54,37 +54,64 @@ impl AppPasswordStore for PgMeta {
     }
 
     async fn insert(&self, scope: AccountScope, password: AppPassword) -> Result<()> {
-        self.once(async move {
         password.validate()?;
-        let mut tx = begin(&self.pool, scope.tenant).await?;
-        let found: Option<i32> =
-            sqlx::query_scalar("SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2")
-                .bind(scope.tenant.as_uuid())
-                .bind(scope.account.as_uuid())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        if found.is_none() {
-            return Err(Error::NotFound);
-        }
-        // Занятый идентификатор — нарушение первичного ключа (`Conflict`).
-        sqlx::query(
-            "INSERT INTO app_passwords (tenant_id, account_id, password_id, label, hash, created_at, revoked_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        // Ключ записи (META-62) — идентификатор пароля учётной записи: после обрыва во время COMMIT пароль
+        // записан, если есть строка с этим идентификатором и хешем.
+        let key = (password.id.clone(), password.hash.clone());
+        let password = std::sync::Arc::new(password);
+        self.keyed(
+            scope.tenant,
+            |tx| {
+                let password = password.clone();
+                Box::pin(async move {
+                    let found: Option<i32> = sqlx::query_scalar(
+                        "SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2",
+                    )
+                    .bind(scope.tenant.as_uuid())
+                    .bind(scope.account.as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    if found.is_none() {
+                        return Err(Error::NotFound);
+                    }
+                    // Занятый идентификатор — нарушение первичного ключа (`Conflict`).
+                    sqlx::query(
+                        "INSERT INTO app_passwords (tenant_id, account_id, password_id, label, hash, created_at, revoked_at)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    )
+                    .bind(scope.tenant.as_uuid())
+                    .bind(scope.account.as_uuid())
+                    .bind(&password.id)
+                    .bind(&password.label)
+                    .bind(&password.hash)
+                    .bind(password.created_at)
+                    .bind(password.revoked_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    Ok(())
+                })
+            },
+            |tx| {
+                let (id, hash) = key.clone();
+                Box::pin(async move {
+                    let found: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM app_passwords
+                                        WHERE tenant_id = $1 AND account_id = $2 AND password_id = $3 AND hash = $4)",
+                    )
+                    .bind(scope.tenant.as_uuid())
+                    .bind(scope.account.as_uuid())
+                    .bind(id)
+                    .bind(hash)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    Ok(found.then_some(()))
+                })
+            },
         )
-        .bind(scope.tenant.as_uuid())
-        .bind(scope.account.as_uuid())
-        .bind(&password.id)
-        .bind(&password.label)
-        .bind(&password.hash)
-        .bind(password.created_at)
-        .bind(password.revoked_at)
-        .execute(&mut *tx)
         .await
-        .map_err(db_err)?;
-        crate::commits::commit(tx).await?;
-        Ok(())
-}).await
     }
 
     async fn revoke(&self, scope: AccountScope, id: &str, at: OffsetDateTime) -> Result<()> {

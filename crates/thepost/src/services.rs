@@ -292,7 +292,7 @@ impl Services {
         let smtp_metrics = Arc::new(SmtpMetrics::new());
         smtp_metrics.register(metrics);
         let limiter = Arc::new(RateLimiter::new(
-            (*cfg.section::<RateLimitConfig>("ratelimit")?).clone(),
+            (*cfg.section::<RateLimitConfig>(tp_platform::ratelimit::RATELIMIT)?).clone(),
         ));
 
         // Секции, читаемые ролями при запуске, проверяются здесь: ошибка — до запуска ролей.
@@ -524,6 +524,9 @@ impl Services {
             accounts: Arc::new(self.meta.clone()),
             authz: self.authz.clone(),
             outbound: Some(outbound.clone()),
+            submissions: Arc::new(self.meta.clone()),
+            delivery_log: Arc::new(self.meta.clone()),
+            audit: Arc::new(self.meta.clone()),
             hooks: self.hooks.clone(),
             capabilities: ext.jmap_capabilities().to_vec(),
             trash: Arc::new(self.meta.clone()),
@@ -576,6 +579,7 @@ impl Services {
 
     /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`
     /// (`impl Moderation for Delivery`, FIX-01) без правил потока почты: письмо прошло их при приёме.
+    /// Журнал аудита — только в базу; в SIEM его выгружает роль maintenance ([`crate::audit_export`]).
     pub fn admin(
         &self,
         ext: &Registry,
@@ -585,8 +589,6 @@ impl Services {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
             audit_log: Arc::new(self.meta.clone()),
-            // Экспорт в SIEM (`admin.audit`) узел не запускает: без приёмников.
-            audit: Arc::new(tp_admin::Fanout::default()),
             delivery: Arc::new(self.meta.clone()),
             groups: Arc::new(self.meta.clone()),
             moderation: Arc::new(self.base_delivery(smtp)?),
@@ -677,14 +679,37 @@ pub fn system_resolver() -> Result<mail_auth::MessageAuthenticator> {
 /// Хранилище блокировок недоступно — решение по `auth.abuse.fail_closed` принимает `AbuseGuard` (AUTH-11,
 /// решение владельца #253): `false` (по умолчанию) — вход проверяется по блокировкам, известным узлу; `true` —
 /// ошибка `AbuseGuard::check` возвращается вызывающему (`Unavailable`: протокол отвечает временным отказом).
-struct Guarded {
+pub struct Guarded {
     inner: Arc<dyn Authenticator>,
     guard: tp_auth::AbuseGuard,
     accounts: Arc<dyn AccountStore>,
     tenant: TenantId,
 }
 
+impl std::fmt::Debug for Guarded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guarded")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Guarded {
+    /// Проверка `inner` под защитой `guard`; учётная запись попытки — по имени входа из `accounts` в `tenant`.
+    pub fn new(
+        inner: Arc<dyn Authenticator>,
+        guard: tp_auth::AbuseGuard,
+        accounts: Arc<dyn AccountStore>,
+        tenant: TenantId,
+    ) -> Self {
+        Self {
+            inner,
+            guard,
+            accounts,
+            tenant,
+        }
+    }
+
     /// Попытка входа по предъявленным данным: для пароля — учётная запись по имени входа (нет или ошибка
     /// каталога — без учётной записи); токен и Kerberos — субъект известен только после проверки.
     async fn attempt(&self, credentials: &Credentials) -> tp_auth::Attempt {

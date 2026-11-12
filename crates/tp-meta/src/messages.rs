@@ -868,7 +868,17 @@ impl MessageStore for PgMeta {
     async fn to_trash(&self, scope: AccountScope, ids: &[MessageId]) -> Result<ModSeq> {
         self.once(async move {
             let db = self.box_db(scope).await?;
-            let trash_for = self.trash_retention(&db, scope).await?;
+            let trash_for = self
+                .trash_retention(&db, scope, || async {
+                    let mut tx = begin(&db.pool, scope.tenant).await?;
+                    let found = existing(&mut tx, scope, &uuids(ids), false).await?;
+                    crate::commits::commit(tx).await?;
+                    let mut folders: Vec<Uuid> = found.into_iter().map(|(_, mb)| mb).collect();
+                    folders.sort_unstable();
+                    folders.dedup();
+                    Ok(folders)
+                })
+                .await?;
             let mut tx = begin(&db.pool, scope.tenant).await?;
             let current = changelog::lock_modseq(&mut tx, scope).await?;
             let trash = by_role(&mut tx, scope, SpecialUse::Trash)
@@ -886,7 +896,7 @@ impl MessageStore for PgMeta {
                 return Ok(current);
             }
             let ms = changelog::bump_modseq(&mut tx, scope).await?;
-            let events: Vec<_> = relocate(&mut tx, scope, ms, &src, trash, Some(trash_for))
+            let events: Vec<_> = relocate(&mut tx, scope, ms, &src, trash, Some(&trash_for))
                 .await?
                 .into_iter()
                 .map(|m| {

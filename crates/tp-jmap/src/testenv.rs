@@ -22,8 +22,9 @@ use tp_contracts::sieve::SieveStore;
 use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_testkit::{
-    Clock, FakeAuthenticator, FakeSearch, MemBlobIndex, MemBlobStore, MemDav, MemEventBus,
-    MemItipSender, MemMetadata, MemOutbound, MemPolicies, MemQuota, MemSieve, MemTrash,
+    Clock, FakeAuthenticator, FakeSearch, MemAddressBook, MemBlobIndex, MemBlobStore, MemDav,
+    MemDeliveryLog, MemEventBus, MemItipSender, MemMailboxAudit, MemMetadata, MemOutbound,
+    MemPolicies, MemQuota, MemSenderLists, MemSieve, MemSubmissions, MemTrash,
     RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
@@ -130,6 +131,11 @@ pub struct Env {
     pub principal: Principal,
     pub authz: Arc<TestAuthz>,
     pub outbound: Arc<MemOutbound>,
+    pub submissions: MemSubmissions,
+    pub delivery_log: MemDeliveryLog,
+    pub audit: MemMailboxAudit,
+    pub sender_lists: MemSenderLists,
+    pub org: MemAddressBook,
     pub bus: MemEventBus,
     /// Корзина (`purge`); настройка `trash.purge` — из `policies`.
     pub trash: MemTrash,
@@ -238,6 +244,11 @@ impl Env {
         let search = FakeSearch::default();
         let authz = Arc::new(TestAuthz::default());
         let outbound = Arc::new(MemOutbound::default());
+        let submissions = MemSubmissions::new();
+        let delivery_log = MemDeliveryLog::new();
+        let audit = MemMailboxAudit::new();
+        let sender_lists = MemSenderLists::new();
+        let org = MemAddressBook::new();
         let unpacking = Unpacking {
             inner: blobs,
             index: index.clone(),
@@ -273,6 +284,9 @@ impl Env {
                 accounts: Arc::new(meta.clone()),
                 authz: authz.clone(),
                 outbound: Some(outbound.clone()),
+                submissions: Arc::new(submissions.clone()),
+                delivery_log: Arc::new(delivery_log.clone()),
+                audit: Arc::new(audit.clone()),
                 hooks,
                 capabilities: caps,
             },
@@ -285,7 +299,15 @@ impl Env {
         .with_freebusy(
             stores.then(|| Arc::new(dav.clone()) as Arc<dyn tp_contracts::schedule::FreeBusy>),
         )
-        .with_schedule(schedule.then_some(schedule_deps));
+        .with_schedule(schedule.then_some(schedule_deps))
+        .with_sender_lists(
+            stores.then(|| {
+                Arc::new(sender_lists.clone()) as Arc<dyn tp_contracts::senders::SenderLists>
+            }),
+        )
+        .with_org(
+            stores.then(|| Arc::new(org.clone()) as Arc<dyn tp_contracts::addressbook::OrgStore>),
+        );
         Self {
             meta,
             search,
@@ -295,6 +317,11 @@ impl Env {
             principal,
             authz,
             outbound,
+            submissions,
+            delivery_log,
+            audit,
+            sender_lists,
+            org,
             bus,
             trash,
             policies,
