@@ -10,6 +10,7 @@
 //! - [`retention`] — корзина ящика: список, восстановление, срок по политике, `trash.purge` и скрытые письма;
 //! - [`app_passwords`] — пароли приложений: выпуск (значение один раз), список, отзыв;
 //! - [`transport`] — настройки транспорта: принятые домены, доверенные источники, политики доменов назначения;
+//! - [`sieve`] — правила Sieve и автоответ учётной записи, скрипт организации: проверка текста до записи;
 //! - [`init`] — первый администратор без OIDC (`thepost admin init`): локальный сокет, одноразовый токен, сессия.
 
 pub mod accounts;
@@ -21,6 +22,7 @@ pub mod groups;
 pub mod init;
 pub mod retention;
 pub mod server;
+pub mod sieve;
 #[cfg(test)]
 mod testenv;
 pub mod transport;
@@ -33,3 +35,4 @@ pub use export::{
 pub use groups::Moderation;
 pub use init::{InitConfig, InitGranted, InitReply, InitRequest};
 pub use server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
+pub use sieve::{ScriptCheck, ScriptError};

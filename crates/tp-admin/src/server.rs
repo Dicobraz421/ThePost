@@ -297,6 +297,8 @@ pub struct Admin {
     pub(crate) transport: Option<Arc<dyn TransportStore>>,
     /// Локальный вход (`admin init`, сессии); `None` — не подключено (обмен отвечает 503).
     pub(crate) local: Option<Arc<Local>>,
+    /// Правила Sieve и автоответ; `None` — не подключено (маршруты отвечают 503).
+    pub(crate) sieve: Option<crate::sieve::Sieve>,
 }
 
 impl fmt::Debug for Admin {
@@ -306,6 +308,7 @@ impl fmt::Debug for Admin {
             .field("cfg", &self.cfg)
             .field("transport", &self.transport.is_some())
             .field("local", &self.local.is_some())
+            .field("sieve", &self.sieve.is_some())
             .finish()
     }
 }
@@ -333,6 +336,7 @@ impl Admin {
             cfg,
             transport: None,
             local: None,
+            sieve: None,
         })
     }
 
@@ -352,6 +356,7 @@ impl Admin {
         api = crate::delivery::routes(api);
         api = crate::groups::routes(api);
         api = crate::transport::routes(api);
+        api = crate::sieve::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -662,6 +667,7 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     api.merge(crate::delivery::Doc::openapi());
     api.merge(crate::groups::Doc::openapi());
     api.merge(crate::transport::Doc::openapi());
+    api.merge(crate::sieve::Doc::openapi());
     api.merge(crate::init::Doc::openapi());
     api
 }
