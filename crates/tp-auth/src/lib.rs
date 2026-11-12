@@ -12,7 +12,7 @@
 //!   делегирования отправки (Send As / Send on Behalf);
 //! - [`gssapi`] — Kerberos: механизм SASL GSSAPI (системная MIT Kerberos — feature `gssapi`) и
 //!   [`KerberosAuthenticator`] (принципал → учётная запись);
-//! - [`sasl`] — механизмы SASL PLAIN, LOGIN, OAUTHBEARER, XOAUTH2 (и GSSAPI) для smtp и imap; пароль, токен
+//! - [`sasl`] — механизмы SASL PLAIN, LOGIN, OAUTHBEARER, XOAUTH2 (и GSSAPI) для служб smtp, imap и sieve; пароль, токен
 //!   и принципал Kerberos в одном обмене проверяет [`CredentialsRouter`].
 
 use std::collections::BTreeSet;

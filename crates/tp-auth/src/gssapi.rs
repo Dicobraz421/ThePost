@@ -34,9 +34,11 @@ const NO_SECURITY_LAYER: u8 = 0x01;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct GssapiConfig {
-    /// Keytab служб (`smtp/узел`, `imap/узел`); не задан — keytab MIT по умолчанию или `KRB5_KTNAME`.
+    /// Keytab служб — по принципалу на службу: `smtp/<узел>`, `imap/<узел>`, `sieve/<узел>` (ManageSieve,
+    /// RFC 5804); не задан — keytab MIT по умолчанию или `KRB5_KTNAME`.
     pub keytab: Option<PathBuf>,
-    /// Узел в принципале службы (`<служба>/<узел>@ОБЛАСТЬ`); не задан — любой ключ из keytab.
+    /// Узел в принципале службы (`<служба>/<узел>@ОБЛАСТЬ`); не задан — ключ из keytab с любым узлом, но
+    /// только своей службы: билет `imap/…` для службы `sieve` не принимается.
     pub hostname: Option<String>,
     /// Область Kerberos (верхний регистр) → почтовый домен имени входа; нет области — она в нижнем регистре.
     pub realms: BTreeMap<String, String>,
@@ -268,6 +270,14 @@ impl SaslSession for Exchange {
     }
 }
 
+/// Билет выписан службе `service`: принципал акцептора — `<service>/<узел>[@ОБЛАСТЬ]`.
+#[cfg(any(test, feature = "gssapi"))]
+fn ticket_for(target: &str, service: &str) -> bool {
+    target
+        .split_once('/')
+        .is_some_and(|(s, _)| !s.is_empty() && s == service)
+}
+
 /// Системная MIT Kerberos через `libgssapi`.
 #[cfg(feature = "gssapi")]
 mod system {
@@ -277,7 +287,7 @@ mod system {
     use libgssapi::oid::{GSS_MECH_KRB5, GSS_NT_HOSTBASED_SERVICE, OidSet};
     use tp_contracts::{Error, Result};
 
-    use super::{Acceptor, Acceptors};
+    use super::{Acceptor, Acceptors, ticket_for};
 
     fn gss(e: libgssapi::error::Error) -> Error {
         Error::Internal(format!("GSSAPI: {e}"))
@@ -291,6 +301,7 @@ mod system {
         fn acceptor(&self, service: &str) -> Result<Box<dyn Acceptor>> {
             Ok(Box::new(SystemAcceptor {
                 target: self.hostname.as_ref().map(|h| format!("{service}@{h}")),
+                service: service.to_owned(),
                 ctx: None,
             }))
         }
@@ -299,6 +310,8 @@ mod system {
     struct SystemAcceptor {
         /// Служба `<служба>@<узел>` (GSS_C_NT_HOSTBASED_SERVICE); `None` — любой ключ keytab.
         target: Option<String>,
+        /// Имя службы SASL: билет должен быть выписан ей и при `target = None`.
+        service: String,
         ctx: Option<ServerCtx>,
     }
 
@@ -327,10 +340,19 @@ mod system {
         fn step(&mut self, token: &[u8]) -> Result<(Vec<u8>, bool)> {
             let ctx = self.ctx()?;
             let out = ctx.step(token, None).map_err(gss)?;
-            Ok((
+            let (out, done) = (
                 out.map(|b| b.to_vec()).unwrap_or_default(),
                 ctx.is_complete(),
-            ))
+            );
+            if done {
+                // Без `hostname` акцептор берёт любой ключ keytab — билет другой службы узла отклоняем.
+                let target = ctx.target_name().map_err(gss)?;
+                let shown = target.display_name().map_err(gss)?;
+                if !std::str::from_utf8(&shown).is_ok_and(|t| ticket_for(t, &self.service)) {
+                    return Err(Error::Forbidden);
+                }
+            }
+            Ok((out, done))
         }
 
         fn wrap(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
@@ -430,11 +452,25 @@ mod tests {
         tls: false,
     };
 
+    /// ManageSieve (RFC 5804, раздел 2.1: имя службы SASL — `sieve`).
+    const SIEVE: SaslContext = SaslContext {
+        service: "sieve",
+        tls: false,
+    };
+
     /// Полный обмен RFC 4752: токены контекста, пустой ответ, слои, выбор клиента с authzid.
     async fn exchange(client: &'static str, choice: &[u8]) -> Result<SaslStep> {
+        exchange_for(&IMAP, client, choice).await
+    }
+
+    async fn exchange_for(
+        ctx: &SaslContext,
+        client: &'static str,
+        choice: &[u8],
+    ) -> Result<SaslStep> {
         let (sasl, log) = server(client).await;
         assert_eq!(sasl.mechanisms(false), vec![Mechanism::Gssapi]);
-        let mut s = sasl.start(Mechanism::Gssapi, &IMAP)?;
+        let mut s = sasl.start(Mechanism::Gssapi, ctx)?;
         assert_eq!(s.step(None).await?, SaslStep::Challenge(Vec::new()));
         assert_eq!(
             s.step(Some(b"t1")).await?,
@@ -449,11 +485,43 @@ mod tests {
             SaslStep::Challenge(b"W\x01\0\0\0".to_vec())
         );
         let res = s.step(Some(&[b"W".as_slice(), choice].concat())).await;
-        assert_eq!(
-            log.lock().expect("lock").first().map(String::as_str),
-            Some("imap")
-        );
+        assert_eq!(*log.lock().expect("lock"), [ctx.service]);
         res
+    }
+
+    /// ManageSieve: акцептор запрошен для службы `sieve`, вход и отказы — как у остальных служб.
+    #[tokio::test]
+    async fn sieve_service() {
+        let SaslStep::Done(p) = exchange_for(&SIEVE, "alice@CORP.EXAMPLE", b"\x01\0\0\0")
+            .await
+            .expect("done")
+        else {
+            panic!("not done");
+        };
+        assert_eq!(p.login, "alice@example.org");
+        assert_eq!(
+            exchange_for(&SIEVE, "sieve/mx@CORP.EXAMPLE", b"\x01\0\0\0").await,
+            Ok(SaslStep::Fail(SaslFailure::Authentication)),
+            "принципал службы — не пользователь"
+        );
+    }
+
+    /// Билет принимается только для своей службы: `imap/…` для `sieve` — нет.
+    #[test]
+    fn ticket_service() {
+        assert!(ticket_for("sieve/mx.example.org@CORP.EXAMPLE", "sieve"));
+        assert!(ticket_for("sieve/mx.example.org", "sieve"));
+        for other in [
+            "imap/mx.example.org@CORP.EXAMPLE",
+            "smtp/mx.example.org@CORP.EXAMPLE",
+            "sieves/mx.example.org@CORP.EXAMPLE",
+            "SIEVE/mx.example.org@CORP.EXAMPLE",
+            "sieve@CORP.EXAMPLE",
+            "/mx.example.org@CORP.EXAMPLE",
+        ] {
+            assert!(!ticket_for(other, "sieve"), "{other}");
+        }
+        assert!(!ticket_for("sieve/mx.example.org@CORP.EXAMPLE", "imap"));
     }
 
     #[tokio::test]
