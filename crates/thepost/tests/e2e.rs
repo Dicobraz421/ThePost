@@ -2,7 +2,8 @@
 //! против PostgreSQL — приём SMTP (объекты письма хранятся сжатыми, приём и доставка — в журнале доставки) → IMAP
 //! FETCH и JMAP Email/get → поиск → удаление в корзину → восстановление → «очистить корзину» в IMAP и JMAP по
 //! настройке `trash.purge` → отправка из JMAP локальному адресату (CMP-07) → истечение срока корзины (роль
-//! maintenance). Вход — через защиту от перебора.
+//! maintenance). Вход — через защиту от перебора. По пути — ManageSieve в роли imap (`STARTTLS`, вход `PLAIN`,
+//! `LISTSCRIPTS`) и событие календаря из JMAP (`CalendarEvent/set`), видимое в CalDAV (APP-27).
 //!
 //! Настройки транспорта без перезапуска (APP-09): доверенный источник, созданный через Admin API (вход — `admin init`
 //! по локальному сокету и сессия), действует на следующую сессию SMTP; правила потока почты тестового модуля
@@ -137,6 +138,10 @@ smtp:
 imap:
   listeners:
     - {{ listen: \"127.0.0.1:0\", implicit_tls: true }}
+sieve:
+  managesieve:
+    listen:
+      - {{ listen: \"127.0.0.1:0\" }}
 http:
   jmap: {{ listen: \"127.0.0.1:0\", allow_plaintext: true }}
 search:
@@ -338,6 +343,43 @@ fn exists(select: &str) -> u32 {
         .unwrap_or_else(|| panic!("нет EXISTS: {select}"))
 }
 
+// ---------- ManageSieve ----------
+
+/// Ответ ManageSieve до строки итога (`OK`, `NO`, `BYE`) включительно.
+async fn sieve_reply<S: AsyncRead + Unpin>(s: &mut S) -> String {
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        s.read_exact(&mut byte).await.expect("managesieve read");
+        buf.push(byte[0]);
+        if !buf.ends_with(b"\r\n") {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let last = text.trim_end().rsplit("\r\n").next().unwrap_or_default();
+        if ["OK", "NO", "BYE"].iter().any(|k| last.starts_with(k)) {
+            return text.into_owned();
+        }
+    }
+}
+
+/// Команда ManageSieve и её ответ.
+async fn sieve_cmd<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, cmd: &str) -> String {
+    s.write_all(format!("{cmd}\r\n").as_bytes())
+        .await
+        .expect("managesieve write");
+    sieve_reply(s).await
+}
+
+/// Итог ответа ManageSieve — `OK`.
+fn sieve_ok(reply: &str) -> bool {
+    reply
+        .trim_end()
+        .rsplit("\r\n")
+        .next()
+        .is_some_and(|l| l.starts_with("OK"))
+}
+
 // ---------- JMAP ----------
 
 /// Запрос HTTP/1.1 с заголовком `Authorization` (`Basic …`, `Bearer …`): код и тело (с разбором `chunked`).
@@ -432,6 +474,7 @@ impl Jmap {
                 "urn:ietf:params:jmap:core",
                 "urn:ietf:params:jmap:mail",
                 "urn:ietf:params:jmap:submission",
+                "urn:ietf:params:jmap:calendars",
             ],
             "methodCalls": [[method, args, "c0"]],
         });
@@ -647,6 +690,96 @@ async fn mvp_mail_flow() {
     let books = format!("/dav/addressbooks/{login}/");
     let listed = dav(web, "PROPFIND", &books, &basic, "1").await;
     assert!(listed.starts_with("HTTP/1.1 207"), "{listed}");
+
+    // 3б. Событие из JMAP видно в CalDAV (APP-27): одно хранилище календарей.
+    let (code, body) = http(web, "GET", "/jmap/session", &basic, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let session: Value = serde_json::from_slice(&body).expect("session");
+    for capability in [
+        "urn:ietf:params:jmap:contacts",
+        "urn:ietf:params:jmap:calendars",
+        "urn:ietf:params:jmap:sieve",
+        "urn:ietf:params:jmap:vacationresponse",
+    ] {
+        assert!(
+            session["capabilities"][capability].is_object(),
+            "{capability}: {session}"
+        );
+    }
+    let set = jmap
+        .call(
+            "CalendarEvent/set",
+            json!({ "accountId": jmap.account, "create": { "e": {
+                "uid": "app-27-e2e", "title": "Planning e2e",
+                "start": "2026-12-01T10:00:00", "timeZone": "Europe/Moscow", "duration": "PT1H",
+            } } }),
+        )
+        .await;
+    assert!(set["created"]["e"]["id"].is_string(), "{set}");
+    let hrefs = |listing: &str| -> Vec<String> {
+        listing
+            .split("<d:href>")
+            .skip(1)
+            .filter_map(|r| r.split("</d:href>").next().map(str::to_owned))
+            .collect()
+    };
+    let listed = dav(web, "PROPFIND", &home, &basic, "1").await;
+    let mut event = None;
+    for calendar in hrefs(&listed).into_iter().filter(|h| *h != home) {
+        let objects = dav(web, "PROPFIND", &calendar, &basic, "1").await;
+        if let Some(href) = hrefs(&objects).into_iter().find(|h| h.ends_with(".ics")) {
+            event = Some(href);
+        }
+    }
+    let event = event.unwrap_or_else(|| panic!("события нет в CalDAV: {listed}"));
+    let ics = dav(web, "GET", &event, &basic, "0").await;
+    assert!(ics.starts_with("HTTP/1.1 200"), "{ics}");
+    assert!(ics.contains("UID:app-27-e2e"), "{ics}");
+    assert!(ics.contains("SUMMARY:Planning e2e"), "{ics}");
+
+    // 3в. ManageSieve в роли imap (APP-27): STARTTLS, вход PLAIN (служба SASL `sieve`), LISTSCRIPTS.
+    let mut tcp = TcpStream::connect(addr(&running, "managesieve"))
+        .await
+        .expect("managesieve connect");
+    let greeting = sieve_reply(&mut tcp).await;
+    assert!(sieve_ok(&greeting), "{greeting}");
+    assert!(greeting.contains("\"STARTTLS\""), "{greeting}");
+    assert!(sieve_ok(&sieve_cmd(&mut tcp, "STARTTLS").await));
+    let name = ServerName::try_from("localhost").expect("name");
+    let mut sieve = tls_connector()
+        .connect(name, tcp)
+        .await
+        .expect("managesieve tls");
+    let capabilities = sieve_reply(&mut sieve).await;
+    assert!(sieve_ok(&capabilities), "{capabilities}");
+    let sasl = capabilities
+        .split("\r\n")
+        .find(|l| l.starts_with("\"SASL\""))
+        .unwrap_or_else(|| panic!("нет SASL: {capabilities}"));
+    assert!(sasl.contains("PLAIN"), "{sasl}");
+    assert!(sasl.contains("OAUTHBEARER"), "{sasl}");
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let wrong = b64.encode(format!("\0{login}\0wrong-password"));
+    let denied = sieve_cmd(&mut sieve, &format!("AUTHENTICATE \"PLAIN\" \"{wrong}\"")).await;
+    assert!(denied.starts_with("NO"), "{denied}");
+    let plain = b64.encode(format!("\0{login}\0{app_password}"));
+    let entered = sieve_cmd(&mut sieve, &format!("AUTHENTICATE \"PLAIN\" \"{plain}\"")).await;
+    assert!(sieve_ok(&entered), "{entered}");
+    let script = "require \"fileinto\";\r\nfileinto \"INBOX\";\r\n";
+    let put = sieve_cmd(
+        &mut sieve,
+        &format!("PUTSCRIPT \"e2e\" {{{}+}}\r\n{script}", script.len()),
+    )
+    .await;
+    assert!(sieve_ok(&put), "{put}");
+    let scripts = sieve_cmd(&mut sieve, "LISTSCRIPTS").await;
+    assert!(sieve_ok(&scripts), "{scripts}");
+    assert!(scripts.contains("\"e2e\""), "{scripts}");
+    assert!(sieve_ok(
+        &sieve_cmd(&mut sieve, "DELETESCRIPT \"e2e\"").await
+    ));
+    let bye = sieve_cmd(&mut sieve, "LOGOUT").await;
+    assert!(sieve_ok(&bye), "{bye}");
 
     // 4. Поиск: индексатор обрабатывает журнал событий, запрос — по полнотекстовому индексу.
     let until = deadline();

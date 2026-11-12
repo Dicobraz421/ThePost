@@ -496,12 +496,15 @@ impl RoleSetup<'_> {
                 )
             }
             Role::Imap => (
-                Arc::new(ImapRole::new(
-                    self.services.imap(),
-                    self.services.imap_extensions(),
-                    self.certs.clone(),
-                    self.sockets.clone(),
-                )),
+                Arc::new(
+                    ImapRole::new(
+                        self.services.imap(),
+                        self.services.imap_extensions(),
+                        self.certs.clone(),
+                        self.sockets.clone(),
+                    )
+                    .with_managesieve(self.services.managesieve(profile)),
+                ),
                 section(sections::IMAP)?,
             ),
             Role::Jmap => {
@@ -756,6 +759,12 @@ fn listen_addrs(cfg: &Config) -> Vec<SocketAddr> {
         if imap.pop3.enabled {
             out.extend(imap.pop3.listeners.iter().map(|e| e.listen));
         }
+    }
+    // ManageSieve — в роли imap.
+    if roles.contains(Role::Imap)
+        && let Ok(sieve) = cfg.section::<tp_sieve::SieveConfig>(sections::SIEVE)
+    {
+        out.extend(sieve.managesieve.listen.iter().map(|e| e.listen));
     }
     out
 }
