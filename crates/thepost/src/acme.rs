@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 use tp_contracts::role::CancellationToken;
+use tp_contracts::secrets::SecretStore;
 use tp_contracts::{Error, Result};
 use tp_platform::acme::challenge_router;
 use tp_platform::{Acme, AcmeConfig, Config, Http01Challenges, TlsCerts, TlsConfig};
@@ -21,20 +22,23 @@ use crate::sections::{HTTP, HttpSection};
 pub const ACME_HTTP: &str = "acme-http01";
 
 /// Клиент ACME узла: секция `acme`, ответы на проверки и слушатель HTTP-01.
-#[derive(Debug)]
 pub struct NodeAcme {
     cfg: AcmeConfig,
     tls: TlsConfig,
     challenges: Http01Challenges,
+    /// Хранилище секретов узла: ключ TLS (`tls.key`) пишется и читается в нём.
+    keys: Arc<dyn SecretStore>,
     /// Слушатель проверок HTTP-01.
     pub listener: JoinHandle<()>,
 }
 
 /// При `acme.enabled` — слушатель проверок HTTP-01 до сигнала `shutdown` (сокет systemd из `sockets` или новый; адрес —
 /// в реестре `sockets` под [`ACME_HTTP`]) и,
-/// если файла сертификата `tls.cert_file` нет, первый выпуск сертификата; иначе `None`.
+/// если файла сертификата `tls.cert_file` нет, первый выпуск сертификата (ключ — в секрет `tls.key` хранилища `keys`);
+/// иначе `None`.
 pub async fn prepare(
     cfg: &Config,
+    keys: Arc<dyn SecretStore>,
     sockets: &Sockets,
     shutdown: CancellationToken,
 ) -> Result<Option<NodeAcme>> {
@@ -52,6 +56,7 @@ pub async fn prepare(
         cfg: (*acme).clone(),
         tls,
         challenges,
+        keys,
         listener,
     };
     let exists = tokio::fs::metadata(&node.tls.cert_file)
@@ -73,6 +78,15 @@ pub async fn prepare(
     Ok(Some(node))
 }
 
+impl std::fmt::Debug for NodeAcme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeAcme")
+            .field("cfg", &self.cfg)
+            .field("tls", &self.tls)
+            .finish_non_exhaustive()
+    }
+}
+
 impl NodeAcme {
     fn client(&self, certs: Option<Arc<TlsCerts>>) -> Acme {
         Acme::new(
@@ -80,6 +94,7 @@ impl NodeAcme {
             self.tls.clone(),
             self.challenges.clone(),
             certs,
+            self.keys.clone(),
         )
     }
 
@@ -126,6 +141,11 @@ mod tests {
     use super::*;
     use crate::sections::registry;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tp_testkit::MemSecretStore;
+
+    fn keys() -> Arc<dyn SecretStore> {
+        Arc::new(MemSecretStore::default())
+    }
 
     fn config(yaml: &str) -> Config {
         // В сборке оба провайдера rustls: клиенту ACME (instant-acme) нужен процессный.
@@ -164,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_without_section() {
         let sockets = Sockets::default();
-        let acme = prepare(&config(BASE), &sockets, CancellationToken::new())
+        let acme = prepare(&config(BASE), keys(), &sockets, CancellationToken::new())
             .await
             .expect("prepare");
         assert!(acme.is_none());
@@ -193,7 +213,7 @@ mod tests {
         ));
         let sockets = Sockets::default();
         let shutdown = CancellationToken::new();
-        let acme = prepare(&cfg, &sockets, shutdown.clone())
+        let acme = prepare(&cfg, keys(), &sockets, shutdown.clone())
             .await
             .expect("prepare")
             .expect("enabled");
@@ -219,7 +239,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
         let cfg = config(&format!(
-            "{BASE}tls:\n  cert_file: {}\n  key_file: {}\n\
+            "{BASE}tls:\n  cert_file: {}\n  key_file: {}\n  key: {{ secret: \"thepost/tls#key\" }}\n\
              acme:\n  enabled: true\n  domains: [mail.example.org]\n  state_dir: {}\n  \
              directory_url: https://127.0.0.1:1/directory\n\
              http:\n  acme: {{ listen: 127.0.0.1:0 }}\n",
@@ -228,7 +248,7 @@ mod tests {
             path(&dir.path().join("acme")),
         ));
         let sockets = Sockets::default();
-        let e = prepare(&cfg, &sockets, CancellationToken::new())
+        let e = prepare(&cfg, keys(), &sockets, CancellationToken::new())
             .await
             .expect_err("no acme server")
             .to_string();

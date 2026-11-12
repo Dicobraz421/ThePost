@@ -1,5 +1,5 @@
 # Цели fuzz разборщиков SMTP (SMTP-19), в каталоге crates/tp-smtp:
-#   cargo +nightly fuzz run <цель> fuzz/corpus/<цель> -- -max_total_time=600
+#   cargo +nightly fuzz run -O <цель> fuzz/corpus/<цель> -- -max_total_time=600
 # Цели: session — поток команд и данных сессии (smtp-in или submission по первому байту); esmtp — параметры
 # расширений ESMTP в MAIL FROM и RCPT TO; proxy_v2 — заголовок PROXY protocol v2 перед сессией smtp-in
 # (соединение loopback со слушателем tp-platform); milter — поток ответов фильтра Milter на проверку письма.
@@ -47,3 +47,13 @@ path = "fuzz_targets/milter.rs"
 test = false
 doc = false
 bench = false
+
+# Сборка — `cargo fuzz -O` (fuzz.yml): проверки отладки и переполнений — у своего кода, mail-parser — как в
+# выпуске. Его debug_assert!(false) на битом MIME — не паника выпуска: там разбор восстанавливается (FIX-06).
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+[profile.release.package.mail-parser]
+debug-assertions = false
+overflow-checks = false

@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::PgPool;
 use time::OffsetDateTime;
 use tp_contracts::acl::AclStore;
 use tp_contracts::auth::SendRight;
@@ -19,6 +18,7 @@ use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::search::{IndexManifestStore, ManifestUpdate, RebuildReason, RebuildRequest};
 use tp_contracts::{BlobHash, BlobKey, Gen, MailboxId, ModSeq, Result, TenantId};
 use tp_meta::PgMeta;
+use tp_meta::pool::DbPool;
 use tp_meta::shards::{ReadIntent, ShardId, ShardResolver};
 use tp_testkit::infra::MemEventBus;
 
@@ -50,7 +50,7 @@ async fn inbox(meta: &PgMeta, scope: AccountScope) -> MailboxId {
 }
 
 /// Строк таблицы `table` учётной записи в БД `pool` (все организации).
-async fn rows(pool: &PgPool, table: &str, scope: AccountScope) -> i64 {
+async fn rows(pool: &DbPool, table: &str, scope: AccountScope) -> i64 {
     let mut tx = tp_meta::schema::begin_system(pool).await.expect("begin");
     let n = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT count(*) FROM {table} WHERE account_id = $1"
@@ -256,7 +256,7 @@ impl ShardResolver for OneShard {
         Ok(ShardId::MAIN)
     }
 
-    async fn pool(&self, _: ShardId, _: ReadIntent) -> Result<PgPool> {
+    async fn pool(&self, _: ShardId, _: ReadIntent) -> Result<DbPool> {
         self.lookups.fetch_add(1, Ordering::SeqCst);
         Err(tp_contracts::Error::internal("основная БД — пул хранилищ"))
     }

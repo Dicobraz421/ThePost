@@ -4,6 +4,7 @@
 # Падение цели — issue «fuzz: <крейт>/<цель>» с входом и командой воспроизведения; открытый issue той же цели
 # получает комментарий вместо нового. На PR не запускается (бюджет CI ≤7 мин).
 # Начальный корпус tp-sieve (CI-09) — .github/fuzz-seeds/tp-sieve.
+# Сборка `-O`: проверки отладки и переполнений задаёт [profile.release] в fuzz/Cargo.toml крейта.
 name: Fuzz
 
 on:
@@ -85,7 +86,7 @@ jobs:
           key: fuzz-corpus-${{ matrix.name }}-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.name }}-${{ matrix.target }}-
       - id: build
-        run: cargo +nightly fuzz build --target "$FUZZ_TRIPLE" "$TARGET"
+        run: cargo +nightly fuzz build -O --target "$FUZZ_TRIPLE" "$TARGET"
       - id: run
         name: Фаззинг
         run: |
@@ -109,7 +110,7 @@ jobs:
             done
             seeds+=("$s")
           fi
-          cargo +nightly fuzz run --target "$FUZZ_TRIPLE" "$TARGET" "fuzz/corpus/$TARGET" "${seeds[@]}" -- \
+          cargo +nightly fuzz run -O --target "$FUZZ_TRIPLE" "$TARGET" "fuzz/corpus/$TARGET" "${seeds[@]}" -- \
             -max_total_time="$SECONDS_PER_TARGET" -timeout=30 -print_final_stats=1 2>&1 | tee "$RUNNER_TEMP/fuzz.log"
       - name: Корпус в кэш
         if: always() && steps.build.outcome == 'success'
@@ -156,7 +157,7 @@ jobs:
                 base64 -w 76 "$art"
                 echo "B64"
               fi
-              echo "cargo +nightly fuzz run $TARGET $f"
+              echo "cargo +nightly fuzz run -O $TARGET $f"
               echo '```'
             else
               echo "Прогон упал без входа в fuzz/artifacts — см. журнал."

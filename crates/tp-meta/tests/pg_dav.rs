@@ -16,6 +16,7 @@ use tp_contracts::dav::{
 use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::{AccountId, DomainId, Error, ModSeq, TenantId};
 use tp_meta::dav::DavConfig;
+use tp_meta::pool::DbPool;
 use tp_meta::{MetaConfig, PgMeta, schema};
 use tp_testkit::MemEventBus;
 use tp_testkit::suite;
@@ -161,7 +162,7 @@ async fn rls_hides_other_tenants() {
 }
 
 /// Отдельная БД с миграциями до версии `version`; возвращает пул к ней и её имя.
-async fn db_until(url: &str, version: i64) -> (PgPool, PgPool, String) {
+async fn db_until(url: &str, version: i64) -> (PgPool, DbPool, String) {
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect(url)
@@ -185,7 +186,7 @@ async fn db_until(url: &str, version: i64) -> (PgPool, PgPool, String) {
         .run(&pool)
         .await
         .expect("migrate until");
-    (admin, pool, name)
+    (admin, common::db(pool), name)
 }
 
 /// Миграция 0021 на базе прежней схемы: учётная запись, заведённая до миграции, получает календари.
@@ -262,7 +263,7 @@ async fn collections_live_on_account_shard() {
         .await
         .expect("create");
     put_card(&t.meta, scope, &book, "a.vcf").await;
-    let count = async |pool: &PgPool| -> i64 {
+    let count = async |pool: &DbPool| -> i64 {
         let mut tx = schema::begin_system(pool).await.expect("begin");
         let n = sqlx::query_scalar("SELECT count(*) FROM dav_objects WHERE account_id = $1")
             .bind(scope.account.as_uuid())
