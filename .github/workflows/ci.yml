@@ -180,27 +180,27 @@ jobs:
         with:
           checks: 'true'
 
-  # Только main, бета и ручной запуск: release-сборка и артефакт.
+  # Только main, бета и ручной запуск: release-сборка и артефакт (решение 116, CI-14) — тем же путём, что выпуск
+  # в beta.yml (.github/actions/release-build: cross, запуск на qemu Nehalem). В PR не выполняется.
   release:
     needs: [changes, test]
     if: >-
       always() && needs.test.result != 'failure' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.3
+      - id: build
+        uses: ./.github/actions/release-build
         with:
-          shared-key: release
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - id: console
-        uses: ./.github/actions/console
-      - run: cargo build --release --locked -p thepost ${{ steps.console.outputs.cargo-args }}
-      - run: target/release/thepost --version || target/release/thepost
+          target: x86_64-unknown-linux-gnu
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: thepost-linux-x86_64
-          path: target/release/thepost
+          path: ${{ steps.build.outputs.binary }}
+          if-no-files-found: error
 
   # Единственный required check: зелёный, если всё нужное прошло или было пропущено.
   gate:
