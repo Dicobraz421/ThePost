@@ -12,6 +12,10 @@
 //! (`Routes::watch` запускает `serve`). Правила потока почты — модуль (`Registry::mail_flow`): один раз на письмо в
 //! доставке smtp-in и submission и в JMAP `EmailSubmission/set` (доставка JMAP их не применяет повторно).
 //!
+//! Планирование встреч (APP-28, SRS 4.4) — одни зависимости на узел ([`Services::schedule`]): приём iTIP в календари
+//! (`tp_dav::ItipInbox`) — у CalDAV, JMAP и доставки smtp-in (iMIP извне, `Delivery::with_itip`); приглашения
+//! внешним участникам — письмом (`tp_dav::ImipSender`) через ту же доставку, что у JMAP; занятость — `PgMeta`.
+//!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
 use std::sync::Arc;
@@ -52,7 +56,7 @@ use tp_smtp::{
 
 use crate::infra;
 use crate::sections::{
-    ADMIN, AUTH, AdminSection, AuthSection, JMAP, MAILSTORE, SEARCH, SIEVE, SMTP,
+    ADMIN, AUTH, AdminSection, AuthSection, DAV, JMAP, MAILSTORE, SEARCH, SIEVE, SMTP,
 };
 
 /// Общие сервисы ролей узла.
@@ -121,6 +125,8 @@ pub struct Services {
     pub sieve_limits: tp_sieve::Limits,
     /// Секция `sieve` на момент запуска: слушатели и лимиты сеансов ManageSieve (APP-27).
     pub sieve: Arc<tp_sieve::SieveConfig>,
+    /// Приём iTIP в календари учётных записей (APP-28): общий для CalDAV, JMAP и доставки smtp-in.
+    pub itip: Arc<tp_dav::ItipInbox>,
 }
 
 impl std::fmt::Debug for Services {
@@ -294,6 +300,11 @@ impl Services {
         // Секции, читаемые ролями при запуске, проверяются здесь: ошибка — до запуска ролей.
         cfg.section::<tp_jmap::JmapConfig>(JMAP)?;
         cfg.section::<AdminSection>(ADMIN)?;
+        // Приём iTIP — с настройками секции `dav` (календарь по умолчанию, входящие планирования, лимиты).
+        let itip = Arc::new(tp_dav::ItipInbox::new(
+            Arc::new(meta.clone()),
+            (*cfg.section::<tp_dav::DavConfig>(DAV)?).clone(),
+        ));
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
         let routes = Arc::new(Routes::new(Arc::new(meta.clone())));
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
@@ -336,6 +347,7 @@ impl Services {
             rules,
             sieve_limits,
             sieve: sieve_section,
+            itip,
         })
     }
 
@@ -343,7 +355,8 @@ impl Services {
     /// группы рассылки с модерацией, журнал доставки, настройки транспорта, пересылка (SRS, ARC) и правила потока
     /// почты модуля (если включён).
     pub fn delivery(&self, smtp: &SmtpConfig) -> Result<Arc<Delivery>> {
-        let delivery = self.base_delivery(smtp)?;
+        // Приглашения и ответы извне (iMIP, SMTP-33) после доставки в ящик применяются к календарю получателя.
+        let delivery = self.base_delivery(smtp)?.with_itip(self.itip.clone());
         Ok(Arc::new(match &self.mail_flow {
             Some(flow) => delivery.with_mail_flow(
                 flow.clone(),
@@ -384,6 +397,19 @@ impl Services {
             .with_transport(self.routes.clone())
             .with_forwarding(Arc::new(forwarding))
             .with_rules(self.rules.clone()))
+    }
+
+    /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
+    /// записям организации сообщения iTIP кладутся прямо в календарь ([`Services::itip`]), остальным адресам —
+    /// письмом iMIP через `outbound` (локальные получатели — в ящики, внешние — в очередь с подписью DKIM);
+    /// занятость — из `PgMeta`.
+    fn schedule(&self, outbound: Arc<dyn Outbound>) -> tp_dav::ScheduleDeps {
+        tp_dav::ScheduleDeps {
+            accounts: Arc::new(self.meta.clone()),
+            delivery: self.itip.clone(),
+            sender: Some(Arc::new(tp_dav::ImipSender::new(outbound))),
+            freebusy: Arc::new(self.meta.clone()),
+        }
     }
 
     /// Доверенные источники приёма smtp-in и submission (шлюз, приложения) из снимков узла.
@@ -499,7 +525,7 @@ impl Services {
             bus: self.bus.clone(),
             accounts: Arc::new(self.meta.clone()),
             authz: self.authz.clone(),
-            outbound: Some(outbound),
+            outbound: Some(outbound.clone()),
             hooks: self.hooks.clone(),
             capabilities: ext.jmap_capabilities().to_vec(),
             trash: Arc::new(self.meta.clone()),
@@ -513,7 +539,9 @@ impl Services {
             .with_sieve(Some(Arc::new(self.meta.clone())))
             // Контакты и календари (JMAP-25…29) — то же хранилище, что у CalDAV и CardDAV; занятость — JMAP-30.
             .with_dav(Some(Arc::new(self.meta.clone())))
-            .with_freebusy(Some(Arc::new(self.meta.clone()))))
+            .with_freebusy(Some(Arc::new(self.meta.clone())))
+            // Приглашения из JMAP (`sendSchedulingMessages`, JMAP-31) — теми же зависимостями, что у CalDAV.
+            .with_schedule(Some(self.schedule(outbound))))
     }
 
     /// Маршруты календарей и контактов (CalDAV, CardDAV; APP-29): хранилище — `PgMeta`, вход — тот же, что у
@@ -521,29 +549,31 @@ impl Services {
     /// «Организация» (группы, скрытые из адресной книги, в неё не попадают); без каталога её нет (SRS 4.4).
     /// `well_known` — добавить перенаправления `/.well-known/caldav` и `/.well-known/carddav` на `/dav/`
     /// (RFC 6764 §5): для слушателя без JMAP, который отдаёт их сам по `jmap.autoconfig`.
-    pub fn dav(&self, cfg: tp_dav::DavConfig, well_known: bool) -> axum::Router {
+    /// Планирование встреч (APP-28): приглашения, ответы и отмены рассылает сервер ([`Services::schedule`]);
+    /// письма iMIP уходят через доставку SMTP с настройками `smtp`.
+    pub fn dav(
+        &self,
+        cfg: tp_dav::DavConfig,
+        smtp: &SmtpConfig,
+        well_known: bool,
+    ) -> Result<axum::Router> {
         let deps = tp_dav::Deps {
             auth: self.authn.clone(),
             store: Arc::new(self.meta.clone()),
         };
-        let router = match &self.directory {
-            Some(directory) => tp_dav::router_with_gal(
-                deps,
-                tp_dav::GalDeps {
-                    directory: directory.clone(),
-                    groups: Some(Arc::new(self.meta.clone())),
-                },
-                cfg,
-            ),
-            None => tp_dav::router(deps, cfg),
-        };
+        let gal = self.directory.as_ref().map(|directory| tp_dav::GalDeps {
+            directory: directory.clone(),
+            groups: Some(Arc::new(self.meta.clone())),
+        });
+        let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
+        let router = tp_dav::router_with(deps, gal, Some(self.schedule(outbound)), cfg);
         if !well_known {
-            return router;
+            return Ok(router);
         }
         let context = || async { axum::response::Redirect::permanent(tp_dav::PREFIX) };
-        router
+        Ok(router
             .route("/.well-known/caldav", axum::routing::any(context))
-            .route("/.well-known/carddav", axum::routing::any(context))
+            .route("/.well-known/carddav", axum::routing::any(context)))
     }
 
     /// Admin API.

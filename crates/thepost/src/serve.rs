@@ -518,7 +518,7 @@ impl RoleSetup<'_> {
                 // Календари и контакты без `http.dav` — на этом же слушателе (один порт с JMAP, APP-29).
                 let mut router = jmap.router();
                 if self.cfg.roles().contains(Role::Dav) && http.dav.is_none() {
-                    router = router.merge(self.services.dav(self.dav_config()?, false));
+                    router = router.merge(self.services.dav(self.dav_config()?, &smtp, false)?);
                 }
                 let service = HttpRole::new(
                     role,
@@ -558,7 +558,7 @@ impl RoleSetup<'_> {
                 (listener, false) => {
                     let service = HttpRole::new(
                         role,
-                        self.services.dav(self.dav_config()?, true),
+                        self.services.dav(self.dav_config()?, &*smtp()?, true)?,
                         listener.cloned(),
                         profile,
                         self.certs.clone(),
