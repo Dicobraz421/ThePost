@@ -120,9 +120,24 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0026_rcpts_per_hour.sql"),
     ),
     (
+        27,
+        "submissions mailbox audit",
+        include_str!("../migrations/0027_submissions_mailbox_audit.sql"),
+    ),
+    (
         28,
+        "audit export",
+        include_str!("../migrations/0028_audit_export.sql"),
+    ),
+    (
+        29,
+        "address book",
+        include_str!("../migrations/0029_address_book.sql"),
+    ),
+    (
+        30,
         "contracts 38",
-        include_str!("../migrations/0028_contracts_38.sql"),
+        include_str!("../migrations/0030_contracts_38.sql"),
     ),
 ];
 

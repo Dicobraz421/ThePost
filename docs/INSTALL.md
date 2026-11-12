@@ -9,8 +9,8 @@
   или 24.04, Astra Linux SE 1.8, РЕД ОС 8, AlmaLinux 10 или 9 (совместимость с RHEL 9 и 10), от 4 vCPU и 8 ГБ памяти
   (целевой размер для 1 000 пользователей), диск — под письма.
 - **Имя сервера** (например, `mail.example.ru`) и **почтовый домен** (`example.ru`), доступ к их DNS.
-- **Открытые порты**: 25 (приём почты), 465 и 587 (отправка), 993 и 143 (IMAP), 443 (JMAP, автонастройка),
-  80 (только для выпуска сертификата Let's Encrypt).
+- **Открытые порты**: 25 (приём почты), 465 и 587 (отправка), 993 и 143 (IMAP), 4190 (ManageSieve — правила
+  фильтрации), 443 (JMAP, автонастройка), 80 (только для выпуска сертификата Let's Encrypt).
 - Все требования к окружению и тонкости настройки (кодировка базы UTF-8 и др.) — [PREREQUISITES.md](PREREQUISITES.md).
 
 Все внутренние компоненты ставятся вместе с сервером: PostgreSQL (метаданные), OpenBao (секреты), Rspamd (антиспам).
@@ -153,10 +153,12 @@ $DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@e
 | | | 143 | STARTTLS |
 | Исходящая почта (SMTP) | `mail.example.ru` | 465 | SSL/TLS |
 | | | 587 | STARTTLS |
+| Правила фильтрации (ManageSieve) | `mail.example.ru` | 4190 | STARTTLS |
 | JMAP | `https://mail.example.ru/.well-known/jmap` | 443 | HTTPS |
 
 Имя входа — адрес целиком (`ivanov@example.ru`), пароль — пароль приложения. Подходит любой клиент IMAP и SMTP
-(например, Thunderbird), по JMAP — [Postman](https://github.com/Dicobraz421/Postman). В тестовом варианте с `example.test` клиент попросит принять
+(например, Thunderbird), правила фильтрации — клиент ManageSieve (дополнение Thunderbird Sieve, `sieve-connect`),
+по JMAP — [Postman](https://github.com/Dicobraz421/Postman). В тестовом варианте с `example.test` клиент попросит принять
 сертификат: его выпустил тестовый центр (`deploy/compose/tls/ca.pem`).
 
 ## DNS домена
@@ -171,14 +173,13 @@ $DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@e
 | `TXT _dmarc` | `v=DMARC1; p=quarantine; rua=mailto:postmaster@example.ru` |
 | `TXT <селектор>._domainkey` (DKIM) | открытый ключ подписи, см. ниже |
 
-**Подпись DKIM.** Закрытый ключ хранится в OpenBao, в `config.yaml` — только ссылка на него:
+**Подпись DKIM.** Закрытый ключ хранится в OpenBao, в `config.yaml` — только ссылка на него. Каким селектором подписывать, задаёт политика организации или домена (Admin API, поле `dkim_selector`); без неё письмо подписывается всеми ключами домена:
 
 ```yaml
 smtp:
   dkim:
     domains:
       example.ru:
-        selector: s2026
         keys:
           s2026: { algorithm: rsa-sha256, key: { secret: "thepost/dkim#example.ru" } }
 ```

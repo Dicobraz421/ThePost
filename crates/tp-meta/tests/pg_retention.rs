@@ -7,7 +7,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tp_contracts::meta::{
     AccountScope, AccountStore, MailboxStore, MessageStore, NewMailbox, NewMessage, Policy,
-    PolicyResolver, PolicyTarget, SpecialUse,
+    PolicyResolver, PolicyStore, PolicyTarget, SpecialUse,
 };
 use tp_contracts::retention::{Quota, Restored, TrashObject, TrashStore};
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, MailboxId};

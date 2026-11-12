@@ -191,28 +191,18 @@ pub trait SubmissionStore: Send + Sync + 'static {
 
     /// Изменения после состояния `since` (CTR-42): не более `limit` отправок (`limit` ≥ 1, иначе `Error::Invalid`),
     /// остальные — `has_more`. Состояние больше текущего или старше хранимой истории — `Error::Conflict` (JMAP
-    /// `cannotCalculateChanges`). По умолчанию — `Error::Internal`.
+    /// `cannotCalculateChanges`).
     async fn submission_changes(
         &self,
         scope: AccountScope,
         since: u64,
         limit: usize,
-    ) -> Result<SubmissionChanges> {
-        let _ = (scope, since, limit);
-        Err(Error::internal(
-            "SubmissionStore::submission_changes не реализован",
-        ))
-    }
+    ) -> Result<SubmissionChanges>;
 
     /// Срок хранения (CTR-42): удаляет [`UndoStatus::Final`] и [`UndoStatus::Canceled`] с `send_at` раньше `before` во
     /// всех организациях, не более `limit`; состояние учётных записей растёт, удалённые — в `destroyed` изменений.
-    /// Возвращает число удалённых. По умолчанию — `Error::Internal`.
-    async fn expire_submissions(&self, before: OffsetDateTime, limit: usize) -> Result<usize> {
-        let _ = (before, limit);
-        Err(Error::internal(
-            "SubmissionStore::expire_submissions не реализован",
-        ))
-    }
+    /// Возвращает число удалённых.
+    async fn expire_submissions(&self, before: OffsetDateTime, limit: usize) -> Result<usize>;
 }
 
 #[cfg(test)]

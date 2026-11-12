@@ -27,6 +27,7 @@ use tp_contracts::{Error, Result, TenantId};
 
 pub mod abuse;
 pub mod authz;
+pub mod dirsync;
 pub mod gssapi;
 pub mod ldap;
 pub mod oidc;
@@ -35,6 +36,7 @@ pub mod sasl;
 
 pub use abuse::{AbuseConfig, AbuseGuard, Attempt};
 pub use authz::AclAuthorizer;
+pub use dirsync::{AccountSyncReport, ContactSyncReport, DirStores, DirectorySync, RemovalPolicy};
 pub use gssapi::{Gssapi, GssapiConfig, KerberosAuthenticator};
 pub use ldap::{GroupSync, GroupSyncReport, LdapConfig, LdapDirectory};
 pub use oidc::{OidcAuthenticator, OidcConfig};
