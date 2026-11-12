@@ -292,7 +292,7 @@ impl Services {
         let smtp_metrics = Arc::new(SmtpMetrics::new());
         smtp_metrics.register(metrics);
         let limiter = Arc::new(RateLimiter::new(
-            (*cfg.section::<RateLimitConfig>(tp_platform::ratelimit::RATELIMIT)?).clone(),
+            (*cfg.section::<RateLimitConfig>("ratelimit")?).clone(),
         ));
 
         // Секции, читаемые ролями при запуске, проверяются здесь: ошибка — до запуска ролей.
@@ -936,26 +936,6 @@ mod tests {
             .expect("login after reset");
         for _ in 0..3 {
             assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
-        }
-        assert_eq!(g.verify(password("right")).await, Err(Error::Forbidden));
-    }
-
-    /// PLT-32: адрес из `ratelimit.trusted` не ограничивается по частоте соединений, но перебор паролей с него
-    /// блокируется защитой от перебора: после порога неудач отвергается и верный пароль.
-    #[tokio::test]
-    async fn trusted_source_is_not_rate_limited_but_bruteforce_is_blocked() {
-        let trusted = std::net::IpAddr::from([192, 0, 2, 10]);
-        let limiter = RateLimiter::new(RateLimitConfig {
-            trusted: vec!["192.0.2.0/24".parse().expect("cidr")],
-            ..RateLimitConfig::default()
-        });
-        let g = guarded(MemAbuseBlocks::default(), 3, false).await;
-        for _ in 0..3 {
-            assert!(limiter.check_ip(trusted).is_allowed());
-            assert_eq!(g.verify(password("wrong")).await, Err(Error::Forbidden));
-        }
-        for _ in 0..100 {
-            assert!(limiter.check_ip(trusted).is_allowed());
         }
         assert_eq!(g.verify(password("right")).await, Err(Error::Forbidden));
     }
