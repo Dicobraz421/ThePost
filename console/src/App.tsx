@@ -20,6 +20,7 @@ import { GroupCreate, GroupEdit, GroupList } from "./pages/groups";
 import { LoginPage } from "./pages/login";
 import { ModerationPage } from "./pages/moderation";
 import { OrganizationPage } from "./pages/organization";
+import { AccountSieve, OrgSieve } from "./pages/sieve";
 import { AccountTrash } from "./pages/trash";
 import { TransportPage } from "./pages/transport";
 import { accessControlProvider, allowed } from "./providers/access";
@@ -72,6 +73,7 @@ export function App() {
               meta: { label: "Группы рассылки" },
             },
             { name: "moderation", list: "/moderation", meta: { label: "Модерация" } },
+            { name: "sieve", list: "/sieve", meta: { label: "Правила организации" } },
             { name: "transport", list: "/transport", meta: { label: "Транспорт" } },
             { name: "delivery", list: "/delivery", meta: { label: "Журнал доставки" } },
             { name: "audit", list: "/audit", meta: { label: "Журнал аудита" } },
@@ -101,6 +103,7 @@ export function App() {
                 <Route path="create" element={<AccountCreate />} />
                 <Route path=":id" element={<AccountShow />} />
                 <Route path=":id/trash" element={<AccountTrash />} />
+                <Route path=":id/sieve" element={<AccountSieve />} />
               </Route>
               <Route path="/groups">
                 <Route index element={<GroupList />} />
@@ -108,6 +111,7 @@ export function App() {
                 <Route path=":id" element={<GroupEdit />} />
               </Route>
               <Route path="/moderation" element={<ModerationPage />} />
+              <Route path="/sieve" element={<OrgSieve />} />
               <Route path="/transport" element={<TransportPage />} />
               <Route path="/delivery" element={<DeliveryPage />} />
               <Route path="/audit" element={<AuditPage />} />

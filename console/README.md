@@ -30,4 +30,11 @@ THEPOST_ADMIN=http://127.0.0.1:8080 npm run dev
 
 `src/api/openapi.json` — копия `GET /api/openapi.json` узла. После изменения API: скачать схему с узла
 (`curl -s $THEPOST_ADMIN/api/openapi.json > src/api/openapi.json`), выполнить `npm run gen:api`; тест сверяет типы
-со схемой. Каждая операция схемы — экран консоли (`src/api/coverage.ts`) или строка в `coverage-pending.txt`.
+со схемой. Каждая операция схемы — экран консоли (`src/api/coverage.ts`) или строка в `coverage-pending.txt`
+(список пуст с UI-09: новая операция Admin API без экрана — красный тест).
+
+## Роли
+
+Меню и кнопки изменения показываются по ролям из `GET /api/v1/whoami` (`src/providers/access.ts`): аудитор видит
+только журнал аудита, оператор — всё, кроме него, без кнопок изменения. Права проверяет узел. Ручная проверка
+разделов по ролям — `docs/manual-tests/UI-09.md`.
