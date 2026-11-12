@@ -86,24 +86,6 @@
     mode: "0644"
   notify: Restart thepost
 
-# Без активации сокетов процесс сам слушает порты ниже 1024: единственная capability — CAP_NET_BIND_SERVICE.
-- name: Grant CAP_NET_BIND_SERVICE without socket activation
-  ansible.builtin.copy:
-    src: "{{ role_path }}/../../../systemd/thepost.service.d/bind-capability.conf"
-    dest: /etc/systemd/system/thepost.service.d/bind-capability.conf
-    owner: root
-    group: root
-    mode: "0644"
-  when: not thepost_socket_activation
-  notify: Restart thepost
-
-- name: Remove CAP_NET_BIND_SERVICE with socket activation
-  ansible.builtin.file:
-    path: /etc/systemd/system/thepost.service.d/bind-capability.conf
-    state: absent
-  when: thepost_socket_activation
-  notify: Restart thepost
-
 # Растущая пауза перезапуска (RestartSteps, RestartMaxDelaySec) — systemd 254+; на старых — постоянные 30 с
 # (решение 85).
 - name: Check systemd version
@@ -169,25 +151,12 @@
     validate: "{{ thepost_binary_path }} config check --config %s"
   notify: Restart thepost
 
-# Сокеты и процесс без активации сокетов делят порты: при смене режима сначала освобождается порт.
-- name: Check socket units
-  ansible.builtin.command: systemctl is-active{% for s in thepost_sockets %} thepost-{{ s }}.socket{% endfor %}
-  register: thepost_sockets_state
-  changed_when: false
-  failed_when: false
-
-- name: Stop thepost to hand its ports over to systemd sockets
-  ansible.builtin.systemd_service:
-    name: thepost
-    state: stopped
-    daemon_reload: true
-  when: thepost_socket_activation and thepost_sockets_state.stdout_lines | reject('eq', 'active') | list | length > 0
-
+# Порты ниже 1024 — только сокеты systemd (решение 102): у процесса нет capabilities.
 - name: Enable systemd sockets
   ansible.builtin.systemd_service:
     name: "thepost-{{ item }}.socket"
-    state: "{{ 'started' if thepost_socket_activation else 'stopped' }}"
-    enabled: "{{ thepost_socket_activation }}"
+    state: started
+    enabled: true
     daemon_reload: true
   loop: "{{ thepost_sockets }}"
   notify: Restart thepost

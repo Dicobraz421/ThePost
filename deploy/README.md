@@ -153,8 +153,8 @@ loopback) → OpenBao (`https://localhost:8200`, пароли `thepost/db`, `the
 → PostgreSQL (`hostssl` только для учётных записей The Post, без SUPERUSER и BYPASSRLS; `postgres` запускается
 юнитом напрямую, без `pg_ctlcluster` на Perl) → Rspamd (Milter `127.0.0.1:11332`) → clamav-milter (`127.0.0.1:7357`) →
 `thepost` (sysusers, юнит и сокеты, `config.yaml` из шаблона с проверкой `thepost config check`, ожидание
-`/healthz/ready`). Порты ниже 1024 — `thepost_socket_activation`: `true` — сокеты systemd, у процесса нет capabilities;
-`false` (по умолчанию, пока узел не принимает сокеты systemd — TODO(PLT-16)) — `CAP_NET_BIND_SERVICE`.
+`/healthz/ready`). Порты ниже 1024 — только сокеты systemd (`thepost-*.socket`, решение 102), у процесса нет
+capabilities.
 Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 Сертификат клиентских протоколов — `thepost_tls_mode`: `certbot` (Let's Encrypt HTTP-01, по умолчанию; порт 80
 открыт, DNS указывает на ВМ), `acme` (встроенный клиент thepost, секция `acme`), `internal` (внутренний CA — стенд),
@@ -211,21 +211,18 @@ sudo install -m 0644 deploy/systemd/thepost.sysusers.conf /usr/lib/sysusers.d/th
 sudo install -D -m 0640 -o root -g thepost deploy/config/all.yaml /etc/thepost/config.yaml   # задать domain, database.url
 sudo install -m 0644 deploy/systemd/thepost.service deploy/systemd/thepost-*.socket /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/thepost.service /etc/systemd/system/thepost-*.socket
-# Порты ниже 1024 — сокеты systemd (у процесса нет capabilities):
+# Порты ниже 1024 — только сокеты systemd (у процесса нет capabilities, решение 102):
 sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submissions,submission,imap,imaps,https}.socket
-# …или без активации сокетов — CAP_NET_BIND_SERVICE (сокеты не включать):
-#   sudo install -D -m 0644 deploy/systemd/thepost.service.d/bind-capability.conf \
-#     /etc/systemd/system/thepost.service.d/bind-capability.conf && sudo systemctl daemon-reload
 # systemd < 254 (`systemctl --version`; Debian 12, AlmaLinux 9, РЕД ОС 8) — постоянная пауза перезапуска 30 с:
 #   sudo install -D -m 0644 deploy/systemd/thepost.service.d/restart-legacy.conf \
 #     /etc/systemd/system/thepost.service.d/restart-legacy.conf && sudo systemctl daemon-reload
 sudo systemctl enable --now thepost
-systemd-analyze security thepost.service   # не хуже 2.0 (с сокетами — 1.2, с bind-capability.conf — 1.6)
+systemd-analyze security thepost.service   # не хуже 2.0 (ожидается 1.2)
 ```
 Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443.
 Узел берёт сокет systemd по адресу слушателя (`0.0.0.0:<порт>` или `[::]:<порт>` совпадает с `ListenStream=<порт>`),
-иначе открывает свой; перезапуск `thepost` не закрывает сокеты. Пока узел не принимает сокеты systemd (TODO(PLT-16)
-в `crates/thepost/src/protocols.rs`), рабочий вариант — `bind-capability.conf`.
+иначе открывает свой (порт ниже 1024 без сокета не откроется — capabilities у процесса нет); перезапуск `thepost` не
+закрывает сокеты: соединения ждут в очереди.
 Hardening юнита: пустой `CapabilityBoundingSet=`, `NoNewPrivileges`, `PrivateUsers`, `ProtectSystem=strict`,
 `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`,
 `SystemCallFilter=@system-service` без привилегированных вызовов (свои профили seccomp и Landlock процесс
