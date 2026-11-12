@@ -19,7 +19,7 @@ pub use cache::{BlobCache, CacheConfig};
 pub use compress::{CompressionConfig, Decompressing};
 pub use gc::{GcConfig, GcMetrics, GcPass, GcWorker};
 pub use local::{LocalConfig, LocalStore};
-pub use orphans::{OrphanConfig, OrphanMetrics, OrphanPass, OrphanSweeper};
+pub use orphans::{OrphanConfig, OrphanMetrics, OrphanPass, OrphanStat, OrphanSweeper};
 pub use s3::{S3Config, S3Credentials, S3Store};
 pub use verify::{BlobInventory, IndexedBlob, Verifier, VerifyConfig, VerifyReport};
 pub use worker::{Now, system_now};
