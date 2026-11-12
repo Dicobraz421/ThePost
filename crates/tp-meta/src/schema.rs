@@ -150,9 +150,9 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0032_sync_holds.sql"),
     ),
     (
-        33,
+        34,
         "audit search",
-        include_str!("../migrations/0033_audit_search.sql"),
+        include_str!("../migrations/0034_audit_search.sql"),
     ),
 ];
 
