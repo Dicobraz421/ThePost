@@ -412,17 +412,47 @@ mod tests {
         peer: crate::testutil::PEER,
     };
 
-    /// CTR-57: адрес клиента из `SaslContext` доходит до проверки учётных данных.
+    /// CTR-57, AUTH-14: адрес клиента из `SaslContext` доходит до проверки учётных данных во всех механизмах —
+    /// и при успехе, и при отказе с несуществующим именем входа (по нему защита от перебора считает неудачи адресу).
     #[tokio::test]
     async fn peer_reaches_authenticator() {
         let fake = tp_testkit::FakeAuthenticator::default();
-        let p = principal("tim", None);
-        fake.add_password("tim", "tanstaaftanstaaf", p.clone());
+        let tim = principal("tim", None);
+        fake.add_password("tim", "tanstaaftanstaaf", tim.clone());
+        let user = principal("user@example.com", Some(BTreeSet::new()));
+        fake.add_token(TOKEN, user.clone());
         let sasl = AuthSasl::new(Arc::new(fake.clone()));
-        let mut s = sasl.start(Mechanism::Plain, &TLS).expect("start");
-        let step = s.step(Some(b"\0tim\0tanstaaftanstaaf")).await;
-        assert_eq!(step, Ok(SaslStep::Done(p)));
-        assert_eq!(fake.peers(), [crate::testutil::PEER]);
+        let fail = Ok(SaslStep::Fail(SaslFailure::Authentication));
+
+        let mut s = sasl.start(Mechanism::Plain, &TLS).expect("plain");
+        assert_eq!(
+            s.step(Some(b"\0tim\0tanstaaftanstaaf")).await,
+            Ok(SaslStep::Done(tim.clone()))
+        );
+        let mut s = sasl.start(Mechanism::Plain, &TLS).expect("plain");
+        assert_eq!(s.step(Some(b"\0nobody\0secret")).await, fail);
+
+        let mut s = sasl.start(Mechanism::Login, &TLS).expect("login");
+        assert!(matches!(
+            s.step(Some(b"ghost")).await,
+            Ok(SaslStep::Challenge(_))
+        ));
+        assert_eq!(s.step(Some(b"secret")).await, fail);
+
+        let ok = format!("n,,\x01auth=Bearer {TOKEN}\x01\x01");
+        let mut s = sasl
+            .start(Mechanism::OauthBearer, &TLS)
+            .expect("oauthbearer");
+        assert_eq!(
+            s.step(Some(ok.as_bytes())).await,
+            Ok(SaslStep::Done(user.clone()))
+        );
+
+        let ok = format!("user=user@example.com\x01auth=Bearer {TOKEN}\x01\x01");
+        let mut s = sasl.start(Mechanism::Xoauth2, &TLS).expect("xoauth2");
+        assert_eq!(s.step(Some(ok.as_bytes())).await, Ok(SaslStep::Done(user)));
+
+        assert_eq!(fake.peers(), [crate::testutil::PEER; 5]);
     }
 
     fn start(m: Mechanism) -> Box<dyn SaslSession> {
