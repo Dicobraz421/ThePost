@@ -1,5 +1,5 @@
 //! JMAP Sieve (RFC 9661; JMAP-24): `SieveScript/get`, `/set`, `/query`, `/validate` поверх
-//! [`SieveStore`] и проверки `tp_sieve::check`.
+//! [`SieveStore`] и проверки `tp_sieve::compile` с пределами доставки ([`Jmap::with_sieve_limits`], JMAP-35).
 //!
 //! Скрипт в хранилище адресуется именем, поэтому `id` — отпечаток имени: переименование меняет `id` (новый — в
 //! `updated`). `blobId` текста скрипта — `S<id>_<отпечаток текста>`, скачивается обычным `downloadUrl`. Текст для
@@ -26,13 +26,14 @@ pub(crate) fn session_capability() -> Value {
     json!({ "implementation": "The Post" })
 }
 
-/// Значение capability учётной записи: лимиты хранилища и расширения интерпретатора.
-pub(crate) fn account_capability(limits: SieveLimits) -> Value {
+/// Значение capability учётной записи: лимиты хранилища, пределы разбора и выполнения `run` (те же, что при
+/// доставке) и расширения интерпретатора.
+pub(crate) fn account_capability(limits: SieveLimits, run: &tp_sieve::Limits) -> Value {
     json!({
         "maxSizeScriptName": MAX_SCRIPT_NAME_LEN * 4,
-        "maxSizeScript": limits.max_script_size,
+        "maxSizeScript": limits.max_script_size.min(run.max_script_size),
         "maxNumberScripts": limits.max_scripts,
-        "maxNumberRedirects": tp_sieve::Limits::default().max_actions,
+        "maxNumberRedirects": run.max_redirects,
         "sieveExtensions": tp_sieve::EXTENSIONS,
         "notificationMethods": null,
         "externalLists": null,
@@ -138,7 +139,8 @@ fn diagnostics(diags: &[tp_sieve::Diagnostic]) -> String {
         .join("; ")
 }
 
-/// Проверенный текст скрипта из blob; ошибка — объект `SetError` (`blobNotFound`, `tooLarge`, `invalidSieve`).
+/// Проверенный текст скрипта из blob (пределы — [`Jmap::with_sieve_limits`]); ошибка — объект `SetError`
+/// (`blobNotFound`, `tooLarge` — больше лимита хранилища, `invalidSieve`).
 async fn script_text(ctx: &Ctx<'_>, blob_id: &str) -> MethodResult<Result<String, Value>> {
     let store = ctx.jmap.sieve_store()?;
     let max = store.limits().max_script_size as u64;
@@ -152,10 +154,12 @@ async fn script_text(ctx: &Ctx<'_>, blob_id: &str) -> MethodResult<Result<String
         let why = "line 1, column 1: script is not valid UTF-8";
         return Ok(Err(set_error("invalidSieve", Some(why), &[])));
     };
-    Ok(match tp_sieve::check(&text) {
-        Ok(_) => Ok(text),
-        Err(diags) => Err(set_error("invalidSieve", Some(&diagnostics(&diags)), &[])),
-    })
+    Ok(
+        match tp_sieve::compile(text.as_bytes(), &ctx.jmap.sieve_limits) {
+            Ok(_) => Ok(text),
+            Err(diags) => Err(set_error("invalidSieve", Some(&diagnostics(&diags)), &[])),
+        },
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -701,6 +705,58 @@ mod tests {
         )
         .await;
         assert_eq!(v["type"], "blobNotFound", "{v}");
+    }
+
+    /// Пределы секции `sieve` (JMAP-35): скрипт сверх уменьшенного предела вложенности или размера отклоняется
+    /// `invalidSieve` и в `/validate`, и в `/set`; capability объявляет те же пределы.
+    #[tokio::test]
+    async fn section_limits() {
+        let limits = tp_sieve::Limits {
+            max_nesting: 2,
+            max_script_size: 200,
+            max_redirects: 2,
+            ..tp_sieve::Limits::default()
+        };
+        let env = Env::with_sieve_limits(limits).await;
+        let acc = env.account();
+        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let caps = &s["accounts"][&acc]["accountCapabilities"][USING[1]];
+        assert_eq!(caps["maxSizeScript"], 200, "{caps}");
+        assert_eq!(caps["maxNumberRedirects"], 2, "{caps}");
+
+        let deep = "if true { if true { if true { if true { keep; } } } }\n";
+        let large = format!("# {}\nkeep;\n", "x".repeat(300));
+        for text in [deep, large.as_str()] {
+            // С пределами по умолчанию скрипт верен.
+            assert!(tp_sieve::check(text).is_ok(), "{text}");
+            let blob = upload(&env, text).await;
+            let v = call(
+                &env,
+                "SieveScript/validate",
+                json!({"accountId": acc, "blobId": blob}),
+            )
+            .await;
+            assert_eq!(v["error"]["type"], "invalidSieve", "{v}");
+            let r = create(&env, "big", text).await;
+            assert_eq!(r["notCreated"]["a"]["type"], "invalidSieve", "{r}");
+            let r = create(&env, "good", GOOD).await;
+            let id = r["created"]["a"]["id"].as_str().expect("id").to_owned();
+            let r = call(
+                &env,
+                "SieveScript/set",
+                json!({"accountId": acc, "update": {&id: {"blobId": blob}}}),
+            )
+            .await;
+            assert_eq!(r["notUpdated"][&id]["type"], "invalidSieve", "{r}");
+            let r = call(
+                &env,
+                "SieveScript/set",
+                json!({"accountId": acc, "destroy": [id]}),
+            )
+            .await;
+            assert!(r["notDestroyed"].is_null(), "{r}");
+        }
+        assert!(env.sieve.list(env.scope).await.expect("list").is_empty());
     }
 
     #[tokio::test]
