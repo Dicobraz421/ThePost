@@ -563,6 +563,7 @@
 | [CI-13](CI-13.md) | бета выпускает тег версии образа | ci | B | ci-11 | done | CI-01 |
 | [DEP-50](DEP-50.md) | Helm и Compose: закрытый образ и тег версии | deploy | A | deploy-36 | done | CI-13 |
 | [CI-14](CI-14.md) | артефакт CI тем же путём, что выпуск; запуск на старом процессоре | ci | B | ci-12 | done | CI-13 |
+| [CI-15](CI-15.md) | воспроизводимая сборка с консолью (repro беты) | ci | B | ci-13 | ready | CI-08,CI-14 |
 | [DEP-51](DEP-51.md) | эталоны deploy/config: edge.yaml и порты IMAP, ManageSieve | deploy | A | deploy-37 | done | DEP-37 |
 | [DEP-52](DEP-52.md) | стенд: доверенные подсети вместо выключенного ограничения частоты | deploy | A | deploy-38 | todo | PLT-32 |
 | [APP-60](APP-60.md) | thepost doctor: подсказки DNS для календарей и контактов | app | A | app-55 | done | DEP-21 |
