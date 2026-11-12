@@ -24,6 +24,7 @@
 //!   display_name: displayName
 //!   emails: [mail, proxyAddresses]
 //!   disabled: { attribute: userAccountControl, flag: 2 }
+//!   hidden: { attribute: msExchHideFromAddressLists, value: "TRUE" }
 //!   gal: { title: title, department: department, phone: telephoneNumber }
 //! groups:
 //!   filter: (&(objectClass=group)(mail=*))
@@ -134,6 +135,9 @@ pub struct AccountMap {
     pub emails: Vec<String>,
     /// Признак отключённой записи; не задан — все записи включены.
     pub disabled: Option<FlagRule>,
+    /// Признак скрытия из адресной книги (CTR-58), по умолчанию AD `msExchHideFromAddressLists: TRUE`;
+    /// `null` — все записи в GAL. Вход и приём почты признак не меняет.
+    pub hidden: Option<FlagRule>,
     /// Атрибуты адресной книги (GAL): имя в The Post → атрибут LDAP.
     pub gal: BTreeMap<String, String>,
     /// Фильтр удалённых записей (режим USN; у надгробий AD остаются `objectClass` и идентификатор).
@@ -222,6 +226,11 @@ impl Default for AccountMap {
             display_name: "cn".into(),
             emails: vec!["mail".into()],
             disabled: None,
+            hidden: Some(FlagRule {
+                attribute: "msExchHideFromAddressLists".into(),
+                value: Some("TRUE".into()),
+                flag: None,
+            }),
             gal: BTreeMap::new(),
             deleted_filter: "(objectClass=user)".into(),
             org: OrgMap::default(),
@@ -400,6 +409,9 @@ impl LdapConfig {
         }
         if let Some(d) = &self.accounts.disabled {
             d.check("accounts.disabled")?;
+        }
+        if let Some(d) = &self.accounts.hidden {
+            d.check("accounts.hidden")?;
         }
         if let Some(d) = &self.groups.internal_only {
             d.check("groups.internal_only")?;
@@ -1006,7 +1018,7 @@ impl LdapDirectory {
                     .and_then(|a| first(e, a))
                     .and_then(|v| v.trim().parse().ok()),
             },
-            hidden_from_gal: false,
+            hidden_from_gal: m.hidden.as_ref().is_some_and(|r| flagged(e, r)),
         })
     }
 
@@ -1015,6 +1027,7 @@ impl LdapDirectory {
         let mut a = vec![m.login.clone(), m.display_name.clone()];
         a.extend(m.emails.iter().cloned());
         a.extend(m.disabled.iter().map(|d| d.attribute.clone()));
+        a.extend(m.hidden.iter().map(|d| d.attribute.clone()));
         a.extend(m.gal.values().cloned());
         a.extend(m.org.title.iter().cloned());
         a.extend(m.org.manager.iter().cloned());

@@ -540,6 +540,36 @@ async fn active_directory_usn() {
     );
 }
 
+#[tokio::test]
+async fn account_hidden_from_gal() {
+    let alice = "03020100-0504-0706-0809-0a0b0c0d0e0f";
+    let hidden = |dir: LdapDirectory| async move {
+        let page = dir.accounts_since(T, None, 10).await.expect("ad");
+        upserts(&page)
+            .into_iter()
+            .map(|a| (a.external_id, a.hidden_from_gal))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let fake = Fake::new(include_str!("ad.ldif"));
+    fake.set(
+        "CN=Alice,OU=Staff,DC=corp,DC=example",
+        "msExchHideFromAddressLists",
+        "TRUE",
+    );
+    // По умолчанию — msExchHideFromAddressLists: скрыта только alice.
+    let got = hidden(LdapDirectory::with_source(T, ad_cfg(), fake.clone())).await;
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(|(id, h)| *h == (id == alice)), "{got:?}");
+    // Признак не задан — все записи в GAL.
+    let mut cfg = ad_cfg();
+    cfg.accounts.hidden = None;
+    let got = hidden(LdapDirectory::with_source(T, cfg, fake.clone())).await;
+    assert!(got.values().all(|h| !h), "{got:?}");
+    // Записи без атрибута (OpenLDAP) — в GAL.
+    let (dir, _) = openldap();
+    assert!(hidden(dir).await.values().all(|h| !h));
+}
+
 #[test]
 fn config_check_and_parse() {
     let cfg = openldap_cfg();
