@@ -721,7 +721,7 @@ mod tests {
     use tp_contracts::role::{CancellationToken, ReadyHandle, fixed_config};
     use tp_testkit::{
         Clock, FakeAuthenticator, FakeSasl, FakeSearch, MemAcl, MemBlobIndex, MemBlobStore,
-        MemEventBus, MemMetadata, MemQuota, MemTrash, SystemClock,
+        MemEventBus, MemMailboxAudit, MemMetadata, MemQuota, MemTrash, SystemClock,
     };
 
     /// Роль imap на хранилищах testkit с расширениями, как собирает их узел (`Services::imap_extensions`).
@@ -753,6 +753,7 @@ mod tests {
             bus: Arc::new(bus),
             trash: Arc::new(trash),
             hooks: DecisionHooks::default(),
+            audit: Arc::new(MemMailboxAudit::new()),
         };
         let acl = Arc::new(MemAcl::new(&meta));
         let accounts = Arc::new(meta);
