@@ -104,6 +104,15 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   флаг `\Deleted`, остальные флаги сохраняет (CTR-33): EXPUNGE в корзине не трогает письмо, удалённое из другой папки.
 - `NewMessage`: `skeleton: BlobKey`, `parts: Vec<PartRef>`, `size`, `received_at`, `flags`, `meta: MessageMeta`
   (envelope, bodystructure, preview, thread key — вычисляются при приёме).
+- `acquire::AcquireObserver` (CTR-51, решение 57) — наблюдатель ожидания соединения пула СУБД: хранилище не зависит от крейта метрик,
+  а сообщает наблюдателю о каждом ожидании (`pool.acquire()`, `pool.begin()`). Объектно-безопасный, `Send + Sync`; методы `started()`
+  (число ожидающих +1) и `finished(AcquireEnd::{Acquired(время), Failed(время), Cancelled})` (−1) — по умолчанию пустые, вызываются
+  только сторожем. `observer.wait() -> AcquireWait` — сторож: `acquired()` — «получено», `failed()` — «отказ» (в том числе тайм-аут
+  пула), брошенный без исхода (отмена задачи) — `Cancelled`: «ожидает» снимается, время не записывается, отказом не считается.
+  `observer.observe(fut)` — то же по результату `Result`. Семантика метрик — как у `tp_platform::dbmetrics::PoolMeter::acquire`
+  (число ожидающих, время ожидания, счётчик отказов); отличие — время брошенного ожидания не записывается. `NoAcquireObserver` —
+  пустая реализация (хранилище без метрик), `AcquireCounter` — счётчик в памяти для тестов потребителей (`waiting`, `acquired`,
+  `failed`, `cancelled`, `observed`, `waited`). Реализация с метриками — PLT-27, вызов в хранилище — META-55. Код — `acquire.rs`.
 
 ## ChangeLog
 Журнал изменений для IMAP QRESYNC и JMAP `/changes`: `message_changes(scope, mailbox?, since: ModSeq, limit)
@@ -400,12 +409,18 @@ Hot reload: новая копия рассылается через `watch`; п�
 
 ## Internal TLS
 SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, S3, узел ↔ узел — только TLS. Общая секция `tls::InternalTls
-{ ca_file, cert_file, key_file, server_name, allow_plaintext }` — поле `tls` секции канала; `Profile { Prod (по умолчанию), Dev }` —
+{ ca_file, cert_file, key_file, key, server_name, allow_plaintext }` — поле `tls` секции канала; `Profile { Prod (по умолчанию), Dev }` —
 параметр `profile` верхнего уровня config.yaml. `InternalTls::check_url(InternalChannel::{Postgres, S3, Node}, url, profile)
 -> Result<Transport::{Tls, Plaintext}>` вызывается в `thepost config check` и при запуске: `allow_plaintext` вне dev, адрес без TLS
 без `allow_plaintext`, `sslmode=require|verify-ca` — `Invalid`. Схемы: PostgreSQL — `sslmode=verify-full` (без `sslmode` клиент
 обязан verify-full), S3 — `https://`, узел — `https://`/`smtps://`. `Transport::Plaintext` — крейт канала пишет
 `InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
+Ключ клиентского сертификата (CTR-52, решение 37) — из хранилища секретов: `key: { secret: "<путь>#<поле>" }` (`SecretRef`, значение — PEM)
+вместо `key_file`; `key_file` остаётся для установок без OpenBao. `key` и `key_file` вместе — `Invalid`; `cert_file` задаётся вместе
+с `key_file` или `key`; ключ открытым текстом в `key` — ошибка разбора «secret in plaintext» без значения в тексте.
+`InternalTls::key_source() -> Result<Option<KeySource::{File(&Path), Secret(&SecretRef)}>>` — источник ключа; крейты каналов берут ключ
+отсюда, а не из полей, секрет читают сами через `SecretStore::get` (межузловой канал — CLU-16, клиент к СУБД — META-56,
+подключение в узле — APP-36). Смена ссылки применяется при новом подключении.
 
 ## Transport (Ф1)
 SRS 4.1, 2.6; решения 2026-11-01-transport-scope-external-mta, 2026-11-01-scale-shards-geo-admin. Код — `transport.rs` (CTR-24).
@@ -798,3 +813,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (папки с суффиксом при совпадении имён) или в его корзину; без режима и с письмами — `Invalid` с подсказкой (было `Conflict`).
   По сравнению с карточкой: перенос — часть операции хранилища, фоновую задачу ведёт Admin API (ADM-10). In-memory — `MemMetadata`;
   набор `suite::account_state`. PostgreSQL — META-33.
+- 2026-11-12 — CTR-51 (волна contracts-37): `acquire::{AcquireObserver, AcquireWait, AcquireEnd, NoAcquireObserver, AcquireCounter}` —
+  наблюдатель ожидания соединения с СУБД (число ожидающих, время, отказы; отмена снимает «ожидает» без записи времени). По сравнению
+  с карточкой: счётчик в памяти `AcquireCounter` — в `tp-contracts`, а не в `tp-testkit`.
+- 2026-11-12 — CTR-52 (волна contracts-37): `InternalTls.key: Option<SecretRef>` — ключ внутренних каналов из хранилища секретов
+  (взамен `key_file`, оба сразу — `Invalid`), `InternalTls::key_source()` и `KeySource::{File, Secret}`. Новое поле секции: код,
+  собирающий `InternalTls` перечислением всех полей, дополняется `key: None` (в репозитории таких мест нет).
