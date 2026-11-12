@@ -1,15 +1,16 @@
 //! Метрики пула СУБД и слушателя сигналов LISTEN (решение 57, PLT-25; отчёт по критериям Д.7).
 //!
 //! Платформа не зависит от драйвера СУБД: владелец пула (`tp-meta`) передаёт снимок занятости замыканием
-//! (как [`Metrics::register_bus`]) и оборачивает получение соединения в [`PoolMeter::acquire`] — так считаются
-//! ожидающие и время ожидания. Имена: `tp_db_pool_in_use`, `tp_db_pool_idle`, `tp_db_pool_max`,
+//! (как [`Metrics::register_bus`]) и сообщает об ожидании соединения наблюдателю [`AcquireObserver`] (CTR-51),
+//! которым служит [`PoolMeter`] ([`DbMetrics::pool_observer`]) — так считаются ожидающие и время ожидания.
+//! Брошенное ожидание (отмена задачи) снимает «ожидает» без записи времени и отказа (PLT-27). Имена: `tp_db_pool_in_use`, `tp_db_pool_idle`, `tp_db_pool_max`,
 //! `tp_db_pool_waiting`, `tp_db_pool_wait_seconds` (гистограмма), `tp_db_pool_acquire_errors_total` — метка
 //! `pool`; `tp_db_listener_connected` (0/1), `tp_db_listener_subscribers`, `tp_db_listener_lag_seconds`,
 //! `tp_db_listener_reconnects_total`, `tp_db_listener_received_total` — метка `listener`.
 
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
@@ -17,6 +18,7 @@ use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::family::{Family, MetricConstructor};
 use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::metrics::histogram::Histogram;
+use tp_contracts::acquire::{AcquireEnd, AcquireObserver};
 
 use crate::telemetry::{Metrics, TelemetryConfig};
 
@@ -137,6 +139,16 @@ impl DbMetrics {
         }
     }
 
+    /// То же, что [`pool`](Self::pool), но счётчики пула отдаются наблюдателем контракта: узел передаёт его
+    /// хранилищу метаданных (`tp-meta`), которое от крейта метрик не зависит.
+    pub fn pool_observer(
+        &self,
+        name: &str,
+        snapshot: impl Fn() -> PoolSample + Send + Sync + 'static,
+    ) -> Arc<dyn AcquireObserver> {
+        Arc::new(self.pool(name, snapshot))
+    }
+
     /// Добавляет слушатель LISTEN `name`: `snapshot` вызывается на каждый `/metrics`.
     pub fn listener(
         &self,
@@ -162,23 +174,33 @@ pub struct PoolMeter {
 impl PoolMeter {
     /// Оборачивает получение соединения (`pool.acquire()`, `pool.begin()`): на время ожидания задача учтена в
     /// `tp_db_pool_waiting`, длительность — в `tp_db_pool_wait_seconds`, отказ — в `…_acquire_errors_total`.
-    /// Отмена ожидания (drop) счётчик ожидающих возвращает.
+    /// Отмена ожидания (drop) счётчик ожидающих возвращает, время не записывается.
     pub async fn acquire<T, E>(&self, acquire: impl Future<Output = Result<T, E>>) -> Result<T, E> {
-        struct Waiting<'a>(&'a PoolMeter, Instant);
-        impl Drop for Waiting<'_> {
-            fn drop(&mut self) {
-                self.0.waiting.dec();
-                self.0.wait.observe(self.1.elapsed().as_secs_f64());
-            }
-        }
+        let observer: &dyn AcquireObserver = self;
+        observer.observe(acquire).await
+    }
+
+    /// Эти же счётчики как наблюдатель контракта.
+    pub fn observer(&self) -> Arc<dyn AcquireObserver> {
+        Arc::new(self.clone())
+    }
+}
+
+impl AcquireObserver for PoolMeter {
+    fn started(&self) {
         self.waiting.inc();
-        let guard = Waiting(self, Instant::now());
-        let out = acquire.await;
-        drop(guard);
-        if out.is_err() {
-            self.errors.inc();
+    }
+
+    fn finished(&self, end: AcquireEnd) {
+        self.waiting.dec();
+        match end {
+            AcquireEnd::Acquired(waited) => self.wait.observe(waited.as_secs_f64()),
+            AcquireEnd::Failed(waited) => {
+                self.wait.observe(waited.as_secs_f64());
+                self.errors.inc();
+            }
+            AcquireEnd::Cancelled => {}
         }
-        out
     }
 }
 
@@ -321,7 +343,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{series}: {text}"))
     }
 
-    /// Приёмка PLT-25: при исчерпании пула растёт время ожидания.
+    /// Приёмка PLT-25 и PLT-27: при исчерпании пула растёт время ожидания — через трейт контракта.
     #[tokio::test]
     async fn wait_time_grows_when_pool_is_exhausted() {
         let metrics = Metrics::default();
@@ -329,7 +351,7 @@ mod tests {
         let slots = Arc::new(Semaphore::new(1));
         let busy = Arc::new(AtomicU32::new(0));
         let probe = busy.clone();
-        let meter = db.pool("primary", move || PoolSample {
+        let meter: Arc<dyn AcquireObserver> = db.pool_observer("primary", move || PoolSample {
             size: 1,
             idle: 1 - probe.load(Ordering::Relaxed),
             max: 1,
@@ -337,7 +359,7 @@ mod tests {
 
         // Свободный пул: соединение сразу, ожидания нет.
         let held = meter
-            .acquire(slots.clone().acquire_owned())
+            .observe(slots.clone().acquire_owned())
             .await
             .expect("acquire");
         busy.store(1, Ordering::Relaxed);
@@ -351,7 +373,7 @@ mod tests {
         // Пул исчерпан: вторая задача ждёт, пока соединение не вернут.
         let waiter = tokio::spawn({
             let (meter, slots) = (meter.clone(), slots.clone());
-            async move { meter.acquire(slots.acquire_owned()).await.map(drop) }
+            async move { meter.observe(slots.acquire_owned()).await.map(drop) }
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
         let text = metrics.encode().expect("encode");
@@ -382,6 +404,7 @@ mod tests {
         let metrics = Metrics::default();
         let db = DbMetrics::register(&metrics, &TelemetryConfig::default());
         let meter = db.pool("replica", PoolSample::default);
+        let observer = meter.observer();
         let slots = Arc::new(Semaphore::new(0));
 
         let timed_out = meter
@@ -391,13 +414,19 @@ mod tests {
             ))
             .await;
         assert!(timed_out.is_err());
-        // Отмена ожидания: задача не остаётся в «ожидающих».
+        // Отмена ожидания: задача не остаётся в «ожидающих», время и отказ не записываются (PLT-27) —
+        // и через `PoolMeter::acquire`, и через трейт.
         let cancelled = tokio::time::timeout(
             Duration::from_millis(100),
             meter.acquire(slots.clone().acquire_owned()),
         )
         .await;
         assert!(cancelled.is_err());
+        let wait = observer.wait();
+        let text = metrics.encode().expect("encode");
+        assert_eq!(value(&text, "tp_db_pool_waiting{pool=\"replica\"}"), 1.0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(wait);
 
         let text = metrics.encode().expect("encode");
         assert_eq!(
@@ -406,7 +435,11 @@ mod tests {
         );
         assert_eq!(value(&text, "tp_db_pool_waiting{pool=\"replica\"}"), 0.0);
         let sum = value(&text, "tp_db_pool_wait_seconds_sum{pool=\"replica\"}");
-        assert!(sum >= 0.3, "{text}");
+        assert!(sum >= 0.2, "{text}");
+        assert_eq!(
+            value(&text, "tp_db_pool_wait_seconds_count{pool=\"replica\"}"),
+            1.0
+        );
     }
 
     #[test]
