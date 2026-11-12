@@ -57,9 +57,9 @@ use tp_contracts::groups::{
 use tp_contracts::identity::{Identity, IdentityAddress, IdentityStore};
 use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
-    Account, AccountScope, AccountState, AccountStore, AccountUpsert, ExistingContent,
-    MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, Policy, PolicyResolver,
-    PolicyStore, PolicyTarget, SpecialUse,
+    Account, AccountScope, AccountState, AccountStore, AccountUpsert, Envelope, ExistingContent,
+    MailboxStore, MessageMeta, MessageQuery, MessageStore, NewMailbox, NewMessage, Policy,
+    PolicyResolver, PolicyStore, PolicyTarget, SpecialUse,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -2539,7 +2539,13 @@ async fn put_message(
         size,
         received_at: purge_received_at(),
         flags: Default::default(),
-        meta: Default::default(),
+        meta: MessageMeta {
+            envelope: Envelope {
+                subject: Some(format!("размер {size}")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     };
     messages
         .insert(scope, mailbox, msg)
@@ -2566,7 +2572,7 @@ fn sorted_ids(mut ids: Vec<MessageId>) -> Vec<MessageId> {
     ids
 }
 
-/// Набор проверок «очистить корзину» (`TrashStore::purge`, `list_hidden`, `restore`) и настройки `trash.purge`
+/// Набор проверок «очистить корзину» (`TrashStore::purge`, `list_hidden`, `hidden_message`, `restore`) и настройки `trash.purge`
 /// (`PolicyResolver::trash_purge`, `set_user_trash_purge`): `hide` скрывает письмо (нет в `MessageStore`, в счётчиках
 /// корзины, в квоте), администратор его восстанавливает; `erase` стирает; Legal Hold и ошибка точки принятия решений
 /// не дают стереть; пользователь не меняет значение без `user_can_choose`, значение администратора приоритетнее.
@@ -2603,6 +2609,7 @@ pub async fn trash_purge(
     let b = put_message(messages, s, inbox, 200).await;
     let c = put_message(messages, s, inbox, 50).await;
     messages.to_trash(s, &[a, b]).await.expect("to trash");
+    let shown = messages.get(s, a).await.expect("get").expect("trashed");
     let out = trash
         .purge(s, &[a, c, MessageId::new(), a], &none)
         .await
@@ -2627,6 +2634,44 @@ pub async fn trash_purge(
     let hidden = trash.list_hidden(s, 0, 100).await.expect("hidden");
     assert_eq!(trash_ids(hidden.clone()), [a]);
     assert_eq!((hidden[0].origin, hidden[0].size), (inbox, 100));
+    // Администратор читает метаданные скрытого письма, скрытие не снимается.
+    let seen = trash
+        .hidden_message(s, a)
+        .await
+        .expect("hidden message")
+        .expect("hidden");
+    assert_eq!(
+        (
+            seen.id,
+            seen.skeleton,
+            seen.size,
+            seen.received_at,
+            &seen.meta
+        ),
+        (a, shown.skeleton, 100, shown.received_at, &shown.meta)
+    );
+    assert_eq!(seen.meta.envelope.subject.as_deref(), Some("размер 100"));
+    assert_eq!(messages.get(s, a).await, Ok(None), "остаётся скрытым");
+    assert_eq!(
+        trash_ids(trash.list_hidden(s, 0, 100).await.expect("hidden")),
+        [a]
+    );
+    for other in [b, c, MessageId::new()] {
+        assert_eq!(
+            trash.hidden_message(s, other).await,
+            Ok(None),
+            "видимое в корзине, вне корзины и отсутствующее — не скрытые"
+        );
+    }
+    let stranger = AccountScope {
+        tenant: s.tenant,
+        account: AccountId::new(),
+    };
+    assert_eq!(
+        trash.hidden_message(stranger, a).await,
+        Ok(None),
+        "чужая учётная запись"
+    );
     let used = quota.usage(s).await.expect("usage");
     assert_eq!(
         (used.used_bytes, used.messages),
@@ -2652,6 +2697,11 @@ pub async fn trash_purge(
         panic!("message expected");
     };
     assert_eq!((mailbox, inserted.id), (inbox, a));
+    assert_eq!(
+        trash.hidden_message(s, a).await,
+        Ok(None),
+        "восстановленное не скрыто"
+    );
     assert_eq!(
         messages.get(s, a).await.expect("get").map(|m| m.mailbox),
         Some(inbox)
