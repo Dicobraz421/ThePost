@@ -541,7 +541,7 @@ mod tests {
             roles: vec![AdminRole::OrganizationAdmin],
             method: "POST".into(),
             route: route.into(),
-            path: "/api/v1/orgs/x/domains".into(),
+            path: "/api/v1/orgs/x/transport/domains".into(),
             status: 201,
             content_messages: None,
         }
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn rfc5424_message() {
-        let r = record("/api/v1/orgs/{org}/domains");
+        let r = record("/api/v1/orgs/{org}/transport/domains");
         let m = rfc5424(&r, 13, Some("mail1.example.org"), "thepost");
         let head = format!(
             "<109>1 2026-11-01T10:20:30.123456Z mail1.example.org thepost {} audit - \u{feff}",
@@ -832,7 +832,7 @@ mod tests {
             .with_simple_exporter(collect.clone())
             .build();
         let sink = OtlpAudit::with_provider(provider);
-        sink.record(&record("/api/v1/orgs/{org}/domains"))
+        sink.record(&record("/api/v1/orgs/{org}/transport/domains"))
             .await
             .expect("record");
         sink.shutdown().expect("shutdown");
@@ -841,7 +841,7 @@ mod tests {
         let (event, body, attrs) = &got[0];
         assert_eq!(*event, Some(OTLP_EVENT));
         let v: serde_json::Value = serde_json::from_str(body).expect("json");
-        assert_eq!(v["route"], "/api/v1/orgs/{org}/domains");
+        assert_eq!(v["route"], "/api/v1/orgs/{org}/transport/domains");
         assert!(
             attrs
                 .iter()

@@ -327,8 +327,8 @@ mod tests {
         assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
         assert!(b.starts_with(b"<!doctype html>"));
 
-        // Маршрут с точкой в последнем сегменте (карточка домена) — тоже страница, а не 404.
-        let (s, h, b) = call(&cfg, dist, "/console/domains/example.org").await;
+        // Маршрут с точкой в последнем сегменте (карточка учётной записи) — тоже страница, а не 404.
+        let (s, h, b) = call(&cfg, dist, "/console/accounts/user@example.org").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
         assert!(b.starts_with(b"<!doctype html>"));
