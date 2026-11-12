@@ -158,7 +158,7 @@ async fn invalid_tokens_and_reports() {
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert!(r.body.contains("<d:sync-traversal-supported/>"));
 
-    let query = r#"<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/></d:prop></c:calendar-query>"#;
+    let query = r#"<d:expand-property xmlns:d="DAV:"><d:property name="owner"/></d:expand-property>"#;
     let r = report(&env, query).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert!(r.body.contains("<d:supported-report/>"));

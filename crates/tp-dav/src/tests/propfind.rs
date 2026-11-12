@@ -112,6 +112,16 @@ async fn thunderbird_snapshot() {
     <d:sync-collection/>
     </d:report>
     </d:supported-report>
+    <d:supported-report>
+    <d:report>
+    <c:calendar-query/>
+    </d:report>
+    </d:supported-report>
+    <d:supported-report>
+    <d:report>
+    <c:free-busy-query/>
+    </d:report>
+    </d:supported-report>
     </d:supported-report-set>
     <c:supported-calendar-component-set>
     <c:comp name="VEVENT"/>
