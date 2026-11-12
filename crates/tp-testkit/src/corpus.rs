@@ -5,13 +5,17 @@
 //! multipart/mixed/alternative/related/report/signed, вложения PDF/DOCX/XLSX, 8bit, КОИ-8, Windows-1251,
 //! UTF-8, ISO-2022-JP, вложенные message/rfc822, длинные строки; файлы `NN-broken-*` — битый MIME.
 //!
-//! Корпус vCard — `crates/tp-testkit/corpus/*.vcf` ([`vcards`], [`vcard`]): по одной карточке в файле,
-//! строки с CRLF, данные вымышленные; что проверяет каждый файл — [`VCARDS`].
+//! Корпус vCard — `crates/tp-testkit/corpus/*.vcf` ([`vcards`], [`vcard`]): одна или несколько карточек
+//! в файле, строки с CRLF, данные вымышленные; что проверяет каждый файл — [`VCARDS`]. Разбор calcard —
+//! [`CorpusCard::parse`].
 
 use std::fs;
 use std::path::PathBuf;
 
-use tp_contracts::{Result, TenantId};
+use calcard::vcard::VCard;
+use calcard::{Entry, Parser};
+use mail_parser::decoders::charsets::map::charset_decoder;
+use tp_contracts::{Error, Result, TenantId};
 
 /// Письмо корпуса.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +62,7 @@ pub fn corpus_mail(name: &str) -> Result<CorpusMail> {
     corpus()?
         .into_iter()
         .find(|m| m.name.split_once('-').is_some_and(|(_, n)| n == name))
-        .ok_or(tp_contracts::Error::NotFound)
+        .ok_or(Error::NotFound)
 }
 
 // ---------- vCard ----------
@@ -121,41 +125,105 @@ pub const VCARDS: &[(&str, &str)] = &[
         "выгрузка Nextcloud / Sabre VObject (3.0): PRODID, TYPE в кавычках, X-SOCIALPROFILE, \
          BDAY;VALUE=DATE, REV;VALUE=DATE-AND-OR-TIME",
     ),
+    (
+        "14-multi-v3-addressbook",
+        "выгрузка адресной книги одним файлом (3.0): три карточки подряд — человек, латиница с переносом NOTE, \
+         организация с X-ABShowAs:COMPANY и пустым N",
+    ),
+    (
+        "15-v3-cp1251-qp",
+        "vCard 3.0 со старым CHARSET=windows-1251;ENCODING=QUOTED-PRINTABLE (выгрузки телефонов): мягкие переносы, \
+         `;` и `,` внутри NOTE и ADR как =3B/=2C, буква ё; файл — чистый ASCII",
+    ),
+    (
+        "16-v21-cp1251-8bit",
+        "vCard 2.1, две карточки, сырые 8-битные байты windows-1251 (CHARSET без ENCODING), во второй NOTE ещё и \
+         в QP; файл не UTF-8: `raw` — байты как есть, `text` — перекод по CHARSET",
+    ),
 ];
 
-/// Карточка корпуса vCard.
+/// Файл корпуса vCard: одна или несколько карточек.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorpusCard {
     /// Имя файла без расширения (`02-v4-org`).
     pub name: String,
-    /// Текст карточки как в файле (UTF-8, CRLF, строки перенесены).
+    /// Байты файла как есть (CRLF, строки перенесены; у `-8bit` — не UTF-8).
+    pub raw: Vec<u8>,
+    /// Текст файла в UTF-8: `raw` как есть или, если `raw` не UTF-8, перекод по первому параметру `CHARSET`
+    /// (calcard принимает только `&str`).
     pub text: String,
     /// Что файл проверяет ([`VCARDS`]).
     pub checks: &'static str,
 }
 
-/// Все карточки корпуса vCard по имени файла. Чтение синхронное: вызывать вне async-кода
+impl CorpusCard {
+    /// Файл не в UTF-8 (сырые 8-битные байты): `text` получен перекодом.
+    pub fn is_8bit(&self) -> bool {
+        std::str::from_utf8(&self.raw).is_err()
+    }
+
+    /// Карточки файла, разобранные calcard (`Parser`, как `VCard::parse`, но до конца файла).
+    pub fn parse(&self) -> Result<Vec<VCard>> {
+        let mut parser = Parser::new(&self.text);
+        let mut out = Vec::new();
+        loop {
+            match parser.entry() {
+                Entry::VCard(card) => out.push(card),
+                Entry::Eof => return Ok(out),
+                other => return Err(Error::invalid(format!("{}: {other:?}", self.name))),
+            }
+        }
+    }
+}
+
+/// UTF-8 из байтов файла: как есть или перекод по первому `CHARSET=` (декодеры mail-parser).
+fn to_utf8(name: &str, raw: Vec<u8>) -> Result<String> {
+    let raw = match String::from_utf8(raw) {
+        Ok(text) => return Ok(text),
+        Err(e) => e.into_bytes(),
+    };
+    let upper = raw.to_ascii_uppercase();
+    let charset = upper
+        .windows(8)
+        .position(|w| w == b"CHARSET=")
+        .map(|i| &raw[i + 8..])
+        .map(|rest| {
+            let end = rest
+                .iter()
+                .position(|b| matches!(b, b';' | b':'))
+                .unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .ok_or_else(|| Error::invalid(format!("{name}: не UTF-8 и нет CHARSET")))?;
+    let decode = charset_decoder(charset)
+        .ok_or_else(|| Error::invalid(format!("{name}: неизвестная кодировка")))?;
+    Ok(decode(&raw))
+}
+
+/// Все файлы корпуса vCard по имени файла. Чтение синхронное: вызывать вне async-кода
 /// (или через `spawn_blocking`).
 pub fn vcards() -> Result<Vec<CorpusCard>> {
     let dir = corpus_dir();
     VCARDS
         .iter()
         .map(|&(name, checks)| {
+            let raw = fs::read(dir.join(format!("{name}.vcf")))?;
             Ok(CorpusCard {
                 name: name.to_owned(),
-                text: fs::read_to_string(dir.join(format!("{name}.vcf")))?,
+                text: to_utf8(name, raw.clone())?,
+                raw,
                 checks,
             })
         })
         .collect()
 }
 
-/// Карточка корпуса по имени файла без номера и расширения (`v4-org`).
+/// Файл корпуса vCard по имени без номера и расширения (`v4-org`).
 pub fn vcard(name: &str) -> Result<CorpusCard> {
     vcards()?
         .into_iter()
         .find(|c| c.name.split_once('-').is_some_and(|(_, n)| n == name))
-        .ok_or(tp_contracts::Error::NotFound)
+        .ok_or(Error::NotFound)
 }
 
 // ---------- PostgreSQL ----------
@@ -467,35 +535,119 @@ mod tests {
 
     #[test]
     fn vcards_are_well_formed() {
-        for card in vcards().expect("vcards") {
-            let n = &card.name;
-            assert!(card.text.starts_with("BEGIN:VCARD\r\nVERSION:"), "{n}");
-            assert!(card.text.ends_with("\r\nEND:VCARD\r\n"), "{n}");
-            assert_eq!(
-                card.text.matches("BEGIN:VCARD").count(),
-                1,
-                "{n}: одна карточка в файле"
-            );
-            assert_eq!(
-                card.text.matches('\n').count(),
-                card.text.matches("\r\n").count(),
-                "{n}: только CRLF"
-            );
+        for file in vcards().expect("vcards") {
+            let n = &file.name;
+            let raw = &file.raw;
+            assert!(raw.starts_with(b"BEGIN:VCARD\r\nVERSION:"), "{n}");
+            assert!(raw.ends_with(b"\r\nEND:VCARD\r\n"), "{n}");
+            let crlf = raw.windows(2).filter(|w| w == b"\r\n").count();
+            let lf = raw.iter().filter(|&&b| b == b'\n').count();
+            assert_eq!(lf, crlf, "{n}: только CRLF");
             assert!(
-                card.text.split("\r\n").all(|l| l.len() <= 75),
+                raw.split(|&b| b == b'\n').all(|l| l.len() <= 76),
                 "{n}: строка длиннее 75 октетов"
             );
-            let lines = unfold(&card.text);
-            let has = |prop: &str| {
-                lines.iter().any(|l| {
-                    l.strip_prefix(prop)
-                        .is_some_and(|r| r.starts_with([':', ';']))
-                })
-            };
-            assert!(has("FN"), "{n}: нет FN");
-            // N обязателен до vCard 4.0.
-            assert!(has("N") || lines[1] == "VERSION:4.0", "{n}: нет N");
+            assert_eq!(
+                file.is_8bit(),
+                n.ends_with("-8bit"),
+                "{n}: `-8bit` — не UTF-8"
+            );
+            let lines = unfold(&file.text);
+            let cards: Vec<&[String]> = lines
+                .split(|l| l == "END:VCARD")
+                .filter(|c| !c.is_empty())
+                .collect();
+            assert_eq!(cards.len(), file.text.matches("BEGIN:VCARD").count(), "{n}");
+            assert_eq!(
+                cards.len() > 1,
+                matches!(n.as_str(), "14-multi-v3-addressbook" | "16-v21-cp1251-8bit"),
+                "{n}: несколько карточек — только в многокарточных файлах"
+            );
+            for card in cards {
+                assert_eq!(card[0], "BEGIN:VCARD", "{n}");
+                let has = |prop: &str| {
+                    card.iter().any(|l| {
+                        l.strip_prefix(prop)
+                            .is_some_and(|r| r.starts_with([':', ';']))
+                    })
+                };
+                assert!(has("FN"), "{n}: нет FN");
+                // N обязателен до vCard 4.0.
+                assert!(has("N") || card[1] == "VERSION:4.0", "{n}: нет N");
+            }
         }
+    }
+
+    /// Каждый файл корпуса разбирается calcard без ошибок; карточек — столько же, сколько `BEGIN:VCARD`,
+    /// у каждой непустое FN.
+    #[test]
+    fn vcards_parse_with_calcard() {
+        use calcard::vcard::VCardProperty;
+        for file in vcards().expect("vcards") {
+            let n = &file.name;
+            let cards = file.parse().unwrap_or_else(|e| panic!("{n}: {e}"));
+            assert_eq!(cards.len(), file.text.matches("BEGIN:VCARD").count(), "{n}");
+            for card in &cards {
+                let fname = card
+                    .property(&VCardProperty::Fn)
+                    .and_then(|e| e.values.first())
+                    .and_then(|v| v.as_text());
+                assert!(fname.is_some_and(|f| !f.is_empty()), "{n}: FN");
+            }
+        }
+    }
+
+    /// Текстовые значения свойства во всех карточках файла после разбора calcard (компоненты через `;`).
+    fn texts(name: &str, prop: calcard::vcard::VCardProperty) -> Vec<String> {
+        vcard(name)
+            .expect(name)
+            .parse()
+            .expect("parse")
+            .iter()
+            .flat_map(|c| c.properties(&prop))
+            .map(|e| {
+                e.values
+                    .iter()
+                    .filter_map(|v| v.as_text())
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .collect()
+    }
+
+    /// Старые кодировки после разбора — правильная кириллица: QP с CHARSET (2.1 и 3.0) и сырые 8 бит.
+    #[test]
+    fn vcards_legacy_charsets_decode() {
+        use calcard::vcard::VCardProperty::{Fn, Note, Org};
+        assert_eq!(texts("export-outlook-v21", Fn), ["Иван Кузьмич Орлов"]);
+        assert_eq!(texts("v3-cp1251-qp", Fn), ["Пётр Ильич Сидоров"]);
+        assert_eq!(
+            texts("v3-cp1251-qp", Org),
+            ["ООО «Пример-Сервис»;Бухгалтерия"]
+        );
+        let note = texts("v3-cp1251-qp", Note).concat();
+        assert!(
+            note.contains("времени; в пятницу — до 16. Ёлка, щётка"),
+            "{note}"
+        );
+        assert_eq!(
+            texts("v21-cp1251-8bit", Fn),
+            ["Елена Андреевна Козлова", "Григорий Ёлкин"]
+        );
+        assert_eq!(
+            texts("v21-cp1251-8bit", Note),
+            ["Заметка в QP внутри 8-битного файла: «ёжик» и щука."]
+        );
+        let bit8 = vcard("v21-cp1251-8bit").expect("8bit");
+        assert!(bit8.is_8bit() && bit8.raw.contains(&0xC5) && bit8.text.contains("Козлова"));
+        assert_eq!(
+            texts("multi-v3-addressbook", Fn),
+            [
+                "Ольга Викторовна Смирнова",
+                "Boris Kuznetsov",
+                "Сервисный центр «Пример»"
+            ]
+        );
     }
 
     #[test]
@@ -545,10 +697,7 @@ mod tests {
         );
         let outlook = vcard("export-outlook-v21").expect("outlook").text;
         assert!(outlook.is_ascii() && outlook.contains("=\r\n"));
-        assert!(matches!(
-            vcard("no-such-card"),
-            Err(tp_contracts::Error::NotFound)
-        ));
+        assert!(matches!(vcard("no-such-card"), Err(Error::NotFound)));
     }
 
     #[test]
