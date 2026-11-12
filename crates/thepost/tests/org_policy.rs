@@ -306,7 +306,7 @@ struct Node {
     _dir: tempfile::TempDir,
     shutdown: CancellationToken,
     running: Running,
-    pool: sqlx::PgPool,
+    pool: tp_meta::pool::DbPool,
     account: String,
     login: String,
     app_password: String,
@@ -377,7 +377,10 @@ impl Node {
         let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
 
         // Пароль приложения администратора — для AUTH в submission и входа в JMAP.
-        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        let pool = tp_meta::pool::DbPool::new(
+            sqlx::PgPool::connect(&url_db).await.expect("pool"),
+            Arc::new(tp_meta::pool::NoAcquireObserver),
+        );
         let meta = PgMeta::new(pool.clone(), MetaConfig::default());
         let tenant = TenantId::DEFAULT;
         let account = meta
