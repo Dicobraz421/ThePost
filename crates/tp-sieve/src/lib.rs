@@ -3,15 +3,19 @@
 //! Своя реализация: sieve-rs распространяется под AGPL-3.0 (SRS 4.3, 7.1). Путь скрипта:
 //! [`parse`] (лексер и грамматика RFC 5228 §8, SIEVE-01) → [`check`] / [`compile`] (require, аргументы, расширения —
 //! программа [`Program`], SIEVE-02) → [`run`] (выполнение над письмом, SIEVE-03) → слияние действий в
-//! `RulesOutcome` (SIEVE-04).
+//! `RulesOutcome` (SIEVE-04). Точка правил доставки — [`Rules`] (SIEVE-07): скрипт организации, автоответ
+//! (SIEVE-06), активный скрипт пользователя; секция конфигурации — [`SieveConfig`]. [`fuzz`] — проверки для целей
+//! cargo-fuzz `crates/tp-sieve/fuzz` (не API).
 //!
 //! Все лимиты ([`Limits`]) дают ошибку разбора или выполнения, а не панику: скрипты пишут пользователи.
 
 pub mod ast;
 mod compile;
 mod config;
+pub mod fuzz;
 mod lexer;
 mod outcome;
+mod rules;
 mod run;
 mod vacation;
 
@@ -21,10 +25,11 @@ use serde::{Deserialize, Serialize};
 
 pub use ast::{Arg, Command, Script, Test, parse};
 pub use compile::{EXTENSIONS, Program, check, compile};
-pub use config::VacationConfig;
+pub use config::{CacheConfig, ManageSieveConfig, SieveConfig, VacationConfig};
+pub use rules::Rules;
 pub use run::{Action, Context, Outcome, VacationAction, run};
 
-/// Лимиты разбора и выполнения (секция `sieve` — SIEVE-07; здесь значения по умолчанию).
+/// Лимиты разбора и выполнения; в приложении — из секции `sieve` ([`SieveConfig::limits`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     /// Размер текста скрипта, байт.
