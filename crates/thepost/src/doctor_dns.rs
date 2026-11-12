@@ -2,10 +2,10 @@
 //!
 //! Проверки: MX основного домена (и указывает ли он на `smtp.hostname`), SPF, DKIM по селекторам
 //! `smtp.dkim.domains`, DMARC, MTA-STS, PTR исходящих адресов (`smtp.queue.source_ip` или адреса
-//! `smtp.hostname`), при роли dav — SRV `_caldavs._tcp` и `_carddavs._tcp` с TXT `path=` (RFC 6764) основного
-//! домена и доменов DKIM, срок и имена сертификата `tls`, закрытый ключ `tls` (файл `key_file` или секрет `tls.key`
+//! `smtp.hostname`), срок и имена сертификата `tls`, закрытый ключ `tls` (файл `key_file` или секрет `tls.key`
 //! подходит к цепочке), слушатели с PROXY protocol v2 за балансировщиком.
 //! Имена зон RFC 6761 (`.test`, `.example`, `.invalid`, `.localhost`) — проверки DNS пропускаются (SKIP, CMP-09).
+//! При роли dav — SRV `_caldavs._tcp` и `_carddavs._tcp` с TXT `path=` (RFC 6764) основного домена и доменов DKIM.
 //! DNS — через [`Dns`]: в работе — системный резолвер (`mail-auth`), в тестах — подстановка.
 
 use std::net::IpAddr;
