@@ -292,7 +292,7 @@ impl Services {
         let smtp_metrics = Arc::new(SmtpMetrics::new());
         smtp_metrics.register(metrics);
         let limiter = Arc::new(RateLimiter::new(
-            (*cfg.section::<RateLimitConfig>("ratelimit")?).clone(),
+            (*cfg.section::<RateLimitConfig>(tp_platform::ratelimit::RATELIMIT)?).clone(),
         ));
 
         // Секции, читаемые ролями при запуске, проверяются здесь: ошибка — до запуска ролей.
@@ -680,14 +680,37 @@ pub fn system_resolver() -> Result<mail_auth::MessageAuthenticator> {
 /// Хранилище блокировок недоступно — решение по `auth.abuse.fail_closed` принимает `AbuseGuard` (AUTH-11,
 /// решение владельца #253): `false` (по умолчанию) — вход проверяется по блокировкам, известным узлу; `true` —
 /// ошибка `AbuseGuard::check` возвращается вызывающему (`Unavailable`: протокол отвечает временным отказом).
-struct Guarded {
+pub struct Guarded {
     inner: Arc<dyn Authenticator>,
     guard: tp_auth::AbuseGuard,
     accounts: Arc<dyn AccountStore>,
     tenant: TenantId,
 }
 
+impl std::fmt::Debug for Guarded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guarded")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Guarded {
+    /// Проверка `inner` под защитой `guard`; учётная запись попытки — по имени входа из `accounts` в `tenant`.
+    pub fn new(
+        inner: Arc<dyn Authenticator>,
+        guard: tp_auth::AbuseGuard,
+        accounts: Arc<dyn AccountStore>,
+        tenant: TenantId,
+    ) -> Self {
+        Self {
+            inner,
+            guard,
+            accounts,
+            tenant,
+        }
+    }
+
     /// Попытка входа по предъявленным данным: для пароля — учётная запись по имени входа (нет или ошибка
     /// каталога — без учётной записи); токен и Kerberos — субъект известен только после проверки.
     async fn attempt(&self, credentials: &Credentials) -> tp_auth::Attempt {
