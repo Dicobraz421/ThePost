@@ -638,7 +638,7 @@ pub(crate) async fn copy(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use base64::Engine;
@@ -677,7 +677,7 @@ mod tests {
     ];
 
     /// Сервер CardDAV поверх того же хранилища и входа.
-    async fn dav(env: &Env) -> std::net::SocketAddr {
+    pub(crate) async fn dav(env: &Env) -> std::net::SocketAddr {
         let app = tp_dav::router(
             tp_dav::Deps {
                 auth: Arc::new(env.auth.clone()),

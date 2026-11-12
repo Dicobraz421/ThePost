@@ -13,6 +13,7 @@
 //! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`
 //!   (подпись профиля ключом TLS — [`ProfileSigner`], [`Jmap::with_profile_signer`]);
 //! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
+//! - `calendars` — Calendar/get, changes, set (draft-ietf-jmap-calendars) поверх `DavStore`, [`Jmap::with_dav`];
 //! - `contact_card` — ContactCard/get, changes, query, queryChanges, set, copy: vCard в `DavStore`, JSContact —
 //!   calcard, индекс — `tp_dav::index`;
 //! - `contacts` — AddressBook/get, changes, set (RFC 9610) поверх `DavStore`, [`Jmap::with_dav`];
@@ -23,6 +24,7 @@
 
 mod autoconfig;
 mod blob;
+mod calendars;
 mod contact_card;
 mod contacts;
 pub mod core;
@@ -46,7 +48,7 @@ pub use crate::autoconfig::sign::{ProfileSigner, SignatureAlgorithm, SigningKey}
 pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
 
 use crate::core::error::MethodResult;
-use crate::core::{CONTACTS, CORE, Ctx, MAIL, SETTINGS, SIEVE, SUBMISSION, VACATION};
+use crate::core::{CALENDARS, CONTACTS, CORE, Ctx, MAIL, SETTINGS, SIEVE, SUBMISSION, VACATION};
 
 /// Встроенные методы и их capability.
 pub(crate) const METHODS: &[(&str, &str)] = &[
@@ -90,6 +92,9 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("ContactCard/queryChanges", CONTACTS),
     ("ContactCard/set", CONTACTS),
     ("ContactCard/copy", CONTACTS),
+    ("Calendar/get", CALENDARS),
+    ("Calendar/changes", CALENDARS),
+    ("Calendar/set", CALENDARS),
 ];
 
 /// Варианты сортировки `Email/query` (сессия, `emailQuerySortOptions`).
@@ -142,6 +147,9 @@ pub(crate) async fn call_builtin(
         "ContactCard/queryChanges" => contact_card::query_changes(ctx, args).await,
         "ContactCard/set" => contact_card::set(ctx, args).await,
         "ContactCard/copy" => contact_card::copy(ctx, args).await,
+        "Calendar/get" => calendars::get(ctx, args).await,
+        "Calendar/changes" => calendars::changes(ctx, args).await,
+        "Calendar/set" => calendars::set(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
 }
