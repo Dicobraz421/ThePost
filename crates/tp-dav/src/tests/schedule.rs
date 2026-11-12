@@ -159,6 +159,22 @@ impl Sched {
             .expect("хранилище")
     }
 
+    /// Число периодов занятости `login` в январе 2026: повторы разворачивает хранилище при запросе (META-54).
+    async fn busy_in_january(&self, login: &str) -> usize {
+        let scope = self.scope(login);
+        let at = |unix| time::OffsetDateTime::from_unix_timestamp(unix).expect("время");
+        let range = tp_contracts::schedule::Period {
+            start: at(1_767_225_600),
+            end: at(1_769_904_000),
+        };
+        tp_contracts::schedule::FreeBusy::query(&self.store, scope.tenant, &[scope.account], range)
+            .await
+            .expect("занятость")
+            .into_iter()
+            .map(|(_, periods)| periods.len())
+            .sum()
+    }
+
     async fn body(&self, login: &str, uid: &str) -> String {
         self.by_uid(login, uid).await.expect("объект").body
     }
@@ -879,10 +895,9 @@ async fn keep_processed_and_instance_cancel() {
         1,
         "сохранено по настройке, повтор не дублирует"
     );
-    assert_eq!(
-        env.by_uid(PETR, "m-12").await.expect("o").index.busy.len(),
-        3
-    );
+    let o = env.by_uid(PETR, "m-12").await.expect("o");
+    assert!(o.index.recurring && o.index.busy.is_empty());
+    assert_eq!(env.busy_in_january(PETR).await, 3);
     // Отмена одного вхождения — исключение из ряда.
     let one = itip_msg(
         "CANCEL",
@@ -907,7 +922,8 @@ async fn keep_processed_and_instance_cancel() {
         "{}",
         o.body
     );
-    assert_eq!(o.index.busy.len(), 2);
+    assert!(o.index.recurring && o.index.busy.is_empty());
+    assert_eq!(env.busy_in_january(PETR).await, 2);
 }
 
 // ---------- DAV-16: занятость ----------
