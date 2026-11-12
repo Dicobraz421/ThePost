@@ -52,13 +52,13 @@ pub(crate) fn connector() -> TlsConnector {
     TlsConnector::from(Arc::new(cfg))
 }
 
-async fn handshake(tcp: TcpStream) -> TlsStream<TcpStream> {
+pub(super) async fn handshake(tcp: TcpStream) -> TlsStream<TcpStream> {
     let name = ServerName::try_from("localhost").expect("name");
     connector().connect(name, tcp).await.expect("tls")
 }
 
 /// Сервер роли с одним слушателем на `127.0.0.1:0`.
-struct Server {
+pub(super) struct Server {
     addr: std::net::SocketAddr,
     rec: Arc<Recorder>,
     shutdown: CancellationToken,
@@ -70,7 +70,7 @@ impl Server {
         Self::with_limiter(mode, implicit_tls, edit, None).await
     }
 
-    async fn with_limiter(
+    pub(super) async fn with_limiter(
         mode: Mode,
         implicit_tls: bool,
         edit: impl FnOnce(&mut SmtpConfig),
@@ -79,7 +79,7 @@ impl Server {
         Self::with_deps(mode, implicit_tls, edit, |d| d.limiter = limiter).await
     }
 
-    async fn with_deps(
+    pub(super) async fn with_deps(
         mode: Mode,
         implicit_tls: bool,
         edit: impl FnOnce(&mut SmtpConfig),
@@ -130,18 +130,18 @@ impl Server {
         }
     }
 
-    async fn connect(&self) -> TcpStream {
+    pub(super) async fn connect(&self) -> TcpStream {
         TcpStream::connect(self.addr).await.expect("connect")
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         self.shutdown.cancel();
         self.task.await.expect("join").expect("serve");
     }
 }
 
 /// `AUTH PLAIN` с паролем `pass` для alice.
-fn plain(pass: &str) -> String {
+pub(super) fn plain(pass: &str) -> String {
     use base64::Engine;
     let raw = format!("\0alice@example.org\0{pass}");
     format!(
@@ -150,7 +150,7 @@ fn plain(pass: &str) -> String {
     )
 }
 
-async fn ehlo<S>(c: &mut Client<S>) -> Vec<String>
+pub(super) async fn ehlo<S>(c: &mut Client<S>) -> Vec<String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {

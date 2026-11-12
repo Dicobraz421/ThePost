@@ -32,6 +32,8 @@ mod session;
 mod tls;
 
 #[cfg(test)]
+mod auth_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 #[cfg(test)]
 pub(crate) mod tls_tests;
