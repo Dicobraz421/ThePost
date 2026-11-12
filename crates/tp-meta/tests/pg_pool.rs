@@ -244,3 +244,103 @@ async fn sslmode_disable_only_in_dev() {
     assert!(tls.value.starts_with("sslmode=disable"), "{tls:?}");
     assert_eq!(tls.status, Status::Warn);
 }
+
+/// META-55: пул из одного соединения, вторая транзакция ждёт — наблюдатель получает ожидание и его время;
+/// отменённое ожидание не оставляет «ожидает».
+#[tokio::test]
+async fn acquire_observer_sees_wait() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tp_contracts::acquire::AcquireCounter;
+
+    let Some(url) = common::pg_url() else {
+        return;
+    };
+    let c = PoolConfig {
+        max_connections: 1,
+        acquire_timeout: Duration::from_secs(30),
+        ..cfg(url, false)
+    };
+    let pool = pool::connect(&c, &*common::secrets())
+        .await
+        .expect("connect");
+    let counter = Arc::new(AcquireCounter::default());
+    pool::observe(&pool, counter.clone());
+    assert_eq!(pool::snapshot(&pool).max, 1);
+
+    let waiting = |n: u64| {
+        let counter = counter.clone();
+        async move {
+            for _ in 0..500 {
+                if counter.waiting() == n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("ожидающих не {n}: {}", counter.waiting());
+        }
+    };
+    let second = |pool: sqlx::PgPool| {
+        tokio::spawn(async move {
+            pool::with_system(&pool, |tx| {
+                Box::pin(async move {
+                    sqlx::query_scalar::<_, i32>("SELECT 1")
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(db_err)
+                })
+            })
+            .await
+        })
+    };
+
+    // Первая транзакция держит единственное соединение.
+    let held = tp_meta::schema::begin(&pool, TenantId::DEFAULT)
+        .await
+        .expect("begin");
+    assert_eq!((counter.waiting(), counter.acquired()), (0, 1));
+    let snap = pool::snapshot(&pool);
+    assert_eq!((snap.size, snap.idle, snap.in_use()), (1, 0, 1));
+
+    // Вторая ждёт: наблюдатель видит ожидание, после освобождения — его время.
+    let task = second(pool.clone());
+    waiting(1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let before = counter.waited();
+    drop(held);
+    assert_eq!(task.await.expect("join"), Ok(1));
+    assert_eq!(
+        (counter.waiting(), counter.acquired(), counter.failed()),
+        (0, 2, 0)
+    );
+    assert!(counter.waited() - before >= Duration::from_millis(50));
+
+    // Отменённое ожидание не оставляет «ожидает» и не считается отказом.
+    let held = tp_meta::schema::begin_system(&pool).await.expect("begin");
+    let task = second(pool.clone());
+    waiting(1).await;
+    task.abort();
+    assert!(task.await.expect_err("отменена").is_cancelled());
+    waiting(0).await;
+    assert_eq!(
+        (counter.acquired(), counter.failed(), counter.cancelled()),
+        (3, 0, 1)
+    );
+    drop(held);
+
+    // Тайм-аут пула — исход «отказ».
+    let short = PoolConfig {
+        acquire_timeout: Duration::from_millis(200),
+        ..c
+    };
+    let pool = pool::connect(&short, &*common::secrets())
+        .await
+        .expect("connect");
+    let timed = Arc::new(AcquireCounter::default());
+    pool::observe(&pool, timed.clone());
+    let held = tp_meta::schema::begin_system(&pool).await.expect("begin");
+    let r = pool::with_system(&pool, |_| Box::pin(async { Ok(()) })).await;
+    assert!(matches!(r, Err(Error::Unavailable { .. })), "{r:?}");
+    assert_eq!((timed.waiting(), timed.failed()), (0, 1));
+    drop(held);
+}

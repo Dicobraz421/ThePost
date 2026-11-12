@@ -287,6 +287,17 @@ impl Failover {
         &self.0.pool
     }
 
+    /// Назначает пулу наблюдателя ожидания соединения (CTR-51, [`pool::observe`]): транзакции и повторы на
+    /// пуле сообщают ему о каждом ожидании; служебные проверки primary не учитываются.
+    pub fn observe(&self, observer: Arc<dyn tp_contracts::acquire::AcquireObserver>) {
+        pool::observe(&self.0.pool, observer);
+    }
+
+    /// Снимок занятости пула для `/metrics` ([`pool::snapshot`]).
+    pub fn snapshot(&self) -> pool::PoolSnapshot {
+        pool::snapshot(&self.0.pool)
+    }
+
     /// Номер переключения primary: новое значение — пул перенаправлен к другому адресу (слушатель сигналов
     /// переподключается, [`crate::signals`]). Выбор primary при запуске — тоже переключение.
     pub fn switches(&self) -> tokio::sync::watch::Receiver<u64> {

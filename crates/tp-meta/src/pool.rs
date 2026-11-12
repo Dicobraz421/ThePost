@@ -24,6 +24,10 @@
 //! [`SecretStore`] при создании пула и при смене учётных данных ([`PoolConfig::client_key`]) и передаётся
 //! драйверу из памяти, на диск не пишется.
 //!
+//! Ожидание соединения пула сообщается наблюдателю [`AcquireObserver`] ([`observe`], CTR-51, META-55): транзакции
+//! [`with_tenant`], [`with_system`] и их варианты с повтором ([`crate::failover`]) получают соединение через него.
+//! Снимок занятости пула для `/metrics` — [`snapshot`].
+//!
 //! Реплика для фоновых чтений ([`PoolConfig::read_replica`], `ReadIntent::Stale`, META-32) — [`connect_replica`],
 //! [`crate::replica`].
 
@@ -31,13 +35,15 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
+use tp_contracts::acquire::AcquireObserver;
 use tp_contracts::config::duration;
 use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalChannel, InternalTls, KeySource, Profile, Transport};
@@ -661,6 +667,79 @@ async fn writable_address(
     Err(Error::UNAVAILABLE)
 }
 
+/// Снимок занятости пула соединений для `/metrics` ([`snapshot`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolSnapshot {
+    /// Открыто соединений (занятые и свободные).
+    pub size: u32,
+    /// Свободных соединений.
+    pub idle: u32,
+    /// Предел размера пула (`database.max_connections`).
+    pub max: u32,
+}
+
+impl PoolSnapshot {
+    /// Занято соединений.
+    pub fn in_use(&self) -> u32 {
+        self.size.saturating_sub(self.idle)
+    }
+}
+
+/// Снимок занятости пула `pool`: без обращения к СУБД.
+pub fn snapshot(pool: &PgPool) -> PoolSnapshot {
+    PoolSnapshot {
+        size: pool.size(),
+        idle: u32::try_from(pool.num_idle()).unwrap_or(u32::MAX),
+        max: pool.options().get_max_connections(),
+    }
+}
+
+/// Наблюдатели пулов: пул и его наблюдатель. Запись держит пул, пока он не закрыт, — адрес его параметров
+/// (признак «тот же пул») не достаётся другому пулу. Записей — по числу пулов узла (основная БД, шарды).
+static OBSERVED: RwLock<Vec<(PgPool, Arc<dyn AcquireObserver>)>> = RwLock::new(Vec::new());
+
+/// `a` и `b` — один пул (клоны): параметры пула лежат в его общем состоянии.
+pub(crate) fn same_pool(a: &PgPool, b: &PgPool) -> bool {
+    std::ptr::eq(a.options(), b.options())
+}
+
+/// Назначает пулу `pool` (и всем его клонам) наблюдателя ожидания соединения (CTR-51): транзакции
+/// [`with_tenant`], [`with_system`], [`crate::schema::begin`] и повторы [`crate::failover::Failover`] на этом
+/// пуле сообщают ему о каждом ожидании; отказ и тайм-аут пула — исход «отказ», отменённая задача — «брошено».
+/// Без назначения наблюдателя нет (ожидание не учитывается). Повторное назначение заменяет прежнее;
+/// записи закрытых пулов удаляются.
+pub fn observe(pool: &PgPool, observer: Arc<dyn AcquireObserver>) {
+    let mut list = OBSERVED.write().unwrap_or_else(PoisonError::into_inner);
+    list.retain(|(p, _)| !p.is_closed() && !same_pool(p, pool));
+    list.push((pool.clone(), observer));
+}
+
+/// Наблюдатель пула `pool`; `None` — не назначен.
+fn observer(pool: &PgPool) -> Option<Arc<dyn AcquireObserver>> {
+    let list = OBSERVED.read().unwrap_or_else(PoisonError::into_inner);
+    list.iter()
+        .find(|(p, _)| same_pool(p, pool))
+        .map(|(_, o)| o.clone())
+}
+
+/// Транзакция на соединении пула `pool`; ожидание соединения — через наблюдателя пула ([`observe`]).
+pub(crate) async fn begin_tx(pool: &PgPool) -> Result<Transaction<'static, Postgres>> {
+    match observer(pool) {
+        Some(o) => o.observe(pool.begin()).await,
+        None => pool.begin().await,
+    }
+    .map_err(db_err)
+}
+
+/// Соединение пула `pool` для одиночного запроса; ожидание — через наблюдателя пула ([`observe`]).
+pub(crate) async fn acquire(pool: &PgPool) -> Result<PoolConnection<Postgres>> {
+    match observer(pool) {
+        Some(o) => o.observe(pool.acquire()).await,
+        None => pool.acquire().await,
+    }
+    .map_err(db_err)
+}
+
 /// Будущее тела транзакции, заимствующее соединение.
 pub type TxFuture<'c, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>;
 
@@ -990,5 +1069,59 @@ dynamic_credentials:
         assert!(is_private_key_pem(
             "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----"
         ));
+    }
+
+    #[tokio::test]
+    async fn acquire_observer_and_snapshot() {
+        use tp_contracts::acquire::AcquireCounter;
+
+        // Адрес без сервера: получение соединения — отказ.
+        let url = "postgres://u@127.0.0.1:1/none?sslmode=disable";
+        let c = PoolConfig {
+            max_connections: 3,
+            acquire_timeout: Duration::from_millis(300),
+            ..dev(url)
+        };
+        let pool = connect_lazy(&c, url, None, None).expect("lazy");
+        assert_eq!(
+            snapshot(&pool),
+            PoolSnapshot {
+                size: 0,
+                idle: 0,
+                max: 3
+            }
+        );
+        // Без наблюдателя — как раньше.
+        assert!(matches!(
+            begin_tx(&pool).await,
+            Err(Error::Unavailable { .. })
+        ));
+
+        let counter = Arc::new(AcquireCounter::default());
+        observe(&pool.clone(), counter.clone());
+        let other = connect_lazy(&c, url, None, None).expect("lazy");
+        assert!(same_pool(&pool, &pool.clone()) && !same_pool(&pool, &other));
+        assert!(observer(&other).is_none());
+
+        assert!(crate::schema::begin_system(&pool).await.is_err());
+        assert!(acquire(&pool).await.is_err());
+        let failed = with_tenant(&pool, TenantId::DEFAULT, |_| Box::pin(async { Ok(()) })).await;
+        assert!(matches!(failed, Err(Error::Unavailable { .. })));
+        assert_eq!(
+            (counter.waiting(), counter.acquired(), counter.failed()),
+            (0, 0, 3)
+        );
+        // Чужой пул наблюдателю не сообщает; повторное назначение заменяет наблюдателя.
+        assert!(begin_tx(&other).await.is_err());
+        assert_eq!(counter.failed(), 3);
+        let second = Arc::new(AcquireCounter::default());
+        observe(&pool, second.clone());
+        assert!(begin_tx(&pool).await.is_err());
+        assert_eq!((counter.failed(), second.failed()), (3, 1));
+        // Запись закрытого пула удаляется при следующем назначении.
+        pool.close().await;
+        observe(&other, counter.clone());
+        assert!(observer(&pool).is_none());
+        other.close().await;
     }
 }

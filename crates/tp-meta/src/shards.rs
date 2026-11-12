@@ -20,6 +20,7 @@
 //! отклоняет ограничение таблицы и проверка при чтении справочника.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -32,9 +33,13 @@ use tp_contracts::meta::AccountScope;
 use tp_contracts::secrets::{SecretRef, SecretStore};
 use tp_contracts::{AccountId, Error, Result, TenantId};
 
-use crate::pool::{PoolConfig, connect_lazy, fetch_secret, url_has_password};
+use crate::pool::{
+    PoolConfig, PoolSnapshot, connect_lazy, fetch_secret, observe, same_pool, snapshot,
+    url_has_password,
+};
 use crate::replica::Replica;
 use crate::schema::{begin, db_err};
+use tp_contracts::acquire::AcquireObserver;
 
 /// Номер шарда — тип контракта (CTR-34): [`ShardId::MAIN`] — основная БД.
 pub use tp_contracts::ShardId;
@@ -180,7 +185,11 @@ pub struct ShardDirectory {
     cfg: PoolConfig,
     secrets: Arc<dyn SecretStore>,
     cache: Mutex<Cache>,
+    observers: Option<ShardObservers>,
 }
+
+/// Наблюдатель ожидания соединения для пула шарда ([`ShardDirectory::with_acquire_observers`]).
+pub type ShardObservers = Arc<dyn Fn(ShardId) -> Arc<dyn AcquireObserver> + Send + Sync>;
 
 impl fmt::Debug for ShardDirectory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -197,7 +206,42 @@ impl ShardDirectory {
             cfg,
             secrets,
             cache: Mutex::new(Cache::default()),
+            observers: None,
         }
+    }
+
+    /// Наблюдатели ожидания соединения пулов шардов (CTR-51, [`crate::pool::observe`]): `observers` вызывается
+    /// при создании пула primary шарда с адресом (в том числе заново после [`forget`](Self::forget) и сброса
+    /// кэша). Пул основной БД (шард без адреса) наблюдает узел; пулы реплик не наблюдаются.
+    pub fn with_acquire_observers(
+        mut self,
+        observers: impl Fn(ShardId) -> Arc<dyn AcquireObserver> + Send + Sync + 'static,
+    ) -> Self {
+        self.observers = Some(Arc::new(observers));
+        self
+    }
+
+    /// Снимки занятости созданных пулов primary шардов с адресом, по номеру шарда (для `/metrics`); пул основной
+    /// БД — [`crate::pool::snapshot`] от пула узла. Без обращения к СУБД.
+    pub fn snapshots(&self) -> Vec<(ShardId, PoolSnapshot)> {
+        let c = self.cached();
+        let mut out: Vec<_> = c
+            .pools
+            .iter()
+            .filter(|(_, p)| !same_pool(p, &self.catalog))
+            .map(|(id, p)| (*id, snapshot(p)))
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// Снимок занятости пула primary шарда `shard`; `None` — пул ещё не создан или шард в основной БД.
+    pub fn snapshot(&self, shard: ShardId) -> Option<PoolSnapshot> {
+        let c = self.cached();
+        c.pools
+            .get(&shard)
+            .filter(|p| !same_pool(p, &self.catalog))
+            .map(snapshot)
     }
 
     /// Все шарды по номеру; строка с паролем в адресе или неверной ссылкой на секрет — `Invalid`.
@@ -205,7 +249,7 @@ impl ShardDirectory {
         let rows: Vec<ShardRow> = sqlx::query_as(
             "SELECT shard_id, name, dsn, credentials, accepts_new, site, read_replica FROM shards ORDER BY shard_id",
         )
-        .fetch_all(&self.catalog)
+        .fetch_all(&mut *crate::pool::acquire(&self.catalog).await?)
         .await
         .map_err(db_err)?;
         rows.into_iter().map(Shard::try_from).collect()
@@ -325,7 +369,7 @@ impl ShardDirectory {
             "SELECT shard_id, name, dsn, credentials, accepts_new, site, read_replica FROM shards WHERE shard_id = $1",
         )
         .bind(shard.0)
-        .fetch_optional(&self.catalog)
+        .fetch_optional(&mut *crate::pool::acquire(&self.catalog).await?)
         .await
         .map_err(db_err)?;
         Ok(ShardRecord {
@@ -358,7 +402,17 @@ impl ShardDirectory {
         if c.epoch != epoch {
             return pool;
         }
-        c.pools.entry(key).or_insert(pool).clone()
+        match c.pools.entry(key) {
+            Entry::Occupied(e) => e.get().clone(),
+            Entry::Vacant(e) => {
+                if let Some(observers) = &self.observers
+                    && !same_pool(&pool, &self.catalog)
+                {
+                    observe(&pool, observers(key));
+                }
+                e.insert(pool).clone()
+            }
+        }
     }
 }
 
@@ -432,7 +486,7 @@ impl ShardResolver for ShardDirectory {
         let shard: Option<i32> = sqlx::query_scalar(
             "SELECT shard_id FROM shards WHERE accepts_new ORDER BY shard_id LIMIT 1",
         )
-        .fetch_optional(&self.catalog)
+        .fetch_optional(&mut *crate::pool::acquire(&self.catalog).await?)
         .await
         .map_err(db_err)?;
         shard
@@ -450,7 +504,7 @@ impl ShardResolver for ShardDirectory {
         };
         let mut ids: Vec<ShardId> =
             sqlx::query_scalar::<_, i32>("SELECT shard_id FROM shards ORDER BY shard_id")
-                .fetch_all(&self.catalog)
+                .fetch_all(&mut *crate::pool::acquire(&self.catalog).await?)
                 .await
                 .map_err(db_err)?
                 .into_iter()

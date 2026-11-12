@@ -147,7 +147,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
 
 /// Транзакция в контексте организации: `app.tenant_id` (SET LOCAL) — RLS видит только её строки.
 pub async fn begin(pool: &PgPool, tenant: TenantId) -> Result<Transaction<'static, Postgres>> {
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = crate::pool::begin_tx(pool).await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(tenant.to_string())
         .execute(&mut *tx)
@@ -158,7 +158,7 @@ pub async fn begin(pool: &PgPool, tenant: TenantId) -> Result<Transaction<'stati
 
 /// Системная транзакция по всем организациям (GC BLOB, журнал событий): `app.all_tenants` (SET LOCAL).
 pub async fn begin_system(pool: &PgPool) -> Result<Transaction<'static, Postgres>> {
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = crate::pool::begin_tx(pool).await?;
     sqlx::query("SELECT set_config('app.all_tenants', 'on', true)")
         .execute(&mut *tx)
         .await

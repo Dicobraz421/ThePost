@@ -135,7 +135,7 @@ impl PgMeta {
             let pos: Option<i64> =
                 sqlx::query_scalar("SELECT last_pos FROM event_partitions WHERE partition = $1")
                     .bind(self.partition_arg(partition)?)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *crate::pool::acquire(&self.pool).await?)
                     .await
                     .map_err(db_err)?;
             Ok(EventPos(to_u64(pos.unwrap_or(0))?))
@@ -269,7 +269,7 @@ impl EventLog for PgMeta {
             )
             .bind(subscriber)
             .bind(self.partition_arg(partition)?)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *crate::pool::acquire(&self.pool).await?)
             .await
             .map_err(db_err)?;
             Ok(EventPos(to_u64(pos.unwrap_or(0))?))
