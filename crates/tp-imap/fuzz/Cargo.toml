@@ -1,5 +1,5 @@
 # Цели fuzz разбора IMAP (IMAP-01, IMAP-13), в каталоге crates/tp-imap:
-#   cargo +nightly fuzz run <цель> fuzz/corpus/<цель> -- -max_total_time=600
+#   cargo +nightly fuzz run -O <цель> fuzz/corpus/<цель> -- -max_total_time=600
 # Цели: command — поток команд IMAP4rev2 и сериализация обратно, literals — литералы и нарезка потока,
 # search — критерии SEARCH/ESEARCH, fetch — атрибуты FETCH по письму (атрибуты, NUL, письмо).
 # Проверки — tp_imap::fuzz; новые входы — в fuzz/corpus/<цель> (не в git).
@@ -46,3 +46,13 @@ path = "fuzz_targets/fetch.rs"
 test = false
 doc = false
 bench = false
+
+# Сборка — `cargo fuzz -O` (fuzz.yml): проверки отладки и переполнений — у своего кода, mail-parser — как в
+# выпуске. Его debug_assert!(false) на битом MIME — не паника выпуска: там разбор восстанавливается (FIX-06).
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+[profile.release.package.mail-parser]
+debug-assertions = false
+overflow-checks = false

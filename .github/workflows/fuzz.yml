@@ -3,6 +3,7 @@
 # Корпус каждой цели — в кэше Actions (восстановление по префиксу, сохранение и при падении).
 # Падение цели — issue «fuzz: <крейт>/<цель>» с входом и командой воспроизведения; открытый issue той же цели
 # получает комментарий вместо нового. На PR не запускается (бюджет CI ≤7 мин).
+# Сборка `-O`: проверки отладки и переполнений задаёт [profile.release] в fuzz/Cargo.toml крейта.
 name: Fuzz
 
 on:
@@ -81,7 +82,7 @@ jobs:
           key: fuzz-corpus-${{ matrix.name }}-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.name }}-${{ matrix.target }}-
       - id: build
-        run: cargo +nightly fuzz build "$TARGET"
+        run: cargo +nightly fuzz build -O "$TARGET"
       - id: run
         name: Фаззинг
         run: |
@@ -90,7 +91,7 @@ jobs:
           seeds=()
           # MS-13: начальный корпус — письма KIT-04 (см. crates/tp-mailstore/fuzz/Cargo.toml).
           if [ "${{ matrix.name }}" = tp-mailstore ]; then seeds+=(../tp-testkit/corpus); fi
-          cargo +nightly fuzz run "$TARGET" "fuzz/corpus/$TARGET" "${seeds[@]}" -- \
+          cargo +nightly fuzz run -O "$TARGET" "fuzz/corpus/$TARGET" "${seeds[@]}" -- \
             -max_total_time="$SECONDS_PER_TARGET" -timeout=30 -print_final_stats=1 2>&1 | tee "$RUNNER_TEMP/fuzz.log"
       - name: Корпус в кэш
         if: always() && steps.build.outcome == 'success'
@@ -137,7 +138,7 @@ jobs:
                 base64 -w 76 "$art"
                 echo "B64"
               fi
-              echo "cargo +nightly fuzz run $TARGET $f"
+              echo "cargo +nightly fuzz run -O $TARGET $f"
               echo '```'
             else
               echo "Прогон упал без входа в fuzz/artifacts — см. журнал."

@@ -1,5 +1,5 @@
 # Цели fuzz разбора MIME (MS-13), в каталоге crates/tp-mailstore:
-#   cargo +nightly fuzz run <цель> fuzz/corpus/<цель> ../tp-testkit/corpus -- -max_total_time=600
+#   cargo +nightly fuzz run -O <цель> fuzz/corpus/<цель> ../tp-testkit/corpus -- -max_total_time=600
 # Цели: split — скелет и части, meta — ENVELOPE и BODYSTRUCTURE, skeleton — объект-скелет из хранилища.
 # Начальный корпус — письма KIT-04 (crates/tp-testkit/corpus), новые входы — в fuzz/corpus/<цель> (не в git).
 # Отдельный workspace: в сборку и Cargo.lock основного workspace не входит.
@@ -38,3 +38,13 @@ path = "fuzz_targets/skeleton.rs"
 test = false
 doc = false
 bench = false
+
+# Сборка — `cargo fuzz -O` (fuzz.yml): проверки отладки и переполнений — у своего кода, mail-parser — как в
+# выпуске. Его debug_assert!(false) на битом MIME — не паника выпуска: там разбор восстанавливается (FIX-06).
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+[profile.release.package.mail-parser]
+debug-assertions = false
+overflow-checks = false

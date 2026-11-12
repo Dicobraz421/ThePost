@@ -1,5 +1,5 @@
 # Цель fuzz разбора DAV (DAV-02), в каталоге crates/tp-dav:
-#   cargo +nightly fuzz run xml fuzz/corpus/xml -- -max_total_time=600
+#   cargo +nightly fuzz run -O xml fuzz/corpus/xml -- -max_total_time=600
 # Цель: xml — XML-тело запроса (PROPFIND, PROPPATCH, sync-collection): лимиты глубины и числа элементов,
 # DTD и неизвестные сущности отклоняются, разбор запросов из дерева без паники.
 # Проверки — tp_dav::fuzz; новые входы — в fuzz/corpus/<цель> (не в git).
@@ -25,3 +25,13 @@ path = "fuzz_targets/xml.rs"
 test = false
 doc = false
 bench = false
+
+# Сборка — `cargo fuzz -O` (fuzz.yml): проверки отладки и переполнений — у своего кода, mail-parser — как в
+# выпуске. Его debug_assert!(false) на битом MIME — не паника выпуска: там разбор восстанавливается (FIX-06).
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+[profile.release.package.mail-parser]
+debug-assertions = false
+overflow-checks = false
