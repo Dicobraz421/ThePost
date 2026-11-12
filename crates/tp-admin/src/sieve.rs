@@ -556,6 +556,81 @@ mod tests {
         assert_eq!(env.sieve.list(scope).await, Ok(vec![]));
     }
 
+    /// Приёмка ADM-17 (решение 62): администратор находит у пользователя правило пересылки, отключает его и
+    /// включает обратно; каждое действие — в журнале аудита (кто, что, код), без текста правила.
+    #[tokio::test]
+    async fn admin_disables_forwarding_rule() {
+        const FORWARD: &str = "redirect \"outside@example.net\";\n";
+        let env = Env::new();
+        let scope = env.account("user@example.org").await;
+        // Правило создал и включил сам пользователь (ManageSieve, JMAP) — в аудите Admin API его нет.
+        env.sieve
+            .put(scope, "пересылка", FORWARD.into())
+            .await
+            .expect("put");
+        env.sieve
+            .activate(scope, Some("пересылка"))
+            .await
+            .expect("activate");
+        let base = base(scope.account);
+        let scripts = format!("{base}/scripts");
+        let script = format!("{scripts}/пересылка");
+
+        let (s, _, b) = env.call("GET", &scripts, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            b,
+            json!([{"name": "пересылка", "size": FORWARD.len(), "active": true}])
+        );
+        let (s, _, b) = env.call("GET", &script, Some("org"), None).await;
+        assert_eq!((s, &b["text"]), (StatusCode::OK, &json!(FORWARD)));
+
+        // Оператор отключить не может; администратор организации — отключает.
+        let off = format!("{base}/deactivate");
+        let (s, _, _) = env.call("POST", &off, Some("operator"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert!(env.sieve.active(scope).await.expect("active").is_some());
+        let (s, _, _) = env.call("POST", &off, Some("org"), None).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        assert_eq!(env.sieve.active(scope).await, Ok(None));
+        // Правило не удалено: текст на месте, только не выполняется.
+        let (_, _, b) = env.call("GET", &script, Some("org"), None).await;
+        assert_eq!((&b["active"], &b["text"]), (&json!(false), &json!(FORWARD)));
+
+        // Правка с той же проверкой и включение обратно.
+        let bad = Some(json!({"text": "oops;"}));
+        let (s, _, _) = env.call("PUT", &script, Some("org"), bad).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            env.sieve.get(scope, "пересылка").await,
+            Ok(Some(FORWARD.into()))
+        );
+        let on = format!("{script}/activate");
+        let (s, _, _) = env.call("POST", &on, Some("org"), None).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+
+        // Аудит: отказ оператору, отключение, отклонённая правка, включение — чтения не пишутся.
+        let log = env.audit.records();
+        let got: Vec<(&str, &str, u16)> = log
+            .iter()
+            .map(|r| (r.method.as_str(), r.route.as_str(), r.status))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("POST", super::DEACTIVATE, 403),
+                ("POST", super::DEACTIVATE, 204),
+                ("PUT", super::SCRIPT, 422),
+                ("POST", super::ACTIVATE, 204),
+            ]
+        );
+        let done = &log[1];
+        assert_eq!(done.tenant, Some(TenantId::DEFAULT));
+        assert!(!done.actor_login.is_empty());
+        assert!(done.path.contains(&scope.account.to_string()), "{done:?}");
+        assert!(!format!("{log:?}").contains("outside@example.net"));
+    }
+
     /// Приёмка ADM-14: неверный скрипт — 422 с позициями, в хранилище не попадает.
     #[tokio::test]
     async fn invalid_script_is_rejected() {
