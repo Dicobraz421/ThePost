@@ -16,13 +16,14 @@ use tp_contracts::meta::{
 };
 use tp_contracts::{BlobHash, BlobKey, Gen, MessageId};
 use tp_meta::PgMeta;
+use tp_meta::pool::DbPool;
 use tp_meta::replica::Replica;
 use tp_meta::schema;
 use tp_meta::shards::{ReadIntent, ShardResolver};
 
 /// Чистая БД со схемой: «реплика» без данных основной БД.
 struct EmptyDb {
-    pool: PgPool,
+    pool: DbPool,
     admin: PgPool,
     name: String,
 }
@@ -48,6 +49,7 @@ impl EmptyDb {
             )
             .await
             .expect("connect replica");
+        let pool = common::db(pool);
         schema::migrate(&pool).await.expect("schema");
         Self { pool, admin, name }
     }
@@ -156,10 +158,12 @@ async fn stale_reads_replica_protocol_reads_primary() {
     // Без реплики и при недоступной реплике — primary.
     let no_replica = meta.clone().with_intent(ReadIntent::Stale);
     assert!(found(&no_replica, scope, id).await);
-    let dead = PgPoolOptions::new()
-        .acquire_timeout(Duration::from_secs(2))
-        .connect_lazy("postgres://nobody@127.0.0.1:1/none")
-        .expect("lazy");
+    let dead = common::db(
+        PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .expect("lazy"),
+    );
     let unreachable = meta
         .clone()
         .with_replica(dead.clone(), lag)
@@ -185,8 +189,8 @@ async fn recovery_conflict_retries_on_primary() {
     let id = delivered(&meta, scope).await;
     // «Реплика», отменяющая чтение писем как при конфликте с восстановлением (40001).
     let replica = EmptyDb::new(&url).await;
-    replica
-        .pool
+    common::conn(&replica.pool)
+        .await
         .execute(
             "ALTER TABLE messages RENAME TO messages_real;
              CREATE FUNCTION tp_conflict() RETURNS SETOF messages_real LANGUAGE plpgsql AS $$
@@ -222,7 +226,7 @@ async fn shard_replica_from_directory() {
     sqlx::query("UPDATE shards SET read_replica = $2 WHERE shard_id = $1")
         .bind(t.shard.0)
         .bind(common::dev_url(&dsn))
-        .execute(t.main.meta.pool())
+        .execute(&mut *common::conn(t.main.meta.pool()).await)
         .await
         .expect("read_replica");
     t.dir.invalidate();

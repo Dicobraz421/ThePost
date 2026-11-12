@@ -7,7 +7,7 @@ mod common;
 use std::str::FromStr;
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{AssertSqlSafe, Executor, PgPool};
+use sqlx::{AssertSqlSafe, Executor};
 use time::OffsetDateTime;
 use tp_contracts::delivery::{
     DeliveryDecision, DeliveryEvent, DeliveryEventKind, DeliveryLog, DeliveryQuery,
@@ -16,20 +16,22 @@ use tp_contracts::groups::{DistributionGroup, GroupStore, SenderRestriction};
 use tp_contracts::membership::NodeId;
 use tp_contracts::{Error, GroupId, TenantId};
 use tp_meta::doctor::{self, DoctorConfig, Status};
+use tp_meta::pool::DbPool;
 use tp_meta::schema::{self, db_err};
 use tp_meta::{MetaConfig, PgMeta};
 
 /// Учётная запись узла — член групповой роли `group`; удаляется [`NodeLogin::drop_role`].
 struct NodeLogin {
-    pool: PgPool,
+    pool: DbPool,
     role: String,
 }
 
 impl NodeLogin {
-    async fn create(admin: &PgPool, url: &str, group: &str) -> Self {
+    async fn create(admin: &DbPool, url: &str, group: &str) -> Self {
         let role = format!("tp_node_{}", uuid::Uuid::now_v7().simple());
         let password = format!("pw-{role}");
-        admin
+        common::conn(admin)
+            .await
             .execute(AssertSqlSafe(format!(
                 "CREATE ROLE {role} LOGIN PASSWORD '{password}' IN ROLE {group}"
             )))
@@ -44,12 +46,16 @@ impl NodeLogin {
             .connect_with(opts)
             .await
             .expect("вход ролью узла");
-        Self { pool, role }
+        Self {
+            pool: common::db(pool),
+            role,
+        }
     }
 
-    async fn drop_role(self, admin: &PgPool) {
+    async fn drop_role(self, admin: &DbPool) {
         self.pool.close().await;
-        admin
+        common::conn(admin)
+            .await
             .execute(AssertSqlSafe(format!("DROP ROLE {}", self.role)))
             .await
             .expect("drop role");
@@ -57,7 +63,7 @@ impl NodeLogin {
 }
 
 /// Выполняет `sql` в транзакции организации `tenant` ролью `pool`; `$1` в `sql` — организация.
-async fn exec(pool: &PgPool, tenant: TenantId, sql: &str) -> Result<(), Error> {
+async fn exec(pool: &DbPool, tenant: TenantId, sql: &str) -> Result<(), Error> {
     let mut tx = schema::begin(pool, tenant).await?;
     let q = sqlx::query(AssertSqlSafe(sql.to_owned()));
     let q = if sql.contains("$1") {

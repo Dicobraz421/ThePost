@@ -47,7 +47,7 @@ async fn insert_shard(
     .bind(name)
     .bind(dsn)
     .bind(credentials.map(ToString::to_string))
-    .execute(meta.pool())
+    .execute(&mut *common::conn(meta.pool()).await)
     .await
     .map_err(db_err)?;
     Ok(())
@@ -56,7 +56,7 @@ async fn insert_shard(
 async fn delete_shard(meta: &tp_meta::PgMeta, id: ShardId) {
     sqlx::query("DELETE FROM shards WHERE shard_id = $1")
         .bind(id.0)
-        .execute(meta.pool())
+        .execute(&mut *common::conn(meta.pool()).await)
         .await
         .expect("cleanup");
 }
@@ -85,6 +85,7 @@ async fn resolve_known_account() {
         meta.pool().clone(),
         PoolConfig::default(),
         common::secrets(),
+        common::unobserved_shards(),
     );
     assert_eq!(dir.shard_of(scope).await.expect("shard_of"), ShardId::MAIN);
     assert!(count_mailboxes(&dir, scope).await > 0);
@@ -121,6 +122,7 @@ async fn new_shard_without_caller_changes() {
             ..common::dev_pool_config(&url)
         },
         common::secrets(),
+        common::unobserved_shards(),
     ));
     let before = count_mailboxes(resolver.as_ref(), scope).await;
 
@@ -156,7 +158,7 @@ async fn new_shard_without_caller_changes() {
         .await
         .expect("pool_for");
     let app: String = sqlx::query_scalar("SELECT current_setting('application_name')")
-        .fetch_one(&pool)
+        .fetch_one(&mut *common::conn(&pool).await)
         .await
         .expect("fetch_one");
     assert_eq!(app, marker, "запрос ушёл в пул нового шарда");
@@ -168,7 +170,7 @@ async fn new_shard_without_caller_changes() {
     set_shard(&meta, scope, ShardId::MAIN).await;
     sqlx::query("DELETE FROM shards WHERE shard_id = $1")
         .bind(id.0)
-        .execute(meta.pool())
+        .execute(&mut *common::conn(meta.pool()).await)
         .await
         .expect("cleanup");
 }
@@ -196,6 +198,7 @@ async fn shard_password_from_secret_store() {
             ..common::dev_pool_config(&url)
         },
         store.clone(),
+        common::unobserved_shards(),
     );
     let id = new_shard_id();
     insert_shard(&meta, id, &marker, &dsn, Some(&secret))
@@ -205,7 +208,7 @@ async fn shard_password_from_secret_store() {
     // Пул шарда подключается паролем из хранилища; справочник показывает ссылку, не значение.
     let pool = dir.pool(id, ReadIntent::Primary).await.expect("pool");
     let app: String = sqlx::query_scalar("SELECT current_setting('application_name')")
-        .fetch_one(&pool)
+        .fetch_one(&mut *common::conn(&pool).await)
         .await
         .expect("fetch_one");
     assert_eq!(app, marker);
@@ -234,7 +237,7 @@ async fn shard_password_from_secret_store() {
         .await
         .expect("pool после смены секрета");
     sqlx::query("SELECT 1")
-        .execute(&pool)
+        .execute(&mut *common::conn(&pool).await)
         .await
         .expect("select");
 
@@ -264,7 +267,7 @@ async fn shard_dsn_with_password_rejected() {
         "INSERT INTO shards (shard_id, name, dsn, credentials) VALUES ($1, 'bad-ref', 'postgres://db/s', 'hunter2')",
     )
     .bind(id.0)
-    .execute(meta.pool())
+    .execute(&mut *common::conn(meta.pool()).await)
     .await
     .map_err(db_err);
     assert!(matches!(bad_ref, Err(Error::Invalid(_))), "{bad_ref:?}");

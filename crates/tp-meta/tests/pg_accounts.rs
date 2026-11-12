@@ -20,7 +20,7 @@ async fn passes_contract_suite() {
         "SELECT lower($1), datctype::text FROM pg_database WHERE datname = current_database()",
     )
     .bind(upper)
-    .fetch_one(meta.pool())
+    .fetch_one(&mut *common::conn(meta.pool()).await)
     .await
     .expect("lower");
     assert_eq!(

@@ -12,7 +12,7 @@ use sqlx::postgres::PgPoolOptions;
 use tp_contracts::secrets::{Secret, SecretRef, SecretStore};
 use tp_contracts::tls::{InternalTls, Profile};
 use tp_contracts::{DomainId, TenantId};
-use tp_meta::pool::PoolConfig;
+use tp_meta::pool::{DbPool, NoAcquireObserver, PoolConfig};
 use tp_meta::{MetaConfig, PgMeta, schema};
 
 /// Адрес тестовой БД.
@@ -149,14 +149,36 @@ pub fn secrets() -> Arc<MemSecrets> {
     STORE.get_or_init(Arc::default).clone()
 }
 
+/// Пул `tp-meta` над пулом sqlx `pool` без учёта ожидания соединения (наблюдатель-пустышка).
+pub fn db(pool: PgPool) -> DbPool {
+    DbPool::new(pool, Arc::new(NoAcquireObserver))
+}
+
+/// Наблюдатели пулов шардов без учёта ожидания соединения (`ShardDirectory::new`).
+pub fn unobserved_shards() -> impl Fn(
+    tp_meta::shards::ShardId,
+    tp_meta::shards::ShardPool,
+) -> Arc<dyn tp_meta::pool::AcquireObserver>
++ Send
++ Sync
++ 'static {
+    |_, _| Arc::new(NoAcquireObserver)
+}
+
+/// Соединение пула для запроса теста вне транзакции.
+pub async fn conn(pool: &DbPool) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    pool.acquire().await.expect("соединение")
+}
+
 /// Пул к тестовой БД с применённой схемой.
-pub async fn pool() -> Option<PgPool> {
+pub async fn pool() -> Option<DbPool> {
     let url = pg_url()?;
     let pool = PgPoolOptions::new()
         .max_connections(48)
         .connect(&url)
         .await
         .expect("подключение к TEST_DATABASE_URL");
+    let pool = db(pool);
     schema::migrate(&pool).await.expect("миграции");
     Some(pool)
 }
@@ -172,7 +194,7 @@ pub async fn meta() -> Option<PgMeta> {
 }
 
 /// Новая организация (тесты изолированы друг от друга своими организациями).
-pub async fn tenant(pool: &PgPool) -> TenantId {
+pub async fn tenant(pool: &DbPool) -> TenantId {
     let tenant = TenantId::new();
     let mut tx = schema::begin(pool, tenant).await.expect("begin");
     sqlx::query("INSERT INTO tenants (tenant_id, name) VALUES ($1, 'test')")
@@ -185,7 +207,7 @@ pub async fn tenant(pool: &PgPool) -> TenantId {
 }
 
 /// Новый домен организации со случайным именем; возвращает идентификатор и имя.
-pub async fn domain(pool: &PgPool, tenant: TenantId) -> (DomainId, String) {
+pub async fn domain(pool: &DbPool, tenant: TenantId) -> (DomainId, String) {
     let id = DomainId::new();
     let name = format!("d{}.test", id.as_uuid().simple());
     let mut tx = schema::begin(pool, tenant).await.expect("begin");
@@ -273,7 +295,7 @@ pub async fn fresh_meta() -> Option<FreshDb> {
         .connect_with(opts)
         .await
         .expect("подключение к чистой БД");
-    let meta = PgMeta::open(pool, MetaConfig::default())
+    let meta = PgMeta::open(db(pool), MetaConfig::default())
         .await
         .expect("open");
     Some(FreshDb { meta, admin, name })
@@ -337,7 +359,7 @@ pub struct TwoShards {
     /// Номер второго шарда.
     pub shard: tp_meta::shards::ShardId,
     /// Прямой пул ко второму шарду (проверки размещения).
-    pub shard_pool: PgPool,
+    pub shard_pool: DbPool,
     shard_db: String,
 }
 
@@ -363,7 +385,7 @@ impl TwoShards {
         use tp_contracts::meta::{AccountStore, AccountUpsert};
         sqlx::query("UPDATE shards SET accepts_new = (shard_id = $1)")
             .bind(shard.0)
-            .execute(self.main.meta.pool())
+            .execute(&mut *conn(self.main.meta.pool()).await)
             .await
             .expect("accepts_new");
         let acc = self
@@ -426,21 +448,22 @@ pub async fn two_shards() -> Option<TwoShards> {
     .bind(shard.0)
     .bind(dev_url(&dsn))
     .bind(credentials.map(|c| c.to_string()))
-    .execute(main.meta.pool())
+    .execute(&mut *conn(main.meta.pool()).await)
     .await
     .expect("shard row");
     let dir = Arc::new(ShardDirectory::new(
         main.meta.pool().clone(),
         dev_pool_config(&url),
         secrets(),
+        unobserved_shards(),
     ));
     dir.migrate().await.expect("migrate shards");
     let meta = main.meta.clone().with_shards(dir.clone());
-    let shard_pool = PgPoolOptions::new()
+    let shard_pool = db(PgPoolOptions::new()
         .max_connections(4)
         .connect(&with_database(&url, &shard_db))
         .await
-        .expect("подключение к шарду");
+        .expect("подключение к шарду"));
     Some(TwoShards {
         main,
         dir,
