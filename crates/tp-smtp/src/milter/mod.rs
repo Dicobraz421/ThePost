@@ -560,7 +560,19 @@ fn apply(raw: &[u8], mods: &[HeaderMod]) -> Bytes {
     let field = |name: &str, value: &str| {
         // Значение от фильтра: `\n` свёртки — в `\r\n`, без управляющих символов вне свёртки.
         let value = value.replace("\r\n", "\n").replace('\r', "");
-        let value = value.replace('\n', "\r\n");
+        // Строка после `\n` без пробела в начале стала бы новым заголовком — дополняется пробелом (FIX-08).
+        let value = value
+            .split('\n')
+            .enumerate()
+            .map(|(i, l)| {
+                if i > 0 && !l.starts_with([' ', '\t']) {
+                    format!(" {l}")
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
         let sep = if value.starts_with([' ', '\t']) {
             ""
         } else {
@@ -572,7 +584,14 @@ fn apply(raw: &[u8], mods: &[HeaderMod]) -> Bytes {
         f.split_once(':')
             .is_some_and(|(n, _)| n.trim_end().eq_ignore_ascii_case(name))
     };
-    for m in mods {
+    // Имя от фильтра — печатные ASCII без `:` (RFC 5322, 2.2), иначе изменение пропускается (FIX-08).
+    let valid = |m: &&HeaderMod| {
+        let (HeaderMod::Add(name, _)
+        | HeaderMod::Insert(_, name, _)
+        | HeaderMod::Change(_, name, _)) = m;
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+    };
+    for m in mods.iter().filter(valid) {
         match m {
             HeaderMod::Add(name, value) => fields.push(field(name, value)),
             HeaderMod::Insert(i, name, value) => {
