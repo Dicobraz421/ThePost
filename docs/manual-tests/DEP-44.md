@@ -13,7 +13,7 @@
 | 7 | `smb.yml -e thepost_tls_mode=files -e thepost_tls_cert_src=… -e thepost_tls_key_src=…`; затем ещё раз | первый — новая версия секрета, цепочка заменена, узел отдаёт новый сертификат без перезапуска; второй — `changed=0` |
 | 8 | `bao policy read thepost` | `thepost/data/tls` — `read`, `create`, `update`; остальное `thepost/data/*` — только чтение |
 | 9 | compose: `docker compose -f deploy/compose/dev.yml up tls-init openbao-tls openbao-init-tls` дважды | первый — `записан ключ TLS thepost/tls`, второй — без неё; `sha256` секрета и `server.key` совпадают; `privkey.pem` в томе `tls` нет |
-| 10 | `helm template deploy/helm/thepost`; `thepost config check` для `config.yaml` из ConfigMap и `compose/thepost-smb.yaml` | `tls.key: { secret: thepost/tls#key }`; том `tls` — только `tls.crt` и `ca.crt`; «конфигурация верна» |
+| 10 | `helm template deploy/helm/thepost`; `thepost config check` для `config.yaml` из ConfigMap и пресета `deploy/config/all.yaml` (с переменными `THEPOST_*` из `compose/dev.yml`) | `tls.key: { secret: thepost/tls#key }`; том `tls` — только `tls.crt` и `ca.crt`; «конфигурация верна» |
 
 ## Прогон 2026-11-12
 
