@@ -19,7 +19,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use time::OffsetDateTime;
 use tp_contracts::Error;
 use tp_contracts::auth::{Authenticator, Credentials, Directory, Principal};
 use tp_contracts::dav::DavStore;
@@ -27,17 +26,18 @@ use tp_contracts::groups::GroupStore;
 use tp_contracts::meta::AccountScope;
 
 use crate::config::DavConfig;
-use crate::index::IndexOptions;
 use crate::path::Target;
+use crate::schedule::{self, ScheduleDeps};
 use crate::xml::{self, Element};
 use crate::{gal, props, resource, sync};
 
-/// Значение заголовка `DAV` (RFC 4918 §10.1, RFC 3744, RFC 4791 §5.1, RFC 6352 §6.1, RFC 5689).
-pub const DAV_HEADER: &str = "1, 3, access-control, calendar-access, addressbook, extended-mkcol";
+/// Значение заголовка `DAV` (RFC 4918 §10.1, RFC 3744, RFC 4791 §5.1, RFC 6638 §2, RFC 6352 §6.1, RFC 5689).
+pub const DAV_HEADER: &str =
+    "1, 3, access-control, calendar-access, calendar-auto-schedule, addressbook, extended-mkcol";
 
 /// Методы ресурсов DAV (`Allow`).
 pub const ALLOW: &str =
-    "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, REPORT, MKCOL, MKCALENDAR";
+    "OPTIONS, GET, HEAD, POST, PUT, DELETE, PROPFIND, PROPPATCH, REPORT, MKCOL, MKCALENDAR";
 
 /// Зависимости сервера DAV: реализации контрактов, выбранные приложением.
 #[derive(Clone)]
@@ -81,6 +81,8 @@ pub(crate) struct Dav {
     pub gal_deps: Option<GalDeps>,
     /// Построенные глобальные адресные книги.
     pub gal: gal::Cache,
+    /// Планирование встреч; `None` — объекты хранятся без рассылки iTIP.
+    pub schedule: Option<ScheduleDeps>,
 }
 
 impl Dav {
@@ -90,30 +92,42 @@ impl Dav {
             .max_object_size
             .min(self.d.store.limits().max_object_size)
     }
-
-    /// Параметры индекса для записи сейчас.
-    pub(crate) fn index_options(&self) -> IndexOptions {
-        self.cfg.index_options(OffsetDateTime::now_utc())
-    }
 }
 
 /// Маршруты DAV под `/dav/`; TLS, PROXY и слушатель — у вызывающего (`tp-platform`).
 pub fn router(d: Deps, cfg: DavConfig) -> Router {
-    build(d, None, cfg)
+    build(d, None, None, cfg)
+}
+
+/// Маршруты DAV с необязательными глобальной адресной книгой `gal` и планированием встреч `schedule`
+/// (RFC 6638: рассылка iTIP после `PUT` и `DELETE`, запрос занятости).
+pub fn router_with(
+    d: Deps,
+    gal: Option<GalDeps>,
+    schedule: Option<ScheduleDeps>,
+    cfg: DavConfig,
+) -> Router {
+    build(d, gal, schedule, cfg)
 }
 
 /// Маршруты DAV с глобальной адресной книгой «Организация» из каталога `gal` (только чтение, в доме адресных
 /// книг каждого пользователя).
 pub fn router_with_gal(d: Deps, gal: GalDeps, cfg: DavConfig) -> Router {
-    build(d, Some(gal), cfg)
+    build(d, Some(gal), None, cfg)
 }
 
-fn build(d: Deps, gal_deps: Option<GalDeps>, cfg: DavConfig) -> Router {
+fn build(
+    d: Deps,
+    gal_deps: Option<GalDeps>,
+    schedule: Option<ScheduleDeps>,
+    cfg: DavConfig,
+) -> Router {
     let dav = Arc::new(Dav {
         d,
         cfg,
         gal_deps,
         gal: gal::Cache::default(),
+        schedule,
     });
     Router::new()
         .route("/dav", any(handle))
@@ -138,6 +152,16 @@ impl Cx<'_> {
     /// Логин вошедшего (в ссылках ответов).
     pub(crate) fn login(&self) -> &str {
         &self.principal.login
+    }
+
+    /// Адреса календарного пользователя вошедшего ([`crate::itip::address`]): имя входа, если оно — адрес.
+    pub(crate) fn addresses(&self) -> Vec<String> {
+        let login = crate::itip::address(&self.principal.login);
+        if login.contains('@') {
+            vec![login]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Заголовок как строка без пробелов по краям.
@@ -204,6 +228,13 @@ async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {
     ) && gal::is_target(&cx, &target)
     {
         return gal::read_only(&cx, &target);
+    }
+    if method != "PROPFIND"
+        && let Some((inbox, item)) = schedule::resource(&target)
+    {
+        return schedule::handle(&cx, method, inbox, item, body)
+            .await
+            .unwrap_or_else(|e| store_error(&e));
     }
     let result = match method {
         "PROPFIND" => props::propfind(&cx, &target, body).await,

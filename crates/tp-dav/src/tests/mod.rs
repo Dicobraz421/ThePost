@@ -26,6 +26,7 @@ mod preconditions;
 mod propfind;
 mod query;
 mod resource;
+mod schedule;
 mod sync;
 
 /// Вошедший пользователь.

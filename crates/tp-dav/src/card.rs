@@ -488,6 +488,7 @@ fn emit(
         name: &o.name,
         etag: &o.etag,
         body,
+        tag: None,
     };
     props::emit(cx, ms, &res, want);
 }
