@@ -10,8 +10,6 @@ manual: no
 
 Хвост волны jmap-17, PR #444 (книга по умолчанию — волна jmap-16, PR #428).
 
-Требует подтверждения владельца: дать клиенту JMAP менять календарь и книгу по умолчанию, видимость и общие оповещения (вариант Б агента)? (PR #444, решение 1)
-
 ## Сделать
 - `Calendar/get`, `/set`: `isSubscribed`, `isVisible`, `defaultAlertsWithTime`, `defaultAlertsWithoutTime` читаются и
   пишутся через поля `Collection` (CTR-56) — сейчас всегда `true` и `null`; `onSuccessSetIsDefault` назначает
