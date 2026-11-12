@@ -48,8 +48,8 @@ COPY --from=build --chown=65532:65532 /out/etc /etc/thepost
 USER 65532:65532
 WORKDIR /var/lib/thepost
 VOLUME ["/var/lib/thepost"]
-# SMTP, submission (465/587), IMAP (143/993), HTTP(S): JMAP, DAV, Admin API.
+# SMTP, submission (465/587), IMAP (143/993), ManageSieve (4190), HTTP(S): JMAP, DAV, Admin API.
 # Порты <1024 доступны nonroot: Docker задаёт net.ipv4.ip_unprivileged_port_start=0.
-EXPOSE 25 465 587 143 993 80 443
+EXPOSE 25 465 587 143 993 4190 80 443
 ENTRYPOINT ["/usr/local/bin/thepost"]
 CMD ["serve", "--config", "/etc/thepost/config.yaml"]

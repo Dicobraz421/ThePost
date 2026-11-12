@@ -56,6 +56,7 @@ ports:
   submission: { container: 5587, service: 587 }
   imap: { container: 1143, service: 143 }
   imaps: { container: 1993, service: 993 }
+  managesieve: { container: 4190, service: 4190 }
   https: { container: 4443, service: 443 }
 
 service:
@@ -225,6 +226,10 @@ config:
       - listen: "0.0.0.0:1143"
       - listen: "0.0.0.0:1993"
         implicit_tls: true
+  sieve:
+    managesieve:
+      listen:
+        - listen: "0.0.0.0:4190"
   smtp:
     hostname: mail.example.ru
     inbound:
