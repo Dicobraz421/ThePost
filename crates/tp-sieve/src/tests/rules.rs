@@ -10,7 +10,7 @@ use tp_contracts::sieve::{
     DeliveryRules, MailboxRef, ReplyBody, RulesInput, RulesOutcome, SieveStore, Vacation,
 };
 use tp_contracts::{AccountId, TenantId};
-use tp_testkit::{Clock, ManualClock, MemSieve, MemVacationLog};
+use tp_testkit::{ManualClock, MemSieve, MemVacationLog};
 
 use super::mailboxes;
 use crate::{CacheConfig, Rules, SieveConfig, fuzz};
@@ -61,8 +61,14 @@ impl Fixture {
     }
 
     async fn user(&self, text: &str) {
-        self.store.put(self.scope, "main", text.to_owned()).await.expect("put");
-        self.store.activate(self.scope, Some("main")).await.expect("activate");
+        self.store
+            .put(self.scope, "main", text.to_owned())
+            .await
+            .expect("put");
+        self.store
+            .activate(self.scope, Some("main"))
+            .await
+            .expect("activate");
     }
 
     async fn org(&self, text: &str) {
@@ -145,7 +151,8 @@ async fn script_order() {
 #[tokio::test]
 async fn org_stop() {
     let f = Fixture::new();
-    f.user("require [\"fileinto\", \"vacation\"]; vacation \"x\"; fileinto \"Work\";").await;
+    f.user("require [\"fileinto\", \"vacation\"]; vacation \"x\"; fileinto \"Work\";")
+        .await;
     f.store
         .set_vacation(
             f.scope,
@@ -157,15 +164,18 @@ async fn org_stop() {
         )
         .await
         .expect("vacation");
-    f.org("if header :contains \"subject\" \"report\" { stop; }").await;
+    f.org("if header :contains \"subject\" \"report\" { stop; }")
+        .await;
     assert_eq!(f.eval().await, RulesOutcome::implicit_keep());
 
-    f.org("if header :contains \"subject\" \"report\" { discard; stop; }").await;
+    f.org("if header :contains \"subject\" \"report\" { discard; stop; }")
+        .await;
     let o = f.eval().await;
     assert!(o.keep.is_empty() && o.discard && o.vacation.is_none());
 
     // Условие не сработало — stop не выполнен: дальше автоответ и скрипт пользователя.
-    f.org("if header :contains \"subject\" \"invoice\" { discard; stop; }").await;
+    f.org("if header :contains \"subject\" \"invoice\" { discard; stop; }")
+        .await;
     let o = f.eval().await;
     assert_eq!(f.folders().await, ["Work"]);
     assert!(o.vacation.is_some());
@@ -184,7 +194,10 @@ async fn vacation_setting() {
         text_body: Some("из настройки".into()),
         html_body: None,
     };
-    f.store.set_vacation(f.scope, setting).await.expect("vacation");
+    f.store
+        .set_vacation(f.scope, setting)
+        .await
+        .expect("vacation");
     // До начала: правил нет вовсе.
     assert_eq!(f.eval().await, RulesOutcome::implicit_keep());
     f.clock.advance(Duration::from_secs(24 * 3600));
@@ -199,10 +212,14 @@ async fn vacation_setting() {
     f.clock.advance(Duration::from_secs(24 * 3600));
     let mut other = f.input.clone();
     other.mail_from = "carol@example.com".into();
-    assert_eq!(f.rules.evaluate(&other).await.expect("rules").vacation, None);
+    assert_eq!(
+        f.rules.evaluate(&other).await.expect("rules").vacation,
+        None
+    );
 
     // Настройка и vacation скрипта вместе: ответ один, из настройки; без настройки — из скрипта.
-    f.user("require \"vacation\"; vacation \"из скрипта\";").await;
+    f.user("require \"vacation\"; vacation \"из скрипта\";")
+        .await;
     let on = Vacation {
         enabled: true,
         text_body: Some("из настройки".into()),
@@ -210,11 +227,20 @@ async fn vacation_setting() {
     };
     f.store.set_vacation(f.scope, on).await.expect("vacation");
     let o = f.rules.evaluate(&other).await.expect("rules");
-    assert_eq!(o.vacation.expect("reply").body, ReplyBody::Text("из настройки".into()));
-    f.store.set_vacation(f.scope, Vacation::default()).await.expect("vacation");
+    assert_eq!(
+        o.vacation.expect("reply").body,
+        ReplyBody::Text("из настройки".into())
+    );
+    f.store
+        .set_vacation(f.scope, Vacation::default())
+        .await
+        .expect("vacation");
     other.mail_from = "dave@example.com".into();
     let o = f.rules.evaluate(&other).await.expect("rules");
-    assert_eq!(o.vacation.expect("reply").body, ReplyBody::Text("из скрипта".into()));
+    assert_eq!(
+        o.vacation.expect("reply").body,
+        ReplyBody::Text("из скрипта".into())
+    );
 }
 
 /// Кэш: программа компилируется один раз на версию; `put`, смена активного и скрипта организации сбрасывают её.
@@ -244,7 +270,10 @@ async fn cache() {
     f.org("keep;").await;
     assert!(!f.eval().await.discard);
     assert_eq!(f.rules.compilations(), 4);
-    f.store.set_org_script(f.scope.tenant, None).await.expect("org");
+    f.store
+        .set_org_script(f.scope.tenant, None)
+        .await
+        .expect("org");
     assert_eq!(f.eval().await, RulesOutcome::implicit_keep());
 
     // Изменение настройки автоответа тоже меняет состояние: кэш не отдаёт старую настройку.
@@ -268,8 +297,14 @@ async fn cache_capacity() {
     f.user("keep;").await;
     let mut peer = f.input.clone();
     peer.scope.account = AccountId::new();
-    f.store.put(peer.scope, "main", "keep;".into()).await.expect("put");
-    f.store.activate(peer.scope, Some("main")).await.expect("activate");
+    f.store
+        .put(peer.scope, "main", "keep;".into())
+        .await
+        .expect("put");
+    f.store
+        .activate(peer.scope, Some("main"))
+        .await
+        .expect("activate");
     f.eval().await;
     f.eval().await;
     assert_eq!(f.rules.compilations(), 1);
@@ -291,7 +326,8 @@ async fn script_errors() {
         max_redirects: 1,
         ..SieveConfig::default()
     });
-    f.user("redirect \"a@example.net\"; redirect \"b@example.net\";").await;
+    f.user("redirect \"a@example.net\"; redirect \"b@example.net\";")
+        .await;
     let o = f.eval().await;
     assert_eq!(o.keep, RulesOutcome::implicit_keep().keep);
     assert!(o.redirect.is_empty());
@@ -305,7 +341,10 @@ async fn script_errors() {
 
     // Сохранённый скрипт с ошибкой (хранилище текст не проверяет).
     f.user("unknown;").await;
-    f.store.set_org_script(f.scope.tenant, None).await.expect("org");
+    f.store
+        .set_org_script(f.scope.tenant, None)
+        .await
+        .expect("org");
     let o = f.eval().await;
     assert_eq!(o.keep, RulesOutcome::implicit_keep().keep);
     assert!(o.errors[0].contains("неизвестная команда"), "{o:?}");
@@ -338,10 +377,14 @@ async fn redirect_loop_protection() {
     assert_eq!(f.eval().await.redirect, ["a@example.net"]);
     f.input.message = format!("{}{MAIL}", foreign.repeat(50)).into_bytes().into();
     let o = f.eval().await;
-    assert!(o.redirect.is_empty() && o.errors[0].contains("Received"), "{o:?}");
+    assert!(
+        o.redirect.is_empty() && o.errors[0].contains("Received"),
+        "{o:?}"
+    );
 
     // redirect :copy при петле: письмо остаётся во «Входящих» один раз. Без redirect петля не проверяется.
-    f.user("require \"copy\"; redirect :copy \"a@example.net\";").await;
+    f.user("require \"copy\"; redirect :copy \"a@example.net\";")
+        .await;
     let o = f.eval().await;
     assert_eq!(o.keep.len(), 1);
     f.user("discard;").await;

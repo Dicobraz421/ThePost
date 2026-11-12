@@ -27,7 +27,10 @@ pub fn parse(data: &[u8]) {
             assert!(ast.is_ok(), "программа без разбора");
             assert!(data.len() <= LIMITS.max_script_size, "скрипт больше лимита");
             for e in program.extensions() {
-                assert!(EXTENSIONS.contains(&e.as_str()), "неизвестное расширение {e}");
+                assert!(
+                    EXTENSIONS.contains(&e.as_str()),
+                    "неизвестное расширение {e}"
+                );
             }
         }
         Err(diags) => {
@@ -56,14 +59,29 @@ pub fn run(data: &[u8]) {
         mailboxes: &mailboxes,
     };
     let o = crate::run(&program, &ctx, &LIMITS);
-    assert!(o.actions.len() <= LIMITS.max_actions, "действий больше лимита");
+    assert!(
+        o.actions.len() <= LIMITS.max_actions,
+        "действий больше лимита"
+    );
     if o.error.is_some() {
-        assert!(o.actions.is_empty() && o.implicit_keep, "ошибка без implicit keep");
+        assert!(
+            o.actions.is_empty() && o.implicit_keep,
+            "ошибка без implicit keep"
+        );
     }
     let implicit = o.implicit_keep;
     let rules = merge(o, &[]);
-    assert!(rules.redirect.len() <= LIMITS.max_redirects, "перенаправлений больше лимита");
-    assert!(!implicit || !rules.keep.is_empty(), "implicit keep без доставки");
-    assert!(!rules.discard || rules.keep.is_empty(), "discard с доставкой");
+    assert!(
+        rules.redirect.len() <= LIMITS.max_redirects,
+        "перенаправлений больше лимита"
+    );
+    assert!(
+        !implicit || !rules.keep.is_empty(),
+        "implicit keep без доставки"
+    );
+    assert!(
+        !rules.discard || rules.keep.is_empty(),
+        "discard с доставкой"
+    );
     assert!(rules.vacation.is_none());
 }

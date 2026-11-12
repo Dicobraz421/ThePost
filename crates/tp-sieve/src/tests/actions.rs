@@ -64,8 +64,7 @@ fn summary(o: &RulesOutcome, list: &[Mailbox]) -> String {
     v.join(", ")
 }
 
-const REQ: &str =
-    "require [\"fileinto\", \"copy\", \"mailbox\", \"imap4flags\"];\n";
+const REQ: &str = "require [\"fileinto\", \"copy\", \"mailbox\", \"imap4flags\"];\n";
 
 #[test]
 fn actions_table() {
@@ -120,12 +119,18 @@ fn actions_table() {
         ("keep :flags [\"\\\\Recent\", \"ok\"];", "INBOX[ok]"),
         // redirect: отменяет implicit keep, :copy — нет; повтор адреса — одно перенаправление.
         ("redirect \"a@example.net\";", "->a@example.net"),
-        ("redirect :copy \"a@example.net\";", "INBOX, ->a@example.net"),
+        (
+            "redirect :copy \"a@example.net\";",
+            "INBOX, ->a@example.net",
+        ),
         (
             "redirect \"a@example.net\"; redirect \"A@EXAMPLE.net\"; fileinto \"Work\";",
             "Work, ->a@example.net",
         ),
-        ("redirect \"a@example.net\"; discard;", "->a@example.net, discard"),
+        (
+            "redirect \"a@example.net\"; discard;",
+            "->a@example.net, discard",
+        ),
     ];
     for (script, expected) in cases {
         let o = outcome(&format!("{REQ}{script}"), &list, &Limits::default());
@@ -160,7 +165,11 @@ fn redirect_limit() {
     let two = "redirect \"a@example.net\"; redirect \"b@example.net\";";
     let o = outcome(two, &list, &limits);
     assert_eq!(summary(&o, &list), "->a@example.net, ->b@example.net");
-    let o = outcome(&format!("{two} redirect \"c@example.net\";"), &list, &limits);
+    let o = outcome(
+        &format!("{two} redirect \"c@example.net\";"),
+        &list,
+        &limits,
+    );
     assert_eq!(summary(&o, &list), "INBOX, errors:1");
     assert!(o.errors[0].contains("перенаправлений"), "{o:?}");
 }

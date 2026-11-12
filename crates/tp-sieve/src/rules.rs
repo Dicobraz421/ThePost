@@ -25,12 +25,12 @@ use tp_contracts::sieve::{
 };
 use tp_contracts::{Result, TenantId};
 
+use crate::Limits;
 use crate::compile::{Program, compile};
 use crate::config::SieveConfig;
 use crate::outcome::{Merge, mailbox_paths};
 use crate::run::{Context, Hdr, parse_headers, run};
 use crate::vacation::{self, Source};
-use crate::Limits;
 
 /// Метка узла The Post в `Received`, когда имя узла не задано ([`Rules::with_node`]).
 const PRODUCT_MARK: [&str; 2] = ["(The", "Post)"];
@@ -129,8 +129,10 @@ impl Rules {
         compile(text.as_bytes(), &self.limits)
             .map(Arc::new)
             .map_err(|d| {
-                d.first()
-                    .map_or_else(|| "скрипт не прошёл проверку".to_owned(), ToString::to_string)
+                d.first().map_or_else(
+                    || "скрипт не прошёл проверку".to_owned(),
+                    ToString::to_string,
+                )
             })
     }
 
@@ -155,11 +157,17 @@ impl Rules {
         let mut cache = self.cache();
         let used = cache.tick;
         let cap = self.config.cache.programs;
-        insert(&mut cache.orgs, cap, tenant, |e| e.used, || OrgEntry {
-            text,
-            program: program.clone(),
-            used,
-        });
+        insert(
+            &mut cache.orgs,
+            cap,
+            tenant,
+            |e| e.used,
+            || OrgEntry {
+                text,
+                program: program.clone(),
+                used,
+            },
+        );
         Ok(Some(program))
     }
 
@@ -184,12 +192,18 @@ impl Rules {
         let used = cache.tick;
         let cap = self.config.cache.programs;
         cache.accounts.remove(&scope);
-        insert(&mut cache.accounts, cap, scope, |e| e.used, || AccountEntry {
-            state,
-            script: script.clone(),
-            vacation: vacation.clone(),
-            used,
-        });
+        insert(
+            &mut cache.accounts,
+            cap,
+            scope,
+            |e| e.used,
+            || AccountEntry {
+                state,
+                script: script.clone(),
+                vacation: vacation.clone(),
+                used,
+            },
+        );
         Ok((script, vacation))
     }
 
@@ -228,7 +242,11 @@ fn by_node(received: &str, node: Option<&str>) -> bool {
         let host = it.next();
         return match node {
             Some(node) => host.is_some_and(|h| h.eq_ignore_ascii_case(node)),
-            None => host.is_some() && it.next() == Some(PRODUCT_MARK[0]) && it.next() == Some(PRODUCT_MARK[1]),
+            None => {
+                host.is_some()
+                    && it.next() == Some(PRODUCT_MARK[0])
+                    && it.next() == Some(PRODUCT_MARK[1])
+            }
         };
     }
     false
@@ -306,8 +324,8 @@ impl DeliveryRules for Rules {
             && let Some(action) = &action
         {
             let source = Source::Script(action);
-            reply = vacation::reply(source, input, &headers, &self.config.vacation, &*self.log)
-                .await?;
+            reply =
+                vacation::reply(source, input, &headers, &self.config.vacation, &*self.log).await?;
         }
         outcome.vacation = reply;
         for error in &outcome.errors {

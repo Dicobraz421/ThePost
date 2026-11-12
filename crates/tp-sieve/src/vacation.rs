@@ -28,14 +28,7 @@ pub(crate) enum Source<'a> {
 }
 
 /// Заголовки с получателями письма (RFC 5230 §4.5).
-const RECIPIENT_HEADERS: &[&str] = &[
-    "To",
-    "Cc",
-    "Bcc",
-    "Resent-To",
-    "Resent-Cc",
-    "Resent-Bcc",
-];
+const RECIPIENT_HEADERS: &[&str] = &["To", "Cc", "Bcc", "Resent-To", "Resent-Cc", "Resent-Bcc"];
 
 /// `:handle` автоответа из настройки учётной записи.
 const SETTING_HANDLE: &str = "vacation-response";
@@ -48,10 +41,7 @@ const DAY: u64 = 24 * 3600;
 /// Адрес для сравнения: строчными буквами и без подадреса (`Anna+news@Example.org` → `anna@example.org`).
 fn base(addr: &str) -> String {
     let a = strip_angle(addr).to_ascii_lowercase();
-    match (
-        address_part(&a, Part::User),
-        address_part(&a, Part::Domain),
-    ) {
+    match (address_part(&a, Part::User), address_part(&a, Part::Domain)) {
         (Some(user), Some(domain)) if !domain.is_empty() => format!("{user}@{domain}"),
         _ => a,
     }
@@ -168,12 +158,12 @@ pub(crate) async fn reply(
             },
         ),
     };
-    let subject = subject
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| match header(headers, "Subject") {
+    let subject = subject.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
+        match header(headers, "Subject") {
             Some(s) if !s.is_empty() => format!("{SUBJECT_PREFIX}: {s}"),
             _ => SUBJECT_PREFIX.to_owned(),
-        });
+        }
+    });
     let subject: String = subject
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

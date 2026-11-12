@@ -9,7 +9,9 @@
 use std::cmp::Ordering;
 
 use mail_parser::decoders::html::html_to_text;
-use mail_parser::{Address, HeaderName, HeaderValue, Message, MessageParser, MimeHeaders, PartType};
+use mail_parser::{
+    Address, HeaderName, HeaderValue, Message, MessageParser, MimeHeaders, PartType,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::Limits;
@@ -598,7 +600,10 @@ impl Scan {
 /// Начало тела: после первой пустой строки; её нет — тела нет.
 fn body_offset(raw: &[u8]) -> usize {
     let mut i = 0;
-    while let Some(n) = raw.get(i..).and_then(|r| r.iter().position(|&b| b == b'\n')) {
+    while let Some(n) = raw
+        .get(i..)
+        .and_then(|r| r.iter().position(|&b| b == b'\n'))
+    {
         let next = i + n + 1;
         match raw.get(next..) {
             Some([b'\n', ..]) => return next + 1,
@@ -615,7 +620,10 @@ fn wanted(types: &[String], ty: &str, sub: &str) -> bool {
     types.iter().any(|t| match t.split_once('/') {
         None => t.is_empty() || t.eq_ignore_ascii_case(ty),
         Some((a, b)) => {
-            !a.is_empty() && !b.is_empty() && a.eq_ignore_ascii_case(ty) && b.eq_ignore_ascii_case(sub)
+            !a.is_empty()
+                && !b.is_empty()
+                && a.eq_ignore_ascii_case(ty)
+                && b.eq_ignore_ascii_case(sub)
         }
     })
 }
@@ -626,9 +634,9 @@ fn collect(msg: &Message<'_>, types: Option<&[String]>, scan: &mut Scan) {
         if scan.left == 0 {
             return;
         }
-        let (ty, sub) = part
-            .content_type()
-            .map_or(("text", "plain"), |c| (c.ctype(), c.subtype().unwrap_or("")));
+        let (ty, sub) = part.content_type().map_or(("text", "plain"), |c| {
+            (c.ctype(), c.subtype().unwrap_or(""))
+        });
         let hit = match types {
             None => ty.eq_ignore_ascii_case("text"),
             Some(types) => wanted(types, ty, sub),

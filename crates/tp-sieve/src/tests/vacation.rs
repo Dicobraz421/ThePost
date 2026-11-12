@@ -1,6 +1,5 @@
 //! Автоответ (SIEVE-06): условия «не отвечать», период `:days`, `:handle`, ответ из настройки `Vacation`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use time::OffsetDateTime;
@@ -67,7 +66,7 @@ impl Fixture {
 
     async fn setting(&self, v: &Vacation, input: &RulesInput) -> Option<AutoReply> {
         let headers = parse_headers(&input.message);
-        let source = Source::Setting(v, tp_testkit::Clock::now(&*Arc::clone(&self.clock.shared())));
+        let source = Source::Setting(v, self.clock.shared().now());
         reply(source, input, &headers, &self.config, &self.log)
             .await
             .expect("log")
@@ -109,12 +108,19 @@ async fn reply_from_script() {
     // Чужой адрес в :from не принимается: ответ — от адреса получателя.
     let i = input(MAIL, "dave@example.com", "bob@example.org");
     let v = action("vacation :from \"ceo@example.org\" :addresses \"ceo@example.org\" \"x\";");
-    assert_eq!(f.script(&v, &i).await.expect("reply").from, "bob@example.org");
+    assert_eq!(
+        f.script(&v, &i).await.expect("reply").from,
+        "bob@example.org"
+    );
 
     // Без темы и Message-ID; References — из In-Reply-To.
-    let mail = "From: a@example.com\r\nTo: bob@example.org\r\nIn-Reply-To: <p@example.com>\r\n\r\nx";
+    let mail =
+        "From: a@example.com\r\nTo: bob@example.org\r\nIn-Reply-To: <p@example.com>\r\n\r\nx";
     let i = input(mail, "erin@example.com", "bob@example.org");
-    let r = f.script(&action("vacation \"x\";"), &i).await.expect("reply");
+    let r = f
+        .script(&action("vacation \"x\";"), &i)
+        .await
+        .expect("reply");
     assert_eq!(r.subject, "Автоответ");
     assert_eq!(r.in_reply_to, None);
     assert_eq!(r.references, ["<p@example.com>"]);
@@ -128,22 +134,75 @@ async fn no_reply_conditions() {
     let with = |extra: &str| MAIL.replacen("Subject:", &format!("{extra}\r\nSubject:"), 1);
     let cases: Vec<(String, &str, &str, &str)> = vec![
         (MAIL.to_owned(), "", "bob@example.org", "пустой отправитель"),
-        (MAIL.to_owned(), "<>", "bob@example.org", "пустой отправитель"),
-        (with("Auto-Submitted: auto-generated"), "a@example.com", "bob@example.org", "Auto-Submitted"),
-        (with("Auto-Submitted: auto-replied; x=y"), "a@example.com", "bob@example.org", "Auto-Submitted"),
-        (with("List-Id: <dev.example.com>"), "a@example.com", "bob@example.org", "List-"),
-        (with("List-Unsubscribe: <mailto:u@example.com>"), "a@example.com", "bob@example.org", "List-"),
-        (with("Precedence: bulk"), "a@example.com", "bob@example.org", "Precedence"),
-        (with("Precedence: List"), "a@example.com", "bob@example.org", "Precedence"),
-        (with("Precedence: junk"), "a@example.com", "bob@example.org", "Precedence"),
-        (MAIL.to_owned(), "a@example.com", "team@example.org", "среди получателей"),
-        (MAIL.to_owned(), "BOB+me@example.org", "bob@example.org", "собственного адреса"),
+        (
+            MAIL.to_owned(),
+            "<>",
+            "bob@example.org",
+            "пустой отправитель",
+        ),
+        (
+            with("Auto-Submitted: auto-generated"),
+            "a@example.com",
+            "bob@example.org",
+            "Auto-Submitted",
+        ),
+        (
+            with("Auto-Submitted: auto-replied; x=y"),
+            "a@example.com",
+            "bob@example.org",
+            "Auto-Submitted",
+        ),
+        (
+            with("List-Id: <dev.example.com>"),
+            "a@example.com",
+            "bob@example.org",
+            "List-",
+        ),
+        (
+            with("List-Unsubscribe: <mailto:u@example.com>"),
+            "a@example.com",
+            "bob@example.org",
+            "List-",
+        ),
+        (
+            with("Precedence: bulk"),
+            "a@example.com",
+            "bob@example.org",
+            "Precedence",
+        ),
+        (
+            with("Precedence: List"),
+            "a@example.com",
+            "bob@example.org",
+            "Precedence",
+        ),
+        (
+            with("Precedence: junk"),
+            "a@example.com",
+            "bob@example.org",
+            "Precedence",
+        ),
+        (
+            MAIL.to_owned(),
+            "a@example.com",
+            "team@example.org",
+            "среди получателей",
+        ),
+        (
+            MAIL.to_owned(),
+            "BOB+me@example.org",
+            "bob@example.org",
+            "собственного адреса",
+        ),
     ];
     for (mail, from, rcpt, reason) in &cases {
         let i = input(mail, from, rcpt);
         let headers = parse_headers(&i.message);
         let got = suppressed(Source::Script(&v), &i, &headers);
-        assert!(got.is_some_and(|r| r.contains(reason)), "{from} {rcpt} {reason}: {got:?}");
+        assert!(
+            got.is_some_and(|r| r.contains(reason)),
+            "{from} {rcpt} {reason}: {got:?}"
+        );
         assert_eq!(f.script(&v, &i).await, None, "{reason}");
     }
     // Отвечать можно: Auto-Submitted: no, обычный Precedence, получатель с подадресом, адрес в Cc.
@@ -151,7 +210,13 @@ async fn no_reply_conditions() {
         (with("Auto-Submitted: no"), "bob@example.org"),
         (with("Precedence: first-class"), "bob@example.org"),
         (MAIL.to_owned(), "Bob+news@Example.org"),
-        (MAIL.replace("To: Bob <bob@example.org>", "To: x@example.org\r\nCc: bob+a@example.org"), "bob@example.org"),
+        (
+            MAIL.replace(
+                "To: Bob <bob@example.org>",
+                "To: x@example.org\r\nCc: bob+a@example.org",
+            ),
+            "bob@example.org",
+        ),
     ] {
         let i = input(&mail, "a@example.com", rcpt);
         let headers = parse_headers(&i.message);
@@ -221,20 +286,40 @@ async fn days_period() {
 async fn handle() {
     let f = Fixture::new();
     let i = input(MAIL, "alice@example.com", "bob@example.org");
-    assert!(f.script(&action("vacation :handle \"h\" \"первый\";"), &i).await.is_some());
-    assert!(f.script(&action("vacation :handle \"h\" \"второй\";"), &i).await.is_none());
-    assert!(f.script(&action("vacation :handle \"g\" \"второй\";"), &i).await.is_some());
+    assert!(
+        f.script(&action("vacation :handle \"h\" \"первый\";"), &i)
+            .await
+            .is_some()
+    );
+    assert!(
+        f.script(&action("vacation :handle \"h\" \"второй\";"), &i)
+            .await
+            .is_none()
+    );
+    assert!(
+        f.script(&action("vacation :handle \"g\" \"второй\";"), &i)
+            .await
+            .is_some()
+    );
     assert!(f.script(&action("vacation \"текст\";"), &i).await.is_some());
     assert!(f.script(&action("vacation \"текст\";"), &i).await.is_none());
-    assert!(f.script(&action("vacation \"другой текст\";"), &i).await.is_some());
-    assert!(f.script(&action("vacation :subject \"s\" \"текст\";"), &i).await.is_some());
+    assert!(
+        f.script(&action("vacation \"другой текст\";"), &i)
+            .await
+            .is_some()
+    );
+    assert!(
+        f.script(&action("vacation :subject \"s\" \"текст\";"), &i)
+            .await
+            .is_some()
+    );
 }
 
 /// Ответ из настройки `Vacation` (JMAP `VacationResponse`, Admin API) с датами `from`/`to`.
 #[tokio::test]
 async fn reply_from_setting() {
     let f = Fixture::new();
-    let now = tp_testkit::Clock::now(&*f.clock.shared());
+    let now = f.clock.shared().now();
     let i = input(MAIL, "alice@example.com", "bob+x@example.org");
     let v = Vacation {
         enabled: true,
