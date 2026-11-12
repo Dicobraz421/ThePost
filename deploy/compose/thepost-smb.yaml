@@ -12,11 +12,11 @@ blob:
   url: file:///var/lib/thepost/blob
 roles: [all]
 
-# Сертификат клиентских протоколов (SMTP, IMAP, JMAP): fullchain.pem и privkey.pem выпускает tls-init
-# (tls/gen-certs.sh, владелец ключа — nonroot 65532), SAN — localhost, thepost, mail.example.test.
+# Сертификат клиентских протоколов (SMTP, IMAP, ManageSieve, JMAP): fullchain.pem выпускает tls-init
+# (tls/gen-certs.sh), SAN — localhost, thepost, mail.example.test; ключ — только в OpenBao (записывает openbao-init-tls).
 tls:
   cert_file: /etc/thepost/tls/fullchain.pem
-  key_file: /etc/thepost/tls/privkey.pem
+  key: { secret: "thepost/tls#key" }
 
 # Слушатели — на все адреса контейнера (IPv4: в контейнере Docker IPv6 по умолчанию выключен).
 # Порты хоста — в dev.yml (TP_SMTP_PORT и т. п.).
@@ -29,6 +29,11 @@ imap:
     - listen: "0.0.0.0:143"
     - listen: "0.0.0.0:993"
       implicit_tls: true
+# ManageSieve (RFC 5804): STARTTLS на 4190, сертификат — секция tls.
+sieve:
+  managesieve:
+    listen:
+      - listen: "0.0.0.0:4190"
 smtp:
   hostname: mail.example.test
   inbound:

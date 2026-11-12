@@ -39,6 +39,13 @@ stand_fill_parallel: 25
 stand_fill_rate: 50
 # Сверка по IMAP STATUS: число ящиков выборки (0 — все).
 stand_fill_verify: 20
+# Календари и контакты (DEP-21, fill-dav.py): каждой учётной записи нагрузки — stand_fill_events событий в календарь
+# по умолчанию (доля stand_fill_recurring — еженедельные повторы) и stand_fill_contacts карточек в адресную книгу;
+# частота и потоки — stand_fill_rate, stand_fill_parallel. Выполненное — {{ stand_dir }}/fill-dav-state.json.
+# Объёма в Д.3 нет: ≈ год встреч (15 календарных операций в сутки) и адресная книга отдела — оценка стенда.
+stand_fill_events: 300
+stand_fill_recurring: 0.1
+stand_fill_contacts: 100
 
 # Внешний мир: исходящая почта к внешним адресатам уходит через smtp.queue.relay на smtp-sink генератора.
 stand_external_domain: external.test
@@ -58,6 +65,14 @@ stand_model:
   devices_per_user: 1.5
   searches_per_day: 10
   flag_changes_per_day: 200
+  # Календарные операции (dav.js): всего, из них приглашений — событие с участником (Д.3: 15, из них 3).
+  calendar_ops_per_day: 15
+  invitations_per_day: 3
+  # Операции с контактами (синхронизация CardDAV, новая карточка): в Д.3 нет — оценка стенда.
+  contact_ops_per_day: 5
+
+# ManageSieve на узле SMB (sieve.managesieve, STARTTLS): зонд и проверка служб.
+stand_managesieve_port: 4190
 
 # Сценарии (Д.6, DEP-14, DEP-25): множитель к номинальной нагрузке и длительность (секунды).
 #   stress     — ступени stand_stress_factors по stand_stress_step с до первого нарушения Д.7;

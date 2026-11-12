@@ -1,8 +1,10 @@
-# Серверный сертификат от внутреннего CA: <dir>/<name>.pem (сертификат, затем CA — цепочка) и <name>.key.
-# Переменные: thepost_pki_issue_name, thepost_pki_issue_dir, thepost_pki_issue_names (SAN: "DNS:…", "IP:…"),
-# thepost_pki_issue_key_group (группа ключа, режим 0640). До конца срока меньше thepost_pki_renew_before — перевыпуск
-# тем же CA и ключом; службы подхватывают его копированием файлов (notify в ролях openbao, postgresql; thepost
-# перечитывает сертификат клиентских протоколов сам).
+# Серверный сертификат от внутреннего CA: <dir>/<name>.pem (сертификат, затем CA — цепочка) и ключ.
+# Переменные: thepost_pki_issue_name, thepost_pki_issue_dir, thepost_pki_issue_names (SAN: "DNS:…", "IP:…") и ключ:
+#   файл <dir>/<name>.key — thepost_pki_issue_key_group (группа ключа, режим 0640): службы PostgreSQL и OpenBao;
+#   секрет OpenBao — thepost_pki_issue_key_secret (путь в KV thepost, поле key) и thepost_pki_issue_openbao_from
+#     (узел OpenBao с токеном администратора, роль openbao): ключ слушателей thepost (решение 100), на диск не пишется.
+# До конца срока меньше thepost_pki_renew_before — перевыпуск тем же CA и ключом; службы подхватывают его копированием
+# файлов (notify в ролях openbao, postgresql; thepost перечитывает сертификат и секрет ключа сам).
 ---
 - name: Create key {{ thepost_pki_issue_name }}
   community.crypto.openssl_privatekey:
@@ -12,11 +14,49 @@
     owner: root
     group: "{{ thepost_pki_issue_key_group }}"
     mode: "0640"
+  when: thepost_pki_issue_key_secret is not defined
+
+- name: Key {{ thepost_pki_issue_name }} in OpenBao
+  when: thepost_pki_issue_key_secret is defined
+  block:
+    - name: Read key {{ thepost_pki_issue_name }} from OpenBao
+      ansible.builtin.include_role:
+        name: openbao
+        tasks_from: kv
+      vars:
+        openbao_kv_from: "{{ thepost_pki_issue_openbao_from }}"
+        openbao_kv_path: "{{ thepost_pki_issue_key_secret }}"
+        openbao_kv_field: key
+
+    # Ключ есть в секрете — он и остаётся; нет — новый.
+    - name: Create key {{ thepost_pki_issue_name }} (in memory)
+      community.crypto.openssl_privatekey_pipe:
+        content: "{{ openbao_kv_read.stdout if openbao_kv_read.rc == 0 else omit }}"
+        type: ECC
+        curve: secp256r1
+        return_current_key: true
+      register: thepost_pki_issue_key
+      no_log: true
+
+    - name: Write key {{ thepost_pki_issue_name }} to OpenBao
+      ansible.builtin.include_role:
+        name: openbao
+        tasks_from: kv
+      vars:
+        openbao_kv_from: "{{ thepost_pki_issue_openbao_from }}"
+        openbao_kv_path: "{{ thepost_pki_issue_key_secret }}"
+        openbao_kv_field: key
+        openbao_kv_value: "{{ (thepost_pki_issue_key.privatekey | trim) ~ '
+' }}"
+      when: thepost_pki_issue_key is changed
 
 - name: Create request {{ thepost_pki_issue_name }}
   community.crypto.openssl_csr:
     path: "{{ thepost_pki_dir }}/{{ thepost_pki_issue_name }}.csr"
-    privatekey_path: "{{ thepost_pki_issue_dir }}/{{ thepost_pki_issue_name }}.key"
+    privatekey_path: >-
+      {{ omit if thepost_pki_issue_key_secret is defined
+         else thepost_pki_issue_dir ~ '/' ~ thepost_pki_issue_name ~ '.key' }}
+    privatekey_content: "{{ thepost_pki_issue_key.privatekey if thepost_pki_issue_key_secret is defined else omit }}"
     common_name: "{{ (thepost_pki_issue_names | first).split(':', 1) | last }}"
     subject_alt_name: "{{ thepost_pki_issue_names }}"
     basic_constraints: ["CA:FALSE"]
@@ -25,6 +65,7 @@
     key_usage_critical: true
     extended_key_usage: [serverAuth]
     mode: "0644"
+  no_log: "{{ thepost_pki_issue_key_secret is defined }}"
 
 - name: Check certificate {{ thepost_pki_issue_name }}
   ansible.builtin.stat:

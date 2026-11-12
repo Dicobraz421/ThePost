@@ -37,7 +37,9 @@ use tp_contracts::delivery::{DeliveryEventKind, DeliveryLog, DeliveryQuery};
 use tp_contracts::ext::{DecisionHooks, Migration, Module, ModuleCtx, Registry};
 use tp_contracts::ids::DomainId;
 use tp_contracts::mailstore::MailStore;
-use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert, MessageStore, Policy};
+use tp_contracts::meta::{
+    AccountScope, AccountStore, AccountUpsert, MessageStore, Policy, PolicyStore, PolicyTarget,
+};
 use tp_contracts::retention::{TrashObject, TrashPurge, TrashPurgeRule, TrashStore};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::secrets::{SecretRef, SecretStore};
@@ -875,7 +877,7 @@ async fn mvp_mail_flow() {
     };
     meta.set_policy(
         tenant,
-        tp_meta::retention::PolicyTarget::Tenant,
+        PolicyTarget::Tenant,
         &Policy {
             trash_purge: Some(erase),
             ..Policy::default()
@@ -993,7 +995,7 @@ async fn mvp_mail_flow() {
     // удалённое в корзину, окончательно удаляет воркер истечения узла.
     meta.set_policy(
         tenant,
-        tp_meta::retention::PolicyTarget::Tenant,
+        PolicyTarget::Tenant,
         &Policy {
             trash_purge: Some(erase),
             trash_retention: Some(Duration::from_secs(2)),

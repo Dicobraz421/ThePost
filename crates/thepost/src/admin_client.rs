@@ -1804,7 +1804,6 @@ mod tests {
         let deps = Deps {
             auth: Arc::new(auth),
             audit_log: Arc::new(MemAuditLog::new()),
-            audit: Arc::new(tp_admin::Fanout::default()),
             delivery: Arc::new(MemDeliveryLog::new()),
             groups: Arc::new(MemGroups::new()),
             moderation: Arc::new(MemModeration::default()),
