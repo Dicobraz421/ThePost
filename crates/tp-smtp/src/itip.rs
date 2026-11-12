@@ -180,10 +180,7 @@ mod tests {
     #[test]
     fn not_itip() {
         assert_eq!(
-            extract(
-                b"From: a@example.com\r\nSubject: s\r\n\r\nMETHOD:REQUEST\r\n",
-                true
-            ),
+            extract(b"From: a@example.com\r\nSubject: s\r\n\r\nMETHOD:REQUEST\r\n"),
             None
         );
         // `text/calendar` без параметра `method` — вложение-календарь, не iMIP (RFC 6047 §2.4).
