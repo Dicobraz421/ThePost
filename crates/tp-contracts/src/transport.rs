@@ -576,7 +576,6 @@ pub struct TenantTransport {
     /// Политики доменов назначения по возрастанию шаблона.
     pub routes: Vec<DestinationPolicy>,
     /// Таблица переписывания адресов конверта по возрастанию `from`.
-    #[serde(default)]
     pub rewrites: Vec<RewriteRule>,
 }
 
@@ -1032,9 +1031,6 @@ mod tests {
         let json = r#"{"from":"@Old.Example","to":"@example.org"}"#;
         let parsed: RewriteRule = serde_json::from_str(json).expect("de");
         assert_eq!(parsed, rule("@old.example", "@example.org", true, true));
-        let legacy: TenantTransport =
-            serde_json::from_str(r#"{"version":1,"routes":[]}"#).expect("de");
-        assert!(legacy.rewrites.is_empty());
     }
 
     #[test]
