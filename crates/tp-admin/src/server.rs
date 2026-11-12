@@ -51,7 +51,7 @@ use crate::audit::{AUDIT_ROUTE, AuditSink};
 use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
 use crate::groups::Moderation;
-use crate::init::{InitConfig, Local};
+use crate::init::{InitConfig, Local, OidcLogin};
 
 /// Начало префикса маршрутов модуля.
 pub const MODULE_PREFIX: &str = "/api/v1/modules/";
@@ -182,6 +182,8 @@ pub struct AdminConfig {
     pub init: InitConfig,
     /// Веб-консоль администратора ([`crate::console`]); по умолчанию раздаётся.
     pub console: ConsoleConfig,
+    /// Вход в консоль через OIDC (`GET /api/v1/session`); по умолчанию не настроен.
+    pub oidc: Option<OidcLogin>,
 }
 
 impl Default for AdminConfig {
@@ -200,6 +202,7 @@ impl Default for AdminConfig {
             audit: AuditExportConfig::default(),
             init: InitConfig::default(),
             console: ConsoleConfig::default(),
+            oidc: None,
         }
     }
 }
@@ -233,6 +236,9 @@ impl AdminConfig {
         self.audit.check()?;
         self.init.check()?;
         self.console.check()?;
+        if let Some(o) = &self.oidc {
+            o.check()?;
+        }
         if self.subject_max_chars == 0 || self.header_scan_bytes == 0 || self.content_page_size == 0
         {
             return Err(Error::invalid(

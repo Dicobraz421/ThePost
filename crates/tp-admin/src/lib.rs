@@ -41,6 +41,6 @@ pub use export::{
     AuditExportConfig, Fanout, OtlpAudit, OtlpAuditConfig, SyslogAudit, SyslogConfig,
 };
 pub use groups::Moderation;
-pub use init::{InitConfig, InitGranted, InitReply, InitRequest};
+pub use init::{InitConfig, InitGranted, InitReply, InitRequest, OidcLogin, SessionInfo};
 pub use server::{Admin, AdminConfig, AdminRole, Deps, ParityStores, RoleBinding};
 pub use sieve::{ScriptCheck, ScriptError};

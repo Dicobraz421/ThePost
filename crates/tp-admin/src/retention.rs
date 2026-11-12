@@ -186,23 +186,26 @@ impl From<TrashPurgeSetting> for TrashPurgeInfo {
 
 /// Маршруты корзины.
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route("/api/v1/orgs/{org}/accounts/{account}/trash", get(list_trash))
-        .route(
-            "/api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore",
-            post(restore),
-        )
-        .route(
-            "/api/v1/orgs/{org}/accounts/{account}/trash/hidden",
-            get(list_hidden),
-        )
-        .route(
-            "/api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore",
-            post(restore_hidden),
-        )
-        .route(
-            "/api/v1/orgs/{org}/accounts/{account}/trash-purge",
-            get(trash_purge),
-        )
+    r.route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash",
+        get(list_trash),
+    )
+    .route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore",
+        post(restore),
+    )
+    .route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash/hidden",
+        get(list_hidden),
+    )
+    .route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore",
+        post(restore_hidden),
+    )
+    .route(
+        "/api/v1/orgs/{org}/accounts/{account}/trash-purge",
+        get(trash_purge),
+    )
 }
 
 /// Спецификация OpenAPI маршрутов модуля.

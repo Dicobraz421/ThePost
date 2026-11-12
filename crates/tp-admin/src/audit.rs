@@ -161,7 +161,10 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
 
 /// Спецификация OpenAPI маршрутов модуля.
 #[derive(Debug, OpenApi)]
-#[openapi(paths(search_audit), components(schemas(AuditRecord, AuditEntry, AuditPage)))]
+#[openapi(
+    paths(search_audit),
+    components(schemas(AuditRecord, AuditEntry, AuditPage))
+)]
 pub(crate) struct Doc;
 
 /// Журнал аудита организации.

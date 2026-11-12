@@ -103,7 +103,10 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
 
 /// Спецификация OpenAPI маршрутов модуля.
 #[derive(Debug, OpenApi)]
-#[openapi(paths(search_delivery), components(schemas(DeliveryEntry, DeliveryResults)))]
+#[openapi(
+    paths(search_delivery),
+    components(schemas(DeliveryEntry, DeliveryResults))
+)]
 pub(crate) struct Doc;
 
 /// Поиск в журнале доставки организации.

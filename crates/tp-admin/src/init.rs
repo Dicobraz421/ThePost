@@ -15,6 +15,9 @@
 //!   проверкой, в том же ответе — значение сессии (`tps_…`, срок `admin.init.session_ttl`); дальше — только сессия
 //!   или OIDC Bearer. Роль сессии — администратор инсталляции. Сессии — в памяти узла: после перезапуска —
 //!   повторный `admin init --force` или вход через OIDC.
+//! - `GET /api/v1/session` — без входа: способы входа консоли — поставщик OIDC из `admin.oidc` ([`OidcLogin`];
+//!   не настроен — `{"oidc": null}`, вход только токеном `admin init`). Секретов в ответе нет: клиент консоли —
+//!   публичный (код авторизации с PKCE).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -25,7 +28,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::get;
 use axum::{Json, Router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -567,15 +570,74 @@ pub struct AdminSession {
     pub roles: Vec<AdminRole>,
 }
 
-/// Маршрут обмена (вне слоя доступа: вход — сам локальный токен).
-pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route(SESSION_ROUTE, post(exchange))
+/// Секция `admin.oidc`: вход в веб-консоль через поставщика OIDC (код авторизации с PKCE, публичный клиент).
+/// Издатель — тот же, что проверяет токены Admin API (`auth.oidc.issuer`).
+///
+/// ```yaml
+/// oidc: { issuer: "https://idp.example.org/realms/mail", client_id: thepost-console, scope: "openid profile" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OidcLogin {
+    /// Издатель (`iss`), `https://…`.
+    pub issuer: String,
+    /// Идентификатор публичного клиента консоли у поставщика.
+    pub client_id: String,
+    /// Запрашиваемые области через пробел; нет — `openid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
-/// Спецификация OpenAPI маршрута обмена.
+impl OidcLogin {
+    /// Проверяет значения: издатель — `https://узел…` без пробелов, клиент и области — непустая строка без
+    /// управляющих знаков.
+    pub fn check(&self) -> Result<()> {
+        let plain = |s: &str| !s.trim().is_empty() && !s.chars().any(char::is_control);
+        let host = self.issuer.strip_prefix("https://").unwrap_or_default();
+        if host.is_empty() || host.starts_with('/') || self.issuer.chars().any(char::is_whitespace)
+        {
+            return Err(Error::invalid(format!(
+                "admin.oidc: issuer {:?} — ожидается https://узел[/путь]",
+                self.issuer
+            )));
+        }
+        if !plain(&self.client_id) || !self.scope.as_deref().is_none_or(plain) {
+            return Err(Error::invalid(
+                "admin.oidc: client_id и scope — непустые строки без управляющих знаков",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Способы входа консоли.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionInfo {
+    /// Поставщик OIDC; `null` — не настроен (вход только токеном `admin init`).
+    pub oidc: Option<OidcLogin>,
+}
+
+/// Маршрут сессии (вне слоя доступа: способы входа — без входа, обмен — вход самим локальным токеном).
+pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
+    r.route(SESSION_ROUTE, get(session_info).post(exchange))
+}
+
+/// Спецификация OpenAPI маршрута сессии.
 #[derive(Debug, OpenApi)]
-#[openapi(paths(exchange), components(schemas(AdminSession)))]
+#[openapi(
+    paths(session_info, exchange),
+    components(schemas(AdminSession, SessionInfo, OidcLogin))
+)]
 pub(crate) struct Doc;
+
+/// Способы входа консоли: поставщик OIDC (`admin.oidc`). Без входа.
+#[utoipa::path(get, path = "/api/v1/session", tag = "admin", security(()),
+    responses((status = 200, body = SessionInfo)))]
+async fn session_info(State(a): State<Arc<Admin>>) -> Json<SessionInfo> {
+    Json(SessionInfo {
+        oidc: a.cfg.oidc.clone(),
+    })
+}
 
 /// Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится
 /// первой проверкой; повтор, срок, отзыв — 401.
@@ -674,6 +736,62 @@ mod tests {
             email: email.into(),
             display_name: None,
             force,
+        }
+    }
+
+    /// Приёмка ADM-25: способы входа — без заголовка `Authorization`; с настройкой OIDC и без.
+    #[tokio::test]
+    async fn session_info_without_login() {
+        let env = Env::new();
+        let (s, _, b) = env.call("GET", SESSION_ROUTE, None, None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b, json!({"oidc": null}));
+
+        let oidc = OidcLogin {
+            issuer: "https://idp.example.org/realms/mail".into(),
+            client_id: "thepost-console".into(),
+            scope: None,
+        };
+        let env = Env::with(
+            crate::server::AdminConfig {
+                oidc: Some(oidc),
+                ..crate::testenv::config()
+            },
+            Vec::new(),
+        );
+        let (s, _, b) = env.call("GET", SESSION_ROUTE, None, None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            b,
+            json!({"oidc": {"issuer": "https://idp.example.org/realms/mail", "client_id": "thepost-console"}})
+        );
+        let spec = serde_json::to_value(crate::server::openapi_spec()).expect("spec");
+        assert_eq!(spec["paths"][SESSION_ROUTE]["get"]["security"], json!([{}]));
+    }
+
+    #[test]
+    fn oidc_login_check() {
+        let ok = OidcLogin {
+            issuer: "https://idp.example.org".into(),
+            client_id: "c".into(),
+            scope: Some("openid profile".into()),
+        };
+        assert!(ok.check().is_ok());
+        for bad in [
+            OidcLogin {
+                issuer: "http://idp.example.org".into(),
+                ..ok.clone()
+            },
+            OidcLogin {
+                client_id: " ".into(),
+                ..ok.clone()
+            },
+            OidcLogin {
+                scope: Some(String::new()),
+                ..ok.clone()
+            },
+        ] {
+            assert!(bad.check().is_err(), "{bad:?}");
         }
     }
 
