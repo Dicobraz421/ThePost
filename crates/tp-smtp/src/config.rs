@@ -416,6 +416,9 @@ pub struct DeliveryConfig {
     pub directory_refresh: Duration,
     /// Ответ на `RCPT TO` получателю с переполненным ящиком (проверка до `250`, SRS 4.1).
     pub quota_reject: QuotaReject,
+    /// Автоответов Sieve учётной записи в час (защита от рассылки автоответами, SMTP-32); 0 — автоответы не
+    /// отправляются. Период ответа одному отправителю (`:days`) проверяют правила.
+    pub vacation_rate: u32,
 }
 
 impl Default for DeliveryConfig {
@@ -424,6 +427,7 @@ impl Default for DeliveryConfig {
             local_domains: Vec::new(),
             directory_refresh: Duration::from_secs(5 * 60),
             quota_reject: QuotaReject::default(),
+            vacation_rate: 60,
         }
     }
 }
