@@ -12,3 +12,10 @@ fn meta_crash_inputs() {
     ));
 }
 
+/// FIX-07, issue #468: цель `split`.
+#[test]
+fn split_crash_inputs() {
+    crate::fuzz::split(include_bytes!(
+        "../fuzz/corpus/split/crash-027f34723b1cec70851215141dfefb391e67aecb"
+    ));
+}
