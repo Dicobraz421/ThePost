@@ -1054,6 +1054,7 @@ async fn submission_copy_to_local_address() {
     assert!(env.inbox("carol@example.org").await.is_empty());
 }
 
+mod addressbook;
 mod imip;
 mod moderation;
 

@@ -5,7 +5,8 @@
 //! - получатель в локальном домене — учётные записи, на которые он разрешается; неизвестный — `550 5.1.1`;
 //!   переполненный ящик — `452 4.2.2` или `552 5.2.2` (`delivery.quota_reject`) до `DATA`;
 //! - группа рассылки ([`Delivery::with_groups`], [`crate::groups`]): отправитель вне круга — `550 5.7.1` на `RCPT`,
-//!   письмо модерируемой группы — в очередь модерации, иначе группа раскрывается;
+//!   письмо модерируемой группы — в очередь модерации, иначе группа раскрывается: учётные записи — в ящики,
+//!   почтовые контакты — внешним адресатам; динамическая группа — по фильтру на момент доставки (SMTP-26);
 //! - внешний получатель: smtp-in — `550 5.7.1` (не открытый релей), submission — в очередь исходящей почты
 //!   ([`Outbound`], [`crate::queue::Queue`]); узел без очереди (`Deps::outbound` = `None`) — `451 4.3.2`;
 //! - submission: до доставки и очереди — `DecisionHooks::on_submission` (`Deny` — `550 5.7.1`; дополнения:
@@ -166,6 +167,8 @@ struct Target {
     delivered_to: Option<String>,
     /// Адрес — группа рассылки [`Groups`] (ограничения отправителей, модерация).
     group: Option<DistributionGroup>,
+    /// Адреса почтовых контактов в составе группы (SMTP-26): внешняя доставка.
+    contacts: Vec<String>,
     /// Неизвестный адрес домена внутренней ретрансляции: в очередь (на `next_hop` домена).
     relay: bool,
     /// Принятый домен другой организации.
@@ -538,6 +541,7 @@ impl Delivery {
             resolved,
             delivered_to,
             group: None,
+            contacts: Vec::new(),
             relay: false,
             foreign: false,
         };
@@ -565,8 +569,9 @@ impl Delivery {
         if let Some(groups) = &self.groups
             && let Some(group) = groups.by_address(self.deps.tenant, &lower).await?
         {
+            let members = groups.members(self.deps.tenant, &group).await?;
             let mut accounts = Vec::new();
-            for id in groups.members(self.deps.tenant, &group).await? {
+            for id in members.accounts {
                 if let Some(acc) = self.deps.accounts.get(self.deps.tenant, id).await?
                     && acc.enabled
                 {
@@ -575,6 +580,7 @@ impl Delivery {
             }
             return Ok(Target {
                 group: Some(group),
+                contacts: members.contacts,
                 ..target(Resolved::Local(accounts), None)
             });
         }
@@ -811,6 +817,8 @@ impl Delivery {
                     continue;
                 }
             }
+            // Контакты в составе группы — внешним адресатам (очередь; письмо извне — пересылкой).
+            push_unique(&mut out.external, target.contacts);
             match target.resolved {
                 Resolved::Local(accounts) => {
                     for acc in accounts {

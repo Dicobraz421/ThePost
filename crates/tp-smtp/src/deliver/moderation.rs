@@ -41,7 +41,8 @@ impl Delivery {
         self.groups.as_ref().ok_or(Error::UNAVAILABLE)
     }
 
-    /// Доставки участникам группы `group` (включённые учётные записи, каждая — один раз) с адресом группы.
+    /// Доставки участникам группы `group` (включённые учётные записи, каждая — один раз) с адресом группы;
+    /// контакты в её составе — внешние адресаты.
     async fn members_of(
         &self,
         groups: &Groups,
@@ -58,7 +59,9 @@ impl Delivery {
             held: Vec::new(),
             failed: Vec::new(),
         };
-        for id in groups.members(self.deps.tenant, group).await? {
+        let members = groups.members(self.deps.tenant, group).await?;
+        out.external = members.contacts;
+        for id in members.accounts {
             if let Some(acc) = self.deps.accounts.get(self.deps.tenant, id).await?
                 && acc.enabled
             {
