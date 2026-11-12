@@ -33,7 +33,7 @@
 {%- if thepost_db_failover | length > 0 -%}
 {%-   set node = node | combine({'database': {'failover': thepost_db_failover}}, recursive=true) -%}
 {%- endif -%}
-{#- ACME: сертификат и ключ — в /var/lib/thepost/tls (StateDirectory юнита). -#}
+{#- ACME: сертификат — в /var/lib/thepost/tls (StateDirectory юнита), ключ — в OpenBao (tls.key, PLT-29). -#}
 {%- if acme -%}
 {%-   set acme_section = {'enabled': true, 'domains': thepost_tls_names, 'contact': ['mailto:' ~ thepost_acme_email],
                           'state_dir': '/var/lib/thepost/acme'} -%}
@@ -42,7 +42,7 @@
 {%-   endif -%}
 {%-   set node = node | combine({'acme': acme_section,
                                 'tls': {'cert_file': '/var/lib/thepost/tls/fullchain.pem',
-                                        'key_file': '/var/lib/thepost/tls/privkey.pem'}}, recursive=true) -%}
+                                        'key': {'secret': thepost_acme_key_secret}}}, recursive=true) -%}
 {%- endif -%}
 # {{ ansible_managed }}
 # The Post, профиль SMB (deploy/ansible/smb.yml): пресет deploy/config/all.yaml + значения инвентаря.

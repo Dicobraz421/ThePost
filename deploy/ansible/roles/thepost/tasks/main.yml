@@ -3,12 +3,12 @@
 - name: Check parameters
   ansible.builtin.assert:
     that:
-      - thepost_tls_mode in ['certbot', 'acme', 'internal', 'files']
-      - thepost_tls_mode not in ['certbot', 'acme'] or thepost_acme_email | length > 0
+      - thepost_tls_mode in ['acme', 'internal', 'files']
+      - thepost_tls_mode != 'acme' or thepost_acme_email | length > 0
       - thepost_tls_mode != 'files' or (thepost_tls_cert_src | length > 0 and thepost_tls_key_src | length > 0)
       - thepost_binary_url | length == 0 or thepost_binary_checksum | length > 0
     fail_msg: >-
-      thepost_tls_mode — certbot, acme, internal или files; для certbot и acme нужен thepost_acme_email,
+      thepost_tls_mode — acme, internal или files; для acme нужен thepost_acme_email,
       для files — thepost_tls_cert_src и thepost_tls_key_src; thepost_binary_url — с thepost_binary_checksum
 
 - name: Install system user (sysusers.d)
@@ -55,6 +55,7 @@
     mode: "0644"
   notify: Restart thepost
 
+# thepost-http.socket (порт 80) — проверки ACME HTTP-01, включается только с thepost_tls_mode: acme.
 - name: Install systemd socket units
   ansible.builtin.copy:
     src: "{{ role_path }}/../../../systemd/thepost-{{ item }}.socket"
@@ -62,7 +63,7 @@
     owner: root
     group: root
     mode: "0644"
-  loop: "{{ thepost_sockets }}"
+  loop: "{{ thepost_sockets + ['http'] }}"
 
 - name: Create unit drop-in directory
   ansible.builtin.file:
@@ -122,7 +123,7 @@
     - /etc/thepost
     - /etc/thepost/tls
 
-# firewalld (РЕД ОС, AlmaLinux, RHEL; включён — открыть порты клиентских протоколов, certbot — и 80).
+# firewalld (РЕД ОС, AlmaLinux, RHEL; включён — открыть порты клиентских протоколов, ACME — и 80).
 - name: Check firewalld
   ansible.builtin.command: systemctl is-active firewalld
   register: thepost_firewalld
@@ -135,7 +136,7 @@
     permanent: true
     immediate: true
     state: enabled
-  loop: "{{ thepost_firewall_ports + ([80] if thepost_tls_mode == 'certbot' else []) }}"
+  loop: "{{ thepost_firewall_ports + ([80] if thepost_tls_mode == 'acme' else []) }}"
   when: thepost_firewalld.stdout == 'active'
 
 - name: Certificate of client protocols
@@ -158,7 +159,16 @@
     state: started
     enabled: true
     daemon_reload: true
-  loop: "{{ thepost_sockets }}"
+  loop: "{{ thepost_sockets + (['http'] if thepost_tls_mode == 'acme' else []) }}"
+  notify: Restart thepost
+
+- name: Disable ACME HTTP-01 socket without ACME
+  ansible.builtin.systemd_service:
+    name: thepost-http.socket
+    state: stopped
+    enabled: false
+    daemon_reload: true
+  when: thepost_tls_mode != 'acme'
   notify: Restart thepost
 
 - name: Start thepost

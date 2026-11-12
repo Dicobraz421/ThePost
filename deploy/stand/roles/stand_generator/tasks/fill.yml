@@ -9,7 +9,7 @@
       - --accounts={{ stand_etc_dir }}/accounts
       - --corpus={{ stand_dir }}/corpus
       - --host={{ stand_smb_hostname }}
-      - --ca={{ (stand_etc_dir ~ '/ca.pem') if hostvars[stand_smb_host].thepost_tls_mode | default('certbot') == 'internal' else '' }}
+      - --ca={{ (stand_etc_dir ~ '/ca.pem') if hostvars[stand_smb_host].thepost_tls_mode | default('acme') == 'internal' else '' }}
       - --users={{ stand_users }}
       - --prefix={{ stand_user_prefix }}
       - --domain={{ stand_domain }}

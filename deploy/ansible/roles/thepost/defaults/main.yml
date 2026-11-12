@@ -14,20 +14,22 @@ thepost_binary_checksum: ""
 thepost_binary_src: "{{ playbook_dir }}/../../target/release/thepost"
 thepost_binary_path: /usr/local/bin/thepost
 
-# Сертификат клиентских протоколов (SMTP, IMAP, JMAP, служебный HTTP):
-#   certbot  — Let's Encrypt (ACME HTTP-01, certbot --standalone на порту 80; продление — certbot.timer, deploy-hook
-#              копирует файлы, thepost перечитывает их без перезапуска — tls.reload_interval);
-#   acme     — встроенный клиент ACME thepost (секция acme, SRS 6.2; файлы — в /var/lib/thepost/tls);
+# Сертификат клиентских протоколов (SMTP, IMAP, JMAP, служебный HTTP; решение 101):
+#   acme     — встроенный клиент ACME thepost (по умолчанию для публичного имени; секция acme, SRS 6.2, HTTP-01 на
+#              порту 80 — сокет thepost-http.socket, firewalld открывает 80): сертификат — /var/lib/thepost/tls,
+#              закрытый ключ — в OpenBao (thepost_acme_key_secret, PLT-29); продление — сам thepost без перезапуска;
 #   internal — внутренний CA роли thepost_pki (стенд, тест; клиентам нужен {{ thepost_pki_dir }}/ca.pem);
 #   files    — свои PEM с управляющей машины: thepost_tls_cert_src (цепочка), thepost_tls_key_src.
-thepost_tls_mode: certbot
+thepost_tls_mode: acme
 thepost_tls_names: ["{{ thepost_hostname }}"]
 thepost_tls_cert_src: ""
 thepost_tls_key_src: ""
-# ACME (certbot и acme): контакт учётной записи и каталог (пусто — Let's Encrypt; staging —
-# https://acme-staging-v02.api.letsencrypt.org/directory).
+# ACME: контакт учётной записи и каталог (пусто — Let's Encrypt; staging —
+# https://acme-staging-v02.api.letsencrypt.org/directory). Ключ сертификата — секрет OpenBao (tls.key; запись —
+# политика узла deploy/openbao/thepost-policy.hcl).
 thepost_acme_email: ""
 thepost_acme_directory_url: ""
+thepost_acme_key_secret: "thepost/tls#key"
 
 # Внутренние каналы — только TLS с проверкой имени (решение 2026-10-30): CA — роль thepost_pki.
 thepost_internal_ca_file: "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/ca.pem"

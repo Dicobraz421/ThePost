@@ -160,10 +160,10 @@ deploy/config/all.yaml`.
 Чистая ВМ → PostgreSQL 16 (PGDG), OpenBao, Rspamd (clamav-milter — `thepost_clamav: true`) и `thepost` (все роли) под
 systemd (SRS 1.2, 5.6). ОС (решения 2026-11-11 №28, 51, 52; семейство — по менеджеру пакетов):
 - apt — Debian 13 (основа) и 12, Ubuntu 26.04 и 24.04, Astra Linux SE 1.8 (наборы PGDG и Rspamd — `bookworm`);
-- dnf — AlmaLinux 10 и 9 (совместимость с RHEL 9 и 10): PGDG yum, Rspamd `rspamd.com/rpm-stable`, restic и certbot —
+- dnf — AlmaLinux 10 и 9 (совместимость с RHEL 9 и 10): PGDG yum, Rspamd `rspamd.com/rpm-stable`, restic —
   EPEL (на самом RHEL EPEL подключает администратор); РЕД ОС 8 — PostgreSQL, Rspamd, pgBackRest и restic из
   репозиториев дистрибутива, ClamAV в них нет. Включённый firewalld — роль `thepost` открывает порты клиентских
-  протоколов (certbot — и 80); SELinux — контексты каталогов pgBackRest (роль `pgbackrest`, `tasks/selinux.yml`).
+  протоколов (ACME — и 80); SELinux — контексты каталогов pgBackRest (роль `pgbackrest`, `tasks/selinux.yml`).
 ```bash
 cargo build --release                                   # или thepost_binary_url + thepost_binary_checksum
 ansible-galaxy collection install -r deploy/ansible/requirements.yml
@@ -179,9 +179,9 @@ loopback) → OpenBao (`https://localhost:8200`, пароли `thepost/db`, `the
 `/healthz/ready`). Порты ниже 1024 — только сокеты systemd (`thepost-*.socket`, решение 102), у процесса нет
 capabilities.
 Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
-Сертификат клиентских протоколов — `thepost_tls_mode`: `certbot` (Let's Encrypt HTTP-01, по умолчанию; порт 80
-открыт, DNS указывает на ВМ), `acme` (встроенный клиент thepost, секция `acme`), `internal` (внутренний CA — стенд),
-`files` (свои PEM). Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
+Сертификат клиентских протоколов (решение 101) — `thepost_tls_mode`: `acme` (по умолчанию для публичного имени:
+встроенный клиент thepost, секция `acme`, Let's Encrypt HTTP-01 на порту 80 через `thepost-http.socket`; DNS указывает
+на ВМ; ключ — в OpenBao, `thepost/tls#key`), `internal` (внутренний CA — стенд), `files` (свои PEM). Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
 Повторный прогон ничего не меняет. Ключи восстановления и root-токен OpenBao — `/root/openbao-init.json` (см. ниже).
 
 ### Резервное копирование и восстановление (роль `pgbackrest`, DEP-15)
@@ -242,7 +242,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now thepost-{smtp,submis
 sudo systemctl enable --now thepost
 systemd-analyze security thepost.service   # не хуже 2.0 (ожидается 1.2)
 ```
-Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443.
+Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443;
+`http` 80 — только проверки встроенного ACME (`acme.enabled`; `systemctl enable --now thepost-http.socket`).
 Узел берёт сокет systemd по адресу слушателя (`0.0.0.0:<порт>` или `[::]:<порт>` совпадает с `ListenStream=<порт>`),
 иначе открывает свой (порт ниже 1024 без сокета не откроется — capabilities у процесса нет); перезапуск `thepost` не
 закрывает сокеты: соединения ждут в очереди.
