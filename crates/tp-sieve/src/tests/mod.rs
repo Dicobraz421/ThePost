@@ -4,6 +4,7 @@ mod actions;
 mod checking;
 mod execution;
 mod extensions;
+mod managesieve;
 mod parsing;
 mod rules;
 mod vacation;

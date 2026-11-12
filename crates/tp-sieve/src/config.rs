@@ -6,6 +6,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tp_contracts::config::duration;
+use tp_platform::listen::EndpointConfig;
 
 use crate::Limits;
 
@@ -107,13 +108,25 @@ impl Default for CacheConfig {
 }
 
 /// Лимиты сеанса ManageSieve (SIEVE-08).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+///
+/// ```yaml
+/// listen:
+///   - listen: "[::]:4190"
+/// idle_timeout: 30m
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ManageSieveConfig {
-    /// Длина строки команды, байт.
+    /// Слушатели (порт 4190, `STARTTLS`); пусто — ManageSieve выключен. Требует перезапуска.
+    pub listen: Vec<EndpointConfig>,
+    /// Длина строки команды, байт; длиннее — `BYE` и закрытие.
     pub max_line: usize,
-    /// Размер литерала `{n+}`, байт.
+    /// Размер литерала `{n+}`, байт; больше — `NO (QUOTA/MAXSIZE)`.
     pub max_literal: usize,
+    /// Одновременных соединений на слушатель; сверх лимита — `BYE (TRYLATER)` и закрытие.
+    pub max_connections: usize,
+    /// Неудачных попыток входа за сеанс; затем `BYE` и закрытие.
+    pub max_auth_failures: u32,
     /// Таймаут бездействия сеанса.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
@@ -123,8 +136,11 @@ pub struct ManageSieveConfig {
 impl Default for ManageSieveConfig {
     fn default() -> Self {
         Self {
+            listen: Vec::new(),
             max_line: 8192,
             max_literal: 256 * 1024,
+            max_connections: 1024,
+            max_auth_failures: 3,
             idle_timeout: Duration::from_secs(30 * 60),
         }
     }

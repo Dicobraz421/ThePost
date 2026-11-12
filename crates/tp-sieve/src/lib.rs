@@ -14,6 +14,7 @@ mod compile;
 mod config;
 pub mod fuzz;
 mod lexer;
+pub mod managesieve;
 mod outcome;
 mod rules;
 mod run;
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 pub use ast::{Arg, Command, Script, Test, parse};
 pub use compile::{EXTENSIONS, Program, check, compile};
 pub use config::{CacheConfig, ManageSieveConfig, SieveConfig, VacationConfig};
+pub use managesieve::ManageSieve;
 pub use rules::Rules;
 pub use run::{Action, Context, Outcome, VacationAction, run};
 
