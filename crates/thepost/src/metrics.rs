@@ -3,6 +3,8 @@
 //!
 //! Метрики критериев Д.7 (APP-34): пул соединений узла и слушатель LISTEN (`tp_platform::DbMetrics`), время
 //! фиксаций с NOTIFY и число слушателей ([`register_db`]), «сироты» BLOB ([`register_orphans`]).
+//!
+//! Проверка целостности BLOB по расписанию (APP-44): [`register_verify`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -17,7 +19,7 @@ use tp_meta::signals::{PgSignalBus, SignalMetrics};
 use tp_platform::{DbMetrics, ListenerSample, Metrics, PoolSample};
 use tp_search::{CacheStats, IndexCache, Indexer, IndexerStats};
 
-use crate::roles::OrphanProbe;
+use crate::roles::{OrphanProbe, VerifyMetrics, VerifyProbe};
 
 /// Описание показателя: имя, пояснение, значение `V` из снимка `S`, счётчик (иначе — текущее значение).
 type StatDef<S, V = u64> = (&'static str, &'static str, fn(&S) -> V, bool);
@@ -327,6 +329,65 @@ pub fn register_orphans(metrics: &Metrics) -> OrphanProbe {
         &Arc::new(probe.clone()),
         OrphanProbe::metrics,
         OrphanMetrics::STATS,
+    );
+    probe
+}
+
+/// Регистрирует показатели проверки целостности BLOB по расписанию роли maintenance (APP-44):
+/// `tp_blob_verify_{passes,failed}_total`, расхождения последнего прохода `tp_blob_verify_{damaged,orphans,errors}`,
+/// `tp_blob_verify_duration_seconds`, `tp_blob_verify_finished_timestamp_seconds`. Возвращает держатель для
+/// `ScheduledVerify::probe`: до первого прохода значения нулевые.
+pub fn register_verify(metrics: &Metrics) -> VerifyProbe {
+    let probe = VerifyProbe::default();
+    let defs: [StatDef<VerifyMetrics>; 7] = [
+        (
+            "tp_blob_verify_passes",
+            "Завершённые проходы проверки целостности BLOB",
+            |m| m.passes,
+            true,
+        ),
+        (
+            "tp_blob_verify_failed",
+            "Проходы проверки целостности BLOB, прерванные ошибкой или потерей лизы",
+            |m| m.failed,
+            true,
+        ),
+        (
+            "tp_blob_verify_damaged",
+            "Повреждённые записи учёта BLOB в последнем проходе (объекта нет или размер не совпадает)",
+            |m| m.damaged,
+            false,
+        ),
+        (
+            "tp_blob_verify_orphans",
+            "Объекты BLOB без записи учёта в последнем проходе",
+            |m| m.orphans,
+            false,
+        ),
+        (
+            "tp_blob_verify_errors",
+            "Объекты и записи BLOB, которые в последнем проходе проверить не удалось",
+            |m| m.errors,
+            false,
+        ),
+        (
+            "tp_blob_verify_duration_seconds",
+            "Время последнего прохода проверки целостности BLOB, секунд",
+            |m| m.duration_secs,
+            false,
+        ),
+        (
+            "tp_blob_verify_finished_timestamp_seconds",
+            "Момент завершения последнего прохода проверки целостности BLOB (0 — проходов не было)",
+            |m| m.finished_at,
+            false,
+        ),
+    ];
+    register(
+        metrics,
+        &Arc::new(probe.clone()),
+        VerifyProbe::metrics,
+        defs,
     );
     probe
 }
