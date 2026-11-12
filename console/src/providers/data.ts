@@ -10,7 +10,9 @@ const item = (resource: string, id: unknown) => `${base(resource)}/${encodeURICo
 export const dataProvider: DataProvider = {
   getApiUrl: () => API,
   getList: async ({ resource, pagination, filters, meta }) => {
-    const query: Record<string, unknown> = { after: meta?.after };
+    // Курсор: `meta.after` или страница бесконечного списка (`useInfiniteList` кладёт курсор в `currentPage`).
+    const page: unknown = pagination?.currentPage;
+    const query: Record<string, unknown> = { after: meta?.after ?? (typeof page === "string" ? page : undefined) };
     if (pagination?.mode !== "off") query.limit = pagination?.pageSize;
     for (const f of filters ?? []) if ("field" in f && f.operator === "eq") query[f.field] = f.value;
     const { data, next } = await request<never[]>(base(resource), { query });
