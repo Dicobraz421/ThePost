@@ -24,10 +24,6 @@
 //! Ожидание не дольше [`TrashConfig::max_wait`]: по его истечении срок сверяется заново (без прохода, если ничего
 //! не истекло) — страховка от потерянного сигнала (шина at-most-once). После ошибки хранилища — повтор не раньше
 //! [`TrashConfig::retry`] (SRS 2.8, таймер 2).
-//!
-//! Заголовки скрытого письма для администратора ([`Store::hidden_headers`], MS-19): тема, отправитель и дата —
-//! из метаданных, вычисленных при приёме (`TrashStore::hidden_message`, `Message::meta.envelope`); объекты BLOB
-//! не читаются, скрытие не снимается. Аудит обращения ведёт вызывающий (ADM-32).
 
 use std::future::Future;
 use std::time::Duration;
@@ -39,7 +35,7 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 use tp_contracts::bus::{EventKind, EventStream};
 use tp_contracts::config::duration;
 use tp_contracts::ext::{Decision, FinalDelete};
-use tp_contracts::meta::{AccountScope, Address, Inserted};
+use tp_contracts::meta::{AccountScope, Inserted};
 use tp_contracts::retention::{TrashItem, TrashObject, trash_changed};
 use tp_contracts::{MessageId, ModSeq, Result};
 
@@ -126,17 +122,6 @@ async fn next_event(events: &mut Option<EventStream>) -> Option<tp_contracts::bu
     }
 }
 
-/// Заголовки скрытого письма корзины ([`Store::hidden_headers`]): значения декодированы при приёме.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HiddenHeaders {
-    /// Тема (заголовок `Subject`); нет заголовка — `None`.
-    pub subject: Option<String>,
-    /// Отправитель (заголовок `From`); нет заголовка — пусто.
-    pub from: Vec<Address>,
-    /// Дата (заголовок `Date`); нет или не разобрана — `None`.
-    pub date: Option<OffsetDateTime>,
-}
-
 /// Момент позже любого срока: `TrashStore::expired` на него — элементы по возрастанию срока.
 pub(crate) const FAR: OffsetDateTime = PrimitiveDateTime::MAX.assume_utc();
 
@@ -184,25 +169,6 @@ impl Store {
                 .await;
         }
         Ok(inserted)
-    }
-
-    /// Заголовки скрытого письма `id` учётной записи для администратора: письмо остаётся скрытым и невидимым
-    /// пользователю, BLOB не читается. Письма нет или оно не скрыто — `None`. Аудит — у вызывающего.
-    pub async fn hidden_headers(
-        &self,
-        scope: AccountScope,
-        id: MessageId,
-    ) -> Result<Option<HiddenHeaders>> {
-        Ok(self
-            .d
-            .trash
-            .hidden_message(scope, id)
-            .await?
-            .map(|m| HiddenHeaders {
-                subject: m.meta.envelope.subject,
-                from: m.meta.envelope.from,
-                date: m.meta.envelope.date,
-            }))
     }
 
     /// Проход истечения на момент `now`: пакеты элементов с `expires_at <= now`, пока они есть и проход
@@ -570,58 +536,6 @@ mod tests {
         async fn before_final_delete(&self, op: &FinalDelete) -> Result<Decision> {
             self.calls.lock().expect("lock").push(op.clone());
             Ok(Decision::Deny("legal hold".into()))
-        }
-    }
-
-    #[tokio::test]
-    async fn hidden_headers_without_unhiding() {
-        let f = fixture(DecisionHooks::default(), 2).await;
-        let (hidden, shown) = (f.ids[0], f.ids[1]);
-        let raw = tp_testkit::corpus::corpus_mail("mixed-pdf")
-            .expect("mail")
-            .raw;
-        let want = crate::meta::message_meta(&raw).envelope;
-        assert!(want.subject.is_some() && !want.from.is_empty());
-        f.delete(&[hidden, shown]).await;
-        let out = TrashStore::purge(&f.env.trash, f.scope, &[hidden], &DecisionHooks::default())
-            .await
-            .expect("purge");
-        assert_eq!(out.hidden, [hidden]);
-        let gets = f.env.blobs.calls(tp_testkit::BlobOp::Get);
-
-        let head = f
-            .env
-            .store
-            .hidden_headers(f.scope, hidden)
-            .await
-            .expect("headers")
-            .expect("hidden");
-        assert_eq!(
-            head,
-            HiddenHeaders {
-                subject: want.subject,
-                from: want.from,
-                date: want.date,
-            }
-        );
-        assert_eq!(
-            f.env.blobs.calls(tp_testkit::BlobOp::Get),
-            gets,
-            "BLOB не читается"
-        );
-        // Письмо остаётся скрытым: пользователю не видно, администратор видит в скрытых.
-        assert!(!f.exists(hidden).await);
-        assert!(f.env.store.fetch_raw(f.scope, hidden, None).await.is_err());
-        let still: Vec<_> = TrashStore::list_hidden(&f.env.trash, f.scope, 0, 100)
-            .await
-            .expect("hidden")
-            .into_iter()
-            .map(|i| i.object)
-            .collect();
-        assert_eq!(still, [TrashObject::Message(hidden)]);
-        // Видимое в корзине и отсутствующее письмо — не скрытые.
-        for id in [shown, MessageId::new()] {
-            assert_eq!(f.env.store.hidden_headers(f.scope, id).await, Ok(None));
         }
     }
 

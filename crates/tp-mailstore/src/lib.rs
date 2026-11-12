@@ -46,7 +46,7 @@ pub mod trash;
 pub use disabled::{DisabledConfig, DisabledMailboxes, DisabledPass};
 pub use quota::QuotaWarnConfig;
 pub use split::MimeLimits;
-pub use trash::{HiddenHeaders, TrashConfig, TrashPass};
+pub use trash::{TrashConfig, TrashPass};
 
 /// Конфигурация хранилища (секция config.yaml; поля необязательны, неизвестное — ошибка).
 ///
