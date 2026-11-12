@@ -467,6 +467,7 @@ impl Services {
             bus: self.bus.clone(),
             trash: Arc::new(self.meta.clone()),
             hooks: self.hooks.clone(),
+            audit: Arc::new(self.meta.clone()),
         }
     }
 
