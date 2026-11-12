@@ -19,6 +19,7 @@ pub mod config;
 pub mod fuzz;
 mod gal;
 pub mod index;
+pub mod itip;
 mod path;
 mod props;
 mod query;
