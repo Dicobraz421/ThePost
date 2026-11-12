@@ -4,6 +4,8 @@
 #     -e "thepost_restore_target='2026-11-11 18:00:00+03'"
 # Без thepost_restore_target — до конца архива WAL (последнее состояние). Параметры — роль pgbackrest (defaults),
 # порядок для новой ВМ — docs/INSTALL.md, «Резервное копирование и восстановление».
+# Новая ВМ: сначала OpenBao из снимка Raft (DEP-23) — секреты прежнего сервера (DKIM, ключи копий, пароли СУБД):
+#   … -e thepost_restore_openbao=true -e thepost_restore_openbao_init_src=<openbao-init.json прежнего сервера> #     -e thepost_restore_openbao_static_key_src=<ключ распечатывания прежнего сервера>
 ---
 - name: The Post SMB restore
   hosts: smb
@@ -22,6 +24,13 @@
     - name: OpenBao
       ansible.builtin.include_role:
         name: openbao
+        public: true
+    # Снимок OpenBao — до СУБД: ключи копий, пароли учётных записей и AppRole узла — из восстановленного OpenBao.
+    - name: Restore OpenBao from snapshot
+      ansible.builtin.include_role:
+        name: pgbackrest
+        tasks_from: restore-openbao
+      when: thepost_restore_openbao | default(false) | bool
     # Средства копирования и учётные данные (новая ВМ: ключи уже в OpenBao); таймеры — только после восстановления,
     # иначе копия каталога писем, снятая после потери данных, станет последней.
     - name: Backup tools

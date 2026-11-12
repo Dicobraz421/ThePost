@@ -1,5 +1,5 @@
-# Резервное копирование эталона SMB (DEP-15): pgBackRest + restic/rsync по таймерам systemd. Роль выполняется после
-# ролей openbao, postgresql и thepost (smb.yml). Повторный прогон ничего не меняет.
+# Резервное копирование эталона SMB (DEP-15): pgBackRest + restic/rsync по таймерам systemd, снимок OpenBao (DEP-23).
+# Роль выполняется после ролей openbao, postgresql и thepost (smb.yml). Повторный прогон ничего не меняет.
 ---
 - name: Check backup parameters
   ansible.builtin.assert:
@@ -47,7 +47,10 @@
        + ([{'path': thepost_backup_repo_path, 'owner': 'postgres', 'mode': '0750'}] if thepost_backup_repo == 'posix' else [])
        + ([{'path': '/var/cache/restic', 'owner': 'root', 'mode': '0700'}] if thepost_backup_blob_tool == 'restic' else [])
        + ([{'path': thepost_backup_rsync_dest, 'owner': 'root', 'mode': '0700'}]
-          if thepost_backup_blob_tool == 'rsync' and ':' not in thepost_backup_rsync_dest else []) }}
+          if thepost_backup_blob_tool == 'rsync' and ':' not in thepost_backup_rsync_dest else [])
+       + ([{'path': thepost_backup_openbao_rsync_dest, 'owner': 'root', 'mode': '0700'}]
+          if thepost_backup_openbao and thepost_backup_blob_tool == 'rsync'
+             and ':' not in thepost_backup_openbao_rsync_dest else []) }}
   loop_control:
     label: "{{ item.path }}"
 
@@ -93,7 +96,9 @@
     owner: root
     group: root
     mode: "0755"
-  loop: "{{ ['thepost-pgbackrest'] + (['thepost-restic'] if thepost_backup_blob_tool == 'restic' else []) }}"
+  loop: >-
+    {{ ['thepost-pgbackrest'] + (['thepost-restic'] if thepost_backup_blob_tool == 'restic' else [])
+       + (['thepost-openbao-snapshot'] if thepost_backup_openbao else []) }}
 
 - name: Apply PostgreSQL restart
   ansible.builtin.meta: flush_handlers
@@ -135,7 +140,9 @@
     owner: root
     group: root
     mode: "0644"
-  loop: [thepost-backup@.service, thepost-backup-blob.service]
+  loop: >-
+    {{ ['thepost-backup@.service', 'thepost-backup-blob.service']
+       + (['thepost-backup-openbao.service'] if thepost_backup_openbao else []) }}
 
 - name: Install backup timers
   ansible.builtin.template:
@@ -165,6 +172,14 @@
     state: stopped
     enabled: false
   when: thepost_backup_blob_schedule | length == 0
+  failed_when: false
+
+- name: Disable OpenBao snapshot timer without schedule
+  ansible.builtin.systemd_service:
+    name: thepost-backup-openbao.timer
+    state: stopped
+    enabled: false
+  when: not thepost_backup_openbao or thepost_backup_openbao_schedule | length == 0
   failed_when: false
 
 # Без полной копии PITR недоступен до первого таймера; копия BLOB идёт следом (Wants= юнита).

@@ -4990,11 +4990,21 @@ dependencies = [
 name = "tp-dav"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "base64 0.23.1",
  "calcard",
+ "futures",
+ "insta",
+ "mail-builder 1.0.0",
+ "mail-parser 0.11.9",
  "quick-xml 0.42.0",
  "schemars",
+ "serde",
  "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tower",
  "tp-contracts",
  "tp-platform",
  "tp-testkit",
@@ -5038,6 +5048,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "calcard",
  "cms",
  "futures",
  "insta",
@@ -5052,7 +5063,9 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tp-contracts",
+ "tp-dav",
  "tp-mailstore",
+ "tp-sieve",
  "tp-testkit",
  "tracing",
  "x509-cert",
@@ -5165,11 +5178,23 @@ dependencies = [
 name = "tp-sieve"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "futures",
+ "insta",
+ "mail-builder 1.0.0",
  "mail-parser 0.11.9",
+ "proptest",
  "schemars",
+ "serde",
  "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-util",
  "tp-contracts",
+ "tp-platform",
  "tp-testkit",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,4085 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "The Post Admin API",
+    "description": "",
+    "license": {
+      "name": "LicenseRef-Proprietary",
+      "identifier": "LicenseRef-Proprietary"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/orgs/{org}": {
+      "get": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Организация и её политика.",
+        "operationId": "get_org",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Organization"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Учётные записи. С `login` — поиск: список из одной записи или пустой. Без `login` — страница по возрастанию\nимени входа (фильтр `prefix`); есть продолжение — заголовок `Link: <…&after=…>; rel=\"next\"` (RFC 8288), нет\nзаголовка — страница последняя. `login` вместе с параметрами списка — 400.",
+        "operationId": "list_accounts",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "login",
+            "in": "path",
+            "description": "Имя входа (без учёта регистра): поиск одной записи; несовместимо с `prefix`, `after`, `limit`.",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "prefix",
+            "in": "path",
+            "description": "Список: имя входа начинается с префикса (без учёта регистра).",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "after",
+            "in": "path",
+            "description": "Список: продолжение после этого имени входа — `after` из ссылки `rel=\"next\"` предыдущей страницы.",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "path",
+            "description": "Список: размер страницы (по умолчанию и наибольший — `admin.page_size`, `admin.max_page_size`).",
+            "required": true,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "headers": {
+              "Link": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Следующая страница списка: `<ссылка>; rel=\"next\"`; нет — страница последняя"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccountInfo"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Создаёт локальную учётную запись (без каталога) в принятом домене организации. Имя занято — 409; домен адреса\nне принят организацией — 400; настройки транспорта не подключены — 503. Пароль — пароль приложения\n(`POST .../app-passwords`).",
+        "operationId": "create_account",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewAccount"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Учётная запись: квота и политики ящика.",
+        "operationId": "get_account",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/app-passwords": {
+      "get": {
+        "tags": [
+          "app-passwords"
+        ],
+        "summary": "Пароли приложений учётной записи, включая отозванные.",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AppPasswordInfo"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "app-passwords"
+        ],
+        "summary": "Выпускает пароль; значение — только в этом ответе.",
+        "operationId": "issue",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewAppPassword"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedAppPassword"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "предел действующих паролей",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/app-passwords/{id}": {
+      "delete": {
+        "tags": [
+          "app-passwords"
+        ],
+        "summary": "Отзывает пароль; повторный отзыв — не ошибка.",
+        "operationId": "revoke",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Идентификатор пароля",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/policy": {
+      "put": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Задаёт политику ящика (локальные атрибуты: квота, срок корзины, лимиты) целиком.",
+        "operationId": "put_account_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/trash": {
+      "get": {
+        "tags": [
+          "trash"
+        ],
+        "summary": "Корзина ящика и действующий срок корзины.",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "path",
+            "description": "Смещение от начала списка.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "path",
+            "description": "Размер страницы (по умолчанию и наибольший — из конфигурации).",
+            "required": true,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrashPage"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/trash-purge": {
+      "get": {
+        "tags": [
+          "trash"
+        ],
+        "summary": "Настройка `trash.purge` ящика: правило администратора, выбор пользователя, действующее значение.",
+        "operationId": "trash_purge",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrashPurgeInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/trash/hidden": {
+      "get": {
+        "tags": [
+          "trash"
+        ],
+        "summary": "Скрытые письма ящика («очистить корзину» с `hide`): пользователь их не видит, хранятся до конца срока корзины.",
+        "operationId": "list_hidden",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "path",
+            "description": "Смещение от начала списка.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "path",
+            "description": "Размер страницы (по умолчанию и наибольший — из конфигурации).",
+            "required": true,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrashPage"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore": {
+      "post": {
+        "tags": [
+          "trash"
+        ],
+        "summary": "Восстанавливает скрытое (или видимое) письмо корзины в исходную папку (нет — во «Входящие»);\nписьма нет в корзине — 404.",
+        "operationId": "restore_hidden",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "message",
+            "in": "path",
+            "description": "Письмо (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestoredMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore": {
+      "post": {
+        "tags": [
+          "trash"
+        ],
+        "summary": "Восстанавливает письмо из корзины; письмо не в корзине — 400.",
+        "operationId": "restore",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "message",
+            "in": "path",
+            "description": "Письмо (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestoredMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/audit": {
+      "get": {
+        "tags": [
+          "audit"
+        ],
+        "summary": "Журнал аудита организации.",
+        "operationId": "search",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "path",
+            "description": "Начало интервала (RFC 3339), включительно.",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "path",
+            "description": "Конец интервала (RFC 3339), не включительно.",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "path",
+            "description": "Размер страницы (по умолчанию и наибольший — из конфигурации).",
+            "required": true,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "after",
+            "in": "path",
+            "description": "Продолжение: `next` предыдущей страницы.",
+            "required": true,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/delivery": {
+      "get": {
+        "tags": [
+          "delivery"
+        ],
+        "summary": "Поиск в журнале доставки организации.",
+        "operationId": "search",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sender",
+            "in": "path",
+            "description": "Отправитель конверта (точно, без учёта регистра ASCII).",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "recipient",
+            "in": "path",
+            "description": "Один из получателей (точно, без учёта регистра ASCII).",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "message_id",
+            "in": "path",
+            "description": "Message-ID без угловых скобок (точно).",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "since",
+            "in": "path",
+            "description": "Начало интервала (RFC 3339), включительно.",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "path",
+            "description": "Конец интервала (RFC 3339), не включительно.",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "path",
+            "description": "Размер страницы (по умолчанию и наибольший — из конфигурации).",
+            "required": true,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "after",
+            "in": "path",
+            "description": "Продолжение: `next` предыдущей страницы с теми же условиями.",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryResults"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/domains": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Домены организации.",
+        "operationId": "list_domains",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DomainInfo"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Создаёт домен.",
+        "operationId": "create_domain",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewDomain"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/domains/{domain}": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Домен и его политика.",
+        "operationId": "get_domain",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Домен (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Удаляет домен без учётных записей.",
+        "operationId": "delete_domain",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Домен (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/domains/{domain}/policy": {
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Задаёт политику домена целиком.",
+        "operationId": "put_domain_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Домен (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/groups": {
+      "get": {
+        "tags": [
+          "groups"
+        ],
+        "summary": "Группы организации.",
+        "operationId": "list_groups",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GroupInfo"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "groups"
+        ],
+        "summary": "Создаёт группу (не из каталога).",
+        "operationId": "create_group",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewGroup"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/groups/{group}": {
+      "get": {
+        "tags": [
+          "groups"
+        ],
+        "summary": "Группа.",
+        "operationId": "get_group",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "path",
+            "description": "Группа (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "groups"
+        ],
+        "summary": "Удаляет группу (не из каталога); письма её очереди модерации отклоняются с уведомлением.",
+        "operationId": "delete_group",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "path",
+            "description": "Группа (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "groups"
+        ],
+        "summary": "Изменяет группу: ограничения, модераторы, скрытие; имя, адрес и участники — только у групп не из каталога.",
+        "operationId": "patch_group",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "path",
+            "description": "Группа (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GroupPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/moderation": {
+      "get": {
+        "tags": [
+          "groups"
+        ],
+        "summary": "Очередь модерации организации или группы.",
+        "operationId": "list_held",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "path",
+            "description": "Только письма группы (UUID).",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "path",
+            "description": "Размер (по умолчанию и наибольший — из конфигурации).",
+            "required": true,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/HeldInfo"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/moderation/{held}/approve": {
+      "post": {
+        "tags": [
+          "groups"
+        ],
+        "summary": "Одобряет письмо: доставка участникам группы.",
+        "operationId": "approve",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "held",
+            "in": "path",
+            "description": "Письмо (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/moderation/{held}/reject": {
+      "post": {
+        "tags": [
+          "groups"
+        ],
+        "summary": "Отклоняет письмо: уведомление отправителю с причиной.",
+        "operationId": "reject",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "held",
+            "in": "path",
+            "description": "Письмо (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Rejection"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {},
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/policy": {
+      "put": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Задаёт политику организации целиком.",
+        "operationId": "put_org_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/transport/domains": {
+      "get": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Принятые домены организации и версия снимка кластера.",
+        "operationId": "list_domains",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainList"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Добавляет принятый домен (идентификатор выдаёт сервер). Имя занято — 409.",
+        "operationId": "create_domain",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DomainBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainWritten"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "устаревшая версия или имя занято",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/transport/domains/{id}": {
+      "put": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Заменяет имя и вид принятого домена организации. Нет — 404, имя занято — 409.",
+        "operationId": "replace_domain",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Домен (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DomainBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainWritten"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "устаревшая версия или имя занято",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Удаляет принятый домен организации. Нет — 404.",
+        "operationId": "delete_domain",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Домен (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "description": "Версия снимка из последнего чтения.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Written"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "устаревшая версия",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/transport/routes": {
+      "get": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Политики доменов назначения организации и версия её снимка.",
+        "operationId": "list_routes",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteList"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/transport/routes/{pattern}": {
+      "put": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Создаёт или заменяет политику домена назначения.",
+        "operationId": "put_route",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pattern",
+            "in": "path",
+            "description": "`example.org`, `*.example.org` (поддомены) или `*` (все внешние)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RouteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Written"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "устаревшая версия",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Удаляет политику домена назначения. Нет — 404.",
+        "operationId": "delete_route",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pattern",
+            "in": "path",
+            "description": "Шаблон",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "description": "Версия снимка из последнего чтения.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Written"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "устаревшая версия",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/transport/sources": {
+      "get": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Доверенные источники организации и версия снимка кластера.",
+        "operationId": "list_sources",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceList"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/transport/sources/{name}": {
+      "put": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Создаёт или заменяет доверенный источник организации. Имя занято другим владельцем — 409.",
+        "operationId": "put_org_source",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Имя источника ([a-z0-9._-], до 64 символов)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Written"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "устаревшая версия или имя занято",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Удаляет доверенный источник организации. Нет — 404.",
+        "operationId": "delete_org_source",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Имя источника",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "description": "Версия снимка из последнего чтения.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Written"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "устаревшая версия",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится\nпервой проверкой; повтор, срок, отзыв — 401.",
+        "operationId": "exchange",
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminSession"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transport": {
+      "get": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Снимок уровня кластера: домены всех организаций, все источники.",
+        "operationId": "cluster",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterView"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transport/sources/{name}": {
+      "put": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Создаёт или заменяет источник кластера (общий шлюз; источник приложения — только у организации, 400).",
+        "operationId": "put_cluster_source",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Имя источника ([a-z0-9._-], до 64 символов)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Written"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "устаревшая версия или имя занято",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "transport"
+        ],
+        "summary": "Удаляет источник кластера. Нет — 404.",
+        "operationId": "delete_cluster_source",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Имя источника",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "description": "Версия снимка из последнего чтения.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Written"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "устаревшая версия",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/whoami": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Текущий администратор и его роли.",
+        "operationId": "whoami",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhoAmI"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccountInfo": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Policies",
+            "description": "Политики ящика."
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "domain",
+              "login",
+              "display_name",
+              "enabled",
+              "quota"
+            ],
+            "properties": {
+              "display_name": {
+                "type": "string",
+                "description": "Отображаемое имя."
+              },
+              "domain": {
+                "type": "string",
+                "description": "Основной домен."
+              },
+              "enabled": {
+                "type": "boolean",
+                "description": "Вход разрешён."
+              },
+              "external_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Идентификатор в каталоге; `null` — локальная запись."
+              },
+              "id": {
+                "type": "string",
+                "description": "Идентификатор."
+              },
+              "login": {
+                "type": "string",
+                "description": "Имя входа."
+              },
+              "quota": {
+                "$ref": "#/components/schemas/QuotaInfo",
+                "description": "Квота."
+              }
+            }
+          }
+        ],
+        "description": "Учётная запись."
+      },
+      "AdminRole": {
+        "type": "string",
+        "description": "Роль администратора.",
+        "enum": [
+          "installation_admin",
+          "organization_admin",
+          "operator",
+          "auditor"
+        ]
+      },
+      "AdminSession": {
+        "type": "object",
+        "description": "Сессия Admin API: значение показывается один раз.",
+        "required": [
+          "session",
+          "expires_at",
+          "tenant",
+          "account",
+          "login",
+          "roles"
+        ],
+        "properties": {
+          "account": {
+            "type": "string",
+            "description": "Учётная запись."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Действует до."
+          },
+          "login": {
+            "type": "string",
+            "description": "Имя входа."
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminRole"
+            },
+            "description": "Роли сессии."
+          },
+          "session": {
+            "type": "string",
+            "description": "Значение для `Authorization: Bearer` (`tps_…`)."
+          },
+          "tenant": {
+            "type": "string",
+            "description": "Организация."
+          }
+        }
+      },
+      "AppPasswordInfo": {
+        "type": "object",
+        "description": "Пароль приложения (без значения).",
+        "required": [
+          "id",
+          "label",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Выпущен."
+          },
+          "id": {
+            "type": "string",
+            "description": "Идентификатор (для отзыва)."
+          },
+          "label": {
+            "type": "string",
+            "description": "Подпись."
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Отозван; `null` — действует."
+          }
+        }
+      },
+      "AuditEntry": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AuditRecord",
+            "description": "Запись."
+          },
+          {
+            "type": "object",
+            "required": [
+              "seq"
+            ],
+            "properties": {
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Номер записи (возрастает в порядке добавления).",
+                "minimum": 0
+              }
+            }
+          }
+        ],
+        "description": "Запись журнала с порядковым номером."
+      },
+      "AuditPage": {
+        "type": "object",
+        "description": "Страница журнала аудита.",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuditEntry"
+            },
+            "description": "Записи по возрастанию `seq`."
+          },
+          "next": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`after` следующей страницы; `null` — записей больше нет.",
+            "minimum": 0
+          }
+        }
+      },
+      "AuditRecord": {
+        "type": "object",
+        "description": "Запись журнала аудита.",
+        "required": [
+          "at",
+          "actor_tenant",
+          "actor",
+          "actor_login",
+          "roles",
+          "method",
+          "route",
+          "path",
+          "status"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string",
+            "description": "Учётная запись администратора."
+          },
+          "actor_login": {
+            "type": "string",
+            "description": "Имя входа администратора."
+          },
+          "actor_tenant": {
+            "type": "string",
+            "description": "Организация администратора."
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Момент (UTC)."
+          },
+          "method": {
+            "type": "string",
+            "description": "Метод HTTP."
+          },
+          "path": {
+            "type": "string",
+            "description": "Путь запроса."
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminRole"
+            },
+            "description": "Роли администратора на момент операции; пусто — ролей нет (отказ)."
+          },
+          "route": {
+            "type": "string",
+            "description": "Шаблон маршрута (`/api/v1/orgs/{org}/domains`); неизвестный маршрут — путь."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Код ответа.",
+            "minimum": 0
+          },
+          "tenant": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Организация, к которой относится операция; `None` — уровень инсталляции."
+          }
+        }
+      },
+      "ClusterView": {
+        "type": "object",
+        "description": "Снимок уровня кластера.",
+        "required": [
+          "version",
+          "domains",
+          "sources"
+        ],
+        "properties": {
+          "domains": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Принятые домены всех организаций."
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Доверенные источники кластера и организаций."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Версия снимка.",
+            "minimum": 0
+          }
+        }
+      },
+      "DeliveryEntry": {
+        "type": "object",
+        "description": "Событие журнала доставки.",
+        "required": [
+          "at",
+          "node",
+          "kind",
+          "sender",
+          "recipients",
+          "decision"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Момент события."
+          },
+          "decision": {
+            "type": "string",
+            "description": "Решение: `accept`, `reject`, `defer`, `quarantine`, `discard`, `hold`."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Событие: `receive`, `reject`, `deliver`, `relay`, `dsn`."
+          },
+          "message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Message-ID."
+          },
+          "node": {
+            "type": "string",
+            "description": "Узел."
+          },
+          "queue_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Запись очереди исходящей почты."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Причина решения."
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Получатели события."
+          },
+          "sender": {
+            "type": "string",
+            "description": "Отправитель конверта; пустой — уведомление о недоставке."
+          }
+        }
+      },
+      "DeliveryResults": {
+        "type": "object",
+        "description": "Страница результатов.",
+        "required": [
+          "events"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeliveryEntry"
+            },
+            "description": "События по возрастанию времени."
+          },
+          "next": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`after` следующей страницы; `null` — записей больше нет."
+          }
+        }
+      },
+      "DomainBody": {
+        "type": "object",
+        "description": "Принятый домен: создание или замена.",
+        "required": [
+          "version",
+          "name"
+        ],
+        "properties": {
+          "kind": {
+            "type": "object",
+            "description": "Вид: `\"authoritative\"` (по умолчанию) или `{\"internal_relay\": {\"next_hop\": \"host[:port]\"}}`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Имя домена (приводится к канонической форме: нижний регистр, без точки в конце, IDN — A-label)."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Версия снимка кластера.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "DomainDetails": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DomainInfo",
+            "description": "Домен."
+          },
+          {
+            "$ref": "#/components/schemas/Policies",
+            "description": "Политики."
+          }
+        ],
+        "description": "Домен с политиками."
+      },
+      "DomainInfo": {
+        "type": "object",
+        "description": "Домен.",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Идентификатор."
+          },
+          "name": {
+            "type": "string",
+            "description": "Имя."
+          }
+        }
+      },
+      "DomainList": {
+        "type": "object",
+        "description": "Принятые домены организации.",
+        "required": [
+          "version",
+          "domains"
+        ],
+        "properties": {
+          "domains": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Домены по имени: `{id, tenant, name, kind}`, `kind` — `\"authoritative\"` или\n`{\"internal_relay\": {\"next_hop\": \"host[:port]\"}}`."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Версия снимка кластера.",
+            "minimum": 0
+          }
+        }
+      },
+      "DomainWritten": {
+        "type": "object",
+        "description": "Записанный домен.",
+        "required": [
+          "version",
+          "domain"
+        ],
+        "properties": {
+          "domain": {
+            "type": "object",
+            "description": "Домен."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Новая версия снимка кластера.",
+            "minimum": 0
+          }
+        }
+      },
+      "GroupInfo": {
+        "type": "object",
+        "description": "Группа рассылки.",
+        "required": [
+          "id",
+          "name",
+          "members",
+          "senders",
+          "moderators",
+          "hidden_from_gal"
+        ],
+        "properties": {
+          "address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Адрес рассылки; `null` — группа без почты (только вложенная)."
+          },
+          "external_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Идентификатор в каталоге; `null` — группа создана через Admin API."
+          },
+          "hidden_from_gal": {
+            "type": "boolean",
+            "description": "Скрыта из адресной книги."
+          },
+          "id": {
+            "type": "string",
+            "description": "Идентификатор."
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Участники: `{\"account\": UUID}` или `{\"group\": UUID}`."
+          },
+          "moderators": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Модераторы; непусто — письма не от модераторов ждут одобрения."
+          },
+          "name": {
+            "type": "string",
+            "description": "Отображаемое имя."
+          },
+          "senders": {
+            "type": "object",
+            "description": "Кто может писать: `\"anyone\"`, `\"internal\"`, `{\"only\": {\"accounts\": [...], \"groups\": [...]}}`."
+          }
+        }
+      },
+      "GroupPatch": {
+        "type": "object",
+        "description": "Изменение группы: заданные поля заменяются, отсутствующие — без изменений.",
+        "properties": {
+          "address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Адрес рассылки; `null` — снять (не для групп каталога)."
+          },
+          "hidden_from_gal": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Скрыта из адресной книги."
+          },
+          "members": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "object"
+            },
+            "description": "Участники (не для групп каталога)."
+          },
+          "moderators": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Модераторы."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Отображаемое имя (не для групп каталога)."
+          },
+          "senders": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Ограничение отправителей."
+          }
+        },
+        "additionalProperties": false
+      },
+      "HeldInfo": {
+        "type": "object",
+        "description": "Письмо в очереди модерации.",
+        "required": [
+          "id",
+          "source",
+          "moderators",
+          "recipients",
+          "sender",
+          "size",
+          "held_at"
+        ],
+        "properties": {
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Группа-адресат; `null` — письмо задержано правилом потока (CTR-43)."
+          },
+          "held_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Момент постановки в очередь."
+          },
+          "id": {
+            "type": "string",
+            "description": "Идентификатор."
+          },
+          "message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Message-ID."
+          },
+          "moderators": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Модераторы письма: `account:<UUID>` или `group:<UUID>`; пусто — модераторы группы."
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Исходные получатели (для письма правила — кому доставляется одобренное письмо)."
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Имя правила потока (для `flow_rule`)."
+          },
+          "sender": {
+            "type": "string",
+            "description": "Отправитель конверта."
+          },
+          "sender_account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Учётная запись отправителя; `null` — внешний."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Размер, байт.",
+            "minimum": 0
+          },
+          "source": {
+            "type": "string",
+            "description": "Источник задержки: `group` — модерируемая группа, `flow_rule` — правило потока почты."
+          }
+        }
+      },
+      "IssuedAppPassword": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AppPasswordInfo",
+            "description": "Пароль."
+          },
+          {
+            "type": "object",
+            "required": [
+              "password"
+            ],
+            "properties": {
+              "password": {
+                "type": "string",
+                "description": "Значение пароля."
+              }
+            }
+          }
+        ],
+        "description": "Выпущенный пароль: значение показывается один раз."
+      },
+      "NewAccount": {
+        "type": "object",
+        "description": "Новая локальная учётная запись (без каталога).",
+        "required": [
+          "login"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Отображаемое имя; нет — имя входа."
+          },
+          "login": {
+            "type": "string",
+            "description": "Имя входа — адрес в принятом домене организации (приводится к нижнему регистру)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewAppPassword": {
+        "type": "object",
+        "description": "Выпуск пароля.",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Подпись («Телефон», «Thunderbird дома»), до 255 символов."
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewDomain": {
+        "type": "object",
+        "description": "Новый домен.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Имя (A-label; приводится к нижнему регистру)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewGroup": {
+        "type": "object",
+        "description": "Новая группа.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Адрес рассылки."
+          },
+          "hidden_from_gal": {
+            "type": "boolean",
+            "description": "Скрыта из адресной книги."
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Участники."
+          },
+          "moderators": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Модераторы."
+          },
+          "name": {
+            "type": "string",
+            "description": "Отображаемое имя."
+          },
+          "senders": {
+            "type": "object",
+            "description": "Ограничение отправителей (по умолчанию — без ограничений)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "Organization": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Policies",
+            "description": "Политики."
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "default"
+            ],
+            "properties": {
+              "default": {
+                "type": "boolean",
+                "description": "Организация по умолчанию."
+              },
+              "id": {
+                "type": "string",
+                "description": "Идентификатор."
+              }
+            }
+          }
+        ],
+        "description": "Организация."
+      },
+      "Policies": {
+        "type": "object",
+        "description": "Политика уровня и действующая политика.",
+        "required": [
+          "policy",
+          "effective"
+        ],
+        "properties": {
+          "effective": {
+            "$ref": "#/components/schemas/PolicyBody",
+            "description": "Действующее с учётом вышестоящих уровней; `null` — значение по умолчанию конфигурации."
+          },
+          "policy": {
+            "$ref": "#/components/schemas/PolicyBody",
+            "description": "Заданное на этом уровне."
+          }
+        }
+      },
+      "PolicyBody": {
+        "type": "object",
+        "description": "Политика уровня; `null` — не задано на уровне.",
+        "properties": {
+          "dkim_selector": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Селектор ключа DKIM."
+          },
+          "max_recipients": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Лимит получателей одного письма.",
+            "minimum": 0
+          },
+          "milter_profile": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Профиль Milter."
+          },
+          "quota_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Квота ящика, байт.",
+            "minimum": 0
+          },
+          "retention": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Срок хранения писем (политика хранения).",
+            "example": "365d"
+          },
+          "send_per_hour": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Лимит отправки, писем в час.",
+            "minimum": 0
+          },
+          "trash_purge": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TrashPurgeRuleBody",
+                "description": "Правило «очистить корзину» в клиенте (`trash.purge`, решение 2026-11-01-trash-purge)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "trash_retention": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Срок хранения в корзине (`30d`, `12h`).",
+            "example": "30d"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Problem": {
+        "type": "object",
+        "description": "Ошибка (RFC 9457).",
+        "required": [
+          "status",
+          "title"
+        ],
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Подробность (недопустимые данные)."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Код HTTP.",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string",
+            "description": "Краткое описание кода."
+          }
+        }
+      },
+      "PurgeMode": {
+        "type": "string",
+        "description": "Значение `trash.purge`.",
+        "enum": [
+          "hide",
+          "erase"
+        ]
+      },
+      "QuotaInfo": {
+        "type": "object",
+        "description": "Использование квоты.",
+        "required": [
+          "used_bytes",
+          "messages"
+        ],
+        "properties": {
+          "limit_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Лимит; `null` — без ограничения.",
+            "minimum": 0
+          },
+          "messages": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Число писем.",
+            "minimum": 0
+          },
+          "used_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Занято байт, включая корзину.",
+            "minimum": 0
+          }
+        }
+      },
+      "Rejection": {
+        "type": "object",
+        "description": "Отклонение письма.",
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Причина для уведомления отправителя (одна строка, ≤ 500 символов)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "RestoredMessage": {
+        "type": "object",
+        "description": "Восстановленное письмо.",
+        "required": [
+          "message",
+          "uid",
+          "modseq"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Письмо."
+          },
+          "modseq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`ModSeq` изменения.",
+            "minimum": 0
+          },
+          "uid": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Новый UID в папке.",
+            "minimum": 0
+          }
+        }
+      },
+      "RouteBody": {
+        "type": "object",
+        "description": "Политика домена назначения: создание или замена (шаблон — в пути).",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "egress_ip": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Адрес исходящих соединений; нет — адрес узла по умолчанию."
+          },
+          "smart_host": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Промежуточный узел (`host` или `host:port`); нет — доставка по MX."
+          },
+          "tls": {
+            "type": "object",
+            "description": "TLS: `\"opportunistic\"` (по умолчанию), `\"required\"` или `{\"pinned\": {\"spki_sha256\": [\"<hex>\"]}}`."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Версия снимка организации.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "RouteList": {
+        "type": "object",
+        "description": "Политики доменов назначения организации.",
+        "required": [
+          "version",
+          "routes"
+        ],
+        "properties": {
+          "routes": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Политики по шаблону: `{pattern, tls, smart_host, egress_ip}`."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Версия снимка организации.",
+            "minimum": 0
+          }
+        }
+      },
+      "SourceBody": {
+        "type": "object",
+        "description": "Доверенный источник: создание или замена (имя — в пути).",
+        "required": [
+          "version",
+          "matcher",
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "object",
+            "description": "Вид: `{\"gateway\": {\"xclient\": true, \"authserv_id\": \"mx.example.org\"}}` или\n`{\"application\": {\"senders\": [\"@example.org\"], \"external\": false}}` (только у источника организации)."
+          },
+          "matcher": {
+            "type": "object",
+            "description": "Признаки соединения: `{\"networks\": [\"192.0.2.0/24\"]}` или `{\"client_cert\": {\"subject\": \"mx.example.org\"}}`."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Версия снимка кластера.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "SourceList": {
+        "type": "object",
+        "description": "Доверенные источники.",
+        "required": [
+          "version",
+          "sources"
+        ],
+        "properties": {
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Источники по имени: `{name, tenant, matcher, kind}`."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Версия снимка кластера.",
+            "minimum": 0
+          }
+        }
+      },
+      "TrashEntry": {
+        "type": "object",
+        "description": "Элемент корзины.",
+        "required": [
+          "message",
+          "origin",
+          "size",
+          "received_at",
+          "deleted_at",
+          "expires_at"
+        ],
+        "properties": {
+          "deleted_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Момент удаления в корзину."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Окончательное удаление не раньше этого момента."
+          },
+          "message": {
+            "type": "string",
+            "description": "Письмо (идентификатор сохраняется при восстановлении)."
+          },
+          "origin": {
+            "type": "string",
+            "description": "Исходная папка."
+          },
+          "received_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Момент приёма письма."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Размер, байт.",
+            "minimum": 0
+          }
+        }
+      },
+      "TrashPage": {
+        "type": "object",
+        "description": "Страница корзины.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrashEntry"
+            },
+            "description": "Элементы, новые первыми."
+          },
+          "next_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Смещение следующей страницы; `null` — страница последняя.",
+            "minimum": 0
+          },
+          "trash_retention": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Действующий срок корзины ящика; `null` — значение по умолчанию конфигурации.",
+            "example": "30d"
+          }
+        }
+      },
+      "TrashPurgeInfo": {
+        "type": "object",
+        "description": "Настройка `trash.purge` ящика.",
+        "required": [
+          "rule",
+          "effective"
+        ],
+        "properties": {
+          "effective": {
+            "$ref": "#/components/schemas/PurgeMode",
+            "description": "Действующее значение."
+          },
+          "rule": {
+            "$ref": "#/components/schemas/TrashPurgeRuleBody",
+            "description": "Действующее правило администратора (цепочка организация → домен → ящик; не задано — `hide` без выбора)."
+          },
+          "user": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PurgeMode",
+                "description": "Выбор пользователя; `null` — не выбран. Хранится и без `user_can_choose`, но тогда не действует."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "TrashPurgeRuleBody": {
+        "type": "object",
+        "description": "Правило администратора `trash.purge`.",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/PurgeMode",
+            "description": "Значение администратора."
+          },
+          "user_can_choose": {
+            "type": "boolean",
+            "description": "Пользователь может выбрать своё значение; иначе действует `mode`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "WhoAmI": {
+        "type": "object",
+        "description": "Текущий администратор.",
+        "required": [
+          "tenant",
+          "account",
+          "login",
+          "roles"
+        ],
+        "properties": {
+          "account": {
+            "type": "string",
+            "description": "Учётная запись."
+          },
+          "login": {
+            "type": "string",
+            "description": "Имя входа."
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminRole"
+            },
+            "description": "Роли."
+          },
+          "tenant": {
+            "type": "string",
+            "description": "Организация."
+          }
+        }
+      },
+      "Written": {
+        "type": "object",
+        "description": "Новая версия снимка после записи.",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Версия снимка (кластера — домены и источники; организации — политики).",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    }
+  ]
+}

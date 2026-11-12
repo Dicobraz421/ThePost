@@ -19,8 +19,9 @@ Environment=AWS_SHARED_CREDENTIALS_FILE=/run/credentials/%n/restic.aws
 Environment=RESTIC_REPOSITORY={{ thepost_backup_restic_repo }}
 Environment=RESTIC_PASSWORD_FILE=/run/credentials/%n/restic.password
 Environment=RESTIC_CACHE_DIR=/var/cache/restic
-ExecStart=/usr/bin/restic {{ thepost_backup_restic_opts }} backup --quiet --tag thepost-blob {{ thepost_backup_blob_dir }}
-ExecStart=/usr/bin/restic {{ thepost_backup_restic_opts }} forget --quiet --tag thepost-blob --keep-last 1 --keep-within {{ thepost_backup_restic_keep_within }} --prune
+# Репозиторий общий со снимком OpenBao (thepost-backup-openbao.service): forget/prune — под общей блокировкой.
+ExecStart=/usr/bin/flock -w 3600 /run/lock/thepost-restic.lock /usr/bin/restic {{ thepost_backup_restic_opts }} backup --quiet --tag thepost-blob {{ thepost_backup_blob_dir }}
+ExecStart=/usr/bin/flock -w 3600 /run/lock/thepost-restic.lock /usr/bin/restic {{ thepost_backup_restic_opts }} forget --quiet --tag thepost-blob --keep-last 1 --keep-within {{ thepost_backup_restic_keep_within }} --prune
 {% else %}
 ExecStart=/usr/bin/rsync -a --numeric-ids{{ ' --delete' if thepost_backup_rsync_delete else '' }} -e "ssh -o BatchMode=yes" {{ thepost_backup_blob_dir }}/ {{ thepost_backup_rsync_dest }}/
 {% endif %}

@@ -57,6 +57,10 @@ paths = ["crates/tp-admin/*"]
 [lane.app]
 paths = ["crates/thepost/*"]
 
+[lane.console]
+# Веб-консоль (SRS 5.2, CI-06): Refine, сборка console/dist вшивается в бинарный файл.
+paths = ["console/*"]
+
 [lane.deploy]
 paths = ["deploy/*"]
 

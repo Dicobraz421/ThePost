@@ -1,0 +1,33 @@
+# Цели fuzz разборщика и исполнителя Sieve (SIEVE-07), в каталоге crates/tp-sieve:
+#   cargo +nightly fuzz run <цель> fuzz/corpus/<цель> -- -max_total_time=600
+# Цели: parse — текст скрипта (лексер, грамматика, проверка); run — скрипт и письмо через байт NUL (выполнение
+# и слияние действий). Проверки — tp_sieve::fuzz; новые входы — в fuzz/corpus/<цель> (не в git).
+# Отдельный workspace: в сборку и Cargo.lock основного workspace не входит.
+[package]
+name = "tp-sieve-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tp-sieve = { path = ".." }
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "run"
+path = "fuzz_targets/run.rs"
+test = false
+doc = false
+bench = false
