@@ -14,6 +14,7 @@ pub mod app_passwords;
 pub mod audit_log;
 pub mod blob_index;
 mod busy;
+mod card_search;
 pub mod changelog;
 pub mod commits;
 pub mod credentials;
