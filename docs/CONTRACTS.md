@@ -549,7 +549,9 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 `before_final_delete` вне транзакции: `Allow` — стереть (как `expunge_final`), `Deny` (Legal Hold) или ошибка хука — скрыть;
 прочие письма — пропуск. Скрытое письмо не видно пользователю: нет в `MessageStore::get`/`list` и операциях над письмами,
 в счётчиках папки, в квоте (`Quota`, `AccountStore::quota`); `ChangeLog` — удалено из корзины, событие ядра — `Trashed`.
-Администратор: `list_hidden(scope, offset, limit)`, `restore` (видимые и скрытые; исходная папка или «Входящие», прежний `MessageId`;
+Администратор: `list_hidden(scope, offset, limit)`, `hidden_message(scope, id) -> Option<Message>` (скрытое письмо — метаданные как у
+`MessageStore::get`, тема/отправитель/дата — в `meta.envelope`; скрытие не снимается; нет или не скрыто — `None`; аудит — у вызывающего),
+`restore` (видимые и скрытые; исходная папка или «Входящие», прежний `MessageId`;
 протоколы и Admin API — через `MailStore::restore`, с уведомлением клиентов);
 `list` — только видимые. Срок корзины для скрытых — как для остальных (`expired` → хук → `expunge_final`).
 Настройка: `Policy::trash_purge: Option<TrashPurgeRule { mode, user_can_choose }>` (администратор, уровни цепочки; не задано —
@@ -864,3 +866,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   по цепочке организация → домен → ящик, `Policy::DEFAULT_RCPTS_PER_HOUR` = 2000, `rcpts_per_hour_or_default()`; потребитель — SMTP
   (SMTP-43). Хранение — столбец `policies.rcpts_per_hour` (миграция 0026), Admin API — поле `rcpts_per_hour` политики уровня. Код,
   собирающий `Policy` перечислением всех полей, дополняется `rcpts_per_hour`.
+- 2026-11-12 — MS-19 (волна mailstore-12, класс B): `TrashStore::hidden_message(scope, id) -> Option<Message>` — метаданные скрытого
+  письма для администратора без снятия скрытия (без реализации по умолчанию; `MemTrash`, `PgMeta`); набор `suite::trash_purge` проверяет
+  его. Потребитель — `tp_mailstore::Store::hidden_headers` (тема, отправитель, дата из `Message::meta.envelope`, без чтения BLOB).
