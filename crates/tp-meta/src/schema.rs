@@ -6,8 +6,10 @@
 use std::borrow::Cow;
 
 use sqlx::migrate::{MigrateError, Migration, MigrationType, Migrator};
-use sqlx::{AssertSqlSafe, PgPool, Postgres, SqlSafeStr, Transaction};
+use sqlx::{AssertSqlSafe, Postgres, SqlSafeStr, Transaction};
 use tp_contracts::{Error, Result, TenantId};
+
+use crate::pool::DbPool;
 
 /// Миграции ядра: (версия, описание, SQL). Версии только добавляются; применённые не меняются.
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -114,8 +116,13 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
     ),
     (
         26,
+        "rcpts per hour",
+        include_str!("../migrations/0026_rcpts_per_hour.sql"),
+    ),
+    (
+        27,
         "submissions mailbox audit",
-        include_str!("../migrations/0026_submissions_mailbox_audit.sql"),
+        include_str!("../migrations/0027_submissions_mailbox_audit.sql"),
     ),
 ];
 
@@ -145,19 +152,24 @@ pub fn migrator_until(version: i64) -> Migrator {
 }
 
 /// Применяет недостающие миграции ядра.
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    migrator().run(pool).await.map_err(|e| match e {
-        MigrateError::Execute(e) | MigrateError::ExecuteMigration(e, _) => db_err(e),
-        e => {
-            tracing::error!(error = %e, "миграция схемы");
-            Error::internal(e.to_string())
-        }
-    })
+/// Соединение — из пула `pool` через его наблюдателя.
+pub async fn migrate(pool: &DbPool) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    migrator()
+        .run_direct(None, &mut *conn, false)
+        .await
+        .map_err(|e| match e {
+            MigrateError::Execute(e) | MigrateError::ExecuteMigration(e, _) => db_err(e),
+            e => {
+                tracing::error!(error = %e, "миграция схемы");
+                Error::internal(e.to_string())
+            }
+        })
 }
 
 /// Транзакция в контексте организации: `app.tenant_id` (SET LOCAL) — RLS видит только её строки.
-pub async fn begin(pool: &PgPool, tenant: TenantId) -> Result<Transaction<'static, Postgres>> {
-    let mut tx = pool.begin().await.map_err(db_err)?;
+pub async fn begin(pool: &DbPool, tenant: TenantId) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = pool.begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(tenant.to_string())
         .execute(&mut *tx)
@@ -167,8 +179,8 @@ pub async fn begin(pool: &PgPool, tenant: TenantId) -> Result<Transaction<'stati
 }
 
 /// Системная транзакция по всем организациям (GC BLOB, журнал событий): `app.all_tenants` (SET LOCAL).
-pub async fn begin_system(pool: &PgPool) -> Result<Transaction<'static, Postgres>> {
-    let mut tx = pool.begin().await.map_err(db_err)?;
+pub async fn begin_system(pool: &DbPool) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = pool.begin().await?;
     sqlx::query("SELECT set_config('app.all_tenants', 'on', true)")
         .execute(&mut *tx)
         .await
@@ -208,8 +220,8 @@ pub fn db_err(e: sqlx::Error) -> Error {
                 Error::internal(e.to_string())
             }
         },
+        sqlx::Error::Tls(t) => tls_err(t.as_ref()),
         sqlx::Error::Io(_)
-        | sqlx::Error::Tls(_)
         | sqlx::Error::PoolTimedOut
         | sqlx::Error::PoolClosed
         | sqlx::Error::WorkerCrashed
@@ -219,6 +231,23 @@ pub fn db_err(e: sqlx::Error) -> Error {
             Error::internal(e.to_string())
         }
     }
+}
+
+/// Ошибка TLS канала до СУБД (META-56): причина — в журнал (значения ключа в ней нет). Ключ клиентского
+/// сертификата не подходит к сертификату — `Invalid` с понятным текстом: rustls сверяет открытый ключ сертификата
+/// с закрытым при сборке параметров TLS (`CertifiedKey::from_der`, текст «keys may not be consistent:
+/// KeyMismatch»), до обмена с сервером. Остальное — `Unavailable` (повтор после исправления поможет).
+fn tls_err(e: &(dyn std::error::Error + Send + Sync)) -> Error {
+    let text = e.to_string();
+    if text.contains("KeyMismatch") {
+        tracing::error!(error = %text, "СУБД: ключ клиентского сертификата не подходит к сертификату");
+        return Error::invalid(
+            "database.tls: ключ клиентского сертификата (tls.key или tls.key_file) не подходит к сертификату \
+             tls.cert_file",
+        );
+    }
+    tracing::warn!(error = %text, "СУБД: ошибка TLS канала");
+    Error::UNAVAILABLE
 }
 
 /// Значение столбца `bigint` → `u32` (UID, UIDVALIDITY, поколение).

@@ -65,16 +65,17 @@ impl std::fmt::Debug for OrphanProbe {
 }
 
 /// Число шардов в справочнике `shards`; `None` — справочника нет (схема ещё не создана).
-pub async fn shard_count(pool: &sqlx::PgPool) -> Result<Option<i64>> {
+pub async fn shard_count(pool: &tp_meta::pool::DbPool) -> Result<Option<i64>> {
+    let mut conn = pool.acquire().await?;
     let exists: bool = sqlx::query_scalar("SELECT to_regclass('shards') IS NOT NULL")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(tp_meta::schema::db_err)?;
     if !exists {
         return Ok(None);
     }
     sqlx::query_scalar("SELECT count(*) FROM shards")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map(Some)
         .map_err(tp_meta::schema::db_err)
@@ -837,7 +838,7 @@ mod tests {
         };
         let url = crate::testutil::dev_url(&url);
         let (db_name, url_db) = crate::testutil::create_database(&url).await;
-        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        let pool = crate::testutil::db_pool(&url_db).await;
         tp_meta::schema::migrate(&pool).await.expect("migrate");
         let ttl = Duration::from_secs(2);
         let mut cfg = tp_meta::MetaConfig::default();

@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgConnection;
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::config::duration;
 use tp_contracts::events::partition_of;
@@ -59,7 +59,7 @@ use crate::doctor::DoctorConfig;
 use crate::events::EventsConfig;
 use crate::failover::Failover;
 use crate::mailbox_audit::MailboxAuditConfig;
-use crate::pool::TxFuture;
+use crate::pool::{DbPool, TxFuture};
 use crate::replica::Replica;
 use crate::retention::RetentionConfig;
 use crate::shards::{ReadIntent, ShardId, ShardResolver};
@@ -211,7 +211,7 @@ pub(crate) struct BoxDb {
     /// Шард.
     pub(crate) shard: ShardId,
     /// Пул шарда (для [`ShardId::MAIN`] — пул основной БД, с повтором над [`Failover`]).
-    pub(crate) pool: PgPool,
+    pub(crate) pool: DbPool,
 }
 
 /// Хранилища метаданных на PostgreSQL.
@@ -247,7 +247,7 @@ pub(crate) struct BoxDb {
 /// вызывающему, а следующая операция идёт к найденному primary.
 #[derive(Debug, Clone)]
 pub struct PgMeta {
-    pool: PgPool,
+    pool: DbPool,
     cfg: Arc<MetaConfig>,
     bus: Signals,
     failover: Option<Failover>,
@@ -259,7 +259,7 @@ pub struct PgMeta {
 
 impl PgMeta {
     /// Хранилища над готовым пулом; схема должна быть применена.
-    pub fn new(pool: PgPool, cfg: MetaConfig) -> Self {
+    pub fn new(pool: DbPool, cfg: MetaConfig) -> Self {
         Self {
             pool,
             cfg: Arc::new(cfg),
@@ -409,7 +409,7 @@ impl PgMeta {
 
     /// Реплика основной БД для [`ReadIntent::Stale`] (`database.read_replica`, [`pool::connect_replica`]) с порогом
     /// отставания `max_lag` (`database.replica_max_lag`).
-    pub fn with_replica(mut self, pool: PgPool, max_lag: Duration) -> Self {
+    pub fn with_replica(mut self, pool: DbPool, max_lag: Duration) -> Self {
         self.replica = ReplicaOf(Some(Arc::new(Replica::new(pool, max_lag))));
         self
     }
@@ -438,7 +438,7 @@ impl PgMeta {
     }
 
     /// Пул чтения закрытого списка шарда `shard` (см. [`PgMeta::read_db`]).
-    pub(crate) async fn read_pool(&self, shard: ShardId) -> Result<PgPool> {
+    pub(crate) async fn read_pool(&self, shard: ShardId) -> Result<DbPool> {
         if self.stale_attempt()
             && let Some(replica) = self.replica_of(shard).await?
             && replica.usable().await
@@ -465,7 +465,7 @@ impl PgMeta {
     }
 
     /// Пул шарда `shard`: основная БД — пул этих хранилищ.
-    pub(crate) async fn shard_pool(&self, shard: ShardId, intent: ReadIntent) -> Result<PgPool> {
+    pub(crate) async fn shard_pool(&self, shard: ShardId, intent: ReadIntent) -> Result<DbPool> {
         match &self.shards.0 {
             Some(r) if shard != ShardId::MAIN => r.pool(shard, intent).await,
             _ => Ok(self.pool.clone()),
@@ -482,7 +482,7 @@ impl PgMeta {
     }
 
     /// Пул ящика учётной записи.
-    pub(crate) async fn box_pool(&self, scope: AccountScope) -> Result<PgPool> {
+    pub(crate) async fn box_pool(&self, scope: AccountScope) -> Result<DbPool> {
         Ok(self.box_db(scope).await?.pool)
     }
 
@@ -597,7 +597,7 @@ impl PgMeta {
     }
 
     /// Хранилища над пулом; при `migrate_on_start` — применение миграций ядра.
-    pub async fn open(pool: PgPool, cfg: MetaConfig) -> Result<Self> {
+    pub async fn open(pool: DbPool, cfg: MetaConfig) -> Result<Self> {
         if cfg.migrate_on_start {
             schema::migrate(&pool).await?;
         }
@@ -605,7 +605,7 @@ impl PgMeta {
     }
 
     /// Пул соединений.
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &DbPool {
         &self.pool
     }
 }

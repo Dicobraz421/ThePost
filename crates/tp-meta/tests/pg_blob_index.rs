@@ -427,6 +427,7 @@ async fn compression_migration_keeps_existing_rows() {
         .run(&pool)
         .await
         .expect("old schema");
+    let pool = common::db(pool);
     let t = TenantId::DEFAULT;
     let (live, deleting, deleted) = (random_hash(), random_hash(), random_hash());
     let mut tx = schema::begin(&pool, t).await.expect("begin");

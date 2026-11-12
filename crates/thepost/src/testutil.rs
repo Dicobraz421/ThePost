@@ -98,6 +98,12 @@ pub async fn drop_database(url: &str, name: &str) {
     }
 }
 
+/// Пул `tp-meta` к базе `url` без учёта ожидания соединения (наблюдатель-пустышка): метрик в тесте нет.
+pub async fn db_pool(url: &str) -> tp_meta::pool::DbPool {
+    let pool = sqlx::PgPool::connect(url).await.expect("pool");
+    tp_meta::pool::DbPool::new(pool, std::sync::Arc::new(tp_meta::pool::NoAcquireObserver))
+}
+
 /// Перечисление записей учёта BLOB поверх `MemBlobIndex` по записанным ключам (`keys`); помеченные
 /// повреждёнными — в `damaged`.
 pub struct MemInventory {

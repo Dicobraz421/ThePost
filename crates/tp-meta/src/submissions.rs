@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::PgMeta;
 use crate::mailboxes::ensure_state;
-use crate::pool::with_system;
+use crate::pool::{DbPool, with_system};
 use crate::schema::{begin, db_err, to_u64};
 use crate::shards::ShardId;
 
@@ -247,7 +247,7 @@ impl PgMeta {
     /// изменений учётных записей.
     async fn purge_submission_tombstones(
         &self,
-        pool: &sqlx::PgPool,
+        pool: &DbPool,
         before: OffsetDateTime,
         limit: usize,
     ) -> Result<()> {

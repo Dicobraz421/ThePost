@@ -31,9 +31,7 @@ use tp_contracts::ext::{DecisionHooks, Registry};
 use tp_contracts::ids::MessageId;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::membership::NodeId;
-use tp_contracts::meta::{
-    AccountScope, AccountStore, MailboxStore, MessageQuery, MessageStore, Policy,
-};
+use tp_contracts::meta::{AccountScope, AccountStore, MailboxStore, MessageQuery, MessageStore};
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
@@ -589,16 +587,16 @@ impl Services {
     ) -> Result<tp_admin::Admin> {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
-            audit: Arc::new(tp_admin::LogAudit),
-            // TODO(ADM-05): чтение журнала аудита — нет реализации `AuditLog` поверх `audit_log` (META-22).
-            audit_log: None,
+            audit_log: Arc::new(self.meta.clone()),
+            // Экспорт в SIEM (`admin.audit`) узел не запускает: без приёмников.
+            audit: Arc::new(tp_admin::Fanout::default()),
             delivery: Arc::new(self.meta.clone()),
             groups: Arc::new(self.meta.clone()),
             moderation: Arc::new(self.base_delivery(smtp)?),
             modules: ext.admin_routes().to_vec(),
             accounts: Arc::new(self.meta.clone()),
             quota: Arc::new(self.meta.clone()),
-            policies: Arc::new(PgPolicies(self.meta.clone())),
+            policies: Arc::new(self.meta.clone()),
             resolver: Arc::new(self.meta.clone()),
             trash: Arc::new(self.meta.clone()),
             store: self.store.clone(),
@@ -735,35 +733,6 @@ impl Authenticator for Guarded {
             }
             Err(e) => Err(e),
         }
-    }
-}
-
-/// Политики уровней Admin API поверх `PgMeta` (до контракта CTR-25).
-struct PgPolicies(PgMeta);
-
-fn policy_target(t: tp_admin::PolicyTarget) -> tp_meta::retention::PolicyTarget {
-    match t {
-        tp_admin::PolicyTarget::Tenant => tp_meta::retention::PolicyTarget::Tenant,
-        tp_admin::PolicyTarget::Domain(d) => tp_meta::retention::PolicyTarget::Domain(d),
-        tp_admin::PolicyTarget::Account(a) => tp_meta::retention::PolicyTarget::Account(a),
-    }
-}
-
-#[async_trait]
-impl tp_admin::PolicyStore for PgPolicies {
-    async fn policy(&self, tenant: TenantId, target: tp_admin::PolicyTarget) -> Result<Policy> {
-        self.0.policy(tenant, policy_target(target)).await
-    }
-
-    async fn set_policy(
-        &self,
-        tenant: TenantId,
-        target: tp_admin::PolicyTarget,
-        policy: &Policy,
-    ) -> Result<()> {
-        self.0
-            .set_policy(tenant, policy_target(target), policy)
-            .await
     }
 }
 
@@ -1022,7 +991,7 @@ mod tests {
         };
         let url = crate::testutil::dev_url(&url);
         let (db_name, url_db) = crate::testutil::create_database(&url).await;
-        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        let pool = crate::testutil::db_pool(&url_db).await;
         tp_meta::schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
         let meta = PgMeta::new(pool, tp_meta::MetaConfig::default()).with_bus(bus.clone());
@@ -1168,7 +1137,7 @@ mod tests {
         };
         let url = crate::testutil::dev_url(&url);
         let (db_name, url_db) = crate::testutil::create_database(&url).await;
-        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        let pool = crate::testutil::db_pool(&url_db).await;
         tp_meta::schema::migrate(&pool).await.expect("migrate");
         let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
         let meta = PgMeta::new(pool.clone(), tp_meta::MetaConfig::default()).with_bus(bus.clone());

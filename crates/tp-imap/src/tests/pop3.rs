@@ -1,10 +1,12 @@
 //! POP3 (IMAP-12): сеанс RFC 1939 — USER/PASS, AUTH (RFC 5034), STAT, LIST, UIDL, RETR, TOP, DELE, RSET, QUIT.
 
+use std::sync::Arc;
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use tp_contracts::meta::{MessageQuery, MessageStore, SpecialUse};
 
-use super::{Client, Env, LOGIN, PASSWORD, TestConn};
+use super::{CLIENT_IP, Client, Env, LOGIN, PASSWORD, TestConn};
 use crate::config::Pop3Config;
 use crate::pop3::Pop3Session;
 
@@ -13,7 +15,8 @@ const TWO: &[u8] = b"From: a@example.org\r\nSubject: two\r\n\r\nHello\r\n";
 
 async fn pop(env: &Env, tls: bool) -> Client {
     let (server, client) = tokio::io::duplex(1 << 20);
-    let session = Pop3Session::new(env.ctx(), TestConn { io: server, tls });
+    let session = Pop3Session::new(env.ctx(), TestConn { io: server, tls })
+        .with_audit(Arc::new(env.audit.clone()), Some(CLIENT_IP));
     let task = tokio::spawn(session.run());
     let mut c = Client {
         io: tokio::io::BufReader::new(client),
@@ -271,4 +274,31 @@ async fn maildrop_locked_per_session() {
     task.await.expect("join").expect("session");
     let mut third = pop(&env, true).await;
     assert_eq!(login(&mut third).await, "+OK Logged in, 2 messages\r\n");
+}
+
+#[tokio::test]
+async fn quit_delete_audited_by_policy() {
+    use tp_contracts::audit::{AuditAction, AuditPolicy, MailboxAudit};
+    let env = two().await;
+    let mut c = logged_in(&env).await;
+    assert!(c.pop("RETR 1").await.starts_with("+OK"));
+    c.multi().await;
+    assert!(c.pop("DELE 1").await.starts_with("+OK"));
+    assert_eq!(c.pop("QUIT").await, "+OK Bye\r\n");
+    // По умолчанию удаление владельцем не записывается, чтение — никогда.
+    assert!(env.audit.entries().is_empty());
+    env.audit
+        .set_audit_policy(env.principal.tenant, None, Some(AuditPolicy::all()))
+        .await
+        .expect("policy");
+    let mut c = pop(&env, true).await;
+    c.pop(&format!("USER {LOGIN}")).await;
+    assert!(c.pop(&format!("PASS {PASSWORD}")).await.starts_with("+OK"));
+    assert!(c.pop("DELE 1").await.starts_with("+OK"));
+    assert_eq!(c.pop("QUIT").await, "+OK Bye\r\n");
+    let e = env.audit.entries();
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert_eq!(e[0].action, AuditAction::Delete);
+    assert_eq!(e[0].object.mailbox, Some(env.mailbox(SpecialUse::Inbox)));
+    assert_eq!(e[0].client.as_deref(), Some("pop3 192.0.2.1"));
 }

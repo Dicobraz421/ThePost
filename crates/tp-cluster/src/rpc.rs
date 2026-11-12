@@ -36,6 +36,7 @@ use crate::hashing::Rendezvous;
 ///   ca_file: /etc/thepost/cluster-ca.pem
 ///   cert_file: /etc/thepost/node.pem     # CN — идентификатор узла
 ///   key: { secret: "thepost/tls/node#key" }   # ключ из хранилища секретов (PEM); либо key_file: <путь>
+/// key_poll_interval: 1m                       # опрос версии секрета tls.key; 0s — не опрашивать
 /// permissions:
 ///   jmap: [search/query]
 ///   admin: [admin/*]
@@ -69,9 +70,15 @@ pub struct RpcConfig {
     /// TLS внутреннего канала: УЦ узлов (`ca_file`), сертификат узла (`cert_file`, CN — идентификатор узла) и
     /// ключ — обязательны при запуске транспорта; открытый канал и `server_name` не допускаются. Ключ — ссылка
     /// на секрет `key: { secret: "<путь>#<поле>" }` (значение — PEM, на диск не пишется) либо файл `key_file`;
-    /// оба сразу — ошибка. Файлы и секрет перечитываются по событиям перечитывания сертификатов; ключ, не
-    /// подходящий к сертификату, — действует прежняя пара.
+    /// оба сразу — ошибка. Файлы и секрет перечитываются по событиям перечитывания сертификатов, секрет — ещё
+    /// и опросом (`key_poll_interval`); ключ, не подходящий к сертификату, — действует прежняя пара.
     pub tls: InternalTls,
+    /// Период опроса версии секрета ключа `tls.key` (событий о новой версии нет): новое значение — пара
+    /// перечитывается без перезапуска ([`crate::node_rpc::NodeRpc::follow_tls`]). `0s` — не опрашивать (новый
+    /// ключ — по событию перечитывания или перезапуском). Как `key_poll_interval` слушателей (решение 80).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub key_poll_interval: Duration,
 }
 
 impl Default for RpcConfig {
@@ -85,6 +92,7 @@ impl Default for RpcConfig {
             members_ttl: Duration::from_secs(1),
             max_body_bytes: 16 << 20,
             tls: InternalTls::default(),
+            key_poll_interval: Duration::from_secs(60),
         }
     }
 }

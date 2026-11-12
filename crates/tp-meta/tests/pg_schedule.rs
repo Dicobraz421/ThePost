@@ -313,6 +313,7 @@ async fn migration_on_existing_db() {
         .run(&pool)
         .await
         .expect("migrate until");
+    let pool = common::db(pool);
     let tenant = common::tenant(&pool).await;
     let (domain, _) = common::domain(&pool, tenant).await;
     let scope = AccountScope {
@@ -440,6 +441,7 @@ async fn migration_moves_recurring_out_of_index() {
         .run(&pool)
         .await
         .expect("migrate until");
+    let pool = common::db(pool);
     let tenant = common::tenant(&pool).await;
     let (domain, _) = common::domain(&pool, tenant).await;
     let scope = AccountScope {
@@ -619,7 +621,7 @@ async fn schedule_lives_on_account_shard() {
         .await
         .expect("inbox_put");
     for table in ["dav_busy", "dav_inbox"] {
-        let count = async |pool: &sqlx::PgPool| -> i64 {
+        let count = async |pool: &tp_meta::pool::DbPool| -> i64 {
             let mut tx = schema::begin_system(pool).await.expect("begin");
             let n = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT count(*) FROM {table} WHERE account_id = $1"

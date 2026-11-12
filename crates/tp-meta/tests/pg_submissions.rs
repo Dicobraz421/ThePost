@@ -146,7 +146,7 @@ async fn submissions_live_on_account_shard() {
         .insert(scope, submission("done", old, UndoStatus::Final))
         .await
         .expect("insert done");
-    let count = async |pool: &sqlx::PgPool| -> i64 {
+    let count = async |pool: &tp_meta::pool::DbPool| -> i64 {
         let mut tx = schema::begin_system(pool).await.expect("begin");
         let n = sqlx::query_scalar("SELECT count(*) FROM email_submissions WHERE tenant_id = $1")
             .bind(tenant.as_uuid())
