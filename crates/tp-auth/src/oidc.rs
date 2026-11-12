@@ -704,7 +704,7 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         // Хранилище не подключено — понятная ошибка, к поставщику без сертификата не идём.
         let (auth, _) = setup(cfg.clone()).await;
         assert!(matches!(
-            auth.verify(Credentials::Bearer(t())).await,
+            auth.verify(Credentials::Bearer(t()), crate::testutil::PEER).await,
             Err(Error::Invalid(m)) if m.contains("secret store")
         ));
         assert_eq!(p.hits("/jwks"), 0);
@@ -724,7 +724,7 @@ MUMElV6U7JBen+Mmd88wiTjFQnwPupCAPsH6marAmHdaA0ybQ0Ldn0G2
         let (auth, alice) = setup(cfg).await;
         let auth = auth.with_secrets(&store).await.expect("with_secrets");
         assert_eq!(
-            auth.verify(Credentials::Bearer(t()))
+            auth.verify(Credentials::Bearer(t()), crate::testutil::PEER)
                 .await
                 .map(|p| p.account),
             Ok(alice)
