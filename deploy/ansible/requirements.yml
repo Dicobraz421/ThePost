@@ -4,8 +4,9 @@
 collections:
   - name: community.crypto
     version: ">=2.16.0"
+  # 3.13 — postgresql_alter_system; параметры подключения — login_port, login_db (в 4.x/5.x без псевдонимов port, db).
   - name: community.postgresql
-    version: ">=3.4.0"
+    version: ">=3.13.0"
   # Стенд (deploy/stand): образ imaptest на генераторе.
   - name: containers.podman
     version: ">=1.10.0"

@@ -275,7 +275,7 @@ impl PgMeta {
             let (tenant, hash) = after.map_or((Uuid::nil(), Vec::new()), |k| {
                 (*k.tenant.as_uuid(), k.hash.as_bytes().to_vec())
             });
-            let mut tx = begin_system(&self.pool).await?;
+            let mut tx = begin_system(&self.read_pool(ShardId::MAIN).await?).await?;
             let rows: Vec<(Uuid, Vec<u8>, i64, i64, bool, String)> = sqlx::query_as(
                 "SELECT tenant_id, hash, gen, size, damaged_at IS NOT NULL, compression FROM blobs
              WHERE (tenant_id, hash) > ($1, $2) AND state = 'live'

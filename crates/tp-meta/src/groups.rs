@@ -63,7 +63,10 @@ impl HeldRow {
             .map_err(|_| Error::internal("длина хэша в group_held"))?;
         Ok(HeldMessage {
             id: HeldId::from_uuid(self.held_id),
-            group: GroupId::from_uuid(self.group_id),
+            group: Some(GroupId::from_uuid(self.group_id)),
+            source: Default::default(),
+            moderators: Vec::new(),
+            recipients: Vec::new(),
             sender: self.sender,
             sender_account: self.sender_account.map(AccountId::from_uuid),
             message_id: self.message_id,
@@ -433,6 +436,13 @@ impl GroupStore for PgMeta {
         if message.blob.tenant != tenant {
             return Err(Error::invalid("объект письма другой организации"));
         }
+        message.validate()?;
+        // Письмо правила потока (CTR-43) и снимок модераторов — колонки META-44.
+        let Some(group) = message.group else {
+            return Err(Error::internal(
+                "очередь модерации: письма правил потока в PostgreSQL — META-44",
+            ));
+        };
         let size = to_i64(message.size)?;
         let held = *message.id.as_uuid();
         let message = &message;
@@ -450,7 +460,7 @@ impl GroupStore for PgMeta {
                         )
                         .bind(tenant.as_uuid())
                         .bind(message.id.as_uuid())
-                        .bind(message.group.as_uuid())
+                        .bind(group.as_uuid())
                         .bind(&message.sender)
                         .bind(message.sender_account.map(|a| *a.as_uuid()))
                         .bind(&message.message_id)

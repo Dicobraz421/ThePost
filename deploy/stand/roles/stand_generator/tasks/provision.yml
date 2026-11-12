@@ -1,0 +1,54 @@
+# Учётные записи стенда (DEP-12): <prefix>1 … <prefix><stand_users>, зонды и ящик big. stand_provision: admin —
+# thepost admin на узле SMB (provision-accounts.sh; повтор пропускает заведённые), none / ldif — общий пароль.
+# Пароли — {{ stand_etc_dir }}/accounts на генераторе (login:пароль, 0600), в журнал и вывод Ansible не попадают.
+---
+- name: Install account provisioning script on SMB node
+  ansible.builtin.copy:
+    src: provision-accounts.sh
+    dest: /usr/local/sbin/thepost-stand-accounts
+    owner: root
+    group: root
+    mode: "0755"
+  delegate_to: "{{ stand_smb_host }}"
+  when: stand_provision == 'admin'
+
+# Вывод — только счётчики (created, existing, issued, skipped): пароли сценарий не печатает.
+- name: Provision accounts on SMB node (thepost admin)
+  ansible.builtin.command:
+    argv: "{{ ['/usr/local/sbin/thepost-stand-accounts', stand_provision_dir, stand_domain, stand_user_prefix,
+              stand_users | string] + stand_probe_accounts + [stand_big_mailbox] }}"
+  delegate_to: "{{ stand_smb_host }}"
+  register: stand_provisioned
+  changed_when: "'issued=0 ' not in stand_provisioned.stdout"
+  when: stand_provision == 'admin'
+
+- name: Read issued app passwords
+  ansible.builtin.slurp:
+    src: "{{ stand_provision_dir }}/accounts"
+  delegate_to: "{{ stand_smb_host }}"
+  register: stand_issued
+  no_log: true
+  when: stand_provision == 'admin'
+
+- name: Write stand accounts on generator
+  ansible.builtin.template:
+    src: accounts.j2
+    dest: "{{ stand_etc_dir }}/accounts"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Write accounts for directory import (LDIF)
+  ansible.builtin.template:
+    src: users.ldif.j2
+    dest: "{{ stand_etc_dir }}/users.ldif"
+    owner: root
+    group: root
+    mode: "0600"
+  when: stand_provision == 'ldif'
+  no_log: true
+
+- name: Show provisioning result
+  ansible.builtin.debug:
+    msg: "{{ stand_provisioned.stdout | default('учётные записи — ' ~ stand_provision ~ ': заведены вне стенда') }}"

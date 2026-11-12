@@ -3,9 +3,9 @@
 - name: Check parameters
   ansible.builtin.assert:
     that:
-      - stand_user_password | length > 0
-      - stand_provision in ['none', 'ldif']
-    fail_msg: "Задайте stand_user_password (ansible-vault); stand_provision — none или ldif"
+      - stand_provision in ['admin', 'none', 'ldif']
+      - stand_provision == 'admin' or stand_user_password | length > 0
+    fail_msg: "stand_provision — admin, none или ldif; для none и ldif задайте stand_user_password (ansible-vault)"
 
 - name: Install load tools
   ansible.builtin.apt:
@@ -106,26 +106,7 @@
     owner: root
     group: root
     mode: "0755"
-  loop: [make-corpus.py, jmap.js, run-scenario.sh]
-
-- name: Write stand parameters
-  ansible.builtin.template:
-    src: stand.env.j2
-    dest: "{{ stand_etc_dir }}/stand.env"
-    owner: root
-    group: root
-    mode: "0600"
-  no_log: true
-
-- name: Write accounts for directory import (LDIF)
-  ansible.builtin.template:
-    src: users.ldif.j2
-    dest: "{{ stand_etc_dir }}/users.ldif"
-    owner: root
-    group: root
-    mode: "0600"
-  when: stand_provision == 'ldif'
-  no_log: true
+  loop: [make-corpus.py, jmap.js, probe.js, run-scenario.sh, fill.py, probes.py, criteria.py]
 
 - name: Build message corpus (D.3)
   ansible.builtin.command:

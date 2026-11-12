@@ -123,13 +123,14 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 ## EventBus
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
-LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
-`MailboxListChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
+LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } |
+DavChanged { kind, collection, modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+`MailboxListChanged`, `DavChanged`, `SieveChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
 `MembersChanged` — с `TenantId::DEFAULT`, `Blocked`, `Unblocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
 Реализации: в процессе (`tp-cluster`), PostgreSQL LISTEN/NOTIFY (`tp-meta`, кластер); in-memory — `MemEventBus` (отставание — `Resync`).
 Доставка — at-most-once; клиент при запуске, после переподключения и по `Resync` сверяется с хранилищем. Публикация — только после фиксации,
-вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`. Набор `suite::signals`.
+вне транзакции изменения. `MembersChanged` публикует реализация `Membership`, `Blocked`, `Unblocked` — реализация `AbuseBlocks`, `TransportChanged` — `TransportStore`, `TrashChanged` — `MailStore::delete_to_trash` и `TrashStore::purge`, `DavChanged` — `DavStore`, `SieveChanged` — `SieveStore`. Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
 ## Lease
@@ -228,6 +229,16 @@ Vec<AccountId> (непусто — модерируемая), hidden_from_gal }`
 1–500 символов, иначе `Invalid`; пустой отправитель — без DSN). Письмо уже забрано `take_held`; успех освобождает ссылку на объект,
 ошибка — вызывающий возвращает письмо `hold`. Реализация — `tp-smtp` (карточка smtp), in-memory — `MemModeration` (запись решений,
 `fail_next`); набор `suite::moderation`.
+Одна очередь модерации для групп и правил потока (CTR-43, решение 2026-11-11-stage2-followups п. 9): `HeldMessage::group: Option<GroupId>`
+(`None` — письмо задержано правилом), `source: HoldSource::{Group, FlowRule { rule }}`, `moderators: Vec<Moderator::{Account, Group}>`
+(у правила — не пусто; у группы — снимок или пусто = модераторы группы), `recipients` — исходные получатели (у правила — не пусто);
+новые поля — `#[serde(default)]`; `HeldMessage::validate()` (источник и группа согласованы, имя правила 1–255 символов) — в `hold`
+(`Invalid`). `Moderation::deliver(tenant, group: Option<&DistributionGroup>, message)`: без группы — доставка исходным получателям;
+`check_delivery` — письмо группы без группы или правила с группой — `Invalid`. `ModerationDecision::Deliver(HeldId, Option<GroupId>)`; набор
+`suite::rule_moderation` (задержка правилом, одобрение — доставка получателям, отказ — DSN). Admin API: очередь модератора показывает
+`source`, `rule`, `moderators`, `recipients`, одобрение письма правила — `deliver(None)`. `PgMeta`: письма групп — как прежде (снимок
+модераторов и получателей не хранится), письмо правила — `Internal` до META-44 (колонка группы допускает NULL, модераторы, источник).
+Постановка правилом (`FlowVerdict::Moderate` → очередь вместо 451, имя правила — из `FlowOutcome::matched`) — SMTP-30.
 
 ## Search
 SRS 4.6. `SearchIndex`: `query(AccountScope, mailboxes: &[MailboxId] (пусто — все), &TextQuery, SearchSort, limit) -> Vec<MessageId>`,
@@ -504,6 +515,54 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 (по умолчанию через `usage` и `QuotaUsage::allows`).
 Политики хранения и Legal Hold — модуль «Соответствие требованиям» через `DecisionHook::before_final_delete`.
 
+## Dav
+SRS 4.4, 3.1; CTR-45. Код — `dav.rs`. Одно хранилище для CalDAV, CardDAV и JMAP Calendars/Contacts; тело объекта хранилище не разбирает —
+индекс вычисляет вызывающий (`tp_dav::index` поверх calcard). JMAP Calendars — по текущему черновику IETF (решение 35).
+`CollectionId`, `DavObjectId` (UUID v7, `ids.rs`); `CollectionKind::{Calendar, AddressBook}`; `Component::{Event, Todo, Journal, Card}`
+(`VEVENT`… `VCARD`, `fits(kind)`). `Collection { id, kind, name (сегмент URL, `valid_name`), display_name, description, color, order,
+timezone (IANA), components: BTreeSet, state: ModSeq }`, `Collection::new(kind, name)`, `validate()` (→ `Invalid`); `kind` и `name` не меняются.
+`DavObject { id, collection, name, etag (без кавычек, `valid_etag`), body: String, index: ObjectIndex { component, uid, span: Option<Span {
+start, end: Option }> } }` — интервал с развёрнутыми повторами, `end = None` — бесконечный; `span = None` — без дат (кандидат любого запроса).
+`TimeRange { start?, end? }`, `ObjectIndex::may_overlap` — кандидат time-range: `start < range.end`, `end ≥ range.start` (точную проверку
+RFC 4791 §9.9 делает вызывающий).
+`DavStore` (по `AccountScope`, чужая учётная запись или организация — как отсутствующие): `limits() -> DavLimits { max_object_size,
+max_objects (в коллекции), max_collections (учётной записи) }` (из конфигурации реализации; превышение — `QuotaExceeded`);
+коллекции — `list_collections(kind)` (по `order`, имени), `get_collection(id)`, `collection_by_name(kind, name)`, `create_collection`
+(занятые `id` или имя вида — `Conflict`), `update_collection` (свойства), `delete_collection` (сразу, без корзины; объекты и коллекция —
+в надгробия, каждый со своим `ModSeq`); объекты — `get_object(collection, name)`, `object_by_uid`, `list_objects -> Vec<ObjectRef { id, name,
+etag }>`, `multiget(names)`, `objects_by_id(ids)` (JMAP), `in_range(collection, TimeRange)`, `put_object(collection, name, body, index,
+Precondition::{Any, IfMatch(etag), IfNoneMatch}) -> PutOutcome::{Stored(Put { id, etag, modseq, created }), PreconditionFailed,
+UidConflict { name }}` (UID уникален в коллекции; компонент не из `components` — `Invalid`; перезапись сохраняет `id`),
+`delete_object(collection, name, Precondition) -> DeleteOutcome::{Deleted(ModSeq), PreconditionFailed}` (нет ресурса при `Any` — `NotFound`).
+Изменения: `ModSeq` — из счётчика учётной записи (как у писем), у каждого изменения свой; `Collection::state` — наибольший `ModSeq`
+коллекции (CTag). `changes(collection, since, limit) -> Changes<String>` (имена, RFC 6578; повторно созданное имя — не в `destroyed`),
+`collection_changes(kind, since, limit) -> Changes<CollectionId>` (JMAP `Calendar/changes`, `AddressBook/changes`),
+`account_changes(kind, since, limit) -> Changes<DavObjectId>` (JMAP `CalendarEvent/changes`, `ContactCard/changes`), `state(kind)`
+(JMAP `state`). `since = 0` — всё в `created`; `has_more` — `new_state` последнего возвращённого; `since` старше очищенных надгробий или
+больше счётчика — `Conflict`. Сигнал `DavChanged { kind, collection, modseq }` (`dav_changed`, учётная запись) — после фиксации каждого
+изменения. In-memory — `MemDav` (`with_limits`, `with_bus`, `purge_tombstones`); наборы `suite::dav` (лимиты `suite::dav::LIMITS`,
+`DavFixture`), `suite::dav::signals`. PostgreSQL — `tp-meta` (META-46…48).
+
+## Sieve
+SRS 4.3; CTR-46. Код — `sieve.rs`. Интерпретатор — свой крейт `tp-sieve` (sieve-rs под AGPL-3.0); ManageSieve — в роли `imap` (как POP3),
+секция `sieve` крейта `tp-sieve`; `Role` не меняется. `SieveStore` (по `AccountScope`; текст проверяет вызывающий): `limits() ->
+SieveLimits { max_scripts, max_script_size }` (из конфигурации реализации; превышение — `QuotaExceeded`), `list -> Vec<ScriptInfo { name,
+size, active }>` (по имени), `get(name)`, `active() -> Option<ActiveScript { name, text }>`, `put(name, text)` (имя — `valid_script_name`,
+RFC 5804; замена сохраняет активность), `rename(from, to)` (занято — `Conflict`, активность переходит), `delete` (активный — `Conflict`),
+`activate(Option<name>)` (активный не больше одного; `None` — снять), `org_script(tenant)` / `set_org_script(tenant, Option<text>)` (скрипт
+организации, выполняется до скрипта пользователя; без сигнала), `vacation()` / `set_vacation(Vacation { enabled, from, to, subject,
+text_body, html_body })` (JMAP `VacationResponse`, RFC 8621 §8; `validate()`, `is_active(now)`: `from ≤ now < to`), `state()` — растёт при
+каждом изменении скриптов и автоответа (JMAP `state`, версия для кэша программ). Изменяющие методы возвращают новое состояние.
+`VacationLog::seen(scope, sender, handle, period) -> bool` — атомарно «уже отвечали за период» или отметка (RFC 5230 `:days`).
+Точка правил доставки `DeliveryRules::evaluate(&RulesInput { scope, recipient (с подадресом), mail_from, message: Bytes, mailboxes })
+-> RulesOutcome { keep: Vec<KeepTo { mailbox: MailboxRef::{Inbox, Id, Name { name, create }}, flags }>, redirect, discard,
+vacation: Option<AutoReply { to, from, subject, body: ReplyBody::{Text, Html, Mime}, in_reply_to, references }>, errors }`;
+порядок — скрипт организации, автоответ, активный скрипт; ошибка скрипта — implicit keep (`RulesOutcome::failed`) и `errors` для журнала;
+`Err` — сбой хранилища: вызывающий доставляет во «Входящие». Нет правил — `RulesOutcome::implicit_keep()`. Письмо автоответа собирает
+`tp-smtp` (RFC 3834). Сигнал `SieveChanged` (`sieve_changed`, учётная запись) — после изменения скриптов и автоответа. In-memory — `MemSieve`
+(`with_limits`, `with_bus`), `MemVacationLog`, фейк `FakeRules` (итог по получателю, `fail_next`, `calls`); наборы `suite::sieve`
+(лимиты `suite::sieve::LIMITS`, `SieveFixture`), `suite::sieve::{vacation_log, signals}`. PostgreSQL — `tp-meta` (META-49, META-50).
+
 ## Extension points
 SRS 2.5, 1.3. Модуль — cargo feature + `modules.<имя>.enabled`. `Module { name(), schema() -> "mod_<имя>", migrations() -> &[Migration { version, name, sql }],
 register(&mut Registry, &ModuleCtx) -> Result<()> }`; имя — `validate_module_name` (`[a-z][a-z0-9_]*`, ≤ 59).
@@ -648,3 +707,18 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (очередь со сроком выпуска, отмена до выпуска), `SubmissionStore::{query_submissions, submission_changes, expire_submissions}`,
   `SubmissionFilter`, `SubmissionChanges`; описание потока в `submission.rs` (воркер `due` только фиксирует наступившие). In-memory —
   `MemOutbound` (`Scheduled`, `release`), `MemSubmissions` (журнал изменений); наборы `suite::{submission_query, outbound_schedule}`.
+- 2026-11-11 — CTR-43 (x/contracts-31, решение 2026-11-11-stage2-followups п. 9): очередь модерации и для правил потока почты —
+  `HeldMessage::{group: Option<_>, source: HoldSource, moderators: Vec<Moderator>, recipients}`, `HeldMessage::validate`,
+  `Moderation::deliver(.., Option<&DistributionGroup>, ..)` (без группы — исходным получателям), `check_delivery` для обоих случаев. In-memory —
+  `MemGroups`, `MemModeration` (`Deliver(_, Option<GroupId>)`); набор `suite::rule_moderation`. `tp-admin` — источник в очереди модератора,
+  одобрение письма правила; `tp-meta` — чтение и запись писем групп (письмо правила — `Internal` до META-44); `tp-smtp`, `tp-auth`, `thepost` —
+  новые поля и сигнатура.
+- 2026-11-11 — CTR-45 (x/contracts-33): `dav::{DavStore, Collection, CollectionKind, Component, DavObject, ObjectIndex, Span, TimeRange,
+  Precondition, PutOutcome, DeleteOutcome, DavLimits, dav_changed}`, `CollectionId`, `DavObjectId`, `EventKind::DavChanged` — календари и
+  контакты Ф2. По сравнению с карточкой: методы с префиксами (`*_collection`, `*_object`), `collection_by_name`, `objects_by_id`,
+  `collection_changes`, `state(kind)` для JMAP; итог записи — `PutOutcome` (412 и `no-uid-conflict` с именем ресурса различимы, не `Conflict`);
+  UID — в `ObjectIndex`. In-memory — `MemDav`; наборы `suite::dav`, `suite::dav::signals`. Реализация в `tp-meta` — META-46…48.
+- 2026-11-11 — CTR-46 (x/contracts-33): `sieve::{SieveStore, ScriptInfo, ActiveScript, SieveLimits, Vacation, VacationLog, DeliveryRules,
+  RulesInput, RulesOutcome, KeepTo, MailboxRef, AutoReply, ReplyBody, sieve_changed}`, `EventKind::SieveChanged`. По сравнению с карточкой:
+  `SieveStore::active`, `limits`, `state`; `MailboxRef::Inbox` для implicit keep; `AutoReply::references`. In-memory — `MemSieve`,
+  `MemVacationLog`, `FakeRules`; наборы `suite::sieve`, `suite::sieve::{vacation_log, signals}`. Реализация в `tp-meta` — META-49, META-50.

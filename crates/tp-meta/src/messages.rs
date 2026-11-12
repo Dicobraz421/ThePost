@@ -588,7 +588,7 @@ impl MessageStore for PgMeta {
 
     async fn get(&self, scope: AccountScope, id: MessageId) -> Result<Option<Message>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
+            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
             let rows: Vec<MessageRow> = sqlx::query_as(select_messages!("AND message_id = $3"))
                 .bind(scope.tenant.as_uuid())
                 .bind(scope.account.as_uuid())
@@ -613,7 +613,7 @@ impl MessageStore for PgMeta {
         let query = &query;
         self.idempotent(|| async move {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
+        let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
         let base = |sql| {
             sqlx::query_as::<_, MessageRow>(sql)
                 .bind(scope.tenant.as_uuid())
