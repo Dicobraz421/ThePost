@@ -412,7 +412,7 @@ def brute_row(run):
         return (name, crit, "—", NONE, b["skipped"])
     fails = {}
     for x in b.get("attempts", []):
-        fails[x["phase"]] = fails.get(x["phase"], 0) + 1
+        fails[x["phase"]] = fails.get(x["phase"], 0) + (x["result"] == "no")
     text = "; ".join(f"{x['name']}: {x['result']} (ожидалось {x['expect']})" for x in b.get("checks", []))
     note = (f"со второго адреса {b.get('source')}: отказов входа {b.get('target')} — {fails.get('account', 0)}, "
             f"под несуществующими именами — {fails.get('address', 0)}")
