@@ -7,10 +7,10 @@
 //! (нет `DTSTART` у события, неверное правило) или объект без дат (задача без `DTSTART` и `DUE`) — без интервала:
 //! такой объект — кандидат любого запроса time-range (CONTRACTS.md#Dav).
 //!
-//! Занятость ([`ObjectIndex::busy`], CONTRACTS.md#Schedule) — вхождения событий до горизонта развёртки, не больше
+//! Занятость ([`ObjectIndex::busy`], CONTRACTS.md#Schedule) — периоды неповторяющегося события, не больше
 //! `MAX_BUSY_PERIODS`: `TRANSP:TRANSPARENT`, `STATUS:CANCELLED` и вхождения нулевой длины не занимают,
-//! `STATUS:TENTATIVE` — отдельным видом; исключения (`RECURRENCE-ID`, `EXDATE`) учтены. Горизонт занятости
-//! хранилища (`DavLimits::busy_horizon`) применяет [`clip_busy`].
+//! `STATUS:TENTATIVE` — отдельным видом. Событие с `RRULE` или `RDATE` — [`ObjectIndex::recurring`], без индекса
+//! занятости: его повторы хранилище разворачивает при запросе (META-54, решение 59).
 
 use calcard::common::timezone::Tz;
 use calcard::icalendar::dates::CalendarExpand;
@@ -105,19 +105,22 @@ pub fn of_calendar(ical: &ICalendar, opts: &IndexOptions) -> Result<ObjectIndex,
     let exp = ical.expand_dates(Tz::UTC, opts.max_instances);
     let mut idx = ObjectIndex::new(component, uid, span(ical, &exp, opts));
     if component == Component::Event {
-        idx.busy = busy(ical, &exp, opts);
+        if ical.components.iter().any(repeats) {
+            idx.recurring = true;
+        } else {
+            idx.busy = busy(ical, &exp);
+        }
     }
     checked(idx)
 }
 
-/// Оставляет в индексе занятости периоды, начинающиеся раньше `until` (момент записи плюс
-/// `DavLimits::busy_horizon`).
-pub fn clip_busy(idx: &mut ObjectIndex, until: OffsetDateTime) {
-    idx.busy.retain(|p| p.start < until);
+/// Компонент с правилом повторения или дополнительными датами (`RRULE`, `RDATE`).
+fn repeats(c: &ICalendarComponent) -> bool {
+    c.has_property(&ICalendarProperty::Rrule) || c.has_property(&ICalendarProperty::Rdate)
 }
 
-/// Периоды занятости события: вхождения до горизонта, склеенные по видам.
-fn busy(ical: &ICalendar, exp: &CalendarExpand, opts: &IndexOptions) -> Vec<BusyPeriod> {
+/// Периоды занятости неповторяющегося события, склеенные по видам.
+fn busy(ical: &ICalendar, exp: &CalendarExpand) -> Vec<BusyPeriod> {
     if !exp.errors.is_empty() {
         return Vec::new();
     }
@@ -138,9 +141,6 @@ fn busy(ical: &ICalendar, exp: &CalendarExpand, opts: &IndexOptions) -> Vec<Busy
         let (Some(start), Some(end)) = (at(s), at(en)) else {
             continue;
         };
-        if start > opts.horizon {
-            continue;
-        }
         let kind = if comp.status() == Some(&ICalendarStatus::Tentative) {
             BusyKind::Tentative
         } else {
@@ -280,17 +280,17 @@ mod tests {
             "BEGIN:VEVENT\r\nUID:ev-1\r\nRECURRENCE-ID:20260107T100000Z\r\nDTSTART:20260107T140000Z\r\n\
              DTEND:20260107T150000Z\r\nSTATUS:TENTATIVE\r\nEND:VEVENT\r\nEND:VCALENDAR",
         );
-        let mut idx = calendar(&body, &opts()).expect("index");
-        assert_eq!(
-            idx.busy,
-            vec![
-                p(5, 10, 11, BusyKind::Busy),
-                p(7, 14, 15, BusyKind::Tentative),
-                p(8, 10, 11, BusyKind::Busy),
-            ]
-        );
-        clip_busy(&mut idx, at(2026, Month::January, 7, 0));
-        assert_eq!(idx.busy, vec![p(5, 10, 11, BusyKind::Busy)]);
+        // Повторяющееся событие — без индекса занятости: повторы разворачивает хранилище при запросе.
+        let idx = calendar(&body, &opts()).expect("index");
+        assert!(idx.recurring && idx.busy.is_empty());
+        let rdate = calendar(&event("RDATE:20260110T100000Z\r\n"), &opts()).expect("index");
+        assert!(rdate.recurring && rdate.busy.is_empty());
+        // Неповторяющееся — период в индексе.
+        let single = calendar(&event(""), &opts()).expect("index");
+        assert!(!single.recurring);
+        assert_eq!(single.busy, vec![p(5, 10, 11, BusyKind::Busy)]);
+        let tentative = calendar(&event("STATUS:TENTATIVE\r\n"), &opts()).expect("index");
+        assert_eq!(tentative.busy, vec![p(5, 10, 11, BusyKind::Tentative)]);
         for free in ["TRANSP:TRANSPARENT\r\n", "STATUS:CANCELLED\r\n"] {
             assert!(
                 calendar(&event(free), &opts())
@@ -300,10 +300,9 @@ mod tests {
                 "{free}"
             );
         }
-        // Повтор без конца — до горизонта, не больше лимита контракта.
+        // Повтор без конца — тоже без индекса.
         let open = calendar(&event("RRULE:FREQ=DAILY\r\n"), &opts()).expect("index");
-        assert!(!open.busy.is_empty() && open.busy.len() <= MAX_BUSY_PERIODS);
-        assert!(open.busy.iter().all(|b| b.start <= opts().horizon));
+        assert!(open.recurring && open.busy.is_empty());
         open.validate().expect("valid");
     }
 

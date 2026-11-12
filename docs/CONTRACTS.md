@@ -556,7 +556,7 @@ start, end: Option }>, busy: Vec<BusyPeriod>, schedule_tag: Option<String> } }` 
 `TimeRange { start?, end? }`, `ObjectIndex::may_overlap` — кандидат time-range: `start < range.end`, `end ≥ range.start` (точную проверку
 RFC 4791 §9.9 делает вызывающий).
 `DavStore` (по `AccountScope`, чужая учётная запись или организация — как отсутствующие): `limits() -> DavLimits { max_object_size,
-max_objects (в коллекции), max_collections (учётной записи), busy_horizon (CTR-47) }` (из конфигурации реализации; превышение — `QuotaExceeded`);
+max_objects (в коллекции), max_collections (учётной записи), max_busy_instances (META-54) }` (из конфигурации реализации; превышение — `QuotaExceeded`);
 коллекции — `list_collections(kind)` (по `order`, имени), `get_collection(id)`, `collection_by_name(kind, name)`, `create_collection`
 (занятые `id` или имя вида — `Conflict`), `update_collection` (свойства), `delete_collection` (сразу, без корзины; объекты и коллекция —
 в надгробия, каждый со своим `ModSeq`); объекты — `get_object(collection, name)`, `object_by_uid`, `list_objects -> Vec<ObjectRef { id, name,
@@ -602,9 +602,13 @@ iMIP (RFC 6047), занятость. iCalendar контракты не разб�
   организатором, прежний при изменении участником только `PARTSTAT`; `If-Schedule-Tag-Match` проверяет вызывающий по прочитанному объекту
   и пишет с `Precondition::IfMatch(etag)`.
 - Занятость: `ObjectIndex::busy: Vec<BusyPeriod { start, end, kind: BusyKind::{Busy, Tentative, Unavailable} }>` (`[start, end)`, UTC;
-  `FBTYPE`) — вхождения с повторами и исключениями до момента записи плюс `DavLimits::busy_horizon` (по умолчанию 400 дней), не больше
-  `MAX_BUSY_PERIODS` (4096), `validate_busy` → `Invalid`. Вычисляет `tp-dav` (DAV-16): `TRANSP:TRANSPARENT`, `STATUS:CANCELLED` — пусто,
-  `STATUS:TENTATIVE` — `Tentative`. `FreeBusy::query(tenant, accounts, Period { start, end }) -> Vec<(AccountId, Vec<BusyPeriod>)>` —
+  `FBTYPE`) — периоды неповторяющегося объекта, не больше `MAX_BUSY_PERIODS` (4096), `validate_busy` → `Invalid`. Вычисляет `tp-dav`
+  (DAV-16): `TRANSP:TRANSPARENT`, `STATUS:CANCELLED` — пусто, `STATUS:TENTATIVE` — `Tentative`. Повторяющееся событие (в теле `RRULE`
+  или `RDATE`) — `ObjectIndex::recurring = true` и пустой `busy` (иначе `Invalid`; только `Component::Event`): его занятость хранилище
+  разворачивает из тела при запросе библиотекой calcard (META-54, решение 59) — `RRULE`, `RDATE`, `EXDATE`, переопределённые вхождения,
+  часовые пояса; время без пояса — в поясе календаря (`Collection::timezone`, иначе UTC); `TRANSP:TRANSPARENT` и `STATUS:CANCELLED` не
+  занимают, `STATUS:TENTATIVE` — `Tentative`; горизонта нет, от начала повторов — не больше `DavLimits::max_busy_instances` вхождений
+  объекта (по умолчанию 20 000), остальные в занятость не попадают; тело, которое не разбирается, занятости не даёт. `FreeBusy::query(tenant, accounts, Period { start, end }) -> Vec<(AccountId, Vec<BusyPeriod>)>` —
   календари учётной записи кроме `transparent`; запись на каждую учётную запись в порядке `accounts` (повторы — один раз), периоды,
   пересекающиеся с интервалом, обрезаны по нему и нормализованы `merge_busy` (по `(start, end, kind)`, один вид склеен, разные — нет);
   нет данных, чужая организация, несуществующая — пусто (существование и права «только занятость», CTR-48, проверяет вызывающий);
@@ -802,6 +806,11 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   и сигнал входящих — для CTag и JMAP `CalendarEventNotification`; горизонт занятости — в `DavLimits`. Новые поля индекса и коллекции —
   `#[serde(default)]`. In-memory — `MemDav` (входящие, `FreeBusy`), `FakeItip`, `MemItipSender`; наборы `suite::itip`,
   `suite::itip::signals`, `suite::freebusy`. Реализация в `tp-meta` — META-51, в `tp-dav` — DAV-13, DAV-15, DAV-16.
+- 2026-11-12 — META-54 (x/meta-35), правка CTR-47 по решению 59: занятость повторяющихся событий разворачивается при запросе.
+  Добавлено `ObjectIndex::recurring` (`#[serde(default)]`; задаёт вызывающий — `tp-dav`, `tp-jmap`), `DavLimits::max_busy_instances`;
+  **удалено** `DavLimits::busy_horizon` и ключ конфигурации `meta.dav.busy_horizon` (секция `deny_unknown_fields`: ключ из конфигурации
+  убрать, вместо него — `meta.dav.max_busy_instances`). `ObjectIndex::busy` — только у неповторяющихся объектов. Разворот — в хранилищах
+  (`PgMeta`, `MemDav`) библиотекой calcard; набор `suite::freebusy_recurring`. Миграция `tp-meta` 0025.
 - 2026-11-12 — CTR-49 (x/contracts-36): `QueueStore::enqueue(owner: Option<AccountId>, msg)`, `BlobIndex::acquire(tenant, owner:
   Option<AccountId>, hash, refs)` — учётная запись отправителя или владельца для выбора шарда (решение 46); `EventKind::ShardsChanged` —
   системный сигнал изменения справочника шардов (решение 47). Вызовы в крейтах — `None` (учётная запись на этих путях неизвестна).
