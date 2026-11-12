@@ -10,6 +10,7 @@
 //! число соединений — секция `sieve.managesieve` ([`ManageSieveConfig`](crate::ManageSieveConfig)).
 
 mod proto;
+mod scripts;
 mod session;
 
 use std::fmt;

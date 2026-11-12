@@ -1,4 +1,4 @@
-//! Сеанс ManageSieve: чтение команд, приветствие, `STARTTLS`, вход SASL (SIEVE-08).
+//! Сеанс ManageSieve: чтение команд, приветствие, `STARTTLS`, вход SASL (SIEVE-08); команды скриптов — [`super::scripts`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use tp_contracts::sasl::{Mechanism, SaslContext, SaslFailure, SaslStep};
 use tp_contracts::tls::Profile;
 
 use super::proto::{Arg, Literal, put_string, split_literal, tokenize};
+use super::scripts;
 use super::{SessionCtx, Transport};
 use crate::compile::EXTENSIONS;
 
@@ -346,6 +347,7 @@ impl<T: Transport> Session<T> {
                 "CAPABILITY" | "NOOP" | "LOGOUT" | "STARTTLS" | "AUTHENTICATE" | "UNAUTHENTICATE",
                 _,
             ) => self.no("Invalid arguments"),
+            (name, args) if scripts::is_command(name) => self.script_command(name, args).await,
             _ => self.no("Unknown command"),
         }
         Ok(true)

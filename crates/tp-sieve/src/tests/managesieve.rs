@@ -141,6 +141,18 @@ impl Stand {
                     .iter()
                     .any(|p| line.starts_with(p))
                 {
+                    // Текст ответа литералом `{n}`: ещё `n` байт и CRLF.
+                    let literal = line
+                        .strip_suffix(b"}\r")
+                        .and_then(|l| l.rsplit(|&b| b == b'{').next())
+                        .and_then(|n| std::str::from_utf8(n).ok()?.parse::<usize>().ok());
+                    if let Some(n) = literal {
+                        from += n + 2;
+                        while self.buf.len() < from {
+                            let n = self.io.read_buf(&mut self.buf).await.expect("чтение");
+                            assert!(n > 0, "соединение закрыто");
+                        }
+                    }
                     let out: Vec<u8> = self.buf.drain(..from).collect();
                     return String::from_utf8(out).expect("utf8");
                 }
@@ -169,8 +181,8 @@ impl Stand {
         }
     }
 
-    pub(super) async fn send(&mut self, data: &str) {
-        self.io.write_all(data.as_bytes()).await.expect("запись");
+    pub(super) async fn send(&mut self, data: impl AsRef<[u8]>) {
+        self.io.write_all(data.as_ref()).await.expect("запись");
     }
 
     /// Команда (CRLF добавляется) и ответ на неё.

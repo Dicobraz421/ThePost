@@ -1,10 +1,11 @@
-//! Тесты tp-sieve: разбор (SIEVE-01), проверка (SIEVE-02), выполнение (SIEVE-03), действия (SIEVE-04), тесты расширений (SIEVE-05), автоответ (SIEVE-06), правила доставки (SIEVE-07).
+//! Тесты tp-sieve: разбор (SIEVE-01), проверка (SIEVE-02), выполнение (SIEVE-03), действия (SIEVE-04), тесты расширений (SIEVE-05), автоответ (SIEVE-06), правила доставки (SIEVE-07), ManageSieve (SIEVE-08, SIEVE-09).
 
 mod actions;
 mod checking;
 mod execution;
 mod extensions;
 mod managesieve;
+mod managesieve_scripts;
 mod parsing;
 mod rules;
 mod vacation;
