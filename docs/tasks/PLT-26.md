@@ -3,7 +3,7 @@
 lane: platform
 deps: [PLT-24]
 class: A
-files: [crates/tp-platform/src/*, deploy/ansible/roles/openbao/*, deploy/ansible/roles/thepost_pki/*]
+files: [crates/tp-platform/src/*]
 read: [docs/decisions/2026-11-11-stage2-followups.md]
 checks: [nextest]
 manual: no
@@ -11,6 +11,8 @@ manual: no
 ## Сделать
 - Выпуск и продление внутренних сертификатов core-компонентов (узлы, СУБД, OpenBao, SeaweedFS) движком PKI
   OpenBao коротким сроком; слушатели клиентов и интеграции — можно внешний УЦ заказчика (решение 64).
+- Цепочка сертификатов — в том же секрете, что ключ (п. 19 синка 12.11, решение 80): замена пары одним шагом.
+- Роли Ansible `openbao` и `thepost_pki` — DEP-36 (решение 71: карточка — одна полоса).
 
 ## Приёмка
 - Тест: сертификат продлевается до конца срока без перезапуска.

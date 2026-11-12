@@ -1,0 +1,15 @@
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//Sabre//Sabre VObject 4.5.4//EN
+UID:5f1c2c1e-0a51-4d6e-9c0b-000000000013
+FN:Ольга Лебедева
+N:Лебедева;Ольга;;;
+EMAIL;TYPE=HOME:olga.lebedeva@example.net
+TEL;TYPE="HOME,VOICE":+7 900 555-01-61
+ADR;TYPE=HOME:;;наб. Озёрная\, д. 2;Петрозаводск;Р
+ еспублика Карелия;185000;Россия
+CATEGORIES:Друзья,Семья
+X-SOCIALPROFILE;TYPE=MASTODON:https://social.example.net/@olga
+BDAY;VALUE=DATE:1992-12-05
+REV;VALUE=DATE-AND-OR-TIME:20261101T120000Z
+END:VCARD

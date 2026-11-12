@@ -175,7 +175,7 @@ expression: r.show()
 </d:report>
 </d:supported-report>
 </d:supported-report-set>
-<d:sync-token>urn:thepost:sync:7565435706391538070</d:sync-token>
+<d:sync-token>urn:thepost:sync:6823048385053052706</d:sync-token>
 </d:prop>
 <d:status>HTTP/1.1 200 OK</d:status>
 </d:propstat>

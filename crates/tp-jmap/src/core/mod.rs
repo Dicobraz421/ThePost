@@ -154,6 +154,8 @@ pub struct Jmap {
     pub(crate) dav: Option<Arc<dyn DavStore>>,
     /// Занятость учётных записей; `None` — capability `principals:availability` не объявляется.
     pub(crate) freebusy: Option<Arc<dyn FreeBusy>>,
+    /// Планирование встреч (JMAP-31); `None` — `sendSchedulingMessages` недоступен.
+    pub(crate) schedule: Option<tp_dav::ScheduleDeps>,
     stop: watch::Sender<bool>,
 }
 
@@ -269,6 +271,7 @@ impl Jmap {
             sieve: None,
             dav: None,
             freebusy: None,
+            schedule: None,
             stop: watch::channel(false).0,
         })
     }
@@ -320,6 +323,16 @@ impl Jmap {
     #[must_use]
     pub fn with_freebusy(mut self, freebusy: Option<Arc<dyn FreeBusy>>) -> Self {
         self.freebusy = freebusy;
+        self
+    }
+
+    /// Подключает планирование встреч (CONTRACTS.md#Schedule, JMAP-31): `CalendarEvent/set` с
+    /// `sendSchedulingMessages` рассылает iTIP теми же зависимостями, что CalDAV (`tp_dav::router_with`):
+    /// учётным записям организации — `ItipDelivery`, внешним — `ItipSender`. `None` — запрос с
+    /// `sendSchedulingMessages: true` отклоняется (`invalidArguments`).
+    #[must_use]
+    pub fn with_schedule(mut self, schedule: Option<tp_dav::ScheduleDeps>) -> Self {
+        self.schedule = schedule;
         self
     }
 

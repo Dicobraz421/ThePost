@@ -79,8 +79,8 @@
       # Ansible: deploy/ansible/roles/thepost — не править вручную.
       # Эталон SMB: PostgreSQL, OpenBao и фильтры Milter — на этой же ВМ.
       [Unit]
-      Wants=postgresql.service openbao.service rspamd.service{{ ' clamav-milter.service' if thepost_clamav else '' }}
-      After=postgresql.service openbao.service rspamd.service{{ ' clamav-milter.service' if thepost_clamav else '' }}
+      Wants={{ thepost_local_units | join(' ') }}
+      After={{ thepost_local_units | join(' ') }}
     owner: root
     group: root
     mode: "0644"
@@ -114,6 +114,22 @@
   loop:
     - /etc/thepost
     - /etc/thepost/tls
+
+# firewalld (РЕД ОС, AlmaLinux, RHEL; включён — открыть порты клиентских протоколов, certbot — и 80).
+- name: Check firewalld
+  ansible.builtin.command: systemctl is-active firewalld
+  register: thepost_firewalld
+  changed_when: false
+  failed_when: false
+
+- name: Open client ports in firewalld
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ thepost_firewall_ports + ([80] if thepost_tls_mode == 'certbot' else []) }}"
+  when: thepost_firewalld.stdout == 'active'
 
 - name: Certificate of client protocols
   ansible.builtin.include_tasks: "tls-{{ thepost_tls_mode }}.yml"

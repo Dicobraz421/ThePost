@@ -1,12 +1,19 @@
 # Внутренний CA и сертификат внутренних служб (community.crypto). Выпуск других сертификатов этим CA —
 # include_role tasks_from: issue (переменные thepost_pki_issue_*).
 ---
-- name: Install python3-cryptography for community.crypto
+- name: Install python3-cryptography for community.crypto (apt)
   ansible.builtin.apt:
     name: python3-cryptography
     state: present
     update_cache: true
     cache_valid_time: 3600
+  when: ansible_pkg_mgr == 'apt'
+
+- name: Install python3-cryptography for community.crypto (dnf)
+  ansible.builtin.dnf:
+    name: python3-cryptography
+    state: present
+  when: ansible_pkg_mgr != 'apt'
 
 - name: Create PKI directory
   ansible.builtin.file:

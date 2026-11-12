@@ -175,7 +175,7 @@ impl Report {
 }
 
 /// Сообщение ошибки без префикса варианта.
-fn message(e: &Error) -> String {
+pub(crate) fn message(e: &Error) -> String {
     match e {
         Error::Invalid(m) | Error::Internal(m) => m.clone(),
         other => other.to_string(),
@@ -289,8 +289,94 @@ pub async fn check(
             "хранилище секретов не настроено",
         ),
     }
-    doctor_dns::check_with(cfg, dns, &doctor, report).await;
+    doctor_dns::check_with(cfg, dns, store.as_ref(), &doctor, report).await;
     internal_pki(cfg, SystemTime::now(), report).await;
+    dav_well_known(cfg, report);
+}
+
+/// Путь адреса автонастройки `target` (`jmap.autoconfig.caldav`, `carddav`): путь на этом сервере или полный URL.
+/// Второе значение — `true` для полного URL.
+fn context_path(target: &str) -> (&str, bool) {
+    match target.split_once("://") {
+        Some((_, rest)) => (rest.find('/').map_or("/", |i| &rest[i..]), true),
+        None => (target, false),
+    }
+}
+
+/// Роль dav (APP-29): клиенты находят календари и контакты по `/.well-known/caldav` и `/.well-known/carddav`
+/// (RFC 6764 §5) — перенаправление должно вести на `/dav/`, где их отдаёт узел. Перенаправление отдаёт JMAP по
+/// `jmap.autoconfig.caldav` и `carddav`; на слушателе без JMAP — сама роль dav, всегда на `/dav/`.
+/// `FAIL` — путь не `/dav/`; `WARN` — слушателя нет либо DAV на отдельном порту `http.dav`, а адрес задан путём
+/// (перенаправление останется на порту JMAP, где DAV нет).
+pub fn dav_well_known(cfg: &Config, report: &mut Report) {
+    use tp_contracts::role::Role;
+    let roles = cfg.roles();
+    if !roles.contains(Role::Dav) {
+        return;
+    }
+    let http = cfg
+        .section::<sections::HttpSection>(sections::HTTP)
+        .map(|h| (*h).clone())
+        .unwrap_or_default();
+    let (listener, shared) = http.dav_listener(roles);
+    let Some(listener) = listener else {
+        report.push(
+            "dav.listener",
+            Status::Warn,
+            "",
+            "роль dav включена, но слушатель не задан (http.dav или http.jmap): календари и контакты недоступны",
+        );
+        return;
+    };
+    let value = listener.listen.to_string();
+    let msg = if shared {
+        "календари и контакты — на слушателе http.jmap"
+    } else {
+        "календари и контакты — на отдельном слушателе"
+    };
+    report.push("dav.listener", Status::Ok, value, msg);
+    if !roles.contains(Role::Jmap) {
+        report.push(
+            "dav.well_known",
+            Status::Ok,
+            tp_dav::PREFIX,
+            "перенаправление /.well-known/caldav и /.well-known/carddav отдаёт слушатель dav",
+        );
+        return;
+    }
+    let auto = cfg
+        .section::<tp_jmap::JmapConfig>(sections::JMAP)
+        .map(|j| j.autoconfig.clone())
+        .unwrap_or_default();
+    for (name, target) in [("caldav", &auto.caldav), ("carddav", &auto.carddav)] {
+        let id = format!("dav.well_known.{name}");
+        let (path, absolute) = context_path(target);
+        let (status, msg) = if path.trim_end_matches('/') != tp_dav::PREFIX.trim_end_matches('/') {
+            (
+                Status::Fail,
+                format!(
+                    "/.well-known/{name} ведёт на {path}, а узел отдаёт календари и контакты по {}: исправьте jmap.autoconfig.{name}",
+                    tp_dav::PREFIX
+                ),
+            )
+        } else if !shared && !absolute {
+            (
+                Status::Warn,
+                format!(
+                    "DAV слушает отдельный адрес http.dav ({}), а /.well-known/{name} ведёт на порт JMAP: задайте jmap.autoconfig.{name} полным адресом (https://<имя>:{}{})",
+                    listener.listen,
+                    listener.listen.port(),
+                    tp_dav::PREFIX
+                ),
+            )
+        } else {
+            (
+                Status::Ok,
+                format!("/.well-known/{name} ведёт на {}", tp_dav::PREFIX),
+            )
+        };
+        report.push(&id, status, target.clone(), msg);
+    }
 }
 
 /// Режим seccomp без секции `confine` — `log`, как при запуске `serve` (`startup::confine`): проверка
@@ -940,6 +1026,63 @@ mod tests {
         ] {
             assert_eq!(locale_status(enc, ctype).0, Status::Fail, "{enc} {ctype}");
         }
+    }
+
+    /// APP-29: `/.well-known/caldav` и `carddav` ведут на `/dav/` — по `jmap.autoconfig` и слушателям `http`.
+    #[test]
+    fn dav_well_known_points_to_dav() {
+        const BASE: &str = "domain: example.org\nprofile: dev\ndatabase:\n  url: postgres://x@y/z?sslmode=disable\n  tls: { allow_plaintext: true }\nblob:\n  url: file:///tmp/b\n";
+        let report = |extra: &str| {
+            let cfg = sections::registry()
+                .expect("registry")
+                .parse(&format!("{BASE}{extra}"), Vec::new())
+                .expect("config");
+            let mut r = Report::default();
+            dav_well_known(&cfg, &mut r);
+            r
+        };
+        let status = |r: &Report, id: &str| r.get(id).map(|c| c.status);
+
+        // Роль dav выключена — проверок нет.
+        let r = report("roles: [jmap]\nhttp:\n  jmap: { listen: 127.0.0.1:443 }\n");
+        assert!(r.checks.is_empty(), "{r:?}");
+        // Общий порт с JMAP, адреса по умолчанию.
+        let r = report("roles: [jmap, dav]\nhttp:\n  jmap: { listen: 127.0.0.1:443 }\n");
+        assert_eq!(status(&r, "dav.listener"), Some(Status::Ok), "{r:?}");
+        assert_eq!(status(&r, "dav.well_known.caldav"), Some(Status::Ok));
+        assert_eq!(status(&r, "dav.well_known.carddav"), Some(Status::Ok));
+        // Слушателя нет.
+        let r = report("roles: [jmap, dav]\n");
+        assert_eq!(status(&r, "dav.listener"), Some(Status::Warn), "{r:?}");
+        // Перенаправление мимо /dav/.
+        let r = report(
+            "roles: [jmap, dav]\nhttp:\n  jmap: { listen: 127.0.0.1:443 }\njmap:\n  autoconfig:\n    caldav: /caldav/\n    carddav: https://mail.example.org/dav\n",
+        );
+        assert_eq!(
+            status(&r, "dav.well_known.caldav"),
+            Some(Status::Fail),
+            "{r:?}"
+        );
+        assert_eq!(status(&r, "dav.well_known.carddav"), Some(Status::Ok));
+        // Отдельный порт: путь без адреса оставит клиента на порту JMAP.
+        let split = "roles: [jmap, dav]\nhttp:\n  jmap: { listen: 127.0.0.1:443 }\n  dav: { listen: 127.0.0.1:8443 }\n";
+        let r = report(split);
+        assert_eq!(
+            status(&r, "dav.well_known.caldav"),
+            Some(Status::Warn),
+            "{r:?}"
+        );
+        let r = report(&format!(
+            "{split}jmap:\n  autoconfig:\n    caldav: https://mail.example.org:8443/dav/\n    carddav: https://mail.example.org:8443/dav/\n"
+        ));
+        assert_eq!(
+            status(&r, "dav.well_known.caldav"),
+            Some(Status::Ok),
+            "{r:?}"
+        );
+        // Узел без роли jmap: перенаправление отдаёт сама роль dav.
+        let r = report("roles: [dav]\nhttp:\n  dav: { listen: 127.0.0.1:8443 }\n");
+        assert_eq!(status(&r, "dav.well_known"), Some(Status::Ok), "{r:?}");
     }
 
     #[test]

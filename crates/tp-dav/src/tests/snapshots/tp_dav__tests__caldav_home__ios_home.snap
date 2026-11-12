@@ -73,6 +73,9 @@ expression: r.show()
 <c:supported-calendar-component-set>
 <c:comp name="VEVENT"/>
 </c:supported-calendar-component-set>
+<c:schedule-calendar-transp>
+<c:opaque/>
+</c:schedule-calendar-transp>
 <ical:calendar-order>0</ical:calendar-order>
 </d:prop>
 <d:status>HTTP/1.1 200 OK</d:status>
@@ -81,7 +84,6 @@ expression: r.show()
 <d:prop>
 <c:calendar-description/>
 <c:calendar-timezone/>
-<c:schedule-calendar-transp/>
 <ical:calendar-color/>
 </d:prop>
 <d:status>HTTP/1.1 404 Not Found</d:status>
@@ -126,6 +128,9 @@ expression: r.show()
 <c:supported-calendar-component-set>
 <c:comp name="VTODO"/>
 </c:supported-calendar-component-set>
+<c:schedule-calendar-transp>
+<c:opaque/>
+</c:schedule-calendar-transp>
 <ical:calendar-order>1</ical:calendar-order>
 </d:prop>
 <d:status>HTTP/1.1 200 OK</d:status>
@@ -134,7 +139,6 @@ expression: r.show()
 <d:prop>
 <c:calendar-description/>
 <c:calendar-timezone/>
-<c:schedule-calendar-transp/>
 <ical:calendar-color/>
 </d:prop>
 <d:status>HTTP/1.1 404 Not Found</d:status>

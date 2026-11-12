@@ -38,7 +38,7 @@ pub use admin_tokens::MemLocalAdminTokens;
 pub use app_passwords::MemAppPasswords;
 pub use audit::MemMailboxAudit;
 pub use blob::{BlobOp, MemBlobIndex, MemBlobStore};
-pub use corpus::{LoadModel, SyntheticMail, corpus, pg_schema, pg_url};
+pub use corpus::{CorpusCard, LoadModel, SyntheticMail, corpus, pg_schema, pg_url, vcards};
 pub use dav::MemDav;
 pub use delivery::MemDeliveryLog;
 pub use fakes::{

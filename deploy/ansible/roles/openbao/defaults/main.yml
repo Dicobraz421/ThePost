@@ -3,12 +3,15 @@
 ---
 openbao_version: "2.7.2"
 openbao_arch: "{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}"
-openbao_package_ext: "{{ 'deb' if ansible_os_family == 'Debian' else 'rpm' }}"
+openbao_package_ext: "{{ 'deb' if ansible_pkg_mgr == 'apt' else 'rpm' }}"
 openbao_release_url: "https://github.com/openbao/openbao/releases/download/v{{ openbao_version }}"
 openbao_package_url: >-
   {{ openbao_release_url }}/openbao_{{ openbao_version }}_linux_{{ openbao_arch }}.{{ openbao_package_ext }}
 # Проверка пакета по checksums.txt релиза; своя зеркальная копия — "sha256:<сумма>".
 openbao_package_checksum: "sha256:{{ openbao_release_url }}/checksums.txt"
+# Файл корневых сертификатов для загрузки пакета через uri вместо get_url (РЕД ОС 8 — см. tasks/download.yml); пусто —
+# get_url.
+openbao_download_ca_path: "{{ '/etc/pki/tls/certs/ca-bundle.crt' if ansible_distribution == 'RED' else '' }}"
 openbao_service: openbao
 openbao_user: openbao
 openbao_config_dir: /etc/openbao

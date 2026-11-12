@@ -44,6 +44,8 @@ const ALL_TYPES: &[&str] = &["Email", "Thread", "Mailbox", "EmailSubmission"];
 const SIEVE_TYPES: &[&str] = &["VacationResponse", "SieveScript"];
 const CONTACT_TYPES: &[&str] = &["AddressBook", "ContactCard"];
 const CALENDAR_TYPES: &[&str] = &["Calendar", "CalendarEvent"];
+/// Уведомления планирования (JMAP-31): состояние входящих планирования `DavStore`.
+const NOTIFICATION_TYPES: &[&str] = &["CalendarEventNotification"];
 
 /// Все типы: почтовые и типы со своим состоянием.
 const EVERY_TYPE: &[&str] = &[
@@ -57,6 +59,7 @@ const EVERY_TYPE: &[&str] = &[
     "ContactCard",
     "Calendar",
     "CalendarEvent",
+    "CalendarEventNotification",
 ];
 
 /// Типы данных, которые меняет уведомление шины.
@@ -73,6 +76,7 @@ pub(crate) fn changed_types(kind: &EventKind) -> &'static [&'static str] {
             kind: CollectionKind::Calendar,
             ..
         } => CALENDAR_TYPES,
+        EventKind::ScheduleInboxChanged { .. } => NOTIFICATION_TYPES,
         // Сигналы потеряны — что изменилось, неизвестно: клиент перечитывает все типы.
         EventKind::Resync => EVERY_TYPE,
         _ => &[],
@@ -85,6 +89,7 @@ struct States {
     sieve: Option<String>,
     contacts: Option<String>,
     calendars: Option<String>,
+    notifications: Option<String>,
 }
 
 impl States {
@@ -106,11 +111,13 @@ impl States {
             )),
             None => None,
         };
+        let notifications = crate::scheduling::notification_state(jmap, scope).await;
         Ok(Self {
             mail,
             sieve,
             contacts,
             calendars,
+            notifications,
         })
     }
 
@@ -122,6 +129,8 @@ impl States {
             self.contacts.as_deref()
         } else if CALENDAR_TYPES.contains(&ty) {
             self.calendars.as_deref()
+        } else if NOTIFICATION_TYPES.contains(&ty) {
+            self.notifications.as_deref()
         } else {
             Some(&self.mail)
         }
@@ -134,6 +143,7 @@ impl States {
             ("s", &self.sieve),
             ("c", &self.contacts),
             ("k", &self.calendars),
+            ("n", &self.notifications),
         ] {
             if let Some(e) = extra {
                 s.push_str(&format!("-{tag}{e}"));

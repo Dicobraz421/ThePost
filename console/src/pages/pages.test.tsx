@@ -6,6 +6,7 @@ import { saveSession, setOrg } from "../api/client";
 import { App } from "../App";
 import { toBody } from "../components/policy-form";
 import { type Call, ORG, session, stubApi, whoami } from "../test-api";
+import { buttons } from "../test-app";
 
 const BASE = `/api/v1/orgs/${ORG}`;
 const empty = {
@@ -73,10 +74,10 @@ test("домены: список и удаление", async () => {
   });
   expect(await screen.findByText("example.org")).toBeTruthy();
   expect(screen.getByText("example.net")).toBeTruthy();
-  fireEvent.click(screen.getAllByRole("button", { name: /Удалить/ })[0]);
+  fireEvent.click((await buttons(/Удалить/))[0]);
   expect(await screen.findByText("Удалить домен example.org?")).toBeTruthy();
-  const buttons = screen.getAllByRole("button", { name: /Удалить/ });
-  fireEvent.click(buttons[buttons.length - 1]);
+  const all = screen.getAllByRole("button", { name: /Удалить/ });
+  fireEvent.click(all[all.length - 1]);
   await waitFor(() => expect(sent(calls, "DELETE", `${BASE}/domains/d1`)).toBeTruthy());
 });
 
@@ -85,7 +86,7 @@ test("домены: добавление; ошибка API — в уведомл
     [`POST ${BASE}/domains`]: { status: 409, body: { status: 409, title: "Conflict", detail: "домен уже есть" } },
   });
   fireEvent.change(await screen.findByLabelText("Имя домена"), { target: { value: "example.org" } });
-  fireEvent.click(screen.getByRole("button", { name: /Сохранить/ }));
+  fireEvent.click((await buttons(/Сохранить/))[0]);
   await waitFor(() => expect(sent(calls, "POST", `${BASE}/domains`)?.body).toEqual({ name: "example.org" }));
   expect(await screen.findByText("домен уже есть")).toBeTruthy();
 });

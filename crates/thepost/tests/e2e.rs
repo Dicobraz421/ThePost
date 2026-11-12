@@ -2,7 +2,8 @@
 //! против PostgreSQL — приём SMTP (объекты письма хранятся сжатыми, приём и доставка — в журнале доставки) → IMAP
 //! FETCH и JMAP Email/get → поиск → удаление в корзину → восстановление → «очистить корзину» в IMAP и JMAP по
 //! настройке `trash.purge` → отправка из JMAP локальному адресату (CMP-07) → истечение срока корзины (роль
-//! maintenance). Вход — через защиту от перебора.
+//! maintenance). Вход — через защиту от перебора. По пути — ManageSieve в роли imap (`STARTTLS`, вход `PLAIN`,
+//! `LISTSCRIPTS`) и событие календаря из JMAP (`CalendarEvent/set`), видимое в CalDAV (APP-27).
 //!
 //! Настройки транспорта без перезапуска (APP-09): доверенный источник, созданный через Admin API (вход — `admin init`
 //! по локальному сокету и сессия), действует на следующую сессию SMTP; правила потока почты тестового модуля
@@ -137,6 +138,10 @@ smtp:
 imap:
   listeners:
     - {{ listen: \"127.0.0.1:0\", implicit_tls: true }}
+sieve:
+  managesieve:
+    listen:
+      - {{ listen: \"127.0.0.1:0\" }}
 http:
   jmap: {{ listen: \"127.0.0.1:0\", allow_plaintext: true }}
 search:
@@ -338,6 +343,43 @@ fn exists(select: &str) -> u32 {
         .unwrap_or_else(|| panic!("нет EXISTS: {select}"))
 }
 
+// ---------- ManageSieve ----------
+
+/// Ответ ManageSieve до строки итога (`OK`, `NO`, `BYE`) включительно.
+async fn sieve_reply<S: AsyncRead + Unpin>(s: &mut S) -> String {
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        s.read_exact(&mut byte).await.expect("managesieve read");
+        buf.push(byte[0]);
+        if !buf.ends_with(b"\r\n") {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let last = text.trim_end().rsplit("\r\n").next().unwrap_or_default();
+        if ["OK", "NO", "BYE"].iter().any(|k| last.starts_with(k)) {
+            return text.into_owned();
+        }
+    }
+}
+
+/// Команда ManageSieve и её ответ.
+async fn sieve_cmd<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, cmd: &str) -> String {
+    s.write_all(format!("{cmd}\r\n").as_bytes())
+        .await
+        .expect("managesieve write");
+    sieve_reply(s).await
+}
+
+/// Итог ответа ManageSieve — `OK`.
+fn sieve_ok(reply: &str) -> bool {
+    reply
+        .trim_end()
+        .rsplit("\r\n")
+        .next()
+        .is_some_and(|l| l.starts_with("OK"))
+}
+
 // ---------- JMAP ----------
 
 /// Запрос HTTP/1.1 с заголовком `Authorization` (`Basic …`, `Bearer …`): код и тело (с разбором `chunked`).
@@ -394,6 +436,30 @@ async fn http(
     (code, payload)
 }
 
+/// Запрос DAV без тела: ответ целиком (строка состояния, заголовки, тело как есть).
+async fn dav(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    authorization: &str,
+    depth: &str,
+) -> String {
+    let mut s = TcpStream::connect(addr).await.expect("dav connect");
+    let auth = if authorization.is_empty() {
+        String::new()
+    } else {
+        format!("Authorization: {authorization}\r\n")
+    };
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Depth: {depth}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.expect("dav write");
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await.expect("dav read");
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
 struct Jmap {
     addr: std::net::SocketAddr,
     auth: String,
@@ -408,6 +474,7 @@ impl Jmap {
                 "urn:ietf:params:jmap:core",
                 "urn:ietf:params:jmap:mail",
                 "urn:ietf:params:jmap:submission",
+                "urn:ietf:params:jmap:calendars",
             ],
             "methodCalls": [[method, args, "c0"]],
         });
@@ -605,6 +672,114 @@ async fn mvp_mail_flow() {
         got["list"][0]["from"][0]["email"], "bob@sender.test",
         "{got}"
     );
+
+    // 3а. Календари и контакты (APP-29): роль dav на слушателе JMAP, вход паролем приложения.
+    let basic = format!("Basic {}", jmap.auth);
+    let web = addr(&running, "jmap");
+    let found = dav(web, "GET", "/.well-known/caldav", "", "0").await;
+    assert!(found.starts_with("HTTP/1.1 301"), "{found}");
+    assert!(found.to_ascii_lowercase().contains("location: "), "{found}");
+    assert!(found.contains("/dav/"), "{found}");
+    let home = format!("/dav/calendars/{login}/");
+    let denied = dav(web, "PROPFIND", &home, "Basic bm9ib2R5Om5vcGU=", "1").await;
+    assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+    let listed = dav(web, "PROPFIND", &home, &basic, "1").await;
+    assert!(listed.starts_with("HTTP/1.1 207"), "{listed}");
+    // Дом и календарь по умолчанию (создаётся при первом обращении).
+    assert!(listed.matches("<d:response>").count() >= 2, "{listed}");
+    let books = format!("/dav/addressbooks/{login}/");
+    let listed = dav(web, "PROPFIND", &books, &basic, "1").await;
+    assert!(listed.starts_with("HTTP/1.1 207"), "{listed}");
+
+    // 3б. Событие из JMAP видно в CalDAV (APP-27): одно хранилище календарей.
+    let (code, body) = http(web, "GET", "/jmap/session", &basic, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let session: Value = serde_json::from_slice(&body).expect("session");
+    for capability in [
+        "urn:ietf:params:jmap:contacts",
+        "urn:ietf:params:jmap:calendars",
+        "urn:ietf:params:jmap:sieve",
+        "urn:ietf:params:jmap:vacationresponse",
+    ] {
+        assert!(
+            session["capabilities"][capability].is_object(),
+            "{capability}: {session}"
+        );
+    }
+    let set = jmap
+        .call(
+            "CalendarEvent/set",
+            json!({ "accountId": jmap.account, "create": { "e": {
+                "uid": "app-27-e2e", "title": "Planning e2e",
+                "start": "2026-12-01T10:00:00", "timeZone": "Europe/Moscow", "duration": "PT1H",
+            } } }),
+        )
+        .await;
+    assert!(set["created"]["e"]["id"].is_string(), "{set}");
+    let hrefs = |listing: &str| -> Vec<String> {
+        listing
+            .split("<d:href>")
+            .skip(1)
+            .filter_map(|r| r.split("</d:href>").next().map(str::to_owned))
+            .collect()
+    };
+    let listed = dav(web, "PROPFIND", &home, &basic, "1").await;
+    let mut event = None;
+    for calendar in hrefs(&listed).into_iter().filter(|h| *h != home) {
+        let objects = dav(web, "PROPFIND", &calendar, &basic, "1").await;
+        if let Some(href) = hrefs(&objects).into_iter().find(|h| h.ends_with(".ics")) {
+            event = Some(href);
+        }
+    }
+    let event = event.unwrap_or_else(|| panic!("события нет в CalDAV: {listed}"));
+    let ics = dav(web, "GET", &event, &basic, "0").await;
+    assert!(ics.starts_with("HTTP/1.1 200"), "{ics}");
+    assert!(ics.contains("UID:app-27-e2e"), "{ics}");
+    assert!(ics.contains("SUMMARY:Planning e2e"), "{ics}");
+
+    // 3в. ManageSieve в роли imap (APP-27): STARTTLS, вход PLAIN (служба SASL `sieve`), LISTSCRIPTS.
+    let mut tcp = TcpStream::connect(addr(&running, "managesieve"))
+        .await
+        .expect("managesieve connect");
+    let greeting = sieve_reply(&mut tcp).await;
+    assert!(sieve_ok(&greeting), "{greeting}");
+    assert!(greeting.contains("\"STARTTLS\""), "{greeting}");
+    assert!(sieve_ok(&sieve_cmd(&mut tcp, "STARTTLS").await));
+    let name = ServerName::try_from("localhost").expect("name");
+    let mut sieve = tls_connector()
+        .connect(name, tcp)
+        .await
+        .expect("managesieve tls");
+    let capabilities = sieve_reply(&mut sieve).await;
+    assert!(sieve_ok(&capabilities), "{capabilities}");
+    let sasl = capabilities
+        .split("\r\n")
+        .find(|l| l.starts_with("\"SASL\""))
+        .unwrap_or_else(|| panic!("нет SASL: {capabilities}"));
+    assert!(sasl.contains("PLAIN"), "{sasl}");
+    assert!(sasl.contains("OAUTHBEARER"), "{sasl}");
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let wrong = b64.encode(format!("\0{login}\0wrong-password"));
+    let denied = sieve_cmd(&mut sieve, &format!("AUTHENTICATE \"PLAIN\" \"{wrong}\"")).await;
+    assert!(denied.starts_with("NO"), "{denied}");
+    let plain = b64.encode(format!("\0{login}\0{app_password}"));
+    let entered = sieve_cmd(&mut sieve, &format!("AUTHENTICATE \"PLAIN\" \"{plain}\"")).await;
+    assert!(sieve_ok(&entered), "{entered}");
+    let script = "require \"fileinto\";\r\nfileinto \"INBOX\";\r\n";
+    let put = sieve_cmd(
+        &mut sieve,
+        &format!("PUTSCRIPT \"e2e\" {{{}+}}\r\n{script}", script.len()),
+    )
+    .await;
+    assert!(sieve_ok(&put), "{put}");
+    let scripts = sieve_cmd(&mut sieve, "LISTSCRIPTS").await;
+    assert!(sieve_ok(&scripts), "{scripts}");
+    assert!(scripts.contains("\"e2e\""), "{scripts}");
+    assert!(sieve_ok(
+        &sieve_cmd(&mut sieve, "DELETESCRIPT \"e2e\"").await
+    ));
+    let bye = sieve_cmd(&mut sieve, "LOGOUT").await;
+    assert!(sieve_ok(&bye), "{bye}");
 
     // 4. Поиск: индексатор обрабатывает журнал событий, запрос — по полнотекстовому индексу.
     let until = deadline();
@@ -1275,4 +1450,128 @@ async fn sieve_rules_and_vacation() {
     assert!(report.failed.is_empty(), "{report:?}");
     pool.close().await;
     drop_database(&url, &db_name).await;
+}
+
+/// FIX-03: домены организации в Admin API узла — принятые домены `TransportStore` (`PgMeta`). Список — 200 с
+/// доменом `admin init`; создание и удаление нового домена; удаление домена с учётной записью — 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_domains() {
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = Arc::new(MemSecretStore::default());
+    let db: SecretRef = "thepost/db#password".parse().expect("ref");
+    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+
+    let domain = "example.ru".to_owned();
+    let socket = dir.path().join("admin.sock");
+    let path = dir.path().join("config.yaml");
+    std::fs::write(&path, admin_config(dir.path(), &db_url, &domain, &socket)).expect("config");
+    let cfg = thepost::sections::registry()
+        .expect("registry")
+        .load(&path)
+        .expect("load config");
+    let bound = ADMIN_SOCKET.lock().await;
+    thepost::local_admin::bind(&cfg).expect("admin init socket");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+    let admin = addr(&running, "admin");
+
+    // Администратор: учётная запись в принятом домене `example.ru` — от `admin init`.
+    let login = format!("admin@{domain}");
+    let granted = admin_init(&socket, &login).await;
+    drop(bound);
+    assert_eq!(granted["status"], "granted", "{granted}");
+    let token = granted["token"].as_str().expect("token").to_owned();
+    let (code, body) = http(
+        admin,
+        "POST",
+        "/api/v1/session",
+        &format!("Bearer {token}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+    let session: Value = serde_json::from_slice(&body).expect("session");
+    let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
+    let base = format!("/api/v1/orgs/{}/domains", TenantId::DEFAULT);
+    let list = || domain_list(admin, &base, &bearer);
+
+    // Список: принятый домен `admin init`.
+    let domains = list().await;
+    let own = domains
+        .iter()
+        .find(|d| d["name"] == domain)
+        .unwrap_or_else(|| panic!("{domain} в {domains:?}"))["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // Создание: имя приводится к канонической форме; повтор — 409.
+    let (code, body) = http(
+        admin,
+        "POST",
+        &base,
+        &bearer,
+        Some(&json!({ "name": "Corp.Example" })),
+    )
+    .await;
+    assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+    let created: Value = serde_json::from_slice(&body).expect("created");
+    assert_eq!(created["name"], "corp.example", "{created}");
+    let id = created["id"].as_str().expect("id").to_owned();
+    assert!(list().await.iter().any(|d| d["id"] == id));
+    let (code, body) = http(
+        admin,
+        "POST",
+        &base,
+        &bearer,
+        Some(&json!({ "name": "corp.example" })),
+    )
+    .await;
+    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = http(admin, "GET", &format!("{base}/{id}"), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+
+    // Удаление домена без учётных записей — 204, повтор — 404.
+    let (code, body) = http(admin, "DELETE", &format!("{base}/{id}"), &bearer, None).await;
+    assert_eq!(code, 204, "{}", String::from_utf8_lossy(&body));
+    assert!(!list().await.iter().any(|d| d["id"] == id));
+    let (code, body) = http(admin, "DELETE", &format!("{base}/{id}"), &bearer, None).await;
+    assert_eq!(code, 404, "{}", String::from_utf8_lossy(&body));
+
+    // Домен с учётной записью администратора не удаляется — 409, домен на месте.
+    let (code, body) = http(admin, "DELETE", &format!("{base}/{own}"), &bearer, None).await;
+    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
+    assert!(list().await.iter().any(|d| d["id"] == own));
+
+    shutdown.cancel();
+    let report = running.wait().await.expect("wait");
+    assert!(report.failed.is_empty(), "{report:?}");
+    drop_database(&url, &db_name).await;
+}
+
+/// `GET /api/v1/orgs/{org}/domains`: 200 и список доменов.
+async fn domain_list(addr: std::net::SocketAddr, path: &str, bearer: &str) -> Vec<Value> {
+    let (code, body) = http(addr, "GET", path, bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let list: Value = serde_json::from_slice(&body).expect("domains");
+    list.as_array().expect("array").clone()
 }

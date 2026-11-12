@@ -1,6 +1,6 @@
 //! Роли протоколов и индексатора (APP-04): слушатели открывает приложение (`Listener::open`), сервисы — крейты
 //! полос: smtp-in и submission (`tp-smtp`), imap (`tp-imap`: IMAP с QUOTA и ACL, POP3 по секции `imap.pop3`),
-//! jmap и admin (HTTP платформы), indexer (`tp-search` с обработчиком журнала событий `tp-meta`, чтение по сигналам —
+//! ManageSieve (`tp-sieve`) — в роли imap по секции `sieve.managesieve.listen`; jmap и admin (HTTP платформы), indexer (`tp-search` с обработчиком журнала событий `tp-meta`, чтение по сигналам —
 //! [`crate::log_reader`]). Роль без
 //! слушателей в конфигурации готова, но соединений не принимает.
 
@@ -269,14 +269,32 @@ impl RoleService for SmtpRole {
 /// Имя слушателей POP3 в реестре адресов ([`Bound`]): POP3 работает в роли imap (секция `imap.pop3`).
 pub const POP3: &str = "pop3";
 
+/// Имя слушателей ManageSieve в реестре адресов ([`Bound`]): ManageSieve работает в роли imap (секция
+/// `sieve.managesieve`, CONTRACTS.md#Sieve).
+pub const MANAGESIEVE: &str = "managesieve";
+
+/// ManageSieve в роли imap (APP-27): контракты сеансов, секция `sieve` и профиль узла (при `dev` вход без TLS).
+/// Секция читается при запуске узла: слушатели (`sieve.managesieve.listen`) и лимиты сеанса требуют перезапуска.
+#[derive(Debug, Clone)]
+pub struct ManageSieveSetup {
+    /// SASL (служба `sieve`, с защитой от перебора) и скрипты учётных записей.
+    pub deps: tp_sieve::managesieve::Deps,
+    /// Секция `sieve`.
+    pub config: Arc<tp_sieve::SieveConfig>,
+    /// Профиль узла.
+    pub profile: Profile,
+}
+
 /// Роль imap: секция `imap` (`listeners`), сервер `tp-imap` с расширениями QUOTA, ACL и общими папками; POP3 —
-/// по секции `imap.pop3` (`enabled`, `listeners`; STLS — сертификаты секции `tls`).
+/// по секции `imap.pop3` (`enabled`, `listeners`; STLS — сертификаты секции `tls`); ManageSieve — по секции
+/// `sieve.managesieve.listen` ([`ImapRole::with_managesieve`]; пустой список — выключен).
 #[derive(Debug, Clone)]
 pub struct ImapRole {
     deps: tp_imap::Deps,
     ext: tp_imap::Extensions,
     tls: Option<Arc<TlsCerts>>,
     sockets: Sockets,
+    sieve: Option<ManageSieveSetup>,
 }
 
 impl ImapRole {
@@ -292,7 +310,14 @@ impl ImapRole {
             ext,
             tls,
             sockets,
+            sieve: None,
         }
+    }
+
+    /// ManageSieve (RFC 5804) на слушателях `sieve.managesieve.listen`; без вызова — не обслуживается.
+    pub fn with_managesieve(mut self, sieve: ManageSieveSetup) -> Self {
+        self.sieve = Some(sieve);
+        self
     }
 }
 
@@ -311,7 +336,11 @@ impl RoleService for ImapRole {
             _ => {}
         }
         let pop3_endpoints: &[EndpointConfig] = if pop3.enabled { &pop3.listeners } else { &[] };
-        if cfg.listeners.is_empty() && pop3_endpoints.is_empty() {
+        let sieve_endpoints: &[EndpointConfig] = match &self.sieve {
+            Some(sieve) => &sieve.config.managesieve.listen,
+            None => &[],
+        };
+        if cfg.listeners.is_empty() && pop3_endpoints.is_empty() && sieve_endpoints.is_empty() {
             return idle(self.name(), &ctx).await;
         }
         // Все слушатели открываются до приёма соединений: ошибка любого — ошибка запуска роли.
@@ -319,6 +348,9 @@ impl RoleService for ImapRole {
             .sockets
             .open(self.name(), &cfg.listeners, self.tls.clone())?;
         let pop3 = self.sockets.open(POP3, pop3_endpoints, self.tls.clone())?;
+        let sieve = self
+            .sockets
+            .open(MANAGESIEVE, sieve_endpoints, self.tls.clone())?;
         let session = || tp_imap::SessionCtx {
             config: cfg.clone(),
             deps: self.deps.clone(),
@@ -334,6 +366,22 @@ impl RoleService for ImapRole {
         for listener in pop3 {
             let server = server.clone();
             loops.spawn(async move { server.serve(listener).await });
+        }
+        if let Some(setup) = &self.sieve {
+            let session = Arc::new(tp_sieve::managesieve::SessionCtx {
+                config: setup.config.clone(),
+                deps: setup.deps.clone(),
+                profile: setup.profile,
+                shutdown: ctx.shutdown.clone(),
+            });
+            for listener in sieve {
+                let session = session.clone();
+                let drain = ctx.drain_deadline;
+                loops.spawn(async move {
+                    tp_sieve::managesieve::serve(session, listener, drain).await;
+                    Ok(())
+                });
+            }
         }
         ctx.ready.set(true);
         let mut result = Ok(());

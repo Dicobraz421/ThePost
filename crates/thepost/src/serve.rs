@@ -224,7 +224,8 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let acme = acme::prepare(&cfg, &sockets, aux.clone()).await?;
     // Сертификаты нужны служебному HTTP (вне dev) и протоколам (STARTTLS, неявный TLS, HTTPS jmap и admin).
     let certs = if !service.allow_plaintext || tls.cert_file.is_file() {
-        let certs = Arc::new(TlsCerts::load(&tls).await.map_err(|e| {
+        // Ключ по ссылке `tls.key` читается из хранилища секретов узла и перечитывается по новой версии (APP-35).
+        let certs = Arc::new(TlsCerts::load_with_secrets(&tls, store.clone()).await.map_err(|e| {
             infra::context(
                 "tls",
                 match e {
@@ -460,6 +461,11 @@ struct RoleSetup<'a> {
 }
 
 impl RoleSetup<'_> {
+    /// Секция `dav` (лимиты CalDAV и CardDAV); применяется при создании маршрутов.
+    fn dav_config(&self) -> Result<tp_dav::DavConfig> {
+        Ok((*self.cfg.section::<tp_dav::DavConfig>(sections::DAV)?).clone())
+    }
+
     /// Сервис роли `role` и источник её секции. Ленивая инициализация (SRS 2.7): только для включённых ролей.
     fn spec(&mut self, role: Role) -> Result<RoleSpec> {
         let section = |name: &str| section_watch(self.updates.clone(), name);
@@ -490,12 +496,15 @@ impl RoleSetup<'_> {
                 )
             }
             Role::Imap => (
-                Arc::new(ImapRole::new(
-                    self.services.imap(),
-                    self.services.imap_extensions(),
-                    self.certs.clone(),
-                    self.sockets.clone(),
-                )),
+                Arc::new(
+                    ImapRole::new(
+                        self.services.imap(),
+                        self.services.imap_extensions(),
+                        self.certs.clone(),
+                        self.sockets.clone(),
+                    )
+                    .with_managesieve(self.services.managesieve(profile)),
+                ),
                 section(sections::IMAP)?,
             ),
             Role::Jmap => {
@@ -506,9 +515,14 @@ impl RoleSetup<'_> {
                     .jmap(self.ext, cfg, &smtp, self.certs.clone())?;
                 let jmap = Arc::new(jmap);
                 let stop = jmap.clone();
+                // Календари и контакты без `http.dav` — на этом же слушателе (один порт с JMAP, APP-29).
+                let mut router = jmap.router();
+                if self.cfg.roles().contains(Role::Dav) && http.dav.is_none() {
+                    router = router.merge(self.services.dav(self.dav_config()?, false));
+                }
                 let service = HttpRole::new(
                     role,
-                    jmap.router(),
+                    router,
                     http.jmap.clone(),
                     profile,
                     self.certs.clone(),
@@ -538,6 +552,21 @@ impl RoleSetup<'_> {
                 );
                 (Arc::new(service), fixed_config(()))
             }
+            Role::Dav => match http.dav_listener(self.cfg.roles()) {
+                // Маршруты DAV — у роли jmap этого узла (ветка `Role::Jmap`).
+                (_, true) => (Arc::new(InProcessRole(role)), fixed_config(())),
+                (listener, false) => {
+                    let service = HttpRole::new(
+                        role,
+                        self.services.dav(self.dav_config()?, true),
+                        listener.cloned(),
+                        profile,
+                        self.certs.clone(),
+                        self.sockets.clone(),
+                    );
+                    (Arc::new(service), fixed_config(()))
+                }
+            },
             Role::Search => (Arc::new(InProcessRole(role)), fixed_config(())),
             Role::Indexer => {
                 let search = self.cfg.section::<SearchConfig>(sections::SEARCH)?;
@@ -558,7 +587,6 @@ impl RoleSetup<'_> {
                 Some(m) => (Arc::new(m), fixed_config(())),
                 None => (Arc::new(PendingRole(role)), fixed_config(())),
             },
-            _ => (Arc::new(PendingRole(role)), fixed_config(())),
         };
         Ok(RoleSpec { service, config })
     }
@@ -682,7 +710,7 @@ async fn heartbeat(
 
 /// Адреса слушателей узла по конфигурации: служебный HTTP, запросы узел → узел (`cluster.listen`, не задан —
 /// `cluster.addr`), HTTP-01 (`acme.enabled`) и слушатели включённых ролей (smtp-in, submission, imap и POP3, jmap,
-/// admin) — для проверки сокетов systemd ([`Sockets::warn_unused`]).
+/// dav, admin) — для проверки сокетов systemd ([`Sockets::warn_unused`]).
 fn listen_addrs(cfg: &Config) -> Vec<SocketAddr> {
     let roles = cfg.roles();
     let mut out = Vec::new();
@@ -707,6 +735,12 @@ fn listen_addrs(cfg: &Config) -> Vec<SocketAddr> {
                 out.push(l.listen);
             }
         }
+        // Роль dav: свой сокет — `http.dav` либо `http.jmap` на узле без роли jmap.
+        if roles.contains(Role::Dav)
+            && let (Some(l), false) = http.dav_listener(roles)
+        {
+            out.push(l.listen);
+        }
     }
     if let Ok(smtp) = cfg.section::<SmtpConfig>(sections::SMTP) {
         for (role, eps) in [
@@ -725,6 +759,12 @@ fn listen_addrs(cfg: &Config) -> Vec<SocketAddr> {
         if imap.pop3.enabled {
             out.extend(imap.pop3.listeners.iter().map(|e| e.listen));
         }
+    }
+    // ManageSieve — в роли imap.
+    if roles.contains(Role::Imap)
+        && let Ok(sieve) = cfg.section::<tp_sieve::SieveConfig>(sections::SIEVE)
+    {
+        out.extend(sieve.managesieve.listen.iter().map(|e| e.listen));
     }
     out
 }
@@ -954,6 +994,105 @@ mod tests {
         let report = running.wait().await.expect("wait");
         assert!(report.failed.is_empty(), "{report:?}");
         assert!(report.cancelled.is_empty(), "{report:?}");
+    }
+
+    /// TLS-соединение со слушателем, доверяя только сертификату `cert` (PEM): `true` — сервер предъявил его.
+    async fn presents(addr: SocketAddr, cert: &[u8]) -> bool {
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(cert).expect("pem"))
+            .expect("root");
+        let cfg = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let name = ServerName::try_from("localhost").expect("name");
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(name, tcp)
+            .await
+            .is_ok()
+    }
+
+    /// APP-35: ключ TLS по ссылке `tls.key` из хранилища секретов узла (файла `key_file` нет) — слушатель с
+    /// неявным TLS стартует; новая версия секрета с новой цепочкой подхватывается без перезапуска.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_key_from_secret_store_and_rotation() {
+        const CERT: &[u8] = include_bytes!("testdata/cert.pem");
+        const KEY: &str = include_str!("testdata/key.pem");
+        // Вторая пара на то же имя (`localhost`) — из тестовых данных tp-platform.
+        let other = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tp-platform/src/testdata");
+        let cert2 = std::fs::read(other.join("cert-b.pem")).expect("cert-b");
+        let key2 = std::fs::read_to_string(other.join("key-b.pem")).expect("key-b");
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, password) = split_password(&dev_url(&url));
+        let secrets = Arc::new(MemSecretStore::default());
+        let db: SecretRef = "thepost/db#password".parse().expect("ref");
+        let key: SecretRef = "thepost/tls#key".parse().expect("ref");
+        secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&cert, CERT).expect("cert");
+        let path = write_config(
+            dir.path(),
+            &format!(
+                "domain: example.org\nprofile: dev\nroles: [imap]\n\
+                 service_http:\n  listen: 127.0.0.1:0\n  allow_plaintext: true\n\
+                 database:\n  url: \"{url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
+                 meta:\n  events:\n    node_ttl: 3s\n\
+                 cluster:\n  node_id: app-tls-{pid}\n\
+                 runtime:\n  drain_deadline: 5s\n\
+                 tls:\n  cert_file: \"{cert}\"\n  key: {{ secret: \"{key}\" }}\n  key_poll_interval: 100ms\n\
+                 imap:\n  listeners:\n    - {{ listen: \"127.0.0.1:0\", implicit_tls: true }}\n\
+                 blob:\n  url: file://{blob}\n",
+                pid = std::process::id(),
+                cert = cert.display(),
+                blob = dir.path().join("blob").display(),
+            ),
+        );
+        // Ключа в хранилище нет — узел не стартует и называет секрет.
+        let (o, _) = opts(path.clone(), Some(secrets.clone()));
+        let e = start(o).await.expect_err("no tls key").to_string();
+        assert!(e.contains("thepost/tls#key"), "{e}");
+        secrets.set(&key, KEY);
+        let (o, shutdown) = opts(path, Some(secrets.clone()));
+        let running = start(o).await.expect("start");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !running.health.is_ready() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "узел не готов: {:?}",
+                running.health.roles_status()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let imap = running.listeners.get(Role::Imap.as_str())[0];
+        assert!(presents(imap, CERT).await);
+        assert!(!presents(imap, &cert2).await);
+
+        // Новая пара: цепочка в файле, ключ — новой версией секрета; опрос секрета (`key_poll_interval`)
+        // перечитывает пару, прежняя действует до успешной загрузки.
+        std::fs::write(&cert, &cert2).expect("cert");
+        secrets.set(&key, key2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !presents(imap, &cert2).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "новая версия ключа не подхвачена"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        shutdown.cancel();
+        let report = running.wait().await.expect("wait");
+        assert!(report.failed.is_empty(), "{report:?}");
     }
 
     /// Сертификаты узлов внутреннего УЦ из `tp-cluster` (CN `a`, `b`; SAN `127.0.0.1`).

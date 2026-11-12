@@ -10,8 +10,6 @@ manual: no
 
 Хвост волны jmap-17, PR #444.
 
-Требует подтверждения владельца: показывать в CalDAV поля CTR-56 (вариант Б агента)? (PR #444, решение 1)
-
 ## Сделать
 - Свойства календаря `default-alarm-vevent-datetime`, `default-alarm-vevent-date` (чтение и `PROPPATCH`) — из
   оповещений по умолчанию `Collection` (CTR-56).

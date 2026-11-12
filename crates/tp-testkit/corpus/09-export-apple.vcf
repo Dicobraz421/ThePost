@@ -1,0 +1,21 @@
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//Apple Inc.//macOS 14.5//EN
+N:Соколов;Пётр;Ильич;;
+FN:Пётр Ильич Соколов
+ORG:АО «Вымпел»;Бухгалтерия
+TITLE:Главный бухгалтер
+EMAIL;type=INTERNET;type=WORK;type=pref:p.sokolov@example.org
+TEL;type=CELL;type=VOICE;type=pref:+7 (900) 555-01-23
+TEL;type=WORK;type=VOICE:+7 (495) 555-01-24
+item1.ADR;type=WORK;type=pref:;;ул. Садовая\, д. 10;Москва;
+ ;101000;Россия
+item1.X-ABADR:ru
+item2.URL;type=pref:https://vympel.example.org
+item2.X-ABLabel:_$!<HomePage>!$_
+item3.X-ABDATE;type=pref:2015-06-01
+item3.X-ABLabel:_$!<Anniversary>!$_
+BDAY:1979-03-15
+X-ABShowAs:PERSON
+X-ABUID:4C1A2B3D-0000-4000-8000-000000000009:ABPerson
+END:VCARD

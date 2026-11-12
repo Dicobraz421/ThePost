@@ -34,9 +34,11 @@ use calcard::icalendar::{
 };
 use time::OffsetDateTime;
 use tp_contracts::ModSeq;
-use tp_contracts::dav::{Collection, CollectionKind, Component};
+use tp_contracts::dav::{Collection, CollectionKind, Component, DavStore};
+use tp_contracts::meta::AccountScope;
 use tp_contracts::{Error, Result};
 
+use crate::config::DavConfig;
 use crate::gal;
 use crate::path::{self, Target};
 use crate::server::{Cx, multistatus, precondition, status};
@@ -81,8 +83,20 @@ pub(crate) enum Res<'a> {
     Principals,
     Principal,
     Home(CollectionKind),
-    /// Ресурс планирования дома календарей: входящие (`true`) или исходящие.
-    Schedule(bool),
+    /// Ресурс планирования дома календарей: входящие (`inbox`) или исходящие.
+    Schedule {
+        inbox: bool,
+        /// Состояние входящих (`getctag`).
+        ctag: Option<ModSeq>,
+        /// Имя календаря по умолчанию (`schedule-default-calendar-URL`).
+        default: Option<&'a str>,
+    },
+    /// Сообщение входящих планирования.
+    InboxItem {
+        name: &'a str,
+        etag: &'a str,
+        body: Option<&'a str>,
+    },
     Collection(&'a Collection),
     Object {
         coll: &'a Collection,
@@ -90,6 +104,8 @@ pub(crate) enum Res<'a> {
         etag: &'a str,
         /// Тело — если запрошены данные объекта.
         body: Option<&'a str>,
+        /// `Schedule-Tag` объекта планирования.
+        tag: Option<&'a str>,
     },
 }
 
@@ -100,7 +116,10 @@ impl Res<'_> {
             Res::Principals => path::PRINCIPALS.to_owned(),
             Res::Principal => path::principal(login),
             Res::Home(k) => path::home(*k, login),
-            Res::Schedule(inbox) => schedule_href(login, *inbox),
+            Res::Schedule { inbox, .. } => schedule_href(login, *inbox),
+            Res::InboxItem { name, .. } => {
+                path::object(CollectionKind::Calendar, login, path::INBOX, name)
+            }
             Res::Collection(c) => path::collection(c.kind, login, &c.name),
             Res::Object { coll, name, .. } => path::object(coll.kind, login, &coll.name, name),
         }
@@ -167,7 +186,7 @@ pub(crate) fn keys(el: &Element) -> Vec<PropName> {
 }
 
 fn is_data(n: &PropName) -> bool {
-    n.is(CALDAV, "calendar-data") || n.is(CARDDAV, "address-data")
+    n.is(CALDAV, "calendar-data") || n.is(CARDDAV, "address-data") || n.is(CALDAV, "schedule-tag")
 }
 
 fn p(ns: &str, name: &str, value: String) -> (PropName, String) {
@@ -193,9 +212,9 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
             CollectionKind::Calendar => "<d:collection/><c:calendar/>",
             CollectionKind::AddressBook => "<d:collection/><card:addressbook/>",
         },
-        Res::Schedule(true) => "<d:collection/><c:schedule-inbox/>",
-        Res::Schedule(false) => "<d:collection/><c:schedule-outbox/>",
-        Res::Object { .. } => "",
+        Res::Schedule { inbox: true, .. } => "<d:collection/><c:schedule-inbox/>",
+        Res::Schedule { inbox: false, .. } => "<d:collection/><c:schedule-outbox/>",
+        Res::Object { .. } | Res::InboxItem { .. } => "",
     };
     let mut v = vec![p(DAV, "resourcetype", rt.to_owned())];
     match res {
@@ -228,12 +247,49 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
                 "schedule-outbox-URL",
                 href(&schedule_href(login, false)),
             ));
+            v.push(p(CALDAV, "calendar-user-type", "INDIVIDUAL".to_owned()));
         }
-        Res::Home(_) | Res::Schedule(_) => v.push(p(DAV, "owner", href(&me))),
+        Res::Home(_) => v.push(p(DAV, "owner", href(&me))),
+        Res::Schedule { ctag, default, .. } => {
+            v.push(p(DAV, "owner", href(&me)));
+            if let Some(state) = ctag {
+                v.push(p(CS, "getctag", state.0.to_string()));
+            }
+            if let Some(name) = default {
+                v.push(p(
+                    CALDAV,
+                    "schedule-default-calendar-URL",
+                    href(&path::collection(CollectionKind::Calendar, login, name)),
+                ));
+            }
+        }
+        Res::InboxItem { etag, body, .. } => {
+            v.push(p(DAV, "getetag", text(&format!("\"{etag}\"")).into_owned()));
+            v.push(p(
+                DAV,
+                "getcontenttype",
+                content_type(CollectionKind::Calendar).to_owned(),
+            ));
+            if let Some(b) = body {
+                v.push(p(CALDAV, "calendar-data", text(b).into_owned()));
+                v.push(p(DAV, "getcontentlength", b.len().to_string()));
+            }
+        }
         Res::Collection(c) => collection_props(cx, c, &me, &mut v),
         Res::Object {
-            coll, etag, body, ..
+            coll,
+            etag,
+            body,
+            tag,
+            ..
         } => {
+            if let Some(t) = tag {
+                v.push(p(
+                    CALDAV,
+                    "schedule-tag",
+                    text(&format!("\"{t}\"")).into_owned(),
+                ));
+            }
             v.push(p(DAV, "getetag", text(&format!("\"{etag}\"")).into_owned()));
             v.push(p(DAV, "getcontenttype", content_type(coll.kind).to_owned()));
             if let Some(b) = body {
@@ -288,6 +344,12 @@ fn collection_props(cx: &Cx<'_>, c: &Collection, me: &str, v: &mut Vec<(PropName
                 v.push(p(ICAL, "calendar-color", text(color).into_owned()));
             }
             v.push(p(ICAL, "calendar-order", c.order.to_string()));
+            let transp = if c.transparent {
+                "<c:transparent/>"
+            } else {
+                "<c:opaque/>"
+            };
+            v.push(p(CALDAV, "schedule-calendar-transp", transp.to_owned()));
             let comps: String = c
                 .components
                 .iter()
@@ -499,7 +561,8 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
             }
             let Some(c) = cx.store().collection_by_name(cx.scope, *kind, name).await? else {
                 if *kind == CollectionKind::Calendar && path::reserved(*kind, name) {
-                    emit(cx, &mut ms, &Res::Schedule(name == path::INBOX), &want);
+                    let inbox = name == path::INBOX;
+                    crate::schedule::propfind(cx, &mut ms, inbox, None, depth1, &want).await?;
                     return Ok(multistatus(ms));
                 }
                 return Ok(status(StatusCode::NOT_FOUND));
@@ -517,6 +580,12 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
                 gal::emit(cx, &mut ms, &g, o, &want);
                 return Ok(multistatus(ms));
             }
+            if let Some((inbox, item)) = crate::schedule::resource(target) {
+                if !crate::schedule::propfind(cx, &mut ms, inbox, item, false, &want).await? {
+                    return Ok(status(StatusCode::NOT_FOUND));
+                }
+                return Ok(multistatus(ms));
+            }
             let Some(c) = cx.store().collection_by_name(cx.scope, *kind, coll).await? else {
                 return Ok(status(StatusCode::NOT_FOUND));
             };
@@ -528,6 +597,7 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
                 name: &o.name,
                 etag: &o.etag,
                 body: Some(&o.body),
+                tag: o.index.schedule_tag.as_deref(),
             };
             emit(cx, &mut ms, &res, &want);
         }
@@ -540,15 +610,19 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
 /// [`path::DEFAULT_TASKS`], [`path::DEFAULT_ADDRESSBOOK`]): одновременные обращения не создают дубликатов
 /// (`Conflict` хранилища — уже создано).
 pub(crate) async fn ensure_defaults(cx: &Cx<'_>, kind: CollectionKind) -> Result<()> {
-    if !cx
-        .store()
-        .list_collections(cx.scope, kind)
-        .await?
-        .is_empty()
-    {
+    defaults(cx.store(), cx.scope, &cx.dav.cfg, kind).await
+}
+
+/// [`ensure_defaults`] без запроса HTTP (приём iTIP).
+pub(crate) async fn defaults(
+    store: &dyn DavStore,
+    scope: AccountScope,
+    cfg: &DavConfig,
+    kind: CollectionKind,
+) -> Result<()> {
+    if !store.list_collections(scope, kind).await?.is_empty() {
         return Ok(());
     }
-    let cfg = &cx.dav.cfg;
     let defaults: &[(&str, &String, Component)] = match kind {
         CollectionKind::Calendar => &[
             (
@@ -575,7 +649,7 @@ pub(crate) async fn ensure_defaults(cx: &Cx<'_>, kind: CollectionKind) -> Result
             components: BTreeSet::from([*component]),
             ..Collection::new(kind, *name)
         };
-        match cx.store().create_collection(cx.scope, c).await {
+        match store.create_collection(scope, c).await {
             Ok(_) | Err(Error::Conflict) => {}
             Err(e) => return Err(e),
         }
@@ -596,6 +670,7 @@ async fn children(cx: &Cx<'_>, ms: &mut Multistatus, c: &Collection, want: &Want
                 name: &o.name,
                 etag: &o.etag,
                 body: Some(&o.body),
+                tag: o.index.schedule_tag.as_deref(),
             };
             emit(cx, ms, &res, want);
         }
@@ -606,6 +681,7 @@ async fn children(cx: &Cx<'_>, ms: &mut Multistatus, c: &Collection, want: &Want
                 name: &r.name,
                 etag: &r.etag,
                 body: None,
+                tag: None,
             };
             emit(cx, ms, &res, want);
         }
@@ -655,6 +731,9 @@ pub(crate) fn apply(c: &mut Collection, name: &PropName, value: Option<&Element>
         }
         (CARDDAV, "addressbook-description") if !calendar => {
             c.description = v.filter(|s| !s.is_empty());
+        }
+        (CALDAV, "schedule-calendar-transp") if calendar => {
+            c.transparent = value.is_some_and(|e| e.child(CALDAV, "transparent").is_some());
         }
         (ICAL, "calendar-color") if calendar => c.color = v.filter(|s| !s.is_empty()),
         (ICAL, "calendar-order") if calendar => match v.as_deref().map(str::parse::<u32>) {

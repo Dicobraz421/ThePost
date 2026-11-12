@@ -5234,6 +5234,7 @@ dependencies = [
  "proptest",
  "schemars",
  "serde",
+ "serde_yaml_ng",
  "thiserror 2.0.21",
  "time",
  "tokio",

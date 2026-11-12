@@ -10,6 +10,11 @@
 //! `min-date-time` / `max-date-time` (`dav.min_date_year`, `dav.max_date_year`); нет коллекции — 409. Проверка
 //! карточек (версия, размер фото) и выдача `GET` в версии vCard из `Accept` — [`crate::card`].
 //!
+//! Планирование (RFC 6638): объект календаря с `ORGANIZER` и `ATTENDEE` получает `Schedule-Tag` (заголовок ответов
+//! `GET` и `PUT`, условие `If-Schedule-Tag-Match` у `PUT` и `DELETE` — 412 при несовпадении); после записи и
+//! удаления сервер рассылает iTIP ([`crate::schedule`]) и дописывает в объект `SCHEDULE-STATUS` — тогда ответ
+//! `PUT` без `ETag` (тело изменено сервером, клиент перечитывает объект).
+//!
 //! `MKCALENDAR` и `MKCOL` — коллекция с именем из последнего сегмента URL: в доме календарей — календарь, в доме
 //! адресных книг — адресная книга (`resourcetype` другого вида — 403 `valid-resourcetype`). Начальные свойства —
 //! как в `PROPPATCH` и `supported-calendar-component-set`; неизвестные свойства пропускаются (клиенты Apple
@@ -22,17 +27,20 @@ use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use calcard::icalendar::{ICalendar, ICalendarProperty};
+use time::OffsetDateTime;
 use tp_contracts::dav::{
-    Collection, CollectionId, CollectionKind, Component, DeleteOutcome, ObjectIndex, Precondition,
-    PutOutcome,
+    Collection, CollectionId, CollectionKind, Component, DavObject, DeleteOutcome, ObjectIndex,
+    Precondition, PutOutcome,
 };
 use tp_contracts::{Error, Result};
 
 use crate::card;
+use crate::deliver;
 use crate::gal;
-use crate::index::{self, IndexError};
+use crate::index::IndexError;
 use crate::path::Target;
 use crate::props::{self, content_type};
+use crate::schedule;
 use crate::server::{Cx, not_allowed, precondition, read, status, xml_response};
 use crate::xml::{self, CALDAV, CARDDAV, DAV, Element, HEADER, XMLNS};
 
@@ -60,6 +68,7 @@ pub(crate) async fn get(cx: &Cx<'_>, target: &Target, head: bool) -> Result<Resp
     let Some(o) = o else {
         return Ok(status(StatusCode::NOT_FOUND));
     };
+    let tag = o.index.schedule_tag.as_deref().and_then(etag_header);
     // Карточка — в версии vCard из `Accept`, если она названа (иначе — как хранится).
     let version = match kind {
         CollectionKind::AddressBook => cx.header("accept").and_then(card::accept_version),
@@ -84,7 +93,32 @@ pub(crate) async fn get(cx: &Cx<'_>, target: &Target, head: bool) -> Result<Resp
     if let Some(e) = etag_header(&o.etag) {
         h.insert(header::ETAG, e);
     }
+    if let Some(t) = tag {
+        h.insert(SCHEDULE_TAG, t);
+    }
     Ok(resp)
+}
+
+/// Заголовок `Schedule-Tag` (RFC 6638 §8.1).
+const SCHEDULE_TAG: &str = "schedule-tag";
+
+/// Условие `If-Schedule-Tag-Match` (RFC 6638 §8.2) по текущему объекту: нет заголовка — `pre` как есть; тег
+/// совпал — запись с условием по ETag прочитанного объекта; иначе `None` (412).
+fn schedule_condition(
+    cx: &Cx<'_>,
+    current: Option<&DavObject>,
+    pre: Precondition,
+) -> Option<Precondition> {
+    let Some(want) = cx.header("if-schedule-tag-match") else {
+        return Some(pre);
+    };
+    let want = want.trim_matches('"');
+    let o = current.filter(|o| o.index.schedule_tag.as_deref() == Some(want))?;
+    match pre {
+        Precondition::IfNoneMatch => None,
+        Precondition::IfMatch(e) if e != o.etag => None,
+        _ => Some(Precondition::IfMatch(o.etag.clone())),
+    }
 }
 
 fn max_size(kind: CollectionKind) -> &'static str {
@@ -108,13 +142,15 @@ fn checked_index(
     cx: &Cx<'_>,
     kind: CollectionKind,
     text: &str,
-) -> std::result::Result<ObjectIndex, &'static str> {
+) -> std::result::Result<(ObjectIndex, Option<ICalendar>), &'static str> {
     const RESOURCE: &str = "<c:valid-calendar-object-resource/>";
     let result = match kind {
         CollectionKind::AddressBook => {
-            return card::check_put(text, cx.dav.cfg.max_photo_size).inspect_err(|inner| {
-                tracing::debug!(precondition = inner, "DAV PUT: карточка не принята");
-            });
+            return card::check_put(text, cx.dav.cfg.max_photo_size)
+                .map(|idx| (idx, None))
+                .inspect_err(|inner| {
+                    tracing::debug!(precondition = inner, "DAV PUT: карточка не принята");
+                });
         }
         CollectionKind::Calendar => match ICalendar::parse(text) {
             Err(_) => Err((IndexError::Calendar, valid_data(kind))),
@@ -123,11 +159,13 @@ fn checked_index(
                     .components
                     .first()
                     .is_some_and(|c| c.has_property(&ICalendarProperty::Method));
-                match index::of_calendar(&ical, &cx.dav.index_options()) {
+                let limits = cx.store().limits();
+                let now = OffsetDateTime::now_utc();
+                match deliver::object_index(&cx.dav.cfg, &limits, &ical, now) {
                     Err(IndexError::Calendar) => Err((IndexError::Calendar, valid_data(kind))),
                     Err(e) => Err((e, RESOURCE)),
                     Ok(_) if method => Err((IndexError::Mixed, RESOURCE)),
-                    Ok(idx) => Ok(idx),
+                    Ok(idx) => Ok((idx, Some(ical))),
                 }
             }
         },
@@ -208,8 +246,8 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
     let Ok(text) = String::from_utf8(bytes.to_vec()) else {
         return Ok(precondition(StatusCode::FORBIDDEN, valid_data(kind)));
     };
-    let idx = match checked_index(cx, kind, &text) {
-        Ok(idx) => idx,
+    let (idx, ical) = match checked_index(cx, kind, &text) {
+        Ok(found) => found,
         Err(inner) => return Ok(precondition(StatusCode::FORBIDDEN, inner)),
     };
     if !c.components.contains(&idx.component) {
@@ -224,9 +262,18 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
     let Some(pre) = condition(cx, c.id, name).await? else {
         return Ok(status(StatusCode::PRECONDITION_FAILED));
     };
+    // Прежний объект календаря: условие по `Schedule-Tag` и сравнение для рассылки iTIP.
+    let old = match kind {
+        CollectionKind::Calendar => cx.store().get_object(cx.scope, c.id, name).await?,
+        CollectionKind::AddressBook => None,
+    };
+    let Some(pre) = schedule_condition(cx, old.as_ref(), pre) else {
+        return Ok(status(StatusCode::PRECONDITION_FAILED));
+    };
+    let tag = idx.schedule_tag.clone();
     match cx
         .store()
-        .put_object(cx.scope, c.id, name, text, idx, pre)
+        .put_object(cx.scope, c.id, name, text, idx.clone(), pre)
         .await?
     {
         PutOutcome::Stored(put) => {
@@ -236,8 +283,27 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
                 StatusCode::NO_CONTENT
             };
             let mut resp = status(code);
-            if let Some(e) = etag_header(&put.etag) {
+            let old_ical = old.and_then(|o| ICalendar::parse(&o.body).ok());
+            let rewritten = match schedule::after_change(cx, old_ical.as_ref(), ical.as_ref()).await
+            {
+                // Итоги рассылки — в объект; одновременная правка клиентом важнее, её не перезаписываем.
+                Some(updated) => {
+                    let pre = Precondition::IfMatch(put.etag.clone());
+                    cx.store()
+                        .put_object(cx.scope, c.id, name, updated.to_string(), idx, pre)
+                        .await
+                        .inspect_err(|e| {
+                            tracing::warn!(error = %e, "DAV PUT: SCHEDULE-STATUS не записан");
+                        })
+                        .is_ok_and(|o| matches!(o, PutOutcome::Stored(_)))
+                }
+                None => false,
+            };
+            if !rewritten && let Some(e) = etag_header(&put.etag) {
                 resp.headers_mut().insert(header::ETAG, e);
+            }
+            if let Some(t) = tag.as_deref().and_then(etag_header) {
+                resp.headers_mut().insert(SCHEDULE_TAG, t);
             }
             Ok(resp)
         }
@@ -266,9 +332,22 @@ pub(crate) async fn delete(cx: &Cx<'_>, target: &Target) -> Result<Response> {
             let Some(pre) = condition(cx, c.id, name).await? else {
                 return Ok(status(StatusCode::PRECONDITION_FAILED));
             };
+            let old = match kind {
+                CollectionKind::Calendar => cx.store().get_object(cx.scope, c.id, name).await?,
+                CollectionKind::AddressBook => None,
+            };
+            let Some(pre) = schedule_condition(cx, old.as_ref(), pre) else {
+                return Ok(status(StatusCode::PRECONDITION_FAILED));
+            };
             Ok(
                 match cx.store().delete_object(cx.scope, c.id, name, pre).await? {
-                    DeleteOutcome::Deleted(_) => status(StatusCode::NO_CONTENT),
+                    DeleteOutcome::Deleted(_) => {
+                        // Организатор удалил встречу — CANCEL участникам; участник — REPLY с отказом.
+                        if let Some(ical) = old.and_then(|o| ICalendar::parse(&o.body).ok()) {
+                            schedule::after_change(cx, Some(&ical), None).await;
+                        }
+                        status(StatusCode::NO_CONTENT)
+                    }
                     DeleteOutcome::PreconditionFailed => status(StatusCode::PRECONDITION_FAILED),
                 },
             )

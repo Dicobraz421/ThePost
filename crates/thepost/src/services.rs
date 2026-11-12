@@ -33,7 +33,7 @@ use tp_contracts::meta::{
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
-use tp_contracts::transport::MailFlow;
+use tp_contracts::transport::{AcceptedDomain, DomainKind, MailFlow};
 use tp_contracts::{Error, Result, TenantId};
 use tp_meta::PgMeta;
 use tp_platform::{Config, Metrics, RateLimitConfig, RateLimiter, TlsCerts};
@@ -119,6 +119,8 @@ pub struct Services {
     pub rules: Arc<tp_sieve::Rules>,
     /// Лимиты проверки текста скрипта в Admin API — секция `sieve` (те же, что при доставке).
     pub sieve_limits: tp_sieve::Limits,
+    /// Секция `sieve` на момент запуска: слушатели и лимиты сеансов ManageSieve (APP-27).
+    pub sieve: Arc<tp_sieve::SieveConfig>,
 }
 
 impl std::fmt::Debug for Services {
@@ -297,6 +299,7 @@ impl Services {
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
         let sieve = (*cfg.section::<tp_sieve::SieveConfig>(SIEVE)?).clone();
         let sieve_limits = sieve.limits();
+        let sieve_section = Arc::new(sieve.clone());
         let rules = Arc::new(
             tp_sieve::Rules::new(Arc::new(meta.clone()), Arc::new(meta.clone()), sieve)
                 .with_node(smtp.hostname.clone()),
@@ -332,6 +335,7 @@ impl Services {
             mail_flow: ext.mail_flow(),
             rules,
             sieve_limits,
+            sieve: sieve_section,
         })
     }
 
@@ -442,6 +446,22 @@ impl Services {
         }
     }
 
+    /// ManageSieve в роли imap (APP-27): вход — SASL узла (служба `sieve` задаётся сеансом `tp-sieve`; проверка —
+    /// через защиту от перебора [`Guarded`], как у IMAP), скрипты — `PgMeta`.
+    pub fn managesieve(
+        &self,
+        profile: tp_contracts::tls::Profile,
+    ) -> crate::protocols::ManageSieveSetup {
+        crate::protocols::ManageSieveSetup {
+            deps: tp_sieve::managesieve::Deps {
+                sasl: self.sasl.clone(),
+                store: Arc::new(self.meta.clone()),
+            },
+            config: self.sieve.clone(),
+            profile,
+        }
+    }
+
     /// Зависимости расширений IMAP: QUOTA (учётные записи), ACL и общие папки (ACL папок, единый слой
     /// авторизации). Без них `tp-imap` эти возможности не объявляет.
     pub fn imap_extensions(&self) -> tp_imap::Extensions {
@@ -490,7 +510,40 @@ impl Services {
             .with_mail_flow(self.mail_flow.clone())
             .with_profile_signer(crate::profile_signer::profile_signer(certs))
             // VacationResponse и SieveScript (JMAP-23, JMAP-24): автоответ из Postman.
-            .with_sieve(Some(Arc::new(self.meta.clone()))))
+            .with_sieve(Some(Arc::new(self.meta.clone())))
+            // Контакты и календари (JMAP-25…29) — то же хранилище, что у CalDAV и CardDAV; занятость — JMAP-30.
+            .with_dav(Some(Arc::new(self.meta.clone())))
+            .with_freebusy(Some(Arc::new(self.meta.clone()))))
+    }
+
+    /// Маршруты календарей и контактов (CalDAV, CardDAV; APP-29): хранилище — `PgMeta`, вход — тот же, что у
+    /// JMAP (с защитой от перебора). С каталогом организации (`auth.ldap`) — глобальная адресная книга
+    /// «Организация» (группы, скрытые из адресной книги, в неё не попадают); без каталога её нет (SRS 4.4).
+    /// `well_known` — добавить перенаправления `/.well-known/caldav` и `/.well-known/carddav` на `/dav/`
+    /// (RFC 6764 §5): для слушателя без JMAP, который отдаёт их сам по `jmap.autoconfig`.
+    pub fn dav(&self, cfg: tp_dav::DavConfig, well_known: bool) -> axum::Router {
+        let deps = tp_dav::Deps {
+            auth: self.authn.clone(),
+            store: Arc::new(self.meta.clone()),
+        };
+        let router = match &self.directory {
+            Some(directory) => tp_dav::router_with_gal(
+                deps,
+                tp_dav::GalDeps {
+                    directory: directory.clone(),
+                    groups: Some(Arc::new(self.meta.clone())),
+                },
+                cfg,
+            ),
+            None => tp_dav::router(deps, cfg),
+        };
+        if !well_known {
+            return router;
+        }
+        let context = || async { axum::response::Redirect::permanent(tp_dav::PREFIX) };
+        router
+            .route("/.well-known/caldav", axum::routing::any(context))
+            .route("/.well-known/carddav", axum::routing::any(context))
     }
 
     /// Admin API.
@@ -508,7 +561,7 @@ impl Services {
             quota: Arc::new(self.meta.clone()),
             policies: Arc::new(PgPolicies(self.meta.clone())),
             resolver: Arc::new(self.meta.clone()),
-            domains: Arc::new(NoDomains),
+            domains: Arc::new(PgDomains(self.meta.clone())),
             trash: Arc::new(self.meta.clone()),
             store: self.store.clone(),
             app_passwords: self.app_passwords.clone(),
@@ -702,23 +755,88 @@ impl tp_admin::groups::Moderation for NoModeration {
     }
 }
 
-/// Домены Admin API: хранения доменов организации в контрактах ещё нет (CTR-25) — операции недоступны.
-struct NoDomains;
+/// Домены Admin API поверх принятых доменов `TransportStore` (`PgMeta`, таблица `domains`; до контракта CTR-25):
+/// список — принятые домены организации, создание — полномочный домен, удаление — только без учётных записей.
+/// Версия снимка кластера устарела между чтением и записью — запись повторяется по свежему снимку.
+struct PgDomains(PgMeta);
 
-const NO_DOMAINS: &str = "домены организации: хранилище ещё не подключено (CTR-25)";
+/// Попыток записи при гонке версий снимка кластера.
+const DOMAIN_ATTEMPTS: usize = 5;
 
 #[async_trait]
-impl tp_admin::DomainStore for NoDomains {
-    async fn list(&self, _tenant: TenantId) -> Result<Vec<tp_admin::Domain>> {
-        Err(Error::Internal(NO_DOMAINS.to_owned()))
+impl tp_admin::DomainStore for PgDomains {
+    async fn list(&self, tenant: TenantId) -> Result<Vec<tp_admin::Domain>> {
+        let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
+        Ok(cluster
+            .domains
+            .into_iter()
+            .filter(|d| d.tenant == tenant)
+            .map(|d| tp_admin::Domain {
+                id: d.id,
+                name: d.name,
+            })
+            .collect())
     }
 
-    async fn create(&self, _tenant: TenantId, _name: &str) -> Result<tp_admin::Domain> {
-        Err(Error::Internal(NO_DOMAINS.to_owned()))
+    async fn create(&self, tenant: TenantId, name: &str) -> Result<tp_admin::Domain> {
+        let domain = AcceptedDomain {
+            id: DomainId::new(),
+            tenant,
+            name: name.to_owned(),
+            kind: DomainKind::Authoritative,
+        };
+        for _ in 0..DOMAIN_ATTEMPTS {
+            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
+            // Имя занято (в любой организации) — `Conflict`; иначе `Conflict` записи — устаревшая версия.
+            if cluster.domain(name).is_some() {
+                return Err(Error::Conflict);
+            }
+            match tp_contracts::transport::TransportStore::put_domain(
+                &self.0,
+                cluster.version,
+                &domain,
+            )
+            .await
+            {
+                Ok(_) => {
+                    return Ok(tp_admin::Domain {
+                        id: domain.id,
+                        name: domain.name,
+                    });
+                }
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
     }
 
-    async fn delete(&self, _tenant: TenantId, _id: DomainId) -> Result<()> {
-        Err(Error::Internal(NO_DOMAINS.to_owned()))
+    async fn delete(&self, tenant: TenantId, id: DomainId) -> Result<()> {
+        for _ in 0..DOMAIN_ATTEMPTS {
+            let cluster = tp_contracts::transport::TransportStore::cluster(&self.0).await?;
+            if !cluster
+                .domains
+                .iter()
+                .any(|d| d.id == id && d.tenant == tenant)
+            {
+                return Err(Error::NotFound);
+            }
+            match tp_contracts::transport::TransportStore::delete_domain(
+                &self.0,
+                cluster.version,
+                id,
+            )
+            .await
+            {
+                Ok(_) => return Ok(()),
+                // Устаревшая версия снимка — повтор по свежему.
+                Err(Error::Conflict) => continue,
+                // Внешний ключ `accounts` → `domains`: у домена есть учётные записи.
+                Err(Error::Invalid(_)) => return Err(Error::Conflict),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict)
     }
 }
 

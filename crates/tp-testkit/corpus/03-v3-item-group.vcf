@@ -1,0 +1,15 @@
+BEGIN:VCARD
+VERSION:3.0
+UID:5f1c2c1e-0a51-4d6e-9c0b-000000000003
+N:Громов;Игорь;Павлович;;
+FN:Игорь Павлович Громов
+ORG:ЗАО «Маяк»;Служба снабжения
+item1.EMAIL;TYPE=INTERNET:i.gromov@example.org
+item1.X-ABLabel:Закупки
+item2.TEL;TYPE=VOICE:+7 812 555-01-03
+item2.X-ABLabel:Склад
+item3.URL:https://mayak.example.org/supply
+item3.X-ABLabel:Портал поставщика
+EMAIL;TYPE=INTERNET,HOME:gromov@example.net
+REV:2026-11-01T10:02:00Z
+END:VCARD

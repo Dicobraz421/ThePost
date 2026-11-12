@@ -16,6 +16,11 @@
 //! `peer_certificates()` соединения TLS. Сертификат от чужого CA — отказ рукопожатия, без сертификата —
 //! соединение принимается. Без настройки сертификат клиента не запрашивается.
 //!
+//! Списки отзыва (CRL, PLT-28) — `client_crl_files` слушателя (PEM или DER): отозванный сертификат клиента не
+//! признаётся — отказ рукопожатия, как сертификату чужого CA. Сертификат CA, для которого списка нет, принимается.
+//! Файлы CA и CRL перечитываются без перезапуска вместе с сертификатами сервера: по событию ОС в их каталогах,
+//! по SIGHUP, опросом (без событий ОС) и по запросу; ошибка перечитывания оставляет в силе прежние CA и списки.
+//!
 //! Текущие цепочка и ключ для подписи (профиль `.mobileconfig`, PLT-23) — [`TlsCerts::certified_key`]: то же, что
 //! у слушателей, включая перечитанное; ключ — `Arc<dyn SigningKey>` rustls, закрытый ключ наружу не выдаётся.
 
@@ -23,11 +28,11 @@ use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;
 use rustls::sign::CertifiedKey;
@@ -111,6 +116,8 @@ pub(crate) enum TlsError {
     NoStore(SecretRef),
     #[error("{path}: client CA: {reason}")]
     ClientCa { path: PathBuf, reason: String },
+    #[error("{path}: client CRL: {reason}")]
+    ClientCrl { path: PathBuf, reason: String },
     #[error("tls: {0}")]
     Rustls(#[from] rustls::Error),
     #[error("tls: loader task failed")]
@@ -126,8 +133,11 @@ impl From<TlsError> for Error {
     }
 }
 
-/// Отметка версии файлов: mtime и размер цепочки и ключа.
-type Stamp = [(Option<SystemTime>, u64); 2];
+/// Отметка версии файла: mtime и размер.
+type FileStamp = (Option<SystemTime>, u64);
+
+/// Отметка версии файлов: цепочка и ключ.
+type Stamp = [FileStamp; 2];
 
 /// Действующие сертификаты сервера. Разделяется слушателями через `Arc`; новые соединения
 /// получают текущую конфигурацию, установленные соединения не затрагиваются.
@@ -135,6 +145,8 @@ pub struct TlsCerts {
     current: RwLock<Arc<Loaded>>,
     files: Mutex<Source>,
     store: Option<Arc<dyn SecretStore>>,
+    /// Проверки сертификата клиента слушателей: их файлы CA и CRL перечитываются вместе с сертификатами.
+    clients: Mutex<Vec<Weak<ClientFiles>>>,
 }
 
 /// Источник действующей пары: секция, отметка файлов и значение секрета ключа (сравнение версий).
@@ -145,11 +157,15 @@ struct Source {
     key: Option<Secret>,
 }
 
-/// Конфигурации с проверкой сертификата клиента по верификатору слушателя.
-type ClientVariants = Vec<(Arc<dyn ClientCertVerifier>, Arc<ServerConfig>)>;
+/// Конфигурации с проверкой сертификата клиента: слушатель, его действующий верификатор и конфигурация.
+type ClientVariants = Vec<(
+    Weak<ClientFiles>,
+    Arc<dyn ClientCertVerifier>,
+    Arc<ServerConfig>,
+)>;
 
 /// Загруженные цепочка и ключ: конфигурация без сертификата клиента и варианты с ним для слушателей с
-/// [`ClientAuth`] (строятся при первом рукопожатии и живут до перечитывания файлов).
+/// [`ClientAuth`] (строятся при первом рукопожатии и живут до перечитывания файлов сервера либо CA и CRL клиента).
 struct Loaded {
     plain: Arc<ServerConfig>,
     /// Цепочка и ключ подписи (ключ загружен провайдером криптографии слушателей).
@@ -188,9 +204,11 @@ impl Loaded {
             .with_client
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, cfg)) = variants
+        let verifier = auth.files.state().verifier;
+        let owner = Arc::downgrade(&auth.files);
+        if let Some((_, _, cfg)) = variants
             .iter()
-            .find(|(v, _)| Arc::ptr_eq(v, &auth.verifier))
+            .find(|(o, v, _)| o.ptr_eq(&owner) && Arc::ptr_eq(v, &verifier))
         {
             return Ok(cfg.clone());
         }
@@ -198,44 +216,139 @@ impl Loaded {
             self.chain.clone(),
             self.key.clone_key(),
             self.min_version,
-            Some(auth.verifier.clone()),
+            Some(verifier.clone()),
         )?);
-        variants.push((auth.verifier.clone(), cfg.clone()));
+        // Варианты закрытых слушателей и прежний верификатор этого слушателя (до перечитывания CA и CRL) не нужны.
+        variants.retain(|(o, _, _)| o.strong_count() > 0 && !o.ptr_eq(&owner));
+        variants.push((owner, verifier, cfg.clone()));
         Ok(cfg)
     }
 }
 
-/// Проверка необязательного сертификата клиента слушателя по доверенным CA (mTLS, PLT-22): сертификат от этих
-/// CA принимается, от чужого — отказ рукопожатия, без сертификата — соединение принимается.
+/// Проверка необязательного сертификата клиента слушателя по доверенным CA (mTLS, PLT-22) и спискам отзыва
+/// (PLT-28): сертификат от этих CA принимается, от чужого или отозванный — отказ рукопожатия, без сертификата —
+/// соединение принимается. Файлы перечитываются [`TlsCerts`], в котором проверка учтена ([`TlsCerts::watch_client`]).
 #[derive(Clone)]
 pub(crate) struct ClientAuth {
+    files: Arc<ClientFiles>,
+}
+
+/// Файлы проверки сертификата клиента и построенный по ним верификатор.
+struct ClientFiles {
+    ca_file: PathBuf,
+    crl_files: Vec<PathBuf>,
+    state: RwLock<ClientState>,
+}
+
+#[derive(Clone)]
+struct ClientState {
     verifier: Arc<dyn ClientCertVerifier>,
+    /// Отметки файла CA и файлов CRL.
+    stamp: Vec<FileStamp>,
 }
 
 impl fmt::Debug for ClientAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClientAuth").finish_non_exhaustive()
+        f.debug_struct("ClientAuth")
+            .field("ca_file", &self.files.ca_file)
+            .field("crl_files", &self.files.crl_files)
+            .finish_non_exhaustive()
     }
 }
 
 impl ClientAuth {
-    /// Доверенные CA из PEM-файла `ca_file` (один или несколько сертификатов). Блокирующий I/O: файл читается
-    /// один раз при открытии слушателя (запуск), как и привязка сокета.
-    pub(crate) fn load(ca_file: &Path) -> Result<Self, TlsError> {
-        let bad = |reason: String| TlsError::ClientCa {
-            path: ca_file.to_owned(),
-            reason,
-        };
-        let mut roots = RootCertStore::empty();
-        for ca in read_chain(ca_file)? {
-            roots.add(ca).map_err(|e| bad(e.to_string()))?;
-        }
-        let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
-            .allow_unauthenticated()
-            .build()
-            .map_err(|e| bad(e.to_string()))?;
-        Ok(Self { verifier })
+    /// Доверенные CA из PEM-файла `ca_file` (один или несколько сертификатов) и списки отзыва `crl_files` (PEM
+    /// или DER). Блокирующий I/O: при открытии слушателя (запуск), как и привязка сокета.
+    pub(crate) fn load(ca_file: &Path, crl_files: &[PathBuf]) -> Result<Self, TlsError> {
+        let state = read_client(ca_file, crl_files)?;
+        Ok(Self {
+            files: Arc::new(ClientFiles {
+                ca_file: ca_file.to_owned(),
+                crl_files: crl_files.to_vec(),
+                state: RwLock::new(state),
+            }),
+        })
     }
+}
+
+impl ClientFiles {
+    fn state(&self) -> ClientState {
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        std::iter::once(&self.ca_file).chain(&self.crl_files)
+    }
+
+    /// Перечитывает CA и CRL: безусловно (`force`) или при изменившихся отметках файлов. `true` — верификатор
+    /// заменён; ошибка оставляет прежний. Блокирующий I/O.
+    fn reload(&self, force: bool) -> Result<bool, TlsError> {
+        if !force && client_stamp(&self.ca_file, &self.crl_files) == self.state().stamp {
+            return Ok(false);
+        }
+        let state = read_client(&self.ca_file, &self.crl_files)?;
+        *self.state.write().unwrap_or_else(PoisonError::into_inner) = state;
+        Ok(true)
+    }
+}
+
+fn client_stamp(ca_file: &Path, crl_files: &[PathBuf]) -> Vec<FileStamp> {
+    std::iter::once(ca_file)
+        .chain(crl_files.iter().map(PathBuf::as_path))
+        .map(file_stamp)
+        .collect()
+}
+
+/// Верификатор сертификата клиента по файлам CA и CRL. Блокирующий I/O.
+fn read_client(ca_file: &Path, crl_files: &[PathBuf]) -> Result<ClientState, TlsError> {
+    let bad = |reason: String| TlsError::ClientCa {
+        path: ca_file.to_owned(),
+        reason,
+    };
+    // Отметка снимается до чтения: изменение во время чтения будет замечено следующим опросом.
+    let stamp = client_stamp(ca_file, crl_files);
+    let mut roots = RootCertStore::empty();
+    for ca in read_chain(ca_file)? {
+        roots.add(ca).map_err(|e| bad(e.to_string()))?;
+    }
+    let mut crls = Vec::new();
+    for path in crl_files {
+        crls.extend(read_crls(path)?);
+    }
+    let mut builder = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
+        .allow_unauthenticated();
+    if !crls.is_empty() {
+        // Список есть не у каждого CA файла: сертификат CA без списка принимается, отозванный по списку — нет.
+        builder = builder.with_crls(crls).allow_unknown_revocation_status();
+    }
+    let verifier = builder.build().map_err(|e| bad(e.to_string()))?;
+    Ok(ClientState { verifier, stamp })
+}
+
+/// Списки отзыва из файла: PEM (один или несколько) либо один список в DER. Блокирующий I/O.
+fn read_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>, TlsError> {
+    let bytes = std::fs::read(path).map_err(|source| TlsError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let bad = |reason: String| TlsError::ClientCrl {
+        path: path.to_owned(),
+        reason,
+    };
+    let pem = rustls_pemfile::crls(&mut bytes.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| bad(e.to_string()))?;
+    if !pem.is_empty() {
+        return Ok(pem);
+    }
+    // DER — SEQUENCE: первый байт 0x30. Содержимое разбирает верификатор.
+    if bytes.first() != Some(&0x30) {
+        return Err(bad("no CRL found".to_owned()));
+    }
+    Ok(vec![CertificateRevocationListDer::from(bytes)])
 }
 
 impl fmt::Debug for TlsCerts {
@@ -274,6 +387,7 @@ impl TlsCerts {
             current: RwLock::new(Arc::new(loaded)),
             files: Mutex::new(source),
             store,
+            clients: Mutex::new(Vec::new()),
         })
     }
 
@@ -323,10 +437,47 @@ impl TlsCerts {
         TlsAcceptor::from(cfg).accept(tcp).await
     }
 
-    /// Перечитывает файлы текущей секции безусловно (например, после выпуска сертификата ACME).
+    /// Берёт файлы CA и CRL проверки `auth` на перечитывание вместе с сертификатами (до закрытия слушателя).
+    pub(crate) fn watch_client(&self, auth: &ClientAuth) {
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        clients.retain(|c| c.strong_count() > 0);
+        clients.push(Arc::downgrade(&auth.files));
+    }
+
+    /// Проверки сертификата клиента открытых слушателей.
+    fn clients(&self) -> Vec<Arc<ClientFiles>> {
+        let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        clients.iter().filter_map(Weak::upgrade).collect()
+    }
+
+    /// Перечитывает файлы CA и CRL слушателей: безусловно (`force`) или изменившиеся. `true` — что-то заменено.
+    /// Ошибка одного слушателя не мешает остальным; возвращается первая.
+    async fn reload_clients(&self, force: bool) -> tp_contracts::Result<bool> {
+        let clients = self.clients();
+        if clients.is_empty() {
+            return Ok(false);
+        }
+        let read = tokio::task::spawn_blocking(move || {
+            let mut changed = false;
+            let mut failed = None;
+            for client in clients {
+                match client.reload(force) {
+                    Ok(done) => changed |= done,
+                    Err(e) => failed = failed.or(Some(e)),
+                }
+            }
+            failed.map_or(Ok(changed), Err)
+        });
+        Ok(read.await.map_err(|_| TlsError::Join)??)
+    }
+
+    /// Перечитывает файлы текущей секции и файлы CA и CRL слушателей безусловно (например, после выпуска
+    /// сертификата ACME).
     pub async fn reload(&self) -> tp_contracts::Result<()> {
         let cfg = self.config();
-        self.reload_with(cfg).await
+        let pair = self.reload_with(cfg).await;
+        let clients = self.reload_clients(true).await;
+        pair.and(clients.map(|_| ()))
     }
 
     /// Применяет новую версию секции: пути и версия TLS. Ошибка — прежние сертификаты остаются.
@@ -337,9 +488,15 @@ impl TlsCerts {
         self.reload_with(cfg.clone()).await
     }
 
-    /// Перечитывает пару, если изменились mtime или размер файлов либо значение секрета ключа (новая версия).
-    /// `true` — сертификаты заменены.
+    /// Перечитывает пару, если изменились mtime или размер файлов либо значение секрета ключа (новая версия), и
+    /// изменившиеся файлы CA и CRL слушателей. `true` — сертификаты, CA или списки отзыва заменены.
     pub async fn reload_if_changed(&self) -> tp_contracts::Result<bool> {
+        let pair = self.reload_pair_if_changed().await;
+        let clients = self.reload_clients(false).await;
+        Ok(pair? | clients?)
+    }
+
+    async fn reload_pair_if_changed(&self) -> tp_contracts::Result<bool> {
         let old = self
             .files
             .lock()
@@ -378,6 +535,9 @@ impl TlsCerts {
             let mut files = vec![cfg.cert_file.clone()];
             if cfg.key.is_none() {
                 files.push(cfg.key_file.clone());
+            }
+            for client in self.clients() {
+                files.extend(client.paths().cloned());
             }
             let dirs = tokio::task::spawn_blocking(move || {
                 fswatch::dirs_of(&files.iter().map(PathBuf::as_path).collect::<Vec<_>>())
@@ -564,11 +724,15 @@ async fn sleep_or_never(wait: Option<Duration>) {
     }
 }
 
-fn stamp(cfg: &TlsConfig) -> Stamp {
-    let one = |p: &Path| match std::fs::metadata(p) {
+fn file_stamp(path: &Path) -> FileStamp {
+    match std::fs::metadata(path) {
         Ok(m) => (m.modified().ok(), m.len()),
         Err(_) => (None, 0),
-    };
+    }
+}
+
+fn stamp(cfg: &TlsConfig) -> Stamp {
+    let one = file_stamp;
     // Ключ из секрета: файл `key_file` не читается и на отметку не влияет.
     let key = match cfg.key {
         Some(_) => (None, 0),
@@ -597,6 +761,16 @@ pub(crate) mod tests {
     pub(crate) const CA_CLIENT: &str = include_str!("testdata/ca-client.pem");
     pub(crate) const CERT_GW: &str = include_str!("testdata/cert-gw.pem");
     pub(crate) const KEY_GW: &str = include_str!("testdata/key-gw.pem");
+    /// CA со списками отзыва (PLT-28): сертификаты клиентов `ok.example.test` и `revoked.example.test`, список
+    /// без отозванных (`CRL_EMPTY`) и с отозванным `revoked.example.test` (`CRL_REVOKED`, он же в DER).
+    pub(crate) const CA_CRL: &str = include_str!("testdata/ca-crl.pem");
+    pub(crate) const CERT_CRL_OK: &str = include_str!("testdata/cert-crl-ok.pem");
+    pub(crate) const KEY_CRL_OK: &str = include_str!("testdata/key-crl-ok.pem");
+    pub(crate) const CERT_CRL_REVOKED: &str = include_str!("testdata/cert-crl-revoked.pem");
+    pub(crate) const KEY_CRL_REVOKED: &str = include_str!("testdata/key-crl-revoked.pem");
+    pub(crate) const CRL_EMPTY: &str = include_str!("testdata/crl-empty.pem");
+    pub(crate) const CRL_REVOKED: &str = include_str!("testdata/crl-revoked.pem");
+    pub(crate) const CRL_REVOKED_DER: &[u8] = include_bytes!("testdata/crl-revoked.der");
 
     /// Временный каталог теста; удаляется при drop.
     pub(crate) struct TempDir(pub(crate) PathBuf);

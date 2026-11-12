@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, test } from "vitest";
 
-import { BASE, open, sent } from "../test-app";
+import { BASE, buttons, open, sent } from "../test-app";
 
 const empty = {
   dkim_selector: null,
@@ -70,7 +70,7 @@ test("учётная запись: создание; ошибка API — в у�
   });
   fireEvent.change(await screen.findByLabelText("Имя входа"), { target: { value: "dave@example.org" } });
   fireEvent.change(screen.getByLabelText("Отображаемое имя"), { target: { value: "Дэйв" } });
-  fireEvent.click(screen.getByRole("button", { name: /Сохранить/ }));
+  fireEvent.click((await buttons(/Сохранить/))[0]);
   await waitFor(() =>
     expect(sent(calls, "POST", `${BASE}/accounts`)[0]?.body).toEqual({ login: "dave@example.org", display_name: "Дэйв" }),
   );

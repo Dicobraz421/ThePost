@@ -9,10 +9,11 @@
 1. `cargo build -p tp-auth --features gssapi` и `cargo nextest run -p tp-auth --features gssapi` — без ошибок.
 
 ## Keytab служб
-1. `ipa service-add imap/mail.corp.example` и `ipa service-add smtp/mail.corp.example`.
-2. `ipa-getkeytab -p imap/mail.corp.example -k /etc/thepost/thepost.keytab`, то же для `smtp/…`;
+1. `ipa service-add imap/mail.corp.example`, `ipa service-add smtp/mail.corp.example` и
+   `ipa service-add sieve/mail.corp.example` (ManageSieve, RFC 5804).
+2. `ipa-getkeytab -p imap/mail.corp.example -k /etc/thepost/thepost.keytab`, то же для `smtp/…` и `sieve/…`;
    `chown thepost: /etc/thepost/thepost.keytab && chmod 600 /etc/thepost/thepost.keytab`.
-3. `klist -k /etc/thepost/thepost.keytab` → оба принципала.
+3. `klist -k /etc/thepost/thepost.keytab` → три принципала.
 
 ## Вход
 1. В config.yaml:
@@ -31,4 +32,8 @@
 4. Отказы: без билета (`kdestroy`) — клиент не начинает обмен; отключённая учётная запись — IMAP
    `NO [AUTHENTICATIONFAILED]`, SMTP `535 5.7.8`; `imtest -u bob@corp.example` (вход от имени другого) —
    `NO [AUTHORIZATIONFAILED]`.
-5. В журнале нет билетов и токенов; при отказе — только `GSSAPI: security context rejected` (уровень debug).
+5. ManageSieve (после подключения в узле, порт 4190): `sieve-connect --server mail.corp.example --authmech GSSAPI
+   --list` → список сценариев; клиент берёт билет `sieve/mail.corp.example` (`klist`). Без принципала
+   `sieve/…` в keytab — отказ `NO`, хотя билет `imap/…` есть: билет другой службы не принимается, в том числе
+   без `hostname` в конфигурации.
+6. В журнале нет билетов и токенов; при отказе — только `GSSAPI: security context rejected` (уровень debug).

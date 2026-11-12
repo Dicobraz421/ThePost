@@ -144,6 +144,7 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, body: Body) -> Result<R
                     name: &o.name,
                     etag: &o.etag,
                     body: need_body.then_some(o.body.as_str()),
+                    tag: o.index.schedule_tag.as_deref(),
                 };
                 props::emit(cx, &mut ms, &res, &want);
             }

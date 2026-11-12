@@ -1,0 +1,63 @@
+---
+source: crates/tp-dav/src/tests/schedule.rs
+expression: "mail(&request.messages[0], IVAN, tenant)"
+---
+From: <ivan@example.org>
+To: <anna@example.net>
+Subject: =?utf-8?B?0J/RgNC40LPQu9Cw0YjQtdC90LjQtTog0J/Qu9Cw0L3RkdGA0Lo=?=
+ =?utf-8?B?0LA=?=
+Date: Thu, 1 Jan 1970 00:00:00 +0000
+Message-ID: <677dbf81d5f31824@example.org>
+MIME-Version: 1.0
+Content-Type: multipart/mixed;
+ boundary="part-1"
+
+
+--part-1
+Content-Type: multipart/alternative;
+ boundary="part-2"
+
+
+--part-2
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: base64
+
+0J/RgNC40LPQu9Cw0YjQtdC90LjQtTog0J/Qu9Cw0L3RkdGA0LrQsA0K0JrQvtCz0LTQsDogMDUu
+MDEuMjAyNiAxMDowMCBVVEMNCtCe0YDQs9Cw0L3QuNC30LDRgtC+0YA6IGl2YW5AZXhhbXBsZS5v
+cmcNCg==
+
+--part-2
+Content-Type: text/calendar; method="REQUEST"; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//The Post//DAV//RU
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:m-5
+DTSTART:20260105T100000Z
+DURATION:PT1H
+SEQUENCE:0
+SUMMARY:=D0=9F=D0=BB=D0=B0=D0=BD=D1=91=D1=80=D0=BA=D0=B0
+ORGANIZER:mailto:ivan@example.org
+ATTENDEE;PARTSTAT=3DNEEDS-ACTION:mailto:anna@example.net
+DTSTAMP:19700101T000000Z
+END:VEVENT
+END:VCALENDAR
+
+--part-2--
+
+--part-1
+Content-Type: application/ics; name="invite.ics"
+Content-Disposition: attachment; filename="invite.ics"
+Content-Transfer-Encoding: base64
+
+QkVHSU46VkNBTEVOREFSDQpWRVJTSU9OOjIuMA0KUFJPRElEOi0vL1RoZSBQb3N0Ly9EQVYvL1JV
+DQpNRVRIT0Q6UkVRVUVTVA0KQkVHSU46VkVWRU5UDQpVSUQ6bS01DQpEVFNUQVJUOjIwMjYwMTA1
+VDEwMDAwMFoNCkRVUkFUSU9OOlBUMUgNClNFUVVFTkNFOjANClNVTU1BUlk60J/Qu9Cw0L3RkdGA
+0LrQsA0KT1JHQU5JWkVSOm1haWx0bzppdmFuQGV4YW1wbGUub3JnDQpBVFRFTkRFRTtQQVJUU1RB
+VD1ORUVEUy1BQ1RJT046bWFpbHRvOmFubmFAZXhhbXBsZS5uZXQNCkRUU1RBTVA6MTk3MDAxMDFU
+MDAwMDAwWg0KRU5EOlZFVkVOVA0KRU5EOlZDQUxFTkRBUg0K
+
+--part-1--

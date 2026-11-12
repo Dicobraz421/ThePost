@@ -854,6 +854,7 @@ fn emit(
         name: &o.name,
         etag: &o.etag,
         body,
+        tag: o.index.schedule_tag.as_deref(),
     };
     props::emit(cx, ms, &res, want);
 }

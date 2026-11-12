@@ -1,0 +1,17 @@
+BEGIN:VCARD
+VERSION:4.0
+EMAIL;PREF=1:d.belov@example.com
+EMAIL:belov@example.net
+FN:Дмитрий Белов
+N:Белов;Дмитрий;;;
+ORG:НИИ «Квант»;Лаборатория №3
+TITLE:Старший научный сотрудник
+TEL;TYPE=work;VALUE=TEXT:+7 383 555-01-51
+TEL;TYPE=cell;VALUE=TEXT:+7 900 555-01-52
+ADR;TYPE=work:;;ул. Академическая\, 7;Новосибирск
+ ;;630090;Россия
+URL;TYPE=work;VALUE=URL:https://kvant.example.org
+TZ;VALUE=TEXT:Asia/Novosibirsk
+NOTE:Звонить после 10:00 по Новосибирску.
+UID:5f1c2c1e-0a51-4d6e-9c0b-000000000012
+END:VCARD

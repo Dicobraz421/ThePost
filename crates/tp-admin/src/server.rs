@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
+use tp_contracts::blob::BlobStore;
 use tp_contracts::delivery::DeliveryLog;
 use tp_contracts::ext::{AdminRequest, AdminRoutes};
 use tp_contracts::groups::GroupStore;
@@ -152,6 +153,12 @@ pub struct AdminConfig {
     pub max_page_size: usize,
     /// Наибольший размер тела запроса, байт.
     pub max_body_size: usize,
+    /// Предел длины темы и отправителя письма в списках корзины и модерации (`include=subject`), символов.
+    pub subject_max_chars: usize,
+    /// Сколько байт начала письма читается ради заголовков `Subject` и `From` (`include=subject`).
+    pub header_scan_bytes: usize,
+    /// Наибольший размер страницы списка с содержимым (`include=subject`): на каждое письмо — чтение объекта.
+    pub content_page_size: usize,
     /// Адрес слушателя (связывает `tp-platform`); по умолчанию — только loopback.
     pub listen: SocketAddr,
     /// Разрешить внешний адрес слушателя (не loopback, не частный, `0.0.0.0`/`::`); по умолчанию — нет (SRS 6.8).
@@ -172,6 +179,9 @@ impl Default for AdminConfig {
             page_size: 100,
             max_page_size: 1_000,
             max_body_size: 1_048_576,
+            subject_max_chars: 200,
+            header_scan_bytes: 65_536,
+            content_page_size: 100,
             listen: SocketAddr::from(([127, 0, 0, 1], 8443)),
             allow_external: false,
             audit: AuditExportConfig::default(),
@@ -210,6 +220,12 @@ impl AdminConfig {
         self.audit.check()?;
         self.init.check()?;
         self.console.check()?;
+        if self.subject_max_chars == 0 || self.header_scan_bytes == 0 || self.content_page_size == 0
+        {
+            return Err(Error::invalid(
+                "admin: subject_max_chars, header_scan_bytes, content_page_size — не меньше 1",
+            ));
+        }
         if self.page_size == 0 || self.page_size > self.max_page_size {
             return Err(Error::invalid("admin: page_size — от 1 до max_page_size"));
         }
@@ -228,6 +244,16 @@ impl AdminConfig {
     /// Размер страницы по запросу клиента.
     pub(crate) fn page(&self, limit: Option<usize>) -> usize {
         limit.unwrap_or(self.page_size).clamp(1, self.max_page_size)
+    }
+
+    /// Размер страницы списка; с содержимым писем (`content`) — не больше `content_page_size`.
+    pub(crate) fn content_page(&self, limit: Option<usize>, content: bool) -> usize {
+        let page = self.page(limit);
+        if content {
+            page.min(self.content_page_size)
+        } else {
+            page
+        }
     }
 }
 
@@ -305,6 +331,8 @@ pub struct Admin {
     pub(crate) local: Option<Arc<Local>>,
     /// Правила Sieve и автоответ; `None` — не подключено (маршруты отвечают 503).
     pub(crate) sieve: Option<crate::sieve::Sieve>,
+    /// Объекты писем очереди модерации; `None` — не подключено (тема письма очереди — `null`).
+    pub(crate) held_blobs: Option<Arc<dyn BlobStore>>,
 }
 
 impl fmt::Debug for Admin {
@@ -315,6 +343,7 @@ impl fmt::Debug for Admin {
             .field("transport", &self.transport.is_some())
             .field("local", &self.local.is_some())
             .field("sieve", &self.sieve.is_some())
+            .field("held_blobs", &self.held_blobs.is_some())
             .finish()
     }
 }
@@ -343,12 +372,21 @@ impl Admin {
             transport: None,
             local: None,
             sieve: None,
+            held_blobs: None,
         })
     }
 
     /// Подключает настройки транспорта ([`crate::transport`]).
     pub fn with_transport(mut self, transport: Arc<dyn TransportStore>) -> Self {
         self.transport = Some(transport);
+        self
+    }
+
+    /// Подключает чтение объектов писем очереди модерации (`HeldMessage::blob`) — для темы письма в списке очереди
+    /// (`include=subject`, [`crate::groups`]). Хранилище должно отдавать письмо как принято (RFC 5322): если узел
+    /// сжимает объекты, сюда передаётся читатель с распаковкой. Без него тема — `null`.
+    pub fn with_held_blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
+        self.held_blobs = Some(blobs);
         self
     }
 
@@ -476,6 +514,7 @@ async fn guard(
             route,
             path,
             status: resp.status().as_u16(),
+            content_messages: None,
         };
         if let Err(e) = a.d.audit.record(&record).await {
             tracing::error!(error = %e, route = %record.route, "admin: запись аудита не сохранена");
@@ -555,6 +594,30 @@ pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 impl From<Error> for ApiError {
     fn from(e: Error) -> Self {
         Self(e)
+    }
+}
+
+/// Отказ обработчика с кодом и пояснением, которых нет у `tp_contracts::Error` (409 и 422 с `detail`).
+#[derive(Debug)]
+pub(crate) enum Refused {
+    /// Ошибка контракта.
+    Api(Error),
+    /// Код HTTP и пояснение.
+    Problem(StatusCode, String),
+}
+
+impl From<Error> for Refused {
+    fn from(e: Error) -> Self {
+        Self::Api(e)
+    }
+}
+
+impl IntoResponse for Refused {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Api(e) => ApiError(e).into_response(),
+            Self::Problem(status, detail) => problem(status, Some(detail)),
+        }
     }
 }
 

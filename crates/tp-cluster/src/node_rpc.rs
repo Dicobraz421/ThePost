@@ -12,7 +12,8 @@
 //! Идентичность узла по сертификату (CLU-14): URI `thepost:node:<id>` в SAN; без него — имена DNS и адреса IP
 //! из SAN, узел — тот, чей хост в `NodeInfo::addr` среди них (без масок `*.`); CN — только у сертификата без
 //! таких SAN (выпуск до CLU-14). Сертификаты перечитываются без перезапуска ([`NodeRpc::reload_tls`],
-//! [`NodeRpc::follow_tls`]): новые соединения — с новыми, установленные дорабатывают на прежних.
+//! [`NodeRpc::follow_tls`]; ключ из хранилища секретов — [`NodeTls::load_with_secrets`],
+//! [`NodeRpc::follow_tls_with_secrets`], CLU-16): новые соединения — с новыми, установленные дорабатывают на прежних.
 //!
 //! Протокол: `POST /rpc/<роль>/<служба>`, тело — длина ключа (u32, big-endian), ключ, тело запроса; остаток срока —
 //! заголовок `x-thepost-rpc-deadline-ms`. Ответ — заголовок `x-thepost-rpc` (`ok` или вид ошибки), тело — ответ
@@ -53,7 +54,8 @@ use tokio_rustls::server::TlsStream;
 use tp_contracts::membership::{Membership, NodeId, NodeInfo};
 use tp_contracts::role::Role;
 use tp_contracts::rpc::{Rpc, RpcError, RpcHandler, RpcRequest, RpcService};
-use tp_contracts::tls::InternalTls;
+use tp_contracts::secrets::SecretStore;
+use tp_contracts::tls::{InternalTls, KeySource};
 use tp_contracts::{Error, Result};
 use tracing::{debug, info, warn};
 use x509_parser::extensions::GeneralName;
@@ -228,17 +230,54 @@ impl std::fmt::Debug for NodeTls {
 }
 
 impl NodeTls {
-    /// Читает PEM-файлы секции `rpc.tls`: `ca_file`, `cert_file` и `key_file` обязательны.
+    /// Читает PEM-файлы секции `rpc.tls`: `ca_file`, `cert_file` и `key_file` обязательны. Ключ по ссылке на
+    /// секрет (`key`) требует хранилища — [`NodeTls::load_with_secrets`], здесь — `Invalid`.
     pub async fn load(tls: &InternalTls) -> Result<Self> {
+        Self::load_from(tls, None).await
+    }
+
+    /// Как [`NodeTls::load`], с хранилищем секретов `store` для ключа по ссылке `key`: значение секрета — PEM,
+    /// на диск не пишется. Обязательны `ca_file`, `cert_file` и `key_file` либо `key` (оба сразу — `Invalid`).
+    /// Секция с ключом в файле хранилище не читает. Хранилище недоступно — его ошибка (повторяемая).
+    pub async fn load_with_secrets(tls: &InternalTls, store: &dyn SecretStore) -> Result<Self> {
+        Self::load_from(tls, Some(store)).await
+    }
+
+    async fn load_from(tls: &InternalTls, store: Option<&dyn SecretStore>) -> Result<Self> {
         let need = |path: &Option<PathBuf>, field: &str| {
             path.clone().ok_or_else(|| {
                 Error::Invalid(format!("rpc.tls.{field} is required (node-to-node mTLS)"))
             })
         };
+        let source = tls.key_source().map_err(|e| match e {
+            Error::Invalid(m) => Error::Invalid(format!("rpc.{m}")),
+            other => other,
+        })?;
         let ca = read_pem(need(&tls.ca_file, "ca_file")?).await?;
         let cert = read_pem(need(&tls.cert_file, "cert_file")?).await?;
-        let key = read_pem(need(&tls.key_file, "key_file")?).await?;
-        Self::from_pem(&ca, &cert, &key)
+        match source {
+            Some(KeySource::File(path)) => {
+                let key = read_pem(path.to_path_buf()).await?;
+                Self::from_pem(&ca, &cert, &key)
+            }
+            Some(KeySource::Secret(secret)) => {
+                let store = store.ok_or_else(|| {
+                    Error::invalid("rpc.tls.key requires a secret store (secrets section)")
+                })?;
+                // Значение секрета в текст ошибки не попадает: только ссылка и вид отказа.
+                let key = store.get(secret).await.map_err(|e| {
+                    if e.is_retryable() {
+                        e
+                    } else {
+                        Error::Invalid(format!("rpc.tls.key: secret {secret}: {e}"))
+                    }
+                })?;
+                Self::from_pem(&ca, &cert, key.expose().as_bytes())
+            }
+            None => Err(Error::invalid(
+                "rpc.tls.key_file or rpc.tls.key is required (node-to-node mTLS)",
+            )),
+        }
     }
 
     /// Из PEM: корневые сертификаты внутреннего УЦ, цепочка сертификата узла (первый — узла) и его ключ.
@@ -437,14 +476,39 @@ impl NodeRpc {
 
     /// Перечитывает файлы секции `tls` ([`NodeTls::load`]) по каждому событию `events` до конца потока.
     /// События — изменение каталога сертификатов, SIGHUP, запрос (источник — приложение, как у PLT-17/PLT-19).
-    /// Ошибка — `warn` в лог, прежние сертификаты остаются.
+    /// Ошибка — `warn` в лог, прежние сертификаты остаются. Ключ по ссылке `key` —
+    /// [`NodeRpc::follow_tls_with_secrets`].
     pub async fn follow_tls<S>(&self, tls: &InternalTls, events: S)
+    where
+        S: Stream<Item = ()>,
+    {
+        self.follow(tls, None, events).await;
+    }
+
+    /// Как [`NodeRpc::follow_tls`], с хранилищем секретов `store`: по тем же событиям заново читаются файлы и
+    /// ключ по ссылке `key` ([`NodeTls::load_with_secrets`]). Ключ, не подходящий к сертификату, недоступное
+    /// хранилище, нет секрета — `warn` в лог, действует прежняя пара.
+    pub async fn follow_tls_with_secrets<S>(
+        &self,
+        tls: &InternalTls,
+        store: Arc<dyn SecretStore>,
+        events: S,
+    ) where
+        S: Stream<Item = ()>,
+    {
+        self.follow(tls, Some(store.as_ref()), events).await;
+    }
+
+    async fn follow<S>(&self, tls: &InternalTls, store: Option<&dyn SecretStore>, events: S)
     where
         S: Stream<Item = ()>,
     {
         let mut events = std::pin::pin!(events);
         while events.next().await.is_some() {
-            match NodeTls::load(tls).await.and_then(|t| self.reload_tls(t)) {
+            match NodeTls::load_from(tls, store)
+                .await
+                .and_then(|t| self.reload_tls(t))
+            {
                 Ok(()) => info!(node = %self.inner.id, "rpc: tls certificates reloaded"),
                 Err(e) => warn!(
                     node = %self.inner.id,

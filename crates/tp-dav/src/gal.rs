@@ -9,11 +9,18 @@
 //! группа — `KIND:group` (`X-ADDRESSBOOKSERVER-KIND` в 3.0). Оргструктура (подразделение, должность, руководитель) —
 //! DAV-22.
 //!
-//! Версия снимка — хеш состава и содержимого карточек: она же ETag каждой карточки, `getctag` и токен
-//! синхронизации книги. `sync-collection`: пустой токен — все карточки, токен текущего снимка — без изменений, токен
-//! прежнего снимка — 403 `valid-sync-token` (клиент повторяет полную синхронизацию и так узнаёт и об удалённых).
-//! Снимок хранится в памяти процесса `dav.gal_cache` (каталог не опрашивается на каждый запрос). Запись (`PUT`,
-//! `DELETE`, `PROPPATCH`, `MKCOL`) — 403 `DAV:need-privileges`.
+//! ETag карточки — хеш её тела: меняется только у изменённой карточки, клиент после смены токена книги сверяет
+//! список ETag и скачивает лишь изменённые. Версия снимка — хеш состава и содержимого всех карточек: `getctag` и
+//! токен синхронизации книги. `sync-collection`: пустой токен — все карточки, токен текущего снимка — без изменений,
+//! токен прежнего снимка — 403 `valid-sync-token` (клиент повторяет полную синхронизацию и так узнаёт и об
+//! удалённых). Снимок хранится в памяти процесса `dav.gal_cache` (каталог не опрашивается на каждый запрос). Запись
+//! (`PUT`, `DELETE`, `PROPPATCH`, `MKCOL`) — 403 `DAV:need-privileges`.
+//!
+//! Книга отчуждаема: основной путь к адресной книге организации — свой клиент (JMAP), CardDAV-книга — для сторонних
+//! клиентов. Вся её логика — в этом модуле, включается только [`crate::router_with_gal`]. Чтобы убрать: удалить
+//! модуль, `GalDeps` и `router_with_gal` (`server.rs`), обращения `gal::` в `props.rs`, `resource.rs`, `sync.rs`,
+//! `card.rs`, `server.rs`, настройки `gal_*` (`config.rs`), имя `path::GAL` и тесты `tests/gal.rs`; хранилище и
+//! остальной CardDAV от неё не зависят.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -271,32 +278,34 @@ fn resource_name(uid: &str) -> String {
     format!("{safe}.vcf")
 }
 
-/// Снимок из карточек: версия — хеш имён и тел.
+fn hash(value: impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Снимок из карточек: ETag карточки — хеш её тела, версия снимка — хеш имён и тел всех карточек.
 fn build(display_name: &str, cards: Vec<Card>) -> Gal {
     let mut named: BTreeMap<String, Card> = BTreeMap::new();
     for (uid, body) in cards {
         named.entry(resource_name(&uid)).or_insert((uid, body));
     }
-    let mut hasher = DefaultHasher::new();
-    for (name, (_, body)) in &named {
-        (name, body).hash(&mut hasher);
-    }
+    let all: Vec<(&String, &String)> = named.iter().map(|(n, (_, body))| (n, body)).collect();
     // Старший бит свободен: версия помещается в знаковое 64-битное число.
-    let version = hasher.finish() >> 1;
+    let version = hash(&all) >> 1;
     let coll = Collection {
         id: CollectionId::new(),
         display_name: display_name.to_owned(),
         state: ModSeq(version),
         ..Collection::new(CollectionKind::AddressBook, path::GAL)
     };
-    let etag = format!("{version:x}");
     let cards = named
         .into_iter()
         .map(|(name, (uid, body))| DavObject {
             id: DavObjectId::new(),
             collection: coll.id,
             name,
-            etag: etag.clone(),
+            etag: format!("{:x}", hash(&body)),
             body,
             index: ObjectIndex::new(Component::Card, uid, None),
         })
@@ -311,6 +320,7 @@ pub(crate) fn emit(cx: &Cx<'_>, ms: &mut Multistatus, g: &Gal, o: &DavObject, wa
         name: &o.name,
         etag: &o.etag,
         body: want.needs_body().then_some(o.body.as_str()),
+        tag: None,
     };
     props::emit(cx, ms, &res, want);
 }

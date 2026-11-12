@@ -4,7 +4,9 @@
 //! (`trash_retention` цепочки организация → домен → ящик; `null` — значение по умолчанию конфигурации хранилища).
 //! Срок задаётся политиками уровней ([`crate::accounts`]) и действует на элементы, удалённые после изменения.
 //! Восстановление — `MailStore::restore`: письмо возвращается в исходную папку (нет — во «Входящие») с тем же
-//! идентификатором, клиенты получают уведомление.
+//! идентификатором, клиенты получают уведомление. Тема и отправитель писем (`subject`, `from`) — только по
+//! `include=subject` и только администратору, с записью в аудит (`crate::content`); источник — `MailStore::fetch_raw`.
+//! Скрытые письма (`…/trash/hidden`) `fetch_raw` не отдаёт, поэтому у них тема и отправитель — `null`.
 //!
 //! «Очистить корзину» в клиенте — настройка `trash.purge` (решение 2026-11-01-trash-purge): правило администратора
 //! (`mode`, `user_can_choose`) — поле `trash_purge` политики уровня ([`crate::accounts`]), выбор пользователя
@@ -15,9 +17,10 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{MatchedPath, Path, Query, State};
+use axum::http::Uri;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tp_contracts::config::duration;
@@ -29,7 +32,8 @@ use tp_contracts::{AccountId, Error, MessageId, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::accounts::account;
-use crate::server::{Admin, ApiResult, Problem};
+use crate::content::{self, Access};
+use crate::server::{Admin, ApiResult, Caller, Problem};
 
 /// Страница списка.
 #[derive(Debug, Deserialize, IntoParams)]
@@ -40,6 +44,9 @@ pub struct PageQuery {
     pub offset: usize,
     /// Размер страницы (по умолчанию и наибольший — из конфигурации).
     pub limit: Option<usize>,
+    /// `subject` — отдать тему и отправителя писем (`subject`, `from`). Только администратору; запрос пишется в
+    /// журнал аудита как доступ к содержимому; страница — не больше `admin.content_page_size`.
+    pub include: Option<String>,
 }
 
 /// Элемент корзины.
@@ -63,6 +70,15 @@ pub struct TrashEntry {
     #[serde(with = "time::serde::rfc3339")]
     #[schema(value_type = String, format = DateTime)]
     pub expires_at: OffsetDateTime,
+    /// Тема письма (заголовок `Subject`, декодированный, обрезанный). Поле есть только с `include=subject`;
+    /// `null` — заголовка нет или письмо недоступно.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub subject: Option<Option<String>>,
+    /// Отправитель (заголовок `From`: `Имя <адрес>`). Поле есть только с `include=subject`; `null` — как у темы.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub from: Option<Option<String>>,
 }
 
 /// Страница корзины.
@@ -217,6 +233,8 @@ impl From<TrashItem> for TrashEntry {
             received_at: i.received_at,
             deleted_at: i.deleted_at,
             expires_at: i.expires_at,
+            subject: None,
+            from: None,
         }
     }
 }
@@ -225,25 +243,41 @@ impl From<TrashItem> for TrashEntry {
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/accounts/{account}/trash", tag = "trash",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("account" = String, Path, description = "Учётная запись (UUID)"), PageQuery),
-    responses((status = 200, body = TrashPage), (status = 404, body = Problem)))]
+    responses((status = 200, body = TrashPage), (status = 400, body = Problem), (status = 403, body = Problem),
+        (status = 404, body = Problem)))]
 async fn list(
     State(a): State<Arc<Admin>>,
+    Extension(caller): Extension<Caller>,
+    route: MatchedPath,
+    uri: Uri,
     Path((org, id)): Path<(TenantId, AccountId)>,
     Query(q): Query<PageQuery>,
 ) -> ApiResult<Json<TrashPage>> {
-    Ok(Json(page(&a, org, id, &q, false).await?))
+    let access = Access {
+        caller: &caller,
+        org,
+        route: route.as_str(),
+        path: uri.path(),
+    };
+    Ok(Json(page(&a, &access, id, &q, false).await?))
 }
 
 /// Страница видимых (`hidden = false`) или скрытых элементов корзины и действующий срок корзины.
+/// С `include=subject` — тема и отправитель писем страницы: только администратору, с записью в аудит.
 async fn page(
     a: &Admin,
-    org: TenantId,
+    access: &Access<'_>,
     id: AccountId,
     q: &PageQuery,
     hidden: bool,
 ) -> Result<TrashPage, Error> {
+    let org = access.org;
+    let subjects = content::requested(q.include.as_deref())?;
+    if subjects {
+        access.check(a).await?;
+    }
     let acc = account(a, org, id).await?;
-    let limit = a.cfg.page(q.limit);
+    let limit = a.cfg.content_page(q.limit, subjects);
     let scope = AccountScope {
         tenant: org,
         account: id,
@@ -257,10 +291,37 @@ async fn page(
         a.d.resolver
             .resolve(org, Some(acc.domain), Some(id), None)
             .await?;
+    let next_offset = (items.len() == limit).then(|| q.offset + limit);
+    let mut entries = Vec::with_capacity(items.len());
+    if subjects {
+        access.record(a, 200, items.len()).await?;
+    }
+    for item in items {
+        let message = match item.object {
+            TrashObject::Message(m) if subjects => Some(m),
+            _ => None,
+        };
+        let mut entry = TrashEntry::from(item);
+        if subjects {
+            let head = match message {
+                Some(m) => {
+                    let raw =
+                        a.d.store
+                            .fetch_raw(scope, m, Some(content::head_range(&a.cfg)))
+                            .await;
+                    content::headline(&a.cfg, raw).await
+                }
+                None => content::Headline::default(),
+            };
+            entry.subject = Some(head.subject);
+            entry.from = Some(head.from);
+        }
+        entries.push(entry);
+    }
     Ok(TrashPage {
         trash_retention: policy.trash_retention,
-        next_offset: (items.len() == limit).then(|| q.offset + limit),
-        items: items.into_iter().map(TrashEntry::from).collect(),
+        next_offset,
+        items: entries,
     })
 }
 
@@ -292,13 +353,23 @@ async fn restore(
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/accounts/{account}/trash/hidden", tag = "trash",
     params(("org" = String, Path, description = "Организация (UUID)"),
         ("account" = String, Path, description = "Учётная запись (UUID)"), PageQuery),
-    responses((status = 200, body = TrashPage), (status = 404, body = Problem)))]
+    responses((status = 200, body = TrashPage), (status = 400, body = Problem), (status = 403, body = Problem),
+        (status = 404, body = Problem)))]
 async fn list_hidden(
     State(a): State<Arc<Admin>>,
+    Extension(caller): Extension<Caller>,
+    route: MatchedPath,
+    uri: Uri,
     Path((org, id)): Path<(TenantId, AccountId)>,
     Query(q): Query<PageQuery>,
 ) -> ApiResult<Json<TrashPage>> {
-    Ok(Json(page(&a, org, id, &q, true).await?))
+    let access = Access {
+        caller: &caller,
+        org,
+        route: route.as_str(),
+        path: uri.path(),
+    };
+    Ok(Json(page(&a, &access, id, &q, true).await?))
 }
 
 /// Восстанавливает скрытое (или видимое) письмо корзины в исходную папку (нет — во «Входящие»);
@@ -424,6 +495,128 @@ mod tests {
         let audited = log.iter().find(|r| r.path == restore).expect("audit");
         assert_eq!(audited.status, 200);
         assert_eq!(audited.tenant, Some(TenantId::DEFAULT));
+    }
+
+    /// Приёмка ADM-19: тема и отправитель — только по `include=subject`, администратору, с записью в аудит.
+    #[tokio::test]
+    async fn subjects_on_request() {
+        let env = Env::new();
+        let scope = env.account("user@example.org").await;
+        let ids = [
+            env.deliver(scope, "=?UTF-8?B?0J7RgtGH0ZHRgg==?= Q3").await,
+            env.deliver(scope, &"x".repeat(300)).await,
+        ];
+        env.store.delete_to_trash(scope, &ids).await.expect("trash");
+        let base = format!(
+            "/api/v1/orgs/{}/accounts/{}/trash",
+            TenantId::DEFAULT,
+            scope.account
+        );
+        let content = |env: &Env| -> Vec<_> {
+            let log = env.audit.records();
+            log.into_iter()
+                .filter(|r| r.content_messages.is_some())
+                .collect()
+        };
+
+        // Без параметра полей нет и записи о доступе к содержимому нет.
+        let (s, _, b) = env.call("GET", &base, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let item = b["items"][0].as_object().expect("item");
+        assert!(!item.contains_key("subject") && !item.contains_key("from"));
+        assert!(content(&env).is_empty());
+
+        let with = format!("{base}?include=subject");
+        let (s, _, b) = env.call("GET", &with, Some("org"), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let items = b["items"].as_array().expect("items");
+        let by_id = |id: MessageId| {
+            items
+                .iter()
+                .find(|i| i["message"] == id.to_string())
+                .expect("item")
+        };
+        assert_eq!(by_id(ids[0])["subject"], "Отчёт Q3");
+        assert_eq!(by_id(ids[0])["from"], "a@example.com");
+        let long = by_id(ids[1])["subject"].as_str().expect("subject");
+        assert_eq!(long.len(), 200, "обрезано до subject_max_chars");
+        let log = content(&env);
+        assert_eq!(log.len(), 1);
+        let r = &log[0];
+        assert_eq!(
+            (r.method.as_str(), r.status, r.content_messages),
+            ("GET", 200, Some(2))
+        );
+        assert_eq!(
+            (r.route.as_str(), r.path.as_str(), r.actor_login.as_str()),
+            (
+                "/api/v1/orgs/{org}/accounts/{account}/trash",
+                base.as_str(),
+                "admin@example.org"
+            )
+        );
+        assert!(
+            !serde_json::to_string(r).expect("json").contains("Отчёт"),
+            "тем в аудите нет"
+        );
+
+        // Оператору содержимое не отдаётся (отказ — в аудите), список без содержимого — да.
+        let (s, _, _) = env.call("GET", &with, Some("operator"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, _) = env.call("GET", &base, Some("operator"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let log = content(&env);
+        let last = log.last().expect("audit");
+        assert_eq!(
+            (log.len(), last.status, last.actor_login.as_str()),
+            (2, 403, "ops@example.org")
+        );
+        let (s, _, _) = env
+            .call("GET", &format!("{base}?include=body"), Some("org"), None)
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // Страница с содержимым — не больше content_page_size; скрытые письма — так же.
+        let cfg = AdminConfig {
+            content_page_size: 1,
+            subject_max_chars: 5,
+            ..config()
+        };
+        let env = Env::with(cfg, Vec::new());
+        let scope = env.account("user@example.org").await;
+        let ids = [
+            env.deliver(scope, "первое письмо").await,
+            env.deliver(scope, "второе письмо").await,
+        ];
+        env.store.delete_to_trash(scope, &ids).await.expect("trash");
+        let base = format!(
+            "/api/v1/orgs/{}/accounts/{}/trash",
+            TenantId::DEFAULT,
+            scope.account
+        );
+        let page = format!("{base}?include=subject&limit=50");
+        let (s, _, b) = env.call("GET", &page, Some("root"), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let items = b["items"].as_array().expect("items");
+        assert_eq!((items.len(), &b["next_offset"]), (1, &json!(1)));
+        let subject = items[0]["subject"].as_str().expect("subject");
+        assert!(["перво", "второ"].contains(&subject), "{subject}");
+        assert_eq!(content(&env)[0].content_messages, Some(1));
+
+        // Скрытое письмо хранилище не отдаёт (`MailStore::fetch_raw` — `NotFound`): поля есть, значения — `null`.
+        env.trash
+            .purge(scope, &ids, &DecisionHooks::default())
+            .await
+            .expect("purge");
+        let hidden = format!("{base}/hidden?include=subject");
+        let (s, _, b) = env.call("GET", &hidden, Some("root"), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let item = b["items"][0].as_object().expect("item");
+        assert_eq!(
+            (item.get("subject"), item.get("from")),
+            (Some(&Value::Null), Some(&Value::Null))
+        );
+        assert_eq!(content(&env).len(), 2);
     }
 
     /// Срок корзины — из политики организации, домена или ящика (самый специфичный уровень).

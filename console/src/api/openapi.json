@@ -511,6 +511,407 @@
         }
       }
     },
+    "/api/v1/orgs/{org}/accounts/{account}/sieve/deactivate": {
+      "post": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Снимает активность со всех скриптов учётной записи.",
+        "operationId": "deactivate",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts": {
+      "get": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Скрипты учётной записи.",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Script"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}": {
+      "get": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Скрипт с текстом.",
+        "operationId": "read",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Имя скрипта",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScriptBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Создаёт или заменяет скрипт (активность сохраняется); текст проверяется до записи.",
+        "operationId": "put",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Имя скрипта (до 128 символов, без управляющих)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptText"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {},
+          "400": {
+            "description": "недопустимое имя",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "ошибки в тексте",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScriptProblem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "лимит числа скриптов или размера текста",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Удаляет скрипт; активный — 409 (сначала снять активность).",
+        "operationId": "remove",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Имя скрипта",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "скрипт активен",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}/activate": {
+      "post": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Делает скрипт активным; прежний активный становится неактивным.",
+        "operationId": "activate",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Имя скрипта",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/orgs/{org}/accounts/{account}/trash": {
       "get": {
         "tags": [
@@ -818,6 +1219,139 @@
             }
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/vacation": {
+      "get": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Автоответ учётной записи; не задан — выключен.",
+        "operationId": "vacation",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VacationBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Заменяет автоответ учётной записи целиком.",
+        "operationId": "set_vacation",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Учётная запись (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VacationBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VacationBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1854,6 +2388,145 @@
             }
           },
           "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orgs/{org}/sieve": {
+      "get": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Скрипт организации; не задан — 404.",
+        "operationId": "org_script",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScriptText"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Задаёт скрипт организации; текст проверяется до записи.",
+        "operationId": "set_org_script",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptText"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {},
+          "422": {
+            "description": "ошибки в тексте",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScriptProblem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "лимит размера текста",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "sieve"
+        ],
+        "summary": "Удаляет скрипт организации; повторное удаление — не ошибка.",
+        "operationId": "remove_org_script",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "Организация (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "503": {
             "content": {
               "application/json": {
                 "schema": {
@@ -3851,6 +4524,121 @@
           }
         }
       },
+      "Script": {
+        "type": "object",
+        "description": "Скрипт в списке учётной записи.",
+        "required": [
+          "name",
+          "size",
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Активный (выполняется при доставке); активный не больше одного."
+          },
+          "name": {
+            "type": "string",
+            "description": "Имя."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Размер текста, байт.",
+            "minimum": 0
+          }
+        }
+      },
+      "ScriptBody": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Script",
+            "description": "Скрипт."
+          },
+          {
+            "type": "object",
+            "required": [
+              "text"
+            ],
+            "properties": {
+              "text": {
+                "type": "string",
+                "description": "Текст (RFC 5228)."
+              }
+            }
+          }
+        ],
+        "description": "Скрипт с текстом."
+      },
+      "ScriptError": {
+        "type": "object",
+        "description": "Ошибка в тексте скрипта с позицией.",
+        "required": [
+          "line",
+          "column",
+          "message"
+        ],
+        "properties": {
+          "column": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Столбец (с 1, в символах).",
+            "minimum": 0
+          },
+          "line": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Строка (с 1).",
+            "minimum": 0
+          },
+          "message": {
+            "type": "string",
+            "description": "Описание."
+          }
+        }
+      },
+      "ScriptProblem": {
+        "type": "object",
+        "description": "Отказ записи скрипта: ошибки текста (RFC 9457 с расширением `errors`).",
+        "required": [
+          "status",
+          "title",
+          "errors"
+        ],
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScriptError"
+            },
+            "description": "Ошибки текста с позициями."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Код HTTP (422).",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string",
+            "description": "Краткое описание кода."
+          }
+        }
+      },
+      "ScriptText": {
+        "type": "object",
+        "description": "Текст скрипта (запись скрипта учётной записи и организации; чтение скрипта организации).",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Текст (RFC 5228)."
+          }
+        },
+        "additionalProperties": false
+      },
       "SourceBody": {
         "type": "object",
         "description": "Доверенный источник: создание или замена (имя — в пути).",
@@ -4018,6 +4806,54 @@
           "user_can_choose": {
             "type": "boolean",
             "description": "Пользователь может выбрать своё значение; иначе действует `mode`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "VacationBody": {
+        "type": "object",
+        "description": "Автоответ учётной записи (модель JMAP `VacationResponse`, RFC 8621 §8); выполняется до активного скрипта.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Включён."
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Начало действия; `null` — сразу."
+          },
+          "html_body": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Текст ответа HTML."
+          },
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Тема; `null` — по умолчанию («Автоответ: <тема письма>»)."
+          },
+          "text_body": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Текст ответа."
+          },
+          "to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Конец действия (не включая); `null` — бессрочно."
           }
         },
         "additionalProperties": false

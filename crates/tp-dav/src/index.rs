@@ -6,14 +6,22 @@
 //! правило без `COUNT` и `UNTIL`, вхождение позже горизонта или достигнутый лимит — интервал без конца. Ошибка дат
 //! (нет `DTSTART` у события, неверное правило) или объект без дат (задача без `DTSTART` и `DUE`) — без интервала:
 //! такой объект — кандидат любого запроса time-range (CONTRACTS.md#Dav).
+//!
+//! Занятость ([`ObjectIndex::busy`], CONTRACTS.md#Schedule) — вхождения событий до горизонта развёртки, не больше
+//! `MAX_BUSY_PERIODS`: `TRANSP:TRANSPARENT`, `STATUS:CANCELLED` и вхождения нулевой длины не занимают,
+//! `STATUS:TENTATIVE` — отдельным видом; исключения (`RECURRENCE-ID`, `EXDATE`) учтены. Горизонт занятости
+//! хранилища (`DavLimits::busy_horizon`) применяет [`clip_busy`].
 
 use calcard::common::timezone::Tz;
+use calcard::icalendar::dates::CalendarExpand;
 use calcard::icalendar::{
-    ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarProperty, ICalendarValue,
+    ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarProperty, ICalendarStatus,
+    ICalendarTransparency, ICalendarValue,
 };
 use calcard::vcard::VCard;
 use time::OffsetDateTime;
 use tp_contracts::dav::{CollectionKind, Component, ObjectIndex, Span};
+use tp_contracts::schedule::{BusyKind, BusyPeriod, MAX_BUSY_PERIODS, merge_busy};
 
 /// Параметры развёртки повторов.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +102,55 @@ pub fn of_calendar(ical: &ICalendar, opts: &IndexOptions) -> Result<ObjectIndex,
     }
     let component = component.ok_or(IndexError::Calendar)?;
     let uid = uid.ok_or(IndexError::Uid)?.to_owned();
-    checked(ObjectIndex::new(component, uid, span(ical, opts)))
+    let exp = ical.expand_dates(Tz::UTC, opts.max_instances);
+    let mut idx = ObjectIndex::new(component, uid, span(ical, &exp, opts));
+    if component == Component::Event {
+        idx.busy = busy(ical, &exp, opts);
+    }
+    checked(idx)
+}
+
+/// Оставляет в индексе занятости периоды, начинающиеся раньше `until` (момент записи плюс
+/// `DavLimits::busy_horizon`).
+pub fn clip_busy(idx: &mut ObjectIndex, until: OffsetDateTime) {
+    idx.busy.retain(|p| p.start < until);
+}
+
+/// Периоды занятости события: вхождения до горизонта, склеенные по видам.
+fn busy(ical: &ICalendar, exp: &CalendarExpand, opts: &IndexOptions) -> Vec<BusyPeriod> {
+    if !exp.errors.is_empty() {
+        return Vec::new();
+    }
+    let at = |t: i64| OffsetDateTime::from_unix_timestamp(t).ok();
+    let mut out = Vec::new();
+    for e in &exp.events {
+        let Some(comp) = ical.component_by_id(e.comp_id) else {
+            continue;
+        };
+        let (s, en) = e.timestamps();
+        if comp.component_type != ICalendarComponentType::VEvent
+            || en <= s
+            || comp.transparency() == Some(&ICalendarTransparency::Transparent)
+            || comp.status() == Some(&ICalendarStatus::Cancelled)
+        {
+            continue;
+        }
+        let (Some(start), Some(end)) = (at(s), at(en)) else {
+            continue;
+        };
+        if start > opts.horizon {
+            continue;
+        }
+        let kind = if comp.status() == Some(&ICalendarStatus::Tentative) {
+            BusyKind::Tentative
+        } else {
+            BusyKind::Busy
+        };
+        out.push(BusyPeriod { start, end, kind });
+    }
+    let mut out = merge_busy(out);
+    out.truncate(MAX_BUSY_PERIODS);
+    out
 }
 
 fn checked(idx: ObjectIndex) -> Result<ObjectIndex, IndexError> {
@@ -102,8 +158,7 @@ fn checked(idx: ObjectIndex) -> Result<ObjectIndex, IndexError> {
     Ok(idx)
 }
 
-fn span(ical: &ICalendar, opts: &IndexOptions) -> Option<Span> {
-    let exp = ical.expand_dates(Tz::UTC, opts.max_instances);
+fn span(ical: &ICalendar, exp: &CalendarExpand, opts: &IndexOptions) -> Option<Span> {
     if !exp.errors.is_empty() || exp.events.is_empty() {
         return None;
     }
@@ -210,6 +265,46 @@ mod tests {
                 "{rule}"
             );
         }
+    }
+
+    #[test]
+    fn busy_index() {
+        let p = |d: u8, h1: u8, h2: u8, kind| BusyPeriod {
+            start: at(2026, Month::January, d, h1),
+            end: at(2026, Month::January, d, h2),
+            kind,
+        };
+        // Повтор с исключённым вхождением и перенесённым (под вопросом) вхождением.
+        let body = event("RRULE:FREQ=DAILY;COUNT=4\r\nEXDATE:20260106T100000Z\r\n").replace(
+            "END:VCALENDAR",
+            "BEGIN:VEVENT\r\nUID:ev-1\r\nRECURRENCE-ID:20260107T100000Z\r\nDTSTART:20260107T140000Z\r\n\
+             DTEND:20260107T150000Z\r\nSTATUS:TENTATIVE\r\nEND:VEVENT\r\nEND:VCALENDAR",
+        );
+        let mut idx = calendar(&body, &opts()).expect("index");
+        assert_eq!(
+            idx.busy,
+            vec![
+                p(5, 10, 11, BusyKind::Busy),
+                p(7, 14, 15, BusyKind::Tentative),
+                p(8, 10, 11, BusyKind::Busy),
+            ]
+        );
+        clip_busy(&mut idx, at(2026, Month::January, 7, 0));
+        assert_eq!(idx.busy, vec![p(5, 10, 11, BusyKind::Busy)]);
+        for free in ["TRANSP:TRANSPARENT\r\n", "STATUS:CANCELLED\r\n"] {
+            assert!(
+                calendar(&event(free), &opts())
+                    .expect("index")
+                    .busy
+                    .is_empty(),
+                "{free}"
+            );
+        }
+        // Повтор без конца — до горизонта, не больше лимита контракта.
+        let open = calendar(&event("RRULE:FREQ=DAILY\r\n"), &opts()).expect("index");
+        assert!(!open.busy.is_empty() && open.busy.len() <= MAX_BUSY_PERIODS);
+        assert!(open.busy.iter().all(|b| b.start <= opts().horizon));
+        open.validate().expect("valid");
     }
 
     #[test]
