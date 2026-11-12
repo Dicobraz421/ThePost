@@ -251,7 +251,7 @@ SRS 5.2, решение 2026-11-01-borrowings-security (CTR-21; код — `deli
 и поиск, содержимое писем не хранится. `DeliveryEvent { tenant, at, node: NodeId, kind, sender, recipients, message_id: Option<_>
 (без угловых скобок), queue_id: Option<QueueId>, decision, reason: Option<String> }`; `DeliveryEventKind { Receive, Reject, Deliver,
 Relay, Dsn, Itip }` (`Itip`, CTR-66 — приём iTIP из письма iMIP: `decision` `Accept` — применено, `Discard` — пропущено, `reason` —
-`METHOD` или `METHOD: причина`, `delivery::itip_record(method, &ItipOutcome)`; пишет `tp-smtp`, SMTP-37; `tp-meta` — миграция 0033),
+`METHOD` или `METHOD: причина`, `delivery::itip_record(method, &ItipOutcome)`; пишет `tp-smtp`, SMTP-37; `tp-meta` — миграция 0035),
 `DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, Hold }` (строки в нижнем регистре).
 `DeliveryLog`: `record(event)`, `record_batch(Vec<_>)` (по умолчанию — по одной), `search(tenant, &DeliveryQuery) -> DeliveryPage
 { events, next: Option<DeliveryCursor> }`, `purge(before)` — по всем организациям (maintenance), можно целыми сутками-секциями.
@@ -1017,7 +1017,7 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   набор `suite::account_by_address`; `PgMeta` до META-68 — без псевдонимов. `AccountStore::by_ids` — без реализации по умолчанию
   (`MemMetadata`, обёртка `Limited` в тестах `tp-imap`; `PgMeta` — META-66). `DavStore::inbox_state`, `inbox_changes` (надгробия
   входящих), `InboxItem::received_at`; набор `suite::itip::inbox_log`; `PgMeta` — META-69 (до неё `inbox_changes` — `Internal`).
-  `DeliveryEventKind::Itip` и `delivery::itip_record`; `tp-meta` — миграция 0033 (`delivery_log.kind`). Несовместимо: новые
+  `DeliveryEventKind::Itip` и `delivery::itip_record`; `tp-meta` — миграция 0035 (`delivery_log.kind`). Несовместимо: новые
   обязательные методы `AccountStore`, `DavStore`, поле `InboxItem::received_at`, вариант `DeliveryEventKind`. По сравнению с карточками:
   методы без реализаций по умолчанию (правило владельца); итог iTIP — в `decision` и `reason`, а не полями варианта (событие — строка в
   хранилище и Admin API).
