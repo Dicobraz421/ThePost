@@ -30,7 +30,7 @@ use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, QueueId, Result, Te
 use uuid::Uuid;
 
 use crate::PgMeta;
-use crate::schema::{begin_system, db_err, to_i64, to_u32, to_u64};
+use crate::schema::{begin, begin_system, db_err, to_i64, to_u32, to_u64};
 use crate::shards::ShardId;
 
 /// Хранилища шарда записи очереди `id` среди `views`: по захвату этого экземпляра или поиском по шардам;
@@ -467,6 +467,53 @@ impl QueueStore for PgMeta {
         .await
     }
 
+    /// Запись ещё не захватывали — `fencing = 0` (захват его увеличивает); удаление блокирует строку, поэтому
+    /// отмена и `claim` (`FOR UPDATE SKIP LOCKED`) атомарны между собой.
+    async fn cancel_queued(&self, tenant: TenantId, id: QueueId) -> Result<BlobKey> {
+        if let Some(views) = self.shard_views().await? {
+            let view = queue_view(self, &views, id).await?;
+            return QueueStore::cancel_queued(view, tenant, id).await;
+        }
+        self.once(async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let row: Option<(Vec<u8>, i64)> = sqlx::query_as(
+                "DELETE FROM queue WHERE tenant_id = $1 AND queue_id = $2 AND fencing = 0
+                 RETURNING blob_hash, blob_gen",
+            )
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let Some((hash, generation)) = row else {
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM queue WHERE tenant_id = $1 AND queue_id = $2)",
+                )
+                .bind(tenant.as_uuid())
+                .bind(id.as_uuid())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                crate::commits::commit(tx).await?;
+                return Err(if exists {
+                    Error::Conflict
+                } else {
+                    Error::NotFound
+                });
+            };
+            crate::commits::commit(tx).await?;
+            Ok(BlobKey {
+                tenant,
+                hash: BlobHash(
+                    hash.try_into()
+                        .map_err(|_| Error::internal("хэш объекта письма не 32 байта"))?,
+                ),
+                generation: Gen(to_u32(generation)?),
+            })
+        })
+        .await
+    }
+
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
         if let Some(views) = self.shard_views().await? {
             let view = queue_view(self, &views, claim.id).await?;
@@ -511,7 +558,7 @@ async fn insert_queued(tx: &mut PgConnection, id: QueueId, msg: &OutMessage) -> 
     sqlx::query(
         "INSERT INTO queue (tenant_id, queue_id, blob_hash, blob_gen, size, mail_from, envid, ret,
                             queued_at, next_attempt)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest(now(), $9), $9)",
     )
     .bind(msg.tenant.as_uuid())
     .bind(id.as_uuid())
