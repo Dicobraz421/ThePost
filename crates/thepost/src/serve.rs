@@ -31,9 +31,9 @@ use tp_meta::events::EventConsumer;
 use tp_meta::{MetaConfig, PgMeta};
 use tp_platform::roles::RssGauge;
 use tp_platform::{
-    Config, Health, LoadConfig, LoadInputs, Metrics, NodeLoad, PressureConfig, Reloader, RoleSpec,
-    Roles, RolesReport, RuntimeConfig, ServiceHttpConfig, Telemetry, TelemetryConfig, TlsCerts,
-    TlsConfig, section_watch,
+    Config, DbMetrics, Health, LoadConfig, LoadInputs, Metrics, NodeLoad, PressureConfig, Reloader,
+    RoleSpec, Roles, RolesReport, RuntimeConfig, ServiceHttpConfig, Telemetry, TelemetryConfig,
+    TlsCerts, TlsConfig, section_watch,
 };
 use tp_platform::{pressure, service_http};
 use tp_search::{IndexCache, SearchConfig};
@@ -155,6 +155,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
 
     let db = infra::connect_node_db(&cfg, store.clone()).await?;
     crate::metrics::register_failover(&metrics, db.clone());
+    let db_metrics = DbMetrics::register(&metrics, &*cfg.section::<TelemetryConfig>("telemetry")?);
     let pool = db.pool().clone();
     let meta_cfg = (*cfg.section::<MetaConfig>(MetaConfig::SECTION)?).clone();
     let migrations = infra::migration_pool(&cfg, store.as_ref(), &pool).await?;
@@ -168,6 +169,10 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     let bus = infra::open_bus(&cfg, Some(&db), store.clone()).await?;
     let sample = bus.sample.clone();
     metrics.register_bus(move || sample());
+    // Метрики Д.7 (APP-34): пул узла, слушатель LISTEN, время фиксаций с NOTIFY.
+    // TODO(META-55): наблюдателя ожидания соединения передать пулу `tp-meta`, когда он начнёт его принимать, —
+    // до тех пор `tp_db_pool_waiting`, `tp_db_pool_wait_seconds` и `tp_db_pool_acquire_errors_total` нулевые.
+    let _pool_observer = crate::metrics::register_db(&metrics, &db_metrics, &db, bus.signals);
     let bus = bus.bus;
     let meta = PgMeta::new(pool, meta_cfg).with_bus(bus.clone());
 
@@ -334,6 +339,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         signals: signals.clone(),
         gc: blob_cfg.gc.clone(),
         orphans: blob_cfg.orphans.clone(),
+        orphan_probe: crate::metrics::register_orphans(&metrics),
         trash: Some(services.mail.clone()),
         purge: Some(Purge {
             meta: meta.clone(),

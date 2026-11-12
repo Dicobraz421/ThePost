@@ -12,6 +12,8 @@
 //! Планирование встреч (APP-28): приглашение из CalDAV и JMAP — участнику организации в календарь, внешнему —
 //! письмом iMIP в очередь исходящей почты.
 //!
+//! Метрики Д.7 (APP-34): `/metrics` узла с шиной LISTEN/NOTIFY — пул СУБД, слушатель, фиксации с NOTIFY, «сироты».
+//!
 //! Без `TEST_DATABASE_URL` тесты пропускаются.
 
 use std::path::{Path, PathBuf};
@@ -1711,6 +1713,85 @@ async fn meeting_scheduling() {
     assert_eq!(queued(&pool, external_jmap).await, 1);
     assert_eq!(queued(&pool, &bob).await, 0);
     pool.close().await;
+    shutdown.cancel();
+    let report = running.wait().await.expect("report");
+    assert!(report.failed.is_empty(), "{report:?}");
+    drop_database(&url, &db_name).await;
+}
+
+// ---------- APP-34: метрики Д.7 ----------
+
+/// `/metrics` узла с шиной LISTEN/NOTIFY содержит показатели критериев Д.7: пул СУБД, слушатель, время фиксаций
+/// с NOTIFY и число слушателей, «сироты» BLOB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d7_metrics() {
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = Arc::new(MemSecretStore::default());
+    let db: SecretRef = "thepost/db#password".parse().expect("ref");
+    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+
+    let path = dir.path().join("config.yaml");
+    let text = config(dir.path(), &db_url, "example.ru")
+        .replace("roles: [all]", "roles: [jmap, maintenance]");
+    assert!(!text.contains("roles: [all]"), "{text}");
+    assert!(!text.contains("\nbus:"), "{text}");
+    std::fs::write(&path, format!("{text}bus:\n  kind: postgres\n")).expect("config");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+
+    // Слушатель подключается в фоне; фиксации с NOTIFY — публикации узла (членство, журнал событий).
+    let until = deadline();
+    let text = loop {
+        let text = running.metrics.encode().expect("metrics");
+        if text.contains("tp_db_listener_connected{listener=\"signals\"} 1") {
+            break text;
+        }
+        retry(until, "слушатель LISTEN подключён").await;
+    };
+    for name in [
+        // Пул узла.
+        "tp_db_pool_in_use{pool=\"primary\"}",
+        "tp_db_pool_idle{pool=\"primary\"}",
+        "tp_db_pool_max{pool=\"primary\"}",
+        "tp_db_pool_waiting{pool=\"primary\"}",
+        "tp_db_pool_wait_seconds_bucket{le=\"+Inf\",pool=\"primary\"}",
+        "tp_db_pool_acquire_errors_total{pool=\"primary\"}",
+        // Слушатель.
+        "tp_db_listener_connected{listener=\"signals\"}",
+        // NOTIFY: время фиксаций и число слушателей.
+        "tp_db_notify_commit_seconds_bucket{le=\"+Inf\"}",
+        "tp_db_notify_commit_seconds_count",
+        "tp_db_commit_seconds_bucket{le=\"+Inf\"}",
+        "tp_db_listeners 1",
+        "tp_db_notify_commit_share",
+        // «Сироты».
+        "tp_blob_orphans_passes_total",
+        "tp_blob_orphans_found_total",
+        "tp_blob_orphans_deleted_total",
+        "tp_blob_orphans_remaining",
+    ] {
+        assert!(text.contains(name), "{name}: {text}");
+    }
+
     shutdown.cancel();
     let report = running.wait().await.expect("report");
     assert!(report.failed.is_empty(), "{report:?}");
