@@ -222,7 +222,7 @@ fn openldap_cfg() -> LdapConfig {
     LdapConfig {
         base_dn: "dc=example,dc=org".into(),
         accounts: AccountMap {
-            disabled: Some(DisabledRule {
+            disabled: Some(FlagRule {
                 attribute: "nsAccountLock".into(),
                 value: Some("true".into()),
                 flag: None,
@@ -464,7 +464,7 @@ fn ad_cfg() -> LdapConfig {
             login: "userPrincipalName".into(),
             display_name: "displayName".into(),
             emails: vec!["mail".into(), "proxyAddresses".into()],
-            disabled: Some(DisabledRule {
+            disabled: Some(FlagRule {
                 attribute: "userAccountControl".into(),
                 value: None,
                 flag: Some(2),
