@@ -576,8 +576,14 @@ impl Services {
             .route("/.well-known/carddav", axum::routing::any(context)))
     }
 
-    /// Admin API.
-    pub fn admin(&self, ext: &Registry, cfg: tp_admin::AdminConfig) -> Result<tp_admin::Admin> {
+    /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`
+    /// (`impl Moderation for Delivery`, FIX-01) без правил потока почты: письмо прошло их при приёме.
+    pub fn admin(
+        &self,
+        ext: &Registry,
+        cfg: tp_admin::AdminConfig,
+        smtp: &SmtpConfig,
+    ) -> Result<tp_admin::Admin> {
         let deps = tp_admin::Deps {
             auth: self.authn.clone(),
             audit: Arc::new(tp_admin::LogAudit),
@@ -585,7 +591,7 @@ impl Services {
             audit_log: None,
             delivery: Arc::new(self.meta.clone()),
             groups: Arc::new(self.meta.clone()),
-            moderation: Arc::new(NoModeration),
+            moderation: Arc::new(self.base_delivery(smtp)?),
             modules: ext.admin_routes().to_vec(),
             accounts: Arc::new(self.meta.clone()),
             quota: Arc::new(self.meta.clone()),
@@ -756,32 +762,6 @@ impl tp_admin::PolicyStore for PgPolicies {
         self.0
             .set_policy(tenant, policy_target(target), policy)
             .await
-    }
-}
-
-/// Решения модерации групп: доставки одобренного письма участникам и DSN отказа в сборке ещё нет.
-struct NoModeration;
-
-const NO_MODERATION: &str = "модерация групп рассылки: доставка решений ещё не подключена";
-
-#[async_trait]
-impl tp_admin::groups::Moderation for NoModeration {
-    async fn deliver(
-        &self,
-        _tenant: TenantId,
-        _group: Option<&tp_contracts::groups::DistributionGroup>,
-        _message: &tp_contracts::groups::HeldMessage,
-    ) -> Result<()> {
-        Err(Error::Internal(NO_MODERATION.to_owned()))
-    }
-
-    async fn reject(
-        &self,
-        _tenant: TenantId,
-        _message: &tp_contracts::groups::HeldMessage,
-        _reason: &str,
-    ) -> Result<()> {
-        Err(Error::Internal(NO_MODERATION.to_owned()))
     }
 }
 
@@ -1250,6 +1230,245 @@ mod tests {
 
         stop.cancel();
         drop((services, delivery, meta));
+        crate::testutil::drop_database(&url, &db_name).await;
+    }
+
+    /// FIX-02: письмо внешнего отправителя в модерируемую группу узла (`PgMeta`) → Admin API узла (`Services::admin`,
+    /// сессия `admin init`): `approve` — 204 (было 500 «доставка решений ещё не подключена»), письмо у каждого
+    /// участника, повтор — 404; `reject` — 204, DSN отправителю в очереди исходящей почты.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moderation_decisions_through_admin_api() {
+        use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
+        use tp_contracts::meta::{AccountUpsert, SpecialUse};
+        use tp_contracts::queue::SubmitStatus;
+        use tp_contracts::transport::TransportStore;
+        use tp_contracts::{GroupId, HeldId};
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
+        let meta = PgMeta::new(pool.clone(), tp_meta::MetaConfig::default()).with_bus(bus.clone());
+        let cfg = crate::sections::registry_of(crate::modules::BUILTIN)
+            .expect("registry")
+            .parse(
+                "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
+                 database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\n\
+                 blob:\n  url: file:///var/lib/thepost/blob\n",
+                Vec::new(),
+            )
+            .expect("config");
+        let ext = Registry::default();
+        let metrics = tp_platform::Metrics::default();
+        let services = Services::build(Base {
+            cfg: &cfg,
+            meta: meta.clone(),
+            blob: Arc::new(tp_testkit::MemBlobStore::default()),
+            bus: bus.clone(),
+            secrets: Arc::new(tp_testkit::MemSecretStore::default()),
+            ext: &ext,
+            metrics: &metrics,
+            node: NodeId::new("fix-02").expect("node"),
+        })
+        .await
+        .expect("services");
+        let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
+        let t = TenantId::DEFAULT;
+        let stop = tp_contracts::role::CancellationToken::new();
+        tokio::spawn(services.routes.clone().watch(
+            bus.clone(),
+            stop.clone(),
+            std::time::Duration::from_millis(50),
+        ));
+
+        // Admin API узла с локальным входом (как роль admin в `serve`): администратор `admin init` — модератор.
+        let admin_cfg = cfg.section::<AdminSection>(ADMIN).expect("admin").0.clone();
+        let admin = Arc::new(crate::local_admin::attach(
+            services.admin(&ext, admin_cfg, &smtp).expect("admin"),
+            &services,
+        ));
+        let granted = admin
+            .init(&tp_admin::InitRequest {
+                email: "admin@example.org".into(),
+                display_name: None,
+                force: false,
+            })
+            .await
+            .expect("admin init");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let router = admin.clone().router();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let http = reqwest::Client::new();
+        let r = http
+            .post(format!("{base}/api/v1/session"))
+            .bearer_auth(&granted.token)
+            .send()
+            .await
+            .expect("session");
+        assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+        let session: serde_json::Value =
+            serde_json::from_slice(&r.bytes().await.expect("body")).expect("json");
+        let session = session["session"].as_str().expect("session").to_owned();
+
+        // Группа news@ — alice и bob, модератор — администратор.
+        let domain = TransportStore::cluster(&meta)
+            .await
+            .expect("cluster")
+            .domain("example.org")
+            .expect("domain")
+            .id;
+        let mut scopes = Vec::new();
+        for login in ["alice@example.org", "bob@example.org"] {
+            let acc = AccountStore::upsert(
+                &meta,
+                t,
+                AccountUpsert {
+                    domain,
+                    login: login.into(),
+                    display_name: login.into(),
+                    external_id: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("account");
+            scopes.push(AccountScope {
+                tenant: t,
+                account: acc.id,
+            });
+        }
+        let group = DistributionGroup {
+            id: GroupId::new(),
+            tenant: t,
+            name: "News".into(),
+            address: Some("news@example.org".into()),
+            external_id: None,
+            members: scopes
+                .iter()
+                .map(|s| GroupMember::Account(s.account))
+                .collect(),
+            senders: SenderRestriction::Anyone,
+            moderators: vec![granted.account],
+            hidden_from_gal: false,
+        };
+        GroupStore::put(&meta, group.clone()).await.expect("group");
+
+        // Два письма внешнего отправителя ждут модератора (домен `admin init` — в снимке транспорта узла).
+        let delivery = services.delivery(&smtp).expect("delivery");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let r = delivery
+                .resolve("alice@example.org")
+                .await
+                .expect("resolve");
+            if matches!(r, tp_smtp::deliver::Resolved::Local(_)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "домен не принят: {r:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for tag in ["fix02-approve", "fix02-reject"] {
+            let raw = format!(
+                "From: ext@remote.example\r\nTo: news@example.org\r\nSubject: {tag}\r\n\
+                 Message-ID: <{tag}@remote.example>\r\n\r\nbody\r\n"
+            );
+            let sent = delivery
+                .submit(
+                    t,
+                    "ext@remote.example",
+                    &["news@example.org".to_owned()],
+                    bytes::Bytes::from(raw),
+                )
+                .await
+                .expect("submit");
+            assert_eq!(sent.rcpts[0].1, SubmitStatus::Queued, "{sent:?}");
+        }
+        let held = GroupStore::held(&meta, t, Some(group.id), 10)
+            .await
+            .expect("held");
+        assert_eq!(held.len(), 2, "{held:?}");
+        let id_of = |tag: &str| {
+            let mid = format!("{tag}@remote.example");
+            held.iter()
+                .find(|h| h.message_id.as_deref() == Some(mid.as_str()))
+                .expect("held message")
+                .id
+        };
+        let (approve, reject) = (id_of("fix02-approve"), id_of("fix02-reject"));
+        let decide = |id: HeldId, what: &str, body: &'static str| {
+            http.post(format!("{base}/api/v1/orgs/{t}/moderation/{id}/{what}"))
+                .bearer_auth(&session)
+                .body(body)
+                .send()
+        };
+        let inbox_count = |scope: AccountScope| {
+            let meta = meta.clone();
+            async move {
+                let inbox = MailboxStore::list(&meta, scope)
+                    .await
+                    .expect("mailboxes")
+                    .into_iter()
+                    .find(|m| m.role == Some(SpecialUse::Inbox))
+                    .expect("inbox")
+                    .id;
+                MessageStore::list(&meta, scope, inbox, MessageQuery::All, 10)
+                    .await
+                    .expect("messages")
+                    .len()
+            }
+        };
+
+        // Одобрение: доставка участникам; повтор по тому же письму — 404.
+        let r = decide(approve, "approve", "").await.expect("approve");
+        let status = r.status();
+        let body = r.text().await.unwrap_or_default();
+        assert_eq!(status, reqwest::StatusCode::NO_CONTENT, "approve: {body}");
+        for scope in &scopes {
+            assert_eq!(inbox_count(*scope).await, 1, "{scope:?}");
+        }
+        let r = decide(approve, "approve", "").await.expect("approve again");
+        assert_eq!(r.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // Отказ: DSN внешнему отправителю — в очереди исходящей почты, участникам ничего.
+        let r = decide(reject, "reject", r#"{"reason":"off-topic"}"#)
+            .await
+            .expect("reject");
+        let status = r.status();
+        let body = r.text().await.unwrap_or_default();
+        assert_eq!(status, reqwest::StatusCode::NO_CONTENT, "reject: {body}");
+        for scope in &scopes {
+            assert_eq!(inbox_count(*scope).await, 1, "{scope:?}");
+        }
+        let mut tx = tp_meta::schema::begin(&pool, t).await.expect("begin");
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM queue_rcpts WHERE address = 'ext@remote.example'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("queue");
+        drop(tx);
+        assert_eq!(queued, 1, "DSN отказа не в очереди");
+        assert!(
+            GroupStore::held(&meta, t, Some(group.id), 10)
+                .await
+                .expect("held")
+                .is_empty()
+        );
+
+        server.abort();
+        stop.cancel();
+        drop((services, delivery, admin, meta, pool));
         crate::testutil::drop_database(&url, &db_name).await;
     }
 }
