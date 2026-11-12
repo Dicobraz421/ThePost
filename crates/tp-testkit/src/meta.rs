@@ -1926,6 +1926,19 @@ mod tests {
         crate::suite::account_list(&MemMetadata::default(), &fx).await;
     }
 
+    /// CTR-63: общий набор `AccountStore::by_ids` (реализация по умолчанию).
+    #[tokio::test]
+    async fn account_by_ids_suite() {
+        let fx = crate::suite::AccountListFixture {
+            tenant: TenantId::DEFAULT,
+            domain: DomainId::new(),
+            domain_name: "example.org".into(),
+            foreign_tenant: TenantId::new(),
+            foreign_domain: DomainId::new(),
+        };
+        crate::suite::account_by_ids(&MemMetadata::default(), &fx).await;
+    }
+
     /// CTR-35: общий набор состояния ящика.
     #[tokio::test]
     async fn account_state_suite() {

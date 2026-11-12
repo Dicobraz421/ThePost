@@ -59,7 +59,7 @@ use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
     Account, AccountScope, AccountState, AccountStore, AccountUpsert, ExistingContent,
     MailboxStore, MessageQuery, MessageStore, NewMailbox, NewMessage, Policy, PolicyResolver,
-    PolicyStore, PolicyTarget, SpecialUse,
+    PolicyStore, PolicyTarget, SpecialUse, account_disabled,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -317,7 +317,7 @@ async fn next_signal(stream: &mut EventStream) -> Option<Event> {
 }
 
 /// Набор проверок системных сигналов `EventBus` (CTR-23, CTR-37, CTR-39, CTR-49): `LogAppended`, `MembersChanged`,
-/// `ShardsChanged`, `Blocked`, `Unblocked`, `TrashChanged` приходят
+/// `ShardsChanged`, `Blocked`, `Unblocked`, `TrashChanged`, `AccountDisabled` (CTR-64) приходят
 /// в `subscribe_system()` и не приходят подписке учётной записи; `publish(Resync)` — `Invalid`.
 /// «Не пришло» проверяется тем, что первым пришёл сигнал, опубликованный позже.
 pub async fn signals(bus: &dyn EventBus) {
@@ -360,6 +360,7 @@ pub async fn signals(bus: &dyn EventBus) {
             },
         ),
         trash_changed(scope),
+        account_disabled(scope),
     ];
     for e in &published {
         assert!(e.kind.is_system());
@@ -2416,6 +2417,52 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
     assert_eq!(list(fx.tenant, "", None, 0).await, Vec::new());
     // Другая организация видит только своё.
     assert_eq!(list(fx.foreign_tenant, "", None, 10).await, vec![foreign]);
+}
+
+// ---------- AccountStore: by_ids ----------
+
+/// Набор проверок `AccountStore::by_ids` (CTR-63): порядок — как в запросе, несуществующие и чужой организации
+/// пропускаются, повтор идентификатора — одна запись, пустой список — пусто. Организации из [`AccountListFixture`]
+/// могут быть непустыми: имена входа уникальны для прогона.
+pub async fn account_by_ids(accounts: &dyn AccountStore, fx: &AccountListFixture) {
+    let run = AccountId::new();
+    let upsert = |domain: DomainId, n: &str| AccountUpsert {
+        domain,
+        login: format!("{n}-{run}@{}", fx.domain_name),
+        display_name: n.into(),
+        external_id: None,
+        enabled: true,
+    };
+    let mut made = Vec::new();
+    for n in ["ids-a", "ids-b"] {
+        made.push(
+            accounts
+                .upsert(fx.tenant, upsert(fx.domain, n))
+                .await
+                .expect("upsert"),
+        );
+    }
+    let foreign = accounts
+        .upsert(fx.foreign_tenant, upsert(fx.foreign_domain, "ids-f"))
+        .await
+        .expect("upsert foreign");
+    let (a, b) = (&made[0], &made[1]);
+    let by_ids = |ids: Vec<AccountId>| async move {
+        accounts.by_ids(fx.tenant, &ids).await.expect("by_ids")
+    };
+
+    // Три идентификатора, один несуществующий — две записи в порядке запроса.
+    assert_eq!(
+        by_ids(vec![b.id, AccountId::new(), a.id]).await,
+        vec![b.clone(), a.clone()]
+    );
+    assert_eq!(by_ids(vec![a.id, b.id]).await, vec![a.clone(), b.clone()]);
+    assert_eq!(
+        by_ids(vec![a.id, foreign.id, a.id]).await,
+        vec![a.clone()],
+        "чужая организация — нет, повтор — один раз"
+    );
+    assert_eq!(by_ids(Vec::new()).await, Vec::new());
 }
 
 // ---------- Moderation ----------
