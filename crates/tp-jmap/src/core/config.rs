@@ -54,6 +54,52 @@ pub struct JmapConfig {
     pub upload_ttl: Duration,
     /// Автонастройка клиентов: серверы IMAP, SMTP, CalDAV и CardDAV в ответах (`crate::autoconfig`).
     pub autoconfig: AutoconfigConfig,
+    /// Календари JMAP: развёртка повторов событий.
+    pub calendars: CalendarsConfig,
+}
+
+/// Секция `jmap.calendars`: лимиты развёртки повторов событий (JMAP Calendars).
+///
+/// ```yaml
+/// calendars:
+///   expand_horizon: 730d
+///   max_expanded_query_duration: 400d
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CalendarsConfig {
+    /// Горизонт развёртки повторов для индекса события (от момента записи), как `dav.expand_horizon`:
+    /// повторы дальше горизонта и правила без конца дают интервал без конца.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub expand_horizon: Duration,
+    /// Наибольшее число развёрнутых вхождений одного события (индекс, `CalendarEvent/query`).
+    pub max_instances: usize,
+    /// `maxExpandedQueryDuration`: наибольший интервал `after`…`before` запроса с `expandRecurrences`.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub max_expanded_query_duration: Duration,
+}
+
+impl CalendarsConfig {
+    /// Параметры индекса события для записи в момент `now`.
+    pub(crate) fn index_options(&self, now: time::OffsetDateTime) -> tp_dav::index::IndexOptions {
+        let horizon = time::Duration::try_from(self.expand_horizon).unwrap_or(time::Duration::MAX);
+        tp_dav::index::IndexOptions {
+            horizon: now.checked_add(horizon).unwrap_or(now),
+            max_instances: self.max_instances,
+        }
+    }
+}
+
+impl Default for CalendarsConfig {
+    fn default() -> Self {
+        Self {
+            expand_horizon: Duration::from_secs(730 * 24 * 3600),
+            max_instances: 10_000,
+            max_expanded_query_duration: Duration::from_secs(400 * 24 * 3600),
+        }
+    }
 }
 
 impl Default for JmapConfig {
@@ -75,6 +121,7 @@ impl Default for JmapConfig {
             push_min_ping: Duration::from_secs(10),
             upload_ttl: Duration::from_secs(7 * 24 * 3600),
             autoconfig: AutoconfigConfig::default(),
+            calendars: CalendarsConfig::default(),
         }
     }
 }
