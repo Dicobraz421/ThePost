@@ -13,6 +13,7 @@
 //! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`
 //!   (подпись профиля ключом TLS — [`ProfileSigner`], [`Jmap::with_profile_signer`]);
 //! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
+//! - `sieve` — SieveScript/get, set, query, validate (RFC 9661) поверх `SieveStore` и проверки `tp_sieve`;
 //! - `settings` — UserSettings/get, set: настройки пользователя (`trash.purge`), capability `urn:thepost:params:jmap:settings`.
 //!
 //! Протокол — JSON поверх HTTP: типы запросов и ответов — `serde_json`, HTTP — `axum`.
@@ -28,6 +29,7 @@ pub mod fuzz;
 mod mailbox;
 mod push;
 mod settings;
+mod sieve;
 pub mod submission;
 #[cfg(test)]
 mod testenv;
@@ -39,7 +41,7 @@ pub use crate::autoconfig::sign::{ProfileSigner, SignatureAlgorithm, SigningKey}
 pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
 
 use crate::core::error::MethodResult;
-use crate::core::{CORE, Ctx, MAIL, SETTINGS, SUBMISSION, VACATION};
+use crate::core::{CORE, Ctx, MAIL, SETTINGS, SIEVE, SUBMISSION, VACATION};
 
 /// Встроенные методы и их capability.
 pub(crate) const METHODS: &[(&str, &str)] = &[
@@ -70,6 +72,10 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("UserSettings/set", SETTINGS),
     ("VacationResponse/get", VACATION),
     ("VacationResponse/set", VACATION),
+    ("SieveScript/get", SIEVE),
+    ("SieveScript/set", SIEVE),
+    ("SieveScript/query", SIEVE),
+    ("SieveScript/validate", SIEVE),
 ];
 
 /// Варианты сортировки `Email/query` (сессия, `emailQuerySortOptions`).
@@ -109,6 +115,10 @@ pub(crate) async fn call_builtin(
         "UserSettings/set" => settings::set(ctx, args).await,
         "VacationResponse/get" => vacation::get(ctx, args).await,
         "VacationResponse/set" => vacation::set(ctx, args).await,
+        "SieveScript/get" => sieve::get(ctx, args).await,
+        "SieveScript/set" => sieve::set(ctx, args).await,
+        "SieveScript/query" => sieve::query(ctx, args).await,
+        "SieveScript/validate" => sieve::validate(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
 }

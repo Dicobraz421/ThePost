@@ -300,7 +300,7 @@ impl Jmap {
     /// Подключена ли встроенная capability, зависящая от хранилища.
     fn optional_enabled(&self, uri: &str) -> bool {
         match uri {
-            VACATION => self.sieve.is_some(),
+            VACATION | SIEVE => self.sieve.is_some(),
             _ => false,
         }
     }
@@ -378,10 +378,16 @@ impl Jmap {
         primary.insert(MAIL.into(), json!(account));
         primary.insert(SUBMISSION.into(), json!(account));
         primary.insert(SETTINGS.into(), json!(account));
-        if self.sieve.is_some() {
+        if let Some(sieve) = &self.sieve {
             caps.insert(VACATION.into(), json!({}));
             account_caps.insert(VACATION.into(), json!({}));
             primary.insert(VACATION.into(), json!(account));
+            caps.insert(SIEVE.into(), crate::sieve::session_capability());
+            account_caps.insert(
+                SIEVE.into(),
+                crate::sieve::account_capability(sieve.limits()),
+            );
+            primary.insert(SIEVE.into(), json!(account));
         }
         for cap in &self.d.capabilities {
             caps.insert(cap.uri().into(), cap.session_object());
