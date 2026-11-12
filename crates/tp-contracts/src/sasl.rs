@@ -56,7 +56,7 @@
 //! }
 //!
 //! // C: AUTH PLAIN AHVzZXIAc2VjcmV0  (base64 "\0user\0secret" декодирует протокол)
-//! let ctx = SaslContext { service: "smtp", tls: true };
+//! let ctx = SaslContext { service: "smtp", tls: true, peer: Some([192, 0, 2, 7].into()) };
 //! let mech: Mechanism = "plain".parse()?;
 //! assert_eq!(Server.mechanisms(false), Vec::<Mechanism>::new());
 //! let mut s = Server.start(mech, &ctx)?;
@@ -147,6 +147,10 @@ pub struct SaslContext {
     pub service: &'static str,
     /// Соединение защищено TLS.
     pub tls: bool,
+    /// Адрес клиента соединения (CTR-57; SRS 6.3): сеанс передаёт его в
+    /// [`Authenticator::verify`](crate::auth::Authenticator::verify) — счётчики защиты от перебора. `None` — только
+    /// когда адрес неизвестен (обмен без соединения клиента).
+    pub peer: Option<IpAddr>,
 }
 
 /// Неуспешная аутентификация; причина клиенту не уточняется сверх кода (SMTP 535 5.7.8, IMAP RFC 5530).
@@ -185,22 +189,8 @@ pub trait SaslServer: Send + Sync + 'static {
     /// Предлагаемые механизмы (`EHLO`, `CAPABILITY`); без TLS — без [`Mechanism::plaintext`].
     fn mechanisms(&self, tls: bool) -> Vec<Mechanism>;
 
-    /// Начинает обмен; механизм не из `mechanisms(ctx.tls)` — `Error::Invalid`.
+    /// Начинает обмен с клиентом `ctx.peer`; механизм не из `mechanisms(ctx.tls)` — `Error::Invalid`.
     fn start(&self, mechanism: Mechanism, ctx: &SaslContext) -> Result<Box<dyn SaslSession>>;
-
-    /// [`SaslServer::start`] с адресом клиента соединения (CTR-57; SRS 6.3): сеанс проверяет учётные данные через
-    /// [`Authenticator::verify_from`](crate::auth::Authenticator::verify_from) с этим адресом — для счётчиков защиты
-    /// от перебора. `peer = None` — адрес неизвестен. Протоколы (smtp, imap, pop3, managesieve) вызывают этот метод с
-    /// адресом соединения; по умолчанию — `start`, адрес не используется.
-    fn start_from(
-        &self,
-        mechanism: Mechanism,
-        ctx: &SaslContext,
-        peer: Option<IpAddr>,
-    ) -> Result<Box<dyn SaslSession>> {
-        let _ = peer;
-        self.start(mechanism, ctx)
-    }
 }
 
 #[cfg(test)]
@@ -224,25 +214,11 @@ mod tests {
 
     #[async_trait]
     impl Authenticator for Recording {
-        async fn verify(&self, _: Credentials) -> Result<Principal> {
-            Err(Error::Forbidden)
-        }
-
-        async fn verify_from(&self, _: Credentials, peer: Option<IpAddr>) -> Result<Principal> {
+        async fn verify(&self, _: Credentials, peer: Option<IpAddr>) -> Result<Principal> {
             if let Ok(mut peers) = self.peers.lock() {
                 peers.push(peer);
             }
             Err(Error::Forbidden)
-        }
-    }
-
-    /// Проверка без защиты от перебора: только `verify`.
-    struct Plain;
-
-    #[async_trait]
-    impl Authenticator for Plain {
-        async fn verify(&self, _: Credentials) -> Result<Principal> {
-            Err(Error::NotFound)
         }
     }
 
@@ -255,7 +231,7 @@ mod tests {
     impl SaslSession for Session {
         async fn step(&mut self, _: Option<&[u8]>) -> Result<SaslStep> {
             let credentials = Credentials::Bearer("t".into());
-            match self.auth.verify_from(credentials, self.peer).await {
+            match self.auth.verify(credentials, self.peer).await {
                 Ok(p) => Ok(SaslStep::Done(p)),
                 Err(Error::Forbidden) => Ok(SaslStep::Fail(SaslFailure::Authentication)),
                 Err(e) => Err(e),
@@ -263,83 +239,41 @@ mod tests {
         }
     }
 
-    /// Сервер с адресом: переопределяет `start_from`.
-    struct WithPeer(Arc<dyn Authenticator>);
+    struct Server(Arc<dyn Authenticator>);
 
-    impl SaslServer for WithPeer {
+    impl SaslServer for Server {
         fn mechanisms(&self, _: bool) -> Vec<Mechanism> {
             vec![Mechanism::OauthBearer]
         }
 
-        fn start(&self, mechanism: Mechanism, ctx: &SaslContext) -> Result<Box<dyn SaslSession>> {
-            self.start_from(mechanism, ctx, None)
-        }
-
-        fn start_from(
-            &self,
-            _: Mechanism,
-            _: &SaslContext,
-            peer: Option<IpAddr>,
-        ) -> Result<Box<dyn SaslSession>> {
+        fn start(&self, _: Mechanism, ctx: &SaslContext) -> Result<Box<dyn SaslSession>> {
             Ok(Box::new(Session {
                 auth: self.0.clone(),
-                peer,
-            }))
-        }
-    }
-
-    /// Сервер без адреса: только `start`.
-    struct NoPeer(Arc<dyn Authenticator>);
-
-    impl SaslServer for NoPeer {
-        fn mechanisms(&self, _: bool) -> Vec<Mechanism> {
-            vec![Mechanism::OauthBearer]
-        }
-
-        fn start(&self, _: Mechanism, _: &SaslContext) -> Result<Box<dyn SaslSession>> {
-            Ok(Box::new(Session {
-                auth: self.0.clone(),
-                peer: None,
+                peer: ctx.peer,
             }))
         }
     }
 
     #[test]
-    fn peer_reaches_verify_from() {
-        const CTX: SaslContext = SaslContext {
-            service: "imap",
-            tls: true,
-        };
+    fn peer_reaches_verify() {
+        // Адрес соединения из `SaslContext` доходит до `verify`; `None` — адрес неизвестен.
         let peer = Some(IpAddr::from([192, 0, 2, 7]));
-        let fail = Ok(SaslStep::Fail(SaslFailure::Authentication));
-
-        // Адрес соединения из `start_from` доходит до `verify_from`; `start` — без адреса.
         let auth = Arc::new(Recording::default());
-        let server = WithPeer(auth.clone());
-        for session in [
-            server.start_from(Mechanism::OauthBearer, &CTX, peer),
-            server.start(Mechanism::OauthBearer, &CTX),
-        ] {
-            let step = session.map(|mut s| block_on(s.step(None)));
-            assert_eq!(step, Ok(fail.clone()));
+        let server = Server(auth.clone());
+        for peer in [peer, None] {
+            let ctx = SaslContext {
+                service: "imap",
+                tls: true,
+                peer,
+            };
+            let step = server
+                .start(Mechanism::OauthBearer, &ctx)
+                .map(|mut s| block_on(s.step(None)));
+            assert_eq!(step, Ok(Ok(SaslStep::Fail(SaslFailure::Authentication))));
         }
         assert_eq!(
             auth.peers.lock().map(|p| p.clone()).ok(),
             Some(vec![peer, None])
-        );
-
-        // Сервер без `start_from`: по умолчанию — `start`, адрес не передаётся.
-        let auth = Arc::new(Recording::default());
-        let step = NoPeer(auth.clone())
-            .start_from(Mechanism::OauthBearer, &CTX, peer)
-            .map(|mut s| block_on(s.step(None)));
-        assert_eq!(step, Ok(fail));
-        assert_eq!(auth.peers.lock().map(|p| p.clone()).ok(), Some(vec![None]));
-
-        // Проверка без `verify_from`: по умолчанию — `verify`.
-        assert_eq!(
-            block_on(Plain.verify_from(Credentials::Bearer("t".into()), peer)),
-            Err(Error::NotFound)
         );
     }
 

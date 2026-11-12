@@ -128,6 +128,7 @@ impl Session {
         let ctx = SaslContext {
             service: "smtp",
             tls: self.conn.tls,
+            peer: Some(self.conn.client.ip()),
         };
         let started = match &self.ctx.sasl {
             Some(sasl) => sasl.start(mechanism, &ctx),

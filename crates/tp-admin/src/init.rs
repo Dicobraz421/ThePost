@@ -838,6 +838,7 @@ mod tests {
                 login: "boss@example.test".into(),
                 secret: again.password.clone(),
             },
+            None,
         )
         .await
         .expect("login");

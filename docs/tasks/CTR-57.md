@@ -11,6 +11,10 @@ manual: no
 Хвост волны app-16, PR #293: счётчики по адресу и подсети не ведутся — контракт `Authenticator::verify(Credentials)` и
 `SaslContext` не несут адрес клиента.
 
+Решение владельца 2026-11-12 (PR #503): один путь — `Authenticator::verify(credentials, peer)` и `SaslContext::peer`; методов
+`verify_from`/`start_from` и вариантов без адреса нет. Все реализации и вызовы переведены в том же PR, протоколы передают адрес
+соединения.
+
 ## Сделать
 - `SaslContext`: поле `peer: Option<IpAddr>` (адрес клиента соединения); `Authenticator`: метод с адресом, например
   `verify_from(credentials, peer: Option<IpAddr>)`, по умолчанию вызывает `verify` — реализации без защиты от перебора

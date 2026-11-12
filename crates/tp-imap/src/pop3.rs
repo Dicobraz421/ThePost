@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use base64::Engine;
@@ -128,6 +129,8 @@ impl DotStuff {
 pub struct Pop3Session<T: Transport> {
     ctx: Arc<SessionCtx>,
     conn: Option<T>,
+    /// Адрес клиента соединения.
+    peer: IpAddr,
     buf: Vec<u8>,
     out: Vec<u8>,
     user: Option<String>,
@@ -169,6 +172,7 @@ impl<T: Transport> Pop3Session<T> {
     pub fn new(ctx: Arc<SessionCtx>, conn: T) -> Self {
         Self {
             ctx,
+            peer: conn.peer(),
             conn: Some(conn),
             buf: Vec::new(),
             out: Vec::new(),
@@ -388,7 +392,7 @@ impl<T: Transport> Pop3Session<T> {
             login,
             secret: secret.to_owned(),
         };
-        match self.ctx.deps.auth.verify(creds).await {
+        match self.ctx.deps.auth.verify(creds, Some(self.peer)).await {
             Ok(p) => self.logged_in(p).await,
             Err(Error::Forbidden) => {
                 self.auth_failed();
@@ -436,6 +440,7 @@ impl<T: Transport> Pop3Session<T> {
         let ctx = SaslContext {
             service: "pop",
             tls,
+            peer: Some(self.peer),
         };
         let mut sasl = match self.ctx.deps.sasl.start(mech, &ctx) {
             Ok(s) => s,

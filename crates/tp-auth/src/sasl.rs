@@ -10,6 +10,7 @@
 //! [`SaslFailure::Authorization`]. GSSAPI (Kerberos) — [`crate::gssapi`], подключается [`AuthSasl::with_gssapi`].
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -102,11 +103,12 @@ impl SaslServer for AuthSasl {
             )));
         }
         if let (Mechanism::Gssapi, Some(g)) = (mechanism, &self.gssapi) {
-            return g.session(ctx.service, self.authn.clone());
+            return g.session(ctx.service, ctx.peer, self.authn.clone());
         }
         Ok(Box::new(Exchange {
             authn: self.authn.clone(),
             mechanism,
+            peer: ctx.peer,
             openid_configuration: self.openid_configuration.clone(),
             state: State::Start,
         }))
@@ -211,6 +213,8 @@ enum State {
 struct Exchange {
     authn: Arc<dyn Authenticator>,
     mechanism: Mechanism,
+    /// Адрес клиента соединения ([`SaslContext::peer`]).
+    peer: Option<IpAddr>,
     openid_configuration: Option<String>,
     state: State,
 }
@@ -269,7 +273,7 @@ impl Exchange {
                 captured.authzid.clone(),
             )
         };
-        match self.authn.verify(credentials).await {
+        match self.authn.verify(credentials, self.peer).await {
             Ok(p) => {
                 self.state = State::Done;
                 Ok(if authorized(&p, authzid.as_deref()) {
@@ -378,7 +382,7 @@ mod tests {
 
     #[async_trait]
     impl Authenticator for Table {
-        async fn verify(&self, c: Credentials) -> Result<Principal> {
+        async fn verify(&self, c: Credentials, _: Option<IpAddr>) -> Result<Principal> {
             match c {
                 Credentials::Password { login, secret } => {
                     match (login.as_str(), secret.as_str()) {
@@ -405,7 +409,21 @@ mod tests {
     const TLS: SaslContext = SaslContext {
         service: "imap",
         tls: true,
+        peer: crate::testutil::PEER,
     };
+
+    /// CTR-57: адрес клиента из `SaslContext` доходит до проверки учётных данных.
+    #[tokio::test]
+    async fn peer_reaches_authenticator() {
+        let fake = tp_testkit::FakeAuthenticator::default();
+        let p = principal("tim", None);
+        fake.add_password("tim", "tanstaaftanstaaf", p.clone());
+        let sasl = AuthSasl::new(Arc::new(fake.clone()));
+        let mut s = sasl.start(Mechanism::Plain, &TLS).expect("start");
+        let step = s.step(Some(b"\0tim\0tanstaaftanstaaf")).await;
+        assert_eq!(step, Ok(SaslStep::Done(p)));
+        assert_eq!(fake.peers(), [crate::testutil::PEER]);
+    }
 
     fn start(m: Mechanism) -> Box<dyn SaslSession> {
         server().start(m, &TLS).expect("start")
@@ -429,6 +447,7 @@ mod tests {
         let plain = SaslContext {
             service: "smtp",
             tls: false,
+            peer: crate::testutil::PEER,
         };
         assert!(s.start(Mechanism::Plain, &plain).is_err());
         assert!(s.start(Mechanism::Gssapi, &TLS).is_err());
@@ -576,6 +595,7 @@ mod tests {
         let sieve = SaslContext {
             service: "sieve",
             tls: true,
+            peer: crate::testutil::PEER,
         };
         let s = server();
         assert_eq!(s.mechanisms(sieve.tls), DEFAULT.to_vec());
@@ -608,6 +628,7 @@ mod tests {
         let plain = SaslContext {
             service: "sieve",
             tls: false,
+            peer: crate::testutil::PEER,
         };
         assert!(s.start(Mechanism::Plain, &plain).is_err());
     }

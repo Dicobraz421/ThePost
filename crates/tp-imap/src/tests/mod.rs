@@ -1,5 +1,6 @@
 //! Окружение тестов: хранилище и фейки testkit, сессия над потоком в памяти, клиент по строкам.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -37,6 +38,9 @@ mod write;
 pub(crate) const LOGIN: &str = "user@example.org";
 pub(crate) const PASSWORD: &str = "secret";
 
+/// Адрес клиента соединений стенда.
+pub(crate) const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7));
+
 /// Поток в памяти вместо соединения; STARTTLS недоступен.
 pub(crate) struct TestConn {
     io: DuplexStream,
@@ -52,6 +56,10 @@ impl Transport for TestConn {
 
     fn tls(&self) -> bool {
         self.tls
+    }
+
+    fn peer(&self) -> IpAddr {
+        PEER
     }
 
     fn can_starttls(&self) -> bool {
