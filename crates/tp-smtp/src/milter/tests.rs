@@ -9,7 +9,7 @@ use tokio::net::TcpListener;
 
 use super::proto::{self, Packet};
 use super::*;
-use crate::config::{MilterConfig, MilterFilter, MilterOnFailure};
+use crate::config::{MilterConfig, MilterDirection, MilterFilter, MilterOnFailure};
 use crate::server::tests::conn_info;
 
 pub(crate) type Script = Arc<dyn Fn(&Packet) -> Vec<Packet> + Send + Sync>;
@@ -80,7 +80,7 @@ impl Mock {
             .collect()
     }
 
-    fn packets(&self, code: u8) -> Vec<Packet> {
+    pub(crate) fn packets(&self, code: u8) -> Vec<Packet> {
         self.seen
             .lock()
             .expect("lock")
@@ -116,7 +116,7 @@ pub(crate) fn on_eob(eob: Vec<Packet>) -> Script {
     })
 }
 
-fn header_mod(code: u8, index: Option<u32>, name: &str, value: &str) -> Packet {
+pub(crate) fn header_mod(code: u8, index: Option<u32>, name: &str, value: &str) -> Packet {
     let mut b = BytesMut::new();
     if let Some(i) = index {
         b.put_u32(i);
@@ -173,10 +173,14 @@ async fn full_session_with_header_changes() {
     )
     .await;
     let m = chain(vec![mock.filter("rspamd")]);
-    assert!(m.applies(Mode::Inbound));
-    assert!(!m.applies(Mode::Submission));
+    assert!(m.applies(MilterDirection::Inbound));
+    assert!(!m.applies(MilterDirection::Outbound));
     let out = m
-        .check(&envelope(Mode::Inbound), Bytes::from_static(MAIL), None)
+        .check(
+            &Mail::of(&envelope(Mode::Inbound)),
+            Bytes::from_static(MAIL),
+            None,
+        )
         .await;
     assert_eq!(out.verdict, Verdict::Accept);
     assert_eq!(out.quarantine, None);
@@ -217,7 +221,11 @@ async fn skipped_steps_and_no_reply() {
     )
     .await;
     let out = chain(vec![mock.filter("f")])
-        .check(&envelope(Mode::Inbound), Bytes::from_static(MAIL), None)
+        .check(
+            &Mail::of(&envelope(Mode::Inbound)),
+            Bytes::from_static(MAIL),
+            None,
+        )
         .await;
     assert_eq!(out.verdict, Verdict::Accept);
     assert_eq!(out.message, Bytes::from_static(MAIL));
@@ -245,7 +253,11 @@ async fn reject_tempfail_replycode_discard() {
     for (eob, expect) in cases {
         let mock = Mock::start(0, on_eob(eob)).await;
         let out = chain(vec![mock.filter("f")])
-            .check(&envelope(Mode::Inbound), Bytes::from_static(MAIL), None)
+            .check(
+                &Mail::of(&envelope(Mode::Inbound)),
+                Bytes::from_static(MAIL),
+                None,
+            )
             .await;
         match (out.verdict, expect) {
             (Verdict::Refuse(r), Some((code, esc))) => {
@@ -269,7 +281,11 @@ async fn reject_tempfail_replycode_discard() {
     )
     .await;
     let out = chain(vec![rcpt_reject.filter("first"), mock.filter("second")])
-        .check(&envelope(Mode::Inbound), Bytes::from_static(MAIL), None)
+        .check(
+            &Mail::of(&envelope(Mode::Inbound)),
+            Bytes::from_static(MAIL),
+            None,
+        )
         .await;
     assert!(matches!(out.verdict, Verdict::Refuse(ref r) if r.code == 550));
     assert_eq!(rcpt_reject.codes().await, "ODCHDMDRQ");
@@ -288,10 +304,12 @@ async fn chain_passes_changes_and_quarantine() {
     )
     .await;
     let second = Mock::start(0, on_eob(vec![reply_of(proto::R_ACCEPT)])).await;
-    let mut f2 = second.filter("second");
-    f2.submission = true;
-    let out = chain(vec![first.filter("first"), f2.clone()])
-        .check(&envelope(Mode::Inbound), Bytes::from_static(MAIL), None)
+    let out = chain(vec![first.filter("first"), second.filter("second")])
+        .check(
+            &Mail::of(&envelope(Mode::Inbound)),
+            Bytes::from_static(MAIL),
+            None,
+        )
         .await;
     assert_eq!(out.verdict, Verdict::Accept);
     assert_eq!(out.quarantine.as_deref(), Some("virus found"));
@@ -302,13 +320,30 @@ async fn chain_passes_changes_and_quarantine() {
         .map(|p| String::from_utf8_lossy(p.split()[0]).into_owned())
         .collect();
     assert_eq!(names, ["From", "Subject", "X-Spam", "X-First"]);
-    // Submission проверяет только фильтр с `submission: true`.
-    let (first_before, second_before) = (first.codes().await.len(), second.codes().await.len());
-    chain(vec![first.filter("first"), f2])
-        .check(&envelope(Mode::Submission), Bytes::from_static(MAIL), None)
+    // Направления раздельны: приём не проходит фильтр исходящей почты, submission — фильтры приёма.
+    let dlp = Mock::start(0, on_eob(vec![reply_of(proto::R_ACCEPT)])).await;
+    let mut out_filter = dlp.filter("dlp");
+    out_filter.direction = MilterDirection::Outbound;
+    let both = chain(vec![first.filter("first"), out_filter]);
+    assert!(both.applies(MilterDirection::Outbound));
+    both.check(
+        &Mail::of(&envelope(Mode::Inbound)),
+        Bytes::from_static(MAIL),
+        None,
+    )
+    .await;
+    assert_eq!(dlp.codes().await, "");
+    let first_before = first.codes().await.len();
+    let out = both
+        .check(
+            &Mail::of(&envelope(Mode::Submission)),
+            Bytes::from_static(MAIL),
+            None,
+        )
         .await;
+    assert_eq!(out.quarantine, None);
     assert_eq!(first.codes().await.len(), first_before);
-    assert!(second.codes().await.len() > second_before);
+    assert!(dlp.codes().await.ends_with('Q'));
 }
 
 #[tokio::test]
@@ -324,18 +359,75 @@ async fn unavailable_filter_policy() {
         ..MilterFilter::default()
     };
     let out = chain(vec![f.clone()])
-        .check(&envelope(Mode::Inbound), Bytes::from_static(MAIL), None)
+        .check(
+            &Mail::of(&envelope(Mode::Inbound)),
+            Bytes::from_static(MAIL),
+            None,
+        )
         .await;
     assert_eq!(out.verdict, Verdict::Accept);
     assert!(
         out.message
             .starts_with(b"X-ThePost-Milter: av; unavailable\r\nFrom: ")
     );
-    f.on_failure = MilterOnFailure::Tempfail;
-    let out = chain(vec![f])
-        .check(&envelope(Mode::Inbound), Bytes::from_static(MAIL), None)
+    f.on_failure = Some(MilterOnFailure::Tempfail);
+    let out = chain(vec![f.clone()])
+        .check(
+            &Mail::of(&envelope(Mode::Inbound)),
+            Bytes::from_static(MAIL),
+            None,
+        )
         .await;
     assert!(matches!(out.verdict, Verdict::Refuse(ref r) if (r.code, r.esc) == (451, [4, 7, 1])));
+    // Профиль исходящей почты: политика своя; не задана — письмо мимо проверки не уходит.
+    f.direction = MilterDirection::Outbound;
+    f.on_failure = None;
+    let submission = envelope(Mode::Submission);
+    let out = chain(vec![f.clone()])
+        .check(&Mail::of(&submission), Bytes::from_static(MAIL), None)
+        .await;
+    assert!(matches!(out.verdict, Verdict::Refuse(ref r) if (r.code, r.esc) == (451, [4, 7, 1])));
+    f.on_failure = Some(MilterOnFailure::Accept);
+    let out = chain(vec![f])
+        .check(&Mail::of(&submission), Bytes::from_static(MAIL), None)
+        .await;
+    assert_eq!(out.verdict, Verdict::Accept);
+    assert!(
+        out.message
+            .starts_with(b"X-ThePost-Milter: av; unavailable\r\n")
+    );
+}
+
+#[tokio::test]
+async fn mail_without_smtp_client() {
+    // Отправка вне сессии SMTP (JMAP): имя узла и семейство адреса «неизвестно», макроса адреса клиента нет.
+    let mock = Mock::start(0, on_eob(vec![reply_of(proto::R_ACCEPT)])).await;
+    let mut f = mock.filter("dlp");
+    f.direction = MilterDirection::Outbound;
+    let rcpts = vec!["x@example.net".to_owned()];
+    let mail = Mail {
+        direction: MilterDirection::Outbound,
+        id: "j1",
+        client: None,
+        login: None,
+        mail_from: "alice@example.org",
+        rcpts: &rcpts,
+    };
+    let out = chain(vec![f])
+        .check(&mail, Bytes::from_static(MAIL), None)
+        .await;
+    assert_eq!(out.verdict, Verdict::Accept);
+    assert_eq!(mock.codes().await, "ODCHDMDRDTLLLDNBDEQ");
+    assert_eq!(
+        &mock.packets(proto::C_CONNECT)[0].data[..],
+        b"mx.example.org\0U"
+    );
+    let macros = mock.packets(proto::C_MACRO);
+    assert!(!macros[0].data.windows(13).any(|w| w == b"{client_addr}"));
+    assert_eq!(
+        mock.packets(proto::C_HELO)[0].split(),
+        [&b"mx.example.org"[..]]
+    );
 }
 
 #[tokio::test]
@@ -344,9 +436,13 @@ async fn timeout_is_failure() {
     let mock = Mock::start(0, on_eob(vec![])).await;
     let mut f = mock.filter("slow");
     f.end_timeout = Duration::from_millis(200);
-    f.on_failure = MilterOnFailure::Tempfail;
+    f.on_failure = Some(MilterOnFailure::Tempfail);
     let out = chain(vec![f])
-        .check(&envelope(Mode::Inbound), Bytes::from_static(MAIL), None)
+        .check(
+            &Mail::of(&envelope(Mode::Inbound)),
+            Bytes::from_static(MAIL),
+            None,
+        )
         .await;
     assert!(matches!(out.verdict, Verdict::Refuse(ref r) if r.code == 451));
 }

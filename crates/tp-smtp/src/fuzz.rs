@@ -264,7 +264,7 @@ fn milter_outcome(data: &[u8]) -> Vec<Verdict> {
     let filter = |on_failure| MilterFilter {
         name: "fuzz".into(),
         address: "127.0.0.1:1".into(),
-        on_failure,
+        on_failure: Some(on_failure),
         ..MilterFilter::default()
     };
     let raw = Bytes::from_static(b"From: a@example.net\r\nSubject: x\r\n\r\nbody\r\n");
@@ -292,15 +292,20 @@ fn milter_outcome(data: &[u8]) -> Vec<Verdict> {
             "mx.example.org",
         );
         let input = Bytes::copy_from_slice(data);
-        let out = runtime().block_on(m.check_with(&env, raw.clone(), None, |_| {
-            let input = input.clone();
-            async move {
-                Ok(tokio::io::join(
-                    std::io::Cursor::new(input),
-                    tokio::io::sink(),
-                ))
-            }
-        }));
+        let out = runtime().block_on(m.check_with(
+            &crate::milter::Mail::of(&env),
+            raw.clone(),
+            None,
+            |_| {
+                let input = input.clone();
+                async move {
+                    Ok(tokio::io::join(
+                        std::io::Cursor::new(input),
+                        tokio::io::sink(),
+                    ))
+                }
+            },
+        ));
         match &out.verdict {
             Verdict::Accept => {
                 assert!(
