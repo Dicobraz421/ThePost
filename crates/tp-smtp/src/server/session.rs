@@ -544,8 +544,8 @@ impl Session {
         if tx.rcpts.iter().any(|r| r.eq_ignore_ascii_case(&address)) {
             return push(out, &reply(250, [2, 1, 5], "OK"));
         }
-        // Submission после AUTH — политика учётной записи; иначе — умолчание организации (не меньше 100 получателей
-        // транзакции, RFC 5321, 4.5.3.1.8).
+        // Submission после AUTH — политика учётной записи; иначе — умолчание `Policy` (100 получателей транзакции —
+        // минимум RFC 5321, 4.5.3.1.8).
         if tx.rcpts.len() >= self.policy.max_recipients_or_default() as usize {
             return push(out, &reply(452, [4, 5, 3], "Too many recipients"));
         }
