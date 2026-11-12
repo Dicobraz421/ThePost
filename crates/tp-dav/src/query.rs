@@ -285,7 +285,10 @@ impl CompFilter {
     /// Интервал для выбора кандидатов: `time-range` единственного фильтра компонента; иначе — все объекты.
     fn candidates(&self) -> TimeRange {
         match self.comps.as_slice() {
-            [one] => one.range.map(|r| r.store()).unwrap_or_default(),
+            // Задачи — все: задача без срока подходит интервалу и вне своего интервала индекса (§9.9).
+            [one] if !one.name.eq_ignore_ascii_case("VTODO") => {
+                one.range.map(|r| r.store()).unwrap_or_default()
+            }
             _ => TimeRange::default(),
         }
     }
@@ -409,8 +412,51 @@ impl<'a> Object<'a> {
         kids.into_iter().any(|k| self.body_matches(k, f))
     }
 
+    /// Задача без повторов пересекает интервал (RFC 4791 §9.9, таблица VTODO).
+    fn todo_in_range(&self, comp: &ICalendarComponent, r: Range) -> bool {
+        use ICalendarProperty as P;
+        let at = |p: P| comp.property(&p).and_then(|e| self.entry_time(e));
+        let duration = comp
+            .property(&P::Duration)
+            .and_then(|e| match e.values.first() {
+                Some(ICalendarValue::Duration(d)) => Some(d.as_seconds()),
+                _ => None,
+            });
+        match (
+            at(P::Dtstart),
+            duration,
+            at(P::Due),
+            at(P::Completed),
+            at(P::Created),
+        ) {
+            (Some(s), Some(d), ..) => r.start <= s + d && (r.end > s || r.end >= s + d),
+            (Some(s), None, Some(due), ..) => {
+                (r.start < due || r.start <= s) && (r.end > s || r.end >= due)
+            }
+            (Some(s), None, None, ..) => r.start <= s && r.end > s,
+            (None, _, Some(due), ..) => r.start < due && r.end >= due,
+            (None, _, None, Some(done), Some(created)) => {
+                (r.start <= created || r.start <= done) && (r.end >= created || r.end >= done)
+            }
+            (None, _, None, Some(done), None) => r.start <= done && r.end >= done,
+            (None, _, None, None, Some(created)) => r.end > created,
+            (None, _, None, None, None) => true,
+        }
+    }
+
     /// Вхождения компонентов вида `name` пересекают интервал.
     fn in_range(&self, name: &str, r: Range) -> bool {
+        if name.eq_ignore_ascii_case("VTODO") {
+            let todos: Vec<&ICalendarComponent> = self
+                .ical
+                .components
+                .iter()
+                .filter(|c| c.component_type == ICalendarComponentType::VTodo)
+                .collect();
+            if !todos.iter().any(|c| c.is_recurrent_or_override()) {
+                return todos.into_iter().any(|c| self.todo_in_range(c, r));
+            }
+        }
         let exp = self.expanded();
         let of_type = |id: u32| self.component(id).is_some_and(|c| is_type(c, name));
         let mut dated = false;
@@ -747,6 +793,7 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
     };
     match root.name.as_str() {
         "calendar-query" => calendar_query(cx, &c, root).await,
+        "calendar-multiget" => multiget(cx, &c, root).await,
         "free-busy-query" => free_busy(cx, &c, root).await,
         _ => Ok(unsupported()),
     }
@@ -828,6 +875,78 @@ async fn calendar_query(cx: &Cx<'_>, c: &Collection, root: &Element) -> Result<R
     }
     if more {
         props::truncated(&mut ms, &path::collection(c.kind, cx.login(), &c.name));
+    }
+    Ok(multistatus(ms))
+}
+
+/// Имя объекта календаря `c` по ссылке `href` (путь или полный URL); чужая или неверная ссылка — `None`.
+fn object_name(cx: &Cx<'_>, c: &Collection, href: &str) -> Option<String> {
+    let path = match href.split_once("://") {
+        Some((_, rest)) => &rest[rest.find('/')?..],
+        None => href,
+    };
+    match Target::parse(path)? {
+        Target::Object(kind, login, coll, name)
+            if kind == c.kind && login.eq_ignore_ascii_case(cx.login()) && coll == c.name =>
+        {
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+/// `calendar-multiget`: объекты по ссылкам в порядке запроса; отсутствующие и чужие — 404 в ответе.
+async fn multiget(cx: &Cx<'_>, c: &Collection, root: &Element) -> Result<Response> {
+    let hrefs: Vec<&str> = root
+        .children
+        .iter()
+        .filter(|e| e.is(DAV, "href"))
+        .map(Element::trimmed)
+        .collect();
+    if hrefs.len() > cx.dav.cfg.max_multiget_hrefs {
+        return Ok(precondition(
+            StatusCode::FORBIDDEN,
+            "<d:number-of-matches-within-limits/>",
+        ));
+    }
+    let Some(opts) = DataOptions::parse(root.child(DAV, "prop")) else {
+        return Ok(status(StatusCode::BAD_REQUEST));
+    };
+    let want = want_of(root);
+    let need_body = want.needs_body();
+    let tz = collection_tz(c);
+    let resolved: Vec<(&str, Option<String>)> = hrefs
+        .into_iter()
+        .map(|h| (h, object_name(cx, c, h)))
+        .collect();
+    let mut names: Vec<String> = resolved.iter().filter_map(|(_, n)| n.clone()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let objects = if names.is_empty() {
+        Vec::new()
+    } else {
+        cx.store().multiget(cx.scope, c.id, &names).await?
+    };
+    let by_name: HashMap<&str, &DavObject> = objects.iter().map(|o| (o.name.as_str(), o)).collect();
+    let mut ms = Multistatus::new();
+    for (href, name) in &resolved {
+        let Some(o) = name.as_deref().and_then(|n| by_name.get(n)) else {
+            ms.status(href, StatusCode::NOT_FOUND, None);
+            continue;
+        };
+        let body = need_body.then(|| {
+            if opts.is_plain() {
+                return Cow::Borrowed(o.body.as_str());
+            }
+            match ICalendar::parse(&o.body) {
+                Ok(ical) => {
+                    let obj = Object::new(&ical, tz, cx.dav.cfg.max_instances);
+                    Cow::Owned(opts.render(&o.body, &obj).into_owned())
+                }
+                Err(_) => Cow::Borrowed(o.body.as_str()),
+            }
+        });
+        emit(cx, &mut ms, c, o, &want, body.as_deref());
     }
     Ok(multistatus(ms))
 }

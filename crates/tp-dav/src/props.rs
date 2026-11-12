@@ -252,6 +252,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
         Res::Collection(c) if c.kind == CollectionKind::Calendar => concat!(
             "<d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report>",
             "<d:supported-report><d:report><c:calendar-query/></d:report></d:supported-report>",
+            "<d:supported-report><d:report><c:calendar-multiget/></d:report></d:supported-report>",
             "<d:supported-report><d:report><c:free-busy-query/></d:report></d:supported-report>"
         ),
         Res::Collection(_) => {

@@ -119,6 +119,11 @@ async fn thunderbird_snapshot() {
     </d:supported-report>
     <d:supported-report>
     <d:report>
+    <c:calendar-multiget/>
+    </d:report>
+    </d:supported-report>
+    <d:supported-report>
+    <d:report>
     <c:free-busy-query/>
     </d:report>
     </d:supported-report>

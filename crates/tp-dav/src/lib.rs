@@ -2,8 +2,8 @@
 //!
 //! Основа (DAV-01…04): маршруты под `/dav/` ([`router`]), вход Basic и Bearer, свойства (`PROPFIND`,
 //! `PROPPATCH`, RFC 4918), ресурсы (`GET`, `PUT`, `DELETE`, `MKCALENDAR` RFC 4791, расширенный `MKCOL` RFC 5689),
-//! синхронизация (`REPORT sync-collection` RFC 6578, `getctag`), отчёты CalDAV (`calendar-query`, `free-busy-query`,
-//! RFC 4791 §7.8, §7.10). Хранилище — [`tp_contracts::dav::DavStore`].
+//! синхронизация (`REPORT sync-collection` RFC 6578, `getctag`), отчёты CalDAV (`calendar-query`,
+//! `calendar-multiget`, `free-busy-query`, RFC 4791 §7.8–7.10). Хранилище — [`tp_contracts::dav::DavStore`].
 //!
 //! - [`config`] — секция `dav` ([`DavConfig`]);
 //! - [`index`] — индекс объекта (UID, компонент, интервал с повторами) из тела, им пользуется и `tp-jmap`;

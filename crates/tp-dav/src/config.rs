@@ -39,6 +39,8 @@ pub struct DavConfig {
     pub expand_horizon: Duration,
     /// Наибольшее число развёрнутых вхождений одного объекта; достигнуто — интервал без конца.
     pub max_instances: usize,
+    /// Ссылок `href` в одном запросе `calendar-multiget`; больше — 403 `number-of-matches-within-limits`.
+    pub max_multiget_hrefs: usize,
     /// Отображаемое имя календаря по умолчанию (создаётся при первом обращении к дому календарей).
     pub default_calendar_name: String,
     /// Отображаемое имя списка задач по умолчанию (VTODO; создаётся вместе с календарём по умолчанию).
@@ -55,6 +57,7 @@ impl Default for DavConfig {
             max_object_size: 1024 * 1024,
             expand_horizon: Duration::from_secs(730 * 24 * 3600),
             max_instances: 10_000,
+            max_multiget_hrefs: 1_000,
             default_calendar_name: "Календарь".to_owned(),
             default_tasks_name: "Задачи".to_owned(),
         }

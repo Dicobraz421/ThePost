@@ -18,6 +18,7 @@ use crate::{DavConfig, Deps, router};
 mod auth;
 mod caldav_home;
 mod propfind;
+mod multiget;
 mod query;
 mod resource;
 mod sync;
