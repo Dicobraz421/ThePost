@@ -76,6 +76,10 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; по умолчанию — `Internal`),
   `list(tenant, prefix, after, limit)` (CTR-44, список Admin API: по возрастанию `lower(login)` в порядке сравнения строк хранилища,
   префикс и курсор `after` — в нижнем регистре, строго больше; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
+  `addresses(tenant, id) -> Vec<String>` (CTR-53) — адреса, на которые учётной записи доставляется почта: основной (имя входа) первым,
+  затем псевдонимы каталога (`DirAlias` с целью — этой учётной записью) без catch-all `@domain`; нижний регистр, без повторов — правило
+  `meta::account_addresses(primary, aliases)`; нет учётной записи — `NotFound`; по умолчанию — только основной адрес через `get`.
+  Потребители: META-57 (PostgreSQL), DAV-23 (`calendar-user-address-set`); in-memory с псевдонимами и тест набора — `tp-testkit`.
   Состояние ящика (CTR-35, «Удалённые ящики» решения 2026-11-04-exchange-parity): `AccountState::{Active, Disabled { until }}` —
   отключённый ящик (учётная запись исчезла из каталога): вход и приём почты запрещены независимо от `enabled`, нет в GAL, хранится до
   `until` (по умолчанию 30 дней — политика синхронизации). `account_state` (по умолчанию — через `get`, всегда `Active`),
@@ -819,3 +823,5 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-52 (волна contracts-37): `InternalTls.key: Option<SecretRef>` — ключ внутренних каналов из хранилища секретов
   (взамен `key_file`, оба сразу — `Invalid`), `InternalTls::key_source()` и `KeySource::{File, Secret}`. Новое поле секции: код,
   собирающий `InternalTls` перечислением всех полей, дополняется `key: None` (в репозитории таких мест нет).
+- 2026-11-12 — CTR-53 (волна contracts-38): `AccountStore::addresses(tenant, id)` — адреса учётной записи (основной и псевдонимы каталога
+  без catch-all; по умолчанию — только основной через `get`), правило — `meta::account_addresses`.

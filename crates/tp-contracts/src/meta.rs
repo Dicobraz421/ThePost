@@ -129,6 +129,26 @@ pub struct QuotaUsage {
     pub limit_bytes: Option<u64>,
 }
 
+/// Адреса учётной записи для [`AccountStore::addresses`] (CTR-53): основной `primary` первым, затем `aliases` в
+/// порядке перечисления; нижний регистр, без повторов. Пропускаются catch-all (`@domain`, пустая локальная часть —
+/// `crate::auth::DirAlias`), пустые строки и строки без `@`.
+pub fn account_addresses<'a>(
+    primary: &'a str,
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for address in std::iter::once(primary).chain(aliases) {
+        let address = address.trim().to_lowercase();
+        let personal = address
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+        if personal && !out.contains(&address) {
+            out.push(address);
+        }
+    }
+    out
+}
+
 /// Учётные записи организации.
 #[async_trait]
 pub trait AccountStore: Send + Sync + 'static {
@@ -164,6 +184,18 @@ pub trait AccountStore: Send + Sync + 'static {
         Err(Error::Internal(
             "AccountStore::list не реализован".to_owned(),
         ))
+    }
+
+    /// Адреса, на которые учётной записи доставляется почта (CTR-53; `calendar-user-address-set` CalDAV, участник
+    /// приглашения): основной (имя входа) первым, затем псевдонимы каталога (`crate::auth::DirAlias` с целью — этой
+    /// учётной записью) без catch-all `@domain`; нижний регистр, без повторов — правило [`account_addresses`].
+    /// Нет учётной записи — `Error::NotFound`. По умолчанию — только основной адрес через [`AccountStore::get`]
+    /// (хранилище без псевдонимов).
+    async fn addresses(&self, tenant: TenantId, id: AccountId) -> Result<Vec<String>> {
+        match self.get(tenant, id).await? {
+            Some(account) => Ok(account_addresses(&account.login, [])),
+            None => Err(Error::NotFound),
+        }
     }
 
     /// Создаёт или обновляет учётную запись (из LDAP); при создании — системные папки.
@@ -773,6 +805,31 @@ mod tests {
         fn _s(_: Arc<dyn MessageStore>) {}
         fn _c(_: Arc<dyn ChangeLog>) {}
         fn _p(_: Arc<dyn PolicyResolver>) {}
+    }
+
+    #[test]
+    fn addresses_rule() {
+        // Основной первым, псевдонимы — в нижнем регистре, без повторов и без catch-all.
+        assert_eq!(
+            account_addresses(
+                "Ann@Example.com",
+                [
+                    "sales@example.com",
+                    "@example.com",
+                    "ANN@example.com",
+                    "Info@Example.COM",
+                    "sales@example.com",
+                    "",
+                    "no-at",
+                ],
+            ),
+            ["ann@example.com", "sales@example.com", "info@example.com"]
+        );
+        // Имя входа — не адрес: остаются только псевдонимы.
+        assert_eq!(
+            account_addresses("ann", ["a@example.com"]),
+            ["a@example.com"]
+        );
     }
 
     #[test]
