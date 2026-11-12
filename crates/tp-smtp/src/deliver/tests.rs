@@ -1427,4 +1427,5 @@ async fn outbound_suite() {
 }
 
 mod rules;
+mod scheduled;
 mod wave;

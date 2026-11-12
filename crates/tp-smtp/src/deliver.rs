@@ -39,6 +39,7 @@
 //! Отправка вне сессии SMTP (JMAP `EmailSubmission/set`) — [`Delivery::submit`] и `impl Outbound for Delivery`
 //! (CMP-04, контракт `tp_contracts::queue::Outbound`, CTR-28): локальные получатели доставляются сразу тем же
 //! `ingest`, внешние — в очередь (без очереди — `SubmitStatus::Failed` с `451 4.3.0`, SMTP-28); статус по получателю.
+//! Отложенная отправка и её отмена (`Outbound::schedule`, `cancel_scheduled`; SMTP-24) — `scheduled`.
 //!
 //! Адресация ([`crate::address`]): получатели переписываются до разрешения, отправитель — после проверок, по
 //! таблице организации из снимка настроек транспорта ([`Delivery::with_transport`], `TenantTransport::rewrites`);
@@ -73,7 +74,7 @@ use tp_contracts::transport::{
     AcceptedDomain, BlobRef, DomainKind, EnvelopeSide, FlowDirection, FlowEnvelope, FlowInput,
     FlowOutcome, FlowVerdict, MailFlow,
 };
-use tp_contracts::{AccountId, Error, MailboxId, Result, TenantId};
+use tp_contracts::{AccountId, Error, MailboxId, QueueId, Result, TenantId};
 
 use crate::address::Addressing;
 use crate::authcheck::AuthCheck;
@@ -212,6 +213,21 @@ impl fmt::Debug for Delivery {
             .field("hostname", &self.hostname)
             .finish_non_exhaustive()
     }
+}
+
+/// Письмо отправки вне сессии SMTP после правил потока.
+struct Flowed {
+    mail_from: String,
+    rcpts: Vec<String>,
+    raw: Bytes,
+}
+
+/// Итог [`Delivery::pre_submit`].
+enum Pre {
+    /// Судьба письма решена: статус всем получателям.
+    Done(SubmitStatus),
+    /// Дальше — доставка и очередь.
+    Go(Flowed),
 }
 
 /// Письмо, подготовленное к доставке.
@@ -1443,27 +1459,15 @@ impl Delivery {
         true
     }
 
-    /// Отправка от имени пользователя вне сессии SMTP (JMAP `EmailSubmission/set`, CMP-04): получатели в
-    /// локальных доменах (`delivery.local_domains` и каталог: домены, адреса, псевдонимы, группы)
-    /// доставляются сразу через [`MailStore::ingest`] — как входящая почта, без очереди, MX, MTA-STS и DANE;
-    /// внешние — в очередь исходящей почты ([`Deps::outbound`]) письмом `raw` без изменений. Пересылки модулей
-    /// на локальные адреса — сразу в ящики, на внешние — в очередь.
-    ///
-    /// Неизвестный локальный адрес и переполненный ящик — статус [`SubmitStatus::Failed`] и уведомление о
-    /// недоставке отправителю (как для входящей почты). Узел без очереди: внешние получатели —
-    /// `SubmitStatus::Failed` с временной ошибкой [`NO_OUTBOUND`] без уведомления (статус получает отправитель),
-    /// локальные доставляются. Ошибка хранилища, каталога или очереди — `Err`.
-    /// Другая организация (`tenant` ≠ `Deps::tenant`) — все получатели в очередь, как до CMP-04 (без очереди —
-    /// все `Failed`).
-    pub async fn submit(
+    /// Обработка письма отправки вне сессии SMTP до доставки и очереди: правила потока (один раз на письмо) и
+    /// переписывание отправителя. `Done` — судьба письма решена правилом (отказ, удаление).
+    async fn pre_submit(
         &self,
         tenant: TenantId,
         mail_from: &str,
         rcpts: &[String],
         mut raw: Bytes,
-    ) -> Result<Submitted> {
-        let id = crate::server::next_id();
-        let requested = rcpts;
+    ) -> Result<Pre> {
         let mut flowed_rcpts = None;
         let input = FlowInput {
             tenant,
@@ -1495,7 +1499,7 @@ impl Delivery {
                     .await;
             }
             if let Some(status) = status {
-                return Ok(Submitted::all(rcpts, status));
+                return Ok(Pre::Done(status));
             }
             if let Some(body) = body {
                 raw = body;
@@ -1509,29 +1513,34 @@ impl Delivery {
             .rewrite(tenant, mail_from, EnvelopeSide::Sender)
             .await?;
         let mail_from = rewritten.as_deref().unwrap_or(mail_from);
-        if tenant != self.deps.tenant {
-            let status = match &self.deps.outbound {
-                Some(q) => {
-                    q.enqueue(tenant, mail_from, rcpts, raw).await?;
-                    SubmitStatus::Queued
-                }
-                None => {
-                    no_outbound(&id, rcpts.len());
-                    SubmitStatus::Failed(NO_OUTBOUND.into())
-                }
-            };
-            return Ok(Submitted::all(requested, status));
-        }
+        Ok(Pre::Go(Flowed {
+            mail_from: mail_from.to_owned(),
+            rcpts: rcpts.to_vec(),
+            raw,
+        }))
+    }
+
+    /// Доставка письма отправки после [`Delivery::pre_submit`]: локальным получателям — в ящики (группы, правила
+    /// Sieve, пересылки), внешним — в очередь. Статус — по каждому адресу `rcpts`. `bounce` — уведомить отправителя
+    /// о недоставленных; выпуск отложенной отправки ([`LocalRelease`]) уведомляет сам, по итогам записи очереди.
+    async fn dispatch(
+        &self,
+        id: &str,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+        bounce: bool,
+    ) -> Result<Vec<(String, SubmitStatus)>> {
         let sender = self.sender_by_address(mail_from).await?;
         let mut prepared = self
-            .prepare(&id, rcpts, false, Origin::Sender(sender))
+            .prepare(id, rcpts, false, Origin::Sender(sender))
             .await?;
         let received_at = OffsetDateTime::now_utc();
         self.hold_all(&prepared.held, mail_from, sender, &raw, received_at)
             .await?;
         let queue = self.deps.outbound.is_some();
         if !queue && !prepared.external.is_empty() {
-            no_outbound(&id, prepared.external.len());
+            no_outbound(id, prepared.external.len());
         }
         let mut failed = prepared.failed;
         // Письмо локальным получателям — с заголовками трассировки; правила и пересылки — по нему.
@@ -1539,7 +1548,7 @@ impl Delivery {
             raw.clone()
         } else {
             let mut full = self
-                .submit_headers(&id, mail_from, rcpts, received_at)
+                .submit_headers(id, mail_from, rcpts, received_at)
                 .into_bytes();
             full.extend_from_slice(&raw);
             Bytes::from(full)
@@ -1551,21 +1560,14 @@ impl Delivery {
             mut replies,
             steps: mut sieve_steps,
         } = self
-            .apply_rules(
-                &id,
-                mail_from,
-                &full,
-                &mut prepared.deliveries,
-                false,
-                false,
-            )
+            .apply_rules(id, mail_from, &full, &mut prepared.deliveries, false, false)
             .await?;
         let local_list = local_rcpts(&prepared.deliveries);
         if !prepared.deliveries.is_empty() {
             let local: Vec<String> = prepared.deliveries.iter().map(|(r, _)| r.clone()).collect();
             match self
                 .ingest_all(
-                    &id,
+                    id,
                     mail_from,
                     full.clone(),
                     prepared.deliveries,
@@ -1591,18 +1593,10 @@ impl Delivery {
             }
         }
         let forward = self
-            .forward(
-                &id,
-                mail_from,
-                &full,
-                forward,
-                false,
-                received_at,
-                delivered,
-            )
+            .forward(id, mail_from, &full, forward, false, received_at, delivered)
             .await?;
         let relayed = self
-            .relay(&id, mail_from, hops, false, received_at, None)
+            .relay(id, mail_from, hops, false, received_at, None)
             .await?;
         sieve::merge_replies(&mut replies, relayed.replies);
         sieve_steps.extend(relayed.steps);
@@ -1631,23 +1625,68 @@ impl Delivery {
         if queue {
             push_unique(&mut out, prepared.relayed);
         }
-        self.queue_out(&id, mail_from, out, raw.clone()).await?;
-        self.queue_forward(&id, mail_from, forward, raw.clone(), None)
+        self.queue_out(id, mail_from, out, raw.clone()).await?;
+        self.queue_forward(id, mail_from, forward, raw.clone(), None)
             .await?;
         let mut steps = vec![Step::new(Ek::Receive, Dd::Accept, rcpts.to_vec())];
         outcome_steps(&mut steps, &prepared.held, &local_list, &failed, false);
         steps.extend(sieve_steps);
-        self.send_replies(&id, mail_from, &full, replies, &mut steps)
+        self.send_replies(id, mail_from, &full, replies, &mut steps)
             .await;
-        if !failed.is_empty() && !mail_from.is_empty() {
-            let sent = self
-                .bounce(&id, mail_from, &failed, &raw, received_at)
-                .await;
+        if bounce && !failed.is_empty() && !mail_from.is_empty() {
+            let sent = self.bounce(id, mail_from, &failed, &raw, received_at).await;
             steps.push(dsn_step(mail_from, sent));
         }
         self.track(mail_from, tracking::message_id(&raw).as_deref(), steps)
             .await;
         tracing::info!(%id, count = rcpts.len(), "smtp: отправка вне сессии обработана");
+        Ok(statuses)
+    }
+
+    /// Отправка от имени пользователя вне сессии SMTP (JMAP `EmailSubmission/set`, CMP-04): получатели в
+    /// локальных доменах (`delivery.local_domains` и каталог: домены, адреса, псевдонимы, группы)
+    /// доставляются сразу через [`MailStore::ingest`] — как входящая почта, без очереди, MX, MTA-STS и DANE;
+    /// внешние — в очередь исходящей почты ([`Deps::outbound`]) письмом `raw` без изменений. Пересылки модулей
+    /// на локальные адреса — сразу в ящики, на внешние — в очередь.
+    ///
+    /// Неизвестный локальный адрес и переполненный ящик — статус [`SubmitStatus::Failed`] и уведомление о
+    /// недоставке отправителю (как для входящей почты). Узел без очереди: внешние получатели —
+    /// `SubmitStatus::Failed` с временной ошибкой [`NO_OUTBOUND`] без уведомления (статус получает отправитель),
+    /// локальные доставляются. Ошибка хранилища, каталога или очереди — `Err`.
+    /// Другая организация (`tenant` ≠ `Deps::tenant`) — все получатели в очередь, как до CMP-04 (без очереди —
+    /// все `Failed`).
+    pub async fn submit(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+    ) -> Result<Submitted> {
+        let id = crate::server::next_id();
+        let requested = rcpts;
+        let Flowed {
+            mail_from,
+            rcpts,
+            raw,
+        } = match self.pre_submit(tenant, mail_from, rcpts, raw).await? {
+            Pre::Done(status) => return Ok(Submitted::all(requested, status)),
+            Pre::Go(m) => m,
+        };
+        let (mail_from, rcpts) = (mail_from.as_str(), rcpts.as_slice());
+        if tenant != self.deps.tenant {
+            let status = match &self.deps.outbound {
+                Some(q) => {
+                    q.enqueue(tenant, mail_from, rcpts, raw).await?;
+                    SubmitStatus::Queued
+                }
+                None => {
+                    no_outbound(&id, rcpts.len());
+                    SubmitStatus::Failed(NO_OUTBOUND.into())
+                }
+            };
+            return Ok(Submitted::all(requested, status));
+        }
+        let statuses = self.dispatch(&id, mail_from, rcpts, raw, true).await?;
         // Статус — по получателям запроса: адрес, убранный правилом потока, считается обработанным.
         let statuses = requested
             .iter()
@@ -2023,6 +2062,21 @@ impl Outbound for Delivery {
     ) -> Result<Submitted> {
         Delivery::submit(self, tenant, mail_from, rcpts, raw).await
     }
+
+    async fn schedule(
+        &self,
+        tenant: TenantId,
+        mail_from: &str,
+        rcpts: &[String],
+        raw: Bytes,
+        release_at: OffsetDateTime,
+    ) -> Result<QueueId> {
+        Delivery::schedule(self, tenant, mail_from, rcpts, raw, release_at).await
+    }
+
+    async fn cancel_scheduled(&self, tenant: TenantId, queue: QueueId) -> Result<()> {
+        Delivery::cancel_scheduled(self, tenant, queue).await
+    }
 }
 
 /// Статус внешнего получателя [`Delivery::submit`] на узле без очереди исходящей почты (временная ошибка).
@@ -2352,6 +2406,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 mod moderation;
+mod scheduled;
 
 #[cfg(test)]
 mod tests;
