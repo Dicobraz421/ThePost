@@ -30,3 +30,4 @@ tracing.workspace = true
 tp-testkit.workspace = true
 insta.workspace = true
 proptest.workspace = true
+serde_yaml_ng.workspace = true
