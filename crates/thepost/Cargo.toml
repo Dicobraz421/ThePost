@@ -13,6 +13,9 @@ workspace = true
 [features]
 # Веб-консоль вшивается в бинарный файл: `cargo build -p thepost --features console`. По умолчанию выключена.
 console = ["tp-admin/console"]
+# Вход по Kerberos (GSSAPI, SRS 6.1): `cargo build -p thepost --features gssapi`; сборке нужны заголовки
+# libkrb5 (libkrb5-dev) и libclang, узлу — libgssapi_krb5. По умолчанию выключена.
+gssapi = ["tp-auth/gssapi"]
 
 [dependencies]
 tp-contracts.workspace = true
