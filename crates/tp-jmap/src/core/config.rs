@@ -81,6 +81,17 @@ pub struct CalendarsConfig {
     pub max_expanded_query_duration: Duration,
 }
 
+impl CalendarsConfig {
+    /// Параметры индекса события для записи в момент `now`.
+    pub(crate) fn index_options(&self, now: time::OffsetDateTime) -> tp_dav::index::IndexOptions {
+        let horizon = time::Duration::try_from(self.expand_horizon).unwrap_or(time::Duration::MAX);
+        tp_dav::index::IndexOptions {
+            horizon: now.checked_add(horizon).unwrap_or(now),
+            max_instances: self.max_instances,
+        }
+    }
+}
+
 impl Default for CalendarsConfig {
     fn default() -> Self {
         Self {

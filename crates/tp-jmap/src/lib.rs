@@ -13,6 +13,8 @@
 //! - `autoconfig` — автонастройка клиентов: `/.well-known/caldav`, `/.well-known/carddav`, Thunderbird, `.mobileconfig`
 //!   (подпись профиля ключом TLS — [`ProfileSigner`], [`Jmap::with_profile_signer`]);
 //! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
+//! - `calendar_event` — CalendarEvent/get, changes, set, copy: iCalendar в `DavStore`, JSCalendar — calcard,
+//!   индекс — `tp_dav::index`;
 //! - `calendars` — Calendar/get, changes, set (draft-ietf-jmap-calendars) поверх `DavStore`, [`Jmap::with_dav`];
 //! - `contact_card` — ContactCard/get, changes, query, queryChanges, set, copy: vCard в `DavStore`, JSContact —
 //!   calcard, индекс — `tp_dav::index`;
@@ -24,6 +26,7 @@
 
 mod autoconfig;
 mod blob;
+mod calendar_event;
 mod calendars;
 mod contact_card;
 mod contacts;
@@ -95,6 +98,10 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("Calendar/get", CALENDARS),
     ("Calendar/changes", CALENDARS),
     ("Calendar/set", CALENDARS),
+    ("CalendarEvent/get", CALENDARS),
+    ("CalendarEvent/changes", CALENDARS),
+    ("CalendarEvent/set", CALENDARS),
+    ("CalendarEvent/copy", CALENDARS),
 ];
 
 /// Варианты сортировки `Email/query` (сессия, `emailQuerySortOptions`).
@@ -150,6 +157,10 @@ pub(crate) async fn call_builtin(
         "Calendar/get" => calendars::get(ctx, args).await,
         "Calendar/changes" => calendars::changes(ctx, args).await,
         "Calendar/set" => calendars::set(ctx, args).await,
+        "CalendarEvent/get" => calendar_event::get(ctx, args).await,
+        "CalendarEvent/changes" => calendar_event::changes(ctx, args).await,
+        "CalendarEvent/set" => calendar_event::set(ctx, args).await,
+        "CalendarEvent/copy" => calendar_event::copy(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
 }
