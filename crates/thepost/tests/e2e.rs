@@ -207,7 +207,7 @@ async fn drop_database(url: &str, name: &str) {
     }
 }
 
-/// Принятый домен организации в БД (как `thepost admin transport domain create`): по нему SMTP доставляет
+/// Принятый домен организации в БД (как `thepost admin domain add`): по нему SMTP доставляет
 /// локально (решение 96), настройки `smtp.delivery` доменов не задают.
 async fn accept_domain(meta: &PgMeta, tenant: TenantId, name: &str) -> DomainId {
     let id = DomainId::new();
