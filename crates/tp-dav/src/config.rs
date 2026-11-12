@@ -63,6 +63,14 @@ pub struct DavConfig {
     pub gal_cache: Duration,
     /// Отображаемое имя адресной книги по умолчанию (создаётся при первом обращении к дому адресных книг).
     pub default_addressbook_name: String,
+    /// Оставлять во входящих планирования (`schedule-inbox`) сообщения iTIP, которые сервер уже применил к
+    /// календарю (`REQUEST`, `REPLY`, `CANCEL`). По умолчанию — нет: клиенты, которые входящие не чистят,
+    /// иначе заполняют их до лимита хранилища. Необработанные (`COUNTER`, `REFRESH`, `ADD`) остаются всегда.
+    pub schedule_keep_processed: bool,
+    /// Попыток записи при приёме iTIP, если объект меняется одновременно (условие записи не выполнено).
+    pub schedule_write_attempts: usize,
+    /// Участников в одном запросе занятости (`POST` VFREEBUSY в `schedule-outbox`); больше — 403.
+    pub max_freebusy_attendees: usize,
 }
 
 impl Default for DavConfig {
@@ -85,6 +93,9 @@ impl Default for DavConfig {
             gal_page_size: 1_000,
             gal_cache: Duration::from_secs(60),
             default_addressbook_name: "Контакты".to_owned(),
+            schedule_keep_processed: false,
+            schedule_write_attempts: 3,
+            max_freebusy_attendees: 100,
         }
     }
 }

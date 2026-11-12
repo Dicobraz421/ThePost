@@ -34,9 +34,11 @@ use calcard::icalendar::{
 };
 use time::OffsetDateTime;
 use tp_contracts::ModSeq;
-use tp_contracts::dav::{Collection, CollectionKind, Component};
+use tp_contracts::dav::{Collection, CollectionKind, Component, DavStore};
+use tp_contracts::meta::AccountScope;
 use tp_contracts::{Error, Result};
 
+use crate::config::DavConfig;
 use crate::gal;
 use crate::path::{self, Target};
 use crate::server::{Cx, multistatus, precondition, status};
@@ -540,15 +542,19 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
 /// [`path::DEFAULT_TASKS`], [`path::DEFAULT_ADDRESSBOOK`]): одновременные обращения не создают дубликатов
 /// (`Conflict` хранилища — уже создано).
 pub(crate) async fn ensure_defaults(cx: &Cx<'_>, kind: CollectionKind) -> Result<()> {
-    if !cx
-        .store()
-        .list_collections(cx.scope, kind)
-        .await?
-        .is_empty()
-    {
+    defaults(cx.store(), cx.scope, &cx.dav.cfg, kind).await
+}
+
+/// [`ensure_defaults`] без запроса HTTP (приём iTIP).
+pub(crate) async fn defaults(
+    store: &dyn DavStore,
+    scope: AccountScope,
+    cfg: &DavConfig,
+    kind: CollectionKind,
+) -> Result<()> {
+    if !store.list_collections(scope, kind).await?.is_empty() {
         return Ok(());
     }
-    let cfg = &cx.dav.cfg;
     let defaults: &[(&str, &String, Component)] = match kind {
         CollectionKind::Calendar => &[
             (
@@ -575,7 +581,7 @@ pub(crate) async fn ensure_defaults(cx: &Cx<'_>, kind: CollectionKind) -> Result
             components: BTreeSet::from([*component]),
             ..Collection::new(kind, *name)
         };
-        match cx.store().create_collection(cx.scope, c).await {
+        match store.create_collection(scope, c).await {
             Ok(_) | Err(Error::Conflict) => {}
             Err(e) => return Err(e),
         }

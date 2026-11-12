@@ -16,6 +16,7 @@
 
 mod card;
 pub mod config;
+pub mod deliver;
 pub mod fuzz;
 mod gal;
 pub mod index;
@@ -32,5 +33,6 @@ pub mod xml;
 mod tests;
 
 pub use config::DavConfig;
+pub use deliver::ItipInbox;
 pub use path::PREFIX;
 pub use server::{ALLOW, DAV_HEADER, Deps, GalDeps, router, router_with_gal};
