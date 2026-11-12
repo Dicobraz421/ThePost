@@ -289,7 +289,7 @@ impl BusSection {
 ///     tls:
 ///       ca_file: /etc/thepost/cluster-ca.pem
 ///       cert_file: /etc/thepost/node.pem     # CN — node_id
-///       key_file: /etc/thepost/node-key.pem
+///       key_file: /etc/thepost/node-key.pem  # либо key: { secret: "thepost/node#key" } — ключ из хранилища секретов
 ///     permissions:
 ///       jmap: [search/query]
 /// ```
@@ -309,9 +309,16 @@ pub struct ClusterSection {
     /// различаются. Не задан — как в `addr` (решение 36). Требует `addr` и перезапуска.
     pub listen: String,
     /// Запросы узел → узел (секция `tp-cluster`, CLU-12): пределы, сроки, матрица разрешений и mTLS внутреннего
-    /// канала (`rpc.tls`: УЦ узлов, сертификат с CN — имя узла, ключ). Транспорт включается адресом `addr` или
-    /// сертификатом узла `rpc.tls.cert_file` (только исходящие запросы).
+    /// канала (`rpc.tls`: УЦ узлов, сертификат с CN — имя узла, ключ — файл `key_file` либо ссылка на секрет
+    /// `key`). Транспорт включается адресом `addr` или сертификатом узла `rpc.tls.cert_file` (только исходящие
+    /// запросы).
     pub rpc: RpcConfig,
+    /// Период проверки сертификатов внутреннего канала `rpc.tls` (файлы УЦ, сертификата и ключа, секрет `key`):
+    /// изменение применяется без перезапуска, ошибка новой пары оставляет прежнюю. `0s` — не проверять (замена
+    /// сертификата — перезапуском узла).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub rpc_tls_reload_interval: Duration,
     /// Запросов перестройки индексов, просматриваемых ролью indexer за проход (перестраиваются ящики своих
     /// разделов журнала).
     pub rebuild_scan: usize,
@@ -325,6 +332,7 @@ impl Default for ClusterSection {
             addr: String::new(),
             listen: String::new(),
             rpc: RpcConfig::default(),
+            rpc_tls_reload_interval: Duration::from_secs(60),
             rebuild_scan: 64,
         }
     }
@@ -339,7 +347,8 @@ impl ClusterSection {
 
     /// Проверка: имя узла (если задано), площадка, адрес (пусто или `https://host:port`), адрес приёма (пусто или
     /// `host:port` с портом 1–65535, только вместе с `addr`), секция `rpc`; с
-    /// включённым транспортом ([`ClusterSection::rpc_enabled`]) — файлы `rpc.tls` (УЦ, сертификат, ключ).
+    /// включённым транспортом ([`ClusterSection::rpc_enabled`]) — `rpc.tls`: файлы УЦ и сертификата, ключ — файл
+    /// `key_file` либо ссылка на секрет `key` (вместе не задаются).
     pub fn check(&self) -> Result<()> {
         if let Some(node) = &self.node_id {
             tp_contracts::membership::NodeId::new(node.clone())?;
@@ -372,10 +381,15 @@ impl ClusterSection {
         }
         if self.rpc_enabled() {
             let tls = &self.rpc.tls;
+            // Ключ — файл либо секрет (CTR-52): источник определяет контракт, оба сразу — ошибка.
+            let key = tls.key_source().map_err(|e| match e {
+                Error::Invalid(m) => Error::invalid(format!("rpc.{m}")),
+                other => other,
+            })?;
             for (field, set) in [
                 ("ca_file", tls.ca_file.is_some()),
                 ("cert_file", tls.cert_file.is_some()),
-                ("key_file", tls.key_file.is_some()),
+                ("key_file либо rpc.tls.key", key.is_some()),
             ] {
                 if !set {
                     return Err(Error::invalid(format!(
@@ -1042,6 +1056,19 @@ blob:
                 "{missing}: {e}"
             );
         }
+        // APP-36: ключ по ссылке на секрет вместо файла; оба сразу — ошибка.
+        let by_secret = RPC_TLS.replace(
+            "key_file: /etc/thepost/node-key.pem",
+            "key: { secret: \"thepost/node#key\" }",
+        );
+        assert_ne!(by_secret, RPC_TLS);
+        let c = parse(&format!("{MINIMAL_DEV}cluster:\n{addr}{by_secret}")).expect("key");
+        let cluster = c.section::<ClusterSection>(CLUSTER).expect("cluster");
+        assert!(cluster.rpc.tls.key.is_some() && cluster.rpc.tls.key_file.is_none());
+        let e = err(parse(&format!(
+            "{MINIMAL_DEV}cluster:\n{addr}{RPC_TLS}      key: {{ secret: \"thepost/node#key\" }}\n"
+        )));
+        assert!(e.contains("mutually exclusive"), "{e}");
         // Только сертификат (исходящие запросы без слушателя) — тоже с УЦ.
         let e = err(parse(&format!(
             "{MINIMAL_DEV}cluster:\n  rpc:\n    tls:\n      cert_file: /n.pem\n      key_file: /k.pem\n"
