@@ -149,6 +149,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "sync holds",
         include_str!("../migrations/0032_sync_holds.sql"),
     ),
+    (
+        33,
+        "card search pending",
+        include_str!("../migrations/0033_card_search_pending.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
