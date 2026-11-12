@@ -389,3 +389,80 @@ pub fn object(v: Value) -> Map<String, Value> {
         _ => Map::new(),
     }
 }
+
+/// Пустой объект результатов `/set` — `null`.
+pub fn or_null(m: Map<String, Value>) -> Value {
+    if m.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(m)
+    }
+}
+
+/// Итоги `/set` по объектам.
+#[derive(Debug, Default)]
+pub struct SetOutcome {
+    /// Созданные: creation id → свойства, заданные сервером.
+    pub created: Map<String, Value>,
+    /// Изменённые: id → изменённые сервером свойства или `null`.
+    pub updated: Map<String, Value>,
+    /// Удалённые.
+    pub destroyed: Vec<String>,
+    /// Ошибки создания.
+    pub not_created: Map<String, Value>,
+    /// Ошибки изменения.
+    pub not_updated: Map<String, Value>,
+    /// Ошибки удаления.
+    pub not_destroyed: Map<String, Value>,
+}
+
+impl SetOutcome {
+    /// Ответ `/set` (RFC 8620 §5.3).
+    pub fn response(
+        self,
+        account_id: &str,
+        old_state: &str,
+        new_state: &str,
+    ) -> Map<String, Value> {
+        object(json!({
+            "accountId": account_id,
+            "oldState": old_state,
+            "newState": new_state,
+            "created": or_null(self.created),
+            "updated": or_null(self.updated),
+            "destroyed": if self.destroyed.is_empty() { Value::Null } else { json!(self.destroyed) },
+            "notCreated": or_null(self.not_created),
+            "notUpdated": or_null(self.not_updated),
+            "notDestroyed": or_null(self.not_destroyed),
+        }))
+    }
+}
+
+/// Аргументы `/set` (общая часть).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetArgs {
+    /// Учётная запись.
+    pub account_id: String,
+    /// Ожидаемое состояние.
+    pub if_in_state: Option<String>,
+    /// Создать: creation id → объект.
+    pub create: Option<Map<String, Value>>,
+    /// Изменить: id → патч.
+    pub update: Option<Map<String, Value>>,
+    /// Удалить.
+    pub destroy: Option<Vec<String>>,
+}
+
+impl SetArgs {
+    /// Проверяет число объектов (`maxObjectsInSet`).
+    pub fn check_limit(&self, max: u32) -> MethodResult<()> {
+        let n = self.create.as_ref().map_or(0, Map::len)
+            + self.update.as_ref().map_or(0, Map::len)
+            + self.destroy.as_ref().map_or(0, Vec::len);
+        if n > max as usize {
+            return Err(MethodError::new("requestTooLarge"));
+        }
+        Ok(())
+    }
+}

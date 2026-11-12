@@ -2,8 +2,10 @@
 //!
 //! Изменения приходят из [`EventBus`](tp_contracts::bus::EventBus) подпиской на учётную запись: `MailboxChanged` —
 //! типы `Email`, `Thread`, `Mailbox`; `MailboxListChanged` — `Mailbox`; `Resync` (шина потеряла сигналы) — все
-//! типы учётной записи ([`ALL_TYPES`]), даже при том же состоянии. Состояние в `StateChange` — текущее
-//! состояние учётной записи; повтор того же состояния не отправляется. Доставка шины — at-most-once: после
+//! типы учётной записи ([`EVERY_TYPE`]), даже при том же состоянии; `SieveChanged` — `VacationResponse`,
+//! `SieveScript`; `DavChanged` адресной книги — `AddressBook`, `ContactCard` (при подключённых хранилищах,
+//! у этих типов своё состояние). Состояние в `StateChange` — текущее состояние типа; повтор тех же состояний
+//! не отправляется. Доставка шины — at-most-once: после
 //! переподключения клиент сверяется по `/changes`. При остановке узла ([`Jmap::shutdown`]) EventSource завершается,
 //! WebSocket получает Close 1001.
 //!
@@ -26,6 +28,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, Interval, interval_at};
 use tp_contracts::auth::Principal;
 use tp_contracts::bus::{EventKind, EventStream};
+use tp_contracts::dav::CollectionKind;
 use tp_contracts::meta::AccountScope;
 
 use crate::core::http::auth_error;
@@ -33,16 +36,89 @@ use crate::core::request::state_string;
 use crate::core::{Jmap, Problem};
 
 /// Типы учётной записи, чьё состояние — состояние учётной записи (`Identity` и `UserSettings` ведут своё).
+#[cfg(test)]
 const ALL_TYPES: &[&str] = &["Email", "Thread", "Mailbox", "EmailSubmission"];
 
+/// Типы со своим состоянием (JMAP-23…26): Sieve и автоответ — состояние `SieveStore`, контакты — состояние
+/// адресных книг `DavStore`. В `StateChange` попадают только при подключённом хранилище.
+const SIEVE_TYPES: &[&str] = &["VacationResponse", "SieveScript"];
+const CONTACT_TYPES: &[&str] = &["AddressBook", "ContactCard"];
+
+/// Все типы: почтовые и типы со своим состоянием.
+const EVERY_TYPE: &[&str] = &[
+    "Email",
+    "Thread",
+    "Mailbox",
+    "EmailSubmission",
+    "VacationResponse",
+    "SieveScript",
+    "AddressBook",
+    "ContactCard",
+];
+
 /// Типы данных, которые меняет уведомление шины.
-fn changed_types(kind: &EventKind) -> &'static [&'static str] {
+pub(crate) fn changed_types(kind: &EventKind) -> &'static [&'static str] {
     match kind {
         EventKind::MailboxChanged { .. } => &["Email", "Thread", "Mailbox"],
         EventKind::MailboxListChanged => &["Mailbox"],
+        EventKind::SieveChanged => SIEVE_TYPES,
+        EventKind::DavChanged {
+            kind: CollectionKind::AddressBook,
+            ..
+        } => CONTACT_TYPES,
         // Сигналы потеряны — что изменилось, неизвестно: клиент перечитывает все типы.
-        EventKind::Resync => ALL_TYPES,
+        EventKind::Resync => EVERY_TYPE,
         _ => &[],
+    }
+}
+
+/// Состояния типов учётной записи для push.
+struct States {
+    mail: String,
+    sieve: Option<String>,
+    contacts: Option<String>,
+}
+
+impl States {
+    async fn load(jmap: &Jmap, scope: AccountScope) -> tp_contracts::Result<Self> {
+        let mail = state_string(jmap.state(scope).await?);
+        let sieve = match &jmap.sieve {
+            Some(s) => Some(s.state(scope).await?.to_string()),
+            None => None,
+        };
+        let contacts = match &jmap.dav {
+            Some(d) => Some(state_string(
+                d.state(scope, CollectionKind::AddressBook).await?,
+            )),
+            None => None,
+        };
+        Ok(Self {
+            mail,
+            sieve,
+            contacts,
+        })
+    }
+
+    /// Состояние типа; тип неподключённого хранилища — `None`.
+    fn of(&self, ty: &str) -> Option<&str> {
+        if SIEVE_TYPES.contains(&ty) {
+            self.sieve.as_deref()
+        } else if CONTACT_TYPES.contains(&ty) {
+            self.contacts.as_deref()
+        } else {
+            Some(&self.mail)
+        }
+    }
+
+    /// `pushState`: состояние почты, при подключённых хранилищах — с их состояниями.
+    fn push_state(&self) -> String {
+        let mut s = self.mail.clone();
+        for (tag, extra) in [("s", &self.sieve), ("c", &self.contacts)] {
+            if let Some(e) = extra {
+                s.push_str(&format!("-{tag}{e}"));
+            }
+        }
+        s
     }
 }
 
@@ -79,20 +155,26 @@ impl Watch {
         if types.is_empty() {
             return None;
         }
-        let state = match self.jmap.state(self.scope).await {
-            Ok(s) => state_string(s),
+        let states = match States::load(&self.jmap, self.scope).await {
+            Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "jmap: состояние для push не получено");
                 return None;
             }
         };
+        let state = states.push_state();
         if !force && self.last.as_deref() == Some(state.as_str()) {
             return None;
         }
         self.last = Some(state.clone());
         let mut by_type = serde_json::Map::new();
         for t in types {
-            by_type.insert(t.to_owned(), json!(state));
+            if let Some(st) = states.of(t) {
+                by_type.insert(t.to_owned(), json!(st));
+            }
+        }
+        if by_type.is_empty() {
+            return None;
         }
         let mut changed = serde_json::Map::new();
         changed.insert(self.scope.account.to_string(), by_type.into());
@@ -305,12 +387,12 @@ async fn ws_message(
                 // Клиент отстал: сразу сообщить текущее состояние всех типов.
                 Some(ps) => {
                     w.last = Some(ps.to_owned());
-                    if let Some(c) = w.change(ALL_TYPES, true, false).await {
+                    if let Some(c) = w.change(EVERY_TYPE, true, false).await {
                         out.push(c);
                     }
                 }
                 None => {
-                    w.last = j.state(w.scope).await.ok().map(state_string);
+                    w.last = States::load(j, w.scope).await.ok().map(|s| s.push_state());
                 }
             }
         }
@@ -393,7 +475,7 @@ mod tests {
     use tp_contracts::bus::{Event, EventBus, EventKind};
     use tp_contracts::meta::{Flags, SpecialUse};
 
-    use super::ALL_TYPES;
+    use super::{ALL_TYPES, EVERY_TYPE};
     use crate::testenv::{Env, mail, serve};
 
     const WAIT: Duration = Duration::from_secs(5);
@@ -525,7 +607,8 @@ mod tests {
         let c = next_json(&mut ws).await;
         assert_eq!(c["@type"], "StateChange", "{c}");
         let state = c["changed"][&acc]["Email"].as_str().expect("Email state");
-        assert_eq!(c["pushState"], state);
+        let push_state = c["pushState"].as_str().expect("pushState");
+        assert!(push_state.starts_with(state), "{c}");
         assert!(c["changed"][&acc].get("Mailbox").is_none(), "{c}");
 
         send(&mut ws, json!({"@type": "Request", "using": []})).await;
@@ -568,16 +651,49 @@ mod tests {
         assert!(v["changed"][&acc]["Mailbox"].is_string(), "{v}");
     }
 
-    /// Все типы учётной записи в `StateChange` с одним состоянием.
+    /// Изменение автоответа (`SieveChanged`) → `StateChange` с типами `VacationResponse` и `SieveScript`.
+    #[tokio::test]
+    async fn websocket_vacation_change() {
+        let env = Env::new().await;
+        let addr = serve(env.jmap.clone()).await;
+        let mut ws = connect(addr).await;
+        let acc = env.account();
+        send(&mut ws, json!({"@type": "WebSocketPushEnable"})).await;
+        send(
+            &mut ws,
+            json!({"@type": "Request", "id": "r1",
+                   "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:vacationresponse"],
+                   "methodCalls": [["VacationResponse/set", {"accountId": acc,
+                       "update": {"singleton": {"isEnabled": true}}}, "c"]]}),
+        )
+        .await;
+        let (mut change, mut new_state) = (None, None);
+        while change.is_none() || new_state.is_none() {
+            let v = next_json(&mut ws).await;
+            if v["@type"] == "StateChange" {
+                change = Some(v);
+            } else {
+                new_state = Some(v["methodResponses"][0][1]["newState"].clone());
+            }
+        }
+        let (c, new_state) = (change.expect("change"), new_state.expect("state"));
+        let changed = c["changed"][&acc].as_object().expect("account");
+        let mut got: Vec<&str> = changed.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, ["SieveScript", "VacationResponse"], "{c}");
+        assert_eq!(changed["VacationResponse"], new_state, "{c}");
+    }
+
+    /// Все типы учётной записи в `StateChange`; почтовые — с одним состоянием.
     fn assert_all_types(c: &Value, acc: &str) {
         let changed = c["changed"][acc].as_object().expect("account");
         let mut got: Vec<&str> = changed.keys().map(String::as_str).collect();
         got.sort_unstable();
-        let mut want = ALL_TYPES.to_vec();
+        let mut want = EVERY_TYPE.to_vec();
         want.sort_unstable();
         assert_eq!(got, want, "{c}");
         let state = &changed["Email"];
-        assert!(changed.values().all(|v| v == state), "{c}");
+        assert!(ALL_TYPES.iter().all(|t| &changed[*t] == state), "{c}");
     }
 
     /// `Resync` в шине → WebSocket получает `StateChange` со всеми типами, хотя состояние не менялось.
@@ -600,7 +716,13 @@ mod tests {
         let c = next_json(&mut ws).await;
         assert_eq!(c["@type"], "StateChange", "{c}");
         assert_all_types(&c, &acc);
-        assert_eq!(c["pushState"], c["changed"][&acc]["Email"], "{c}");
+        let email = c["changed"][&acc]["Email"].as_str().expect("Email state");
+        assert!(
+            c["pushState"]
+                .as_str()
+                .is_some_and(|p| p.starts_with(email)),
+            "{c}"
+        );
     }
 
     /// `Resync` в шине → EventSource отдаёт `StateChange` со всеми типами.

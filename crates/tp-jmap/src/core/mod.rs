@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tp_contracts::auth::{Authenticator, Authorizer, Principal};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::bus::EventBus;
+use tp_contracts::dav::DavStore;
 use tp_contracts::ext::{DecisionHooks, JmapCapability};
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{
@@ -22,6 +23,7 @@ use tp_contracts::meta::{
 use tp_contracts::queue::Outbound;
 use tp_contracts::retention::TrashStore;
 use tp_contracts::search::SearchIndex;
+use tp_contracts::sieve::SieveStore;
 use tp_contracts::transport::MailFlow;
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Result, TenantId};
 
@@ -49,8 +51,17 @@ pub const WEBSOCKET: &str = "urn:ietf:params:jmap:websocket";
 /// Capability настроек пользователя The Post (`UserSettings`: `trash.purge`).
 pub const SETTINGS: &str = "urn:thepost:params:jmap:settings";
 
+/// Capability автоответа (RFC 8621 §8); доступна при подключённом [`Jmap::with_sieve`].
+pub const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
+/// Capability скриптов Sieve (RFC 9661); доступна при подключённом [`Jmap::with_sieve`].
+pub const SIEVE: &str = "urn:ietf:params:jmap:sieve";
+/// Capability контактов (RFC 9610); доступна при подключённом [`Jmap::with_dav`].
+pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
+
 /// Встроенные capability.
 const BUILTIN: [&str; 5] = [CORE, MAIL, SUBMISSION, WEBSOCKET, SETTINGS];
+/// Встроенные capability, доступные при подключённом хранилище (URI заняты всегда).
+const OPTIONAL: [&str; 3] = [VACATION, SIEVE, CONTACTS];
 
 /// Зависимости сервера JMAP: реализации контрактов, выбранные приложением.
 #[derive(Clone)]
@@ -119,6 +130,10 @@ pub struct Jmap {
     pub(crate) mail_flow: Option<Arc<dyn MailFlow>>,
     /// Ключ подписи профиля `.mobileconfig`; `None` — профиль без подписи.
     pub(crate) profile_signer: Option<Arc<dyn ProfileSigner>>,
+    /// Скрипты Sieve и автоответ; `None` — capability `vacationresponse` и `sieve` не объявляются.
+    pub(crate) sieve: Option<Arc<dyn SieveStore>>,
+    /// Календари и контакты; `None` — capability `contacts` не объявляется.
+    pub(crate) dav: Option<Arc<dyn DavStore>>,
     stop: watch::Sender<bool>,
 }
 
@@ -129,6 +144,8 @@ impl fmt::Debug for Jmap {
             .field("cfg", &self.cfg)
             .field("mail_flow", &self.mail_flow.is_some())
             .field("profile_signer", &self.profile_signer.is_some())
+            .field("sieve", &self.sieve.is_some())
+            .field("dav", &self.dav.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -207,6 +224,7 @@ impl Jmap {
     /// и повтор имени метода — `Error::Conflict`.
     pub fn new(d: Deps, cfg: JmapConfig) -> Result<Self> {
         let mut uris = BUILTIN.to_vec();
+        uris.extend(OPTIONAL);
         let mut methods: Vec<&str> = crate::METHODS.iter().map(|(m, _)| *m).collect();
         for cap in &d.capabilities {
             if uris.contains(&cap.uri()) {
@@ -228,6 +246,8 @@ impl Jmap {
             uploaded: crate::blob::Uploads::default(),
             mail_flow: None,
             profile_signer: None,
+            sieve: None,
+            dav: None,
             stop: watch::channel(false).0,
         })
     }
@@ -250,6 +270,42 @@ impl Jmap {
         self
     }
 
+    /// Подключает скрипты Sieve и автоответ (CONTRACTS.md#Sieve): capability
+    /// `urn:ietf:params:jmap:vacationresponse` (JMAP-23) и `urn:ietf:params:jmap:sieve` (JMAP-24).
+    /// `None` — capability не объявляются, их методы — `unknownMethod`.
+    #[must_use]
+    pub fn with_sieve(mut self, sieve: Option<Arc<dyn SieveStore>>) -> Self {
+        self.sieve = sieve;
+        self
+    }
+
+    /// Подключает хранилище календарей и контактов (CONTRACTS.md#Dav): capability
+    /// `urn:ietf:params:jmap:contacts` (JMAP-25, JMAP-26). `None` — capability не объявляется.
+    #[must_use]
+    pub fn with_dav(mut self, dav: Option<Arc<dyn DavStore>>) -> Self {
+        self.dav = dav;
+        self
+    }
+
+    /// Хранилище Sieve для метода; не подключено — `unknownMethod`.
+    pub(crate) fn sieve_store(&self) -> MethodResult<&Arc<dyn SieveStore>> {
+        self.sieve.as_ref().ok_or(MethodError::new("unknownMethod"))
+    }
+
+    /// Хранилище DAV для метода; не подключено — `unknownMethod`.
+    pub(crate) fn dav_store(&self) -> MethodResult<&Arc<dyn DavStore>> {
+        self.dav.as_ref().ok_or(MethodError::new("unknownMethod"))
+    }
+
+    /// Подключена ли встроенная capability, зависящая от хранилища.
+    fn optional_enabled(&self, uri: &str) -> bool {
+        match uri {
+            VACATION | SIEVE => self.sieve.is_some(),
+            CONTACTS => self.dav.is_some(),
+            _ => false,
+        }
+    }
+
     /// Остановка узла: закрывает соединения push (EventSource завершается, WebSocket получает Close).
     /// Запросы API обслуживаются до остановки слушателя вызывающим.
     pub fn shutdown(&self) {
@@ -267,7 +323,9 @@ impl Jmap {
     }
 
     fn known_capability(&self, uri: &str) -> bool {
-        BUILTIN.contains(&uri) || self.d.capabilities.iter().any(|c| c.uri() == uri)
+        BUILTIN.contains(&uri)
+            || self.optional_enabled(uri)
+            || self.d.capabilities.iter().any(|c| c.uri() == uri)
     }
 
     /// Объект сессии (RFC 8620 §2) для субъекта; `base` — внешний адрес сервера без `/` в конце.
@@ -321,6 +379,22 @@ impl Jmap {
         primary.insert(MAIL.into(), json!(account));
         primary.insert(SUBMISSION.into(), json!(account));
         primary.insert(SETTINGS.into(), json!(account));
+        if let Some(sieve) = &self.sieve {
+            caps.insert(VACATION.into(), json!({}));
+            account_caps.insert(VACATION.into(), json!({}));
+            primary.insert(VACATION.into(), json!(account));
+            caps.insert(SIEVE.into(), crate::sieve::session_capability());
+            account_caps.insert(
+                SIEVE.into(),
+                crate::sieve::account_capability(sieve.limits()),
+            );
+            primary.insert(SIEVE.into(), json!(account));
+        }
+        if self.dav.is_some() {
+            caps.insert(CONTACTS.into(), json!({}));
+            account_caps.insert(CONTACTS.into(), crate::contacts::account_capability());
+            primary.insert(CONTACTS.into(), json!(account));
+        }
         for cap in &self.d.capabilities {
             caps.insert(cap.uri().into(), cap.session_object());
             account_caps.insert(cap.uri().into(), json!({}));
