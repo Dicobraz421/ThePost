@@ -10,15 +10,31 @@
 //!
 //! `limit` (`nresults`, не больше `dav.max_response_items`): остаток — `507` с `number-of-matches-within-limits`
 //! для адресной книги (§8.6.2). `address-data` с `prop` — карточка только с названными свойствами (`VERSION` — всегда).
+//!
+//! Версия vCard: карточка хранится в принятой версии и так же выдаётся, пока клиент не назвал другую — `Accept:
+//! text/vcard; version=3.0|4.0` у `GET` или атрибуты `content-type`, `version` у `address-data` отчётов (другая
+//! версия или тип в `address-data` — 403 `supported-address-data`). Преобразование — запись calcard в нужной версии
+//! ([`convert`]) и то, чего она не делает: `TYPE=pref` ↔ `PREF=1`, группы Apple `X-ADDRESSBOOKSERVER-KIND`,
+//! `X-ADDRESSBOOKSERVER-MEMBER` (3.0) ↔ `KIND`, `MEMBER` (4.0); в 3.0 добавляется обязательное `N` (из `FN`), в 4.0
+//! убираются `CHARSET` и тип встроенного фото из `TYPE` (он — в значении `data:`).
+//!
+//! Проверка карточки при `PUT` ([`check_put`], RFC 6352 §6.3.2.1): `valid-address-data` (не разбирается, нет `UID`),
+//! `supported-address-data` (версия не 3.0 и не 4.0), `max-resource-size` — встроенное фото больше
+//! `dav.max_photo_size` (публикуется как `max-image-size`).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use axum::response::Response;
-use calcard::vcard::{VCard, VCardEntry, VCardValue, VCardVersion};
+use calcard::vcard::{
+    VCard, VCardEntry, VCardKind, VCardParameter, VCardParameterName, VCardParameterValue,
+    VCardProperty, VCardValue, VCardVersion,
+};
 use tp_contracts::Result;
-use tp_contracts::dav::{Collection, CollectionKind, DavObject, TimeRange};
+use tp_contracts::dav::{Collection, CollectionKind, DavObject, ObjectIndex, TimeRange};
+
+use crate::index;
 
 use crate::path::{self, Target};
 use crate::props::{self, Res, Want};
@@ -196,38 +212,198 @@ fn entry_texts(e: &VCardEntry) -> Vec<Cow<'_, str>> {
     parts
 }
 
+/// Свойство и свойство-участник группы Apple в vCard 3.0.
+const APPLE_KIND: &str = "X-ADDRESSBOOKSERVER-KIND";
+const APPLE_MEMBER: &str = "X-ADDRESSBOOKSERVER-MEMBER";
+
+/// Версия vCard, в которой сервер выдаёт карточки: `3.0` или `4.0`.
+fn version_of(s: &str) -> Option<VCardVersion> {
+    match s.trim().trim_matches('"') {
+        "3.0" => Some(VCardVersion::V3_0),
+        "4.0" => Some(VCardVersion::V4_0),
+        _ => None,
+    }
+}
+
+/// Версия vCard из заголовка `Accept` (`text/vcard; version=4.0`); не названа или не поддерживается — `None`.
+pub(crate) fn accept_version(accept: &str) -> Option<VCardVersion> {
+    accept.split(',').find_map(|part| {
+        let mut it = part.split(';').map(str::trim);
+        if !it.next()?.eq_ignore_ascii_case("text/vcard") {
+            return None;
+        }
+        it.filter_map(|p| p.split_once('='))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("version"))
+            .and_then(|(_, v)| version_of(v))
+    })
+}
+
+fn is_pref(p: &VCardParameter) -> bool {
+    p.name == VCardParameterName::Type
+        && matches!(&p.value, VCardParameterValue::Text(t) if t.eq_ignore_ascii_case("pref"))
+}
+
+/// Карточка, подготовленная к записи в версии `to` (то, чего не делает запись calcard, — см. описание модуля).
+fn adapt(card: &VCard, to: VCardVersion) -> VCard {
+    let v4 = to == VCardVersion::V4_0;
+    let mut entries: Vec<VCardEntry> = card.entries.clone();
+    for e in &mut entries {
+        if v4 {
+            e.params
+                .retain(|p| !p.name.as_str().eq_ignore_ascii_case("CHARSET"));
+            // Тип фото в 4.0 — в самом значении `data:` (в 3.0 запись calcard вернёт его в `TYPE`).
+            let media = e
+                .values
+                .iter()
+                .filter_map(VCardValue::as_binary)
+                .find_map(|d| d.content_type.as_deref())
+                .and_then(|t| t.rsplit('/').next());
+            if let Some(sub) = media {
+                e.params.retain(|p| {
+                    p.name != VCardParameterName::Type
+                        || !p
+                            .value
+                            .as_text()
+                            .is_some_and(|t| t.eq_ignore_ascii_case(sub))
+                });
+            }
+            for p in &mut e.params {
+                if is_pref(p) {
+                    *p = VCardParameter::pref(1u32);
+                }
+            }
+            if e.name.as_str().eq_ignore_ascii_case(APPLE_KIND) {
+                e.name = VCardProperty::Kind;
+                for v in &mut e.values {
+                    let kind = match v.as_text().map(str::to_ascii_lowercase).as_deref() {
+                        Some("group") => VCardKind::Group,
+                        Some("individual") => VCardKind::Individual,
+                        Some("org") => VCardKind::Org,
+                        Some("location") => VCardKind::Location,
+                        _ => continue,
+                    };
+                    *v = VCardValue::Kind(kind);
+                }
+            } else if e.name.as_str().eq_ignore_ascii_case(APPLE_MEMBER) {
+                e.name = VCardProperty::Member;
+            }
+        } else {
+            for p in &mut e.params {
+                if p.name == VCardParameterName::Pref
+                    && p.value == VCardParameterValue::Integer(1)
+                {
+                    *p = VCardParameter::typ("pref".to_owned());
+                }
+            }
+            match e.name {
+                VCardProperty::Kind => {
+                    e.name = VCardProperty::Other(APPLE_KIND.to_owned());
+                    for v in &mut e.values {
+                        if let Some(t) = v.as_text().map(str::to_ascii_lowercase) {
+                            *v = VCardValue::Text(t);
+                        }
+                    }
+                }
+                VCardProperty::Member => e.name = VCardProperty::Other(APPLE_MEMBER.to_owned()),
+                _ => {}
+            }
+        }
+    }
+    if !v4
+        && !entries.iter().any(|e| e.name == VCardProperty::N)
+        && let Some(name) = card
+            .property(&VCardProperty::Fn)
+            .and_then(|e| e.values.first())
+            .and_then(VCardValue::as_text)
+    {
+        let mut n = VCardEntry::new(VCardProperty::N).with_value(name.to_owned());
+        n.values
+            .extend((0..4).map(|_| VCardValue::Text(String::new())));
+        entries.push(n);
+    }
+    VCard { entries }
+}
+
+/// Запись карточки в версии `to`.
+pub(crate) fn convert(card: &VCard, to: VCardVersion) -> Option<String> {
+    let mut out = String::new();
+    adapt(card, to).write_to(&mut out, to).ok()?;
+    Some(out)
+}
+
+/// Тело карточки в версии `to`: уже в ней или не разбирается — как есть.
+pub(crate) fn in_version(body: &str, to: VCardVersion) -> Cow<'_, str> {
+    match VCard::parse(body) {
+        Ok(card) if card.version() != Some(to) => {
+            convert(&card, to).map_or(Cow::Borrowed(body), Cow::Owned)
+        }
+        _ => Cow::Borrowed(body),
+    }
+}
+
+/// Проверка тела `PUT` в адресную книгу: индекс или нарушенное предусловие (см. описание модуля).
+pub(crate) fn check_put(
+    body: &str,
+    max_photo_size: usize,
+) -> std::result::Result<ObjectIndex, &'static str> {
+    const VALID: &str = "<card:valid-address-data/>";
+    let card = VCard::parse(body).map_err(|_| VALID)?;
+    if !matches!(
+        card.version(),
+        Some(VCardVersion::V3_0 | VCardVersion::V4_0)
+    ) {
+        return Err("<card:supported-address-data/>");
+    }
+    let photo = card
+        .properties(&VCardProperty::Photo)
+        .flat_map(|e| &e.values)
+        .filter_map(VCardValue::as_binary)
+        .map(|d| d.data.len())
+        .max();
+    if photo.is_some_and(|len| len > max_photo_size) {
+        return Err("<card:max-resource-size/>");
+    }
+    index::card(body).map_err(|_| VALID)
+}
+
 /// Параметры `address-data` запроса.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CardData {
+    /// Запрошенная версия; `None` — как хранится.
+    version: Option<VCardVersion>,
     /// Запрошенные свойства (`prop name`); пусто — карточка целиком.
     props: Vec<String>,
 }
 
 impl CardData {
-    /// Из элемента `prop` запроса (с `address-data` или без).
-    pub(crate) fn parse(prop: Option<&Element>) -> CardData {
-        let props = prop
-            .and_then(|p| p.child(CARDDAV, "address-data"))
-            .map(|d| {
-                d.children
-                    .iter()
-                    .filter(|c| c.is(CARDDAV, "prop"))
-                    .filter_map(|c| c.attr("name"))
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        CardData { props }
-    }
-
-    /// Тело возвращается как хранится.
-    pub(crate) fn is_plain(&self) -> bool {
-        self.props.is_empty()
+    /// Из элемента `prop` запроса (с `address-data` или без); тип не `text/vcard` или версия не 3.0 и не 4.0 —
+    /// `None` (`supported-address-data`).
+    pub(crate) fn parse(prop: Option<&Element>) -> Option<CardData> {
+        let Some(d) = prop.and_then(|p| p.child(CARDDAV, "address-data")) else {
+            return Some(CardData::default());
+        };
+        if d.attr("content-type")
+            .is_some_and(|t| !t.trim().eq_ignore_ascii_case("text/vcard"))
+        {
+            return None;
+        }
+        let version = match d.attr("version") {
+            None => None,
+            Some(v) => Some(version_of(v)?),
+        };
+        let props = d
+            .children
+            .iter()
+            .filter(|c| c.is(CARDDAV, "prop"))
+            .filter_map(|c| c.attr("name"))
+            .map(str::to_owned)
+            .collect();
+        Some(CardData { version, props })
     }
 
     /// Тело карточки по параметрам запроса; тело, которое не разбирается, — как есть.
     pub(crate) fn render<'b>(&self, body: &'b str, card: Option<&VCard>) -> Cow<'b, str> {
-        if self.is_plain() {
+        if self.props.is_empty() && self.version.is_none() {
             return Cow::Borrowed(body);
         }
         let parsed;
@@ -241,25 +417,33 @@ impl CardData {
                 Err(_) => return Cow::Borrowed(body),
             },
         };
-        let version = card.version().unwrap_or(VCardVersion::V3_0);
-        let out = VCard {
-            entries: card
-                .entries
-                .iter()
-                .filter(|e| {
-                    self.props
-                        .iter()
-                        .any(|p| p.eq_ignore_ascii_case(e.name.as_str()))
-                })
-                .cloned()
-                .collect(),
+        let stored = card.version();
+        let version = self.version.or(stored).unwrap_or(VCardVersion::V3_0);
+        if self.props.is_empty() && stored == Some(version) {
+            return Cow::Borrowed(body);
+        }
+        let mut out = if stored == Some(version) {
+            card.clone()
+        } else {
+            adapt(card, version)
         };
+        if !self.props.is_empty() {
+            out.entries.retain(|e| {
+                self.props
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(e.name.as_str()))
+            });
+        }
         let mut text = String::with_capacity(body.len());
         match out.write_to(&mut text, version) {
             Ok(()) => Cow::Owned(text),
             Err(_) => Cow::Borrowed(body),
         }
     }
+}
+
+fn unsupported_data() -> Response {
+    precondition(StatusCode::FORBIDDEN, "<card:supported-address-data/>")
 }
 
 /// Отчёты CardDAV (корневой элемент `root` в пространстве CardDAV).
@@ -323,7 +507,9 @@ fn query(cx: &Cx<'_>, c: &Collection, objects: &[DavObject], root: &Element) -> 
         Some(Ok(n)) => n.min(cx.dav.cfg.max_response_items),
         Some(Err(_)) => return status(StatusCode::BAD_REQUEST),
     };
-    let data = CardData::parse(root.child(DAV, "prop"));
+    let Some(data) = CardData::parse(root.child(DAV, "prop")) else {
+        return unsupported_data();
+    };
     let want = want_of(root);
     let need_body = want.needs_body();
     let mut ms = Multistatus::new();
@@ -364,7 +550,9 @@ async fn multiget(cx: &Cx<'_>, c: &Collection, root: &Element) -> Result<Respons
             "<d:number-of-matches-within-limits/>",
         ));
     }
-    let data = CardData::parse(root.child(DAV, "prop"));
+    let Some(data) = CardData::parse(root.child(DAV, "prop")) else {
+        return Ok(unsupported_data());
+    };
     let want = want_of(root);
     let need_body = want.needs_body();
     let resolved: Vec<(&str, Option<String>)> = hrefs

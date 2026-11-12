@@ -18,6 +18,7 @@ use crate::{DavConfig, Deps, router};
 mod auth;
 mod caldav_home;
 mod card_query;
+mod card_versions;
 mod carddav_home;
 mod multiget;
 mod preconditions;

@@ -13,7 +13,7 @@
 //!
 //! Дом адресных книг (`addressbook-home-set` принципала): при первом `PROPFIND`, если адресных книг нет, создаётся
 //! книга `contacts` с именем из `dav.default_addressbook_name`. Свойства книги: `supported-address-data` (vCard 3.0
-//! и 4.0), `max-resource-size`, `addressbook-description`.
+//! и 4.0), `max-resource-size`, `max-image-size` (Apple; `dav.max_photo_size`), `addressbook-description`.
 //!
 //! `PROPPATCH` — у коллекции: `displayname`, описание (`calendar-description`, `addressbook-description`), цвет и
 //! порядок календаря (`calendar-color`, `calendar-order`, Apple), часовой пояс календаря (`calendar-timezone` —
@@ -330,6 +330,11 @@ fn collection_props(cx: &Cx<'_>, c: &Collection, me: &str, v: &mut Vec<(PropName
                 .to_owned(),
             ));
             v.push(p(CARDDAV, "max-resource-size", max));
+            v.push(p(
+                CARDDAV,
+                "max-image-size",
+                cx.dav.cfg.max_photo_size.to_string(),
+            ));
         }
     }
 }

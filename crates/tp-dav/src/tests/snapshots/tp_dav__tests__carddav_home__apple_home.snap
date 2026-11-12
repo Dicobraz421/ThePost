@@ -93,6 +93,7 @@ expression: r.show()
 </d:privilege>
 </d:current-user-privilege-set>
 <d:displayname>Контакты</d:displayname>
+<card:max-image-size>524288</card:max-image-size>
 <card:max-resource-size>1048576</card:max-resource-size>
 <d:owner>
 <d:href>/dav/principals/ivan@example.org/</d:href>
@@ -125,7 +126,6 @@ expression: r.show()
 <d:propstat>
 <d:prop>
 <d:add-member/>
-<card:max-image-size/>
 <cs:me-card/>
 <cs:push-transports/>
 <cs:pushkey/>
