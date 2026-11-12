@@ -411,3 +411,34 @@ async fn stores_signal_after_commit() {
     meta.leave(&node.id).await.expect("leave again");
     assert!(rec.take().is_empty());
 }
+
+/// META-53: метрики публикатора для Д.7 растут при сигналах.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_metrics_grow_with_signals() {
+    let Some((bus, _, _)) = bus(SignalsConfig::default()).await else {
+        return;
+    };
+    let mut sys = bus.subscribe_system().await.expect("subscribe_system");
+    let before = bus.metrics();
+    assert_eq!(before.listeners, 1, "слушатель подключён: {before:?}");
+    for round in 0..3 {
+        let e = log(round);
+        bus.publish(e.clone()).await.expect("publish");
+        assert_eq!(next(&mut sys).await, e);
+    }
+    let m = bus.metrics();
+    let sent = m.notify_commit.count - before.notify_commit.count;
+    assert!(sent >= 1, "{m:?}");
+    assert_eq!(m.notify_commit.count, m.batches);
+    assert_eq!(m.notify_commit.sum, m.notify_total);
+    assert!(m.notify_commit.sum > before.notify_commit.sum);
+    assert_eq!(
+        m.notify_commit.buckets.iter().sum::<u64>(),
+        m.notify_commit.count
+    );
+    // Общая гистограмма процесса включает фиксации с NOTIFY (и фиксации других тестов).
+    assert!(m.commit.count - before.commit.count >= sent, "{m:?}");
+    assert!(m.commit.sum >= m.notify_commit.sum);
+    let share = m.notify_commit_share().expect("фиксации были");
+    assert!(share > 0.0 && share <= 1.0, "{share}");
+}

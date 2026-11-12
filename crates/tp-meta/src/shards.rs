@@ -383,7 +383,7 @@ impl ShardResolver for ShardDirectory {
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         let shard = shard.map(ShardId).ok_or(Error::NotFound)?;
         let mut c = self.cached();
         if c.epoch == epoch {

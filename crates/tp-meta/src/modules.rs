@@ -158,7 +158,7 @@ pub async fn migrate_module(pool: &PgPool, module: &dyn Module) -> Result<usize>
         .await
         .map_err(db_err)?;
     }
-    tx.commit().await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
     if !pending.is_empty() {
         tracing::info!(
             module = module.name(),
@@ -205,5 +205,5 @@ pub async fn drop_module(pool: &PgPool, name: &str) -> Result<()> {
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)
+    crate::commits::commit(tx).await
 }

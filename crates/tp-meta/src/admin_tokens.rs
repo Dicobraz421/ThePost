@@ -68,7 +68,7 @@ impl LocalAdminTokens for PgMeta {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(())
         })
         .await
@@ -88,7 +88,7 @@ impl LocalAdminTokens for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             // Причина отказа (нет, погашен, отозван, истёк) не раскрывается.
             row.map(LocalAdminToken::from).ok_or(Error::Forbidden)
         })
@@ -108,7 +108,7 @@ impl LocalAdminTokens for PgMeta {
             .await
             .map_err(db_err)?
             .rows_affected();
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             if updated == 0 {
                 return Err(Error::NotFound);
             }
@@ -129,7 +129,7 @@ impl LocalAdminTokens for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(rows.into_iter().map(LocalAdminToken::from).collect())
         })
         .await
@@ -145,7 +145,7 @@ impl LocalAdminTokens for PgMeta {
                 .await
                 .map_err(db_err)?
                 .rows_affected();
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(removed)
         })
         .await

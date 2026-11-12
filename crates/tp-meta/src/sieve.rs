@@ -161,7 +161,7 @@ impl PgMeta {
                     return Ok((cur, false));
                 }
                 let next = bump_state(&mut tx, scope).await?;
-                tx.commit().await.map_err(db_err)?;
+                crate::commits::commit(tx).await?;
                 Ok((next, true))
             })
             .await?;
@@ -235,7 +235,7 @@ impl VacationLog for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(marked.is_none())
         })
         .await
@@ -260,7 +260,7 @@ impl SieveStore for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             rows.into_iter()
                 .map(|(name, size, active)| {
                     Ok(ScriptInfo {
@@ -286,7 +286,7 @@ impl SieveStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(text)
         })
         .await
@@ -303,7 +303,7 @@ impl SieveStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(row.map(|(name, text)| ActiveScript { name, text }))
         })
         .await
@@ -459,7 +459,7 @@ impl SieveStore for PgMeta {
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(text)
         })
         .await
@@ -489,7 +489,7 @@ impl SieveStore for PgMeta {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(())
         })
         .await
@@ -507,7 +507,7 @@ impl SieveStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             Ok(row.map_or_else(Vacation::default, |r| Vacation {
                 enabled: r.enabled,
                 from: r.from_at,
@@ -561,7 +561,7 @@ impl SieveStore for PgMeta {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             to_u64(v.unwrap_or(0))
         })
         .await

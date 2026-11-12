@@ -612,7 +612,7 @@ where
 {
     let mut tx = begin(pool, tenant).await?;
     let out = f(&mut tx).await?;
-    tx.commit().await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
     Ok(out)
 }
 
@@ -623,7 +623,7 @@ where
 {
     let mut tx = begin_system(pool).await?;
     let out = f(&mut tx).await?;
-    tx.commit().await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
     Ok(out)
 }
 

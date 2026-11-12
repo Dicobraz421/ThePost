@@ -176,7 +176,7 @@ impl PgMeta {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        crate::commits::commit(tx).await?;
         Ok(done.rows_affected())
 }).await
     }
@@ -256,7 +256,7 @@ impl EventLog for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            crate::commits::commit(tx).await?;
             rows.into_iter().map(|r| r.into_logged(partition)).collect()
         })
         .await
