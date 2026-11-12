@@ -378,8 +378,11 @@ BAO_TOKEN=<root-токен> TLS_KEY=tls.key sh deploy/helm/openbao/bootstrap.sh 
 
 ### Узел thepost (Helm)
 ```bash
-helm install thepost deploy/helm/thepost -n thepost --create-namespace -f <свои значения>
+kubectl -n thepost create secret docker-registry ghcr --docker-server=ghcr.io   --docker-username=<логин GitHub> --docker-password=<токен read:packages>
+helm install thepost deploy/helm/thepost -n thepost --set 'imagePullSecrets[0].name=ghcr' -f <свои значения>
 ```
+Образ в ghcr.io закрытый: без `imagePullSecrets` чарт не рендерится (ошибка с подсказкой). Тег по умолчанию —
+`appVersion` чарта (версия выпуска, `beta.yml` публикует его вместе с `beta-<дата>`).
 Под — `runAsNonRoot` (65532), `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`,
 seccomp `RuntimeDefault` (свой профиль узла — `containerSecurityContext.seccompProfile` типа `Localhost`) и профили ролей
 процесса (секция `confine`). Слушатели — на портах выше 1024, стандартные порты (25, 465, 587, 143, 993, 443) — у Service;
