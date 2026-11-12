@@ -81,7 +81,8 @@ const PRIV_READ: &str = concat!(
 pub(crate) enum Res<'a> {
     Root,
     Principals,
-    Principal,
+    /// Принципал вошедшего с адресами календарного пользователя (`calendar-user-address-set`).
+    Principal(&'a [String]),
     Home(CollectionKind),
     /// Ресурс планирования дома календарей: входящие (`inbox`) или исходящие.
     Schedule {
@@ -114,7 +115,7 @@ impl Res<'_> {
         match self {
             Res::Root => path::PREFIX.to_owned(),
             Res::Principals => path::PRINCIPALS.to_owned(),
-            Res::Principal => path::principal(login),
+            Res::Principal(_) => path::principal(login),
             Res::Home(k) => path::home(*k, login),
             Res::Schedule { inbox, .. } => schedule_href(login, *inbox),
             Res::InboxItem { name, .. } => {
@@ -207,7 +208,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
     let me = path::principal(login);
     let rt = match res {
         Res::Root | Res::Principals | Res::Home(_) => "<d:collection/>",
-        Res::Principal => "<d:collection/><d:principal/>",
+        Res::Principal(_) => "<d:collection/><d:principal/>",
         Res::Collection(c) => match c.kind {
             CollectionKind::Calendar => "<d:collection/><c:calendar/>",
             CollectionKind::AddressBook => "<d:collection/><card:addressbook/>",
@@ -218,7 +219,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
     };
     let mut v = vec![p(DAV, "resourcetype", rt.to_owned())];
     match res {
-        Res::Principal => {
+        Res::Principal(addresses) => {
             v.push(p(DAV, "displayname", text(login).into_owned()));
             v.push(p(DAV, "principal-URL", href(&me)));
             v.push(p(
@@ -231,10 +232,10 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
                 "addressbook-home-set",
                 href(&path::home(CollectionKind::AddressBook, login)),
             ));
-            let mut addrs = String::new();
-            if login.contains('@') {
-                addrs.push_str(&href(&format!("mailto:{login}")));
-            }
+            let mut addrs: String = addresses
+                .iter()
+                .map(|a| href(&format!("mailto:{a}")))
+                .collect();
             addrs.push_str(&href(&me));
             v.push(p(CALDAV, "calendar-user-address-set", addrs));
             v.push(p(
@@ -306,7 +307,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
     v.push(p(DAV, "current-user-principal", href(&me)));
     v.push(p(DAV, "principal-collection-set", href(path::PRINCIPALS)));
     let privs = match res {
-        Res::Root | Res::Principals | Res::Principal => PRIV_READ,
+        Res::Root | Res::Principals | Res::Principal(_) => PRIV_READ,
         Res::Collection(c) | Res::Object { coll: c, .. } if gal::is(c) => PRIV_READ,
         _ => PRIV_OWNER,
     };
@@ -522,10 +523,14 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         Target::Principals => {
             emit(cx, &mut ms, &Res::Principals, &want);
             if depth1 {
-                emit(cx, &mut ms, &Res::Principal, &want);
+                let addresses = cx.addresses().await?;
+                emit(cx, &mut ms, &Res::Principal(&addresses), &want);
             }
         }
-        Target::Principal(_) => emit(cx, &mut ms, &Res::Principal, &want),
+        Target::Principal(_) => {
+            let addresses = cx.addresses().await?;
+            emit(cx, &mut ms, &Res::Principal(&addresses), &want);
+        }
         Target::Home(kind, _) => {
             ensure_defaults(cx, *kind).await?;
             emit(cx, &mut ms, &Res::Home(*kind), &want);

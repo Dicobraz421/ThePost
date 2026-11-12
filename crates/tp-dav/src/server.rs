@@ -155,14 +155,27 @@ impl Cx<'_> {
         &self.principal.login
     }
 
-    /// Адреса календарного пользователя вошедшего ([`crate::itip::address`]): имя входа, если оно — адрес.
-    pub(crate) fn addresses(&self) -> Vec<String> {
+    /// Адреса календарного пользователя вошедшего ([`crate::itip::address`]; `calendar-user-address-set`, свои
+    /// при разборе участников): с планированием — все адреса учётной записи (`Account::addresses`, основной первым,
+    /// затем псевдонимы), без него или без учётной записи — имя входа, если оно — адрес.
+    pub(crate) async fn addresses(&self) -> tp_contracts::Result<Vec<String>> {
+        if let Some(s) = &self.dav.schedule
+            && let Some(account) = s
+                .accounts
+                .get(self.scope.tenant, self.scope.account)
+                .await?
+        {
+            let all = account.addresses();
+            if !all.is_empty() {
+                return Ok(all);
+            }
+        }
         let login = crate::itip::address(&self.principal.login);
-        if login.contains('@') {
+        Ok(if login.contains('@') {
             vec![login]
         } else {
             Vec::new()
-        }
+        })
     }
 
     /// Заголовок как строка без пробелов по краям.
