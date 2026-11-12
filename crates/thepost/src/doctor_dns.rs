@@ -2,7 +2,7 @@
 //!
 //! Проверки: MX основного домена (и указывает ли он на `smtp.hostname`), SPF, DKIM по селекторам
 //! `smtp.dkim.domains`, DMARC, MTA-STS, PTR исходящих адресов (`smtp.queue.source_ip` или адреса
-//! `smtp.hostname`), срок и имена сертификата `tls`, закрытый ключ `tls` (файл `key_file` или секрет `tls.key`
+//! `smtp.hostname`), срок и имена сертификата `tls`, закрытый ключ `tls` (секрет `tls.key` в хранилище секретов
 //! подходит к цепочке), слушатели с PROXY protocol v2 за балансировщиком.
 //! Имена зон RFC 6761 (`.test`, `.example`, `.invalid`, `.localhost`) — проверки DNS пропускаются (SKIP, CMP-09).
 //! DNS — через [`Dns`]: в работе — системный резолвер (`mail-auth`), в тестах — подстановка.
@@ -557,31 +557,22 @@ async fn certificate(
     }
 }
 
-/// Закрытый ключ секции `tls` подходит к цепочке `cert_file` — та же загрузка, что при запуске узла. При `tls.key`
-/// ключ читается из хранилища секретов, файл `key_file` не проверяется; иначе — файл `key_file`. В отчёте — путь
-/// или ссылка на секрет, значение ключа не выводится.
+/// Закрытый ключ секции `tls` (секрет `tls.key` в хранилище секретов, PLT-31) подходит к цепочке `cert_file` — та
+/// же загрузка, что при запуске узла; без хранилища проверка пропускается. В отчёте — ссылка на секрет, значение
+/// ключа не выводится.
 async fn key(tls: &TlsConfig, store: Option<&Arc<dyn SecretStore>>, report: &mut Report) {
     let id = "tls.key";
-    let (value, loaded) = match (&tls.key, store) {
-        (Some(secret), None) => {
-            report.push(
-                id,
-                Status::Skipped,
-                format!("секрет {secret}"),
-                "хранилище секретов не настроено",
-            );
-            return;
-        }
-        (Some(secret), Some(store)) => (
-            format!("секрет {secret}"),
-            TlsCerts::load_with_secrets(tls, store.clone()).await,
-        ),
-        (None, _) => (
-            tls.key_file.display().to_string(),
-            TlsCerts::load(tls).await,
-        ),
+    let value = format!("секрет {}", tls.key);
+    let Some(store) = store else {
+        report.push(
+            id,
+            Status::Skipped,
+            value,
+            "хранилище секретов не настроено",
+        );
+        return;
     };
-    match loaded {
+    match TlsCerts::load(tls, store.clone()).await {
         Ok(_) => report.push(id, Status::Ok, value, "ключ подходит к сертификату"),
         Err(e) => report.push(id, Status::Fail, value, message(&e)),
     }
@@ -896,8 +887,7 @@ mod tests {
         let path = dir.path().join("cert.pem");
         std::fs::write(&path, CERT).expect("write");
         let cfg = config(&format!(
-            "smtp:\n  hostname: mx.example.org\ntls:\n  cert_file: \"{}\"\n  key_file: \"{}\"\n",
-            path.display().to_string().replace('\\', "/"),
+            "smtp:\n  hostname: mx.example.org\ntls:\n  cert_file: \"{}\"\n",
             path.display().to_string().replace('\\', "/"),
         ));
         let r = run(&cfg, &healthy()).await;
@@ -909,37 +899,20 @@ mod tests {
         assert_eq!(status(&r, "tls.certificate"), Some(Status::Warn));
     }
 
-    /// APP-35: ключ в файле — пара проверяется; `tls.key` — файл `key_file` не читается, секрет читается из
-    /// хранилища и сверяется с цепочкой; значение ключа в отчёт не попадает.
+    /// APP-35, PLT-31: ключ `tls.key` — только секрет: читается из хранилища и сверяется с цепочкой (ссылка по
+    /// умолчанию — `thepost/tls#key`); значение ключа в отчёт не попадает.
     #[tokio::test]
-    async fn tls_key_from_file_or_secret() {
+    async fn tls_key_from_secret() {
         const KEY: &str = include_str!("testdata/key.pem");
         const OTHER: &str = include_str!("testdata/key-rsa.pem");
         let dir = tempfile::tempdir().expect("tempdir");
         let cert = dir.path().join("cert.pem");
-        let key_file = dir.path().join("key.pem");
         std::fs::write(&cert, CERT).expect("cert");
-        std::fs::write(&key_file, KEY).expect("key");
         let path = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
         let dns = healthy();
 
-        let files = config(&format!(
-            "tls:\n  cert_file: \"{}\"\n  key_file: \"{}\"\n",
-            path(&cert),
-            path(&key_file)
-        ));
-        let r = run(&files, &dns).await;
-        assert_eq!(status(&r, "tls.key"), Some(Status::Ok), "{r:?}");
-        std::fs::write(&key_file, OTHER).expect("key");
-        let r = run(&files, &dns).await;
-        assert_eq!(status(&r, "tls.key"), Some(Status::Fail), "{r:?}");
-
-        // Файла key_file нет (значение по умолчанию): при tls.key о нём не сообщается.
         let secret: tp_contracts::secrets::SecretRef = "thepost/tls#key".parse().expect("ref");
-        let by_secret = config(&format!(
-            "tls:\n  cert_file: \"{}\"\n  key: {{ secret: \"{secret}\" }}\n",
-            path(&cert)
-        ));
+        let by_secret = config(&format!("tls:\n  cert_file: \"{}\"\n", path(&cert)));
         let mem = Arc::new(tp_testkit::MemSecretStore::default());
         let store: Arc<dyn SecretStore> = mem.clone();
         let r = run_store(&by_secret, &dns, None).await;

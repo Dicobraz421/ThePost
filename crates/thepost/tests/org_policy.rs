@@ -114,7 +114,6 @@ service_http:
   allow_plaintext: true
 tls:
   cert_file: \"{cert}\"
-  key_file: \"{key}\"
 meta:
   events:
     node_ttl: 3s
@@ -149,7 +148,6 @@ admin:
 ",
         blob = path(dir.join("blob")),
         cert = path(testdata("cert.pem")),
-        key = path(testdata("key.pem")),
         index = path(dir.join("index")),
         socket = path(socket.to_path_buf()),
         pid = std::process::id(),
@@ -336,6 +334,12 @@ impl Node {
         let secrets = Arc::new(MemSecretStore::default());
         let db: SecretRef = "thepost/db#password".parse().expect("ref");
         secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+        // Ключ TLS — только секрет `tls.key` (PLT-31; ссылка по умолчанию `thepost/tls#key`).
+        let key: SecretRef = "thepost/tls#key".parse().expect("ref");
+        secrets.set(
+            &key,
+            std::fs::read_to_string(testdata("key.pem")).expect("key.pem"),
+        );
 
         let domain = "example.ru";
         let socket = dir.path().join("admin.sock");
