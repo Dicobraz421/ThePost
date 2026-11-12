@@ -15,6 +15,8 @@
 //! - `vacation` — VacationResponse/get, set: автоответ (RFC 8621 §8) поверх `SieveStore`, [`Jmap::with_sieve`];
 //! - `calendar_event` — CalendarEvent/get, changes, set, copy: iCalendar в `DavStore`, JSCalendar — calcard,
 //!   индекс — `tp_dav::index`;
+//! - `calendar_query` — CalendarEvent/query, queryChanges: интервал по индексу и развёртке повторов calcard,
+//!   `expandRecurrences`;
 //! - `calendars` — Calendar/get, changes, set (draft-ietf-jmap-calendars) поверх `DavStore`, [`Jmap::with_dav`];
 //! - `contact_card` — ContactCard/get, changes, query, queryChanges, set, copy: vCard в `DavStore`, JSContact —
 //!   calcard, индекс — `tp_dav::index`;
@@ -27,6 +29,7 @@
 mod autoconfig;
 mod blob;
 mod calendar_event;
+mod calendar_query;
 mod calendars;
 mod contact_card;
 mod contacts;
@@ -100,6 +103,8 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("Calendar/set", CALENDARS),
     ("CalendarEvent/get", CALENDARS),
     ("CalendarEvent/changes", CALENDARS),
+    ("CalendarEvent/query", CALENDARS),
+    ("CalendarEvent/queryChanges", CALENDARS),
     ("CalendarEvent/set", CALENDARS),
     ("CalendarEvent/copy", CALENDARS),
 ];
@@ -159,6 +164,8 @@ pub(crate) async fn call_builtin(
         "Calendar/set" => calendars::set(ctx, args).await,
         "CalendarEvent/get" => calendar_event::get(ctx, args).await,
         "CalendarEvent/changes" => calendar_event::changes(ctx, args).await,
+        "CalendarEvent/query" => calendar_query::query(ctx, args).await,
+        "CalendarEvent/queryChanges" => calendar_query::query_changes(ctx, args).await,
         "CalendarEvent/set" => calendar_event::set(ctx, args).await,
         "CalendarEvent/copy" => calendar_event::copy(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),

@@ -202,7 +202,7 @@ fn strings(v: &Value, out: &mut Vec<String>) {
 }
 
 /// Есть ли `needle` (в нижнем регистре) в строках свойств `props` карточки.
-fn contains(card: &Map<String, Value>, props: &[&str], needle: &str) -> bool {
+pub(crate) fn contains(card: &Map<String, Value>, props: &[&str], needle: &str) -> bool {
     let mut all = Vec::new();
     for p in props {
         if let Some(v) = card.get(*p) {
