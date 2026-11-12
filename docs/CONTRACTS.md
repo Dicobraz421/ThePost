@@ -409,12 +409,18 @@ Hot reload: новая копия рассылается через `watch`; п�
 
 ## Internal TLS
 SRS 6.2, решение 2026-10-30. Узел ↔ PostgreSQL, S3, узел ↔ узел — только TLS. Общая секция `tls::InternalTls
-{ ca_file, cert_file, key_file, server_name, allow_plaintext }` — поле `tls` секции канала; `Profile { Prod (по умолчанию), Dev }` —
+{ ca_file, cert_file, key_file, key, server_name, allow_plaintext }` — поле `tls` секции канала; `Profile { Prod (по умолчанию), Dev }` —
 параметр `profile` верхнего уровня config.yaml. `InternalTls::check_url(InternalChannel::{Postgres, S3, Node}, url, profile)
 -> Result<Transport::{Tls, Plaintext}>` вызывается в `thepost config check` и при запуске: `allow_plaintext` вне dev, адрес без TLS
 без `allow_plaintext`, `sslmode=require|verify-ca` — `Invalid`. Схемы: PostgreSQL — `sslmode=verify-full` (без `sslmode` клиент
 обязан verify-full), S3 — `https://`, узел — `https://`/`smtps://`. `Transport::Plaintext` — крейт канала пишет
 `InternalChannel::plaintext_warning()` в лог на каждом запуске. Служебный HTTP — TLS слушателя (`tp-platform`).
+Ключ клиентского сертификата (CTR-52, решение 37) — из хранилища секретов: `key: { secret: "<путь>#<поле>" }` (`SecretRef`, значение — PEM)
+вместо `key_file`; `key_file` остаётся для установок без OpenBao. `key` и `key_file` вместе — `Invalid`; `cert_file` задаётся вместе
+с `key_file` или `key`; ключ открытым текстом в `key` — ошибка разбора «secret in plaintext» без значения в тексте.
+`InternalTls::key_source() -> Result<Option<KeySource::{File(&Path), Secret(&SecretRef)}>>` — источник ключа; крейты каналов берут ключ
+отсюда, а не из полей, секрет читают сами через `SecretStore::get` (межузловой канал — CLU-16, клиент к СУБД — META-56,
+подключение в узле — APP-36). Смена ссылки применяется при новом подключении.
 
 ## Transport (Ф1)
 SRS 4.1, 2.6; решения 2026-11-01-transport-scope-external-mta, 2026-11-01-scale-shards-geo-admin. Код — `transport.rs` (CTR-24).
@@ -810,3 +816,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
 - 2026-11-12 — CTR-51 (волна contracts-37): `acquire::{AcquireObserver, AcquireWait, AcquireEnd, NoAcquireObserver, AcquireCounter}` —
   наблюдатель ожидания соединения с СУБД (число ожидающих, время, отказы; отмена снимает «ожидает» без записи времени). По сравнению
   с карточкой: счётчик в памяти `AcquireCounter` — в `tp-contracts`, а не в `tp-testkit`.
+- 2026-11-12 — CTR-52 (волна contracts-37): `InternalTls.key: Option<SecretRef>` — ключ внутренних каналов из хранилища секретов
+  (взамен `key_file`, оба сразу — `Invalid`), `InternalTls::key_source()` и `KeySource::{File, Secret}`. Новое поле секции: код,
+  собирающий `InternalTls` перечислением всех полей, дополняется `key: None` (в репозитории таких мест нет).

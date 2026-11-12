@@ -6,7 +6,7 @@
 //! `allow_plaintext: true`; тогда крейт пишет [`InternalChannel::plaintext_warning`] в лог на каждом запуске.
 //!
 //! ```
-//! use tp_contracts::tls::{InternalChannel, InternalTls, Profile, Transport};
+//! use tp_contracts::tls::{InternalChannel, InternalTls, KeySource, Profile, Transport};
 //!
 //! let tls = InternalTls::default();
 //! let url = "postgres://thepost@db.internal/thepost?sslmode=verify-full";
@@ -19,16 +19,28 @@
 //!     Transport::Plaintext
 //! );
 //! assert!(dev.check_url(InternalChannel::S3, "http://s3.internal:9000", Profile::Prod).is_err());
+//!
+//! // Ключ клиентского сертификата — из хранилища секретов (`key`) или из файла (`key_file`), но не оба сразу.
+//! let mtls: InternalTls = serde_json::from_str(
+//!     r#"{"cert_file": "/etc/thepost/node.pem", "key": {"secret": "thepost/tls/node#key"}}"#,
+//! )
+//! .expect("section");
+//! mtls.validate(InternalChannel::Node, Profile::Prod)?;
+//! match mtls.key_source()? {
+//!     Some(KeySource::Secret(secret)) => assert_eq!(secret.to_string(), "thepost/tls/node#key"),
+//!     other => panic!("unexpected key source: {other:?}"),
+//! }
 //! # Ok::<(), tp_contracts::Error>(())
 //! ```
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::secrets::SecretRef;
 
 /// Профиль запуска узла: параметр `profile` верхнего уровня config.yaml (читает приложение).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, JsonSchema)]
@@ -141,34 +153,65 @@ pub enum Transport {
 
 /// Секция TLS внутреннего канала (поле `tls` секции канала). Без полей — TLS с системными корнями.
 ///
-/// Сертификаты и ключи — PEM-файлы; источник (файлы, секреты Kubernetes) и перечитывание — как для
-/// клиентского TLS (SRS 6.2). Изменение путей применяется при новом подключении.
+/// Сертификаты — PEM-файлы; ключ клиентского сертификата — из хранилища секретов (`key`, решение 37) или из
+/// PEM-файла (`key_file`), источник отдаёт [`InternalTls::key_source`]. Перечитывание — как для клиентского TLS
+/// (SRS 6.2). Изменение путей и ссылки применяется при новом подключении.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct InternalTls {
     /// Корневые сертификаты для проверки сервера (PEM); не задан — системные корни.
     pub ca_file: Option<PathBuf>,
-    /// Клиентский сертификат для mTLS (PEM); задаётся вместе с `key_file`.
+    /// Клиентский сертификат для mTLS (PEM); задаётся вместе с `key` или `key_file`.
     pub cert_file: Option<PathBuf>,
-    /// Ключ клиентского сертификата (PEM); задаётся вместе с `cert_file`.
+    /// Ключ клиентского сертификата — файл (PEM); задаётся вместе с `cert_file`, вместо `key`.
     pub key_file: Option<PathBuf>,
+    /// Ключ клиентского сертификата — ссылка на секрет `{ secret: "<путь>#<поле>" }`, значение — PEM; задаётся
+    /// вместе с `cert_file`, вместо `key_file`. Ключ открытым текстом — ошибка разбора.
+    pub key: Option<SecretRef>,
     /// Имя сервера для SNI и проверки сертификата; не задано — хост из адреса.
     pub server_name: Option<String>,
     /// Разрешить открытый канал. Только в профиле dev; иначе — ошибка конфигурации.
     pub allow_plaintext: bool,
 }
 
+/// Источник ключа клиентского сертификата внутреннего канала ([`InternalTls::key_source`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource<'a> {
+    /// PEM-файл (`tls.key_file`).
+    File(&'a Path),
+    /// Поле секрета в хранилище (`tls.key`), значение — PEM; читает потребитель через `SecretStore::get`.
+    Secret(&'a SecretRef),
+}
+
 impl InternalTls {
-    /// Проверяет секцию: `allow_plaintext` только в профиле dev, сертификат и ключ клиента — парой.
+    /// Источник ключа клиентского сертификата: файл или ссылка на секрет; `None` — ключ не задан (без mTLS).
+    /// `key` и `key_file` вместе — [`Error::Invalid`]. Крейты каналов берут ключ отсюда, а не из полей.
+    pub fn key_source(&self) -> Result<Option<KeySource<'_>>> {
+        match (&self.key, &self.key_file) {
+            (Some(_), Some(_)) => Err(Error::Invalid(
+                "tls.key and tls.key_file are mutually exclusive".into(),
+            )),
+            (Some(secret), None) => Ok(Some(KeySource::Secret(secret))),
+            (None, Some(file)) => Ok(Some(KeySource::File(file))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Проверяет секцию: `allow_plaintext` только в профиле dev, сертификат и ключ клиента (`key_file` или
+    /// `key`) — парой, `key` и `key_file` вместе не задаются.
     pub fn validate(&self, channel: InternalChannel, profile: Profile) -> Result<()> {
         if self.allow_plaintext && profile != Profile::Dev {
             return Err(Error::Invalid(format!(
                 "{channel}: tls.allow_plaintext is allowed only with profile: dev"
             )));
         }
-        if self.cert_file.is_some() != self.key_file.is_some() {
+        let key = self.key_source().map_err(|e| match e {
+            Error::Invalid(m) => Error::Invalid(format!("{channel}: {m}")),
+            other => other,
+        })?;
+        if self.cert_file.is_some() != key.is_some() {
             return Err(Error::Invalid(format!(
-                "{channel}: tls.cert_file and tls.key_file must be set together"
+                "{channel}: tls.cert_file must be set together with tls.key_file or tls.key"
             )));
         }
         if self.server_name.as_deref().is_some_and(str::is_empty) {
@@ -310,11 +353,116 @@ mod tests {
         };
         assert!(half.validate(Node, Profile::Prod).is_err());
 
+        assert_eq!(
+            tls.key_source(),
+            Ok(Some(KeySource::File(Path::new("/etc/thepost/node.key"))))
+        );
+        assert_eq!(InternalTls::default().key_source(), Ok(None));
+
         assert_eq!(Profile::default(), Profile::Prod);
         assert_eq!(
             serde_json::from_str::<Profile>(r#""dev""#).expect("dev"),
             Profile::Dev
         );
         assert!(serde_json::from_str::<Profile>(r#""staging""#).is_err());
+    }
+
+    fn secret_key() -> SecretRef {
+        "thepost/tls/node#key".parse().expect("ref")
+    }
+
+    #[test]
+    fn key_from_secret() {
+        let tls: InternalTls = serde_json::from_str(
+            r#"{"cert_file": "/etc/thepost/node.pem", "key": {"secret": "thepost/tls/node#key"}}"#,
+        )
+        .expect("parse");
+        assert_eq!(tls.validate(Node, Profile::Prod), Ok(()));
+        assert_eq!(tls.key_source(), Ok(Some(KeySource::Secret(&secret_key()))));
+        // Запись и чтение секции не теряют ссылку.
+        let json = serde_json::to_string(&tls).expect("json");
+        assert_eq!(
+            serde_json::from_str::<InternalTls>(&json).expect("again"),
+            tls
+        );
+    }
+
+    #[test]
+    fn key_without_cert_file() {
+        let tls = InternalTls {
+            key: Some(secret_key()),
+            ..InternalTls::default()
+        };
+        assert_eq!(
+            tls.validate(Postgres, Profile::Prod),
+            Err(Error::Invalid(
+                "PostgreSQL: tls.cert_file must be set together with tls.key_file or tls.key"
+                    .into()
+            ))
+        );
+        // Источник ключа при этом определён: пару с сертификатом проверяет `validate`.
+        assert!(matches!(tls.key_source(), Ok(Some(KeySource::Secret(_)))));
+    }
+
+    #[test]
+    fn key_with_key_file() {
+        let tls = InternalTls {
+            cert_file: Some("/etc/thepost/node.pem".into()),
+            key_file: Some("/etc/thepost/node.key".into()),
+            key: Some(secret_key()),
+            ..InternalTls::default()
+        };
+        assert_eq!(
+            tls.key_source(),
+            Err(Error::Invalid(
+                "tls.key and tls.key_file are mutually exclusive".into()
+            ))
+        );
+        assert_eq!(
+            tls.validate(Node, Profile::Prod),
+            Err(Error::Invalid(
+                "node-to-node: tls.key and tls.key_file are mutually exclusive".into()
+            ))
+        );
+        assert!(
+            tls.check_url(Node, "https://mailbox-1:8443", Profile::Prod)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn key_in_plaintext() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIHNlY3JldA\n-----END PRIVATE KEY-----";
+        let section = serde_json::json!({"cert_file": "/etc/thepost/node.pem", "key": pem});
+        let e = serde_json::from_value::<InternalTls>(section)
+            .expect_err("plaintext key")
+            .to_string();
+        assert!(e.contains("secret in plaintext"), "{e}");
+        assert!(!e.contains("PRIVATE KEY") && !e.contains("MC4CAQ"), "{e}");
+        // Ссылка без поля и лишние ключи — тоже ошибка разбора.
+        assert!(serde_json::from_str::<InternalTls>(r#"{"key": {"secret": "nohash"}}"#).is_err());
+        assert!(
+            serde_json::from_str::<InternalTls>(r#"{"key": {"secret": "a#b", "pem": "x"}}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_has_key() {
+        let schema = serde_json::to_value(schemars::schema_for!(InternalTls)).expect("schema");
+        let props = &schema["properties"];
+        for field in [
+            "ca_file",
+            "cert_file",
+            "key_file",
+            "key",
+            "server_name",
+            "allow_plaintext",
+        ] {
+            assert!(props.get(field).is_some(), "{field}: {schema}");
+        }
+        let key = props["key"].to_string();
+        assert!(key.contains("SecretRef"), "{key}");
+        assert_eq!(schema["additionalProperties"], false);
     }
 }
