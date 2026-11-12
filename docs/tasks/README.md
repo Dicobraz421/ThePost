@@ -420,6 +420,11 @@
 | [DEP-13](DEP-13.md) | стенд SMB — замеры и отчёт по критериям Д.7 | deploy | A | deploy-12 | ready | DEP-12 |
 | [DEP-14](DEP-14.md) | стенд SMB — стресс, ×3, отказы и длительный прогон | deploy | A | deploy-12 | ready | DEP-13 |
 | [DEP-15](DEP-15.md) | резервное копирование SMB — pgBackRest и копия каталога писем | deploy | A | deploy-13 | ready | DEP-05 |
+| [META-53](META-53.md) | метрика доли NOTIFY во времени фиксации primary | meta | A | meta-34 | todo | — |
+| [BLOB-16](BLOB-16.md) | метрика «сирот» после цикла GC | blob | A | blob-09 | todo | — |
+| [PLT-25](PLT-25.md) | метрики пула СУБД и слушателя сигналов | platform | A | platform-15 | ready | — |
+| [APP-31](APP-31.md) | старт узла при медленном OpenBao | app | A | app-30 | todo | — |
+| [DEP-25](DEP-25.md) | стенд Д.6 — два прогона, квота 150 MB, генератор доверенный, сценарий перебора | deploy | A | deploy-21 | todo | DEP-14 |
 | [DOC-01](DOC-01.md) | docs/PREREQUISITES.md — требования и тонкости настройки окружения | docs | A | docs-01 | done | — |
 | [APP-24](APP-24.md) | thepost doctor — кодировка и LC_CTYPE базы | app | A | app-23 | done | — |
 | [DEP-16](DEP-16.md) | эталоны задают кодировку UTF8 и LC_CTYPE UTF-8 базы | deploy | A | deploy-14 | ready | — |
@@ -442,6 +447,7 @@
 | [CLU-15](CLU-15.md) | Rpc — h2 в ALPN | cluster | A | cluster-10 | todo | DEPS-06 |
 | [DEP-22](DEP-22.md) | сертификаты узлов с URI thepost:node:<id> | deploy | A | deploy-20 | todo | CLU-14 |
 | [PLT-24](PLT-24.md) | ключи TLS из OpenBao | platform | A | platform-14 | ready | PLT-23 |
+| [PLT-26](PLT-26.md) | внутренние сертификаты движком PKI OpenBao | platform | A | platform-16 | todo | PLT-24 |
 
 ## Ф2. Совместная работа (≈5 мес.)
 
@@ -503,6 +509,10 @@
 | [UI-09](UI-09.md) | правила и автоответ пользователя; покрытие Admin API | console | A | console-03 | todo | UI-04,UI-05,UI-06,UI-07,UI-08,ADM-14 |
 | [ADM-15](ADM-15.md) | раздача веб-консоли ролью admin | admin | A | admin-10 | todo | DEPS-05,UI-01 |
 | [CTR-47](CTR-47.md) | планирование встреч — iTIP и занятость | contracts | B | contracts-34 | todo | CTR-45 |
+| [META-54](META-54.md) | занятость повторяющихся событий — разворот при запросе | meta | B | meta-35 | todo | CTR-47 |
+| [SMTP-34](SMTP-34.md) | пересылка правилами и автоответ — через правила получателя с проверкой петли | smtp | A | smtp-14 | todo | SMTP-31 |
+| [ADM-17](ADM-17.md) | Sieve-скрипты пользователя в Admin API и CLI | admin | A | admin-12 | todo | — |
+| [APP-32](APP-32.md) | очистка надгробий DAV и журнала автоответов в роли maintenance | app | A | app-31 | todo | META-48,META-50 |
 | [META-51](META-51.md) | входящие планирования и индекс занятости | meta | B | meta-32 | todo | CTR-47,META-47 |
 | [DAV-13](DAV-13.md) | планирование внутри организации — RFC 6638 | dav | A | dav-04 | todo | DAV-08,CTR-47 |
 | [DAV-14](DAV-14.md) | iMIP наружу — приглашения внешним участникам | dav | A | dav-04 | todo | DAV-13 |

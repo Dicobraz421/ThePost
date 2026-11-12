@@ -12,9 +12,21 @@ workspace = true
 
 [dependencies]
 tp-contracts.workspace = true
+tp-platform.workspace = true
 schemars.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+futures.workspace = true
+mail-builder.workspace = true
 mail-parser.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+time = { workspace = true, features = ["formatting", "parsing"] }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tp-testkit.workspace = true
+insta.workspace = true
+proptest.workspace = true
