@@ -404,7 +404,11 @@ class SourceIMAP(imaplib.IMAP4_SSL):
 
 
 def try_login(c, login, pw, source=""):
-    """Вход IMAP: ("ok" | "no" | "conn", текст ответа, мс)."""
+    """Вход IMAP: ("ok" | "no" | "unavail" | "conn", текст ответа, мс).
+
+    no — отказ входа (неверный пароль или блокировка: узел отвечает на них одинаково); unavail — временный отказ
+    ([UNAVAILABLE]: перегрузка узла, не блокировка); conn — обрыв или тайм-аут соединения.
+    """
     t0 = time.monotonic()
     try:
         m = SourceIMAP(c.a.host, 993, source, ssl_context=c.ssl, timeout=30)
@@ -414,7 +418,8 @@ def try_login(c, login, pw, source=""):
         m.login(login, pw)
         return "ok", "OK", (time.monotonic() - t0) * 1000
     except imaplib.IMAP4.error as e:
-        return "no", str(e)[:200], (time.monotonic() - t0) * 1000
+        text = str(e)[:200]
+        return ("unavail" if "UNAVAILABLE" in text else "no"), text, (time.monotonic() - t0) * 1000
     except OSError as e:
         return "conn", str(e)[:200], (time.monotonic() - t0) * 1000
     finally:
@@ -423,6 +428,9 @@ def try_login(c, login, pw, source=""):
 
 def brute(a):
     """Перебор со второго адреса (Д.6, решение 56): учётная запись, затем адрес.
+
+    Временные отказы узла (unavail, conn — перегрузка стенда) не считаются: неудачная попытка повторяется, пока
+    отказов входа («no») не наберётся сколько нужно, проверка — пока не будет ответа «ok» или «no» (до --retries раз).
 
     1. Исходное состояние: --target входит верным паролем со второго адреса (иначе блокировки прошлого прогона ещё
        действуют — оценка невозможна).
@@ -438,34 +446,52 @@ def brute(a):
     res = {"source": a.source, "target": target, "check": check, "ip_failures": a.ip_failures,
            "account_failures": a.account_failures, "attempts": [], "checks": []}
 
-    def attempt(phase, login, pw):
-        out, text, ms = try_login(c, login, pw, a.source)
-        res["attempts"].append({"t": round(time.time(), 3), "phase": phase, "login": login, "result": out,
-                                "text": text, "ms": round(ms, 1)})
-        return out
+    def attempts(phase, n, login):
+        """n отказов входа («no») неверным паролем со второго адреса; временные отказы — повтор."""
+        got = 0
+        for _ in range(n * a.retries):
+            if got >= n:
+                break
+            name = login() if callable(login) else login
+            out, text, ms = try_login(c, name, "wrong-" + secrets.token_hex(6), a.source)
+            res["attempts"].append({"t": round(time.time(), 3), "phase": phase, "login": name, "result": out,
+                                    "text": text, "ms": round(ms, 1)})
+            got += out == "no"
+            if out != "no":
+                time.sleep(2)
+
+    def definite(login, pw, source):
+        """Вход до ответа «ok» или «no» (временные отказы — повтор, до --retries раз)."""
+        tries = 0
+        for tries in range(1, a.retries + 1):
+            out, text, ms = try_login(c, login, pw, source)
+            if out in ("ok", "no"):
+                break
+            time.sleep(5)
+        return out, text, ms, tries
 
     def verify(name, login, pw, source, expect):
-        out, text, ms = try_login(c, login, pw, source)
+        out, text, ms, tries = definite(login, pw, source)
         res["checks"].append({"t": round(time.time(), 3), "name": name, "login": login, "source": source or "генератор",
-                              "expect": expect, "result": out, "text": text, "ms": round(ms, 1),
+                              "expect": expect, "result": out, "text": text, "ms": round(ms, 1), "tries": tries,
                               "ok": out == expect})
 
-    out, text, _ = try_login(c, target, tpw, a.source)
+    out, text, _, _ = definite(target, tpw, a.source)
     res["baseline"] = {"result": out, "text": text}
     if out != "ok":
         res["skipped"] = (f"исходный вход {target} со второго адреса — {out} ({text}): блокировка прошлого прогона "
                           "(auth.abuse.block_for) или адрес не настроен на генераторе")
     else:
-        for _ in range(a.account_failures + 1):
-            attempt("account", target, "wrong-" + secrets.token_hex(6))
+        attempts("account", a.account_failures + 1, target)
         verify("учётная запись: верный пароль со второго адреса", target, tpw, a.source, "no")
         verify("учётная запись: верный пароль с адреса генератора", target, tpw, "", "no")
         verify("генератор после блокировки учётной записи", check, cpw, "", "ok")
-        for _ in range(a.ip_failures + 1):
-            attempt("address", f"nobody-{secrets.token_hex(4)}@{a.domain}", "wrong-" + secrets.token_hex(6))
+        attempts("address", a.ip_failures + 1, lambda: f"nobody-{secrets.token_hex(4)}@{a.domain}")
         verify("адрес: верный пароль другой учётной записи со второго адреса", check, cpw, a.source, "no")
         verify("генератор после блокировки адреса", check, cpw, "", "ok")
     res["ok"] = "skipped" not in res and all(x["ok"] for x in res["checks"])
+    # Нет ответа «ok» или «no» — узел перегружен: проверка не состоялась (не «не прошёл»).
+    res["inconclusive"] = [x["name"] for x in res["checks"] if x["result"] not in ("ok", "no")]
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump(res, f, ensure_ascii=False, indent=1)
     for x in res["checks"]:
@@ -496,6 +522,7 @@ def main():
     p.add_argument("--check", default="")
     p.add_argument("--ip-failures", type=int, default=10)
     p.add_argument("--account-failures", type=int, default=20)
+    p.add_argument("--retries", type=int, default=5)
     a = p.parse_args()
     {"run": run, "idle": idle, "count": count, "brute": brute}[a.mode](a)
 

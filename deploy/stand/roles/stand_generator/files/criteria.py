@@ -414,8 +414,12 @@ def brute_row(run):
     for x in b.get("attempts", []):
         fails[x["phase"]] = fails.get(x["phase"], 0) + 1
     text = "; ".join(f"{x['name']}: {x['result']} (ожидалось {x['expect']})" for x in b.get("checks", []))
-    note = (f"со второго адреса {b.get('source')}: неверных паролей {b.get('target')} — {fails.get('account', 0)}, "
-            f"входов под несуществующими именами — {fails.get('address', 0)}")
+    note = (f"со второго адреса {b.get('source')}: отказов входа {b.get('target')} — {fails.get('account', 0)}, "
+            f"под несуществующими именами — {fails.get('address', 0)}")
+    wrong = [x for x in b.get("checks", []) if x["result"] in ("ok", "no") and not x["ok"]]
+    if b.get("inconclusive") and not wrong:
+        return (name, crit, text, NONE, "узел не ответил «ok» или «no» (UNAVAILABLE, обрыв — перегрузка): "
+                + ", ".join(b["inconclusive"]) + "; " + note)
     return (name, crit, text, PASS if b.get("ok") else FAIL, note)
 
 
