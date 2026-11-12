@@ -11,6 +11,8 @@ manual: docs/manual-tests/APP-28.md
 ## Сделать
 - `ItipDelivery` из tp-dav в доставку smtp-in (`Delivery::with_itip`); `ItipSender` — через `Outbound` (очередь и DKIM); `FreeBusy` —
   `PgMeta` для DAV и JMAP.
+- Подключение по итогам dav-04 (PR #485): маршруты `tp_dav::router_with` с `ScheduleDeps`, `ItipInbox` из tp-dav в
+  доставку `tp-smtp` и в `tp-jmap`, `ImipSender` поверх очереди (`Outbound`).
 - Ручная проверка: встреча внутри организации (Thunderbird ↔ iOS), приглашение внешнему участнику (Gmail или Outlook.com) и его ответ,
   занятость в Календаре macOS.
 

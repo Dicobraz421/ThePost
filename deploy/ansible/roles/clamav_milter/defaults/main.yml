@@ -7,3 +7,15 @@ clamav_milter_on_infected: Reject
 # Ожидание первой загрузки баз freshclam (без баз clamd не запускается).
 clamav_db_wait_retries: 60
 clamav_db_wait_delay: 10
+
+# Пакеты и пути: Debian, Ubuntu — пакеты дистрибутива; AlmaLinux — EPEL (на RHEL EPEL подключает администратор);
+# в РЕД ОС 8 и Astra Linux SE 1.8 ClamAV нет.
+clamav_rhel: "{{ ansible_pkg_mgr != 'apt' }}"
+clamav_packages: >-
+  {{ ['clamav', 'clamd', 'clamav-update', 'clamav-milter'] if clamav_rhel | bool
+     else ['clamav-daemon', 'clamav-freshclam', 'clamav-milter'] }}
+clamav_milter_conf: "{{ '/etc/mail/clamav-milter.conf' if clamav_rhel | bool else '/etc/clamav/clamav-milter.conf' }}"
+clamav_clamd_conf: "{{ '/etc/clamd.d/scan.conf' if clamav_rhel | bool else '/etc/clamav/clamd.conf' }}"
+clamav_clamd_socket: "{{ '/run/clamd.scan/clamd.sock' if clamav_rhel | bool else '/var/run/clamav/clamd.ctl' }}"
+clamav_clamd_service: "{{ 'clamd@scan' if clamav_rhel | bool else 'clamav-daemon' }}"
+clamav_epel: "{{ clamav_rhel | bool and ansible_distribution != 'RedHat' }}"

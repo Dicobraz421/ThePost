@@ -1,15 +1,39 @@
-# chrony из пакета дистрибутива (Debian, Ubuntu): свои серверы — файл в sources.d, пул пакета при них закомментирован.
+# chrony из пакета дистрибутива (Debian, Ubuntu, Astra Linux, РЕД ОС, AlmaLinux): свои серверы — файл в sources.d,
+# пул пакета при них закомментирован.
 ---
-- name: Install chrony
+- name: Install chrony (apt)
   ansible.builtin.apt:
     name: chrony
     state: present
     update_cache: true
     cache_valid_time: 3600
+  when: not chrony_redhat | bool
+
+- name: Install chrony (dnf)
+  ansible.builtin.dnf:
+    name: chrony
+    state: present
+  when: chrony_redhat | bool
+
+# Пакет РЕД ОС и AlmaLinux не читает каталог sources.d — роль подключает его.
+- name: Create NTP sources directory
+  ansible.builtin.file:
+    path: "{{ chrony_sources_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Include NTP sources directory
+  ansible.builtin.lineinfile:
+    path: "{{ chrony_conf_file }}"
+    line: "sourcedir {{ chrony_sources_dir }}"
+  when: chrony_redhat | bool
+  notify: Restart chrony
 
 - name: Write NTP servers
   ansible.builtin.copy:
-    dest: /etc/chrony/sources.d/thepost.sources
+    dest: "{{ chrony_sources_dir }}/thepost.sources"
     content: |
       # Управляется Ansible (роль chrony, thepost_ntp_servers).
       {% for server in thepost_ntp_servers %}
@@ -23,17 +47,17 @@
 
 - name: Remove NTP servers
   ansible.builtin.file:
-    path: /etc/chrony/sources.d/thepost.sources
+    path: "{{ chrony_sources_dir }}/thepost.sources"
     state: absent
   when: thepost_ntp_servers | length == 0
   notify: Restart chrony
 
-# Пул пакета (строки pool: Debian — chrony.conf, Ubuntu — sources.d/ubuntu-ntp-pools.sources) — только без своих
-# серверов: в закрытой сети он недоступен.
+# Пул пакета (строки pool: chrony.conf, Ubuntu — sources.d/ubuntu-ntp-pools.sources) — только без своих серверов:
+# в закрытой сети он недоступен.
 - name: Find package sources
   ansible.builtin.find:
-    paths: [/etc/chrony, /etc/chrony/sources.d]
-    patterns: [chrony.conf, "*.sources"]
+    paths: ["{{ chrony_conf_file | dirname }}", "{{ chrony_sources_dir }}"]
+    patterns: ["{{ chrony_conf_file | basename }}", "*.sources"]
     excludes: [thepost.sources]
   register: thepost_ntp_files
 
@@ -61,6 +85,6 @@
 
 - name: Start chrony
   ansible.builtin.systemd_service:
-    name: chrony
+    name: "{{ chrony_service }}"
     state: started
     enabled: true

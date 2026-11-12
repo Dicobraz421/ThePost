@@ -1451,3 +1451,127 @@ async fn sieve_rules_and_vacation() {
     pool.close().await;
     drop_database(&url, &db_name).await;
 }
+
+/// FIX-03: домены организации в Admin API узла — принятые домены `TransportStore` (`PgMeta`). Список — 200 с
+/// доменом `admin init`; создание и удаление нового домена; удаление домена с учётной записью — 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_domains() {
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = Arc::new(MemSecretStore::default());
+    let db: SecretRef = "thepost/db#password".parse().expect("ref");
+    secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
+
+    let domain = "example.ru".to_owned();
+    let socket = dir.path().join("admin.sock");
+    let path = dir.path().join("config.yaml");
+    std::fs::write(&path, admin_config(dir.path(), &db_url, &domain, &socket)).expect("config");
+    let cfg = thepost::sections::registry()
+        .expect("registry")
+        .load(&path)
+        .expect("load config");
+    let bound = ADMIN_SOCKET.lock().await;
+    thepost::local_admin::bind(&cfg).expect("admin init socket");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+    let admin = addr(&running, "admin");
+
+    // Администратор: учётная запись в принятом домене `example.ru` — от `admin init`.
+    let login = format!("admin@{domain}");
+    let granted = admin_init(&socket, &login).await;
+    drop(bound);
+    assert_eq!(granted["status"], "granted", "{granted}");
+    let token = granted["token"].as_str().expect("token").to_owned();
+    let (code, body) = http(
+        admin,
+        "POST",
+        "/api/v1/session",
+        &format!("Bearer {token}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+    let session: Value = serde_json::from_slice(&body).expect("session");
+    let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
+    let base = format!("/api/v1/orgs/{}/domains", TenantId::DEFAULT);
+    let list = || domain_list(admin, &base, &bearer);
+
+    // Список: принятый домен `admin init`.
+    let domains = list().await;
+    let own = domains
+        .iter()
+        .find(|d| d["name"] == domain)
+        .unwrap_or_else(|| panic!("{domain} в {domains:?}"))["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // Создание: имя приводится к канонической форме; повтор — 409.
+    let (code, body) = http(
+        admin,
+        "POST",
+        &base,
+        &bearer,
+        Some(&json!({ "name": "Corp.Example" })),
+    )
+    .await;
+    assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+    let created: Value = serde_json::from_slice(&body).expect("created");
+    assert_eq!(created["name"], "corp.example", "{created}");
+    let id = created["id"].as_str().expect("id").to_owned();
+    assert!(list().await.iter().any(|d| d["id"] == id));
+    let (code, body) = http(
+        admin,
+        "POST",
+        &base,
+        &bearer,
+        Some(&json!({ "name": "corp.example" })),
+    )
+    .await;
+    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = http(admin, "GET", &format!("{base}/{id}"), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+
+    // Удаление домена без учётных записей — 204, повтор — 404.
+    let (code, body) = http(admin, "DELETE", &format!("{base}/{id}"), &bearer, None).await;
+    assert_eq!(code, 204, "{}", String::from_utf8_lossy(&body));
+    assert!(!list().await.iter().any(|d| d["id"] == id));
+    let (code, body) = http(admin, "DELETE", &format!("{base}/{id}"), &bearer, None).await;
+    assert_eq!(code, 404, "{}", String::from_utf8_lossy(&body));
+
+    // Домен с учётной записью администратора не удаляется — 409, домен на месте.
+    let (code, body) = http(admin, "DELETE", &format!("{base}/{own}"), &bearer, None).await;
+    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
+    assert!(list().await.iter().any(|d| d["id"] == own));
+
+    shutdown.cancel();
+    let report = running.wait().await.expect("wait");
+    assert!(report.failed.is_empty(), "{report:?}");
+    drop_database(&url, &db_name).await;
+}
+
+/// `GET /api/v1/orgs/{org}/domains`: 200 и список доменов.
+async fn domain_list(addr: std::net::SocketAddr, path: &str, bearer: &str) -> Vec<Value> {
+    let (code, body) = http(addr, "GET", path, bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let list: Value = serde_json::from_slice(&body).expect("domains");
+    list.as_array().expect("array").clone()
+}
