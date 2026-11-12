@@ -72,7 +72,7 @@ fn cards_of(c: &CorpusCard) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// `PUT` 8-битной карточки: кириллица сохраняется верно, тело — UTF-8 без `CHARSET`, ответ без `ETag`;
+/// `PUT` 8-битной карточки: кириллица сохраняется верно, тело — UTF-8 (`CHARSET=UTF-8`), ответ без `ETag`;
 /// `addressbook-query` по `FN` находит карточку.
 #[tokio::test]
 async fn put_8bit_corpus() {
@@ -109,11 +109,18 @@ async fn put_8bit_corpus() {
         }
     };
     let first = get(0).await;
-    assert!(first.contains("FN:Елена Андреевна Козлова\r\n"), "{first}");
+    // Запись calcard 3.0 помечает значения не из ASCII `CHARSET=UTF-8` — прежнего windows-1251 нет.
+    assert!(
+        first.contains("FN;CHARSET=UTF-8:Елена Андреевна Козлова\r\n"),
+        "{first}"
+    );
     assert!(first.contains("Садовая"), "{first}");
-    assert!(!first.to_ascii_uppercase().contains("CHARSET"), "{first}");
+    assert!(
+        !first.to_ascii_lowercase().contains("windows-1251"),
+        "{first}"
+    );
     let second = get(1).await;
-    assert!(second.contains("ORG:ИП Ёлкин Г."), "{second}");
+    assert!(second.contains("ORG;CHARSET=UTF-8:ИП Ёлкин Г."), "{second}");
     // NOTE — QP поверх того же CHARSET: раскодирует calcard.
     assert!(second.contains("«ёжик» и щука."), "{second}");
     // Поиск по поисковым строкам контакта (FN) находит кириллицу.

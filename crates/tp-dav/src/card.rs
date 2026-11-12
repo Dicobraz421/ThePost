@@ -369,8 +369,8 @@ pub(crate) fn in_version(body: &str, to: VCardVersion) -> Cow<'_, str> {
 }
 
 /// Текст тела `PUT` в адресную книгу и признак «тело изменено сервером». В UTF-8 — как есть; 8-битное (`CHARSET`
-/// без `ENCODING`) — перекод [`crate::charset::vcard_utf8`] и запись calcard в той же версии: без устаревшего
-/// `CHARSET` у значений, уже записанных в UTF-8. Не перекодируется или не разбирается — `None`.
+/// без `ENCODING`) — перекод [`crate::charset::vcard_utf8`] и запись calcard в той же версии: прежний `CHARSET`
+/// у значений, уже записанных в UTF-8, не остаётся (3.0 — `CHARSET=UTF-8`). Не перекодируется или не разбирается — `None`.
 pub(crate) fn put_text(raw: &[u8]) -> Option<(String, bool)> {
     if let Ok(text) = std::str::from_utf8(raw) {
         return Some((text.to_owned(), false));
