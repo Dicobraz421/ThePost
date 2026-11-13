@@ -273,6 +273,10 @@ pub trait MailboxAudit: Send + Sync + 'static {
     /// Действующая политика ящика: заданная для ящика, иначе для организации, иначе [`AuditPolicy::default`].
     async fn audit_policy(&self, scope: AccountScope) -> Result<AuditPolicy>;
 
+    /// Политика организации `tenant`, заданная [`MailboxAudit::set_audit_policy`] без ящика; `None` — не задана
+    /// (ящикам без своей действует [`AuditPolicy::default`]). Чтение формы политики в Admin API (ADM-40).
+    async fn tenant_audit_policy(&self, tenant: TenantId) -> Result<Option<AuditPolicy>>;
+
     /// Задаёт политику организации (`account = None`) или ящика; `None` — сбросить уровень.
     /// Некорректная политика — `Error::Invalid` ([`AuditPolicy::validate`]).
     async fn set_audit_policy(

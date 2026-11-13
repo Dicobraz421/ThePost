@@ -3816,6 +3816,7 @@ pub async fn mailbox_audit(audit: &dyn MailboxAudit, tenant: TenantId, foreign_t
         audit.audit_policy(owner).await.expect("policy"),
         AuditPolicy::default()
     );
+    assert_eq!(audit.tenant_audit_policy(tenant).await, Ok(None));
     let rec = async |e: AuditEntry| audit.record_audit(e).await.expect("record");
     assert!(rec(entry(K::Delegate, AuditAction::Read, 1)).await);
     assert!(rec(entry(K::Admin, AuditAction::Login, 2)).await);
@@ -3862,10 +3863,17 @@ pub async fn mailbox_audit(audit: &dyn MailboxAudit, tenant: TenantId, foreign_t
         AuditPolicy::all()
     );
     assert_eq!(audit.audit_policy(owner).await.expect("owner"), only_delete);
+    // Заданная политика организации (ADM-40) — без политики ящика и только своей организации.
+    assert_eq!(
+        audit.tenant_audit_policy(tenant).await,
+        Ok(Some(AuditPolicy::all()))
+    );
+    assert_eq!(audit.tenant_audit_policy(foreign_tenant).await, Ok(None));
     audit
         .set_audit_policy(tenant, None, None)
         .await
         .expect("reset tenant");
+    assert_eq!(audit.tenant_audit_policy(tenant).await, Ok(None));
     assert_eq!(
         audit.audit_policy(other).await.expect("other reset"),
         AuditPolicy::default()

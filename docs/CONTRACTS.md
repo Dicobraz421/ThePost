@@ -384,7 +384,8 @@ Delete, Send, SendAs, SendOnBehalf, ChangeRights, ChangeRules, ChangeForwarding}
 `AuditPolicy { non_owner (по умолчанию true), owner: BTreeSet<AuditAction> (по умолчанию пусто; только `AuditAction::OWNER`) }`,
 `records(kind, action)` — вход, чтение и поиск владельцем не записываются никогда. `MailboxAudit`:
 `record_audit(entry) -> bool` — протоколы вызывают для каждого действия, политику применяет хранилище; `audit_policy(scope)` (ящик → организация
-→ по умолчанию), `set_audit_policy(tenant, account?, policy?)`, `search_audit(tenant, &AuditQuery { account, actor, actor_kind, action, since,
+→ по умолчанию), `tenant_audit_policy(tenant) -> Option<AuditPolicy>` (заданная политика организации, ADM-40), `set_audit_policy(tenant,
+account?, policy?)`, `search_audit(tenant, &AuditQuery { account, actor, actor_kind, action, since,
 until, limit, after })` -> `AuditPage` (как `DeliveryLog::search`), `purge_audit(before)` (maintenance, можно сутками). In-memory —
 `MemMailboxAudit` (`entries`, `fail_next`); набор `suite::mailbox_audit`. Запись — IMAP-15, JMAP-18; PostgreSQL (только добавление) — META-33;
 выгрузка в SIEM и выборка — ADM-10.

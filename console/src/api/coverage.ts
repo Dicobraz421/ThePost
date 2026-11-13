@@ -72,6 +72,7 @@ export const covered: Record<string, string> = {
   "GET /api/v1/orgs/{org}/delivery": "pages/delivery.tsx",
   "GET /api/v1/orgs/{org}/audit": "pages/audit.tsx",
   "GET /api/v1/orgs/{org}/mailbox-audit": "pages/mailbox-audit.tsx",
+  "GET /api/v1/orgs/{org}/mailbox-audit/policy": "pages/mailbox-audit.tsx",
   "PUT /api/v1/orgs/{org}/mailbox-audit/policy": "pages/mailbox-audit.tsx",
   "DELETE /api/v1/orgs/{org}/mailbox-audit/policy": "pages/mailbox-audit.tsx",
   "GET /api/v1/orgs/{org}/accounts/{account}/sieve/scripts": "pages/sieve.tsx",

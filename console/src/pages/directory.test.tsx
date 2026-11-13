@@ -187,10 +187,11 @@ test("отключённые ящики: восстановление и под�
   expect(await screen.findByText("Ящик подключён")).toBeTruthy();
 });
 
-test("аудит ящиков: выборка по ящику и действию; политика организации — PUT и сброс", async () => {
+test("аудит ящиков: выборка по ящику и действию; политика организации — текущая, PUT и сброс", async () => {
   const entry = { account: "a1", at: "2026-11-10T10:00:00Z", actor: "boss@example.org", actor_kind: "delegate", action: "send_as" };
   const calls = open("/mailbox-audit?account=a1", {
     [`GET ${BASE}/mailbox-audit`]: { body: { entries: [entry], next: null } },
+    [`GET ${BASE}/mailbox-audit/policy`]: { body: { non_owner: false, owner: ["send"] } },
     [`PUT ${BASE}/mailbox-audit/policy`]: (c) => ({ body: c.body }),
     [`DELETE ${BASE}/mailbox-audit/policy`]: { status: 204 },
   });
@@ -203,19 +204,33 @@ test("аудит ящиков: выборка по ящику и действи�
   fireEvent.click(screen.getByRole("button", { name: "Найти" }));
   await waitFor(() => expect(sent(calls, "GET", `${BASE}/mailbox-audit?account=a1&actor=boss%40example.org`)).toHaveLength(1));
 
-  fireEvent.click(await screen.findByLabelText("удаление писем"));
+  // Форма открывается с текущей политикой организации, а не со значениями по умолчанию.
+  expect(((await screen.findByLabelText("отправка")) as HTMLInputElement).checked).toBe(true);
+  expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("false");
+  fireEvent.click(screen.getByLabelText("удаление писем"));
   fireEvent.click(screen.getByRole("button", { name: "Сохранить политику аудита" }));
-  await waitFor(() => expect(sent(calls, "PUT", `${BASE}/mailbox-audit/policy`)[0]?.body).toEqual({ non_owner: true, owner: ["delete"] }));
+  await waitFor(() =>
+    expect(sent(calls, "PUT", `${BASE}/mailbox-audit/policy`)[0]?.body).toEqual({ non_owner: false, owner: ["delete", "send"] }),
+  );
   fireEvent.click(screen.getByRole("button", { name: "Сбросить к политике по умолчанию" }));
   const confirm = await screen.findByText("Сбросить политику аудита организации?");
   fireEvent.click(within(confirm.closest(".ant-popover") as HTMLElement).getByRole("button", { name: "Сбросить" }));
   await waitFor(() => expect(sent(calls, "DELETE", `${BASE}/mailbox-audit/policy`)).toHaveLength(1));
 });
 
-test("аудитор: аудит ящиков доступен без политики, оператору — «Нет доступа»", async () => {
-  open("/mailbox-audit", { [`GET ${BASE}/mailbox-audit`]: { body: { entries: [], next: null } } }, ["auditor"]);
+test("аудитор: аудит ящиков и политика организации — только просмотр, оператору — «Нет доступа»", async () => {
+  open(
+    "/mailbox-audit",
+    {
+      [`GET ${BASE}/mailbox-audit`]: { body: { entries: [], next: null } },
+      [`GET ${BASE}/mailbox-audit/policy`]: { body: { non_owner: true, owner: ["delete"] } },
+    },
+    ["auditor"],
+  );
   expect(await screen.findByText("Аудит ящиков")).toBeTruthy();
-  await waitFor(() => expect(screen.queryByText("Политика аудита организации")).toBeNull());
+  expect(await screen.findByText("Политика аудита организации")).toBeTruthy();
+  const del = (await screen.findByLabelText("удаление писем")) as HTMLInputElement;
+  expect(del.checked && del.disabled).toBe(true);
   expect(screen.queryByRole("button", { name: "Сохранить политику аудита" })).toBeNull();
   cleanup();
   open("/mailbox-audit", {}, ["operator"]);

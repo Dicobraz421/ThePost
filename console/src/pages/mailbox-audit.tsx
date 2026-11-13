@@ -1,7 +1,7 @@
 // Аудит доступа к ящикам (SRS 4.7, ADM-10): выборка журнала по ящику, исполнителю, действию и интервалу;
 // политика аудита организации (политика ящика — на карточке учётной записи).
 import { List } from "@refinedev/antd";
-import { type HttpError, useCustomMutation } from "@refinedev/core";
+import { type HttpError, useCustom, useCustomMutation } from "@refinedev/core";
 import { Button, DatePicker, Divider, Form, Input, Select, Table, Typography } from "antd";
 import type { Dayjs } from "dayjs";
 import { useState } from "react";
@@ -28,10 +28,12 @@ const ACTIONS: Record<string, string> = {
 };
 const options = (m: Record<string, string>) => Object.entries(m).map(([value, label]) => ({ value, label }));
 
-/** Политика организации: узел её отдельно не отдаёт — форма задаёт её заново целиком. */
-function OrgPolicy() {
-  const { mutate, mutation } = useCustomMutation<Schemas["AuditPolicyBody"], HttpError, Schemas["AuditPolicyBody"] | undefined>();
+/** Политика организации: текущая (заданная, иначе по умолчанию); аудитору — только просмотр. */
+function OrgPolicy({ readOnly }: { readOnly: boolean }) {
   const url = `${BASE}/policy`;
+  const { query } = useCustom<Schemas["AuditPolicyBody"]>({ url, method: "get" });
+  const { mutate, mutation } = useCustomMutation<Schemas["AuditPolicyBody"], HttpError, Schemas["AuditPolicyBody"] | undefined>();
+  const refetch = { onSuccess: () => void query.refetch() };
   return (
     <>
       <Divider orientation="left">Политика аудита организации</Divider>
@@ -39,24 +41,33 @@ function OrgPolicy() {
         Действует для ящиков без своей политики. Сохранение заменяет политику организации целиком; действующая политика ящика —
         на карточке учётной записи. После сброса записываются только действия не владельца.
       </Typography.Paragraph>
-      <AuditPolicyForm
-        readOnly={false}
-        saving={mutation.isPending}
-        onSave={(values) =>
-          mutate({ url, method: "put", values, successNotification: { type: "success", message: "Политика аудита организации сохранена" } })
-        }
-        reset={{
-          label: "Сбросить к политике по умолчанию",
-          confirm: "Сбросить политику аудита организации?",
-          run: () =>
-            mutate({
-              url,
-              method: "delete",
-              values: undefined,
-              successNotification: { type: "success", message: "Политика аудита организации сброшена" },
-            }),
-        }}
-      />
+      {!query.isLoading && (
+        <AuditPolicyForm
+          policy={query.data?.data}
+          readOnly={readOnly}
+          saving={mutation.isPending}
+          onSave={(values) =>
+            mutate(
+              { url, method: "put", values, successNotification: { type: "success", message: "Политика аудита организации сохранена" } },
+              refetch,
+            )
+          }
+          reset={{
+            label: "Сбросить к политике по умолчанию",
+            confirm: "Сбросить политику аудита организации?",
+            run: () =>
+              mutate(
+                {
+                  url,
+                  method: "delete",
+                  values: undefined,
+                  successNotification: { type: "success", message: "Политика аудита организации сброшена" },
+                },
+                refetch,
+              ),
+          }}
+        />
+      )}
     </>
   );
 }
@@ -111,7 +122,7 @@ export function MailboxAuditPage() {
         <Table.Column<Entry> title="Пояснение" render={(_, e) => e.detail ?? "—"} />
       </Table>
       {pager}
-      {!readOnly && <OrgPolicy />}
+      <OrgPolicy readOnly={readOnly} />
     </List>
   );
 }

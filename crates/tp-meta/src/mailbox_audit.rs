@@ -97,6 +97,17 @@ impl EntryRow {
     }
 }
 
+/// Политика из строки `mailbox_audit_policies` (`non_owner`, `owner_actions`).
+fn policy_of((non_owner, owner): (bool, Vec<String>)) -> Result<AuditPolicy> {
+    Ok(AuditPolicy {
+        non_owner,
+        owner: owner
+            .into_iter()
+            .map(enum_of::<AuditAction>)
+            .collect::<Result<BTreeSet<_>>>()?,
+    })
+}
+
 /// Действующая политика ящика: своя, иначе организации, иначе по умолчанию.
 async fn policy(tx: &mut PgConnection, scope: AccountScope) -> Result<AuditPolicy> {
     let row: Option<(bool, Vec<String>)> = sqlx::query_as(
@@ -109,16 +120,7 @@ async fn policy(tx: &mut PgConnection, scope: AccountScope) -> Result<AuditPolic
     .fetch_optional(&mut *tx)
     .await
     .map_err(db_err)?;
-    let Some((non_owner, owner)) = row else {
-        return Ok(AuditPolicy::default());
-    };
-    Ok(AuditPolicy {
-        non_owner,
-        owner: owner
-            .into_iter()
-            .map(enum_of::<AuditAction>)
-            .collect::<Result<BTreeSet<_>>>()?,
-    })
+    row.map_or(Ok(AuditPolicy::default()), policy_of)
 }
 
 impl PgMeta {
@@ -181,6 +183,25 @@ impl MailboxAudit for PgMeta {
         self.idempotent(|| {
             with_tenant(&self.pool, scope.tenant, move |tx| {
                 Box::pin(async move { policy(tx, scope).await })
+            })
+        })
+        .await
+    }
+
+    async fn tenant_audit_policy(&self, tenant: TenantId) -> Result<Option<AuditPolicy>> {
+        self.idempotent(|| {
+            with_tenant(&self.pool, tenant, move |tx| {
+                Box::pin(async move {
+                    let row: Option<(bool, Vec<String>)> = sqlx::query_as(
+                        "SELECT non_owner, owner_actions FROM mailbox_audit_policies
+                         WHERE tenant_id = $1 AND account_id IS NULL",
+                    )
+                    .bind(tenant.as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    row.map(policy_of).transpose()
+                })
             })
         })
         .await
