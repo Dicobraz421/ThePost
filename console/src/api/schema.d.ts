@@ -591,7 +591,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Очередь модерации организации или группы. */
+        /**
+         * Очередь модерации организации или группы по времени постановки. Есть продолжение — заголовок
+         *     `Link: <…&after=…>; rel="next"` (RFC 8288), нет заголовка — страница последняя; неразборчивый `after` — 400.
+         */
         get: operations["list_held"];
         put?: never;
         post?: never;
@@ -3827,6 +3830,8 @@ export interface operations {
                 group: string | null;
                 /** @description Размер (по умолчанию и наибольший — из конфигурации). */
                 limit: number | null;
+                /** @description Продолжение после этого письма — `after` из ссылки `rel="next"` предыдущей страницы (непрозрачная позиция). */
+                after: string | null;
                 /**
                  * @description `subject` — отдать тему писем (`subject`). Только администратору; запрос пишется в журнал аудита как доступ
                  *     к содержимому; размер — не больше `admin.content_page_size`.
@@ -3839,6 +3844,8 @@ export interface operations {
         responses: {
             200: {
                 headers: {
+                    /** @description Следующая страница очереди: `<ссылка>; rel="next"`; нет — страница последняя */
+                    Link?: string;
                     [name: string]: unknown;
                 };
                 content: {
