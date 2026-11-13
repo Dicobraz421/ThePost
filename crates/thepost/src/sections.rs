@@ -759,6 +759,7 @@ impl StartupSection {
 /// maintenance:
 ///   purge_interval: 1h
 ///   admin_token_retention: 30d
+///   gal_interval: 1m
 ///   verify:
 ///     at: "03:00"
 ///     interval: 24h
@@ -778,6 +779,12 @@ pub struct MaintenanceSection {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub admin_token_retention: Duration,
+    /// Период заполнения книги GAL «Организация» из каталога `auth.ldap` (`1m`, APP-49): первый проход — при запуске
+    /// роли; изменение каталога видно в книге CardDAV и JMAP не позже чем через период. Без `auth.ldap` книги нет.
+    /// Требует перезапуска.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub gal_interval: Duration,
     /// Проверка целостности BLOB по расписанию (`thepost verify` без `--fix`, APP-44).
     pub verify: VerifySchedule,
 }
@@ -787,6 +794,7 @@ impl Default for MaintenanceSection {
         Self {
             purge_interval: Duration::from_secs(3600),
             admin_token_retention: Duration::from_secs(30 * 24 * 3600),
+            gal_interval: Duration::from_secs(60),
             verify: VerifySchedule::default(),
         }
     }
@@ -799,6 +807,9 @@ impl MaintenanceSection {
             return Err(Error::invalid(
                 "maintenance: purge_interval must be positive",
             ));
+        }
+        if self.gal_interval.is_zero() {
+            return Err(Error::invalid("maintenance: gal_interval must be positive"));
         }
         self.verify.check()
     }
@@ -1326,6 +1337,32 @@ blob:
             "{MINIMAL_DEV}maintenance:\n  purge_interval: 0s\n"
         )));
         assert!(e.contains("purge_interval"), "{e}");
+    }
+
+    /// APP-49: период заполнения книги GAL — `1m` по умолчанию, из config.yaml, нулевой — ошибка.
+    #[test]
+    fn maintenance_gal_interval() {
+        let c = parse(MINIMAL_DEV).expect("config");
+        let m = c
+            .section::<MaintenanceSection>(MAINTENANCE)
+            .expect("section");
+        assert_eq!(m.gal_interval, Duration::from_secs(60));
+        let c = parse(&format!(
+            "{MINIMAL_DEV}maintenance:
+  gal_interval: 5m
+"
+        ))
+        .expect("config");
+        let m = c
+            .section::<MaintenanceSection>(MAINTENANCE)
+            .expect("section");
+        assert_eq!(m.gal_interval, Duration::from_secs(300));
+        let e = err(parse(&format!(
+            "{MINIMAL_DEV}maintenance:
+  gal_interval: 0s
+"
+        )));
+        assert!(e.contains("gal_interval"), "{e}");
     }
 
     /// APP-44: расписание проверки целостности — раз в сутки в 03:00 UTC по умолчанию; время и период из

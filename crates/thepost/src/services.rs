@@ -562,8 +562,8 @@ impl Services {
     }
 
     /// Маршруты календарей и контактов (CalDAV, CardDAV; APP-29): хранилище — `PgMeta`, вход — тот же, что у
-    /// JMAP (с защитой от перебора). С каталогом организации (`auth.ldap`) — глобальная адресная книга
-    /// «Организация» (группы, скрытые из адресной книги, в неё не попадают); без каталога её нет (SRS 4.4).
+    /// JMAP (с защитой от перебора). Глобальная адресная книга «Организация» читается из того же хранилища, её
+    /// заполняет роль maintenance ([`Services::gal`]).
     /// `well_known` — добавить перенаправления `/.well-known/caldav` и `/.well-known/carddav` на `/dav/`
     /// (RFC 6764 §5): для слушателя без JMAP, который отдаёт их сам по `jmap.autoconfig`.
     /// Планирование встреч (APP-28): приглашения, ответы и отмены рассылает сервер ([`Services::schedule`]);
@@ -578,12 +578,8 @@ impl Services {
             auth: self.authn.clone(),
             store: Arc::new(self.meta.clone()),
         };
-        let gal = self.directory.as_ref().map(|directory| tp_dav::GalDeps {
-            directory: directory.clone(),
-            groups: Some(Arc::new(self.meta.clone())),
-        });
         let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
-        let router = tp_dav::router_with(deps, gal, Some(self.schedule(outbound)), cfg);
+        let router = tp_dav::router_with(deps, Some(self.schedule(outbound)), cfg);
         if !well_known {
             return Ok(router);
         }
@@ -591,6 +587,33 @@ impl Services {
         Ok(router
             .route("/.well-known/caldav", axum::routing::any(context))
             .route("/.well-known/carddav", axum::routing::any(context)))
+    }
+
+    /// Заполнение глобальной адресной книги «Организация» (APP-49, решение 72) для роли maintenance: из каталога
+    /// организации (`auth.ldap`) — учётные записи и группы, кроме скрытых из адресной книги (группы — по признаку в
+    /// `PgMeta`), — в хранилище `PgMeta`, откуда её читают CardDAV и JMAP Contacts. Раз в `interval`, под лизой
+    /// держателя `holder` (одна запись на организацию в кластере); имя книги и размер порции — секция `dav`.
+    /// Без каталога книги нет (SRS 4.4) — `None`.
+    pub fn gal(
+        &self,
+        cfg: tp_dav::DavConfig,
+        leases: Arc<dyn tp_contracts::lease::LeaseStore>,
+        holder: String,
+        interval: std::time::Duration,
+    ) -> Option<crate::gal::GalSync> {
+        let directory = self.directory.clone()?;
+        Some(crate::gal::GalSync::new(
+            tp_dav::GalDeps {
+                directory,
+                groups: Some(Arc::new(self.meta.clone())),
+            },
+            Arc::new(self.meta.clone()),
+            self.tenant,
+            cfg,
+            leases,
+            holder,
+            interval,
+        ))
     }
 
     /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`

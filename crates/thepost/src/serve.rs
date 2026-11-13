@@ -353,6 +353,15 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         store.clone(),
         reloader.subscribe(),
     ));
+    // Книга GAL «Организация» из каталога (APP-49): роль maintenance, одна запись на организацию (лиза).
+    let gal = services
+        .gal(
+            (*cfg.section::<tp_dav::DavConfig>(sections::DAV)?).clone(),
+            leases.clone(),
+            holder.clone(),
+            maintenance_cfg.gal_interval,
+        )
+        .map(Arc::new);
     let maintenance = Maintenance {
         index: Arc::new(blob_index.clone()),
         store: blob.clone(),
@@ -391,6 +400,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         }),
         audit_export: Some(audit_export),
         card_reindex: Some(meta.clone()),
+        gal,
     };
     let mut setup = RoleSetup {
         cfg: &cfg,
