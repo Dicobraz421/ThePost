@@ -28,7 +28,7 @@
 //! - `principal` — Principal/get, query (RFC 9670) и Principal/getAvailability поверх `AccountStore` и `FreeBusy`,
 //!   [`Jmap::with_freebusy`];
 //! - `scheduling` — приглашения (JMAP-31): рассылка iTIP после `CalendarEvent/set` с `sendSchedulingMessages`
-//!   (`tp_dav::itip`, [`Jmap::with_schedule`]), ParticipantIdentity/get, CalendarEventNotification/get, changes, set
+//!   (`tp_dav::itip`, [`Jmap::with_schedule`]), ParticipantIdentity/get, CalendarEventNotification/get, changes, query, set
 //!   по входящим планирования;
 //! - `sieve` — SieveScript/get, set, query, validate (RFC 9661) поверх `SieveStore` и проверки `tp_sieve`;
 //! - `sender_lists` — SenderList/get, set: личные списки надёжных и заблокированных отправителей, capability
@@ -139,6 +139,7 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("ParticipantIdentity/get", CALENDARS),
     ("CalendarEventNotification/get", CALENDARS),
     ("CalendarEventNotification/changes", CALENDARS),
+    ("CalendarEventNotification/query", CALENDARS),
     ("CalendarEventNotification/set", CALENDARS),
 ];
 
@@ -211,6 +212,7 @@ pub(crate) async fn call_builtin(
         "ParticipantIdentity/get" => scheduling::identity_get(ctx, args).await,
         "CalendarEventNotification/get" => scheduling::notification_get(ctx, args).await,
         "CalendarEventNotification/changes" => scheduling::notification_changes(ctx, args).await,
+        "CalendarEventNotification/query" => scheduling::notification_query(ctx, args).await,
         "CalendarEventNotification/set" => scheduling::notification_set(ctx, args).await,
         _ => Err(MethodError::new("unknownMethod")),
     }
