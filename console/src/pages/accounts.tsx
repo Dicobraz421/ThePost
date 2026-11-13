@@ -16,6 +16,8 @@ import { Link } from "react-router";
 
 import type { Schemas } from "../api/client";
 import { AuditPolicyForm } from "../components/audit-policy-form";
+import { CollectionsAcl } from "../components/collection-acl";
+import { Delegates } from "../components/delegates";
 import { bytes, when } from "../components/format";
 import { PolicyForm } from "../components/policy-form";
 import { useReadOnly } from "../providers/access";
@@ -295,7 +297,10 @@ function AccountAuditPolicy({ account }: { account: string }) {
   );
 }
 
-/** Учётная запись: сведения, имя и блокировка, политика ящика, отправители, аудит ящика, пароли приложений. */
+/**
+ * Учётная запись: сведения, имя и блокировка, политика ящика, отправители, аудит ящика, представители, общий доступ к
+ * календарям и адресным книгам, пароли приложений.
+ */
 export function AccountShow() {
   const { result: account, query } = useShow<Account>();
   const { mutate, mutation } = useCustomMutation<Schemas["PolicyBody"]>();
@@ -351,6 +356,10 @@ export function AccountShow() {
       {account && <SenderLists account={account.id} />}
       <Divider orientation="left">Аудит ящика</Divider>
       {account && <AccountAuditPolicy account={account.id} />}
+      <Divider orientation="left">Представители</Divider>
+      {account && <Delegates account={account.id} />}
+      <Divider orientation="left">Общий доступ к календарям и адресным книгам</Divider>
+      {account && <CollectionsAcl account={account.id} />}
       <Divider orientation="left">Пароли приложений</Divider>
       {account && <AppPasswords account={account.id} />}
     </Show>

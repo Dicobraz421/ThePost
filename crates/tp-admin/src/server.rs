@@ -374,6 +374,8 @@ pub struct Admin {
     pub(crate) sieve: Option<crate::sieve::Sieve>,
     /// Объекты писем очереди модерации; `None` — не подключено (тема письма очереди — `null`).
     pub(crate) held_blobs: Option<Arc<dyn BlobStore>>,
+    /// Общий доступ, представители, ресурсы; `None` — не подключено (маршруты отвечают 503).
+    pub(crate) sharing: Option<crate::sharing::SharingStores>,
 }
 
 impl fmt::Debug for Admin {
@@ -385,6 +387,7 @@ impl fmt::Debug for Admin {
             .field("local", &self.local.is_some())
             .field("sieve", &self.sieve.is_some())
             .field("held_blobs", &self.held_blobs.is_some())
+            .field("sharing", &self.sharing.is_some())
             .finish()
     }
 }
@@ -419,6 +422,7 @@ impl Admin {
             local: None,
             sieve: None,
             held_blobs: None,
+            sharing: None,
         })
     }
 
@@ -449,6 +453,8 @@ impl Admin {
         api = crate::sieve::routes(api);
         api = crate::directory::routes(api);
         api = crate::mailboxes::routes(api);
+        api = crate::sharing::routes(api);
+        api = crate::resources::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -799,6 +805,8 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     api.merge(crate::init::Doc::openapi());
     api.merge(crate::directory::Doc::openapi());
     api.merge(crate::mailboxes::Doc::openapi());
+    api.merge(crate::sharing::Doc::openapi());
+    api.merge(crate::resources::Doc::openapi());
     api
 }
 
