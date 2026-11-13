@@ -59,10 +59,16 @@ pub struct DavConfig {
     pub gal_page_size: usize,
     /// Отображаемое имя адресной книги по умолчанию (создаётся при первом обращении к дому адресных книг).
     pub default_addressbook_name: String,
-    /// Оставлять во входящих планирования (`schedule-inbox`) сообщения iTIP, которые сервер уже применил к
-    /// календарю (`REQUEST`, `REPLY`, `CANCEL`). По умолчанию — нет: клиенты, которые входящие не чистят,
-    /// иначе заполняют их до лимита хранилища. Необработанные (`COUNTER`, `REFRESH`, `ADD`) остаются всегда.
+    /// Хранить сообщения iTIP, которые сервер уже применил к календарю (`REQUEST`, `REPLY`, `CANCEL`, `ADD`), для
+    /// ленты уведомлений JMAP (`CalendarEventNotification`) — не дольше `schedule_processed_ttl`; во входящих
+    /// планирования CalDAV (`schedule-inbox`) они не видны (решение 92). По умолчанию — нет. Необработанные
+    /// (`COUNTER`, `REFRESH`, `ADD` без ряда) остаются во входящих всегда.
     pub schedule_keep_processed: bool,
+    /// Срок хранения применённых сообщений при `schedule_keep_processed` (от получения); старше — удаляет шаг
+    /// очистки роли maintenance ([`crate::ItipInbox::purge_processed`]).
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub schedule_processed_ttl: Duration,
     /// Попыток записи при приёме iTIP, если объект меняется одновременно (условие записи не выполнено).
     pub schedule_write_attempts: usize,
     /// Участников в одном запросе занятости (`POST` VFREEBUSY в `schedule-outbox`); больше — 403.
@@ -89,6 +95,7 @@ impl Default for DavConfig {
             gal_page_size: 1_000,
             default_addressbook_name: "Контакты".to_owned(),
             schedule_keep_processed: false,
+            schedule_processed_ttl: Duration::from_secs(30 * 24 * 3600),
             schedule_write_attempts: 3,
             max_freebusy_attendees: 100,
         }
