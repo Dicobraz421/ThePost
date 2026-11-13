@@ -177,6 +177,7 @@ impl From<AuditPolicyBody> for AuditPolicy {
 
 /// Условия выборки журнала аудита ящиков (по «и»).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxAuditQuery {
     /// Ящик (UUID учётной записи).

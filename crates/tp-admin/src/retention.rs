@@ -37,6 +37,7 @@ use crate::server::{Admin, ApiResult, Caller, Problem};
 
 /// Страница списка.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct PageQuery {
     /// Смещение от начала списка.

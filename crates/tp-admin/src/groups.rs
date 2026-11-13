@@ -328,6 +328,7 @@ impl From<HeldMessage> for HeldInfo {
 
 /// Очередь модерации: фильтр и размер.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct HeldQuery {
     /// Только письма группы (UUID).

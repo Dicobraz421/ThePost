@@ -33,6 +33,125 @@ use crate::server::{Admin, ApiResult, Problem};
 /// Префикс маршрутов уровня кластера (только администратор инсталляции, [`crate::AdminRole::permits`]).
 pub const CLUSTER_PREFIX: &str = "/api/v1/transport";
 
+// Схемы OpenAPI контрактов `tp_contracts::transport` (в `serde` — тот же вид); значений этих типов нет.
+
+/// Вид принятого домена: `"authoritative"` — полномочный (неизвестный адрес отклоняется в `RCPT TO`),
+/// `{"internal_relay": {"next_hop": "host[:port]"}}` — неизвестные адреса передаются на узел `next_hop`.
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = DomainKind)]
+pub enum DomainKindSchema {
+    /// Полномочный.
+    Authoritative,
+    /// Внутренняя ретрансляция.
+    InternalRelay {
+        /// Узел назначения неизвестных адресов (`host` или `host:port`).
+        next_hop: String,
+    },
+}
+
+/// Принятый домен организации.
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(as = AcceptedDomain)]
+pub struct AcceptedDomainSchema {
+    /// Домен (UUID).
+    pub id: String,
+    /// Организация (UUID).
+    pub tenant: String,
+    /// Имя в канонической форме.
+    pub name: String,
+    /// Вид.
+    pub kind: DomainKindSchema,
+}
+
+/// Признаки соединения доверенного источника: `{"networks": ["192.0.2.0/24"]}` — адрес клиента в одной из подсетей,
+/// `{"client_cert": {"subject": "mx.example.org"}}` — имя в сертификате клиента (mTLS).
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = SourceMatch)]
+pub enum SourceMatchSchema {
+    /// Подсети (CIDR, не пусто).
+    Networks(Vec<String>),
+    /// Сертификат клиента.
+    ClientCert {
+        /// dNSName из SAN, без учёта регистра ASCII.
+        subject: String,
+    },
+}
+
+/// Вид доверенного источника: шлюз перед продуктом или приложение без SASL (только у источника организации).
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = SourceKind)]
+pub enum SourceKindSchema {
+    /// Внешний MTA перед продуктом.
+    Gateway {
+        /// Принимать исходного клиента из `XCLIENT`/`XFORWARD`.
+        xclient: bool,
+        /// authserv-id доверенных `Authentication-Results` шлюза; `null` — не доверять.
+        authserv_id: Option<String>,
+    },
+    /// Устройство или система без SASL.
+    Application {
+        /// Разрешённые адреса отправителя (`user@example.org` или `@example.org`; не пусто).
+        senders: Vec<String>,
+        /// Разрешены внешние получатели.
+        external: bool,
+    },
+}
+
+/// Доверенный источник приёма.
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(as = TrustedSource)]
+pub struct TrustedSourceSchema {
+    /// Имя (ключ записи).
+    pub name: String,
+    /// Организация (UUID); `null` — источник кластера (общий шлюз).
+    pub tenant: Option<String>,
+    /// Признаки соединения.
+    pub matcher: SourceMatchSchema,
+    /// Вид.
+    pub kind: SourceKindSchema,
+}
+
+/// TLS при доставке в домен назначения: `"opportunistic"` — по возможности, `"required"` — обязательный с проверкой
+/// сертификата, `{"pinned": {"spki_sha256": ["<hex>"]}}` — обязательный с закреплённым ключом.
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = TlsRequirement)]
+pub enum TlsRequirementSchema {
+    /// По возможности.
+    Opportunistic,
+    /// Обязательный с проверкой сертификата.
+    Required,
+    /// Обязательный с закреплённым ключом.
+    Pinned {
+        /// SHA-256 SubjectPublicKeyInfo (hex, 64 символа; не пусто).
+        spki_sha256: Vec<String>,
+    },
+}
+
+/// Политика домена назначения.
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(as = DestinationPolicy)]
+pub struct DestinationPolicySchema {
+    /// Шаблон: `example.org`, `*.example.org` (поддомены) или `*` (все внешние домены).
+    pub pattern: String,
+    /// Требование к TLS.
+    pub tls: TlsRequirementSchema,
+    /// Промежуточный узел (`host` или `host:port`); `null` — доставка по MX.
+    pub smart_host: Option<String>,
+    /// Адрес исходящих соединений; `null` — адрес узла по умолчанию.
+    pub egress_ip: Option<String>,
+}
+
 /// Новая версия снимка после записи.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Written {
@@ -42,6 +161,7 @@ pub struct Written {
 
 /// Версия снимка, на котором основано удаление.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct VersionQuery {
     /// Версия снимка из последнего чтения.
@@ -53,9 +173,8 @@ pub struct VersionQuery {
 pub struct DomainList {
     /// Версия снимка кластера.
     pub version: u64,
-    /// Домены по имени: `{id, tenant, name, kind}`, `kind` — `"authoritative"` или
-    /// `{"internal_relay": {"next_hop": "host[:port]"}}`.
-    #[schema(value_type = Vec<Object>)]
+    /// Домены по имени.
+    #[schema(value_type = Vec<AcceptedDomainSchema>)]
     pub domains: Vec<AcceptedDomain>,
 }
 
@@ -67,9 +186,9 @@ pub struct DomainBody {
     pub version: u64,
     /// Имя домена (приводится к канонической форме: нижний регистр, без точки в конце, IDN — A-label).
     pub name: String,
-    /// Вид: `"authoritative"` (по умолчанию) или `{"internal_relay": {"next_hop": "host[:port]"}}`.
+    /// Вид (по умолчанию `"authoritative"`).
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = DomainKindSchema)]
     pub kind: DomainKind,
 }
 
@@ -79,7 +198,7 @@ pub struct DomainWritten {
     /// Новая версия снимка кластера.
     pub version: u64,
     /// Домен.
-    #[schema(value_type = Object)]
+    #[schema(value_type = AcceptedDomainSchema)]
     pub domain: AcceptedDomain,
 }
 
@@ -88,8 +207,8 @@ pub struct DomainWritten {
 pub struct SourceList {
     /// Версия снимка кластера.
     pub version: u64,
-    /// Источники по имени: `{name, tenant, matcher, kind}`.
-    #[schema(value_type = Vec<Object>)]
+    /// Источники по имени.
+    #[schema(value_type = Vec<TrustedSourceSchema>)]
     pub sources: Vec<TrustedSource>,
 }
 
@@ -99,12 +218,11 @@ pub struct SourceList {
 pub struct SourceBody {
     /// Версия снимка кластера.
     pub version: u64,
-    /// Признаки соединения: `{"networks": ["192.0.2.0/24"]}` или `{"client_cert": {"subject": "mx.example.org"}}`.
-    #[schema(value_type = Object)]
+    /// Признаки соединения.
+    #[schema(value_type = SourceMatchSchema)]
     pub matcher: SourceMatch,
-    /// Вид: `{"gateway": {"xclient": true, "authserv_id": "mx.example.org"}}` или
-    /// `{"application": {"senders": ["@example.org"], "external": false}}` (только у источника организации).
-    #[schema(value_type = Object)]
+    /// Вид (`application` — только у источника организации).
+    #[schema(value_type = SourceKindSchema)]
     pub kind: SourceKind,
 }
 
@@ -114,10 +232,10 @@ pub struct ClusterView {
     /// Версия снимка.
     pub version: u64,
     /// Принятые домены всех организаций.
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<AcceptedDomainSchema>)]
     pub domains: Vec<AcceptedDomain>,
     /// Доверенные источники кластера и организаций.
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<TrustedSourceSchema>)]
     pub sources: Vec<TrustedSource>,
 }
 
@@ -136,8 +254,8 @@ impl From<ClusterTransport> for ClusterView {
 pub struct RouteList {
     /// Версия снимка организации.
     pub version: u64,
-    /// Политики по шаблону: `{pattern, tls, smart_host, egress_ip}`.
-    #[schema(value_type = Vec<Object>)]
+    /// Политики по шаблону.
+    #[schema(value_type = Vec<DestinationPolicySchema>)]
     pub routes: Vec<DestinationPolicy>,
 }
 
@@ -147,9 +265,9 @@ pub struct RouteList {
 pub struct RouteBody {
     /// Версия снимка организации.
     pub version: u64,
-    /// TLS: `"opportunistic"` (по умолчанию), `"required"` или `{"pinned": {"spki_sha256": ["<hex>"]}}`.
+    /// TLS (по умолчанию `"opportunistic"`).
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = TlsRequirementSchema)]
     pub tls: TlsRequirement,
     /// Промежуточный узел (`host` или `host:port`); нет — доставка по MX.
     #[serde(default)]
@@ -212,6 +330,13 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         delete_cluster_source
     ),
     components(schemas(
+        DomainKindSchema,
+        AcceptedDomainSchema,
+        SourceMatchSchema,
+        SourceKindSchema,
+        TrustedSourceSchema,
+        TlsRequirementSchema,
+        DestinationPolicySchema,
         Written,
         DomainList,
         DomainBody,
@@ -579,6 +704,77 @@ mod tests {
 
     fn version(b: &Value) -> u64 {
         b["version"].as_u64().expect("version")
+    }
+
+    /// Приёмка ADM-30: схема транспорта — точные типы (`oneOf` видов, ссылки на типы записей), а не `object`.
+    #[test]
+    fn transport_schema_snapshot() {
+        let spec = serde_json::to_value(crate::server::openapi_spec()).expect("spec");
+        let c = &spec["components"]["schemas"];
+        // Варианты `oneOf`: строка — её значение, объект — его единственный ключ.
+        let variants = |name: &str| -> Vec<String> {
+            c[name]["oneOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name}: нет oneOf: {}", c[name]))
+                .iter()
+                .map(|v| match v["enum"].as_array() {
+                    Some(e) => e[0].as_str().expect("enum").to_owned(),
+                    None => v["required"][0].as_str().expect("key").to_owned(),
+                })
+                .collect()
+        };
+        assert_eq!(variants("DomainKind"), ["authoritative", "internal_relay"]);
+        assert_eq!(variants("SourceMatch"), ["networks", "client_cert"]);
+        assert_eq!(variants("SourceKind"), ["gateway", "application"]);
+        assert_eq!(
+            variants("TlsRequirement"),
+            ["opportunistic", "required", "pinned"]
+        );
+        let reference = |name: &str| json!({"$ref": format!("#/components/schemas/{name}")});
+        let field = |schema: &str, f: &str| {
+            let v = &c[schema]["properties"][f];
+            match v.get("items") {
+                Some(items) => items.clone(),
+                None => json!({"$ref": v["$ref"]}),
+            }
+        };
+        for (schema, f, target) in [
+            ("DomainList", "domains", "AcceptedDomain"),
+            ("DomainBody", "kind", "DomainKind"),
+            ("DomainWritten", "domain", "AcceptedDomain"),
+            ("SourceList", "sources", "TrustedSource"),
+            ("SourceBody", "matcher", "SourceMatch"),
+            ("SourceBody", "kind", "SourceKind"),
+            ("ClusterView", "domains", "AcceptedDomain"),
+            ("ClusterView", "sources", "TrustedSource"),
+            ("RouteList", "routes", "DestinationPolicy"),
+            ("RouteBody", "tls", "TlsRequirement"),
+            ("AcceptedDomain", "kind", "DomainKind"),
+            ("TrustedSource", "matcher", "SourceMatch"),
+            ("TrustedSource", "kind", "SourceKind"),
+            ("DestinationPolicy", "tls", "TlsRequirement"),
+        ] {
+            assert_eq!(field(schema, f), reference(target), "{schema}.{f}");
+        }
+        let props = |name: &str| -> Vec<String> {
+            let mut p: Vec<String> = c[name]["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+                .cloned()
+                .collect();
+            p.sort();
+            p
+        };
+        assert_eq!(props("AcceptedDomain"), ["id", "kind", "name", "tenant"]);
+        assert_eq!(
+            props("TrustedSource"),
+            ["kind", "matcher", "name", "tenant"]
+        );
+        assert_eq!(
+            props("DestinationPolicy"),
+            ["egress_ip", "pattern", "smart_host", "tls"]
+        );
     }
 
     /// Приёмка ADM-08: принятые домены — создание, замена вида, удаление; устаревшая версия — 409.

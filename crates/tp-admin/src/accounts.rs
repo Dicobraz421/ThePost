@@ -193,6 +193,7 @@ pub struct AccountPatch {
 
 /// Поиск по имени входа или страница списка учётных записей.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct AccountQuery {
     /// Имя входа (без учёта регистра): поиск одной записи; несовместимо с `prefix`, `after`, `limit`.

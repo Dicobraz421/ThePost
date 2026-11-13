@@ -22,6 +22,7 @@ use crate::server::{Admin, ApiResult, Problem};
 
 /// Параметры поиска.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryParams {
     /// Отправитель конверта (точно, без учёта регистра ASCII).

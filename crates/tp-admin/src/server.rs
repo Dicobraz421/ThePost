@@ -952,6 +952,27 @@ mod tests {
         assert!(dups.is_empty(), "{dups:#?}");
     }
 
+    /// ADM-30: параметр вне шаблона пути — параметр запроса (`in: query`), необязательный, кроме `version` удаления.
+    #[test]
+    fn query_params_in_query() {
+        let spec = serde_json::to_value(openapi_spec()).expect("spec");
+        let mut wrong = Vec::new();
+        for (path, item) in spec["paths"].as_object().expect("paths") {
+            for (method, op) in item.as_object().expect("item") {
+                for p in op["parameters"].as_array().into_iter().flatten() {
+                    let name = p["name"].as_str().expect("name");
+                    let in_path = path.contains(&format!("{{{name}}}"));
+                    let place = if in_path { "path" } else { "query" };
+                    let required = in_path || (method == "delete" && name == "version");
+                    if p["in"] != place || p["required"] != required {
+                        wrong.push(format!("{method} {path}: {name} {p}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[tokio::test]
     async fn openapi_without_login() {
         let env = Env::new();

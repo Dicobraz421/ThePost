@@ -57,13 +57,19 @@ pub struct AdminAuditEntry {
     pub record: AdminAuditRecord,
 }
 
-/// Запрос к журналу аудита организации.
+/// Запрос к журналу аудита организации: условия — по «и».
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminAuditQuery {
     /// Начало интервала по `at`, включительно.
     pub since: Option<OffsetDateTime>,
     /// Конец интервала по `at`, не включительно.
     pub until: Option<OffsetDateTime>,
+    /// Администратор: имя входа (`actor_login`, без учёта регистра) или UUID учётной записи (`actor`).
+    pub actor: Option<String>,
+    /// Метод HTTP (`method`), точно.
+    pub method: Option<String>,
+    /// Начало шаблона маршрута (`route`): `/api/v1/orgs/{org}/transport` — все маршруты транспорта.
+    pub route_prefix: Option<String>,
     /// Не более записей, ≥ 1.
     pub limit: usize,
     /// Курсор: записи с номером больше этого (`next` предыдущей страницы).
@@ -71,7 +77,21 @@ pub struct AdminAuditQuery {
 }
 
 impl AdminAuditQuery {
-    /// Проверяет запрос: `limit` ≥ 1, `since` раньше `until`; иначе [`Error::Invalid`].
+    /// Запрос без условий: первые `limit` записей.
+    pub fn first(limit: usize) -> Self {
+        Self {
+            since: None,
+            until: None,
+            actor: None,
+            method: None,
+            route_prefix: None,
+            limit,
+            after: None,
+        }
+    }
+
+    /// Проверяет запрос: `limit` ≥ 1, `since` раньше `until`, условия `actor`, `method`, `route_prefix` не пусты;
+    /// иначе [`Error::Invalid`].
     pub fn validate(&self) -> Result<()> {
         if self.limit == 0 {
             return Err(Error::invalid("audit: limit must be at least 1"));
@@ -81,7 +101,31 @@ impl AdminAuditQuery {
         {
             return Err(Error::invalid("audit: since must be before until"));
         }
+        for (name, value) in [
+            ("actor", &self.actor),
+            ("method", &self.method),
+            ("route_prefix", &self.route_prefix),
+        ] {
+            if value.as_deref().is_some_and(str::is_empty) {
+                return Err(Error::invalid(format!("audit: {name} is empty")));
+            }
+        }
         Ok(())
+    }
+
+    /// Запись удовлетворяет условиям запроса по самой записи (интервал, администратор, метод, маршрут; без
+    /// организации и курсора) — правило выборки для реализаций.
+    pub fn matches(&self, r: &AdminAuditRecord) -> bool {
+        self.since.is_none_or(|s| r.at >= s)
+            && self.until.is_none_or(|u| r.at < u)
+            && self.actor.as_deref().is_none_or(|a| {
+                r.actor_login.to_lowercase() == a.to_lowercase() || r.actor.to_string() == a
+            })
+            && self.method.as_deref().is_none_or(|m| r.method == m)
+            && self
+                .route_prefix
+                .as_deref()
+                .is_none_or(|p| r.route.starts_with(p))
     }
 }
 
@@ -100,9 +144,10 @@ pub trait AuditLog: Send + Sync + 'static {
     /// Добавляет запись; возвращает её номер.
     async fn append(&self, record: &AdminAuditRecord) -> Result<u64>;
 
-    /// Записи организации `tenant` (без уровня инсталляции и без чужих организаций) по возрастанию `seq`:
-    /// `at` в интервале [`since`, `until`), `seq` больше `after`, не более `limit`. Неверный запрос
-    /// ([`AdminAuditQuery::validate`]) — [`Error::Invalid`].
+    /// Записи организации `tenant` (без уровня инсталляции и без чужих организаций) по возрастанию `seq`,
+    /// удовлетворяющие условиям ([`AdminAuditQuery::matches`]: `at` в интервале [`since`, `until`), администратор,
+    /// метод, начало маршрута), `seq` больше `after`, не более `limit`. Отбор — в хранилище: страница с условием
+    /// полная, пока подходящие записи есть. Неверный запрос ([`AdminAuditQuery::validate`]) — [`Error::Invalid`].
     async fn search(&self, tenant: TenantId, query: &AdminAuditQuery) -> Result<AdminAuditPage>;
 
     /// Выгрузка в SIEM: записи всех организаций и уровня инсталляции с номером больше `after` по возрастанию
@@ -148,8 +193,7 @@ mod tests {
         let q = AdminAuditQuery {
             since: Some(now),
             until: Some(now + time::Duration::seconds(1)),
-            limit: 1,
-            after: None,
+            ..AdminAuditQuery::first(1)
         };
         assert_eq!(q.validate(), Ok(()));
         let empty = AdminAuditQuery {
@@ -159,9 +203,62 @@ mod tests {
         assert!(matches!(empty.validate(), Err(Error::Invalid(_))));
         let reversed = AdminAuditQuery {
             until: Some(now),
-            ..q
+            ..q.clone()
         };
         assert!(matches!(reversed.validate(), Err(Error::Invalid(_))));
+        let blank = [
+            AdminAuditQuery {
+                actor: Some(String::new()),
+                ..q.clone()
+            },
+            AdminAuditQuery {
+                method: Some(String::new()),
+                ..q.clone()
+            },
+            AdminAuditQuery {
+                route_prefix: Some(String::new()),
+                ..q
+            },
+        ];
+        for b in blank {
+            assert!(matches!(b.validate(), Err(Error::Invalid(_))), "{b:?}");
+        }
+    }
+
+    #[test]
+    fn query_matches() {
+        let r = AdminAuditRecord {
+            at: OffsetDateTime::UNIX_EPOCH,
+            tenant: Some(TenantId::DEFAULT),
+            actor_tenant: TenantId::DEFAULT,
+            actor: AccountId::new(),
+            actor_login: "Admin@Example.org".into(),
+            roles: Vec::new(),
+            method: "PUT".into(),
+            route: "/api/v1/orgs/{org}/transport/routes/{pattern}".into(),
+            path: "/api/v1/orgs/x/transport/routes/*".into(),
+            status: 200,
+            content_messages: None,
+        };
+        let with = |f: &dyn Fn(&mut AdminAuditQuery)| {
+            let mut q = AdminAuditQuery::first(1);
+            f(&mut q);
+            q.matches(&r)
+        };
+        assert!(with(&|_| {}));
+        assert!(with(&|q| q.actor = Some("admin@example.ORG".into())));
+        assert!(with(&|q| q.actor = Some(r.actor.to_string())));
+        assert!(!with(&|q| q.actor = Some("admin".into())));
+        assert!(with(&|q| q.method = Some("PUT".into())));
+        assert!(!with(&|q| q.method = Some("DELETE".into())));
+        assert!(with(
+            &|q| q.route_prefix = Some("/api/v1/orgs/{org}/transport".into())
+        ));
+        assert!(!with(
+            &|q| q.route_prefix = Some("/api/v1/orgs/{org}/accounts".into())
+        ));
+        assert!(!with(&|q| q.since = Some(r.at + time::Duration::SECOND)));
+        assert!(!with(&|q| q.until = Some(r.at)));
     }
 
     #[test]
