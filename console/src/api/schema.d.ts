@@ -1416,6 +1416,16 @@ export interface components {
         };
         /** @description Политика уровня; `null` — не задано на уровне. */
         PolicyBody: {
+            /**
+             * @description Возраст автопереноса писем в архив (`730d`); уровень папки не применяется (CTR-76).
+             * @example 730d
+             */
+            archive_after?: string | null;
+            /**
+             * Format: int64
+             * @description Квота архива ящика, байт (отдельно от основной квоты).
+             */
+            archive_quota_bytes?: number | null;
             /** @description Селектор ключа DKIM. */
             dkim_selector?: string | null;
             /**

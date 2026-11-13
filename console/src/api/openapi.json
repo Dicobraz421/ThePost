@@ -1201,6 +1201,23 @@
         "additionalProperties": false,
         "description": "Политика уровня; `null` — не задано на уровне.",
         "properties": {
+          "archive_after": {
+            "description": "Возраст автопереноса писем в архив (`730d`); уровень папки не применяется (CTR-76).",
+            "example": "730d",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "archive_quota_bytes": {
+            "description": "Квота архива ящика, байт (отдельно от основной квоты).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "dkim_selector": {
             "description": "Селектор ключа DKIM.",
             "type": [
