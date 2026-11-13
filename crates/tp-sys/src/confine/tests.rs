@@ -442,3 +442,62 @@ fn landlock_resolv_conf_replaced_by_resolved() {
     assert_eq!(before.expect("до замены"), b"search a.test");
     assert_eq!(after.expect("после замены"), b"search b.test");
 }
+
+/// SYS-16: при входе GSSAPI (`krb5_rcache` задан) правила Landlock содержат каталог кэша повторов Kerberos на запись
+/// для любых ролей, в т.ч. edge; без него — нет, и `/var/tmp` не разрешается ни в каком случае.
+#[test]
+fn landlock_krb5_rcache_only_with_gssapi() {
+    let rcache = PathBuf::from(KRB5_RCACHE_DIR);
+    let has = |rules: &[(Grant, Vec<PathBuf>)], path: &Path| {
+        rules
+            .iter()
+            .any(|(g, paths)| *g == Grant::Write && paths.iter().any(|p| p == path))
+    };
+    let any = |rules: &[(Grant, Vec<PathBuf>)], path: &Path| {
+        rules
+            .iter()
+            .any(|(_, paths)| paths.iter().any(|p| p == path))
+    };
+    let access = Profile::for_roles(&set(&[RoleEntry::Preset(RolePreset::Access)]));
+    for profile in [edge(), access] {
+        let with = Confinement::new(
+            ConfineConfig::default(),
+            profile,
+            RolePaths {
+                krb5_rcache: Some(rcache.clone()),
+                ..RolePaths::default()
+            },
+        )
+        .rules();
+        assert!(has(&with, &rcache), "{profile:?}: каталог кэша с GSSAPI");
+        assert!(!any(&with, Path::new("/var/tmp")), "{profile:?}: /var/tmp");
+        let without =
+            Confinement::new(ConfineConfig::default(), profile, RolePaths::default()).rules();
+        assert!(
+            !any(&without, &rcache),
+            "{profile:?}: каталог кэша без GSSAPI"
+        );
+    }
+
+    // Под Landlock узел edge пишет в каталог кэша, только если он задан.
+    let dir = Dir::new("krb5rcache");
+    let cache = dir.sub("rcache", "krb5_0.rcache2");
+    let write = |krb5_rcache: Option<PathBuf>| {
+        let paths = RolePaths {
+            krb5_rcache,
+            ..RolePaths::default()
+        };
+        let c = Confinement::new(bare(SeccompMode::Off, true), edge(), paths);
+        let file = cache.join("krb5_1.rcache2");
+        confined(c, move |report| {
+            (report.landlock, std::fs::write(file, b"rc"))
+        })
+    };
+    let (outcome, allowed) = write(Some(cache.clone()));
+    if outcome == LandlockOutcome::Unsupported {
+        return;
+    }
+    allowed.expect("запись в каталог кэша повторов");
+    let (_, other) = write(None);
+    assert!(denied(other), "без GSSAPI каталог кэша закрыт");
+}
