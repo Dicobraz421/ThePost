@@ -123,9 +123,8 @@ pub struct Services {
     /// Правила Sieve и автоответ при доставке (APP-26): скрипты и журнал автоответов — `PgMeta`, кэш программ —
     /// общий для smtp-in, submission и JMAP.
     pub rules: Arc<tp_sieve::Rules>,
-    /// Лимиты проверки текста скрипта в Admin API — секция `sieve` (те же, что при доставке).
-    pub sieve_limits: tp_sieve::Limits,
-    /// Секция `sieve` на момент запуска: слушатели и лимиты сеансов ManageSieve (APP-27).
+    /// Секция `sieve` на момент запуска: слушатели и лимиты сеансов ManageSieve (APP-27); её пределы разбора
+    /// (`SieveConfig::limits`, те же, что при доставке) проверяют текст скрипта в ManageSieve, JMAP и Admin API.
     pub sieve: Arc<tp_sieve::SieveConfig>,
     /// Приём iTIP в календари учётных записей (APP-28): общий для CalDAV, JMAP и доставки узла.
     pub itip: Arc<tp_dav::ItipInbox>,
@@ -312,7 +311,6 @@ impl Services {
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
         let sieve = (*cfg.section::<tp_sieve::SieveConfig>(SIEVE)?).clone();
-        let sieve_limits = sieve.limits();
         let sieve_section = Arc::new(sieve.clone());
         let rules = Arc::new(
             tp_sieve::Rules::new(Arc::new(meta.clone()), Arc::new(meta.clone()), sieve)
@@ -349,7 +347,6 @@ impl Services {
             routes,
             mail_flow: ext.mail_flow(),
             rules,
-            sieve_limits,
             sieve: sieve_section,
             itip,
         })
@@ -552,6 +549,8 @@ impl Services {
             .with_profile_signer(crate::profile_signer::profile_signer(certs))
             // VacationResponse и SieveScript (JMAP-23, JMAP-24): автоответ из Postman.
             .with_sieve(Some(Arc::new(self.meta.clone())))
+            // Пределы разбора скриптов в `SieveScript/set` и `/validate` — те же, что у ManageSieve (APP-65).
+            .with_sieve_limits(self.sieve.limits())
             // Контакты и календари (JMAP-25…29) — то же хранилище, что у CalDAV и CardDAV; занятость — JMAP-30.
             .with_dav(Some(Arc::new(self.meta.clone())))
             .with_freebusy(Some(Arc::new(self.meta.clone())))
@@ -625,7 +624,7 @@ impl Services {
             // `auth.oidc` — ошибка `Admin::new`.
             oidc_issuer: self.oidc_issuer.clone(),
         };
-        let limits = self.sieve_limits;
+        let limits = self.sieve.limits();
         let check = move |text: &str| match tp_sieve::compile(text.as_bytes(), &limits) {
             Ok(_) => Vec::new(),
             Err(diags) => diags
@@ -1693,6 +1692,174 @@ mod tests {
         server.abort();
         stop.cancel();
         drop((services, delivery, admin, meta, pool));
+        crate::testutil::drop_database(&url, &db_name).await;
+    }
+
+    /// Ответ JMAP на один вызов `method` (APP-65).
+    async fn jmap_call(
+        jmap: &tp_jmap::Jmap,
+        p: &Principal,
+        method: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve"],
+            "methodCalls": [[method, args, "c0"]],
+        });
+        let resp = jmap
+            .api(p, body.to_string().as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("{method}: {e:?}"));
+        let resp = serde_json::to_value(resp).expect("json");
+        assert_eq!(resp["methodResponses"][0][0], method, "{resp}");
+        resp["methodResponses"][0][1].clone()
+    }
+
+    /// APP-65: пределы секции `sieve` узла одни для ManageSieve и JMAP. Скрипт сверх уменьшенной вложенности
+    /// отклоняет проверка ManageSieve (`Services::managesieve`), а JMAP (`Services::jmap`) — `invalidSieve` и в
+    /// `SieveScript/validate`, и в `/set`; capability объявляет `max_redirects` секции.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn jmap_sieve_limits_match_managesieve() {
+        use tp_contracts::ids::DomainId;
+        use tp_contracts::meta::{AccountKind, AccountUpsert};
+        use tp_contracts::sieve::SieveStore;
+        use tp_contracts::transport::{AcceptedDomain, DomainKind, TransportStore};
+
+        const ALICE: &str = "alice@corp.example";
+        const SIEVE_CAP: &str = "urn:ietf:params:jmap:sieve";
+        const DEEP: &str = "if true { if true { if true { if true { keep; } } } }\n";
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = crate::testutil::db_pool(&url_db).await;
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
+        let meta = PgMeta::new(pool, tp_meta::MetaConfig::default()).with_bus(bus.clone());
+        let cfg = crate::sections::registry_of(crate::modules::BUILTIN)
+            .expect("registry")
+            .parse(
+                "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
+                 database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\n\
+                 blob:\n  url: file:///var/lib/thepost/blob\n\
+                 sieve:\n  max_nesting: 2\n  max_redirects: 2\n",
+                Vec::new(),
+            )
+            .expect("config");
+        let ext = Registry::default();
+        let metrics = tp_platform::Metrics::default();
+        let services = Services::build(Base {
+            cfg: &cfg,
+            meta: meta.clone(),
+            blob: Arc::new(tp_testkit::MemBlobStore::default()),
+            bus: bus.clone(),
+            secrets: Arc::new(tp_testkit::MemSecretStore::default()),
+            ext: &ext,
+            metrics: &metrics,
+            node: NodeId::new("app-65").expect("node"),
+        })
+        .await
+        .expect("services");
+        let t = TenantId::DEFAULT;
+
+        let version = TransportStore::cluster(&meta)
+            .await
+            .expect("cluster")
+            .version;
+        let domain = DomainId::new();
+        TransportStore::put_domain(
+            &meta,
+            version,
+            &AcceptedDomain {
+                id: domain,
+                tenant: t,
+                name: "corp.example".into(),
+                kind: DomainKind::Authoritative,
+            },
+        )
+        .await
+        .expect("domain");
+        let acc = AccountStore::upsert(
+            &meta,
+            t,
+            AccountUpsert {
+                domain,
+                login: ALICE.into(),
+                display_name: ALICE.into(),
+                external_id: None,
+                enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
+            },
+        )
+        .await
+        .expect("account");
+        let scope = AccountScope {
+            tenant: t,
+            account: acc.id,
+        };
+        let p = Principal {
+            tenant: t,
+            account: acc.id,
+            login: ALICE.into(),
+            groups: BTreeSet::new(),
+            scopes: None,
+        };
+
+        // ManageSieve (`CHECKSCRIPT`, `PUTSCRIPT`) проверяет текст пределами своей секции; с пределами по умолчанию
+        // скрипт верен.
+        let managesieve = services.managesieve(tp_contracts::tls::Profile::Dev);
+        assert!(tp_sieve::check(DEEP).is_ok());
+        assert!(tp_sieve::compile(DEEP.as_bytes(), &managesieve.config.limits()).is_err());
+
+        // Скрипт уже в хранилище (как записанный до уменьшения предела): его blob — текст для JMAP.
+        SieveStore::put(&meta, scope, "deep", DEEP.into())
+            .await
+            .expect("put");
+        let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
+        let jmap_cfg = (*cfg.section::<tp_jmap::JmapConfig>(JMAP).expect("jmap")).clone();
+        let jmap = services.jmap(&ext, jmap_cfg, &smtp, None).expect("jmap");
+        let session = jmap.session(&p, "https://mail.corp.example");
+        let account = session["primaryAccounts"][SIEVE_CAP]
+            .as_str()
+            .expect("account")
+            .to_owned();
+        let caps = &session["accounts"][&account]["accountCapabilities"][SIEVE_CAP];
+        assert_eq!(caps["maxNumberRedirects"], 2, "{caps}");
+
+        let got = jmap_call(
+            &jmap,
+            &p,
+            "SieveScript/get",
+            serde_json::json!({"accountId": account}),
+        )
+        .await;
+        let blob = got["list"][0]["blobId"]
+            .as_str()
+            .expect("blobId")
+            .to_owned();
+        let v = jmap_call(
+            &jmap,
+            &p,
+            "SieveScript/validate",
+            serde_json::json!({"accountId": account, "blobId": blob}),
+        )
+        .await;
+        assert_eq!(v["error"]["type"], "invalidSieve", "{v}");
+        let r = jmap_call(
+            &jmap,
+            &p,
+            "SieveScript/set",
+            serde_json::json!({"accountId": account, "create": {"a": {"name": "copy", "blobId": blob}}}),
+        )
+        .await;
+        assert_eq!(r["notCreated"]["a"]["type"], "invalidSieve", "{r}");
+
+        jmap.shutdown();
+        drop((services, managesieve, jmap, meta));
         crate::testutil::drop_database(&url, &db_name).await;
     }
 }
