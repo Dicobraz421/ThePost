@@ -29,6 +29,7 @@ jobs:
       rust: ${{ steps.d.outputs.rust }}
       deps: ${{ steps.d.outputs.deps }}
       console: ${{ steps.d.outputs.console }}
+      openapi: ${{ steps.d.outputs.openapi }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -42,7 +43,7 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
         run: |
           if [ -z "$BASE" ]; then
-            echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"
+            echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"; echo openapi=true >> "$GITHUB_OUTPUT"
             if [ -f console/package-lock.json ]; then echo console=true; else echo console=false; fi >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -54,8 +55,10 @@ jobs:
           if [ "$EVENT" = pull_request ]; then
             python3 .github/lane_check.py lanes.toml changed.txt "$HEAD_REF"
           fi
-          # Веб-консоль (console/) Rust не трогает: её проверяет job console (CI-06).
-          if grep -qvE '^(docs/|console/|[^/]*\.md$|.*/README\.md$)' changed.txt; then
+          # Веб-консоль (console/) Rust не трогает: её проверяет job console (CI-06). Кроме копии схемы Admin API:
+          # её сверяет со схемой бинарного файла job test (CI-11).
+          if grep -qvE '^(docs/|console/|[^/]*\.md$|.*/README\.md$)' changed.txt \
+            || grep -qx 'console/src/api/openapi.json' changed.txt; then
             echo rust=true >> "$GITHUB_OUTPUT"
           else
             echo rust=false >> "$GITHUB_OUTPUT"
@@ -69,6 +72,12 @@ jobs:
             echo console=true >> "$GITHUB_OUTPUT"
           else
             echo console=false >> "$GITHUB_OUTPUT"
+          fi
+          # Схема Admin API (utoipa) — только в tp-admin; копия консоли — console/src/api/openapi.json.
+          if grep -qE '^(crates/tp-admin/|console/src/api/openapi\.json$)' changed.txt; then
+            echo openapi=true >> "$GITHUB_OUTPUT"
+          else
+            echo openapi=false >> "$GITHUB_OUTPUT"
           fi
 
   fmt:
@@ -117,6 +126,22 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --locked --profile ci --no-tests=pass
+      # Схема Admin API = копия консоли (решение 74, CI-11): `thepost admin openapi` (APP-37, без узла) — бинарь,
+      # собранный nextest для интеграционных тестов thepost, без отдельной сборки.
+      - name: Схема Admin API = console/src/api/openapi.json
+        if: needs.changes.outputs.openapi == 'true'
+        shell: bash
+        run: |
+          bin=target/debug/thepost
+          [ -x "$bin" ] || { echo "::error::$bin не собран nextest — сверять схему нечем"; exit 1; }
+          "$bin" admin openapi -o "$RUNNER_TEMP/openapi.json"
+          if ! diff -u console/src/api/openapi.json "$RUNNER_TEMP/openapi.json"; then
+            echo "::error file=console/src/api/openapi.json::схема Admin API разошлась с копией консоли —" \
+              "перегенерировать схему консоли: thepost admin openapi -o console/src/api/openapi.json," \
+              "затем (cd console && npm run gen:api)"
+            exit 1
+          fi
+          echo "схема Admin API совпадает с console/src/api/openapi.json"
       - run: cargo test --doc --workspace --locked
 
   # Поставка без интерпретаторов (решение 2026-11-01, SRS 7.2; CI-05): самопроверка interp_check.py и базовый
