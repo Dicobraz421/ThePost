@@ -228,6 +228,9 @@ impl Services {
         if let Some(oidc) = &auth.oidc {
             let bearer = tp_auth::OidcAuthenticator::new(oidc.clone(), profile, accounts.clone())
                 .await
+                .map_err(|e| infra::context("auth.oidc", e))?
+                .with_secrets(secrets.as_ref())
+                .await
                 .map_err(|e| infra::context("auth.oidc", e))?;
             router = router.bearer(Arc::new(bearer));
         }
@@ -1236,6 +1239,65 @@ mod tests {
 
         stop.cancel();
         drop((services, delivery, meta));
+        crate::testutil::drop_database(&url, &db_name).await;
+    }
+
+    /// APP-56: узел с `auth.oidc` и mTLS к поставщику стартует с ключом клиента `tls.key` из хранилища секретов;
+    /// секрета нет в хранилище — ошибка запуска с путём секрета.
+    #[tokio::test]
+    async fn oidc_client_key_from_secret_store() {
+        use tp_contracts::secrets::SecretRef;
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = crate::testutil::db_pool(&url_db).await;
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
+        let meta = PgMeta::new(pool.clone(), tp_meta::MetaConfig::default()).with_bus(bus.clone());
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testdata");
+        let cfg = crate::sections::registry_of(crate::modules::BUILTIN)
+            .expect("registry")
+            .parse(
+                &format!(
+                    "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
+                     database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: {{ allow_plaintext: true }}\n\
+                     blob:\n  url: file:///var/lib/thepost/blob\n\
+                     auth:\n  oidc:\n    issuer: https://sso.example.test\n    audience: [thepost]\n    tls:\n\
+                     \x20     cert_file: \"{}\"\n      key: {{ secret: \"thepost/oidc#tls_key\" }}\n",
+                    dir.join("cert.pem").display()
+                ),
+                Vec::new(),
+            )
+            .expect("config");
+        let ext = Registry::default();
+        let metrics = tp_platform::Metrics::default();
+        let store = Arc::new(tp_testkit::MemSecretStore::default());
+        let build = |secrets: Arc<dyn SecretStore>| {
+            Services::build(Base {
+                cfg: &cfg,
+                meta: meta.clone(),
+                blob: Arc::new(tp_testkit::MemBlobStore::default()),
+                bus: bus.clone(),
+                secrets,
+                ext: &ext,
+                metrics: &metrics,
+                node: NodeId::new("app-56").expect("node"),
+            })
+        };
+
+        let e = build(store.clone()).await.expect_err("нет секрета");
+        assert!(e.to_string().contains("thepost/oidc#tls_key"), "{e}");
+
+        store.set(
+            &SecretRef::new("thepost/oidc", "tls_key").expect("ref"),
+            std::fs::read_to_string(dir.join("key.pem")).expect("key"),
+        );
+        let services = build(store).await.expect("services");
+        drop((services, meta));
         crate::testutil::drop_database(&url, &db_name).await;
     }
 
