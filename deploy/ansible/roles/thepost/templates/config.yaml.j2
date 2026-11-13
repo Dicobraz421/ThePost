@@ -58,6 +58,8 @@
 {%-   set node = node | combine({'acme': acme_section,
                                 'tls': {'cert_file': '/var/lib/thepost/tls/fullchain.pem'}}, recursive=true) -%}
 {%- endif -%}
+{#- Первая строка — метка DEP-55: текстовый интерфейс открывает такой файл только на чтение. -#}
+# thepost: managed-by=ansible
 # {{ ansible_managed }}
 # The Post, профиль SMB (deploy/ansible/smb.yml): пресет deploy/config/all.yaml + значения инвентаря.
 # Секретов здесь нет — только ссылки на OpenBao.
