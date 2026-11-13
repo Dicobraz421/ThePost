@@ -4,18 +4,24 @@
 //!
 //! Здесь — только то, что нужно до вызова: часть письма, метод и сверка `From` с участниками. От организатора
 //! (`REQUEST`, `CANCEL`, …) `From` должен совпадать с `ORGANIZER`, от участника (`REPLY`, `COUNTER`, `REFRESH`) — с
-//! одним из `ATTENDEE`. Доверие к самому `From` (DMARC у iMIP, принадлежность вошедшей учётной записи у письма из
-//! клиента) проверяет вызывающий. iCalendar целиком не разбирается (это делает реализация `ItipDelivery` на
-//! calcard): из объекта читаются только строки `METHOD`, `ORGANIZER` и `ATTENDEE`.
+//! одним из `ATTENDEE`, либо с параметром `SENT-BY` такого свойства (RFC 5545 §3.2.18: представитель отправляет от
+//! имени владельца, SMTP-38). Доверие к самому `From` (DMARC у iMIP, принадлежность вошедшей учётной записи у письма
+//! из клиента) и право представителя на адрес владельца проверяет вызывающий. iCalendar целиком не разбирается (это
+//! делает реализация `ItipDelivery` на calcard): из объекта читаются только строки `METHOD`, `ORGANIZER` и
+//! `ATTENDEE`.
+
+use std::collections::BTreeSet;
 
 use mail_parser::{MessageParser, MimeHeaders};
 use tp_contracts::schedule::ItipMethod;
 
-/// Сообщение iTIP из письма, `From` которого совпал с организатором или участником.
+/// Сообщение iTIP из письма, `From` которого совпал с организатором или участником либо с его `SENT-BY`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Imip {
-    /// Адрес `From` (строчными), совпавший с `ORGANIZER` или `ATTENDEE`.
+    /// Адрес `ORGANIZER` или `ATTENDEE` (строчными), от имени которого письмо: `From` или владелец `SENT-BY`.
     pub from: String,
+    /// Адрес `From` (строчными), совпавший с `SENT-BY` владельца `from`; `None` — `From` и есть `from`.
+    pub sent_by: Option<String>,
     pub method: ItipMethod,
     /// Объект iCalendar как получен.
     pub ics: String,
@@ -58,19 +64,39 @@ pub(crate) fn extract(raw: &[u8]) -> Option<Result<Imip, &'static str>> {
         } else {
             "ATTENDEE"
         };
-        let known = lines
+        let props: Vec<_> = lines.iter().filter_map(|l| property(l, role)).collect();
+        let (owner, sent_by) = if props
             .iter()
-            .filter_map(|l| property(l, role))
-            .any(|v| address(v).eq_ignore_ascii_case(from));
-        if !known {
-            return Err(if method.from_organizer() {
-                "отправитель письма — не организатор"
-            } else {
-                "отправитель письма — не участник"
-            });
-        }
+            .any(|(_, v)| address(v).eq_ignore_ascii_case(from))
+        {
+            (from.to_lowercase(), None)
+        } else {
+            // Представитель: `From` — `SENT-BY` ровно одного владельца (право проверяется на один адрес).
+            let owners: BTreeSet<String> = props
+                .iter()
+                .filter(|(params, _)| {
+                    sent_by_param(params).is_some_and(|s| s.eq_ignore_ascii_case(from))
+                })
+                .map(|(_, v)| address(v).to_lowercase())
+                .collect();
+            let mut owners = owners.into_iter();
+            match (owners.next(), owners.next()) {
+                (Some(owner), None) => (owner, Some(from.to_lowercase())),
+                (Some(_), Some(_)) => {
+                    return Err("отправитель письма — SENT-BY нескольких адресов");
+                }
+                (None, _) => {
+                    return Err(if method.from_organizer() {
+                        "отправитель письма — не организатор"
+                    } else {
+                        "отправитель письма — не участник"
+                    });
+                }
+            }
+        };
         Ok(Imip {
-            from: from.to_lowercase(),
+            from: owner,
+            sent_by,
             method,
             ics: ics.clone(),
         })
@@ -90,9 +116,9 @@ fn unfold(ics: &str) -> Vec<String> {
     out
 }
 
-/// Значение свойства `name` строки `line` (`NAME;параметры:значение`); двоеточие в кавычках параметра — не
-/// разделитель.
-fn property<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+/// Параметры (с начальной `;` или пусто) и значение свойства `name` строки `line` (`NAME;параметры:значение`);
+/// двоеточие в кавычках параметра — не разделитель.
+fn property<'a>(line: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
     let head = line.get(..name.len())?;
     let rest = &line[name.len()..];
     if !head.eq_ignore_ascii_case(name) || !rest.starts_with([':', ';']) {
@@ -103,7 +129,24 @@ fn property<'a>(line: &'a str, name: &str) -> Option<&'a str> {
         quoted ^= c == '"';
         (c == ':' && !quoted).then_some(i)
     })?;
-    Some(&rest[colon + 1..])
+    Some((&rest[..colon], &rest[colon + 1..]))
+}
+
+/// Адрес параметра `SENT-BY` в параметрах свойства `params` (`;ИМЯ=значение…`); точка с запятой в кавычках — не
+/// разделитель.
+fn sent_by_param(params: &str) -> Option<&str> {
+    let mut quoted = false;
+    params
+        .split(|c: char| {
+            quoted ^= c == '"';
+            c == ';' && !quoted
+        })
+        .find_map(|p| {
+            let (name, value) = p.split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("SENT-BY")
+                .then(|| address(value.trim().trim_matches('"')))
+        })
 }
 
 /// Адрес календарного пользователя без `mailto:`.
@@ -137,6 +180,7 @@ mod tests {
             .expect("itip")
             .expect("ok");
         assert_eq!(m.from, "org@example.com");
+        assert_eq!(m.sent_by, None);
         assert_eq!(m.method, ItipMethod::Request);
         assert!(m.ics.starts_with("BEGIN:VCALENDAR") && m.ics.contains("UID:u1"));
     }
@@ -167,14 +211,49 @@ mod tests {
             let got = extract(mail(method, ics).as_bytes()).expect("itip");
             assert!(got.is_err(), "{method}: {got:?}");
         }
-        // Адрес в SENT-BY и в имени — не организатор.
-        let sent_by = REQUEST
-            .replace("org@exam\r\n ple.com", "boss@example.net")
-            .replace("x@example.net", "org@example.com");
+        // Адрес только в имени — не организатор и не представитель.
+        let in_name = REQUEST.replace("org@exam\r\n ple.com", "boss@example.net");
         assert!(matches!(
-            extract(mail("REQUEST", &sent_by).as_bytes()),
+            extract(mail("REQUEST", &in_name).as_bytes()),
             Some(Err(_))
         ));
+    }
+
+    #[test]
+    fn sent_by_delegate() {
+        // `From` — `SENT-BY` организатора: от имени организатора, с адресом представителя.
+        let ics = REQUEST
+            .replace("org@exam\r\n ple.com", "boss@example.net")
+            .replace("x@example.net", "ORG@example.com");
+        let m = extract(mail("REQUEST", &ics).as_bytes())
+            .expect("itip")
+            .expect("ok");
+        assert_eq!(m.from, "boss@example.net");
+        assert_eq!(m.sent_by.as_deref(), Some("org@example.com"));
+        // Ответ представителя участника; `SENT-BY` без `mailto:` и после других параметров.
+        let reply = REQUEST.replace("METHOD:REQUEST", "METHOD:REPLY").replace(
+            "ATTENDEE:mailto:bob@example.org",
+            "ATTENDEE;PARTSTAT=ACCEPTED;sent-by=org@example.com:mailto:bob@example.org",
+        );
+        let m = extract(mail("REPLY", &reply).as_bytes())
+            .expect("itip")
+            .expect("ok");
+        assert_eq!(m.from, "bob@example.org");
+        assert_eq!(m.sent_by.as_deref(), Some("org@example.com"));
+        // `SENT-BY` чужой — не представитель; представитель нескольких участников — неоднозначно.
+        let other = ics.replace("ORG@example.com", "x@example.net");
+        assert_eq!(
+            extract(mail("REQUEST", &other).as_bytes()),
+            Some(Err("отправитель письма — не организатор"))
+        );
+        let two = reply.replace(
+            "END:VEVENT",
+            "ATTENDEE;SENT-BY=\"mailto:org@example.com\":mailto:carol@example.org\r\nEND:VEVENT",
+        );
+        assert_eq!(
+            extract(mail("REPLY", &two).as_bytes()),
+            Some(Err("отправитель письма — SENT-BY нескольких адресов"))
+        );
     }
 
     #[test]
