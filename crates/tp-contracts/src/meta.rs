@@ -264,13 +264,8 @@ pub trait AccountStore: Send + Sync + 'static {
 
     /// Учётная запись по идентификатору в каталоге (`Account::external_id`, точное совпадение; CTR-32). Синхронизация
     /// каталога сопоставляет по нему участников групп и учётные записи: переименование входа не меняет `AccountId`.
-    /// По умолчанию — `Error::Internal` (реализации — `tp-meta`, `tp-testkit`).
-    async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>> {
-        let _ = (tenant, external_id);
-        Err(Error::Internal(
-            "AccountStore::by_external_id не реализован".to_owned(),
-        ))
-    }
+    /// Обязателен (CTR-72); реализации — `tp-meta`, `tp-testkit`.
+    async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>>;
 
     /// Учётные записи организации постранично (CTR-44, список Admin API): по возрастанию имени входа в нижнем
     /// регистре (порядок сравнения строк хранилища), имя входа в нижнем регистре начинается с `prefix` (нижний

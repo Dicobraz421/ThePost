@@ -89,7 +89,7 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
 CTR-25: раздел журнала событий — `Partition { shard, index }`; разделы перечисляются по всем шардам справочника.
 `ModSeq` выдаётся из одного счётчика учётной записи: монотонен в папке (CONDSTORE) и в учётной записи (состояние JMAP).
 - `AccountStore`: `get`, `by_login`, `by_external_id` (идентификатор каталога, точное совпадение; CTR-32 — синхронизация каталога
-  сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; по умолчанию — `Internal`),
+  сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; обязателен — CTR-72),
   `list(tenant, prefix, after, limit)` (CTR-44, список Admin API: по возрастанию `lower(login)` в порядке сравнения строк хранилища,
   префикс и курсор `after` — в нижнем регистре, строго больше; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
   Псевдонимы (CTR-53) — поле `Account::aliases` (нижний регистр, без повторов, основного адреса и catch-all `@domain`; хранится с
@@ -1083,6 +1083,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   обязательные методы `AccountStore`, `DavStore`, поле `InboxItem::received_at`, вариант `DeliveryEventKind`. По сравнению с карточками:
   методы без реализаций по умолчанию (правило владельца); итог iTIP — в `decision` и `reason`, а не полями варианта (событие — строка в
   хранилище и Admin API).
+- 2026-11-13 — CTR-72 (волна contracts-48): `AccountStore::by_external_id` — без реализации по умолчанию (было `Internal`: реализация
+  могла «забыть» метод). Реализации — `PgMeta`, `MemMetadata` (уже были), обёртка `Limited` в тестах `tp-imap`. Несовместимо: новый
+  обязательный метод `AccountStore`.
 - 2026-11-13 — CTR-73, CTR-74, CTR-76, CTR-77, CTR-78 (волна contracts-50). Очередь без опроса: `QueueStore::next_due()` и сигнал
   `QueueReady` (`queue::queue_ready`, тема `<tenant>/queue/outbound`) после `enqueue`, `reschedule`, `postpone`; `MemQueue::with_bus`.
   `Outbound::enqueue`, `submit`, `schedule` получают `owner: Option<AccountId>` (решение 46), `schedule` обязателен; места вызова

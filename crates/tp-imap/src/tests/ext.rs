@@ -124,6 +124,19 @@ impl AccountStore for Limited {
         self.0.by_login(tenant, login)
     }
 
+    fn by_external_id<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        external_id: &'life1 str,
+    ) -> Fut<'async_trait, Option<Account>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.by_external_id(tenant, external_id)
+    }
+
     fn upsert<'life0, 'async_trait>(
         &'life0 self,
         tenant: TenantId,
