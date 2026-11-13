@@ -12,8 +12,8 @@ pub mod socket;
 mod test_logs;
 
 pub use confine::{
-    ConfineConfig, ConfineError, ConfineReport, Confinement, LandlockOutcome, Profile, RolePaths,
-    SeccompMode, landlock_abi,
+    ConfineConfig, ConfineError, ConfineReport, Confinement, KRB5_RCACHE_DIR, LandlockOutcome,
+    Profile, RolePaths, SeccompMode, landlock_abi,
 };
 pub use fs_usage::{FsUsage, fs_usage};
 pub use psi::{PsiError, PsiFile, PsiStall, PsiThreshold, PsiTrigger};

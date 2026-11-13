@@ -7,6 +7,7 @@
 //!
 //! Landlock: процессу доступны только каталоги из [`RolePaths`] и служебные файлы [`ConfineConfig`];
 //! узел edge — только конфигурация, секреты и служебные файлы (резолвер, procfs, cgroups; SRS 2.6).
+//! Вход GSSAPI (`auth.gssapi`) — ещё каталог кэша повторов Kerberos [`RolePaths::krb5_rcache`] (SYS-16).
 //!
 //! Применять после инициализации ролей, до приёма соединений: [`Confinement::apply`] действует на все
 //! потоки процесса (seccomp — TSYNC; Landlock — TSYNC на ядрах с ABI v8, на старых — только вызывающий
@@ -101,6 +102,10 @@ impl Default for ConfineConfig {
     }
 }
 
+/// Каталог кэша повторов Kerberos узла (`KRB5RCACHEDIR`) при входе GSSAPI (SYS-16). MIT Kerberos по умолчанию
+/// пишет кэш в `/var/tmp`; узел задаёт этот каталог, и Landlock разрешает только его, а не весь `/var/tmp`.
+pub const KRB5_RCACHE_DIR: &str = "/var/lib/thepost/krb5rcache";
+
 /// Каталоги и файлы ролей узла; заполняет приложение по конфигурации.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RolePaths {
@@ -114,6 +119,9 @@ pub struct RolePaths {
     pub cache: Vec<PathBuf>,
     /// Прочее рабочее состояние: ACME, делегированная cgroup подпроцессов (чтение и запись).
     pub state: Vec<PathBuf>,
+    /// Каталог кэша повторов Kerberos (`KRB5RCACHEDIR`, обычно [`KRB5_RCACHE_DIR`]) — только при включённом входе
+    /// GSSAPI (`auth.gssapi`), для любых ролей: MIT Kerberos пишет в него при приёме контекста (чтение и запись).
+    pub krb5_rcache: Option<PathBuf>,
 }
 
 /// Требования ролей к системе.
@@ -297,7 +305,7 @@ impl Confinement {
     }
 
     /// Правила Landlock по профилю.
-    fn rules(&self) -> Vec<(Grant, Vec<PathBuf>)> {
+    pub(crate) fn rules(&self) -> Vec<(Grant, Vec<PathBuf>)> {
         let p = &self.paths;
         let read = [
             p.config.as_slice(),
@@ -308,6 +316,9 @@ impl Confinement {
             (Grant::Read, read.concat()),
             (Grant::Write, self.cfg.system_rw.clone()),
         ];
+        if let Some(dir) = &p.krb5_rcache {
+            rules.push((Grant::Write, vec![dir.clone()]));
+        }
         if self.profile.needs.data {
             let data = [p.blob.as_slice(), p.cache.as_slice(), p.state.as_slice()];
             rules.push((Grant::Write, data.concat()));
