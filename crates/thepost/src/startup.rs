@@ -30,13 +30,19 @@ pub fn prepare_serve(path: &Path) -> Result<ConfineReport> {
     confine(&cfg, paths, has_section(&text, "confine"))
 }
 
-/// Создаёт недостающие каталоги ролей, разрешённые на запись (BLOB, кэш, состояние), с правами 0700 учётной
-/// записи процесса; `skip` — каталоги, которые готовит развёртывание (делегированная cgroup). Файлы (TLS,
-/// секреты) не создаются, права существующих каталогов не меняются. Возвращает созданные каталоги; ошибка
+/// Создаёт недостающие каталоги ролей, разрешённые на запись (BLOB, кэш, состояние, кэш повторов Kerberos), с правами
+/// 0700 учётной записи процесса; `skip` — каталоги, которые готовит развёртывание (делегированная cgroup). Файлы
+/// (TLS, секреты) не создаются, права существующих каталогов не меняются. Возвращает созданные каталоги; ошибка
 /// создания (путь и причина) прерывает запуск.
 pub fn create_role_dirs(paths: &RolePaths, skip: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut created = Vec::new();
-    for dir in paths.blob.iter().chain(&paths.cache).chain(&paths.state) {
+    for dir in paths
+        .blob
+        .iter()
+        .chain(&paths.cache)
+        .chain(&paths.state)
+        .chain(&paths.krb5_rcache)
+    {
         if skip.contains(dir) || dir.as_os_str().is_empty() || dir.is_dir() {
             continue;
         }
@@ -87,7 +93,8 @@ pub fn has_section(text: &str, name: &str) -> bool {
 }
 
 /// Каталоги ролей: секции платформы (`privileges::role_paths`), каталог BLOB (`blob.url` `file://`), индексы
-/// поиска, делегированная cgroup подпроцессов, файлы TLS внутренних каналов (CA, сертификат и ключ клиента).
+/// поиска, делегированная cgroup подпроцессов, файлы TLS внутренних каналов (CA, сертификат и ключ клиента), при
+/// входе GSSAPI (`auth.gssapi`) — keytab и каталог кэша повторов Kerberos (`KRB5RCACHEDIR` задаёт развёртывание).
 pub fn role_paths(cfg: &Config, config_file: &Path) -> RolePaths {
     let mut paths = privileges::role_paths(cfg, config_file);
     if let Ok(blob) = cfg.section::<BlobSection>(BLOB) {
@@ -115,6 +122,9 @@ pub fn role_paths(cfg: &Config, config_file: &Path) -> RolePaths {
         }
         if let Some(keytab) = auth.gssapi.as_ref().and_then(|g| g.keytab.clone()) {
             paths.secrets.push(keytab);
+        }
+        if auth.gssapi.is_some() {
+            paths.krb5_rcache = Some(tp_sys::KRB5_RCACHE_DIR.into());
         }
     }
     paths
@@ -197,6 +207,45 @@ mod tests {
                 .expect("dirs")
                 .is_empty()
         );
+    }
+
+    /// APP-68: при входе GSSAPI (`auth.gssapi`) каталог кэша повторов Kerberos — в путях роли и создаётся до Landlock;
+    /// без секции — его нет.
+    #[test]
+    fn krb5_rcache_dir_with_gssapi() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parse = |auth: &str| {
+            let cfg = sections::registry()
+                .expect("registry")
+                .parse(
+                    &format!(
+                        "domain: example.org\nprofile: dev\n\
+                         database:\n  url: postgres://x@y/z\n\
+                         blob:\n  url: file:///var/lib/thepost/blob\n{auth}"
+                    ),
+                    Vec::new(),
+                )
+                .expect("config");
+            role_paths(&cfg, Path::new("/etc/thepost/config.yaml"))
+        };
+        let with = parse("auth:\n  gssapi: { hostname: mail.example.org }\n");
+        assert_eq!(
+            with.krb5_rcache,
+            Some(PathBuf::from(tp_sys::KRB5_RCACHE_DIR))
+        );
+        assert_eq!(parse("").krb5_rcache, None);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("krb5rcache");
+        let paths = RolePaths {
+            krb5_rcache: Some(dir.clone()),
+            ..RolePaths::default()
+        };
+        let created = create_role_dirs(&paths, &[]).expect("dirs");
+        assert_eq!(created, vec![dir.clone()]);
+        let mode = std::fs::metadata(&dir).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o077, 0, "mode {mode:o}");
     }
 
     #[test]
