@@ -26,7 +26,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tp_contracts::audit::AuditAction;
 use tp_contracts::auth::{Credentials, Principal};
-use tp_contracts::meta::{AccountScope, MessageQuery, SpecialUse};
+use tp_contracts::meta::{AccountScope, AccountStore, MessageQuery, SpecialUse};
 use tp_contracts::sasl::{Mechanism, SaslContext, SaslStep};
 use tp_contracts::{Error, MailboxId, MessageId, Result};
 use tp_platform::{Conn, Listener};
@@ -777,6 +777,7 @@ impl<T: Transport> Pop3Session<T> {
 pub struct Pop3Server {
     ctx: Arc<SessionCtx>,
     sessions: Sessions,
+    accounts: Option<Arc<dyn AccountStore>>,
 }
 
 impl fmt::Debug for Pop3Server {
@@ -791,12 +792,20 @@ impl Pop3Server {
         Self {
             ctx: Arc::new(ctx),
             sessions: Sessions::default(),
+            accounts: None,
         }
+    }
+
+    /// Хранилище учётных записей для сверки открытых сессий после переподписки и по `Resync` (как
+    /// `Extensions::accounts` у [`Server`](crate::Server)); без него потерянный `AccountDisabled` сессию не закрывает.
+    pub fn with_accounts(mut self, accounts: Option<Arc<dyn AccountStore>>) -> Self {
+        self.accounts = accounts;
+        self
     }
 
     /// Принимает соединения до остановки узла (POP3 выключен — сразу возвращает `Ok`), затем ждёт сессии
     /// не дольше `imap.timeouts.drain` и прерывает оставшиеся. Сигнал `AccountDisabled` закрывает сессии учётной
-    /// записи.
+    /// записи; по `Resync` они сверяются с хранилищем [`with_accounts`](Self::with_accounts).
     pub async fn serve(&self, listener: Listener) -> Result<()> {
         if !self.ctx.config.pop3.enabled {
             return Ok(());
@@ -805,7 +814,7 @@ impl Pop3Server {
         let shutdown = self.ctx.shutdown.clone();
         self.sessions.start(
             self.ctx.deps.bus.clone(),
-            None,
+            self.accounts.clone(),
             self.ctx.config.timeouts.resubscribe,
             shutdown.clone(),
         );

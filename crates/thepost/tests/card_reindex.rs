@@ -1,42 +1,23 @@
-//! Защита от потери данных до шардированного GC BLOB (FIX-05): со вторым шардом в справочнике узел с ролью
-//! maintenance не стартует, `thepost doctor` — `FAIL` (`database.shards`); с одним шардом — как раньше.
+//! APP-63: роль maintenance при запуске пересчитывает поисковые строки контактов, записанных до миграции 0030
+//! (META-78): старая карточка после запуска узла находится поиском.
 //!
 //! Без `TEST_DATABASE_URL` тест пропускается.
 
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use thepost::doctor::{self, Status};
-use thepost::doctor_dns::{Dns, SrvRecord};
 use thepost::serve::{ServeOptions, start};
+use tp_contracts::dav::{
+    Collection, CollectionKind, Component, DavStore, ObjectIndex, Precondition, PutOutcome,
+};
+use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::role::CancellationToken;
 use tp_contracts::secrets::{SecretRef, SecretStore};
+use tp_contracts::{DomainId, TenantId};
+use tp_meta::pool::{DbPool, NoAcquireObserver};
+use tp_meta::{MetaConfig, PgMeta};
 use tp_testkit::MemSecretStore;
-
-/// DNS без записей: проверкам шардов DNS не нужен, сеть теста не трогаем.
-struct NoDns;
-
-#[async_trait]
-impl Dns for NoDns {
-    async fn mx(&self, _: &str) -> Result<Vec<(u16, String)>, String> {
-        Ok(Vec::new())
-    }
-    async fn srv(&self, _: &str) -> Result<Vec<SrvRecord>, String> {
-        Ok(Vec::new())
-    }
-    async fn txt(&self, _: &str) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
-    }
-    async fn ip(&self, _: &str) -> Result<Vec<IpAddr>, String> {
-        Ok(Vec::new())
-    }
-    async fn ptr(&self, _: IpAddr) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
-    }
-}
 
 /// Адрес без `sslmode` — открытый канал (профиль dev).
 fn dev_url(url: &str) -> String {
@@ -66,9 +47,13 @@ fn split_password(url: &str) -> (String, Option<String>) {
     )
 }
 
-/// Отдельная база: второй шард в общей базе остановил бы роль maintenance узлов других тестов.
+fn random() -> String {
+    DomainId::new().as_uuid().simple().to_string()
+}
+
+/// Отдельная база: ответ — имя и адрес.
 async fn create_database(url: &str) -> (String, String) {
-    let name = format!("fix05_{}", uuid_like());
+    let name = format!("app63_{}", random());
     let admin = sqlx::PgPool::connect(url).await.expect("admin pool");
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
         .execute(&admin)
@@ -87,13 +72,6 @@ async fn create_database(url: &str) -> (String, String) {
     (name.clone(), format!("{base}/{name}{query}"))
 }
 
-fn uuid_like() -> String {
-    tp_contracts::ids::DomainId::new()
-        .as_uuid()
-        .simple()
-        .to_string()
-}
-
 async fn drop_database(url: &str, name: &str) {
     if let Ok(admin) = sqlx::PgPool::connect(url).await {
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -102,6 +80,41 @@ async fn drop_database(url: &str, name: &str) {
         .execute(&admin)
         .await;
         admin.close().await;
+    }
+}
+
+/// Учётная запись организации по умолчанию в новом домене.
+async fn account(meta: &PgMeta, pool: &DbPool) -> AccountScope {
+    let tenant = TenantId::DEFAULT;
+    let domain = DomainId::new();
+    let name = format!("d{}.test", random());
+    let mut tx = tp_meta::schema::begin(pool, tenant).await.expect("begin");
+    sqlx::query("INSERT INTO domains (tenant_id, domain_id, name) VALUES ($1, $2, $3)")
+        .bind(tenant.as_uuid())
+        .bind(domain.as_uuid())
+        .bind(&name)
+        .execute(&mut *tx)
+        .await
+        .expect("domain");
+    tx.commit().await.expect("commit");
+    let acc = meta
+        .upsert(
+            tenant,
+            AccountUpsert {
+                domain,
+                login: format!("u{}@{name}", random()),
+                display_name: "User".into(),
+                external_id: None,
+                enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
+            },
+        )
+        .await
+        .expect("upsert");
+    AccountScope {
+        tenant,
+        account: acc.id,
     }
 }
 
@@ -119,39 +132,69 @@ fn opts(config: &Path, secrets: &Arc<MemSecretStore>) -> (ServeOptions, Cancella
     )
 }
 
-async fn doctor_shards(
-    config: &Path,
-    secrets: &Arc<MemSecretStore>,
-) -> (Option<Status>, String, i32) {
-    let report = doctor::run_with(
-        config,
-        Some(secrets.clone() as Arc<dyn SecretStore>),
-        Some(&NoDns),
-    )
-    .await;
-    let check = report.get("database.shards").cloned();
-    (
-        check.as_ref().map(|c| c.status),
-        check.map(|c| c.message).unwrap_or_default(),
-        report.exit_code(),
-    )
+async fn found(meta: &PgMeta, scope: AccountScope, book: &Collection) -> Vec<String> {
+    meta.find_cards(scope, book.id, "петров", 10)
+        .await
+        .expect("find")
+        .into_iter()
+        .map(|o| o.name)
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn second_shard_blocks_maintenance_and_fails_doctor() {
+async fn maintenance_reindexes_old_cards_on_start() {
     let Some(url) = tp_testkit::pg_url() else {
         eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
         return;
     };
     let admin_url = dev_url(&url);
     let (db_name, url_db) = create_database(&admin_url).await;
+    let pool = DbPool::new(
+        sqlx::PgPool::connect(&url_db).await.expect("pool"),
+        Arc::new(NoAcquireObserver),
+    );
+    tp_meta::schema::migrate(&pool).await.expect("migrate");
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let scope = account(&meta, &pool).await;
+    let book = Collection::new(CollectionKind::AddressBook, "contacts");
+    meta.create_collection(scope, book.clone())
+        .await
+        .expect("create");
+    // Карточка до миграции 0030: без поисковых строк, признак «не посчитаны».
+    let body = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:old\r\nFN:Пётр Петров\r\nN:Петров;Пётр;;;\r\n\
+                EMAIL:petrov@example.org\r\nEND:VCARD\r\n";
+    match meta
+        .put_object(
+            scope,
+            book.id,
+            "old.vcf",
+            body.to_owned(),
+            ObjectIndex::new(Component::Card, "old", None),
+            Precondition::Any,
+        )
+        .await
+        .expect("put")
+    {
+        PutOutcome::Stored(_) => {}
+        other => panic!("карточка не записана: {other:?}"),
+    }
+    let mut tx = tp_meta::schema::begin_system(&pool).await.expect("begin");
+    sqlx::query("UPDATE dav_objects SET search_pending = true WHERE component = 'VCARD'")
+        .execute(&mut *tx)
+        .await
+        .expect("pending");
+    tx.commit().await.expect("commit");
+    assert!(
+        found(&meta, scope, &book).await.is_empty(),
+        "до пересчёта не находится"
+    );
+
     let (db_url, password) = split_password(&url_db);
     let secrets = Arc::new(MemSecretStore::default());
     let db: SecretRef = "thepost/db#password".parse().expect("ref");
     secrets.set(&db, password.unwrap_or_else(|| "unused".to_owned()));
     let dir = tempfile::tempdir().expect("tempdir");
-    let blob = dir.path().join("blob");
-    let config: PathBuf = dir.path().join("config.yaml");
+    let config = dir.path().join("config.yaml");
     std::fs::write(
         &config,
         format!(
@@ -159,57 +202,34 @@ async fn second_shard_blocks_maintenance_and_fails_doctor() {
              service_http:\n  listen: 127.0.0.1:0\n  allow_plaintext: true\n\
              database:\n  url: \"{db_url}\"\n  password: {{ secret: \"{db}\" }}\n  tls: {{ allow_plaintext: true }}\n\
              meta:\n  events:\n    node_ttl: 3s\n\
-             cluster:\n  node_id: fix05-{}\n\
+             cluster:\n  node_id: app63-{}\n\
              runtime:\n  drain_deadline: 5s\n\
              blob:\n  url: file://{}\n",
             std::process::id(),
-            blob.display().to_string().replace('\\', "/")
+            dir.path()
+                .join("blob")
+                .display()
+                .to_string()
+                .replace('\\', "/")
         ),
     )
     .expect("config");
 
-    // Один шард — как раньше: роль maintenance стартует (миграции — при запуске), doctor — OK.
     let (o, shutdown) = opts(&config, &secrets);
-    let running = start(o).await.expect("start with one shard");
+    let running = start(o).await.expect("start");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !running.health.is_ready() {
+    while found(&meta, scope, &book).await != ["old.vcf"] {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "узел не готов: {:?}",
+            "старая карточка не пересчитана: роли {:?}",
             running.health.roles_status()
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     shutdown.cancel();
     let report = running.wait().await.expect("wait");
     assert!(report.failed.is_empty(), "{report:?}");
-    let (status, message, _) = doctor_shards(&config, &secrets).await;
-    assert_eq!(status, Some(Status::Ok), "{message}");
 
-    // Второй шард в справочнике: GC BLOB его не учитывает — узел не стартует, doctor — FAIL с причиной.
-    let pool = sqlx::PgPool::connect(&url_db).await.expect("pool");
-    sqlx::query(
-        "INSERT INTO shards (shard_id, name, dsn, accepts_new) \
-         VALUES (1, 'second', 'postgres://thepost@127.0.0.1:1/second', false)",
-    )
-    .execute(&pool)
-    .await
-    .expect("second shard");
     pool.close().await;
-
-    let (o, _) = opts(&config, &secrets);
-    let e = match start(o).await {
-        Ok(_) => panic!("узел с ролью maintenance запущен при двух шардах"),
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        e.contains("FIX-04") && e.contains("шардов в справочнике: 2"),
-        "{e}"
-    );
-    let (status, message, code) = doctor_shards(&config, &secrets).await;
-    assert_eq!(status, Some(Status::Fail), "{message}");
-    assert!(message.contains("FIX-04"), "{message}");
-    assert_eq!(code, 1);
-
     drop_database(&admin_url, &db_name).await;
 }

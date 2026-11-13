@@ -18,11 +18,13 @@
 //! - [`imip`] — письмо iMIP внешним участникам ([`ImipSender`] — реализация `ItipSender`);
 //! - [`schedule`] — рассылка ([`ScheduleDeps::dispatch`]) и ресурсы планирования;
 //! - [`index`] — индекс объекта (UID, компонент, интервал с повторами) из тела, им пользуется и `tp-jmap`;
+//! - [`charset`] — перекод 8-битной vCard (`CHARSET` без `ENCODING`) в UTF-8 перед calcard, общий с `tp-jmap`;
 //! - [`xml`] — разбор XML-тел с лимитами и запись `multistatus`;
 //! - [`fuzz`] — проверки разбора для цели cargo-fuzz `crates/tp-dav/fuzz` (не API).
 
 mod alarm;
 mod card;
+pub mod charset;
 pub mod config;
 pub mod deliver;
 pub mod fuzz;

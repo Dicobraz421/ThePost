@@ -540,40 +540,10 @@ async fn database(
         }
         Err(e) => report.push("database.checks", Status::Fail, "", message(&e)),
     }
-    shards(&pool, meta.timeout, report).await;
     locale(&pool, meta.timeout, report).await;
     extensions(&pool, meta.timeout, report).await;
     clock_skew(&pool, meta.timeout, doctor, report).await;
     pool.close().await;
-}
-
-/// Справочник шардов (FIX-05): больше одного шарда — `FAIL`, пока GC BLOB не шардирован (FIX-04).
-async fn shards(pool: &DbPool, timeout: Duration, report: &mut Report) {
-    let id = "database.shards";
-    match tokio::time::timeout(timeout, crate::roles::shard_count(pool)).await {
-        Ok(Ok(None)) => report.push(
-            id,
-            Status::Skipped,
-            "",
-            "справочника шардов нет: схема не создана",
-        ),
-        Ok(Ok(Some(n))) => match crate::roles::unsharded_gc(n) {
-            Some(reason) => report.push(id, Status::Fail, n.to_string(), reason),
-            None => report.push(id, Status::Ok, n.to_string(), "один шард"),
-        },
-        Ok(Err(e)) => report.push(
-            id,
-            Status::Fail,
-            "",
-            format!("справочник шардов не прочитан: {}", message(&e)),
-        ),
-        Err(_) => report.push(
-            id,
-            Status::Fail,
-            "",
-            "справочник шардов не прочитан: нет ответа",
-        ),
-    }
 }
 
 /// Кодировка и `LC_CTYPE` базы узла (решение 2026-11-11 №23): `lower(login)` переводит кириллицу только в UTF8 с

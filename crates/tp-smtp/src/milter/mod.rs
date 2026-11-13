@@ -16,7 +16,8 @@
 //! - `reject`, `replycode` (5xx) — отказ `550`/код фильтра; `tempfail`, `replycode` (4xx) — `451`/код фильтра;
 //! - `discard` — письмо принято (`250`) и никому не доставляется;
 //! - добавление, вставка и изменение заголовков (`h`, `i`, `m`) — применяются к письму, следующий фильтр
-//!   видит изменённое письмо;
+//!   видит изменённое письмо; пакет без индекса, не из двух полей или с именем не из печатных ASCII без `:` —
+//!   нарушение протокола;
 //! - `quarantine` — направление приёма доставляет письмо в «Спам», направление исходящей почты отклоняет (`550 5.7.1`):
 //!   исходящее письмо в карантине наружу не уходит.
 //!
@@ -437,23 +438,8 @@ impl Milters {
             let p = s.read(s.filter.end_timeout).await?;
             match p.code {
                 proto::R_PROGRESS => {}
-                proto::R_ADDHEADER => {
-                    if let [name, value] = p.split()[..] {
-                        mods.push(HeaderMod::Add(text(name), text(value)));
-                    }
-                }
-                proto::R_INSHEADER | proto::R_CHGHEADER => {
-                    let mut d = p.data.clone();
-                    let index = proto::take_u32(&mut d).unwrap_or_default() as usize;
-                    let rest = Packet::new(p.code, d);
-                    if let [name, value] = rest.split()[..] {
-                        let (name, value) = (text(name), text(value));
-                        mods.push(if p.code == proto::R_INSHEADER {
-                            HeaderMod::Insert(index, name, value)
-                        } else {
-                            HeaderMod::Change(index, name, value)
-                        });
-                    }
+                proto::R_ADDHEADER | proto::R_INSHEADER | proto::R_CHGHEADER => {
+                    mods.push(parse_header_mod(&p)?);
                 }
                 proto::R_QUARANTINE => {
                     let reason = p.split().first().map(|r| text(r)).unwrap_or_default();
@@ -585,6 +571,36 @@ fn final_action(p: &Packet) -> Result<Option<Filtered>, ProtoError> {
     })
 }
 
+/// Изменение заголовка из пакета `h` (имя, значение) или `i`, `m` (индекс u32, имя, значение). Нет индекса,
+/// не два поля или имя не из печатных ASCII без `:` (RFC 5322, 2.2) — ошибка протокола, сеанс с фильтром
+/// закрывается по `on_failure` (FIX-08).
+fn parse_header_mod(p: &Packet) -> Result<HeaderMod, ProtoError> {
+    let bad = |what: &str| {
+        ProtoError::Protocol(format!(
+            "bad header change {:?}: {what}",
+            char::from(p.code)
+        ))
+    };
+    let mut data = p.data.clone();
+    let index = match p.code {
+        proto::R_ADDHEADER => 0,
+        _ => proto::take_u32(&mut data).ok_or_else(|| bad("no index"))? as usize,
+    };
+    let fields = Packet::new(p.code, data);
+    let [name, value] = fields.split()[..] else {
+        return Err(bad("expected name and value"));
+    };
+    if name.is_empty() || !name.iter().all(|b| b.is_ascii_graphic() && *b != b':') {
+        return Err(bad("invalid name"));
+    }
+    let (name, value) = (text(name), text(value));
+    Ok(match p.code {
+        proto::R_ADDHEADER => HeaderMod::Add(name, value),
+        proto::R_INSHEADER => HeaderMod::Insert(index, name, value),
+        _ => HeaderMod::Change(index, name, value),
+    })
+}
+
 fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
@@ -660,14 +676,8 @@ fn apply(raw: &[u8], mods: &[HeaderMod]) -> Bytes {
         f.split_once(':')
             .is_some_and(|(n, _)| n.trim_end().eq_ignore_ascii_case(name))
     };
-    // Имя от фильтра — печатные ASCII без `:` (RFC 5322, 2.2), иначе изменение пропускается (FIX-08).
-    let valid = |m: &&HeaderMod| {
-        let (HeaderMod::Add(name, _)
-        | HeaderMod::Insert(_, name, _)
-        | HeaderMod::Change(_, name, _)) = m;
-        !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic() && b != b':')
-    };
-    for m in mods.iter().filter(valid) {
+    // Имена проверены при разборе пакета ([`parse_header_mod`]).
+    for m in mods {
         match m {
             HeaderMod::Add(name, value) => fields.push(field(name, value)),
             HeaderMod::Insert(i, name, value) => {

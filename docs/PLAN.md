@@ -12,8 +12,8 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 233/262 | 332/372 | в работе, 89 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
-| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 57/105 | 99/177 | в работе, 56 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 241/286 | 343/404 | в работе, 85 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 67/106 | 117/178 | в работе, 66 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 1/2 | 1/2 | в работе, 50 % карточек | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
 
@@ -37,7 +37,9 @@
 только самого раннего незавершённого этапа; волны следующего этапа — когда в текущем нет готовых (свободная полоса); этапы 3 и 4 — после приёмки этапа 2, шаги 4.1–4.3 этапа 4 — раньше этапа 3 (решение 33).
 
 **Срочно, первыми** (ошибки на живом узле, этап 2; реестр облачных волн, п. 26–27): `app-43` (FIX-03, домены организации в
-Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение и отказ модерации — 500).
+Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение и отказ модерации — 500); паники от письма и ответа
+фильтра (фаззер, п. 89) — `mailstore-13` (FIX-06, FIX-07), `smtp-22` (FIX-08); защита от потери данных при втором шарде —
+`app-49` (FIX-05).
 
 1. **Этап 1 — «почта работает на стенде SMB»** (срочно). Установка `--profile smb`, первый администратор, учётные записи,
    письмо между двумя пользователями, IMAP и JMAP, корзина, защита входа.
@@ -73,6 +75,11 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
      Затем: `contracts-46` → `deploy-32`, `smtp-21` → `app-48`; ключи TLS только из OpenBao — `deploy-31`, `platform-19` →
      `platform-20`; `deploy-33` (только ACME, сокеты systemd, один пресет SMB) → `docs-04`; `auth-13`. GSSAPI в сборке —
      `deps-12` → `ci-10` (решение 107).
+   - Реестр облачных волн, п. 62–91: FIX-05…08 (срочно, выше); `admin-25` (CLI: `--after`, остальные команды, `login --oidc`),
+     `blob-10` (счётчики `verify`), `deploy-35` → `docs-05` (ключи `maintenance.*`, `cli.oidc.*`), `app-50` (OIDC с ключом
+     из OpenBao), `contracts-48` (`by_external_id` обязателен).
+   - Хвосты 13.11: `app-59` (APP-64, POP3 сверяет сеансы после потери сигнала), `dav-11` → `jmap-27` (импорт 8-битных
+     vCard); этап 3 — `meta-52` (META-79, срок GC по всем шардам). Пересчёт индекса старых контактов — `meta-51`, `app-58` (влиты).
    - Хвосты 12.11, вечер: `app-57` (APP-62, приглашения из JMAP и DAV в узле, после `smtp-16`); этап 3 — `app-56` (APP-61,
      узел edge без базы, после `platform-22`), `contracts-54` (CTR-82, права отправителя через группы).
    - Приёмка этапа: критерии выхода Ф1 ниже (нагрузка Д.6 для SMB) — отчёт `criteria.md` DEP-13 без «не прошёл».
@@ -85,6 +92,9 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
      пресет edge); `deps-09` (mail-parser 1.0, решение 17).
    - Аудит 12.11: `cluster-13` (узел — только по URI, после `deploy-20`), `contracts-47` (ключ подписчика шарда),
      `deploy-34` (порты Helm из конфигурации); перед выпуском 1.0 — `meta-45` (миграции — одна схема, раздел Ф4).
+   - Реестр облачных волн, п. 62–91: **до включения второго шарда** — `app-52` (FIX-04, GC по всем шардам); `meta-47`,
+     `testkit-08` (GC по шардам); `deps-13` → `sys-09` (`statvfs` из `nix`); очередь без опроса и шард отправителя —
+     `contracts-50` → `meta-48` → `smtp-23`, `mailstore-14`; `deps-09` (mail-parser 1.0 — одной волной класса B).
    - HTTP/2 между узлами, URI узла в сертификатах, PKI OpenBao (решения 31, 32, 64): `deps-06` → `cluster-10`, `deploy-20`,
      `platform-16` → `deploy-26`.
    - Синк 12.11, часть 2: сессии Admin API в PostgreSQL — `contracts-43` → `meta-40`, `admin-18` → `app-42` (решение 77).
@@ -107,7 +117,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
      Синк 12.11, часть 2: `deploy-25` (образ с консолью) → `ci-07`; `deps-10` → `admin-17` (CORS, `GET /session`, `GET /orgs`,
      `operationId`) → `console-05`; `ci-09` (архив консоли в выпуске, сверка схемы на PR) — решения 68, 73, 74.
      Реестр облачных волн, п. 26–55: `deploy-28` (ManageSieve в поставке: секция и порт 4190); GSSAPI в узле — `deps-12` →
-     `ci-10`, `deploy-29` → `docs-03`; `admin-20` (фильтры аудита, CLI блокировки); `contracts-44` → `meta-42`, `mailstore-12` →
+     `ci-10`, `deploy-29` → `docs-03`, `app-51` (вход GSSAPI в узле); `admin-20` (фильтры аудита, CLI блокировки); `contracts-44` → `meta-42`, `mailstore-12` →
      `admin-21`, `imap-12`, `jmap-24` (блокировка рвёт сеансы); `console-06`.
      Приёмка шага: `docs/manual-tests/UI-09.md` (консоль тремя ролями), `docs/manual-tests/AUTH-05.md` шаг 5 (GSSAPI на
      живом Kerberos, после `ci-10`).
@@ -283,6 +293,15 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | cluster-13 | CLU-18 | A | deploy-20 | 4 |
 | contracts-47 (ветка `x/contracts-47`) | CTR-71 | B | contracts-22 | 1 |
 | deploy-34 | DEP-47 | A | deploy-07 | 4 |
+| ✅ app-52 | FIX-04 | A | blob-08 | 2 |
+| meta-47 | META-73 | A | blob-08 | 3 |
+| testkit-08 | KIT-11 | A | blob-08 | 1 |
+| deps-13 (ветка `x/deps-13`) | DEPS-13 | B | sys-08 | 1 |
+| sys-09 | SYS-14 | A | deps-13 | 2 |
+| contracts-50 (ветка `x/contracts-50`) | CTR-73, CTR-74, CTR-76, CTR-77, CTR-78 | B | contracts-23 | 1 |
+| meta-48 | META-72, META-75 | A | contracts-50 | 3 |
+| smtp-23 | SMTP-42 | A | meta-48 | 4 |
+| mailstore-14 | MS-20 | A | contracts-50, mailstore-10 | 1 |
 
 ### Синк 12.11, часть 2 — этап 3: сессии Admin API в PostgreSQL, роли PKI OpenBao (решения 71, 77)
 
@@ -531,8 +550,14 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ app-55 | APP-60 | A | — | 2 |
 | ✅ platform-22 | PLT-33 | A | — | 2 |
 | app-56 | APP-61 | A | platform-22 | 3 |
-| app-57 | APP-62 | A | smtp-16 | 2 |
+| ✅ app-57 | APP-62 | A | smtp-16 | 2 |
 | contracts-54 (ветка `x/contracts-54`) | CTR-82 | B | smtp-16 | 3 |
+| ✅ meta-51 | META-78 | A | dav-07 | 2 |
+| ✅ app-58 | APP-63 | A | meta-51 | 2 |
+| meta-52 | META-79 | A | app-52 | 3 |
+| app-59 | APP-64 | A | imap-12 | 2 |
+| dav-11 | DAV-33 | A | testkit-07 | 2 |
+| jmap-27 | JMAP-44 | A | dav-11 | 2 |
 | ✅ app-47 | APP-54 | A | — | 2 |
 | ✅ contracts-46 (ветка `x/contracts-46`) | CTR-25, CTR-67, CTR-68, CTR-70 | B | contracts-37 | 1 |
 | ✅ contracts-51 (ветка `x/contracts-51`) | CTR-79 | B | contracts-46 | 1 |
@@ -549,9 +574,25 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ smtp-21 | SMTP-39, SMTP-40 | A | deploy-31, deploy-32, app-47, contracts-46, smtp-20 | 4 |
 | ✅ app-48 | APP-55 | A | smtp-21 | 2 |
 | ✅ platform-20 (ветка `x/platform-20`) | PLT-31 | B | deploy-31, platform-19, contracts-46 | 2 |
-| deploy-33 | DEP-45, DEP-46, DEP-48 | A | platform-19, deploy-31 | 4 |
+| ✅ deploy-33 | DEP-45, DEP-46, DEP-48 | A | platform-19, deploy-31 | 4 |
 | docs-04 | DOC-04 | A | deploy-33 | 1 |
 | ✅ auth-13 | AUTH-18 | A | — | 1 |
+
+### Хвосты облачных волн 12.11, п. 62–91 — этап 2 (FIX — срочно)
+
+| Волна | Карточки | Класс | Ждёт | Поток |
+|---|---|---|---|---|
+| ✅ app-49 | FIX-05 | A | — | 2 |
+| ✅ mailstore-13 | FIX-06, FIX-07 | A | — | 1 |
+| ✅ smtp-22 | FIX-08 | A | — | 4 |
+| admin-25 | ADM-37, ADM-38, ADM-39 | A | app-39 | 3 |
+| blob-10 | BLOB-17 | A | — | 4 |
+| deploy-35 | DEP-49 | A | app-39, app-37 | 4 |
+| docs-05 | DOC-05 | A | deploy-35 | 1 |
+| app-50 | APP-56 | A | auth-12 | 2 |
+| contracts-48 (ветка `x/contracts-48`) | CTR-72 | B | — | 1 |
+
+Влиты: `app-49` — #555, `mailstore-13` — #574 (issues #475, #468 закрыты).
 
 
 Первая учётная запись SMB без OIDC (#193) и отложенная отправка с отменой (#195) — решены 2026-11-10, карточки выше.
@@ -619,35 +660,35 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ ci-06 (ветка `x/ci-06`) | CI-07 | B | admin-12 | 1 |
 | ✅ admin-14 | ADM-22 | A | ci-06, admin-13 | 3 |
 | ✅ deps-07 (ветка `x/deps-07`) | DEPS-07 | B | deps-05 | 1 |
-| ci-07 (ветка `x/ci-07`) | CI-08 | B | deps-07, admin-10, deploy-25 | 1 |
+| ✅ ci-07 (ветка `x/ci-07`) | CI-08 | B | deps-07, admin-10, deploy-25 | 1 |
 | ✅ contracts-38 (ветка `x/contracts-38`) | CTR-53, CTR-54, CTR-55, CTR-56 | B | contracts-33, contracts-31 | 1 |
 | meta-37 (ветка `x/meta-37`) | META-57, META-58, META-59, META-60 | A/B | contracts-38, meta-30 | 3 |
-| dav-07 | DAV-23, DAV-24, DAV-25 | A | contracts-38, dav-03 | 4 |
+| ✅ dav-07 | DAV-23, DAV-24, DAV-25 | A | contracts-38, dav-03 | 4 |
 | jmap-20 | JMAP-34, JMAP-35, JMAP-36 | A | contracts-38, testkit-06, jmap-17, app-25 | 3 |
 | admin-15 | ADM-21 | A | contracts-38, meta-37, admin-14 | 3 |
 | app-36 | APP-38 | A | dav-07, meta-37, admin-13, jmap-20, app-28, app-26 | 2 |
 | ✅ contracts-40 (ветка `x/contracts-40`) | CTR-58 | B | — | 1 |
-| auth-11 | AUTH-16 | A | contracts-40 | 1 |
-| dav-08 | DAV-26, DAV-27, DAV-28 | A | contracts-39, contracts-40, dav-03 | 4 |
+| ✅ auth-11 | AUTH-16 | A | contracts-40 | 1 |
+| ✅ dav-08 | DAV-26, DAV-27, DAV-28 | A | contracts-39, contracts-40, dav-03 | 4 |
 | ✅ sieve-05 | SIEVE-12 | A | contracts-39, sieve-03 | 2 |
 | jmap-22 | JMAP-38 | A | jmap-18, contracts-35 | 3 |
-| contracts-41 (ветка `x/contracts-41`) | CTR-60 | B | contracts-40 | 1 |
+| ✅ contracts-41 (ветка `x/contracts-41`) | CTR-60 | B | contracts-40 | 1 |
 | meta-39 (ветка `x/meta-39`) | META-63 | B | contracts-41, meta-37 | 3 |
 | dav-09 | DAV-29 | A | contracts-41, dav-08 | 4 |
 | jmap-23 | JMAP-39 | A | contracts-41, jmap-20 | 3 |
 | app-41 | APP-49 | A | dav-09, meta-39, jmap-23, app-28 | 2 |
 | ✅ deps-10 (ветка `x/deps-10`) | DEPS-10 | B | deps-05 | 1 |
-| admin-17 | ADM-24, ADM-25, ADM-26, ADM-27 | A | admin-10, deps-10 | 3 |
+| ✅ admin-17 | ADM-24, ADM-25, ADM-26, ADM-27 | A | admin-10, deps-10 | 3 |
 | console-05 | UI-12, UI-13 | A | console-03, admin-17 | 1 |
 | ci-09 (ветка `x/ci-09`) | CI-10, CI-11 | B | ci-07, app-35 | 1 |
 | ✅ deploy-25 | DEP-35 | A | deps-07 | 4 |
 | ✅ contracts-42 (ветка `x/contracts-42`) | CTR-59 | B | contracts-34 | 1 |
-| smtp-16 | SMTP-36 | A | smtp-13, contracts-38 | 1 |
+| ✅ smtp-16 | SMTP-36 | A | smtp-13, contracts-38 | 1 |
 | meta-41 | META-65 | A | contracts-41 | 3 |
 | app-45 | APP-51, APP-52 | A | meta-41, app-41, app-31 | 2 |
 | ✅ deploy-27 | DEP-37 | A | app-31, app-28 | 4 |
 | ✅ deps-11 (ветка `x/deps-11`) | DEPS-11 | B | testkit-06 | 1 |
-| testkit-07 | KIT-10 | A | deps-11 | 1 |
+| ✅ testkit-07 | KIT-10 | A | deps-11 | 1 |
 | ✅ deploy-28 | DEP-38 | A | app-26 | 4 |
 | ✅ deps-12 (ветка `x/deps-12`) | DEPS-12 | B | auth-08 | 1 |
 | ci-10 (ветка `x/ci-10`) | CI-12 | B | deps-12 | 1 |
@@ -655,14 +696,14 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | docs-03 | DOC-03 | A | deploy-29 | 1 |
 | admin-20 | ADM-30, ADM-31 | A | admin-17, admin-13, ci-06 | 3 |
 | ✅ contracts-44 (ветка `x/contracts-44`) | CTR-63, CTR-64 | B | — | 1 |
-| meta-42 | META-66, META-67 | A | contracts-44 | 3 |
+| ✅ meta-42 | META-66, META-67 | A | contracts-44 | 3 |
 | ✅ contracts-52 (ветка `x/contracts-52`) | CTR-80 | B | contracts-23 | 1 |
 | ✅ mailstore-12 | MS-19 | A | contracts-52 | 1 |
 | contracts-53 (ветка `x/contracts-53`) | CTR-81 | B | — | 3 |
 | imap-13 | IMAP-23 | A | contracts-53 | 3 |
 | jmap-26 | JMAP-43 | A | contracts-53 | 3 |
 | admin-21 | ADM-32 | A | contracts-44, mailstore-12, admin-13 | 3 |
-| imap-12 | IMAP-22 | A | contracts-44 | 2 |
+| ✅ imap-12 | IMAP-22 | A | contracts-44 | 2 |
 | jmap-24 | JMAP-41 | A | contracts-44 | 3 |
 | console-06 | UI-14, UI-15 | A | console-03, console-05, admin-13 | 1 |
 | contracts-45 (ветка `x/contracts-45`) | CTR-62, CTR-65, CTR-66 | B | contracts-38 | 1 |
@@ -672,6 +713,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | smtp-18 | SMTP-37 | A | contracts-45, smtp-13 | 4 |
 | app-46 | APP-53 | A | jmap-18, dav-10 | 2 |
 | smtp-19 | SMTP-38 | A | smtp-13, contracts-35 | 4 |
+| app-51 | APP-58 | A | deps-12 | 2 |
 
 Выход Ф2: `docs/manual-tests/CMP-10.md` на бете без «не прошёл» — календари, контакты, правила и автоответы проверены клиентами
 (Thunderbird, iOS и macOS, DAVx5, Evolution, Postman); консоль покрывает Admin API (`console/coverage-pending.txt` пуст, UI-09).
@@ -679,7 +721,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 Строки от `auth-08` до `app-36` — хвосты облачных волн 2026-11-12 (PR #426, #427, #428, #429, #431, #439–#442, #444); карточки с
 пометкой «Требует подтверждения владельца» — перед запуском — ответ владельца. Строки от `contracts-40` до `jmap-22` — хвосты
 PR 10–12.11 (#293, #443, #449). Строки от `contracts-41` до `smtp-16` — синк 12.11, часть 2 (решения 68–78). Строки от
-`meta-41` до `smtp-19` — реестр недоделок облачных волн 12.11, п. 26–55 (`smtp-19` — шаг 4.4).
+`meta-41` до `smtp-19` — реестр недоделок облачных волн 12.11, п. 26–55 (`smtp-19` — шаг 4.4). Строка `app-51` — п. 62–91 (шаг 4.2).
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 

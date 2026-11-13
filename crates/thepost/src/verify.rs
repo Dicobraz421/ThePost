@@ -138,10 +138,13 @@ pub async fn command(
         .map_err(|_| Error::internal("чтение конфигурации прервано"))??;
     let secrets = secrets::store(&cfg, store).await?;
     let pool = infra::connect_db(&cfg, secrets.as_ref()).await?;
+    // Учёт по всем шардам справочника (FIX-04): `--fix` не удалит объект, на который ссылается только другой шард.
+    let shards = infra::shard_directory(&cfg, pool.clone(), secrets.clone())?;
     let meta = PgMeta::new(
         pool,
         (*cfg.section::<MetaConfig>(MetaConfig::SECTION)?).clone(),
-    );
+    )
+    .with_shards(shards);
     let blob = infra::open_blob(&cfg, secrets.as_ref()).await?;
     let page_size = cfg.section::<VerifySection>(VERIFY)?.page_size;
     let inventory = Arc::new(PgInventory::new(meta.clone(), page_size));

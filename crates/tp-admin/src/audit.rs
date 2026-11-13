@@ -144,19 +144,22 @@ pub struct AuditParams {
 
 /// Маршруты журнала аудита.
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route(AUDIT_ROUTE, get(search))
+    r.route(AUDIT_ROUTE, get(search_audit))
 }
 
 /// Спецификация OpenAPI маршрутов модуля.
 #[derive(Debug, OpenApi)]
-#[openapi(paths(search), components(schemas(AuditRecord, AuditEntry, AuditPage)))]
+#[openapi(
+    paths(search_audit),
+    components(schemas(AuditRecord, AuditEntry, AuditPage))
+)]
 pub(crate) struct Doc;
 
 /// Журнал аудита организации.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/audit", tag = "audit",
     params(("org" = String, Path, description = "Организация (UUID)"), AuditParams),
     responses((status = 200, body = AuditPage), (status = 400, body = Problem), (status = 403, body = Problem)))]
-async fn search(
+async fn search_audit(
     State(a): State<Arc<Admin>>,
     Path(org): Path<TenantId>,
     Query(q): Query<AuditParams>,
