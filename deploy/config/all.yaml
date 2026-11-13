@@ -61,8 +61,6 @@ maintenance:
   purge_interval: 1h
   # Срок хранения токенов `thepost admin init` после их истечения (аудит); 0s — удалять сразу.
   admin_token_retention: 30d
-  # Период заполнения книги GAL «Организация» из каталога: auth.ldap, без него — учётные записи и группы PostgreSQL.
-  gal_interval: 1m
   # Проверка целостности BLOB по расписанию — `thepost verify` без --fix: итог — журнал узла и /metrics
   # (tp_blob_verify_*), исправление — только вручную (`thepost verify --fix`). Время — UTC, ЧЧ:ММ.
   verify:
