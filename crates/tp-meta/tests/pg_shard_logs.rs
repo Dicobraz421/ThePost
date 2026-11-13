@@ -357,6 +357,81 @@ async fn blob_referenced_on_another_shard_is_kept() {
     t.drop_db().await;
 }
 
+/// Записи учёта поколения [`Gen::INITIAL`] с хэшами `hashes` на шарде `pool`: `refcnt` ссылок, без ссылок —
+/// обнулённые в моменты `zeros`.
+async fn put_blobs(
+    pool: &DbPool,
+    tenant: TenantId,
+    hashes: &[BlobHash],
+    refcnt: i64,
+    zeros: &[OffsetDateTime],
+) {
+    let hashes: Vec<Vec<u8>> = hashes.iter().map(|h| h.as_bytes().to_vec()).collect();
+    let mut tx = tp_meta::schema::begin(pool, tenant).await.expect("begin");
+    sqlx::query(
+        "INSERT INTO blobs (tenant_id, hash, gen, refcnt, size, zero_since)
+         SELECT $1, u.h, 0, $3, 1, CASE WHEN $3 = 0 THEN u.z END
+         FROM unnest($2::bytea[], $4::timestamptz[]) AS u(h, z)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(hashes)
+    .bind(refcnt)
+    .bind(zeros.to_vec())
+    .execute(&mut *tx)
+    .await
+    .expect("blobs");
+    tx.commit().await.expect("commit");
+}
+
+fn initial(tenant: TenantId, hash: BlobHash) -> BlobKey {
+    BlobKey {
+        tenant,
+        hash,
+        generation: Gen::INITIAL,
+    }
+}
+
+/// META-73: записи, занятые другим шардом, отбрасываются до `LIMIT` — 300 таких записей впереди (больше
+/// страницы выборки) не скрывают свободного кандидата.
+#[tokio::test]
+async fn busy_blobs_ahead_do_not_hide_free_candidate() {
+    let Some(t) = common::two_shards().await else {
+        return;
+    };
+    let (tenant, _, _) = t.tenant().await;
+    let base = OffsetDateTime::now_utc() - Duration::from_secs(7200);
+    let busy: Vec<BlobHash> = (0..300).map(|_| hash()).collect();
+    let zeros: Vec<OffsetDateTime> = (0..300u64)
+        .map(|i| base + Duration::from_millis(i))
+        .collect();
+    // Основная БД: ссылок нет, обнулены раньше свободного; второй шард: ссылки есть.
+    put_blobs(t.main.meta.pool(), tenant, &busy, 0, &zeros).await;
+    put_blobs(&t.shard_pool, tenant, &busy, 1, &zeros).await;
+    let free = hash();
+    put_blobs(
+        t.main.meta.pool(),
+        tenant,
+        &[free],
+        0,
+        &[base + Duration::from_secs(60)],
+    )
+    .await;
+
+    let later = OffsetDateTime::now_utc() + Duration::from_secs(3600);
+    let free = initial(tenant, free);
+    for limit in [1, 10, 1000] {
+        assert_eq!(
+            t.meta
+                .gc_candidates(later, limit)
+                .await
+                .expect("candidates"),
+            vec![free],
+            "limit {limit}"
+        );
+    }
+    t.drop_db().await;
+}
+
 #[tokio::test]
 async fn signals_from_every_shard() {
     let Some(t) = common::two_shards().await else {
