@@ -1164,17 +1164,6 @@ async fn admin_init(socket: &Path, email: &str) -> Value {
     serde_json::from_slice(&out).expect("admin init reply")
 }
 
-/// Новая сессия SMTP: код ответа на `RCPT TO:<to>` после `MAIL FROM:<from>`.
-async fn rcpt_code(addr: std::net::SocketAddr, from: &str, to: &str) -> u16 {
-    let mut s = TcpStream::connect(addr).await.expect("smtp connect");
-    assert_eq!(smtp_reply(&mut s).await, 220);
-    assert_eq!(smtp_cmd(&mut s, "EHLO client.test").await, 250);
-    assert_eq!(smtp_cmd(&mut s, &format!("MAIL FROM:<{from}>")).await, 250);
-    let code = smtp_cmd(&mut s, &format!("RCPT TO:<{to}>")).await;
-    assert_eq!(smtp_cmd(&mut s, "QUIT").await, 221);
-    code
-}
-
 /// Новая сессия SMTP: код ответа на `MAIL FROM:<from>`.
 async fn mail_from_code(addr: std::net::SocketAddr, from: &str) -> u16 {
     let mut s = TcpStream::connect(addr).await.expect("smtp connect");
@@ -2230,12 +2219,16 @@ async fn gal_without_ldap() {
         "From: Bob <bob@sender.test>\nTo: <{alias}>\nSubject: {word}\n\
          Message-ID: <{word}@sender.test>\n\nДоставка на псевдоним.\n"
     );
-    let smtp = addr(&running, "smtp-in");
-    let until = deadline();
-    while rcpt_code(smtp, "bob@sender.test", &alias).await != 250 {
-        retry(until, "псевдоним в снимке адресов SMTP").await;
-    }
-    smtp_send(smtp, "bob@sender.test", &alias, &message).await;
+    // Снимок адресов SMTP живёт `directory_refresh` (1 с): псевдоним в нём — после обновления. Опрос `RCPT` в цикле
+    // упёрся бы в частоту соединений экрана smtp-in (`screen.max_rate`, `421`).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    smtp_send(
+        addr(&running, "smtp-in"),
+        "bob@sender.test",
+        &alias,
+        &message,
+    )
+    .await;
     let mut imap = imap_login(addr(&running, "imap"), &colleague, ivan_secret.expose()).await;
     let until = deadline();
     while exists(&imap.cmd("SELECT INBOX").await) != 1 {

@@ -3,7 +3,7 @@
 lane: admin
 deps: []
 class: B
-files: [crates/tp-admin/src/*, crates/thepost/src/admin_client.rs, crates/thepost/tests/e2e.rs, console/*]
+files: [crates/tp-admin/src/*, crates/thepost/src/admin_client.rs, crates/thepost/src/services.rs, crates/thepost/tests/e2e.rs, console/*]
 read: [docs/spec/S4.md#4.1, docs/spec/S4.md#4.5, docs/tasks/CTR-83.md, docs/tasks/ADM-18.md, docs/tasks/CI-11.md]
 checks: [nextest]
 manual: no
@@ -22,7 +22,9 @@ manual: no
 - Учётная запись каталога (`external_id` задан): `aliases` и `hidden_from_gal` ведёт каталог, синхронизация их
   перезаписывает — изменение через API 409 с пояснением (один источник данных).
 - Приём почты на новый псевдоним — по снимку адресов SMTP: не позже чем через `smtp.delivery.directory_refresh`
-  (по умолчанию 5 мин), книга «Организация» — через `maintenance.gal_interval`.
+  (по умолчанию 5 мин), книга «Организация» — через `maintenance.gal_interval`. Без LDAP снимок строится из
+  каталога PostgreSQL (`impl Directory for PgMeta`), как книга «Организация»: прежде доставке без LDAP каталог не
+  передавался, и псевдонимы из `accounts.aliases` почту не принимали (`Services::org_directory`).
 - Создание локальной учётной записи — та же проверка занятости адреса (адрес-псевдоним новой записи не отдаётся).
 - Схема `openapi_spec()` и копия консоли `console/src/api/openapi.json`, `schema.d.ts` — в том же PR (CI-11).
 - CLI: `thepost admin account set <учётная запись> [--alias АДРЕС]… [--no-aliases] [--hidden-from-gal true|false]`;
