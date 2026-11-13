@@ -179,6 +179,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "account hidden from gal",
         include_str!("../migrations/0038_account_hidden_from_gal.sql"),
     ),
+    (
+        39,
+        "sharing",
+        include_str!("../migrations/0039_sharing.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

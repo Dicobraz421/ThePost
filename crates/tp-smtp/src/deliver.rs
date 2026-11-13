@@ -385,6 +385,11 @@ impl Delivery {
     ///   (`Account::addresses`) или право Send As / Send on Behalf ([`Delivery::with_authz`]); источник
     ///   `ItipSource::Internal`. Иначе — только письмо.
     ///
+    /// Представитель (SMTP-38): `From` совпал с `SENT-BY` организатора или участника — сообщение передаётся от имени
+    /// владельца (`ItipMessage::from`), если `From` принадлежит учётной записи отправителя и у неё есть право Send As
+    /// или Send on Behalf на адрес владельца; иначе — только письмо. У iMIP право представителя не проверить
+    /// (DMARC подтверждает только домен) — только письмо.
+    ///
     /// Письмо в любом случае остаётся в ящике. Итог `itip` (применено или пропущено с причиной) — событие `Itip`
     /// журнала доставки на получателя (SMTP-37, `delivery::itip_record`), сбой — только запись в журнал узла.
     pub fn with_itip(mut self, itip: Arc<dyn ItipDelivery>) -> Self {
@@ -424,23 +429,35 @@ impl Delivery {
             Some(Ok(m)) => m,
         };
         let source = match origin {
-            ItipOrigin::Imip { dmarc_pass: true } => ItipSource::Imip,
             ItipOrigin::Imip { dmarc_pass: false } => {
                 tracing::info!(%id, reason = "отправитель не прошёл DMARC", "smtp: сообщение iTIP не применено");
                 return steps;
             }
+            // Право представителя внешнего отправителя узлу неизвестно: DMARC подтверждает только домен `From`.
+            ItipOrigin::Imip { dmarc_pass: true } if msg.sent_by.is_some() => {
+                tracing::info!(%id, reason = "представитель (SENT-BY) извне", "smtp: сообщение iTIP не применено");
+                return steps;
+            }
+            ItipOrigin::Imip { dmarc_pass: true } => ItipSource::Imip,
             ItipOrigin::Internal { account, principal } => {
-                match self.sender_right(account, principal, &msg.from).await {
-                    Ok(Some(_)) => ItipSource::Internal,
-                    Ok(None) => {
-                        tracing::info!(%id, %account, "smtp: From приглашения не принадлежит отправителю, осталось письмом");
-                        return steps;
-                    }
-                    Err(e) => {
-                        tracing::warn!(%id, %account, error = %e, "smtp: сбой проверки отправителя приглашения");
-                        return steps;
+                // `From` — адрес отправителя; у представителя (`SENT-BY`, SMTP-38) — ещё и право Send As или Send on
+                // Behalf на адрес владельца: то же право, что у письма от имени владельца.
+                let mut owned = true;
+                for addr in msg.sent_by.iter().chain([&msg.from]) {
+                    match self.sender_right(account, principal, addr).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => owned = false,
+                        Err(e) => {
+                            tracing::warn!(%id, %account, error = %e, "smtp: сбой проверки отправителя приглашения");
+                            return steps;
+                        }
                     }
                 }
+                if !owned {
+                    tracing::info!(%id, %account, "smtp: From приглашения не принадлежит отправителю, осталось письмом");
+                    return steps;
+                }
+                ItipSource::Internal
             }
         };
         let mut seen = HashSet::new();

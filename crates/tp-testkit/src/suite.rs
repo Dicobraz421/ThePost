@@ -298,6 +298,7 @@ pub mod dav;
 pub mod freebusy;
 pub mod itip;
 pub mod lifecycle;
+pub mod sharing;
 pub mod sieve;
 
 pub use dav::dav;

@@ -10,6 +10,8 @@
 //! - [`oidc`] — [`Authenticator`] для токенов OpenID Connect (Bearer);
 //! - [`authz`] — [`Authorizer`](tp_contracts::auth::Authorizer) поверх ACL папок (RFC 4314), групп и
 //!   делегирования отправки (Send As / Send on Behalf);
+//! - [`sharing`] — права на календари и адресные книги ([`CollectionAuthorizer`]): владелец, общий доступ,
+//!   представители, политика организации;
 //! - [`gssapi`] — Kerberos: механизм SASL GSSAPI (системная MIT Kerberos — feature `gssapi`) и
 //!   [`KerberosAuthenticator`] (принципал → учётная запись);
 //! - [`sasl`] — механизмы SASL PLAIN, LOGIN, OAUTHBEARER, XOAUTH2 (и GSSAPI) для служб smtp, imap и sieve; пароль, токен
@@ -34,6 +36,7 @@ pub mod ldap;
 pub mod oidc;
 pub mod password;
 pub mod sasl;
+pub mod sharing;
 
 pub use abuse::{AbuseConfig, AbuseGuard, Attempt};
 pub use authz::AclAuthorizer;
@@ -43,6 +46,7 @@ pub use ldap::{GroupSync, GroupSyncReport, LdapConfig, LdapDirectory};
 pub use oidc::{OidcAuthenticator, OidcConfig};
 pub use password::{AppPasswords, PasswordAuthenticator, PasswordCheck, PasswordConfig};
 pub use sasl::AuthSasl;
+pub use sharing::{CollectionAuthorizer, SharingStores};
 
 /// Группы учётной записи для `Principal::groups` (с учётом вложенности). Реализация — [`LdapDirectory`].
 #[async_trait]
