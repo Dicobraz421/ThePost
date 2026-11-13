@@ -1,21 +1,22 @@
-// Вход в консоль (SRS 5.2): одноразовый токен `thepost admin init` (META-43) или OIDC с PKCE.
+// Вход в консоль (SRS 5.2, решение 117): пароль администратора, OIDC с PKCE или — при выключенном входе по паролю —
+// одноразовый токен `thepost admin init` (META-43).
 import type { AuthProvider } from "@refinedev/core";
 
 import { API, getOrg, loadSession, request, saveSession, type Schemas, setOrg, whoami } from "../api/client";
 
-/** Способы входа узла (`GET /api/v1/session`): поставщик OIDC, если настроен. */
+/** Способы входа узла (`GET /api/v1/session`): поставщик OIDC, если настроен, и вход по паролю. */
 export type SessionInfo = Schemas["SessionInfo"];
 type Oidc = Schemas["OidcLogin"];
-export type LoginParams = { token: string } | { oidc: Oidc; callback?: boolean };
+export type LoginParams = Schemas["PasswordLogin"] | { token: string } | { oidc: Oidc; callback?: boolean };
 
 const redirectUri = () => `${location.origin}${import.meta.env.BASE_URL}login`;
 
-/** Способы входа узла; узел недоступен — вход только токеном (ошибка придёт при входе). */
+/** Способы входа узла; узел недоступен — форма пароля (ошибка придёт при входе). */
 export async function sessionInfo(): Promise<SessionInfo> {
   try {
     return (await request<SessionInfo>(`${API}/session`)).data;
   } catch {
-    return { oidc: null };
+    return { oidc: null, password: true };
   }
 }
 
@@ -31,13 +32,16 @@ async function oidcManager(p: Oidc) {
   });
 }
 
+/** Сессия Admin API по паролю или токену `admin init` (`POST /api/v1/session`). */
+async function openSession(o: { body?: Schemas["PasswordLogin"]; bearer?: string }) {
+  const { data } = await request<Schemas["AdminSession"]>(`${API}/session`, { method: "POST", ...o });
+  saveSession({ token: data.session, expires_at: data.expires_at });
+  if (!getOrg()) setOrg(data.tenant);
+}
+
 async function login(p: LoginParams) {
-  if ("token" in p) {
-    const { data } = await request<Schemas["AdminSession"]>(`${API}/session`, { method: "POST", bearer: p.token.trim() });
-    saveSession({ token: data.session, expires_at: data.expires_at });
-    if (!getOrg()) setOrg(data.tenant);
-    return;
-  }
+  if ("password" in p) return openSession({ body: { login: p.login.trim(), password: p.password } });
+  if ("token" in p) return openSession({ bearer: p.token.trim() });
   const manager = await oidcManager(p.oidc);
   if (!p.callback) return manager.signinRedirect();
   const user = await manager.signinRedirectCallback();

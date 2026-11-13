@@ -4,8 +4,9 @@
 Узел SMB — выпуск с CLI `thepost admin account` / `app-password` (APP-21; beta-20261111.3 и новее).
 
 ## Что делает
-- `--tags provision` (`stand_provision: admin`, по умолчанию): на узле SMB `thepost admin init` (повтор — 409, пропуск;
-  сессия стенда утрачена — `init --force`), `admin login`, затем `account create` и `app-password create` для
+- `--tags provision` (`stand_provision: admin`, по умолчанию): на узле SMB `thepost admin init` один раз (пароль
+  администратора — в состоянии стенда; утрачен — `init --force`), вход по паролю `admin login --password-stdin`
+  (истёкшая сессия — снова вход по паролю), затем `account create` и `app-password create` для
   `user1 … user<N>`, зондов `probe1 … probe3` и ящика `big`. Состояние — `/var/lib/thepost-stand-admin/` на узле
   (0700, файлы 0600), пароли — `/etc/thepost-stand/accounts` на генераторе (0600, `login:пароль`). В вывод Ansible
   попадают только счётчики (`created=… existing=… issued=… skipped=…`), задачи с паролями — `no_log`.

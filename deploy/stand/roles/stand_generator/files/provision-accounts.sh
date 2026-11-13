@@ -1,10 +1,11 @@
 #!/bin/bash
 # Учётные записи стенда SMB через thepost admin на узле (DEP-12, docs/INSTALL.md «Учётные записи»): сессия Admin API
-# (admin init → admin login; повтор — пропуск по 409, при утраченной сессии — init --force), затем каждой учётной
+# (admin init один раз → вход по паролю admin login; истёкшая сессия — снова вход по паролю), затем каждой учётной
 # записи — account create (существующая — 409, пропуск) и пароль приложения (app-password create). Повтор пропускает
 # учётные записи, чей пароль уже выпущен.
 # Запуск (root): provision-accounts.sh <каталог состояния> <домен> <префикс> <число> [служебные имена…]
-# Состояние (0600): <каталог>/session — сессия tps_…, <каталог>/accounts — строки login:пароль.
+# Состояние (0600): <каталог>/admin — login:пароль администратора admin init, <каталог>/session — сессия tps_…,
+# <каталог>/accounts — строки login:пароль.
 # Вывод — только счётчики: created=… existing=… issued=… skipped=… total=…; пароли не выводятся.
 set -euo pipefail
 
@@ -13,6 +14,7 @@ shift 4
 umask 077
 mkdir -p "$STATE"
 chmod 0700 "$STATE"
+ADMIN=$STATE/admin
 SESSION=$STATE/session
 ACCOUNTS=$STATE/accounts
 touch "$ACCOUNTS"
@@ -22,21 +24,27 @@ json() { python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])'
 
 TOKEN=$(cat "$SESSION" 2>/dev/null || true)
 if [ -z "$TOKEN" ] || ! admin whoami >/dev/null 2>&1; then
-  if ! out=$(thepost admin init 2>&1); then
-    case $out in
-      *409*)
-        echo "admin init: администратор уже заведён (409), сессии стенда нет — admin init --force" >&2
-        out=$(thepost admin init --force)
-        ;;
-      *)
-        echo "$out" >&2
-        exit 1
-        ;;
-    esac
+  if [ ! -s "$ADMIN" ]; then
+    # Пароля администратора в состоянии нет: admin init; уже заведён (409) — пароль утрачен, init --force.
+    if ! out=$(thepost admin init 2>&1); then
+      case $out in
+        *409*)
+          echo "admin init: администратор уже заведён (409), его пароля в состоянии стенда нет — admin init --force" >&2
+          out=$(thepost admin init --force)
+          ;;
+        *)
+          echo "$out" >&2
+          exit 1
+          ;;
+      esac
+    fi
+    login=$(sed -n 's/^Администратор заведён: \([^[:space:]]*\) .*$/\1/p' <<<"$out")
+    pw=$(sed -n 's/^Пароль .*: \([^[:space:]]*\)$/\1/p' <<<"$out")
+    [ -n "$login" ] && [ -n "$pw" ] || { echo "admin init: в выводе нет имени входа или пароля" >&2; exit 1; }
+    printf '%s:%s\n' "$login" "$pw" >"$ADMIN"
   fi
-  TOKEN=$(sed -n 's/^Токен Admin API.*: \(tpa_[^[:space:]]*\)$/\1/p' <<<"$out")
-  [ -n "$TOKEN" ] || { echo "admin init: в выводе нет токена Admin API" >&2; exit 1; }
-  TOKEN=$(admin login --json | json session)
+  IFS=: read -r login pw <"$ADMIN"
+  TOKEN=$(admin login --user "$login" --password-stdin --json <<<"$pw" | json session)
   printf '%s\n' "$TOKEN" >"$SESSION"
 fi
 

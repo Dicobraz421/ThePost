@@ -184,6 +184,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "sharing",
         include_str!("../migrations/0039_sharing.sql"),
     ),
+    (
+        40,
+        "installation admins",
+        include_str!("../migrations/0040_installation_admins.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
