@@ -16,6 +16,8 @@ import { Link } from "react-router";
 
 import type { Schemas } from "../api/client";
 import { AuditPolicyForm } from "../components/audit-policy-form";
+import { CollectionsAcl } from "../components/collection-acl";
+import { Delegates } from "../components/delegates";
 import { bytes, when } from "../components/format";
 import { PolicyForm } from "../components/policy-form";
 import { useReadOnly } from "../providers/access";
@@ -170,18 +172,24 @@ function AppPasswords({ account }: { account: string }) {
 }
 
 /**
- * Отображаемое имя и блокировка входа (`PATCH`, ADM-18): уходят только изменённые поля. У записи каталога оба поля
- * ведёт каталог — форма только для чтения.
+ * Отображаемое имя и блокировка входа (`PATCH`, ADM-18), у локальной записи — ещё псевдонимы и скрытие из книги
+ * «Организация» (ADM-42): уходят только изменённые поля. У записи каталога эти поля ведёт каталог — имя и блокировка
+ * только для чтения, псевдонимов и скрытия в форме нет (они — в сведениях карточки).
  */
 function AccountForm({ account, onSaved }: { account: Account; onSaved: () => void }) {
   const readOnly = useReadOnly("accounts");
   const catalog = !!account.external_id;
   const { mutate, mutation } = useCustomMutation<Account, HttpError, Schemas["AccountPatch"]>();
-  const initial = { display_name: account.display_name, enabled: account.enabled };
+  const initial = {
+    display_name: account.display_name,
+    enabled: account.enabled,
+    ...(catalog ? {} : { aliases: account.aliases, hidden_from_gal: account.hidden_from_gal }),
+  };
   const [form] = Form.useForm<typeof initial>();
   const values = Form.useWatch([], form) ?? initial;
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
   const changed = Object.fromEntries(
-    Object.entries(values).filter(([k, v]) => v !== undefined && v !== initial[k as keyof typeof initial]),
+    Object.entries(values).filter(([k, v]) => v !== undefined && !same(v, initial[k as keyof typeof initial])),
   ) as Schemas["AccountPatch"];
   const locked = readOnly || catalog;
   return (
@@ -207,7 +215,14 @@ function AccountForm({ account, onSaved }: { account: Account; onSaved: () => vo
         )
       }
     >
-      {catalog && <Alert type="info" showIcon style={{ marginBottom: 16 }} message="Имя и блокировку записи каталога ведёт каталог." />}
+      {catalog && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="Имя, блокировку, псевдонимы и скрытие из книги «Организация» записи каталога ведёт каталог."
+        />
+      )}
       <Form.Item
         name="display_name"
         label="Отображаемое имя"
@@ -218,6 +233,25 @@ function AccountForm({ account, onSaved }: { account: Account; onSaved: () => vo
       <Form.Item name="enabled" label="Разрешить вход" valuePropName="checked" extra="Выключено — учётная запись заблокирована.">
         <Switch />
       </Form.Item>
+      {!catalog && (
+        <>
+          <Form.Item
+            name="aliases"
+            label="Псевдонимы"
+            extra="Адреса в принятых доменах организации, не занятые другой учётной записью, группой или контактом; через запятую или пробел."
+          >
+            <Select mode="tags" tokenSeparators={[",", " "]} open={false} style={{ maxWidth: 640 }} />
+          </Form.Item>
+          <Form.Item
+            name="hidden_from_gal"
+            label="Скрыть из книги «Организация»"
+            valuePropName="checked"
+            extra="Вход и приём почты — как обычно; книга обновляется не сразу, а за период её построения."
+          >
+            <Switch />
+          </Form.Item>
+        </>
+      )}
       {!locked && (
         <Button type="primary" htmlType="submit" disabled={Object.keys(changed).length === 0} loading={mutation.isPending}>
           Сохранить
@@ -295,7 +329,10 @@ function AccountAuditPolicy({ account }: { account: string }) {
   );
 }
 
-/** Учётная запись: сведения, имя и блокировка, политика ящика, отправители, аудит ящика, пароли приложений. */
+/**
+ * Учётная запись: сведения, имя, блокировка и адреса, политика ящика, отправители, аудит ящика, представители, общий доступ к
+ * календарям и адресным книгам, пароли приложений.
+ */
 export function AccountShow() {
   const { result: account, query } = useShow<Account>();
   const { mutate, mutation } = useCustomMutation<Schemas["PolicyBody"]>();
@@ -318,6 +355,8 @@ export function AccountShow() {
           {account?.external_id ? `каталог (${account.external_id})` : "локальная запись"}
         </Descriptions.Item>
         <Descriptions.Item label="Состояние">{account && state(account)}</Descriptions.Item>
+        <Descriptions.Item label="Псевдонимы">{account?.aliases.length ? account.aliases.join(", ") : "нет"}</Descriptions.Item>
+        <Descriptions.Item label="Книга «Организация»">{account?.hidden_from_gal ? "скрыта" : "видна"}</Descriptions.Item>
         <Descriptions.Item label="Занято">{account && `${quota(account)}, писем: ${account.quota.messages}`}</Descriptions.Item>
         <Descriptions.Item label="Идентификатор">{account?.id}</Descriptions.Item>
       </Descriptions>
@@ -328,7 +367,7 @@ export function AccountShow() {
           {audit && <Link to={`/mailbox-audit?account=${encodeURIComponent(account.id)}`}>Журнал аудита ящика</Link>}
         </Space>
       )}
-      <Divider orientation="left">Имя и блокировка</Divider>
+      <Divider orientation="left">Имя, блокировка и адреса</Divider>
       {account && <AccountForm account={account} onSaved={() => void query.refetch()} />}
       <Divider orientation="left">Политика ящика</Divider>
       <PolicyForm
@@ -351,6 +390,10 @@ export function AccountShow() {
       {account && <SenderLists account={account.id} />}
       <Divider orientation="left">Аудит ящика</Divider>
       {account && <AccountAuditPolicy account={account.id} />}
+      <Divider orientation="left">Представители</Divider>
+      {account && <Delegates account={account.id} />}
+      <Divider orientation="left">Общий доступ к календарям и адресным книгам</Divider>
+      {account && <CollectionsAcl account={account.id} />}
       <Divider orientation="left">Пароли приложений</Divider>
       {account && <AppPasswords account={account.id} />}
     </Show>

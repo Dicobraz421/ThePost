@@ -82,9 +82,10 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * Изменяет локальную учётную запись: отображаемое имя и блокировка входа (`enabled: false` — вход запрещён).
-         *     Пустое тело (`{}`) — 422. У записи каталога (`external_id` задан) оба поля ведёт каталог: синхронизация
-         *     перезаписывает и имя, и признак блокировки, поэтому изменение — 409 с пояснением.
+         * Изменяет локальную учётную запись: отображаемое имя, блокировка входа (`enabled: false` — вход запрещён),
+         *     псевдонимы (целиком) и скрытие из книги «Организация». Пустое тело (`{}`) — 422. Псевдоним в домене, не принятом
+         *     организацией, или адрес, занятый учётной записью, группой или контактом, — 409. У записи каталога (`external_id`
+         *     задан) эти поля ведёт каталог: синхронизация перезаписывает их, поэтому изменение — 409 с пояснением.
          */
         patch: operations["patch_account"];
         trace?: never;
@@ -138,6 +139,102 @@ export interface paths {
         post?: never;
         /** Сбрасывает политику аудита ящика: действует политика организации. */
         delete: operations["delete_audit_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/accounts/{account}/collections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Календари, затем адресные книги учётной записи (по порядку в клиенте); книга GAL организации не входит — её
+         *     права не выдаются. Нет учётной записи — 404.
+         */
+        get: operations["list_collections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/accounts/{account}/collections/{collection}/acl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Права на календарь или адресную книгу учётной записи. Нет учётной записи или коллекции — 404. */
+        get: operations["get_acl"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/accounts/{account}/collections/{collection}/acl/{identifier}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Заменяет права субъекта на коллекцию целиком; пустые права (`{}`) отзывают запись. Субъект — имя входа, имя
+         *     группы или `anyone`; недопустимый идентификатор — 400; нет учётной записи или коллекции — 404; сверх политики
+         *     общего доступа — 409. Ответ — записи коллекции после изменения.
+         */
+        put: operations["put_acl"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/accounts/{account}/delegates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Представители учётной записи. */
+        get: operations["list_delegates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/accounts/{account}/delegates/{delegate}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Назначает представителя или заменяет его уровень. Нет учётной записи или представителя — 404; сам себе — 400;
+         *     сверх политики общего доступа — 409.
+         */
+        put: operations["put_delegate"];
+        post?: never;
+        /** Отзывает представителя; не назначен — без изменений. Нет учётной записи — 404. */
+        delete: operations["remove_delegate"];
         options?: never;
         head?: never;
         patch?: never;
@@ -364,6 +461,27 @@ export interface paths {
         /** Журнал аудита организации: записи по возрастанию `seq`, удовлетворяющие условиям; пустое условие — 400. */
         get: operations["search_audit"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/calendar-sharing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Политика общего доступа организации; не задана — по умолчанию. */
+        get: operations["get_policy"];
+        /**
+         * Задаёт политику общего доступа организации целиком. Неизвестная группа — 400. Уже выданные права не удаляются:
+         *     их ограничивает новая политика.
+         */
+        put: operations["put_policy"];
         post?: never;
         delete?: never;
         options?: never;
@@ -659,6 +777,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/orgs/{org}/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Действующие ресурсы организации по имени входа (удалённые, но ещё хранимые — среди отключённых ящиков). */
+        get: operations["list_resources"];
+        put?: never;
+        /**
+         * Создаёт ресурс: локальную учётную запись вида `resource` в принятом домене организации и правила бронирования.
+         *     Имя занято — 409; домен не принят организацией, недопустимые правила или неизвестная учётная запись или группа в
+         *     `bookers` — 400; хранилища не подключены — 503.
+         */
+        post: operations["create_resource"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/resources/{account}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Ресурс и его правила бронирования; нет или не ресурс — 404. */
+        get: operations["get_resource"];
+        put?: never;
+        post?: never;
+        /**
+         * Удаляет ресурс: снимает правила и отключает учётную запись со сроком хранения «сейчас» — окончательно её удаляет
+         *     обслуживание. Ресурс из каталога — 409 (удаляется в каталоге); нет или не ресурс — 404.
+         */
+        delete: operations["delete_resource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/resources/{account}/booking-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Задаёт правила бронирования ресурса целиком. Недопустимые правила или неизвестная учётная запись или группа в
+         *     `bookers` — 400; нет или не ресурс — 404.
+         */
+        put: operations["put_booking_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/orgs/{org}/sieve": {
         parameters: {
             query?: never;
@@ -896,14 +1077,20 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`). Без входа. */
+        /**
+         * Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`) и вход по паролю
+         *     (`admin.password_login`). Без входа.
+         */
         get: operations["session_info"];
         put?: never;
         /**
-         * Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится
-         *     первой проверкой; повтор, срок, отзыв — 401.
+         * Новая сессия Admin API. С телом `PasswordLogin` — вход администратора по паролю (решение 117): неверный пароль
+         *     или блокировка перебора — 401, нет ролей администрирования — 403, вход по паролю выключен
+         *     (`admin.password_login`) — 404. Без тела — обмен одноразового токена `admin init`
+         *     (`Authorization: Bearer tpa_…`): токен гасится первой проверкой; повтор, срок, отзыв — 401. Каждая попытка — в
+         *     журнал аудита.
          */
-        post: operations["exchange"];
+        post: operations["create_session"];
         delete?: never;
         options?: never;
         head?: never;
@@ -979,6 +1166,8 @@ export interface components {
         };
         /** @description Учётная запись. */
         AccountInfo: components["schemas"]["Policies"] & {
+            /** @description Псевдонимы — адреса, доставляемые учётной записи, кроме основного (нижний регистр, в порядке задания). */
+            aliases: string[];
             /** @description Отображаемое имя. */
             display_name: string;
             /** @description Основной домен. */
@@ -987,6 +1176,8 @@ export interface components {
             enabled: boolean;
             /** @description Идентификатор в каталоге; `null` — локальная запись. */
             external_id?: string | null;
+            /** @description Скрыта из книги «Организация» (GAL): вход и приём почты — как обычно. */
+            hidden_from_gal: boolean;
             /** @description Идентификатор. */
             id: string;
             /** @description Имя входа. */
@@ -996,10 +1187,28 @@ export interface components {
         };
         /** @description Изменение учётной записи: заданные поля заменяются, отсутствующие — без изменений; хотя бы одно поле обязательно. */
         AccountPatch: {
+            /**
+             * @description Псевдонимы целиком (заменяют прежние, `[]` — без псевдонимов; регистр не важен, повторы и основной адрес
+             *     отбрасываются): адреса в принятых доменах организации, не занятые другой учётной записью, группой рассылки или
+             *     почтовым контактом, — иначе 409. У записи каталога — 409.
+             */
+            aliases?: string[] | null;
             /** @description Отображаемое имя (непустое, одна строка); у записи каталога — 409. */
             display_name?: string | null;
             /** @description Вход разрешён; `false` — учётная запись заблокирована. У записи каталога — 409. */
             enabled?: boolean | null;
+            /**
+             * @description Скрыть из книги «Организация» (GAL); книга меняется не позже чем через `maintenance.gal_interval`. У записи
+             *     каталога — 409.
+             */
+            hidden_from_gal?: boolean | null;
+        };
+        /** @description Запись прав на коллекцию. */
+        AclEntryBody: {
+            /** @description Субъект: имя входа, имя группы или `anyone`. */
+            identifier: string;
+            /** @description Права, как выданы (без включённых младших). */
+            rights: components["schemas"]["RightsBody"];
         };
         /**
          * @description Роль администратора.
@@ -1110,6 +1319,56 @@ export interface components {
             /** @description Организация, к которой относится операция; `None` — уровень инсталляции. */
             tenant?: string | null;
         };
+        /**
+         * @description Кому разрешено бронировать ресурс: `{"type": "internal"}` — любой учётной записи организации,
+         *     `{"type": "only", "accounts": [...], "groups": [...]}` — перечисленным учётным записям и участникам групп.
+         */
+        BookersBody: {
+            /** @enum {string} */
+            type: "internal";
+        } | {
+            /** @description Учётные записи (UUID). */
+            accounts?: string[];
+            /** @description Группы (UUID), с вложенными. */
+            groups?: string[];
+            /** @enum {string} */
+            type: "only";
+        };
+        /** @description Правила бронирования ресурса; отсутствующее поле — значение по умолчанию. */
+        BookingPolicyBody: {
+            /**
+             * @description Разрешены пересекающиеся бронирования.
+             * @default false
+             */
+            allow_conflicts: boolean;
+            /**
+             * @description Подходящее приглашение принимается автоматически; иначе остаётся предварительным до решения представителя
+             *     ресурса.
+             * @default true
+             */
+            auto_accept: boolean;
+            /**
+             * @description Кому разрешено бронировать.
+             * @default {
+             *       "type": "internal"
+             *     }
+             */
+            bookers: components["schemas"]["BookersBody"];
+            /**
+             * @description Насколько вперёд можно бронировать (`180d`); `null` — без ограничения.
+             * @default 180d
+             * @example 90d
+             */
+            horizon: string | null;
+            /**
+             * @description Наибольшая длительность встречи (`4h`); `null` — без ограничения.
+             * @default 1d
+             * @example 4h
+             */
+            max_duration: string | null;
+            /** @default null */
+            working_hours: components["schemas"]["WorkingHoursBody"] | null;
+        };
         /** @description Снимок уровня кластера. */
         ClusterView: {
             /** @description Принятые домены всех организаций. */
@@ -1122,6 +1381,22 @@ export interface components {
              */
             version: number;
         };
+        /** @description Календарь или адресная книга учётной записи. */
+        CollectionInfo: {
+            /** @description Отображаемое имя. */
+            display_name: string;
+            /** @description Идентификатор (UUID). */
+            id: string;
+            /** @description Вид. */
+            kind: components["schemas"]["CollectionKindBody"];
+            /** @description Имя — сегмент URL CalDAV/CardDAV. */
+            name: string;
+        };
+        /**
+         * @description Вид коллекции.
+         * @enum {string}
+         */
+        CollectionKindBody: "calendar" | "address_book";
         /** @description Контакт без идентификатора: создание и замена целиком. */
         ContactBody: {
             /** @description Атрибуты (имя ASCII → значение). */
@@ -1156,6 +1431,31 @@ export interface components {
             /** @description Идентификатор. */
             id: string;
         };
+        /** @description Назначение представителя. */
+        DelegateBody: {
+            /** @description Уровень доступа к календарям. */
+            level: components["schemas"]["DelegateLevelBody"];
+            /** @description Отправляет приглашения и ответы от имени владельца. */
+            schedule_on_behalf?: boolean;
+        };
+        /** @description Представитель учётной записи. */
+        DelegateInfo: {
+            /** @description Учётная запись представителя (UUID). */
+            delegate: string;
+            /** @description Отображаемое имя представителя. */
+            display_name: string;
+            /** @description Уровень доступа к календарям. */
+            level: components["schemas"]["DelegateLevelBody"];
+            /** @description Имя входа представителя. */
+            login: string;
+            /** @description Отправляет приглашения и ответы от имени владельца. */
+            schedule_on_behalf: boolean;
+        };
+        /**
+         * @description Уровень доступа представителя ко всем календарям владельца.
+         * @enum {string}
+         */
+        DelegateLevelBody: "read" | "write";
         /** @description Событие журнала доставки. */
         DeliveryEntry: {
             /**
@@ -1428,6 +1728,14 @@ export interface components {
             /** @description Ограничение отправителей (по умолчанию — без ограничений). */
             senders?: components["schemas"]["SenderRestriction"];
         };
+        /** @description Новый ресурс. */
+        NewResource: {
+            booking_policy?: components["schemas"]["BookingPolicyBody"] | null;
+            /** @description Отображаемое имя («Переговорная 5.12»); нет — имя входа. */
+            display_name?: string | null;
+            /** @description Имя входа — адрес в принятом домене организации (приводится к нижнему регистру). */
+            login: string;
+        };
         /** @description Вход в консоль через поставщика OIDC: издатель из `auth.oidc`, клиент из `admin.oidc`. */
         OidcLogin: {
             /** @description Идентификатор публичного клиента консоли у поставщика. */
@@ -1443,6 +1751,16 @@ export interface components {
             default: boolean;
             /** @description Идентификатор. */
             id: string;
+        };
+        /** @description Вход администратора по паролю. */
+        PasswordLogin: {
+            /** @description Имя входа (адрес учётной записи). */
+            login: string;
+            /**
+             * Format: password
+             * @description Пароль: каталога (`auth.ldap`) или приложения, в том числе выданный `thepost admin init`.
+             */
+            password: string;
         };
         /** @description Политика уровня и действующая политика. */
         Policies: {
@@ -1539,6 +1857,10 @@ export interface components {
             /** @description Причина для уведомления отправителя (одна строка, ≤ 500 символов). */
             reason?: string | null;
         };
+        /** @description Ресурс: учётная запись и правила бронирования. */
+        ResourceInfo: components["schemas"]["AccountInfo"] & {
+            booking_policy?: components["schemas"]["BookingPolicyBody"] | null;
+        };
         /** @description Восстановленное письмо. */
         RestoredMessage: {
             /** @description Письмо. */
@@ -1553,6 +1875,37 @@ export interface components {
              * @description Новый UID в папке.
              */
             uid: number;
+        };
+        /**
+         * @description Права на коллекцию: старшее включает младшие (`admin` — все, `write` — `read`, `read` — `free_busy`);
+         *     `schedule` — отдельное. Отсутствующее поле — `false`.
+         */
+        RightsBody: {
+            /**
+             * @description Менять свойства коллекции, удалять её и выдавать права.
+             * @default false
+             */
+            admin: boolean;
+            /**
+             * @description Видеть занятость без подробностей.
+             * @default false
+             */
+            free_busy: boolean;
+            /**
+             * @description Читать объекты.
+             * @default false
+             */
+            read: boolean;
+            /**
+             * @description Планировать от имени владельца: приглашения и ответы.
+             * @default false
+             */
+            schedule: boolean;
+            /**
+             * @description Создавать, изменять и удалять объекты.
+             * @default false
+             */
+            write: boolean;
         };
         /** @description Политика домена назначения: создание или замена (шаблон — в пути). */
         RouteBody: {
@@ -1650,6 +2003,42 @@ export interface components {
         /** @description Способы входа консоли. */
         SessionInfo: {
             oidc?: components["schemas"]["OidcLogin"] | null;
+            /** @description Вход по паролю администратора включён (`POST /api/v1/session` с телом `PasswordLogin`, `admin.password_login`). */
+            password: boolean;
+        };
+        /** @description Политика общего доступа организации к календарям и адресным книгам. */
+        SharingPolicyBody: {
+            /**
+             * @description Наибольшие права субъекту вне групп политики и субъекту `anyone`.
+             * @default {
+             *       "admin": false,
+             *       "free_busy": true,
+             *       "read": true,
+             *       "schedule": false,
+             *       "write": false
+             *     }
+             */
+            max_outside: components["schemas"]["RightsBody"];
+            /**
+             * @description Кому можно выдавать права.
+             * @default {
+             *       "type": "organization"
+             *     }
+             */
+            scope: components["schemas"]["SharingScopeBody"];
+        };
+        /** @description Кому в организации можно выдавать права на свои календари и адресные книги. */
+        SharingScopeBody: {
+            /** @enum {string} */
+            type: "nobody";
+        } | {
+            /** @description Группы (UUID). */
+            groups: string[];
+            /** @enum {string} */
+            type: "groups";
+        } | {
+            /** @enum {string} */
+            type: "organization";
         };
         /** @description Доверенный источник: создание или замена (имя — в пути). */
         SourceBody: {
@@ -1863,6 +2252,11 @@ export interface components {
              */
             to?: string | null;
         };
+        /**
+         * @description День недели.
+         * @enum {string}
+         */
+        Weekday: "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday";
         /** @description Текущий администратор. */
         WhoAmI: {
             /** @description Учётная запись. */
@@ -1873,6 +2267,26 @@ export interface components {
             roles: components["schemas"]["AdminRole"][];
             /** @description Организация. */
             tenant: string;
+        };
+        /** @description Рабочее время ресурса в его часовом поясе: вне его приглашения отклоняются. */
+        WorkingHoursBody: {
+            /** @description Рабочие дни (непусто). */
+            days: components["schemas"]["Weekday"][];
+            /**
+             * @description Начало рабочего дня, `ЧЧ:ММ`.
+             * @example 09:00
+             */
+            from: string;
+            /**
+             * @description Часовой пояс IANA.
+             * @example Europe/Moscow
+             */
+            timezone: string;
+            /**
+             * @description Конец рабочего дня, `ЧЧ:ММ`, позже начала.
+             * @example 18:00
+             */
+            to: string;
         };
         /** @description Новая версия снимка после записи. */
         Written: {
@@ -2137,6 +2551,14 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
         };
     };
     list_app_passwords: {
@@ -2353,6 +2775,294 @@ export interface operations {
                 content?: never;
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_collections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CollectionInfo"][];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_acl: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Календарь или адресная книга (UUID) */
+                collection: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AclEntryBody"][];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_acl: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Календарь или адресная книга (UUID) */
+                collection: string;
+                /** @description Субъект: имя входа, имя группы или `anyone` */
+                identifier: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RightsBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AclEntryBody"][];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_delegates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DelegateInfo"][];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_delegate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Учётная запись представителя (UUID) */
+                delegate: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DelegateBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DelegateInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    remove_delegate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Учётная запись представителя (UUID) */
+                delegate: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3114,6 +3824,94 @@ export interface operations {
                 };
             };
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharingPolicyBody"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharingPolicyBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharingPolicyBody"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4136,6 +4934,232 @@ export interface operations {
             };
         };
     };
+    list_resources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceInfo"][];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create_resource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewResource"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_resource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Ресурс (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceInfo"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_resource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Ресурс (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_booking_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Ресурс (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BookingPolicyBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BookingPolicyBody"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     org_script: {
         parameters: {
             query?: never;
@@ -5071,14 +6095,19 @@ export interface operations {
             };
         };
     };
-    exchange: {
+    create_session: {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description Вход по паролю; без тела — обмен токена `admin init` (`Authorization: Bearer tpa_…`) */
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["PasswordLogin"] | null;
+            };
+        };
         responses: {
             201: {
                 headers: {
@@ -5088,7 +6117,34 @@ export interface operations {
                     "application/json": components["schemas"]["AdminSession"];
                 };
             };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description неверный пароль или токен, блокировка перебора */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description у учётной записи нет ролей администрирования */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description вход по паролю выключен (`admin.password_login`) */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

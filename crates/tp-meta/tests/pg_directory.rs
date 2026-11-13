@@ -1,18 +1,21 @@
 //! META-65: каталог `Directory` поверх учётных записей, групп и оргструктуры PostgreSQL — книга «Организация» узла
 //! без LDAP. Учётная запись, заведённая как в Admin API (`AccountStore::upsert`), видна в `accounts_since` (скрытая из
 //! книги — с признаком `hidden_from_gal`, CTR-83); группа, скрытая из GAL, — нет; курсор неизменного каталога даёт
-//! пустую порцию, изменённого — `Conflict`.
+//! пустую порцию, изменённого — `Conflict`. META-80: почтовый контакт, заведённый как в Admin API
+//! (`ContactStore::put_contact`), виден в `contacts_since` и в участниках своих групп; скрытый из GAL — нет.
 
 mod common;
 
 use std::collections::BTreeMap;
 
 use tp_contracts::Error;
-use tp_contracts::addressbook::{OrgAttributes, OrgStore, OrgUnit};
-use tp_contracts::auth::{DirAccount, DirChange, DirCursor, DirGroup, DirPage, Directory};
+use tp_contracts::addressbook::{ContactStore, MailContact, OrgAttributes, OrgStore, OrgUnit};
+use tp_contracts::auth::{
+    DirAccount, DirChange, DirContact, DirCursor, DirGroup, DirPage, Directory,
+};
 use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
 use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
-use tp_contracts::{AccountId, DomainId, GroupId, OrgUnitId, TenantId};
+use tp_contracts::{AccountId, ContactId, DomainId, GroupId, OrgUnitId, TenantId};
 use tp_meta::PgMeta;
 
 async fn create(
@@ -351,4 +354,131 @@ async fn accounts_groups_and_cursors() {
         (units[0].external_id.as_str(), units[0].name.as_str()),
         (unit.to_string().as_str(), "Бухгалтерия")
     );
+}
+
+async fn all_contacts(meta: &PgMeta, tenant: TenantId) -> (Vec<DirContact>, DirCursor) {
+    let page = meta
+        .contacts_since(tenant, None, 100)
+        .await
+        .expect("contacts_since");
+    assert!(!page.has_more);
+    let next = page.next.clone();
+    (upserts(page), next)
+}
+
+fn contact(
+    tenant: TenantId,
+    name: &str,
+    email: &str,
+    groups: Vec<GroupId>,
+    hidden: bool,
+) -> MailContact {
+    MailContact {
+        id: ContactId::new(),
+        tenant,
+        display_name: name.to_owned(),
+        email: email.to_owned(),
+        external_id: None,
+        attributes: BTreeMap::from([("company".to_owned(), "Партнёр".to_owned())]),
+        groups,
+        hidden_from_gal: hidden,
+    }
+}
+
+#[tokio::test]
+async fn contacts_in_directory() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let tenant = common::tenant(meta.pool()).await;
+    let foreign = common::tenant(meta.pool()).await;
+    let (domain, name) = common::domain(meta.pool(), tenant).await;
+    meta.put_contact(contact(
+        foreign,
+        "Чужой",
+        "stranger@partner.example",
+        Vec::new(),
+        false,
+    ))
+    .await
+    .expect("put_contact");
+
+    let (none, empty) = all_contacts(&meta, tenant).await;
+    assert!(none.is_empty());
+
+    let ivan = create(&meta, tenant, domain, &format!("ivan@{name}"), &[]).await;
+    let staff = group(
+        tenant,
+        "Сотрудники",
+        &format!("staff@{name}"),
+        vec![GroupMember::Account(ivan)],
+        false,
+    );
+    meta.put(staff.clone()).await.expect("put");
+    let partner = contact(
+        tenant,
+        "Партнёр",
+        "p@partner.example",
+        vec![staff.id],
+        false,
+    );
+    let hidden = contact(
+        tenant,
+        "Скрытый партнёр",
+        "h@partner.example",
+        vec![staff.id],
+        true,
+    );
+    for c in [&partner, &hidden] {
+        meta.put_contact(c.clone()).await.expect("put_contact");
+    }
+
+    // Новый контакт — новая версия; в каталоге только видимый, чужой организации нет.
+    assert!(matches!(
+        meta.contacts_since(tenant, Some(&empty), 100).await,
+        Err(Error::Conflict)
+    ));
+    let (contacts, cursor) = all_contacts(&meta, tenant).await;
+    assert_eq!(
+        contacts,
+        [DirContact {
+            external_id: partner.id.to_string(),
+            display_name: "Партнёр".to_owned(),
+            email: "p@partner.example".to_owned(),
+            attributes: partner.attributes.clone(),
+        }]
+    );
+    let same = meta
+        .contacts_since(tenant, Some(&cursor), 100)
+        .await
+        .expect("contacts_since");
+    assert!(same.changes.is_empty() && !same.has_more);
+    assert_eq!(same.next, cursor);
+
+    // Состав группы: учётные записи, затем видимые контакты; атрибуты контактов — в атрибутах книги.
+    let (groups, _) = all_groups(&meta, tenant).await;
+    assert_eq!(
+        groups[0].members,
+        vec![ivan.to_string(), partner.id.to_string()]
+    );
+    assert_eq!(
+        meta.gal_attributes(tenant).await.expect("gal_attributes"),
+        ["company"]
+    );
+
+    // Скрытие из GAL — новая версия, контакта в каталоге и в группе больше нет.
+    meta.put_contact(MailContact {
+        hidden_from_gal: true,
+        ..partner.clone()
+    })
+    .await
+    .expect("hide");
+    assert!(matches!(
+        meta.contacts_since(tenant, Some(&cursor), 100).await,
+        Err(Error::Conflict)
+    ));
+    let (contacts, _) = all_contacts(&meta, tenant).await;
+    assert!(contacts.is_empty(), "{contacts:?}");
+    let (groups, _) = all_groups(&meta, tenant).await;
+    assert_eq!(groups[0].members, vec![ivan.to_string()]);
 }

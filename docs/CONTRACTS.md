@@ -92,6 +92,9 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; обязателен — CTR-72),
   `list(tenant, prefix, after, limit)` (CTR-44, список Admin API: по возрастанию `lower(login)` в порядке сравнения строк хранилища,
   префикс и курсор `after` — в нижнем регистре, строго больше; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
+  Роль администратора установки — явная запись: `grant_installation_admin(tenant, id)` (повтор — не ошибка, нет
+  учётной записи — `NotFound`, удаляется с учётной записью) и `is_installation_admin(tenant, id) -> bool`; ставит
+  `thepost admin init`, читает вход администратора по паролю (решение 117).
   Псевдонимы (CTR-53) — поле `Account::aliases` (нижний регистр, без повторов, основного адреса и catch-all `@domain`; хранится с
   учётной записью, задаётся `AccountUpsert::aliases` — псевдонимы каталога `DirAlias` с целью — этой учётной записью, заменяют прежние;
   правило хранения — `meta::account_aliases(primary, aliases)`). Адреса, на которые учётной записи доставляется почта, —
@@ -1127,6 +1130,11 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   По сравнению с карточкой: реализации в той же волне (правило владельца «старое рядом с новым не оставлять»); скрытая учётная запись
   остаётся в `accounts_since` с признаком, а не пропадает из выгрузки — как у LDAP (AUTH-16): из книги её убирает построение GAL
   (DAV-27), ссылки `DirOrg::manager` на неё остаются. `PATCH` признака в Admin API и консоль — отдельные волны.
+- 2026-11-14 — ADM-41 (x/admin-27, решение 117, решение владельца 14.11 «Переделать роль»): `AccountStore::grant_installation_admin`,
+  `is_installation_admin` — роль администратора установки явной записью вместо признака «действующий пароль приложения с подписью
+  `thepost admin init`». Без реализации по умолчанию: `PgMeta` (таблица `installation_admins`, миграция 0040 переносит роль учётной
+  записи `admin init` по прежнему признаку), `MemMetadata`; набор `suite::account_installation_admin`. Несовместимо: новые
+  обязательные методы `AccountStore`.
 - 2026-11-13 — CTR-84 (волна contracts-56): `sharing::SharingAuthorizer` — проверка прав на коллекции для протоколов (`rights`, `check`,
   `shared_with`, `delegations`, `check_grant`, `check_delegate`), все методы обязательные. Новый трейт, а не расширение `Authorizer`: у
   папок и коллекций разные хранилища и реализации, CalDAV и CardDAV права на папки не нужны. `tp_auth::CollectionAuthorizer` реализует

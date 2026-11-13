@@ -406,7 +406,7 @@ impl Services {
             store: self.store.clone(),
             accounts: Arc::new(self.meta.clone()),
             mailboxes: Arc::new(self.meta.clone()),
-            directory: self.directory.clone(),
+            directory: Some(self.org_directory()),
             quota: Some(Arc::new(self.meta.clone())),
             outbound: Some(self.queue.clone()),
             hooks: self.hooks.clone(),
@@ -613,6 +613,15 @@ impl Services {
             .route("/.well-known/carddav", axum::routing::any(context)))
     }
 
+    /// Каталог организации — один, по конфигурации: с секцией `auth.ldap` — LDAP, без неё — учётные записи и группы
+    /// PostgreSQL (`impl Directory for PgMeta`, META-65). Из него строятся книга «Организация» ([`Self::gal`]) и
+    /// снимок адресов доставки SMTP (адреса и псевдонимы учётных записей, ADM-42).
+    fn org_directory(&self) -> Arc<dyn Directory> {
+        self.directory
+            .clone()
+            .unwrap_or_else(|| Arc::new(self.meta.clone()) as Arc<dyn Directory>)
+    }
+
     /// Заполнение глобальной адресной книги «Организация» (APP-49, решение 72) для роли maintenance: учётные записи
     /// и группы каталога организации, кроме скрытых из адресной книги (группы — по признаку в `PgMeta`), — в
     /// хранилище `PgMeta`, откуда её читают CardDAV и JMAP Contacts. Каталог один, по конфигурации: с секцией
@@ -626,13 +635,9 @@ impl Services {
         holder: String,
         interval: std::time::Duration,
     ) -> crate::gal::GalSync {
-        let directory = self
-            .directory
-            .clone()
-            .unwrap_or_else(|| Arc::new(self.meta.clone()) as Arc<dyn Directory>);
         crate::gal::GalSync::new(
             tp_dav::GalDeps {
-                directory,
+                directory: self.org_directory(),
                 groups: Some(Arc::new(self.meta.clone())),
             },
             Arc::new(self.meta.clone()),

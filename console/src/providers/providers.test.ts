@@ -18,10 +18,29 @@ afterEach(async () => {
 
 const signIn = async () => {
   stubApi({ "POST /api/v1/session": { status: 201, body: session() } });
-  await authProvider.login({ token: "tpa_once" });
+  await authProvider.login({ login: "admin@example.org", password: "s3cret" });
 };
 
-test("вход по токену: обмен на сессию, организация администратора, выход", async () => {
+test("вход по паролю: тело PasswordLogin без токена, сессия, организация администратора", async () => {
+  const calls = stubApi({ "POST /api/v1/session": { status: 201, body: session() } });
+  expect(await authProvider.login({ login: " admin@example.org ", password: "s3cret" })).toMatchObject({
+    success: true,
+    redirectTo: "/",
+  });
+  expect(calls[0]).toMatchObject({ method: "POST", path: "/api/v1/session" });
+  expect(calls[0].auth).toBeFalsy();
+  expect(calls[0].body).toEqual({ login: "admin@example.org", password: "s3cret" });
+  expect(loadSession()?.token).toBe("tps_test");
+  expect(localStorage.getItem("thepost.org")).toBe(ORG);
+
+  stubApi({ "POST /api/v1/session": { status: 401, body: { status: 401, title: "Unauthorized" } } });
+  expect(await authProvider.login({ login: "admin@example.org", password: "wrong" })).toMatchObject({
+    success: false,
+    error: { message: "Unauthorized" },
+  });
+});
+
+test("вход по токену (вход по паролю выключен): обмен на сессию, выход", async () => {
   const calls = stubApi({ "POST /api/v1/session": { status: 201, body: session() } });
   expect(await authProvider.login({ token: " tpa_once " })).toMatchObject({ success: true, redirectTo: "/" });
   expect(calls[0]).toMatchObject({ method: "POST", path: "/api/v1/session", auth: "Bearer tpa_once" });
@@ -53,15 +72,15 @@ test("отказ во входе — ошибка с текстом API; ист�
   expect(await authProvider.onError({ statusCode: 409 })).toEqual({});
 });
 
-test("поставщик OIDC — из GET /api/v1/session (SessionInfo); не настроен или узел недоступен — только токен", async () => {
+test("способы входа — из GET /api/v1/session (SessionInfo); узел недоступен — вход по паролю", async () => {
   const oidc = { issuer: "https://idp.example.org", client_id: "thepost-console", scope: "openid profile" };
-  const calls = stubApi({ "GET /api/v1/session": { body: { oidc } } });
-  expect(await sessionInfo()).toEqual({ oidc });
+  const calls = stubApi({ "GET /api/v1/session": { body: { oidc, password: false } } });
+  expect(await sessionInfo()).toEqual({ oidc, password: false });
   expect(calls[0]).toMatchObject({ method: "GET", path: "/api/v1/session" });
-  stubApi({ "GET /api/v1/session": { body: { oidc: null } } });
-  expect(await sessionInfo()).toEqual({ oidc: null });
+  stubApi({ "GET /api/v1/session": { body: { oidc: null, password: true } } });
+  expect(await sessionInfo()).toEqual({ oidc: null, password: true });
   stubApi({ "GET /api/v1/session": { status: 503, body: { status: 503, title: "Service Unavailable" } } });
-  expect(await sessionInfo()).toEqual({ oidc: null });
+  expect(await sessionInfo()).toEqual({ oidc: null, password: true });
 });
 
 const json = { "Content-Type": "application/json" };
@@ -96,7 +115,7 @@ test("config.json: нет файла, страница вместо него и�
   for (const reply of replies) {
     stubApi({ [`GET ${CONFIG}`]: reply });
     await loadConfig();
-    const calls = stubApi({ "GET /api/v1/session": { body: { oidc: null } } });
+    const calls = stubApi({ "GET /api/v1/session": { body: { oidc: null, password: true } } });
     await sessionInfo();
     expect(calls[0].path).toBe("/api/v1/session");
   }

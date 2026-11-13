@@ -26,9 +26,10 @@ use tp_testkit::{
     MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies,
     MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
 };
-use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
+use tp_testkit::{MemAddressBook, MemDav, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
+use crate::sharing::SharingStores;
 use crate::sieve::ScriptError;
 
 /// Издатель токенов OIDC тестов (`Deps::oidc_issuer`).
@@ -177,6 +178,16 @@ impl AccountStore for CountedAccounts {
         self.calls.push("remove_disabled");
         self.inner.remove_disabled(tenant, id).await
     }
+
+    async fn grant_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        self.calls.push("grant_installation_admin");
+        self.inner.grant_installation_admin(tenant, id).await
+    }
+
+    async fn is_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<bool> {
+        self.calls.push("is_installation_admin");
+        self.inner.is_installation_admin(tenant, id).await
+    }
 }
 
 /// Хранилища в памяти: метаданные, квоты, почтовое хранилище.
@@ -197,6 +208,8 @@ pub struct Stores {
     pub senders: MemSenderLists,
     pub mailbox_audit: MemMailboxAudit,
     pub sync_gate: MemSyncGate,
+    /// Календари и адресные книги, права на коллекции.
+    pub dav: MemDav,
 }
 
 impl Stores {
@@ -233,6 +246,18 @@ impl Stores {
             senders: MemSenderLists::new(),
             mailbox_audit: MemMailboxAudit::new(),
             sync_gate: MemSyncGate::new(),
+            dav: MemDav::new(),
+        }
+    }
+
+    /// Хранилища общего доступа, представителей и ресурсов (`Admin::with_sharing`).
+    pub fn sharing(&self) -> SharingStores {
+        SharingStores {
+            acl: Arc::new(self.dav.clone()),
+            delegates: Arc::new(self.meta.clone()),
+            resources: Arc::new(self.meta.clone()),
+            policy: Arc::new(self.meta.clone()),
+            collections: Arc::new(self.dav.clone()),
         }
     }
 
@@ -306,6 +331,8 @@ pub struct Env {
     pub addressbook: MemAddressBook,
     pub mailbox_audit: MemMailboxAudit,
     pub sync_gate: MemSyncGate,
+    /// Календари и адресные книги, права на коллекции (`Admin::with_sharing`).
+    pub dav: MemDav,
     pub admin: Arc<Admin>,
     pub router: Router,
     pub other_tenant: TenantId,
@@ -376,16 +403,21 @@ impl Env {
 
     /// Без настроек транспорта (маршруты транспорта — 503).
     pub fn without_transport() -> Self {
-        Self::build(config(), Vec::new(), false, true)
+        Self::build(config(), Vec::new(), false, true, true)
     }
 
-    /// Без локального входа (`admin init` и обмен — 503).
+    /// Без локального входа (`admin init`, вход по паролю и обмен — 503).
     pub fn without_local() -> Self {
-        Self::build(config(), Vec::new(), true, false)
+        Self::build(config(), Vec::new(), true, false, true)
+    }
+
+    /// Без общего доступа, представителей и ресурсов (их маршруты — 503).
+    pub fn without_sharing() -> Self {
+        Self::build(config(), Vec::new(), true, true, false)
     }
 
     pub fn with(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>) -> Self {
-        Self::build(cfg, modules, true, true)
+        Self::build(cfg, modules, true, true, true)
     }
 
     fn build(
@@ -393,6 +425,7 @@ impl Env {
         modules: Vec<Arc<dyn AdminRoutes>>,
         with_transport: bool,
         with_local: bool,
+        with_sharing: bool,
     ) -> Self {
         let auth = FakeAuthenticator::default();
         let other_tenant = TenantId::new();
@@ -427,6 +460,11 @@ impl Env {
         } else {
             admin
         };
+        let admin = if with_sharing {
+            admin.with_sharing(stores.sharing())
+        } else {
+            admin
+        };
         let sieve = MemSieve::new();
         let held_blobs = MemBlobStore::new(Arc::new(SystemClock));
         let admin = Arc::new(
@@ -448,6 +486,7 @@ impl Env {
             addressbook,
             mailbox_audit,
             sync_gate,
+            dav,
             ..
         } = stores;
         Self {
@@ -470,6 +509,7 @@ impl Env {
             addressbook,
             mailbox_audit,
             sync_gate,
+            dav,
             router: admin.clone().router(),
             admin,
             other_tenant,

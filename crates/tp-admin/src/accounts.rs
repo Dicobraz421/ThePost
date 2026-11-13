@@ -8,8 +8,10 @@
 //!   имени входа, фильтр по префиксу; продолжение — заголовок `Link` с `rel="next"`, RFC 8288), чтение с
 //!   использованием квоты и только локальные атрибуты — политика ящика (квота, срок корзины, лимиты отправки);
 //!   без каталога (SMB, решение #193) — создание локальной учётной записи в принятом домене организации (пароль — пароль приложения);
-//!   изменение (`PATCH`): отображаемое имя и блокировка входа (`enabled`) — только у локальных записей, у записей
-//!   каталога оба поля ведёт каталог (409);
+//!   изменение (`PATCH`): отображаемое имя, блокировка входа (`enabled`), псевдонимы (`aliases`) и скрытие из книги
+//!   «Организация» (`hidden_from_gal`) — только у локальных записей, у записей каталога эти поля ведёт каталог (409);
+//!   псевдоним — адрес в принятом домене организации, не занятый другой учётной записью, группой рассылки или
+//!   почтовым контактом (иначе 409; SRS 4.1, 4.5);
 //! - правило `trash.purge` (`mode`, `user_can_choose`) — поле политики уровня; выбор пользователя и действующее
 //!   значение ящика — [`crate::retention`];
 //! - политика уровня задаётся целиком (`PUT`), поле `null` — не задано на уровне; действующая политика
@@ -27,7 +29,9 @@ use axum::routing::{get, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_contracts::config::duration;
-use tp_contracts::meta::{Account, AccountKind, AccountUpsert, Policy, PolicyTarget};
+use tp_contracts::meta::{
+    Account, AccountKind, AccountUpsert, AddressTarget, Policy, PolicyTarget,
+};
 use tp_contracts::retention::TrashPurgeRule;
 use tp_contracts::transport::normalize_domain;
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
@@ -161,6 +165,10 @@ pub struct AccountInfo {
     pub external_id: Option<String>,
     /// Вход разрешён.
     pub enabled: bool,
+    /// Псевдонимы — адреса, доставляемые учётной записи, кроме основного (нижний регистр, в порядке задания).
+    pub aliases: Vec<String>,
+    /// Скрыта из книги «Организация» (GAL): вход и приём почты — как обычно.
+    pub hidden_from_gal: bool,
     /// Квота.
     pub quota: QuotaInfo,
     /// Политики ящика.
@@ -189,6 +197,15 @@ pub struct AccountPatch {
     /// Вход разрешён; `false` — учётная запись заблокирована. У записи каталога — 409.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Псевдонимы целиком (заменяют прежние, `[]` — без псевдонимов; регистр не важен, повторы и основной адрес
+    /// отбрасываются): адреса в принятых доменах организации, не занятые другой учётной записью, группой рассылки или
+    /// почтовым контактом, — иначе 409. У записи каталога — 409.
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
+    /// Скрыть из книги «Организация» (GAL); книга меняется не позже чем через `maintenance.gal_interval`. У записи
+    /// каталога — 409.
+    #[serde(default)]
+    pub hidden_from_gal: Option<bool>,
 }
 
 /// Поиск по имени входа или страница списка учётных записей.
@@ -443,7 +460,28 @@ async fn create_account(
     Path(org): Path<TenantId>,
     Json(body): Json<NewAccount>,
 ) -> ApiResult<(StatusCode, Json<AccountInfo>)> {
-    let (login, domain) = split_login(&body.login)?;
+    let acc = create_local(
+        &a,
+        org,
+        &body.login,
+        body.display_name.as_deref(),
+        AccountKind::User,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(account_info(&a, acc).await?)))
+}
+
+/// Создаёт локальную учётную запись вида `kind` в принятом домене организации (`POST …/accounts`, ресурсы —
+/// [`crate::resources`]). Не адрес — `Invalid`; домен не принят организацией — `Invalid` с подсказкой; имя занято —
+/// `Conflict`; настройки транспорта не подключены — `Unavailable`.
+pub(crate) async fn create_local(
+    a: &Admin,
+    org: TenantId,
+    login: &str,
+    display_name: Option<&str>,
+    kind: AccountKind,
+) -> Result<Account> {
+    let (login, domain) = split_login(login)?;
     let t = a.transport.as_deref().ok_or(Error::UNAVAILABLE)?;
     let snap = t.cluster().await?;
     let d = snap
@@ -454,33 +492,29 @@ async fn create_account(
                 "домен {domain} не принят организацией: сначала POST /api/v1/orgs/{org}/transport/domains"
             ))
         })?;
-    if a.d.accounts.by_login(org, &login).await?.is_some() {
-        return Err(Error::Conflict.into());
+    if address_holder(a, org, &login, None).await?.is_some() {
+        return Err(Error::Conflict);
     }
-    let display_name = body
-        .display_name
-        .as_deref()
+    let display_name = display_name
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .unwrap_or(&login)
         .to_owned();
-    let acc =
-        a.d.accounts
-            .upsert(
-                org,
-                AccountUpsert {
-                    domain: d.id,
-                    login,
-                    display_name,
-                    external_id: None,
-                    enabled: true,
-                    aliases: Vec::new(),
-                    kind: AccountKind::User,
-                    hidden_from_gal: false,
-                },
-            )
-            .await?;
-    Ok((StatusCode::CREATED, Json(account_info(&a, acc).await?)))
+    a.d.accounts
+        .upsert(
+            org,
+            AccountUpsert {
+                domain: d.id,
+                login,
+                display_name,
+                external_id: None,
+                enabled: true,
+                aliases: Vec::new(),
+                kind,
+                hidden_from_gal: false,
+            },
+        )
+        .await
 }
 
 pub(crate) async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo> {
@@ -504,6 +538,8 @@ pub(crate) async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo>
         display_name: acc.display_name,
         external_id: acc.external_id,
         enabled: acc.enabled,
+        aliases: acc.aliases,
+        hidden_from_gal: acc.hidden_from_gal,
         quota: QuotaInfo {
             used_bytes: q.used_bytes,
             messages: q.messages,
@@ -525,32 +561,107 @@ async fn get_account(
     Ok(Json(account_info(&a, acc).await?))
 }
 
-/// Изменяет локальную учётную запись: отображаемое имя и блокировка входа (`enabled: false` — вход запрещён).
-/// Пустое тело (`{}`) — 422. У записи каталога (`external_id` задан) оба поля ведёт каталог: синхронизация
-/// перезаписывает и имя, и признак блокировки, поэтому изменение — 409 с пояснением.
+/// Кто, кроме учётной записи `except`, занимает адрес `address` организации `org`: учётная запись (основной адрес
+/// или псевдоним), группа рассылки или почтовый контакт — пояснение для ответа 409; адрес свободен — `None`.
+pub(crate) async fn address_holder(
+    a: &Admin,
+    org: TenantId,
+    address: &str,
+    except: Option<AccountId>,
+) -> Result<Option<String>> {
+    match a.d.accounts.by_address(org, address).await? {
+        Some(AddressTarget::Account(x)) if Some(x.id) != except => {
+            return Ok(Some(format!("учётная запись {}", x.login)));
+        }
+        Some(AddressTarget::Group(g)) => {
+            return Ok(Some(format!("группа рассылки «{}»", g.name)));
+        }
+        _ => {}
+    }
+    if let Some(g) = a.d.groups.by_address(org, address).await? {
+        return Ok(Some(format!("группа рассылки «{}»", g.name)));
+    }
+    Ok(a.d
+        .contacts
+        .contact_by_address(org, address)
+        .await?
+        .map(|c| format!("почтовый контакт «{}»", c.display_name)))
+}
+
+/// Псевдонимы учётной записи `acc` из `PATCH`: адреса в нижнем регистре без повторов и основного адреса, в порядке
+/// задания. Не адрес — 400; домен не принят организацией или адрес занят ([`address_holder`]) — 409 с пояснением;
+/// настройки транспорта не подключены — 503.
+async fn check_aliases(
+    a: &Admin,
+    acc: &Account,
+    list: Vec<String>,
+) -> std::result::Result<Vec<String>, Refused> {
+    let conflict = |detail: String| Refused::Problem(StatusCode::CONFLICT, detail);
+    let own = acc.login.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    if list.is_empty() {
+        return Ok(out);
+    }
+    let t = a.transport.as_deref().ok_or(Error::UNAVAILABLE)?;
+    let snap = t.cluster().await?;
+    for raw in list {
+        let (alias, domain) = split_login(&raw)?;
+        if alias == own || out.contains(&alias) {
+            continue;
+        }
+        if snap
+            .domain(&domain)
+            .filter(|d| d.tenant == acc.tenant)
+            .is_none()
+        {
+            return Err(conflict(format!(
+                "домен псевдонима {alias} не принят организацией: псевдоним — адрес в домене организации"
+            )));
+        }
+        if let Some(holder) = address_holder(a, acc.tenant, &alias, Some(acc.id)).await? {
+            return Err(conflict(format!("адрес {alias} уже занят: {holder}")));
+        }
+        out.push(alias);
+    }
+    Ok(out)
+}
+
+/// Изменяет локальную учётную запись: отображаемое имя, блокировка входа (`enabled: false` — вход запрещён),
+/// псевдонимы (целиком) и скрытие из книги «Организация». Пустое тело (`{}`) — 422. Псевдоним в домене, не принятом
+/// организацией, или адрес, занятый учётной записью, группой или контактом, — 409. У записи каталога (`external_id`
+/// задан) эти поля ведёт каталог: синхронизация перезаписывает их, поэтому изменение — 409 с пояснением.
 #[utoipa::path(patch, path = "/api/v1/orgs/{org}/accounts/{account}", tag = "accounts",
     params(("org" = String, Path, description = "Организация (UUID)"), ("account" = String, Path, description = "Учётная запись (UUID)")),
     request_body = AccountPatch,
     responses((status = 200, body = AccountInfo), (status = 400, body = Problem), (status = 404, body = Problem),
-        (status = 409, body = Problem), (status = 422, body = Problem)))]
+        (status = 409, body = Problem), (status = 422, body = Problem), (status = 503, body = Problem)))]
 async fn patch_account(
     State(a): State<Arc<Admin>>,
     Path((org, id)): Path<(TenantId, AccountId)>,
     Json(p): Json<AccountPatch>,
 ) -> std::result::Result<Json<AccountInfo>, Refused> {
-    if p.display_name.is_none() && p.enabled.is_none() {
+    if p.display_name.is_none()
+        && p.enabled.is_none()
+        && p.aliases.is_none()
+        && p.hidden_from_gal.is_none()
+    {
         return Err(Refused::Problem(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "нужно хотя бы одно поле: display_name, enabled".to_owned(),
+            "нужно хотя бы одно поле: display_name, enabled, aliases, hidden_from_gal".to_owned(),
         ));
     }
     let acc = account(&a, org, id).await?;
     if acc.external_id.is_some() {
         let detail = if p.display_name.is_some() {
             "отображаемое имя записи каталога ведёт каталог: измените его в каталоге"
-        } else {
+        } else if p.enabled.is_some() {
             "признак блокировки записи каталога перезаписывает синхронизация каталога: \
              заблокируйте учётную запись в каталоге"
+        } else if p.aliases.is_some() {
+            "псевдонимы записи каталога перезаписывает синхронизация каталога: задайте адреса в каталоге"
+        } else {
+            "скрытие записи каталога из книги «Организация» перезаписывает синхронизация каталога: \
+             скройте её в каталоге"
         };
         return Err(Refused::Problem(StatusCode::CONFLICT, detail.to_owned()));
     }
@@ -561,7 +672,11 @@ async fn patch_account(
             );
         }
         Some(n) => n.to_owned(),
-        None => acc.display_name,
+        None => acc.display_name.clone(),
+    };
+    let aliases = match p.aliases {
+        Some(list) => check_aliases(&a, &acc, list).await?,
+        None => acc.aliases,
     };
     let acc =
         a.d.accounts
@@ -573,9 +688,9 @@ async fn patch_account(
                     display_name,
                     external_id: None,
                     enabled: p.enabled.unwrap_or(acc.enabled),
-                    aliases: acc.aliases,
+                    aliases,
                     kind: acc.kind,
-                    hidden_from_gal: acc.hidden_from_gal,
+                    hidden_from_gal: p.hidden_from_gal.unwrap_or(acc.hidden_from_gal),
                 },
             )
             .await?;
@@ -1273,6 +1388,193 @@ mod tests {
         let (_, _, spec) = env.call("GET", "/api/openapi.json", None, None).await;
         let op = &spec["paths"]["/api/v1/orgs/{org}/accounts/{account}"]["patch"];
         assert_eq!(op["operationId"], "patch_account");
+    }
+
+    /// Приёмка ADM-42: псевдонимы и скрытие из книги «Организация» локальной записи; домен не принят, адрес занят
+    /// учётной записью, группой или контактом и запись каталога — 409; не адрес — 400; без транспорта — 503.
+    #[tokio::test]
+    async fn patch_aliases_and_gal() {
+        use tp_contracts::addressbook::{ContactStore, MailContact};
+        use tp_contracts::groups::{DistributionGroup, GroupStore, SenderRestriction};
+        use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
+        use tp_contracts::transport::{AcceptedDomain, DomainKind, TransportStore};
+
+        let env = Env::new();
+        let c = env.transport.cluster().await.expect("cluster");
+        let d = AcceptedDomain {
+            id: tp_contracts::DomainId::new(),
+            tenant: TenantId::DEFAULT,
+            name: "example.org".into(),
+            kind: DomainKind::Authoritative,
+        };
+        env.transport
+            .put_domain(c.version, &d)
+            .await
+            .expect("domain");
+        let scope = env.account("user@example.org").await;
+        env.account("bob@example.org").await;
+        let one = format!("{}/accounts/{}", org(), scope.account);
+        let patch = |body: Value| {
+            let env = &env;
+            let one = one.clone();
+            async move { env.call("PATCH", &one, Some("org"), Some(body)).await }
+        };
+
+        // Регистр, повторы и основной адрес отбрасываются; порядок — как задан.
+        let body = json!({"aliases": ["Anna@Example.org", "anna@example.org", "USER@example.org", "a.p@example.org"]});
+        let (s, _, b) = patch(body).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["aliases"], json!(["anna@example.org", "a.p@example.org"]));
+        assert_eq!(b["hidden_from_gal"], false);
+        let (s, _, b) = patch(json!({"hidden_from_gal": true})).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let (_, _, b) = env.call("GET", &one, Some("org"), None).await;
+        assert_eq!(
+            (&b["aliases"], &b["hidden_from_gal"], &b["enabled"]),
+            (
+                &json!(["anna@example.org", "a.p@example.org"]),
+                &json!(true),
+                &json!(true)
+            ),
+            "псевдонимы прежние, вход не тронут"
+        );
+        let acc = env
+            .meta
+            .get(TenantId::DEFAULT, scope.account)
+            .await
+            .expect("get")
+            .expect("account");
+        assert_eq!(acc.aliases, ["anna@example.org", "a.p@example.org"]);
+        assert!(acc.hidden_from_gal);
+
+        // Адрес псевдонима занят: новая учётная запись с ним — 409.
+        let (s, _, _) = env
+            .call(
+                "POST",
+                &format!("{}/accounts", org()),
+                Some("org"),
+                Some(json!({"login": "anna@example.org"})),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+
+        // Занят другой учётной записью, группой, контактом; домен не принят — 409 с пояснением.
+        env.groups
+            .put(DistributionGroup {
+                id: tp_contracts::GroupId::new(),
+                tenant: TenantId::DEFAULT,
+                name: "Staff".into(),
+                address: Some("staff@example.org".into()),
+                external_id: None,
+                members: vec![],
+                senders: SenderRestriction::Anyone,
+                moderators: vec![],
+                hidden_from_gal: false,
+            })
+            .await
+            .expect("group");
+        env.addressbook
+            .put_contact(MailContact {
+                id: tp_contracts::ContactId::new(),
+                tenant: TenantId::DEFAULT,
+                display_name: "Партнёр".into(),
+                email: "partner@example.org".into(),
+                external_id: None,
+                attributes: Default::default(),
+                groups: vec![],
+                hidden_from_gal: false,
+            })
+            .await
+            .expect("contact");
+        for (alias, why) in [
+            ("BOB@example.org", "учётная запись bob@example.org"),
+            ("staff@example.org", "группа рассылки «Staff»"),
+            ("partner@example.org", "почтовый контакт «Партнёр»"),
+            ("anna@other.test", "не принят организацией"),
+        ] {
+            let (s, _, b) = patch(json!({"aliases": ["new@example.org", alias]})).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{alias}: {b}");
+            let detail = b["detail"].as_str().expect("detail");
+            assert!(detail.contains(why), "{alias}: {detail}");
+        }
+        for bad in ["no-at", "@example.org", "a b@example.org"] {
+            let (s, _, b) = patch(json!({"aliases": [bad]})).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {b}");
+        }
+        let (_, _, b) = env.call("GET", &one, Some("org"), None).await;
+        assert_eq!(
+            b["aliases"],
+            json!(["anna@example.org", "a.p@example.org"]),
+            "отказ ничего не меняет"
+        );
+
+        // Пустой список снимает псевдонимы; показ в книге.
+        let (s, _, b) = patch(json!({"aliases": [], "hidden_from_gal": false})).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            (&b["aliases"], &b["hidden_from_gal"]),
+            (&json!([]), &json!(false))
+        );
+
+        // Запись каталога: псевдонимы и скрытие ведёт каталог.
+        let dir = env
+            .meta
+            .upsert(
+                TenantId::DEFAULT,
+                AccountUpsert {
+                    domain: d.id,
+                    login: "dir@example.org".into(),
+                    display_name: "Из каталога".into(),
+                    external_id: Some("guid-1".into()),
+                    enabled: true,
+                    aliases: vec!["d@example.org".into()],
+                    kind: AccountKind::User,
+                    hidden_from_gal: false,
+                },
+            )
+            .await
+            .expect("upsert");
+        let dir_url = format!("{}/accounts/{}", org(), dir.id);
+        for body in [
+            json!({"aliases": ["x@example.org"]}),
+            json!({"aliases": []}),
+            json!({"hidden_from_gal": true}),
+        ] {
+            let (s, _, b) = env.call("PATCH", &dir_url, Some("org"), Some(body)).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{b}");
+            assert!(
+                b["detail"].as_str().expect("detail").contains("каталог"),
+                "{b}"
+            );
+        }
+        let (_, _, b) = env.call("GET", &dir_url, Some("org"), None).await;
+        assert_eq!(
+            (&b["aliases"], &b["hidden_from_gal"]),
+            (&json!(["d@example.org"]), &json!(false))
+        );
+
+        // Без настроек транспорта домен псевдонима не проверить — 503; скрытие — без транспорта.
+        let env = Env::without_transport();
+        let scope = env.account("user@example.org").await;
+        let one = format!("{}/accounts/{}", org(), scope.account);
+        let (s, _, _) = env
+            .call(
+                "PATCH",
+                &one,
+                Some("org"),
+                Some(json!({"aliases": ["a@example.org"]})),
+            )
+            .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        let (s, _, b) = env
+            .call(
+                "PATCH",
+                &one,
+                Some("org"),
+                Some(json!({"hidden_from_gal": true})),
+            )
+            .await;
+        assert_eq!((s, &b["hidden_from_gal"]), (StatusCode::OK, &json!(true)));
     }
 
     #[test]

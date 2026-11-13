@@ -37,6 +37,13 @@
           },
           {
             "properties": {
+              "aliases": {
+                "description": "Псевдонимы — адреса, доставляемые учётной записи, кроме основного (нижний регистр, в порядке задания).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
               "display_name": {
                 "description": "Отображаемое имя.",
                 "type": "string"
@@ -55,6 +62,10 @@
                   "string",
                   "null"
                 ]
+              },
+              "hidden_from_gal": {
+                "description": "Скрыта из книги «Организация» (GAL): вход и приём почты — как обычно.",
+                "type": "boolean"
               },
               "id": {
                 "description": "Идентификатор.",
@@ -75,6 +86,8 @@
               "login",
               "display_name",
               "enabled",
+              "aliases",
+              "hidden_from_gal",
               "quota"
             ],
             "type": "object"
@@ -86,6 +99,16 @@
         "additionalProperties": false,
         "description": "Изменение учётной записи: заданные поля заменяются, отсутствующие — без изменений; хотя бы одно поле обязательно.",
         "properties": {
+          "aliases": {
+            "description": "Псевдонимы целиком (заменяют прежние, `[]` — без псевдонимов; регистр не важен, повторы и основной адрес\nотбрасываются): адреса в принятых доменах организации, не занятые другой учётной записью, группой рассылки или\nпочтовым контактом, — иначе 409. У записи каталога — 409.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "display_name": {
             "description": "Отображаемое имя (непустое, одна строка); у записи каталога — 409.",
             "type": [
@@ -99,8 +122,33 @@
               "boolean",
               "null"
             ]
+          },
+          "hidden_from_gal": {
+            "description": "Скрыть из книги «Организация» (GAL); книга меняется не позже чем через `maintenance.gal_interval`. У записи\nкаталога — 409.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
+        "type": "object"
+      },
+      "AclEntryBody": {
+        "description": "Запись прав на коллекцию.",
+        "properties": {
+          "identifier": {
+            "description": "Субъект: имя входа, имя группы или `anyone`.",
+            "type": "string"
+          },
+          "rights": {
+            "$ref": "#/components/schemas/RightsBody",
+            "description": "Права, как выданы (без включённых младших)."
+          }
+        },
+        "required": [
+          "identifier",
+          "rights"
+        ],
         "type": "object"
       },
       "AdminRole": {
@@ -357,6 +405,109 @@
         ],
         "type": "object"
       },
+      "BookersBody": {
+        "description": "Кому разрешено бронировать ресурс: `{\"type\": \"internal\"}` — любой учётной записи организации,\n`{\"type\": \"only\", \"accounts\": [...], \"groups\": [...]}` — перечисленным учётным записям и участникам групп.",
+        "oneOf": [
+          {
+            "description": "Любая учётная запись организации.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "internal"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Только перечисленные.",
+            "properties": {
+              "accounts": {
+                "description": "Учётные записи (UUID).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "groups": {
+                "description": "Группы (UUID), с вложенными.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": {
+                "enum": [
+                  "only"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "BookingPolicyBody": {
+        "additionalProperties": false,
+        "description": "Правила бронирования ресурса; отсутствующее поле — значение по умолчанию.",
+        "properties": {
+          "allow_conflicts": {
+            "default": false,
+            "description": "Разрешены пересекающиеся бронирования.",
+            "type": "boolean"
+          },
+          "auto_accept": {
+            "default": true,
+            "description": "Подходящее приглашение принимается автоматически; иначе остаётся предварительным до решения представителя\nресурса.",
+            "type": "boolean"
+          },
+          "bookers": {
+            "$ref": "#/components/schemas/BookersBody",
+            "default": {
+              "type": "internal"
+            },
+            "description": "Кому разрешено бронировать."
+          },
+          "horizon": {
+            "default": "180d",
+            "description": "Насколько вперёд можно бронировать (`180d`); `null` — без ограничения.",
+            "example": "90d",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_duration": {
+            "default": "1d",
+            "description": "Наибольшая длительность встречи (`4h`); `null` — без ограничения.",
+            "example": "4h",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "working_hours": {
+            "default": null,
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkingHoursBody",
+                "description": "Рабочее время; `null` — круглосуточно."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ClusterView": {
         "description": "Снимок уровня кластера.",
         "properties": {
@@ -387,6 +538,42 @@
           "sources"
         ],
         "type": "object"
+      },
+      "CollectionInfo": {
+        "description": "Календарь или адресная книга учётной записи.",
+        "properties": {
+          "display_name": {
+            "description": "Отображаемое имя.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Идентификатор (UUID).",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CollectionKindBody",
+            "description": "Вид."
+          },
+          "name": {
+            "description": "Имя — сегмент URL CalDAV/CardDAV.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "name",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "CollectionKindBody": {
+        "description": "Вид коллекции.",
+        "enum": [
+          "calendar",
+          "address_book"
+        ],
+        "type": "string"
       },
       "ContactBody": {
         "additionalProperties": false,
@@ -481,6 +668,65 @@
           "hidden_from_gal"
         ],
         "type": "object"
+      },
+      "DelegateBody": {
+        "additionalProperties": false,
+        "description": "Назначение представителя.",
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/DelegateLevelBody",
+            "description": "Уровень доступа к календарям."
+          },
+          "schedule_on_behalf": {
+            "description": "Отправляет приглашения и ответы от имени владельца.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "level"
+        ],
+        "type": "object"
+      },
+      "DelegateInfo": {
+        "description": "Представитель учётной записи.",
+        "properties": {
+          "delegate": {
+            "description": "Учётная запись представителя (UUID).",
+            "type": "string"
+          },
+          "display_name": {
+            "description": "Отображаемое имя представителя.",
+            "type": "string"
+          },
+          "level": {
+            "$ref": "#/components/schemas/DelegateLevelBody",
+            "description": "Уровень доступа к календарям."
+          },
+          "login": {
+            "description": "Имя входа представителя.",
+            "type": "string"
+          },
+          "schedule_on_behalf": {
+            "description": "Отправляет приглашения и ответы от имени владельца.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "delegate",
+          "login",
+          "display_name",
+          "level",
+          "schedule_on_behalf"
+        ],
+        "type": "object"
+      },
+      "DelegateLevelBody": {
+        "description": "Уровень доступа представителя ко всем календарям владельца.",
+        "enum": [
+          "read",
+          "write"
+        ],
+        "type": "string"
       },
       "DeliveryEntry": {
         "description": "Событие журнала доставки.",
@@ -1222,6 +1468,38 @@
         ],
         "type": "object"
       },
+      "NewResource": {
+        "additionalProperties": false,
+        "description": "Новый ресурс.",
+        "properties": {
+          "booking_policy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BookingPolicyBody",
+                "description": "Правила бронирования; нет — по умолчанию."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "display_name": {
+            "description": "Отображаемое имя («Переговорная 5.12»); нет — имя входа.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "login": {
+            "description": "Имя входа — адрес в принятом домене организации (приводится к нижнему регистру).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "login"
+        ],
+        "type": "object"
+      },
       "OidcLogin": {
         "description": "Вход в консоль через поставщика OIDC: издатель из `auth.oidc`, клиент из `admin.oidc`.",
         "properties": {
@@ -1272,6 +1550,26 @@
           }
         ],
         "description": "Организация."
+      },
+      "PasswordLogin": {
+        "additionalProperties": false,
+        "description": "Вход администратора по паролю.",
+        "properties": {
+          "login": {
+            "description": "Имя входа (адрес учётной записи).",
+            "type": "string"
+          },
+          "password": {
+            "description": "Пароль: каталога (`auth.ldap`) или приложения, в том числе выданный `thepost admin init`.",
+            "format": "password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "login",
+          "password"
+        ],
+        "type": "object"
       },
       "Policies": {
         "description": "Политика уровня и действующая политика.",
@@ -1472,6 +1770,31 @@
         },
         "type": "object"
       },
+      "ResourceInfo": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AccountInfo",
+            "description": "Учётная запись ресурса."
+          },
+          {
+            "properties": {
+              "booking_policy": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/BookingPolicyBody",
+                    "description": "Правила бронирования; `null` — не заданы (приглашения не обрабатываются автоматически)."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "Ресурс: учётная запись и правила бронирования."
+      },
       "RestoredMessage": {
         "description": "Восстановленное письмо.",
         "properties": {
@@ -1497,6 +1820,38 @@
           "uid",
           "modseq"
         ],
+        "type": "object"
+      },
+      "RightsBody": {
+        "additionalProperties": false,
+        "description": "Права на коллекцию: старшее включает младшие (`admin` — все, `write` — `read`, `read` — `free_busy`);\n`schedule` — отдельное. Отсутствующее поле — `false`.",
+        "properties": {
+          "admin": {
+            "default": false,
+            "description": "Менять свойства коллекции, удалять её и выдавать права.",
+            "type": "boolean"
+          },
+          "free_busy": {
+            "default": false,
+            "description": "Видеть занятость без подробностей.",
+            "type": "boolean"
+          },
+          "read": {
+            "default": false,
+            "description": "Читать объекты.",
+            "type": "boolean"
+          },
+          "schedule": {
+            "default": false,
+            "description": "Планировать от имени владельца: приглашения и ответы.",
+            "type": "boolean"
+          },
+          "write": {
+            "default": false,
+            "description": "Создавать, изменять и удалять объекты.",
+            "type": "boolean"
+          }
+        },
         "type": "object"
       },
       "RouteBody": {
@@ -1751,15 +2106,105 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/OidcLogin",
-                "description": "Поставщик OIDC; `null` — не настроен (вход только токеном `admin init`)."
+                "description": "Поставщик OIDC; `null` — не настроен."
               },
               {
                 "type": "null"
               }
             ]
+          },
+          "password": {
+            "description": "Вход по паролю администратора включён (`POST /api/v1/session` с телом `PasswordLogin`, `admin.password_login`).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "password"
+        ],
+        "type": "object"
+      },
+      "SharingPolicyBody": {
+        "additionalProperties": false,
+        "description": "Политика общего доступа организации к календарям и адресным книгам.",
+        "properties": {
+          "max_outside": {
+            "$ref": "#/components/schemas/RightsBody",
+            "default": {
+              "admin": false,
+              "free_busy": true,
+              "read": true,
+              "schedule": false,
+              "write": false
+            },
+            "description": "Наибольшие права субъекту вне групп политики и субъекту `anyone`."
+          },
+          "scope": {
+            "$ref": "#/components/schemas/SharingScopeBody",
+            "default": {
+              "type": "organization"
+            },
+            "description": "Кому можно выдавать права."
           }
         },
         "type": "object"
+      },
+      "SharingScopeBody": {
+        "description": "Кому в организации можно выдавать права на свои календари и адресные книги.",
+        "oneOf": [
+          {
+            "description": "Общий доступ запрещён: права и представители не выдаются.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "nobody"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Полные права — участникам перечисленных групп (с вложенными), остальным субъектам — не больше\n`max_outside`.",
+            "properties": {
+              "groups": {
+                "description": "Группы (UUID).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": {
+                "enum": [
+                  "groups"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "groups",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Любому субъекту организации — полные права.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "organization"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "SourceBody": {
         "additionalProperties": false,
@@ -2303,6 +2748,19 @@
         },
         "type": "object"
       },
+      "Weekday": {
+        "description": "День недели.",
+        "enum": [
+          "monday",
+          "tuesday",
+          "wednesday",
+          "thursday",
+          "friday",
+          "saturday",
+          "sunday"
+        ],
+        "type": "string"
+      },
       "WhoAmI": {
         "description": "Текущий администратор.",
         "properties": {
@@ -2331,6 +2789,41 @@
           "account",
           "login",
           "roles"
+        ],
+        "type": "object"
+      },
+      "WorkingHoursBody": {
+        "additionalProperties": false,
+        "description": "Рабочее время ресурса в его часовом поясе: вне его приглашения отклоняются.",
+        "properties": {
+          "days": {
+            "description": "Рабочие дни (непусто).",
+            "items": {
+              "$ref": "#/components/schemas/Weekday"
+            },
+            "type": "array"
+          },
+          "from": {
+            "description": "Начало рабочего дня, `ЧЧ:ММ`.",
+            "example": "09:00",
+            "type": "string"
+          },
+          "timezone": {
+            "description": "Часовой пояс IANA.",
+            "example": "Europe/Moscow",
+            "type": "string"
+          },
+          "to": {
+            "description": "Конец рабочего дня, `ЧЧ:ММ`, позже начала.",
+            "example": "18:00",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timezone",
+          "days",
+          "from",
+          "to"
         ],
         "type": "object"
       },
@@ -2729,9 +3222,18 @@
                 }
               }
             }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
           }
         },
-        "summary": "Изменяет локальную учётную запись: отображаемое имя и блокировка входа (`enabled: false` — вход запрещён).\nПустое тело (`{}`) — 422. У записи каталога (`external_id` задан) оба поля ведёт каталог: синхронизация\nперезаписывает и имя, и признак блокировки, поэтому изменение — 409 с пояснением.",
+        "summary": "Изменяет локальную учётную запись: отображаемое имя, блокировка входа (`enabled: false` — вход запрещён),\nпсевдонимы (целиком) и скрытие из книги «Организация». Пустое тело (`{}`) — 422. Псевдоним в домене, не принятом\nорганизацией, или адрес, занятый учётной записью, группой или контактом, — 409. У записи каталога (`external_id`\nзадан) эти поля ведёт каталог: синхронизация перезаписывает их, поэтому изменение — 409 с пояснением.",
         "tags": [
           "accounts"
         ]
@@ -3066,6 +3568,457 @@
         "summary": "Задаёт политику аудита ящика (приоритетнее политики организации).",
         "tags": [
           "audit"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/collections": {
+      "get": {
+        "operationId": "list_collections",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Учётная запись (UUID)",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CollectionInfo"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Календари, затем адресные книги учётной записи (по порядку в клиенте); книга GAL организации не входит — её\nправа не выдаются. Нет учётной записи — 404.",
+        "tags": [
+          "sharing"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/collections/{collection}/acl": {
+      "get": {
+        "operationId": "get_acl",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Учётная запись (UUID)",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Календарь или адресная книга (UUID)",
+            "in": "path",
+            "name": "collection",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AclEntryBody"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Права на календарь или адресную книгу учётной записи. Нет учётной записи или коллекции — 404.",
+        "tags": [
+          "sharing"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/collections/{collection}/acl/{identifier}": {
+      "put": {
+        "operationId": "put_acl",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Учётная запись (UUID)",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Календарь или адресная книга (UUID)",
+            "in": "path",
+            "name": "collection",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Субъект: имя входа, имя группы или `anyone`",
+            "in": "path",
+            "name": "identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RightsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AclEntryBody"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Заменяет права субъекта на коллекцию целиком; пустые права (`{}`) отзывают запись. Субъект — имя входа, имя\nгруппы или `anyone`; недопустимый идентификатор — 400; нет учётной записи или коллекции — 404; сверх политики\nобщего доступа — 409. Ответ — записи коллекции после изменения.",
+        "tags": [
+          "sharing"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/delegates": {
+      "get": {
+        "operationId": "list_delegates",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Учётная запись (UUID)",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DelegateInfo"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Представители учётной записи.",
+        "tags": [
+          "sharing"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/accounts/{account}/delegates/{delegate}": {
+      "delete": {
+        "operationId": "remove_delegate",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Учётная запись (UUID)",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Учётная запись представителя (UUID)",
+            "in": "path",
+            "name": "delegate",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Отзывает представителя; не назначен — без изменений. Нет учётной записи — 404.",
+        "tags": [
+          "sharing"
+        ]
+      },
+      "put": {
+        "operationId": "put_delegate",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Учётная запись (UUID)",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Учётная запись представителя (UUID)",
+            "in": "path",
+            "name": "delegate",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DelegateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DelegateInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Назначает представителя или заменяет его уровень. Нет учётной записи или представителя — 404; сам себе — 400;\nсверх политики общего доступа — 409.",
+        "tags": [
+          "sharing"
         ]
       }
     },
@@ -4257,6 +5210,121 @@
         "summary": "Журнал аудита организации: записи по возрастанию `seq`, удовлетворяющие условиям; пустое условие — 400.",
         "tags": [
           "audit"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/calendar-sharing": {
+      "get": {
+        "operationId": "get_policy",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharingPolicyBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Политика общего доступа организации; не задана — по умолчанию.",
+        "tags": [
+          "sharing"
+        ]
+      },
+      "put": {
+        "operationId": "put_policy",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharingPolicyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharingPolicyBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Задаёт политику общего доступа организации целиком. Неизвестная группа — 400. Уже выданные права не удаляются:\nих ограничивает новая политика.",
+        "tags": [
+          "sharing"
         ]
       }
     },
@@ -5794,6 +6862,316 @@
         ]
       }
     },
+    "/api/v1/orgs/{org}/resources": {
+      "get": {
+        "operationId": "list_resources",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ResourceInfo"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Действующие ресурсы организации по имени входа (удалённые, но ещё хранимые — среди отключённых ящиков).",
+        "tags": [
+          "resources"
+        ]
+      },
+      "post": {
+        "operationId": "create_resource",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewResource"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Создаёт ресурс: локальную учётную запись вида `resource` в принятом домене организации и правила бронирования.\nИмя занято — 409; домен не принят организацией, недопустимые правила или неизвестная учётная запись или группа в\n`bookers` — 400; хранилища не подключены — 503.",
+        "tags": [
+          "resources"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/resources/{account}": {
+      "delete": {
+        "operationId": "delete_resource",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ресурс (UUID)",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Удаляет ресурс: снимает правила и отключает учётную запись со сроком хранения «сейчас» — окончательно её удаляет\nобслуживание. Ресурс из каталога — 409 (удаляется в каталоге); нет или не ресурс — 404.",
+        "tags": [
+          "resources"
+        ]
+      },
+      "get": {
+        "operationId": "get_resource",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ресурс (UUID)",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Ресурс и его правила бронирования; нет или не ресурс — 404.",
+        "tags": [
+          "resources"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/resources/{account}/booking-policy": {
+      "put": {
+        "operationId": "put_booking_policy",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ресурс (UUID)",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BookingPolicyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookingPolicyBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Задаёт правила бронирования ресурса целиком. Недопустимые правила или неизвестная учётная запись или группа в\n`bookers` — 400; нет или не ресурс — 404.",
+        "tags": [
+          "resources"
+        ]
+      }
+    },
     "/api/v1/orgs/{org}/sieve": {
       "delete": {
         "operationId": "remove_org_script",
@@ -7095,19 +8473,45 @@
         "security": [
           {}
         ],
-        "summary": "Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`). Без входа.",
+        "summary": "Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`) и вход по паролю\n(`admin.password_login`). Без входа.",
         "tags": [
           "admin"
         ]
       },
       "post": {
-        "operationId": "exchange",
+        "operationId": "create_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PasswordLogin"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "description": "Вход по паролю; без тела — обмен токена `admin init` (`Authorization: Bearer tpa_…`)"
+        },
         "responses": {
           "201": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminSession"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }
@@ -7119,7 +8523,28 @@
                   "$ref": "#/components/schemas/Problem"
                 }
               }
-            }
+            },
+            "description": "неверный пароль или токен, блокировка перебора"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "у учётной записи нет ролей администрирования"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "вход по паролю выключен (`admin.password_login`)"
           },
           "503": {
             "content": {
@@ -7131,7 +8556,13 @@
             }
           }
         },
-        "summary": "Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится\nпервой проверкой; повтор, срок, отзыв — 401.",
+        "security": [
+          {},
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Новая сессия Admin API. С телом `PasswordLogin` — вход администратора по паролю (решение 117): неверный пароль\nили блокировка перебора — 401, нет ролей администрирования — 403, вход по паролю выключен\n(`admin.password_login`) — 404. Без тела — обмен одноразового токена `admin init`\n(`Authorization: Bearer tpa_…`): токен гасится первой проверкой; повтор, срок, отзыв — 401. Каждая попытка — в\nжурнал аудита.",
         "tags": [
           "admin"
         ]

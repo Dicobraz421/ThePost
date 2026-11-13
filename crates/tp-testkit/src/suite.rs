@@ -2806,6 +2806,72 @@ pub async fn account_by_ids(accounts: &dyn AccountStore, fx: &AccountListFixture
     assert_eq!(by_ids(Vec::new()).await, Vec::new());
 }
 
+/// Набор проверок роли администратора установки (`AccountStore::grant_installation_admin`,
+/// `is_installation_admin`; решение 117): без записи — нет роли, запись — у одной учётной записи, повтор — не ошибка,
+/// нет учётной записи или она другой организации — `NotFound` и нет роли. Организации из [`AccountListFixture`]
+/// могут быть непустыми: имена входа уникальны для прогона.
+pub async fn account_installation_admin(accounts: &dyn AccountStore, fx: &AccountListFixture) {
+    let run = AccountId::new();
+    let upsert = |domain: DomainId, n: &str| AccountUpsert {
+        domain,
+        login: format!("{n}-{run}@{}", fx.domain_name),
+        display_name: n.into(),
+        external_id: None,
+        enabled: true,
+        aliases: Vec::new(),
+        kind: AccountKind::User,
+        hidden_from_gal: false,
+    };
+    let a = accounts
+        .upsert(fx.tenant, upsert(fx.domain, "root-a"))
+        .await
+        .expect("upsert a");
+    let b = accounts
+        .upsert(fx.tenant, upsert(fx.domain, "root-b"))
+        .await
+        .expect("upsert b");
+    let foreign = accounts
+        .upsert(fx.foreign_tenant, upsert(fx.foreign_domain, "root-f"))
+        .await
+        .expect("upsert foreign");
+    let is = |tenant: TenantId, id: AccountId| async move {
+        accounts
+            .is_installation_admin(tenant, id)
+            .await
+            .expect("is_installation_admin")
+    };
+
+    assert!(!is(fx.tenant, a.id).await, "без записи — нет роли");
+    accounts
+        .grant_installation_admin(fx.tenant, a.id)
+        .await
+        .expect("grant");
+    assert!(is(fx.tenant, a.id).await);
+    assert!(!is(fx.tenant, b.id).await, "роль — только у назначенной");
+    accounts
+        .grant_installation_admin(fx.tenant, a.id)
+        .await
+        .expect("повтор — не ошибка");
+    assert!(is(fx.tenant, a.id).await);
+
+    assert_eq!(
+        accounts
+            .grant_installation_admin(fx.tenant, AccountId::new())
+            .await,
+        Err(Error::NotFound)
+    );
+    assert!(!is(fx.tenant, AccountId::new()).await);
+    assert_eq!(
+        accounts
+            .grant_installation_admin(fx.tenant, foreign.id)
+            .await,
+        Err(Error::NotFound),
+        "учётная запись другой организации"
+    );
+    assert!(!is(fx.tenant, foreign.id).await);
+    assert!(!is(fx.foreign_tenant, foreign.id).await);
+}
+
 /// Набор проверок `AccountStore::by_address` (CTR-62): основной адрес и псевдоним — учётная запись, адрес группы
 /// рассылки — группа (без учёта регистра и пробелов по краям), неизвестный адрес и адрес другой организации — `None`.
 /// `groups` — группы, которые видит `accounts`. Организации из [`AccountListFixture`] могут быть непустыми: адреса
