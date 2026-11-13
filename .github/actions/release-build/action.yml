@@ -18,11 +18,17 @@ inputs:
   save-cache:
     description: Сохранять rust-cache
     default: 'true'
+  console-archive:
+    description: Имя архива console/dist (без .tar.gz; пусто — архива нет)
+    default: ''
 
 outputs:
   binary:
     description: Путь к бинарю
     value: target/${{ inputs.target }}/release/thepost
+  console-archive:
+    description: Путь к архиву консоли (.tar.gz, рядом .tar.gz.sha256); пусто — архива нет
+    value: ${{ steps.archive.outputs.path }}
 
 runs:
   using: composite
@@ -59,3 +65,20 @@ runs:
         docker run --rm -v "$PWD/$BIN:/thepost:ro" "$GUEST" sh -c 'apt-get update -qq &&
           apt-get install -y -qq --no-install-recommends qemu-user libgssapi-krb5-2 >/dev/null &&
           qemu-x86_64 -cpu Nehalem /thepost --version'
+    # Архив console/dist (решение 68, CI-10) для раздачи веб-сервером — те же файлы, что вшиты в бинарь этой сборки.
+    # Детерминированный: порядок имён, время — коммита, владелец 0:0, права нормализованы, gzip без имени и времени;
+    # repro сверяет его sha256. Каталог в архиве — имя архива.
+    - id: archive
+      name: Архив консоли
+      if: inputs.console-archive != '' && steps.console.outputs.cargo-args != ''
+      shell: bash
+      env:
+        NAME: ${{ inputs.console-archive }}
+        OUT: ${{ runner.temp }}/console-archive
+      run: |
+        mkdir -p "$OUT"
+        tar -C console --format=gnu --sort=name --mtime="@$(git log -1 --format=%ct)" \
+          --owner=0 --group=0 --numeric-owner --mode='u=rwX,go=rX' --transform "s|^dist|$NAME|" \
+          -cf - dist | gzip -9n > "$OUT/$NAME.tar.gz"
+        (cd "$OUT" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" && cat "$NAME.tar.gz.sha256")
+        echo "path=$OUT/$NAME.tar.gz" >> "$GITHUB_OUTPUT"

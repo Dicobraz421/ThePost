@@ -2,6 +2,7 @@
 # «консоль не собрана» (503). Узел — роль admin (profile dev, открытый HTTP на loopback) против PostgreSQL 16
 # в контейнере; проверяются страница (200, `id="root"`) и первый скрипт `assets/` из неё (200).
 # Один из входов: `binary` — бинарный файл на раннере (x86_64), `image` — образ в локальном docker.
+# `index` — сверка страницы с файлом побайтно (бета: вшитая консоль = архив консоли выпуска, CI-10).
 name: console-check
 description: Бинарный файл или образ раздаёт веб-консоль
 
@@ -12,6 +13,9 @@ inputs:
   image:
     description: Образ в локальном docker (CMD — serve --config /etc/thepost/config.yaml)
     default: ''
+  index:
+    description: Ожидаемый index.html (например, из архива консоли выпуска); пусто — не сверяется
+    default: ''
 
 runs:
   using: composite
@@ -21,6 +25,7 @@ runs:
       env:
         BIN: ${{ inputs.binary }}
         IMAGE: ${{ inputs.image }}
+        INDEX: ${{ inputs.index }}
       run: |
         set -euo pipefail
         if { [ -n "$BIN" ] && [ -n "$IMAGE" ]; } || { [ -z "$BIN" ] && [ -z "$IMAGE" ]; }; then
@@ -96,3 +101,7 @@ runs:
         [ -n "$js" ] || { cat "$dir/page"; echo "::error::в странице консоли нет скрипта assets/"; exit 1; }
         curl -fsS -o /dev/null "$base$js" || { logs; echo "::error::GET $js — не 200"; exit 1; }
         echo "консоль раздаётся: /console/ — 200, $js — 200"
+        if [ -n "$INDEX" ]; then
+          cmp "$INDEX" "$dir/page" || { echo "::error::GET /console/ — не тот index.html, что $INDEX"; exit 1; }
+          echo "index.html совпадает с $INDEX"
+        fi
