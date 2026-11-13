@@ -390,7 +390,7 @@ pub(crate) async fn prepare_share(
     ty: ObjectType,
     c: Option<CollectionId>,
     changes: &[(String, Value)],
-) -> MethodResult<Result<Vec<Grant>, Value>> {
+) -> MethodResult<std::result::Result<Vec<Grant>, Value>> {
     let bad = |why: &str| {
         Ok(Err(set_error(
             "invalidProperties",
