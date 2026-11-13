@@ -84,6 +84,9 @@ pub struct Services {
     pub authz: Arc<dyn Authorizer>,
     /// Каталог LDAP; `None` — учётные записи только из PostgreSQL.
     pub directory: Option<Arc<dyn Directory>>,
+    /// Шина JMAP с системным `GalChanged` в подписках учётных записей (APP-49); `None` — без каталога книги GAL
+    /// нет, JMAP подписан на [`Services::bus`]. Системные сигналы читает `GalPush::run` (запускает `serve`).
+    pub gal_push: Option<Arc<crate::gal::GalPush>>,
     /// Издатель токенов OIDC (`auth.oidc.issuer`); `None` — вход Bearer OIDC не настроен.
     pub oidc_issuer: Option<String>,
     /// Пароли приложений.
@@ -320,6 +323,10 @@ impl Services {
                 .with_node(smtp.hostname.clone()),
         );
 
+        let gal_push = directory
+            .is_some()
+            .then(|| Arc::new(crate::gal::GalPush::new(bus.clone())));
+
         Ok(Self {
             tenant,
             meta,
@@ -331,6 +338,7 @@ impl Services {
             authn,
             sasl,
             authz,
+            gal_push,
             directory,
             oidc_issuer: auth.oidc.as_ref().map(|o| o.issuer.clone()),
             app_passwords,
@@ -534,7 +542,11 @@ impl Services {
                 Arc::new(self.meta.clone()),
             )),
             blob_index: Arc::new(self.meta.clone()),
-            bus: self.bus.clone(),
+            // Push узнаёт об изменении книги GAL организации (`GalChanged`) через `GalPush`.
+            bus: match &self.gal_push {
+                Some(push) => push.clone() as Arc<dyn EventBus>,
+                None => self.bus.clone(),
+            },
             accounts: Arc::new(self.meta.clone()),
             authz: self.authz.clone(),
             outbound: Some(outbound.clone()),

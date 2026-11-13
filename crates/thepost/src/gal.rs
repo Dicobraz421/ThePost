@@ -9,18 +9,31 @@
 //!
 //! В кластере книгу организации пишет один узел — держатель лизы [`GalSync::lease_name`]; остальные узлы с ролью
 //! maintenance ждут её истечения. Ошибка каталога или хранилища — в журнал, книга прежняя, повтор — через период.
+//!
+//! JMAP push подписан только на сигналы учётной записи, а `GalChanged` — системный. [`GalPush`] — шина для JMAP
+//! узла: системный `GalChanged` организации приходит в подписку каждой её учётной записи как `DavChanged` книги
+//! «Организация» (она — среди адресных книг каждой учётной записи), и клиент получает `StateChange` контактов.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tp_contracts::TenantId;
-use tp_contracts::dav::DavStore;
+use async_trait::async_trait;
+use futures::{StreamExt, stream};
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
+use tp_contracts::bus::{Event, EventBus, EventKind, EventStream};
+use tp_contracts::dav::{CollectionKind, DavStore, dav_changed};
 use tp_contracts::lease::{Lease, LeaseStore};
+use tp_contracts::meta::AccountScope;
 use tp_contracts::role::CancellationToken;
+use tp_contracts::{Result, TenantId};
 use tp_dav::{DavConfig, GalDeps};
 
 /// Наименьший срок лизы: короткий период не должен отдавать книгу другому узлу на каждой паузе сети.
 const MIN_LEASE_TTL: Duration = Duration::from_secs(30);
+
+/// Сигналов `GalChanged` в очереди подписки [`GalPush`]; отставшая подписка получает `Resync`.
+const PUSH_BUFFER: usize = 64;
 
 /// Заполнение книги GAL организации роли maintenance.
 pub struct GalSync {
@@ -139,15 +152,120 @@ impl GalSync {
     }
 }
 
+/// Шина JMAP узла (APP-49): сигналы учётной записи и публикация — из `inner`, плюс системный `GalChanged` её
+/// организации в виде `DavChanged` книги «Организация» этой учётной записи. Системные сигналы узел читает одной
+/// подпиской ([`GalPush::run`]) и раздаёт подпискам учётных записей в памяти; отставшая подписка получает `Resync`.
+/// Поток подписки завершается вместе с потоком учётной записи `inner` (потеря связи с шиной).
+pub struct GalPush {
+    inner: Arc<dyn EventBus>,
+    tx: broadcast::Sender<Event>,
+}
+
+impl std::fmt::Debug for GalPush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GalPush")
+            .field("subscribers", &self.tx.receiver_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GalPush {
+    /// Шина поверх `inner`.
+    pub fn new(inner: Arc<dyn EventBus>) -> Self {
+        let (tx, _) = broadcast::channel(PUSH_BUFFER);
+        Self { inner, tx }
+    }
+
+    /// Системные сигналы `GalChanged` до остановки; поток прервался или подписка не удалась — новая через `retry`.
+    pub async fn run(self: Arc<Self>, retry: Duration, shutdown: CancellationToken) {
+        while !shutdown.is_cancelled() {
+            match self.inner.subscribe_system().await {
+                Ok(mut events) => loop {
+                    let ev = tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        ev = events.next() => ev,
+                    };
+                    match ev {
+                        Some(ev) if matches!(ev.kind, EventKind::GalChanged { .. }) => {
+                            // Подписчиков нет — сигнал некому передать.
+                            let _ = self.tx.send(ev);
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "книга GAL: подписка на системные сигналы не удалась")
+                }
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(retry) => {}
+            }
+        }
+    }
+}
+
+/// `GalChanged` организации `scope` — изменение книги «Организация» учётной записи `scope`.
+fn for_account(ev: Event, scope: AccountScope) -> Option<Event> {
+    match ev.kind {
+        EventKind::GalChanged { collection, modseq } if ev.tenant == scope.tenant => Some(
+            dav_changed(scope, CollectionKind::AddressBook, collection, modseq),
+        ),
+        _ => None,
+    }
+}
+
+#[async_trait]
+impl EventBus for GalPush {
+    async fn publish(&self, event: Event) -> Result<()> {
+        self.inner.publish(event).await
+    }
+
+    async fn subscribe(&self, scope: AccountScope) -> Result<EventStream> {
+        let gal = self.tx.subscribe();
+        let own = self.inner.subscribe(scope).await?;
+        let gal = stream::unfold(gal, move |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if let Some(ev) = for_account(ev, scope) {
+                            return Some((ev, rx));
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        let resync = Event {
+                            tenant: scope.tenant,
+                            account: Some(scope.account),
+                            kind: EventKind::Resync,
+                        };
+                        return Some((resync, rx));
+                    }
+                    Err(RecvError::Closed) => return None,
+                }
+            }
+        });
+        // Конец потока учётной записи (`None`) завершает и общий поток.
+        let own = own.map(Some).chain(stream::once(async { None }));
+        Ok(stream::select(own, gal.map(Some))
+            .take_while(|ev| std::future::ready(ev.is_some()))
+            .filter_map(std::future::ready)
+            .boxed())
+    }
+
+    async fn subscribe_system(&self) -> Result<EventStream> {
+        self.inner.subscribe_system().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
     use tp_contracts::auth::{DirAccount, DirOrg};
-    use tp_contracts::dav::CollectionKind;
-    use tp_contracts::meta::AccountScope;
-    use tp_contracts::{AccountId, TenantId};
+    use tp_contracts::dav::{CollectionId, gal_changed};
+    use tp_contracts::{AccountId, ModSeq, TenantId};
     use tp_testkit::{FakeDirectory, MemDav, MemGroups, MemLease};
 
     use super::*;
@@ -261,5 +379,79 @@ mod tests {
                 .is_some(),
             "после остановки лиза отдана"
         );
+    }
+
+    /// APP-49: системный `GalChanged` организации приходит в подписку её учётной записи как `DavChanged` адресной
+    /// книги (JMAP push — `StateChange` контактов), учётной записи другой организации — нет; сигналы учётной записи
+    /// проходят как были.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gal_changed_reaches_account_push() {
+        let inner: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::new(
+            &tp_cluster::LocalBusConfig::default(),
+        ));
+        let push = Arc::new(GalPush::new(inner.clone()));
+        let shutdown = CancellationToken::new();
+        tokio::spawn(
+            push.clone()
+                .run(Duration::from_millis(10), shutdown.clone()),
+        );
+        let tenant = TenantId::new();
+        let scope = AccountScope {
+            tenant,
+            account: AccountId::new(),
+        };
+        let stranger = AccountScope {
+            tenant: TenantId::new(),
+            account: AccountId::new(),
+        };
+        let mut mine = push.subscribe(scope).await.expect("подписка");
+        let mut other = push.subscribe(stranger).await.expect("подписка");
+        let collection = CollectionId::new();
+
+        // Системная подписка `run` могла ещё не начаться: сигнал повторяется до получения.
+        let got = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                inner
+                    .publish(gal_changed(tenant, collection, ModSeq(7)))
+                    .await
+                    .expect("publish");
+                if let Ok(Some(ev)) =
+                    tokio::time::timeout(Duration::from_millis(50), mine.next()).await
+                {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("GalChanged не пришёл");
+        assert_eq!(
+            got,
+            dav_changed(scope, CollectionKind::AddressBook, collection, ModSeq(7))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), other.next())
+                .await
+                .is_err(),
+            "сигнал чужой организации"
+        );
+
+        let own = Event {
+            tenant,
+            account: Some(scope.account),
+            kind: EventKind::MailboxListChanged,
+        };
+        inner.publish(own.clone()).await.expect("publish");
+        let ev = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ev = mine.next().await.expect("поток");
+                if ev.kind != got.kind {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("сигнал учётной записи");
+        assert_eq!(ev, own);
+        shutdown.cancel();
     }
 }
