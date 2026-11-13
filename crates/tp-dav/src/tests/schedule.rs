@@ -45,8 +45,14 @@ struct Sched {
 }
 
 impl Sched {
+    /// Без хранения применённых сообщений: входящие CalDAV и хранилище совпадают, тесты считают только
+    /// необработанные. Хранение по умолчанию (DAV-36) проверяет `keep_processed_by_default`.
     async fn new() -> Self {
-        Self::with_config(DavConfig::default()).await
+        Self::with_config(DavConfig {
+            schedule_keep_processed: false,
+            ..DavConfig::default()
+        })
+        .await
     }
 
     async fn with_config(cfg: DavConfig) -> Self {
@@ -874,6 +880,49 @@ async fn reply_only_from_attendee() {
     );
     assert_eq!(env.by_uid(IVAN, "m-11").await.expect("o").etag, after.etag);
     assert_eq!(env.inbox_len(IVAN).await, 0);
+}
+
+/// DAV-36: без настройки применённое приглашение остаётся во входящих для ленты уведомлений JMAP, в CalDAV
+/// его не видно.
+#[tokio::test]
+async fn keep_processed_by_default() {
+    assert!(DavConfig::default().schedule_keep_processed);
+    let env = Sched::with_config(DavConfig::default()).await;
+    let request = itip_msg(
+        "REQUEST",
+        &meeting("m-40", ANNA, T10, 0, &attendee(PETR, "NEEDS-ACTION")),
+    );
+    assert_eq!(
+        env.deliver(PETR, ANNA, ItipMethod::Request, &request).await,
+        ItipOutcome::Applied
+    );
+    assert!(
+        env.by_uid(PETR, "m-40").await.is_some(),
+        "приглашение в календаре"
+    );
+    let items = env
+        .store
+        .inbox_list(env.scope(PETR))
+        .await
+        .expect("входящие")
+        .items;
+    assert_eq!(items.len(), 1, "применённое хранится для ленты");
+    assert!(
+        crate::deliver::processed(&items[0].name),
+        "{}",
+        items[0].name
+    );
+    let inbox = format!("{}inbox/", home(PETR));
+    let r = env
+        .send(
+            PETR,
+            "PROPFIND",
+            &inbox,
+            &[("depth", "1")],
+            "<d:propfind xmlns:d=\"DAV:\"><d:prop><d:getetag/></d:prop></d:propfind>",
+        )
+        .await;
+    assert!(!r.body.contains(&items[0].name), "{}", r.body);
 }
 
 #[tokio::test]

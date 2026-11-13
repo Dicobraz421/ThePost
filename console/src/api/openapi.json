@@ -1551,6 +1551,26 @@
         ],
         "description": "Организация."
       },
+      "PasswordLogin": {
+        "additionalProperties": false,
+        "description": "Вход администратора по паролю.",
+        "properties": {
+          "login": {
+            "description": "Имя входа (адрес учётной записи).",
+            "type": "string"
+          },
+          "password": {
+            "description": "Пароль: каталога (`auth.ldap`) или приложения, в том числе выданный `thepost admin init`.",
+            "format": "password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "login",
+          "password"
+        ],
+        "type": "object"
+      },
       "Policies": {
         "description": "Политика уровня и действующая политика.",
         "properties": {
@@ -2086,14 +2106,21 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/OidcLogin",
-                "description": "Поставщик OIDC; `null` — не настроен (вход только токеном `admin init`)."
+                "description": "Поставщик OIDC; `null` — не настроен."
               },
               {
                 "type": "null"
               }
             ]
+          },
+          "password": {
+            "description": "Вход по паролю администратора включён (`POST /api/v1/session` с телом `PasswordLogin`, `admin.password_login`).",
+            "type": "boolean"
           }
         },
+        "required": [
+          "password"
+        ],
         "type": "object"
       },
       "SharingPolicyBody": {
@@ -8446,19 +8473,45 @@
         "security": [
           {}
         ],
-        "summary": "Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`). Без входа.",
+        "summary": "Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`) и вход по паролю\n(`admin.password_login`). Без входа.",
         "tags": [
           "admin"
         ]
       },
       "post": {
-        "operationId": "exchange",
+        "operationId": "create_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PasswordLogin"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "description": "Вход по паролю; без тела — обмен токена `admin init` (`Authorization: Bearer tpa_…`)"
+        },
         "responses": {
           "201": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminSession"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }
@@ -8470,7 +8523,28 @@
                   "$ref": "#/components/schemas/Problem"
                 }
               }
-            }
+            },
+            "description": "неверный пароль или токен, блокировка перебора"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "у учётной записи нет ролей администрирования"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "вход по паролю выключен (`admin.password_login`)"
           },
           "503": {
             "content": {
@@ -8482,7 +8556,13 @@
             }
           }
         },
-        "summary": "Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится\nпервой проверкой; повтор, срок, отзыв — 401.",
+        "security": [
+          {},
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Новая сессия Admin API. С телом `PasswordLogin` — вход администратора по паролю (решение 117): неверный пароль\nили блокировка перебора — 401, нет ролей администрирования — 403, вход по паролю выключен\n(`admin.password_login`) — 404. Без тела — обмен одноразового токена `admin init`\n(`Authorization: Bearer tpa_…`): токен гасится первой проверкой; повтор, срок, отзыв — 401. Каждая попытка — в\nжурнал аудита.",
         "tags": [
           "admin"
         ]

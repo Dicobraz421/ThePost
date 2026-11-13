@@ -61,7 +61,8 @@ pub struct DavConfig {
     pub default_addressbook_name: String,
     /// Хранить сообщения iTIP, которые сервер уже применил к календарю (`REQUEST`, `REPLY`, `CANCEL`, `ADD`), для
     /// ленты уведомлений JMAP (`CalendarEventNotification`) — не дольше `schedule_processed_ttl`; во входящих
-    /// планирования CalDAV (`schedule-inbox`) они не видны (решение 92). По умолчанию — нет. Необработанные
+    /// планирования CalDAV (`schedule-inbox`) они не видны (решение 92). По умолчанию — да (DAV-36): лента работает из
+    /// коробки, а срок ограничивает очистка роли maintenance. Необработанные
     /// (`COUNTER`, `REFRESH`, `ADD` без ряда) остаются во входящих всегда.
     pub schedule_keep_processed: bool,
     /// Срок хранения применённых сообщений при `schedule_keep_processed` (от получения); старше — удаляет шаг
@@ -94,7 +95,7 @@ impl Default for DavConfig {
             gal_name: "Организация".to_owned(),
             gal_page_size: 1_000,
             default_addressbook_name: "Контакты".to_owned(),
-            schedule_keep_processed: false,
+            schedule_keep_processed: true,
             schedule_processed_ttl: Duration::from_secs(30 * 24 * 3600),
             schedule_write_attempts: 3,
             max_freebusy_attendees: 100,

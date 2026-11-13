@@ -85,6 +85,7 @@ proptest = "1.12.0"
 quick-xml = "0.42.0"
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+rpassword = "7.5.5"
 rsasl = { version = "2.3.1", default-features = false, features = ["config_builder", "provider", "plain", "login", "oauthbearer", "xoauth2"] }
 # Статика веб-консоли внутри бинарного файла (SRS 5.2); tp-admin, фича `console`. Сжатие и MIME не нужны.
 # deterministic-timestamps (CI-15): без неё в бинарь вшиваются mtime и время создания файлов console/dist —

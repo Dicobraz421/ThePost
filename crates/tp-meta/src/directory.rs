@@ -1,15 +1,16 @@
 //! Каталог организации на PostgreSQL (CONTRACTS.md#Directory; META-65): источник книги «Организация» узла без LDAP.
-//! Учётные записи, группы и подразделения — строки основной БД, заведённые в консоли или через Admin API
-//! (`AccountStore`, `GroupStore`, `OrgStore`).
+//! Учётные записи, группы, подразделения и почтовые контакты — строки основной БД, заведённые в консоли или через
+//! Admin API (`AccountStore`, `GroupStore`, `OrgStore`, `ContactStore`).
 //!
-//! Идентификатор записи каталога (`external_id`) — идентификатор строки: `AccountId`, `GroupId`, `OrgUnitId`
-//! (UUID). На них же ссылаются `DirOrg::department`, `DirOrg::manager` и `DirGroup::members` (учётные записи и
-//! вложенные группы). Атрибуты адресной книги — `OrgAttributes::attributes`, их имена — [`Directory::gal_attributes`].
+//! Идентификатор записи каталога (`external_id`) — идентификатор строки: `AccountId`, `GroupId`, `OrgUnitId`,
+//! `ContactId` (UUID). На них же ссылаются `DirOrg::department`, `DirOrg::manager` и `DirGroup::members` (учётные
+//! записи и вложенные группы в порядке записи, затем почтовые контакты группы по возрастанию идентификатора). Атрибуты адресной книги — `OrgAttributes::attributes`, их имена — [`Directory::gal_attributes`].
 //! Учётная запись, скрытая из книги «Организация» (`Account::hidden_from_gal`, CTR-83), отдаётся с признаком
 //! `DirAccount::hidden_from_gal`, как из LDAP: в книгу её не берёт построение GAL, ссылки на неё (`DirOrg::manager`,
 //! участники групп) остаются. Группа, скрытая из GAL (`DistributionGroup::hidden_from_gal`), в каталог не попадает —
-//! у `DirGroup` признака нет, а книга строится из каталога. Почтовых контактов каталог не отдаёт (`contacts_since` —
-//! по умолчанию).
+//! у `DirGroup` признака нет, а книга строится из каталога. Почтовые контакты (`MailContact`, SRS 4.5: входят в GAL и
+//! в состав групп) отдаёт `contacts_since` (META-80); скрытый из GAL (`MailContact::hidden_from_gal`) в каталог не
+//! попадает и в участниках групп не значится — у `DirContact` признака нет, как у групп.
 //!
 //! Курсор — версия выгрузки: `md5` строк каталога организации (всё, что отдаёт каталог), снятая в начале полной
 //! выгрузки. В выгрузке — `p:<версия>:<последний id>` (порции по возрастанию id), после неё — `v:<версия>`.
@@ -25,8 +26,8 @@ use sqlx::postgres::PgRow;
 use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, FromRow};
 use tp_contracts::auth::{
-    DirAccount, DirAlias, DirChange, DirCursor, DirDomain, DirGroup, DirOrg, DirPage, DirUnit,
-    Directory,
+    DirAccount, DirAlias, DirChange, DirContact, DirCursor, DirDomain, DirGroup, DirOrg, DirPage,
+    DirUnit, Directory,
 };
 use tp_contracts::meta::account_addresses;
 use tp_contracts::{Error, Result, TenantId};
@@ -47,9 +48,18 @@ const ACCOUNTS_SQL: &str = "SELECT a.account_id, a.login, a.display_name, a.enab
 const GROUPS_SQL: &str = "SELECT g.group_id, g.name, g.address,
         coalesce((SELECT array_agg(coalesce(m.account_id, m.member_group_id) ORDER BY m.pos)
                   FROM group_members m WHERE m.tenant_id = g.tenant_id AND m.group_id = g.group_id),
-                 '{}'::uuid[]) AS members
+                 '{}'::uuid[])
+        || coalesce((SELECT array_agg(c.contact_id ORDER BY c.contact_id)
+                     FROM mail_contacts c
+                     WHERE c.tenant_id = g.tenant_id AND g.group_id = ANY (c.groups) AND NOT c.hidden_from_gal),
+                    '{}'::uuid[]) AS members
     FROM groups g
     WHERE g.tenant_id = $1 AND NOT g.hidden_from_gal";
+
+/// Почтовые контакты каталога без скрытых из GAL: `$1` — организация, ключ порции — `contact_id`.
+const CONTACTS_SQL: &str = "SELECT c.contact_id, c.display_name, c.email, c.attributes
+    FROM mail_contacts c
+    WHERE c.tenant_id = $1 AND NOT c.hidden_from_gal";
 
 #[derive(FromRow)]
 struct AccountRow {
@@ -101,6 +111,25 @@ impl From<GroupRow> for DirGroup {
             name: r.name,
             email: r.address,
             members: r.members.iter().map(Uuid::to_string).collect(),
+        }
+    }
+}
+
+#[derive(FromRow)]
+struct ContactRow {
+    contact_id: Uuid,
+    display_name: String,
+    email: String,
+    attributes: Json<BTreeMap<String, String>>,
+}
+
+impl From<ContactRow> for DirContact {
+    fn from(r: ContactRow) -> Self {
+        DirContact {
+            external_id: r.contact_id.to_string(),
+            display_name: r.display_name,
+            email: r.email,
+            attributes: r.attributes.0,
         }
     }
 }
@@ -252,6 +281,23 @@ impl Directory for PgMeta {
         .await
     }
 
+    /// Почтовые контакты (`ContactStore`), кроме скрытых из GAL; курсор — как у учётных записей.
+    async fn contacts_since(
+        &self,
+        tenant: TenantId,
+        cursor: Option<&DirCursor>,
+        limit: usize,
+    ) -> Result<DirPage<DirContact>> {
+        self.dir_page::<ContactRow, _>(
+            tenant,
+            cursor,
+            limit,
+            CONTACTS_SQL,
+            ("contact_id", |r| r.contact_id),
+        )
+        .await
+    }
+
     /// Псевдонимы учётных записей (`Account::aliases`), по учётной записи и в порядке записи.
     async fn aliases(&self, tenant: TenantId) -> Result<Vec<DirAlias>> {
         self.idempotent(|| async move {
@@ -301,14 +347,20 @@ impl Directory for PgMeta {
         .await
     }
 
-    /// Имена атрибутов, заданных учётным записям организации (`OrgAttributes::attributes`), по возрастанию.
+    /// Имена атрибутов, заданных учётным записям (`OrgAttributes::attributes`) и почтовым контактам каталога
+    /// (`MailContact::attributes`, без скрытых из GAL) организации, по возрастанию.
     async fn gal_attributes(&self, tenant: TenantId) -> Result<Vec<String>> {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let names: Vec<String> = sqlx::query_scalar(
-                r#"SELECT DISTINCT k.name COLLATE "C" FROM org_attributes o
+                r#"SELECT k.name COLLATE "C" FROM org_attributes o
                    CROSS JOIN LATERAL jsonb_object_keys(o.attributes) AS k(name)
-                   WHERE o.tenant_id = $1 ORDER BY 1"#,
+                   WHERE o.tenant_id = $1
+                   UNION
+                   SELECT k.name COLLATE "C" FROM mail_contacts c
+                   CROSS JOIN LATERAL jsonb_object_keys(c.attributes) AS k(name)
+                   WHERE c.tenant_id = $1 AND NOT c.hidden_from_gal
+                   ORDER BY 1"#,
             )
             .bind(tenant.as_uuid())
             .fetch_all(&mut *tx)

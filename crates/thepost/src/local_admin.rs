@@ -8,7 +8,7 @@
 //! - [`serve`] — роль admin начинает приём на открытом сокете: соединения принимаются от root и от учётной
 //!   записи службы (владельца сокета), остальные — отказ (`SO_PEERCRED`, `tp_admin::init::serve_local`).
 //! - [`command`] — `thepost admin init [--email] [--name] [--force]`: запрос узлу по сокету, пароль и токен —
-//!   один раз в stdout.
+//!   один раз в stdout. Дальше администратор входит по паролю (`thepost admin login`, решение 117).
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
@@ -179,10 +179,10 @@ async fn init(config: &Path, args: InitArgs) -> std::result::Result<String, Stri
                 .unwrap_or_else(|| g.expires_at.to_string());
             Ok(format!(
                 "Администратор заведён: {login} (организация {tenant}, учётная запись {account}).\n\
-                 Пароль (IMAP, SMTP, JMAP; показывается один раз): {password}\n\
+                 Пароль (вход администратора, IMAP, SMTP, JMAP; показывается один раз): {password}\n\
                  Токен Admin API (одноразовый, действует до {expires}): {token}\n\
-                 Обмен на сессию Admin API: POST /api/v1/session с заголовком «Authorization: Bearer <токен>»;\n\
-                 в ответе — значение сессии (tps_…) для следующих запросов.\n",
+                 Вход: thepost admin login --user {login} или консоль — по паролю; токен — первый вход\n\
+                 в консоль при выключенном admin.password_login.\n",
                 login = g.login,
                 tenant = g.tenant,
                 account = g.account,

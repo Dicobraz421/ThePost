@@ -3,8 +3,9 @@
 //! - Адрес — `--url`, иначе `THEPOST_ADMIN_URL`, иначе `http.admin.listen` из config.yaml (`allow_plaintext` — `http`,
 //!   иначе `https`; сертификат на другое имя — `--ca-file` или `--insecure`).
 //! - Вход — `Authorization: Bearer`: сессия Admin API (`tps_…`) или токен OIDC; значение — `THEPOST_ADMIN_TOKEN`
-//!   (или `--token`, но ключ виден в списке процессов). Одноразовый токен `admin init` (`tpa_…`) обменивает на сессию
-//!   [`ApiAction::Login`] (`POST /api/v1/session`); для остальных запросов он не принимается и узлом.
+//!   (или `--token`, но ключ виден в списке процессов). Сессию выдаёт [`ApiAction::Login`] — вход по паролю
+//!   администратора (`POST /api/v1/session`, решение 117): пароль — из терминала без эха или `--password-stdin`,
+//!   не из аргумента. Одноразовый токен `admin init` (`tpa_…`) клиент не принимает.
 //! - Организация — `--org`, иначе `THEPOST_ADMIN_ORG`, иначе организация администратора (`GET /api/v1/whoami`).
 //! - Вывод — таблица или ответ API (`--json`); и то и другое — из типизированного ответа.
 //!
@@ -31,7 +32,7 @@ use tp_admin::app_passwords::{AppPasswordInfo, IssuedAppPassword, NewAppPassword
 use tp_admin::audit::{AuditPage, AuditParams};
 use tp_admin::delivery::{DeliveryParams, DeliveryResults};
 use tp_admin::groups::{GroupInfo, GroupPatch, NewGroup};
-use tp_admin::init::AdminSession;
+use tp_admin::init::{AdminSession, PasswordLogin};
 use tp_admin::retention::{PageQuery, RestoredMessage, TrashPage};
 use tp_admin::server::{Problem, WhoAmI};
 use tp_admin::sieve::{Script, ScriptBody, ScriptProblem, ScriptText, VacationBody};
@@ -102,9 +103,15 @@ impl Default for ApiArgs {
 /// Команды Admin API.
 #[derive(Debug, Clone, Subcommand)]
 pub enum ApiAction {
-    /// Обмен одноразового токена admin init (tpa_…, из THEPOST_ADMIN_TOKEN или --token) на сессию Admin API (tps_…);
+    /// Вход администратора по паролю — сессия Admin API (tps_…); пароль — из терминала без эха или --password-stdin.
     /// --oidc — вход у поставщика OIDC с устройства.
     Login {
+        /// Имя входа администратора (адрес; пароль — каталога или выданный thepost admin init).
+        #[arg(long, required_unless_present = "oidc", conflicts_with = "oidc")]
+        user: Option<String>,
+        /// Пароль — первой строкой stdin (сценарии), а не из терминала.
+        #[arg(long, conflicts_with = "oidc")]
+        password_stdin: bool,
         /// Вход у поставщика auth.oidc с устройства (RFC 8628, клиент — cli.oidc): адрес и код — в stderr, токен
         /// OIDC — строкой в stdout, без записи в историю оболочки:
         /// export THEPOST_ADMIN_TOKEN="$(thepost admin login --oidc)".
@@ -958,17 +965,26 @@ type CliResult<T> = std::result::Result<T, String>;
 /// Запрос без тела.
 const NO_BODY: Option<&()> = None;
 
-/// Клиент Admin API: адрес и токен входа.
+/// Клиент Admin API: адрес и токен входа (нет — только вход по паролю).
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
     base: Url,
-    token: String,
+    token: Option<String>,
 }
 
 impl Client {
     /// Клиент к `base` с токеном `token`; TLS — по `args` (`--ca-file`, `--insecure`), предельное время — `--timeout`.
     pub fn new(base: Url, token: String, args: &ApiArgs) -> CliResult<Self> {
+        Self::build(base, Some(token), args)
+    }
+
+    /// Клиент без токена — для входа по паролю ([`login`]).
+    pub fn anonymous(base: Url, args: &ApiArgs) -> CliResult<Self> {
+        Self::build(base, None, args)
+    }
+
+    fn build(base: Url, token: Option<String>, args: &ApiArgs) -> CliResult<Self> {
         let mut b = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(args.timeout.max(1)));
@@ -1025,7 +1041,10 @@ impl Client {
     ) -> CliResult<(HeaderMap, Vec<u8>)> {
         let url = self.url(op, params, query)?;
         let method = Method::from_bytes(op.method.as_bytes()).map_err(|e| e.to_string())?;
-        let mut req = self.http.request(method, url).bearer_auth(&self.token);
+        let mut req = self.http.request(method, url);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
         if let Some(body) = body {
             let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
             req = req.header(CONTENT_TYPE, "application/json").body(bytes);
@@ -1175,19 +1194,28 @@ fn problem(op: Op, status: StatusCode, body: &[u8]) -> String {
             ));
         }
     }
-    if status == StatusCode::UNAUTHORIZED {
-        msg.push_str(if op == SESSION {
-            " (токен admin init одноразовый: уже обменян, истёк или отозван; новый — thepost admin init --force)"
-        } else {
+    let hint = match (op == SESSION, status) {
+        (true, StatusCode::UNAUTHORIZED) => {
+            " (неверное имя входа или пароль, либо вход временно заблокирован после неудачных попыток)"
+        }
+        (true, StatusCode::FORBIDDEN) => {
+            " (у учётной записи нет ролей администрирования: admin.roles)"
+        }
+        (true, StatusCode::NOT_FOUND) => {
+            " (вход по паролю выключен: admin.password_login; вход через OIDC — thepost admin login --oidc)"
+        }
+        (false, StatusCode::UNAUTHORIZED) => {
             " (токен не принят: сессия истекла или токен OIDC неверен; новая сессия — thepost admin login)"
-        });
-    }
+        }
+        _ => "",
+    };
+    msg.push_str(hint);
     msg
 }
 
 /// `thepost admin <ресурс> <действие>`: код возврата (0 — успех, 1 — отказ или ошибка).
 pub async fn command(config: &Path, args: ApiArgs, action: ApiAction) -> i32 {
-    if matches!(action, ApiAction::Login { oidc: true }) {
+    if matches!(action, ApiAction::Login { oidc: true, .. }) {
         return crate::oidc_device::command(config).await;
     }
     match run(config, &args, action).await {
@@ -1203,14 +1231,76 @@ pub async fn command(config: &Path, args: ApiArgs, action: ApiAction) -> i32 {
 }
 
 async fn run(config: &Path, args: &ApiArgs, action: ApiAction) -> CliResult<String> {
-    let token = token(args, matches!(action, ApiAction::Login { .. }))?;
+    if let ApiAction::Login {
+        user: Some(user),
+        password_stdin,
+        ..
+    } = &action
+    {
+        let password = read_password(*password_stdin).await?;
+        let client = Client::anonymous(base_url(config, args)?, args)?;
+        return login(&client, args, user, password).await;
+    }
+    let token = token(args)?;
     let base = base_url(config, args)?;
     let client = Client::new(base, token, args)?;
     execute(&client, args, action).await
 }
 
-/// Токен из `--token` или `THEPOST_ADMIN_TOKEN`; `login` ждёт одноразовый токен, остальные команды — не его.
-fn token(args: &ApiArgs, login: bool) -> CliResult<String> {
+/// Пароль входа: первая строка stdin (`--password-stdin`) или ввод в терминале без эха; чтение — вне потоков async.
+async fn read_password(stdin: bool) -> CliResult<String> {
+    let read = move || -> std::io::Result<String> {
+        if stdin {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+        } else {
+            rpassword::prompt_password("Пароль: ")
+        }
+    };
+    let password = tokio::task::spawn_blocking(read)
+        .await
+        .map_err(|e| format!("чтение пароля: {e}"))?
+        .map_err(|e| {
+            if stdin {
+                format!("пароль из stdin: {e}")
+            } else {
+                format!("пароль из терминала: {e} (без терминала — --password-stdin)")
+            }
+        })?;
+    if password.is_empty() {
+        return Err("пустой пароль".to_owned());
+    }
+    Ok(password)
+}
+
+/// Вход по паролю: сессия Admin API (`POST /api/v1/session`), значение — один раз в stdout.
+pub async fn login(
+    client: &Client,
+    args: &ApiArgs,
+    user: &str,
+    password: String,
+) -> CliResult<String> {
+    let body = PasswordLogin {
+        login: user.trim().to_owned(),
+        password,
+    };
+    let s: AdminSession = client.call(SESSION, &[], &[], Some(&body)).await?;
+    let text = format!(
+        "{}Значение сессии показывается один раз. Дальше: export {ENV_TOKEN}=<сессия>\n",
+        record(&[
+            ("Сессия", s.session.clone()),
+            ("Действует до", json_field(&s, "expires_at")),
+            ("Администратор", s.login.clone()),
+            ("Организация", s.tenant.clone()),
+            ("Роли", roles(&s.roles)),
+        ])
+    );
+    out(args, &s, text)
+}
+
+/// Токен из `--token` или `THEPOST_ADMIN_TOKEN`: сессия или токен OIDC, не одноразовый токен `admin init`.
+fn token(args: &ApiArgs) -> CliResult<String> {
     let token = args
         .token
         .clone()
@@ -1222,17 +1312,14 @@ fn token(args: &ApiArgs, login: bool) -> CliResult<String> {
                 "нет токена: задайте {ENV_TOKEN} (сессия tps_… из thepost admin login или токен OIDC) или --token"
             )
         })?;
-    match (login, is_local_admin_token(&token)) {
-        (true, false) => Err(format!(
-            "login обменивает одноразовый токен thepost admin init (tpa_…); в {ENV_TOKEN} — другой токен"
-        )),
-        (false, true) => Err(
-            "одноразовый токен admin init (tpa_…) не принимается для запросов: обменяйте его на сессию — \
-             thepost admin login"
+    if is_local_admin_token(&token) {
+        return Err(
+            "одноразовый токен admin init (tpa_…) не принимается: войдите по паролю — \
+             thepost admin login --user <адрес>"
                 .to_owned(),
-        ),
-        _ => Ok(token),
+        );
     }
+    Ok(token)
 }
 
 /// Адрес Admin API: `--url`, `THEPOST_ADMIN_URL` или `http.admin` из config.yaml.
@@ -1292,23 +1379,9 @@ fn out<T: Serialize>(args: &ApiArgs, v: &T, text: String) -> CliResult<String> {
 /// Выполняет команду через `client`; текст для stdout.
 pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliResult<String> {
     match action {
-        ApiAction::Login { oidc: true } => Err(
-            "login --oidc — вход у поставщика OIDC (thepost admin login --oidc), не запрос Admin API".to_owned(),
+        ApiAction::Login { .. } => Err(
+            "login — вход по паролю или у поставщика OIDC (thepost admin login), не запрос с сессией".to_owned(),
         ),
-        ApiAction::Login { oidc: false } => {
-            let s: AdminSession = client.call(SESSION, &[], &[], NO_BODY).await?;
-            let text = format!(
-                "{}Значение сессии показывается один раз. Дальше: export {ENV_TOKEN}=<сессия>\n",
-                record(&[
-                    ("Сессия", s.session.clone()),
-                    ("Действует до", json_field(&s, "expires_at")),
-                    ("Администратор", s.login.clone()),
-                    ("Организация", s.tenant.clone()),
-                    ("Роли", roles(&s.roles)),
-                ])
-            );
-            out(args, &s, text)
-        }
         ApiAction::Whoami => {
             let w: WhoAmI = client.call(WHOAMI, &[], &[], NO_BODY).await?;
             out(args, &w, whoami_record(&w))
@@ -2690,9 +2763,9 @@ mod tests {
     use tp_contracts::auth::Principal;
     use tp_contracts::ext::DecisionHooks;
     use tp_testkit::{
-        Clock, FakeAuthenticator, MemAppPasswords, MemAuditLog, MemBlobIndex, MemBlobStore,
-        MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemModeration,
-        MemPolicies, MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
+        Clock, FakeAuthenticator, MemAbuseBlocks, MemAppPasswords, MemAuditLog, MemBlobIndex,
+        MemBlobStore, MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata,
+        MemModeration, MemPolicies, MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
     };
     use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
@@ -2769,12 +2842,52 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Admin {
-                action: AdminAction::Api(ApiAction::Login { oidc: true }),
+                action: AdminAction::Api(ApiAction::Login {
+                    oidc: true,
+                    user: None,
+                    ..
+                }),
                 ..
             }
         ));
-        for args in [
+        // Пароль — не аргумент: только --user и --password-stdin; без --user (и без --oidc) — ошибка разбора.
+        let cli = Cli::try_parse_from([
+            "thepost",
+            "admin",
+            "login",
+            "--user",
+            "a@b.test",
+            "--password-stdin",
+        ])
+        .expect("login --user");
+        assert!(matches!(
+            cli.command,
+            Command::Admin {
+                action: AdminAction::Api(ApiAction::Login {
+                    user: Some(_),
+                    password_stdin: true,
+                    oidc: false
+                }),
+                ..
+            }
+        ));
+        for bad in [
             &["thepost", "admin", "login"][..],
+            &[
+                "thepost",
+                "admin",
+                "login",
+                "--user",
+                "a@b.test",
+                "--password",
+                "x",
+            ],
+            &["thepost", "admin", "login", "--user", "a@b.test", "--oidc"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+        for args in [
+            &["thepost", "admin", "login", "--user", "a@b.test"][..],
             &["thepost", "admin", "whoami"],
             &[
                 "thepost",
@@ -3119,11 +3232,9 @@ mod tests {
             token: Some(t.to_owned()),
             ..ApiArgs::default()
         };
-        assert!(token(&args("tpa_x"), true).is_ok());
-        assert!(token(&args("tps_x"), true).is_err());
-        let err = token(&args("tpa_x"), false).expect_err("local token");
-        assert!(err.contains("thepost admin login"), "{err}");
-        assert_eq!(token(&args(" tps_x "), false).expect("session"), "tps_x");
+        let err = token(&args("tpa_x")).expect_err("local token");
+        assert!(err.contains("thepost admin login --user"), "{err}");
+        assert_eq!(token(&args(" tps_x ")).expect("session"), "tps_x");
     }
 
     #[test]
@@ -3252,6 +3363,12 @@ mod tests {
     /// Admin API tp-admin на хранилищах testkit на loopback: локальный вход подключён, `oidc` — токен OIDC
     /// администратора инсталляции; страница списков — 2 записи (переход по `Link` в каждом списке длиннее).
     async fn admin_api() -> (Arc<tp_admin::Admin>, Url) {
+        admin_api_with(tp_auth::AbuseConfig::default()).await
+    }
+
+    /// То же с защитой от перебора `abuse`. Учётные данные проверяет путь входа узла ([`crate::services::Guarded`]):
+    /// пароль — `PasswordAuthenticator` с паролями приложений, Bearer — `oidc`; адрес клиента — из соединения.
+    async fn admin_api_with(abuse: tp_auth::AbuseConfig) -> (Arc<tp_admin::Admin>, Url) {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let index = MemBlobIndex::new(clock.clone());
         let meta = MemMetadata::new(clock.clone()).with_blob_index(index.clone());
@@ -3273,8 +3390,8 @@ mod tests {
             tp_auth::PasswordConfig::default(),
         )
         .expect("app passwords");
-        let auth = FakeAuthenticator::default();
-        auth.add_token(
+        let bearer = FakeAuthenticator::default();
+        bearer.add_token(
             "oidc",
             Principal {
                 tenant: TenantId::DEFAULT,
@@ -3283,6 +3400,20 @@ mod tests {
                 groups: BTreeSet::from(["mail-root".to_owned()]),
                 scopes: None,
             },
+        );
+        let password = tp_auth::PasswordAuthenticator::new(tp_auth::Accounts::new(
+            TenantId::DEFAULT,
+            Arc::new(meta.clone()),
+        ))
+        .with_app_passwords(app_passwords.clone());
+        let router = tp_auth::CredentialsRouter::default()
+            .password(Arc::new(password))
+            .bearer(Arc::new(bearer));
+        let auth = crate::services::Guarded::new(
+            Arc::new(router),
+            tp_auth::AbuseGuard::new(abuse, Arc::new(MemAbuseBlocks::default())),
+            Arc::new(meta.clone()),
+            TenantId::DEFAULT,
         );
         let deps = Deps {
             auth: Arc::new(auth),
@@ -3327,10 +3458,44 @@ mod tests {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let router = admin.clone().router();
+        let router = admin
+            .clone()
+            .router()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, router).await });
         let url = Url::parse(&format!("http://{addr}")).expect("url");
         (admin, url)
+    }
+
+    /// Приёмка ADM-41: перебор пароля с одного адреса — блокировка `AbuseGuard` по адресу клиента, после неё и
+    /// верный пароль не принимается (401).
+    #[tokio::test]
+    async fn password_login_bruteforce_is_blocked() {
+        let (admin, url) = admin_api_with(tp_auth::AbuseConfig {
+            ip_failures: 3,
+            ..tp_auth::AbuseConfig::default()
+        })
+        .await;
+        let granted = admin
+            .init(&InitRequest {
+                email: "admin@example.test".into(),
+                display_name: None,
+                force: false,
+            })
+            .await
+            .expect("init");
+        let anon = Client::anonymous(url, &ApiArgs::default()).expect("client");
+        let args = ApiArgs::default();
+        for _ in 0..3 {
+            let err = login(&anon, &args, &granted.login, "wrong".into())
+                .await
+                .expect_err("неверный пароль");
+            assert!(err.contains("401"), "{err}");
+        }
+        let err = login(&anon, &args, &granted.login, granted.password.clone())
+            .await
+            .expect_err("адрес заблокирован");
+        assert!(err.contains("401"), "{err}");
     }
 
     /// Проверка скрипта, как у узла: разбор tp-sieve.
@@ -3417,20 +3582,28 @@ mod tests {
             .await
             .expect("init");
 
-        // Обмен одноразового токена: сессия один раз, повтор — 401 с подсказкой.
-        let local = client(&url, &granted.token);
+        // Вход по паролю admin init: сессия; неверный пароль — 401 с подсказкой.
+        let anon = Client::anonymous(url.clone(), &ApiArgs::default()).expect("client");
+        let json_args = ApiArgs {
+            json: true,
+            ..ApiArgs::default()
+        };
         let session: Value = serde_json::from_str(
-            &exec(&local, true, ApiAction::Login { oidc: false })
+            &login(&anon, &json_args, &granted.login, granted.password.clone())
                 .await
                 .expect("login"),
         )
         .expect("json");
         let session = session["session"].as_str().expect("session").to_owned();
         assert!(session.starts_with("tps_"), "{session}");
-        let err = exec(&local, false, ApiAction::Login { oidc: false })
+        let err = login(&anon, &ApiArgs::default(), &granted.login, "wrong".into())
             .await
-            .expect_err("повтор");
-        assert!(err.contains("401") && err.contains("одноразовый"), "{err}");
+            .expect_err("неверный пароль");
+        assert!(err.contains("401") && err.contains("пароль"), "{err}");
+        let err = exec(&anon, false, ApiAction::Whoami)
+            .await
+            .expect_err("без сессии");
+        assert!(err.contains("401"), "{err}");
 
         let s = client(&url, &session);
         let who = exec(&s, false, ApiAction::Whoami).await.expect("whoami");
@@ -4140,7 +4313,11 @@ mod tests {
                  tls: {{ allow_plaintext: true }}\n{cli}"
             )
         };
-        let login = || ApiAction::Login { oidc: true };
+        let login = || ApiAction::Login {
+            user: None,
+            password_stdin: false,
+            oidc: true,
+        };
         std::fs::write(&path, config("cli:\n  oidc:\n    client_id: thepost-cli\n"))
             .expect("write");
         assert_eq!(command(&path, ApiArgs::default(), login()).await, 0);
