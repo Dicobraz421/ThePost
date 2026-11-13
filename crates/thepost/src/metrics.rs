@@ -4,7 +4,8 @@
 //! Метрики критериев Д.7 (APP-34): пул соединений узла и слушатель LISTEN (`tp_platform::DbMetrics`), время
 //! фиксаций с NOTIFY и число слушателей ([`register_db`]), «сироты» BLOB ([`register_orphans`]).
 //!
-//! Проверка целостности BLOB по расписанию (APP-44): [`register_verify`].
+//! Проверка целостности BLOB по расписанию (APP-44): [`register_verify`]. Очистка по сроку роли maintenance
+//! (APP-52): [`register_purge`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ use tp_meta::signals::{PgSignalBus, SignalMetrics};
 use tp_platform::{DbMetrics, ListenerSample, Metrics, PoolSample};
 use tp_search::{CacheStats, IndexCache, Indexer, IndexerStats};
 
-use crate::roles::{OrphanProbe, VerifyMetrics, VerifyProbe};
+use crate::roles::{OrphanProbe, PurgeProbe, VerifyMetrics, VerifyProbe};
 
 /// Описание показателя: имя, пояснение, значение `V` из снимка `S`, счётчик (иначе — текущее значение).
 type StatDef<S, V = u64> = (&'static str, &'static str, fn(&S) -> V, bool);
@@ -421,9 +422,77 @@ pub fn register_verify(metrics: &Metrics) -> VerifyProbe {
     probe
 }
 
+/// Регистрирует показатели очистки по сроку роли maintenance (APP-52) с меткой `step` (`Purged::STEPS`):
+/// `tp_maintenance_purge_{runs,errors}_total`, `tp_maintenance_purged_total` (у шагов с числом удалённых записей) и
+/// `tp_maintenance_purge_last_success_timestamp_seconds` (0 — успешных выполнений не было). Возвращает держатель для
+/// `Purge::probe`: до первого прохода значения нулевые.
+pub fn register_purge(metrics: &Metrics) -> PurgeProbe {
+    let probe = PurgeProbe::new();
+    metrics.register(
+        "tp_maintenance_purge_runs",
+        "Выполнения шагов очистки по сроку роли maintenance",
+        probe.runs.clone(),
+    );
+    metrics.register(
+        "tp_maintenance_purge_errors",
+        "Шаги очистки по сроку, завершённые ошибкой (повтор — в следующий проход)",
+        probe.errors.clone(),
+    );
+    metrics.register(
+        "tp_maintenance_purged",
+        "Записи, удалённые очисткой по сроку",
+        probe.purged.clone(),
+    );
+    metrics.register(
+        "tp_maintenance_purge_last_success_timestamp_seconds",
+        "Момент последнего успешного выполнения шага очистки, секунд от начала эпохи Unix (0 — не было)",
+        probe.last_success.clone(),
+    );
+    probe
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// APP-52: ошибка шага увеличивает счётчик ошибок и не меняет время успеха; успешный шаг — время и удалённые
+    /// записи. Ряды всех шагов есть до первого прохода.
+    #[test]
+    fn purge_stats_exported() {
+        let metrics = Metrics::default();
+        let probe = register_purge(&metrics);
+        let text = metrics.encode().expect("encode");
+        for step in crate::roles::Purged::STEPS {
+            for line in [
+                format!("tp_maintenance_purge_runs_total{{step=\"{step}\"}} 0"),
+                format!("tp_maintenance_purge_errors_total{{step=\"{step}\"}} 0"),
+                format!("tp_maintenance_purge_last_success_timestamp_seconds{{step=\"{step}\"}} 0"),
+            ] {
+                assert!(text.contains(&line), "{line}: {text}");
+            }
+        }
+
+        let failure = tp_contracts::Error::internal("СУБД недоступна");
+        probe.record("purge_vacation_log", Err(&failure), 1_700_000_000);
+        probe.record("purge_dav_tombstones", Ok(Some(3)), 1_700_000_100);
+        probe.record("purge_expired_delivery", Ok(None), 1_700_000_200);
+        let text = metrics.encode().expect("encode");
+        for line in [
+            "tp_maintenance_purge_runs_total{step=\"purge_vacation_log\"} 1",
+            "tp_maintenance_purge_errors_total{step=\"purge_vacation_log\"} 1",
+            "tp_maintenance_purge_last_success_timestamp_seconds{step=\"purge_vacation_log\"} 0",
+            "tp_maintenance_purge_errors_total{step=\"purge_dav_tombstones\"} 0",
+            "tp_maintenance_purged_total{step=\"purge_dav_tombstones\"} 3",
+            "tp_maintenance_purge_last_success_timestamp_seconds{step=\"purge_dav_tombstones\"} 1700000100",
+            "tp_maintenance_purge_last_success_timestamp_seconds{step=\"purge_expired_delivery\"} 1700000200",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        assert!(
+            !text.contains("tp_maintenance_purged_total{step=\"purge_expired_delivery\"}"),
+            "журнал удаляется секциями: числа записей нет"
+        );
+    }
 
     /// Гистограмма из снимка `tp-meta` кодируется накопительно с границами в секундах и `+Inf`.
     #[test]
