@@ -24,6 +24,7 @@ use tp_contracts::meta::{
     disabled_mailbox_changed,
 };
 use tp_contracts::retention::{PurgeOutcome, Restored};
+use tp_contracts::sharing::{BookingPolicy, Delegate, SharingPolicy};
 use tp_contracts::{
     AccountId, BlobKey, DomainId, Error, MailboxId, MessageId, ModSeq, Result, TenantId, Uid,
     UidValidity,
@@ -126,6 +127,10 @@ struct AccountData {
     floor: ModSeq,
     /// Состояние ящика (CTR-35).
     state: AccountState,
+    /// Представители учётной записи по `delegate` (CTR-48).
+    delegates: BTreeMap<AccountId, Delegate>,
+    /// Правила бронирования ресурса (CTR-48); только у вида [`AccountKind::Resource`].
+    booking: Option<BookingPolicy>,
 }
 
 /// Письмо-кандидат в архив (CTR-76): идентификатор, папка, момент получения.
@@ -632,6 +637,8 @@ impl AccountData {
 #[derive(Debug, Default)]
 struct MetaState {
     accounts: HashMap<(TenantId, AccountId), AccountData>,
+    /// Политики общего доступа организаций (CTR-48); нет — по умолчанию.
+    sharing: HashMap<TenantId, SharingPolicy>,
 }
 
 /// Метаданные в памяти: [`AccountStore`], [`MailboxStore`], [`MessageStore`], [`ChangeLog`].
@@ -1257,6 +1264,10 @@ impl AccountStore for MemMetadata {
                 .accounts
                 .get_mut(&(tenant, id))
                 .ok_or_else(|| Error::internal("учётная запись пропала"))?;
+            if data.kind != AccountKind::Resource {
+                // Смена вида на пользователя снимает правила бронирования (CTR-48).
+                acc.booking = None;
+            }
             let a = &mut acc.account;
             a.domain = data.domain;
             a.aliases = account_aliases(&data.login, data.aliases.iter().map(String::as_str));
@@ -1302,6 +1313,8 @@ impl AccountStore for MemMetadata {
             mbx_log: Vec::new(),
             floor: ModSeq::ZERO,
             state: AccountState::Active,
+            delegates: BTreeMap::new(),
+            booking: None,
         };
         for (name, role) in SYSTEM_FOLDERS {
             let data = NewMailbox {
@@ -2124,6 +2137,8 @@ impl ChangeLog for MemMetadata {
         })
     }
 }
+
+mod sharing;
 
 #[cfg(test)]
 mod tests {

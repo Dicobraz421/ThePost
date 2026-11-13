@@ -23,6 +23,10 @@ use tp_contracts::schedule::{
     BusyPeriod, FreeBusy, Inbox, InboxItem, InboxMessage, Period, merge_busy,
     schedule_inbox_changed,
 };
+use tp_contracts::sharing::{
+    CollectionAcl, CollectionAclEntry, CollectionRights, SharedCollection, collection_rights,
+    validate_identifier,
+};
 use tp_contracts::{AccountId, Error, ModSeq, Result, TenantId};
 
 use crate::infra::lock;
@@ -46,6 +50,8 @@ struct Coll {
     created: ModSeq,
     props: ModSeq,
     objects: BTreeMap<String, Obj>,
+    /// Права на коллекцию по субъектам (CTR-48), как выданы; удаляются с коллекцией.
+    acl: BTreeMap<String, CollectionRights>,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +399,7 @@ impl DavStore for MemDav {
                     created: modseq,
                     props: modseq,
                     objects: BTreeMap::new(),
+                    acl: BTreeMap::new(),
                 },
             );
             (cleared, modseq)
@@ -930,6 +937,7 @@ impl DavStore for MemDav {
                         created: modseq,
                         props: modseq,
                         objects: BTreeMap::new(),
+                        acl: BTreeMap::new(),
                     }
                 }
             };
@@ -1140,6 +1148,101 @@ impl DavStore for MemDav {
     }
 }
 
+/// Права на коллекции (CTR-48): записи — у своей коллекции учётной записи (книга GAL — `NotFound`), удаляются вместе
+/// с ней, как внешним ключом в PostgreSQL.
+#[async_trait]
+impl CollectionAcl for MemDav {
+    async fn collection_acl(
+        &self,
+        owner: AccountScope,
+        collection: CollectionId,
+    ) -> Result<Vec<CollectionAclEntry>> {
+        let st = lock(&self.state);
+        let c = st
+            .accounts
+            .get(&owner)
+            .and_then(|a| a.collections.get(&collection))
+            .ok_or(Error::NotFound)?;
+        Ok(acl_entries(&c.acl))
+    }
+
+    async fn set_collection_acl(
+        &self,
+        owner: AccountScope,
+        collection: CollectionId,
+        identifier: &str,
+        rights: CollectionRights,
+    ) -> Result<()> {
+        validate_identifier(identifier, false)?;
+        let mut st = lock(&self.state);
+        let c = st
+            .accounts
+            .get_mut(&owner)
+            .and_then(|a| a.collections.get_mut(&collection))
+            .ok_or(Error::NotFound)?;
+        if rights.is_empty() {
+            c.acl.remove(identifier);
+        } else {
+            c.acl.insert(identifier.to_owned(), rights);
+        }
+        Ok(())
+    }
+
+    async fn collection_rights(
+        &self,
+        owner: AccountScope,
+        collection: CollectionId,
+        identifiers: &[String],
+    ) -> Result<CollectionRights> {
+        for id in identifiers {
+            validate_identifier(id, false)?;
+        }
+        let st = lock(&self.state);
+        Ok(st
+            .accounts
+            .get(&owner)
+            .and_then(|a| a.collections.get(&collection))
+            .map_or(CollectionRights::NONE, |c| {
+                collection_rights(acl_entries(&c.acl).iter(), identifiers)
+            }))
+    }
+
+    async fn shared_with(
+        &self,
+        scope: AccountScope,
+        identifiers: &[String],
+    ) -> Result<Vec<SharedCollection>> {
+        for id in identifiers {
+            validate_identifier(id, false)?;
+        }
+        let st = lock(&self.state);
+        let mut out: Vec<SharedCollection> = st
+            .accounts
+            .iter()
+            .filter(|(owner, _)| owner.tenant == scope.tenant && owner.account != scope.account)
+            .flat_map(|(owner, acc)| {
+                acc.collections.iter().map(|(id, c)| SharedCollection {
+                    owner: owner.account,
+                    collection: *id,
+                    rights: collection_rights(acl_entries(&c.acl).iter(), identifiers),
+                })
+            })
+            .filter(|s| !s.rights.is_empty())
+            .collect();
+        out.sort_by_key(|s| (s.owner, s.collection));
+        Ok(out)
+    }
+}
+
+fn acl_entries(acl: &BTreeMap<String, CollectionRights>) -> Vec<CollectionAclEntry> {
+    acl.iter()
+        .map(|(identifier, rights)| CollectionAclEntry {
+            identifier: identifier.clone(),
+            rights: *rights,
+        })
+        .collect()
+}
+
 #[async_trait]
 impl FreeBusy for MemDav {
     async fn query(
@@ -1213,6 +1316,28 @@ mod tests {
     async fn suite_dav() {
         let store = MemDav::new().with_limits(suite::dav::LIMITS);
         suite::dav(&store, &suite::dav::DavFixture::new()).await;
+    }
+
+    #[tokio::test]
+    async fn suite_collection_acl() {
+        let store = MemDav::new();
+        let tenant = TenantId::new();
+        let fx = suite::sharing::SharingFixture {
+            owner: AccountScope {
+                tenant,
+                account: AccountId::new(),
+            },
+            peer: AccountScope {
+                tenant,
+                account: AccountId::new(),
+            },
+            resource: AccountScope {
+                tenant,
+                account: AccountId::new(),
+            },
+            foreign: scope(),
+        };
+        suite::sharing::collection_acl(&store, &store, &fx).await;
     }
 
     #[tokio::test]
