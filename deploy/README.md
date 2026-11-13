@@ -291,16 +291,18 @@ Hardening юнита: пустой `CapabilityBoundingSet=`, `NoNewPrivileges`, 
 и заменить `LoadCredential=` на `LoadCredentialEncrypted=` (drop-in `systemctl edit thepost`).
 
 ### Вход по Kerberos (GSSAPI)
-SASL GSSAPI (SMTP, IMAP, ManageSieve; секция `auth.gssapi`) — системная MIT Kerberos (`libgssapi_krb5`: пакет
+SASL GSSAPI (SMTP, IMAP, POP3, ManageSieve; секция `auth.gssapi`) — системная MIT Kerberos (`libgssapi_krb5`: пакет
 выше, в образе — своя копия). Keytab узла — по принципалу на службу, `<узел>` — имя, по которому подключаются клиенты
-(`gssapi.hostname`): `smtp/<узел>`, `imap/<узел>`, `sieve/<узел>` (ManageSieve, RFC 5804). Билет одной службы для
-другой не принимается. `HTTP/<узел>` не нужен: JMAP, DAV и Admin API по Kerberos не входят.
+(`gssapi.hostname`): `smtp/<узел>`, `imap/<узел>`, `pop/<узел>` (POP3, RFC 5034), `sieve/<узел>` (ManageSieve,
+RFC 5804). Билет одной службы для другой не принимается. `HTTP/<узел>` не нужен: JMAP, DAV и Admin API по Kerberos
+не входят.
 ```bash
 # MIT Kerberos (kadmin), область EXAMPLE.RU:
-kadmin -q 'addprinc -randkey smtp/mail.example.ru' -q 'addprinc -randkey imap/mail.example.ru'        -q 'addprinc -randkey sieve/mail.example.ru'
-kadmin -q 'ktadd -k thepost.keytab smtp/mail.example.ru imap/mail.example.ru sieve/mail.example.ru'
-# Active Directory: учётная запись узла с SPN smtp/, imap/, sieve/mail.example.ru (setspn -S), keytab — ktpass или msktutil.
-klist -k thepost.keytab   # три принципала
+kadmin -q 'addprinc -randkey smtp/mail.example.ru' -q 'addprinc -randkey imap/mail.example.ru' \
+       -q 'addprinc -randkey pop/mail.example.ru' -q 'addprinc -randkey sieve/mail.example.ru'
+kadmin -q 'ktadd -k thepost.keytab smtp/mail.example.ru imap/mail.example.ru pop/mail.example.ru sieve/mail.example.ru'
+# Active Directory: учётная запись узла с SPN smtp/, imap/, pop/, sieve/mail.example.ru (setspn -S), keytab — ktpass или msktutil.
+klist -k thepost.keytab   # четыре принципала
 ```
 Keytab MIT Kerberos читает только из `KRB5_KTNAME`; `auth.gssapi.keytab` узел сверяет с этой переменной.
 - ВМ (Ansible): `thepost_gssapi_keytab_src` — файл на управляющей машине → `/etc/thepost/thepost.keytab` (0640
