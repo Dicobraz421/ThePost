@@ -7,16 +7,21 @@
 //! к полнотекстовому индексу ([`SearchIndex`]): по словам с морфологией, а не по подстроке. Индекс может
 //! отставать от приёма: только что пришедшее письмо по тексту может не найтись.
 //!
+//! Поиск с `BODY`/`TEXT` в чужой папке записывается в журнал аудита (`AuditAction::Search`, IMAP-23) до
+//! выполнения; в пояснении — только эти условия.
+//!
 //! Ответ — `* SEARCH` для клиентов IMAP4rev1 без `RETURN`, иначе `* ESEARCH` (в IMAP4rev2 — всегда).
 //! `RETURN (SAVE)` (SEARCHRES) не поддерживается: imap-codec не разбирает `$` в наборах номеров.
 
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU32, NonZeroU64};
 
+use tp_contracts::audit::AuditAction;
 use tp_contracts::meta::{Address, Flag, Message, MessageQuery};
 use tp_contracts::search::{SearchSort, TextField, TextQuery};
 use tp_contracts::{Error, MessageId, Result};
 
+use crate::audit;
 use crate::proto::types::core::{AString, Charset, Tag, Vec1};
 use crate::proto::types::response::{Code, Data};
 use crate::proto::types::search::SearchKey;
@@ -86,6 +91,36 @@ fn collect_text(key: &SearchKey<'_>, out: &mut Vec<TextQuery>) {
                 out.push(q);
             }
         }
+    }
+}
+
+/// Условия `BODY`/`TEXT` для журнала аудита (решение 114): `BODY "…"`, `TEXT "…"` в порядке запроса без
+/// повторов, строка — как прислал клиент (кавычки и `\` экранированы); прочие критерии не раскрываются.
+fn audit_terms(key: &SearchKey<'_>, out: &mut Vec<String>) {
+    let (name, s) = match key {
+        SearchKey::And(keys) => {
+            keys.as_ref().iter().for_each(|k| audit_terms(k, out));
+            return;
+        }
+        SearchKey::Or(a, b) => {
+            audit_terms(a, out);
+            audit_terms(b, out);
+            return;
+        }
+        SearchKey::Not(k) => {
+            audit_terms(k, out);
+            return;
+        }
+        SearchKey::Body(s) => ("BODY", s),
+        SearchKey::Text(s) => ("TEXT", s),
+        _ => return,
+    };
+    let s = String::from_utf8_lossy(s.as_ref())
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let t = format!("{name} \"{s}\"");
+    if !out.contains(&t) {
+        out.push(t);
     }
 }
 
@@ -334,6 +369,13 @@ impl<T: Transport> Session<T> {
         let snapshot = selected.messages.clone();
         let scope = self.mailbox_scope().ok_or(Error::Forbidden)?;
         let key = SearchKey::And(cmd.criteria);
+        // Поиск по тексту в чужой папке — в журнал до выполнения: без записи результат не выдаётся.
+        let mut terms = Vec::new();
+        audit_terms(&key, &mut terms);
+        if let Some(detail) = audit::detail(&terms.join(" ")) {
+            self.audit(scope, AuditAction::Search, mailbox, &[], Some(detail))
+                .await?;
+        }
         let modseq_used = uses_modseq(&key);
         // Критерий MODSEQ включает CONDSTORE (RFC 7162, 3.1).
         if modseq_used {

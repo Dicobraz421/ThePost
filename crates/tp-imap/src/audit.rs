@@ -1,11 +1,14 @@
 //! Аудит доступа к ящику в IMAP и POP3 (IMAP-15; CONTRACTS.md#MailboxAudit, SRS 5.2).
 //!
 //! Действие с ящиком записывается в [`MailboxAudit`] из [`crate::Deps::audit`]: исполнитель — владелец, если вошёл в свою учётную запись,
-//! иначе представитель (общие папки по ACL). Что сохранять, решает политика ящика в хранилище; вход и чтение
-//! владельцем не передаются вовсе (никогда не записываются). Точки записи:
+//! иначе представитель (общие папки по ACL). Что сохранять, решает политика ящика в хранилище; вход, чтение и
+//! поиск владельцем не передаются вовсе (никогда не записываются). Точки записи:
 //! - `SELECT`/`EXAMINE` чужой папки — `Login`;
 //! - `FETCH` содержимого письма (`BODY[…]`, `BINARY[…]`, `RFC822*`) и `COPY`/`MOVE` из чужой папки — `Read`
 //!   до выдачи данных: без записи данные не выдаются;
+//! - `SEARCH`/`UID SEARCH` (и с `RETURN`) с `BODY`/`TEXT` в чужой папке — `Search` до выполнения (решение 114):
+//!   пояснение — только эти условия (`BODY "…"`, `TEXT "…"`) через [`detail`], найденные письма не записываются;
+//!   поиск по заголовкам, флагам и прочим метаданным не записывается;
 //! - `MOVE` — `Move`; `EXPUNGE`, `UID EXPUNGE`, `CLOSE`, POP3 `QUIT` с `DELE`, `DELETE` папки с письмами —
 //!   `Delete` (запись о папке);
 //! - `SETACL`, `DELETEACL` — `ChangeRights` (пояснение — идентификатор и новые права).
@@ -17,12 +20,25 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 use tp_contracts::Result;
-use tp_contracts::audit::{AuditAction, AuditActorKind, AuditEntry, AuditObject, MailboxAudit};
+use tp_contracts::audit::{
+    AuditAction, AuditActorKind, AuditEntry, AuditObject, MAX_AUDIT_TEXT_LEN, MailboxAudit,
+};
 use tp_contracts::auth::Principal;
 use tp_contracts::ids::{MailboxId, MessageId};
 use tp_contracts::meta::AccountScope;
 
 use crate::session::{Session, Transport};
+
+/// Пояснение записи (CONTRACTS.md#MailboxAudit): без управляющих символов, не длиннее [`MAX_AUDIT_TEXT_LEN`]
+/// символов; пустое — `None`.
+pub(crate) fn detail(text: &str) -> Option<String> {
+    let clean: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_AUDIT_TEXT_LEN)
+        .collect();
+    (!clean.is_empty()).then_some(clean)
+}
 
 /// Журнал аудита сессии и адрес клиента.
 #[derive(Clone)]
@@ -57,7 +73,11 @@ impl Audit {
         } else {
             AuditActorKind::Delegate
         };
-        if kind == AuditActorKind::Owner && matches!(action, AuditAction::Login | AuditAction::Read)
+        if kind == AuditActorKind::Owner
+            && matches!(
+                action,
+                AuditAction::Login | AuditAction::Read | AuditAction::Search
+            )
         {
             return Ok(());
         }
@@ -137,5 +157,24 @@ impl<T: Transport> Session<T> {
                 .record_done(p, owner, action, Some(mailbox), messages, detail)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tp_contracts::audit::MAX_AUDIT_TEXT_LEN;
+
+    use super::detail;
+
+    #[test]
+    fn detail_limits() {
+        assert_eq!(detail(""), None);
+        assert_eq!(detail("\r\n\t"), None);
+        assert_eq!(
+            detail("BODY \"до\r\nговор\"").as_deref(),
+            Some("BODY \"договор\"")
+        );
+        let long = detail(&"я".repeat(MAX_AUDIT_TEXT_LEN + 5)).expect("detail");
+        assert_eq!(long.chars().count(), MAX_AUDIT_TEXT_LEN);
     }
 }
