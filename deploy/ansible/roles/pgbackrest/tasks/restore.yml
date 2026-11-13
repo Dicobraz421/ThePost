@@ -174,10 +174,12 @@
 - name: Check verify report
   ansible.builtin.assert:
     that:
-      - (thepost_restore_verify.stdout | from_json).damaged | int == 0
+      - (thepost_restore_verify.stdout | from_json).missing | int == 0
+      - (thepost_restore_verify.stdout | from_json).size_mismatch | int == 0
       - (thepost_restore_verify.stdout | from_json).errors | int == 0
     fail_msg: >-
-      thepost verify: повреждённых записей {{ (thepost_restore_verify.stdout | from_json).damaged }}, ошибок
+      thepost verify: пропало {{ (thepost_restore_verify.stdout | from_json).missing }}, неверный размер
+      {{ (thepost_restore_verify.stdout | from_json).size_mismatch }}, ошибок
       {{ (thepost_restore_verify.stdout | from_json).errors }} — тела части писем отсутствуют (копия BLOB старше T?).
       Подробности — runuser -u thepost -- thepost verify; пометить повреждённые — thepost verify --fix
     success_msg: >-

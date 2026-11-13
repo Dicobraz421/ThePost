@@ -587,7 +587,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ mailstore-13 | FIX-06, FIX-07 | A | — | 1 |
 | ✅ smtp-22 | FIX-08 | A | — | 4 |
 | admin-25 | ADM-37, ADM-38, ADM-39 | A | app-39 | 3 |
-| ✅ blob-10 | BLOB-17 | A | — | 4 |
+| blob-10 | BLOB-17 | A | — | 4 |
 | deploy-35 | DEP-49 | A | app-39, app-37 | 4 |
 | docs-05 | DOC-05 | A | deploy-35 | 1 |
 | app-50 | APP-56 | A | auth-12 | 2 |

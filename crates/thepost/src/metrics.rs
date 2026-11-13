@@ -357,12 +357,12 @@ pub fn register_orphans(metrics: &Metrics) -> OrphanProbe {
 }
 
 /// Регистрирует показатели проверки целостности BLOB по расписанию роли maintenance (APP-44):
-/// `tp_blob_verify_{passes,failed}_total`, расхождения последнего прохода `tp_blob_verify_{damaged,orphans,errors}`,
+/// `tp_blob_verify_{passes,failed}_total`, расхождения последнего прохода `tp_blob_verify_{missing,size_mismatch,orphans,errors}`,
 /// `tp_blob_verify_duration_seconds`, `tp_blob_verify_finished_timestamp_seconds`. Возвращает держатель для
 /// `ScheduledVerify::probe`: до первого прохода значения нулевые.
 pub fn register_verify(metrics: &Metrics) -> VerifyProbe {
     let probe = VerifyProbe::default();
-    let defs: [StatDef<VerifyMetrics>; 7] = [
+    let defs: [StatDef<VerifyMetrics>; 8] = [
         (
             "tp_blob_verify_passes",
             "Завершённые проходы проверки целостности BLOB",
@@ -376,9 +376,15 @@ pub fn register_verify(metrics: &Metrics) -> VerifyProbe {
             true,
         ),
         (
-            "tp_blob_verify_damaged",
-            "Повреждённые записи учёта BLOB в последнем проходе (объекта нет или размер не совпадает)",
-            |m| m.damaged,
+            "tp_blob_verify_missing",
+            "Записи учёта BLOB в последнем проходе, у которых объекта нет в хранилище",
+            |m| m.missing,
+            false,
+        ),
+        (
+            "tp_blob_verify_size_mismatch",
+            "Записи учёта BLOB в последнем проходе, у которых размер объекта не совпадает с учётом",
+            |m| m.size_mismatch,
             false,
         ),
         (

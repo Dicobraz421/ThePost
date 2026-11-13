@@ -38,13 +38,14 @@ pub fn exit_code(report: &VerifyReport) -> i32 {
 /// Краткий текст отчёта для терминала.
 pub fn summary(report: &VerifyReport) -> String {
     let mut out = format!(
-        "verify{}: объектов {}, записей {}, «сирот» {} (удалено {}), повреждённых записей {} (помечено {}), ошибок {}\n",
+        "verify{}: объектов {}, записей {}, «сирот» {} (удалено {}), пропало {}, неверный размер {} (помечено повреждёнными {}), ошибок {}\n",
         if report.fix { " --fix" } else { "" },
         report.objects_listed,
         report.records_checked,
         report.orphans,
         report.orphans_deleted,
-        report.missing + report.size_mismatch,
+        report.missing,
+        report.size_mismatch,
         report.damaged_marked,
         report.errors,
     );
