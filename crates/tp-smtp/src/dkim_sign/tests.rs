@@ -147,6 +147,7 @@ async fn queue_signs_before_enqueue() {
     let q = Queue::new(env.deps.clone()).with_dkim(dkim);
     q.enqueue(
         tp_contracts::TenantId::DEFAULT,
+        None,
         "alice@example.org",
         &["x@example.com".into()],
         bytes::Bytes::from_static(MAIL.as_bytes()),

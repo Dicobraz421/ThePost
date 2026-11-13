@@ -8,11 +8,17 @@
 //! Очередь общая для всех организаций: `claim` — системный вызов роли smtp-out, организация — поле записи.
 //! Время передаёт вызывающий (`now`), чтобы повторы проверялись тестовыми часами.
 //!
+//! # Без опроса (SRS 2.8, CTR-73)
+//!
+//! smtp-out ждёт сигнала [`EventKind::QueueReady`] ([`queue_ready`]) или ближайшего срока [`QueueStore::next_due`] —
+//! один таймер. Сигнал публикует реализация после фиксации постановки и переноса; потерянный сигнал (at-most-once)
+//! покрывает сверка `next_due` по `Resync` и при запуске.
+//!
 //! # Тело письма
 //!
 //! Вызывающий загружает письмо одним объектом и учитывает одну ссылку на него в `BlobIndex` до `enqueue`
 //! (ошибка `enqueue` — освободить ссылку); учётная запись отправителя — одна и та же в `BlobIndex::acquire` и
-//! [`QueueStore::enqueue`] (CTR-49: шард). Когда все получатели в конечном статусе, [`QueueStore::complete`]
+//! [`QueueStore::enqueue`] (CTR-49: шард), её передаёт [`Outbound`] (CTR-74). Когда все получатели в конечном статусе, [`QueueStore::complete`]
 //! возвращает `true`: запись удалена, вызывающий освобождает ссылку (`BlobIndex::release`) отдельной транзакцией.
 //!
 //! # Постановка письма
@@ -29,6 +35,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::bus::{Event, EventKind};
 use crate::error::{Error, Result};
 use crate::ids::{AccountId, BlobKey, QueueId, TenantId};
 
@@ -171,6 +178,17 @@ pub struct Claimed {
     pub rcpts: Vec<QueuedRcpt>,
 }
 
+/// Сигнал «очередь организации `tenant` пополнена или срок перенесён» (системный, `account = None`,
+/// [`EventKind::QueueReady`]; тема `<tenant>/queue/outbound`, CTR-73). Публикует реализация [`QueueStore`] после
+/// фиксации `enqueue`, `reschedule` и `postpone`.
+pub fn queue_ready(tenant: TenantId) -> Event {
+    Event {
+        tenant,
+        account: None,
+        kind: EventKind::QueueReady,
+    }
+}
+
 /// Очередь исходящей почты. Реализация — `tp-meta` (PostgreSQL), локальная очередь узла edge — `tp-smtp`;
 /// in-memory — `tp-testkit`.
 ///
@@ -185,7 +203,13 @@ pub trait QueueStore: Send + Sync + 'static {
     /// ставит запись на шард её ящика, рядом с «Отправленными»; `None` — отправителя-учётной записи нет (DSN,
     /// пересылка, письмо модуля) — шард по выбору хранилища. Хранилище без шардов `owner` не использует;
     /// существование учётной записи не проверяется.
+    /// После фиксации — сигнал [`queue_ready`] организации `msg.tenant`.
     async fn enqueue(&self, owner: Option<AccountId>, msg: OutMessage) -> Result<QueueId>;
+
+    /// Ближайший момент, когда [`QueueStore::claim`] выдаст запись (CTR-73; таймер smtp-out): наименьший срок
+    /// попытки получателей без конечного статуса, а у записи с лизой — не раньше её конца. Записей нет — `None`.
+    /// Системный вызов (все организации).
+    async fn next_due(&self) -> Result<Option<OffsetDateTime>>;
 
     /// Захватывает до `limit` записей, у которых есть получатели без конечного статуса со сроком попытки
     /// не позже `now` и нет действующей лизы; лиза — до `now + lease`, номер захвата увеличивается.
@@ -201,7 +225,8 @@ pub trait QueueStore: Send + Sync + 'static {
     async fn renew(&self, claim: &QueueClaim, until: OffsetDateTime) -> Result<()>;
 
     /// Временная неудача доставки получателю: следующая попытка в `at`, `attempts` + 1, причина сохраняется.
-    /// Захват устарел — `Error::Conflict`; получателя нет или он в конечном статусе — `Error::NotFound`.
+    /// Захват устарел — `Error::Conflict`; получателя нет или он в конечном статусе — `Error::NotFound`. После
+    /// фиксации — сигнал [`queue_ready`] организации записи.
     async fn reschedule(
         &self,
         claim: &QueueClaim,
@@ -211,7 +236,7 @@ pub trait QueueStore: Send + Sync + 'static {
     ) -> Result<()>;
 
     /// Перенос получателя планировщиком без попытки доставки (лимит соединений или скорости домена назначения,
-    /// нагрузка узла): следующая попытка в `at`, `attempts` и `last_error` не меняются. Ошибки — как у
+    /// нагрузка узла): следующая попытка в `at`, `attempts` и `last_error` не меняются. Ошибки и сигнал — как у
     /// `reschedule`. По умолчанию — `Error::Internal` (реализация без переноса).
     async fn postpone(&self, claim: &QueueClaim, rcpt: &str, at: OffsetDateTime) -> Result<()> {
         let _ = (claim, rcpt, at);
@@ -266,6 +291,10 @@ impl Submitted {
 /// `tp_smtp::Delivery` (локальные получатели — сразу в ящики); in-memory — `tp-testkit`.
 ///
 /// Маршрут правила потока (`FlowOutcome::route`) не передаётся: очередь выбирает политику по домену назначения.
+///
+/// `owner` — учётная запись отправителя организации `tenant` (CTR-74, решение 46): реализация передаёт её в
+/// `BlobIndex::acquire` и [`QueueStore::enqueue`] — тело и запись очереди ложатся на шард её ящика. `None` —
+/// отправителя-учётной записи нет (DSN, пересылка, письмо модуля).
 #[async_trait]
 pub trait Outbound: Send + Sync + 'static {
     /// Ставит письмо `raw` (RFC 5322) от `mail_from` получателям `rcpts` организации `tenant`. Ошибка — письмо не
@@ -273,6 +302,7 @@ pub trait Outbound: Send + Sync + 'static {
     async fn enqueue(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -280,18 +310,16 @@ pub trait Outbound: Send + Sync + 'static {
 
     /// Отложенная отправка (CTR-42; JMAP `sendAt`): ставит письмо в очередь со сроком выпуска `release_at`
     /// ([`OutMessage::next_attempt`]) для всех получателей — локальные доставляются при выпуске — и возвращает запись
-    /// очереди (`EmailSubmission::queue`). Ошибки — как у [`Outbound::enqueue`]. По умолчанию — `Error::Internal`.
+    /// очереди (`EmailSubmission::queue`). Ошибки — как у [`Outbound::enqueue`].
     async fn schedule(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
         release_at: OffsetDateTime,
-    ) -> Result<QueueId> {
-        let _ = (tenant, mail_from, rcpts, raw, release_at);
-        Err(Error::internal("outbound does not support schedule"))
-    }
+    ) -> Result<QueueId>;
 
     /// Отмена отложенной отправки до выпуска (CTR-42; JMAP `undoStatus: canceled`): [`QueueStore::cancel_queued`] и
     /// освобождение ссылки на тело. Уже выпущено — `Error::Conflict` (`cannotUnsend`); нет записи — `Error::NotFound`.
@@ -308,11 +336,12 @@ pub trait Outbound: Send + Sync + 'static {
     async fn submit(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<Submitted> {
-        self.enqueue(tenant, mail_from, rcpts, raw).await?;
+        self.enqueue(tenant, owner, mail_from, rcpts, raw).await?;
         Ok(Submitted::all(rcpts, SubmitStatus::Queued))
     }
 }
@@ -333,24 +362,44 @@ mod tests {
     #[tokio::test]
     async fn submit_default_queued() {
         #[derive(Default)]
-        struct Plain(Mutex<Vec<Vec<String>>>);
+        struct Plain(Mutex<Vec<(Option<AccountId>, Vec<String>)>>);
         #[async_trait]
         impl Outbound for Plain {
             async fn enqueue(
                 &self,
                 _: TenantId,
+                owner: Option<AccountId>,
                 _: &str,
                 rcpts: &[String],
                 _: Bytes,
             ) -> Result<()> {
-                self.0.lock().expect("lock").push(rcpts.to_vec());
+                self.0.lock().expect("lock").push((owner, rcpts.to_vec()));
                 Ok(())
+            }
+
+            async fn schedule(
+                &self,
+                _: TenantId,
+                _: Option<AccountId>,
+                _: &str,
+                _: &[String],
+                _: Bytes,
+                _: OffsetDateTime,
+            ) -> Result<QueueId> {
+                Err(Error::internal("not scheduled"))
             }
         }
         let ob = Plain::default();
+        let owner = AccountId::new();
         let rcpts = vec!["b@example.com".to_owned(), "a@example.org".to_owned()];
         let sent = ob
-            .submit(TenantId::DEFAULT, "x@example.org", &rcpts, Bytes::new())
+            .submit(
+                TenantId::DEFAULT,
+                Some(owner),
+                "x@example.org",
+                &rcpts,
+                Bytes::new(),
+            )
             .await
             .expect("submit");
         assert_eq!(
@@ -360,14 +409,20 @@ mod tests {
                 ("a@example.org".to_owned(), SubmitStatus::Queued),
             ]
         );
-        assert_eq!(*ob.0.lock().expect("lock"), vec![rcpts.clone()]);
-        let at = OffsetDateTime::UNIX_EPOCH;
-        let scheduled = ob
-            .schedule(TenantId::DEFAULT, "x@example.org", &rcpts, Bytes::new(), at)
-            .await;
-        assert!(matches!(scheduled, Err(Error::Internal(_))));
+        assert_eq!(
+            *ob.0.lock().expect("lock"),
+            vec![(Some(owner), rcpts.clone())]
+        );
         let canceled = ob.cancel_scheduled(TenantId::DEFAULT, QueueId::new()).await;
         assert!(matches!(canceled, Err(Error::Internal(_))));
+    }
+
+    #[test]
+    fn queue_ready_is_system() {
+        let t = TenantId::new();
+        let e = queue_ready(t);
+        assert_eq!((e.tenant, e.account), (t, None));
+        assert!(e.kind.is_system());
     }
 
     #[test]

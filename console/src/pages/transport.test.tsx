@@ -51,6 +51,8 @@ test("принятые домены: список, добавление с ве�
 
 test("политика домена: окно у строки принятого домена — GET и PUT transport/domains/{id}/policy", async () => {
   const empty = {
+    archive_after: null,
+    archive_quota_bytes: null,
     dkim_selector: null,
     max_recipients: null,
     milter_profile: null,

@@ -297,6 +297,7 @@ pub async fn membership_info(m: &dyn Membership, ttl: Duration, wait: &dyn Wait)
 pub mod dav;
 pub mod freebusy;
 pub mod itip;
+pub mod lifecycle;
 pub mod sieve;
 
 pub use dav::dav;
@@ -3723,7 +3724,7 @@ pub async fn outbound_submit(ob: &dyn Outbound, tenant: TenantId, rcpts: &[Strin
         b"From: suite@example.org\r\nTo: suite@example.org\r\nSubject: outbound suite\r\n\r\nbody\r\n",
     );
     let sent = ob
-        .submit(tenant, "suite@example.org", rcpts, raw.clone())
+        .submit(tenant, None, "suite@example.org", rcpts, raw.clone())
         .await
         .expect("submit");
     let got: Vec<&str> = sent.rcpts.iter().map(|(r, _)| r.as_str()).collect();
@@ -3736,7 +3737,7 @@ pub async fn outbound_submit(ob: &dyn Outbound, tenant: TenantId, rcpts: &[Strin
         "принимаемые получатели не отклоняются: {:?}",
         sent.rcpts
     );
-    ob.enqueue(tenant, "suite@example.org", rcpts, raw)
+    ob.enqueue(tenant, None, "suite@example.org", rcpts, raw)
         .await
         .expect("enqueue");
 }
@@ -4512,7 +4513,7 @@ pub struct AccountStateFixture {
 /// Набор проверок состояния ящика `AccountStore` (CTR-35, CTR-50): отключение со сроком (`upsert` его не снимает),
 /// списки отключённых и истёкших, восстановление, подключение к другой учётной записи (письма сохраняются, запись `to`
 /// удаляется; письма ящика `to` — по режиму `ExistingContent`, без режима — `Invalid`), окончательное удаление
-/// отключённого без писем.
+/// удаляемого без писем (отметка — [`lifecycle::account_removal`]).
 pub async fn account_state(
     accounts: &dyn AccountStore,
     mailboxes: &dyn MailboxStore,
@@ -4765,7 +4766,7 @@ pub async fn account_state(
             .any(|m| m.name == "Projects")
     );
 
-    // Окончательное удаление: только отключённый и без писем.
+    // Окончательное удаление: только удаляемый (CTR-78, `begin_removal`) и без писем.
     assert!(matches!(
         accounts.remove_disabled(t, a.id).await,
         Err(Error::Invalid(_))
@@ -4774,10 +4775,18 @@ pub async fn account_state(
         .disable_account(t, a.id, until)
         .await
         .expect("disable a again");
+    accounts
+        .begin_removal(t, a.id, until)
+        .await
+        .expect("begin_removal a");
     assert_eq!(
         accounts.remove_disabled(t, a.id).await,
         Err(Error::Conflict)
     );
+    accounts
+        .begin_removal(t, gone.id, until)
+        .await
+        .expect("begin_removal gone");
     accounts
         .remove_disabled(t, gone.id)
         .await
@@ -5061,7 +5070,14 @@ pub async fn outbound_schedule(
 ) {
     let raw = Bytes::from_static(b"Subject: later\r\n\r\nbody\r\n");
     let id = ob
-        .schedule(tenant, "anna@example.org", rcpts, raw.clone(), release_at)
+        .schedule(
+            tenant,
+            None,
+            "anna@example.org",
+            rcpts,
+            raw.clone(),
+            release_at,
+        )
         .await
         .expect("schedule");
     assert_eq!(
@@ -5071,7 +5087,7 @@ pub async fn outbound_schedule(
     ob.cancel_scheduled(tenant, id).await.expect("cancel");
     assert_eq!(ob.cancel_scheduled(tenant, id).await, Err(Error::NotFound));
     let other = ob
-        .schedule(tenant, "anna@example.org", rcpts, raw, release_at)
+        .schedule(tenant, None, "anna@example.org", rcpts, raw, release_at)
         .await
         .expect("schedule again");
     assert_ne!(other, id);
@@ -5243,6 +5259,8 @@ pub async fn policy_store(
         dkim_selector: Some("t2026".into()),
         milter_profile: Some("tenant".into()),
         trash_purge: Some(rule),
+        archive_after: Some(DAY * 730),
+        archive_quota_bytes: Some(50_000),
     };
     let domain = Policy {
         rcpts_per_hour: Some(1500),
@@ -5253,6 +5271,7 @@ pub async fn policy_store(
     let account = Policy {
         send_per_hour: Some(5),
         milter_profile: Some("account".into()),
+        archive_after: Some(DAY * 365),
         ..Policy::default()
     };
     let mailbox = Policy {
@@ -5284,6 +5303,8 @@ pub async fn policy_store(
             dkim_selector: Some("d2026".into()),
             milter_profile: Some("account".into()),
             trash_purge: Some(rule),
+            archive_after: Some(DAY * 365),
+            archive_quota_bytes: Some(50_000),
         }
     );
     assert_eq!(effective.send_per_hour_or_default(), 5);

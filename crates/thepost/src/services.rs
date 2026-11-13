@@ -1547,6 +1547,7 @@ mod tests {
             let sent = outbound
                 .submit(
                     t,
+                    None,
                     sender,
                     &[BOB.to_owned()],
                     bytes::Bytes::from(invite(sender, uid)),
@@ -1776,6 +1777,7 @@ mod tests {
             let sent = delivery
                 .submit(
                     t,
+                    None,
                     "ext@remote.example",
                     &["news@example.org".to_owned()],
                     bytes::Bytes::from(raw),

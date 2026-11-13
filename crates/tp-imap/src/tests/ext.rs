@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use time::OffsetDateTime;
 use tp_contracts::acl::AclStore;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::meta::{
@@ -199,6 +200,56 @@ impl AccountStore for Limited {
         Self: 'async_trait,
     {
         self.0.attach_account(tenant, disabled, to, existing)
+    }
+
+    fn disable_account<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        id: AccountId,
+        until: OffsetDateTime,
+    ) -> Fut<'async_trait, ()>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.disable_account(tenant, id, until)
+    }
+
+    fn expired_accounts<'life0, 'async_trait>(
+        &'life0 self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Fut<'async_trait, Vec<AccountScope>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.expired_accounts(now, limit)
+    }
+
+    fn begin_removal<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        id: AccountId,
+        now: OffsetDateTime,
+    ) -> Fut<'async_trait, ()>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.begin_removal(tenant, id, now)
+    }
+
+    fn remove_disabled<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        id: AccountId,
+    ) -> Fut<'async_trait, ()>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.remove_disabled(tenant, id)
     }
 }
 

@@ -1246,10 +1246,12 @@ impl Delivery {
         Ok(out)
     }
 
-    /// Ставит в очередь исходящей почты внешних получателей и пересылки.
+    /// Ставит в очередь исходящей почты внешних получателей и пересылки; `owner` — учётная запись отправителя
+    /// (CTR-74: шард её ящика), `None` — пересылка, уведомление, письмо без отправителя-учётной записи.
     async fn queue_out(
         &self,
         id: &str,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: Vec<String>,
         raw: Bytes,
@@ -1258,7 +1260,10 @@ impl Delivery {
             return Ok(());
         }
         match &self.deps.outbound {
-            Some(q) => q.enqueue(self.deps.tenant, mail_from, &rcpts, raw).await,
+            Some(q) => {
+                q.enqueue(self.deps.tenant, owner, mail_from, &rcpts, raw)
+                    .await
+            }
             None => {
                 // Узел без очереди: внешних получателей submission не принимает (RCPT — 451, `submit` —
                 // `SubmitStatus::Failed`), здесь остаются только внешние пересылки и копии модулей.
@@ -1368,7 +1373,7 @@ impl Delivery {
             return Ok(());
         }
         let Some(fwd) = &self.forwarding else {
-            return self.queue_out(id, mail_from, rcpts, raw).await;
+            return self.queue_out(id, None, mail_from, rcpts, raw).await;
         };
         let mut sender = mail_from.to_owned();
         if let Some((_, domain)) = mail_from.rsplit_once('@')
@@ -1386,7 +1391,7 @@ impl Delivery {
             m.extend_from_slice(&raw);
             raw = Bytes::from(m);
         }
-        self.queue_out(id, &sender, rcpts, raw).await
+        self.queue_out(id, None, &sender, rcpts, raw).await
     }
 
     /// Правила потока почты (SMTP-22): тело — объектом BLOB на время вызова; изменённое тело — прочитано, ссылка на
@@ -1403,6 +1408,7 @@ impl Delivery {
             f.blobs.as_ref(),
             f.index.as_ref(),
             input.tenant,
+            None,
             raw.clone(),
         )
         .await?;
@@ -1722,7 +1728,7 @@ impl Delivery {
             .await?;
         sieve::merge_replies(&mut replies, relayed.replies);
         sieve_steps.extend(relayed.steps);
-        self.queue_out(&env.id, &env.mail_from, rcpts, full.clone())
+        self.queue_out(&env.id, sender, &env.mail_from, rcpts, full.clone())
             .await?;
         self.queue_forward(
             &env.id,
@@ -1891,6 +1897,7 @@ impl Delivery {
     async fn dispatch(
         &self,
         id: &str,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -2024,7 +2031,8 @@ impl Delivery {
         if queue {
             push_unique(&mut out, prepared.relayed);
         }
-        self.queue_out(id, mail_from, out, raw.clone()).await?;
+        self.queue_out(id, owner, mail_from, out, raw.clone())
+            .await?;
         self.queue_forward(id, mail_from, forward, raw.clone(), None)
             .await?;
         let mut steps = vec![Step::new(Ek::Receive, Dd::Accept, rcpts.to_vec())];
@@ -2062,6 +2070,7 @@ impl Delivery {
     pub async fn submit(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -2083,7 +2092,7 @@ impl Delivery {
         if tenant != self.deps.tenant {
             let status = match &self.deps.outbound {
                 Some(q) => {
-                    q.enqueue(tenant, mail_from, rcpts, raw).await?;
+                    q.enqueue(tenant, owner, mail_from, rcpts, raw).await?;
                     SubmitStatus::Queued
                 }
                 None => {
@@ -2093,7 +2102,9 @@ impl Delivery {
             };
             return Ok(Submitted::all(requested, status));
         }
-        let statuses = self.dispatch(&id, mail_from, rcpts, raw, true).await?;
+        let statuses = self
+            .dispatch(&id, owner, mail_from, rcpts, raw, true)
+            .await?;
         // Статус — по получателям запроса: адрес, убранный правилом потока, считается обработанным.
         let statuses = requested
             .iter()
@@ -2492,11 +2503,12 @@ impl Outbound for Delivery {
     async fn enqueue(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<()> {
-        let sent = Delivery::submit(self, tenant, mail_from, rcpts, raw).await?;
+        let sent = Delivery::submit(self, tenant, owner, mail_from, rcpts, raw).await?;
         // Узел без очереди и ни одной доставки: письмо никуда не попало — ошибка, повтор безопасен.
         // Иначе внешним получателям — только `Failed` в журнале (повтор задвоил бы локальную доставку).
         let lost = |s: &SubmitStatus| matches!(s, SubmitStatus::Failed(r) if r == NO_OUTBOUND);
@@ -2509,22 +2521,24 @@ impl Outbound for Delivery {
     async fn submit(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<Submitted> {
-        Delivery::submit(self, tenant, mail_from, rcpts, raw).await
+        Delivery::submit(self, tenant, owner, mail_from, rcpts, raw).await
     }
 
     async fn schedule(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
         release_at: OffsetDateTime,
     ) -> Result<QueueId> {
-        Delivery::schedule(self, tenant, mail_from, rcpts, raw, release_at).await
+        Delivery::schedule(self, tenant, owner, mail_from, rcpts, raw, release_at).await
     }
 
     async fn cancel_scheduled(&self, tenant: TenantId, queue: QueueId) -> Result<()> {
@@ -2590,7 +2604,7 @@ impl DsnSink for Delivery {
                     .map(|_| ())
             }
             Resolved::External => match &self.deps.outbound {
-                Some(q) => q.enqueue(tenant, "", &[to.to_owned()], raw).await,
+                Some(q) => q.enqueue(tenant, None, "", &[to.to_owned()], raw).await,
                 None => {
                     tracing::warn!(
                         "smtp: уведомление внешнему адресу без очереди исходящей почты не отправлено"

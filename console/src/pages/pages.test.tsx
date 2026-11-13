@@ -9,6 +9,8 @@ import { type Call, ORG, orgs, OTHER, session, stubApi, whoami } from "../test-a
 
 const BASE = `/api/v1/orgs/${ORG}`;
 const empty = {
+  archive_after: null,
+  archive_quota_bytes: null,
   dkim_selector: null,
   max_recipients: null,
   milter_profile: null,

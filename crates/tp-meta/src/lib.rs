@@ -11,6 +11,7 @@ pub mod acl;
 mod address_book;
 pub mod admin_tokens;
 pub mod app_passwords;
+mod archive;
 pub mod audit_log;
 pub mod blob_index;
 mod busy;
@@ -236,7 +237,9 @@ pub(crate) struct BoxDb {
 /// С шиной ([`PgMeta::with_bus`]) после фиксации публикуются сигналы: `LogAppended` — после записи событий
 /// в журнал ядра, `MembersChanged` — при изменении состава кластера, `Blocked` — после блокировки,
 /// `Unblocked` — после снятия блокировки, `TransportChanged` — после изменения настроек транспорта ([`transport`]),
-/// `AccountDisabled` — после запрета входа учётной записи (`upsert` с `enabled = false`, `disable_account`). Сигнал
+/// `AccountDisabled` — после запрета входа учётной записи (`upsert` с `enabled = false`, `disable_account`),
+/// `DisabledMailboxChanged` — после `disable_account`, восстановления отключённого и `attach_account` (CTR-77),
+/// `QueueReady` — после `QueueStore::enqueue`, `reschedule`, `postpone` (CTR-73). Сигнал
 /// at-most-once: ошибка публикации не отменяет зафиксированное изменение (только запись в журнал узла).
 ///
 /// Над [`Failover`] ([`PgMeta::from_failover`]) хранилища переживают переключение СУБД: при временном отказе

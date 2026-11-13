@@ -78,6 +78,7 @@ async fn released_at_time_to_local_and_external() {
     s.delivery
         .schedule(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &list,
             Bytes::from_static(MAIL),
@@ -119,6 +120,7 @@ async fn cancelled_before_release_is_not_sent_and_body_is_freed() {
         .delivery
         .schedule(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &list,
             Bytes::from_static(MAIL),
@@ -159,6 +161,7 @@ async fn released_message_cannot_be_cancelled() {
         .delivery
         .schedule(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &rcpts(&["x@example.net"]),
             Bytes::from_static(MAIL),
@@ -221,6 +224,7 @@ async fn scheduled_over_hourly_limit_is_refused() {
     let schedule = || {
         s.delivery.schedule(
             TenantId::DEFAULT,
+            None,
             super::org_policy::ALICE,
             &list,
             Bytes::from_static(MAIL),

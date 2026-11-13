@@ -196,7 +196,8 @@ impl Moderation for Delivery {
                     .map(|r| dsn::Recipient::new(r, dsn::Action::Failed, NO_OUTBOUND)),
             );
         }
-        self.queue_out(&id, mail_from, out, raw.clone()).await?;
+        self.queue_out(&id, message.sender_account, mail_from, out, raw.clone())
+            .await?;
         self.queue_forward(&id, mail_from, forwarded, raw.clone(), None)
             .await?;
         let mut steps =
