@@ -574,13 +574,13 @@ impl Delivery {
         for (name, addrs) in &fields {
             // Поле без адреса (группа без участников, неразборчивое значение) — не проверить, отказ.
             if addrs.is_empty() {
-                return refuse(*name);
+                return refuse(name);
             }
             for addr in addrs {
                 match self.sender_right(p.account, Some(p), addr).await? {
                     Some(SendRight::SendAs) => {}
                     Some(SendRight::SendOnBehalf) if *name == "From" => on_behalf = true,
-                    Some(SendRight::SendOnBehalf) | None => return refuse(*name),
+                    Some(SendRight::SendOnBehalf) | None => return refuse(name),
                 }
             }
         }
