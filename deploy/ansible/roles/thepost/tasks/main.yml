@@ -94,6 +94,7 @@
   notify: Restart thepost
 
 # Keytab Kerberos: MIT Kerberos читает его только из KRB5_KTNAME (auth.gssapi.keytab сверяется с переменной).
+# Кэш повторов — KRB5RCACHEDIR: каталог узла, разрешённый Landlock при auth.gssapi (SYS-16), а не /var/tmp.
 - name: Set keytab path for thepost (KRB5_KTNAME)
   ansible.builtin.copy:
     dest: /etc/systemd/system/thepost.service.d/gssapi.conf
@@ -101,6 +102,7 @@
       # Ansible: deploy/ansible/roles/thepost — не править вручную.
       [Service]
       Environment=KRB5_KTNAME=FILE:{{ thepost_gssapi_keytab }}
+      Environment=KRB5RCACHEDIR=/var/lib/thepost/krb5rcache
     owner: root
     group: root
     mode: "0644"
