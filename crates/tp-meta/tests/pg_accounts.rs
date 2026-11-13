@@ -1,6 +1,7 @@
 //! CTR-44, META-45: постраничный список учётных записей на PostgreSQL — общий набор `tp_testkit::suite::account_list`
 //! (побайтный порядок, страницы, курсор, префикс, регистр, изоляция организаций) и план запроса по индексу
-//! `accounts_login_c`; набор `account_by_ids` (CTR-63, META-66; одним запросом); сигнал `AccountDisabled` (META-67).
+//! `accounts_login_c`; набор `account_by_ids` (CTR-63, META-66; одним запросом); сигнал `AccountDisabled` (META-67);
+//! набор `account_by_address` (CTR-62, META-68; псевдонимы и группы одним запросом).
 
 mod common;
 
@@ -14,7 +15,7 @@ use tp_contracts::meta::{
 };
 use tp_meta::accounts::{LIST_PREFIX_SQL, LIST_SQL};
 use tp_meta::schema;
-use tp_testkit::suite::{AccountListFixture, account_by_ids, account_list};
+use tp_testkit::suite::{AccountListFixture, account_by_address, account_by_ids, account_list};
 
 #[tokio::test]
 async fn passes_contract_suite() {
@@ -68,6 +69,26 @@ async fn passes_by_ids_suite() {
         foreign_domain,
     };
     account_by_ids(&meta, &fx).await;
+}
+
+/// CTR-62, META-68: `AccountStore::by_address` — основной адрес, псевдоним, группа рассылки; чужая организация не видна.
+#[tokio::test]
+async fn passes_by_address_suite() {
+    let Some(meta) = common::meta().await else {
+        return;
+    };
+    let tenant = common::tenant(meta.pool()).await;
+    let (domain, domain_name) = common::domain(meta.pool(), tenant).await;
+    let foreign_tenant = common::tenant(meta.pool()).await;
+    let (foreign_domain, _) = common::domain(meta.pool(), foreign_tenant).await;
+    let fx = AccountListFixture {
+        tenant,
+        domain,
+        domain_name,
+        foreign_tenant,
+        foreign_domain,
+    };
+    account_by_address(&meta, &meta, &fx).await;
 }
 
 /// META-67: переход `enabled` в `false` (`upsert`, синхронизация каталога) и `disable_account` публикуют

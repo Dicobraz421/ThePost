@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use sqlx::postgres::PgArguments;
+use sqlx::postgres::PgRow;
 use sqlx::query::QueryAs;
-use sqlx::{FromRow, PgConnection, Postgres};
+use sqlx::{FromRow, PgConnection, Postgres, Row};
 use time::OffsetDateTime;
-use tp_contracts::groups::GroupStore;
 use tp_contracts::meta::{
     Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
     DisabledAccount, ExistingContent, QuotaUsage, account_aliases, account_disabled,
@@ -35,6 +35,19 @@ pub const LIST_PREFIX_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, lo
     WHERE tenant_id = $1 AND lower(login) COLLATE "C" >= $2 AND lower(login) COLLATE "C" < $5
       AND lower(login) COLLATE "C" > $3
     ORDER BY lower(login) COLLATE "C" LIMIT $4"#;
+
+/// `AccountStore::by_address` (CTR-62, META-68): `$1` — организация, `$2` — адрес в нижнем регистре без пробелов по
+/// краям. Строка учётной записи (`group_id` — `NULL`) или группы (столбцы учётной записи — `NULL`); ранг — основной
+/// адрес, псевдоним, группа.
+const BY_ADDRESS_SQL: &str = r#"SELECT * FROM (
+        SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind,
+               NULL::uuid AS group_id, CASE WHEN lower(login) = lower($2) THEN 0 ELSE 1 END AS rank
+        FROM accounts WHERE tenant_id = $1 AND (lower(login) = lower($2) OR $2 = ANY(aliases))
+        UNION ALL
+        SELECT NULL::uuid, NULL::uuid, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::boolean, NULL::text[],
+               NULL::text, group_id, 2
+        FROM groups WHERE tenant_id = $1 AND address IS NOT NULL AND lower(address) = lower($2)
+    ) t ORDER BY rank LIMIT 1"#;
 
 /// Наименьшая строка больше всех строк с префиксом `prefix` в побайтном порядке (он совпадает с порядком кодовых
 /// точек UTF-8): последний знак меньше `U+10FFFF` заменяется следующим (суррогаты пропускаются), хвост
@@ -303,16 +316,37 @@ impl AccountStore for PgMeta {
             .collect()
     }
 
-    // CTR-62: до META-68 — только основной адрес и адрес группы, без псевдонимов; одним запросом с псевдонимами —
-    // META-68.
+    /// Одним запросом (META-68): основной адрес (`accounts_login`), псевдоним (`aliases` — в нижнем регистре) и адрес
+    /// группы (`groups_address`), по рангу — основной, псевдоним, группа; группа дочитывается в той же транзакции.
+    /// Чужая организация не видна (условие `tenant_id` и RLS).
     async fn by_address(&self, tenant: TenantId, address: &str) -> Result<Option<AddressTarget>> {
-        let address = address.trim();
-        if let Some(account) = self.by_login(tenant, address).await? {
-            return Ok(Some(AddressTarget::Account(account)));
-        }
-        Ok(GroupStore::by_address(self, tenant, address)
-            .await?
-            .map(AddressTarget::Group))
+        let address = address.trim().to_lowercase();
+        let address = &address;
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
+            let row: Option<PgRow> = sqlx::query(BY_ADDRESS_SQL)
+                .bind(tenant.as_uuid())
+                .bind(address)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            let target = match row {
+                None => None,
+                Some(row) => match row.try_get::<Option<Uuid>, _>("group_id").map_err(db_err)? {
+                    Some(id) => crate::groups::load(&mut tx, tenant, Some(vec![id]))
+                        .await?
+                        .into_iter()
+                        .next()
+                        .map(AddressTarget::Group),
+                    None => Some(AddressTarget::Account(Account::try_from(
+                        AccountRow::from_row(&row).map_err(db_err)?,
+                    )?)),
+                },
+            };
+            crate::commits::commit(tx).await?;
+            Ok(target)
+        })
+        .await
     }
 
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
