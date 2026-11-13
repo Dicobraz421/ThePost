@@ -1,5 +1,5 @@
 //! Общие наборы тестов контрактов: in-memory реализации testkit и настоящие реализации полос
-//! (`tp-meta` — `Membership`, `AbuseBlocks`, сигналы `EventBus`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие `BlobIndex`,
+//! (`tp-meta` — `Membership`, `AbuseBlocks`, сигналы `EventBus`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие и GC по шардам `BlobIndex`,
 //! «очистить корзину» `TrashStore::purge` с настройкой `trash.purge`, `TransportStore` и его таблица переписывания,
 //! перенос получателей `QueueStore::postpone`, статусы `Outbound::submit` (`tp-smtp` — `Queue`, `Delivery`),
 //! `tp-platform` — `SecretStore`, `tp-cluster` — `Rpc`) проходят одни и те же проверки.
@@ -82,8 +82,8 @@ use tp_contracts::{
     MessageId, OrgUnitId, QueueId, ShardId, TenantId,
 };
 
-use crate::ManualClock;
 use crate::fakes::{HookCall, RecordingDecisionHook};
+use crate::{Clock, ManualClock};
 
 /// Ход времени для наборов тестов.
 #[async_trait]
@@ -1845,6 +1845,212 @@ pub async fn blob_uploads(index: &dyn BlobIndex, tenant: TenantId, foreign_tenan
     assert_eq!(index.upload_owned(scope, &a, now).await, Ok(true));
     assert_eq!(index.prune_uploads(now + 30 * s, 0).await, Ok(0));
     assert_eq!(index.upload_owned(scope, &a, now).await, Ok(true));
+}
+
+// ---------- BlobIndex: GC по шардам ----------
+
+/// Сколько объектов, занятых вторым шардом, обнулено на основном раньше свободного в [`blob_gc_shards`].
+const BUSY_AHEAD: usize = 5;
+
+/// Набор проверок GC `BlobIndex` по ссылкам всех шардов справочника (SRS 3.6; BLOB-15, META-73, META-79).
+///
+/// - `index` — учёт хранилища с шардами: `acquire`, `commit_new`, `release` — на шарде основной БД, операции GC —
+///   по всем шардам (`MemShardedBlobIndex`, `PgMeta::with_shards`);
+/// - `second` — учёт другого шарда того же справочника (`MemShardedBlobIndex::shard`, `PgMeta::on_shard`):
+///   на нём набор ставит и снимает ссылки, как транзакции ящика этого шарда;
+/// - `clock` — часы, по которым учёт ставит момент обнуления, `wait` — их ход: [`ManualClock`] в обеих ролях
+///   или `SystemClock` и [`RealTime`] (две паузы по секунде).
+///
+/// Проверяет: объект со ссылкой только на втором шарде — не кандидат и не помечается; занятые впереди не скрывают
+/// свободного кандидата (`gc_candidates(_, 1)`) и не обнуляют срок `next_gc_due`; окно W считается на каждом шарде,
+/// отказ пометки не оставляет следов; шарду без строки — надгробие того же поколения. Хэши — случайные: чужие
+/// записи учёта не мешают, если чужих кандидатов GC меньше тысячи.
+pub async fn blob_gc_shards(
+    index: &dyn BlobIndex,
+    second: &dyn BlobIndex,
+    tenant: TenantId,
+    clock: &dyn Clock,
+    wait: &dyn Wait,
+) {
+    const LIMIT: usize = 1000;
+    const PAUSE: Duration = Duration::from_secs(1);
+    const W: Duration = Duration::from_secs(3600);
+    let minute = time::Duration::MINUTE;
+    // Объект с одной ссылкой на основном шарде.
+    let put = async || {
+        let hash = fresh_hash();
+        let generation = match index
+            .acquire(tenant, None, &hash, 1)
+            .await
+            .expect("acquire")
+        {
+            Acquire::Absent { generation } => generation,
+            other => panic!("ожидался Absent: {other:?}"),
+        };
+        match index
+            .commit_new(tenant, &hash, generation, 1, 1)
+            .await
+            .expect("commit")
+        {
+            Commit::Done { generation } => BlobKey {
+                tenant,
+                hash,
+                generation,
+            },
+            other => panic!("ожидался Done: {other:?}"),
+        }
+    };
+    // Ссылка второго шарда на тот же объект (копия письма в ящике этого шарда).
+    let refer = async |k: &BlobKey| {
+        assert_eq!(
+            second.commit_new(tenant, &k.hash, k.generation, 1, 1).await,
+            Ok(Commit::Done {
+                generation: k.generation
+            })
+        );
+    };
+    let release = async |on: &dyn BlobIndex, k: &BlobKey| {
+        on.release(tenant, &k.hash, k.generation, 1)
+            .await
+            .expect("release");
+    };
+    // Новая ссылка на то же поколение и её снятие: запись `live`, пометки `deleting` нет.
+    let still_live = async |on: &dyn BlobIndex, k: &BlobKey, what: &str| {
+        assert_eq!(
+            on.acquire(tenant, None, &k.hash, 1).await,
+            Ok(Acquire::Existing {
+                generation: k.generation
+            }),
+            "{what}"
+        );
+        release(on, k).await;
+    };
+
+    // Занятые: ссылка основного шарда снята, второго — осталась. Поздний: второй шард снимет ссылку после `mid`.
+    // Свободный: только на основном шарде, обнулён последним.
+    let mut busy = Vec::new();
+    for _ in 0..BUSY_AHEAD {
+        let k = put().await;
+        refer(&k).await;
+        release(index, &k).await;
+        busy.push(k);
+    }
+    let late = put().await;
+    refer(&late).await;
+    release(index, &late).await;
+    wait.wait(Duration::from_millis(10)).await;
+    let free = put().await;
+    release(index, &free).await;
+    wait.wait(PAUSE).await;
+    let mid = clock.now();
+    wait.wait(PAUSE).await;
+    release(second, &late).await;
+    let after = clock.now() + minute;
+
+    // Кандидаты — объекты без ссылок на всех шардах; занятые впереди не скрывают свободного.
+    let all = index.gc_candidates(after, LIMIT).await.expect("gc");
+    assert!(all.contains(&free), "свободный — кандидат");
+    assert!(all.contains(&late), "поздний — кандидат после окна W");
+    assert!(
+        busy.iter().all(|k| !all.contains(k)),
+        "занятый вторым шардом — не кандидат"
+    );
+    let first = index.gc_candidates(after, 1).await.expect("gc");
+    assert_eq!(
+        first.len(),
+        1,
+        "занятые впереди не скрывают свободного кандидата"
+    );
+    assert!(!busy.contains(&first[0]), "первый кандидат занят");
+    let early = index.gc_candidates(mid, LIMIT).await.expect("gc");
+    assert!(early.contains(&free), "свободный обнулён до mid");
+    assert!(busy.iter().all(|k| !early.contains(k)));
+    let due = index
+        .next_gc_due(W)
+        .await
+        .expect("next_gc_due")
+        .expect("срок есть: самые ранние обнулённые заняты, но свободный ждёт GC");
+    assert!(
+        due <= after + time::Duration::HOUR,
+        "срок {due} позже свободного"
+    );
+
+    // Занятый: отказ пометки; запись основного шарда осталась `live`.
+    for k in &busy {
+        assert_eq!(index.exists(k).await, Ok(true));
+        assert_eq!(
+            index.mark_deleting(k, after).await,
+            Ok(false),
+            "ссылка на втором шарде"
+        );
+    }
+    still_live(index, &busy[0], "пометка занятого откачена").await;
+
+    // Поздний: окно W от `mid` на втором шарде не истекло — отказ без следов на обоих шардах.
+    assert_eq!(
+        index.mark_deleting(&late, mid).await,
+        Ok(false),
+        "окно W второго шарда не истекло"
+    );
+    still_live(index, &late, "пометка основного шарда откачена").await;
+    still_live(second, &late, "второй шард не помечен").await;
+    assert_eq!(index.mark_deleting(&late, after).await, Ok(true));
+    assert_eq!(index.finalize_delete(&late).await, Ok(true));
+    assert_eq!(index.exists(&late).await, Ok(false));
+    assert_eq!(
+        second.exists(&late).await,
+        Ok(false),
+        "надгробие и на втором шарде"
+    );
+
+    // Свободный: второму шарду без строки — надгробие того же поколения; повтор пометки (сбой удаления) — успех.
+    assert_eq!(index.mark_deleting(&free, after).await, Ok(true));
+    assert_eq!(
+        index.mark_deleting(&free, after).await,
+        Ok(true),
+        "повтор пометки"
+    );
+    assert_eq!(index.finalize_delete(&free).await, Ok(true));
+    assert_eq!(
+        index.finalize_delete(&free).await,
+        Ok(false),
+        "повтор после надгробия"
+    );
+    assert_eq!(
+        index.mark_deleting(&free, after).await,
+        Ok(false),
+        "надгробие не помечается"
+    );
+    assert_eq!(index.exists(&free).await, Ok(false));
+    assert_eq!(
+        second
+            .commit_new(tenant, &free.hash, free.generation, 1, 1)
+            .await,
+        Ok(Commit::Bumped {
+            generation: free.generation.next()
+        }),
+        "загрузка на втором шарде по удалённому поколению — новое поколение"
+    );
+    assert_eq!(
+        index.acquire(tenant, None, &free.hash, 1).await,
+        Ok(Acquire::Absent {
+            generation: free.generation.next()
+        })
+    );
+
+    // Второй шард снял ссылки — занятые стали кандидатами и удаляются; удалённые — уже не кандидаты.
+    for k in &busy {
+        release(second, k).await;
+    }
+    let later = clock.now() + minute;
+    let all = index.gc_candidates(later, LIMIT).await.expect("gc");
+    assert!(busy.iter().all(|k| all.contains(k)), "ссылок больше нет");
+    assert!(!all.contains(&free) && !all.contains(&late), "надгробия");
+    for k in &busy {
+        assert_eq!(index.mark_deleting(k, later).await, Ok(true));
+        assert_eq!(index.finalize_delete(k).await, Ok(true));
+        assert_eq!(second.exists(k).await, Ok(false));
+    }
 }
 
 // ---------- DeliveryLog ----------
