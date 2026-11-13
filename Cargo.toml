@@ -37,6 +37,7 @@ tp-jmap = { path = "crates/tp-jmap" }
 tp-dav = { path = "crates/tp-dav" }
 tp-search = { path = "crates/tp-search" }
 tp-admin = { path = "crates/tp-admin" }
+tp-tui = { path = "crates/tp-tui" }
 # Внешние (SRS 7.4). Добавление/обновление — только полоса deps (класс B).
 anyhow = "1.0.104"
 argon2 = "0.6.0"
@@ -51,6 +52,8 @@ calcard = "0.3.14"
 cms = { version = "0.2.3", default-features = false, features = ["std"] }
 chrono = { version = "0.4.45", default-features = false }
 clap = { version = "4.6.7", features = ["derive"] }
+# Текстовый интерфейс `thepost admin tui` (решение 118): терминал и разметка экранов; та же ветка crossterm, что у ratatui.
+crossterm = "0.29.0"
 flate2 = "1.1.10"
 futures = "0.3.34"
 hex = "0.4.3"
@@ -84,6 +87,7 @@ prometheus-client = "0.25.1"
 proptest = "1.12.0"
 quick-xml = "0.42.0"
 rand = "0.10.3"
+ratatui = "0.30.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 rpassword = "7.5.5"
 rsasl = { version = "2.3.1", default-features = false, features = ["config_builder", "provider", "plain", "login", "oauthbearer", "xoauth2"] }
