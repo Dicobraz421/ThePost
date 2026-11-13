@@ -221,7 +221,8 @@ pub async fn serve(
     serve_on(tls, router, shutdown).await
 }
 
-/// Обслуживает `router` на `listener`; запрос несёт адрес клиента соединения (`ConnectInfo<SocketAddr>`).
+/// Обслуживает `router` на `listener`; запрос несёт адрес клиента соединения (`ConnectInfo<SocketAddr>`)
+/// в канонической форме ([`CanonicalPeer`]).
 async fn serve_on<L>(
     listener: L,
     router: Router,
@@ -233,12 +234,33 @@ where
     // Адрес клиента соединения — в расширении запроса `ConnectInfo<SocketAddr>`: обработчики передают его в
     // проверку учётных данных (CTR-57, защита от перебора).
     axum::serve(
-        listener.tap_io(|_| {}),
+        CanonicalPeer(listener).tap_io(|_| {}),
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move { shutdown.cancelled().await })
     .await
     .map_err(|e| Error::Internal(format!("service http: {e}")))
+}
+
+/// Слушатель с адресом клиента в канонической форме ([`crate::listen::canonical`]): IPv4-клиент двухстекового
+/// `[::]` — адрес IPv4, как у [`crate::ConnInfo`]; обработчики и проверка учётных данных его не нормализуют.
+struct CanonicalPeer<L>(L);
+
+impl<L> axum::serve::Listener for CanonicalPeer<L>
+where
+    L: axum::serve::Listener<Addr = SocketAddr>,
+{
+    type Io = L::Io;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let (io, peer) = self.0.accept().await;
+        (io, crate::listen::canonical(peer))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
 }
 
 /// Результат рукопожатия: поток TLS и адрес клиента; `None` — рукопожатие не удалось.
@@ -569,6 +591,32 @@ mod tests {
             get_plain(addr, "/healthz/live").await,
             (200, "live\n".to_owned())
         );
+        trigger.cancel();
+        server.await.expect("join").expect("serve");
+    }
+
+    /// PLT-34: IPv4-клиент двухстекового `[::]` — в `ConnectInfo` адрес IPv4, не `::ffff:a.b.c.d`.
+    #[tokio::test]
+    async fn dual_stack_peer_is_canonical() {
+        let cfg = ServiceHttpConfig {
+            listen: "[::]:0".parse().expect("addr"),
+            ..ServiceHttpConfig::default()
+        };
+        let listener = bind(&cfg).expect("bind [::]");
+        let port = listener.local_addr().expect("addr").port();
+        let router = Router::new().route(
+            "/peer",
+            get(
+                |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>| async move {
+                    peer.ip().to_string()
+                },
+            ),
+        );
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
+        let server = tokio::spawn(serve_on(listener, router, shutdown));
+        let at = SocketAddr::from(([127, 0, 0, 1], port));
+        assert_eq!(get_plain(at, "/peer").await, (200, "127.0.0.1".to_owned()));
         trigger.cancel();
         server.await.expect("join").expect("serve");
     }

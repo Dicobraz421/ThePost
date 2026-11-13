@@ -7,6 +7,9 @@
 //! Доверенные подсети (`trusted`, PLT-32) — без лимитов адреса и подсети; защита от перебора паролей
 //! (`auth.abuse`, `tp_auth::AbuseGuard`) от них не зависит и действует для всех. Секция применяется без перезапуска
 //! ([`RateLimiter::follow`]).
+//!
+//! Адрес приходит в канонической форме от слушателя ([`crate::ConnInfo`], PLT-34): `::ffff:a.b.c.d` здесь
+//! не нормализуется.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -232,7 +235,6 @@ impl RateLimiter {
     /// [`Self::check_ip`] на момент `now`. Доверенный адрес (`trusted`) — всегда `Allow`, без учёта.
     pub fn check_ip_at(&self, ip: IpAddr, now: Instant) -> Verdict {
         let cfg = self.config();
-        let ip = ip.to_canonical();
         if cfg.trusted.iter().any(|net| net.contains(ip)) {
             return Verdict::Allow;
         }
@@ -278,13 +280,12 @@ impl RateLimiter {
     pub fn block_ip_at(&self, ip: IpAddr, now: Instant) {
         let cfg = self.config();
         let mut state = self.lock();
-        block(&mut state, &cfg, Key::Ip(ip.to_canonical()), now);
+        block(&mut state, &cfg, Key::Ip(ip), now);
     }
 
     /// Адрес `ip` или его подсеть заблокированы на момент `now`.
     pub fn is_blocked_at(&self, ip: IpAddr, now: Instant) -> bool {
         let cfg = self.config();
-        let ip = ip.to_canonical();
         let prefix = match ip {
             IpAddr::V4(_) => cfg.ipv4_prefix,
             IpAddr::V6(_) => cfg.ipv6_prefix,
@@ -544,8 +545,6 @@ mod tests {
             rl.check_ip_at(ip("203.0.114.1"), clock.at(1.0))
                 .is_allowed()
         );
-        // IPv4-mapped IPv6 — тот же адрес IPv4.
-        assert!(rl.is_blocked_at(ip("::ffff:203.0.113.9"), clock.at(1.0)));
 
         for i in 1..=5 {
             let a = ip(&format!("2001:db8:1:2:{i}::1"));
@@ -632,10 +631,6 @@ mod tests {
             assert_eq!(
                 rl.check_ip_at(ip("192.0.2.10"), clock.at(0.0)),
                 Verdict::Allow
-            );
-            assert!(
-                rl.check_ip_at(ip("::ffff:192.0.2.10"), clock.at(0.0))
-                    .is_allowed()
             );
             assert!(
                 rl.check_ip_at(ip("2001:db8:5:1::7"), clock.at(0.0))
