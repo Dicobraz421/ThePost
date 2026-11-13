@@ -283,6 +283,12 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         aux.clone(),
         cfg.section::<SmtpConfig>(sections::SMTP)?.queue.resubscribe,
     ));
+    // Изменение книги GAL — в JMAP push учётных записей организации (APP-49).
+    if let Some(push) = services.gal_push.clone()
+        && cfg.roles().contains(Role::Jmap)
+    {
+        tokio::spawn(push.run(events_cfg.retry_min, aux.clone()));
+    }
     // Ротация ключей DKIM без перезапуска (SMTP-08).
     tokio::spawn(apply_dkim(
         reloader.subscribe(),
