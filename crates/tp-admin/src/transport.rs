@@ -14,10 +14,10 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::Router;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, put};
-use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_contracts::meta::PolicyTarget;
 use tp_contracts::transport::{
@@ -28,6 +28,7 @@ use tp_contracts::{DomainId, Error, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::accounts::{Policies, PolicyBody, policies};
+use crate::extract::{Json, Path, Query};
 use crate::server::{Admin, ApiResult, Problem};
 
 /// Префикс маршрутов уровня кластера (только администратор инсталляции, [`crate::AdminRole::permits`]).
@@ -872,7 +873,7 @@ mod tests {
         assert_eq!(b["effective"]["send_per_hour"], 100);
         let bad = json!({"trash_retention": "14 days"});
         let (s, _, _) = env.call("PUT", &policy, Some("org"), Some(bad)).await;
-        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(s, StatusCode::BAD_REQUEST);
 
         // Оператор — только чтение; другая организация — 403; чужой домен под своей организацией — 404.
         let (s, _, _) = env.call("GET", &policy, Some("operator"), None).await;

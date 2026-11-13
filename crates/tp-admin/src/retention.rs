@@ -17,10 +17,10 @@
 
 use std::sync::Arc;
 
-use axum::extract::{MatchedPath, Path, Query, State};
+use axum::extract::{MatchedPath, State};
 use axum::http::Uri;
 use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tp_contracts::config::duration;
@@ -33,6 +33,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::accounts::account;
 use crate::content::{self, Access};
+use crate::extract::{Json, Path, Query};
 use crate::server::{Admin, ApiResult, Caller, Problem};
 
 /// Страница списка.
@@ -777,7 +778,7 @@ mod tests {
             json!({"trash_purge": {"mode": "hide", "extra": 1}}),
         ] {
             let (s, _, _) = env.call("PUT", &policy, Some("org"), Some(bad)).await;
-            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(s, StatusCode::BAD_REQUEST);
         }
         let (s, _, _) = env.call("GET", &setting, Some("user"), None).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
