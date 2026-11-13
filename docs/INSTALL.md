@@ -136,11 +136,13 @@ export THEPOST_ADMIN_TOKEN=tps_…
 thepost admin account create ivanov@example.ru --name "Иван Иванов" --insecure
 thepost admin app-password create ivanov@example.ru --label Thunderbird --insecure   # пароль — один раз
 thepost admin account get ivanov@example.ru --insecure
-thepost admin domain list --insecure
+thepost admin transport domain list --insecure
 ```
 
 У каждого клиента может быть свой пароль приложения: `app-password list` показывает их без значений,
-`app-password revoke` отзывает один, не трогая остальные. Вывод — таблица или `--json`.
+`app-password revoke` отзывает один, не трогая остальные. Принятые домены организации —
+`transport domain list|create|delete` (`create <домен> --relay host[:port]` — пересылка на другой узел вместо
+собственного домена). Вывод — таблица или `--json`.
 
 В Docker Compose те же команды выполняются в контейнере узла:
 
@@ -155,8 +157,15 @@ $DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@e
 Вместо токена `admin init` администратор может войти у поставщика OpenID Connect из `auth.oidc` с устройства без
 браузера (OAuth 2.0 Device Authorization Grant, RFC 8628): команда показывает адрес и код, администратор
 подтверждает вход в браузере на другом устройстве, команда выводит токен доступа одной строкой в stdout.
-Команда `thepost admin login --oidc` в CLI ещё не подключена (карточка ADM-39): пока ключи ниже только
-проверяются `thepost config check`.
+Адрес и код команда пишет в stderr, а токен — в stdout, чтобы он не попал в историю оболочки:
+
+```bash
+export THEPOST_ADMIN_TOKEN="$(thepost admin login --oidc)"
+thepost admin whoami --insecure
+```
+
+Токен OIDC подставляется в `THEPOST_ADMIN_TOKEN` вместо сессии `tps_…`: обмена на сессию нет, остальные команды
+`thepost admin` — те же.
 
 | Ключ | Умолчание | Что задаёт |
 |---|---|---|
