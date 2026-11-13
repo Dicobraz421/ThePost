@@ -74,3 +74,20 @@ test("скрытые письма: список и восстановление 
   fireEvent.click(buttons[buttons.length - 1]);
   await waitFor(() => expect(sent(calls, "POST", `${A}/trash/hidden/h1/restore`)).toHaveLength(1));
 });
+
+test("корзина: тема и отправитель — по переключателю, запрос с include=subject", async () => {
+  const calls = open("/accounts/a1/trash", {
+    ...routes,
+    [`GET ${A}/trash`]: (c) => ({
+      body: {
+        items: [c.path.includes("include=subject") ? { ...entry("m1"), subject: "Счёт", from: "Боб <bob@example.org>" } : entry("m1")],
+        next_offset: null,
+      },
+    }),
+  });
+  expect(await screen.findByText("m1")).toBeTruthy();
+  fireEvent.click(await screen.findByRole("switch", { name: "Показать темы писем" }));
+  expect(await screen.findByText("Счёт")).toBeTruthy();
+  expect(screen.getByText("Боб <bob@example.org>")).toBeTruthy();
+  expect(sent(calls, "GET", `${A}/trash?offset=0&include=subject`)).toHaveLength(1);
+});

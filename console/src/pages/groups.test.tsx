@@ -16,8 +16,9 @@ const group = (id: string, name: string, more: object = {}) =>
     members: [],
     moderators: [],
     senders: "anyone",
+    names: {},
     ...more,
-  }) as unknown as Schemas["GroupInfo"];
+  }) as Schemas["GroupInfo"];
 const held = (id: string, more: object = {}) => ({
   id,
   source: "group",
@@ -103,20 +104,26 @@ test("группа: создание — POST groups", async () => {
 });
 
 test("группа каталога: изменение — PATCH без имени, адреса и состава; очередь модерации группы", async () => {
-  const g = group("g1", "Отдел", { external_id: "cn=dept", members: [{ account: "a1" }], moderators: ["a1"] });
+  const g = group("g1", "Отдел", {
+    external_id: "cn=dept",
+    members: [{ account: "a1" }, { account: "a9" }],
+    moderators: ["a1"],
+    names: { a1: "alice@example.org" },
+  });
   const calls = open("/groups/g1", {
     [`GET ${BASE}/groups/g1`]: { body: g },
     [`GET ${BASE}/groups`]: { body: [g] },
     [`GET ${BASE}/accounts`]: { body: [] },
-    [`GET ${BASE}/accounts/a1`]: { body: { id: "a1", login: "alice@example.org" } },
     [`GET ${BASE}/moderation`]: { body: [held("h1")] },
     [`PATCH ${BASE}/groups/g1`]: { body: g },
   });
   const name = (await screen.findByLabelText("Имя группы")) as HTMLInputElement;
   expect(name.value).toBe("Отдел");
   expect(name.disabled).toBe(true);
-  // Подписи участников и модераторов — имена входа, а не идентификаторы.
+  // Подписи участников и модераторов — имена входа из ответа (`names`), без запросов по каждой записи.
   expect((await screen.findAllByText("alice@example.org")).length).toBe(2);
+  expect(screen.getByText("a9 (записи нет)")).toBeTruthy();
+  expect(calls.filter((c) => c.path.startsWith(`${BASE}/accounts/`))).toEqual([]);
   // Очередь — только этой группы.
   expect(await screen.findByText("h1@ext.example")).toBeTruthy();
   expect(sent(calls, "GET", `${BASE}/moderation?group=g1`)).toHaveLength(1);
@@ -155,4 +162,23 @@ test("очередь модерации: одобрить и отклонить 
   fireEvent.click(screen.getByRole("button", { name: "Отклонить письмо" }));
   await waitFor(() => expect(sent(calls, "POST", `${BASE}/moderation/h2/reject`)[0]?.body).toEqual({ reason: "не по теме" }));
   await waitFor(() => expect(screen.queryByText("h2@ext.example")).toBeNull());
+});
+
+test("очередь модерации: тема письма — только по переключателю (include=subject); оператору переключателя нет", async () => {
+  const calls = open("/moderation", {
+    [`GET ${BASE}/moderation`]: (c) => ({ body: [held("h1", c.path.includes("include=subject") ? { subject: "Отчёт за ноябрь" } : {})] }),
+    [`GET ${BASE}/groups`]: { body: [group("g1", "Staff")] },
+  });
+  expect(await screen.findByText("h1@ext.example")).toBeTruthy();
+  expect(screen.queryByText("Тема")).toBeNull();
+  fireEvent.click(await screen.findByRole("switch", { name: "Показать темы писем" }));
+  expect(await screen.findByText("Отчёт за ноябрь")).toBeTruthy();
+  expect(sent(calls, "GET", `${BASE}/moderation?include=subject`)).toHaveLength(1);
+  cleanup();
+
+  const read = open("/moderation", { [`GET ${BASE}/moderation`]: { body: [held("h2")] }, [`GET ${BASE}/groups`]: { body: [] } }, ["operator"]);
+  expect(await screen.findByText("h2@ext.example")).toBeTruthy();
+  await waitFor(() => expect(read.some((c) => c.path === "/api/v1/whoami")).toBe(true));
+  expect(screen.queryByRole("switch", { name: "Показать темы писем" })).toBeNull();
+  expect(read.some((c) => c.path.includes("include="))).toBe(false);
 });

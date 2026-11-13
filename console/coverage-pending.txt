@@ -30,6 +30,3 @@ PUT /api/v1/orgs/{org}/mailbox-audit/policy
 DELETE /api/v1/orgs/{org}/mailbox-audit/policy
 GET /api/v1/orgs/{org}/sync-hold
 POST /api/v1/orgs/{org}/sync-hold/approve
-
-# Изменение и блокировка учётной записи (ADM-18) — экран UI-15.
-PATCH /api/v1/orgs/{org}/accounts/{account}

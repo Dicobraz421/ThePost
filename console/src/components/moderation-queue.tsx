@@ -6,14 +6,19 @@ import { useState } from "react";
 import type { Schemas } from "../api/client";
 
 import { bytes, when } from "./format";
+import { useSubjects } from "./subjects";
 
 type Held = Schemas["HeldInfo"];
 
 export function ModerationQueue({ group }: { group?: string }) {
+  const { include, shown, toggle } = useSubjects("moderation");
   const { result, query } = useList<Held>({
     resource: "moderation",
     pagination: { mode: "off" },
-    filters: group ? [{ field: "group", operator: "eq", value: group }] : [],
+    filters: [
+      ...(group ? [{ field: "group", operator: "eq" as const, value: group }] : []),
+      ...(include ? [{ field: "include", operator: "eq" as const, value: include }] : []),
+    ],
   });
   const { result: groups } = useList<Schemas["GroupInfo"]>({ resource: "groups", pagination: { mode: "off" } });
   const { mutate, mutation } = useCustomMutation<never, never, Schemas["Rejection"] | undefined>();
@@ -41,8 +46,10 @@ export function ModerationQueue({ group }: { group?: string }) {
       : `группа «${groups.data.find((g) => g.id === h.group)?.name ?? h.group ?? ""}»`;
   return (
     <>
+      {toggle}
       <Table<Held> dataSource={result.data} loading={query.isLoading} rowKey="id" pagination={false}>
         <Table.Column dataIndex="sender" title="Отправитель" />
+        {shown && <Table.Column<Held> title="Тема" render={(_, h) => h.subject ?? "—"} />}
         <Table.Column<Held> title="Получатели" render={(_, h) => h.recipients.join(", ")} />
         <Table.Column<Held> title="Причина задержки" render={(_, h) => cause(h)} />
         <Table.Column<Held> title="Размер" render={(_, h) => bytes(h.size)} />

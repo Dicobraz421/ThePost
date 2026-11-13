@@ -2,7 +2,7 @@ import "@refinedev/antd/dist/reset.css";
 import "dayjs/locale/ru";
 
 import { ErrorComponent, ThemedLayout, ThemedTitle, useNotificationProvider } from "@refinedev/antd";
-import { Authenticated, Refine, usePermissions } from "@refinedev/core";
+import { Authenticated, CanAccess, Refine, usePermissions } from "@refinedev/core";
 import routerProvider, { CatchAllNavigate, DocumentTitleHandler, NavigateToResource } from "@refinedev/react-router";
 import { App as AntdApp, ConfigProvider } from "antd";
 // ES-модуль: `antd/locale/ru_RU` (CommonJS) в сборке Vite приходит обёрткой без текстов — интерфейс остаётся английским.
@@ -10,6 +10,7 @@ import ruRU from "antd/es/locale/ru_RU";
 import dayjs from "dayjs";
 import { Outlet, Route, Routes } from "react-router";
 
+import { Forbidden } from "./components/forbidden";
 import { Header } from "./components/header";
 import { i18nProvider } from "./i18n";
 import type { Schemas } from "./api/client";
@@ -79,7 +80,10 @@ export function App() {
               element={
                 <Authenticated key="app" fallback={<CatchAllNavigate to="/login" />}>
                   <ThemedLayout Title={Title} Header={Header}>
-                    <Outlet />
+                    {/* Раздел или действие по маршруту, недоступные роли, — «Нет доступа» вместо отказов узла в таблице. */}
+                    <CanAccess fallback={<Forbidden />}>
+                      <Outlet />
+                    </CanAccess>
                   </ThemedLayout>
                 </Authenticated>
               }

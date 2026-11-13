@@ -6,6 +6,7 @@ import { useParams } from "react-router";
 
 import type { Schemas } from "../api/client";
 import { bytes, when } from "../components/format";
+import { useSubjects } from "../components/subjects";
 
 type Entry = Schemas["TrashEntry"];
 
@@ -20,14 +21,18 @@ function TrashTable({ account, hidden }: { account: string; hidden?: boolean }) 
   // Смещения пройденных страниц: последнее — текущая.
   const [offsets, setOffsets] = useState([0]);
   const offset = offsets[offsets.length - 1];
-  const { result, query } = useCustom<Schemas["TrashPage"]>({ url, method: "get", config: { query: { offset } } });
+  const { include, shown, toggle } = useSubjects("accounts");
+  const { result, query } = useCustom<Schemas["TrashPage"]>({ url, method: "get", config: { query: { offset, include } } });
   const { mutate, mutation } = useCustomMutation<Schemas["RestoredMessage"], HttpError, undefined>();
   const page = result.data;
   const next = page?.next_offset;
   return (
     <>
+      {toggle}
       <Table<Entry> dataSource={page?.items} loading={query.isLoading} rowKey="message" pagination={false}>
         <Table.Column dataIndex="message" title="Письмо" />
+        {shown && <Table.Column<Entry> title="Тема" render={(_, e) => e.subject ?? "—"} />}
+        {shown && <Table.Column<Entry> title="Отправитель" render={(_, e) => e.from ?? "—"} />}
         {/* Узел отдаёт идентификатор папки; имён папок ящика в Admin API нет. */}
         <Table.Column dataIndex="origin" title="Исходная папка (идентификатор)" />
         <Table.Column<Entry> title="Размер" render={(_, e) => bytes(e.size)} />

@@ -69,9 +69,11 @@ test("учётная запись: создание; ошибка API — в у�
   const calls = open("/accounts/create", {
     [`POST ${BASE}/accounts`]: { status: 409, body: { status: 409, title: "Conflict", detail: "имя занято" } },
   });
+  // Форма готова, когда известны роли (кнопка включена): раньше введённое сбрасывается при её подготовке.
+  const [save] = await buttons(/Сохранить/);
   fireEvent.change(await screen.findByLabelText("Имя входа"), { target: { value: "dave@example.org" } });
   fireEvent.change(screen.getByLabelText("Отображаемое имя"), { target: { value: "Дэйв" } });
-  fireEvent.click((await buttons(/Сохранить/))[0]);
+  fireEvent.click(save);
   await waitFor(() =>
     expect(sent(calls, "POST", `${BASE}/accounts`)[0]?.body).toEqual({ login: "dave@example.org", display_name: "Дэйв" }),
   );
@@ -99,6 +101,43 @@ test("учётная запись: политика ящика — PUT accounts/
   fireEvent.click(screen.getByRole("button", { name: "Сохранить политику" }));
   await waitFor(() => expect(sent(calls, "PUT", `${BASE}/accounts/a1/policy`)[0]?.body).toEqual({ ...empty, quota_bytes: 200 }));
   expect(await screen.findByText("Политика ящика сохранена")).toBeTruthy();
+});
+
+test("учётная запись: блокировка и имя — PATCH только изменённых полей; запись каталога не меняется", async () => {
+  let current = account("a1", "alice@example.org");
+  const calls = open("/accounts/a1", {
+    [`GET ${BASE}/accounts/a1`]: () => ({ body: current }),
+    [`GET ${BASE}/accounts/a1/app-passwords`]: { body: [] },
+    [`PATCH ${BASE}/accounts/a1`]: (c) => {
+      current = { ...current, ...(c.body as object) };
+      return { body: current };
+    },
+  });
+  const save = await waitFor(() => {
+    const b = screen.getByRole("button", { name: "Сохранить" }) as HTMLButtonElement;
+    expect(b.disabled).toBe(true);
+    return b;
+  });
+  fireEvent.click(screen.getByRole("switch", { name: "Разрешить вход" }));
+  await waitFor(() => expect(save.disabled).toBe(false));
+  fireEvent.click(save);
+  await waitFor(() => expect(sent(calls, "PATCH", `${BASE}/accounts/a1`)[0]?.body).toEqual({ enabled: false }));
+  expect(await screen.findByText("Учётная запись заблокирована")).toBeTruthy();
+  expect(await screen.findByText("Заблокирована")).toBeTruthy();
+
+  fireEvent.change(screen.getByRole("textbox", { name: "Отображаемое имя" }), { target: { value: " Алиса " } });
+  fireEvent.click(screen.getByRole("button", { name: "Сохранить" }));
+  await waitFor(() => expect(sent(calls, "PATCH", `${BASE}/accounts/a1`)[1]?.body).toEqual({ display_name: "Алиса" }));
+});
+
+test("учётная запись каталога: имя и блокировка только для чтения", async () => {
+  open("/accounts/a1", {
+    [`GET ${BASE}/accounts/a1`]: { body: account("a1", "alice@example.org", { external_id: "uid=alice" }) },
+    [`GET ${BASE}/accounts/a1/app-passwords`]: { body: [] },
+  });
+  expect(await screen.findByText("Имя и блокировку записи каталога ведёт каталог.")).toBeTruthy();
+  expect((screen.getByRole("switch", { name: "Разрешить вход" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.queryByRole("button", { name: "Сохранить" })).toBeNull();
 });
 
 test("пароли приложений: выпуск показывает пароль один раз, отзыв — DELETE", async () => {
