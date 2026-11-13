@@ -212,7 +212,9 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
   `LoadCredentialEncrypted=` юнитов копий и drop-in `postgresql@16-main.service.d/pgbackrest.conf` (для
   `archive_command` и `restore_command`). pgBackRest читает их через `--config-include-path=/run/credentials/<юнит>`,
   restic — через `RESTIC_PASSWORD_FILE` и `AWS_SHARED_CREDENTIALS_FILE`. Вручную — `thepost-pgbackrest …` и
-  `thepost-restic …` (обёртки `systemd-run` с теми же учётными данными);
+  `thepost-restic …` от root (обёртки `systemd-run` с теми же учётными данными); через `sudo` в семействе RHEL —
+  полным путём `/usr/local/sbin/thepost-…`: `secure_path` sudo там без `/usr/local/sbin` (так их вызывают роль и
+  `restore.yml`);
 - снимок Raft OpenBao (`thepost_backup_openbao: true`, DEP-23; все секреты The Post — DKIM, AppRole, пароли СУБД,
   ключи копий) — `thepost-backup-openbao.service` после каждой копии СУБД (своё расписание —
   `thepost_backup_openbao_schedule`) в то же хранилище: restic (тег `thepost-openbao`) или каталог rsync
