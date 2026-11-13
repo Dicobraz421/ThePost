@@ -2,9 +2,7 @@
 //!
 //! Пароль генерирует сервер (`tp_auth::AppPasswords`, argon2id): значение возвращается один раз в ответе на
 //! выпуск (`Cache-Control: no-store`) и не хранится; в аудит тело не попадает. Отозванный пароль сразу перестаёт
-//! приниматься `PasswordAuthenticator` (IMAP, SMTP, JMAP Basic). Предел действующих паролей — 409. Подпись
-//! [`INIT_PASSWORD_LABEL`] зарезервирована за `thepost admin init` (по ней вход по паролю узнаёт администратора
-//! инсталляции, [`crate::init`]) — 400.
+//! приниматься `PasswordAuthenticator` (IMAP, SMTP, JMAP Basic). Предел действующих паролей — 409.
 
 use std::sync::Arc;
 
@@ -17,11 +15,10 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tp_contracts::app_password::AppPassword;
 use tp_contracts::meta::AccountScope;
-use tp_contracts::{AccountId, Error, TenantId};
+use tp_contracts::{AccountId, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::accounts::account;
-use crate::init::INIT_PASSWORD_LABEL;
 use crate::server::{Admin, ApiResult, Problem};
 
 /// Пароль приложения (без значения).
@@ -125,12 +122,6 @@ async fn issue(
     Path((org, id)): Path<(TenantId, AccountId)>,
     Json(body): Json<NewAppPassword>,
 ) -> ApiResult<Response> {
-    if body.label.trim().eq_ignore_ascii_case(INIT_PASSWORD_LABEL) {
-        return Err(Error::invalid(format!(
-            "подпись {INIT_PASSWORD_LABEL:?} зарезервирована за thepost admin init"
-        ))
-        .into());
-    }
     let scope = scope(&a, org, id).await?;
     let (p, secret) = a.d.app_passwords.issue(scope, &body.label).await?;
     let issued = IssuedAppPassword {

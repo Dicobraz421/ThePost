@@ -177,6 +177,16 @@ impl AccountStore for CountedAccounts {
         self.calls.push("remove_disabled");
         self.inner.remove_disabled(tenant, id).await
     }
+
+    async fn grant_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        self.calls.push("grant_installation_admin");
+        self.inner.grant_installation_admin(tenant, id).await
+    }
+
+    async fn is_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<bool> {
+        self.calls.push("is_installation_admin");
+        self.inner.is_installation_admin(tenant, id).await
+    }
 }
 
 /// Хранилища в памяти: метаданные, квоты, почтовое хранилище.

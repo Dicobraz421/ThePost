@@ -251,6 +251,30 @@ impl AccountStore for Limited {
     {
         self.0.remove_disabled(tenant, id)
     }
+
+    fn grant_installation_admin<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        id: AccountId,
+    ) -> Fut<'async_trait, ()>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.grant_installation_admin(tenant, id)
+    }
+
+    fn is_installation_admin<'life0, 'async_trait>(
+        &'life0 self,
+        tenant: TenantId,
+        id: AccountId,
+    ) -> Fut<'async_trait, bool>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.is_installation_admin(tenant, id)
+    }
 }
 
 struct Ext {

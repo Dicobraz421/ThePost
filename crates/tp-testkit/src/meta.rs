@@ -131,6 +131,8 @@ struct AccountData {
     delegates: BTreeMap<AccountId, Delegate>,
     /// Правила бронирования ресурса (CTR-48); только у вида [`AccountKind::Resource`].
     booking: Option<BookingPolicy>,
+    /// Роль администратора установки (`AccountStore::grant_installation_admin`, решение 117).
+    installation_admin: bool,
 }
 
 /// Письмо-кандидат в архив (CTR-76): идентификатор, папка, момент получения.
@@ -1315,6 +1317,7 @@ impl AccountStore for MemMetadata {
             state: AccountState::Active,
             delegates: BTreeMap::new(),
             booking: None,
+            installation_admin: false,
         };
         for (name, role) in SYSTEM_FOLDERS {
             let data = NewMailbox {
@@ -1465,6 +1468,20 @@ impl AccountStore for MemMetadata {
         }
         st.accounts.remove(&(tenant, id));
         Ok(())
+    }
+
+    async fn grant_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        let mut st = lock(&self.state);
+        let acc = st.accounts.get_mut(&(tenant, id)).ok_or(Error::NotFound)?;
+        acc.installation_admin = true;
+        Ok(())
+    }
+
+    async fn is_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<bool> {
+        Ok(lock(&self.state)
+            .accounts
+            .get(&(tenant, id))
+            .is_some_and(|a| a.installation_admin))
     }
 }
 
@@ -2173,6 +2190,19 @@ mod tests {
             foreign_domain: DomainId::new(),
         };
         crate::suite::account_by_ids(&MemMetadata::default(), &fx).await;
+    }
+
+    /// Решение 117: общий набор роли администратора установки.
+    #[tokio::test]
+    async fn account_installation_admin_suite() {
+        let fx = crate::suite::AccountListFixture {
+            tenant: TenantId::DEFAULT,
+            domain: DomainId::new(),
+            domain_name: "example.org".into(),
+            foreign_tenant: TenantId::new(),
+            foreign_domain: DomainId::new(),
+        };
+        crate::suite::account_installation_admin(&MemMetadata::default(), &fx).await;
     }
 
     /// CTR-62: общий набор `AccountStore::by_address`.

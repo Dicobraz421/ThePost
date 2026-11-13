@@ -369,6 +369,15 @@ pub trait AccountStore: Send + Sync + 'static {
     /// отключённый без отметки удаления — `Error::Invalid`; остались письма — `Error::Conflict`; нет —
     /// `Error::NotFound`.
     async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()>;
+
+    /// Назначает учётной записи роль администратора установки (решение 117): явная запись о роли — её ставит
+    /// `thepost admin init`, читает вход администратора по паролю (`tp-admin`). Повтор — не ошибка; нет учётной
+    /// записи — `Error::NotFound`. Запись удаляется вместе с учётной записью.
+    async fn grant_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<()>;
+
+    /// Учётной записи назначена роль администратора установки ([`AccountStore::grant_installation_admin`]); нет
+    /// учётной записи — `false`.
+    async fn is_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<bool>;
 }
 
 // ---------- Папки ----------

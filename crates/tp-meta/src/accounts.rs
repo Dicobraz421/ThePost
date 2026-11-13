@@ -543,6 +543,48 @@ impl AccountStore for PgMeta {
     async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {
         self.remove_disabled_box(tenant, id).await
     }
+
+    /// Одним запросом (таблица `installation_admins`, миграция 0040): вставка из строки учётной записи, повтор —
+    /// `ON CONFLICT DO NOTHING`; нет строки учётной записи — `NotFound`.
+    async fn grant_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        self.rewrite(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let (found,): (i64,) = sqlx::query_as(
+                "WITH a AS (SELECT tenant_id, account_id FROM accounts WHERE tenant_id = $1 AND account_id = $2),
+                      ins AS (INSERT INTO installation_admins (tenant_id, account_id)
+                              SELECT tenant_id, account_id FROM a ON CONFLICT DO NOTHING)
+                 SELECT count(*) FROM a",
+            )
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if found == 0 {
+                return Err(Error::NotFound);
+            }
+            crate::commits::commit(tx).await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn is_installation_admin(&self, tenant: TenantId, id: AccountId) -> Result<bool> {
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
+            let (found,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM installation_admins WHERE tenant_id = $1 AND account_id = $2)",
+            )
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            crate::commits::commit(tx).await?;
+            Ok(found)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]

@@ -8,16 +8,17 @@
 //!   (`admin.init.socket`) и права на него — у вызывающего, `thepost`; [`serve_local`] — цикл приёма на Unix;
 //!   клиент — [`request`].
 //! - [`Admin::init`] — организация по умолчанию, принятый домен адреса (создаётся, если нет), учётная запись
-//!   администратора, пароль (пароль приложения с подписью [`INIT_PASSWORD_LABEL`]: вход IMAP, SMTP, JMAP и вход
-//!   администратора по паролю) и одноразовый токен Admin API со сроком `admin.init.token_ttl`. Администратор уже
-//!   заведён (есть учётная запись с этим адресом или ранее выпущенный токен) — отказ, `force` — повтор (прежние
-//!   пароли `admin init` отзываются). Каждый вызов — в журнал аудита.
+//!   администратора с ролью администратора установки (явная запись, `AccountStore::grant_installation_admin`),
+//!   пароль (пароль приложения с подписью [`INIT_PASSWORD_LABEL`]: вход IMAP, SMTP, JMAP и вход администратора по
+//!   паролю) и одноразовый токен Admin API со сроком `admin.init.token_ttl`. Администратор уже заведён (есть учётная
+//!   запись с этим адресом или ранее выпущенный токен) — отказ, `force` — повтор (прежние пароли `admin init`
+//!   отзываются). Каждый вызов — в журнал аудита.
 //! - `POST /api/v1/session` с телом [`PasswordLogin`] — вход администратора по имени входа и паролю (решение 117):
 //!   пароль проверяет [`crate::Deps::auth`] — тот же путь, что вход пользователя на узле (пароль каталога или
 //!   приложения под защитой от перебора `AbuseGuard` по адресу клиента и учётной записи). Роли сессии — по
-//!   назначениям `admin.roles` ([`Admin::caller`]); учётная запись `admin init` (действующий пароль с подписью
-//!   [`INIT_PASSWORD_LABEL`]) — администратор инсталляции. Без ролей — 403, неверный пароль или блокировка — 401,
-//!   выключен (`admin.password_login`, [`crate::AdminConfig::password_login_enabled`]) — 404.
+//!   назначениям `admin.roles` ([`Admin::caller`]) и записи о роли администратора установки
+//!   (`AccountStore::is_installation_admin`; ставит `admin init`). Подпись пароля роли не даёт. Без ролей — 403,
+//!   неверный пароль или блокировка — 401, выключен (`admin.password_login`, [`crate::AdminConfig::password_login_enabled`]) — 404.
 //! - `POST /api/v1/session` без тела — обмен токена `admin init` (`Authorization: Bearer tpa_…`) на сессию
 //!   (решение 2026-11-11, п. 2): токен гасится первой проверкой; роль — администратор инсталляции. Работает и при
 //!   выключенном входе по паролю: первый вход и вход без ролей в `admin.roles`.
@@ -63,7 +64,7 @@ pub const SESSION_ROUTE: &str = "/api/v1/session";
 /// Префикс значения сессии Admin API в `Authorization: Bearer`.
 pub const SESSION_PREFIX: &str = "tps_";
 
-/// Подпись паролей, выпущенных `admin init`.
+/// Подпись паролей, выпущенных `admin init` (по ней повтор `--force` отзывает прежние; роли не даёт).
 pub const INIT_PASSWORD_LABEL: &str = "thepost admin init";
 
 /// Маршрут записей аудита локального сокета.
@@ -344,6 +345,10 @@ impl Admin {
                 .await?
             }
         };
+        self.d
+            .accounts
+            .grant_installation_admin(tenant, account.id)
+            .await?;
         let scope = AccountScope {
             tenant,
             account: account.id,
@@ -411,25 +416,6 @@ impl Admin {
         if let Err(e) = crate::audit::record(&self.d, &record).await {
             tracing::error!(error = %e, route = INIT_ROUTE, "admin: запись аудита не сохранена");
         }
-    }
-
-    /// Учётная запись заведена `admin init`: у неё действующий пароль с подписью [`INIT_PASSWORD_LABEL`]
-    /// (организация по умолчанию; подпись зарезервирована — Admin API её не выдаёт, [`crate::app_passwords`]).
-    pub(crate) async fn init_admin(&self, p: &Principal) -> Result<bool> {
-        if p.tenant != TenantId::DEFAULT {
-            return Ok(false);
-        }
-        let scope = AccountScope {
-            tenant: p.tenant,
-            account: p.account,
-        };
-        Ok(self
-            .d
-            .app_passwords
-            .list(scope)
-            .await?
-            .iter()
-            .any(|x| x.label == INIT_PASSWORD_LABEL && x.revoked_at.is_none()))
     }
 
     /// Администратор по значению сессии в момент `now`; не сессия — `None`, нет или истекла — `Forbidden`.
@@ -866,7 +852,12 @@ async fn password_login(
         result,
     };
     let mut roles = a.caller(principal.clone()).roles;
-    match a.init_admin(&principal).await {
+    match a
+        .d
+        .accounts
+        .is_installation_admin(principal.tenant, principal.account)
+        .await
+    {
         Ok(true) => {
             roles.insert(AdminRole::InstallationAdmin);
         }
@@ -1036,8 +1027,8 @@ mod tests {
         assert_eq!(env.admin.local.as_ref().expect("local").sessions().len(), 0);
     }
 
-    /// Учётная запись `admin init` входит по паролю `admin init` администратором инсталляции без `admin.roles`;
-    /// отозванный пароль `admin init` роль снимает. Подпись пароля `admin init` в Admin API не выдаётся.
+    /// После `admin init` вход по паролю даёт роль администратора установки без `admin.roles`: роль — запись
+    /// учётной записи, а не признак пароля, — отзыв паролей `admin init` её не снимает (вход решает проверка пароля).
     #[tokio::test]
     async fn init_admin_logs_in_by_password() {
         let env = Env::new();
@@ -1046,6 +1037,12 @@ mod tests {
             .init(&req("boss@example.test", false))
             .await
             .expect("init");
+        assert_eq!(
+            env.meta
+                .is_installation_admin(TenantId::DEFAULT, g.account)
+                .await,
+            Ok(true)
+        );
         let scope = AccountScope {
             tenant: TenantId::DEFAULT,
             account: g.account,
@@ -1058,23 +1055,56 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED, "{b}");
         assert_eq!(b["roles"], json!(["installation_admin"]));
 
-        let reserved = json!({"label": " Thepost Admin Init "});
-        let path = format!(
-            "/api/v1/orgs/{}/accounts/{}/app-passwords",
-            TenantId::DEFAULT,
-            g.account
-        );
-        let (s, _, b) = env.call("POST", &path, Some("root"), Some(reserved)).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
-
         for p in env.app_passwords.list(scope).await.expect("list") {
             env.app_passwords
                 .revoke(scope, &p.id)
                 .await
                 .expect("revoke");
         }
-        let (s, _, _) = env.call("POST", SESSION_ROUTE, None, Some(body)).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, b) = env.call("POST", SESSION_ROUTE, None, Some(body)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(b["roles"], json!(["installation_admin"]));
+    }
+
+    /// Пароль приложения с подписью [`INIT_PASSWORD_LABEL`], выпущенный не `admin init` (Admin API), роли не даёт:
+    /// вход по нему без `admin.roles` — 403.
+    #[tokio::test]
+    async fn init_label_gives_no_role() {
+        let env = Env::new();
+        let scope = env.account("mallory@example.org").await;
+        let path = format!(
+            "/api/v1/orgs/{}/accounts/{}/app-passwords",
+            scope.tenant, scope.account
+        );
+        let (s, _, b) = env
+            .call(
+                "POST",
+                &path,
+                Some("root"),
+                Some(json!({"label": INIT_PASSWORD_LABEL})),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let password = b["password"].as_str().expect("password").to_owned();
+        let labels: Vec<_> = env
+            .app_passwords
+            .list(scope)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|p| p.label)
+            .collect();
+        assert_eq!(labels, [INIT_PASSWORD_LABEL]);
+        add_password(&env, scope, "mallory@example.org", &password, &[]);
+        let body = password_body("mallory@example.org", &password);
+        let (s, _, b) = env.call("POST", SESSION_ROUTE, None, Some(body)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        assert_eq!(
+            env.meta
+                .is_installation_admin(scope.tenant, scope.account)
+                .await,
+            Ok(false)
+        );
     }
 
     /// `admin.password_login`: по умолчанию включён без `admin.oidc`, выключен с ним; выключен — 404 без проверки
