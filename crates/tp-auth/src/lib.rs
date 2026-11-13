@@ -272,6 +272,7 @@ pub(crate) mod testutil {
                         enabled: *enabled,
                         aliases: Vec::new(),
                         kind: AccountKind::User,
+                        hidden_from_gal: false,
                     },
                 )
                 .await

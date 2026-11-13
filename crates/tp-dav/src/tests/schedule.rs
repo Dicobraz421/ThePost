@@ -67,6 +67,7 @@ impl Sched {
                         enabled: true,
                         aliases: Vec::new(),
                         kind: AccountKind::User,
+                        hidden_from_gal: false,
                     },
                 )
                 .await
@@ -1038,6 +1039,7 @@ async fn principal_addresses_with_alias() {
                 enabled: true,
                 aliases: vec!["I.Ivanov@Example.org".to_owned()],
                 kind: AccountKind::User,
+                hidden_from_gal: false,
             },
         )
         .await
@@ -1200,6 +1202,7 @@ async fn invite_alias_and_group() {
                 enabled: true,
                 aliases: vec![alias.to_owned()],
                 kind: AccountKind::User,
+                hidden_from_gal: false,
             },
         )
         .await

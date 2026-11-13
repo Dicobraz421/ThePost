@@ -24,6 +24,7 @@ async fn upsert_creates_system_folders_and_matches() {
         enabled: true,
         aliases: Vec::new(),
         kind: AccountKind::User,
+        hidden_from_gal: false,
     };
     let acc = meta.upsert(tenant, data.clone()).await.expect("upsert");
     assert_eq!(acc.tenant, tenant);

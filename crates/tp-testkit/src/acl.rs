@@ -243,6 +243,7 @@ mod tests {
                     enabled: true,
                     aliases: Vec::new(),
                     kind: tp_contracts::meta::AccountKind::User,
+                    hidden_from_gal: false,
                 },
             )
             .await

@@ -720,6 +720,7 @@ impl MemMetadata {
                     enabled: true,
                     aliases: Vec::new(),
                     kind: AccountKind::User,
+                    hidden_from_gal: false,
                 },
             )
             .await?;
@@ -1260,6 +1261,7 @@ impl AccountStore for MemMetadata {
             a.domain = data.domain;
             a.aliases = account_aliases(&data.login, data.aliases.iter().map(String::as_str));
             a.kind = data.kind;
+            a.hidden_from_gal = data.hidden_from_gal;
             a.login = data.login;
             a.display_name = data.display_name;
             a.external_id = data.external_id.or(a.external_id.take());
@@ -1287,6 +1289,7 @@ impl AccountStore for MemMetadata {
             display_name: data.display_name,
             external_id: data.external_id,
             enabled: data.enabled,
+            hidden_from_gal: data.hidden_from_gal,
         };
         let mut acc = AccountData {
             account: account.clone(),
@@ -2833,6 +2836,7 @@ mod tests {
             enabled: true,
             aliases: Vec::new(),
             kind: AccountKind::User,
+            hidden_from_gal: false,
         };
         let t = TenantId::DEFAULT;
         let x = meta

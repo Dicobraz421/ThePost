@@ -174,6 +174,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "inbox log",
         include_str!("../migrations/0037_inbox_log.sql"),
     ),
+    (
+        38,
+        "account hidden from gal",
+        include_str!("../migrations/0038_account_hidden_from_gal.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

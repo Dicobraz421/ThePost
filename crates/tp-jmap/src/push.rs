@@ -861,6 +861,7 @@ mod tests {
                     enabled: false,
                     aliases: Vec::new(),
                     kind: AccountKind::User,
+                    hidden_from_gal: false,
                 },
             )
             .await

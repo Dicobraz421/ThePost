@@ -43,6 +43,7 @@ async fn account_in(meta: &PgMeta, tenant: TenantId, domain: (DomainId, &str)) -
                 enabled: true,
                 aliases: Vec::new(),
                 kind: AccountKind::User,
+                hidden_from_gal: false,
             },
         )
         .await

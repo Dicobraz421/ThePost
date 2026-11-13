@@ -382,6 +382,8 @@ impl DirectorySync {
             // Адреса каталога: основной и повторы отбрасывает правило `meta::account_aliases` (CTR-53).
             aliases: a.emails.clone(),
             kind: tp_contracts::meta::AccountKind::User,
+            // Признак каталога (LDAP — `msExchHideFromAddressLists`, AUTH-16) — с учётной записью (CTR-83).
+            hidden_from_gal: a.hidden_from_gal,
         };
         let account = match self.stores.accounts.upsert(t, upsert).await {
             Ok(acc) => acc,
