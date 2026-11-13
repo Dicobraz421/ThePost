@@ -150,6 +150,50 @@ $DC exec -e THEPOST_ADMIN_TOKEN=tpa_… thepost thepost admin login --insecure
 $DC exec -e THEPOST_ADMIN_TOKEN=tps_… thepost thepost admin account create a@example.test --insecure
 ```
 
+### Вход администратора через OIDC: секция `cli.oidc`
+
+Вместо токена `admin init` администратор может войти у поставщика OpenID Connect из `auth.oidc` с устройства без
+браузера (OAuth 2.0 Device Authorization Grant, RFC 8628): команда показывает адрес и код, администратор
+подтверждает вход в браузере на другом устройстве, команда выводит токен доступа одной строкой в stdout.
+Команда `thepost admin login --oidc` в CLI ещё не подключена (карточка ADM-39): пока ключи ниже только
+проверяются `thepost config check`.
+
+| Ключ | Умолчание | Что задаёт |
+|---|---|---|
+| `cli.oidc.client_id` | не задан — вход с устройства выключен | открытый клиент (public client) у поставщика с разрешённым Device Authorization Grant; его токен должен содержать получателя из `auth.oidc.audience` |
+| `cli.oidc.scope` | `openid` | области доступа через пробел |
+| `cli.oidc.poll_interval` | `5s` | пауза между опросами токена, если поставщик не прислал свой `interval` |
+| `cli.oidc.slow_down_step` | `5s` | прибавка к паузе на каждый ответ поставщика `slow_down` |
+| `cli.oidc.max_wait` | `15m` | наибольшее ожидание подтверждения, даже если код поставщика действует дольше |
+
+Секцию читает сама команда при каждом запуске — перезапуск узла не нужен. Без `auth.oidc` или без `client_id`
+команда завершается ошибкой; пустой `client_id` или `scope`, нулевые паузы — ошибка `thepost config check`.
+Ansible — `thepost_cli_oidc` (например `{ client_id: thepost-cli }`), Helm — `config.cli.oidc`.
+
+## Обслуживание: секция `maintenance`
+
+Роль `maintenance` (входит в пресеты) очищает данные по сроку, заполняет книгу «Организация» и проверяет
+целостность хранилища писем. Все ключи читаются при запуске узла — после изменения нужен перезапуск. Ansible —
+`thepost_maintenance` (например `{ verify: { at: "02:30" } }`), Helm — `config.maintenance`; полный перечень с
+описаниями — `thepost config schema`.
+
+| Ключ | Умолчание | Что задаёт |
+|---|---|---|
+| `maintenance.purge_interval` | `1h` | период очистки по сроку: надгробия DAV, журналы автоответов и доставки, завершённые отправки JMAP, аудит ящиков, токены `admin init`, применённые сообщения iTIP; первый проход — при запуске роли. Сами сроки — в `meta` (`meta.dav.tombstone_ttl`, `meta.sieve.vacation_log_ttl`, `meta.delivery.retention`, `meta.submissions.retention`, `meta.mailbox_audit.retention`) |
+| `maintenance.admin_token_retention` | `30d` | сколько хранить токены `thepost admin init` после истечения (погашенные, отозванные, истёкшие — для аудита); `0s` — удалять сразу. Срок действия самого токена — `admin.init.token_ttl` (`10m`) |
+| `maintenance.gal_interval` | `1m` | период заполнения книги «Организация» (GAL) из каталога: `auth.ldap`, без него — учётные записи и группы PostgreSQL; первый проход — при запуске роли, изменение каталога видно в CardDAV и JMAP не позже чем через период |
+| `maintenance.verify.enabled` | `true` | проверка целостности BLOB по расписанию — `thepost verify` без `--fix`: ничего не удаляет, итог — в журнал узла и `/metrics` (`tp_blob_verify_*`); исправление — только вручную, `thepost verify --fix` |
+| `maintenance.verify.at` | `"03:00"` | время прохода, UTC, `ЧЧ:ММ` |
+| `maintenance.verify.interval` | `24h` | период проходов; не в целых сутках — сетка проходов отсчитывается от `at` после полуночи UTC 1970-01-01 |
+| `maintenance.verify.lease_name` | `blob-verify` | имя лизы: в кластере проход выполняет один узел — её держатель |
+| `maintenance.verify.lease_ttl` | `2m` | срок лизы; продлевается во время прохода и держится после него — должен покрывать расхождение часов узлов |
+| `dav.schedule_keep_processed` | `false` | хранить применённые сервером сообщения iTIP для ленты уведомлений JMAP; во входящих планирования CalDAV они не видны. `true` — их удаляет очистка по сроку |
+| `dav.schedule_processed_ttl` | `30d` | срок хранения этих сообщений при `dav.schedule_keep_processed: true` |
+
+`thepost config check` отклоняет нулевые `purge_interval`, `gal_interval`, `verify.interval`, `verify.lease_ttl`,
+пустой `verify.lease_name` и `verify.at` не в виде `ЧЧ:ММ`. Удалённые ключи `smtp.queue.poll_interval` и
+`mailstore.disabled.max_wait` — в [несовместимых изменениях 0.2.0](releases/0.2.0.md#несовместимые-изменения-для-администратора).
+
 ## Настройка клиентов
 
 | | Сервер | Порт | Защита |
