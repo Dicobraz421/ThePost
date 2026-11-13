@@ -221,7 +221,8 @@ mod tests {
                 .parse(
                     &format!(
                         "domain: example.org\nprofile: dev\n\
-                         database:\n  url: postgres://x@y/z\n{auth}"
+                         database:\n  url: postgres://x@y/z\n\
+                         blob:\n  url: file:///var/lib/thepost/blob\n{auth}"
                     ),
                     Vec::new(),
                 )
