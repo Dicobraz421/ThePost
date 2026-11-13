@@ -2,7 +2,7 @@
 
 lane: dav
 deps: [META-80, DAV-27]
-class: A
+class: B
 files: [crates/tp-dav/src/*, crates/thepost/src/services.rs, crates/thepost/src/gal.rs]
 read: [docs/tasks/META-80.md, docs/CONTRACTS.md#Directory]
 checks: [nextest]
