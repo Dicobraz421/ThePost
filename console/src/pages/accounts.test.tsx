@@ -101,6 +101,43 @@ test("учётная запись: политика ящика — PUT accounts/
   expect(await screen.findByText("Политика ящика сохранена")).toBeTruthy();
 });
 
+test("учётная запись: блокировка и имя — PATCH только изменённых полей; запись каталога не меняется", async () => {
+  let current = account("a1", "alice@example.org");
+  const calls = open("/accounts/a1", {
+    [`GET ${BASE}/accounts/a1`]: () => ({ body: current }),
+    [`GET ${BASE}/accounts/a1/app-passwords`]: { body: [] },
+    [`PATCH ${BASE}/accounts/a1`]: (c) => {
+      current = { ...current, ...(c.body as object) };
+      return { body: current };
+    },
+  });
+  const save = await waitFor(() => {
+    const b = screen.getByRole("button", { name: "Сохранить" }) as HTMLButtonElement;
+    expect(b.disabled).toBe(true);
+    return b;
+  });
+  fireEvent.click(screen.getByRole("switch", { name: "Разрешить вход" }));
+  await waitFor(() => expect(save.disabled).toBe(false));
+  fireEvent.click(save);
+  await waitFor(() => expect(sent(calls, "PATCH", `${BASE}/accounts/a1`)[0]?.body).toEqual({ enabled: false }));
+  expect(await screen.findByText("Учётная запись заблокирована")).toBeTruthy();
+  expect(await screen.findByText("Заблокирована")).toBeTruthy();
+
+  fireEvent.change(screen.getByRole("textbox", { name: "Отображаемое имя" }), { target: { value: " Алиса " } });
+  fireEvent.click(screen.getByRole("button", { name: "Сохранить" }));
+  await waitFor(() => expect(sent(calls, "PATCH", `${BASE}/accounts/a1`)[1]?.body).toEqual({ display_name: "Алиса" }));
+});
+
+test("учётная запись каталога: имя и блокировка только для чтения", async () => {
+  open("/accounts/a1", {
+    [`GET ${BASE}/accounts/a1`]: { body: account("a1", "alice@example.org", { external_id: "uid=alice" }) },
+    [`GET ${BASE}/accounts/a1/app-passwords`]: { body: [] },
+  });
+  expect(await screen.findByText("Имя и блокировку записи каталога ведёт каталог.")).toBeTruthy();
+  expect((screen.getByRole("switch", { name: "Разрешить вход" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.queryByRole("button", { name: "Сохранить" })).toBeNull();
+});
+
 test("пароли приложений: выпуск показывает пароль один раз, отзыв — DELETE", async () => {
   const passwords = [
     { id: "p1", label: "Телефон", created_at: "2026-11-01T10:00:00Z", revoked_at: null },

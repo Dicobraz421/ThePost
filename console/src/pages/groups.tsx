@@ -7,8 +7,6 @@ import { AccountSelect } from "../components/account-select";
 import { ModerationQueue } from "../components/moderation-queue";
 
 type Group = Schemas["GroupInfo"];
-type Member = { account: string } | { group: string };
-type Senders = "anyone" | "internal" | { only: { accounts: string[]; groups: string[] } };
 
 /** Значения формы группы: участники и отправители разложены по видам. */
 type GroupForm = {
@@ -23,19 +21,15 @@ type GroupForm = {
   moderators: string[];
 };
 
-// В схеме узла участники и ограничение отправителей описаны как произвольный объект: разбор — здесь.
-const members = (g: Group) => g.members as unknown as Member[];
-const senders = (g: Group) => g.senders as unknown as Senders;
-
 export function toForm(g?: Group): GroupForm {
-  const s = g ? senders(g) : "anyone";
+  const s = g?.senders ?? "anyone";
   const only = typeof s === "object" ? s.only : { accounts: [], groups: [] };
   return {
     name: g?.name ?? "",
     address: g?.address,
     hidden_from_gal: g?.hidden_from_gal ?? false,
-    member_accounts: g ? members(g).flatMap((m) => ("account" in m ? [m.account] : [])) : [],
-    member_groups: g ? members(g).flatMap((m) => ("group" in m ? [m.group] : [])) : [],
+    member_accounts: g?.members.flatMap((m) => ("account" in m ? [m.account] : [])) ?? [],
+    member_groups: g?.members.flatMap((m) => ("group" in m ? [m.group] : [])) ?? [],
     senders: typeof s === "object" ? "only" : s,
     only_accounts: only.accounts,
     only_groups: only.groups,
@@ -75,7 +69,7 @@ export function GroupList() {
             <>
               {g.external_id && <Tag>каталог</Tag>}
               {moderated(g) && <Tag color="blue">модерация</Tag>}
-              {senders(g) !== "anyone" && <Tag color="gold">ограничены отправители</Tag>}
+              {g.senders !== "anyone" && <Tag color="gold">ограничены отправители</Tag>}
               {g.hidden_from_gal && <Tag>скрыта из адресной книги</Tag>}
             </>
           )}
@@ -100,8 +94,11 @@ export function GroupList() {
   );
 }
 
-/** Поля группы; `catalog` — группа из каталога: имя, адрес и состав не редактируются. */
-function GroupFields({ catalog, self }: { catalog?: boolean; self?: string }) {
+/**
+ * Поля группы; `catalog` — группа из каталога: имя, адрес и состав не редактируются. `names` — имена участников,
+ * отправителей и модераторов из ответа узла.
+ */
+function GroupFields({ catalog, self, names }: { catalog?: boolean; self?: string; names?: Record<string, string> }) {
   const { result: groups } = useList<Group>({ resource: "groups", pagination: { mode: "off" } });
   const options = groups.data.filter((g) => g.id !== self).map((g) => ({ value: g.id, label: g.name }));
   const restricted = Form.useWatch("senders") === "only";
@@ -115,7 +112,7 @@ function GroupFields({ catalog, self }: { catalog?: boolean; self?: string }) {
         <Input disabled={catalog} placeholder="staff@example.org" />
       </Form.Item>
       <Form.Item name="member_accounts" label="Участники — учётные записи" extra={fromCatalog}>
-        <AccountSelect disabled={catalog} />
+        <AccountSelect disabled={catalog} names={names} />
       </Form.Item>
       <Form.Item name="member_groups" label="Участники — вложенные группы" extra={fromCatalog}>
         <Select mode="multiple" options={options} optionFilterProp="label" disabled={catalog} />
@@ -132,7 +129,7 @@ function GroupFields({ catalog, self }: { catalog?: boolean; self?: string }) {
       {restricted && (
         <>
           <Form.Item name="only_accounts" label="Разрешённые отправители — учётные записи">
-            <AccountSelect />
+            <AccountSelect names={names} />
           </Form.Item>
           <Form.Item name="only_groups" label="Разрешённые отправители — участники групп">
             <Select mode="multiple" options={groups.data.map((g) => ({ value: g.id, label: g.name }))} optionFilterProp="label" />
@@ -144,7 +141,7 @@ function GroupFields({ catalog, self }: { catalog?: boolean; self?: string }) {
         label="Модераторы"
         extra="Заданы — письма не от модераторов ждут одобрения в очереди модерации."
       >
-        <AccountSelect />
+        <AccountSelect names={names} />
       </Form.Item>
       <Form.Item name="hidden_from_gal" label="Скрыть из адресной книги" valuePropName="checked">
         <Switch />
@@ -199,7 +196,7 @@ export function GroupEdit() {
             })
           }
         >
-          <GroupFields catalog={catalog} self={group.id} />
+          <GroupFields catalog={catalog} self={group.id} names={group.names} />
         </Form>
       )}
       {group && moderated(group) && (

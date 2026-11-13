@@ -1,12 +1,13 @@
 import { Create, List, Show, ShowButton, useForm } from "@refinedev/antd";
-import { useCreate, useCustom, useCustomMutation, useDelete, useInfiniteList, useList, useShow } from "@refinedev/core";
-import { Alert, Button, Descriptions, Divider, Form, Input, Modal, Popconfirm, Space, Table, Tag, Typography } from "antd";
+import { type HttpError, useCreate, useCustom, useCustomMutation, useDelete, useInfiniteList, useList, useShow } from "@refinedev/core";
+import { Alert, Button, Descriptions, Divider, Form, Input, Modal, Popconfirm, Space, Switch, Table, Tag, Typography } from "antd";
 import { useState } from "react";
 import { Link } from "react-router";
 
 import type { Schemas } from "../api/client";
 import { bytes, when } from "../components/format";
 import { PolicyForm } from "../components/policy-form";
+import { useReadOnly } from "../providers/access";
 
 type Account = Schemas["AccountInfo"];
 type AppPassword = Schemas["AppPasswordInfo"];
@@ -157,7 +158,65 @@ function AppPasswords({ account }: { account: string }) {
   );
 }
 
-/** Учётная запись: сведения, политика ящика, пароли приложений. */
+/**
+ * Отображаемое имя и блокировка входа (`PATCH`, ADM-18): уходят только изменённые поля. У записи каталога оба поля
+ * ведёт каталог — форма только для чтения.
+ */
+function AccountForm({ account, onSaved }: { account: Account; onSaved: () => void }) {
+  const readOnly = useReadOnly("accounts");
+  const catalog = !!account.external_id;
+  const { mutate, mutation } = useCustomMutation<Account, HttpError, Schemas["AccountPatch"]>();
+  const initial = { display_name: account.display_name, enabled: account.enabled };
+  const [form] = Form.useForm<typeof initial>();
+  const values = Form.useWatch([], form) ?? initial;
+  const changed = Object.fromEntries(
+    Object.entries(values).filter(([k, v]) => v !== undefined && v !== initial[k as keyof typeof initial]),
+  ) as Schemas["AccountPatch"];
+  const locked = readOnly || catalog;
+  return (
+    <Form
+      key={JSON.stringify(initial)}
+      form={form}
+      layout="vertical"
+      initialValues={initial}
+      disabled={locked}
+      onFinish={() =>
+        mutate(
+          {
+            url: `/api/v1/orgs/{org}/accounts/${encodeURIComponent(account.id)}`,
+            method: "patch",
+            values: changed.display_name ? { ...changed, display_name: changed.display_name.trim() } : changed,
+            successNotification: {
+              type: "success",
+              message:
+                changed.enabled === false ? "Учётная запись заблокирована" : changed.enabled ? "Вход разрешён" : "Учётная запись сохранена",
+            },
+          },
+          { onSuccess: onSaved },
+        )
+      }
+    >
+      {catalog && <Alert type="info" showIcon style={{ marginBottom: 16 }} message="Имя и блокировку записи каталога ведёт каталог." />}
+      <Form.Item
+        name="display_name"
+        label="Отображаемое имя"
+        rules={[{ required: true, whitespace: true, message: "Укажите отображаемое имя" }]}
+      >
+        <Input style={{ maxWidth: 420 }} />
+      </Form.Item>
+      <Form.Item name="enabled" label="Разрешить вход" valuePropName="checked" extra="Выключено — учётная запись заблокирована.">
+        <Switch />
+      </Form.Item>
+      {!locked && (
+        <Button type="primary" htmlType="submit" disabled={Object.keys(changed).length === 0} loading={mutation.isPending}>
+          Сохранить
+        </Button>
+      )}
+    </Form>
+  );
+}
+
+/** Учётная запись: сведения, имя и блокировка, политика ящика, пароли приложений. */
 export function AccountShow() {
   const { result: account, query } = useShow<Account>();
   const { mutate, mutation } = useCustomMutation<Schemas["PolicyBody"]>();
@@ -188,6 +247,8 @@ export function AccountShow() {
           <Link to={`/accounts/${encodeURIComponent(account.id)}/sieve`}>Правила и автоответ</Link>
         </Space>
       )}
+      <Divider orientation="left">Имя и блокировка</Divider>
+      {account && <AccountForm account={account} onSaved={() => void query.refetch()} />}
       <Divider orientation="left">Политика ящика</Divider>
       <PolicyForm
         policies={account}

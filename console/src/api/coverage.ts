@@ -13,6 +13,7 @@ export const covered: Record<string, string> = {
   "GET /api/v1/orgs/{org}/accounts": "pages/accounts.tsx",
   "POST /api/v1/orgs/{org}/accounts": "pages/accounts.tsx",
   "GET /api/v1/orgs/{org}/accounts/{account}": "pages/accounts.tsx",
+  "PATCH /api/v1/orgs/{org}/accounts/{account}": "pages/accounts.tsx",
   "PUT /api/v1/orgs/{org}/accounts/{account}/policy": "pages/accounts.tsx",
   "GET /api/v1/orgs/{org}/accounts/{account}/app-passwords": "pages/accounts.tsx",
   "POST /api/v1/orgs/{org}/accounts/{account}/app-passwords": "pages/accounts.tsx",
