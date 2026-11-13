@@ -596,7 +596,7 @@ pub(crate) mod tests {
         assert_eq!(r["updated"][other], json!({"isDefault": true}), "{r}");
         assert_eq!(r["updated"][&before[0]], json!({"isDefault": false}), "{r}");
         let g = call(&env, "AddressBook/get", json!({"accountId": acc})).await;
-        assert_eq!(defaults(&g), [other.clone()], "{g}");
+        assert_eq!(defaults(&g), [other.as_str()], "{g}");
         let got = g["list"]
             .as_array()
             .expect("list")
@@ -618,7 +618,7 @@ pub(crate) mod tests {
         assert_eq!(r["updated"][other], json!({"isDefault": false}), "{r}");
         let c = r["created"]["n"]["id"].as_str().expect("id").to_owned();
         let g = call(&env, "AddressBook/get", json!({"accountId": acc})).await;
-        assert_eq!(defaults(&g), [c.clone()], "{g}");
+        assert_eq!(defaults(&g), [c.as_str()], "{g}");
 
         // Неизвестная книга или ошибка в вызове — признак не меняется, ошибки метода нет.
         let r = call(

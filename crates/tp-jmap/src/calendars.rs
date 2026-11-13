@@ -702,7 +702,7 @@ pub(crate) mod tests {
         assert_eq!(cal["defaultAlertsWithTime"], with_time, "{g}");
         assert_eq!(cal["defaultAlertsWithoutTime"], without_time, "{g}");
         let g = call(&env, "Calendar/get", json!({"accountId": acc})).await;
-        assert_eq!(defaults(&g), [other.clone()], "{g}");
+        assert_eq!(defaults(&g), [other.as_str()], "{g}");
 
         // Событие без календаря — в календарь по умолчанию.
         let r = call(
@@ -790,7 +790,7 @@ pub(crate) mod tests {
         .await;
         assert!(r["newState"].is_string(), "{r}");
         let g = call(&env, "Calendar/get", json!({"accountId": acc})).await;
-        assert_eq!(defaults(&g), [other.clone()], "{g}");
+        assert_eq!(defaults(&g), [other.as_str()], "{g}");
     }
 
     /// Изменение календаря → push `Calendar`, `CalendarEvent`; состояние контактов не меняется.

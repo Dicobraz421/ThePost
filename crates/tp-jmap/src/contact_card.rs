@@ -811,6 +811,22 @@ pub(crate) mod tests {
         v
     }
 
+    /// Параметр `PREF` без значения (vCard 2.1, свойство вне JSContact): calcard читает его как `"0"`, а пишет
+    /// `PREF=`, которое читает как `""`. Значения нет в обоих случаях; для сравнения — `""`.
+    fn bare_pref(mut v: Value) -> Value {
+        if let Some(props) = v
+            .pointer_mut("/vCard/properties")
+            .and_then(Value::as_array_mut)
+        {
+            for p in props {
+                if p[1]["pref"] == "0" {
+                    p[1]["pref"] = json!("");
+                }
+            }
+        }
+        v
+    }
+
     /// JSContact из vCard (calcard) для сравнения.
     fn jscontact(vcard: &str) -> Value {
         let js = VCard::parse(vcard)
@@ -884,7 +900,11 @@ pub(crate) mod tests {
             assert!(r["notUpdated"].is_null(), "{name}: {r}");
             let (status, back) = dav_request(addr, "GET", &format!("{base}{name}"), "").await;
             assert_eq!(status, 200, "{name}: {back}");
-            assert_eq!(jscontact(&back), want, "{name}: {back}");
+            assert_eq!(
+                bare_pref(jscontact(&back)),
+                bare_pref(want),
+                "{name}: {back}"
+            );
         }
 
         // Изменение из JMAP: новая заметка и телефон; остальные поля vCard, в том числе X-свойства, — как были.
