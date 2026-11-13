@@ -1,16 +1,19 @@
 //! Приём iTIP учётной записью: реализация [`ItipDelivery`] поверх [`DavStore`] (RFC 5546, RFC 6638 §3.2).
 //!
-//! - `REQUEST` — событие в календаре по умолчанию получателя (или обновление уже принятого): свой `PARTSTAT` —
-//!   `NEEDS-ACTION` у нового и перенесённого события, прежний — при правке без переноса; сообщение только с
-//!   исключениями (`RECURRENCE-ID`) дополняет ряд;
-//! - `REPLY` — `PARTSTAT` участника в событии организатора (`SCHEDULE-STATUS=2.0`), `Schedule-Tag` прежний;
+//! - `REQUEST` — событие (VEVENT) или задача (VTODO) в календаре по умолчанию получателя для этого компонента (или
+//!   обновление уже принятого): свой `PARTSTAT` — `NEEDS-ACTION` у нового и перенесённого, прежний — при правке без
+//!   переноса; сообщение только с исключениями (`RECURRENCE-ID`) дополняет ряд;
+//! - `REPLY` — `PARTSTAT` участника в событии организатора (`SCHEDULE-STATUS=2.0`), `Schedule-Tag` прежний; ответ
+//!   на вхождение ряда, которого нет отдельным компонентом, — новое переопределение вхождения;
 //! - `CANCEL` — `STATUS:CANCELLED` всему событию, отдельному вхождению — `EXDATE` или статус исключения;
-//! - `ADD`, `REFRESH`, `COUNTER`, `DECLINECOUNTER` — во входящие планирования как есть (разбирает клиент);
-//!   `PUBLISH` и VTODO не применяются.
+//! - `ADD` — новые вхождения ряда (`RDATE` и переопределение); ряда нет — во входящие;
+//! - `REFRESH`, `COUNTER`, `DECLINECOUNTER` — во входящие планирования как есть (разбирает клиент); `PUBLISH` не
+//!   применяется.
 //!
-//! Применённое сообщение во входящих не остаётся (`dav.schedule_keep_processed`). Защита: `REQUEST` и `CANCEL` —
-//! только от организатора сообщения и события с тем же UID, `REPLY` — только от адреса участника события и только
-//! организатору; меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
+//! Применённое сообщение во входящих CalDAV не остаётся; при `dav.schedule_keep_processed` оно хранится для ленты
+//! уведомлений JMAP с именем [`PROCESSED_PREFIX`] и удаляется по сроку ([`ItipInbox::purge_processed`]). Защита:
+//! `REQUEST`, `ADD` и `CANCEL` — только от организатора сообщения и события с тем же UID, `REPLY` — только от адреса
+//! участника события и только организатору; меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
 //! Повторная доставка ничего не меняет. Запись — с условием по ETag: одновременное изменение — повтор
 //! (`dav.schedule_write_attempts`), затем `Unavailable`.
 
@@ -24,15 +27,15 @@ use calcard::icalendar::{
 };
 use time::OffsetDateTime;
 use tp_contracts::dav::{
-    Collection, CollectionKind, Component, DavObject, DavStore, ObjectIndex, Precondition,
-    PutOutcome, default_of, valid_name,
+    Collection, CollectionKind, Component, DavObject, DavStore, Precondition, PutOutcome,
+    default_of, valid_name,
 };
 use tp_contracts::meta::AccountScope;
 use tp_contracts::schedule::{InboxMessage, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome};
 use tp_contracts::{Error, Result};
 
 use crate::config::DavConfig;
-use crate::index::{self, IndexError};
+use crate::index;
 use crate::itip::{self, Itip};
 use crate::props;
 
@@ -54,36 +57,60 @@ impl ItipInbox {
     pub fn new(store: Arc<dyn DavStore>, cfg: DavConfig) -> Self {
         Self { store, cfg }
     }
+
+    /// Шаг очистки роли maintenance (DAV-32; подключение — APP-53): удаляет из входящих планирования учётной записи
+    /// `scope` применённые сервером сообщения ([`processed`]), полученные раньше `now` минус
+    /// `dav.schedule_processed_ttl`. Необработанные не трогает. Возвращает число удалённых.
+    pub async fn purge_processed(&self, scope: AccountScope, now: OffsetDateTime) -> Result<usize> {
+        let ttl = time::Duration::try_from(self.cfg.schedule_processed_ttl)
+            .unwrap_or(time::Duration::MAX);
+        let Some(before) = now.checked_sub(ttl) else {
+            return Ok(0);
+        };
+        let list = self.store.inbox_list(scope).await?;
+        let mut removed = 0;
+        for i in list
+            .items
+            .iter()
+            .filter(|i| processed(&i.name) && i.received_at < before)
+        {
+            match self.store.inbox_delete(scope, &i.name).await {
+                Ok(_) => removed += 1,
+                Err(Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
 }
 
-/// Индекс объекта календаря для записи в момент `now`: интервал, занятость, `Schedule-Tag`.
-pub(crate) fn object_index(
-    cfg: &DavConfig,
-    ical: &ICalendar,
-    now: OffsetDateTime,
-) -> std::result::Result<ObjectIndex, IndexError> {
-    let mut idx = index::of_calendar(ical, &cfg.index_options(now))?;
-    idx.schedule_tag = itip::schedule_tag(ical);
-    Ok(idx)
+/// Префикс имени применённого сервером сообщения во входящих планирования (DAV-32): хранится при
+/// `dav.schedule_keep_processed` для ленты уведомлений JMAP, в CalDAV не виден.
+pub const PROCESSED_PREFIX: &str = "p-";
+
+/// Сообщение входящих с именем `name` применено сервером ([`PROCESSED_PREFIX`]).
+pub fn processed(name: &str) -> bool {
+    name.starts_with(PROCESSED_PREFIX)
 }
 
-/// Календарь по умолчанию для приглашений (`schedule-default-calendar-URL`) — правило контракта
-/// [`tp_contracts::dav::default_of`] среди календарей с VEVENT (назначенный `Collection::is_default`, CTR-56); у
-/// учётной записи без календарей создаются календари по умолчанию.
+/// Календарь по умолчанию для приглашений компонента `component` (VEVENT — `schedule-default-calendar-URL`, VTODO —
+/// список задач) — правило контракта [`tp_contracts::dav::default_of`] среди календарей с этим компонентом
+/// (назначенный `Collection::is_default`, CTR-56); у учётной записи без календарей создаются календари по умолчанию.
 pub(crate) async fn default_calendar(
     store: &dyn DavStore,
     scope: AccountScope,
     cfg: &DavConfig,
+    component: Component,
 ) -> Result<Option<Collection>> {
     props::defaults(store, scope, cfg, CollectionKind::Calendar).await?;
     let list = store
         .list_collections(scope, CollectionKind::Calendar)
         .await?;
-    let events: Vec<Collection> = list
+    let suitable: Vec<Collection> = list
         .into_iter()
-        .filter(|c| c.components.contains(&Component::Event))
+        .filter(|c| c.components.contains(&component))
         .collect();
-    Ok(default_of(&events).cloned())
+    Ok(default_of(&suitable).cloned())
 }
 
 /// Объект с UID `uid` в календарях учётной записи.
@@ -112,9 +139,11 @@ fn hash(parts: &[&str]) -> String {
     )
 }
 
-/// Шаг применения: итог или повтор после одновременного изменения.
+/// Шаг применения: итог, сообщение оставлено во входящих для клиента или повтор после одновременного изменения.
 enum Step {
     Done(ItipOutcome),
+    /// Применено: сообщение — во входящих необработанным (разбирает клиент).
+    Inboxed,
     Retry,
 }
 
@@ -152,6 +181,40 @@ fn by_rid(ical: &ICalendar, rid: Option<&str>) -> Option<usize> {
         .find(|i| itip::recurrence_id(&ical.components[*i]).as_deref() == rid)
 }
 
+/// Переопределение вхождения ряда `ical` для ответа `rc` (компонент с `RECURRENCE-ID`) участника `attendee`: копия
+/// основного компонента без повторов с `RECURRENCE-ID` и временем вхождения из ответа (`DTSTART`; конец — `DTEND`
+/// или `DURATION` ответа, иначе `DURATION` ряда). Нет ряда, участника в нём или времени — `None`.
+fn instance_of(
+    ical: &ICalendar,
+    rc: &ICalendarComponent,
+    attendee: &str,
+) -> Option<ICalendarComponent> {
+    let master = &ical.components[by_rid(ical, None)?];
+    itip::attendee_entry(master, attendee)?;
+    let rid = rc.property(&ICalendarProperty::RecurrenceId)?;
+    let start = rc.property(&ICalendarProperty::Dtstart)?;
+    let end = rc
+        .property(&ICalendarProperty::Dtend)
+        .or_else(|| rc.property(&ICalendarProperty::Duration))
+        .or_else(|| master.property(&ICalendarProperty::Duration))?
+        .clone();
+    let mut c = master.clone();
+    c.entries.retain(|e| {
+        !matches!(
+            e.name,
+            ICalendarProperty::Rrule
+                | ICalendarProperty::Rdate
+                | ICalendarProperty::Exdate
+                | ICalendarProperty::Dtstart
+                | ICalendarProperty::Dtend
+                | ICalendarProperty::Duration
+                | ICalendarProperty::RecurrenceId
+        )
+    });
+    c.entries.extend([rid.clone(), start.clone(), end]);
+    Some(c)
+}
+
 impl ItipInbox {
     /// Записывает объект; `existing` — заменяемый, иначе создаётся в календаре по умолчанию с именем по `attempt`.
     async fn write(
@@ -169,7 +232,8 @@ impl ItipInbox {
         if body.len() > self.cfg.max_object_size.min(limits.max_object_size) {
             return ignored("объект больше допустимого размера");
         }
-        let Ok(idx) = object_index(&self.cfg, ical, OffsetDateTime::now_utc()) else {
+        let Ok(idx) = index::for_write(ical, &self.cfg.index_options(OffsetDateTime::now_utc()))
+        else {
             return ignored("недопустимый объект календаря");
         };
         let (coll, name, pre) = match existing {
@@ -179,8 +243,10 @@ impl ItipInbox {
                 Precondition::IfMatch(o.etag.clone()),
             ),
             None => {
-                let Some(c) = default_calendar(self.store.as_ref(), scope, &self.cfg).await? else {
-                    return ignored("нет календаря для событий");
+                let calendar =
+                    default_calendar(self.store.as_ref(), scope, &self.cfg, idx.component).await?;
+                let Some(c) = calendar else {
+                    return ignored("нет календаря для приглашения");
                 };
                 let plain = format!("{}.ics", idx.uid);
                 let name = if attempt == 0 && valid_name(&plain) && plain.len() <= 128 {
@@ -204,8 +270,15 @@ impl ItipInbox {
         }
     }
 
-    /// Кладёт сообщение во входящие планирования (имя — по содержимому: повторная доставка перезаписывает).
-    async fn to_inbox(&self, msg: &ItipMessage, it: &Itip, from: &str) -> Result<Step> {
+    /// Кладёт сообщение во входящие планирования (имя — по содержимому: повторная доставка перезаписывает);
+    /// `processed` — применённое сервером, с префиксом [`PROCESSED_PREFIX`].
+    async fn to_inbox(
+        &self,
+        msg: &ItipMessage,
+        it: &Itip,
+        from: &str,
+        processed: bool,
+    ) -> Result<Step> {
         let rids: Vec<String> = it
             .ical
             .components
@@ -216,7 +289,8 @@ impl ItipInbox {
         let seq = it.meeting.sequence.to_string();
         let mut parts = vec![it.method.as_str(), it.meeting.uid.as_str(), &seq, from];
         parts.extend(rids.iter().map(String::as_str));
-        let name = format!("{}.ics", hash(&parts));
+        let prefix = if processed { PROCESSED_PREFIX } else { "" };
+        let name = format!("{prefix}{}.ics", hash(&parts));
         let message = InboxMessage {
             method: it.method,
             uid: it.meeting.uid.clone(),
@@ -224,7 +298,8 @@ impl ItipInbox {
             body: msg.ics.clone(),
         };
         match self.store.inbox_put(msg.recipient, &name, message).await {
-            Ok(_) => APPLIED,
+            Ok(_) if processed => APPLIED,
+            Ok(_) => Ok(Step::Inboxed),
             Err(Error::QuotaExceeded) => ignored("входящие планирования переполнены"),
             Err(Error::Invalid(_)) => ignored("недопустимое сообщение"),
             Err(e) => Err(e),
@@ -335,10 +410,21 @@ impl ItipInbox {
             let Some(answer) = itip::attendee_entry(rc, from) else {
                 continue;
             };
-            let target = by_rid(&new, itip::recurrence_id(rc).as_deref())
-                .and_then(|t| itip::attendee_entry_mut(&mut new.components[t], from));
+            let rid = itip::recurrence_id(rc);
+            let t = match by_rid(&new, rid.as_deref()) {
+                Some(t) => Some(t),
+                // Ответ на вхождение ряда, которого нет отдельным компонентом: переопределение вхождения.
+                None if rid.is_some() => instance_of(&new, rc, from).map(|c| {
+                    let src = new.clone();
+                    let t = new.components.len();
+                    itip::push(&mut new, &src, c, true);
+                    t
+                }),
+                None => None,
+            };
+            let target = t.and_then(|t| itip::attendee_entry_mut(&mut new.components[t], from));
             let Some(e) = target else {
-                // Ответ на вхождение, которого нет отдельным компонентом: оставляется клиенту организатора.
+                // Вхождение не построить (нет времени в ответе и в ряде): оставляется клиенту организатора.
                 unmatched = true;
                 continue;
             };
@@ -353,9 +439,71 @@ impl ItipInbox {
             );
         }
         match self.write(msg.recipient, existing, &new, 0).await? {
-            Step::Done(ItipOutcome::Applied) if unmatched => self.to_inbox(msg, it, from).await,
+            Step::Done(ItipOutcome::Applied) if unmatched => {
+                self.to_inbox(msg, it, from, false).await
+            }
             step => Ok(step),
         }
+    }
+
+    /// `ADD` (RFC 5546 §3.2.4): новые вхождения ряда — `RDATE` основного компонента и переопределение вхождения с
+    /// содержимым сообщения (свой `PARTSTAT` — `NEEDS-ACTION`). Ряда нет — во входящие клиенту (он запросит
+    /// `REFRESH`).
+    async fn add(
+        &self,
+        msg: &ItipMessage,
+        it: &Itip,
+        from: &str,
+        to: &str,
+        existing: Option<&DavObject>,
+    ) -> Result<Step> {
+        let parsed = existing.and_then(|o| {
+            ICalendar::parse(&o.body)
+                .ok()
+                .and_then(|i| itip::meeting(&i).map(|m| (i, m)))
+        });
+        let Some((old, m)) = parsed else {
+            return self.to_inbox(msg, it, from, false).await;
+        };
+        if m.organizer.as_deref() != Some(from) {
+            return ignored("чужой UID организатора");
+        }
+        if it.meeting.sequence < m.sequence {
+            return ignored("устаревший SEQUENCE");
+        }
+        let Some(master) = by_rid(&old, None) else {
+            return self.to_inbox(msg, it, from, false).await;
+        };
+        let mut new = old;
+        for i in sched_ids(&it.ical) {
+            let rc = &it.ical.components[i];
+            let Some(start) = rc.property(&ICalendarProperty::Dtstart) else {
+                continue;
+            };
+            let mut rdate =
+                ICalendarEntry::new(ICalendarProperty::Rdate).with_values(start.values.clone());
+            rdate.params.clone_from(&start.params);
+            let line = itip::line(&rdate);
+            let comp = &mut new.components[master];
+            if !comp.entries.iter().any(|e| itip::line(e) == line) {
+                comp.entries.push(rdate);
+            }
+            let mut rid = ICalendarEntry::new(ICalendarProperty::RecurrenceId)
+                .with_values(start.values.clone());
+            rid.params.clone_from(&start.params);
+            if by_rid(&new, Some(itip::line(&rid).as_str())).is_some() {
+                continue;
+            }
+            let mut c = rc.clone();
+            c.entries
+                .retain(|e| e.name != ICalendarProperty::RecurrenceId);
+            c.entries.push(rid);
+            if let Some(e) = itip::attendee_entry_mut(&mut c, to) {
+                itip::replace_param(e, &ICalendarParameterName::Partstat, Some(needs_action()));
+            }
+            itip::push(&mut new, &it.ical, c, true);
+        }
+        self.write(msg.recipient, existing, &new, 0).await
     }
 
     async fn cancel(
@@ -429,10 +577,10 @@ impl ItipInbox {
         let scope = msg.recipient;
         let auto = matches!(
             it.method,
-            ItipMethod::Request | ItipMethod::Reply | ItipMethod::Cancel
+            ItipMethod::Request | ItipMethod::Reply | ItipMethod::Cancel | ItipMethod::Add
         );
         if !auto {
-            return self.to_inbox(msg, it, from).await;
+            return self.to_inbox(msg, it, from, false).await;
         }
         let existing = find_uid(self.store.as_ref(), scope, &it.meeting.uid).await?;
         let step = match it.method {
@@ -441,11 +589,13 @@ impl ItipInbox {
                     .await?
             }
             ItipMethod::Reply => self.reply(msg, it, from, to, existing.as_ref()).await?,
+            ItipMethod::Add => self.add(msg, it, from, to, existing.as_ref()).await?,
             _ => self.cancel(scope, it, from, existing.as_ref()).await?,
         };
         if self.cfg.schedule_keep_processed
             && matches!(step, Step::Done(ItipOutcome::Applied))
-            && let Step::Done(ItipOutcome::Ignored(reason)) = self.to_inbox(msg, it, from).await?
+            && let Step::Done(ItipOutcome::Ignored(reason)) =
+                self.to_inbox(msg, it, from, true).await?
         {
             tracing::debug!(%reason, "iTIP: применённое сообщение не сохранено во входящих");
         }
@@ -469,8 +619,8 @@ impl ItipDelivery for ItipInbox {
         if it.method != msg.method {
             return refuse("METHOD не совпадает с заявленным");
         }
-        if !it.meeting.event || it.method == ItipMethod::Publish {
-            return refuse("метод или компонент не поддерживается");
+        if it.method == ItipMethod::Publish {
+            return refuse("метод не поддерживается");
         }
         let (from, to) = (itip::address(&msg.from), itip::address(&msg.to));
         let sender_ok = if it.method.from_organizer() {
@@ -485,6 +635,7 @@ impl ItipDelivery for ItipInbox {
             match self.apply(msg, &it, &from, &to, attempt).await? {
                 Step::Done(ItipOutcome::Ignored(reason)) => return refuse(&reason),
                 Step::Done(outcome) => return Ok(outcome),
+                Step::Inboxed => return Ok(ItipOutcome::Applied),
                 Step::Retry => {}
             }
         }

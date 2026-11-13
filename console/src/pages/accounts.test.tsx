@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, test } from "vitest";
 
 import { BASE, buttons, open, sent } from "../test-app";
@@ -171,4 +171,44 @@ test("пароли приложений: выпуск показывает па�
   const buttons = screen.getAllByRole("button", { name: "Отозвать" });
   fireEvent.click(buttons[buttons.length - 1]);
   await waitFor(() => expect(sent(calls, "DELETE", `${BASE}/accounts/a1/app-passwords/p1`)).toHaveLength(1));
+});
+
+test("учётная запись: списки отправителей — PUT целиком; аудит ящика — политика, сброс, ссылка на журнал", async () => {
+  let policy = { non_owner: true, owner: ["send"] };
+  const calls = open("/accounts/a1", {
+    [`GET ${BASE}/accounts/a1`]: { body: account("a1", "alice@example.org") },
+    [`GET ${BASE}/accounts/a1/app-passwords`]: { body: [] },
+    [`GET ${BASE}/accounts/a1/senders`]: { body: { safe: ["partner.example"], blocked: [] } },
+    [`PUT ${BASE}/accounts/a1/senders`]: (c) => ({ body: c.body }),
+    [`GET ${BASE}/accounts/a1/audit-policy`]: () => ({ body: policy }),
+    [`PUT ${BASE}/accounts/a1/audit-policy`]: (c) => {
+      policy = c.body as typeof policy;
+      return { body: policy };
+    },
+    [`DELETE ${BASE}/accounts/a1/audit-policy`]: () => {
+      policy = { non_owner: true, owner: [] };
+      return { status: 204 };
+    },
+  });
+  expect(await screen.findByText("partner.example")).toBeTruthy();
+  // Адреса вводятся через запятую или пробел.
+  fireEvent.change(screen.getByLabelText("Заблокированные отправители"), { target: { value: "spam.example," } });
+  fireEvent.click(screen.getByRole("button", { name: "Сохранить списки" }));
+  await waitFor(() =>
+    expect(sent(calls, "PUT", `${BASE}/accounts/a1/senders`)[0]?.body).toEqual({ safe: ["partner.example"], blocked: ["spam.example"] }),
+  );
+
+  const send = (await screen.findByLabelText("отправка")) as HTMLInputElement;
+  expect(send.checked).toBe(true);
+  fireEvent.click(screen.getByLabelText("удаление писем"));
+  fireEvent.click(screen.getByRole("button", { name: "Сохранить политику аудита" }));
+  await waitFor(() =>
+    expect(sent(calls, "PUT", `${BASE}/accounts/a1/audit-policy`)[0]?.body).toEqual({ non_owner: true, owner: ["delete", "send"] }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Сбросить к политике организации" }));
+  const confirm = await screen.findByText(/Сбросить политику аудита ящика\?/);
+  fireEvent.click(within(confirm.closest(".ant-popover") as HTMLElement).getByRole("button", { name: "Сбросить" }));
+  await waitFor(() => expect(sent(calls, "DELETE", `${BASE}/accounts/a1/audit-policy`)).toHaveLength(1));
+  await waitFor(() => expect((screen.getByLabelText("отправка") as HTMLInputElement).checked).toBe(false));
+  expect(screen.getByRole("link", { name: "Журнал аудита ящика" }).getAttribute("href")).toBe("/mailbox-audit?account=a1");
 });

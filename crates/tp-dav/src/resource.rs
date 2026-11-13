@@ -12,14 +12,17 @@
 //!
 //! Планирование (RFC 6638): объект календаря с `ORGANIZER` и `ATTENDEE` получает `Schedule-Tag` (заголовок ответов
 //! `GET` и `PUT`, условие `If-Schedule-Tag-Match` у `PUT` и `DELETE` — 412 при несовпадении); после записи и
-//! удаления сервер рассылает iTIP ([`crate::schedule`]) и дописывает в объект `SCHEDULE-STATUS` — тогда ответ
-//! `PUT` без `ETag` (тело изменено сервером, клиент перечитывает объект).
+//! удаления сервер рассылает iTIP ([`crate::schedule`]) и дописывает в объект `SCHEDULE-STATUS` и участников
+//! раскрытых групп — тогда ответ `PUT` без `ETag` (тело изменено сервером, клиент перечитывает объект). Участник
+//! меняет в своей копии только своё участие и личные свойства ([`crate::itip::attendee_change_allowed`]), иначе — 403
+//! `allowed-attendee-scheduling-object-change`.
 //!
 //! `MKCALENDAR` и `MKCOL` — коллекция с именем из последнего сегмента URL: в доме календарей — календарь, в доме
 //! адресных книг — адресная книга (`resourcetype` другого вида — 403 `valid-resourcetype`). Начальные свойства —
 //! как в `PROPPATCH` и `supported-calendar-component-set`; неизвестные свойства пропускаются (клиенты Apple
 //! передают свои), ошибка известного — 403 с `mkcalendar-response` / `mkcol-response`, коллекция не создаётся.
-//! Имя занято — 405. `DELETE` коллекции удаляет её вместе с объектами.
+//! Имя занято — 405. `DELETE` коллекции удаляет её вместе с объектами; встречи удалённого календаря — как удалённые
+//! объекты: организатор рассылает `CANCEL`, участник — отказ.
 
 use std::collections::BTreeSet;
 
@@ -35,8 +38,8 @@ use tp_contracts::dav::{
 use tp_contracts::{Error, Result};
 
 use crate::card;
-use crate::deliver;
-use crate::index::IndexError;
+use crate::index::{self, IndexError};
+use crate::itip;
 use crate::path::Target;
 use crate::props::{self, content_type};
 use crate::schedule;
@@ -154,7 +157,7 @@ fn checked_index(
                     .first()
                     .is_some_and(|c| c.has_property(&ICalendarProperty::Method));
                 let now = OffsetDateTime::now_utc();
-                match deliver::object_index(&cx.dav.cfg, &ical, now) {
+                match index::for_write(&ical, &cx.dav.cfg.index_options(now)) {
                     Err(IndexError::Calendar) => Err((IndexError::Calendar, valid_data(kind))),
                     Err(e) => Err((e, RESOURCE)),
                     Ok(_) if method => Err((IndexError::Mixed, RESOURCE)),
@@ -268,7 +271,18 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
     let Some(pre) = schedule_condition(cx, old.as_ref(), pre) else {
         return Ok(status(StatusCode::PRECONDITION_FAILED));
     };
-    let tag = idx.schedule_tag.clone();
+    let old_ical = old.and_then(|o| ICalendar::parse(&o.body).ok());
+    // Участник меняет в своей копии только своё участие и личные свойства (RFC 6638 §3.2.2.1).
+    if cx.dav.schedule.is_some()
+        && let (Some(o), Some(n)) = (&old_ical, &ical)
+        && !itip::attendee_change_allowed(o, n, &cx.addresses().await?)
+    {
+        return Ok(precondition(
+            StatusCode::FORBIDDEN,
+            "<c:allowed-attendee-scheduling-object-change/>",
+        ));
+    }
+    let mut tag = idx.schedule_tag.clone();
     match cx
         .store()
         .put_object(cx.scope, c.id, name, text, idx.clone(), pre)
@@ -281,19 +295,27 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
                 StatusCode::NO_CONTENT
             };
             let mut resp = status(code);
-            let old_ical = old.and_then(|o| ICalendar::parse(&o.body).ok());
             let rewritten = match schedule::after_change(cx, old_ical.as_ref(), ical.as_ref()).await
             {
-                // Итоги рассылки — в объект; одновременная правка клиентом важнее, её не перезаписываем.
+                // Итоги рассылки и раскрытые группы — в объект; одновременная правка клиентом важнее, её не
+                // перезаписываем. Участники групп меняют `Schedule-Tag` — индекс пересчитывается.
                 Some(updated) => {
+                    let opts = cx.dav.cfg.index_options(OffsetDateTime::now_utc());
+                    let idx = index::for_write(&updated, &opts).unwrap_or(idx);
+                    let new_tag = idx.schedule_tag.clone();
                     let pre = Precondition::IfMatch(put.etag.clone());
-                    cx.store()
+                    let stored = cx
+                        .store()
                         .put_object(cx.scope, c.id, name, updated.to_string(), idx, pre)
                         .await
                         .inspect_err(|e| {
                             tracing::warn!(error = %e, "DAV PUT: SCHEDULE-STATUS не записан");
                         })
-                        .is_ok_and(|o| matches!(o, PutOutcome::Stored(_)))
+                        .is_ok_and(|o| matches!(o, PutOutcome::Stored(_)));
+                    if stored {
+                        tag = new_tag;
+                    }
+                    stored
                 }
                 None => false,
             };
@@ -357,7 +379,13 @@ pub(crate) async fn delete(cx: &Cx<'_>, target: &Target) -> Result<Response> {
             let Some(c) = by_name(cx, *kind, name).await? else {
                 return Ok(status(StatusCode::NOT_FOUND));
             };
+            // Удаление календаря — как удаление каждой встречи в нём: отмены и отказы рассылаются после удаления.
+            let meetings = match kind {
+                CollectionKind::Calendar => schedule::scheduling_objects(cx, c.id).await?,
+                CollectionKind::AddressBook => Vec::new(),
+            };
             cx.store().delete_collection(cx.scope, c.id).await?;
+            schedule::after_delete_collection(cx, &meetings).await;
             Ok(status(StatusCode::NO_CONTENT))
         }
         _ => Ok(status(StatusCode::FORBIDDEN)),

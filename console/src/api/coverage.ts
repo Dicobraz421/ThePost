@@ -1,7 +1,6 @@
 /**
- * Покрытие Admin API экранами консоли (UI-02): «МЕТОД путь» операции OpenAPI → файл экрана в `src/`.
- * Операция без экрана — строка в `coverage-pending.txt`; тест падает, если операция схемы не учтена
- * ни здесь, ни там (критерий Ф2: список ожидания пуст).
+ * Покрытие Admin API экранами консоли (UI-02, критерий Ф2): «МЕТОД путь» операции OpenAPI → файл экрана в `src/`.
+ * Тест падает, если операции схемы здесь нет: новая операция Admin API приходит в консоль вместе с экраном.
  */
 export const covered: Record<string, string> = {
   "GET /api/v1/session": "pages/login.tsx",
@@ -9,6 +8,8 @@ export const covered: Record<string, string> = {
   "GET /api/v1/whoami": "components/header.tsx",
   "GET /api/v1/orgs": "components/orgs.tsx",
   "GET /api/v1/orgs/{org}": "pages/organization.tsx",
+  "GET /api/v1/orgs/{org}/sync-hold": "pages/organization.tsx",
+  "POST /api/v1/orgs/{org}/sync-hold/approve": "pages/organization.tsx",
   "PUT /api/v1/orgs/{org}/policy": "pages/organization.tsx",
   "GET /api/v1/orgs/{org}/accounts": "pages/accounts.tsx",
   "POST /api/v1/orgs/{org}/accounts": "pages/accounts.tsx",
@@ -18,11 +19,33 @@ export const covered: Record<string, string> = {
   "GET /api/v1/orgs/{org}/accounts/{account}/app-passwords": "pages/accounts.tsx",
   "POST /api/v1/orgs/{org}/accounts/{account}/app-passwords": "pages/accounts.tsx",
   "DELETE /api/v1/orgs/{org}/accounts/{account}/app-passwords/{id}": "pages/accounts.tsx",
+  "GET /api/v1/orgs/{org}/accounts/{account}/senders": "pages/accounts.tsx",
+  "PUT /api/v1/orgs/{org}/accounts/{account}/senders": "pages/accounts.tsx",
+  "GET /api/v1/orgs/{org}/accounts/{account}/audit-policy": "pages/accounts.tsx",
+  "PUT /api/v1/orgs/{org}/accounts/{account}/audit-policy": "pages/accounts.tsx",
+  "DELETE /api/v1/orgs/{org}/accounts/{account}/audit-policy": "pages/accounts.tsx",
+  "GET /api/v1/orgs/{org}/disabled-accounts": "pages/disabled.tsx",
+  "POST /api/v1/orgs/{org}/disabled-accounts/{account}/attach": "pages/disabled.tsx",
+  "POST /api/v1/orgs/{org}/disabled-accounts/{account}/restore": "pages/disabled.tsx",
   "GET /api/v1/orgs/{org}/groups": "pages/groups.tsx",
   "POST /api/v1/orgs/{org}/groups": "pages/groups.tsx",
   "GET /api/v1/orgs/{org}/groups/{group}": "pages/groups.tsx",
   "PATCH /api/v1/orgs/{org}/groups/{group}": "pages/groups.tsx",
   "DELETE /api/v1/orgs/{org}/groups/{group}": "pages/groups.tsx",
+  "GET /api/v1/orgs/{org}/groups/{group}/filter": "components/dynamic-filter.tsx",
+  "PUT /api/v1/orgs/{org}/groups/{group}/filter": "components/dynamic-filter.tsx",
+  "DELETE /api/v1/orgs/{org}/groups/{group}/filter": "components/dynamic-filter.tsx",
+  "GET /api/v1/orgs/{org}/groups/{group}/filter/members": "components/dynamic-filter.tsx",
+  "GET /api/v1/orgs/{org}/contacts": "pages/contacts.tsx",
+  "POST /api/v1/orgs/{org}/contacts": "pages/contacts.tsx",
+  "GET /api/v1/orgs/{org}/contacts/{contact}": "pages/contacts.tsx",
+  "PUT /api/v1/orgs/{org}/contacts/{contact}": "pages/contacts.tsx",
+  "DELETE /api/v1/orgs/{org}/contacts/{contact}": "pages/contacts.tsx",
+  "GET /api/v1/orgs/{org}/units": "pages/units.tsx",
+  "POST /api/v1/orgs/{org}/units": "pages/units.tsx",
+  "PUT /api/v1/orgs/{org}/units/{unit}": "pages/units.tsx",
+  "DELETE /api/v1/orgs/{org}/units/{unit}": "pages/units.tsx",
+  "GET /api/v1/orgs/{org}/units/{unit}/members": "pages/units.tsx",
   "GET /api/v1/orgs/{org}/moderation": "components/moderation-queue.tsx",
   "POST /api/v1/orgs/{org}/moderation/{held}/approve": "components/moderation-queue.tsx",
   "POST /api/v1/orgs/{org}/moderation/{held}/reject": "components/moderation-queue.tsx",
@@ -48,6 +71,9 @@ export const covered: Record<string, string> = {
   "DELETE /api/v1/transport/sources/{name}": "pages/transport.tsx",
   "GET /api/v1/orgs/{org}/delivery": "pages/delivery.tsx",
   "GET /api/v1/orgs/{org}/audit": "pages/audit.tsx",
+  "GET /api/v1/orgs/{org}/mailbox-audit": "pages/mailbox-audit.tsx",
+  "PUT /api/v1/orgs/{org}/mailbox-audit/policy": "pages/mailbox-audit.tsx",
+  "DELETE /api/v1/orgs/{org}/mailbox-audit/policy": "pages/mailbox-audit.tsx",
   "GET /api/v1/orgs/{org}/accounts/{account}/sieve/scripts": "pages/sieve.tsx",
   "GET /api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}": "pages/sieve.tsx",
   "PUT /api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}": "pages/sieve.tsx",

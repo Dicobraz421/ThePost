@@ -779,8 +779,9 @@ pub struct MaintenanceSection {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub admin_token_retention: Duration,
-    /// Период заполнения книги GAL «Организация» из каталога `auth.ldap` (`1m`, APP-49): первый проход — при запуске
-    /// роли; изменение каталога видно в книге CardDAV и JMAP не позже чем через период. Без `auth.ldap` книги нет.
+    /// Период заполнения книги GAL «Организация» из каталога (`1m`, APP-49): `auth.ldap`, без него — учётные записи и
+    /// группы PostgreSQL (APP-51). Первый проход — при запуске роли; изменение каталога видно в книге CardDAV и JMAP
+    /// не позже чем через период.
     /// Требует перезапуска.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
