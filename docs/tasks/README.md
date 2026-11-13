@@ -615,10 +615,10 @@
 | [ADM-37](ADM-37.md) | CLI `account list --after` | admin | A | admin-25 | ready | APP-22 |
 | [ADM-38](ADM-38.md) | CLI: политики, группы, корзина, аудит, журнал доставки, транспорт | admin | A | admin-25 | ready | APP-22 |
 | [ADM-39](ADM-39.md) | CLI: `thepost admin login --oidc` | admin | A | admin-25 | ready | APP-42 |
-| [BLOB-17](BLOB-17.md) | `verify`: раздельные счётчики «пропал» и «неверный размер» | blob | A | blob-10 | ready | BLOB-14 |
+| [BLOB-17](BLOB-17.md) | `verify`: раздельные счётчики «пропал» и «неверный размер» | blob | A | blob-10 | done | BLOB-14 |
 | [DEP-49](DEP-49.md) | эталонные конфигурации: `maintenance.*` и `cli.oidc.*` | deploy | A | deploy-35 | ready | APP-44,APP-39 |
 | [DOC-05](DOC-05.md) | справочник администратора: `maintenance.*` и `cli.oidc.*` | docs | A | docs-05 | todo | DEP-49 |
-| [APP-56](APP-56.md) | узел: OIDC с ключом из хранилища секретов | app | A | app-50 | ready | AUTH-17 |
+| [APP-56](APP-56.md) | узел: OIDC с ключом из хранилища секретов | app | A | app-50 | done | AUTH-17 |
 | [CTR-72](CTR-72.md) | `AccountStore::by_external_id` — обязательный метод | contracts | B | contracts-48 | ready | — |
 
 ## Ф2. Совместная работа (≈5 мес.)
@@ -747,9 +747,9 @@
 | [JMAP-38](JMAP-38.md) | JMAP Principal: тип `resource` для переговорных и оборудования | jmap | A | jmap-22 | ready | JMAP-30,CTR-48 |
 | [CTR-60](CTR-60.md) | `DavStore` — глобальная адресная книга организации | contracts | B | contracts-41 | done | CTR-45,CTR-58 |
 | [META-63](META-63.md) | книга GAL в PostgreSQL | meta | B | meta-39 | done | CTR-60 |
-| [DAV-29](DAV-29.md) | CardDAV: книга GAL из `DavStore` | dav | A | dav-09 | ready | CTR-60,DAV-27,DAV-28 |
-| [JMAP-39](JMAP-39.md) | JMAP Contacts: книга GAL | jmap | A | jmap-23 | ready | CTR-60,JMAP-34 |
-| [APP-49](APP-49.md) | узел: заполнение книги GAL | app | A | app-41 | todo | DAV-29,META-63,JMAP-39 |
+| [DAV-29](DAV-29.md) | CardDAV: книга GAL из `DavStore` | dav | A | dav-09 | done | CTR-60,DAV-27,DAV-28 |
+| [JMAP-39](JMAP-39.md) | JMAP Contacts: книга GAL | jmap | A | jmap-23 | done | CTR-60,JMAP-34 |
+| [APP-49](APP-49.md) | узел: заполнение книги GAL | app | A | app-41 | done | DAV-29,META-63,JMAP-39 |
 | [DEPS-10](DEPS-10.md) | `tower-http` (CORS) для `tp-admin` | deps | B | deps-10 | done | DEPS-05 |
 | [ADM-24](ADM-24.md) | CORS в Admin API для консоли на отдельном веб-сервере | admin | A | admin-17 | done | ADM-15,DEPS-10 |
 | [ADM-25](ADM-25.md) | `GET /api/v1/session` — настройки входа OIDC для консоли | admin | A | admin-17 | done | ADM-15 |
