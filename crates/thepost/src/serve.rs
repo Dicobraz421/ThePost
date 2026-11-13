@@ -284,10 +284,13 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         cfg.section::<SmtpConfig>(sections::SMTP)?.queue.resubscribe,
     ));
     // Изменение книги GAL — в JMAP push учётных записей организации (APP-49).
-    if let Some(push) = services.gal_push.clone()
-        && cfg.roles().contains(Role::Jmap)
-    {
-        tokio::spawn(push.run(events_cfg.retry_min, aux.clone()));
+    if cfg.roles().contains(Role::Jmap) {
+        tokio::spawn(
+            services
+                .gal_push
+                .clone()
+                .run(events_cfg.retry_min, aux.clone()),
+        );
     }
     // Ротация ключей DKIM без перезапуска (SMTP-08).
     tokio::spawn(apply_dkim(
@@ -359,15 +362,14 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         store.clone(),
         reloader.subscribe(),
     ));
-    // Книга GAL «Организация» из каталога (APP-49): роль maintenance, одна запись на организацию (лиза).
-    let gal = services
-        .gal(
-            (*cfg.section::<tp_dav::DavConfig>(sections::DAV)?).clone(),
-            leases.clone(),
-            holder.clone(),
-            maintenance_cfg.gal_interval,
-        )
-        .map(Arc::new);
+    // Книга GAL «Организация» из каталога — LDAP или PostgreSQL (APP-49, APP-51): роль maintenance, одна запись на
+    // организацию (лиза).
+    let gal = Arc::new(services.gal(
+        (*cfg.section::<tp_dav::DavConfig>(sections::DAV)?).clone(),
+        leases.clone(),
+        holder.clone(),
+        maintenance_cfg.gal_interval,
+    ));
     let maintenance = Maintenance {
         index: Arc::new(blob_index.clone()),
         store: blob.clone(),
@@ -389,6 +391,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             meta: meta.clone(),
             interval: maintenance_cfg.purge_interval,
             admin_token_retention: maintenance_cfg.admin_token_retention,
+            probe: crate::metrics::register_purge(&metrics),
         }),
         verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {
             verifier: Arc::new(crate::verify::verifier(
@@ -406,7 +409,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         }),
         audit_export: Some(audit_export),
         card_reindex: Some(meta.clone()),
-        gal,
+        gal: Some(gal),
     };
     let mut setup = RoleSetup {
         cfg: &cfg,

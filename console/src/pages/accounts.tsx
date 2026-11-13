@@ -1,10 +1,21 @@
 import { Create, List, Show, ShowButton, useForm } from "@refinedev/antd";
-import { type HttpError, useCreate, useCustom, useCustomMutation, useDelete, useInfiniteList, useList, useShow } from "@refinedev/core";
-import { Alert, Button, Descriptions, Divider, Form, Input, Modal, Popconfirm, Space, Switch, Table, Tag, Typography } from "antd";
+import {
+  type HttpError,
+  useCan,
+  useCreate,
+  useCustom,
+  useCustomMutation,
+  useDelete,
+  useInfiniteList,
+  useList,
+  useShow,
+} from "@refinedev/core";
+import { Alert, Button, Descriptions, Divider, Form, Input, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Typography } from "antd";
 import { useState } from "react";
 import { Link } from "react-router";
 
 import type { Schemas } from "../api/client";
+import { AuditPolicyForm } from "../components/audit-policy-form";
 import { bytes, when } from "../components/format";
 import { PolicyForm } from "../components/policy-form";
 import { useReadOnly } from "../providers/access";
@@ -216,7 +227,75 @@ function AccountForm({ account, onSaved }: { account: Account; onSaved: () => vo
   );
 }
 
-/** Учётная запись: сведения, имя и блокировка, политика ящика, пароли приложений. */
+/** Списки отправителей ящика (надёжные и заблокированные адреса и домены): замена целиком (`PUT`). */
+function SenderLists({ account }: { account: string }) {
+  const readOnly = useReadOnly("accounts");
+  const url = `/api/v1/orgs/{org}/accounts/${encodeURIComponent(account)}/senders`;
+  const { result, query } = useCustom<Schemas["SenderListBody"]>({ url, method: "get" });
+  const { mutate, mutation } = useCustomMutation<Schemas["SenderListBody"], HttpError, Schemas["SenderListBody"]>();
+  const lists = { safe: result.data?.safe ?? [], blocked: result.data?.blocked ?? [] };
+  const tags = { mode: "tags" as const, tokenSeparators: [",", " "], open: false, style: { maxWidth: 640 } };
+  if (query.isLoading) return null;
+  return (
+    <Form<Schemas["SenderListBody"]>
+      key={JSON.stringify(lists)}
+      layout="vertical"
+      initialValues={lists}
+      disabled={readOnly}
+      onFinish={(values) =>
+        mutate(
+          { url, method: "put", values, successNotification: { type: "success", message: "Списки отправителей сохранены" } },
+          { onSuccess: () => void query.refetch() },
+        )
+      }
+    >
+      <Form.Item name="safe" label="Надёжные отправители" extra="Адреса и домены: user@example.com, example.com.">
+        <Select {...tags} />
+      </Form.Item>
+      <Form.Item name="blocked" label="Заблокированные отправители">
+        <Select {...tags} />
+      </Form.Item>
+      {!readOnly && (
+        <Button type="primary" htmlType="submit" loading={mutation.isPending}>
+          Сохранить списки
+        </Button>
+      )}
+    </Form>
+  );
+}
+
+/** Политика аудита ящика: действующая (ящика, иначе организации, иначе по умолчанию), своя или сброс. */
+function AccountAuditPolicy({ account }: { account: string }) {
+  const readOnly = useReadOnly("accounts");
+  const url = `/api/v1/orgs/{org}/accounts/${encodeURIComponent(account)}/audit-policy`;
+  const { query } = useCustom<Schemas["AuditPolicyBody"]>({ url, method: "get" });
+  const { mutate, mutation } = useCustomMutation<Schemas["AuditPolicyBody"], HttpError, Schemas["AuditPolicyBody"] | undefined>();
+  if (query.isLoading) return null;
+  return (
+    <AuditPolicyForm
+      policy={query.data?.data}
+      readOnly={readOnly}
+      saving={mutation.isPending}
+      onSave={(values) =>
+        mutate(
+          { url, method: "put", values, successNotification: { type: "success", message: "Политика аудита ящика сохранена" } },
+          { onSuccess: () => void query.refetch() },
+        )
+      }
+      reset={{
+        label: "Сбросить к политике организации",
+        confirm: "Сбросить политику аудита ящика? Будет действовать политика организации.",
+        run: () =>
+          mutate(
+            { url, method: "delete", values: undefined, successNotification: { type: "success", message: "Политика аудита ящика сброшена" } },
+            { onSuccess: () => void query.refetch() },
+          ),
+      }}
+    />
+  );
+}
+
+/** Учётная запись: сведения, имя и блокировка, политика ящика, отправители, аудит ящика, пароли приложений. */
 export function AccountShow() {
   const { result: account, query } = useShow<Account>();
   const { mutate, mutation } = useCustomMutation<Schemas["PolicyBody"]>();
@@ -228,6 +307,7 @@ export function AccountShow() {
     errorNotification: false,
   });
   const domain = accepted.data?.domains?.find((d) => d.id === account?.domain)?.name ?? account?.domain;
+  const audit = useCan({ resource: "mailbox-audit", action: "list" }).data?.can;
   return (
     <Show title={account?.login ?? "Учётная запись"} isLoading={query.isLoading}>
       <Descriptions column={1}>
@@ -245,6 +325,7 @@ export function AccountShow() {
         <Space size="large" style={{ marginTop: 8 }}>
           <Link to={`/accounts/${encodeURIComponent(account.id)}/trash`}>Корзина и скрытые письма</Link>
           <Link to={`/accounts/${encodeURIComponent(account.id)}/sieve`}>Правила и автоответ</Link>
+          {audit && <Link to={`/mailbox-audit?account=${encodeURIComponent(account.id)}`}>Журнал аудита ящика</Link>}
         </Space>
       )}
       <Divider orientation="left">Имя и блокировка</Divider>
@@ -266,6 +347,10 @@ export function AccountShow() {
           )
         }
       />
+      <Divider orientation="left">Списки отправителей</Divider>
+      {account && <SenderLists account={account.id} />}
+      <Divider orientation="left">Аудит ящика</Divider>
+      {account && <AccountAuditPolicy account={account.id} />}
       <Divider orientation="left">Пароли приложений</Divider>
       {account && <AppPasswords account={account.id} />}
     </Show>
