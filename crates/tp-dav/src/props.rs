@@ -14,7 +14,8 @@
 //! Дом адресных книг (`addressbook-home-set` принципала): при первом `PROPFIND`, если адресных книг нет, создаётся
 //! книга `contacts` с именем из `dav.default_addressbook_name`. Свойства книги: `supported-address-data` (vCard 3.0
 //! и 4.0), `max-resource-size`, `max-image-size` (Apple; `dav.max_photo_size`), `addressbook-description`.
-//! Глобальная адресная книга ([`crate::gal`]) — последней в списке дома, права — только чтение.
+//! Глобальная адресная книга ([`crate::gal`], `Collection::is_gal`) — последней в списке дома, права — только
+//! чтение; при создании книги по умолчанию она не учитывается.
 //!
 //! Оповещения по умолчанию календаря (`default-alarm-vevent-datetime`, `default-alarm-vevent-date`; CTR-56) —
 //! компоненты VALARM из `Collection::alerts_with_time`, `alerts_without_time` ([`crate::alarm`]), те же, что JMAP
@@ -44,13 +45,13 @@ use tp_contracts::dav::{Collection, CollectionKind, Component, DavStore};
 use tp_contracts::meta::AccountScope;
 use tp_contracts::{Error, Result};
 
+use crate::alarm;
 use crate::config::DavConfig;
 use crate::path::{self, Target};
 use crate::server::{Cx, multistatus, precondition, status};
 use crate::xml::{
     CALDAV, CARDDAV, CS, DAV, Element, Group, ICAL, Multistatus, PropName, href, text,
 };
-use crate::{alarm, gal};
 
 /// Оповещения по умолчанию для событий со временем (CTR-56, [`crate::alarm`]).
 const ALARM_DATETIME: &str = "default-alarm-vevent-datetime";
@@ -319,7 +320,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
     v.push(p(DAV, "principal-collection-set", href(path::PRINCIPALS)));
     let privs = match res {
         Res::Root | Res::Principals | Res::Principal(_) => PRIV_READ,
-        Res::Collection(c) | Res::Object { coll: c, .. } if gal::is(c) => PRIV_READ,
+        Res::Collection(c) | Res::Object { coll: c, .. } if c.is_gal() => PRIV_READ,
         _ => PRIV_OWNER,
     };
     v.push(p(DAV, "current-user-privilege-set", privs.to_owned()));
@@ -556,35 +557,18 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
             ensure_defaults(cx, *kind).await?;
             emit(cx, &mut ms, &Res::Home(*kind), &want);
             if depth1 {
-                let list = cx.store().list_collections(cx.scope, *kind).await?;
+                let mut list = cx.store().list_collections(cx.scope, *kind).await?;
+                // Книга GAL — последней (сортировка устойчива).
+                list.sort_by_key(Collection::is_gal);
                 for c in list.iter().take(max) {
                     emit(cx, &mut ms, &Res::Collection(c), &want);
                 }
                 if list.len() > max {
                     truncated(&mut ms, &target.href(cx.login()));
                 }
-                // Каталог недоступен — дом показывается без глобальной адресной книги.
-                if *kind == CollectionKind::AddressBook {
-                    match gal::load(cx).await {
-                        Ok(Some(g)) => emit(cx, &mut ms, &Res::Collection(&g.coll), &want),
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, "DAV: глобальная адресная книга недоступна");
-                        }
-                    }
-                }
             }
         }
         Target::Collection(kind, _, name) => {
-            if let Some(g) = gal::find(cx, *kind, name).await? {
-                emit(cx, &mut ms, &Res::Collection(&g.coll), &want);
-                if depth1 {
-                    for o in &g.cards {
-                        gal::emit(cx, &mut ms, &g, o, &want);
-                    }
-                }
-                return Ok(multistatus(ms));
-            }
             let Some(c) = cx.store().collection_by_name(cx.scope, *kind, name).await? else {
                 if *kind == CollectionKind::Calendar && path::reserved(*kind, name) {
                     let inbox = name == path::INBOX;
@@ -599,13 +583,6 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
             }
         }
         Target::Object(kind, _, coll, name) => {
-            if let Some(g) = gal::find(cx, *kind, coll).await? {
-                let Some(o) = g.card(name) else {
-                    return Ok(status(StatusCode::NOT_FOUND));
-                };
-                gal::emit(cx, &mut ms, &g, o, &want);
-                return Ok(multistatus(ms));
-            }
             if let Some((inbox, item)) = crate::schedule::resource(target) {
                 if !crate::schedule::propfind(cx, &mut ms, inbox, item, false, &want).await? {
                     return Ok(status(StatusCode::NOT_FOUND));
@@ -646,7 +623,8 @@ pub(crate) async fn defaults(
     cfg: &DavConfig,
     kind: CollectionKind,
 ) -> Result<()> {
-    if !store.list_collections(scope, kind).await?.is_empty() {
+    let own = store.list_collections(scope, kind).await?;
+    if own.iter().any(|c| !c.is_gal()) {
         return Ok(());
     }
     // Имя, отображаемое имя, компонент; первая — коллекция по умолчанию вида (`Collection::is_default`).

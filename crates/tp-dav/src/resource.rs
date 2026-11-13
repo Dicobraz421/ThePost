@@ -36,7 +36,6 @@ use tp_contracts::{Error, Result};
 
 use crate::card;
 use crate::deliver;
-use crate::gal;
 use crate::index::IndexError;
 use crate::path::Target;
 use crate::props::{self, content_type};
@@ -57,15 +56,10 @@ pub(crate) async fn get(cx: &Cx<'_>, target: &Target, head: bool) -> Result<Resp
     let Target::Object(kind, _, coll, name) = target else {
         return Ok(not_allowed());
     };
-    let o = if let Some(g) = gal::find(cx, *kind, coll).await? {
-        g.card(name).cloned()
-    } else {
-        let Some(c) = by_name(cx, *kind, coll).await? else {
-            return Ok(status(StatusCode::NOT_FOUND));
-        };
-        cx.store().get_object(cx.scope, c.id, name).await?
+    let Some(c) = by_name(cx, *kind, coll).await? else {
+        return Ok(status(StatusCode::NOT_FOUND));
     };
-    let Some(o) = o else {
+    let Some(o) = cx.store().get_object(cx.scope, c.id, name).await? else {
         return Ok(status(StatusCode::NOT_FOUND));
     };
     let tag = o.index.schedule_tag.as_deref().and_then(etag_header);

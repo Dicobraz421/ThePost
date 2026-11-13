@@ -3,7 +3,8 @@
 //! Вход — `Authorization: Basic` (пароль приложения) или `Bearer` (OAuth 2.0) через [`Authenticator`], как в JMAP;
 //! без данных или с неверными — 401 с `WWW-Authenticate: Basic realm="dav"`. `OPTIONS` отвечает без входа
 //! (клиенты узнают возможности сервера до запроса пароля). Доступ — только к своим ресурсам: логин в URL не
-//! совпадает с вошедшим — 403 (общий доступ — DAV-17). Глобальная адресная книга ([`crate::gal`]) — только чтение.
+//! совпадает с вошедшим — 403 (общий доступ — DAV-17). Глобальная адресная книга ([`crate::gal`]) — только чтение:
+//! запись в неё — 403 `need-privileges` до обращения к хранилищу.
 //!
 //! `/.well-known/caldav` и `/.well-known/carddav` перенаправляет на `/dav/` `tp-jmap` (секция `jmap.autoconfig`,
 //! по умолчанию `caldav: /dav/`, `carddav: /dav/`); здесь эти пути не обслуживаются.
@@ -21,12 +22,12 @@ use axum::routing::any;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use tp_contracts::Error;
-use tp_contracts::auth::{Authenticator, Credentials, Directory, Principal};
+use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::dav::DavStore;
-use tp_contracts::groups::GroupStore;
 use tp_contracts::meta::AccountScope;
 
 use crate::config::DavConfig;
+use crate::gal::GalDeps;
 use crate::path::Target;
 use crate::schedule::{self, ScheduleDeps};
 use crate::xml::{self, Element};
@@ -49,22 +50,6 @@ pub struct Deps {
     pub store: Arc<dyn DavStore>,
 }
 
-/// Источники глобальной адресной книги ([`router_with_gal`]).
-#[derive(Clone)]
-pub struct GalDeps {
-    /// Каталог организации: учётные записи и группы.
-    pub directory: Arc<dyn Directory>,
-    /// Группы рассылки: скрытые из адресной книги (`hidden_from_gal`) в неё не попадают; `None` — видны все
-    /// группы каталога.
-    pub groups: Option<Arc<dyn GroupStore>>,
-}
-
-impl fmt::Debug for GalDeps {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GalDeps").finish_non_exhaustive()
-    }
-}
-
 impl fmt::Debug for Deps {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Deps")
@@ -78,10 +63,6 @@ impl fmt::Debug for Deps {
 pub(crate) struct Dav {
     pub d: Deps,
     pub cfg: DavConfig,
-    /// Источники глобальной адресной книги; `None` — книги нет.
-    pub gal_deps: Option<GalDeps>,
-    /// Построенные глобальные адресные книги.
-    pub gal: gal::Cache,
     /// Планирование встреч; `None` — объекты хранятся без рассылки iTIP.
     pub schedule: Option<ScheduleDeps>,
 }
@@ -97,39 +78,23 @@ impl Dav {
 
 /// Маршруты DAV под `/dav/`; TLS, PROXY и слушатель — у вызывающего (`tp-platform`).
 pub fn router(d: Deps, cfg: DavConfig) -> Router {
-    build(d, None, None, cfg)
+    build(d, None, cfg)
 }
 
-/// Маршруты DAV с необязательными глобальной адресной книгой `gal` и планированием встреч `schedule`
-/// (RFC 6638: рассылка iTIP после `PUT` и `DELETE`, запрос занятости).
+/// Маршруты DAV с необязательным планированием встреч `schedule` (RFC 6638: рассылка iTIP после `PUT` и `DELETE`,
+/// запрос занятости). Книгу GAL маршруты читают из хранилища, заполняет её [`crate::gal::sync`]; `_gal` не
+/// используется — аргумент убирает подключение `gal::sync` в узле (APP-49).
 pub fn router_with(
     d: Deps,
-    gal: Option<GalDeps>,
+    _gal: Option<GalDeps>,
     schedule: Option<ScheduleDeps>,
     cfg: DavConfig,
 ) -> Router {
-    build(d, gal, schedule, cfg)
+    build(d, schedule, cfg)
 }
 
-/// Маршруты DAV с глобальной адресной книгой «Организация» из каталога `gal` (только чтение, в доме адресных
-/// книг каждого пользователя).
-pub fn router_with_gal(d: Deps, gal: GalDeps, cfg: DavConfig) -> Router {
-    build(d, Some(gal), None, cfg)
-}
-
-fn build(
-    d: Deps,
-    gal_deps: Option<GalDeps>,
-    schedule: Option<ScheduleDeps>,
-    cfg: DavConfig,
-) -> Router {
-    let dav = Arc::new(Dav {
-        d,
-        cfg,
-        gal_deps,
-        gal: gal::Cache::default(),
-        schedule,
-    });
+fn build(d: Deps, schedule: Option<ScheduleDeps>, cfg: DavConfig) -> Router {
+    let dav = Arc::new(Dav { d, cfg, schedule });
     Router::new()
         .route("/dav", any(handle))
         .route("/dav/", any(handle))
@@ -244,7 +209,7 @@ async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {
     if matches!(
         method,
         "PUT" | "DELETE" | "PROPPATCH" | "MKCOL" | "MKCALENDAR"
-    ) && gal::is_target(&cx, &target)
+    ) && gal::is_target(&target)
     {
         return gal::read_only(&cx, &target);
     }
