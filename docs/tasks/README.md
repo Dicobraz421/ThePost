@@ -563,9 +563,9 @@
 | [CI-13](CI-13.md) | бета выпускает тег версии образа | ci | B | ci-11 | done | CI-01 |
 | [DEP-50](DEP-50.md) | Helm и Compose: закрытый образ и тег версии | deploy | A | deploy-36 | done | CI-13 |
 | [CI-14](CI-14.md) | артефакт CI тем же путём, что выпуск; запуск на старом процессоре | ci | B | ci-12 | done | CI-13 |
-| [CI-15](CI-15.md) | воспроизводимая сборка с консолью (repro беты) | ci | B | ci-13 | ready | CI-08,CI-14 |
+| [CI-15](CI-15.md) | воспроизводимая сборка с консолью (repro беты) | ci | B | ci-13 | done | CI-08,CI-14 |
 | [DEP-51](DEP-51.md) | эталоны deploy/config: edge.yaml и порты IMAP, ManageSieve | deploy | A | deploy-37 | done | DEP-37 |
-| [DEP-52](DEP-52.md) | стенд: доверенные подсети вместо выключенного ограничения частоты | deploy | A | deploy-38 | todo | PLT-32 |
+| [DEP-52](DEP-52.md) | стенд: доверенные подсети вместо выключенного ограничения частоты | deploy | A | deploy-38 | done | PLT-32 |
 | [APP-60](APP-60.md) | thepost doctor: подсказки DNS для календарей и контактов | app | A | app-55 | done | DEP-21 |
 | [PLT-33](PLT-33.md) | обязательные параметры по ролям — edge без базы данных | platform | A | platform-22 | done | — |
 | [APP-61](APP-61.md) | узел edge запускается без базы данных и хранилища писем | app | A | app-56 | ready | — |
@@ -574,9 +574,9 @@
 | [META-78](META-78.md) | пересчёт поисковых строк контактов, записанных до миграции 0030 | meta | A | meta-51 | done | DAV-24 |
 | [APP-63](APP-63.md) | пересчёт поисковых строк старых контактов в узле | app | A | app-58 | done | META-78 |
 | [META-79](META-79.md) | срок следующего прохода GC BLOB по всем шардам | meta | A | meta-52 | ready | — |
-| [APP-64](APP-64.md) | POP3 сверяет сеансы с хранилищем после потери сигнала блокировки | app | A | app-59 | ready | — |
-| [DAV-33](DAV-33.md) | импорт 8-битных vCard (2.1 и 3.0 с CHARSET без ENCODING) | dav | A | dav-11 | ready | — |
-| [JMAP-44](JMAP-44.md) | импорт 8-битных vCard в ContactCard | jmap | A | jmap-27 | todo | — |
+| [APP-64](APP-64.md) | POP3 сверяет сеансы с хранилищем после потери сигнала блокировки | app | A | app-59 | done | — |
+| [DAV-33](DAV-33.md) | импорт 8-битных vCard (2.1 и 3.0 с CHARSET без ENCODING) | dav | A | dav-11 | done | — |
+| [SYS-15](SYS-15.md) | в журнал — только смена лимитов ресурсов узла | sys | A | sys-10 | done | SYS-06 |
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | done | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | done | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | done | — |
@@ -591,7 +591,7 @@
 | [APP-59](APP-59.md) | узел запускает экспорт журнала аудита в syslog/OTLP | app | A | app-53 | done | ADM-34 |
 | [META-76](META-76.md) | убрать старые PgMeta::policy/set_policy и реэкспорт PolicyTarget | meta | A | meta-49 | done | META-70 |
 | [META-77](META-77.md) | проверка номеров миграций — подряд, без повторов, совпадают с именами файлов | meta | A | meta-50 | done | — |
-| [ADM-35](ADM-35.md) | CLI: проверка скрипта Sieve без `tp_sieve::check` | admin | A | admin-24 | todo | JMAP-35 |
+| [ADM-35](ADM-35.md) | CLI: проверка скрипта Sieve без `tp_sieve::check` | admin | A | admin-24 | ready | JMAP-35 |
 | [SIEVE-13](SIEVE-13.md) | одна проверка скрипта: удалить `tp_sieve::check` | sieve | A | sieve-06 | done | SIEVE-11,JMAP-35,ADM-35 |
 | [DEP-43](DEP-43.md) | эталоны: лимиты, селектор DKIM и Milter — политикой организации | deploy | A | deploy-32 | ready | CTR-67 |
 | [SMTP-39](SMTP-39.md) | локальные домены — только принятые домены организации | smtp | A | smtp-21 | done | DEP-42,APP-54 |
@@ -733,9 +733,9 @@
 | [DAV-23](DAV-23.md) | `calendar-user-address-set` — псевдонимы учётной записи | dav | A | dav-07 | done | CTR-53,DAV-05 |
 | [DAV-24](DAV-24.md) | CardDAV — поисковые строки контакта и `addressbook-query` по индексу | dav | A | dav-07 | done | CTR-54,DAV-10 |
 | [DAV-25](DAV-25.md) | CalDAV и CardDAV — оповещения по умолчанию и коллекция по умолчанию | dav | A | dav-07 | done | CTR-56,DAV-05 |
-| [JMAP-34](JMAP-34.md) | ContactCard — перенос между книгами, запрос по индексу, тесты на корпусе vCard | jmap | A | jmap-20 | ready | CTR-54,KIT-09,JMAP-26 |
-| [JMAP-35](JMAP-35.md) | `SieveScript/validate` и `/set` — проверка с пределами секции `sieve` | jmap | A | jmap-20 | ready | JMAP-24,APP-26 |
-| [JMAP-36](JMAP-36.md) | Calendar и AddressBook — `isDefault`, `isSubscribed`, `isVisible`, оповещения по умолчанию | jmap | A | jmap-20 | ready | CTR-56,JMAP-27,JMAP-25 |
+| [JMAP-34](JMAP-34.md) | ContactCard — перенос между книгами, запрос по индексу, тесты на корпусе vCard | jmap | A | jmap-20 | done | CTR-54,KIT-09,JMAP-26 |
+| [JMAP-35](JMAP-35.md) | `SieveScript/validate` и `/set` — проверка с пределами секции `sieve` | jmap | A | jmap-20 | done | JMAP-24,APP-26 |
+| [JMAP-36](JMAP-36.md) | Calendar и AddressBook — `isDefault`, `isSubscribed`, `isVisible`, оповещения по умолчанию | jmap | A | jmap-20 | done | CTR-56,JMAP-27,JMAP-25 |
 | [ADM-21](ADM-21.md) | очередь модерации — страницы по курсору | admin | A | admin-15 | todo | CTR-55,META-59 |
 | [APP-38](APP-38.md) | подключения хвостов Ф2 в узле — адреса для CalDAV, темы писем, пределы Sieve в JMAP | app | A | app-36 | todo | DAV-23,META-57,ADM-19,JMAP-35,APP-29,APP-27 |
 | [CTR-58](CTR-58.md) | признак «скрыта из GAL» у учётной записи каталога | contracts | B | contracts-40 | done | — |
@@ -746,9 +746,9 @@
 | [SIEVE-12](SIEVE-12.md) | адрес клиента во входе ManageSieve | sieve | A | sieve-05 | done | CTR-57 |
 | [JMAP-38](JMAP-38.md) | JMAP Principal: тип `resource` для переговорных и оборудования | jmap | A | jmap-22 | ready | JMAP-30,CTR-48 |
 | [CTR-60](CTR-60.md) | `DavStore` — глобальная адресная книга организации | contracts | B | contracts-41 | done | CTR-45,CTR-58 |
-| [META-63](META-63.md) | книга GAL в PostgreSQL | meta | B | meta-39 | todo | CTR-60 |
+| [META-63](META-63.md) | книга GAL в PostgreSQL | meta | B | meta-39 | done | CTR-60 |
 | [DAV-29](DAV-29.md) | CardDAV: книга GAL из `DavStore` | dav | A | dav-09 | ready | CTR-60,DAV-27,DAV-28 |
-| [JMAP-39](JMAP-39.md) | JMAP Contacts: книга GAL | jmap | A | jmap-23 | todo | CTR-60,JMAP-34 |
+| [JMAP-39](JMAP-39.md) | JMAP Contacts: книга GAL | jmap | A | jmap-23 | ready | CTR-60,JMAP-34 |
 | [APP-49](APP-49.md) | узел: заполнение книги GAL | app | A | app-41 | todo | DAV-29,META-63,JMAP-39 |
 | [DEPS-10](DEPS-10.md) | `tower-http` (CORS) для `tp-admin` | deps | B | deps-10 | done | DEPS-05 |
 | [ADM-24](ADM-24.md) | CORS в Admin API для консоли на отдельном веб-сервере | admin | A | admin-17 | done | ADM-15,DEPS-10 |
@@ -815,5 +815,6 @@
 
 | Задача | Суть | Полоса | Класс | Зависит |
 |---|---|---|---|---|
+| [APP-65](APP-65.md) | пределы Sieve узла для JMAP — те же, что у ManageSieve | app | A | JMAP-35 |
 | [AUTH-09](AUTH-09.md) | пароли приложений на контракте AppPasswordStore | auth | A | CTR-22 |
 | [CTR-22](CTR-22.md) | контракт AppPasswordStore (пароли приложений) | contracts | B | CTR-19,AUTH-02 |
