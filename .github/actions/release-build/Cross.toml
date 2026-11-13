@@ -15,7 +15,18 @@ pre-build = [
     "mkdir -p /opt/gssapi/include",
     "ln -s /usr/include/gssapi /usr/include/gssapi.h /opt/gssapi/include/",
     "ln -s \"/usr/lib/$m\" /opt/gssapi/lib",
+    # Встроенные заголовки clang (stddef.h): каталог ресурсов libclang 8 сам не находит; имя без номера версии.
+    "ln -s /usr/lib/llvm-8/lib/clang/*/include /opt/clang-include",
+    "test -f /opt/clang-include/stddef.h",
 ]
 
 [build.env]
 passthrough = ["LIBCLANG_PATH=/usr/lib/llvm-8/lib", "LIBGSSAPI_PREFIX=/opt/gssapi"]
+
+# bindgen берёт BINDGEN_EXTRA_CLANG_ARGS_<цель> вместо общей переменной: для aarch64 образ cross задаёт в ней
+# --sysroot, она повторяется здесь.
+[target.x86_64-unknown-linux-gnu.env]
+passthrough = ["BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu=-isystem /opt/clang-include"]
+
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = ["BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=/usr/aarch64-linux-gnu -isystem /opt/clang-include"]
