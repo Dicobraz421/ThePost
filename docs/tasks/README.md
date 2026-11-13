@@ -596,6 +596,16 @@
 | [DEP-53](DEP-53.md) | развёртывание: KRB5RCACHEDIR — каталог кэша повторов Kerberos узла | deploy | A | deploy-39 | done | SYS-16 |
 | [DOC-06](DOC-06.md) | INSTALL: `admin transport domain` вместо `admin domain`, вход `admin login --oidc` | docs | A | docs-06 | done | ADM-38,ADM-39 |
 | [DEP-54](DEP-54.md) | развёртывание: принципал `pop/<узел>` в keytab для входа GSSAPI по POP3 | deploy | A | deploy-40 | done | DEP-39 |
+| [DEPS-14](DEPS-14.md) | зависимости текстового интерфейса — `ratatui`, `crossterm` | deps | B | deps-14 | ready | — |
+| [ADM-44](ADM-44.md) | клиент Admin API — общий крейт для CLI и текстового интерфейса | admin | B | admin-30 | ready | — |
+| [TUI-01](TUI-01.md) | каркас текстового интерфейса — две панели, клавиши, вход | tui | A | tui-01 | todo | DEPS-14,ADM-44 |
+| [TUI-02](TUI-02.md) | общий движок списков и форм по схеме Admin API | tui | A | tui-01 | todo | TUI-01 |
+| [DEP-55](DEP-55.md) | метка «управляется Ansible/Helm» в config.yaml | deploy | A | deploy-41 | ready | — |
+| [TUI-03](TUI-03.md) | раскладки главных разделов | tui | A | tui-02 | todo | TUI-02 |
+| [TUI-04](TUI-04.md) | конфигурация узла в текстовом интерфейсе | tui | A | tui-02 | todo | TUI-02,DEP-55 |
+| [TUI-05](TUI-05.md) | подкоманда `thepost admin tui` в узле | app | A | app-65 | todo | TUI-01 |
+| [CI-16](CI-16.md) | покрытие Admin API тремя клиентами | ci | B | ci-14 | todo | TUI-02 |
+| [DOC-08](DOC-08.md) | руководство по текстовому интерфейсу | docs | A | docs-08 | todo | TUI-03,TUI-04 |
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | done | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | done | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | done | — |
@@ -834,5 +844,10 @@
 
 | Задача | Суть | Полоса | Класс | Зависит |
 |---|---|---|---|---|
+| [ADM-41](ADM-41.md) | вход администратора по паролю | admin | B | — |
+| [ADM-42](ADM-42.md) | псевдонимы и скрытие из книги «Организация» учётной записи без LDAP — Admin API, CLI, консоль | admin | B | — |
 | [AUTH-09](AUTH-09.md) | пароли приложений на контракте AppPasswordStore | auth | A | CTR-22 |
 | [CTR-22](CTR-22.md) | контракт AppPasswordStore (пароли приложений) | contracts | B | CTR-19,AUTH-02 |
+| [DAV-36](DAV-36.md) | `dav.schedule_keep_processed` по умолчанию включён | dav | A | DAV-32,APP-53 |
+| [DOC-07](DOC-07.md) | ожидания APP-28 и CMP-10 по `inbox/`/`outbox/` и ленте уведомлений; значение по умолчанию в INSTALL | docs | A | DAV-36 |
+| [META-80](META-80.md) | почтовые контакты в каталоге PostgreSQL (`Directory::contacts_since`) | meta | A | META-65 |
