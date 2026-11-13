@@ -1544,8 +1544,9 @@ mod tests {
     }
 
     /// FIX-02: письмо внешнего отправителя в модерируемую группу узла (`PgMeta`) → Admin API узла (`Services::admin`,
-    /// сессия `admin init`): список с `include=subject` отдаёт темы писем (APP-38); `approve` — 204 (было 500 «доставка решений ещё не подключена»), письмо у каждого
-    /// участника, повтор — 404; `reject` — 204, DSN отправителю в очереди исходящей почты.
+    /// сессия `admin init`): список с `include=subject` отдаёт темы писем (APP-38); `approve` — 204 (было 500
+    /// «доставка решений ещё не подключена»), письмо у каждого участника, повтор — 404; `reject` — 204, DSN
+    /// отправителю в очереди исходящей почты.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn moderation_decisions_through_admin_api() {
         use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
