@@ -12,8 +12,8 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 263/298 | 370/416 | в работе, 89 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
-| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 88/106 | 149/178 | в работе, 84 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 272/302 | 379/420 | в работе, 90 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 93/106 | 156/178 | в работе, 88 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 1/2 | 1/2 | в работе, 50 % карточек | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
 
@@ -303,7 +303,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ sys-09 | SYS-14 | A | deps-13 | 2 |
 | ✅ contracts-50 (ветка `x/contracts-50`) | CTR-73, CTR-74, CTR-76, CTR-77, CTR-78 | B | contracts-23 | 1 |
 | ✅ meta-48 | META-72, META-75 | A | contracts-50 | 3 |
-| smtp-23 | SMTP-42 | A | meta-48 | 4 |
+| ✅ smtp-23 | SMTP-42 | A | meta-48 | 4 |
 | ✅ mailstore-14 | MS-20 | A | contracts-50, mailstore-10 | 1 |
 
 ### Синк 12.11, часть 2 — этап 3: сессии Admin API в PostgreSQL, роли PKI OpenBao (решения 71, 77)
@@ -568,11 +568,15 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ auth-14 | AUTH-19 | A | auth-09 | 1 |
 | ✅ console-08 | UI-17 | A | console-05 | 1 |
 | ✅ app-62 | APP-66 | A | contracts-50 | 2 |
-| app-63 | APP-67 | A | mailstore-14 | 2 |
-| admin-26 | ADM-40 | A | console-08 | 3 |
-| platform-23 | PLT-34 | A | auth-14 | 2 |
-| contracts-55 (ветка `x/contracts-55`) | CTR-83 | B | meta-41 | 3 |
-| dav-13 | DAV-35 | A | dav-10 | 4 |
+| ✅ app-63 | APP-67 | A | mailstore-14 | 2 |
+| ✅ admin-26 | ADM-40 | A | console-08 | 3 |
+| ✅ platform-23 | PLT-34 | A | auth-14 | 2 |
+| ✅ contracts-55 (ветка `x/contracts-55`) | CTR-83 | B | meta-41 | 3 |
+| ✅ dav-13 | DAV-35 | A | dav-10 | 4 |
+| ✅ auth-15 | AUTH-20 | A | platform-23 | 1 |
+| ✅ smtp-27 | SMTP-46 | A | platform-23 | 1 |
+| sys-11 | SYS-16 | A | deploy-29 | 2 |
+| console-09 | UI-18 | A | admin-20 | 1 |
 | ✅ app-47 | APP-54 | A | — | 2 |
 | ✅ contracts-46 (ветка `x/contracts-46`) | CTR-25, CTR-67, CTR-68, CTR-70 | B | contracts-37 | 1 |
 | ✅ contracts-51 (ветка `x/contracts-51`) | CTR-79 | B | contracts-46 | 1 |
@@ -602,7 +606,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ smtp-22 | FIX-08 | A | — | 4 |
 | admin-25 | ADM-37, ADM-38, ADM-39 | A | app-39 | 3 |
 | ✅ blob-10 | BLOB-17 | A | — | 4 |
-| deploy-35 | DEP-49 | A | app-39, app-37 | 4 |
+| ✅ deploy-35 | DEP-49 | A | app-39, app-37 | 4 |
 | docs-05 | DOC-05 | A | deploy-35 | 1 |
 | ✅ app-50 | APP-56 | A | auth-12 | 2 |
 | ✅ contracts-48 (ветка `x/contracts-48`) | CTR-72 | B | — | 1 |
@@ -680,7 +684,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | meta-37 (ветка `x/meta-37`) | META-57, META-58, META-59, META-60 | A/B | contracts-38, meta-30 | 3 |
 | ✅ dav-07 | DAV-23, DAV-24, DAV-25 | A | contracts-38, dav-03 | 4 |
 | ✅ jmap-20 | JMAP-34, JMAP-35, JMAP-36 | A | contracts-38, testkit-06, jmap-17, app-25 | 3 |
-| admin-15 | ADM-21 | A | contracts-38, meta-37, admin-14 | 3 |
+| ✅ admin-15 | ADM-21 | A | contracts-38, meta-37, admin-14 | 3 |
 | ✅ app-36 | APP-38 | A | dav-07, meta-37, admin-13, jmap-20, app-28, app-26 | 2 |
 | ✅ contracts-40 (ветка `x/contracts-40`) | CTR-58 | B | — | 1 |
 | ✅ auth-11 | AUTH-16 | A | contracts-40 | 1 |
@@ -707,9 +711,9 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ deploy-28 | DEP-38 | A | app-26 | 4 |
 | ✅ deps-12 (ветка `x/deps-12`) | DEPS-12 | B | auth-08 | 1 |
 | ✅ ci-10 (ветка `x/ci-10`) | CI-12 | B | deps-12 | 1 |
-| deploy-29 | DEP-39 | A | deps-12 | 4 |
+| ✅ deploy-29 | DEP-39 | A | deps-12 | 4 |
 | docs-03 | DOC-03 | A | deploy-29 | 1 |
-| admin-20 | ADM-30, ADM-31 | A | admin-17, admin-13, ci-06 | 3 |
+| ✅ admin-20 | ADM-30, ADM-31 | A | admin-17, admin-13, ci-06 | 3 |
 | ✅ contracts-44 (ветка `x/contracts-44`) | CTR-63, CTR-64 | B | — | 1 |
 | ✅ meta-42 | META-66, META-67 | A | contracts-44 | 3 |
 | ✅ contracts-52 (ветка `x/contracts-52`) | CTR-80 | B | contracts-23 | 1 |
@@ -717,14 +721,14 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ contracts-53 (ветка `x/contracts-53`) | CTR-81 | B | — | 3 |
 | ✅ imap-13 | IMAP-23 | A | contracts-53 | 3 |
 | jmap-26 | JMAP-43 | A | contracts-53 (отложена: в JMAP нет доступа к чужим ящикам — до карточки доступа) | 3 |
-| admin-21 | ADM-32 | A | contracts-44, mailstore-12, admin-13 | 3 |
+| ✅ admin-21 | ADM-32 | A | contracts-44, mailstore-12, admin-13 | 3 |
 | ✅ imap-12 | IMAP-22 | A | contracts-44 | 2 |
 | ✅ jmap-24 | JMAP-41 | A | contracts-44 | 3 |
 | ✅ console-06 | UI-14, UI-15 | A | console-03, console-05, admin-13 | 1 |
 | ✅ contracts-45 (ветка `x/contracts-45`) | CTR-62, CTR-65, CTR-66 | B | contracts-38 | 1 |
 | ✅ meta-43 | META-68, META-69 | A | contracts-45, meta-32 | 3 |
 | ✅ dav-10 | DAV-30, DAV-31, DAV-32 | A | contracts-45, dav-04 | 4 |
-| jmap-25 | JMAP-40, JMAP-42 | A | dav-10, contracts-45, jmap-18 | 3 |
+| ✅ jmap-25 | JMAP-40, JMAP-42 | A | dav-10, contracts-45, jmap-18 | 3 |
 | ✅ smtp-18 | SMTP-37 | A | contracts-45, smtp-13 | 4 |
 | ✅ app-46 | APP-53 | A | jmap-18, dav-10 | 2 |
 | smtp-19 | SMTP-38 | A | smtp-13, contracts-35 | 4 |

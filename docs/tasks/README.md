@@ -300,7 +300,7 @@
 | [CTR-78](CTR-78.md) | атомарная отметка «ящик удаляется» | contracts | B | contracts-50 | done | — |
 | [META-72](META-72.md) | очередь: `next_due` и сигнал в PostgreSQL | meta | A | meta-48 | done | CTR-73,CTR-74 |
 | [META-75](META-75.md) | архив и отключённые ящики в PostgreSQL | meta | A | meta-48 | done | CTR-76,CTR-77,CTR-78 |
-| [SMTP-42](SMTP-42.md) | smtp-out без опроса: сигнал очереди и таймер ближайшего срока | smtp | A | smtp-23 | ready | META-72 |
+| [SMTP-42](SMTP-42.md) | smtp-out без опроса: сигнал очереди и таймер ближайшего срока | smtp | A | smtp-23 | done | META-72 |
 | [MS-20](MS-20.md) | отключённые ящики: воркер на сигнале | mailstore | A | mailstore-14 | done | CTR-77 |
 
 ## Ф1 · Синк 12.11, часть 2 — этап 3: сессии Admin API в PostgreSQL, роли PKI OpenBao (решения 71, 77)
@@ -583,11 +583,15 @@
 | [AUTH-19](AUTH-19.md) | защита от перебора: адрес `::ffff:a.b.c.d` — как IPv4 | auth | A | auth-14 | done | — |
 | [UI-17](UI-17.md) | консоль: экраны операций ADM-10 — адресная книга, оргструктура, отключённые ящики, аудит ящиков | console | A | console-08 | done | ADM-10,UI-15 |
 | [APP-66](APP-66.md) | шина узла — обработчику очереди smtp-out | app | A | app-62 | done | CTR-73 |
-| [APP-67](APP-67.md) | — | — | — | app-63 | ready | — |
-| [ADM-40](ADM-40.md) | `GET` политики аудита ящиков организации | admin | A | admin-26 | ready | — |
-| [PLT-34](PLT-34.md) | адрес клиента — в канонической форме при приёме соединения | platform | A | platform-23 | ready | — |
-| [CTR-83](CTR-83.md) | признак «скрыта из книги «Организация»» у учётной записи без LDAP | contracts | B | contracts-55 | ready | — |
-| [DAV-35](DAV-35.md) | планирование — вложенные группы в участниках | dav | A | dav-13 | ready | — |
+| [APP-67](APP-67.md) | воркер отключённых ящиков в роли maintenance, истечение корзины в /metrics | app | A | app-63 | done | MS-20,APP-52 |
+| [ADM-40](ADM-40.md) | `GET` политики аудита ящиков организации | admin | A | admin-26 | done | — |
+| [PLT-34](PLT-34.md) | адрес клиента — в канонической форме при приёме соединения | platform | A | platform-23 | done | — |
+| [CTR-83](CTR-83.md) | признак «скрыта из книги «Организация»» у учётной записи без LDAP | contracts | B | contracts-55 | done | — |
+| [DAV-35](DAV-35.md) | планирование — вложенные группы в участниках | dav | A | dav-13 | done | — |
+| [AUTH-20](AUTH-20.md) | защита от перебора — без своей нормализации адреса | auth | A | auth-15 | done | PLT-34 |
+| [SMTP-46](SMTP-46.md) | адрес клиента — без нормализации в потребителях; `XCLIENT`/`XFORWARD ADDR` — в канонической форме | smtp | A | smtp-27 | done | PLT-34 |
+| [SYS-16](SYS-16.md) | Landlock — кэш повторов Kerberos для входа GSSAPI | sys | A | sys-11 | ready | — |
+| [UI-18](UI-18.md) | консоль — журнал аудита на фильтрах хранилища | console | A | console-09 | ready | — |
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | done | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | done | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | done | — |
@@ -627,8 +631,8 @@
 | [ADM-38](ADM-38.md) | CLI: политики, группы, корзина, аудит, журнал доставки, транспорт | admin | A | admin-25 | ready | APP-22 |
 | [ADM-39](ADM-39.md) | CLI: `thepost admin login --oidc` | admin | A | admin-25 | ready | APP-42 |
 | [BLOB-17](BLOB-17.md) | `verify`: раздельные счётчики «пропал» и «неверный размер» | blob | A | blob-10 | done | BLOB-14 |
-| [DEP-49](DEP-49.md) | эталонные конфигурации: `maintenance.*` и `cli.oidc.*` | deploy | A | deploy-35 | ready | APP-44,APP-39 |
-| [DOC-05](DOC-05.md) | справочник администратора: `maintenance.*` и `cli.oidc.*` | docs | A | docs-05 | todo | DEP-49 |
+| [DEP-49](DEP-49.md) | эталонные конфигурации: `maintenance.*` и `cli.oidc.*` | deploy | A | deploy-35 | done | APP-44,APP-39 |
+| [DOC-05](DOC-05.md) | справочник администратора: `maintenance.*` и `cli.oidc.*` | docs | A | docs-05 | ready | DEP-49 |
 | [APP-56](APP-56.md) | узел: OIDC с ключом из хранилища секретов | app | A | app-50 | done | AUTH-17 |
 | [CTR-72](CTR-72.md) | `AccountStore::by_external_id` — обязательный метод | contracts | B | contracts-48 | done | — |
 
@@ -747,7 +751,7 @@
 | [JMAP-34](JMAP-34.md) | ContactCard — перенос между книгами, запрос по индексу, тесты на корпусе vCard | jmap | A | jmap-20 | done | CTR-54,KIT-09,JMAP-26 |
 | [JMAP-35](JMAP-35.md) | `SieveScript/validate` и `/set` — проверка с пределами секции `sieve` | jmap | A | jmap-20 | done | JMAP-24,APP-26 |
 | [JMAP-36](JMAP-36.md) | Calendar и AddressBook — `isDefault`, `isSubscribed`, `isVisible`, оповещения по умолчанию | jmap | A | jmap-20 | done | CTR-56,JMAP-27,JMAP-25 |
-| [ADM-21](ADM-21.md) | очередь модерации — страницы по курсору | admin | A | admin-15 | todo | CTR-55,META-59 |
+| [ADM-21](ADM-21.md) | очередь модерации — страницы по курсору | admin | A | admin-15 | done | CTR-55,META-59 |
 | [APP-38](APP-38.md) | подключения хвостов Ф2 в узле — адреса для CalDAV, темы писем, пределы Sieve в JMAP | app | A | app-36 | done | DAV-23,META-57,ADM-19,JMAP-35,APP-29,APP-27 |
 | [CTR-58](CTR-58.md) | признак «скрыта из GAL» у учётной записи каталога | contracts | B | contracts-40 | done | — |
 | [AUTH-16](AUTH-16.md) | LDAP: атрибут «скрыта из GAL» у учётной записи | auth | A | auth-11 | done | CTR-58 |
@@ -782,10 +786,10 @@
 | [DEP-38](DEP-38.md) | ManageSieve в поставке: секция и порт 4190 | deploy | A | deploy-28 | done | APP-27 |
 | [DEPS-12](DEPS-12.md) | фича `gssapi` в сборке узла | deps | B | deps-12 | done | AUTH-13 |
 | [CI-12](CI-12.md) | libkrb5 в CI, выпуск и бета с GSSAPI | ci | B | ci-10 | done | DEPS-12 |
-| [DEP-39](DEP-39.md) | образ и эталоны: libkrb5 для GSSAPI | deploy | A | deploy-29 | ready | DEPS-12 |
-| [DOC-03](DOC-03.md) | PREREQUISITES: Kerberos — принципалы служб и keytab | docs | A | docs-03 | todo | DEP-39 |
-| [ADM-30](ADM-30.md) | журнал аудита: фильтры `actor`, `method`, `route`; точные схемы транспорта | admin | A | admin-20 | ready | ADM-27 |
-| [ADM-31](ADM-31.md) | CLI: блокировка и изменение учётной записи | admin | A | admin-20 | ready | ADM-18,CI-07 |
+| [DEP-39](DEP-39.md) | образ и эталоны: libkrb5 для GSSAPI | deploy | A | deploy-29 | done | DEPS-12 |
+| [DOC-03](DOC-03.md) | PREREQUISITES: Kerberos — принципалы служб и keytab | docs | A | docs-03 | ready | DEP-39 |
+| [ADM-30](ADM-30.md) | журнал аудита: фильтры `actor`, `method`, `route`; точные схемы транспорта | admin | A | admin-20 | done | ADM-27 |
+| [ADM-31](ADM-31.md) | CLI: блокировка и изменение учётной записи | admin | A | admin-20 | done | ADM-18,CI-07 |
 | [CTR-63](CTR-63.md) | `AccountStore::by_ids` — учётные записи по списку идентификаторов | contracts | B | contracts-44 | done | — |
 | [CTR-64](CTR-64.md) | сигнал `AccountDisabled` — вход учётной записи запрещён | contracts | B | contracts-44 | done | — |
 | [META-66](META-66.md) | `by_ids` в PostgreSQL | meta | A | meta-42 | done | CTR-63 |
@@ -795,7 +799,7 @@
 | [CTR-81](CTR-81.md) | действие «поиск» в журнале аудита ящика | contracts | B | contracts-53 | done | CTR-35 |
 | [IMAP-23](IMAP-23.md) | поиск по тексту в чужом ящике — в журнал аудита | imap | A | imap-13 | done | CTR-81 |
 | [JMAP-43](JMAP-43.md) | Email/query по тексту в чужом ящике — в журнал аудита | jmap | A | jmap-26 | ready | CTR-81 |
-| [ADM-32](ADM-32.md) | темы скрытых писем и имена участников групп одним запросом | admin | A | admin-21 | ready | CTR-63,MS-19,ADM-19,ADM-20 |
+| [ADM-32](ADM-32.md) | темы скрытых писем и имена участников групп одним запросом | admin | A | admin-21 | done | CTR-63,MS-19,ADM-19,ADM-20 |
 | [IMAP-22](IMAP-22.md) | заблокированная учётная запись — закрытие сеансов IMAP и POP3 | imap | A | imap-12 | done | CTR-64 |
 | [JMAP-41](JMAP-41.md) | заблокированная учётная запись — закрытие push JMAP | jmap | A | jmap-24 | done | CTR-64 |
 | [UI-14](UI-14.md) | консоль: страница «нет доступа» | console | A | console-06 | done | UI-09 |
@@ -808,8 +812,8 @@
 | [DAV-30](DAV-30.md) | планирование: участник по псевдониму и адресу группы | dav | A | dav-10 | done | CTR-62,DAV-15 |
 | [DAV-31](DAV-31.md) | планирование: частные случаи RFC 6638 | dav | A | dav-10 | done | DAV-16 |
 | [DAV-32](DAV-32.md) | открытый `index::for_write`; срок обработанных сообщений входящих | dav | A | dav-10 | done | DAV-15 |
-| [JMAP-40](JMAP-40.md) | календарь из JMAP: `Schedule-Tag` и занятость | jmap | A | jmap-25 | ready | DAV-32 |
-| [JMAP-42](JMAP-42.md) | `CalendarEventNotification/query` и изменения по журналу входящих | jmap | A | jmap-25 | ready | CTR-65,JMAP-31 |
+| [JMAP-40](JMAP-40.md) | календарь из JMAP: `Schedule-Tag` и занятость | jmap | A | jmap-25 | done | DAV-32 |
+| [JMAP-42](JMAP-42.md) | `CalendarEventNotification/query` и изменения по журналу входящих | jmap | A | jmap-25 | done | CTR-65,JMAP-31 |
 | [SMTP-37](SMTP-37.md) | журнал доставки: запись о приёме iTIP | smtp | A | smtp-18 | done | CTR-66,SMTP-33 |
 | [APP-53](APP-53.md) | узел: планирование в JMAP и очистка входящих | app | A | app-46 | done | JMAP-31,DAV-32 |
 | [SMTP-38](SMTP-38.md) | iMIP: отправитель «от имени» (`SENT-BY`) | smtp | A | smtp-19 | ready | SMTP-33,CTR-48 |
