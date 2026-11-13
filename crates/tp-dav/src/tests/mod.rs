@@ -13,7 +13,7 @@ use tp_contracts::dav::{Collection, CollectionKind, DavStore};
 use tp_contracts::meta::AccountScope;
 use tp_testkit::{FakeAuthenticator, FakeDirectory, MemDav, MemGroups, principal};
 
-use crate::{DavConfig, Deps, GalDeps, gal, router};
+use crate::{DavConfig, Deps, GalDeps, router};
 
 mod auth;
 mod caldav_home;
@@ -92,13 +92,13 @@ impl Env {
         }
     }
 
-    /// Книга GAL организации из каталога [`Env::dir`] и групп [`Env::groups`] ([`gal::sync`]).
+    /// Книга GAL организации из каталога [`Env::dir`] и групп [`Env::groups`] ([`crate::gal::sync`]).
     pub(crate) async fn sync_gal(&self) {
         let source = GalDeps {
             directory: Arc::new(self.dir.clone()),
             groups: Some(Arc::new(self.groups.clone())),
         };
-        gal::sync(&source, &self.store, self.scope.tenant, &self.cfg)
+        crate::gal::sync(&source, &self.store, self.scope.tenant, &self.cfg)
             .await
             .expect("gal::sync");
     }
