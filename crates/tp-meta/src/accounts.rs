@@ -11,13 +11,14 @@ use tp_contracts::groups::GroupStore;
 use tp_contracts::meta::{
     Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
     DisabledAccount, ExistingContent, QuotaUsage, account_aliases, account_disabled,
+    disabled_mailbox_changed,
 };
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use uuid::Uuid;
 
 use crate::PgMeta;
 use crate::mailboxes;
-use crate::schema::{begin, db_err, to_u64};
+use crate::schema::{begin, db_err};
 use crate::shards::{ReadIntent, ShardId};
 
 /// `AccountStore::list` без верхней границы префикса (пустой префикс или одни `U+10FFFF`): `$1` — организация,
@@ -394,7 +395,8 @@ impl AccountStore for PgMeta {
         }
     }
 
-    /// Лимит (`limit_bytes`) разрешает `PolicyResolver`; здесь — только использование.
+    /// Лимит (`limit_bytes`) разрешает `PolicyResolver`; здесь — только использование основной квоты (письма вне
+    /// ветки архива, CTR-76).
     async fn quota(&self, tenant: TenantId, id: AccountId) -> Result<QuotaUsage> {
         self.idempotent(|| async move {
             let scope = AccountScope {
@@ -402,34 +404,27 @@ impl AccountStore for PgMeta {
                 account: id,
             };
             let db = self.box_db(scope).await?;
-            if db.shard != ShardId::MAIN {
-                // Учётная запись найдена в каталоге (её шард); письма — на шарде.
-                let (used_bytes, messages) = crate::retention::box_usage(&db.pool, scope).await?;
-                return Ok(QuotaUsage {
-                    used_bytes,
-                    messages,
-                    limit_bytes: None,
-                });
+            if db.shard == ShardId::MAIN {
+                // Без справочника шардов `box_db` учётную запись не ищет: её нет — `NotFound`.
+                let mut tx = begin(&self.pool, tenant).await?;
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2)",
+                )
+                .bind(tenant.as_uuid())
+                .bind(id.as_uuid())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                crate::commits::commit(tx).await?;
+                if !exists {
+                    return Err(Error::NotFound);
+                }
             }
-            let mut tx = begin(&self.pool, tenant).await?;
-            let row: Option<(i64, i64)> = sqlx::query_as(
-                "SELECT coalesce(sum(m.size), 0)::bigint, count(m.message_id)
-             FROM accounts a
-             LEFT JOIN messages m ON m.tenant_id = a.tenant_id AND m.account_id = a.account_id
-                                 AND m.hidden_at IS NULL
-             WHERE a.tenant_id = $1 AND a.account_id = $2
-             GROUP BY a.account_id",
-            )
-            .bind(tenant.as_uuid())
-            .bind(id.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            crate::commits::commit(tx).await?;
-            let (used, messages) = row.ok_or(Error::NotFound)?;
+            let (used_bytes, messages) =
+                crate::retention::box_usage(&db.pool, scope, false).await?;
             Ok(QuotaUsage {
-                used_bytes: to_u64(used)?,
-                messages: to_u64(messages)?,
+                used_bytes,
+                messages,
                 limit_bytes: None,
             })
         })
@@ -449,16 +444,34 @@ impl AccountStore for PgMeta {
         until: OffsetDateTime,
     ) -> Result<()> {
         self.set_disabled(tenant, id, Some(until)).await?;
-        self.signal(account_disabled(AccountScope {
+        let scope = AccountScope {
             tenant,
             account: id,
-        }))
-        .await;
+        };
+        self.signal(account_disabled(scope)).await;
+        self.signal(disabled_mailbox_changed(scope)).await;
         Ok(())
     }
 
+    /// Отключённый восстановлен — сигнал `DisabledMailboxChanged` (CTR-77).
     async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
-        self.set_disabled(tenant, id, None).await
+        if self.set_disabled(tenant, id, None).await? {
+            self.signal(disabled_mailbox_changed(AccountScope {
+                tenant,
+                account: id,
+            }))
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn begin_removal(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        self.mark_removing(tenant, id, now).await
     }
 
     async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
@@ -480,7 +493,13 @@ impl AccountStore for PgMeta {
         to: AccountId,
         existing: Option<ExistingContent>,
     ) -> Result<Account> {
-        self.attach(tenant, disabled, to, existing).await
+        let account = self.attach(tenant, disabled, to, existing).await?;
+        self.signal(disabled_mailbox_changed(AccountScope {
+            tenant,
+            account: disabled,
+        }))
+        .await;
+        Ok(account)
     }
 
     async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {

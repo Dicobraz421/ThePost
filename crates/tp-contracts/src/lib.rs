@@ -9,6 +9,7 @@ pub mod addressbook;
 pub mod admin_audit;
 pub mod admin_token;
 pub mod app_password;
+pub mod archive;
 pub mod audit;
 pub mod auth;
 pub mod blob;

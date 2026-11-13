@@ -110,6 +110,7 @@ async fn retries_by_schedule_then_success() {
     let q = Queue::new(env.deps.clone());
     q.enqueue(
         TenantId::DEFAULT,
+        None,
         "alice@example.org",
         &["x@example.net".into(), "X@example.net".into()],
         Bytes::from_static(MAIL),
@@ -151,6 +152,7 @@ async fn recipients_grouped_by_domain_and_final_statuses() {
     Queue::new(env.deps.clone())
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &[
                 "a@example.com".into(),
@@ -207,6 +209,7 @@ async fn queue_metrics() {
     Queue::new(env.deps.clone())
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &[
                 "a@example.com".into(),
@@ -241,6 +244,7 @@ async fn stale_claim_is_skipped() {
     Queue::new(env.deps.clone())
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &["a@example.com".into()],
             Bytes::from_static(MAIL),
@@ -273,6 +277,7 @@ async fn enqueue_failure_releases_reference() {
     let r = q
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &[],
             Bytes::from_static(MAIL),
@@ -521,6 +526,7 @@ async fn worker_delivers_through_relay() {
     Queue::new(env.deps.clone())
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &["x@example.net".into(), "y@example.com".into()],
             Bytes::from_static(MAIL),
@@ -566,6 +572,7 @@ async fn failure_dsn_is_queued_before_completion() {
     Queue::new(env.deps.clone())
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &["x@example.net".into()],
             Bytes::from_static(MAIL),
@@ -598,6 +605,7 @@ async fn delay_dsn_once_and_expiry_status() {
     Queue::new(env.deps.clone())
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &["x@example.net".into()],
             Bytes::from_static(MAIL),
@@ -651,6 +659,7 @@ async fn success_dsn_only_on_request() {
     env.deps
         .put(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             rcpts,
             Bytes::from_static(MAIL),
@@ -735,6 +744,7 @@ async fn enqueue(env: &Env, rcpts: &[&str]) {
     Queue::new(env.deps.clone())
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &rcpts,
             Bytes::from_static(MAIL),
@@ -820,6 +830,10 @@ impl QueueStore for NoPostpone {
         self.0.enqueue(owner, msg).await
     }
 
+    async fn next_due(&self) -> Result<Option<OffsetDateTime>> {
+        self.0.next_due().await
+    }
+
     async fn claim(
         &self,
         now: OffsetDateTime,
@@ -894,6 +908,7 @@ async fn deferred_recipients_are_postponed_without_attempt() {
     Queue::new(deps)
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &["c@dead.example".to_owned()],
             Bytes::from_static(MAIL),

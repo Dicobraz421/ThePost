@@ -164,6 +164,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "delivery itip",
         include_str!("../migrations/0035_delivery_itip.sql"),
     ),
+    (
+        36,
+        "archive removal",
+        include_str!("../migrations/0036_archive_removal.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

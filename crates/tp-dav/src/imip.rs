@@ -151,7 +151,13 @@ impl ItipSender for ImipSender {
         msg.validate()?;
         let raw = message(msg, OffsetDateTime::now_utc())?;
         self.outbound
-            .submit(msg.sender.tenant, &msg.from, &msg.to, Bytes::from(raw))
+            .submit(
+                msg.sender.tenant,
+                Some(msg.sender.account),
+                &msg.from,
+                &msg.to,
+                Bytes::from(raw),
+            )
             .await
     }
 }

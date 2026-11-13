@@ -14,12 +14,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
+use tp_contracts::bus::EventBus;
 use tp_contracts::events::{CoreEvent, CoreEventKind};
 use tp_contracts::meta::{
     Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
     ChangeLog, Changes, DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate,
     Inserted, Mailbox, MailboxStatus, MailboxStore, Message, MessageChange, MessageQuery,
     MessageStore, NewMailbox, NewMessage, QuotaUsage, SpecialUse, account_aliases,
+    disabled_mailbox_changed,
 };
 use tp_contracts::retention::{PurgeOutcome, Restored};
 use tp_contracts::{
@@ -126,11 +128,66 @@ struct AccountData {
     state: AccountState,
 }
 
+/// Письмо-кандидат в архив (CTR-76): идентификатор, папка, момент получения.
+pub(crate) type ArchiveCandidate = (MessageId, MailboxId, OffsetDateTime);
+
+/// Шина сигналов [`MemMetadata`] (CTR-77): `None` — без сигналов.
+#[derive(Clone, Default)]
+struct Signals(Option<Arc<dyn EventBus>>);
+
+impl std::fmt::Debug for Signals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Signals(bus)"
+        } else {
+            "Signals(none)"
+        })
+    }
+}
+
 fn blob_keys(m: &Message) -> impl Iterator<Item = BlobKey> + '_ {
     std::iter::once(m.skeleton).chain(m.parts.iter().map(|p| p.blob))
 }
 
 impl AccountData {
+    /// Ветка архива (CTR-76): папка с ролью `\Archive` и все вложенные в неё.
+    pub(crate) fn archive_branch(&self) -> HashSet<MailboxId> {
+        let mut branch: HashSet<MailboxId> = self
+            .mailboxes
+            .values()
+            .filter(|m| m.mailbox.role == Some(SpecialUse::Archive))
+            .map(|m| m.mailbox.id)
+            .collect();
+        loop {
+            let before = branch.len();
+            for m in self.mailboxes.values() {
+                if m.mailbox.parent.is_some_and(|p| branch.contains(&p)) {
+                    branch.insert(m.mailbox.id);
+                }
+            }
+            if branch.len() == before {
+                return branch;
+            }
+        }
+    }
+
+    /// Использование квоты (CTR-76): письма ветки архива (`archive`) или вне её, без скрытых.
+    pub(crate) fn usage(&self, archive: bool) -> QuotaUsage {
+        let branch = self.archive_branch();
+        let (mut used_bytes, mut messages) = (0, 0);
+        for m in self.messages.values() {
+            if branch.contains(&m.message.mailbox) == archive {
+                used_bytes += m.message.size;
+                messages += 1;
+            }
+        }
+        QuotaUsage {
+            used_bytes,
+            messages,
+            limit_bytes: None,
+        }
+    }
+
     fn bump(&mut self) -> ModSeq {
         self.modseq = self.modseq.next();
         self.modseq
@@ -588,6 +645,7 @@ pub struct MemMetadata {
     /// Группы рассылки для [`AccountStore::by_address`] (CTR-62); `None` — только учётные записи.
     groups: Option<MemGroups>,
     trash_retention: Duration,
+    bus: Signals,
 }
 
 impl MemMetadata {
@@ -600,6 +658,23 @@ impl MemMetadata {
             blobs: None,
             groups: None,
             trash_retention: DEFAULT_TRASH_RETENTION,
+            bus: Signals::default(),
+        }
+    }
+
+    /// Публиковать `DisabledMailboxChanged` в `bus` после отключения, смены срока, восстановления и подключения
+    /// отключённого ящика (CTR-77), как реализация `tp-meta`.
+    pub fn with_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
+        self.bus = Signals(Some(bus));
+        self
+    }
+
+    async fn disabled_changed(&self, tenant: TenantId, account: AccountId) {
+        if let Some(bus) = &self.bus.0 {
+            // Сигнал после «фиксации»; потеря сигнала не отменяет изменение (at-most-once).
+            let _ = bus
+                .publish(disabled_mailbox_changed(AccountScope { tenant, account }))
+                .await;
         }
     }
 
@@ -731,6 +806,43 @@ impl MemMetadata {
                     .unwrap_or(time::Duration::MAX),
             ),
         )
+    }
+
+    /// Письма вне ветки архива и корзины у действующих ящиков всех организаций (CTR-76, [`crate::MemArchive`]):
+    /// учётная запись и её письма — идентификатор, папка, момент получения.
+    pub(crate) fn archive_candidates(&self) -> Vec<(Account, Vec<ArchiveCandidate>)> {
+        let st = lock(&self.state);
+        st.accounts
+            .values()
+            .filter(|a| a.state == AccountState::Active)
+            .map(|a| {
+                let branch = a.archive_branch();
+                let trash: HashSet<MailboxId> = a
+                    .mailboxes
+                    .values()
+                    .filter(|m| m.mailbox.role == Some(SpecialUse::Trash))
+                    .map(|m| m.mailbox.id)
+                    .collect();
+                let messages = a
+                    .messages
+                    .values()
+                    .map(|m| &m.message)
+                    .filter(|m| !branch.contains(&m.mailbox) && !trash.contains(&m.mailbox))
+                    .map(|m| (m.id, m.mailbox, m.received_at))
+                    .collect();
+                (a.account.clone(), messages)
+            })
+            .collect()
+    }
+
+    /// Использование квоты архива учётной записи (без лимита) и её домен (CTR-76).
+    pub(crate) fn archive_usage_of(&self, scope: AccountScope) -> Result<(QuotaUsage, DomainId)> {
+        let st = lock(&self.state);
+        let acc = st
+            .accounts
+            .get(&(scope.tenant, scope.account))
+            .ok_or(Error::NotFound)?;
+        Ok((acc.usage(true), acc.account.domain))
     }
 
     /// Элементы корзины: учётная запись `scope` или все (`None`).
@@ -958,6 +1070,72 @@ fn apply(op: &FlagOp, old: &Flags) -> Flags {
     }
 }
 
+impl MemMetadata {
+    /// Подключение отключённого ящика под одной блокировкой ([`AccountStore::attach_account`]).
+    fn attach_now(
+        &self,
+        tenant: TenantId,
+        disabled: AccountId,
+        to: AccountId,
+        existing: Option<ExistingContent>,
+    ) -> Result<Account> {
+        let mark = self.trash_mark();
+        let now = self.now_unix();
+        let mut st = lock(&self.state);
+        let from = st
+            .accounts
+            .get(&(tenant, disabled))
+            .ok_or(Error::NotFound)?;
+        let target = st.accounts.get(&(tenant, to)).ok_or(Error::NotFound)?;
+        if from.state == AccountState::Active || disabled == to {
+            return Err(Error::invalid("attach: mailbox is not disabled"));
+        }
+        if matches!(from.state, AccountState::Removing { .. })
+            || target.state != AccountState::Active
+        {
+            return Err(Error::Conflict);
+        }
+        let busy = !target.messages.is_empty() || !target.hidden.is_empty();
+        if busy && existing.is_none() {
+            return Err(Error::invalid(
+                "attach: в ящике учётной записи есть письма — выберите режим: keep (перенести в подключаемый \
+                 ящик) или delete (в корзину подключаемого ящика)",
+            ));
+        }
+        let src = st
+            .accounts
+            .remove(&(tenant, to))
+            .ok_or_else(|| Error::internal("учётная запись пропала"))?;
+        let Some(acc) = st.accounts.get_mut(&(tenant, disabled)) else {
+            st.accounts.insert((tenant, to), src);
+            return Err(Error::internal("учётная запись пропала"));
+        };
+        let mut fx = Effects::default();
+        if let (true, Some(mode)) = (busy, existing)
+            && let Err(e) = acc.absorb(&src, mode, mark, now, &mut fx)
+        {
+            st.accounts.insert((tenant, to), src);
+            return Err(e);
+        }
+        let identity = src.account;
+        acc.account.domain = identity.domain;
+        acc.account.login = identity.login;
+        acc.account.display_name = identity.display_name;
+        acc.account.external_id = identity.external_id;
+        acc.account.enabled = identity.enabled;
+        acc.state = AccountState::Active;
+        let account = acc.account.clone();
+        self.apply(
+            AccountScope {
+                tenant,
+                account: disabled,
+            },
+            fx,
+        );
+        Ok(account)
+    }
+}
+
 #[async_trait]
 impl AccountStore for MemMetadata {
     async fn get(&self, tenant: TenantId, id: AccountId) -> Result<Option<Account>> {
@@ -1137,11 +1315,7 @@ impl AccountStore for MemMetadata {
     async fn quota(&self, tenant: TenantId, id: AccountId) -> Result<QuotaUsage> {
         let st = lock(&self.state);
         let acc = st.accounts.get(&(tenant, id)).ok_or(Error::NotFound)?;
-        Ok(QuotaUsage {
-            used_bytes: acc.messages.values().map(|m| m.message.size).sum(),
-            messages: acc.messages.len() as u64,
-            limit_bytes: None,
-        })
+        Ok(acc.usage(false))
     }
 
     async fn account_state(&self, tenant: TenantId, id: AccountId) -> Result<AccountState> {
@@ -1155,21 +1329,53 @@ impl AccountStore for MemMetadata {
         id: AccountId,
         until: OffsetDateTime,
     ) -> Result<()> {
-        let mut st = lock(&self.state);
-        st.accounts
-            .get_mut(&(tenant, id))
-            .ok_or(Error::NotFound)?
-            .state = AccountState::Disabled { until };
+        {
+            let mut st = lock(&self.state);
+            let acc = st.accounts.get_mut(&(tenant, id)).ok_or(Error::NotFound)?;
+            if matches!(acc.state, AccountState::Removing { .. }) {
+                return Err(Error::Conflict);
+            }
+            acc.state = AccountState::Disabled { until };
+        }
+        self.disabled_changed(tenant, id).await;
         Ok(())
     }
 
     async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
-        let mut st = lock(&self.state);
-        st.accounts
-            .get_mut(&(tenant, id))
-            .ok_or(Error::NotFound)?
-            .state = AccountState::Active;
+        let was_disabled = {
+            let mut st = lock(&self.state);
+            let acc = st.accounts.get_mut(&(tenant, id)).ok_or(Error::NotFound)?;
+            match acc.state {
+                AccountState::Active => false,
+                AccountState::Disabled { .. } => {
+                    acc.state = AccountState::Active;
+                    true
+                }
+                AccountState::Removing { .. } => return Err(Error::Conflict),
+            }
+        };
+        if was_disabled {
+            self.disabled_changed(tenant, id).await;
+        }
         Ok(())
+    }
+
+    async fn begin_removal(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let mut st = lock(&self.state);
+        let acc = st.accounts.get_mut(&(tenant, id)).ok_or(Error::NotFound)?;
+        match acc.state {
+            AccountState::Disabled { until } if until <= now => {
+                acc.state = AccountState::Removing { until };
+                Ok(())
+            }
+            AccountState::Removing { .. } => Ok(()),
+            AccountState::Active | AccountState::Disabled { .. } => Err(Error::Conflict),
+        }
     }
 
     async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
@@ -1179,10 +1385,12 @@ impl AccountStore for MemMetadata {
             .values()
             .filter(|a| a.account.tenant == tenant)
             .filter_map(|a| match a.state {
-                AccountState::Disabled { until } => Some(DisabledAccount {
-                    account: a.account.clone(),
-                    until,
-                }),
+                AccountState::Disabled { until } | AccountState::Removing { until } => {
+                    Some(DisabledAccount {
+                        account: a.account.clone(),
+                        until,
+                    })
+                }
                 AccountState::Active => None,
             })
             .collect();
@@ -1200,7 +1408,9 @@ impl AccountStore for MemMetadata {
             .accounts
             .values()
             .filter_map(|a| match a.state {
-                AccountState::Disabled { until } if until <= now => {
+                AccountState::Disabled { until } | AccountState::Removing { until }
+                    if until <= now =>
+                {
                     Some((until, a.account.id, a.account.tenant))
                 }
                 _ => None,
@@ -1221,65 +1431,18 @@ impl AccountStore for MemMetadata {
         to: AccountId,
         existing: Option<ExistingContent>,
     ) -> Result<Account> {
-        let mark = self.trash_mark();
-        let now = self.now_unix();
-        let mut st = lock(&self.state);
-        let from = st
-            .accounts
-            .get(&(tenant, disabled))
-            .ok_or(Error::NotFound)?;
-        let target = st.accounts.get(&(tenant, to)).ok_or(Error::NotFound)?;
-        if from.state == AccountState::Active || disabled == to {
-            return Err(Error::invalid("attach: mailbox is not disabled"));
-        }
-        if target.state != AccountState::Active {
-            return Err(Error::Conflict);
-        }
-        let busy = !target.messages.is_empty() || !target.hidden.is_empty();
-        if busy && existing.is_none() {
-            return Err(Error::invalid(
-                "attach: в ящике учётной записи есть письма — выберите режим: keep (перенести в подключаемый \
-                 ящик) или delete (в корзину подключаемого ящика)",
-            ));
-        }
-        let src = st
-            .accounts
-            .remove(&(tenant, to))
-            .ok_or_else(|| Error::internal("учётная запись пропала"))?;
-        let Some(acc) = st.accounts.get_mut(&(tenant, disabled)) else {
-            st.accounts.insert((tenant, to), src);
-            return Err(Error::internal("учётная запись пропала"));
-        };
-        let mut fx = Effects::default();
-        if let (true, Some(mode)) = (busy, existing)
-            && let Err(e) = acc.absorb(&src, mode, mark, now, &mut fx)
-        {
-            st.accounts.insert((tenant, to), src);
-            return Err(e);
-        }
-        let identity = src.account;
-        acc.account.domain = identity.domain;
-        acc.account.login = identity.login;
-        acc.account.display_name = identity.display_name;
-        acc.account.external_id = identity.external_id;
-        acc.account.enabled = identity.enabled;
-        acc.state = AccountState::Active;
-        let account = acc.account.clone();
-        self.apply(
-            AccountScope {
-                tenant,
-                account: disabled,
-            },
-            fx,
-        );
+        let account = self.attach_now(tenant, disabled, to, existing)?;
+        self.disabled_changed(tenant, disabled).await;
         Ok(account)
     }
 
     async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {
         let mut st = lock(&self.state);
         let acc = st.accounts.get(&(tenant, id)).ok_or(Error::NotFound)?;
-        if acc.state == AccountState::Active {
-            return Err(Error::invalid("remove_disabled: mailbox is active"));
+        if !matches!(acc.state, AccountState::Removing { .. }) {
+            return Err(Error::invalid(
+                "remove_disabled: mailbox is not being removed (begin_removal)",
+            ));
         }
         if !acc.messages.is_empty() || !acc.hidden.is_empty() {
             return Err(Error::Conflict);
@@ -2019,6 +2182,20 @@ mod tests {
         };
         let meta = MemMetadata::default();
         crate::suite::account_state(&meta, &meta, &meta, &fx).await;
+    }
+
+    /// CTR-77, CTR-78: сигнал отключённого ящика и атомарная отметка удаления.
+    #[tokio::test]
+    async fn disabled_mailbox_suites() {
+        let fx = crate::suite::AccountStateFixture {
+            tenant: TenantId::DEFAULT,
+            domain: DomainId::new(),
+            domain_name: "example.org".into(),
+        };
+        let bus = Arc::new(crate::MemEventBus::new(64));
+        let meta = MemMetadata::default().with_bus(bus.clone());
+        crate::suite::lifecycle::disabled_mailbox_signals(&meta, bus.as_ref(), &fx).await;
+        crate::suite::lifecycle::account_removal(&meta, &fx).await;
     }
 
     fn key(n: u8) -> BlobKey {

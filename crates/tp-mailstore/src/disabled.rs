@@ -10,16 +10,18 @@
 //!   уменьшает он; объекты удаляет GC BLOB) → `AccountStore::remove_disabled`. Запрет хука хотя бы для одного письма
 //!   (Legal Hold, политика хранения) или его ошибка — ящик не трогается, срок переносится на
 //!   [`DisabledConfig::defer`] (`AccountStore::disable_account`): удаление необратимо, при сомнении ящик сохраняется.
-//!   Проход повторяем: прерванное удаление продолжается со следующего прохода (письма, уже перенесённые в корзину,
-//!   удаляются из неё), ящик, восстановленный до начала удаления, пропускается;
+//!   Начало удаления — атомарная отметка `AccountStore::begin_removal` (CTR-78): после неё восстановление и
+//!   подключение ящика — `Conflict`, а восстановленный раньше ящик отметку не получает и пропускается. Проход
+//!   повторяем: прерванное удаление удаляемого ящика продолжается со следующего прохода без повторного вопроса хуку
+//!   (письма, уже перенесённые в корзину, удаляются из неё);
 //! - восстановление ([`DisabledMailboxes::restore`]) и подключение к другой учётной записи
 //!   ([`DisabledMailboxes::attach`]): после `AccountStore::attach_account` письма могли оказаться в корзине
 //!   подключённого ящика, поэтому публикуется системный сигнал `TrashChanged` (таймер истечения корзины).
 //!
 //! Воркер не делает периодических проходов (SRS 2.8): один таймер на ближайший срок хранения. Срок сверяется при
 //! запуске, после прохода, после `restore` и `attach` этого объекта (и его клонов) и не реже [`DisabledConfig::max_wait`]:
-//! сигнала шины об отключении ящика в контрактах нет, отключение другим узлом или синхронизацией каталога воркер
-//! замечает при очередной сверке. После ошибки хранилища — повтор не раньше [`DisabledConfig::retry`].
+//! сигнал шины `DisabledMailboxChanged` (CTR-77) воркер пока не слушает (MS-17), отключение другим узлом или
+//! синхронизацией каталога он замечает при очередной сверке. После ошибки хранилища — повтор не раньше [`DisabledConfig::retry`].
 
 use std::future::Future;
 use std::sync::Arc;
@@ -277,14 +279,16 @@ impl DisabledMailboxes {
         }
     }
 
-    /// Срок хранения отключённого ящика; ящик действует или его нет — `None`.
+    /// Срок хранения отключённого (или удаляемого) ящика; ящик действует или его нет — `None`.
     async fn until(&self, scope: AccountScope) -> Result<Option<OffsetDateTime>> {
         match self
             .accounts
             .account_state(scope.tenant, scope.account)
             .await
         {
-            Ok(AccountState::Disabled { until }) => Ok(Some(until)),
+            Ok(AccountState::Disabled { until } | AccountState::Removing { until }) => {
+                Ok(Some(until))
+            }
             Ok(AccountState::Active) | Err(Error::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
@@ -299,19 +303,41 @@ impl DisabledMailboxes {
             .filter(|m| m.role != Some(SpecialUse::Trash))
             .map(|m| m.id)
             .collect();
-        if !self.allowed(scope, &boxes).await? {
-            let until = time::Duration::try_from(self.cfg().defer)
-                .ok()
-                .and_then(|d| now.checked_add(d))
-                .ok_or_else(|| Error::internal("срок отсрочки удаления ящика вне диапазона"))?;
-            self.accounts
-                .disable_account(scope.tenant, scope.account, until)
-                .await?;
-            return Ok(Outcome::Deferred);
-        }
-        // Перед необратимым шагом: ящик всё ещё отключён и срок не перенесён (восстановление, подключение).
-        if self.until(scope).await?.is_none_or(|until| until > now) {
+        let state = match self
+            .accounts
+            .account_state(scope.tenant, scope.account)
+            .await
+        {
+            Ok(state) => state,
+            Err(Error::NotFound) => return Ok(Outcome::Skipped),
+            Err(e) => return Err(e),
+        };
+        if state == AccountState::Active {
             return Ok(Outcome::Skipped);
+        }
+        // Удаляемый — удаление начато прежним проходом после разрешения хука: продолжается без повторной проверки.
+        if !matches!(state, AccountState::Removing { .. }) {
+            if !self.allowed(scope, &boxes).await? {
+                let until = time::Duration::try_from(self.cfg().defer)
+                    .ok()
+                    .and_then(|d| now.checked_add(d))
+                    .ok_or_else(|| Error::internal("срок отсрочки удаления ящика вне диапазона"))?;
+                self.accounts
+                    .disable_account(scope.tenant, scope.account, until)
+                    .await?;
+                return Ok(Outcome::Deferred);
+            }
+            // Перед необратимым шагом — отметка «удаляется» одной операцией с проверкой состояния (CTR-78): ящик
+            // восстановлен, подключён или срок перенесён — `Conflict`, ящик пропускается.
+            match self
+                .accounts
+                .begin_removal(scope.tenant, scope.account, now)
+                .await
+            {
+                Ok(()) => {}
+                Err(Error::Conflict | Error::NotFound) => return Ok(Outcome::Skipped),
+                Err(e) => return Err(e),
+            }
         }
         for mailbox in boxes {
             self.drain(scope, Source::Mailbox(mailbox)).await?;

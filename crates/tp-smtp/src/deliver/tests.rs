@@ -30,6 +30,7 @@ impl Outbound for Queue {
     async fn enqueue(
         &self,
         _tenant: TenantId,
+        _owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -39,6 +40,18 @@ impl Outbound for Queue {
             .expect("lock")
             .push((mail_from.to_owned(), rcpts.to_vec(), raw));
         Ok(())
+    }
+
+    async fn schedule(
+        &self,
+        _tenant: TenantId,
+        _owner: Option<AccountId>,
+        _mail_from: &str,
+        _rcpts: &[String],
+        _raw: Bytes,
+        _release_at: OffsetDateTime,
+    ) -> Result<QueueId> {
+        Err(Error::internal("тестовая очередь без отложенной отправки"))
     }
 }
 
@@ -395,6 +408,7 @@ async fn subaddress_catch_all_and_rewrite() {
     let sent = d
         .submit(
             TenantId::DEFAULT,
+            None,
             "sender@old.example.org",
             &["partner@example.net".into()],
             Bytes::from_static(MAIL),
@@ -810,6 +824,7 @@ async fn submit_local_recipient_delivered_without_queue() {
     let out = d
         .submit(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &rcpts(&["Bob@Example.org"]),
             Bytes::from_static(OWN),
@@ -848,6 +863,7 @@ async fn submit_mixed_recipients() {
     let out = d
         .submit(
             TenantId::DEFAULT,
+            None,
             "carol@example.org",
             &list,
             Bytes::from_static(OWN),
@@ -876,6 +892,7 @@ async fn submit_mixed_recipients() {
     }
     ob.enqueue(
         TenantId::DEFAULT,
+        None,
         "carol@example.org",
         &rcpts(&["bob@example.org", "y@example.com"]),
         Bytes::from_static(OWN),
@@ -895,6 +912,7 @@ async fn submit_unknown_local_address_bounces() {
     let out = d
         .submit(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &rcpts(&["nobody@example.org", "bob@example.org"]),
             Bytes::from_static(OWN),
@@ -930,6 +948,7 @@ async fn submit_full_mailbox_bounces() {
     let out = d
         .submit(
             TenantId::DEFAULT,
+            None,
             "sender@example.net",
             &rcpts(&["bob@example.org"]),
             Bytes::from_static(MAIL),
@@ -959,6 +978,7 @@ async fn submit_mixed_without_queue() {
     let out = d
         .submit(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &rcpts(&["bob@example.org", "x@example.net"]),
             Bytes::from_static(OWN),
@@ -982,6 +1002,7 @@ async fn submit_mixed_without_queue() {
     let ob: Arc<dyn Outbound> = Arc::new(env.delivery(false));
     ob.enqueue(
         TenantId::DEFAULT,
+        None,
         "alice@example.org",
         &rcpts(&["bob@example.org", "x@example.net"]),
         Bytes::from_static(OWN),
@@ -992,6 +1013,7 @@ async fn submit_mixed_without_queue() {
     let err = ob
         .enqueue(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &rcpts(&["x@example.net"]),
             Bytes::from_static(OWN),
@@ -1003,6 +1025,7 @@ async fn submit_mixed_without_queue() {
     let out = d
         .submit(
             TenantId::new(),
+            None,
             "alice@example.org",
             &rcpts(&["bob@example.org"]),
             Bytes::from_static(OWN),
@@ -1037,6 +1060,7 @@ async fn forward_to_local_address_without_queue() {
     let out = d
         .submit(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &rcpts(&["carol@example.org"]),
             Bytes::from_static(OWN),
@@ -1242,6 +1266,7 @@ mod groups {
         let sent = d
             .submit(
                 TenantId::DEFAULT,
+                None,
                 "x@example.net",
                 &rcpts(&["staff@example.org"]),
                 Bytes::from_static(MAIL),
@@ -1297,6 +1322,7 @@ mod groups {
         let sent = d
             .submit(
                 TenantId::DEFAULT,
+                None,
                 "alice@example.org",
                 &rcpts(&["news@example.org"]),
                 Bytes::from_static(MAIL),

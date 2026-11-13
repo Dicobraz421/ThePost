@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
 use tp_contracts::queue::{Outbound, SubmitStatus, Submitted};
-use tp_contracts::{Error, QueueId, Result, TenantId};
+use tp_contracts::{AccountId, Error, QueueId, Result, TenantId};
 
 use crate::infra::lock;
 
@@ -21,6 +21,8 @@ use crate::infra::lock;
 pub struct Queued {
     /// Организация.
     pub tenant: TenantId,
+    /// Учётная запись отправителя (CTR-74).
+    pub owner: Option<AccountId>,
     /// Отправитель конверта.
     pub mail_from: String,
     /// Получатели в порядке вызова.
@@ -94,6 +96,7 @@ impl MemOutbound {
     fn accept(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -104,6 +107,7 @@ impl MemOutbound {
         }
         st.queued.push(Queued {
             tenant,
+            owner,
             mail_from: mail_from.to_owned(),
             rcpts: rcpts.to_vec(),
             raw,
@@ -117,16 +121,18 @@ impl Outbound for MemOutbound {
     async fn enqueue(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<()> {
-        self.accept(tenant, mail_from, rcpts, raw)
+        self.accept(tenant, owner, mail_from, rcpts, raw)
     }
 
     async fn schedule(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -141,6 +147,7 @@ impl Outbound for MemOutbound {
             queue,
             message: Queued {
                 tenant,
+                owner,
                 mail_from: mail_from.to_owned(),
                 rcpts: rcpts.to_vec(),
                 raw,
@@ -171,11 +178,12 @@ impl Outbound for MemOutbound {
     async fn submit(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<Submitted> {
-        self.accept(tenant, mail_from, rcpts, raw)?;
+        self.accept(tenant, owner, mail_from, rcpts, raw)?;
         let st = lock(&self.state);
         Ok(Submitted {
             rcpts: rcpts
@@ -204,9 +212,11 @@ mod tests {
         suite::outbound_submit(&ob, TenantId::DEFAULT, &["a@example.com".into()]).await;
         ob.set_status("B@example.org", SubmitStatus::Delivered);
         let rcpts = vec!["b@example.org".to_owned(), "c@example.net".to_owned()];
+        let owner = AccountId::new();
         let sent = ob
             .submit(
                 TenantId::DEFAULT,
+                Some(owner),
                 "x@example.org",
                 &rcpts,
                 Bytes::from_static(b"m"),
@@ -222,12 +232,19 @@ mod tests {
         );
         ob.fail_next(Error::UNAVAILABLE);
         assert!(
-            ob.enqueue(TenantId::DEFAULT, "x@example.org", &rcpts, Bytes::new())
-                .await
-                .is_err()
+            ob.enqueue(
+                TenantId::DEFAULT,
+                None,
+                "x@example.org",
+                &rcpts,
+                Bytes::new()
+            )
+            .await
+            .is_err()
         );
         assert_eq!(ob.queued().len(), 3);
         assert_eq!(ob.queued()[2].rcpts, rcpts);
+        assert_eq!(ob.queued()[2].owner, Some(owner));
     }
 
     /// CTR-42: отложенная отправка, отмена до выпуска, после выпуска — `Conflict`.
@@ -239,11 +256,13 @@ mod tests {
         let at = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
         suite::outbound_schedule(&ob, t, &rcpts, at).await;
         assert!(ob.scheduled().is_empty());
+        let owner = AccountId::new();
         let id = ob
-            .schedule(t, "x@example.org", &rcpts, Bytes::new(), at)
+            .schedule(t, Some(owner), "x@example.org", &rcpts, Bytes::new(), at)
             .await
             .expect("schedule");
         assert_eq!(ob.scheduled()[0].release_at, at);
+        assert_eq!(ob.scheduled()[0].message.owner, Some(owner));
         assert!(ob.release(id));
         assert_eq!(ob.cancel_scheduled(t, id).await, Err(Error::Conflict));
         assert!(ob.queued().is_empty());

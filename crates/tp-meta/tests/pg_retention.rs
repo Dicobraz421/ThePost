@@ -150,6 +150,8 @@ async fn policy_chain_resolution() {
             dkim_selector: Some("s1".into()),
             milter_profile: Some("strict".into()),
             trash_purge: None,
+            archive_after: None,
+            archive_quota_bytes: None,
         }
     );
 

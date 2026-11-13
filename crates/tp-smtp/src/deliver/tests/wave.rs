@@ -175,6 +175,7 @@ impl MailFlow for StubFlow {
                 &self.blobs,
                 &self.index,
                 input.tenant,
+                None,
                 Bytes::from_static(b),
             )
             .await?;
@@ -287,6 +288,7 @@ async fn mail_flow_once_for_submission_to_internal_recipient() {
     let out = d
         .submit(
             TenantId::DEFAULT,
+            None,
             "alice@example.org",
             &["bob@example.org".to_owned()],
             Bytes::from_static(MAIL),
