@@ -9,6 +9,10 @@
 //! `name/surname` или `email` (само или внутри `AND`) берёт кандидатов из поискового индекса
 //! ([`DavStore::find_cards`]: полное имя, части имени, псевдонимы, адреса e-mail) и проверяется по карточке; прочие
 //! фильтры, в том числе `text` (ищет и по полям вне индекса), — перебором карточек книг.
+//!
+//! Карточки книги GAL организации (CTR-60, JMAP-39) читаются и ищутся, как свои; их изменения — по
+//! [`DavStore::gal_changes`] вместе с [`DavStore::account_changes`] (состояние — [`State`]). Создание карточки в книге
+//! GAL, изменение, перенос и удаление её карточек — `forbidden`.
 
 use std::cmp::Ordering;
 use std::str::FromStr;
@@ -25,15 +29,16 @@ use tp_contracts::dav::{
 };
 use tp_contracts::meta::AccountScope;
 
-use crate::contacts::{KIND, default_book, state, store_error};
+use crate::contacts::{KIND, State, default_book, gal_book, state, store_error};
 use crate::core::Ctx;
 use crate::core::error::{MethodError, MethodResult, changes_error, set_error};
 use crate::core::request::{
     ChangesArgs, Comparator, GetArgs, QueryChangesArgs, QueryWindow, SetArgs, SetOutcome,
-    apply_window, changes_response, map_changes, object, parse_args, parse_state,
-    query_changes_response, select,
+    apply_window, changes_response, map_changes, object, parse_args, query_changes_response,
+    select,
 };
 use crate::email_get::utc_date;
+use tp_contracts::meta::Changes;
 
 /// Карточка JMAP из объекта хранилища: JSContact из vCard и свойства JMAP (`id`, `addressBookIds`).
 /// Неразбираемое тело (хранилище его не проверяет) — карточка только с `uid` из индекса.
@@ -166,7 +171,51 @@ pub(crate) async fn get(
     })))
 }
 
-/// `ContactCard/changes` по журналу объектов адресных книг.
+/// Изменения карточек после `since` (не больше `limit`): сначала своих книг ([`DavStore::account_changes`]), затем
+/// книги GAL ([`DavStore::gal_changes`]); вместе с состоянием после возвращённых изменений.
+async fn card_changes(
+    ctx: &Ctx<'_>,
+    since: State,
+    limit: usize,
+) -> MethodResult<(Changes<String>, State)> {
+    let store = ctx.jmap.dav_store()?;
+    let own = store
+        .account_changes(ctx.scope, KIND, since.own, limit)
+        .await
+        .map_err(changes_error)?;
+    let mut c = map_changes(own, ToString::to_string);
+    let mut new = State {
+        own: c.new_state,
+        gal: since.gal,
+    };
+    if c.has_more {
+        return Ok((c, new));
+    }
+    let taken = c.created.len() + c.updated.len() + c.destroyed.len();
+    let left = limit.saturating_sub(taken);
+    let gal = store
+        .gal_changes(ctx.scope.tenant, since.gal, left.max(1))
+        .await
+        .map_err(changes_error)?;
+    let gal = map_changes(gal, ToString::to_string);
+    if left == 0 {
+        // Места на странице нет: карточки GAL — на следующей.
+        if gal.created.is_empty() && gal.updated.is_empty() && gal.destroyed.is_empty() {
+            new.gal = gal.new_state;
+        } else {
+            c.has_more = true;
+        }
+        return Ok((c, new));
+    }
+    c.created.extend(gal.created);
+    c.updated.extend(gal.updated);
+    c.destroyed.extend(gal.destroyed);
+    c.has_more = gal.has_more;
+    new.gal = gal.new_state;
+    Ok((c, new))
+}
+
+/// `ContactCard/changes` по журналу объектов адресных книг и книги GAL.
 pub(crate) async fn changes(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
@@ -174,15 +223,11 @@ pub(crate) async fn changes(
     let a: ChangesArgs = parse_args(args)?;
     ctx.check_account(&a.account_id)?;
     let limit = a.limit(ctx.jmap.cfg.max_changes)?;
-    let since = parse_state(&a.since_state)?;
-    let c = ctx
-        .jmap
-        .dav_store()?
-        .account_changes(ctx.scope, KIND, since, limit)
-        .await
-        .map_err(changes_error)?;
-    let c = map_changes(c, ToString::to_string);
-    Ok(changes_response(&a.account_id, &a.since_state, &c))
+    let since = State::parse(&a.since_state)?;
+    let (c, new) = card_changes(ctx, since, limit).await?;
+    let mut out = changes_response(&a.account_id, &a.since_state, &c);
+    out.insert("newState".into(), json!(new.to_string()));
+    Ok(out)
 }
 
 // ---------- Запрос ----------
@@ -442,7 +487,7 @@ pub(crate) async fn query(
     Ok(out)
 }
 
-/// `ContactCard/queryChanges` по журналу объектов адресных книг.
+/// `ContactCard/queryChanges` по журналу объектов адресных книг и книги GAL.
 pub(crate) async fn query_changes(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
@@ -453,16 +498,12 @@ pub(crate) async fn query_changes(
     q.retain(|k, _| matches!(k.as_str(), "accountId" | "filter" | "sort"));
     let a: QueryArgs = parse_args(q)?;
     let limit = qc.limit(ctx.jmap.cfg.max_changes)?;
-    let since = parse_state(&qc.since_query_state)?;
-    let c = ctx
-        .jmap
-        .dav_store()?
-        .account_changes(ctx.scope, KIND, since, limit)
-        .await
-        .map_err(changes_error)?;
-    let c = map_changes(c, ToString::to_string);
+    let since = State::parse(&qc.since_query_state)?;
+    let (c, new) = card_changes(ctx, since, limit).await?;
     let ids = run_query(ctx, &a).await?;
-    query_changes_response(&qc, &ids, &c, limit)
+    let mut out = query_changes_response(&qc, &ids, &c, limit)?;
+    out.insert("newQueryState".into(), json!(new.to_string()));
+    Ok(out)
 }
 
 // ---------- Изменение ----------
@@ -515,7 +556,15 @@ fn put_error(r: tp_contracts::Result<PutOutcome>) -> MethodResult<Result<DavObje
     })
 }
 
-async fn create_one(ctx: &Ctx<'_>, v: &Value) -> MethodResult<Result<Value, Value>> {
+fn forbidden() -> Value {
+    set_error("forbidden", Some("the address book is read-only"), &[])
+}
+
+async fn create_one(
+    ctx: &Ctx<'_>,
+    v: &Value,
+    gal: Option<CollectionId>,
+) -> MethodResult<Result<Value, Value>> {
     let store = ctx.jmap.dav_store()?;
     let Value::Object(src) = v else {
         return Ok(Err(set_error("invalidProperties", None, &[])));
@@ -532,6 +581,9 @@ async fn create_one(ctx: &Ctx<'_>, v: &Value) -> MethodResult<Result<Value, Valu
         let why = "exactly one existing address book is required";
         return Ok(Err(invalid(why, &["addressBookIds"])));
     };
+    if Some(book) == gal {
+        return Ok(Err(forbidden()));
+    }
     let now = utc_date(OffsetDateTime::now_utc());
     let object_id = DavObjectId::new();
     card.entry("@type").or_insert_with(|| json!("Card"));
@@ -568,11 +620,19 @@ async fn create_one(ctx: &Ctx<'_>, v: &Value) -> MethodResult<Result<Value, Valu
     }))
 }
 
-async fn update_one(ctx: &Ctx<'_>, id: &str, patch: &Value) -> MethodResult<Result<Value, Value>> {
+async fn update_one(
+    ctx: &Ctx<'_>,
+    id: &str,
+    patch: &Value,
+    gal: Option<CollectionId>,
+) -> MethodResult<Result<Value, Value>> {
     let store = ctx.jmap.dav_store()?;
     let Some(obj) = find(store.as_ref(), ctx.scope, id).await? else {
         return Ok(Err(set_error("notFound", None, &[])));
     };
+    if Some(obj.collection) == gal {
+        return Ok(Err(forbidden()));
+    }
     let Value::Object(patch) = patch else {
         return Ok(Err(set_error("invalidPatch", None, &[])));
     };
@@ -595,6 +655,9 @@ async fn update_one(ctx: &Ctx<'_>, id: &str, patch: &Value) -> MethodResult<Resu
         let why = "exactly one existing address book is required";
         return Ok(Err(invalid(why, &["addressBookIds"])));
     };
+    if Some(to) == gal {
+        return Ok(Err(forbidden()));
+    }
     let now = utc_date(OffsetDateTime::now_utc());
     card.insert("updated".into(), now.clone());
     let (body, index) = match to_vcard(card) {
@@ -651,9 +714,10 @@ pub(crate) async fn set(
     if a.if_in_state.as_ref().is_some_and(|s| *s != old) {
         return Err(MethodError::new("stateMismatch"));
     }
+    let gal = gal_book(store.as_ref(), ctx.scope).await?.map(|b| b.id);
     let mut out = SetOutcome::default();
     for (cid, v) in a.create.unwrap_or_default() {
-        match create_one(ctx, &v).await? {
+        match create_one(ctx, &v, gal).await? {
             Ok(created) => {
                 if let Some(id) = created["id"].as_str() {
                     ctx.created.insert(cid.clone(), id.to_owned());
@@ -667,7 +731,7 @@ pub(crate) async fn set(
     }
     for (id, patch) in a.update.unwrap_or_default() {
         let rid = ctx.resolve_id(&id).to_owned();
-        match update_one(ctx, &rid, &patch).await? {
+        match update_one(ctx, &rid, &patch, gal).await? {
             Ok(v) => out.updated.insert(id, v),
             Err(e) => out.not_updated.insert(id, e),
         };
@@ -679,6 +743,10 @@ pub(crate) async fn set(
                 .insert(id, set_error("notFound", None, &[]));
             continue;
         };
+        if Some(obj.collection) == gal {
+            out.not_destroyed.insert(id, forbidden());
+            continue;
+        }
         match store
             .delete_object(ctx.scope, obj.collection, &obj.name, Precondition::Any)
             .await
@@ -688,7 +756,9 @@ pub(crate) async fn set(
                 out.not_destroyed
                     .insert(id, set_error("notFound", None, &[]));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                out.not_destroyed.insert(id, store_error(e)?);
+            }
         }
     }
     let new = state(store.as_ref(), ctx.scope).await?;
@@ -1419,5 +1489,239 @@ pub(crate) mod tests {
             q(json!({"operator": "OR", "conditions": [{"email": "hidden"}]})).await,
             json!([hidden])
         );
+    }
+
+    fn gal_card(uid: &str, full: &str, email: &str) -> tp_contracts::dav::GalCard {
+        let body = format!(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:{uid}\r\nFN:{full}\r\nEMAIL:{email}\r\nEND:VCARD\r\n"
+        );
+        let index = tp_dav::index::card(&body).expect("index");
+        tp_contracts::dav::GalCard {
+            name: format!("{uid}.vcf"),
+            body,
+            index,
+        }
+    }
+
+    fn ids(v: &Value) -> Vec<String> {
+        let mut out: Vec<String> = v
+            .as_array()
+            .unwrap_or_else(|| panic!("{v}"))
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_owned))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Книга GAL организации (JMAP-39): видна, только читается; карточки читаются и ищутся; изменения — по
+    /// `sync_gal`, постранично вместе со своими.
+    #[tokio::test]
+    async fn gal_book() {
+        let env = Env::new().await;
+        let acc = env.account();
+        let tenant = env.scope.tenant;
+        let st0 = call(
+            &env,
+            "ContactCard/get",
+            json!({"accountId": acc, "ids": []}),
+        )
+        .await["state"]
+            .clone();
+        let ivan = gal_card("gal-ivan", "Иван Иванов", "ivan@example.org");
+        let olga = gal_card("gal-olga", "Ольга Петрова", "olga@example.org");
+        env.dav
+            .sync_gal(tenant, "Организация", vec![ivan, olga])
+            .await
+            .expect("sync");
+
+        // Книга — среди книг учётной записи, только для чтения, не по умолчанию.
+        let g = call(&env, "AddressBook/get", json!({"accountId": acc})).await;
+        let list = g["list"].as_array().expect("list");
+        assert_eq!(list.len(), 1, "{g}");
+        let gal = list[0]["id"].as_str().expect("id").to_owned();
+        assert_eq!(list[0]["name"], "Организация", "{g}");
+        assert_eq!(list[0]["isDefault"], false, "{g}");
+        assert_eq!(list[0]["isSubscribed"], true, "{g}");
+        assert_eq!(
+            list[0]["myRights"],
+            json!({"mayRead": true, "mayWrite": false, "mayShare": false, "mayDelete": false})
+        );
+        let c = call(
+            &env,
+            "AddressBook/changes",
+            json!({"accountId": acc, "sinceState": st0}),
+        )
+        .await;
+        assert_eq!(c["created"], json!([gal]), "{c}");
+        assert_eq!(c["newState"], g["state"], "{c}");
+
+        // Карточки читаются и ищутся.
+        let got = call(&env, "ContactCard/get", json!({"accountId": acc})).await;
+        let cards = got["list"].as_array().expect("list");
+        assert_eq!(cards.len(), 2, "{got}");
+        assert!(
+            cards
+                .iter()
+                .all(|c| c["addressBookIds"] == json!({&gal: true})),
+            "{got}"
+        );
+        let card_id = |uid: &str| {
+            cards
+                .iter()
+                .find(|c| c["uid"] == uid)
+                .and_then(|c| c["id"].as_str())
+                .unwrap_or_else(|| panic!("{uid}: {got}"))
+                .to_owned()
+        };
+        let (ivan_id, olga_id) = (card_id("gal-ivan"), card_id("gal-olga"));
+        let q = call(
+            &env,
+            "ContactCard/query",
+            json!({"accountId": acc, "filter": {"name": "иванов"}}),
+        )
+        .await;
+        assert_eq!(q["ids"], json!([ivan_id]), "{q}");
+        let q = call(
+            &env,
+            "ContactCard/query",
+            json!({"accountId": acc, "filter": {"inAddressBook": gal}, "sort": [{"property": "uid"}]}),
+        )
+        .await;
+        assert_eq!(q["ids"], json!([ivan_id, olga_id]), "{q}");
+
+        // Изменения после `sync_gal` — и постранично.
+        let c = call(
+            &env,
+            "ContactCard/changes",
+            json!({"accountId": acc, "sinceState": st0}),
+        )
+        .await;
+        assert_eq!(ids(&c["created"]), ids(&json!([ivan_id, olga_id])), "{c}");
+        assert_eq!(c["hasMoreChanges"], false, "{c}");
+        assert_eq!(c["newState"], got["state"], "{c}");
+        let c = call(
+            &env,
+            "ContactCard/changes",
+            json!({"accountId": acc, "sinceState": st0, "maxChanges": 1}),
+        )
+        .await;
+        assert_eq!(c["created"].as_array().map(Vec::len), Some(1), "{c}");
+        assert_eq!(c["hasMoreChanges"], true, "{c}");
+        let c = call(
+            &env,
+            "ContactCard/changes",
+            json!({"accountId": acc, "sinceState": c["newState"], "maxChanges": 1}),
+        )
+        .await;
+        assert_eq!(c["created"].as_array().map(Vec::len), Some(1), "{c}");
+        assert_eq!(c["hasMoreChanges"], false, "{c}");
+        assert_eq!(c["newState"], got["state"], "{c}");
+
+        // Изменение — `forbidden`: книга, её карточки, создание в ней и перенос в неё.
+        let own = create_book(&env, "Личные").await;
+        let r = call(
+            &env,
+            "ContactCard/set",
+            json!({"accountId": acc, "create": {
+                "g": {"addressBookIds": {&gal: true}, "name": {"full": "Новый"}},
+                "o": {"addressBookIds": {&own: true}, "name": {"full": "Свой"}}}}),
+        )
+        .await;
+        assert_eq!(r["notCreated"]["g"]["type"], "forbidden", "{r}");
+        let mine = r["created"]["o"]["id"].as_str().expect("id").to_owned();
+        let r = call(
+            &env,
+            "ContactCard/set",
+            json!({"accountId": acc,
+                   "update": {&ivan_id: {"notes": {"n": {"note": "x"}}}, &mine: {"addressBookIds": {&gal: true}}},
+                   "destroy": [olga_id]}),
+        )
+        .await;
+        assert_eq!(r["notUpdated"][&ivan_id]["type"], "forbidden", "{r}");
+        assert_eq!(r["notUpdated"][&mine]["type"], "forbidden", "{r}");
+        assert_eq!(r["notDestroyed"][&olga_id]["type"], "forbidden", "{r}");
+        let r = call(
+            &env,
+            "AddressBook/set",
+            json!({"accountId": acc, "update": {&gal: {"name": "x"}}, "destroy": [gal],
+                   "onDestroyRemoveContents": true}),
+        )
+        .await;
+        assert_eq!(r["notUpdated"][&gal]["type"], "forbidden", "{r}");
+        assert_eq!(r["notDestroyed"][&gal]["type"], "forbidden", "{r}");
+        let r = call(
+            &env,
+            "AddressBook/set",
+            json!({"accountId": acc, "onSuccessSetIsDefault": gal}),
+        )
+        .await;
+        assert!(r["updated"].is_null(), "{r}");
+
+        // Новый набор: изменённая карточка — `updated`, исчезнувшая — `destroyed`, книга — `updated`.
+        let st1 = call(
+            &env,
+            "ContactCard/get",
+            json!({"accountId": acc, "ids": []}),
+        )
+        .await["state"]
+            .clone();
+        let ivan2 = gal_card("gal-ivan", "Иван Иванов", "ivan.ivanov@example.org");
+        env.dav
+            .sync_gal(tenant, "Организация", vec![ivan2])
+            .await
+            .expect("sync");
+        let c = call(
+            &env,
+            "ContactCard/changes",
+            json!({"accountId": acc, "sinceState": st1}),
+        )
+        .await;
+        assert_eq!(c["created"], json!([]), "{c}");
+        assert_eq!(c["updated"], json!([ivan_id]), "{c}");
+        assert_eq!(c["destroyed"], json!([olga_id]), "{c}");
+        let qc = call(
+            &env,
+            "ContactCard/queryChanges",
+            json!({"accountId": acc, "sinceQueryState": st1, "filter": {"inAddressBook": gal}}),
+        )
+        .await;
+        assert_eq!(qc["added"], json!([{"id": ivan_id, "index": 0}]), "{qc}");
+        assert_eq!(qc["newQueryState"], c["newState"], "{qc}");
+        let c = call(
+            &env,
+            "AddressBook/changes",
+            json!({"accountId": acc, "sinceState": st1}),
+        )
+        .await;
+        assert_eq!(c["updated"], json!([gal]), "{c}");
+        // Тот же набор — без изменений.
+        let st2 = call(
+            &env,
+            "ContactCard/get",
+            json!({"accountId": acc, "ids": []}),
+        )
+        .await["state"]
+            .clone();
+        env.dav
+            .sync_gal(
+                tenant,
+                "Организация",
+                vec![gal_card(
+                    "gal-ivan",
+                    "Иван Иванов",
+                    "ivan.ivanov@example.org",
+                )],
+            )
+            .await
+            .expect("sync");
+        let c = call(
+            &env,
+            "ContactCard/changes",
+            json!({"accountId": acc, "sinceState": st2}),
+        )
+        .await;
+        assert_eq!(c["updated"], json!([]), "{c}");
+        assert_eq!(c["newState"], st2, "{c}");
     }
 }
