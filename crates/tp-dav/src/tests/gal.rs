@@ -1,18 +1,18 @@
-//! DAV-12: глобальная адресная книга «Организация» на in-memory каталоге: состав, скрытые из GAL (группы и учётные
-//! записи — DAV-27), запрет записи, синхронизация по версии снимка каталога (изменения от прежнего снимка — DAV-28).
+//! DAV-12, DAV-29: глобальная адресная книга «Организация» из in-memory каталога, записанная [`crate::gal::sync`] в
+//! `MemDav`: состав, скрытые из GAL (группы и учётные записи — DAV-27), запрет записи, синхронизация по токену
+//! хранилища (после изменения каталога новая версия — только у изменённой карточки).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use tp_contracts::auth::{DirAccount, DirGroup, DirOrg};
+use tp_contracts::dav::{CollectionKind, DavStore};
 use tp_contracts::groups::{DistributionGroup, GroupStore, SenderRestriction};
 use tp_contracts::ids::GroupId;
-use tp_testkit::{FakeAuthenticator, MemDav};
 
-use super::{BOOKS, Env, vcard};
-use crate::{DavConfig, Deps, router};
+use super::{BOOKS, Env, basic, vcard};
+use crate::DavConfig;
 
 fn account(id: &str, name: &str, emails: &[&str], enabled: bool) -> DirAccount {
     DirAccount {
@@ -36,12 +36,10 @@ fn group(id: &str, name: &str, email: Option<&str>) -> DirGroup {
     }
 }
 
-/// Сервер без хранения снимка в памяти (каждый запрос видит текущий каталог) и каталог: Иван (два адреса,
-/// телефоны), Мария, отключённый Пётр, учётная запись без адреса; группы «Продажи», скрытая «Руководство» и группа
-/// без адреса.
+/// Каталог (выгрузка порциями по две записи) и книга GAL из него: Иван (два адреса, телефоны), Мария, отключённый
+/// Пётр, учётная запись без адреса; группы «Продажи», скрытая «Руководство» и группа без адреса.
 async fn env() -> Env {
     let env = Env::with_config(DavConfig {
-        gal_cache: Duration::ZERO,
         gal_page_size: 2,
         ..Default::default()
     });
@@ -90,6 +88,7 @@ async fn env() -> Env {
         })
         .await
         .expect("группа");
+    env.sync_gal().await;
     env
 }
 
@@ -105,6 +104,29 @@ fn names(body: &str) -> Vec<String> {
         .filter_map(|h| h.rsplit('/').next())
         .filter(|n| n.ends_with(".vcf"))
         .map(str::to_owned)
+        .collect()
+}
+
+/// Имена ресурсов ответа по алфавиту.
+fn sorted(body: &str) -> Vec<String> {
+    let mut v = names(body);
+    v.sort();
+    v
+}
+
+/// ETag карточек ответа по имени ресурса.
+fn etags(body: &str) -> BTreeMap<String, String> {
+    body.split("<d:response>")
+        .skip(1)
+        .filter_map(|r| {
+            let name = names(r).pop()?;
+            let etag = r
+                .split("<d:getetag>")
+                .nth(1)?
+                .split("</d:getetag>")
+                .next()?;
+            Some((name, etag.to_owned()))
+        })
         .collect()
 }
 
@@ -228,39 +250,24 @@ async fn read_only() {
 }
 
 #[tokio::test]
-async fn sync_by_snapshot_version() {
+async fn sync_by_store_token() {
     let env = env().await;
     let t = env.scope.tenant;
     let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     assert_eq!(names(&r.body).len(), 3);
     let first = token(&r.body);
-    // ETag по имени карточки.
-    let etags = |body: &str| -> BTreeMap<String, String> {
-        body.split("<d:response>")
-            .skip(1)
-            .filter_map(|r| {
-                let name = names(r).pop()?;
-                let etag = r
-                    .split("<d:getetag>")
-                    .nth(1)?
-                    .split("</d:getetag>")
-                    .next()?;
-                Some((name, etag.to_owned()))
-            })
-            .collect()
-    };
     let before = etags(&r.body);
     assert_eq!(before.len(), 3);
 
-    // Каталог не менялся: токен тот же, изменений нет.
+    // Каталог не менялся: повторная запись ничего не меняет, токен тот же, изменений нет.
+    env.sync_gal().await;
     let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     assert!(names(&r.body).is_empty(), "{}", r.body);
     assert_eq!(token(&r.body), first);
 
-    // Изменение каталога меняет токен и getctag; от прежнего токена (DAV-28) — изменённая и новая карточки и
-    // удалённая (404). ETag меняется только у изменённой карточки.
+    // До записи книги изменение каталога не видно.
     env.dir.upsert_account(
         t,
         account("u-ivan", "Иван Петров", &["ivan.petrov@example.org"], true),
@@ -271,10 +278,16 @@ async fn sync_by_snapshot_version() {
     );
     env.dir.remove_account(t, "u-maria");
     let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
+    assert!(names(&r.body).is_empty(), "{}", r.body);
+
+    // После записи от прежнего токена — изменённая и новая карточки и удалённая (404). ETag меняется только у
+    // изменённой карточки.
+    env.sync_gal().await;
+    let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     assert_eq!(
-        names(&r.body),
-        ["u-ivan.vcf", "u-olga.vcf", "u-maria.vcf"],
+        sorted(&r.body),
+        ["u-ivan.vcf", "u-maria.vcf", "u-olga.vcf"],
         "{}",
         r.body
     );
@@ -282,14 +295,14 @@ async fn sync_by_snapshot_version() {
     let delta_token = token(&r.body);
     let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
     assert_eq!(token(&r.body), delta_token);
-    assert_eq!(names(&r.body), ["g-sales.vcf", "u-ivan.vcf", "u-olga.vcf"]);
+    assert_eq!(sorted(&r.body), ["g-sales.vcf", "u-ivan.vcf", "u-olga.vcf"]);
     let second = token(&r.body);
     assert_ne!(second, first);
     let after = etags(&r.body);
     assert_eq!(after["g-sales.vcf"], before["g-sales.vcf"]);
     assert_ne!(after["u-ivan.vcf"], before["u-ivan.vcf"]);
 
-    // Скрытие группы в хранилище групп — тоже новый снимок.
+    // Снятие скрытия группы в хранилище групп — новая карточка после записи.
     let mut g = env
         .groups
         .by_external_id(t, "g-board")
@@ -298,30 +311,25 @@ async fn sync_by_snapshot_version() {
         .expect("группа");
     g.hidden_from_gal = false;
     env.groups.put(g).await.expect("группа");
+    env.sync_gal().await;
     let r = env.send("REPORT", &gal(), &[], &sync_body(&second)).await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     assert_eq!(names(&r.body), ["g-board.vcf"], "{}", r.body);
-    let r = env.propfind(&gal(), "1", ETAGS).await;
-    assert!(names(&r.body).contains(&"g-board.vcf".to_owned()));
-    // Токен первого снимка — ещё в истории: изменения за два снимка.
+    // От первого токена — изменения за обе записи.
     let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
     assert_eq!(
-        names(&r.body),
-        ["g-board.vcf", "u-ivan.vcf", "u-olga.vcf", "u-maria.vcf"],
+        sorted(&r.body),
+        ["g-board.vcf", "u-ivan.vcf", "u-maria.vcf", "u-olga.vcf"],
         "{}",
         r.body
     );
 }
 
-/// DAV-28: изменение одной записи каталога меняет ETag одной карточки — `sync-collection` от прежнего токена
-/// отдаёт одну; токен старше `dav.gal_sync_history` снимков — 403 `valid-sync-token`.
+/// DAV-28, DAV-29: изменение одной записи каталога — новая версия одной карточки, ETag остальных прежние;
+/// `sync-collection` от прежнего токена отдаёт одну её.
 #[tokio::test]
 async fn sync_changed_card_only() {
-    let env = Env::with_config(DavConfig {
-        gal_cache: Duration::ZERO,
-        gal_sync_history: 1,
-        ..Default::default()
-    });
+    let env = Env::new();
     let t = env.scope.tenant;
     for (id, name, email) in [
         ("u-1", "Первый", "one@example.org"),
@@ -330,64 +338,70 @@ async fn sync_changed_card_only() {
     ] {
         env.dir.upsert_account(t, account(id, name, &[email], true));
     }
+    env.sync_gal().await;
     let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
     assert_eq!(names(&r.body).len(), 3);
     let first = token(&r.body);
+    let before = etags(&r.body);
     env.dir.upsert_account(
         t,
         account("u-2", "Второй Иванов", &["two@example.org"], true),
     );
+    env.sync_gal().await;
     let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     assert_eq!(names(&r.body), ["u-2.vcf"], "{}", r.body);
     assert!(!r.body.contains("404 Not Found"), "{}", r.body);
-    let second = token(&r.body);
-    assert_ne!(second, first);
-
-    // Ещё одно изменение: первый токен вышел из истории (один снимок).
-    env.dir.remove_account(t, "u-3");
-    let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN);
-    assert!(r.body.contains("<d:valid-sync-token/>"), "{}", r.body);
-    let r = env.send("REPORT", &gal(), &[], &sync_body(&second)).await;
-    assert_eq!(names(&r.body), ["u-3.vcf"], "{}", r.body);
-    assert_eq!(r.body.matches("404 Not Found").count(), 1, "{}", r.body);
+    assert_ne!(token(&r.body), first);
+    let r = env.propfind(&gal(), "1", ETAGS).await;
+    let after = etags(&r.body);
+    assert_eq!(after["u-1.vcf"], before["u-1.vcf"]);
+    assert_eq!(after["u-3.vcf"], before["u-3.vcf"]);
+    assert_ne!(after["u-2.vcf"], before["u-2.vcf"]);
 }
 
+/// Книга в хранилище — одна на организацию, видна каждой её учётной записи и не мешает созданию книги по
+/// умолчанию.
 #[tokio::test]
-async fn cached_snapshot() {
-    // Со сроком хранения по умолчанию изменение каталога видно не сразу.
-    let env = Env::new();
-    let t = env.scope.tenant;
-    env.dir
-        .upsert_account(t, account("u-1", "Первый", &["one@example.org"], true));
-    let r = env.propfind(&gal(), "1", ETAGS).await;
-    assert_eq!(names(&r.body), ["u-1.vcf"]);
-    env.dir
-        .upsert_account(t, account("u-2", "Второй", &["two@example.org"], true));
-    let r = env.propfind(&gal(), "1", ETAGS).await;
-    assert_eq!(names(&r.body), ["u-1.vcf"]);
-}
-
-#[tokio::test]
-async fn no_directory_no_gal() {
-    let env = Env::new();
-    let app = router(
-        Deps {
-            auth: Arc::new(env.auth.clone()),
-            store: Arc::new(MemDav::new()),
-        },
-        DavConfig::default(),
+async fn stored_book() {
+    let env = env().await;
+    let books = env
+        .store
+        .list_collections(env.scope, CollectionKind::AddressBook)
+        .await
+        .expect("список");
+    assert_eq!(books.len(), 1);
+    assert!(books[0].is_gal());
+    assert_eq!(books[0].display_name, "Организация");
+    // Первое обращение к дому создаёт книгу по умолчанию, хотя книга GAL уже есть.
+    let r = env.propfind(BOOKS, "1", "").await;
+    assert!(r.body.contains("/contacts/"), "{}", r.body);
+    assert!(r.body.contains("/gal/"), "{}", r.body);
+    let req = Request::builder()
+        .method("PROPFIND")
+        .uri("/dav/addressbooks/petr@example.org/gal/")
+        .header("authorization", basic("petr@example.org", "secret2"))
+        .header("depth", "1")
+        .body(Body::from(ETAGS))
+        .expect("запрос");
+    let r = env.raw(req).await;
+    assert_eq!(r.status, StatusCode::MULTI_STATUS, "{}", r.body);
+    assert_eq!(
+        sorted(&r.body),
+        ["g-sales.vcf", "u-ivan.vcf", "u-maria.vcf"]
     );
-    let env = Env { app, ..env };
-    let _: &FakeAuthenticator = &env.auth;
+}
+
+/// Пока книга не записана ([`crate::gal::sync`]), её нет; имя зарезервировано и без неё.
+#[tokio::test]
+async fn no_sync_no_gal() {
+    let env = Env::new();
     let r = env.propfind(BOOKS, "1", "").await;
     assert!(!r.body.contains("/gal/"), "{}", r.body);
     assert_eq!(
         env.propfind(&gal(), "0", "").await.status,
         StatusCode::NOT_FOUND
     );
-    // Имя зарезервировано и без каталога.
     let r = env.send("MKCOL", &gal(), &[], "").await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 }
@@ -401,6 +415,7 @@ async fn hidden_account() {
     let mut maria = account("u-maria", "Мария Иванова", &["maria@example.org"], true);
     maria.hidden_from_gal = true;
     env.dir.upsert_account(t, maria.clone());
+    env.sync_gal().await;
     let query = r#"<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
       <d:prop><d:getetag/></d:prop>
       <card:filter><card:prop-filter name="FN"><card:text-match>Мария</card:text-match></card:prop-filter></card:filter>
@@ -416,6 +431,7 @@ async fn hidden_account() {
 
     maria.hidden_from_gal = false;
     env.dir.upsert_account(t, maria);
+    env.sync_gal().await;
     let r = env.send("REPORT", &gal(), &[], query).await;
     assert_eq!(names(&r.body), ["u-maria.vcf"], "{}", r.body);
     let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;

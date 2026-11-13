@@ -182,6 +182,8 @@ pub struct Jmap {
     /// Оргструктура; `None` — capability `urn:thepost:orgchart` не объявляется.
     pub(crate) org: Option<Arc<dyn OrgStore>>,
     stop: watch::Sender<bool>,
+    /// Открытые соединения push: закрытие по `AccountDisabled` (JMAP-41).
+    pub(crate) push: crate::disable::Sessions,
 }
 
 impl fmt::Debug for Jmap {
@@ -303,6 +305,7 @@ impl Jmap {
             sender_lists: None,
             org: None,
             stop: watch::channel(false).0,
+            push: crate::disable::Sessions::default(),
         })
     }
 

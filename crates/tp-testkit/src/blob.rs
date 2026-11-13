@@ -3,10 +3,11 @@
 //! [`MemBlobStore`] повторяет поведение `tp-blob` (идемпотентная запись, обрезка диапазона, проверка
 //! произвольных путей) и умеет инъекцию ошибок и задержек по операциям ([`BlobOp`]).
 //! [`MemBlobIndex`] — протокол поколений `tp-meta`: состояния `live` → `deleting` → надгробие `deleted`.
+//! [`MemShardedBlobIndex`] — учёт на нескольких шардах справочника: GC по ссылкам всех шардов.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -637,6 +638,229 @@ impl BlobIndex for MemBlobIndex {
     }
 }
 
+// ---------- Учёт объектов на шардах ----------
+
+/// Блокировка строк учёта одного шарда.
+type Rows<'a> = MutexGuard<'a, HashMap<(TenantId, BlobHash), BlobRow>>;
+
+/// Учёт объектов на нескольких шардах справочника в памяти — как `PgMeta::with_shards` в `tp-meta`
+/// (SRS 3.6, решение 2026-11-01-scale-shards-geo-admin). Клоны разделяют данные.
+///
+/// Шард 0 — основная БД: `acquire`, `commit_new`, `release`, отметки загрузок. Ссылки на других шардах
+/// ставит и снимает вызывающий через учёт шарда [`MemShardedBlobIndex::shard`] (как `PgMeta::on_shard`).
+/// Операции GC — по всем шардам: объект — кандидат, только если ни на одном шарде на его поколение нет ссылок
+/// и на каждом окно W истекло; `mark_deleting` под блокировкой всех шардов ставит `deleting`, шарду без строки —
+/// надгробие того же поколения (параллельная загрузка на нём получит новое поколение); `finalize_delete` —
+/// на всех шардах. Срок `next_gc_due` — по последнему обнулению объекта среди шардов.
+#[derive(Debug, Clone)]
+pub struct MemShardedBlobIndex {
+    shards: Vec<MemBlobIndex>,
+}
+
+impl MemShardedBlobIndex {
+    /// Учёт `shards` шардов (не меньше одного) с часами `clock`.
+    pub fn new(clock: Arc<dyn Clock>, shards: usize) -> Self {
+        assert!(shards > 0, "нужен хотя бы один шард");
+        Self {
+            shards: (0..shards)
+                .map(|_| MemBlobIndex::new(clock.clone()))
+                .collect(),
+        }
+    }
+
+    /// Учёт шарда `n` (0 — основная БД); номер за пределами числа шардов — паника.
+    pub fn shard(&self, n: usize) -> &MemBlobIndex {
+        &self.shards[n]
+    }
+
+    /// Строки всех шардов по порядку (порядок блокировок един — взаимных ожиданий нет).
+    fn locked(&self) -> Vec<Rows<'_>> {
+        self.shards.iter().map(|s| lock(&s.rows)).collect()
+    }
+}
+
+/// Строки поколения `key` на шардах `rows`, кроме надгробий.
+fn rows_of<'a>(rows: &'a [Rows<'_>], key: &'a BlobKey) -> impl Iterator<Item = &'a BlobRow> {
+    rows.iter().filter_map(|r| {
+        r.get(&(key.tenant, key.hash))
+            .filter(|r| r.generation == key.generation && r.state != BlobState::Deleted)
+    })
+}
+
+/// Последнее обнуление объекта `key` среди шардов `rows`; `None` — на каком-то шарде есть ссылки или строки нет.
+fn released_at(rows: &[Rows<'_>], key: &BlobKey) -> Option<OffsetDateTime> {
+    let mut last = None;
+    for r in rows_of(rows, key) {
+        if r.refcnt > 0 {
+            return None;
+        }
+        last = last.max(Some(r.zero_since?));
+    }
+    last
+}
+
+/// Объекты без ссылок на всех шардах `rows` с моментом последнего обнуления.
+fn released(rows: &[Rows<'_>]) -> Vec<(OffsetDateTime, BlobKey)> {
+    let keys: HashSet<BlobKey> = rows
+        .iter()
+        .flat_map(|r| r.iter())
+        .filter(|(_, r)| r.refcnt == 0 && r.state != BlobState::Deleted)
+        .map(|(&(tenant, hash), r)| BlobKey {
+            tenant,
+            hash,
+            generation: r.generation,
+        })
+        .collect();
+    keys.into_iter()
+        .filter_map(|k| released_at(rows, &k).map(|z| (z, k)))
+        .collect()
+}
+
+#[async_trait]
+impl BlobIndex for MemShardedBlobIndex {
+    async fn acquire(
+        &self,
+        tenant: TenantId,
+        owner: Option<AccountId>,
+        hash: &BlobHash,
+        refs: u32,
+    ) -> Result<Acquire> {
+        self.shards[0].acquire(tenant, owner, hash, refs).await
+    }
+
+    async fn commit_new(
+        &self,
+        tenant: TenantId,
+        hash: &BlobHash,
+        generation: Gen,
+        size: u64,
+        refs: u32,
+    ) -> Result<Commit> {
+        self.shards[0]
+            .commit_new(tenant, hash, generation, size, refs)
+            .await
+    }
+
+    fn supports_compression(&self) -> bool {
+        true
+    }
+
+    async fn commit_new_with(
+        &self,
+        tenant: TenantId,
+        hash: &BlobHash,
+        generation: Gen,
+        size: u64,
+        refs: u32,
+        compression: Compression,
+    ) -> Result<Commit> {
+        self.shards[0]
+            .commit_new_with(tenant, hash, generation, size, refs, compression)
+            .await
+    }
+
+    async fn release(
+        &self,
+        tenant: TenantId,
+        hash: &BlobHash,
+        generation: Gen,
+        refs: u32,
+    ) -> Result<()> {
+        self.shards[0].release(tenant, hash, generation, refs).await
+    }
+
+    async fn gc_candidates(
+        &self,
+        older_than: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<BlobKey>> {
+        let mut found: Vec<_> = released(&self.locked())
+            .into_iter()
+            .filter(|(z, _)| *z < older_than)
+            .collect();
+        found.sort_by_key(|(z, _)| *z);
+        Ok(found.into_iter().take(limit).map(|(_, k)| k).collect())
+    }
+
+    async fn mark_deleting(&self, key: &BlobKey, older_than: OffsetDateTime) -> Result<bool> {
+        let now = self.shards[0].clock.now();
+        let mut rows = self.locked();
+        if !released_at(&rows, key).is_some_and(|z| z < older_than) {
+            return Ok(false);
+        }
+        for shard in &mut rows {
+            match shard.get_mut(&(key.tenant, key.hash)) {
+                Some(r) if r.generation == key.generation && r.state != BlobState::Deleted => {
+                    r.state = BlobState::Deleting;
+                }
+                // Другое поколение — другой объект; надгробие удалённого — помечать нечего.
+                Some(_) => {}
+                None => {
+                    shard.insert(
+                        (key.tenant, key.hash),
+                        BlobRow {
+                            generation: key.generation,
+                            refcnt: 0,
+                            state: BlobState::Deleting,
+                            size: 0,
+                            zero_since: Some(now),
+                            compression: Compression::None,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    async fn finalize_delete(&self, key: &BlobKey) -> Result<bool> {
+        let mut done = false;
+        for s in &self.shards {
+            done |= s.finalize_delete(key).await?;
+        }
+        Ok(done)
+    }
+
+    async fn exists(&self, key: &BlobKey) -> Result<bool> {
+        Ok(rows_of(&self.locked(), key).next().is_some())
+    }
+
+    async fn compression(&self, key: &BlobKey) -> Result<Option<Compression>> {
+        Ok(rows_of(&self.locked(), key).next().map(|r| r.compression))
+    }
+
+    async fn next_gc_due(&self, window: Duration) -> Result<Option<OffsetDateTime>> {
+        let window = time::Duration::try_from(window).unwrap_or(time::Duration::MAX);
+        Ok(released(&self.locked())
+            .into_iter()
+            .map(|(z, _)| z)
+            .min()
+            .map(|z| z.saturating_add(window)))
+    }
+
+    async fn mark_upload(
+        &self,
+        scope: AccountScope,
+        key: &BlobKey,
+        until: OffsetDateTime,
+    ) -> Result<()> {
+        self.shards[0].mark_upload(scope, key, until).await
+    }
+
+    async fn upload_owned(
+        &self,
+        scope: AccountScope,
+        key: &BlobKey,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        self.shards[0].upload_owned(scope, key, now).await
+    }
+
+    async fn prune_uploads(&self, now: OffsetDateTime, limit: usize) -> Result<usize> {
+        self.shards[0].prune_uploads(now, limit).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +976,61 @@ mod tests {
         assert_eq!(
             idx.compression(&key(42, g.next())).await,
             Ok(Some(Compression::None))
+        );
+    }
+
+    /// Набор GC по шардам на двух и трёх шардах (третий — без строк: ему надгробие).
+    #[tokio::test]
+    async fn sharded_gc_suite() {
+        for n in [2, 3] {
+            let clock = ManualClock::default();
+            let idx = MemShardedBlobIndex::new(clock.shared(), n);
+            crate::suite::blob_gc_shards(&idx, idx.shard(1), TenantId::DEFAULT, &clock, &clock)
+                .await;
+        }
+    }
+
+    /// Учёт с шардами проходит и общие наборы учёта: запись — на основном шарде.
+    #[tokio::test]
+    async fn sharded_common_suites() {
+        let clock = ManualClock::default();
+        let idx = MemShardedBlobIndex::new(clock.shared(), 2);
+        let t = TenantId::DEFAULT;
+        assert_eq!(idx.next_gc_due(W).await, Ok(None));
+        crate::suite::blob_compression(&idx, t).await;
+        crate::suite::blob_gc_due(&idx, t).await;
+        crate::suite::blob_uploads(&idx, t, TenantId::new()).await;
+    }
+
+    /// Срок GC — последнее обнуление объекта среди шардов; объект со ссылкой на шарде срока не даёт.
+    #[tokio::test]
+    async fn sharded_due_is_last_release() {
+        let clock = ManualClock::default();
+        let idx = MemShardedBlobIndex::new(clock.shared(), 2);
+        let (t, h) = (TenantId::DEFAULT, hash(7));
+        let k = key(7, Gen::INITIAL);
+        idx.commit_new(t, &h, Gen::INITIAL, 1, 1)
+            .await
+            .expect("commit");
+        idx.shard(1)
+            .commit_new(t, &h, Gen::INITIAL, 1, 1)
+            .await
+            .expect("refer");
+        idx.release(t, &h, Gen::INITIAL, 1).await.expect("release");
+        assert_eq!(idx.next_gc_due(W).await, Ok(None));
+        clock.advance(W);
+        idx.shard(1)
+            .release(t, &h, Gen::INITIAL, 1)
+            .await
+            .expect("release");
+        let last = clock.now();
+        assert_eq!(idx.next_gc_due(W).await, Ok(Some(last + W)));
+        clock.advance(W);
+        assert_eq!(idx.gc_candidates(last, 10).await, Ok(vec![]));
+        assert!(!idx.mark_deleting(&k, last).await.expect("mark"));
+        assert_eq!(
+            idx.gc_candidates(last + time::Duration::SECOND, 10).await,
+            Ok(vec![k])
         );
     }
 

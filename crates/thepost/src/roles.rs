@@ -100,6 +100,9 @@ pub struct Maintenance {
     /// Пересчёт поисковых строк контактов, записанных до миграции 0030 (`PgMeta::reindex_cards`, META-78, APP-63):
     /// один раз в фоне при запуске роли; `None` — не выполняется (тесты без PostgreSQL).
     pub card_reindex: Option<PgMeta>,
+    /// Заполнение книги GAL «Организация» из каталога (`maintenance.gal_interval`, APP-49); `None` — каталог
+    /// `auth.ldap` не настроен (книги нет) или тесты.
+    pub gal: Option<Arc<crate::gal::GalSync>>,
 }
 
 /// Показатели проверки целостности BLOB по расписанию для `/metrics` (`crate::metrics::register_verify`).
@@ -111,8 +114,10 @@ pub struct VerifyMetrics {
     pub passes: u64,
     /// Проходы, прерванные ошибкой (листинг хранилища, СУБД) или потерей лизы.
     pub failed: u64,
-    /// Повреждённые записи учёта в последнем проходе: объекта нет или его размер не совпадает с учётом.
-    pub damaged: u64,
+    /// Записи учёта в последнем проходе, у которых объекта нет в хранилище.
+    pub missing: u64,
+    /// Записи учёта в последнем проходе, у которых размер объекта не совпадает с учётом.
+    pub size_mismatch: u64,
     /// «Сироты» в последнем проходе: объекты хранилища без записи учёта.
     pub orphans: u64,
     /// Объекты и записи, которые в последнем проходе проверить не удалось.
@@ -242,7 +247,8 @@ impl ScheduledVerify {
         let duration_secs = started.elapsed().as_secs();
         self.probe.update(|m| {
             m.passes += 1;
-            m.damaged = report.damaged;
+            m.missing = report.missing;
+            m.size_mismatch = report.size_mismatch;
             m.orphans = report.orphans;
             m.errors = report.errors;
             m.duration_secs = duration_secs;
@@ -260,15 +266,16 @@ impl ScheduledVerify {
         for path in &report.orphan_paths {
             tracing::error!(path = %path, "проверка целостности BLOB: объект без записи учёта («сирота»)");
         }
-        let (objects, records, damaged, orphans, errors, truncated) = (
+        let (objects, records, missing, size_mismatch, orphans, errors, truncated) = (
             report.objects_listed,
             report.records_checked,
-            report.damaged,
+            report.missing,
+            report.size_mismatch,
             report.orphans,
             report.errors,
             report.truncated,
         );
-        if damaged + orphans + errors == 0 {
+        if missing + size_mismatch + orphans + errors == 0 {
             tracing::info!(
                 objects,
                 records,
@@ -279,7 +286,8 @@ impl ScheduledVerify {
             tracing::error!(
                 objects,
                 records,
-                damaged,
+                missing,
+                size_mismatch,
                 orphans,
                 errors,
                 truncated,
@@ -409,6 +417,7 @@ impl std::fmt::Debug for Maintenance {
             .field("holder", &self.holder)
             .field("trash", &self.trash.is_some())
             .field("purge", &self.purge)
+            .field("gal", &self.gal.is_some())
             .field(
                 "sinks",
                 &self.sinks.iter().map(|s| s.name()).collect::<Vec<_>>(),
@@ -501,7 +510,18 @@ impl RoleService for Maintenance {
                 }
             })
         });
+        // Книга GAL «Организация» (APP-49): первый проход при запуске, затем по периоду; один узел — держатель лизы.
+        let gal = self.gal.clone().map(|gal| {
+            let token = ctx.shutdown.clone();
+            tokio::spawn(async move { gal.run(token).await })
+        });
         ctx.ready.set(true);
+        let gal = async move {
+            match gal {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
         let card_reindex = async move {
             match card_reindex {
                 Some(task) => task.await,
@@ -532,7 +552,7 @@ impl RoleService for Maintenance {
                 None => Ok(()),
             }
         };
-        let (gc, orphans, trash, purge, verify, audit_export, card_reindex, ()) = tokio::join!(
+        let (gc, orphans, trash, purge, verify, audit_export, card_reindex, gal, ()) = tokio::join!(
             gc,
             orphans,
             trash,
@@ -540,6 +560,7 @@ impl RoleService for Maintenance {
             verify,
             audit_export,
             card_reindex,
+            gal,
             consume(
                 self.events.clone(),
                 self.sinks.clone(),
@@ -555,6 +576,7 @@ impl RoleService for Maintenance {
             ("blob-verify", verify),
             ("audit-export", audit_export),
             ("card-reindex", card_reindex),
+            ("gal", gal),
         ] {
             if let Err(e) = done {
                 return Err(tp_contracts::Error::Internal(format!("{what}: {e}")));
@@ -685,6 +707,7 @@ mod tests {
             verify: None,
             audit_export: None,
             card_reindex: None,
+            gal: None,
         };
         let (ctx, shutdown, ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -770,7 +793,8 @@ mod tests {
         };
         let text = metrics.encode().expect("encode");
         assert!(text.contains("tp_blob_verify_passes_total 0"), "{text}");
-        assert!(text.contains("tp_blob_verify_damaged 0"), "{text}");
+        assert!(text.contains("tp_blob_verify_missing 0"), "{text}");
+        assert!(text.contains("tp_blob_verify_size_mismatch 0"), "{text}");
 
         // Лиза у другого узла: прохода нет.
         let leases = MemLease::default();
@@ -816,6 +840,7 @@ mod tests {
             verify: Some(verify),
             audit_export: None,
             card_reindex: None,
+            gal: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -832,10 +857,14 @@ mod tests {
         task.await.expect("join").expect("run");
 
         let m = probe.metrics();
-        assert_eq!((m.damaged, m.orphans, m.errors, m.failed), (1, 1, 0, 0));
+        assert_eq!(
+            (m.missing, m.size_mismatch, m.orphans, m.errors, m.failed),
+            (1, 0, 1, 0, 0)
+        );
         assert!(m.finished_at > 0);
         let text = metrics.encode().expect("encode");
-        assert!(text.contains("tp_blob_verify_damaged 1"), "{text}");
+        assert!(text.contains("tp_blob_verify_missing 1"), "{text}");
+        assert!(text.contains("tp_blob_verify_size_mismatch 0"), "{text}");
         assert!(text.contains("tp_blob_verify_orphans 1"), "{text}");
         assert!(!text.contains("tp_blob_verify_passes_total 0"), "{text}");
         assert_eq!(leases.holder(&lease_name).as_deref(), Some("node-a/1"));
@@ -1076,6 +1105,7 @@ mod tests {
             verify: None,
             audit_export: None,
             card_reindex: None,
+            gal: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });

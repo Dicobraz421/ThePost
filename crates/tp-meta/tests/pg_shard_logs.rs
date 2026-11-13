@@ -357,6 +357,136 @@ async fn blob_referenced_on_another_shard_is_kept() {
     t.drop_db().await;
 }
 
+/// Записи учёта поколения [`Gen::INITIAL`] с хэшами `hashes` на шарде `pool`: `refcnt` ссылок, без ссылок —
+/// обнулённые в моменты `zeros`.
+async fn put_blobs(
+    pool: &DbPool,
+    tenant: TenantId,
+    hashes: &[BlobHash],
+    refcnt: i64,
+    zeros: &[OffsetDateTime],
+) {
+    let hashes: Vec<Vec<u8>> = hashes.iter().map(|h| h.as_bytes().to_vec()).collect();
+    let mut tx = tp_meta::schema::begin(pool, tenant).await.expect("begin");
+    sqlx::query(
+        "INSERT INTO blobs (tenant_id, hash, gen, refcnt, size, zero_since)
+         SELECT $1, u.h, 0, $3, 1, CASE WHEN $3 = 0 THEN u.z END
+         FROM unnest($2::bytea[], $4::timestamptz[]) AS u(h, z)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(hashes)
+    .bind(refcnt)
+    .bind(zeros.to_vec())
+    .execute(&mut *tx)
+    .await
+    .expect("blobs");
+    tx.commit().await.expect("commit");
+}
+
+fn initial(tenant: TenantId, hash: BlobHash) -> BlobKey {
+    BlobKey {
+        tenant,
+        hash,
+        generation: Gen::INITIAL,
+    }
+}
+
+/// META-73: записи, занятые другим шардом, отбрасываются до `LIMIT` — 300 таких записей впереди (больше
+/// страницы выборки) не скрывают свободного кандидата.
+#[tokio::test]
+async fn busy_blobs_ahead_do_not_hide_free_candidate() {
+    let Some(t) = common::two_shards().await else {
+        return;
+    };
+    let (tenant, _, _) = t.tenant().await;
+    let base = OffsetDateTime::now_utc() - Duration::from_secs(7200);
+    let busy: Vec<BlobHash> = (0..300).map(|_| hash()).collect();
+    let zeros: Vec<OffsetDateTime> = (0..300u64)
+        .map(|i| base + Duration::from_millis(i))
+        .collect();
+    // Основная БД: ссылок нет, обнулены раньше свободного; второй шард: ссылки есть.
+    put_blobs(t.main.meta.pool(), tenant, &busy, 0, &zeros).await;
+    put_blobs(&t.shard_pool, tenant, &busy, 1, &zeros).await;
+    let free = hash();
+    put_blobs(
+        t.main.meta.pool(),
+        tenant,
+        &[free],
+        0,
+        &[base + Duration::from_secs(60)],
+    )
+    .await;
+
+    let later = OffsetDateTime::now_utc() + Duration::from_secs(3600);
+    let free = initial(tenant, free);
+    for limit in [1, 10, 1000] {
+        assert_eq!(
+            t.meta
+                .gc_candidates(later, limit)
+                .await
+                .expect("candidates"),
+            vec![free],
+            "limit {limit}"
+        );
+    }
+    t.drop_db().await;
+}
+
+/// META-79: срок следующего прохода GC — по всем шардам среди объектов без ссылок. Самый ранний обнулённый
+/// объект занят вторым шардом, следующий свободен: срок — по свободному (не `None`), проход удаляет его и
+/// оставляет занятый. Объект, обнулённый на втором шарде позже, получает срок по позднему обнулению.
+#[tokio::test]
+async fn next_gc_due_skips_blob_held_by_another_shard() {
+    const W: Duration = Duration::from_secs(3600);
+    let Some(t) = common::two_shards().await else {
+        return;
+    };
+    let (tenant, _, _) = t.tenant().await;
+    let base = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_000).expect("ts");
+    let (busy, free) = (hash(), hash());
+    put_blobs(t.main.meta.pool(), tenant, &[busy], 0, &[base]).await;
+    put_blobs(&t.shard_pool, tenant, &[busy], 1, &[base]).await;
+    let free_zero = base + Duration::from_secs(60);
+    put_blobs(t.main.meta.pool(), tenant, &[free], 0, &[free_zero]).await;
+    assert_eq!(t.meta.next_gc_due(W).await, Ok(Some(free_zero + W)));
+
+    // Проход GC в срок: кандидат — только свободный объект.
+    let older_than = free_zero + Duration::from_micros(1);
+    let (busy, free) = (initial(tenant, busy), initial(tenant, free));
+    let keys = t
+        .meta
+        .gc_candidates(older_than, 100)
+        .await
+        .expect("candidates");
+    assert_eq!(keys, vec![free]);
+    assert!(t.meta.mark_deleting(&free, older_than).await.expect("mark"));
+    assert!(t.meta.finalize_delete(&free).await.expect("finalize"));
+    assert!(!t.meta.exists(&free).await.expect("exists"));
+    assert!(t.meta.exists(&busy).await.expect("exists"));
+    assert_eq!(t.meta.next_gc_due(W).await, Ok(None));
+
+    // Обнулён на обоих шардах: срок — по второму, обнулённому позже.
+    let late = hash();
+    let late_zero = base + Duration::from_secs(600);
+    put_blobs(t.main.meta.pool(), tenant, &[late], 0, &[base]).await;
+    put_blobs(&t.shard_pool, tenant, &[late], 0, &[late_zero]).await;
+    assert_eq!(t.meta.next_gc_due(W).await, Ok(Some(late_zero + W)));
+    assert!(
+        t.meta
+            .gc_candidates(late_zero, 100)
+            .await
+            .expect("candidates")
+            .is_empty()
+    );
+    assert_eq!(
+        t.meta
+            .gc_candidates(late_zero + Duration::from_micros(1), 100)
+            .await,
+        Ok(vec![initial(tenant, late)])
+    );
+    t.drop_db().await;
+}
+
 #[tokio::test]
 async fn signals_from_every_shard() {
     let Some(t) = common::two_shards().await else {

@@ -18,7 +18,8 @@ use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tp_auth::OidcConfig;
-use tp_contracts::tls::{InternalTls, Profile};
+use tp_contracts::secrets::{Secret, SecretStore};
+use tp_contracts::tls::{InternalTls, KeySource, Profile};
 
 use crate::sections::{self, AUTH, AuthSection, CLI, CliOidc, CliSection};
 
@@ -84,8 +85,14 @@ pub struct DeviceLogin {
 }
 
 impl DeviceLogin {
-    /// Клиент к поставщику `oidc` с настройками `cli`; канал — как у узла (`auth.oidc.tls`, открытый — только dev).
-    pub async fn new(oidc: &OidcConfig, cli: &CliOidc, profile: Profile) -> CliResult<Self> {
+    /// Клиент к поставщику `oidc` с настройками `cli`; канал — как у узла (`auth.oidc.tls`, открытый — только dev;
+    /// ключ сертификата клиента `tls.key` — из хранилища `secrets`).
+    pub async fn new(
+        oidc: &OidcConfig,
+        cli: &CliOidc,
+        profile: Profile,
+        secrets: &dyn SecretStore,
+    ) -> CliResult<Self> {
         let plaintext = oidc.check(profile).map_err(|e| format!("auth.oidc: {e}"))?;
         cli.check().map_err(|e| e.to_string())?;
         let client_id = cli.client_id.clone().ok_or_else(|| {
@@ -93,8 +100,9 @@ impl DeviceLogin {
              Device Authorization Grant у поставщика OIDC"
                 .to_owned()
         })?;
+        let key = client_key(&oidc.tls, secrets).await?;
         let tls = oidc.tls.clone();
-        let (roots, identity) = tokio::task::spawn_blocking(move || read_tls(&tls))
+        let (roots, identity) = tokio::task::spawn_blocking(move || read_tls(&tls, key))
             .await
             .map_err(|e| format!("auth.oidc.tls: {e}"))??;
         let mut http = reqwest::Client::builder()
@@ -249,9 +257,26 @@ fn urlencoded(form: &[(&str, &str)]) -> CliResult<String> {
     Ok(url.query().unwrap_or_default().to_owned())
 }
 
-/// Корневые сертификаты и сертификат клиента канала к поставщику (`auth.oidc.tls`), как у узла.
+/// Ключ сертификата клиента канала к поставщику (`auth.oidc.tls.key`, PEM) из хранилища `secrets`, как у узла;
+/// `None` — без mTLS. `tls.key_file` не поддерживается (решение 100).
+async fn client_key(tls: &InternalTls, secrets: &dyn SecretStore) -> CliResult<Option<Secret>> {
+    match tls.key_source().map_err(|e| format!("auth.oidc.tls: {e}"))? {
+        None => Ok(None),
+        Some(KeySource::File(_)) => Err(
+            "auth.oidc.tls.key_file не поддерживается; задайте tls.key: { secret: \"<путь>#<поле>\" }".to_owned(),
+        ),
+        Some(KeySource::Secret(r)) => secrets
+            .get(r)
+            .await
+            .map(Some)
+            .map_err(|e| format!("auth.oidc.tls.key: секрет {}#{}: {e}", r.path(), r.field())),
+    }
+}
+
+/// Корневые сертификаты и сертификат клиента канала к поставщику (`auth.oidc.tls`, ключ `key`), как у узла.
 fn read_tls(
     tls: &InternalTls,
+    key: Option<Secret>,
 ) -> CliResult<(Vec<reqwest::Certificate>, Option<reqwest::Identity>)> {
     let read =
         |p: &Path| std::fs::read(p).map_err(|e| format!("auth.oidc.tls: {}: {e}", p.display()));
@@ -260,11 +285,11 @@ fn read_tls(
             .map_err(|e| format!("auth.oidc.tls.ca_file: {e}"))?,
         None => Vec::new(),
     };
-    let identity = match (&tls.cert_file, &tls.key_file) {
+    let identity = match (&tls.cert_file, key) {
         (Some(cert), Some(key)) => {
             let mut pem = read(cert)?;
             pem.push(b'\n');
-            pem.extend(read(key)?);
+            pem.extend_from_slice(key.expose().as_bytes());
             let identity = reqwest::Identity::from_pem(&pem)
                 .map_err(|e| format!("auth.oidc.tls.cert_file: {e}"));
             pem.fill(0);
@@ -330,7 +355,10 @@ async fn run(config: &Path) -> CliResult<String> {
     let cli = cfg
         .section::<CliSection>(CLI)
         .map_err(|e| format!("{}: секция cli: {e}", config.display()))?;
-    DeviceLogin::new(oidc, &cli.oidc, cfg.profile())
+    let secrets = crate::secrets::store(&cfg, None)
+        .await
+        .map_err(|e| format!("{}: хранилище секретов: {e}", config.display()))?;
+    DeviceLogin::new(oidc, &cli.oidc, cfg.profile(), secrets.as_ref())
         .await?
         .login(|code| eprint!("{}", prompt_text(code)))
         .await
@@ -339,6 +367,7 @@ async fn run(config: &Path) -> CliResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::NoSecretStore;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -432,7 +461,7 @@ mod tests {
             slow_down_step: Duration::from_millis(400),
             ..CliOidc::default()
         };
-        let login = DeviceLogin::new(&oidc, &cli, Profile::Dev)
+        let login = DeviceLogin::new(&oidc, &cli, Profile::Dev, &NoSecretStore)
             .await
             .expect("client");
         (p, login)
@@ -538,7 +567,7 @@ mod tests {
             client_id: Some("thepost-cli".into()),
             ..CliOidc::default()
         };
-        let e = DeviceLogin::new(&oidc, &cli, Profile::Dev)
+        let e = DeviceLogin::new(&oidc, &cli, Profile::Dev, &NoSecretStore)
             .await
             .expect("client")
             .login(|_| {})
@@ -546,9 +575,53 @@ mod tests {
             .expect_err("unsupported");
         assert!(e.contains("device_authorization_endpoint"), "{e}");
 
-        let e = DeviceLogin::new(&oidc, &CliOidc::default(), Profile::Dev)
+        let e = DeviceLogin::new(&oidc, &CliOidc::default(), Profile::Dev, &NoSecretStore)
             .await
             .expect_err("no client");
         assert!(e.contains("cli.oidc.client_id"), "{e}");
+    }
+
+    /// APP-56: ключ сертификата клиента `auth.oidc.tls.key` — из хранилища секретов; секрета нет — ошибка с путём;
+    /// `tls.key_file` — ошибка.
+    #[tokio::test]
+    async fn client_key_from_secret_store() {
+        use tp_contracts::secrets::SecretRef;
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testdata");
+        let r = SecretRef::new("thepost/oidc", "tls_key").expect("ref");
+        let mut oidc = OidcConfig {
+            issuer: "https://sso.example.test".into(),
+            audience: vec!["thepost".into()],
+            tls: InternalTls {
+                cert_file: Some(dir.join("cert.pem")),
+                key: Some(r.clone()),
+                ..InternalTls::default()
+            },
+            ..OidcConfig::default()
+        };
+        let cli = CliOidc {
+            client_id: Some("thepost-cli".into()),
+            ..CliOidc::default()
+        };
+        let store = tp_testkit::MemSecretStore::default();
+        let e = DeviceLogin::new(&oidc, &cli, Profile::Dev, &store)
+            .await
+            .expect_err("нет секрета");
+        assert!(e.contains("thepost/oidc#tls_key"), "{e}");
+
+        store.set(
+            &r,
+            std::fs::read_to_string(dir.join("key.pem")).expect("key"),
+        );
+        DeviceLogin::new(&oidc, &cli, Profile::Dev, &store)
+            .await
+            .expect("клиент с ключом из хранилища");
+
+        oidc.tls.key = None;
+        oidc.tls.key_file = Some(dir.join("key.pem"));
+        let e = DeviceLogin::new(&oidc, &cli, Profile::Dev, &store)
+            .await
+            .expect_err("key_file");
+        assert!(e.contains("key_file"), "{e}");
     }
 }

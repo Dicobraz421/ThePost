@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, test } from "vitest";
 
 import { BASE, buttons, open, sent } from "../test-app";
@@ -117,6 +117,8 @@ test("инсталляция: источники кластера — /api/v1/tr
   fireEvent.click(await screen.findByRole("tab", { name: "Инсталляция" }));
   expect(await screen.findByText("сертификат: edge.example.net")).toBeTruthy();
   expect(screen.getByText("кластер")).toBeTruthy();
+  // Организация — по имени из GET /api/v1/orgs: владелец источника mx и оба принятых домена.
+  expect(within(screen.getByRole("tabpanel")).getAllByText("по умолчанию")).toHaveLength(3);
   // Кнопки — только у источника кластера.
   expect(screen.getAllByRole("button", { name: "Удалить" })).toHaveLength(1);
   fireEvent.click(screen.getByRole("button", { name: "Удалить" }));

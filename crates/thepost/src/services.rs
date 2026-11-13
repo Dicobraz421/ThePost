@@ -84,6 +84,9 @@ pub struct Services {
     pub authz: Arc<dyn Authorizer>,
     /// Каталог LDAP; `None` — учётные записи только из PostgreSQL.
     pub directory: Option<Arc<dyn Directory>>,
+    /// Шина JMAP с системным `GalChanged` в подписках учётных записей (APP-49); `None` — без каталога книги GAL
+    /// нет, JMAP подписан на [`Services::bus`]. Системные сигналы читает `GalPush::run` (запускает `serve`).
+    pub gal_push: Option<Arc<crate::gal::GalPush>>,
     /// Издатель токенов OIDC (`auth.oidc.issuer`); `None` — вход Bearer OIDC не настроен.
     pub oidc_issuer: Option<String>,
     /// Пароли приложений.
@@ -228,6 +231,9 @@ impl Services {
         if let Some(oidc) = &auth.oidc {
             let bearer = tp_auth::OidcAuthenticator::new(oidc.clone(), profile, accounts.clone())
                 .await
+                .map_err(|e| infra::context("auth.oidc", e))?
+                .with_secrets(secrets.as_ref())
+                .await
                 .map_err(|e| infra::context("auth.oidc", e))?;
             router = router.bearer(Arc::new(bearer));
         }
@@ -317,6 +323,10 @@ impl Services {
                 .with_node(smtp.hostname.clone()),
         );
 
+        let gal_push = directory
+            .is_some()
+            .then(|| Arc::new(crate::gal::GalPush::new(bus.clone())));
+
         Ok(Self {
             tenant,
             meta,
@@ -328,6 +338,7 @@ impl Services {
             authn,
             sasl,
             authz,
+            gal_push,
             directory,
             oidc_issuer: auth.oidc.as_ref().map(|o| o.issuer.clone()),
             app_passwords,
@@ -531,7 +542,11 @@ impl Services {
                 Arc::new(self.meta.clone()),
             )),
             blob_index: Arc::new(self.meta.clone()),
-            bus: self.bus.clone(),
+            // Push узнаёт об изменении книги GAL организации (`GalChanged`) через `GalPush`.
+            bus: match &self.gal_push {
+                Some(push) => push.clone() as Arc<dyn EventBus>,
+                None => self.bus.clone(),
+            },
             accounts: Arc::new(self.meta.clone()),
             authz: self.authz.clone(),
             outbound: Some(outbound.clone()),
@@ -559,8 +574,8 @@ impl Services {
     }
 
     /// Маршруты календарей и контактов (CalDAV, CardDAV; APP-29): хранилище — `PgMeta`, вход — тот же, что у
-    /// JMAP (с защитой от перебора). С каталогом организации (`auth.ldap`) — глобальная адресная книга
-    /// «Организация» (группы, скрытые из адресной книги, в неё не попадают); без каталога её нет (SRS 4.4).
+    /// JMAP (с защитой от перебора). Глобальная адресная книга «Организация» читается из того же хранилища, её
+    /// заполняет роль maintenance ([`Services::gal`]).
     /// `well_known` — добавить перенаправления `/.well-known/caldav` и `/.well-known/carddav` на `/dav/`
     /// (RFC 6764 §5): для слушателя без JMAP, который отдаёт их сам по `jmap.autoconfig`.
     /// Планирование встреч (APP-28): приглашения, ответы и отмены рассылает сервер ([`Services::schedule`]);
@@ -575,12 +590,10 @@ impl Services {
             auth: self.authn.clone(),
             store: Arc::new(self.meta.clone()),
         };
-        let gal = self.directory.as_ref().map(|directory| tp_dav::GalDeps {
-            directory: directory.clone(),
-            groups: Some(Arc::new(self.meta.clone())),
-        });
         let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
-        let router = tp_dav::router_with(deps, gal, Some(self.schedule(outbound)), cfg);
+        // Второй аргумент (`_gal`) `tp-dav` не использует: книгу GAL заполняет `Services::gal`; аргумент убирает
+        // межполосная правка `tp_dav::router_with`.
+        let router = tp_dav::router_with(deps, None, Some(self.schedule(outbound)), cfg);
         if !well_known {
             return Ok(router);
         }
@@ -588,6 +601,33 @@ impl Services {
         Ok(router
             .route("/.well-known/caldav", axum::routing::any(context))
             .route("/.well-known/carddav", axum::routing::any(context)))
+    }
+
+    /// Заполнение глобальной адресной книги «Организация» (APP-49, решение 72) для роли maintenance: из каталога
+    /// организации (`auth.ldap`) — учётные записи и группы, кроме скрытых из адресной книги (группы — по признаку в
+    /// `PgMeta`), — в хранилище `PgMeta`, откуда её читают CardDAV и JMAP Contacts. Раз в `interval`, под лизой
+    /// держателя `holder` (одна запись на организацию в кластере); имя книги и размер порции — секция `dav`.
+    /// Без каталога книги нет (SRS 4.4) — `None`.
+    pub fn gal(
+        &self,
+        cfg: tp_dav::DavConfig,
+        leases: Arc<dyn tp_contracts::lease::LeaseStore>,
+        holder: String,
+        interval: std::time::Duration,
+    ) -> Option<crate::gal::GalSync> {
+        let directory = self.directory.clone()?;
+        Some(crate::gal::GalSync::new(
+            tp_dav::GalDeps {
+                directory,
+                groups: Some(Arc::new(self.meta.clone())),
+            },
+            Arc::new(self.meta.clone()),
+            self.tenant,
+            cfg,
+            leases,
+            holder,
+            interval,
+        ))
     }
 
     /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`
@@ -1236,6 +1276,65 @@ mod tests {
 
         stop.cancel();
         drop((services, delivery, meta));
+        crate::testutil::drop_database(&url, &db_name).await;
+    }
+
+    /// APP-56: узел с `auth.oidc` и mTLS к поставщику стартует с ключом клиента `tls.key` из хранилища секретов;
+    /// секрета нет в хранилище — ошибка запуска с путём секрета.
+    #[tokio::test]
+    async fn oidc_client_key_from_secret_store() {
+        use tp_contracts::secrets::SecretRef;
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = crate::testutil::db_pool(&url_db).await;
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
+        let meta = PgMeta::new(pool.clone(), tp_meta::MetaConfig::default()).with_bus(bus.clone());
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testdata");
+        let cfg = crate::sections::registry_of(crate::modules::BUILTIN)
+            .expect("registry")
+            .parse(
+                &format!(
+                    "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
+                     database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: {{ allow_plaintext: true }}\n\
+                     blob:\n  url: file:///var/lib/thepost/blob\n\
+                     auth:\n  oidc:\n    issuer: https://sso.example.test\n    audience: [thepost]\n    tls:\n\
+                     \x20     cert_file: \"{}\"\n      key: {{ secret: \"thepost/oidc#tls_key\" }}\n",
+                    dir.join("cert.pem").display()
+                ),
+                Vec::new(),
+            )
+            .expect("config");
+        let ext = Registry::default();
+        let metrics = tp_platform::Metrics::default();
+        let store = Arc::new(tp_testkit::MemSecretStore::default());
+        let build = |secrets: Arc<dyn SecretStore>| {
+            Services::build(Base {
+                cfg: &cfg,
+                meta: meta.clone(),
+                blob: Arc::new(tp_testkit::MemBlobStore::default()),
+                bus: bus.clone(),
+                secrets,
+                ext: &ext,
+                metrics: &metrics,
+                node: NodeId::new("app-56").expect("node"),
+            })
+        };
+
+        let e = build(store.clone()).await.expect_err("нет секрета");
+        assert!(e.to_string().contains("thepost/oidc#tls_key"), "{e}");
+
+        store.set(
+            &SecretRef::new("thepost/oidc", "tls_key").expect("ref"),
+            std::fs::read_to_string(dir.join("key.pem")).expect("key"),
+        );
+        let services = build(store).await.expect("services");
+        drop((services, meta));
         crate::testutil::drop_database(&url, &db_name).await;
     }
 

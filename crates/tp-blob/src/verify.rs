@@ -1,7 +1,8 @@
 //! `thepost verify` (SRS 3.5): сверка хранилища и учёта объектов в обе стороны.
 //!
 //! - «Сироты»: объекты хранилища старше периода ожидания без записи учёта того же поколения.
-//! - Повреждённые записи: запись `live`, у которой объекта нет или размер не совпадает.
+//! - Повреждённые записи: запись `live`, у которой объекта нет («пропал») или размер не совпадает
+//!   («неверный размер»); в отчёте — отдельные счётчики.
 //!
 //! Отчёт — JSON ([`VerifyReport::to_json`]). В режиме исправления «сироты» удаляются, повреждённые
 //! записи помечаются через [`BlobInventory::mark_damaged`] (письма со ссылкой на них — повреждённые).
@@ -108,8 +109,10 @@ pub struct VerifyReport {
     pub orphans: u64,
     /// Удалено «сирот» (режим исправления).
     pub orphans_deleted: u64,
-    /// Найдено повреждённых записей.
-    pub damaged: u64,
+    /// Записей, у которых объекта нет в хранилище.
+    pub missing: u64,
+    /// Записей, у которых размер объекта не совпадает с учётом.
+    pub size_mismatch: u64,
     /// Помечено повреждёнными (режим исправления).
     pub damaged_marked: u64,
     /// Ошибок отдельных операций (сверка продолжена).
@@ -130,7 +133,7 @@ impl VerifyReport {
 
     /// Расхождений нет.
     pub fn is_clean(&self) -> bool {
-        self.orphans == 0 && self.damaged == 0 && self.errors == 0
+        self.orphans == 0 && self.missing == 0 && self.size_mismatch == 0 && self.errors == 0
     }
 }
 
@@ -191,7 +194,8 @@ impl Verifier {
         tracing::info!(
             fix,
             orphans = report.orphans,
-            damaged = report.damaged,
+            missing = report.missing,
+            size_mismatch = report.size_mismatch,
             errors = report.errors,
             "verify BLOB"
         );
@@ -269,7 +273,10 @@ impl Verifier {
                 Some(size) if size != rec.size => Damage::SizeMismatch,
                 Some(_) => continue,
             };
-            report.damaged += 1;
+            match damage {
+                Damage::Missing => report.missing += 1,
+                Damage::SizeMismatch => report.size_mismatch += 1,
+            }
             let item = DamagedBlob {
                 path: rec.key.path(),
                 damage,
@@ -422,8 +429,8 @@ mod tests {
         e.clock.advance(Duration::from_secs(GRACE + 1));
         let report = e.verifier.run(false).await.expect("вызов");
         assert_eq!(
-            (report.records_checked, report.damaged),
-            (2, 1),
+            (report.records_checked, report.missing, report.size_mismatch),
+            (2, 0, 1),
             "{report:?}"
         );
         assert_eq!(report.damaged_blobs[0].path, broken.path());
@@ -474,7 +481,15 @@ mod tests {
             .expect("вызов");
 
         let report = e.verifier.run(false).await.expect("вызов");
-        assert_eq!((report.orphans, report.damaged, report.errors), (1, 2, 0));
+        assert_eq!(
+            (
+                report.orphans,
+                report.missing,
+                report.size_mismatch,
+                report.errors
+            ),
+            (1, 1, 1, 0)
+        );
         assert_eq!((report.orphans_deleted, report.damaged_marked), (0, 0));
         assert_eq!(report.orphan_paths, vec![orphan.path()]);
         let mut damaged = report.damaged_blobs.clone();
@@ -501,6 +516,11 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&report.to_json().expect("значение")).expect("значение");
         assert_eq!(json["orphans"], 1);
+        assert_eq!(
+            (json["missing"].as_u64(), json["size_mismatch"].as_u64()),
+            (Some(1), Some(1))
+        );
+        assert!(json.get("damaged").is_none());
         assert_eq!(json["fix"], false);
         assert!(
             json["damaged_blobs"]
@@ -534,7 +554,7 @@ mod tests {
             e.inventory.keys.lock().expect("lock").push(key);
         }
         let report = e.verifier.run(false).await.expect("вызов");
-        assert_eq!(report.damaged, 3);
+        assert_eq!((report.missing, report.size_mismatch), (3, 0));
         assert_eq!(report.damaged_blobs.len(), 1);
         assert!(report.truncated);
     }

@@ -53,17 +53,10 @@ pub struct DavConfig {
     /// Размер встроенного в карточку фото (`PHOTO`, после декодирования base64), байт; больше — `PUT` отклоняется
     /// (`max-resource-size`). Публикуется как `max-image-size`.
     pub max_photo_size: usize,
-    /// Отображаемое имя глобальной адресной книги (каталог организации, только для чтения).
+    /// Отображаемое имя глобальной адресной книги (каталог организации, только для чтения; [`crate::gal::sync`]).
     pub gal_name: String,
     /// Записей каталога в одной порции при построении глобальной адресной книги.
     pub gal_page_size: usize,
-    /// Срок хранения построенной глобальной адресной книги в памяти; `0s` — строить на каждый запрос.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub gal_cache: Duration,
-    /// Прежних снимков глобальной адресной книги, от токена которых `sync-collection` отдаёт только изменённые,
-    /// новые и удалённые карточки; токен старше — 403 `valid-sync-token` (полная синхронизация).
-    pub gal_sync_history: usize,
     /// Отображаемое имя адресной книги по умолчанию (создаётся при первом обращении к дому адресных книг).
     pub default_addressbook_name: String,
     /// Оставлять во входящих планирования (`schedule-inbox`) сообщения iTIP, которые сервер уже применил к
@@ -94,8 +87,6 @@ impl Default for DavConfig {
             max_photo_size: 512 * 1024,
             gal_name: "Организация".to_owned(),
             gal_page_size: 1_000,
-            gal_cache: Duration::from_secs(60),
-            gal_sync_history: 10,
             default_addressbook_name: "Контакты".to_owned(),
             schedule_keep_processed: false,
             schedule_write_attempts: 3,

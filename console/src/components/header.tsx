@@ -1,36 +1,20 @@
 import { useGetIdentity, usePermissions } from "@refinedev/core";
-import { useQueryClient } from "@tanstack/react-query";
-import { Input, Layout, Space, Typography } from "antd";
+import { Layout, Space, Typography } from "antd";
 
-import { getOrg, type Schemas, setOrg } from "../api/client";
+import { getOrg, type Schemas } from "../api/client";
+import { allowed } from "../providers/access";
+import { OrgSelect, useOrgs } from "./orgs";
 
-/** Шапка: кто вошёл, выбор организации (администратор инсталляции); выход — в меню. */
+/** Шапка: кто вошёл, организация (администратор инсталляции выбирает её из списка); выход — в меню. */
 export function Header() {
   const { data: me } = useGetIdentity<Schemas["WhoAmI"]>();
   const { data: roles } = usePermissions<Schemas["AdminRole"][]>({});
-  const queries = useQueryClient();
-  const choose = (org: string) => {
-    if (!org.trim()) return;
-    setOrg(org.trim());
-    void queries.invalidateQueries();
-  };
+  const { name } = useOrgs(Boolean(roles && allowed(roles, "organization", "list")));
   return (
     <Layout.Header style={{ background: "transparent", display: "flex", justifyContent: "flex-end", padding: "0 24px" }}>
       <Space size="middle">
-        {roles?.includes("installation_admin") ? (
-          // Списка организаций в Admin API пока нет: администратор инсталляции вводит UUID.
-          <Input.Search
-            key={getOrg()}
-            aria-label="Организация"
-            addonBefore="Организация"
-            defaultValue={getOrg()}
-            enterButton="Выбрать"
-            onSearch={choose}
-            style={{ width: 580, verticalAlign: "middle" }}
-          />
-        ) : (
-          <Typography.Text type="secondary">Организация: {getOrg()}</Typography.Text>
-        )}
+        <Typography.Text type="secondary">Организация:</Typography.Text>
+        {roles?.includes("installation_admin") ? <OrgSelect /> : <Typography.Text>{name(getOrg())}</Typography.Text>}
         <Typography.Text strong>{me?.login}</Typography.Text>
       </Space>
     </Layout.Header>

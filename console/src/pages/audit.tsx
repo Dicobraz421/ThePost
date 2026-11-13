@@ -11,12 +11,13 @@ import { interval, moment } from "../components/format";
 
 type Entry = Schemas["AuditEntry"];
 
-const ROLES: Record<Schemas["AdminRole"], string> = {
+// В записи журнала роли — строки (роль, которой уже нет, показывается как есть); подписи — у всех ролей схемы.
+const ROLES: Partial<Record<string, string>> = {
   installation_admin: "администратор инсталляции",
   organization_admin: "администратор организации",
   operator: "оператор",
   auditor: "аудитор",
-};
+} satisfies Record<Schemas["AdminRole"], string>;
 const has = (text: string, part: string) => text.toLowerCase().includes(part.trim().toLowerCase());
 
 export function AuditPage() {

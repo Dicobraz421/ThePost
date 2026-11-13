@@ -50,10 +50,11 @@
 | 993, 143 | IMAP (TLS, STARTTLS) | `openssl s_client -connect <сервер>:993` | клиенты не читают почту | [INSTALL](INSTALL.md#настройка-клиентов) |
 | 4190 | ManageSieve — правила фильтрации (STARTTLS) | `openssl s_client -connect <сервер>:4190 -starttls sieve` | клиенты не меняют правила фильтрации | [INSTALL](INSTALL.md#настройка-клиентов) |
 | 443 | JMAP, автонастройка | `curl -si https://<сервер>/.well-known/jmap` → `401` | JMAP-клиенты не подключаются | [deploy/README](../deploy/README.md#эталон-smb-в-контейнерах-профиль-smb) |
-| 80 | только выпуск и продление сертификата Let's Encrypt (встроенный ACME, HTTP-01; `thepost_tls_mode: acme`) | `curl -I http://<сервер>/` во время выпуска | сертификат не выпускается | [INSTALL](INSTALL.md#рабочий-сервер-ansible) |
+| 80 | только выпуск и продление сертификата Let's Encrypt (встроенный ACME, HTTP-01, `http.acme.listen`; `thepost_tls_mode: acme`) | `curl -I http://<сервер>/` во время выпуска | сертификат не выпускается: при первом запуске узел не стартует («acme: сертификат … не выпущен»), позже — сертификат не продлевается | [INSTALL](INSTALL.md#рабочий-сервер-ansible), [`acme.rs`](../crates/thepost/src/acme.rs) |
 
 Порты ниже 1024 слушает только systemd (юниты `thepost-*.socket`, решение 102) и передаёт узлу готовые сокеты — у
-процесса нет ни одной capability. Проверка: `privileges.capabilities` — `OK`; любые capabilities — `WARN`.
+процесса нет ни одной capability: без сокета такой порт не откроется. Проверка: `systemctl list-sockets 'thepost-*'` —
+сокеты всех портов (при `acme` — и `thepost-http.socket`); `privileges.capabilities` — `OK`, любые capabilities — `WARN`.
 
 Исходящие:
 
@@ -106,8 +107,9 @@ PTR задаёт владелец адреса (провайдер, хостин
 | Требование | Проверка | При нарушении | Источник |
 |---|---|---|---|
 | Сертификат клиентских протоколов (секция `tls`) читается и действителен | `tls.certificate` | истёк — `FAIL`; < 21 сут. (`doctor.cert_warn_before`) — `WARN`; файла нет — `WARN` (при `acme` — `SKIP` до выпуска) | [`doctor_dns.rs`](../crates/thepost/src/doctor_dns.rs) |
+| Ключ TLS — только секрет `tls.key` (`thepost/tls#key`) в OpenBao, на диске ключа нет; ключ подходит к цепочке `tls.cert_file` | `tls.key` | секрета нет или ключ не от этой цепочки — `FAIL`: протоколы с TLS не стартуют; без хранилища секретов — `SKIP` | [`doctor_dns.rs`](../crates/thepost/src/doctor_dns.rs), решение 100 |
 | Сертификат покрывает `smtp.hostname` | `tls.names` | `WARN`: клиенты не проверят TLS | там же |
-| Способ выпуска — `thepost_tls_mode`: `acme` (по умолчанию; порт 80, DNS на ВМ), `files`, `internal` (только стенд) | прогон плейбука | плейбук отклоняет неверный режим или пустой `thepost_acme_email` | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
+| Способ выпуска — `thepost_tls_mode`: `acme` (по умолчанию; встроенный клиент, порт 80, DNS на ВМ), `files` (свои PEM: цепочка — файл, ключ плейбук загружает в OpenBao), `internal` (только стенд) | прогон плейбука | плейбук отклоняет неверный режим или пустой `thepost_acme_email` | [роль `thepost`](../deploy/ansible/roles/thepost/defaults/main.yml) |
 | Клиенты — TLS 1.3; TLS 1.2 только настройкой `tls.min_version: "1.2"` | `openssl s_client -tls1_2 -connect <сервер>:993` | старые клиенты без TLS 1.3 не подключатся | [S6 п. 6.2](spec/S6.md), [`tls.rs`](../crates/tp-platform/src/tls.rs) |
 | Внутренние каналы (PostgreSQL, S3, OpenBao, служебный HTTP) — только TLS с проверкой имени | `database.tls`, `secrets.config` | открытый канал — только профиль `dev` (`allow_plaintext`) с `WARN` | [S6 п. 6.2](spec/S6.md), [решение 2026-10-30](decisions/2026-10-30-owner-answers.md) |
 | Эталон SMB: внутренний CA `thepost_pki` (CA — 10 лет, сертификат служб — 825 сут.). Прогон плейбука перевыпускает сертификат тем же CA, если до конца срока < 90 сут. (`thepost_pki_renew_before`); CA сам не перевыпускается: истёк — плейбук останавливается с инструкцией (удалить `/etc/thepost/pki`, повторить прогон, раздать новый `ca.pem` клиентам вне ВМ) | `openssl x509 -enddate -noout -in /etc/thepost/pki/internal.pem` | по истечении — внутренние каналы не установятся (проверка в `doctor` — APP-25) | [роль `thepost_pki`](../deploy/ansible/roles/thepost_pki/defaults/main.yml), [решение 27](decisions/2026-11-11-stage2-followups.md) |
@@ -149,10 +151,10 @@ PTR задаёт владелец адреса (провайдер, хостин
 |---|---|---|---|
 | OpenBao 2.7.2 (эталон Ansible и Compose; Helm-чарт 0.30.6) или существующий HashiCorp Vault | `bao version`, `secrets.store` | хранилище недоступно, не инициализировано или запечатано — `FAIL`: узел не получит пароли СУБД | [роль `openbao`](../deploy/ansible/roles/openbao/defaults/main.yml), [deploy/README](../deploy/README.md#openbao-хранилище-секретов) |
 | Канал — только TLS (`secrets.url` — `https://`, CA узла) | `secrets.config` | открытый канал — только `dev`, `WARN`; роль Ansible без файлов TLS останавливается | [`secrets.rs`](../crates/tp-platform/src/secrets.rs) |
-| Политика `thepost`: чтение `thepost/*`, кроме `db-readonly`; продление своего токена | `bao policy read thepost`; [DEP-08](manual-tests/DEP-08.md) шаг 4 | лишние права — узел читает пароль только чтения | [`thepost-policy.hcl`](../deploy/openbao/thepost-policy.hcl) |
+| Политика `thepost`: чтение `thepost/*`, кроме `db-readonly`; запись — только `thepost/tls` (ключ TLS от встроенного ACME); продление своего токена | `bao policy read thepost`; [DEP-08](manual-tests/DEP-08.md) шаг 4 | лишние права — узел читает пароль только чтения | [`thepost-policy.hcl`](../deploy/openbao/thepost-policy.hcl) |
 | Вход узла — AppRole (`role_id`, `secret_id` через `LoadCredential=`) или Kubernetes auth | `secrets.login` | `FAIL`: секреты не читаются | [deploy/README](../deploy/README.md#установка-под-systemd-smb-enterprise-вм) |
 | Токен узла — с продлением или сроком ≥ 1 ч (`secrets.doctor.min_token_ttl`); эталон — TTL 1 ч, максимум 24 ч | `secrets.token` | бессрочный или короткий без продления — `WARN` | [`secrets.rs`](../crates/tp-platform/src/secrets.rs) |
-| Секреты стенда: `thepost/db`, `thepost/db-owner`, `thepost/db-readonly` (и `thepost/s3` для S3) | `secrets.refs` | ссылка на отсутствующий секрет — `FAIL` | [deploy/README](../deploy/README.md#профиль-tls-по-умолчанию) |
+| Секреты: `thepost/db`, `thepost/db-owner`, `thepost/db-readonly`, `thepost/tls` (ключ TLS; при `acme` его пишет узел) и `thepost/s3` для S3 | `secrets.refs` | ссылка на отсутствующий секрет — `FAIL` | [deploy/README](../deploy/README.md#профиль-tls-по-умолчанию) |
 | Распечатывание после перезапуска — автоматическое (PKCS#11/TPM, KMS); ключ в файле — по умолчанию | `secrets.seal` | `static` — `WARN` (ключ на сервере, риск 16); `shamir` — `WARN`: почта стоит до ручного `bao operator unseal` | [решение 2026-10-30](decisions/2026-10-30-config-events-secrets.md), [APP-Z З.1](spec/APP-Z.md) |
 | Ключи восстановления и root-токен из `/root/openbao-init.json` перенесены в надёжное место и удалены с сервера | `ls /root/openbao-init.json` — нет файла | компрометация сервера раскрывает root-токен | [INSTALL](INSTALL.md#рабочий-сервер-ansible) |
 | Enterprise: кластер Raft из 3 узлов | `bao operator raft list-peers` | кворум 2 из 3: потеря двух — секреты недоступны | [APP-Z З.2, З.3](spec/APP-Z.md) |

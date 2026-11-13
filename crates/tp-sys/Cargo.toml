@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 landlock.workspace = true
-nix = { workspace = true, features = ["sched"] }
+nix = { workspace = true, features = ["fs", "sched"] }
 schemars.workspace = true
 seccompiler.workspace = true
 serde.workspace = true

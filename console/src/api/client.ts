@@ -1,4 +1,4 @@
-// Обращения к Admin API (SRS 5.2): сессия, организация, ошибки RFC 9457.
+// Обращения к Admin API (SRS 5.2): адрес API, сессия, организация, ошибки RFC 9457.
 import type { HttpError } from "@refinedev/core";
 
 import type { components } from "./schema";
@@ -6,6 +6,28 @@ import type { components } from "./schema";
 export type Schemas = components["schemas"];
 
 export const API = "/api/v1";
+
+/** Источник Admin API (`https://узел[:порт]`); пусто — источник страницы (консоль раздаёт узел). */
+let apiBase = "";
+
+/**
+ * Читает необязательный `config.json` рядом с `index.html` (UI-12): `{"apiBase": "https://узел[:порт]"}` — консоль на
+ * отдельном веб-сервере. Нет файла (или вместо него страница) или поля — запросы к источнику страницы. Один раз при старте.
+ */
+export async function loadConfig(base: string = import.meta.env.BASE_URL) {
+  apiBase = "";
+  const resp = await fetch(`${base}config.json`, { headers: { Accept: "application/json" }, cache: "no-store" }).catch(() => null);
+  if (!resp?.ok || !resp.headers.get("Content-Type")?.includes("json")) return;
+  const { apiBase: value } = (await resp.json()) as { apiBase?: unknown };
+  if (value === undefined || value === "") return;
+  // Только источник: путь, учётные данные или другая схема — ошибка конфигурации, а не молчаливая подмена.
+  const origin = typeof value === "string" && URL.canParse(value) ? new URL(value).origin : "null";
+  if (origin === "null" || origin !== String(value).replace(/\/$/, "")) {
+    throw new Error(`config.json: apiBase — источник вида https://узел[:порт], а не ${JSON.stringify(value)}`);
+  }
+  apiBase = origin;
+}
+
 const SESSION_KEY = "thepost.session";
 const ORG_KEY = "thepost.org";
 
@@ -54,12 +76,12 @@ export type RequestOptions = {
 
 /** Запрос к Admin API; `{org}` в пути — выбранная организация. Ошибка — `HttpError` для уведомлений Refine. */
 export async function request<T>(path: string, o: RequestOptions = {}): Promise<{ data: T; next?: string }> {
-  const url = new URL(path.replace("{org}", encodeURIComponent(getOrg())), location.origin);
+  const url = new URL(path.replace("{org}", encodeURIComponent(getOrg())), apiBase || location.origin);
   for (const [k, v] of Object.entries(o.query ?? {})) {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
   }
   const bearer = o.bearer ?? loadSession()?.token;
-  const resp = await fetch(url.pathname + url.search, {
+  const resp = await fetch(`${apiBase}${url.pathname}${url.search}`, {
     method: (o.method ?? "GET").toUpperCase(),
     headers: {
       Accept: "application/json",
@@ -83,6 +105,6 @@ export async function request<T>(path: string, o: RequestOptions = {}): Promise<
   }
   // Продолжение списка: `Link: <…&after=…>; rel="next"` (RFC 8288).
   const link = /<([^>]*)>;\s*rel="next"/.exec(resp.headers.get("Link") ?? "");
-  const next = link ? (new URL(link[1], location.origin).searchParams.get("after") ?? undefined) : undefined;
+  const next = link ? (new URL(link[1], url).searchParams.get("after") ?? undefined) : undefined;
   return { data: data as T, next };
 }

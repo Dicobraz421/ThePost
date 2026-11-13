@@ -15,7 +15,7 @@
 
 use std::fmt::Write as _;
 
-use tp_contracts::dav::CollectionKind;
+use tp_contracts::dav::{CollectionKind, GAL_COLLECTION_NAME};
 
 /// Префикс пространства DAV.
 pub const PREFIX: &str = "/dav/";
@@ -140,14 +140,12 @@ pub(crate) const INBOX: &str = "inbox";
 /// Имя ресурса исходящих приглашений в доме календарей (`schedule-outbox-URL`).
 pub(crate) const OUTBOX: &str = "outbox";
 
-/// Имя глобальной адресной книги в доме адресных книг (сегмент URL).
-pub(crate) const GAL: &str = "gal";
-
-/// Имя зарезервировано: ресурсы планирования дома календарей, глобальная адресная книга дома адресных книг.
+/// Имя зарезервировано: ресурсы планирования дома календарей, глобальная адресная книга дома адресных книг
+/// ([`GAL_COLLECTION_NAME`]).
 pub(crate) fn reserved(kind: CollectionKind, name: &str) -> bool {
     match kind {
         CollectionKind::Calendar => name == INBOX || name == OUTBOX,
-        CollectionKind::AddressBook => name == GAL,
+        CollectionKind::AddressBook => name == GAL_COLLECTION_NAME,
     }
 }
 

@@ -38,13 +38,14 @@ pub fn exit_code(report: &VerifyReport) -> i32 {
 /// Краткий текст отчёта для терминала.
 pub fn summary(report: &VerifyReport) -> String {
     let mut out = format!(
-        "verify{}: объектов {}, записей {}, «сирот» {} (удалено {}), повреждённых записей {} (помечено {}), ошибок {}\n",
+        "verify{}: объектов {}, записей {}, «сирот» {} (удалено {}), пропало {}, неверный размер {} (помечено повреждёнными {}), ошибок {}\n",
         if report.fix { " --fix" } else { "" },
         report.objects_listed,
         report.records_checked,
         report.orphans,
         report.orphans_deleted,
-        report.damaged,
+        report.missing,
+        report.size_mismatch,
         report.damaged_marked,
         report.errors,
     );
@@ -223,14 +224,18 @@ mod tests {
         );
 
         let report = verifier.run(false).await.expect("verify");
-        assert_eq!((report.orphans, report.damaged), (1, 2), "{report:?}");
+        assert_eq!(
+            (report.orphans, report.missing, report.size_mismatch),
+            (1, 1, 1),
+            "{report:?}"
+        );
         assert_eq!(exit_code(&report), 1);
         assert!(store.contains(&orphan), "без --fix ничего не удаляется");
         let json = report.to_json().expect("json");
         assert!(json.contains(&orphan.path()), "{json}");
         let text = summary(&report);
         assert!(
-            text.contains("«сирот» 1") && text.contains("повреждённых записей 2"),
+            text.contains("«сирот» 1") && text.contains("пропало 1, неверный размер 1"),
             "{text}"
         );
 
