@@ -92,8 +92,8 @@ impl EndpointConfig {
         }
     }
 
+    /// `peer` — в канонической форме.
     fn expects_proxy_header(&self, peer: IpAddr) -> bool {
-        let peer = peer.to_canonical();
         self.proxy_protocol
             && (self.trusted_proxies.is_empty()
                 || self.trusted_proxies.iter().any(|c| c.contains(peer)))
@@ -314,8 +314,8 @@ impl Listener {
         let local = tcp.local_addr()?;
         Ok(Incoming {
             tcp,
-            peer,
-            local,
+            peer: canonical(peer),
+            local: canonical(local),
             cfg: self.cfg.clone(),
             tls: self.tls.clone(),
             client_auth: self.client_auth.clone(),
@@ -343,7 +343,7 @@ impl fmt::Debug for Incoming {
 }
 
 impl Incoming {
-    /// Адрес TCP-собеседника (балансировщик при PROXY protocol).
+    /// Адрес TCP-собеседника (балансировщик при PROXY protocol), в канонической форме.
     pub fn peer(&self) -> SocketAddr {
         self.peer
     }
@@ -384,7 +384,8 @@ impl Incoming {
     }
 }
 
-/// Сведения о соединении для протокола, журналов и rate limit.
+/// Сведения о соединении для протокола, журналов и rate limit. Адреса — в канонической форме:
+/// потребители их не нормализуют.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnInfo {
     /// Адрес клиента: из заголовка PROXY или адрес TCP-собеседника.
@@ -503,6 +504,13 @@ impl AsyncWrite for Stream {
     }
 }
 
+/// Адрес в канонической форме ([`IpAddr::to_canonical`]): IPv4, отображённый в IPv6 (`::ffff:a.b.c.d` от
+/// двухстекового `[::]` или из PROXY), — адрес IPv4 `a.b.c.d`. Единственное место нормализации адреса соединения:
+/// через неё проходят адреса при приёме ([`Listener::accept`], заголовок PROXY, служебный HTTP).
+pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 /// Читает заголовок PROXY v2 ровно по его длине (данные протокола за ним остаются в сокете).
 /// `Some((клиент, адрес назначения))` — команда PROXY с адресами TCP; `None` — LOCAL (проверка балансировщика)
 /// или адреса не IP.
@@ -528,8 +536,11 @@ async fn read_proxy_header(
             SocketAddr::new(a.destination_address.into(), a.destination_port),
         )),
         Addresses::IPv6(a) => Some((
-            SocketAddr::new(a.source_address.into(), a.source_port),
-            SocketAddr::new(a.destination_address.into(), a.destination_port),
+            canonical(SocketAddr::new(a.source_address.into(), a.source_port)),
+            canonical(SocketAddr::new(
+                a.destination_address.into(),
+                a.destination_port,
+            )),
         )),
         Addresses::Unspecified | Addresses::Unix(_) => None,
     })
@@ -643,6 +654,39 @@ mod tests {
             .expect("write");
         let err = server.await.expect("join").expect_err("no header");
         assert!(err.to_string().contains("proxy protocol"), "{err}");
+    }
+
+    /// PLT-34: IPv4-клиент двухстекового `[::]` и IPv4, отображённый в IPv6, из PROXY v2 — адреса IPv4.
+    #[tokio::test]
+    async fn dual_stack_and_proxy_addresses_are_canonical() {
+        let cfg = EndpointConfig::new(addr("[::]:0"));
+        let l = Listener::bind(&cfg, None).expect("bind [::]");
+        let port = l.local_addr().expect("addr").port();
+        let server = tokio::spawn(serve_one(l));
+        let mut c = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        c.write_all(b"plain").await.expect("write");
+        let (info, _) = server.await.expect("join").expect("establish");
+        assert_eq!(info.client, c.local_addr().expect("addr"));
+        assert!(info.client.is_ipv4(), "{}", info.client);
+        assert_eq!(info.local, addr(&format!("127.0.0.1:{port}")));
+
+        let mut cfg = EndpointConfig::new(addr("127.0.0.1:0"));
+        cfg.proxy_protocol = true;
+        let (l, at) = listener(cfg, None).await;
+        let server = tokio::spawn(serve_one(l));
+        let mut c = TcpStream::connect(at).await.expect("connect");
+        let mut data = proxy_header(
+            Command::Proxy,
+            "[::ffff:10.0.0.1]:4242",
+            "[::ffff:198.51.100.1]:993",
+        );
+        data.extend_from_slice(b"hello");
+        c.write_all(&data).await.expect("write");
+        let (info, _) = server.await.expect("join").expect("establish");
+        assert_eq!(info.client, addr("10.0.0.1:4242"));
+        assert_eq!(info.local, addr("198.51.100.1:993"));
     }
 
     #[tokio::test]
