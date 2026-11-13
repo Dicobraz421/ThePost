@@ -29,6 +29,7 @@ jobs:
       rust: ${{ steps.d.outputs.rust }}
       deps: ${{ steps.d.outputs.deps }}
       console: ${{ steps.d.outputs.console }}
+      openapi: ${{ steps.d.outputs.openapi }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -43,6 +44,8 @@ jobs:
         run: |
           if [ -z "$BASE" ]; then
             echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"
+            # Сверка схемы с копией консоли — только PR и очередь (CI-11): расхождение не валит main и артефакт release.
+            echo openapi=false >> "$GITHUB_OUTPUT"
             if [ -f console/package-lock.json ]; then echo console=true; else echo console=false; fi >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -54,8 +57,10 @@ jobs:
           if [ "$EVENT" = pull_request ]; then
             python3 .github/lane_check.py lanes.toml changed.txt "$HEAD_REF"
           fi
-          # Веб-консоль (console/) Rust не трогает: её проверяет job console (CI-06).
-          if grep -qvE '^(docs/|console/|[^/]*\.md$|.*/README\.md$)' changed.txt; then
+          # Веб-консоль (console/) Rust не трогает: её проверяет job console (CI-06). Кроме копии схемы Admin API:
+          # её сверяет со схемой бинарного файла job test (CI-11).
+          if grep -qvE '^(docs/|console/|[^/]*\.md$|.*/README\.md$)' changed.txt \
+            || grep -qx 'console/src/api/openapi.json' changed.txt; then
             echo rust=true >> "$GITHUB_OUTPUT"
           else
             echo rust=false >> "$GITHUB_OUTPUT"
@@ -70,6 +75,12 @@ jobs:
           else
             echo console=false >> "$GITHUB_OUTPUT"
           fi
+          # Схема Admin API (utoipa) — только в tp-admin; копия консоли — console/src/api/openapi.json.
+          if grep -qE '^(crates/tp-admin/|console/src/api/openapi\.json$)' changed.txt; then
+            echo openapi=true >> "$GITHUB_OUTPUT"
+          else
+            echo openapi=false >> "$GITHUB_OUTPUT"
+          fi
 
   fmt:
     needs: changes
@@ -79,17 +90,23 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - run: cargo fmt --all --check
 
+  # Фича gssapi (решение 107, CI-12) — как в выпуске: код Kerberos проверяется на каждом PR. libgssapi-sys нужны
+  # заголовки libkrb5 и libclang (bindgen). Тесты — без фичи: механизм с системной Kerberos проверяется вручную (AUTH-05).
   clippy:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: libkrb5 и libclang
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libkrb5-dev libclang-dev >/dev/null
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: clippy
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked --features thepost/gssapi
 
   test:
     needs: changes
@@ -118,6 +135,31 @@ jobs:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --locked --profile ci --no-tests=pass
       - run: cargo test --doc --workspace --locked
+      # Схема Admin API = копия консоли (решение 74, CI-11): `thepost admin openapi` (APP-37, без узла) — бинарь,
+      # собранный nextest для интеграционных тестов thepost, без отдельной сборки. Сравнение — по содержанию (jq -S):
+      # копию снимают и `curl` с узла (console/README.md), порядок ключей там не алфавитный. Свежая схема при
+      # расхождении — артефакт openapi.json.
+      - id: openapi
+        name: Схема Admin API = console/src/api/openapi.json
+        if: needs.changes.outputs.openapi == 'true'
+        shell: bash
+        run: |
+          bin=target/debug/thepost
+          [ -x "$bin" ] || { echo "::error::$bin не собран nextest — сверять схему нечем"; exit 1; }
+          "$bin" admin openapi -o "$RUNNER_TEMP/openapi.json"
+          if ! diff -u --label console/src/api/openapi.json --label 'thepost admin openapi' \
+            <(jq -S . console/src/api/openapi.json) <(jq -S . "$RUNNER_TEMP/openapi.json"); then
+            echo "::error file=console/src/api/openapi.json::схема Admin API разошлась с копией консоли —" \
+              "перегенерировать схему консоли: thepost admin openapi -o console/src/api/openapi.json," \
+              "затем (cd console && npm run gen:api)"
+            exit 1
+          fi
+          echo "схема Admin API совпадает с console/src/api/openapi.json"
+      - if: failure() && steps.openapi.outcome == 'failure'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: openapi.json
+          path: ${{ runner.temp }}/openapi.json
 
   # Поставка без интерпретаторов (решение 2026-11-01, SRS 7.2; CI-05): самопроверка interp_check.py и базовый
   # образ последней стадии deploy/docker/Dockerfile. Готовый образ и архивы проверяет beta.yml до публикации.
@@ -196,10 +238,19 @@ jobs:
         with:
           target: x86_64-unknown-linux-gnu
           save-cache: ${{ github.ref == 'refs/heads/main' }}
+          console-archive: thepost-console
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: thepost-linux-x86_64
           path: ${{ steps.build.outputs.binary }}
+          if-no-files-found: error
+      # Архив веб-консоли (CI-10), как в бете: console/dist, вшитая в этот бинарь.
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: thepost-console
+          path: |
+            ${{ steps.build.outputs.console-archive }}
+            ${{ steps.build.outputs.console-archive }}.sha256
           if-no-files-found: error
 
   # Единственный required check: зелёный, если всё нужное прошло или было пропущено.

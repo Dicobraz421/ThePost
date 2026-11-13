@@ -10,10 +10,13 @@
 # CI-06: build и repro собирают console/dist (.github/actions/console) до cross build (фича `console` крейта thepost).
 # CI-08: образ — с консолью (deploy/docker/Dockerfile, CONSOLE=1 по умолчанию, DEP-35); build (x86_64) и image
 # проверяют, что thepost отвечает на GET /console/ страницей консоли (.github/actions/console-check).
+# CI-10 (решение 68): архив веб-консоли thepost-console-<тег>.tar.gz (и .sha256) — console/dist сборки x86_64, что
+# вшита в бинарь (console-check сверяет index.html); repro сверяет sha256 архива; подписан, как остальные.
 # CI-14 (решение 116): сборка build и repro — .github/actions/release-build (её же берёт артефакт ci.yml): cross под
 # базовый x86-64 без AVX2, бинарь x86_64 запускается на qemu Nehalem — падение валит сборку.
 # CI-13 (решение 111): образ ещё и с тегом версии выпуска — appVersion из deploy/helm/thepost/Chart.yaml (источник
 # версии; чарт по умолчанию берёт тот же тег). Все теги — один digest: подпись cosign и SBOM образа — на все.
+# CI-12 (решение 107): build и repro — с фичей gssapi (release-build, libkrb5 в образе cross).
 name: Beta
 
 on:
@@ -84,17 +87,21 @@ jobs:
         target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
     env:
       PKG: thepost-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
+      CONSOLE: thepost-console-${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@v7.0.1
+      # Консоль вшивается одинаково для обеих целей: архив консоли — от x86_64 (его же бинарь запускается на раннере).
       - id: build
         uses: ./.github/actions/release-build
         with:
           target: ${{ matrix.target }}
-      # Консоль вшивается одинаково для обеих целей; aarch64 на раннере x86_64 не запускается.
+          console-archive: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && env.CONSOLE || '' }}
+      # aarch64 на раннере x86_64 не запускается.
       - if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: ./.github/actions/console-check
         with:
           binary: ${{ steps.build.outputs.binary }}
+          index: console/dist/index.html
       - name: Архив
         shell: bash
         run: |
@@ -110,6 +117,15 @@ jobs:
           path: |
             dist/${{ env.PKG }}.tar.gz
             dist/${{ env.PKG }}.tar.gz.sha256
+          if-no-files-found: error
+      # Без interp_check: в архиве консоли — скрипты браузера (.js), узел его не исполняет.
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ${{ env.CONSOLE }}
+          path: |
+            ${{ steps.build.outputs.console-archive }}
+            ${{ steps.build.outputs.console-archive }}.sha256
           if-no-files-found: error
 
   # OCI-образ из deploy/docker/Dockerfile (linux/amd64), push в ghcr.io и подпись cosign по digest.
@@ -188,15 +204,23 @@ jobs:
         target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
     env:
       PKG: thepost-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
+      CONSOLE: thepost-console-${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/release-build
+      - id: build
+        uses: ./.github/actions/release-build
         with:
           target: ${{ matrix.target }}
           cache: 'false'
+          console-archive: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && env.CONSOLE || '' }}
       - uses: actions/download-artifact@v8.0.2
         with:
           name: ${{ env.PKG }}
+          path: ${{ runner.temp }}/ref
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: ${{ env.CONSOLE }}
           path: ${{ runner.temp }}/ref
       - name: Сравнение хэшей
         shell: bash
@@ -213,6 +237,22 @@ jobs:
             exit 1
           fi
           echo "${{ matrix.target }}: воспроизводима, sha256 $a" >> "$GITHUB_STEP_SUMMARY"
+      - name: Сравнение хэшей архива консоли
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          REF: ${{ runner.temp }}/ref/${{ env.CONSOLE }}.tar.gz
+          NEW: ${{ steps.build.outputs.console-archive }}
+        run: |
+          a=$(sha256sum < "$REF" | cut -d' ' -f1)
+          b=$(sha256sum < "$NEW" | cut -d' ' -f1)
+          echo "build: $a"; echo "repro: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::error::архив консоли невоспроизводим: $a != $b"
+            echo "консоль: невоспроизводима ($a / $b)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "консоль: воспроизводима, sha256 $a" >> "$GITHUB_STEP_SUMMARY"
 
   # Выпуск не ждёт образа: сбой ghcr.io — красный job image, бета выходит без раздела об образе.
   release:
@@ -229,9 +269,9 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: actions/download-artifact@v8.0.2
         with:
-          # Только архивы беты: build-push-action кладёт в прогон ещё запись сборки (*.dockerbuild),
+          # Только архивы беты и консоли: build-push-action кладёт в прогон ещё запись сборки (*.dockerbuild),
           # её загрузка падает и роняла выпуск (прогон 43046334824).
-          pattern: thepost-beta-*
+          pattern: thepost-*
           path: ${{ runner.temp }}/dist
           merge-multiple: true
       - name: SBOM (SPDX по Cargo.lock)
@@ -279,6 +319,11 @@ jobs:
           ```
 
           SBOM — `thepost-@TAG@.spdx.json` (SPDX JSON по `Cargo.lock`, syft).
+
+          ## Веб-консоль
+
+          `thepost-console-@TAG@.tar.gz` — веб-консоль для раздачи любым веб-сервером: те же файлы, что вшиты
+          в бинарный файл (`/console/`).
           EOF
           if [ -n "$IMAGE" ]; then
             cat >> notes.md <<'EOF'

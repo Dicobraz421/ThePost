@@ -16,6 +16,8 @@
 //! (`tp_dav::ItipInbox`) — у CalDAV, JMAP и доставки узла (iMIP извне и письма-приглашения из почтового клиента,
 //! `Delivery::with_itip`, права отправки — `Delivery::with_authz`); приглашения
 //! внешним участникам — письмом (`tp_dav::ImipSender`) через ту же доставку, что у JMAP; занятость — `PgMeta`.
+//! Применённые сообщения во входящих планирования (`dav.schedule_keep_processed`) удаляет по сроку роль maintenance
+//! (`crate::roles::ItipPurge`, APP-53).
 //!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
@@ -1882,7 +1884,7 @@ mod tests {
         crate::testutil::drop_database(&url, &db_name).await;
     }
 
-    /// Ответ JMAP на один вызов `method` (APP-65).
+    /// Ответ JMAP на один вызов `method` (APP-65, APP-53).
     async fn jmap_call(
         jmap: &tp_jmap::Jmap,
         p: &Principal,
@@ -1890,7 +1892,11 @@ mod tests {
         args: serde_json::Value,
     ) -> serde_json::Value {
         let body = serde_json::json!({
-            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve"],
+            "using": [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:sieve",
+                "urn:ietf:params:jmap:calendars",
+            ],
             "methodCalls": [[method, args, "c0"]],
         });
         let resp = jmap
@@ -2047,6 +2053,207 @@ mod tests {
 
         jmap.shutdown();
         drop((services, managesieve, jmap, meta));
+        crate::testutil::drop_database(&url, &db_name).await;
+    }
+
+    /// APP-53: событие с участником, созданное в JMAP узла (`Services::jmap`, `sendSchedulingMessages`), — в
+    /// календаре участника и (`dav.schedule_keep_processed`) применённым сообщением во входящих его планирования;
+    /// по истечении `dav.schedule_processed_ttl` его удаляет шаг очистки роли maintenance (`Purge` с `ItipPurge`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn jmap_invite_reaches_attendee_inbox() {
+        use tp_contracts::dav::{CollectionKind, DavStore};
+        use tp_contracts::ids::DomainId;
+        use tp_contracts::meta::{AccountKind, AccountUpsert};
+        use tp_contracts::transport::{AcceptedDomain, DomainKind, TransportStore};
+
+        const ALICE: &str = "alice@corp.example";
+        const BOB: &str = "bob@corp.example";
+        const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
+        const UID: &str = "app53-meeting";
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = crate::testutil::db_pool(&url_db).await;
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
+        let meta = PgMeta::new(pool, tp_meta::MetaConfig::default()).with_bus(bus.clone());
+        let cfg = crate::sections::registry_of(crate::modules::BUILTIN)
+            .expect("registry")
+            .parse(
+                "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
+                 database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\n\
+                 blob:\n  url: file:///var/lib/thepost/blob\n\
+                 dav:\n  schedule_keep_processed: true\n  schedule_processed_ttl: 1s\n",
+                Vec::new(),
+            )
+            .expect("config");
+        let ext = Registry::default();
+        let metrics = tp_platform::Metrics::default();
+        let services = Services::build(Base {
+            cfg: &cfg,
+            meta: meta.clone(),
+            blob: Arc::new(tp_testkit::MemBlobStore::default()),
+            bus: bus.clone(),
+            secrets: Arc::new(tp_testkit::MemSecretStore::default()),
+            ext: &ext,
+            metrics: &metrics,
+            node: NodeId::new("app-53").expect("node"),
+        })
+        .await
+        .expect("services");
+        let t = TenantId::DEFAULT;
+
+        let version = TransportStore::cluster(&meta)
+            .await
+            .expect("cluster")
+            .version;
+        let domain = DomainId::new();
+        TransportStore::put_domain(
+            &meta,
+            version,
+            &AcceptedDomain {
+                id: domain,
+                tenant: t,
+                name: "corp.example".into(),
+                kind: DomainKind::Authoritative,
+            },
+        )
+        .await
+        .expect("domain");
+        let mut ids = std::collections::HashMap::new();
+        for login in [ALICE, BOB] {
+            let acc = AccountStore::upsert(
+                &meta,
+                t,
+                AccountUpsert {
+                    domain,
+                    login: login.into(),
+                    display_name: login.into(),
+                    external_id: None,
+                    enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
+                },
+            )
+            .await
+            .expect("account");
+            ids.insert(login, acc.id);
+        }
+        let p = Principal {
+            tenant: t,
+            account: ids[ALICE],
+            login: ALICE.into(),
+            groups: BTreeSet::new(),
+            scopes: None,
+        };
+        let bob = AccountScope {
+            tenant: t,
+            account: ids[BOB],
+        };
+
+        let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
+        let jmap_cfg = (*cfg.section::<tp_jmap::JmapConfig>(JMAP).expect("jmap")).clone();
+        let jmap = services.jmap(&ext, jmap_cfg, &smtp, None).expect("jmap");
+        let session = jmap.session(&p, "https://mail.corp.example");
+        let account = session["primaryAccounts"][CALENDARS]
+            .as_str()
+            .unwrap_or_else(|| panic!("{session}"))
+            .to_owned();
+        let cal = jmap_call(
+            &jmap,
+            &p,
+            "Calendar/set",
+            serde_json::json!({"accountId": account, "create": {"c": {"name": "Работа"}}}),
+        )
+        .await;
+        assert!(cal["created"]["c"]["id"].is_string(), "{cal}");
+        let set = jmap_call(
+            &jmap,
+            &p,
+            "CalendarEvent/set",
+            serde_json::json!({
+                "accountId": account,
+                "sendSchedulingMessages": true,
+                "create": {"e": {
+                    "uid": UID,
+                    "title": "Планёрка",
+                    "start": "2027-01-11T10:00:00",
+                    "timeZone": "Europe/Moscow",
+                    "duration": "PT1H",
+                    "organizerCalendarAddress": format!("mailto:{ALICE}"),
+                    "participants": {
+                        "a": {"@type": "Participant", "calendarAddress": format!("mailto:{ALICE}"),
+                              "roles": {"owner": true}},
+                        "b": {"@type": "Participant", "calendarAddress": format!("mailto:{BOB}"),
+                              "roles": {"attendee": true}, "participationStatus": "needs-action",
+                              "expectReply": true},
+                    },
+                }},
+            }),
+        )
+        .await;
+        assert!(set["created"]["e"]["id"].is_string(), "{set}");
+
+        // Участник: событие в календаре и применённое сообщение во входящих планирования.
+        let mut invited = false;
+        for c in DavStore::list_collections(&meta, bob, CollectionKind::Calendar)
+            .await
+            .expect("calendars")
+        {
+            invited |= DavStore::object_by_uid(&meta, bob, c.id, UID)
+                .await
+                .expect("object")
+                .is_some();
+        }
+        assert!(invited, "приглашения из JMAP нет в календаре участника");
+        let processed = || {
+            let meta = meta.clone();
+            async move {
+                DavStore::inbox_list(&meta, bob)
+                    .await
+                    .expect("inbox")
+                    .items
+                    .into_iter()
+                    .filter(|i| tp_dav::deliver::processed(&i.name))
+                    .count()
+            }
+        };
+        assert_eq!(
+            processed().await,
+            1,
+            "приглашения нет во входящих участника"
+        );
+
+        // Шаг очистки роли maintenance после срока хранения удаляет применённое сообщение.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let purge = crate::roles::Purge {
+            meta: meta.clone(),
+            interval: std::time::Duration::from_secs(3600),
+            admin_token_retention: std::time::Duration::from_secs(3600),
+            probe: crate::roles::PurgeProbe::new(),
+            itip: Some(crate::roles::ItipPurge {
+                tenant: t,
+                inbox: services.itip.clone(),
+            }),
+        };
+        let done = purge.step().await;
+        assert_eq!(
+            done.itip_processed
+                .as_ref()
+                .expect("шаг")
+                .as_ref()
+                .expect("очистка"),
+            &1,
+            "{done:?}"
+        );
+        assert_eq!(processed().await, 0, "применённое сообщение не удалено");
+
+        jmap.shutdown();
+        drop((services, jmap, meta));
         crate::testutil::drop_database(&url, &db_name).await;
     }
 }
