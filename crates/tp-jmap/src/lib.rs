@@ -10,6 +10,7 @@
 //! - [`submission`] — Identity/get, set и EmailSubmission/get, changes, query, queryChanges, set: отправка сразу и
 //!   отложенная (`sendAt`, отмена) через [`Outbound`](tp_contracts::queue::Outbound), записи — `SubmissionStore` (RFC 8621 §6–7);
 //! - `push` — EventSource и WebSocket (RFC 8620 §7, RFC 8887) по шине уведомлений;
+//! - `disable` — закрытие соединений push заблокированной учётной записи по `AccountDisabled` (JMAP-41);
 //! - `fuzz` — проверки разбора для целей cargo-fuzz `crates/tp-jmap/fuzz` (JMAP-09; не API);
 //! - `audit` — запись действий с ящиком в `MailboxAudit` (JMAP-18): отправка от чужого адреса, по политике — удаление,
 //!   перенос, отправка и изменение правил владельцем;
@@ -47,6 +48,7 @@ mod calendars;
 mod contact_card;
 mod contacts;
 pub mod core;
+mod disable;
 mod email_get;
 mod email_query;
 mod email_set;
