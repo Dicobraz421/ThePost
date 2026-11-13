@@ -1,4 +1,4 @@
-//! Admin REST API: ящики, политики, экспорт/импорт, корзина, Legal Hold, аудит (SRS 5.2, 5.3).
+//! Admin REST API: ящики, политики, экспорт/импорт, корзина, Legal Hold, аудит, общий доступ, ресурсы (SRS 5.2, 5.3).
 //!
 //! - [`server`] — каркас: HTTP (`axum`), OpenAPI (`utoipa`), вход Bearer OIDC, роли администраторов с областью,
 //!   маршруты модулей, ошибки;
@@ -13,6 +13,9 @@
 //! - [`transport`] — настройки транспорта: принятые домены, доверенные источники, политики доменов назначения;
 //! - [`directory`] — адресная книга: почтовые контакты, дерево подразделений, фильтры динамических групп;
 //! - [`mailboxes`] — списки отправителей ящика, отключённые ящики, остановка синхронизации, аудит доступа к ящикам;
+//! - [`sharing`] — общий доступ к календарям и адресным книгам: политика организации, представители, права на
+//!   коллекции;
+//! - [`resources`] — ресурсы (переговорные, оборудование) и правила бронирования;
 //! - [`sieve`] — правила Sieve и автоответ учётной записи, скрипт организации: проверка текста до записи;
 //! - `cors` — CORS `/api/v1/*` для консоли на отдельном веб-сервере (`admin.console.cors_origins`);
 //! - [`console`] — веб-консоль: вшитая статика `console/dist` (фича `console`), маршруты SPA, заголовки безопасности;
@@ -30,8 +33,10 @@ pub mod export;
 pub mod groups;
 pub mod init;
 pub mod mailboxes;
+pub mod resources;
 pub mod retention;
 pub mod server;
+pub mod sharing;
 pub mod sieve;
 #[cfg(test)]
 mod testenv;
@@ -48,4 +53,5 @@ pub use init::{
     InitConfig, InitGranted, InitReply, InitRequest, OidcClient, OidcLogin, SessionInfo,
 };
 pub use server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
+pub use sharing::SharingStores;
 pub use sieve::{ScriptCheck, ScriptError};

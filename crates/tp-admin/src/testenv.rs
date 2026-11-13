@@ -1,6 +1,6 @@
 //! Окружение тестов: Admin API поверх in-memory реализаций tp-testkit; запросы — `tower::ServiceExt::oneshot`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 use tower::ServiceExt;
 use tp_contracts::admin_audit::AdminAuditRecord;
 use tp_contracts::auth::Principal;
+use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore};
 use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
@@ -20,15 +21,21 @@ use tp_contracts::meta::{
     Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
     DisabledAccount, ExistingContent, Flags, QuotaUsage, SpecialUse,
 };
-use tp_contracts::{AccountId, DomainId, MessageId, Result, TenantId};
+use tp_contracts::sharing::{
+    BookingPolicy, CollectionAcl, CollectionAclEntry, CollectionRights, Delegate, DelegateStore,
+    Delegation, ResourceStore, SharedCollection, SharingPolicy, SharingPolicyStore,
+    collection_rights, validate_identifier,
+};
+use tp_contracts::{AccountId, DomainId, Error, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemAuditLog, MemBlobIndex, MemBlobStore,
     MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies,
     MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
 };
-use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
+use tp_testkit::{MemAddressBook, MemDav, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
 use crate::server::{Admin, AdminConfig, AdminRole, Deps, RoleBinding};
+use crate::sharing::SharingStores;
 use crate::sieve::ScriptError;
 
 /// Издатель токенов OIDC тестов (`Deps::oidc_issuer`).
@@ -179,6 +186,267 @@ impl AccountStore for CountedAccounts {
     }
 }
 
+/// Общий доступ, представители, ресурсы и политика организации в памяти (CTR-48) — до реализаций tp-testkit;
+/// коллекции заводит тест ([`MemSharing::add_collection`]), учётные записи — [`MemMetadata`].
+#[derive(Clone)]
+pub struct MemSharing {
+    meta: MemMetadata,
+    dav: MemDav,
+    state: Arc<Mutex<SharingState>>,
+}
+
+#[derive(Default)]
+struct SharingState {
+    acl: HashMap<(AccountScope, CollectionId), Vec<CollectionAclEntry>>,
+    delegates: HashMap<AccountScope, Vec<Delegate>>,
+    booking: HashMap<AccountScope, BookingPolicy>,
+    policy: HashMap<TenantId, SharingPolicy>,
+}
+
+impl MemSharing {
+    pub fn new(meta: MemMetadata) -> Self {
+        Self {
+            meta,
+            dav: MemDav::new(),
+            state: Arc::default(),
+        }
+    }
+
+    /// Хранилища Admin API (`Admin::with_sharing`).
+    pub fn stores(&self) -> SharingStores {
+        SharingStores {
+            acl: Arc::new(self.clone()),
+            delegates: Arc::new(self.clone()),
+            resources: Arc::new(self.clone()),
+            policy: Arc::new(self.clone()),
+            collections: Arc::new(self.dav.clone()),
+        }
+    }
+
+    /// Новый календарь `name` учётной записи без записей прав.
+    pub async fn add_collection(&self, owner: AccountScope, name: &str) -> CollectionId {
+        let c = Collection::new(CollectionKind::Calendar, name);
+        self.dav
+            .create_collection(owner, c.clone())
+            .await
+            .expect("collection");
+        c.id
+    }
+
+    /// Коллекция существует ([`MemDav`]); нет — `NotFound`.
+    async fn collection(&self, owner: AccountScope, id: CollectionId) -> Result<()> {
+        self.dav
+            .get_collection(owner, id)
+            .await?
+            .map(|_| ())
+            .ok_or(Error::NotFound)
+    }
+
+    /// Правила бронирования ресурса, как хранятся.
+    pub fn booking(&self, scope: AccountScope) -> Option<BookingPolicy> {
+        self.lock().booking.get(&scope).cloned()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SharingState> {
+        self.state.lock().expect("sharing")
+    }
+
+    async fn existing(&self, scope: AccountScope) -> Result<Account> {
+        self.meta
+            .get(scope.tenant, scope.account)
+            .await?
+            .ok_or(Error::NotFound)
+    }
+}
+
+#[async_trait]
+impl CollectionAcl for MemSharing {
+    async fn collection_acl(
+        &self,
+        owner: AccountScope,
+        collection: CollectionId,
+    ) -> Result<Vec<CollectionAclEntry>> {
+        self.collection(owner, collection).await?;
+        Ok(self
+            .lock()
+            .acl
+            .get(&(owner, collection))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn set_collection_acl(
+        &self,
+        owner: AccountScope,
+        collection: CollectionId,
+        identifier: &str,
+        rights: CollectionRights,
+    ) -> Result<()> {
+        validate_identifier(identifier, false)?;
+        self.collection(owner, collection).await?;
+        let mut st = self.lock();
+        let entries = st.acl.entry((owner, collection)).or_default();
+        entries.retain(|e| e.identifier != identifier);
+        if !rights.is_empty() {
+            entries.push(CollectionAclEntry {
+                identifier: identifier.to_owned(),
+                rights,
+            });
+        }
+        Ok(())
+    }
+
+    async fn collection_rights(
+        &self,
+        owner: AccountScope,
+        collection: CollectionId,
+        identifiers: &[String],
+    ) -> Result<CollectionRights> {
+        Ok(self
+            .lock()
+            .acl
+            .get(&(owner, collection))
+            .map_or(CollectionRights::NONE, |e| {
+                collection_rights(e, identifiers)
+            }))
+    }
+
+    async fn shared_with(
+        &self,
+        scope: AccountScope,
+        identifiers: &[String],
+    ) -> Result<Vec<SharedCollection>> {
+        let mut out: Vec<SharedCollection> = self
+            .lock()
+            .acl
+            .iter()
+            .filter(|((o, _), _)| o.tenant == scope.tenant && *o != scope)
+            .map(|((o, c), e)| SharedCollection {
+                owner: o.account,
+                collection: *c,
+                rights: collection_rights(e, identifiers),
+            })
+            .filter(|s| !s.rights.is_empty())
+            .collect();
+        out.sort_by_key(|s| (s.owner, s.collection));
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl DelegateStore for MemSharing {
+    async fn delegates(&self, owner: AccountScope) -> Result<Vec<Delegate>> {
+        self.existing(owner).await?;
+        Ok(self
+            .lock()
+            .delegates
+            .get(&owner)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn set_delegate(&self, owner: AccountScope, delegate: Delegate) -> Result<()> {
+        if delegate.delegate == owner.account {
+            return Err(Error::invalid("представитель — сам владелец"));
+        }
+        self.existing(owner).await?;
+        self.existing(AccountScope {
+            tenant: owner.tenant,
+            account: delegate.delegate,
+        })
+        .await?;
+        let mut st = self.lock();
+        let list = st.delegates.entry(owner).or_default();
+        list.retain(|d| d.delegate != delegate.delegate);
+        list.push(delegate);
+        Ok(())
+    }
+
+    async fn remove_delegate(&self, owner: AccountScope, delegate: AccountId) -> Result<()> {
+        self.existing(owner).await?;
+        if let Some(list) = self.lock().delegates.get_mut(&owner) {
+            list.retain(|d| d.delegate != delegate);
+        }
+        Ok(())
+    }
+
+    async fn delegations(&self, delegate: AccountScope) -> Result<Vec<Delegation>> {
+        let mut out: Vec<Delegation> = self
+            .lock()
+            .delegates
+            .iter()
+            .filter(|(o, _)| o.tenant == delegate.tenant)
+            .flat_map(|(o, list)| {
+                list.iter()
+                    .filter(|d| d.delegate == delegate.account)
+                    .map(|d| Delegation {
+                        owner: o.account,
+                        level: d.level,
+                        schedule_on_behalf: d.schedule_on_behalf,
+                    })
+            })
+            .collect();
+        out.sort_by_key(|d| d.owner);
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl ResourceStore for MemSharing {
+    async fn booking_policy(&self, scope: AccountScope) -> Result<Option<BookingPolicy>> {
+        if self.existing(scope).await?.kind != AccountKind::Resource {
+            return Ok(None);
+        }
+        Ok(self.booking(scope))
+    }
+
+    async fn set_booking_policy(
+        &self,
+        scope: AccountScope,
+        policy: Option<BookingPolicy>,
+    ) -> Result<()> {
+        let acc = self.existing(scope).await?;
+        match policy {
+            Some(p) => {
+                p.validate()?;
+                if acc.kind != AccountKind::Resource {
+                    return Err(Error::invalid("учётная запись — не ресурс"));
+                }
+                self.lock().booking.insert(scope, p);
+            }
+            None => {
+                self.lock().booking.remove(&scope);
+            }
+        }
+        Ok(())
+    }
+
+    async fn resources(&self, tenant: TenantId) -> Result<Vec<AccountId>> {
+        let mut ids: Vec<AccountId> = self
+            .meta
+            .list(tenant, "", None, usize::MAX)
+            .await?
+            .into_iter()
+            .filter(|a| a.kind == AccountKind::Resource)
+            .map(|a| a.id)
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+}
+
+#[async_trait]
+impl SharingPolicyStore for MemSharing {
+    async fn sharing_policy(&self, tenant: TenantId) -> Result<SharingPolicy> {
+        Ok(self.lock().policy.get(&tenant).cloned().unwrap_or_default())
+    }
+
+    async fn set_sharing_policy(&self, tenant: TenantId, policy: SharingPolicy) -> Result<()> {
+        self.lock().policy.insert(tenant, policy);
+        Ok(())
+    }
+}
+
 /// Хранилища в памяти: метаданные, квоты, почтовое хранилище.
 pub struct Stores {
     pub meta: MemMetadata,
@@ -306,6 +574,8 @@ pub struct Env {
     pub addressbook: MemAddressBook,
     pub mailbox_audit: MemMailboxAudit,
     pub sync_gate: MemSyncGate,
+    /// Общий доступ, представители, ресурсы (`Admin::with_sharing`).
+    pub sharing: MemSharing,
     pub admin: Arc<Admin>,
     pub router: Router,
     pub other_tenant: TenantId,
@@ -376,16 +646,21 @@ impl Env {
 
     /// Без настроек транспорта (маршруты транспорта — 503).
     pub fn without_transport() -> Self {
-        Self::build(config(), Vec::new(), false, true)
+        Self::build(config(), Vec::new(), false, true, true)
     }
 
     /// Без локального входа (`admin init` и обмен — 503).
     pub fn without_local() -> Self {
-        Self::build(config(), Vec::new(), true, false)
+        Self::build(config(), Vec::new(), true, false, true)
+    }
+
+    /// Без общего доступа, представителей и ресурсов (их маршруты — 503).
+    pub fn without_sharing() -> Self {
+        Self::build(config(), Vec::new(), true, true, false)
     }
 
     pub fn with(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>) -> Self {
-        Self::build(cfg, modules, true, true)
+        Self::build(cfg, modules, true, true, true)
     }
 
     fn build(
@@ -393,6 +668,7 @@ impl Env {
         modules: Vec<Arc<dyn AdminRoutes>>,
         with_transport: bool,
         with_local: bool,
+        with_sharing: bool,
     ) -> Self {
         let auth = FakeAuthenticator::default();
         let other_tenant = TenantId::new();
@@ -424,6 +700,12 @@ impl Env {
         let tokens = MemLocalAdminTokens::new();
         let admin = if with_local {
             admin.with_local_tokens(Arc::new(tokens.clone()))
+        } else {
+            admin
+        };
+        let sharing = MemSharing::new(stores.meta.clone());
+        let admin = if with_sharing {
+            admin.with_sharing(sharing.stores())
         } else {
             admin
         };
@@ -470,6 +752,7 @@ impl Env {
             addressbook,
             mailbox_audit,
             sync_gate,
+            sharing,
             router: admin.clone().router(),
             admin,
             other_tenant,

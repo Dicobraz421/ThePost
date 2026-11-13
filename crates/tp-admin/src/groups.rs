@@ -423,17 +423,28 @@ async fn check_refs(a: &Admin, g: &DistributionGroup) -> Result<()> {
         accounts.extend(sa);
         groups.extend(sg);
     }
+    groups.retain(|x| *x != g.id);
+    check_ids(a, g.tenant, accounts, groups).await
+}
+
+/// Учётные записи и группы существуют в организации `tenant`; иначе `Invalid`.
+pub(crate) async fn check_ids(
+    a: &Admin,
+    tenant: TenantId,
+    mut accounts: Vec<AccountId>,
+    mut groups: Vec<GroupId>,
+) -> Result<()> {
     accounts.sort_unstable();
     accounts.dedup();
     groups.sort_unstable();
     groups.dedup();
     for x in accounts {
-        if a.d.accounts.get(g.tenant, x).await?.is_none() {
+        if a.d.accounts.get(tenant, x).await?.is_none() {
             return Err(Error::invalid(format!("unknown account {x}")));
         }
     }
     for x in groups {
-        if x != g.id && a.d.groups.get(g.tenant, x).await?.is_none() {
+        if a.d.groups.get(tenant, x).await?.is_none() {
             return Err(Error::invalid(format!("unknown group {x}")));
         }
     }
