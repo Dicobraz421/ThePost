@@ -638,3 +638,62 @@ async fn shared_access_audited() {
     assert!(o.cmd("F3 FETCH 1:* BODY[]").await.contains("F3 OK"));
     assert_eq!(x.env.audit.entries().len(), 4);
 }
+
+#[tokio::test]
+async fn shared_text_search_audited() {
+    use tp_contracts::audit::{AuditAction, AuditActorKind};
+    let x = Ext::new(None).await;
+    let projects = x.projects().await;
+    share(&x, projects, "lr").await;
+    let (mut b, bob) = x.bob_with_scope().await;
+    let shared = format!("\"Other Users/{LOGIN}/Projects\"");
+    assert!(
+        b.cmd(&format!("S1 SELECT {shared}"))
+            .await
+            .contains("S1 OK")
+    );
+    let searches = || {
+        x.env
+            .audit
+            .entries()
+            .into_iter()
+            .filter(|e| e.action == AuditAction::Search)
+            .collect::<Vec<_>>()
+    };
+    // Представитель ищет по тексту в общем ящике — одна запись со строкой запроса, без найденных писем.
+    let r = b.cmd("Q1 SEARCH BODY {14+}\r\nдоговор").await;
+    assert!(r.contains("Q1 OK"), "{r}");
+    let e = searches();
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert_eq!(e[0].scope, x.env.scope());
+    assert_eq!(e[0].actor, BOB);
+    assert_eq!(e[0].actor_account, Some(bob.account));
+    assert_eq!(e[0].actor_kind, AuditActorKind::Delegate);
+    assert_eq!(e[0].object.mailbox, Some(projects));
+    assert_eq!(e[0].object.message, None);
+    assert_eq!(e[0].object.detail.as_deref(), Some("BODY \"договор\""));
+    assert_eq!(e[0].client.as_deref(), Some("imap 192.0.2.7"));
+    // Поиск по заголовкам и флагам не записывается.
+    let r = b
+        .cmd("Q2 SEARCH SUBJECT hi FLAGGED HEADER X-Project Apollo")
+        .await;
+    assert!(r.contains("Q2 OK"), "{r}");
+    assert_eq!(searches().len(), 1);
+    // ESEARCH: в пояснении — только условия по тексту, без прочих критериев.
+    let r = b
+        .cmd("Q3 UID SEARCH RETURN (COUNT) OR TEXT \"a \\\"b\\\"\" BODY Hello SINCE 1-Jan-2020")
+        .await;
+    assert!(r.contains("Q3 OK"), "{r}");
+    let e = searches();
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!(
+        e[1].object.detail.as_deref(),
+        Some("TEXT \"a \\\"b\\\"\" BODY \"Hello\"")
+    );
+    // Владелец в своём ящике — записей нет.
+    let mut o = x.login(LOGIN, PASSWORD).await;
+    assert!(o.cmd("S2 SELECT Projects").await.contains("S2 OK"));
+    let r = o.cmd("Q4 SEARCH BODY Hello").await;
+    assert!(r.contains("Q4 OK"), "{r}");
+    assert_eq!(searches().len(), 2);
+}
