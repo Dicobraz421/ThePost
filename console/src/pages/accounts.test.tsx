@@ -4,6 +4,8 @@ import { afterEach, expect, test } from "vitest";
 import { BASE, buttons, open, sent } from "../test-app";
 
 const empty = {
+  archive_after: null,
+  archive_quota_bytes: null,
   dkim_selector: null,
   max_recipients: null,
   milter_profile: null,
