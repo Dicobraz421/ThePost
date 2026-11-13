@@ -169,6 +169,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "archive removal",
         include_str!("../migrations/0036_archive_removal.sql"),
     ),
+    (
+        37,
+        "inbox log",
+        include_str!("../migrations/0037_inbox_log.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

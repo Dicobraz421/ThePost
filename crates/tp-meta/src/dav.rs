@@ -15,7 +15,9 @@
 //! повторяющихся событий (`dav_objects.recurring`; META-54, решение 59) строк индекса нет: тем же запросом читаются
 //! их тела, повторы разворачивает calcard вне транзакции ([`crate::busy`]). Входящие
 //! планирования — `dav_inbox`: номера изменений из того же счётчика, но состояние календарей они не меняют
-//! (`mailbox_state.dav_inbox_state`).
+//! (`mailbox_state.dav_inbox_state`). Журнал входящих (CTR-65, META-69) — `dav_inbox.created_modseq` и надгробия
+//! `dav_inbox_tombstones`; их очищает тот же [`PgMeta::purge_dav_tombstones`], граница —
+//! `mailbox_state.dav_inbox_floor`.
 //!
 //! Книга GAL организации (CTR-60) — в основной БД, в тех же таблицах, под служебной «учётной записью» организации
 //! (`gal_scope`: идентификатор — идентификатор организации) со своей строкой `mailbox_state` (счётчик `ModSeq`
@@ -614,6 +616,19 @@ async fn advance_inbox(tx: &mut PgConnection, scope: AccountScope, to: ModSeq) -
     Ok(())
 }
 
+/// Состояние входящих планирования (`mailbox_state.dav_inbox_state`; строки нет — `ModSeq::ZERO`).
+async fn inbox_state(tx: &mut PgConnection, scope: AccountScope) -> Result<ModSeq> {
+    let v: Option<i64> = sqlx::query_scalar(
+        "SELECT dav_inbox_state FROM mailbox_state WHERE tenant_id = $1 AND account_id = $2",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    modseq(v.unwrap_or(0))
+}
+
 #[derive(Debug, FromRow)]
 struct InboxRow {
     item_id: Uuid,
@@ -624,28 +639,17 @@ struct InboxRow {
     body: String,
     etag: String,
     modseq: i64,
+    received_at: OffsetDateTime,
 }
 
 impl InboxRow {
     fn into_item(self) -> Result<InboxItem> {
-        // CTR-65: до META-69 (столбец времени) — время из идентификатора UUID v7, выданного при первой записи.
-        let received_at = self
-            .item_id
-            .get_timestamp()
-            .and_then(|t| {
-                let (secs, nanos) = t.to_unix();
-                let secs = i64::try_from(secs).ok()?;
-                OffsetDateTime::from_unix_timestamp(secs)
-                    .ok()
-                    .map(|at| at + time::Duration::nanoseconds(i64::from(nanos)))
-            })
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
         Ok(InboxItem {
             id: DavObjectId::from_uuid(self.item_id),
             name: self.name,
             etag: self.etag,
             modseq: modseq(self.modseq)?,
-            received_at,
+            received_at: self.received_at,
             message: InboxMessage {
                 method: self.method.parse()?,
                 uid: self.uid,
@@ -677,6 +681,8 @@ struct RecurringRow {
 enum Floor {
     Kind(CollectionKind),
     Collection(CollectionId),
+    /// Входящие планирования (`mailbox_state.dav_inbox_floor`).
+    Inbox,
 }
 
 /// `since` больше счётчика учётной записи или старше очищенных надгробий `floor` — `Conflict`; коллекция удалена
@@ -688,22 +694,25 @@ async fn check_since(
     since: ModSeq,
     floor: Floor,
 ) -> Result<()> {
-    let (calendar, collection) = match floor {
-        Floor::Kind(kind) => (kind == CollectionKind::Calendar, None),
-        Floor::Collection(id) => (false, Some(*id.as_uuid())),
+    let (which, collection) = match floor {
+        Floor::Kind(CollectionKind::Calendar) => ("calendar", None),
+        Floor::Kind(CollectionKind::AddressBook) => ("address_book", None),
+        Floor::Collection(id) => ("collection", Some(*id.as_uuid())),
+        Floor::Inbox => ("inbox", None),
     };
     let row: Option<(i64, Option<i64>)> = sqlx::query_as(
         "SELECT s.modseq,
-                CASE WHEN $4::uuid IS NOT NULL THEN
+                CASE $3 WHEN 'collection' THEN
                          (SELECT c.tombstone_floor FROM dav_collections c
                           WHERE c.tenant_id = $1 AND c.account_id = $2 AND c.collection_id = $4)
-                     WHEN $3 THEN s.dav_calendar_floor
+                     WHEN 'calendar' THEN s.dav_calendar_floor
+                     WHEN 'inbox' THEN s.dav_inbox_floor
                      ELSE s.dav_addressbook_floor END
          FROM mailbox_state s WHERE s.tenant_id = $1 AND s.account_id = $2",
     )
     .bind(scope.tenant.as_uuid())
     .bind(scope.account.as_uuid())
-    .bind(calendar)
+    .bind(which)
     .bind(collection)
     .fetch_optional(&mut *tx)
     .await
@@ -954,7 +963,9 @@ impl PgMeta {
                 let accounts: Vec<(Uuid, Uuid)> = with_system(&db.pool, move |tx| {
                     Box::pin(async move {
                         sqlx::query_as(
-                            "SELECT DISTINCT tenant_id, account_id FROM dav_tombstones WHERE deleted_at < $1",
+                            "SELECT tenant_id, account_id FROM dav_tombstones WHERE deleted_at < $1
+                             UNION
+                             SELECT tenant_id, account_id FROM dav_inbox_tombstones WHERE deleted_at < $1",
                         )
                         .bind(before)
                         .fetch_all(&mut *tx)
@@ -977,7 +988,8 @@ impl PgMeta {
     }
 }
 
-/// Очистка надгробий учётной записи `scope` старше `before` с подъёмом границ вида и коллекций.
+/// Очистка надгробий учётной записи `scope` старше `before` (DAV и входящих планирования) с подъёмом границ вида,
+/// коллекций и входящих.
 async fn purge_account(
     pool: &crate::pool::DbPool,
     scope: AccountScope,
@@ -989,6 +1001,9 @@ async fn purge_account(
         "WITH gone AS (
              DELETE FROM dav_tombstones WHERE tenant_id = $1 AND account_id = $2 AND deleted_at < $3
              RETURNING kind, collection_id, modseq
+         ), inbox_gone AS (
+             DELETE FROM dav_inbox_tombstones WHERE tenant_id = $1 AND account_id = $2 AND deleted_at < $3
+             RETURNING modseq
          ), by_collection AS (
              UPDATE dav_collections c SET tombstone_floor = greatest(c.tombstone_floor, g.floor)
              FROM (SELECT collection_id, max(modseq) AS floor FROM gone GROUP BY collection_id) g
@@ -998,10 +1013,12 @@ async fn purge_account(
                  dav_calendar_floor = greatest(s.dav_calendar_floor,
                      coalesce((SELECT max(modseq) FROM gone WHERE kind = 'calendar'), 0)),
                  dav_addressbook_floor = greatest(s.dav_addressbook_floor,
-                     coalesce((SELECT max(modseq) FROM gone WHERE kind = 'address_book'), 0))
+                     coalesce((SELECT max(modseq) FROM gone WHERE kind = 'address_book'), 0)),
+                 dav_inbox_floor = greatest(s.dav_inbox_floor,
+                     coalesce((SELECT max(modseq) FROM inbox_gone), 0))
              WHERE s.tenant_id = $1 AND s.account_id = $2
          )
-         SELECT count(*) FROM gone",
+         SELECT (SELECT count(*) FROM gone) + (SELECT count(*) FROM inbox_gone)",
     )
     .bind(scope.tenant.as_uuid())
     .bind(scope.account.as_uuid())
@@ -1972,8 +1989,9 @@ impl DavStore for PgMeta {
                 let id = existing.map_or_else(DavObjectId::new, DavObjectId::from_uuid);
                 sqlx::query(
                     "INSERT INTO dav_inbox AS i (tenant_id, account_id, item_id, name, method, uid, sender, body,
-                                                 etag, modseq)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                                                 etag, modseq, created_modseq)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+                     -- Перезапись сохраняет received_at и created_modseq (CTR-65).
                      ON CONFLICT (tenant_id, account_id, item_id) DO UPDATE
                      SET method = excluded.method, uid = excluded.uid, sender = excluded.sender,
                          body = excluded.body, etag = excluded.etag, modseq = excluded.modseq",
@@ -2009,7 +2027,7 @@ impl DavStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
             let rows: Vec<InboxRow> = sqlx::query_as(
-                "SELECT item_id, name, method, uid, sender, body, etag, modseq FROM dav_inbox
+                "SELECT item_id, name, method, uid, sender, body, etag, modseq, received_at FROM dav_inbox
                  WHERE tenant_id = $1 AND account_id = $2 ORDER BY modseq",
             )
             .bind(scope.tenant.as_uuid())
@@ -2017,45 +2035,44 @@ impl DavStore for PgMeta {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            let state: Option<i64> = sqlx::query_scalar(
-                "SELECT dav_inbox_state FROM mailbox_state WHERE tenant_id = $1 AND account_id = $2",
-            )
-            .bind(scope.tenant.as_uuid())
-            .bind(scope.account.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
+            let state = inbox_state(&mut tx, scope).await?;
             crate::commits::commit(tx).await?;
             Ok(Inbox {
                 items: rows
                     .into_iter()
                     .map(InboxRow::into_item)
                     .collect::<Result<_>>()?,
-                state: modseq(state.unwrap_or(0))?,
+                state,
             })
         })
         .await
     }
 
+    /// Удаление и надгробие — одним запросом: ресурса нет — нет и надгробия.
     async fn inbox_delete(&self, scope: AccountScope, name: &str) -> Result<ModSeq> {
         let ms = self
             .once(async move {
                 let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
-                let cur = lock_modseq(&mut tx, scope).await?;
-                let n = sqlx::query(
-                    "DELETE FROM dav_inbox WHERE tenant_id = $1 AND account_id = $2 AND name = $3",
+                let ms = lock_modseq(&mut tx, scope).await?.next();
+                let gone: Option<Uuid> = sqlx::query_scalar(
+                    "WITH gone AS (
+                         DELETE FROM dav_inbox WHERE tenant_id = $1 AND account_id = $2 AND name = $3
+                         RETURNING item_id
+                     )
+                     INSERT INTO dav_inbox_tombstones (tenant_id, account_id, modseq, item_id)
+                     SELECT $1, $2, $4, item_id FROM gone
+                     RETURNING item_id",
                 )
                 .bind(scope.tenant.as_uuid())
                 .bind(scope.account.as_uuid())
                 .bind(name)
-                .execute(&mut *tx)
+                .bind(arg(ms)?)
+                .fetch_optional(&mut *tx)
                 .await
-                .map_err(db_err)?
-                .rows_affected();
-                if n == 0 {
+                .map_err(db_err)?;
+                if gone.is_none() {
                     return Err(Error::NotFound);
                 }
-                let ms = cur.next();
                 advance_inbox(&mut tx, scope, ms).await?;
                 crate::commits::commit(tx).await?;
                 Ok(ms)
@@ -2065,21 +2082,54 @@ impl DavStore for PgMeta {
         Ok(ms)
     }
 
-    // CTR-65: до META-69 — состояние через `inbox_list`; журнал с надгробиями входящих — META-69.
     async fn inbox_state(&self, scope: AccountScope) -> Result<ModSeq> {
-        Ok(self.inbox_list(scope).await?.state)
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
+            let s = inbox_state(&mut tx, scope).await?;
+            crate::commits::commit(tx).await?;
+            Ok(s)
+        })
+        .await
     }
 
+    /// Живые ресурсы с `modseq > since` (созданы — `created_modseq > since`) и надгробия после `since` (при
+    /// `since = 0` — без надгробий) одним запросом по `ModSeq`; границу проверяет [`check_since`] после выборки.
     async fn inbox_changes(
         &self,
         scope: AccountScope,
         since: ModSeq,
         limit: usize,
     ) -> Result<Changes<DavObjectId>> {
-        let _ = (scope, since, limit);
-        Err(Error::internal(
-            "журнал входящих планирования в PostgreSQL — META-69",
-        ))
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
+            let mut rows: Vec<ChangeRow<Uuid>> = Vec::new();
+            if since <= ModSeq(i64::MAX as u64) {
+                rows = sqlx::query_as(
+                    "SELECT item_id, modseq, created_modseq > $3, false FROM dav_inbox
+                     WHERE tenant_id = $1 AND account_id = $2 AND modseq > $3
+                     UNION ALL
+                     SELECT item_id, modseq, false, true FROM dav_inbox_tombstones
+                     WHERE $3 > 0 AND tenant_id = $1 AND account_id = $2 AND modseq > $3
+                     ORDER BY 2 LIMIT $4",
+                )
+                .bind(scope.tenant.as_uuid())
+                .bind(scope.account.as_uuid())
+                .bind(arg(since)?)
+                .bind(fetch_limit(limit))
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
+            let complete = inbox_state(&mut tx, scope).await?;
+            check_since(&mut tx, scope, since, Floor::Inbox).await?;
+            crate::commits::commit(tx).await?;
+            let rows = rows
+                .into_iter()
+                .map(|(id, m, c, d)| (DavObjectId::from_uuid(id), m, c, d))
+                .collect();
+            page(rows, since, limit, complete)
+        })
+        .await
     }
 
     async fn sync_gal(

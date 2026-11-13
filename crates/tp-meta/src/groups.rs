@@ -90,7 +90,7 @@ fn senders_kind(s: &SenderRestriction) -> &'static str {
 }
 
 /// Группы организации: `ids` — только эти (`None` — все), по возрастанию идентификатора.
-async fn load(
+pub(crate) async fn load(
     tx: &mut PgConnection,
     tenant: TenantId,
     ids: Option<Vec<Uuid>>,
