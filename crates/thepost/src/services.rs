@@ -585,9 +585,8 @@ impl Services {
             store: Arc::new(self.meta.clone()),
         };
         let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
-        // Второй аргумент (`_gal`) `tp-dav` не использует: книгу GAL заполняет `Services::gal`; аргумент убирает
-        // межполосная правка `tp_dav::router_with`.
-        let router = tp_dav::router_with(deps, None, Some(self.schedule(outbound)), cfg);
+        // Книгу GAL маршруты читают из хранилища, заполняет её `Services::gal`.
+        let router = tp_dav::router_with(deps, Some(self.schedule(outbound)), cfg);
         if !well_known {
             return Ok(router);
         }
