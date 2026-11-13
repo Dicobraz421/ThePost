@@ -69,9 +69,11 @@ test("учётная запись: создание; ошибка API — в у�
   const calls = open("/accounts/create", {
     [`POST ${BASE}/accounts`]: { status: 409, body: { status: 409, title: "Conflict", detail: "имя занято" } },
   });
+  // Форма готова, когда известны роли (кнопка включена): раньше введённое сбрасывается при её подготовке.
+  const [save] = await buttons(/Сохранить/);
   fireEvent.change(await screen.findByLabelText("Имя входа"), { target: { value: "dave@example.org" } });
   fireEvent.change(screen.getByLabelText("Отображаемое имя"), { target: { value: "Дэйв" } });
-  fireEvent.click((await buttons(/Сохранить/))[0]);
+  fireEvent.click(save);
   await waitFor(() =>
     expect(sent(calls, "POST", `${BASE}/accounts`)[0]?.body).toEqual({ login: "dave@example.org", display_name: "Дэйв" }),
   );
