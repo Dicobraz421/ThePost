@@ -65,37 +65,39 @@ test("журнал доставки: поиск по отправителю и M
   expect(sent(calls, "GET", `${BASE}/delivery?message_id=m1%40example.org`)).toHaveLength(1);
 });
 
-test("журнал аудита: записи, отбор по администратору и действию на странице, страницы по next", async () => {
+test("журнал аудита: условия администратора, метода и маршрута — в запросе, страницы по next с теми же условиями", async () => {
+  const query = `${BASE}/audit?actor=bob%40example.org&method=DELETE&route=%2Fapi%2Fv1%2Forgs%2F%7Borg%7D%2Fgroups`;
   const calls = open("/audit", {
     [`GET ${BASE}/audit`]: (c) =>
-      c.path.includes("after=2")
-        ? { body: { entries: [record(3, "carol@example.org", "GET", "/api/v1/orgs/{org}/audit")], next: null } }
-        : {
-            body: {
-              entries: [
-                record(1, "alice@example.org", "POST", "/api/v1/orgs/{org}/transport/domains", 201),
-                record(2, "bob@example.org", "DELETE", "/api/v1/orgs/{org}/groups/{group}", 403),
-              ],
-              next: 2,
+      c.path === `${query}&after=2`
+        ? { body: { entries: [record(3, "bob@example.org", "DELETE", "/api/v1/orgs/{org}/groups/{group}/members")], next: null } }
+        : c.path === query
+          ? { body: { entries: [record(2, "bob@example.org", "DELETE", "/api/v1/orgs/{org}/groups/{group}", 403)], next: 2 } }
+          : {
+              body: {
+                entries: [
+                  record(1, "alice@example.org", "POST", "/api/v1/orgs/{org}/transport/domains", 201),
+                  record(2, "bob@example.org", "DELETE", "/api/v1/orgs/{org}/groups/{group}", 403),
+                ],
+                next: null,
+              },
             },
-          },
   });
   expect(await screen.findByText("alice@example.org")).toBeTruthy();
   expect(screen.getByText("DELETE /api/v1/orgs/{org}/groups/{group}")).toBeTruthy();
   expect(screen.getAllByText("администратор организации")).toHaveLength(2);
 
-  fireEvent.change(screen.getByLabelText("Администратор"), { target: { value: "BOB" } });
+  fireEvent.change(screen.getByLabelText("Администратор"), { target: { value: " bob@example.org " } });
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "Метод" }));
+  fireEvent.click(await screen.findByTitle("DELETE"));
+  fireEvent.change(screen.getByLabelText("Маршрут"), { target: { value: "/api/v1/orgs/{org}/groups" } });
+  fireEvent.click(screen.getByRole("button", { name: "Найти" }));
+  await waitFor(() => expect(sent(calls, "GET", query)).toHaveLength(1));
   await waitFor(() => expect(screen.queryByText("alice@example.org")).toBeNull());
-  expect(screen.getByText("bob@example.org")).toBeTruthy();
-  fireEvent.change(screen.getByLabelText("Действие"), { target: { value: "post" } });
-  await waitFor(() => expect(screen.queryByText("bob@example.org")).toBeNull());
-  expect(screen.getByText(/показано 0 из 2/)).toBeTruthy();
-  fireEvent.change(screen.getByLabelText("Администратор"), { target: { value: "" } });
-  fireEvent.change(screen.getByLabelText("Действие"), { target: { value: "" } });
 
-  fireEvent.click(screen.getByRole("button", { name: "Дальше" }));
-  expect(await screen.findByText("carol@example.org")).toBeTruthy();
-  expect(sent(calls, "GET", `${BASE}/audit?after=2`)).toHaveLength(1);
+  fireEvent.click(await screen.findByRole("button", { name: "Дальше" }));
+  expect(await screen.findByText("DELETE /api/v1/orgs/{org}/groups/{group}/members")).toBeTruthy();
+  expect(sent(calls, "GET", `${query}&after=2`)).toHaveLength(1);
 });
 
 test("аудитор: консоль открывается на журнале аудита, других разделов не запрашивает", async () => {
