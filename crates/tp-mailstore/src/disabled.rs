@@ -18,10 +18,12 @@
 //!   ([`DisabledMailboxes::attach`]): после `AccountStore::attach_account` письма могли оказаться в корзине
 //!   подключённого ящика, поэтому публикуется системный сигнал `TrashChanged` (таймер истечения корзины).
 //!
-//! Воркер не делает периодических проходов (SRS 2.8): один таймер на ближайший срок хранения. Срок сверяется при
-//! запуске, после прохода, после `restore` и `attach` этого объекта (и его клонов) и не реже [`DisabledConfig::max_wait`]:
-//! сигнал шины `DisabledMailboxChanged` (CTR-77) воркер пока не слушает (MS-17), отключение другим узлом или
-//! синхронизацией каталога он замечает при очередной сверке. После ошибки хранилища — повтор не раньше [`DisabledConfig::retry`].
+//! Воркер не делает периодических проходов и сверок по таймеру (SRS 2.8): один таймер на ближайший срок хранения.
+//! Срок сверяется при запуске, после прохода и по сигналам системной подписки шины: `DisabledMailboxChanged`
+//! (CTR-77; публикует реализация `AccountStore` любого узла после отключения, смены срока, восстановления и
+//! подключения ящика) и `Resync` (сигналы потеряны). Подписка и переподписка — общие с воркером корзины
+//! (`crate::worker::Signals`); пока подписки нет — следующая попытка через [`DisabledConfig::retry`]. После ошибки
+//! хранилища — повтор не раньше [`DisabledConfig::retry`].
 
 use std::future::Future;
 use std::sync::Arc;
@@ -30,6 +32,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use time::OffsetDateTime;
+use tp_contracts::bus::EventKind;
 use tp_contracts::config::duration;
 use tp_contracts::ext::{Decision, FinalDelete};
 use tp_contracts::meta::{
@@ -40,12 +43,11 @@ use tp_contracts::retention::{TrashItem, TrashObject, trash_changed};
 use tp_contracts::{AccountId, Error, MailboxId, MessageId, Result, TenantId, Uid};
 
 use crate::Store;
-use crate::trash::{FAR, SystemTimer, Timer, after};
+use crate::worker::{FAR, Signals, SystemTimer, Timer, after};
 
 /// Хранение отключённых ящиков (секция `disabled` конфигурации хранилища).
 ///
 /// ```yaml
-/// max_wait: 1h
 /// retry: 5m
 /// batch: 100
 /// page: 500
@@ -54,11 +56,8 @@ use crate::trash::{FAR, SystemTimer, Timer, after};
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct DisabledConfig {
-    /// Наибольшее ожидание таймера: сверка ближайшего срока хранения не реже (отключение ящика сигналом не сообщается).
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub max_wait: Duration,
-    /// Пауза перед повтором после ошибки хранилища (ящики с истёкшим сроком не обработаны).
+    /// Пауза перед повтором после ошибки хранилища (ящики с истёкшим сроком не обработаны) и перед повторной
+    /// подпиской на сигналы шины.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub retry: Duration,
@@ -75,7 +74,6 @@ pub struct DisabledConfig {
 impl Default for DisabledConfig {
     fn default() -> Self {
         Self {
-            max_wait: Duration::from_secs(3600),
             retry: Duration::from_secs(300),
             batch: 100,
             page: 500,
@@ -112,8 +110,6 @@ pub struct DisabledMailboxes {
     store: Store,
     accounts: Arc<dyn AccountStore>,
     mailboxes: Arc<dyn MailboxStore>,
-    /// Сигнал воркеру: `restore` или `attach` выполнены, ближайший срок мог измениться (общий для клонов).
-    wake: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for DisabledMailboxes {
@@ -136,7 +132,6 @@ impl DisabledMailboxes {
             store,
             accounts,
             mailboxes,
-            wake: Arc::default(),
         }
     }
 
@@ -145,11 +140,10 @@ impl DisabledMailboxes {
     }
 
     /// Восстанавливает отключённый ящик (`AccountStore::restore_account`: действующий — без изменений,
-    /// нет учётной записи — `Error::NotFound`); воркер сверяет ближайший срок.
+    /// нет учётной записи — `Error::NotFound`; удаляется — `Error::Conflict`). Воркеры узлов сверяют ближайший срок
+    /// по сигналу `DisabledMailboxChanged` хранилища.
     pub async fn restore(&self, tenant: TenantId, account: AccountId) -> Result<()> {
-        self.accounts.restore_account(tenant, account).await?;
-        self.wake.notify_one();
-        Ok(())
+        self.accounts.restore_account(tenant, account).await
     }
 
     /// Подключает отключённый ящик `disabled` к учётной записи `to` (`AccountStore::attach_account`; содержимое
@@ -174,7 +168,6 @@ impl DisabledMailboxes {
         if let Err(e) = self.store.d.bus.publish(trash_changed(scope)).await {
             tracing::warn!(error = %e, "mailstore: сигнал корзины не опубликован");
         }
-        self.wake.notify_one();
         Ok(account)
     }
 
@@ -210,7 +203,8 @@ impl DisabledMailboxes {
         }
     }
 
-    /// Воркер окончательного удаления до завершения `shutdown`: один таймер на ближайший срок хранения.
+    /// Воркер окончательного удаления до завершения `shutdown`: один таймер на ближайший срок хранения, пробуждение
+    /// по сигналам `DisabledMailboxChanged` и `Resync`, без сверок по таймеру.
     pub async fn run(&self, shutdown: impl Future<Output = ()>) {
         self.worker(&SystemTimer, shutdown).await;
     }
@@ -220,7 +214,9 @@ impl DisabledMailboxes {
         // После ошибки хранилища — не раньше этого момента (иначе необработанный ящик с истёкшим сроком
         // взводил бы таймер в прошлое).
         let mut not_before: Option<OffsetDateTime> = None;
+        let mut signals = Signals::new(timer.now(), self.cfg().retry, "отключённых ящиков");
         loop {
+            signals.ensure(self.store.d.bus.as_ref(), timer.now()).await;
             let due = match self.next_expiry().await {
                 Ok(next) => next.map(|at| not_before.map_or(at, |nb| at.max(nb))),
                 Err(e) => {
@@ -230,17 +226,25 @@ impl DisabledMailboxes {
                     Some(at)
                 }
             };
-            // Не дольше `max_wait`: по его истечении — только сверка срока.
-            let cap = after(timer.now(), self.cfg().max_wait);
-            let (at, pass) = match due {
-                Some(at) if at <= cap => (at, true),
-                _ => (cap, false),
+            // Без подписки — не дольше следующей попытки подписаться: по ней — только сверка срока. С подпиской и без
+            // отключённых ящиков таймера нет.
+            let (at, pass) = match (due, signals.pending()) {
+                (Some(at), Some(retry)) if retry < at => (Some(retry), false),
+                (Some(at), _) => (Some(at), true),
+                (None, retry) => (retry, false),
+            };
+            let sleep = async {
+                match at {
+                    Some(at) => timer.sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
             };
             let fire = tokio::select! {
                 () = &mut shutdown => return,
-                // Восстановление или подключение этим узлом: сверить срок и перевзвести таймер.
-                () = self.wake.notified() => false,
-                () = timer.sleep_until(at) => pass,
+                // Ящик отключён, восстановлен или подключён (на любом узле), сигналы потеряны или поток завершился:
+                // сверить срок и перевзвести таймер.
+                () = signals.changed(timer, |k| matches!(k, EventKind::DisabledMailboxChanged { .. })) => false,
+                () = sleep => pass,
             };
             if fire {
                 let now = timer.now();
@@ -758,15 +762,25 @@ mod tests {
             .map(|i| i.object)
             .collect();
         assert!(trashed.contains(&TrashObject::Message(own)));
-        let ev = tokio::time::timeout(Duration::from_secs(5), system.next())
-            .await
-            .expect("signal")
-            .expect("event");
+        // Сигналы после подключения: хранилища (`DisabledMailboxChanged`) и корзины.
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(Duration::from_secs(5), system.next())
+                .await
+                .expect("signal")
+                .expect("event");
+            kinds.push(ev.kind);
+        }
         assert_eq!(
-            ev.kind,
-            EventKind::TrashChanged {
-                account: scope.account
-            }
+            kinds,
+            [
+                EventKind::DisabledMailboxChanged {
+                    account: scope.account
+                },
+                EventKind::TrashChanged {
+                    account: scope.account
+                }
+            ]
         );
 
         // Подключённый ящик действует: срок хранения его не касается.
@@ -779,20 +793,17 @@ mod tests {
         );
     }
 
-    /// Воркер на часах testkit: таймер взведён на срок хранения, восстановление снимает его, удаление — в срок.
+    /// Приёмка MS-20: воркер на часах testkit без ящиков таймера не взводит; отключение ящика мимо
+    /// [`DisabledMailboxes`] (синхронизация каталога, другой узел) — таймер на срок по сигналу, без сверки по
+    /// таймеру; восстановление снимает его, удаление — в срок, после него таймера нет.
     #[tokio::test]
-    async fn worker_arms_nearest_deadline() {
+    async fn worker_wakes_on_signal() {
         let clock = tp_testkit::ManualClock::default();
         let t0 = tp_testkit::Clock::now(&clock);
-        let mut env = Env::with_clock(clock.shared());
-        env.store.cfg.disabled.max_wait = Duration::from_secs(40 * 86_400);
-        let (first, _) = disabled_mailbox(&env, t0).await;
+        let env = Env::with_clock(clock.shared());
+        let first = env.meta.account("gone@example.org").await.expect("acc");
         let second = env.meta.account("later@example.org").await.expect("acc");
         deliver(&env, second, t0).await;
-        env.meta
-            .disable_account(second.tenant, second.account, t0 + days(35))
-            .await
-            .expect("disable");
         let d = disabled(&env);
 
         let armed = Arc::new(Mutex::new(Vec::new()));
@@ -810,19 +821,40 @@ mod tests {
                 .await;
             })
         };
-        let last = || armed.lock().expect("lock").last().copied();
+        let armed = || armed.lock().expect("lock").clone();
+        until("подписка воркера", async || {
+            env.bus.subscribers() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(armed().is_empty(), "отключённых ящиков нет — таймера нет");
+
+        env.meta
+            .disable_account(first.tenant, first.account, t0 + days(30))
+            .await
+            .expect("disable");
         until(
-            "таймер на ближайший срок",
-            async || last() == Some(t0 + days(30)),
+            "таймер по сигналу отключения",
+            async || armed() == [t0 + days(30)],
         )
         .await;
+        env.meta
+            .disable_account(second.tenant, second.account, t0 + days(35))
+            .await
+            .expect("disable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            armed().last(),
+            Some(&(t0 + days(30))),
+            "срок второго позже — таймер прежний"
+        );
 
         // Восстановление ближайшего ящика: таймер перевзведён на следующий срок.
         d.restore(first.tenant, first.account)
             .await
             .expect("restore");
         until("таймер перевзведён", async || {
-            last() == Some(t0 + days(35))
+            armed().last() == Some(&(t0 + days(35)))
         })
         .await;
         assert_eq!(state(&env, first).await, Ok(AccountState::Active));
@@ -833,10 +865,64 @@ mod tests {
         })
         .await;
         assert_eq!(state(&env, first).await, Ok(AccountState::Active));
-        // Отключённых ящиков нет: только сверка не реже `max_wait`.
-        until("таймер сверки", async || {
-            last() == Some(t0 + days(35) + days(40))
+        let after_pass = armed().len();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            armed().len(),
+            after_pass,
+            "ящиков нет — таймер не взводится"
+        );
+
+        stop.send(()).expect("stop");
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("worker stopped")
+            .expect("join");
+    }
+
+    /// Потеря связи с шиной: воркер переподписывается и снова реагирует на отключение ящика.
+    #[tokio::test]
+    async fn worker_resubscribes() {
+        let clock = tp_testkit::ManualClock::default();
+        let t0 = tp_testkit::Clock::now(&clock);
+        let env = Env::with_clock(clock.shared());
+        let scope = env.meta.account("gone@example.org").await.expect("acc");
+        let d = disabled(&env);
+        let armed = Arc::new(Mutex::new(Vec::new()));
+        let timer = TestTimer {
+            clock: clock.clone(),
+            armed: armed.clone(),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let worker = {
+            let d = d.clone();
+            tokio::spawn(async move {
+                d.worker(&timer, async {
+                    let _ = stopped.await;
+                })
+                .await;
+            })
+        };
+        until("подписка воркера", async || {
+            env.bus.subscribers() == 1
         })
+        .await;
+
+        // Поток закрылся позже `retry` с оформления — переподписка сразу.
+        clock.set(after(t0, env.store.cfg.disabled.retry));
+        env.bus.disconnect();
+        until("переподписка", async || {
+            env.bus.subscribers() == 1
+        })
+        .await;
+        env.meta
+            .disable_account(scope.tenant, scope.account, t0 + days(30))
+            .await
+            .expect("disable");
+        until(
+            "таймер по сигналу после переподписки",
+            async || armed.lock().expect("lock").last() == Some(&(t0 + days(30))),
+        )
         .await;
 
         stop.send(()).expect("stop");
