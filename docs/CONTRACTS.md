@@ -112,7 +112,13 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   `Invalid`, остались письма — `Conflict`). Методы, кроме `account_state`, по умолчанию — `Internal`. In-memory — `MemMetadata`; набор
   `suite::account_state`. PostgreSQL — META-33.
   CTR-63: `by_ids(tenant, &[AccountId]) -> Vec<Account>` — в порядке запроса, не найденные и чужой организации пропускаются, повтор —
-  одна запись (первое вхождение); по умолчанию — `get` по одному, одним запросом — META-66; набор `suite::account_by_ids`.
+  одна запись (первое вхождение); обязателен (без реализации по умолчанию; PostgreSQL одним запросом — META-66); набор
+  `suite::account_by_ids`.
+  CTR-62: `by_address(tenant, address) -> Option<AddressTarget>` — получатель адреса организации (участник приглашения):
+  `AddressTarget::Account(Account)` — основной адрес или псевдоним (`Account::addresses`), иначе `AddressTarget::Group(DistributionGroup)`
+  — адрес группы рассылки (`GroupStore::by_address`); без учёта регистра и пробелов по краям; вход и состояние ящика не учитываются.
+  Обязателен; `MemMetadata` видит группы через `with_groups(MemGroups)`; `PgMeta` до META-68 — основной адрес и адрес группы без
+  псевдонимов. Набор `suite::account_by_address`; потребители — DAV-30.
   CTR-64: после фиксации `enabled = false` (`upsert` разрешённой ранее записи) и `disable_account` реализация публикует
   `account_disabled(scope)` — системный сигнал `AccountDisabled { account }` (раздел EventBus; `tp-meta` — META-67).
 - `MailboxStore`: `list(account)`, `get`, `create`, `rename`, `delete(scope, id, cascade)`, `set_subscribed`, `status` (counts, uidnext, highest modseq).
@@ -245,7 +251,9 @@ In-memory — `MemAbuseBlocks` (`with_bus`), наборы `suite::abuse_blocks`,
 SRS 5.2, решение 2026-11-01-borrowings-security (CTR-21; код — `delivery.rs`). Журнал доставки (message tracking): только добавление
 и поиск, содержимое писем не хранится. `DeliveryEvent { tenant, at, node: NodeId, kind, sender, recipients, message_id: Option<_>
 (без угловых скобок), queue_id: Option<QueueId>, decision, reason: Option<String> }`; `DeliveryEventKind { Receive, Reject, Deliver,
-Relay, Dsn }`, `DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, Hold }` (строки в нижнем регистре).
+Relay, Dsn, Itip }` (`Itip`, CTR-66 — приём iTIP из письма iMIP: `decision` `Accept` — применено, `Discard` — пропущено, `reason` —
+`METHOD` или `METHOD: причина`, `delivery::itip_record(method, &ItipOutcome)`; пишет `tp-smtp`, SMTP-37; `tp-meta` — миграция 0035),
+`DeliveryDecision { Accept, Reject, Defer, Quarantine, Discard, Hold }` (строки в нижнем регистре).
 `DeliveryLog`: `record(event)`, `record_batch(Vec<_>)` (по умолчанию — по одной), `search(tenant, &DeliveryQuery) -> DeliveryPage
 { events, next: Option<DeliveryCursor> }`, `purge(before)` — по всем организациям (maintenance), можно целыми сутками-секциями.
 `by_queue(tenant, QueueId, limit)` (CTR-35) — события записи очереди по `at` (равные — в порядке записи), `limit ≥ 1`: статус доставки
@@ -695,8 +703,13 @@ iMIP (RFC 6047), занятость. iCalendar контракты не разб�
 - Входящие планирования (`schedule-inbox`, RFC 6638 §2.2) в `DavStore` (методы с реализацией по умолчанию — `Internal`):
   `inbox_put(scope, name, InboxMessage { method, uid, from, body }) -> Put` (создать или перезаписать, `id` сохраняется; UID не уникален;
   имя — `valid_name`, `validate()` → `Invalid`; тело больше `max_object_size` или сообщений больше `max_objects` — `QuotaExceeded`),
-  `inbox_list(scope) -> Inbox { items: Vec<InboxItem { id, name, etag, modseq, message }> (по `ModSeq`), state }` (`state` — CTag
-  входящих и JMAP `state` `CalendarEventNotification`), `inbox_delete(scope, name) -> ModSeq` (без надгробия; нет — `NotFound`).
+  `inbox_list(scope) -> Inbox { items: Vec<InboxItem { id, name, etag, modseq, received_at, message }> (по `ModSeq`), state }` (`state` —
+  CTag входящих и JMAP `state` `CalendarEventNotification`), `inbox_delete(scope, name) -> ModSeq` (надгробие; нет — `NotFound`).
+  Журнал входящих (CTR-65; обязательные методы): `inbox_state(scope) -> ModSeq` — как `Inbox::state`; `inbox_changes(scope, since, limit)
+  -> Changes<DavObjectId>` (JMAP `CalendarEventNotification/changes`) — созданные, перезаписанные и удалённые (надгробия) после `since`,
+  страницы и `new_state` — как у `account_changes`, устаревший `since` — `Conflict`; `InboxItem::received_at` — время первой записи (UTC,
+  JMAP `created`), перезапись не меняет. Набор `suite::itip::inbox_log`; PostgreSQL — META-69 (до неё `PgMeta`: `inbox_changes` —
+  `Internal`, `received_at` — из UUID v7 идентификатора, надгробий нет).
   `ModSeq` — из счётчика учётной записи; `DavStore::state` и `*changes` календарей входящие не меняют. Сигнал
   `ScheduleInboxChanged { modseq }` (`schedule_inbox_changed`, учётная запись) — после каждого `inbox_put`, `inbox_delete`.
 - `Schedule-Tag` (RFC 6638 §3.2) — `ObjectIndex::schedule_tag` (как ETag, `valid_etag`): задаёт вызывающий — новый при изменении
@@ -1030,3 +1043,12 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   из `OWNER`). Несовместимо: новый вариант `AuditAction`; исчерпывающих `match` по нему в коде нет. `tp-meta` — миграция 0034
   (`mailbox_audit_action_check`), `tp-admin` — описание параметра `action`; набор `suite::mailbox_audit` — запись `Search`. Запись
   протоколами — IMAP-23, JMAP-43.
+- 2026-11-13 — CTR-62, CTR-65, CTR-66 и обязательный `by_ids` (волна contracts-45). `AccountStore::by_address(tenant, address) ->
+  Option<AddressTarget::{Account, Group}>` — основной адрес и псевдоним — учётная запись, адрес группы — группа; `MemMetadata::with_groups`,
+  набор `suite::account_by_address`; `PgMeta` до META-68 — без псевдонимов. `AccountStore::by_ids` — без реализации по умолчанию
+  (`MemMetadata`, обёртка `Limited` в тестах `tp-imap`; `PgMeta` — META-66). `DavStore::inbox_state`, `inbox_changes` (надгробия
+  входящих), `InboxItem::received_at`; набор `suite::itip::inbox_log`; `PgMeta` — META-69 (до неё `inbox_changes` — `Internal`).
+  `DeliveryEventKind::Itip` и `delivery::itip_record`; `tp-meta` — миграция 0035 (`delivery_log.kind`). Несовместимо: новые
+  обязательные методы `AccountStore`, `DavStore`, поле `InboxItem::received_at`, вариант `DeliveryEventKind`. По сравнению с карточками:
+  методы без реализаций по умолчанию (правило владельца); итог iTIP — в `decision` и `reason`, а не полями варианта (событие — строка в
+  хранилище и Admin API).

@@ -7,9 +7,10 @@ use sqlx::postgres::PgArguments;
 use sqlx::query::QueryAs;
 use sqlx::{FromRow, PgConnection, Postgres};
 use time::OffsetDateTime;
+use tp_contracts::groups::GroupStore;
 use tp_contracts::meta::{
-    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, DisabledAccount,
-    ExistingContent, QuotaUsage, account_aliases, account_disabled,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
+    DisabledAccount, ExistingContent, QuotaUsage, account_aliases, account_disabled,
 };
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use uuid::Uuid;
@@ -300,6 +301,18 @@ impl AccountStore for PgMeta {
             .filter_map(|k| found.remove(k))
             .map(Account::try_from)
             .collect()
+    }
+
+    // CTR-62: до META-68 — только основной адрес и адрес группы, без псевдонимов; одним запросом с псевдонимами —
+    // META-68.
+    async fn by_address(&self, tenant: TenantId, address: &str) -> Result<Option<AddressTarget>> {
+        let address = address.trim();
+        if let Some(account) = self.by_login(tenant, address).await? {
+            return Ok(Some(AddressTarget::Account(account)));
+        }
+        Ok(GroupStore::by_address(self, tenant, address)
+            .await?
+            .map(AddressTarget::Group))
     }
 
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {

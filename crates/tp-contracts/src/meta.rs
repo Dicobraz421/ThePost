@@ -27,6 +27,7 @@ use time::OffsetDateTime;
 
 use crate::bus::{Event, EventKind};
 use crate::error::{Error, Result};
+use crate::groups::DistributionGroup;
 use crate::ids::{
     AccountId, BlobKey, DomainId, MailboxId, MessageId, ModSeq, TenantId, Uid, UidValidity,
 };
@@ -85,6 +86,16 @@ impl Account {
     pub fn addresses(&self) -> Vec<String> {
         account_addresses(&self.login, self.aliases.iter().map(String::as_str))
     }
+}
+
+/// Получатель адреса организации ([`AccountStore::by_address`], CTR-62).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AddressTarget {
+    /// Учётная запись: адрес — её основной (имя входа) или псевдоним ([`Account::addresses`]).
+    Account(Account),
+    /// Группа рассылки: адрес — [`DistributionGroup::address`]; участников раскрывает вызывающий
+    /// ([`crate::groups::GroupStore::expand`]).
+    Group(DistributionGroup),
 }
 
 /// Данные для создания или обновления учётной записи (синхронизация с каталогом).
@@ -214,22 +225,18 @@ pub trait AccountStore: Send + Sync + 'static {
 
     /// Учётные записи по списку идентификаторов (CTR-63; имена участников группы, Admin API): в порядке `ids`,
     /// не найденные (и чужой организации) пропускаются, повтор идентификатора — одна запись (первое вхождение).
-    /// По умолчанию — [`AccountStore::get`] по одному; реализация одним запросом — `tp-meta` (META-66).
-    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
-        let mut seen = BTreeSet::new();
-        let mut out = Vec::with_capacity(ids.len());
-        for &id in ids {
-            if seen.insert(id)
-                && let Some(a) = self.get(tenant, id).await?
-            {
-                out.push(a);
-            }
-        }
-        Ok(out)
-    }
+    /// Реализации — `tp-meta` (одним запросом, META-66), `tp-testkit`.
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>>;
 
     /// Учётная запись по имени входа (без учёта регистра).
     async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>>;
+
+    /// Получатель адреса организации `tenant` (CTR-62; участник приглашения, доставка): учётная запись, у которой
+    /// `address` — основной адрес или псевдоним ([`Account::addresses`]), иначе группа рассылки с этим адресом
+    /// ([`crate::groups::GroupStore::by_address`]); без учёта регистра, пробелы по краям не учитываются. Нет — `None`.
+    /// Вход и состояние ящика не учитываются (проверяет вызывающий). Реализации — `tp-meta` (META-68), `tp-testkit`
+    /// (группы — [`crate::groups::GroupStore`], переданное реализации).
+    async fn by_address(&self, tenant: TenantId, address: &str) -> Result<Option<AddressTarget>>;
 
     /// Учётная запись по идентификатору в каталоге (`Account::external_id`, точное совпадение; CTR-32). Синхронизация
     /// каталога сопоставляет по нему участников групп и учётные записи: переименование входа не меняет `AccountId`.

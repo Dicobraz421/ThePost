@@ -628,11 +628,24 @@ struct InboxRow {
 
 impl InboxRow {
     fn into_item(self) -> Result<InboxItem> {
+        // CTR-65: до META-69 (столбец времени) — время из идентификатора UUID v7, выданного при первой записи.
+        let received_at = self
+            .item_id
+            .get_timestamp()
+            .and_then(|t| {
+                let (secs, nanos) = t.to_unix();
+                let secs = i64::try_from(secs).ok()?;
+                OffsetDateTime::from_unix_timestamp(secs)
+                    .ok()
+                    .map(|at| at + time::Duration::nanoseconds(i64::from(nanos)))
+            })
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
         Ok(InboxItem {
             id: DavObjectId::from_uuid(self.item_id),
             name: self.name,
             etag: self.etag,
             modseq: modseq(self.modseq)?,
+            received_at,
             message: InboxMessage {
                 method: self.method.parse()?,
                 uid: self.uid,
@@ -2050,6 +2063,23 @@ impl DavStore for PgMeta {
             .await?;
         self.signal(schedule_inbox_changed(scope, ms)).await;
         Ok(ms)
+    }
+
+    // CTR-65: до META-69 — состояние через `inbox_list`; журнал с надгробиями входящих — META-69.
+    async fn inbox_state(&self, scope: AccountScope) -> Result<ModSeq> {
+        Ok(self.inbox_list(scope).await?.state)
+    }
+
+    async fn inbox_changes(
+        &self,
+        scope: AccountScope,
+        since: ModSeq,
+        limit: usize,
+    ) -> Result<Changes<DavObjectId>> {
+        let _ = (scope, since, limit);
+        Err(Error::internal(
+            "журнал входящих планирования в PostgreSQL — META-69",
+        ))
     }
 
     async fn sync_gal(

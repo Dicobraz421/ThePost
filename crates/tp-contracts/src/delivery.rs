@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 use crate::error::{Error, Result};
 use crate::ids::{QueueId, TenantId};
 use crate::membership::NodeId;
+use crate::schedule::{ItipMethod, ItipOutcome};
 
 /// Событие журнала доставки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -28,6 +29,24 @@ pub enum DeliveryEventKind {
     Relay,
     /// Отправка уведомления о доставке (DSN).
     Dsn,
+    /// Приём сообщения iTIP учётной записью организации (CTR-66; письмо iMIP,
+    /// [`crate::schedule::ItipDelivery`]): `decision` — [`DeliveryDecision::Accept`] (применено) или
+    /// [`DeliveryDecision::Discard`] (пропущено), `reason` — метод и причина ([`itip_record`]). Письмо при любом итоге
+    /// доставлено в ящик (своё событие `Deliver`).
+    Itip,
+}
+
+/// Решение и причина записи [`DeliveryEventKind::Itip`] (CTR-66) по итогу
+/// [`crate::schedule::ItipDelivery::deliver`]: применено — [`DeliveryDecision::Accept`] и метод (`REQUEST`); пропущено
+/// ([`ItipOutcome::Ignored`]) — [`DeliveryDecision::Discard`] и `METHOD: причина`. Содержимого сообщения нет.
+pub fn itip_record(method: ItipMethod, outcome: &ItipOutcome) -> (DeliveryDecision, String) {
+    match outcome {
+        ItipOutcome::Applied => (DeliveryDecision::Accept, method.as_str().to_owned()),
+        ItipOutcome::Ignored(why) => (
+            DeliveryDecision::Discard,
+            format!("{}: {why}", method.as_str()),
+        ),
+    }
 }
 
 /// Решение по письму в событии.
@@ -206,6 +225,28 @@ mod tests {
             decision: DeliveryDecision::Accept,
             reason: None,
         }
+    }
+
+    #[test]
+    fn itip() {
+        assert_eq!(
+            itip_record(ItipMethod::Request, &ItipOutcome::Applied),
+            (DeliveryDecision::Accept, "REQUEST".to_owned())
+        );
+        assert_eq!(
+            itip_record(
+                ItipMethod::Cancel,
+                &ItipOutcome::Ignored("устаревший SEQUENCE".into())
+            ),
+            (
+                DeliveryDecision::Discard,
+                "CANCEL: устаревший SEQUENCE".to_owned()
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(DeliveryEventKind::Itip).ok(),
+            Some(serde_json::json!("itip"))
+        );
     }
 
     #[test]
