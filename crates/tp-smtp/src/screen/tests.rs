@@ -154,10 +154,10 @@ fn cache_rate_and_exempt() {
     let later = t0 + cfg.pass_ttl + Duration::from_secs(1);
     assert!(matches!(s.admit_at(&cfg, ip, later), Admission::Probe(_)));
     // Нарушитель: отказ из кэша до `reject_ttl`.
-    let bad: IpAddr = "::ffff:198.51.100.7".parse().expect("ip");
+    let bad: IpAddr = "198.51.100.7".parse().expect("ip");
     s.record_at(&cfg, bad, Some(Err(Violation::Pregreet)), t0);
     assert_eq!(
-        s.admit_at(&cfg, "198.51.100.7".parse().expect("ip"), t0),
+        s.admit_at(&cfg, bad, t0),
         Admission::Reject {
             violation: Violation::Pregreet,
             cached: true

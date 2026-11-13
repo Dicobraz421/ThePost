@@ -2,7 +2,9 @@
 //!
 //! До сессии ([`Screen::admit`]): частота соединений с адреса (`screen.max_rate` за `screen.rate_window`) и
 //! кэш результатов по IP-адресу — прошедший проверки адрес не проверяется `screen.pass_ttl`, нарушитель
-//! отклоняется без проверки `screen.reject_ttl`. Адреса из `screen.exempt` не проверяются.
+//! отклоняется без проверки `screen.reject_ttl`. Адреса из `screen.exempt` не проверяются. Адрес клиента приходит
+//! в канонической форме (слушатель — PLT-34, `XCLIENT`/`XFORWARD` — разбор [`crate::sources`]); к ней приводятся
+//! только одиночные адреса `screen.exempt` из конфигурации.
 //!
 //! В начале сессии ([`Probe`], проверки ведёт [`crate::server::Session`]):
 //! - задержка приветствия: сервер отправляет первую строку `220-` и ждёт `screen.greet_delay`; клиент,
@@ -148,7 +150,6 @@ impl Screen {
 
     /// [`Screen::admit`] в момент `now`.
     pub fn admit_at(&self, cfg: &ScreenConfig, ip: IpAddr, now: Instant) -> Admission {
-        let ip = ip.to_canonical();
         if !cfg.enabled || exempt(cfg, ip) {
             return Admission::Exempt;
         }
@@ -215,7 +216,7 @@ impl Screen {
             Some(Err(_)) | None => return,
         };
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        insert(&mut st.cache, cfg, ip.to_canonical(), verdict, now);
+        insert(&mut st.cache, cfg, ip, verdict, now);
     }
 
     /// Нарушение: журнал и метрика (`rejected` или `logged`).
